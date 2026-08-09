@@ -43,5 +43,7 @@ test("the menu adds the notification bell toggle — inverted polarity: `notify`
   assert.match(SRC, /toggle\("bell", !onBell,\s*onBell \? "Stop notifying" : "Notify me"/);
   assert.match(SRC, /setSessionFlag\(id, "notify", !onBell\)/);
   // what it does, in the sub-line: the kernel's feed-diff notifier fires on blocked-on-you / completed
-  assert.match(SRC, /system notification when its work blocks on you or completes/);
+  assert.match(SRC, /a notification when its work blocks on you or completes/);
+  // …and the ON state's copy is a MUTE, since the bell is on by default now (the user 2026-08-09)
+  assert.match(SRC, /mute notifications for this session/);
 });

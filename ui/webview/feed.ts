@@ -636,8 +636,8 @@ function paintCardBell(card: HTMLElement, on: boolean): void {
   (btn as any)._bellOn = on;
   btn.classList.toggle("on", on);
   btn.innerHTML = cardBellSvg(!on);
-  btn.title = on ? "system notifications on for this task — click to stop"
-    : "notify me when this task blocks on you or completes";
+  btn.title = on ? "notifications on for this task — click to stop"
+    : "notify me about this task even while its session is muted";
 }
 
 // the ONE toggle path — the corner bell click and the right-click menu both land here
@@ -659,8 +659,8 @@ function showCardMenu(e: MouseEvent, card: HTMLElement): void {
   const body = el("span", "ctx-item-body");
   const lab = el("span", "ctx-item-label"); lab.textContent = on ? "Stop notifying" : "Notify me";
   const sub = el("span", "ctx-item-sub");
-  sub.textContent = on ? "no more system notifications for this card"
-    : "system notification when this card blocks on you or completes";
+  sub.textContent = on ? "no more notifications for this card"
+    : "notify me about this card even while its session is muted";
   body.append(lab, sub);
   item.append(icon, body);
   item.addEventListener("click", (ev) => {

@@ -3705,7 +3705,7 @@ function showTabMenu(e: MouseEvent, tab: HTMLElement, label: HTMLElement, id: st
   // inverted polarity vs the two above: `notify` true is the ENABLED state, so the icon slashes on !onBell.
   toggle("bell", !onBell,
     onBell ? "Stop notifying" : "Notify me",
-    onBell ? "no more system notifications for this session" : "system notification when its work blocks on you or completes",
+    onBell ? "mute notifications for this session" : "a notification when its work blocks on you or completes",
     () => setSessionFlag(id, "notify", !onBell));
   // Color swatches (the user 2026-06-29): the romp identity palette as circles, the session's current one
   // ringed. Click one to recolor the session. Omitted until /palette has loaded (paletteColors empty).

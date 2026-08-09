@@ -25,7 +25,15 @@ class TabFlags(unittest.TestCase):
     def test_kernel_handles_a_chat_side_setSessionFlag(self):
         text = open(KPATH).read()
         self.assertIn('msg.get("type") == "setSessionFlag"', text)
-        self.assertIn("_set_session_flag(str(msg[\"id\"]), str(msg[\"flag\"]), bool(msg.get(\"value\")))", text)
+        self.assertIn('_flag, _val = str(msg["flag"]), bool(msg.get("value"))', text)
+        self.assertIn('_set_session_flag(str(msg["id"]), _flag, _val)', text)
+
+    def test_the_notify_bell_is_stored_inverted(self):
+        # the bell is ON by default (the user 2026-08-09), and the flags file cannot hold a false — so
+        # what persists is "notifyOff". Clients still send the positive `notify`; the flip lives in the
+        # handler, the one place that writes it.
+        text = open(KPATH).read()
+        self.assertIn('_flag, _val = "notifyOff", not _val', text)
 
     def test_set_session_flag_round_trips(self):
         sid = "11111111-2222-3333-4444-555555555555"

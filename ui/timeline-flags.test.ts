@@ -42,7 +42,7 @@ test("the menu lists all three toggles with icons, state words, and plain-langua
   // each row explains itself (the user asked for an explanation per toggle, not bare labels)
   assert.match(SRC, /its prompts make cards on the feed; off, the lane stays here but new prompts mint none/);
   assert.match(SRC, /visible to peer sessions, can send and receive their messages; off = fully isolated/);
-  assert.match(SRC, /system notification when its work blocks on you or completes/);
+  assert.match(SRC, /a notification when its work blocks on you or completes/);
   // polarity is encoded per toggle: two off-flags, one on-flag
   assert.match(SRC, /enabled: \(s\) => !s\.hideFromFeed, value: \(enable\) => !enable,/);
   assert.match(SRC, /enabled: \(s\) => !!s\.notify, value: \(enable\) => enable,/);

@@ -16,7 +16,7 @@ from pathlib import Path
 from datetime import datetime
 from importlib.machinery import SourceFileLoader
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, unquote, urlencode
+from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -1418,6 +1418,14 @@ def _prune_notify_cards(live_ids):
     if gone:
         kept = {i: True for i in cur if i in live_ids}
         _atomic_write(jd.STATE / "notify-cards.json", json.dumps(kept, sort_keys=True))
+
+
+def _notify_on(sid):
+    """Is this session's bell on? ON unless muted (the user 2026-08-09) — the flag stored is the NEGATIVE
+    one, "notifyOff", because the flags file has no way to hold a false (a falsy set pops the key), and
+    because a default-on service with an off-switch is the shape postalServiceOff already uses. The wire
+    keeps the positive `notify`: every client renders "bell on/off", not "off-flag set"."""
+    return not _session_flag(sid, "notifyOff")
 
 
 # ── Auto Nudge (the user 2026-06-19) ──────────────────────────────────────────────────────────────
@@ -11797,7 +11805,7 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None):
             # the timeline lane's feed checkbox + postal mailbox. Same flags + legacy fallback as build_timeline.
             "hideFromFeed": _session_flag(sid, "hideFromFeed"),
             "postalServiceOff": _session_flag(sid, "postalServiceOff") or _session_flag(sid, "postalOff"),
-            "notify": _session_flag(sid, "notify"),   # session-level bell: OS notification when its work blocks on you / completes (the user 2026-07-28)
+            "notify": _notify_on(sid),   # session-level bell: notification here + on your phone when its work blocks on you / completes (the user 2026-07-28; on by default 2026-08-09)
             # NEVER `now`. This rides the chat payload, and _send_client dedups by comparing the
             # SERIALIZED payload against what that client last received — so a firstSeen that ticked
             # with the wall clock made every build differ, defeated the dedup entirely, and re-sent the
@@ -14946,7 +14954,7 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
             "faded": faded,
             "hideFromFeed": _session_flag(sid, "hideFromFeed"),    # lane checkbox → mute from feed (timeline-only)
             "postalServiceOff": _session_flag(sid, "postalServiceOff") or _session_flag(sid, "postalOff"),  # lane mailbox → isolate from the Romp Postal Service (bin/romp-postal-service)
-            "notify": _session_flag(sid, "notify")})   # lane bell → OS notification when this session's work blocks on you / completes (the user 2026-07-28)
+            "notify": _notify_on(sid)})   # lane bell → notification here + on your phone when this session's work blocks on you / completes (the user 2026-07-28; on by default 2026-08-09)
     if with_bars:
         messages = _postal_messages(now, set(id2name), id2name)
         _bind_message_execs(messages, turns)             # connector exec → the recipient's process-start (real transit)
@@ -16034,19 +16042,30 @@ def _cached_feed(now, tmux, sig, connect=False):
     feed = build_feed(now, tmux)         # instant may be invisible to the build below → must rebuild
     feed["buildId"] = bid
     _built_feed[:] = [sig, feed, time.time(), started]
-    for _t, _b in _feed_notifications(feed):              # armed bells: fresh builds are the transition event
-        _system_notify(_t, _b)
+    for _t, _b, _p, _s in _feed_notifications(feed):      # the bells: fresh builds are the transition event
+        _notify(_t, _b, priority=_p, tags=("warning" if _p == "high" else "white_check_mark"), sid=_s)
     return feed
 
 
-# ── system notifications: the bell toggles (the user 2026-07-28) ──────────────────────────────────
-# A session's bell (timeline lane / tab menu → session-flags "notify") or a card's bell (right-click →
-# notify-cards.json) arms OS-level notifications, fired when an armed card ENTERS needs_input (blocked
-# on you) or completed. Detection diffs each fresh feed build against the previous one — the exact event
-# the columns move on, no separate heuristic — and the FIRST build after a kernel start is a silent
-# baseline: existing state is status, not news (the same policy as extension.ts freshNeedsYou). A card
-# re-entering needs_input later (a new block after an answer) notifies again by construction.
+# ── notifications: the bells (the user 2026-07-28; ON by default + phone push 2026-08-09) ─────────
+# A card ENTERING needs_input (blocked on you) or completed notifies — for EVERY session, without
+# arming anything first (the user 2026-08-09, who wanted to hear about a blocked agent while away from
+# the machine, which means the default has to be on: a bell you must remember to arm is silent exactly
+# when you weren't watching). The bell is therefore a MUTE now: session-flags "notifyOff" silences one
+# session, and the per-card bell (notify-cards.json) speaks over that mute for a single card. This is
+# the same default-on/off-flag shape as the postal service (postalServiceOff), not a new one.
+#
+# Detection diffs each fresh feed build against the previous one — the exact event the columns move on,
+# no separate heuristic — and the FIRST build after a kernel start is a silent baseline: existing state
+# is status, not news (the same policy as extension.ts freshNeedsYou). A card re-entering needs_input
+# later (a new block after an answer) notifies again by construction.
+#
+# An ON-YOU API error (prompt too long, spend cap, model allowance) needs no detector of its own: it
+# already floors its card to needs_input (api_block in build_feed), so it arrives here as an ordinary
+# column entry and only its wording differs. _api_error_notifications covers the one case that leaves
+# no card — a session that hit the error before any goal was filed.
 _NOTIFY_PREV = [None]   # itemId -> column at the last build; None = baseline pending
+_NOTIFY_BLOCKED_SIDS = set()   # sids with a needs_input card in the latest build (the api-error fallback's dedup)
 
 
 def _system_notify(title, body):
@@ -16064,10 +16083,121 @@ def _system_notify(title, body):
         pass
 
 
+# ── ntfy: the transport that reaches you away from the machine ────────────────────────────────────
+# An OS notification only lands if you are sitting at the box the kernel runs on, which for a kernel on
+# a always-on remote host is close to never. So every notification is ALSO published to an ntfy topic
+# that a phone subscribes to (the user 2026-08-09). Config lives OUTSIDE the repo, in
+# ~/.config/romp/ntfy.json — the topic is a bearer secret (anyone who knows it can read your
+# notifications and post to them), so it must never be committed — with $ROMP_NTFY_* overriding it:
+#     {"url": "https://ntfy.sh", "topic": "...", "token": "", "click": "https://.../?sid={sid}"}
+# `token` is sent as a Bearer header for a protected topic; `click` is the URL the phone opens when you
+# tap the notification, with {sid} substituted. NO topic configured → every publish is a no-op, so this
+# costs nothing (and reaches nothing) for anyone who has not set it up.
+_NTFY_CONFIG = Path(os.path.expanduser("~/.config/romp/ntfy.json"))
+_ntfy_cache = {}        # (mtime_ns,size) -> parsed dict, same shape as the other config readers
+_ntfy_complained = [0]  # rate-limits the unreadable-config gripe to one per (mtime,size)
+
+
+def _ntfy_conf():
+    """The configured ntfy endpoint as {url,topic,token,click}, or None when there is no topic. File
+    first, $ROMP_NTFY_* over it. An UNREADABLE config logs loudly rather than reading as "off": a typo'd
+    JSON file that silently disables your notifications is the failure you would never notice."""
+    d = {}
+    try:
+        st = _NTFY_CONFIG.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        hit = _ntfy_cache.get("f")
+        if hit is not None and hit[0] == key:
+            d = hit[1]
+        else:
+            try:
+                o = json.loads(_NTFY_CONFIG.read_text())
+                d = o if isinstance(o, dict) else {}
+            except Exception:
+                d = {}
+                if _ntfy_complained[0] != key:
+                    _ntfy_complained[0] = key
+                    sys.stderr.write("ntfy: %s is not readable JSON — phone notifications are OFF\n"
+                                     % _NTFY_CONFIG)
+            _ntfy_cache["f"] = (key, d)
+    except OSError:
+        pass                                         # no file → env-only, or unconfigured
+    topic = os.environ.get("ROMP_NTFY_TOPIC") or d.get("topic") or ""
+    if not topic:
+        return None
+    return {"url": str(os.environ.get("ROMP_NTFY_URL") or d.get("url") or "https://ntfy.sh").rstrip("/"),
+            "topic": str(topic),
+            "token": str(os.environ.get("ROMP_NTFY_TOKEN") or d.get("token") or ""),
+            "click": str(os.environ.get("ROMP_NTFY_CLICK") or d.get("click") or "")}
+
+
+def _ntfy_header(s):
+    """One HTTP-header-safe line. Header values are latin-1 and single-line, but a session name or a
+    goal title is neither by construction — an emoji or a newline in a title would raise inside
+    http.client and lose the notification, so non-encodable characters are dropped here instead."""
+    one = " ".join(str(s).split())                   # collapse newlines/tabs — a header is one line
+    return one.encode("latin-1", "ignore").decode("latin-1")[:200]
+
+
+def _ntfy_request(conf, title, body, priority="default", tags="", click=""):
+    """The (url, headers, body-bytes) of one publish. Split out from the send so the request SHAPE is
+    testable without a socket — the part that has to be right (title escaping, auth, click-through)."""
+    headers = {"Title": _ntfy_header(title), "Priority": str(priority),
+               "Content-Type": "text/plain; charset=utf-8"}
+    if tags:
+        headers["Tags"] = _ntfy_header(tags)
+    if click or conf["click"]:
+        headers["Click"] = _ntfy_header(click or conf["click"])
+    if conf["token"]:
+        headers["Authorization"] = "Bearer %s" % conf["token"]
+    return ("%s/%s" % (conf["url"], quote(conf["topic"], safe="")), headers,
+            str(body).encode("utf-8"))
+
+
+def _ntfy_publish(title, body, priority="default", tags="", click=""):
+    """Publish one notification to the configured topic, on a daemon thread: the pusher must never block
+    on the network, and an unreachable phone must never slow a push or raise into it. Returns True if a
+    publish was dispatched (i.e. a topic is configured), False if there is nothing to publish to."""
+    conf = _ntfy_conf()
+    if not conf:
+        return False
+    url, headers, data = _ntfy_request(conf, title, body, priority, tags, click)
+
+    def _post():
+        import urllib.request
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=8) as r:
+                r.read(1)
+        except Exception as e:                       # unreachable topic / bad token / offline: log, never raise
+            sys.stderr.write("ntfy publish: %s\n" % e)
+
+    threading.Thread(target=_post, name="ntfy", daemon=True).start()
+    return True
+
+
+def _notify(title, body, priority="default", tags="", sid=""):
+    """Fire ONE notification on EVERY transport — the OS notifier on this machine and the ntfy topic that
+    reaches the phone. The single choke point, so a new trigger picks up both by construction."""
+    _system_notify(title, body)
+    conf = _ntfy_conf()
+    click = conf["click"].replace("{sid}", quote(str(sid or ""), safe="")) if (conf and conf["click"]) else ""
+    _ntfy_publish(title, body, priority=priority, tags=tags, click=click)
+
+
+def _notify_muted(sid, item_id=""):
+    """Is this card silenced? Notifications are ON by default (see the section header): only a session
+    bell turned OFF mutes, and an explicitly armed card overrides that mute — which is what the per-card
+    bell is FOR once the session default is on."""
+    if item_id and _notify_cards().get(item_id):
+        return False
+    return _session_flag(str(sid or ""), "notifyOff")
+
+
 def _feed_notifications(feed):
-    """Diff this feed build against the last; return [(title, body)] for every ARMED card that newly
-    entered needs_input or completed (including a card appearing already there — work can surface
-    blocked). Also advances the prev map and prunes armed ids whose card left the feed."""
+    """Diff this feed build against the last; return [(title, body, priority, sid)] for every unmuted card
+    that newly entered needs_input or completed (including a card appearing already there — work can
+    surface blocked). Also advances the prev map and prunes armed ids whose card left the feed."""
     prev = _NOTIFY_PREV[0]
     cur = {}
     for a in feed.get("asks") or []:
@@ -16075,22 +16205,93 @@ def _feed_notifications(feed):
             continue                                 # placeholder churn — not a stable card yet
         cur[str(a.get("itemId"))] = a
     _NOTIFY_PREV[0] = {i: a.get("column") for i, a in cur.items()}
+    _NOTIFY_BLOCKED_SIDS.clear()
+    _NOTIFY_BLOCKED_SIDS.update(str(a.get("sid") or "") for a in cur.values()
+                                if a.get("column") == "needs_input")
     _prune_notify_cards(set(cur))
     if prev is None:
         return []                                    # baseline: existing state is status, not news
-    cards = _notify_cards()
     out = []
     for iid, a in cur.items():
         col = a.get("column")
         if col not in ("needs_input", "completed") or prev.get(iid) == col:
             continue
-        if not (cards.get(iid) or _session_flag(str(a.get("sid") or ""), "notify")):
+        if _notify_muted(a.get("sid"), iid):
             continue
-        what = "Needs you" if col == "needs_input" else "Completed"
         txt = str(a.get("text") or "").strip()
-        out.append(("romp: %s" % (a.get("name") or "session"),
-                    "%s: %s" % (what, txt[:140] if txt else "a task changed state")))
+        blocked = a.get("blocked") or {}
+        if col != "needs_input":
+            body, prio = "Completed: %s" % (txt[:140] if txt else "a task finished"), "default"
+        elif blocked.get("state") == "apiError":
+            # An on-you API error arrives as a needs_input card, but "Needs you: <goal title>" would
+            # describe the WORK, not the thing you have to go do. The card's own `what` line already
+            # says it in the user's terms (compact it / raise the cap / switch the model), so reuse it.
+            body, prio = "Stopped: %s" % (blocked.get("what") or "an API error — Retry to resume"), "high"
+        else:
+            body, prio = "Needs you: %s" % (txt[:140] if txt else "a task is blocked on you"), "high"
+        out.append(("romp: %s" % (a.get("name") or "session"), body, prio, str(a.get("sid") or "")))
     return out
+
+
+# The ON-YOU api-error fallback: a session that stops on "prompt is too long" / a spend cap / a model
+# allowance normally surfaces it as a needs_input CARD, which the diff above already reports. But a
+# session that hits one before the planner has filed any goal has no card to floor, and that is the very
+# first prompt of a session — a real way to sit stopped and unheard. Keyed on the error RECORD's identity
+# (_api_error's `uuid`), so a NEW failed attempt is a new event and a still-standing one never re-fires.
+_API_ERR_PREV = [None]   # sid -> error record uuid; None = baseline pending, same policy as the feed diff
+
+
+def _api_error_notifications(now, tmux):
+    """[(title, body, priority, sid)] for every live session that newly stopped on an ON-YOU API error
+    and has NO needs_input card carrying it. Transient errors are excluded on purpose: auto-retry
+    recovers them, and buzzing a phone for something that fixes itself is a false interrupt."""
+    cur = {}
+    for s in _alive_sessions(now, tmux):
+        try:
+            e = _api_error(s["path"])
+        except Exception:
+            continue                                 # per-session isolation: one bad transcript silences nothing else
+        if e and (e.get("tooLong") or e.get("spendLimit") or e.get("modelLimit")):
+            cur[s["sid"]] = (e, s.get("name") or s["sid"][:8])
+    prev = _API_ERR_PREV[0]
+    _API_ERR_PREV[0] = {sid: (e.get("uuid") or e.get("text")) for sid, (e, _n) in cur.items()}
+    if prev is None:
+        return []                                    # baseline: existing state is status, not news
+    out = []
+    for sid, (e, name) in cur.items():
+        if prev.get(sid) == (e.get("uuid") or e.get("text")) or sid in _NOTIFY_BLOCKED_SIDS:
+            continue                                 # unchanged, or its card already said so
+        if _notify_muted(sid):
+            continue
+        what = ("this account hit its monthly spend limit — raise it to continue" if e.get("spendLimit")
+                else "this session's prompt is too long — compact it to continue" if e.get("tooLong")
+                else "this session's model is out of allowance — switch its model or add credits")
+        out.append(("romp: %s" % name, "Stopped: %s" % what, "high", sid))
+    return out
+
+
+# Notifications with NO browser open. The bells ride fresh feed builds, and build_feed only runs inside a
+# push — so closing the last pane silenced every notification, which is precisely when a phone
+# notification is the point (the user 2026-08-09). This covers the gap from the pusher thread, keyed on
+# the SUBSTANTIVE change signal (transcripts, session states, postal, judge generation) rather than
+# _fleet_view_sig, whose 5s time bucket would rebuild the feed on a clock forever on an idle machine.
+_HEADLESS_SIG = [None]
+
+
+def _headless_notify_tick(now, tmux):
+    """Build the feed (and run both detectors) when nothing is connected to do it for us. A no-op while
+    any client is attached — the push path owns the build then, and running both would double-fire."""
+    with _clients_lock:
+        if _clients:
+            _HEADLESS_SIG[0] = None                  # re-arm: the first headless pass after the last pane closes builds
+            return
+    if not tmux:
+        return
+    sig = (json.dumps(_producer_sig(True), sort_keys=True, default=str), _judge_gen[0])
+    if sig == _HEADLESS_SIG[0]:
+        return                                       # nothing moved since the last headless build
+    _HEADLESS_SIG[0] = sig
+    _cached_feed(now, tmux, _fleet_view_sig(now, tmux))   # fires _feed_notifications on a fresh build
 
 
 def _cached_timeline(now, tmux, sig, connect=False):
@@ -16184,6 +16385,15 @@ def _pusher():
         if any_client:
             _push_all()
         # (the WS keepalive lives on its own _heartbeat thread — NOT here — so a slow push can't starve it)
+        try:                                  # the bells must ring with NOTHING connected — that's the point of them
+            _headless_notify_tick(int(time.time()), _tmux_sessions())
+        except Exception:
+            sys.stderr.write("headless-notify: %s\n" % traceback.format_exc())
+        try:                                  # …and for an on-you API error that stopped a session before it had a card
+            for _t, _b, _p, _s in _api_error_notifications(int(time.time()), _tmux_sessions()):
+                _notify(_t, _b, priority=_p, tags="rotating_light", sid=_s)
+        except Exception:
+            sys.stderr.write("api-error-notify: %s\n" % traceback.format_exc())
         try:                                  # Auto Nudge runs server-side even with no browser open (cheap when off)
             _auto_nudge_tick(int(time.time()), _tmux_sessions())
         except Exception:
@@ -19549,7 +19759,12 @@ class Handler(BaseHTTPRequestHandler):
         elif msg and msg.get("type") == "setSessionFlag" and msg.get("id") and msg.get("flag"):
             # timeline lane gear → toggle a per-session view flag (e.g. hideFromFeed). Persisted +
             # re-broadcast so the feed drops/restores that session's cards immediately.
-            _set_session_flag(str(msg["id"]), str(msg["flag"]), bool(msg.get("value")))
+            _flag, _val = str(msg["flag"]), bool(msg.get("value"))
+            if _flag == "notify":
+                # The bell is on by default, so what persists is the MUTE (see _notify_on). Clients keep
+                # sending the positive flag; the inversion lives here, in the one place that writes it.
+                _flag, _val = "notifyOff", not _val
+            _set_session_flag(str(msg["id"]), _flag, _val)
             _mark_views_dirty()
         elif msg and msg.get("type") == "cardNotify" and msg.get("itemId"):
             # feed card right-click → per-card bell (OS notification when THIS card blocks on you /

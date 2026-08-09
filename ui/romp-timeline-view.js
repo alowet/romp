@@ -425,7 +425,7 @@ const LANE_TOGGLES = [
     desc: 'visible to peer sessions, can send and receive their messages; off = fully isolated' },
   { flag: 'notify', label: 'Notifications', icon: bellIcon,
     enabled: (s) => !!s.notify, value: (enable) => enable,
-    desc: 'system notification when its work blocks on you or completes' },
+    desc: 'on by default: a notification when its work blocks on you or completes' },
 ];
 // Model + effort choices come from the kernel's /models — the ONE list shared with the chat statusline picker
 // and the judge-tier settings (the user 2026-07-02: no hardcoded model list per surface). Populated in place

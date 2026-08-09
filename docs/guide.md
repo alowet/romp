@@ -363,6 +363,59 @@ internet and your agents, with no device check in front of it.
     standing between other members and your agents. Either keep the tailnet to
     your own devices, or write an ACL restricting the kernel machine to them.
 
+### Notifications
+
+Romp tells you when a session's work **blocks on you** or **completes**, so you
+can leave the dashboard closed and still find out. This is on by default for
+every session; you do not arm anything first.
+
+Two things get a notification:
+
+- A card entering **needs you** — a permission prompt, a question only you can
+  answer, or a session stopped on something that is yours to fix (a prompt that
+  needs compacting, a spend cap, a model out of allowance). These go out at high
+  priority.
+- A card **completing**, at ordinary priority.
+
+A transient API error does not notify. Romp retries those itself, and buzzing you
+for something that fixes itself is exactly the false interrupt the rest of Romp
+is built to avoid.
+
+The bell on a timeline lane, or in a chat tab's right-click menu, **mutes** one
+session. A single card's bell (right-click the card) speaks over that mute, for
+when one task in a noisy session is the one you care about.
+
+By default the notification appears on the machine the kernel runs on. That is
+the wrong place if the kernel lives on another machine, so Romp will also publish
+every notification to an [ntfy](https://ntfy.sh) topic, which the ntfy phone app
+subscribes to. Create `~/.config/romp/ntfy.json`:
+
+```json
+{
+  "topic": "romp-<something long and random>",
+  "click": "https://<machine>.<tailnet>.ts.net/"
+}
+```
+
+Then subscribe to the same topic in the ntfy app. `click` is optional — it is the
+URL the phone opens when you tap the notification, and `{sid}` in it is replaced
+with the session's id. Two more optional keys: `url`, if you run your own ntfy
+server rather than `ntfy.sh`, and `token`, sent as a bearer credential for a
+protected topic. `ROMP_NTFY_TOPIC`, `ROMP_NTFY_URL`, `ROMP_NTFY_TOKEN` and
+`ROMP_NTFY_CLICK` override the file, for setting this from a service unit.
+
+With no `ntfy.json` and none of those variables set, nothing is published
+anywhere — the local notification is all you get.
+
+!!! warning "The topic name is the password"
+
+    On the public `ntfy.sh` there are no accounts in front of a topic: anyone who
+    knows its name can read everything you publish to it and post to it
+    themselves. Your notifications carry session names and goal titles. So make
+    the topic long and random rather than memorable, keep it out of anything you
+    commit or share, and use a self-hosted server with `token` if the titles
+    themselves are sensitive.
+
 ## Security and trust
 
 Romp drives agents that run tools and shell commands as you, so reaching its API
