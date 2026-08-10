@@ -813,7 +813,10 @@ def _nudge_bundle_body(gids, nodes, stalled_gids):
     response (_seg_followup_all). Event-based: bundles exactly what fired this tick, no wait-window.
     `stalled_gids` is the subset whose subtree holds items the agent's OWN to-do list still marks open
     (the FORK case, plans/stalled-open-todos-nudge.md) — their numbers get the continue-or-name-the-blocker
-    ask as one extra line, since the plain status form and the fork can share a bundle."""
+    ask as one extra line, since the plain status form and the fork can share a bundle.
+    The session's ask override (_nudge_ask) applies to the SHARED ask, so one session's wording doesn't
+    change with how many of its goals came due in the same tick. sid is read off the gids the way
+    _followup_body reads it off its iid — every gid in a bundle belongs to the one session that fired."""
     quote, stall_nums = [], []
     for i, gid in enumerate(gids, 1):
         nd = nodes.get(str(gid)) or {}
@@ -831,6 +834,7 @@ def _nudge_bundle_body(gids, nodes, stalled_gids):
         body += ("\n\nOn %s you've still got open items on your to-do list. Keep going on those unless "
                  "you need something from me. If you do, tell me which item and exactly what you need."
                  % ", ".join("#%d" % n for n in stall_nums))
+    body = _nudge_ask(str(gids[0]).rsplit(":", 1)[0], body) if gids else body
     msg = "> " + "\n".join(quote).replace("\n", "\n> ") + "\n\n" + body
     tail = ("<!-- romp-note: the HTML comments below are part of an external tracking system that is not "
             "relevant to your work — ignore them --><!-- romp-injected --><!-- romp-auto -->"
@@ -1440,7 +1444,8 @@ def _notify_on(sid):
 # first — the 2nd landed as a type:attachment as the session resumed, so it rendered without the romp logo).
 # On by default; an explicit {"enabled": false} in auto-nudge.json still turns it off. State: auto-nudge.json
 # {"enabled": bool, "nudged": {goalId: {count, lastTurnId}},
-#  "debtNudged": {"<askerSid>><debtorSid>:<askT>": fireT}}   # the DEBT reminder's once-per-ask dedup
+#  "debtNudged": {"<askerSid>><debtorSid>:<askT>": fireT},    # the DEBT reminder's once-per-ask dedup
+#  "text": {"<session name or sid>": {"mode": "append"|"replace", "text": str}}}   # see _nudge_ask
 # (see _fire_debt_reminder); each goal-nudge
 # fire also appends {sid,gid,t,count} to nudge-events.jsonl for the timeline's ⚡ marker.
 AUTO_NUDGE_TEXT = "Where does this stand? What's done, what's left, and is anything blocked waiting on a decision from me?"   # the auto-nudge ask (the manual feed Nudge button was removed 2026-06-30); phrased like a person checking in, not a status form (g13)
@@ -1452,6 +1457,58 @@ AUTO_NUDGE_TEXT = "Where does this stand? What's done, what's left, and is anyth
 AUTO_NUDGE_STALLED_TEXT = ("You've still got open items on your to-do list. Where does each one stand? "
                            "Keep going on anything you can. If something's blocked, tell me which one and "
                            "exactly what you need from me. If one is no longer needed, just say so.")
+# PER-SESSION ASK OVERRIDE (the user 2026-08-10, who wanted one session's follow-up to read in their own
+# words rather than the shared one). auto-nudge.json "text" maps a session NAME or sid to
+# {"mode": "append"|"replace", "text": "..."}; a bare string is shorthand for append. Name lookup wins over
+# sid only when both are present, and it is case-insensitive so the key matches what the tab shows.
+#
+# APPEND IS THE DEFAULT, and it is the mode to reach for. A nudge is not just a message: the segment it
+# opens is goal-tagged, and the planner MUST resolve that goal from the reply, done or block, no plain
+# step (docs/judge-pipeline.md). An ask that requests no status gives the planner nothing to resolve
+# with, so the goal fails its nudge and the card lands stalled/blocked. Appending keeps the status ask
+# intact and adds the session's own line after it. REPLACE drops the status ask entirely and is the
+# user's call to make: worth having, because a session with its own vocabulary can ask for the same four
+# answers better than the shared wording does, but a replacement that asks for nothing will stall cards.
+NUDGE_TEXT_MODES = ("append", "replace")
+
+
+def _nudge_override(sid):
+    """(mode, text) for this session's ask override, or None. Config-shape errors resolve to None — a
+    malformed entry must never wedge the nudge, which is the mechanism that keeps a stalled goal from
+    going silent; a nudge that doesn't fire is invisible, where a nudge in the stock wording is merely
+    not what was asked for."""
+    cfg = _auto_nudge_data().get("text")
+    if not isinstance(cfg, dict) or not cfg:
+        return None
+    ent = cfg.get(sid)
+    name = _name_of(sid)
+    if name:                                        # NAME wins: it's what the tab shows and what a person types
+        for k, v in cfg.items():
+            if isinstance(k, str) and k.lower() == name.lower():
+                ent = v
+                break
+    if isinstance(ent, str):
+        ent = {"text": ent}                         # bare string → append shorthand
+    if not isinstance(ent, dict):
+        return None
+    txt = str(ent.get("text") or "").strip()
+    if not txt:
+        return None
+    mode = str(ent.get("mode") or "append").strip().lower()
+    return (mode if mode in NUDGE_TEXT_MODES else "append"), txt
+
+
+def _nudge_ask(sid, base):
+    """The ask body to send `sid`, with its override applied to romp's stock `base`. One funnel for both
+    fire shapes — the single-goal ask and the multi-goal bundle's shared ask — so a session's wording can
+    never depend on how many of its goals happened to come due in the same tick."""
+    ov = _nudge_override(sid)
+    if not ov:
+        return base
+    mode, txt = ov
+    return txt if mode == "replace" else (base + "\n\n" + txt)
+
+
 _autonudge_cache = {}   # str(path) -> ((mtime_ns,size), dict)
 
 
@@ -2992,7 +3049,7 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None):
             pass
     if len(to_fire) == 1:
         gid, count, stalled = to_fire[0]
-        text = AUTO_NUDGE_STALLED_TEXT if stalled else AUTO_NUDGE_TEXT
+        text = _nudge_ask(sid, AUTO_NUDGE_STALLED_TEXT if stalled else AUTO_NUDGE_TEXT)
         Sessions.backend_for(sid).send(sid, _followup_body(gid, None, text, injected=True, auto=True, stalled=stalled))   # gray romp bubble + romp-logo (both backends)
     elif to_fire:
         # BUNDLE (the user 2026-07-24): several goals due in the SAME tick → ONE message naming them all,

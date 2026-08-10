@@ -107,6 +107,31 @@ ghostty --working-directory={dir}   # Linux: Ghostty
 code {dir}                          # VS Code instead
 ```
 
+### Wording the follow-up, per session
+
+When a session stalls, romp asks it where the work stands ([automatic
+nudges](guide.md#automatic-nudges)). One sentence serves every session. To give
+one session its own wording, add a `text` map to
+`${XDG_STATE_HOME:-~/.local/state}/romp/auto-nudge.json`, keyed by the session
+name shown on its tab (case doesn't matter) or by its id:
+
+```json
+{
+  "text": {
+    "web": "Say it in one line if you can.",
+    "api": {"mode": "replace", "text": "Where are we, and what do you need from me?"}
+  }
+}
+```
+
+A bare string is **appended** after romp's ask. `"mode": "replace"` sends yours
+instead. Edits take effect on the next nudge; no restart.
+
+Prefer appending. The reply to a follow-up is what tells romp whether the work
+finished or needs you, so an ask that requests no status leaves nothing to read
+and the card sits stalled. Replace when your own wording asks for the same
+thing better, not to turn the follow-up into something other than a question.
+
 ### Install-time switches
 
 For `./install.sh`:
