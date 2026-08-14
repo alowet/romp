@@ -741,6 +741,53 @@ EFFORT_CHOICES = [{"value": v, "label": v} for v in ("low", "medium", "high", "x
 _MODEL_VALUES = {m["value"] for m in MODEL_CHOICES}
 _EFFORT_VALUES = {e["value"] for e in EFFORT_CHOICES}
 
+# ── The CLI's own extra model option, offered per SESSION (the user 2026-08-13) ───────────────────
+# Claude Code can expose ONE model beyond the Claude ladder — ANTHROPIC_CUSTOM_MODEL_OPTION, with
+# ANTHROPIC_CUSTOM_MODEL_OPTION_NAME as its label — which is how a gateway-routed model reaches the
+# CLI's own picker. A session the SDK starts can already run on it (the CLI resolves the id fine on
+# its non-interactive path); romp just never OFFERED it, because MODEL_CHOICES is a literal. Nothing
+# downstream needed changing: neither the kernel's setModel nor the SDK backend's validates the value.
+#
+# Read from the settings FILE, not os.environ: that env lives in ~/.claude/settings.json, which Claude
+# Code applies to ITSELF at startup, so an SDK-spawned session has it — but the kernel is started by
+# the login service and inherits nothing of the sort (verified: the kernel's environ has no such var).
+# A real env var still wins when one is present, since that is what a session would actually see.
+_CLAUDE_SETTINGS = Path(os.path.expanduser("~/.claude/settings.json"))   # overridable in tests
+
+
+def _custom_model_choice():
+    """The extra {value,label} the custom-model option defines, or None when nothing defines one. The
+    value is the model id the CLI is handed verbatim; the label is only for display, so the picker's
+    current-entry match (which tests the live badge against the VALUE) is unaffected by it. A value that
+    shadows a ladder alias is dropped rather than listed twice."""
+    def pick(src):
+        return (str(src.get("ANTHROPIC_CUSTOM_MODEL_OPTION") or "").strip(),
+                str(src.get("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME") or "").strip())
+    value, label = pick(os.environ)
+    if not value:
+        env = {}
+        for p in (_CLAUDE_SETTINGS, _CLAUDE_SETTINGS.with_name("settings.local.json")):
+            try:                                  # local overrides user, exactly as the CLI merges them
+                d = json.loads(p.read_text())
+            except (OSError, ValueError):
+                continue                          # absent or unparseable → simply no custom option
+            if isinstance(d, dict) and isinstance(d.get("env"), dict):
+                env.update(d["env"])
+        value, label = pick(env)
+    if not value or value in _MODEL_VALUES:
+        return None
+    return {"value": value, "label": label or value}
+
+
+def _session_model_choices():
+    """The models a SESSION picker offers: the Claude ladder plus the custom option when one exists.
+    Deliberately separate from MODEL_CHOICES, which stays the Claude ladder alone — the lane colour ramp
+    ranks off its ORDER and the judge tiers validate against _MODEL_VALUES, and neither should shift
+    because a session-level extra was added (the user 2026-08-13, who wanted the routed model pickable
+    per session while the judges — which run constantly, across every session — stay on Claude)."""
+    extra = _custom_model_choice()
+    return MODEL_CHOICES + [extra] if extra else MODEL_CHOICES
+
 
 def _set_session_color(sid, bg):
     """Override a session's identity color: rewrite the names registry's bg (3rd field) + fg word (4th),
@@ -24805,10 +24852,19 @@ class Handler(BaseHTTPRequestHandler):
                 # each choice carries its colormap tint (the user 2026-08-17: the new-comment dialog's
                 # selectors wear the same colors the statusline badges do, for ANY pick — the badge
                 # colors only cover the current value, so the list is where the shared tint belongs)
+                #
+                # TWO model lists, because the readers want different things (the user 2026-08-13):
+                # `models` stays the Claude ladder and is what the JUDGE-tier dropdowns read — widening
+                # it would offer the judges a value _set_judge_model then silently refuses, and a control
+                # that quietly does nothing is exactly what this repo forbids. `sessionModels` adds the
+                # CLI's custom-model option and is what the per-session pickers read. A client older than
+                # this key simply falls back to `models` and behaves as before.
                 _stops = cm.stops_for(_colormap())
                 return self._send(200, json.dumps(
                     {"models": [dict(c, color=_model_color(c["value"], _stops)) for c in MODEL_CHOICES],
-                     "efforts": [dict(c, color=_effort_color(c["value"], _stops)) for c in EFFORT_CHOICES]}),
+                     "efforts": [dict(c, color=_effort_color(c["value"], _stops)) for c in EFFORT_CHOICES],
+                     "sessionModels": [dict(c, color=_model_color(c["value"], _stops))
+                                       for c in _session_model_choices()]}),
                     "application/json", cache="no-cache")
             if p == "/usage":                                 # the /usage rate-limit bars, re-read on demand: the rail's
                 # usage widget is click-to-refresh (the user 2026-06-30). Returns the freshest on-disk snapshot

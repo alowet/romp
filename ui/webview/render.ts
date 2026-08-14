@@ -8517,7 +8517,10 @@ interface MetaChoice { label: string; value: string; sub?: string; sdkOnly?: boo
 const MODEL_CHOICES: { label: string; value: string; color?: number[] | null }[] = [];
 const EFFORT_CHOICES: { label: string; value: string; color?: number[] | null }[] = [];
 fetch(kernelUrl("/models"), { cache: "no-store" }).then((r) => r.json()).then((d) => {
-  if (Array.isArray(d.models)) { MODEL_CHOICES.length = 0; MODEL_CHOICES.push(...d.models, { label: "Default", value: "default" }); }
+  // sessionModels = the ladder PLUS the CLI's custom-model option; `models` (the judge-tier list, which
+  // must stay Claude-only) is the fallback for a kernel that predates the key (the user 2026-08-13).
+  const ms = Array.isArray(d.sessionModels) ? d.sessionModels : d.models;
+  if (Array.isArray(ms)) { MODEL_CHOICES.length = 0; MODEL_CHOICES.push(...ms, { label: "Default", value: "default" }); }
   if (Array.isArray(d.efforts)) { EFFORT_CHOICES.length = 0; EFFORT_CHOICES.push(...d.efforts); }
 }).catch(() => { /* picker stays empty until it lands */ });
 // Permission mode. A tmux session has no slash command for it — the host cycles shift+tab the right

@@ -513,7 +513,10 @@ const MODEL_CHOICES = [];
 const EFFORT_CHOICES = [];
 try {
   if (typeof fetch !== 'undefined') fetch('/models', { cache: 'no-store' }).then((r) => r.json()).then((d) => {
-    if (Array.isArray(d.models)) { MODEL_CHOICES.length = 0; for (const m of d.models) MODEL_CHOICES.push(m); MODEL_CHOICES.push({ label: 'Default', value: 'default' }); }
+    // sessionModels = the ladder PLUS the CLI's custom-model option; `models` (judge-tier, Claude-only)
+    // is the fallback for a kernel that predates the key (the user 2026-08-13).
+    const ms = Array.isArray(d.sessionModels) ? d.sessionModels : d.models;
+    if (Array.isArray(ms)) { MODEL_CHOICES.length = 0; for (const m of ms) MODEL_CHOICES.push(m); MODEL_CHOICES.push({ label: 'Default', value: 'default' }); }
     if (Array.isArray(d.efforts)) { EFFORT_CHOICES.length = 0; for (const e of d.efforts) EFFORT_CHOICES.push(e); }
   }).catch(() => {});
 } catch (e) {}
