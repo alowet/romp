@@ -13546,6 +13546,121 @@ def _set_fast_or_park(be, sid, value):
     return be.set_fast(sid, value)
 
 
+# ── A safeguards downgrade is undone at the next idle (the user 2026-08-13) ──────────────────────
+# Claude Code's safeguards can flag a prompt mid-session and silently retry the turn on a fallback
+# model. The swap's own record says `scope: "session"`, and it means it: EVERY later turn stays on
+# the fallback until somebody picks the model back by hand. On a session nobody is watching that is
+# invisible for hours — and the unattended ones are exactly the sessions this costs the most, since
+# the whole point of leaving them running is not having to look. So romp picks it back itself.
+#
+# Event-based end to end, no timers. The swap is the CLI's OWN record (system/model_refusal_fallback,
+# already an atom in the event model — its authoritative account of what happened, not a guess from
+# reading model names off replies), and "the next idle" is the same quiet gate the parked-op queue
+# drains on, re-checked each push — which the turn-end hook pokes, so the pick lands as the session
+# settles rather than waiting out a poll.
+#
+# ONE restore per turn (the user 2026-08-13). The key is the fallback turn's id, so a turn flagged
+# several times is answered once, not once per flag. ACROSS turns it never gives up: a re-flag on the
+# next turn is a new turn id and earns its own restore. Two guards keep it off a model the user chose
+# — it fires only while the session is STILL sitting on the exact model the swap moved it to, so a
+# manual pick in between (back to the original, or anywhere else) retires the restore by failing that
+# check; and a switch already in flight is left to resolve.
+_model_restored = {}      # {sid: turn_id} — the downgrade turn already answered. In memory, like _auto_retried:
+                          # a kernel restart re-arms, which is right — a session still parked on the fallback
+                          # model after a restart genuinely does still want putting back.
+
+
+def _model_family_alias(model_id):
+    """The MODEL_CHOICES alias a raw model id belongs to ('claude-fable-5' → 'fable'), or '' when it
+    names no known family. Same claude-<family>-… split _alias_reflects uses, kept to the four values
+    the picker offers so an unrecognised id can never be handed to set_model as a model name."""
+    m = (model_id or "").lower()
+    fam = m.split("-")[1] if m.startswith("claude-") and "-" in m else m
+    return fam if fam in _MODEL_VALUES else ""
+
+
+_newest_swap_cache = {}       # {path: ((mtime, size), (turn_id, back_alias, onto_alias) | None)}
+
+
+def _newest_downgrade(path, session):
+    """The transcript's most recent safeguards swap as (turn_id, back_alias, onto_alias), or None —
+    where `back` is the family to return to and `onto` the family it was moved to. CACHED by the
+    transcript's (mtime, size), like _api_error: the scan walks atoms newest-first and stops at the
+    first swap, but a session that has never been flagged (the overwhelmingly common case) has no
+    such stopping point and would be walked end to end on every push. Unrecognised or same-family
+    pairings resolve to None here rather than at the caller, so a model name romp doesn't know can
+    never reach set_model."""
+    try:
+        st = os.stat(path)
+        key = (st.st_mtime, st.st_size)
+    except OSError:
+        key = None
+    hit = _newest_swap_cache.get(path)
+    if hit is not None and key is not None and hit[0] == key:
+        return hit[1]
+    found, seen = None, False
+    for turn in reversed(session.get("turns") or []):
+        for a in reversed(turn.get("atoms") or []):
+            if a.get("type") == "system" and a.get("subtype") == "model_refusal_fallback":
+                back = _model_family_alias(a.get("fallback_from"))
+                onto = _model_family_alias(a.get("fallback_to"))
+                if back and onto and back != onto:
+                    found = (turn.get("id"), back, onto)
+                seen = True              # the NEWEST swap decides, even when it's a pairing we can't act
+                break                    # on — an older one it superseded must never be resurrected
+        if seen:
+            break
+    if key is not None:
+        if len(_newest_swap_cache) > 256:
+            _newest_swap_cache.clear()
+        _newest_swap_cache[path] = (key, found)
+    return found
+
+
+def _downgrade_in_force(path, session, live_model):
+    """The session's most recent safeguards downgrade that is STILL in force, as (turn_id, alias): the
+    turn the swap happened on, and the alias to put the session back on. None when the transcript
+    carries no such swap, or when the session has since moved OFF the model the swap moved it to —
+    picked back by hand, or moved somewhere else entirely. Either way that is a live human decision
+    and not ours to overrule, so only the LATEST swap counts and a stale one is dropped."""
+    newest = _newest_downgrade(path, session)
+    if not newest:
+        return None
+    turn_id, back, onto = newest
+    if not _alias_reflects(live_model, onto):
+        return None                      # no longer on the fallback → the swap is already undone
+    return (turn_id, back)
+
+
+def _auto_restore_model_tick(now, tmux):
+    """Put a session the safeguards bumped off its model back onto it, at the next idle. Runs every
+    push and is cheap when there is nothing to undo: a cached parse plus a dict lookup per session,
+    and the transcript scan stops at the newest swap."""
+    for s in _alive_sessions(now, tmux):
+        sid = str(s.get("sid") or "")
+        path = s.get("path")
+        session = _parse_cached(path) if path else None
+        if not sid or not session:
+            continue                     # no cached parse yet → next push, once the build has warmed it
+        tm = tmux.get(sid) or {}
+        hit = _downgrade_in_force(path, session, tm.get("model") or "")
+        if not hit:
+            _model_restored.pop(sid, None)   # back on its own model → re-arm for the next swap
+            continue
+        turn_id, back = hit
+        if _model_restored.get(sid) == turn_id:
+            continue                     # this turn's swap is already answered — one try per turn
+        if _working_now(sid) or _compacting_now(sid) or _clearing_now(sid):
+            continue                     # mid-turn: the pick waits for idle, it does not land in a live turn
+        if _model_pending_now(sid, tm):
+            continue                     # a switch is already in flight (ours or a click) — let it resolve
+        _model_restored[sid] = turn_id
+        _set_model_or_park(Sessions.backend_for(sid), sid, back)
+        sys.stderr.write("model-restore: %s — safeguards moved it to %s, put back on %s at idle\n"
+                         % (sid, tm.get("model") or "?", back))
+        _push_soon()
+
+
 def _deliver_send_batch(be, sid, run):
     """Deliver a run of consecutive parked ('send', text, echo) ops AT ONCE (the user 2026-07-17: a pile of
     queued messages should all go in together, not one turn each). A backend that forwards its own sends
@@ -21119,6 +21234,10 @@ def _pusher_cycle_jobs(now, tmux, any_client):
         _auto_resume_session_retry(now, tmux)
     except Exception:
         sys.stderr.write("auto-resume-session-retry: %s\n" % traceback.format_exc())
+    try:                                  # a safeguards swap off the session's model is picked back at its next idle
+        _auto_restore_model_tick(now, tmux)
+    except Exception:
+        sys.stderr.write("model-restore: %s\n" % traceback.format_exc())
     try:                                  # the kernel drives the transient-api-error retry itself (unattended;
         _auto_retry_tick(now, tmux)       # the dashboard tick is just the countdown + a redundant asker)
     except Exception:
