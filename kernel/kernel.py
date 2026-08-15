@@ -13607,14 +13607,36 @@ def _set_fast_or_park(be, sid, value):
 # settles rather than waiting out a poll.
 #
 # ONE restore per turn (the user 2026-08-13). The key is the fallback turn's id, so a turn flagged
-# several times is answered once, not once per flag. ACROSS turns it never gives up: a re-flag on the
-# next turn is a new turn id and earns its own restore. Two guards keep it off a model the user chose
+# several times is answered once, not once per flag. Two guards keep it off a model the user chose
 # — it fires only while the session is STILL sitting on the exact model the swap moved it to, so a
 # manual pick in between (back to the original, or anywhere else) retires the restore by failing that
 # check; and a switch already in flight is left to resolve.
+#
+# And a BUDGET across turns (the user 2026-08-15). Restoring forever was the original design, on the
+# reasoning that a re-flag is a new turn and deserves a new answer. But a session that keeps getting
+# flagged is a session whose work keeps tripping the safeguards, and putting it straight back on the
+# model that just got flagged simply feeds the next flag — repeatedly, unattended, all night. That is
+# the shape that risks an account-level lockout, which costs far more than a session sitting on a
+# fallback model. So each session gets _MODEL_RESTORE_BUDGET restores; after that romp stands down
+# and leaves it on the fallback, and says so once (stderr + a notification), because a silent stand-
+# down would recreate the invisibility this whole mechanism exists to fix.
+#
+# The budget refills on exactly one event: the session leaving the fallback WHILE romp is stood down.
+# romp is not touching the model then, so that move is a human's, and a human at the wheel earns the
+# session a fresh set. The stand-down has to be LATCHED for that to be readable — "off the fallback"
+# on its own is also what a restore landing looks like, so testing the model alone would refill the
+# budget the moment the fifth restore worked. Nothing else refills it: not a clean turn (a session
+# alternating flag/clean would then never exhaust it), not the passage of time.
+_MODEL_RESTORE_BUDGET = 5     # restores per session before romp stops trying
 _model_restored = {}      # {sid: turn_id} — the downgrade turn already answered. In memory, like _auto_retried:
                           # a kernel restart re-arms, which is right — a session still parked on the fallback
                           # model after a restart genuinely does still want putting back.
+_model_restore_spent = {}  # {sid: n} — restores already spent against the budget. In memory for the same
+                           # reason, and with the same consequence: a kernel restart hands the session a
+                           # fresh budget. Restarts are deliberate and rare, so that is a reset a human
+                           # asked for; it is not a way for an unattended session to loop forever.
+_model_stood_down = {}     # {sid: True} — budget spent AND a swap left standing: romp has declined to act
+                           # and said so once. Cleared by the human pick that refills the budget.
 
 
 def _model_family_alias(model_id):
@@ -13679,10 +13701,28 @@ def _downgrade_in_force(path, session, live_model):
     return (turn_id, back)
 
 
+def _stand_down_on_restores(sid, back, live):
+    """Say, ONCE, that romp has spent this session's restore budget and is leaving it on the fallback.
+    Standing down quietly would put the session back exactly where the restore was built to rescue it
+    from — parked on a model nobody chose, with nobody aware — so the stand-down goes out on the same
+    transports as every other thing worth looking at, and the session's own bell still governs it."""
+    sys.stderr.write("model-restore: %s — %d restores spent, standing down; it stays on %s until a "
+                     "model is picked by hand\n" % (sid, _MODEL_RESTORE_BUDGET, live or "the fallback"))
+    if _notify_muted(sid):
+        return
+    label = next((m["label"] for m in MODEL_CHOICES if m["value"] == back), back)
+    _notify("romp: %s" % (_name_of(sid) or sid[:8]),
+            "Safeguards keep moving this off %s — put back %d times already, so romp has stopped "
+            "trying. It's on %s now; pick a model to hand it a fresh set."
+            % (label, _MODEL_RESTORE_BUDGET, live or "a fallback model"),
+            priority="high", tags="warning", sid=sid)
+
+
 def _auto_restore_model_tick(now, tmux):
-    """Put a session the safeguards bumped off its model back onto it, at the next idle. Runs every
-    push and is cheap when there is nothing to undo: a cached parse plus a dict lookup per session,
-    and the transcript scan stops at the newest swap."""
+    """Put a session the safeguards bumped off its model back onto it, at the next idle — up to
+    _MODEL_RESTORE_BUDGET times, after which romp stands down and says so. Runs every push and is
+    cheap when there is nothing to undo: a cached parse plus a dict lookup per session, and the
+    transcript scan stops at the newest swap."""
     for s in _alive_sessions(now, tmux):
         sid = str(s.get("sid") or "")
         path = s.get("path")
@@ -13693,18 +13733,27 @@ def _auto_restore_model_tick(now, tmux):
         hit = _downgrade_in_force(path, session, tm.get("model") or "")
         if not hit:
             _model_restored.pop(sid, None)   # back on its own model → re-arm for the next swap
-            continue
+            if _model_stood_down.pop(sid, None):
+                _model_restore_spent.pop(sid, None)   # stood down, and it moved off the fallback anyway →
+            continue                                  # a human did that, so hand it a fresh budget
         turn_id, back = hit
         if _model_restored.get(sid) == turn_id:
             continue                     # this turn's swap is already answered — one try per turn
+        spent = _model_restore_spent.get(sid, 0)
+        if spent >= _MODEL_RESTORE_BUDGET:
+            if not _model_stood_down.get(sid):
+                _model_stood_down[sid] = True         # the budget is spent and a swap is standing: this is
+                _stand_down_on_restores(sid, back, tm.get("model") or "")   # the moment it's genuinely
+            continue                                                        # stuck, so say so — once
         if _working_now(sid) or _compacting_now(sid) or _clearing_now(sid):
             continue                     # mid-turn: the pick waits for idle, it does not land in a live turn
         if _model_pending_now(sid, tm):
             continue                     # a switch is already in flight (ours or a click) — let it resolve
         _model_restored[sid] = turn_id
+        _model_restore_spent[sid] = spent + 1
         _set_model_or_park(Sessions.backend_for(sid), sid, back)
-        sys.stderr.write("model-restore: %s — safeguards moved it to %s, put back on %s at idle\n"
-                         % (sid, tm.get("model") or "?", back))
+        sys.stderr.write("model-restore: %s — safeguards moved it to %s, put back on %s at idle (%d/%d)\n"
+                         % (sid, tm.get("model") or "?", back, spent + 1, _MODEL_RESTORE_BUDGET))
         _push_soon()
 
 
