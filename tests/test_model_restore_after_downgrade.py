@@ -7,6 +7,10 @@ on an unattended session nobody does, for hours. romp now undoes it itself: the 
 already carries (system/model_refusal_fallback) arms a restore, and the restore fires when the session
 goes quiet, ONE per flagged turn, never into a live turn and never over a model the user chose.
 
+Budgeted, though (the user 2026-08-15): a session flagged over and over is fed straight back into the
+safeguards by an unconditional restore, so after _MODEL_RESTORE_BUDGET of them romp stands down, says
+so once, and waits for a human pick before it will try again.
+
 SYNTHETIC only: placeholder uuids, invented notes-api prompts, temp dirs.
 """
 import json
@@ -153,12 +157,19 @@ class _FakeBackend:
         return None
 
 
-class TheRestoreFiresAtIdleOncePerTurn(unittest.TestCase):
+class _RestoreTickHarness(unittest.TestCase):
+    """One idle session running off a synthetic transcript, with every surface the tick touches
+    stubbed — including the notifier, so a test run can never fire a real desktop/phone alert."""
+
     def setUp(self):
         self.be = _FakeBackend()
+        self.notified = []
         self._saved = (km._alive_sessions, km._parse_cached, km._working_now, km._compacting_now,
                        km._clearing_now, km._model_pending_now, km.Sessions.backend_for,
-                       km._push_soon, km._push_all, km._mark_views_dirty)
+                       km._push_soon, km._push_all, km._mark_views_dirty,
+                       km._notify, km._notify_muted)
+        km._notify = lambda title, body, **kw: self.notified.append((title, body))
+        km._notify_muted = lambda sid, item_id="": False
         self.path = str(Path(tempfile.mkdtemp()) / (SID + ".jsonl"))
         km._alive_sessions = lambda now, tmux: [{"sid": SID, "path": self.path}]
         km._working_now = lambda sid: False
@@ -170,6 +181,8 @@ class TheRestoreFiresAtIdleOncePerTurn(unittest.TestCase):
         km._push_all = lambda: None
         km._mark_views_dirty = lambda: None
         km._model_restored.clear()
+        km._model_restore_spent.clear()
+        km._model_stood_down.clear()
         km._pending_ops.clear()
         km._model_switch_pending.clear()
         km._newest_swap_cache.clear()
@@ -177,8 +190,11 @@ class TheRestoreFiresAtIdleOncePerTurn(unittest.TestCase):
     def tearDown(self):
         (km._alive_sessions, km._parse_cached, km._working_now, km._compacting_now,
          km._clearing_now, km._model_pending_now, km.Sessions.backend_for,
-         km._push_soon, km._push_all, km._mark_views_dirty) = self._saved
+         km._push_soon, km._push_all, km._mark_views_dirty,
+         km._notify, km._notify_muted) = self._saved
         km._model_restored.clear()
+        km._model_restore_spent.clear()
+        km._model_stood_down.clear()
         km._pending_ops.clear()
         km._model_switch_pending.clear()
         km._newest_swap_cache.clear()
@@ -190,6 +206,8 @@ class TheRestoreFiresAtIdleOncePerTurn(unittest.TestCase):
         return {SID: {"state": "idle", "since": NOW - 100, "model": live_model, "effort": "",
                       "context": None, "compactPct": None, "color": None}}
 
+
+class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
     def test_an_idle_downgraded_session_is_put_back(self):
         tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
         km._auto_restore_model_tick(NOW, tmux)
@@ -220,7 +238,7 @@ class TheRestoreFiresAtIdleOncePerTurn(unittest.TestCase):
                          "Opus 4.8")
         km._auto_restore_model_tick(NOW, tmux)
         self.assertEqual(self.be.calls, [(SID, "fable"), (SID, "fable")],
-                         "it never gives up across turns — a new flag is a new turn and earns a new restore")
+                         "across turns a new flag is a new turn and earns its own restore (up to the budget)")
 
     def test_it_never_fires_into_a_live_turn(self):
         tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
@@ -255,6 +273,73 @@ class TheRestoreFiresAtIdleOncePerTurn(unittest.TestCase):
         km._parse_cached = lambda path: None
         km._auto_restore_model_tick(NOW, {SID: {"model": "Opus 4.8"}})
         self.assertEqual(self.be.calls, [], "no cached parse yet → wait for one, never act on a guess")
+
+
+class TheRestoreBudgetStopsItLoopingForever(_RestoreTickHarness):
+    """A session that keeps getting flagged is not helped by being put straight back on the model that
+    keeps getting flagged — that just feeds the next flag, unattended, indefinitely, which is the shape
+    that risks an account-level lockout (the user 2026-08-15). So the restores are budgeted, romp stands
+    down when the budget runs out, and it says so rather than leaving the session quietly parked."""
+
+    def setUp(self):
+        super().setUp()
+        self.recs = []
+
+    def _flag_again(self, n, frm="claude-fable-5", live="Opus 4.8"):
+        """Append one more flagged turn to the transcript this session is running on, and push once."""
+        self.recs += flagged_turn(n, T0 + 100 * n, frm=frm)
+        km._auto_restore_model_tick(NOW, self._arm(list(self.recs), live))
+
+    def _budget(self):
+        return km._MODEL_RESTORE_BUDGET
+
+    def test_it_stops_after_the_budget_and_says_so_exactly_once(self):
+        for n in range(1, self._budget() + 1):
+            self._flag_again(n)
+        self.assertEqual(len(self.be.calls), self._budget(), "every restore inside the budget lands")
+        self.assertEqual(self.notified, [], "nothing is stuck yet — it has been put back every time")
+
+        self._flag_again(self._budget() + 1)
+        self.assertEqual(len(self.be.calls), self._budget(),
+                         "the budget is spent — this flag is left standing rather than fed again")
+        self.assertEqual(len(self.notified), 1,
+                         "…and it is announced, because the session is now parked where nobody put it")
+
+        for n in range(self._budget() + 2, self._budget() + 5):
+            self._flag_again(n)
+            km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Opus 4.8"))   # and idle pushes
+        self.assertEqual(len(self.be.calls), self._budget(), "stood down stays stood down")
+        self.assertEqual(len(self.notified), 1, "one stand-down notice, not one per flag or per push")
+
+    def test_a_restore_that_lands_is_not_mistaken_for_a_hand_pick(self):
+        for n in range(1, self._budget() + 1):
+            self._flag_again(n)
+            # the pick lands — the session sits on its own model until the next flag
+            km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Fable 5"))
+        self._flag_again(self._budget() + 1)
+        self.assertEqual(len(self.be.calls), self._budget(),
+                         "leaving the fallback because the restore WORKED must not refill the budget")
+
+    def test_clean_turns_in_between_do_not_refill_the_budget(self):
+        for n in range(1, self._budget() + 1):
+            self._flag_again(n)
+            self.recs += clean_turn(50 + n, T0 + 100 * n + 50)
+            km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Fable 5"))
+        self._flag_again(self._budget() + 1)
+        self.assertEqual(len(self.be.calls), self._budget(),
+                         "work going well in between is not a reason to start the count over")
+
+    def test_a_hand_pick_while_stood_down_hands_it_a_fresh_budget(self):
+        for n in range(1, self._budget() + 2):
+            self._flag_again(n)
+        self.assertEqual(len(self.notified), 1, "stood down, and the user has been told")
+
+        # the user picks a model themselves: romp is not touching it, so this move is theirs
+        km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Sonnet 5"))
+        self._flag_again(self._budget() + 2, frm="claude-sonnet-5")
+        self.assertEqual(len(self.be.calls), self._budget() + 1,
+                         "a human back at the wheel earns the session a fresh set of restores")
+        self.assertEqual(self.be.calls[-1], (SID, "sonnet"), "and it goes back to what THEY picked")
 
 
 if __name__ == "__main__":
