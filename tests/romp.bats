@@ -1091,7 +1091,7 @@ PY
     [ "$(grep -c 'tmux new-session' "$MOCK_LOG")" -eq 0 ]
 }
 
-@test "new --model/--effort: ride /new VERBATIM (full ids, no alias munging) and report what was applied" {
+@test "new --model/--effort/--fast: ride /new VERBATIM (full ids, no alias munging) and report what was applied" {
     command -v python3 >/dev/null 2>&1 || skip "python3 not available"
     touch "$MOCK_LOG"
     mkdir -p "$XDG_STATE_HOME/romp"
@@ -1107,7 +1107,8 @@ class H(BaseHTTPRequestHandler):
         with open(log, "w") as f:
             json.dump({"path": self.path, "body": body}, f)
         out = json.dumps({"ok": True, "id": "11111111-2222-3333-4444-555555555555",
-                          "model": body.get("model"), "effort": body.get("effort")}).encode()
+                          "model": body.get("model"), "effort": body.get("effort"),
+                          "fast": body.get("fast")}).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out))); self.end_headers()
         self.wfile.write(out)
@@ -1119,16 +1120,17 @@ srv.handle_request()
 PY
     local srv=$!
     until [ -s "$TEST_DIR/port" ]; do sleep 0.05; done
-    ROMP_KERNEL_PORT="$(cat "$TEST_DIR/port")" run run_romp new --model claude-fable-5 --effort ultracode opt
+    ROMP_KERNEL_PORT="$(cat "$TEST_DIR/port")" run run_romp new --model claude-fable-5 --effort ultracode --fast on opt
     kill "$srv" 2>/dev/null || true
     [ "$status" -eq 0 ]
     grep -q '"model": "claude-fable-5"' "$TEST_DIR/req.log"
     grep -q '"effort": "ultracode"' "$TEST_DIR/req.log"
-    [[ "$output" == *"applied model claude-fable-5, effort ultracode"* ]]
+    grep -q '"fast": "on"' "$TEST_DIR/req.log"
+    [[ "$output" == *"applied model claude-fable-5, effort ultracode, fast on"* ]]
     [ "$(grep -c 'tmux new-session' "$MOCK_LOG")" -eq 0 ]
 }
 
-@test "new --model/--effort: a kernel that does NOT ack them warns loudly (no silent divergence)" {
+@test "new --model/--effort/--fast: a kernel that does NOT ack them warns loudly (no silent divergence)" {
     command -v python3 >/dev/null 2>&1 || skip "python3 not available"
     touch "$MOCK_LOG"
     mkdir -p "$XDG_STATE_HOME/romp"
@@ -1156,20 +1158,40 @@ PY
     ROMP_KERNEL_PORT="$(cat "$TEST_DIR/port")" run run_romp new --model claude-fable-5 opt
     kill "$srv" 2>/dev/null || true
     [ "$status" -eq 0 ]
-    [[ "$output" == *"did not acknowledge --model/--effort"* ]]
+    [[ "$output" == *"did not acknowledge --model/--effort/--fast"* ]]
 }
 
 @test "new --model with -t refuses loudly (SDK-only flags), and starts nothing" {
     touch "$MOCK_LOG"
     run run_romp new -t --model claude-fable-5 x
     [ "$status" -eq 2 ]
-    [[ "$output" == *"--model/--effort need the default (SDK) session"* ]]
+    [[ "$output" == *"--model/--effort/--fast need the default (SDK) session"* ]]
     [ "$(grep -c 'tmux new-session' "$MOCK_LOG")" -eq 0 ]
 }
 
-@test "new: help names --model and --effort (the nightly optimizer's presence guard greps help)" {
+@test "new --fast: only on|off, and a bad value starts nothing" {
+    touch "$MOCK_LOG"
+    run run_romp new --fast yes x
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--fast takes on or off"* ]]
+    run run_romp new --fast x
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--fast takes on or off"* ]]
+    [ "$(grep -c 'tmux new-session' "$MOCK_LOG")" -eq 0 ]
+}
+
+@test "new --fast with -t refuses loudly (SDK-only flag), and starts nothing" {
+    touch "$MOCK_LOG"
+    run run_romp new -t --fast on x
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--model/--effort/--fast need the default (SDK) session"* ]]
+    [ "$(grep -c 'tmux new-session' "$MOCK_LOG")" -eq 0 ]
+}
+
+@test "new: help names --model, --effort and --fast (the nightly optimizer's presence guard greps help)" {
     run run_romp -h
     [ "$status" -eq 0 ]
     [[ "$output" == *"--model <id>"* ]]
     [[ "$output" == *"--effort <level>"* ]]
+    [[ "$output" == *"--fast on|off"* ]]
 }

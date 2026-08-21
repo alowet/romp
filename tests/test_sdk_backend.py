@@ -1293,6 +1293,25 @@ class RememberedDefaults(unittest.TestCase):
         sb.write_sdk_default(self.d, mode="bypassPermissions")
         self.assertEqual(sb.read_reg(self.d, self.be.spawn("a", self.d))["mode"], "bypassPermissions")
 
+    def test_a_hand_written_fast_default_is_honoured_and_rides_the_first_connect(self):
+        # Same shape as the bypass carve-out above: set_fast declines to REMEMBER a click, but a `fast`
+        # written into sdk-defaults.json on purpose still seeds (the user 2026-08-21, who wants every
+        # new session on fast). The point of seeding it at SPAWN is the connect: fast_opt reads straight
+        # off this reg, and _options turns it into the fastMode flag-settings key — so the FIRST connect
+        # already carries it. Asking for it after connect instead costs a teardown+relaunch of a CLI
+        # that just came up, which is what made a fast-on launch look hung.
+        sb.write_sdk_default(self.d, fast=True)
+        reg = sb.read_reg(self.d, self.be.spawn("a", self.d))
+        self.assertTrue(reg.get("fast"), "the ask is in the reg BEFORE anything connects")
+        self.assertTrue(sb.SdkSession(self.be, reg).fast_opt,
+                        "so the session the first connect builds is already opted in")
+        self.assertEqual(json.load(open(sb.flag_settings_path(self.d, reg["sid"], fast=True))),
+                         {"fastMode": True}, "and _options writes the CLI's opt-in key")
+
+    def test_no_fast_default_leaves_new_sessions_plain(self):
+        self.assertNotIn("fast", sb.read_reg(self.d, self.be.spawn("a", self.d)),
+                         "fast is opt-in: an unset default must never turn it on")
+
     def test_remembering_mode_does_not_clobber_model_or_effort(self):
         s1 = self.be.spawn("a", self.d)
         self.be.set_effort(s1, "low"); self.be.set_model(s1, "opus"); self.be.set_mode(s1, "plan")
@@ -2018,6 +2037,16 @@ class OptionsAssembly(unittest.TestCase):
         sess.fast_opt = True
         opts = be._options(sess, _sdk.ClaudeAgentOptions)
         self.assertTrue(opts.settings, "fast mode needs a flag-settings file to opt in through")
+        with open(opts.settings) as f:
+            self.assertEqual(json.load(f), {"fastMode": True})
+
+    def test_a_seeded_fast_default_reaches_the_options_of_the_first_connect(self):
+        # End to end through the real seam: sdk-defaults → spawn's reg → SdkSession → _options. No
+        # set_fast call anywhere, so nothing reconnects; the launch itself is the fast-mode launch.
+        sb.write_sdk_default(self.d, fast=True)
+        be = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None)
+        sess = sb.SdkSession(be, sb.read_reg(self.d, be.spawn("a", self.d)))
+        opts = be._options(sess, _sdk.ClaudeAgentOptions)
         with open(opts.settings) as f:
             self.assertEqual(json.load(f), {"fastMode": True})
 

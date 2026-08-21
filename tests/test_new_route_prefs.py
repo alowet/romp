@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""POST /new's per-spawn model/effort (the user 2026-08-14): applied via the park-aware setters on
-CREATE and on the idempotent existing:true open (a nightly re-brief re-asserts them), echoed in the
-response so a caller can be loud when ignored; absent keys touch nothing.
+"""POST /new's per-spawn model/effort/fast (the user 2026-08-14; fast 2026-08-21): applied via the
+park-aware setters on CREATE and on the idempotent existing:true open (a nightly re-brief re-asserts
+them), echoed in the response so a caller can be loud when ignored; absent keys touch nothing.
 
 Drives the REAL Handler over HTTP (the test_kernel_ws_auth.py pattern). Synthetic only — placeholder
 UUIDs, temp dirs, no session state touched (the setters are recorded, never executed).
@@ -47,17 +47,18 @@ class NewRoutePrefs(unittest.TestCase):
     def setUp(self):
         self.calls = []
         self._saved = (km._live_names, km._tmux_sessions, km._set_model_or_park,
-                       km._set_effort_or_park, km.Sessions.backend_for,
+                       km._set_effort_or_park, km._set_fast_or_park, km.Sessions.backend_for,
                        km._sdk_ready, km._create_sdk_session, km._push_soon)
         km._tmux_sessions = lambda: []
         km._set_model_or_park = lambda be, sid, v: self.calls.append(("model", sid, v))
         km._set_effort_or_park = lambda be, sid, v: self.calls.append(("effort", sid, v))
+        km._set_fast_or_park = lambda be, sid, v: self.calls.append(("fast", sid, v))
         km.Sessions.backend_for = staticmethod(lambda sid: object())
         km._push_soon = lambda: None
 
     def tearDown(self):
         (km._live_names, km._tmux_sessions, km._set_model_or_park,
-         km._set_effort_or_park, km.Sessions.backend_for,
+         km._set_effort_or_park, km._set_fast_or_park, km.Sessions.backend_for,
          km._sdk_ready, km._create_sdk_session, km._push_soon) = self._saved
 
     def _post(self, body):
@@ -79,12 +80,41 @@ class NewRoutePrefs(unittest.TestCase):
         self.assertIn(("model", SID, "claude-fable-5"), self.calls)
         self.assertIn(("effort", SID, "ultracode"), self.calls)
 
+    def test_fresh_sdk_create_pins_fast_before_connect(self):
+        """The whole point of routing fast through here: the pin lands between spawn and connect, so
+        the FIRST connect carries the fastMode flag and nothing has to reconnect a just-connected CLI."""
+        km._live_names = lambda *_: {}
+        km._sdk_ready = lambda: True
+        km._create_sdk_session = (lambda nm, cwd, auth="", prefs=None:
+                                  (SID2, km._apply_new_session_prefs(SID2, prefs or {})))
+        r = self._post({"name": "opt", "dir": self.dir, "model": "claude-opus-5", "fast": "on"})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r.get("fast"), "on")
+        self.assertEqual(r.get("model"), "claude-opus-5")
+        self.assertIn(("fast", SID2, "on"), self.calls)
+
+    def test_existing_open_reasserts_fast(self):
+        km._live_names = lambda *_: {"opt": SID}
+        r = self._post({"name": "opt", "dir": self.dir, "fast": "off"})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r.get("fast"), "off")
+        self.assertEqual(self.calls, [("fast", SID, "off")])
+
+    def test_unrecognised_fast_value_is_ignored_not_echoed(self):
+        """A typo must not read as applied — no setter call, no echo (the caller sees the omission)."""
+        km._live_names = lambda *_: {"opt": SID}
+        r = self._post({"name": "opt", "dir": self.dir, "fast": "yes"})
+        self.assertTrue(r["ok"])
+        self.assertNotIn("fast", r)
+        self.assertEqual(self.calls, [])
+
     def test_existing_open_without_prefs_touches_nothing(self):
         km._live_names = lambda *_: {"opt": SID}
         r = self._post({"name": "opt", "dir": self.dir})
         self.assertTrue(r["ok"])
         self.assertNotIn("model", r)
         self.assertNotIn("effort", r)
+        self.assertNotIn("fast", r)
         self.assertEqual(self.calls, [])
 
     def test_fresh_sdk_create_applies_both_and_echoes_them(self):

@@ -1143,8 +1143,10 @@ def _defaults_path(state_dir: Path) -> Path:
 
 
 def read_sdk_defaults(state_dir: Path) -> dict:
-    """{'model': <alias|'default'>, 'effort': <level>, 'mode': <permission mode>} — whatever the user last
-    picked on any session, seeded into the next new session by spawn(); {} if never set."""
+    """{'model': <alias|'default'>, 'effort': <level>, 'mode': <permission mode>, 'auth': <login|key>,
+    'fast': <bool>} — whatever the user last picked on any session, seeded into the next new session by
+    spawn(); {} if never set. 'fast' is the one key no picker writes (set_fast deliberately never seeds
+    it): it is set deliberately, in this file or through /new's `fast` pref."""
     try:
         d = json.loads(_defaults_path(state_dir).read_text())
         return d if isinstance(d, dict) else {}
@@ -1153,8 +1155,9 @@ def read_sdk_defaults(state_dir: Path) -> dict:
 
 
 def write_sdk_default(state_dir: Path, **fields) -> None:
-    """Merge {model?, effort?} into the remembered defaults (atomic tmp+rename). Only non-None keys passed
-    are touched, so remembering a model never clobbers the remembered effort and vice-versa."""
+    """Merge {model?, effort?, mode?, auth?} into the remembered defaults (atomic tmp+rename). Only
+    non-None keys passed are touched, so remembering a model never clobbers the remembered effort and
+    vice-versa. Nothing writes 'fast' through here on purpose — see read_sdk_defaults."""
     d = read_sdk_defaults(state_dir)
     d.update({k: v for k, v in fields.items() if v is not None})
     p = _defaults_path(state_dir)
@@ -3635,6 +3638,18 @@ class SdkBackend:
                "effort": eff, "lastSid": "", "alive": True}
         if d.get("model") and d["model"] != "default":
             reg["model"] = d["model"]
+        # Fast mode, when the defaults file asks for it (the user 2026-08-21, who wants every new
+        # session to come up on fast). Seeding it HERE is the whole point — fastMode is a connect-time
+        # flag-settings key, so a reg that already carries it rides the FIRST connect. Turning it on
+        # after the session is up instead costs a full teardown+relaunch (set_fast → request_reconnect),
+        # and at launch that reconnect lands on a CLI that has only just finished connecting: the
+        # session holds its lock through "Reloading session…" and every other op on it (an /interrupt,
+        # a safeguards model restore) blocks behind it. That stack is what made a fast-on launch look
+        # hung for minutes. set_fast STILL does not write this default — a click on one session must
+        # not spread (see its docstring); the seed exists to be set deliberately, in sdk-defaults.json
+        # or via /new's `fast` pref, which is the same escape hatch the permission mode documents.
+        if d.get("fast"):
+            reg["fast"] = True
         # Auth: the picker's explicit pick wins; else the remembered default (a gear /auth pick on any
         # session); unset stays unset — effective_auth's fallback IS the pre-selector behavior.
         a = auth if auth in ("login", "key") else (d.get("auth") if d.get("auth") in ("login", "key") else "")
@@ -4253,7 +4268,10 @@ class SdkBackend:
           opt-in (_options → flag_settings_path), so a lingering flag on a session the user turned off
           is impossible, and a dormant session applies the pick at its next connect. Deliberately NOT
           write_sdk_default: fast mode draws credits at a higher rate and carries its own rate limits,
-          so it stays per-session rather than quietly spreading to every new session.
+          so it stays per-session rather than quietly spreading to every new session. (spawn() DOES
+          honour a `fast` already sitting in sdk-defaults.json — a default set on purpose, the same
+          escape hatch STICKY_MODE_EXCLUDES leaves open for bypassPermissions. That seed is also the
+          only way to have fast at LAUNCH without paying the reconnect below.)
         - A connection made WITH the flag (_fast_unlocked) takes the literal send in both directions:
           the send's echo is the chat's acknowledgement, the flip here is optimistic for the badge,
           and fast_mode_state on the next init re-asserts the truth.

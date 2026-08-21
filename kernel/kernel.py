@@ -4783,18 +4783,28 @@ def _pick_identity_color(now=None):
 
 
 def _apply_new_session_prefs(sid, body):
-    """POST /new's optional per-spawn "model"/"effort" (the user 2026-08-14): applied through the SAME
-    park-aware setters as the dashboard's setModel/setEffort ops, and echoed back so the caller can be
-    loud when a kernel ignores them. Values pass through VERBATIM — full model ids as the picker sends
-    them (claude-fable-5), never a short alias: the CLI alias table stops at opus/sonnet/haiku and
-    quietly resolved "fable" to Opus 5 (observed live 2026-08-14). Runs on the idempotent existing:true
-    open too, so a nightly re-brief re-asserts them on the standing session — ultracode is per-session
-    by design (never a write_sdk_default seed), and a headless script has no WS, so this is the
-    sanctioned door."""
+    """POST /new's optional per-spawn "model"/"effort"/"fast" (the user 2026-08-14): applied through the
+    SAME park-aware setters as the dashboard's setModel/setEffort/setFast ops, and echoed back so the
+    caller can be loud when a kernel ignores them. Values pass through VERBATIM — full model ids as the
+    picker sends them (claude-fable-5), never a short alias: the CLI alias table stops at
+    opus/sonnet/haiku and quietly resolved "fable" to Opus 5 (observed live 2026-08-14). Runs on the
+    idempotent existing:true open too, so a nightly re-brief re-asserts them on the standing session —
+    ultracode is per-session by design (never a write_sdk_default seed), and a headless script has no
+    WS, so this is the sanctioned door.
+
+    "fast" ('on'|'off') joined the set 2026-08-21. It belongs here for the same reason effort does:
+    fastMode is a CONNECT-TIME flag-settings key, and _create_sdk_session runs this BETWEEN spawn and
+    connect, so the ask is a plain registry write the first connect reads. Ask for it any later and
+    set_fast has to request_reconnect — tearing down a CLI that has only just finished connecting, and
+    holding the session's lock through the relaunch while every other op on it queues behind. An
+    unrecognised value is ignored rather than echoed, so a caller that typoed sees the omission."""
     out = {}
     m = str((body or {}).get("model") or "").strip()
     e = str((body or {}).get("effort") or "").strip()
-    if not (m or e):
+    f = str((body or {}).get("fast") or "").strip().lower()
+    if f not in ("on", "off"):
+        f = ""
+    if not (m or e or f):
         return out
     try:
         be = Sessions.backend_for(str(sid))
@@ -4808,6 +4818,9 @@ def _apply_new_session_prefs(sid, body):
     if e:
         _set_effort_or_park(be, str(sid), e)
         out["effort"] = e
+    if f:
+        _set_fast_or_park(be, str(sid), f)
+        out["fast"] = f
     _push_soon()
     return out
 
@@ -25468,9 +25481,9 @@ class Handler(BaseHTTPRequestHandler):
                 # Headless session creation (`romp new`, 2026-07-25): the WS createSession op as a
                 # one-shot POST, so a terminal can start a session — SDK by default, the recommended
                 # backend — without a browser. Body: {"name": ..., "dir": ..., "backend": "sdk"|"tmux"},
-                # plus optional "model"/"effort" (full ids/levels, applied park-aware and echoed back;
-                # also applied on the existing:true open, so a re-brief re-asserts them — see
-                # _apply_new_session_prefs).
+                # plus optional "model"/"effort"/"fast" (full ids/levels/on|off, applied park-aware and
+                # echoed back; also applied on the existing:true open, so a re-brief re-asserts them —
+                # see _apply_new_session_prefs).
                 # Same validation and the same no-silent-fallback rule as the WS op: when the SDK
                 # backend is unavailable, say so (ok:false + reason), never hand back a mystery tmux
                 # session. An already-live name is a success (idempotent open), not an error.
