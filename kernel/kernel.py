@@ -13805,16 +13805,18 @@ def _stand_down_on_restores(sid, off, live):
     """Say, ONCE, that romp has spent this session's restore budget and is leaving it on the fallback.
     Standing down quietly would put the session back exactly where the restore was built to rescue it
     from — parked on a model nobody chose, with nobody aware — so the stand-down goes out on the same
-    transports as every other thing worth looking at, and the session's own bell still governs it."""
+    transports the feed's bells use (_system_notify + _push_notify), and the session's own bell
+    (_notify_session_effective: its override, else the master) still governs it."""
     sys.stderr.write("model-restore: %s — %d restores spent, standing down; it stays on %s until a "
                      "model is picked by hand\n" % (sid, _MODEL_RESTORE_BUDGET, live or "the fallback"))
-    if _notify_muted(sid):
-        return
-    _notify("romp: %s" % (_name_of(sid) or sid[:8]),
-            "Safeguards keep moving this off %s — romp has put it back on the default model %d times "
+    if not _notify_session_effective(sid):
+        return                           # this session's bell is off — the stderr line above still stands
+    title = "romp: %s" % (_name_of(sid) or sid[:8])
+    body = ("Safeguards keep moving this off %s — romp has put it back on the default model %d times "
             "and has stopped trying. It's on %s now; pick a model to hand it a fresh set."
-            % (off or "its model", _MODEL_RESTORE_BUDGET, live or "a fallback model"),
-            priority="high", tags="warning", sid=sid)
+            % (off or "its model", _MODEL_RESTORE_BUDGET, live or "a fallback model"))
+    _system_notify(title, body)
+    _push_notify(title, body, sid)       # …and the phone, the same pair the feed's bells go out on
 
 
 def _auto_restore_model_tick(now, tmux):

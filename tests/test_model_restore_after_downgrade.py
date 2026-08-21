@@ -30,6 +30,10 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
 os.environ["ROMP_KERNEL_NO_OPEN"] = "1"
 os.environ.setdefault("ROMP_SERVE_TOKEN", "testtok")
+# Hermetic state BEFORE the loads — they resolve their state root at import time, and only
+# pytest runs conftest's floor (a bare unittest or script run otherwise writes REAL state).
+os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
+os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel's export outranks the XDG floor
 em = SourceFileLoader("romp_em_mrestore", os.path.join(BIN, "romp-event-model")).load_module()
 km = SourceFileLoader("romp_kernel_mrestore", os.path.join(BIN, "romp-kernel")).load_module()
 
@@ -189,9 +193,11 @@ class _RestoreTickHarness(unittest.TestCase):
         self._saved = (km._alive_sessions, km._parse_cached, km._working_now, km._compacting_now,
                        km._clearing_now, km._model_pending_now, km.Sessions.backend_for,
                        km._push_soon, km._push_all, km._mark_views_dirty,
-                       km._notify, km._notify_muted, km._path_of)
-        km._notify = lambda title, body, **kw: self.notified.append((title, body))
-        km._notify_muted = lambda sid, item_id="": False
+                       km._system_notify, km._push_notify,
+                       km._notify_session_effective, km._path_of)
+        km._system_notify = lambda title, body: self.notified.append((title, body))
+        km._push_notify = lambda title, body, sid="", badge=None: None
+        km._notify_session_effective = lambda sid: True   # bell on: the stand-down is not muted
         self.path = str(Path(tempfile.mkdtemp()) / (SID + ".jsonl"))
         km._alive_sessions = lambda now, tmux: [{"sid": SID, "path": self.path}]
         km._path_of = lambda sid: self.path
@@ -216,7 +222,8 @@ class _RestoreTickHarness(unittest.TestCase):
         (km._alive_sessions, km._parse_cached, km._working_now, km._compacting_now,
          km._clearing_now, km._model_pending_now, km.Sessions.backend_for,
          km._push_soon, km._push_all, km._mark_views_dirty,
-         km._notify, km._notify_muted, km._path_of) = self._saved
+         km._system_notify, km._push_notify,
+         km._notify_session_effective, km._path_of) = self._saved
         km._model_restored.clear()
         km._model_restore_spent.clear()
         km._model_stood_down.clear()
