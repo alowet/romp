@@ -11,6 +11,11 @@ Budgeted, though (the user 2026-08-15): a session flagged over and over is fed s
 safeguards by an unconditional restore, so after _MODEL_RESTORE_BUDGET of them romp stands down, says
 so once, and waits for a human pick before it will try again.
 
+And it puts the session on the CLI's "Default" rather than the model it was flagged off (the user
+2026-08-18) — restoring Fable handed the safeguards the model that had just tripped them, and the loop
+that produced burned the whole budget in two minutes. Which means the swap's two models can now be one
+FAMILY apart and no more (Opus 5 restored, Opus 4.8 the fallback), so everything here is version-exact.
+
 SYNTHETIC only: placeholder uuids, invented notes-api prompts, temp dirs.
 """
 import json
@@ -98,7 +103,7 @@ class WhichDowngradeIsStillInForce(unittest.TestCase):
     def test_a_swap_the_session_is_still_sitting_on_arms_the_restore(self):
         hit = km._downgrade_in_force(*write(flagged_turn(1, T0)), "Opus 4.8")
         self.assertIsNotNone(hit, "the session is still on the model the swap moved it to")
-        self.assertEqual(hit[1], "fable", "it goes back to the family the swap took it off")
+        self.assertEqual(hit[1], "Fable 5", "it reports the model the swap took it off, for the messages")
 
     def test_a_session_already_back_on_its_own_model_has_nothing_to_undo(self):
         self.assertIsNone(km._downgrade_in_force(*write(flagged_turn(1, T0)), "Fable 5"),
@@ -116,15 +121,32 @@ class WhichDowngradeIsStillInForce(unittest.TestCase):
         km._newest_swap_cache.clear()
         hit = km._downgrade_in_force(*write(recs), "Sonnet 5")
         self.assertIsNotNone(hit)
-        self.assertEqual(hit[1], "fable")
+        self.assertEqual(hit[1], "Fable 5")
 
     def test_a_transcript_with_no_swap_arms_nothing(self):
         self.assertIsNone(km._downgrade_in_force(*write(clean_turn(1, T0)), "Fable 5"))
 
-    def test_an_unrecognised_pairing_is_never_handed_to_set_model(self):
+    def test_a_swap_off_a_model_romp_cannot_name_is_left_alone(self):
         recs = flagged_turn(1, T0, frm="some-other-vendor-model", to="claude-opus-4-8")
         self.assertIsNone(km._downgrade_in_force(*write(recs), "Opus 4.8"),
-                          "no known family to go back to → leave the session alone, don't invent one")
+                          "a routed/unknown model is a choice romp can't read — don't move it to the default")
+
+    def test_a_restore_that_landed_is_not_read_as_still_on_the_fallback(self):
+        # the whole point of the version-exact test: the restore lands the session on Opus 5, and the
+        # fallback is Opus 4.8. A family test would call that "still downgraded" forever.
+        self.assertIsNone(km._downgrade_in_force(*write(flagged_turn(1, T0)), "Opus 5"),
+                          "Opus 5 is not Opus 4.8 — the swap is undone, re-arm for the next one")
+
+    def test_a_swap_within_one_family_still_counts(self):
+        # …and the other half: once restores land on Opus 5, a re-flag is Opus 5 → Opus 4.8. Dismissing
+        # that as "same family, no swap" would park the session on the fallback with nobody told.
+        hit = km._downgrade_in_force(*write(flagged_turn(1, T0, frm="claude-opus-5")), "Opus 4.8")
+        self.assertIsNotNone(hit, "same family, different model — it is still a downgrade")
+        self.assertEqual(hit[1], "Opus 5")
+
+    def test_a_bare_versionless_badge_is_waited_out_not_guessed_at(self):
+        self.assertIsNone(km._downgrade_in_force(*write(flagged_turn(1, T0)), "Opus"),
+                          "which Opus that is decides everything — wait for a badge that says")
 
     def test_an_unrecognised_newest_swap_does_not_resurrect_the_one_before_it(self):
         recs = (flagged_turn(1, T0)
@@ -142,15 +164,15 @@ class WhichDowngradeIsStillInForce(unittest.TestCase):
         path, parsed = write(clean_turn(1, T0) + flagged_turn(2, T0 + 300), path=path)
         hit = km._downgrade_in_force(path, parsed, "Opus 4.8")
         self.assertIsNotNone(hit, "the transcript changed → the memo must re-scan, not serve the old answer")
-        self.assertEqual(hit[1], "fable")
+        self.assertEqual(hit[1], "Fable 5")
 
 
 class _FakeBackend:
     def __init__(self):
         self.calls = []
 
-    def set_model(self, sid, value):
-        self.calls.append((sid, value))
+    def set_model(self, sid, value, seed=True):
+        self.calls.append((sid, value, seed))
         return True
 
     def busy(self, sid):
@@ -167,11 +189,12 @@ class _RestoreTickHarness(unittest.TestCase):
         self._saved = (km._alive_sessions, km._parse_cached, km._working_now, km._compacting_now,
                        km._clearing_now, km._model_pending_now, km.Sessions.backend_for,
                        km._push_soon, km._push_all, km._mark_views_dirty,
-                       km._notify, km._notify_muted)
+                       km._notify, km._notify_muted, km._path_of)
         km._notify = lambda title, body, **kw: self.notified.append((title, body))
         km._notify_muted = lambda sid, item_id="": False
         self.path = str(Path(tempfile.mkdtemp()) / (SID + ".jsonl"))
         km._alive_sessions = lambda now, tmux: [{"sid": SID, "path": self.path}]
+        km._path_of = lambda sid: self.path
         km._working_now = lambda sid: False
         km._compacting_now = lambda sid: False
         km._clearing_now = lambda sid: False
@@ -183,6 +206,8 @@ class _RestoreTickHarness(unittest.TestCase):
         km._model_restored.clear()
         km._model_restore_spent.clear()
         km._model_stood_down.clear()
+        km._model_restore_inflight.clear()
+        km._model_hand_picked.clear()
         km._pending_ops.clear()
         km._model_switch_pending.clear()
         km._newest_swap_cache.clear()
@@ -191,10 +216,12 @@ class _RestoreTickHarness(unittest.TestCase):
         (km._alive_sessions, km._parse_cached, km._working_now, km._compacting_now,
          km._clearing_now, km._model_pending_now, km.Sessions.backend_for,
          km._push_soon, km._push_all, km._mark_views_dirty,
-         km._notify, km._notify_muted) = self._saved
+         km._notify, km._notify_muted, km._path_of) = self._saved
         km._model_restored.clear()
         km._model_restore_spent.clear()
         km._model_stood_down.clear()
+        km._model_restore_inflight.clear()
+        km._model_hand_picked.clear()
         km._pending_ops.clear()
         km._model_switch_pending.clear()
         km._newest_swap_cache.clear()
@@ -211,14 +238,15 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
     def test_an_idle_downgraded_session_is_put_back(self):
         tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "fable")], "the swap is undone at idle")
+        self.assertEqual(self.be.calls, [(SID, "default", False)],
+                         "the swap is undone at idle — onto the CLI default, and not as a new-session seed")
 
     def test_it_does_not_fire_twice_for_the_same_flagged_turn(self):
         tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
         km._auto_restore_model_tick(NOW, tmux)
         km._auto_restore_model_tick(NOW, tmux)      # the switch has not landed yet — model still reads Opus
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "fable")],
+        self.assertEqual(self.be.calls, [(SID, "default", False)],
                          "one restore per flagged turn — a re-flagged turn is answered once, not per flag")
 
     def test_a_turn_flagged_twice_still_earns_only_one_restore(self):
@@ -228,7 +256,7 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
         tmux = self._arm(recs, "Opus 4.8")
         km._auto_restore_model_tick(NOW, tmux)
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "fable")])
+        self.assertEqual(self.be.calls, [(SID, "default", False)])
 
     def test_a_fresh_downgrade_on_a_later_turn_gets_its_own_restore(self):
         tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
@@ -237,7 +265,7 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
         tmux = self._arm(flagged_turn(1, T0) + clean_turn(2, T0 + 200) + flagged_turn(3, T0 + 400),
                          "Opus 4.8")
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "fable"), (SID, "fable")],
+        self.assertEqual(self.be.calls, [(SID, "default", False), (SID, "default", False)],
                          "across turns a new flag is a new turn and earns its own restore (up to the budget)")
 
     def test_it_never_fires_into_a_live_turn(self):
@@ -247,7 +275,8 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
         self.assertEqual(self.be.calls, [], "mid-turn the pick waits — it does not land in an open turn")
         km._working_now = lambda sid: False
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "fable")], "…and lands the moment the session settles")
+        self.assertEqual(self.be.calls, [(SID, "default", False)],
+                         "…and lands the moment the session settles")
 
     def test_a_compaction_parks_it_instead_of_dropping_it(self):
         tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
@@ -256,7 +285,7 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
         self.assertEqual(self.be.calls, [], "a compaction is not idle")
         km._compacting_now = lambda sid: False
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "fable")])
+        self.assertEqual(self.be.calls, [(SID, "default", False)])
 
     def test_a_switch_already_in_flight_is_left_to_resolve(self):
         tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
@@ -268,6 +297,38 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
         tmux = self._arm(flagged_turn(1, T0), "Sonnet 5")
         km._auto_restore_model_tick(NOW, tmux)
         self.assertEqual(self.be.calls, [], "the user picked this model after the swap — leave it")
+
+    def test_a_human_picking_the_fallback_model_itself_is_not_overruled(self):
+        """The one case the live-model test can never see. romp's picker offers "Opus", which resolves to
+        Opus 4.8 here — the very model the safeguards move sessions onto — so a user who deliberately
+        picks it leaves a badge indistinguishable from an untouched downgrade. The pick itself is the
+        signal (_human_picked_model), and it retires the swap that was standing when they made it."""
+        tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
+        km._compacting_now = lambda sid: False
+        km._set_model_or_park(self.be, SID, "opus")     # their own pick, onto the fallback model
+        self.be.calls.pop()                             # (not one of romp's restores)
+        km._auto_restore_model_tick(NOW, tmux)
+        self.assertEqual(self.be.calls, [], "they chose this model seconds ago — do not move them off it")
+
+        tmux = self._arm(flagged_turn(1, T0) + flagged_turn(2, T0 + 300), "Opus 4.8")
+        km._auto_restore_model_tick(NOW, tmux)
+        self.assertEqual(self.be.calls, [(SID, "default", False)],
+                         "a flag AFTER their pick is a new event their pick was not a verdict on")
+
+    def test_a_backend_that_refuses_the_pick_spends_nothing(self):
+        # SdkBackend.set_model returns False outright for a sid with no registry entry (a session
+        # mid-teardown). Counting that as a restore would let a session be stood down — and announced as
+        # "put back 5 times" — having never once actually been put back.
+        class _Refuses(_FakeBackend):
+            def set_model(self, sid, value, seed=True):
+                _FakeBackend.set_model(self, sid, value, seed)
+                return False
+        self.be = _Refuses()
+        tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
+        km._auto_restore_model_tick(NOW, tmux)
+        self.assertEqual(km._model_restore_spent.get(SID, 0), 0, "nothing landed, so nothing was spent")
+        km._auto_restore_model_tick(NOW, tmux)
+        self.assertEqual(len(self.be.calls), 2, "…and the turn is not marked answered — it tries again")
 
     def test_an_unparsed_session_is_skipped_not_guessed_at(self):
         km._parse_cached = lambda path: None
@@ -314,8 +375,8 @@ class TheRestoreBudgetStopsItLoopingForever(_RestoreTickHarness):
     def test_a_restore_that_lands_is_not_mistaken_for_a_hand_pick(self):
         for n in range(1, self._budget() + 1):
             self._flag_again(n)
-            # the pick lands — the session sits on its own model until the next flag
-            km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Fable 5"))
+            # the pick lands — the session sits on the default (Opus 5 here) until the next flag
+            km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Opus 5"))
         self._flag_again(self._budget() + 1)
         self.assertEqual(len(self.be.calls), self._budget(),
                          "leaving the fallback because the restore WORKED must not refill the budget")
@@ -324,22 +385,69 @@ class TheRestoreBudgetStopsItLoopingForever(_RestoreTickHarness):
         for n in range(1, self._budget() + 1):
             self._flag_again(n)
             self.recs += clean_turn(50 + n, T0 + 100 * n + 50)
-            km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Fable 5"))
+            km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Opus 5"))
         self._flag_again(self._budget() + 1)
         self.assertEqual(len(self.be.calls), self._budget(),
                          "work going well in between is not a reason to start the count over")
+
+    def test_the_last_restore_landing_after_the_stand_down_does_not_refill_it(self):
+        """The loop this whole budget exists to stop, in the shape the journal caught it (2026-08-17,
+        19:19:27 stand-down → 19:19:37 restore 1/5). A pick is SENT at one push and the live model reads
+        back several pushes later, so the budget can run out and stand down while the last restore is
+        still in flight. When it lands the session leaves the fallback — which looks exactly like a hand
+        pick unless romp remembers that the move was its own."""
+        for n in range(1, self._budget() + 2):        # …+1 flag past the budget → stood down, announced
+            self._flag_again(n)
+        self.assertEqual(len(self.notified), 1)
+        spent = len(self.be.calls)
+
+        km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Opus 5"))   # the last pick lands, late
+        self._flag_again(self._budget() + 2, frm="claude-opus-5")
+        self.assertEqual(len(self.be.calls), spent,
+                         "romp's own restore landing is not a human at the wheel — no fresh budget")
+        self.assertEqual(len(self.notified), 1, "and no second stand-down notice either")
+
+    def test_an_out_of_band_pick_after_the_restore_landed_still_refills_it(self):
+        for n in range(1, self._budget() + 2):
+            self._flag_again(n)
+        spent = len(self.be.calls)
+        km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Opus 5"))   # romp's restore, consumed
+        km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Sonnet 5"))  # and NOW a human picks
+        self._flag_again(self._budget() + 2, frm="claude-sonnet-5")
+        self.assertEqual(len(self.be.calls), spent + 1,
+                         "the move romp cannot account for is the human's, and it earns a fresh set")
+
+    def test_a_swap_romp_cannot_read_does_not_hand_back_the_budget(self):
+        """The refill infers a human from the session leaving the fallback. A swap whose models romp
+        can't name also makes the swap unreadable — but the session has not moved anywhere, nobody has
+        touched it, and reading that as a hand pick would quietly undo the cap that exists to keep an
+        unattended session from cycling restores into the safeguards all night."""
+        for n in range(1, self._budget() + 2):
+            self._flag_again(n)
+        spent = len(self.be.calls)
+        self.assertEqual(len(self.notified), 1, "stood down")
+
+        # a newest swap romp can't read lands, with the session still sitting on the fallback
+        self.recs += flagged_turn(90, T0 + 9000, frm="some-other-vendor-model")
+        km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Opus 4.8"))
+        self._flag_again(self._budget() + 2)
+        self.assertEqual(len(self.be.calls), spent, "still stood down — nothing about this was a human")
 
     def test_a_hand_pick_while_stood_down_hands_it_a_fresh_budget(self):
         for n in range(1, self._budget() + 2):
             self._flag_again(n)
         self.assertEqual(len(self.notified), 1, "stood down, and the user has been told")
 
-        # the user picks a model themselves: romp is not touching it, so this move is theirs
-        km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Sonnet 5"))
+        # the user picks a model themselves, through a surface — the pick romp can SEE being made, so
+        # the refill needs no inference at all (and none of romp's own picks are seeded this way)
+        km._compacting_now = lambda sid: False
+        km._set_model_or_park(self.be, SID, "sonnet")
+        self.be.calls.pop()                             # their pick is not one of romp's restores
         self._flag_again(self._budget() + 2, frm="claude-sonnet-5")
         self.assertEqual(len(self.be.calls), self._budget() + 1,
                          "a human back at the wheel earns the session a fresh set of restores")
-        self.assertEqual(self.be.calls[-1], (SID, "sonnet"), "and it goes back to what THEY picked")
+        self.assertEqual(self.be.calls[-1], (SID, "default", False),
+                         "the restore target does not follow what they picked — it is always the default")
 
 
 if __name__ == "__main__":

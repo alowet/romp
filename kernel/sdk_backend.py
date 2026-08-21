@@ -4192,13 +4192,20 @@ class SdkBackend:
             s.name = new_name
         return True
 
-    def set_model(self, sid: str, value: str) -> bool:
+    def set_model(self, sid: str, value: str, seed: bool = True) -> bool:
         """Change the session's model. Persisted in the registry (so a reconnect keeps it) and applied
         LIVE on a connected session via the SDK control channel — NOT a /model slash injection, which the
-        SDK input stream does not interpret. 'default' resets to the CLI default (set_model(None))."""
-        if not read_reg(self.state_dir, sid):
+        SDK input stream does not interpret. 'default' resets to the CLI default (set_model(None)).
+
+        seed=False applies the change to THIS session only, leaving the next-new-session default alone —
+        for a pick romp made on the user's behalf rather than one they made (the kernel's safeguards
+        restore). The registry write still happens either way: that is this session's own state."""
+        reg = read_reg(self.state_dir, sid)
+        if not reg:
             return False
-        write_sdk_default(self.state_dir, model=value)   # remember as the seed for the NEXT new session (the user 2026-06-27)
+        reg["model"] = value
+        if seed:
+            write_sdk_default(self.state_dir, model=value)   # remember as the seed for the NEXT new session (the user 2026-06-27)
         s = self.sessions.get(sid)
         if s:
             s.chosen_model = value

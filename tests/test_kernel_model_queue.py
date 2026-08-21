@@ -34,9 +34,11 @@ SID = "11111111-2222-3333-4444-555555555555"
 class _FakeBackend:
     def __init__(self):
         self.calls = []
+        self.seeds = []
 
-    def set_model(self, sid, value):
+    def set_model(self, sid, value, seed=True):
         self.calls.append((sid, value))
+        self.seeds.append(seed)
         return True
 
     def busy(self, sid):
@@ -94,6 +96,45 @@ class ParkOrApply(unittest.TestCase):
         km.Sessions.backend_for = dead
         km._apply_pending_ops()                         # must not raise
         self.assertNotIn(SID, km._pending_ops, "a dead session's park is dropped, never retried forever")
+
+    # ---- a pick romp made itself carries seed=False all the way through the queue ----
+    # (the kernel's safeguards restore: it moves THIS session, and must never change the model new
+    # sessions are seeded with — see _set_model_or_park. The flag has to survive the park, because a
+    # restore fired mid-compaction is parked like any other pick.)
+    def test_an_ordinary_pick_seeds_the_next_new_session(self):
+        km._compacting_now = lambda sid: False
+        km._set_model_or_park(self.be, SID, "sonnet")
+        self.assertEqual(self.be.seeds, [True], "a pick from a surface is the user's — remember it")
+
+    def test_a_pick_romp_made_itself_does_not_seed(self):
+        km._compacting_now = lambda sid: False
+        km._set_model_or_park(self.be, SID, "default", seed=False)
+        self.assertEqual(self.be.seeds, [False])
+
+    def test_the_flag_survives_a_park_and_the_shape_is_unchanged_without_it(self):
+        km._compacting_now = lambda sid: True
+        km._set_model_or_park(self.be, SID, "default", seed=False)
+        self.assertEqual(km._pending_ops.get(SID), [("model", "default", False)],
+                         "the flag rides along so the delivery after the compaction still knows")
+        km._set_model_or_park(self.be, SID, "sonnet")
+        self.assertEqual(km._pending_ops.get(SID), [("model", "sonnet")],
+                         "…and an ordinary pick parks in exactly the shape it always did")
+
+    def test_a_parked_restore_is_delivered_unseeded(self):
+        km._pending_ops[SID] = [("model", "default", False)]
+        km.Sessions.backend_for = lambda sid: self.be
+        km._compacting_now = lambda sid: False
+        km._apply_pending_ops()
+        self.assertEqual((self.be.calls, self.be.seeds), ([(SID, "default")], [False]))
+
+    def test_a_park_from_an_older_kernel_still_seeds(self):
+        # pending-ops.json is read back by whatever kernel boots next; a 2-tuple predates the flag and
+        # is a pick from a surface, which is exactly the case that SHOULD seed
+        km._pending_ops[SID] = [("model", "opus")]
+        km.Sessions.backend_for = lambda sid: self.be
+        km._compacting_now = lambda sid: False
+        km._apply_pending_ops()
+        self.assertEqual(self.be.seeds, [True])
 
     def test_producer_ticks_the_apply(self):
         import inspect

@@ -47,7 +47,7 @@ class FakeBackend:
     def set_mode(self, sid, m):
         self.calls.append(("set_mode", sid, m)); return True
 
-    def set_model(self, sid, v):
+    def set_model(self, sid, v, seed=True):
         self.calls.append(("set_model", sid, v)); return True
 
     def set_effort(self, sid, v):

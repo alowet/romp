@@ -106,7 +106,9 @@ class SessionBackend(ABC):
         return False
 
     @abstractmethod
-    def set_model(self, sid: str, value: str) -> bool: ...
+    def set_model(self, sid: str, value: str, seed: bool = True) -> bool:
+        """Put the session on `value`. seed=False means romp picked it, not the user, so a backend that
+        remembers the last pick as the default for NEW sessions must not remember this one."""
 
     @abstractmethod
     def set_mode(self, sid: str, mode: str) -> bool:

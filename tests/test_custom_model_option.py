@@ -121,8 +121,9 @@ class CustomModelOption(unittest.TestCase):
 
     # ---- the restore policy must not mistake it for a Claude model ----
     def test_the_safeguards_restore_leaves_an_off_ladder_model_alone(self):
-        self.assertEqual(km._model_family_alias(ROUTED), "",
-                         "a routed model belongs to no Claude family — the fallback restore must skip it")
+        self.assertEqual(km._model_display_name(ROUTED), "",
+                         "a routed model has no Claude display name — the fallback restore must skip a swap "
+                         "off it rather than move a choice it can't read onto the CLI default")
 
 
 if __name__ == "__main__":

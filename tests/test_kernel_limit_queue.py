@@ -56,7 +56,7 @@ class _FakeBackend:
         self.calls.append(("send", text))
         return True
 
-    def set_model(self, sid, value):
+    def set_model(self, sid, value, seed=True):
         self.calls.append(("model", value))
         return True
 

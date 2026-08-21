@@ -1307,6 +1307,19 @@ class RememberedDefaults(unittest.TestCase):
         s2 = self.be.spawn("b", self.d)
         self.assertNotIn("model", sb.read_reg(self.d, s2), "remembered 'default' → no model override (account default)")
 
+    def test_a_pick_romp_made_itself_moves_the_session_but_not_the_seed(self):
+        # the kernel's safeguards restore picks a model ON THE USER'S BEHALF (seed=False). It must move
+        # this session and leave the model new sessions start on exactly where the user left it —
+        # otherwise one downgrade at 3am quietly changes what every session created afterwards runs.
+        s1 = self.be.spawn("a", self.d)
+        self.be.set_model(s1, "fable")                                   # the user's own pick, remembered
+        self.assertTrue(self.be.set_model(s1, "default", seed=False))    # romp's repair, not theirs
+        self.assertEqual(sb.read_reg(self.d, s1)["model"], "default", "this session did move")
+        self.assertEqual(sb.read_sdk_defaults(self.d).get("model"), "fable",
+                         "…and the seed still holds what the user picked")
+        s2 = self.be.spawn("b", self.d)
+        self.assertEqual(sb.read_reg(self.d, s2)["model"], "fable", "so a new session comes up on it")
+
     def test_bad_remembered_effort_falls_back_to_hardcoded(self):
         sb.write_sdk_default(self.d, effort="ultra")                     # a level that isn't valid (e.g. stale file)
         sid = self.be.spawn("a", self.d)

@@ -5891,7 +5891,7 @@ class ViewBuilder(unittest.TestCase):
             km._model_switch_pending.clear()
             km._tmux_sessions = lambda: {SID: {"state": "working", "since": NOW - 10, "model": "Haiku",
                                                "effort": "high", "context": 20, "compactPct": None, "color": None}}
-            fake_be = types.SimpleNamespace(set_model=lambda sid, value: None)
+            fake_be = types.SimpleNamespace(set_model=lambda sid, value, seed=True: None)
             km._set_model_or_park(fake_be, SID, "opus")   # accepted, from EITHER surface — same call either way
             st = km.build_session(SID, NOW)["status"]
             self.assertTrue(st.get("modelPending"), "the chat chip shows the switching dots too")

@@ -6955,7 +6955,9 @@ class TmuxBackend(sb.SessionBackend):
         self.send_keys(name, "Escape")
         return True, ""
 
-    def set_model(self, sid, value):
+    def set_model(self, sid, value, seed=True):
+        # `seed` is accepted and ignored: the CLI's own /model is session-scoped and persists nothing, so a
+        # tmux pick has no next-new-session seed to leave alone (the SDK backend is where it means something).
         _tmux_send(_name_of(sid) or sid, "/model " + value, model_cmd=True)   # /model opens a confirm → 2nd Enter
         return True
 
@@ -13548,15 +13550,25 @@ def _send_or_park(be, sid, text, echo=None):
         _optimistic_echo(sid, text, author=echo)
 
 
-def _set_model_or_park(be, sid, value):
+def _set_model_or_park(be, sid, value, seed=True):
     """Apply a model change now — or park it in the sid's FIFO op queue while the session compacts. Either
     way, the pick is ACCEPTED now: stamp the shared pending signal (_mark_model_pending) so chat + timeline
-    both show switching-dots immediately, from whichever surface the click came from (the user 2026-07-03)."""
+    both show switching-dots immediately, from whichever surface the click came from (the user 2026-07-03).
+
+    `seed` False marks a pick romp made ON THE USER'S BEHALF (the safeguards restore below): it moves THIS
+    session and nothing else. A pick from a surface is also remembered as the model the next NEW session
+    starts on, which is right for a click and wrong for a repair — the seed is the user's setting, and an
+    unattended session getting flagged at 3am must not quietly change what tomorrow's sessions run."""
     _mark_model_pending(sid, value)
+    if seed:
+        _human_picked_model(sid)      # a pick from a surface IS the human at the wheel — see below
     if _ops_gate(sid):
-        _park_op(sid, ("model", value))
-    else:
-        be.set_model(sid, value)
+        # the flag rides as an OPTIONAL third field, present only when it is False: a park is mirrored to
+        # disk and read back by whatever kernel boots next, and every ordinary pick keeps the exact
+        # ("model", value) shape the queue has always had (_apply_pending_ops defaults a 2-tuple to True).
+        _park_op(sid, ("model", value) if seed else ("model", value, False))
+        return None                   # parked, not answered yet — distinct from the backend refusing
+    return be.set_model(sid, value, seed=seed)
 
 
 def _set_effort_or_park(be, sid, value):
@@ -13609,25 +13621,52 @@ def _set_fast_or_park(be, sid, value):
 # ONE restore per turn (the user 2026-08-13). The key is the fallback turn's id, so a turn flagged
 # several times is answered once, not once per flag. Two guards keep it off a model the user chose
 # — it fires only while the session is STILL sitting on the exact model the swap moved it to, so a
-# manual pick in between (back to the original, or anywhere else) retires the restore by failing that
-# check; and a switch already in flight is left to resolve.
+# manual pick in between retires the restore by failing that check; and a switch already in flight is
+# left to resolve.
 #
 # And a BUDGET across turns (the user 2026-08-15). Restoring forever was the original design, on the
 # reasoning that a re-flag is a new turn and deserves a new answer. But a session that keeps getting
-# flagged is a session whose work keeps tripping the safeguards, and putting it straight back on the
-# model that just got flagged simply feeds the next flag — repeatedly, unattended, all night. That is
-# the shape that risks an account-level lockout, which costs far more than a session sitting on a
-# fallback model. So each session gets _MODEL_RESTORE_BUDGET restores; after that romp stands down
-# and leaves it on the fallback, and says so once (stderr + a notification), because a silent stand-
-# down would recreate the invisibility this whole mechanism exists to fix.
+# flagged all night, unattended, is the shape that risks an account-level lockout, which costs far more
+# than a session sitting on a fallback model. So each session gets _MODEL_RESTORE_BUDGET restores; after
+# that romp stands down and leaves it on the fallback, and says so once (stderr + a notification),
+# because a silent stand-down would recreate the invisibility this whole mechanism exists to fix.
 #
-# The budget refills on exactly one event: the session leaving the fallback WHILE romp is stood down.
-# romp is not touching the model then, so that move is a human's, and a human at the wheel earns the
-# session a fresh set. The stand-down has to be LATCHED for that to be readable — "off the fallback"
-# on its own is also what a restore landing looks like, so testing the model alone would refill the
-# budget the moment the fifth restore worked. Nothing else refills it: not a clean turn (a session
-# alternating flag/clean would then never exhaust it), not the passage of time.
+# The budget refills when a human takes the wheel — read two ways, because a pick can reach a session
+# from outside romp entirely. A pick made through a SURFACE is not inferred at all: _set_model_or_park
+# hands it to _human_picked_model, which refills on the spot (that is the seed=True set — every pick
+# romp did not make itself). The inference covers the rest — a /model typed straight into a tmux pane,
+# say: the session leaving the fallback WHILE romp is stood down and not because of a pick of romp's
+# own. Both halves of THAT test are load-bearing, because "off the fallback" on its own is ALSO what a
+# restore landing looks like:
+#   - the stand-down is LATCHED, so a restore landing before the budget runs out can't refill it; and
+#   - a restore romp fired but has not yet seen land is remembered (_model_restore_inflight), so the
+#     departure it causes is attributed to romp and consumed rather than read as a hand pick. Without
+#     that, the last restore of a budget landing AFTER the stand-down latched (the pick is sent at one
+#     push and the model reads back several pushes later — a whole flagged turn can happen in between)
+#     refills the budget and starts the loop over. That is not hypothetical: it is what this machine's
+#     journal shows, a stand-down at 19:19:27 and a fresh restore ten seconds later, all night.
+# The conservative direction is deliberate: an out-of-band pick that lands while a restore of romp's is
+# still in flight is attributed to romp, so in that one case it costs a second pick (or a kernel
+# restart, which refills everything) — never a loop. A pick through a surface is never affected: it
+# refills through _human_picked_model without going near the inference.
+# Nothing else refills it: not a clean turn (a session alternating flag/clean would then never exhaust
+# it), not the passage of time.
+#
+# WHERE it puts the session back is NOT the model it was flagged off (the user 2026-08-18). Restoring
+# the original model was the first design and this machine's own journal is the case against it: the
+# swap fires on the way OUT of Fable, so putting the session straight back on Fable hands the
+# safeguards the same model that just tripped them — restore, re-flag, restore, re-flag, the budget
+# spent and a stand-down inside two minutes, then a hand-pick refill and the same loop again, all
+# night. So the restore targets the CLI's own "Default" instead: whatever `default` resolves to on this
+# box (Opus 5 here, from the settings.json model), which is a model the safeguards are not bouncing.
+# Deliberately NOT the `opus` alias, which reads as Opus 4.8 — that IS the fallback the swap moved it
+# to. The cost is honest and small: a session the user had hand-picked onto, say, Sonnet comes back on
+# Default rather than Sonnet. A restore that sticks on a model nobody minds beats a restore that is
+# undone ten seconds later on the model they wanted.
 _MODEL_RESTORE_BUDGET = 5     # restores per session before romp stops trying
+_MODEL_RESTORE_TARGET = "default"   # the CLI's own "Default (recommended)" option: `/model <name>` documents
+                                    # "…, default, or a full model ID" for the tmux path, and the SDK backend
+                                    # maps 'default' to set_model(None). Repointing the restore is this line.
 _model_restored = {}      # {sid: turn_id} — the downgrade turn already answered. In memory, like _auto_retried:
                           # a kernel restart re-arms, which is right — a session still parked on the fallback
                           # model after a restart genuinely does still want putting back.
@@ -13637,28 +13676,88 @@ _model_restore_spent = {}  # {sid: n} — restores already spent against the bud
                            # asked for; it is not a way for an unattended session to loop forever.
 _model_stood_down = {}     # {sid: True} — budget spent AND a swap left standing: romp has declined to act
                            # and said so once. Cleared by the human pick that refills the budget.
+_model_restore_inflight = {}   # {sid: True} — romp fired a restore and has not yet seen the session leave
+                               # the fallback. The next departure is therefore ITS doing, not a human's.
 
 
-def _model_family_alias(model_id):
-    """The MODEL_CHOICES alias a raw model id belongs to ('claude-fable-5' → 'fable'), or '' when it
-    names no known family. Same claude-<family>-… split _alias_reflects uses, kept to the four values
-    the picker offers so an unrecognised id can never be handed to set_model as a model name."""
-    m = (model_id or "").lower()
-    fam = m.split("-")[1] if m.startswith("claude-") and "-" in m else m
-    return fam if fam in _MODEL_VALUES else ""
+_model_hand_picked = {}    # {sid: turn_id|None} — the swap that was standing when a human last picked a
+                           # model. Consumed by the next tick, which leaves THAT swap alone (a later one
+                           # is a new event their pick can't have been about).
 
 
-_newest_swap_cache = {}       # {path: ((mtime, size), (turn_id, back_alias, onto_alias) | None)}
+def _human_picked_model(sid):
+    """A model pick came from a SURFACE (chat, timeline, a typed /model) — so the human is at the wheel
+    for this session, right now, with no inference needed. _set_model_or_park calls this for every
+    seeded pick, which is exactly the set of picks romp did not make itself. Three things follow:
+
+    Whatever romp had in flight is theirs to override; a stood-down session earns its fresh set of
+    restores here rather than being deduced from the model changing later; and the swap standing right
+    now is RETIRED unspent, because they just chose. That last one is the case the live-model test can
+    never see: picking the fallback model itself (the picker's "Opus" resolves to Opus 4.8 here, which
+    IS what the safeguards move sessions to) leaves the badge reading exactly like an untouched
+    downgrade, and romp would move them off a model they had just deliberately chosen.
+
+    What is remembered is WHICH swap was standing when they picked, not merely that they picked: a
+    session that gets flagged again afterwards has a new swap the pick cannot have been a verdict on,
+    and that one is romp's to answer as usual."""
+    _model_restore_inflight.pop(sid, None)
+    path = _path_of(sid)
+    session = _parse_cached(path) if path else None
+    newest = _newest_downgrade(path, session) if session else None
+    _model_hand_picked[sid] = newest[0] if newest else None
+    if _model_stood_down.pop(sid, None):
+        _model_restore_spent.pop(sid, None)
+
+
+def _model_display_name(model_id):
+    """A raw model id → the badge name a live session shows for it ('claude-opus-4-8' → 'Opus 4.8'), or
+    '' for anything that does not name a Claude model. Mirrors romp_sdk_backend.pretty_model, duplicated
+    here for the reason _alias_reflects is (a tmux-only box never imports the SDK module) — except that
+    an unrecognised id resolves to '' instead of passing through: every caller below reads '' as "romp
+    cannot tell what this is", which is the reading that makes it keep its hands off.
+
+    Mirroring it EXACTLY is what makes the version-exact test below safe. An SDK session's badge is
+    pretty_model() of the id its own turns reported, so the two sides of that comparison are the same
+    function over the same id: a shape neither handles well (a dated id with no minor version —
+    'claude-opus-4-20250514' → 'Opus 4.20250514') is mangled identically on both sides and they still
+    agree. Fixing one without the other is what would break matching, so keep them in step."""
+    m = re.match(r"claude-([a-z]+)-(\d+)(?:[-.](\d+))?", (model_id or "").strip().lower())
+    if not m:
+        return ""
+    fam, maj, minor = m.groups()
+    return "%s %s%s" % (fam.capitalize(), maj, "." + minor if minor else "")
+
+
+def _is_on_model(live_pretty, name):
+    """Is the session's live badge THIS model — version and all ('Opus 4.8', not merely something Opus)?
+    Version-EXACT on purpose, unlike _alias_reflects's family test, because the restore target and the
+    safeguards' fallback are now one family and two models (Opus 5 vs Opus 4.8). A family test would read
+    a restore that WORKED as "still on the fallback", and would wave off a later Opus 5 → Opus 4.8 swap as
+    no swap at all, leaving the session parked on 4.8 with the mechanism that exists to spot that silent.
+    A bare version-less badge ('Opus', which a session carries until one of its turns reports the real
+    name) matches nothing: which Opus that is would be a guess, and waiting a push costs nothing."""
+    live = (live_pretty or "").strip().lower()
+    want = (name or "").strip().lower()
+    return bool(want) and (live == want or live.startswith(want + " "))
+
+
+_newest_swap_cache = {}       # {path: ((mtime, size), (turn_id, off_name, onto_name) | None)}
 
 
 def _newest_downgrade(path, session):
-    """The transcript's most recent safeguards swap as (turn_id, back_alias, onto_alias), or None —
-    where `back` is the family to return to and `onto` the family it was moved to. CACHED by the
-    transcript's (mtime, size), like _api_error: the scan walks atoms newest-first and stops at the
-    first swap, but a session that has never been flagged (the overwhelmingly common case) has no
-    such stopping point and would be walked end to end on every push. Unrecognised or same-family
-    pairings resolve to None here rather than at the caller, so a model name romp doesn't know can
-    never reach set_model."""
+    """The transcript's most recent safeguards swap as (turn_id, off_name, onto_name); (turn_id, '', '')
+    when the newest one is a pairing romp cannot read; None when the transcript carries no swap at all.
+    Those last two are deliberately NOT the same answer: "no swap" and "moved off the fallback" mean
+    there is nothing standing over this session, while "unreadable" means romp is blind to it — and the
+    budget refill below must not read blindness as a human at the wheel. Where
+    `off` is the model it was flagged off and `onto` the model it was moved to, both as the display names
+    a live badge carries ('Fable 5', 'Opus 4.8'). CACHED by the transcript's (mtime, size), like
+    _api_error: the scan walks atoms newest-first and stops at the first swap, but a session that has
+    never been flagged (the overwhelmingly common case) has no such stopping point and would be walked
+    end to end on every push. A pairing romp cannot read resolves to None here rather than at the caller:
+    an unreadable `onto` leaves no way to tell whether the swap still stands, and an unreadable `off`
+    means the session was on something romp does not recognise (a gateway-routed model, say), where
+    moving it to the CLI default would be overruling a choice it cannot even name."""
     try:
         st = os.stat(path)
         key = (st.st_mtime, st.st_size)
@@ -13671,10 +13770,10 @@ def _newest_downgrade(path, session):
     for turn in reversed(session.get("turns") or []):
         for a in reversed(turn.get("atoms") or []):
             if a.get("type") == "system" and a.get("subtype") == "model_refusal_fallback":
-                back = _model_family_alias(a.get("fallback_from"))
-                onto = _model_family_alias(a.get("fallback_to"))
-                if back and onto and back != onto:
-                    found = (turn.get("id"), back, onto)
+                off = _model_display_name(a.get("fallback_from"))
+                onto = _model_display_name(a.get("fallback_to"))
+                found = ((turn.get("id"), off, onto) if off and onto and off != onto
+                         else (turn.get("id"), "", ""))
                 seen = True              # the NEWEST swap decides, even when it's a pairing we can't act
                 break                    # on — an older one it superseded must never be resurrected
         if seen:
@@ -13687,21 +13786,22 @@ def _newest_downgrade(path, session):
 
 
 def _downgrade_in_force(path, session, live_model):
-    """The session's most recent safeguards downgrade that is STILL in force, as (turn_id, alias): the
-    turn the swap happened on, and the alias to put the session back on. None when the transcript
-    carries no such swap, or when the session has since moved OFF the model the swap moved it to —
-    picked back by hand, or moved somewhere else entirely. Either way that is a live human decision
-    and not ours to overrule, so only the LATEST swap counts and a stale one is dropped."""
+    """The session's most recent safeguards downgrade that is STILL in force, as (turn_id, off_name): the
+    turn the swap happened on, and the model it was flagged off (for the messages — the restore itself
+    goes to _MODEL_RESTORE_TARGET, not there). None when the transcript carries no such swap, or when the
+    session has since moved OFF the model the swap moved it to — picked back by hand, moved somewhere
+    else, or put on the default by a restore that landed. Either way that is a live decision and not ours
+    to overrule, so only the LATEST swap counts and a stale one is dropped."""
     newest = _newest_downgrade(path, session)
-    if not newest:
+    if not newest or not newest[2]:      # no swap, or one romp can't read → nothing it may act on
         return None
-    turn_id, back, onto = newest
-    if not _alias_reflects(live_model, onto):
+    turn_id, off, onto = newest
+    if not _is_on_model(live_model, onto):
         return None                      # no longer on the fallback → the swap is already undone
-    return (turn_id, back)
+    return (turn_id, off)
 
 
-def _stand_down_on_restores(sid, back, live):
+def _stand_down_on_restores(sid, off, live):
     """Say, ONCE, that romp has spent this session's restore budget and is leaving it on the fallback.
     Standing down quietly would put the session back exactly where the restore was built to rescue it
     from — parked on a model nobody chose, with nobody aware — so the stand-down goes out on the same
@@ -13710,17 +13810,16 @@ def _stand_down_on_restores(sid, back, live):
                      "model is picked by hand\n" % (sid, _MODEL_RESTORE_BUDGET, live or "the fallback"))
     if _notify_muted(sid):
         return
-    label = next((m["label"] for m in MODEL_CHOICES if m["value"] == back), back)
     _notify("romp: %s" % (_name_of(sid) or sid[:8]),
-            "Safeguards keep moving this off %s — put back %d times already, so romp has stopped "
-            "trying. It's on %s now; pick a model to hand it a fresh set."
-            % (label, _MODEL_RESTORE_BUDGET, live or "a fallback model"),
+            "Safeguards keep moving this off %s — romp has put it back on the default model %d times "
+            "and has stopped trying. It's on %s now; pick a model to hand it a fresh set."
+            % (off or "its model", _MODEL_RESTORE_BUDGET, live or "a fallback model"),
             priority="high", tags="warning", sid=sid)
 
 
 def _auto_restore_model_tick(now, tmux):
-    """Put a session the safeguards bumped off its model back onto it, at the next idle — up to
-    _MODEL_RESTORE_BUDGET times, after which romp stands down and says so. Runs every push and is
+    """Put a session the safeguards bumped off its model back on _MODEL_RESTORE_TARGET, at the next idle
+    — up to _MODEL_RESTORE_BUDGET times, after which romp stands down and says so. Runs every push and is
     cheap when there is nothing to undo: a cached parse plus a dict lookup per session, and the
     transcript scan stops at the newest swap."""
     for s in _alive_sessions(now, tmux):
@@ -13732,28 +13831,47 @@ def _auto_restore_model_tick(now, tmux):
         tm = tmux.get(sid) or {}
         hit = _downgrade_in_force(path, session, tm.get("model") or "")
         if not hit:
-            _model_restored.pop(sid, None)   # back on its own model → re-arm for the next swap
-            if _model_stood_down.pop(sid, None):
-                _model_restore_spent.pop(sid, None)   # stood down, and it moved off the fallback anyway →
-            continue                                  # a human did that, so hand it a fresh budget
-        turn_id, back = hit
+            _model_restored.pop(sid, None)   # off the fallback → re-arm for the next swap
+            _model_hand_picked.pop(sid, None)                  # nothing standing for it to retire
+            ours = _model_restore_inflight.pop(sid, None)      # this departure is the restore we fired
+            newest = _newest_downgrade(path, session)          # cached — this is a dict hit
+            readable = not newest or newest[2]   # a swap romp CAN'T read is not the session moving off it
+            if readable and not ours and _model_stood_down.pop(sid, None):
+                _model_restore_spent.pop(sid, None)            # stood down and something else moved it off
+            continue                                           # the fallback → a human did that: fresh set
+        turn_id, off = hit
+        if _model_hand_picked.pop(sid, None) == turn_id:
+            _model_restored[sid] = turn_id   # a human picked while this swap stood (possibly onto the
+            continue                         # fallback itself) — their call retires it, and unspent
         if _model_restored.get(sid) == turn_id:
             continue                     # this turn's swap is already answered — one try per turn
         spent = _model_restore_spent.get(sid, 0)
         if spent >= _MODEL_RESTORE_BUDGET:
             if not _model_stood_down.get(sid):
                 _model_stood_down[sid] = True         # the budget is spent and a swap is standing: this is
-                _stand_down_on_restores(sid, back, tm.get("model") or "")   # the moment it's genuinely
-            continue                                                        # stuck, so say so — once
+                _stand_down_on_restores(sid, off, tm.get("model") or "")     # the moment it's genuinely
+            continue                                                         # stuck, so say so — once
         if _working_now(sid) or _compacting_now(sid) or _clearing_now(sid):
             continue                     # mid-turn: the pick waits for idle, it does not land in a live turn
         if _model_pending_now(sid, tm):
             continue                     # a switch is already in flight (ours or a click) — let it resolve
         _model_restored[sid] = turn_id
         _model_restore_spent[sid] = spent + 1
-        _set_model_or_park(Sessions.backend_for(sid), sid, back)
-        sys.stderr.write("model-restore: %s — safeguards moved it to %s, put back on %s at idle (%d/%d)\n"
-                         % (sid, tm.get("model") or "?", back, spent + 1, _MODEL_RESTORE_BUDGET))
+        _model_restore_inflight[sid] = True    # the departure this causes is ours, not a hand pick
+        # seed=False: romp picked this, not the user, so it moves THIS session and must not become the
+        # model the next NEW session is seeded with (that seed is the user's own last pick — Fable here).
+        if _set_model_or_park(Sessions.backend_for(sid), sid, _MODEL_RESTORE_TARGET, seed=False) is False:
+            # the backend REFUSED outright (the SDK's set_model does that for a sid with no registry
+            # entry — a session mid-teardown). Nothing was picked, so nothing was spent: give the slot
+            # and the turn back, or a session could be stood down having never once been put back.
+            # (A park returns None, not False — a queued pick is still going to happen.)
+            _model_restored.pop(sid, None)
+            _model_restore_spent[sid] = spent
+            _model_restore_inflight.pop(sid, None)
+            continue
+        sys.stderr.write("model-restore: %s — safeguards moved it off %s to %s, put back on %s at idle "
+                         "(%d/%d)\n" % (sid, off, tm.get("model") or "?", _MODEL_RESTORE_TARGET,
+                                        spent + 1, _MODEL_RESTORE_BUDGET))
         _push_soon()
 
 
@@ -13825,8 +13943,8 @@ def _apply_pending_ops():
                     ops.pop(0)
                     break                             # the compaction must finish first
                 elif op[0] == "model":
-                    be.set_model(sid, op[1])
-                    ops.pop(0)
+                    be.set_model(sid, op[1], seed=op[2] if len(op) > 2 else True)   # 2-tuple = a park from
+                    ops.pop(0)                                  # an older kernel (or a surface): it seeds
                 elif op[0] == "effort":
                     be.set_effort(sid, op[1])
                     ops.pop(0)

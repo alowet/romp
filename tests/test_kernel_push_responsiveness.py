@@ -51,7 +51,7 @@ class _FakeBackend:
     def interrupt(self, sid):
         self.calls.append(("interrupt", sid)); return True
 
-    def set_model(self, sid, value):
+    def set_model(self, sid, value, seed=True):
         self.calls.append(("set_model", sid, value)); return True
 
     def set_effort(self, sid, value):
