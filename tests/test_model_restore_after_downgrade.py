@@ -266,14 +266,23 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
         self.assertEqual(self.be.calls, [(SID, km._MODEL_RESTORE_TARGET, False)])
 
     def test_a_fresh_downgrade_on_a_later_turn_gets_its_own_restore(self):
-        tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
-        km._auto_restore_model_tick(NOW, tmux)
-        # the switch lands, the session runs a clean turn on its own model, then gets flagged again
-        tmux = self._arm(flagged_turn(1, T0) + clean_turn(2, T0 + 200) + flagged_turn(3, T0 + 400),
-                         "Opus 4.8")
-        km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, km._MODEL_RESTORE_TARGET, False), (SID, km._MODEL_RESTORE_TARGET, False)],
-                         "across turns a new flag is a new turn and earns its own restore (up to the budget)")
+        # The subject here is the TURN KEY, not the budget: _model_restored is keyed on the flagged
+        # turn's id, so a later turn must not be waved off as already-answered. The shipped budget is
+        # 1, which would refuse the second restore for an entirely different reason and hide whether
+        # the key works at all — so this one test buys itself the room to see the mechanism.
+        saved, km._MODEL_RESTORE_BUDGET = km._MODEL_RESTORE_BUDGET, 2
+        try:
+            tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
+            km._auto_restore_model_tick(NOW, tmux)
+            # the switch lands, the session runs a clean turn on its own model, then gets flagged again
+            tmux = self._arm(flagged_turn(1, T0) + clean_turn(2, T0 + 200) + flagged_turn(3, T0 + 400),
+                             "Opus 4.8")
+            km._auto_restore_model_tick(NOW, tmux)
+            self.assertEqual(self.be.calls,
+                             [(SID, km._MODEL_RESTORE_TARGET, False), (SID, km._MODEL_RESTORE_TARGET, False)],
+                             "across turns a new flag is a new turn and earns its own restore")
+        finally:
+            km._MODEL_RESTORE_BUDGET = saved
 
     def test_it_never_fires_into_a_live_turn(self):
         tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
@@ -360,6 +369,29 @@ class TheRestoreBudgetStopsItLoopingForever(_RestoreTickHarness):
 
     def _budget(self):
         return km._MODEL_RESTORE_BUDGET
+
+    def test_the_budget_is_one_try(self):
+        """A second flag after a restore is already the answer — the safeguards have objected to this
+        session twice and romp's own restore is part of why, so it hands over rather than spending more
+        attempts to learn the same thing (the user 2026-08-21, who cut this from five)."""
+        self.assertEqual(km._MODEL_RESTORE_BUDGET, 1)
+        self._flag_again(1)
+        self.assertEqual(len(self.be.calls), 1, "the one restore lands")
+        self.assertEqual(self.notified, [], "nothing to say yet — it was put back")
+        self._flag_again(2)
+        self.assertEqual(len(self.be.calls), 1, "the second flag is left standing, not fed again")
+        self.assertEqual(len(self.notified), 1, "…and handed over, out loud")
+
+    def test_the_stand_down_messages_read_correctly_at_this_budget(self):
+        """The budget is a COUNT dropped into the one line a user actually reads, and at 1 the obvious
+        "%d times" renders "1 times". Both messages go through _times."""
+        self.assertEqual((km._times(1), km._times(2), km._times(5)), ("once", "twice", "5 times"))
+        for n in range(1, self._budget() + 2):
+            self._flag_again(n)
+        self.assertEqual(len(self.notified), 1)
+        body = " ".join(str(x) for x in self.notified[0])
+        self.assertNotIn("1 times", body)
+        self.assertIn(km._times(km._MODEL_RESTORE_BUDGET), body)
 
     def test_it_stops_after_the_budget_and_says_so_exactly_once(self):
         for n in range(1, self._budget() + 1):

@@ -13644,6 +13644,14 @@ def _set_fast_or_park(be, sid, value):
 # that romp stands down and leaves it on the fallback, and says so once (stderr + a notification),
 # because a silent stand-down would recreate the invisibility this whole mechanism exists to fix.
 #
+# ONE restore, since 2026-08-21 (was five). The budget is not a retry allowance — it is how many times
+# romp is willing to be wrong about a session before it stops. A second flag after a restore is already
+# the answer: the safeguards have now objected to this session twice, and the first restore is part of
+# why. Spending four more attempts to learn that costs four more flags against the account, and the
+# thing being protected against is precisely an accumulation of them. One try, then hand it over.
+# The refill machinery below matters MORE at this size, not less — with a single restore in the pocket,
+# a stand-down that fails to lift when a human takes the wheel would strand the session for good.
+#
 # The budget refills when a human takes the wheel — read two ways, because a pick can reach a session
 # from outside romp entirely. A pick made through a SURFACE is not inferred at all: _set_model_or_park
 # hands it to _human_picked_model, which refills on the spot (that is the seed=True set — every pick
@@ -13670,13 +13678,12 @@ def _set_fast_or_park(be, sid, value):
 # swap fires on the way OUT of Fable, so putting the session straight back on Fable hands the
 # safeguards the same model that just tripped them — restore, re-flag, restore, re-flag, the budget
 # spent and a stand-down inside two minutes, then a hand-pick refill and the same loop again, all
-# night. So the restore targets the CLI's own "Default" instead: whatever `default` resolves to on this
-# box (Opus 5 here, from the settings.json model), which is a model the safeguards are not bouncing.
-# Deliberately NOT the `opus` alias, which reads as Opus 4.8 — that IS the fallback the swap moved it
-# to. The cost is honest and small: a session the user had hand-picked onto, say, Sonnet comes back on
-# Default rather than Sonnet. A restore that sticks on a model nobody minds beats a restore that is
-# undone ten seconds later on the model they wanted.
-_MODEL_RESTORE_BUDGET = 5     # restores per session before romp stops trying
+# night. So the restore targets _MODEL_RESTORE_TARGET, one named model, chosen to match what new
+# sessions are seeded with — see that constant for why it is spelled out rather than deferred to the
+# CLI's "Default". The cost is honest and small: a session the user had hand-picked onto, say, Sonnet
+# comes back on the target rather than Sonnet. A restore that sticks on a model nobody minds beats a
+# restore that is undone ten seconds later on the model they wanted.
+_MODEL_RESTORE_BUDGET = 1     # restores per session before romp stops trying (the user 2026-08-21)
 _MODEL_RESTORE_TARGET = "claude-opus-5[1m]"   # the model a flagged session is put BACK on. Repointing the
                                     # restore is this line. It was "default" — the CLI's own "Default
                                     # (recommended)" option, which `/model <name>` documents alongside a full
@@ -13830,21 +13837,29 @@ def _downgrade_in_force(path, session, live_model):
     return (turn_id, off)
 
 
+def _times(n):
+    """A count as English: once / twice / N times. The stand-down messages quote the restore budget,
+    and the budget is small enough that a bare "%d times" renders "1 times" — on the one line a user
+    actually reads, at the moment romp is admitting it gave up."""
+    return {1: "once", 2: "twice"}.get(n, "%d times" % n)
+
+
 def _stand_down_on_restores(sid, off, live):
     """Say, ONCE, that romp has spent this session's restore budget and is leaving it on the fallback.
     Standing down quietly would put the session back exactly where the restore was built to rescue it
     from — parked on a model nobody chose, with nobody aware — so the stand-down goes out on the same
     transports the feed's bells use (_system_notify + _push_notify), and the session's own bell
     (_notify_session_effective: its override, else the master) still governs it."""
-    sys.stderr.write("model-restore: %s — %d restores spent, standing down; it stays on %s until a "
-                     "model is picked by hand\n" % (sid, _MODEL_RESTORE_BUDGET, live or "the fallback"))
+    sys.stderr.write("model-restore: %s — put back %s, flagged again, standing down; it stays on %s "
+                     "until a model is picked by hand\n"
+                     % (sid, _times(_MODEL_RESTORE_BUDGET), live or "the fallback"))
     if not _notify_session_effective(sid):
         return                           # this session's bell is off — the stderr line above still stands
     title = "romp: %s" % (_name_of(sid) or sid[:8])
-    body = ("Safeguards keep moving this off %s — romp has put it back on %s %d times and has stopped "
-            "trying. It's on %s now; pick a model to hand it a fresh set."
+    body = ("Safeguards keep moving this off %s — romp put it back on %s %s and it happened again, so "
+            "it has stopped trying. It's on %s now; pick a model to hand it another go."
             % (off or "its model", _model_display_name(_MODEL_RESTORE_TARGET) or "its model",
-               _MODEL_RESTORE_BUDGET, live or "a fallback model"))
+               _times(_MODEL_RESTORE_BUDGET), live or "a fallback model"))
     _system_notify(title, body)
     _push_notify(title, body, sid)       # …and the phone, the same pair the feed's bells go out on
 
