@@ -245,15 +245,15 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
     def test_an_idle_downgraded_session_is_put_back(self):
         tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "default", False)],
-                         "the swap is undone at idle — onto the CLI default, and not as a new-session seed")
+        self.assertEqual(self.be.calls, [(SID, km._MODEL_RESTORE_TARGET, False)],
+                         "the swap is undone at idle — onto the restore target, and not as a new-session seed")
 
     def test_it_does_not_fire_twice_for_the_same_flagged_turn(self):
         tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
         km._auto_restore_model_tick(NOW, tmux)
         km._auto_restore_model_tick(NOW, tmux)      # the switch has not landed yet — model still reads Opus
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "default", False)],
+        self.assertEqual(self.be.calls, [(SID, km._MODEL_RESTORE_TARGET, False)],
                          "one restore per flagged turn — a re-flagged turn is answered once, not per flag")
 
     def test_a_turn_flagged_twice_still_earns_only_one_restore(self):
@@ -263,7 +263,7 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
         tmux = self._arm(recs, "Opus 4.8")
         km._auto_restore_model_tick(NOW, tmux)
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "default", False)])
+        self.assertEqual(self.be.calls, [(SID, km._MODEL_RESTORE_TARGET, False)])
 
     def test_a_fresh_downgrade_on_a_later_turn_gets_its_own_restore(self):
         tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
@@ -272,7 +272,7 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
         tmux = self._arm(flagged_turn(1, T0) + clean_turn(2, T0 + 200) + flagged_turn(3, T0 + 400),
                          "Opus 4.8")
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "default", False), (SID, "default", False)],
+        self.assertEqual(self.be.calls, [(SID, km._MODEL_RESTORE_TARGET, False), (SID, km._MODEL_RESTORE_TARGET, False)],
                          "across turns a new flag is a new turn and earns its own restore (up to the budget)")
 
     def test_it_never_fires_into_a_live_turn(self):
@@ -282,7 +282,7 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
         self.assertEqual(self.be.calls, [], "mid-turn the pick waits — it does not land in an open turn")
         km._working_now = lambda sid: False
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "default", False)],
+        self.assertEqual(self.be.calls, [(SID, km._MODEL_RESTORE_TARGET, False)],
                          "…and lands the moment the session settles")
 
     def test_a_compaction_parks_it_instead_of_dropping_it(self):
@@ -292,7 +292,7 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
         self.assertEqual(self.be.calls, [], "a compaction is not idle")
         km._compacting_now = lambda sid: False
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "default", False)])
+        self.assertEqual(self.be.calls, [(SID, km._MODEL_RESTORE_TARGET, False)])
 
     def test_a_switch_already_in_flight_is_left_to_resolve(self):
         tmux = self._arm(flagged_turn(1, T0), "Opus 4.8")
@@ -319,7 +319,7 @@ class TheRestoreFiresAtIdleOncePerTurn(_RestoreTickHarness):
 
         tmux = self._arm(flagged_turn(1, T0) + flagged_turn(2, T0 + 300), "Opus 4.8")
         km._auto_restore_model_tick(NOW, tmux)
-        self.assertEqual(self.be.calls, [(SID, "default", False)],
+        self.assertEqual(self.be.calls, [(SID, km._MODEL_RESTORE_TARGET, False)],
                          "a flag AFTER their pick is a new event their pick was not a verdict on")
 
     def test_a_backend_that_refuses_the_pick_spends_nothing(self):
@@ -453,8 +453,27 @@ class TheRestoreBudgetStopsItLoopingForever(_RestoreTickHarness):
         self._flag_again(self._budget() + 2, frm="claude-sonnet-5")
         self.assertEqual(len(self.be.calls), self._budget() + 1,
                          "a human back at the wheel earns the session a fresh set of restores")
-        self.assertEqual(self.be.calls[-1], (SID, "default", False),
-                         "the restore target does not follow what they picked — it is always the default")
+        self.assertEqual(self.be.calls[-1], (SID, km._MODEL_RESTORE_TARGET, False),
+                         "the restore target does not follow what they picked — it is always the target")
+
+
+class TheRestoreTargetNamesItsModel(unittest.TestCase):
+    """The target must be a MODEL ID, never "default" (the user 2026-08-21). "default" defers to
+    ~/.claude/settings.json, which is edited for reasons that have nothing to do with romp — so the
+    restore silently changed which model it restored TO when that file moved to another family, and a
+    session started on one model came back from a safeguards swap on another with nothing saying so.
+    Naming the model is also what lets the version-exact matcher read the target at all."""
+
+    def test_the_target_is_a_readable_model_id_not_the_settings_default(self):
+        self.assertNotEqual(km._MODEL_RESTORE_TARGET, "default",
+                            "the restore must not inherit whatever settings.json currently calls default")
+        self.assertTrue(km._model_display_name(km._MODEL_RESTORE_TARGET),
+                        "and it must be an id the badge matcher can read")
+
+    def test_a_restore_that_lands_on_the_target_reads_as_the_swap_undone(self):
+        # the mechanism's own consistency check: _downgrade_in_force must see a session sitting on the
+        # target as no longer downgraded, or the restore would re-fire against its own success.
+        self.assertFalse(km._is_on_model(km._model_display_name(km._MODEL_RESTORE_TARGET), "Opus 4.8"))
 
 
 if __name__ == "__main__":

@@ -13677,9 +13677,25 @@ def _set_fast_or_park(be, sid, value):
 # Default rather than Sonnet. A restore that sticks on a model nobody minds beats a restore that is
 # undone ten seconds later on the model they wanted.
 _MODEL_RESTORE_BUDGET = 5     # restores per session before romp stops trying
-_MODEL_RESTORE_TARGET = "default"   # the CLI's own "Default (recommended)" option: `/model <name>` documents
-                                    # "…, default, or a full model ID" for the tmux path, and the SDK backend
-                                    # maps 'default' to set_model(None). Repointing the restore is this line.
+_MODEL_RESTORE_TARGET = "claude-opus-5[1m]"   # the model a flagged session is put BACK on. Repointing the
+                                    # restore is this line. It was "default" — the CLI's own "Default
+                                    # (recommended)" option, which `/model <name>` documents alongside a full
+                                    # model ID and which the SDK backend maps to set_model(None) — chosen when
+                                    # ~/.claude/settings.json's own default WAS this model. That indirection
+                                    # is the problem: settings.json later moved to a different family, and the
+                                    # restore silently followed it, so a session started on Opus 5 came back
+                                    # from a swap on something else entirely with nothing saying so. Name the
+                                    # model instead, and keep it in step with the model new sessions are
+                                    # seeded with (sdk-defaults.json) — otherwise one safeguards flag is all
+                                    # it takes for the default to stop meaning anything (the user 2026-08-21).
+                                    #
+                                    # Naming the seed does mean the restore can put a session back on the
+                                    # very model that tripped the safeguards, which is the loop the 2026-08-18
+                                    # work moved away from. That is deliberate and already bounded: the
+                                    # 5-restore budget below caps it at five attempts and then stands down
+                                    # loudly. Note the alternative was no safer — "default" had drifted onto
+                                    # the model MOST sessions ran, so the same loop was available to them,
+                                    # just by accident rather than on purpose.
 _model_restored = {}      # {sid: turn_id} — the downgrade turn already answered. In memory, like _auto_retried:
                           # a kernel restart re-arms, which is right — a session still parked on the fallback
                           # model after a restart genuinely does still want putting back.
@@ -13825,9 +13841,10 @@ def _stand_down_on_restores(sid, off, live):
     if not _notify_session_effective(sid):
         return                           # this session's bell is off — the stderr line above still stands
     title = "romp: %s" % (_name_of(sid) or sid[:8])
-    body = ("Safeguards keep moving this off %s — romp has put it back on the default model %d times "
-            "and has stopped trying. It's on %s now; pick a model to hand it a fresh set."
-            % (off or "its model", _MODEL_RESTORE_BUDGET, live or "a fallback model"))
+    body = ("Safeguards keep moving this off %s — romp has put it back on %s %d times and has stopped "
+            "trying. It's on %s now; pick a model to hand it a fresh set."
+            % (off or "its model", _model_display_name(_MODEL_RESTORE_TARGET) or "its model",
+               _MODEL_RESTORE_BUDGET, live or "a fallback model"))
     _system_notify(title, body)
     _push_notify(title, body, sid)       # …and the phone, the same pair the feed's bells go out on
 
@@ -13874,7 +13891,8 @@ def _auto_restore_model_tick(now, tmux):
         _model_restore_spent[sid] = spent + 1
         _model_restore_inflight[sid] = True    # the departure this causes is ours, not a hand pick
         # seed=False: romp picked this, not the user, so it moves THIS session and must not become the
-        # model the next NEW session is seeded with (that seed is the user's own last pick — Fable here).
+        # model the next NEW session is seeded with (that seed is the user's own last pick, which this
+        # target happens to match today but must not overwrite — a repair is never a preference).
         if _set_model_or_park(Sessions.backend_for(sid), sid, _MODEL_RESTORE_TARGET, seed=False) is False:
             # the backend REFUSED outright (the SDK's set_model does that for a sid with no registry
             # entry — a session mid-teardown). Nothing was picked, so nothing was spent: give the slot
