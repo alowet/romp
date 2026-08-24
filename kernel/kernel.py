@@ -13649,29 +13649,19 @@ def _set_fast_or_park(be, sid, value):
 # the answer: the safeguards have now objected to this session twice, and the first restore is part of
 # why. Spending four more attempts to learn that costs four more flags against the account, and the
 # thing being protected against is precisely an accumulation of them. One try, then hand it over.
-# The refill machinery below matters MORE at this size, not less — with a single restore in the pocket,
-# a stand-down that fails to lift when a human takes the wheel would strand the session for good.
 #
-# The budget refills when a human takes the wheel — read two ways, because a pick can reach a session
-# from outside romp entirely. A pick made through a SURFACE is not inferred at all: _set_model_or_park
-# hands it to _human_picked_model, which refills on the spot (that is the seed=True set — every pick
-# romp did not make itself). The inference covers the rest — a /model typed straight into a tmux pane,
-# say: the session leaving the fallback WHILE romp is stood down and not because of a pick of romp's
-# own. Both halves of THAT test are load-bearing, because "off the fallback" on its own is ALSO what a
-# restore landing looks like:
-#   - the stand-down is LATCHED, so a restore landing before the budget runs out can't refill it; and
-#   - a restore romp fired but has not yet seen land is remembered (_model_restore_inflight), so the
-#     departure it causes is attributed to romp and consumed rather than read as a hand pick. Without
-#     that, the last restore of a budget landing AFTER the stand-down latched (the pick is sent at one
-#     push and the model reads back several pushes later — a whole flagged turn can happen in between)
-#     refills the budget and starts the loop over. That is not hypothetical: it is what this machine's
-#     journal shows, a stand-down at 19:19:27 and a fresh restore ten seconds later, all night.
-# The conservative direction is deliberate: an out-of-band pick that lands while a restore of romp's is
-# still in flight is attributed to romp, so in that one case it costs a second pick (or a kernel
-# restart, which refills everything) — never a loop. A pick through a surface is never affected: it
-# refills through _human_picked_model without going near the inference.
-# Nothing else refills it: not a clean turn (a session alternating flag/clean would then never exhaust
-# it), not the passage of time.
+# And NOTHING refills it (the user 2026-08-24, who wanted once per session, not once per flag — it
+# used to refill on a hand pick, and before that on an inferred out-of-band pick). Once the restore is
+# spent, every later flag is left standing: the session stays wherever the safeguards or the user put
+# it, however it got back onto a flaggable model in between. The refill read "a human took the wheel"
+# as licence for a fresh set, but the budget protects the ACCOUNT, and a hand pick changes nothing
+# about what another flag would cost it. A hand pick still does everything else a pick does — it moves
+# the session, and the swap standing at that moment is retired as their call (_model_hand_picked) — it
+# just never re-arms romp. Dropping the refill also dropped the whole attribution problem the old
+# machinery existed for (telling romp's own restore landing apart from a hand pick, the in-flight
+# marker, the readable-swap check): with nothing to refill, nothing needs attributing.
+# The only reset is a kernel restart — this is in-memory state (see _model_restore_spent), and a
+# restart is a deliberate, rare human act, not something an unattended session can loop on.
 #
 # WHERE it puts the session back is NOT the model it was flagged off (the user 2026-08-18). Restoring
 # the original model was the first design and this machine's own journal is the case against it: the
@@ -13699,7 +13689,7 @@ _MODEL_RESTORE_TARGET = "claude-opus-5[1m]"   # the model a flagged session is p
                                     # Naming the seed does mean the restore can put a session back on the
                                     # very model that tripped the safeguards, which is the loop the 2026-08-18
                                     # work moved away from. That is deliberate and already bounded: the
-                                    # 5-restore budget below caps it at five attempts and then stands down
+                                    # budget below allows one attempt per session and then stands down
                                     # loudly. Note the alternative was no safer — "default" had drifted onto
                                     # the model MOST sessions ran, so the same loop was available to them,
                                     # just by accident rather than on purpose.
@@ -13711,9 +13701,8 @@ _model_restore_spent = {}  # {sid: n} — restores already spent against the bud
                            # fresh budget. Restarts are deliberate and rare, so that is a reset a human
                            # asked for; it is not a way for an unattended session to loop forever.
 _model_stood_down = {}     # {sid: True} — budget spent AND a swap left standing: romp has declined to act
-                           # and said so once. Cleared by the human pick that refills the budget.
-_model_restore_inflight = {}   # {sid: True} — romp fired a restore and has not yet seen the session leave
-                               # the fallback. The next departure is therefore ITS doing, not a human's.
+                           # and said so once. Never cleared (the user 2026-08-24): nothing refills the
+                           # budget, so nothing lifts the stand-down short of a kernel restart.
 
 
 _model_hand_picked = {}    # {sid: turn_id|None} — the swap that was standing when a human last picked a
@@ -13724,25 +13713,24 @@ _model_hand_picked = {}    # {sid: turn_id|None} — the swap that was standing 
 def _human_picked_model(sid):
     """A model pick came from a SURFACE (chat, timeline, a typed /model) — so the human is at the wheel
     for this session, right now, with no inference needed. _set_model_or_park calls this for every
-    seeded pick, which is exactly the set of picks romp did not make itself. Three things follow:
+    seeded pick, which is exactly the set of picks romp did not make itself. One thing follows:
 
-    Whatever romp had in flight is theirs to override; a stood-down session earns its fresh set of
-    restores here rather than being deduced from the model changing later; and the swap standing right
-    now is RETIRED unspent, because they just chose. That last one is the case the live-model test can
-    never see: picking the fallback model itself (the picker's "Opus" resolves to Opus 4.8 here, which
-    IS what the safeguards move sessions to) leaves the badge reading exactly like an untouched
-    downgrade, and romp would move them off a model they had just deliberately chosen.
+    The swap standing right now is RETIRED unspent, because they just chose. That is the case the
+    live-model test can never see: picking the fallback model itself (the picker's "Opus" resolves to
+    Opus 4.8 here, which IS what the safeguards move sessions to) leaves the badge reading exactly
+    like an untouched downgrade, and romp would move them off a model they had just deliberately
+    chosen. What is remembered is WHICH swap was standing when they picked, not merely that they
+    picked: a session that gets flagged again afterwards has a new swap the pick cannot have been a
+    verdict on, and that one is romp's to answer — IF its one restore is still unspent.
 
-    What is remembered is WHICH swap was standing when they picked, not merely that they picked: a
-    session that gets flagged again afterwards has a new swap the pick cannot have been a verdict on,
-    and that one is romp's to answer as usual."""
-    _model_restore_inflight.pop(sid, None)
+    What a pick deliberately does NOT do is refill the budget (the user 2026-08-24). It used to, on
+    the reasoning that a human back at the wheel earns romp a fresh set — but the budget protects the
+    account, not the user's attention, and a hand pick changes nothing about what another flag would
+    cost. Once per session means once per session; a stood-down session stays stood down."""
     path = _path_of(sid)
     session = _parse_cached(path) if path else None
     newest = _newest_downgrade(path, session) if session else None
     _model_hand_picked[sid] = newest[0] if newest else None
-    if _model_stood_down.pop(sid, None):
-        _model_restore_spent.pop(sid, None)
 
 
 def _model_display_name(model_id):
@@ -13784,8 +13772,8 @@ def _newest_downgrade(path, session):
     """The transcript's most recent safeguards swap as (turn_id, off_name, onto_name); (turn_id, '', '')
     when the newest one is a pairing romp cannot read; None when the transcript carries no swap at all.
     Those last two are deliberately NOT the same answer: "no swap" and "moved off the fallback" mean
-    there is nothing standing over this session, while "unreadable" means romp is blind to it — and the
-    budget refill below must not read blindness as a human at the wheel. Where
+    there is nothing standing over this session, while "unreadable" means romp is blind to it — and
+    blindness reads as keep-hands-off, never as evidence about what stands over the session. Where
     `off` is the model it was flagged off and `onto` the model it was moved to, both as the display names
     a live badge carries ('Fable 5', 'Opus 4.8'). CACHED by the transcript's (mtime, size), like
     _api_error: the scan walks atoms newest-first and stops at the first swap, but a session that has
@@ -13850,14 +13838,15 @@ def _stand_down_on_restores(sid, off, live):
     from — parked on a model nobody chose, with nobody aware — so the stand-down goes out on the same
     transports the feed's bells use (_system_notify + _push_notify), and the session's own bell
     (_notify_session_effective: its override, else the master) still governs it."""
-    sys.stderr.write("model-restore: %s — put back %s, flagged again, standing down; it stays on %s "
-                     "until a model is picked by hand\n"
+    sys.stderr.write("model-restore: %s — put back %s, flagged again, standing down for this session; "
+                     "it stays on %s unless a model is picked by hand\n"
                      % (sid, _times(_MODEL_RESTORE_BUDGET), live or "the fallback"))
     if not _notify_session_effective(sid):
         return                           # this session's bell is off — the stderr line above still stands
     title = "romp: %s" % (_name_of(sid) or sid[:8])
     body = ("Safeguards keep moving this off %s — romp put it back on %s %s and it happened again, so "
-            "it has stopped trying. It's on %s now; pick a model to hand it another go."
+            "it has stopped trying for this session. It's on %s now; move it by hand if you want it "
+            "elsewhere."
             % (off or "its model", _model_display_name(_MODEL_RESTORE_TARGET) or "its model",
                _times(_MODEL_RESTORE_BUDGET), live or "a fallback model"))
     _system_notify(title, body)
@@ -13878,14 +13867,9 @@ def _auto_restore_model_tick(now, tmux):
         tm = tmux.get(sid) or {}
         hit = _downgrade_in_force(path, session, tm.get("model") or "")
         if not hit:
-            _model_restored.pop(sid, None)   # off the fallback → re-arm for the next swap
+            _model_restored.pop(sid, None)   # off the fallback → this turn's swap is answered
             _model_hand_picked.pop(sid, None)                  # nothing standing for it to retire
-            ours = _model_restore_inflight.pop(sid, None)      # this departure is the restore we fired
-            newest = _newest_downgrade(path, session)          # cached — this is a dict hit
-            readable = not newest or newest[2]   # a swap romp CAN'T read is not the session moving off it
-            if readable and not ours and _model_stood_down.pop(sid, None):
-                _model_restore_spent.pop(sid, None)            # stood down and something else moved it off
-            continue                                           # the fallback → a human did that: fresh set
+            continue                         # (the budget does NOT come back — see the design note above)
         turn_id, off = hit
         if _model_hand_picked.pop(sid, None) == turn_id:
             _model_restored[sid] = turn_id   # a human picked while this swap stood (possibly onto the
@@ -13904,7 +13888,6 @@ def _auto_restore_model_tick(now, tmux):
             continue                     # a switch is already in flight (ours or a click) — let it resolve
         _model_restored[sid] = turn_id
         _model_restore_spent[sid] = spent + 1
-        _model_restore_inflight[sid] = True    # the departure this causes is ours, not a hand pick
         # seed=False: romp picked this, not the user, so it moves THIS session and must not become the
         # model the next NEW session is seeded with (that seed is the user's own last pick, which this
         # target happens to match today but must not overwrite — a repair is never a preference).
@@ -13915,7 +13898,6 @@ def _auto_restore_model_tick(now, tmux):
             # (A park returns None, not False — a queued pick is still going to happen.)
             _model_restored.pop(sid, None)
             _model_restore_spent[sid] = spent
-            _model_restore_inflight.pop(sid, None)
             continue
         sys.stderr.write("model-restore: %s — safeguards moved it off %s to %s, put back on %s at idle "
                          "(%d/%d)\n" % (sid, off, tm.get("model") or "?", _MODEL_RESTORE_TARGET,

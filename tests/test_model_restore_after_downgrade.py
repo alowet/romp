@@ -8,8 +8,9 @@ already carries (system/model_refusal_fallback) arms a restore, and the restore 
 goes quiet, ONE per flagged turn, never into a live turn and never over a model the user chose.
 
 Budgeted, though (the user 2026-08-15): a session flagged over and over is fed straight back into the
-safeguards by an unconditional restore, so after _MODEL_RESTORE_BUDGET of them romp stands down, says
-so once, and waits for a human pick before it will try again.
+safeguards by an unconditional restore, so after _MODEL_RESTORE_BUDGET of them romp stands down and
+says so once. The budget is per SESSION and nothing refills it (the user 2026-08-24) — a hand pick
+moves the session but never re-arms romp; only a kernel restart starts the count over.
 
 And it puts the session on the CLI's "Default" rather than the model it was flagged off (the user
 2026-08-18) — restoring Fable handed the safeguards the model that had just tripped them, and the loop
@@ -212,7 +213,6 @@ class _RestoreTickHarness(unittest.TestCase):
         km._model_restored.clear()
         km._model_restore_spent.clear()
         km._model_stood_down.clear()
-        km._model_restore_inflight.clear()
         km._model_hand_picked.clear()
         km._pending_ops.clear()
         km._model_switch_pending.clear()
@@ -227,7 +227,6 @@ class _RestoreTickHarness(unittest.TestCase):
         km._model_restored.clear()
         km._model_restore_spent.clear()
         km._model_stood_down.clear()
-        km._model_restore_inflight.clear()
         km._model_hand_picked.clear()
         km._pending_ops.clear()
         km._model_switch_pending.clear()
@@ -356,7 +355,11 @@ class TheRestoreBudgetStopsItLoopingForever(_RestoreTickHarness):
     """A session that keeps getting flagged is not helped by being put straight back on the model that
     keeps getting flagged — that just feeds the next flag, unattended, indefinitely, which is the shape
     that risks an account-level lockout (the user 2026-08-15). So the restores are budgeted, romp stands
-    down when the budget runs out, and it says so rather than leaving the session quietly parked."""
+    down when the budget runs out, and it says so rather than leaving the session quietly parked.
+
+    The budget is per SESSION and nothing refills it (the user 2026-08-24, who wanted once per session,
+    not once per flag): not romp's own restore landing, not a clean turn, not an out-of-band move, and
+    not a hand pick — a stood-down session stays stood down until the kernel restarts."""
 
     def setUp(self):
         super().setUp()
@@ -411,7 +414,7 @@ class TheRestoreBudgetStopsItLoopingForever(_RestoreTickHarness):
         self.assertEqual(len(self.be.calls), self._budget(), "stood down stays stood down")
         self.assertEqual(len(self.notified), 1, "one stand-down notice, not one per flag or per push")
 
-    def test_a_restore_that_lands_is_not_mistaken_for_a_hand_pick(self):
+    def test_a_restore_that_lands_does_not_hand_back_the_budget(self):
         for n in range(1, self._budget() + 1):
             self._flag_again(n)
             # the pick lands — the session sits on the default (Opus 5 here) until the next flag
@@ -433,8 +436,9 @@ class TheRestoreBudgetStopsItLoopingForever(_RestoreTickHarness):
         """The loop this whole budget exists to stop, in the shape the journal caught it (2026-08-17,
         19:19:27 stand-down → 19:19:37 restore 1/5). A pick is SENT at one push and the live model reads
         back several pushes later, so the budget can run out and stand down while the last restore is
-        still in flight. When it lands the session leaves the fallback — which looks exactly like a hand
-        pick unless romp remembers that the move was its own."""
+        still in flight; when it lands, the session leaves the fallback. The old refill inferred a hand
+        pick from exactly that departure and needed an in-flight marker to tell them apart — now nothing
+        refills at all, and this pins that the late landing stays consumed rather than re-arming romp."""
         for n in range(1, self._budget() + 2):        # …+1 flag past the budget → stood down, announced
             self._flag_again(n)
         self.assertEqual(len(self.notified), 1)
@@ -446,21 +450,25 @@ class TheRestoreBudgetStopsItLoopingForever(_RestoreTickHarness):
                          "romp's own restore landing is not a human at the wheel — no fresh budget")
         self.assertEqual(len(self.notified), 1, "and no second stand-down notice either")
 
-    def test_an_out_of_band_pick_after_the_restore_landed_still_refills_it(self):
+    def test_an_out_of_band_pick_does_not_refill_it(self):
+        """A /model typed straight into a tmux pane moves the session off the fallback with no surface
+        pick romp can see. The old refill read that departure as a human at the wheel and handed back
+        the budget — which made "once per session" quietly mean "once per flag, given a human who keeps
+        picking". Now the move stands (it is theirs), but romp stays stood down (the user 2026-08-24)."""
         for n in range(1, self._budget() + 2):
             self._flag_again(n)
         spent = len(self.be.calls)
-        km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Opus 5"))   # romp's restore, consumed
+        km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Opus 5"))   # romp's restore lands
         km._auto_restore_model_tick(NOW, self._arm(list(self.recs), "Sonnet 5"))  # and NOW a human picks
         self._flag_again(self._budget() + 2, frm="claude-sonnet-5")
-        self.assertEqual(len(self.be.calls), spent + 1,
-                         "the move romp cannot account for is the human's, and it earns a fresh set")
+        self.assertEqual(len(self.be.calls), spent,
+                         "their move is theirs to make, but it does not earn romp another restore")
+        self.assertEqual(len(self.notified), 1, "and the stand-down is not re-announced")
 
     def test_a_swap_romp_cannot_read_does_not_hand_back_the_budget(self):
-        """The refill infers a human from the session leaving the fallback. A swap whose models romp
-        can't name also makes the swap unreadable — but the session has not moved anywhere, nobody has
-        touched it, and reading that as a hand pick would quietly undo the cap that exists to keep an
-        unattended session from cycling restores into the safeguards all night."""
+        """A swap whose models romp can't name leaves it blind: the session has not moved anywhere and
+        nobody has touched it. Blindness must read as keep-hands-off — never as anything that would undo
+        the cap that keeps an unattended session from cycling restores into the safeguards all night."""
         for n in range(1, self._budget() + 2):
             self._flag_again(n)
         spent = len(self.be.calls)
@@ -472,21 +480,23 @@ class TheRestoreBudgetStopsItLoopingForever(_RestoreTickHarness):
         self._flag_again(self._budget() + 2)
         self.assertEqual(len(self.be.calls), spent, "still stood down — nothing about this was a human")
 
-    def test_a_hand_pick_while_stood_down_hands_it_a_fresh_budget(self):
+    def test_a_hand_pick_while_stood_down_does_not_refill_it(self):
+        """The refill this replaces (the user 2026-08-24): a surface pick used to hand a stood-down
+        session a fresh set of restores, so over a long day romp could restore once per hand pick — not
+        once per session. The pick still lands (it is the human's call, and the swap standing at that
+        moment is retired as theirs), but romp's own restore stays spent for good."""
         for n in range(1, self._budget() + 2):
             self._flag_again(n)
         self.assertEqual(len(self.notified), 1, "stood down, and the user has been told")
 
-        # the user picks a model themselves, through a surface — the pick romp can SEE being made, so
-        # the refill needs no inference at all (and none of romp's own picks are seeded this way)
         km._compacting_now = lambda sid: False
-        km._set_model_or_park(self.be, SID, "sonnet")
+        km._set_model_or_park(self.be, SID, "sonnet")   # the user picks a model themselves, via a surface
         self.be.calls.pop()                             # their pick is not one of romp's restores
         self._flag_again(self._budget() + 2, frm="claude-sonnet-5")
-        self.assertEqual(len(self.be.calls), self._budget() + 1,
-                         "a human back at the wheel earns the session a fresh set of restores")
-        self.assertEqual(self.be.calls[-1], (SID, km._MODEL_RESTORE_TARGET, False),
-                         "the restore target does not follow what they picked — it is always the target")
+        self.assertEqual(len(self.be.calls), self._budget(),
+                         "the new flag is left standing — a hand pick never re-arms romp")
+        self.assertEqual(len(self.notified), 1,
+                         "and the hand-over is not announced a second time — it already was")
 
 
 class TheRestoreTargetNamesItsModel(unittest.TestCase):
