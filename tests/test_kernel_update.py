@@ -207,13 +207,18 @@ class UpdateCheck(Fresh):
             km._update_check()
         self.assertEqual(len(sent), 1, "one banner push per discovered version, not one per pass")
 
-    def test_a_newer_release_than_the_announced_one_reoffers(self):
+    def test_a_newer_release_than_the_announced_one_reoffers_past_the_daily_stamp(self):
+        # a second release inside the same day is HELD, not re-offered (the user 2026-08-25: at most
+        # one suggestion per day) — and left unlatched, so the pass past the window offers it
         sent = []
         with mock.patch.object(km, "_kernel_ver", return_value="v0.6.0"), \
              mock.patch.object(km, "_send_to_app", side_effect=lambda app, m: sent.append(m)):
             with mock.patch.object(km, "_latest_release_tag", return_value="v0.7.0"):
                 km._update_check()
             with mock.patch.object(km, "_latest_release_tag", return_value="v0.8.0"):
+                km._update_check()
+                self.assertEqual([m["tag"] for m in sent], ["v0.7.0"], "inside the day, one banner")
+                (jd.STATE / "update-suggested.json").write_text(json.dumps({"t": 0}))  # the day passes
                 km._update_check()
         self.assertEqual([m["tag"] for m in sent], ["v0.7.0", "v0.8.0"])
         self.assertEqual(km._UPDATE_AVAIL[0], "v0.8.0")

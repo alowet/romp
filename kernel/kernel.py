@@ -1962,7 +1962,8 @@ def _set_auto_nudge(enabled):
 # (`git ls-remote --tags` — network read only, nothing local moves) and compares it against the
 # release this code descends from (_kernel_ver's VERSION file, "+" stripped). Three modes, persisted
 # in update-mode.json under STATE, "ask" by default — the check is ON out of the box:
-#   ask  — a newer release raises the shell's update banner; its Update button POSTs /update.
+#   ask  — a newer release raises the shell's update banner (at most one banner per day across
+#          both watchers — _suggest_held below); its Update button POSTs /update.
 #   auto — the kernel updates itself at boot, once per discovered version (update-attempted.json
 #          keeps a failing update from looping on every restart — that stall is logged, not silent).
 #   off  — never even checks.
@@ -1990,6 +1991,31 @@ def _update_mode():
 def _set_update_mode(mode):
     if mode in _UPDATE_MODES:
         _atomic_write(jd.STATE / "update-mode.json", json.dumps({"mode": mode}))
+
+
+# Ask-mode banners are rate-limited to ONE suggestion per day across BOTH watchers (the user
+# 2026-08-25): main takes merges in bursts, and every kernel restart resets the in-memory
+# discovered/offered latches, so the banner re-offered an update several times a day. Like
+# _CONVERGE_COOLDOWN_S this is a deliberate rate policy on the user's attention, not a proxy for an
+# event — and the stamp persists under STATE (update-suggested.json) precisely because the restarts
+# that reset the latches are the re-nag vector. A held offer leaves its latch CLEAR, so the first
+# pass past the window offers the NEWEST release/sha (N drifts in a day, one banner tomorrow). Auto
+# mode never consults the stamp: its restart rate is the converge cool-down's job, and the
+# auto-update-already-failed banner stays exempt (fail loudly).
+_SUGGEST_EVERY_S = float(os.environ.get("ROMP_SUGGEST_COOLDOWN", "86400"))
+
+
+def _suggest_held():
+    """True while the newest ask-mode banner is younger than the window ('' stamp/none = free)."""
+    try:
+        t = float(json.loads((jd.STATE / "update-suggested.json").read_text()).get("t", 0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return time.time() - t < _SUGGEST_EVERY_S
+
+
+def _mark_suggested():
+    _atomic_write(jd.STATE / "update-suggested.json", json.dumps({"t": int(time.time())}))
 
 
 def _semver(tag):
@@ -2102,8 +2128,8 @@ def _update_check():
         return
     if latest == _UPDATE_AVAIL[0]:
         return                                      # already discovered and acted on this kernel run
-    _UPDATE_AVAIL[0] = latest
     if _update_mode() == "auto":
+        _UPDATE_AVAIL[0] = latest
         tried = ""
         try:
             tried = json.loads((jd.STATE / "update-attempted.json").read_text()).get("tag", "")
@@ -2121,6 +2147,10 @@ def _update_check():
         _atomic_write(jd.STATE / "update-attempted.json", json.dumps({"tag": latest, "t": int(time.time())}))
         _run_update(latest)
     else:
+        if _suggest_held():
+            return          # held: _UPDATE_AVAIL stays clear, so a pass past the window re-offers
+        _UPDATE_AVAIL[0] = latest
+        _mark_suggested()
         _send_to_app("shell", {"type": "updateAvail", "cur": _kernel_ver() or "", "tag": latest,
                                "boot": _BOOT_ID})
 
@@ -2212,6 +2242,10 @@ def _main_drift_check():
         _LAST_AUTO_CONVERGE[0] = time.time()
         _run_main_update(kind)
     else:
+        if _suggest_held():
+            _MAIN_DRIFT[slot] = ""   # held: left unoffered, so the first pass past the window offers the LATEST sha
+            return
+        _mark_suggested()
         _send_to_app("shell", {"type": "updateAvail", "kind": "main", "drift": kind,
                                "cur": _kernel_sha() or "", "tag": target, "boot": _BOOT_ID})
 
