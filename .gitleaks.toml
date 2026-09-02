@@ -1,0 +1,74 @@
+# Secret-scanning config (gitleaks), run via pre-commit on every commit.
+# Living document: add provider rules as you encounter new key formats.
+# NOTE: patterns here are Go regexes in TOML raw strings — single backslashes.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "openrouter-api-key"
+description = "Detected an OpenRouter API Key, posing a risk of unauthorized access to AI models and budget consumption."
+regex = '''\b(sk-or(-v\d+)?-[a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)'''
+keywords = ["sk-or"]
+
+# Generic sk- prefix catch-all (Anthropic/OpenAI/etc.); prefer false positives
+# over a leaked key.
+[[rules]]
+id = "generic-sk-key"
+description = "Detected an API key with sk- prefix followed by 20 or more characters."
+regex = '''\b(sk-[a-zA-Z0-9_\-]{20,})(?:[\x60'"\s;]|\\[nr]|$)'''
+keywords = ["sk-"]
+
+# Tinker (Thinking Machines) - tml- prefix
+[[rules]]
+id = "tinker-api-key"
+description = "Detected a Tinker (Thinking Machines) API Key"
+regex = '''\b(tml-[a-zA-Z0-9_\-]{60,})(?:[\x60'"\s;]|\\[nr]|$)'''
+keywords = ["tml-"]
+
+# HuggingFace user access tokens - hf_ prefix (this project reads HF models;
+# tokens must live at HF_TOKEN_PATH, never in the repo).
+[[rules]]
+id = "huggingface-token"
+description = "Detected a HuggingFace user access token"
+regex = '''\b(hf_[a-zA-Z0-9]{30,})(?:[\x60'"\s;]|\\[nr]|$)'''
+keywords = ["hf_"]
+
+# RunPod API keys - rpa_ prefix
+[[rules]]
+id = "runpod-api-key"
+description = "Detected a RunPod API Key"
+regex = '''\b(rpa_[a-zA-Z0-9_\-]{20,})(?:[\x60'"\s;]|\\[nr]|$)'''
+keywords = ["rpa_"]
+
+# Replicate - r8_ prefix
+[[rules]]
+id = "replicate-api-key"
+description = "Detected a Replicate API Key"
+regex = '''\b(r8_[a-zA-Z0-9]{20,})(?:[\x60'"\s;]|\\[nr]|$)'''
+keywords = ["r8_"]
+
+# Weights & Biases: 40-hex key assigned to a WANDB var (entity logs runs here).
+[[rules]]
+id = "wandb-api-key"
+description = "Detected a Weights & Biases API Key assignment"
+regex = '''(?i)wandb(_api)?_?key['"\s]*[=:]['"\s]*(local-)?[a-f0-9]{40}'''
+keywords = ["wandb"]
+
+# HuggingFace OAuth / JWT-style tokens. These ALSO start with hf_ but contain
+# dots and underscores, so the alnum-only rule above does NOT match them
+# (verified: an 825-char oauth token of shape hf_<5>_<90>.<638>.<1>_<16>_<67>
+# scanned clean before this rule existed). Entropy gate keeps dotted
+# identifier chains like hf_model_config.some_attr.other from tripping it.
+[[rules]]
+id = "huggingface-token-oauth"
+description = "Detected a HuggingFace OAuth/JWT access token"
+regex = '''\b(hf_[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{30,}\.[A-Za-z0-9_\-]{4,})'''
+keywords = ["hf_"]
+entropy = 4.0
+
+# Credential FILES must never be committed, whatever their contents.
+[[rules]]
+id = "credential-file-name"
+description = "A credential file (hf_token, stored_tokens, .netrc, key) was staged"
+path = '''(^|/)(hf_token|\.hf_token|stored_tokens|\.netrc|id_rsa|id_ed25519)$'''
