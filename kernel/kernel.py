@@ -21541,6 +21541,19 @@ def _forwards_sends(be):
         return False
 
 
+def _model_switches_live(be):
+    """True if this backend applies a model pick to a RUNNING session mid-turn (no shipped backend yet: the
+    SDK has the channel for it but declares False for now — see SdkBackend.model_switches_live), so
+    _set_model_or_park fires the pick into an open turn instead of parking it until the turn ends.
+    getattr-guarded like _forwards_sends: a backend / test fake without the capability reads as False (park
+    while a turn runs, fire at its end — the pre-#923 rule)."""
+    fn = getattr(be, "model_switches_live", None)
+    try:
+        return bool(fn()) if fn else False
+    except Exception:
+        return False
+
+
 # A leading slash-COMMAND token ("/autocompact auto", "/compact"), not a path ("/tmp/x is broken",
 # "/Users/…"): the token must end at whitespace/EOL before any second "/". Shape-matched, not matched
 # against the session's command list, deliberately — the CLI owns what executes; romp only decides WHEN
@@ -21660,29 +21673,40 @@ def _set_model_or_park(be, sid, value, floating=False):
     version submenu's "Latest" row: the value is a family alias AND the family's remembered pin is
     forgotten, so the family follows the CLI's newest again — the one picker gesture back from a pin (the
     family row sends the pin, the version rows pin, and a typed bare alias leaves the memory alone by
-    design). Meaningless on a non-alias value."""
+    design). Meaningless on a non-alias value. Returns True when the pick PARKED, False when it fired now."""
     if floating and value in _MODEL_VALUES:
         _forget_model_pick(value)
     _mark_model_pending(sid, value)
     _note_model_pick(value)          # a version pick becomes its family's remembered default (2026-08-25)
-    # A model change is NOT connect-time and NOT a slash injection: SDKBackend.set_model states it applies
-    # "LIVE on a connected session via the SDK control channel — NOT a /model slash injection, which the SDK
-    # input stream does not interpret". So the reason _send_or_park parks a typed slash command mid-turn (the
-    # CLI only EXECUTES one as a fresh top-level prompt) does not apply here, and an open turn alone is no
-    # reason to defer the pick. This mirrors _send_or_park's own rule for the same backends: a forwards_sends
-    # backend takes input mid-turn, so the switch lands on the turn's next request — which is what the
-    # interactive CLI does and what a user typing /model expects. Every OTHER park reason stands, and each is
-    # a case the control channel cannot answer: a compaction or a move is tearing the client down, a limit
-    # hold means the account cannot serve a request at all, and an existing FIFO means an earlier op is still
-    # owed its turn, so press order must hold (the user 2026-07-02 x2). Press order is kept when it fires
-    # too: with no queue created, a send typed after this one is handed over next, in order.
+    # A model change is NOT connect-time, and on the SDK it is NOT a slash injection: SDKBackend.set_model
+    # applies it over the SDK control channel (set_model_live) and never touches the input stream, so the
+    # reason _send_or_park parks a typed slash command mid-turn (the CLI only EXECUTES one arriving as a
+    # fresh top-level prompt) does not apply here — on an hours-long agentic turn a parked pick sat as a
+    # queued chip for a day while the session kept answering on the old model (PR #923, 2026-09-04). So an
+    # open turn parks a pick only when the backend cannot take a switch mid-turn, and that is the backend's
+    # OWN word, _model_switches_live, NOT forwards_sends: forwarding a plain send mid-turn says nothing about
+    # how a backend applies a model change — Codex forwards sends (they STEER the live turn) but its
+    # set_model lands at the NEXT turn_start, so a pick fired there mid-turn would let the send typed after
+    # it steer the OLD model first, the exact inversion the press-order rule forbids; tmux's set_model TYPES
+    # /model into the pane, never mid-turn; and the SDK says no for now too, because the CLI mis-parents a
+    # mid-turn switch's transcript breadcrumbs and the rest of the turn is lost as a rewound branch (the
+    # evidence and the conditions for flipping it live in SdkBackend.model_switches_live; review fold,
+    # 2026-09-04). Every OTHER park reason stands, and each is a case no control channel can answer: a
+    # compaction or a move is tearing the client down, a limit hold means the account cannot serve a request
+    # at all, and an existing FIFO means an earlier op is still owed its turn, so press order must hold (the
+    # user 2026-07-02 x2). Press order is kept when it fires too: no queue is created, and the pick's control
+    # request reaches the CLI before any send typed after it. Returns True when PARKED, False when handed
+    # over now — _route_meta_command reads it so POST /send answers `queued` truthfully (it used to infer
+    # the park from _ops_gate, which this setter no longer parks under).
     if _compacting_now(sid) or str(sid) in _moving or _limit_hold(sid) is not None:
         _park_op(sid, ("model", value))
         return True
-    if _working_now(sid) and not _forwards_sends(be):
-        _park_op(sid, ("model", value))     # tmux: set_model TYPES /model into the pane, never mid-turn
+    if _working_now(sid) and not _model_switches_live(be):
+        _park_op(sid, ("model", value))
         return True
-    if _park_behind_queue(sid, ("model", value)):      # the locked queue check + park (_gate_or_park's second step)
+    # the queue-presence check and the park are ONE locked step, as _gate_or_park's second step (#954):
+    # an op must never slip past a queue another handler filled between an unlocked read and the park
+    if _park_behind_queue(sid, ("model", value)):
         return True
     be.set_model(sid, value)
     return False
@@ -21749,8 +21773,9 @@ def _route_meta_command(be, sid, text, client=None, floating=False, state=None):
     caller's to send verbatim: the CLI owns what executes. A refused fast toggle is told to
     the client (fail loudly): a dormant SDK session has no live CLI to apply it, and the typed text
     used to at least draw the CLI's own refusal. `state`, when given, receives {"queued": bool} — whether
-    the setter PARKED the change (they park under _ops_gate, read here) — so POST /send answers `queued`
-    for a meta command exactly as for a text send (2026-09-03: a parked /model read as plain 'ok')."""
+    the change PARKED: the effort/fast setters park under _ops_gate (read here), the model setter returns
+    its own verdict (_set_model_or_park) — so POST /send answers `queued` for a meta command exactly as for
+    a text send (2026-09-03: a parked /model read as plain 'ok')."""
     head, _, rest = (text or "").strip().partition(" ")
     value = rest.strip()
     # ONE token, and one the kernel can vouch for: the setters PERSIST their value — set_model's lands
@@ -21759,12 +21784,12 @@ def _route_meta_command(be, sid, text, client=None, floating=False, state=None):
     # ours to swallow: it stays the CLI's, verbatim, and the user sees the CLI's own error.
     if not value or len(value.split()) != 1:
         return False
-    # each setter now DECIDES its park under the queue lock (#954) and returns it; read that verdict rather
-    # than a second, unlocked _ops_gate read that could disagree with the locked decision (review find on
-    # #954, 2026-09-07: a parked /model answered queued:false on POST /send). Also spares a redundant tmux
-    # fork + discover sweep + usage read per meta command.
+    gate = _ops_gate(sid)                  # the effort/fast setters park under exactly this gate; read here so `state` can say so
     if head == "/model" and _vouched_model(value):
-        parked = _set_model_or_park(be, sid, value, floating=floating)     # mid-compaction → parked as a queued command
+        # the model setter has its OWN rule (an open turn fires it live only on a backend that declares
+        # model_switches_live — none shipped does yet, so the SDK still parks; #923), so its verdict is
+        # read, not inferred from the gate — which would say `queued` for a pick that had already applied
+        parked = _set_model_or_park(be, sid, value, floating=floating)
     elif head == "/effort" and value in _EFFORT_VALUES:
         parked = _set_effort_or_park(be, sid, value)    # mid-compaction → parked as a queued command
     elif head == "/fast" and value in ("on", "off"):

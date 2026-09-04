@@ -7233,6 +7233,25 @@ class SdkBackend:
         them; the reconciliation renders the still-waiting message as a queued bubble until it forwards."""
         return True
 
+    def model_switches_live(self) -> bool:
+        """False FOR NOW (see SessionBackend.model_switches_live), although set_model rides the SDK control
+        channel and the CLI does adopt a mid-turn switch at its next API call: on CLI 2.1.257 a switch
+        applied INSIDE a turn corrupts the transcript. The CLI pushes its three /model breadcrumb records
+        (caveat, <command-name>/model, <local-command-stdout>Set model to X) into the in-memory conversation
+        at switch time but persists them only at the NEXT prompt, parented on the record that was current at
+        the switch (the running tool_use, or the prompt itself while the first reply streams). The next prompt
+        chains off the breadcrumbs, so every record of the switched turn written after that point — the
+        tool_result, the later work, the final reply — leaves the leaf's ancestry: romp's file adapter reads
+        that tail as a rewound branch and drops all of it from the chat, the timeline and the judges, and the
+        CLI's own --resume (every romp reconnect) rebuilds the context without the later work and the final
+        reply (its salvage re-attaches only a tool_result whose tool_use is still on the chain). A second,
+        romp-side blocker:
+        _do_set_model refreshes the live model name at once, so an old-model response still streaming then
+        reads as a capacity fallback (a false 'Model changed automatically' card, a badge flap). Flip this to
+        True only once the CLI parents mid-turn breadcrumbs at the turn's tail AND that refresh waits out
+        inflight>0 (review of PR #923, 2026-09-04; verified against the installed binary, not the docs)."""
+        return False
+
     def busy(self, sid: str) -> "bool | None":
         """Authoritative in-flight signal (see SessionBackend.busy): a turn is running (inflight>0) OR one is
         queued and about to run (_pending). Either means a drive op pressed now must PARK to hold press-order,

@@ -109,9 +109,20 @@ class SessionBackend(ABC):
         + its inputs() generator). The kernel then hands composer sends straight to send() the instant they
         arrive (the user 2026-07-17, who wanted them in as soon as possible), instead of parking them itself.
         False (default) means the backend has no such queue, so the kernel holds sends while a turn runs and
-        merges them into one message at turn end (tmux). Slash-command drive ops (/compact, /model, /effort)
-        still park in the kernel FIFO on BOTH backends to preserve press-order — this flag governs plain text
-        sends only."""
+        merges them into one message at turn end (tmux). Slash-command drive ops (/compact, /effort, …) still
+        park in the kernel FIFO on BOTH backends to preserve press-order — this flag governs plain text sends
+        only; a model pick has its own capability, model_switches_live."""
+        return False
+
+    def model_switches_live(self) -> bool:
+        """True if a model pick may be applied to a RUNNING session mid-turn — then the kernel fires it into
+        an open turn instead of parking it in the FIFO until the turn ends (PR #923). False (default) means
+        the pick waits for the turn: tmux TYPES /model into the pane; Codex's set_model lands at the next
+        turn_start while its sends steer the live turn, so a send typed after a mid-turn pick would reach
+        the OLD model first; and the SDK, whose set_model does ride the CLI's control channel, still says
+        False because the CLI mis-parents a mid-turn switch's transcript breadcrumbs and orphans the rest of
+        the turn (see SdkBackend.model_switches_live for the evidence and the flip conditions). Deliberately
+        distinct from forwards_sends: forwarding a plain send says nothing about how a model change applies."""
         return False
 
     @abstractmethod
