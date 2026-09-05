@@ -428,24 +428,31 @@ the option stays off and says so. On Android and on a desktop browser the page
 itself can receive them.
 
 Then tap the bell. On a phone it sits in the bar along the bottom; on a desktop
-it is in the bottom-right cluster. A small card opens with three switches and a
-button:
+it is in the bottom-right cluster. A small card opens with a main switch, two
+switches indented under it, and a button:
 
-- **All devices** is the main switch. It turns notifications on for every task,
-  on every device you have set up and on the desktop of every machine you have
-  attached. The bells on individual sessions and cards then work as mutes.
-- **This device** turns them on for the phone or browser you are holding. The
-  first time, the browser asks for permission. If you refuse, the row goes grey
-  and tells you where to allow it again (on an iPhone, Settings, then
-  Notifications, then Romp; in a desktop browser, the site permission beside the
-  address). Turning this off silences only this device.
-- **Also when a turn finishes** adds a notification every time any session
-  finishes a turn, with the session's name and the first line of what it said.
-  With many sessions running this is a lot of buzzing, so it is off unless you
-  want it. A turn that ends by asking you something buzzes once, not twice.
+- **Notifications** is the main switch. Off silences every device and the
+  desktop of every machine you have attached; the bells on individual sessions
+  and cards are mutes under it. While it is off, the two switches beneath it are
+  dimmed but still work, so you can set a phone up first and switch everything
+  on when you are ready.
+- **This device**, under it, turns them on for the phone or browser you are
+  holding. The first time, the browser asks for permission. If you refuse, the
+  row goes grey and tells you where to allow it again (on an iPhone, Settings,
+  then Notifications, then Romp; in a desktop browser, the site permission
+  beside the address). Turning this off silences only this device. With the
+  main switch off, the row says the device is set up but nothing arrives until
+  the main switch is on.
+- **Also when a turn finishes**, also under it, adds a notification every time
+  any session finishes a turn, with the session's name and the first line of
+  what it said. With many sessions running this is a lot of buzzing, so it is
+  off unless you want it. A turn that ends by asking you something buzzes once,
+  not twice.
 - **Send a test notification** sends one notification to the device you are
-  holding and prints the push service's answer under the button, so you can see
-  at once whether the phone is set up or why it is not.
+  holding, whatever the switches say, and prints the push service's answer under
+  the button, so you can see at once whether the phone is set up or why it is
+  not. With the main switch off, the answer adds that real notifications will
+  not arrive until it is on.
 
 The bell itself shows the state of the device you are looking at: lit when the
 main switch is on and this device is set up, and crossed out otherwise. Its

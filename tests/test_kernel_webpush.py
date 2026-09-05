@@ -531,8 +531,10 @@ class RailBell(unittest.TestCase):
     """The desktop rail carries the same bell as the mobile tab bar (the user 2026-08-08). Since
     2026-09-05 the pair OPENS THE POPOVER (tests/test_kernel_notify_popover.py) whose rows are the
     switches: the kernel-wide master (the user 2026-08-09's model: on = every task notifies unless
-    its own bell mutes it) and this device's push subscription, pulled apart so a phone turning
-    itself off no longer silences every device."""
+    its own bell mutes it), labelled "Notifications", and nested under it this device's push
+    subscription — pulled apart so a phone turning itself off no longer silences every device, and
+    nested so the master reads as the master, not as a scope beside "This device" (the user
+    2026-09-05)."""
 
     def test_shell_serves_both_bells_and_one_flow_drives_them(self):
         status, body = _serve_get("/", headers={"X-Romp-Token": km.TOKEN})
@@ -559,7 +561,9 @@ class RailBell(unittest.TestCase):
 
     def test_the_bell_opens_the_popover_whose_rows_are_the_switches(self):
         # (2026-09-05: was "the bell is the master switch, not a device toggle" — the tap now opens
-        # the popover, and the All-devices row is the master while This-device is the subscription)
+        # the popover; the Notifications row is the master and This-device, nested under it, is the
+        # subscription. The pin moved from "All devices" the same day: that label read as a scope
+        # choice, not the switch the rest sit under)
         _, body = _serve_get("/", headers={"X-Romp-Token": km.TOKEN})
         page = body.decode()
         # kernel-authoritative paint of the master: GET /notify-all at boot and the shell WS push

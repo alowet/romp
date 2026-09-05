@@ -532,14 +532,68 @@ class ShellPopover(unittest.TestCase):
         self.assertIn("id=rbell-pop role=dialog", h)
         for act in ("data-act=all", "data-act=dev", "data-act=turns"):
             self.assertIn("class=rbp-row %s role=switch" % act, h)
-        self.assertIn(">All devices<", h)
+        # the master is labelled as the master (was "All devices", which beside "This device" read as
+        # a scope choice rather than the switch the other two sit under — the user 2026-09-05)
+        self.assertIn(">Notifications<", h)
+        self.assertNotIn(">All devices<", h)
         self.assertIn(">This device<", h)
         self.assertIn(">Also when a turn finishes<", h)
         self.assertIn("id=rbp-test data-act=test>Send a test notification<", h)
-        # the one-sentence "why" under each switch
-        self.assertIn("Arms every device, and the desktop of every machine you've attached.", h)
+        # the "why" under each switch — the master's in two sentences: what off does, what the bells are
+        self.assertIn("The main switch: off silences every device, and the desktop of every machine you've attached. "
+                      "The bells on sessions and cards are mutes under it.", h)
         self.assertIn("Buzzes every time any session finishes a turn. With many sessions running, that is a lot of buzzing.", h)
         self.assertIn("id=rbp-test-out", h)
+
+    def test_the_device_and_turn_rows_nest_under_the_master(self):
+        h = self.html
+        pop = h[h.index("<div id=rbell-pop"):h.index("<div class=rbp-div>")]
+        # the nest opens right after the master row and closes right before the divider, holding
+        # exactly the device and turns rows — a visible hierarchy, not three peers
+        self.assertIn("</div></div><div class=rbp-nest><div class=rbp-row data-act=dev", pop)
+        self.assertTrue(pop.endswith("</div></div></div>"), "the nest closes before the divider")
+        self.assertEqual(pop.count("<div class=rbp-nest>"), 1)
+        self.assertLess(pop.index("data-act=all"), pop.index("<div class=rbp-nest>"))
+        self.assertLess(pop.index("<div class=rbp-nest>"), pop.index("data-act=dev"))
+        self.assertLess(pop.index("data-act=dev"), pop.index("data-act=turns"))
+        # one indent + one hairline, the popover's own hairline token (with its dark fallback, as
+        # every token in this block carries — the token test below sweeps the same slice)
+        self.assertIn(".rbp-nest{margin-left:10px;padding-left:4px;border-left:1px solid var(--menu-border,rgba(255,255,255,0.12))}", h)
+
+    def test_master_off_dims_the_nested_rows_but_leaves_them_operable(self):
+        js, h = km._LANDING_PUSH_JS, self.html
+        # the class the JS toggles, from INSIDE paint() — the one function the boot fetch and the
+        # kernel's notifyAll push both run, so the dim follows the master's live state with no
+        # polling and no second source of truth
+        paint = js[js.index("function paint(){"):js.index("window.__rompNotifyAllPaint=")]
+        self.assertIn("pop.classList.toggle('master-off',!isOn)", paint)
+        self.assertIn("window.__rompNotifyAllPaint=function(on){isOn=!!on;paint();}", js)
+        # …and the rule it drives: the nested rows wear the wash .off and .busy already wear
+        self.assertIn("#rbell-pop.master-off .rbp-nest>.rbp-row{opacity:.55}", h)
+        self.assertIn(".rbp-row.off{opacity:.55;", h)
+        self.assertIn(".rbp-row.busy{opacity:.55}", h)
+        # dimmed is not disabled: no cursor or hover suppression on the dimmed rows, and no tap guard
+        # reads master-off — a phone can be set up before the main switch goes on
+        self.assertNotIn("master-off .rbp-nest>.rbp-row:hover", h)
+        self.assertNotIn("master-off .rbp-nest>.rbp-row{opacity:.55;cursor", h)
+        self.assertNotIn("master-off", js.replace("pop.classList.toggle('master-off',!isOn)", ""))
+        # the device sub-line says the device is set up but nothing arrives — the devOn-and-master-off
+        # branch, ahead of the plain devOn line so it wins while the master is off
+        self.assertIn('else if(devOn&&!isOn)sub="This device is set up, but nothing arrives until the main switch is on.";', js)
+        self.assertLess(js.index("else if(devOn&&!isOn)sub="), js.index('else if(devOn)sub="This browser gets a notification'))
+
+    def test_the_test_result_adds_that_the_master_is_off(self):
+        js = km._LANDING_PUSH_JS
+        # the test ignores the switches on purpose (it asks "is this phone wired up?"); with the master
+        # off, ONE sentence rides the result so a working test is not read as notifications working
+        handler = js[js.index("if(act==='test')"):]
+        line = "if(!isOn)testOut.textContent+=\" Real notifications won't arrive until the main switch is on.\";"
+        self.assertIn(line, handler)
+        self.assertEqual(js.count("Real notifications won't arrive"), 1, "one sentence, appended once")
+        # appended AFTER the result line, inside the same then-handler, so every answer the push
+        # service can give carries it
+        self.assertLess(handler.index("'The push service accepted it.'"), handler.index(line))
+        self.assertLess(handler.index(line), handler.index("},function(e){testOut.classList.add('bad')"))
 
     def test_the_bell_opens_it_and_the_rows_are_the_switches(self):
         js = km._LANDING_PUSH_JS

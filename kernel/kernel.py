@@ -32491,12 +32491,17 @@ var last='chat';try{var s=localStorage.getItem(KT);if(s&&F[s])last=s;}catch(e){}
 # (plans/ios-app.md proposal 2) — so turning the bell off on a phone silenced every device, a denied
 # permission left the master on with only a Log line to show for it, and nothing ever told the user
 # whether the push service had accepted a subscription at all. The popover pulls the two apart as
-# rows — "All devices" (the master, kernel-authoritative: GET /notify-all at boot, a {type:'notifyAll'}
-# shell push on every toggle so every dashboard agrees) and "This device" (this browser's
-# subscription; Notification.requestPermission still runs synchronously in the tap's own stack
-# because iOS voids the gesture across an await) — adds the turn-finished switch (/notify-turns,
+# rows — "Notifications" (the master, kernel-authoritative: GET /notify-all at boot, a {type:'notifyAll'}
+# shell push on every toggle so every dashboard agrees) and, nested under it, "This device" (this
+# browser's subscription; Notification.requestPermission still runs synchronously in the tap's own
+# stack because iOS voids the gesture across an await) — adds the turn-finished switch (/notify-turns,
 # its own {type:'notifyTurns'} push), and a test button that POSTs /push/test with this device's
-# endpoint and shows the push service's answer as one sentence under itself. The bell GLYPH now
+# endpoint and shows the push service's answer as one sentence under itself. The master's paint
+# also dims the nested rows (#rbell-pop.master-off) while it is off and the device sub-line says the
+# device is set up but nothing arrives — the same kernel bit, so the dim follows every notifyAll
+# push with no polling; the rows stay operable. The test button ignores the switches on purpose
+# (it answers "is this phone wired up?"), so with the master off its result adds one sentence
+# saying real notifications will not arrive until the main switch is on. The bell GLYPH now
 # reflects this device: lit only when the master is on AND this browser is subscribed; a browser
 # with no Push API has no subscription half to reflect, so the master alone paints it there. The
 # tooltip names which half is off. Where push is blocked or unavailable the This-device row is
@@ -32522,9 +32527,11 @@ else if(!isOn)t='Notifications off for all devices';
 else t='Notifications off on this device';
 bells.forEach(function(b){b.classList.toggle('on',lit);b.setAttribute('title',t);b.setAttribute('aria-label',t);});
 sw('all',isOn,true);sw('dev',devOn,devOk);sw('turns',turnsOn,true);
+pop.classList.toggle('master-off',!isOn);   // the rows under the master dim while it is off — same kernel bit as its pill, same repaint
 var sub;
 if(!canPush)sub="Push isn't available in this browser. On iPhone, add romp to the Home Screen first and open it from there.";
 else if(perm()==='denied')sub="Notifications are blocked for this site. On iPhone: Settings, then Notifications, then Romp. In a desktop browser: the site permission beside the address.";
+else if(devOn&&!isOn)sub="This device is set up, but nothing arrives until the main switch is on.";
 else if(devOn)sub="This browser gets a notification when a session needs you or finishes.";
 else sub="Turn on to get them on this device.";
 if(devSubEl)devSubEl.textContent=sub;}
@@ -32576,6 +32583,7 @@ sub().then(function(s){if(!s)return {ok:false,status:0,detail:'',nosub:true};ret
 var ok=!!(d&&d.ok);testOut.classList.toggle('bad',!ok);
 testOut.textContent=ok?'The push service accepted it.':(d&&d.nosub?"This device isn't subscribed yet.":
 (d&&d.status?('The push service refused it: '+d.status+' '+(d.detail||'')+'.'):('Could not reach the push service: '+((d&&d.detail)||'no answer')+'.')));
+if(!isOn)testOut.textContent+=" Real notifications won't arrive until the main switch is on.";   // the test ignores the switches on purpose; say so
 },function(e){testOut.classList.add('bad');testOut.textContent='Test failed: '+((e&&e.message)||e)+'.';})
 .then(function(){testBtn.disabled=false;testBtn.textContent=label;});}
 });
@@ -33166,6 +33174,12 @@ def _landing():
             ".rbp-sw::after{content:'';position:absolute;top:2px;left:2px;width:10px;height:10px;border-radius:50%;"
             "background:var(--menu-fg,#cccccc);transition:transform .15s}"
             ".rbp-sw.on{background:var(--accent)}.rbp-sw.on::after{background:var(--accent-fg);transform:translateX(12px)}"
+            # the switches under the master: one indent and one hairline — the popover's own hairline
+            # token, at the master label's left edge — so the hierarchy is visible, not just implied
+            ".rbp-nest{margin-left:10px;padding-left:4px;border-left:1px solid var(--menu-border,rgba(255,255,255,0.12))}"
+            # master off: the nested rows dim in the wash .off and .busy already wear — but keep their
+            # cursor and hover, because they still take a tap (set the phone up first, switch on later)
+            "#rbell-pop.master-off .rbp-nest>.rbp-row{opacity:.55}"
             ".rbp-div{height:1px;background:var(--menu-border,rgba(255,255,255,0.12));margin:3px 6px}"
             ".rbp-act{cursor:default}.rbp-act:hover{background:none}"
             "#rbp-test{display:block;width:100%;box-sizing:border-box;background:none;border:1px solid var(--menu-border,rgba(255,255,255,0.12));"
@@ -33680,13 +33694,22 @@ def _landing():
             # service's answer. Sub-lines are the one-sentence "why"; the This-device sub-line is
             # rewritten by the JS to say what this browser can and cannot do. Hidden until the bell is
             # tapped; the transparent backdrop closes it, as does Escape (_LANDING_ESC_JS).
+            # The master is NAMED as the master and the other two switches NEST under it (.rbp-nest):
+            # its first label, "All devices", sat beside "This device" and read as a scope choice — and
+            # with the master off the device row still painted ON, since it reads only this browser's
+            # subscription (the user 2026-09-05, confused by exactly that pair). The nest dims while the
+            # master is off (#rbell-pop.master-off, painted by the JS) but its rows stay operable, so a
+            # phone can be set up before anything is switched on.
             "<div id=rbell-back hidden><div id=rbell-pop role=dialog aria-label='Notification settings'>"
-            "<div class=rbp-row data-act=all role=switch aria-checked=false><div class=rbp-head>All devices<span class=rbp-sw></span></div>"
-            "<div class=rbp-sub>Arms every device, and the desktop of every machine you've attached.</div></div>"
+            "<div class=rbp-row data-act=all role=switch aria-checked=false><div class=rbp-head>Notifications<span class=rbp-sw></span></div>"
+            "<div class=rbp-sub>The main switch: off silences every device, and the desktop of every machine you've attached. "
+            "The bells on sessions and cards are mutes under it.</div></div>"
+            "<div class=rbp-nest>"
             "<div class=rbp-row data-act=dev role=switch aria-checked=false><div class=rbp-head>This device<span class=rbp-sw></span></div>"
             "<div class=rbp-sub id=rbp-dev-sub>Turn on to get them on this device.</div></div>"
             "<div class=rbp-row data-act=turns role=switch aria-checked=false><div class=rbp-head>Also when a turn finishes<span class=rbp-sw></span></div>"
             "<div class=rbp-sub>Buzzes every time any session finishes a turn. With many sessions running, that is a lot of buzzing.</div></div>"
+            "</div>"
             "<div class=rbp-div></div>"
             "<div class='rbp-row rbp-act'><button id=rbp-test data-act=test>Send a test notification</button>"
             "<div class=rbp-sub id=rbp-test-out></div></div>"
