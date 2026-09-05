@@ -295,20 +295,24 @@ test("an unclaimed printable keystroke drops the cursor into the composer — na
   assert.ok(end > at, "the redirect focuses the box without jolting the transcript");
   const block = RENDER.slice(at, end);
   // gates, in the order the hazards were mapped: upstream handlers, chords, IME, non-printables,
-  // Space (ask-card toggle / scroll), a missing or read-only box, key repeat, typing targets, the
-  // live-ask card's number keys, open menus/dialogs, and the full-pane surfaces
+  // Space (ask-card toggle / scroll) — the KEY-specific ones stay in the handler…
   assert.match(block, /if \(e\.defaultPrevented \|\| e\.altKey \|\| e\.ctrlKey \|\| e\.metaKey\) return;/);
   assert.match(block, /if \(e\.isComposing \|\| e\.keyCode === 229\) return;/);
   assert.match(block, /if \(e\.key\.length !== 1 \|\| e\.key === " "\) return;/);
-  assert.match(block, /if \(!ta \|\| ta\.disabled \|\| document\.activeElement === ta\) return;/);
-  assert.match(block, /if \(isTypingTarget\(e\.target\) \|\| isTypingTarget\(document\.activeElement\)\) return;/);
+  // …and the rest — a missing or read-only box, key repeat, typing targets, the live-ask card's
+  // number keys, open menus/dialogs, the full-pane surfaces — live in typeFromAnywhereTarget, the
+  // ONE gate list this handler shares with paste-to-focus (2026-09-05; composer-paste-focus.test.ts)
+  assert.match(block, /const ta = typeFromAnywhereTarget\(e\);\s*\n\s*if \(!ta\) return;/);
+  const gates = RENDER.split("function typeFromAnywhereTarget(")[1].split("\n}")[0];
+  assert.match(gates, /if \(!ta \|\| ta\.disabled \|\| document\.activeElement === ta\) return null;/);
+  assert.match(gates, /if \(isTypingTarget\(e\.target\) \|\| isTypingTarget\(document\.activeElement\)\) return null;/);
   // the pane's own modals and meta menus own their keys, and a dropdown's type-ahead is typing: a
   // letter typed in the settings modal must never land in the hidden draft (review 2026-09-02)
-  assert.match(block, /document\.querySelector\("#rsettings:not\(\[hidden\]\), #ra-back:not\(\[hidden\]\), #rkeys-back, \.meta-menu"\)/);
+  assert.match(gates, /document\.querySelector\("#rsettings:not\(\[hidden\]\), #ra-back:not\(\[hidden\]\), #rkeys-back, \.meta-menu"\)/);
   assert.match(RENDER, /elm\.tagName === "SELECT"/, "SELECT is a typing target");
-  assert.match(block, /if \(activeId && liveAsks\.has\(activeId\)\) return;/);
-  assert.match(block, /if \(ctxMenuEl \|\| document\.querySelector\("\.picker-overlay"\)\) return;/);
-  assert.match(block, /romp-fileview[\s\S]*romp-filebrowse[\s\S]*romp-lightbox/);
+  assert.match(gates, /if \(activeId && liveAsks\.has\(activeId\)\) return null;/);
+  assert.match(gates, /if \(ctxMenuEl \|\| document\.querySelector\("\.picker-overlay"\)\) return null;/);
+  assert.match(gates, /romp-fileview[\s\S]*romp-filebrowse[\s\S]*romp-lightbox/);
   // NEVER preventDefault: the point is that the native keystroke inserts into the newly focused
   // box, so the composer's own input bookkeeping (draft, slash menu) sees ordinary typing
   assert.doesNotMatch(block, /preventDefault/);

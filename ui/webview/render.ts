@@ -43,6 +43,7 @@ import { openFileView } from "./file-view";
 import { initFileView } from "./file-view";
 import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser is pane-local here now (the user 2026-08-24)
 import { pastedFilePath } from "./paste-path";
+import { insertAtCaret } from "./composer-insert";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
 import { dirStatusHint, nextDirActive, createDirPrompt, type DirStatus } from "./dir-complete";
 import { mediaSrc, kernelUrl } from "./media";
@@ -5412,6 +5413,22 @@ window.addEventListener("keydown", (e) => {
     if (focusComposerOrAsk()) e.preventDefault();   // the picker card if one's up, else the message box
   }
 });
+// The gates the two "from anywhere" defaults share — the printable keystroke below and the paste after
+// it. Returns the box to drop into, or null while something else owns the input. ONE list, so the two
+// can never disagree about what counts as "nobody claimed this": a surface that must keep its keys keeps
+// its pastes too.
+function typeFromAnywhereTarget(e: Event): HTMLTextAreaElement | null {
+  const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
+  if (!ta || ta.disabled || document.activeElement === ta) return null;   // no box / read-only session / already in the box (covers key repeat; a paste there is native)
+  if (isTypingTarget(e.target) || isTypingTarget(document.activeElement)) return null;
+  if (activeId && liveAsks.has(activeId)) return null;   // the live-ask card owns input while it is up (digits are its number keys)
+  if (ctxMenuEl || document.querySelector(".picker-overlay")) return null;   // an open menu / #picker / #confirm owns the keys
+  if (document.getElementById("romp-fileview") || document.getElementById("romp-filebrowse")
+      || document.getElementById("romp-lightbox")) return null;   // full-pane surfaces own their keys
+  if (document.querySelector("#rsettings:not([hidden]), #ra-back:not([hidden]), #rkeys-back, .meta-menu")) return null;   // the pane's own modals + meta menus own their keys (a letter typed there must never land in the draft)
+  if (composerNoteHolds()) return null;   // the box just changed hands under the user — no focus steal, the note flashes; a click re-binds (T236). Nothing to cancel either: a key on the bare body has nothing to insert into.
+  return ta;
+}
 // SELECT → TYPE → ⌘⏎ (the user 2026-09-02): a transcript selection already seeded the reply chip
 // (selectionchange), so the natural next act is just TYPING — the first printable keystroke drops
 // the cursor into the message box with the chip attached, no mouse round-trip, and ⌘⏎ stages as
@@ -5425,16 +5442,37 @@ window.addEventListener("keydown", (e) => {
   if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;   // chords are not typing (shift stays: capitals)
   if (e.isComposing || e.keyCode === 229) return;   // IME mid-composition — a focus steal aborts the composition
   if (e.key.length !== 1 || e.key === " ") return;  // printable only; Space stays a toggle/scroll key
-  const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
-  if (!ta || ta.disabled || document.activeElement === ta) return;   // no box / read-only session / already typing (covers key repeat)
-  if (isTypingTarget(e.target) || isTypingTarget(document.activeElement)) return;
-  if (activeId && liveAsks.has(activeId)) return;   // digits belong to the live-ask card's number keys
-  if (ctxMenuEl || document.querySelector(".picker-overlay")) return;   // an open menu / #picker / #confirm owns the keys
-  if (document.getElementById("romp-fileview") || document.getElementById("romp-filebrowse")
-      || document.getElementById("romp-lightbox")) return;   // full-pane surfaces own their keys
-  if (document.querySelector("#rsettings:not([hidden]), #ra-back:not([hidden]), #rkeys-back, .meta-menu")) return;   // the pane's own modals + meta menus own their keys (a letter typed there must never land in the draft)
-  if (composerNoteHolds()) return;   // the box just changed hands under the user — no focus steal, the note flashes; a click re-binds (T236). Nothing to cancel either: a key on the bare body has nothing to insert into.
+  const ta = typeFromAnywhereTarget(e);
+  if (!ta) return;
   ta.focus({ preventScroll: true });   // the native keystroke lands in the box; the chip survives (a collapse never clears it)
+});
+// SELECT → PASTE → ⌘⏎ (the user 2026-09-05): dictation tools land the whole utterance at once — a
+// paste, not keystrokes — so type-to-focus never fired and, with nothing editable focused after a
+// transcript selection, the dictated text went nowhere. (Focusing the box when the selection ends was
+// ruled out: it collapses the page selection and breaks plain copy.) Same gates as type-to-focus,
+// same bubble-phase-on-window stance: we take only a paste nobody claimed. The difference is
+// mechanical — a paste has ALREADY dispatched at the body by the time it bubbles here, so focusing
+// the box cannot re-target it the way a keydown's native insertion follows focus. So this one DOES
+// preventDefault and inserts the text itself, then fires the input event the box's own bookkeeping
+// (draft, autosize, slash menu) listens for — insertAtCaret. The armed quote chip is never touched:
+// the focus collapses the selection, and a collapse never clears it, so ⌘⏎ stages exactly as after
+// typing. A paste into the FOCUSED box never reaches this branch (typeFromAnywhereTarget), so the
+// composer's own paste handler (files, path-shaped text) keeps its native default.
+window.addEventListener("paste", (e) => {
+  if (e.defaultPrevented) return;   // an element handler already acted
+  const ta = typeFromAnywhereTarget(e);
+  if (!ta) return;
+  const dt = e.clipboardData;
+  // Files (a clipboard screenshot) stay out of scope here: the composer attaches them from its OWN
+  // paste handler, per-file and inline (path vs shipped bytes by host), not through a callable this
+  // branch could reuse — factoring that is its own change. Until then a file paste from the bare
+  // area does what it did before: nothing.
+  if (!dt || dt.files.length) return;
+  const text = dt.getData("text/plain");
+  if (!text) return;
+  e.preventDefault();
+  ta.focus({ preventScroll: true });
+  insertAtCaret(ta, text);
 });
 // Cmd/Ctrl+O and Cmd/Ctrl+Shift+O — the in-PAGE fallback, from anywhere including the composer, the
 // way Obsidian's quick switcher opens over the editor (the user 2026-08-08). Inside the romp shell
