@@ -56,3 +56,23 @@ test("each RUNNING task row has a Stop button riding the stable delegate (the us
   // own terminal lifecycle event) is the real confirmation, and a re-render restores a live task's button
   assert.match(RENDER, /btn\.disabled = true; btn\.textContent = "Stopping…";/);
 });
+
+test("a row's trailing cluster sits INLINE after the label, left-aligned — never pushed to the right edge (the user 2026-09-05)", () => {
+  // Before: .bg-sum grew (flex 1 1 auto) to fill the row, so the arrow, elapsed, status word, Stop and caret
+  // hugged the far right — on a wide desktop pane the user missed them entirely. The label now takes only its
+  // own width, shrinking with an ellipsis when long (0 1 auto + min-width 0), and the cluster follows it at
+  // the existing 8px gap. Every cluster item is 0 0 auto so a long label can never push it off-screen, and
+  // nothing in the row uses a spacer, margin-left:auto or space-between.
+  const SUM = (CSS.match(/\.bg-sum \{[^}]*\}/) || [""])[0];
+  assert.match(SUM, /flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;/);
+  assert.doesNotMatch(SUM, /flex: 1 1 auto/);
+  const ROWHEAD = (CSS.match(/\.bg-head \{[^}]*\}/) || [""])[0];
+  assert.match(ROWHEAD, /display: flex; align-items: center; gap: 8px;/);
+  assert.doesNotMatch(ROWHEAD, /justify-content|space-between/);
+  for (const sel of [".bg-since", ".bg-status", ".bg-caret", ".bg-stop", ".tool-open-agent, .sub-head-pin"]) {
+    const rule = (CSS.match(new RegExp(sel.replace(/[.,]/g, (c) => "\\" + c) + " \\{[^}]*\\}")) || [""])[0];
+    assert.match(rule, /flex: 0 0 auto;/, sel + " holds its width");
+    assert.doesNotMatch(rule, /margin-left: auto/, sel + " is not a spacer");
+  }
+  assert.doesNotMatch(CSS, /\.bg-head [^{]*\{[^}]*margin-left: auto/, "no cluster item is pushed right");
+});

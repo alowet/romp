@@ -199,6 +199,20 @@ test("the feed pill shows for ANY wait with rows, words itself by the same rule,
   assert.match(FEEDCSS, /\.ftask-group \{ font-size: 0\.72em; text-transform: uppercase; letter-spacing: 0\.06em; color: var\(--dim\); margin: 4px 0 1px; \}/);
 });
 
+test("every row — agent, command, watch, peer — is ONE line: label, then arrow · elapsed · status · Stop/Cancel · caret, inline (the user 2026-09-05)", () => {
+  // The cluster used to sit at the row's right edge (the label grew to fill); on a wide desktop the user
+  // missed it. One row builder (bgRow) serves every kind, so the DOM order pinned here IS the reading
+  // order for all of them, and styles.css's .bg-sum (0 1 auto, min-width 0) keeps the cluster right after
+  // the label — bg-tasks-layout.test.ts pins the CSS half.
+  const row = RENDER.split("function bgRow(")[1].split("\nfunction ")[0];
+  const at = (s: string) => { const i = row.indexOf(s); assert.ok(i >= 0, "found " + s); return i; };
+  const order = [at('el("span", "bg-sum")'), at('open.classList.add("bg-open-agent")'), at('el("span", "bg-since")'),
+                 at('el("span", "bg-status")'), at('el("button", "bg-stop")'), at('el("button", "bg-stop bg-cancel")'),
+                 at('el("span", "bg-caret")')];
+  assert.deepEqual([...order].sort((a, b) => a - b), order, "label → arrow → elapsed → status → Stop → Cancel → caret");
+  assert.match(STYLES, /\.bg-sum \{ flex: 0 1 auto; min-width: 0;/);
+});
+
 // --- vocabulary: the plain words everywhere, and no card moves --------------------------------------------
 test("the user-visible words are agent / command / watch / <peer> / timer; the kernel's why sentences match", () => {
   assert.match(KERNEL, /return "%d background command%s" % \(n, "" if n == 1 else "s"\)/);

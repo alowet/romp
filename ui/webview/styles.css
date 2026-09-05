@@ -851,7 +851,12 @@ body.chat-theme-yatharth .tab.active.colored:not(.tab-blocked) {
 /* SOLID status dot — no pulse (the user 2026-07-07: the pulsating yellow was distracting; a running dot is
    just solid working-yellow, like the rest of the dashboard's status dots). */
 .bg-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--bgt); }
-.bg-sum { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--fg); }
+/* the row reads LEFT TO RIGHT as one line — label, then its cluster (arrow · elapsed · STATUS · Stop · caret)
+   INLINE right after it (the user 2026-09-05: with the label growing to fill, the cluster sat at the far
+   right edge and a wide desktop pane lost it entirely). The label takes only its own width and shrinks with
+   an ellipsis when too long (flex 0 1 auto, min-width 0); every cluster item is 0 0 auto, so the label can
+   never push them off-screen; no spacer, no margin-left:auto, no space-between. */
+.bg-sum { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--fg); }
 .bg-status { flex: 0 0 auto; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; color: var(--bgt); }
 .bg-caret { flex: 0 0 auto; color: var(--dim); font-size: 10px; width: 10px; }
 /* level 3: a task's command + output, each its own scrollable block, indented under the line (overscroll-
