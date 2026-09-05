@@ -4,9 +4,11 @@ Agent/Task subagent is openable from the dashboard, live and after.
 Kernel half, pinned here:
   - discovery + join: the subagents/ sidecar map (toolUseId -> agentId, dir-mtime cached) and the
     launch ack's toolUseResult.agentId both name the agent on the parent's Agent tool event;
-  - the Agent tool event carries toolUseId + agentId; a RUNNING background agent drops its launch-ack
-    output and takes agentRunning + the agentGist preview (last 3 tool calls, count, stamps); a landed
-    <task-notification> puts its <result> in the event's output (the report fold) and the gist goes;
+  - the Agent tool event carries toolUseId + agentId, and — running or finished — agentSteps (every
+    tool call so far in order, the newest SUBAGENT_STEPS_CAP) + stepsTotal, folded once per file
+    change; a RUNNING background agent drops its launch-ack output and takes agentRunning + the
+    agentGist clock (calls, since, last — the preview derives its three rows from the steps); a landed
+    <task-notification> puts its <result> in the event's output (the report fold) and the clock goes;
   - build_subagent renders the agent's own file through build_session's pipeline (sidechain mode), a
     capped tail with `truncated`, `running` from the parent's pairing + the live sets, and a LOUD
     error for a missing file;
@@ -232,38 +234,92 @@ class DiscoveryAndJoin(World):
 
 
 class RunningPreview(World):
-    def test_a_running_background_agent_drops_the_ack_and_shows_the_last_three_calls(self):
+    def test_a_running_background_agent_drops_the_ack_and_ships_its_steps_and_clock(self):
         ev = self._agent_events()[TU_BG]
         self.assertTrue(ev.get("agentAsync"))
         self.assertTrue(ev.get("agentRunning"))
         self.assertEqual(ev["output"], "", "the launch ack is not a report — an empty output reads as running")
         self.assertFalse(ev["isError"])
+        # every tool call so far, in order (the fold lists them; the preview takes the last three client-side)
+        steps = ev["agentSteps"]
+        self.assertEqual([r["tool"] for r in steps], ["Read", "Bash", "Grep", "Read"], "all of them, oldest first")
+        self.assertEqual(steps[1]["desc"], "run the api tests", "input.description wins")
+        self.assertEqual(steps[2]["desc"], "def test_", "else the pattern")
+        self.assertEqual(steps[3]["desc"], "/tmp/notes-api/api/notes.py", "else the file path")
+        self.assertTrue(all(r.get("ts") for r in steps))
+        self.assertEqual(ev["stepsTotal"], 4)
+        # the clock: count + first/last stamps; no `recent` — the steps carry the rows now (2026-09-05)
         g = ev["agentGist"]
-        self.assertEqual(g["calls"], 4)
-        self.assertEqual([r["tool"] for r in g["recent"]], ["Bash", "Grep", "Read"], "the last 3, newest LAST")
-        self.assertEqual(g["recent"][0]["desc"], "run the api tests", "input.description wins")
-        self.assertEqual(g["recent"][1]["desc"], "def test_", "else the pattern")
-        self.assertEqual(g["recent"][2]["desc"], "/tmp/notes-api/api/notes.py", "else the file path")
-        self.assertEqual(g["since"], iso(T0 + 5))
-        self.assertEqual(g["last"], iso(T0 + 5 + 2 * 4 + 3))
-        self.assertTrue(all(r.get("ts") for r in g["recent"]))
+        self.assertEqual(g, {"calls": 4, "since": iso(T0 + 5), "last": iso(T0 + 5 + 2 * 4 + 3)})
 
-    def test_the_preview_follows_the_agent_file_as_it_grows(self):
+    def test_the_steps_follow_the_agent_file_as_it_grows(self):
         self._agent_events()
         append_jsonl(self.bg_file, [dict(arec(T0 + 40, "%s-a9" % AID_BG,
                                               [tool_use("%s-tu9" % AID_BG, "Edit", {"file_path": "/tmp/notes-api/api/notes.py"})],
                                               "%s-fin" % AID_BG, stop="tool_use"), isSidechain=True, agentId=AID_BG)])
         km._parse_cache.clear(); km._chat_fold.clear()
-        g = self._agent_events()[TU_BG]["agentGist"]
-        self.assertEqual(g["calls"], 5)
-        self.assertEqual(g["recent"][-1]["tool"], "Edit")
+        ev = self._agent_events()[TU_BG]
+        self.assertEqual(ev["agentGist"]["calls"], 5)
+        self.assertEqual(ev["stepsTotal"], 5)
+        self.assertEqual(ev["agentSteps"][-1]["tool"], "Edit", "newest LAST")
 
-    def test_a_foreground_agent_keeps_its_report_and_shows_no_preview(self):
+    def test_the_steps_are_capped_at_the_newest_and_the_total_says_the_true_count(self):
+        # 200 calls is the cap: a 210-call agent ships the last 200 and stepsTotal 210
+        n = km.SUBAGENT_STEPS_CAP + 10
+        write_jsonl(self.bg_file, self._agent_records(AID_BG, T0 + 5, [
+            ("Read", {"file_path": "/tmp/notes-api/f%d.py" % i}, "…") for i in range(n)]))
+        km._AGENT_GIST_CACHE.clear()
+        ev = self._agent_events()[TU_BG]
+        self.assertEqual(ev["stepsTotal"], n)
+        self.assertEqual(len(ev["agentSteps"]), km.SUBAGENT_STEPS_CAP)
+        self.assertEqual(ev["agentSteps"][0]["desc"], "/tmp/notes-api/f10.py", "the OLDEST ten fell off")
+        self.assertEqual(ev["agentSteps"][-1]["desc"], "/tmp/notes-api/f%d.py" % (n - 1))
+        self.assertEqual(ev["agentGist"]["calls"], n)
+
+    def test_the_steps_fold_is_cached_on_the_file_and_an_unchanged_file_folds_nothing(self):
+        steps = []
+        real = km._gist_step
+        km._gist_step = lambda st, o: steps.append(o) or real(st, o)
+        try:
+            first = km._agent_steps(self.bg_file)
+            self.assertEqual(first["calls"], 4)
+            folded = len(steps)
+            self.assertGreater(folded, 0)
+            # same mtime and size → the cached state answers; not one record is stepped again
+            again = km._agent_steps(self.bg_file)
+            self.assertEqual(again["calls"], 4)
+            self.assertEqual(len(steps), folded, "an unchanged file is a stat, never a re-fold")
+            # a grown file steps ONLY its new records (append-incremental)
+            append_jsonl(self.bg_file, [dict(arec(T0 + 40, "%s-a9" % AID_BG,
+                                                  [tool_use("%s-tu9" % AID_BG, "Edit", {"file_path": "/tmp/notes-api/api/notes.py"})],
+                                                  "%s-fin" % AID_BG, stop="tool_use"), isSidechain=True, agentId=AID_BG)])
+            grown = km._agent_steps(self.bg_file)
+            self.assertEqual(grown["calls"], 5)
+            self.assertEqual(len(steps), folded + 1)
+        finally:
+            km._gist_step = real
+
+    def test_a_finished_foreground_agent_keeps_its_report_and_its_steps_but_no_clock(self):
         ev = self._agent_events()[TU_FG]
-        self.assertNotIn("agentGist", ev)
+        self.assertNotIn("agentGist", ev, "the clock is the running preview's; a finished head has none")
         self.assertNotIn("agentRunning", ev)
         self.assertNotIn("agentAsync", ev)
         self.assertIn("README summary", ev["output"], "the sync tool_result IS the report")
+        # the steps keep shipping after the finish: the fold lists prompt, steps, report in one click
+        self.assertEqual([r["tool"] for r in ev["agentSteps"]], ["Read"])
+        self.assertEqual(ev["agentSteps"][0]["desc"], "/tmp/notes-api/README.md")
+        self.assertEqual(ev["stepsTotal"], 1)
+
+    def test_a_foreground_agent_mid_turn_ships_the_clock_too(self):
+        # the parent transcript cut before the foreground agent's tool_result: no output → the client
+        # reads it as running, so the preview's clock and the steps both ride the head
+        write_jsonl(self.tpath, self.parent[:6])
+        km._parse_cache.clear(); km._chat_fold.clear()
+        ev = self._agent_events()[TU_FG]
+        self.assertEqual(ev["output"], "")
+        self.assertEqual(ev["agentGist"]["calls"], 1)
+        self.assertEqual(ev["stepsTotal"], 1)
+        self.assertNotIn("agentRunning", ev, "a sync launch's run-state stays the client's no-output rule")
 
     def test_the_gist_desc_rule_is_the_head_vocabulary(self):
         self.assertEqual(km._tool_gist_desc("Bash", {"command": "ls -la\nwc -l", "description": "list files"}), "list files")
@@ -284,6 +340,9 @@ class LandedReport(World):
         self.assertNotIn("agentGist", ev)
         self.assertNotIn("agentRunning", ev)
         self.assertEqual(ev["agentId"], AID_BG, "the join stays after the report lands")
+        self.assertEqual([r["tool"] for r in ev["agentSteps"]], ["Read", "Bash", "Grep", "Read"],
+                         "the steps keep shipping after the finish — the fold lists them under the prompt")
+        self.assertEqual(ev["stepsTotal"], 4)
         # the task-notification notice card in the transcript is untouched: the user turn still carries it
         notes = [e for e in self._events() if e.get("kind") == "user" and any("<result>" in r for r in (e.get("reminders") or []))]
         self.assertEqual(len(notes), 1)
@@ -316,6 +375,7 @@ class Liveness(World):
         self.assertNotIn("agentRunning", ev)
         self.assertNotIn("agentGist", ev)
         self.assertIn("Async agent launched", ev["output"])
+        self.assertEqual(ev["stepsTotal"], 4, "what it did before it died still lists in the fold")
         # the task-lifecycle set (tool-use id) is the other live source
         self.tm = {SID: dict(self.live, subagents=[], bgTasks=[{"toolUseId": TU_BG, "desc": "x"}])}
         km._chat_fold.clear()

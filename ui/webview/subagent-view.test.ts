@@ -8,7 +8,7 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { subTabId, isSubId, subParts, subLabel, gistLines, elapsedSince, subHeadParts, openIconSvg, pinIconSvg, SUB_SEP } from "../../ui/webview/subagent-view";
+import { subTabId, isSubId, subParts, subLabel, gistLines, stepLines, stepsNote, agentFoldLabel, elapsedSince, subHeadParts, openIconSvg, pinIconSvg, SUB_SEP, PREVIEW_ROWS } from "../../ui/webview/subagent-view";
 
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
 const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
@@ -39,23 +39,58 @@ test("the tab label is the description (clipped), else the agent type, never the
   assert.ok(long.length <= 28 && long.endsWith("…"), long);
 });
 
-test("gistLines: newest LAST, the head vocabulary per row, count + elapsed trailing the last row only", () => {
+// The preview's rows come from the STEPS now (2026-09-05: the kernel ships every call as agentSteps and
+// the fold lists them all, so the three-row preview is steps.slice(-3) client-side — the old
+// `gist.recent` field is gone from the wire). The pins below moved from `recent` to `steps` for that.
+const STEPS = [{ tool: "Read", desc: "/tmp/notes-api/tests/test_api.py" }, { tool: "Bash", desc: "run the api tests" },
+               { tool: "Grep", desc: "def test_" }, { tool: "Read", desc: "/tmp/notes-api/api/notes.py" }];
+const CLOCK = { calls: 12, since: "2026-09-05T10:00:20.000Z", last: "2026-09-05T10:00:58.000Z" };
+
+test("gistLines: the newest THREE steps, newest LAST, the head vocabulary per row, count + elapsed trailing the last row only", () => {
   const now = Date.parse("2026-09-05T10:01:00.000Z");
-  const g = { recent: [{ tool: "Bash", desc: "run the api tests" }, { tool: "Grep", desc: "def test_" }, { tool: "Read", desc: "/tmp/notes-api/api/notes.py" }],
-              calls: 12, since: "2026-09-05T10:00:20.000Z", last: "2026-09-05T10:00:58.000Z" };
-  const lines = gistLines(g, now);
-  assert.equal(lines.length, 3);
+  const lines = gistLines(STEPS, CLOCK, now);
+  assert.equal(PREVIEW_ROWS, 3);
+  assert.equal(lines.length, 3, "four steps → the newest three");
   assert.deepEqual(lines.map((l) => l.tool), ["Bash", "Grep", "Read"]);
   assert.equal(lines[0].meta, "", "only the last row carries the count/elapsed");
   assert.equal(lines[1].meta, "");
   assert.equal(lines[2].meta, "· 12 tool calls · 40s");
   // one call reads singular; a longer run reads m/s like the statusline timer
-  assert.equal(gistLines({ recent: [{ tool: "Read", desc: "x" }], calls: 1, since: "2026-09-05T09:58:55.000Z" }, now)[0].meta, "· 1 tool call · 2m 5s");
-  // more than three recent rows are clipped to the newest three (defensive: the kernel ships three)
-  assert.equal(gistLines({ recent: [1, 2, 3, 4].map((i) => ({ tool: "T" + i, desc: "" })), calls: 4 }, now).map((l) => l.tool).join(","), "T2,T3,T4");
-  // no gist / nothing recent → nothing to draw (the caller renders no box)
-  assert.deepEqual(gistLines(null, now), []);
-  assert.deepEqual(gistLines({ recent: [], calls: 0 }, now), []);
+  assert.equal(gistLines([{ tool: "Read", desc: "x" }], { calls: 1, since: "2026-09-05T09:58:55.000Z" }, now)[0].meta, "· 1 tool call · 2m 5s");
+  // no clock (the agent finished) / no steps → nothing to draw (the caller renders no preview)
+  assert.deepEqual(gistLines(STEPS, null, now), [], "a finished agent has no preview");
+  assert.deepEqual(gistLines([], CLOCK, now), []);
+  assert.deepEqual(gistLines(null, CLOCK, now), []);
+});
+
+test("stepLines: EVERY step in order for the fold; the elapsed alone trails the last row while running, nothing when finished", () => {
+  const now = Date.parse("2026-09-05T10:01:00.000Z");
+  const running = stepLines(STEPS, CLOCK, now);
+  assert.equal(running.length, 4);
+  assert.deepEqual(running.map((l) => l.tool), ["Read", "Bash", "Grep", "Read"], "oldest first, newest LAST");
+  assert.deepEqual(running.map((l) => l.meta), ["", "", "", "· 40s"], "the count lives in the fold label, not the row");
+  const finished = stepLines(STEPS, null, now);
+  assert.deepEqual(finished.map((l) => l.meta), ["", "", "", ""]);
+  assert.equal(finished[1].desc, "run the api tests");
+  assert.deepEqual(stepLines([], CLOCK, now), []);
+  assert.deepEqual(stepLines(undefined, null, now), []);
+});
+
+test("stepsNote: names the calls the kernel's cap cut, singular handled, empty when every call is on the wire", () => {
+  assert.equal(stepsNote(200, 257), "57 earlier calls not shown");
+  assert.equal(stepsNote(200, 201), "1 earlier call not shown");
+  assert.equal(stepsNote(4, 4), "");
+  assert.equal(stepsNote(4, undefined), "");
+  assert.equal(stepsNote(4, 3), "", "never negative");
+});
+
+test("agentFoldLabel: running 'prompt · N tool calls'; finished adds '· report · N lines'; zero calls omits the part; singulars", () => {
+  assert.equal(agentFoldLabel({ stepsTotal: 12, reportLines: null }), "prompt · 12 tool calls");
+  assert.equal(agentFoldLabel({ stepsTotal: 12, reportLines: 3 }), "prompt · 12 tool calls · report · 3 lines");
+  assert.equal(agentFoldLabel({ stepsTotal: 0, reportLines: null }), "prompt");
+  assert.equal(agentFoldLabel({ stepsTotal: 0, reportLines: 1 }), "prompt · report · 1 line");
+  assert.equal(agentFoldLabel({ stepsTotal: 1, reportLines: 1 }), "prompt · 1 tool call · report · 1 line");
+  assert.equal(agentFoldLabel({ reportLines: null }), "prompt", "no steps shipped at all reads like zero");
 });
 
 test("elapsedSince prints the statusline timer's shapes and is empty for an unreadable stamp", () => {
@@ -83,8 +118,20 @@ test("both icons wear the house line-icon style: 16-unit viewBox, currentColor, 
 });
 
 // ── render.ts wiring (source pins) ──────────────────────────────────────────────────────────────
-test("the arrow rides the Agent/Task head ONLY when the event carries an agentId, and the preview only with a gist", () => {
-  assert.match(RENDER, /if \(\(ev\.name === "Task" \|\| ev\.name === "Agent"\) && ev\.agentId\) \{[\s\S]{0,700}?head\.appendChild\(agentOpenButton\(ev\.agentId, ev\.uuid \|\| null, renderingOwnerSid \|\| renderingSid \|\| null\)\);\s*\n\s*if \(ev\.agentGist\) head\.insertAdjacentElement\("afterend", renderAgentGist\(ev\.agentGist\)\);/);
+test("the arrow rides the Agent/Task head whenever the event carries an agentId — running OR finished; the preview only with the clock AND a closed fold", () => {
+  // the arrow: gated on agentId alone — a FINISHED agent (output landed, no clock) still carries it, so
+  // its whole transcript stays one click away after the fact (the user asked, 2026-09-05)
+  const block = (RENDER.match(/if \(\(ev\.name === "Task" \|\| ev\.name === "Agent"\) && ev\.agentId\) \{[\s\S]*?\n  \}\n  return turn;/) || [""])[0];
+  assert.ok(block.length > 200, "found the arrow/preview block");
+  assert.match(block, /head\.appendChild\(agentOpenButton\(ev\.agentId, ev\.uuid \|\| null, renderingOwnerSid \|\| renderingSid \|\| null\)\);/);
+  assert.doesNotMatch(block.split("agentOpenButton")[0], /agentGist|agentRunning|ev\.output/, "nothing about run-state gates the arrow");
+  // the preview (2026-09-05): shown while the kernel ships the clock (running) AND the head's fold is
+  // CLOSED — an open fold lists every call, so the preview steps aside. The fold's state is read from
+  // openFolds under the same fkey the fold persists with; no new state.
+  assert.match(block, /if \(ev\.agentGist && !\(fkey && openFolds\.has\(fkey\)\)\) head\.insertAdjacentElement\("afterend", renderAgentGist\(ev\.agentSteps, ev\.agentGist\)\);/);
+  // …and the CSS twin hides it the instant the fold opens, before the next push rebuilds the turn
+  assert.match(CSS, /\.turn-tool\.fold-open > \.agent-preview \{ display: none; \}/);
+  assert.match(RENDER, /const box = el\("div", "agent-gist agent-preview"\);/);
   // the running-dot rule the older pin holds is untouched: the kernel clears a running background
   // agent's output, so "no output" still reads as running
   assert.match(RENDER, /const agentRunning = \(ev\.name === "Task" \|\| ev\.name === "Agent"\) && !ev\.output && !ev\.isError;/);
@@ -99,8 +146,10 @@ test("the arrow is click-safe: a data-act on the stable body delegate, a setTip 
 });
 
 test("the preview renders INSIDE the tool turn in the fold-toggle's size — a collapsed compact run hides it; the collapsed line never draws it", () => {
-  assert.match(RENDER, /function renderAgentGist\(g: AgentGist\): HTMLElement \{[\s\S]{0,300}?for \(const line of gistLines\(g, Date\.now\(\)\)\) \{/);
-  assert.match(RENDER, /const row = el\("div", "agent-gist-row"\);[\s\S]{0,400}?"agent-gist-tool"[\s\S]{0,200}?"agent-gist-desc"[\s\S]{0,200}?"agent-gist-meta"/);
+  // (2026-09-05) the preview's rows come from the steps: renderAgentGist takes (steps, clock) and both it
+  // and the fold's full list append rows through ONE builder, so the two read alike
+  assert.match(RENDER, /function renderAgentGist\(steps: AgentGistRow\[\] \| undefined, g: AgentGist\): HTMLElement \{[\s\S]{0,300}?appendGistRows\(box, gistLines\(steps, g, Date\.now\(\)\)\);/);
+  assert.match(RENDER, /function appendGistRows\(box: HTMLElement, lines: GistLine\[\]\): void \{[\s\S]{0,200}?const row = el\("div", "agent-gist-row"\);[\s\S]{0,400}?"agent-gist-tool"[\s\S]{0,200}?"agent-gist-desc"[\s\S]{0,200}?"agent-gist-meta"/);
   // the collapsed toolgroup line knows nothing of the gist — only the per-tool renderTool (run when expanded) does
   const group = (RENDER.match(/function renderToolGroup\([\s\S]*?\n\}\n/) || [""])[0];
   assert.ok(group.length > 200, "found renderToolGroup");

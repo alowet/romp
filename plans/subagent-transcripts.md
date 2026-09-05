@@ -1,7 +1,8 @@
 # Subagent transcripts: open any agent's whole conversation from the dashboard
 
 **Status: slice 1 IN FLIGHT** (branch `subagent-transcripts`, 2026-09-05; lands with this PR's
-merge commit). Slice 2 (the Awaiting box by kind) is scoped at the bottom and is a separate PR.
+merge commit; second cut the same day flattened the Agent head's fold — see "The head's fold").
+Slice 2 (the Awaiting box by kind) is scoped at the bottom and is a separate PR.
 
 Direction picked by the user (2026-09-05): a Claude Code subagent (the `Agent` tool, older
 transcripts say `Task`) should be readable in full from the dashboard — live while it runs and
@@ -87,18 +88,28 @@ the join (it also fills the bg-scan rows via `_bg_step`).
   anything else that wants to pair a result to its call).
 - `agentId` (or `null`) on every Agent/Task event.
 - `agentAsync: true` when the tool_result was an async launch ack.
+- on EVERY Agent/Task event with a readable agent file, running or finished: `agentSteps:
+  [{tool, desc, ts}, …]` — every tool call the agent has made so far, oldest first, capped at the
+  NEWEST `SUBAGENT_STEPS_CAP` (200) — and `stepsTotal`, the true count (so the label can say it and
+  the fold can note the cut). Folded append-incrementally from the agent's file (`em.fold_records`
+  on `_AGENT_GIST_CACHE`, keyed by the file's (mtime, size)): a growing file steps only its new
+  records, a finished file costs one read and then a stat per build (and its launch turn seals, so
+  the chat fold stops even that). `desc` is the head vocabulary: `input.description`, else the file
+  path, else the first line of the command, clipped. (2026-09-05, second cut: the first cut shipped
+  only `agentGist.recent`, the last three, and only while running; the fold lists them all now, so
+  `recent` left the wire — the client takes `steps.slice(-3)` for the preview.)
 - while a BACKGROUND agent runs: `agentRunning: true`, `output: ""` (the launch ack is not a
-  report — the client's existing "no output → amber dot" rule then reads it as running), and
-  `agentGist: {recent: [{tool, desc, ts}, …up to 3, newest last], calls, since, last}` folded
-  append-incrementally from the agent's file (`em.fold_records`, cached on the file's (mtime,
-  size)). `desc` is the head vocabulary: `input.description`, else the file path, else the first
-  line of the command, clipped.
+  report — the client's existing "no output → amber dot" rule then reads it as running), and the
+  preview's clock `agentGist: {calls, since, last}`. A FOREGROUND agent still mid-turn (no
+  tool_result yet) ships the clock too — the client reads its empty output as running, so the
+  preview needs it.
 - once the background agent's `<task-notification>` has landed in the parent transcript: `output`
   = the notification's `<result>` text (`_parse_task_notification` now captures it; the scan-all
   rows keep it, capped like the chat's own output cap) and `isError` from its status, so the head's
   report fold shows the closing summary instead of the launch ack. The task-notification notice
   card in the transcript stays as it was. A foreground agent's tool_result was always the report.
-- `agentGist` is absent once the agent has finished — the report fold is the endpoint then.
+- `agentGist` is absent once the agent has finished (no clock to show); `agentSteps` + `stepsTotal`
+  keep shipping — the fold lists what the agent did under its prompt and above its report.
 
 **The chat fold** (issue 903's sealed-prefix cache) treats a running agent the way it treats an
 undecided interrupt seam: the launch's turn is never sealed while the agent runs
@@ -139,11 +150,29 @@ rows are untouched.
 - **Arrow** (level 0): a house line-icon button on the Agent/Task head — and on agent bg-task
   rows — when `agentId` is present; tooltip "open transcript" (`setTip`), delegated through
   `actions.ts` (`data-act="openSubagent"`, click-safe across re-renders, `.romp-acted` pulse).
-- **Live preview** (level 0, only while running): up to three dim rows under the head, one per
-  recent tool call in the head vocabulary (`<tool> <desc>`), newest at the bottom, the last row
-  trailing `· N tool calls · <elapsed>`. It wears the tool-fold-toggle's 0.86em (no new size) and
-  lives INSIDE the tool turn, so a collapsed compact run hides it and an expanded run shows it.
-  Gone the moment the agent finishes.
+- **Live preview** (level 0, only while running AND the head's fold is closed): up to three dim rows
+  under the head, one per recent tool call in the head vocabulary (`<tool> <desc>`) — the newest
+  three of `agentSteps` — newest at the bottom, the last row trailing `· N tool calls · <elapsed>`.
+  It wears the tool-fold-toggle's 0.86em (no new size) and lives INSIDE the tool turn, so a
+  collapsed compact run hides it and an expanded run shows it. Gone the moment the agent finishes.
+  When the fold is OPEN the full list below replaces it: the render reads the fold's state from
+  `openFolds` under the fold's own key (no new state), and a CSS twin
+  (`.turn-tool.fold-open > .agent-preview`) hides it the instant the fold is clicked, before the
+  next push rebuilds the turn.
+- **The head's fold** (level 1, ONE click; same `tool:<uuid>` key as every tool fold, so an open fold
+  survives re-renders). Its label says what the click reveals, in order: `prompt · 12 tool calls`
+  while running, `prompt · 12 tool calls · report · 3 lines` once finished (singulars handled; the
+  tool-calls part is omitted at zero — `agentFoldLabel` in `subagent-view.ts`). Inside, all OPEN
+  and nothing nested: the prompt as markdown (the `prompt` field, the green-edged `.agent-report`
+  box); then EVERY shipped tool call, one dim row each in the preview's own classes
+  (`.agent-gist-row` / `-tool` / `-desc`), newest last, growing live on each push while the agent
+  runs (the last row trails the elapsed alone — the count is in the label), with a one-line
+  `N earlier calls not shown` note above when `stepsTotal > agentSteps.length`; then, once
+  finished, the report as markdown. The 2026-07-08 cut nested the prompt and the report as
+  collapsed caret boxes INSIDE the fold, so reading the prompt took two clicks — the user found that
+  odd (2026-09-05), hence the flat fold. The list is inline (no inner scroll box): the cap bounds
+  it at 200 rows, and a scroll-follow rule for a nested live list is more machinery than the case
+  earns; the arrow's viewer is where a long agent gets read properly.
 - **Peek tab viewer** (level 1): the arrow opens a peek tab (`peekId` / `.tab-peek` mechanics —
   `chatVisible()` says a subagent view is in the chat lens only when pinned) with id
   `sub:<sid>:<agentId>`, labelled by the sidecar's description (clipped) or agentType, wearing the
@@ -161,8 +190,9 @@ rows are untouched.
 ## Sizes and caps
 
 Per-block caps are the chat's own (`output` 16000 chars, `input` 4000, prompt/report markdown).
-`SUBAGENT_EVENT_CAP` bounds the shipped tail; the gist keeps 3 recent calls and two timestamps. The
-gist fold state is bounded by the JSONL cache's LRU (384 files) like every other reader.
+`SUBAGENT_EVENT_CAP` bounds the shipped tail; `SUBAGENT_STEPS_CAP` (200) bounds the steps on the
+head, with `stepsTotal` honest about the cut; the clock is a count and two timestamps. The steps
+fold state is bounded by the JSONL cache's LRU (384 files) like every other reader.
 
 ## Slice 2 (separate PR): the Awaiting box lists what a session waits on, by kind
 

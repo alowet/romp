@@ -17767,11 +17767,11 @@ def _bg_tasks(path, spawned_at=None, live=None):
 # (mtime, size) keys, the transcript's own launch↔notification pairing, and the SDK's live sets.
 _AGENT_ID_RE = re.compile(r"^a[0-9a-f]{16}$")
 _SUBAGENT_META_CACHE = {}       # subagents dir -> (dir mtime_ns, {toolUseId: {agentId, agentType, description, spawnDepth}})
-_AGENT_GIST_CACHE = {}          # agent jsonl path -> em.fold_records entry (the live preview's fold state)
+_AGENT_GIST_CACHE = {}          # agent jsonl path -> em.fold_records entry (the Agent head's steps fold state)
 _AGENT_LAUNCH_CACHE = {}        # parent jsonl path -> em.fold_records entry (foreground launches + their settles)
 _SUBAGENT_FRAMES = {}           # (sid, agentId) -> (change key, frame, serialized) — shared by every client with it open
 SUBAGENT_EVENT_CAP = 300        # events shipped per viewer frame — a bounded TAIL, honest about the cut (the episode fold's rule)
-SUBAGENT_RECENT = 3             # tool calls the live preview shows under the Agent head
+SUBAGENT_STEPS_CAP = 200        # tool calls shipped on the Agent head (agentSteps) — the newest; stepsTotal says the true count
 
 
 def _subagents_dir(path):
@@ -17864,7 +17864,7 @@ def _tool_gist_desc(name, inp):
 
 
 def _gist_fresh():
-    return {"recent": [], "calls": 0, "since": None, "last": None}
+    return {"steps": [], "calls": 0, "since": None, "last": None}
 
 
 def _gist_step(state, o):
@@ -17878,23 +17878,35 @@ def _gist_step(state, o):
             for b in c:
                 if isinstance(b, dict) and b.get("type") == "tool_use":
                     state["calls"] += 1
-                    state["recent"] = (state["recent"] + [{"tool": b.get("name") or "tool",
-                                                           "desc": _tool_gist_desc(b.get("name"), b.get("input")),
-                                                           "ts": ts}])[-SUBAGENT_RECENT:]
+                    state["steps"] = (state["steps"] + [{"tool": b.get("name") or "tool",
+                                                         "desc": _tool_gist_desc(b.get("name"), b.get("input")),
+                                                         "ts": ts}])[-SUBAGENT_STEPS_CAP:]
     return state
 
 
-def _agent_gist(agent_path):
-    """The live preview under a running Agent head: its last SUBAGENT_RECENT tool calls (newest last),
-    the tool-call count so far, and the first/last record stamps — folded append-incrementally over the
-    agent's own file (em.fold_records: a growing file steps only its new records). None when unreadable."""
+def _agent_steps(agent_path):
+    """The Agent head's view of the agent's own file: every tool call so far in order (`steps`, the newest
+    SUBAGENT_STEPS_CAP of them), the true count (`calls`), and the first/last record stamps — folded
+    append-incrementally over the file (em.fold_records: a growing file steps only its new records; a
+    finished file costs one read, then a stat per build). None when unreadable or empty. Shipped on the
+    event as agentSteps + stepsTotal whether the agent runs or has finished (the fold shows the list
+    either way); the running preview's clock (agentGist: calls/since/last) rides only while it runs."""
     try:
         st = em.fold_records(_AGENT_GIST_CACHE, str(agent_path), _gist_fresh, _gist_step)
     except Exception:
         return None
     if not st["since"]:
         return None
-    return {"recent": [dict(r) for r in st["recent"]], "calls": st["calls"], "since": st["since"], "last": st["last"]}
+    return st
+
+
+def _stamp_steps(ev, st):
+    ev["agentSteps"] = [dict(r) for r in st["steps"]]
+    ev["stepsTotal"] = st["calls"]
+
+
+def _gist_of(st):
+    return {"calls": st["calls"], "since": st["since"], "last": st["last"]}
 
 
 def _launch_fresh():
@@ -17960,10 +17972,11 @@ def _stamp_agents(by_tool, scan_path, tm, spawned_at, meta_path=None):
     """Post-pass over one build's Agent/Task tool events (plans/subagent-transcripts.md): every one gets
     toolUseId + agentId (from the ack's toolUseResult or the sidecar map); a BACKGROUND launch that is
     still running drops its launch-ack output (the ack is not a report — the client's existing no-output
-    rule then reads it as running), takes agentRunning and the live agentGist preview; one whose
+    rule then reads it as running), takes agentRunning and the live agentGist clock; one whose
     <task-notification> has landed takes the notification's <result> as its output, so the head's report
     fold shows the closing summary instead of the ack. A foreground agent's tool_result was always the
-    report and is left alone. Returns {toolUseId: "sync"|"running"|"report"|"pending"} for the fold's
+    report and is left alone. Every one with a readable agent file carries agentSteps (its tool calls,
+    the newest SUBAGENT_STEPS_CAP) + stepsTotal, running or finished. Returns {toolUseId: "sync"|"running"|"report"|"pending"} for the fold's
     sealed-agent gate (pending = launched, no result, and not alive — the ack stays as the honest output)."""
     meta = None
     rows = None
@@ -17975,7 +17988,16 @@ def _stamp_agents(by_tool, scan_path, tm, spawned_at, meta_path=None):
             meta = _subagent_meta_map(meta_path or scan_path)
         aid = ev.get("agentId") or (meta.get(tid) or {}).get("agentId")
         ev["agentId"] = str(aid) if aid else None
+        # the agent's tool calls ride the head running OR finished — the fold lists them either way
+        ap = _subagent_file(meta_path or scan_path, aid) if aid else None
+        st = _agent_steps(ap) if ap is not None else None
+        if st:
+            _stamp_steps(ev, st)
         if not ev.get("agentAsync"):
+            # a FOREGROUND agent still mid-turn (no tool_result yet) reads as running on the client (no
+            # output), so its preview clock ships too; its landed tool_result is the report
+            if st and not ev.get("resultUuid"):
+                ev["agentGist"] = _gist_of(st)
             out[tid] = "sync"
             continue
         if rows is None:
@@ -17989,10 +18011,8 @@ def _stamp_agents(by_tool, scan_path, tm, spawned_at, meta_path=None):
         elif _agent_alive(row, aid, tm, spawned_at):
             ev["output"] = ""
             ev["agentRunning"] = True
-            ap = _subagent_file(meta_path or scan_path, aid) if aid else None
-            g = _agent_gist(ap) if ap is not None else None
-            if g:
-                ev["agentGist"] = g
+            if st:
+                ev["agentGist"] = _gist_of(st)
             out[tid] = "running"
         else:
             out[tid] = "pending"

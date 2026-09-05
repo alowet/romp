@@ -1,5 +1,5 @@
 // Subagent transcripts (plans/subagent-transcripts.md, 2026-09-05): the pure half of the viewer —
-// tab ids, labels, the live-preview rows and the two line icons. render.ts owns the DOM (the arrow on
+// tab ids, labels, the Agent head's preview rows, fold label and full steps list, and the two line icons. render.ts owns the DOM (the arrow on
 // the Agent head and the bg-task row, the peek-tab viewer, the header) and the kernel protocol
 // (openSubagent / closeSubagent ↔ {type:"subagent"} frames); this module is what the source pins and
 // the executable tests exercise without a DOM.
@@ -24,8 +24,14 @@ export function subParts(id: string): { parentId: string; agentId: string } | nu
 }
 
 export interface SubMeta { agentType?: string; description?: string; spawnDepth?: number | null; toolUseId?: string; }
+// One tool call the agent made (the kernel's agentSteps row): the tool name and its one-line gist in the
+// head vocabulary. The kernel ships every call so far, oldest first, capped at the NEWEST 200
+// (SUBAGENT_STEPS_CAP) with stepsTotal saying the true count.
 export interface AgentGistRow { tool: string; desc: string; ts?: string; }
-export interface AgentGist { recent: AgentGistRow[]; calls: number; since?: string | null; last?: string | null; }
+// The running preview's clock: the call count and the agent's first/last record stamps. Ships only
+// while the agent runs; the preview's three rows come from the steps (no `recent` on the wire since
+// 2026-09-05 — the fold lists the same steps, so one field feeds both).
+export interface AgentGist { calls: number; since?: string | null; last?: string | null; }
 
 // The tab label: the sidecar's description (what the parent asked for), clipped to a tab's worth; else
 // the agent type; else the bare word. Never the agent id — a hex string says nothing at a glance.
@@ -50,21 +56,57 @@ export function elapsedSince(iso: string | null | undefined, nowMs: number): str
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-// The preview's rows: the agent's recent tool calls in the head vocabulary (`<tool> <desc>`), newest
-// LAST (the kernel ships them oldest→newest), with the trailing count/elapsed on the last row —
-// "· 12 tool calls · 40s". Only while the kernel ships a gist (the agent is running); the caller shows
-// nothing otherwise. Pure, so the shape is testable without a DOM.
+// The level-0 preview's rows: the agent's LAST THREE tool calls in the head vocabulary (`<tool> <desc>`),
+// newest LAST (the kernel ships the steps oldest→newest), with the trailing count/elapsed on the last
+// row — "· 12 tool calls · 40s". Only while the kernel ships the clock (the agent is running); the
+// caller shows nothing otherwise. Pure, so the shape is testable without a DOM.
+export const PREVIEW_ROWS = 3;
 export interface GistLine { tool: string; desc: string; meta: string; }
-export function gistLines(g: AgentGist | null | undefined, nowMs: number): GistLine[] {
-  if (!g || !Array.isArray(g.recent) || !g.recent.length) return [];
-  const rows = g.recent.slice(-3);
+function stepLine(r: AgentGistRow, meta: string): GistLine {
+  return { tool: String(r.tool || "tool"), desc: String(r.desc || ""), meta };
+}
+function clockMeta(g: AgentGist | null | undefined, nowMs: number, withCount: boolean): string {
+  if (!g) return "";
   const n = Math.max(0, g.calls | 0);
   const parts: string[] = [];
-  if (n) parts.push(`${n} tool call${n === 1 ? "" : "s"}`);
+  if (withCount && n) parts.push(`${n} tool call${n === 1 ? "" : "s"}`);
   const el = elapsedSince(g.since, nowMs);
   if (el) parts.push(el);
-  const meta = parts.length ? "· " + parts.join(" · ") : "";
-  return rows.map((r, i) => ({ tool: String(r.tool || "tool"), desc: String(r.desc || ""), meta: i === rows.length - 1 ? meta : "" }));
+  return parts.length ? "· " + parts.join(" · ") : "";
+}
+export function gistLines(steps: AgentGistRow[] | null | undefined, g: AgentGist | null | undefined, nowMs: number): GistLine[] {
+  if (!g || !Array.isArray(steps) || !steps.length) return [];
+  const rows = steps.slice(-PREVIEW_ROWS);
+  const meta = clockMeta(g, nowMs, true);
+  return rows.map((r, i) => stepLine(r, i === rows.length - 1 ? meta : ""));
+}
+
+// The fold's FULL list: every shipped step, same vocabulary and order; while the agent runs (a clock
+// ships) the last row trails the elapsed alone — the count already sits in the fold label. A finished
+// agent's rows carry no meta.
+export function stepLines(steps: AgentGistRow[] | null | undefined, g: AgentGist | null | undefined, nowMs: number): GistLine[] {
+  if (!Array.isArray(steps) || !steps.length) return [];
+  const meta = clockMeta(g, nowMs, false);
+  return steps.map((r, i) => stepLine(r, i === steps.length - 1 ? meta : ""));
+}
+
+// The one line above the list when the kernel's cap cut the oldest steps: "57 earlier calls not shown".
+// "" when every call is on the wire.
+export function stepsNote(shown: number, total: number | null | undefined): string {
+  const n = Math.max(0, (total || 0) - shown);
+  return n ? `${n} earlier call${n === 1 ? "" : "s"} not shown` : "";
+}
+
+// The Agent head's fold label — what ONE click reveals, in the order it appears: the prompt, the tool
+// calls (omitted at zero), and — once the agent has finished — the report with its line count.
+//   running:  "prompt · 12 tool calls"
+//   finished: "prompt · 12 tool calls · report · 3 lines"
+export function agentFoldLabel(o: { stepsTotal?: number | null; reportLines?: number | null }): string {
+  const parts = ["prompt"];
+  const n = Math.max(0, o.stepsTotal || 0);
+  if (n) parts.push(`${n} tool call${n === 1 ? "" : "s"}`);
+  if (o.reportLines != null) parts.push(`report · ${o.reportLines} line${o.reportLines === 1 ? "" : "s"}`);
+  return parts.join(" · ");
 }
 
 // The viewer header's one line: "subagent of <parent> · <agentType> · running|finished". The parent

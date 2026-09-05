@@ -37,7 +37,7 @@ import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional 
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
 import { parseAgentNotif, type AgentNotif } from "./agent-notif";
-import { subTabId, isSubId, subParts, subLabel, gistLines, subHeadParts, openIconSvg, pinIconSvg, type SubMeta, type AgentGist } from "./subagent-view";
+import { subTabId, isSubId, subParts, subLabel, gistLines, stepLines, stepsNote, agentFoldLabel, subHeadParts, openIconSvg, pinIconSvg, type SubMeta, type AgentGist, type AgentGistRow, type GistLine } from "./subagent-view";
 import { previewKind, previewFull, canPreview, fileUrl, retryFailedPreviews, refreshSettledPreviews, installMdImgHeal, setLightboxNav, type LightboxNavEntry } from "./preview";
 import { openFileView } from "./file-view";
 // initFileView rides its OWN line: the import above is pinned verbatim by file-view.test.ts
@@ -123,13 +123,17 @@ type ChatEvent = (
       skillMd?: string;
       // Subagent transcripts (plans/subagent-transcripts.md): the tool_use BLOCK id (uuid is the record's);
       // for Agent/Task the agent the launch wrote (null when no sidecar/ack names one), whether the launch
-      // was a background one, whether it is still running, and — only while running — the live preview
-      // of its last few tool calls. The kernel clears `output` while a background agent runs (the launch
-      // ack is not a report) and fills it with the notification's <result> once it lands.
+      // was a background one, whether it is still running, its tool calls so far (agentSteps: oldest
+      // first, the newest 200; stepsTotal the true count — shipped running OR finished, the fold lists
+      // them either way) and — only while running — the preview's clock (agentGist). The kernel clears
+      // `output` while a background agent runs (the launch ack is not a report) and fills it with the
+      // notification's <result> once it lands.
       toolUseId?: string;
       agentId?: string | null;
       agentAsync?: boolean;
       agentRunning?: boolean;
+      agentSteps?: AgentGistRow[];
+      stepsTotal?: number;
       agentGist?: AgentGist;
     }
   | {
@@ -3791,28 +3795,37 @@ function renderTool(ev: Extract<ChatEvent, { kind: "tool" }>): HTMLElement {
     const signal = ev.name === "Task" || ev.name === "Agent";
     if (signal) {
       // Subagent (Task/Agent) = a delegated mini-conversation, disclosed PROGRESSIVELY (the user
-      // 2026-07-17: default compact, click to go deeper — everywhere). Level 0 is ONE head row (Task +
-      // its description, the amber/green rail dot carrying run-state); level 1 (the head's inline fold)
-      // reveals the PROMPT and REPORT as their own collapsed caret boxes; level 2 opens either box —
-      // each markdown-rendered (the user 2026-07-08; the prompt is the prompt field, not the tool JSON).
-      // Unlike the pre-07-08 head toggle this reveals fold LABELS, not the prompt itself, so nothing
-      // renders twice.
-      const akey = fkey ? fkey + ":agent" : undefined;
-      const halves = el("div", "agent-folds");
+      // 2026-07-17: default compact, click to go deeper — everywhere). Level 0 is ONE head row (Agent +
+      // its description, the amber/green rail dot carrying run-state) plus, while it runs, the three-row
+      // preview below. Level 1 — ONE click on the head's inline fold — reveals everything, all OPEN and
+      // in the label's order: the PROMPT as markdown (the prompt field, not the tool JSON — the user
+      // 2026-07-08), the FULL list of tool calls (one dim row each, the preview's own vocabulary, newest
+      // last, growing live while the agent runs), then the REPORT as markdown once it has finished. The
+      // 2026-07-08 cut nested prompt and report as collapsed caret boxes inside the fold, so reading the
+      // prompt took two clicks; the user found that odd (2026-09-05), hence one fold, nothing nested.
+      // The label says what the click reveals: "prompt · 12 tool calls" / "… · report · 3 lines".
+      const body = el("div", "agent-folds");
       if (ev.input) {
         let promptText = ev.input;   // ev.input is the tool's full JSON; show just the prompt the agent was given
         try { const o = JSON.parse(ev.input); if (o && typeof o.prompt === "string") promptText = o.prompt; } catch { /* truncated JSON → show raw */ }
         const box = el("div", "agent-report md"); box.innerHTML = md(promptText); highlight(box);
-        halves.appendChild(foldable("prompt", box, akey ? akey + ":prompt" : undefined));
+        body.appendChild(box);
+      }
+      const steps = ev.agentSteps || [];
+      if (steps.length) {
+        const list = el("div", "agent-gist agent-steps");
+        const note = stepsNote(steps.length, ev.stepsTotal);
+        if (note) { const n = el("div", "agent-steps-note"); n.textContent = note; list.appendChild(n); }
+        appendGistRows(list, stepLines(steps, ev.agentGist, Date.now()));
+        body.appendChild(list);
       }
       if (ev.output) {
-        // the report is the meatier half → its line count rides the fold label (else just "report")
         const box = el("div", "agent-report md"); box.innerHTML = md(ev.output); highlight(box);
-        halves.appendChild(foldable(`report · ${countLines(ev.output)} lines`, box, akey ? akey + ":report" : undefined));
+        body.appendChild(box);
       }
-      if (halves.childElementCount) {
-        const label = ev.output ? `prompt + report · ${countLines(ev.output)} line${countLines(ev.output) === 1 ? "" : "s"}` : "prompt";
-        inlineFold(head, turn, label, halves, fkey);
+      if (body.childElementCount) {
+        const label = agentFoldLabel({ stepsTotal: ev.stepsTotal ?? steps.length, reportLines: ev.output ? countLines(ev.output) : null });
+        inlineFold(head, turn, label, body, fkey);
       }
     } else if (!ev.output) {
       // No result text yet, OR a command that finished with no output (mkdir, git add, …). Keep the command
@@ -3841,11 +3854,15 @@ function renderTool(ev: Extract<ChatEvent, { kind: "tool" }>): HTMLElement {
   // right beside an identical dot, so it was pure duplication.
   if ((ev.name === "Task" || ev.name === "Agent") && ev.agentId) {
     // Subagent transcripts (plans/subagent-transcripts.md): the arrow opens the agent's WHOLE
-    // conversation as a peek tab (level 1); while the agent runs, the preview under the head shows
-    // its last few tool calls (level 0). Both live inside this turn, so a collapsed compact run hides
-    // them with the head and an expanded run shows them.
+    // conversation as a peek tab — running or finished, whenever the agent is known. While the agent
+    // runs (the kernel ships its clock), the preview under the head shows its last three tool calls
+    // (level 0) — but only while the head's fold is CLOSED: an open fold lists every call, so the
+    // preview would repeat its tail. The fold's state is read from the same store that keeps it across
+    // re-renders (openFolds, keyed by fkey) — no new state; the CSS twin (.fold-open hides
+    // .agent-preview) covers the click itself, before the next push rebuilds the turn. Everything here
+    // lives inside this turn, so a collapsed compact run hides it with the head.
     head.appendChild(agentOpenButton(ev.agentId, ev.uuid || null, renderingOwnerSid || renderingSid || null));
-    if (ev.agentGist) head.insertAdjacentElement("afterend", renderAgentGist(ev.agentGist));
+    if (ev.agentGist && !(fkey && openFolds.has(fkey))) head.insertAdjacentElement("afterend", renderAgentGist(ev.agentSteps, ev.agentGist));
   }
   return turn;
 }
@@ -3866,17 +3883,22 @@ function agentOpenButton(agentId: string, anchorUuid: string | null, ownerSid: s
 
 // The running agent's preview: up to three dim rows in the head vocabulary (`<tool> <desc>`), newest
 // last, the last row trailing "· N tool calls · elapsed". Wears the tool-fold-toggle's size (0.86em) —
-// no new font-size on the tool head. Gone once the kernel stops shipping the gist (the agent finished).
-function renderAgentGist(g: AgentGist): HTMLElement {
-  const box = el("div", "agent-gist");
-  for (const line of gistLines(g, Date.now())) {
+// no new font-size on the tool head. Gone once the kernel stops shipping the clock (the agent finished).
+function renderAgentGist(steps: AgentGistRow[] | undefined, g: AgentGist): HTMLElement {
+  const box = el("div", "agent-gist agent-preview");
+  appendGistRows(box, gistLines(steps, g, Date.now()));
+  return box;
+}
+
+// One dim row per tool call — the preview and the fold's full list share the rows, so they read alike.
+function appendGistRows(box: HTMLElement, lines: GistLine[]): void {
+  for (const line of lines) {
     const row = el("div", "agent-gist-row");
     const t = el("span", "agent-gist-tool"); t.textContent = line.tool; row.appendChild(t);
     if (line.desc) { const d = el("span", "agent-gist-desc"); d.textContent = line.desc; row.appendChild(d); }
     if (line.meta) { const m = el("span", "agent-gist-meta"); m.textContent = line.meta; row.appendChild(m); }
     box.appendChild(row);
   }
-  return box;
 }
 
 
