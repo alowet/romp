@@ -1,8 +1,9 @@
 # Subagent transcripts: open any agent's whole conversation from the dashboard
 
-**Status: slice 1 IN FLIGHT** (branch `subagent-transcripts`, 2026-09-05; lands with this PR's
-merge commit; second cut the same day flattened the Agent head's fold — see "The head's fold").
-Slice 2 (the Awaiting box by kind) is scoped at the bottom and is a separate PR.
+**Status: slice 1 IN FLIGHT** (branch `subagent-transcripts`, PR #935, 2026-09-05; lands with that PR's
+merge commit). **Slice 2 BUILT** the same day on branch `awaiting-rows`, stacked on #935 — the Awaiting
+box lists what a session waits on as rows grouped by kind, and the chip opens it; its section is at the
+bottom.
 
 Direction picked by the user (2026-09-05): a Claude Code subagent (the `Agent` tool, older
 transcripts say `Task`) should be readable in full from the dashboard — live while it runs and
@@ -88,28 +89,18 @@ the join (it also fills the bg-scan rows via `_bg_step`).
   anything else that wants to pair a result to its call).
 - `agentId` (or `null`) on every Agent/Task event.
 - `agentAsync: true` when the tool_result was an async launch ack.
-- on EVERY Agent/Task event with a readable agent file, running or finished: `agentSteps:
-  [{tool, desc, ts}, …]` — every tool call the agent has made so far, oldest first, capped at the
-  NEWEST `SUBAGENT_STEPS_CAP` (200) — and `stepsTotal`, the true count (so the label can say it and
-  the fold can note the cut). Folded append-incrementally from the agent's file (`em.fold_records`
-  on `_AGENT_GIST_CACHE`, keyed by the file's (mtime, size)): a growing file steps only its new
-  records, a finished file costs one read and then a stat per build (and its launch turn seals, so
-  the chat fold stops even that). `desc` is the head vocabulary: `input.description`, else the file
-  path, else the first line of the command, clipped. (2026-09-05, second cut: the first cut shipped
-  only `agentGist.recent`, the last three, and only while running; the fold lists them all now, so
-  `recent` left the wire — the client takes `steps.slice(-3)` for the preview.)
 - while a BACKGROUND agent runs: `agentRunning: true`, `output: ""` (the launch ack is not a
-  report — the client's existing "no output → amber dot" rule then reads it as running), and the
-  preview's clock `agentGist: {calls, since, last}`. A FOREGROUND agent still mid-turn (no
-  tool_result yet) ships the clock too — the client reads its empty output as running, so the
-  preview needs it.
+  report — the client's existing "no output → amber dot" rule then reads it as running), and
+  `agentGist: {recent: [{tool, desc, ts}, …up to 3, newest last], calls, since, last}` folded
+  append-incrementally from the agent's file (`em.fold_records`, cached on the file's (mtime,
+  size)). `desc` is the head vocabulary: `input.description`, else the file path, else the first
+  line of the command, clipped.
 - once the background agent's `<task-notification>` has landed in the parent transcript: `output`
   = the notification's `<result>` text (`_parse_task_notification` now captures it; the scan-all
   rows keep it, capped like the chat's own output cap) and `isError` from its status, so the head's
   report fold shows the closing summary instead of the launch ack. The task-notification notice
   card in the transcript stays as it was. A foreground agent's tool_result was always the report.
-- `agentGist` is absent once the agent has finished (no clock to show); `agentSteps` + `stepsTotal`
-  keep shipping — the fold lists what the agent did under its prompt and above its report.
+- `agentGist` is absent once the agent has finished — the report fold is the endpoint then.
 
 **The chat fold** (issue 903's sealed-prefix cache) treats a running agent the way it treats an
 undecided interrupt seam: the launch's turn is never sealed while the agent runs
@@ -150,29 +141,11 @@ rows are untouched.
 - **Arrow** (level 0): a house line-icon button on the Agent/Task head — and on agent bg-task
   rows — when `agentId` is present; tooltip "open transcript" (`setTip`), delegated through
   `actions.ts` (`data-act="openSubagent"`, click-safe across re-renders, `.romp-acted` pulse).
-- **Live preview** (level 0, only while running AND the head's fold is closed): up to three dim rows
-  under the head, one per recent tool call in the head vocabulary (`<tool> <desc>`) — the newest
-  three of `agentSteps` — newest at the bottom, the last row trailing `· N tool calls · <elapsed>`.
-  It wears the tool-fold-toggle's 0.86em (no new size) and lives INSIDE the tool turn, so a
-  collapsed compact run hides it and an expanded run shows it. Gone the moment the agent finishes.
-  When the fold is OPEN the full list below replaces it: the render reads the fold's state from
-  `openFolds` under the fold's own key (no new state), and a CSS twin
-  (`.turn-tool.fold-open > .agent-preview`) hides it the instant the fold is clicked, before the
-  next push rebuilds the turn.
-- **The head's fold** (level 1, ONE click; same `tool:<uuid>` key as every tool fold, so an open fold
-  survives re-renders). Its label says what the click reveals, in order: `prompt · 12 tool calls`
-  while running, `prompt · 12 tool calls · report · 3 lines` once finished (singulars handled; the
-  tool-calls part is omitted at zero — `agentFoldLabel` in `subagent-view.ts`). Inside, all OPEN
-  and nothing nested: the prompt as markdown (the `prompt` field, the green-edged `.agent-report`
-  box); then EVERY shipped tool call, one dim row each in the preview's own classes
-  (`.agent-gist-row` / `-tool` / `-desc`), newest last, growing live on each push while the agent
-  runs (the last row trails the elapsed alone — the count is in the label), with a one-line
-  `N earlier calls not shown` note above when `stepsTotal > agentSteps.length`; then, once
-  finished, the report as markdown. The 2026-07-08 cut nested the prompt and the report as
-  collapsed caret boxes INSIDE the fold, so reading the prompt took two clicks — the user found that
-  odd (2026-09-05), hence the flat fold. The list is inline (no inner scroll box): the cap bounds
-  it at 200 rows, and a scroll-follow rule for a nested live list is more machinery than the case
-  earns; the arrow's viewer is where a long agent gets read properly.
+- **Live preview** (level 0, only while running): up to three dim rows under the head, one per
+  recent tool call in the head vocabulary (`<tool> <desc>`), newest at the bottom, the last row
+  trailing `· N tool calls · <elapsed>`. It wears the tool-fold-toggle's 0.86em (no new size) and
+  lives INSIDE the tool turn, so a collapsed compact run hides it and an expanded run shows it.
+  Gone the moment the agent finishes.
 - **Peek tab viewer** (level 1): the arrow opens a peek tab (`peekId` / `.tab-peek` mechanics —
   `chatVisible()` says a subagent view is in the chat lens only when pinned) with id
   `sub:<sid>:<agentId>`, labelled by the sidecar's description (clipped) or agentType, wearing the
@@ -190,18 +163,113 @@ rows are untouched.
 ## Sizes and caps
 
 Per-block caps are the chat's own (`output` 16000 chars, `input` 4000, prompt/report markdown).
-`SUBAGENT_EVENT_CAP` bounds the shipped tail; `SUBAGENT_STEPS_CAP` (200) bounds the steps on the
-head, with `stepsTotal` honest about the cut; the clock is a count and two timestamps. The steps
-fold state is bounded by the JSONL cache's LRU (384 files) like every other reader.
+`SUBAGENT_EVENT_CAP` bounds the shipped tail; the gist keeps 3 recent calls and two timestamps. The
+gist fold state is bounded by the JSONL cache's LRU (384 files) like every other reader.
 
-## Slice 2 (separate PR): the Awaiting box lists what a session waits on, by kind
+## Slice 2 (PR stacked on #935): the Awaiting box lists what a session waits on, by kind
 
-- The bg-tasks / awaiting box groups pending rows in separate sections — **agents** (each with the
-  arrow above), **commands** (background Bash), **watches** (monitors) — instead of one flat list.
-- The statusline "Awaiting …" chip becomes clickable and opens that box.
-- The mixed-set label collapse goes away: `_session_awaiting`'s "kind is `agents` only if every
-  pending row is an agent, else `task`" is replaced by per-kind counts the chip can word honestly
-  ("2 agents · 1 command").
-- Nested subagents (an agent's own Agent calls, `spawnDepth` 2) already carry the arrow inside the
-  viewer since the meta map is per parent transcript; making the viewer's header show the chain
-  (parent → agent → agent) is slice-2 polish.
+**Status: built 2026-09-05** (branch `awaiting-rows`). The user's call, paraphrased: the three things a
+session can wait on — agents, background commands, kernel watches — are different things, so show them
+as SEPARATE ROWS grouped by kind, and make the chip clickable.
+
+### The defect it fixes (traced before the change)
+`_session_awaiting` answered with ONE kind chosen by source precedence: live SDK subagents → "agents";
+else the pending background launches → "agents" only if EVERY pending row was an agent, else the generic
+"task" (so a background shell command plus a background agent read "Awaiting 2 tasks" with the agent
+silently absorbed); else armed watches → "job", a word nothing else on screen explained. The same
+situation read "agents" or "tasks" depending on which source spoke first, and the statusline chip was a
+plain span — the one status word on the pane you could not click through. The feed's pill showed only
+when the legacy `tasks` list was non-empty, so a wait on live subagents had no clickable affordance on
+the card at all.
+
+### Kernel (`kernel/kernel.py`, `kernel/judge.py`)
+- `_session_awaiting` COMBINES its live sources instead of short-circuiting. Each contributes rows
+  (`_awaiting_item`): the backend snapshot's live subagents (kind `agents`, carrying the hook's
+  `agentId` so the slice-1 arrow works), the pending background launches (`agents` for Agent/Task/
+  Workflow dispatches, `commands` for run_in_background Bash and Monitor), and the armed watches
+  (`watches`; label = the `--note`, else the clipped predicate, else `PR #N (repo)`). A background agent
+  seen by BOTH the hook set and the task stream is one row (matched on agentId), wearing the launch's id
+  (Stop's handle), its description, and the earlier start. `_awaiting_from_items` derives the legacy
+  `kind` / `count` / `why` / `since` / `tasks` from the union: one kind present → that kind's legacy key
+  and the sentence it always wore; several → kind `"mixed"`, count = every row, and a why that names
+  each group ("waiting on 2 background agents, 1 background command and 1 armed watch"). The all(...)
+  collapse is gone. The overlay, owned-yield, judge-stamp and delegation arms ship `items: []` (they
+  name no live rows) except the peer arms, which list their peers as `peer` rows.
+- **The wire shape**, shipped wherever `awaitingKind`/`awaitingCount` ship — the chat status
+  (`awaitingItems`), the timeline lane (`awaitingItems`), the goal card and the placeholder card
+  (`awaiting.items`): `[{kind, id, label, since, agentId?, detail?, watchId?}]`, kind in
+  `agents | commands | watches | peer | timer`. `since` is the row's OWN event time or null, never now.
+  A generic watch row carries `watchId` (cancel_watch's handle) and its predicate as `detail`; a PR
+  watch carries neither.
+- `AWAIT_KINDS` gains `"mixed"`; the judge's parse sites (`_parse_close`, `_parse_plan`) validate
+  against `AWAIT_KINDS_JUDGED` (the five specific kinds), so a closer never FILES mixed — an LLM
+  emitting the word degrades to kindless like any other off-enum kind, and every lift/supersede rule
+  keyed on a stamp's kind keeps seeing a specific one. The overlay reader accepts mixed as data.
+- Vocabulary in the kernel's sentences: "waiting on a background command: X" / "waiting on 2 background
+  commands — X, …" (was "task(s)"), "waiting on 2 armed watches — X, …" (unchanged), "N background
+  agent(s) still working" (unchanged). The owned-yield arm and `_awaiting_card`'s fallback headline say
+  "command" too; the legacy kind KEYS (`task`, `job`) stay for every consumer that reads them.
+- A `cancelWatch` WS door: `{type: "cancelWatch", id: <sid>, watchId}` → the SAME `cancel_watch` that
+  `romp watch --cancel <id>` and `POST /watch {"cancel"}` reach; loud `warn` on a miss. **A cancel path
+  existed for generic watches only** — nothing retires a `romp watch-pr` early today, so PR-watch rows
+  carry no `watchId` and the box offers no button for them (not added here: it would be a new retire
+  path, out of this slice's scope).
+
+### Words (`ui/webview/spin-caption.ts`, `ui/romp-timeline-view.js`)
+`KIND_WORD` keeps the kernel's keys and changes the words: `task` → "command", `job` → "watch",
+`mixed` → no word; `kindWord` pluralizes "watch" → "watches". New shared helpers: `groupRows` (display
+order agents → commands → watches → peers → timers; an unknown group is kept, never dropped),
+`awaitBreakdown` ("2 agents · 1 command · 1 watch"), and `awaitWord` — the ONE label rule for the chip,
+the box gist and the feed pill: one row → its word ("agent" / "command" / "watch" / "timer"; a peer row →
+the peer's own name, swapped in by the caller); several of one kind → count + word ("3 agents");
+several kinds → the number alone ("4"); no rows (an older kernel, a stamp) → the legacy kind + count as
+before. The timeline's standalone twin mirrors the table (`tlKindWord`), and its badge goes through
+`tlAwaitSuffix` so a mixed wait reads "Awaiting 4" on the lane — the only timeline change.
+
+### Chat pane (`ui/webview/render.ts`, `styles.css`)
+- The statusline chip is a `<button class="chip chip-awaitingBg chip-btn" data-act="awaitingChip">`
+  on a delegate installed once on the stable `#statusline` (click-safe across the per-push rebuild; the
+  delegate's `.romp-acted` pulse acknowledges). Click → `bgFoldOpen.add(sid)` (the box's own fold
+  state), `renderBgTasks()`, `scrollIntoView`. Tip via `setTip`: the breakdown, the kernel's why, and
+  what the click does. Label per `awaitWord`; a single named peer keeps its coloured name.
+- `renderBgTasks` hands the box to `renderAwaitWhy` whenever a wait exists (tracked tasks join its
+  rows); the tasks-only path (no wait: a service the session keeps around) is unchanged. `renderAwaitWhy`
+  header: "Awaiting <n> · <breakdown>" for mixed, the single-kind sentence as before. Expanded: the rows
+  grouped by kind under `.bg-group-head` (shown only when 2+ groups, "Background tasks" counting as a
+  group for the tracked leftovers), then the plain-words note. ONE row renderer (`bgRow`, fed by
+  `awaitRowSpec` / `taskRowSpec`): agent rows → the slice-1 arrow + Stop while their launch is a live
+  tracked task, the prompt as the fold, NO output tail (the output file is the raw transcript; the arrow
+  is the way in — this also drops the raw JSONL fold from tracked agent rows in the tasks-only path);
+  command rows → status, Stop, the command + output-tail fold; watch rows → await-green dot, "armed",
+  "· 31m" since registration, Cancel when `watchId` rides, the predicate as the fold; peer rows → the
+  name in identity colour; a row with nothing to unfold is not a toggle. Per-row "· 12m" clocks tick
+  with the statusline timer from `data-since` (the box re-renders only on new fields; `awaitKey` now
+  includes `awaitingItems`). A wait with no rows (stamp / overlay) still expands to its full sentence.
+- No change to WHEN the chip flips or a card moves: `_session_chip`'s formula is untouched; only what
+  the surfaces say and what is clickable changed.
+
+### Feed (`ui/webview/feed.ts`, `feed.css`)
+The pill shows for ANY wait with rows (`awaiting.items`, or an older kernel's `tasks` read as rows of
+the legacy kind's group), reads by `awaitWord` (a single peer → its coloured name), opens by default
+like the bg-task pill did, and its expansion lists the rows grouped under `.ftask-group` headers when
+2+ groups — labels only (peer rows keep the identity colour + click-opens-session). `spinFor`'s
+say-it-once rule now stands the caption down under rows of ANY kind (`items` or `tasks`); a wait the
+kernel cannot enumerate keeps the boxed caption, the only place its why shows.
+
+### Tests
+Kernel: `tests/test_awaiting_rows.py` (all three sources at once → mixed; the shell + agent case is two
+rows of two kinds, never "task"; the hook/launch merge; single-kind sentences; watch rows' handles; the
+mixed kind's enum/parse rules; the cancel door), plus the existing pins updated with a note each
+(`test_awaiting_count.py` also pins that every surface ships the rows). UI: `ui/webview/awaiting-rows.
+test.ts` (the label rules executed; the three word maps agree on every kind × count; chip-as-button +
+delegate; grouped rows and per-kind affordances; Cancel → cancel_watch; the feed pill for any wait; the
+vocabulary), plus the updated pins in awaiting-state / awaiting-box-sync / awaiting-peer-name /
+bg-tasks-layout / feed-awaiting-swirl / spin-caption / timeline-awaiting / src/bg-tasks.
+Screenshot fixtures: `tools/ui-verify/fixtures/awaiting-rows-{chat,feed}.html`.
+
+### Left for later
+- Nested subagents' chain in the viewer header (parent → agent → agent) — slice-2 polish from the
+  original scoping, not done here.
+- An early-retire path for PR watches (then the watch row's Cancel appears for them too).
+- The owned-yield arm words every owned dispatch as a "command" (it carries no type); a placed agent
+  dispatch that outruns a block with no stamp is the one case that reads slightly off.
