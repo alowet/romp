@@ -24,6 +24,8 @@ import { kernelUrl } from "./media";
 import { quoteSrcLabel } from "./docreview";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const gclock = require("./gesture-clock.js");   // the gesture clock every settings post stamps through
+import { delegate } from "./actions";
+import { resolveDocRelative, joinDocPath, urlTitleParts } from "./md-links";
 
 // hljs is registered per-bundle. Same language set (and grammar registrations) the chat's fence
 // highlighting uses, dup-guarded, so importing this module alongside render.ts costs nothing.
@@ -112,6 +114,26 @@ function el(tag: string, cls?: string): HTMLElement {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
   return e;
+}
+
+// The romp loader (swirl + wordmark + three pulsing accent dots), per the loading-state rule: the
+// FIRST thing up on any wait, fading the instant real content lands. The viewer's earlier waits
+// build this markup inline; the URL viewer reaches for it here.
+function loaderEl(): HTMLElement {
+  const load = el("div", "fileview-load");
+  load.innerHTML = '<img src="/media/romp-swirl-glyph.svg" alt=""><span>romp</span>'
+    + '<i class="fileview-dot"></i><i class="fileview-dot"></i><i class="fileview-dot"></i>';
+  return load;
+}
+
+// The 2 MB body cap for a URL document — a MIRROR of the kernel's _TEXT_MAX_BYTES (kernel.py), which
+// is what a local .md is already held to on the /file route. The URL viewer fetches from the browser,
+// so no kernel ever sees the body; the cap is applied here, from Content-Length when the server
+// sends one and from the decoded length otherwise. md-url-view.test.ts pins the two numbers equal.
+const URL_TEXT_MAX_BYTES = 2 * 1024 * 1024;
+
+function humanSize(n: number): string {
+  return n >= 1e6 ? (n / 1e6).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1e3)) + " KB";
 }
 
 // ── raw-mode editing (the file browser's slice 2, the user 2026-08-14) ─────────────────────────────
@@ -497,6 +519,20 @@ export function openFileView(path: string, sid?: string | null): void {
   bar.appendChild(name); if (sess) bar.appendChild(sess); bar.appendChild(acts);
 
   const body = el("div", "fileview-body");
+  // A rendered document's RELATIVE links (`[notes](./notes.md)`, `[fig](plots/a.png)`) open the
+  // sibling file in this same viewer — mdBlock stamps each one `data-act="fv-open"` with the joined
+  // path (joinDocPath) instead of a target the page would navigate to. One delegated listener on
+  // the body, installed once per open and keyed off data-act (actions.ts: click-safe across the
+  // Rendered ⇄ Raw swaps that rebuild the body's children, and the press flash acknowledges the
+  // click). The chat's document-level anchor delegate (render.ts) leaves scheme-less hrefs alone,
+  // so the click reaches here in the chat document and in the feed document alike.
+  delegate(body, {
+    "fv-open": (a, ev) => {
+      ev.preventDefault();
+      const target = a.dataset.path;
+      if (target) openFileView(target, sid);
+    },
+  });
   // Per the loading-state rule the first thing up is the romp loader, not a blank pane — a file coming
   // over an ssh tunnel to a phone is a real wait.
   const load = el("div", "fileview-load");
@@ -564,7 +600,7 @@ export function openFileView(path: string, sid?: string | null): void {
       return;
     }
     if (text === null || editing) return;   // loading, or the textarea owns the body right now
-    body.replaceChildren(rendered ? mdBlock(text) : codeBlock(text, path, true));   // long lines always soft-wrap (the user 2026-08-24)
+    body.replaceChildren(rendered ? mdBlock(text, { kind: "file", path, sid: sid || null }) : codeBlock(text, path, true));   // long lines always soft-wrap (the user 2026-08-24)
   };
 
   // Selection → labeled quote chip (the user 2026-08-23): mouseup is the gesture's settle point.
@@ -814,6 +850,148 @@ function offersDownload(status: number | undefined): boolean {
   return status === 413 || status === 415;
 }
 
+// ── URL mode (the user 2026-09-06) ─────────────────────────────────────────────────────────────────
+// A chat message linking a markdown file on the dashboard's OWN origin (`https://<this host>/figs/
+// run-1/evidence.md` — a published report, an evidence doc) used to open the raw text in a new tab.
+// It presents here instead: same modal, same Rendered ⇄ Raw preference (FMT_KEY), same loader-first
+// wait, same mdBlock — fetched by the BROWSER from the URL itself, with no kernel in the loop. Zero new
+// kernel surface is the point: the kernel's /file relay is a preview relay and has stayed one on
+// purpose (_remote_file's docstring), and a same-origin URL needs no relay — the browser already has
+// the cookie. Cross-origin .md links are never routed here (render.ts checks isMarkdownUrl first).
+//
+// The shell is built here rather than threaded through openFileView because almost everything in that
+// row is keyed on the KERNEL's reply — Edit on the text/plain + mtime verdicts, Download on the
+// ?download=1 route, the GitHub link on a fileGitLink ask, ‹ Files on the browser overlay — and none
+// of it exists for a URL. What both modes share is shared by construction: el/loaderEl, the format
+// pref, mdBlock/codeBlock, closeFileView and the module-level teardown registrations.
+export function openUrlView(href: string): void {
+  // The same replace path as openFileView: an editor holding unsaved changes is asked first, and
+  // every module-level registration the old viewer made is dropped before it is torn down.
+  if (document.getElementById("romp-fileview") && closeGuard && !closeGuard()) return;
+  closeGuard = null;
+  editHooks = null;
+  gitHooks = null;
+  dropMediaUrl();
+  document.getElementById("romp-fileview")?.remove();
+  const wrap = el("div");
+  wrap.id = "romp-fileview";
+  wrap.onclick = (ev) => { if (ev.target === wrap) closeFileView(); };
+  const box = el("div", "fileview");
+  document.body.classList.add("fileview-open");
+
+  // Title: host/dir/ dimmed then the basename, the local viewer's two-element treatment — but the
+  // directory half is NOT a browse link here: there is no listing to open for a URL.
+  const bar = el("div", "fileview-bar");
+  const name = el("div", "fileview-name");
+  name.title = href;                                   // the full URL, one hover away
+  const parts = urlTitleParts(href);
+  const dir = el("span", "fileview-dir");
+  dir.textContent = parts.dir;
+  const base = el("span", "fileview-base");
+  base.textContent = parts.base;
+  name.appendChild(dir); name.appendChild(base);
+  const acts = el("div", "fileview-acts");
+
+  const fmt = loadFmt();
+  let text: string | null = null;
+  const segBtns: Array<["rendered" | "raw", HTMLButtonElement]> = [];
+  for (const mode of ["rendered", "raw"] as const) {
+    const b = el("button", "fileview-btn") as HTMLButtonElement;
+    b.type = "button";
+    b.textContent = mode === "rendered" ? "Rendered" : "Raw";
+    b.title = mode === "rendered" ? "The prose the markdown means" : "The document's actual bytes";
+    b.addEventListener("click", () => { fmt.md = mode; saveFmt(fmt); renderBody(); });
+    segBtns.push([mode, b]);
+    acts.appendChild(b);
+  }
+  // The way OUT to the URL itself, in a new tab — an anchor wearing the button treatment, the
+  // GitHub link's dress: the browser owns the tab. It is also every failure pane's exit below.
+  // data-new-tab: this href IS a same-origin .md, exactly what the chat's anchor delegate routes
+  // back into this viewer — the marker tells it this one click means the tab.
+  const linkOut = (): HTMLAnchorElement => {
+    const a = el("a", "fileview-btn fileview-gh") as HTMLAnchorElement;
+    a.href = href; a.target = "_blank"; a.rel = "noopener";
+    a.dataset.newTab = "1";
+    a.textContent = "Open ↗"; a.title = "Open the URL in a new tab";
+    return a;
+  };
+  acts.appendChild(linkOut());
+  const copy = el("button", "fileview-btn") as HTMLButtonElement;
+  copy.type = "button"; copy.textContent = "Copy URL"; copy.title = href;
+  copy.addEventListener("click", () => {
+    navigator.clipboard?.writeText(href).then(
+      () => { copy.textContent = "Copied"; setTimeout(() => { copy.textContent = "Copy URL"; }, 1200); },
+      () => { copy.textContent = "Copy failed"; });
+  });
+  const close = el("button", "fileview-btn fileview-close") as HTMLButtonElement;
+  close.type = "button"; close.textContent = "✕"; close.title = "Close (Esc)";
+  close.setAttribute("aria-label", "Close the file viewer");
+  close.addEventListener("click", closeFileView);
+  acts.appendChild(copy); acts.appendChild(close);
+  bar.appendChild(name); bar.appendChild(acts);
+
+  const body = el("div", "fileview-body");
+  body.appendChild(loaderEl());                        // loader first; the fetch below replaces it
+  box.appendChild(bar); box.appendChild(body);
+  wrap.appendChild(box);
+  document.body.appendChild(wrap);
+
+  const renderBody = () => {
+    for (const [mode, b] of segBtns) {
+      const on = fmt.md === mode;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", String(on));
+    }
+    if (text === null) return;                         // the loader holds the body until the bytes land
+    body.replaceChildren(fmt.md === "rendered"
+      ? mdBlock(text, { kind: "url", href })
+      : codeBlock(text, parts.base, true));            // basename → langFor → markdown highlighting
+  };
+  renderBody();
+
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key !== "Escape" || !document.getElementById("romp-fileview")) return;
+    e.preventDefault();
+    closeFileView();
+    document.removeEventListener("keydown", onKey);
+  };
+  document.addEventListener("keydown", onKey);
+
+  // Every failure says WHY, in the pane, with the way out: never a console-only failure, never a
+  // blank pane. The lines name the host and the URL rather than the viewer's mechanics.
+  const fail = (words: string) => {
+    if (!wrap.isConnected) return;                     // closed or replaced while in flight — paint nothing
+    const why = el("div", "fileview-err");
+    why.textContent = words;
+    const hint = el("div", "fileview-err-hint");
+    hint.textContent = href;
+    why.appendChild(hint);
+    why.appendChild(linkOut());
+    body.replaceChildren(why);
+  };
+  const host = parts.dir.split("/")[0] || href;
+  const tooLarge = (n: number) =>
+    fail("this document is " + humanSize(n) + " — too large to show here (the cap is " + humanSize(URL_TEXT_MAX_BYTES) + ")");
+
+  // Same-origin, cookie-authed, cache: no-store like every viewer fetch. No Content-Type sniffing:
+  // the URL was intercepted because its PATH is markdown, so the body is read as text and rendered as
+  // markdown, whatever the server labelled it.
+  fetch(href, { cache: "no-store" }).then((r) => {
+    if (!wrap.isConnected) return;
+    if (!r.ok) { fail("HTTP " + r.status + " from " + host); return; }
+    const declared = Number(r.headers.get("Content-Length") || "");
+    if (declared > URL_TEXT_MAX_BYTES) { tooLarge(declared); return; }
+    return r.text().then((t) => {
+      if (!wrap.isConnected) return;
+      if (t.length > URL_TEXT_MAX_BYTES) { tooLarge(t.length); return; }
+      text = t;
+      renderBody();
+    });
+  }).catch((err) => {
+    fail("this document could not be loaded from this page — " + String(err && (err as Error).message || err));
+  });
+}
+
 // Kick the browser's downloader at `url` without touching the pane: a clicked <a download> starts a
 // same-origin, cookie-authed request the BROWSER owns (its progress UI, its save location), and since
 // the kernel answers with Content-Disposition: attachment the page never navigates — the viewer, the
@@ -887,11 +1065,21 @@ function codeBlock(text: string, path: string, wrapLines: boolean): HTMLElement 
   return wrap;
 }
 
+// Where the rendered document LIVES, so its relative references can be resolved against it (the user
+// 2026-09-06: a `![fig](fig.png)` in a viewed document pointed at the dashboard's root). Two homes:
+//   • url  — the document was fetched from `href` by the browser (openUrlView); a relative src/href
+//            resolves against that URL, exactly as it would have on the page itself.
+//   • file — the document is `path` on the session's disk (openFileView); a relative image is the
+//            sibling file over the kernel's /file route (fileUrl — federation-aware, never hand-built),
+//            and a relative link opens the sibling in this same viewer.
+// No location at all (a caller with nothing to say) leaves the markup as marked emitted it.
+type MdDocLoc = { kind: "url"; href: string } | { kind: "file"; path: string; sid: string | null };
+
 // Markdown rendered as the prose it means (the user 2026-08-09: Rendered is the default, Raw one click
 // away). The file is arbitrary bytes off a disk and marked emits raw HTML verbatim, so — exactly like the
 // chat's md() in render.ts — the output goes through DOMPurify before it ever reaches .innerHTML: an
 // <img onerror> or a javascript: href in a README must never run in the dashboard.
-function mdBlock(text: string): HTMLElement {
+function mdBlock(text: string, doc?: MdDocLoc): HTMLElement {
   const box = el("div", "fileview-md");
   try {
     const dirty = marked.parse(text) as string;
@@ -901,9 +1089,47 @@ function mdBlock(text: string): HTMLElement {
   } catch {
     box.textContent = text;                            // a marked bug must never cost the content
   }
+  // Relative references resolve against the DOCUMENT, after sanitisation (DOMPurify has already
+  // dropped every dangerous scheme; what is left is either absolute — untouched — or relative to a
+  // document the browser knows nothing about). getAttribute, never the .src/.href property: the
+  // property is already resolved against the PAGE, which is the wrong base.
+  if (doc) {
+    box.querySelectorAll("img[src]").forEach((node) => {
+      const img = node as HTMLImageElement;
+      const src = img.getAttribute("src") || "";
+      if (doc.kind === "url") {
+        const abs = resolveDocRelative(src, doc.href);
+        if (abs !== src) img.setAttribute("src", abs);
+      } else if (src && !/^[a-z][a-z0-9+.-]*:/i.test(src) && !src.startsWith("//")) {
+        // Every path-shaped src — relative, absolute, ~-anchored — is a file on the session's disk;
+        // only a scheme (http:, data:) or a protocol-relative URL names something the browser fetches.
+        img.setAttribute("src", fileUrl(joinDocPath(doc.path, src), doc.sid));
+      }
+    });
+    box.querySelectorAll("a[href]").forEach((node) => {
+      const a = node as HTMLAnchorElement;
+      const href = a.getAttribute("href") || "";
+      if (!href || href.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(href)) return;   // in-document, or already absolute
+      if (doc.kind === "url") {
+        // Absolute now, so the chat's document-level anchor delegate sees a scheme: a same-origin
+        // .md target opens in this viewer (isMarkdownUrl), everything else in a new tab.
+        a.setAttribute("href", resolveDocRelative(href, doc.href));
+      } else if (!href.startsWith("//")) {
+        // The sibling path rides data-act/data-path for openFileView's delegated body listener;
+        // the href stays as written (hover still shows where it goes) and no _blank is forced —
+        // the page would only 404 on it.
+        const joined = joinDocPath(doc.path, href);
+        a.dataset.act = "fv-open";
+        a.dataset.path = joined;
+        a.title = joined;
+      }
+    });
+  }
   // Links open a NEW tab: the viewer lives inside the chat pane's document, and letting a README link
-  // navigate it away would silently eat the chat until a reload.
+  // navigate it away would silently eat the chat until a reload. (A local document's sibling links,
+  // stamped fv-open above, open in the viewer instead.)
   box.querySelectorAll("a[href]").forEach((a) => {
+    if ((a as HTMLElement).dataset.act === "fv-open") return;
     (a as HTMLAnchorElement).target = "_blank";
     (a as HTMLAnchorElement).rel = "noopener";
   });

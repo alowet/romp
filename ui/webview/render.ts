@@ -43,6 +43,8 @@ import { previewKind, previewFull, canPreview, fileUrl, retryFailedPreviews, ref
 import { openFileView } from "./file-view";
 // initFileView rides its OWN line: the import above is pinned verbatim by file-view.test.ts
 import { initFileView, setFileViewIdentity, hostStub } from "./file-view";
+import { openUrlView } from "./file-view";                 // the URL mode of the same viewer (md-url-view.test.ts)
+import { isMarkdownUrl } from "./md-links";
 import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser is pane-local here now (the user 2026-08-24)
 import { pastedFilePath } from "./paste-path";
 import { insertAtCaret } from "./composer-insert";
@@ -913,6 +915,14 @@ document.addEventListener("click", (e) => {
   e.preventDefault();
   e.stopPropagation();
   if (location.protocol === "http:" || location.protocol === "https:") {
+    // A markdown file on THIS origin (a published report, an evidence doc under the dashboard's own
+    // host) presents in the file viewer, rendered, instead of as raw text in a tab (the user
+    // 2026-09-06). Same origin ONLY — the viewer fetches from the browser, and a cross-origin fetch
+    // is a CORS guess; a .md on any other origin keeps the new tab exactly as before. Anchors inside
+    // the open viewer bubble through this same delegate, so a document's own same-origin .md links
+    // navigate in place too — except the viewer's own link-out, which marks itself data-new-tab
+    // because its href is that very document and the click means "in a tab, please".
+    if (!a.dataset.newTab && isMarkdownUrl(href, location.origin)) { openUrlView(href); return; }
     window.open(href, "_blank", "noopener,noreferrer"); // web dashboard → open in the viewer's browser
   } else if (vscodeApi) {
     vscodeApi.postMessage({ type: "openLink", href });  // VS Code webview → host openExternal

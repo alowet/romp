@@ -46,6 +46,13 @@ clone writes its tracking ref; where nothing local could refresh the answer (a
 `--single-branch` clone, or a branch on origin this clone has not fetched) origin is asked on
 each open.
 
+**Opening a markdown document.** A markdown link in the chat opens in the file viewer,
+rendered, with **Raw** one click away — a path on the session's machine, or a link to a
+file served from the dashboard's own address (a published report, an evidence doc). Figures
+and links inside the document resolve relative to the document, so a `![fig](fig.png)`
+beside it shows, and a link to a sibling document opens in the same viewer. Links to files
+on other sites open in a new tab, as before.
+
 ### The feed
 
 The feed is Romp's task-management layer: a card for each task. Romp's
