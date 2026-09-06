@@ -25,7 +25,8 @@ import { quoteSrcLabel } from "./docreview";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const gclock = require("./gesture-clock.js");   // the gesture clock every settings post stamps through
 import { delegate } from "./actions";
-import { resolveDocRelative, joinDocPath, urlTitleParts } from "./md-links";
+import { resolveDocRelative, joinDocPath, urlTitleParts, headingSlug, uniqueSlugs } from "./md-links";
+import { readTextCapped, overCapWords } from "./capped-read";
 
 // hljs is registered per-bundle. Same language set (and grammar registrations) the chat's fence
 // highlighting uses, dup-guarded, so importing this module alongside render.ts costs nothing.
@@ -128,13 +129,10 @@ function loaderEl(): HTMLElement {
 
 // The 2 MB body cap for a URL document — a MIRROR of the kernel's _TEXT_MAX_BYTES (kernel.py), which
 // is what a local .md is already held to on the /file route. The URL viewer fetches from the browser,
-// so no kernel ever sees the body; the cap is applied here, from Content-Length when the server
-// sends one and from the decoded length otherwise. md-url-view.test.ts pins the two numbers equal.
+// so no kernel ever sees the body; the cap is applied here — a declared Content-Length refuses before
+// the body is read, and otherwise the streaming reader (capped-read.ts) counts the bytes as they
+// arrive and cancels the source the moment they pass it. md-url-view.test.ts pins the two numbers equal.
 const URL_TEXT_MAX_BYTES = 2 * 1024 * 1024;
-
-function humanSize(n: number): string {
-  return n >= 1e6 ? (n / 1e6).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1e3)) + " KB";
-}
 
 // ── raw-mode editing (the file browser's slice 2, the user 2026-08-14) ─────────────────────────────
 // The save op rides the WS poster the pane's boot hands initFileView; replies route back to the OPEN
@@ -176,6 +174,17 @@ function dropMediaUrl(): void {
   if (mediaUrlLive) {
     try { URL.revokeObjectURL(mediaUrlLive); } catch { /* already gone */ }
     mediaUrlLive = null;
+  }
+}
+// ONE in-flight URL read at a time, the same shape as mediaUrlLive: the URL viewer registers its
+// AbortController here and BOTH exits (closeFileView and either replace path) abort it, so a modal
+// torn down mid-body cancels its fetch and its stream — a stale read must never keep pulling bytes
+// for a viewer that is gone.
+let urlAbort: AbortController | null = null;
+function dropUrlRead(): void {
+  if (urlAbort) {
+    try { urlAbort.abort(); } catch { /* already settled */ }
+    urlAbort = null;
   }
 }
 
@@ -303,6 +312,7 @@ export function closeFileView(): void {
   editHooks = null;
   gitHooks = null;                                     // a reply landing after the close decorates nothing
   dropMediaUrl();                                      // an image/PDF view's bytes leave with the viewer
+  dropUrlRead();                                       // …and a URL view's in-flight read is cancelled
   wrap.remove();
   document.body.classList.remove("fileview-open");
 }
@@ -316,6 +326,7 @@ export function openFileView(path: string, sid?: string | null): void {
   editHooks = null;
   gitHooks = null;                                     // the replace path skips closeFileView — same drop
   dropMediaUrl();                                      // …and the old viewer's image bytes (the Reload path)
+  dropUrlRead();                                       // …and a URL viewer's in-flight read, if that is what was up
   document.getElementById("romp-fileview")?.remove();
   // backdrop (the whole overlay carries the id every open/closed check targets) + the ~95% card.
   // The backdrop treatment matches the lightbox: dimmed, click outside the card closes, content
@@ -532,6 +543,8 @@ export function openFileView(path: string, sid?: string | null): void {
       const target = a.dataset.path;
       if (target) openFileView(target, sid);
     },
+    // an in-document `[top](#evidence)` lands on its heading (mdBlock minted the ids) — never a tab
+    "fv-anchor": (a, ev) => { ev.preventDefault(); scrollToFragment(body, a.getAttribute("href") || ""); },
   });
   // Per the loading-state rule the first thing up is the romp loader, not a blank pane — a file coming
   // over an ssh tunnel to a phone is a real wait.
@@ -872,7 +885,12 @@ export function openUrlView(href: string): void {
   editHooks = null;
   gitHooks = null;
   dropMediaUrl();
+  dropUrlRead();                                       // a previous URL viewer's read stops pulling bytes
   document.getElementById("romp-fileview")?.remove();
+  // THIS open's read, registered for the teardowns above (the mediaUrlLive pattern): the fetch and the
+  // streaming body read both ride ctrl.signal, so a close or a replace mid-body cancels them.
+  const ctrl = new AbortController();
+  urlAbort = ctrl;
   const wrap = el("div");
   wrap.id = "romp-fileview";
   wrap.onclick = (ev) => { if (ev.target === wrap) closeFileView(); };
@@ -880,11 +898,13 @@ export function openUrlView(href: string): void {
   document.body.classList.add("fileview-open");
 
   // Title: host/dir/ dimmed then the basename, the local viewer's two-element treatment — but the
-  // directory half is NOT a browse link here: there is no listing to open for a URL.
+  // directory half is NOT a browse link here: there is no listing to open for a URL. Drawn from the
+  // clicked href now and RE-DRAWN from the response's URL once it lands (a redirect moves the document).
   const bar = el("div", "fileview-bar");
   const name = el("div", "fileview-name");
   name.title = href;                                   // the full URL, one hover away
-  const parts = urlTitleParts(href);
+  let parts = urlTitleParts(href);
+  let loc = href;                                      // where the document LIVES: the response URL once it lands
   const dir = el("span", "fileview-dir");
   dir.textContent = parts.dir;
   const base = el("span", "fileview-base");
@@ -931,6 +951,12 @@ export function openUrlView(href: string): void {
   bar.appendChild(name); bar.appendChild(acts);
 
   const body = el("div", "fileview-body");
+  // In-document links land on their heading (mdBlock's fv-anchor stamp): one delegated listener, the
+  // local viewer's pattern. No fv-open here — a URL document's sibling links are made absolute and
+  // the chat's own anchor delegate routes them.
+  delegate(body, {
+    "fv-anchor": (a, ev) => { ev.preventDefault(); scrollToFragment(body, a.getAttribute("href") || ""); },
+  });
   body.appendChild(loaderEl());                        // loader first; the fetch below replaces it
   box.appendChild(bar); box.appendChild(body);
   wrap.appendChild(box);
@@ -944,7 +970,7 @@ export function openUrlView(href: string): void {
     }
     if (text === null) return;                         // the loader holds the body until the bytes land
     body.replaceChildren(fmt.md === "rendered"
-      ? mdBlock(text, { kind: "url", href })
+      ? mdBlock(text, { kind: "url", href: loc })      // relative refs resolve against where it LIVES
       : codeBlock(text, parts.base, true));            // basename → langFor → markdown highlighting
   };
   renderBody();
@@ -969,26 +995,50 @@ export function openUrlView(href: string): void {
     why.appendChild(linkOut());
     body.replaceChildren(why);
   };
-  const host = parts.dir.split("/")[0] || href;
-  const tooLarge = (n: number) =>
-    fail("this document is " + humanSize(n) + " — too large to show here (the cap is " + humanSize(URL_TEXT_MAX_BYTES) + ")");
+  const hostWord = (u: string) => urlTitleParts(u).dir.split("/")[0] || u;
+  // Redraw the title from where the response actually CAME from: `/latest.md` → 302 →
+  // `/reports/run-1/evidence.md` names the second, and relative figures resolve against it (loc feeds
+  // mdBlock). The clicked href stays what Open ↗ and Copy URL hand back — the link the user was given.
+  const relocate = (r: Response) => {
+    loc = r.url || href;
+    parts = urlTitleParts(loc);
+    dir.textContent = parts.dir; base.textContent = parts.base; name.title = loc;
+  };
+  // The URL's own #fragment (`evidence.md#results`) lands after the FIRST rendered paint — once, and
+  // only when there is a rendered body with heading ids to land on.
+  let landed = false;
+  const landFragment = () => {
+    if (landed) return;
+    landed = true;
+    let hash = "";
+    try { hash = new URL(href).hash; } catch { /* not a URL — nothing to land on */ }
+    if (hash && fmt.md === "rendered") requestAnimationFrame(() => { if (wrap.isConnected) scrollToFragment(body, hash); });
+  };
 
-  // Same-origin, cookie-authed, cache: no-store like every viewer fetch. No Content-Type sniffing:
-  // the URL was intercepted because its PATH is markdown, so the body is read as text and rendered as
-  // markdown, whatever the server labelled it.
-  fetch(href, { cache: "no-store" }).then((r) => {
+  // Same-origin, cookie-authed, cache: no-store like every viewer fetch, on this open's abort signal.
+  // No Content-Type sniffing: the URL was intercepted because its PATH is markdown, so the body is
+  // read as text and rendered as markdown, whatever the server labelled it.
+  fetch(href, { cache: "no-store", signal: ctrl.signal }).then(async (r) => {
     if (!wrap.isConnected) return;
-    if (!r.ok) { fail("HTTP " + r.status + " from " + host); return; }
+    relocate(r);
+    if (!r.ok) { fail("HTTP " + r.status + " from " + hostWord(loc)); return; }
     const declared = Number(r.headers.get("Content-Length") || "");
-    if (declared > URL_TEXT_MAX_BYTES) { tooLarge(declared); return; }
-    return r.text().then((t) => {
-      if (!wrap.isConnected) return;
-      if (t.length > URL_TEXT_MAX_BYTES) { tooLarge(t.length); return; }
-      text = t;
-      renderBody();
-    });
+    if (declared > URL_TEXT_MAX_BYTES) { fail(overCapWords(declared, URL_TEXT_MAX_BYTES)); return; }
+    if (!r.body) { fail("this document could not be loaded from this page — the response carried no body"); return; }
+    // Streamed under the cap: bytes counted as they arrive, the source cancelled the moment they pass
+    // it (never the whole body buffered first), decoded as a stream so a codepoint split across two
+    // chunks survives, and aborted with the viewer (ctrl.signal).
+    const got = await readTextCapped(r.body, URL_TEXT_MAX_BYTES, ctrl.signal);
+    if (!wrap.isConnected) return;
+    if ("tooLarge" in got) { fail(overCapWords(null, URL_TEXT_MAX_BYTES)); return; }
+    text = got.text;
+    renderBody();
+    landFragment();
   }).catch((err) => {
+    if ((err as { name?: string } | null)?.name === "AbortError") return;   // the teardown cancelled it — the modal is gone
     fail("this document could not be loaded from this page — " + String(err && (err as Error).message || err));
+  }).finally(() => {
+    if (urlAbort === ctrl) urlAbort = null;              // this read is over; a later open's registration stands
   });
 }
 
@@ -1065,6 +1115,20 @@ function codeBlock(text: string, path: string, wrapLines: boolean): HTMLElement 
   return wrap;
 }
 
+// Land an in-document fragment on its heading. The fragment — as typed, percent-encoded or not —
+// slugs the same way the heading ids were minted, so `#Evidence%20Results`, `#evidence-results` and
+// `#Evidence Results` all find md-evidence-results inside THIS rendered box (never the page's own ids).
+// Nothing found → nothing happens: inert, never a scroll to the top and never a navigation.
+function scrollToFragment(box: HTMLElement, fragment: string): boolean {
+  let frag = fragment.replace(/^#/, "");
+  try { frag = decodeURIComponent(frag); } catch { /* a stray % — match the bytes as written */ }
+  if (!frag) return false;
+  const target = box.querySelector('[id="md-' + headingSlug(frag) + '"]');   // the slug's alphabet needs no escaping
+  if (!target) return false;
+  target.scrollIntoView({ block: "start" });
+  return true;
+}
+
 // Where the rendered document LIVES, so its relative references can be resolved against it (the user
 // 2026-09-06: a `![fig](fig.png)` in a viewed document pointed at the dashboard's root). Two homes:
 //   • url  — the document was fetched from `href` by the browser (openUrlView); a relative src/href
@@ -1093,6 +1157,14 @@ function mdBlock(text: string, doc?: MdDocLoc): HTMLElement {
   // dropped every dangerous scheme; what is left is either absolute — untouched — or relative to a
   // document the browser knows nothing about). getAttribute, never the .src/.href property: the
   // property is already resolved against the PAGE, which is the wrong base.
+  //
+  // Every heading gets an id first — marked 12 emits none, so a document's own `[top](#evidence)`
+  // had nothing to land on. GitHub's slug (headingSlug, made unique in order by uniqueSlugs), and
+  // PREFIXED `md-` on purpose: an unprefixed id="tabs" would dress a heading in the chat page's
+  // #tabs CSS and shadow getElementById("tabs") for the page's own controls.
+  const heads = Array.from(box.querySelectorAll("h1, h2, h3, h4, h5, h6")) as HTMLElement[];
+  const slugs = uniqueSlugs(heads.map((h) => headingSlug(h.textContent || "")));
+  heads.forEach((h, i) => { h.id = "md-" + slugs[i]; });
   if (doc) {
     box.querySelectorAll("img[src]").forEach((node) => {
       const img = node as HTMLImageElement;
@@ -1126,12 +1198,16 @@ function mdBlock(text: string, doc?: MdDocLoc): HTMLElement {
     });
   }
   // Links open a NEW tab: the viewer lives inside the chat pane's document, and letting a README link
-  // navigate it away would silently eat the chat until a reload. (A local document's sibling links,
-  // stamped fv-open above, open in the viewer instead.)
-  box.querySelectorAll("a[href]").forEach((a) => {
-    if ((a as HTMLElement).dataset.act === "fv-open") return;
-    (a as HTMLAnchorElement).target = "_blank";
-    (a as HTMLAnchorElement).rel = "noopener";
+  // navigate it away would silently eat the chat until a reload. Two kinds stay in the viewer: a local
+  // document's sibling links (stamped fv-open above), and IN-DOCUMENT `#fragment` links, which land on
+  // their heading through the body's delegated fv-anchor handler — a forced _blank on those opened a
+  // REAL tab at the chat page's own URL plus the fragment (found live, 2026-09-06).
+  box.querySelectorAll("a[href]").forEach((node) => {
+    const a = node as HTMLAnchorElement;
+    if (a.dataset.act === "fv-open") return;
+    if ((a.getAttribute("href") || "").startsWith("#")) { a.dataset.act = "fv-anchor"; return; }
+    a.target = "_blank";
+    a.rel = "noopener";
   });
   // Fenced blocks: highlight only a language the fence NAMES and this bundle registers — the same
   // no-guessing rule as langFor; an unnamed block stays plain rather than being painted at random.

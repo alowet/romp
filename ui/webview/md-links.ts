@@ -79,6 +79,28 @@ export function joinDocPath(docPath: string, rel: string): string {
   return joined || (dir.startsWith("/") ? "/" : ".");
 }
 
+/** A GitHub-style slug for a heading's text, so a document's own `[top](#evidence)` has an id to land
+ *  on (marked 12 emits none): lower-case; letters of any script, digits, spaces and hyphens kept,
+ *  everything else dropped; whitespace runs become one hyphen. Empty → "section", a stable fallback so
+ *  every heading gets an id. Idempotent — a slug slugs to itself — which is what lets a hand-written
+ *  `#my-section` fragment find the same id the heading "My Section" was given. */
+export function headingSlug(text: string): string {
+  const s = String(text ?? "").toLowerCase().replace(/[^\p{L}\p{N}\s-]/gu, "").trim().replace(/\s+/g, "-");
+  return s || "section";
+}
+
+/** Make heading slugs unique in document order, GitHub's way: the first `x` stays `x`, later ones
+ *  become `x-1`, `x-2`, … — skipping a suffix an earlier heading already holds as its own slug. */
+export function uniqueSlugs(slugs: string[]): string[] {
+  const used = new Set<string>();
+  return slugs.map((s) => {
+    let out = s;
+    for (let i = 1; used.has(out); i++) out = s + "-" + i;
+    used.add(out);
+    return out;
+  });
+}
+
 /** The title-bar halves for a URL document: `host/dir/` (dimmed in the bar, like a local path's
  *  directory) and the basename, percent-decoded for reading. A non-URL yields the whole string as
  *  the basename and no directory, so a bar can always be drawn. */

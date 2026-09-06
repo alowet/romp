@@ -921,8 +921,10 @@ document.addEventListener("click", (e) => {
     // is a CORS guess; a .md on any other origin keeps the new tab exactly as before. Anchors inside
     // the open viewer bubble through this same delegate, so a document's own same-origin .md links
     // navigate in place too — except the viewer's own link-out, which marks itself data-new-tab
-    // because its href is that very document and the click means "in a tab, please".
-    if (!a.dataset.newTab && isMarkdownUrl(href, location.origin)) { openUrlView(href); return; }
+    // because its href is that very document and the click means "in a tab, please". Only an
+    // UNMODIFIED primary click takes the viewer: a ctrl-, ⌘- or shift-click asked for a tab and gets
+    // the one it always got (middle-click is auxclick and was never intercepted).
+    if (!a.dataset.newTab && !e.ctrlKey && !e.metaKey && !e.shiftKey && isMarkdownUrl(href, location.origin)) { openUrlView(href); return; }
     window.open(href, "_blank", "noopener,noreferrer"); // web dashboard → open in the viewer's browser
   } else if (vscodeApi) {
     vscodeApi.postMessage({ type: "openLink", href });  // VS Code webview → host openExternal

@@ -51,7 +51,8 @@ rendered, with **Raw** one click away — a path on the session's machine, or a 
 file served from the dashboard's own address (a published report, an evidence doc). Figures
 and links inside the document resolve relative to the document, so a `![fig](fig.png)`
 beside it shows, and a link to a sibling document opens in the same viewer. Links to files
-on other sites open in a new tab, as before.
+on other sites open in a new tab, as before — and a ctrl- or ⌘-click still opens the file in
+a tab.
 
 ### The feed
 

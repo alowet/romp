@@ -3,7 +3,7 @@
 // them. Synthetic hosts and paths throughout (TESTHOST, the notes-api demo tree).
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
-import { isMarkdownUrl, resolveDocRelative, joinDocPath, urlTitleParts } from "./md-links";
+import { isMarkdownUrl, resolveDocRelative, joinDocPath, urlTitleParts, headingSlug, uniqueSlugs } from "./md-links";
 
 const ORIGIN = "https://TESTHOST";
 const DOC = "https://TESTHOST/figs/run-1/evidence.md";
@@ -145,4 +145,44 @@ test("urlTitleParts: host/dir/ then the basename, decoded for reading, port kept
   assert.deepEqual(urlTitleParts("https://TESTHOST/x.md"), { dir: "testhost/", base: "x.md" }, "a root file: host and slash");
   assert.deepEqual(urlTitleParts("https://TESTHOST/a%20b/my%20doc.md"), { dir: "testhost/a b/", base: "my doc.md" });
   assert.deepEqual(urlTitleParts("not a url"), { dir: "", base: "not a url" }, "a non-URL still draws a bar");
+});
+
+// ── headingSlug / uniqueSlugs: the ids a rendered document's own `#fragment` links land on ──
+
+test("headingSlug: GitHub's shape — lower-case, letters/digits/spaces/hyphens kept, the rest dropped, spaces → hyphens", () => {
+  assert.equal(headingSlug("Evidence"), "evidence");
+  assert.equal(headingSlug("Hello World"), "hello-world");
+  assert.equal(headingSlug("Hello  World"), "hello-world", "a whitespace run is ONE hyphen");
+  assert.equal(headingSlug("  Hello World  "), "hello-world", "outer whitespace trimmed");
+  assert.equal(headingSlug("Results: arm A vs. arm B!"), "results-arm-a-vs-arm-b", "punctuation dropped");
+  assert.equal(headingSlug("Run 1 — pooled estimate"), "run-1-pooled-estimate", "an em dash is not a hyphen; it drops");
+  assert.equal(headingSlug("keep-the-hyphens"), "keep-the-hyphens");
+  assert.equal(headingSlug("Ünïcödé Ωmega 日本語"), "ünïcödé-ωmega-日本語", "letters of any script are kept");
+  assert.equal(headingSlug("v2.0 (final)"), "v20-final");
+  assert.equal(headingSlug("`code` & <b>tags</b>"), "code-btagsb", "only the text — angle brackets and ampersands go");
+});
+
+test("headingSlug: idempotent (a slug slugs to itself), and empty → the stable fallback 'section'", () => {
+  for (const s of ["evidence", "hello-world", "results-arm-a-vs-arm-b", "run-1-pooled-estimate"]) assert.equal(headingSlug(s), s);
+  assert.equal(headingSlug(""), "section");
+  assert.equal(headingSlug("   "), "section");
+  assert.equal(headingSlug("!!! ??? ..."), "section", "nothing survives → the fallback, never an empty id");
+  assert.equal(headingSlug(undefined as unknown as string), "section");
+});
+
+test("uniqueSlugs: duplicates are numbered -1, -2… in document order, skipping a suffix a heading already owns", () => {
+  assert.deepEqual(uniqueSlugs(["x", "x", "x"]), ["x", "x-1", "x-2"]);
+  assert.deepEqual(uniqueSlugs(["a", "b", "a", "c", "b"]), ["a", "b", "a-1", "c", "b-1"]);
+  assert.deepEqual(uniqueSlugs(["x", "x-1", "x"]), ["x", "x-1", "x-2"], "the literal heading 'x-1' keeps its slug; the duplicate moves on");
+  assert.deepEqual(uniqueSlugs(["section", "section"]), ["section", "section-1"], "two empty headings still get distinct ids");
+  assert.deepEqual(uniqueSlugs([]), []);
+});
+
+test("the round trip a fragment link takes: heading text → id, fragment → the same id", () => {
+  const ids = uniqueSlugs(["Evidence", "Results", "Results"].map(headingSlug));
+  assert.deepEqual(ids, ["evidence", "results", "results-1"]);
+  // the author wrote [top](#Evidence), [r](#results), [r2](#Results%20) — decoded, slugged, found
+  assert.equal(headingSlug(decodeURIComponent("Evidence")), "evidence");
+  assert.equal(headingSlug(decodeURIComponent("Results%20")), "results");
+  assert.equal(headingSlug("results-1"), "results-1", "the numbered id is reachable as written");
 });

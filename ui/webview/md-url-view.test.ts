@@ -3,8 +3,11 @@
 // fetches the URL itself (no kernel route, no proxy — the kernel's /file relay is a preview relay and
 // stays one), mdBlock renders it with the shared Rendered ⇄ Raw preference, and relative figures and
 // links inside the document resolve against the document rather than the page. Cross-origin .md links
-// keep the new tab exactly. No jsdom harness for these modules → source pins, plus the executed
-// helpers in md-links.test.ts. Synthetic hosts/paths only (TESTHOST, /figs/run-1/evidence.md).
+// keep the new tab exactly. The review round added: a streamed, byte-counted body read cancelled with
+// the viewer (capped-read.ts), redirect-aware document location, modifier clicks keeping the tab,
+// heading ids + in-document fragment links that land instead of spawning a tab, and cap words that
+// never read as an equal pair. No jsdom harness for these modules → source pins, plus the executed
+// helpers in md-links.test.ts and capped-read.test.ts. Synthetic hosts/paths only.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -16,6 +19,7 @@ const VIEW = web("file-view.ts");
 const CHAT_CSS = web("styles.css");
 const FEED_CSS = web("feed.css");
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
+const GUIDE = fs.readFileSync(path.resolve(process.cwd(), "..", "docs", "guide.md"), "utf8");
 
 // the chat's global anchor-click delegate (the same isolation chat-link-open.test.ts uses)
 const HANDLER = (RENDER.match(/closest\?\.\("a\[href\]"\)[\s\S]*?\}, true\);/) || [""])[0];
@@ -26,12 +30,15 @@ const MD_FN = (VIEW.split("function mdBlock(")[1] || "").split("// The image bod
 // the local viewer (the split file-view.test.ts uses — openUrlView sits AFTER offersDownload so it
 // never leaks into this slice)
 const OPEN_FN = VIEW.split("export function openFileView")[1].split("function offersDownload")[0];
+const CLOSE_FN = VIEW.split("export function closeFileView")[1].split("/** Show `path`")[0];
 
-// ── 1. the interception: same-origin .md, BEFORE window.open, web only ──
+// ── 1. the interception: same-origin .md, unmodified primary click, BEFORE window.open, web only ──
+
+const COND = 'if (!a.dataset.newTab && !e.ctrlKey && !e.metaKey && !e.shiftKey && isMarkdownUrl(href, location.origin)) { openUrlView(href); return; }';
 
 test("the anchor delegate routes a same-origin .md href to the viewer BEFORE the new-tab window.open", () => {
   assert.ok(HANDLER, "found the anchor-click handler");
-  assert.match(HANDLER, /if \(!a\.dataset\.newTab && isMarkdownUrl\(href, location\.origin\)\) \{ openUrlView\(href\); return; \}/);
+  assert.ok(HANDLER.includes(COND), "the exact interception condition");
   const viewer = HANDLER.indexOf("openUrlView(href)");
   const tab = HANDLER.indexOf('window.open(href, "_blank", "noopener,noreferrer")');
   assert.ok(viewer > -1 && tab > -1 && viewer < tab, "the viewer branch precedes window.open");
@@ -50,6 +57,16 @@ test("the anchor delegate routes a same-origin .md href to the viewer BEFORE the
   assert.match(RENDER, /import \{ isMarkdownUrl \} from "\.\/md-links";/);
 });
 
+test("a ctrl-, meta- or shift-click on a same-origin .md keeps the tab: the modifier test sits IN the .md branch", () => {
+  const branch = HANDLER.slice(HANDLER.indexOf("if (!a.dataset.newTab"), HANDLER.indexOf("openUrlView(href)"));
+  for (const mod of ["!e.ctrlKey", "!e.metaKey", "!e.shiftKey"]) assert.ok(branch.includes(mod), mod + " gates the viewer");
+  // the fall-through is the SAME window.open the cross-origin path takes — one new-tab call, no second one
+  assert.equal((HANDLER.match(/window\.open\(/g) || []).length, 1, "exactly one window.open in the delegate");
+  // middle-click is auxclick and was never intercepted — no auxclick listener was added anywhere
+  assert.doesNotMatch(RENDER, /addEventListener\("auxclick"/);
+  assert.match(GUIDE, /ctrl- or ⌘-click still opens the file in\s+a tab/, "the guide says so");
+});
+
 test("the whole-backtick URL anchors (url-code-link) flow through the same delegate — no handler of their own", () => {
   const linkify = RENDER.split("function linkifyFileUris(")[1].split("const previewable")[0];
   assert.match(linkify, /a\.href = t;/, "an absolute http(s) href — the delegate sees a scheme");
@@ -65,7 +82,7 @@ test("openUrlView exists, fetches the given href from the browser (never fileUrl
   assert.ok(VIEW.indexOf("export function openUrlView") > VIEW.indexOf("function offersDownload"),
     "sits after offersDownload — outside the slice file-view.test.ts takes as openFileView's body");
   assert.doesNotMatch(OPEN_FN, /openUrlView|kind: "url"/, "the local viewer's body is untouched by URL mode");
-  assert.match(URL_FN, /fetch\(href, \{ cache: "no-store" \}\)/);
+  assert.match(URL_FN, /fetch\(href, \{ cache: "no-store", signal: ctrl\.signal \}\)/);
   assert.doesNotMatch(URL_FN, /fileUrl\(|kernelUrl\(|\/file\?|\/remote\//, "the URL is fetched as given — no kernel route, no relay");
   assert.doesNotMatch(URL_FN, /\bpost\(/, "nothing is asked of the kernel over the socket either");
   // …and the kernel gained no route for it
@@ -78,9 +95,23 @@ test("URL mode: the loader is up before the fetch, the body renders through mdBl
   const loader = URL_FN.indexOf("body.appendChild(loaderEl());");
   const fetchAt = URL_FN.indexOf("fetch(href, { cache");
   assert.ok(loader > -1 && fetchAt > -1 && loader < fetchAt, "loader first, then the fetch replaces it");
-  assert.match(URL_FN, /mdBlock\(text, \{ kind: "url", href \}\)/);
+  assert.match(URL_FN, /mdBlock\(text, \{ kind: "url", href: loc \}\)/, "the EFFECTIVE location, not the clicked href");
   assert.match(URL_FN, /codeBlock\(text, parts\.base, true\)/, "Raw is the same soft-wrapped code view, highlighted as markdown");
   assert.match(URL_FN, /if \(text === null\) return;/, "the loader holds the body until the bytes land");
+});
+
+test("redirects: the document LIVES at the response URL — mdBlock's base and the title follow it; Open ↗ and Copy URL keep the clicked link", () => {
+  assert.match(URL_FN, /let loc = href;/);
+  assert.match(URL_FN, /const relocate = \(r: Response\) => \{\s*\n\s*loc = r\.url \|\| href;\s*\n\s*parts = urlTitleParts\(loc\);\s*\n\s*dir\.textContent = parts\.dir; base\.textContent = parts\.base; name\.title = loc;/);
+  // relocate runs on the response BEFORE any status branch — a 404's title names where it was looked for
+  const rel = URL_FN.indexOf("relocate(r);");
+  assert.ok(rel > -1 && rel < URL_FN.indexOf("if (!r.ok)"), "relocate precedes the status check");
+  assert.match(URL_FN, /fail\("HTTP " \+ r\.status \+ " from " \+ hostWord\(loc\)\)/, "the status line names the effective host");
+  // the clicked href is what the user was given: the link-out, the copy, and the failure hint keep it
+  assert.match(URL_FN, /a\.href = href; a\.target = "_blank"; a\.rel = "noopener";/);
+  assert.match(URL_FN, /navigator\.clipboard\?\.writeText\(href\)/);
+  assert.match(URL_FN, /hint\.textContent = href;/);
+  assert.doesNotMatch(URL_FN, /writeText\(loc\)|a\.href = loc/);
 });
 
 test("URL mode shares the Rendered ⇄ Raw preference (the same localStorage key) and acknowledges the toggle synchronously", () => {
@@ -92,13 +123,12 @@ test("URL mode shares the Rendered ⇄ Raw preference (the same localStorage key
 });
 
 test("URL mode chrome: host/dir/ dimmed (not a browse link) + basename; Open ↗ link-out; Copy URL; ✕; Esc closes", () => {
-  assert.match(URL_FN, /const parts = urlTitleParts\(href\);/);
+  assert.match(URL_FN, /let parts = urlTitleParts\(href\);/);
   assert.match(URL_FN, /el\("span", "fileview-dir"\)[\s\S]*?dir\.textContent = parts\.dir;/);
   assert.match(URL_FN, /el\("span", "fileview-base"\)[\s\S]*?base\.textContent = parts\.base;/);
   assert.doesNotMatch(URL_FN, /fileview-dir-link|browseFiles/, "no file browser for a URL — the directory half is plain");
   // the link-out: an anchor in the button dress, new tab, noopener — the GitHub link's treatment
   assert.match(URL_FN, /el\("a", "fileview-btn fileview-gh"\)/);
-  assert.match(URL_FN, /a\.href = href; a\.target = "_blank"; a\.rel = "noopener";/);
   assert.match(URL_FN, /a\.textContent = "Open ↗";/);
   // …and it marks itself data-new-tab: its href IS the same-origin .md the delegate would otherwise
   // route straight back into this viewer — the marker is what makes the tab open
@@ -109,7 +139,6 @@ test("URL mode chrome: host/dir/ dimmed (not a browse link) + basename; Open ↗
   assert.doesNotMatch(MD_FN, /newTab|new-tab/);
   // Copy copies the URL (the local mode's Copy path equivalent), with the same feedback words
   assert.match(URL_FN, /copy\.textContent = "Copy URL";/);
-  assert.match(URL_FN, /navigator\.clipboard\?\.writeText\(href\)/);
   assert.match(URL_FN, /copy\.textContent = "Copied";/);
   assert.match(URL_FN, /copy\.textContent = "Copy failed";/);
   // ✕ and Esc close through the shared closeFileView
@@ -130,15 +159,39 @@ test("URL mode has NO Edit / Save / Download / GitHub / ‹ Files — every one 
 
 test("URL mode replaces an open viewer through the same guarded path (unsaved edits ask first; registrations drop)", () => {
   assert.match(URL_FN, /if \(document\.getElementById\("romp-fileview"\) && closeGuard && !closeGuard\(\)\) return;/);
-  for (const drop of ["closeGuard = null;", "editHooks = null;", "gitHooks = null;", "dropMediaUrl();"])
+  for (const drop of ["closeGuard = null;", "editHooks = null;", "gitHooks = null;", "dropMediaUrl();", "dropUrlRead();"])
     assert.ok(URL_FN.includes(drop), drop + " before the old viewer is torn down");
-  assert.ok(URL_FN.indexOf("dropMediaUrl();") < URL_FN.indexOf('document.getElementById("romp-fileview")?.remove();'));
+  assert.ok(URL_FN.indexOf("dropUrlRead();") < URL_FN.indexOf('document.getElementById("romp-fileview")?.remove();'));
 });
 
-// ── 3. loud failures, and the 2 MB cap mirrored from the kernel ──
+// ── 3. the in-flight read is cancelled by EVERY teardown ──
+
+test("the fetch and the body read ride one AbortController, registered module-level like mediaUrlLive", () => {
+  assert.match(VIEW, /let urlAbort: AbortController \| null = null;\s*\nfunction dropUrlRead\(\): void \{\s*\n\s*if \(urlAbort\) \{\s*\n\s*try \{ urlAbort\.abort\(\); \} catch \{[^}]*\}\s*\n\s*urlAbort = null;/);
+  // registered right after the old viewer is dropped, BEFORE any element is built
+  assert.match(URL_FN, /const ctrl = new AbortController\(\);\s*\n\s*urlAbort = ctrl;/);
+  assert.ok(URL_FN.indexOf("urlAbort = ctrl;") < URL_FN.indexOf('const wrap = el("div");'));
+  assert.match(URL_FN, /signal: ctrl\.signal \}\)/, "the fetch is on the signal");
+  assert.match(URL_FN, /readTextCapped\(r\.body, URL_TEXT_MAX_BYTES, ctrl\.signal\)/, "…and so is the streaming read");
+  // an abort is the teardown's doing, not a failure to paint
+  assert.match(URL_FN, /if \(\(err as \{ name\?: string \} \| null\)\?\.name === "AbortError"\) return;/);
+  // this read's registration is released when it is over — never a LATER open's
+  assert.match(URL_FN, /\.finally\(\(\) => \{\s*\n\s*if \(urlAbort === ctrl\) urlAbort = null;/);
+});
+
+test("closeFileView and BOTH replace paths call dropUrlRead — a stale read never keeps pulling for a gone modal", () => {
+  assert.match(CLOSE_FN, /dropMediaUrl\(\);[^\n]*\n\s*dropUrlRead\(\);/, "close: right beside the media-URL revoke");
+  assert.match(OPEN_FN, /dropMediaUrl\(\);[^\n]*\n\s*dropUrlRead\(\);[^\n]*\n\s*document\.getElementById\("romp-fileview"\)\?\.remove\(\);/,
+    "the local viewer's replace path: before the old viewer is torn down");
+  assert.match(URL_FN, /dropMediaUrl\(\);\s*\n\s*dropUrlRead\(\);[^\n]*\n\s*document\.getElementById\("romp-fileview"\)\?\.remove\(\);/,
+    "the URL viewer's own replace path too");
+  assert.equal((VIEW.match(/dropUrlRead\(\);/g) || []).length, 3, "exactly the three exits");
+});
+
+// ── 4. loud failures, and the 2 MB cap mirrored from the kernel — streamed, not buffered ──
 
 test("a non-OK status shows `HTTP <status> from <host>` in the pane, plus the link-out — never console-only", () => {
-  assert.match(URL_FN, /if \(!r\.ok\) \{ fail\("HTTP " \+ r\.status \+ " from " \+ host\); return; \}/);
+  assert.match(URL_FN, /if \(!r\.ok\) \{ fail\("HTTP " \+ r\.status \+ " from " \+ hostWord\(loc\)\); return; \}/);
   const failFn = (URL_FN.split("const fail = ")[1] || "").split("\n  };")[0];
   assert.ok(failFn, "the failure pane builder exists");
   assert.match(failFn, /el\("div", "fileview-err"\)/);
@@ -151,43 +204,35 @@ test("a non-OK status shows `HTTP <status> from <host>` in the pane, plus the li
 });
 
 test("a thrown fetch (network) says the document could not be loaded from this page, with the link-out", () => {
-  assert.match(URL_FN, /\.catch\(\(err\) => \{\s*\n\s*fail\("this document could not be loaded from this page — " \+ String\(err && \(err as Error\)\.message \|\| err\)\);/);
+  assert.match(URL_FN, /fail\("this document could not be loaded from this page — " \+ String\(err && \(err as Error\)\.message \|\| err\)\);/);
 });
 
-test("the body cap is the kernel's 2 MB text cap: Content-Length when declared, the decoded length otherwise", () => {
+test("the cap is the kernel's 2 MB: a declared Content-Length refuses first, then the body is STREAMED and counted in bytes", () => {
   assert.match(VIEW, /const URL_TEXT_MAX_BYTES = 2 \* 1024 \* 1024;/);
   assert.match(KERNEL, /^_TEXT_MAX_BYTES = 2 \* 1024 \* 1024/m, "the kernel's cap the viewer mirrors");
+  assert.match(VIEW, /import \{ readTextCapped, overCapWords \} from "\.\/capped-read";/);
   assert.match(URL_FN, /const declared = Number\(r\.headers\.get\("Content-Length"\) \|\| ""\);/);
-  assert.match(URL_FN, /if \(declared > URL_TEXT_MAX_BYTES\) \{ tooLarge\(declared\); return; \}/);
-  assert.match(URL_FN, /if \(t\.length > URL_TEXT_MAX_BYTES\) \{ tooLarge\(t\.length\); return; \}/);
-  assert.match(URL_FN, /too large to show here \(the cap is " \+ humanSize\(URL_TEXT_MAX_BYTES\) \+ "\)"/);
-  // ordering: status → declared length → body → decoded length; the body is never read past a refusal
+  assert.match(URL_FN, /if \(declared > URL_TEXT_MAX_BYTES\) \{ fail\(overCapWords\(declared, URL_TEXT_MAX_BYTES\)\); return; \}/,
+    "a known size is named against the limit");
+  assert.match(URL_FN, /const got = await readTextCapped\(r\.body, URL_TEXT_MAX_BYTES, ctrl\.signal\);/);
+  assert.match(URL_FN, /if \("tooLarge" in got\) \{ fail\(overCapWords\(null, URL_TEXT_MAX_BYTES\)\); return; \}/,
+    "the streaming refusal names no measured size");
+  assert.match(URL_FN, /text = got\.text;/);
+  // the buffering read is GONE: no r.text(), no code-unit .length check
+  assert.doesNotMatch(URL_FN, /r\.text\(\)|t\.length|\.length > URL_TEXT_MAX_BYTES/);
+  // ordering: status → declared length → streamed read → refusal; the body is never pulled past a refusal
   const status = URL_FN.indexOf("if (!r.ok)");
   const declared = URL_FN.indexOf("if (declared > URL_TEXT_MAX_BYTES)");
-  const readBody = URL_FN.indexOf("return r.text()");
-  const decoded = URL_FN.indexOf("if (t.length > URL_TEXT_MAX_BYTES)");
-  assert.ok(status < declared && declared < readBody && readBody < decoded, "status, header cap, read, decoded cap");
+  const readBody = URL_FN.indexOf("await readTextCapped(");
+  const tripped = URL_FN.indexOf('if ("tooLarge" in got)');
+  assert.ok(status < declared && declared < readBody && readBody < tripped, "status, header cap, streamed read, streamed cap");
   // no Content-Type sniffing: the path decided it is markdown, the body is text and renders as markdown
   assert.doesNotMatch(URL_FN, /headers\.get\("Content-Type"\)/);
-  assert.match(URL_FN, /return r\.text\(\)\.then/, "read as text, whatever the server labelled it");
-  // executed: the pipeline model — an absent/unparseable Content-Length falls through to the decoded length
-  const CAP = 2 * 1024 * 1024;
-  const route = (ok: boolean, status: number, lengthHeader: string | null, textLen: number) => {
-    if (!ok) return "HTTP " + status;
-    const declared = Number(lengthHeader || "");
-    if (declared > CAP) return "large";
-    if (textLen > CAP) return "large";
-    return "ok";
-  };
-  assert.equal(route(false, 404, null, 0), "HTTP 404");
-  assert.equal(route(true, 200, String(CAP + 1), 10), "large", "the header alone refuses — the body is never read");
-  assert.equal(route(true, 200, String(CAP), CAP), "ok", "exactly the cap is fine");
-  assert.equal(route(true, 200, null, CAP + 1), "large", "no header: the decoded length decides");
-  assert.equal(route(true, 200, "not-a-number", 10), "ok", "an unparseable header is not a refusal");
-  assert.equal(route(true, 200, "", 10), "ok");
+  // a response without a body stream fails loudly rather than pretending
+  assert.match(URL_FN, /if \(!r\.body\) \{ fail\("this document could not be loaded from this page — the response carried no body"\); return; \}/);
 });
 
-// ── 4. relative references inside the rendered document ──
+// ── 5. relative references inside the rendered document ──
 
 test("mdBlock takes the document's location and rewrites relative img/src and a/href AFTER DOMPurify", () => {
   assert.match(VIEW, /type MdDocLoc = \{ kind: "url"; href: string \} \| \{ kind: "file"; path: string; sid: string \| null \};/);
@@ -202,10 +247,10 @@ test("mdBlock takes the document's location and rewrites relative img/src and a/
   // URL mode: both resolve against the document URL through the executed helper
   assert.match(MD_FN, /const abs = resolveDocRelative\(src, doc\.href\);\s*\n\s*if \(abs !== src\) img\.setAttribute\("src", abs\);/);
   assert.match(MD_FN, /a\.setAttribute\("href", resolveDocRelative\(href, doc\.href\)\);/);
-  // in-document and already-absolute anchors are left alone
+  // in-document and already-absolute anchors are left alone by the resolver
   assert.match(MD_FN, /if \(!href \|\| href\.startsWith\("#"\) \|\| \/\^\[a-z\]\[a-z0-9\+\.-\]\*:\/i\.test\(href\)\) return;/);
-  // the two helpers arrive from the pure module
-  assert.match(VIEW, /import \{ resolveDocRelative, joinDocPath, urlTitleParts \} from "\.\/md-links";/);
+  // the helpers arrive from the pure module
+  assert.match(VIEW, /import \{ resolveDocRelative, joinDocPath, urlTitleParts, headingSlug, uniqueSlugs \} from "\.\/md-links";/);
 });
 
 test("local file mode: a relative image is the sibling over the kernel's /file route (fileUrl, never hand-built)", () => {
@@ -221,7 +266,7 @@ test("local file mode: a relative image is the sibling over the kernel's /file r
 test("local file mode: a relative link opens the sibling in the viewer via ONE delegated data-act listener on the body", () => {
   // the anchor carries the joined path as data, keeps its href for hover, and is not forced to _blank
   assert.match(MD_FN, /const joined = joinDocPath\(doc\.path, href\);\s*\n\s*a\.dataset\.act = "fv-open";\s*\n\s*a\.dataset\.path = joined;\s*\n\s*a\.title = joined;/);
-  assert.match(MD_FN, /if \(\(a as HTMLElement\)\.dataset\.act === "fv-open"\) return;\s*\n\s*\(a as HTMLAnchorElement\)\.target = "_blank";/);
+  assert.match(MD_FN, /if \(a\.dataset\.act === "fv-open"\) return;/);
   // …the delegate: actions.ts's delegate, installed once per open on the body (stable across the
   // Rendered ⇄ Raw swaps that rebuild its children), preventDefault, then openFileView with this sid
   assert.match(VIEW, /import \{ delegate \} from "\.\/actions";/);
@@ -232,7 +277,53 @@ test("local file mode: a relative link opens the sibling in the viewer via ONE d
   assert.match(HANDLER, /if \(!\/\^\[a-z\]\[a-z0-9\+\.-\]\*:\/i\.test\(href\)\) return;/);
 });
 
-// ── 5. styling: no new rules — the URL viewer wears the viewer's existing chrome in BOTH sheets ──
+// ── 6. in-document fragments: heading ids, and `#links` that land instead of spawning a tab ──
+
+test("every heading gets id=md-<slug> after sanitisation, in both modes (the md- prefix keeps the page's own ids and CSS out of it)", () => {
+  assert.match(MD_FN, /const heads = Array\.from\(box\.querySelectorAll\("h1, h2, h3, h4, h5, h6"\)\) as HTMLElement\[\];\s*\n\s*const slugs = uniqueSlugs\(heads\.map\(\(h\) => headingSlug\(h\.textContent \|\| ""\)\)\);\s*\n\s*heads\.forEach\(\(h, i\) => \{ h\.id = "md-" \+ slugs\[i\]; \}\);/);
+  const sanitize = MD_FN.indexOf("DOMPurify.sanitize(");
+  const ids = MD_FN.indexOf('h.id = "md-"');
+  const docGate = MD_FN.indexOf("if (doc) {");
+  assert.ok(sanitize < ids && ids < docGate, "after DOMPurify, and OUTSIDE the doc gate — every mode, every caller");
+  assert.match(MD_FN, /an unprefixed id="tabs" would dress a heading in the chat page's[\s\S]*?#tabs CSS and shadow getElementById\("tabs"\)/, "the prefix's reason is written down");
+});
+
+test("a `#fragment` anchor is stamped fv-anchor and gets NO _blank; every other anchor still does", () => {
+  assert.match(MD_FN, /if \(\(a\.getAttribute\("href"\) \|\| ""\)\.startsWith\("#"\)\) \{ a\.dataset\.act = "fv-anchor"; return; \}\s*\n\s*a\.target = "_blank";\s*\n\s*a\.rel = "noopener";/);
+  // the fragment branch is in the UNCONDITIONAL loop — a document with no location still lands its own links
+  const finalLoop = MD_FN.slice(MD_FN.lastIndexOf('box.querySelectorAll("a[href]")'));
+  assert.ok(finalLoop.includes('a.dataset.act = "fv-anchor"'), "stamped in the final, doc-independent pass");
+  assert.ok(finalLoop.includes('if (a.dataset.act === "fv-open") return;'), "…which also leaves the sibling links alone");
+});
+
+test("scrollToFragment: decode, slug, find md-<slug> inside THIS box, scrollIntoView; nothing found → inert", () => {
+  const fn = VIEW.split("function scrollToFragment(")[1].split("\n}")[0];
+  assert.match(fn, /let frag = fragment\.replace\(\/\^#\/, ""\);/);
+  assert.match(fn, /try \{ frag = decodeURIComponent\(frag\); \} catch \{/);
+  assert.match(fn, /if \(!frag\) return false;/);
+  assert.match(fn, /const target = box\.querySelector\('\[id="md-' \+ headingSlug\(frag\) \+ '"\]'\);/, "the box, never document.getElementById");
+  assert.match(fn, /if \(!target\) return false;/);
+  assert.match(fn, /target\.scrollIntoView\(\{ block: "start" \}\);/);
+  assert.doesNotMatch(fn, /location\.|document\.getElementById|window\.open/);
+});
+
+test("both viewers handle fv-anchor in their body delegate: preventDefault, then scrollToFragment on the body", () => {
+  const H = /"fv-anchor": \(a, ev\) => \{ ev\.preventDefault\(\); scrollToFragment\(body, a\.getAttribute\("href"\) \|\| ""\); \},/;
+  assert.match(OPEN_FN, H, "the local viewer's existing delegate gained the handler");
+  assert.match(URL_FN, H, "the URL viewer installs its own delegate for it");
+  assert.equal((URL_FN.match(/delegate\(body/g) || []).length, 1, "one listener per open");
+  assert.ok(URL_FN.indexOf("delegate(body") < URL_FN.indexOf("const renderBody ="), "installed before any render can run");
+  assert.doesNotMatch(URL_FN, /"fv-open"/, "no sibling-path links in URL mode — those are absolute and the chat's delegate routes them");
+});
+
+test("the opened URL's own #fragment lands after the FIRST rendered paint — once, and only with a rendered body", () => {
+  assert.match(URL_FN, /let landed = false;\s*\n\s*const landFragment = \(\) => \{\s*\n\s*if \(landed\) return;\s*\n\s*landed = true;/);
+  assert.match(URL_FN, /try \{ hash = new URL\(href\)\.hash; \} catch \{/);
+  assert.match(URL_FN, /if \(hash && fmt\.md === "rendered"\) requestAnimationFrame\(\(\) => \{ if \(wrap\.isConnected\) scrollToFragment\(body, hash\); \}\);/);
+  assert.match(URL_FN, /text = got\.text;\s*\n\s*renderBody\(\);\s*\n\s*landFragment\(\);/, "after the paint, not before it");
+});
+
+// ── 7. styling: no new rules — the URL viewer wears the viewer's existing chrome in BOTH sheets ──
 
 test("every class the URL viewer uses is already declared in both sheets (nothing new to mirror)", () => {
   for (const head of ["#romp-fileview {", ".fileview {", ".fileview-bar {", ".fileview-name {", ".fileview-dir {",
