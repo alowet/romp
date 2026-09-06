@@ -9,8 +9,11 @@ but a process's first recorded a fraction of itself (a day read as roughly half 
 kernel/sdk_backend.py `_turn_usage` for the measurement). The recorder is fixed; this recounts what it wrote.
 
 The transcripts are the CLI's own per-call record: every assistant message carries the `usage` block the API
-returned for that call. Summing them by local hour and day, per session, gives the ledger's token columns
-directly — and the sum is what the fixed recorder would have written. Dollars and turn counts are the
+returned for that call — the session's own file (`<projects>/<slug>/<sid>.jsonl`) AND its subagents' files
+(`<projects>/<slug>/<sid>/subagents/agent-*.jsonl`; the Agent tool's calls run in the same CLI process and are
+in the recorder's modelUsage total, and they were 45% of one measured day). Summing them by local hour and
+day, per session, gives the ledger's token columns directly — and the sum is what the fixed recorder would
+have written. Dollars and turn counts are the
 recorder's and are left exactly as they are; only the token columns (bucket, `key` sub-count, `bySid` rows)
 are rewritten. A bucket the ledger does not hold is added only inside the span it already covers, with zero
 dollars and turns (a turn's calls can straddle an hour edge; its result lands in one bucket).
@@ -127,6 +130,7 @@ def recount(state, claude, ledger):
         paths = []
         for fid in sorted(info["ids"]):
             paths += glob.glob(str(claude / "projects" / "*" / (fid + ".jsonl")))
+            paths += glob.glob(str(claude / "projects" / "*" / fid / "subagents" / "*.jsonl"))   # the Agent tool's lanes
         for hk, dk, u in _scan(sorted(set(paths)), seen):
             for kind, key in (("hours", hk), ("days", dk)):
                 slot = per.setdefault((kind, key), {}).setdefault(owner, {k: 0 for k, _ in KINDS})

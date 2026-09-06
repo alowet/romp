@@ -66,6 +66,17 @@ class SpendRebuild(unittest.TestCase):
                                                  "content": [{"type": "text", "text": "ok"}]}}))
         (self.proj / (sid + ".jsonl")).write_text("\n".join(lines) + "\n")
 
+    def _subagent(self, sid, agent, calls):
+        """A subagent lane's transcript under the session's sidecar folder — same record shape."""
+        d = self.proj / sid / "subagents"
+        d.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for off, mid, u, side in calls:
+            lines.append(json.dumps({"type": "assistant", "timestamp": self._ts(off), "isSidechain": side,
+                                     "message": {"id": mid, "role": "assistant", "model": "claude-x", "usage": u,
+                                                 "content": [{"type": "text", "text": "ok"}]}}))
+        (d / (agent + ".jsonl")).write_text("\n".join(lines) + "\n")
+
     def _reg(self, sid, name, auth="key", thread_of=""):
         d = {"sid": sid, "name": name, "cwd": "/tmp/notes-api", "auth": auth}
         if thread_of:
@@ -105,6 +116,19 @@ class SpendRebuild(unittest.TestCase):
         baks = list(self.state.glob("spend.json.bak-*"))
         self.assertEqual(len(baks), 1, "the previous ledger is kept beside the new one")
         self.assertEqual(json.loads(baks[0].read_text())["days"][self.day]["tokCacheR"], 300)
+
+    def test_subagent_lanes_count_toward_their_session(self):
+        # the Agent tool's lanes write their own transcripts under <sid>/subagents/; their calls are in the
+        # recorder's modelUsage total (same CLI process), so the recount must read them too — they were
+        # 45% of one measured day, and a recount without them still read as roughly half
+        self._transcript(WEB, [(0, "m1", U1, False)])
+        self._subagent(WEB, "agent-a1", [(20, "s1", U2, True), (40, "s2", U3, True)])
+        self._reg(WEB, "web")
+        self._ledger({self.day: self._wrong_bucket()}, {self.hour: self._wrong_bucket()})
+        self.assertEqual(self._run("--apply"), 0)
+        h = self._read()["hours"][self.hour]
+        self.assertEqual(h["tokCacheR"], 5000 + 5300 + 1000)
+        self.assertEqual(h["bySid"][WEB]["tok"], _tok(U1) + _tok(U2) + _tok(U3), "lanes bill the session that ran them")
 
     def test_a_dry_run_writes_nothing(self):
         self._transcript(WEB, [(0, "m1", U1, False), (60, "m2", U2, False)])
