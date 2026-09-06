@@ -120,7 +120,7 @@ class NotifyCardStore(unittest.TestCase):
 
 
 class FeedNotifications(unittest.TestCase):
-    """The diff detector: [(title, body)] per armed card newly in needs_input/completed."""
+    """The diff detector: [(title, body, sid, itemId)] per armed card newly in needs_input/completed."""
 
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
@@ -223,6 +223,7 @@ class FeedNotifications(unittest.TestCase):
                                            _card("OTHERSID:g1", "OTHERSID", "needs_input")))
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0][2], "OTHERSID", "only the unmuted session's card notifies")
+        self.assertEqual(out[0][3], "OTHERSID:g1", "the card's own id rides along for the tap to land on")
 
     def test_a_card_arm_overrides_its_sessions_mute(self):
         # most-specific-wins: card > session > master
@@ -305,7 +306,7 @@ class NotifyWiring(unittest.TestCase):
         # (the sid joined the tuple 2026-08-08 so the push sink can aim its tap-to-open; the list
         # got a name the same day so the federated forward rides the SAME events, never a re-diff)
         self.assertIn("_fired = _feed_notifications(feed)", self.src)
-        self.assertIn("for _t, _b, _sid in _fired:", self.src)
+        self.assertIn("for _t, _b, _sid, _iid in _fired:", self.src)   # itemId: the tap scrolls the feed to the card
         self.assertIn("_system_notify(_t, _b)", self.src)
         self.assertIn("_push_forward([{", self.src)   # trusted peers hear the same transition
 
