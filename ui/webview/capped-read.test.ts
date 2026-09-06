@@ -4,7 +4,7 @@
 // these run the real reader. Fixtures are invented bytes; nothing here is recorded data.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
-import { readTextCapped, humanSize, overCapWords } from "./capped-read";
+import { readTextCapped, humanSize, overCapWords, settleUrlResponse } from "./capped-read";
 
 const enc = new TextEncoder();
 
@@ -120,4 +120,67 @@ test("overCapWords: a KNOWN size names it against the limit; a size that would r
 
 test("overCapWords: the streaming refusal names no measured size — the true size was never read", () => {
   assert.equal(overCapWords(null, CAP), "this document is over 2 MB — too large to show here");
+});
+
+// ── settleUrlResponse: the pre-read decision, and the transfer STOPS on every refusal ──
+// A refused response used to paint its words and return while the body kept downloading for a modal
+// already closed (measured live: received bytes kept climbing after the close). The verdict helper
+// fires `stop` — the open's AbortController.abort — on every verdict that will not read the body.
+
+function resp(over: { ok?: boolean; status?: number; headers?: Record<string, string>; body?: ReadableStream<Uint8Array> | null | "stream" }) {
+  const h = new Map(Object.entries(over.headers || {}).map(([k, v]) => [k.toLowerCase(), v]));
+  const body = over.body === "stream" || over.body === undefined ? source([enc.encode("# doc\n")]).stream : over.body;
+  return { ok: over.ok ?? true, status: over.status ?? 200, headers: { get: (n: string) => h.get(n.toLowerCase()) ?? null }, body };
+}
+// a `stop` that behaves like the real one: aborting the controller also cancels the response body
+function stopper(body: ReadableStream<Uint8Array> | null) {
+  const ac = new AbortController();
+  const calls = { n: 0 };
+  return { ac, calls, stop: () => { calls.n++; ac.abort(); if (body) void body.cancel().catch(() => {}); } };
+}
+
+test("settleUrlResponse: a non-OK status → http verdict, and the transfer is stopped", () => {
+  const { stream, state } = source([enc.encode("nope")]);
+  const r = resp({ ok: false, status: 404, body: stream });
+  const s = stopper(r.body);
+  assert.deepEqual(settleUrlResponse(r, CAP, s.stop), { kind: "http", status: 404 });
+  assert.equal(s.calls.n, 1, "stop fired exactly once");
+  assert.equal(s.ac.signal.aborted, true, "the controller is aborted");
+  return new Promise<void>((done) => setTimeout(() => { assert.equal(state.cancelled, true, "…and the body's source was cancelled"); done(); }, 5));
+});
+
+test("settleUrlResponse: a declared Content-Length past the cap → declared-too-large with the number, transfer stopped", () => {
+  const { stream, state } = source([enc.encode("x")]);
+  const r = resp({ headers: { "Content-Length": String(CAP + 1) }, body: stream });
+  const s = stopper(r.body);
+  assert.deepEqual(settleUrlResponse(r, CAP, s.stop), { kind: "declared-too-large", bytes: CAP + 1 });
+  assert.equal(s.calls.n, 1);
+  assert.equal(s.ac.signal.aborted, true);
+  return new Promise<void>((done) => setTimeout(() => { assert.equal(state.cancelled, true); done(); }, 5));
+});
+
+test("settleUrlResponse: no body stream → no-body, stop still fires (symmetry: every non-read verdict aborts)", () => {
+  const r = resp({ body: null });
+  const s = stopper(null);
+  assert.deepEqual(settleUrlResponse(r, CAP, s.stop), { kind: "no-body" });
+  assert.equal(s.calls.n, 1);
+  assert.equal(s.ac.signal.aborted, true);
+});
+
+test("settleUrlResponse: an OK response with a body under (or without) a declared length → read, and stop NEVER fires", () => {
+  const cases: Record<string, string>[] = [{}, { "Content-Length": String(CAP) }, { "Content-Length": "12" }, { "Content-Length": "not-a-number" }, { "content-length": "0" }];
+  for (const headers of cases) {
+    const r = resp({ headers });
+    const s = stopper(r.body);
+    assert.deepEqual(settleUrlResponse(r, CAP, s.stop), { kind: "read" }, JSON.stringify(headers));
+    assert.equal(s.calls.n, 0, "the body is about to be read — nothing is stopped: " + JSON.stringify(headers));
+    assert.equal(s.ac.signal.aborted, false);
+  }
+});
+
+test("settleUrlResponse: the order is status, then declared length, then body — a 404 with a huge Content-Length is an http verdict", () => {
+  const r = resp({ ok: false, status: 500, headers: { "Content-Length": String(10 * CAP) }, body: null });
+  const s = stopper(null);
+  assert.deepEqual(settleUrlResponse(r, CAP, s.stop), { kind: "http", status: 500 });
+  assert.equal(s.calls.n, 1, "stopped once, not once per reason");
 });

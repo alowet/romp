@@ -186,3 +186,22 @@ test("the round trip a fragment link takes: heading text → id, fragment → th
   assert.equal(headingSlug(decodeURIComponent("Results%20")), "results");
   assert.equal(headingSlug("results-1"), "results-1", "the numbered id is reachable as written");
 });
+
+test("uniqueSlugs is amortised linear: 20,000 identical headings dedupe in well under a second, all distinct, last = setup-19999", () => {
+  // the regression: a per-duplicate restart at suffix 1 was quadratic — 12,000 repeated `## Setup`
+  // headings in an 84 KB document (well under the cap) took 11 s to render and froze the page
+  const slugs = new Array(20_000).fill("setup");
+  const t0 = process.hrtime.bigint();
+  const out = uniqueSlugs(slugs);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  assert.ok(ms < 500, "took " + ms.toFixed(1) + " ms");
+  assert.equal(out.length, 20_000);
+  assert.equal(new Set(out).size, 20_000, "all distinct");
+  assert.equal(out[0], "setup");
+  assert.equal(out[1], "setup-1");
+  assert.equal(out[19_999], "setup-19999");
+  // explicit numbered headings interleaved with duplicates still never collide, and the counter never restarts
+  const mixed = uniqueSlugs(["setup", "setup-2", "setup", "setup", "setup", "setup-5", "setup"]);
+  assert.deepEqual(mixed, ["setup", "setup-2", "setup-1", "setup-3", "setup-4", "setup-5", "setup-6"]);
+  assert.equal(new Set(mixed).size, mixed.length);
+});

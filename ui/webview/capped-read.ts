@@ -51,6 +51,42 @@ export async function readTextCapped(stream: ReadableStream<Uint8Array>, cap: nu
   }
 }
 
+// ── the decision a URL response gets BEFORE its body is read ──────────────────────────────────────
+// Pure apart from one callback, so it executes under node --test: `stop` is the open's
+// AbortController.abort, and it fires on EVERY verdict that will not read the body. The review found
+// the hole this closes: a refused response (a 404, an oversized Content-Length) painted its words and
+// returned, but the TRANSFER kept running — Chromium went on receiving the body for a modal that had
+// already been closed, because nothing had aborted the signal and the teardown had by then let go of
+// the controller. Aborting after the response resolved tears the body stream down, and nothing
+// reaches the fetch's .catch, since that promise has already settled.
+export type ResponseLike = {
+  ok: boolean;
+  status: number;
+  headers: { get(name: string): string | null };
+  body: ReadableStream<Uint8Array> | null;
+};
+export type UrlVerdict =
+  | { kind: "read" }
+  | { kind: "http"; status: number }
+  | { kind: "declared-too-large"; bytes: number }
+  | { kind: "no-body" };
+
+/** http (a non-OK status) → declared-too-large (a Content-Length past `cap`; absent or unparseable is
+ *  not a refusal — the streamed read decides) → no-body (nothing to read) → read. `stop` fires on the
+ *  first three, never on read. */
+export function settleUrlResponse(r: ResponseLike, cap: number, stop: () => void): UrlVerdict {
+  let v: UrlVerdict;
+  if (!r.ok) v = { kind: "http", status: r.status };
+  else {
+    const declared = Number(r.headers.get("Content-Length") || "");
+    if (declared > cap) v = { kind: "declared-too-large", bytes: declared };
+    else if (!r.body) v = { kind: "no-body" };
+    else v = { kind: "read" };
+  }
+  if (v.kind !== "read") stop();
+  return v;
+}
+
 /** Base-1024, the unit the cap is set in (2 * 1024 * 1024 IS 2 MB here): a trailing ".0" is dropped
  *  so the cap reads "2 MB", and anything under a megabyte is whole kilobytes. */
 export function humanSize(n: number): string {

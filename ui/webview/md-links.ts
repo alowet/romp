@@ -90,12 +90,21 @@ export function headingSlug(text: string): string {
 }
 
 /** Make heading slugs unique in document order, GitHub's way: the first `x` stays `x`, later ones
- *  become `x-1`, `x-2`, … — skipping a suffix an earlier heading already holds as its own slug. */
+ *  become `x-1`, `x-2`, … — skipping a suffix an earlier heading already holds as its own slug.
+ *  Amortised linear: each base keeps the NEXT suffix to try, so a duplicate never rescans the
+ *  suffixes already handed out (restarting at 1 per duplicate was quadratic — 12,000 repeated
+ *  headings in an 84 KB document took 11 s to render and froze the page, ✕ included). An explicitly
+ *  numbered heading that already holds `base-N` just advances that base's counter past it. */
 export function uniqueSlugs(slugs: string[]): string[] {
   const used = new Set<string>();
+  const next = new Map<string, number>();
   return slugs.map((s) => {
     let out = s;
-    for (let i = 1; used.has(out); i++) out = s + "-" + i;
+    if (used.has(out)) {
+      let n = next.get(s) ?? 1;
+      for (out = s + "-" + n; used.has(out); out = s + "-" + ++n) { /* held by an explicit heading — keep advancing */ }
+      next.set(s, n + 1);
+    }
     used.add(out);
     return out;
   });

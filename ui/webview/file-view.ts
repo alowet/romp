@@ -26,7 +26,7 @@ import { quoteSrcLabel } from "./docreview";
 const gclock = require("./gesture-clock.js");   // the gesture clock every settings post stamps through
 import { delegate } from "./actions";
 import { resolveDocRelative, joinDocPath, urlTitleParts, headingSlug, uniqueSlugs } from "./md-links";
-import { readTextCapped, overCapWords } from "./capped-read";
+import { readTextCapped, overCapWords, settleUrlResponse } from "./capped-read";
 
 // hljs is registered per-bundle. Same language set (and grammar registrations) the chat's fence
 // highlighting uses, dup-guarded, so importing this module alongside render.ts costs nothing.
@@ -1019,23 +1019,29 @@ export function openUrlView(href: string): void {
   // No Content-Type sniffing: the URL was intercepted because its PATH is markdown, so the body is
   // read as text and rendered as markdown, whatever the server labelled it.
   fetch(href, { cache: "no-store", signal: ctrl.signal }).then(async (r) => {
-    if (!wrap.isConnected) return;
+    // EVERY exit that stops short of consuming the body aborts this open's controller — once the
+    // response has resolved that is what tears the transfer down (the review: a refused response's
+    // bytes kept arriving for a modal already closed, because .finally had let go of the controller
+    // and nothing had aborted it). settleUrlResponse fires the abort itself on each refusal verdict.
+    if (!wrap.isConnected) { ctrl.abort(); return; }
     relocate(r);
-    if (!r.ok) { fail("HTTP " + r.status + " from " + hostWord(loc)); return; }
-    const declared = Number(r.headers.get("Content-Length") || "");
-    if (declared > URL_TEXT_MAX_BYTES) { fail(overCapWords(declared, URL_TEXT_MAX_BYTES)); return; }
-    if (!r.body) { fail("this document could not be loaded from this page — the response carried no body"); return; }
+    const v = settleUrlResponse(r, URL_TEXT_MAX_BYTES, () => ctrl.abort());
+    if (v.kind === "http") { fail("HTTP " + v.status + " from " + hostWord(loc)); return; }
+    if (v.kind === "declared-too-large") { fail(overCapWords(v.bytes, URL_TEXT_MAX_BYTES)); return; }
+    if (v.kind === "no-body") { fail("this document could not be loaded from this page — the response carried no body"); return; }
     // Streamed under the cap: bytes counted as they arrive, the source cancelled the moment they pass
     // it (never the whole body buffered first), decoded as a stream so a codepoint split across two
     // chunks survives, and aborted with the viewer (ctrl.signal).
-    const got = await readTextCapped(r.body, URL_TEXT_MAX_BYTES, ctrl.signal);
-    if (!wrap.isConnected) return;
-    if ("tooLarge" in got) { fail(overCapWords(null, URL_TEXT_MAX_BYTES)); return; }
+    const got = await readTextCapped(r.body!, URL_TEXT_MAX_BYTES, ctrl.signal);   // read verdict: the body is there
+    if (!wrap.isConnected) { ctrl.abort(); return; }
+    if ("tooLarge" in got) { ctrl.abort(); fail(overCapWords(null, URL_TEXT_MAX_BYTES)); return; }
     text = got.text;
     renderBody();
     landFragment();
   }).catch((err) => {
-    if ((err as { name?: string } | null)?.name === "AbortError") return;   // the teardown cancelled it — the modal is gone
+    // Only the TEARDOWN's abort is silent (the modal is gone, or a refusal already painted its words);
+    // an independently errored stream that merely wears the AbortError name still paints its failure.
+    if (ctrl.signal.aborted) return;
     fail("this document could not be loaded from this page — " + String(err && (err as Error).message || err));
   }).finally(() => {
     if (urlAbort === ctrl) urlAbort = null;              // this read is over; a later open's registration stands

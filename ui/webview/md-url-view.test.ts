@@ -103,10 +103,10 @@ test("URL mode: the loader is up before the fetch, the body renders through mdBl
 test("redirects: the document LIVES at the response URL — mdBlock's base and the title follow it; Open ↗ and Copy URL keep the clicked link", () => {
   assert.match(URL_FN, /let loc = href;/);
   assert.match(URL_FN, /const relocate = \(r: Response\) => \{\s*\n\s*loc = r\.url \|\| href;\s*\n\s*parts = urlTitleParts\(loc\);\s*\n\s*dir\.textContent = parts\.dir; base\.textContent = parts\.base; name\.title = loc;/);
-  // relocate runs on the response BEFORE any status branch — a 404's title names where it was looked for
+  // relocate runs on the response BEFORE any verdict branch — a 404's title names where it was looked for
   const rel = URL_FN.indexOf("relocate(r);");
-  assert.ok(rel > -1 && rel < URL_FN.indexOf("if (!r.ok)"), "relocate precedes the status check");
-  assert.match(URL_FN, /fail\("HTTP " \+ r\.status \+ " from " \+ hostWord\(loc\)\)/, "the status line names the effective host");
+  assert.ok(rel > -1 && rel < URL_FN.indexOf("settleUrlResponse(r,"), "relocate precedes the verdict");
+  assert.match(URL_FN, /fail\("HTTP " \+ v\.status \+ " from " \+ hostWord\(loc\)\)/, "the status line names the effective host");
   // the clicked href is what the user was given: the link-out, the copy, and the failure hint keep it
   assert.match(URL_FN, /a\.href = href; a\.target = "_blank"; a\.rel = "noopener";/);
   assert.match(URL_FN, /navigator\.clipboard\?\.writeText\(href\)/);
@@ -172,9 +172,11 @@ test("the fetch and the body read ride one AbortController, registered module-le
   assert.match(URL_FN, /const ctrl = new AbortController\(\);\s*\n\s*urlAbort = ctrl;/);
   assert.ok(URL_FN.indexOf("urlAbort = ctrl;") < URL_FN.indexOf('const wrap = el("div");'));
   assert.match(URL_FN, /signal: ctrl\.signal \}\)/, "the fetch is on the signal");
-  assert.match(URL_FN, /readTextCapped\(r\.body, URL_TEXT_MAX_BYTES, ctrl\.signal\)/, "…and so is the streaming read");
-  // an abort is the teardown's doing, not a failure to paint
-  assert.match(URL_FN, /if \(\(err as \{ name\?: string \} \| null\)\?\.name === "AbortError"\) return;/);
+  assert.match(URL_FN, /readTextCapped\(r\.body!, URL_TEXT_MAX_BYTES, ctrl\.signal\)/, "…and so is the streaming read");
+  // only the TEARDOWN's abort is silent — keyed on this open's signal, never on an error's name: an
+  // independently errored stream that merely wears the AbortError name still paints its failure
+  assert.match(URL_FN, /\.catch\(\(err\) => \{[\s\S]*?if \(ctrl\.signal\.aborted\) return;\s*\n\s*fail\("this document could not be loaded from this page — "/);
+  assert.doesNotMatch(URL_FN, /name === "AbortError"/);
   // this read's registration is released when it is over — never a LATER open's
   assert.match(URL_FN, /\.finally\(\(\) => \{\s*\n\s*if \(urlAbort === ctrl\) urlAbort = null;/);
 });
@@ -191,7 +193,7 @@ test("closeFileView and BOTH replace paths call dropUrlRead — a stale read nev
 // ── 4. loud failures, and the 2 MB cap mirrored from the kernel — streamed, not buffered ──
 
 test("a non-OK status shows `HTTP <status> from <host>` in the pane, plus the link-out — never console-only", () => {
-  assert.match(URL_FN, /if \(!r\.ok\) \{ fail\("HTTP " \+ r\.status \+ " from " \+ hostWord\(loc\)\); return; \}/);
+  assert.match(URL_FN, /if \(v\.kind === "http"\) \{ fail\("HTTP " \+ v\.status \+ " from " \+ hostWord\(loc\)\); return; \}/);
   const failFn = (URL_FN.split("const fail = ")[1] || "").split("\n  };")[0];
   assert.ok(failFn, "the failure pane builder exists");
   assert.match(failFn, /el\("div", "fileview-err"\)/);
@@ -210,26 +212,49 @@ test("a thrown fetch (network) says the document could not be loaded from this p
 test("the cap is the kernel's 2 MB: a declared Content-Length refuses first, then the body is STREAMED and counted in bytes", () => {
   assert.match(VIEW, /const URL_TEXT_MAX_BYTES = 2 \* 1024 \* 1024;/);
   assert.match(KERNEL, /^_TEXT_MAX_BYTES = 2 \* 1024 \* 1024/m, "the kernel's cap the viewer mirrors");
-  assert.match(VIEW, /import \{ readTextCapped, overCapWords \} from "\.\/capped-read";/);
-  assert.match(URL_FN, /const declared = Number\(r\.headers\.get\("Content-Length"\) \|\| ""\);/);
-  assert.match(URL_FN, /if \(declared > URL_TEXT_MAX_BYTES\) \{ fail\(overCapWords\(declared, URL_TEXT_MAX_BYTES\)\); return; \}/,
+  assert.match(VIEW, /import \{ readTextCapped, overCapWords, settleUrlResponse \} from "\.\/capped-read";/);
+  // the pre-read decision is the executed helper's (capped-read.test.ts), fed this open's abort as `stop`
+  assert.match(URL_FN, /const v = settleUrlResponse\(r, URL_TEXT_MAX_BYTES, \(\) => ctrl\.abort\(\)\);/);
+  assert.match(URL_FN, /if \(v\.kind === "declared-too-large"\) \{ fail\(overCapWords\(v\.bytes, URL_TEXT_MAX_BYTES\)\); return; \}/,
     "a known size is named against the limit");
-  assert.match(URL_FN, /const got = await readTextCapped\(r\.body, URL_TEXT_MAX_BYTES, ctrl\.signal\);/);
-  assert.match(URL_FN, /if \("tooLarge" in got\) \{ fail\(overCapWords\(null, URL_TEXT_MAX_BYTES\)\); return; \}/,
+  assert.match(URL_FN, /const got = await readTextCapped\(r\.body!, URL_TEXT_MAX_BYTES, ctrl\.signal\);/);
+  assert.match(URL_FN, /if \("tooLarge" in got\) \{ ctrl\.abort\(\); fail\(overCapWords\(null, URL_TEXT_MAX_BYTES\)\); return; \}/,
     "the streaming refusal names no measured size");
   assert.match(URL_FN, /text = got\.text;/);
-  // the buffering read is GONE: no r.text(), no code-unit .length check
+  // the buffering read is GONE: no r.text(), no code-unit .length check — and no header is read here
+  // at all (the helper owns Content-Length; Content-Type is never sniffed)
   assert.doesNotMatch(URL_FN, /r\.text\(\)|t\.length|\.length > URL_TEXT_MAX_BYTES/);
-  // ordering: status → declared length → streamed read → refusal; the body is never pulled past a refusal
-  const status = URL_FN.indexOf("if (!r.ok)");
-  const declared = URL_FN.indexOf("if (declared > URL_TEXT_MAX_BYTES)");
+  assert.doesNotMatch(URL_FN, /headers\.get\(/);
+  // ordering: status → declared length → no-body → streamed read → refusal; the body is never pulled
+  // past a refusal
+  const status = URL_FN.indexOf('if (v.kind === "http")');
+  const declared = URL_FN.indexOf('if (v.kind === "declared-too-large")');
+  const noBody = URL_FN.indexOf('if (v.kind === "no-body")');
   const readBody = URL_FN.indexOf("await readTextCapped(");
   const tripped = URL_FN.indexOf('if ("tooLarge" in got)');
-  assert.ok(status < declared && declared < readBody && readBody < tripped, "status, header cap, streamed read, streamed cap");
-  // no Content-Type sniffing: the path decided it is markdown, the body is text and renders as markdown
-  assert.doesNotMatch(URL_FN, /headers\.get\("Content-Type"\)/);
+  assert.ok(status > -1 && status < declared && declared < noBody && noBody < readBody && readBody < tripped,
+    "status, header cap, no-body, streamed read, streamed cap");
   // a response without a body stream fails loudly rather than pretending
-  assert.match(URL_FN, /if \(!r\.body\) \{ fail\("this document could not be loaded from this page — the response carried no body"\); return; \}/);
+  assert.match(URL_FN, /if \(v\.kind === "no-body"\) \{ fail\("this document could not be loaded from this page — the response carried no body"\); return; \}/);
+});
+
+test("EVERY exit that stops short of consuming the body aborts this open's controller — a refused response's transfer stops", () => {
+  // the hole (measured live): a 404 / oversized-length refusal painted its words and returned, .finally
+  // let go of the controller, and the body kept downloading for a modal already closed
+  const thenBody = URL_FN.split(".then(async (r) => {")[1].split(".catch(")[0];
+  assert.match(thenBody, /^\s*(\/\/[^\n]*\n\s*)*if \(!wrap\.isConnected\) \{ ctrl\.abort\(\); return; \}/, "closed before the response landed: abort");
+  assert.match(thenBody, /settleUrlResponse\(r, URL_TEXT_MAX_BYTES, \(\) => ctrl\.abort\(\)\)/, "http / declared-too-large / no-body: the helper fires the abort");
+  assert.match(thenBody, /await readTextCapped\(r\.body!, URL_TEXT_MAX_BYTES, ctrl\.signal\);[^\n]*\n\s*if \(!wrap\.isConnected\) \{ ctrl\.abort\(\); return; \}/, "closed while the body streamed: abort");
+  assert.match(thenBody, /if \("tooLarge" in got\) \{ ctrl\.abort\(\);/, "the streaming trip: abort (the reader already cancelled its source; the signal makes it symmetric)");
+  // three literal aborts in the closure + the one the helper fires = every early return; the success path has none
+  assert.equal((thenBody.match(/ctrl\.abort\(\)/g) || []).length, 4);
+  const success = thenBody.slice(thenBody.indexOf("text = got.text;"));
+  assert.doesNotMatch(success, /ctrl\.abort/, "a consumed body has nothing left to stop");
+  // every early `return` in the closure is preceded on its line by an abort or by a verdict branch
+  // (whose abort the helper already fired)
+  for (const line of thenBody.split("\n").filter((l) => /return;/.test(l))) {
+    assert.ok(/ctrl\.abort\(\)|v\.kind ===/.test(line), "an early exit without an abort: " + line.trim());
+  }
 });
 
 // ── 5. relative references inside the rendered document ──
@@ -333,4 +358,14 @@ test("every class the URL viewer uses is already declared in both sheets (nothin
     assert.ok(FEED_CSS.includes(head), head + " in feed.css");
   }
   assert.doesNotMatch(URL_FN, /style\.|cssText|innerHTML = '<style/, "no inline styling");
+});
+
+test("a landed heading sits a breath below the title bar: scroll-margin-top on h1–h6, byte-equal in both sheets, the bar's own 10px", () => {
+  const RULE = ".fileview-md h1, .fileview-md h2, .fileview-md h3, .fileview-md h4, .fileview-md h5, .fileview-md h6 { scroll-margin-top: 10px; }";
+  assert.ok(CHAT_CSS.includes(RULE), "styles.css");
+  assert.ok(FEED_CSS.includes(RULE), "feed.css");
+  // 10px is a spacing the viewer already wears (the bar's padding, the refusal's Download offset) — no new value
+  assert.match(CHAT_CSS, /\.fileview-bar \{[^}]*padding: 7px 10px;/);
+  assert.match(CHAT_CSS, /\.fileview-err-dl \{ display: block; margin-top: 10px; \}/);
+  assert.doesNotMatch(RULE, /font-size|--/, "no font size, no token");
 });
