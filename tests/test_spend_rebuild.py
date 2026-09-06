@@ -17,6 +17,10 @@ from pathlib import Path
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
+# Hermetic state BEFORE the loads — they resolve their state root at import time, and only
+# pytest runs conftest's floor (a bare unittest or script run otherwise writes REAL state).
+os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
+os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel's export outranks the XDG floor
 cli = SourceFileLoader("romp_spend_rebuild_cli", os.path.join(BIN, "romp-spend-rebuild")).load_module()
 
 WEB = "11111111-2222-3333-4444-555555555555"
