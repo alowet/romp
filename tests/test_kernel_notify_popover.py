@@ -258,7 +258,12 @@ class PushTestRoute(_LoopbackMixin, unittest.TestCase):
         d = json.loads(payload.decode())
         self.assertEqual(d["title"], "romp")
         self.assertTrue(d["body"])
-        self.assertEqual(set(d), {"title", "body"}, "a test carries no sid to jump to and no badge")
+        # preview reconciliation with #940: the tap payload rides `data` (kind test, no sid) and a tag
+        self.assertLessEqual(set(d), {"title", "body", "tag", "data", "sid"}, "a test carries no sid to jump to and no badge")
+        self.assertFalse(d.get("sid"))
+        self.assertEqual(d["data"]["kind"], "test")
+        self.assertFalse(d["data"].get("sid"))
+        self.assertNotIn("badge", d)
 
     def test_a_refusal_comes_back_verbatim(self):
         code, res, _ = self._test((403, "Forbidden: {\"reason\":\"BadJwtToken\"}"))
@@ -353,7 +358,7 @@ class TurnFinishedPush(unittest.TestCase):
         _stamp_stop(SID_WEB, 1001)
         fired, pushed, fwd = self._tick()
         self.assertEqual(fired, [{"title": "web", "body": "Done: the login flow now redirects to the notes list.",
-                                  "sid": SID_WEB}])
+                                  "sid": SID_WEB, "kind": "turn"}])   # preview reconciliation with #940: the kind rides to peers
         (args, kw), = pushed
         self.assertEqual(args, ("web", "Done: the login flow now redirects to the notes list.", SID_WEB))
         self.assertNotIn("badge", kw, "the count rides its own push")
@@ -484,7 +489,7 @@ class OneBuzzPerTurnEnd(unittest.TestCase):
         import inspect
         src = inspect.getsource(km._cached_feed)
         self.assertIn('_buzz_claim(_sid, _turn_end_key(_sid), "bell")', src)
-        self.assertLess(src.index("_buzz_claim("), src.index("_push_notify(_t, _b, _sid, _badge)"))
+        self.assertLess(src.index("_buzz_claim("), src.index('_push_notify(_t, _b, _sid, _badge, kind="card", card_id=_iid)'))
         self.assertLess(src.index("_system_notify(_t, _b)"), src.index("_buzz_claim("),
                         "the desktop notice is not the buzz and never yields")
 
@@ -513,7 +518,10 @@ class RelayOfTurnEvents(unittest.TestCase):
             h.log_message = lambda *a: None
             with mock.patch.object(km, "_push_notify") as pn:
                 h.do_POST()
-            pn.assert_called_once_with("web", "Done: shipped.", "boxa:" + SID_WEB)
+            pn.assert_called_once()   # preview reconciliation with #940: kind/host ride as kwargs
+            args, kw = pn.call_args
+            self.assertEqual(args, ("web", "Done: shipped.", "boxa:" + SID_WEB))
+            self.assertEqual(kw.get("host"), "boxa")
         finally:
             with km._remotes_lock:
                 km._remotes.pop("boxa", None)

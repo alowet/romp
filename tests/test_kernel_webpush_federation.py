@@ -170,7 +170,7 @@ class RelayRoute(unittest.TestCase):
         # the origin rides the sid AND the title, the way every federated surface wears it —
         # and badge is OMITTED (positional call, default None): the origin's count is not ours
         pn.assert_called_once_with("romp: boxa:web", "Needs you: fix the login flow",
-                                   "boxa:11111111-2222")
+                                   "boxa:11111111-2222", kind="card", card_id="", host="boxa")
         self.assertEqual(err, "")
 
     def test_title_and_sid_surgery_is_tolerant(self):
@@ -180,7 +180,23 @@ class RelayRoute(unittest.TestCase):
         status, parsed, pn, _, _ = self._relay({"origin": "boxa", "events": evs})
         self.assertEqual(status, 200)
         self.assertEqual(parsed["mirrored"], 1)
-        pn.assert_called_once_with("Custom shape", "b", "already:prefixed")
+        pn.assert_called_once_with("Custom shape", "b", "already:prefixed", kind="card", card_id="", host="boxa")
+
+    def test_kind_and_card_pass_through_with_the_origin_as_host(self):
+        # the card id is a goal id — globally unique, never host-prefixed (federation.ts) — so the
+        # merged feed finds it as-is; the sid wears the prefix and host names the origin outright
+        _seed_remote("boxa", "trusted")
+        ev = {"title": "romp: web", "body": "Needs you: x", "sid": "11111111-2222",
+              "kind": "card", "cardId": "11111111-2222:g1"}
+        status, parsed, pn, _, _ = self._relay({"origin": "boxa", "events": [ev]})
+        self.assertEqual(parsed["mirrored"], 1)
+        pn.assert_called_once_with("romp: boxa:web", "Needs you: x", "boxa:11111111-2222",
+                                   kind="card", card_id="11111111-2222:g1", host="boxa")
+        # …and the payload that reaches the phone carries both, the deep link included
+        d = km._push_payload("romp: boxa:web", "Needs you: x", "boxa:11111111-2222",
+                             kind="card", card_id="11111111-2222:g1", host="boxa")["data"]
+        self.assertEqual((d["sid"], d["host"], d["cardId"]), ("boxa:11111111-2222", "boxa", "11111111-2222:g1"))
+        self.assertEqual(d["url"], "/?push-reveal=boxa%3A11111111-2222&push-card=11111111-2222%3Ag1")
 
     def test_a_remembered_trusted_host_counts(self):
         # trust is judged by origin, attached or not — the remembered table is the origin store
@@ -188,7 +204,7 @@ class RelayRoute(unittest.TestCase):
         status, parsed, pn, _, _ = self._relay(
             {"origin": "boxb", "events": [{"title": "romp: api", "body": "Completed: done", "sid": "S2"}]})
         self.assertEqual(parsed, {"ok": True, "mirrored": 1})
-        pn.assert_called_once_with("romp: boxb:api", "Completed: done", "boxb:S2")
+        pn.assert_called_once_with("romp: boxb:api", "Completed: done", "boxb:S2", kind="card", card_id="", host="boxb")
 
     def test_below_trusted_drops_loudly_and_never_buzzes(self):
         _seed_remote("boxa", "directed")
@@ -269,7 +285,7 @@ class ForwardWiring(unittest.TestCase):
         # turn-finished push — so a peer's phone hears each turn end once, exactly like ours.
         src = open(os.path.join(BIN, "romp-kernel")).read()
         self.assertIn("_fired = _feed_notifications(feed)", src)
-        self.assertIn('_buzzed.append({"title": _t, "body": _b, "sid": _sid})', src)
+        self.assertIn('_buzzed.append({"title": _t, "body": _b, "sid": _sid, "kind": "card", "cardId": _iid})', src)
         self.assertIn("_push_forward(_buzzed)", src)
         self.assertNotIn("_push_forward([{", src, "no second list is built from a second diff")
 

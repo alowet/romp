@@ -6,11 +6,17 @@ end — `/sw.js`, `/push/*`, VAPID, the `_push_notify` sink beside `_system_noti
 bell), live-verified on a real iPhone on 2026-08-07; then 3 plus tap-to-open on 2026-08-08, after
 the first real push opened the app on a session OTHER than the one that fired it — the bug that
 motivated the routing metadata below. A push now carries the firing card's sid and the
-needs-you count as routing metadata: the notification tap lands on that session (live window →
-SW postMessage → focus into the chat pane; cold start → `/?push-reveal=` → `POST /reveal` parks a
-wid-aimed focus consumed on that window's chat `ready` — an exact event, no delay heuristics),
-and the app icon wears the count (`navigator.setAppBadge` — the SW paints it while the app is
-closed, the shell trues it up over its WS on connect and on every change).
+needs-you count as routing metadata — and, since 2026-09-06, a `data` block `{sid, host, kind,
+cardId, url}` plus a per-session `tag` (`_push_payload`). The notification tap lands on that
+session: the SW closes the notification, focuses the window the user last had in front and posts
+`{romp:'notificationClick', …}` to it (a refused `focus()` falls through to `openWindow` on the
+deep link, all inside `waitUntil`); with no window it opens `url` (`/?push-reveal=<sid>
+[&push-card=<id>]`). Either way the shell asks the kernel for the focus (`POST /reveal`, wid-aimed,
+parked until that window's chat `ready` when the pane is not up yet — an exact event, no delay
+heuristics; a dead sid gets the revive prompt, never a silent miss) and, for a card, posts
+`revealCard` into the feed once it has announced its first payload; the URL params are stripped
+with `replaceState`. The app icon wears the count (`navigator.setAppBadge` — the SW paints it while
+the app is closed, the shell trues it up over its WS on connect and on every change).
 Implementation notes that amend this sketch:
 - The shell background is `#1e1e1e`, not the `#101418` guessed below (that is the login page);
   the manifest and theme-color use `#1e1e1e`.

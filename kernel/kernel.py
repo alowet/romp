@@ -29526,7 +29526,7 @@ def _cached_feed(now, tmux, sig, connect=False):
     _badge = _needs_you_count(feed)
     _fired = _feed_notifications(feed)                    # armed bells: fresh builds are the transition event
     _buzzed = []
-    for _t, _b, _sid in _fired:
+    for _t, _b, _sid, _iid in _fired:
         _system_notify(_t, _b)
         # ONE phone buzz per session per turn end (the 2026-09-05 rule, see _buzz_claim): a card
         # moving because its session just stopped shares that stop with the turn-finished push —
@@ -29534,8 +29534,9 @@ def _cached_feed(now, tmux, sig, connect=False):
         # the badge below are not the buzz and never yield.
         if not _buzz_claim(_sid, _turn_end_key(_sid), "bell"):
             continue
-        _push_notify(_t, _b, _sid, _badge)                # same events to subscribed phones (plans/ios-app.md)
-        _buzzed.append({"title": _t, "body": _b, "sid": _sid})
+        # same events to subscribed phones (plans/ios-app.md); kind + card id are what the tap acts on
+        _push_notify(_t, _b, _sid, _badge, kind="card", card_id=_iid)
+        _buzzed.append({"title": _t, "body": _b, "sid": _sid, "kind": "card", "cardId": _iid})
     if _buzzed:
         # …and to trusted peers' devices (plans/federated-push.md): the phone subscribed at the
         # always-on box must buzz for THIS kernel's cards too — which kernel detected an event is
@@ -29573,11 +29574,12 @@ def _system_notify(title, body):
 
 
 def _feed_notifications(feed):
-    """Diff this feed build against the last; return [(title, body, sid)] for every ARMED card that
-    newly entered needs_input or completed (including a card appearing already there — work can
-    surface blocked). Also advances the prev map and prunes armed ids whose card left the feed.
-    sid rides along so a push notification's tap can land ON the session that fired (the user
-    2026-08-08, whose first real push opened the app on a different session)."""
+    """Diff this feed build against the last; return [(title, body, sid, itemId)] for every ARMED
+    card that newly entered needs_input or completed (including a card appearing already there —
+    work can surface blocked). Also advances the prev map and prunes armed ids whose card left the
+    feed. sid rides along so a push notification's tap can land ON the session that fired (the
+    user 2026-08-08, whose first real push opened the app on a different session); itemId joined
+    it 2026-09-06 so the same tap can also scroll the feed to the card itself."""
     prev = _NOTIFY_PREV[0]
     cur = {}
     for a in feed.get("asks") or []:
@@ -29600,7 +29602,7 @@ def _feed_notifications(feed):
         txt = str(a.get("text") or "").strip()
         out.append(("romp: %s" % (a.get("name") or "session"),
                     "%s: %s" % (what, txt[:140] if txt else "a task changed state"),
-                    str(a.get("sid") or "")))
+                    str(a.get("sid") or ""), iid))
     return out
 
 
@@ -29808,7 +29810,7 @@ def _push_test(endpoint):
     if not sub:
         return {"ok": False, "status": 0, "detail": "this device isn't subscribed yet"}
     _vapid_keys()                                          # RuntimeError without cryptography → the route's 500
-    payload = json.dumps({"title": "romp", "body": "Test notification — this device is set up."}).encode()
+    payload = json.dumps(_push_payload("romp", "Test notification — this device is set up.", kind="test")).encode()
     status, detail = _push_post(sub, payload)
     ok = 200 <= status < 300
     if status in _PUSH_DEAD_STATUSES:
@@ -29817,15 +29819,54 @@ def _push_test(endpoint):
     return {"ok": ok, "status": status, "detail": detail}
 
 
-def _push_notify(title, body, sid="", badge=None):
+def _push_payload(title, body, sid="", badge=None, kind="card", card_id="", host=""):
+    """The JSON one web push carries — the ONE builder every push kind goes through, so a tap on
+    any of them lands the same way (the user 2026-09-06, who wants a tap to focus the romp
+    window they already have open and put them on the session — and card — that buzzed).
+
+    Content is the gist and nothing more: title + body. Everything else is ROUTING metadata the
+    service worker acts on, never text it shows:
+      sid   — top level, for a worker of the previous build still installed on some phone (it
+              read d.sid; a worker updates on the next push or app open, not before);
+      tag   — one notification per SESSION: a second push for the same session replaces the
+              first on the lock screen instead of stacking (renotify keeps the buzz), and a
+              sid-less push wears a fixed tag so tests collapse too;
+      badge — the needs-you count the worker paints on the app icon while the app is closed;
+              None OMITS the key and the worker leaves the count alone — the shape a mirrored
+              federated event wears, because the origin's count is not ours;
+      data  — {sid, host, kind, cardId, url}: what the worker hands the shell on a tap (or puts
+              in the URL it opens when no window exists). kind names the leg that fired ("card":
+              a card entered needs-you/completed; "turn": a turn ended; "test": the popover's
+              probe, no sid, nowhere to land); cardId (a card kind only) is the goal id the feed
+              scrolls to; url is the same-origin deep link the shell already parses at boot
+              (?push-reveal=<sid>, plus &push-card=<id> for a card) — "/" when there is no
+              session to land on. host is the origin kernel of a relayed event ("" = local);
+              the sid already wears it as a prefix (host:sid, the merged dashboard's own tab
+              address), so this is a courtesy copy, not a second source of truth."""
+    import urllib.parse
+    sid, card_id, kind = str(sid or ""), str(card_id or ""), str(kind or "card")
+    host = str(host or "") or (sid.split(":", 1)[0] if ":" in sid else "")
+    url = "/"
+    if sid:
+        q = [("push-reveal", sid)] + ([("push-card", card_id)] if card_id else [])
+        url = "/?" + urllib.parse.urlencode(q)
+    d = {"title": str(title), "body": str(body), "sid": sid,
+         "tag": "romp:" + (sid or kind),
+         "data": {"sid": sid, "host": host, "kind": kind, "cardId": card_id, "url": url}}
+    if badge is not None:
+        d["badge"] = int(badge or 0)
+    return d
+
+
+def _push_notify(title, body, sid="", badge=None, kind="card", card_id="", host=""):
     """_system_notify's sibling sink: the same (title, body) — the card's gist and nothing more —
-    to every subscribed device, plus two pieces of ROUTING metadata, not content: sid, so tapping
-    the notification lands on the session that fired (the user 2026-08-08), and badge, the
-    needs-you count the service worker paints on the app icon while the app is closed. badge=None
-    OMITS the key and the worker leaves the icon's count alone — the shape a mirrored federated
-    event wears, because the origin kernel's count is not this kernel's count
-    (plans/federated-push.md). Runs on the pusher thread, so all network work moves to a daemon
-    thread (the _refresh_remote_prices discipline) and this never blocks or raises."""
+    to every subscribed device, plus the ROUTING metadata _push_payload documents: sid, so
+    tapping the notification lands on the session that fired (the user 2026-08-08); badge, the
+    needs-you count for the app icon (None omits it — the mirrored federated shape,
+    plans/federated-push.md); and kind/card_id/host, so the tap can also scroll the feed to the
+    card and name the origin of a relayed event. Runs on the pusher thread, so all network work
+    moves to a daemon thread (the _refresh_remote_prices discipline) and this never blocks or
+    raises."""
     subs = _push_subs()
     if not subs:
         return
@@ -29835,10 +29876,7 @@ def _push_notify(title, body, sid="", badge=None):
         print("romp: web push: %d subscription(s) on file but the python 'cryptography' package "
               "is missing — notification not delivered" % len(subs), file=sys.stderr)
         return
-    d = {"title": str(title), "body": str(body), "sid": str(sid or "")}
-    if badge is not None:
-        d["badge"] = int(badge or 0)
-    payload = json.dumps(d).encode()
+    payload = json.dumps(_push_payload(title, body, sid, badge, kind, card_id, host)).encode()
 
     def run():
         dead = []
@@ -29857,8 +29895,9 @@ def _push_notify(title, body, sid="", badge=None):
 def _push_forward(events):
     """The federated half of the push sink (plans/federated-push.md; the user 2026-08-08, who wants
     one device subscription to buzz for EVERY connected kernel): hand this kernel's fresh bell
-    events — [{title, body, sid}] — to every attached TRUSTED peer, and each peer delivers them to
-    the devices subscribed to IT. Rides the channel every kernel-to-kernel control call already
+    events — [{title, body, sid, kind, cardId}] — to every attached TRUSTED peer, and each peer
+    delivers them to the devices subscribed to IT (kind/cardId ride so a tap on the mirrored
+    notification lands on the card, not just the session; a peer of an older build ignores them). Rides the channel every kernel-to-kernel control call already
     rides (_peer_call: the pair's tunnel + the token exchanged at attach) — no new legs, no new
     trust surface. Only events THIS kernel detected are ever forwarded, and /push/relay mirrors to
     devices only, never onward, so a cycle of attachments cannot echo an event back. Fire-and-forget
@@ -29966,8 +30005,8 @@ def _turn_notify_tick(now, tmux):
             continue                                     # a bell event already buzzed for this turn end
         body = _first_line(_last_assistant_text(s.get("path") or "")) or "finished a turn"
         title = str(s.get("name") or _name_of(sid) or sid[:8])
-        _push_notify(title, body, sid)                   # badge omitted: the count rides its own push
-        fired.append({"title": title, "body": body, "sid": sid})
+        _push_notify(title, body, sid, kind="turn")                 # badge omitted: the count rides its own push
+        fired.append({"title": title, "body": body, "sid": sid, "kind": "turn"})   # the kind rides to peers too, so their tap lands the same way
     if fired:
         _push_forward(fired)                             # peers' phones hear it too, the bell-event way
     return fired
@@ -29988,8 +30027,14 @@ self.addEventListener('install',function(e){self.skipWaiting();});
 self.addEventListener('activate',function(e){e.waitUntil(clients.claim());});
 self.addEventListener('push',function(e){
 var d={};try{d=e.data?e.data.json():{};}catch(err){}
-var work=[self.registration.showNotification(d.title||'romp',
-{body:d.body||'',icon:'/media/romp-app-192.png',badge:'/media/romp-app-192.png',data:{sid:d.sid||''}})];
+// data = the ROUTING block the kernel built (_push_payload: sid, host, kind, cardId, url) — what the
+// tap below acts on; a payload from an older kernel carries only a flat sid, so that is the fallback.
+// tag: one notification per session — a second buzz for the same session REPLACES the first on the
+// lock screen instead of stacking (renotify keeps it audible); the kernel picks the tag.
+var opts={body:d.body||'',icon:'/media/romp-app-192.png',badge:'/media/romp-app-192.png',
+data:(d.data&&typeof d.data==='object')?d.data:{sid:d.sid||''}};
+if(d.tag){opts.tag=d.tag;opts.renotify=true;}
+var work=[self.registration.showNotification(d.title||'romp',opts)];
 // the app-icon count, kept current while the app is CLOSED (the open shell re-paints it live over
 // its own WS). setAppBadge exists in the SW only where badging works at all (iOS installed apps).
 // Numeric-only on purpose: a mirrored federated event omits badge (the ORIGIN kernel's count is
@@ -29999,15 +30044,25 @@ if('setAppBadge' in self.navigator&&typeof d.badge==='number')work.push(self.nav
 e.waitUntil(Promise.all(work));
 });
 // Land ON the thing that notified (the user 2026-08-08, whose first push opened a different
-// session): a live window gets focus + the sid over postMessage (the shell relays it into the
-// chat pane); no window -> open one with the sid in the URL, and the shell asks the kernel to
-// aim the focus at it once its chat pane connects (POST /reveal).
+// session; 2026-09-06, who wants the tap to come back to the romp they already have open): the
+// notification closes; then the window the user last had in front (matchAll orders most-recently-
+// focused first) is focused and handed the routing block over postMessage — the shell turns that
+// into the chat focus + the feed's card reveal. No window at all -> open one on the deep link the
+// kernel built (the shell parses it at boot). focus() can REJECT (an installed iOS app has refused
+// it) — then the tap still lands: fall through to openWindow rather than dropping it. Everything
+// rides waitUntil, so the worker is kept alive until the tap has landed; no timers anywhere.
 self.addEventListener('notificationclick',function(e){
 e.notification.close();
-var sid=(e.notification.data&&e.notification.data.sid)||'';
+var d=e.notification.data||{};var sid=d.sid||'';
+var url=d.url||(sid?'/?push-reveal='+encodeURIComponent(sid):'/');
+var msg={romp:'notificationClick',sid:sid,host:d.host||'',kind:d.kind||'',cardId:d.cardId||''};
+function open(){return clients.openWindow(url);}
 e.waitUntil(clients.matchAll({type:'window',includeUncontrolled:true}).then(function(ws){
-if(ws.length)return ws[0].focus().then(function(w){try{(w||ws[0]).postMessage({romp:'pushReveal',sid:sid});}catch(err){}});
-return clients.openWindow(sid?'/?push-reveal='+encodeURIComponent(sid):'/');}));
+if(!ws.length)return open();
+var w=ws[0];
+return Promise.resolve().then(function(){return w.focus();}).then(function(fw){
+try{(fw||w).postMessage(msg);}catch(err){}},open);
+}));
 });
 """
 
@@ -32588,26 +32643,52 @@ if(!isOn)testOut.textContent+=" Real notifications won't arrive until the main s
 .then(function(){testBtn.disabled=false;testBtn.textContent=label;});}
 });
 })();
-// Landing a push tap on the session that fired (the user 2026-08-08). Two arrivals:
-//  - live window: the SW focused us and posted {romp:'pushReveal',sid} — relay a focus straight
-//    into the chat iframe. Its own handler does the rest (tab select, come forward on mobile via
-//    revealSelfPane), same as a kernel-sent focus — the shim delivers those over postMessage too.
-//  - cold start: the SW opened '/?push-reveal=sid' — the chat pane's WS does not exist yet, so
-//    ask the kernel to park the focus for OUR wid (POST /reveal, consumed on the pane's ready).
-//    The param is then stripped so a later manual reload does not replay the jump.
-// Separate IIFE from the bell on purpose: the bell bails where the Push API is missing, but a
-// pushReveal can only ever arrive where it exists, and this block must not ride that bail.
+"""
+
+
+# Landing a notification tap on what fired (the user 2026-08-08, whose first push opened a different
+# session; 2026-09-06, who wants the tap to come back to the romp already open and put them on the
+# session — and the card — that buzzed). Two arrivals, ONE activation path: both ask the KERNEL to
+# aim the chat focus at THIS dashboard (POST /reveal {sid, wid}) — never a focus posted straight
+# into the chat iframe, which could only ever address a tab that is already there. The kernel
+# answers a live session with the focus (chat pane connected → delivered now; not yet → parked for
+# that wid and consumed on the pane's ready — the exact event, no delay heuristics) and a dead or
+# unknown one with the revive prompt (_reveal_msg), so no sid ever ends in a silent no-op.
+#  - live window: the SW focused us and posted {romp:'notificationClick', sid, host, kind, cardId}.
+#  - cold start: the SW opened the kernel's deep link '/?push-reveal=<sid>[&push-card=<id>]'. The
+#    params are stripped (history.replaceState) the moment they are read, so a manual reload later
+#    does not replay the jump.
+# A card kind ALSO scrolls the feed to its card: {romp:'revealCard'} into the feed iframe — the same
+# message the Log's bell entries post — but only once the feed has its cards, which it announces
+# with {romp:'ready', app:'feed'} after its first payload renders (before that the iframe may have
+# no listener yet, or nothing to scroll to); a tap that arrives earlier waits for exactly that
+# message. A sid-less tap (a test notification) has nowhere to land: the SW's focus/openWindow was
+# the whole action. A /reveal the kernel refuses lands in the Log rather than vanishing.
+# Its own <script>, like every shell behaviour (test_kernel_mobile's count pin): a throw in the
+# bell's script must not strand a tap, and a bell that bails where the Push API is missing must
+# not take the deep-link half with it.
+_LANDING_REVEAL_JS = """
 (function(){
-function reveal(sid){if(!sid)return;var f=document.getElementById('f-chat');
-try{f&&f.contentWindow&&f.contentWindow.postMessage({type:'focus',id:sid,live:true},'*');}catch(e){}}
-if('serviceWorker' in navigator&&navigator.serviceWorker.addEventListener){
-navigator.serviceWorker.addEventListener('message',function(ev){
-var m=ev.data;if(m&&m.romp==='pushReveal'&&m.sid)reveal(m.sid);});}
-var u=new URL(location.href),pr=u.searchParams.get('push-reveal');
-if(pr){var wid='';try{wid=sessionStorage.getItem('romp:wid')||'';}catch(e){}
-fetch('/reveal',{method:'POST',body:JSON.stringify({sid:pr,wid:wid})})['catch'](function(e){});
-u.searchParams['delete']('push-reveal');
-try{history.replaceState(null,'',u.pathname+(u.searchParams.toString()?'?'+u.searchParams.toString():''));}catch(e){}}
+function wid(){try{return sessionStorage.getItem('romp:wid')||'';}catch(e){return '';}}
+function fail(e){try{window.__rompNotify&&window.__rompNotify('error','Could not open the session this notification was about: '+((e&&e.message)||e));}catch(err){}}
+var feedReady=false,pendingCard=null;
+function revealCard(itemId,sid){if(!feedReady){pendingCard={itemId:itemId,sid:sid};return;}
+var f=document.getElementById('f-feed');
+try{f&&f.contentWindow&&f.contentWindow.postMessage({romp:'revealCard',itemId:itemId,sid:sid},'*');}catch(e){}}
+window.addEventListener('message',function(e){var m=e&&e.data;
+if(!(m&&m.romp==='ready'&&m.app==='feed'))return;
+feedReady=true;if(pendingCard){var c=pendingCard;pendingCard=null;revealCard(c.itemId,c.sid);}});
+function land(sid,kind,cardId){
+if(sid)fetch('/reveal',{method:'POST',body:JSON.stringify({sid:sid,wid:wid()})}).then(function(r){
+if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});})['catch'](fail);
+if(sid&&kind==='card'&&cardId)revealCard(cardId,sid);}
+if('serviceWorker' in navigator&&navigator.serviceWorker&&navigator.serviceWorker.addEventListener){
+navigator.serviceWorker.addEventListener('message',function(ev){var m=ev&&ev.data;
+if(m&&m.romp==='notificationClick')land(String(m.sid||''),String(m.kind||''),String(m.cardId||''));});}
+var u=new URL(location.href),pr=u.searchParams.get('push-reveal'),pc=u.searchParams.get('push-card');
+if(pr||pc){land(pr||'',pc?'card':'',pc||'');
+u.searchParams['delete']('push-reveal');u.searchParams['delete']('push-card');
+try{history.replaceState(null,'',u.pathname+(u.searchParams.toString()?'?'+u.searchParams.toString():'')+u.hash);}catch(e){}}
 })();
 """
 
@@ -33925,6 +34006,7 @@ def _landing():
             "<script>" + _LANDING_REMOTES_JS + "</script>"
             "<script>" + _LANDING_MOBILE_JS + "</script>"
             "<script>" + _LANDING_PUSH_JS + "</script>"
+            "<script>" + _LANDING_REVEAL_JS + "</script>"
             "<script>" + _LANDING_COLLAPSE_JS + "</script>"
             # the command palette (Cmd/Ctrl+P) and the session quick-switcher hotkey (Cmd/Ctrl+O):
             # a dist bundle (ui/webview/palette-main.ts) like age-color-global above. Loaded last —
@@ -34884,7 +34966,12 @@ class Handler(BaseHTTPRequestHandler):
                         sid = "%s:%s" % (origin, sid)
                     if t.startswith("romp: "):
                         t = "romp: %s:%s" % (origin, t[len("romp: "):])
-                    _push_notify(t, b, sid)       # badge omitted: the origin's count is not ours
+                    # badge omitted: the origin's count is not ours. kind/cardId pass through
+                    # (an older peer sends neither → the card default, which is all it had);
+                    # the card id is a goal id, globally unique and never host-prefixed
+                    # (federation.ts), so the merged feed finds it as-is.
+                    _push_notify(t, b, sid, kind=str(ev.get("kind") or "card"),
+                                 card_id=str(ev.get("cardId") or ""), host=origin)
                     n += 1
                 return self._send(200, json.dumps({"ok": True, "mirrored": n}), "application/json")
             if u.path == "/reveal":
