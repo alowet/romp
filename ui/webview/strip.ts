@@ -136,6 +136,13 @@ export function apiCell(usage: any): ApiCell | null {
     if (!seg || typeof seg.usd !== "number") continue;
     const turns = seg.turns || 0;
     lines.push(`${label} — ${fmtUsd(seg.usd)} · ${fmtTok(seg.tok || 0)} tok · ${turns} turn${turns === 1 ? "" : "s"}`);
+    // the by-KIND split under each window (the user 2026-09-06, who read the day's token count and
+    // could not see how it was possible): cache reads — every API call of a turn re-reads the whole
+    // context — are most of it, at a tenth of the input price. A window without the split (an older
+    // kernel) simply has no second line — the rail hover's fleetSpendHTML makes the same call.
+    if (typeof seg.tokCacheR === "number")
+      lines.push(`    ${fmtTok(seg.tokCacheR)} cache read · ${fmtTok(seg.tokCacheW || 0)} cache write · `
+                 + `${fmtTok(seg.tokIn || 0)} in · ${fmtTok(seg.tokOut || 0)} out`);
   }
   return { segs, title: lines.join("\n") };
 }

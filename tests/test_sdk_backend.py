@@ -2934,7 +2934,11 @@ class SpendRecord(unittest.TestCase):
         src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
                                 "kernel", "sdk_backend.py")).read()
         self.assertIn("self.backend._record_spend(delta, turn_u, keyed=self.api_key_auth,", src,
-                      "the settle folds THIS turn's DELTAS — cost AND tokens are cumulative per process")
+                      "the settle folds THIS turn's cost DELTA and _turn_usage's token counts")
+        self.assertIn("turn_u = self._turn_usage(msg)", src,
+                      "tokens come from _turn_usage — the flat usage dict is per-turn and is never diffed")
+        self.assertIn('mu = getattr(msg, "model_usage", None)', src,
+                      "the cumulative modelUsage map is the counter the token watermarks diff")
         self.assertIn("sid=self.thread_of or self.sid)   # the rail's spend", src,
                       "a comment THREAD bills its OWNING session (T144); a plain session bills itself "
                       "(T100's per-session attribution, completed)")
@@ -2949,14 +2953,7 @@ class SpendRecord(unittest.TestCase):
         self.assertIn('"spend": _spend_windows()', ksrc)
         self.assertIn("def _spend_windows(keyed_only=False):", ksrc)   # keyed_only: the mixed-host API sum (test_session_auth)
 
-    def test_cumulative_process_totals_fold_as_per_turn_deltas(self):
-        """The CLI's total_cost_usd AND its usage dict are CUMULATIVE per process (the result event
-        carries totalCostUSD beside `usage: this.totalUsage`): folding the raw values re-added the
-        whole session-so-far on every turn, compounding the readouts into fiction — the dollars first
-        (the user 2026-08-08, who did not believe the bottom line), then the tokens (same day, round
-        two: the hover's 5h/7d/month dollars-per-token ratios diverged wildly because each window
-        carried a different inflation factor). Fold deltas for both; reset the watermarks with each
-        new CLI process; treat a shrunken counter as a reset we missed."""
+    def _spend_session(self):
         import asyncio
         sid = "11111111-2222-3333-4444-bbbbbbbbbbbb"
         s = sb.SdkSession(self.be, {"sid": sid, "name": "n", "cwd": "/tmp"})
@@ -2965,30 +2962,97 @@ class SpendRecord(unittest.TestCase):
         async def _noop(): pass
         s._do_refresh_context = _noop
         s._do_refresh_usage = _noop
-        def _result(total, tok_in):
-            r = _ResultMessage()
-            r.total_cost_usd = total
-            r.usage = {"input_tokens": tok_in}
-            return r
-        async def run(total, tok_in):
-            s._on_message(_result(total, tok_in), _AssistantMessage, _ResultMessage, type("S", (), {}))
-            await asyncio.sleep(0)
+        def run(r):
+            async def go():
+                s._on_message(r, _AssistantMessage, _ResultMessage, type("S", (), {}))
+                await asyncio.sleep(0)
+            asyncio.run(go())
         def day():
             return json.loads(self.p.read_text())["days"][self._today()]
-        asyncio.run(run(1.0, 100))   # first turn of the process: delta = the whole counter
-        asyncio.run(run(2.5, 140))   # second turn: deltas = 1.5 / 40 tokens, NOT another 2.5 / 140
+        return s, run, day
+
+    @staticmethod
+    def _model_map(total_in, model="claude-x", out=0):
+        return {model: {"inputTokens": total_in, "outputTokens": out, "cacheReadInputTokens": 0,
+                        "cacheCreationInputTokens": 0, "webSearchRequests": 0, "costUSD": 0.0}}
+
+    def test_cost_and_model_usage_are_running_totals_folded_as_deltas(self):
+        """The CLI's total_cost_usd and its modelUsage map are CUMULATIVE per process — the CLI documents
+        the map as cumulative like the cost: read the latest result, never sum results — so folding the
+        raw values re-added the whole session-so-far on every turn (the dollars first: the user
+        2026-08-08, who did not believe the bottom line; then the tokens). Fold deltas for both; reset
+        the watermarks with each new CLI process; treat a shrunken counter as a reset we missed. The
+        flat `usage` dict rides every result as the TURN's own total and, with the map present, is
+        neither summed nor diffed — the map governs."""
+        s, run, day = self._spend_session()
+        def _result(total, map_in, turn_in):
+            r = _ResultMessage()
+            r.total_cost_usd = total
+            r.model_usage = self._model_map(map_in)
+            r.usage = {"input_tokens": turn_in}      # the turn's own figure — consistent with the map's delta
+            return r
+        run(_result(1.0, 100, 100))    # first turn of the process: delta = the whole counter
+        run(_result(2.5, 140, 40))     # second turn: deltas = 1.5 / 40 tokens, NOT another 2.5 / 140
         d = day()
         self.assertAlmostEqual(d["usd"], 2.5, msg="two turns fold to the process total, never more")
-        self.assertEqual(d["tokIn"], 140, "tokens fold as deltas of the totalUsage counter too")
+        self.assertEqual(d["tokIn"], 140, "tokens fold as deltas of the modelUsage running total")
         self.assertEqual(d["turns"], 2)
-        s._last_cost_total = 0.0     # the connect reset: a fresh CLI process starts at zero…
-        s._last_usage_totals = {}    # …on both counters
-        asyncio.run(run(0.8, 30))
+        s._last_cost_total = 0.0       # the connect reset: a fresh CLI process starts at zero…
+        s._last_usage_totals = {}      # …on both counters
+        run(_result(0.8, 30, 30))
         self.assertAlmostEqual(day()["usd"], 3.3)
         self.assertEqual(day()["tokIn"], 170)
-        asyncio.run(run(0.5, 20))    # a counter BELOW the watermark = a reset we missed → fold it whole
+        run(_result(0.5, 20, 20))      # a counter BELOW the watermark = a reset we missed → fold it whole
         self.assertAlmostEqual(day()["usd"], 3.8)
         self.assertEqual(day()["tokIn"], 190)
+
+    def test_the_model_usage_map_sums_across_models_and_all_four_kinds(self):
+        # a mid-process model switch keeps BOTH models' running totals in the map — the process total
+        # is their sum, and every kind (in / out / cache read / cache write) folds
+        s, run, day = self._spend_session()
+        r = _ResultMessage(); r.total_cost_usd = 1.0
+        r.model_usage = {"claude-a": {"inputTokens": 10, "outputTokens": 20, "cacheReadInputTokens": 1000, "cacheCreationInputTokens": 60}}
+        run(r)
+        r2 = _ResultMessage(); r2.total_cost_usd = 2.0
+        r2.model_usage = {"claude-a": {"inputTokens": 10, "outputTokens": 20, "cacheReadInputTokens": 1000, "cacheCreationInputTokens": 60},
+                          "claude-b": {"inputTokens": 5, "outputTokens": 7, "cacheReadInputTokens": 300, "cacheCreationInputTokens": 9}}
+        run(r2)
+        d = day()
+        self.assertEqual((d["tokIn"], d["tokOut"], d["tokCacheR"], d["tokCacheW"]), (15, 27, 1300, 69))
+        self.assertEqual(d["turns"], 2)
+
+    def test_the_flat_usage_dict_is_the_turns_own_total_and_folds_whole(self):
+        """REGRESSION (the user 2026-09-06, who read the day's token count, asked how it was possible,
+        and was right in the other direction: the ledger held roughly HALF the true count). The flat
+        `usage` on a result is the TURN's own total — measured on CLI 2.1.263 against the transcript:
+        turn one's three API calls summed, turn two's single call alone — yet the settle diffed it
+        against the previous turn's like a running total, so a 100-token turn followed by a 140-token
+        turn recorded 140, not 240, and every turn but the first lost the previous turn's worth (a
+        SMALLER turn folded whole, by the shrunken-counter rule, which is why the loss looked random).
+        Without a modelUsage map (an older CLI) the flat dict folds WHOLE; it is never diffed."""
+        s, run, day = self._spend_session()
+        def _result(total, turn_in):
+            r = _ResultMessage()
+            r.total_cost_usd = total
+            r.usage = {"input_tokens": turn_in}
+            return r
+        run(_result(1.0, 100))
+        run(_result(2.5, 140))
+        self.assertEqual(day()["tokIn"], 240, "two turns of 100 and 140 tokens are 240 tokens — the bug recorded 140")
+        run(_result(3.0, 60))
+        self.assertEqual(day()["tokIn"], 300, "a turn smaller than the last folds whole too — there is no watermark on a per-turn figure")
+        self.assertAlmostEqual(day()["usd"], 3.0, msg="the dollars stay a delta of their running total")
+        self.assertEqual(s._last_usage_totals, {}, "the per-turn dict leaves the modelUsage watermarks untouched")
+
+    def test_the_keyed_sub_count_carries_the_by_kind_split(self):
+        # the hover splits each window's tokens by kind; a mixed host's API readout sums ONLY the keyed
+        # sub-counts, so the split must ride them too (2026-09-06) — and a login turn carries it forward
+        self.be._record_spend(0.02, {"input_tokens": 100, "output_tokens": 40,
+                                     "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 60}, keyed=True)
+        self.be._record_spend(0.03, {"input_tokens": 10, "output_tokens": 5}, keyed=False)
+        k = json.loads(self.p.read_text())["days"][self._today()]["key"]
+        self.assertEqual((k["tok"], k["tokIn"], k["tokOut"], k["tokCacheR"], k["tokCacheW"]), (1200, 100, 40, 1000, 60))
+        self.assertEqual(k["turns"], 1, "the login turn is carried forward, not counted")
 
 
 class RewindFiles(unittest.TestCase):

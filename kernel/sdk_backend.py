@@ -2429,11 +2429,15 @@ class SdkSession:
         #   so spend folds the DELTA between results — folding the raw value re-added the whole
         #   session-so-far cost every turn (the user 2026-08-08, whose spend line was fiction). Reset
         #   at each connect: a fresh CLI process starts its counter at zero.
-        self._last_usage_totals = {}  # same for the TOKEN counts: the result event's usage is the
-        #   process-lifetime `this.totalUsage` counter (verified in the bundle beside total_cost_usd),
-        #   so each field folds as a delta too — raw folding compounded the token readout exactly like
-        #   the dollars (the user 2026-08-08, round two: the hover's 5h/7d/month $-per-token ratios
-        #   diverged wildly because each window carried a different inflation factor).
+        self._last_usage_totals = {}  # the TOKEN watermarks — kept against the result's `model_usage`
+        #   map (the CLI's modelUsage), the per-model counter the CLI documents as cumulative like
+        #   total_cost_usd, same lifecycle, so each field folds as a delta exactly like the dollars.
+        #   Raw folding compounded the token readout (the user 2026-08-08, round two: the hover's
+        #   5h/7d/month $-per-token ratios diverged wildly because each window carried a different
+        #   inflation factor). NOT kept against the flat `usage` dict any more: that was the process
+        #   total when the deltas were written (`usage: this.totalUsage`) and is the TURN's own total
+        #   on the current CLI — diffing it under-counted every turn but the first (the user
+        #   2026-09-06). Which counter is which, and the measurement: _turn_usage.
         # Pending conversation REWIND (the chat's edit-message branch): the target record uuid +
         # the transcript leaf recorded at request time (the one-shot guard — see rewind_disposition).
         # Seeded from the reg so a kernel death mid-rewind re-applies it iff nothing landed since.
@@ -3564,6 +3568,52 @@ class SdkSession:
         self._cli_working = (state == "working")
         append_state(self.backend.state_dir, self.sid, state)
 
+    # (snake_case API name, camelCase modelUsage name) — the four token kinds the ledger keeps
+    _USAGE_KEYS = (("input_tokens", "inputTokens"), ("output_tokens", "outputTokens"),
+                   ("cache_read_input_tokens", "cacheReadInputTokens"),
+                   ("cache_creation_input_tokens", "cacheCreationInputTokens"))
+
+    def _turn_usage(self, msg):
+        """THIS turn's token counts for _record_spend, one dict in the API's snake_case names.
+
+        Two token counters ride a ResultMessage and they are NOT the same kind of number (measured
+        2026-09-06 on CLI 2.1.263: a three-turn session read against its own transcript's per-call
+        `usage` blocks):
+        - `model_usage` (the CLI's modelUsage map) is a RUNNING TOTAL per model, process-wide, the
+          same lifecycle as total_cost_usd — the CLI documents it as cumulative, "read the latest
+          result rather than summing across results"; a /clear zeroes it. Sum it across models and
+          fold the per-field DELTA against the last result, exactly as the dollars fold; a field
+          below its watermark is a reset we did not watch (a /clear, a new process) and folds whole.
+        - `usage` (the flat dict) is the TURN's own total — the main loop's per-query accumulator,
+          equal to the sum of that turn's API calls (the bundle emits it from a query-local beside
+          `total_cost_usd` from a process-wide getter). It was the process total when the delta
+          logic was written (2026-08-08, `usage: this.totalUsage`); the CLI has since moved it
+          per-turn, and diffing a per-turn figure against the previous turn's recorded a fraction
+          of every turn — roughly half a day's tokens went missing, and five sessions' recorded
+          totals matched that subtraction to the token (the user 2026-09-06, who did not believe
+          the count and was right, in the other direction). So the flat dict is never diffed: when
+          the map is absent (an older CLI) it folds WHOLE.
+        Cache reads dominate either way — every API call of a turn re-reads the whole context — and
+        the hover breaks the count down by kind so the size of the number has its explanation."""
+        mu = getattr(msg, "model_usage", None)
+        if isinstance(mu, dict) and mu:
+            tot = {k: 0 for k, _ in self._USAGE_KEYS}
+            for m in mu.values():
+                if not isinstance(m, dict):
+                    continue
+                for k, mk in self._USAGE_KEYS:
+                    v = m.get(mk)
+                    tot[k] += int(v) if isinstance(v, (int, float)) else 0
+            out = {}
+            for k, v in tot.items():
+                last = self._last_usage_totals.get(k, 0)
+                out[k] = v - last if v >= last else v
+                self._last_usage_totals[k] = v
+            return out
+        u = getattr(msg, "usage", None)
+        u = u if isinstance(u, dict) else {}
+        return {k: (int(u[k]) if isinstance(u.get(k), (int, float)) else 0) for k, _ in self._USAGE_KEYS}
+
     def _on_message(self, msg, AssistantMessage, ResultMessage, SystemMessage):
         if getattr(self, "_ping_feeding", False):   # getattr: __new__-built test doubles skip __init__
             # the ping's turn is streaming — the CLI demonstrably started it, so a message fed from
@@ -3783,17 +3833,9 @@ class SdkSession:
             if isinstance(total, (int, float)) and total > 0:
                 delta = total - self._last_cost_total if total >= self._last_cost_total else total
                 self._last_cost_total = float(total)
-                # the usage dict is the SAME kind of counter (`usage: this.totalUsage` in the bundle):
-                # per-field deltas, a shrunken field folding whole — see _last_usage_totals in __init__
-                u = getattr(msg, "usage", None)
-                u = u if isinstance(u, dict) else {}
-                turn_u = {}
-                for k in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
-                    v = u.get(k)
-                    v = int(v) if isinstance(v, (int, float)) else 0
-                    last = self._last_usage_totals.get(k, 0)
-                    turn_u[k] = v - last if v >= last else v
-                    self._last_usage_totals[k] = v
+                # the tokens: THIS turn's counts, from whichever result counter is a running total —
+                # the two are not the same kind (see _turn_usage; the flat `usage` is per-turn now)
+                turn_u = self._turn_usage(msg)
                 self.backend._record_spend(delta, turn_u, keyed=self.api_key_auth,
                                            sid=self.thread_of or self.sid)   # the rail's spend —
                 #   a comment THREAD bills its owning session (T144: whole-session truth for the
@@ -5832,7 +5874,8 @@ class SdkBackend:
         rail's API readout must sum ONLY the key's turns — a login turn's computed cost there would be
         dollars nobody is billed (the user 2026-08-08). Token fields mirror the ResultMessage usage
         dict: input/output plus the two cache flavors, kept separately so the tooltip can break them
-        down. Pruned to the last 90 days; atomic.
+        down (on the bucket, and since 2026-09-06 on its `key` sub-count too). Pruned to the last
+        90 days; atomic.
         PER-SESSION ATTRIBUTION (T100, the nightly optimizer's accepted ask 2026-08-24: key-billed
         cost per session — 63%% of a day was untraceable): each bucket carries a `bySid` sub-map,
         {sid: {usd, turns, tok, key:{usd,turns,tok}}} — SID-keyed (rename-proof; names flap), the
@@ -5871,7 +5914,14 @@ class SdkBackend:
                 if keyed or ke:   # carry an existing key split forward even on a login turn
                     n["key"] = {"usd": round(float(ke.get("usd") or 0) + (float(cost) if keyed else 0), 6),
                                 "turns": int(ke.get("turns") or 0) + (1 if keyed else 0),
-                                "tok": int(ke.get("tok") or 0) + (tok_total if keyed else 0)}
+                                "tok": int(ke.get("tok") or 0) + (tok_total if keyed else 0),
+                                # the by-KIND split rides the keyed sub-count too (2026-09-06): the
+                                # hover breaks each window's tokens down, and a mixed host's API
+                                # readout sums ONLY these — the bucket totals would be the login's
+                                "tokIn": int(ke.get("tokIn") or 0) + (_tok("input_tokens") if keyed else 0),
+                                "tokOut": int(ke.get("tokOut") or 0) + (_tok("output_tokens") if keyed else 0),
+                                "tokCacheR": int(ke.get("tokCacheR") or 0) + (_tok("cache_read_input_tokens") if keyed else 0),
+                                "tokCacheW": int(ke.get("tokCacheW") or 0) + (_tok("cache_creation_input_tokens") if keyed else 0)}
                 by = e.get("bySid") if isinstance(e.get("bySid"), dict) else {}
                 if sid:
                     se = by.get(sid) if isinstance(by.get(sid), dict) else {}
