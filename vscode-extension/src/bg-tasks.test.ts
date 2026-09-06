@@ -17,9 +17,14 @@ test("the box payload is {count, tasks} and rides on the session across pushes",
   assert.match(SRC, /bgTasks: \("bgTasks" in msg\) \? msg\.bgTasks : \(prev \? prev\.bgTasks : undefined\)/);
 });
 
-test("the header collapses to a count: one → 'Background task · name', many → 'N background tasks'", () => {
-  assert.match(SRC, /count === 1 \? "Background task · " \+ \(tasks\[0\]\.summary \|\| "running"\)/);
-  assert.match(SRC, /: count \+ " background tasks"/);
+test("the header is ONE line worded from the rows — 'Awaiting …' idle, 'In the background · …' working; the legacy count header is gone", () => {
+  // pin changed 2026-09-06: the "N background tasks" / "Background task · name" header was the legacy branch
+  // the box fell to whenever the kernel shipped no awaited rows — mid-turn, every time — so the box swapped
+  // presentations at each turn boundary; one renderer now words the header from the same rows in both states
+  assert.doesNotMatch(SRC, /count \+ " background tasks"/);
+  assert.doesNotMatch(SRC, /"Background task · "/);
+  assert.match(SRC, /lab\.textContent = "In the background · " \+ awaitBreakdown\(counted\);/);
+  assert.match(SRC, /lab\.textContent = "Awaiting " \+ word \+ " · " \+ awaitBreakdown\(items\);/);
   // collapsed by default: when the fold isn't open, only the header renders
   assert.match(SRC, /const open = bgFoldOpen\.has\(sid\);/);
   assert.match(SRC, /if \(!open\) return;/);

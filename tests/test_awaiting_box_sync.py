@@ -55,7 +55,7 @@ class SourcePins(unittest.TestCase):
         # since slice 2 (plans/subagent-transcripts.md, 2026-09-05) the ONE rule is awaitWord: the kernel's
         # kind + count + the awaited ROWS word the chip and the gist alike ("agent", "3 agents", "4" for mixed)
         self.assertIn("const chipWord = awaitWord(s.status.awaitingKind, s.status.awaitingCount, chipItems);", RENDER)
-        self.assertIn("const word = awaitWord(s!.status.awaitingKind, s!.status.awaitingCount, items);", RENDER)
+        self.assertIn("const word = awaitWord(s.status.awaitingKind, s.status.awaitingCount, items);", RENDER)   # `s` narrowed by the one renderer's gate (2026-09-06)
 
 
 def _free_port():

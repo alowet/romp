@@ -175,6 +175,122 @@ class AwaitingRows(unittest.TestCase):
         self.assertEqual(aw["count"], 2)
 
 
+class RowsDoNotDependOnIdleness(unittest.TestCase):
+    """The rows are the SAME set whether or not the turn is open (2026-09-06).
+
+    Seen live: a session with two background agents and a background command showed the grouped rows
+    ("Awaiting 3 · 2 agents · 1 command") while idle; the moment the user sent a message the view vanished,
+    and it came back when the turn ended. _session_awaiting answers None mid-turn BY DESIGN (a working
+    session is Working — the chip's Awaiting is idle-only), and the rows shipped only through it, so the
+    client fell to the legacy tasks list mid-turn: two presentations of one set of facts, swapped at every
+    turn boundary. Now the assembly is _awaiting_live_rows, turn-agnostic; _session_background_items joins
+    it, and _awaiting_items_payload is the one expression both session-scoped surfaces ship. The idle-only
+    fields (why / kind / count) are untouched — nothing about WHEN the chip flips changed.
+    Synthetic inputs, stubbed like the class above."""
+    A1, A2 = "a1111111111111111", "a2222222222222222"
+
+    def setUp(self):
+        self._saved = {n: getattr(km, n) for n in
+                       ("_tmux_sessions", "_bg_live_norm", "_bg_pending", "_states_awaiting_overlay",
+                        "_owned_yield_why", "_session_stamp_full", "_session_delegated_why",
+                        "_session_delegated_identities", "_watches", "_pr_watches", "_peer_identity")}
+        km._tmux_sessions = lambda: {SID: {"subagents": [{"type": "general-purpose", "since": 100, "agentId": self.A1},
+                                                         {"type": "general-purpose", "since": 105, "agentId": self.A2}]}}
+        km._bg_live_norm = lambda sid, path: [
+            {"tid": "toolu_01", "desc": "Check the exporter for banned words", "t": 98, "type": "local_agent", "agentId": self.A1},
+            {"tid": "toolu_02", "desc": "Rerun the notes-api harness", "t": 104, "type": "local_agent", "agentId": self.A2},
+            {"tid": "toolu_03", "desc": "build the docs site", "t": 110, "type": "local_bash"}]
+        km._bg_pending = lambda sid, path, tasks: tasks
+        km._states_awaiting_overlay = lambda sid: None
+        km._owned_yield_why = lambda sid, path: None
+        km._session_stamp_full = lambda sid: (None, 0, None, None, ())
+        km._session_delegated_why = lambda sid: None
+        km._session_delegated_identities = lambda sid: []
+        km._watches, km._pr_watches = [], []
+
+    def tearDown(self):
+        for n, f in self._saved.items():
+            setattr(km, n, f)
+
+    def test_the_same_rows_idle_and_mid_turn_and_the_wait_only_when_idle(self):
+        idle = km._session_awaiting(SID, "/tmp/x", True)
+        self.assertEqual([(it["kind"], it["label"], it["id"]) for it in idle["items"]],
+                         [("agents", "Check the exporter for banned words", "toolu_01"),
+                          ("agents", "Rerun the notes-api harness", "toolu_02"),
+                          ("commands", "build the docs site", "toolu_03")])
+        self.assertEqual((idle["kind"], idle["count"]), ("mixed", 3))
+        self.assertEqual(idle["why"], "waiting on 2 background agents and 1 background command")
+        # the turn opens: no wait (the chip reads Working), the same rows
+        self.assertIsNone(km._session_awaiting(SID, "/tmp/x", False), "a working session is Working — unchanged")
+        self.assertEqual(km._session_background_items(SID, "/tmp/x"), idle["items"],
+                         "byte-identical rows in both turn states — the agentId join and the labels included")
+        self.assertEqual(km._awaiting_items_payload(None, SID, "/tmp/x"), idle["items"], "what the surfaces ship mid-turn")
+        self.assertEqual(km._awaiting_items_payload(idle, SID, "/tmp/x"), idle["items"], "…and idle: the wait's own rows")
+
+    def test_armed_watches_ride_the_rows_mid_turn_too(self):
+        # the 2026-08-30 rule (anything awaited shows even while working) now holds through the rows alone
+        # — the chat status no longer re-runs _watch_awaiting into awaitingWhy while the turn is open, which
+        # made the box read "Awaiting" under a Working chip
+        km._watches = [{"id": "w1", "sid": SID, "cmd": "test -f /tmp/notes-api.done", "note": "the CI run", "at": 90}]
+        rows = km._session_background_items(SID, "/tmp/x")
+        self.assertEqual([it["kind"] for it in rows], ["agents", "agents", "commands", "watches"])
+        self.assertEqual(rows[-1]["label"], "the CI run")
+        self.assertEqual(rows[-1]["watchId"], "w1", "Cancel's handle rides mid-turn as it does idle")
+        self.assertEqual(rows, km._session_awaiting(SID, "/tmp/x", True)["items"])
+
+    def test_a_stamp_wait_ships_its_own_rows_and_nothing_running_ships_none(self):
+        km._tmux_sessions = lambda: {SID: {}}
+        km._bg_live_norm = lambda sid, path: []
+        self.assertEqual(km._session_background_items(SID, "/tmp/x"), [])
+        self.assertEqual(km._awaiting_items_payload(None, SID, "/tmp/x"), [], "nothing in flight → no rows, no box")
+        km._peer_identity = lambda p: {"name": str(p), "host": "", "sid": str(p), "color": None}
+        km._session_stamp_full = lambda sid: ("g1", 8765, "delegated to two peers", "peer", ("api", "web"))
+        aw = km._session_awaiting(SID, "/tmp/x", True, stamp=True)
+        self.assertEqual([it["kind"] for it in km._awaiting_items_payload(aw, SID, "/tmp/x")], ["peer", "peer"],
+                         "an idle-gated arm's rows (a peer stamp) ship as the wait's rows — they exist only idle")
+        self.assertEqual(km._awaiting_items_payload({"why": "waiting on a build", "kind": "job", "items": []}, SID, "/tmp/x"), [],
+                         "a wait no source can enumerate ships none — never the live rows behind its back")
+
+    def test_a_build_handed_a_snapshot_takes_no_fresh_liveness_read_for_the_mid_turn_rows(self):
+        # caught by tests/test_kernel_pusher_snapshot.py on the first cut: the mid-turn read forked tmux /
+        # swept the registry twice per build_session (its own row lookup + _bg_live_norm's) on the WORKING
+        # path, which had never taken a liveness read. The caller's map is lent to _live_scope for the read
+        # (_serve_live) — the pusher cycle's own one-snapshot mechanism — and released after; a scope
+        # already active (the cycle's) is left untouched.
+        km._bg_live_norm = self._saved["_bg_live_norm"]   # the real normalizer, so its row lookup is exercised
+        reads = []
+        snap = {SID: {"subagents": [{"type": "explore", "since": 100, "agentId": self.A1}],
+                      "bgTasks": [{"toolUseId": "toolu_03", "taskId": "b3333", "type": "local_bash", "since": 110,
+                                   "desc": "build the docs site", "lastTool": ""}]}}
+        km._tmux_sessions = self._saved["_tmux_sessions"]   # the real delegator: scope snapshot, else Sessions.live
+        saved_live, saved_scope = km.Sessions.live, getattr(km._live_scope, "snapshot", None)
+        km.Sessions.live = lambda: (reads.append(1), {})[1]
+        km._live_scope.snapshot = None
+        try:
+            rows = km._awaiting_items_payload(None, SID, None, snap)
+            self.assertEqual([(it["kind"], it["label"]) for it in rows], [("agents", "explore"), ("commands", "build the docs site")],
+                             "the rows come from the map the caller handed over")
+            self.assertEqual(reads, [], "a provided snapshot is enough — no fresh liveness read")
+            self.assertIsNone(km._live_scope.snapshot, "the lent scope is released with the read")
+            # inside a cycle (a scope already active) the cycle's snapshot wins and stays
+            km._live_scope.snapshot = snap
+            km._awaiting_items_payload(None, SID, None, {SID: {}})
+            self.assertIs(km._live_scope.snapshot, snap, "an active scope is left alone")
+            km._live_scope.snapshot = None
+            # no map at all → the read is fresh, as every un-scoped read is
+            km._awaiting_items_payload(None, SID, None)
+            self.assertEqual(len(reads), 2, "no snapshot handed over → fresh reads (the row lookup and the normalizer's)")
+        finally:
+            km.Sessions.live = saved_live
+            km._live_scope.snapshot = saved_scope
+
+    def test_the_join_is_one_concatenation_shared_by_both_reads(self):
+        src = inspect.getsource(km)
+        self.assertIn("    items = _awaiting_join_items(agents, commands, watch)\n    if not items:\n        return None", src)
+        self.assertIn("    return _awaiting_join_items(agents, commands, watch)", src)
+        self.assertIn("    agents, commands, watch = _awaiting_live_rows(sid, path, live)\n    combined = _awaiting_from_items(agents, commands, watch)", src)
+
+
 class MixedKind(unittest.TestCase):
     """"mixed" is a LIVE-read kind only: the enum every surface validates against accepts it, while the
     judge's parse sites keep filing a specific kind — an LLM emitting "mixed" degrades to kindless."""

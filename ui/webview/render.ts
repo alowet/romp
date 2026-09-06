@@ -232,7 +232,7 @@ interface TodoTask { id: string; subject: string; activeForm?: string; status: s
 
 type ChipState = "working" | "ready" | "needsInput" | "awaiting" | "awaitingBg" | "idle" | "closed" | "compacting" | "clearing" | "blocked" | "retrying" | "interrupting" | "opening";   // needsInput = a live permission/picker prompt (on YOU) — renamed from the legacy "awaiting" (2026-08-15), which stays accepted for OLDER REMOTE KERNELS across federation; awaitingBg = idle main thread waiting on background work it dispatched (the user 2026-07-13)
 type PeerIdent = { name: string; host?: string; sid?: string; color?: { bg: string; fg: string } | null };   // a named peer behind a peer-kind wait (kernel _peer_identity, 2026-08-26)
-interface Status { state: ChipState; sinceEpoch: number | null; awaitingWhy?: string | null; awaitingKind?: string | null; awaitingPeers?: PeerIdent[] | null; awaitingTasks?: string[]; awaitingTaskIds?: string[]; awaitingCount?: number | null; awaitingItems?: AwaitRow[]; effort?: string; model?: string; modelPending?: boolean; effortPending?: boolean; mode?: string; fast?: string; auth?: string; authLive?: string; authPending?: boolean; authBoth?: boolean; authAcct?: string; ctx?: string; ctxOver?: boolean; ctxColor?: number[]; modelColor?: number[]; effortColor?: number[]; modelTone?: number[]; effortTone?: number[]; ctxTone?: number[]; faded?: boolean; backend?: string; apiTooLong?: boolean; apiSpendLimit?: boolean; apiModelLimit?: boolean; apiAuthErr?: boolean; apiRefusal?: boolean; retrySuppressed?: boolean; retryNextAt?: number | null; retryTries?: number | null; }   // awaitingWhy/awaitingTasks = what an awaitingBg session is waiting on (kernel _session_awaiting's phrasing + the live awaited task descriptions) — the #bg-tasks box renders it when no tracked tasks claim the box (renderAwaitWhy; the user 2026-08-13, who moved it out of the statusline the same day PR #350 put it there)   // retrySuppressed = the user interrupted this thread's API-error storm → romp's auto-retry stays OFF for it until a successful turn re-arms (the user 2026-07-06). backend = "tmux" | "sdk"; apiTooLong = the "blocked" is a "prompt is too long" error (on you → red tab) vs a transient API error (amber/retrying); apiSpendLimit = a monthly spend cap (on you → raise it; NEVER auto-retried — retrying can't fix it, the user 2026-07-14); apiModelLimit = this session's MODEL is out of allowance (on you → switch model or add credits; not auto-retried either, the user 2026-08-01); apiRefusal = the model's safeguards refused the prompt itself (on you → rewrite it or drop the thread; never auto-retried — a refusal is deterministic on the same input, so a retry just manufactures the same refusal, the user 2026-08-15); ctxColor = the GLOBAL colormap's RGB for the context%, computed server-side; modelColor/effortColor = the same map's RGB tint for the model name + effort (by capability/effort rank), server-computed; modelPending = a /model switch is resolving → the badge shows switching-dots until the new name lands (server-driven, event-based, the user 2026-07-03); fast = the CLI's fast-mode state ("on"/"off"/"cooldown", from the SDK init's fast_mode_state; absent = unknown/unavailable → no fast badge)
+interface Status { state: ChipState; sinceEpoch: number | null; awaitingWhy?: string | null; awaitingKind?: string | null; awaitingPeers?: PeerIdent[] | null; awaitingTasks?: string[]; awaitingTaskIds?: string[]; awaitingCount?: number | null; awaitingItems?: AwaitRow[]; effort?: string; model?: string; modelPending?: boolean; effortPending?: boolean; mode?: string; fast?: string; auth?: string; authLive?: string; authPending?: boolean; authBoth?: boolean; authAcct?: string; ctx?: string; ctxOver?: boolean; ctxColor?: number[]; modelColor?: number[]; effortColor?: number[]; modelTone?: number[]; effortTone?: number[]; ctxTone?: number[]; faded?: boolean; backend?: string; apiTooLong?: boolean; apiSpendLimit?: boolean; apiModelLimit?: boolean; apiAuthErr?: boolean; apiRefusal?: boolean; retrySuppressed?: boolean; retryNextAt?: number | null; retryTries?: number | null; }   // awaitingWhy/awaitingTasks = what an awaitingBg session is waiting on (kernel _session_awaiting's phrasing + the live awaited task descriptions) — the #bg-tasks box renders it as the header of the in-flight rows (renderBgTasks; the user 2026-08-13, who moved it out of the statusline the same day PR #350 put it there)   // retrySuppressed = the user interrupted this thread's API-error storm → romp's auto-retry stays OFF for it until a successful turn re-arms (the user 2026-07-06). backend = "tmux" | "sdk"; apiTooLong = the "blocked" is a "prompt is too long" error (on you → red tab) vs a transient API error (amber/retrying); apiSpendLimit = a monthly spend cap (on you → raise it; NEVER auto-retried — retrying can't fix it, the user 2026-07-14); apiModelLimit = this session's MODEL is out of allowance (on you → switch model or add credits; not auto-retried either, the user 2026-08-01); apiRefusal = the model's safeguards refused the prompt itself (on you → rewrite it or drop the thread; never auto-retried — a refusal is deterministic on the same input, so a retry just manufactures the same refusal, the user 2026-08-15); ctxColor = the GLOBAL colormap's RGB for the context%, computed server-side; modelColor/effortColor = the same map's RGB tint for the model name + effort (by capability/effort rank), server-computed; modelPending = a /model switch is resolving → the badge shows switching-dots until the new name lands (server-driven, event-based, the user 2026-07-03); fast = the CLI's fast-mode state ("on"/"off"/"cooldown", from the SDK init's fast_mode_state; absent = unknown/unavailable → no fast badge)
 interface Color { bg: string; fg: string; }
 // A run_in_background task surfaced in the #bg-tasks box (the kernel's _bg_tasks): a one-line summary +
 // status, expandable to the command + its output. status = running | completed | failed. For a dispatched
@@ -240,7 +240,7 @@ interface Color { bg: string; fg: string; }
 // carries the full ask — the Agent prompt / the Workflow script — so the row's detail level says what the
 // work IS, not a generic label over an empty block (the user 2026-08-15).
 interface BgTask { id: string; status: string; summary: string; command?: string; output?: string; agentId?: string; }   // agentId: an AGENT row (its own transcript is openable — plans/subagent-transcripts.md); absent on shell tasks
-// The box payload: count (total to surface → the "N background tasks" header) + up to 16 tasks (the list).
+// The box payload: count (the true total of tracked tasks) + up to 16 tasks (the rows the #bg-tasks box joins to the kernel's in-flight rows).
 interface BgTasks { count: number; tasks: BgTask[]; }
 // events is a contiguous TAIL of the transcript: global indices [headFrom, headTotal). On a fresh load the
 // kernel ships only the last WIRE_TAIL events (headFrom > 0) to keep startup light; older history streams in
@@ -9778,19 +9778,29 @@ function renderLedger() {
   if (host) { host.replaceChildren(); host.style.display = "none"; }
 }
 
-// Background-task box (#bg-tasks) between the transcript and the composer (the user 2026-06-26). Three-level
-// disclosure, like a tool-use fold — and COLLAPSED by default so a busy session (e.g. many running training
-// tasks) doesn't fill the box:
-//   1. a count HEADER — "Background task · <name>" for one, "N background tasks" for many (+ a worst-status
-//      dot so a failure is glanceable while collapsed). Click → toggle the list.
-//   2. the LIST — one row per task (status dot + summary), scrollable (~5 visible). Click a row → details.
-//   3. per-task DETAILS — the command + its output, each in its own scrollable block.
-// Both fold levels persist across the per-push re-render (keyed by session id / task id); every toggle is
-// DELEGATED to the stable #bg-tasks container so a rebuild mid-click never drops it. textContent only
-// (command/output are untrusted).
-const bgExpanded = new Set<string>();   // task ids whose details are open
+// The in-flight box (#bg-tasks) between the transcript and the composer (the user 2026-06-26): everything
+// the active session has running in the background — dispatched agents, background commands, armed kernel
+// watches, the peers a wait names — as rows grouped by kind (slice 2, plans/subagent-transcripts.md).
+// Three-level disclosure, like a tool-use fold, and COLLAPSED by default so a busy session doesn't fill it:
+//   1. a one-line HEADER — "Awaiting 3 · 2 agents · 1 command" while the session is idle waiting on the
+//      rows (the chip's Awaiting), "In the background · 2 agents · 1 command" while it works — with a status
+//      dot (await-green idle; the worst tracked status working, so a failure is glanceable while collapsed).
+//      Click → toggle the list.
+//   2. the LIST — one row per thing (bgRow), under small dim group headers when more than one kind shows.
+//      Click a row → details.
+//   3. per-row DETAILS — an agent's prompt, a command's command line + output tail, a watch's predicate.
+// ONE presentation in both turn states (2026-09-06): the rows come from the kernel's awaitingItems, which
+// ships the same set whether or not the turn is open; only the header follows awaitingWhy. Before this the
+// rows shipped only while idle and the box fell to a legacy count-headed tasks list mid-turn, so it
+// swapped views at every turn boundary of a session with agents in flight (the user 2026-09-06, who watched
+// it vanish on send and come back when the turn ended). Both fold levels persist across the per-push
+// re-render (keyed by session id / row id — renderBgTasks never writes them, so the idle↔working flip
+// cannot close an open box); every toggle is DELEGATED to the stable #bg-tasks container so a rebuild
+// mid-click never drops it. textContent only (command/output are untrusted).
+const bgExpanded = new Set<string>();   // row ids whose details are open
 const bgFoldOpen = new Set<string>();   // session ids whose list is expanded
 const BG_RANK: Record<string, number> = { failed: 3, running: 2, completed: 1 };
+const BG_LEFTOVER_TITLE = "Also running";   // tracked tasks the wait does not name (a dev server the session keeps around)
 // ── SUBAGENT VIEWER (plans/subagent-transcripts.md, 2026-09-05) ─────────────────────────────────
 // The arrow on an Agent head (or an agent bg-task row) opens the agent's whole transcript as a PEEK tab:
 // a client-only pseudo-session in `sessions`/`order` with id `<parentId>/agent/<agentId>`, fed by the
@@ -9930,41 +9940,106 @@ function renderBgTasks() {
   if (!host) return;
   host.replaceChildren();
   const s = activeId ? sessions.get(activeId) : null;
-  const box = s && s.bgTasks;
-  const tasks = (box && box.tasks) || [];
-  const count = box ? box.count : 0;
-  host.classList.remove("bg-awaited");   // re-derived below from THIS payload (renderAwaitWhy adds its own)
-  // An awaited WAIT owns the box (slice 2, 2026-09-05): its rows, grouped by kind, with the tracked
-  // background tasks joined in — a session waiting on an agent AND a build AND a watch used to show the
-  // tasks list alone (the watch invisible, the header saying "2 background tasks"). No tracked tasks and
-  // no wait → renderAwaitWhy hides the box.
+  const tasks: BgTask[] = (s && s.bgTasks && s.bgTasks.tasks) || [];
+  // Keyed on CONTENT, never the chip state (the user 2026-08-30, paraphrased: even while working, anything
+  // the session has in flight shows at the chat bottom). The rows ride awaitingItems in both turn states;
+  // awaitingWhy rides only while the session is idle waiting on them (⇔ the chip's Awaiting) and picks the
+  // header's words; the tracked tasks (s.bgTasks) lend the command rows their output tail and Stop handle,
+  // and list on their own when the wait does not name them (a service the session keeps around).
   const why = (s && (s.status.awaitingWhy || "").trim()) || "";
-  if (why || !count || !tasks.length) { renderAwaitWhy(host, s || null, tasks); return; }
+  const items = ((s && s.status.awaitingItems) || []).filter((it) => it && it.kind);
+  if (!s || !activeId || (!why && !items.length && !tasks.length)) { host.style.display = "none"; host.classList.remove("bg-awaited"); return; }
   host.style.display = "";
-  // the AWAITED rows (the user 2026-08-19): when the chip waits on specific tasks, those rows — and
-  // the box holding them — wear a thin outline in the chip's green (awaitingTaskIds, the kernel's
-  // exact launch-id match); the status DOT keeps its meaning (yellow = the task is running). Keyed on
-  // the ids' PRESENCE, never the chip state (the user 2026-08-30: awaited things show even while the
-  // session is working — the kernel only ships ids when something genuinely awaits them).
-  const awaited = new Set<string>(s!.status.awaitingTaskIds || []);
-  host.classList.toggle("bg-awaited", tasks.some((t) => awaited.has(t.id)));
-  const sid = activeId as string;
+  const sid = activeId;
+  // the AWAITED outline (the user 2026-08-19): the box wears the chip's await-green while the session waits
+  // on its rows (the wait IS the box), and whenever the kernel names tracked tasks as awaited
+  // (awaitingTaskIds — an exact launch-id match; the ids' PRESENCE, never the chip state); the status DOT
+  // keeps its own meaning (yellow = the row is running)
+  const awaited = new Set<string>(s.status.awaitingTaskIds || []);
+  host.classList.toggle("bg-awaited", !!why || tasks.some((t) => awaited.has(t.id)));
   const open = bgFoldOpen.has(sid);
-  // worst status among the shown tasks → the header dot color (so a failure shows even while collapsed)
-  const worst = tasks.reduce((w, t) => (BG_RANK[t.status] || 0) > (BG_RANK[w] || 0) ? t.status : w, "completed");
-  const head = el("div", "bg-fold-head bg-" + worst + (open ? " open" : ""));
+  const groups = groupRows(items);
+  const awPeers = s.status.awaitingPeers || [];
+  const itemIds = new Set<string>(items.map((it) => it.id || "").filter(Boolean));
+  const leftovers = tasks.filter((t) => !itemIds.has(t.id));   // tracked tasks the wait does not name (services)
+  // the header dot: await-green while waiting, like the chip; otherwise the worst tracked status, so a
+  // failed task is glanceable while collapsed (running-yellow when nothing tracked has failed)
+  const worst = tasks.reduce((w, t) => (BG_RANK[t.status] || 0) > (BG_RANK[w] || 0) ? t.status : w, "running");
+  const head = el("div", "bg-fold-head " + (why ? "bg-await" : "bg-" + worst) + (open ? " open" : ""));
   head.dataset.act = "bg-fold"; head.dataset.id = sid;
   const car = el("span", "bg-caret"); car.textContent = open ? "▾" : "▸"; head.appendChild(car);   // ▸ closed → ▾ open (expands DOWNWARD beneath the header)
   head.appendChild(el("span", "bg-dot"));
   const lab = el("span", "bg-fold-label");
-  lab.textContent = count === 1 ? "Background task · " + (tasks[0].summary || "running")
-    : count + " background tasks";
+  if (why) {
+    // IDLE, waiting on the rows — the chip reads Awaiting and the header agrees with it in number: ONE rule
+    // words both (awaitWord). The kernel's why leads with the verb ("waiting on a background command: …");
+    // strip it so the labeled header doesn't stutter. The expanded body carries the rows (or the sentence).
+    const word = awaitWord(s.status.awaitingKind, s.status.awaitingCount, items);
+    if (awPeers.length && groups.every((g) => g.kind === "peer")) {
+      // a peer-kind wait NAMES the actual session (the user 2026-08-26) — identity colour, quiet
+      // host: prefix, the feed box's own treatment; the why tail keeps the wait's verb without
+      // restating the names ("delegated to X; " is the names, already rendered)
+      lab.append("Awaiting ");
+      awPeers.forEach((pr, i) => {
+        if (i) lab.append(", ");
+        const nm = el("span", "bg-await-peer");
+        nm.textContent = (pr.host ? pr.host + ":" : "") + pr.name;
+        if (pr.color && pr.color.bg) nm.style.color = pr.color.bg;
+        lab.appendChild(nm);
+      });
+      lab.append(" · " + why.replace(/^delegated to [^;]*;\s*/i, "").replace(/^(waiting on|awaiting)\s+/i, ""));
+    } else if (groups.length > 1) {
+      lab.textContent = "Awaiting " + word + " · " + awaitBreakdown(items);   // mixed kinds: the number, then the breakdown
+    } else {
+      lab.textContent = "Awaiting" + (word ? " " + word : "") + " · " + why.replace(/^(waiting on|awaiting)\s+/i, "");
+    }
+  } else {
+    // WORKING (or idle with nothing awaited — a service the session keeps around): the same rows, worded
+    // as what they are, no idle note. The breakdown counts the in-flight rows, or the tracked tasks when
+    // the kernel names none (they are shell tasks by construction — _bg_split never makes an agent a service).
+    const counted: AwaitRow[] = items.length ? items : leftovers.map((t) => ({ kind: "commands", id: t.id, label: t.summary }));
+    lab.textContent = "In the background · " + awaitBreakdown(counted);
+  }
   head.appendChild(lab);
   host.appendChild(head);
   if (!open) return;
+  if (!groups.length && !leftovers.length) {
+    // nothing enumerable (a judge stamp, an overlay row, an older kernel): the full sentence, the legacy
+    // descriptions when there are several, the note — never a dead end (only a wait reaches here: with no
+    // why, no rows and no tasks the box is hidden above)
+    const det = el("div", "bg-detail bg-await-detail");
+    const w = el("div", "bg-await-why"); w.textContent = why; det.appendChild(w);
+    const descs = s.status.awaitingTasks || [];
+    if (descs.length > 1) {   // a single description is already the why — list only a real plurality
+      for (const d of descs) { const r = el("div", "bg-await-task"); r.textContent = "· " + d; det.appendChild(r); }
+    }
+    det.appendChild(bgIdleNote());
+    host.appendChild(det);
+    return;
+  }
+  const taskById = new Map<string, BgTask>(tasks.map((t) => [t.id, t]));
+  const peerByName = new Map<string, PeerIdent>(awPeers.map((p) => [p.name, p]));
+  const headers = groups.length + (leftovers.length ? 1 : 0) >= 2;   // group headers only when there is more than one group to tell apart
   const list = el("div", "bg-list");
-  for (const t of tasks) list.appendChild(bgRow(taskRowSpec(t, awaited.has(t.id)), sid));
+  for (const g of groups) {
+    if (headers) { const gh = el("div", "bg-group-head"); gh.textContent = GROUP_TITLE[g.kind] || "Other"; list.appendChild(gh); }
+    for (const it of g.rows) list.appendChild(bgRow(awaitRowSpec(it, taskById.get(it.id || ""), peerByName), sid));
+  }
+  if (leftovers.length) {
+    if (headers) { const gh = el("div", "bg-group-head"); gh.textContent = BG_LEFTOVER_TITLE; list.appendChild(gh); }
+    for (const t of leftovers) list.appendChild(bgRow(taskRowSpec(t, awaited.has(t.id)), sid));
+  }
+  // the plain-words note on what the state means — for the idle wait only, where the state is not obvious
+  // from the header; "In the background" says all a working session needs (2026-09-06)
+  if (why) list.appendChild(bgIdleNote());
   host.appendChild(list);
+}
+
+// The one sentence under an idle wait's rows: what the state means, in plain words.
+function bgIdleNote(): HTMLElement {
+  const note = el("div", "bg-await-note");
+  note.textContent = "The session is idle until this finishes; it picks back up on its own when the result lands.";
+  return note;
 }
 
 // One ROW of the box, whatever it is (slice 2, 2026-09-05) — the awaited things are different kinds,
@@ -10079,94 +10154,6 @@ function bgRow(t: BgRowSpec, sid: string): HTMLElement {
     row.appendChild(det);
   }
   return row;
-}
-
-// The Awaiting session's box (the user 2026-08-13: the reason spent a few hours beside the statusline
-// chip — PR #350 — and crowded the composer area; this box between transcript and composer is where
-// dispatched work has always surfaced). Same fold treatment as the task header: one await-green-dotted
-// line — "Awaiting <word> · <why>" for one kind, "Awaiting <n> · <breakdown>" when the kinds are mixed
-// — and, expanded, the awaited ROWS grouped by kind (slice 2, 2026-09-05): a small dim header per group
-// when several groups show, each row with its own kind's affordances (bgRow), the tracked background
-// tasks the wait does not name trailing under "Background tasks", and a plain-words note on what the
-// state means. A wait the kernel cannot enumerate (a judge stamp, an overlay row, an older kernel)
-// expands to its full sentence instead — never a dead end.
-function renderAwaitWhy(host: HTMLElement, s: Session | null, tasks: BgTask[] = []) {
-  // Keyed on awaited CONTENT, never the chip state (the user 2026-08-30, their words paraphrased:
-  // even while working, anything the session awaits shows at the chat bottom in the green box). The
-  // kernel ships awaitingWhy whenever something is genuinely awaited — armed kernel watches included,
-  // mid-turn included — so the fields' presence IS the render condition; the chip keeps its meaning.
-  const why = (s && (s.status.awaitingWhy || "").trim()) || "";
-  if (!why || !activeId) { host.style.display = "none"; return; }
-  host.style.display = "";
-  host.classList.add("bg-awaited");   // this whole box IS the awaited thing — the chip's green border
-  const sid = activeId;
-  const open = bgFoldOpen.has(sid);
-  const items = (s!.status.awaitingItems || []).filter((it) => it && it.kind);
-  const groups = groupRows(items);
-  const awPeers = s!.status.awaitingPeers || [];
-  const head = el("div", "bg-fold-head bg-await" + (open ? " open" : ""));
-  head.dataset.act = "bg-fold"; head.dataset.id = sid;
-  const car = el("span", "bg-caret"); car.textContent = open ? "▾" : "▸"; head.appendChild(car);
-  head.appendChild(el("span", "bg-dot"));
-  const lab = el("span", "bg-fold-label");
-  // the kernel's why leads with the verb ("waiting on a background command: …") — strip it so the
-  // labeled header doesn't stutter; the expanded body carries the rows (or the full sentence)
-  const word = awaitWord(s!.status.awaitingKind, s!.status.awaitingCount, items);
-  if (awPeers.length && groups.every((g) => g.kind === "peer")) {
-    // a peer-kind wait NAMES the actual session (the user 2026-08-26) — identity colour, quiet
-    // host: prefix, the feed box's own treatment; the why tail keeps the wait's verb without
-    // restating the names ("delegated to X; " is the names, already rendered)
-    lab.append("Awaiting ");
-    awPeers.forEach((pr, i) => {
-      if (i) lab.append(", ");
-      const nm = el("span", "bg-await-peer");
-      nm.textContent = (pr.host ? pr.host + ":" : "") + pr.name;
-      if (pr.color && pr.color.bg) nm.style.color = pr.color.bg;
-      lab.appendChild(nm);
-    });
-    lab.append(" · " + why.replace(/^delegated to [^;]*;\s*/i, "").replace(/^(waiting on|awaiting)\s+/i, ""));
-  } else if (groups.length > 1) {
-    lab.textContent = "Awaiting " + word + " · " + awaitBreakdown(items);   // mixed kinds: the number, then the breakdown
-  } else {
-    lab.textContent = "Awaiting" + (word ? " " + word : "") + " · " + why.replace(/^(waiting on|awaiting)\s+/i, "");
-  }
-  head.appendChild(lab);
-  host.appendChild(head);
-  if (!open) return;
-  const note = el("div", "bg-await-note");
-  note.textContent = s!.status.state === "awaitingBg"
-    ? "The session is idle until this finishes; it picks back up on its own when the result lands."
-    : "The session keeps working meanwhile; it's told when this lands.";
-  const itemIds = new Set<string>(items.map((it) => it.id || "").filter(Boolean));
-  const leftovers = tasks.filter((t) => !itemIds.has(t.id));   // tracked tasks the wait does not name (services)
-  if (!groups.length && !leftovers.length) {
-    // nothing enumerable (a judge stamp, an overlay row, an older kernel): the full sentence, the legacy
-    // descriptions when there are several, the note
-    const det = el("div", "bg-detail bg-await-detail");
-    const w = el("div", "bg-await-why"); w.textContent = why; det.appendChild(w);
-    const descs = s!.status.awaitingTasks || [];
-    if (descs.length > 1) {   // a single description is already the why — list only a real plurality
-      for (const d of descs) { const r = el("div", "bg-await-task"); r.textContent = "· " + d; det.appendChild(r); }
-    }
-    det.appendChild(note);
-    host.appendChild(det);
-    return;
-  }
-  const awaited = new Set<string>(s!.status.awaitingTaskIds || []);
-  const taskById = new Map<string, BgTask>(tasks.map((t) => [t.id, t]));
-  const peerByName = new Map<string, PeerIdent>(awPeers.map((p) => [p.name, p]));
-  const headers = groups.length + (leftovers.length ? 1 : 0) >= 2;   // group headers only when there is more than one group to tell apart
-  const list = el("div", "bg-list");
-  for (const g of groups) {
-    if (headers) { const gh = el("div", "bg-group-head"); gh.textContent = GROUP_TITLE[g.kind] || "Other"; list.appendChild(gh); }
-    for (const it of g.rows) list.appendChild(bgRow(awaitRowSpec(it, taskById.get(it.id || ""), peerByName), sid));
-  }
-  if (leftovers.length) {
-    if (headers) { const gh = el("div", "bg-group-head"); gh.textContent = "Background tasks"; list.appendChild(gh); }
-    for (const t of leftovers) list.appendChild(bgRow(taskRowSpec(t, awaited.has(t.id)), sid));
-  }
-  list.appendChild(note);
-  host.appendChild(list);
 }
 
 // ---- live "awaiting your input" widgets (structured: radio / checkbox / submit / text) ----
@@ -11350,7 +11337,7 @@ function updateStatusline() {
     timer.id = "work-timer";
     timer.textContent = elapsedMs(s.status.sinceEpoch);
     sl.appendChild(timer);
-    // The WHY renders in the #bg-tasks box between transcript and composer (renderAwaitWhy), not
+    // The WHY renders in the #bg-tasks box between transcript and composer (renderBgTasks), not
     // here — a reason line beside the chip crowded the composer area (the user 2026-08-13, on the
     // same day's PR #350 that first surfaced it here).
   } else if (s.status.state === "compacting") {
@@ -12663,7 +12650,7 @@ function requestOlder(sid: string, v: View, content: HTMLElement): void {
   vscodeApi?.postMessage({ type: "loadOlder", id: sid, before: s.headFrom });
 }
 
-// The awaiting fields the #bg-tasks box renders from (renderAwaitWhy / the awaited-row outline) — one
+// The awaiting fields the #bg-tasks box renders from (renderBgTasks — the header words, the rows, the awaited-row outline) — one
 // key per status, so a status-only frame re-renders the box exactly when THESE change (the chip's own
 // flip is one of them) and never on the per-second ticks that touch nothing the box shows.
 function awaitKey(st: Status | undefined): string {

@@ -1204,20 +1204,25 @@ class ViewBuilder(unittest.TestCase):
 
     def test_a_working_session_still_lists_its_armed_kernel_watches(self):
         # The user (2026-08-30, paraphrased): even while working, anything the session awaits shows
-        # at the chat bottom in the green box. Kernel half: the status payload carries the awaited
-        # content mid-turn while the chip formula stays untouched — state reads working, the box
-        # renders from the fields.
+        # at the chat bottom in the box. Kernel half: the status payload carries the awaited content
+        # mid-turn while the chip formula stays untouched — state reads working, the box renders from
+        # the fields. Pin changed 2026-09-06: the content rides the ROWS (awaitingItems), the same
+        # turn-agnostic set every in-flight thing rides, and awaitingWhy stays None mid-turn. The
+        # 2026-08-30 cut re-ran _watch_awaiting alone into awaitingWhy while the turn was open, which
+        # made the box read "Awaiting" under a Working chip and left every other in-flight row to the
+        # legacy tasks list — two presentations of one set of facts, swapped at every turn boundary.
         with self.tpath.open("a") as f:                  # an OPEN turn → the session reads working
             f.write(json.dumps(uline(NOW, "keep working on the strip", "uOpen", parent="a2")) + "\n")
         km._parse_cache.clear()
-        km.add_watch("test -f /tmp/synthetic-sentinel", SID, note="the cluster job's sentinel file")
+        row, _err = km.add_watch("test -f /tmp/synthetic-sentinel", SID, note="the cluster job's sentinel file")
         try:
             st = km.build_session(SID, NOW)["status"]
             self.assertEqual(st["state"], "working", "the shared chip formula is untouched")
-            self.assertIn("the cluster job's sentinel file", st["awaitingWhy"] or "")
-            self.assertEqual(st["awaitingKind"], "job")
-            self.assertEqual(st["awaitingTasks"], ["the cluster job's sentinel file"],
-                             "the box's fold lists each watch in the registrant's own words")
+            self.assertIsNone(st["awaitingWhy"], "awaitingWhy means idle-and-waiting — the chip's Awaiting — on every surface")
+            self.assertIsNone(st["awaitingKind"])
+            self.assertEqual([(it["kind"], it["label"], it.get("watchId")) for it in st["awaitingItems"]],
+                             [("watches", "the cluster job's sentinel file", row["id"])],
+                             "the watch is a row in the registrant's own words, Cancel's handle riding, while the turn is open")
         finally:
             self._clear_watches()
 

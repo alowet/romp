@@ -541,6 +541,24 @@ class OneRowPerAgentAcrossTheHookAndTheStream(unittest.TestCase):
         self.assertEqual((aw["kind"], aw["why"]), ("mixed", "waiting on 2 background agents and 1 background command"))
         self.assertEqual(aw["tasks"], ["Check the exporter for banned words", "Rerun the notes-api harness", "build the docs site"])
 
+    def test_the_same_three_rows_ride_while_the_turn_is_open(self):
+        # 2026-09-06, on the REAL _bg_live_norm: the joined rows are a turn-agnostic read
+        # (_session_background_items) — the chat box lists them under a working header instead of falling
+        # to the legacy tasks list, which is what made the box swap presentations at every turn boundary
+        self._snap([{"type": "general-purpose", "since": 100, "agentId": self.A1},
+                    {"type": "general-purpose", "since": 105, "agentId": self.A2}],
+                   [{"toolUseId": "toolu_01", "taskId": self.A1, "type": "local_agent", "since": 98,
+                     "desc": "Running Check the exporter for banned words", "lastTool": ""},
+                    {"toolUseId": "toolu_02", "taskId": self.A2, "type": "local_agent", "since": 104,
+                     "desc": "Running Rerun the notes-api harness", "lastTool": ""},
+                    {"toolUseId": "toolu_03", "taskId": "b3333", "type": "local_bash", "since": 110,
+                     "desc": "build the docs site", "lastTool": ""}])
+        idle_rows = km._session_awaiting(self.SID, None, True)["items"]
+        self.assertIsNone(km._session_awaiting(self.SID, None, False), "mid-turn there is no WAIT (the chip reads Working)")
+        self.assertEqual(km._session_background_items(self.SID, None), idle_rows, "…but the rows are the same three")
+        self.assertEqual([it["label"] for it in idle_rows],
+                         ["Check the exporter for banned words", "Rerun the notes-api harness", "build the docs site"])
+
     def test_a_live_agent_the_stream_has_not_seen_keeps_its_type_as_the_label(self):
         self._snap([{"type": "explore", "since": 100, "agentId": self.A1}], [])
         aw = km._session_awaiting(self.SID, None, True)

@@ -56,11 +56,13 @@ test("the await key covers every field the box renders from, and nothing that ti
   assert.doesNotMatch(key, /sinceEpoch|ctx\b|modelPending|effortPending/, "timer/ctx ticks must not rebuild the box");
 });
 
-test("the box's render condition is unchanged: awaited content present ⇒ box; absent ⇒ hidden", () => {
-  const why = RENDER.split("function renderAwaitWhy(")[1].split("\n}")[0];
-  assert.match(why, /if \(!why \|\| !activeId\) \{ host\.style\.display = "none"; return; \}/,
-    "chip cleared (awaitingWhy gone) ⇒ the same status frame hides the box");
-  assert.match(why, /host\.style\.display = "";/);
+test("the box's render condition: in-flight content present ⇒ box; absent ⇒ hidden — a chip flip alone never hides it", () => {
+  // pin changed 2026-09-06: the rows ride in BOTH turn states now, so the box hides only when there is
+  // neither a wait, nor rows, nor tracked tasks. A chip flip Awaiting→Working with agents still in flight
+  // keeps the box (its header re-worded); a wait clearing with nothing left hides it in the same frame.
+  const body = RENDER.split("function renderBgTasks(")[1].split("\nfunction ")[0];
+  assert.match(body, /if \(!s \|\| !activeId \|\| \(!why && !items\.length && !tasks\.length\)\) \{ host\.style\.display = "none"; host\.classList\.remove\("bg-awaited"\); return; \}/);
+  assert.match(body, /host\.style\.display = "";/);
 });
 
 test("the chip and the box gist take the kind word from ONE count (T225 rider)", () => {
@@ -73,7 +75,7 @@ test("the chip and the box gist take the kind word from ONE count (T225 rider)",
   assert.match(RENDER, /awaitingItems\?: AwaitRow\[\];/, "…and the rows (slice 2)");
   assert.match(RENDER, /const chipWord = awaitWord\(s\.status\.awaitingKind, s\.status\.awaitingCount, chipItems\);/);
   assert.match(RENDER, /chip\.textContent = CHIP_LABEL\.awaitingBg \+ \(chipWord \? " " \+ chipWord : ""\);/);
-  assert.match(RENDER, /const word = awaitWord\(s!\.status\.awaitingKind, s!\.status\.awaitingCount, items\);/);
+  assert.match(RENDER, /const word = awaitWord\(s\.status\.awaitingKind, s\.status\.awaitingCount, items\);/);   // `s` is narrowed by the one renderer's gate since 2026-09-06 (no `s!`)
   assert.match(RENDER, /lab\.textContent = "Awaiting" \+ \(word \? " " \+ word : ""\) \+ " · " \+ why\.replace/);
   // the feed pill and the spin caption derive their word the same way
   assert.match(FEED, /import \{ spinFor, waitedSuffix, awaitWord, groupRows, GROUP_TITLE, ROW_KIND_OF_LEGACY, type AwaitRow \} from "\.\/spin-caption";/);

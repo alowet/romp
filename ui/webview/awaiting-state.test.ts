@@ -75,16 +75,18 @@ test("the awaiting WHY lives in the background box, not the statusline (the user
   const branch = RENDER.split('state === "awaitingBg") {')[1].split("} else if")[0];
   assert.doesNotMatch(branch, /sl-await-why/);
   assert.doesNotMatch(STYLES, /sl-await-why/);
-  // …and the #bg-tasks box renders it — since slice 2 (2026-09-05) whenever a wait exists, the tracked
-  // tasks joining its rows: the same fold treatment (await-green dot, verb-stripped header), expanding
-  // to the awaited ROWS grouped by kind, or to the full why when the kernel names none, and a
-  // plain-words note on what the state means. Stop rides only a row backed by a LIVE tracked task
-  // (bgRow's stopId) — an untracked wait (a peer's PR, a watch) still has no process to kill.
-  assert.match(RENDER, /if \(why \|\| !count \|\| !tasks\.length\) \{ renderAwaitWhy\(host, s \|\| null, tasks\); return; \}/);
-  assert.match(RENDER, /"bg-fold-head bg-await"/);
+  // …and the #bg-tasks box renders it — since slice 2 (2026-09-05) as the header over the awaited ROWS
+  // grouped by kind, the tracked tasks joining them (or the full why when the kernel names none), with a
+  // plain-words note on what the state means. Since 2026-09-06 ONE renderer (renderBgTasks) draws the
+  // box in both turn states from the same rows; the wait's why picks the header's words and its
+  // await-green dot (pin changed: the two-branch split into a legacy tasks list is gone). Stop rides
+  // only a row backed by a LIVE tracked task (bgRow's stopId) — an untracked wait (a peer's PR, a
+  // watch) still has no process to kill.
+  assert.ok(!RENDER.includes("function renderAwaitWhy"), "one renderer");
+  assert.match(RENDER, /const head = el\("div", "bg-fold-head " \+ \(why \? "bg-await" : "bg-" \+ worst\) \+ \(open \? " open" : ""\)\);/);
   assert.match(RENDER, /lab\.textContent = "Awaiting" \+ \(word \? " " \+ word : ""\) \+ " · " \+ why\.replace\(\/\^\(waiting on\|awaiting\)\\s\+\/i, ""\)/);
   // …the kind word rides the visible label (the user 2026-08-15) — tooltips are dead on the touch PWA
-  assert.match(RENDER, /const word = awaitWord\(s!\.status\.awaitingKind, s!\.status\.awaitingCount, items\);/);
+  assert.match(RENDER, /const word = awaitWord\(s\.status\.awaitingKind, s\.status\.awaitingCount, items\);/);
   assert.match(RENDER, /chip-awaiting-" \+ \(s\.status\.awaitingKind \|\| "untyped"\)/);
   assert.match(RENDER, /if \(descs\.length > 1\)/);   // the no-rows fallback lists the legacy descriptions only when there are several
   assert.match(RENDER, /bg-await-note/);
@@ -99,14 +101,16 @@ test("the awaited tasks wear the chip's green outline — exact launch-id match;
   assert.match(KERNEL, /"awaitingTaskIds": \(_awaiting_task_ids\(sid, sess\["path"\]\) if awaiting_why else \[\]\),/);
   assert.match(KERNEL, /def _awaiting_task_ids\(sid, path\):/);
   assert.match(KERNEL, /return \[t\["tid"\] for t in awaited if t\.get\("tid"\)\]/);
-  // client: rows are marked from awaitingTaskIds only while the chip is awaitingBg…
+  // client: rows are marked from awaitingTaskIds — the ids' presence, never the chip state (2026-08-30:
+  // awaited things show even while working)…
   assert.match(RENDER, /awaitingTaskIds\?: string\[\];/);
-  assert.match(RENDER, /const awaited = new Set<string>\(s!\.status\.awaitingTaskIds \|\| \[\]\);/);   // ids' presence, never the chip state (2026-08-30: awaited things show even while working)
-  assert.match(RENDER, /host\.classList\.toggle\("bg-awaited", tasks\.some\(\(t\) => awaited\.has\(t\.id\)\)\);/);
+  assert.match(RENDER, /const awaited = new Set<string>\(s\.status\.awaitingTaskIds \|\| \[\]\);/);
+  // …and the box wears the border whole while the session WAITS on its rows (the wait IS the box) or
+  // whenever a tracked task is named awaited — one toggle since the one-renderer cut (2026-09-06; the
+  // kernel ships the ids only with a wait, so mid-turn the box wears its neutral border under a Working chip)
+  assert.match(RENDER, /host\.classList\.toggle\("bg-awaited", !!why \|\| tasks\.some\(\(t\) => awaited\.has\(t\.id\)\)\);/);
   assert.match(RENDER, /bgRow\(taskRowSpec\(t, awaited\.has\(t\.id\)\), sid\)/);   // the row spec carries the match (slice 2's one row renderer)
   assert.match(RENDER, /\(t\.awaited \? " bg-awaited" : ""\)/);
-  // …the untracked-wait box (renderAwaitWhy) IS the awaited thing, so it wears the border whole
-  assert.match(RENDER, /host\.classList\.add\("bg-awaited"\);/);
   // the outline is the chip's await-green — the border/outline only; the status DOT rules are untouched
   assert.match(STYLES, /#bg-tasks\.bg-awaited \{ border-color: var\(--st-awaitbg-bg\); \}/);
   assert.match(STYLES, /\.bg-task\.bg-awaited \{ box-shadow: inset 0 0 0 1px var\(--st-awaitbg-bg\); border-radius: 5px; \}/);
@@ -116,23 +120,32 @@ test("the awaited tasks wear the chip's green outline — exact launch-id match;
 test("awaited things show even while WORKING, and kernel watches feed the box (the user 2026-08-30)", () => {
   // Their requirement, paraphrased: even mid-turn, anything the session awaits — jobs, watches,
   // pending externals — shows at the chat bottom in the green box. Three legs, pinned where they live:
-  // 1. the box keys on awaited CONTENT, never the chip state (the old state gate was the defect)
+  // 1. the box keys on in-flight CONTENT, never the chip state (the old state gate was the defect)
   assert.match(RENDER, /const why = \(s && \(s\.status\.awaitingWhy \|\| ""\)\.trim\(\)\) \|\| "";/);
-  assert.doesNotMatch(RENDER.split("function renderAwaitWhy")[1].split("\n}")[0],
-    /state === "awaitingBg" &&/);
-  // …with the fold's plain-words note adapting to the chip: idle keeps the historic sentence,
-  // working says the session keeps going and is told when the wait lands
-  assert.match(RENDER, /s!\.status\.state === "awaitingBg"\s*\n\s*\? "The session is idle until this finishes/);
-  assert.match(RENDER, /: "The session keeps working meanwhile; it's told when this lands\."/);
+  const body = RENDER.split("function renderBgTasks(")[1].split("\nfunction ")[0];
+  assert.doesNotMatch(body, /state === "awaitingBg"/);
+  // …with the fold's plain-words note under a WAIT only (pin changed 2026-09-06): the header now says
+  // which state the box is in — "Awaiting …" idle, "In the background …" working — so the working
+  // state needs no sentence; the old two-note switch keyed on the chip state is gone with it
+  assert.match(body, /if \(why\) list\.appendChild\(bgIdleNote\(\)\);/);
+  assert.doesNotMatch(RENDER, /The session keeps working meanwhile/);
+  assert.match(RENDER, /function bgIdleNote\(\): HTMLElement \{[\s\S]*?"The session is idle until this finishes; it picks back up on its own when the result lands\."/);
   // 2. kernel watches are an awaiting SOURCE (idle: flips the chip like any wait; the rows are
   // kernel-owned and event-true at both ends — armed at registration, cleared on fire/cancel)
   assert.match(KERNEL, /def _watch_awaiting\(sid\):/);
   // …COMBINED with the live agents and pending launches since slice 2 (2026-09-05) — no source
-  // short-circuits another; the one answer is derived from every row
-  assert.match(KERNEL, /combined = _awaiting_from_items\(agents, commands, _watch_awaiting\(sid\)\)\s*\n\s*if combined:\s*\n\s*return combined/);
-  // 3. mid-turn, the CONTENT rides the payload while the shared state formula stays untouched —
-  // the chip keeps reading working, the box renders from the fields
-  assert.match(KERNEL, /if not _aw and open_now:\s*\n\s*_aw = _watch_awaiting\(sid\)/);
+  // short-circuits another; the one answer is derived from every row — by _awaiting_live_rows, the
+  // assembly the mid-turn read shares (2026-09-06)
+  assert.match(KERNEL, /agents, commands, watch = _awaiting_live_rows\(sid, path, live\)\s*\n\s*combined = _awaiting_from_items\(agents, commands, watch\)\s*\n\s*if combined:\s*\n\s*return combined/);
+  assert.match(KERNEL, /return agents, commands, _watch_awaiting\(sid\)/);
+  // 3. mid-turn, the CONTENT rides the payload while the shared state formula stays untouched — the
+  // chip keeps reading working, the box renders from the fields. Pin changed 2026-09-06: the content
+  // is the ROWS (awaitingItems, the same set in both turn states), not a watch-only re-run into
+  // awaitingWhy — that arm made the box read "Awaiting" under a Working chip and left every other
+  // in-flight row to the legacy list; awaitingWhy now means idle-and-waiting on every surface
+  assert.doesNotMatch(KERNEL, /if not _aw and open_now:/);
+  assert.match(KERNEL, /_aw_items = _awaiting_items_payload\(_aw, sid, sess\["path"\], tmux\)/);   // under the build's own snapshot — no fresh liveness read on the working path
+  assert.match(KERNEL, /"awaitingItems": _aw_items,/);
   assert.match(KERNEL, /"working" if open_now else\n/);   // the state formula's ordering is intact
 });
 

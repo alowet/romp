@@ -131,12 +131,17 @@ test("the chip's label: a single named peer keeps its coloured name; every other
 
 // --- the box: rows grouped by kind, per-kind affordances ------------------------------------------------
 test("the box groups the rows by kind, headers only when more than one group shows, tracked services trailing", () => {
-  const body = RENDER.split("function renderAwaitWhy(")[1].split("\nfunction ")[0];
+  // since 2026-09-06 the one renderer is renderBgTasks (renderAwaitWhy folded into it — see the
+  // "one presentation" tests below); the grouping is unchanged
+  const body = RENDER.split("function renderBgTasks(")[1].split("\nfunction ")[0];
   assert.match(body, /const groups = groupRows\(items\);/);
   assert.match(body, /const leftovers = tasks\.filter\(\(t\) => !itemIds\.has\(t\.id\)\);/, "tracked tasks the wait does not name still list");
   assert.match(body, /const headers = groups\.length \+ \(leftovers\.length \? 1 : 0\) >= 2;/);
   assert.match(body, /if \(headers\) \{ const gh = el\("div", "bg-group-head"\); gh\.textContent = GROUP_TITLE\[g\.kind\] \|\| "Other"; list\.appendChild\(gh\); \}/);
-  assert.match(body, /if \(headers\) \{ const gh = el\("div", "bg-group-head"\); gh\.textContent = "Background tasks"; list\.appendChild\(gh\); \}/);
+  // the trailing group's title (pin changed 2026-09-06): "Background tasks" was the legacy list's word and the
+  // renderer must not say it anywhere; a tracked task the wait does not name is simply also running
+  assert.match(body, /if \(headers\) \{ const gh = el\("div", "bg-group-head"\); gh\.textContent = BG_LEFTOVER_TITLE; list\.appendChild\(gh\); \}/);
+  assert.match(RENDER, /const BG_LEFTOVER_TITLE = "Also running";/);
   // the header: mixed → "Awaiting <n> · <breakdown>"; one kind → the sentence as before
   assert.match(body, /\} else if \(groups\.length > 1\) \{\s*\n\s*lab\.textContent = "Awaiting " \+ word \+ " · " \+ awaitBreakdown\(items\);/);
   // the no-rows fallback still expands to the full sentence — never a dead end
@@ -176,8 +181,10 @@ test("Cancel rides the box's stable delegate, acknowledges, and reaches the kern
 test("the box re-renders on a rows change like any other awaiting field, and every surface ships the rows", () => {
   const key = RENDER.split("function awaitKey(")[1].split("\n}")[0];
   assert.ok(key.includes("st.awaitingItems"), "awaitingItems is in the await key");
-  assert.match(KERNEL, /"awaitingItems": \(list\(\(_aw or \{\}\)\.get\("items"\) or \[\]\) if awaiting_why else \[\]\),/, "chat status");
-  assert.match(KERNEL, /"awaitingItems": \(list\(\(_aw_bg or \{\}\)\.get\("items"\) or \[\]\) if awaiting_bg else \[\]\),/, "timeline lane");
+  // pins changed 2026-09-06: the session-scoped surfaces ship the rows in BOTH turn states (the wait's own rows
+  // idle-awaiting, everything in flight otherwise — _awaiting_items_payload), not gated on awaiting_why
+  assert.match(KERNEL, /_aw_items = _awaiting_items_payload\(_aw, sid, sess\["path"\], tmux\)[\s\S]*?"awaitingItems": _aw_items,/, "chat status");
+  assert.match(KERNEL, /"awaitingItems": \(_awaiting_items_payload\(_aw_bg, sid, s\["path"\], tmux\) if live else \[\]\),/, "timeline lane");
   assert.match(KERNEL, /"items": await_items,/, "the goal card");
   assert.match(KERNEL, /"items": list\(items or \[\]\),/, "the placeholder card");
 });
@@ -211,6 +218,75 @@ test("every row — agent, command, watch, peer — is ONE line: label, then arr
                  at('el("span", "bg-caret")')];
   assert.deepEqual([...order].sort((a, b) => a - b), order, "label → arrow → elapsed → status → Stop → Cancel → caret");
   assert.match(STYLES, /\.bg-sum \{ flex: 0 1 auto; min-width: 0;/);
+});
+
+// --- one presentation in both turn states (the user 2026-09-06) -------------------------------------------
+// Seen live: a session with two background agents and a background command showed the grouped rows while
+// idle ("Awaiting 3 · 2 agents · 1 command", the idle note); the moment the user sent a message the view
+// vanished, and it came back when the turn ended. The kernel shipped the rows only while idle (alongside the
+// chip's idle-only Awaiting), so mid-turn the client fell to the legacy "N background tasks" list built from
+// s.bgTasks — two presentations of one set of facts, swapped at every turn boundary. Now the rows ride in both
+// states and ONE renderer draws them; only the header follows awaitingWhy (idle-and-waiting ⇔ the chip's
+// Awaiting). The chip itself still flips exactly when it did.
+test("ONE renderer: the grouped rows render whenever rows exist, idle or not; the legacy count list and its words are gone", () => {
+  const body = RENDER.split("function renderBgTasks(")[1].split("\nfunction ")[0];
+  assert.ok(!RENDER.includes("function renderAwaitWhy"), "the two-branch split is gone — one code path");
+  assert.doesNotMatch(body, /background tasks/i, "the legacy header string is gone from the renderer");
+  assert.doesNotMatch(RENDER, /count \+ " background tasks"/);
+  assert.doesNotMatch(RENDER, /"Background task · "/);
+  // the render gate is CONTENT: rows (awaitingItems, shipped in both states), a wait's why, or tracked tasks
+  assert.match(body, /const items = \(\(s && s\.status\.awaitingItems\) \|\| \[\]\)\.filter\(\(it\) => it && it\.kind\);/);
+  assert.match(body, /if \(!s \|\| !activeId \|\| \(!why && !items\.length && !tasks\.length\)\) \{ host\.style\.display = "none"; host\.classList\.remove\("bg-awaited"\); return; \}/);
+  // the same row renderer for every row in either state — tracked tasks still lend the command rows their
+  // output tail and Stop handle (awaitRowSpec's `tracked`), and list on their own when the wait names none
+  assert.match(body, /const taskById = new Map<string, BgTask>\(tasks\.map\(\(t\) => \[t\.id, t\]\)\);/);
+  assert.match(body, /for \(const it of g\.rows\) list\.appendChild\(bgRow\(awaitRowSpec\(it, taskById\.get\(it\.id \|\| ""\), peerByName\), sid\)\);/);
+  assert.match(body, /for \(const t of leftovers\) list\.appendChild\(bgRow\(taskRowSpec\(t, awaited\.has\(t\.id\)\), sid\)\);/);
+  // the awaited outline keys on the wait / the awaited ids' presence as before — never the chip state
+  assert.match(body, /host\.classList\.toggle\("bg-awaited", !!why \|\| tasks\.some\(\(t\) => awaited\.has\(t\.id\)\)\);/);
+  assert.doesNotMatch(body, /status\.state/, "nothing in the renderer reads the chip state");
+});
+
+test("the header follows the wait: idle → 'Awaiting …' + the idle note; working → 'In the background · <breakdown>' and NO note", () => {
+  const body = RENDER.split("function renderBgTasks(")[1].split("\nfunction ")[0];
+  assert.match(body, /if \(why\) \{[\s\S]*?const word = awaitWord\(s\.status\.awaitingKind, s\.status\.awaitingCount, items\);/, "idle: today's label, agreeing in number with the chip");
+  assert.match(body, /\} else \{[\s\S]*?const counted: AwaitRow\[\] = items\.length \? items : leftovers\.map\(\(t\) => \(\{ kind: "commands", id: t\.id, label: t\.summary \}\)\);\s*\n\s*lab\.textContent = "In the background · " \+ awaitBreakdown\(counted\);/,
+    "working: the same rows, worded as what they are; a tracked service with no awaited row counts as the command it is");
+  // the idle note is appended under a wait only — once at the end of the list, once in the no-rows fallback
+  assert.match(body, /if \(why\) list\.appendChild\(bgIdleNote\(\)\);/);
+  assert.match(body, /det\.appendChild\(bgIdleNote\(\)\);/);
+  assert.equal((body.match(/bgIdleNote\(\)/g) || []).length, 2, "no other note anywhere in the renderer");
+  assert.doesNotMatch(RENDER, /keeps working meanwhile/, "the working-state sentence is gone: 'In the background' says it");
+  assert.match(RENDER, /function bgIdleNote\(\): HTMLElement \{[\s\S]*?"The session is idle until this finishes; it picks back up on its own when the result lands\."/);
+  // the header dot: await-green under a wait (like the chip), else the worst tracked status — a failed task
+  // stays glanceable while collapsed, running-yellow otherwise (never completed-blue for a box of live rows)
+  assert.match(body, /const head = el\("div", "bg-fold-head " \+ \(why \? "bg-await" : "bg-" \+ worst\) \+ \(open \? " open" : ""\)\);/);
+  assert.match(body, /const worst = tasks\.reduce\(\(w, t\) => \(BG_RANK\[t\.status\] \|\| 0\) > \(BG_RANK\[w\] \|\| 0\) \? t\.status : w, "running"\);/);
+  // the words, EXECUTED: the same rows word both headers, singular and plural
+  const rows = [agent("a"), agent("b"), command("c")];
+  assert.equal("Awaiting " + awaitWord("mixed", 3, rows) + " · " + awaitBreakdown(rows), "Awaiting 3 · 2 agents · 1 command");
+  assert.equal("In the background · " + awaitBreakdown(rows), "In the background · 2 agents · 1 command");
+  assert.equal("In the background · " + awaitBreakdown([agent("a")]), "In the background · 1 agent");
+  assert.equal("In the background · " + awaitBreakdown([command("c"), command("d")]), "In the background · 2 commands");
+  assert.equal("In the background · " + awaitBreakdown([watch("w")]), "In the background · 1 watch", "an armed watch shows mid-turn too (the 2026-08-30 rule, through the rows)");
+  assert.equal("In the background · " + awaitBreakdown([{ kind: "commands", id: "b1", label: "serve the docs" }]), "In the background · 1 command");
+});
+
+test("the box's fold state survives the idle↔working flip: the renderer only READS bgFoldOpen; the two clicks are its only writers", () => {
+  const body = RENDER.split("function renderBgTasks(")[1].split("\nfunction ")[0];
+  assert.match(body, /const open = bgFoldOpen\.has\(sid\);/);
+  assert.doesNotMatch(body, /bgFoldOpen\.(add|delete|clear)\(/, "the renderer never writes the fold state");
+  const writers = (RENDER.match(/bgFoldOpen\.(add|delete|clear)\([^)]*\)/g) || []).sort();
+  assert.deepEqual(writers, ["bgFoldOpen.add(activeId)", "bgFoldOpen.add(id)", "bgFoldOpen.delete(id)"],
+    "the header toggle and the chip click, nothing else — a status-only frame that flips awaitingWhy re-renders through awaitKey and finds the fold as it was");
+  const key = RENDER.split("function awaitKey(")[1].split("\n}")[0];
+  assert.ok(key.includes("st.awaitingWhy") && key.includes("st.awaitingItems"), "the flip and the rows both re-render the box");
+  // …and the kernel ships the SAME rows in both states, so only the header changes on the flip
+  assert.match(KERNEL, /def _awaiting_live_rows\(sid, path, live\):/);
+  assert.match(KERNEL, /def _session_background_items\(sid, path\):/);
+  assert.match(KERNEL, /def _awaiting_items_payload\(aw, sid, path, tmux=None\):[\s\S]*?if aw:\s*\n\s*return list\(aw\.get\("items"\) or \[\]\)\s*\n\s*with _serve_live\(tmux\):\s*\n\s*return _session_background_items\(sid, path\)/,
+    "the wait's own rows, else everything in flight — read under the caller's snapshot (no fresh liveness read on the working path)");
+  assert.match(KERNEL, /def _awaiting_join_items\(agents, commands, watch\):/, "one concatenation for the idle read and the turn-agnostic read");
 });
 
 // --- vocabulary: the plain words everywhere, and no card moves --------------------------------------------

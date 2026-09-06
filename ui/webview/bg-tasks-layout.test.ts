@@ -1,5 +1,5 @@
 // Background-task box (the user 2026-07-07): ONE dedicated full-width rounded box just above the statusline.
-// The "N background tasks" header BAR sits at the TOP of the box; clicking it expands the list DOWNWARD
+// The one-line header BAR ("Awaiting …" idle / "In the background …" working) sits at the TOP of the box; clicking it expands the list DOWNWARD
 // beneath the header inside the SAME box (a normal flex-direction: column, reading top-to-bottom), so nothing
 // spills below the box — the earlier design let a shrink-1 box get squeezed and its rows clipped behind the
 // composer. It HOLDS its content (flex 0 0 auto), is capped so it never crowds the composer, and the inner

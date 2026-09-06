@@ -33,7 +33,7 @@ test("the chat pane names the peer: box in identity colour, pill with the colour
   assert.match(RENDER, /awaitingPeers\?: PeerIdent\[\] \| null;/, "the payload field beside awaitingKind");
   assert.match(RENDER, /type PeerIdent = \{ name: string; host\?: string; sid\?: string; color\?: \{ bg: string; fg: string \} \| null \};/,
     "named alias — the Status interface line stays brace-free for its other pins");
-  const boxAt = RENDER.indexOf("const awPeers = s!.status.awaitingPeers");
+  const boxAt = RENDER.indexOf("const awPeers = s.status.awaitingPeers");   // narrowed `s` since the one-renderer cut (2026-09-06)
   const box = RENDER.slice(boxAt, RENDER.indexOf("head.appendChild(lab);", boxAt));
   assert.match(box, /el\("span", "bg-await-peer"\)/);
   assert.match(box, /\(pr\.host \? pr\.host \+ ":" : ""\) \+ pr\.name/, "host-prefixed when cross-host");

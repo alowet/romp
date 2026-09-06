@@ -807,8 +807,9 @@ body.chat-theme-yatharth .tab.active.colored:not(.tab-blocked) {
 #bg-tasks { flex: 0 0 auto; min-height: 0; max-height: min(50vh, 340px); overflow: hidden;
   box-sizing: border-box; margin: 8px 10px 6px; border: 1px solid var(--box-border); border-radius: 8px;
   background: var(--box-bg); display: flex; flex-direction: column; }
-/* level 1: the header BAR at the top of the box ("N background tasks" / "Background task · name"). No own
-   border/radius — the box provides them; a bottom border appears when expanded, separating it from the list below. */
+/* level 1: the header BAR at the top of the box ("Awaiting 3 · 2 agents · 1 command" idle, "In the background ·
+   2 agents · 1 command" working — 2026-09-06). No own border/radius — the box provides them; a bottom border
+   appears when expanded, separating it from the list below. */
 .bg-fold-head { --bgt: var(--st-working-bg); flex: 0 0 auto; display: flex; align-items: center; gap: 7px;
   padding: 7px 11px; cursor: pointer; user-select: none; font-size: 12px; }
 .bg-fold-head.open { border-bottom: 1px solid var(--box-border); }
