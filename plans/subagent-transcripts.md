@@ -189,7 +189,14 @@ the card at all.
   Workflow dispatches, `commands` for run_in_background Bash and Monitor), and the armed watches
   (`watches`; label = the `--note`, else the clipped predicate, else `PR #N (repo)`). A background agent
   seen by BOTH the hook set and the task stream is one row (matched on agentId), wearing the launch's id
-  (Stop's handle), its description, and the earlier start. `_awaiting_from_items` derives the legacy
+  (Stop's handle), its description, and the earlier start. **The stream row's agentId is the lifecycle
+  task's own id** (`taskId` on every bgTasks row since 2026-09-06 — the CLI keys an Agent task by its
+  agent id), or the async ack's `agentId` on the transcript-scan path; the sidecar meta map is only a
+  fallback. Before that fix the stream rows carried no key at all (the ledger is Bash/Monitor-only and
+  records the ACTING agent; the meta map is keyed on the original launch's toolUseId, which a resumed
+  agent's task no longer carries), so each agent listed twice — once by type with the arrow, once as
+  "Running <description>" without it — and the chip counted both. Agent rows also drop the CLI's
+  "Running " prefix from the lifecycle description (`_agent_task_label`): the STATUS word already says it. `_awaiting_from_items` derives the legacy
   `kind` / `count` / `why` / `since` / `tasks` from the union: one kind present → that kind's legacy key
   and the sentence it always wore; several → kind `"mixed"`, count = every row, and a why that names
   each group ("waiting on 2 background agents, 1 background command and 1 armed watch"). The all(...)

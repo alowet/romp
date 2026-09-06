@@ -4826,10 +4826,13 @@ class SdkSession:
         self.backend._poke()
 
     def _live_bg_tasks(self) -> list:
-        """The background tasks running RIGHT NOW: [{"desc","type","since","toolUseId","lastTool"}], oldest
-        first. Copied under the lock, like _live_subagents."""
+        """The background tasks running RIGHT NOW: [{"desc","type","since","toolUseId","lastTool","taskId"}],
+        oldest first. Copied under the lock, like _live_subagents. `taskId` is the CLI's own lifecycle key —
+        for an Agent task that IS the agent id (see _on_task_event), which is how the kernel joins this row
+        to the SubagentStart hook's: without it the same agent listed twice in the Awaiting box, once by
+        type and once as "Running <description>" (2026-09-06)."""
         with self._sub_lock:
-            return sorted((dict(v) for v in self._bg_tasks.values()), key=lambda d: d.get("since") or 0)
+            return sorted(({**v, "taskId": k} for k, v in self._bg_tasks.items()), key=lambda d: d.get("since") or 0)
 
     # ---- snapshot for live_sessions() ----
 

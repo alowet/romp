@@ -17660,7 +17660,7 @@ def _session_awaiting(sid, path, idle, stamp=False):
         # story belongs to the judge's verdicts (see the docstring's 0.5 entry for the full rule).
         # A dispatched agent/workflow is an AGENT row even through the task stream; a shell command or
         # a Monitor is a COMMAND row. No collapse: two kinds present read as two groups, never "task".
-        is_agent = "agent" in (t.get("type") or "") or t.get("type") == "local_workflow"
+        is_agent = _bg_is_agent(t.get("type"))
         if not is_agent:
             commands.append(_awaiting_item("commands", t.get("tid") or "", t.get("desc") or "background command", t.get("t")))
             continue
@@ -17671,10 +17671,12 @@ def _session_awaiting(sid, path, idle, stamp=False):
         hit = seen_agent.get(str(aid)) if aid else None
         if hit is not None:
             # the SAME agent seen by the hook: one row, wearing the launch's id (Stop's handle), its
-            # description, and the earlier of the two start times
+            # description, and the earlier of the two start times (the launch's own time normally
+            # precedes the hook's stamp; until 2026-09-06 only a MISSING since was filled, so the later
+            # hook stamp won)
             hit["id"] = t.get("tid") or hit["id"]
             hit["label"] = t.get("desc") or hit["label"]
-            if t.get("t") and not hit.get("since"):
+            if t.get("t") and (not hit.get("since") or int(t["t"]) < hit["since"]):
                 hit["since"] = int(t["t"])
             continue
         agents.append(_awaiting_item("agents", t.get("tid") or "", t.get("desc") or "background agent", t.get("t"), agent_id=aid))
@@ -17743,12 +17745,36 @@ def _session_awaiting(sid, path, idle, stamp=False):
     return None
 
 
+def _bg_is_agent(kind):
+    """Is a task-stream / scan row a dispatched AGENT (Agent/Task or a Workflow run) rather than a shell
+    command or a Monitor? The one type test every bg-task consumer applies."""
+    return "agent" in (kind or "") or kind == "local_workflow"
+
+
+def _agent_task_label(desc, kind):
+    """The words a background AGENT row wears: the dispatch description alone. The CLI's task lifecycle
+    stream describes an Agent task as "Running <description>" — the STATUS word beside every row already
+    says running, so the prefix only doubled it (the user 2026-09-06, whose box read "Running Check…"
+    beside RUNNING). Stripped for agent rows only: a shell command's description is the user's own words,
+    and one that happens to start with "Running" must keep them."""
+    d = str(desc or "").strip()
+    if _bg_is_agent(kind) and d.startswith("Running "):
+        d = d[len("Running "):].strip()
+    return d
+
+
 def _bg_live_norm(sid, path):
-    """A session's LIVE background tasks, normalized to {tid, desc, t} across BOTH sources: the backend
-    snapshot's lifecycle set (source 0.5 — toolUseId/desc/since; a present-but-empty set is authoritative,
-    never overridden) or, for a live CLI carrying no lifecycle set (tmux; SDK mid-reattach), the
-    transcript's launch↔notification pairing ghost-gated by the CLI spawn stamp (source 0.75 — id/summary/
-    launch t). [] for a dormant session: its tasks died with its CLI."""
+    """A session's LIVE background tasks, normalized to {tid, desc, t, type} (+ agentId on agent rows)
+    across BOTH sources: the backend snapshot's lifecycle set (source 0.5 — toolUseId/desc/since; a
+    present-but-empty set is authoritative, never overridden) or, for a live CLI carrying no lifecycle set
+    (tmux; SDK mid-reattach), the transcript's launch↔notification pairing ghost-gated by the CLI spawn
+    stamp (source 0.75 — id/summary/launch t). [] for a dormant session: its tasks died with its CLI.
+    `agentId` is the agent's own id — the join key _session_awaiting uses to fold a stream row into the
+    SubagentStart hook's row for the same agent. It comes from the row's OWN record of the launch: the
+    lifecycle stream keys an Agent task by its agent id (`taskId`, probe-verified on 2.1.257), and the
+    transcript ack names it (`agentId`). Both are designed fields; the sidecar meta map is only the
+    fallback (its key is the ORIGINAL launch's toolUseId, which a resumed agent's task no longer carries —
+    the 2026-09-06 duplicate rows were exactly the agents that fallback could not resolve)."""
     live = _tmux_sessions().get(str(sid))
     if live is None:
         return []
@@ -17766,24 +17792,34 @@ def _bg_live_norm(sid, path):
         for t in live.get("bgTasks") or []:
             if not isinstance(t, dict):
                 continue
-            row = {"tid": t.get("toolUseId"), "desc": str(t.get("desc") or "").strip(),
-                   "t": int(t.get("since") or 0), "type": str(t.get("type") or "")}
+            kind = str(t.get("type") or "")
+            row = {"tid": t.get("toolUseId"), "desc": _agent_task_label(t.get("desc"), kind),
+                   "t": int(t.get("since") or 0), "type": kind}
             e = led.get(str(t.get("toolUseId")))
             if e and e.get("deadlineEpoch"):
                 row["deadline"] = float(e["deadlineEpoch"])
                 row["deadlineSrc"] = "hook"
-            if e and e.get("agentId"):
-                row["agentId"] = e["agentId"]
+            tid = str(t.get("taskId") or "")
+            if _bg_is_agent(kind) and _AGENT_ID_RE.match(tid):
+                row["agentId"] = tid       # the stream's own key for an Agent task is the agent's id
+            elif e and e.get("agentId"):
+                row["agentId"] = e["agentId"]   # the ledger's ACTING agent (a shell launched by a subagent)
             out.append(row)
         return [r for r in out if not em._bg_expired(r, time.time())]
     if not path:
         return []
     sp = _sdk_spawned_at(sid)
-    return [{"tid": tk.get("id"), "desc": str(tk.get("summary") or "").strip(), "t": int(tk.get("t") or 0),
-             "type": str(tk.get("type") or "")}
-            for tk in _bg_scan_cached(path)
-            if not (sp and tk.get("t") and tk["t"] < sp)
-            and not em._bg_expired(tk, time.time())]   # a monitor past its lifetime ceiling is not a live wait
+    out = []
+    for tk in _bg_scan_cached(path):
+        if (sp and tk.get("t") and tk["t"] < sp) or em._bg_expired(tk, time.time()):
+            continue                       # a ghost of the previous CLI / a monitor past its lifetime ceiling
+        kind = str(tk.get("type") or "")
+        row = {"tid": tk.get("id"), "desc": _agent_task_label(tk.get("summary"), kind),
+               "t": int(tk.get("t") or 0), "type": kind}
+        if tk.get("agentId"):
+            row["agentId"] = str(tk["agentId"])   # the async ack names the agent (em._scan_bg_tasks)
+        out.append(row)
+    return out
 
 
 def _bg_pending(sid, path, tasks):

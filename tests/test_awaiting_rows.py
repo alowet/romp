@@ -89,8 +89,10 @@ class AwaitingRows(unittest.TestCase):
             {"tid": "tu_agent1", "desc": "map the parser", "t": 95, "type": "local_agent", "agentId": AID}]
         aw = km._session_awaiting(SID, "/tmp/x", True)
         self.assertEqual((aw["kind"], aw["count"]), ("agents", 1))
+        # pin changed 2026-09-06: the joined row's since is the EARLIER of the hook's start and the launch's
+        # own time (the design said so; the code only ever filled a MISSING since, so the later hook stamp won)
         self.assertEqual(aw["items"], [{"kind": "agents", "id": "tu_agent1", "label": "map the parser",
-                                        "since": 100, "agentId": AID}])
+                                        "since": 95, "agentId": AID}])
         self.assertEqual(aw["why"], "1 background agent still working")
 
     # ---- single-kind sentences (byte-identical to the pre-rows whys where the word did not change) ----

@@ -58,6 +58,21 @@ class AwaitingCount(unittest.TestCase):
         self.assertEqual(aw["count"], 3)
         self.assertIn("3 background agents", aw["why"])
 
+    def test_an_agent_seen_by_the_hook_and_the_stream_counts_once(self):
+        # 2026-09-06: two agents + one shell command read "Awaiting 5 · 4 agents · 1 command" because the
+        # hook row and the stream row for the same agent were never joined — the count is per awaited THING
+        a1, a2 = "a1111111111111111", "a2222222222222222"
+        km._tmux_sessions = lambda: {SID: {"subagents": [{"type": "general-purpose", "since": 100, "agentId": a1},
+                                                         {"type": "general-purpose", "since": 105, "agentId": a2}]}}
+        km._bg_live_norm = lambda sid, path: [
+            {"tid": "toolu_01", "desc": "check the exporter", "t": 98, "type": "local_agent", "agentId": a1},
+            {"tid": "toolu_02", "desc": "rerun the harness", "t": 104, "type": "local_agent", "agentId": a2},
+            {"tid": "toolu_03", "desc": "build the docs", "t": 110, "type": "local_bash"}]
+        km._bg_pending = lambda sid, path, ts: ts
+        aw = km._session_awaiting(SID, "/tmp/x", True)
+        self.assertEqual((aw["kind"], aw["count"]), ("mixed", 3))
+        self.assertEqual(aw["why"], "waiting on 2 background agents and 1 background command")
+
     def test_pending_tasks_count_the_pending_ones(self):
         tasks = [{"tid": "1", "desc": "watching CI", "t": 7, "type": "bash"},
                  {"tid": "2", "desc": "polling deploy", "t": 3, "type": "bash"}]

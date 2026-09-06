@@ -488,6 +488,99 @@ class DurableAwaitingSource(unittest.TestCase):
             os.unlink(path)
 
 
+class OneRowPerAgentAcrossTheHookAndTheStream(unittest.TestCase):
+    """A background agent is reported TWICE to _session_awaiting: by the SubagentStart hook set (source 0:
+    {type, since, agentId}) and by the CLI's task lifecycle stream (source 0.5: the bgTasks mirror, whose
+    rows carry the launch's toolUseId and the CLI's own description). The slice-2 join matched them on
+    agentId — but the stream rows never carried one: _live_bg_tasks dropped the lifecycle task_id (which IS
+    the agent id for an Agent task, probe-verified on 2.1.257 and already relied on by _on_task_event), the
+    launch ledger records Bash/Monitor only (its agentId is the ACTING agent), and the sidecar meta map is
+    keyed on the ORIGINAL launch's toolUseId, which a resumed agent's task no longer carries. Seen live on
+    2026-09-06: two agents and a shell command read "Awaiting 5 · 4 agents · 1 command" — each agent once by
+    type (with the open-transcript arrow) and once as "Running <description>" (no arrow). The join key is
+    the stream's own task_id (`taskId` on every bgTasks row), and an agent row's label is the dispatch
+    description with the CLI's "Running " prefix stripped (the STATUS word already says running).
+    SYNTHETIC: placeholder sid, invented agent ids and descriptions (the notes-api demo domain)."""
+    SID = "11111111-2222-3333-4444-555555555555"
+    A1, A2 = "a1111111111111111", "a2222222222222222"
+
+    def setUp(self):
+        self._saved = (km._tmux_sessions, km._sdk_spawned_at, km._states_awaiting_overlay, km._bg_pending)
+        km._sdk_spawned_at = lambda sid: None
+        km._states_awaiting_overlay = lambda sid: None
+        km._bg_pending = lambda sid, path, tasks: tasks     # nothing placed yet: every live row is pending
+
+    def tearDown(self):
+        km._tmux_sessions, km._sdk_spawned_at, km._states_awaiting_overlay, km._bg_pending = self._saved
+
+    def _snap(self, subs, tasks):
+        km._tmux_sessions = lambda: {self.SID: {"subagents": subs, "bgTasks": tasks}}
+
+    def test_two_agents_seen_by_both_sources_and_a_shell_command_are_three_rows(self):
+        # the live defect, reproduced on the REAL _bg_live_norm: hook rows (type-labelled) + stream rows
+        # (the same two agents, the CLI's "Running <description>" wording, toolUseIds) + one shell task
+        self._snap([{"type": "general-purpose", "since": 100, "agentId": self.A1},
+                    {"type": "general-purpose", "since": 105, "agentId": self.A2}],
+                   [{"toolUseId": "toolu_01", "taskId": self.A1, "type": "local_agent", "since": 98,
+                     "desc": "Running Check the exporter for banned words", "lastTool": ""},
+                    {"toolUseId": "toolu_02", "taskId": self.A2, "type": "local_agent", "since": 104,
+                     "desc": "Running Rerun the notes-api harness", "lastTool": ""},
+                    {"toolUseId": "toolu_03", "taskId": "b3333", "type": "local_bash", "since": 110,
+                     "desc": "build the docs site", "lastTool": ""}])
+        aw = km._session_awaiting(self.SID, None, True)
+        self.assertEqual(aw["count"], 3, "one row per awaited thing — the same agent is never counted twice: %r" % aw["items"])
+        self.assertEqual([it["kind"] for it in aw["items"]], ["agents", "agents", "commands"])
+        self.assertEqual([it["label"] for it in aw["items"]],
+                         ["Check the exporter for banned words", "Rerun the notes-api harness", "build the docs site"],
+                         "the dispatch description, never the agent type and never the CLI's 'Running ' prefix")
+        self.assertEqual([it.get("agentId") for it in aw["items"]], [self.A1, self.A2, None],
+                         "every joined agent row keeps its agentId (the open-transcript arrow)")
+        self.assertEqual([it["id"] for it in aw["items"]], ["toolu_01", "toolu_02", "toolu_03"],
+                         "a joined row wears the launch's toolUseId — Stop's handle")
+        self.assertEqual([it["since"] for it in aw["items"]], [98, 104, 110], "the earlier of the two starts")
+        self.assertEqual((aw["kind"], aw["why"]), ("mixed", "waiting on 2 background agents and 1 background command"))
+        self.assertEqual(aw["tasks"], ["Check the exporter for banned words", "Rerun the notes-api harness", "build the docs site"])
+
+    def test_a_live_agent_the_stream_has_not_seen_keeps_its_type_as_the_label(self):
+        self._snap([{"type": "explore", "since": 100, "agentId": self.A1}], [])
+        aw = km._session_awaiting(self.SID, None, True)
+        self.assertEqual([(it["kind"], it["label"], it.get("agentId"), it["id"]) for it in aw["items"]],
+                         [("agents", "explore", self.A1, self.A1)])
+        self.assertEqual(aw["count"], 1)
+
+    def test_a_stream_agent_with_no_hook_row_is_one_row_by_description(self):
+        self._snap([], [{"toolUseId": "toolu_01", "taskId": self.A1, "type": "local_agent", "since": 98,
+                         "desc": "Running Check the exporter for banned words", "lastTool": ""}])
+        aw = km._session_awaiting(self.SID, None, True)
+        self.assertEqual([(it["kind"], it["label"], it.get("agentId"), it["id"]) for it in aw["items"]],
+                         [("agents", "Check the exporter for banned words", self.A1, "toolu_01")])
+        self.assertEqual(aw["count"], 1)
+
+    def test_the_stream_row_carries_the_agent_id_and_the_plain_description(self):
+        # the normalized row itself, so every reader of _bg_live_norm (the chip's awaitingTasks, the
+        # feed pill, the nudge gates) sees one vocabulary
+        self._snap([], [{"toolUseId": "toolu_01", "taskId": self.A1, "type": "local_agent", "since": 98,
+                         "desc": "Running Check the exporter for banned words", "lastTool": ""},
+                        {"toolUseId": "toolu_03", "taskId": "b3333", "type": "local_bash", "since": 110,
+                         "desc": "Running the docs build", "lastTool": ""}])
+        rows = km._bg_live_norm(self.SID, None)
+        self.assertEqual([(r["tid"], r.get("agentId"), r["desc"]) for r in rows],
+                         [("toolu_01", self.A1, "Check the exporter for banned words"),
+                          ("toolu_03", None, "Running the docs build")],
+                         "only an AGENT row's desc wears the CLI's prefix; a shell task's description is the user's own words")
+
+    def test_the_transcript_scan_path_carries_the_acks_agent_id(self):
+        # source 0.75 (a live CLI with no lifecycle set — tmux): the async ack names the agent; the row
+        # must carry it so the same join works there
+        path = _write([_agent_tool_use(tid="tu_agent1", desc="Map the parser"), _agent_launch(tid="tu_agent1")])
+        km._tmux_sessions = lambda: {self.SID: {"name": "web"}}
+        try:
+            rows = km._bg_live_norm(self.SID, path)
+        finally:
+            os.unlink(path)
+        self.assertEqual([(r["tid"], r.get("agentId"), r["desc"]) for r in rows], [("tu_agent1", "a1", "Map the parser")])
+
+
 class AgentTasksAreNeverServices(unittest.TestCase):
     """_bg_split (the user 2026-07-27): a dispatched AGENT is work the session waits on by construction,
     never furniture — only shell tasks can be classified as services. A background agent was riding the

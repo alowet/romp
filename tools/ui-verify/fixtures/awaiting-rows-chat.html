@@ -4,6 +4,10 @@
      open-transcript arrow + Stop, the command row's Stop + fold caret, the watch row's Cancel), and the
      statusline beneath it with the Awaiting chip as a BUTTON reading "Awaiting 4". Invented content
      (notes-api demo domain), the DOM class for class as renderAwaitWhy / bgRow / updateStatusline emit it.
+     The two agent rows are the JOINED shape (2026-09-06): each background agent is reported by both the
+     SubagentStart hook and the CLI's task stream, and shows ONCE — labelled by its dispatch description
+     (no agent type, no "Running " prefix: the status word beside it already says running), with the
+     open-transcript arrow. Before the join the same box listed four agent rows for these two.
        tools/ui-verify/shot.sh --css ui/webview/styles.css --body tools/ui-verify/fixtures/awaiting-rows-chat.html \
            --out /tmp/awaiting-shots/chat-dark.png --size 760x540 --extra-css 'body{background:var(--bg);padding-top:10px}'
        …and with --body-class "theme-light chat-theme-<name>" for the light theme. The height matters: the
