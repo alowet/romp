@@ -8387,8 +8387,12 @@ def _list_dir(raw, sid=None, hidden=False, limit=DIR_LIST_MAX):
                 row = {"name": e.name, "isDir": is_dir, "isLink": is_link,
                        "size": 0 if is_dir else size, "mtime": mtime}
                 if not is_dir:
-                    row["viewable"] = bool(_PREVIEW_MIME.get(os.path.splitext(e.name)[1].lower())) \
-                        or _is_text_path(e.name)
+                    # SIZE-AWARE (2026-09-06): the same caps /file applies, so a row the view route would 413
+                    # is download-only up front — a PDF opens in its own tab now, and an oversize one would
+                    # otherwise land that tab on the refusal instead of the viewer that offered the save
+                    _m = _PREVIEW_MIME.get(os.path.splitext(e.name)[1].lower())
+                    row["viewable"] = (bool(_m) and size <= _PREVIEW_MAX_BYTES) \
+                        or (not _m and _is_text_path(e.name) and size <= _TEXT_MAX_BYTES)
                 (dirs if is_dir else files).append(row)
     except OSError as ex:
         return dict(err_ctx,
@@ -30141,16 +30145,43 @@ _TEXT_MAX_BYTES = 2 * 1024 * 1024                # 2 MB of source is already pas
 _DOWNLOAD_CHUNK = 256 * 1024                     # fixed stream chunk: bounded memory whatever the file size
 
 
-def _attachment_disposition(name):
-    """Content-Disposition for the download path. The basename lands inside a quoted-string, so anything
-    that could terminate or extend the HEADER is replaced: CR/LF (header injection), the quote and the
-    backslash (quoted-string escapes), other control bytes. A name the ASCII form had to mangle also
-    rides the RFC 6266/5987 `filename*` form, so a browser that speaks it saves the real name."""
+def _attachment_disposition(name, kind="attachment"):
+    """Content-Disposition for the download path — and, with kind="inline", for a PDF served to its own
+    browser tab (the tab's title and a Save's name come from it; 2026-09-06). The basename lands inside a
+    quoted-string, so anything that could terminate or extend the HEADER is replaced: CR/LF (header
+    injection), the quote and the backslash (quoted-string escapes), other control bytes. A name the
+    ASCII form had to mangle also rides the RFC 6266/5987 `filename*` form, so a browser that speaks it
+    saves the real name."""
     safe = "".join(c if " " <= c < "\x7f" and c not in '"\\' else "_" for c in name) or "download"
-    disp = 'attachment; filename="%s"' % safe
+    disp = '%s; filename="%s"' % (kind, safe)
     if safe != name:
         disp += "; filename*=UTF-8''" + quote(name, safe="")
     return disp
+
+
+def _html_esc(s):
+    """The five characters HTML gives meaning to, escaped — for the one static page /file renders."""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&#39;"))
+
+
+def _too_large_page(msg, name, q, route="/file"):
+    """The 413 a PDF's OWN TAB shows (2026-09-06): the same sentence the text form carries, plus the way
+    out — a link to the download half of the SAME route (`route`: /file, or a federated session's
+    /remote/<host>/file relay) for the same path and sid. Same-origin, so the cookie rides the download
+    exactly as it rode the view. Built from the parsed query, never the raw request line, and every value
+    is escaped; the page has no script and inherits _send's nosniff."""
+    dq = {"path": (q.get("path") or [""])[0], "download": "1"}
+    sid = (q.get("sid") or [""])[0]
+    if sid:
+        dq["sid"] = sid
+    href = route + "?" + urlencode(dq)
+    return ("<!doctype html><html><head><meta charset=\"utf-8\"><title>%s</title>"
+            "<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
+            "background:#1e1e1e;color:#cccccc;font:15px/1.5 system-ui,sans-serif}main{max-width:40em;padding:2em}"
+            "a{color:#9cd2ff}</style></head><body><main><p>%s</p>"
+            "<p><a href=\"%s\" download=\"%s\">Download %s</a> instead.</p></main></body></html>"
+            % (_html_esc(name), _html_esc(msg), _html_esc(href), _html_esc(name), _html_esc(name)))
 
 
 def _is_text_path(fp):
@@ -36595,10 +36626,18 @@ class Handler(BaseHTTPRequestHandler):
         size = os.path.getsize(fp)
         cap = _TEXT_MAX_BYTES if text else _PREVIEW_MAX_BYTES
         if size > cap:
-            return self._send(413, b"" if head else
-                              "too large to show: %s (%s, limit %s)"
-                              % (_tilde(fp), _human_bytes(size), _human_bytes(cap)),
-                              "text/plain")
+            msg = "too large to show: %s (%s, limit %s)" % (_tilde(fp), _human_bytes(size), _human_bytes(cap))
+            if not head and mime == "application/pdf" and self._is_navigation():
+                # A PDF opens in its OWN TAB now (preview.ts openPdfTab, 2026-09-06), decided by extension
+                # inside the click — so an oversize one lands its whole tab on this refusal, with no viewer
+                # around it to offer the Download button the in-pane path used to (review find). A refusal
+                # to RENDER is never a dead end: the tab itself gets the sentence and the way out — a link to
+                # the download half of this very route. Only a top-level navigation (Sec-Fetch-Dest:
+                # document) gets the page; the viewer's fetch and the card's HEAD probe keep the plain text
+                # they parse. Static markup, every value escaped, no script — nosniff rides as always.
+                return self._send(413, _too_large_page(msg, os.path.basename(fp), q), "text/html; charset=utf-8",
+                                  cache="no-cache")
+            return self._send(413, b"" if head else msg, "text/plain")
         # The file's mtime rides every success twice: Last-Modified (the standard form) and
         # X-Romp-Mtime-Ns — NANOSECONDS, the anchor saveFile's conflict floor actually compares,
         # because the HTTP date's whole seconds let an agent write landing in the same second slip
@@ -36612,6 +36651,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(size))   # the real length, no body (HEAD semantics)
             self.send_header("Last-Modified", lastmod)
             self.send_header("X-Romp-Mtime-Ns", mtime_ns)
+            if mime == "application/pdf":                     # the probe agrees with the GET (below) on the tab's name
+                self.send_header("Content-Disposition", _attachment_disposition(os.path.basename(fp), kind="inline"))
             self.send_header("X-Content-Type-Options", "nosniff")   # _send's guarantee, restated on the HEAD path
             self.send_header("Cache-Control", "no-cache")
             if getattr(self, "_cors_origin", None):         # the chat's fetch-HEAD probe rides CORS too
@@ -36667,8 +36708,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, body, mime, cache="no-cache",
                               headers={"Last-Modified": lastmod, "X-Romp-Mtime-Ns": mtime_ns,
                                        "X-Romp-Text-Utf8": u8})
-        return self._send(200, raw, mime, cache="no-cache",
-                          headers={"Last-Modified": lastmod, "X-Romp-Mtime-Ns": mtime_ns})
+        extra = {"Last-Modified": lastmod, "X-Romp-Mtime-Ns": mtime_ns}
+        if mime == "application/pdf":
+            # INLINE, with the file's name (2026-09-06): a PDF opens in its own browser tab now (preview.ts
+            # openPdfTab), and the browser titles that tab and names a Save from this header — without it
+            # the tab reads as the route's name and a save lands as file.pdf. inline, never attachment: the
+            # tab must RENDER it, not download it. Images get none: an <img> reads no disposition.
+            extra["Content-Disposition"] = _attachment_disposition(os.path.basename(fp), kind="inline")
+        return self._send(200, raw, mime, cache="no-cache", headers=extra)
+
+    def _is_navigation(self):
+        """Is this request a browser NAVIGATING a tab to the URL (Sec-Fetch-Dest: document), as opposed to
+        a fetch, an <img>/<iframe> load or a HEAD probe? Every current browser sends the header on
+        same-origin requests; its absence reads as "not a navigation", the conservative answer."""
+        return ((getattr(self, "headers", None) or {}).get("Sec-Fetch-Dest") or "").strip().lower() == "document"
 
     def _file_download(self, fp, head=False):
         """GET/HEAD /file?download=1 — the SAVE half of the route (the user 2026-08-09): any file that
@@ -39485,6 +39538,22 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         if len(body) > _PREVIEW_MAX_BYTES:       # backstop only — the remote's own cap 413s long before this
             return self._send(413, b"" if head else "too large to preview", "text/plain")
+        if status not in (200, 206):
+            # The remote's non-success verdict (404 / 413 / 415 / 502…) is PROSE from its own _file_preview,
+            # never file bytes — label it as such. It used to ride out under OUR media mime, which an <img>
+            # or the lightbox iframe merely failed on; a PDF opens in its own TAB now (2026-09-06), and a
+            # tab handed prose labelled application/pdf shows a corrupt-PDF error instead of the sentence
+            # (skeptic find). An oversize PDF navigated to gets the same way-out page the local route
+            # serves, linking THIS relay's download half — the remote never sees Sec-Fetch-Dest, so the
+            # decision is made here. Body only; the remote's own headers are not mirrored on this arm.
+            if head:
+                return self._send(status, b"", "text/plain")
+            if status == 413 and mime == "application/pdf" and self._is_navigation():
+                return self._send(413, _too_large_page(_decode_text(body) or "too large to show",
+                                                       os.path.basename(rp), q,
+                                                       route="/remote/%s/file" % quote(host, safe="")),
+                                  "text/html; charset=utf-8", cache="no-cache")
+            return self._send(status, body, "text/plain", cache="no-cache")
         if head:
             # mirror _file_preview's HEAD: the remote's verdict + real length, no body
             self.send_response(status)
@@ -39495,6 +39564,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Last-Modified", lastmod)
             if r_ns:
                 self.send_header("X-Romp-Mtime-Ns", r_ns)
+            if status == 200 and mime == "application/pdf":   # the tab's name — OURS, from the requested path
+                self.send_header("Content-Disposition", _attachment_disposition(os.path.basename(rp), kind="inline"))
             self.send_header("X-Content-Type-Options", "nosniff")   # _send's guarantee, restated on the HEAD path
             self.send_header("Cache-Control", "no-cache")
             if getattr(self, "_cors_origin", None):
@@ -39524,6 +39595,11 @@ class Handler(BaseHTTPRequestHandler):
         # and the Edit gate ride on them, and deriving them locally would lie about a remote disk.
         mirrored = {k: v for k, v in (("Last-Modified", lastmod), ("X-Romp-Mtime-Ns", r_ns),
                                       ("X-Romp-Text-Utf8", r_u8)) if v}
+        if status == 200 and mime == "application/pdf":
+            # A remote session's PDF opens in its own tab too (2026-09-06): the tab's title and a Save's name
+            # come from this header — derived HERE from the requested basename, like the Content-Type, never
+            # mirrored: a remote's disposition is an instruction to this browser, not a fact about its disk.
+            mirrored["Content-Disposition"] = _attachment_disposition(os.path.basename(rp), kind="inline")
         return self._send(status, body, ctype, cache="no-cache", headers=mirrored or None)
 
     def _relay_download(self, host, port, rtok, q, head=False):

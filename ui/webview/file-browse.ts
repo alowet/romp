@@ -362,7 +362,7 @@ function onListing(m: DirListing): void {
       if (dlOnly) row.classList.add("fb-dlonly");
       row.title = p + (en.isLink ? "  ·  symlink" : "")
         + "  ·  " + new Date(en.mtime * 1000).toLocaleString()
-        + (dlOnly ? "  ·  not viewable in the browser — click downloads it" : "");
+        + (dlOnly ? "  ·  opens as a download (not viewable in the browser, or too large to show)" : "");
       const sz = el("span", "fb-size");
       sz.textContent = (dlOnly ? "⤓ " : "") + human(en.size);
       row.appendChild(nm); row.appendChild(sz);

@@ -40,6 +40,7 @@ km = SourceFileLoader("romp_kernel", os.path.join(BIN, "romp-kernel")).load_modu
 
 REMOTE_TOKEN = "remote-token-DO-NOT-USE"
 PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-png-bytes"
+PDF_BYTES = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"   # a minimal synthetic PDF
 PY_BYTES = b"print('hello from the remote box')\n"
 # the download fixture: NUL-ridden, off every view allowlist, and BIGGER than one relay stream chunk,
 # so the pass-through provably crosses a chunk boundary intact
@@ -79,6 +80,27 @@ class _FakeRemoteFileHandler(BaseHTTPRequestHandler):
             self.end_headers()
             if not head:
                 self.wfile.write(PY_BYTES)
+            return
+        if "big.pdf" in self.path:
+            # the remote's own size cap: its _file_preview's prose verdict, text/plain, no disposition
+            body = b"too large to show: /tmp/big.pdf (95.4 MB, limit 47.7 MB)"
+            self.send_response(413)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if not head:
+                self.wfile.write(body)
+            return
+        if "paper.pdf" in self.path:
+            # a (hostile) remote's own disposition — an instruction to this browser, which the relay must
+            # never echo: ours is derived from the requested name
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Disposition", 'attachment; filename="evil.pdf"')
+            self.send_header("Content-Length", str(len(PDF_BYTES)))
+            self.end_headers()
+            if not head:
+                self.wfile.write(PDF_BYTES)
             return
         if "plot.png" not in self.path:
             body = b"not found: /tmp/gone" if "download=1" in self.path else b""
@@ -190,6 +212,60 @@ class RemoteFileRelay(unittest.TestCase):
         self.assertNotIn(km.TOKEN, req)
         self.assertIn("path=%2Ftmp%2Fplot.png", req)
         self.assertIn("sid=11111111-2222-3333-4444-555555555555", req)
+
+    def test_a_remote_pdf_is_served_inline_with_its_own_name_derived_here_never_the_remotes(self):
+        # a remote session's PDF opens in its own browser tab too (2026-09-06): the tab's title and a Save's
+        # name ride Content-Disposition, which the local route sends — so the relay must as well, from the
+        # REQUESTED basename, on GET and on the HEAD probe. The remote's header is discarded like its
+        # Content-Type: an instruction to this browser, not a fact about its disk.
+        self._register("gpu1", self.fake.server_address[1])
+        for method in ("GET", "HEAD"):
+            status, body, headers = self._get("/remote/gpu1/file?path=%2Ftmp%2Fpaper.pdf", method=method)
+            self.assertEqual(status, 200, method)
+            self.assertEqual(headers.get("Content-Type"), "application/pdf")
+            self.assertEqual(headers.get("Content-Disposition"), 'inline; filename="paper.pdf"', method)
+            self.assertNotIn("evil", headers.get("Content-Disposition") or "")
+            self.assertEqual(body, PDF_BYTES if method == "GET" else b"")
+        # a remote 404 for a .pdf name carries no disposition — there is no file to name
+        status, _, headers = self._get("/remote/gpu1/file?path=%2Ftmp%2Fgone.pdf")
+        self.assertEqual(status, 404)
+        self.assertIsNone(headers.get("Content-Disposition"))
+        # …and an image never gets one, exactly as locally
+        status, _, headers = self._get("/remote/gpu1/file?path=%2Ftmp%2Fplot.png")
+        self.assertEqual(status, 200)
+        self.assertIsNone(headers.get("Content-Disposition"))
+
+    def test_a_remote_error_verdict_is_prose_and_an_oversize_pdf_tab_gets_the_relays_own_way_out(self):
+        # a PDF opens in its own TAB now (2026-09-06): the remote's 413/404 prose used to come back labelled
+        # with OUR media mime, which an <img> merely failed on but a tab shows as a corrupt-PDF error
+        # (skeptic find). Every non-success verdict is text/plain; a navigation to an oversize PDF gets the
+        # same way-out page the local route serves, linking THIS relay's download half.
+        self._register("gpu1", self.fake.server_address[1])
+        sid = "11111111-2222-3333-4444-555555555555"
+        qp = "/remote/gpu1/file?path=%2Ftmp%2Fbig.pdf&sid=" + sid
+        req = urllib.request.Request("http://127.0.0.1:%d%s" % (self.port, qp),
+                                     headers={"X-Romp-Token": km.TOKEN, "Sec-Fetch-Dest": "document"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                status, body, headers = r.status, r.read(), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            status, body, headers = e.code, e.read(), dict(e.headers)
+        self.assertEqual(status, 413)
+        self.assertTrue(headers.get("Content-Type", "").startswith("text/html"), headers.get("Content-Type"))
+        page = body.decode("utf-8")
+        self.assertIn("too large to show: /tmp/big.pdf", page)
+        dq = urllib.parse.urlencode({"path": "/tmp/big.pdf", "download": "1", "sid": sid})
+        self.assertIn('href="' + km._html_esc("/remote/gpu1/file?" + dq) + '"', page, "the relay's download half")
+        # the same without the navigation marker: the remote's prose, labelled as prose
+        status, body, headers = self._get(qp)
+        self.assertEqual(status, 413)
+        self.assertEqual(headers.get("Content-Type"), "text/plain")
+        self.assertTrue(body.startswith(b"too large to show:"), body[:40])
+        status, body, headers = self._get(qp, method="HEAD")
+        self.assertEqual((status, body, headers.get("Content-Type")), (413, b"", "text/plain"))
+        # a remote 404 for a .pdf name: prose too, never application/pdf
+        status, body, headers = self._get("/remote/gpu1/file?path=%2Ftmp%2Fgone.pdf")
+        self.assertEqual((status, headers.get("Content-Type")), (404, "text/plain"))
 
     def test_head_relays_the_verdict_without_a_body(self):
         # the PDF chip's existence probe: headers only, the remote's real length

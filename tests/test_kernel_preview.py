@@ -70,9 +70,9 @@ class FilePreviewEndpoint(unittest.TestCase):
         cls.srv.shutdown()
         cls.tmp.cleanup()
 
-    def _req(self, path, method="GET"):
+    def _req(self, path, method="GET", headers=None):
         url = "http://127.0.0.1:%d%s%stoken=%s" % (self.port, path, "&" if "?" in path else "?", TOKEN)
-        req = urllib.request.Request(url, method=method)
+        req = urllib.request.Request(url, method=method, headers=headers or {})
         try:
             with urllib.request.urlopen(req, timeout=3) as r:
                 return r.status, dict(r.headers), r.read()
@@ -84,6 +84,64 @@ class FilePreviewEndpoint(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(hdrs.get("Content-Type"), "image/png")
         self.assertEqual(body, PNG)
+
+    def test_a_pdf_is_served_inline_with_its_name_so_its_own_tab_is_titled_and_a_save_names_it(self):
+        # a PDF opens in its OWN browser tab now (ui/webview/preview.ts openPdfTab, the user 2026-09-06);
+        # the browser titles that tab and names a Save from Content-Disposition — inline, never
+        # attachment, so the tab renders it instead of downloading. Images carry none: an <img> reads
+        # no disposition, and the header set they always had stays byte-for-byte.
+        code, hdrs, _ = self._req("/file?path=" + urllib.parse.quote(self.pdf))
+        self.assertEqual(code, 200)
+        self.assertEqual(hdrs.get("Content-Type"), "application/pdf")
+        self.assertEqual(hdrs.get("Content-Disposition"), 'inline; filename="report.pdf"')
+        code, hdrs, body = self._req("/file?path=" + urllib.parse.quote(self.pdf), method="HEAD")
+        self.assertEqual(code, 200)
+        self.assertEqual(hdrs.get("Content-Disposition"), 'inline; filename="report.pdf"', "the probe agrees")
+        self.assertEqual(body, b"")
+        for p in (self.png, self.svg):
+            code, hdrs, _ = self._req("/file?path=" + urllib.parse.quote(p))
+            self.assertEqual(code, 200)
+            self.assertIsNone(hdrs.get("Content-Disposition"), p)
+
+    def test_an_oversize_pdf_navigated_to_in_its_own_tab_gets_a_page_with_the_download_as_the_way_out(self):
+        # a PDF opens in its own tab now, decided by extension inside the click — so a PDF over the cap lands
+        # its whole tab on the 413, with no viewer around it to offer the Download button the in-pane path
+        # used to (review find 2026-09-06). A refusal to render is never a dead end: a NAVIGATION
+        # (Sec-Fetch-Dest: document) gets a page with the sentence and a link to the download half; a fetch,
+        # an <iframe>/<img> load or a HEAD probe keeps the plain text they parse.
+        big = os.path.join(self.tmp.name, "thesis <draft> & \"final\".pdf")
+        with open(big, "wb") as f:
+            f.truncate(km._PREVIEW_MAX_BYTES + 1)           # sparse: no bytes written, the cap is on st_size
+        try:
+            sid = "11111111-2222-3333-4444-555555555555"
+            qp = "/file?path=" + urllib.parse.quote(big) + "&sid=" + sid
+            code, hdrs, body = self._req(qp, headers={"Sec-Fetch-Dest": "document"})
+            self.assertEqual(code, 413)
+            self.assertTrue(hdrs.get("Content-Type", "").startswith("text/html"), hdrs.get("Content-Type"))
+            self.assertEqual(hdrs.get("X-Content-Type-Options"), "nosniff")
+            page = body.decode("utf-8")
+            self.assertIn("too large to show:", page)
+            self.assertNotIn("<draft>", page, "the path is escaped — it names a file, never markup")
+            self.assertIn("&lt;draft&gt; &amp; &quot;final&quot;.pdf", page)
+            dq = urllib.parse.urlencode({"path": big, "download": "1", "sid": sid})
+            self.assertIn('href="' + km._html_esc("/file?" + dq) + '"', page, "the way out: this route's download half, same path and sid")
+            self.assertNotIn("<script", page.lower())
+            # the same request without the navigation marker: the plain text the viewer's catch parses, unchanged
+            code, hdrs, body = self._req(qp)
+            self.assertEqual(code, 413)
+            self.assertEqual(hdrs.get("Content-Type"), "text/plain")
+            self.assertTrue(body.startswith(b"too large to show:"), body[:40])
+            code, hdrs, body = self._req(qp, method="HEAD", headers={"Sec-Fetch-Dest": "document"})
+            self.assertEqual((code, body), (413, b""), "a HEAD carries the verdict, never a page")
+            # an oversize IMAGE navigated to keeps the text — only a PDF opens in its own tab
+            bigpng = os.path.join(self.tmp.name, "huge.png")
+            with open(bigpng, "wb") as f:
+                f.truncate(km._PREVIEW_MAX_BYTES + 1)
+            code, hdrs, _ = self._req("/file?path=" + urllib.parse.quote(bigpng), headers={"Sec-Fetch-Dest": "document"})
+            self.assertEqual((code, hdrs.get("Content-Type")), (413, "text/plain"))
+            os.unlink(bigpng)
+        finally:
+            os.unlink(big)
 
     def test_a_media_200_carries_its_mime_and_no_text_utf8_marker(self):
         # The viewer's media branches (ui/webview/file-view.ts) key on exactly this contract: a media
@@ -207,9 +265,9 @@ class FileDownloadEndpoint(unittest.TestCase):
         cls.srv.shutdown()
         cls.tmp.cleanup()
 
-    def _req(self, path, method="GET"):
+    def _req(self, path, method="GET", headers=None):
         url = "http://127.0.0.1:%d%s%stoken=%s" % (self.port, path, "&" if "?" in path else "?", TOKEN)
-        req = urllib.request.Request(url, method=method)
+        req = urllib.request.Request(url, method=method, headers=headers or {})
         try:
             with urllib.request.urlopen(req, timeout=5) as r:
                 return r.status, dict(r.headers), r.read()
