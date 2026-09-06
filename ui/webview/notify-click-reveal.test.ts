@@ -35,3 +35,26 @@ test("revealCard unfolds a collapsed thread before looking for the card (no sile
   // and the existing fallback stands: a card gone from the feed still opens its session
   assert.match(SRC, /\} else if \(m\.sid\) \{\n      vscodeApi\?\.postMessage\(\{ type: "openSession", id: String\(m\.sid\) \}\);/);
 });
+
+const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
+
+test("a reveal outranks the persisted-tab restore: the focus handler retires wantActive", () => {
+  // the federated cold start (the user 2026-09-06, on the phone): the kernel parks the tap's focus
+  // and delivers it on the chat pane's ready — BEFORE any remote host has relayed its sessions. The
+  // focus sets the active tab; then the persisted tab (a remote one, arriving later over its own
+  // socket) matched wantActive and setActive'd itself over the reveal. An explicit reveal is newer
+  // information than a restore of where the page last was.
+  const focusBlock = (RENDER.match(/else if \(m\.type === "focus"\) \{[\s\S]*?\n  \}/) || [""])[0];
+  assert.ok(focusBlock.length > 100, "found the focus handler");
+  assert.match(focusBlock, /\n    wantActive = null;/);
+  // …and the restore itself is still the one-shot it was: consumed on arrival, or retired here
+  assert.match(RENDER, /if \(wantActive && msg\.id === wantActive\) \{ wantActive = null; setActive\(msg\.id\); \}/);
+});
+
+test("a focus on a federated session its host has not relayed yet shows the loader, not 'No session open'", () => {
+  // the tab exists nowhere on the client until the owning host's relay lands; the id's host prefix
+  // says one is coming, so the wait wears the romp loader (CLAUDE.md: loading states) instead of the
+  // empty-dashboard copy, which read as the tap having done nothing
+  assert.match(RENDER, /if \(activeId && \(tabMeta\.has\(activeId\) \|\| hostOf\(activeId\)\)\) \{/);
+  assert.match(RENDER, /: \(hostOf\(activeId\) \? "a session on " \+ hostOf\(activeId\) : "“session”"\);/);
+});

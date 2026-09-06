@@ -162,8 +162,17 @@ global.clients = {
 """
 _SW_DRIVER = r"""
 function win(focusOk) {
-  const w = { focus: () => { LOG.push(['focus']); return focusOk ? Promise.resolve(w) : Promise.reject(new Error('refused')); },
+  const w = { frameType: 'top-level',
+              focus: () => { LOG.push(['focus']); return focusOk ? Promise.resolve(w) : Promise.reject(new Error('refused')); },
               postMessage: (m) => LOG.push(['post', m]) };
+  return w;
+}
+// a TAGGED client, for the dashboard's shape: the shell (top-level) plus its same-origin pane iframes,
+// which the browser lists as window clients too (frameType 'nested'), most-recently-focused first
+function frame(tag, frameType) {
+  const w = { frameType,
+              focus: () => { LOG.push(['focus', tag]); return Promise.resolve(w); },
+              postMessage: (m) => LOG.push(['post', tag, m]) };
   return w;
 }
 async function tap(data, windows) {
@@ -191,6 +200,12 @@ async function tap(data, windows) {
   out.testLive = await tap(testSid, [win(true)]);
   out.testCold = await tap(testSid, []);
   out.legacyTap = await tap({ sid: 'S7' }, []);            // a notification an older worker showed: flat sid, no url
+  // the phone (2026-09-06): the user last tapped INSIDE the chat pane (the mobile session picker), so the
+  // chat iframe is the most recently focused client — ahead of the shell that carries the reveal listener
+  const fed = { sid: 'boxa:S8', host: 'boxa', kind: 'test', cardId: '', url: '/?push-reveal=boxa%3AS8' };
+  out.nested = await tap(fed, [frame('chat', 'nested'), frame('feed', 'nested'), frame('shell', 'top-level')]);
+  out.nestedOnly = await tap(fed, [frame('chat', 'nested')]);   // a pane with no shell above it: nothing to post to
+  out.untyped = await tap(fed, [frame('old', undefined)]);       // a browser that reports no frameType is a window
   console.log(JSON.stringify(out));
 })();
 """
@@ -253,6 +268,19 @@ class ServiceWorkerExecutes(unittest.TestCase):
 
     def test_a_notification_from_the_previous_worker_still_lands(self):
         self.assertEqual(self.out["legacyTap"]["log"][-1], ["openWindow", "/?push-reveal=S7"])
+
+    def test_the_tap_is_posted_to_the_shell_never_into_a_pane_iframe(self):
+        # the user 2026-09-06, on the phone: the tap did nothing. matchAll lists the dashboard's
+        # same-origin pane iframes as window clients too, most-recently-focused first — and the
+        # chat pane the user had just switched sessions in was first. Only the top-level shell
+        # listens for the worker's message; posting into the pane dropped the tap on the floor.
+        msg = {"romp": "notificationClick", "sid": "boxa:S8", "host": "boxa", "kind": "test", "cardId": ""}
+        self.assertEqual(self.out["nested"]["log"],
+                         [["close"], self.MATCH, ["focus", "shell"], ["post", "shell", msg]])
+        # no top-level client at all → the deep link, exactly as with no window
+        self.assertEqual(self.out["nestedOnly"]["log"], [["close"], self.MATCH, ["openWindow", "/?push-reveal=boxa%3AS8"]])
+        # a client that reports no frameType is treated as a window, never dropped
+        self.assertEqual(self.out["untyped"]["log"][-1], ["post", "old", msg])
 
 
 @unittest.skipUnless(HAVE_CRYPTO, "python 'cryptography' not installed")
@@ -599,6 +627,55 @@ class RevealAiming(unittest.TestCase):
             km._consume_pending_reveal(c)
         self.assertEqual(got[0]["id"], "S")
 
+    def test_a_booting_page_parks_past_the_previous_pages_socket(self):
+        # the deep-link arrival (2026-09-06, the phone): the page is BOOTING, so its own chat pane
+        # cannot be connected yet — a same-wid chat socket the kernel still holds is the PREVIOUS
+        # page's (sessionStorage keeps the wid across a reload; a suspended phone never sent its
+        # close, and the ping timeout has up to WS_DEAD_S to notice). "Delivering" there parked
+        # nothing, and the new pane's ready found nothing to consume.
+        twin, twin_got = self._register("chat", "W-phone")
+        with mock.patch.object(km, "_tmux_sessions", return_value={"S": {}}):
+            self.assertFalse(km._reveal_request("S", "W-phone", boot=True))
+            self.assertEqual(twin_got, [], "a booting page's tap is never aimed at a socket that predates it")
+            self.assertEqual(km._PENDING_REVEAL[0], {"sid": "S", "wid": "W-phone"})
+            fresh, fresh_got = _fake_ws_client("chat", "W-phone")
+            km._consume_pending_reveal(fresh)
+        self.assertEqual(fresh_got, [{"type": "focus", "id": "S", "live": True}])
+        self.assertIsNone(km._PENDING_REVEAL[0])
+
+    def test_a_live_tap_to_an_unproven_socket_keeps_a_copy_until_the_pong_or_the_redial(self):
+        # the live half of the same hole: the pane's socket has a ping on the wire nobody has
+        # answered yet (pingAt set — the peer is unproven since the last heartbeat). The focus goes
+        # out as before, AND stays parked: the pong that proves the socket alive retires the copy
+        # (the frame is ordered behind the ping it answers); a dead socket never pongs, the pane
+        # redials, and its ready consumes the copy instead of finding nothing.
+        c, got = self._register("chat", "W1")
+        c["pingAt"] = 100.0
+        with mock.patch.object(km, "_tmux_sessions", return_value={"S": {}}):
+            self.assertTrue(km._reveal_request("S", "W1"))
+        self.assertEqual(got, [{"type": "focus", "id": "S", "live": True}], "still delivered at once")
+        self.assertEqual((km._PENDING_REVEAL[0] or {}).get("sid"), "S", "…and kept until the socket proves itself")
+        # another window's pane pongs: not this tap's socket, the copy stays
+        other, _ = self._register("chat", "W2")
+        other["pingAt"] = 100.0
+        km._note_ws_inbound(other, now=101.0)
+        self.assertIsNotNone(km._PENDING_REVEAL[0])
+        # the delivered-to socket pongs → proven → the copy is retired, and a later ready replays nothing
+        km._note_ws_inbound(c, now=101.0)
+        self.assertIsNone(km._PENDING_REVEAL[0])
+        c["pingAt"] = None
+        with mock.patch.object(km, "_tmux_sessions", return_value={"S": {}}):
+            self.assertTrue(km._reveal_request("S", "W1"))
+        self.assertIsNone(km._PENDING_REVEAL[0], "a socket with no ping outstanding is proven — nothing parked")
+        # the dead case: never pongs; the pane's redial says ready and takes the copy
+        c["pingAt"] = 100.0
+        with mock.patch.object(km, "_tmux_sessions", return_value={"S": {}}):
+            km._reveal_request("S", "W1")
+            fresh, fresh_got = _fake_ws_client("chat", "W1")
+            km._consume_pending_reveal(fresh)
+        self.assertEqual(fresh_got, [{"type": "focus", "id": "S", "live": True}])
+        self.assertIsNone(km._PENDING_REVEAL[0])
+
 
 class RevealRoute(unittest.TestCase):
     """POST /reveal over the real handler (the ServeSecurity pattern)."""
@@ -642,6 +719,22 @@ class RevealRoute(unittest.TestCase):
         code, _ = self._post("/reveal", {"wid": "W"})
         self.assertEqual(code, 400)
         self.assertIsNone(km._PENDING_REVEAL[0])
+
+    def test_a_boot_flagged_reveal_parks_even_past_a_connected_same_wid_pane(self):
+        # the deep-link arrival says it is booting; the kernel parks for the pane that is about to
+        # connect and never counts the previous page's socket as delivery (RevealAiming has the why)
+        twin, twin_got = _fake_ws_client("chat", "W-x")
+        with km._clients_lock:
+            km._clients.append(twin)
+        try:
+            code, body = self._post("/reveal", {"sid": "SID-x", "wid": "W-x", "boot": True})
+        finally:
+            with km._clients_lock:
+                km._clients.remove(twin)
+        self.assertEqual(code, 200)
+        self.assertFalse(json.loads(body)["delivered"])
+        self.assertEqual(twin_got, [])
+        self.assertEqual(km._PENDING_REVEAL[0], {"sid": "SID-x", "wid": "W-x"})
 
 
 class Badge(unittest.TestCase):
@@ -761,7 +854,9 @@ class LandingRevealExecutes(unittest.TestCase):
 
     def test_a_cold_start_asks_the_kernel_at_once_and_strips_the_link(self):
         b = self.out["boot"]
-        self.assertEqual(b["fetches"], [["/reveal", {"sid": "S1", "wid": "W-test"}]])
+        # boot:true — this page is booting, so its own chat pane is not connected yet; the kernel
+        # parks for it rather than aiming at a same-wid socket the previous page left behind
+        self.assertEqual(b["fetches"], [["/reveal", {"sid": "S1", "wid": "W-test", "boot": True}]])
         self.assertEqual(b["replaced"], ["/?keep=1#frag"], "only OUR params go; a reload must not replay the jump")
 
     def test_the_card_waits_for_the_feeds_own_ready(self):

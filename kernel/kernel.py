@@ -13569,9 +13569,12 @@ def list_remotes():
         return [_remote_public(r) for r in _remotes.values()]
 
 
-def _poll_remote_sids(r):
-    """GET the remote kernel's /sessions THROUGH the -L tunnel; return its session ids (for the wake-router's
-    host↔sid map). None on any failure — leave the last-known map in place.
+def _poll_remote_sessions(r):
+    """GET the remote kernel's /sessions THROUGH the -L tunnel; return its id-bearing rows (each `{id, name,
+    …}` — the same unified list _session_rows serves here). None on any failure — leave the last-known
+    snapshot in place. The supervisor reads BOTH the ids (the wake-router's host↔sid map) and the names
+    (_remote_names: the kernel's own copy of what that host calls each session, so a notification about a
+    remote session can be named without a round-trip — 2026-09-06) off ONE poll.
 
     Also files HOW it failed in r["_probe"], because the shape of the failure is the one thing that tells a
     live tunnel with no romp behind it apart from an ssh that is still holding its listener over a transport
@@ -13595,7 +13598,7 @@ def _poll_remote_sids(r):
             return None
         rows = json.loads(data.decode("utf-8"))
         r["_probe"] = "ok"
-        return [x.get("id") for x in rows if isinstance(x, dict) and x.get("id")]
+        return [x for x in rows if isinstance(x, dict) and x.get("id")]
     except (socket.timeout, TimeoutError):
         r["_probe"] = "timeout"
         return None
@@ -13609,6 +13612,30 @@ def _poll_remote_sids(r):
         # a malformed body still proves the far side spoke, so this is never a dead transport
         r["_probe"] = "refused"
         return None
+
+
+def _poll_remote_sids(r):
+    """The remote's session ids, off _poll_remote_sessions (None on failure, same verdict in r["_probe"])."""
+    rows = _poll_remote_sessions(r)
+    return None if rows is None else [x.get("id") for x in rows]
+
+
+def _remote_names(rows):
+    """{sid: name} from a host's /sessions rows — a string name only; a row without one files nothing
+    (never a coined name, so a miss stays a miss and the caller falls back on purpose)."""
+    return {str(x["id"]): x["name"] for x in (rows or [])
+            if isinstance(x, dict) and x.get("id") and isinstance(x.get("name"), str) and x["name"]}
+
+
+def _remote_name_of(host, sid):
+    """What the attached host `host` calls session `sid` (a BARE id), from the supervisor's last successful
+    poll of its /sessions — the kernel's authoritative local copy of that host's registry, the same
+    snapshot _host_for_sid routes by. None when this kernel has no such copy: the host never polled, a row
+    from before names were filed, or an id that host does not list."""
+    with _remotes_lock:
+        r = _remotes.get(str(host or ""))
+        names = (r or {}).get("names") or {}
+        return names.get(str(sid or "")) or None
 
 
 def _host_for_sid(sid):
@@ -15414,7 +15441,8 @@ def _tunnel_supervisor():
                 if skip:
                     continue
                 up = _port_open(r["local_port"])              # outside the lock (socket round-trip)
-                sids = _poll_remote_sids(r) if up else None
+                rows = _poll_remote_sessions(r) if up else None   # its session rows: ids for the wake-router, names for notifications
+                sids = None if rows is None else [x.get("id") for x in rows]
                 rver = _poll_remote_version(r) if up else None   # the code the remote is running (drift check)
                 rsha = (rver or {}).get("sha")
                 # …and which Claude account it burns, so the rail can draw a second set of bars when it is
@@ -15504,6 +15532,7 @@ def _tunnel_supervisor():
                         # _start_remote wrote it (the user 2026-07-11)
                     if sids is not None:
                         r["sids"] = sids
+                        r["names"] = _remote_names(rows)   # what that host calls each of them (_remote_name_of)
                     if rver and rver.get("pid"):
                         r["hub_pid"] = rver["pid"]   # the peer kernel's incarnation — a restart changes it (auto-reconnect 2026-08-24)
                     if rsha is not None:
@@ -26976,6 +27005,7 @@ def _note_ws_inbound(client, now=None):
     else:
         client["lastIn"] = now if now is not None else _ws_clock()
         client["pingAt"] = None
+    _reveal_proven(client)     # a push tap handed to this socket while it was unproven has landed (2026-09-06)
 
 
 def _drop_dead_ws_client(client, why):
@@ -29798,7 +29828,10 @@ def _push_send_one(sub, payload):
     return status not in _PUSH_DEAD_STATUSES
 
 
-def _push_test(endpoint, sid="", host=""):
+PUSH_LABEL_MAX = 80    # the shell's tab label, as a last-resort session name: display text, clipped
+
+
+def _push_test(endpoint, sid="", host="", label=""):
     """The popover's "Send a test notification" (2026-09-05): ONE plain notification to ONE
     subscription — the asking device's — and the push service's answer back to it as
     {ok, status, detail}. Synchronous on purpose: the whole point is to show the user what the
@@ -29814,19 +29847,33 @@ def _push_test(endpoint, sid="", host=""):
     one — and `host` the courtesy copy _push_payload documents. It rides the payload's routing
     block under kind "test", so the tap lands exactly the way a turn's does (the shell POSTs
     /reveal for any sid; only a card kind adds the card scroll), and the body names the session so
-    the lock screen says where the tap goes. The name is the local registry's; a federated
-    session's name lives at its origin kernel, so it falls back to the short id there. The answer
-    carries `sid` and `name` back so the popover's result line says the same thing in the same
-    words. With no session active the shell sends no sid and the test is what it was: a sid-less
-    probe that just brings romp forward."""
+    the lock screen says where the tap goes. The answer carries `sid` and `name` back so the
+    popover's result line says the same thing in the same words. With no session active the shell
+    sends no sid and the test is what it was: a sid-less probe that just brings romp forward.
+
+    THE NAME, in order of authority (the user 2026-09-06, whose test for a session on another
+    machine named its short id): a local session's is the names registry's (_name_of); a federated
+    one's is what its host calls it in the tunnel supervisor's snapshot of that host's /sessions
+    (_remote_name_of), worn host-prefixed the way the merged dashboard shows it. When the kernel
+    truly has no name — a host not polled yet, a kernel too old to file names — the shell's
+    `label` stands in: the active tab's own text, the user's UI text and nothing more, so it is
+    clipped and flattened here and never consulted ahead of the kernel's own copy. Neither → the
+    short id, as before."""
     sub = _push_subs().get(str(endpoint or ""))
     if not sub:
         return {"ok": False, "status": 0, "detail": "this device isn't subscribed yet"}
     _vapid_keys()                                          # RuntimeError without cryptography → the route's 500
     sid, host, name = str(sid or ""), str(host or ""), ""
+    label = " ".join(str(label or "").split())[:PUSH_LABEL_MAX]
     if sid:
-        bare = sid.split(":", 1)[1] if ":" in sid else sid
-        name = _name_of(bare) or bare[:8]
+        if ":" in sid:
+            pfx, bare = sid.split(":", 1)
+            rn = _remote_name_of(pfx, bare)
+            name = ("%s:%s" % (pfx, rn)) if rn else ""
+        else:
+            bare = sid
+            name = _name_of(bare) or ""
+        name = name or label or bare[:8]
         body = "Test notification — tap to come back to %s." % name
     else:
         body = "Test notification — this device is set up."
@@ -30076,15 +30123,23 @@ e.waitUntil(Promise.all(work));
 // kernel built (the shell parses it at boot). focus() can REJECT (an installed iOS app has refused
 // it) — then the tap still lands: fall through to openWindow rather than dropping it. Everything
 // rides waitUntil, so the worker is kept alive until the tap has landed; no timers anywhere.
+// TOP-LEVEL windows only (the user 2026-09-06, whose tap on the phone did nothing): the dashboard's
+// panes are same-origin iframes under this worker's scope, and matchAll lists each of them as a
+// window client too (frameType 'nested') — most recently FOCUSED first, which after a tap in the
+// chat pane's session picker is the chat iframe. Only the shell (the top-level document) carries
+// the reveal listener; posting into a pane dropped the tap on the floor. A client that reports no
+// frameType is treated as a window rather than dropped.
 self.addEventListener('notificationclick',function(e){
 e.notification.close();
 var d=e.notification.data||{};var sid=d.sid||'';
 var url=d.url||(sid?'/?push-reveal='+encodeURIComponent(sid):'/');
 var msg={romp:'notificationClick',sid:sid,host:d.host||'',kind:d.kind||'',cardId:d.cardId||''};
 function open(){return clients.openWindow(url);}
+function shell(w){return !w.frameType||w.frameType==='top-level'||w.frameType==='auxiliary';}
 e.waitUntil(clients.matchAll({type:'window',includeUncontrolled:true}).then(function(ws){
-if(!ws.length)return open();
-var w=ws[0];
+var tops=ws.filter(shell);
+if(!tops.length)return open();
+var w=tops[0];
 return Promise.resolve().then(function(){return w.focus();}).then(function(fw){
 try{(fw||w).postMessage(msg);}catch(err){}},open);
 }));
@@ -30099,7 +30154,9 @@ try{(fw||w).postMessage(msg);}catch(err){}},open);
 # for: that window's chat pane saying "ready" (matched by wid — the per-dashboard id the shell
 # mints and every same-window pane shares — so a second dashboard's reload cannot steal it). One
 # slot, latest wins: two taps before a boot completes should land on the newer notification.
-_PENDING_REVEAL = [None]                     # {"sid": ..., "wid": ...} or None
+# `sent` (2026-09-06): the clients a LIVE tap was already handed to while unproven — see
+# _reveal_request; a pong from one of them retires the slot, a redial's ready consumes it.
+_PENDING_REVEAL = [None]                     # {"sid": ..., "wid": ...[, "sent": [clients]]} or None
 
 
 def _reveal_msg(sid):
@@ -30118,22 +30175,51 @@ def _reveal_msg(sid):
     return {"type": "focus", "id": sid, "live": True}
 
 
-def _reveal_request(sid, wid):
+def _reveal_request(sid, wid, boot=False):
     """POST /reveal: aim the focus at the dashboard whose wid asked. Its chat pane already
     connected → deliver now; not yet (the cold-start norm — the shell's fetch beats the iframe's
-    WS) → park for _consume_pending_reveal. Returns whether it was delivered immediately."""
+    WS) → park for _consume_pending_reveal. Returns whether it was delivered immediately.
+
+    Two ways a same-wid chat socket the kernel holds is NOT the pane this tap is for (the user
+    2026-09-06, whose tap on the phone did nothing — the phone is where sockets die without a
+    close: a suspended app, a VPN link that dropped with the screen):
+      boot  — the shell says the page is BOOTING (the deep-link arrival: iOS opens the installed
+              app's one window on the link, or the app comes back from a kill). Its own chat pane
+              cannot be connected yet, so a socket wearing its wid is the PREVIOUS page's
+              (sessionStorage keeps the wid across a reload) — dead, and the ping timeout has up to
+              WS_DEAD_S to say so. Park only; "delivering" there parked nothing and the new pane's
+              ready found nothing to consume.
+      unproven — a live tap, but the target has a ping on the wire nobody has answered (pingAt set:
+              the peer is unproven since the last heartbeat). Deliver as before AND keep a copy
+              parked, tagged with who it went to: the pong that proves that socket alive retires it
+              (_note_ws_inbound — the focus frame is ordered behind the ping it answers); a dead
+              socket never pongs, the pane redials, and its ready consumes the copy instead of
+              finding nothing. A socket with no ping outstanding is proven: nothing parked, so a
+              later ready never replays a landed tap."""
     with _clients_lock:
-        targets = [c for c in _clients if c["app"] == "chat" and (c.get("wid") or "") == wid]
-    delivered = False
+        targets = [] if boot else [c for c in _clients if c["app"] == "chat" and (c.get("wid") or "") == wid]
+    delivered, sent = False, []
     for c in targets:
         try:
             c["send"](json.dumps(_reveal_msg(sid)))
             delivered = True
+            if c.get("pingAt") is not None:
+                sent.append(c)
         except Exception:
             pass
     if not delivered:
         _PENDING_REVEAL[0] = {"sid": str(sid), "wid": str(wid or "")}
+    elif sent:
+        _PENDING_REVEAL[0] = {"sid": str(sid), "wid": str(wid or ""), "sent": sent}
     return delivered
+
+
+def _reveal_proven(client):
+    """A pong or message from `client`: if the parked reveal was HANDED to it while unproven, the
+    socket is alive and the focus frame ahead of this pong has landed — retire the copy."""
+    p = _PENDING_REVEAL[0]
+    if p and any(c is client for c in (p.get("sent") or ())):
+        _PENDING_REVEAL[0] = None
 
 
 def _consume_pending_reveal(client):
@@ -32644,10 +32730,13 @@ return (s?s.unsubscribe():Promise.resolve()).then(function(){return ep?post('/pu
 // the session the user is LOOKING AT: the chat pane's active tab, read off the same-origin iframe's DOM — the very
 // nodes the mobile header's current-session chip mirrors (_CHAT_MOBILE_JS reads #tabs .tab.active), so one truth and
 // no second channel. A federated tab's id is already host-prefixed (host:sid); the host rides along as the payload's
-// courtesy copy. No tab in front → no sid, and the test is the plain probe it always was.
+// courtesy copy. No tab in front → no sid, and the test is the plain probe it always was. The tab's LABEL rides
+// along too (2026-09-06): the kernel names the session from its own registry or its snapshot of the owning host and
+// falls back to this — the user's own UI text, display-only, clipped here as well as there.
 function activeSession(){var t=null;try{var f=document.getElementById('f-chat'),d=f&&f.contentDocument;t=d&&d.querySelector('#tabs .tab.active[data-id]');}catch(e){}
 var id=t?String(t.getAttribute('data-id')||''):'';var i=id.indexOf(':');
-return {sid:id,host:i>0?id.slice(0,i):''};}
+var lab=t&&t.querySelector('.tab-label');
+return {sid:id,host:i>0?id.slice(0,i):'',label:String((lab&&lab.textContent)||'').replace(/\\s+/g,' ').trim().slice(0,80)};}
 function place(anchor){var r=anchor.getBoundingClientRect();   // beside the rail bell / above the tab bar: both sit at the bottom edge
 pop.style.bottom=Math.max(8,window.innerHeight-r.top+6)+'px';pop.style.right=Math.max(8,window.innerWidth-r.right)+'px';}
 function open(anchor){place(anchor);back.hidden=false;}
@@ -32670,7 +32759,7 @@ post('/notify-turns',{on:wantT}).then(function(){turnsOn=wantT;paint();},fail).t
 else if(act==='test'){if(!testBtn||testBtn.disabled)return;testBtn.disabled=true;var label=testBtn.textContent;testBtn.textContent='Sending…';
 testOut.className='rbp-sub';testOut.textContent='';
 var at=activeSession();   // read AT the press, before any await: the session you were looking at, not the one you switch to while it sends
-sub().then(function(s){if(!s)return {ok:false,status:0,detail:'',nosub:true};return post('/push/test',{endpoint:s.endpoint,sid:at.sid,host:at.host});}).then(function(d){
+sub().then(function(s){if(!s)return {ok:false,status:0,detail:'',nosub:true};return post('/push/test',{endpoint:s.endpoint,sid:at.sid,host:at.host,label:at.label});}).then(function(d){
 var ok=!!(d&&d.ok);testOut.classList.toggle('bad',!ok);
 testOut.textContent=ok?'The push service accepted it.':(d&&d.nosub?"This device isn't subscribed yet.":
 (d&&d.status?('The push service refused it: '+d.status+' '+(d.detail||'')+'.'):('Could not reach the push service: '+((d&&d.detail)||'no answer')+'.')));
@@ -32694,7 +32783,11 @@ if(!isOn)testOut.textContent+=" Real notifications won't arrive until the main s
 #  - live window: the SW focused us and posted {romp:'notificationClick', sid, host, kind, cardId}.
 #  - cold start: the SW opened the kernel's deep link '/?push-reveal=<sid>[&push-card=<id>]'. The
 #    params are stripped (history.replaceState) the moment they are read, so a manual reload later
-#    does not replay the jump.
+#    does not replay the jump. This arrival POSTs boot:true — the page is booting, so its chat pane
+#    is not connected yet, and the kernel must park for it rather than hand the focus to a same-wid
+#    socket the previous page left behind (the phone, 2026-09-06: iOS reopens the installed app's
+#    one window on the link and sessionStorage keeps the wid; the old pane's socket died without a
+#    close and sat in the kernel's client list until the ping timeout).
 # A card kind ALSO scrolls the feed to its card: {romp:'revealCard'} into the feed iframe — the same
 # message the Log's bell entries post — but only once the feed has its cards, which it announces
 # with {romp:'ready', app:'feed'} after its first payload renders (before that the iframe may have
@@ -32718,15 +32811,16 @@ try{f&&f.contentWindow&&f.contentWindow.postMessage({romp:'revealCard',itemId:it
 window.addEventListener('message',function(e){var m=e&&e.data;
 if(!(m&&m.romp==='ready'&&m.app==='feed'))return;
 feedReady=true;if(pendingCard){var c=pendingCard;pendingCard=null;revealCard(c.itemId,c.sid);}});
-function land(sid,kind,cardId){
-if(sid)fetch('/reveal',{method:'POST',body:JSON.stringify({sid:sid,wid:wid()})}).then(function(r){
+function land(sid,kind,cardId,boot){
+var body={sid:sid,wid:wid()};if(boot)body.boot=true;   // booting: our chat pane is not connected yet — park for it
+if(sid)fetch('/reveal',{method:'POST',body:JSON.stringify(body)}).then(function(r){
 if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});})['catch'](fail);
 if(sid&&kind==='card'&&cardId)revealCard(cardId,sid);}
 if('serviceWorker' in navigator&&navigator.serviceWorker&&navigator.serviceWorker.addEventListener){
 navigator.serviceWorker.addEventListener('message',function(ev){var m=ev&&ev.data;
-if(m&&m.romp==='notificationClick')land(String(m.sid||''),String(m.kind||''),String(m.cardId||''));});}
+if(m&&m.romp==='notificationClick')land(String(m.sid||''),String(m.kind||''),String(m.cardId||''),false);});}
 var u=new URL(location.href),pr=u.searchParams.get('push-reveal'),pc=u.searchParams.get('push-card');
-if(pr||pc){land(pr||'',pc?'card':'',pc||'');
+if(pr||pc){land(pr||'',pc?'card':'',pc||'',true);
 u.searchParams['delete']('push-reveal');u.searchParams['delete']('push-card');
 try{history.replaceState(null,'',u.pathname+(u.searchParams.toString()?'?'+u.searchParams.toString():'')+u.hash);}catch(e){}}
 })();
@@ -34928,18 +35022,23 @@ class Handler(BaseHTTPRequestHandler):
                 # Since 2026-09-06 addressed to the session the shell had in front (sid, host-
                 # prefixed for a federated one, plus host), so the tap comes back to it; no sid is
                 # the plain probe. Missing crypto is the same loud 500 the subscribe route gives.
+                # `label` (2026-09-06): the active tab's text, the fallback name when this kernel
+                # holds none for the id — a string, clipped in _push_test, or a 400.
                 try:
                     _tb = json.loads(raw_body or b"{}")
                     _ep = str(_tb.get("endpoint") or "")
                     _tsid, _thost = _tb.get("sid") or "", _tb.get("host") or ""
+                    _tlabel = _tb.get("label") or ""
                 except (ValueError, AttributeError):
                     return self._send(400, "bad json", "text/plain")
                 if not _ep:
                     return self._send(400, "missing endpoint", "text/plain")
                 if not isinstance(_tsid, str) or not isinstance(_thost, str):
                     return self._send(400, "bad sid", "text/plain")
+                if not isinstance(_tlabel, str):
+                    return self._send(400, "bad label", "text/plain")
                 try:
-                    _res = _push_test(_ep, _tsid, _thost)
+                    _res = _push_test(_ep, _tsid, _thost, _tlabel)
                 except RuntimeError as e:
                     return self._send(500, str(e), "text/plain")
                 return self._send(200, json.dumps(_res), "application/json")
@@ -35024,15 +35123,19 @@ class Handler(BaseHTTPRequestHandler):
                 # The cold-start half of a push tap (see _PENDING_REVEAL): the freshly opened
                 # shell asks for the focus its ?push-reveal= URL named, aimed by its own wid so
                 # no other open dashboard gets dragged along (the 2026-07-29 rule).
+                # `boot` (2026-09-06): the deep-link arrival — the page is booting, so its own chat
+                # pane is not connected yet; the kernel parks for it and never counts a same-wid
+                # socket the previous page left behind as delivery (_reveal_request has the why).
                 try:
                     body = json.loads(raw_body or b"{}")
                     sid = str(body.get("sid") or "")
                     wid = str(body.get("wid") or "")
+                    boot = bool(body.get("boot"))
                 except (ValueError, AttributeError):
                     return self._send(400, "bad json", "text/plain")
                 if not sid:
                     return self._send(400, "missing sid", "text/plain")
-                now_ = _reveal_request(sid, wid)
+                now_ = _reveal_request(sid, wid, boot=boot)
                 return self._send(200, json.dumps({"ok": True, "delivered": now_}), "application/json")
             if u.path == "/tick":
                 # Event-driven wake: the Stop / UserPromptSubmit / PostCompact hooks (and the postal drain) poke

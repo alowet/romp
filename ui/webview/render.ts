@@ -8931,11 +8931,16 @@ function showActive() {
     // A KNOWN-LOADING tab (its meta arrived, its payload hasn't — the clicked placeholder): the
     // thread area holds the pane-local romp loader, and the first session frame renders in place —
     // you're already there (the user 2026-08-25). Everything else keeps the no-sessions copy.
+    // A FEDERATED id nothing here knows yet counts as loading too (2026-09-06): a push tap's focus
+    // lands on this pane's ready, before the owning host has relayed its tab list, and the id's
+    // host prefix says one is coming — the no-sessions copy read as the tap having done nothing.
     document.getElementById("tab-loading")?.remove();
-    if (activeId && tabMeta.has(activeId)) {
+    if (activeId && (tabMeta.has(activeId) || hostOf(activeId))) {
       const wait = el("div", "tab-loading-wait");
       wait.id = "tab-loading";
-      wait.appendChild(rompLoaderInner("opening “" + (tabMeta.get(activeId)?.name || "session") + "”…"));
+      const meta = tabMeta.get(activeId);
+      const what = meta?.name ? "“" + meta.name + "”" : (hostOf(activeId) ? "a session on " + hostOf(activeId) : "“session”");
+      wait.appendChild(rompLoaderInner("opening " + what + "…"));
       content.appendChild(wait);
       if (empty) empty.style.display = "none";
     } else if (!empty) {
@@ -12468,6 +12473,11 @@ window.addEventListener("message", (e: MessageEvent) => {
     revealSelfPane();   // every focus is someone jumping HERE — on mobile, come forward (incl. from a remote kernel)
     closingTabs.delete(m.id);   // an explicit reveal outranks a pending close-suppression: closing a tab and
     //                             reopening it from the picker inside the ack window must show it at once
+    // …and outranks the persisted-tab restore (the user 2026-09-06, on the phone): a push tap's focus is
+    // delivered on this pane's ready, BEFORE any remote host has relayed its sessions — so when the tab
+    // this page last showed was a remote one, its later arrival matched wantActive and setActive'd
+    // itself straight over the reveal. A reveal is newer information than where the page last was.
+    wantActive = null;
     if (revivePending && m.id === revivePending) clearReviveLoader();   // the revive landed — the loader's success event
     assertPeekFor(m.id);   // an out-of-view focus peeks even on the already-active fast path below (setActive is skipped there)
     // `live` (the user 2026-07-08): land on the LIVE TAIL. A blocked card's picker/permission prompt IS the

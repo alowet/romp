@@ -291,8 +291,9 @@ class PushTestRoute(_LoopbackMixin, unittest.TestCase):
         self.assertNotIn("badge", d, "the count rides its own push")
 
     def test_a_federated_session_keeps_its_prefix_and_falls_back_to_the_short_id(self):
-        # a remote session's name lives at its origin kernel; ours knows only the id and says so
-        # rather than inventing one — the prefixed id and the host ride the routing block as-is
+        # a remote session's name lives at its origin kernel; with no snapshot of that kernel's
+        # list and no label from the shell, ours knows only the id and says so rather than
+        # inventing one — the prefixed id and the host ride the routing block as-is
         with mock.patch.object(km, "_vapid_keys", return_value=(None, "pub")), \
              mock.patch.object(km, "_push_post", return_value=(201, "Created")) as pp, \
              mock.patch.object(km, "_name_of", return_value=None):
@@ -303,6 +304,63 @@ class PushTestRoute(_LoopbackMixin, unittest.TestCase):
         d = json.loads(pp.call_args[0][1].decode())
         self.assertEqual(d["body"], "Test notification — tap to come back to %s." % SID_API[:8])
         self.assertEqual((d["data"]["sid"], d["data"]["host"], d["data"]["kind"]), ("boxa:" + SID_API, "boxa", "test"))
+
+    def _snapshot(self, host, names):
+        """Seed the supervisor's per-host snapshot the way its poll files it (sids + names)."""
+        with km._remotes_lock:
+            km._remotes[host] = {"host": host, "kernel_port": 1, "local_port": 1, "status": "up",
+                                 "sids": list(names), "names": dict(names)}
+        self.addCleanup(lambda: km._remotes.pop(host, None))
+
+    def test_a_remote_sessions_name_comes_from_the_kernels_own_snapshot_of_that_host(self):
+        # the user 2026-09-06, whose test notification for a session on another machine named its
+        # short id: the kernel DOES know that name — the tunnel supervisor polls every attached
+        # host's /sessions (id + name) for the wake-router's map — so the notification and the
+        # popover's result line read it from there, host-prefixed the way the dashboard shows it.
+        # The shell's label is display text of last resort and loses to the kernel's own copy.
+        self._snapshot("boxa", {SID_API: "api"})
+        with mock.patch.object(km, "_vapid_keys", return_value=(None, "pub")), \
+             mock.patch.object(km, "_push_post", return_value=(201, "Created")) as pp, \
+             mock.patch.object(km, "_name_of", return_value=None):
+            code, body = self._post("/push/test", {"endpoint": self.ep, "sid": "boxa:" + SID_API, "host": "boxa",
+                                                   "label": "boxa:stale-label"})
+        self.assertEqual(code, 200)
+        res = json.loads(body)
+        self.assertEqual((res["sid"], res["name"]), ("boxa:" + SID_API, "boxa:api"))
+        d = json.loads(pp.call_args[0][1].decode())
+        self.assertEqual(d["body"], "Test notification — tap to come back to boxa:api.")
+
+    def test_the_shells_label_stands_in_when_the_kernel_has_no_name_for_the_id(self):
+        # no snapshot for that host (never polled, or a kernel too old to file names): the tab's own
+        # label — the user's UI text, display-only — beats a bare short id
+        with mock.patch.object(km, "_vapid_keys", return_value=(None, "pub")), \
+             mock.patch.object(km, "_push_post", return_value=(201, "Created")) as pp, \
+             mock.patch.object(km, "_name_of", return_value=None):
+            code, body = self._post("/push/test", {"endpoint": self.ep, "sid": "boxa:" + SID_API, "host": "boxa",
+                                                   "label": "  boxa:api\n(paused) "})
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["name"], "boxa:api (paused)", "trimmed and flattened, otherwise verbatim")
+        d = json.loads(pp.call_args[0][1].decode())
+        self.assertEqual(d["body"], "Test notification — tap to come back to boxa:api (paused).")
+        # a local session keeps the registry's name even when the label disagrees (the registry is authoritative)
+        with mock.patch.object(km, "_vapid_keys", return_value=(None, "pub")), \
+             mock.patch.object(km, "_push_post", return_value=(201, "Created")), \
+             mock.patch.object(km, "_name_of", side_effect=lambda s: "web" if s == SID_WEB else None):
+            code, body = self._post("/push/test", {"endpoint": self.ep, "sid": SID_WEB, "host": "", "label": "renamed"})
+        self.assertEqual(json.loads(body)["name"], "web")
+
+    def test_the_label_is_a_capped_string_or_a_400(self):
+        with mock.patch.object(km, "_vapid_keys", return_value=(None, "pub")), \
+             mock.patch.object(km, "_push_post", return_value=(201, "Created")), \
+             mock.patch.object(km, "_name_of", return_value=None):
+            code, _ = self._post("/push/test", {"endpoint": self.ep, "sid": "boxa:" + SID_API, "label": 5})
+            self.assertEqual(code, 400)
+            code, _ = self._post("/push/test", {"endpoint": self.ep, "sid": "boxa:" + SID_API, "label": ["x"]})
+            self.assertEqual(code, 400)
+            code, body = self._post("/push/test", {"endpoint": self.ep, "sid": "boxa:" + SID_API, "label": "x" * 500})
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["name"], "x" * km.PUSH_LABEL_MAX, "long UI text is clipped, not refused")
+        self.assertLessEqual(km.PUSH_LABEL_MAX, 80)
 
     def test_without_a_sid_the_probe_is_what_it_was(self):
         code, res, pp = self._test((201, "Created"))
@@ -358,6 +416,61 @@ class PushTestRoute(_LoopbackMixin, unittest.TestCase):
         self.assertEqual(code, 400)
         code, _ = self._post("/push/test", None, raw=b"nope")
         self.assertEqual(code, 400)
+
+
+class RemoteNames(unittest.TestCase):
+    """Where the kernel's copy of a remote session's name comes from (2026-09-06): the tunnel
+    supervisor already GETs each attached host's /sessions through the -L tunnel every pass for the
+    wake-router's host↔sid map; the same rows carry `name`, so the poll files both beside each
+    other on the host's row and _remote_name_of reads that snapshot."""
+
+    def _serve_rows(self, rows):
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        body = json.dumps(rows).encode()
+
+        class Svc(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), Svc)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def test_the_poll_returns_the_rows_and_the_ids_are_read_off_them(self):
+        port = self._serve_rows([{"id": SID_API, "name": "api", "state": "ready"},
+                                 {"id": SID_WEB, "name": "web"}, {"nope": 1}, "junk"])
+        r = {"host": "boxa", "local_port": port, "token": ""}
+        rows = km._poll_remote_sessions(r)
+        self.assertEqual([x["id"] for x in rows], [SID_API, SID_WEB], "id-bearing dict rows only")
+        self.assertEqual(r["_probe"], "ok")
+        self.assertEqual(km._poll_remote_sids(r), [SID_API, SID_WEB], "the sid list is unchanged for its callers")
+        self.assertEqual(km._remote_names(rows), {SID_API: "api", SID_WEB: "web"})
+        self.assertEqual(km._remote_names([{"id": SID_API, "name": 7}, {"id": SID_WEB}]), {},
+                         "a row without a string name files nothing — never a coined one")
+
+    def test_the_supervisor_files_names_beside_sids(self):
+        import inspect
+        src = inspect.getsource(km._tunnel_supervisor)
+        self.assertIn('r["sids"] = sids', src)
+        self.assertIn('r["names"] = _remote_names(rows)', src, "same poll, same locked write as the sids")
+        self.assertIn("rows = _poll_remote_sessions(r) if up else None", src, "ONE GET per pass, not a second one for names")
+
+    def test_remote_name_of_reads_the_snapshot_and_says_nothing_otherwise(self):
+        with km._remotes_lock:
+            km._remotes["boxa"] = {"host": "boxa", "sids": [SID_API], "names": {SID_API: "api"}}
+            km._remotes["boxb"] = {"host": "boxb", "sids": [SID_WEB]}          # an older row: no names filed
+        self.addCleanup(lambda: (km._remotes.pop("boxa", None), km._remotes.pop("boxb", None)))
+        self.assertEqual(km._remote_name_of("boxa", SID_API), "api")
+        self.assertIsNone(km._remote_name_of("boxa", SID_WEB))
+        self.assertIsNone(km._remote_name_of("boxb", SID_WEB))
+        self.assertIsNone(km._remote_name_of("nohost", SID_WEB))
 
 
 def _stamp_stop(sid, t):
@@ -662,13 +775,18 @@ class ShellPopover(unittest.TestCase):
         self.assertIn("function activeSession(){", js)
         self.assertIn("document.getElementById('f-chat')", js)
         self.assertIn("d.querySelector('#tabs .tab.active[data-id]')", js)
-        # a federated tab's id is host:sid, so the host is its prefix; a bare local id has none
-        self.assertIn("var i=id.indexOf(':');\nreturn {sid:id,host:i>0?id.slice(0,i):''};", js)
+        # a federated tab's id is host:sid, so the host is its prefix; a bare local id has none.
+        # The tab's LABEL rides along too (2026-09-06): the kernel names the session from its own
+        # registry or its snapshot of the owning host, and falls back to this — the user's own UI
+        # text, display-only, clipped here as well as there
+        self.assertIn("var i=id.indexOf(':');\nvar lab=t&&t.querySelector('.tab-label');\nreturn {sid:id,host:i>0?id.slice(0,i):'',label:", js)
+        self.assertIn(".replace(/\\s+/g,' ').trim().slice(0,80)}", js)   # flattened + clipped at the same cap the kernel applies
+        self.assertEqual(km.PUSH_LABEL_MAX, 80)
         handler = js[js.index("if(act==='test')"):]
         # read AT the press, before the subscription lookup's await: the session you were looking
         # at, not the one you switch to while it sends
         self.assertLess(handler.index("var at=activeSession();"), handler.index("sub().then("))
-        self.assertIn("post('/push/test',{endpoint:s.endpoint,sid:at.sid,host:at.host})", handler)
+        self.assertIn("post('/push/test',{endpoint:s.endpoint,sid:at.sid,host:at.host,label:at.label})", handler)
         # on success with a session, ONE sentence says where the tap goes — in the kernel's words
         # (d.name, the name the notification body carries) — after the outcome, before the master-off note
         line = "if(ok&&d.name)testOut.textContent+=' Tapping it brings you back to '+d.name+'.';"
@@ -691,8 +809,9 @@ class ShellPopover(unittest.TestCase):
         self.assertIn("post('/notify-turns',{on:wantT})", js)
         self.assertIn("if(act==='test')", js)
         # the test is addressed to the session in front (2026-09-06): the endpoint AND the active
-        # tab's sid/host ride the POST, so its tap comes back to that session
-        self.assertIn("post('/push/test',{endpoint:s.endpoint,sid:at.sid,host:at.host})", js)
+        # tab's sid/host ride the POST, so its tap comes back to that session — plus the tab's label,
+        # the fallback name when the kernel holds none for the id
+        self.assertIn("post('/push/test',{endpoint:s.endpoint,sid:at.sid,host:at.host,label:at.label})", js)
         # the test button acknowledges at once and self-restores; the answer lands under it
         self.assertIn("testBtn.disabled=true", js)
         self.assertIn("testBtn.textContent='Sending…'", js)
