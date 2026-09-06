@@ -451,8 +451,11 @@ switches indented under it, and a button:
 - **Send a test notification** sends one notification to the device you are
   holding, whatever the switches say, and prints the push service's answer under
   the button, so you can see at once whether the phone is set up or why it is
-  not. With the main switch off, the answer adds that real notifications will
-  not arrive until it is on.
+  not. The test is addressed to the session you were looking at when you
+  pressed the button, so you can switch to another session or another browser
+  tab, tap the notification, and check that it brings you back. With the main
+  switch off, the answer adds that real notifications will not arrive until it
+  is on.
 
 The bell itself shows the state of the device you are looking at: lit when the
 main switch is on and this device is set up, and crossed out otherwise. Its

@@ -187,6 +187,9 @@ async function tap(data, windows) {
   out.cold = await tap(data, []);
   out.refused = await tap(data, [win(false)]);
   out.test = await tap({ sid: '', host: '', kind: 'test', cardId: '', url: '/' }, []);
+  const testSid = { sid: 'S5', host: '', kind: 'test', cardId: '', url: '/?push-reveal=S5' };   // a test addressed to the session in front (2026-09-06)
+  out.testLive = await tap(testSid, [win(true)]);
+  out.testCold = await tap(testSid, []);
   out.legacyTap = await tap({ sid: 'S7' }, []);            // a notification an older worker showed: flat sid, no url
   console.log(JSON.stringify(out));
 })();
@@ -238,7 +241,15 @@ class ServiceWorkerExecutes(unittest.TestCase):
         self.assertEqual(self.out["refused"]["log"], [["close"], self.MATCH, ["focus"], ["openWindow", self.URL]])
 
     def test_a_test_notification_just_opens_romp(self):
+        # …when it carries no session: the button was pressed with no session in front
         self.assertEqual(self.out["test"]["log"], [["close"], self.MATCH, ["openWindow", "/"]])
+
+    def test_a_test_addressed_to_a_session_lands_on_it_like_a_turn(self):
+        # the user 2026-09-06: the test carries the session the button was pressed on. The worker
+        # does not branch on kind — the same focus + routing block live, the same deep link cold
+        msg = {"romp": "notificationClick", "sid": "S5", "host": "", "kind": "test", "cardId": ""}
+        self.assertEqual(self.out["testLive"]["log"], [["close"], self.MATCH, ["focus"], ["post", msg]])
+        self.assertEqual(self.out["testCold"]["log"], [["close"], self.MATCH, ["openWindow", "/?push-reveal=S5"]])
 
     def test_a_notification_from_the_previous_worker_still_lands(self):
         self.assertEqual(self.out["legacyTap"]["log"][-1], ["openWindow", "/?push-reveal=S7"])
@@ -684,7 +695,8 @@ class LandingRevealPins(unittest.TestCase):
 # _LANDING_REVEAL_JS against stubs of the few browser globals it touches, booting on a deep link
 # and then replaying the worker's messages. Pins the routing, not the words: /reveal is asked
 # with the shell's wid, the URL is stripped, the card waits for the FEED's ready (not the
-# timeline's), a turn kind reveals no card, a sid-less tap does nothing, a refused /reveal is loud.
+# timeline's), a turn kind reveals no card, a test addressed to a session reveals it the same way,
+# a sid-less tap does nothing, a refused /reveal is loud.
 _REVEAL_HARNESS = r"""
 'use strict';
 const FETCHES = [], POSTED = [], NOTES = [], REPLACED = [], WIN = [], SW = [];
@@ -721,6 +733,9 @@ const winMsg = (m) => WIN.forEach((f) => f({ data: m }));
   FETCHES.length = 0; POSTED.length = 0;
   swMsg({ romp: 'notificationClick', sid: '', host: '', kind: 'test', cardId: '' });
   out.test = { fetches: FETCHES.slice(), posted: POSTED.slice() };
+  FETCHES.length = 0; POSTED.length = 0;
+  swMsg({ romp: 'notificationClick', sid: 'S5', host: '', kind: 'test', cardId: '' });   // a test addressed to the session in front (2026-09-06)
+  out.testSid = { fetches: FETCHES.slice(), posted: POSTED.slice() };
   fetchOk = false; FETCHES.length = 0;
   swMsg({ romp: 'notificationClick', sid: 'S-bad', kind: 'turn' });
   await tick(); await tick();
@@ -760,10 +775,14 @@ class LandingRevealExecutes(unittest.TestCase):
         self.assertEqual(live["fetches"], [["/reveal", {"sid": "S2", "wid": "W-test"}]])
         self.assertEqual(live["posted"], [{"romp": "revealCard", "itemId": "S2:g4", "sid": "S2"}])
 
-    def test_a_turn_focuses_without_a_card_and_a_test_lands_nowhere(self):
+    def test_a_turn_focuses_without_a_card_and_a_sidless_test_lands_nowhere(self):
         self.assertEqual(len(self.out["turn"]["fetches"]), 1)
         self.assertEqual(self.out["turn"]["posted"], [])
         self.assertEqual(self.out["test"], {"fetches": [], "posted": []})
+
+    def test_a_test_addressed_to_a_session_reveals_it_like_a_turn(self):
+        # the user 2026-09-06: ANY sid lands, whatever the kind; only a card adds the card scroll
+        self.assertEqual(self.out["testSid"], {"fetches": [["/reveal", {"sid": "S5", "wid": "W-test"}]], "posted": []})
 
     def test_a_refused_reveal_is_loud(self):
         self.assertEqual(self.out["refused"]["notes"],

@@ -11,7 +11,10 @@ What these pin, by layer:
     and returns the push service's answer {ok, status, detail}; an unknown endpoint says so; a
     dead one (404/410) is pruned exactly like the fan-out prunes it; missing crypto is the same
     loud 500 the subscribe route gives. _push_post is the one HTTP path under both; _push_send_one
-    keeps its prune semantics (False on 404/410 ONLY) on top of it.
+    keeps its prune semantics (False on 404/410 ONLY) on top of it. Since 2026-09-06 the test is
+    ADDRESSED to the session the shell had in front (sid + host, the chat pane's active tab): the
+    payload carries it under kind test so the tap comes back there like a turn's, the body names
+    it, and the answer echoes sid + name for the popover's result line; no sid is the old probe.
   * the turn-finished push — _turn_notify_tick fires on a session's turn-end KEY moving (the Stop
     hook's lastStopAt, or a STOPPED states/ transition), only with the master AND the switch on
     and the session unmuted, with a silent first-sight baseline; the event travels to trusted
@@ -264,6 +267,55 @@ class PushTestRoute(_LoopbackMixin, unittest.TestCase):
         self.assertEqual(d["data"]["kind"], "test")
         self.assertFalse(d["data"].get("sid"))
         self.assertNotIn("badge", d)
+
+    def test_addressed_to_the_session_you_were_looking_at(self):
+        # the user 2026-09-06: press the button on one session, switch away, tap, come back to it.
+        # The shell sends the chat pane's active tab; the payload carries it under kind test, the
+        # body names it, and the answer echoes sid + name for the popover's result line
+        with mock.patch.object(km, "_vapid_keys", return_value=(None, "pub")), \
+             mock.patch.object(km, "_push_post", return_value=(201, "Created")) as pp, \
+             mock.patch.object(km, "_name_of", side_effect=lambda s: "web" if s == SID_WEB else None):
+            code, body = self._post("/push/test", {"endpoint": self.ep, "sid": SID_WEB, "host": ""})
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body), {"ok": True, "status": 201, "detail": "Created", "sid": SID_WEB, "name": "web"})
+        (sub, payload), _ = pp.call_args
+        self.assertEqual(sub["endpoint"], self.ep)
+        d = json.loads(payload.decode())
+        self.assertEqual(d["title"], "romp")
+        self.assertEqual(d["body"], "Test notification — tap to come back to web.")
+        self.assertEqual(d["sid"], SID_WEB)
+        self.assertEqual(d["tag"], "romp:" + SID_WEB)
+        # a turn's routing shape under kind test: the shell POSTs /reveal for the sid, no card to scroll to
+        self.assertEqual(d["data"], {"sid": SID_WEB, "host": "", "kind": "test", "cardId": "",
+                                     "url": "/?push-reveal=" + SID_WEB})
+        self.assertNotIn("badge", d, "the count rides its own push")
+
+    def test_a_federated_session_keeps_its_prefix_and_falls_back_to_the_short_id(self):
+        # a remote session's name lives at its origin kernel; ours knows only the id and says so
+        # rather than inventing one — the prefixed id and the host ride the routing block as-is
+        with mock.patch.object(km, "_vapid_keys", return_value=(None, "pub")), \
+             mock.patch.object(km, "_push_post", return_value=(201, "Created")) as pp, \
+             mock.patch.object(km, "_name_of", return_value=None):
+            code, body = self._post("/push/test", {"endpoint": self.ep, "sid": "boxa:" + SID_API, "host": "boxa"})
+        self.assertEqual(code, 200)
+        res = json.loads(body)
+        self.assertEqual((res["sid"], res["name"]), ("boxa:" + SID_API, SID_API[:8]))
+        d = json.loads(pp.call_args[0][1].decode())
+        self.assertEqual(d["body"], "Test notification — tap to come back to %s." % SID_API[:8])
+        self.assertEqual((d["data"]["sid"], d["data"]["host"], d["data"]["kind"]), ("boxa:" + SID_API, "boxa", "test"))
+
+    def test_without_a_sid_the_probe_is_what_it_was(self):
+        code, res, pp = self._test((201, "Created"))
+        self.assertEqual(res, {"ok": True, "status": 201, "detail": "Created"}, "no session, no sid or name echoed")
+        d = json.loads(pp.call_args[0][1].decode())
+        self.assertEqual(d["body"], "Test notification — this device is set up.")
+        self.assertEqual(d["data"]["url"], "/", "nowhere to land: the tap just brings romp forward")
+
+    def test_a_sid_or_host_that_is_not_a_string_is_a_400(self):
+        code, _ = self._post("/push/test", {"endpoint": self.ep, "sid": 5})
+        self.assertEqual(code, 400)
+        code, _ = self._post("/push/test", {"endpoint": self.ep, "sid": SID_WEB, "host": ["boxa"]})
+        self.assertEqual(code, 400)
 
     def test_a_refusal_comes_back_verbatim(self):
         code, res, _ = self._test((403, "Forbidden: {\"reason\":\"BadJwtToken\"}"))
@@ -603,6 +655,28 @@ class ShellPopover(unittest.TestCase):
         self.assertLess(handler.index("'The push service accepted it.'"), handler.index(line))
         self.assertLess(handler.index(line), handler.index("},function(e){testOut.classList.add('bad')"))
 
+    def test_the_test_is_addressed_to_the_session_in_front(self):
+        js = km._LANDING_PUSH_JS
+        # the shell reads the chat pane's ACTIVE TAB off the same-origin iframe's own DOM — the nodes
+        # the mobile header's #mcur chip mirrors — rather than growing a second channel for one fact
+        self.assertIn("function activeSession(){", js)
+        self.assertIn("document.getElementById('f-chat')", js)
+        self.assertIn("d.querySelector('#tabs .tab.active[data-id]')", js)
+        # a federated tab's id is host:sid, so the host is its prefix; a bare local id has none
+        self.assertIn("var i=id.indexOf(':');\nreturn {sid:id,host:i>0?id.slice(0,i):''};", js)
+        handler = js[js.index("if(act==='test')"):]
+        # read AT the press, before the subscription lookup's await: the session you were looking
+        # at, not the one you switch to while it sends
+        self.assertLess(handler.index("var at=activeSession();"), handler.index("sub().then("))
+        self.assertIn("post('/push/test',{endpoint:s.endpoint,sid:at.sid,host:at.host})", handler)
+        # on success with a session, ONE sentence says where the tap goes — in the kernel's words
+        # (d.name, the name the notification body carries) — after the outcome, before the master-off note
+        line = "if(ok&&d.name)testOut.textContent+=' Tapping it brings you back to '+d.name+'.';"
+        self.assertIn(line, handler)
+        self.assertEqual(js.count("Tapping it brings you back to"), 1, "one sentence, appended once")
+        self.assertLess(handler.index("'The push service accepted it.'"), handler.index(line))
+        self.assertLess(handler.index(line), handler.index("if(!isOn)testOut.textContent+="))
+
     def test_the_bell_opens_it_and_the_rows_are_the_switches(self):
         js = km._LANDING_PUSH_JS
         self.assertIn("open(bl)", js)
@@ -616,7 +690,9 @@ class ShellPopover(unittest.TestCase):
         self.assertIn("if(act==='turns')", js)
         self.assertIn("post('/notify-turns',{on:wantT})", js)
         self.assertIn("if(act==='test')", js)
-        self.assertIn("post('/push/test',{endpoint:s.endpoint})", js)
+        # the test is addressed to the session in front (2026-09-06): the endpoint AND the active
+        # tab's sid/host ride the POST, so its tap comes back to that session
+        self.assertIn("post('/push/test',{endpoint:s.endpoint,sid:at.sid,host:at.host})", js)
         # the test button acknowledges at once and self-restores; the answer lands under it
         self.assertIn("testBtn.disabled=true", js)
         self.assertIn("testBtn.textContent='Sending…'", js)

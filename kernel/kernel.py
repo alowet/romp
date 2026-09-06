@@ -29798,25 +29798,48 @@ def _push_send_one(sub, payload):
     return status not in _PUSH_DEAD_STATUSES
 
 
-def _push_test(endpoint):
+def _push_test(endpoint, sid="", host=""):
     """The popover's "Send a test notification" (2026-09-05): ONE plain notification to ONE
     subscription — the asking device's — and the push service's answer back to it as
     {ok, status, detail}. Synchronous on purpose: the whole point is to show the user what the
     service said. An endpoint nobody subscribed answers ok:false with the reason (the shell shows
     it under the button); a dead subscription (404/410) is pruned exactly as the fan-out would
     prune it, and the detail says so. Raises RuntimeError when the crypto dependency is missing —
-    the route turns that into the same loud 500 /push/subscribe gives."""
+    the route turns that into the same loud 500 /push/subscribe gives.
+
+    ADDRESSED TO A SESSION (the user 2026-09-06, who wants to try the tap for real: press the
+    button while looking at one session, switch to another session and another browser tab, tap
+    the notification, and be brought back to the first). `sid` is the session the shell had in
+    front when the button was pressed — the chat pane's active tab, host-prefixed for a federated
+    one — and `host` the courtesy copy _push_payload documents. It rides the payload's routing
+    block under kind "test", so the tap lands exactly the way a turn's does (the shell POSTs
+    /reveal for any sid; only a card kind adds the card scroll), and the body names the session so
+    the lock screen says where the tap goes. The name is the local registry's; a federated
+    session's name lives at its origin kernel, so it falls back to the short id there. The answer
+    carries `sid` and `name` back so the popover's result line says the same thing in the same
+    words. With no session active the shell sends no sid and the test is what it was: a sid-less
+    probe that just brings romp forward."""
     sub = _push_subs().get(str(endpoint or ""))
     if not sub:
         return {"ok": False, "status": 0, "detail": "this device isn't subscribed yet"}
     _vapid_keys()                                          # RuntimeError without cryptography → the route's 500
-    payload = json.dumps(_push_payload("romp", "Test notification — this device is set up.", kind="test")).encode()
+    sid, host, name = str(sid or ""), str(host or ""), ""
+    if sid:
+        bare = sid.split(":", 1)[1] if ":" in sid else sid
+        name = _name_of(bare) or bare[:8]
+        body = "Test notification — tap to come back to %s." % name
+    else:
+        body = "Test notification — this device is set up."
+    payload = json.dumps(_push_payload("romp", body, sid=sid, kind="test", host=host)).encode()
     status, detail = _push_post(sub, payload)
     ok = 200 <= status < 300
     if status in _PUSH_DEAD_STATUSES:
         _del_push_sub(sub["endpoint"])
         detail = "%s — the push service says this subscription is gone, so it was removed; turn This device off and on again" % detail
-    return {"ok": ok, "status": status, "detail": detail}
+    res = {"ok": ok, "status": status, "detail": detail}
+    if sid:
+        res["sid"], res["name"] = sid, name
+    return res
 
 
 def _push_payload(title, body, sid="", badge=None, kind="card", card_id="", host=""):
@@ -29837,7 +29860,9 @@ def _push_payload(title, body, sid="", badge=None, kind="card", card_id="", host
       data  — {sid, host, kind, cardId, url}: what the worker hands the shell on a tap (or puts
               in the URL it opens when no window exists). kind names the leg that fired ("card":
               a card entered needs-you/completed; "turn": a turn ended; "test": the popover's
-              probe, no sid, nowhere to land); cardId (a card kind only) is the goal id the feed
+              probe, carrying the session the user was looking at when they pressed the button —
+              2026-09-06 — so its tap comes back there like a turn's; sid-less, and nowhere to
+              land, only when no session was in front); cardId (a card kind only) is the goal id the feed
               scrolls to; url is the same-origin deep link the shell already parses at boot
               (?push-reveal=<sid>, plus &push-card=<id> for a card) — "/" when there is no
               session to land on. host is the origin kernel of a relayed event ("" = local);
@@ -32551,7 +32576,10 @@ var last='chat';try{var s=localStorage.getItem(KT);if(s&&F[s])last=s;}catch(e){}
 # browser's subscription; Notification.requestPermission still runs synchronously in the tap's own
 # stack because iOS voids the gesture across an await) — adds the turn-finished switch (/notify-turns,
 # its own {type:'notifyTurns'} push), and a test button that POSTs /push/test with this device's
-# endpoint and shows the push service's answer as one sentence under itself. The master's paint
+# endpoint AND the session the chat pane has in front (2026-09-06: the test is addressed to it, so
+# its tap brings the user back there — read off the chat iframe's active tab at the press, the same
+# same-origin DOM the mobile header's current-session chip mirrors, no second channel) and shows
+# the push service's answer as one sentence under itself, plus where the tap goes. The master's paint
 # also dims the nested rows (#rbell-pop.master-off) while it is off and the device sub-line says the
 # device is set up but nothing arrives — the same kernel bit, so the dim follows every notifyAll
 # push with no polling; the rows stay operable. The test button ignores the switches on purpose
@@ -32613,6 +32641,13 @@ return reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64u
 }).then(function(s){return post('/push/subscribe',s.toJSON());});}
 function devUnsubscribe(){return sub().then(function(s){var ep=s?s.endpoint:'';
 return (s?s.unsubscribe():Promise.resolve()).then(function(){return ep?post('/push/unsubscribe',{endpoint:ep}):null;});});}
+// the session the user is LOOKING AT: the chat pane's active tab, read off the same-origin iframe's DOM — the very
+// nodes the mobile header's current-session chip mirrors (_CHAT_MOBILE_JS reads #tabs .tab.active), so one truth and
+// no second channel. A federated tab's id is already host-prefixed (host:sid); the host rides along as the payload's
+// courtesy copy. No tab in front → no sid, and the test is the plain probe it always was.
+function activeSession(){var t=null;try{var f=document.getElementById('f-chat'),d=f&&f.contentDocument;t=d&&d.querySelector('#tabs .tab.active[data-id]');}catch(e){}
+var id=t?String(t.getAttribute('data-id')||''):'';var i=id.indexOf(':');
+return {sid:id,host:i>0?id.slice(0,i):''};}
 function place(anchor){var r=anchor.getBoundingClientRect();   // beside the rail bell / above the tab bar: both sit at the bottom edge
 pop.style.bottom=Math.max(8,window.innerHeight-r.top+6)+'px';pop.style.right=Math.max(8,window.innerWidth-r.right)+'px';}
 function open(anchor){place(anchor);back.hidden=false;}
@@ -32634,10 +32669,12 @@ else if(act==='turns'){if(busy.turns)return;setBusy('turns',true);var wantT=!tur
 post('/notify-turns',{on:wantT}).then(function(){turnsOn=wantT;paint();},fail).then(function(){setBusy('turns',false);});}
 else if(act==='test'){if(!testBtn||testBtn.disabled)return;testBtn.disabled=true;var label=testBtn.textContent;testBtn.textContent='Sending…';
 testOut.className='rbp-sub';testOut.textContent='';
-sub().then(function(s){if(!s)return {ok:false,status:0,detail:'',nosub:true};return post('/push/test',{endpoint:s.endpoint});}).then(function(d){
+var at=activeSession();   // read AT the press, before any await: the session you were looking at, not the one you switch to while it sends
+sub().then(function(s){if(!s)return {ok:false,status:0,detail:'',nosub:true};return post('/push/test',{endpoint:s.endpoint,sid:at.sid,host:at.host});}).then(function(d){
 var ok=!!(d&&d.ok);testOut.classList.toggle('bad',!ok);
 testOut.textContent=ok?'The push service accepted it.':(d&&d.nosub?"This device isn't subscribed yet.":
 (d&&d.status?('The push service refused it: '+d.status+' '+(d.detail||'')+'.'):('Could not reach the push service: '+((d&&d.detail)||'no answer')+'.')));
+if(ok&&d.name)testOut.textContent+=' Tapping it brings you back to '+d.name+'.';   // addressed to a session: say where the tap goes, in the kernel's words (the body names it the same way)
 if(!isOn)testOut.textContent+=" Real notifications won't arrive until the main switch is on.";   // the test ignores the switches on purpose; say so
 },function(e){testOut.classList.add('bad');testOut.textContent='Test failed: '+((e&&e.message)||e)+'.';})
 .then(function(){testBtn.disabled=false;testBtn.textContent=label;});}
@@ -32662,8 +32699,11 @@ if(!isOn)testOut.textContent+=" Real notifications won't arrive until the main s
 # message the Log's bell entries post — but only once the feed has its cards, which it announces
 # with {romp:'ready', app:'feed'} after its first payload renders (before that the iframe may have
 # no listener yet, or nothing to scroll to); a tap that arrives earlier waits for exactly that
-# message. A sid-less tap (a test notification) has nowhere to land: the SW's focus/openWindow was
-# the whole action. A /reveal the kernel refuses lands in the Log rather than vanishing.
+# message. ANY sid lands, whatever the kind: a test notification carries the session the user was
+# looking at when they pressed the button (2026-09-06) and comes back to it exactly like a turn's;
+# only a card kind adds the card scroll. A sid-less tap (a test pressed with no session in front)
+# has nowhere to land: the SW's focus/openWindow was the whole action. A /reveal the kernel refuses
+# lands in the Log rather than vanishing.
 # Its own <script>, like every shell behaviour (test_kernel_mobile's count pin): a throw in the
 # bell's script must not strand a tap, and a bell that bails where the Push API is missing must
 # not take the deep-link half with it.
@@ -34885,15 +34925,21 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/push/test":
                 # the popover's test button (2026-09-05): one notification to THIS device's
                 # subscription, the push service's answer back verbatim — {ok, status, detail}.
-                # Missing crypto is the same loud 500 the subscribe route gives.
+                # Since 2026-09-06 addressed to the session the shell had in front (sid, host-
+                # prefixed for a federated one, plus host), so the tap comes back to it; no sid is
+                # the plain probe. Missing crypto is the same loud 500 the subscribe route gives.
                 try:
-                    _ep = str(json.loads(raw_body or b"{}").get("endpoint") or "")
+                    _tb = json.loads(raw_body or b"{}")
+                    _ep = str(_tb.get("endpoint") or "")
+                    _tsid, _thost = _tb.get("sid") or "", _tb.get("host") or ""
                 except (ValueError, AttributeError):
                     return self._send(400, "bad json", "text/plain")
                 if not _ep:
                     return self._send(400, "missing endpoint", "text/plain")
+                if not isinstance(_tsid, str) or not isinstance(_thost, str):
+                    return self._send(400, "bad sid", "text/plain")
                 try:
-                    _res = _push_test(_ep)
+                    _res = _push_test(_ep, _tsid, _thost)
                 except RuntimeError as e:
                     return self._send(500, str(e), "text/plain")
                 return self._send(200, json.dumps(_res), "application/json")
