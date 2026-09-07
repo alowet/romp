@@ -1,19 +1,32 @@
 #!/usr/bin/env bash
 # romp pre-push hook: refuse to publish a commit that carries a personal identifier.
 #
-# The repo may go public and history is permanent, so this scans the COMMITS
-# BEING PUSHED (every new commit's full tree, not the working tree) for the
-# strings in ~/.config/romp/private-strings.txt — one banned string per line,
-# `#` comments and blank lines ignored, matched case-insensitively. With no such
-# file it exits 0 and stays out of your way, so on a clone that never set one up
-# (any contributor's machine) it is a no-op.
+# The repo may go public and history is permanent, so this reads the COMMITS
+# BEING PUSHED (not the working tree) for the strings in
+# ~/.config/romp/private-strings.txt — one banned string per line, `#` comments
+# and blank lines ignored, matched case-insensitively. With no such file it
+# exits 0 and stays out of your way, so on a clone that never set one up (any
+# contributor's machine) it is a no-op.
 #
-# Why pushed trees rather than a working-tree scan: the hook is symlinked into
+# Two checks per pushed ref, both about what THIS push changes on the remote:
+#
+#   the tip's tree    the content the push exposes. A banned string anywhere in
+#                     it refuses the push.
+#   each new commit   the lines it ADDS against its first parent. A string
+#                     introduced in an intermediate commit and removed by a
+#                     later one is still caught, and the commit named; a commit
+#                     whose tree merely INHERITS a string an older commit put
+#                     there is not. Every commit on every branch cut from main
+#                     between a string landing there and its redaction inherits
+#                     it that way, and a per-commit TREE scan refuses them all,
+#                     over files the branch never touched, when the only
+#                     exposure any of them could add is its tip.
+#
+# Why pushed commits rather than a working-tree scan: the hook is symlinked into
 # the SHARED git hooks dir (by install.sh), so it fires from every worktree —
 # but a working-tree scan is only as good as the tree you happen to push from,
 # and an untracked scanner script exists in only one worktree. Reading the
-# denylist from $HOME and grepping the pushed shas arms every worktree equally,
-# and catches a string buried in an intermediate commit whose tip is clean.
+# denylist from $HOME and reading the pushed shas arms every worktree equally.
 #
 # Bypass a false positive with `git push --no-verify`.
 set -euo pipefail
@@ -31,23 +44,70 @@ while IFS= read -r line; do
 done < "$strings_file"
 [ ${#grep_args[@]} -gt 0 ] || exit 0
 
+# $1 is the remote being pushed to: a name, or a bare URL when pushing by URL.
+remote="${1:-}"
 zero=0000000000000000000000000000000000000000
+
+# The commits THIS push publishes for one ref: what the remote does not already
+# have. "Already has" means reachable from ANY of the remote's refs as this clone
+# last fetched them (refs/remotes/<remote>/*), not only from the ref being pushed.
+# The difference is a branch that merged main: its range holds main's commits,
+# every one of them on the remote already through main. Scanning those refuses
+# the push over a string that main itself published, and a string already on the
+# remote is fixed FORWARD, on main (redact, push main) — not by blocking every
+# branch that merged main before the redaction. The exclusion is scoped to the
+# remote being pushed to: a commit only another remote has is still new to this
+# one. With no remote-tracking refs for the remote (never fetched, or a push to a
+# bare URL) the exclusion matches nothing and the range falls back to everything
+# the remote ref lacks — for a new ref, the whole history.
+rev_range() {   # <local_sha> <remote_sha> → a rev-list argument list
+    local args="$1 --not"
+    [ "$2" = "$zero" ] || args="$args $2"
+    [ -z "$remote" ] || args="$args --remotes=$remote"
+    printf '%s' "$args"
+}
+
+# The lines a commit adds, one per line as "<path>\t<text>": its diff against
+# its first parent (for a root commit, against the empty tree). A merge is read
+# the same way, so content in neither parent — a conflict resolution — counts as
+# the merge's own addition. -M keeps a rename from re-adding every line of the
+# file. The path comes from the `+++ b/<path>` header, read only between a
+# `diff --git` line and the first hunk: inside a hunk, a line that begins with
+# `+++ ` is added content (`++ b/x` as written) and belongs to the current file.
+added_lines() {   # <rev>
+    local parent
+    { if parent=$(git rev-parse -q --verify "$1^" 2>/dev/null); then
+          git diff-tree -p -r -M --no-color "$parent" "$1"
+      else
+          git diff-tree -p -r -M --no-color --root "$1"
+      fi; } | awk '
+        /^diff --git /       { hdr = 1; next }
+        hdr && /^\+\+\+ b\// { f = substr($0, 7); next }
+        hdr && /^\+\+\+ /    { f = $0; next }
+        /^@@/                { hdr = 0; next }
+        !hdr && /^\+/        { print f "\t" substr($0, 2) }'
+}
+
 blocked=0
-while read -r _local_ref local_sha _remote_ref remote_sha; do
+while read -r local_ref local_sha _remote_ref remote_sha; do
     [ -n "${local_sha:-}" ] || continue
     [ "$local_sha" = "$zero" ] && continue          # deleting a remote ref pushes nothing
-    # Only the commits this push actually publishes: what the remote ref lacks,
-    # or (for a new ref) what no remote-tracking ref already has.
-    if [ "$remote_sha" = "$zero" ]; then
-        revs=$(git rev-list "$local_sha" --not --remotes 2>/dev/null || git rev-list "$local_sha")
-    else
-        revs=$(git rev-list "$remote_sha..$local_sha")
+
+    # The tip's tree. -I skips binaries; -l lists files.
+    if hits=$(git grep -i -I -l -F "${grep_args[@]}" "$local_sha" -- 2>/dev/null) && [ -n "$hits" ]; then
+        echo "romp pre-push: the tip of $local_ref (${local_sha:0:10}) would publish a personal identifier in:" >&2
+        echo "$hits" | sed "s/^$local_sha:/  /" >&2
+        blocked=1
     fi
+
+    # The lines each commit new to the remote adds.
+    # shellcheck disable=SC2046  # the range is deliberately word-split
+    revs=$(git rev-list $(rev_range "$local_sha" "$remote_sha") 2>/dev/null \
+           || git rev-list "$local_sha")
     for rev in $revs; do
-        # -I skips binaries; -l lists files; the tree at $rev is what ships.
-        if hits=$(git grep -i -I -l -F "${grep_args[@]}" "$rev" -- 2>/dev/null) && [ -n "$hits" ]; then
-            echo "romp pre-push: commit ${rev:0:10} would publish a personal identifier in:" >&2
-            echo "$hits" | sed "s/^$rev:/  /" >&2
+        if hits=$(added_lines "$rev" | grep -i -F "${grep_args[@]}" | cut -f1 | sort -u) && [ -n "$hits" ]; then
+            echo "romp pre-push: commit ${rev:0:10} ADDS a personal identifier in:" >&2
+            echo "$hits" | sed 's/^/  /' >&2
             blocked=1
         fi
     done
@@ -58,6 +118,7 @@ if [ "$blocked" -ne 0 ]; then
     echo "romp pre-push: BLOCKED — a banned string from $strings_file is in a pushed commit." >&2
     echo "  Replace it with synthetic data (see CONTRIBUTING.md), then push again." >&2
     echo "  If the string is only in an INTERMEDIATE commit, squash or rewrite the branch." >&2
+    echo "  If the tip only INHERITS a string an older commit added and main has since redacted, merge main." >&2
     echo "  To bypass for one push (you are sure it is fine): git push --no-verify" >&2
     exit 1
 fi

@@ -288,11 +288,14 @@ PY
 # ── git pre-push identifier hook ──────────────────────────────────────
 # install.sh symlinks .githooks/pre-push into the shared git hooks dir. The hook
 # reads the banned strings from ~/.config/romp/private-strings.txt (so it arms
-# EVERY worktree, not just the one holding an untracked scanner) and greps each
-# PUSHED commit's tree — the working tree is not what gets published, and a leak
-# in an intermediate commit ships even when the tip is clean. No strings file →
-# a no-op, so a contributor's clone is unaffected. (ROMP_GITHOOK_DIR redirects
-# install.sh's symlink target below; the behaviour tests copy the hook directly.)
+# EVERY worktree, not just the one holding an untracked scanner) and reads the
+# PUSHED commits, not the working tree, which is not what gets published: each
+# pushed ref's TIP tree must be clean, and each commit new to the remote must
+# ADD no banned line — so a leak in an intermediate commit is caught even when
+# the tip is clean, while a tree that only inherits an older one is not refused.
+# No strings file → a no-op, so a contributor's clone is unaffected.
+# (ROMP_GITHOOK_DIR redirects install.sh's symlink target below; the behaviour
+# tests copy the hook directly.)
 
 @test "install.sh: symlinks the pre-push hook into the git hooks dir" {
     run "$ROMP_DIR/install.sh"

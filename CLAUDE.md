@@ -57,11 +57,14 @@ This repo may go public; assume every commit is permanent and world-readable.
   `notes-api` with `web`/`api`/`tests` sessions) rather than inventing per-test
   worlds.
 - Two machine-local backstops enforce this, neither a substitute for the rule:
-  the `.githooks/pre-push` hook greps every PUSHED commit's tree for the strings
-  in `~/.config/romp/private-strings.txt` (absent file → no-op, so contributors
-  are unaffected; it scans pushed shas, not the working tree, so it arms every
+  the `.githooks/pre-push` hook greps each pushed ref's TIP tree, plus the lines
+  every commit new to the remote ADDS, for the strings in
+  `~/.config/romp/private-strings.txt` (absent file → no-op, so contributors
+  are unaffected; it reads pushed shas, not the working tree, so it arms every
   worktree — a working-tree scan missed a leak pushed from a peer worktree on
-  2026-07-25); and the maintainer's clone carries an UNTRACKED
+  2026-07-25; and added lines rather than every commit's tree, so a branch that
+  only INHERITED a string main has since redacted pushes once it merges main —
+  2026-09-06); and the maintainer's clone carries an UNTRACKED
   `tests/test_no_personal_identifiers.py` that scans the working tree for the
   same strings plus that machine's hostname and home path. The pytest file is
   deliberately not in the repo: one machine's identifiers mean nothing on anyone
