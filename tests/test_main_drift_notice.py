@@ -107,6 +107,92 @@ class DriftWiring(unittest.TestCase):
             km._LAST_AUTO_CONVERGE[0] = saved[5]
             km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = saved[6], saved[7]
 
+    def test_the_cool_down_holds_across_the_restart_it_spaces(self):
+        # T240: the cool-down lived in module memory ("a restart resets it, which is fine — the
+        # restart WAS the converge"). It was not fine: the converge's own restart boots a fresh
+        # process with the cool-down at zero, so the next merge converged again at once — 05:19Z then
+        # 05:24Z against a 1500 s window. The last DEPLOY restart is read from durable state (the
+        # restart-cuts ledger's newest deploy row), so a fresh process still honours the window.
+        import json, time
+        ran = []
+        saved = (km._update_mode, km._origin_main_sha, km._checkout_sha, km._kernel_sha,
+                 km._run_main_update, km._LAST_AUTO_CONVERGE[0], km._MAIN_DRIFT[0], km._MAIN_DRIFT[1])
+        km._update_mode = lambda: "auto"
+        km._checkout_sha = lambda: "aaa"
+        km._kernel_sha = lambda: "aaa"
+        km._origin_main_sha = lambda: "bbb"
+        km._run_main_update = lambda kind, immediate=False: ran.append(kind)
+        try:
+            km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
+            km._LAST_AUTO_CONVERGE[0] = 0.0                       # a FRESH process: module memory is empty
+            now = time.time()
+            with open(km.RESTART_CUTS_FILE, "a") as f:            # …but the ledger says a deploy restart
+                f.write(json.dumps({"t": int(now - 300), "reason": "main-converge", "cutTurns": []}) + "\n")
+            km._main_drift_check()
+            self.assertEqual(ran, [], "5 min after a landed deploy restart, the cool-down still holds")
+            self.assertEqual(km._MAIN_DRIFT[0], "", "the deferred sha stays unoffered — the first pass past the window takes the LATEST")
+            km.RESTART_CUTS_FILE.write_text(json.dumps({"t": int(now - 2000), "reason": "p2p-update: from X to Y",
+                                                        "cutTurns": []}) + "\n")
+            km._main_drift_check()
+            self.assertEqual(ran, ["pull"], "past the window, the converge fires")
+        finally:
+            (km._update_mode, km._origin_main_sha, km._checkout_sha, km._kernel_sha,
+             km._run_main_update) = saved[:5]
+            km._LAST_AUTO_CONVERGE[0] = saved[5]
+            km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = saved[6], saved[7]
+            if km.RESTART_CUTS_FILE.exists():
+                km.RESTART_CUTS_FILE.unlink()
+
+    def test_the_audit_row_anchors_the_window_when_the_cut_row_was_lost(self):
+        # review find, reproduced by simulation: a stale-manager converge can lose its cut row (the
+        # parent-watch exited the kernel mid-drain). The deploy's AUDIT row is written before the
+        # restart and survives — it anchors the window on its own.
+        import json, time
+        now = time.time()
+        audit = km.jd.STATE / "restart-audit.jsonl"
+        audit.write_text(json.dumps({"t": int(now - 300), "action": "main-converge", "when": "now", "tag": "pull"}) + "\n")
+        try:
+            if km.RESTART_CUTS_FILE.exists():
+                km.RESTART_CUTS_FILE.unlink()
+            self.assertAlmostEqual(km._last_deploy_restart_t(), now - 300, delta=2, msg="no cut row needed")
+            audit.write_text(json.dumps({"t": int(now - 200), "action": "main-converge", "tag": "abc"}) + "\n")
+            self.assertEqual(km._last_deploy_restart_t(), 0.0, "a clicked-Update request row without when=now "
+                             "is not a landed deploy on its own")
+            audit.write_text(json.dumps({"t": int(now - 100), "action": "p2p-update", "reason": "from X to Y",
+                                         "when": "quiet"}) + "\n")
+            self.assertAlmostEqual(km._last_deploy_restart_t(), now - 100, delta=2, msg="a peer's apply anchors too")
+        finally:
+            audit.unlink()
+
+    def test_the_parent_watch_stands_down_under_a_graceful_term(self):
+        import inspect
+        pw = inspect.getsource(km._parent_watch)
+        self.assertLess(pw.index("if _TERMINATING[0]:"), pw.index("os._exit(0)"),
+                        "the watchdog never exits the kernel out from under its own drain")
+        gt = inspect.getsource(km._graceful_term)
+        self.assertLess(gt.index("_TERMINATING[0] = True"), gt.index("_broadcast_restarting()"),
+                        "the flag is the FIRST thing the graceful term does")
+
+    def test_only_deploy_restarts_count_toward_the_cool_down(self):
+        # a rail-button restart, a self-close, an in-place skip: none of them is a converge, so none
+        # of them spaces the next one
+        import json, time
+        now = time.time()
+        km.RESTART_CUTS_FILE.write_text("".join(json.dumps(r) + "\n" for r in [
+            {"t": int(now - 3000), "reason": "main-converge", "cutTurns": []},
+            {"t": int(now - 100), "reason": "kernel-asks-manager-restart-all: rail button", "cutTurns": []},
+            {"t": int(now - 50), "reason": "main-converge-skip", "cutTurns": []},
+            {"t": int(now + 7200), "reason": "p2p-update: from X to Y", "cutTurns": []},   # a clock stepped back
+        ]))
+        try:
+            self.assertAlmostEqual(km._last_deploy_restart_t(), now - 3000, delta=2)
+            km.RESTART_CUTS_FILE.write_text(json.dumps(
+                {"t": int(now - 200), "reason": "self-update: v0.15 -> v0.16", "cutTurns": []}) + "\n")
+            self.assertAlmostEqual(km._last_deploy_restart_t(), now - 200, delta=2,
+                                   msg="a release self-update is a deploy restart too")
+        finally:
+            km.RESTART_CUTS_FILE.unlink()
+
     def test_the_shell_banner_carries_the_drift_variants(self):
         src = inspect.getsource(km)
         self.assertIn("m.drift||''", src, "the shell relay forwards the drift kind")

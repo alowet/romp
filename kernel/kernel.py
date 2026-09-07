@@ -3958,7 +3958,12 @@ _MAIN_CHECK_EVERY_S = 300
 # no-op sleep with pytest printing nothing until the 15-minute cap.
 _CHECK_LOOP_STOP = threading.Event()
 _CONVERGE_COOLDOWN_S = float(os.environ.get("ROMP_CONVERGE_COOLDOWN", "1500"))   # min gap between AUTO converges (25 min → ≤2-3 restarts/hour on a hot main)
-_LAST_AUTO_CONVERGE = [0.0]   # when the last auto converge fired (module state; a restart resets it, which is fine — the restart WAS the converge)              # one ls-remote — cheap enough to notice a merge within minutes
+_LAST_AUTO_CONVERGE = [0.0]   # when THIS process last fired an auto converge — module memory that covers only
+#                               the seconds before the restart's own ledger row lands. It is NOT the cool-down's
+#                               source of truth: the converge's restart boots a fresh process with this at zero,
+#                               so the next merge converged again at once (05:19Z then 05:24Z against a 1500 s
+#                               window, T240). _last_deploy_restart_t reads the LANDED deploy restarts from the
+#                               restart-cuts ledger, which survives the restart it spaces.
 _MAIN_DRIFT = ["", ""]                 # [origin sha a notice fired for, checkout sha one fired for]
 
 
@@ -4276,6 +4281,69 @@ def _in_place_converge(target):
     return False
 
 
+_DEPLOY_RESTART_REASONS = ("main-converge", "p2p-update", "self-update",   # ledger reasons that ARE a
+                           "kernel-asks-manager-restart-all: self-update")   # deploy restart of this kernel
+_NO_RESTART_ACTIONS = {"main-converge-skip", "bus-converge", "end-on-idle"}   # audit rows that restart no
+#                                                                              kernel (in-place converges; a
+#                                                                              session's own self-close ask)
+
+
+def _last_deploy_restart_t():
+    """When the last DEPLOY restart actually LANDED on this box, from the restart-cuts ledger — the
+    row a restarting kernel writes as it dies, with `reason` joined from the audit row that asked
+    (main-converge, or a p2p-update from a peer; a main-converge-skip never restarts, a rail-button or
+    self-close restart is not a converge; a clicked Update IS one — the user just restarted, and
+    spacing the next AUTO converge after it is exactly the rate the cool-down exists for). Durable
+    across the restart it spaces, which module memory is not (T240). 0.0 when the ledger has no such
+    row or cannot be read — the cool-down then rests on module memory alone, exactly today's
+    behavior. A row stamped in the FUTURE (a clock stepped back) is ignored rather than holding every
+    converge until the clock catches up (review find)."""
+    try:
+        lines = RESTART_CUTS_FILE.read_text().strip().splitlines()[-200:]
+    except Exception:
+        lines = []                      # no ledger yet (or unreadable): the audit file below still counts
+    horizon = time.time() + 60.0
+    best = 0.0
+    for line in reversed(lines):
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        reason = str((r or {}).get("reason") or "")
+        if reason.startswith("main-converge-skip"):
+            continue
+        t = r.get("t")
+        if any(reason.startswith(p) for p in _DEPLOY_RESTART_REASONS) and isinstance(t, (int, float)) \
+                and t <= horizon:
+            best = float(t)
+            break
+    # The audit row is the SECOND source, and the one that survives the row-loss race (review find,
+    # reproduced by simulation): a converge that finds its manager stale takes the shutdownAll path,
+    # the manager exits ~0.8 s after the SIGTERM, and the kernel's parent-watch could os._exit before
+    # the graceful term finished its drain and wrote the cut row — the very path THIS change's own
+    # deploy takes. The old kernel writes its main-converge / self-update audit row BEFORE it posts
+    # the restart, and a peer's p2p-update row lands before its apply restarts us, so the request
+    # time anchors the window when the landing row is missing. The newer of the two wins.
+    try:
+        alines = (jd.STATE / "restart-audit.jsonl").read_text().strip().splitlines()[-200:]
+    except Exception:
+        alines = []
+    for line in reversed(alines):
+        try:
+            a = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(a, dict) or not isinstance(a.get("t"), (int, float)) or a["t"] > horizon:
+            continue
+        act, reason = str(a.get("action") or ""), str(a.get("reason") or "")
+        deploy = (act == "main-converge" and a.get("when") == "now") or act in ("p2p-update", "self-update") \
+            or (act == "kernel-asks-manager-restart-all" and reason.startswith("self-update"))
+        if deploy:
+            best = max(best, float(a["t"]))
+            break
+    return best
+
+
 def _main_drift_check():
     """One origin/checkout/running comparison pass; fires the SAME banner as the release check (the
     shell's offer() renders the main-drift wording off kind:"main"). Re-fires only when the target sha
@@ -4313,7 +4381,12 @@ def _main_drift_check():
         # further auto converges HOLD for a cool-down; the slot is left unoffered so the first pass
         # past the window converges to the LATEST sha — N merges, one restart. A deliberate rate
         # policy on restart disruption, not a proxy for an event; a clicked Update never waits.
-        if time.time() - _LAST_AUTO_CONVERGE[0] < _CONVERGE_COOLDOWN_S:
+        # The window is measured from the last deploy restart that LANDED (the ledger), not from
+        # this process's memory: the converge's own restart forgets module state, and a p2p-update
+        # restart from a peer resets it the same way (T240). Module memory still covers the seconds
+        # before the ledger row exists.
+        last = max(_LAST_AUTO_CONVERGE[0], _last_deploy_restart_t())
+        if time.time() - last < _CONVERGE_COOLDOWN_S:
             _MAIN_DRIFT[slot] = ""
             return
         _LAST_AUTO_CONVERGE[0] = time.time()
@@ -15245,25 +15318,72 @@ def _mark_boot(kind):
         pass
 
 
+def _audit_reason_text(rec):
+    """The cut row's `reason` for an audit row (or "" for none): action, plus its reason when it has one."""
+    if not isinstance(rec, dict):
+        return ""
+    return str(rec.get("action") or "") + (": " + str(rec["reason"]) if rec.get("reason") else "")
+
+
+def _consumed_audit_t():
+    """The `t` of the audit row the NEWEST cut row already joined (auditT) — a row consumed by the
+    restart it asked for must not name a later, anonymous cut too: a quiet p2p row stays inside its
+    20-minute window long after its restart landed, so an unaudited SIGTERM 15 minutes later
+    inherited its reason and even counted as a deploy for the cool-down (T240 review)."""
+    try:
+        lines = RESTART_CUTS_FILE.read_text().strip().splitlines()
+        for line in reversed(lines[-20:]):
+            r = json.loads(line)
+            if isinstance(r, dict) and "cutTurns" in r:          # a cut row (boot rows carry no cuts)
+                return int(r.get("auditT") or 0)
+    except Exception:
+        pass
+    return 0
+
+
 def _recent_restart_reason(window=90, now=None):
     """The most recent restart-audit action within `window` seconds — joins the cut row to WHO asked
     (deploy refresh, self-update, the rail button…). Best-effort: an anonymous SIGTERM has no row
     and reads as ""."""
+    return _audit_reason_text(_recent_restart_audit(window=window, now=now))
+
+
+def _recent_restart_audit(window=90, now=None):
+    """The restart-audit ROW (dict) that explains a cut happening now, or None: the newest row that
+    requested a kernel restart, not yet consumed by an earlier cut, inside its window (90 s; a
+    quiet-window request stays pending up to the far manager's 15-minute backstop)."""
     try:
         tail = (jd.STATE / "restart-audit.jsonl").read_text().strip().splitlines()
         if not tail:
-            return ""
-        rec = json.loads(tail[-1])
+            return None
+        consumed = _consumed_audit_t()
+        rec = None
+        for line in reversed(tail[-50:]):
+            # walk PAST rows that requested no restart — an in-place converge (main-converge-skip) or
+            # a bus bounce writes an audit row but cuts no kernel, and reading only the last row named
+            # a real cut after it as the skip (T240 nit)
+            try:
+                cand = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(cand, dict) and str(cand.get("action") or "") in _NO_RESTART_ACTIONS:
+                continue
+            if isinstance(cand, dict) and consumed and cand.get("t") == consumed:
+                return None                          # spent on the cut it asked for — this cut is anonymous
+            rec = cand
+            break
+        if rec is None:
+            return None
         t0 = int(now if now is not None else time.time())
         if isinstance(rec, dict) and rec.get("when") == "quiet":
             # a QUIET-WINDOW request is pending until the restart it asked for lands — up to the far
             # manager's 15-minute backstop — so it names the cut well past the immediate window (T238)
             window = max(window, RESTART_EXPECT_MAX_S)
         if isinstance(rec, dict) and isinstance(rec.get("t"), int) and t0 - rec["t"] <= window:
-            return str(rec.get("action") or "") + (": " + str(rec["reason"]) if rec.get("reason") else "")
+            return rec
     except Exception:
         pass
-    return ""
+    return None
 
 
 def _local_machine_label():
@@ -34448,6 +34568,10 @@ class Handler(BaseHTTPRequestHandler):
                 # but arms nothing; the manager reads the serve-token file and sends X-Romp-Token.
                 be = _sdk()
                 n = be.busy_count() if be and hasattr(be, "busy_count") else 0
+                # the breakdown rides beside the total (T240): the manager defers on EITHER kind of
+                # busyness but asks for the drain hold only while turns are actually in flight —
+                # background work must never freeze other sessions' queued prompts
+                inflight, background = (be.busy_breakdown() if be and hasattr(be, "busy_breakdown") else (n, 0))
                 draining = False
                 if be is not None and hasattr(be, "refresh_drain_hold"):
                     if q.get("drain", [""])[0] == "1":
@@ -34458,7 +34582,8 @@ class Handler(BaseHTTPRequestHandler):
                             _note_drain_refused()    # T224: the one event the gate exists for —
                             #                          read LOUDLY, once per episode (see the helper)
                     draining = be.drain_holding()
-                return self._send(200, json.dumps({"busy": n, "draining": draining}),
+                return self._send(200, json.dumps({"busy": n, "inflight": inflight, "background": background,
+                                                   "draining": draining}),
                                   "application/json", cache="no-cache")
             if p == "/manifest.webmanifest":
                 # the install manifest — auth-exempt like /healthz, and for a hard reason: the
@@ -37202,15 +37327,24 @@ def _pid_alive(pid):
         return True
 
 
+_TERMINATING = [False]   # set the moment _graceful_term starts: the watchdog below must not exit under it
+
+
 def _parent_watch():
     """Exit if the manager that spawned us (ROMP_MANAGER_PID) dies, so a supervisor crash doesn't
-    orphan the kernel. No-op when launched standalone (no ROMP_MANAGER_PID)."""
+    orphan the kernel. No-op when launched standalone (no ROMP_MANAGER_PID). STANDS DOWN while a
+    graceful term is already running (T240 review): a stale manager's shutdownAll SIGTERMs us and
+    exits ~0.8 s later, and this watchdog used to os._exit the kernel mid-drain — before the cut
+    row was written — losing the ledger row the deploy cool-down and the T121 metrics depend on.
+    The graceful term owns the exit then; it is bounded (~2 s) and ends in os._exit itself."""
     pid = os.environ.get("ROMP_MANAGER_PID")
     if not (pid and pid.isdigit()):
         return
     pid = int(pid)
     while _pid_alive(pid):
         time.sleep(2)
+    if _TERMINATING[0]:
+        return                                       # the graceful term is finishing the job
     os._exit(0)
 
 
@@ -37222,6 +37356,7 @@ def _graceful_term(signum, frame):
     mutation, and a cut turn keeps its 'working' state tail — the NEXT kernel's boot reconcile
     resumes exactly those. Bounded (~2s) so `romp refresh` stays snappy. Never construct the
     backend here — no SDK sessions were running if it doesn't exist."""
+    _TERMINATING[0] = True                          # the parent-watch stands down (see _parent_watch)
     _broadcast_restarting()                        # T217: announce the death FIRST — the frame is
     #                                                the shims' eager-reconnect event, and its
     #                                                sub-second budget cannot widen the shutdown
@@ -37240,8 +37375,11 @@ def _graceful_term(signum, frame):
         # the restart-cut ledger (T121): one row per restart, ALWAYS — an empty cutTurns row is the
         # clean-drain metric, and a drain that errored writes what it knew plus the error (T143).
         try:
+            rec = _recent_restart_audit()
             row = _restart_cut_row(res, watches_armed=len(_pr_watches) + len(_watches),
-                                   audit_reason=_recent_restart_reason())
+                                   audit_reason=_audit_reason_text(rec))
+            if rec:
+                row["auditT"] = int(rec["t"])       # the audit row this cut CONSUMED (see _recent_restart_audit)
             if err:
                 row["drainError"] = err.strip().splitlines()[-1][:200]
             _append_restart_cut(row)

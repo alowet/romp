@@ -49,6 +49,21 @@ class DrainLease(unittest.TestCase):
         self.assertTrue(woken, "the lease-end timer nudges every input generator — a held fresh "
                                "turn starts without waiting for another event")
 
+    def test_a_lapsed_lease_re_armed_moments_later_is_the_same_episode(self):
+        # T240: the manager drops the hold during background-only stretches and re-arms it when a
+        # turn starts — a flap, not a new park: the episode clock (the 5-minute ring) and the
+        # "parked" line must not restart per flap
+        be = _backend()
+        be.DRAIN_HOLD_TTL = 0.2
+        be.refresh_drain_hold()
+        since0 = be._drain_hold_since
+        time.sleep(0.3)                                    # lapsed
+        be.refresh_drain_hold()                            # re-armed within 2×TTL of the lapse
+        self.assertEqual(be._drain_hold_since, since0, "same episode")
+        time.sleep(0.7)                                    # lapsed for > 2×TTL: genuinely a new park
+        be.refresh_drain_hold()
+        self.assertGreater(be._drain_hold_since, since0, "a new episode starts its own clock")
+
     def test_arming_is_visible_and_a_long_hold_rings(self):
         logs = []
         be = sb.SdkBackend(tempfile.mkdtemp(), "/bin/true", lambda *a, **k: None, log=logs.append)
@@ -75,7 +90,7 @@ class DrainLease(unittest.TestCase):
                       "/busy?drain=1 refreshes the lease in the same round-trip that reads the count — "
                       "but the arm is a WRITE, gated on an explicit token (the behavioral pins live "
                       "in tests/test_kernel_auth_hardening.py::BusyDrainWriteGate); the READ stays exempt")
-        self.assertIn('json.dumps({"busy": n, "draining": draining})', ksrc,
+        self.assertIn('json.dumps({"busy": n, "inflight": inflight, "background": background,', ksrc,
                       "the payload says when the box is draining — glanceable, never mysterious")
         self.assertIn("'http://127.0.0.1:%d/restart-all'", ksrc,
                       "the self-update deploy cuts IMMEDIATELY (T160, reversing the T121 quiet "
@@ -84,7 +99,7 @@ class DrainLease(unittest.TestCase):
         self.assertNotIn("/restart-all?when=quiet'", ksrc,
                          "no kernel-side deploy path defaults to the quiet window any more")
         msrc = open(os.path.join(BIN, "romp-manager")).read()
-        self.assertIn("fetchBusy(KERNEL_PORT, cb, '/busy?drain=1')", msrc,
+        self.assertIn("fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1' : '/busy')", msrc,
                       "the manager's PARKED poll is the lease's refresher")
 
 

@@ -148,8 +148,10 @@ test('quietTick: the answer to the CURRENT park still applies exactly as before'
 test('the parked quiet poll refreshes the kernel drain lease in the same probe', () => {
   const fs = require('node:fs');
   const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'romp-manager'), 'utf8');
-  assert.ok(src.includes("fetchBusy(KERNEL_PORT, cb, '/busy?drain=1')"),
-    'the quiet tick binds the drain-refresh spelling of the probe');
+  assert.ok(src.includes("fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1' : '/busy')"),
+    'the quiet tick binds the drain-refresh spelling of the probe — while a turn is in flight (T240)');
+  assert.ok(src.includes('const holdTurns = park.lastInflight === undefined || park.lastInflight > 0;'),
+    'the hold is asked for only while a turn is actually in flight (or on the first, uninformed poll) — background-only busyness defers without freezing other sessions');
   assert.ok(src.includes('path: path || \'/busy\''),
     'a plain /busy stays side-effect free — only the parked poll holds');
 });
