@@ -1401,7 +1401,7 @@ body.fileview-open { overflow: hidden; }
 .fileview-sess { flex: 0 0 auto; display: block; max-width: 38%; padding: 1px 8px;
   border-radius: var(--radius-pill, 999px); font-size: 0.82em; font-weight: 600; line-height: 1.5;
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
-  background: var(--overlay-10, rgba(255, 255, 255, 0.12)); color: var(--fg); }
+  background: var(--overlay-10, rgba(255, 255, 255, 0.12)); color: var(--fg); user-select: none; }
 .fileview-sess .host-prefix { color: inherit; opacity: 0.75; }
 .fileview-acts { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
 .fileview-btn { font: inherit; font-size: 0.82em; cursor: pointer; flex: 0 0 auto;
