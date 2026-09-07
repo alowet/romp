@@ -25,12 +25,22 @@ export interface SessionViews {
    *  viewer-side so remote-homed names hold position without cross-kernel writes; locals also
    *  keep array order (the drag rewrites both). Unlisted names follow, in natural order. */
   tagOrder?: string[];
+  /** the store's write stamp (epoch s) — the stale-writer guard's evidence time, echoed back as-is */
+  at?: number;
+  /** the store's WRITE SEQUENCE (2026-09-05): strictly increasing per accepted write, on every frame
+   *  and ack the blob rides. A client adopts a blob only when its seq is at least the held one, so a
+   *  frame built before a write can never replace the ack's newer blob (views-writes.ts adoptViews). */
+  seq?: number;
 }
 // One union group = one tag NAME across every kernel defining it (user ruling 2026-08-24: kernels
 // are plumbing — no host prefixes in any tag presentation). The typed mirror of the timeline's
 // viewTagUnion over the same client blob (local tags + remoteTags); the local store's colour wins.
 // The chat's tab-menu Tags section reads and edits through this exact shape.
-export interface TagUnion { name: string; color: string; members: string[]; ids: string[]; localId: string | null; remotes: SessionTag[] }
+// `pending`: the union's local tag is an optimistic create's row, wearing the placeholder id the
+// kernel's ack replaces (views-writes.ts isPlaceholderId) — it renders, and takes no gesture: an
+// op addressed by that id would be refused as a tag that does not exist (the
+// 2026-09-05 review). Every builder of an action on a union checks it.
+export interface TagUnion { name: string; color: string; members: string[]; ids: string[]; localId: string | null; remotes: SessionTag[]; pending?: boolean }
 export function viewTagUnion(views: SessionViews | null | undefined): TagUnion[] {
   // byName is null-prototype: a user-typed tag NAME can be "constructor"/"toString", which a
   // plain {} resolves through the prototype chain (the lookup returned a Function and the
@@ -39,7 +49,7 @@ export function viewTagUnion(views: SessionViews | null | undefined): TagUnion[]
   for (const t of viewTags(views)) {
     const key = t.name || "tag";
     const g = byName[key] || (byName[key] = { name: key, color: "", members: [], ids: [], localId: null, remotes: [] });
-    if (!g.localId) { g.localId = t.id; g.color = t.color || g.color; }
+    if (!g.localId) { g.localId = t.id; g.color = t.color || g.color; if (/^pending-/.test(t.id)) g.pending = true; }
     g.ids.push(t.id);
     for (const m of (t.members || [])) if (!g.members.includes(m)) g.members.push(m);
     if (!out.includes(g)) out.push(g);

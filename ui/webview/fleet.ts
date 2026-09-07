@@ -11,6 +11,7 @@ import { loadSettings, installSettingsSync, onExternalSettingsChange } from "./s
 import { SessionViews, viewTagUnion } from "./session-views";
 import { lensVisible, surfaceLens } from "./tag-lens";
 import { openTagMenu, tagMenuButton, syncTagFilter } from "./tag-menu";
+import { mintWriteId } from "./views-writes";
 import { fleetVisibleRoots } from "./fleet-roots";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { hostPrefix } from "./host-prefix";
@@ -52,6 +53,15 @@ let pendingHosts: string[] = [];
 let pendingDead: string[] = [];
 let searchQuery = "";     // #fleet-search filter (the user 2026-06-29): show only sessions whose NAME matches
 let fleetViews: SessionViews | null = null;   // the rendered views blob off the feed payload — the outline lens reads it (2026-08-25)
+let outlineViewsWriteSeq = 0;                   // per-page counter behind this pane's lens-write ids (mintWriteId)
+// This pane's lens write: the frame copy it holds with only the outline lens changed, posted with a
+// writeId and `edited: []` (the 2026-09-05 review) — the empty list is the kernel's word
+// that the write changes NO tag, so the tags the copy carries are never applied over a newer store;
+// only the lens lands. The pane ignores the viewsAck and settles from the next feed frame, as it
+// always has (docs/read-side.md, the views contract).
+function postOutlineLens(v: SessionViews) {
+  vscodeApi?.postMessage({ type: "setTimelineViews", views: v, writeId: mintWriteId(++outlineViewsWriteSeq), edited: [] });
+}
 let syncFleetTagBtn: (() => void) | null = null;   // re-dress the tag button per the shared convention on each render
 // Provisional cards (the user 2026-06-29): a session working a brand-new prompt the planner hasn't classified
 // into a goal yet has NO ledger node, so it's invisible in the fleet — exactly the "things about to appear" the
@@ -941,7 +951,7 @@ function showHoverCard(row: HTMLElement, sid: string, nid: string): void {
           const v = JSON.parse(JSON.stringify(fleetViews || { active: "all", tags: [] }));
           v.actives = Object.assign({}, v.actives, { outline: l });
           fleetViews = v;                                        // optimistic: the next feed push echoes it
-          vscodeApi?.postMessage({ type: "setTimelineViews", views: v });
+          postOutlineLens(v);
           render();
         },
         onConfigure: () => { vscodeApi?.postMessage({ type: "openTagsDialog" }); },
@@ -957,7 +967,7 @@ function showHoverCard(row: HTMLElement, sid: string, nid: string): void {
       const v = JSON.parse(JSON.stringify(fleetViews || { active: "all", tags: [] }));
       v.actives = Object.assign({}, v.actives, { outline: l });
       fleetViews = v;
-      vscodeApi?.postMessage({ type: "setTimelineViews", views: v });
+      postOutlineLens(v);
       render();
     });
     syncFleetTagBtn();
