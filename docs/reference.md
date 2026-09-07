@@ -595,6 +595,32 @@ check whether each is still running before relaunching it. A kernel restart has
 never touched work a session deliberately detached: tmux servers, `setsid`
 children and other processes that outlive their shell.
 
+A message the kernel cannot handle does not end the session's CLI. The kernel
+handles each streamed message on its own: when a handler raises, it logs the
+exception type, the message's type and subtype, the exception's own text
+(uuid-shaped ids shortened to eight characters, clipped to 160 characters; it
+carries whatever the raising code put in it, never the message's content), what
+that message lost (an assistant or user message is also a transcript record, so
+the chat rebuilds it from disk — a compaction boundary is one too, while a model
+or mode change's confirmation line is not; a turn result still settles its turn,
+and the line says so only when the settle ran; a stream-only frame's content is
+gone until the next such frame), and a compact frame chain (file, line and
+function for at most the innermost eight frames, no locals, at most 600
+characters, dropping outer frames first so the failing frame is always named) to
+the kernel log and the dashboard's error center, then goes on to the next
+message. A failure while filing a turn result — its spend, its live-tail
+sweep — still settles the turn: the session reads waiting, its queue moves,
+and a reconnect that waited for the turn's end runs. A handler that
+fails on every message is one error-center entry with a repeat count; every
+repeat is still a kernel log line, and an entry the ring has since dropped
+re-enters with its full detail.
+Before 2026-09-06 one such exception ended the receive loop, which closed the
+CLI in the middle of its work (the in-flight turn, its subagents, its background
+tasks) and resumed the session as after a crash. A fault of the stream itself,
+such as the CLI exiting or its transport closing, still ends the loop; the log
+names the failing task and its frame chain, and the session resumes with its
+history, told what was cut.
+
 A service restart (`systemctl --user restart romp-manager`, or the machine's
 own service management) kills everything in the service's cgroup, so on Linux
 under systemd Romp runs each session's CLI, and the default tmux server the
