@@ -26186,7 +26186,34 @@ def _derive_judging(sid, caps, goals, t0, out, seg_ends=None):
         pass
 
 
-_session_tok_cache = {}   # path -> (mtime, [(t, in, out, cache_w, cache_r, model), ...]): per-message token rows
+_session_tok_cache = {}   # transcript path -> ((mtime, size), [(t, in, out, cache_w, cache_r, model), ...]): one
+#                           token row per API RESPONSE (message.id) in THAT file. The main transcript and each
+#                           subagent transcript cache separately, so a file that moved re-parses itself alone
+
+
+def _subagent_transcripts(path):
+    """The subagent transcripts beside a session's main one, sorted; [] when none. The CLI writes each
+    spawned agent's conversation under `<sid>/subagents/` next to `<sid>.jsonl`: Task agents as
+    `agent-<id>.jsonl` at the top, and (Claude Code 2.1.261) Workflow agents one level down at
+    `workflows/wf_<id>/agent-<id>.jsonl` — its path parser takes any extra segments — so the walk is
+    RECURSIVE (a flat listing misses every nested file; measured on one installation, those held a
+    quarter of the sessions' tokens and 62% of their output tokens). Bounded to the session's own
+    subagents tree: no symlink is followed — not a directory (os.walk's followlinks=False), not a FILE
+    (os.walk lists a symlinked file like any other and the reader would open it wherever it points; the
+    CLI writes none, so one is a user's, and it is skipped), and not the subagents directory itself.
+    Cost: one directory read per directory under it plus one lstat per file."""
+    base, ext = os.path.splitext(str(path))
+    if ext != ".jsonl":
+        return []
+    d = os.path.join(base, "subagents")
+    if os.path.islink(d):
+        return []
+    out = []
+    for root, dirs, files in os.walk(d):            # followlinks=False — never leaves the session's own tree
+        dirs.sort()
+        out.extend(p for p in (os.path.join(root, n) for n in files if n.endswith(".jsonl"))
+                   if not os.path.islink(p))
+    return sorted(out)
 
 
 def _msg_epoch(o):
@@ -26200,44 +26227,109 @@ def _msg_epoch(o):
         return None
 
 
-def _session_tokens(path, t0):
-    """Sum a session's token usage over assistant messages timestamped >= t0 — the SESSIONS half of the
-    token split, windowed to match the PIPELINE half (_judge_usage) so the footer compares like-for-like.
-    Each assistant record carries a `usage` block. The per-message rows are mtime-cached (now-independent);
-    the windowed sum is computed per call. Undated rows are counted (defensive). Zeros on error."""
-    z = {"in": 0, "out": 0, "cache_w": 0, "cache_r": 0}
+def _transcript_tok_rows(p):
+    """ONE transcript file's per-response token rows, cached in _session_tok_cache on the file's
+    (mtime, size) stamp — the parse runs only when the stamp moved — or None when the file is unreadable.
+
+    ONE row per API response, not per transcript record: the CLI writes a response with several content
+    blocks as several assistant records that share one `message.id`, so summing records counted each
+    response 2.3-3.0x (the analytics read 1.55x the spend ledger over a day). The row kept is the one
+    with the LARGEST output count, and that rule is load-bearing, not defensive: a MAIN transcript's
+    same-id records repeat one usage block, but a SUBAGENT transcript's carry the stream-start snapshot
+    (a few output tokens) on every record but the last, which holds the final tally — measured on one
+    installation's subagent files, about nine in ten multi-record groups differ (88% and 94% on two
+    samples) and the last record holds the maximum in every one; a first-record fold would keep about a
+    tenth of the subagents' output tokens. That is an observed regularity of the CLI's writer, not a
+    documented contract: a writer that logged per-block usage DELTAS under one id would be under-counted
+    by it. A record with no id counts on its own. The fold is per FILE: each API response is logged in
+    exactly one transcript, the conversation that made it (no id shared between a main transcript and
+    its subagents' in 130k measured), so the session's rows are the files' rows concatenated."""
     try:
-        mt = os.path.getmtime(path)
+        st = os.stat(p)
     except OSError:
-        return dict(z)
-    hit = _session_tok_cache.get(path)
-    if not hit or hit[0] != mt:
-        rows = []
-        try:
-            with open(path, errors="replace") as f:
-                for line in f:
-                    try:
-                        o = json.loads(line)
-                    except Exception:
+        return None
+    stamp = (st.st_mtime, st.st_size)
+    hit = _session_tok_cache.get(p)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    rows, by_id = [], {}
+    try:
+        with open(p, errors="replace") as f:
+            for line in f:
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(o, dict) or o.get("type") != "assistant":
+                    continue
+                m = o.get("message") or {}
+                u = m.get("usage") or {}
+                row = (_msg_epoch(o),
+                       int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
+                       int(u.get("cache_creation_input_tokens") or 0),
+                       int(u.get("cache_read_input_tokens") or 0),
+                       m.get("model") or "")   # for cost weighting (price is per-model)
+                mid = m.get("id")
+                if mid:
+                    j = by_id.get(mid)
+                    if j is not None:            # the same response again (another content block)
+                        if row[2] > rows[j][2]:
+                            rows[j] = (rows[j][0],) + row[1:]
                         continue
-                    if o.get("type") != "assistant":
-                        continue
-                    m = o.get("message") or {}
-                    u = m.get("usage") or {}
-                    rows.append((_msg_epoch(o),
-                                 int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
-                                 int(u.get("cache_creation_input_tokens") or 0),
-                                 int(u.get("cache_read_input_tokens") or 0),
-                                 m.get("model") or ""))   # for cost weighting (price is per-model)
-        except OSError:
-            return dict(z)
-        _session_tok_cache[path] = (mt, rows)
-        hit = _session_tok_cache[path]
-    acc = dict(z)
-    for (t, i, o, cw, cr, _m) in hit[1]:
-        if t is None or t >= t0:
-            acc["in"] += i; acc["out"] += o; acc["cache_w"] += cw; acc["cache_r"] += cr
-    return acc
+                    by_id[mid] = len(rows)
+                rows.append(row)
+    except OSError:
+        return None
+    _session_tok_cache[p] = (stamp, rows)
+    return rows
+
+
+def _session_tok_rows(path):
+    """A session's per-response token rows — the main transcript's and every subagent transcript's
+    under it (_transcript_tok_rows each) — or None when the main transcript is unreadable. Each file
+    caches on its OWN stamp, so a subagent that lands or grows parses that one file while the main
+    transcript's rows (the largest file by far) stay cached, and the main file moving leaves every
+    subagent's rows in place; a per-session fingerprint would re-parse the whole tree whenever any one
+    file moved, which on a session with Workflow agents running is every build. A subagent file gone
+    between the listing and the read drops out and the rest still count. Cost per call: the subagents
+    walk (one directory read per directory), one stat per file, and the concatenation; parsing only for
+    the files whose stamp moved. The analytics build calls this ONCE per session (_session_usage)."""
+    rows = _transcript_tok_rows(str(path))
+    if rows is None:
+        return None
+    rows = list(rows)
+    for p in _subagent_transcripts(path):
+        sub = _transcript_tok_rows(p)
+        if sub is not None:                      # None: gone since the listing
+            rows.extend(sub)
+    return rows
+
+
+def _session_usage(path, t0, prices):
+    """The analytics build's ONE pass over a session's rows: token totals over responses timestamped
+    >= t0 (the SESSIONS half of the split, cut at the same t0 as the PIPELINE half, _judge_usage, so
+    the modal compares like-for-like) and the token-price estimate over the same span (`cost`: each
+    response's tokens x its model's _model_prices row — an ESTIMATE; sessions log no cost of their own,
+    unlike judges — with cache reads priced too, cheap per token but huge in volume). `prices` None
+    skips the pricing. Undated rows count (defensive). Zeros when the transcript is unreadable."""
+    out = {"in": 0, "out": 0, "cache_w": 0, "cache_r": 0, "cost": 0.0}
+    rows = _session_tok_rows(path)
+    if rows is None:
+        return out
+    for (t, i, o, cw, cr, model) in rows:
+        if t is not None and t < t0:
+            continue
+        out["in"] += i; out["out"] += o; out["cache_w"] += cw; out["cache_r"] += cr
+        pr = _price_for(model, prices) if prices else None
+        if pr:
+            out["cost"] += i * pr["in"] + o * pr["out"] + cw * pr["cache_w"] + cr * pr["cache_r"]
+    return out
+
+
+def _session_tokens(path, t0):
+    """A session's token totals over responses timestamped >= t0 — _session_usage's token half."""
+    u = _session_usage(path, t0, None)
+    return {k: u[k] for k in ("in", "out", "cache_w", "cache_r")}
 
 
 # judge-usage.jsonl is append-only, time-ordered, and never rotated (38.7 MB / 148k lines measured
@@ -26340,6 +26432,11 @@ DEFAULT_MODEL_PRICES = {   # $/token: input, output, cache write (5m), cache rea
                            # the LiteLLM refresh overwrites these with the live feed (which carries the
                            # exact ids), so they just need to be sane when offline / before the first fetch.
     "claude-fable-5":            {"in": 10e-6, "out": 50e-6, "cache_w": 12.5e-6, "cache_r": 1e-6},
+    "claude-fable-5-1":          {"in": 10e-6, "out": 50e-6, "cache_w": 12.5e-6, "cache_r": 0.25e-6},   # its
+    #   own row: without one the family fallback priced Fable 5.1's cache reads at Fable 5's $1/Mtok — 4x
+    #   the list rate. Rates read from Claude Code's baked-in model catalog (2.1.261, checked on 2.1.263),
+    #   where claude-fable-5-1 carries the tier `tier_10_50_cache_read_0_25` (10 / 50 / 12.5 / 0.25 $/Mtok;
+    #   1h cache writes are 20 and are folded into cache_w here at the 5m rate, a known simplification)
     "claude-opus-4-8":           {"in": 5e-6, "out": 25e-6, "cache_w": 6.25e-6, "cache_r": 0.5e-6},
     "claude-sonnet-5":           {"in": 3e-6, "out": 15e-6, "cache_w": 3.75e-6, "cache_r": 0.3e-6},
     "claude-sonnet-4-6":         {"in": 3e-6, "out": 15e-6, "cache_w": 3.75e-6, "cache_r": 0.3e-6},
@@ -26415,11 +26512,17 @@ def _model_prices(now=None):
 
 
 def _price_for(model, prices):
-    """The price row for a model: exact id, else any priced model of the same family
-    (fable/opus/sonnet/haiku) so a differently-dated id still gets a sane rate, else None
-    (uncounted — defensive)."""
+    """The price row for a model: exact id, else the priced model with the same (family, major, minor)
+    signature (a dated `claude-fable-5-1-2026…` lands on the fable-5-1 row, not on whichever fable row
+    the table lists first — the two differ 4x on cache reads), else any priced model of the same family
+    (fable/opus/sonnet/haiku) so an unknown id still gets a sane rate, else None (uncounted — defensive)."""
     if model in prices:
         return prices[model]
+    sig = _price_sig(model)
+    if sig:
+        for k, v in prices.items():
+            if _price_sig(k) == sig:
+                return v
     m = (model or "").lower()
     for fam in ("fable", "opus", "sonnet", "haiku"):
         if fam in m:
@@ -26430,21 +26533,9 @@ def _price_for(model, prices):
 
 
 def _session_cost(path, t0, prices):
-    """$ cost of a session's token usage over [t0, now], priced per-message by its model — sessions carry
-    no logged cost (unlike judges). Reuses _session_tokens' per-message row cache (which now carries the
-    model). Cache reads are cheap per token but huge in volume, so all four token classes are priced."""
-    _session_tokens(path, t0)                        # populate/refresh the row cache
-    hit = _session_tok_cache.get(path)
-    if not hit:
-        return 0.0
-    c = 0.0
-    for (t, i, o, cw, cr, model) in hit[1]:
-        if t is not None and t < t0:
-            continue
-        pr = _price_for(model, prices)
-        if pr:
-            c += i * pr["in"] + o * pr["out"] + cw * pr["cache_w"] + cr * pr["cache_r"]
-    return c
+    """The token-price ESTIMATE of a session's usage over responses timestamped >= t0 — _session_usage's
+    cost half (priced per response by its model; sessions carry no logged cost, unlike judges)."""
+    return _session_usage(path, t0, prices)["cost"]
 
 
 _ANALYTICS_MEMO = {}   # window -> {"t": epoch, "jkey": judge-usage cache size, "resp": the payload}
@@ -26455,8 +26546,9 @@ def _token_analytics(now, window):
     the coding SESSIONS total (summed transcript usage of the discovered fleet) vs the judge PIPELINE
     broken out per judge AND per tier (_judge_usage). One ARBITRARY window — the modal's period picker.
     Each side also carries $ cost so the modal can toggle tokens↔cost without a refetch: judges = exact
-    logged cost, sessions = tokens × _model_prices. Cheap: _session_tokens caches per-path rows and
-    _judge_usage reads the shared incremental row cache, so this re-sums memory."""
+    logged cost, sessions = tokens × _model_prices. Cheap: _session_usage makes ONE pass per session over
+    _session_tok_rows' cached rows and _judge_usage reads the shared incremental row cache, so this
+    re-sums memory."""
     # a tiny TTL memo: the modal refetches on every period click and every reopen, and the recompute is
     # honest-but-pointless within seconds of itself (the user 2026-08-13's fast-and-visible rule); a new
     # judge row (cache size moved) invalidates early so the numbers never sit stale behind live judging
@@ -26471,9 +26563,9 @@ def _token_analytics(now, window):
     # the full window but sessions over only the last 48h of activity — the "judges = N% of session
     # cost" note was wrong there by construction (the user 2026-08-13's map)
     for fsid, path, anchor, name in jd.discover(now, window=max(window, 48 * 3600)):
-        d = _session_tokens(str(path), t0)
+        d = _session_usage(str(path), t0, prices)
         s["in"] += d["in"]; s["out"] += d["out"]
-        s["cost"] += _session_cost(str(path), t0, prices)
+        s["cost"] += d["cost"]
     resp = {"window": window, "now": now, "sessions": s, "judges": _judge_usage(t0)}
     _ANALYTICS_MEMO[window] = {"t": now, "jkey": _JUDGE_USAGE_CACHE["size"], "resp": resp}
     return resp

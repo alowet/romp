@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for build_timeline's token-usage split:
-  _session_tokens  — per-session transcript token sums (the SESSIONS half)
+  _session_tokens  — per-session transcript token sums (the SESSIONS half), one row per API
+                     response across the main transcript and its subagents' (_session_tok_rows)
   _judge_usage     — the judge PIPELINE rollup from judge-usage.jsonl (per-judge / per-tier)
 Synthetic data only (placeholder usage numbers, a temp state dir)."""
 import json
@@ -26,10 +27,12 @@ def iso(epoch):
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
-def _asst(usage, ts=None, model=None):
+def _asst(usage, ts=None, model=None, mid=None):
     msg = {"role": "assistant", "content": [], "usage": usage}
     if model is not None:
         msg["model"] = model
+    if mid is not None:
+        msg["id"] = mid
     o = {"type": "assistant", "message": msg}
     if ts is not None:
         o["timestamp"] = ts
@@ -55,6 +58,149 @@ class SessionTokens(unittest.TestCase):
     def test_missing_file_returns_zeros(self):
         self.assertEqual(km._session_tokens("/no/such/transcript.jsonl", NOW - 3600),
                          {"in": 0, "out": 0, "cache_w": 0, "cache_r": 0})
+
+    def test_records_sharing_a_message_id_count_once(self):
+        """The CLI writes a multi-block response as several assistant records sharing one message.id;
+        summing records counted each response 2.3-3.0x. In a MAIN transcript the records repeat one usage
+        block (2,515 groups measured, none differing); subagent transcripts differ — see the next test.
+        One row per id, the largest output count kept; an id-less record stands alone."""
+        u = {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 200}
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.jsonl")
+            with open(p, "w") as f:
+                for _ in range(3):
+                    f.write(_asst(u, iso(NOW - 100), mid="msg_aaaa") + "\n")         # a 3-block response
+                f.write(_asst({"input_tokens": 1, "output_tokens": 1}, iso(NOW - 90)) + "\n")   # no id
+                f.write(_asst({"input_tokens": 1, "output_tokens": 1}, iso(NOW - 80)) + "\n")   # no id
+                f.write(_asst({"input_tokens": 7, "output_tokens": 2}, iso(NOW - 70), mid="msg_bbbb") + "\n")
+                # a split response whose LAST record carries a larger output count (a final tally): the
+                # larger figure is the one kept, never both
+                f.write(_asst({"input_tokens": 4, "output_tokens": 1}, iso(NOW - 60), mid="msg_cccc") + "\n")
+                f.write(_asst({"input_tokens": 4, "output_tokens": 9}, iso(NOW - 59), mid="msg_cccc") + "\n")
+            self.assertEqual(km._session_tokens(p, NOW - 3600),
+                             {"in": 10 + 2 + 7 + 4, "out": 5 + 2 + 2 + 9, "cache_w": 100, "cache_r": 200})
+
+    def test_subagent_same_id_records_keep_the_final_tally_whatever_their_order(self):
+        """A SUBAGENT transcript's same-id records DIFFER: every record but the last carries the
+        stream-start snapshot (a few output tokens) and the last the final tally — measured on one
+        installation's subagent files, about nine in ten multi-record groups (88% and 94% on two
+        samples), the last record the maximum in every one. The fold keeps the LARGEST output count, in either order, so a first-record fold (about
+        a tenth of the subagents' output) or a last-record fold cannot quietly replace it."""
+        first = {"input_tokens": 4000, "output_tokens": 3, "cache_read_input_tokens": 50000}    # stream start
+        last = {"input_tokens": 4000, "output_tokens": 1950, "cache_read_input_tokens": 50000}  # final tally
+        with tempfile.TemporaryDirectory() as d:
+            for name, order in (("a.jsonl", (first, first, last)), ("b.jsonl", (last, first, first))):
+                pth = os.path.join(d, name)
+                with open(pth, "w") as f:
+                    for k, u in enumerate(order):
+                        f.write(_asst(u, iso(NOW - 100 + k), mid="msg_sub") + "\n")
+                self.assertEqual(km._session_tokens(pth, NOW - 3600),
+                                 {"in": 4000, "out": 1950, "cache_w": 0, "cache_r": 50000},
+                                 name + ": one row, the final tally's output count")
+
+    def test_subagent_transcripts_beside_the_main_one_count_and_refresh_the_cache(self):
+        """`<sid>/subagents/agent-<id>.jsonl` holds each spawned agent's conversation; its tokens are the
+        session's spend too. Each contributing file caches on its own stamp, so a subagent landing
+        later refreshes the sum while the main file rests."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "11111111-2222-3333-4444-555555555555.jsonl")
+            with open(p, "w") as f:
+                f.write(_asst({"input_tokens": 10, "output_tokens": 5}, iso(NOW - 100), mid="m1") + "\n")
+            sub = pathlib.Path(d) / "11111111-2222-3333-4444-555555555555" / "subagents"
+            sub.mkdir(parents=True)
+            (sub / "agent-a1.jsonl").write_text(
+                _asst({"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 1000},
+                      iso(NOW - 90), mid="m2") + "\n"
+                + _asst({"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 1000},
+                        iso(NOW - 89), mid="m2") + "\n"                       # a split block, deduped too
+                + _asst({"input_tokens": 999, "output_tokens": 999}, iso(NOW - 99999), mid="m3") + "\n")  # out of window
+            (sub / "notes.txt").write_text("not a transcript\n")
+            # a Workflow agent's transcript one level down (Claude Code 2.1.261 writes
+            # subagents/workflows/wf_<id>/agent-<id>.jsonl): the walk is recursive, so it counts too
+            wf = sub / "workflows" / "wf_1111-2222"
+            wf.mkdir(parents=True)
+            (wf / "agent-c3.jsonl").write_text(_asst({"input_tokens": 1000, "output_tokens": 500}, iso(NOW - 80), mid="m5") + "\n")
+            # …but the walk never leaves the session's own tree: a symlinked directory is not followed
+            other = pathlib.Path(d) / "elsewhere"
+            other.mkdir()
+            (other / "agent-zz.jsonl").write_text(_asst({"input_tokens": 7777, "output_tokens": 7777}, iso(NOW - 70), mid="m6") + "\n")
+            os.symlink(other, sub / "linked")
+            # …nor is a symlinked FILE: os.walk lists one like any other file (only DIRECTORY links go
+            # unfollowed), so a reader that trusted the listing would open it wherever it points
+            os.symlink(other / "agent-zz.jsonl", sub / "agent-link.jsonl")
+            self.assertEqual(km._session_tokens(p, NOW - 3600), {"in": 1110, "out": 555, "cache_w": 0, "cache_r": 1000})
+            # a second subagent lands; the main transcript's mtime has not moved
+            mt = os.path.getmtime(p)
+            (sub / "agent-b2.jsonl").write_text(_asst({"input_tokens": 1, "output_tokens": 1}, iso(NOW - 10), mid="m4") + "\n")
+            os.utime(p, (mt, mt))
+            self.assertEqual(km._session_tokens(p, NOW - 3600)["in"], 1111, "the new subagent file refreshes the rows")
+            # a NESTED file growing refreshes them too (its mtime is in the fingerprint like any other)
+            with (wf / "agent-c3.jsonl").open("a") as f:
+                f.write(_asst({"input_tokens": 1, "output_tokens": 1}, iso(NOW - 5), mid="m7") + "\n")
+            os.utime(p, (mt, mt))
+            self.assertEqual(km._session_tokens(p, NOW - 3600)["in"], 1112, "a nested file's growth refreshes the rows")
+            self.assertEqual(km._subagent_transcripts(p),
+                             [str(sub / "agent-a1.jsonl"), str(sub / "agent-b2.jsonl"), str(wf / "agent-c3.jsonl")],
+                             "sorted, nested files included, the symlinked directory not walked, the symlinked file skipped")
+            self.assertEqual(km._subagent_transcripts(os.path.join(d, "no-such.jsonl")), [])
+            self.assertEqual(km._subagent_transcripts(os.path.join(d, "x.txt")), [])
+
+    def test_each_transcript_caches_on_its_own_stamp_so_one_file_moving_parses_only_itself(self):
+        """The row cache is per FILE (path -> (stamp, rows)), not per session: a subagent file landing or
+        growing parses that file alone while the main transcript's rows stay cached, and the main file
+        moving leaves every subagent's rows in place. A per-session fingerprint re-parsed the whole tree
+        (main transcript plus every subagent file) whenever any one of them moved — on a live session
+        with Workflow agents running, that is every build, on the GIL, in the /analytics handler."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "11111111-2222-3333-4444-555555555555.jsonl")
+            with open(p, "w") as f:
+                f.write(_asst({"input_tokens": 10, "output_tokens": 5}, iso(NOW - 100), mid="m1") + "\n")
+            sub = pathlib.Path(d) / "11111111-2222-3333-4444-555555555555" / "subagents"
+            sub.mkdir(parents=True)
+            a1 = sub / "agent-a1.jsonl"
+            a1.write_text(_asst({"input_tokens": 100, "output_tokens": 50}, iso(NOW - 90), mid="m2") + "\n")
+            self.assertEqual(km._session_tokens(p, NOW - 3600)["in"], 110)
+            main_rows, a1_rows = km._session_tok_cache[p][1], km._session_tok_cache[str(a1)][1]
+            self.assertEqual([r[1] for r in main_rows], [10], "the main transcript's own rows, cached under its path")
+            self.assertEqual([r[1] for r in a1_rows], [100], "the subagent's own rows, cached under its path")
+            # a second subagent lands: it parses, the two cached files do not
+            mt = os.path.getmtime(p)
+            (sub / "agent-b2.jsonl").write_text(_asst({"input_tokens": 1, "output_tokens": 1}, iso(NOW - 10), mid="m4") + "\n")
+            os.utime(p, (mt, mt))
+            self.assertEqual(km._session_tokens(p, NOW - 3600)["in"], 111)
+            self.assertIs(km._session_tok_cache[p][1], main_rows, "the main transcript was not re-parsed")
+            self.assertIs(km._session_tok_cache[str(a1)][1], a1_rows, "the untouched subagent was not re-parsed")
+            # the main transcript grows: it parses, the subagents' rows stay
+            with open(p, "a") as f:
+                f.write(_asst({"input_tokens": 1000, "output_tokens": 1}, iso(NOW - 5), mid="m8") + "\n")
+            os.utime(p, (mt + 5, mt + 5))
+            self.assertEqual(km._session_tokens(p, NOW - 3600)["in"], 1111)
+            self.assertIsNot(km._session_tok_cache[p][1], main_rows, "the grown main transcript was re-parsed")
+            self.assertIs(km._session_tok_cache[str(a1)][1], a1_rows, "…and the subagent's rows were not")
+            # a same-mtime rewrite that changes the size still refreshes (the stamp is mtime AND size)
+            b2_rows = km._session_tok_cache[str(sub / "agent-b2.jsonl")][1]
+            bmt = os.path.getmtime(sub / "agent-b2.jsonl")
+            with (sub / "agent-b2.jsonl").open("a") as f:
+                f.write(_asst({"input_tokens": 1, "output_tokens": 1}, iso(NOW - 4), mid="m9") + "\n")
+            os.utime(sub / "agent-b2.jsonl", (bmt, bmt))
+            self.assertEqual(km._session_tokens(p, NOW - 3600)["in"], 1112)
+            self.assertIsNot(km._session_tok_cache[str(sub / "agent-b2.jsonl")][1], b2_rows)
+
+    def test_a_symlinked_subagents_directory_is_not_walked_either(self):
+        """os.walk follows its TOP argument even when it is a symlink (followlinks governs the descent, not
+        the root), so `<sid>/subagents` itself pointing elsewhere would read another tree wholesale."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "11111111-2222-3333-4444-555555555555.jsonl")
+            with open(p, "w") as f:
+                f.write(_asst({"input_tokens": 10, "output_tokens": 5}, iso(NOW - 100), mid="m1") + "\n")
+            other = pathlib.Path(d) / "elsewhere"
+            other.mkdir()
+            (other / "agent-zz.jsonl").write_text(_asst({"input_tokens": 7777, "output_tokens": 7777}, iso(NOW - 70), mid="m6") + "\n")
+            sid_dir = pathlib.Path(d) / "11111111-2222-3333-4444-555555555555"
+            sid_dir.mkdir()
+            os.symlink(other, sid_dir / "subagents")
+            self.assertEqual(km._subagent_transcripts(p), [])
+            self.assertEqual(km._session_tokens(p, NOW - 3600), {"in": 10, "out": 5, "cache_w": 0, "cache_r": 0})
 
 
 class JudgeUsageIncrementalCache(unittest.TestCase):
@@ -309,6 +455,18 @@ class CostWeighting(unittest.TestCase):
             self.assertEqual(row["out"], rate, mid + " output rate")
         self.assertEqual(km._price_for("claude-fable-5", prices)["in"], 10e-6, "fable input is 2x opus")
         self.assertEqual(km._price_for("claude-opus-4-8", prices)["in"], 5e-6, "opus rate unchanged")
+
+    def test_fable_5_1_has_its_own_row_with_the_quarter_rate_cache_read(self):
+        # Before the row existed the family fallback handed Fable 5.1 Fable 5's $1/Mtok cache read — 4x
+        # its list rate (Claude Code 2.1.261's catalog: tier_10_50_cache_read_0_25), and the remote feed
+        # could never correct it because only exact (family, major, minor) signatures match.
+        prices = km._model_prices(NOW)
+        row = km._price_for("claude-fable-5-1", prices)
+        self.assertEqual((row["in"], row["out"], row["cache_w"], row["cache_r"]), (10e-6, 50e-6, 12.5e-6, 0.25e-6))
+        self.assertEqual(km._price_for("claude-fable-5", prices)["cache_r"], 1e-6, "Fable 5 keeps its own rate")
+        self.assertEqual(km._price_sig("claude-fable-5-1"), ("fable", "5", "1"), "signs distinctly, so the feed can reach it")
+        self.assertEqual(km._price_for("claude-fable-5-1-20261201", prices)["cache_r"], 0.25e-6,
+                         "…and a dated id of the same model lands on the fable-5-1 row by signature, not on the first fable row")
 
     def test_price_sig_signs_single_number_ids_and_ignores_date_suffixes(self):
         self.assertEqual(km._price_sig("claude-opus-4-8"), ("opus", "4", "8"), "X-Y pair still signs")
