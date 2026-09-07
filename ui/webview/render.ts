@@ -12125,7 +12125,11 @@ function transcriptSelection(): { text: string; uuid: string | null } | null {
   if (r.collapsed) return null;                             // the ACTIVE range must be a real span
   const turnOf = (n: Node | null) => {
     const e = n instanceof Element ? n : n?.parentElement;
-    return e?.closest?.(".turn") ?? null;
+    const t = e?.closest?.(".turn") ?? null;
+    // a comment thread's popover renders its rows with the chat's own renderer, so they are .turn elements
+    // too — but a highlight there belongs to the THREAD, never the main composer (T241, the user
+    // 2026-09-07: a popover highlight seeded a quote chip on the main chip box)
+    return t && !t.closest?.("#cmt-pop") ? t : null;
   };
   const a = turnOf(r.startContainer), f = turnOf(r.endContainer);
   if (!a || !f) return null;                                // both endpoints must be transcript turns
