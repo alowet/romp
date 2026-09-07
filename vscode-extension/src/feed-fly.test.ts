@@ -44,14 +44,21 @@ test("flyColumnChanges FLIPs any moved card (not new cards / non-movers); only c
   // in the read pass and carried to the write pass — feed-flip.test.ts pins the read-then-write order)
   assert.match(FEED, /crossed: prev\.col !== colEl\.id/);
   assert.match(FEED, /if \(crossed\) c\.classList\.add\("fitem-flying"\);/);
+  const fly = FEED.slice(FEED.indexOf("function flyColumnChanges("), FEED.indexOf("// ── Absorb:"));
+  const at = (s: string) => { const i = fly.indexOf(s); assert.ok(i >= 0, "present: " + s); return i; };
+  assert.ok(at("moves.push(") < at("c.style.transform ="), "every read (into `moves`) precedes the first write");
+  assert.equal((fly.match(/getBoundingClientRect/g) || []).length, 1, "one read per card, all in the read phase");
+  // The fly's ends — transitionend, transitioncancel, the 650 ms backstop — its per-element ownership token
+  // and `played` guard, the release frame's stand-down, the zero-rect skips at either end (a folded column)
+  // and the back-layer class coming off whichever fly added it are BEHAVIOUR, run under a DOM stand-in in
+  // ui/webview/feed-render-incremental.test.ts; they are not pinned as source text here.
 });
 
 test("FLIP: invert to the old spot instantly, then release with a transition (two rAFs)", () => {
   assert.match(FEED, /c\.style\.transition = "none";\s*\n\s*c\.style\.transform = `translate\(\$\{dx\}px, \$\{dy\}px\)`;/);
   assert.match(FEED, /requestAnimationFrame\(\(\) => requestAnimationFrame\(\(\) => \{[\s\S]*?c\.style\.transform = "translate\(0, 0\)";/);
-  // cleans up on transitionend so the card returns to normal flow + stacking (the back-layer class only on a crosser)
-  assert.match(FEED, /ev\.propertyName !== "transform"/);
-  assert.match(FEED, /if \(crossed\) c\.classList\.remove\("fitem-flying"\)/);
+  // (how the fly ends, and that the card returns to normal flow and stacking whichever fly added the class,
+  // is run in ui/webview/feed-render-incremental.test.ts — see the note above)
 });
 
 test("respects prefers-reduced-motion", () => {

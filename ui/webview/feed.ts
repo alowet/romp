@@ -3501,9 +3501,15 @@ function makeSessHead(): HTMLElement {
   return h;
 }
 function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
-  h.setAttribute("data-fsid", e.sid);   // the hover-freeze badge painter finds headers by sid
+  // the hover-freeze badge painter finds headers by sid; compare first, like the labels below — the DOM's
+  // change-an-attribute steps queue a mutation record for a same-value write too
+  if (h.getAttribute("data-fsid") !== e.sid) h.setAttribute("data-fsid", e.sid);
   const nm = (h as any)._name as HTMLElement;
-  nm.replaceChildren(...hostNameNodes(e.name, e.sid));
+  // the name nodes are minted only when what they show changes: headers repaint every render (they are not
+  // behind the per-card update gate), and each mint is a Text-node replacement — the same reason cards are
+  // gated. hostNameNodes reads the name, the sid's host prefix and whether that host's link is down.
+  const nmSig = e.name + "\u0000" + e.sid + "\u0000" + (hostIsDown(e.sid) ? "d" : "");
+  if ((h as any)._nmSig !== nmSig) { (h as any)._nmSig = nmSig; nm.replaceChildren(...hostNameNodes(e.name, e.sid)); }
   if (e.color) nm.style.color = e.color.bg;
   nm.classList.toggle("dead", !e.live);
   nm.onclick = (ev) => { ev.stopPropagation(); openOrReviveSession(e.sid, e.live, e.name); };
@@ -4381,6 +4387,7 @@ function columnsOf(buckets: Record<Column, Entry[]>): Map<string, string> {
   return m;
 }
 const FLY_COLS: ("asks" | "needsInput" | "completed")[] = ["asks", "needsInput", "completed"];
+let flySeq = 0;   // the fly token: the element remembers the newest fly's number (see the write phase)
 function captureCardRects(cols: ReturnType<typeof ensureCols>): Map<string, FlipState> {
   const m = new Map<string, FlipState>();
   for (const key of FLY_COLS) {
@@ -4404,35 +4411,64 @@ function flyColumnChanges(first: Map<string, FlipState>, cols: ReturnType<typeof
       const k = c.dataset.key; if (!k) continue;
       const prev = first.get(k);
       if (!prev) continue;                                 // brand-new card → no FLIP (nothing to glide from)
+      // a card nobody could see — its column folded to the header (display:none) — has a zero First rect:
+      // nothing to glide from, and a fly from (0,0) zooms in from the pane's corner
+      if (!prev.rect.width && !prev.rect.height) continue;
       const now = c.getBoundingClientRect();
+      // …and a target nobody can see has a zero Last rect and no transition to run, so a fly written to it
+      // would never end: the class it wears, pointer-events:none, stayed until the card's next repaint, and
+      // the per-card update gate no longer rewrites className every render. Nothing to glide to; leave it.
+      if (!now.width && !now.height) continue;
       const dx = prev.rect.left - now.left, dy = prev.rect.top - now.top;
       if (!dx && !dy) continue;                            // didn't move → leave it alone
       moves.push({ c, dx, dy, crossed: prev.col !== colEl.id });
     }
   }
   for (const { c, dx, dy, crossed } of moves) {
-    {
-      // Two flavors of move, ONE FLIP (the user 2026-06-29): a card that CHANGED COLUMN flies in the BACK
-      // layer (z-index:-1 → behind the other cards, so it never sails over them); a card that STAYED in its
-      // column but shifted — because the card that left it vacated a slot — glides IN PLACE in normal flow, so
-      // the remaining cards reflow smoothly to their new spots instead of snapping there in a discrete jump.
-      if (crossed) c.classList.add("fitem-flying");
-      // Invert: jump the card back to its old spot, instantly.
-      c.style.transition = "none";
-      c.style.transform = `translate(${dx}px, ${dy}px)`;
-      // Play: next frame, release the offset with a transition → it glides to its new home.
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        c.style.transition = "transform .42s cubic-bezier(.22, .61, .36, 1)";
-        c.style.transform = "translate(0, 0)";
-      }));
-      const done = (ev: TransitionEvent) => {
-        if (ev.propertyName !== "transform") return;
-        c.removeEventListener("transitionend", done);
-        if (crossed) c.classList.remove("fitem-flying");
-        c.style.transition = ""; c.style.transform = "";   // back to normal flow + stacking
-      };
-      c.addEventListener("transitionend", done);
-    }
+    // Two flavors of move, ONE FLIP (the user 2026-06-29): a card that CHANGED COLUMN flies in the BACK
+    // layer (z-index:-1 → behind the other cards, so it never sails over them); a card that STAYED in its
+    // column but shifted — because the card that left it vacated a slot — glides IN PLACE in normal flow, so
+    // the remaining cards reflow smoothly to their new spots instead of snapping there in a discrete jump.
+    // ONE fly owns an element at a time: a second render can fly the same card while the first fly's 420 ms
+    // transition still runs — two deltas within half a second on an active board. The second Invert cancels
+    // the first transition, and the browser delivers that transitioncancel to EVERY listener on the element
+    // before the second fly's Play frame. Two guards: a per-element token, so a superseded fly's
+    // end/cancel/backstop removes its own listeners and touches nothing else; and `played`, so a fly ignores
+    // transition events that arrive before its own Play wrote the transition — those belong to the fly it
+    // cancelled. Without them the older fly's cancel handler wiped the newer Invert and the card snapped
+    // where it should have glided (reproduced in Chromium).
+    const mine = ++flySeq;
+    (c as any)._flySeq = mine;
+    if (crossed) c.classList.add("fitem-flying");
+    // Invert: jump the card back to its old spot, instantly.
+    c.style.transition = "none";
+    c.style.transform = `translate(${dx}px, ${dy}px)`;
+    // the fly ends on its own event — end OR cancel (a card re-inserted or hidden mid-flight gets
+    // transitioncancel, never transitionend) — with a backstop so a lost event can never leave the card in
+    // the back layer, pointer-events off (absorbIntoParent's idiom). Idempotent: whichever fires first.
+    let flown = false, played = false;
+    const done = (ev?: TransitionEvent) => {
+      if (flown) return;
+      if (ev && (ev.propertyName !== "transform" || !played)) return;   // not this fly's transition
+      flown = true;
+      c.removeEventListener("transitionend", done);
+      c.removeEventListener("transitioncancel", done);
+      if ((c as any)._flySeq !== mine) return;             // superseded: the newer fly owns the element's styles
+      c.classList.remove("fitem-flying");                  // whichever fly added it — the element is settled now
+      c.style.transition = ""; c.style.transform = "";     // back to normal flow + stacking
+    };
+    c.addEventListener("transitionend", done);
+    c.addEventListener("transitioncancel", done);
+    window.setTimeout(done, 650);
+    // Play: next frame, release the offset with a transition → it glides to its new home. Unless the fly
+    // already ended or was superseded (a hidden tab pauses animation frames while the backstop's timer
+    // still runs): a release after that would leave an inline identity transform on a settled card.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (flown || (c as any)._flySeq !== mine) return;
+      played = true;
+      c.style.transition = "transform .42s cubic-bezier(.22, .61, .36, 1)";
+      c.style.transform = "translate(0, 0)";
+    }));
   }
 }
 
@@ -5748,6 +5784,21 @@ function revealCards(keys: Set<string>) {
     c.classList.remove("card-pulse");
     void c.offsetWidth;
     c.classList.add("card-pulse");
+    // and off again when the animation ends (the per-card update gate no longer rewrites className every
+    // render, which used to strip it); under reduced motion no animation runs and the class paints a steady
+    // accent ring, so a backstop a little past the animation's 1.4 s takes it off. animationend bubbles, so
+    // only the pulse's own end counts — a button's acted flash inside the card must not end it. One pulse per
+    // element at a time: a second reveal inside the window re-arms the same handle, so the first reveal's
+    // backstop cannot cut the second's animation short.
+    const prev = (c as any)._pulse as { off: (ev?: AnimationEvent) => void; t: number } | undefined;
+    if (prev) { window.clearTimeout(prev.t); c.removeEventListener("animationend", prev.off); }
+    const off = (ev?: AnimationEvent) => {
+      if (ev && ev.animationName !== "romp-card-pulse") return;
+      c.removeEventListener("animationend", off); window.clearTimeout(cur.t); (c as any)._pulse = undefined; c.classList.remove("card-pulse");
+    };
+    const cur = { off, t: window.setTimeout(off, 1500) };
+    (c as any)._pulse = cur;
+    c.addEventListener("animationend", off);
   }
 }
 
