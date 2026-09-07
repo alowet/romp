@@ -191,13 +191,13 @@ class ApiKeyHelperPrecedence(unittest.TestCase):
 
     def test_explicit_env_var_wins_over_the_borrowed_command(self):
         cfg = self._settings("cfg", "/opt/example/borrowed --print")
-        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": cfg,
+        with mock.patch.dict(os.environ, {"HOME": os.path.join(self.td, "home"), "CLAUDE_CONFIG_DIR": cfg,
                                           "ROMP_MOVE_LIVE_API_KEY_HELPER": "/opt/example/explicit"}):
             self.assertEqual(_api_key_helper(), "/opt/example/explicit")
 
     def test_without_the_env_var_the_borrowed_command_is_used(self):
         cfg = self._settings("cfg", "/opt/example/borrowed --print")
-        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": cfg}):
+        with mock.patch.dict(os.environ, {"HOME": os.path.join(self.td, "home"), "CLAUDE_CONFIG_DIR": cfg}):
             os.environ.pop("ROMP_MOVE_LIVE_API_KEY_HELPER", None)
             self.assertEqual(_api_key_helper(), "/opt/example/borrowed --print")
             self.assertEqual(_user_api_key_helper(), "/opt/example/borrowed --print", "no argument: $CLAUDE_CONFIG_DIR")

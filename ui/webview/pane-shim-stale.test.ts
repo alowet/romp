@@ -281,8 +281,8 @@ test("the foreground path abandoning an ARMED quiet socket raises too; its redia
 
 test("a redial armed as FOREGROUND that then stays silent raises when the watchdog abandons it: the why is foreground-quiet", () => {
   // the arm names the path that forced the reconnect, and a silent socket's raise keeps that name with the
-  // -quiet suffix — the shim comment, docs/read-side.md and the body name both spellings; only reconnect-quiet
-  // was pinned before this
+  // -quiet suffix — the shim comment and docs/read-side.md name both spellings; only reconnect-quiet was
+  // pinned before this
   const h = FEED();
   h.ws.open(); h.ws.msg({ type: "feed", asks: [] });   // connected, then the socket goes quiet while the tab sleeps
   h.now += 31_000;

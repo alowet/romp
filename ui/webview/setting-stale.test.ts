@@ -166,8 +166,21 @@ test("one toast per refused gesture, naming the refusing hosts: the fold key is 
     "the fold keys on the gesture, never on a clock or a window");
 });
 
-test("the kept value rides when cheap, and reads as words (booleans become on/off)", () => {
+test("the kept value rides when cheap, and reads as words (booleans become on/off; a select's sentinel by the name it shows)", () => {
   assert.match(KERNEL, /def _setting_kept_value\(name\)/, "one cheap store read at reply time, never on the apply path");
-  assert.ok(GEAR.includes("function staleWord(v) { return v === true ? 'on' : v === false ? 'off'"), "a boolean value reads as on/off in the toast");
-  assert.ok(GEAR.includes("var kept = staleWord(m.kept);"), "…the kept value through the one helper");
+  assert.ok(GEAR.includes("function staleWord(v, setting) {"), "the one helper takes the setting, for the sentinel names");
+  assert.ok(GEAR.includes("return v === true ? 'on' : v === false ? 'off'"), "a boolean value reads as on/off in the toast");
+  assert.ok(GEAR.includes("var kept = staleWord(m.kept, m.setting);"), "…the kept value through the one helper");
+  assert.ok(GEAR.includes("staleWord(m.gesture[keys[0]], m.setting)"), "…and the refused value");
+  // every sentinel option paintChoices renders under a name other than its value has that name in
+  // STALE_WORDS, so the toast says what the select shows — the effort selects' Default is the EMPTY
+  // value, which staleWord read as no value at all (the #967 review); setting-stale-fold.test.ts drives it
+  const wordsSrc = GEAR.match(/var STALE_WORDS = \{([\s\S]*?)\};/);
+  assert.ok(wordsSrc, "gear.js's STALE_WORDS map located");
+  const paint = GEAR.slice(GEAR.indexOf("function paintChoices() {"), GEAR.indexOf("var choicesP = null;"));
+  assert.ok(paint.length > 0 && paint.length < 4000, "paintChoices located");
+  const sentinels = Array.from(paint.matchAll(/<option value="([a-z]*)">([^<]+)<\/option>/g)).filter((m) => m[1] !== m[2]);
+  assert.ok(sentinels.length >= 5, `the selects' literal sentinel options located (${sentinels.length})`);
+  for (const [, value, label] of sentinels)
+    assert.ok(wordsSrc![1].includes(`'${value}': '${label}'`), `STALE_WORDS words ${JSON.stringify(value)} as ${label}`);
 });
