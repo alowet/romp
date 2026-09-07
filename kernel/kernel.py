@@ -19294,13 +19294,18 @@ def _split_reminders(text):
 # `/\.(png|jpe?g|gif|webp)$/i` (Claude Code 2.1.261 bundle) — the paths it reads and rewrites to
 # "[Image #N]" before the submit. No bmp, no svg: the wider set this carried until 2026-09-06 claimed
 # extractions the CLI never performs (a `.svg` send waited for a rewrite that never came). Twin of
-# sdk_backend._IMG_PATH_RE; tests/test_kernel_fed_echo_absorbed.py pins both to that set.
+# sdk_backend._IMG_PATH_RE; tests/test_kernel_fed_echo_absorbed.py pins both to that set. Its reader is
+# the one that WAITS ON the CLI's rewrite: _injected_img_paths (the tmux pre-Enter wait). The bare-path
+# PREVIEW in _user_images is romp's own feature and reads _PREVIEW_IMG_RE (beside _IMG_MIME) instead —
+# it never claims a CLI extraction, so it is not bound to the CLI's set.
 _IMG_PATH_RE = re.compile(r"(?:^|[\s'\"`(])((?:~/|/)[^\s'\"`()]+\.(?:png|jpe?g|gif|webp))\b", re.I)
 def _user_images(blocks, text, human):
     """A user turn's images. Inline base64 → a data: URL; an image
     source path → "path:<abs>" (the webview hydrates it via imgRequest); and — the common case — a bare
     image PATH typed or dragged into the composer arrives as PLAIN TEXT, so scan a human turn's text for
-    absolute / ~ paths with a known image extension. Capped at 4."""
+    absolute / ~ paths with an extension the imgRequest route can serve (_PREVIEW_IMG_RE, built from
+    _IMG_MIME's keys — bmp and svg included; on an SDK session every image path lands as text, so this
+    scan is the only way a referenced picture gets shown). Capped at 4."""
     imgs = []
     for b in (blocks or []):
         if isinstance(b, dict) and b.get("type") == "image":
@@ -19310,7 +19315,7 @@ def _user_images(blocks, text, human):
             elif s.get("path"):
                 imgs.append({"src": "path:" + s["path"], "path": s["path"]})
     if human and not imgs:                            # a bare image path typed/dragged in → plain text
-        for m in _IMG_PATH_RE.finditer(text or ""):
+        for m in _PREVIEW_IMG_RE.finditer(text or ""):
             p = m.group(1)
             if not any(im.get("path") == p for im in imgs):
                 imgs.append({"src": "path:" + p, "path": p})
@@ -30162,6 +30167,16 @@ def _tell_stale_gesture(client, msg):
 #      hydrated and OS drops did nothing — the user 2026-06-16) ----
 _IMG_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
              ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp", ".svg": "image/svg+xml"}
+# The bare-path PREVIEW scan's extension set (_user_images): exactly the extensions this route can
+# serve, derived from _IMG_MIME so the two cannot drift — a path the scan proposed but _img_data_url
+# refused would leave a chip with no picture. Same path shape as _IMG_PATH_RE (absolute or ~-rooted,
+# delimited), but NOT that regex: _IMG_PATH_RE is the CLI paste hook's set, read by the code that waits
+# on the CLI's "[Image #N]" rewrite, and the preview claims no such extraction. Until 2026-09-06 both
+# readers shared one regex; narrowing it to the CLI's set for the extraction reader would have silently
+# dropped svg/bmp previews, so the preview got its own.
+_PREVIEW_IMG_RE = re.compile(
+    r"(?:^|[\s'\"`(])((?:~/|/)[^\s'\"`()]+\.(?:%s))\b"
+    % "|".join(re.escape(k[1:]) for k in sorted(_IMG_MIME)), re.I)
 _IMG_MAX_BYTES = 8_000_000
 _img_cache = {}                                  # "path:mtime:size" → dataURL | None
 

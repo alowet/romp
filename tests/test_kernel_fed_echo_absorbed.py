@@ -189,7 +189,8 @@ class ImagePathPredicateTwins(unittest.TestCase):
     for the route where the hook does run. When the CLI's set changes, change BOTH twins here: the kernel
     waits on the rewrite (_injected_img_paths), the backend exports the predicate — a drift between them
     or from the CLI makes an echo the CLI did rewrite persist forever, or one it did not rewrite get
-    retired as an extraction."""
+    retired as an extraction. The kernel's bare-path PREVIEW (_user_images) is deliberately NOT a
+    reader: it is romp's own feature on its own set (PreviewSetIsTheHydrationRoutes below)."""
 
     CLI_SET = "png|jpe?g|gif|webp"
 
@@ -211,6 +212,38 @@ class ImagePathPredicateTwins(unittest.TestCase):
             self.assertFalse(sb._path_bearing("see /tmp/notes-api/docs/shot.%s now" % ext),
                              "%s: the CLI never rewrites it" % ext)
             self.assertEqual(km._injected_img_paths("see /tmp/notes-api/docs/shot.%s now" % ext), [])
+
+
+class PreviewSetIsTheHydrationRoutes(unittest.TestCase):
+    """_user_images scans a human turn's text for a bare image path to preview — on an SDK session every
+    image path lands as text, so this scan is the only way a referenced picture gets shown. Its set is
+    NOT the CLI twin's: it is exactly what the imgRequest route can serve (_IMG_MIME's keys, bmp and svg
+    included), derived from that map so the scan can never propose a path _img_data_url would refuse.
+    Pinned because narrowing the shared regex to the CLI's set on 2026-09-06 would otherwise have dropped
+    svg/bmp previews without any test noticing."""
+
+    def test_the_preview_set_is_derived_from_the_mime_map(self):
+        m = re.search(r"\\\.\(\?:([a-z|]+)\)", km._PREVIEW_IMG_RE.pattern)
+        self.assertIsNotNone(m, km._PREVIEW_IMG_RE.pattern)
+        self.assertEqual(set(m.group(1).split("|")), {k[1:] for k in km._IMG_MIME})
+        self.assertTrue(km._PREVIEW_IMG_RE.flags & re.IGNORECASE, "_img_data_url lowercases the extension")
+        self.assertIn("svg", m.group(1)); self.assertIn("bmp", m.group(1))
+
+    def test_a_bare_svg_or_bmp_path_still_previews(self):
+        for ext in ("svg", "bmp", "BMP", "png", "jpeg", "JPG", "gif", "webp"):
+            p = "/tmp/notes-api/docs/diagram.%s" % ext
+            self.assertEqual(km._user_images([], "compare with %s please" % p, True),
+                             [{"src": "path:" + p, "path": p}], ext)
+        self.assertEqual(km._user_images([], "~/notes/todo.md is stale, see /tmp/x.ico", True), [],
+                         "an extension the route cannot serve is not proposed")
+
+    def test_the_preview_is_wider_than_the_cli_twin_and_the_twin_is_unchanged(self):
+        # the extraction reader still answers with the CLI's set: an svg path is previewed, yet the tmux
+        # pre-Enter wait does not wait for a rewrite the CLI never performs
+        text = "compare with /tmp/notes-api/docs/diagram.svg"
+        self.assertEqual(len(km._user_images([], text, True)), 1)
+        self.assertEqual(km._injected_img_paths(text), [])
+        self.assertFalse(sb._path_bearing(text))
 
 
 if __name__ == "__main__":
