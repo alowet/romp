@@ -1814,6 +1814,15 @@ body.chat-theme-yatharth .meta-btn.mode-risky, body.chat-theme-yatharth .meta-it
   color: var(--dim); background: transparent; border: 0; border-radius: 6px; padding: 0;
 }
 .queued-x:hover { color: var(--vscode-errorForeground, #f48771); background: rgba(255, 255, 255, 0.08); }
+/* A notice romp itself queued (T243) wears the LANDED romp notice card nested inside the queued bubble: the
+   dashed "you" dress comes off the wrapper (the card brings its own gray tone), and the ✕ moves inside the
+   card's corner so it reads as the card's control. */
+.queued-bubble.queued-romp { background: transparent; border: 0; padding: 0; opacity: 1; }
+.queued-bubble.queued-romp.cancelable { padding-right: 0; }
+.queued-bubble.queued-romp.cancelable:hover { border-color: transparent; }
+.queued-bubble.queued-romp > .notice-card { margin-top: 0; }
+.queued-bubble.queued-romp.cancelable > .notice-card,
+.queued-bubble.queued-romp.cancelable > .romp-bubble { padding-right: 30px; }   /* room for the ✕ only when there is one */
 /* NEVER-DELIVERED send (ev.undelivered): a message whose CLI died holding it — kept, because the bubble
    is the only surviving copy of the text, but marked as a LOSS instead of posing as delivered history
    (the user 2026-07-29). Dashed like the queued family (a send that never became a turn), red-edged like

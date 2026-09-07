@@ -395,7 +395,7 @@ class QueuedBubble(unittest.TestCase):
                       "the queued indicator shows even when a parked op is the only pending item")
         self.assertIn("for j, op in enumerate(pending_ops):", src,
                       "ONE loop, park order — rendering IS execution order")
-        self.assertIn('{"md": _parked_md(op), "park": j, "cancelable": True}', src,
+        self.assertIn('{"md": _parked_md(op), "park": j, "cancelable": True, **(_queued_romp_flags(op[1]) if op[0] == "send" else {})}', src,
                       "parked ops are CANCELABLE (the user 2026-07-08): park index + shared body renderer")
 
     def test_drive_routes_park_cancels(self):

@@ -828,6 +828,22 @@ class QueuedBubbleDisplay(unittest.TestCase):
         self.assertEqual(q["texts"][0]["idx"], 1,
                          "a surviving bubble's idx still names its backend _pending position")
 
+    def test_a_romp_injected_queued_entry_carries_the_landed_flags(self):
+        # T243 (the user 2026-09-07): a queued watch notice romp itself injected rendered as the user's own
+        # pending bubble. The queued entry now carries the same flags a LANDED romp message gets from the same
+        # markers (romp / rompSystem / rompAuto), so the client can draw the landed romp notice grammar
+        notice = ("<!-- romp-injected --><!-- romp-system --><!-- romp-tag: watch -->"
+                  "[romp] The pull request you asked romp to watch has MERGED: notes-api/web#12. This watch is done.")
+        nudge = "<!-- romp-injected --><!-- romp-auto -->Where does each of these stand?"
+        evs = self._events([notice, "please rerun the failing test", nudge])
+        q = next((e for e in evs if e.get("kind") == "queued"), None)
+        self.assertIsNotNone(q)
+        by_idx = {t["idx"]: t for t in q["texts"]}
+        self.assertEqual((by_idx[0].get("romp"), by_idx[0].get("rompSystem"), by_idx[0].get("rompAuto")), (True, True, None))
+        self.assertNotIn("romp", by_idx[1], "the user's own message carries no romp flag")
+        self.assertEqual((by_idx[2].get("romp"), by_idx[2].get("rompSystem"), by_idx[2].get("rompAuto")), (True, None, True))
+        self.assertIn("<!-- romp-injected -->", by_idx[0]["md"], "the marker still rides the text — the client hides it as the landed card does")
+
     def test_an_all_wrapper_queue_emits_no_queued_event(self):
         evs = self._events([_wrap(0)])
         self.assertIsNone(next((e for e in evs if e.get("kind") == "queued"), None),
