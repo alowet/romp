@@ -7995,7 +7995,19 @@ class SdkBackend:
         hit = self._owns_memo.get(sid)
         if hit is not None and hit[0] == key:
             return hit[1]
-        ok = read_reg(self.state_dir, sid) is not None
+        # read_reg returns None on ANY OSError from read_text (EMFILE, EIO, EACCES), not only a missing
+        # file — and the stat above already succeeded, so the file IS there. Memoizing that transient
+        # None as "not ours" latched a live session's backend to False until its reg was next rewritten,
+        # silently misrouting it (review find on #933, 2026-09-07). Distinguish the two: a dict is a
+        # positive answer worth caching; read_reg_for_rmw returns None only for a reg that EXISTS but
+        # would not read (the transient case) and {} for a genuinely absent one, so cache True/False on
+        # that and leave the memo untouched on a transient failure — the next call re-reads.
+        reg = read_reg_for_rmw(self.state_dir, sid)
+        if reg is None:
+            self._owns_memo.pop(sid, None)            # transient: do not latch; re-read next call
+            self._log("owns(%s): reg stat ok but read failed transiently — not cached" % sid, problem=True)
+            return bool(self.sessions.get(sid))       # a live thread is proof enough for this pass
+        ok = bool(reg)
         self._owns_memo[sid] = (key, ok)
         return ok
 

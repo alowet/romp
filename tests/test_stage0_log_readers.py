@@ -242,12 +242,8 @@ class ViewCountersAreVisible(unittest.TestCase):
         self.assertEqual(km._VIEW_STATS["tlServe"] - before["tlServe"], 1)
 
     def test_b_the_version_payload_carries_them(self):
-        fn = getattr(km, "_version_payload", None) or getattr(km, "_kernel_version_payload", None)
-        if fn is None:
-            src = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py"), encoding="utf-8").read()
-            self.assertIn('"views": dict(_VIEW_STATS)', src)
-            return
-        self.assertEqual(set(fn()["views"]), set(km._VIEW_STATS))
+        # _version_info is the real /version brain; it must expose the same view-stat keys the counters use
+        self.assertEqual(set(km._version_info()["views"]), set(km._VIEW_STATS))
 
 
 class BackendOwnsIsMemoized(unittest.TestCase):
@@ -276,6 +272,30 @@ class BackendOwnsIsMemoized(unittest.TestCase):
             sb.read_reg = real
         os.unlink(sb._reg_path(be.state_dir, self.SID))
         self.assertFalse(be.owns(self.SID), "a vanished reg is not owned")
+
+    def test_a_transient_read_failure_is_not_latched_as_not_owned(self):
+        # read_reg returns None on ANY OSError (EMFILE/EIO/EACCES), not only a missing file; caching that
+        # as "not ours" latched a live session's backend False until its reg was rewritten (review find on
+        # #933, 2026-09-07). A transient failure must not be cached; the next call re-reads.
+        sb = SourceFileLoader("romp_sdk_backend_stage0_t", os.path.join(BIN, "romp_sdk_backend.py")).load_module()
+        be = sb.SdkBackend(tempfile.mkdtemp(), "/bin/true", lambda *a, **k: None, log=lambda *a, **k: None)
+        sb.write_reg(be.state_dir, self.SID, {"sid": self.SID, "name": "web", "cwd": "/tmp", "alive": True})
+        self.assertTrue(be.owns(self.SID))
+        be._owns_memo.clear()
+        real = sb.read_reg_for_rmw
+        boom = {"n": 0}
+        def flaky(*a, **k):
+            boom["n"] += 1
+            return None if boom["n"] == 1 else real(*a, **k)   # first read fails transiently, then heals
+        sb.read_reg_for_rmw = flaky
+        try:
+            # the one transient failure answers conservatively (no live thread here) but does NOT latch
+            self.assertFalse(be.owns(self.SID), "a transient failure with no live thread answers not-owned for this call")
+            self.assertNotIn(self.SID, be._owns_memo, "…but it is NOT cached (the bug latched False here)")
+            self.assertTrue(be.owns(self.SID), "the healed read is owned")
+            self.assertIn(self.SID, be._owns_memo, "…and now cached")
+        finally:
+            sb.read_reg_for_rmw = real
 
 
 class ViewSignatureKeysOnExactInputs(_StateSandbox):
@@ -440,7 +460,10 @@ class ActiveTabIsServedOnAnExactKey(_StateSandbox):
         km._cwd_of = lambda sid: sub                       # a cwd INSIDE the repo, not its top
         try:
             e1 = km._external_sig(self.SID, str(self.tpath))
-            self.assertTrue(any(x is not None for x in e1[1:2]), "the repo's HEAD is stat'd for a subdirectory cwd: %r" % (e1,))
+            hp = km._git_head_file(repo)
+            st = os.stat(hp)
+            self.assertIn((st.st_mtime_ns, st.st_size, st.st_ino), e1,
+                          "the repo's HEAD is stat'd for a subdirectory cwd: %r" % (e1,))
             s1 = km._active_chat_sig(self.sess, self.tm, NOW)
             subprocess.run(["git", "-C", repo, "checkout", "-q", "-b", "feature"], check=True)
             self.assertNotEqual(s1, km._active_chat_sig(self.sess, self.tm, NOW), "a branch switch moves the key")
