@@ -8388,7 +8388,7 @@ def _list_dir(raw, sid=None, hidden=False, limit=DIR_LIST_MAX):
                        "size": 0 if is_dir else size, "mtime": mtime}
                 if not is_dir:
                     # SIZE-AWARE (2026-09-06): the same caps /file applies, so a row the view route would 413
-                    # is download-only up front — a PDF opens in its own tab now, and an oversize one would
+                    # is download-only up front — a PDF can open in its own tab (a modified click), and an oversize one would
                     # otherwise land that tab on the refusal instead of the viewer that offered the save
                     _m = _PREVIEW_MIME.get(os.path.splitext(e.name)[1].lower())
                     row["viewable"] = (bool(_m) and size <= _PREVIEW_MAX_BYTES) \

@@ -1,18 +1,22 @@
-// A PDF opens in its OWN browser tab (the user 2026-09-06, who wanted what OpenReview and HotCRP do:
-// the paper full size in a tab of its own, not a small window inside the dashboard). The opener is
-// ONE window.open inside the click gesture aimed at the kernel's /file URL — the browser's own viewer
-// renders the inline application/pdf response from its cache, nothing lands on disk — and a null
-// handle (the browser blocked the popup) falls back to the in-app view so the PDF is never
-// unreachable. Executed here with a stubbed window/location; the wiring is pinned in source.
+// A PDF opens inside the dashboard on a plain click, like an image, and in its OWN browser tab on a
+// Cmd/Ctrl- or middle-click (the user 2026-09-07, who wanted one opening rule for images and PDFs with
+// the modifier as the way out; 2026-09-06, who wanted what OpenReview and HotCRP do: the paper full
+// size in a tab of its own). The opener is ONE window.open inside the click gesture aimed at the
+// kernel's /file URL — the browser's own viewer renders the inline application/pdf response from its
+// cache, nothing lands on disk — and a null handle (the browser blocked the popup) falls back to the
+// in-app view so the PDF is never unreachable. Executed here with a stubbed window/location; the
+// wiring is pinned in source.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { openPdfTab, fileUrl } from "./preview";
+import { openPdfTab, fileUrl, wantsOwnTab } from "./preview";
 
 const UI = path.resolve(process.cwd(), "..", "ui", "webview");
 const PREVIEW = fs.readFileSync(path.join(UI, "preview.ts"), "utf8");
 const VIEW = fs.readFileSync(path.join(UI, "file-view.ts"), "utf8");
+const BROWSE = fs.readFileSync(path.join(UI, "file-browse.ts"), "utf8");
+const RENDER = fs.readFileSync(path.join(UI, "render.ts"), "utf8");
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "bin", "romp-kernel"), "utf8");
 const GUIDE = fs.readFileSync(path.resolve(process.cwd(), "..", "docs", "guide.md"), "utf8");
 
@@ -67,11 +71,27 @@ test("not the web dashboard (a webview origin): no attempt at all, false", () =>
   assert.equal(calls.length, 0, "the webview sandbox cannot window.open — callers keep their own path");
 });
 
-test("wiring: the card and the viewer open the tab first and fall back to the in-app view", () => {
-  // the card's click → openPdf → the tab, else the lightbox
-  assert.match(PREVIEW, /export function openPdf\(path: string, sid\?: string \| null\): void \{\n  if \(!openPdfTab\(path, sid\)\) openLightbox\(path, sid\);\n\}/);
+test("the gesture decides: a plain click is in-app, a Cmd/Ctrl-click or a middle button is the tab", () => {
+  assert.equal(wantsOwnTab(undefined), false);
+  assert.equal(wantsOwnTab(null), false);
+  assert.equal(wantsOwnTab({}), false, "a plain click stays inside the dashboard, like an image");
+  assert.equal(wantsOwnTab({ button: 0 }), false);
+  assert.equal(wantsOwnTab({ metaKey: true }), true, "Cmd-click (macOS)");
+  assert.equal(wantsOwnTab({ ctrlKey: true }), true, "Ctrl-click (Windows, Linux)");
+  assert.equal(wantsOwnTab({ button: 1 }), true, "the middle button, as auxclick reports it");
+  assert.equal(wantsOwnTab({ shiftKey: true } as any), false, "shift alone is selection, not a new tab");
+  assert.equal(wantsOwnTab({ metaKey: true, key: "Enter" } as any), true, "a keyboard gesture carries the same modifier: Cmd/Ctrl+Enter on a file-browser row");
+});
+
+test("wiring: every click on a PDF carries its gesture; modified → the tab, plain or blocked → the in-app view", () => {
+  // the card's click → openPdf(path, sid, ev) → the tab on a modified click, else (or when blocked) the lightbox
+  assert.match(PREVIEW, /export function openPdf\(path: string, sid\?: string \| null, ev\?: MouseEvent \| null\): void \{\n  if \(wantsOwnTab\(ev\) && openPdfTab\(path, sid\)\) return;\n  openLightbox\(path, sid\);\n\}/);
   const pf = PREVIEW.slice(PREVIEW.indexOf("export function previewFull"));
-  assert.match(pf, /box\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); openPdf\(path, sid\); \};/);
+  assert.match(pf, /box\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); openPdf\(path, sid, ev\); \};/);
+  assert.match(pf, /box\.onmousedown = \(ev\) => \{ if \(ev\.button === 1\) ev\.preventDefault\(\); \};/,
+    "the middle PRESS is cancelled: autoscroll (Firefox, Edge) starts on mousedown and would swallow the auxclick");
+  assert.match(pf, /box\.onauxclick = \(ev\) => \{ if \(ev\.button !== 1\) return; ev\.stopPropagation\(\); openPdf\(path, sid, ev\); \};/,
+    "a middle-click reaches the card as auxclick, never as click");
   // the opener itself: synchronous, two-argument window.open — the gesture and the handle both matter
   const opener = PREVIEW.slice(PREVIEW.indexOf("export function openPdfTab"), PREVIEW.indexOf("export function openPdf("));
   assert.match(opener, /if \(previewKind\(path\) !== "pdf" \|\| !canPreview\(\)\) return false;/, "the kind check is the opener's own");
@@ -79,13 +99,29 @@ test("wiring: the card and the viewer open the tab first and fall back to the in
   assert.doesNotMatch(opener, /"noopener/, "the noopener FEATURE makes window.open return null on success — the block signal would be lost");
   assert.match(opener, /if \(!w\) return false;[^\n]*\n\s+try \{ w\.opener = null; \}/, "…so the link is severed on the handle instead, before anything else");
   assert.doesNotMatch(opener, /await|\.then\(/, "the open happens inside the click gesture, never after a fetch");
-  // the viewer: a .pdf path takes the tab BEFORE anything on screen is touched, by extension, synchronously
+  // the viewer: the ONE place a clicked file's gesture is read — openFileClick — and the plain open below it
+  // never opens a tab (a relayed viewFile, a Reload: no gesture, the viewer)
+  assert.match(VIEW, /export function openFileClick\(ev: MouseEvent \| KeyboardEvent \| null \| undefined, path: string, sid\?: string \| null\): void \{\n  if \(wantsOwnTab\(ev\) && openPdfTab\(path, sid \?\? null\)\) return;\n  openFileView\(path, sid\);\n\}/);
+  // no click site bypasses the gesture reader: the chat and the browser never call openFileView themselves
+  assert.equal((RENDER.match(/openFileView\(/g) || []).length, 0, "render.ts opens files through openFileClick only");
+  assert.equal((BROWSE.match(/openFileView\(/g) || []).length, 0, "file-browse.ts opens files through openFileClick only");
   const view = VIEW.slice(VIEW.indexOf("export function openFileView("));
-  const branch = view.indexOf("if (openPdfTab(path, sid ?? null)) return;");
-  assert.ok(branch > 0, "the viewer's PDF branch exists");
-  assert.ok(branch < view.indexOf('document.getElementById("romp-fileview")?.remove();'),
-    "…and runs before the current viewer (if any) is replaced");
-  assert.ok(branch < view.indexOf("closeGuard && !closeGuard()"), "…and before the unsaved-edits ask: the tab disturbs nothing");
+  const body = view.slice(0, view.indexOf("\n}\n"));
+  assert.doesNotMatch(body, /openPdfTab|wantsOwnTab/, "openFileView itself opens in-app, whatever the path");
+  // the file browser's rows and the chat's path pills hand their gesture over, middle button included
+  assert.match(BROWSE, /list\.addEventListener\("click", \(ev\) => \{[\s\S]*?onAct\(row, ev\);/);
+  assert.match(BROWSE, /const fileRowOf = \(ev: MouseEvent\) => \{[\s\S]*?row\.dataset\.act === "file" \? row : null;/,
+    "a middle-click acts on a FILE row only — never a folder's navigation or a download-only row's download");
+  assert.match(BROWSE, /list\.addEventListener\("mousedown", \(ev\) => \{[\s\S]*?if \(ev\.button === 1 && fileRowOf\(ev\)\) ev\.preventDefault\(\);/,
+    "the middle PRESS on a file row is cancelled so autoscroll cannot swallow the auxclick");
+  assert.match(BROWSE, /list\.addEventListener\("auxclick", \(ev\) => \{[\s\S]*?if \(ev\.button !== 1\) return;[\s\S]*?const row = fileRowOf\(ev\);[\s\S]*?onAct\(row, ev\);/);
+  assert.match(BROWSE, /if \(active\) \{ e\.preventDefault\(\); onAct\(active, e\); \}/, "Enter on a row carries its modifiers: Cmd/Ctrl+Enter on a PDF → its own tab");
+  assert.match(BROWSE, /if \(row\.dataset\.act === "file"\) \{ openFileClick\(ev, p, curSid\); return; \}/);
+  assert.match(RENDER, /function openPath\(path: string, sid\?: string \| null, ev\?: MouseEvent \| null\): void \{[\s\S]*?openFileClick\(ev, path, sid \|\| activeId \|\| null\);/);
+  assert.match(RENDER, /function onMiddleClick\(a: HTMLElement, fn: \(e: MouseEvent\) => void\): void \{\n  a\.addEventListener\("mousedown", \(e\) => \{ if \(e\.button === 1\) e\.preventDefault\(\); \}\);\n  a\.addEventListener\("auxclick", \(e\) => \{ if \(e\.button !== 1\) return; e\.stopPropagation\(\); fn\(e\); \}\);/);
+  assert.match(RENDER, /x\.addEventListener\("auxclick", \(e\) => e\.stopPropagation\(\)\);/, "a middle-click on the composer attachment's ✕ is inert, never the box's open");
+  assert.equal((RENDER.match(/onMiddleClick\(/g) || []).length, 5, "the declaration and the four path pills: tool file, image path, path link, composer attachment");
+  assert.equal((RENDER.match(/openPath\([^)]*, e\)/g) || []).length, 8, "each pill passes its click AND its middle-click");
 });
 
 test("the kernel serves a PDF inline WITH its name, so the tab is titled and a Save names the file", () => {
@@ -119,6 +155,8 @@ test("an oversize PDF's tab is not a dead end, and the listing marks such a file
 });
 
 test("the guide says so, in the user's terms", () => {
-  assert.match(GUIDE, /\*\*Opening a PDF\.\*\* .*opens\nin a new browser tab/);
-  assert.match(GUIDE, /If the browser\nblocks the new tab, the PDF opens in the in-app viewer instead; a PDF too large to show\noffers a download in its place\./);
+  const flat = GUIDE.replace(/\s+/g, " ");
+  assert.match(flat, /\*\*Opening a PDF\.\*\* [^*]{0,160}opens inside the dashboard like an image/);
+  assert.match(flat, /Cmd-click it instead \(Ctrl on Windows and Linux\), or middle-click, and it opens in a new browser tab in the browser's own viewer/);
+  assert.match(flat, /If the browser blocks that new tab, the PDF opens inside the dashboard instead; a PDF too large to show offers a download in its place\./);
 });

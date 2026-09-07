@@ -86,7 +86,7 @@ class FilePreviewEndpoint(unittest.TestCase):
         self.assertEqual(body, PNG)
 
     def test_a_pdf_is_served_inline_with_its_name_so_its_own_tab_is_titled_and_a_save_names_it(self):
-        # a PDF opens in its OWN browser tab now (ui/webview/preview.ts openPdfTab, the user 2026-09-06);
+        # a PDF opens in its OWN browser tab on a Cmd/Ctrl- or middle-click (ui/webview/preview.ts openPdfTab, the user 2026-09-06/07);
         # the browser titles that tab and names a Save from Content-Disposition — inline, never
         # attachment, so the tab renders it instead of downloading. Images carry none: an <img> reads
         # no disposition, and the header set they always had stays byte-for-byte.
@@ -104,7 +104,7 @@ class FilePreviewEndpoint(unittest.TestCase):
             self.assertIsNone(hdrs.get("Content-Disposition"), p)
 
     def test_an_oversize_pdf_navigated_to_in_its_own_tab_gets_a_page_with_the_download_as_the_way_out(self):
-        # a PDF opens in its own tab now, decided by extension inside the click — so a PDF over the cap lands
+        # a modified click opens a PDF in its own tab, decided by extension inside the click — so a PDF over the cap lands
         # its whole tab on the 413, with no viewer around it to offer the Download button the in-pane path
         # used to (review find 2026-09-06). A refusal to render is never a dead end: a NAVIGATION
         # (Sec-Fetch-Dest: document) gets a page with the sentence and a link to the download half; a fetch,
@@ -148,7 +148,7 @@ class FilePreviewEndpoint(unittest.TestCase):
             self.assertEqual((code, hdrs.get("Content-Type")), (413, "text/plain"), "a fetch() keeps the text")
             code, hdrs, body = self._req(qp, headers={"Sec-Fetch-Dest": "empty", "Accept": "text/html"})
             self.assertEqual((code, hdrs.get("Content-Type")), (413, "text/plain"), "a present non-shown dest wins over Accept")
-            # an oversize IMAGE navigated to keeps the text — only a PDF opens in its own tab
+            # an oversize IMAGE navigated to keeps the text — only a PDF can open in its own tab
             bigpng = os.path.join(self.tmp.name, "huge.png")
             with open(bigpng, "wb") as f:
                 f.truncate(km._PREVIEW_MAX_BYTES + 1)

@@ -19,7 +19,8 @@ import hljs from "highlight.js/lib/core";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { hostOf, bareId, hostNameNodes } from "./host-prefix";
-import { fileUrl, openPdfTab } from "./preview";
+import { fileUrl } from "./preview";
+import { openPdfTab, wantsOwnTab } from "./preview";   // a PDF's own tab, and the gesture that asks for it
 import { kernelUrl } from "./media";
 import { quoteSrcLabel } from "./docreview";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -317,15 +318,21 @@ export function closeFileView(): void {
   document.body.classList.remove("fileview-open");
 }
 
+/** A click on a file — a path in the chat, a file-browser row — WITH its gesture. A Cmd/Ctrl- or
+ *  middle-click on a PDF (or Cmd/Ctrl+Enter on a file-browser row) opens the browser's own tab (preview.ts
+ *  openPdfTab); a plain click opens the
+ *  viewer below, like an image (the user 2026-09-07). Decided by EXTENSION, synchronously, inside the
+ *  gesture: deciding on the fetched Content-Type would lose the gesture, and every browser would then
+ *  block the tab. Every clicked file lands here, so this is the one place the choice lives; a relayed
+ *  viewFile or a Reload has no gesture and opens the viewer directly. A BLOCKED popup falls through to
+ *  the viewer, so the PDF is never unreachable, and a non-PDF is simply not the opener's business. */
+export function openFileClick(ev: MouseEvent | KeyboardEvent | null | undefined, path: string, sid?: string | null): void {
+  if (wantsOwnTab(ev) && openPdfTab(path, sid ?? null)) return;
+  openFileView(path, sid);
+}
+
 /** Show `path` in a modal over this pane. Re-opening replaces whatever is up — never stacks. */
 export function openFileView(path: string, sid?: string | null, frag?: string | null): void {
-  // A PDF belongs in its own browser tab (preview.ts openPdfTab — the user 2026-09-06); the in-pane
-  // viewer below is only the fallback for a blocked popup. Decided by EXTENSION, synchronously, inside
-  // the click gesture: deciding on the fetched Content-Type would lose the gesture, and every browser
-  // would then block the tab. Every caller lands here — a path link, a file-browser row, a relayed
-  // viewFile — so this is the one place the choice lives. Nothing up is touched: the tab opens beside.
-  // (openPdfTab answers false for a non-PDF path: the kind check is its own, by extension.)
-  if (openPdfTab(path, sid ?? null)) return;
   // The replace path bypasses closeFileView, so it needs the same dirty ask: opening file B over an
   // edited-but-unsaved file A must not silently eat A's buffer.
   if (document.getElementById("romp-fileview") && closeGuard && !closeGuard()) return;

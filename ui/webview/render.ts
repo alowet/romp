@@ -40,7 +40,7 @@ import { numberDiff, type DiffRow } from "./diff-lines";
 import { parseAgentNotif, type AgentNotif } from "./agent-notif";
 import { subTabId, isSubId, subParts, subLabel, gistLines, stepLines, stepsNote, agentFoldLabel, subHeadParts, openIconSvg, pinIconSvg, type SubMeta, type AgentGist, type AgentGistRow, type GistLine } from "./subagent-view";
 import { previewKind, previewFull, canPreview, fileUrl, retryFailedPreviews, refreshSettledPreviews, installMdImgHeal, setLightboxNav, type LightboxNavEntry } from "./preview";
-import { openFileView } from "./file-view";
+import { openFileClick } from "./file-view";                  // a clicked file WITH its gesture (pdf-new-tab.test.ts)
 // initFileView rides its OWN line: the import above is pinned verbatim by file-view.test.ts
 import { initFileView, setFileViewIdentity, hostStub } from "./file-view";
 import { openUrlView } from "./file-view";                 // the URL mode of the same viewer (md-url-view.test.ts)
@@ -944,13 +944,22 @@ document.addEventListener("click", (e) => {
 //
 // Same document as the click, so there is no shell relay and no fallback ladder: standalone /chat
 // and the framed pane behave identically.
-function openPath(path: string, sid?: string | null): void {
+function openPath(path: string, sid?: string | null, ev?: MouseEvent | null): void {
   if (!vscodeApi) return;
   if (location.protocol === "http:" || location.protocol === "https:") {
-    openFileView(path, sid || activeId || null);
+    openFileClick(ev, path, sid || activeId || null);   // with its gesture: a Cmd/Ctrl- or middle-click on a PDF → the browser's own tab
     return;
   }
   vscodeApi.postMessage(sid ? { type: "openFile", path, id: sid } : { type: "openFile", path });
+}
+
+// A middle-click on a path pill is the same open with its gesture (a PDF then takes a browser tab of its
+// own, openFileClick). `click` never fires for the middle button; `auxclick` does. The middle PRESS is
+// cancelled on mousedown: its default, autoscroll (Firefox on Windows/macOS, Edge), starts on the press and
+// would swallow the release's auxclick — a pill is a span, not a link, so the browser does not exempt it.
+function onMiddleClick(a: HTMLElement, fn: (e: MouseEvent) => void): void {
+  a.addEventListener("mousedown", (e) => { if (e.button === 1) e.preventDefault(); });
+  a.addEventListener("auxclick", (e) => { if (e.button !== 1) return; e.stopPropagation(); fn(e); });
 }
 
 // Surface the FILE BROWSER at `path` for the session: the shell brings the feed pane forward and the
@@ -980,8 +989,9 @@ function fileLink(path: string): HTMLElement {
   a.title = "Open " + path;
   a.addEventListener("click", (e) => {
     e.stopPropagation();
-    openPath(path);
+    openPath(path, null, e);
   });
+  onMiddleClick(a, (e) => openPath(path, null, e));
   return a;
 }
 
@@ -1272,8 +1282,9 @@ function imgPathLink(path: string): HTMLElement {
   a.title = "Open " + path;
   a.addEventListener("click", (e) => {
     e.stopPropagation();
-    openPath(path);
+    openPath(path, null, e);
   });
+  onMiddleClick(a, (e) => openPath(path, null, e));
   return a;
 }
 // Make literal occurrences of the images' paths inside the rendered message text
@@ -1315,8 +1326,9 @@ function openPathLink(raw: string, open: string, relative = false): HTMLElement 
   a.title = "Open " + open;
   a.addEventListener("click", (e) => {
     e.stopPropagation();
-    openPath(open, relative ? activeId : null);
+    openPath(open, relative ? activeId : null, e);
   });
+  onMiddleClick(a, (e) => openPath(open, relative ? activeId : null, e));
   return a;
 }
 function fileUriLink(uri: string): HTMLElement { return openPathLink(uri, fileUriToPath(uri)); }
@@ -11904,11 +11916,13 @@ function renderComposerFiles(id: string | null): void {
     } else {
       box.appendChild(composerFileDoc(p));
     }
-    box.addEventListener("click", () => { openPath(p, id || null); });
+    box.addEventListener("click", (e) => { openPath(p, id || null, e); });
+    onMiddleClick(box, (e) => openPath(p, id || null, e));
     const x = el("button", "composer-file-x");
     x.setAttribute("aria-label", "Remove attachment");
     x.textContent = "\u2715";
     x.addEventListener("click", (e) => { e.stopPropagation(); if (id) removeComposerFile(id, i); });
+    x.addEventListener("auxclick", (e) => e.stopPropagation());   // a middle-click on ✕ is inert, never the box's open
     box.appendChild(x);
     strip.appendChild(box);
   });

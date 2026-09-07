@@ -29,6 +29,15 @@ export function canPreview(): boolean {
   return location.protocol === "http:" || location.protocol === "https:";
 }
 
+// Which click means "in a browser tab of its own"? The browser-wide idiom, so there is nothing new to
+// learn and no setting to find: a Cmd/Ctrl-click (the `click` event carries the modifier) or a
+// middle-button press (which arrives as `auxclick`, button 1). A plain click keeps a PDF inside the
+// dashboard exactly as an image opens (the user 2026-09-07, who wanted one opening rule for both); the
+// modifier is the one signal that the browser's own viewer, beside the dashboard, is what is wanted.
+export function wantsOwnTab(ev?: { metaKey?: boolean; ctrlKey?: boolean; button?: number } | null): boolean {
+  return !!ev && (!!ev.metaKey || !!ev.ctrlKey || ev.button === 1);
+}
+
 // LOADING CUE (the user 2026-07-31): a remote image's bytes arrive over the ssh tunnel, so for a
 // beat the message showed only the path text and the picture "popped in" with nothing saying it was
 // on the way. Per the loading-state rule the first thing up is the romp swirl: a mini spinning glyph
@@ -111,11 +120,13 @@ export function fileUrl(path: string, sid?: string | null): string {
   return base + "?path=" + encodeURIComponent(path) + (bare ? "&sid=" + encodeURIComponent(bare) : "");
 }
 
-// A PDF opens in a NEW BROWSER TAB, in the browser's own viewer (the user 2026-09-06, who wanted what
-// OpenReview and HotCRP do: the paper in its own tab, full size, kept open beside the dashboard — not a
-// small window inside it). Those sites do nothing more than link the PDF's URL with target=_blank and
-// serve it inline as application/pdf; the browser renders it from its own cache, and nothing lands on
-// disk unless the browser is set to download PDFs — no download-then-delete dance is needed. /file
+// A PDF's OWN browser tab — on a Cmd/Ctrl- or middle-click (wantsOwnTab). A plain click keeps the PDF
+// inside the dashboard like an image: the lightbox from the chat card, the in-pane viewer from a path or a
+// file-browser row (the user 2026-09-07). The modified click opens the paper full size in the browser's own
+// viewer, the way one opens from OpenReview or HotCRP (the user 2026-09-06), and it stays open beside the
+// dashboard while the work goes on. Those sites do nothing more than link the PDF's URL with a new-tab
+// target and serve it inline as application/pdf; the browser renders it from its own cache and nothing lands
+// on disk unless the browser is set to download PDFs — no download-then-delete dance is needed. /file
 // already serves exactly that (same-origin, cookie-authed, federation-aware through fileUrl), so the
 // tab is ONE window.open inside the click gesture — synchronous, so a popup blocker reads it as
 // user-initiated; a fetch-then-open would lose the gesture and be blocked everywhere. The opener
@@ -128,10 +139,10 @@ export function fileUrl(path: string, sid?: string | null): string {
 // look-alike (reverse tabnabbing) — every other new tab this UI opens is disowned the same way.
 // The flag is set while the tab is still its same-origin initial page and rides every later
 // navigation. Web dashboard only: the VS Code webview cannot window.open, and previews are gated off
-// there anyway (canPreview). The KIND check lives here, by
-// extension — the only fact available inside the gesture — so a caller passes any path and a non-PDF
-// is simply "not mine" (false): the viewer's own media branch keeps keying on the kernel's
-// Content-Type verdict, never on an extension re-test (file-view.test.ts pins that).
+// there anyway (canPreview). The KIND check lives here, by extension — the only fact available inside
+// the gesture — so a caller passes any path and a non-PDF is simply "not mine" (false): the viewer's own
+// media branch keeps keying on the kernel's Content-Type verdict, never on an extension re-test
+// (file-view.test.ts pins that).
 export function openPdfTab(path: string, sid?: string | null): boolean {
   if (previewKind(path) !== "pdf" || !canPreview()) return false;
   const w = window.open(fileUrl(path, sid), "_blank");
@@ -140,13 +151,16 @@ export function openPdfTab(path: string, sid?: string | null): boolean {
   return true;
 }
 
-// The PDF card's click: its own tab, else the in-app lightbox when the popup was blocked.
-export function openPdf(path: string, sid?: string | null): void {
-  if (!openPdfTab(path, sid)) openLightbox(path, sid);
+// The PDF card's click, with its gesture: a plain click opens the in-app lightbox, like an image; a
+// Cmd/Ctrl- or middle-click opens the PDF in its own browser tab (openPdfTab), and a BLOCKED popup falls
+// back to the lightbox so the PDF is never unreachable.
+export function openPdf(path: string, sid?: string | null, ev?: MouseEvent | null): void {
+  if (wantsOwnTab(ev) && openPdfTab(path, sid)) return;
+  openLightbox(path, sid);
 }
 
 // Full-view lightbox: dark backdrop, the image at natural-but-capped size or the PDF in the browser's
-// native viewer (the FALLBACK for a blocked popup — a PDF opens in its own tab first, openPdf),
+// native viewer (a plain click's PDF view, and the fallback when a modified click's tab was popup-blocked — openPdf),
 // filename caption. One singleton element; backdrop click / Esc / ✕ closes. Styles live
 // in BOTH styles.css and feed.css (each page loads only its own sheet — the .romp-acted precedent).
 // Pinch-zoom on the lightbox image (T162, the user 2026-08-28 on Android). Pointer events only —
@@ -253,7 +267,7 @@ export function openLightbox(path: string, sid?: string | null, pin?: string): v
   let cue: HTMLElement | null = null;                    // the compact position mark ("3/17") in the bar
   let curImg: (() => HTMLImageElement) | null = null;    // the img on screen NOW (step rebinds it) — the copy source
   if (kind === "pdf") {
-    // the in-app FALLBACK only (openPdf): a PDF opens in its own browser tab unless the popup was blocked
+    // a plain click's view (openPdf), and the fallback when a modified click's tab was popup-blocked
     const frame = document.createElement("iframe");
     frame.className = "romp-lightbox-frame";
     frame.src = fileUrl(path, sid);
@@ -394,8 +408,8 @@ export function openLightbox(path: string, sid?: string | null, pin?: string): v
 // thumbnail but a rendered image, like the user messages). Self-verifying —
 // a path the kernel can't serve removes itself — and an image click still opens the lightbox. Images
 // render at the user-image scale (.path-full-img mirrors .user-img's 320px cap, one size per
-// information type). A PDF is a labeled CARD, not an auto-loading inline viewer (click → its own
-// browser tab, openPdf; the lightbox only when the popup is blocked):
+// information type). A PDF is a labeled CARD, not an auto-loading inline viewer (click → the
+// lightbox; Cmd/Ctrl- or middle-click → its own browser tab, openPdf):
 // the first cut embedded an <iframe> per mentioned PDF, and a browser set to "Download PDFs" (or one
 // that declines to render inline) saved a FRESH COPY on every chat re-render — the user's Downloads
 // folder silently filled with datasheet copies (2026-07-20). A fetch must be user-initiated, once.
@@ -423,8 +437,10 @@ export function previewFull(path: string, sid?: string | null, verified = false,
     nm.textContent = path.slice(path.lastIndexOf("/") + 1);
     box.append(tag, nm);
     box.style.cursor = "pointer";
-    box.title = "open " + path + " in a new tab";
-    box.onclick = (ev) => { ev.stopPropagation(); openPdf(path, sid); };   // its own tab, else the lightbox
+    box.title = "Open " + path + " (Cmd/Ctrl-click or middle-click: a browser tab of its own)";
+    box.onclick = (ev) => { ev.stopPropagation(); openPdf(path, sid, ev); };   // plain: the lightbox; modified: its own tab
+    box.onmousedown = (ev) => { if (ev.button === 1) ev.preventDefault(); };   // the middle press: no autoscroll (it would swallow the auxclick)
+    box.onauxclick = (ev) => { if (ev.button !== 1) return; ev.stopPropagation(); openPdf(path, sid, ev); };
     // a chip can't self-verify like an <img> — HEAD-probe (headers only, no body — never a download)
     // so a missing PDF never shows a dead card. A kernel-VERIFIED card skips the probe: the kernel
     // said the file exists, and a transient probe failure must not erase the card.
