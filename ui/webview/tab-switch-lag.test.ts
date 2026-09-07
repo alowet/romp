@@ -32,7 +32,7 @@ test("inbound tails repaint the tab strip once per animation frame; gestures sti
 
 test("the idle pre-build checks its budget before each tab, on a deadline that counts down", () => {
   const run = /^function runPrebuild\([\s\S]*?\n\}/m.exec(RENDER)![0];
-  const check = run.indexOf("if (deadline.timeRemaining() < 3 && !deadline.didTimeout) { schedulePrebuild(); break; }");
+  const check = run.indexOf("if (deadline.timeRemaining() < 3 && (!deadline.didTimeout || built > 0)) { schedulePrebuild(); break; }");
   const work = run.indexOf("syncView(id); // build the hidden view now");
   assert.ok(check > 0 && work > 0 && check < work, "the budget check precedes the work");
   assert.match(RENDER, /cb\(\{ timeRemaining: \(\) => Math\.max\(0, 12 - \(performance\.now\(\) - t0\)\) \}\)/);
