@@ -29,9 +29,10 @@ test("renderQueued draws a wireframe-hourglass header (singular/plural) + one ma
   assert.match(RENDER, /return `\$\{n\} queued \$\{noun\}\$\{n === 1 \? "" : "s"\}`/);
   assert.match(RENDER, /label\.textContent = queuedCountText\(n, nCmd\) \+ why;/);
   assert.match(RENDER, /el\("div", "queued-head"\)/);
-  // one faint "you" bubble per pending message, rendered as markdown (like a landed message)
+  // one faint "you" bubble per pending message, rendered as markdown (like a landed message — the
+  // user-text renderer, newlines kept, so the queued→landed swap changes nothing on screen)
   assert.match(RENDER, /for \(const t of ev\.texts\)[\s\S]*?el\("div", "queued-bubble md" \+ \(t\.cancelable \? " cancelable" : ""\)\)/);
-  assert.match(RENDER, /if \(!isCmd\) bubble\.innerHTML = md\(t\.md\)/);
+  assert.match(RENDER, /if \(!isCmd\) bubble\.innerHTML = userMd\(t\.md\)/);
 });
 
 test("a queued slash command renders as a command chip, not a plain 'message' (the user 2026-07-01)", () => {

@@ -21,7 +21,7 @@ test("renderQueued renders markdown (not raw text) + the follow-up header", () =
   const fn = SRC.slice(qStart, SRC.indexOf("function renderApiError", qStart));
   assert.ok(fn.length > 0, "found renderQueued");
   assert.match(fn, /if \(t\.followUp\) turn\.appendChild\(followUpHeader\(t\.goal, t\.fuCtx, t\.idx !== undefined \? "q:" \+ t\.idx : undefined\)\);/);
-  assert.match(fn, /bubble\.innerHTML = md\(t\.md\);/);
+  assert.match(fn, /bubble\.innerHTML = userMd\(t\.md\);/);   // markdown, through the user-text renderer (newlines kept)
   assert.doesNotMatch(fn, /textContent = t\b/, "no more raw textContent dump");
 });
 

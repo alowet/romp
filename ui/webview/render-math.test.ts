@@ -91,10 +91,15 @@ test("escaped \\$ never opens math", () => {
 
 const UI = (f: string) => fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", f), "utf8");
 
-test("render.ts wires the math extensions into marked", () => {
+test("render.ts wires the math extensions into marked, through the shared chat grammar", () => {
+  // chat-md.ts owns the extension list (shared with the breaks:true user-text instance, so a user
+  // message with math renders exactly as before); render.ts applies it to the singleton.
+  const grammar = UI("chat-md.ts");
+  assert.match(grammar, /import \{ mathBlock, mathInline \} from "\.\/math";/);
+  assert.match(grammar, /export const chatMdExtensions: MarkedExtension\[\] = \[delDoubleTilde, \{ extensions: \[mathBlock, mathInline\] \}\];/);
   const src = UI("render.ts");
-  assert.match(src, /import \{ mathBlock, mathInline \} from "\.\/math";/);
-  assert.match(src, /marked\.use\(\{ extensions: \[mathBlock, mathInline\] \}\)/);
+  assert.match(src, /import \{ chatMdExtensions, userMdHtml \} from "\.\/chat-md";/);
+  assert.match(src, /marked\.use\(\.\.\.chatMdExtensions\);/);
 });
 
 test("math.ts renders html-only output so md()'s DOMPurify profile passes it", () => {

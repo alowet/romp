@@ -18900,7 +18900,20 @@ def _split_reminders(text):
             reminders.append(text[j + len(OPEN):].strip()); break
         reminders.append(text[j + len(OPEN):k].strip())
         i = k + len(CLOSE)
-    return " ".join("".join(out).split()), [r for r in reminders if r]
+    # Rejoin the fragments around the peeled blocks. Each SEAM collapses to one separator — a paragraph
+    # break if the whitespace the block sat in held a blank line, a newline if it held one, else a space —
+    # and the prompt's OWN whitespace is kept. This used to be " ".join(prompt.split()), which flattened
+    # every newline in a message that happened to arrive with a reminder attached (the first prompt of a
+    # session rides with the CLAUDE.md block; a prompt after a background task rides with its notification),
+    # so a message typed with Shift+Enter line breaks rendered as one run-together line (the user 2026-09-06).
+    prompt = out[0]
+    for seg in out[1:]:
+        left, right = prompt.rstrip(), seg.lstrip()
+        lws, rws = prompt[len(left):], seg[:len(seg) - len(right)]     # the whitespace on each side of the block
+        nl = max(lws.count("\n"), rws.count("\n"))                     # per side: a blank line on either side is a paragraph break
+        sep = "\n\n" if nl >= 2 else "\n" if nl else " " if (lws or rws) else ""
+        prompt = left + sep + right
+    return prompt.strip(), [r for r in reminders if r]
 
 
 _IMG_PATH_RE = re.compile(r"(?:^|[\s'\"`(])((?:~/|/)[^\s'\"`()]+\.(?:png|jpe?g|gif|webp|bmp|svg))\b", re.I)

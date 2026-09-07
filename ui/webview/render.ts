@@ -1,5 +1,6 @@
 import { marked } from "marked";
 import DOMPurify from "dompurify";
+import type { Config } from "dompurify";   // the one sanitizer profile both md() and userMd() share
 import hljs from "highlight.js/lib/core";
 import bash from "highlight.js/lib/languages/bash";
 import python from "highlight.js/lib/languages/python";
@@ -50,7 +51,7 @@ import { dirStatusHint, nextDirActive, createDirPrompt, type DirStatus } from ".
 import { mediaSrc, kernelUrl } from "./media";
 import { initStrip, fmtReset } from "./strip";
 import { apiErrorReason } from "./api-error-reason";
-import { mathBlock, mathInline } from "./math";
+import { chatMdExtensions, userMdHtml } from "./chat-md";
 import { setTip, pruneTip } from "./tip";
 import { agentCount, replyOwed, threadsByAnchor, threadBusy, threadStuck, findAnchorRange, sliceRanges, prunePending, type CommentThread } from "./comments";
 import { dragSlotIndex } from "./dragslot";
@@ -64,24 +65,10 @@ for (const [name, lang] of Object.entries({
 }
 
 marked.setOptions({ gfm: true, breaks: false });
-// Strikethrough requires DOUBLE tildes (the user 2026-06-26). marked's built-in GFM `del` tokenizer also
-// fires on a SINGLE tilde, so prose like "near the ~21 Wh/day budget … gives ~1.5–2 days" renders as one big
-// <del> struck through from the first ~ to the second. GitHub itself only strikes ~~double~~, so match that:
-// a lone ~ (commonly "approximately") stays literal. Returning undefined lets marked treat the ~ as text.
-marked.use({
-  tokenizer: {
-    del(src: string) {
-      const m = /^~~(?=\S)([\s\S]*?\S)~~/.exec(src);
-      if (!m) return undefined;
-      return { type: "del", raw: m[0], text: m[1], tokens: (this as { lexer: { inlineTokens(s: string): unknown[] } }).lexer.inlineTokens(m[1]) };
-    },
-  },
-} as Parameters<typeof marked.use>[0]);
-
-// TeX math ($..$, $$..$$, \(..\), \[..\]) rendered via KaTeX. All delimiter heuristics (the
-// $-vs-shell/price disambiguation) live in math.ts; the output is plain spans + inline styles
-// (output: "html"), which DOMPurify's html profile in md() passes through unchanged.
-marked.use({ extensions: [mathBlock, mathInline] });
+// The chat grammar — the ~~-only `del` tokenizer and the KaTeX math extensions — is defined ONCE in
+// chat-md.ts and shared with `userMarked`, the breaks:true instance that renders the user's own words
+// (userMd below). Everything assistant-authored stays on this singleton, breaks:false.
+marked.use(...chatMdExtensions);
 
 // One answered (or pending) question on an AskUserQuestion turn: the prompt + its options, plus the
 // user's answer TEXT per question (`chosen`). Answer text may name an option label OR be free-text
@@ -753,21 +740,34 @@ function el(tag: string, cls?: string): HTMLElement {
   return e;
 }
 
+// ONE sanitizer profile for both renderers. svg profile too (the user 2026-08-19): KaTeX's html output
+// still draws STRETCHY glyphs — \sqrt radicals, wide accents, extensible arrows — as inline <svg><path>,
+// and the html-only profile silently ate them: $\sqrt{d}$ rendered as a bare serif "d", the radical gone.
+// DOMPurify's svg profile is still sanitized (no scripts, handlers, or foreignObject). Keep data: URIs on
+// <img> (the CSP allows them and inline transcript images rely on them).
+const MD_PURIFY: Config = { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"] };
+
 function md(src: string): string {
   // Transcript text (user prompts, assistant output, subagent reports, postal
   // bodies) is UNTRUSTED and `marked` emits raw HTML verbatim, so its output
   // must be sanitized before it ever reaches .innerHTML — otherwise a payload
   // like `<img src=x onerror=...>` or `[x](javascript:...)` runs in the webview
   // (which can postMessage the host to open files / drive sessions). DOMPurify
-  // strips event-handler attributes and dangerous URL schemes. Keep data: URIs
-  // on <img> (the CSP allows them and inline transcript images rely on them).
+  // strips event-handler attributes and dangerous URL schemes (profile: MD_PURIFY).
   try {
     const dirty = marked.parse(src) as string;
-    // svg profile too (the user 2026-08-19): KaTeX's html output still draws STRETCHY glyphs —
-    // \sqrt radicals, wide accents, extensible arrows — as inline <svg><path>, and the html-only
-    // profile silently ate them: $\sqrt{d}$ rendered as a bare serif "d", the radical gone.
-    // DOMPurify's svg profile is still sanitized (no scripts, handlers, or foreignObject).
-    return DOMPurify.sanitize(dirty, { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"] });
+    return DOMPurify.sanitize(dirty, MD_PURIFY);
+  } catch { const d = document.createElement("div"); d.textContent = src; return d.innerHTML; }
+}
+
+// The user's OWN typed words (the blue bubble, its queued/optimistic twin): same grammar, same sanitizer,
+// but newlines KEPT — Shift+Enter in the composer means a new line, and the singleton's breaks:false
+// (right for assistant markdown, where a lone newline is a soft wrap) ran a multi-line message together
+// into one paragraph once it landed in the chat (the user 2026-09-06). userMarked is the breaks:true
+// instance in chat-md.ts; the singleton and every assistant surface are untouched.
+function userMd(src: string): string {
+  try {
+    return DOMPurify.sanitize(userMdHtml(src), MD_PURIFY);
   } catch { const d = document.createElement("div"); d.textContent = src; return d.innerHTML; }
 }
 
@@ -2438,7 +2438,9 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
           bubble.title = bubble.classList.contains("expanded") ? "click to collapse" : "click to expand";
         }
       } else if (ev.md) {
-        bubble.innerHTML = md(ev.md);
+        // the user's OWN words keep their line breaks (userMd); a harness-injected note — compact
+        // summary, command stdout — shares this branch and stays on the assistant grammar
+        bubble.innerHTML = kind === "user" ? userMd(ev.md) : md(ev.md);
         linkifyFileUris(bubble, imgPaths, ev.spacePaths, ev.pathLinks, ev.pathPins);   // bare file:// URLs in a message → clickable (open in the host's default app)
       }
       // images, IN the bubble (part of his message): thumbnail + open/copy caption;
@@ -3483,7 +3485,7 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
     else if (!t.cancelable && t.idx !== undefined)
       bubble.title = "queued in the session — it can't be recalled, and joins the conversation at the session's next step";
     const isCmd = renderSlashCmd(bubble, t.md);
-    if (!isCmd) bubble.innerHTML = md(t.md);
+    if (!isCmd) bubble.innerHTML = userMd(t.md);   // the user's words, newlines kept — byte-for-byte what the landed bubble shows
     // An optimistic echo's dragged images render as THUMBNAILS, not just their trailing paths (the
     // user 2026-08-25: composer preview → path-only provisional → thumbnail landing flashed). Same
     // machinery end to end: userImage with the landed form's exact "path:" shape — buildPathImg's
