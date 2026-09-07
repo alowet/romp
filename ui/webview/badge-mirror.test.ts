@@ -125,7 +125,10 @@ test("the feed answers revealCard: scroll to the card, pulse it accent, session 
   // the return path of the bell's jump (the user 2026-07-28): the shell posts {romp:'revealCard'};
   // the feed finds the card by its data-key, scrolls + pulses; a gone card opens the session instead.
   assert.match(FEED, /if \(m\.romp === "revealCard"\) \{/);
-  assert.match(FEED, /\[data-key="a:\$\{String\(m\.itemId \|\| ""\)\}"\]/);
+  // the card is found by dataset.key EQUALITY over [data-key] nodes, never an interpolated selector (a
+  // crafted push-card value with a quote threw inside querySelector; review fold on #940, 2026-09-07)
+  assert.match(FEED, /const key = "a:" \+ String\(m\.itemId \|\| ""\);/);
+  assert.match(FEED, /\.find\(\(c\) => c\.dataset\.key === key\) \|\| null;/);
   assert.match(FEED, /target\.scrollIntoView\(\{ block: "center", behavior: "smooth" \}\);/);
   assert.match(FEED, /target\.classList\.add\("reveal-pulse"\);/);
   assert.match(FEED, /animationend.*reveal-pulse.*once: true/, "the pulse is one-shot");

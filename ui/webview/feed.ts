@@ -5192,8 +5192,13 @@ window.addEventListener("message", (e: MessageEvent) => {
     // FOLDED thread has no element yet — unfold first (the same rule revealCards follows: the navigation wins
     // over the disclosure). A card that no longer exists under its own key (cleared, or folded into a group)
     // falls back to opening the session.
-    unfoldThreadsFor(new Set(["a:" + String(m.itemId || "")]));
-    const target = document.querySelector(`[data-key="a:${String(m.itemId || "")}"]`) as HTMLElement | null;
+    const key = "a:" + String(m.itemId || "");
+    unfoldThreadsFor(new Set([key]));
+    // Match the key STRUCTURALLY, never an interpolated attribute selector: a crafted push-card value
+    // with a quote or bracket would throw a SyntaxError inside querySelector and abort this handler,
+    // dropping the openSession fallback too (review find on #940, 2026-09-07).
+    const target = (Array.from(document.querySelectorAll("[data-key]")) as HTMLElement[])
+      .find((c) => c.dataset.key === key) || null;
     if (target) {
       target.scrollIntoView({ block: "center", behavior: "smooth" });
       target.classList.remove("reveal-pulse"); void target.offsetWidth;   // restart the animation on a repeat jump
