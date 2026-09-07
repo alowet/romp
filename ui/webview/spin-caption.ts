@@ -65,6 +65,12 @@ export interface Spin {
   tip: string;
   awaitingBg: boolean;
   still?: boolean;   // the at-rest floor: glyph present but NOT spinning — spin reads as in-flight, and quiet/unknown are states of rest
+  /** A caption that ENDS in a running duration, split for a live label: `caption` is
+   *  `text + workingFor(nowS - since)` exactly, and the renderer stamps the duration on its own element
+   *  (feed-age.ts fmt "dur") so the 15 s live pass keeps it moving. The feed's per-card update gate
+   *  repaints a card only when its inputs change, so a duration baked into one string would freeze on a
+   *  card the kernel has no reason to re-send (a long wait whose record does not change). */
+  dur?: { text: string; since: number } | null;
 }
 
 const NONE: Spin = { caption: null, tip: "", awaitingBg: false };
@@ -205,12 +211,13 @@ export function spinFor(it: SpinItem, distillPending: boolean, dCompleted: boole
     // how long the wait has held, from the kernel's event time — the same live readout the working
     // narration wears, so a stuck wait is visible at a glance (the user 2026-08-23)
     const waited = waitedSuffix(aw.since, nowS);
+    const head = /^waiting on/i.test(why) ? why.charAt(0).toUpperCase() + why.slice(1) : "Awaiting " + word;
     return {
-      caption: (/^waiting on/i.test(why) ? why.charAt(0).toUpperCase() + why.slice(1)
-                                         : "Awaiting " + word) + waited,
+      caption: head + waited,
       tip: why ? why + ". Not on you; paused until the background work lands."
                : "Paused, waiting on background work it dispatched (not on you). Clears when the result lands.",
       awaitingBg: true,
+      dur: waited ? { text: head + " · ", since: aw.since as number } : null,
     };
   }
   if (it.provisional && it.column === "working" && !aw) {
@@ -286,12 +293,14 @@ export function spinFor(it: SpinItem, distillPending: boolean, dCompleted: boole
     const dur = nowS && it.working.since ? workingFor(nowS - it.working.since) : "";
     // zero tool uses says nothing worth reading ("0 tool uses" was noise — the user 2026-08-13):
     // the count appears once there is one, and until then the timer alone carries the narration
-    const parts = [n >= 1 ? `${n} tool ${n === 1 ? "use" : "uses"}` : "", dur].filter(Boolean);
+    const count = n >= 1 ? `${n} tool ${n === 1 ? "use" : "uses"}` : "";
+    const parts = [count, dur].filter(Boolean);
     return {
       caption: parts.length ? `Working — ${parts.join(" · ")}` : "Working…",
       tip: "The open turn's live progress: tool calls made so far, and how long this stretch has been "
          + "running. If the count freezes while the timer climbs, something is worth a look.",
       awaitingBg: false,
+      dur: dur ? { text: "Working — " + (count ? count + " · " : ""), since: it.working.since as number } : null,
     };
   }
   if (it.column === "working") {

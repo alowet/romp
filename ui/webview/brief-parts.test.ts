@@ -61,8 +61,8 @@ test("the trailing still-open paragraph renders unstamped, and only the item par
   assert.ok(FEED.includes("if (stampOk && i < bp!.length) {"),
     "the chip is appended only for paragraphs that HAVE a part; the extra one gets none");
   const block = FEED.slice(FEED.indexOf("// PER-PARAGRAPH ages"), FEED.indexOf("// The distiller line is a LINK"));
-  assert.ok(/paras\.forEach\(\(p, i\) => \{[\s\S]*?if \(stampOk && i < bp!\.length\) \{[\s\S]*?relAge\(nowS - \(bp!\[i\]\.since/.test(block),
-    "the guard wraps the relAge lookup itself, so bp[i] is never read past the end");
+  assert.ok(/paras\.forEach\(\(p, i\) => \{[\s\S]*?if \(stampOk && i < bp!\.length\) \{[\s\S]*?if \(bp!\[i\]\.since\) stampAge\(age, bp!\[i\]\.since/.test(block),
+    "the guard wraps the stamp's since lookup itself, so bp[i] is never read past the end");
   assert.ok(block.includes("ONE EXTRA TRAILING PARAGRAPH"), "the why is recorded where the gate lives");
 });
 
@@ -72,8 +72,9 @@ test("the trailing still-open paragraph renders unstamped, and only the item par
 
 test("each paragraph wears its own live age chip", () => {
   assert.ok(FEED.includes('el("span", "fask-para-age")'));
-  assert.ok(FEED.includes("relAge(nowS - (bp![i].since || nowS))"),
-    "the ask's OWN block-event age, via the shared relAge vocabulary");
+  assert.ok(FEED.includes('if (bp![i].since) stampAge(age, bp![i].since, "plain", false, nowS, relAge, ageColorReadable);'),
+    "the ask's OWN block-event age, via the shared relAge vocabulary — stamped, so the 15 s live pass moves it on a card the update gate does not repaint");
+  assert.ok(FEED.includes('else age.textContent = relAge(0);'), "no event time → the static chip it always showed, unstamped (nothing to count from)");
 });
 
 test("the chip inherits the brief's font size — dimness is the only differentiation", () => {

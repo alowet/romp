@@ -1,8 +1,9 @@
 // The feed pane's per-card update gate, RUN: feed.ts booted under a DOM stand-in, fed synthetic frames through
 // the window message it listens on, and watched for what each render REBUILT. The invariant these frames pin:
 // a card repaints when the kernel sent it (a new object), when a board-level input it reads changed (the
-// key), or when a gesture touched it; its column and order are re-applied on every render regardless;
-// nothing else touches it. Two of the assertions are the regressions the paint key this gate replaced would
+// key), or when a gesture touched it; its column and order are re-applied on every render regardless; and
+// the 15 s live pass moves its ages and durations on the kernel's clock, writing only the labels whose text
+// changed. Two of the assertions are the regressions the paint key this gate replaced would
 // fail: a re-dispatch of the same objects across a 15 s boundary rebuilds nothing (the key carried a
 // fifteen-second clock term, so the first frame of every window repainted every card), and one session's
 // `working` change repaints that session's cards alone (the key carried an epoch every status-set change
@@ -192,6 +193,9 @@ win.acquireVsCodeApi = () => ({ postMessage: (m: any) => posted.push(m) });
 (globalThis as any).requestAnimationFrame = win.requestAnimationFrame;
 (globalThis as any).getComputedStyle = win.getComputedStyle;
 (globalThis as any).MouseEvent = class MouseEvent extends Event { clientX = 0; clientY = 0; };
+// the paint gate's second measure: render() observes #feed-list once; a test drives the callback by hand
+const observers: { cb: (entries: { isIntersecting: boolean }[]) => void }[] = [];
+(globalThis as any).IntersectionObserver = class { cb: any; constructor(cb: any) { this.cb = cb; observers.push(this); } observe() {} disconnect() {} };
 const doc: any = new EventTarget();
 Object.assign(doc, {
   body, head: new El("head"), documentElement: new El("html"), hidden: false, activeElement: body,
@@ -220,10 +224,11 @@ const g1 = cardOf("g1", WEB, "web", "#3366cc", "Wire the notes-api health route"
   { tree: [node("g1", "Wire the notes-api health route", "web", WEB, ["g1a"]), node("g1a", "Add the /health handler", "web", WEB)] });
 const g2 = cardOf("g2", API, "api", "#cc6633", "Write the notes-api README", "working");
 const g3 = cardOf("g3", TESTS, "tests", "#33cc66", "Run the notes-api test suite", "working",
-  { awaiting: { why: "", kind: "agents", count: 2, since: K0 - 600 } });
-// upstream's frame shape: the kernel's `now`, per-card `trgb`, the status sets, the session order and list
+  { awaiting: { why: "", kind: "agents", count: 2, since: K0 - 600 } });   // a wait ten minutes old: its duration must move without a frame
+// the frame shape: the kernel's `now` and federation's `nowAt` (when the frame landed, the pane's clock anchor),
+// per-card `trgb`, the status sets, the session order and list
 const frame = (asks: any[], over: Record<string, unknown> = {}) => ({
-  type: "feed", now: K0, buildId: 1, asks,
+  type: "feed", now: K0, nowAt: T0 * 1000, buildId: 1, asks,
   working: [], awaiting: [], stateUnknown: [], order: [WEB, API, TESTS], selfHost: "TESTHOST",
   sessions: [{ sid: WEB, name: "web", color: g1.color }, { sid: API, name: "api", color: g2.color }, { sid: TESTS, name: "tests", color: g3.color }],
   bgServices: {}, ...over,
@@ -244,13 +249,14 @@ const ev = { stopPropagation() {}, preventDefault() {} };
 
 test("frame A: three cards are built once each, in the Working column", async () => {
   mock.timers.enable({ apis: ["Date", "setTimeout", "setInterval"], now: T0 * 1000 });
-  await import("./feed");                   // module load: gear (a no-op here), listeners, the 15 s tick
+  await import("./feed");                   // module load: gear (a no-op here), listeners, the 15 s live pass
   assert.equal(posted.filter((m) => m.type === "ready").length, 1, "the ready handshake");
   await dispatch(frame([g1, g2, g3]));
   assert.deepEqual(nameRebuilds(), { g1: 1, g2: 1, g3: 1 }, "each name node was built exactly once");
   assert.deepEqual({ g1: colOf("g1"), g2: colOf("g2"), g3: colOf("g3") }, { g1: "col-asks-list", g2: "col-asks-list", g3: "col-asks-list" });
   assert.equal(card("g1")._time.textContent, "4m ago", "on the kernel's clock (the browser clock is five minutes ahead)");
-  assert.match(card("g3")._awaitWhy.textContent, /^Awaiting /, "the awaiting box shows the wait");
+  assert.equal(card("g3")._awaitWhy.textContent, "Awaiting agents · 10m", "the awaiting box, with the wait's duration on the kernel's clock");
+  assert.equal(card("g3")._awaitWhy.querySelector(".fask-dur")?.dataset.ageFmt, "dur", "…as a stamped element the live pass can reach");
   // open card 1's Sub-goals section (a gesture): the section state must survive the renders below untouched
   card("g1")._subBtn.onclick(ev);
   assert.equal(card("g1")._subBtn.getAttribute("aria-pressed"), "true");
@@ -295,8 +301,8 @@ test("frame C: the same frame re-dispatched (a federation re-emit) rebuilds noth
 
 test("…and across a 15 s boundary: the clock is not a paint input", async () => {
   // the key this gate replaced carried a fifteen-second term, so the first frame in every 15 s window
-  // repainted every card. The tick that fires inside this window rewrites the age labels (its own business);
-  // it rebuilds no card.
+  // repainted every card. The live pass that fires inside this window moves the labels whose minute rolled
+  // over (its own business, pinned below); it rebuilds no card.
   const before = nameRebuilds(), readsBefore = rectReads;
   const same = frame([g1, card("g2")._it, g3]);
   mock.timers.tick(16_000);
@@ -393,7 +399,7 @@ test("a quarantine card never skips: its sender's colour, looked up by name in t
   await dispatch(frame([g1, recoloured, g3, q1], { working: ["web"] }));   // q1 is the very same object
   assert.equal(sender().style.color, "#112233", "the held-mail card repainted although nothing of its own changed");
   await dispatch(frame([g1, { ...recoloured, color: g2.color }, g3], { working: ["web"] }));   // decided elsewhere; api's colour as before
-  assert.equal(card("q1"), null);
+  assert.ok(!card("q1"));
 });
 
 test("a handoff recipient's working state is a paint input: the delegating card repaints and its delegation line appears when the recipient starts working; an idle session's card does not repaint", async () => {
@@ -425,7 +431,7 @@ test("a remote host going down is a paint input: that host's card repaints (its 
   assert.deepEqual({ ...nameRebuilds(), r1: card("r1")._name.rc }, { ...before, r1: before.r1 + 1 }, "the remote card alone repainted");
   delete (globalThis as any).__rompFed;
   await dispatch(frame([g1, card("g2")._it, g3], { working: ["web"] }));
-  assert.equal(card("r1"), null);
+  assert.ok(!card("r1"));
 });
 
 test("a colour echo (an in-place write into the shared objects) repaints that session's cards through the key, once", async () => {
@@ -435,6 +441,166 @@ test("a colour echo (an in-place write into the shared objects) repaints that se
   assert.equal(card("g2")._name.style.color, "#cc3366");
   await dispatch(frame([g1, card("g2")._it, g3], { working: ["web"] }));   // the same objects again, colour still echoed
   assert.deepEqual(nameRebuilds(), { g1: before.g1, g2: before.g2 + 1, g3: before.g3 }, "the echoed colour is in the key: no flap, no second rebuild");
+});
+
+test("the 15 s live pass moves ages and durations on cards no frame touched, writing only the labels whose text changed", () => {
+  // 16.7 s have elapsed since boot (frame C's 700 ms, the 16 s boundary), so one pass has run, at 15 s. The pass
+  // runs at every 15 s multiple on the kernel's clock — the frame's `now` plus the local time since its `nowAt`.
+  // The cards are 240 s old at the frame and relAge rounds to the nearest minute, so "4m ago" becomes "5m ago" at
+  // 270 s (30 s elapsed); the wait is 600 s old and workingFor floors, so "10m" becomes "11m" at 660 s (60 s).
+  const before = nameRebuilds();
+  const time1 = card("g1")._time, dur3 = card("g3")._awaitWhy.querySelector(".fask-dur")!;
+  const t1 = time1.tc, d3 = dur3.tc;
+  assert.equal(time1.textContent, "4m ago"); assert.equal(dur3.textContent, "10m");
+  mock.timers.tick(15_000);                 // the pass at 30 s: the age label crossed its minute, the duration did not
+  assert.equal(time1.textContent, "5m ago"); assert.equal(time1.tc, t1 + 1, "one write, at the minute it crossed");
+  assert.equal(dur3.textContent, "10m"); assert.equal(dur3.tc, d3, "an unchanged label is not written");
+  mock.timers.tick(30_000);                 // the passes at 45 s and 60 s: only the duration crossed, at 60 s
+  assert.equal(dur3.textContent, "11m"); assert.equal(dur3.tc, d3 + 1);
+  assert.equal(time1.textContent, "5m ago"); assert.equal(time1.tc, t1 + 1);
+  mock.timers.tick(15_000);                 // the pass at 75 s: nothing crossed, nothing written
+  assert.equal(time1.tc, t1 + 1); assert.equal(dur3.tc, d3 + 1);
+  assert.deepEqual(nameRebuilds(), before, "the pass repaints labels, never cards");
+  // a pane nobody can see skips the pass and catches up once when shown
+  doc.hidden = true;
+  mock.timers.tick(60_000);                 // the passes at 90-135 s: the age reads 6m from 90 s (330 s) on — nothing written while hidden
+  assert.equal(time1.textContent, "5m ago"); assert.equal(time1.tc, t1 + 1);
+  assert.equal(dur3.textContent, "11m"); assert.equal(dur3.tc, d3 + 1);
+  doc.hidden = false;
+  doc.dispatchEvent(new Event("visibilitychange"));
+  assert.equal(time1.textContent, "6m ago", "shown: one catch-up pass"); assert.equal(time1.tc, t1 + 2);
+  assert.equal(dur3.textContent, "12m"); assert.equal(dur3.tc, d3 + 1 + 1);   // 735 s
+  doc.dispatchEvent(new Event("visibilitychange"));
+  assert.equal(time1.tc, t1 + 2, "a second visibility flip with no skipped pass behind it runs nothing");
+  // the other measure the paint gate reads: #feed-list off screen by the observer's word (the pane the shell has
+  // display:none'd, for which document.hidden stays false) skips the pass the same way, and the observer's
+  // callback is what catches it up — a same-size re-show fires no resize
+  assert.equal(observers.length, 1, "render() observes #feed-list once");
+  observers[0].cb([{ isIntersecting: false }]);
+  mock.timers.tick(60_000);                 // the passes at 150-195 s: the age reads 7m from 150 s (390 s) on — nothing written off screen
+  assert.equal(time1.textContent, "6m ago"); assert.equal(time1.tc, t1 + 2);
+  assert.equal(dur3.textContent, "12m"); assert.equal(dur3.tc, d3 + 2);
+  observers[0].cb([{ isIntersecting: true }]);
+  assert.equal(time1.textContent, "7m ago", "on screen by the observer's word: one catch-up pass"); assert.equal(time1.tc, t1 + 3);
+  assert.equal(dur3.textContent, "13m"); assert.equal(dur3.tc, d3 + 3);   // 795 s
+  observers[0].cb([{ isIntersecting: true }]);
+  assert.equal(time1.tc, t1 + 3, "a second callback with no skipped pass behind it runs nothing");
+  assert.deepEqual(nameRebuilds(), before);
+});
+
+// The kernel clock as a card painted NOW reads it: the frame's `now` plus the local seconds since its `nowAt`
+// (feed-age.ts liveNow). The tests below stamp their fixtures relative to it and tick 15 s at a time, one pass
+// per tick (the pass runs at every 15 s of local time since the module loaded). Under the mock a pass fired
+// inside a tick reads the clock at the tick's END (frame C's note), so each 15 s tick moves every label's clock
+// by 15 s. Ages round to the minute (relAge), durations floor (workingFor).
+const kernelNow = () => K0 + Math.floor((Date.now() - T0 * 1000) / 1000);
+const dur = (el: any) => el.querySelector(".fask-dur");
+
+test("the grouped-mode headers write their labels compare-first: three renders of one frame write no text; a background process appearing writes that header's chip alone", async () => {
+  const same = frame([g1, card("g2")._it, g3], { working: ["web"] });
+  await dispatch(same);
+  const heads = () => body.querySelectorAll(".feed-sess-head").filter((h) => !h.classList.contains("sess-exit"));
+  const writes = () => Object.fromEntries(heads().map((h: any) => [h.getAttribute("data-fsid"), h._fold.tc + h._foldn.tc + h._svc.tc]));
+  const before = writes();
+  assert.equal(Object.keys(before).length, 3, "one header per session run");
+  await dispatch(same); await dispatch(same);
+  assert.deepEqual(writes(), before, "the caret, the folded count and the process chip: compared and skipped");
+  await dispatch(frame([g1, card("g2")._it, g3], { working: ["web"], bgServices: { web: ["dev server on :3000"] } }));
+  const webHead = heads().find((h: any) => h.getAttribute("data-fsid") === WEB) as any;
+  assert.equal(webHead._svc.textContent, "background process"); assert.equal(webHead._svc.style.display, "");
+  assert.deepEqual(writes(), { ...before, [WEB]: before[WEB] + 1 }, "one write, on the header whose chip changed");
+  await dispatch(same);                                          // the process is gone: the chip's count text and display change back
+  assert.equal(webHead._svc.style.display, "none");
+  assert.deepEqual(writes(), { ...before, [WEB]: before[WEB] + 2 });
+});
+
+test("the Awaiting-task pill's waited time and the waiting-on chip's elapsed time are stamped durations the pass moves, writing once at the minute they cross; a wait with no `since` carries no duration", async () => {
+  const kNow = kernelNow();
+  const g4 = cardOf("g4", TESTS, "tests", "#33cc66", "Run the lint pass", "working",
+    { awaiting: { why: "", kind: "tasks", tasks: ["run the suite"], count: 1, since: kNow - 595 } });   // 9m 55s into the wait
+  const g5 = cardOf("g5", API, "api", "#cc6633", "Ask web for the route list", "working",
+    { waitingOn: { peerSid: WEB, name: "web", color: null, inCycle: false, since: kNow - 595 },
+      awaiting: { why: "", kind: "tasks", tasks: ["lint"], count: 1 } });                             // a wait with no since
+  await dispatch(frame([g1, card("g2")._it, g3, g4, g5], { working: ["web"] }));
+  const pill = card("g4")._taskLbl, pillDur = dur(pill);
+  assert.equal(card("g4")._taskBtn.style.display, "", "live tasks: the pill shows");
+  assert.ok(pillDur, "…with the wait's duration as a stamped element");
+  assert.equal(pillDur.dataset.ageFmt, "dur"); assert.equal(pillDur.dataset.ageT, String(kNow - 595));
+  assert.equal(pillDur.textContent, "9m"); assert.match(pill.textContent, /^Awaiting .* · 9m$/);
+  const chip = card("g5")._waitOn, chipDur = chip.querySelector(".fask-waiton-dur .fask-dur"), chipName = chip.querySelector(".fask-waiton-name");
+  assert.equal(chipDur.textContent, "9m"); assert.equal(chipDur.dataset.ageT, String(kNow - 595));
+  assert.equal(chipName.textContent, "web");
+  assert.ok(!dur(card("g5")._taskLbl), "no since: no duration node, no guess");
+  assert.doesNotMatch(card("g5")._taskLbl.textContent, / · /, "the label ends with the word alone");
+  const w0 = { pill: pillDur.tc, chip: chipDur.tc, name: chipName.tc };
+  mock.timers.tick(15_000);                                      // 610 s into both waits → "10m"
+  assert.equal(pillDur.textContent, "10m"); assert.equal(chipDur.textContent, "10m");
+  assert.deepEqual({ pill: pillDur.tc, chip: chipDur.tc, name: chipName.tc }, { pill: w0.pill + 1, chip: w0.chip + 1, name: w0.name }, "one write each; the peer's name node untouched");
+  mock.timers.tick(15_000);                                      // 625 s → still "10m"
+  assert.deepEqual({ pill: pillDur.tc, chip: chipDur.tc, name: chipName.tc }, { pill: w0.pill + 1, chip: w0.chip + 1, name: w0.name }, "no crossing, no write");
+  await dispatch(frame([g1, card("g2")._it, g3], { working: ["web"] }));
+  assert.ok(!card("g4") && !card("g5"), "the fixtures left with the frame");
+});
+
+let g7: any;   // the needs-you card the next two tests share
+test("per-paragraph ages of a multi-item brief are stamps the pass moves; a paragraph with no event time is the static '<1m ago' chip", async () => {
+  const kNow = kernelNow();
+  g7 = cardOf("g7", WEB, "web", "#3366cc", "Decide the auth scheme", "needs_input",
+    { blockSummary: "Pick between sessions and tokens.\n\nName the cookie domain.\n\nStill open: the refresh interval.",
+      briefParts: [{ id: "g7a", since: kNow - 260 }, { id: "g7b", since: kNow - 600 }, { id: "g7c", since: null }] });
+  await dispatch(frame([g1, card("g2")._it, g3, g7], { working: ["web"] }));
+  const ages = (): any[] => card("g7")._distill.querySelectorAll(".fask-para-age");
+  assert.equal(ages().length, 3, "one chip per paragraph");
+  assert.deepEqual(ages().map((a) => a.textContent), ["4m ago", "10m ago", "<1m ago"]);
+  assert.deepEqual(ages().map((a) => a.dataset.ageT), [String(kNow - 260), String(kNow - 600), undefined], "the third carries no stamp: nothing to count from");
+  const w0 = ages().map((a) => a.tc);
+  mock.timers.tick(15_000);                                      // 275 s rounds to 5m; 615 s stays 10m
+  assert.deepEqual(ages().map((a) => a.textContent), ["5m ago", "10m ago", "<1m ago"]);
+  assert.deepEqual(ages().map((a) => a.tc), [w0[0] + 1, w0[1], w0[2]]);
+  mock.timers.tick(30_000);                                      // 305 s stays 5m; 645 s rounds to 11m
+  assert.deepEqual(ages().map((a) => a.textContent), ["5m ago", "11m ago", "<1m ago"]);
+  assert.deepEqual(ages().map((a) => a.tc), [w0[0] + 1, w0[1] + 1, w0[2]], "the unstamped chip is never written");
+});
+
+test("the latched Continue's hover title is refreshed by the pass once the payload carries the latch, compare-then-write", async () => {
+  const cont = card("g7")._cont;
+  assert.equal(cont.style.display, "", "a live needs-you card offers Continue");
+  let sets = 0, held = "";
+  const watch = () => { held = cont.title; Object.defineProperty(cont, "title", { get: () => held, set: () => { sets++; }, configurable: true }); };
+  const unwatch = () => { delete cont.title; cont.title = held; };
+  cont.onclick(ev);                                              // posts the gesture, latches the button, predicts the move to Working
+  assert.equal(cont.disabled, true);
+  assert.match(cont.title, /^a continue sent — /); assert.doesNotMatch(cont.title, /ago/, "no age: the click's own object carries no followupAt");
+  watch(); mock.timers.tick(14_000); unwatch();                  // one pass, inside the prediction's 15 s ack window
+  assert.equal(sets, 0, "the payload does not carry the latch yet: the pass has nothing to move and writes nothing");
+  const kNow = kernelNow();
+  await dispatch(frame([g1, card("g2")._it, g3, { ...g7, column: "working", followupPending: true, followupAt: kNow - 100 }], { working: ["web"] }));   // the kernel confirms, stamping the follow-up 100 s ago
+  assert.equal(cont.disabled, true, "still latched: the judge has not ruled");
+  assert.match(cont.title, /^a continue sent 2m ago — /, "the payload's stamp is the title's age now");
+  watch(); mock.timers.tick(15_000); mock.timers.tick(15_000); unwatch();   // 115 s, 130 s: both round to 2m
+  assert.equal(sets, 0, "two passes, no crossing: the title is compared and left alone");
+  mock.timers.tick(30_000);                                      // 160 s rounds to 3m
+  assert.match(cont.title, /^a continue sent 3m ago — /, "the pass moved the title's age");
+  await dispatch(frame([g1, card("g2")._it, g3], { working: ["web"] }));
+  assert.ok(!card("g7"));
+});
+
+test("the group card's time label is a stamp the pass moves: the newest member's time", async () => {
+  const kNow = kernelNow();
+  const h1 = cardOf("h1", API, "api", "#cc6633", "Ship the README", "working", { turnId: "turn-shared", groupTitle: "Ship the README and the CHANGELOG", t: kNow - 260 });
+  const h2 = cardOf("h2", API, "api", "#cc6633", "Ship the CHANGELOG", "working", { turnId: "turn-shared", groupTitle: "Ship the README and the CHANGELOG", t: kNow - 300 });
+  await dispatch(frame([g1, card("g2")._it, g3, h1, h2], { working: ["web"] }));
+  const group = body.querySelector('[data-key="g:turn-shared"]') as any;
+  assert.ok(group, "two asks of one typed turn fold into a group card"); assert.ok(!card("h1"), "the members are folded into it");
+  assert.equal(group._time.textContent, "4m ago"); assert.equal(group._time.dataset.ageT, String(kNow - 260));
+  const w0 = group._time.tc;
+  mock.timers.tick(15_000);                                      // 275 s → 5m
+  assert.equal(group._time.textContent, "5m ago"); assert.equal(group._time.tc, w0 + 1);
+  mock.timers.tick(15_000);                                      // 290 s → still 5m
+  assert.equal(group._time.tc, w0 + 1, "no crossing, no write");
+  await dispatch(frame([g1, card("g2")._it, g3], { working: ["web"] }));
+  assert.ok(!body.querySelector('[data-key="g:turn-shared"]'));
+  mock.timers.tick(700);                                         // the in-place glides this frame started end (their backstop) before the fly cases below
 });
 
 test("Undo inside a card's 180 ms collapse keeps the restored card: the gesture strips .dismissing, which the class rewrite used to do", () => {

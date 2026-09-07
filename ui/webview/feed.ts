@@ -7,15 +7,15 @@
 // pushes and updated in place — never torn down — so hovering one doesn't flicker
 // when the sessions stream new deliverables in. A kept card is REPAINTED only when
 // its inputs changed (feed-card-gate.ts): the kernel re-sent it, a board-level input
-// it reads moved, or a gesture touched it. Its column and order are re-applied on
-// every render regardless.
+// it reads moved, a gesture touched it, or the 15 s live pass aged it. Its column and
+// order are re-applied on every render regardless.
 import { distillText, distillInputs, applyDistillLine, distillPending, distillStaleNote } from "./distiller-line";
 import { flipNeeded } from "./feed-flip";
 import { delegate } from "./actions";
 import { paintHeld, paintReleased } from "./paint-gate";
 import { linkifyPrRefs, setLinkedText, senderPrRepo, installPrLinkOpener } from "./pr-links";
 import { cardInputsKey, cardNeedsUpdate, type GateEnv } from "./feed-card-gate";
-import { spinFor, waitedSuffix, awaitWord, groupRows, GROUP_TITLE, ROW_KIND_OF_LEGACY, type AwaitRow } from "./spin-caption";
+import { spinFor, awaitWord, groupRows, GROUP_TITLE, ROW_KIND_OF_LEGACY, type AwaitRow } from "./spin-caption";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { searchMatches, searchSids } from "./feed-search";
 import { TagLens, lensAll, lensLabel, lensVisible, lensUnions } from "./tag-lens";
@@ -26,6 +26,7 @@ import { hostNameNodes, hostPartsNodes, hostIsDown, hostDownNote, hostOf } from 
 import { extHoverMatches } from "./card-key";
 import { provenanceRows, provenanceGroupRows, rootStart, type ProvFmt, type ProvRow } from "./provenance";
 import { ageColorReadable } from "./age-color";
+import { liveNow, liveRefresher, refreshAges, stampAge } from "./feed-age";
 import { badgeNotices, clearBoundaryNotices, sdkProblemNotices, syncNotices,
   type ClearNoticeRow, type SdkNoticeRow, type SyncNoticeRow } from "./badge-mirror";
 import { initStrip } from "./strip";
@@ -700,6 +701,12 @@ function setWorkDot(nameEl: HTMLElement | null, state: DotState | boolean) {
 }
 
 let hostNow = Math.floor(Date.now() / 1000);
+// …and WHEN that clock was read (ms, the browser's clock): the frame's `nowAt` when federation stamped one,
+// else the handling. Every age and duration on a card reads the kernel's clock through nowSec() (feed-age.ts
+// liveNow): the frame's `now` plus the local time since it landed, so the browser's skew from the kernel
+// never enters an age, and a quiet board's ages keep moving between frames.
+let hostNowAt = Date.now();
+function nowSec(): number { return liveNow(hostNow, hostNowAt, Date.now()); }
 let showDismissed = false;
 let dismissedCount = 0;
 let canUndoClear = false;   // host: cleared.jsonl has rows → the UndoClear button shows
@@ -717,6 +724,11 @@ function el(tag: string, cls?: string): HTMLElement {
   if (cls) e.className = cls;
   return e;
 }
+// A text write that compares first. In a document that has created a MutationObserver — gear.js creates
+// several at boot — Blink treats an identical textContent write as a real Text-node replacement and dirties
+// layout (feed-age.ts has the mechanism). The grouped-mode session headers repaint on every render (they are
+// not behind the per-card update gate), so their labels write through here.
+function setText(e: HTMLElement, s: string): void { if (e.textContent !== s) e.textContent = s; }
 
 // A lightweight yes/no overlay for the feed. Separate from the ask #feed-modal
 // (a different state machine); Esc or a backdrop click cancels.
@@ -846,7 +858,7 @@ function clockHM(t: number): string {
 // a disabled control (the buttons rule) — the label itself stays one word.
 function contTitle(latched: boolean, verb: string, at?: number | null): string {
   return latched
-    ? verb + " sent" + (at ? " " + relAge(hostNow - at) : "") +
+    ? verb + " sent" + (at ? " " + relAge(nowSec() - at) : "") +
       " — waiting for the session's reply to be judged; this re-arms then, and the card moves on its own"
     : verb === "a continue"
       ? "nothing needed from you — asks the session to keep going"
@@ -861,6 +873,22 @@ function relAge(sec: number): string {
   if (s < 3600) return `${Math.round(s / 60)}m ago`;
   if (s < 86400) return `${Math.round(s / 3600)}h ago`;
   return `${Math.round(s / 86400)}d ago`;
+}
+
+// A RUNNING duration as its own stamped element (feed-age.ts fmt "dur"): "42m" / "1h 5m" since an event
+// time, repainted by the 15 s live pass like every other age. Every elapsed label on a card renders through
+// here — the awaiting box, the Awaiting-task pill, the waiting-on chip, the working narration — because the
+// per-card update gate repaints a card only when its inputs change, and a duration baked into a caption
+// string would freeze on a card the kernel has no reason to re-send (a long wait whose record does not
+// change). On the kernel's clock (nowSec), like every other age here; these read Date.now() before.
+function durSpan(since: number): HTMLElement {
+  const d = el("span", "fask-dur");
+  stampAge(d, since, "dur", false, nowSec(), relAge, ageColorReadable);
+  return d;
+}
+/** waitedSuffix's live twin: [" · ", <duration>] for a known start, [] otherwise — no since, no duration, never a guess. */
+function durNodes(since: number | null | undefined): (string | HTMLElement)[] {
+  return since && since > 0 ? [" · ", durSpan(since)] : [];
 }
 
 function dayLabel(t: number, now: number): string {
@@ -1606,9 +1634,6 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
   // class in the visible label (tooltips are dead on the touch PWA). ONE rule with the chat chip and
   // the awaiting box (awaitWord, slice 2): one row → its word, several of a kind → count + word, mixed
   // kinds → the number alone ("Awaiting 4"); a single named peer → its name in identity colour.
-  // the wait's elapsed time rides the pill exactly as it rides the awaiting box and the working
-  // narration — a stuck wait must be glanceable everywhere the state shows (the user 2026-08-23)
-  const pillWaited = waitedSuffix(it.awaiting && it.awaiting.since, Date.now() / 1000);
   const pillPeers = (it.awaiting && it.awaiting.peers) || [];
   const pillWord = awaitWord(awKind, (it.awaiting && it.awaiting.count) ?? taskRows.length, taskRows);
   const pillLbl = a._taskLbl as HTMLElement;
@@ -1619,7 +1644,10 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
     if (pillPeers[0].color && pillPeers[0].color.bg) nm.style.color = pillPeers[0].color.bg;
     pillLbl.appendChild(nm);
   } else pillLbl.append(pillWord);
-  pillLbl.append(pillWaited);
+  // the wait's elapsed time rides the pill exactly as it rides the awaiting box and the working
+  // narration — a stuck wait must be glanceable everywhere the state shows (the user 2026-08-23) —
+  // as a stamped duration the 15 s live pass keeps moving (durNodes, the live twin of waitedSuffix)
+  pillLbl.append(...durNodes(it.awaiting && it.awaiting.since));   // the waited time, live (durSpan)
   taskBtn.classList.toggle("on", choice === "tasks");
   taskBtn.setAttribute("aria-pressed", choice === "tasks" ? "true" : "false");
   taskBtn.title = choice === "tasks" ? "hide the tasks" : "show the tasks";
@@ -1881,7 +1909,7 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
       og.append(peer);
     });
   }
-  a._time.textContent = relAge(hostNow - it.t);
+  stampAge(a._time, it.t, "plain", false, nowSec(), relAge, ageColorReadable);   // stamped: the 15 s live pass moves it
   // hover the stamp for provenance (the user 2026-07-27): the age marks the NEWEST event (a done card's
   // age is its completion), so the popover tells where the thread came from — started when, each sub +
   // its time, what the stamp marks.
@@ -1959,10 +1987,10 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
     a._waitOn.append(woPre, woName);
     // elapsed since the unanswered ask went out (kernel _wait_for_graph's since) — the same readout the
     // working narration and awaiting box wear, so a wait stuck for hours is glanceable (the user 2026-08-23)
-    const woWaited = waitedSuffix(wo.since, Date.now() / 1000);
-    if (woWaited) {
-      const woDur = el("span", "fask-waiton-dur"); woDur.textContent = woWaited;
-      a._waitOn.append(woDur);
+    const woDur = durNodes(wo.since);
+    if (woDur.length) {
+      const woWrap = el("span", "fask-waiton-dur"); woWrap.append(...woDur);
+      a._waitOn.append(woWrap);
     }
     a._waitOn.title = wo.inCycle
       ? "MUTUAL WAIT — this session and " + wo.name + " are each waiting on the other (a deadlock); auto-nudge surfaces it instead of nudging"
@@ -1992,7 +2020,7 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
   // The card is not left mute in that window: the Working displacement only happens under recheck/rejudging,
   // and both raise the "Analyzing…" swirl below, which says the judge is looking at it again.
   const spin = spinFor(it, distillPending(dCompleted, dBlocked, it.summary, it.blockSummary, !!it.blocked),
-                       dCompleted, Date.now() / 1000);
+                       dCompleted, nowSec());
   const spinCaption = spin.caption, spinTip = spin.tip, awaitingBg = spin.awaitingBg;
   a._awaitSpin.style.display = spinCaption ? "" : "none";
   // The AWAITING case gets a rounded box (its distinct read); the swirl spins in every case now —
@@ -2021,8 +2049,9 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
         }
         a._awaitWhy.appendChild(nm);
       });
-      a._awaitWhy.append(waitedSuffix(it.awaiting && it.awaiting.since, Date.now() / 1000));
-    } else a._awaitWhy.textContent = spinCaption;
+      a._awaitWhy.append(...durNodes(it.awaiting && it.awaiting.since));
+    } else if (spin.dur) a._awaitWhy.replaceChildren(spin.dur.text, durSpan(spin.dur.since));   // the caption's running duration, live
+    else a._awaitWhy.textContent = spinCaption;
     a._awaitSpin.title = spinTip || spinCaption;
     // HONEST fallback (the user 2026-08-26): a peer-kind wait with no named session says WHY the
     // name is missing, instead of presenting "peer" as a style — identity is only truly unknowable
@@ -2100,13 +2129,14 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
     if (stampOk || anchOk) {
       const dle = a._distill as HTMLElement;
       dle.textContent = "";
-      const nowS = Date.now() / 1000;
+      const nowS = nowSec();
       paras.forEach((p, i) => {
         const para = el("div", "fask-para");
         para.textContent = p;
         if (stampOk && i < bp!.length) {
           const age = el("span", "fask-para-age");
-          age.textContent = relAge(nowS - (bp![i].since || nowS));
+          if (bp![i].since) stampAge(age, bp![i].since, "plain", false, nowS, relAge, ageColorReadable);   // stamped: the live pass moves it
+          else age.textContent = relAge(0);   // no event time → the static "<1m ago" this chip always showed; nothing to count from
           para.append(" ", age);
         }
         // T220 first: the paragraph's own citation, with its located span riding the landing
@@ -2590,7 +2620,7 @@ function updateGroupCard(card: HTMLElement, g: AskGroup) {
   a._name.replaceChildren(...hostNameNodes(g.name, g.sid));
   if (g.color) a._name.style.color = g.color.bg;
   setWorkDot(a._name, dotFor(g.name));   // working/awaiting dot before the session name
-  a._time.textContent = relAge(hostNow - g.t);
+  stampAge(a._time, g.t, "plain", false, nowSec(), relAge, ageColorReadable);
   wireAgeTip(a._time, () => provenanceGroupRows(g.members.map(rootStart), g.t, hostNow, PROV_FMT));
   // member lines — rebuilt only when the member set or any member's status changes
   const memSig = g.members.map((m) => m.itemId + ":" + memberStatus(m)).join("|");
@@ -3482,13 +3512,13 @@ function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
   const fold = (h as any)._fold as HTMLElement, foldn = (h as any)._foldn as HTMLElement;
   const shut = collapsedThreads.has(e.sid);
   h.classList.toggle("folded", shut);
-  fold.textContent = shut ? "▸" : "▾";           // ▸ folded / ▾ open
+  setText(fold, shut ? "▸" : "▾");               // ▸ folded / ▾ open
   fold.title = shut ? "show this session's cards" : "collapse this session to its name — new cards stay folded too";
   fold.setAttribute("aria-expanded", shut ? "false" : "true");
   fold.setAttribute("aria-label", (shut ? "expand " : "collapse ") + e.name);
   foldn.style.display = shut && e.folded ? "" : "none";
   // just the number (the user 2026-08-26) — the section chips' own vocabulary; the words live on hover
-  foldn.textContent = String(e.folded);
+  setText(foldn, String(e.folded));
   foldn.title = e.folded === 1 ? "1 card folded under this session" : e.folded + " cards folded under this session";
   fold.onclick = (ev) => {
     ev.stopPropagation();   // the fold IS the acknowledgement: local state + an immediate re-render
@@ -3506,7 +3536,7 @@ function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
   const procs = e.live ? bgServicesMap[e.name] || [] : [];
   const open = procs.length > 0 && openBgSvc.has(e.sid);
   svc.style.display = procs.length ? "" : "none";
-  svc.textContent = procs.length === 1 ? "background process" : procs.length + " background processes";
+  setText(svc, procs.length === 1 ? "background process" : procs.length + " background processes");
   svc.title = open ? "hide the processes" : "processes this session keeps running — click to list";
   svc.classList.toggle("on", open);
   svc.setAttribute("aria-pressed", open ? "true" : "false");
@@ -4667,6 +4697,7 @@ function watchFeedVisibility(list: HTMLElement): void {
   new IntersectionObserver((entries) => {
     feedIntersecting = entries.some((e) => e.isIntersecting);
     releasePaint();
+    live.catchUp();   // the 15 s age pass skipped while off screen (feed-age.ts liveRefresher); one pass, same measure
   }).observe(list);
 }
 // The owed paint, settled the moment both measures say the pane can be seen. Synchronous on purpose (no
@@ -5384,7 +5415,13 @@ function applyFeedPayload(m: any): void {
     // event: the session left the tab list), rather than leaving the board silently pinned to nothing
     if (feedOnlySid && !sessionsMeta.some((s) => s.sid === feedOnlySid)) setFeedOnly(null);
   }
-  hostNow = typeof m.now === "number" ? m.now : Math.floor(Date.now() / 1000);
+  if (typeof m.now === "number") {
+    hostNow = m.now;
+    hostNowAt = typeof m.nowAt === "number" ? m.nowAt : Date.now();   // the pair travels together: the frame's clock, and when THAT frame arrived (federation stamps it, so a re-emit of a held frame does not re-anchor)
+  } else {
+    hostNow = Math.floor(Date.now() / 1000);   // an older kernel's frame carries no clock: the browser's own, from here
+    hostNowAt = Date.now();
+  }
   mirrorBadges(incomingAsks, Array.isArray(m.clearNotices) ? m.clearNotices : [],
     Array.isArray(m.sdkNotices) ? m.sdkNotices : [],
     Array.isArray(m.syncNotices) ? m.syncNotices : []);   // card trouble chips + /clear drops + SDK failures + fleet syncs also log in the shell's bell (chips stay on the cards)
@@ -5714,15 +5751,43 @@ function revealCards(keys: Set<string>) {
   }
 }
 
-// Keep "Xm ago" honest between host pushes (host reposts ~1×/min for color fade).
-setInterval(() => {
-  const now = Math.floor(Date.now() / 1000);
-  for (const [id, card] of askEls) {
-    const it = asks.find((a) => a.itemId === id);
-    const t = (card as any)._time as HTMLElement | undefined;
-    if (it && t) t.textContent = relAge(now - it.t);
+// ── the 15 s LIVE PASS ────────────────────────────────────────────────────────────────────────────
+// Keep every "Xm ago" and every running duration honest between host pushes, on the kernel's clock (nowSec):
+// on the delta path a quiet board sends a pane nothing between the 60 s reposts, and the per-card update gate
+// (feed-card-gate.ts) repaints a card only when its inputs change, so this pass is what moves time on every
+// card the kernel does not re-send. Every age-bearing label on a card face is stamped (feed-age.ts stampAge)
+// and the pass repaints them all from one clock, rather than each render path owning a copy of the
+// formatting.
+//
+// The pass WRITES ONLY WHAT CHANGED: relAge rounds to the minute and then the hour, so a handful of labels
+// move per tick on a board of hundreds, and in a document that has ever created a MutationObserver — gear.js
+// creates several at boot — Blink treats an identical textContent write as a real Text-node replacement that
+// dirties layout (paintAge compares first). A pane nobody can see skips the pass and catches up once when
+// shown (liveRefresher, the Outline pane's pattern), by the paint gate's own two measures (paint-gate.ts):
+// the tab hidden, or #feed-list off screen by the observer's word, which is how a pane the shell has
+// display:none'd reads. The two events that release an owed paint catch the pass up, so the feed has one
+// definition of "hidden".
+function livePass(): void {
+  const now = nowSec();
+  for (const card of askEls.values()) {
+    const it = (card as any)._it as AskItem | undefined;
+    if (!it) continue;
+    // the latched Continue's hover title names how long ago it was sent (contTitle, T150): a title, so it
+    // cannot be stamped — refreshed here for the few latched buttons, compare-then-write like the rest, and
+    // only once the payload itself carries the latch (the same test updateAskCard re-arms on): a click
+    // latches the button before any frame lands, and the stale object's followupAt would name an older
+    // follow-up
+    const cont = (card as any)._cont as HTMLButtonElement | undefined;
+    if (cont && cont.disabled && (it.followupPending || it.recheck || it.rejudging)) {
+      const ct = contTitle(true, "a continue", it.followupAt);
+      if (cont.title !== ct) cont.title = ct;
+    }
   }
-}, 15000);
+  refreshAges(document.querySelectorAll<HTMLElement>("[data-age-t]"), now, relAge, ageColorReadable);
+}
+const live = liveRefresher({ hidden: () => paintHeld(document.hidden, feedIntersecting, true), pass: livePass });
+setInterval(live.tick, 15000);
+document.addEventListener("visibilitychange", live.catchUp);
 
 initFileView((m) => vscodeApi?.postMessage(m));   // the file browser opens the viewer in this pane (and saves ride the poster)
 // …and how the viewer names the session a file was opened from: this pane's session list (the same tab
