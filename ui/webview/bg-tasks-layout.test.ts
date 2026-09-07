@@ -1,5 +1,5 @@
 // Background-task box (the user 2026-07-07): ONE dedicated full-width rounded box just above the statusline.
-// The "N background tasks" header BAR sits at the TOP of the box; clicking it expands the list DOWNWARD
+// The one-line header BAR ("Awaiting …" idle / "In the background …" working) sits at the TOP of the box; clicking it expands the list DOWNWARD
 // beneath the header inside the SAME box (a normal flex-direction: column, reading top-to-bottom), so nothing
 // spills below the box — the earlier design let a shrink-1 box get squeezed and its rows clipped behind the
 // composer. It HOLDS its content (flex 0 0 auto), is capped so it never crowds the composer, and the inner
@@ -44,12 +44,35 @@ test("status dots are SOLID — the pulsating yellow animation is gone", () => {
 test("each RUNNING task row has a Stop button riding the stable delegate (the user 2026-08-04)", () => {
   // the button posts the SDK's designed stop_task control request, keyed by the id the box shows;
   // gated on status so a finished row never grows a dead control
-  assert.match(RENDER, /if \(\(t\.status \|\| "running"\) === "running"\) \{/);
-  assert.match(RENDER, /stop\.dataset\.act = "bg-stop"; stop\.dataset\.id = t\.id;/);
+  // since slice 2 (2026-09-05) the row SPEC decides: a tracked task's Stop handle is its id while it
+  // runs (taskRowSpec / awaitRowSpec), and bgRow renders the button from that handle
+  assert.match(RENDER, /stopId: status === "running" \? t\.id : null/);
+  assert.match(RENDER, /if \(t\.stopId\) \{/);
+  assert.match(RENDER, /stop\.dataset\.act = "bg-stop"; stop\.dataset\.id = t\.stopId;/);
   // click-safe: handled on the SAME delegate as the fold toggles, never a per-render listener…
   assert.match(RENDER, /"bg-stop": \(el\) => \{/);
   assert.match(RENDER, /vscodeApi\?\.postMessage\(\{ type: "stopTask", id: activeId, taskId: id \}\);/);
   // …and the click acknowledges IMMEDIATELY, before any round-trip; the row's disappearance (the task's
   // own terminal lifecycle event) is the real confirmation, and a re-render restores a live task's button
   assert.match(RENDER, /btn\.disabled = true; btn\.textContent = "Stopping…";/);
+});
+
+test("a row's trailing cluster sits INLINE after the label, left-aligned — never pushed to the right edge (the user 2026-09-05)", () => {
+  // Before: .bg-sum grew (flex 1 1 auto) to fill the row, so the arrow, elapsed, status word, Stop and caret
+  // hugged the far right — on a wide desktop pane the user missed them entirely. The label now takes only its
+  // own width, shrinking with an ellipsis when long (0 1 auto + min-width 0), and the cluster follows it at
+  // the existing 8px gap. Every cluster item is 0 0 auto so a long label can never push it off-screen, and
+  // nothing in the row uses a spacer, margin-left:auto or space-between.
+  const SUM = (CSS.match(/\.bg-sum \{[^}]*\}/) || [""])[0];
+  assert.match(SUM, /flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;/);
+  assert.doesNotMatch(SUM, /flex: 1 1 auto/);
+  const ROWHEAD = (CSS.match(/\.bg-head \{[^}]*\}/) || [""])[0];
+  assert.match(ROWHEAD, /display: flex; align-items: center; gap: 8px;/);
+  assert.doesNotMatch(ROWHEAD, /justify-content|space-between/);
+  for (const sel of [".bg-since", ".bg-status", ".bg-caret", ".bg-stop", ".tool-open-agent, .sub-head-pin"]) {
+    const rule = (CSS.match(new RegExp(sel.replace(/[.,]/g, (c) => "\\" + c) + " \\{[^}]*\\}")) || [""])[0];
+    assert.match(rule, /flex: 0 0 auto;/, sel + " holds its width");
+    assert.doesNotMatch(rule, /margin-left: auto/, sel + " is not a spacer");
+  }
+  assert.doesNotMatch(CSS, /\.bg-head [^{]*\{[^}]*margin-left: auto/, "no cluster item is pushed right");
 });

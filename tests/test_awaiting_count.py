@@ -58,6 +58,21 @@ class AwaitingCount(unittest.TestCase):
         self.assertEqual(aw["count"], 3)
         self.assertIn("3 background agents", aw["why"])
 
+    def test_an_agent_seen_by_the_hook_and_the_stream_counts_once(self):
+        # 2026-09-06: two agents + one shell command read "Awaiting 5 · 4 agents · 1 command" because the
+        # hook row and the stream row for the same agent were never joined — the count is per awaited THING
+        a1, a2 = "a1111111111111111", "a2222222222222222"
+        km._tmux_sessions = lambda: {SID: {"subagents": [{"type": "general-purpose", "since": 100, "agentId": a1},
+                                                         {"type": "general-purpose", "since": 105, "agentId": a2}]}}
+        km._bg_live_norm = lambda sid, path: [
+            {"tid": "toolu_01", "desc": "check the exporter", "t": 98, "type": "local_agent", "agentId": a1},
+            {"tid": "toolu_02", "desc": "rerun the harness", "t": 104, "type": "local_agent", "agentId": a2},
+            {"tid": "toolu_03", "desc": "build the docs", "t": 110, "type": "local_bash"}]
+        km._bg_pending = lambda sid, path, ts: ts
+        aw = km._session_awaiting(SID, "/tmp/x", True)
+        self.assertEqual((aw["kind"], aw["count"]), ("mixed", 3))
+        self.assertEqual(aw["why"], "waiting on 2 background agents and 1 background command")
+
     def test_pending_tasks_count_the_pending_ones(self):
         tasks = [{"tid": "1", "desc": "watching CI", "t": 7, "type": "bash"},
                  {"tid": "2", "desc": "polling deploy", "t": 3, "type": "bash"}]
@@ -77,6 +92,8 @@ class AwaitingCount(unittest.TestCase):
             aw = km._session_awaiting(SID, "/tmp/x", True)
             self.assertEqual((aw["kind"], aw["count"]), ("job", 3))
             self.assertEqual(len(aw["tasks"]), 3)
+            self.assertEqual(len(aw["items"]), 3, "one row per watch (slice 2)")
+            self.assertTrue(all(it["kind"] == "watches" for it in aw["items"]))
         finally:
             km._watches, km._pr_watches = saved
 
@@ -122,9 +139,45 @@ class AwaitingCount(unittest.TestCase):
         self.assertIn('"awaitingCount": ((_aw_bg or {}).get("count") if isinstance((_aw_bg or {}).get("count"), int) else None),',
                       src, "the timeline lane payload")
         self.assertIn('"count": await_count,', src, "the goal card's awaiting object")
-        self.assertIn('(_owned_why, "task", _owned_since, None, 1)', src, "one owned dispatch counts one")
-        self.assertIn('(_stamp_why, _stamp_kind, _stamp_since, _stamp_peers, (len(_stamp_peers) if _stamp_peers else None))', src,
-                      "a stamp counts the peers it names")
+        # the or-chain tuples grew a sixth slot — the awaited ROWS (slice 2, 2026-09-05) — beside the count
+        self.assertIn('(_owned_why, "task", _owned_since, None, 1, [])', src, "one owned dispatch counts one (and names no row)")
+        self.assertIn('(_stamp_why, _stamp_kind, _stamp_since, _stamp_peers, (len(_stamp_peers) if _stamp_peers else None), _awaiting_peer_items(_stamp_peers))', src,
+                      "a stamp counts the peers it names, and lists them as rows")
+
+    def test_every_surface_ships_the_rows_beside_the_count(self):
+        # slice 2 (plans/subagent-transcripts.md, 2026-09-05): wherever awaitingKind/awaitingCount ship,
+        # the awaited ROWS ship too — the chat status, the timeline lane, the goal card, the placeholder card.
+        # Pins changed 2026-09-06: the two SESSION-scoped surfaces ship the rows in BOTH turn states now
+        # (_awaiting_items_payload: the wait's rows when idle-awaiting, everything in flight otherwise) —
+        # gating them on awaiting_why made the chat box swap presentations at every turn boundary. The
+        # goal card and the placeholder keep theirs inside the card's awaiting object (a wait only).
+        src = inspect.getsource(km)
+        self.assertIn('_aw_items = _awaiting_items_payload(_aw, sid, sess["path"], tmux)', src, "the chat status payload (under the build's own snapshot)")
+        self.assertIn('"awaitingItems": _aw_items,', src, "the chat status payload")
+        self.assertIn('"awaitingItems": (_awaiting_items_payload(_aw_bg, sid, s["path"], tmux) if live else []),', src, "the timeline lane payload")
+        self.assertIn('"items": await_items,', src, "the goal card's awaiting object")
+        self.assertIn('"items": list(items or []),', src, "the placeholder card's awaiting object")
+        self.assertIn('count=sess_awaiting_count, items=sess_awaiting_items))', src, "…threaded from the session read")
+
+    def test_mid_turn_the_count_kind_and_why_stay_idle_only_while_the_rows_ride(self):
+        # 2026-09-06: the chip's Awaiting (and the count/kind it words itself from) is idle-only BY DESIGN —
+        # a working session is Working. What changed is the ROWS: they are the same set either way, so the
+        # box that lists them no longer swaps presentations when a turn opens. The one-number contract holds
+        # in the idle state exactly as before; mid-turn there is no number, only the rows.
+        a1, a2 = "a1111111111111111", "a2222222222222222"
+        km._tmux_sessions = lambda: {SID: {"subagents": [{"type": "general-purpose", "since": 100, "agentId": a1},
+                                                         {"type": "general-purpose", "since": 105, "agentId": a2}]}}
+        km._bg_live_norm = lambda sid, path: [
+            {"tid": "toolu_01", "desc": "check the exporter", "t": 98, "type": "local_agent", "agentId": a1},
+            {"tid": "toolu_02", "desc": "rerun the harness", "t": 104, "type": "local_agent", "agentId": a2},
+            {"tid": "toolu_03", "desc": "build the docs", "t": 110, "type": "local_bash"}]
+        km._bg_pending = lambda sid, path, ts: ts
+        idle = km._session_awaiting(SID, "/tmp/x", True)
+        self.assertEqual((idle["kind"], idle["count"]), ("mixed", 3))
+        self.assertIsNone(km._session_awaiting(SID, "/tmp/x", False), "mid-turn: no wait, no count, no kind, no why")
+        self.assertEqual(km._awaiting_items_payload(None, SID, "/tmp/x"), idle["items"],
+                         "…but the rows the surfaces ship are the SAME three, in the same order")
+        self.assertEqual(km._awaiting_items_payload(idle, SID, "/tmp/x"), idle["items"], "idle: the wait's own rows")
 
 
 if __name__ == "__main__":

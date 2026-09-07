@@ -33,7 +33,7 @@ test("the chat pane names the peer: box in identity colour, pill with the colour
   assert.match(RENDER, /awaitingPeers\?: PeerIdent\[\] \| null;/, "the payload field beside awaitingKind");
   assert.match(RENDER, /type PeerIdent = \{ name: string; host\?: string; sid\?: string; color\?: \{ bg: string; fg: string \} \| null \};/,
     "named alias — the Status interface line stays brace-free for its other pins");
-  const boxAt = RENDER.indexOf("const awPeers = s!.status.awaitingPeers");
+  const boxAt = RENDER.indexOf("const awPeers = s.status.awaitingPeers");   // narrowed `s` since the one-renderer cut (2026-09-06)
   const box = RENDER.slice(boxAt, RENDER.indexOf("head.appendChild(lab);", boxAt));
   assert.match(box, /el\("span", "bg-await-peer"\)/);
   assert.match(box, /\(pr\.host \? pr\.host \+ ":" : ""\) \+ pr\.name/, "host-prefixed when cross-host");
@@ -53,9 +53,10 @@ test("the chat pane names the peer: box in identity colour, pill with the colour
 });
 
 test("the kernel ships identities on every arm — the or-chain's hardcoded Nones are gone", () => {
-  assert.match(KERNEL, /\(_stamp_why, _stamp_kind, _stamp_since, _stamp_peers, \(len\(_stamp_peers\) if _stamp_peers else None\)\)/, "the judge-stamp arm (identities + their count, T228)");
-  assert.match(KERNEL, /\(sess_awaiting_why, sess_awaiting_kind, sess_awaiting_since, sess_awaiting_peers, sess_awaiting_count\)/,
-    "the session-snapshot arm");
+  // …plus, since slice 2 (2026-09-05), the peers as ROWS in the sixth slot, so the pill lists them
+  assert.match(KERNEL, /\(_stamp_why, _stamp_kind, _stamp_since, _stamp_peers, \(len\(_stamp_peers\) if _stamp_peers else None\), _awaiting_peer_items\(_stamp_peers\)\)/, "the judge-stamp arm (identities + their count, T228; rows, slice 2)");
+  assert.match(KERNEL, /\(sess_awaiting_why, sess_awaiting_kind, sess_awaiting_since, sess_awaiting_peers, sess_awaiting_count, sess_awaiting_items\)/,
+    "the session-snapshot arm (its rows in the sixth slot, slice 2)");
   assert.match(KERNEL, /"awaitingPeers": \(\(_aw or \{\}\)\.get\("peers"\) or None\)/, "the chat status payload");
   assert.match(KERNEL, /"awaitingPeers": \(\(_aw_bg or \{\}\)\.get\("peers"\) or None\)/, "the timeline sessions payload");
   assert.match(KERNEL, /def _peer_identity\(psid\):/, "the ONE identity ladder");

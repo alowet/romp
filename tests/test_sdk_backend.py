@@ -4164,6 +4164,19 @@ class BgTaskLifecycle(unittest.TestCase):
         self.assertEqual((snap[0]["desc"], snap[0]["lastTool"]), ("long build", "Bash"),
                          "a progress event for an id we never saw ADDS it (mid-task attach converges)")
 
+    def test_every_live_row_carries_its_lifecycle_task_id(self):
+        # the CLI keys an Agent task's lifecycle by the AGENT ID (probe-verified on 2.1.257; _on_task_event
+        # already retires the subagent by it). Shipping it on the row is what lets the kernel join the
+        # stream's row to the SubagentStart hook's — without it the same agent listed twice in the
+        # Awaiting box, once by type and once as "Running <description>" (2026-09-06).
+        s = self._sess()
+        self._feed(s, "task_started", {"task_id": "a1111111111111111", "description": "Running Map the parser",
+                                       "task_type": "local_agent", "tool_use_id": "toolu_01"})
+        self._feed(s, "task_started", {"task_id": "b2222", "description": "build the docs", "tool_use_id": "toolu_02"})
+        rows = s.snapshot()["bgTasks"]
+        self.assertEqual([(r["taskId"], r["toolUseId"]) for r in rows],
+                         [("a1111111111111111", "toolu_01"), ("b2222", "toolu_02")])
+
     def test_a_task_id_less_event_is_ignored(self):
         s = self._sess()
         self._feed(s, "task_started", {"description": "no id"})

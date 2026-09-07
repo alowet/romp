@@ -1,8 +1,10 @@
 # Subagent transcripts: open any agent's whole conversation from the dashboard
 
-**Status: slice 1 IN FLIGHT** (branch `subagent-transcripts`, 2026-09-05; lands with this PR's
-merge commit; second cut the same day flattened the Agent head's fold — see "The head's fold").
-Slice 2 (the Awaiting box by kind) is scoped at the bottom and is a separate PR.
+**Status: slice 1 IN FLIGHT** (branch `subagent-transcripts`, PR #935, 2026-09-05; lands with that PR's
+merge commit; a second cut the same day flattened the Agent head's fold — see "The head's fold").
+**Slice 2 BUILT** the same day on branch `awaiting-rows`, stacked on #935 — the Awaiting box lists what a
+session waits on as rows grouped by kind, and the chip opens it; its section is at the bottom. A 2026-09-06
+cut on the same branch made the box ONE presentation in both turn states (see "One presentation" there).
 
 Direction picked by the user (2026-09-05): a Claude Code subagent (the `Agent` tool, older
 transcripts say `Task`) should be readable in full from the dashboard — live while it runs and
@@ -194,14 +196,172 @@ Per-block caps are the chat's own (`output` 16000 chars, `input` 4000, prompt/re
 head, with `stepsTotal` honest about the cut; the clock is a count and two timestamps. The steps
 fold state is bounded by the JSONL cache's LRU (384 files) like every other reader.
 
-## Slice 2 (separate PR): the Awaiting box lists what a session waits on, by kind
+## Slice 2 (PR stacked on #935): the Awaiting box lists what a session waits on, by kind
 
-- The bg-tasks / awaiting box groups pending rows in separate sections — **agents** (each with the
-  arrow above), **commands** (background Bash), **watches** (monitors) — instead of one flat list.
-- The statusline "Awaiting …" chip becomes clickable and opens that box.
-- The mixed-set label collapse goes away: `_session_awaiting`'s "kind is `agents` only if every
-  pending row is an agent, else `task`" is replaced by per-kind counts the chip can word honestly
-  ("2 agents · 1 command").
-- Nested subagents (an agent's own Agent calls, `spawnDepth` 2) already carry the arrow inside the
-  viewer since the meta map is per parent transcript; making the viewer's header show the chain
-  (parent → agent → agent) is slice-2 polish.
+**Status: built 2026-09-05** (branch `awaiting-rows`). The user's call, paraphrased: the three things a
+session can wait on — agents, background commands, kernel watches — are different things, so show them
+as SEPARATE ROWS grouped by kind, and make the chip clickable.
+
+### The defect it fixes (traced before the change)
+`_session_awaiting` answered with ONE kind chosen by source precedence: live SDK subagents → "agents";
+else the pending background launches → "agents" only if EVERY pending row was an agent, else the generic
+"task" (so a background shell command plus a background agent read "Awaiting 2 tasks" with the agent
+silently absorbed); else armed watches → "job", a word nothing else on screen explained. The same
+situation read "agents" or "tasks" depending on which source spoke first, and the statusline chip was a
+plain span — the one status word on the pane you could not click through. The feed's pill showed only
+when the legacy `tasks` list was non-empty, so a wait on live subagents had no clickable affordance on
+the card at all.
+
+### Kernel (`kernel/kernel.py`, `kernel/judge.py`)
+- `_session_awaiting` COMBINES its live sources instead of short-circuiting. Each contributes rows
+  (`_awaiting_item`): the backend snapshot's live subagents (kind `agents`, carrying the hook's
+  `agentId` so the slice-1 arrow works), the pending background launches (`agents` for Agent/Task/
+  Workflow dispatches, `commands` for run_in_background Bash and Monitor), and the armed watches
+  (`watches`; label = the `--note`, else the clipped predicate, else `PR #N (repo)`). A background agent
+  seen by BOTH the hook set and the task stream is one row (matched on agentId), wearing the launch's id
+  (Stop's handle), its description, and the earlier start. **The stream row's agentId is the lifecycle
+  task's own id** (`taskId` on every bgTasks row since 2026-09-06 — the CLI keys an Agent task by its
+  agent id), or the async ack's `agentId` on the transcript-scan path; the sidecar meta map is only a
+  fallback. Before that fix the stream rows carried no key at all (the ledger is Bash/Monitor-only and
+  records the ACTING agent; the meta map is keyed on the original launch's toolUseId, which a resumed
+  agent's task no longer carries), so each agent listed twice — once by type with the arrow, once as
+  "Running <description>" without it — and the chip counted both. Agent rows also drop the CLI's
+  "Running " prefix from the lifecycle description (`_agent_task_label`): the STATUS word already says it. `_awaiting_from_items` derives the legacy
+  `kind` / `count` / `why` / `since` / `tasks` from the union: one kind present → that kind's legacy key
+  and the sentence it always wore; several → kind `"mixed"`, count = every row, and a why that names
+  each group ("waiting on 2 background agents, 1 background command and 1 armed watch"). The all(...)
+  collapse is gone. The overlay, owned-yield, judge-stamp and delegation arms ship `items: []` (they
+  name no live rows) except the peer arms, which list their peers as `peer` rows.
+- **The wire shape**, shipped wherever `awaitingKind`/`awaitingCount` ship — the chat status
+  (`awaitingItems`), the timeline lane (`awaitingItems`), the goal card and the placeholder card
+  (`awaiting.items`): `[{kind, id, label, since, agentId?, detail?, watchId?}]`, kind in
+  `agents | commands | watches | peer | timer`. `since` is the row's OWN event time or null, never now.
+  A generic watch row carries `watchId` (cancel_watch's handle) and its predicate as `detail`; a PR
+  watch carries neither.
+- `AWAIT_KINDS` gains `"mixed"`; the judge's parse sites (`_parse_close`, `_parse_plan`) validate
+  against `AWAIT_KINDS_JUDGED` (the five specific kinds), so a closer never FILES mixed — an LLM
+  emitting the word degrades to kindless like any other off-enum kind, and every lift/supersede rule
+  keyed on a stamp's kind keeps seeing a specific one. The overlay reader accepts mixed as data.
+- Vocabulary in the kernel's sentences: "waiting on a background command: X" / "waiting on 2 background
+  commands — X, …" (was "task(s)"), "waiting on 2 armed watches — X, …" (unchanged), "N background
+  agent(s) still working" (unchanged). The owned-yield arm and `_awaiting_card`'s fallback headline say
+  "command" too; the legacy kind KEYS (`task`, `job`) stay for every consumer that reads them.
+- A `cancelWatch` WS door: `{type: "cancelWatch", id: <sid>, watchId}` → the SAME `cancel_watch` that
+  `romp watch --cancel <id>` and `POST /watch {"cancel"}` reach; loud `warn` on a miss. **A cancel path
+  existed for generic watches only** — nothing retires a `romp watch-pr` early today, so PR-watch rows
+  carry no `watchId` and the box offers no button for them (not added here: it would be a new retire
+  path, out of this slice's scope).
+
+### Words (`ui/webview/spin-caption.ts`, `ui/romp-timeline-view.js`)
+`KIND_WORD` keeps the kernel's keys and changes the words: `task` → "command", `job` → "watch",
+`mixed` → no word; `kindWord` pluralizes "watch" → "watches". New shared helpers: `groupRows` (display
+order agents → commands → watches → peers → timers; an unknown group is kept, never dropped),
+`awaitBreakdown` ("2 agents · 1 command · 1 watch"), and `awaitWord` — the ONE label rule for the chip,
+the box gist and the feed pill: one row → its word ("agent" / "command" / "watch" / "timer"; a peer row →
+the peer's own name, swapped in by the caller); several of one kind → count + word ("3 agents");
+several kinds → the number alone ("4"); no rows (an older kernel, a stamp) → the legacy kind + count as
+before. The timeline's standalone twin mirrors the table (`tlKindWord`), and its badge goes through
+`tlAwaitSuffix` so a mixed wait reads "Awaiting 4" on the lane — the only timeline change.
+
+### Chat pane (`ui/webview/render.ts`, `styles.css`)
+- The statusline chip is a `<button class="chip chip-awaitingBg chip-btn" data-act="awaitingChip">`
+  on a delegate installed once on the stable `#statusline` (click-safe across the per-push rebuild; the
+  delegate's `.romp-acted` pulse acknowledges). Click → `bgFoldOpen.add(sid)` (the box's own fold
+  state), `renderBgTasks()`, `scrollIntoView`. Tip via `setTip`: the breakdown, the kernel's why, and
+  what the click does. Label per `awaitWord`; a single named peer keeps its coloured name.
+- `renderBgTasks` hands the box to `renderAwaitWhy` whenever a wait exists (tracked tasks join its
+  rows); the tasks-only path (no wait: a service the session keeps around) is unchanged. `renderAwaitWhy`
+  header: "Awaiting <n> · <breakdown>" for mixed, the single-kind sentence as before. Expanded: the rows
+  grouped by kind under `.bg-group-head` (shown only when 2+ groups, "Background tasks" counting as a
+  group for the tracked leftovers), then the plain-words note. ONE row renderer (`bgRow`, fed by
+  `awaitRowSpec` / `taskRowSpec`): agent rows → the slice-1 arrow + Stop while their launch is a live
+  tracked task, the prompt as the fold, NO output tail (the output file is the raw transcript; the arrow
+  is the way in — this also drops the raw JSONL fold from tracked agent rows in the tasks-only path);
+  command rows → status, Stop, the command + output-tail fold; watch rows → await-green dot, "armed",
+  "· 31m" since registration, Cancel when `watchId` rides, the predicate as the fold; peer rows → the
+  name in identity colour; a row with nothing to unfold is not a toggle. Per-row "· 12m" clocks tick
+  with the statusline timer from `data-since` (the box re-renders only on new fields; `awaitKey` now
+  includes `awaitingItems`). A wait with no rows (stamp / overlay) still expands to its full sentence.
+- No change to WHEN the chip flips or a card moves: `_session_chip`'s formula is untouched; only what
+  the surfaces say and what is clickable changed.
+
+### Feed (`ui/webview/feed.ts`, `feed.css`)
+The pill shows for ANY wait with rows (`awaiting.items`, or an older kernel's `tasks` read as rows of
+the legacy kind's group), reads by `awaitWord` (a single peer → its coloured name), opens by default
+like the bg-task pill did, and its expansion lists the rows grouped under `.ftask-group` headers when
+2+ groups — labels only (peer rows keep the identity colour + click-opens-session). `spinFor`'s
+say-it-once rule now stands the caption down under rows of ANY kind (`items` or `tasks`); a wait the
+kernel cannot enumerate keeps the boxed caption, the only place its why shows.
+
+### Tests
+Kernel: `tests/test_awaiting_rows.py` (all three sources at once → mixed; the shell + agent case is two
+rows of two kinds, never "task"; the hook/launch merge; single-kind sentences; watch rows' handles; the
+mixed kind's enum/parse rules; the cancel door), plus the existing pins updated with a note each
+(`test_awaiting_count.py` also pins that every surface ships the rows). UI: `ui/webview/awaiting-rows.
+test.ts` (the label rules executed; the three word maps agree on every kind × count; chip-as-button +
+delegate; grouped rows and per-kind affordances; Cancel → cancel_watch; the feed pill for any wait; the
+vocabulary), plus the updated pins in awaiting-state / awaiting-box-sync / awaiting-peer-name /
+bg-tasks-layout / feed-awaiting-swirl / spin-caption / timeline-awaiting / src/bg-tasks.
+Screenshot fixtures: `tools/ui-verify/fixtures/awaiting-rows-{chat,feed}.html`.
+
+### One presentation in both turn states (2026-09-06, same branch)
+**The flap, seen live:** a session with two background agents and a background command showed the grouped
+rows while idle ("Awaiting 3 · 2 agents · 1 command", the idle note). The moment the user sent a message the
+view vanished; when the turn ended it came back. Cause: `_session_awaiting` answers None unless the session
+is idle (by design — the chip's Awaiting is idle-only, a working session is Working), and the rows shipped
+ONLY through it, so mid-turn `awaitingItems` was empty and `renderBgTasks` fell to the LEGACY branch — the
+"N background tasks" list built from `s.bgTasks` (kernel `_bg_tasks`, never idle-gated) — or hid the box when
+that list was empty. Two presentations of one set of facts, swapped at every turn boundary. The chip was
+right and is untouched; the box must not flap.
+
+- **Kernel: the rows do not depend on idleness.** The live-source assembly (hook subagents ⋈ pending agent
+  launches on agentId, the pending commands, the armed watches — the slice-2 code, label rules included) is
+  `_awaiting_live_rows(sid, path, live)`, called by `_session_awaiting` for the idle read and by
+  `_session_background_items(sid, path)` for the turn-agnostic one; `_awaiting_join_items` is the ONE
+  concatenation both use. `_awaiting_items_payload(aw, sid, path, tmux)` is what the two session-scoped
+  surfaces ship as `awaitingItems` (the chat status and the timeline lane, under the SAME key): the wait's
+  own rows when `aw` (= `_session_awaiting`'s answer) exists — for a live-source wait these ARE the live
+  rows, for a peer stamp its peers, for an overlay row nothing — else everything in flight, read under the
+  build's own liveness map (`_serve_live` lends it to `_live_scope`, the pusher cycle's one-snapshot
+  mechanism): the working path never took a fresh liveness read and `test_kernel_pusher_snapshot.py`
+  holds it to that — the first cut forked tmux twice per build there. `awaitingWhy` / `awaitingKind`
+  / `awaitingCount` / `awaitingTasks` / `awaitingTaskIds` stay idle-gated exactly as before, so nothing
+  about WHEN the chip or a card moves changed; peer waits and timers exist only through the idle-gated arms
+  and simply do not appear mid-turn. The goal card and the placeholder keep their rows inside the card's
+  `awaiting` object (a wait only) — the feed pill already shows only for a wait.
+- **The 2026-08-30 mid-turn watch arm is retired.** The chat status used to re-run `_watch_awaiting` alone
+  into `awaitingWhy` while the turn was open, to keep armed watches visible mid-turn. That satisfied the
+  rule then but made the box read "Awaiting" (idle note included) under a Working chip, and left every OTHER
+  in-flight row to the legacy list. Watches ride `awaitingItems` mid-turn like everything else now, and
+  `awaitingWhy` means one thing on every surface: idle and waiting on these (⇔ the chip's Awaiting).
+  `tests/test_kernel.py::test_a_working_session_still_lists_its_armed_kernel_watches` pins the new shape.
+- **Client: one renderer.** `renderAwaitWhy` is folded into `renderBgTasks`; the legacy count-headed branch
+  is gone and the string "background tasks" no longer exists in the renderer. The box shows whenever there is
+  a wait, rows, or tracked tasks, and hides otherwise. Header: a wait (`awaitingWhy`) → today's
+  "Awaiting 3 · 2 agents · 1 command" / single-kind sentence / named peers, await-green dot, the idle note
+  closing the list; no wait → "In the background · 2 agents · 1 command" (singular forms fall out of
+  `awaitBreakdown`), the worst tracked status as the dot (a failed task stays glanceable while collapsed;
+  running-yellow otherwise), NO note. Row affordances are identical in both states (`bgRow` fed by
+  `awaitRowSpec` / `taskRowSpec`; `s.bgTasks` still lends command rows their output tail and Stop handle).
+  Tracked tasks the wait does not name list under "Also running" (was "Background tasks"); when the kernel
+  names no rows at all the working header counts them as the commands they are ("In the background · 1
+  command" for a dev server). The `bg-awaited` outline is one toggle: a wait, or a tracked task named in
+  `awaitingTaskIds` — the ids' presence, never the chip state; mid-turn the box wears its neutral border.
+  `bgFoldOpen` is only ever written by the header toggle and the chip click, so the status-only frame that
+  flips `awaitingWhy` (through `awaitKey`) finds the fold as it was.
+- **Tests:** kernel `tests/test_awaiting_rows.py::RowsDoNotDependOnIdleness` (same synthetic session idle vs
+  mid-turn → identical rows; the wait only when idle; watches mid-turn; a stamp's own rows; the shared join),
+  `test_awaiting_count.py` (the idle-only fields stay idle-only while the rows ride; the re-pinned ship
+  sites), `test_kernel_bg_tasks.py` (the same three joined rows on the real `_bg_live_norm` with the turn
+  open). UI `awaiting-rows.test.ts` ("one presentation" section: one renderer, the header rule per state
+  executed, no note working, no legacy string, the fold writers), plus the deliberately re-pinned
+  awaiting-state / awaiting-box-sync / awaiting-peer-name / bg-tasks-layout / src/bg-tasks pins, each with a
+  note saying why. The chat fixture (`tools/ui-verify/fixtures/awaiting-rows-chat.html`) now shows both
+  states one above the other.
+
+### Left for later
+- Nested subagents' chain in the viewer header (parent → agent → agent) — slice-2 polish from the
+  original scoping, not done here.
+- An early-retire path for PR watches (then the watch row's Cancel appears for them too).
+- The owned-yield arm words every owned dispatch as a "command" (it carries no type); a placed agent
+  dispatch that outruns a block with no stamp is the one case that reads slightly off.
