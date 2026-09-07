@@ -40118,8 +40118,19 @@ if(kind==="dict"){items[kk]=v[kk];}
 else if(kind.indexOf("dictlist:")===0){var cut=kk.indexOf(SEP),dk=cut<0?kk:kk.slice(0,cut),rest=cut<0?"":kk.slice(cut+1),lane=v[dk];if(rest===""){items[kk]=lane;}else{var j=pos[dk]||0;pos[dk]=j+1;items[kk]=lane[j];}}
 else{items[kk]=v[i];}}
 maps[name]={order:order,items:items};}return maps;}
-function assemble(kind,map){var i,kk;if(kind==="dict"){var o={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))o[kk]=map.items[kk];}return o;}
+// dictlist lanes keep their ARRAY IDENTITY across a delta that did not touch them: the lane prefix of
+// every set/del key names a touched lane, and an order that crosses touches every lane whose key
+// subsequence differs from the held order. An untouched lane assembles elementwise-identical to the
+// array the pane already holds, so assemble hands back that same array — turns[sid] identity then means
+// "unchanged", and a per-lane cache in the pane can key on it. The assembled VALUE is what it always
+// was; only object identity differs.
+function laneOf(kk){var cut=kk.indexOf(SEP);return cut<0?kk:kk.slice(0,cut);}
+function laneSeqs(order){var s={};for(var i=0;i<order.length;i++){var kk=order[i],ln=laneOf(kk);(s[ln]||(s[ln]=[])).push(kk);}return s;}
+function touchedLanes(c,oldOrder,newOrder){var t={},k;if(c.del)for(k=0;k<c.del.length;k++)t[laneOf(c.del[k])]=1;if(c.set)for(k in c.set)t[laneOf(k)]=1;
+if(c.order){var a=laneSeqs(oldOrder),b=laneSeqs(newOrder),ln;for(ln in a)if(!(ln in b)||JSON.stringify(a[ln])!==JSON.stringify(b[ln]))t[ln]=1;for(ln in b)if(!(ln in a))t[ln]=1;}return t;}
+function assemble(kind,map,prev,touched){var i,kk;if(kind==="dict"){var o={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))o[kk]=map.items[kk];}return o;}
 if(kind.indexOf("dictlist:")===0){var d={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(!map.items.hasOwnProperty(kk))continue;var cut=kk.indexOf(SEP);var dk=cut<0?kk:kk.slice(0,cut),rest=cut<0?"":kk.slice(cut+1);
+if(prev&&touched&&!touched[dk]&&Object.prototype.hasOwnProperty.call(prev,dk)){if(!d.hasOwnProperty(dk))d[dk]=prev[dk];continue;}   // an untouched lane: the held array itself, not a copy
 if(rest===""){d[dk]=map.items[kk];continue;}   // a bare-prefix entry: the lane's own (empty or non-list) value
 if(!d.hasOwnProperty(dk))d[dk]=[];d[dk].push(map.items[kk]);}return d;}
 var out=[];for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))out.push(map.items[kk]);}return out;}
@@ -40129,7 +40140,8 @@ var coll=d.coll||{};for(var name in coll){var kind=kinds[name];if(!kind)continue
 if(c.del){for(var x=0;x<c.del.length;x++){delete items[c.del[x]];}}
 if(c.set){for(var sk in c.set){if(!items.hasOwnProperty(sk))order.push(sk);items[sk]=c.set[sk];}}
 if(c.order){order=c.order.slice();}else{order=order.filter(function(kk){return items.hasOwnProperty(kk);});}
-last.maps[name]={order:order,items:items};m[name]=assemble(kind,last.maps[name]);}
+var touched=kind.indexOf("dictlist:")===0?touchedLanes(c,map.order,order):null;
+last.maps[name]={order:order,items:items};m[name]=assemble(kind,last.maps[name],last.msg[name],touched);}
 last.rev=d.rev;last.msg=m;return m;}
 window.__rompLocalSend=send;window.__rompApp=APP;   // federation.ts (the multi-kernel manager) routes local sends + knows the app through these
 var SK="romp-vscode-state-%s";   // persist webview state to localStorage so UI prefs survive a refresh
