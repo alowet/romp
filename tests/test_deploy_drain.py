@@ -109,11 +109,18 @@ class DrainLease(unittest.TestCase):
         ksrc = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
         # T224 split the gate into branches so a REFUSED drain can be counted and said loudly; the
         # arm still sits under the explicit-token check and nowhere else
-        self.assertIn('if q.get("drain", [""])[0] == "1":\n                        if self._write_token_ok(q):\n'
-                      '                            be.refresh_drain_hold(park=park or None)', ksrc,
+        gate = 'if q.get("drain", [""])[0] == "1":\n                        if self._write_token_ok(q):\n'
+        self.assertIn(gate, ksrc,
                       "/busy?drain=1 refreshes the lease in the same round-trip that reads the count — "
                       "but the arm is a WRITE, gated on an explicit token (the behavioral pins live "
                       "in tests/test_kernel_auth_hardening.py::BusyDrainWriteGate); the READ stays exempt")
+        armed = ksrc[ksrc.index(gate):].split("_note_drain_armed()", 1)[0]
+        self.assertIn("be.refresh_drain_hold(park=park)", armed,
+                      "the arm carries the manager's park identity when the poll brought one (T240c)")
+        self.assertIn("be.refresh_drain_hold()", armed,
+                      "and keeps the old spelling for a poll without one: a backend that never learned "
+                      "the keyword still arms")
+        self.assertNotIn("_note_drain_refused()", armed, "both arms sit under the token check")
         self.assertIn('json.dumps({"busy": n, "inflight": inflight, "background": background,', ksrc,
                       "the payload says when the box is draining — glanceable, never mysterious")
         self.assertIn("'http://127.0.0.1:%d/restart-all'", ksrc,

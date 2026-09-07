@@ -36161,7 +36161,12 @@ class Handler(BaseHTTPRequestHandler):
                 if be is not None and hasattr(be, "refresh_drain_hold"):
                     if q.get("drain", [""])[0] == "1":
                         if self._write_token_ok(q):
-                            be.refresh_drain_hold(park=park or None)
+                            # The keyword only when a park arrived: a backend without it (an older
+                            # build, a test stand-in) keeps arming the hold the old way.
+                            if park:
+                                be.refresh_drain_hold(park=park)
+                            else:
+                                be.refresh_drain_hold()
                             _note_drain_armed()
                         else:
                             _note_drain_refused()    # T224: the one event the gate exists for —

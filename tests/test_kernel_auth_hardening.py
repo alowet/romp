@@ -230,8 +230,9 @@ class _DrainSpy:
     def busy_count(self):
         return 3
 
-    def refresh_drain_hold(self):
+    def refresh_drain_hold(self, park=None):
         self.refreshed += 1
+        self.park = park
         self.holding = True
 
     def drain_holding(self):
