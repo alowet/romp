@@ -2308,7 +2308,11 @@ def _fire_debt_reminder(sid, now, alive_ids):
     asks = _debt_asks(sid, alive_ids)
     if not asks:
         return False
-    dn0 = _auto_nudge_data().get("debtNudged") or {}
+    snap = _auto_nudge_data()
+    if snap.get(UNPROVED):
+        return False                                   # the record write would be refused → an unrecorded
+        #                                                reminder re-fires every tick; the tick is paused anyway
+    dn0 = snap.get("debtNudged") or {}
     due = [(asker, name, ts, kind, head) for asker, name, ts, kind, head in asks
            if ("%s>%s:%d" % (asker, sid, ts)) not in dn0]
     if not due:
@@ -4134,6 +4138,28 @@ def _pop_stale_notice():
     return d
 
 
+def _note_refused_gesture(name, gt, enabled, snap):
+    """A gt-gated toggle's write was REFUSED because its ledger read was unproved (the snapshot carries
+    UNPROVED — the file could not be read, so the writer would not persist a copy of it). Recorded on this
+    thread the way _setting_stale records a stand-down, so the WS branch that delivered the gesture can tell
+    its own socket (_tell_stale_gesture). Silent, the refusal was the defect's other face: the gear flips
+    its checkbox locally and re-fills only on reopen, so the box read OFF while the kernel held ON — and once
+    the file healed, ON is what ran. A different notice from the stale one on purpose: nothing about
+    ordering is claimed, and the frame names the fault. `known` says whether a kept value can be NAMED at
+    all: the tagged copy is the last snapshot this process proved (its last read or its own last write)
+    only when one is cached; otherwise it is the default, and the frame must not present that as kept."""
+    _stale_seen.refused = {"setting": name, "gt": gt, "refused": "on" if enabled else "off",
+                           "why": str(snap.get(UNPROVED) or "the ledger could not be read"),
+                           "known": str(jd.STATE / "auto-nudge.json") in _autonudge_cache}   # kept: None → the
+    #                                                                                gear drops "Keeping …"
+
+
+def _pop_refused_notice():
+    d = getattr(_stale_seen, "refused", None)
+    _stale_seen.refused = None
+    return d
+
+
 # ONE lock for every gt-gated setting's read-check-write span (2026-08-29): the stores read the
 # stamp, check _setting_stale, then write, on a ThreadingHTTPServer — with no lock, two
 # near-simultaneous flushes of one setting (two dashboards flushing on a host's recovery) could
@@ -4159,27 +4185,178 @@ _SETTINGS_LOCK = threading.RLock()
 _NUDGE_LOCK = threading.RLock()
 
 
-def _auto_nudge_data():
-    p = jd.STATE / "auto-nudge.json"
+# ── the two automatic ledgers: a snapshot is PROVED, or it says it is not (2026-09-07) ───────────
+# auto-nudge.json and retry-suppressed.json are each read by ONE reader and written by ONE writer, with
+# many read-modify-write sites between them (`d = dict(reader()); d[k] = v; writer(d)`). Both readers
+# used to answer ANY fault with the fresh-install default — a stat or read error, bytes that did not
+# parse — and cache that answer under the file's real stat key, so the next writer persisted it: one
+# EIO on a tick and every stalled goal across every session was nudged again (the dedupe map read as
+# empty), a user's auto-nudge OFF was flipped back ON, and every sibling session's "stop retrying" was
+# erased by the next interrupt. Missing is the ONLY fault that means the default: a file that is not
+# there IS the fresh-install state. Every other fault yields a snapshot the reader cannot vouch for, and
+# that snapshot carries the fault under UNPROVED, so the writer — the one choke point every RMW site
+# already funnels through — refuses to persist it, loud once per fault episode. Readers still get their
+# best view (the last snapshot this process proved, else the default) for display and gates; nothing
+# unproved is ever cached, so the file's next successful read is the episode's end — an event, not a
+# clock. Bytes that do not parse are a fault of the bytes, not of the moment: they are moved aside as
+# <file>.corrupt-<utc stamp> (evidence kept, never deleted) and the ledger then reads, truthfully, as
+# absent. The tag travels IN the snapshot because every RMW site copies it with dict(): a flag beside
+# the cache would not survive the copy, and a per-path "last read failed" bit races a sibling thread's
+# proved read.
+UNPROVED = "_unproved"                 # snapshot tag → the fault text; never a key a ledger stores
+_ledger_fault_warned = {}              # what -> fault the reader already shouted; cleared by a proved read
+_ledger_refusal_warned = {}            # what -> fault the writer already shouted; cleared by a proved write
+
+
+def _ledger_read(p, cache, default, what, normalize=None):
+    """FOUR-STATE read of a small JSON ledger. Absent → default() (uncached: the fresh-install arm, byte for
+    byte the old behavior); readable and a JSON object → the dict (normalize applied), cached under its
+    stat key; bytes that do not parse → moved aside (_ledger_quarantine), then default(); any other stat
+    or read fault → a COPY of the last cached snapshot (else default()) tagged UNPROVED, nothing cached."""
     try:
-        st = p.stat(); key = (st.st_mtime_ns, st.st_size)
-    except OSError:
-        return {"enabled": True, "nudged": {}}
-    hit = _autonudge_cache.get(str(p))
+        st = p.stat()
+    except FileNotFoundError:
+        return _ledger_proved(what, default())
+    except OSError as e:
+        return _ledger_unproved(p, cache, default, what, "stat failed: %s" % e)
+    key = (st.st_mtime_ns, st.st_size)
+    hit = cache.get(str(p))
     if hit is not None and hit[0] == key:
-        return hit[1]
+        return _ledger_proved(what, hit[1])
+    reason = None                          # set when the bytes were read whole and are not a ledger
     try:
-        d = json.loads(p.read_text())
-        if not isinstance(d, dict):
-            d = {}
+        raw = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _ledger_proved(what, default())   # removed between the stat and the read: absent
+    except OSError as e:
+        return _ledger_unproved(p, cache, default, what, "read failed: %s" % e)
+    except UnicodeError as e:
+        reason = "not UTF-8: %s" % e
+    if reason is None:
+        try:
+            d = json.loads(raw)
+        except Exception as e:             # json.JSONDecodeError is a ValueError
+            reason = "invalid JSON: %s" % e
+        else:
+            if not isinstance(d, dict):
+                reason = "top-level JSON value is %s, not an object" % type(d).__name__
+    if reason is not None:                 # the bytes' fault, not the moment's: move them aside
+        why = _ledger_quarantine(p, st, what, reason)
+        if why is None:
+            return _ledger_proved(what, default())
+        return _ledger_unproved(p, cache, default, what, "%s (%s)" % (reason, why))
+    if normalize is not None:
+        normalize(d)
+    cache[str(p)] = (key, d)
+    return _ledger_proved(what, d)
+
+
+def _ledger_proved(what, d):
+    """A PROVED state — a readable object, or absence (the fresh-install state) — ends the fault episode
+    for both once-per-episode registries, the reader's and the writer's, so the next fault shouts again
+    even when the episode ended with reads alone (a write-only reset left the writer's registry armed
+    across a read-healed episode: a repeat fault with the same text then refused silently)."""
+    _ledger_fault_warned.pop(what, None)
+    _ledger_refusal_warned.pop(what, None)
+    return d
+
+
+def _ledger_unproved(p, cache, default, what, fault):
+    """The snapshot a fault leaves: a copy of the last one this process proved (else the default), tagged
+    with the fault so the writer refuses it. One stderr line per fault episode — keyed on the fault text,
+    never on the tick — so a disk that stays broken says so once and a different fault says so again."""
+    hit = cache.get(str(p))
+    if _ledger_fault_warned.get(what) != fault:
+        _ledger_fault_warned[what] = fault
+        sys.stderr.write("%s: %s is unreadable (%s) — serving %s; nothing is written to it until it "
+                         "reads again\n" % (what, p.name, fault,
+                                            "the last snapshot this kernel proved" if hit is not None
+                                            else "the default (no proved snapshot yet)"))
+    d = dict(hit[1]) if hit is not None else default()
+    d[UNPROVED] = fault
+    return d
+
+
+def _ledger_quarantine(p, st, what, reason):
+    """Move an unparseable ledger ASIDE (never delete it) so the evidence survives the fresh start that
+    follows: the sidecar keeps the original name plus `.corrupt-<utc stamp>` (a `-n` suffix for a second in
+    the same second), the shape the judge's goal-store quarantine wears, so one convention reads across both.
+    Only while the file is still the one whose bytes failed (same inode and generation) — an atomic publish
+    since then already replaced them, and the new file gets its own read. Returns None once the bytes are out
+    of the way (moved, or already gone: a sibling reader moved them), with one stderr line for the move;
+    else the reason they are NOT, for the caller's fault text — which _ledger_unproved dedupes per episode,
+    so a corrupt file that cannot be moved (a read-only state dir) is said once, never once per read."""
+    try:
+        cur = p.stat()
+        if (cur.st_ino, cur.st_mtime_ns, cur.st_size) != (st.st_ino, st.st_mtime_ns, st.st_size):
+            return "replaced meanwhile; the new bytes get their own read"
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        aside, n = p.with_name("%s.corrupt-%s" % (p.name, stamp)), 0
+        while aside.exists():                            # a second corrupt file in the same second
+            n += 1
+            aside = p.with_name("%s.corrupt-%s-%d" % (p.name, stamp, n))
+        os.replace(p, aside)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        # errno + strerror ONLY: str(e) names both paths, and the destination carries the per-second stamp,
+        # so a text with it changed every second and every once-per-fault-text dedupe fired once a second
+        return "could not be moved aside: %s" % ("[Errno %d] %s" % (e.errno, e.strerror) if e.errno is not None
+                                                 else type(e).__name__)
+    sys.stderr.write("%s: %s could not be parsed (%s); moved aside to %s, the ledger reads as absent\n"
+                     % (what, p.name, reason, aside.name))
+    return None
+
+
+def _ledger_write_proved(p, what, d, cache, normalize=None):
+    """The ONE choke point every RMW site of a ledger funnels through: persist `d` — unless it descends from
+    an unproved snapshot (it carries UNPROVED), then refuse, one stderr line per fault episode, and return
+    False; the file keeps whatever it holds. Persisting that snapshot IS the erase-everything bug: the copy
+    a fault leaves is the default or a stale last-known-good, never the file's current contents. An OSError
+    from the write itself propagates as before (callers that own a gesture catch it and say so).
+    A write that lands is a PROVED state: it ends the fault episode and refreshes the cache with what the
+    file now holds (read back under its stat key), so "the last snapshot this process proved" — what a
+    later fault serves, what a refused gesture names as kept — includes this kernel's own last write, not
+    just its last read. Best-effort: a read-back that fails leaves the cache as it was."""
+    fault = d.get(UNPROVED) if isinstance(d, dict) else None
+    if fault:
+        if _ledger_refusal_warned.get(what) != fault:
+            _ledger_refusal_warned[what] = fault
+            sys.stderr.write("%s: refusing to write %s from an unproved snapshot (%s) — the file keeps what "
+                             "it holds\n" % (what, p.name, fault))
+        return False
+    _atomic_write(p, json.dumps(d))
+    _ledger_proved(what, None)               # a proved write ends the episode too
+    try:
+        st = p.stat()
+        back = json.loads(p.read_text(encoding="utf-8"))
+        st2 = p.stat()
+        if isinstance(back, dict) and (st.st_mtime_ns, st.st_size) == (st2.st_mtime_ns, st2.st_size):
+            if normalize is not None:
+                normalize(back)
+            cache[str(p)] = ((st.st_mtime_ns, st.st_size), back)
     except Exception:
-        d = {}
+        pass                                 # the write landed; the next read proves the file on its own
+    return True
+
+
+def _auto_nudge_default():
+    return {"enabled": True, "nudged": {}}
+
+
+def _auto_nudge_normalize(d):
     d.setdefault("enabled", True)
     d.setdefault("nudged", {})         # {gid: {count, lastTurnId}} — re-arm per stall episode (replaces the one-shot "done" list)
     d.pop("done", None)                # drop the vestigial one-shot list (old code wrote it; nothing reads it now) →
     #                                    cleaned from the file on the next write (the user via business 2026-06-22)
-    _autonudge_cache[str(p)] = (key, d)
-    return d
+
+
+def _auto_nudge_data():
+    """The auto-nudge ledger's snapshot — see the ledger block above: absent reads as the default, a fault
+    reads as the last proved snapshot tagged UNPROVED (which _write_auto_nudge refuses), bytes that do not
+    parse are moved aside. Writers copy it first (`dict(_auto_nudge_data())`); the tag rides the copy."""
+    return _ledger_read(jd.STATE / "auto-nudge.json", _autonudge_cache, _auto_nudge_default, "auto-nudge",
+                        _auto_nudge_normalize)
 
 
 def _auto_nudge_on():
@@ -4273,13 +4450,17 @@ def _conserve_tick(now):
 
 
 def _write_auto_nudge(d):
-    _atomic_write(jd.STATE / "auto-nudge.json", json.dumps(d))
+    """Persist the auto-nudge ledger — the ONE writer behind every RMW site. False (loud, once per fault
+    episode) when `d` descends from an unproved snapshot: see _ledger_write_proved."""
+    return _ledger_write_proved(jd.STATE / "auto-nudge.json", "auto-nudge", d, _autonudge_cache,
+                                _auto_nudge_normalize)
 
 
 def _set_auto_nudge(enabled, gt=None):
     """Returns the applied gesture stamp (epoch ms), or None when a stale `gt` stood down —
     see the gesture-time ordering block above _NUDGE_LOCK — or the store write failed (OSError:
-    loud on stderr, nothing applied). The catch lives HERE, like _set_update_mode's and
+    loud on stderr, nothing applied), or the ledger read was unproved (the writer refuses the
+    snapshot, loud once per fault episode; nothing applied). The catch lives HERE, like _set_update_mode's and
     _set_judge_state's: a raised OSError reaches the WS reader loop, which classifies it as a
     socket failure and re-raises into a silent pass — a full-disk gear toggle tearing the whole
     dashboard WebSocket down with zero log output."""
@@ -4292,7 +4473,9 @@ def _set_auto_nudge(enabled, gt=None):
         d["enabled"] = bool(enabled)
         d["gt"] = gt if gt is not None else int(time.time() * 1000)
         try:
-            _write_auto_nudge(d)
+            if _write_auto_nudge(d) is False:           # unproved snapshot: refused at the writer, nothing
+                _note_refused_gesture("auto-nudge", gt, enabled, d)   # applied — and the socket hears it
+                return None
         except OSError as e:
             sys.stderr.write("setting auto-nudge: write failed (%s) — nothing applied\n" % e)
             return None
@@ -4323,7 +4506,9 @@ def _set_compact_suggest(enabled, gt=None):
         d["compactSuggestEnabled"] = bool(enabled)
         d["compactSuggestGt"] = gt if gt is not None else int(time.time() * 1000)
         try:
-            _write_auto_nudge(d)
+            if _write_auto_nudge(d) is False:           # unproved snapshot: refused at the writer, nothing
+                _note_refused_gesture("compact-suggest", gt, enabled, d)   # applied — and the socket hears it
+                return None
         except OSError as e:
             sys.stderr.write("setting compact-suggest: write failed (%s) — nothing applied\n" % e)
             return None
@@ -5616,26 +5801,24 @@ def _auto_resume_retry(now, tmux):
 # STATE/retry-suppressed.json {sid: stop_ts}. A sid present = suppressed; stop_ts is the re-arm floor (only a
 # successful turn AFTER it lifts the suppression). _auto_resume_session_retry clears re-armed sids each tick.
 _retry_suppress_cache = {}   # str(path) -> ((mtime_ns,size), dict)
+_RETRY_SUPPRESS_LOCK = threading.Lock()   # the arm/clear read-modify-write span: the interrupt handler (a WS
+#                                           thread) and the pusher's re-arm sweep rewrite the same whole blob;
+#                                           unlocked, the loser's snapshot erased the winner's key. Held across
+#                                           the file read + write only — never across a backend call.
+_retry_floor_warned = set()               # (sid, type name) of a non-numeric floor already shouted
 
 
 def _retry_suppress_data():
-    p = jd.STATE / "retry-suppressed.json"
-    try:
-        stt = p.stat()
-        key = (stt.st_mtime_ns, stt.st_size)
-    except OSError:
-        return {}
-    hit = _retry_suppress_cache.get(str(p))
-    if hit and hit[0] == key:
-        return hit[1]
-    try:
-        d = json.loads(p.read_text())
-        if not isinstance(d, dict):
-            d = {}
-    except Exception:
-        d = {}
-    _retry_suppress_cache[str(p)] = (key, d)
-    return d
+    """The per-session retry-suppression ledger's snapshot — the ledger block above _auto_nudge_data: absent
+    reads as {} (nobody suppressed), a fault reads as the last proved snapshot tagged UNPROVED (which the
+    writer refuses), bytes that do not parse are moved aside."""
+    return _ledger_read(jd.STATE / "retry-suppressed.json", _retry_suppress_cache, dict, "retry-suppress")
+
+
+def _write_retry_suppress(d):
+    """The ONE writer behind the arm and the clear: False (loud, once per fault episode) when `d` descends
+    from an unproved snapshot — see _ledger_write_proved."""
+    return _ledger_write_proved(jd.STATE / "retry-suppressed.json", "retry-suppress", d, _retry_suppress_cache)
 
 
 def _session_retry_suppressed(sid):
@@ -5647,18 +5830,38 @@ def _session_retry_suppressed(sid):
 
 def _suppress_session_retry(sid):
     """Arm per-session retry-suppression at NOW (the re-arm floor). Every interrupt refreshes the floor, so
-    "suppressed since your most recent interrupt" is the invariant."""
-    d = dict(_retry_suppress_data())
-    d[str(sid)] = time.time()
-    _atomic_write(jd.STATE / "retry-suppressed.json", json.dumps(d))
+    "suppressed since your most recent interrupt" is the invariant. Returns None once the suppression is on
+    disk, else ONE sentence saying why it is not — the caller is the user's stop click (the interrupt
+    handler), which toasts it: a stop that did not land must never look like one. Two ways it does not land:
+    the ledger read was unproved (the writer refuses the snapshot — persisting it erased every sibling
+    session's stop), or the write itself failed (ENOSPC — before this the OSError escaped into the WS reader
+    loop, which reads any OSError as a socket failure and tore the dashboard's connection down, with the
+    suppression neither on disk nor anywhere)."""
+    with _RETRY_SUPPRESS_LOCK:
+        d = dict(_retry_suppress_data())
+        d[str(sid)] = time.time()
+        try:
+            written = _write_retry_suppress(d)
+        except OSError as e:
+            sys.stderr.write("retry-suppress: write failed (%s) — the stop for %s is not recorded\n" % (e, sid))
+            why = getattr(e, "strerror", None) or str(e)
+        else:
+            if written:
+                return None
+            why = d.get(UNPROVED)
+    return ("Interrupted, but the stop could not be recorded (retry-suppressed.json: %s) — romp may retry "
+            "into this session again" % why)
 
 
 def _clear_session_retry_suppress(sid):
-    d = dict(_retry_suppress_data())
-    if d.pop(str(sid), None) is not None:
-        _atomic_write(jd.STATE / "retry-suppressed.json", json.dumps(d))
-        return True
-    return False
+    """Drop `sid`'s suppression; True when the ledger on disk changed. A refused write (an unproved snapshot)
+    leaves the suppression standing and returns False — suppressed is the safe direction while the ledger
+    cannot be read; the sweep retries on its next tick, and the file's next proved read is the event."""
+    with _RETRY_SUPPRESS_LOCK:
+        d = dict(_retry_suppress_data())
+        if d.pop(str(sid), None) is None:
+            return False
+        return _write_retry_suppress(d)
 
 
 def _auto_resume_session_retry(now, tmux):
@@ -5675,6 +5878,14 @@ def _auto_resume_session_retry(now, tmux):
     for s in _alive_sessions(now, tmux):
         sid = str(s.get("sid"))
         floor = d.get(sid)
+        if floor is not None and (isinstance(floor, bool) or not isinstance(floor, (int, float))):
+            # a hand-edited or foreign file: never a compare operand (the `<= floor` below raised TypeError
+            # into the pusher tick and the whole sweep died) — read as no floor, said once per session
+            if (sid, type(floor).__name__) not in _retry_floor_warned:
+                _retry_floor_warned.add((sid, type(floor).__name__))
+                sys.stderr.write("retry-suppress: session %s has a non-numeric floor (%r) — read as no floor; "
+                                 "nothing re-arms it until the entry is a number\n" % (sid, floor))
+            continue
         if not floor:
             continue
         path = s.get("path")
@@ -6041,7 +6252,7 @@ def _set_intr_blocked(sid, gid):
         else:
             m.pop(str(sid), None)
         d["intrBlocked"] = m
-        _write_auto_nudge(d)
+        return _write_auto_nudge(d)      # False when refused (an unproved snapshot): the caller gates on it
 
 
 def _intr_block_stands(sid, gid):
@@ -6099,6 +6310,16 @@ def _interrupt_block_tick(now, tmux):
         #                                                  evidence times both writes are stamped with
         block_it = bool(turns) and not _session_working(turns) and stop_t > human_t
         if block_it:                                     # a GENUINE user stop → block the focus goal on them,
+            snap = _auto_nudge_data()
+            if snap.get(UNPROVED):
+                # the ledger cannot be read: file NO block now — its once-per-episode marker could not be
+                # minted (the writer refuses an unproved snapshot), and the lift on re-engagement is gated
+                # on that marker, so an unmarked block would stand until a judge happened to unblock it.
+                # The stop is re-evaluated from the transcript every push, so the block lands on the first
+                # tick after the file reads again. Loud once per fault episode, on the pass's latch.
+                _auto_nudge_pause(snap[UNPROVED])
+                continue
+            _auto_nudge_resume()
             ib = _intr_blocked(sid)                      # once per interrupt episode (the intrBlocked marker) —
             if ib and not _intr_block_stands(sid, ib):   # but VERIFY the marked block still holds its card (see
                 _set_intr_blocked(sid, None)             # _intr_block_stands): a stale marker is the 'already
@@ -6114,15 +6335,23 @@ def _interrupt_block_tick(now, tmux):
                                      for a in (turn.get("atoms") or [])])
                 g = _record_interrupt_block(sid, ev)
                 if g:
+                    # the block IS filed — a proved goal-store write, a needs-you flip the feed must hear —
+                    # so this pushes whatever the marker write's fate: a fault landing between the tag
+                    # check above and here refuses the marker, and the next tick stands down at the check
                     _set_intr_blocked(sid, g); changed = True
         else:                                            # working / re-engaged / machine cut → lift OUR block if any
             ib = _intr_blocked(sid)
             if ib:
                 # the re-engagement IS the newest turn's trigger — the same stamp the judges will put on
-                # every verdict about that turn, so their ruling outranks this lift on arrival order
+                # every verdict about that turn, so their ruling outranks this lift on arrival order.
+                # The lift runs whatever the ledger's state — it is the user's own re-engagement — but
+                # `changed` follows the MARKER write: refused under a fault, the marker stays in the last
+                # proved snapshot, the lift re-runs as a no-op next tick, and nothing pushes every cycle.
+                # A lift that could not READ the goals store (False: its row is filed) keeps the marker
+                # too, so the next tick retries the lift rather than erasing it (the #1019 boundary)
                 if _lift_interrupt_block(sid, ib, turns[-1].get("t") if turns else 0):
-                    _set_intr_blocked(sid, None); changed = True   # spent; on a store fault the marker
-                #                                                    stays so the next tick retries the lift
+                    if _set_intr_blocked(sid, None):     # spent → the marker goes; `changed` follows the write
+                        changed = True
     if changed:                                          # a needs-you flip should reach the feed at once
         _push_all()
 
@@ -6600,7 +6829,8 @@ def _compact_suggest_tick(sid, tm, now):
         #                                                BOTH thresholds latch when found past both —
         #                                                one message, never two in a tick
         d["compactSuggested"] = cs
-        _write_auto_nudge(d)
+        if _write_auto_nudge(d) is False:
+            return False                               # the claim did not latch (unproved ledger): no send
     try:
         # the marker tail its sibling injectors carry (T207, the user 2026-08-31, who saw the
         # bare send render as their own blue bubble and ruled it must read system-injected):
@@ -6690,12 +6920,45 @@ def _ws_act_now_tick():
         sys.stderr.write("auto-nudge (ws act-now): %s\n" % traceback.format_exc())
 
 
+_auto_nudge_paused = [None]   # the fault the tick is standing down on; None = the ledger reads, nudging runs
+
+
+def _auto_nudge_pause(fault):
+    """A tick found the ledger unreadable: the nudge pass stands down WHOLE — the nudge, the wake, the
+    compaction suggestion, the debt ladder, the sweeps — and the interrupt→blocked tick files no block;
+    loudly, once per fault episode (stderr + the dashboard's bell), and never defaulted on. Every leg
+    records what it fired in this ledger, and a record the writer refuses re-fires the same message every
+    tick (the every-tick re-nudge of every stalled goal, reproduced with one EIO); the fabricated default
+    also read an explicit OFF as ON. One latch for both ticks, so a fault says so once. Resumes on the
+    first tick whose read proves (_auto_nudge_resume) — the file's next successful read is the event; there
+    is no timer."""
+    if _auto_nudge_paused[0] == fault:
+        return
+    _auto_nudge_paused[0] = fault
+    line = ("auto-nudge: auto-nudge.json is unreadable (%s) — nudging and the interrupt→blocked flip are "
+            "paused, not defaulted on, until it reads again" % fault)
+    sys.stderr.write(line + "\n")
+    _sdk_problem(line)                                    # the error center: a kernel-side fault the user can act on
+
+
+def _auto_nudge_resume():
+    if _auto_nudge_paused[0] is not None:
+        _auto_nudge_paused[0] = None
+        sys.stderr.write("auto-nudge: auto-nudge.json reads again — nudging resumed\n")
+
+
 def _auto_nudge_pass(now, tmux, run_dead_wait):
     """The body of one pass — the walk, the sweeps, the push. Only _auto_nudge_tick calls it, under
     the single-flight guard (split out the way _pusher_cycle_jobs is from _pusher_cycle). `on` is the auto-nudge toggle:
-    off, the walk runs WAKE-ONLY — the awaiting dead-man still fires (see _auto_nudge_tick)."""
+    off, the walk runs WAKE-ONLY — the awaiting dead-man still fires (see _auto_nudge_tick). An UNPROVED
+    ledger snapshot (a read fault) stands the whole pass down — see _auto_nudge_pause."""
+    snap = _auto_nudge_data()
+    if snap.get(UNPROVED):
+        _auto_nudge_pause(snap[UNPROVED])
+        return
+    _auto_nudge_resume()
     on = _auto_nudge_on()
-    nudged = dict(_auto_nudge_data().get("nudged", {}))   # {gid: {count, lastTurnId}}
+    nudged = dict(snap.get("nudged", {}))                 # {gid: {count, lastTurnId}}
     alive = list(_alive_sessions(now, tmux))
     alive_ids = {s["sid"] for s in alive}
     waitfor = _wait_for_graph(now, alive_ids)             # {sid:{peerSid,name,inCycle}} — the peer-wait gate
@@ -11786,9 +12049,11 @@ def _drive(msg, client):
     elif t == "interrupt":
         be.interrupt(sid)                                 # Esc/stop AND settle idle (in the backend)
         _interrupt_clicked[str(sid)] = time.time()        # chip → "interrupting" NOW (event-cleared on settle)
-        _suppress_session_retry(sid)                      # interrupting a thread STOPS romp's auto-retry into it until a
+        err = _suppress_session_retry(sid)                # interrupting a thread STOPS romp's auto-retry into it until a
                                                           # successful turn re-arms (the user 2026-07-06) — the interrupt
                                                           # already aborted any in-flight CLI retry; this stops the relapse
+        if err:                                           # …and a stop that did NOT land is said, the rewind ops' warn-toast
+            client["send"](json.dumps({"type": "warn", "text": err}))   # idiom (fail loudly; the interrupt itself happened)
         _mark_views_dirty()                               # the stamp lives in memory — no sig sees it
     elif t in ("compact", "compactSession"):
         # Mid-turn (or behind an existing queue) the click PARKS as a queued /compact chip and fires when
@@ -31197,13 +31462,28 @@ def _tell_stale_gesture(client, msg):
     one — and the gear only re-issues a type that matches the setting the frame names.
     It also carries `gt`, the refused gesture's OWN stamp: a dashboard's broadcast reaches every
     linked kernel, so one stale flush draws one refusal per kernel — all sharing this stamp — and
-    the gear folds them into one toast naming the refusing hosts (setting + gt is the fold key)."""
+    the gear folds them into one toast naming the refusing hosts (setting + gt is the fold key).
+    A write REFUSED over an unproved ledger read (_note_refused_gesture) answers the same socket with
+    the same frame plus `why` (the fault): the gear's copy — not applied, keeping the stored value —
+    is exactly true of it, and the frame's re-fill snaps the checkbox back to the last snapshot this
+    kernel proved (`kept`, named only when there is one); the fault itself, which the copy does not
+    carry, goes to the error center so it is on record."""
     st = _pop_stale_notice()
-    if not st:
+    if st:
+        _reply(client, {"type": "settingStale", "setting": st["setting"],
+                        "storedGt": st["storedGt"], "gt": st["gt"], "kept": _setting_kept_value(st["setting"]),
+                        "gesture": {k: v for k, v in msg.items() if k != "gt"}})
         return
-    _reply(client, {"type": "settingStale", "setting": st["setting"],
-                    "storedGt": st["storedGt"], "gt": st["gt"], "kept": _setting_kept_value(st["setting"]),
-                    "gesture": {k: v for k, v in msg.items() if k != "gt"}})
+    rf = _pop_refused_notice()
+    if not rf:
+        return
+    kept = _setting_kept_value(rf["setting"]) if rf.get("known") else None
+    _sdk_problem("setting %s: %s was not applied — %s; the stored value%s stands until the ledger reads again"
+                 % (rf["setting"], rf["refused"], rf["why"],
+                    "" if kept is None else " (%s)" % ("on" if kept else "off")))
+    _reply(client, {"type": "settingStale", "setting": rf["setting"],
+                    "storedGt": _setting_stored_gt(rf["setting"]), "gt": rf["gt"], "kept": kept,
+                    "why": rf["why"], "gesture": {k: v for k, v in msg.items() if k != "gt"}})
 
 
 # ---- pasted-image hydration + dropped-file handling (ported from the old TS kernel chat-view/src/

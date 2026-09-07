@@ -6,10 +6,14 @@ interrupt aborts the in-flight CLI retry, and this suppression keeps romp from r
 thread until a SUCCESSFUL turn lands, then it re-arms. Mirrors how an interrupt already suppresses
 auto-NUDGE (_interrupt_suppresses_nudge). Functional tests on the state machine + source-pins on the wiring.
 """
+import contextlib
+import errno
+import io
 import json
 import os
 import tempfile
 import time
+import types
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -124,6 +128,187 @@ class SessionRetrySuppressWiring(unittest.TestCase):
         # (now, tmux) — the cycle's ONE liveness snapshot, not a per-job fresh read (2026-08-10 CPU fix)
         self.assertIn("_auto_resume_session_retry(now, tmux)", SRC,
                       "the pusher tick re-arms suppressed threads that land a clean turn")
+
+    def test_the_interrupt_handler_toasts_a_stop_that_did_not_land(self):
+        blk = SRC.split('elif t == "interrupt":', 1)[1].split("elif t ==", 1)[0]
+        self.assertIn("err = _suppress_session_retry(sid)", blk, "the arm's verdict is read, not dropped")
+        self.assertIn('"warn"', blk, "…and a refusal takes the rewind ops' warn-toast idiom")
+
+    def test_arm_and_clear_hold_the_ledger_lock_across_their_read_modify_write(self):
+        # the interrupt handler (a WS thread) and the pusher's re-arm sweep rewrite the same whole blob;
+        # unlocked, the loser's snapshot erased the winner's key
+        for fn in ("_suppress_session_retry", "_clear_session_retry_suppress"):
+            body = SRC.split("def %s(" % fn, 1)[1].split("\ndef ", 1)[0]
+            self.assertIn("with _RETRY_SUPPRESS_LOCK:", body, fn)
+
+
+SID = "11111111-2222-3333-4444-555555555555"
+EIO = OSError(errno.EIO, "Input/output error")
+
+
+class LedgerFaultsNeverEraseSiblings(unittest.TestCase):
+    """The ledger is never rewritten from a fabricated default after a read fault (2026-09-07). The reader
+    answered ANY fault with {} and cached it under the file's real stat key; the next interrupt then wrote
+    {that sid} over every sibling session's stop — a retry storm the user had explicitly halted, resumed.
+    And the write itself had no OSError handling: an ENOSPC out of the interrupt handler reached the WS
+    reader loop, which reads any OSError as a socket failure and tore the dashboard's connection down.
+    Now only a MISSING file reads as {}; every other fault yields a snapshot tagged UNPROVED that the
+    writer refuses (loud once per fault episode), a failed write is reported to the click that asked, and
+    a non-numeric floor is read as no floor instead of a TypeError that killed the re-arm sweep. The
+    shared reader contract is pinned in tests/test_ledger_unproved_reads.py."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.dir = Path(self.td.name)
+        self._saved_state = km.jd.STATE
+        km.jd.STATE = self.dir
+        self.p = self.dir / "retry-suppressed.json"
+        self._orig = {k: getattr(km, k) for k in
+                      ("_alive_sessions", "_parse_cached", "_session_chip", "_mark_views_dirty",
+                       "_kernel_knows", "_atomic_write")}
+        self._orig_backend = km.Sessions.backend_for
+        km._mark_views_dirty = lambda *a, **k: None
+        self._undo = []
+        self._reset()
+
+    def tearDown(self):
+        for undo in reversed(self._undo):
+            undo()
+        for k, v in self._orig.items():
+            setattr(km, k, v)
+        km.Sessions.backend_for = self._orig_backend
+        self._reset()
+        km.jd.STATE = self._saved_state
+        self.td.cleanup()
+
+    @staticmethod
+    def _reset():
+        km._retry_suppress_cache.clear()
+        for reg in ("_ledger_fault_warned", "_ledger_refusal_warned", "_retry_floor_warned"):
+            vars(km).get(reg, set()).clear()       # the once-only registries — absent on a kernel before the
+            #                                        fix, so these tests fail there on the DEFECT, not in setUp
+
+    def _seed(self, d=None):
+        self.p.write_text(json.dumps(d if d is not None else {"s1": 100.0, "s2": 200.0}))
+        km._retry_suppress_cache.clear()
+        return self.p.read_bytes()
+
+    def _fail_read(self, exc=EIO):
+        real, target = Path.read_text, str(self.p)
+
+        def failing(p, *a, **k):
+            if str(p) == target:
+                raise exc
+            return real(p, *a, **k)
+        Path.read_text = failing
+        self._undo.append(lambda: setattr(Path, "read_text", real))
+
+    def _aside(self):
+        return sorted(n for n in os.listdir(self.dir) if n.startswith("retry-suppressed.json.corrupt-"))
+
+    def test_a_missing_file_reads_as_nobody_suppressed_with_no_log(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            d = km._retry_suppress_data()
+        self.assertEqual(d, {})
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(os.listdir(self.dir), [], "absent: nothing moved aside, nothing created")
+        self.assertEqual(km._retry_suppress_cache, {}, "absent is not cached — the old arm, byte for byte")
+
+    def test_a_read_fault_never_rewrites_the_file_and_the_click_is_told(self):
+        self._seed()
+        self.assertTrue(km._session_retry_suppressed("s1"))      # a proved read: s1 and s2 are the last proved snapshot
+        self.p.write_text(json.dumps({"s1": 100.0, "s2": 200.0}, indent=1))   # the file moves on (a new stat key)…
+        before = self.p.read_bytes()
+        self._fail_read()                                         # …and the new bytes cannot be read
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cleared = km._clear_session_retry_suppress("s1")      # the sweep's clear: s1 IS in the tagged copy…
+        self.assertEqual(self.p.read_bytes(), before, "suppressed is the safe direction while the ledger cannot be read")
+        self.assertFalse(cleared, "…so the clear reaches the writer, and the writer refuses")
+        self.assertEqual(err.getvalue().count("refusing to write retry-suppressed.json"), 1,
+                         "the refusal count rose: refused at the writer, not short-circuited before it")
+        with contextlib.redirect_stderr(err):
+            told = km._suppress_session_retry("s3")
+        self.assertEqual(self.p.read_bytes(), before, "s1 and s2 keep their stops: the file is byte for byte what it was")
+        self.assertIsInstance(told, str, "the arm reports a stop that did not land")
+        self.assertIn("could not be recorded", told)
+        self.assertIn("Input/output error", told, "…and names the fault")
+        self.assertEqual(err.getvalue().count("refusing to write"), 1, "once per fault episode, not per write")
+        st = os.stat(self.p)
+        self.assertNotEqual(km._retry_suppress_cache[str(self.p)][0], (st.st_mtime_ns, st.st_size),
+                            "nothing unproved is cached: the cache still holds the proved snapshot's key, not the file's")
+        self.assertEqual(set(km._retry_suppress_cache[str(self.p)][1]), {"s1", "s2"})
+
+    def test_the_snapshot_a_fault_leaves_is_the_last_proved_one(self):
+        self._seed()
+        self.assertTrue(km._session_retry_suppressed("s1"))      # a proved read fills the cache
+        self.p.write_text(json.dumps({"s1": 100.0}))              # the file moves on (a different size)…
+        self._fail_read()                                         # …and the new bytes cannot be read
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(km._session_retry_suppressed("s2"), "membership reads the last proved snapshot, never a fabricated {}")
+
+    def test_enospc_on_the_write_is_reported_to_the_click_not_raised(self):
+        before = self._seed()
+
+        def full(*a, **k):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        km._atomic_write = full
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            told = km._suppress_session_retry("s3")               # raised straight into the WS reader loop before
+        self.assertIsInstance(told, str)
+        self.assertIn("No space left on device", told)
+        self.assertIn("write failed", err.getvalue())
+        self.assertEqual(self.p.read_bytes(), before)
+
+    def test_the_interrupt_handler_toasts_a_stop_that_did_not_land(self):
+        # through the real dispatcher (_drive → the interrupt branch): the interrupt itself happens, the
+        # stop's failure is a warn toast on the delivering socket, and a healthy ledger toasts nothing
+        self._seed()
+        cuts = []
+        km._kernel_knows = lambda sid: True
+        km.Sessions.backend_for = lambda sid: types.SimpleNamespace(interrupt=lambda sid: cuts.append(sid))
+        sent = []
+        client = {"app": "chat", "alive": True, "send": lambda s: sent.append(json.loads(s))}
+        self._fail_read()
+        with contextlib.redirect_stderr(io.StringIO()):
+            km.Handler._dispatch_ws(types.SimpleNamespace(), {"type": "interrupt", "id": SID}, client)
+        self.assertEqual(cuts, [SID], "the interrupt itself happened")
+        self.assertEqual([m["type"] for m in sent], ["warn"], "the stop that did not land is said, not swallowed")
+        self.assertIn("could not be recorded", sent[0]["text"])
+        for undo in self._undo:
+            undo()
+        self._undo = []
+        sent.clear()
+        km.Handler._dispatch_ws(types.SimpleNamespace(), {"type": "interrupt", "id": SID}, client)
+        self.assertEqual(sent, [], "a stop that landed says nothing — the chip's 'interrupting' is the acknowledgement")
+        self.assertIn(SID, json.loads(self.p.read_text()))
+
+    def test_a_non_numeric_floor_is_read_as_no_floor_and_said_once(self):
+        self._seed({"s1": "yesterday", "s2": 200.0})
+        km._alive_sessions = lambda now, tmux: [{"sid": "s1", "path": "x"}, {"sid": "s2", "path": "y"}]
+        km._parse_cached = lambda p: {"turns": [_human_turn(500)]}      # both spoke after any numeric floor
+        km._session_chip = lambda *a, **k: "ready"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            km._auto_resume_session_retry(1000, {})                    # a TypeError killed the whole sweep before
+            km._auto_resume_session_retry(1001, {})
+        self.assertEqual(json.loads(self.p.read_text()), {"s1": "yesterday"},
+                         "s2 re-armed as ever; s1's entry is not a floor, so nothing re-arms it — and nothing invents one")
+        self.assertEqual(err.getvalue().count("non-numeric floor"), 1, "said once per session, not per tick")
+
+    def test_corrupt_bytes_are_moved_aside_and_the_next_stop_lands_on_a_fresh_ledger(self):
+        self.p.write_text('{"s1": 100.0,')
+        km._retry_suppress_cache.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(km._suppress_session_retry("s3"), "absent after the move is the fresh-install state")
+        self.assertEqual(set(json.loads(self.p.read_text())), {"s3"})
+        aside = self._aside()
+        self.assertEqual(len(aside), 1, "evidence kept, never deleted")
+        self.assertEqual((self.dir / aside[0]).read_text(), '{"s1": 100.0,')
+        self.assertEqual(err.getvalue().count("moved aside"), 1)
 
 
 if __name__ == "__main__":

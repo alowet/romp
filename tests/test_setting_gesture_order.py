@@ -27,6 +27,7 @@ binding for a delegating namespace whose Thread runs inline, so every fan-out is
 synchronously and nothing sleeps.
 """
 import contextlib
+import errno
 import io
 import json
 import os
@@ -1128,6 +1129,111 @@ class ThinkingSummariesSetting(_Base):
                          "per-install: NOT a KERNEL_SETTING — it must never queue for or reach another kernel")
         km._set_thinking_summaries(True, gt=T_NEW)
         self.assertIs(km._version_info()["thinkingSummaries"], True, "/version reports it so the gear fills")
+
+
+class RefusedToggleTellsTheDeliveringSocket(_Base):
+    """A toggle whose ledger read was UNPROVED (auto-nudge.json unreadable; 2026-09-07) is refused at the
+    writer rather than persisting a copy the reader could not vouch for — and the refusal must reach the
+    socket that made the gesture. Silent, it was the defect's other face: gear.js flips the checkbox
+    locally and re-fills only on reopen, so the box read OFF while the kernel kept ON, and when the file
+    healed ON is what ran. The setter records a `refused` notice (a sibling of _setting_stale's stand-down,
+    claiming nothing about ordering) and the WS branch answers with the settingStale frame plus `why`: the
+    gear's copy — not applied, keeping the stored value — is exactly true, and its re-fill snaps the box
+    back; the fault itself goes to the error center."""
+
+    def setUp(self):
+        super().setUp()
+        for reg in ("_ledger_fault_warned", "_ledger_refusal_warned"):
+            vars(km).get(reg, {}).clear()                  # absent on a kernel before the fix: fail on the defect
+        self.ledger = km.jd.STATE / "auto-nudge.json"
+        self.problems = len(km._SDK_BOOT_PROBLEMS)
+        self.ticks = []
+        km._auto_nudge_tick = lambda *a, **k: self.ticks.append(a)
+        self._real_read = Path.read_text
+
+    def tearDown(self):
+        Path.read_text = self._real_read
+        super().tearDown()
+
+    def _fault(self):
+        real, target = Path.read_text, str(self.ledger)
+
+        def failing(p, *a, **k):
+            if str(p) == target:
+                raise OSError(errno.EIO, "Input/output error")
+            return real(p, *a, **k)
+        Path.read_text = failing
+
+    def _dispatch(self, msg):
+        sent = []
+        client = {"send": lambda s: sent.append(json.loads(s)), "alive": True}
+        with contextlib.redirect_stderr(io.StringIO()):
+            km.Handler._dispatch_ws(types.SimpleNamespace(), msg, client)
+        return sent, client
+
+    def test_a_toggle_under_a_read_fault_is_refused_and_the_socket_hears_it(self):
+        self.assertEqual(km._set_auto_nudge(False, gt=T_OLD), T_OLD)   # OFF on disk
+        km._autonudge_cache.clear()
+        km._auto_nudge_data()                                          # a proved read: OFF is the last proved snapshot
+        self.ledger.write_text(json.dumps(json.loads(self.ledger.read_bytes()), indent=1))   # the file moves on…
+        before = self.ledger.read_bytes()
+        self._fault()                                                  # …and the new bytes cannot be read
+        sent, client = self._dispatch({"type": "setAutoNudge", "enabled": True, "gt": T_NEW})
+        Path.read_text = self._real_read
+        self.assertEqual(self.ledger.read_bytes(), before, "the file keeps its bytes: nothing rewritten from a copy the reader could not vouch for")
+        frames = [m for m in sent if m.get("type") == "settingStale"]
+        self.assertEqual(len(frames), 1, "the delivering socket hears the refusal: the gear re-fills and says not applied")
+        f = frames[0]
+        self.assertEqual(f["setting"], "auto-nudge")
+        self.assertIs(f["kept"], False, "the kept value is the last snapshot this process proved — OFF — never the fabricated ON")
+        self.assertIn("Input/output error", f["why"], "…and the frame names the fault")
+        self.assertEqual(f["gt"], T_NEW)
+        self.assertEqual(f["storedGt"], T_OLD)
+        self.assertEqual(f["gesture"], {"type": "setAutoNudge", "enabled": True})
+        self.assertEqual(self.ticks, [], "a refused toggle fires no act-now tick")
+        self.assertTrue(client["alive"])
+        self.assertEqual(len(km._SDK_BOOT_PROBLEMS), self.problems + 1, "the fault is on record in the error center")
+        self.assertIn("on was not applied", km._SDK_BOOT_PROBLEMS[-1]["text"])
+        # healed, the same gesture applies and the socket hears nothing
+        sent, _c = self._dispatch({"type": "setAutoNudge", "enabled": True, "gt": T_NEW})
+        self.assertEqual([m for m in sent if m.get("type") == "settingStale"], [])
+        km._autonudge_cache.clear()
+        self.assertTrue(km._auto_nudge_on())
+        self.assertEqual(len(self.ticks), 1, "…and the turn-on acts at once, as ever")
+
+    def test_the_kept_value_includes_this_kernel_s_own_last_write(self):
+        # a proved WRITE is a proved state too: after it, and before any read, a refusal must name the
+        # written value — not the value of the last proved read (the writer publishes and refreshes the
+        # cache with what it read back under the file's stat key)
+        self.assertEqual(km._set_auto_nudge(False, gt=T_OLD), T_OLD)
+        km._autonudge_cache.clear()
+        self.assertFalse(km._auto_nudge_data()["enabled"])            # the last proved READ says OFF
+        self.assertEqual(km._set_auto_nudge(True, gt=T_OLD + 1), T_OLD + 1)   # this kernel writes ON; no read since
+        self.ledger.write_text(json.dumps(json.loads(self.ledger.read_bytes()), indent=1))   # the file moves on…
+        self._fault()                                                  # …and the new bytes cannot be read
+        sent, _c = self._dispatch({"type": "setAutoNudge", "enabled": False, "gt": T_NEW})
+        Path.read_text = self._real_read
+        frames = [m for m in sent if m.get("type") == "settingStale"]
+        self.assertEqual(len(frames), 1)
+        self.assertIs(frames[0]["kept"], True, "the kept value is what this kernel last proved — its own write, ON")
+        self.assertIn("off was not applied", km._SDK_BOOT_PROBLEMS[-1]["text"])
+
+    def test_with_no_proved_snapshot_the_frame_names_no_kept_value(self):
+        # a fault before this kernel ever proved a read (boot): the copy readers get is the DEFAULT, so
+        # the frame must not present it as the kept value — the gear then drops its "Keeping …" clause
+        self.assertEqual(km._set_compact_suggest(True, gt=T_OLD), T_OLD)
+        km._autonudge_cache.clear()
+        before = self.ledger.read_bytes()
+        self._fault()
+        sent, _c = self._dispatch({"type": "setCompactSuggest", "enabled": False, "gt": T_NEW})
+        Path.read_text = self._real_read
+        self.assertEqual(self.ledger.read_bytes(), before)
+        frames = [m for m in sent if m.get("type") == "settingStale"]
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["setting"], "compact-suggest")
+        self.assertIsNone(frames[0]["kept"], "unknown is unknown: no fabricated kept value")
+        self.assertIn("Input/output error", frames[0]["why"])
+        self.assertEqual(self.ticks, [])
 
 
 if __name__ == "__main__":

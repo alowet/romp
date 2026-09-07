@@ -16,6 +16,9 @@ unprompted messages): it files the stamp's lift, the exact row the orphan lift f
 returns to plain Working and the closer is re-nominated. With nudges ON the injected check-in is
 unchanged. Either way it acts once per stamp episode (the wake record / the lifted stamp), never
 again per tick. SYNTHETIC fixtures only; a PRIVATE sid (goal-store fixture rule)."""
+import contextlib
+import errno
+import io
 import json
 import os
 import tempfile
@@ -229,6 +232,140 @@ class OwnWaitOutranksTheDelegatedGate(_Base):
         self._seed(kind=None, age=7 * H)
         self._tick()
         self.assertEqual(self.fb.sent, [], "a kindless stamp may be a peer wait — conservative, as before")
+
+
+class UnreadableLedgerPausesThePass(_Base):
+    """…but never from a ledger the reader cannot vouch for (2026-09-07). A read fault on auto-nudge.json
+    used to fabricate the default — enabled:True, nudged:{} — so the walk fired every due wake and nudge
+    AGAIN each tick (the dedupe map read as empty; the record write then persisted the fabrication) and
+    read an explicit OFF as ON. The pass now stands down whole on an UNPROVED snapshot, says so once per
+    fault episode (stderr + the dashboard's bell), and resumes on the first pass whose read proves — the
+    file reading again is the event; there is no timer. Pinned here because this is where the firing
+    fixture lives; the ledger's own read/write contract is tests/test_ledger_unproved_reads.py."""
+
+    def setUp(self):
+        super().setUp()
+        # the pause latch + the once-per-episode registries (absent on a kernel before the fix, so these
+        # tests fail there on the DEFECT — a fired wake — not in setUp)
+        vars(km).get("_auto_nudge_paused", [None])[0] = None
+        for reg in ("_ledger_fault_warned", "_ledger_refusal_warned"):
+            vars(km).get(reg, {}).clear()
+        self.problems = len(km._SDK_BOOT_PROBLEMS)
+        self.ledger = jd.STATE / "auto-nudge.json"
+
+    def _fault(self):
+        real, target = Path.read_text, str(self.ledger)
+
+        def failing(p, *a, **k):
+            if str(p) == target:
+                raise OSError(errno.EIO, "Input/output error")
+            return real(p, *a, **k)
+        Path.read_text = failing
+        self.addCleanup(setattr, Path, "read_text", real)
+        return lambda: setattr(Path, "read_text", real)
+
+    def test_no_wake_fires_from_an_unproved_snapshot_and_the_first_proved_read_resumes(self):
+        self._toggle(True)
+        self._seed(kind="job", age=7 * H)                # the shape NudgesOnKeepTheCheckIn fires one wake for
+        before = self.ledger.read_bytes()
+        heal = self._fault()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._tick(); self._tick(NOW + 5); self._tick(NOW + 10)
+        self.assertEqual(self.fb.sent, [], "nothing injected from a snapshot the reader cannot vouch for")
+        self.assertEqual(self.ledger.read_bytes(), before, "and nothing written over the file")
+        self.assertEqual(err.getvalue().count("paused, not defaulted on"), 1, "loud once per fault episode, not per tick")
+        self.assertEqual(len(km._SDK_BOOT_PROBLEMS), self.problems + 1, "…and once in the dashboard's bell")
+        self.assertIn("Input/output error", km._SDK_BOOT_PROBLEMS[-1]["text"])
+        heal()
+        with contextlib.redirect_stderr(err):
+            self._tick(NOW + 60)
+        self.assertEqual(len(self._wakes()), 1, "the first pass whose read proves fires — the event, no timer")
+        self.assertIn("nudging resumed", err.getvalue())
+        self.assertTrue(km._auto_nudge_data()["nudged"][self.gid].get("wake"), "recorded, so the next tick dedupes")
+
+    def test_an_explicit_off_is_never_read_as_on(self):
+        self._toggle(False)
+        self._seed(stamped=False, delegated=False)       # an unstamped working top: the plain nudge's shape
+        self._fault()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._tick()
+        self.assertEqual(self.fb.sent, [], "OFF on disk, unreadable now: no fabricated ON fires a status check")
+
+    # ── a fault that lands MID-pass: the head read proved, a leg's read did not ──────────────────
+    # The pass gate covers a fault at the head. Two legs record what they fired only AFTER deciding to
+    # send (the debt reminder) or send only after a durable claim (the compaction suggestion); each
+    # checks the tag itself, because a fault between the head and its own read hands it a tagged copy —
+    # and a send whose record or claim the writer refuses is a send repeated every tick.
+
+    def _fault_after_the_first_read(self):
+        """The pass's head read proves; from the reader's second call on, the file has moved on (a peer
+        wrote it — a new stat key) and the new bytes cannot be read, so every leg sees a tagged copy of
+        the last proved snapshot. Deterministic: the wrapper counts the reader's calls."""
+        real, calls, ledger, test = km._auto_nudge_data, [0], self.ledger, self
+
+        def flaky():
+            calls[0] += 1
+            if calls[0] == 2:
+                ledger.write_text(json.dumps(json.loads(ledger.read_bytes()), indent=1))
+                test.moved_on = ledger.read_bytes()
+                test._fault()
+            return real()
+        km._auto_nudge_data = flaky
+        self.addCleanup(setattr, km, "_auto_nudge_data", real)
+
+    def _owes_a_reply(self):
+        orig = km._debt_asks
+        km._debt_asks = lambda sid, alive: [("66666666-7777-8888-9999-000000000000", "web", NOW - 1800,
+                                              "question", "Which port should the staging server use?")]
+        self.addCleanup(setattr, km, "_debt_asks", orig)
+
+    def test_control_an_owed_reply_draws_the_reminder_when_the_ledger_reads(self):
+        self._toggle(True)
+        self._owes_a_reply()
+        self._tick()
+        self.assertEqual(len(self.fb.sent), 1, "the path is reached: one reminder goes out")
+        self.assertIn("web", self.fb.sent[0][1])
+
+    def test_no_debt_reminder_when_the_ledger_faults_mid_pass(self):
+        self._toggle(True)
+        self._owes_a_reply()
+        self._fault_after_the_first_read()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._tick()
+        self.assertEqual(self.fb.sent, [], "an unrecorded reminder re-fires every tick: no send whose record would be refused")
+        self.assertEqual(self.ledger.read_bytes(), self.moved_on, "and the file is untouched")
+        self.assertIsNone(vars(km).get("_auto_nudge_paused", [None])[0],
+                          "the head gate proved: the leg refused on its own, not the pause")
+
+    def _settled_past_a_crossing(self):
+        d = json.loads(self.ledger.read_bytes())
+        d["compactSuggestEnabled"] = True                # the per-install opt-in (default OFF)
+        self.ledger.write_text(json.dumps(d))
+        km._autonudge_cache.clear()
+        for n, v in (("_settle_event_key", lambda sid: NOW - 7200), ("_thread_reg", lambda sid: {})):
+            orig = getattr(km, n)
+            setattr(km, n, v)
+            self.addCleanup(setattr, km, n, orig)
+        return {SID: {"state": "", "ctxTokens": 450_000}}   # idle, an hour settled, past the first threshold
+
+    def test_control_a_settled_crossing_draws_the_suggestion_when_the_ledger_reads(self):
+        self._toggle(True)
+        tm = self._settled_past_a_crossing()
+        km._auto_nudge_tick(NOW, tm)
+        self.assertEqual(len(self.fb.sent), 1, "the path is reached: one suggestion goes out")
+        self.assertIn("compact", self.fb.sent[0][1])
+
+    def test_no_compaction_suggestion_when_the_ledger_faults_mid_pass(self):
+        self._toggle(True)
+        tm = self._settled_past_a_crossing()
+        self._fault_after_the_first_read()
+        with contextlib.redirect_stderr(io.StringIO()):
+            km._auto_nudge_tick(NOW, tm)
+        self.assertEqual(self.fb.sent, [], "the claim did not latch: a suggestion whose claim is refused is sent again every tick")
+        self.assertEqual(self.ledger.read_bytes(), self.moved_on, "and the file is untouched")
+        self.assertIsNone(vars(km).get("_auto_nudge_paused", [None])[0],
+                          "the head gate proved: the leg refused on its own, not the pause")
 
 
 if __name__ == "__main__":
