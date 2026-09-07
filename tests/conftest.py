@@ -81,6 +81,21 @@ def pytest_unconfigure(config):
     _remove_run_dirs(report=True)
 
 
+# No test's git reads the developer's configuration (2026-09-06). Fixture repos are built by `git
+# init` + `git commit` in temp dirs, and those commands honoured the developer's global config: a
+# global core.hooksPath ran their pre-commit hook on every seed commit, an LFS filter would run on
+# every checkout, and a credential helper or insteadOf rewrite could reach a real remote
+# (tests/test_file_github.py pins its own environment for exactly that reason). CI has no global git
+# config, so a test that leans on one is already broken there; this makes every run match.
+# GIT_CONFIG_GLOBAL is honoured by git >= 2.32; the identity is synthetic, and it is set rather than
+# defaulted so a developer's own GIT_AUTHOR_* cannot leak into fixture commits either. The env
+# identity outranks `git config user.*` and `-c user.*`, so a test that must pin a particular author
+# exports its own GIT_AUTHOR_* / GIT_COMMITTER_* per call; other config keys still yield to `-c`.
+os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
+os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+os.environ["GIT_AUTHOR_NAME"] = os.environ["GIT_COMMITTER_NAME"] = "romp tests"
+os.environ["GIT_AUTHOR_EMAIL"] = os.environ["GIT_COMMITTER_EMAIL"] = "tests@example.invalid"
+
 os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="romp-tests-state-")   # inside the root; the hook records it
 os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel exports this to its sessions; it outranks the XDG floor
 
