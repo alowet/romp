@@ -464,7 +464,7 @@ class _InterruptTickRig(unittest.TestCase):
         jd.parsed_session = lambda sid, paths, now: {"turns": [{"id": "t1", "t": 1000, "atoms": []}]}
         km._session_working = lambda turns: False
         self.marks = (1200, 900)                           # the stop is newer than the last human message: a user stop
-        km._interrupt_marks = lambda turns, sid="": self.marks
+        km._interrupt_marks = lambda turns, sid="", **k: self.marks   # the tick names its memo family
         self.recorded, self.lifted, self.pushes = [], [], []
         km._record_interrupt_block = lambda sid, ev: self.recorded.append((sid, ev)) or GID
         km._lift_interrupt_block = lambda sid, gid, ev: self.lifted.append((sid, gid, ev)) or True   # spent; the real

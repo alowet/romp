@@ -623,24 +623,101 @@ def _machine_cut_cause(users, i, cut_t=0.0, cut_cause=""):
     return None
 
 
-def _interrupt_marks(turns, sid=""):
+# The _interrupt_marks memo: (sid, family) -> (turns, (cut_t, cut_cause), (stop_t, human_t)). One entry
+# per key, so a sid pins at most two parses (one per family); the tick's sweep (_intr_marks_forget)
+# releases a sid's entries when it leaves the alive set, and the cap is the backstop for callers that
+# run outside the tick. The counters are bumped through _intr_marks_bump, under a lock: the interrupt
+# and nudge ticks bump them on the pusher thread and a connect-time build_feed bumps them on a WS
+# thread, so a bare `+= 1` here would be a read-modify-write across threads. The memo dict itself
+# needs no lock: its ops are single dict operations on immutable tuples keyed by the parse object, so
+# a lost insert or a double clear is one extra miss, never a wrong answer.
+_intr_marks_memo = {}
+_INTR_MARKS_MEMO_MAX = 512
+_intr_marks_memo_stats = {"hit": 0, "miss": 0, "evict": 0}
+_INTR_MARKS_STATS_LOCK = threading.Lock()
+
+
+def _intr_marks_bump(key, n=1):
+    with _INTR_MARKS_STATS_LOCK:
+        _intr_marks_memo_stats[key] = _intr_marks_memo_stats.get(key, 0) + n
+
+
+def _interrupt_marks(turns, sid="", family=None):
     """(newest genuine user STOP, newest genuine human PROMPT) on this thread, in transcript time —
     the one place the two are tallied, so the predicate below and the interrupt block's EVIDENCE stamp
     read the same events. A MACHINE cut (kernel restart / process death) mints the same stop record but
     is romp's own, so it never counts as a stop (_machine_cut_cause, via the resume notice that follows
     it, or — before that notice reaches disk — the backend's machineCut stamp). The interrupt record
     itself authors 'human', so it's classified FIRST. `sid` is optional only so the pure-atom callers in
-    the tests stay pure: pass it wherever it is known, or a cut still on its way to disk reads as a stop."""
+    the tests stay pure: pass it wherever it is known, or a cut still on its way to disk reads as a stop.
+
+    MEMOIZED per (sid, family) on the IDENTITY of `turns` and the value of the machineCut pair: the
+    result is a pure function of the user atoms and (cut_t, cut_cause) — no clock, no store, no global —
+    so while the caller hands in the same list object and the stamp has not moved, the answer cannot
+    have changed. A new parse object (a transcript or states append, a rewind cut armed or cleared, a
+    live atom merged) or a moved stamp is exactly the event that can change it, and either misses. A
+    held strong reference cannot have its id recycled, so `is` is exact. The inputs are never mutated
+    in place: event_model.parse_session allocates a fresh turns list per parse and _merge_live_atoms
+    copies rather than extends (a test pins the appended-transcript case); a list mutated in place is
+    not a supported input.
+
+    `family` names the parse the caller reads, "judge" (jd.parsed_session's object: the interrupt tick
+    and the nudge tick) or "display" (the kernel _parse cache's object: build_feed's badge). The split
+    is not a correctness requirement — identity keying would make one shared entry exact too — it stops
+    the two objects from evicting each other every cycle. Display-family hits are on the _parse_cache
+    object, which build_feed reads through _merge_live_atoms: that returns the cache object itself when
+    no unlanded live atom is pending and a fresh shallow copy otherwise, so a session mid-stream misses
+    each build until its tail lands (new information; the parse that follows hits again). While a judge
+    pass frame is open the tick alternates between the frame-pinned parse and the cache object, one
+    miss per swap. No family, or an empty sid, means no memo (the pure-atom test callers; a sid-less key
+    would be one slot thrashed by every caller)."""
+    cut = _last_machine_cut(sid) if sid else (0.0, "")
+    key = (sid, family) if (sid and family) else None
+    if key is not None:
+        e = _intr_marks_memo.get(key)
+        if e is not None and e[0] is turns and e[1] == cut:
+            _intr_marks_bump("hit")
+            return e[2]
+        _intr_marks_bump("miss")
     atoms = [a for turn in turns for a in (turn.get("atoms") or [])]
-    cut_t, cut_cause = _last_machine_cut(sid) if sid else (0.0, "")
-    return _interrupt_marks_atoms(atoms, cut_t, cut_cause)
+    res = _interrupt_marks_atoms(atoms, cut[0], cut[1])
+    if key is not None:
+        if len(_intr_marks_memo) >= _INTR_MARKS_MEMO_MAX and key not in _intr_marks_memo:
+            _intr_marks_bump("evict", len(_intr_marks_memo))   # the repo's overflow idiom: clear whole
+            _intr_marks_memo.clear()
+        _intr_marks_memo[key] = (turns, cut, res)
+    return res
+
+
+def _intr_marks_forget(alive):
+    """Drop every memo entry whose sid is not in `alive`. The interrupt tick calls this with the cycle's
+    alive set, so a session leaving it (death, the recorded event) releases the parses its entries pin
+    instead of holding them for the kernel's life. Iterates a key snapshot: a connect-push build on a
+    WS thread may insert concurrently."""
+    for k in list(_intr_marks_memo):
+        if k[0] not in alive and _intr_marks_memo.pop(k, None) is not None:
+            _intr_marks_bump("evict")
 
 
 def _interrupt_marks_atoms(atoms, cut_t=0.0, cut_cause=""):
     """The pure-atom core of _interrupt_marks — `atoms` plus the backend's machineCut stamp as
     plain arguments, so the classifier is testable without a states/ file (T219's repro rides
-    this surface)."""
-    users = [a for a in atoms if a.get("type") == "user"]
+    this surface).
+
+    A user atom whose `author` key is present and None is dropped before the text scan.
+    event_model.author_of returns None for exactly one shape, a record with no text block (every
+    branch on a non-empty text returns an author; the final `_is_real_prompt` gate is the only path
+    to None), so such an atom can be neither an interrupt record (is_interrupt_record needs text) nor
+    a human prompt (author != "human"), and the forward scan in _machine_cut_cause reads past it as
+    wedge either way: dropping it changes no tally. Its reach is narrow on purpose. The file adapter
+    OMITS the key for a None author rather than writing it (measured on a 31-session state copy: all
+    19,667 text-less user atoms lack the key; none carries None), so on disk-parsed sessions this gate
+    meets nothing, and a key-less atom must NOT be skipped: an SDK live-tail atom
+    (sdk_backend.msg_to_atom sets no author on stream user messages) may carry text, and a merged
+    live interrupt record would otherwise go uncounted until a parse of the disk record replaced it —
+    on a feed-only dashboard, whose cached parse nothing refreshes promptly, an arbitrary lag on the
+    "interrupted" badge. The per-cycle scan itself is what the memo in _interrupt_marks removes."""
+    users = [a for a in atoms if a.get("type") == "user" and a.get("author", "") is not None]
     last_intr = last_human = 0
     for i, a in enumerate(users):
         t = a.get("t", 0)
@@ -653,7 +730,7 @@ def _interrupt_marks_atoms(atoms, cut_t=0.0, cut_cause=""):
     return last_intr, last_human
 
 
-def _interrupt_suppresses_nudge(turns, sid=""):
+def _interrupt_suppresses_nudge(turns, sid="", family=None):
     """True while the session's most recent USER action is a GENUINE user INTERRUPT: the user stopped
     the agent and hasn't spoken since, so they're at the controls — auto-nudge stays suppressed until
     their NEXT message (the user 2026-07-05, refined via ui: re-engage on the user-message EVENT, never
@@ -668,8 +745,9 @@ def _interrupt_suppresses_nudge(turns, sid=""):
     user 2026-07-14: restart-cut SDK sessions sat inertly in Working wearing that false badge, and
     auto-nudge stayed off so a genuine RE-stall was never caught). Such a cut is identified by the romp
     resume notice that FOLLOWS its record (_interrupt_cause) and is EXCLUDED from the user-stop tally —
-    or, in the window before that notice reaches disk, by the backend's machineCut stamp (pass `sid`)."""
-    last_intr, last_human = _interrupt_marks(turns, sid)
+    or, in the window before that notice reaches disk, by the backend's machineCut stamp (pass `sid`).
+    `family` is _interrupt_marks' memo family, passed through by the per-cycle callers."""
+    last_intr, last_human = _interrupt_marks(turns, sid, family)
     return last_intr > last_human
 
 
@@ -7651,7 +7729,8 @@ def _interrupt_block_tick(now, tmux):
     it), and trusting the bare marker skipped the re-block forever — the live focus goal sat in
     Working wearing only the badge, auto-nudge suppressed: invisible-blocked."""
     changed = False
-    for s in _alive_sessions(now, tmux):
+    alive = _alive_sessions(now, tmux)
+    for s in alive:
         sid = s["sid"]
         if _session_flag(sid, "hideFromFeed"):           # muted from the feed → no interrupt-block bookkeeping either
             continue
@@ -7664,8 +7743,9 @@ def _interrupt_block_tick(now, tmux):
             turns = jd.parsed_session(sid, [s["path"]], now)["turns"]
         except Exception:
             continue
-        stop_t, human_t = _interrupt_marks(turns, sid)   # the two EVENTS this tick reasons about — and the
-        #                                                  evidence times both writes are stamped with
+        stop_t, human_t = _interrupt_marks(turns, sid, family="judge")   # the two EVENTS this tick reasons
+        #                                                  about — and the evidence times both writes are
+        #                                                  stamped with (memo family: the judge parse)
         block_it = bool(turns) and not _session_working(turns) and stop_t > human_t
         if block_it:                                     # a GENUINE user stop → block the focus goal on them,
             snap = _auto_nudge_data()
@@ -7712,6 +7792,7 @@ def _interrupt_block_tick(now, tmux):
                 if _lift_interrupt_block(sid, ib, turns[-1].get("t") if turns else 0):
                     if _set_intr_blocked(sid, None):     # spent → the marker goes; `changed` follows the write
                         changed = True
+    _intr_marks_forget({s["sid"] for s in alive})       # a sid that left the alive set releases its memo entries
     if changed:                                          # a needs-you flip should reach the feed at once
         _push_all()
 
@@ -9890,7 +9971,7 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only
     lt = turns[-1]
     if _session_working(turns):                      # still actively working (event model) → not orphaned
         return "working"
-    if _interrupt_suppresses_nudge(turns, sid):      # the user's LAST action was a GENUINE interrupt → they're
+    if _interrupt_suppresses_nudge(turns, sid, family="judge"):   # the user's LAST action was a GENUINE interrupt → they're
         return "user-interrupt"                                # driving; suppressed until their NEXT message. The stopped
         #                                              focus goal's BLOCKED-on-you flip is owned by the always-on
         #                                              _interrupt_block_tick (a needs-you rule, not a nudge feature).
@@ -28663,9 +28744,12 @@ def build_feed(now, tmux=None):
         # The user's LAST action on this session was an INTERRUPT (no message from them since): its quiet
         # is user-chosen, not a stall — auto-nudge is suppressed (same predicate, _auto_nudge_tick) and
         # the working card wears an "interrupted" badge saying so (the user 2026-07-05). Cache-only,
-        # like the working dot: the badge snaps in once _warm_fleet_bg fills the parse.
+        # like the working dot: the badge snaps in once _warm_fleet_bg fills the parse. The read is memoized
+        # on that cache object's identity (_interrupt_marks, the "display" family), so an unchanged parse
+        # costs no scan per build.
         try:
-            sess_interrupted = bool(ps) and not who_working and _interrupt_suppresses_nudge(ps["turns"], fsid)
+            sess_interrupted = bool(ps) and not who_working and \
+                _interrupt_suppresses_nudge(ps["turns"], fsid, family="display")
         except Exception:
             sess_interrupted = False
         # A user interrupt still IN FLIGHT (dispatched, not yet settled): the card wears a steady

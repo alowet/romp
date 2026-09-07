@@ -147,7 +147,7 @@ class InjectedTurnDeadlockEndToEnd(unittest.TestCase):
         km._compacting_now = lambda sid: False
         km._api_error = lambda path: None
         km._session_working = lambda turns: False
-        km._interrupt_suppresses_nudge = lambda turns, sid="": False
+        km._interrupt_suppresses_nudge = lambda turns, sid="", **k: False
         km._backend_queued = lambda sid: False
         km._backend_rewind_pending = lambda sid: False
         km._last_state = lambda sid: ("", 0)
