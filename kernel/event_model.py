@@ -2837,7 +2837,7 @@ def declared_plan(session):
     result text (a creation-order `cN` fallback if the result is unreadable); `status` rides each
     TaskUpdate. Only TaskCreate/TaskUpdate are folded — plain TodoWrite (no durable ids) is not
     used by romp. Empty list if the session declared no plan."""
-    results = {}                                           # tool_use_id → result text (carries 'Task #N')
+    results = {}                                           # tool_use_id → result content (a TaskCreate's carries 'Task #N')
     rejected = set()                                       # tool_use_ids whose result came back is_error
     for turn in session["turns"]:
         for a in turn["atoms"]:
@@ -2845,8 +2845,7 @@ def declared_plan(session):
                 continue
             for b in (a.get("message") or {}).get("content", []) or []:
                 if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id"):
-                    c = b.get("content")
-                    results[b["tool_use_id"]] = c if isinstance(c, str) else json.dumps(c)
+                    results[b["tool_use_id"]] = b.get("content")
                     if b.get("is_error"):
                         rejected.add(b["tool_use_id"])
     tasks, order = {}, 0
@@ -2866,7 +2865,10 @@ def declared_plan(session):
                     # could ever close. Keyed on the result's is_error, as the kernel's fold is.
                     if b.get("id") in rejected:
                         continue
-                    m = re.search(r"Task #(\d+)", results.get(b.get("id"), "") or "")
+                    # Only a TaskCreate's result is ever read, so only it is encoded, here, to the same text
+                    # the regex saw when every result was encoded up front, as the kernel's _fold_tasks does.
+                    r = results.get(b.get("id"), "")
+                    m = re.search(r"Task #(\d+)", (r if isinstance(r, str) else json.dumps(r)) or "")
                     key = m.group(1) if m else "c%d" % order
                     af = inp.get("activeForm")
                     tasks[key] = {"_order": order, "key": key, "text": str(inp.get("subject") or ""),
