@@ -1454,6 +1454,11 @@ class CodexBackend:
     def forwards_sends(self):
         return True    # sends steer mid-turn or queue; the kernel hands them over immediately
 
+    def model_switches_live(self):
+        # set_model lands at the NEXT turn_start (above) while a send steers the LIVE turn: a pick fired
+        # mid-turn would let a send typed right after it steer the old model first — so it parks (#923 fold)
+        return False
+
     def set_auth(self, sid, value):
         return False   # Codex auth is machine-global (codex login); no per-session pick
 
