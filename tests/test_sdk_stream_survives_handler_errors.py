@@ -1283,6 +1283,41 @@ class LogHelpers(unittest.TestCase):
         self.assertRegex(sb._failing_site(e), r"^test_sdk_stream_survives_handler_errors\.py:\d+ inner$")
         self.assertEqual(sb._failing_site(ValueError("no traceback")), "?")
 
+    def test_the_failing_site_skips_synthetic_scopes_and_names_the_function(self):
+        """Before Python 3.12 (PEP 709) a comprehension runs in its own frame, so a raise inside one has
+        `<dictcomp>` as its innermost frame: the site read `file:line <dictcomp>` on 3.10 and 3.11 and
+        `file:line _turn_usage` on 3.12 and 3.13, and the NaN-usage settle test went red on two of the
+        four interpreters (upstream CI on the 2026-09-07 review). The site names the innermost REAL
+        function: every angle-bracketed scope is skipped, so a generator expression (its own frame on
+        every interpreter) names the function too, at the line the comprehension is on — while the
+        chain keeps every frame the interpreter made. With nothing real to name, the innermost stands."""
+        me = "test_sdk_stream_survives_handler_errors.py"
+        def a_fold_with_a_comprehension(u):
+            return {k: int(u[k]) for k in ("input_tokens",)}
+        def a_count_with_a_generator(u):
+            return sum(int(u[k]) for k in ("input_tokens",))
+        def a_caller(fn):
+            fn({"input_tokens": float("nan")})
+        for fn in (a_fold_with_a_comprehension, a_count_with_a_generator):
+            try:
+                a_caller(fn)
+            except ValueError as exc:
+                e = exc                                # the except clause unbinds its own name on exit
+            line = fn.__code__.co_firstlineno + 1      # the one-line body: the comprehension's line
+            self.assertEqual(sb._failing_frame(e), (me, line, fn.__name__))
+            self.assertEqual(sb._failing_site(e), "%s:%d %s" % (me, line, fn.__name__))
+            chain = sb._compact_tb(e)
+            self.assertIn("%s:%d %s < %s:" % (me, line, fn.__name__, me), chain, "the function is a step of the chain")
+            self.assertEqual(chain.startswith("%s:%d <" % (me, line)),
+                             fn is a_count_with_a_generator or sys.version_info < (3, 12),
+                             "the chain keeps the synthetic frame wherever the interpreter made one: %r" % chain)
+        # nothing real to name: a raise caught at the top level of an exec'd string has only synthetic
+        # frames (`<module>`, and before 3.12 the comprehension's own) — the innermost one is named
+        ns = {}
+        exec(compile("try:\n    [1 // 0 for _ in (0,)]\nexcept ZeroDivisionError as exc:\n    err = exc\n",
+                     "a_string_of_code.py", "exec"), ns)
+        self.assertRegex(sb._failing_site(ns["err"]), r"^a_string_of_code\.py:2 <(listcomp|module)>$")
+
     def test_compact_tb_is_bounded_to_the_innermost_frames_and_a_length_cap(self):
         """A RecursionError's chain ran to 18 KB — into the error-center ring and every feed payload that
         carries it. The chain keeps the innermost COMPACT_TB_FRAMES frames (the failing site LEADS, since

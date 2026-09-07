@@ -3699,15 +3699,16 @@ class SdkSession:
 
     def _note_message_failure(self, msg, e) -> None:
         """One problem line per failure, with enough to fix by: the exception type and the FAILING SITE
-        (the innermost frame, file:line function — _failing_site), the message's type and subtype
-        (never its content), what that message losing its handling cost (_failure_consequence — for a
-        ResultMessage read from whether the settle's finally ran for it, never assumed), the exception's
-        own text (uuid-shaped ids shortened, clipped — _mask_ids), and the frame chain (innermost
-        first, no locals, bounded; _compact_tb). A bare `KeyError: '<uuid>'` with none of this is what
-        the last such failure left to diagnose from. The site LEADS the line, right after the type: the
-        error center shows a row's first 240 characters (the kernel feed caps the text at 400), and
-        with the chain at the end of ~335 characters of prose a user never saw where a handler failed
-        (2026-09-07 review). The full chain stays at the tail for the kernel log.
+        (the innermost frame of a real function, file:line function — _failing_site; a comprehension's
+        or lambda's own frame is skipped, so the site reads the same on every interpreter), the
+        message's type and subtype (never its content), what that message losing its handling cost
+        (_failure_consequence — for a ResultMessage read from whether the settle's finally ran for it,
+        never assumed), the exception's own text (uuid-shaped ids shortened, clipped — _mask_ids), and
+        the frame chain (innermost first, no locals, bounded; _compact_tb). A bare `KeyError: '<uuid>'`
+        with none of this is what the last such failure left to diagnose from. The site LEADS the line,
+        right after the type: the error center shows a row's first 240 characters (the kernel feed caps
+        the text at 400), and with the chain at the end of ~335 characters of prose a user never saw
+        where a handler failed (2026-09-07 review). The full chain stays at the tail for the kernel log.
 
         Repeats: a signature is (session, exception type, the failing frame as file/line/function —
         _failing_frame, read from the traceback itself, so the chain's length cap cannot change it).
@@ -5221,14 +5222,26 @@ def _frame_step(f) -> str:
 
 
 def _failing_frame(exc):
-    """The exception's innermost frame — where it was raised — as (file basename, line, function),
-    read from the traceback itself. This is the recurring-failure dedupe key (_note_message_failure):
-    taken from the frame and not from the rendered chain, so no rendering bound can change it. None
-    when the exception carries no traceback."""
+    """The exception's failing frame — the innermost frame of a REAL function — as (file basename,
+    line, function), read from the traceback itself. This is the recurring-failure dedupe key
+    (_note_message_failure) and the site the problem line names (_failing_site): taken from the frame
+    and not from the rendered chain, so no rendering bound can change it. None when the exception
+    carries no traceback.
+
+    Synthetic scopes are skipped: a frame whose code name is angle-bracketed (`<dictcomp>`,
+    `<listcomp>`, `<setcomp>`, `<genexpr>`, `<lambda>`, `<module>`) is not a function a reader can look
+    up by name, and whether one exists at all depends on the interpreter — before Python 3.12
+    (PEP 709) a comprehension runs in its own frame, so a raise inside one named `<dictcomp>` on 3.10
+    and 3.11 while 3.12 and 3.13 named the enclosing function, and the site (the dedupe key with it)
+    differed by interpreter (upstream CI on the 2026-09-07 review: the NaN-usage settle test). The
+    site is the innermost frame whose name is a function's, at the line that frame reports (for a
+    comprehension, the line the comprehension is on); when every frame is synthetic (a raise caught at
+    the top level of an exec'd string) the innermost one stands. The rendered chain (_compact_tb)
+    keeps every frame, synthetic ones included."""
     frames = traceback.extract_tb(getattr(exc, "__traceback__", None))
     if not frames:
         return None
-    f = frames[-1]
+    f = next((f for f in reversed(frames) if not f.name.startswith("<")), frames[-1])
     return (os.path.basename(f.filename), f.lineno or 0, f.name)
 
 
