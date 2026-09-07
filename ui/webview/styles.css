@@ -357,6 +357,31 @@ body.chat-theme-yatharth #tabs .tab-row-line { display: none; }
 }
 #tabbar-resize:hover::after, #tabbar-resize.dragging::after { background: var(--accent); width: 52px; }
 body.tabbar-resizing { cursor: ns-resize; user-select: none; }
+/* TAB SECTIONS — groups are tags (the user 2026-09-04): one header per home tag in the strip, the
+   tag's dot + name at the tab's own type size (labels match labels), the untagged trail behind a
+   plain separator. Folded: the count and one pip (working gold / blocked red — status colours keep
+   their meaning) carry the gist. Headers drag to reorder the groups (tagOrder); the header under a
+   dragged group wears the accent insertion cue. Own pip class, never .tab-dot: the kernel's mobile
+   scrape keys on the tab pips' vocabulary. */
+.tab-group-head { display: flex; flex: 0 0 auto; align-items: center; gap: 5px; padding: 6px 7px 6px 9px;
+  font-size: 0.92em; color: var(--dim); cursor: pointer; white-space: nowrap; user-select: none; border-radius: 6px 6px 0 0; }
+.tab-group-head:hover { color: var(--fg); background: rgba(255, 255, 255, 0.06); }
+/* the section holding the active tab: unfoldable while active (no fold action on its header), so no
+   pointer cursor promising a click — it still drags to reorder the groups */
+.tab-group-head.holds-active { cursor: default; }
+.tab-group-head.dragging { opacity: 0.45; }
+.tab-group-head.drop-target { box-shadow: inset 2px 0 0 var(--accent); }
+.tab-group-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--dim); }
+.tab-group-name { font-weight: 600; }
+.tab-group-count { font-size: 0.82em; opacity: 0.7; }
+.tab-group-pip { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--st-working-bg); }
+.tab-group-pip.blocked { background: var(--st-blocked-bg); }
+.tab-group-pip.retrying { background: #e67e22; }   /* the tab's own amber (.tab.tab-retrying): an API error retrying on its own */
+/* the separator's 6px gutters are PADDING, not margin, and the 1px line is the content box: its box
+   is then the full 13px it occupies in the row, so the tab drag's virtual layout (which measures
+   getBoundingClientRect widths) wraps where the real strip wraps, and paintTabRowLines reads its
+   offsetTop as the row's. */
+.tab-group-sep { flex: 0 0 auto; box-sizing: border-box; width: 13px; padding: 8px 6px; background: var(--box-border); background-clip: content-box; }
 /* (the settings gear + modal live on the TIMELINE now — see ui/romp-timeline-view.js) */
 
 .tab {
@@ -2673,6 +2698,12 @@ body.picker-lifted > #picker.kb-tight { align-items: flex-start; padding: 12px 1
 /* the Billing row's single-choice text: written out where the buttons would sit (the user 2026-08-09) —
    the buttons' 0.82em, plain, no button chrome (it is a fact, not a control) */
 .picker-auth-fixed { flex: 0 0 auto; color: var(--fg); font-size: 0.82em; padding: 4px 0; }
+/* the picker's Tags row (tab groups, the user 2026-09-04): the Backend row's chips, each with its
+   tag's identity dot; several may be selected — a session can hold several tags */
+.picker-tags { flex-wrap: wrap; }
+.picker-tag-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+/* the tmux pick: the chips stay in place, disabled, behind the note (tags apply to SDK and Codex sessions) */
+.picker-tags.disabled .picker-be-opt { opacity: 0.45; cursor: default; pointer-events: none; }
 .picker-list { overflow-y: auto; }
 /* The resume list's heading (the user 2026-08-12): the list sits LAST in the dialog — typing in the
    name box re-filters it, and its changing height used to jump every control below it — so this line
