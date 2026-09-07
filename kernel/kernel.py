@@ -7086,7 +7086,8 @@ def _auto_pause_on_limit():
         _set_retry_paused(True)
         sys.stderr.write("retry-pause: auto-engaged — usage limit reached (%s) → auto-retry + judges paused until reset\n"
                          % ",".join(account))
-        _push_all()
+        # no inline push: _set_retry_paused marked the views dirty and woke the pusher, whose next cycle
+        # carries the flip in its globalRetryPaused frame (see _auto_resume_retry)
 
 
 def _spend_capped_session(now, tmux):
@@ -7117,7 +7118,8 @@ def _auto_pause_on_spend_limit(now, tmux):
         _set_retry_paused(True, reason="spend")
         sys.stderr.write("retry-pause: auto-engaged — monthly spend limit reached → auto-retry + judges "
                          "paused until the cap is raised (claude.ai/settings/usage)\n")
-        _push_all()
+        # no inline push: _set_retry_paused marked the views dirty and woke the pusher, whose next cycle
+        # carries the flip in its globalRetryPaused frame (see _auto_resume_retry)
 
 
 def _auto_resume_retry(now, tmux):
@@ -7130,7 +7132,19 @@ def _auto_resume_retry(now, tmux):
 
     Event-based recovery signal: a live session that is NOT currently blocked on an API error AND has written
     fresh transcript output since the pause began (mtime past the pause floor) is proof the account can serve
-    requests again. Clearing re-enables both auto-retry and the judges together."""
+    requests again. Clearing re-enables both auto-retry and the judges together.
+
+    Delivery (the two auto-pause siblings above do the same): no inline push from this thread.
+    _set_retry_paused ends in _mark_views_dirty, which stamps the dirty mark and sets _pusher_wake, so
+    the pusher's next cycle rebuilds past the mark and its globalRetryPaused frame (sent to every chat
+    client on every push) carries the flip, one cycle start after the write, sub-second; the active
+    tab's key stats retry-paused.json as well (_ACTIVE_SIG_FILES), so the queued-hold reason follows on
+    that same push. The inline _push_all that used to end this branch spared no rebuild — the next
+    cycle's dirty-forced build is the same one — and cost a second push's fixed work per flip. A
+    BACKGROUND chat tab's queued-hold reason still waits for its own key to move (_chat_build_sig folds
+    neither the flag's file nor the dirty mark): pre-existing, unchanged. The re-arm below is a store
+    write the cards show (a given-up card's summary sentinel goes back to None), made after the flag's
+    own stamp, so it marks the views dirty itself: the write is the new information."""
     if not _retry_paused_on():
         return
     floor = _retry_pause_ts()
@@ -7150,9 +7164,11 @@ def _auto_resume_retry(now, tmux):
                 rearmed = jd.rearm_failed_summaries(now)  # while degraded, so their summaries/briefs retry now
                 if rearmed:
                     sys.stderr.write("distiller: re-armed %d given-up card(s) after recovery\n" % rearmed)
+                    _mark_views_dirty()                  # a store write the cards show, after the flag's stamp
             except Exception:
                 sys.stderr.write("rearm-failed-summaries: %s\n" % traceback.format_exc())
-            _push_all()                                  # globalRetryPaused=false reaches the UI immediately
+            # no inline push: _set_retry_paused marked the views dirty and woke the pusher; its next cycle
+            # carries globalRetryPaused=false (docstring)
             return
 
 
@@ -7727,8 +7743,16 @@ def _interrupt_block_tick(now, tmux):
     The once-per-episode marker is VERIFIED against the store each tick, never trusted (the user
     2026-08-08): judges complete/clear the goal it points at off newer turns (or compaction archives
     it), and trusting the bare marker skipped the re-block forever — the live focus goal sat in
-    Working wearing only the badge, auto-nudge suppressed: invisible-blocked."""
-    changed = False
+    Working wearing only the badge, auto-nudge suppressed: invisible-blocked.
+
+    No inline push: both writers end in _mark_views_dirty(), which stamps the dirty mark and sets
+    _pusher_wake, so the next cycle's own _push_all rebuilds past the mark. The inline call spared no
+    rebuild (the next cycle's dirty-forced build is the same one); it delivered the flip one cycle tail
+    earlier (the jobs after this tick plus the next cycle's liveness read: sub-second) at a second
+    push's fixed cost, and on the stand-down path below (a marker whose block a judge now owns) it
+    pushed with nothing new to show. The two fault paths push nothing either: an unproved ledger
+    stands the block down before any write, and a refused marker write leaves the store write's own
+    dirty mark to carry the flip."""
     alive = _alive_sessions(now, tmux)
     for s in alive:
         sid = s["sid"]
@@ -7773,28 +7797,28 @@ def _interrupt_block_tick(now, tmux):
                                      for a in (turn.get("atoms") or [])])
                 g = _record_interrupt_block(sid, ev)
                 if g:
-                    # the block IS filed — a proved goal-store write, a needs-you flip the feed must hear —
-                    # so this pushes whatever the marker write's fate: a fault landing between the tag
-                    # check above and here refuses the marker, the next tick stands down at the check, and
-                    # the first healed tick re-mints the marker (_record_interrupt_block hands back the gid
-                    # of a card our own block already holds, appending nothing)
-                    _set_intr_blocked(sid, g); changed = True
+                    # the block IS filed — a proved goal-store write that marked the views dirty, a needs-you
+                    # flip the next cycle carries — whatever the marker write's fate: a fault landing between
+                    # the tag check above and here refuses the marker, the next tick stands down at the check,
+                    # and the first healed tick re-mints the marker (_record_interrupt_block hands back the
+                    # gid of a card our own block already holds, appending nothing)
+                    _set_intr_blocked(sid, g)
         else:                                            # working / re-engaged / machine cut → lift OUR block if any
             ib = _intr_blocked(sid)
             if ib:
                 # the re-engagement IS the newest turn's trigger — the same stamp the judges will put on
                 # every verdict about that turn, so their ruling outranks this lift on arrival order.
-                # The lift runs whatever the ledger's state — it is the user's own re-engagement — but
-                # `changed` follows the MARKER write: refused under a fault, the marker stays in the last
-                # proved snapshot, the lift re-runs as a no-op next tick, and nothing pushes every cycle.
-                # A lift that could not READ the goals store (False: its row is filed) keeps the marker
-                # too, so the next tick retries the lift rather than erasing it (the #1019 boundary)
+                # The lift runs whatever the ledger's state — it is the user's own re-engagement. Nothing
+                # pushes from here (docstring): a lift that wrote the store marked the views dirty itself;
+                # a marker write refused under a fault leaves the marker in the last proved snapshot, the
+                # lift re-runs as a no-op next tick, and a no-op marks nothing, so nothing rebuilds every
+                # cycle either. A lift that could not READ the goals store (False: its row is filed) keeps
+                # the marker too, so the next tick retries the lift rather than erasing it (the #1019 boundary)
                 if _lift_interrupt_block(sid, ib, turns[-1].get("t") if turns else 0):
-                    if _set_intr_blocked(sid, None):     # spent → the marker goes; `changed` follows the write
-                        changed = True
+                    _set_intr_blocked(sid, None)     # spent → the marker goes; refused under a fault it stays
+                #                                      in the last proved snapshot and the next tick retries
     _intr_marks_forget({s["sid"] for s in alive})       # a sid that left the alive set releases its memo entries
-    if changed:                                          # a needs-you flip should reach the feed at once
-        _push_all()
+    # a flip's writer marked the views dirty and woke the pusher: the next cycle carries it (docstring)
 
 
 def _walk_root_record(sid):

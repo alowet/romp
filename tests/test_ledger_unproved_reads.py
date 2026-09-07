@@ -445,7 +445,12 @@ class CorruptBytes(_Ledger):
 
 class _InterruptTickRig(unittest.TestCase):
     """The interrupt tick's collaborators as recording stubs, the rig the two classes below share
-    (unittest collects inherited test_ names, so the fixture lives apart from either's tests)."""
+    (unittest collects inherited test_ names, so the fixture lives apart from either's tests).
+
+    The tick pushes nothing inline: a flip reaches the next cycle through its WRITER's dirty mark and pusher
+    wake (_record_interrupt_block and _lift_interrupt_block end in _mark_views_dirty), so the rig reads those
+    two signals and keeps _push_all as a tripwire. _views_dirty is a module global shared across the suite:
+    each test records its own floor (_refloor), and the wake is put back on the way out."""
 
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
@@ -470,7 +475,9 @@ class _InterruptTickRig(unittest.TestCase):
         km._lift_interrupt_block = lambda sid, gid, ev: self.lifted.append((sid, gid, ev)) or True   # spent; the real
         #                                            one returns False only on a goal-store read fault, keeping the marker (PR #1019)
         km._intr_block_stands = lambda sid, gid: True
-        km._push_all = lambda *a, **k: self.pushes.append(1)
+        km._push_all = lambda *a, **k: self.pushes.append(1)   # a tripwire: the tick never pushes inline
+        self._wake_was = km._pusher_wake.is_set()
+        self._refloor()
         self._undo = []
         _reset_ledger_state()
 
@@ -479,6 +486,10 @@ class _InterruptTickRig(unittest.TestCase):
             undo()
         for n, v in self.saved.items():
             setattr(km, n, v)
+        if self._wake_was:
+            km._pusher_wake.set()
+        else:
+            km._pusher_wake.clear()
         jd.parsed_session = self.saved_parsed
         _reset_ledger_state()
         jd.STATE = self.saved_state
@@ -496,6 +507,17 @@ class _InterruptTickRig(unittest.TestCase):
         for _ in range(n):
             km._interrupt_block_tick(2000, {SID: {"state": ""}})
 
+    def _refloor(self):
+        """Forget the marks so far: _marked and _woken then read only what the ticks after this do."""
+        self.floor = km._views_dirty[0]
+        km._pusher_wake.clear()
+
+    def _marked(self):
+        return km._views_dirty[0] > self.floor
+
+    def _woken(self):
+        return km._pusher_wake.is_set()
+
 
 class InterruptBlockTickUnderAFault(_InterruptTickRig):
     """_interrupt_block_tick runs every push OUTSIDE the paused nudge pass. Under an unproved snapshot its
@@ -504,8 +526,11 @@ class InterruptBlockTickUnderAFault(_InterruptTickRig):
     episode stood until a judge happened to unblock it; and its lift arm, with the marker clear refused,
     set `changed` every cycle and pushed every cycle. Now the block arm files nothing under a fault (the
     stop is re-evaluated from the transcript every push, so the block lands on the first tick after the
-    file reads again), the lift still runs (it is the user's own re-engagement), and `changed` follows the
-    marker write. Control flow only: every collaborator is a recording stub."""
+    file reads again), the lift still runs (it is the user's own re-engagement), and nothing pushes inline
+    from the tick at all: a writer's own dirty mark and pusher wake carry a flip to the next cycle (the real
+    writers run in MidTickFaultThenHeal below; the recording stubs here mark nothing), and a refused marker
+    write marks nothing, so a fault repeats nothing every cycle. Control flow only: every collaborator is a
+    recording stub."""
 
     def test_a_stop_during_a_fault_files_no_block_until_the_ledger_reads_again(self):
         self.p.write_text(json.dumps(DEFAULT))
@@ -516,7 +541,8 @@ class InterruptBlockTickUnderAFault(_InterruptTickRig):
         with contextlib.redirect_stderr(err):
             self._tick(5)
         self.assertEqual(self.recorded, [], "no block whose marker cannot be minted: unmarked, it could never be lifted")
-        self.assertEqual(self.pushes, [], "…and nothing pushes")
+        self.assertEqual(self.pushes, [], "…and nothing pushes inline")
+        self.assertFalse(self._marked() or self._woken(), "…or marks the views dirty or wakes the pusher: nothing to show")
         self.assertEqual(self.p.read_bytes(), before)
         self.assertEqual(err.getvalue().count("paused"), 1, "loud once per fault episode, on the pass's latch")
         self._heal()
@@ -524,12 +550,14 @@ class InterruptBlockTickUnderAFault(_InterruptTickRig):
             self._tick()
         self.assertEqual(len(self.recorded), 1, "the stop is re-evaluated every push: the block lands on the first tick after the file reads")
         self.assertEqual(json.loads(self.p.read_text())["intrBlocked"], {SID: GID}, "…with its once-per-episode marker")
-        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(self.pushes, [], "no inline push: the block's own store write is what marks the views dirty "
+                                          "(the real writer, in MidTickFaultThenHeal; this rig's stub marks nothing)")
 
-    def test_a_fault_landing_mid_tick_still_pushes_the_block_it_filed_and_then_stands_down(self):
+    def test_a_fault_landing_mid_tick_leaves_the_block_it_filed_to_its_writers_mark_and_then_stands_down(self):
         # the tag check at the arm's top proves; the fault lands before the marker write. The block IS in
-        # the goal store — a proved write, a needs-you flip the feed must hear — so this tick pushes once
-        # whatever the marker's fate; every later faulted tick stands down at the check: no storm
+        # the goal store — a proved write, whose writer marks the views dirty (the real one; MidTickFaultThenHeal
+        # pins the mark) — so the flip reaches the next cycle whatever the marker's fate, and the tick pushes
+        # nothing inline; every later faulted tick stands down at the check: no storm
         self.p.write_text(json.dumps(DEFAULT))
         km._autonudge_cache.clear()
         real, calls, ledger, test = km._auto_nudge_data, [0], self.p, self
@@ -545,10 +573,11 @@ class InterruptBlockTickUnderAFault(_InterruptTickRig):
         with contextlib.redirect_stderr(io.StringIO()):
             self._tick(5)
         self.assertEqual(len(self.recorded), 1, "the block was filed once")
-        self.assertEqual(self.pushes, [1], "…and pushed exactly once, marker or no marker")
+        self.assertEqual(self.pushes, [], "…and nothing pushed inline, marker or no marker: the writer's mark carries it")
+        self.assertFalse(self._marked() or self._woken(), "the stubbed writer marks nothing, and the tick adds no mark of its own")
         self.assertNotIn("intrBlocked", json.loads(self.p.read_bytes()), "the marker write was refused")
 
-    def test_a_re_engagement_during_a_fault_lifts_our_block_and_pushes_once_the_marker_clears(self):
+    def test_a_re_engagement_during_a_fault_lifts_our_block_and_marks_nothing_while_the_marker_clear_is_refused(self):
         marked = dict(DEFAULT, intrBlocked={SID: GID})
         self.p.write_text(json.dumps(marked))
         km._autonudge_cache.clear()
@@ -560,12 +589,15 @@ class InterruptBlockTickUnderAFault(_InterruptTickRig):
         with contextlib.redirect_stderr(io.StringIO()):
             self._tick(5)
         self.assertGreaterEqual(len(self.lifted), 1, "the lift is the user's own re-engagement: it runs whatever the ledger's state")
-        self.assertEqual(self.pushes, [], "the marker clear was refused: no push storm (one per cycle before)")
+        self.assertEqual(self.pushes, [], "the marker clear was refused: no inline push (one per cycle before)")
+        self.assertFalse(self._marked() or self._woken(),
+                         "…and no dirty mark or wake either: a refused clear marks nothing, so no rebuild storm takes the push storm's place")
         self.assertEqual(self.p.read_bytes(), before)
         self._heal()
         self._tick()
         self.assertNotIn(SID, json.loads(self.p.read_text()).get("intrBlocked", {}), "the marker clears on the first tick after the file reads")
-        self.assertEqual(len(self.pushes), 1, "…and that is the one push")
+        self.assertEqual(self.pushes, [], "…with no inline push: the lift's own store write is what marks the views dirty "
+                                          "(the real writer, in MidTickFaultThenHeal)")
 
 
 B = 1_700_000_000   # an epoch base for the store class below: the diary is an evidence-time ledger
@@ -631,7 +663,11 @@ class MidTickFaultThenHeal(_InterruptTickRig):
         self.assertEqual(self._store()["status"][GID], "blocked", "the block was filed in the goal store")
         self.assertEqual(self._block_rows(), ["interrupt"])
         self.assertNotIn("intrBlocked", json.loads(self.p.read_bytes()), "…and the marker write was refused")
-        self.assertEqual(self.pushes, [1], "the block's push")
+        self.assertEqual(self.pushes, [], "no inline push from the tick")
+        self.assertTrue(self._marked() and self._woken(),
+                        "the block's own store write marked the views dirty and woke the pusher: the next cycle carries the "
+                        "flip, marker or no marker")
+        self._refloor()
         self._heal()
 
     def _re_engage(self):
@@ -646,15 +682,19 @@ class MidTickFaultThenHeal(_InterruptTickRig):
         self.assertEqual(json.loads(self.p.read_text()).get("intrBlocked"), {SID: GID},
                          "the marker our own block is owed is minted on the first tick after the file reads")
         self.assertEqual(self._block_rows(), ["interrupt"], "…without a second block row: the diary already says it")
-        self.assertEqual(self.pushes, [1, 1], "the block's push, and the marker's")
+        self.assertEqual(self.pushes, [], "nothing pushes inline")
+        self.assertFalse(self._marked() or self._woken(),
+                         "…and the re-mint marks nothing: the card already shows the block (the ledger's mtime is in the view signature)")
         with contextlib.redirect_stderr(io.StringIO()):
             self._tick(3)
-        self.assertEqual(self.pushes, [1, 1], "settled: the marker stands and the block holds, nothing more to push")
+        self.assertFalse(self._marked() or self._woken(), "settled: the marker stands and the block holds, nothing marks or wakes")
         self._re_engage()
         with contextlib.redirect_stderr(io.StringIO()):
             self._tick()
         self.assertEqual(self._store()["status"][GID], "working", "the re-engagement lifts our block: the card leaves Needs-you")
         self.assertNotIn(SID, json.loads(self.p.read_text()).get("intrBlocked", {}), "…and the marker clears")
+        self.assertTrue(self._marked() and self._woken(), "the lift's store write marked the views dirty and woke the pusher")
+        self.assertEqual(self.pushes, [], "…and pushed nothing inline")
 
     def test_a_judge_block_filed_since_is_left_alone(self):
         self._fault_on_the_marker_write()
@@ -666,7 +706,8 @@ class MidTickFaultThenHeal(_InterruptTickRig):
             self._tick(3)
         self.assertNotIn("intrBlocked", json.loads(self.p.read_text()), "a card a judge has blocked is theirs: no marker")
         self.assertEqual(self._block_rows(), ["interrupt", "closer"], "…and nothing appended")
-        self.assertEqual(self.pushes, [1], "…and nothing pushed")
+        self.assertEqual(self.pushes, [], "…and nothing pushed inline")
+        self.assertFalse(self._marked() or self._woken(), "…or marked or woken: a judge's card is not ours to move")
         self._re_engage()
         with contextlib.redirect_stderr(io.StringIO()):
             self._tick()
