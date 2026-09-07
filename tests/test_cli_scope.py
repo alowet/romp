@@ -33,6 +33,7 @@ ROMP_CLI_SCOPE=0 for every backend construction):
     limit that is not set; every cell of that table is pinned in SettleTable.
 Synthetic fixtures only: placeholder sid, /bin/true as the CLI.
 """
+import json
 import os
 import subprocess
 import sys
@@ -393,9 +394,9 @@ class FallbackNotice(_Backend):
     the CLI directly after a failed pre-flight. The CLI then STARTS, so _record_launch_error never
     drains the stderr tail and the line was never read (2026-09-05): the boot verdict kept saying
     scopes were on while the session's work sat in the service cgroup. _on_cli_stderr now logs that
-    line at once, as a problem naming the session; every other line is still only buffered — the
-    wrapper's `romp-cli-scope: refused:` line included, since on that path no CLI started and the
-    launch-error card reports it from the tail."""
+    line at once, as a problem naming the session, and the backend counts it for /api-health; every
+    other line is still only buffered — the wrapper's `romp-cli-scope: refused:` line included, since
+    on that path no CLI started and the launch-error card reports it from the tail."""
 
     NOTICE = ("romp-cli-scope: fallback: systemd-run cannot start a transient scope (Failed to connect to bus: "
               "No such file or directory) — running the CLI directly, outside a scope; a service restart will "
@@ -419,6 +420,8 @@ class FallbackNotice(_Backend):
         self.assertIn(SID[:8], m, "and its sid")
         self.assertIn(self.NOTICE, m, "the wrapper's own reason, verbatim")
         self.assertEqual(sess.stderr_tail(), self.NOTICE, "buffered too, like any other line")
+        self.assertEqual(self.be.cli_scope_fallbacks, 1)
+        self.assertIsNotNone(self.be.cli_scope_fallback_at)
 
     def test_an_ordinary_line_is_only_buffered(self):
         problems = self._capture()
@@ -427,26 +430,49 @@ class FallbackNotice(_Backend):
         # the prefix mid-line is not the wrapper speaking (a shell naming the wrapper's path, say)
         sess._on_cli_stderr("sh: /x/bin/romp-cli-scope: Permission denied\n")
         self.assertEqual(problems, [], "nothing logged per line — a chatty CLI must not drown the log")
+        self.assertEqual(self.be.cli_scope_fallbacks, 0)
+        self.assertIsNone(self.be.cli_scope_fallback_at)
         self.assertEqual(sess.stderr_tail().splitlines(),
                          ["some CLI chatter", "sh: /x/bin/romp-cli-scope: Permission denied"])
 
-    def test_the_refusal_line_is_not_logged_as_a_fallback(self):
+    def test_the_refusal_line_is_not_counted_as_a_fallback(self):
         # the wrapper's other line (ROMP_CLI_REAL unset, exit 127): no CLI started, so nothing ran
         # outside a scope, and the launch fails — _record_launch_error reports the line from the
-        # stderr tail. Logging it here too reported the one event twice, the first time as a CLI
-        # "started outside a scope" when none had started.
+        # stderr tail. Counting and logging it here too reported the one event twice, the first time
+        # as a CLI "started outside a scope" when none had started.
         problems = self._capture()
         sess = self._sess()
         sess._on_cli_stderr(self.REFUSAL + "\n")
         self.assertEqual(problems, [], "left to the launch-error path")
+        self.assertEqual(self.be.cli_scope_fallbacks, 0)
+        self.assertIsNone(self.be.cli_scope_fallback_at)
         self.assertEqual(sess.stderr_tail(), self.REFUSAL, "buffered: the launch-error card reads it from here")
+        self.assertEqual(self.be.api_health_snapshot()["cliScope"]["fallbacks"], 0)
 
     def test_the_generic_prefix_alone_is_not_a_fallback(self):
-        # only the fallback FORM is logged: a line with the wrapper's prefix and neither second word
-        # (a future third message, say) is buffered and nothing more, rather than misreported
+        # only the fallback FORM counts: a line with the wrapper's prefix and neither second word (a
+        # future third message, say) is buffered and nothing more, rather than miscounted
         problems = self._capture()
         self._sess()._on_cli_stderr(sb.CLI_SCOPE_NOTICE_PREFIX + " something else entirely\n")
         self.assertEqual(problems, [])
+        self.assertEqual(self.be.cli_scope_fallbacks, 0)
+
+    def test_the_snapshot_reports_the_verdict_and_the_fallbacks(self):
+        self.assertEqual(self.be.api_health_snapshot()["cliScope"],
+                         {"on": False, "fallbacks": 0, "lastFallbackAt": None, "limitsIgnored": 0, "rejected": [],
+                          "memoryControllerDelegated": None, "unsettled": [],
+                          "memoryMax": None, "memoryHigh": None, "memorySwapMax": None, "oomScoreAdj": None},
+                         "the test floor: off, nothing fell back, no limits, no probe")
+        self._capture()
+        sess = self._sess()
+        sess._on_cli_stderr(self.NOTICE + "\n")
+        sess._on_cli_stderr(self.NOTICE + "\n")
+        snap = self.be.api_health_snapshot()["cliScope"]
+        self.assertEqual(snap["fallbacks"], 2)
+        self.assertIsInstance(snap["lastFallbackAt"], int)
+        self.assertGreater(snap["lastFallbackAt"], 0)
+        self.be.cli_scope = True
+        self.assertTrue(self.be.api_health_snapshot()["cliScope"]["on"])
 
     def test_the_prefixes_are_what_the_wrapper_writes(self):
         # the constants and the script agree: every stderr line the wrapper writes starts with the
@@ -619,8 +645,9 @@ class LimitRules(unittest.TestCase):
 
 
 class LimitsOnTheBackend(_Backend):
-    """Read once at construction from the manager's environment; handed down by _options; the wrapper's
-    `ignored:` line logged at arrival as a problem naming the session."""
+    """Read once at construction from the manager's environment; handed down by _options; reported by
+    api_health_snapshot; the wrapper's `ignored:` line logged at arrival as a problem naming the session,
+    and counted."""
 
     def _construct(self, **env):
         saved = {k: os.environ.get(k) for k in env}
@@ -716,7 +743,43 @@ class LimitsOnTheBackend(_Backend):
         for v in LIMIT_VARS:
             self.assertNotIn(v, env, "no wrapper, no scope, nothing for a limit to apply to")
 
-    def test_the_ignored_line_is_logged_at_once_as_a_problem_naming_the_session(self):
+    def test_the_snapshot_reports_the_values_in_force_and_the_refused_names(self):
+        self.be.cli_scope_limits = {"memoryMax": "16G", "memoryHigh": "12G", "oomScoreAdj": "500"}
+        self.be.cli_scope_rejected = {"ROMP_CLI_SCOPE_MEMORY_SWAP_MAX": "some"}
+        self.be.cli_scope = True
+        snap = self.be.api_health_snapshot()["cliScope"]
+        self.assertEqual(snap["memoryMax"], "16G")
+        self.assertEqual(snap["memoryHigh"], "12G")
+        self.assertIsNone(snap["memorySwapMax"], "refused: not in force")
+        self.assertEqual(snap["oomScoreAdj"], 500, "an integer, as JSON should carry it")
+        self.assertEqual(snap["rejected"], ["ROMP_CLI_SCOPE_MEMORY_SWAP_MAX"])
+        self.assertEqual(snap["limitsIgnored"], 0)
+        self.assertIsNone(snap["memoryControllerDelegated"], "not settled (no probe ran on this backend)")
+        self.assertEqual(snap["unsettled"], [], "nothing was due, so nothing is unsettled")
+        json.dumps(snap)
+        # an unsettled check rides by name: the one field that tells a set value whose check did not
+        # answer from a settled one (oomScoreAdj 500 beside memoryControllerDelegated true reads as
+        # settled otherwise)
+        self.be.cli_scope_unsettled = ["oomScoreAdj"]
+        snap = self.be.api_health_snapshot()["cliScope"]
+        self.assertEqual((snap["oomScoreAdj"], snap["unsettled"]), (500, ["oomScoreAdj"]))
+        self.assertIsNot(snap["unsettled"], self.be.cli_scope_unsettled, "a copy: the snapshot is serialized, not the backend's list")
+        # the boot probe's verdict on the memory controller rides as it was settled, either way
+        for verdict in (True, False):
+            self.be.cli_scope_memory_delegated = verdict
+            snap = self.be.api_health_snapshot()["cliScope"]
+            self.assertIs(snap["memoryControllerDelegated"], verdict)
+            self.assertEqual(snap["memoryMax"], "16G", "set and held by systemd: still reported; the flag says whether it applies")
+            json.dumps(snap)
+        # scopes off: nothing is in force, however the variables read; the refusal still shows
+        self.be.cli_scope = False
+        snap = self.be.api_health_snapshot()["cliScope"]
+        for key in ("memoryMax", "memoryHigh", "memorySwapMax", "oomScoreAdj", "memoryControllerDelegated"):
+            self.assertIsNone(snap[key], key)
+        self.assertEqual(snap["rejected"], ["ROMP_CLI_SCOPE_MEMORY_SWAP_MAX"])
+        self.assertEqual(snap["unsettled"], [], "off: no check was due")
+
+    def test_the_ignored_line_is_logged_at_once_and_counted_apart_from_the_fallbacks(self):
         problems = []
         self.be._log = lambda m, problem=None: problems.append((m, problem))
         sess = self._sess()
@@ -729,6 +792,11 @@ class LimitsOnTheBackend(_Backend):
         self.assertIn("without a per-session limit", m)
         self.assertIn(IGNORED, m, "the wrapper's own line, verbatim")
         self.assertEqual(sess.stderr_tail(), IGNORED, "buffered too")
+        self.assertEqual(self.be.cli_scope_ignored, 1)
+        self.assertEqual(self.be.cli_scope_fallbacks, 0, "not a fallback: the scope is there")
+        self.assertIsNone(self.be.cli_scope_fallback_at)
+        snap = self.be.api_health_snapshot()["cliScope"]
+        self.assertEqual((snap["limitsIgnored"], snap["fallbacks"]), (1, 0))
 
     def test_the_fixture_is_what_the_wrapper_writes(self):
         with open(os.path.join(BIN, "romp-cli-scope")) as f:
@@ -771,6 +839,9 @@ class LimitsOnTheBackend(_Backend):
         self.assertEqual(be.cli_scope_unsettled, [], "every due check answered")
         problems = [m for m in self.logged if m.startswith("cli scope:") and ("not delegated" in m or "cannot be written" in m)]
         self.assertEqual(len(problems), 2, self.logged)
+        snap = be.api_health_snapshot()["cliScope"]
+        self.assertEqual((snap["memoryMax"], snap["oomScoreAdj"], snap["rejected"], snap["memoryControllerDelegated"], snap["unsettled"]),
+                         ("16G", None, ["ROMP_CLI_SCOPE_OOM_SCORE_ADJ"], False, []))
         # and _options hands the refused adjustment down empty, the size as itself, the unset two not at all
         sess = sb.SdkSession(be, {"sid": SID, "name": "web", "cwd": self.d, "mode": "acceptEdits"})
         env = be._options(sess, dict)["env"]
@@ -811,6 +882,10 @@ class LimitsOnTheBackend(_Backend):
                          "plain lines: the wrapper reports on each launch")
         env = be._options(sb.SdkSession(be, {"sid": SID, "name": "web", "cwd": self.d, "mode": "acceptEdits"}), dict)["env"]
         self.assertEqual(env["ROMP_CLI_SCOPE_MEMORY_MAX"], "16G", "handed down as read")
+        # /api-health shows the same: the limit beside a null verdict, and `unsettled` naming the check
+        snap = be.api_health_snapshot()["cliScope"]
+        self.assertEqual((snap["memoryMax"], snap["memoryControllerDelegated"], snap["unsettled"]),
+                         ("16G", None, ["memoryLimits"]))
 
     def test_with_the_scopes_off_the_backend_runs_no_probe_however_the_limits_read(self):
         real_run = subprocess.run

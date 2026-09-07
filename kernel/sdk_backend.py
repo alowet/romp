@@ -6855,15 +6855,22 @@ class SdkBackend:
             # directly, unscoped.
             os.environ["ROMP_CLI_REAL"] = self.claude_bin
         self._cli_scope_wrapper_logged = False    # the missing-wrapper fallback is reported once per backend
+        # CLI launches since boot that the wrapper reported running WITHOUT a scope (its stderr notice,
+        # see _on_cli_stderr), and when the last one was. The boot verdict above is taken once; these say
+        # whether it stopped holding afterwards. Read by api_health_snapshot (cliScope.fallbacks).
+        self.cli_scope_fallbacks = 0
+        self.cli_scope_fallback_at: float | None = None
         # The per-session limits (cli_scope_limits): the values the wrapper applies, keyed as the boot
-        # line reports them; the variables refused (each logged once, as a problem, in there) — by their
-        # rule, or by this box, which the boot probe settles once here (subprocess.run, with the scopes
-        # on) so the wrapper does not report the same refusal on every launch; the probe's verdict on the
-        # memory controller (None when it did not run); and the probe's checks that settled nothing
-        # (CLI_SCOPE_CHECKS). Read once per backend, like the verdict; _options hands them down at every
-        # connect.
+        # line and /api-health report them; the variables refused (each logged once, as a problem, in
+        # there) — by their rule, or by this box, which the boot probe settles once here (subprocess.run,
+        # with the scopes on) so the wrapper does not report the same refusal on every launch; the probe's
+        # verdict on the memory controller (None when it did not run); and the probe's checks that settled
+        # nothing (CLI_SCOPE_CHECKS; /api-health's `unsettled`). Read once per backend, like the verdict;
+        # _options hands them down at every connect. `cli_scope_ignored` counts the wrapper's `ignored:`
+        # lines since boot (_note_cli_scope_ignored; /api-health's `limitsIgnored`).
         (self.cli_scope_limits, self.cli_scope_rejected, self.cli_scope_memory_delegated,
          self.cli_scope_unsettled) = cli_scope_limits(log=self._log, scope_on=self.cli_scope, run=subprocess.run)
+        self.cli_scope_ignored = 0
         self._heal_attempts: dict[str, int] = {}  # sid -> crash-resume attempts since its last COMPLETED turn
         #                                           (bounds _heal_cut_session to one resume per cut; a completed
         #                                           turn resets it, so a crash LOOP can't respawn forever)
@@ -8133,10 +8140,13 @@ class SdkBackend:
         """The scope wrapper wrote its fallback notice on `sess`'s stderr (SdkSession._on_cli_stderr,
         CLI_SCOPE_FALLBACK_PREFIX): this CLI is running directly, inside the service cgroup, after the
         pre-flight scope failed. Logged at once as a problem (the error center shows it; a launch that
-        succeeds never drains the stderr tail, so nothing else would), so a reader of the log can tell
-        that the boot verdict "cli scope: on" stopped holding. The wrapper's exit-127 refusal
-        (CLI_SCOPE_REFUSAL_PREFIX) never reaches here: no CLI started, and the launch-error path
-        reports it."""
+        succeeds never drains the stderr tail, so nothing else would) and counted, so a reader of the
+        log or of /api-health can tell that the boot verdict "cli scope: on" stopped holding. The
+        wrapper's exit-127 refusal (CLI_SCOPE_REFUSAL_PREFIX) never reaches here: no CLI started, and
+        the launch-error path reports it."""
+        with self._lock:
+            self.cli_scope_fallbacks += 1
+            self.cli_scope_fallback_at = time.time()
         self._log("cli scope: session %s (%s) started its CLI outside a scope — %s"
                   % (sess.name, str(sess.sid)[:8], text), problem=True)
 
@@ -8144,7 +8154,10 @@ class SdkBackend:
         """The scope wrapper wrote its `ignored:` line on `sess`'s stderr (SdkSession._on_cli_stderr,
         CLI_SCOPE_IGNORED_PREFIX): a per-session limit (CLI_SCOPE_LIMITS) was not applied, and the CLI
         runs in its scope without it. Logged at once as a problem, for the fallback's reason (the CLI
-        starts, so nothing drains the tail). Not a fallback: the scope itself is there."""
+        starts, so nothing drains the tail), and counted for /api-health (cliScope.limitsIgnored) —
+        apart from the fallbacks, since the scope itself is there."""
+        with self._lock:
+            self.cli_scope_ignored += 1
         self._log("cli scope: session %s (%s) started its CLI without a per-session limit — %s"
                   % (sess.name, str(sess.sid)[:8], text), problem=True)
 
@@ -8161,6 +8174,28 @@ class SdkBackend:
         out["coverage"]["inTurn"] = sum(1 for s in live if (getattr(s, "inflight", 0) or 0) > 0
                                         or getattr(s, "retrying", False))
         out["coverage"]["retrying"] = sum(1 for s in live if getattr(s, "retrying", False))
+        # The per-session scopes (cli_scope_supported): the boot verdict, and whether it stopped holding
+        # afterwards — CLI launches the wrapper reported running without a scope (_note_cli_scope_fallback).
+        # Plus the per-session limits (cli_scope_limits): each /api-health key carries the value in force
+        # — null when unset, refused, or when the scopes are off (nothing is started for a limit to apply
+        # to); `rejected` names the variables whose values were refused, by their rule or by this box at
+        # the boot probe; `memoryControllerDelegated` is the boot probe's verdict on the memory controller
+        # (null when no memory limit is set, the scopes are off, or it could not be settled); `unsettled`
+        # names the boot probe's checks that settled nothing (CLI_SCOPE_CHECKS: memoryLimits,
+        # memoryController, oomScoreAdj), so a value shown here whose check did not answer is marked as
+        # such — without it an unsettled adjustment reads exactly like a settled one; empty when every due
+        # check answered, or none was due; `limitsIgnored` counts the wrapper's `ignored:` lines since boot
+        # (_note_cli_scope_ignored) — lines, not launches.
+        with self._lock:
+            n, at, ign = self.cli_scope_fallbacks, self.cli_scope_fallback_at, self.cli_scope_ignored
+        out["cliScope"] = {"on": bool(self.cli_scope), "fallbacks": n,
+                           "lastFallbackAt": int(at) if at else None,
+                           "limitsIgnored": ign, "rejected": sorted(self.cli_scope_rejected),
+                           "memoryControllerDelegated": self.cli_scope_memory_delegated if self.cli_scope else None,
+                           "unsettled": list(self.cli_scope_unsettled) if self.cli_scope else []}
+        for _var, key, _ok, _rule, typ in CLI_SCOPE_LIMITS:
+            v = self.cli_scope_limits.get(key) if self.cli_scope else None
+            out["cliScope"][key] = typ(v) if v is not None else None
         return out
 
     def _poke(self):
