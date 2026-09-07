@@ -23624,6 +23624,18 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                         if prompt or reminders or imgs:
                             ev = {"kind": "user", "md": prompt, "uuid": a.get("uuid"), "ts": ts,
                                   "human": author == "human" or bool(imgs), "reminders": reminders}
+                            if a.get("absorbed"):
+                                # A mid-turn splice (event_model._absorbed): the CLI queued this send
+                                # behind the running turn and took it at a later tool boundary, so the
+                                # atom sits at its SEND time, above the steps that ran while it waited.
+                                # The client marks it ("joined mid-turn") and, when the landing retires
+                                # a pending bubble that sat at the tail, leaves a cue where the bubble
+                                # was — the user 2026-09-05 watched a message vanish from the bottom
+                                # and reappear higher up with no explanation. `landedAt`: when the CLI
+                                # took it (the attachment's file-order predecessor; `ts` is the send).
+                                ev["absorbed"] = True
+                                if a.get("landedT"):
+                                    ev["landedAt"] = int(a["landedT"])
                             sp = _space_paths(prompt, sid, a.get("uuid"))
                             if sp:
                                 ev["spacePaths"] = sp   # backticked filenames WITH spaces, filesystem-verified → whole-span links

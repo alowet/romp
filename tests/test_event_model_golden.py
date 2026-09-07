@@ -179,15 +179,20 @@ SENT_LOG = [{"t": T0 + 190, "ev": "sent", "id": MID, "from": "feeddesign",
 
 # ───────────────────────── scenarios ─────────────────────────
 def scenario_multi_input_absorbed():
-    """A typed opener, then a mid-turn prompt spliced in (enqueue -> remove, recorded
-    only as a queued_command attachment) while the assistant is mid-tool. One turn,
-    two inputs, two segments."""
+    """A typed opener, then a mid-turn prompt spliced in while the assistant is mid-tool, in the
+    shape the CLI writes: the enqueue op (no uuid — never a landing witness), the tool_result the
+    splice waited for, the remove op, then the queued_command ATTACHMENT — stamped with the ENQUEUE
+    time (where the atom is placed) but written at the splice, so its file-order predecessor, the
+    tool_result, is when the session took it (`landedT`). One turn, two inputs, two segments.
+    Until 2026-09-06 this scenario had no tool_result and stamped the attachment at the remove
+    time — a shape the CLI never writes — so the golden pinned a landedT 40 s BEFORE the send."""
     return [
         uline(T0, "refactor the ledger", "u1", ps="typed"),
         aline(T0 + 20, "Reading romp-ledger.", "a1", "u1", tools=("Read",), stop="tool_use"),
         qop(T0 + 40, "enqueue", "also rename the digest file"),
-        qop(T0 + 60, "remove"),
-        attline(T0 + 60, "also rename the digest file", "att1", "a1"),
+        trline(T0 + 55, "tu_a1_0", "tr1", "a1"),
+        qop(T0 + 55, "remove"),
+        attline(T0 + 40, "also rename the digest file", "att1", "tr1"),
         aline(T0 + 90, "Folded the rename in too.", "a2", "att1", stop="end_turn"),
     ]
 
@@ -286,15 +291,19 @@ IDLE_STATES = [
 
 def scenario_popall():
     """popAll clears the whole queue at once: every still-queued item is spliced into the
-    continuation as an absorbed mid-turn atom (the old code missed this op)."""
+    continuation as an absorbed mid-turn atom (the old code missed this op). The CLI's shape, as in
+    scenario_multi_input_absorbed: the tool_result the splice waited for precedes the attachments,
+    each stamped with its own ENQUEUE time, and both read that boundary as `landedT` (attachments
+    are never witnesses for each other)."""
     return [
         uline(T0, "start the big task", "u1", ps="typed"),
         aline(T0 + 20, "Working.", "a1", "u1", tools=("Read",), stop="tool_use"),
         qop(T0 + 30, "enqueue", "first queued note"),
         qop(T0 + 40, "enqueue", "second queued note"),
+        trline(T0 + 50, "tu_a1_0", "tr1", "a1"),
         qop(T0 + 50, "popAll"),
-        attline(T0 + 50, "first queued note", "att1", "a1"),
-        attline(T0 + 51, "second queued note", "att2", "att1"),
+        attline(T0 + 30, "first queued note", "att1", "tr1"),
+        attline(T0 + 40, "second queued note", "att2", "att1"),
         aline(T0 + 90, "Folded both notes in.", "a2", "att2", stop="end_turn"),
     ]
 
@@ -1806,6 +1815,61 @@ class PopAll(unittest.TestCase):
         absorbed = [a.get("uuid") for a in out["turns"][0]["atoms"]
                     if a.get("uuid") in ("att1", "att2")]
         self.assertEqual(absorbed, ["att1", "att2"])
+
+
+class AbsorbedLandingNeverPrecedesTheSend(unittest.TestCase):
+    """`landedT` — when the CLI took a mid-turn send — is read off the attachment's file-order
+    predecessor, whose stamp can precede the attachment's own (the ENQUEUE time) only by clock
+    granularity: the live corpus's worst case is -0.2 s, which whole-second stamps can turn into a 1 s
+    inversion. No truthful landing precedes the send, so the event model clamps landedT to the send
+    and counts the clamp in parse stats (`landedT-clamp`): the chat's cue can never read "delivered at"
+    a time before the bubble's own send. Pinned across every golden, because the two goldens that carry
+    absorbed atoms once pinned the inverted value (2026-09-06 review) from a scenario shape with no
+    tool_result before the attachment."""
+
+    def _absorbed(self, out):
+        return [a for t in out["turns"] for a in t["atoms"] if a.get("absorbed")]
+
+    def test_every_golden_absorbed_atom_lands_at_or_after_its_send(self):
+        seen = 0
+        for name in ALL_SCENARIOS:
+            for a in self._absorbed(run_scenario(name)):
+                seen += 1
+                self.assertGreaterEqual(a["landedT"], a["t"], (name, a["uuid"]))
+        self.assertGreaterEqual(seen, 3, "multi_input_absorbed and popall carry the absorbed atoms this pins")
+
+    def test_the_realistic_shape_lands_at_the_boundary_after_the_send(self):
+        a = self._absorbed(run_scenario("multi_input_absorbed"))
+        self.assertEqual([(x["t"], x["landedT"]) for x in a], [(T0 + 40, T0 + 55)],
+                         "placed at the enqueue, taken at the tool_result that followed it in file order")
+        a = self._absorbed(run_scenario("popall"))
+        self.assertEqual([(x["t"], x["landedT"]) for x in a], [(T0 + 30, T0 + 50), (T0 + 40, T0 + 50)],
+                         "two splices at one boundary both read that boundary")
+
+    def test_an_inverted_witness_clamps_to_the_send_and_is_counted(self):
+        # the tool_result stamped before the attachment's enqueue stamp: clock granularity at worst, an
+        # impossible shape beyond it — either way the landing reads as the send, never earlier
+        recs = [uline(T0, "refactor the ledger", "u1", ps="typed"),
+                aline(T0 + 20, "Reading.", "a1", "u1", tools=("Read",), stop="tool_use"),
+                trline(T0 + 39, "tu_a1_0", "tr1", "a1"),
+                attline(T0 + 40, "also rename the digest file", "att1", "tr1"),
+                aline(T0 + 90, "Done.", "a2", "att1", stop="end_turn")]
+        before = em._ASM_STATS.get("landedT-clamp", 0)
+        a = self._absorbed(run_recs(recs))
+        self.assertEqual([(x["t"], x["landedT"]) for x in a], [(T0 + 40, T0 + 40)])
+        self.assertEqual(em._ASM_STATS.get("landedT-clamp", 0), before + 1,
+                         "counted in parse stats, beside ts-repair — a run of these is a CLI write-order change")
+
+    def test_a_witness_at_the_send_second_is_not_a_clamp(self):
+        recs = [uline(T0, "refactor the ledger", "u1", ps="typed"),
+                aline(T0 + 20, "Reading.", "a1", "u1", tools=("Read",), stop="tool_use"),
+                trline(T0 + 40, "tu_a1_0", "tr1", "a1"),
+                attline(T0 + 40, "also rename the digest file", "att1", "tr1"),
+                aline(T0 + 90, "Done.", "a2", "att1", stop="end_turn")]
+        before = em._ASM_STATS.get("landedT-clamp", 0)
+        a = self._absorbed(run_recs(recs))
+        self.assertEqual([(x["t"], x["landedT"]) for x in a], [(T0 + 40, T0 + 40)])
+        self.assertEqual(em._ASM_STATS.get("landedT-clamp", 0), before, "equal stamps are a landing, not an inversion")
 
 
 class SafeDefault(unittest.TestCase):
