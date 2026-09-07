@@ -4444,11 +4444,14 @@ def _parked_quiet_deploy(checkout, now=None):
     already gives such a row for cut attribution. So a park lost with its manager self-heals at that
     bound, and the cut row that lands the deploy consumes the row: events, not a timer of this
     function's own. The p2p row's sha rides its reason ("from <host> to <sha>"); the converge row
-    carries `sha` outright; a quiet row naming no sha matches nothing (never guess)."""
+    carries `sha` outright, and so does the CLI's `romp refresh --quiet` row, which names no action
+    (bin/romp's caller-attribution row, review find: that door parked a quiet restart the check
+    pre-empted just the same); a quiet row naming no sha matches nothing (never guess)."""
     rec = _recent_restart_audit(now=now)
     if not isinstance(rec, dict) or rec.get("when") != "quiet" or not checkout:
         return 0
-    if str(rec.get("action") or "") not in ("p2p-update", "main-converge"):
+    act = str(rec.get("action") or "")
+    if act and act not in ("p2p-update", "main-converge"):
         return 0
     sha = str(rec.get("sha") or "")
     if not sha:
@@ -4470,11 +4473,12 @@ def _main_drift_check():
         # one notice per new TAG, from _update_check — and must never hear about dev commits.
         # The maintainer's mesh keeps this watcher through its own signals (_main_channel_verdict).
         return
-    checkout = _checkout_sha()      # ONE read: the verdict's input and the parked-deploy match below
-    kind, target = _main_drift_verdict(_origin_main_sha(), checkout, _kernel_sha())
+    checkout = _checkout_sha()      # ONE read each: the verdict's inputs and the parked-deploy
+    running = _kernel_sha()         # match below read the same shas the verdict examined
+    kind, target = _main_drift_verdict(_origin_main_sha(), checkout, running)
     if kind == "restart" and target == _REBUILT_FOR[0]:
         return                                        # already converged in place (UI-only rebuild)
-    if kind == "restart" and not _kernel_code_changed(_kernel_sha(), target):
+    if kind == "restart" and not _kernel_code_changed(running, target):
         # NO-KERNEL-CODE drift (the user 2026-08-23, widened T216): the checkout moved but nothing
         # the running process executes changed — converge in place, in EVERY mode and with no
         # cool-down (in-place converges cut no turns, which is the only thing the gates protect).
@@ -4485,6 +4489,7 @@ def _main_drift_check():
             return
     if not kind:
         _MAIN_DRIFT[0] = _MAIN_DRIFT[1] = ""          # in sync: a future drift is new information again
+        _QUIET_PARKED_LOGGED[0] = ""                  # whatever was parked has landed
         return
     slot = 0 if kind == "pull" else 1
     if _MAIN_DRIFT[slot] == target:
@@ -4511,14 +4516,22 @@ def _main_drift_check():
         # leave it to the window — one restart, and any pull follows on the pass after it lands. Not
         # marked acted on: the pass after the row is consumed (or expires) re-evaluates. Said once per
         # sha, not once per pass. The immediate policy for a genuinely new pull (T160) and the
-        # cool-down are unchanged.
-        if _parked_quiet_deploy(checkout):
+        # cool-down are unchanged. Only while the restart is still OWED (the kernel does not yet run
+        # the checkout): a quiet deploy that landed but lost its cut row leaves its row unconsumed
+        # for the rest of the window, and a pull must not wait on a park that already delivered
+        # (review find). When a stand-down ends without that landing — the row expired, the park
+        # died with its manager — say so once and let the converge proceed on its own terms.
+        if running != checkout and _parked_quiet_deploy(checkout):
             if _QUIET_PARKED_LOGGED[0] != checkout:
                 _QUIET_PARKED_LOGGED[0] = checkout
                 sys.stderr.write("romp-kernel: converge: %s already parked as a quiet deploy — leaving it "
                                  "to the quiet window\n" % checkout[:8])
             _MAIN_DRIFT[slot] = ""
             return
+        if _QUIET_PARKED_LOGGED[0] == checkout:
+            _QUIET_PARKED_LOGGED[0] = ""
+            sys.stderr.write("romp-kernel: converge: the quiet deploy parked for %s is no longer pending — "
+                             "the converge proceeds on its own terms\n" % checkout[:8])
         last = max(_LAST_AUTO_CONVERGE[0], _last_deploy_restart_t())
         if time.time() - last < _CONVERGE_COOLDOWN_S:
             _MAIN_DRIFT[slot] = ""
@@ -4529,7 +4542,7 @@ def _main_drift_check():
         if target in _dismissed_updates():
             return                    # Not-now'd THIS sha, durably — a NEW sha offers again
         _send_to_app("shell", {"type": "updateAvail", "kind": "main", "drift": kind,
-                               "cur": _kernel_sha() or "", "tag": target, "boot": _BOOT_ID})
+                               "cur": running or "", "tag": target, "boot": _BOOT_ID})
 
 
 # HTTP-triggered restarts resolve ROMP_MANAGER_PORT BEFORE their ack goes out (2026-08-27): the
@@ -15771,10 +15784,12 @@ def _recent_restart_audit(window=90, now=None):
             return None
         consumed = _consumed_audit_t()
         rec = None
-        for line in reversed(tail[-50:]):
+        for line in reversed(tail[-200:]):
             # walk PAST rows that requested no restart — an in-place converge (main-converge-skip) or
             # a bus bounce writes an audit row but cuts no kernel, and reading only the last row named
-            # a real cut after it as the skip (T240 nit)
+            # a real cut after it as the skip (T240 nit). A deep tail: every session self-close writes
+            # an end-on-idle row, and fifty of them inside a parked quiet window pushed the live park's
+            # row out of a 50-row tail and un-parked it (T240d review find)
             try:
                 cand = json.loads(line)
             except Exception:
