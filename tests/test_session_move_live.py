@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SID = "aaaaaaaa-1111-4222-8333-444444444444"
 CODEWORD = "PLUM-FORTY-TWO"
@@ -171,6 +172,52 @@ class UserApiKeyHelper(unittest.TestCase):
             shutil.rmtree(td, ignore_errors=True)
 
 
+class ApiKeyHelperPrecedence(unittest.TestCase):
+    """The helper the hermetic settings get (always-run; the live class stays opt-in): the explicit
+    $ROMP_MOVE_LIVE_API_KEY_HELPER wins; else the command borrowed from $CLAUDE_CONFIG_DIR/settings.json;
+    else from ~/.claude/settings.json; "" when none names one. HOME and CLAUDE_CONFIG_DIR point at temp
+    dirs throughout, so nothing here reads the operator's own settings."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="romp-move-live-prec-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+
+    def _settings(self, sub, helper):
+        d = os.path.join(self.td, sub)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "settings.json"), "w") as f:
+            json.dump({"apiKeyHelper": helper}, f)
+        return d
+
+    def test_explicit_env_var_wins_over_the_borrowed_command(self):
+        cfg = self._settings("cfg", "/opt/example/borrowed --print")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": cfg,
+                                          "ROMP_MOVE_LIVE_API_KEY_HELPER": "/opt/example/explicit"}):
+            self.assertEqual(_api_key_helper(), "/opt/example/explicit")
+
+    def test_without_the_env_var_the_borrowed_command_is_used(self):
+        cfg = self._settings("cfg", "/opt/example/borrowed --print")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": cfg}):
+            os.environ.pop("ROMP_MOVE_LIVE_API_KEY_HELPER", None)
+            self.assertEqual(_api_key_helper(), "/opt/example/borrowed --print")
+            self.assertEqual(_user_api_key_helper(), "/opt/example/borrowed --print", "no argument: $CLAUDE_CONFIG_DIR")
+
+    def test_the_default_dir_is_dot_claude_under_home(self):
+        home = os.path.join(self.td, "home")
+        self._settings("home/.claude", "/opt/example/home-helper")
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            os.environ.pop("ROMP_MOVE_LIVE_API_KEY_HELPER", None)
+            self.assertEqual(_user_api_key_helper(), "/opt/example/home-helper")
+            self.assertEqual(_api_key_helper(), "/opt/example/home-helper")
+
+    def test_empty_when_nothing_names_a_helper(self):
+        with mock.patch.dict(os.environ, {"HOME": os.path.join(self.td, "empty"),
+                                          "CLAUDE_CONFIG_DIR": os.path.join(self.td, "absent")}):
+            os.environ.pop("ROMP_MOVE_LIVE_API_KEY_HELPER", None)
+            self.assertEqual(_api_key_helper(), "")
+
+
 @unittest.skipIf(_skip_reason(), _skip_reason())
 class LiveSetCwd(unittest.TestCase):
     def test_set_cwd_relocates_and_the_conversation_survives(self):
@@ -193,6 +240,9 @@ class LiveSetCwd(unittest.TestCase):
                 f.write(CHILD)
             r = subprocess.run([_sdk_python(), child, cfg, a, b, cli, SID, CODEWORD, spath],
                                capture_output=True, text=True, timeout=300, env=env, cwd=td)
+            # a failure embeds the child's stderr, which can carry the apiKeyHelper's own diagnostics (never
+            # a key: the helper's output is not read here) — read a failing run's message with that in mind
+            # before pasting it anywhere
             self.assertEqual(r.returncode, 0, "child failed:\n%s\n%s" % (r.stdout[-2000:], r.stderr[-4000:]))
             res = json.loads(r.stdout.strip().splitlines()[-1])
             self.assertTrue(res["has_sender"], "the SDK still exposes _send_control_request")

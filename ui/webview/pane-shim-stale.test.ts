@@ -6,7 +6,8 @@
 // on this socket with no resync between them — a single keepalive can be a beat that was already queued
 // when the socket was accepted), by the reconnected socket CLOSING before it, or by the shim ABANDONING it
 // as quiet before it (the watchdog's tick or the foreground path: a socket the kernel accepted and never
-// spoke on — abandon() disowns its onclose, so it runs the close rule itself), and by nothing else — no
+// spoke on — abandon() disowns its onclose, so it runs the close rule itself; the why names the path that
+// ARMED, reconnect-quiet or foreground-quiet), and by nothing else — no
 // timer (every scenario runs the pending timers afterwards and asserts nothing fired, and asserts no timer
 // is armed on open; the watchdog's interval is captured and ticked by hand); the first non-keepalive frame
 // retires it; a keepalive never reaches the bundle. Also run here: the close breadcrumbs (one `wsclose` per
@@ -276,6 +277,30 @@ test("the foreground path abandoning an ARMED quiet socket raises too; its redia
   assert.equal(h.stale(), 2, "the foreground redial armed on its own account, and its two beats raise as usual");
   assert.equal(h.diags("stale-raise")[1].data.why, "foreground");
   h.settles(2);
+});
+
+test("a redial armed as FOREGROUND that then stays silent raises when the watchdog abandons it: the why is foreground-quiet", () => {
+  // the arm names the path that forced the reconnect, and a silent socket's raise keeps that name with the
+  // -quiet suffix — the shim comment, docs/read-side.md and the body name both spellings; only reconnect-quiet
+  // was pinned before this
+  const h = FEED();
+  h.ws.open(); h.ws.msg({ type: "feed", asks: [] });   // connected, then the socket goes quiet while the tab sleeps
+  h.now += 31_000;
+  for (const f of h.visibility) f();                    // foregrounded: the quiet socket is abandoned (it never armed: no raise) and redialed now
+  assert.equal(h.stale(), 0, "abandoning a socket that never armed is not a raise");
+  assert.equal(h.sockets.length, 2, "abandoned and redialed at once");
+  h.ws.open();                                          // the forced reconnect opens and arms as foreground
+  assert.equal(h.timers.length, 0, "no timer is armed on open");
+  h.now += 31_000;
+  h.tick();                                             // the foreground redial said nothing either: the watchdog abandons it
+  assert.equal(h.stale(), 1, "abandoning the armed foreground redial is the event");
+  assert.equal(h.sockets.length, 3, "…and the same tick redialed");
+  h.ws.open();
+  assert.deepEqual(h.diags("stale-raise").map((m) => m.data.why), ["foreground-quiet"], "named for the path that armed, with the quiet suffix");
+  assert.equal(h.diags("watchdog-close").length, 1);
+  h.ws.msg({ type: "feed", asks: [] });
+  assert.equal(h.fresh(), 1, "the redial's resync retires it");
+  h.settles(1);
 });
 
 test("every close the browser reports for a socket that OPENED leaves a wsclose breadcrumb with the code, the socket's age and the quiet gap", () => {

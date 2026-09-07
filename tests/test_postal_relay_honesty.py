@@ -277,6 +277,12 @@ class PresenceBlinkHonesty(_RelayBase):
         super().setUp()
         pm._LOCAL_PRESENCE_GOOD[0], pm._LOCAL_PRESENCE_GOOD[1] = [], False
         pm._PRESENCE_SERVE_WARNED[0] = False
+        # serve() creates the postal state directory before any listing is read; these tests drive
+        # _local_presence without it, and the twin's write failure is swallowed by design, so without
+        # this the first answered read leaves no twin and the disk-twin test depends on whether an
+        # earlier test in the same process made the directory (the relay ack tests do, through
+        # peer_seen_add) — red when selected alone or on an xdist worker that had not run one of them
+        pm._PRESENCE_GOOD_FILE.parent.mkdir(parents=True, exist_ok=True)
         pm._PRESENCE_GOOD_FILE.unlink(missing_ok=True)
 
     def test_unanswered_serves_the_last_answered_rows(self):
@@ -306,6 +312,7 @@ class PresenceBlinkHonesty(_RelayBase):
         # authoritative emptiness — the disk twin primes it
         _set_live([{"id": ALPHA, "name": "web"}])
         pm._local_presence()                                     # answered → disk twin written
+        self.assertTrue(pm._PRESENCE_GOOD_FILE.exists(), "an answered read writes the disk twin")
         pm._LOCAL_PRESENCE_GOOD[0], pm._LOCAL_PRESENCE_GOOD[1] = [], False   # a fresh bus process
         os.environ.pop("ROMP_SESSIONS_FILE", None)
         pm.KERNEL_BASE = "http://127.0.0.1:9"

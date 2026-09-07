@@ -154,8 +154,9 @@ SH
 # The pre-flight is bounded (2026-09-05): `timeout 10 systemd-run … -- true` when coreutils' timeout is
 # on PATH. A user bus that accepts the connection and never answers would otherwise hold systemd-run
 # for its own 90 s default, past the SDK's 60 s initialize timeout, so the fallback never engaged in the
-# case it was added for. The fake systemd-run below sleeps on the pre-flight only; the wrapper must fall
-# back well inside that sleep, and the CLI's own launch must not run through timeout.
+# case it was added for. The fake systemd-run below sleeps on the pre-flight only, so the no-timeout test
+# can show an unbounded pre-flight that completes; the bound itself is proven with a fake timeout that
+# exits 124.
 _preflight_sleeps() {   # $1: seconds the fake systemd-run sleeps on a `-- true` pre-flight, then exits 0
     cat > "$BIN/systemd-run" <<SH
 #!/bin/sh
@@ -182,23 +183,27 @@ SH
     chmod +x "$BIN/timeout"
 }
 
-@test "a pre-flight that hangs is cut off at 10 s and the CLI falls back to a direct run" {
-    # without coreutils' timeout(1) (macOS) the wrapper runs the pre-flight unbounded, by design (the
-    # test after the next one), so the 10 s bound is not there to check
-    command -v timeout >/dev/null 2>&1 || skip "no timeout(1) on this box"
-    _preflight_sleeps 20
+@test "a pre-flight that hits the 10 s bound (timeout exits 124) falls back to a direct run" {
+    # coreutils' timeout exits 124 when the bound is hit; a fake that says so at once covers the wrapper's
+    # branch in milliseconds, where a real 20 s sleeper and a 9-16 s wall-clock window could miss on a
+    # loaded runner. The fake IS the timeout(1) the wrapper finds, so this runs on a box without one too.
+    export TIMEOUT_LOG="$TEST_DIR/timeout.calls"
+    cat > "$BIN/timeout" <<'SH'
+#!/bin/sh
+echo "$*" >> "$TIMEOUT_LOG"
+exit 124
+SH
+    chmod +x "$BIN/timeout"
     ERR="$TEST_DIR/stderr"
-    t0="$(date +%s)"
     run sh -c '"$0" --input-format stream-json 2>"$1"' "$WRAPPER" "$ERR"
-    t1="$(date +%s)"
     [ "$status" -eq 0 ]
-    [ $((t1 - t0)) -ge 9 ]
-    [ $((t1 - t0)) -lt 16 ]
-    # the CLI ran, directly: systemd-run was tried once (the pre-flight), never for the CLI itself
+    # the bound was asked for once, with the pre-flight behind it; systemd-run itself never ran — not for
+    # the pre-flight (the fake cut it) and not for the CLI (it ran directly)
+    [ "$(wc -l < "$TIMEOUT_LOG")" -eq 1 ]
+    [ "$(cat "$TIMEOUT_LOG")" = "10 systemd-run --user --scope --quiet --collect -- true" ]
+    [ ! -e "$FAKE_CALLS" ]
     [[ "$output" == *"REAL pid="* ]]
     [ "$(printf '%s\n' "$output" | grep '^ARG:')" = "$(printf 'ARG:%s\n' --input-format stream-json)" ]
-    [ "$(wc -l < "$FAKE_CALLS")" -eq 1 ]
-    [[ "$(cat "$FAKE_CALLS")" == *"-- true" ]]
     # one stderr line, the fallback form, naming the bound as the reason
     [ "$(wc -l < "$ERR")" -eq 1 ]
     grep -q '^romp-cli-scope: fallback: ' "$ERR"

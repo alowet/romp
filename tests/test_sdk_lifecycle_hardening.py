@@ -16,7 +16,8 @@ Covers the backend half:
   * drain — the SIGTERM path stops every running session, counts in-flight turns, and writes NO
     idle/waiting state (the trailing 'working' IS the next boot's resume marker).
 
-All deterministic: no SDK import, no real claude processes (ps/os.kill are patched).
+All deterministic: no SDK import, no real claude processes (ps/os.kill are patched) — except PsArgv's
+two real-ps tests, Linux-only, which run the machine's ps against a sleeper child they spawn and kill.
 """
 import json
 import os

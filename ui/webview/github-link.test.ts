@@ -85,9 +85,16 @@ function assertPending(unit: El): void {
   assert.ok(dots!.childNodes.every((c) => c instanceof El && c.tagName === "i" && c.className === "fileview-dot"));
   assert.ok(unit.childNodes.indexOf(dots!) < unit.childNodes.indexOf(ctl), "dots before the button, as the caption will be");
 }
+// The module with its poster bound ONCE for this file: every initFileView call adds another romp:wsup
+// (and message) listener on the shared window, so binding per test would make the re-ask count below
+// equal the number of tests run so far — which is why it could only be asserted as "at least one".
+let bound: Promise<typeof import("./file-view")> | null = null;
+function view(): Promise<typeof import("./file-view")> {
+  if (!bound) bound = import("./file-view").then((fv) => { fv.initFileView((m) => posted.push(m)); return fv; });
+  return bound;
+}
 async function mountAndAnswer(url: string, reason: string): Promise<El> {
-  const fv = await import("./file-view");
-  fv.initFileView((m) => posted.push(m));
+  const fv = await view();
   const unit = fv.githubLinkAction.mount({ path: "/tmp/notes-api/src/app.py", sid: null }) as unknown as El;
   assertPending(unit);
   const ask = posted[posted.length - 1];
@@ -150,8 +157,7 @@ test("state 3 — a URL whose branch is not on origin: a dashed anchor with the 
 });
 
 test("a reply for an older open lands nowhere — the newer open keeps waiting for its own", async () => {
-  const fv = await import("./file-view");
-  fv.initFileView((m) => posted.push(m));
+  const fv = await view();
   const ctx = { path: "/tmp/notes-api/src/app.py", sid: null };
   const first = fv.githubLinkAction.mount(ctx) as unknown as El;
   const firstReq = posted[posted.length - 1].reqId;
@@ -170,8 +176,7 @@ test("a socket drop while the ask is out: the reconnect re-asks with the same re
   // the frame went and nothing re-sends it, so the reply is lost and the placeholder would pulse for
   // the rest of the open. The shim's romp:wsup (its RECONNECT event; the first connect fires none) is
   // the re-ask's trigger — an event, not a timer, as the browse overlay does.
-  const fv = await import("./file-view");
-  fv.initFileView((m) => posted.push(m));
+  const fv = await view();
   const unit = fv.githubLinkAction.mount({ path: "/tmp/notes-api/src/app.py", sid: null }) as unknown as El;
   const reqId = posted[posted.length - 1].reqId;
   const before = posted.length;
@@ -179,7 +184,7 @@ test("a socket drop while the ask is out: the reconnect re-asks with the same re
   assertPending(unit);     // the drop alone changes nothing: the answer may still come
   win.dispatchEvent(new Event("romp:wsup"));
   const again = posted.slice(before);
-  assert.ok(again.length >= 1, "the return re-asks");
+  assert.equal(again.length, 1, "exactly one re-ask per reconnect: one listener, one pending ask");
   assert.ok(again.every((m) => m.type === "fileGitLink" && m.reqId === reqId && m.path === "/tmp/notes-api/src/app.py"),
     "the same question, same reqId: a late first reply and the second are one answer");
   win.dispatchEvent(new MessageEvent("message", { data: { type: "fileGitLink", reqId, url: "", reason: "not committed (staged only)" } }));

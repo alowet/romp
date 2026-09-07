@@ -459,7 +459,10 @@ class LearnedVersions(_ModelsServer):
         self._reg("11111111-2222-3333-4444-555555555501", liveModelId="claude-opus-5-1")
         self._reg("11111111-2222-3333-4444-555555555502", liveModelId="claude-sonnet-5-1")
         self._reg("11111111-2222-3333-4444-555555555503", liveModelId="claude-haiku-5")
-        first = km._learned_versions()
+        with self._counting_reg_reads() as cold:
+            first = km._learned_versions()
+        self.assertEqual(sorted(cold), ["11111111-2222-3333-4444-5555555555%02d.json" % n for n in (1, 2, 3)],
+                         "the cold scan reads each reg once — so the counter below is proven to see reads")
         self.assertEqual(sorted(first), ["haiku", "opus", "sonnet"])
         with self._counting_reg_reads() as reads:
             second = km._learned_versions()
