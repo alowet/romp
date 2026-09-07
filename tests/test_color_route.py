@@ -63,10 +63,17 @@ class ColorRoute(unittest.TestCase):
         km._pal_cache.update({"name": km.pal.DEFAULT, "mt": None})
 
     def _post(self, body):
+        # km.TOKEN, not os.environ: pytest imports every collected module before any test runs, and
+        # test_kernel.py assigns ROMP_SERVE_TOKEN at import. When this module was the FIRST collected
+        # module to set the variable (a two-file or small-subset run), its kernel captured the default
+        # here and test_kernel.py's later write changed what the env held at request time, so the
+        # request was refused with a 403 (found 2026-09-06). In the full suite some forty earlier
+        # modules setdefault the same value test_kernel.py writes, which is why it passed there. The
+        # kernel's own token is the one the handler checks.
         req = urllib.request.Request(
             "http://127.0.0.1:%d/color" % self.port, data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json",
-                     "X-Romp-Token": os.environ["ROMP_SERVE_TOKEN"]})
+                     "X-Romp-Token": km.TOKEN})
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 return r.status, json.loads(r.read().decode())
