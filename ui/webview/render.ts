@@ -13134,10 +13134,10 @@ window.addEventListener("message", (e: MessageEvent) => {
     pendingCancelRestores.delete(key);
     if (!m.ok) {
       // evidence for the next report (T244): which cancel missed, and whether a composer restore was in play
-      // — body LENGTH only, never the text
+      // — body LENGTH only, never the text: not even the kernel's refusal sentence, which quotes the body's
+      // leading token when it starts with "/" (a path-first message would land in the log)
       vscodeApi?.postMessage({ type: "clientDiag", surface: "chat", what: "cancel-miss",
-                               data: { sid: m.id, mdLen: typeof m.md === "string" ? m.md.length : -1,
-                                       hadRestore: !!stash, text: typeof m.text === "string" ? m.text.slice(0, 120) : "" } });
+                               data: { sid: m.id, mdLen: typeof m.md === "string" ? m.md.length : -1, hadRestore: !!stash } });
       if (typeof m.text === "string" && m.text) warnToast(m.text);
       if (stash && m.id === activeId) {
         const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
@@ -14413,7 +14413,8 @@ setupSettings();
         const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
         const before = ta ? ta.value : "";
         restoreToComposer(qmd);
-        pendingCancelRestores.set(activeId + " " + qmd, { before, after: ta ? ta.value : "" });
+        // a provisional ✕ gets no cancelResult (nothing was posted) — no stash to consume, none kept
+        if (!provisional) pendingCancelRestores.set(activeId + " " + qmd, { before, after: ta ? ta.value : "" });
       }
       // Optimistic; the next push rebuilds the queue without it. The GROUP is reflowed in the same breath —
       // the bubble alone leaves its "1 queued message" header behind, still counting what just went.

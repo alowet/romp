@@ -24,8 +24,9 @@ test("a ✕ on a provisional-tab bubble forgets the send from provisionalQueue a
   assert.match(qx, /const provisional = isProvisionalId\(sidQ\);/);
   assert.match(qx, /if \(provisional && qmd\) forgetProvisionalSend\(qmd\);/, "the text must not come back through adoption");
   assert.match(qx, /if \(!provisional\) vscodeApi\.postMessage\(msg\);/, "nothing at the kernel to cancel for a session that does not exist yet");
-  // the restore to the composer stays — the message never left the client
+  // the restore to the composer stays — the message never left the client; no cancelResult will come, so no stash is kept
   assert.match(qx, /restoreToComposer\(qmd\);/);
+  assert.match(qx, /if \(!provisional\) pendingCancelRestores\.set\(activeId \+ " " \+ qmd,/);
   // adoption re-sends only what remains in the queue (unchanged: it reads provisionalQueue via dropProvisional)
   assert.match(RENDER, /for \(const text of queued\) \{\s*\n\s*vscodeApi\?\.postMessage\(\{ type: "sendMessage", id: realId, text \}\);\s*\n\s*registerOptimistic\(realId, text\);/);
 });
@@ -42,8 +43,9 @@ test("every cancel that misses leaves evidence: a client-diag row and a kernel l
   // client: cancelResult ok:false → a clientDiag breadcrumb (surface chat, what cancel-miss), body length only — never the text
   const cr = RENDER.split('else if (m.type === "cancelResult" && typeof m.id === "string") {')[1].split("\n  }\n")[0];
   assert.match(cr, /vscodeApi\?\.postMessage\(\{ type: "clientDiag", surface: "chat", what: "cancel-miss",/);
-  assert.match(cr, /mdLen: typeof m\.md === "string" \? m\.md\.length : -1/);
-  assert.doesNotMatch(cr, /data: \{[^}]*\bmd: m\.md\b/, "the message body never rides a diag row");
+  assert.match(cr, /data: \{ sid: m\.id, mdLen: typeof m\.md === "string" \? m\.md\.length : -1, hadRestore: !!stash \} \}/,
+    "sid, body LENGTH, restore flag — never the body, and never the kernel's refusal sentence (it quotes a slash-led body's first token)");
+  assert.doesNotMatch(cr, /what: "cancel-miss",[\s\S]{0,300}?\bmd: m\.md\b|what: "cancel-miss",[\s\S]{0,300}?\btext: m\.text/, "no user content on a diag row");
   // client: a provisional-stage ✕ leaves its own breadcrumb, so the next report says which path it was
   const qx = RENDER.split("    qx: (el) => {")[1].split("\n    },\n")[0];
   assert.match(qx, /vscodeApi\.postMessage\(\{ type: "clientDiag", surface: "chat", what: "cancel-provisional",/);
