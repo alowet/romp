@@ -68,6 +68,21 @@ class ListDirShape(_Tree):
         self.assertNotIn("viewable", [k for e in r["entries"] if e["isDir"] for k in e if k == "viewable"],
                          "directories carry no viewable verdict — they are navigated, not viewed")
 
+    def test_viewable_is_size_aware_so_an_oversize_file_is_download_only_up_front(self):
+        # a PDF opens in its own browser tab (2026-09-06), decided before any request — a row the view route
+        # would 413 must therefore be marked download-only here, or the tab lands on the refusal. Sparse
+        # files: the caps are on st_size, no bytes are written.
+        for name, over in (("big.pdf", km._PREVIEW_MAX_BYTES + 1), ("huge.log", km._TEXT_MAX_BYTES + 1),
+                           ("paper.pdf", 4096), ("notes.log", 4096)):
+            with open(os.path.join(self.tmp, name), "wb") as f:
+                f.truncate(over)
+        v = {e["name"]: e.get("viewable") for e in km._list_dir(self.tmp)["entries"]}
+        self.assertFalse(v["big.pdf"], "over the media cap -> download only, like /file's 413")
+        self.assertFalse(v["huge.log"], "over the text cap -> download only")
+        self.assertTrue(v["paper.pdf"])
+        self.assertTrue(v["notes.log"])
+        self.assertTrue(v["app.py"])
+
     def test_hidden_entries_only_when_asked(self):
         self.assertNotIn(".env", self.names(km._list_dir(self.tmp)))
         self.assertIn(".env", self.names(km._list_dir(self.tmp, hidden=True)))

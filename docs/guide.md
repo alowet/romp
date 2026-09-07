@@ -54,6 +54,14 @@ beside it shows, and a link to a sibling document opens in the same viewer. Link
 on other sites open in a new tab, as before — and a ctrl- or ⌘-click still opens the file in
 a tab.
 
+**Opening a PDF.** A PDF the session mentions, or one you click in the file browser, opens
+inside the dashboard like an image: the chat's PDF card opens it full-view, a path or a
+file-browser row opens it in the file viewer. Cmd-click it instead (Ctrl on Windows and
+Linux), or middle-click, and it opens in a new browser tab in the browser's own viewer, the
+way a paper opens from OpenReview: full size, and it stays open beside the dashboard while
+you keep working. If the browser blocks that new tab, the PDF opens inside the dashboard
+instead; a PDF too large to show offers a download in its place.
+
 ### The feed
 
 The feed is Romp's task-management layer: a card for each task. Romp's

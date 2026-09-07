@@ -18,7 +18,7 @@
 // disk needs zero relay code. Staleness is the dirComplete protocol — a client-minted reqId echoed
 // back, replies dropped on mismatch, one in-flight ask with newest-value coalescing (the pacing is the
 // round-trip itself — an event, not a timer). File BYTES stay on HTTP /file via the existing viewer.
-import { openFileView, closeFileView } from "./file-view";
+import { closeFileView, openFileClick } from "./file-view";
 import { fileUrl } from "./preview";
 
 type DirEntry = {
@@ -159,7 +159,20 @@ export function openFileBrowse(path: string, sid?: string | null): void {
     list.addEventListener("click", (ev) => {
       const row = (ev.target as HTMLElement).closest("[data-act]") as HTMLElement | null;
       if (!row || !list.contains(row)) return;
-      onAct(row);
+      onAct(row, ev);
+    });
+    const fileRowOf = (ev: MouseEvent) => {
+      const row = (ev.target as HTMLElement).closest("[data-act]") as HTMLElement | null;
+      return row && list.contains(row) && row.dataset.act === "file" ? row : null;   // a FILE row only: a middle-click
+    };                                                                                // never navigates or downloads
+    list.addEventListener("mousedown", (ev) => {         // the middle PRESS on a file row: no autoscroll, which
+      if (ev.button === 1 && fileRowOf(ev)) ev.preventDefault();   // starts on the press and would swallow the auxclick
+    });
+    list.addEventListener("auxclick", (ev) => {          // a middle-click: a PDF row in a browser tab of its own
+      if (ev.button !== 1) return;                        // (`click` never fires for the middle button)
+      const row = fileRowOf(ev);
+      if (!row) return;
+      onAct(row, ev);
     });
     crumbs.addEventListener("click", (ev) => {
       const c = (ev.target as HTMLElement).closest("[data-path]") as HTMLElement | null;
@@ -208,7 +221,7 @@ export function openFileBrowse(path: string, sid?: string | null): void {
       }
       if (e.key === "Enter") {
         const active = box2.querySelector<HTMLElement>(".fb-row.active");
-        if (active) { e.preventDefault(); onAct(active); }
+        if (active) { e.preventDefault(); onAct(active, e); }   // Cmd/Ctrl+Enter on a PDF row: its own tab, like the click
       }
     };
     document.addEventListener("keydown", onKey);
@@ -222,10 +235,10 @@ export function openFileBrowse(path: string, sid?: string | null): void {
   ask(path);
 }
 
-function onAct(row: HTMLElement): void {
+function onAct(row: HTMLElement, ev?: MouseEvent | KeyboardEvent): void {
   const p = row.dataset.path || "";
   if (row.dataset.act === "dir") { ask(p); return; }
-  if (row.dataset.act === "file") { openFileView(p, curSid); return; }
+  if (row.dataset.act === "file") { openFileClick(ev, p, curSid); return; }   // a modified click on a PDF → its own tab
   if (row.dataset.act === "dl") startDownload(p);       // download-only rows download directly —
 }                                                       // a viewer that could only apologize helps nobody
 
@@ -362,7 +375,7 @@ function onListing(m: DirListing): void {
       if (dlOnly) row.classList.add("fb-dlonly");
       row.title = p + (en.isLink ? "  ·  symlink" : "")
         + "  ·  " + new Date(en.mtime * 1000).toLocaleString()
-        + (dlOnly ? "  ·  not viewable in the browser — click downloads it" : "");
+        + (dlOnly ? "  ·  opens as a download (not viewable in the browser, or too large to show)" : "");
       const sz = el("span", "fb-size");
       sz.textContent = (dlOnly ? "⤓ " : "") + human(en.size);
       row.appendChild(nm); row.appendChild(sz);
