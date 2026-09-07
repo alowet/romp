@@ -5448,6 +5448,24 @@ class ViewBuilder(unittest.TestCase):
         self.assertIn("real ask", p3); self.assertIn("mid", p3); self.assertIn("end", p3)
         self.assertEqual(r3, ["x", "y"])
 
+    def test_split_reminders_keeps_the_prompts_newlines(self):
+        # A message typed with Shift+Enter line breaks must keep them when a harness block rides along
+        # (the user 2026-09-06: the old " ".join(split()) flattened the whole prompt to one line). The
+        # CLI appends the block as its own text block; build_session joins blocks with a space.
+        p, r = km._split_reminders("line one\nline two <system-reminder>ctx</system-reminder>")
+        self.assertEqual(p, "line one\nline two"); self.assertEqual(r, ["ctx"])
+        # …and leads with it on a session's first prompt
+        p, r = km._split_reminders("<system-reminder>ctx</system-reminder> line one\n\nline three")
+        self.assertEqual(p, "line one\n\nline three"); self.assertEqual(r, ["ctx"])
+        # indentation inside the prompt (a pasted snippet) survives too
+        p, _ = km._split_reminders("see:\n    x = 1\n    y = 2 <task-notification>t</task-notification>")
+        self.assertEqual(p, "see:\n    x = 1\n    y = 2")
+        # the SEAM a block sat in collapses to what it held: a space, a newline, or a paragraph break
+        self.assertEqual(km._split_reminders("a <system-reminder>x</system-reminder> b")[0], "a b")
+        self.assertEqual(km._split_reminders("a\n<system-reminder>x</system-reminder>\nb")[0], "a\nb")
+        self.assertEqual(km._split_reminders("a\n\n<system-reminder>x</system-reminder>\n\nb")[0], "a\n\nb")
+        self.assertEqual(km._split_reminders("a<system-reminder>x</system-reminder>b")[0], "ab")
+
     def test_img_hydration_and_dropped_file_host_handlers(self):
         # ported host handlers (the user 2026-06-16): a path-image hydrates to a data: URL, and a
         # dropped file's bytes are saved under the state dir's drops/ for the prompt to reference.
