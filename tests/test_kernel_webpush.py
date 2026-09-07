@@ -124,16 +124,163 @@ class ServiceWorkerRoute(unittest.TestCase):
         self.assertIn("clients.claim()", js)
 
     def test_sw_click_lands_on_the_session_that_fired(self):
-        # the user 2026-08-08: the first real push opened the app on a DIFFERENT session. The sid
-        # rides the notification's data; a live window gets it over postMessage, a cold start gets
-        # it in the URL for the shell's POST /reveal.
+        # the user 2026-08-08: the first real push opened the app on a DIFFERENT session. The
+        # kernel's routing block rides the notification's data; a live window gets it over
+        # postMessage, a cold start gets the kernel's deep link (ServiceWorkerExecutes runs it).
         _, body = _serve_get("/sw.js", headers={"X-Romp-Token": km.TOKEN})
         js = body.decode()
-        self.assertIn("data:{sid:", js)
-        self.assertIn("pushReveal", js)
-        self.assertIn("/?push-reveal=", js)
+        self.assertIn("data:(d.data&&typeof d.data==='object')?d.data:{sid:d.sid||''}", js,
+                      "the routing block verbatim; an older kernel's flat sid still lands")
+        self.assertIn("opts.tag=d.tag;opts.renotify=true", js, "one notification per session, still audible")
+        self.assertIn("romp:'notificationClick'", js)
+        self.assertIn("clients.openWindow(url)", js)
+        self.assertIn("/?push-reveal=", js)              # the fallback deep link for a data block without one
+        self.assertNotIn("setTimeout", js)                # event-based end to end — no timers in the worker
         # ...and the closed-app badge count comes from the payload
         self.assertIn("setAppBadge", js)
+
+
+# The worker, EXECUTED (the test_error_center.py pattern): node runs _SW_JS against stubs of the
+# ServiceWorker globals and the driver replays a push and four taps, logging every call in order.
+# A source pin says the words are there; this says the sequence is right: close → matchAll →
+# focus + postMessage, openWindow only when no window exists or focus() refused, all under waitUntil.
+_SW_HARNESS = r"""
+'use strict';
+const H = {};            // event name -> the worker's handler
+const LOG = [];          // every call the worker makes, in order
+global.self = {
+  addEventListener: (k, f) => { H[k] = f; },
+  skipWaiting: () => {},
+  registration: { showNotification: (title, opts) => { LOG.push(['show', title, opts]); return Promise.resolve(); } },
+  navigator: {},         // no setAppBadge here: the numeric-only badge rule has its own pin
+};
+global.clients = {
+  claim: () => Promise.resolve(),
+  matchAll: (q) => { LOG.push(['matchAll', q]); return Promise.resolve([]); },
+  openWindow: (u) => { LOG.push(['openWindow', u]); return Promise.resolve({}); },
+};
+"""
+_SW_DRIVER = r"""
+function win(focusOk) {
+  const w = { frameType: 'top-level',
+              focus: () => { LOG.push(['focus']); return focusOk ? Promise.resolve(w) : Promise.reject(new Error('refused')); },
+              postMessage: (m) => LOG.push(['post', m]) };
+  return w;
+}
+// a TAGGED client, for the dashboard's shape: the shell (top-level) plus its same-origin pane iframes,
+// which the browser lists as window clients too (frameType 'nested'), most-recently-focused first
+function frame(tag, frameType) {
+  const w = { frameType,
+              focus: () => { LOG.push(['focus', tag]); return Promise.resolve(w); },
+              postMessage: (m) => LOG.push(['post', tag, m]) };
+  return w;
+}
+async function tap(data, windows) {
+  LOG.length = 0;
+  const waited = [];
+  global.clients.matchAll = (q) => { LOG.push(['matchAll', q]); return Promise.resolve(windows); };
+  H.notificationclick({ notification: { close: () => LOG.push(['close']), data }, waitUntil: (p) => waited.push(p) });
+  for (const p of waited) await p;
+  return { log: LOG.slice(), waited: waited.length };
+}
+(async () => {
+  const out = {};
+  const data = { sid: 'S1', host: '', kind: 'card', cardId: 'S1:g1', url: '/?push-reveal=S1&push-card=S1%3Ag1' };
+  H.push({ data: { json: () => ({ title: 'romp: web', body: 'Needs you: x', sid: 'S1', tag: 'romp:S1', badge: 2, data }) },
+           waitUntil: () => { out.pushWaited = true; } });
+  out.push = LOG.slice();
+  LOG.length = 0;
+  H.push({ data: { json: () => ({ title: 't', body: 'b', sid: 'S9' }) }, waitUntil: () => {} });   // an older kernel's flat payload
+  out.pushLegacy = LOG.slice();
+  out.live = await tap(data, [win(true)]);
+  out.cold = await tap(data, []);
+  out.refused = await tap(data, [win(false)]);
+  out.test = await tap({ sid: '', host: '', kind: 'test', cardId: '', url: '/' }, []);
+  const testSid = { sid: 'S5', host: '', kind: 'test', cardId: '', url: '/?push-reveal=S5' };   // a test addressed to the session in front (2026-09-06)
+  out.testLive = await tap(testSid, [win(true)]);
+  out.testCold = await tap(testSid, []);
+  out.legacyTap = await tap({ sid: 'S7' }, []);            // a notification an older worker showed: flat sid, no url
+  // the phone (2026-09-06): the user last tapped INSIDE the chat pane (the mobile session picker), so the
+  // chat iframe is the most recently focused client — ahead of the shell that carries the reveal listener
+  const fed = { sid: 'boxa:S8', host: 'boxa', kind: 'test', cardId: '', url: '/?push-reveal=boxa%3AS8' };
+  out.nested = await tap(fed, [frame('chat', 'nested'), frame('feed', 'nested'), frame('shell', 'top-level')]);
+  out.nestedOnly = await tap(fed, [frame('chat', 'nested')]);   // a pane with no shell above it: nothing to post to
+  out.untyped = await tap(fed, [frame('old', undefined)]);       // a browser that reports no frameType is a window
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+class ServiceWorkerExecutes(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import subprocess, tempfile as _tf
+        with _tf.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(_SW_HARNESS + km._SW_JS + _SW_DRIVER)
+            path = f.name
+        try:
+            r = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
+        finally:
+            os.unlink(path)
+        assert r.returncode == 0, "the worker threw: " + r.stderr[:800]
+        cls.out = json.loads(r.stdout.strip().splitlines()[-1])
+
+    MATCH = ["matchAll", {"type": "window", "includeUncontrolled": True}]
+    MSG = {"romp": "notificationClick", "sid": "S1", "host": "", "kind": "card", "cardId": "S1:g1"}
+    URL = "/?push-reveal=S1&push-card=S1%3Ag1"
+
+    def test_push_shows_the_gist_and_keeps_the_routing_block_verbatim(self):
+        show = self.out["push"][0]
+        self.assertEqual(show[:2], ["show", "romp: web"])
+        opts = show[2]
+        self.assertEqual(opts["body"], "Needs you: x")
+        self.assertEqual(opts["data"], {"sid": "S1", "host": "", "kind": "card", "cardId": "S1:g1", "url": self.URL})
+        self.assertEqual((opts["tag"], opts["renotify"]), ("romp:S1", True), "same session → replaces, still buzzes")
+        self.assertTrue(self.out["pushWaited"])
+        # an older kernel's flat payload still lands on its sid, and wears no tag it did not send
+        legacy = self.out["pushLegacy"][0][2]
+        self.assertEqual(legacy["data"], {"sid": "S9"})
+        self.assertNotIn("tag", legacy)
+
+    def test_a_live_window_is_focused_and_told_never_reopened(self):
+        live = self.out["live"]
+        self.assertEqual(live["waited"], 1, "the whole tap rides one waitUntil")
+        self.assertEqual(live["log"], [["close"], self.MATCH, ["focus"], ["post", self.MSG]])
+
+    def test_no_window_opens_the_deep_link(self):
+        self.assertEqual(self.out["cold"]["log"], [["close"], self.MATCH, ["openWindow", self.URL]])
+        self.assertEqual(self.out["cold"]["waited"], 1)
+
+    def test_a_refused_focus_falls_through_to_open_window(self):
+        # the installed-app case: focus() rejects — the tap must still land somewhere
+        self.assertEqual(self.out["refused"]["log"], [["close"], self.MATCH, ["focus"], ["openWindow", self.URL]])
+
+    def test_a_test_notification_just_opens_romp(self):
+        # …when it carries no session: the button was pressed with no session in front
+        self.assertEqual(self.out["test"]["log"], [["close"], self.MATCH, ["openWindow", "/"]])
+
+    def test_a_test_addressed_to_a_session_lands_on_it_like_a_turn(self):
+        # the user 2026-09-06: the test carries the session the button was pressed on. The worker
+        # does not branch on kind — the same focus + routing block live, the same deep link cold
+        msg = {"romp": "notificationClick", "sid": "S5", "host": "", "kind": "test", "cardId": ""}
+        self.assertEqual(self.out["testLive"]["log"], [["close"], self.MATCH, ["focus"], ["post", msg]])
+        self.assertEqual(self.out["testCold"]["log"], [["close"], self.MATCH, ["openWindow", "/?push-reveal=S5"]])
+
+    def test_a_notification_from_the_previous_worker_still_lands(self):
+        self.assertEqual(self.out["legacyTap"]["log"][-1], ["openWindow", "/?push-reveal=S7"])
+
+    def test_the_tap_is_posted_to_the_shell_never_into_a_pane_iframe(self):
+        # the user 2026-09-06, on the phone: the tap did nothing. matchAll lists the dashboard's
+        # same-origin pane iframes as window clients too, most-recently-focused first — and the
+        # chat pane the user had just switched sessions in was first. Only the top-level shell
+        # listens for the worker's message; posting into the pane dropped the tap on the floor.
+        msg = {"romp": "notificationClick", "sid": "boxa:S8", "host": "boxa", "kind": "test", "cardId": ""}
+        self.assertEqual(self.out["nested"]["log"],
+                         [["close"], self.MATCH, ["focus", "shell"], ["post", "shell", msg]])
+        # no top-level client at all → the deep link, exactly as with no window
+        self.assertEqual(self.out["nestedOnly"]["log"], [["close"], self.MATCH, ["openWindow", "/?push-reveal=boxa%3AS8"]])
+        # a client that reports no frameType is treated as a window, never dropped
+        self.assertEqual(self.out["untyped"]["log"][-1], ["post", "old", msg])
 
 
 @unittest.skipUnless(HAVE_CRYPTO, "python 'cryptography' not installed")
@@ -313,7 +460,7 @@ class PushSink(unittest.TestCase):
         import inspect
         src = inspect.getsource(km._cached_feed)
         self.assertIn("_system_notify(_t, _b)", src)
-        self.assertIn("_push_notify(_t, _b, _sid, _badge)", src)
+        self.assertIn('_push_notify(_t, _b, _sid, _badge, kind="card", card_id=_iid)', src)
         self.assertIn("_badge_push(_badge)", src)
 
     def test_no_subscriptions_means_no_work(self):
@@ -351,11 +498,49 @@ class PushSink(unittest.TestCase):
         self.assertEqual(set(km._push_subs()), {"https://push.example.net/send/live"},
                          "404/410 prunes; success stays")
         body = json.loads(list(seen.values())[0].decode())
-        # the plan's privacy note, pinned: the payload is the card's gist (title + body) plus two
-        # pieces of ROUTING metadata — the sid the tap should land on and the badge count — and
-        # nothing more (no brief, no transcript), even though the content is E2E-encrypted
-        self.assertEqual(set(body), {"title", "body", "sid", "badge"})
+        # the plan's privacy note, pinned: the payload is the card's gist (title + body) plus
+        # ROUTING metadata — where the tap lands (sid, the data block), how it stacks (tag) and the
+        # badge count — and nothing more (no brief, no transcript), even though the content is
+        # E2E-encrypted. Every routing value is an id or a fixed word, never text.
+        self.assertEqual(set(body), {"title", "body", "sid", "badge", "tag", "data"})
         self.assertEqual((body["title"], body["sid"], body["badge"]), ("romp: web", "SID-web", 3))
+        self.assertEqual(set(body["data"]), {"sid", "host", "kind", "cardId", "url"})
+
+
+class PushPayloadShape(unittest.TestCase):
+    """_push_payload: the ONE builder every push kind goes through (the user 2026-09-06, who wants
+    a tap to focus the romp already open and land on the session — and card — that buzzed)."""
+
+    def test_a_card_push_carries_the_card_and_a_deep_link_the_shell_parses(self):
+        d = km._push_payload("romp: web", "Needs you: pick one", "SID-web", 2, kind="card",
+                             card_id="SID-web:g3")
+        self.assertEqual(d["data"], {"sid": "SID-web", "host": "", "kind": "card", "cardId": "SID-web:g3",
+                                     "url": "/?push-reveal=SID-web&push-card=SID-web%3Ag3"})
+        self.assertEqual(d["tag"], "romp:SID-web", "one notification per session")
+        self.assertEqual(d["sid"], "SID-web", "…and flat, for a worker of the previous build")
+        self.assertEqual(d["badge"], 2)
+
+    def test_a_turn_push_names_its_kind_and_carries_no_card(self):
+        d = km._push_payload("web", "finished a turn", "SID-web", kind="turn")
+        self.assertEqual((d["data"]["kind"], d["data"]["cardId"], d["data"]["url"]),
+                         ("turn", "", "/?push-reveal=SID-web"))
+        self.assertNotIn("badge", d, "None omits the key — the worker leaves the count alone")
+
+    def test_a_test_push_has_no_session_and_lands_on_romp_itself(self):
+        # the popover's probe (PR #937's _push_test builds its payload here once it lands): kind
+        # "test", no sid, so the tap can only ever focus or open romp — and every test collapses
+        # into one notification rather than stacking on the lock screen
+        d = km._push_payload("romp", "Test notification", kind="test")
+        self.assertEqual(d["data"], {"sid": "", "host": "", "kind": "test", "cardId": "", "url": "/"})
+        self.assertEqual(d["tag"], "romp:test")
+
+    def test_a_relayed_push_keeps_the_origin_in_sid_and_host(self):
+        # a federated event's sid already wears its host prefix (the merged dashboard's own tab
+        # address); host is the courtesy copy, from the relay's origin or read off the prefix
+        d = km._push_payload("romp: boxa:web", "b", "boxa:11111111-2222", host="boxa", card_id="11111111-2222:g1")
+        self.assertEqual((d["data"]["sid"], d["data"]["host"]), ("boxa:11111111-2222", "boxa"))
+        self.assertEqual(d["data"]["url"], "/?push-reveal=boxa%3A11111111-2222&push-card=11111111-2222%3Ag1")
+        self.assertEqual(km._push_payload("t", "b", "boxb:S")["data"]["host"], "boxb")
 
     def test_missing_crypto_with_subscriptions_says_so(self):
         km._save_push_subs({"https://push.example.net/send/x": {
@@ -442,6 +627,55 @@ class RevealAiming(unittest.TestCase):
             km._consume_pending_reveal(c)
         self.assertEqual(got[0]["id"], "S")
 
+    def test_a_booting_page_parks_past_the_previous_pages_socket(self):
+        # the deep-link arrival (2026-09-06, the phone): the page is BOOTING, so its own chat pane
+        # cannot be connected yet — a same-wid chat socket the kernel still holds is the PREVIOUS
+        # page's (sessionStorage keeps the wid across a reload; a suspended phone never sent its
+        # close, and the ping timeout has up to WS_DEAD_S to notice). "Delivering" there parked
+        # nothing, and the new pane's ready found nothing to consume.
+        twin, twin_got = self._register("chat", "W-phone")
+        with mock.patch.object(km, "_tmux_sessions", return_value={"S": {}}):
+            self.assertFalse(km._reveal_request("S", "W-phone", boot=True))
+            self.assertEqual(twin_got, [], "a booting page's tap is never aimed at a socket that predates it")
+            self.assertEqual(km._PENDING_REVEAL[0], {"sid": "S", "wid": "W-phone"})
+            fresh, fresh_got = _fake_ws_client("chat", "W-phone")
+            km._consume_pending_reveal(fresh)
+        self.assertEqual(fresh_got, [{"type": "focus", "id": "S", "live": True}])
+        self.assertIsNone(km._PENDING_REVEAL[0])
+
+    def test_a_live_tap_to_an_unproven_socket_keeps_a_copy_until_the_pong_or_the_redial(self):
+        # the live half of the same hole: the pane's socket has a ping on the wire nobody has
+        # answered yet (pingAt set — the peer is unproven since the last heartbeat). The focus goes
+        # out as before, AND stays parked: the pong that proves the socket alive retires the copy
+        # (the frame is ordered behind the ping it answers); a dead socket never pongs, the pane
+        # redials, and its ready consumes the copy instead of finding nothing.
+        c, got = self._register("chat", "W1")
+        c["pingAt"] = 100.0
+        with mock.patch.object(km, "_tmux_sessions", return_value={"S": {}}):
+            self.assertTrue(km._reveal_request("S", "W1"))
+        self.assertEqual(got, [{"type": "focus", "id": "S", "live": True}], "still delivered at once")
+        self.assertEqual((km._PENDING_REVEAL[0] or {}).get("sid"), "S", "…and kept until the socket proves itself")
+        # another window's pane pongs: not this tap's socket, the copy stays
+        other, _ = self._register("chat", "W2")
+        other["pingAt"] = 100.0
+        km._note_ws_inbound(other, now=101.0)
+        self.assertIsNotNone(km._PENDING_REVEAL[0])
+        # the delivered-to socket pongs → proven → the copy is retired, and a later ready replays nothing
+        km._note_ws_inbound(c, now=101.0)
+        self.assertIsNone(km._PENDING_REVEAL[0])
+        c["pingAt"] = None
+        with mock.patch.object(km, "_tmux_sessions", return_value={"S": {}}):
+            self.assertTrue(km._reveal_request("S", "W1"))
+        self.assertIsNone(km._PENDING_REVEAL[0], "a socket with no ping outstanding is proven — nothing parked")
+        # the dead case: never pongs; the pane's redial says ready and takes the copy
+        c["pingAt"] = 100.0
+        with mock.patch.object(km, "_tmux_sessions", return_value={"S": {}}):
+            km._reveal_request("S", "W1")
+            fresh, fresh_got = _fake_ws_client("chat", "W1")
+            km._consume_pending_reveal(fresh)
+        self.assertEqual(fresh_got, [{"type": "focus", "id": "S", "live": True}])
+        self.assertIsNone(km._PENDING_REVEAL[0])
+
 
 class RevealRoute(unittest.TestCase):
     """POST /reveal over the real handler (the ServeSecurity pattern)."""
@@ -486,6 +720,22 @@ class RevealRoute(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertIsNone(km._PENDING_REVEAL[0])
 
+    def test_a_boot_flagged_reveal_parks_even_past_a_connected_same_wid_pane(self):
+        # the deep-link arrival says it is booting; the kernel parks for the pane that is about to
+        # connect and never counts the previous page's socket as delivery (RevealAiming has the why)
+        twin, twin_got = _fake_ws_client("chat", "W-x")
+        with km._clients_lock:
+            km._clients.append(twin)
+        try:
+            code, body = self._post("/reveal", {"sid": "SID-x", "wid": "W-x", "boot": True})
+        finally:
+            with km._clients_lock:
+                km._clients.remove(twin)
+        self.assertEqual(code, 200)
+        self.assertFalse(json.loads(body)["delivered"])
+        self.assertEqual(twin_got, [])
+        self.assertEqual(km._PENDING_REVEAL[0], {"sid": "SID-x", "wid": "W-x"})
+
 
 class Badge(unittest.TestCase):
     """Proposal 3: the app icon wears the needs-you count."""
@@ -515,10 +765,17 @@ class Badge(unittest.TestCase):
 class LandingRevealPins(unittest.TestCase):
     def test_shell_carries_both_halves_of_the_tap(self):
         html = km._landing()
-        self.assertIn("pushReveal", html)          # live window: SW message → focus into the chat iframe
-        self.assertIn("push-reveal", html)         # cold start: URL param → POST /reveal {sid, wid}
-        self.assertIn("'/reveal'", html)
-        self.assertIn("romp:wid", html)            # aimed by the shell's own per-window id
+        self.assertIn("m.romp==='notificationClick'", html)   # live window: the SW's message
+        self.assertIn("searchParams.get('push-reveal')", html)  # cold start: the deep link's params…
+        self.assertIn("searchParams.get('push-card')", html)
+        self.assertIn("searchParams['delete']('push-reveal')", html)   # …stripped once read
+        self.assertIn("history.replaceState", html)
+        self.assertIn("fetch('/reveal'", html)     # ONE activation path: the kernel aims the focus…
+        self.assertIn("romp:wid", html)            # …at the shell's own per-window id
+        self.assertIn("romp:'revealCard'", html)   # a card kind also scrolls the feed to the card…
+        self.assertIn("m.romp==='ready'&&m.app==='feed'", html)   # …once the feed has its cards
+        self.assertNotIn("type:'focus',id:sid", html, "no focus posted straight into the chat iframe any more")
+        self.assertNotIn("setTimeout", km._LANDING_REVEAL_JS, "event-based: the feed's ready, never a timer")
 
     def test_shell_ws_trues_up_the_badge(self):
         html = km._landing()
@@ -527,10 +784,115 @@ class LandingRevealPins(unittest.TestCase):
         self.assertIn("clearAppBadge", html)       # zero clears, never leaves a stale number
 
 
+# The shell's reveal script, EXECUTED (the test_error_center.py pattern): node runs
+# _LANDING_REVEAL_JS against stubs of the few browser globals it touches, booting on a deep link
+# and then replaying the worker's messages. Pins the routing, not the words: /reveal is asked
+# with the shell's wid, the URL is stripped, the card waits for the FEED's ready (not the
+# timeline's), a turn kind reveals no card, a test addressed to a session reveals it the same way,
+# a sid-less tap does nothing, a refused /reveal is loud.
+_REVEAL_HARNESS = r"""
+'use strict';
+const FETCHES = [], POSTED = [], NOTES = [], REPLACED = [], WIN = [], SW = [];
+let fetchOk = true;
+const feedWin = { postMessage: (m) => POSTED.push(m) };
+global.window = global;
+global.document = { getElementById: (id) => (id === 'f-feed' ? { contentWindow: feedWin } : null) };
+global.sessionStorage = { getItem: (k) => (k === 'romp:wid' ? 'W-test' : null) };
+global.addEventListener = (k, f) => { if (k === 'message') WIN.push(f); };
+Object.defineProperty(global, 'navigator', { configurable: true,   // a getter-only global in node 22
+  value: { serviceWorker: { addEventListener: (k, f) => { if (k === 'message') SW.push(f); } } } });
+global.history = { replaceState: (s, t, u) => REPLACED.push(u) };
+global.location = { href: 'http://localhost:7777/?push-reveal=S1&push-card=S1%3Ag1&keep=1#frag' };
+global.fetch = (path, init) => { FETCHES.push([path, JSON.parse(init.body)]);
+  return Promise.resolve(fetchOk ? { ok: true } : { ok: false, status: 400, text: () => Promise.resolve('missing sid') }); };
+global.__rompNotify = (kind, text) => NOTES.push([kind, text]);
+"""
+_REVEAL_DRIVER = r"""
+const tick = () => new Promise((r) => setTimeout(r, 0));
+const swMsg = (m) => SW.forEach((f) => f({ data: m }));
+const winMsg = (m) => WIN.forEach((f) => f({ data: m }));
+(async () => {
+  const out = { boot: { fetches: FETCHES.slice(), replaced: REPLACED.slice(), postedBeforeReady: POSTED.length } };
+  winMsg({ romp: 'ready' });                              // the timeline's ready: not the feed's
+  out.boot.postedAfterTimelineReady = POSTED.length;
+  winMsg({ romp: 'ready', app: 'feed' });
+  out.boot.postedAfterFeedReady = POSTED.slice();
+  FETCHES.length = 0; POSTED.length = 0;
+  swMsg({ romp: 'notificationClick', sid: 'S2', host: '', kind: 'card', cardId: 'S2:g4' });
+  out.live = { fetches: FETCHES.slice(), posted: POSTED.slice() };
+  FETCHES.length = 0; POSTED.length = 0;
+  swMsg({ romp: 'notificationClick', sid: 'S3', host: '', kind: 'turn', cardId: '' });
+  out.turn = { fetches: FETCHES.slice(), posted: POSTED.slice() };
+  FETCHES.length = 0; POSTED.length = 0;
+  swMsg({ romp: 'notificationClick', sid: '', host: '', kind: 'test', cardId: '' });
+  out.test = { fetches: FETCHES.slice(), posted: POSTED.slice() };
+  FETCHES.length = 0; POSTED.length = 0;
+  swMsg({ romp: 'notificationClick', sid: 'S5', host: '', kind: 'test', cardId: '' });   // a test addressed to the session in front (2026-09-06)
+  out.testSid = { fetches: FETCHES.slice(), posted: POSTED.slice() };
+  fetchOk = false; FETCHES.length = 0;
+  swMsg({ romp: 'notificationClick', sid: 'S-bad', kind: 'turn' });
+  await tick(); await tick();
+  out.refused = { notes: NOTES.slice() };
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+class LandingRevealExecutes(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import subprocess, tempfile as _tf
+        with _tf.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(_REVEAL_HARNESS + km._LANDING_REVEAL_JS + _REVEAL_DRIVER)
+            path = f.name
+        try:
+            r = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
+        finally:
+            os.unlink(path)
+        assert r.returncode == 0, "the reveal script threw: " + r.stderr[:800]
+        cls.out = json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_a_cold_start_asks_the_kernel_at_once_and_strips_the_link(self):
+        b = self.out["boot"]
+        # boot:true — this page is booting, so its own chat pane is not connected yet; the kernel
+        # parks for it rather than aiming at a same-wid socket the previous page left behind
+        self.assertEqual(b["fetches"], [["/reveal", {"sid": "S1", "wid": "W-test", "boot": True}]])
+        self.assertEqual(b["replaced"], ["/?keep=1#frag"], "only OUR params go; a reload must not replay the jump")
+
+    def test_the_card_waits_for_the_feeds_own_ready(self):
+        b = self.out["boot"]
+        self.assertEqual(b["postedBeforeReady"], 0, "no listener yet, nothing to scroll to")
+        self.assertEqual(b["postedAfterTimelineReady"], 0, "another pane's ready is not the feed's")
+        self.assertEqual(b["postedAfterFeedReady"], [{"romp": "revealCard", "itemId": "S1:g1", "sid": "S1"}])
+
+    def test_a_live_tap_routes_the_same_way(self):
+        live = self.out["live"]
+        self.assertEqual(live["fetches"], [["/reveal", {"sid": "S2", "wid": "W-test"}]])
+        self.assertEqual(live["posted"], [{"romp": "revealCard", "itemId": "S2:g4", "sid": "S2"}])
+
+    def test_a_turn_focuses_without_a_card_and_a_sidless_test_lands_nowhere(self):
+        self.assertEqual(len(self.out["turn"]["fetches"]), 1)
+        self.assertEqual(self.out["turn"]["posted"], [])
+        self.assertEqual(self.out["test"], {"fetches": [], "posted": []})
+
+    def test_a_test_addressed_to_a_session_reveals_it_like_a_turn(self):
+        # the user 2026-09-06: ANY sid lands, whatever the kind; only a card adds the card scroll
+        self.assertEqual(self.out["testSid"], {"fetches": [["/reveal", {"sid": "S5", "wid": "W-test"}]], "posted": []})
+
+    def test_a_refused_reveal_is_loud(self):
+        self.assertEqual(self.out["refused"]["notes"],
+                         [["error", "Could not open the session this notification was about: missing sid"]])
+
+
+
 class RailBell(unittest.TestCase):
-    """The desktop rail carries the same bell as the mobile tab bar (the user 2026-08-08), and the
-    pair is the MASTER notification switch (the user 2026-08-09): on = every task notifies unless
-    its own bell mutes it, with the device push subscription a best-effort leg on top."""
+    """The desktop rail carries the same bell as the mobile tab bar (the user 2026-08-08). Since
+    2026-09-05 the pair OPENS THE POPOVER (tests/test_kernel_notify_popover.py) whose rows are the
+    switches: the kernel-wide master (the user 2026-08-09's model: on = every task notifies unless
+    its own bell mutes it), labelled "Notifications", and nested under it this device's push
+    subscription — pulled apart so a phone turning itself off no longer silences every device, and
+    nested so the master reads as the master, not as a scope beside "This device" (the user
+    2026-09-05)."""
 
     def test_shell_serves_both_bells_and_one_flow_drives_them(self):
         status, body = _serve_get("/", headers={"X-Romp-Token": km.TOKEN})
@@ -555,22 +917,31 @@ class RailBell(unittest.TestCase):
         self.assertIn(".bell-slash{display:none}", page)
         self.assertIn("#rail-bell:not(.on) .bell-slash,#mbell:not(.on) .bell-slash{display:block}", page)
 
-    def test_the_bell_is_the_master_switch_not_a_device_toggle(self):
+    def test_the_bell_opens_the_popover_whose_rows_are_the_switches(self):
+        # (2026-09-05: was "the bell is the master switch, not a device toggle" — the tap now opens
+        # the popover; the Notifications row is the master and This-device, nested under it, is the
+        # subscription. The pin moved from "All devices" the same day: that label read as a scope
+        # choice, not the switch the rest sit under)
         _, body = _serve_get("/", headers={"X-Romp-Token": km.TOKEN})
         page = body.decode()
-        # kernel-authoritative paint: state comes from GET /notify-all at boot and the shell WS
-        # push on every toggle — never from this device's push subscription
+        # kernel-authoritative paint of the master: GET /notify-all at boot and the shell WS push
+        # on every toggle, so every dashboard's row agrees
         self.assertIn("fetch('/notify-all')", page)
         self.assertIn("window.__rompNotifyAllPaint", page)
         self.assertIn("m.type==='notifyAll'", page, "the shell WS repaints every open dashboard")
         self.assertIn("post('/notify-all',{on:want})", page)
+        self.assertIn("id=rbell-pop", page)
+        self.assertIn("data-act=all", page)
+        self.assertIn("data-act=dev", page)
         # the bell shows everywhere — the master matters even where the Push API is missing (the
-        # kernel box still gets osascript, other devices still buzz); only the subscribe leg gates
+        # kernel box still gets osascript, other devices still buzz); only the device row gates
         self.assertNotIn("('Notification' in window))return", page,
                          "the old whole-bell capability bail is gone")
         self.assertIn("var canPush=", page)
         # the permission ask still runs in the tap's own stack (iOS voids the gesture across awaits)
         self.assertIn("Notification.requestPermission():null", page)
+        # the glyph is THIS device's truth now: master AND subscribed (tests/test_kernel_notify_popover.py)
+        self.assertIn("var lit=isOn&&(canPush?devOn:true)", page)
 
 
 class MasterBellRoute(unittest.TestCase):

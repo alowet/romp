@@ -254,6 +254,7 @@ const pendingMoveKind = new Map<string, MoveKind>();
 // trail instead of unreproducible archaeology. Ids only, no card text.
 const shownCol = new Map<string, string>();            // itemId → column as last RENDERED (post-prediction)
 let lastFeedEvent = "init";                            // the input change the next render reflects
+let feedAnnounced = false;                             // {romp:'ready'} posted to the shell once, on the first payload's render
 let lastPayloadBuildId = 0;
 function auditShownColumns(list: AskItem[]) {
   const seen = new Set<string>();
@@ -5170,6 +5171,13 @@ function applyFeedPayload(m: any): void {
   if (typeof m.showDismissed === "boolean") showDismissed = m.showDismissed;
   if (typeof m.canUndoClear === "boolean") canUndoClear = m.canUndoClear;
   render();
+  if (!feedAnnounced) {
+    feedAnnounced = true;
+    // First content is on screen → tell the shell, the way the timeline does: the boot splash's cue, and the
+    // exact event a notification tap's card reveal waits for — the shell holds its {romp:'revealCard'} until
+    // the feed has cards to scroll to (kernel.py _LANDING_REVEAL_JS). Standalone page: no parent, nothing to say.
+    try { if (window.parent && window.parent !== window) window.parent.postMessage({ romp: "ready", app: "feed" }, "*"); } catch { /* no shell */ }
+  }
 }
 
 
@@ -5179,9 +5187,12 @@ window.addEventListener("message", (e: MessageEvent) => {
   if (m.type === "pipeState") { pipeBanner(!!m.up, Number(m.queued) || 0); return; }
   if (m.romp === "paneFocus") { kbEnterCards(); return; }   // the shell handed us keyboard focus → arm card nav
   if (m.romp === "revealCard") {
-    // a bell-entry click jumps back to the card it was minted from (the user 2026-07-28): scroll it
-    // into view and pulse it accent so the eye lands on the right card. A card that no longer exists
-    // under its own key (cleared, or folded into a group) falls back to opening the session.
+    // a bell-entry click (the user 2026-07-28) or a notification tap (2026-09-06) jumps to the card it was
+    // minted from: scroll it into view and pulse it accent so the eye lands on the right card. A card in a
+    // FOLDED thread has no element yet — unfold first (the same rule revealCards follows: the navigation wins
+    // over the disclosure). A card that no longer exists under its own key (cleared, or folded into a group)
+    // falls back to opening the session.
+    unfoldThreadsFor(new Set(["a:" + String(m.itemId || "")]));
     const target = document.querySelector(`[data-key="a:${String(m.itemId || "")}"]`) as HTMLElement | null;
     if (target) {
       target.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -5426,20 +5437,23 @@ function applyExtHover() {
 // exactly the cards a hover would have outlined. The class is removed and re-added across a forced
 // reflow, or a second click on the same card would re-add a class it already has and CSS would replay
 // nothing — the "clicked again and it didn't flash" bug this shape avoids.
-function revealCards(keys: Set<string>) {
-  // A target inside a FOLDED thread has no element to scroll to, and a jump that lands on nothing is the
-  // silent no-op a collapse must never cause (the user 2026-07-31). Unfold the owning thread(s) and render
-  // before looking: the navigation wins over the disclosure, and the thread stays open afterwards so you
-  // can see where you were taken.
-  if (collapsedThreads.size) {
-    let opened = false;
-    for (const a of asks) {
-      if (collapsedThreads.has(a.sid) && extHoverMatches("a:" + a.itemId, keys)) {
-        collapsedThreads.delete(a.sid); opened = true;
-      }
+// A target inside a FOLDED thread has no element to scroll to, and a jump that lands on nothing is the
+// silent no-op a collapse must never cause (the user 2026-07-31). Unfold the owning thread(s) and render
+// before looking: the navigation wins over the disclosure, and the thread stays open afterwards so you
+// can see where you were taken. Shared by every "take me to this card" entry (revealCards, revealCard).
+function unfoldThreadsFor(keys: Set<string>): void {
+  if (!collapsedThreads.size) return;
+  let opened = false;
+  for (const a of asks) {
+    if (collapsedThreads.has(a.sid) && extHoverMatches("a:" + a.itemId, keys)) {
+      collapsedThreads.delete(a.sid); opened = true;
     }
-    if (opened) render();
   }
+  if (opened) render();
+}
+
+function revealCards(keys: Set<string>) {
+  unfoldThreadsFor(keys);
   const hits = Array.from(document.querySelectorAll<HTMLElement>("[data-key]"))
     .filter((c) => extHoverMatches(c.dataset.key, keys));
   if (!hits.length) return;

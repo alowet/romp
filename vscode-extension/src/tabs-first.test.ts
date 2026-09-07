@@ -39,8 +39,10 @@ test("makePlaceholderTab draws name + identity color, and is CLICKABLE while loa
   assert.match(fn, /tab\.addEventListener\("keydown", onTabKey\);/);
   assert.ok(!/close|draggable/.test(fn), "no close ✕, no drag — the only new power is selection");
   // …and the ACTIVE loading tab's thread area holds the pane-local romp loader until frames land in place
-  assert.match(RENDER, /if \(activeId && tabMeta\.has\(activeId\)\) \{/);
-  assert.match(RENDER, /wait\.appendChild\(rompLoaderInner\("opening “" \+ \(tabMeta\.get\(activeId\)\?\.name \|\| "session"\) \+ "”…"\)\);/);
+  // (a federated id no host has relayed yet counts as loading too — notify-click-reveal.test.ts)
+  assert.match(RENDER, /if \(activeId && \(tabMeta\.has\(activeId\) \|\| hostOf\(activeId\)\)\) \{/);
+  assert.match(RENDER, /const what = meta\?\.name \? "“" \+ meta\.name \+ "”" : /);
+  assert.match(RENDER, /wait\.appendChild\(rompLoaderInner\("opening " \+ what \+ "…"\)\);/);
   assert.match(RENDER, /document\.getElementById\("tab-loading"\)\?\.remove\(\);   \/\/ the payload landed — the real view takes over in place/);
 });
 
