@@ -75,6 +75,17 @@ test("the chat strip and the outline both mount the shared component (source pin
   assert.match(KERNEL, /"views": _views_client\(\),   # the rendered views blob — the outline \+ feed tag mounts read it/);
 });
 
+test("the chat's menu carries the 'Group tabs by tag' switch at its foot; the phone mount does not (its strip is hidden)", () => {
+  // tab groups (the user 2026-09-04): the per-browser sectioned-strip switch rides the SHARED menu
+  // as an optional foot row beside Configure tags… — the chat strip passes it, the outline does not
+  const desktop = RENDER.slice(RENDER.indexOf('tagMenuButton("filter these tabs by tag"'), RENDER.indexOf('tagBtn.classList.add("tab-tagfilter");'));
+  assert.match(desktop, /groupToggle: \{ label: "Group tabs by tag"/);
+  const mobile = RENDER.slice(RENDER.indexOf('const mslot = document.getElementById("mtag-slot")'), RENDER.indexOf("paintTabRowLines(bar);"));
+  assert.ok(!mobile.includes("groupToggle"), "the kernel's mobile page hides #tabs (_CHAT_MOBILE_CSS) — nothing to section there");
+  assert.ok(!FLEET.includes("groupToggle"), "the outline filters; it has no strip to section");
+  assert.match(MENU, /if \(opts\.groupToggle \|\| opts\.onConfigure\) \{/, "the foot divider appears for either entry");
+});
+
 test("every pane's Configure tags… routes to THE dialog on the timeline (source pins)", () => {
   assert.match(RENDER, /vscodeApi\?\.postMessage\(\{ type: "openTagsDialog" \}\)/);
   assert.match(FLEET, /vscodeApi\?\.postMessage\(\{ type: "openTagsDialog" \}\)/);

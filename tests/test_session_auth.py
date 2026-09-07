@@ -578,7 +578,8 @@ class DrivePlumbing(unittest.TestCase):
 
     def test_create_paths_pass_the_pick_through(self):
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        self.assertIn("def _create_sdk_session(nm, cwd, auth=\"\", prefs=None, client=None, env=None):", src)
+        # (parent + tags joined the signature with tab groups, 2026-09-04 — auth's slot is unchanged)
+        self.assertIn("def _create_sdk_session(nm, cwd, auth=\"\", prefs=None, client=None, env=None, parent=\"\", tags=()):", src)
         self.assertEqual(src.count('auth=(a if a in ("login", "key") else "")'), 2,
                          "the WS op and POST /new both pass it")
 

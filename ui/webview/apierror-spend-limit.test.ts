@@ -24,8 +24,12 @@ test("the auto-retry tick SKIPS a spend-capped thread (retrying can't fix a bill
 });
 
 test("a spend cap paints the tab alarm-red (on-you), not amber retrying", () => {
-  // a safeguards refusal is the fifth on-you class (the user 2026-08-15) — see apierror-refusal.test.ts
-  assert.match(R, /\(s\.status\.apiTooLong \|\| s\.status\.apiSpendLimit \|\| s\.status\.apiModelLimit \|\| s\.status\.apiAuthErr \|\| s\.status\.apiRefusal\) \? "tab-blocked" : "tab-retrying"/);
+  // a safeguards refusal is the fifth on-you class (the user 2026-08-15) — see apierror-refusal.test.ts.
+  // The rule lives in tab-state.ts since tab groups (2026-09-04): one function for the tab and the
+  // folded section header's pip (tab-state.test.ts executes it); render.ts wears its result
+  const S = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "tab-state.ts"), "utf8");
+  assert.match(S, /\(s!\.apiTooLong \|\| s!\.apiSpendLimit \|\| s!\.apiModelLimit \|\| s!\.apiAuthErr \|\| s!\.apiRefusal\) \? "tab-blocked" : "tab-retrying"/);
+  assert.match(R, /const stateCls = tabStateClass\(s\.status\);/);
 });
 
 test("the paused line names the spend cap and points at the settings page (no fake countdown)", () => {

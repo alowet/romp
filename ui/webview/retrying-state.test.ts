@@ -13,7 +13,10 @@ const TL = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "romp-timelin
 test("chat: 'retrying' is a ChipState with an 'API retrying…' label, an amber chip, and a tab ring", () => {
   assert.match(RENDER, /type ChipState =[^;]*\| "retrying"/);
   assert.match(RENDER, /retrying: "API retrying…"/);
-  assert.match(RENDER, /else if \(st === "retrying"\) tab\.classList\.add\("tab-retrying"\)/);
+  // the state → class rule lives in tab-state.ts since tab groups (2026-09-04); render.ts wears its result
+  const S = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "tab-state.ts"), "utf8");
+  assert.match(S, /if \(st === "retrying"\) return "tab-retrying";/);
+  assert.match(RENDER, /const stateCls = tabStateClass\(s\.status\);\s*\n\s*if \(stateCls\) tab\.classList\.add\(stateCls\);/);
   // amber chip, distinct from working-yellow / blocked-red
   assert.match(CSS, /\.chip-retrying \{ background: #e67e22/);
   // amber dashed tab ring (same dashed treatment as awaiting, but amber, no fill)

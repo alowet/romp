@@ -138,6 +138,21 @@ class TabMetaPush(unittest.TestCase):
         self.assertTrue(mine, "the next cycle's tabOrder views blob carries the new tag")
         self.assertIn(SID, mine[0].get("members") or [], "…with the session filed under it")
 
+    def test_inherited_membership_rides_the_next_push_cycle(self):
+        # tab groups on tags (the user 2026-09-04): a child's inherited membership is a views write
+        # like any tag edit, so the very next tabOrder frame carries it to the sectioned strip
+        child = "66666666-7777-8888-9999-000000000000"
+        self._post("/tag", {"name": "workers", "add": ["web"]})
+        self._cycle()
+        self.assertTrue(self.dirty)
+        self.dirty.clear()
+        self.assertEqual(km._inherit_tag_membership(SID, child), ["workers"])
+        self.assertTrue(self.dirty, "the inheritance wakes the pusher like a tag edit does")
+        self._cycle()
+        mine = [t for t in self._tab_orders()[-1]["views"]["tags"] if t.get("name") == "workers"]
+        self.assertEqual(sorted(mine[0]["members"]), sorted([SID, child]),
+                         "the next cycle's views blob files the child beside its parent")
+
     def test_an_unchanged_cycle_is_deduped_but_never_a_changed_one(self):
         self._cycle()
         n = len(self._tab_orders())

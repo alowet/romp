@@ -507,7 +507,8 @@ class DrivePlumbing(unittest.TestCase):
 
     def test_the_create_path_passes_env_through(self):
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        self.assertIn('def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None, env=None):', src)
+        # (parent + tags joined the signature with tab groups, 2026-09-04 — env's slot is unchanged)
+        self.assertIn('def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None, env=None, parent="", tags=()):', src)
         self.assertIn("sid = _sdk().spawn(nm, cwd, bg, fg, auth=auth, env=env)", src,
                       "env rides the SPAWN — the reg is born with it, ahead of the prefs pass")
 

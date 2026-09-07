@@ -21,7 +21,8 @@ test("the + dialog builds a SDK | tmux | Codex backend toggle, hidden in pick-mo
 
 test("createSession uses the picked backend, falling back to the gear default", () => {
   assert.match(RENDER, /const beSel = beWrap\.querySelector\("\.picker-be-opt\.sel"\)/);
-  assert.match(RENDER, /backend: beSel\?\.dataset\.be \|\| loadSettings\(\)\.backend/);
+  assert.match(RENDER, /const backend = beSel\?\.dataset\.be \|\| loadSettings\(\)\.backend;/);
+  assert.match(RENDER, /startCreate\(\{ name, backend,/);
 });
 
 test("the toggle's selected option is the romp ACCENT (the user 2026-06-24), not the working-yellow", () => {

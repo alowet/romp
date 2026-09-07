@@ -53,8 +53,9 @@ test("edits reuse the wire — never a fork: local edits post TARGETED tagEdit o
     "an add with no local home routes to the tag's single home over the editTag wire");
   assert.ok(body.includes("for (const rt of g.remotes) {"),
     "a REMOVE walks every remote store holding the pair — remove-everywhere, never half");
-  assert.ok(body.includes("if (ops.length) { for (const op of ops) postTagEdit(nv, op); }"), "ONE optimistic blob per gesture — the flyout reads true instantly");
-  assert.ok(body.includes("else if (mirrored) { pendingSessionViews = nv; renderTabs(); }"),
+  assert.ok(body.includes("postUnionEdits(nv, applyUnionEdit(nv, g, edit));"), "ONE optimistic blob per gesture — the flyout reads true instantly");
+  assert.ok(body.includes("if (ops.length) { for (const op of ops) postTagEdit(nv, op); }"), "N targeted ops, the one copy shown for all of them");
+  assert.ok(body.includes("else if (edits.some((e) => e.mirrored)) { pendingSessionViews = nv; renderTabs(); }"),
     "a remote-only edit has no local op: its mirror shows until the next frame, as before");
   assert.ok(body.includes("if (g.localId && !g.pending) {"), "a union whose create is still in flight takes no op (its id is the placeholder the ack replaces)");
   assert.ok(body.includes("const nvRemote = (rt: SessionTag)"),
@@ -79,6 +80,24 @@ test("presentation: one chip per NAME, identity dot, ✕ — and never a host pr
   assert.match(CSS, /\.ctx-tag-dot \{ flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; \}/);
   const fly = RENDER.slice(RENDER.indexOf("const sub = el(\"div\", \"ctx-menu ctx-sub ctx-sub-tags\");"));
   assert.doesNotMatch(fly.slice(0, 2500), /host-prefix|hostNameNodes/, "kernels are plumbing — no host chrome in the flyout");
+});
+
+test("one-click MOVE between groups (tab groups, 2026-09-04): 'Move to <name>' adds the target and drops the HOME tag on ONE blob; '+' adds without moving", () => {
+  const fly = RENDER.slice(RENDER.indexOf('const sub = el("div", "ctx-menu ctx-sub ctx-sub-tags");'), RENDER.indexOf("// New tag… — an inline input"));
+  assert.match(fly, /const home0 = readTabGroups\(\)\.on \? holding\(\)\[0\] : undefined;\s*\n\s*const home = home0 && !home0\.pending \? home0 : undefined;/,
+    "the home tag is the FIRST holder in the union order — the same rule that sections the strip; only while the strip is sectioned, and never a home whose create is still in flight");
+  assert.match(fly, /lb\.textContent = "Move to " \+ g\.name; bodyE\.appendChild\(lb\);/);
+  assert.match(fly, /moveUnion\(home, g\); build\(\); sb\.textContent = subText\(\);/, "the row IS the move");
+  assert.match(fly, /plus\.title = "add this tag too — the session stays in its current group";/, "…and multi-tag stays one click away");
+  assert.match(fly, /lb\.textContent = "\+ " \+ g\.name; bodyE\.appendChild\(lb\);/, "with no home tag, + <name> is the move");
+  const mv = RENDER.slice(RENDER.indexOf("const moveUnion = (from: TagUnion, to: TagUnion)"), RENDER.indexOf("// HOVER-INTENT open"));
+  assert.match(mv, /const a = applyUnionEdit\(nv, to, \{ add: \[id\] \}\);\s*\n\s*const r = applyUnionEdit\(nv, from, \{ remove: \[id\] \}\);/,
+    "two edits on ONE blob shown — the strip never shows the half-moved state");
+  assert.match(mv, /postUnionEdits\(nv, \{ ops: \[\{ op: "move", tid_from: rem\.tid, tid_to: add\.tid, sid: id \}\], mirrored: a\.mirrored \|\| r\.mirrored \}\);/,
+    "…and with both tags local, ONE `move` op the kernel applies under its lock: both halves or neither");
+  assert.match(mv, /else postUnionEdits\(nv, a, r\);/, "a half with no local home rides its own wire as before");
+  assert.match(RENDER, /const applyUnionEdit = \(nv: SessionViews, g: TagUnion, edit: \{ add\?: string\[\]; remove\?: string\[\] \}\): UnionEdit =>/,
+    "editUnion and moveUnion share the one edit — never a forked implementation");
 });
 
 test("the menu groups BY KIND: [Rename+colors] / [toggles+billing+Tags] / [Browse] (the user 2026-08-24, final ruling)", () => {

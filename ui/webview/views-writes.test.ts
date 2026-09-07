@@ -248,16 +248,21 @@ test("pins: every views arrival in render.ts goes through the ONE seq-gated adop
   assert.match(RENDER, /if \(adopted\) sessionViews = rejectedViews;/, "…that second one is the reconnect event's adoption and nothing else");
 });
 
-test("pins: the Tags flyout's local edits are targeted ops on ONE optimistic blob", () => {
+test("pins: the Tags flyout's local edits are targeted ops on ONE optimistic blob; a MOVE is two ops, one blob", () => {
   const at = RENDER.indexOf("const editUnion = (g: TagUnion");
-  const body = RENDER.slice(at, at + 4200);   // the union editor's two op sites and its post (the pending-union comment sits inside this window)
+  const body = RENDER.slice(at, at + 4200);   // the union editor's two op sites and postUnionEdits (the pending-union comment sits inside this window)
   const fly = RENDER.slice(at, RENDER.indexOf("// BROWSE FILES", at));
   assert.ok(body.includes('ops.push({ op: "addMember", tid: g.localId, sids: edit.add.slice() });'), "a local add is an addMember by the tag's stored id");
   assert.ok(body.includes('ops.push({ op: "removeMember", tid: g.localId, sids: edit.remove.slice() });'), "a local remove is a removeMember by id");
   assert.doesNotMatch(body, /op: "(?:addMember|removeMember|rename|recolor|delete)", name:/, "no op but create carries a tag name");
+  assert.match(body, /const postUnionEdits = \(nv: SessionViews, \.\.\.edits: UnionEdit\[\]\) =>/);
   assert.match(body, /for \(const op of ops\) postTagEdit\(nv, op\);/, "N ops, the one copy shown for all of them");
-  assert.match(body, /else if \(mirrored\) \{ pendingSessionViews = nv; renderTabs\(\); \}/,
+  assert.match(body, /else if \(edits\.some\(\(e\) => e\.mirrored\)\) \{ pendingSessionViews = nv; renderTabs\(\); \}/,
     "a remote-only edit has no local op: its mirror shows until the next frame");
+  assert.match(RENDER, /const a = applyUnionEdit\(nv, to, \{ add: \[id\] \}\);\s*\n\s*const r = applyUnionEdit\(nv, from, \{ remove: \[id\] \}\);/,
+    "the move: two edits on one blob — the strip never shows the half-moved state");
+  assert.match(RENDER, /\{ op: "move", tid_from: rem\.tid, tid_to: add\.tid, sid: id \}/,
+    "…posted as ONE atomic op when both tags are local (both halves land or neither)");
   assert.match(RENDER, /if \(pendingSessionViews && v && !viewsWrites\.length\) pendingSessionViews = null;/,
     "…which captureViews lets go on any frame, seq or not — a copy with no write in flight is that mirror alone");
   assert.match(RENDER, /postTagEdit\(nv, \{ op: "create", name, color, sids: \[id\] \}, tg\.id\);/,

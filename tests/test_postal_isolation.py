@@ -55,6 +55,10 @@ class PostalOff(unittest.TestCase):
         self.assertFalse(pm._postal_off(SID), "hideFromFeed alone must not isolate from postal")
 
     def test_malformed_flags_file_fails_open(self):
+        # the flags dir is made HERE, not inherited from an earlier test: under pytest-xdist the
+        # class's tests split across workers, and this one landed on a worker where no sibling had
+        # created the dir yet (surfaced 2026-09-04 when the suite's test count shifted the split)
+        pm.SESSION_FLAGS.parent.mkdir(parents=True, exist_ok=True)
         pm.SESSION_FLAGS.write_text("{not valid json")
         self.assertFalse(pm._postal_off(SID), "a corrupt flags file must NOT wedge messaging (fail open)")
 
