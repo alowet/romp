@@ -15,6 +15,17 @@ export interface CaretBox {
 }
 
 export function insertAtCaret(box: CaretBox, text: string): void {
+  // Prefer the browser's own EDITING command when the box is the focused element: setRangeText is a
+  // programmatic value change, which Chromium records as no undo step and which discards the box's
+  // existing undo history — so a dictated utterance that landed through the bare-area paste could not
+  // be Cmd+Z'd, unlike the same paste into the focused box (review find on #939, 2026-09-07).
+  // execCommand("insertText") replaces the selection at the caret, fires `input` itself, and IS an undo
+  // step. Fallback to setRangeText where there is no document (node tests), the box is not focused,
+  // or the command is refused, so the helper's contract holds everywhere.
+  try {
+    if (typeof document !== "undefined" && (box as unknown) === document.activeElement
+        && typeof document.execCommand === "function" && document.execCommand("insertText", false, text)) return;
+  } catch { /* fall through to the programmatic path */ }
   box.setRangeText(text, box.selectionStart, box.selectionEnd, "end");
   box.dispatchEvent(new Event("input", { bubbles: true }));
 }
