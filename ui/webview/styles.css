@@ -1821,6 +1821,12 @@ body.chat-theme-yatharth .meta-btn.mode-risky, body.chat-theme-yatharth .meta-it
 .queued-bubble.queued-romp.cancelable { padding-right: 0; }
 .queued-bubble.queued-romp.cancelable:hover { border-color: transparent; }
 .queued-bubble.queued-romp > .notice-card { margin-top: 0; }
+/* The queued NUDGE nests the landed .romp-tag + .romp-bubble: the wrapper is the landed romp turn's own
+   right-aligned column (tag above, bubble flush right), the nested bubble sheds its own 72% cap (the
+   wrapper already carries it — nested, it shrank to 72% of 72% and wrapped one-line gists) and anchors the
+   ✕ in ITS corner, not the wrapper's (T243 follow-up, measured in queued-romp-layout.test.ts). */
+.queued-bubble.queued-romp:not(.queued-sys) { display: flex; flex-direction: column; align-items: flex-end; }
+.queued-bubble.queued-romp > .romp-bubble { max-width: none; position: relative; }
 .queued-bubble.queued-romp.cancelable > .notice-card,
 .queued-bubble.queued-romp.cancelable > .romp-bubble { padding-right: 30px; }   /* room for the ✕ only when there is one */
 /* NEVER-DELIVERED send (ev.undelivered): a message whose CLI died holding it — kept, because the bubble
