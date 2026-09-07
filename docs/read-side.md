@@ -208,6 +208,40 @@ widget per block), with **no second transcript parser** — the event model alre
 produced the tree. Plus the live chip from the state read, and the TOC ledger below
 the tabs.
 
+**A send stays visible from the press until its record lands, and each layer
+retires on an event, never a timer.** The kernel keeps an input echo (a synthetic
+user atom in the backend's live store, mirrored to the registry so a restart cannot
+lose it) from `send()` until the transcript carries the same text. For a message fed
+into a running turn that record is the `queued_command` attachment the CLI writes
+when it splices the message in at its next tool boundary. On the SDK route no floor
+retires an echo: it retires when its text lands in a record stamped at or after the
+send (a user record or that attachment), or when the CLI dies holding it (`dropped`,
+which the chat shows as never delivered, with restore and dismiss). The CLI extracts
+no image paths on the stream-json route (its only image-path test belongs to the
+interactive composer's paste handler), so an image path in an SDK send lands as
+typed and the echo's text matches. `_path_bearing` and the extension set it tests
+(png, jpe?g, gif, webp, case-insensitive: the CLI bundle's single image-path test,
+pinned equal between kernel and backend) remain for the tmux settle path only, where
+the paste hook does run and rewrites the path to `[Image #N]`. The chat's own image
+previews (`_user_images`) use a separate set, built from the served MIME table
+(`_IMG_MIME`, svg and bmp included), so a preview is never proposed for a file the
+image route cannot serve.
+
+**A kernel restart does not re-run a mid-turn send.** The boot duplicate guard
+(`_text_landed`) reads the `queued_command` attachment too, and it scans from the
+transcript's byte size at the moment of the send (recorded on the echo as
+`_echo_off` with the file id `_echo_fsid`, mirrored in the registry as `off` and
+`fsid`) to the end of the file, so a landed send is neither re-queued nor flagged as
+undelivered however much the session wrote afterwards. A mark from another file (a
+/clear or a fork since), a mark past the end of the file, or an echo with no mark
+reads the whole file. The found verdict is recorded on the echo (`_landed`), and
+`prune_live` and the chat merge retire the echo on it without a text match, so a
+found echo always has an exit and a later boot never re-scans it. Every by-text
+comparison of an echo against a record (the guard's scan, `prune_live`'s retire, the
+kernel's `_atom_user_texts` and its folds, and the tmux echo's prune
+`_tmux_echo_prune`) uses one key, `echo_text_key` in `session_backend.py`: outer
+whitespace stripped, nothing else.
+
 **The ledger is a table of contents** (pure projection of captions + archive):
 - top: the archiver's one-sentence headline for the session,
 - then **turn captions** as top-level bullets, the whole session (not just recent),
