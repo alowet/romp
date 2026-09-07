@@ -2906,22 +2906,36 @@ def _clear_unresolved_live_note(sid):
     _UNRESOLVED_LIVE_NOTED.discard(str(sid or ""))
 
 
-def _tab_order_frame(order, tabs, live):
+def _tab_order_frame(order, tabs, live, c=None):
     """The ONE tabOrder frame shape (T258) for its four senders (the pusher's tabs-first send, _push_session_now,
-    _confirm_close_now, and the WS 'ready' handler's connect-time frame): the shared order, the tabs meta, the
-    viewer's views blob, `live` — the sids the kernel affirms are LIVE this build (raw tmux/SDK liveness,
-    independent of whether discover could resolve each one's transcript) — and `selfHost`, this kernel's own
-    name (_self_host). The pane keeps a live sid on the strip even if this frame's `order` omits it: a
-    transient read failure that drops a session from the order is not a close (render.ts applyTabOrder). The
-    chat reads a postal card's sender host against `selfHost` (its postalSenderHost). The session frame
-    carries the name too, but only a LOCAL session's frame teaches it, so a dashboard whose kernel runs no
-    sessions of its own — every session attached from elsewhere — never learned it until the + picker was
-    opened, and a remote card stamped with this kernel's name stayed plain text (review find, 2026-09-06).
-    Every chat client receives a tabOrder frame, first of all on connect (tabs-first), so the name is known
-    before any card renders. Older clients ignore the extra fields. Under a views read fault the blob is the last
-    one served, marked `viewsFault`, or absent with the marker alone (_views_payload)."""
-    return {"type": "tabOrder", "order": list(order), "tabs": tabs, "selfHost": _self_host(),
-            **_views_payload(), "live": sorted({str(x) for x in live})}
+    _confirm_close_now, and the WS 'ready' handler's connect-time frame), all of which go through
+    _send_tab_order: the shared order, the tabs meta, the viewer's views blob, `live` — the sids the kernel
+    affirms are LIVE this build (raw tmux/SDK liveness, independent of whether discover could resolve each
+    one's transcript) — and `selfHost`, this kernel's own name (_self_host). The pane keeps a live sid on the
+    strip even if this frame's `order` omits it: a transient read failure that drops a session from the order
+    is not a close (render.ts applyTabOrder). The chat reads a postal card's sender host against `selfHost`
+    (its postalSenderHost). The session frame carries the name too, but only a LOCAL session's frame teaches
+    it, so a dashboard whose kernel runs no sessions of its own — every session attached from elsewhere —
+    never learned it until the + picker was opened, and a remote card stamped with this kernel's name stayed
+    plain text (review find, 2026-09-06). Every chat client receives a tabOrder frame, first of all on connect
+    (tabs-first), so the name is known before any card renders. Older clients ignore the extra fields. Under a
+    views read fault the blob is the last one served, marked `viewsFault`, or absent with the marker alone
+    (_views_payload).
+
+    `c` is the client the frame is built FOR (every kernel emitter passes it: _send_tab_order, the one caller):
+    `skeleton` rides EVERY tabOrder once this client has had a set — non-empty while tabs are still to load,
+    then an EMPTY list until `ready` resets the client — never only the first: the shim's FIFO replaces an
+    older still-queued tabOrder with a newer one, so a later frame without the key would erase the set on the
+    client; and the federated merge keeps a host's last list when a frame carries no key, so an emptied set
+    must be SAID ([]) for the strip to stop showing skeletons (integration find 2026-09-07). A client that
+    never had a set (a fresh page) sends no key, as before. The caller holds _client_lock(c) (see
+    _send_tab_order); with no client the frame is the bare shape."""
+    fr = {"type": "tabOrder", "order": list(order), "tabs": tabs, "selfHost": _self_host(),
+          **_views_payload(), "live": sorted({str(x) for x in live})}
+    if c is not None and "skeletonOrder" in c:       # a set has existed for this client
+        sk = c.get("skeleton") or set()
+        fr["skeleton"] = [sid for sid in (c.get("skeletonOrder") or []) if sid in sk]
+    return fr
 
 
 def _alive_sessions(now, tmux):
@@ -36336,6 +36350,7 @@ def _client_reset_chat_sid(client, sid):
     with _client_lock(client):
         client.get("echat", {}).pop(sid, None)
         client.get("sent", {}).pop(("chat", sid), None)
+        _release_skeleton_locked(client, sid)   # a needFull for a skeleton tab (a click, the idle prefetch) loads it
 
 
 def _client_reset_chat_base(client):
@@ -36354,9 +36369,113 @@ def _client_reset_chat_base(client):
     before the reset (its slot and tail entry are cleared, _push_one re-sends) or after it."""
     with _client_lock(client):
         client.get("echat", {}).clear()
+        # …and the reconnect skeleton set (2026-09-07): a renderer that just evaluated holds NOTHING, so there
+        # is nothing it could lazily reload — every tab must arrive whole, and the status slots go with the set
+        client.pop("skeleton", None); client.pop("skeletonOrder", None); client.pop("reconnect", None)
         snt = client.get("sent", {})
-        for k in [k for k in snt if isinstance(k, tuple) and k and k[0] == "chat"]:
+        for k in [k for k in snt if isinstance(k, tuple) and k and k[0] in ("chat", "status")]:
             snt.pop(k, None)
+
+
+# ── Reconnect skeletons (2026-09-07). A pane whose socket died while its browser tab was away (a long freeze,
+# a laptop sleep, a network change) redials, and the kernel used to serve the new socket as a client that
+# holds nothing: a full session frame for EVERY tab — 17 frames, ~9 MB on the measured board — for ONE tab on
+# screen. The page still holds every session it had; it only needs the one it shows. So the shim declares the
+# redial (?reconnect=1: this page has opened a socket before), and the kernel sends that client the tab strip
+# with a `skeleton` list — every listed tab except the active one, cheapest transcript first — the active
+# tab's full session, and a small status frame per skeleton tab so its chip stays honest. A skeleton tab
+# loads on the user's click (activeTab / needFull) or on the client's idle prefetch (needFull), and any full
+# send releases it; `ready` (a renderer that just evaluated) clears the whole set. Every read and write of the
+# set happens under the client's slot lock, and every frame that MENTIONS the set is enqueued under that same
+# lock, so the client's queue order matches: a tabOrder still naming X is always ahead of X's full.
+
+def _release_skeleton_locked(c, sid):
+    """Forget that `c` holds `sid` as a skeleton tab, and drop the status slot that stood in for its chat.
+    The caller holds _client_lock(c). Returns whether it was held."""
+    sk = c.get("skeleton")
+    held = bool(sk) and sid in sk
+    if held:
+        sk.discard(sid)
+    c.get("sent", {}).pop(("status", sid), None)
+    return held
+
+
+def _release_skeleton(c, sid):
+    with _client_lock(c):
+        return _release_skeleton_locked(c, sid)
+
+
+def _skeleton_for(c, act, chat_list):
+    """The sids a reconnecting client is NOT looking at, ascending by transcript size — a free stat, the byte
+    proxy the kernel has before building anything (the tail length ties at WIRE_TAIL for every busy session,
+    so it cannot rank them). Transcript-less sessions are never skeleton, for the reason build_order ranks them
+    first: their build is near-free, their creator is staring at them, and a placeholder that never fills is
+    the 2026-08-08 bug. `act` may name a remote (host:uuid), viewer or already-closed id — then it matches no
+    local sid and every local session with a transcript is skeleton; a click on any tab loads it."""
+    sized = []
+    for s in chat_list:
+        if s["sid"] == act:
+            continue
+        try:
+            n = os.path.getsize(s.get("path") or "")
+        except (OSError, TypeError, ValueError):
+            continue                                  # no transcript → built and sent whole, as today
+        sized.append((n, s["sid"]))
+    sized.sort(key=lambda t: t[0])                    # stable: equal sizes keep tab order
+    return [sid for _, sid in sized]
+
+
+def _resolve_reconnect(c, chat_list):
+    """Consume a client's reconnect flag and fix its skeleton set — ONCE, by the first tabOrder sender that sees
+    it (the pusher, _push_session_now, _confirm_close_now, ready), so no strip can reach a reconnecting client
+    before its set exists: a close confirmation landing in the gap before the pusher's first pass would
+    otherwise paint the page's stale sessions as loaded tabs. No active hint (no localStorage) → the kernel
+    cannot know what the page shows → no set → today's full push (fail safe)."""
+    # ATOMIC under the client's slot lock, flag to set (review find 2026-09-07): with the pop and the stats outside
+    # it, a second strip sender racing this one popped False, sent a keyless strip and a FULL for some sid, and
+    # this sender then wrote a set still naming that sid — held whole by the client yet served only status frames
+    # from then on, a tab frozen until clicked. The stats cost ~100 µs under the RLock; and a sid the client already
+    # holds whole (echat) is excluded outright, so a full that won the race can never be re-listed.
+    with _client_lock(c):
+        if not c.pop("reconnect", False):
+            return
+        act = c.get("active")
+        if not act:
+            return
+        held = c.get("echat") or {}
+        skel = [sid for sid in _skeleton_for(c, str(act), chat_list) if sid not in held]
+        c["skeleton"] = set(skel)
+        c["skeletonOrder"] = skel
+
+
+def _send_tab_order(c, tab_order, tab_meta, live):
+    """The tab strip to one client through the pusher's ("taborder",) dedup slot — built AND enqueued under the
+    client's slot lock so the frame's skeleton list and its queue position agree with every release, which
+    enqueues under the same lock. Per-client dedup, so a per-client frame costs nothing. `live` is the build's
+    raw liveness map (the tmux/SDK merge), the frame's T258 `live` field — the ONE builder takes it beside the
+    client, so every emitter's strip carries both the affirmed-live sids and this client's skeleton list."""
+    with _client_lock(c):
+        sk = c.get("skeleton")
+        if sk:
+            listed = set(tab_order)                    # a session that ended or hid since the set resolved leaves it
+            for gone in [sid for sid in sk if sid not in listed]:   # (review find 2026-09-07: the strip named a sid its
+                sk.discard(gone)                       #  order lacked, and the client's prefetch asked for a session
+                c.get("sent", {}).pop(("status", gone), None)   #  the kernel could never send)
+        _send_client(c, ("taborder",), _tab_order_frame(tab_order, tab_meta, live, c))
+
+
+def _send_chat_or_status(c, m, ms, change_from, led_changed):
+    """_send_chat for the pusher's per-client loop: a sid the client holds as a skeleton gets a ~400 B status
+    frame on its own ("status", sid) slot (deduped, so an unchanged status costs nothing) instead of its chat,
+    and the lazy full serialization stays unmaterialized. A skeleton sid never reaches _send_chat_locked, so
+    echat has no entry and `sent` no ("chat", sid) slot for it — the moment it is released the existing full
+    path fires exactly as for a never-sent session."""
+    with _client_lock(c):
+        sid = m["id"]
+        if sid in (c.get("skeleton") or ()):
+            _send_client(c, ("status", sid), {"type": "status", "id": sid, "status": m.get("status")})
+            return ms
+        return _send_chat_locked(c, m, ms, change_from, led_changed)
 
 
 # View deltas (2026-09-03). The timeline's bars and the feed used to cross the wire WHOLE on every change —
@@ -36897,6 +37016,7 @@ def _send_chat_locked(c, m, ms, change_from, led_changed):
         st[sid] = (pc[0], pc[1])                       # same tail base, now caught up through `total`
         return ms
     head_from = max(0, total - WIRE_TAIL)
+    _release_skeleton_locked(c, sid)                  # a full send loads a skeleton tab, whoever sent it (2026-09-07)
     if head_from == 0:
         if ms is None:
             ms = json.dumps(m)                        # materialize the lazy serialization, once
@@ -38649,7 +38769,8 @@ def _push(targets, connect=False, tmux=None):
                 _send_client(c, ("globalRetryPaused",), {"type": "globalRetryPaused", "value": _retry_paused_on(),
                                                          "resumeAt": _retry_resume_at(),   # limit reset epoch → the card counts down to the real retry
                                                          "reason": _retry_pause_reason()})   # "spend" → the card says 'raise your cap', no countdown
-                _send_client(c, ("taborder",), _tab_order_frame(tab_order, tab_meta, tmux))
+                _resolve_reconnect(c, chat_list)         # a redialing page: fix its skeleton set BEFORE any strip
+                _send_tab_order(c, tab_order, tab_meta, tmux)
             active = {c.get("active") for c in chat_clients if c.get("active")}
             # Stable: active tabs first — and TRANSCRIPT-LESS sessions with them. A just-created session
             # has no transcript, so its build is near-free, and its creator is guaranteed to be staring
@@ -38746,8 +38867,9 @@ def _push(targets, connect=False, tmux=None):
                     _prev_chat_ledger[m["id"]] = m.get("ledger")
                 for c in chat_clients:
                     # flush as built → the active tab lands first; a full send materializes the lazy
-                    # serialization ONCE and every later client (and the cache below) reuses it
-                    ms = _send_chat(c, m, ms, change_from, led_changed)
+                    # serialization ONCE and every later client (and the cache below) reuses it. A tab the
+                    # client holds as a skeleton gets only its status (2026-09-07)
+                    ms = _send_chat_or_status(c, m, ms, change_from, led_changed)
                 # cache AFTER the sends, so a serialization a full send just paid for is kept — the next
                 # connect-push for this unchanged tab reuses it instead of dumping again
                 if sig is not None:
@@ -39102,8 +39224,9 @@ def _push_session_now(sid):
             return                                   # the periodic pusher owns the sid until content returns
         ms = None                                    # lazy: the first full send materializes it, the rest reuse
         for c in targets:
-            _send_client(c, ("taborder",), _tab_order_frame(tab_order, tab_meta, tmux))
-            ms = _send_chat(c, m, ms, 0, True)       # change_from 0 → always the full-session form
+            _resolve_reconnect(c, chat_list)         # a redialing page must never see a strip before its set exists
+            _send_tab_order(c, tab_order, tab_meta, tmux)
+            ms = _send_chat(c, m, ms, 0, True)       # change_from 0 → always the full-session form (…and releases a skeleton)
     except Exception:
         sys.stderr.write("push-session-now (%s): %s\n" % (sid, traceback.format_exc()))
 
@@ -39143,12 +39266,12 @@ def _confirm_close_now(sid):
         chat_list = _chat_tab_sessions(now, tmux)
         tab_order = [s["sid"] for s in chat_list]
         tab_meta = [{"id": s["sid"], "name": s.get("name", ""), "color": _name_color(s["sid"])} for s in chat_list]
-        frame = _tab_order_frame(tab_order, tab_meta, tmux)
         with _clients_lock:
             targets = [c for c in _clients if c["app"] == "chat"]
         for c in targets:
             try:
-                _send_client(c, ("taborder",), frame)
+                _resolve_reconnect(c, chat_list)     # a confirmation may be the FIRST strip a redialing page sees
+                _send_tab_order(c, tab_order, tab_meta, tmux)
             except Exception:
                 c["alive"] = False
         return sid not in tab_order
@@ -40736,7 +40859,7 @@ function connect(){if(ws&&(ws.readyState===0||ws.readyState===1))return;   // on
 if(returnAt)returnRedialed=true;   // a dial inside a return window (whatever path led here) → the return-fresh row says so
 connT=Date.now();var proto=location.protocol==="https:"?"wss://":"ws://";
 var active="";try{var st0=JSON.parse(localStorage.getItem(SK)||"null");active=(st0&&st0.activeId)||"";}catch(e){}
-ws=new WebSocket(proto+location.host+"/ws?app=%s&delta=1&iid="+encodeURIComponent(IID)+(wid?"&wid="+encodeURIComponent(wid):"")+(active?"&active="+encodeURIComponent(active):""));
+ws=new WebSocket(proto+location.host+"/ws?app=%s&delta=1&iid="+encodeURIComponent(IID)+(wid?"&wid="+encodeURIComponent(wid):"")+(active?"&active="+encodeURIComponent(active):"")+(everConnected?"&reconnect=1":""));   // reconnect=1: this page has held a socket before, so it may already hold sessions — the kernel skeletons the tabs it is not looking at (2026-09-07)
 // onopen: flush the queue; a RECONNECT (after a drop) also PROMPTS a reload — the fresh socket resyncs live via
 // the kernel's next push, and the banner offers a full reload for anything a live push doesn't cover. This
 // replaced the old silent location.reload() (the user 2026-07-05: don't foist a reload; let me click). Narrowed by
@@ -40754,7 +40877,8 @@ if(failedConnects){send({type:"clientDiag",surface:"pane-shim",what:"wsconnfail"
 if(wasReconn){var ann=restartAnnounced&&Date.now()-restartAnnounced<30000;restartAnnounced=0;   // one-shot: spent here
 if(window.__rompReload&&!window.__rompReload.inShell())window.__rompReload.checkBoot();   // T265: a REOPEN is the restart signal — a standalone page asks /version whose kernel answered; inside the shell, the shell asks on its own socket
 if(!ann)armStale(pendingWhy||"reconnect");   // T217: an ANNOUNCED restart's reconnect skips the arm — the resync lands in a beat and the flash was pure noise; a restart that never comes back stays loud through the disconnected state itself, and a SECOND reconnect arms as always
-pendingWhy="";freshPending=true;try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}}};
+pendingWhy="";freshPending=true;try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}
+enqueue({type:"wsup"});}};   // the flip as a FRAME too: frames of the dead socket may still be draining from the FIFO, and a bundle that scopes "loaded on this socket" must see the flip between them and the new socket's frames, not at onopen (review find 2026-09-07)
 ws.onmessage=function(ev){lastRecv=Date.now();resumeProvisional=0;if(returnAt)returnBytes+=(ev.data&&ev.data.length)||0;var msg;try{msg=JSON.parse(ev.data);}catch(e){return;}
 if(msg&&msg.type==="ka"){if(LOADEDV&&msg.dv&&msg.dv>LOADEDV)raiseBuild();
 if(stalePending&&++staleKa>=2){var sw=stalePending;stalePending="";raiseStale(sw);}   // the SECOND keepalive since the arm, no resync between: a full heartbeat period on THIS socket with the kernel alive, talking to it, and not resyncing it — the view IS stale. (One keepalive alone can be a beat queued at accept, ahead of the resync frame.)
@@ -47273,6 +47397,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if msg and msg.get("type") == "activeTab":
             client["active"] = msg.get("id")   # tab switch → next push builds the now-active tab first
+            if msg.get("id"):
+                _release_skeleton(client, str(msg["id"]))   # a skeleton tab clicked: its full rides that push (2026-09-07)
             _pusher_wake.set()                 # …and that push starts when the in-flight cycle ends, not
             return                             #    after the 0.5 s backstop (the tab switch IS the event)
         if msg and msg.get("type") == "needSlot" and msg.get("slot") in _DELTA_SLOTS:
@@ -47387,12 +47513,10 @@ class Handler(BaseHTTPRequestHandler):
                     _o = [s["sid"] for s in _alive]
                     # name+color per tab → the client paints the whole strip as placeholders up front (tabs-first)
                     _tabs = [{"id": s["sid"], "name": s.get("name", ""), "color": _name_color(s["sid"])} for s in _alive]
-                    _frame = _tab_order_frame(_o, _tabs, _tm)
-                    client["send"](json.dumps(_frame))
-                    # sent on the raw socket, not through _send_client — so its views seq is captured here
-                    _sq = _views_seq_of(_frame)
-                    if _sq is not None:
-                        _VIEWS_SERVED.seqs.append(_sq)
+                    _resolve_reconnect(client, _alive)   # a no-op here (the reset above consumed the flag) — every strip sender resolves
+                    # through _send_client, which captures the frame's views seq for the caps frame below (the raw send
+                    # this replaced bypassed that capture and had to record the seq by hand)
+                    _send_tab_order(client, _o, _tabs, _tm)
                 except Exception:
                     pass
             finally:
@@ -48323,6 +48447,7 @@ class Handler(BaseHTTPRequestHandler):
         wid = (q.get("wid") or [""])[0]         # which DASHBOARD this pane belongs to → _send_to_view aims at one
         iid = (q.get("iid") or [""])[0]         # which page INSTANCE: a reconnect carrying it retires its old socket
         active = (q.get("active") or [""])[0]   # the tab this client is looking at → _push builds it FIRST
+        reconnect = (q.get("reconnect") or [""])[0] == "1"   # the shim's own statement: this page opened a socket before
         self.send_response(101)
         self.send_header("Upgrade", "websocket")
         self.send_header("Connection", "Upgrade")
@@ -48343,7 +48468,14 @@ class Handler(BaseHTTPRequestHandler):
             client["delta"] = True                     # the shim reassembles view deltas (see _send_slot)
         if iid:
             client["iid"] = iid
+        if reconnect:
+            # The page held every session before its socket died, so the FIRST tabOrder sender to see this
+            # flag skeletons the tabs it is not looking at (_resolve_reconnect); a full push for one tab on
+            # screen was 17 session frames / 9 MB on the measured board (2026-09-07).
+            client["reconnect"] = True
         _register_ws_client(client)
+        if client.get("reconnect"):
+            _pusher_wake.set()   # the reconnect is the event; without this it waited out the 0.5-3 s backstop
         try:
             while client["alive"]:
                 # one COMPLETE message per iteration — fragments reassembled, pings answered inline

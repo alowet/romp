@@ -56,12 +56,18 @@ test("every input the strip renders is in the signature", () => {
   assert.match(sig, /visibleIds\.map\(\(id\) => \{/, "per visible id: a placeholder's meta or the session's painted fields");
   // the state class the paint adds is the signature's own reading of the state: one rule for both — and for
   // the folded header's pip (tab-state.ts, the shared module)
-  assert.match(fn, /const stateCls = tabStateClass\(s\.status\);\s*\n\s*if \(stateCls\) tab\.classList\.add\(stateCls\);/);
+  // …applied in applyTabStatus, the chip helper renderTabs shares with the skeleton tab (2026-09-07)
+  const chip = RENDER.slice(RENDER.indexOf("function applyTabStatus("), RENDER.indexOf("function wireTabDrag("));
+  assert.match(fn, /const st = applyTabStatus\(tab, s\);/);
+  assert.match(chip, /const stateCls = tabStateClass\(s\.status\);\s*\n\s*if \(stateCls\) tab\.classList\.add\(stateCls\);/);
   assert.match(RENDER, /^import \{ tabStateClass, tabDotClass, sectionPip, sectionPipMembers, sectionPipTitle \} from "\.\/tab-state";/m);   // + tabDotClass: the dot slot every tab carries derives from st.state, already in the signature (the tab-strip fix, 2026-09-08)
 });
 
 test("a tab drag resets the signature (its live reorder changes the strip's DOM outside renderTabs), and the tooltip reads the session fresh", () => {
-  assert.match(fn, /tab\.addEventListener\("dragstart", \(e\) => \{\s*\n\s*draggedId = id; draggedEl = tab; tabDragCommitted = false;\s*\n\s*tabStripSig = "";/);
+  // the listeners live in wireTabDrag, shared with the skeleton tab (2026-09-07); renderTabs wires every loaded tab through it
+  assert.match(fn, /wireTabDrag\(tab, id\);/);
+  const wire = RENDER.slice(RENDER.indexOf("function wireTabDrag("), RENDER.indexOf("function makeSkeletonTab("));
+  assert.match(wire, /tab\.addEventListener\("dragstart", \(e\) => \{\s*\n\s*draggedId = id; draggedEl = tab; tabDragCommitted = false;\s*\n\s*tabStripSig = "";/);
   assert.match(fn, /showTabTip\(tab, sessions\.get\(id\) \?\? s\)/, "a tab node now outlives a frame that replaced the session object");
   assert.match(RENDER, /^let tabStripSig = "";/m);
   // a GROUP drag needs no reset: its dragover only marks the drop target (no live reorder of headers — the

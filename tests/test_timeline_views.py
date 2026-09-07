@@ -263,13 +263,16 @@ class TimelineViews(unittest.TestCase):
         self.assertIn('**_views_payload(),', src, "the timeline payload carries the RENDERED shape (through the one carrier, which marks "
                       "a blob a read fault left unproved or sends the marker alone, 2026-09-08)")
         self.assertIn('"palette": pal.colors(_palette_name()),', src, "and the palette, for tag colors in every host")
-        self.assertIn('_tab_order_frame(tab_order, tab_meta, tmux)', src, "tabOrder pushes carry it (the one frame builder, T258)")
-        # every tabOrder frame is built by ONE helper (2026-09-06: the frame also carries selfHost; 2026-09-08: the
-        # views ride the one carrier, which marks a blob a read fault left unproved or sends the marker alone)
-        self.assertIn('return {"type": "tabOrder", "order": list(order), "tabs": tabs, "selfHost": _self_host(),\n'
-                      '            **_views_payload(), "live": sorted({str(x) for x in live})}', src, "tabOrder frames carry it")
+        self.assertIn('_send_tab_order(c, tab_order, tab_meta, tmux)', src, "tabOrder pushes carry it (through the one frame builder, T258)")
+        # every tabOrder frame is built by ONE helper (2026-09-06: the frame also carries selfHost; 2026-09-07: it is
+        # built per client through _send_tab_order, so a reconnecting client's skeleton list can ride it; 2026-09-08:
+        # the views ride the one carrier, which marks a blob a read fault left unproved or sends the marker alone)
+        self.assertIn('fr = {"type": "tabOrder", "order": list(order), "tabs": tabs, "selfHost": _self_host(),\n'
+                      '          **_views_payload(), "live": sorted({str(x) for x in live})}', src, "tabOrder frames carry it")
         self.assertIn('**_views_payload(), "live":', src, "…which carries the blob")
-        self.assertIn('_frame = _tab_order_frame(_o, _tabs, _tm)', src, "the connect-time tabOrder carries it")
+        # the connect-time strip goes through _send_tab_order → _tab_order_frame, whose frame is the literal pinned
+        # above; pin the hand-off instead of a second literal
+        self.assertIn('_send_tab_order(client, _o, _tabs, _tm)', src, "the connect-time tabOrder carries it")
 
     def test_web_boot_exposes_the_set_views_hook(self):
         src = open(os.path.join(BIN, "romp-kernel")).read()
