@@ -30,7 +30,13 @@ test("the shell's reveal script waits for exactly that message, never another pa
 test("revealCard unfolds a collapsed thread before looking for the card (no silent miss on a fold)", () => {
   assert.match(SRC, /function unfoldThreadsFor\(keys: Set<string>\): void \{/);
   // both "take me to this card" entries share it: the bell-entry/notification jump and the chat-dot jump
-  assert.match(SRC, /unfoldThreadsFor\(new Set\(\["a:" \+ String\(m\.itemId \|\| ""\)\]\)\);\n    const target = document\.querySelector/);
+  // the card id is matched STRUCTURALLY (dataset.key equality), never interpolated into a selector: a
+  // crafted push-card value with a quote or bracket used to throw inside querySelector and skip the
+  // openSession fallback (review fold on #940, 2026-09-07); the landing script also drops a non-id value
+  assert.match(SRC, /const key = "a:" \+ String\(m\.itemId \|\| ""\);\n    unfoldThreadsFor\(new Set\(\[key\]\)\);/);
+  assert.match(SRC, /\.find\(\(c\) => c\.dataset\.key === key\) \|\| null;/);
+  assert.doesNotMatch(SRC, /querySelector\(`\[data-key="a:\$\{/, "no interpolated selector");
+  assert.match(KERNEL, /if\(pc&&!\/\^\[A-Za-z0-9_\.:-\]\{1,128\}\$\/\.test\(pc\)\)pc='';/, "a non-id push-card is dropped before it lands");
   assert.match(SRC, /function revealCards\(keys: Set<string>\) \{\n  unfoldThreadsFor\(keys\);/);
   // and the existing fallback stands: a card gone from the feed still opens its session
   assert.match(SRC, /\} else if \(m\.sid\) \{\n      vscodeApi\?\.postMessage\(\{ type: "openSession", id: String\(m\.sid\) \}\);/);

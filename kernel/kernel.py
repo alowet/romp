@@ -34287,6 +34287,10 @@ if('serviceWorker' in navigator&&navigator.serviceWorker&&navigator.serviceWorke
 navigator.serviceWorker.addEventListener('message',function(ev){var m=ev&&ev.data;
 if(m&&m.romp==='notificationClick')land(String(m.sid||''),String(m.kind||''),String(m.cardId||''),false);});}
 var u=new URL(location.href),pr=u.searchParams.get('push-reveal'),pc=u.searchParams.get('push-card');
+// push-card is a goal id; a crafted link with a quote or bracket would reach the feed's
+// [data-key="a:..."] lookup as a selector and throw a SyntaxError that skips the openSession fallback
+// too (review find on #940, 2026-09-07). Drop a non-id value before it lands.
+if(pc&&!/^[A-Za-z0-9_.:-]{1,128}$/.test(pc))pc='';
 if(pr||pc){land(pr||'',pc?'card':'',pc||'',true);
 u.searchParams['delete']('push-reveal');u.searchParams['delete']('push-card');
 try{history.replaceState(null,'',u.pathname+(u.searchParams.toString()?'?'+u.searchParams.toString():'')+u.hash);}catch(e){}}
