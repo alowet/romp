@@ -20,15 +20,14 @@ ps = SourceFileLoader("romp_postal_echo", os.path.join(BIN, "romp-postal-service
 
 class SendEcho(unittest.TestCase):
     def setUp(self):
-        self._saved = (ps._http, ps.my_name, ps.my_id, ps._heartbeat)
+        self._saved = (ps._http, ps._self_identity, ps._heartbeat)
         self.posts = []
         ps._http = lambda method, path, payload=None: (self.posts.append((method, path, payload)) or {})
-        ps.my_name = lambda: "web"
-        ps.my_id = lambda: "id-web"
+        ps._self_identity = lambda: ("id-web", "web")     # the one resolver every tool call reads (2026-09-06)
         ps._heartbeat = lambda *a, **k: None
 
     def tearDown(self):
-        ps._http, ps.my_name, ps.my_id, ps._heartbeat = self._saved
+        ps._http, ps._self_identity, ps._heartbeat = self._saved
 
     def _send(self, kind):
         out, err = ps._mcp_call("send_message", {"to": "api", "body": "the staging port?", "kind": kind})

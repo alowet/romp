@@ -377,6 +377,26 @@ PY
     grep -q "X-Kind: coordinate" "$(mb uuid-b)/new/"*
 }
 
+@test "heartbeat: the bus answers local from its own listing, and only then" {
+    # The bit a session's MCP loop reads to stop beating (2026-09-06): true only for a sid the bus's own
+    # kernel listing holds; a sid it does not list is recorded as remote presence exactly as before.
+    _tok="${ROMP_SERVE_TOKEN:-$(cat "$XDG_STATE_HOME/romp/serve-token")}"
+    run curl -s -X POST -H "X-Romp-Token: $_tok" "127.0.0.1:$ROMP_POSTAL_PORT/heartbeat" \
+        -d '{"id": "uuid-a", "name": "alpha"}'
+    [[ "$output" == *'"local": true'* ]]
+    run curl -s -X POST -H "X-Romp-Token: $_tok" "127.0.0.1:$ROMP_POSTAL_PORT/heartbeat" \
+        -d '{"id": "33333333-4444-5555-6666-777777777777", "name": "gamma"}'
+    [[ "$output" == *'"local": false'* ]]
+    run "$POSTAL" agents
+    [[ "$output" == *"gamma"* ]]                  # the remote beat is presence, as it always was
+    [[ "$output" == *"remote"* ]]
+    # the seam drops alpha (the kernel no longer lists it): the same beat is no longer local
+    printf 'beta|uuid-b\n' > "$SESS"; mksessions
+    run curl -s -X POST -H "X-Romp-Token: $_tok" "127.0.0.1:$ROMP_POSTAL_PORT/heartbeat" \
+        -d '{"id": "uuid-a", "name": "alpha"}'
+    [[ "$output" == *'"local": false'* ]]
+}
+
 @test "bus self-stops when no romp clients remain" {
     : > "$SESS"; mksessions   # drop all sessions (also from the seam the bus reads); heartbeats age out (TTL=2)
     local stopped=0 _

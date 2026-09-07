@@ -22,6 +22,8 @@ pm = SourceFileLoader("romp_postal", os.path.join(BIN, "romp-postal-service")).l
 
 ALPHA = "11111111-2222-3333-4444-555555555555"
 GHOST = "99999999-8888-7777-6666-555555555555"
+THREAD = "11111111-2222-3333-4444-777777777777"
+PEER = "99999999-8888-7777-6666-555555555557"    # a federated peer: known here only by its heartbeat
 
 
 def _tool_names():
@@ -55,6 +57,15 @@ class LiveOnlyAddressing(unittest.TestCase):
         _set_live([{"id": ALPHA, "name": "alpha"}])
         self.assertIsNone(pm._recip_id_for(GHOST))
 
+    def test_a_live_thread_row_resolves_by_its_own_name(self):
+        # a comment thread is hidden from the default listing; recipient resolution asks for thread
+        # rows (the 2026-08-22 rule), so recall by the thread's name still finds it now that its
+        # heartbeat no longer leaves a phantom remote row (2026-09-06)
+        _set_live([{"id": ALPHA, "name": "alpha"},
+                   {"id": THREAD, "name": "alpha-t1", "thread": True, "parent": ALPHA}])
+        self.assertEqual(pm._recip_id_for("alpha-t1"), THREAD)
+        self.assertEqual(pm._name_for_id(THREAD), "alpha-t1", "the thread's name lives only on its row")
+
     def test_heartbeat_remote_resolves(self):
         # a heartbeating remote peer is LIVE for addressing purposes
         _set_live([])
@@ -75,7 +86,7 @@ class RecallReachesParkedMailForTheDead(unittest.TestCase):
 
     def tearDown(self):
         os.environ.pop("ROMP_SESSIONS_FILE", None)
-        for rid in (GHOST, "99999999-8888-7777-6666-555555555556"):
+        for rid in (GHOST, "99999999-8888-7777-6666-555555555556", PEER):
             box = pm.MAILROOT / rid / "new"
             if box.is_dir():
                 for f in box.iterdir():
@@ -103,6 +114,36 @@ class RecallReachesParkedMailForTheDead(unittest.TestCase):
     def test_only_the_senders_own_mail_comes_back(self):
         self._park(GHOST, "ghost")
         self.assertEqual(pm._recall("00000000-0000-0000-0000-000000000001", "ghost", None), [])
+
+    def test_recall_by_a_live_thread_name(self):
+        # a comment thread withholds its names entry, so only its live row can carry the name
+        _set_live([{"id": ALPHA, "name": "alpha"},
+                   {"id": THREAD, "name": "alpha-t1", "thread": True, "parent": ALPHA}])
+        box = pm.MAILROOT / THREAD / "new"
+        box.mkdir(parents=True, exist_ok=True)
+        (box / "m7").write_text("From: alpha\nFrom-Id: %s\n\nthe reply body" % ALPHA)
+        try:
+            removed = pm._recall(ALPHA, "alpha-t1", None)
+            self.assertEqual([(r["id"], r["to"]) for r in removed], [("m7", "alpha-t1")])
+            self.assertEqual(list(box.iterdir()), [])
+        finally:
+            for f in box.iterdir():
+                f.unlink()
+
+
+    def test_recall_by_a_remote_peers_name(self):
+        # a peer known here only through its heartbeat (a federated session: no local row, no names
+        # entry): recall by its name resolves through the remote presence _recip_id_for folds into the
+        # listing it is handed, as it did when it fetched the listing itself (2026-09-06)
+        pm.HEARTBEATS[PEER] = ("ghost", pm.time.time())
+        self.addCleanup(pm.HEARTBEATS.clear)
+        (pm.NAMES_DIR / PEER).unlink(missing_ok=True)       # only the heartbeat may name it
+        box = pm.MAILROOT / PEER / "new"
+        box.mkdir(parents=True, exist_ok=True)
+        (box / "m8").write_text("From: alpha\nFrom-Id: %s\n\nthe body" % ALPHA)
+        removed = pm._recall(ALPHA, "ghost", None)
+        self.assertEqual([r["id"] for r in removed], ["m8"])
+        self.assertEqual(list(box.iterdir()), [])
 
 
 class KernelSilenceIsNotDeadness(unittest.TestCase):
