@@ -924,6 +924,30 @@ def _version_info():
             "nativeDialogs": _native_dialogs()}   # whether Browse… can draw a dialog HERE → the gear drops the button when it can't
 
 
+# client-diag.jsonl held rare breadcrumbs (a wsclose, a stale-banner raise) until the pane bundles began posting
+# a performance row per pane per active minute (ui/webview/perf-telemetry.ts, 2026-09-06): about 1 KB each, so
+# an open dashboard adds several MB a day and nothing pruned it. Past this many bytes the file is renamed to
+# client-diag.jsonl.1 (replacing the previous .1) and a new file starts, so at most two files, about 16 MB,
+# are ever kept; `romp perf client` reads both. Checked on every append: one stat, under one lock.
+CLIENT_DIAG_MAX_BYTES = 8 * 1024 * 1024
+_client_diag_lock = threading.Lock()
+
+
+def _client_diag_append(fp, line):
+    """Append one row to client-diag.jsonl, rotating it first once it is at the cap. One lock across the size
+    check, the rename and the write: every pane's socket is its own handler thread, so rows arrive
+    concurrently, and two threads finding the file at the cap at once would both rename, the second moving
+    the file the first had just started over the run the first had just rotated, and that run was gone."""
+    with _client_diag_lock:
+        try:
+            if fp.stat().st_size >= CLIENT_DIAG_MAX_BYTES:
+                os.replace(str(fp), str(fp) + ".1")
+        except OSError:
+            pass   # no file yet (fresh state) or a failed rename: the append below still goes to the current file
+        with open(fp, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
 def _dist_ver():
     """A cache-bust token = the newest mtime across the built bundles (dist/*.js + *.css). Appended as
     `?v=<token>` to every <script>/<link> URL so a rebuilt bundle gets a NEW url → the browser is
@@ -34173,7 +34197,10 @@ if(!P.createDiv)P.createDiv=function(o){return this.createEl('div',o);};
 if(!P.createSpan)P.createSpan=function(o){return this.createEl('span',o);};})();
 (function(){var api=window.acquireVsCodeApi(),panel=null;
 function post(m){api.postMessage(m);}
-window.addEventListener("message",function(ev){var m=ev.data;if(!m||!panel)return;
+// the frame listener, wrapped like every pane's through the page's performance collector when there is one
+// (ui/webview/perf-telemetry.ts, published on window.__rompPerf by federation.js, which loads before this boot),
+// so each frame's handling is timed by type; without a collector the plain listener
+var onFrame=function(ev){var m=ev.data;if(!m||!panel)return;
 if(m.type==="data")panel.update(m.data);
 else if(m.type==="bars"&&panel.applyBars)panel.applyBars(m);
 else if(m.type==="activeChat"&&panel.setActiveChat)panel.setActiveChat(m.activeChat);
@@ -34184,7 +34211,8 @@ else if(m.type==="hover"&&panel.setHover)panel.setHover(m);
 else if(m.type==="revealEvent"&&panel.revealEvent)panel.revealEvent(m.sid,m.t,m.id);
 else if(m.type==="models"&&panel.refreshModels)panel.refreshModels();
 else if(m.type==="tagEditFailed"&&panel.tagEditFailed)panel.tagEditFailed(m);
-else if(m.type==="openViewsDialog"&&panel._openViewsDialog)panel._openViewsDialog(null);});
+else if(m.type==="openViewsDialog"&&panel._openViewsDialog)panel._openViewsDialog(null);};
+window.addEventListener("message",(window.__rompPerf&&window.__rompPerf.wrapFrameHandler)?window.__rompPerf.wrapFrameHandler(onFrame):onFrame);
 window.__rompTimelineOpenExternal=function(url){try{var u=new URL(url);if(u.protocol==="vscode:"){var q=u.searchParams;
 post({type:"deepLink",session:q.get("session"),anchor:q.get("anchor")||undefined,anchorT:Number(q.get("anchorT"))||undefined,anchorKind:q.get("anchorKind")||undefined,compose:q.get("compose")==="1"});
 if(window.parent!==window)window.parent.postMessage({romp:"reveal",pane:"chat"},"*");return;}}catch(e){}window.open(url,"_blank");};
@@ -39788,8 +39816,9 @@ class Handler(BaseHTTPRequestHandler):
                 rec = {"t": int(time.time()), "wid": str(client.get("wid") or ""),
                        "surface": str(msg.get("surface") or ""), "what": str(msg.get("what") or ""),
                        "data": msg.get("data")}
-                with open(jd.STATE / "client-diag.jsonl", "a", encoding="utf-8") as f:
-                    f.write(json.dumps(rec) + "\n")
+                # past the size cap the file becomes .1 and a new one starts; the check, rename and write are one
+                # locked step, since every pane's socket posts from its own handler thread
+                _client_diag_append(jd.STATE / "client-diag.jsonl", json.dumps(rec) + "\n")
             except OSError:
                 pass
         elif msg and msg.get("type") == "orderAudit":
