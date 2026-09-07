@@ -1528,9 +1528,14 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
             outp = os.path.join(JUDGE_SCRATCH, "codex-%d-%d.out" % (os.getpid(), rid))
             try:
                 try:
-                    # another vendor's process has no use for the Anthropic key (_judge_env re-injects
-                    # it for key-billed sessions); strip it from the child's environment (PR #885 review)
-                    cenv = {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"}
+                    # another vendor's process has no use for anything in the Anthropic namespace.
+                    # _judge_env already withholds the billing names for a codex call (auth "codex":
+                    # nothing is injected back), but the kernel's environment can carry more under the
+                    # same prefix — ANTHROPIC_BASE_URL and ANTHROPIC_CUSTOM_HEADERS for a proxy (the
+                    # header usually carries its credential), ANTHROPIC_MODEL, debug knobs — and a list
+                    # would need maintaining as the CLI grows names. Strip the prefix; the harmless
+                    # names go too, on purpose (PR #885 review, widened from the one key)
+                    cenv = {k: v for k, v in env.items() if not k.startswith("ANTHROPIC_")}
                     p = subprocess.run(_judge_cmd_codex(model, _codex_effort(effort, tier), outp),
                                        input=(sys_prompt or "") + "\n\n" + (user or ""),
                                        capture_output=True, text=True, cwd=JUDGE_SCRATCH, env=cenv,

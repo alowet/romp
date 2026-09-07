@@ -154,13 +154,17 @@ class JudgeEngine(unittest.TestCase):
         self.assertIn("--output-format", cmd)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class CodexChildEnvIsVendorScoped(unittest.TestCase):
-    """The Anthropic key never reaches the codex judge child (PR #885 review): _judge_env re-injects it
-    for key-billed sessions, and another vendor's process has no use for it."""
+    """No ANTHROPIC_* name reaches the codex judge child (PR #885 review, widened to the prefix):
+    _judge_env withholds the billing names for a codex call, and the branch strips whatever else rides
+    under the vendor's prefix — a proxy URL, custom headers, a model pin — because another vendor's
+    process has no use for any of it."""
+
+    # not credential-shaped (the repo is scanned for secrets), and a failure prints names only
+    FIXTURES = {"ANTHROPIC_API_KEY": "sk-test-not-real",
+                "ANTHROPIC_AUTH_TOKEN": "romp-test-fixture-token",
+                "ANTHROPIC_BASE_URL": "https://proxy.example.invalid",
+                "ANTHROPIC_CUSTOM_HEADERS": "X-Test: fixture"}
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -168,7 +172,8 @@ class CodexChildEnvIsVendorScoped(unittest.TestCase):
         jd._state_cache.clear()
         (jd.STATE / "judge-engine").write_text("codex")
 
-    def test_the_codex_subprocess_env_lacks_the_anthropic_key(self):
+    def _codex_child_env(self, *patches):
+        """One codex judge call with subprocess.run replaced; returns the env the child was given."""
         from unittest import mock
         seen = {}
 
@@ -182,14 +187,42 @@ class CodexChildEnvIsVendorScoped(unittest.TestCase):
                 Path(outp[-1]).write_text("ok")
             return _P()
 
-        fake_env = dict(os.environ, ANTHROPIC_API_KEY="sk-test-not-real", ROMP_SUMMARIZING="1")
-        with mock.patch.object(jd, "_judge_env", return_value=fake_env), \
-             mock.patch.object(jd.subprocess, "run", side_effect=fake_run), \
-             contextlib.redirect_stderr(io.StringIO()):
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(jd.subprocess, "run", side_effect=fake_run))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
             try:
                 jd._judge_run("gpt-5", "SYS", "payload", judge="captioner", tier="index")
             except Exception:
                 pass                                  # the reply shape is not under test here
         self.assertIsNotNone(seen.get("env"), "the codex branch ran through subprocess.run")
-        self.assertNotIn("ANTHROPIC_API_KEY", seen["env"], "the Anthropic key is stripped from the codex child")
-        self.assertEqual(seen["env"].get("ROMP_SUMMARIZING"), "1", "…and the rest of the judge env rides as before")
+        return seen["env"]
+
+    def _assert_no_anthropic_name(self, env):
+        # names only, in every message: assertNotIn on a mapping prints the whole mapping on failure,
+        # i.e. a developer's real environment
+        for name in self.FIXTURES:
+            self.assertFalse(name in env, "%s reached the codex child" % name)
+        leaked = sorted(k for k in env if k.startswith("ANTHROPIC_"))
+        self.assertEqual(leaked, [], "ANTHROPIC_* names reached the codex child: %s" % leaked)
+        self.assertEqual(env.get("ROMP_SUMMARIZING"), "1", "…and the rest of the judge env rides as before")
+
+    def test_the_codex_subprocess_env_lacks_every_anthropic_name(self):
+        # whatever _judge_env hands over, the branch strips the prefix — its own rule, not _judge_env's list
+        from unittest import mock
+        fake_env = dict(os.environ, ROMP_SUMMARIZING="1", **self.FIXTURES)
+        env = self._codex_child_env(mock.patch.object(jd, "_judge_env", return_value=fake_env))
+        self._assert_no_anthropic_name(env)
+
+    def test_the_real_judge_env_and_the_strip_compose(self):
+        # the unmocked path: a codex call resolves auth "codex", so _judge_env withholds the billing names
+        # and injects none back; the proxy URL and headers are what the prefix strip is for
+        from unittest import mock
+        env = self._codex_child_env(mock.patch.dict(os.environ, self.FIXTURES))
+        self._assert_no_anthropic_name(env)
+        self.assertEqual(env.get("DISABLE_PROMPT_CACHING"), "1", "the real _judge_env built this env")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -48,7 +48,9 @@ one-shot `codex exec` call — ephemeral (no session files), using romp's custom
 `romp_judge` permission profile, and billing the machine's Codex login. The
 profile grants only Codex's minimal runtime files plus read access to the fresh
 empty scratch workspace supplied by `-C`; it denies writes, network access, and
-host-wide reads. Verified live: the real caption and gist
+host-wide reads. Every `ANTHROPIC_*` variable is removed from the child's
+environment, so a key, proxy URL or custom header configured for Claude never
+reaches Codex. Verified live: the real caption and gist
 judges answer correctly in ~5–6s per call.
 
 Honest caveats while this is new:
