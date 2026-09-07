@@ -10683,7 +10683,7 @@ function prettyMode(m: string | undefined): string {
 }
 const CODEX_MODE_CHOICES: MetaChoice[] = [
   { label: "Sandboxed", value: "sandboxed", sub: "commands stay sandboxed; escalation is denied" },
-  { label: "Auto", value: "auto", sub: "Codex reviews escalations; manual requests are denied" },
+  { label: "Auto", value: "auto", sub: "approved commands run unsandboxed as you; the rest denied" },
 ];
 const META_CHOICES: Record<MetaKind, MetaChoice[]> = {
   mode: MODE_CHOICES, model: MODEL_CHOICES, effort: EFFORT_CHOICES, fast: FAST_CHOICES,

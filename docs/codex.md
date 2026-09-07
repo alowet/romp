@@ -90,11 +90,16 @@ when the kernel restarts. Existing and new sessions default to Sandboxed.
 
 - **Sandboxed:** commands stay within the workspace permission profile;
   requests to execute outside it are denied.
-- **Auto:** the same sandbox stays enabled. Codex's own automatic reviewer
-  evaluates escalation requests (`on-request` with `auto_review`); ROMP does not
-  approve them itself. A reviewer refusal remains a refusal. Requests routed
-  back to ROMP for manual approval are declined with a warning because the
-  current SDK cannot wait for a UI answer without blocking its shared reader.
+- **Auto:** the sandbox applies only to commands the reviewer does not let
+  out. Codex's own automatic reviewer evaluates escalation requests
+  (`on-request` with `auto_review`); ROMP does not approve them itself. A
+  command the reviewer approves runs OUTSIDE the sandbox, as the kernel's user,
+  with that user's full access; the reviewer approves low- and medium-risk
+  actions on its own judgement, so the read-confidentiality the Sandboxed mode
+  gives is not promised here. A reviewer refusal remains a refusal. Requests
+  routed back to ROMP for manual approval are declined with a warning because
+  the current SDK cannot wait for a UI answer without blocking its shared
+  reader.
 
 Change modes between turns; an in-flight turn retains the mode it started with.
 Auto may allow a reviewed command to run outside the sandbox, so it has a wider
