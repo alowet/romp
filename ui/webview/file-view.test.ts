@@ -78,10 +78,11 @@ test("the viewer is a singleton MODAL over its pane: ~95% card, dimmed backdrop,
 // chat already has. "Comment" means only the transcript's live threads now. ──
 
 test("selecting in the viewer seeds the composer's editor chip — the editorSelection shape, path:line label", () => {
-  // mouseup posts to our OWN window (the browseFiles precedent — no import cycle with render.ts),
+  // mouseup posts to the composer's window — this document's when it holds one (the browseFiles
+  // precedent — no import cycle with render.ts), else the shell's chat pane (composerWindow, below) —
   // and render.ts's existing editorSelection handler owns the chip end to end
   assert.match(VIEW, /box\.addEventListener\("mouseup", \(\) => \{/);
-  assert.match(VIEW, /window\.postMessage\(\{ type: "editorSelection", text: picked, sid: sid \|\| undefined, src: quoteSrcLabel\(path, doc, picked\) \}, "\*"\);/);
+  assert.match(VIEW, /seedTarget\.postMessage\(\{ type: "editorSelection", text: picked, sid: sid \|\| undefined, src: quoteSrcLabel\(path, doc, picked\) \}, "\*"\);/);
   // a collapsed or out-of-viewer selection seeds nothing, and CodeMirror selections are edits
   assert.match(VIEW, /if \(!sel \|\| sel\.isCollapsed \|\| !sel\.anchorNode \|\| !box\.contains\(sel\.anchorNode\)\) return;/);
   assert.match(VIEW, /if \(editing\) return;/);
@@ -107,14 +108,47 @@ test("the label's line is minted against a FRESH read, and a failed re-read fall
   assert.match(VIEW, /if \(seq !== seedSeq\) return;/, "two racing reads: the last gesture wins");
 });
 
-test("the FEED-hosted viewer stays inert: no editorSelection listener there, and no review layer anywhere", () => {
-  // the feed document has no composer — the posted message just lands unheard, by design
+test("a viewer whose document has no composer seeds THROUGH the shell: the feed reaches the chat's chip", () => {
+  // The feed document has no composer, so a post to its own window landed unheard — the guide's
+  // promise that any passage selected in the viewer lands in the composer was false for a file opened
+  // from the feed's file browser, and each selection still paid the fresh read. So the TARGET is
+  // resolved: this window when it holds the composer, else the same-origin shell, which forwards the
+  // unchanged message into the chat pane. No composer and no shell (VS Code's cross-origin parent, a
+  // standalone pane) still stands the gesture down before the fresh read (the no-sink gating).
+  assert.match(VIEW, /function composerWindow\(\): Window \| null \{\n\s*if \(document\.getElementById\("composer-input"\)\) return window;\n\s*try \{ if \(window\.parent !== window && window\.parent\.document\.getElementById\("chat-pane"\)\) return window\.parent; \}\n\s*catch \{[^}]*\}\n\s*return null;\n\}/);
+  assert.match(VIEW, /const seedTarget = composerWindow\(\);\n\s*if \(!seedTarget\) return;/);
+  // the shell's arm: the SAME message, forwarded whole into the chat frame — sid intact, so the chip
+  // lands in the session the file was opened for (the 2026-08-19 routing rule holds across documents)
+  const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
+  assert.match(KERNEL, /if\(m\.type==='editorSelection'&&typeof m\.text==='string'\)\{var fc=document\.getElementById\('f-chat'\);\n\s*try\{fc&&fc\.contentWindow&&fc\.contentWindow\.postMessage\(m,'\*'\);\}catch\(e\)\{\}\}/);
+  // …and the chat's existing window-message handler is the receiver: nothing new listens in feed.ts
+  assert.match(RENDER, /else if \(m\.type === "editorSelection" && typeof m\.text === "string" && m\.text\.trim\(\)\) \{/);
   assert.doesNotMatch(FEED, /editorSelection/);
   // the review layer is gone from every module and both sheets, and the orphaned store is swept
   for (const source of [VIEW, RENDER, FEED, CHAT_CSS, FEED_CSS]) {
     assert.doesNotMatch(source, /setCommentSink|buildReviewMessage|fv-hl|fileview-submit/);
   }
   assert.match(VIEW, /localStorage\.removeItem\("romp:fileviewComments"\)/);
+});
+
+// executed: composerWindow's ladder, lifted from the source (a hand copy would drift), run against
+// shimmed window/document pairs for each hosting situation
+test("composerWindow, executed: own composer → the same-origin shell's chat pane → nothing", () => {
+  const m = VIEW.match(/function composerWindow\(\): Window \| null \{[\s\S]*?\n\}/);
+  assert.ok(m, "composerWindow found");
+  const body = m![0].replace(/^function composerWindow\(\): Window \| null /, "");
+  const run = new Function("window", "document", "return (function()" + body + ")();") as (w: unknown, d: unknown) => unknown;
+  const doc = (ids: string[]) => ({ getElementById: (id: string) => (ids.includes(id) ? {} : null) });
+  const self: any = {}; self.parent = self;
+  assert.equal(run(self, doc(["composer-input"])), self, "the chat document: its own window");
+  const shell = { document: doc(["chat-pane"]) };
+  const framed = { parent: shell };
+  assert.equal(run(framed, doc([])), shell, "a pane inside the shell: the shell, which forwards into the chat");
+  assert.equal(run(framed, doc(["composer-input"])), framed, "a composer at hand always wins over the relay");
+  assert.equal(run({ parent: { get document() { throw new Error("cross-origin"); } } }, doc([])), null,
+    "VS Code's cross-origin parent is not the shell — the gesture stands down");
+  assert.equal(run({ parent: { document: doc([]) } }, doc([])), null, "a same-origin parent that is not the shell");
+  assert.equal(run(self, doc([])), null, "unframed and composer-less: nowhere to seed");
 });
 
 test("it waits with the romp loader and fails with the kernel's own words, never a blank pane", () => {
@@ -434,16 +468,18 @@ test("a 200 image renders ONE <img> at an object URL; the quote gesture stays of
 // a selection there seeds a labeled quote chip exactly as in any text view; a blanket media gate
 // would make an .svg's XML unquotable. ──
 test("the quote seed gates off RENDERED media only — the SVG Source view is a text view like any other", () => {
-  // executed: the seed offer across the view states
-  const seedable = (isImage: boolean, isPdf: boolean, srcView: boolean): boolean =>
-    !((isImage || isPdf) && !srcView);
-  assert.equal(seedable(true, false, true), true, "SVG Source view: the selection seeds a chip");
-  assert.equal(seedable(true, false, false), false, "the img view has no honest text to quote");
-  assert.equal(seedable(false, true, false), false, "the PDF iframe owns its own surface");
-  assert.equal(seedable(false, false, false), true, "plain text views are untouched");
-  // source: the media arm of the mouseup gate carves out the Source view, sitting right after the
-  // edit-mode gate (CodeMirror selections are edit gestures, not quotes)
-  assert.match(VIEW, /if \(editing\) return;[^\n]*\n(\s*\/\/[^\n]*\n)*\s*if \(\(isImage \|\| isPdf\) && !\(svgSource && svgText !== null\)\) return;/);
+  // executed: the seed offer across the view states (the no-target gate holds throughout — a
+  // reachable composer, own document or the chat's through the shell, is what makes a gesture)
+  const seedable = (target: boolean, isImage: boolean, isPdf: boolean, srcView: boolean): boolean =>
+    target && !((isImage || isPdf) && !srcView);
+  assert.equal(seedable(true, true, false, true), true, "SVG Source view: the selection seeds a chip");
+  assert.equal(seedable(true, true, false, false), false, "the img view has no honest text to quote");
+  assert.equal(seedable(true, false, true, false), false, "the PDF iframe owns its own surface");
+  assert.equal(seedable(false, true, false, true), false, "no composer reachable still gates everything off");
+  assert.equal(seedable(true, false, false, false), true, "plain text views are untouched");
+  // source: the media arm of the mouseup gate carves out the Source view, sitting AFTER the
+  // no-target gate (whose pin lives in the through-the-shell test above)
+  assert.match(VIEW, /if \(!seedTarget\) return;\n(\s*\/\/[^\n]*\n)*\s*if \(\(isImage \|\| isPdf\) && !\(svgSource && svgText !== null\)\) return;/);
   // anchoring reads the text THE VIEW SHOWS — the Source view's decoded XML, never the text
   // pipeline's null — so a quote on the XML earns its path:line label (viewText, pinned with the
   // fresh-read test above); renderBody's Source arm builds those text nodes through codeBlock
@@ -621,4 +657,100 @@ test("the line gutter numbers every line and drops a trailing newline's phantom 
   assert.match(VIEW, /wrap\.appendChild\(gutter\); wrap\.appendChild\(pre\);/, "sibling, not inside the pre");
   assert.match(FEED_CSS, /\.fileview-gutter \{[\s\S]*?user-select: none;/);
   assert.match(CHAT_CSS, /\.fileview-gutter \{[\s\S]*?user-select: none;/);
+});
+
+// ── the session chip (the user 2026-09-03): the title bar names the session the file was opened
+// from. The viewer knows only a sid — and its openers mostly know no more (the relay branch and the
+// conflict Reload live inside this module, the file browser hands over a bare sid) — so the identity
+// is RESOLVED from the sid through a lookup each hosting document registers once at boot. The DOM
+// build itself runs for real in fileview-chip.test.ts; these are the source pins. ──
+
+test("the title bar carries a session chip resolved from the sid — never invented, absent when unknown", () => {
+  assert.match(VIEW, /import \{ hostOf, bareId, hostNameNodes \} from "\.\/host-prefix";/);
+  assert.match(VIEW, /export interface FileViewIdentity \{ name: string; color: \{ bg: string; fg: string \} \| null \}/);
+  assert.match(VIEW, /let identityOf: \(sid: string\) => FileViewIdentity \| null = \(\) => null;/,
+    "unregistered → nothing to show, not a guess");
+  assert.match(VIEW, /export function setFileViewIdentity\(fn: typeof identityOf\): void \{ identityOf = fn; \}/);
+  const openFn = VIEW.split("export function openFileView")[1].split("function offersDownload")[0];
+  assert.match(openFn, /const owner = sid \? identityOf\(sid\) : null;/, "no sid → the resolver is not even asked");
+  assert.match(openFn, /if \(owner\) \{\n\s*sess = el\("span", "fileview-sess"\);/, "no identity → no chip element at all");
+  assert.match(openFn, /sess\.replaceChildren\(\.\.\.hostNameNodes\(owner\.name, sid\)\);/, "host: quiet for a remote session");
+  assert.match(openFn, /if \(owner\.color\) \{ sess\.style\.background = owner\.color\.bg; sess\.style\.color = owner\.color\.fg; \}/,
+    "the session's identity colour, inline — an uncolored stub keeps the sheet's neutral pill");
+  assert.match(openFn, /sess\.title = "Opened from the " \+ owner\.name \+ " session";/,
+    "capitalized like this bar's other tooltips; 'session' so a name like web is not read as a place");
+  assert.match(openFn, /bar\.appendChild\(name\); if \(sess\) bar\.appendChild\(sess\); bar\.appendChild\(acts\);/,
+    "between the path and the actions");
+  // the signatures every opener and the relay pin depend on are exactly as they were
+  assert.match(VIEW, /export function openFileView\(path: string, sid\?: string \| null\): void \{/);
+  assert.match(VIEW, /export function initFileView\(poster: \(m: Record<string, unknown>\) => void\): void \{/);
+});
+
+test("both hosting documents register a resolver beside their initFileView boot", () => {
+  // the chat document: the tab set, the way renderTabs names a tab (the session first, then the
+  // kernel's tab meta, which keeps a dormant session's name and colour)
+  assert.match(RENDER, /import \{ initFileView, setFileViewIdentity, hostStub \} from "\.\/file-view";/);
+  assert.match(RENDER, /initFileView\(\(m\) => vscodeApi\?\.postMessage\(m\)\);\n(\/\/.*\n)*setFileViewIdentity\(\(id\) => \{\n\s*const s = sessions\.get\(id\) \?\? tabMeta\.get\(id\);\n\s*return s && s\.name \? \{ name: s\.name, color: s\.color \?\? null \} : hostStub\(id\);\n\}\);/);
+  // the feed document: its session list (the same tab set, relayed per frame), else a card carrying
+  // the session's name and colour — never sessionColors, which is keyed by NAME, not sid
+  assert.match(FEED, /import \{ initFileView, setFileViewIdentity, hostStub \} from "\.\/file-view";/);
+  assert.match(FEED, /initFileView\(\(m\) => vscodeApi\?\.postMessage\(m\)\);.*\n(\/\/.*\n)*setFileViewIdentity\(\(id\) => \{\n\s*const s = sessionsMeta\.find\(\(x\) => x\.sid === id\) \?\? asks\.find\(\(a\) => a\.sid === id\);\n\s*return s && s\.name \? \{ name: s\.name, color: s\.color \?\? null \} : hostStub\(id\);\n\}\);/);
+  const feedReg = FEED.split("setFileViewIdentity(")[1].split("});")[0];
+  assert.doesNotMatch(feedReg, /sessionColors/, "a name-keyed index cannot answer a sid");
+});
+
+// executed: the ladder each document's resolver runs — its own lists, then the kernel's
+// _peer_identity fallback (a remote sid's host + the sid's first 8 characters, uncolored), then no
+// chip at all. Synthetic rows: the notes-api world, TESTHOST for the remote kernel.
+test("resolver ladder: a named session, then a host-prefixed 8-char stub, then no chip", () => {
+  type Id = { name: string; color: { bg: string; fg: string } | null };
+  const hostOf = (id: string) => { const i = id.indexOf(":"); return i > 0 ? id.slice(0, i) : ""; };
+  const bareId = (id: string) => { const i = id.indexOf(":"); return i > 0 ? id.slice(i + 1) : id; };
+  const hostStub = (sid: string): Id | null => {
+    const bare = bareId(sid);
+    if (!bare) return null;
+    const host = hostOf(sid);
+    return { name: (host ? host + ":" : "") + bare.slice(0, 8), color: null };
+  };
+  const WEB = "11111111-2222-3333-4444-555555555555";
+  const API = "22222222-3333-4444-5555-666666666666";
+  const TESTS = "33333333-4444-5555-6666-777777777777";
+  const rows = new Map<string, Id>([
+    [WEB, { name: "web", color: { bg: "#3a7bd5", fg: "#ffffff" } }],
+    ["TESTHOST:" + API, { name: "TESTHOST:api", color: { bg: "#d53a7b", fg: "#ffffff" } }],   // federation prefixes sid AND name
+    [TESTS, { name: "", color: null }],                                                        // a placeholder tab, name not yet known
+  ]);
+  const resolve = (id: string): Id | null => {
+    const s = rows.get(id);
+    return s && s.name ? { name: s.name, color: s.color ?? null } : hostStub(id);
+  };
+  assert.deepEqual(resolve(WEB), { name: "web", color: { bg: "#3a7bd5", fg: "#ffffff" } });
+  assert.deepEqual(resolve("TESTHOST:" + API), { name: "TESTHOST:api", color: { bg: "#d53a7b", fg: "#ffffff" } },
+    "a remote row keeps its host: prefix — hostNameNodes renders it as quiet metadata");
+  assert.deepEqual(resolve("44444444-5555-6666-7777-888888888888"), { name: "44444444", color: null },
+    "an unknown local sid → the kernel's 8-character stub, uncolored");
+  assert.deepEqual(resolve("TESTHOST:44444444-5555-6666-7777-888888888888"), { name: "TESTHOST:44444444", color: null },
+    "an unknown remote sid → host: + stub, so the host still reads as metadata");
+  assert.deepEqual(resolve(TESTS), { name: "33333333", color: null },
+    "a row with no name yet is not a name — the stub, never an empty chip");
+  assert.equal(resolve(""), null, "no sid → no chip");
+  assert.equal(resolve("TESTHOST:"), null, "a host with no sid names nothing");
+  // replica ↔ source
+  assert.match(VIEW, /export function hostStub\(sid: string\): FileViewIdentity \| null \{\n\s*const bare = bareId\(sid\);\n\s*if \(!bare\) return null;\n\s*const host = hostOf\(sid\);\n\s*return \{ name: \(host \? host \+ ":" : ""\) \+ bare\.slice\(0, 8\), color: null \};\n\}/);
+});
+
+test("the chip's dress is in BOTH sheets: a fixed-width pill that never yields to the path", () => {
+  for (const css of [CHAT_CSS, FEED_CSS]) {
+    // A BLOCK container, not inline-flex: text-overflow acts on block containers only — on a flex container
+    // the text sits in an anonymous flex item the property cannot reach, and an over-long name hard-clipped
+    // at max-width (the review of #970). 0.82em of --fs, the size the bar's buttons wear, so the chip scales
+    // with its neighbours; a px value did not.
+    assert.match(css, /\.fileview-sess \{ flex: 0 0 auto; display: block; max-width: 38%;[^}]*font-size: 0\.82em;[^}]*overflow: hidden; white-space: nowrap; text-overflow: ellipsis;/);
+    const sess = css.slice(css.indexOf(".fileview-sess {"), css.indexOf("}", css.indexOf(".fileview-sess {")));
+    assert.doesNotMatch(sess, /inline-flex|align-items|font-size: [\d.]+px/, "no flex container around the text, no px size");
+    // color:inherit so the host: token takes the pill's own fg — the global .host-prefix{color:var(--dim)}
+    // otherwise wins over the inline foreground and the token is near-invisible on a coloured pill
+    // (~1:1 contrast for a remote session's chip). opacity keeps it quiet without dimming to gray.
+    assert.match(css, /\.fileview-sess \.host-prefix \{ color: inherit; opacity: 0\.75; \}/, "the host: token uses the pill's fg, quiet");
+  }
 });

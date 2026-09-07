@@ -40,7 +40,7 @@ import { parseAgentNotif, type AgentNotif } from "./agent-notif";
 import { previewKind, previewFull, canPreview, fileUrl, retryFailedPreviews, refreshSettledPreviews, installMdImgHeal, setLightboxNav, type LightboxNavEntry } from "./preview";
 import { openFileView } from "./file-view";
 // initFileView rides its OWN line: the import above is pinned verbatim by file-view.test.ts
-import { initFileView } from "./file-view";
+import { initFileView, setFileViewIdentity, hostStub } from "./file-view";
 import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser is pane-local here now (the user 2026-08-24)
 import { pastedFilePath } from "./paste-path";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
@@ -14000,4 +14000,11 @@ document.getElementById("content")?.addEventListener("contextmenu", showSelectio
 // the kernel's replies come back as window MessageEvents via the pane shim — either document, one
 // mechanism (file-view.ts initFileView).
 initFileView((m) => vscodeApi?.postMessage(m));
+// …and how the viewer names the session a file was opened from: the tab set, the way renderTabs names
+// a tab (nameOf's ladder — the session first, then the kernel's tab meta, which keeps a dormant
+// session's name and colour); a sid neither knows falls to the kernel's 8-character stub.
+setFileViewIdentity((id) => {
+  const s = sessions.get(id) ?? tabMeta.get(id);
+  return s && s.name ? { name: s.name, color: s.color ?? null } : hostStub(id);
+});
 if (vscodeApi) vscodeApi.postMessage({ type: "ready" });
