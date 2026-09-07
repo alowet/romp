@@ -104,7 +104,7 @@ class _World(unittest.TestCase):
         self._write(A, _store(A, "the faulting session's goal"))
         self._write(B, _store(B, "the healthy session's goal"))
         km._parse_cache.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def tearDown(self):
         for sid in (A, B, P):
@@ -121,7 +121,7 @@ class _World(unittest.TestCase):
         p = Path(self.td.name) / (sid + ".jsonl")
         p.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
         km._parse_cache.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         return str(p)
 
     def _rows(self, err=None):
@@ -273,7 +273,7 @@ class InterruptLiftBoundary(_World):
             f.write(json.dumps(_uline(self.RESUME_T, "use the staging host for now", "u3", "u2")) + "\n")
             f.write(json.dumps(_aline(self.RESUME_T + 40, "done", "a2", "u3")) + "\n")
         km._parse_cache.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def test_a_fault_at_the_reengage_tick_keeps_the_marker_so_the_next_tick_lifts(self):
         gid = A + ":g1"
@@ -312,7 +312,7 @@ class InterruptLiftBoundary(_World):
             for r in recs:
                 f.write(json.dumps(r) + "\n")
         km._parse_cache.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def test_a_second_stop_during_the_fault_keeps_the_marker_so_the_block_is_still_lifted_after(self):
         """The kept-marker promise has to survive the block branch too: a SECOND genuine stop while the

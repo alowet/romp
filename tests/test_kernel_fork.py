@@ -270,7 +270,7 @@ class CourierEpisodeFloor(unittest.TestCase):
              "to_id": self.RECIP, "body": "what subnet is the new box on?"}) + "\n")
         self.calls = []
         jd.courier_llm = lambda *a, **k: self.calls.append(1) or '{"verdict": "delegating", "goal": 0, "text": "x"}'
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._discover_cache.clear()
         jd._postal_from_memo["key"] = None
         # the marker rides the comment-wrapped wire form (see test_courier_origin_host)
@@ -283,7 +283,7 @@ class CourierEpisodeFloor(unittest.TestCase):
         (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.CAPDIR, jd.ARCHDIR, jd.PCACHE,
          jd.MESSAGES, jd.ERRORS, jd.EPIDIR, jd.courier_llm) = self.saved
         jd._postal_from_memo["key"] = None
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._discover_cache.clear()
         self.td.cleanup()
 

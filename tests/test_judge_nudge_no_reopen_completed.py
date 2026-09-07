@@ -35,7 +35,7 @@ class NudgeNoReopenCompleted(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.mkdtemp()
         jd._rebind_state(Path(self.td))
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         # a completed top goal (the closer finished it)
         self.store = {"rompUuid": SID, "seq": 1, "placementsV": jd.PLACEMENTS_V,
                       "nodes": {GID: {"id": GID, "text": "Clarify the design", "parentId": None,

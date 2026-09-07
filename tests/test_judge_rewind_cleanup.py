@@ -73,8 +73,7 @@ class Base(unittest.TestCase):
     def tearDown(self):
         jd.set_pending_cut_provider(None)
         jd.end_pass_frame(True)
-        jd._PARSE_CACHE.clear()
-        jd._CHAIN_MEMO.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._rebind_state(self._saved_state)
 
     def write(self, recs):
@@ -832,6 +831,36 @@ class ChainMemo(Base):
         self.assertEqual(jd.chain_memo_stats()["populate"] - before["populate"], 2)
         self.assertEqual(jd._rewound_away(SID, str(self.path), "u2"), "durable")
         self.assertEqual(len(self.built), 2, "the third call is a hit")
+
+    def test_a_same_identity_rewrite_is_served_stale_until_the_memo_is_cleared(self):
+        # WHY every test site that clears _PARSE_CACHE clears _CHAIN_MEMO beside it: both key on the
+        # transcript's (mtime, size), so a fixture rewritten in place to the same byte count inside one
+        # clock tick keeps its key, and a memo an earlier test populated serves the OLD verdict for the
+        # new bytes without reading the file. Deterministic here: the mtime is pinned back with
+        # os.utime, never left to the clock. em's records cache keys on the same identity and is
+        # cleared beside the two, so the rebuild reads the new bytes and the chain memo's own
+        # contribution is what the test isolates.
+        recs = self.base_recs() + self.fork_recs()
+        self.write(recs)
+        want = self.path.stat().st_size
+        st = os.stat(self.path)
+        self.assertEqual(jd._rewound_away(SID, str(self.path), "u2"), "durable")
+        self.assertEqual(len(self.built), 1)
+        # the same byte count with u2 LIVE: the fork rows go, a padded row under a2 makes up the length
+        pad = want - len(("\n".join(json.dumps(r) for r in self.base_recs() + [uline(T0 + 60, "", "u9", "a2")]) + "\n").encode())
+        self.assertGreaterEqual(pad, 0, "the filler row fits inside the original byte count")
+        live = self.base_recs() + [uline(T0 + 60, "x" * pad, "u9", "a2")]
+        self.write(live)
+        os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        now = os.stat(self.path)
+        self.assertEqual((now.st_mtime_ns, now.st_size), (st.st_mtime_ns, st.st_size), "precondition: same identity")
+        self.assertEqual(jd._rewound_away(SID, str(self.path), "u2"), "durable",
+                         "the hazard: the memo serves the pre-rewrite verdict for bytes under which u2 is live")
+        self.assertEqual(len(self.built), 1, "...without a build, so nothing read the new bytes")
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()          # the swept sites' form
+        em._JSONL_CACHE.clear()                                  # the records cache under the adapter, same key
+        self.assertFalse(jd._rewound_away(SID, str(self.path), "u2"), "cleared: rebuilt from the new bytes, u2 kept")
+        self.assertEqual(len(self.built), 2)
 
 
 class PlanSessionIntegration(Base):

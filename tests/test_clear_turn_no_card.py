@@ -78,7 +78,7 @@ class ClearTurnNoCard(unittest.TestCase):
         jd.STATESDIR.mkdir(parents=True, exist_ok=True)
         (jd.STATESDIR / (SID + ".jsonl")).write_text(
             "\n".join(json.dumps(m) for m in markers) + ("\n" if markers else ""))
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         return jd.parsed_session(SID, [str(tpath)], NOW)
 
     def test_no_content_marker_never_becomes_an_atom(self):

@@ -91,7 +91,7 @@ class SplicedDone(unittest.TestCase):
             jd.plan_llm = jd.opener_llm = fake
             jd._group_store = lambda *a, **k: None
             try:
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
             finally:
@@ -142,7 +142,7 @@ class SplicedDone(unittest.TestCase):
             td = Path(td)
             tpath = td / (SID + ".jsonl")
             tpath.write_text("\n".join(json.dumps(r) for r in spliced_records()) + "\n")
-            jd._PARSE_CACHE.clear()
+            jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
             session = jd.parsed_session(SID, [str(tpath)], NOW)
         segs = [seg for turn in session["turns"] for seg in jd.em.segments(turn)]
         by_trig = {seg.get("trigger"): seg for seg in segs}

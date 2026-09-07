@@ -133,7 +133,7 @@ class CourierMintCarriesTheFrame(unittest.TestCase):
         jd.discover = lambda now, window=None, forks=True: fleet
         self._llm = jd.courier_llm
         jd.courier_llm = lambda text, menu, declared=None: '{"verdict": "delegating", "goal": 0, "text": "verify refs"}'
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def tearDown(self):
         jd._delegate_user_rooted = self._rooted

@@ -479,17 +479,17 @@ class LiveWorkCaption(_FleetHarness, unittest.TestCase):
                 self.assertEqual(len(lives()), 1, "the first live caption fires once a CHUNK of work has accrued")
                 self.assertEqual(lives()[0]["grain"], "segment", "no turn-grain while open")
                 # grow by ONE atom (< CHUNK) → throttled, NO re-caption
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 self._tpath.write_text("\n".join(json.dumps(r) for r in self._opened(CHUNK + 2)) + "\n")
                 jd.run_index(now=now + 10)
                 self.assertEqual(len(lives()), 1, "a sub-chunk growth does NOT re-caption (throttled)")
                 # grow by a full CHUNK more → re-caption
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 self._tpath.write_text("\n".join(json.dumps(r) for r in self._opened(2 * CHUNK + 2)) + "\n")
                 jd.run_index(now=now + 20)
                 self.assertEqual(len(lives()), 2, "re-captioned once a full new chunk of atoms accrues")
                 # CLOSE the turn → a FINAL non-live segment caption, and the seg id becomes deduped
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 self._tpath.write_text("\n".join(json.dumps(r) for r in [
                     uline(T0, "investigate the crash", "u1", ps="typed"),
                     aline(T0 + 30, "Fixed the off-by-one crash.", "a1", "u1", tools=("Bash", "Edit"), stop="end_turn")]) + "\n")
@@ -733,11 +733,11 @@ class PlanParseStorm(unittest.TestCase):
             jd._group_store = lambda *a, **k: None         # don't fire the real grouper model after a placement
             try:
                 tpath.write_text("\n".join(json.dumps(r) for r in recs1) + "\n")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 if recs2 is not None:
                     tpath.write_text("\n".join(json.dumps(r) for r in recs2) + "\n")
-                    jd._PARSE_CACHE.clear()
+                    jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                     jd._plan_session(SID, str(tpath), NOW + 100)
                 store = jd.load_goals(SID)
             finally:
@@ -1124,7 +1124,7 @@ class SegKeyDrift(unittest.TestCase):
             jd._group_store = lambda *a, **k: None
             try:
                 tpath.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd.plan_llm = lambda *a, **k: '{"ops":[{"why":"asked","do":"mint","text":"Ship the exporter"}]}'
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
@@ -1140,7 +1140,7 @@ class SegKeyDrift(unittest.TestCase):
 
                 calls = []
                 jd.plan_llm = lambda *a, **k: (calls.append(1), '{"ops":[{"why":"dup","do":"mint","text":"DUP"}]}')[1]
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW + 100)
                 self.assertEqual(calls, [], "a drift-shifted placement still dedups — the planner is not re-run")
                 self.assertEqual(len(jd.load_goals(SID)["nodes"]), 1, "no duplicate goal was minted")
@@ -1684,7 +1684,7 @@ class Grouper(unittest.TestCase):
         (names / SID).write_text("testsess\t%s\t#abcdef\n" % str(cdir))
         saved = (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.plan_llm, jd.group_llm)
         jd.NAMES, jd.PROJECTS, jd.GOALDIR = names, proj, td / "goals"
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         gcalls = []
         try:
             jd.plan_llm = (lambda text, menu, human=False, **_kw:
@@ -1701,7 +1701,7 @@ class Grouper(unittest.TestCase):
             self.assertGreaterEqual(len(gcalls), 1, "the planner invoked the grouper after a placement")
         finally:
             (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.plan_llm, jd.group_llm) = saved
-            jd._PARSE_CACHE.clear()
+            jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
 
 class Consolidator(unittest.TestCase):
@@ -2300,7 +2300,7 @@ class PostalDelegation(unittest.TestCase):
                 jd.save_goals(SID, store)
                 if view_cleared and gid:
                     jd._view_cleared = lambda g=gid: {g}   # the user crossed G off the feed → _reopen won't unseal it
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 for _ in range(passes):
                     jd._plan_session(SID, str(tpath), NOW)
                 return jd.load_goals(SID), seg_id, gid
@@ -2404,7 +2404,7 @@ class PostalDelegation(unittest.TestCase):
                 for s in peers:                            # the courier marked every one coordination
                     store["placements"][s["id"]] = "fyi"
                 jd.save_goals(SID, store)
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)     # ONE pass
                 store = jd.load_goals(SID)
                 tops = [nd for nd in store["nodes"].values() if nd["parentId"] is None]
@@ -2467,7 +2467,7 @@ class NudgeMustResolve(unittest.TestCase):
                                          "nodeComplete": False, "blocked": False, "cleared": False,
                                          "trail": ["seed"], "t": T0, "mt": T0}}}
                 jd.save_goals(SID, store)
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 return jd.load_goals(SID), gid
             finally:
@@ -2550,7 +2550,7 @@ class NudgeMustResolve(unittest.TestCase):
                 self.assertEqual([n for n in mid["nodes"].values() if n.get("parentId") == gid], [],
                                  "no stub node is minted — the reopen event alone holds the top open")
                 self.assertEqual(mid["status"][gid], "working", "held at working through the optimistic window")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
                 subs = [n for n in store["nodes"].values() if n.get("parentId") == gid]
@@ -4372,13 +4372,13 @@ class SettledGateStates(unittest.TestCase):
         statesdir = td / "states"; statesdir.mkdir()
         self._saved = (jd.STATESDIR, dict(jd._PARSE_CACHE))
         jd.STATESDIR = statesdir
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         return str(path), statesdir
 
     def tearDown(self):
         if hasattr(self, "_saved"):
             jd.STATESDIR = self._saved[0]
-            jd._PARSE_CACHE.clear(); jd._PARSE_CACHE.update(self._saved[1])
+            jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear(); jd._PARSE_CACHE.update(self._saved[1])
 
     def test_ended_turn_is_settled_without_idle(self):
         # the fix: an ended turn (assistant handed back the floor) is settled immediately — no idle needed.
@@ -4424,7 +4424,7 @@ class SettledGateStates(unittest.TestCase):
         Path(path).write_text("\n".join(json.dumps(r) for r in
                               [uline(T0, "ship it", "u1", ps="typed"),
                                aline(T0 + 10, "shipped", "a1", "u1", stop="end_turn")]) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd.rollup_status(s, jd._session_closed(jd.parsed_session(SID, [path], now)))
         self.assertEqual(s["status"][g["id"]], "completed", "turn ended → focus goal finalizes (no prompt, no idle)")
 
@@ -4455,14 +4455,14 @@ class FollowUp(unittest.TestCase):
         (names / SID).write_text("testsess\t%s\t#abcdef\n" % str(cdir))
         self._saved = (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.plan_llm, jd.group_llm)
         jd.NAMES, jd.PROJECTS, jd.GOALDIR = names, proj, td / "goals"
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd.migrate_store(store)                        # fixtures are legacy-shaped: adopt their diaries
         jd.save_goals(SID, store)
 
     def tearDown(self):
         if hasattr(self, "_saved"):
             (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.plan_llm, jd.group_llm) = self._saved
-            jd._PARSE_CACHE.clear()
+            jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def _completed_top(self, gid, blocked=False):
         return {"rompUuid": SID, "seq": 1, "placementsV": jd.PLACEMENTS_V, "status": {gid: "blocked" if blocked else "completed"},
@@ -5370,11 +5370,11 @@ class KnownTargetContext(unittest.TestCase):
             jd._group_store = lambda *a, **k: None
             try:
                 tpath.write_text("\n".join(json.dumps(r) for r in recs1) + "\n")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd.plan_llm = plan1
                 jd._plan_session(SID, str(tpath), NOW)
                 tpath.write_text("\n".join(json.dumps(r) for r in recs2) + "\n")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd.plan_llm = plan2
                 jd._plan_session(SID, str(tpath), NOW + 200)
                 return jd.load_goals(SID)
@@ -5649,13 +5649,13 @@ class Distiller(unittest.TestCase):
         (names / SID).write_text("testsess\t%s\t#abcdef\n" % str(cdir))
         self._saved = (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.STATESDIR, jd.distill_llm, jd.brief_llm)
         jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.STATESDIR = names, proj, td / "goals", td / "states"
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         return str(path)
 
     def tearDown(self):
         if hasattr(self, "_saved"):
             (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.STATESDIR, jd.distill_llm, jd.brief_llm) = self._saved
-            jd._PARSE_CACHE.clear()
+            jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def test_distills_completed_top_from_its_discontinuous_trail(self):
         records = [uline(T0, "do part one", "u1", ps="typed"),
@@ -7583,7 +7583,7 @@ class LiveReplan(unittest.TestCase):
         jd.GOALDIR.mkdir()
         jd._group_store = lambda *a, **k: None           # never fire the real grouper model
         jd.opener_llm = self._boom                  # the deduped prompt-run must never re-fire
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def tearDown(self):
         (jd.GOALDIR, jd.GOALARCHDIR, jd.PCACHE, jd.STATE,
@@ -7689,7 +7689,7 @@ class LiveReplan(unittest.TestCase):
         tpath.write_text("\n".join(json.dumps(r) for r in (recs or self.OPEN_RECS)) + "\n")
         (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(store))
         jd.plan_llm = llm
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._plan_session(SID, str(tpath), now)
         return jd.load_goals(SID)
 
@@ -7717,7 +7717,7 @@ class LiveReplan(unittest.TestCase):
         self.assertEqual(store["placements"].get(seg + "#live"), tops[0]["id"],
                          "keyed seg#live so it runs exactly once")
         jd.plan_llm = self._boom                        # a second pass must not re-fire the live run
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._plan_session(SID, str(Path(self.td.name) / (SID + ".jsonl")), NOW + 5)
 
     def test_live_phase_skip_is_coerced_the_invariant_is_hard(self):
@@ -7745,7 +7745,7 @@ class LiveReplan(unittest.TestCase):
             calls.append(k)
             return '{"ops":[{"why":"the work landed","do":"sub","under":%d,"text":"Reworked the grid"}]}' % k["goal_num"]
         jd.plan_llm = work_llm
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._plan_session(SID, str(tpath), NOW + 1000)
         store = jd.load_goals(SID)
         self.assertEqual(len(calls), 1, "one work-run call for the ended segment")
@@ -8536,7 +8536,7 @@ class FollowupContinuationCarry(unittest.TestCase):
                 recs1 = [uline(T0, "add a GUI control for the deep-sleep window", "u1", ps="typed"),
                          aline(T0 + 10, "Built it, pushed, verified.", "a1", "u1", stop="end_turn")]
                 tpath.write_text("\n".join(json.dumps(r) for r in recs1) + "\n")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
                 gid = next(iter(store["nodes"]))
@@ -8546,7 +8546,7 @@ class FollowupContinuationCarry(unittest.TestCase):
                                  aline(T0 + 110, "Confirmed: defaults to off, verified on device.",
                                        "a2", "u2", stop="end_turn")]
                 tpath.write_text("\n".join(json.dumps(r) for r in recs2) + "\n")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW + 200)
                 return jd.load_goals(SID), gid
             finally:
