@@ -199,6 +199,17 @@ const STORM_COOLDOWN_MS = 30000;      // during a storm, hold to 1 restart per t
 // loudly. Immediate restarts (the dashboard ↻, `--now`) behave exactly as before and satisfy any
 // pending quiet request in passing.
 const QUIET_POLL_MS = Number(process.env.ROMP_QUIET_POLL_MS) || 3000;
+// T240b: a busy poll that gets NO answer is a MISS, not quiet. Under load — exactly when a review
+// workflow's agents are running — the kernel answers /busy late, and one timed-out poll applied a
+// parked deploy over live background work ten minutes before the backstop (07:57Z 2026-09-07).
+// The tunnel supervisor's STALE_MISSES precedent: unreachable applies only after this many
+// CONSECUTIVE unanswered probes; any answer resets the streak. Probes go out on the 3 s grid and
+// each carries its own 5 s timeout, so a DEAD kernel (connection refused, instant) applies at
+// ~6 s and one that accepts but never answers at ~11 s (timeouts at 5, 8, 11) — measured, not
+// "3 poll intervals". The stated trade-off: a live kernel whose /busy latency stays above 5 s for
+// three probes in a row (a stall of ~10 s) is indistinguishable from a wedged one and is cut; the
+// backstop stays the ultimate bound.
+const BUSY_MISS_LIMIT = Number(process.env.ROMP_BUSY_MISS_LIMIT) || 3;
 const QUIET_MAX_DEFER_MS = Number(process.env.ROMP_QUIET_MAX_DEFER_MS) || 15 * 60 * 1000;
 
 function spawnKernel(spec) {
@@ -317,8 +328,15 @@ function restartAllOrSelf() {
 // Pure decision (time injected → unit-testable). `st` = {since}; `busy` = the kernel's in-flight
 // SDK turn count, or null when the kernel is unreachable — a kernel that isn't answering has no
 // turns a restart could cut, so unreachable counts as quiet.
-function quietGate(st, busy, now, opts, bd) {
-  if (busy === null || busy === 0) return { action: 'apply', reason: busy === null ? 'kernel unreachable' : 'quiet' };
+function quietGate(st, busy, now, opts, bd, misses) {
+  if (busy === null) {
+    // no answer: a MISS (T240b) — injected like `now`, counted by quietTick on the park
+    const n = misses || 0, lim = opts.missLimit || BUSY_MISS_LIMIT;
+    if (n >= lim) return { action: 'apply', reason: `kernel unreachable — ${n} consecutive busy polls missed` };
+    if (now - st.since >= opts.maxDeferMs) return { action: 'apply', reason: 'backstop cap' };
+    return { action: 'wait', reason: `busy poll missed (${n}/${lim}) — a slow or unreachable kernel is not yet quiet` };
+  }
+  if (busy === 0) return { action: 'apply', reason: 'quiet' };
   if (now - st.since >= opts.maxDeferMs) return { action: 'apply', reason: 'backstop cap' };
   // T240: `busy` counts sessions with a turn in flight OR live background work (a Workflow run, a
   // background agent) — either kind defers the restart; the breakdown says which
@@ -383,7 +401,9 @@ function fetchBusy(port, cb, path) {
   const tok = kernelToken();
   const headers = tok ? { 'X-Romp-Token': tok } : {};
   const wantDrain = /[?&]drain=1(?:&|$)/.test(path || '');
-  const req = http.get({ host: HOST, port, path: path || '/busy', timeout: 2000, headers }, (res) => {
+  // 5 s, not 2 (T240b): the kernel answers /busy on a thread that competes with its pushers under
+  // load, and a 2 s cap turned ordinary slowness into "unreachable"
+  const req = http.get({ host: HOST, port, path: path || '/busy', timeout: 5000, headers }, (res) => {
     let b = ''; res.on('data', (d) => (b += d));
     res.on('end', () => {
       let n = null, draining = null, bd = null;
@@ -451,7 +471,17 @@ function quietTick(deps) {
       return;
     }
     try {
-      const g = quietGate(park, busy, now(), opts, bd);
+      // the miss streak lives on the park (one per generation, like its drain evidence): a null
+      // answer extends it and logs once per miss; ANY answer ends it, loudly if it ran (T240b)
+      const lim = opts.missLimit || BUSY_MISS_LIMIT;
+      if (busy === null) {
+        park.misses = (park.misses || 0) + 1;
+        log(`busy poll missed (${park.misses}/${lim}): timeout or no answer — ${park.misses >= lim ? 'treating the kernel as unreachable' : 'not yet quiet'}`);
+      } else if (park.misses) {
+        log(`busy poll answered again after ${park.misses} miss(es) — the kernel was slow, not gone`);
+        park.misses = 0;
+      }
+      const g = quietGate(park, busy, now(), opts, bd, park.misses || 0);
       if (g.action === 'apply') apply(g);
     } catch (e) {
       log(`quiet-window evaluation failed (${e && e.message}) — the pending refresh stays queued`);
@@ -503,7 +533,11 @@ function queueQuietRestart(mode) {
       // the first poll, knowing nothing yet, asks for the hold as before
       const holdTurns = park.lastInflight === undefined || park.lastInflight > 0;
       park.lastAsked = holdTurns;            // what THIS poll asked for — the answer's refusal test reads it
-      fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1' : '/busy');
+      // the park's identity rides every parked poll (T240c): the kernel keys its drain EPISODE — one
+      // "parked" line, one 5-minute ring — on it instead of a time window, and can ring from a plain
+      // poll while only background work holds the park
+      const pk = 'park=' + Math.round(park.since);
+      fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1&' + pk : '/busy?' + pk);
     },
     now: Date.now,
     opts: { maxDeferMs: QUIET_MAX_DEFER_MS },

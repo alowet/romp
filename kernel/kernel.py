@@ -4383,7 +4383,28 @@ def _last_deploy_restart_t():
     # the graceful term finished its drain and wrote the cut row — the very path THIS change's own
     # deploy takes. The old kernel writes its main-converge / self-update audit row BEFORE it posts
     # the restart, and a peer's p2p-update row lands before its apply restarts us, so the request
-    # time anchors the window when the landing row is missing. The newer of the two wins.
+    # time anchors the window when the landing row is missing. A request counts only once the
+    # restart it asked for LANDED (event, not time): a boot at or after it exists — a boot row, or
+    # THIS process, since a running kernel has by construction booted after every request older than
+    # its start (its own boot row lands only after the first serve and the reconcile, and the drift
+    # loop's first pass runs before that, so a lost-row deploy anchored nothing on exactly the pass
+    # that matters — review find) — and NO cut row lies between the request and that boot unless the
+    # ledger joined it to this very request: a cut row in between means the ledger DID record that
+    # restart and attributed it elsewhere (an anonymous manual restart after a self-update click
+    # whose script failed), so this request restarted nothing (review find). The lost-row race is
+    # specifically "a boot, and no cut row between", and still counts. The newer source wins.
+    boots, cuts = [float(_STARTED)], []
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(r, dict) or not isinstance(r.get("t"), (int, float)):
+            continue
+        if r.get("bootSettled"):
+            boots.append(float(r["t"]))
+        elif "cutTurns" in r:
+            cuts.append((float(r["t"]), float(r.get("auditT") or 0)))
     try:
         alines = (jd.STATE / "restart-audit.jsonl").read_text().strip().splitlines()[-200:]
     except Exception:
@@ -4398,9 +4419,16 @@ def _last_deploy_restart_t():
         act, reason = str(a.get("action") or ""), str(a.get("reason") or "")
         deploy = (act == "main-converge" and a.get("when") == "now") or act in ("p2p-update", "self-update") \
             or (act == "kernel-asks-manager-restart-all" and reason.startswith("self-update"))
-        if deploy:
-            best = max(best, float(a["t"]))
-            break
+        if not deploy:
+            continue
+        at = float(a["t"])
+        landed = min((b for b in boots if b >= at), default=None)
+        if landed is None:
+            continue                                  # requested, but nothing has booted since: not landed
+        if any(at < ct <= landed and aud != at for ct, aud in cuts):
+            continue                                  # the ledger recorded that restart and joined it elsewhere
+        best = max(best, at)
+        break
     return best
 
 
@@ -15533,12 +15561,18 @@ def _consumed_audit_t():
     inherited its reason and even counted as a deploy for the cool-down (T240 review)."""
     try:
         lines = RESTART_CUTS_FILE.read_text().strip().splitlines()
-        for line in reversed(lines[-20:]):
-            r = json.loads(line)
-            if isinstance(r, dict) and "cutTurns" in r:          # a cut row (boot rows carry no cuts)
-                return int(r.get("auditT") or 0)
     except Exception:
-        pass
+        return 0
+    for line in reversed(lines[-50:]):
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue                                  # a torn or glued line never disables the guard
+        if isinstance(r, dict) and "cutTurns" in r and r.get("auditT"):
+            # the newest cut that CONSUMED a row — walked back past anonymous cuts (a service stop, a
+            # Ctrl+C, a bare kill), which used to reset consumption to 0 and let the next anonymous cut
+            # re-inherit the still-in-window row (review find: rows alternated consumed/anonymous/consumed)
+            return int(r["auditT"])
     return 0
 
 
@@ -36130,11 +36164,26 @@ class Handler(BaseHTTPRequestHandler):
                 # busyness but asks for the drain hold only while turns are actually in flight —
                 # background work must never freeze other sessions' queued prompts
                 inflight, background = (be.busy_breakdown() if be and hasattr(be, "busy_breakdown") else (n, 0))
+                # ?park=<since> (T240c): the manager's park identity, on EVERY parked poll — the drain
+                # episode (its "parked" line, its 5-minute ring) keys on it, not on a time window, and a
+                # park held only by background work (plain polls, no hold) still rings. Never a hold —
+                # but the episode clock and the 5-minute problem ring ARE writable state (a drive-by
+                # loopback GET could reset a live park's ring, or fabricate one — review find), so it
+                # rides the same explicit token as the arm: the manager sends X-Romp-Token on every
+                # poll, and an older manager sends no park at all.
+                park = (q.get("park", [""])[0] or "")[:32]
+                if park and be is not None and hasattr(be, "note_parked_poll") and self._write_token_ok(q):
+                    be.note_parked_poll(park)
                 draining = False
                 if be is not None and hasattr(be, "refresh_drain_hold"):
                     if q.get("drain", [""])[0] == "1":
                         if self._write_token_ok(q):
-                            be.refresh_drain_hold()
+                            # The keyword only when a park arrived: a backend without it (an older
+                            # build, a test stand-in) keeps arming the hold the old way.
+                            if park:
+                                be.refresh_drain_hold(park=park)
+                            else:
+                                be.refresh_drain_hold()
                             _note_drain_armed()
                         else:
                             _note_drain_refused()    # T224: the one event the gate exists for —

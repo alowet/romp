@@ -85,7 +85,18 @@ class CutRow(unittest.TestCase):
             self.assertIn("p2p-update", km._recent_restart_reason(now=1240), "the restart it asked for")
             km._append_restart_cut({"t": 1240, "reason": "p2p-update: from X to abc1234", "cutTurns": [],
                                     "auditT": 1000})
-            self.assertEqual(km._recent_restart_reason(now=1900), "", "spent — the later cut is anonymous")
+            self.assertEqual(km._recent_restart_reason(now=1500), "", "spent — the later cut is anonymous")
+            # …and that anonymous cut's own row (no auditT) must not reset consumption: the NEXT
+            # anonymous cut inside the window used to re-inherit the row (rows alternated
+            # consumed / anonymous / consumed — review find)
+            km._append_restart_cut({"t": 1500, "reason": "", "cutTurns": []})
+            self.assertEqual(km._recent_restart_reason(now=1900), "", "still spent after an anonymous cut")
+            km._append_restart_cut({"t": 1900, "reason": "", "cutTurns": []})
+            self.assertEqual(km._recent_restart_reason(now=2100), "")
+            # a torn line NEWER than the consuming cut never disables the guard
+            with open(km.RESTART_CUTS_FILE, "a") as f:
+                f.write('{"t": 2100, "reason": "", "cutTur\n')
+            self.assertEqual(km._recent_restart_reason(now=2150), "", "a malformed line is skipped, not fatal")
         finally:
             audit.unlink()
             km.RESTART_CUTS_FILE.unlink()

@@ -4980,6 +4980,7 @@ class SdkBackend:
         self._drain_hold_until = 0.0              # deploy-drain lease (T121): RUNTIME-ONLY — a fresh boot starts clear by construction
         self._drain_hold_since = 0.0
         self._drain_hold_rang = False
+        self._drain_park = ""                     # the manager's park identity (?park=<since>) the episode is keyed on (T240c)
         self._drain_wake_timer = None
         self.login_ok = lambda: True              # the kernel wires its credential-store probe (T124); permissive unwired
         self._usage_all_keyed = False             # refresh_usage's one-shot: the last refresh found only
@@ -5678,16 +5679,65 @@ class SdkBackend:
     DRAIN_HOLD_TTL = 12.0     # seconds; ~4 manager polls — the lease outlives a missed poll, not a dead manager
     DRAIN_LOUD_S = 300.0      # a drain still holding after 5 min rings — visible, never mysterious
 
-    def refresh_drain_hold(self) -> None:
-        """Arm/extend the drain lease (the manager's parked quiet poll calls this each tick)."""
+    def note_parked_poll(self, park: str) -> None:
+        """A parked quiet poll carrying the manager's park identity (T240c). The EPISODE — the one
+        "deploy restart parked" line and the 5-minute "still parked" ring — keys on that identity, never
+        on a time window: the manager drops the hold for minutes at a time during background-only
+        stretches (T240), so the 2×TTL window mis-read the next in-flight re-arm as a new park, and a
+        park held ONLY by background work never reached refresh_drain_hold at all and stayed silent
+        after its first line. A plain parked poll now starts, continues and rings the episode too.
+        An empty identity is a no-op (nothing to key on), and one BELOW the current identity is a
+        stale probe from a park the manager has since replaced — ignored rather than flipping the
+        episode back and forth (review find: handler threads take the lock in no fixed order)."""
+        self._park_seen(str(park or ""), time.time())
+
+    @staticmethod
+    def _park_ord(park):
+        try:
+            return int(park)
+        except (TypeError, ValueError):
+            return None
+
+    def _park_seen(self, park: str, now: float) -> None:
+        if not park:
+            return
+        with self._lock:
+            new_episode = park != self._drain_park
+            if new_episode:
+                a, b = self._park_ord(park), self._park_ord(self._drain_park)
+                if a is not None and b is not None and a < b:
+                    return                            # a stale probe from a replaced park
+                self._drain_park = park
+                self._drain_hold_since = now
+                self._drain_hold_rang = False
+            ring = (not new_episode and self._drain_hold_since > 0.0
+                    and now - self._drain_hold_since > self.DRAIN_LOUD_S and not self._drain_hold_rang)
+            if ring:
+                self._drain_hold_rang = True
+        if new_episode:
+            self._log("deploy restart parked: draining — %d in-flight turn(s), %d session(s) with background "
+                      "work; new turn starts hold while a turn is in flight (queued prompts persist and "
+                      "start after the bounce)" % self.busy_breakdown())
+        elif ring:
+            self._log("deploy restart still parked after %d min — %d in-flight turn(s), %d session(s) with "
+                      "background work have not finished (the manager's backstop will apply the restart "
+                      "regardless)" % ((int((now - self._drain_hold_since) / 60),) + self.busy_breakdown()),
+                      problem=True)
+
+    def refresh_drain_hold(self, park: str | None = None) -> None:
+        """Arm/extend the drain lease (the manager's parked quiet poll calls this each tick). With a
+        park identity the episode bookkeeping is _park_seen's (no time window); without one — an
+        older manager — the 2×TTL flap window below stands in for it."""
         now = time.time()
+        if park:
+            self._park_seen(str(park), now)
         with self._lock:
             first = self._drain_hold_until <= now
-            # a NEW episode, not a flap: the manager now drops the hold during background-only
-            # stretches and re-arms it when a turn starts (T240), so a lease that lapsed moments ago
-            # is the same park — its 5-minute ring and its "parked" line must not restart per flap
-            new_episode = first and (self._drain_hold_since == 0.0
-                                     or now - self._drain_hold_until > 2 * self.DRAIN_HOLD_TTL)
+            # a NEW episode, not a flap (the legacy, no-park path): the manager drops the hold during
+            # background-only stretches and re-arms it when a turn starts (T240), so a lease that
+            # lapsed moments ago is the same park — its ring and its "parked" line must not restart
+            new_episode = (not park) and first and (self._drain_hold_since == 0.0
+                                                   or now - self._drain_hold_until > 2 * self.DRAIN_HOLD_TTL)
             self._drain_hold_until = now + self.DRAIN_HOLD_TTL
             if new_episode:
                 self._drain_hold_since = now
@@ -5703,7 +5753,7 @@ class SdkBackend:
             self._log("deploy restart parked: draining — %d in-flight turn(s), %d session(s) with background "
                       "work; new turn starts held until this box quiets (queued prompts persist and "
                       "start after the bounce)" % self.busy_breakdown())
-        elif now - self._drain_hold_since > self.DRAIN_LOUD_S and not self._drain_hold_rang:
+        elif not park and now - self._drain_hold_since > self.DRAIN_LOUD_S and not self._drain_hold_rang:
             with self._lock:
                 self._drain_hold_rang = True
             self._log("deploy restart still parked after %d min — %d in-flight turn(s), %d session(s) with "

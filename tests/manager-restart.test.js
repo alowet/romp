@@ -62,8 +62,17 @@ test('in-flight turns defer the bounce', () => {
   assert.match(g.reason, /2 turn/);
 });
 
-test('an unreachable kernel applies — nothing a restart could cut', () => {
-  assert.equal(quietGate({ since: 1000 }, null, 2000, QOPTS).action, 'apply');
+test('an unreachable kernel applies only after three consecutive missed polls (T240b)', () => {
+  // T240b: ONE failed busy poll is a MISS, not quiet — under load (a review workflow's agents) the
+  // kernel answers /busy late, and a single null applied a parked deploy over live background work
+  // 10 minutes before the backstop (07:57Z 2026-09-07). Unreachable applies only after 3 misses.
+  assert.equal(quietGate({ since: 1000 }, null, 2000, QOPTS, null, 1).action, 'wait', 'first miss waits');
+  assert.match(quietGate({ since: 1000 }, null, 2000, QOPTS, null, 2).reason, /missed \(2\/3\)/);
+  const gone = quietGate({ since: 1000 }, null, 2000, QOPTS, null, 3);
+  assert.equal(gone.action, 'apply', 'a genuinely wedged kernel still restarts in ~6 s (dead) to ~11 s (accepts, never answers)');
+  assert.match(gone.reason, /unreachable.*3.*miss/, 'the apply line names the misses');
+  assert.equal(quietGate({ since: 1000 }, null, 1000 + QOPTS.maxDeferMs, QOPTS, null, 1).action, 'apply',
+    'the backstop is the ultimate bound whatever the poll did');
 });
 
 test('the backstop cap applies even while busy — a deploy can never starve', () => {
@@ -103,6 +112,32 @@ test('quietTick: a throwing evaluation is LOUD and leaves the refresh queued', (
               opts: QOPTS, log: (m) => { logged = m; }, schedule: () => {}, apply: () => { applied++; } });
   assert.match(logged, /stays queued/);
   assert.equal(applied, 0);
+});
+
+test('quietTick: one timed-out busy poll then an answer waits — misses reset on any answer', () => {
+  // the 07:57Z shape: the poll times out once under load while background work runs; today the
+  // gate applied on that single null and cut every session's workflows
+  let applied = 0; const logs = []; const park = { since: 0 };
+  const answers = [[null, null], [1, { inflight: 0, background: 1 }]];
+  const deps = { pending: () => park, fetchBusy: (c) => c(...answers.shift()), now: () => 1000,
+                 opts: QOPTS, log: (m) => logs.push(m), schedule: () => {}, apply: () => { applied++; } };
+  quietTick(deps);                                  // miss 1
+  assert.equal(applied, 0, 'a single miss must not apply');
+  assert.equal(park.misses, 1);
+  assert.ok(logs.some((m) => /busy poll missed \(1\/3\)/.test(m)), 'each miss is logged with its streak: ' + logs);
+  quietTick(deps);                                  // an answer: busy, background work
+  assert.equal(applied, 0);
+  assert.equal(park.misses, 0, 'any answer resets the streak');
+});
+
+test('quietTick: three consecutive misses apply, naming them', () => {
+  let reason = ''; const park = { since: 0 };
+  const deps = { pending: () => park, fetchBusy: (c) => c(null, null), now: () => 1000,
+                 opts: QOPTS, log: () => {}, schedule: () => {}, apply: (g) => { reason = g.reason; } };
+  quietTick(deps); quietTick(deps);
+  assert.equal(reason, '', 'two misses still wait');
+  quietTick(deps);
+  assert.match(reason, /unreachable.*3.*miss/);
 });
 
 test('quietTick: a satisfied pending (an immediate restart won) neither probes nor re-arms', () => {
@@ -148,8 +183,10 @@ test('quietTick: the answer to the CURRENT park still applies exactly as before'
 test('the parked quiet poll refreshes the kernel drain lease in the same probe', () => {
   const fs = require('node:fs');
   const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'romp-manager'), 'utf8');
-  assert.ok(src.includes("fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1' : '/busy')"),
-    'the quiet tick binds the drain-refresh spelling of the probe — while a turn is in flight (T240)');
+  assert.ok(src.includes("fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1&' + pk : '/busy?' + pk)"),
+    'the quiet tick binds the drain-refresh spelling of the probe — while a turn is in flight (T240), carrying the park identity (T240c)');
+  assert.ok(src.includes("const pk = 'park=' + Math.round(park.since);"),
+    'the park identity keys the kernel\'s drain episode (T240c)');
   assert.ok(src.includes('const holdTurns = park.lastInflight === undefined || park.lastInflight > 0;'),
     'the hold is asked for only while a turn is actually in flight (or on the first, uninformed poll) — background-only busyness defers without freezing other sessions');
   assert.ok(src.includes('path: path || \'/busy\''),
