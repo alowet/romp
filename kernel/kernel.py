@@ -32706,12 +32706,14 @@ def _dedup_sig(msg, s):
     return s
 
 
-# The pusher's wire caches, counted: whole frames serialized per slot (a _LazyWire made; at most once per build
-# each), builds whose payload could not be keyed and took the whole dump for their signature, and values a wire
-# encoder shipped as str() (_wire_default, one per encode). Bumped through _wire_bump, under a lock: the pusher
-# bumps the fallback counters, and whichever sender thread first materializes a _LazyWire bumps its counter, so
-# a bare `+= 1` here would be a read-modify-write across threads (the tests assert exact counts).
-_wire_stats = {"feed_body": 0, "bars_body": 0, "feed_sig_fallback": 0, "bars_sig_fallback": 0, "default_str": 0}
+# The pusher's wire caches, counted: a collection's per-entry split served from _delta_split_memo (hit) or run
+# (miss, a raise included), whole frames serialized per slot (a _LazyWire made; at most once per build each),
+# builds whose payload could not be keyed and took the whole dump for their signature, and values a wire encoder
+# shipped as str() (_wire_default, one per encode). Bumped through _wire_bump, under a lock: the pusher and a
+# handler-thread connect push both split, and whichever sender thread first materializes a _LazyWire bumps its
+# counter, so a bare `+= 1` here would be a read-modify-write across threads (the tests assert exact counts).
+_wire_stats = {"split_hit": 0, "split_miss": 0, "feed_body": 0, "bars_body": 0, "feed_sig_fallback": 0,
+               "bars_sig_fallback": 0, "default_str": 0}
 _WIRE_STATS_LOCK = threading.Lock()
 _wire_default_said = set()   # type names _wire_default has written to stderr: a type is said once, not per value
 
@@ -32918,6 +32920,14 @@ _DELTA_SLOTS = {
 _DELTA_SEP = "\u001f"          # joins composite keys; never appears in an id or a sid
 _DELTA_MAX_FRACTION = 0.6      # a delta this large a fraction of the full payload is sent as the full instead
 _delta_parts_cache = {}        # frame type -> (payload object identity, parts) — one split per BUILD, shared by clients
+_delta_split_memo = {}         # (frame type, collection) -> (collection object identity, its split) — the same once-per-build
+#                                rule one level down. _push serves the feed as a COPY of the cached build with the cycle's
+#                                ledgers attached (feed = dict(feed_src)), so a cycle whose ledgers moved but whose build
+#                                did not is a new payload object around the same asks list: the payload cache misses and,
+#                                without this, every card was encoded again for a remainder-only change. Identity-keyed
+#                                on the premise the payload cache and _feed_wire already rest on — a built collection is
+#                                never mutated in place; a rebuild mints a new one. One entry per (frame type,
+#                                collection), replaced on a miss: it pins the entry graph _delta_parts_cache pins.
 _delta_unkeyable_said = set()  # (frame type, why) already written to stderr: an unkeyable shape is said once, not per cycle
 
 
@@ -32994,7 +33004,9 @@ def _delta_split(kind, value):
 
 
 def _delta_parts(ftype, payload):
-    """The payload split into its keyed collections and the remainder, computed once per payload object."""
+    """The payload split into its keyed collections and the remainder, computed once per payload object — and each
+    collection's split once per collection object (_delta_split_memo), so a payload that changed only its
+    remainder re-encodes no entry."""
     hit = _delta_parts_cache.get(ftype)
     if hit is not None and hit[0] is payload:
         return hit[1]
@@ -33002,10 +33014,18 @@ def _delta_parts(ftype, payload):
     try:
         colls = {}
         for name, kind in kinds.items():
+            value = payload.get(name)
+            m = _delta_split_memo.get((ftype, name))
+            if m is not None and m[0] is value:          # the same collection object: the same entries, the same strings
+                colls[name] = m[1]
+                _wire_bump("split_hit")
+                continue
+            _wire_bump("split_miss")
             try:
-                colls[name] = _delta_split(kind, payload.get(name))
+                colls[name] = _delta_split(kind, value)
             except ValueError as e:
                 raise ValueError("%s: %s" % (name, e)) from None     # name the collection for the log line
+            _delta_split_memo[(ftype, name)] = (value, colls[name])
     except ValueError as e:
         parts = None                                   # a payload the protocol cannot key: this build goes whole
         if (ftype, str(e)) not in _delta_unkeyable_said:   # …and says so once: a silent whole is a silent perf loss
@@ -35145,7 +35165,9 @@ def _push(targets, connect=False, tmux=None):
         feed = feed_src
         if feed is not None:
             feed = dict(feed_src)                        # copy so the per-push ledger attach never dirties the cache
-            #                                              (feed_src's identity keys the wire cache below)
+            #                                              (feed_src's identity keys the wire cache below; the asks list
+            #                                              rides through the copy, so a refill's cards are served from
+            #                                              _delta_split_memo rather than encoded again)
             # Attach `ledgers` whenever the session build RAN (want_chat or want_fleet) — even as an EMPTY list
             # for a fleet with no sessions — so the fleet can tell "the build ran, here's the data (maybe none)"
             # from "no data yet, still loading" and keep its loader up until real data lands (the user

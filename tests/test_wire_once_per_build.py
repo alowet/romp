@@ -104,7 +104,7 @@ class _World:
     def __init__(self, test, feed=None, timeline=None):
         self.feed, self.timeline = feed, timeline
         saved = {n: getattr(km, n) for n in self.NAMES}
-        saved_wire = (km._feed_wire, km._bars_wire, km._skel_wire, dict(km._delta_parts_cache))
+        saved_wire = (km._feed_wire, km._bars_wire, km._skel_wire, dict(km._delta_parts_cache), dict(km._delta_split_memo))
         saved_built = (list(km._built_feed), list(km._built_timeline))
         km._cached_feed = lambda now, tmux, sig, connect=False: self.feed
         km._cached_timeline = lambda now, tmux, sig, connect=False: self.timeline
@@ -113,7 +113,7 @@ class _World:
         km._fleet_view_sig = lambda now, tmux: ("sig",)
         km._DELTA_MAX_FRACTION = 10.0        # synthetic payloads are tiny: the size guard would send wholes
         km._feed_wire = km._bars_wire = km._skel_wire = None
-        km._delta_parts_cache.clear()
+        km._delta_parts_cache.clear(); km._delta_split_memo.clear()
         km._built_timeline[:] = [None, timeline, time.time(), time.time()]   # warmed: a connect push serves the cache
 
         def restore():
@@ -121,6 +121,7 @@ class _World:
                 setattr(km, n, v)
             km._feed_wire, km._bars_wire, km._skel_wire = saved_wire[:3]
             km._delta_parts_cache.clear(); km._delta_parts_cache.update(saved_wire[3])
+            km._delta_split_memo.clear(); km._delta_split_memo.update(saved_wire[4])
             km._built_feed[:] = saved_built[0]; km._built_timeline[:] = saved_built[1]
         test.addCleanup(restore)
 
@@ -141,8 +142,8 @@ class OneEncodePerBuild(unittest.TestCase):
             self.assertEqual([f["type"] for f in dfeed["frames"]], ["feed"]); self.assertIn("_keys", dfeed["frames"][0])
             self.assertEqual([f["type"] for f in legacy["frames"]], ["feed"]); self.assertNotIn("_keys", legacy["frames"][0])
             self.assertEqual([f["type"] for f in tl["frames"]], ["data", "bars"]); self.assertIn("_keys", tl["frames"][1])
-            self.assertEqual(_delta(km._wire_stats, s0), {"feed_body": 1, "bars_body": 1},
-                             "one whole frame each, shared by the keyed full and the legacy client")
+            self.assertEqual(_delta(km._wire_stats, s0), {"feed_body": 1, "bars_body": 1, "split_miss": 4},
+                             "one whole frame each, shared by the keyed full and the legacy client; four collections split")
             self.assertEqual(km._feed_wire[4], km._parts_sig(km._feed_wire[5]), "the feed's signature is the split's tuple")
             self.assertEqual(km._bars_wire[4], km._parts_sig(km._bars_wire[5]), "so is the bars'")
             self.assertEqual(legacy["sent"][("feed",)][0], km._feed_wire[4])
@@ -159,7 +160,7 @@ class OneEncodePerBuild(unittest.TestCase):
             splits.clear(); s0 = dict(km._wire_stats)
             km._push([dfeed, tl])
             self.assertEqual(sum(splits.values()), 4)
-            self.assertEqual(_delta(km._wire_stats, s0), {})
+            self.assertEqual(_delta(km._wire_stats, s0), {"split_miss": 4}, "new collection objects: every split ran")
             self.assertEqual(dfeed["frames"][-1]["type"], "delta")
             self.assertEqual(list(dfeed["frames"][-1]["coll"]["asks"]["set"]), ["%s:g2" % SID])
             self.assertEqual(tl["frames"][-1]["type"], "delta")
@@ -204,7 +205,8 @@ class OneEncodePerBuild(unittest.TestCase):
         self.assertIsInstance(km._bars_wire[4], str, "the sort_keys fallback signature, as before")
         self.assertIsNone(km._bars_wire[5])
         self.assertTrue(km._bars_wire[3].materialized(), "the whole dump the signature needed pre-fills the cell")
-        self.assertEqual(_delta(km._wire_stats, s0), {"bars_sig_fallback": 1})
+        self.assertEqual(_delta(km._wire_stats, s0), {"bars_sig_fallback": 1, "split_miss": 1},
+                         "the turns split ran and raised; the collections after it were never reached")
         self.assertEqual(err.getvalue().count("cannot be keyed"), 1, "said once, as before")
         w.timeline = _timeline(unkeyable=True, now=2)            # a rebuild: the whole frame goes again
         w.timeline["judging"] = [{"sid": SID, "judge": "closer", "t": 1, "t1": 2}]
@@ -212,6 +214,117 @@ class OneEncodePerBuild(unittest.TestCase):
             km._push([tl])
         self.assertEqual([f["type"] for f in tl["frames"]], ["data", "bars", "bars"],
                          "a rebuild with unchanged lanes: no lanes frame, and the whole bars frame again")
+
+
+class ALedgersOnlyRefillEncodesNoCard(unittest.TestCase):
+    """_push copies the cached feed build (feed = dict(feed_src)) and attaches the cycle's ledgers to the copy, so a
+    cycle whose ledgers moved but whose build did not misses the wire tuple and splits the payload again: a new dict
+    around the SAME asks list. _delta_parts memoizes each collection's split on the collection object's identity
+    (_delta_split_memo), so that refill re-encodes the remainder and no card."""
+
+    def test_a_refill_with_the_same_asks_object_and_a_changed_remainder_makes_no_split(self):
+        _World(self)                                              # empties the parts cache and the split memo; restores after
+        src = _feed(n=6)
+        first = dict(src, ledgers=[{"sid": SID, "name": "web", "status": "idle"}])
+        refill = dict(src, ledgers=[{"sid": SID, "name": "web", "status": "working"}])   # the same asks list, another remainder
+        splits = collections.Counter(); real_split = km._delta_split
+        with mock.patch.object(km, "_delta_split", side_effect=lambda kind, v: splits.update([kind]) or real_split(kind, v)):
+            s0 = dict(km._wire_stats)
+            p1 = km._delta_parts("feed", first)
+            self.assertEqual(dict(splits), {"byid:itemId": 1}); self.assertEqual(_delta(km._wire_stats, s0), {"split_miss": 1})
+            splits.clear(); s0 = dict(km._wire_stats)
+            p2 = km._delta_parts("feed", refill)
+            self.assertEqual(dict(splits), {}, "the asks list is the same object: no card encoded")
+            self.assertEqual(_delta(km._wire_stats, s0), {"split_hit": 1})
+            self.assertIs(p2[0]["asks"], p1[0]["asks"], "the split is shared, not copied")
+            self.assertEqual(p2[1]["ledgers"], refill["ledgers"]); self.assertNotEqual(p2[2], p1[2], "the remainder was re-encoded")
+            self.assertNotEqual(km._parts_sig(p1), km._parts_sig(p2), "and the signature moves with it")
+            # a new asks object (a rebuild, or any copy) splits again, and the memo follows it
+            rebuilt = dict(refill, asks=list(src["asks"]))
+            splits.clear(); s0 = dict(km._wire_stats)
+            p3 = km._delta_parts("feed", rebuilt)
+            self.assertEqual(dict(splits), {"byid:itemId": 1}); self.assertEqual(_delta(km._wire_stats, s0), {"split_miss": 1})
+            self.assertEqual(km._parts_sig(p3), km._parts_sig(p2), "equal cards in a new list: an equal signature")
+            self.assertIs(km._delta_split_memo[("feed", "asks")][0], rebuilt["asks"])
+            splits.clear(); s0 = dict(km._wire_stats)
+            km._delta_parts("feed", dict(rebuilt, now=NOW + 5))
+            self.assertEqual(dict(splits), {}); self.assertEqual(_delta(km._wire_stats, s0), {"split_hit": 1})
+            self.assertEqual(len(km._delta_split_memo), 1, "one entry per (frame type, collection): replaced, never grown")
+
+    def test_through_push_a_refill_that_misses_the_wire_tuple_on_its_ledgers_re_encodes_no_card(self):
+        w = _World(self, feed=_feed())
+        board, dfeed = _client("fleet"), _client("feed")
+        splits = collections.Counter(); real_split = km._delta_split
+        with mock.patch.object(km, "_delta_split", side_effect=lambda kind, v: splits.update([kind]) or real_split(kind, v)):
+            s0 = dict(km._wire_stats)
+            km._push([board])                                     # an app="fleet" client: the cycle attaches ledgers to the copy
+            self.assertEqual(dict(splits), {"byid:itemId": 1}); self.assertEqual(km._feed_wire[1], [])
+            self.assertEqual(_delta(km._wire_stats, s0), {"feed_body": 1, "split_miss": 1})
+            splits.clear(); s0 = dict(km._wire_stats)
+            km._push([dfeed])                                     # the same build without the attach: the wire tuple misses on its ledgers
+            self.assertEqual(dict(splits), {}, "the refill served the cards from the memo")
+            self.assertEqual(_delta(km._wire_stats, s0), {"feed_body": 1, "split_hit": 1})
+            self.assertIsNone(km._feed_wire[1]); self.assertIs(km._feed_wire[0], w.feed)
+            self.assertEqual([f["type"] for f in dfeed["frames"]], ["feed"]); self.assertNotIn("ledgers", dfeed["frames"][0])
+            self.assertEqual([f["type"] for f in board["frames"]], ["feed"]); self.assertEqual(board["frames"][0]["ledgers"], [])
+            w.feed = _feed(build_id=2)                            # a rebuild: a new asks list, split again
+            splits.clear(); s0 = dict(km._wire_stats)
+            km._push([dfeed])
+            self.assertEqual(dict(splits), {"byid:itemId": 1}); self.assertEqual(_delta(km._wire_stats, s0), {"split_miss": 1})
+
+    def test_a_bars_payload_around_unchanged_collections_splits_no_bar(self):
+        # the same path for the bars: a new bars dict around the SAME turns/judging/messages objects (a warming flip, or
+        # any other remainder) is a memo hit for all three collections; a rebuild's new lanes object splits alone
+        _World(self)
+        tl = _timeline(nbars=3)
+        splits = collections.Counter(); real_split = km._delta_split
+        with mock.patch.object(km, "_delta_split", side_effect=lambda kind, v: splits.update([kind]) or real_split(kind, v)):
+            s0 = dict(km._wire_stats)
+            p1 = km._delta_parts("bars", _bars_of(tl, warming=True))
+            self.assertEqual(sum(splits.values()), 3); self.assertEqual(_delta(km._wire_stats, s0), {"split_miss": 3})
+            splits.clear(); s0 = dict(km._wire_stats)
+            p2 = km._delta_parts("bars", _bars_of(tl, warming=False))
+            self.assertEqual(dict(splits), {}, "the same collection objects: no bar encoded")
+            self.assertEqual(_delta(km._wire_stats, s0), {"split_hit": 3})
+            for name in ("turns", "judging", "messages"):
+                self.assertIs(p2[0][name], p1[0][name], name + ": the split is shared")
+            self.assertIs(p2[1]["warming"], False); self.assertNotEqual(km._parts_sig(p1), km._parts_sig(p2), "the remainder moved the signature")
+            nxt = dict(tl, turns={SID: [dict(b) for b in tl["turns"][SID]]}, now=2)   # a rebuild's lanes: split again; the rest hit
+            splits.clear(); s0 = dict(km._wire_stats)
+            km._delta_parts("bars", _bars_of(nxt))
+            self.assertEqual(dict(splits), {"dictlist:id": 1}); self.assertEqual(_delta(km._wire_stats, s0), {"split_hit": 2, "split_miss": 1})
+            self.assertEqual(len(km._delta_split_memo), 3, "one entry per (frame type, collection)")
+
+    def test_split_hit_and_miss_are_exact_under_a_forced_interleaving(self):
+        # the memo's counters go through _wire_bump like the rest: the pusher and a handler-thread connect push both
+        # fill, so a bare `+= 1` would lose increments. A dict whose reads yield the thread forces the interleaving the
+        # lock is for (under the GIL alone the race is rare enough to stay green without it).
+        _World(self)
+        src = _feed(n=3)
+
+        class _Yielding(dict):
+            def get(self, k, d=None):
+                v = dict.get(self, k, d); time.sleep(0); return v
+
+            def __getitem__(self, k):
+                v = dict.__getitem__(self, k); time.sleep(0); return v
+        saved = km._wire_stats
+        km._wire_stats = _Yielding(saved)
+        try:
+            s0 = km._wire_stats["split_hit"] + km._wire_stats["split_miss"]
+
+            def run():
+                for i in range(300):
+                    km._delta_parts("feed", dict(src, now=NOW + i))   # a new payload each: the asks list hits after the first miss
+            ts = [threading.Thread(target=run, daemon=True) for _ in range(8)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(60)
+            self.assertFalse(any(t.is_alive() for t in ts))
+            self.assertEqual(km._wire_stats["split_hit"] + km._wire_stats["split_miss"] - s0, 8 * 300, "every fill bumped exactly one of the two")
+        finally:
+            km._wire_stats = saved
 
 
 class LazyWireCell(unittest.TestCase):
@@ -321,7 +434,7 @@ class ANonJsonValueOnTheWireIsCountedAndSaidOnce(unittest.TestCase):
         self.assertEqual([f["type"] for f in legacy["frames"]], ["data", "bars"])
         self.assertEqual(legacy["frames"][1]["turns"][SID][0]["tags"], "{'a'}", "shipped as str(), as the delta path did")
         self.assertNotIn("_keys", legacy["frames"][1])
-        self.assertEqual(_delta(km._wire_stats, s0), {"bars_body": 1, "default_str": 2},
+        self.assertEqual(_delta(km._wire_stats, s0), {"bars_body": 1, "default_str": 2, "split_miss": 3},
                          "one per encode of the value: the per-entry pass (_delta_split) and the whole frame (_push)")
         self.assertEqual(_wire_lines(err), ["wire: set serialized via str() in _delta_split"],
                          "said once, naming the encoder that met it first; the whole frame's encode adds no line")
@@ -343,7 +456,7 @@ class ANonJsonValueOnTheWireIsCountedAndSaidOnce(unittest.TestCase):
         self.assertEqual(legacy["frames"][0]["asks"][0]["when"], "{1, 2}", "shipped as str(), as the delta path did")
         self.assertIn('"when": "{1, 2}"', km._feed_wire[5][0]["asks"][0]["%s:g0" % SID][1],
                       "the per-card string carries the same bytes")
-        self.assertEqual(_delta(km._wire_stats, s0), {"feed_body": 1, "default_str": 2},
+        self.assertEqual(_delta(km._wire_stats, s0), {"feed_body": 1, "default_str": 2, "split_miss": 1},
                          "one per encode of the value: the per-entry pass and the whole frame")
         self.assertEqual(_wire_lines(err), ["wire: set serialized via str() in _delta_split"])
 
@@ -356,7 +469,7 @@ class ANonJsonValueOnTheWireIsCountedAndSaidOnce(unittest.TestCase):
             km._push([tl])
         self.assertIn("_keys", tl["frames"][1])
         self.assertEqual(tl["frames"][1]["turns"][SID][0]["tags"], "{'a'}")
-        self.assertEqual(_delta(km._wire_stats, s0), {"bars_body": 1, "default_str": 2}, "the split and the keyed full")
+        self.assertEqual(_delta(km._wire_stats, s0), {"bars_body": 1, "default_str": 2, "split_miss": 3}, "the split and the keyed full")
         nxt = _timeline(nbars=3, now=2); nxt["turns"][SID][0]["tags"] = {"a"}; nxt["turns"][SID][1]["tags"] = {"b"}
         w.timeline = nxt
         s0 = dict(km._wire_stats)
@@ -367,7 +480,7 @@ class ANonJsonValueOnTheWireIsCountedAndSaidOnce(unittest.TestCase):
         self.assertEqual(sorted(sent), ["%s%sb1" % (SID, km._DELTA_SEP), "%s%sb2" % (SID, km._DELTA_SEP)],
                          "the unchanged bar (same entry string) does not ride")
         self.assertEqual(sent["%s%sb1" % (SID, km._DELTA_SEP)]["tags"], "{'b'}", "the delta frame ships the same str()")
-        self.assertEqual(_delta(km._wire_stats, s0), {"default_str": 3},
+        self.assertEqual(_delta(km._wire_stats, s0), {"default_str": 3, "split_miss": 3},
                          "two sets in the per-entry pass, and the changed entry's set again in the delta frame; no whole frame")
         self.assertEqual(_wire_lines(err), ["wire: set serialized via str() in _delta_split"], "still said once")
 
