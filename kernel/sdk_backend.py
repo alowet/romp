@@ -2112,6 +2112,46 @@ def _check_key_file_agrees(startup: str, live: str) -> None:
            _keysrc.service_env_path(), _keysrc.KEY_VAR))
 
 
+_ENV_FILE_AUTH_CHECKED = False   # the env-file-vs-declaration check (one line, once per process)
+
+
+def _check_env_file_vs_declaration(log, state_dir, path: str | None = None) -> str:
+    """Say ONCE per process, as a problem-ring line, when the env file selects an API key source while
+    ROMP_EXPECTED_AUTH=login declares that the sessions bill the machine login. The two cannot both
+    hold: a source the file selects — an `ANTHROPIC_API_KEY=` line with a value, or a `ROMP_API_KEY_REF=`
+    line — is injected at launch for every session without an explicit Billing pick (effective_auth and
+    default_auth answer "key" whenever a source is configured), so those sessions bill the key. Without
+    this line the first sign is _note_auth_source's per-init mismatch, after a launch has already
+    billed the wrong account, and that line names the helper and the file without saying which line.
+
+    Gated on _declared_auth, not _expected_auth: one explicit gear Billing pick makes the declaration
+    inert everywhere else, and under a remembered login pick every spawn is seeded auth=login (spawn),
+    so the sentence above would be false there. =key is never a contradiction: a key source in the
+    file lands the sessions keyed, as declared (the reference shape docs/reference.md recommends
+    included), so nothing is said. Undeclared, nothing is said either: a key line in service.env
+    with no declaration is the ordinary shape. The file is read through keysource, so the only names
+    this can ever say are its two (a token another service keeps in the file is never one of them),
+    and the line names the file and the variable, never a value. Returns the variable named ("" when
+    quiet) so the caller and the tests can see what it decided."""
+    global _ENV_FILE_AUTH_CHECKED
+    if _ENV_FILE_AUTH_CHECKED:
+        return ""
+    exp, src = _declared_auth(state_dir)
+    if exp != "login" or src != "env":
+        return ""
+    p = path or _keysrc.service_env_path()
+    source = _keysrc.read_source(p)
+    if source.kind not in ("file", "op") or not source.configured:
+        return ""                    # no source selected (a missing file, an empty key line) or a file the
+    _ENV_FILE_AUTH_CHECKED = True    # launch itself will report as unreadable: nothing to weigh against the declaration
+    var = _keysrc.REF_VAR if source.kind == "op" else _keysrc.KEY_VAR
+    log("auth: %s sets %s while ROMP_EXPECTED_AUTH=login. The declaration says the sessions bill the machine "
+        "login, but the key source this file selects is injected at launch for every session without an "
+        "explicit Billing pick, so they bill the key. Fix whichever side is wrong: remove the line, or change "
+        "the declaration to match what the file selects." % (p, var), problem=True)
+    return var
+
+
 def _expected_auth() -> str:
     """The box-wide INTENDED auth, declared in the manager's environment (service.env):
     ROMP_EXPECTED_AUTH=key|login; unset or any other value declares nothing. On a machine whose
@@ -5478,6 +5518,10 @@ class SdkBackend:
         self._problems: list[dict] = []
         self._problem_seq = 0
         self._problem_lock = threading.Lock()
+        # The env file's key source against the auth declaration (_check_env_file_vs_declaration): said
+        # once, here, where the problem ring exists to carry it, before the boot reconcile below can
+        # launch a session on the account the declaration says it does not bill.
+        _check_env_file_vs_declaration(self._log, self.state_dir)
         # The dependency check, done ONCE here: absent → every session this backend owns reports the same
         # launch error (launch_error), instead of each one silently dying at its own lazy import.
         self._sdk_missing = not sdk_importable()
