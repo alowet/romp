@@ -3517,7 +3517,12 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
     head.appendChild(label);
     turn.appendChild(head);
   }
-  const seenSig = new Map<string, number>();   // text hash → how many identical texts precede this one
+  // text hash → how many identical texts the queue holds; each entry's fold identity is "hash : how many
+  // identical texts FOLLOW it" — the queue drains from the FRONT, so a duplicate landing ahead leaves every
+  // later duplicate's count untouched (counting the ones BEFORE renumbered them, review 2026-09-07)
+  const totalSig = new Map<string, number>();
+  for (const t of ev.texts) { const k = strHash32(t.md); totalSig.set(k, (totalSig.get(k) || 0) + 1); }
+  const seenSig = new Map<string, number>();
   for (const t of ev.texts) {
     if (t.followUp && !t.romp) turn.appendChild(followUpHeader(t.goal, t.fuCtx, t.idx !== undefined ? "q:" + t.idx : undefined));
     const bubble = el("div", "queued-bubble md" + (t.cancelable ? " cancelable" : "")
@@ -3539,8 +3544,9 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
     // text plus its occurrence among identical texts), never by the queue slot (which renumbers as entries
     // ahead land) and never by text alone (two identical notices must not share one expand state).
     const sig = strHash32(t.md);
-    const nth = seenSig.get(sig) || 0;
-    seenSig.set(sig, nth + 1);
+    const before = seenSig.get(sig) || 0;
+    seenSig.set(sig, before + 1);
+    const nth = (totalSig.get(sig) || 1) - before - 1;   // identical texts AFTER this one — stable across a front drain
     const qkey = sig + ":" + nth;
     let xHost: HTMLElement = bubble;   // where the ✕ lives: the nudge's own bubble corner, else the wrapper
     if (t.rompSystem) {

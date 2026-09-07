@@ -71,11 +71,11 @@ function measure(): Measured | null {
   const driver = path.join(dir, "driver.mjs"); fs.writeFileSync(driver, DRIVER);
   const htmlPath = path.join(dir, "page.html"); fs.writeFileSync(htmlPath, html);
   try {
-    const p = cp.spawnSync("node", [driver], { encoding: "utf8", timeout: 120000,
+    const p = cp.spawnSync(process.execPath, [driver], { encoding: "utf8", timeout: 120000,   // the running node, never PATH
       env: { ...process.env, EXT_PKG: path.resolve(process.cwd(), "package.json"), HTML_PATH: htmlPath, CSS_PATH: CSS_PATH,
              SHOT: process.env.QROMP_LAYOUT_SHOT || "" } });
     if (p.status === 3) return null;                                  // no playwright / no browser here
-    if (p.status !== 0) throw new Error("layout driver failed: " + (p.stderr || p.stdout).slice(-800));
+    if (p.status !== 0) throw new Error("layout driver failed: " + String(p.stderr || p.stdout || p.error || "").slice(-800));
     const line = (p.stdout || "").split("\n").find((l: string) => l.startsWith("RESULT:"));
     if (!line) throw new Error("layout driver printed no result: " + (p.stdout || "").slice(-400));
     return JSON.parse(line.slice("RESULT:".length));

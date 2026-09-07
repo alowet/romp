@@ -257,7 +257,8 @@ test("what romp itself queued wears the LANDED romp grammar, split as landed: no
   assert.match(body, /rb\.dataset\.act = "nudgetoggle";[\s\S]*?const nkey = "qnudge:" \+ qkey \+ ":" \+ gist\.slice\(0, 24\);/);
   // folds are keyed by the text's hash plus its occurrence — never the queue slot (it renumbers), never text alone
   assert.match(RENDER, /function strHash32\(str: string\): string/);
-  assert.match(body, /const sig = strHash32\(t\.md\);\s*\n\s*const nth = seenSig\.get\(sig\) \|\| 0;\s*\n\s*seenSig\.set\(sig, nth \+ 1\);\s*\n\s*const qkey = sig \+ ":" \+ nth;/);
+  assert.match(body, /const sig = strHash32\(t\.md\);\s*\n\s*const before = seenSig\.get\(sig\) \|\| 0;\s*\n\s*seenSig\.set\(sig, before \+ 1\);\s*\n\s*const nth = \(totalSig\.get\(sig\) \|\| 1\) - before - 1;/,
+    "the fold identity counts the identical texts AFTER the entry — the queue drains from the front");
   // the nudge's ✕ lives in its bubble's corner; the wrapper is the landed right-aligned column and the nested
   // bubble sheds its own 72% cap (T243 follow-up — measured in queued-romp-layout.test.ts)
   assert.match(body, /xHost = rb;/); assert.match(body, /xHost\.appendChild\(x\);/);
