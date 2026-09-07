@@ -12,15 +12,17 @@
 #
 #   the tip's tree    the content the push exposes. A banned string anywhere in
 #                     it refuses the push.
-#   each new commit   the lines it ADDS against its first parent. A string
-#                     introduced in an intermediate commit and removed by a
-#                     later one is still caught, and the commit named; a commit
-#                     whose tree merely INHERITS a string an older commit put
-#                     there is not. Every commit on every branch cut from main
-#                     between a string landing there and its redaction inherits
-#                     it that way, and a per-commit TREE scan refuses them all,
-#                     over files the branch never touched, when the only
-#                     exposure any of them could add is its tip.
+#   each new commit   the lines it ADDS: against its parent, or for a merge the
+#                     lines in none of its parents. A string introduced in an
+#                     intermediate commit and removed by a later one is still
+#                     caught, and the commit named; a commit whose tree merely
+#                     INHERITS a string an older commit put there is not, and
+#                     neither is a merge that brought one in from a parent the
+#                     remote already has. Every commit on every branch cut from
+#                     main between a string landing there and its redaction
+#                     inherits it that way, and a per-commit TREE scan refuses
+#                     them all, over files the branch never touched, when the
+#                     only exposure any of them could add is its tip.
 #
 # Why pushed commits rather than a working-tree scan: the hook is symlinked into
 # the SHARED git hooks dir (by install.sh), so it fires from every worktree —
@@ -69,25 +71,30 @@ rev_range() {   # <local_sha> <remote_sha> → a rev-list argument list
     printf '%s' "$args"
 }
 
-# The lines a commit adds, one per line as "<path>\t<text>": its diff against
-# its first parent (for a root commit, against the empty tree). A merge is read
-# the same way, so content in neither parent — a conflict resolution — counts as
-# the merge's own addition. -M keeps a rename from re-adding every line of the
-# file. The path comes from the `+++ b/<path>` header, read only between a
-# `diff --git` line and the first hunk: inside a hunk, a line that begins with
-# `+++ ` is added content (`++ b/x` as written) and belongs to the current file.
+# The lines a commit adds, one per line as "<path>\t<text>". A commit with one
+# parent: its diff against that parent (a root commit, against the empty tree).
+# A merge: the combined diff against ALL its parents (-c), keeping only the lines
+# in NONE of them — a conflict resolution, a line typed into the merge — which is
+# what the merge itself adds. A diff against the first parent alone named a merge
+# of main, taken while main carried a string, as adding it: the content came in
+# through the second parent, which the remote already had, and the branch's tip
+# was clean (the #968 review). In a combined diff every content line carries one
+# column per parent, and a line in no parent has a `+` in each; -c also omits a
+# file that matches any parent outright, which holds no such line. -M keeps a
+# rename from re-adding every line of the file. The path comes from the
+# `+++ b/<path>` header, read only between a `diff --git` or `diff --combined`
+# line and the first hunk: inside a hunk, a line that begins with `+++ ` is added
+# content (`++ b/x` as written) and belongs to the current file.
 added_lines() {   # <rev>
-    local parent
-    { if parent=$(git rev-parse -q --verify "$1^" 2>/dev/null); then
-          git diff-tree -p -r -M --no-color "$parent" "$1"
-      else
-          git diff-tree -p -r -M --no-color --root "$1"
-      fi; } | awk '
-        /^diff --git /       { hdr = 1; next }
-        hdr && /^\+\+\+ b\// { f = substr($0, 7); next }
-        hdr && /^\+\+\+ /    { f = $0; next }
-        /^@@/                { hdr = 0; next }
-        !hdr && /^\+/        { print f "\t" substr($0, 2) }'
+    local n
+    n=$(git rev-list --parents -n 1 "$1" | awk '{ print NF - 1 }')
+    git diff-tree -p -r -M -c --root --no-commit-id --no-color "$1" | awk -v n="$n" '
+        BEGIN { if (n < 1) n = 1; for (i = 0; i < n; i++) plus = plus "+" }
+        /^diff --(git|combined) /        { hdr = 1; next }
+        hdr && /^\+\+\+ b\//             { f = substr($0, 7); next }
+        hdr && /^\+\+\+ /                { f = $0; next }
+        /^@@/                            { hdr = 0; next }
+        !hdr && substr($0, 1, n) == plus { print f "\t" substr($0, n + 1) }'
 }
 
 blocked=0

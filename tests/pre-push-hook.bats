@@ -245,6 +245,64 @@ project_leaked_and_redacted_fork_behind() {
     [[ "$output" != *"${LEAK_SHA:0:10}"* ]]       # the project's own commit is not re-flagged
 }
 
+# ── merges ────────────────────────────────────────────────────────────────
+# A merge's own additions are the lines in NONE of its parents: a conflict
+# resolution, a line typed into the merge. A merge of main taken while main
+# carried a string brings it in through the second parent, which the remote
+# already has, and a diff against the first parent alone named the merge as
+# adding it although the branch's tip was clean (the #968 review).
+
+# A branch cut BEFORE main publishes an identifier merges main while the string
+# is live (the merge's first-parent diff adds it; its second parent has it),
+# then merges the redaction: the tip is clean. Leaves HEAD on the branch.
+branch_merged_main_while_leak_was_live() {
+    add_remote
+    commit_file base.txt "notes-api" "base"
+    git -C "$REPO" push -q origin main
+    git -C "$REPO" checkout -q -b feature
+    commit_file web.txt "the web session's work" "branch work"
+    git -C "$REPO" checkout -q main
+    commit_file leak.txt "home is /home/zzsynthuser/code" "leak"
+    git -C "$REPO" push -q origin main
+    git -C "$REPO" checkout -q feature
+    git -C "$REPO" merge -q -m "merge main while the leak is live" main
+    LIVE_MERGE_SHA="$(git -C "$REPO" rev-parse HEAD)"
+    git -C "$REPO" checkout -q main
+    remove_file leak.txt "redact"
+    git -C "$REPO" push -q origin main
+    git -C "$REPO" checkout -q feature
+    git -C "$REPO" merge -q -m "merge the redaction" main
+}
+
+@test "a merge of main taken while the leak was live is not the merge's own addition" {
+    branch_merged_main_while_leak_was_live
+    run_hook                # new ref: the branch commit and both merges are in the range, main's commits are not
+    [ "$status" -eq 0 ]
+}
+
+@test "a string typed into a merge's conflict resolution is the merge's own addition, naming the merge" {
+    add_remote
+    commit_file notes.txt "notes-api" "base"
+    git -C "$REPO" push -q origin main
+    git -C "$REPO" checkout -q -b feature
+    commit_file notes.txt "the web session's line" "branch side"
+    git -C "$REPO" checkout -q main
+    commit_file notes.txt "the api session's line" "main side"
+    git -C "$REPO" push -q origin main
+    git -C "$REPO" checkout -q feature
+    run git -C "$REPO" merge -q -m "merge main" main
+    [ "$status" -ne 0 ]                           # both sides changed notes.txt: a conflict to resolve
+    printf '%s\n' "resolved at /home/zzsynthuser/notes" > "$REPO/notes.txt"   # in neither parent
+    git -C "$REPO" add notes.txt
+    git -C "$REPO" commit -qm "merge main, resolved"
+    merge_sha="$(git -C "$REPO" rev-parse HEAD)"
+    commit_file notes.txt "settled" "settle"      # tip is clean, so the added-lines pass decides
+    run_hook
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"commit ${merge_sha:0:10} ADDS a personal identifier"* ]]
+    [[ "$output" == *"  notes.txt"* ]]
+}
+
 @test "with no remote-tracking refs, the same rule covers everything the remote ref lacks (the fallback)" {
     commit_file base.txt "notes-api" "base"
     remote_sha="$(git -C "$REPO" rev-parse HEAD)"
