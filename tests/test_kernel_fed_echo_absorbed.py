@@ -320,6 +320,26 @@ class ChatEventSaysAbsorbed(unittest.TestCase):
         self.assertTrue(all("absorbed" not in e for e in users if e["uuid"] != "att1"),
                         "a native user record never wears the flag")
 
+    def test_a_record_of_several_sends_carries_its_blocks(self):
+        """Back-to-back sends the CLI takes together land as ONE user record with a text block each (the
+        shape _atom_user_texts prunes the kernel's echoes against). The chat's own pending bubbles end
+        on an exact match with a landed event's text, and `md` is the blocks joined, which matches
+        none of them — so the event ships `blocks`, each under the one text key, and only when there
+        are two or more (2026-09-07 review)."""
+        first, second = "rename this to fetch_notes", "and update the docstring  "
+        batched = {"type": "user", "timestamp": iso(T0 + 90), "uuid": "u9", "parentUuid": "a3", "promptSource": "sdk",
+                   "message": {"role": "user", "content": [{"type": "text", "text": first},
+                                                           {"type": "text", "text": second}]}}
+        recs, shift = self._recs(running_turn() + spliced_tail() + [batched, aline(T0 + 95, "Both done.", "a4", "u9")])
+        self.tpath.write_text("".join(json.dumps(r) + "\n" for r in recs))
+        m = km.build_session(SID, self.now, self.tm)
+        self.assertIsNotNone(m)
+        users = {e["uuid"]: e for e in m["events"] if e.get("kind") == "user" and e.get("md")}
+        self.assertEqual(users["u9"]["blocks"], [first, second.strip()], "one entry per block, under echo_text_key")
+        self.assertEqual(users["u9"]["md"], (first + " " + second).strip(), "md stays the joined text")
+        self.assertEqual([u for u, e in users.items() if "blocks" in e], ["u9"],
+                         "a single-block record and the absorbed attachment ship no blocks")
+
 
 class OneTextRuleAcrossKernelAndBackend(unittest.TestCase):
     """The by-text prune has two sides in two modules: the kernel builds the keys (_atom_user_texts →

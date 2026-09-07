@@ -23,7 +23,10 @@
 // stable kernel event (`at.after`) and the uuids of the user events that ALREADY carried the text
 // (`at.seen`: an older identical message, an old echo, an undismissed never-delivered bubble). A
 // landing, a verdict or a provisional counts for this send only when it sits after the anchor and is
-// not in `seen`. The old form read the last 30 events and assumed the landing was near the tail — but an
+// not in `seen`. ONE RECORD CAN CARRY SEVERAL SENDS (2026-09-07 review): the CLI takes back-to-back
+// sends at one boundary as one user record with a text block each, and the kernel ships those blocks
+// (`blocks`); such a record is as many copies as it has matching blocks, and `seen` lists its uuid once
+// per copy already spoken for. The old form read the last 30 events and assumed the landing was near the tail — but an
 // absorbed atom is placed at its SEND time, so after a gap in pushes (a sleep, a reconnect, a turn with
 // many thinking and tool events) it sat far above the tail and, with the lifetime gone, the bubble never
 // ended. When the anchor itself has left the resident window (the transcript grew past the wire tail),
@@ -31,7 +34,9 @@
 
 export type SendBase = {
   after: string | null;   // uuid of the last stable kernel event at the press; null → nothing to anchor on, scan from the head
-  seen: string[];         // uuids of the user events carrying the text at the press: background, never this send
+  seen: string[];         // uuids of the user events carrying the text that are background for this send: what
+                          //   the press found, and what an earlier same-text entry claimed since — ONE ENTRY PER
+                          //   COPY (a record of several sends lists its uuid once per spoken-for block)
   queued: number;         // copies of the text the kernel's queued bubble(s) already listed at the press
 };
 
@@ -63,6 +68,9 @@ export type TailEvent = {
   undelivered?: boolean;
   images?: unknown[];
   texts?: { md?: string }[];
+  blocks?: string[];    // a user record the CLI wrote from SEVERAL sends taken at one boundary: one text per
+                        //   block (kernel.py build_session ships them when there are two or more); `md` is
+                        //   the blocks joined, so each block is a copy of its own send
 };
 
 export const OPT_PREFIX = "optimistic:";
@@ -87,20 +95,34 @@ export function newPending(text: string, imgPaths?: string[], now: number = Date
  *  and a landing of the longer message must not retire the shorter send (2026-09-06 review). */
 const sameText = (md: string, text: string): boolean => md.trim() === text.trim();
 
-/** A LANDED user atom carrying this send: a user event whose uuid is not the kernel's echo prefix and
- *  whose md IS the text — or, for an image send, whose md is the body and which carries images (the
- *  CLI rewrote the paths to "[Image #N]"; the kernel strips the placeholders and renders the pictures,
- *  so the paths are gone from the text; a quoted path may leave its quotes behind, so those are set
- *  aside on both sides). */
-export function landedIn(e: TailEvent, p: PendingSend): boolean {
-  if (e.kind !== "user" || typeof e.md !== "string" || isKernelEchoUuid(e.uuid)) return false;
-  if (sameText(e.md, p.text)) return true;
+/** How many COPIES of the send's text a user event carries: one when its md IS the text; otherwise one
+ *  per text block that is. The CLI takes back-to-back sends at one boundary as ONE user record with a
+ *  block per send (the shape the kernel's own echo prune, `_atom_user_texts`, was written for), and the
+ *  event's md is the blocks joined — so with an md-only test none of those sends' bubbles ever ended
+ *  (2026-09-07 review). The kernel ships `blocks` only when there are two or more. */
+function textCopies(e: TailEvent, p: PendingSend): number {
+  if (typeof e.md === "string" && sameText(e.md, p.text)) return 1;
+  let n = 0;
+  if (Array.isArray(e.blocks)) for (const b of e.blocks) if (typeof b === "string" && sameText(b, p.text)) n++;
+  return n;
+}
+
+/** How many copies of this send a LANDED user atom carries: a user event whose uuid is not the kernel's
+ *  echo prefix and whose md (or one of whose blocks) IS the text — or, for an image send, whose md is
+ *  the body and which carries images (the CLI rewrote the paths to "[Image #N]"; the kernel strips the
+ *  placeholders and renders the pictures, so the paths are gone from the text; a quoted path may leave
+ *  its quotes behind, so those are set aside on both sides). */
+export function landedCopies(e: TailEvent, p: PendingSend): number {
+  if (e.kind !== "user" || typeof e.md !== "string" || isKernelEchoUuid(e.uuid)) return 0;
+  const n = textCopies(e, p);
+  if (n) return n;
   if (p.imgPaths && p.imgPaths.length && Array.isArray(e.images) && e.images.length > 0) {
     const noq = (s: string) => collapse(s.replace(/"/g, ""));
-    return noq(e.md) === noq(p.body);
+    return noq(e.md) === noq(p.body) ? 1 : 0;
   }
-  return false;
+  return 0;
 }
+export const landedIn = (e: TailEvent, p: PendingSend): boolean => landedCopies(e, p) > 0;
 
 /** How many copies of the send's text a kernel queued bubble lists. */
 function queuedCopies(e: TailEvent, p: PendingSend): number {
@@ -110,18 +132,29 @@ function queuedCopies(e: TailEvent, p: PendingSend): number {
   return n;
 }
 
-/** The kernel's own PROVISIONAL copy of the send: its queued bubble or its unlanded echo atom. A
- *  never-delivered echo is a VERDICT, not a provisional (lostIn), and never suppresses a bubble. */
-export function provisionalIn(e: TailEvent, p: PendingSend): boolean {
-  if (e.kind === "queued") return queuedCopies(e, p) > 0;
-  return e.kind === "user" && isKernelEchoUuid(e.uuid) && !e.undelivered && typeof e.md === "string" && sameText(e.md, p.text);
+/** The kernel's own PROVISIONAL copies of the send: its queued bubble's, or its unlanded echo atom (one
+ *  text, the send's own — the kernel builds every echo from a single block). A never-delivered echo is a
+ *  VERDICT, not a provisional (lostIn), and never suppresses a bubble. */
+function provisionalCopies(e: TailEvent, p: PendingSend): number {
+  if (e.kind === "queued") return queuedCopies(e, p);
+  return e.kind === "user" && isKernelEchoUuid(e.uuid) && !e.undelivered ? textCopies(e, p) : 0;
 }
+export const provisionalIn = (e: TailEvent, p: PendingSend): boolean => provisionalCopies(e, p) > 0;
 
 /** The kernel's verdict that the send was LOST: its echo, flagged never-delivered (the CLI died holding
  *  it, or the session moved past it). That bubble carries the text and the resend/dismiss actions. */
-export function lostIn(e: TailEvent, p: PendingSend): boolean {
-  return e.kind === "user" && !!e.undelivered && typeof e.md === "string" && sameText(e.md, p.text);
+function lostCopies(e: TailEvent, p: PendingSend): number {
+  return e.kind === "user" && !!e.undelivered ? textCopies(e, p) : 0;
 }
+export const lostIn = (e: TailEvent, p: PendingSend): boolean => lostCopies(e, p) > 0;
+
+/** The copies of the send a USER event carries in whichever role it plays — the roles are disjoint (a
+ *  landed atom is never the kernel's echo; the verdict is the flagged echo), so at most one is non-zero. */
+const copiesIn = (e: TailEvent, p: PendingSend): number =>
+  e.kind !== "user" ? 0 : landedCopies(e, p) || lostCopies(e, p) || provisionalCopies(e, p);
+
+/** How many copies of the event `u` are already spoken for from this send's point of view. */
+const spokenFor = (at: SendBase, u: string): number => { let n = 0; for (const s of at.seen) if (s === u) n++; return n; };
 
 /** A kernel event a pending send can be anchored to: it has a uuid the kernel will keep. The client's own
  *  injections and the kernel's echo atoms are excluded — an echo is replaced by the landed atom (a new
@@ -182,7 +215,8 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
   for (const e of events) {
     if (e.kind === "queued") { queued += queuedCopies(e, p); continue; }
     if (e.kind !== "user" || !e.uuid || isOptimisticUuid(e.uuid) || !beforeSend(e)) continue;
-    if (landedIn(e, p) || lostIn(e, p) || provisionalIn(e, p)) seen.push(e.uuid);
+    const n = copiesIn(e, p);
+    for (let k = 0; k < n; k++) seen.push(e.uuid);   // once per COPY: a record of several sends is several
   }
   // the queued presumption (above): a late stamp's newest `own` copies are this press's, so the count of
   // background copies stops short of them — at zero when the frame lists fewer than presumed (the kernel
@@ -210,7 +244,10 @@ export type Reconciled = {
  *  accounts for ONE entry — the same rule for a landing and for the kernel's provisional copy:
  *   - the k-th landing after the anchor retires the k-th pending send with that text, and a landing an
  *     earlier entry took is background (`seen`) for every later entry with the same text — two
- *     identical sends in flight used to both retire on the first landing (2026-09-06 review);
+ *     identical sends in flight used to both retire on the first landing (2026-09-06 review). A record
+ *     of SEVERAL sends (`blocks`) is as many landings as it has matching blocks, so the claims on one
+ *     record are COUNTED (this push in `claimed`, for good in `seen`), never booleaned — two sends the
+ *     CLI took as one record used to leave both bubbles pending for ever (2026-09-07 review);
  *   - the k-th kernel copy of the text after the anchor — an echo atom no earlier entry claimed, or a
  *     queued copy beyond the entry's press-time count — covers the k-th pending send with that text: it
  *     hides that send's bubble for this push and proves the kernel received THAT send (`received`). A
@@ -236,7 +273,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
   for (const p of list) if (!p.at && p.late) lateOwn.set(p.text, (lateOwn.get(p.text) || 0) + 1);
   for (const p of list) if (!p.at) p.at = stampBase(events, p, p.late ? lateOwn.get(p.text) || 1 : 0);
   const r: Reconciled = { keep: [], inject: [], landed: [], lost: [] };
-  const claimed = new Set<number>();                   // landing indices taken by an earlier entry THIS push
+  const claimed = new Map<string, number>();           // "index\0text" → copies of that text in that landing taken by earlier entries THIS push
   const takenCopies = new Map<string, Set<number>>();  // text → queued-copy positions taken by an earlier entry THIS push
   for (const p of list) {
     const at = p.at!;
@@ -244,16 +281,19 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
     let landedIdx = -1, lostIdx = -1, echoIdx = -1, copies = 0;
     for (let i = from; i < events.length; i++) {
       const e = events[i];
-      if (e.uuid && at.seen.includes(e.uuid)) continue;
       if (e.kind === "queued") { copies += queuedCopies(e, p); continue; }
-      if (landedIdx < 0 && !claimed.has(i) && landedIn(e, p)) { landedIdx = i; continue; }
-      if (lostIdx < 0 && lostIn(e, p)) { lostIdx = i; continue; }
-      if (echoIdx < 0 && provisionalIn(e, p)) echoIdx = i;   // the first echo no earlier entry claimed (`seen`)
+      // the copies of this event that are NOT this send's: background at the stamp, or claimed by an
+      // entry retired since (`seen`); a landing an earlier entry took this push is counted in `claimed`
+      const spoken = e.uuid ? spokenFor(at, e.uuid) : 0;
+      if (landedIdx < 0 && landedCopies(e, p) > spoken + (claimed.get(i + "\0" + p.text) || 0)) { landedIdx = i; continue; }
+      if (lostIdx < 0 && lostCopies(e, p) > spoken) { lostIdx = i; continue; }
+      if (echoIdx < 0 && provisionalCopies(e, p) > spoken) echoIdx = i;   // the first echo no earlier entry claimed (`seen`)
     }
     // ONE kernel copy covers ONE send: an unclaimed echo atom first — its uuid is then background for
     // every later same-text entry, this push and every push after (the claim must outlive the claimant:
-    // a ✕ on it must not hand its echo to the next entry) — else the first queued copy beyond this
-    // entry's press-time count that no earlier entry took this push.
+    // a ✕ on it must not hand its echo to the next entry; an echo is one text, so one entry in `seen` is
+    // the whole of it) — else the first queued copy beyond this entry's press-time count that no
+    // earlier entry took this push.
     let covered = false;
     if (echoIdx >= 0) {
       covered = true;
@@ -267,17 +307,22 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
     if (covered) p.received = true;             // the kernel holds this send: proven once, latched
     if (p.received) p.lost = undefined;         // the drop is older news than the kernel's own copy
     if (landedIdx >= 0) {
-      claimed.add(landedIdx);
-      const u = events[landedIdx].uuid;
-      // this landing is spoken for: background for every later pending send with the same text, on this
-      // push and every push after (the retired entry's claim would otherwise leave with it)
-      if (u) for (const q of list) if (q !== p && q.at && q.text === p.text && !q.at.seen.includes(u)) q.at.seen.push(u);
+      const ck = landedIdx + "\0" + p.text;             // per text: a record of two DIFFERENT sends is one landing for each
+      claimed.set(ck, (claimed.get(ck) || 0) + 1);
       r.landed.push({ p, idx: landedIdx });
       continue;
     }
     if (lostIdx >= 0) { r.lost.push(p); continue; }
     r.keep.push(p);
     if (!covered) r.inject.push(p);
+  }
+  // Every landing claimed this push is spoken for: one copy per claim becomes background for every
+  // pending send with the same text that STAYS, on every push after (the retired entry's claim would
+  // otherwise leave with it, and the next identical send would retire on a record that was never its
+  // own). Once per claim — the claimant leaves the list with this push — so `seen` counts exactly.
+  for (const { p, idx } of r.landed) {
+    const u = events[idx].uuid;
+    if (u) for (const q of r.keep) if (q.text === p.text) q.at!.seen.push(u);
   }
   return r;
 }

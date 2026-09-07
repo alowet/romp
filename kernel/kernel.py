@@ -23636,6 +23636,19 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                                 ev["absorbed"] = True
                                 if a.get("landedT"):
                                     ev["landedAt"] = int(a["landedT"])
+                            # Several back-to-back sends the CLI took together land as ONE user record
+                            # with a text block each — the shape _atom_user_texts prunes the kernel's
+                            # echoes against. The chat's own pending bubbles end on an EXACT text match
+                            # with a landed event, and `md` is the blocks joined, which matches none of
+                            # them: without the blocks none of those bubbles ever ended (2026-09-07
+                            # review). Shipped only when there are two or more, each under the one text
+                            # key; the client counts one copy per matching block. (Not `texts`: the
+                            # queued event uses that name for another shape.)
+                            btexts = [sb.echo_text_key(b.get("text")) for b in blocks
+                                      if isinstance(b, dict) and b.get("type") == "text"]
+                            btexts = [t for t in btexts if t]
+                            if len(btexts) >= 2:
+                                ev["blocks"] = btexts
                             sp = _space_paths(prompt, sid, a.get("uuid"))
                             if sp:
                                 ev["spacePaths"] = sp   # backticked filenames WITH spaces, filesystem-verified → whole-span links

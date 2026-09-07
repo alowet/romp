@@ -3698,12 +3698,16 @@ class SdkSession:
             return False
 
     def _note_message_failure(self, msg, e) -> None:
-        """One problem line per failure, with enough to fix by: the exception type, the message's type
-        and subtype (never its content), the exception's own text (uuid-shaped ids shortened, clipped —
-        _mask_ids), what that message losing its handling cost (_failure_consequence — for a
-        ResultMessage read from whether the settle's finally ran for it, never assumed), and the frame
-        chain (file:line function, no locals, bounded; _compact_tb). A bare `KeyError: '<uuid>'` with
-        none of this is what the last such failure left to diagnose from.
+        """One problem line per failure, with enough to fix by: the exception type and the FAILING SITE
+        (the innermost frame, file:line function — _failing_site), the message's type and subtype
+        (never its content), what that message losing its handling cost (_failure_consequence — for a
+        ResultMessage read from whether the settle's finally ran for it, never assumed), the exception's
+        own text (uuid-shaped ids shortened, clipped — _mask_ids), and the frame chain (innermost
+        first, no locals, bounded; _compact_tb). A bare `KeyError: '<uuid>'` with none of this is what
+        the last such failure left to diagnose from. The site LEADS the line, right after the type: the
+        error center shows a row's first 240 characters (the kernel feed caps the text at 400), and
+        with the chain at the end of ~335 characters of prose a user never saw where a handler failed
+        (2026-09-07 review). The full chain stays at the tail for the kernel log.
 
         Repeats: a signature is (session, exception type, the failing frame as file/line/function —
         _failing_frame, read from the traceback itself, so the chain's length cap cannot change it).
@@ -3727,9 +3731,10 @@ class SdkSession:
             return
         settled = getattr(self, "_settled_msg", None) is msg   # getattr: __new__-built test doubles
         again = "" if n == 1 else " (repeat %d this kernel life; its earlier error-center entry was evicted)" % n
-        self.backend._log("sdk session %s: %s while handling a %s message%s; that message's handling "
-                          "stopped there (%s) and the stream continues. %s: %s, at %s"
-                          % (self.name, type(e).__name__, kind, again, _failure_consequence(msg, settled=settled),
+        self.backend._log("sdk session %s: %s at %s while handling a %s message%s; that message's handling "
+                          "stopped there (%s) and the stream continues. %s: %s. Frames, innermost first: %s"
+                          % (self.name, type(e).__name__, _failing_site(e), kind, again,
+                             _failure_consequence(msg, settled=settled),
                              type(e).__name__, _mask_ids(e), _compact_tb(e)), problem=True, key=key)
 
     def _on_message(self, msg, AssistantMessage, ResultMessage, SystemMessage):
@@ -3952,24 +3957,10 @@ class SdkSession:
         elif isinstance(msg, ResultMessage):
             try:
                 # (This try is the whole branch: its body is the result's BOOKKEEPING, its finally is
-                # THE SETTLE — the finally's comment has the rule.)
-                # total_cost_usd is CUMULATIVE per CLI process (the result event's totalCostUSD counter, beside
-                # total_duration/lines) — fold only THIS turn's delta, or every result re-adds the whole
-                # session-so-far cost and the spend readout compounds into fiction (the user 2026-08-08). A
-                # total below the last seen means a counter we didn't watch reset — fold it whole, never negative.
-                total = getattr(msg, "total_cost_usd", None)
-                if isinstance(total, (int, float)) and total > 0:
-                    delta = total - self._last_cost_total if total >= self._last_cost_total else total
-                    self._last_cost_total = float(total)
-                    # the tokens: THIS turn's counts, from whichever result counter is a running total —
-                    # the two are not the same kind (see _turn_usage; the flat `usage` is per-turn now)
-                    turn_u = self._turn_usage(msg)
-                    self.backend._record_spend(delta, turn_u, keyed=self.api_key_auth,
-                                               sid=self.thread_of or self.sid)   # the rail's spend —
-                    #   a comment THREAD bills its owning session (T144: whole-session truth for the
-                    #   rail and the optimizer; a deliberate fork has no threadOf and bills itself)
-                    #   + token readout; keyed = THIS session's init-reported auth, so the API sum stays
-                    #   honest on a mixed host (see _record_spend)
+                # THE SETTLE — the finally's comment has the rule. The spend accounting runs LAST in the
+                # body: it is the step most likely to raise on data (a NaN usage field, a failing spend
+                # write), and ahead of the others it skipped the rewind consumption and the live-tail
+                # sweep — 2026-09-07 review.)
                 if self._rewind_to and getattr(self, "_rewind_wait", False):
                     # delete-while-busy: THIS settle is the interrupted turn ending — the flag is being
                     # ARMED here, not consumed. Second observer of the turn-end fact (the Stop hook is
@@ -4005,10 +3996,28 @@ class SdkSession:
                 asyncio.ensure_future(self._do_refresh_context())   # refresh ctx % + model from the SDK and
                 #   persist them, so the bar reflects the turn that just landed and survives idle/restart.
                 asyncio.ensure_future(self._do_refresh_usage())     # + the exact /usage snapshot (rail bars)
+                # total_cost_usd is CUMULATIVE per CLI process (the result event's totalCostUSD counter, beside
+                # total_duration/lines) — fold only THIS turn's delta, or every result re-adds the whole
+                # session-so-far cost and the spend readout compounds into fiction (the user 2026-08-08). A
+                # total below the last seen means a counter we didn't watch reset — fold it whole, never negative.
+                # (The scheduled refreshes above cannot run before this synchronous step: nothing yields.)
+                total = getattr(msg, "total_cost_usd", None)
+                if isinstance(total, (int, float)) and total > 0:
+                    delta = total - self._last_cost_total if total >= self._last_cost_total else total
+                    self._last_cost_total = float(total)
+                    # the tokens: THIS turn's counts, from whichever result counter is a running total —
+                    # the two are not the same kind (see _turn_usage; the flat `usage` is per-turn now)
+                    turn_u = self._turn_usage(msg)
+                    self.backend._record_spend(delta, turn_u, keyed=self.api_key_auth,
+                                               sid=self.thread_of or self.sid)   # the rail's spend —
+                    #   a comment THREAD bills its owning session (T144: whole-session truth for the
+                    #   rail and the optimizer; a deliberate fork has no threadOf and bills itself)
+                    #   + token readout; keyed = THIS session's init-reported auth, so the API sum stays
+                    #   honest on a mixed host (see _record_spend)
             finally:
                 # THE SETTLE — everything that makes the turn over for the kernel — runs whatever the
-                # bookkeeping above did (the spend fold, the rewind flags, the live-tail
-                # sweep, the refreshes: any step may raise and stop the rest). The rule
+                # bookkeeping above did (the rewind flags, the live-tail sweep, the refreshes, the spend
+                # accounting last: any step may raise and stop the rest). The rule
                 # (2026-09-06): a ResultMessage is the CLI saying the turn ended, so a kernel-side failure
                 # while filing it must never leave the session reading 'working' with its queue parked.
                 # The first cut opened the try only ahead of the rewind steps, so a raise in the spend
@@ -5223,17 +5232,26 @@ def _failing_frame(exc):
     return (os.path.basename(f.filename), f.lineno or 0, f.name)
 
 
+def _failing_site(exc) -> str:
+    """The failing frame rendered as the chain renders a step (`file:line function`), or "?" when the
+    exception carries no traceback — what the problem line names right after the exception type."""
+    site = _failing_frame(exc)
+    return "%s:%d %s" % site if site else "?"
+
+
 def _compact_tb(exc, max_frames: int = COMPACT_TB_FRAMES, cap: int = COMPACT_TB_CHARS) -> str:
-    """The exception's frame chain as `file:line function` steps, outermost first — no locals, no
-    source lines: enough to name the site on the next occurrence, small enough for one log line.
-    BOUNDED FROM THE OUTER END: at most the innermost `max_frames` frames, then outer frames dropped
-    one at a time until the chain fits `cap` characters, with a prefix saying how many were dropped
-    in all. The innermost frame — the failing site — is always kept; if it alone overflows the cap,
-    its function name is clipped and its file:line stands. (A RecursionError's chain ran to 18 KB
-    before any bound, into the error-center ring and every feed payload that carries it; the first
-    bound then clipped the chain's TAIL, which is the innermost frame, so a chain through long-named
-    frames lost its failing site, and a dedupe key read off the rendering became the literal '…' —
-    every long-chained failure of one type folded into one ring entry. 2026-09-06.)"""
+    """The exception's frame chain as `file:line function` steps, INNERMOST FIRST — the failing site
+    leads, and each ` < ` step is the caller of the one before it — no locals, no source lines: enough
+    to name the site on the next occurrence, small enough for one log line. BOUNDED FROM THE OUTER
+    END: at most the innermost `max_frames` frames, then outer frames dropped one at a time until the
+    chain fits `cap` characters, with a suffix saying how many were dropped in all. The innermost
+    frame — the failing site — is always kept; if it alone overflows the cap, its function name is
+    clipped and its file:line stands. (A RecursionError's chain ran to 18 KB before any bound, into
+    the error-center ring and every feed payload that carries it; the first bound then clipped the
+    chain's TAIL, which was the innermost frame, so a chain through long-named frames lost its failing
+    site, and a dedupe key read off the rendering became the literal '…' — every long-chained failure
+    of one type folded into one ring entry. 2026-09-06. Innermost first since 2026-09-07: the chain
+    sits at the end of a line the error center clips, so what survives the clip must be the site.)"""
     frames = traceback.extract_tb(getattr(exc, "__traceback__", None))
     if not frames:
         return "?"
@@ -5241,21 +5259,21 @@ def _compact_tb(exc, max_frames: int = COMPACT_TB_FRAMES, cap: int = COMPACT_TB_
 
     def render(kept):
         dropped = total - len(kept)
-        s = " > ".join(kept)
-        return "…%d outer frame%s dropped… > %s" % (dropped, "" if dropped == 1 else "s", s) if dropped else s
+        s = " < ".join(kept)
+        return "%s < …%d outer frame%s dropped…" % (s, dropped, "" if dropped == 1 else "s") if dropped else s
 
-    steps = [_frame_step(f) for f in frames[-max(1, max_frames):]]
-    kept = steps[-1:]                        # the innermost frame, unconditionally
-    for step in reversed(steps[:-1]):        # then outward, one frame at a time, while the whole fits
-        if len(render([step] + kept)) > cap:
+    steps = [_frame_step(f) for f in reversed(frames[-max(1, max_frames):])]   # innermost first
+    kept = steps[:1]                         # the innermost frame, unconditionally
+    for step in steps[1:]:                   # then outward, one frame at a time, while the whole fits
+        if len(render(kept + [step])) > cap:
             break
-        kept = [step] + kept
+        kept = kept + [step]
     s = render(kept)
     if len(s) > cap:                         # the innermost frame alone overflows: clip its function name
         site, _, func = kept[0].partition(" ")
-        head = render([site + " "])          # the prefix and the file:line — never clipped
-        room = cap - len(head) - 1
-        s = (head + func[:room] + "…") if room >= 0 else s[:cap - 1] + "…"   # (a site wider than the cap: bound it anyway)
+        bare = render([site + " "])          # the file:line and the drop suffix — never clipped
+        room = cap - len(bare) - 1
+        s = render([site + " " + func[:room] + "…"]) if room >= 0 else s[:cap - 1] + "…"   # (a site wider than the cap: bound it anyway)
     return s
 
 

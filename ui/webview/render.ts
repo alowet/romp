@@ -11886,9 +11886,10 @@ function routeUserMessage(sid: string, text: string, cites: Citation[] | undefin
   const quoteCites = cites ? cites.filter((c) => c.quote) : [];
   // EVERY branch echoes optimistically (the user 2026-08-23: quoted and follow-up sends showed
   // nothing until the kernel round-tripped, while plain sends painted instantly — the exact
-  // inconsistency reported). The quote branch echoes the COMPOSED body, which is byte-identical to
-  // what lands (quoteReplyBody IS the send path), so the reconcile's includes() match is exact; the
-  // follow-up echoes the typed words, a substring of the goal-wrapped landing.
+  // inconsistency reported). The reconcile ends a bubble on an EXACT text match with the landed event's
+  // md (send-pending.ts): the quote branch echoes the COMPOSED body, which is byte-identical to what
+  // lands (quoteReplyBody IS the send path); the follow-up echoes the typed words, which is what the
+  // kernel ships as the landed event's md once it strips the goal wrapper (_split_followup).
   if (goalCite?.itemId) { vscodeApi.postMessage({ type: "askFollowUp", itemId: goalCite.itemId, text, sid }); registerOptimistic(sid, text, imgPaths); }
   else if (quoteCites.length) { const body = quoteReplyBody(quoteCites, text); vscodeApi.postMessage({ type: "sendMessage", id: sid, text: body }); registerOptimistic(sid, body, imgPaths); }
   else { vscodeApi.postMessage({ type: "sendMessage", id: sid, text }); registerOptimistic(sid, text, imgPaths); }

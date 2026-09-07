@@ -597,23 +597,27 @@ children and other processes that outlive their shell.
 
 A message the kernel cannot handle does not end the session's CLI. The kernel
 handles each streamed message on its own: when a handler raises, it logs the
-exception type, the message's type and subtype, the exception's own text
-(uuid-shaped ids shortened to eight characters, clipped to 160 characters; it
-carries whatever the raising code put in it, never the message's content), what
-that message lost (an assistant or user message is also a transcript record, so
-the chat rebuilds it from disk — a compaction boundary is one too, while a model
-or mode change's confirmation line is not; a turn result still settles its turn,
-and the line says so only when the settle ran; a stream-only frame's content is
-gone until the next such frame), and a compact frame chain (file, line and
-function for at most the innermost eight frames, no locals, at most 600
-characters, dropping outer frames first so the failing frame is always named) to
-the kernel log and the dashboard's error center, then goes on to the next
-message. A failure while filing a turn result — its spend, its live-tail
-sweep — still settles the turn: the session reads waiting, its queue moves,
-and a reconnect that waited for the turn's end runs. A handler that
-fails on every message is one error-center entry with a repeat count; every
-repeat is still a kernel log line, and an entry the ring has since dropped
-re-enters with its full detail.
+exception type and the failing frame (file, line and function, first on the line
+so the error center's clipped row still shows it), the message's type and
+subtype, what that message lost (an assistant or user message is also a
+transcript record, so the chat rebuilds it from disk — a compaction boundary is
+one too, while a model or mode change's confirmation line is not; a turn result
+still settles its turn, and the line says so only when the settle ran; a
+stream-only frame's content is gone until the next such frame), the exception's
+own text (uuid-shaped ids shortened to eight characters, clipped to 160
+characters; it carries whatever the raising code put in it, never the message's
+content), and a compact frame chain (innermost first: file, line and function
+for at most the innermost eight frames, no locals, at most 600 characters,
+dropping outer frames first so the failing frame is always named) to the kernel
+log and the dashboard's error center, then goes on to the next message. A
+failure while filing a turn result — its spend, its live-tail sweep — still
+settles the turn: the session reads waiting, its queue moves, and a reconnect
+that waited for the turn's end runs; the spend accounting runs last among the
+result's bookkeeping, so its failure skips nothing else. A handler that fails on
+every message is one error-center entry, showing its first occurrence: the
+repeat count is kept on the kernel's problem ring (appended to the row's text,
+past what the error center displays), every repeat is a kernel log line, and an
+entry the ring has since dropped re-enters with its full detail.
 Before 2026-09-06 one such exception ended the receive loop, which closed the
 CLI in the middle of its work (the in-flight turn, its subagents, its background
 tasks) and resumed the session as after a crash. A fault of the stream itself,

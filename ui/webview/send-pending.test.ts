@@ -39,12 +39,22 @@ const filler = (n: number, prefix = "f"): TailEvent[] =>
 // ── (1) no lifetime ──────────────────────────────────────────────────────────────────────────────
 
 test("a pending send survives past 20 s — and past any time — without confirmation", () => {
-  const list = press([{ kind: "assistant", md: "still working on the earlier step" }], TEXT);
-  // nothing happens for a minute, then an hour
-  for (const later of [T0 + 21_000, T0 + 60_000, T0 + 3_600_000]) {
-    const r = reconcilePending([{ kind: "assistant", md: "…" }], list);
-    assert.equal(r.keep.length, 1, `still pending at +${(later - T0) / 1000}s`);
-    assert.equal(r.inject.length, 1, "…and still shown: nothing in the payload accounts for it");
+  const list = press([{ kind: "assistant", md: "still working on the earlier step", uuid: "a0" }], TEXT);
+  // nothing happens for a minute, then an hour: the wall clock moves on and the kernel's stamps move on
+  // with it, and the decision reads neither
+  const realNow = Date.now;
+  try {
+    for (const later of [T0 + 21_000, T0 + 60_000, T0 + 3_600_000]) {
+      Date.now = () => later;
+      const r = reconcilePending([
+        { kind: "assistant", md: "still working on the earlier step", uuid: "a0" },
+        { kind: "assistant", md: "…", uuid: "a-" + later, ts: new Date(later).toISOString() },
+      ], list);
+      assert.equal(r.keep.length, 1, `still pending at +${(later - T0) / 1000}s`);
+      assert.equal(r.inject.length, 1, "…and still shown: nothing in the payload accounts for it");
+    }
+  } finally {
+    Date.now = realNow;
   }
   assert.doesNotMatch(RENDER, /OPT_TTL_MS/, "the 20 s backstop is gone from render.ts");
 });
@@ -443,13 +453,12 @@ test("a send pressed against no frame (a placeholder tab): the first frame's cop
   assert.match(RENDER, /const p = newPending\(text, imgPaths\);\s*\n\s*arr\.push\(p\);/);
   assert.match(RENDER, /if \(!s\) \{ p\.late = true; return; \}/);
   // the clock the bound compares against: the kernel stamps the echo atom at its receipt of the send, in
-  // whole seconds, and the chat builder ships every event's stamp as iso(t)
+  // whole seconds (sdk_backend.py send). That the chat builder ships every event's stamp as iso(t) is
+  // proven behaviourally, not pinned here: tests/test_kernel_fed_echo_absorbed.py (ChatEventSaysAbsorbed)
+  // reads a built user event's ts back as iso(t) of its atom.
   const SDK = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "sdk_backend.py"), "utf8");
   assert.match(SDK, /sent_t = int\(time\.time\(\)\)/);
-  assert.match(SDK, /"type": "user", "uuid": key, "session_id": sid, "t": sent_t,/);
-  const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
-  assert.match(KERNEL, /t = a\.get\("t"\); ts = iso\(t\) if t else None/);
-  assert.match(KERNEL, /def iso\(t\):\s*\n\s*"""Epoch → the ISO-8601 UTC/);
+  assert.match(SDK, /"t": sent_t\b/);
 });
 
 test("a late stamp presumes the first frame's newest queued copy of the text is this send's own (busy and held queues)", () => {
@@ -555,4 +564,42 @@ test("every composer send posts a clientDiag breadcrumb — sid, time, length, r
   // one owner: the breadcrumb sits in routeUserMessage, which every send path (plain, quote, follow-up, staged flush) goes through
   const fn = RENDER.slice(RENDER.indexOf("function routeUserMessage("), RENDER.indexOf("\n}\n", RENDER.indexOf("function routeUserMessage(")));
   assert.ok(fn.includes('what: "send"'));
+});
+
+// ── (15) one record, several sends ───────────────────────────────────────────────────────────────
+
+test("two back-to-back sends the CLI took as ONE record retire both bubbles; a third with other text stays", () => {
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
+  const list = press(tail, "continue", "continue", "and the docstring");
+  // the kernel's user event for the batched record: md is the blocks joined; `blocks` lists each send
+  const rec: TailEvent = { kind: "user", md: "continue continue", uuid: "u1", blocks: ["continue", "continue"] };
+  const r = reconcilePending([...tail, rec], list);
+  assert.deepEqual(r.landed.map((l) => [l.p, l.idx]), [[list[0], 1], [list[1], 1]], "one copy per block, in send order");
+  assert.deepEqual(r.keep, [list[2]], "the third send's text is in no block");
+  assert.equal(landedIn(rec, list[2]), false);
+  assert.equal(landedIn(rec, list[0]), true);
+  // two sends of DIFFERENT texts batched the same way: each block is its own send's landing
+  const list2 = press(tail, "continue", "and the docstring");
+  const rec2: TailEvent = { kind: "user", md: "continue and the docstring", uuid: "u2", blocks: ["continue", "and the docstring"] };
+  const r2 = reconcilePending([...tail, rec2], list2);
+  assert.deepEqual(r2.landed.map((l) => [l.p.text, l.idx]), [["continue", 1], ["and the docstring", 1]]);
+  // a record of two copies that was already there at the press is background twice over
+  const list3 = press([...tail, rec], "continue");
+  assert.deepEqual(list3[0].at?.seen, ["u1", "u1"], "seen counts copies, not events");
+  assert.equal(reconcilePending([...tail, rec], list3).keep.length, 1, "neither copy is this send's");
+  // across pushes: the first of three identical sends retired on its own record earlier; the two-block
+  // record then retires exactly the two that remain — the claims on one record are counted
+  const list4 = press(tail, "continue", "continue", "continue");
+  let r4 = reconcilePending([...tail, { kind: "user", md: "continue", uuid: "u0" }], list4);
+  assert.deepEqual(r4.landed.map((l) => l.p), [list4[0]]);
+  r4 = reconcilePending([...tail, { kind: "user", md: "continue", uuid: "u0" }, rec], r4.keep);
+  assert.deepEqual(r4.landed.map((l) => l.p), [list4[1], list4[2]]);
+  assert.equal(r4.keep.length, 0);
+  // a fourth identical send pressed later finds every copy already there: the record of two is two
+  const list5 = press([...tail, { kind: "user", md: "continue", uuid: "u0" }, rec], "continue");
+  assert.deepEqual(list5[0].at?.seen, ["u0", "u1", "u1"], "the press lists the two-block record twice");
+  assert.equal(reconcilePending([...tail, { kind: "user", md: "continue", uuid: "u0" }, rec], list5).keep.length, 1);
+  // the same counting for the kernel's copies: a record of several sends is never an echo (one text each)
+  assert.equal(provisionalIn({ kind: "user", md: "continue continue", uuid: "echo:1", blocks: ["continue", "continue"] }, list[0]), true,
+    "…but were one ever shipped with blocks, its copies would be read the same way");
 });
