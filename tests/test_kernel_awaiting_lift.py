@@ -16,11 +16,13 @@ stamp (those remain the 6h backstop's job, the one case a timer is the only tool
 
 SYNTHETIC fixtures only: placeholder UUIDs, invented task descriptions.
 """
+import errno
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -126,6 +128,28 @@ class AwaitingLift(unittest.TestCase):
         self.assertIsNotNone(self._stamp(), "precondition: the goal starts stamped")
         self._tick()
         self.assertIsNone(self._stamp(), "every dispatch came back → the wait is over")
+
+    def test_a_faulting_store_forgets_the_gate_so_the_next_tick_retries(self):
+        """The inputs gate (_lift_seen) is recorded before the store read; a read FAULT must forget it,
+        exactly as a raised ruling does, or the next tick over the same inputs would skip the session
+        and the lift would wait for the transcript to change."""
+        self._transcript([_launch("t1", LAUNCH), _launch("t2", LAUNCH + 5),
+                          _notification("t1", BACK), _notification("t2", BACK + 5)])
+        self._seed()
+        km._lift_seen.pop(SID, None)
+        km.jd._STORE_FAULTS.pop(SID, None)
+        target, orig = km.jd.GOALDIR / (SID + ".json"), Path.read_text
+
+        def faulting(path, *a, **kw):
+            if path == target:
+                raise OSError(errno.EIO, "Input/output error", str(path))
+            return orig(path, *a, **kw)
+        with mock.patch.object(Path, "read_text", faulting):
+            self._tick()
+        self.assertIsNotNone(self._stamp(), "nothing is written to a store that could not be read")
+        self.assertNotIn(SID, km._lift_seen, "the gate is forgotten on a fault, not spent...")
+        self._tick()
+        self.assertIsNone(self._stamp(), "...so the very next tick, same inputs, retries and lifts")
 
     def test_one_still_running_keeps_the_stamp(self):
         self._transcript([_launch("t1", LAUNCH), _launch("t2", LAUNCH + 5),

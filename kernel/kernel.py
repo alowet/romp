@@ -1769,7 +1769,9 @@ def _followup_body(iid, title, text, injected=False, auto=False, stalled=False, 
     sid = str(iid).rsplit(":", 1)[0]
     nodes = {}
     try:
-        nodes = jd.load_goals(sid).get("nodes", {})
+        store, fault = jd.load_goals_or_fault(sid)  # a faulting store files its row; the message still goes
+        if fault is None:                            # out in the single-line form (no goal-derived enumeration)
+            nodes = store.get("nodes", {})
     except Exception:
         pass
     title = (title or "").strip()
@@ -5132,7 +5134,9 @@ def _record_interrupt_block(sid, ev):
     fold would bury the row anyway. The tick retries every push, so a refused APPEND would grow the
     diary at push cadence; refusing without one keeps it clean until newer evidence (the next settled
     turn) makes the block land."""
-    store = jd.load_goals(sid)
+    store, fault = jd.load_goals_or_fault(sid)
+    if fault is not None:
+        return None                                  # its row is filed; no block is recorded on a store we cannot read
     gid = _interrupt_focus_top(store)
     if not gid:
         return None
@@ -5173,11 +5177,18 @@ def _lift_interrupt_block(sid, gid, ev):
     read as "evidence newer than the last turn romp saw end", so _nudge_fire_list held the nudge under
     a why the stall surface screens), until a peer's message opened a fresh turn whose verdict finally
     outranked it. Floored at the block's own stamp so the lift can never sort BEFORE what it lifts —
-    the same guard rollup_status's moot-unblock uses."""
-    store = jd.load_goals(sid)
+    the same guard rollup_status's moot-unblock uses.
+
+    Returns True when the marker is SPENT (the block lifted, or there was nothing of ours left to lift)
+    and False when the store could not be read: the tick keeps the intrBlocked marker on False so the
+    lift is retried next tick, instead of erasing it and leaving romp's own block on the card with no
+    tick ever looking again."""
+    store, fault = jd.load_goals_or_fault(sid)
+    if fault is not None:
+        return False                                 # its row is filed; the caller keeps the marker → retried next tick
     nd = store.get("nodes", {}).get(gid)
     if nd is None:
-        return
+        return True
     log = nd.get("log") or []
     lastblk = next((e.get("src") for e in reversed(log) if e.get("kind") == "block"), None)
     if lastblk == "interrupt" and nd.get("blocked"):
@@ -5187,6 +5198,7 @@ def _lift_interrupt_block(sid, gid, ev):
         jd.rollup_status(store, False)
         jd.save_goals(sid, store)
         _mark_views_dirty()
+    return True
 
 
 def _intr_blocked(sid=None):
@@ -5214,13 +5226,17 @@ def _intr_block_stands(sid, gid):
     compaction archives it — and a tick that trusts the bare marker skips the re-block forever while
     the session's live focus goal sits in Working wearing only the 'interrupted' badge, auto-nudge
     suppressed: invisible-blocked (the user 2026-08-08, whose stopped session's marker pointed at a
-    goal since ruled done, cleared, and archived)."""
+    goal since ruled done, cleared, and archived). An UNREADABLE store is not evidence the block fell:
+    it reads as standing, so the marker is KEPT (its row is filed) exactly as the lift keeps it — a
+    second stop during a persisting fault used to read "no longer stands", pop the marker, fail to
+    re-block through the same fault, and leave romp's own block on the card with nothing to lift it
+    once the file read again."""
     if not gid:
         return False
-    try:
-        nd = jd.load_goals(sid).get("nodes", {}).get(gid)
-    except Exception:
-        return False
+    store, fault = jd.load_goals_or_fault(sid)
+    if fault is not None:
+        return True
+    nd = store.get("nodes", {}).get(gid)
     return bool(nd and nd.get("blocked"))
 
 
@@ -5278,8 +5294,9 @@ def _interrupt_block_tick(now, tmux):
             if ib:
                 # the re-engagement IS the newest turn's trigger — the same stamp the judges will put on
                 # every verdict about that turn, so their ruling outranks this lift on arrival order
-                _lift_interrupt_block(sid, ib, turns[-1].get("t") if turns else 0)
-                _set_intr_blocked(sid, None); changed = True
+                if _lift_interrupt_block(sid, ib, turns[-1].get("t") if turns else 0):
+                    _set_intr_blocked(sid, None); changed = True   # spent; on a store fault the marker
+                #                                                    stays so the next tick retries the lift
     if changed:                                          # a needs-you flip should reach the feed at once
         _push_all()
 
@@ -6142,7 +6159,10 @@ def _lift_spent_awaiting(now, tmux):
             if gate is not None and _lift_seen.get(sid) == gate:
                 continue
             _lift_seen[sid] = gate                    # recorded now; a ruling that RAISES forgets it below,
-            store = jd.load_goals(sid)                # so the next cycle retries instead of skipping
+            store, fault = jd.load_goals_or_fault(sid)   # so the next cycle retries instead of skipping
+            if fault is not None:                     # its row is filed; forget the gate so the next cycle
+                _lift_seen.pop(sid, None)             # retries this session, and go on to the others
+                continue
             nodes = store.get("nodes") or {}
             stamped = [nd for nd in nodes.values()
                        if nd.get("awaitingWhy") and nd.get("awaitingAt") and not nd.get("rolledUp")]
@@ -7449,7 +7469,9 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only
     # deliberately NOT the arm: a romp-injected turn can never become the arm, so a verdict about one is
     # newer than the arm FOREVER (see _nudge_fire_list's deadlock note).
     seen = next((tn for tn in reversed(turns) if tn.get("ended")), None)
-    store = jd.load_goals(sid)
+    store, fault = jd.load_goals_or_fault(sid)
+    if fault is not None:
+        return None                                  # its row is filed; nothing fires or stamps on a store we cannot read
     # Don't nudge until the CLOSER has classified this turn AT ITS CURRENT SIZE (session-level gate). A turn
     # that ENDS by asking you a question is "working" only in the window before the closer marks its goal
     # blocked; nudging there is pointless (it's waiting on YOU) and churns. _closer_settled mirrors the
@@ -19998,7 +20020,12 @@ def _feed_goals(sid):
                     sys.stderr.write("feed-goals: user-override replay: %s\n" % traceback.format_exc())
             return _apply_rewind_hold(sid, store)      # a pending rewind's cards are hidden NOW (latched
             #                                            at the gesture; archive lands at the branch-take)
-    return _apply_rewind_hold(sid, jd.load_goals(sid))   # no pass in flight → live read, outside the lock
+    store, fault = jd.load_goals_or_fault(sid)     # no pass in flight → live read, outside the lock
+    if fault is not None:
+        return None                                    # the read FAULTED (the pre-pass snapshot skips such a file
+    #                                                    too): the row is filed once per episode, and build_feed
+    #                                                    renders this one session without goal-derived content
+    return _apply_rewind_hold(sid, store)
 
 # Delta-send (the user 2026-06-25, who wanted to stop re-sending what didn't change): the chat pusher used to send the
 # FULL events array (~8MB for a 34MB transcript) on every change, even when one event was appended. Keep the
@@ -23224,7 +23251,8 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
     events, by_tool = [], {}                  # by_tool: tool_use_id → its tool event (fill output later)
     uuid2seg, seg_anchors = {}, {}            # atom uuid → seg id; seg id → (promptId, workId) for the dot/bar split
     seg_trig, seg_work = {}, {}               # goal-node DEEP-LINK anchors: prompt = the segment's trigger
-    _bs_store = jd.load_goals(sid)            # seam-aware seg ids (mirror the judge's split)
+    _bs_store, _bs_fault = jd.load_goals_or_fault(sid)   # seam-aware seg ids (mirror the judge's split); a
+    #                                                      FAULT (row filed) → None → seams off, the tab still builds
     #                                          (the per-turn seg loop runs below, after the fold decision)
     last_t = None
     last_model = ""                           # the model on the most recent assistant message (system-card meta)
@@ -24045,18 +24073,22 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
     # LEAF: its descendants are hidden even if open. Skip cleared nodes. `current` marks the focus node
     # being worked on (the graph's lastNode) so render can point a line at it; done nodes carry their
     # time for a recency-coloured "(Xm ago)" on the right.
-    gstore = _apply_rewind_hold(sid, jd.load_goals(sid))   # a pending rewind's cards hide on EVERY
+    gstore, gfault = jd.load_goals_or_fault(sid)   # a FAULT (row filed) → None: this tab's ledger tree
+    if gfault is None:                             # renders EMPTY instead of every tab's build failing
+        gstore = _apply_rewind_hold(sid, gstore)   # a pending rewind's cards hide on EVERY
     #                                            surface — this ledger tree (and the tab-hover
     #                                            recents derived from it) used to keep showing the
     #                                            doomed asks for the whole armed window while the
     #                                            feed hid them (the "one chokepoint" premise was
     #                                            false; the window is unbounded on a bare delete)
-    gnodes, gstatus, gcleared = gstore.get("nodes", {}), gstore.get("status", {}), _cleared_ids()
+    gnodes = gstore.get("nodes", {}) if gstore is not None else {}
+    gstatus = gstore.get("status", {}) if gstore is not None else {}
+    gcleared = _cleared_ids()
     gkids = {}
     for _gid, _gn in gnodes.items():
         gkids.setdefault(_gn.get("parentId"), []).append(_gid)
     g_agent_open = _agent_open_set(gnodes, gkids)   # authoritative-open subtree → never 'done' (mirrors build_feed / the judge)
-    focus = gstore.get("lastNode")
+    focus = gstore.get("lastNode") if gstore is not None else None
     tree = []
 
     def _cleared(cid):
@@ -24502,10 +24534,14 @@ def _mark_nodes_cleared(item_ids, value, src="user", why=None):
     # a full jd.discover() filesystem enumeration — INSIDE the loop, so a Clear-all → Undo-clear across N
     # sessions did N back-to-back discoveries, blocking the single-threaded kernel (the "really slow" undo).
     sess_paths = {s["sid"]: s["path"] for s in _sessions(now)}
+    skipped = {}                                       # sid -> fault text: sessions this gesture could NOT reach
     for sid, ids in by_sid.items():
-        store = jd.load_goals(sid)
-        nodes = store.get("nodes", {})
-        touched = False
+        store, fault = jd.load_goals_or_fault(sid)
+        if fault is not None:
+            skipped[sid] = str(fault)                  # its row is filed; the flag cannot be written on a store we
+            continue                                   # cannot read (the view-level clear still holds), the other
+        nodes = store.get("nodes", {})                 # sessions' clears proceed, and the CALLER answers the user
+        touched = False                                # (a WS gesture reports the refusal to its own socket)
         for iid in ids:
             nd = nodes.get(iid)
             if nd is not None and bool(nd.get("cleared")) != value:
@@ -24550,6 +24586,7 @@ def _mark_nodes_cleared(item_ids, value, src="user", why=None):
             _note_user_goal_write(sid)
     if not value:
         _mark_views_dirty()
+    return skipped
 
 
 # ── /clear is an episode boundary, not a deletion (the user 2026-07-26) ──────────────────────────
@@ -24634,8 +24671,9 @@ def _episode_boundary_check(sid, path, now):
 
 
 def _clear_ask(item_id):
-    """Clear one feed card (inbox-zero) — a batch of one (see _clear_all)."""
-    _clear_all([item_id])
+    """Clear one feed card (inbox-zero) — a batch of one (see _clear_all). Returns _clear_all's
+    {sid: fault} so the WS op answers the socket when the card's session could not be read."""
+    return _clear_all([item_id])
 
 
 def _subtree_item_ids(iid):
@@ -24699,6 +24737,42 @@ def _delegation_linked_ids(item_ids):
     return out
 
 
+def _gesture_store_refusal(client, gesture, skipped):
+    """A user gesture (a clear, a sub-goal drop, an undo) that a session's UNREADABLE goal store made us
+    skip must say so on the socket that made it (the standing rule: a refusal of a user gesture reaches
+    the user). The feed's `err` dialog is the existing "that action did not land" surface, bell included;
+    one per session skipped, naming the session and the fault, and saying exactly what did and did not
+    happen, never a promise. Three accounts, because three different things happened: a whole-card clear
+    (askClear, Clear-all) DID hide the card(s) — cleared.jsonl hides top cards on its own — but the
+    durable flag was not written; a sub-goal drop (the modal's Drop, sub-task-only) changed NOTHING,
+    since a sub row renders from the node flag alone, the very write the fault refused, so the user is
+    told to try again (a retry appends a fresh row and sets the flag); an undo restored nothing and the
+    next Undo retries it (_undo_clear keeps those ids the newest batch). `text` carries the whole
+    account; there is no `copy` key, which by contract is the USER'S undelivered text (the feed renders
+    it as a "Copy my text" button and folds it into the bell entry). The skip itself is already a
+    `store-unreadable` judge-errors row (jd.load_goals_or_fault); this is the user's copy."""
+    for sid, fault in (skipped or {}).items():
+        who = _name_of(sid) or sid[:8]
+        if gesture == "undo":
+            title = "That undo did not land for %s" % who
+            text = ("Its cards were not restored: romp could not read that session's goals file (%s). "
+                    "They are still held for you; press Undo again once the file reads. The other sessions "
+                    "were not affected." % fault)
+        elif gesture == "drop":
+            title = "That sub-goal was not cleared for %s" % who
+            text = ("romp could not read that session's goals file (%s), so nothing changed there and the "
+                    "row is as it was. Try it again once the file reads." % fault)
+        else:                                          # "clear": one card, or every card of one session
+            title = "That clear did not fully land for %s" % who
+            text = ("What you cleared there is off the board, but the clear was not written into that "
+                    "session's goals file, which romp could not read (%s); nothing else changed there, and "
+                    "the other sessions were not affected." % fault)
+        try:
+            client["send"](json.dumps({"type": "err", "sid": sid, "title": title, "text": text}))
+        except Exception:
+            sys.stderr.write("gesture refusal (%s %s): %s\n" % (gesture, sid[:8], traceback.format_exc()))
+
+
 def _clear_all(item_ids):
     """Clear every given card in ONE batch (shared float timestamp = the batch key) so a single
     UndoClear restores the whole batch. Append-only + single-writer (the kernel) → crash-safe; an
@@ -24707,7 +24781,7 @@ def _clear_all(item_ids):
     sides at once and one UndoClear restores it on both (the user 2026-06-23)."""
     item_ids = [i for i in item_ids if i]
     if not item_ids:
-        return
+        return {}
     seen = set(item_ids)
     item_ids = item_ids + [i for i in _delegation_linked_ids(item_ids) if i not in seen]   # + the delegation's peer copy
     p = jd.STATE / "cleared.jsonl"
@@ -24716,12 +24790,13 @@ def _clear_all(item_ids):
     with p.open("a") as f:
         for iid in item_ids:
             f.write(json.dumps({"id": iid, "t": t, "op": "clear"}) + "\n")
-    _mark_nodes_cleared(item_ids, True)               # durable node flag → no grouper re-wrap, no column bounce
+    skipped = _mark_nodes_cleared(item_ids, True)     # durable node flag → no grouper re-wrap, no column bounce
     # CLEAR IS SILENT (the user 2026-08-23, reversing the 2026-07-24 wrap-up): the session hears
     # NOTHING. The wrap's response turn routinely re-minted the very card the user had just cleared —
     # a discard that answered back — so the gesture now only discards; if anything real remains, the
     # user asks a follow-up or tells the session themselves. The judge keeps recognizing HISTORICAL
     # wrap markers in old transcripts; no new ones are ever sent.
+    return skipped                                    # {sid: fault} for sessions whose store could not be read
 
 
 # (_clear_wrap_targets / _clear_wrap_body / _clear_wrap_notify lived here 2026-07-24..2026-08-23:
@@ -24733,17 +24808,37 @@ def _clear_all(item_ids):
 
 def _undo_clear():
     """Restore the most-recent clear BATCH — every id cleared at the latest timestamp. So one
-    UndoClear undoes a Clear-all as a unit, and a single-card clear restores just that card."""
+    UndoClear undoes a Clear-all as a unit, and a single-card clear restores just that card.
+    A session whose goals file cannot be read is left OWED, never consumed: its ids are journaled as
+    undone only if the archive restore reached its store, and any id journaled whose flag step then
+    could not run is re-journaled as cleared, so in every fault shape those ids stay the newest batch
+    and the user's next Undo retries exactly them. Journaling every id first consumed the batch on a
+    fault (the ids read as undone, the nodes stayed in the archive, and no later Undo could reach
+    them); journaling last is not an option either, since the reopen verdict's gate needs the undo
+    row on disk before the flag step runs (its comment says why). Returns {sid: fault} for the
+    sessions skipped."""
     cur = _cleared_ids()
     if not cur:
-        return
+        return {}
     newest = max(cur.values())
     restored = [i for i, ct in cur.items() if ct == newest]
-    with (jd.STATE / "cleared.jsonl").open("a") as f:
+    skipped = dict(_restore_goal_archive(restored))   # pull the restored tops back OUT of the archive FIRST,
+    restored = [i for i in restored if i.rsplit(":", 1)[0] not in skipped]   # (a session it could not read
+    with (jd.STATE / "cleared.jsonl").open("a") as f:   # keeps its clear rows: still the newest batch)
         for iid in restored:
             f.write(json.dumps({"id": iid, "t": time.time(), "op": "undo"}) + "\n")
-    _restore_goal_archive(restored)                   # pull the restored tops back OUT of the archive FIRST,
-    _mark_nodes_cleared(restored, False)              # so this finds the nodes → un-set the durable flag → real status
+    late = _mark_nodes_cleared(restored, False)       # so this finds the nodes → un-set the durable flag → real status
+    if late:
+        # The store read fine (or held nothing archived) a moment ago and faults NOW, after the undo row
+        # landed: the node is restored flag-cleared, which build_feed hides exactly like the clear did, and
+        # the modal has no op that could reach it (resolve and clear only). Re-journal the clear for those
+        # ids so the batch stays owed — the very next Undo restores them once the file reads again.
+        with (jd.STATE / "cleared.jsonl").open("a") as f:
+            for iid in restored:
+                if iid.rsplit(":", 1)[0] in late:
+                    f.write(json.dumps({"id": iid, "t": time.time(), "op": "clear"}) + "\n")
+        skipped.update(late)
+    return skipped                                    # {sid: fault} for sessions whose store could not be read
 
 
 # ── goal-store compaction: archive dismissed (cleared) cards out of the live tree ──────────────────────────
@@ -24764,7 +24859,9 @@ def _compact_goal_store(fsid):
     Returns the count of nodes moved. Whole-subtree only (a cleared top rolls cleared/done DOWN its tree, so the
     subtree is terminal) and roots only (parentId is null), so an active card never loses children."""
     cleared = _cleared_ids()
-    store = jd.load_goals(fsid)
+    store, fault = jd.load_goals_or_fault(fsid)
+    if fault is not None:
+        return None                                    # its row is filed; nothing moves out of a store we cannot read
     nodes = store.get("nodes", {})
     if not nodes:
         return 0
@@ -24821,7 +24918,10 @@ def _compact_goal_stores():
             continue
         if _compact_seen.get(fsid) == mt:
             continue                                   # unchanged → nothing new to archive
-        moved += _compact_goal_store(fsid)
+        n = _compact_goal_store(fsid)
+        if n is None:
+            continue                                   # unreadable this sweep: NOT recorded as seen (its mtime did
+        moved += n                                     # not move), so the next sweep retries it
         try:                                           # record OUR write's mtime so we don't re-sweep it next pass
             _compact_seen[fsid] = os.path.getmtime(jd.GOALDIR / (fsid + ".json"))
         except OSError:
@@ -24836,6 +24936,7 @@ def _restore_goal_archive(item_ids):
     by_sid = {}
     for iid in item_ids:
         by_sid.setdefault(iid.rsplit(":", 1)[0], []).append(iid)
+    skipped = {}                                       # sid -> fault text: sessions the restore could NOT reach
     for sid, ids in by_sid.items():
         with jd._GOAL_ARCH_LOCK:                       # the archive is a blind RMW — see the lock's note
             arch = jd.load_goal_archive(sid)
@@ -24857,8 +24958,11 @@ def _restore_goal_archive(item_ids):
                             stack.extend(a_children.get(x, []))
             if not move:
                 continue
-            store = jd.load_goals(sid)
-            nodes = store.setdefault("nodes", {})
+            store, fault = jd.load_goals_or_fault(sid)
+            if fault is not None:
+                skipped[sid] = str(fault)              # its row is filed; the archive keeps these nodes (nothing is
+                continue                               # restored INTO a store we cannot read), the other sessions'
+            nodes = store.setdefault("nodes", {})      # restores proceed, and the caller answers the user
             status = store.setdefault("status", {})
             # Journal the payload FIRST (the user 2026-07-10): once the archive save below lands, these nodes
             # exist only in the live store's save — a stale triage-pass save racing it would drop them from
@@ -24890,6 +24994,7 @@ def _restore_goal_archive(item_ids):
             jd.save_goals(sid, store)
             jd.save_goal_archive(sid, arch)
             _compact_seen.pop(sid, None)               # force a re-stat next sweep (we just changed the live file)
+    return skipped
 
 
 def _resolve_node(sid, node_id):
@@ -25544,6 +25649,14 @@ def build_feed(now, tmux=None):
         sess_retrying = _session_retrying(fsid, tm)
         store = _feed_goals(fsid)                # pre-pass snapshot while a judge pass is mid-flight → the card's
                                                  # status never shows a half-applied intermediate (atomic visibility)
+        store_faulted = store is None            # this session's store could not be READ (EACCES, EIO, a directory
+        if store_faulted:                        # at the path): its row is filed (jd.load_goals_or_fault) and THIS
+            store = {"nodes": {}, "status": {}}  # session renders with no goal-derived content — no cards (so no
+            #                                      floors and no swirl, which land only on cards) and nothing
+            #                                      inferred from the absence (the provisional card is gated on the
+            #                                      flag below). A render-only stand-in, never saved. Every other
+            #                                      session is untouched; before this, one such file aborted the
+            #                                      whole build.
         # ANALYZING (the user 2026-07-13; broadened 2026-08-12): the card must say when romp is working
         # on it. Two prongs, either lights the swirl:
         #   * the SETTLE GAP — the turn just settled but the closer hasn't delivered its verdict yet
@@ -25957,9 +26070,11 @@ def build_feed(now, tmux=None):
                 # offered Continue. Badges persist for the card's life, so one absorbed badge
                 # poisoned the session's whole card tail.
                 psid, gid = o["peer"], o.get("goalId")
-                sgoal = jd.load_goals(psid).get("nodes", {}).get(gid) if gid else None
+                pstore, pfault = jd.load_goals_or_fault(psid) if gid else (None, None)
+                sgoal = pstore.get("nodes", {}).get(gid) if pstore is not None else None
                 origin_live = bool(sgoal and not sgoal.get("nodeComplete") and not sgoal.get("cleared")
-                                   and gid not in cleared)
+                                   and gid not in cleared)   # a sender whose store faults reads absorbed (dimmed,
+                #                                              no affordance) rather than aborting the build
                 # Name resolution: the live names registry first (a local sender may have been
                 # renamed), then the courier's plant-time snapshot (the only source for a
                 # FEDERATED sender, whose sid this kernel can't resolve), then the sid stub.
@@ -26400,7 +26515,9 @@ def build_feed(now, tmux=None):
             # perm_top excluded: a live-blocked focus card no longer counts as "working" (it reports needs_input
             # now), so without this guard a session whose ONLY card is the picker-blocked one would ALSO get a
             # provisional working placeholder — a duplicate. A floored perm_top already covers the live prompt.
-            pc = _provisional_card(s, name, color, fsid, live, now, store)
+            # store_faulted excluded: "the planner has not placed this yet" is an inference from placements we
+            # could not read, so a session whose store faulted gets no provisional card (its row says why).
+            pc = _provisional_card(s, name, color, fsid, live, now, store) if not store_faulted else None
             if pc:
                 asks.append(pc)
             elif perm_state in _NEEDS_INPUT_STATES:      # perm_top is None here (outer guard) → no goal to floor
@@ -28453,7 +28570,9 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
         tm = tmux.get(sid)
         live = tm is not None
         hexcol = (tm and tm["color"]) or (_name_color(sid) or {}).get("bg", "#888888")
-        goals = jd.load_goals(sid)
+        goals, gfault = jd.load_goals_or_fault(sid)  # a FAULT (row filed) → None: this lane renders without
+        if gfault is not None:                       # goal-derived data (blocked state, seams, judging marks)
+            _bars_complain(sid, "goals", gfault)     # and the frame ships for every other lane
         if with_bars:
             try:
                 session = _parse(s["path"], sid, now)
@@ -28520,7 +28639,8 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
         else:                             # dead lane: NEVER "working" — a turn left open at death (e.g. a stalled API
                                           # turn that never returned a ResultMessage, then ended) must not read as
                                           # active (the user 2026-06-23); badgeFor dims a dead lane anyway.
-            blocked = "blocked" in goals.get("status", {}).values() and not _session_flag(sid, "hideFromFeed")
+            blocked = (goals is not None and "blocked" in goals.get("status", {}).values()
+                       and not _session_flag(sid, "hideFromFeed"))
             state = "needsInput" if blocked else "idle"   # muted → no awaiting/background-task badge on the lane
             aw_open = open_now                          # unused (awaitingBg is None for a dead lane) — kept defined
         bars, last_t, seg_ends = [], None, {}            # seg_ends: seg-start t → work-END t (for completion marks)
@@ -28586,7 +28706,8 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
         if with_bars:
             turns[sid] = bars
             try:
-                _derive_judging(sid, caps, goals, now - TL_HORIZON, semantic, seg_ends)
+                if goals is not None:
+                    _derive_judging(sid, caps, goals, now - TL_HORIZON, semantic, seg_ends)
             except Exception as e:
                 _bars_complain(sid, "judging-marks", e)   # this lane loses its marks, the frame ships
         _bft = (branch_of.get(sid) or {}).get("t")
@@ -29196,7 +29317,10 @@ def _goal_segments(item_id):
     `id` IS the segment id, so `hit(segId)` lights both its dot and bar). item_id is the goal node id;
     its prefix (before ':gN') is the owning session's rompUuid. Empty list if unknown."""
     sid = item_id.rsplit(":", 1)[0]
-    nodes = jd.load_goals(sid).get("nodes", {})
+    store, fault = jd.load_goals_or_fault(sid)
+    if fault is not None:
+        return []                                      # its row is filed; nothing lights for a store we cannot read
+    nodes = store.get("nodes", {})
     if item_id not in nodes:
         return []
     children = {}
@@ -29222,7 +29346,10 @@ def _cards_for_segments(sid, seg_ids):
     seg_set = set(seg_ids or [])
     if not seg_set:
         return []
-    nodes = jd.load_goals(sid).get("nodes", {})
+    store, fault = jd.load_goals_or_fault(sid)
+    if fault is not None:
+        return []                                      # its row is filed; nothing lights for a store we cannot read
+    nodes = store.get("nodes", {})
 
     def top(nid):
         while nodes.get(nid, {}).get("parentId") is not None:
@@ -38798,7 +38925,7 @@ class Handler(BaseHTTPRequestHandler):
             # (wireNodeZones sends the clicked node's own id), so collect the card's whole subtree BEFORE
             # the clear archives it out of the live store, and drop a chip citing ANY of those nodes.
             _gone = _subtree_item_ids(str(msg["itemId"]))
-            _clear_ask(msg["itemId"])
+            _gesture_store_refusal(client, "clear", _clear_ask(msg["itemId"]))
             _send_to_app("chat", {"type": "dropCitation", "itemId": str(msg["itemId"]), "itemIds": _gone})
             _mark_views_dirty()                # cleared.jsonl is invisible to the fleet sig → dirty-rebuild now
         elif msg and msg.get("type") == "quarantineDecision" and msg.get("mid"):
@@ -38846,7 +38973,7 @@ class Handler(BaseHTTPRequestHandler):
                                       "op": "resolve", "ok": _rok, "error": _rerr})
             elif msg.get("op") == "clear":
                 _gone = _subtree_item_ids(str(msg["nodeId"]))
-                _clear_all([str(msg["nodeId"])])
+                _gesture_store_refusal(client, "drop", _clear_all([str(msg["nodeId"])]))   # a SUB-goal: its own account
                 _send_to_app("chat", {"type": "dropCitation", "itemId": str(msg["nodeId"]), "itemIds": _gone})
                 _mark_views_dirty()
         elif msg and msg.get("type") == "redistill" and msg.get("sid") and msg.get("itemId"):
@@ -38884,11 +39011,15 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         elif msg and msg.get("type") == "clearAll":
             d = build_feed(int(time.time()))
-            _clear_all([a["itemId"] for a in d["asks"]] + [c["itemId"] for c in d["items"]])
+            # `items` (the old stream deliverables) is no longer a payload key; indexing it raised before
+            # _clear_all ever ran, so Clear-all cleared nothing and only the receive loop's stderr line knew
+            _gesture_store_refusal(client, "clear",
+                                   _clear_all([a["itemId"] for a in d["asks"]]
+                                              + [c["itemId"] for c in (d.get("items") or [])]))
             _send_to_app("chat", {"type": "dropCitationsAll"})   # every card cleared → drop every composer chip
             _mark_views_dirty()
         elif msg and msg.get("type") == "undoClear":
-            _undo_clear()
+            _gesture_store_refusal(client, "undo", _undo_clear())
             _mark_views_dirty()
         elif msg and msg.get("type") == "dismissLane" and msg.get("id"):
             # timeline: clear a DEAD lane's leftover row (the user 2026-07-02). DURABLE since 2026-08-14
