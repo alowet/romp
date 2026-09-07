@@ -23,8 +23,12 @@ test("the browser is the viewer's sibling MODAL, one z layer BENEATH it", () => 
   assert.match(FEED_CSS, /\.filebrowse \{ width: min\(720px, 95%\); height: min\(760px, 95%\);/);
   assert.match(FEED_CSS, /#romp-fileview \{ position: fixed; inset: 0; z-index: 1200;/);
   assert.match(BROWSE, /wrap\.id = "romp-filebrowse";/);
-  assert.match(BROWSE, /wrap\.onclick = \(ev\) => \{ if \(ev\.target === wrap\) closeFileBrowse\(\); \};/,
-    "backdrop clicks close; content clicks never do (the lightbox contract)");
+  // backdrop clicks close; content clicks never do (the lightbox contract) — and a drag that STARTED inside
+  // the card and ended over the dim is not a backdrop click: the close is armed on pointerdown and fires only
+  // when both ends were on the dim (review fold on #924, 2026-09-07)
+  assert.match(BROWSE, /wrap\.addEventListener\("pointerdown", \(e\) => \{ downOnDim = e\.target === wrap; \}\);/);
+  assert.match(BROWSE, /wrap\.onclick = \(ev\) => \{ const close = downOnDim && ev\.target === wrap; downOnDim = false; if \(close\) closeFileBrowse\(\); \};/,
+    "backdrop clicks close; content clicks and card-to-dim drags never do");
   assert.match(BROWSE, /document\.body\.classList\.add\("filebrowse-open"\);/);
 });
 
