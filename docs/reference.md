@@ -33,6 +33,7 @@ These are for scripting and for agents rather than daily use:
 |---|---|
 | `romp url` | Print only the tokened dashboard URL, for piping |
 | `romp sessions [--json]` | The fleet with each session's state, identity colours, directory and backend |
+| `romp perf [--interval <s>] [--json]`, `romp perf log on\|off` | The kernel's performance counters as rates over two snapshots (below); `--json` prints one raw snapshot; `log on\|off` turns the `romp-perf` stderr log on or off without a restart |
 | `romp mail …` | The postal service from the shell (below) |
 | `romp send <session> [--tag <label>] <text>` | Hand a session a message, on either backend. Anything a script, cron job, or launcher composes SHOULD carry a tag (one word, letters/digits/dashes, up to 24 chars): the chat then renders it as machine-sent under that label instead of as the user's typed words. Raw POST /send callers pass it as the JSON `tag` field (`{name, text, tag}` — a malformed tag fails the whole send, loudly); `--tag` is the CLI's equivalent. Both resolve to the `<!-- romp-tag: <label> -->` marker in the delivered text |
 | `romp new --env NAME=VALUE <name>` | A per-session env var for the SDK session, repeatable; a re-run against a running `<name>` replaces the whole set — vars not re-named are dropped |
@@ -667,6 +668,61 @@ reason); when the scopes were wanted on Linux and the box cannot provide them
 also appears in the dashboard's error center, since every session then runs
 inside the service cgroup. The macOS launchd path is unchanged: there is no cgroup kill there,
 and the tmux server keeps its launchd lineage.
+
+## Kernel performance counters
+
+`GET /perf` returns one JSON document of counters the kernel keeps at all
+times: what its pusher, judge and HTTP threads have done since the process
+started. The route takes the serve token. The counters cost a lock and a few
+dictionary increments per event, so they stay on; nothing is formatted or
+serialized until a request reads them. `romp perf` takes two snapshots
+`--interval` seconds apart (default 10) and prints the difference as rates on
+one screen: pusher cycles and wakes per second, cycle time percentiles, the
+share of cycle time in each stage, CPU split between the pusher thread, the
+judge threads and the rest of the process, builds served from cache against
+rebuilds, bytes sent per slot as full frames, deltas and deduplicated frames,
+goal-store loads and writes per second, judge passes and their durations,
+memory and thread count. `romp perf --json` prints one raw snapshot. If the
+kernel restarted between the two snapshots the counters have started over, so
+the command says so and exits non-zero instead of printing negative rates; a
+refused token is reported as such, not as a dead kernel.
+
+The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
+
+- `now`, `since`, `uptime_s`, `log`: the clock, when the counters started,
+  seconds since the process started, and whether the `romp-perf` log is on.
+- `process`: `rss_kb`, `threads`, `cpu_s`, `pid`.
+- `pusher`: `cycles`, `wakes` (every wake call; a burst of wakes runs one
+  cycle), `wakes_event` and `wakes_backstop` (how the loop's wait ended),
+  `cycle_ms_sum`, `cycle_ms_max` (since start), `cycle_ms_last`,
+  `cycle_cpu_ms_sum` (the pusher thread's own CPU time), and `cycle_ms_p50`,
+  `cycle_ms_p90`, `cycle_ms_ring_max`, `ring_n` from the last 256 cycles.
+- `stages_ms`: `jobs` (the cycle's tick jobs outside the push), `push`, and
+  inside it `push.chat`, `push.feed`, `push.timeline`, `push.send`. The
+  `push.*` stages count every push, including the one a connecting page gets,
+  so they can add up to more than `push`.
+- `builds`: `chat`, `feed`, `timeline`, each with `cached`, `built`, `ms`.
+- `sends`: `full`, `delta`, `deduped`, each a map from slot name (`chat`,
+  `feed`, `bars`, `taborder`, ...) to `count` and `bytes`. A deduplicated frame
+  was built and compared, then not sent.
+- `goals`: `loads`, `saves`, `writes` on the goal stores. A save that would
+  rewrite identical bytes is a save without a write.
+- `judge`: `passes`, `ms_sum`, `ms_last`, `ms_mean` (wall time; a pass waits
+  on model calls), `cpu_ms_sum` (CPU time of the judge tier threads and every
+  per-session worker they run; the workers' share is `cpu_ms_workers`).
+- `http`: request `count` and `ms` per `METHOD /path` for GET, POST, HEAD and
+  OPTIONS, the query string removed and `/dist/*`, `/media/*` and
+  `/remote/*/…` collapsed to one key each, for at most 64 keys; further keys
+  fold into `other`. A WebSocket upgrade is counted when it arrives and not
+  timed, since its handler runs for the life of the socket.
+
+`POST /perf` with the body `{"log": true}` or `{"log": false}` turns the
+`romp-perf` stderr log on or off in the running kernel (`romp perf log on|off`).
+The log prints one line per chat build and per frame sent or deduplicated. It
+goes where the manager's stderr goes: under systemd, `journalctl --user -u
+romp-manager -f | grep romp-perf`; under launchd (macOS), `tail -f
+~/.local/state/romp/manager.log | grep romp-perf`. Setting `ROMP_PERF=1` in the
+kernel's environment still turns it on at start.
 
 ## Where things live
 
