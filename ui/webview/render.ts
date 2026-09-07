@@ -70,6 +70,7 @@ import { agentCount, replyOwed, threadsByAnchor, threadBusy, threadStuck, findAn
 import { dragSlotIndex } from "./dragslot";
 import { perfFrameHandler } from "./perf-telemetry";
 import { linkifyPrRefs, senderPrRepo, postalSenderHost } from "./pr-links";
+import { listenForFrames } from "./frame-listener";
 
 for (const [name, lang] of Object.entries({
   bash, sh: bash, shell: bash, python, py: python, javascript, js: javascript,
@@ -14060,7 +14061,8 @@ function pipeBanner(up: boolean, queued: number): void {
 
 // every frame's synchronous handling time is measured (perf-telemetry.ts: one clientDiag row a
 // minute, read by `romp perf client`); the handler itself is unchanged
-window.addEventListener("message", perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: MessageEvent) => {
+// …and handed the merged frames by direct call from federation.js when this page has it (frame-listener.ts)
+listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: MessageEvent) => {
   const m = e.data;
   if (!m) return;
   // the shell's palette: "Fork this session…" → the fork modal for the ACTIVE session, from the tip

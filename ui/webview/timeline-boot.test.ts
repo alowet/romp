@@ -217,7 +217,7 @@ test("dispatchFrame routes tagEditFailed to the panel — the LOUD half of remot
   const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
   // (the listener body ends there; the boot registers it wrapped through the page's performance collector when one
   // is published on window.__rompPerf, the way every pane bundle wraps its own — perf-telemetry.ts)
-  assert.match(KERNEL, /else if\(m\.type==="tagEditFailed"&&panel\.tagEditFailed\)panel\.tagEditFailed\(m\);\nelse if\(m\.type==="openViewsDialog"&&panel\._openViewsDialog\)panel\._openViewsDialog\(null\);\};\nwindow\.addEventListener\("message",\(window\.__rompPerf&&window\.__rompPerf\.wrapFrameHandler\)\?window\.__rompPerf\.wrapFrameHandler\(onFrame\):onFrame\);/);
+  assert.match(KERNEL, /else if\(m\.type==="tagEditFailed"&&panel\.tagEditFailed\)panel\.tagEditFailed\(m\);\nelse if\(m\.type==="openViewsDialog"&&panel\._openViewsDialog\)panel\._openViewsDialog\(null\);\};\nvar frameListener=\(window\.__rompPerf&&window\.__rompPerf\.wrapFrameHandler\)\?window\.__rompPerf\.wrapFrameHandler\(onFrame\):onFrame;\nwindow\.addEventListener\("message",frameListener\);/);
   assert.match(KERNEL, /window\.__rompTimelineEditTag=function\(edit\)\{post\(\{type:"editTag",edit:edit\}\);\};/);
   const BOOT = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "timeline-boot.ts"), "utf8");
   assert.match(BOOT, /__rompTimelineEditTag: \(edit: unknown\) => post\(\{ type: "editTag", edit \}\),/);

@@ -55,9 +55,21 @@ class BuildGating(unittest.TestCase):
         # (2026-09-06); without a collector the plain listener is registered.
         boot = km._TIMELINE_BOOT
         self.assertIn("var onFrame=function(ev){var m=ev.data;if(!m||!panel)return;", boot)
-        self.assertIn('window.addEventListener("message",(window.__rompPerf&&window.__rompPerf.wrapFrameHandler)'
-                      "?window.__rompPerf.wrapFrameHandler(onFrame):onFrame);", boot)
+        self.assertIn('var frameListener=(window.__rompPerf&&window.__rompPerf.wrapFrameHandler)'
+                      "?window.__rompPerf.wrapFrameHandler(onFrame):onFrame;", boot)
+        self.assertIn('window.addEventListener("message",frameListener);', boot)
         self.assertEqual(boot.count('addEventListener("message"'), 1, "one listener, the wrapped one")
+
+    def test_the_host_shim_registers_the_same_listener_with_federation_for_direct_delivery(self):
+        # federation.js hands its merged data/bars frames to the handlers registered through window.__rompFed.onFrame
+        # by direct call, and dispatches them on window only when nothing registered (ui/webview/federation.ts
+        # emit): a "message" listener in another JavaScript world that reads event.data forces a structured clone of
+        # the frame on every window dispatch. The boot registers the SAME wrapped listener it puts on window, so a
+        # frame reaches it once, timed the same way; a page without the slot (an older federation.js) is unchanged.
+        boot = km._TIMELINE_BOOT
+        self.assertIn("if(window.__rompFed&&window.__rompFed.onFrame)window.__rompFed.onFrame(frameListener);", boot)
+        self.assertLess(boot.index('window.addEventListener("message",frameListener);'),
+                        boot.index("window.__rompFed.onFrame(frameListener)"), "window first, the registry after it")
 
     def test_the_lanes_skeleton_does_not_parse_any_transcript(self):
         # cold-start speed (the user 2026-06-26): a fresh kernel (the refresh button = POST /restart) re-parses
