@@ -59,7 +59,7 @@ test("menu rows toggle with the SAME optimistic + sticky + reconcile-before-draw
 });
 
 test("the gear menu closes on outside click / Escape / teardown, alongside the meta menu", () => {
-  assert.match(SRC, /_closeLaneMenu\(\) \{ if \(this\._laneMenu\) \{ this\._laneMenu\.remove\(\); this\._laneMenu = null; \} \}/);
+  assert.match(SRC, /_closeLaneMenu\(\) \{\s*\n\s*if \(!this\._laneMenu\) return;\s*\n\s*this\._laneMenu\.remove\(\); this\._laneMenu = null;/);
   assert.match(SRC, /this\._onDocClick = \(\) => \{ this\._closeMetaMenu\(\); this\._closeLaneMenu\(\); this\._closeViewsMenu\(\); \};/);
   assert.match(SRC, /if \(e\.key === 'Escape'\) \{ this\._closeMetaMenu\(\); this\._closeLaneMenu\(\); this\._closeViewsMenu\(\); \}/);
 });

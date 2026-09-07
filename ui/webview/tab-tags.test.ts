@@ -43,16 +43,20 @@ test("the Tags row sits with the session controls ABOVE the divider; Browse stay
     "the compact one-line row: current names, or the honest empty state");
 });
 
-test("edits reuse the wire — never a fork: local adds post the whole blob, remote edits ride editTag", () => {
+test("edits reuse the wire — never a fork: local edits post TARGETED tagEdit ops, remote edits ride editTag", () => {
   const at = RENDER.indexOf("const editUnion = (g: TagUnion");
-  const body = RENDER.slice(at, at + 2400);
-  assert.ok(body.includes("t.members = Array.from(new Set((t.members || []).concat(edit.add))); dirty = true;"),
-    "local add edits the whole blob (posted once below — pendingSessionViews echoes instantly)");
+  const body = RENDER.slice(at, at + 4200);
+  assert.ok(body.includes('ops.push({ op: "addMember", tid: g.localId, sids: edit.add.slice() });'),
+    "a local add is an addMember by the tag's stored id (2026-09-05: the whole-blob post was refused as stale against the page's own earlier write; by name, a refused rename left the next gesture addressing the other tag)");
+  assert.ok(body.includes('ops.push({ op: "removeMember", tid: g.localId, sids: edit.remove.slice() });'), "…and a local remove");
   assert.ok(body.includes('vscodeApi?.postMessage({ type: "editTag", edit: { host: g.remotes[0].host || "", name: g.name, add: edit.add.slice() } });'),
     "an add with no local home routes to the tag's single home over the editTag wire");
   assert.ok(body.includes("for (const rt of g.remotes) {"),
     "a REMOVE walks every remote store holding the pair — remove-everywhere, never half");
-  assert.ok(body.includes("if (dirty) postViews(nv);"), "ONE optimistic blob per gesture — the flyout reads true instantly");
+  assert.ok(body.includes("if (ops.length) { for (const op of ops) postTagEdit(nv, op); }"), "ONE optimistic blob per gesture — the flyout reads true instantly");
+  assert.ok(body.includes("else if (mirrored) { pendingSessionViews = nv; renderTabs(); }"),
+    "a remote-only edit has no local op: its mirror shows until the next frame, as before");
+  assert.ok(body.includes("if (g.localId && !g.pending) {"), "a union whose create is still in flight takes no op (its id is the placeholder the ack replaces)");
   assert.ok(body.includes("const nvRemote = (rt: SessionTag)"),
     "the remote entries mirror optimistically too — echoed remoteTags are derived, kernel-dropped, presentation-only");
   assert.match(RENDER, /x\.title = "remove this tag from the session — everywhere it holds it";/);
@@ -62,7 +66,9 @@ test("New tag… is an inline input (menu vocabulary, no native prompt) that cre
   assert.match(RENDER, /inp\.placeholder = "New tag…"; inp\.maxLength = 40;/);
   assert.doesNotMatch(RENDER.slice(RENDER.indexOf("const editUnion")), /window\.prompt/);
   assert.match(RENDER, /const color = paletteColors\.find\(\(c\) => !used\.has\(c\)\) \|\| paletteColors\[0\] \|\| "#1EA1EB";/);
-  assert.match(RENDER, /nv\.tags = viewTags\(nv\)\.concat\(\[\{ id: "g" \+ Date\.now\(\)\.toString\(36\), name, color, members: \[id\] \}\]\);/);
+  assert.match(RENDER, /const tg = \{ id: "pending-" \+ Date\.now\(\)\.toString\(36\), name, color, members: \[id\] \};\s*\n\s*nv\.tags = viewTags\(nv\)\.concat\(\[tg\]\);/,
+    "the optimistic row wears a placeholder id — the kernel mints the real one");
+  assert.match(RENDER, /postTagEdit\(nv, \{ op: "create", name, color, sids: \[id\] \}, tg\.id\);/, "one targeted create, the session in it, no client id on the op (the placeholder rides beside it for the legacy path to re-id)");
   // an existing name typed into the box ADDS to that union instead of minting a duplicate tag
   assert.match(RENDER, /const existing = unionFor\(\)\.find\(\(g\) => g\.name === name\);/);
 });

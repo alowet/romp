@@ -55,7 +55,7 @@ test("the phone gets the chat tag control too — the SHARED button mounted into
   const mnt = RENDER.slice(RENDER.indexOf('const mslot = document.getElementById("mtag-slot")'),
                            RENDER.indexOf("paintTabRowLines(bar);"));
   assert.match(mnt, /tagMenuButton\("filter sessions by tag"/, "the SHARED component, never a copy");
-  assert.match(mnt, /Object\.assign\(\{\}, mv\.actives, \{ chat: l \}\)/, "writes land on the chat lens — per-surface semantics");
+  assert.match(mnt, /postLens\(\{ actives: Object\.assign\(\{\}, \(effViews\(\) \|\| \{\}\)\.actives, \{ chat: l \}\) \}\)/, "writes land on the chat lens — per-surface semantics — as a lens write on the store's blob (the 2026-09-05 review)");
   assert.match(mnt, /syncTagFilter\(mslot\.children\[0\] as HTMLElement, mslot\.children\[1\] as HTMLElement,/,
     "the mobile pair re-syncs every render like the desktop one");
 });
@@ -66,7 +66,7 @@ test("the chat strip and the outline both mount the shared component (source pin
     "tabs + peeks decide through actives.chat");
   assert.match(RENDER, /tagMenuButton\("filter these tabs by tag"/,
     "the tooltip names the surface — the ONE scope carrier since the menu caption retired (2026-08-25)");
-  assert.match(RENDER, /Object\.assign\(\{\}, v\.actives, \{ chat: l \}\)/, "writes land on chat's lens only");
+  assert.match(RENDER, /postLens\(\{ actives: Object\.assign\(\{\}, \(v \|\| \{\}\)\.actives, \{ chat: l \}\) \}\)/, "writes land on chat's lens only");
   assert.match(FLEET, /tagMenuButton\("filter this outline by tag"/,
     "ditto — the outline tooltip names its surface");
   assert.match(FLEET, /Object\.assign\(\{\}, v\.actives, \{ outline: l \}\)/);
