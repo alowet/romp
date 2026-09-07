@@ -177,6 +177,24 @@ class HeadlessRoutes(unittest.TestCase):
         finally:
             km._pending_ops.clear()
 
+    def test_send_route_reads_the_setters_locked_verdict_not_a_second_gate(self):
+        # #954 moved the deciding park under the queue lock (_gate_or_park); the route must report the
+        # setter's OWN verdict, not a separate unlocked _ops_gate read that can disagree (review find on
+        # #954, 2026-09-07: a parked /model answered queued:false). Force the two apart: _gate_or_park
+        # parks (True) while _ops_gate reads False.
+        fake = mock.Mock(); fake.busy.return_value = None
+        km._pending_ops.clear()
+        try:
+            with mock.patch.object(km.Sessions, "backend_for", staticmethod(lambda sid: fake)), \
+                 mock.patch.object(km, "_ops_gate", lambda sid: False), \
+                 mock.patch.object(km, "_gate_or_park", lambda sid, op: (km._pending_ops.setdefault(str(sid), []).append(op) or True)):
+                code, resp = self._post("/send", {"id": "sid-x", "text": "/model sonnet"})
+            self.assertEqual((code, resp), (200, {"ok": True, "queued": True}),
+                             "the route reports the setter's locked park, not the unlocked gate")
+            fake.set_model.assert_not_called()
+        finally:
+            km._pending_ops.clear()
+
     def test_send_route_passes_a_remote_kernels_queued_through(self):
         # a session living on another kernel: its answer's `queued` rides back to the caller; an older
         # remote without the field reads as not queued (today's behaviour)

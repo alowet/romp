@@ -25,6 +25,7 @@ SYNTHETIC fixtures only: placeholder uuids, invented texts.
 """
 import io
 import os
+import contextlib
 import tempfile
 import threading
 import time
@@ -633,3 +634,35 @@ class TheMirrorIsWrittenPerWriter(_Drain):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DrainRaiseClearsTheInFlightRecord(_Drain):
+    """The except path in _apply_pending_ops clears _inflight_ops for the sid — without it a drain that
+    raised mid-delivery leaves a stale in-flight record, and every later ✕ on that sid's head is refused
+    as 'too late' forever (review find on #954, 2026-09-07)."""
+
+    def test_a_raise_mid_delivery_does_not_leave_a_stale_in_flight_record(self):
+        # /compact is a turn-opening op: the drain records it in _inflight_ops, then calls the backend.
+        # Make that call raise; the sid's in-flight record must be cleared so a re-press is cancellable.
+        km._compact_or_park(self.be, SID)
+        self.assertEqual(km._pending_ops.get(SID), [("compact",)])
+        boom = mock.patch.object(self.be, "send", side_effect=RuntimeError("app-server died"))
+        with boom, contextlib.redirect_stderr(io.StringIO()):
+            km._apply_pending_ops()
+        self.assertNotIn(SID, km._inflight_ops, "the except path cleared the in-flight record")
+        # a second /compact press parks, and its ✕ is honoured — not refused as an in-flight head
+        km._compact_or_park(self.be, SID)
+        self.assertEqual(km._cancel_parked(SID, 0, km._parked_md(("compact",))), None,
+                         "the re-pressed compact is cancellable, not stuck behind a phantom in-flight op")
+
+    def test_the_park_wake_runs_after_the_lock_is_released(self):
+        # the drain's non-blocking top-of-walk acquire relies on a handler's park waking the pusher AFTER
+        # it drops the lock; a wake fired while still holding it could find the lock busy and skip a cycle
+        # with nothing to re-fire it (review find on #954, 2026-09-07).
+        held = []
+        with mock.patch.object(km, "_mark_views_dirty", lambda: held.append(km._pending_ops_lock._is_owned())):
+            km._park_op(SID, ("model", "opus"))
+            km._park_behind_queue(SID, ("send", "next", "human"))
+            km._cancel_parked(SID, 0, km._parked_md(("model", "opus")))
+        self.assertTrue(held, "the wake ran")
+        self.assertTrue(all(owned is False for owned in held), "every wake fired with the lock released")
