@@ -34,6 +34,7 @@ These are for scripting and for agents rather than daily use:
 | `romp url` | Print only the tokened dashboard URL, for piping |
 | `romp sessions [--json]` | The fleet with each session's state, identity colours, directory and backend |
 | `romp perf [--interval <s>] [--json]`, `romp perf log on\|off` | The kernel's performance counters as rates over two snapshots (below); `--json` prints one raw snapshot; `log on\|off` turns the `romp-perf` stderr log on or off without a restart |
+| `romp perf client [--minutes <n>] [--json]` | What the open dashboards' browsers spent on the frames they received (below): handler milliseconds per minute by frame type with window p50/p90/p99 and max, the worst minute's main-thread-free p90, long animation frames and their attributed callbacks, the worst minute, heap and DOM, the slowest frames — per dashboard and pane over the last `<n>` minutes (default 10) |
 | `romp mail …` | The postal service from the shell (below) |
 | `romp send <session> [--tag <label>] <text>` | Hand a session a message, on either backend. Anything a script, cron job, or launcher composes SHOULD carry a tag (one word, letters/digits/dashes, up to 24 chars): the chat then renders it as machine-sent under that label instead of as the user's typed words. Raw POST /send callers pass it as the JSON `tag` field (`{name, text, tag}` — a malformed tag fails the whole send, loudly); `--tag` is the CLI's equivalent. Both resolve to the `<!-- romp-tag: <label> -->` marker in the delivered text |
 | `romp new --env NAME=VALUE <name>` | A per-session env var for the SDK session, repeatable; a re-run against a running `<name>` replaces the whole set — vars not re-named are dropped |
@@ -723,6 +724,117 @@ goes where the manager's stderr goes: under systemd, `journalctl --user -u
 romp-manager -f | grep romp-perf`; under launchd (macOS), `tail -f
 ~/.local/state/romp/manager.log | grep romp-perf`. Setting `ROMP_PERF=1` in the
 kernel's environment still turns it on at start.
+
+## Browser-side performance telemetry
+
+The counters above say what the kernel spent. What the browser spent on the
+frames it received is measured in the panes themselves, by
+`ui/webview/perf-telemetry.ts`:
+
+- The feed, Outline and chat bundles wrap their window `message` handler, so
+  each frame's synchronous handling time is recorded by frame type (`feed`,
+  `chatTail`, `session`, `tabOrder`, `bars`, a shell message as `shell`, a raw
+  delta as `delta:<slot>`, anything else as `other`; frames the handler ignores
+  count too). The federation layer, which every kernel page loads, times its
+  own prefixing, delta application and merge of each frame as `fed:<type>`,
+  nested outside the pane's handler; each level records its own time, so
+  `fed:feed` and `feed` add up to the frame's cost. The timeline's listener is
+  wrapped the same way on both hosts (the VS Code bundle directly; the kernel
+  page's inline boot through the `window.__rompPerf` that `federation.js`
+  publishes before it runs), so `data`, `bars`, `hover`, `activeChat`,
+  `revealEvent` and `models` are timed like any pane's frames.
+- Per type and minute: count, summed and maximum handler time, the exact
+  number of frames over 16.7 ms (one dropped frame at 60 Hz) and at or over
+  100 ms, and a 14-bucket log2 histogram (under 1 ms, 1-2, 2-4, ..., 2048-4096,
+  4096 and over) that is additive across minutes, so `romp perf client`
+  computes window percentiles from it.
+- Two `requestAnimationFrame` callbacks after the outermost handler it records
+  how long the main thread stayed busy with the work the handler queued (a
+  deferred render, layout, paint). A hidden document or a pane the shell has
+  set to `display:none` takes no sample, and a sample armed before such a hide
+  is cancelled (on `visibilitychange`, or on the `resize` that takes the
+  pane's viewport to zero).
+- A `PerformanceObserver` on `long-animation-frame` entries (Chrome 123+;
+  `longtask` where that is missing, with no attribution) records each frame
+  over 50 ms with its blocking time and the scripts the browser attributes it
+  to. The browser names the top-level callback it invoked, not the hottest
+  function, so a key is `<file>:<function>@<character position>`
+  (`feed.js:render@1200`, `feed.js:(anonymous)@48213`), and an inline page
+  script (the pane shim, whose socket callback runs for every frame) is
+  `page:<function>@<position>`. The release build keeps identifiers so a key
+  means the same thing after a rebuild; whitespace and syntax are still
+  minified.
+- Once a minute the pane posts ONE `clientDiag` row on the socket it already
+  uses for breadcrumbs, only when something happened that minute (a frame
+  arrived or a long frame was observed); the kernel appends it to
+  `client-diag.jsonl` under the state directory with the dashboard id (`wid`)
+  and its own clock. A frame whose whole synchronous handling ran 100 ms or
+  more also posts a `slowframe` row at once, carrying the long-frame
+  attribution when the browser reports one for that frame; at most five such
+  rows a minute per pane, the rest counted in the minute row.
+- The kernel rotates `client-diag.jsonl` once it reaches 8 MB: the file
+  becomes `client-diag.jsonl.1` (replacing the previous one) and a new file
+  starts, so at most two files, about 16 MB, are kept. A minute row is about
+  1 KB, so one open dashboard writes a few MB a day.
+
+Rows carry numbers and code identifiers only, never card text, session names,
+file paths or transcript content: an element id inside an invoker name is
+stripped (`DIV#tab-web.onclick` is recorded as `DIV.onclick`), an element
+source as `[src]`, and a script URL as its basename.
+
+The two rows, as the kernel writes them (`t` its clock, `wid` the dashboard id):
+
+- `{"t", "wid", "surface": "perf", "what": "minute", "data": {app, since,
+  span_ms, frames: {<type>: {n, ms_sum, ms_max, n16, n100, hist}}, free: {n,
+  p50, p90, max} | null, loaf: {n, blocking_ms, worst_ms, top: [{k, ms, n,
+  inv}], src}, slow: {sent, suppressed, suppressed_worst_ms}, heap_mb?, dom,
+  visible, hidden_pane, ua}}`. `app` is the pane (`chat`, `feed`, `fleet`,
+  `timeline`); `since` is the minute's start on the browser's clock (epoch ms)
+  and `span_ms` its length (shorter than a minute when the page was
+  hidden or closed); `hist` is the 14 bucket counts; `free` is null when no
+  sample was taken; `loaf.top` is the five largest keys by summed duration,
+  `inv` the last invoker seen for each (`WebSocket.onmessage`,
+  `Window.requestAnimationFrame`, `DIV.onclick`), `src` is `loaf`, `longtask`
+  or `none`; `slow` counts the slowframe rows sent and the slow frames past
+  the cap, with the worst of those; `heap_mb` is
+  `performance.memory.usedJSHeapSize` and is absent outside Chrome; `dom` is
+  the element count; `visible` is the document's visibility, `hidden_pane`
+  the zero-viewport test the pane shim uses for a pane the shell has set to
+  `display:none`; `ua` is `chrome-desktop`, `safari-ios` or `other`.
+- `{"t", "wid", "surface": "perf", "what": "slowframe", "data": {app, type, ms,
+  dom, loaf?: {ms, blocking_ms, top: [{k, ms, inv}]}}}`. `type` is the frame
+  as received on the wire and `ms` its whole synchronous handling, the
+  federation layer included.
+
+`romp perf client [--minutes <n>] [--json]` reads the file and its `.1`
+predecessor (no kernel round trip, so it works with the kernel down) and folds
+the last `<n>` minutes (default 10) per dashboard id and pane into one screen:
+the pane's total handler milliseconds per minute, then each frame type sorted
+by its share, with frames per minute, milliseconds per minute, p50/p90/p99 as
+histogram bucket upper bounds over the whole window, the maximum, and the
+share of frames over 16.7 ms and at or over 100 ms; the worst minute's
+main-thread-free p90 (each minute row's p90 is over that minute's samples, and
+the screen shows the largest, so it is not a window percentile like the handler
+columns); long frames and blocking milliseconds per minute with the worst
+entry; the top attributed keys with their invokers; the worst minute (the one
+with the most handler time: its span from the minute's start to the row's
+arrival at the kernel, frame counts and long frames); heap and DOM at the last
+sample; and the five slowest slow frames in the window with their attribution,
+plus how many more there were. An absent file or one without perf rows is
+reported as no browser telemetry yet (the bundles predate it or no dashboard
+has loaded them: rebuild the bundles and reload the dashboard); perf rows all
+older than the window are reported with their age. `--json` prints the folded
+panes, with a per-minute array (`t`, `since`, `total_ms`, `loaf_n`,
+`blocking_ms`) so a spike is visible without re-reading the file.
+
+In DevTools, `window.__rompPerf.snapshot()` in a pane's frame is the minute
+in progress in the same shape, plus a derived `p90_le` per type, `active`
+(whether it will be sent), `observer` (`loaf`, `longtask`, `none`),
+`pending_slow` (slow frames waiting for their long-frame report) and
+`free_pending` (a main-thread sample armed). A page without `performance.now`
+(the node test stand-ins) gets no telemetry and an unwrapped handler; every
+other browser API is behind a feature check, and nothing in the module throws
+into the pane.
 
 ## Where things live
 
