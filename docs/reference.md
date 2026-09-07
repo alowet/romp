@@ -277,6 +277,17 @@ on: the remembered pick becomes the box's expectation and the env var goes
 inert (it described the unpicked design), so re-seeded spawns are judged
 against your pick, never against stale doctrine.
 
+The declaration is also checked against `service.env` once, when the kernel
+starts. Under `ROMP_EXPECTED_AUTH=login`, a file that selects an API key
+source (an `ANTHROPIC_API_KEY=` line with a value, or a `ROMP_API_KEY_REF=`
+line) is a contradiction: that source is injected at launch for every session
+without an explicit Billing pick, so those sessions bill the key. One problem
+line in the Log panel says so before anything launches, naming the file and
+the variable but never a value; fix whichever side is wrong. Under `key`, a
+key source in the file agrees with the declaration and nothing is said. With
+no declaration, or once a Billing pick has made it inert, nothing is said
+either. The per-init check above still confirms each landing.
+
 The usage rail reflects a mixed machine: the window bars (5 hours / 7 days /
 Fable 5) are drawn once, aggregated across every connected host's login as the
 worst reading per window, and an `API` cell beside them carries the
