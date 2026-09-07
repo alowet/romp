@@ -9428,12 +9428,15 @@ def _comments_frame(sid, tmux=None):
                 # LOST — a reconnect with it in flight; the popover shows "never delivered") owes nothing.
                 user_atoms = [a for tr in turns for a in (tr.get("atoms") or []) if a.get("type") == "user"]
                 def _landed(e):
-                    et = (e.get("_echo_text") or "").strip()
+                    et = sb.echo_text_key(e.get("_echo_text"))
                     since = float(e.get("t") or 0)                     # the send's own stamp: the record the CLI writes for
                     return any(et in _atom_user_texts(a) for a in user_atoms if float(a.get("t") or 0) >= since)   # it is at or after it
                 floor = _human_turn_floor({"turns": turns}) if turns else 0
-                held = [a for a in live if (a.get("_echo_text") or "").strip() and not a.get("command")
-                        and not a.get("dropped") and not _landed(a) and not _echo_overtaken(a, floor)]
+                # `_landed` on the atom: the backend's boot/spawn scan read the landing off the transcript
+                # itself (sdk_backend._mark_dropped_echoes) — delivered, so nothing is held for it
+                held = [a for a in live if sb.echo_text_key(a.get("_echo_text")) and not a.get("command")
+                        and not a.get("dropped") and not a.get("_landed") and not _landed(a)
+                        and not _echo_overtaken(a, floor)]
                 queued = max(queued, len(held))
         # the newest record the projection shows (or the transcript holds): the client's "did the transcript
         # move?" datum, independent of the 80-event / 40-message caps on the shipped projections
@@ -22694,13 +22697,15 @@ def _claudemd_docs(cwd):
 
 
 def _atom_user_text(a):
-    """The plain text of a user atom (for deduping the optimistic input echo against the transcript)."""
+    """The plain text of a user atom (for deduping the optimistic input echo against the transcript), keyed
+    by sb.echo_text_key — the ONE rule the SDK backend's by-text prune and its landing scan share with the
+    keys built here (2026-09-06: the scan matched a collapsed text the prune's raw comparison never could)."""
     if a.get("type") != "user":
         return None
     c = (a.get("message") or {}).get("content")
     if isinstance(c, list):
-        return " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text").strip() or None
-    return (c.strip() if isinstance(c, str) else None) or None
+        return sb.echo_text_key(" ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")) or None
+    return sb.echo_text_key(c) or None
 
 
 def _atom_user_texts(a):
@@ -22725,7 +22730,7 @@ def _atom_user_texts(a):
     if isinstance(c, list):
         for b in c:
             if isinstance(b, dict) and b.get("type") == "text":
-                t = (b.get("text") or "").strip()
+                t = sb.echo_text_key(b.get("text") or "")
                 if t and t != joined:
                     out.append(t)
     return tuple(out)
@@ -22752,12 +22757,20 @@ def _tmux_echo_atoms(sid):
     return list(_tmux_echo.get(sid, {}).values())
 
 def _tmux_echo_prune(sid, tx_uuids, tx_texts):
-    """Drop an echo once the transcript has its real user atom (by uuid or text); pop the sid when empty."""
+    """Drop an echo once the transcript has its real user atom (by uuid or text); pop the sid when empty.
+    The text side compares under sb.echo_text_key — `tx_texts` are the keys _atom_user_texts built (outer
+    whitespace stripped), and the echo stores the send's text verbatim, so a raw comparison never matched a
+    trailing-newline send (`romp send` passes its argument verbatim): the delivered echo stayed, hidden by
+    the display dedup, and the settle then marked it `dropped` once a later human turn landed — a "never
+    delivered" bubble for a message the transcript holds (2026-09-06)."""
     d = _tmux_echo.get(sid)
     if not d:
         return
-    for k in [k for k, a in d.items()
-              if a.get("uuid") in tx_uuids or (a.get("_echo_text") and a["_echo_text"] in tx_texts)]:
+
+    def _landed(a):
+        et = sb.echo_text_key(a.get("_echo_text"))
+        return a.get("uuid") in tx_uuids or (et and et in tx_texts)
+    for k in [k for k, a in d.items() if _landed(a)]:
         d.pop(k, None)
     if not d:
         _tmux_echo.pop(sid, None)
@@ -22917,9 +22930,13 @@ def _merge_live_atoms(session, sid, shown_texts=()):
                 tx_text_t[t] = max(tx_text_t.get(t, 0), float(a.get("t") or 0))
     human_floor = _human_turn_floor(session)
     be.prune_live(sid, tx_uuids, tx_text_t, human_floor)
-    hide = tx_texts | {t.strip() for t in shown_texts if t}    # transcript dups + already-shown queued msgs
+    hide = tx_texts | {sb.echo_text_key(t) for t in shown_texts if t}    # transcript dups + already-shown queued msgs
+    # `live` was snapshotted before the prune, so each of prune_live's three exits has its paint-side twin
+    # here: by uuid (tx_uuids), by text (hide), and the recorded landing (`_landed`: the backend's boot/spawn
+    # scan read the record off the transcript — the prune just retired it, and painting it once more would
+    # show a delivered message as a pending bubble for one build)
     fresh = [a for a in live if a.get("uuid") not in tx_uuids
-             and not (a.get("_echo_text") and a["_echo_text"].strip() in hide)]
+             and not (a.get("_echo_text") and (a.get("_landed") or sb.echo_text_key(a["_echo_text"]) in hide))]
     if not fresh:
         return session
     # Reopen the turn ONLY for genuine live ASSISTANT work (a streaming reply), never for a lone input echo.
@@ -23274,7 +23291,7 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
         tx_user = {t for turn in parsed["turns"] for a in turn["atoms"] for t in _atom_user_texts(a)}
         echo_floor = _human_turn_floor(parsed)
         for a in be.live_atoms(sid):
-            et = (a.get("_echo_text") or "").strip()
+            et = sb.echo_text_key(a.get("_echo_text"))
             if et and et not in already and et not in tx_user and not _echo_overtaken(a, echo_floor):
                 queued = queued + [et]; already.add(et)
     session = parsed if path_override else _merge_live_atoms(parsed, sid, shown_texts=queued)
