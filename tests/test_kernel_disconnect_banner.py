@@ -29,10 +29,14 @@ class DisconnectBanner(unittest.TestCase):
         js = km._shim("chat")
         # reports up/down to the shell
         self.assertIn('postMessage({romp:"wsState",app:APP,state:s}', js)
-        self.assertIn('ws.onopen=function(){lastRecv=Date.now();openT=lastRecv;openSock=this;netState("up");', js)   # lastRecv stamp → heartbeat watchdog; openT/openSock → the close rule + wsclose breadcrumb
+        self.assertIn('ws.onopen=function(){lastRecv=Date.now();openT=lastRecv;openSock=this;netState("up");', js)   # lastRecv stamp → heartbeat watchdog; openT/openSock → the close rule + ws
         self.assertIn('ws.onclose=function(ev){netState("down");', js)   # reconnects on close (wsdown loader + retry follow)
-        self.assertIn("setTimeout(connect,(restartAnnounced&&Date.now()-restartAnnounced<30000)?250:1500);",
-                      js, "T217: an ANNOUNCED death redials tight; the blind 1.5s stays for real drops")
+        # T217: an ANNOUNCED death redials tight; since 2026-09-07 so does a close landing within STALE_MS
+        # of a foreground (the FIN a frozen tab thawed into); the blind 1.5s stays for unannounced drops
+        self.assertIn("var inWin=Date.now()-foregroundedAt<STALE_MS,d=1500;", js)
+        self.assertIn("if(inWin){d=eagerDial?0:250;eagerDial=false;}", js)   # the FIRST close after a foreground redials now; a second waits 250 ms
+        self.assertIn("if(restartAnnounced&&Date.now()-restartAnnounced<30000)d=Math.min(d,250);", js)
+        self.assertIn("setTimeout(connect,d);", js)
         self.assertIn("ws.onerror=function(){try{ws.close();}catch(e){}};", js)
         # a RECONNECT no longer silently reloads (the user 2026-07-05): it PROMPTS via raiseStale, and the fresh
         # socket resyncs live. The old auto-reload-on-reopen is gone.
@@ -59,7 +63,11 @@ class DisconnectBanner(unittest.TestCase):
         # hands that reconnect its reason; the reconnect's arm then follows the same two events as any other
         # (a keepalive or a close before the resync), and the resync frame disarms it (the user 2026-08-01).
         self.assertIn('document.addEventListener("visibilitychange"', js)
-        self.assertIn('Date.now()-lastRecv>STALE_MS){pendingWhy="foreground";freshPending=true;', js)
+        # 2026-09-07: the handler latches foregroundedAt, names its verdict (`stale`, filed as the return
+        # breadcrumb's decision) and only then hands the reconnect its reason — the test itself is unchanged
+        self.assertIn("var stale=!ws||ws.readyState!==1||Date.now()-lastRecv>STALE_MS;", js)
+        self.assertIn('if(!stale){returnRow=row;returnDiag("return",row);return;}', js)   # held: a FIN queued in the thaw burst re-files it
+        self.assertIn('pendingWhy="foreground";freshPending=true;', js)
 
     def test_a_hidden_pane_never_raises_the_stale_banner(self):
         # the user 2026-08-15, on the phone: the mobile shell shows ONE pane, hiding the rest with
@@ -201,7 +209,11 @@ class DisconnectBanner(unittest.TestCase):
         # a tab foregrounded onto a dead socket forces a reconnect and used to prompt immediately; that
         # reconnect resyncs like any other, so it arms the same window and disarms on the same frame
         js = km._shim("chat", 7777)
-        self.assertIn('Date.now()-lastRecv>STALE_MS){pendingWhy="foreground";freshPending=true;', js)
+        # 2026-09-07: the handler latches foregroundedAt, names its verdict (`stale`, filed as the return
+        # breadcrumb's decision) and only then hands the reconnect its reason — the test itself is unchanged
+        self.assertIn("var stale=!ws||ws.readyState!==1||Date.now()-lastRecv>STALE_MS;", js)
+        self.assertIn('if(!stale){returnRow=row;returnDiag("return",row);return;}', js)   # held: a FIN queued in the thaw burst re-files it
+        self.assertIn('pendingWhy="foreground";freshPending=true;', js)
         self.assertNotIn("STALE_MS){raiseStale();", js)
 
     def test_a_standalone_page_retires_only_its_connection_bar(self):

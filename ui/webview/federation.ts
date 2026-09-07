@@ -685,8 +685,34 @@ export class FederationManager {
     // remote socket that is not open, or has gone quiet past the bound, is closed and redialed now
     // rather than waited out — the phone's re-foreground is exactly the audited case.
     try {
-      document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") this.watchdog(Date.now(), true); });
+      this.watchLifecycle(document);
     } catch (e) { /* no document — the node tests construct the manager bare */ }
+  }
+
+  /** The Page Lifecycle listeners on the document (public and parameterised so the tests install them
+   *  on a fake and fire the events in the browser's order). `resume` → resumed(); `visibilitychange`
+   *  to visible → the foreground watchdog pass, exactly as before. */
+  watchLifecycle(doc: { addEventListener(type: string, listener: () => void): void; readonly visibilityState: string }): void {
+    doc.addEventListener("resume", () => this.resumed(Date.now()));
+    doc.addEventListener("visibilitychange", () => { if (doc.visibilityState === "visible") this.watchdog(Date.now(), true); });
+  }
+
+  /** The Page Lifecycle `resume` event (the user 2026-09-07, whose dashboard froze every time they came
+   *  back to its tab): stamp every OPEN relay socket's lastRecv to now. A Chromium tab left in the
+   *  background is FROZEN — no JS runs at all — so no frame could stamp lastRecv even though the socket
+   *  stayed open and the kernel kept heartbeating. lastRecv therefore measured "JS did not run", not
+   *  "the socket went silent", and the foreground pass (watchdog(now, true), fired by visibilitychange
+   *  right after the thaw) read the frozen stretch as 30s+ of silence and abandoned+redialed EVERY
+   *  attached host on EVERY return — each redial a full resend from that kernel. Chromium fires
+   *  `resume` before `visibilitychange`, so the stamp lands first and socketVerdict (unchanged) sees a
+   *  fresh socket and keeps it; the frames queued during the freeze then dispatch on the same socket.
+   *  This re-BASES the measurement, it does not disarm it: a socket that stays silent after the thaw is
+   *  still put down at REMOTE_STALE_MS by the regular tick. Only readyState 1 is stamped — a socket
+   *  still CONNECTING is a handshake the frozen tab never finished, and the foreground pass still kills
+   *  it. Where no `resume` fires (Firefox, Safari, a hidden-but-running tab) stale lastRecv IS real
+   *  silence, and today's instant abandon on foreground is unchanged. */
+  resumed(now: number): void {
+    for (const c of this.conns.values()) if (c.ws && c.ws.readyState === 1) c.lastRecv = now;
   }
 
   /** One pass of the remote-socket watchdog (public so the tests can tick it with their own clock):

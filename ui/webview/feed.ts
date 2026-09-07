@@ -8,6 +8,7 @@
 // when the fleet streams new deliverables in.
 import { distillText, distillInputs, applyDistillLine, distillPending, distillStaleNote } from "./distiller-line";
 import { flipNeeded } from "./feed-flip";
+import { paintHeld, paintReleased } from "./paint-gate";
 import { spinFor, waitedSuffix, awaitWord, groupRows, GROUP_TITLE, ROW_KIND_OF_LEGACY, type AwaitRow } from "./spin-caption";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { searchMatches, searchSids } from "./feed-search";
@@ -4512,8 +4513,42 @@ function ensureHostLoad(list: HTMLElement): void {
   }));
 }
 
+// ── HIDDEN-PAINT HOLD (the user 2026-09-07, whose dashboard froze on the return to its browser tab) ──
+// Every payload is APPLIED the moment it arrives — applyFeedPayload's bookkeeping (mirrorBadges feeds the
+// shell's bell, clearUndoBusy, pendingCleared/pendingRestored, reconcileFollowMove and the follow-move
+// backstops it retires) never waits — but the PAINT is owed while nobody can see it, and settled once,
+// synchronously, on the event that makes the pane visible again: the tab's visibilitychange, or the
+// observer's callback for a display:none pane (each is blind to the other's case; paint-gate.ts). Before
+// this, a hidden tab rendered every payload in full — the FLIP pass pinned two forced layouts and a
+// double rAF per moved card onto the return frame — and the hidden-tab pile-up was the freeze. NOT the
+// hover-freeze queue below: that holder withholds the payload itself, and a confirming payload held back
+// lets the follow-move backstop revert a move the kernel had already confirmed.
+let feedIntersecting = true;   // #feed-list on screen by the observer's measure; true where there is no observer
+let paintDirty = false;        // a render was withheld while the pane could not be seen
+let skipFlipOnce = false;      // the release paint snaps: cards that moved while away have no old spot to glide from
+let feedWatching = false;
+function watchFeedVisibility(list: HTMLElement): void {
+  if (typeof IntersectionObserver === "undefined") return;   // no observer → the tab's visibility alone gates
+  new IntersectionObserver((entries) => {
+    feedIntersecting = entries.some((e) => e.isIntersecting);
+    releasePaint();
+  }).observe(list);
+}
+// The owed paint, settled the moment both measures say the pane can be seen. Synchronous on purpose (no
+// requestAnimationFrame hop): on a tab switch the compositor shows the cached frame until the page paints,
+// so a paint inside the event handler is the earliest fresh frame.
+function releasePaint(): void {
+  if (!paintReleased(paintDirty, document.hidden, feedIntersecting)) return;
+  paintDirty = false;
+  skipFlipOnce = true;
+  render();
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) releasePaint(); });
+
 function render() {
   const list = document.getElementById("feed-list")!;
+  if (!feedWatching) { feedWatching = true; watchFeedVisibility(list); }
+  if (paintHeld(document.hidden, feedIntersecting, list.childElementCount > 0)) { paintDirty = true; return; }
   pruneTip();   // drop the styled tip only if the render tore its hovered anchor out (tip.ts pruneTip)
   applyFollowMove(asks);   // keep optimistically-moved follow-up cards in Working until the kernel confirms (or reverts)
   paintJudgeLimit();   // the usage-limit banner above the columns (build-once; hidden when unlatched)
@@ -4535,6 +4570,7 @@ function render() {
     //                     wordmark never rendered (the user 2026-07-08; payload-audit fallout). Goal cards are
     //                     the only feed unit now, so an empty asks list IS an empty feed.
     askEls.clear(); groupEls.clear();
+    skipFlipOnce = false;   // this IS the release paint when the board emptied while away — the snap is spent
     // inbox zero → the romp wordmark (a CSS background). role/aria-label + title keep the meaning for hover /
     // screen readers, since a background image carries no accessible text. Created ONCE (idempotent): on the
     // transition from cards→empty we mint it (its CSS fade-in plays once, the user 2026-06-25), and every
@@ -4625,7 +4661,12 @@ function render() {
   // something CAN move: the capture and the fly each force a layout of the whole document, and most frames
   // change a card in place (text, tint, status chip) with every card staying where it was (2026-09-04).
   const nextCols = columnsOf(buckets);
-  const needFlip = flipNeeded(prevCols, nextCols);
+  // The release paint after a hidden stretch SNAPS (skipFlipOnce, 2026-09-07): a card that moved while nobody
+  // watched has no old spot in the user's eye to glide from — motion on return is motion without new
+  // information (the 2026-07-29 rule) — and the two forced layouts plus a double rAF per moved card are what
+  // the return frame cannot afford. prevCols still records the painted columns, so the NEXT move glides.
+  const needFlip = !skipFlipOnce && flipNeeded(prevCols, nextCols);
+  skipFlipOnce = false;
   prevCols = nextCols;
   const flipFirst = needFlip ? captureCardRects(cols) : new Map<string, FlipState>();
 
@@ -5229,6 +5270,11 @@ window.addEventListener("message", (e: MessageEvent) => {
     // FOLDED thread has no element yet — unfold first (the same rule revealCards follows: the navigation wins
     // over the disclosure). A card that no longer exists under its own key (cleared, or folded into a group)
     // falls back to opening the session.
+    // The shell shows this pane and posts the jump in the SAME task, before the observer has re-measured
+    // the list (its callback waits for a rendering step): a paint owed from a hidden stretch is settled
+    // here on the shell's word, or a card added while away is not there to find (2026-09-07). The
+    // observer's next callback re-measures, so a wrong word costs one unseen paint, never a stale pane.
+    if (paintDirty) { feedIntersecting = true; releasePaint(); }
     const key = "a:" + String(m.itemId || "");
     unfoldThreadsFor(new Set([key]));
     // Match the key STRUCTURALLY, never an interpolated attribute selector: a crafted push-card value

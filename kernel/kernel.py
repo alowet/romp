@@ -32682,7 +32682,7 @@ def _shim(app, v=0):
     # "newer build" prompt, not just the dashboard landing's /version poll (the user 2026-07-13: a standalone
     # pane sat silent through rebuilds).
     return """
-(function(){var queue=[],ws=null,everConnected=false;
+(function(){/*shim-core*/var queue=[],ws=null,everConnected=false;
 var queuedDiag=0,DIAG_QUEUE_MAX=20;   // clientDiag rows waiting in `queue` for a reconnect, capped (an outage must not pile up breadcrumbs); other queued messages are untouched
 var failedConnects=0,firstFailT=0;   // handshakes that never OPENED since the last open: reported as ONE wsconnfail row on the next open, never one wsclose per redial
 // This pane's DASHBOARD id. ?wid= when the host supplies one (the VS Code extension builds its own pane
@@ -32723,7 +32723,8 @@ function selfStale(){selfBar("romp lost the live connection, so what you see may
 // new code is not delivered by a resync, so only a reload can answer that one.
 function clearStale(){stalePending="";   // armed but never shown → nothing to see
 if(window.parent!==window){try{window.parent.postMessage({romp:"wsFresh"},"*");}catch(e){}}
-else{var b=document.getElementById("romp-stale-self");if(b&&b.dataset.kind==="conn")b.remove();}}
+else{var b=document.getElementById("romp-stale-self");if(b&&b.dataset.kind==="conn")b.remove();}
+try{window.dispatchEvent(new Event("romp:wsfresh"));}catch(e){}}   // the pane's own reconnecting cue (_pane_spin's corner badge) ends on FRESH DATA, not on the socket opening (the user 2026-09-07: over a slow link the resync ran for seconds with no cue, so the dashboard looked frozen)
 // A pane the user cannot SEE never interrupts them about ITS OWN staleness (the user 2026-08-15: the
 // phone shell shows one pane at a time via display:none, iOS throttles the hidden iframes' JS, and each
 // hidden pane's watchdog force-closed its own healthy socket and re-raised the banner every ~45s over a
@@ -32739,6 +32740,29 @@ function paneHidden(){try{return window.parent!==window&&(window.innerWidth===0|
 // socket is down and delivers on reconnect, so the breadcrumb survives the very drop it describes.
 function staleDiag(what,why){try{send({type:"clientDiag",surface:"pane-shim",what:what,
 data:{app:APP,why:why||"",ready:ws?ws.readyState:-1,quietMs:lastRecv?Date.now()-lastRecv:-1,hidden:paneHidden()}});}catch(e){}}
+// RETURN breadcrumbs (the user 2026-09-07, whose dashboard froze after its tab sat in the background): which
+// browser regime a return lands in — hidden-but-running, FROZEN (Page Lifecycle freeze/resume) or DISCARDED (a
+// cold reload; document.wasDiscarded) — decides what can help, and no emulation can tell them apart. So the
+// shim records, on the user's own machine: the page load (discarded? navigation type), every return (was a
+// resume seen; how long frozen/hidden/quiet; the socket state; what the fast-path below DECIDED), and how long
+// the first fresh frame then took (and whether a redial got in the way). Same clientDiag path as staleDiag:
+// send() queues while the socket is down, so a row survives the very redial it describes.
+var frozeAt=0,resumedAt=0,resumeQuiet=-1,hiddenAt=0,foregroundedAt=0,returnAt=0,returnBytes=0,returnRedialed=false,returnRow=null,eagerDial=false;   // eagerDial: the one immediate redial each return window gets   // returnRow: a keep-decision row held until a close inside the return window proves its socket was already dead
+function returnDiag(what,data){try{data.app=APP;send({type:"clientDiag",surface:"pane-shim",what:what,data:data});}catch(e){}}
+var nav="";try{var ne=performance.getEntriesByType("navigation");nav=(ne&&ne[0]&&ne[0].type)||"";}catch(e){}
+// the page-load row exists to catch a tab the browser DISCARDED and reloaded on return (Memory Saver: the return is a
+// cold load, no visibilitychange, so no `return` row) or a reload/back-forward arrival — a plain navigation says
+// nothing, so it files nothing (four rows per dashboard open would be noise, and they would eat the queued-breadcrumb
+// cap other rows share) (2026-09-07)
+if(document.wasDiscarded||(nav&&nav!=="navigate"))returnDiag("page-load",{wasDiscarded:!!document.wasDiscarded,nav:nav});
+document.addEventListener("freeze",function(){frozeAt=Date.now();});
+// `resume` (Chromium's thaw, dispatched before visibilitychange and before any task the freeze queued) is the
+// event that "lastRecv is stale" was approximating: lastRecv measures how long JS did not RUN, not how long
+// the socket was silent, so a thawed tab read its healthy OPEN socket as dead and redialed — a full resync per
+// pane on every return. Stamping here makes the clock honest; the foreground test and the watchdog tick the
+// freeze queued then KEEP the socket. No `resume` (Firefox, Safari, hidden-but-running, a genuinely silent
+// socket) reads stale exactly as before and redials at once. The pre-stamp gap is kept for the return row.
+document.addEventListener("resume",function(){resumedAt=Date.now();resumeQuiet=lastRecv?resumedAt-lastRecv:-1;if(ws&&ws.readyState===1)lastRecv=Date.now();});
 function raiseStale(why){if(paneHidden()){staleDiag("stale-suppressed-hidden",why);return;}
 staleDiag("stale-raise",why);
 if(window.parent!==window){try{window.parent.postMessage({romp:"wsStale"},"*");}catch(e){}}else{selfStale();}}
@@ -32775,6 +32799,7 @@ function raiseBuild(){if(buildRaised)return;buildRaised=true;
 if(window.parent!==window){try{window.parent.postMessage({romp:"wsStale",build:1},"*");}catch(e){}}
 else selfBar("A newer romp build is available.","build");}
 function connect(){if(ws&&(ws.readyState===0||ws.readyState===1))return;   // one live attempt at a time — a lost timer + the watchdog can both call in
+if(returnAt)returnRedialed=true;   // a dial inside a return window (whatever path led here) → the return-fresh row says so
 connT=Date.now();var proto=location.protocol==="https:"?"wss://":"ws://";
 var active="";try{var st0=JSON.parse(localStorage.getItem(SK)||"null");active=(st0&&st0.activeId)||"";}catch(e){}
 ws=new WebSocket(proto+location.host+"/ws?app=%s&delta=1&iid="+encodeURIComponent(IID)+(wid?"&wid="+encodeURIComponent(wid):"")+(active?"&active="+encodeURIComponent(active):""));
@@ -32790,7 +32815,7 @@ if(failedConnects){send({type:"clientDiag",surface:"pane-shim",what:"wsconnfail"
 if(wasReconn){var ann=restartAnnounced&&Date.now()-restartAnnounced<30000;restartAnnounced=0;   // one-shot: spent here
 if(!ann)armStale(pendingWhy||"reconnect");   // T217: an ANNOUNCED restart's reconnect skips the arm — the resync lands in a beat and the flash was pure noise; a restart that never comes back stays loud through the disconnected state itself, and a SECOND reconnect arms as always
 pendingWhy="";freshPending=true;try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}}};
-ws.onmessage=function(ev){lastRecv=Date.now();var msg;try{msg=JSON.parse(ev.data);}catch(e){return;}
+ws.onmessage=function(ev){lastRecv=Date.now();if(returnAt)returnBytes+=(ev.data&&ev.data.length)||0;var msg;try{msg=JSON.parse(ev.data);}catch(e){return;}
 if(msg&&msg.type==="ka"){if(LOADEDV&&msg.dv&&msg.dv>LOADEDV)raiseBuild();
 if(stalePending&&++staleKa>=2){var sw=stalePending;stalePending="";raiseStale(sw);}   // the SECOND keepalive since the arm, no resync between: a full heartbeat period on THIS socket with the kernel alive, talking to it, and not resyncing it — the view IS stale. (One keepalive alone can be a beat queued at accept, ahead of the resync frame.)
 return;}   // keepalive: stamped lastRecv above; carries the build token (drift → reload banner); nothing for the bundle to render
@@ -32804,12 +32829,13 @@ if(msg&&msg.type==="restarting"){restartAnnounced=Date.now();staleDiag("restart-
 // the first REAL frame after a reconnect is the kernel's connect-time push — the resync itself, so the
 // "what you see may be stale" prompt is answered and retires (see clearStale). Keepalives return above.
 if(freshPending){freshPending=false;clearStale();}
+if(returnAt){returnDiag("return-fresh",{ms:Date.now()-returnAt,bytesSince:returnBytes,redialed:returnRedialed});returnAt=0;}   // the first real frame after a return: how long the user waited for current content
 // VIEW DELTAS (2026-09-03): the bars/feed slots arrive as {type:"delta"} frames carrying only the changed
 // entries; reassemble the full message from what this pane holds and hand the bundle exactly what it
 // used to receive. A delta whose base is not the revision held here cannot be applied → ask for a full.
 if(msg&&msg.type==="delta"){var full=applyDelta(msg);if(!full){send({type:"needSlot",slot:msg.slot});return;}msg=full;}
 else if(msg&&DELTA_KINDS[msg.type]){var keys=msg._keys;delete msg._keys;LAST[msg.type]=keys?{rev:0,msg:msg,maps:buildMaps(msg,keys)}:null;}
-if(window.__rompFed){window.__rompFed.inbound("",msg);}else{window.dispatchEvent(new MessageEvent("message",{data:msg}));}};
+enqueue(msg);};   // the handoff to the bundle is the ONE deferred step (see the FIFO below); everything above reacted to the wire, in wire order
 // onclose: flag the shell, RE-SHOW this pane's romp loader (the user 2026-06-29, who wanted the swirling loader on
 // kernel restart), + RETRY (don't blind-reload — on a real outage the reload just fails into a dead page).
 // Every close the BROWSER reports for a socket that OPENED leaves a breadcrumb with the CLOSE CODE and
@@ -32827,11 +32853,45 @@ if(openSock===this){try{send({type:"clientDiag",surface:"pane-shim",what:"wsclos
 else{if(!failedConnects)firstFailT=Date.now();failedConnects++;}
 if(stalePending&&openSock===this){var cw=stalePending;stalePending="";raiseStale(cw+"-closed");}   // the reconnected socket died before its resync: nothing is coming on it, and the view IS stale
 try{window.dispatchEvent(new Event("romp:wsdown"));}catch(e){}
-setTimeout(connect,(restartAnnounced&&Date.now()-restartAnnounced<30000)?250:1500);};   // announced death → tight redial (the frame is the event; the blind 1.5s stays for unannounced drops)
+// a close landing inside the return window: the socket the keep-decision row (and maybe its return-fresh) was written
+// into was already dead when the tab thawed — re-file the row marked resent and re-open the return-fresh window, so
+// both ride the redial (review find 2026-09-07: the frozen-then-dropped regime otherwise left no trace)
+if(returnRow&&Date.now()-foregroundedAt<STALE_MS){var rr=returnRow;returnRow=null;rr.resent=true;returnDiag("return",rr);returnAt=returnAt||foregroundedAt;returnBytes=0;}
+var inWin=Date.now()-foregroundedAt<STALE_MS,d=1500;   // a close landing within STALE_MS of a foreground (the FIN a frozen tab thawed into; an iOS return): the close IS the event
+if(inWin){d=eagerDial?0:250;eagerDial=false;}   // …so the FIRST such close redials NOW; a second one in the same window waits 250 ms (a kernel that is down must not be hammered) (2026-09-07)
+if(restartAnnounced&&Date.now()-restartAnnounced<30000)d=Math.min(d,250);   // an announced death keeps its tight redial
+setTimeout(connect,d);};   // the blind 1.5 s stays for unannounced drops outside any return window
 ws.onerror=function(){try{ws.close();}catch(e){}};}
 function send(m){var s=JSON.stringify(m);if(ws&&ws.readyState===1){ws.send(s);return;}
 if(m&&m.type==="clientDiag"){if(queuedDiag>=DIAG_QUEUE_MAX)return;queuedDiag++;}   // breadcrumbs waiting for a reconnect are capped; everything else queues as before
 queue.push(s);}
+// ONE ordered dispatch FIFO per socket (the user 2026-09-07, whose dashboard froze on return to its tab): a tab
+// that sat hidden or frozen thaws into EVERY frame the browser queued for it, and each used to be parsed AND
+// fully rendered in its own task — eight feed renders and sixteen timeline draws for a board that only needs
+// its newest state. Frames are still parsed, delta-applied and LAST-stamped synchronously in wire order above
+// (reactions to the wire, like ka/restarting/needSlot/clearStale); only the HANDOFF to the bundle rides this
+// queue, flushed in one MessageChannel task — never rAF (held while hidden and in a display:none frame, and
+// state must still land) and never a timer (throttled in the background). A newer WHOLE-STATE frame (a full
+// feed/bars/skeleton/tabOrder/working/globalRetryPaused) replaces the older entry of its type and takes the
+// END position, so it never overtakes a frame that arrived between them (a `closed` between two tabOrders must
+// still land before the second, or the closed tab ghosts back). Chained kinds (session, chatTail, closed,
+// focus, status, …) are never removed. abandon()/onclose leave the queue alone: its frames are the newest
+// state the pane should hold; the next socket's frames enter behind them. Steady state: one sub-ms task hop.
+var FIFO=[],flushArmed=false,WHOLE={feed:1,bars:1,data:1,tabOrder:1,working:1,globalRetryPaused:1};
+var ch=new MessageChannel();ch.port1.onmessage=flush;
+function enqueue(m){if(m&&WHOLE[m.type]){for(var i=0;i<FIFO.length;i++){if(FIFO[i]&&FIFO[i].type===m.type){FIFO.splice(i,1);break;}}}
+FIFO.push(m);if(!flushArmed){flushArmed=true;ch.port2.postMessage(0);}}
+// The flush is TIME-SLICED (2026-09-07, measured on the thaw of a 45 s freeze: one task delivering 25 chat tails
+// ran 796 ms — every tail an incremental repaint with a forced layout). Frames are delivered in wire order until
+// the slice budget is spent, then the port is re-armed and the rest follows in the next task, so a click or a
+// keystroke can land between slices and a frame can paint. Nothing is lost or reordered: the queue is drained
+// from its head, and a newer whole-state frame arriving mid-burst still replaces its older still-queued twin.
+var FLUSH_MS=8;
+function flush(){flushArmed=false;var t0=Date.now(),err=null;
+while(FIFO.length){var m=FIFO.shift();try{deliver(m);}catch(e){if(!err)err=e;}   // one bad frame never eats the rest of the burst; its error still surfaces
+if(FIFO.length&&Date.now()-t0>=FLUSH_MS){flushArmed=true;ch.port2.postMessage(0);break;}}   // budget spent → the rest rides the next task
+if(err)throw err;}
+function deliver(m){if(window.__rompFed){window.__rompFed.inbound("",m);}else{window.dispatchEvent(new MessageEvent("message",{data:m}));}}
 // The delta reassembler. DELTA_KINDS mirrors the kernel's _DELTA_SLOTS: which top-level collections of each
 // slot are keyed, and how — "dict" (an object keyed by its own keys), "byid" (a list keyed by item id),
 // "bykeys:a,b" (a list keyed by a composite of item fields), "dictlist:id" (an object of lists, each item keyed by its
@@ -32888,13 +32948,36 @@ if(ws.readyState===3&&Date.now()-connT>8000){connect();}},5000);
 // visibility fast-path (the user 2026-07-05): a BACKGROUNDED tab has its timers throttled, so the 5s watchdog
 // above can lag and the browser may have quietly dropped the socket while it slept. The instant the tab is
 // foregrounded, if the socket isn't open or has gone quiet past the watchdog window, treat the view as stale:
-// force a reconnect (which resyncs live) and hand the reconnect its reason, so ITS arm reads "foreground" —
-// the prompt then follows the same two events as any reconnect, rather than leaving the user on a frozen frame.
-document.addEventListener("visibilitychange",function(){if(document.visibilityState!=="visible"||!everConnected)return;
-if(!ws||ws.readyState!==1||Date.now()-lastRecv>STALE_MS){pendingWhy="foreground";freshPending=true;
+// force a reconnect (which resyncs live) and hand the reconnect its reason, so ITS arm reads "foreground".
+// 2026-09-07: it latches hiddenAt/foregroundedAt first (onclose's eager redial and the return rows key on them),
+// names its DECISION, files the `return` row, and only then acts — the test itself is unchanged.
+document.addEventListener("visibilitychange",function(){if(document.visibilityState!=="visible"){hiddenAt=Date.now();return;}
+foregroundedAt=Date.now();eagerDial=true;if(!everConnected)return;
+var stale=!ws||ws.readyState!==1||Date.now()-lastRecv>STALE_MS;var res=resumedAt>hiddenAt;
+var row={decision:stale?((!ws||ws.readyState!==1)?"redial-closed":"redial-stale"):"keep",resumed:res,hiddenMs:hiddenAt?Date.now()-hiddenAt:-1,
+frozenMs:(res&&frozeAt>=hiddenAt&&resumedAt>frozeAt)?resumedAt-frozeAt:0,quietMs:lastRecv?Date.now()-lastRecv:-1,quietAtResumeMs:res?resumeQuiet:-1,ready:ws?ws.readyState:-1};
+returnAt=Date.now();returnBytes=0;returnRedialed=false;
+if(!stale){returnRow=row;returnDiag("return",row);return;}   // the socket stands: the row rides it now — and is HELD, because a FIN queued in the same thaw burst would swallow it (review find 2026-09-07; onclose re-files)
+pendingWhy="foreground";freshPending=true;   // the reconnect's arm reads "foreground" (upstream's two-event prompt)
 if(ws&&ws.readyState===1)abandon();else{try{if(ws&&ws.readyState===0)ws.close();}catch(e){}}   // OPEN-but-quiet → abandoned + redialed below, now; stuck-CONNECTING → aborted, onclose retries
-if(!ws||ws.readyState===3)connect();}});})();
+if(!ws||ws.readyState===3)connect();
+returnDiag("return",row);});/*end-shim-core*/})();   // filed AFTER the redial so it queues for the new socket instead of vanishing into the dead one
 """ % (app, int(v), app, app)
+
+
+def _shim_core_js(app="test", v=0):
+    """The shim's decision code alone — the IIFE body between its /*shim-core*/ anchors, formatted for `app` —
+    so a node test can run the REAL code (connect/onmessage/onclose, the watchdog, the visibility fast-path,
+    the resume stamp, the dispatch FIFO, the return breadcrumbs) at module scope with fakes for Date.now,
+    document, WebSocket, MessageChannel and the timers, and read its state back by name. A helper rather than
+    a regex in the tests (2026-09-07): test_view_deltas' regex lift of the delta functions is one reflow of its
+    anchor line away from silently matching nothing. Fails loudly if the anchors ever go missing."""
+    js = _shim(app, v)
+    a, b = "/*shim-core*/", "/*end-shim-core*/"
+    i, j = js.find(a), js.find(b)
+    if i < 0 or j < i:
+        raise RuntimeError("the shim-core anchors are missing from _shim")
+    return js[i + len(a):j]
 
 
 # On a narrow / touch viewport the chat's session tabs wrap into several rows and eat vertical space.
@@ -33180,13 +33263,21 @@ def _pane_spin(cid, ignore_id=""):
             "arm();"
             "if(c){try{new MutationObserver(function(){if(ready())hide();}).observe(c,{childList:true});}catch(e){}"
             "if(ready())hide();}"
-            "var rb=document.getElementById('pane-reconn');"
-            "function badge(on){if(rb)rb.classList.toggle('on',!!on);}"
+            "var rb=document.getElementById('pane-reconn'),bfail=0;"
+            # the badge's own failsafe, armed per SHOW like the sheet's (2026-09-07): it now waits for
+            # fresh DATA (below), which over a dead tunnel may never come — 30s only ever fires then.
+            "function badge(on){if(rb)rb.classList.toggle('on',!!on);clearTimeout(bfail);if(on)bfail=setTimeout(function(){badge(false);},30000);}"
             # T217: a drop over EXISTING content keeps the content — translucent corner badge, not
             # the opaque sheet; the sheet stays for a genuinely empty pane (cold load / never
-            # painted), per the loading-states rule. wsup ends both, exactly as before.
+            # painted), per the loading-states rule.
             "window.addEventListener('romp:wsdown',function(){if(ready()){badge(true);}else{show();}});"
-            "window.addEventListener('romp:wsup',function(){badge(false);hide();});})();</script>")
+            # wsup still ends the empty-pane sheet (content arrival hides it too, via the observer). The
+            # BADGE no longer comes down on wsup (2026-09-07, the user, whose dashboard looked frozen while
+            # a slow resync ran with no cue): the socket OPENING is not the end of "reconnecting" for a
+            # pane that has content — the kernel's connect-time push landing is. So it waits for
+            # romp:wsfresh, the shim's first real frame after the reconnect.
+            "window.addEventListener('romp:wsup',function(){hide();});"
+            "window.addEventListener('romp:wsfresh',function(){badge(false);});})();</script>")
 
 
 def _chat_page():

@@ -74,10 +74,15 @@ class ShimWatchdogSourcePins(unittest.TestCase):
         # watchdog wiring in the shared shim AND that no second copy has crept back in.
         self.assertEqual(KSRC.count("var lastRecv=0;var STALE_MS=30000;"), 1,
                          "still ONE shim — the anti-duplicate guard (no second hand-rolled copy)")
-        self.assertGreaterEqual(KSRC.count("lastRecv=Date.now()"), 2)   # onopen + onmessage
+        # onopen + onmessage + the Page Lifecycle `resume` stamp (2026-09-07): a thawed tab's lastRecv only
+        # said "JS did not run", so a healthy OPEN socket read as dead and was redialed on every return
+        self.assertGreaterEqual(KSRC.count("lastRecv=Date.now()"), 3)
+        self.assertIn('document.addEventListener("resume",function(){resumedAt=Date.now();', KSRC)
+        self.assertIn("if(ws&&ws.readyState===1)lastRecv=Date.now();});", KSRC, "only an OPEN socket earns the stamp")
         # the staleness threshold is used TWICE within the one shim: the 5s interval watchdog AND the
-        # visibilitychange fast-path (a foregrounded tab checks freshness at once). Both live in _shim, so the
-        # single-shim guard above still holds.
+        # visibilitychange fast-path (a foregrounded tab checks freshness at once — since 2026-09-07 it
+        # names that verdict `stale` and files it as the return row's decision, still one test). Both live
+        # in _shim, so the single-shim guard above still holds.
         self.assertEqual(KSRC.count("Date.now()-lastRecv>STALE_MS"), 2)
         self.assertNotIn("new WebSocket", km._TIMELINE_BOOT, "the timeline boot owns no socket of its own")
 

@@ -29,8 +29,16 @@ test("a predicted card is kept in Working at render, styled like the kernel's re
   assert.match(FEED, /if \(\(pendingMoveKind\.get\(a\.itemId\) \?\? "followup"\) === "followup"\) \{ c\.recheck = true; c\.followupPending = true; \}/);
   // applied at the top of render so EVERY render (push, modal close) reflects the prediction
   // (2026-07-27: render() prunes the age-provenance popover first — hiding it only when the hovered
-  // stamp was torn out of the DOM — so the pin allows that line between the two.)
-  assert.match(FEED, /const list = document\.getElementById\("feed-list"\)!;\s*\n(\s*pruneTip\(\);.*\n)?\s*applyFollowMove\(asks\);/);
+  // stamp was torn out of the DOM — so the pin allows that line between the two. 2026-09-07: the
+  // paint gate sits between them too — a hidden pane applies state and skips the paint, and this
+  // styling is paint-side (a copy for the cards), so it rightly waits with the paint; see paint-gate.ts.)
+  const head = FEED.slice(FEED.indexOf("function render() {"));
+  const gateEnd = head.indexOf("applyFollowMove(asks);");
+  assert.ok(gateEnd > 0, "applyFollowMove(asks) follows the list lookup");
+  const between = head.slice(0, gateEnd);
+  assert.ok(between.split("\n").length <= 16, "only the paint gate, its observer install and pruneTip may sit before it");
+  assert.match(between, /paintHeld\(document\.hidden, feedIntersecting, list\.childElementCount > 0\)/, "the gate");
+  assert.match(between, /pruneTip\(\);[^\n]*\n\s*$/, "pruneTip immediately precedes it");
   // the removed drag machinery must not creep back in front of it
   assert.doesNotMatch(FEED, /dragAskId|DRAG_CARDS_ENABLED|fdrop-slot/);
   assert.doesNotMatch(FEED, /"cardMove"/, "the messageless move op is gone from the feed");

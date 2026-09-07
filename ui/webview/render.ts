@@ -4604,6 +4604,19 @@ function scheduleRenderTabs(): void {
   tabsRaf = requestAnimationFrame(() => { tabsRaf = null; renderTabs(); });
 }
 
+// The same coalescing for the ACTIVE tab's incremental repaint (2026-09-07, measured on the thaw of a 45 s
+// freeze: the queued tails for the watched session replayed as one task of 796 ms — each tail an appendActive
+// with a forced layout, repainting the same suffix again and again). Tails still APPLY at once (events pushed,
+// `rendered` lowered to the earliest changed point, the ledger stored); the paint runs once per animation
+// frame from that lowest point, and carries the ledger with it. A frame is also the right clock for a hidden
+// tab: the browser holds it, so a background tab applies state and paints once on return. The full-session
+// paths (upsert, chatHead, the rewind overlay) keep their synchronous appendActive — they are one frame each.
+let appendRaf: number | null = null;
+function scheduleAppendActive(): void {
+  if (appendRaf != null) return;
+  appendRaf = requestAnimationFrame(() => { appendRaf = null; appendActive(); renderLedger(); });
+}
+
 function renderTabs() {
   if (renameActive) { renderPendingAfterRename = true; return; }
   if (tabPointerHeld) { renderPendingWhilePressed = true; return; }   // don't destroy a tab mid-click (see tabPointerHeld)
@@ -12546,8 +12559,7 @@ function chatTail(msg: any) {
       v.rendered = Math.min(v.rendered, from);        // repaint from the exact changed point (catches a tool fill)
       if (shrank) v.stale = true;                     // …but a pure truncation needs the window rebuilt, see above
     }
-    appendActive();
-    renderLedger();
+    scheduleAppendActive();   // one paint per animation frame however many tails land (2026-09-07); the ledger rides it
     // THIS is the frame that flips the chip (T225): a status-only change reaches a caught-up client as a
     // chatTail with an empty suffix and the full status — awaitingWhy/Kind/Count/Tasks included. The box
     // rendered only from the full-session path, so the chip read "Awaiting agents" with no box until a

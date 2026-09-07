@@ -831,6 +831,11 @@ class TimelinePanel {
     // so draw() paints the romp swirl loader there. Set true the instant applyBars runs (or a full one-shot
     // data object arrives through update()), and the loader is gone on the next draw. CLAUDE.md loader rule.
     this._barsLoaded = false;
+    // A bars frame that arrived BEFORE any lanes skeleton (the user 2026-09-07, who came back to a frozen
+    // dashboard tab): the pane shim now coalesces same-type frames, so on a first connect [data1, bars1,
+    // data2] can reach the pane as [bars1, data2] — and applyBars used to drop bars1 on `!this.data`. It is
+    // parked here instead and lands with the next skeleton (update()). Newest parked frame wins.
+    this._pendingBars = null;
     // per-LANE bars evidence (the user 2026-08-15: after a restart, a live WORKING lane vanished from
     // the active-only view, then reappeared bar-less): every with_bars build writes a turns entry for
     // EVERY lane it covered (empty for a quiet one), so a lane's key appearing is the exact "its
@@ -1064,6 +1069,25 @@ class TimelinePanel {
       if (this.tip && this.tip.classList && this.tip.classList.contains('show')) this.hideTip();
       _release();
     });
+    // Paint only when the pane can be seen (the user 2026-09-07, who came back to the dashboard's browser tab
+    // after it sat in the background and found the page frozen): every frame the kernel pushed while the tab
+    // was hidden was parsed AND fully drawn — N frames, N whole-SVG rebuilds — so the return paid for all of
+    // them at once. update()/applyBars() now apply their STATE unconditionally (this.data, the live edge's
+    // clock, the loader latch) but hold the draw while hidden, on the same _dirtyWhileTip path the tooltip
+    // and click holds use, and this is that hold's RELEASE: the tab coming back (visibilitychange → visible)
+    // or the pane itself coming into view (IntersectionObserver on the wrap — a display:none pane, a hidden
+    // Obsidian leaf, where the tab never changed state). One catch-up draw per return, never one per frame.
+    // Both are events; no timer polls for visibility. The observer is optional (Obsidian / a bare host may
+    // lack it) — see _hiddenForPaint for what the hold keys on without it.
+    this._onVis = () => this._releasePaintHold();
+    if (typeof document !== 'undefined' && document.addEventListener) document.addEventListener('visibilitychange', this._onVis);
+    this._io = null;
+    if (typeof IntersectionObserver !== 'undefined') {
+      try {
+        this._io = new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) this._releasePaintHold(); });
+        this._io.observe(this.wrap);
+      } catch (e) { this._io = null; }
+    }
 
     // controls row BELOW the time axis. Layout (the user 2026-06-11): usage bars LEFT-justified,
     // then a flexible spacer, then RIGHT-justified "collapse idle gaps" with the 🔒 lock-to-now
@@ -1236,7 +1260,7 @@ class TimelinePanel {
     this._hover = null; // feed→timeline hover highlight {ids,...} (set by update from data.hover OR setHover; null = none)
     this._hoverNonce = null;  // highest hover nonce applied — gates the direct push vs the file poll so neither clobbers the other (the same monotonic nonce rides both; see setHover)
     this._frozeFromPin = false;  // freeze-on-hover: true while a tooltip has paused live-follow that WAS pinned (so hideTip knows to resume)
-    this._dirtyWhileTip = false; // a data poll arrived while a tooltip was up (draw was skipped) → hideTip repaints the catch-up
+    this._dirtyWhileTip = false; // a data poll arrived while a tooltip was up (draw was skipped) → hideTip repaints the catch-up; also set under a pressed pointer (_release repaints) and while the pane is out of sight (_releasePaintHold repaints, 2026-09-07)
     this._unfreezeTimer = null;  // deferred hideTip resume — cancelled by a quick glyph→glyph hover handoff
     this.wrap.tabIndex = 0; this.wrap.style.outline = 'none';
     this._onKey = (e) => this.onKey(e);
@@ -1302,6 +1326,8 @@ class TimelinePanel {
       this.wrap.removeEventListener('touchstart', this._onTouchStart); this.wrap.removeEventListener('touchmove', this._onTouchMove); this.wrap.removeEventListener('touchend', this._onTouchEnd); this.wrap.removeEventListener('touchcancel', this._onTouchEnd); }
     if (this._drawRAF) cancelAnimationFrame(this._drawRAF);
     this._stopLiveTick();
+    if (this._onVis && typeof document !== 'undefined' && document.removeEventListener) document.removeEventListener('visibilitychange', this._onVis);
+    if (this._io) { try { this._io.disconnect(); } catch (e) {} this._io = null; }
     if (this._autoOpenT) clearTimeout(this._autoOpenT);
     if (this._unfreezeTimer) clearTimeout(this._unfreezeTimer);
     if (this._onDragMove) window.removeEventListener('mousemove', this._onDragMove, true);
@@ -1607,6 +1633,27 @@ class TimelinePanel {
     const w = this.wrap;
     return !!(w && w.offsetParent !== null);
   }
+  // Out of sight, for the PAINT hold in update()/applyBars() (2026-09-07)? Says "hidden" only for a reason
+  // whose RELEASE event is wired: the tab's visibilityState always (visibilitychange); the pane's own layout
+  // (offsetParent null — a display:none iframe, a hidden Obsidian leaf) only where the IntersectionObserver
+  // could be installed to notice it coming back. Without the observer an offsetParent-null pane keeps
+  // painting as it always did, rather than freezing on a stale frame with nothing to wake it — the
+  // 2026-06-25 stuck-hold bug in a new coat (a held pane must always have a release).
+  _hiddenForPaint() {
+    if (this._io) return !this._isVisible();
+    return typeof document !== 'undefined' && document.visibilityState === 'hidden';
+  }
+  // The paint hold's release (2026-09-07): the tab came back or the pane came into view. Repaint the held
+  // frames as ONE catch-up — exactly what hideTip / _release do for their holds — and re-arm the live tick,
+  // which _tickLive stopped while hidden. Still hidden by the OTHER criterion (tab visible, pane display:none,
+  // or the reverse) → that criterion's own event releases later. A shown tip or a pressed pointer keeps its
+  // own hold and its own release repaints; the tick re-arm is safe under both (it self-gates).
+  _releasePaintHold() {
+    if (this._hiddenForPaint()) return;
+    const tipUp = this.tip && this.tip.classList && this.tip.classList.contains('show');
+    if (this._dirtyWhileTip && !tipUp && !this._pointerHeld) { this._dirtyWhileTip = false; this.draw(); }
+    this._startLiveTick();
+  }
   // The effective `now` draw() renders the right edge at: data.now plus wall-clock since that poll while
   // live-following, else the raw data.now (a held/frozen view must NOT creep as time passes).
   _liveNow() {
@@ -1623,8 +1670,10 @@ class TimelinePanel {
   // The live-follow loop: a look (draw if the edge moved LIVE_MIN_PX; see _tickLive), then a sleep sized to
   // the edge's speed, then the next look on an animation frame. Restarted by update()/applyBars() (each frame
   // re-paces it: a pending sleep computed for the old zoom or data is dropped), by gestures, and by the
-  // pointer release when a look was skipped under a held pointer. Hidden pane: it keeps sleeping (long) so it
-  // resumes by itself when shown; not live-following: it stops until a gesture pins the edge again.
+  // pointer release when a look was skipped under a held pointer. Hidden pane: the loop STOPS (its old 2 s
+  // sleep re-entered _isVisible()'s forced offsetParent layout every wake, for a pane nobody could see —
+  // 2026-09-07) and the paint hold's release (_releasePaintHold) re-arms it; not live-following: it stops
+  // until a gesture pins the edge again.
   _startLiveTick() {
     if (!this._liveFollowing() || !this._isVisible()) return;
     if (this._liveRAF != null) return;                                        // a look is already imminent
@@ -1648,7 +1697,7 @@ class TimelinePanel {
   _tickLive() {
     this._liveRAF = null; this._liveTO = null;
     if (!this._liveFollowing() || !this.data) return;          // gate closed → stop; a gesture or a frame re-arms
-    if (!this._isVisible()) { this._sleep(2000); return; }      // hidden pane: stay alive cheaply, resume when shown
+    if (!this._isVisible()) return;                             // hidden pane: stop; _releasePaintHold re-arms when it shows (no 2 s layout poll)
     // Click-safe: don't rebuild the SVG under a pressed pointer (a click in progress). The release event
     // (_release) restarts the loop — no polling for it. See the constructor.
     if (this._pointerHeld) { this._liveResume = true; return; }
@@ -1799,7 +1848,8 @@ class TimelinePanel {
     // A FULL data object (the test harness / an older one-shot) carries its own turns, so the bars are
     // already present → no loader. The two-message path leaves turns empty here; the loader shows until
     // applyBars lands. Read the RAW turns BEFORE the prev-carry below back-fills them.
-    if (data.turns && Object.keys(data.turns).length) this._barsLoaded = true;
+    const ownBars = !!(data.turns && Object.keys(data.turns).length);
+    if (ownBars) this._barsLoaded = true;
     if (data.turns) for (const k of Object.keys(data.turns)) this._barsSeen.add(k);
     const prev = this.data;
     if (prev && (!data.turns || !Object.keys(data.turns).length)) {
@@ -1831,6 +1881,11 @@ class TimelinePanel {
       this._nowBaseSec = data.now; this._nowBaseMs = _tMs;
     }
     this._wasLive = _live;
+    // A bars frame parked ahead of its skeleton (see applyBars) lands now that lanes exist — the skeleton
+    // arriving IS the event. Merged AFTER this frame's clock so the newer skeleton's `now` wins the edge, and
+    // BEFORE the fit + draw below so the first paint carries the bars. A skeleton that brought its own turns
+    // (a full one-shot) is newer than anything parked before it, so the parked frame is dropped (2026-09-07).
+    if (this._pendingBars) { const pb = this._pendingBars; this._pendingBars = null; if (!ownBars) this._mergeBars(pb); }
     if (!this.fitted && Object.keys(this.data.turns || {}).length && this.fitWindow()) this.fitted = true;   // fit once bars exist (a skeleton-only first paint waits for applyBars); no latch without a clock sample
     // first paint with a chat already open → seed the highlight from it (don't override a later local pick)
     if (this.selectedSid == null) { const sid = this._sidForActiveChat(data.activeChat); if (sid) this.selectedSid = sid; }
@@ -1859,9 +1914,11 @@ class TimelinePanel {
     // every x-position = the jump the user saw under the held edge. Keep the last frame; hideTip repaints
     // the buffered data as ONE catch-up. (Also skips the focus-jump + live-tick below — both move the view.)
     // Hold the SVG layout while it's deliberately frozen: a tooltip is up (freeze-on-hover) OR a pointer is
-    // pressed (a click in progress — click-safe, see the constructor). Buffer the data; repaint the catch-up
-    // when the hold ends (hideTip / pointer release). Skips the focus-jump + live-tick below — both move the view.
-    if ((this.tip && this.tip.classList && this.tip.classList.contains('show')) || this._pointerHeld) { this._dirtyWhileTip = true; return; }
+    // pressed (a click in progress — click-safe, see the constructor) OR the pane is out of sight (a hidden tab,
+    // a display:none pane — 2026-09-07; nobody sees a paint there, and the return used to pay for every held
+    // frame's rebuild at once). Buffer the data; repaint the catch-up when the hold ends (hideTip / pointer
+    // release / _releasePaintHold). Skips the focus-jump + live-tick below — both move the view.
+    if ((this.tip && this.tip.classList && this.tip.classList.contains('show')) || this._hiddenForPaint() || this._pointerHeld) { this._dirtyWhileTip = true; return; }
     this.draw();
     // feed→timeline locate: a NEW focus nonce (update_feed wrote timeline-focus.json on a card click)
     // → pan/scroll/pulse to that event. Adopt the nonce silently on first load (don't jump to a stale
@@ -1890,7 +1947,23 @@ class TimelinePanel {
     this._wasLive = live;
   }
   applyBars(m) {
-    if (!m || !this.data || !this.data.sessions) return;
+    if (!m) return;
+    // No skeleton yet → PARK the frame, don't drop it (2026-09-07): the pane shim coalesces same-type frames,
+    // so a first connect's [data1, bars1, data2] can arrive here as [bars1, data2]; dropping bars1 left the
+    // loader up until the next bars push. update() merges the parked frame when the skeleton lands.
+    if (!this.data || !this.data.sessions) { this._pendingBars = m; return; }
+    this._pendingBars = null;   // anything parked is older than this frame
+    this._mergeBars(m);
+    // honor the same freeze-on-hover / click-hold / out-of-sight guard update() uses (don't relayout under a
+    // held pointer or tip, nor for a pane nobody can see — _releasePaintHold repaints the catch-up)
+    if ((this.tip && this.tip.classList && this.tip.classList.contains('show')) || this._hiddenForPaint() || this._pointerHeld) { this._dirtyWhileTip = true; return; }
+    this.draw();
+    this._startLiveTick();   // bars are up now → resume the smooth-advance loop (gated off while the loader showed)
+  }
+  // The STATE half of a bars frame — everything that must land whether or not the pane can be seen: the
+  // turns/judging/messages, the loader latch, the live edge's clock (2026-09-07). applyBars() paints after
+  // it; update() runs it for a frame that was parked ahead of its skeleton.
+  _mergeBars(m) {
     this.data.turns = m.turns || {};
     for (const k of Object.keys(this.data.turns)) this._barsSeen.add(k);
     this.data.judging = m.judging || [];
@@ -1919,10 +1992,6 @@ class TimelinePanel {
       this._anchorNow(this.data.now);
     }
     if (!this.fitted && Object.keys(this.data.turns).length && this.fitWindow()) this.fitted = true;   // no latch without a clock sample (see fitWindow)
-    // honor the same freeze-on-hover / click-hold guard update() uses (don't relayout under a held pointer/tip)
-    if ((this.tip && this.tip.classList && this.tip.classList.contains('show')) || this._pointerHeld) { this._dirtyWhileTip = true; return; }
-    this.draw();
-    this._startLiveTick();   // bars are up now → resume the smooth-advance loop (gated off while the loader showed)
   }
 
   // Direct hover push from the kernel (server.ts pushHover) — the FAST path that skips the
