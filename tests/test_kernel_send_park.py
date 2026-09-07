@@ -428,6 +428,13 @@ class QueuedBubble(unittest.TestCase):
         self.assertIn('_cancel_backend_queued(be, sid, int(msg["idx"]), str(msg.get("md") or ""))', src,
                       "the backend-queue cancel goes through the drift guard now")
 
+    def test_a_body_only_cancel_that_finds_nothing_is_logged(self):
+        # T244 (the user 2026-09-07): a ✕ on a "sending…" bubble left no evidence of which way the cancel went.
+        # The body-only arm now logs a miss (sid only — the body is the user's text) so the next report carries it.
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        arm = src.split('elif t == "cancelQueued" and msg.get("md"):')[1].split("\n    elif ")[0]
+        self.assertIn('sys.stderr.write("queued-cancel miss: %s (body-only)\\n" % sid)', arm)
+
     def test_drive_answers_every_cancel_with_an_authoritative_result_frame(self):
         # the user 2026-07-20: a ✕ whose target had already been handed to the CLI silently no-opped
         # while the client showed the message as deleted — and the CLI answered it anyway. EVERY cancel
