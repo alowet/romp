@@ -39,6 +39,7 @@ SourceFileLoader("romp_judge", os.path.join(BIN, "romp-judge")).load_module()
 os.environ["ROMP_KERNEL_NO_OPEN"] = "1"
 os.environ.setdefault("ROMP_SERVE_TOKEN", "test-token-DO-NOT-USE")
 km = SourceFileLoader("romp_kernel", os.path.join(BIN, "romp-kernel")).load_module()
+sb = SourceFileLoader("romp_sdk_backend_authhard", os.path.join(BIN, "romp_sdk_backend.py")).load_module()
 
 TOK = km.TOKEN
 
@@ -639,6 +640,155 @@ class PostBodyGateOverTheWire(unittest.TestCase):
         st, r, head = _raw_post(self.port, "/rename", [("X-Romp-Token", TOK), ("Content-Length", "2")], body=b"{}")
         self.assertEqual(st, 400, r)
         self.assertNotIn("announced", r.get("error", ""))
+
+
+_AH_KEY_MATERIAL = "test-key-material-" + "z" * 28   # invented; not shaped like any provider's key
+_AH_KEY_FP = sb._keysrc.fingerprint(_AH_KEY_MATERIAL)   # what a keyed launch records (_launched_key_fp)
+
+
+class _ApiHealthBackend:
+    """A stand-in SDK backend carrying a REAL aggregator (sdk_backend.ApiHealth) over a temp state
+    dir, seeded with one storm filed under a label digested from synthetic key material — so the
+    served payload is the real shape and the leak checks have something to catch."""
+
+    def __init__(self):
+        self.ah = sb.ApiHealth(tempfile.mkdtemp())
+        label = sb.api_health_auth_label("ANTHROPIC_API_KEY", salt=self.ah.salt(),
+                                         key_fp=_AH_KEY_FP, launched_keyed=True)
+        now = time.time()
+        for i in range(20):
+            is429 = i % 5 in (3, 4)
+            self.ah._push(sb.AhEvent(now - 290 + i * 14, label, "fable", "retry" if is429 else "ok",
+                                     "429" if is429 else "ok", 429 if is429 else None,
+                                     "11111111-2222-3333-4444-555555555555", 0))
+
+    def api_health_snapshot(self, now=None, uptime_s=None):
+        out = self.ah.snapshot(now, uptime_s=uptime_s)
+        out["coverage"].update({"sdkSessionsLive": 1, "inTurn": 1, "retrying": 1})
+        return out
+
+
+def _strings(o):
+    """Every string value in a JSON-shaped payload (keys included)."""
+    if isinstance(o, dict):
+        for k, v in o.items():
+            yield k
+            yield from _strings(v)
+    elif isinstance(o, (list, tuple)):
+        for v in o:
+            yield from _strings(v)
+    elif isinstance(o, str):
+        yield o
+
+
+class ApiHealthRouteGate(unittest.TestCase):
+    """GET /api-health is a READ gated by the plain _authorize — never in the pre-auth exempt block.
+    The exempt reads (/healthz, /version, /busy) carry only bare counters; this payload names auth
+    labels and model families, so it costs a credential. Same drive-the-real-dispatcher approach as
+    the drain-gate tests above: a source-position pin cannot catch a route served on the wrong side."""
+
+    def setUp(self):
+        self._saved_sdk = km._sdk
+        self.be = _ApiHealthBackend()
+        km._sdk = lambda: self.be
+
+    def tearDown(self):
+        km._sdk = self._saved_sdk
+
+    def test_no_credential_no_signal(self):
+        for headers in ({}, {"Cookie": "romp_token=wrong"}, {"X-Romp-Token": "wrong"},
+                        {"Cookie": "romp_token=" + TOK, "Origin": "http://127.0.0.1:5173",
+                         "Host": "127.0.0.1:%d" % km.PORT}):
+            status, body = _serve_get("/api-health", headers)
+            self.assertEqual(status, 403, "no credential must not reach /api-health (%r)" % headers)
+            self.assertNotIn("buckets", body)
+
+    def test_the_header_token_reads_the_signal(self):
+        status, body = _serve_get("/api-health", {"X-Romp-Token": TOK})
+        self.assertEqual(status, 200)
+        out = json.loads(body)
+        self.assertEqual(out["schema"], 1)
+        self.assertIs(out["coverage"]["sidechainExcluded"], True)
+        self.assertEqual(out["rate429Basis"], "attempts")
+        self.assertEqual(len(out["buckets"]), 1)
+        (b,) = out["buckets"].values()
+        self.assertEqual(b["state"], "thrashing")
+        self.assertEqual(out["overall"]["state"], "thrashing")
+        self.assertEqual(b["windows"]["300"]["rate429"], 0.4)
+
+    def test_the_cookie_reads_it_from_the_dashboards_own_origin(self):
+        host = "127.0.0.1:%d" % km.PORT
+        status, _ = _serve_get("/api-health", {"Cookie": "romp_token=" + TOK,
+                                               "Origin": "http://" + host, "Host": host})
+        self.assertEqual(status, 200, "a read: the plain gate, not the stricter write token")
+
+    def test_the_route_sits_after_the_gate_in_the_source_too(self):
+        # belt to the dispatcher's braces: within do_GET the gate line occurs once, and the route must
+        # follow it — never among /healthz, /version, /busy and the manifest
+        import inspect
+        src = inspect.getsource(km.Handler.do_GET)
+        gate = "ok, self._set_cookie, why = self._authorize(q)"
+        self.assertEqual(src.count(gate), 1)
+        self.assertGreater(src.index('p == "/api-health"'), src.index(gate))
+        self.assertLess(src.index('p == "/manifest.webmanifest"'), src.index(gate), "sanity: the exempt block IS above the gate")
+
+    def test_the_payload_carries_no_paths_and_no_key_material(self):
+        status, body = _serve_get("/api-health", {"X-Romp-Token": TOK})
+        self.assertEqual(status, 200)
+        for s in _strings(json.loads(body)):
+            self.assertNotIn("/", s, "no filesystem path may ride the signal: %r" % s)
+            self.assertFalse(s.startswith("~"), s)
+        for i in range(len(_AH_KEY_MATERIAL) - 4):
+            self.assertNotIn(_AH_KEY_MATERIAL[i:i + 5], body, "a fragment of the key material leaked")
+        self.assertNotIn(_AH_KEY_FP, body, "salted: the key's fingerprint is not the bucket's name either")
+        self.assertNotIn(os.path.expanduser("~"), body)
+
+    def test_boot_identity_is_versions_own(self):
+        status, body = _serve_get("/api-health", {"X-Romp-Token": TOK})
+        out = json.loads(body)
+        v = km._version_info()
+        self.assertEqual(out["bootId"], km._BOOT_ID)
+        self.assertEqual(out["bootId"], v["boot"], "the same id /version and X-Romp-Boot carry — never a third")
+        self.assertEqual(out["bootAt"], v["started"])
+        self.assertAlmostEqual(out["uptimeS"], v["uptime_s"], delta=2.0)
+        self.assertIsInstance(out["complete"], bool)
+        self.assertEqual(out["complete"], out["uptimeS"] >= 900)
+        import inspect
+        src = inspect.getsource(km.Handler.do_GET)
+        self.assertIn('out["bootId"] = _BOOT_ID', src)
+        self.assertIn("uptime_s=now - _STARTED", src)
+
+    def test_no_backend_is_a_loud_503_not_an_empty_signal(self):
+        km._sdk = lambda: None
+        status, body = _serve_get("/api-health", {"X-Romp-Token": TOK})
+        self.assertEqual(status, 503)
+        self.assertIn("error", json.loads(body))
+
+    def test_coverage_counts_the_tmux_sessions_the_signal_does_not_see(self):
+        # the kernel's half of `coverage`: tmux-backed sessions have no SDK stream; the backend's
+        # half (sdkSessionsLive / inTurn / retrying) arrives with the payload
+        saved = km.Sessions.live
+        km.Sessions.live = staticmethod(lambda: {"11111111-2222-3333-4444-555555555555": {"backend": "tmux"},
+                                                 "11111111-2222-3333-4444-666666666666": {"backend": "sdk"},
+                                                 "11111111-2222-3333-4444-777777777777": {"backend": "tmux"}})
+        try:
+            status, body = _serve_get("/api-health", {"X-Romp-Token": TOK})
+        finally:
+            km.Sessions.live = saved
+        self.assertEqual(status, 200)
+        cov = json.loads(body)["coverage"]
+        self.assertEqual(cov["tmuxSessionsUncovered"], 2)
+        self.assertEqual((cov["sdkSessionsLive"], cov["inTurn"], cov["retrying"]), (1, 1, 1))
+        # …and a failed enumeration is a visible null, never a silent zero
+        km.Sessions.live = staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("no tmux")))
+        try:
+            status, body = _serve_get("/api-health", {"X-Romp-Token": TOK})
+        finally:
+            km.Sessions.live = saved
+        self.assertEqual(status, 200)
+        self.assertIsNone(json.loads(body)["coverage"]["tmuxSessionsUncovered"])
+
+
 
 
 if __name__ == "__main__":
