@@ -226,7 +226,7 @@ class TimelineReaders(unittest.TestCase):
         p = jd.STATE / "states" / (SID + ".jsonl")
         _append(str(p), {"t": now - 300, "state": "working"}, {"t": now - 200, "state": "permission"})
         self.assertEqual(km._state_intervals(SID, "permission", now), [[now - 200, now]],
-                         "an open awaiting interval runs to now")
+                         "an open awaiting interval runs to now (the build clock the renderer reads as open)")
         _append(str(p), {"t": now - 100, "state": "working"}, {"awaiting": False})
         self.assertEqual(km._state_intervals(SID, "permission", now), [[now - 200, now - 100]])
         self.assertEqual(km._state_intervals(SID, "compacting", now), [])
