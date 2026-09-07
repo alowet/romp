@@ -24537,7 +24537,52 @@ _judge_gen = [0]                                 # bumped when a producer pass C
 _goals_snap = [None]                             # {sid: store} while a judge pass is mid-flight, else None
 _goals_snap_at = [0.0]                           # when that snapshot's file reads STARTED (see _feed_goals)
 _goals_snap_done = {}                            # sid → the user-write mark already punched onto THIS snapshot
+_goals_snap_owned = set()                        # sids whose snapshot entry is THIS pass's private copy (copy-on-punch)
 _goals_snap_lock = threading.Lock()
+# STAT-KEYED STORE MEMO (2026-09-06). The snapshot used to json.loads EVERY goals/<fsid>.json at the
+# start of every pass — on one busy kernel 72 files of up to 1.3 MB, about 3% of its interpreter time
+# and most of the producer thread's cost — although a pass changes only a few of them. Every writer
+# publishes by rename (save_goals), so the bytes under an inode never change once it is at its path. The
+# memo keeps the parsed object per path under (st_ino, st_mtime_ns, st_size); a pass stats every file,
+# decodes only the ones whose key moved, and builds the snapshot from memo REFERENCES. Consequence: a
+# snapshot entry is shared with later passes, so nothing may mutate it — _feed_goals copies an entry
+# before punching a user gesture onto it (the _apply_rewind_hold idiom), and build_feed only reads. A
+# version that fails to decode is remembered under its key too, so a corrupt store is decoded (and
+# reported) once per file version rather than once per pass; its sid stays out of the snapshot and the
+# feed reads it live. A read that fails (EMFILE under descriptor pressure, EIO) is not remembered: that
+# is the pass's failure, not the version's, so the next pass reads the file again, as every pass did
+# before the memo. Entries for paths gone from the directory are evicted at the next pass.
+# WHAT THE KEY RESTS ON: st_mtime_ns moving between publishes, not the inode. Inode numbers recycle
+# (on ext4, consecutive tmp+rename publishes of one path alternate between two numbers, so the third
+# version can sit on the first's inode), and equal sizes are common (a digit bump, a same-length
+# status word). On Linux 6.13+ (multigrain timestamps) the move is guaranteed: the pass's own stat
+# marks the inode as queried, so the next publish gets a fine-grained stamp. On a coarse-timestamp
+# kernel, two equal-size publishes of one store inside one clock tick after the pass's stat reproduce
+# the memoized key and pin the earlier parse until the store's next publish — a known blind spot. A byte
+# compare on a stat hit closes it; this memo does not carry one, so the cost is one pass serving the
+# earlier parse (a stale card until the store's next publish, never a wrong write).
+_goals_memo = [{}]                               # path → ((st_ino, st_mtime_ns, st_size), parsed store | _GOALS_MEMO_BAD)
+_GOALS_MEMO_BAD = object()                       # a file version that did not decode: no snapshot entry, no retry until it changes
+# Bare `+= 1` increments with one writer per key: hit/miss/fail/evict are written only by the producer thread
+# (_begin_goals_pass runs only from _producer) and punch only under _goals_snap_lock, so no key has two writers.
+_goals_memo_stats = {"hit": 0, "miss": 0, "fail": 0, "evict": 0, "punch": 0}   # read by tests; surfaced on GET /perf once that route exists
+
+
+def _goals_memo_decode(data):
+    """The memo's one decode: a raw parse of the file's bytes, exactly what the snapshot always held
+    (no _guard_nodes, no replay — those are load_goals' business). A module function so tests count
+    decodes here rather than by patching json.loads."""
+    return json.loads(data)
+
+
+def _goals_memo_report():
+    """The memo's counters plus its current occupancy: `entries` memoized paths and `bytes` their summed
+    on-disk size (a proxy for the parsed objects' footprint). GET /perf reports it once that route exists."""
+    memo = _goals_memo[0]
+    out = dict(_goals_memo_stats)
+    out["entries"] = len(memo)
+    out["bytes"] = sum(k[2] for k, v in memo.values() if v is not _GOALS_MEMO_BAD)
+    return out
 # A USER gesture (card reply, Move to Working, resolve) must NEVER wait out a pass (the user 2026-07-21).
 # The snapshot above exists to hide half-applied JUDGE writes; it was also hiding the user's own, because
 # optimistic_followup writes the LIVE store while the feed reads the frozen copy. A reply landing
@@ -24552,27 +24597,77 @@ def _note_user_goal_write(sid):
     _user_goal_write[str(sid)] = time.time()
 
 def _begin_goals_pass():
-    """Capture the PRE-pass goal stores so build_feed serves a pass-boundary-consistent view for the pass."""
-    at = time.time()          # stamped BEFORE the reads: a write racing this loop must count as AFTER them,
-    snap = {}                 # so it gets replayed onto the snapshot rather than lost to the read order
+    """Capture the PRE-pass goal stores so build_feed serves a pass-boundary-consistent view for the pass.
+
+    Stat-keyed (see the memo note above): each store is decoded only when its (ino, mtime_ns, size)
+    moved since the last pass; an unchanged one is served as the memoized object. The key is taken by
+    fstat on the fd the bytes are read from, so key and content are the same file version: a rename
+    landing between the listing's stat and the open is read whole from the new inode and keyed as
+    such. Any race the other way (content newer than its key) only costs one extra decode next pass;
+    it can never pin a stale parse, because the next stat sees a moved key. The one way a stale parse
+    CAN pin is the coarse-timestamp blind spot in the memo note above (equal size, recycled inode, same
+    clock tick); on a multigrain-timestamp kernel it does not occur."""
+    # ui/webview/feed-move-ack.test.ts pins the next line's comment text ("stamped BEFORE the reads").
+    at = time.time()          # stamped BEFORE the reads and the stats that gate them: a write racing this loop
+    snap = {}                 # must count as AFTER them, so it is replayed onto the snapshot, not lost to the read order
+    prev = _goals_memo[0]
+    memo = {}
+    hit = miss = fail = 0
     try:
-        for p in jd.GOALDIR.glob("*.json"):
-            try:
-                snap[p.stem] = json.loads(p.read_text())
-            except Exception:
-                pass
-    except Exception:
-        pass
+        entries = [e for e in os.scandir(jd.GOALDIR) if e.name.endswith(".json") and e.is_file()]
+    except OSError:
+        entries = []
+    for ent in entries:
+        path, sid = ent.path, ent.name[:-5]
+        try:
+            st = ent.stat()
+            key = (st.st_ino, st.st_mtime_ns, st.st_size)
+            old = prev.get(path)
+            if old is not None and old[0] == key:
+                hit += 1                                   # same file version → the memoized parse (or its
+                memo[path] = old                           # remembered decode failure) stands
+                if old[1] is not _GOALS_MEMO_BAD:
+                    snap[sid] = old[1]
+                continue
+            with open(path, "rb") as fh:
+                st = os.fstat(fh.fileno())
+                key = (st.st_ino, st.st_mtime_ns, st.st_size)
+                data = fh.read()
+            store = _goals_memo_decode(data)
+        except FileNotFoundError:
+            continue                                       # gone between the listing and the read: no store
+        except OSError as e:                               # unreadable (EMFILE, EIO): out of the snapshot for THIS
+            fail += 1                                      # pass and not remembered, so the next pass reads it again
+            sys.stderr.write("goals-pass: %s: %s: %s (not in the pass snapshot; served live, read again next pass)\n"
+                             % (ent.name, type(e).__name__, e))
+            continue
+        except Exception as e:                             # undecodable: out of the snapshot (the feed reads it
+            fail += 1                                      # live, as before), said once per version
+            memo[path] = (key, _GOALS_MEMO_BAD)
+            sys.stderr.write("goals-pass: %s: %s: %s (not in the pass snapshot; served live until the file changes)\n"
+                             % (ent.name, type(e).__name__, e))
+            continue
+        miss += 1
+        memo[path] = (key, store)
+        snap[sid] = store
+    _goals_memo[0] = memo
+    _goals_memo_stats["hit"] += hit
+    _goals_memo_stats["miss"] += miss
+    _goals_memo_stats["fail"] += fail
+    _goals_memo_stats["evict"] += len(prev.keys() - memo.keys())
     with _goals_snap_lock:
         _goals_snap[0] = snap
         _goals_snap_at[0] = at
         _goals_snap_done.clear()
+        _goals_snap_owned.clear()
 
 def _end_goals_pass():
-    """Pass over — drop the snapshot so reads go live again (post-pass results + any user writes show now)."""
+    """Pass over — drop the snapshot so reads go live again (post-pass results + any user writes show now).
+    The memo keeps its parsed stores: they are the next pass's cache hits."""
     with _goals_snap_lock:
         _goals_snap[0] = None
         _goals_snap_done.clear()
+        _goals_snap_owned.clear()
 
 def _feed_goals(sid):
     """Goal store for the FEED, frozen at the pre-pass snapshot while a judge pass is mid-flight (so a card
@@ -24591,6 +24686,14 @@ def _feed_goals(sid):
         if snap is not None and sid in snap:
             store, mark = snap[sid], _user_goal_write.get(str(sid), 0.0)
             if mark >= _goals_snap_at[0] and _goals_snap_done.get(sid) != mark:
+                if sid not in _goals_snap_owned:
+                    # COPY-ON-PUNCH: the entry is the memo's object, shared with every later pass that
+                    # finds the file unchanged, so the replay and rollup below must land on a copy of it
+                    # (the _apply_rewind_hold idiom). Once per pass per sid: a second gesture in the
+                    # same pass punches the copy this one made.
+                    store = snap[sid] = json.loads(json.dumps(store))
+                    _goals_snap_owned.add(sid)
+                    _goals_memo_stats["punch"] += 1
                 try:
                     jd._replay_overrides(sid, store)   # the reopen/move/resolve/unclear event, applied by the judge's own code
                     jd.rollup_status(store, False)     # …and the card's column follows it (the user just acted → working)
