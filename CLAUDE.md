@@ -80,7 +80,7 @@ broad `git add` will sweep up your work). Conventions:
 - **Never commit on the shared `main` checkout** (user rule, 2026-07-24). Branches and
   worktrees are how work happens here, with no "quick one in main" exception. A commit
   that lands on the local `main` branch and is not pushed immediately makes local `main`
-  diverge from `origin/main`, and then every peer session is stuck: they cannot push,
+  diverge from `upstream/main`, and then every peer session is stuck: they cannot push,
   cannot fast-forward, and cannot reset the shared tree without destroying whatever
   uncommitted edits other sessions are holding in it. This happened on 2026-07-24 (six
   docs commits stranded on local `main`, already duplicated on a PR branch, blocking two
@@ -89,13 +89,19 @@ broad `git add` will sweep up your work). Conventions:
   without asking — through the fork (user rule, 2026-07-27): rulesets on the upstream
   block EVERY direct branch push (`main` and feature branches alike, no bypass), so
   publishing is always push-then-PR:
-  1. `git push -u fork <branch>` — the clone's `fork` remote is the maintainer's fork;
-     `remote.pushDefault` already points there, so a bare `git push` does the same.
-     Never push to `origin`: the server rejects it, and naming it in scripts bakes in
-     a failure.
+  1. `git push -u origin <branch>`: `origin` is the maintainer's **fork** and `upstream`
+     is romp-on/romp (remote convention, the user 2026-09-06; a plain install has only
+     `origin`, which is then romp-on itself). `remote.pushDefault` points at `origin`,
+     so a bare `git push` does the same. Never push to `upstream`: the server rejects
+     it, and naming it in scripts bakes in a failure.
   2. `gh pr create --repo romp-on/romp --label <tier>` (gh detects the fork head), then
      `gh pr merge --auto --merge`: it lands itself when the required Linux checks
      pass. There is no way to move `main` except a green PR.
+  Anything that reads the canonical repo (the release script's post-merge
+  fast-forward and tag push, the kernel's update and drift probes) resolves the remote
+  as `upstream` when the clone has one, else `origin` (`_release_remote` in
+  `kernel/kernel.py`, `canonical_remote` in `scripts/release.sh`); never a literal
+  `origin`, which in a fork layout is a stale mirror nobody advances.
 - **Every PR carries exactly one tier label** (maintainers' rule, 2026-09-06). A
   required check holds a PR with no tier label, or two, red, so an unlabeled PR never
   auto-merges. The author picks the tier at filing time:

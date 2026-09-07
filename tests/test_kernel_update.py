@@ -355,7 +355,12 @@ class CheckLoop(Fresh):
 class RunUpdate(Fresh):
     def test_detached_child_lands_on_the_tag_installs_reports_and_restarts_only_on_success(self):
         calls = []
+        # The release remote is pinned: this test's Popen seam swallows every subprocess, the
+        # resolver's `git remote` included, and the real checkout's layout (a maintainer's clone
+        # has `upstream`) must not decide what a plain-install script says. The resolver has its
+        # own tests (test_main_drift_notice.ReleaseRemote).
         with mock.patch.object(km.subprocess, "Popen", side_effect=lambda *a, **kw: calls.append((a, kw))), \
+             mock.patch.object(km, "_release_remote", return_value="origin"), \
              mock.patch.dict(km.os.environ, {"ROMP_MANAGER_PORT": "7777"}):
             self.assertTrue(km._run_update("v0.7.0"))
         (a, kw), = calls
@@ -615,8 +620,11 @@ class ReleaseChannelMigration(unittest.TestCase):
                 pass
         calls = []
         env = {**os.environ, "ROMP_MANAGER_PORT": ""}            # no manager → no restart leg
+        # The install clones its bare `origin` directly, the plain layout; the resolver would say
+        # so, but the Popen seam below swallows its `git remote` too, so it is pinned here.
         with mock.patch.object(km.subprocess, "Popen", side_effect=lambda *a, **kw: calls.append(a)), \
              mock.patch.object(km, "ROOT", Path(inst)), \
+             mock.patch.object(km, "_release_remote", return_value="origin"), \
              mock.patch.dict(km.os.environ, env, clear=True):
             km._UPDATE_STATE[0] = ""
             self.assertTrue(km._run_update(tag))

@@ -24,6 +24,45 @@ SourceFileLoader("romp_judge", os.path.join(BIN, "romp-judge")).load_module()
 km = SourceFileLoader("romp_kernel_drift", os.path.join(BIN, "romp-kernel")).load_module()
 
 
+class ReleaseRemote(unittest.TestCase):
+    """_release_remote picks the remote the updater reads. The remote convention (the user
+    2026-09-06) makes a maintainer's `origin` their FORK, whose main nobody advances: an updater
+    still reading a literal `origin` would report the fork's stale main as the truth and, in auto
+    mode, walk the checkout backwards onto it. A plain bootstrap install has only `origin`, which
+    IS the canonical repo. Throwaway repos; no network."""
+
+    def _repo_with_remotes(self, *names):
+        import subprocess
+        d = tempfile.mkdtemp()
+        subprocess.run(["git", "init", "-q", d], check=True)
+        for n in names:
+            subprocess.run(["git", "-C", d, "remote", "add", n, "https://example.invalid/%s.git" % n], check=True)
+        return d
+
+    def _resolve_in(self, root):
+        from pathlib import Path
+        saved = km.ROOT
+        km.ROOT = Path(root)
+        try:
+            return km._release_remote()
+        finally:
+            km.ROOT = saved
+
+    def test_a_fork_layout_reads_upstream(self):
+        self.assertEqual(self._resolve_in(self._repo_with_remotes("origin", "upstream")), "upstream")
+
+    def test_a_plain_install_reads_origin(self):
+        self.assertEqual(self._resolve_in(self._repo_with_remotes("origin")), "origin")
+
+    def test_no_git_checkout_falls_back_to_origin(self):
+        self.assertEqual(self._resolve_in(tempfile.mkdtemp()), "origin")
+
+    def test_every_updater_probe_and_walk_goes_through_it(self):
+        for fn in (km._latest_release_tag, km._origin_main_sha, km._run_main_update, km._run_update):
+            self.assertIn("_release_remote()", inspect.getsource(fn), fn.__name__)
+            self.assertNotIn('"origin"', inspect.getsource(fn), "%s still names a literal origin" % fn.__name__)
+
+
 class DriftVerdict(unittest.TestCase):
     def test_origin_ahead_of_the_checkout_wants_a_pull(self):
         self.assertEqual(km._main_drift_verdict("aaaa1111", "bbbb2222", "bbbb2222"), ("pull", "aaaa1111"))
@@ -59,7 +98,9 @@ class DriftWiring(unittest.TestCase):
         self.assertIn('"status", "--porcelain"', src)
         self.assertIn("uncommitted work", src, "the refusal names the real problem")
         self.assertIn('_MAIN_DRIFT[0] = ""', src, "the notice re-fires once the tree is clean")
-        self.assertIn('"checkout", "--detach", "origin/main"', src, "advance is the repo's own convention")
+        self.assertIn('"checkout", "--detach", "%s/main" % remote', src, "advance is the repo's own convention")
+        self.assertIn("remote = _release_remote()", src,
+                      "the walk targets the RELEASE remote, never a literal origin (a fork layout's stale mirror)")
 
     def test_every_converge_is_immediate_by_default_and_quiet_stays_expressible(self):
         # T160 (the user 2026-08-28): deploys cut in-flight turns NOW — auto converge included.
