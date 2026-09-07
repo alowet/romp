@@ -5756,6 +5756,16 @@ let pickAllowNew = false;
 let pendingNewSession: string | null = null;
 let provisionalId: string | null = null;
 const provisionalQueue: string[] = [];
+// A ✕ on a provisional tab's "sending…" bubble forgets the send HERE too (T244, the user 2026-09-07): the
+// message has never left the client — adoption re-sends whatever this queue still holds — so dropping only
+// the optimistic entry brought the cut message back as a bubble under the real tab while the ✕'s restore had
+// already put the same text in the composer. One press forgets one send.
+function forgetProvisionalSend(text: string): boolean {
+  const i = provisionalQueue.indexOf(text);
+  if (i < 0) return false;
+  provisionalQueue.splice(i, 1);
+  return true;
+}
 let provisionalTimer: ReturnType<typeof setTimeout> | undefined;
 // Text typed into a provisional tab whose create had to ask something first, waiting for the retry's tab.
 let pendingCarry = "";
@@ -13123,6 +13133,11 @@ window.addEventListener("message", (e: MessageEvent) => {
     const stash = pendingCancelRestores.get(key);
     pendingCancelRestores.delete(key);
     if (!m.ok) {
+      // evidence for the next report (T244): which cancel missed, and whether a composer restore was in play
+      // — body LENGTH only, never the text: not even the kernel's refusal sentence, which quotes the body's
+      // leading token when it starts with "/" (a path-first message would land in the log)
+      vscodeApi?.postMessage({ type: "clientDiag", surface: "chat", what: "cancel-miss",
+                               data: { sid: m.id, mdLen: typeof m.md === "string" ? m.md.length : -1, hadRestore: !!stash } });
       if (typeof m.text === "string" && m.text) warnToast(m.text);
       if (stash && m.id === activeId) {
         const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
@@ -14381,17 +14396,25 @@ setupSettings();
         if (i >= 0) { list.splice(i, 1); if (list.length) pendingSent.set(sidQ, list); else pendingSent.delete(sidQ); }
         echoShownSig.delete(sidQ);
       }
+      // a PROVISIONAL tab's send has never left the client (T244): forget it from the queue adoption would
+      // re-send, and post no kernel cancel — the kernel has no such session yet, and a miss there would
+      // toast "too late" for a message that was never late. A breadcrumb says which path this ✕ took.
+      const provisional = isProvisionalId(sidQ);
+      if (provisional && qmd) forgetProvisionalSend(qmd);
       const msg: Record<string, unknown> = { type: "cancelQueued", id: sidQ, md: qmd };
       if (el.dataset.qidx !== undefined) msg.idx = Number(el.dataset.qidx);
       if (el.dataset.qpark !== undefined) msg.park = Number(el.dataset.qpark);
-      vscodeApi.postMessage(msg);
+      if (!provisional) vscodeApi.postMessage(msg);
+      else vscodeApi.postMessage({ type: "clientDiag", surface: "chat", what: "cancel-provisional",
+                                  data: { mdLen: qmd ? qmd.length : -1, queuedLeft: provisionalQueue.length } });
       if (qmd && el.dataset.qcmd !== "1" && el.dataset.qromp !== "1") {
         // a message returns to the composer; a command just cancels. The restore is optimistic — stash
         // the composer's before/after so the kernel's cancelResult ok:false can undo it (untouched only).
         const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
         const before = ta ? ta.value : "";
         restoreToComposer(qmd);
-        pendingCancelRestores.set(activeId + " " + qmd, { before, after: ta ? ta.value : "" });
+        // a provisional ✕ gets no cancelResult (nothing was posted) — no stash to consume, none kept
+        if (!provisional) pendingCancelRestores.set(activeId + " " + qmd, { before, after: ta ? ta.value : "" });
       }
       // Optimistic; the next push rebuilds the queue without it. The GROUP is reflowed in the same breath —
       // the bubble alone leaves its "1 queued message" header behind, still counting what just went.

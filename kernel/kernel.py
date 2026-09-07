@@ -11143,6 +11143,10 @@ def _drive(msg, client):
             err2 = _cancel_backend_queued(be, sid, -1, md)
             if err2 is None:
                 err = None
+        if err:
+            # evidence for the next report (T244): a ✕ whose cancel found nothing in either queue — the send
+            # had already gone through, or never reached this kernel. sid only: the body is the user's text
+            sys.stderr.write("queued-cancel miss: %s (body-only)\n" % sid)
         client["send"](json.dumps({"type": "cancelResult", "ok": not err, "id": sid,
                                    "md": md, "text": err or ""}))
         _push_soon()
