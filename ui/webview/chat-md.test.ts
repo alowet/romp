@@ -92,7 +92,7 @@ test("the user bubble renders the user's OWN words with userMd, harness notes an
   assert.doesNotMatch(RENDER, /bubble\.innerHTML = md\(ev\.md\);/, "no user bubble left on the soft-wrap grammar");
   // the queued / optimistic bubble is the same message a beat earlier — same renderer, so the swap to the
   // landed bubble changes nothing on screen
-  assert.match(RENDER, /if \(!isCmd\) bubble\.innerHTML = userMd\(t\.md\);/);
+  assert.match(RENDER, /if \(!t\.romp && !isCmd\) bubble\.innerHTML = userMd\(t\.md\);/);
   assert.doesNotMatch(RENDER, /bubble\.innerHTML = md\(t\.md\);/);
   // romp-authored surfaces keep the assistant grammar: nudges, notices, the Continue gesture, tagged sends
   assert.match(RENDER, /full\.innerHTML = md\(raw\);/, "the romp nudge fold");

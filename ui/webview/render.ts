@@ -158,7 +158,7 @@ type ChatEvent = (
   // `held` DOES come from the kernel (_limit_hold): the queue is stuck on the ACCOUNT rather than on this
   // session — a usage limit or a monthly spend cap holds every send — so the head names what it is waiting
   // for, and how long is left when the API reported a reset (the user 2026-07-24).
-  | { kind: "queued"; texts: { md: string; followUp?: boolean; goal?: string; fuCtx?: string; idx?: number; park?: number; cancelable?: boolean; optimistic?: boolean; imgPaths?: string[] }[]; ts?: string; uuid?: string; bare?: boolean; held?: { reason: string; resetsAt?: number | null; what: string; detail?: string } }   // imgPaths: an optimistic echo's dragged-image attachments → thumbnails, the landed form's own renderer (the user 2026-08-25)
+  | { kind: "queued"; texts: { md: string; followUp?: boolean; goal?: string; fuCtx?: string; idx?: number; park?: number; cancelable?: boolean; optimistic?: boolean; romp?: boolean; rompSystem?: boolean; rompAuto?: boolean; imgPaths?: string[] }[]; ts?: string; uuid?: string; bare?: boolean; held?: { reason: string; resetsAt?: number | null; what: string; detail?: string } }   // imgPaths: an optimistic echo's dragged-image attachments → thumbnails, the landed form's own renderer (the user 2026-08-25)
   // The turn stopped on an API error (event-based: transcript isApiErrorMessage). The session is BLOCKED
   // until retried — a red-dot card at the bottom with a Retry button (the user 2026-06-16).
   | { kind: "apiError"; text: string; status?: number; ts?: string; uuid?: string }
@@ -3421,8 +3421,10 @@ function renderSlashCmd(bubble: HTMLElement, text: string): boolean {
 // a "message" — the user 2026-07-01).
 // The "N queued …" count. Shared with the ✕'s immediate recount so the number on screen can never drift
 // from the bubbles under it while the cancel is in flight.
-function queuedCountText(n: number, nCmd: number): string {
-  const noun = nCmd === n ? "command" : nCmd === 0 ? "message" : "item";
+function queuedCountText(n: number, nCmd: number, nRomp = 0): string {
+  // a notice romp itself queued is neither the user's message nor a command (T243): all notices → "notice";
+  // a notice among the user's messages → the mixed "item", never a claim of N "messages"
+  const noun = nCmd === n ? "command" : nRomp === n ? "notice" : (nCmd === 0 && nRomp === 0) ? "message" : "item";
   return `${n} queued ${noun}${n === 1 ? "" : "s"}`;
 }
 
@@ -3439,7 +3441,8 @@ function reflowQueuedGroup(turn: HTMLElement): void {
     return;
   }
   const nCmd = bubbles.filter((b) => b.querySelector(".slash-cmd-chip")).length;
-  label.textContent = queuedCountText(bubbles.length, nCmd) + (label.dataset.why || "");
+  const nRomp = bubbles.filter((b) => b.classList.contains("queued-romp")).length;
+  label.textContent = queuedCountText(bubbles.length, nCmd, nRomp) + (label.dataset.why || "");
 }
 
 function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
@@ -3463,6 +3466,7 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
   if (!ev.bare) {
     const n = ev.texts.length;
     const nCmd = ev.texts.filter((t) => SLASH_CMD_RE.test(t.md)).length;
+    const nRomp = ev.texts.filter((t) => !!t.romp).length;
     const head = el("div", "queued-head");
     head.appendChild(hourglassIcon());
     // While a question is pending, say WHAT it's waiting on: a message you'd already written when the picker
@@ -3480,7 +3484,7 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
       : askNote;
     const label = el("span", "queued-count");
     label.dataset.why = why;      // the ✕'s recount rewrites the count and keeps this suffix as-is
-    label.textContent = queuedCountText(n, nCmd) + why;
+    label.textContent = queuedCountText(n, nCmd, nRomp) + why;
     // `detail` is the CLI's OWN sentence about the limit (it carries the reset time as a wall clock, which
     // is why that flavor has no epoch to count down to). One level deeper on hover, per the compact-by-
     // default rule — the head keeps its one-line reason.
@@ -3490,7 +3494,7 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
   }
   for (const t of ev.texts) {
     if (t.followUp) turn.appendChild(followUpHeader(t.goal, t.fuCtx, t.idx !== undefined ? "q:" + t.idx : undefined));
-    const bubble = el("div", "queued-bubble md" + (t.cancelable ? " cancelable" : ""));
+    const bubble = el("div", "queued-bubble md" + (t.cancelable ? " cancelable" : "") + (t.romp ? " queued-romp" : ""));
     // one phrase separating OUR unconfirmed echo from a real queued message, which the session has accepted
     // and is holding (the user 2026-07-16)
     if (t.optimistic) bubble.title = "sent just now — romp hasn't confirmed the session has it yet";
@@ -3500,7 +3504,21 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
     else if (!t.cancelable && t.idx !== undefined)
       bubble.title = "queued in the session — it can't be recalled, and joins the conversation at the session's next step";
     const isCmd = renderSlashCmd(bubble, t.md);
-    if (!isCmd) bubble.innerHTML = userMd(t.md);   // the user's words, newlines kept — byte-for-byte what the landed bubble shows
+    if (t.romp) {
+      // a notice romp itself queued (a watch notice, a restart notice, a nudge) wears the LANDED romp grammar
+      // (T243, the user 2026-09-07): the same gray notice card the landed message becomes — chip, gist line,
+      // marker tail and "[romp]" prefix hidden, the full text one caret away — nested inside the queued bubble
+      // so the group's header, the ✕ and the recount keep working unchanged
+      const text = t.md.replace(/<!--[\s\S]*?-->/g, "").replace(/^\s*\[romp\]\s*/i, "").trim();
+      const firstLine = (text.split("\n").find((l) => l.trim()) || text).trim();
+      const gist = firstLine.length > 90 ? firstLine.slice(0, 88).replace(/\s+\S*$/, "") + "…" : firstLine;
+      const nb = el("div", "notice-md md");
+      nb.innerHTML = md(text);
+      bubble.appendChild(noticeCard({ variant: "romp", chip: "romp", logo: true, head: gist, body: nb,
+                                      collapsible: collapseWs(text) !== collapseWs(gist),
+                                      key: "qromp:" + gist.slice(0, 60), nested: true }));
+    }
+    if (!t.romp && !isCmd) bubble.innerHTML = userMd(t.md);   // the user's words, newlines kept — byte-for-byte what the landed bubble shows
     // An optimistic echo's dragged images render as THUMBNAILS, not just their trailing paths (the
     // user 2026-08-25: composer preview → path-only provisional → thumbnail landing flashed). Same
     // machinery end to end: userImage with the landed form's exact "path:" shape — buildPathImg's
@@ -3518,8 +3536,9 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
     if (t.cancelable && (t.idx !== undefined || t.park !== undefined || t.optimistic)) {
       const x = el("button", "queued-x");
       x.textContent = "✕";
-      x.title = isCmd ? "cancel this queued command" : "cancel this queued message and move it back to the composer";
+      x.title = t.romp ? "cancel this queued notice" : isCmd ? "cancel this queued command" : "cancel this queued message and move it back to the composer";
       x.dataset.act = "qx";
+      if (t.romp) x.dataset.qromp = "1";   // romp's words, not the user's: cancelling never restores it to the composer (T243)
       if (t.idx !== undefined) x.dataset.qidx = String(t.idx);
       if (t.park !== undefined) x.dataset.qpark = String(t.park);
       if (t.optimistic) x.dataset.qopt = "1";   // ✕ before confirmation → cancel-by-body (no park/idx yet)
@@ -14290,7 +14309,7 @@ setupSettings();
       if (el.dataset.qidx !== undefined) msg.idx = Number(el.dataset.qidx);
       if (el.dataset.qpark !== undefined) msg.park = Number(el.dataset.qpark);
       vscodeApi.postMessage(msg);
-      if (qmd && el.dataset.qcmd !== "1") {
+      if (qmd && el.dataset.qcmd !== "1" && el.dataset.qromp !== "1") {
         // a message returns to the composer; a command just cancels. The restore is optimistic — stash
         // the composer's before/after so the kernel's cancelResult ok:false can undo it (untouched only).
         const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;

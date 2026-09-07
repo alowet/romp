@@ -17043,6 +17043,22 @@ def _genuine_queued(text):
     return not ("romp-msg-id" in t or t.startswith("####################") or "\U0001F4EC" in t)
 
 
+def _queued_romp_flags(text):
+    """The flags a LANDED romp-injected message gets from its markers (romp / rompSystem / rompAuto — see the
+    user-event build), read off a QUEUED text so the client can draw the same gray romp notice grammar for a
+    notice romp itself queued (T243, the user 2026-09-07: a queued watch notice wore the user's own pending
+    bubble). The markers stay in the text; the client hides them the way the landed card does."""
+    t = text or ""
+    out = {}
+    if "<!-- romp-injected -->" in t:
+        out["romp"] = True
+    if "<!-- romp-system -->" in t:
+        out["rompSystem"] = True
+    if "<!-- romp-auto -->" in t:
+        out["rompAuto"] = True
+    return out
+
+
 def _postal_shaped(text):
     """True when `text` is AGENT MAIL by shape — a postal banner (romp-msg-id / the #### rule / the mailbox
     glyph), the same recognizers _genuine_queued uses to keep agent mail out of the user's queued chip. The
@@ -23908,7 +23924,7 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                 # backend _pending position for cancelQueued.
                 continue
             goal, body, fu, ctx = _split_followup(t)
-            m = {"md": body, "idx": i, "cancelable": cancelable}   # idx ↔ the backend's _pending position (cancelQueued)
+            m = {"md": body, "idx": i, "cancelable": cancelable, **_queued_romp_flags(t)}   # idx ↔ the backend's _pending position (cancelQueued)
             if fu:
                 m["followUp"] = True
                 if goal:
@@ -23925,7 +23941,7 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
         # romp-owned on EVERY backend — `park` is the op's _pending_ops position, and the body doubles as
         # the ✕ handshake (_parked_md/_cancel_parked verify it so a shifted queue never drops the wrong op).
         for j, op in enumerate(pending_ops):
-            m = {"md": _parked_md(op), "park": j, "cancelable": True}
+            m = {"md": _parked_md(op), "park": j, "cancelable": True, **(_queued_romp_flags(op[1]) if op[0] == "send" else {})}
             if op[0] == "send":
                 goal, _, fu, ctx = _split_followup(op[1])
                 if fu:
