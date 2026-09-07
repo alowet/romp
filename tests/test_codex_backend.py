@@ -301,8 +301,11 @@ class ApprovalModes(unittest.TestCase):
             self.assertEqual(be._handle_approval(method, {}), {"decision": "decline"})
         self.assertEqual(be._handle_approval("item/permissions/requestApproval", {}),
                          {"permissions": {}, "scope": "turn"})
-        with self.assertRaises(RuntimeError):
-            be._handle_approval("unknown/requestApproval", {})
+        # an UNKNOWN request answers the SDK's own default, `{}` — never a raise: the handler runs inline on
+        # the SDK's single reader thread, and a raise there ends the reader and fails every Codex session's
+        # in-flight turn at once (review find on #930, 2026-09-07); the app-server reads an empty approval
+        # answer as a denial, scoped to that one request
+        self.assertEqual(be._handle_approval("unknown/requestApproval", {}), {})
         self.assertTrue(notices)
         self.assertTrue(all(msg["type"] == "warn" for msg in notices))
 

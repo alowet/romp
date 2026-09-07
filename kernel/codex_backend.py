@@ -601,8 +601,15 @@ class CodexBackend:
             return {"permissions": {}, "scope": "turn"}
         if method == "item/tool/requestUserInput":
             return {"answers": {}}
-        # Unknown reply schemas must fail the transport rather than accidentally grant access.
-        raise RuntimeError("Unsupported Codex server request: %s" % method)
+        # An UNKNOWN server request must not raise: the pinned SDK invokes this handler inline on its single
+        # stdout reader thread, whose loop has no per-request error handling — a raise ends the reader
+        # (`except BaseException: router.fail_all`), no JSON-RPC reply is ever written, and every in-flight
+        # request and turn of EVERY Codex session fails at once (review find on #930, 2026-09-07). Answer the
+        # SDK's own default for an unrecognised method, `{}`: the app-server's parse fallbacks read an empty
+        # or malformed approval answer as a denial (deny / decline / empty at 0.153.3), scoped to that one
+        # request, so nothing is granted and the transport stays up. Loud on the log and the session.
+        self.log("unknown Codex server request %s declined with an empty answer; no permission granted" % method)
+        return {}
 
     def _check_auth(self, client):
         """A missing `codex login` must surface as text on the session, not as a hung turn."""
