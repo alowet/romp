@@ -43,6 +43,7 @@ class Redelivery(unittest.TestCase):
             state_dir = None
             _live = {}
             _reg_lock = __import__("threading").RLock()
+            _live_lock = __import__("threading").RLock()   # the live tail's lock (_mark_dropped_echoes selects under it)
             _persisted = []
             _logs = []
 

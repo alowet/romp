@@ -2734,9 +2734,11 @@ class SdkSession:
         legitimately be in flight (the user 2026-07-01, who switched the model on a new session and it
         said working indefinitely). A reconnect abandons the previous client; a turn it left in flight
         can NEVER get its ResultMessage on the new connection — so inflight, and the "working" signal it
-        drives, would be stranded elevated FOREVER. request_reconnect defers while inflight>0, but a race
-        (it fired at inflight==0, then the input generator fed a turn before the teardown ran) can still
-        strand a turn here: settle the counters to idle. A not-yet-STARTED _pending turn survives as
+        drives, would be stranded elevated FOREVER. request_reconnect defers while inflight>0, and
+        inputs() holds the queue once a reconnect is armed (2026-09-06: that closed, at the feed, the
+        race this guarded — the arm at inflight==0, then the feeder fed a turn before the teardown
+        ran); this stays as the backstop for anything that still strands a turn here: settle the
+        counters to idle. A not-yet-STARTED _pending turn survives as
         before (never fed to the dead client; the new inputs() re-feeds it). No-op on the first connect
         and on a clean reconnect. Event-based on the reconnect itself, not a time/age heuristic.
 
@@ -3247,6 +3249,16 @@ class SdkSession:
                     # would land it on the un-rewound branch (the exact wrong-branch delivery this guards)
                     blocked = blocked or bool(self._rewind_to and not self._rewind_armed)
                     blocked = blocked or self._ping_feeding   # the ping's record must not share its window
+                    # a reconnect is ARMED (_reconnect: the waker is about to tear this client down) →
+                    # hold the head for the NEXT client. The settle wakes this feeder and arms a deferred
+                    # reconnect in the same finally, both wakeups queued FIFO on the loop, so without
+                    # this hold the feeder ran first and fed a message gate-held behind an interrupted
+                    # turn to the dying client; the teardown stranded it in flight and
+                    # _reconcile_stranded, on a resumable conversation, flagged it 'never delivered'
+                    # (2026-09-06). The same hold covers the idle arm in
+                    # _do_request_reconnect racing a send that lands before the waker runs. The loop's
+                    # top clears _reconnect before the new client's inputs() is created.
+                    blocked = blocked or self._reconnect
                     # a parked deploy restart is DRAINING (T121): hold NEW turn starts — the queued
                     # prompt persists (the checkpoint) and /busy falls to 0 on this box's own
                     # turn-end events. Mid-turn forwards keep flowing (inflight > 0), so the
@@ -4966,24 +4978,35 @@ def _path_bearing(text: str) -> bool:
     return bool(_PATHY_RE.search(text or ""))
 
 
-def _evict_live_overflow(d: dict, cap: int = LIVE_TAIL_CAP) -> None:
+def _evict_live_overflow(d: dict, cap: int = LIVE_TAIL_CAP) -> int:
     """Bound a session's in-memory live tail when no client ever drains/prunes it — but never at the
     cost of an INPUT ECHO or a command-feedback line. A stream WORK atom is disposable (the transcript
     supersedes it by uuid within a second), but an echo is the ONLY record of a send the transcript
     hasn't caught up on — evicting it makes an in-flight or dropped message silently invisible (the
     user 2026-07-20: a reply vanished from the chat with no trace). Oldest work atoms go first; only
     in the pathological all-echo case does the cap fall back to evicting oldest-regardless, because a
-    bounded store still beats an unbounded leak."""
+    bounded store still beats an unbounded leak.
+
+    Sweeps a SNAPSHOT of the items and pops with a default: the tail is shared with the kernel thread
+    (see SdkBackend._note_live_tail_race), which may retire a key between the snapshot and the pop.
+    Returns how many keys had vanished that way, for the caller to report."""
     if len(d) <= cap:
-        return
-    for k in list(d.keys()):
+        return 0
+    vanished = 0
+    for k, a in list(d.items()):
         if len(d) <= cap:
-            return
-        a = d[k]
+            return vanished
         if not a.get("_echo_text") and not a.get("command"):
-            del d[k]
+            if d.pop(k, None) is None:
+                vanished += 1
     while len(d) > cap:
-        del d[next(iter(d))]
+        try:
+            k = next(iter(d))
+        except StopIteration:        # emptied under us
+            break
+        if d.pop(k, None) is None:
+            vanished += 1
+    return vanished
 
 
 # ---------------------------------------------------------------------------
@@ -5028,6 +5051,21 @@ class SdkBackend:
         #                                           the exact "the live tail moved" event the kernel's active-tab
         #                                           cache keys on (2026-09-03); bumped by _touch_live at every
         #                                           mutation site, never read as a value beyond equality
+        # THE LIVE-TAIL LOCK (2026-09-06). `_live` and every per-sid dict inside it are shared by the
+        # kernel thread (send, recall, dismiss_echo, the pusher's live_atoms/prune_live) and each
+        # session's loop thread (_forward, the settle's retire_live_work, _mark_dropped_echoes at
+        # spawn/reconnect). Lock-free, the sweeps read `d[k]` off stale key lists (KeyError ended a
+        # session's CLI), _persist_echoes and _mark_dropped_echoes walked a dict the other thread was
+        # resizing (RuntimeError: out of the pusher's build; out of the session thread at reconnect),
+        # and `if not d: _live.pop(sid)` was two steps, so an atom stashed between them landed in a
+        # dict nothing could reach. The rule: every write to the tail (a stash, a pop, the sid-level
+        # pop) and every read that iterates it happens under this lock; iteration walks a snapshot
+        # taken under it; the emptiness check and the sid-level pop are one step under it; and the
+        # lock is never held across I/O (a reg write, a transcript read, the orphan-reply append) or
+        # a callback (the pusher wake, a state mark) — copy under the lock, act outside. Re-entrant
+        # so a locked site may call a helper that locks. The class attribute below is the default
+        # for __new__-built test doubles.
+        self._live_lock = threading.RLock()
         self._rl_lock = threading.Lock()          # serializes usage.json read-merge-write (_record_rate_limit)
         self._drain_hold_until = 0.0              # deploy-drain lease (T121): RUNTIME-ONLY — a fresh boot starts clear by construction
         self._drain_hold_since = 0.0
@@ -6803,11 +6841,14 @@ class SdkBackend:
             return None
         text = s.unqueue(idx, expect)
         if text is not None:
-            live = self._live.get(sid) or {}
-            for k, a in list(live.items()):                # snapshot: the live-tail thread may mutate concurrently
-                if a.get("_echo_text") == text:
-                    live.pop(k, None)                      # one echo per canceled message
-                    break
+            with self._live_lock:                          # find + pop + the sid-level pop, one step
+                live = self._live.get(sid) or {}
+                for k, a in list(live.items()):
+                    if a.get("_echo_text") == text:
+                        live.pop(k, None)                  # one echo per canceled message
+                        break
+                if not live and self._live.get(sid) is live:
+                    self._live.pop(sid, None)
             self._persist_echoes(sid)                      # the canceled echo leaves the restart mirror too
             self._wake_push()                              # repaint without the echo so it stops reading as sent
         return text
@@ -6866,8 +6907,7 @@ class SdkBackend:
             "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
         if injected and "<!-- romp-auto -->" in text:
             echo["rompAuto"] = True                          # auto-nudge → romp-logo on the chat/timeline
-        self._live.setdefault(sid, {})[key] = echo
-        self._touch_live(sid)
+        self._stash_live(sid, key, echo)
         self._persist_echoes(sid)                            # unlanded echoes survive a kernel restart (reg mirror)
         self._wake_push()
         return True
@@ -6880,11 +6920,17 @@ class SdkBackend:
         echo died with the kernel, and the message vanished with NO trace anywhere. With the mirror, the
         reseeded echo persists unanswered in the chat, so the LOSS is visible and the user can resend.
         Command-feedback lines (/model etc.) are deliberately not mirrored — replaying a stale confirmation
-        after a restart would assert something that may no longer be true."""
-        d = self._live.get(sid) or {}
-        snap = [{"t": a.get("t", 0), "text": a["_echo_text"], "author": a.get("author") or "human",
-                 "rompAuto": bool(a.get("rompAuto")), "dropped": bool(a.get("dropped"))}
-                for a in d.values() if a.get("_echo_text") and not a.get("command")]
+        after a restart would assert something that may no longer be true.
+
+        The walk is under the live-tail lock (the reg write is not): reached from prune_live on the
+        kernel thread while the session thread stashes and retires atoms, an unlocked walk raised
+        `RuntimeError: dictionary changed size during iteration` out of the pusher's chat build —
+        every client missed that cycle and nothing reached the error center (2026-09-06)."""
+        with self._live_lock:
+            d = self._live.get(sid) or {}
+            snap = [{"t": a.get("t", 0), "text": a["_echo_text"], "author": a.get("author") or "human",
+                     "rompAuto": bool(a.get("rompAuto")), "dropped": bool(a.get("dropped"))}
+                    for a in list(d.values()) if a.get("_echo_text") and not a.get("command")]
         try:
             self._update_reg(sid, echoes=snap)
         except Exception as e:
@@ -6913,8 +6959,7 @@ class SdkBackend:
                     atom["rompAuto"] = True
                 if e.get("dropped"):
                     atom["dropped"] = True
-                self._live.setdefault(reg["sid"], {})[key] = atom
-                self._touch_live(reg["sid"])
+                self._stash_live(reg["sid"], key, atom)
             if self._live.get(reg["sid"]):
                 self._mark_dropped_echoes(reg["sid"], reg.get("queue") or [])
 
@@ -6936,13 +6981,19 @@ class SdkBackend:
         kept the first, exactly the duplicate that branch refuses by design. The loss still surfaces in
         full (the dropped flag); only the queue re-add is withheld. Boot and dead-spawn callers keep the
         default: no client survived there to have landed anything."""
-        d = self._live.get(sid)
-        if not d:
-            return
         qs = {q for q in queued_texts if isinstance(q, str)}
-        newly = [a for a in d.values()
-                 if a.get("_echo_text") and not a.get("command") and not a.get("dropped")
-                 and a["_echo_text"] not in qs]
+        # The selection is under the live-tail lock; everything after it (the transcript scan, the
+        # queue re-add, the reg write) is not. This runs on the SESSION thread at spawn and at every
+        # reconnect, outside the connect's try — while the kernel thread's send() stashes an echo into
+        # the same dict. Unlocked, the comprehension raised RuntimeError there and the session thread
+        # died with no reconnect (2026-09-06).
+        with self._live_lock:
+            d = self._live.get(sid)
+            if not d:
+                return
+            newly = [a for a in list(d.values())
+                     if a.get("_echo_text") and not a.get("command") and not a.get("dropped")
+                     and a["_echo_text"] not in qs]
         if not newly:
             return
         # RE-DELIVER, don't just flag (the user 2026-08-23, their strongest point in the restart
@@ -7046,19 +7097,24 @@ class SdkBackend:
         only: a live (pending) echo is the sole visible record of an in-flight send and must stay until
         it lands or its loss is proven. Returns the retired text, or None on a miss (already gone —
         idempotent; the next push simply paints without it)."""
-        live = self._live.get(sid) or {}
-        for k, a in list(live.items()):                    # snapshot: the live-tail thread may mutate concurrently
-            if not (a.get("_echo_text") and a.get("dropped")):
-                continue
-            if (uuid is not None and k == uuid) or (t is not None and int(a.get("t") or 0) == t):
-                live.pop(k, None)
-                self._touch_live(sid)
-                if not live:
-                    self._live.pop(sid, None)
-                self._persist_echoes(sid)
-                self._wake_push()
-                return a.get("_echo_text")
-        return None
+        hit = None
+        with self._live_lock:                              # find + pop + the sid-level pop, one step
+            live = self._live.get(sid) or {}
+            for k, a in list(live.items()):
+                if not (a.get("_echo_text") and a.get("dropped")):
+                    continue
+                if (uuid is not None and k == uuid) or (t is not None and int(a.get("t") or 0) == t):
+                    live.pop(k, None)
+                    self._touch_live(sid)
+                    if not live and self._live.get(sid) is live:
+                        self._live.pop(sid, None)
+                    hit = a
+                    break
+        if hit is None:
+            return None
+        self._persist_echoes(sid)                          # the reg write and the wake, outside the lock
+        self._wake_push()
+        return hit.get("_echo_text")
 
     def rewind(self, sid: str, target_uuid: str, text: str) -> "tuple[bool, str]":
         """Rewind the conversation to `target_uuid` (a transcript record uuid the KERNEL has validated:
@@ -7914,10 +7970,10 @@ class SdkBackend:
         a dormant session."""
         t = int(time.time())
         uid = "cmd:%d:%s" % (t, command.lstrip("/"))
-        self._live.setdefault(sid, {})[uid] = {
+        self._stash_live(sid, uid, {
             "type": "user", "uuid": uid, "session_id": sid, "fsid": fsid, "parentUuid": None,
             "t": t, "author": "human", "command": command, "_echo_text": disp,
-            "message": {"role": "user", "content": [{"type": "text", "text": disp}]}}
+            "message": {"role": "user", "content": [{"type": "text", "text": disp}]}})
         append_cmd_gesture(self.state_dir, sid, disp, t=t)
         self._wake_push()
 
@@ -8406,6 +8462,44 @@ class SdkBackend:
         replays durably to chat clients — and so the poll never clobbers it with an askLiveClear."""
         return self._pending_ask.get(sid)
 
+    _live_tail_race_seen: set = set()          # sweep sites that saw a key vanish mid-sweep, per kernel life
+    _live_tail_race_lock = threading.Lock()
+    _live_lock = threading.RLock()             # the default for __new__-built test doubles; __init__ gives
+    #                                            each backend its own (the rule is documented there)
+
+    def _note_live_tail_race(self, site: str) -> None:
+        """A live-tail sweep, holding the live-tail lock, found a key gone between its snapshot and its
+        pop. Before the lock (2026-09-06) the tail (`self._live[sid]`) was a plain dict shared by two
+        threads: the session's loop thread added atoms (_forward) and retired them at the settle
+        (retire_live_work), the kernel thread pruned landed ones during a chat build (prune_live), and
+        each sweep walked a stale key list and read `d[k]` — so when the kernel thread pruned a
+        just-landed reply while the settle sweep still held its uuid, `KeyError: '<message uuid>'`
+        escaped _on_message and ended the receive loop, which tore the CLI down mid-work (the in-flight
+        turn, its subagents and its background tasks went with it). The lock (`_live_lock`,
+        see __init__) is the fix; the sweeps still walk a snapshot and pop with a default, so a key
+        that vanishes anyway costs nothing — and it is reported, ONCE per site per kernel life, because
+        under the lock it can only mean a mutator changed the tail without taking it: a fix that made
+        that invisible would hide the next thing that shares this dict. (retire_live_work does not
+        report: it releases the lock for the orphan salvage's transcript read, and a key gone at its
+        pop is a landing prune_live filed in that window — expected, not a fault.)"""
+        with SdkBackend._live_tail_race_lock:
+            if site in SdkBackend._live_tail_race_seen:
+                return
+            SdkBackend._live_tail_race_seen.add(site)
+        self._log("live tail (%s): a message-uuid key vanished between the sweep's snapshot and its pop "
+                  "with the live-tail lock held — something changed the tail without taking _live_lock. "
+                  "Harmless here: the sweep continued (before 2026-09-06 this KeyError ended the "
+                  "session's receive loop and its CLI). Reported once per site per kernel life." % site,
+                  problem=True)
+
+    def _stash_live(self, sid: str, key: str, atom: dict) -> None:
+        """Add one atom to the sid's live tail — the ONE way a key enters it from outside _forward
+        (send's echo, the boot reseed, the /model chip). Under the live-tail lock, so the stash can
+        never land in a dict a sweep is popping from `_live` in the same instant."""
+        with self._live_lock:
+            self._live.setdefault(sid, {})[key] = atom
+            self._touch_live(sid)
+
     def _forward(self, sess: SdkSession, msg):
         # LIVE TAIL: translate the streamed message to an atom and stash it in memory, AHEAD of the
         # transcript on disk (the SDK stream leads the disk write), then wake the kernel's pusher for an
@@ -8415,10 +8509,13 @@ class SdkBackend:
         if not (atom and atom.get("uuid")):
             return
         _note_skill_tool_ids(atom, sess._skill_tool_ids)   # a Skill tool_use arms its payload's classification
-        d = self._live.setdefault(sess.sid, {})
-        d[atom["uuid"]] = atom
-        _evict_live_overflow(d)                  # safety cap if no client ever drains/prunes — never an echo
-        self._touch_live(sess.sid)
+        with self._live_lock:
+            d = self._live.setdefault(sess.sid, {})
+            d[atom["uuid"]] = atom
+            vanished = _evict_live_overflow(d)   # safety cap if no client ever drains/prunes — never an echo
+            self._touch_live(sess.sid)
+        if vanished:
+            self._note_live_tail_race("_evict_live_overflow")
         # The stream is the AUTHORITATIVE busy signal: a genuine WORK atom (streamed assistant/tool
         # output — not an input echo, not a /model-style command line) means the CLI is producing RIGHT
         # NOW, so re-assert 'working' if a prior state write settled ahead of it (e.g. a separate turn
@@ -8465,8 +8562,10 @@ class SdkBackend:
 
     def live_atoms(self, sid: str) -> list:
         """The session's in-memory live-tail atoms (newest last), for build_session to merge ahead of disk."""
-        d = self._live.get(sid)
-        return sorted(d.values(), key=lambda a: a.get("t", 0)) if d else []
+        with self._live_lock:                      # the pusher's read: copy under the lock, sort outside
+            d = self._live.get(sid)
+            vals = list(d.values()) if d else []
+        return sorted(vals, key=lambda a: a.get("t", 0))
 
     def prune_live(self, sid: str, tx_uuids, tx_user_texts=(), human_floor: int = 0) -> None:
         """Drop live atoms the transcript has now caught up on — by uuid (assistant/tool/user from the
@@ -8481,10 +8580,11 @@ class SdkBackend:
         can be neither queued nor landed, and the blanket floor hid exactly that in-flight message the
         moment any other human record landed. A plain-text echo now prunes ONLY by its own text landing —
         and a genuinely dropped send's echo PERSISTS, so the loss shows (the tmux echo's semantics).
-        (Echo-only: real stream atoms have no _echo_text and prune by uuid as before.)"""
-        d = self._live.get(sid)
-        if not d:
-            return
+        (Echo-only: real stream atoms have no _echo_text and prune by uuid as before.)
+
+        Pure dict work, so the whole sweep runs under the live-tail lock (the emptiness check and the
+        sid-level pop included — one step, so a stash can never land in a dict this pops); the echo
+        mirror's reg write follows outside it."""
         # `tx_user_texts` may be a MAPPING text → the newest record time carrying it (the kernel's
         # _merge_live_atoms ships that since T237b): an echo then lands by text only through a record
         # written AT OR AFTER its own send — a fork copies the parent's history, and "ok" / "go ahead" /
@@ -8498,23 +8598,30 @@ class SdkBackend:
                 return et in tx_user_texts
             return et in text_t and float(text_t[et] or 0) >= float(a.get("t") or 0)
         echo_removed = False
-        for k in list(d.keys()):
-            a = d[k]
-            et = a.get("_echo_text")
-            landed = a.get("uuid") in tx_uuids or _by_text(a, et)
-            stale_echo = (bool(et) and human_floor and a.get("t", 0) <= human_floor
-                          and not a.get("command") and _path_bearing(et))
-            # A COMMAND atom (the CLI's streamed /model, /compact feedback) from a TURN-LESS control
-            # request may never get a transcript record to land against — retire it once a genuine human
-            # turn postdates it, so the stale confirmation line doesn't ride pinned inside every later
-            # turn forever (the user 2026-07-02, with the live_work command exemption).
-            stale_cmd = bool(a.get("command")) and human_floor and a.get("t", 0) <= human_floor
-            if landed or stale_echo or stale_cmd:
-                echo_removed = echo_removed or bool(et and not a.get("command"))
-                del d[k]
-                self._touch_live(sid)
-        if not d:
-            self._live.pop(sid, None)
+        vanished = 0
+        with self._live_lock:
+            d = self._live.get(sid)
+            if not d:
+                return
+            for k, a in list(d.items()):   # a SNAPSHOT (belt-and-braces under the lock — _note_live_tail_race)
+                et = a.get("_echo_text")
+                landed = a.get("uuid") in tx_uuids or _by_text(a, et)
+                stale_echo = (bool(et) and human_floor and a.get("t", 0) <= human_floor
+                              and not a.get("command") and _path_bearing(et))
+                # A COMMAND atom (the CLI's streamed /model, /compact feedback) from a TURN-LESS control
+                # request may never get a transcript record to land against — retire it once a genuine human
+                # turn postdates it, so the stale confirmation line doesn't ride pinned inside every later
+                # turn forever (the user 2026-07-02, with the live_work command exemption).
+                stale_cmd = bool(a.get("command")) and human_floor and a.get("t", 0) <= human_floor
+                if landed or stale_echo or stale_cmd:
+                    echo_removed = echo_removed or bool(et and not a.get("command"))
+                    if d.pop(k, None) is None:
+                        vanished += 1
+                    self._touch_live(sid)
+            if not d and self._live.get(sid) is d:
+                self._live.pop(sid, None)
+        if vanished:
+            self._note_live_tail_race("prune_live")
         if echo_removed:
             self._persist_echoes(sid)   # keep the restart mirror in step (empty once everything landed)
 
@@ -8526,44 +8633,52 @@ class SdkBackend:
         belongs to an attempt that produced NO transcript record (an API-errored/rate-limited try, a
         killed process). Left in place it is merged forever, and its live_work forces the turn open —
         the chat chip read WORKING with a 3h20m timer on a session whose turn died in a usage-limit
-        retry storm, while the timeline lane said READY (the user 2026-07-03)."""
-        d = self._live.get(sid)
-        if not d:
-            return
-        for k in list(d.keys()):
-            a = d[k]
-            if not a.get("_echo_text") and not a.get("command"):
-                # An assistant atom carrying real TEXT that never landed on disk is a reply the user WATCHED
-                # stream but the transcript dropped (an API-errored try — the CLI discards the partial and the
-                # retry writes a fresh record with a new uuid). Persist it durably BEFORE dropping the live
-                # atom, so build_session can interleave it back at its timestamp — dedup'd against the disk so a
-                # retry that DID re-reply never doubles. Without this the reply vanishes at settle and only the
-                # "Recovered after N retries" note remains where it was (the user 2026-07-21).
-                if a.get("type") == "assistant" and not a.get("isApiError"):
-                    txt = _atom_text(a)
-                    # "(no content)" is the CLI's placeholder for contentless command feedback (an SDK
-                    # /clear streams one) — nothing the user watched, nothing to salvage. Persisted, it
-                    # resurfaced as a worked reply on the bare command turn (the user 2026-07-27); the
-                    # parse-side guard in synthesize_orphans covers markers already written.
-                    # VERIFIED AT THE WRITE MOMENT (the user 2026-08-26): a marker claims "this reply
-                    # is on disk nowhere", and the claim's precondition — prune_live retired every
-                    # landed atom — holds only for sessions the chat BUILDS. A comment thread is never
-                    # built (hidden by design), so its landed replies were still live at settle and
-                    # EVERY thread reply minted a spurious marker: states/ litter, and the judge's
-                    # per-push marker scan grows with it. One tail read of the sid's own transcript
-                    # per would-be marker (settles are rare; healthy sessions already pruned) keeps
-                    # the salvage honest for every hidden-session shape, threads and future ones. A
-                    # genuinely-lost reply (the API-error discard) is on disk nowhere and still mints.
-                    if txt.strip() and txt.strip() != "(no content)" \
-                            and not self._reply_on_disk(sid, a.get("uuid") or ""):
-                        try:
-                            append_orphan_reply(self.state_dir, sid, a.get("uuid") or "", txt, t=a.get("t"))
-                        except Exception:
-                            self._log("orphan-reply persist failed: %s" % traceback.format_exc())
-                del d[k]
+        retry storm, while the timeline lane said READY (the user 2026-07-03).
+
+        Three phases around the live-tail lock: the work atoms are snapshotted under it, the orphan
+        salvage's I/O (a transcript tail read, the marker append) runs outside it, and the pops go
+        back under it — from the SAME dict object the snapshot came from, with the emptiness check
+        and the sid-level pop as one step. A key already gone at its pop is a landing prune_live
+        filed during the I/O window (legitimate, under the lock), so it is not reported as a race."""
+        with self._live_lock:
+            d = self._live.get(sid)
+            if not d:
+                return
+            work = [(k, a) for k, a in list(d.items()) if not a.get("_echo_text") and not a.get("command")]
+        for k, a in work:
+            # An assistant atom carrying real TEXT that never landed on disk is a reply the user WATCHED
+            # stream but the transcript dropped (an API-errored try — the CLI discards the partial and the
+            # retry writes a fresh record with a new uuid). Persist it durably BEFORE dropping the live
+            # atom, so build_session can interleave it back at its timestamp — dedup'd against the disk so a
+            # retry that DID re-reply never doubles. Without this the reply vanishes at settle and only the
+            # "Recovered after N retries" note remains where it was (the user 2026-07-21).
+            if a.get("type") == "assistant" and not a.get("isApiError"):
+                txt = _atom_text(a)
+                # "(no content)" is the CLI's placeholder for contentless command feedback (an SDK
+                # /clear streams one) — nothing the user watched, nothing to salvage. Persisted, it
+                # resurfaced as a worked reply on the bare command turn (the user 2026-07-27); the
+                # parse-side guard in synthesize_orphans covers markers already written.
+                # VERIFIED AT THE WRITE MOMENT (the user 2026-08-26): a marker claims "this reply
+                # is on disk nowhere", and the claim's precondition — prune_live retired every
+                # landed atom — holds only for sessions the chat BUILDS. A comment thread is never
+                # built (hidden by design), so its landed replies were still live at settle and
+                # EVERY thread reply minted a spurious marker: states/ litter, and the judge's
+                # per-push marker scan grows with it. One tail read of the sid's own transcript
+                # per would-be marker (settles are rare; healthy sessions already pruned) keeps
+                # the salvage honest for every hidden-session shape, threads and future ones. A
+                # genuinely-lost reply (the API-error discard) is on disk nowhere and still mints.
+                if txt.strip() and txt.strip() != "(no content)" \
+                        and not self._reply_on_disk(sid, a.get("uuid") or ""):
+                    try:
+                        append_orphan_reply(self.state_dir, sid, a.get("uuid") or "", txt, t=a.get("t"))
+                    except Exception:
+                        self._log("orphan-reply persist failed: %s" % traceback.format_exc())
+        with self._live_lock:
+            for k, _a in work:
+                d.pop(k, None)
                 self._touch_live(sid)
-        if not d:
-            self._live.pop(sid, None)
+            if not d and self._live.get(sid) is d:
+                self._live.pop(sid, None)
 
     def _reply_on_disk(self, sid: str, uuid: str) -> bool:
         """Does the sid's transcript already hold this uuid? The orphan salvage's own precondition,
@@ -8605,11 +8720,11 @@ class SdkBackend:
         fate at settle (echo, command, apiError, hasText). The kernel's chat-divergence tripwire logs it
         to pin WHICH atom held a chat turn open after the backend settled — the 2026-07-25 stale-"running"
         chat could not be diagnosed because a restart cleared exactly this state before anyone read it."""
-        d = self._live.get(sid)
-        if not d:
-            return []
+        with self._live_lock:
+            d = self._live.get(sid)
+            vals = list(d.values()) if d else []   # copy under the lock; the summary is built outside
         out = []
-        for a in list(d.values()):                 # copy: loop threads mutate the dict mid-iteration
+        for a in vals:
             if not isinstance(a, dict):
                 continue
             out.append({"uuid": a.get("uuid") or "", "type": a.get("type") or "",
