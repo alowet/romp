@@ -305,10 +305,19 @@ class LiveSpawnEnv(_Backend):
             ks.read_source = orig
         self.assertEqual(len(reads), 1, "two reads could return two different keys")
 
-    def test_an_empty_key_line_refuses_an_explicit_key_launch(self):
+    def test_an_empty_key_line_launches_an_explicit_key_pick_with_nothing_injected(self):
+        """Until 2026-09-07 this refused the launch (#932). The maintainer's direction since: given no
+        key, romp injects nothing and Claude Code's own credential resolution applies — its apiKeyHelper
+        or its login — so a box that never handed romp a key keeps launching, said once as a problem
+        row. A source that cannot be READ (the op marker, a garbled line) still refuses."""
         self.write_env("", lines=["ROMP_PERF=1"])       # `ANTHROPIC_API_KEY=` with nothing after it
-        with self.assertRaisesRegex(ks.KeySourceError, "no API key source"):
-            self._launch_env(4)
+        env = self._launch_env(4)
+        self.assertNotIn("ANTHROPIC_API_KEY", env, "nothing injected: the CLI's own credential pays")
+        self._launch_env(5)
+        rows = [l for l in self.logged if "Claude Code's own credential" in l]
+        self.assertEqual(len(rows), 1, "one row per process")
+        self.assertIn(self.path, rows[0])
+        self.assertNotIn(OLD_KEY, "\n".join(self.logged))
 
     def test_the_live_key_reaches_the_has_a_key_bool_and_the_auth_default(self):
         self.assertEqual(self.be.default_auth({}), "key")
@@ -329,12 +338,18 @@ class StartupFallback(_Backend):
     BOOT = BOOT_KEY
 
     def test_removing_a_previously_selected_file_key_does_not_restore_the_startup_key(self):
+        """The file once carried the key, so it stays authoritative: with the line gone, an explicit key
+        pick launches with NOTHING injected (the maintainer's direction, 2026-09-07: given no key, romp
+        defers to Claude Code's default) — never the key the manager started with, the fallback this
+        rule exists to end. Until 2026-09-07 the launch refused instead (#932)."""
         with open(self.path, "w") as fh:                # genuinely no assignment, not an empty one
             fh.write("ROMP_PERF=1\n")
         ks._CACHE = ((), "")
         self.assertEqual(self.be.work_key, "")
-        with self.assertRaises(ks.KeySourceError):
-            self._launch_env(1)
+        env = self._launch_env(1)
+        self.assertNotIn("ANTHROPIC_API_KEY", env, "not the startup key — not anything")
+        self.assertNotIn(BOOT_KEY, repr(env))
+        self.assertTrue([l for l in self.logged if "Claude Code's own credential" in l])
 
     def test_an_empty_key_line_does_not_restore_the_startup_key(self):
         self.write_env("", lines=["ROMP_PERF=1"])       # `ANTHROPIC_API_KEY=` with nothing after it
@@ -1286,12 +1301,13 @@ class NothingLeaksTheKey(_Backend):
                          "the one-claimer property: an ambient key bills every session")
 
     def test_the_problem_ring_the_dashboard_reads_never_carries_a_key(self):
-        self.write_env("", lines=["ROMP_PERF=1"])       # a key pick with no key: the loudest path
-        with self.assertRaises(ks.KeySourceError):
-            self._launch_env(1)
+        self.write_env("", lines=["ROMP_PERF=1"])       # a key pick with no key: the loudest path — since
+        self._launch_env(1)                             # 2026-09-07 a problem row, not a refusal
         self.write_env(NEW_KEY)
         self._launch_env(2)
-        for p in self.be.problems(50):
+        rows = self.be.problems(50)
+        self.assertTrue([p for p in rows if "Claude Code's own credential" in p["text"]], "the path was walked")
+        for p in rows:
             self.assertNotIn(NEW_KEY, p["text"])
             self.assertNotIn(OLD_KEY, p["text"])
 

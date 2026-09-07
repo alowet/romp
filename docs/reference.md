@@ -368,6 +368,16 @@ selected configuration. An empty or invalid reference is an error, not a
 request to use the legacy key. Remove competing plaintext assignments when
 migrating; `romp keyswap` does this automatically when selecting a profile.
 
+With no key source selected — the env file has no `ROMP_API_KEY_REF=` line
+and no `ANTHROPIC_API_KEY=` line with a value, and no reference was selected
+earlier (a removed reference stays an error until another source is
+configured; see below) — Romp injects nothing, and Claude Code's own
+credential resolution applies: its `apiKeyHelper`, which can fetch a key from
+any secrets manager, or its login. A session's API-key Billing pick then only
+takes effect once a source exists; until one does, the kernel says so once in
+its log. A reference or key line in `service.env` is for boxes where Romp
+should manage the key — swap it, fingerprint it, cycle sessions onto it.
+
 Romp runs [`op read --no-newline`](https://www.1password.dev/cli/reference/commands/read)
 for each Claude SDK session launch or reconnect, each API-key-billed judge
 call, and each direct model-catalog refresh. A paginated catalog refresh uses

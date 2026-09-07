@@ -116,13 +116,21 @@ class RuntimeSdkAuth(unittest.TestCase):
         self.assertEqual(sess.effective_auth(), "key")
         self.assertNotIn("provider-output", str(record.call_args))
 
-    def test_empty_explicit_key_refuses_login_fallback(self):
+    def test_an_explicit_key_pick_with_no_key_launches_on_claude_codes_own_credential(self):
+        """Until 2026-09-07 this refused the launch (#932). The maintainer's direction since: given no
+        key, romp injects nothing and defers to Claude Code's own credential resolution (its apiKeyHelper
+        or its login) — the pre-#932 launch — said once per process as a problem row."""
         self.be.work_key = ""
         sess = self.session("key")
-        self.assertEqual(sess.effective_auth(), "key")
-        with self.assertRaisesRegex(ks.KeySourceError, "no API key source"):
-            self.be._options(sess, dict)
+        self.assertEqual(sess.effective_auth(), "key", "the pick itself stands")
+        opts = self.be._options(sess, dict)
+        self.assertNotIn("ANTHROPIC_API_KEY", opts["env"], "nothing injected — not an empty var either")
+        self.assertEqual(opts["env"].get("CLAUDE_CODE_OAUTH_TOKEN"), "synthetic-oauth", "as a login launch")
+        self.assertFalse(sess._launched_keyed)
+        self.assertTrue(sess._launched_unkeyed_pick)
         self.provider.assert_not_called()
+        self.be._options(sess, dict)
+        self.assertEqual(sum("Claude Code's own credential" in l for l in self.logs), 1, "said once")
 
     def test_provider_failure_record_does_not_reuse_a_previous_clis_stderr(self):
         sess = self.session("key")
@@ -361,3 +369,166 @@ class OpCredentialAndDiscardNotice(unittest.TestCase):
             self.be.cycle_key(keyed.sid, resolve_error="1Password credential retrieval failed")
         self.provider.assert_not_called()
 
+
+class UnkeyedPickLaunch(unittest.TestCase):
+    """An explicit API-key pick on a box that holds NO key source — the shape the 2026-09-07 outage had:
+    a supervised service.env with no key line, the sessions billing through Claude Code's own
+    apiKeyHelper. #932 made that launch raise, so every such session died at its next connect and
+    stayed dead until an operator rewrote the file and restarted the service. The maintainer's
+    direction since: given no key, romp injects nothing and defers to Claude Code's own credential
+    resolution (its apiKeyHelper or its login), said once per process as a problem row. A CONFIGURED
+    source — resolving, failing, or a reference removed behind its marker — is untouched."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "service.env"
+        self.path.write_text("ROMP_PERF=1\n")          # a supervised box whose env file carries NO key line
+        self.env = patch.dict(os.environ, {
+            "ROMP_SERVICE_ENV_FILE": str(self.path), "ROMP_SERVICE_ENV": str(self.path),
+            "ROMP_SUPERVISED": "1", "ANTHROPIC_API_KEY": "synthetic-old-startup-key",
+            "ANTHROPIC_AUTH_TOKEN": "synthetic-bearer", "CLAUDE_CODE_OAUTH_TOKEN": "synthetic-oauth",
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.addCleanup(patch.stopall)
+        os.environ.pop("ROMP_API_KEY_REF", None)      # an (even empty) reference in the env is a selection
+        os.environ.pop("ROMP_EXPECTED_AUTH", None)
+        patch.object(sb, "_WORK_KEY", None).start()
+        patch.object(sb, "_STARTUP_AUTH_ENV", None).start()
+        patch.object(sb, "_STARTUP_KEY_DISCARD_SAID", False).start()
+        patch.object(sb, "_KEY_FILE_CHECKED", True).start()
+        patch.object(ks, "_CACHE", ((), ks.KeySource("none"))).start()
+        patch.object(ks, "_AUTHORITATIVE_PATHS", {}).start()
+        patch.object(sb, "_FAST_ORG_VERDICTS", {}).start()
+        patch.object(sb, "_fetch_key_fast_org", return_value=True).start()
+        self.provider = patch.object(ks.subprocess, "run", return_value=SimpleNamespace(
+            returncode=0, stdout=KEY.encode())).start()
+        fake_sdk = ModuleType("claude_agent_sdk")
+        fake_sdk.HookMatcher = lambda **kw: kw
+        fake_sdk.ClaudeAgentOptions = dict
+        fake_sdk.ClaudeSDKClient = unittest.mock.Mock()
+        for name in ("AssistantMessage", "ResultMessage", "SystemMessage"):
+            setattr(fake_sdk, name, type(name, (), {}))
+        patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}).start()
+        patch("sys.stderr", new_callable=lambda: __import__("io").StringIO()).start()
+        self.logs = []
+        self.be = sb.SdkBackend(str(Path(self.tmp.name) / "state"), "/bin/true",
+                                lambda *a, **k: None, log=self.logs.append)
+
+    def session(self, auth="key", name="synthetic"):
+        sid = self.be.spawn(name, "/tmp", auth=auth)
+        return sb.SdkSession(self.be, sb.read_reg(self.be.state_dir, sid))
+
+    def configure_source(self):
+        """The operator writes the reference line."""
+        self.path.write_text("ROMP_API_KEY_REF=" + REF + "\n")
+        ks._CACHE = ((), ks.KeySource("none"))
+
+    def rows(self):
+        return [l for l in self.logs if "Claude Code's own credential" in l]
+
+    def problems(self):
+        return [p["text"] for p in self.be._problems]
+
+    def test_the_box_is_unconfigured_the_way_the_incident_left_it(self):
+        src = self.be._work_key_source()
+        self.assertEqual((src.kind, src.configured), ("file", False))
+        self.assertFalse(self.be.work_key_configured)
+        self.assertEqual(self.be.default_auth({}), "login", "an unpicked session launches login-side, as before")
+
+    def test_an_explicit_key_pick_launches_with_nothing_injected_and_says_so_once(self):
+        sess = self.session("key")
+        self.assertEqual(sess.effective_auth(), "key", "the pick itself stands")
+        opts = self.be._options(sess, dict)
+        self.assertNotIn("ANTHROPIC_API_KEY", opts["env"], "nothing injected — not an empty var either")
+        self.assertEqual(opts["env"].get("CLAUDE_CODE_OAUTH_TOKEN"), "synthetic-oauth",
+                         "the login tokens ride exactly as they do for a login launch")
+        self.assertEqual(opts["env"].get("ANTHROPIC_AUTH_TOKEN"), "synthetic-bearer")
+        self.assertFalse(sess._launched_keyed)
+        self.assertTrue(sess._launched_unkeyed_pick)
+        self.assertEqual(sess._launched_key_fp, "")
+        self.provider.assert_not_called()
+        self.assertEqual(len(self.rows()), 1)
+        self.assertIn("picked for API-key billing", self.rows()[0])
+        self.assertIn("ROMP_API_KEY_REF=op://vault/item/field", self.rows()[0])
+        self.assertIn(str(self.path), self.rows()[0], "the row names the file to write")
+        self.assertIn(self.rows()[0], self.problems(), "a key romp cannot see is a problem row")
+        self.be._options(sess, dict)
+        self.be._options(self.session("key", name="second"), dict)
+        self.assertEqual(len(self.rows()), 1, "one row per process")
+
+    def test_an_unpicked_session_launches_the_same_way_and_says_nothing(self):
+        sess = self.session("")
+        opts = self.be._options(sess, dict)
+        self.assertNotIn("ANTHROPIC_API_KEY", opts["env"])
+        self.assertFalse(sess._launched_keyed)
+        self.assertFalse(sess._launched_unkeyed_pick)
+        self.assertEqual(self.rows(), [], "the row is for an explicit pick romp cannot honour")
+
+    def test_a_remembered_key_default_is_not_seeded_onto_a_box_with_no_source(self):
+        """_auth_avail already tells the picker the default is login on such a box; seeding `key`
+        anyway would launch every NEW session unkeyed with the once-row and, on a login landing, a
+        per-init alarm — a standing false alarm the rule would otherwise create. A re-seed is never an
+        explicit pick; an explicit `auth` from the picker still lands as asked."""
+        d = Path(self.be.state_dir)
+        d.mkdir(parents=True, exist_ok=True)              # nothing has written the state dir yet in this test
+        sb._defaults_path(d).write_text(json.dumps({"auth": "key"}))
+        sid = self.be.spawn("seeded", "/tmp")
+        self.assertNotIn("auth", sb.read_reg(self.be.state_dir, sid), "the remembered key default seeds nothing here")
+        sid2 = self.be.spawn("asked", "/tmp", auth="key")
+        self.assertEqual(sb.read_reg(self.be.state_dir, sid2).get("auth"), "key", "an explicit ask still lands")
+        self.configure_source()
+        sid3 = self.be.spawn("seeded-later", "/tmp")
+        self.assertEqual(sb.read_reg(self.be.state_dir, sid3).get("auth"), "key", "with a source the default seeds as before")
+
+    def test_the_init_check_judges_an_unkeyed_pick_by_what_it_meant(self):
+        """An explicit API-key pick that launched with nothing injected MEANT the key: the CLI landing
+        on its own apiKeyHelper is the intended outcome and stays quiet (before this, every init of
+        such a session rang the launched-for-the-login row — the false alarm ROMP_EXPECTED_AUTH was
+        introduced to end for unpicked sessions), while a login landing is the pick contradicted and
+        rings, worded as a launch for the API key."""
+        sess = self.session("key")
+        self.be._options(sess, dict)
+        self.be._note_auth_source(sess, "apiKeyHelper")
+        self.assertEqual([l for l in self.logs if "is billing the" in l], [], "a keyed landing honours the pick")
+        self.assertEqual(sess.auth_live, "key")
+        self.be._note_auth_source(sess, "none")
+        ring = [l for l in self.logs if "is billing the login" in l]
+        self.assertEqual(len(ring), 1, "a login landing contradicts the pick and rings")
+        self.assertIn("launched for the API key", ring[0])
+        self.assertIn(ring[0], [p["text"] for p in self.be._problems])
+
+    def test_a_configured_source_is_untouched(self):
+        self.configure_source()
+        self.assertTrue(self.be.work_key_configured)
+        sess = self.session("key")
+        opts = self.be._options(sess, dict)
+        self.assertEqual(opts["env"]["ANTHROPIC_API_KEY"], KEY, "a configured source is what launches")
+        self.assertTrue(sess._launched_keyed)
+        self.assertFalse(sess._launched_unkeyed_pick)
+        self.assertEqual(sess._launched_key_fp, ks.fingerprint(KEY))
+        self.assertEqual(self.provider.call_count, 1)
+        self.assertEqual(self.rows(), [])
+        # …and one that FAILS to resolve keeps today's hard failure: a selected source is authoritative
+        self.provider.return_value = SimpleNamespace(returncode=1, stdout=b"provider-output-must-not-leak")
+        with self.assertRaisesRegex(ks.KeySourceError, "1Password credential retrieval failed"):
+            self.be._options(self.session("key", name="second"), dict)
+        self.assertNotIn("provider-output", "\n".join(self.logs))
+        self.assertEqual(self.rows(), [])
+
+    def test_a_reference_removed_behind_its_marker_still_refuses(self):
+        """Only the GENUINELY unconfigured box changed. A file that once selected a 1Password reference
+        keeps governing (the durable `op` marker): emptying it is an error the launch reports, never a
+        slide onto the CLI's credential — the silent fallback keysource exists to end."""
+        self.configure_source()
+        self.be._options(self.session("key"), dict)                 # selects the reference; writes the marker
+        self.assertEqual(ks.read_marker(str(self.path)), "op")
+        self.path.write_text("ROMP_PERF=1\n")
+        ks._CACHE = ((), ks.KeySource("none"))
+        ks._AUTHORITATIVE_PATHS.clear()                            # a restarted kernel: the marker alone decides
+        src = self.be._work_key_source()
+        self.assertEqual((src.kind, src.configured), ("error", True))
+        with self.assertRaisesRegex(ks.KeySourceError, "1Password reference was removed"):
+            self.be._options(self.session("key", name="second"), dict)
+        self.assertEqual(self.rows(), [])

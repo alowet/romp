@@ -70,6 +70,7 @@ class _JudgeAuthBase(unittest.TestCase):
         jd._WORK_KEY_CONFIGURED_FN = None
         jd._LOGIN_AUTH_ENV_FN = None
         jd._auth_cache[:] = [None, {}]
+        jd._UNKEYED_SAID.clear()          # the once-per-process line is asserted per test
         jd.SDKDIR.mkdir(parents=True, exist_ok=True)
         for p in (jd.JUDGE_AUTH, jd.SDKDIR / (SID + ".json"),
                   jd.STATE / "retry-paused.json", jd.STATE / "usage.json"):
@@ -141,8 +142,12 @@ class JudgeBillingResolution(_JudgeAuthBase):
     def test_a_key_pick_with_no_key_keeps_its_billing_intent(self):
         self._reg("key")
         self.assertEqual(jd._judge_auth(SID), "key")
-        with self.assertRaises(jd._keysrc.KeySourceError):
-            jd._judge_env("triage", "key")
+        # …and with no romp key source the call runs keyless on the CLI's own credential (2026-09-07;
+        # UnkeyedJudgeCalls below) — until then it raised, and every pass logged err=auth
+        import io
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()):
+            self.assertNotIn("ANTHROPIC_API_KEY", jd._judge_env("triage", "key"))
 
 
 class JudgeEnvBilling(_JudgeAuthBase):
@@ -519,6 +524,87 @@ class OpCredentialAndRetrievalGate(_JudgeAuthBase):
             self.assertEqual(len(calls), 2)
         finally:
             jd._KEY_GATE.update(saved); jd._PASS_GEN[0] = saved_gen
+
+
+class UnkeyedJudgeCalls(_JudgeAuthBase):
+    """2026-09-07: a session whose pick said `key` on a box whose env file carries NO key line. Before
+    runtime retrieval (#932) its judge children launched without an injected key and Claude Code's own
+    credential — an apiKeyHelper, or the login — authenticated them; the hard error that replaced that
+    logged err=auth on every pass while the board was down. The maintainer's direction since: given no
+    key, romp defers to Claude Code's default. So an UNCONFIGURED source (decided before any retrieval)
+    launches the child keyless, said once per process; a configured source — resolving or failing —
+    keeps its own path."""
+
+    def _stderr(self, fn):
+        import io
+        from contextlib import redirect_stderr
+        out = io.StringIO()
+        with redirect_stderr(out):
+            r = fn()
+        return r, out.getvalue()
+
+    def test_an_unconfigured_source_launches_the_child_keyless_and_says_so_once(self):
+        self._reg("key")
+        self.assertTrue(jd._key_source_unconfigured())
+        prev_login = jd._LOGIN_AUTH_ENV_FN
+        jd._LOGIN_AUTH_ENV_FN = lambda: {"CLAUDE_CODE_OAUTH_TOKEN": "synthetic-login-token"}
+        self.addCleanup(setattr, jd, "_LOGIN_AUTH_ENV_FN", prev_login)
+        env, err = self._stderr(lambda: jd._judge_env("triage", "key"))
+        self.assertNotIn("ANTHROPIC_API_KEY", env, "the CLI's own credential authenticates it — removal, not blanking")
+        self.assertEqual(env.get("CLAUDE_CODE_OAUTH_TOKEN"), "synthetic-login-token",
+                         "the unkeyed child gets the login tokens a login call gets (before #932 it inherited them)")
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env, "…and only those: the ambient bearer stays stripped")
+        self.assertEqual(env.get("ROMP_SUMMARIZING"), "1", "the rest of the env contract is untouched")
+        self.assertIn("romp-judge: key-billed judge calls run on Claude Code's own credential", err)
+        self.assertIn("romp holds no key source", err)
+        _, err2 = self._stderr(lambda: jd._judge_env("index", "key"))
+        self.assertEqual(err2, "", "said once per process")
+
+    def test_the_kernel_wire_decides_configuredness_without_a_retrieval(self):
+        jd._WORK_KEY_CONFIGURED_FN = lambda: False
+        jd._WORK_KEY_FN = Mock(side_effect=AssertionError("an unconfigured source is never resolved"))
+        env, _ = self._stderr(lambda: jd._judge_env("triage", "key"))
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        jd._WORK_KEY_FN.assert_not_called()
+
+    def test_a_retrieval_failure_keeps_its_own_path(self):
+        def failing():
+            raise jd._keysrc.KeySourceError("1Password credential retrieval timed out; check op authentication")
+        jd._WORK_KEY_FN = failing
+        jd._WORK_KEY_CONFIGURED_FN = lambda: True
+        with self.assertRaisesRegex(jd._keysrc.KeySourceError, "timed out"):
+            jd._judge_env("triage", "key")
+
+    def test_a_wired_key_callback_alone_is_a_configured_source_and_the_retrieval_decides(self):
+        # standalone wiring of the key callback alone (no configured wire): the retrieval is the verdict, as before
+        jd._WORK_KEY_FN = lambda: ""
+        self.assertFalse(jd._key_source_unconfigured())
+        with self.assertRaisesRegex(jd._keysrc.KeySourceError, "No API key source is configured for this judge call"):
+            jd._judge_env("triage", "key")
+
+    def test_a_configured_source_still_injects_the_key_and_says_nothing(self):
+        jd._WORK_KEY_FN = lambda: FAKE_KEY
+        jd._WORK_KEY_CONFIGURED_FN = lambda: True
+        env, err = self._stderr(lambda: jd._judge_env("triage", "key"))
+        self.assertEqual(env.get("ANTHROPIC_API_KEY"), FAKE_KEY)
+        self.assertEqual(err, "")
+
+    def test_a_keyless_call_runs_end_to_end_and_latches_nothing(self):
+        self._reg("key")
+        jd._judge_ctx.fsid = SID
+        seen = {}
+
+        def fake_run(cmd, input=None, env=None, **kw):
+            seen["env"] = env
+            return SimpleNamespace(stdout=json.dumps({"result": "ok", "usage": {}, "duration_ms": 3}),
+                                   stderr="", returncode=0)
+        with patch.object(jd, "_judge_engine", return_value="claude"), \
+                patch.object(jd.subprocess, "run", side_effect=fake_run):
+            out, _ = self._stderr(lambda: jd._judge_run("sonnet", "SYS", "u", judge="planner", tier="triage"))
+        self.assertEqual(out, "ok")
+        self.assertNotIn("ANTHROPIC_API_KEY", seen["env"])
+        self.assertEqual(jd._auth_down_map(), {}, "a call that ran is not an auth failure")
+        self.assertFalse(jd._judge_ctx.paused)
 
 
 if __name__ == "__main__":

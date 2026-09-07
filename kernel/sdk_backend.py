@@ -2424,6 +2424,9 @@ class SdkSession:
         #   _note_auth_source compares the init's apiKeySource against THIS, so a CLI that lands on
         #   the other auth (a stale login, a key found via apiKeyHelper) is flagged loudly instead
         #   of silently billing the wrong account
+        self._launched_unkeyed_pick = False  # an explicit API-key pick that launched with NOTHING injected
+        #   because romp holds no key source (_options): Claude Code's own credential — its apiKeyHelper
+        #   or its login — is what pays, said once per process in the log
         self._last_cost_total = 0.0   # the CLI's totalCostUSD is CUMULATIVE per process (verified in
         #   the bundle: the result event's total_cost_usd sits beside total_duration/lines counters),
         #   so spend folds the DELTA between results — folding the raw value re-added the whole
@@ -3100,9 +3103,12 @@ class SdkSession:
     def effective_auth(self, key=None) -> str:
         """Billing intent, without retrieving credentials for repeated UI snapshots.
 
-        An explicit key pick stays keyed even when retrieval fails: launch must report
-        the missing credential instead of billing the login. `key` permits callers
-        holding an already-resolved credential to avoid a second source read.
+        An explicit key pick stays keyed while a source is CONFIGURED, even when its
+        retrieval fails: the launch must then report the missing credential instead of
+        billing the login. With no source selected romp injects nothing for any pick and
+        Claude Code's own credential decides (the maintainer 2026-09-07); _options owns
+        that rule. `key` permits callers holding an already-resolved credential to avoid a
+        second source read.
         """
         if self.auth == "login":
             return "login"
@@ -5047,6 +5053,7 @@ class SdkBackend:
         #   EVERY session whatever its pick. The VALUE is read per launch off `work_key` below, live,
         #   so a keyswap needs no kernel restart (the user 2026-09-04).
         self._key_fp_said = None                  # last key fingerprint written to the log (change-only)
+        self._unkeyed_pick_said = False           # the "launching on Claude Code's own credential" row: once per process
         # Backend PROBLEMS, kept in a bounded ring so the dashboard can show them (see _log): until
         # 2026-07-28 every SDK failure went to the kernel log alone, which nobody tails, so a session
         # whose stream died or whose model switch was refused just looked odd with no way to find out.
@@ -5170,6 +5177,19 @@ class SdkBackend:
             else:
                 src = "read from %s" % _keysrc.service_env_path()
             self._log("work key: sessions now launch on the key sha256:%s (%s)" % (fp, src))
+
+    def _note_unkeyed_pick(self) -> None:
+        """Said ONCE per process, as a problem row: a session picked for API-key billing is launching with
+        nothing of romp's injected, because romp holds no key source — Claude Code's own credential (its
+        apiKeyHelper or its login) is what pays. That is how these boxes ran before #932 and it works; but
+        it is a key romp cannot see, swap or fingerprint, so the row names what puts romp in charge of it."""
+        if self._unkeyed_pick_said:
+            return
+        self._unkeyed_pick_said = True
+        self._log("sessions picked for API-key billing launch on Claude Code's own credential (its apiKeyHelper "
+                  "or login) because romp holds no key source — add ROMP_API_KEY_REF=op://vault/item/field or "
+                  "ANTHROPIC_API_KEY to %s if romp should manage the key" % _keysrc.service_env_path(),
+                  problem=True)
 
     def cycle_key(self, sid: str, expected_source_fp: str | None = None, current_key_fp: str | None = None,
                   probe: bool = False, resolve_error: str | None = None) -> str:
@@ -5994,8 +6014,14 @@ class SdkBackend:
         # the box's UNPICKED design, while set_auth's contract is that the next init confirms the
         # PICK — judged (and worded) against what the pick launched, so a landing honoring the pick
         # stays quiet whatever the box declares, and one contradicting it still rings.
+        # An explicit API-key pick that launched with NOTHING injected (romp holds no key source, so
+        # Claude Code's own resolution decides — the maintainer's direction, 2026-09-07) MEANT the key:
+        # a keyed landing (the CLI's apiKeyHelper) is what the pick wanted and stays quiet, a login
+        # landing is the pick contradicted and rings. Before this the row rang on every init of such a
+        # session — the same false alarm ROMP_EXPECTED_AUTH was introduced to end for unpicked ones.
+        meant_key = sess._launched_keyed or sess._launched_unkeyed_pick
         exp, exp_src = ("", "") if sess.auth in ("login", "key") else _declared_auth(self.state_dir)
-        if keyed != ((exp == "key") if exp else sess._launched_keyed):
+        if keyed != ((exp == "key") if exp else meant_key):
             if exp:
                 what = ("ROMP_EXPECTED_AUTH=%s" % exp) if exp_src == "env" \
                     else ("the remembered Billing pick is %s" % exp)
@@ -6005,7 +6031,7 @@ class SdkBackend:
             else:
                 self._log("auth (%s): launched for %s but the CLI reports apiKeySource=%r — this session "
                           "is billing the %s. Check the login (claude /login) and service.env."
-                          % (sess.name, "the API key" if sess._launched_keyed else "the login", source,
+                          % (sess.name, "the API key" if meant_key else "the login", source,
                              "API key" if keyed else "login"), problem=True)
         sess.auth_live = "key" if keyed else "login"   # the CLI's own report, for the Billing row
         if keyed == sess.api_key_auth:
@@ -6448,9 +6474,17 @@ class SdkBackend:
                                 env=env_vars, log=self._log)
         if fs:
             kw["settings"] = fs
-        # Authentication is resolved only for a launch that selects API-key billing.
-        # Source presence is metadata; a provider failure cannot turn it into login.
-        launch_keyed = sess.auth == "key" or (sess.auth != "login" and key_source.configured)
+        # Authentication is resolved only for a launch that selects API-key billing AND has a source to
+        # bill. An explicit API-key pick with NO key source configured (an empty supervised service.env,
+        # nothing anywhere) launches like an unpicked session: romp injects nothing, and Claude Code's
+        # own credential resolution applies — its apiKeyHelper if one is configured, else its login.
+        # That is how such boxes ran before #932; the hard refusal #932 put here took every one of their
+        # sessions down, with no way back until an operator rewrote service.env and restarted the
+        # service (the maintainer's direction, 2026-09-07: given no key, romp defers to Claude Code's
+        # default). Said once per process, as a problem row, when an explicit pick launched this way.
+        # A CONFIGURED source that fails to resolve stays the hard failure below: source presence is
+        # metadata, and a provider failure cannot turn it into login.
+        launch_keyed = key_source.configured and sess.auth != "login"
         work_key = ""
         if launch_keyed:
             work_key, key_src = self._work_key_and_source(key_source)
@@ -6461,7 +6495,10 @@ class SdkBackend:
                              **key_fast_org_env(work_key, self._log))
         else:
             kw["env"] = dict(kw["env"], **startup_auth_env())
+            if sess.auth == "key":
+                self._note_unkeyed_pick()
         sess._launched_keyed = launch_keyed
+        sess._launched_unkeyed_pick = sess.auth == "key" and not launch_keyed
         sess._launched_key_fp = _keysrc.fingerprint(work_key) if launch_keyed else ""
         return ClaudeAgentOptions(**kw)
 
@@ -6497,6 +6534,13 @@ class SdkBackend:
         # Auth: the picker's explicit pick wins; else the remembered default (a gear /auth pick on any
         # session); unset stays unset — effective_auth's fallback IS the pre-selector behavior.
         a = auth if auth in ("login", "key") else (d.get("auth") if d.get("auth") in ("login", "key") else "")
+        if a == "key" and not auth and not self.work_key_configured:
+            # A REMEMBERED key default on a box with no key source seeds nothing: _auth_avail already
+            # shows the picker "login" there, and a seeded pick would launch unkeyed with the once-row
+            # plus a per-init "launched for the API key" alarm for every new session (review find,
+            # 2026-09-07). A re-seed is never an explicit pick (_declared_auth); an EXPLICIT `auth` from
+            # the picker still lands as asked.
+            a = ""
         if a:
             reg["auth"] = a
         # Per-session env is a per-spawn ask, never a remembered default (a var one session needed is
