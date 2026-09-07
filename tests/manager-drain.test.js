@@ -55,7 +55,8 @@ function scriptedStub() {
     const srv = http.createServer((req, res) => {
       stub.seen.push(req.url);
       res.setHeader('Content-Type', 'application/json');
-      const next = stub.answers.length ? stub.answers.shift() : stub.fallback;
+      const fb = typeof stub.fallback === 'function' ? stub.fallback(req.url) : stub.fallback;
+      const next = stub.answers.length ? stub.answers.shift() : fb;
       if (next === HOLD) { stub.held.push(res); return; }
       res.end(next);
     });
@@ -237,10 +238,12 @@ test('a park held only by background work polls plainly, carries its identity, a
   // backstop line blamed a lost hold — this drives the REAL park through the stub instead
   fs.writeFileSync(TOKEN_FILE, 'drain-probe-credential\n');
   kstub.seen.length = 0;
-  // the first, uninformed poll ASKS for the hold and the kernel arms it; every later poll is plain
-  // (0 in flight) and answers draining:false by construction — none of those may count as a refusal
-  kstub.answers = [JSON.stringify({ busy: 1, inflight: 0, background: 1, draining: true })];
-  kstub.fallback = JSON.stringify({ busy: 1, inflight: 0, background: 1, draining: false });
+  // the kernel answers what a real one does, BY PATH: a poll that asks (drain=1) arms the hold and
+  // reads draining:true, a plain poll reads draining:false. Path-aware rather than scripted, so a
+  // slow first round trip that lets the 25 ms tick issue a second uninformed probe never
+  // manufactures a refusal (review find: the scripted single arm made the test cadence-dependent)
+  kstub.answers = [];
+  kstub.fallback = (url) => JSON.stringify({ busy: 1, inflight: 0, background: 1, draining: /drain=1/.test(url) });
   let logged;
   try {
     logged = await capturedUntil(/applying deferred refresh/, () => { queueQuietRestart('ghost'); });
@@ -248,8 +251,12 @@ test('a park held only by background work polls plainly, carries its identity, a
   const applyLine = logged.split('\n').find((l) => /applying deferred refresh/.test(l));
   assert.match(applyLine, /backstop cap/, 'background work never quiets here, so the backstop applies');
   assert.doesNotMatch(applyLine, /refused|never armed|LOST/, 'plain polls answer draining:false by construction — no refusal');
-  const drainPolls = kstub.seen.filter((u) => /drain=1/.test(u));
-  assert.ok(drainPolls.length <= 1, 'only the first, uninformed poll asks for the hold: ' + kstub.seen.join(' '));
+  // the uninformed probe(s) ask for the hold; once the kernel has said 0 in flight, every later
+  // poll is plain — a prefix, never a return to asking (stall-tolerant: a tick that fires before
+  // the first answer lands issues one more uninformed probe)
+  const firstPlain = kstub.seen.findIndex((u) => !/drain=1/.test(u));
+  assert.ok(firstPlain >= 0 && firstPlain <= 2 && kstub.seen.slice(firstPlain).every((u) => !/drain=1/.test(u)),
+    'only the uninformed first probe(s) ask for the hold, then the polls stay plain: ' + kstub.seen.join(' '));
   assert.ok(kstub.seen.length >= 2 && kstub.seen.every((u) => /[?&]park=\d+/.test(u)),
     'every parked poll carries the park identity: ' + kstub.seen.join(' '));
 });

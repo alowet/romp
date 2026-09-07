@@ -235,6 +235,9 @@ class _DrainSpy:
         self.park = park
         self.holding = True
 
+    def note_parked_poll(self, park):
+        self.parks = getattr(self, "parks", []) + [park]
+
     def drain_holding(self):
         return self.holding
 
@@ -295,6 +298,20 @@ class BusyDrainWriteGate(unittest.TestCase):
         status, _ = _serve_get("/busy?drain=1&token=" + TOK)
         self.assertEqual(status, 200)
         self.assertEqual(self.spy.refreshed, 1, "an explicit ?token= arms it too")
+
+    def test_the_park_identity_rides_the_same_token_as_the_arm(self):
+        # T240c review find: the park identity drives the drain EPISODE — its clock and its 5-minute
+        # problem ring — which is writable state a tokenless drive-by GET must not reach
+        status, _ = _serve_get("/busy?park=1700000000")
+        self.assertEqual(status, 200, "the read still answers")
+        self.assertEqual(getattr(self.spy, "parks", []), [], "a tokenless park is bookkeeping nobody asked for")
+        status, _ = _serve_get("/busy?park=1700000000", headers={"X-Romp-Token": TOK})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.spy.parks, ["1700000000"], "the manager's X-Romp-Token carries it")
+        status, _ = _serve_get("/busy?drain=1&park=1700000000", headers={"X-Romp-Token": TOK})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.spy.refreshed, 1)
+        self.assertEqual(self.spy.park, "1700000000", "…and the arm carries it too")
 
     # ── T224: a REFUSED drain is the one event the gate exists for — it must read LOUDLY ──
     def _refusals(self):

@@ -5685,18 +5685,33 @@ class SdkBackend:
         on a time window: the manager drops the hold for minutes at a time during background-only
         stretches (T240), so the 2×TTL window mis-read the next in-flight re-arm as a new park, and a
         park held ONLY by background work never reached refresh_drain_hold at all and stayed silent
-        after its first line. A plain parked poll now starts, continues and rings the episode too."""
+        after its first line. A plain parked poll now starts, continues and rings the episode too.
+        An empty identity is a no-op (nothing to key on), and one BELOW the current identity is a
+        stale probe from a park the manager has since replaced — ignored rather than flipping the
+        episode back and forth (review find: handler threads take the lock in no fixed order)."""
         self._park_seen(str(park or ""), time.time())
 
+    @staticmethod
+    def _park_ord(park):
+        try:
+            return int(park)
+        except (TypeError, ValueError):
+            return None
+
     def _park_seen(self, park: str, now: float) -> None:
+        if not park:
+            return
         with self._lock:
             new_episode = park != self._drain_park
             if new_episode:
+                a, b = self._park_ord(park), self._park_ord(self._drain_park)
+                if a is not None and b is not None and a < b:
+                    return                            # a stale probe from a replaced park
                 self._drain_park = park
                 self._drain_hold_since = now
                 self._drain_hold_rang = False
-            ring = (not new_episode and now - self._drain_hold_since > self.DRAIN_LOUD_S
-                    and not self._drain_hold_rang)
+            ring = (not new_episode and self._drain_hold_since > 0.0
+                    and now - self._drain_hold_since > self.DRAIN_LOUD_S and not self._drain_hold_rang)
             if ring:
                 self._drain_hold_rang = True
         if new_episode:

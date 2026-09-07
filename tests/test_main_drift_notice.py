@@ -192,6 +192,8 @@ class DriftWiring(unittest.TestCase):
         now = time.time()
         audit = km.jd.STATE / "restart-audit.jsonl"
         audit.write_text(json.dumps({"t": int(now - 300), "action": "main-converge", "when": "now", "tag": "pull"}) + "\n")
+        started = km._STARTED
+        km._STARTED = now - 3600      # this process booted long before every row below
         try:
             # the request LANDED: a boot row newer than it (the cut row itself was lost)
             km.RESTART_CUTS_FILE.write_text(json.dumps({"t": int(now - 296), "bootSettled": True, "pid": 1}) + "\n")
@@ -200,6 +202,25 @@ class DriftWiring(unittest.TestCase):
             # apply that restarted nothing — anchors NOTHING (event, not time)
             km.RESTART_CUTS_FILE.write_text(json.dumps({"t": int(now - 900), "bootSettled": True, "pid": 1}) + "\n")
             self.assertEqual(km._last_deploy_restart_t(), 0.0, "requested, never landed")
+            # the RUNNING kernel is a boot too (review find): the new kernel's own boot row lands only
+            # after its first serve and reconcile, and the drift loop's first pass runs before that —
+            # a lost-row deploy must anchor on that very pass, not one boot row later
+            km._STARTED = now - 10
+            self.assertAlmostEqual(km._last_deploy_restart_t(), now - 300, delta=2,
+                                   msg="a request older than this process has, by construction, been followed by a boot")
+            km._STARTED = now - 3600
+            # a cut row BETWEEN the request and the boot that the ledger did not join to it (review
+            # find): the restart that booted was recorded and attributed elsewhere — an anonymous
+            # manual restart ten minutes after a self-update click whose script failed — so the
+            # click restarted nothing and anchors nothing, however many boots follow it
+            km.RESTART_CUTS_FILE.write_text(json.dumps({"t": int(now - 94), "reason": "", "cutTurns": []}) + "\n"
+                                            + json.dumps({"t": int(now - 90), "bootSettled": True, "pid": 1}) + "\n")
+            self.assertEqual(km._last_deploy_restart_t(), 0.0, "a later unrelated restart does not land an earlier request")
+            # …but a cut row the ledger DID join to the request (auditT) is the request landing
+            km.RESTART_CUTS_FILE.write_text(json.dumps({"t": int(now - 294), "reason": "", "cutTurns": [],
+                                                        "auditT": int(now - 300)}) + "\n"
+                                            + json.dumps({"t": int(now - 290), "bootSettled": True, "pid": 1}) + "\n")
+            self.assertAlmostEqual(km._last_deploy_restart_t(), now - 300, delta=2, msg="its own cut row is not a stranger's")
             km.RESTART_CUTS_FILE.write_text(json.dumps({"t": int(now - 296), "bootSettled": True, "pid": 1}) + "\n")
             audit.write_text(json.dumps({"t": int(now - 200), "action": "main-converge", "tag": "abc"}) + "\n")
             self.assertEqual(km._last_deploy_restart_t(), 0.0, "a clicked-Update request row without when=now "
@@ -210,6 +231,7 @@ class DriftWiring(unittest.TestCase):
             km.RESTART_CUTS_FILE.write_text(json.dumps({"t": int(now - 90), "bootSettled": True, "pid": 1}) + "\n")
             self.assertAlmostEqual(km._last_deploy_restart_t(), now - 100, delta=2, msg="a peer's apply anchors once it landed")
         finally:
+            km._STARTED = started
             audit.unlink()
 
     def test_the_parent_watch_stands_down_under_a_graceful_term(self):

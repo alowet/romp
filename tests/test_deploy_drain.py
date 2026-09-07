@@ -76,7 +76,7 @@ class DrainLease(unittest.TestCase):
         since0 = be._drain_hold_since
         be.DRAIN_HOLD_TTL = 0.2
         be.refresh_drain_hold(park="1700000000")          # a turn started: the hold arms — same park
-        time.sleep(0.3)                                    # …and lapses for far longer than any window
+        be._drain_hold_until = time.time() - 10 * be.DRAIN_HOLD_TTL   # …and the lease lapsed far longer ago than any window
         be.note_parked_poll("1700000000")
         be.refresh_drain_hold(park="1700000000")
         self.assertEqual(be._drain_hold_since, since0, "the same park is the same episode, whatever the gaps")
@@ -87,6 +87,27 @@ class DrainLease(unittest.TestCase):
         be.note_parked_poll("1700000900")                 # a new park identity: a new episode, its own line
         self.assertEqual(sum("deploy restart parked" in str(l) for l in logs), 2)
         self.assertGreater(be._drain_hold_since, since0)
+
+    def test_an_empty_or_stale_park_identity_is_ignored(self):
+        # review finds: an empty identity on a fresh backend compared equal to the initial "" and
+        # rang a bogus "still parked after 29 million minutes" problem; and a stale probe from a park
+        # the manager had since replaced could flip the episode back and reset the newer park's clock
+        logs = []
+        be = sb.SdkBackend(tempfile.mkdtemp(), "/bin/true", lambda *a, **k: None, log=logs.append)
+        be.note_parked_poll("")
+        be.note_parked_poll(None)
+        self.assertFalse(any("parked" in str(l) for l in logs), "nothing to key on: no episode, no ring")
+        self.assertFalse(be._drain_hold_rang)
+        self.assertFalse(any("still parked" in str(p) for p in be.problems()), "no fabricated ring")
+        be.note_parked_poll("1700000900")
+        since0 = be._drain_hold_since
+        be.note_parked_poll("1700000000")                 # a probe issued for the park this one replaced
+        self.assertEqual(be._drain_park, "1700000900", "a lower identity is a stale probe, not a new park")
+        self.assertEqual(be._drain_hold_since, since0)
+        self.assertEqual(sum("deploy restart parked" in str(l) for l in logs), 1)
+        be.note_parked_poll("not-a-number")                # a non-numeric identity is simply a different park
+        self.assertEqual(be._drain_park, "not-a-number")
+        self.assertEqual(sum("deploy restart parked" in str(l) for l in logs), 2)
 
     def test_arming_is_visible_and_a_long_hold_rings(self):
         logs = []
