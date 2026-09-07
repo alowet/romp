@@ -1292,10 +1292,25 @@ if [[ "${1:-}" == "api-health" ]]; then
     shift
     if [[ $# -gt 0 ]]; then echo "usage: romp api-health" >&2; exit 2; fi
     _kport="${ROMP_KERNEL_PORT:-29855}"
-    _resp="$(_romp_token_cfg | curl -sf -m 10 --config - "http://127.0.0.1:$_kport/api-health")" \
+    # The HTTP status rides the reply's last line (-w), so a refusal is reported AS ITSELF. With
+    # `curl -f` every non-2xx wore the one "kernel not reachable" message, which hid the route's own
+    # 503 (the SDK backend is not up: a signal that does not exist yet, not a kernel that is down),
+    # a refused token (401/403) and a kernel that predates the route (404) behind "is romp running?".
+    # Only a reply that never came (connection refused, a timeout) is "not reachable".
+    _raw="$(_romp_token_cfg | curl -s -m 10 --config - -w '\n%{http_code}' "http://127.0.0.1:$_kport/api-health")" \
         || { echo "romp api-health: kernel not reachable on :$_kport (is romp running?)" >&2; exit 1; }
-    printf '%s\n' "$_resp"
-    exit 0
+    _code="${_raw##*$'\n'}"
+    _body="${_raw%$'\n'*}"; _body="${_body%$'\n'}"
+    case "$_code" in
+        2??) printf '%s\n' "$_body"; exit 0 ;;
+        503) # the route's own message rides its body as {"error": "..."}: print that, not a guess
+             _why="$(printf '%s' "$_body" | python3 -c 'import json, sys; print(json.load(sys.stdin)["error"])' 2>/dev/null)" \
+                 || _why="$_body"
+             echo "romp api-health: no signal, the kernel answered HTTP 503: $_why" >&2; exit 1 ;;
+        401|403) echo "romp api-health: the kernel refused the serve token (HTTP $_code): a stale ROMP_SERVE_TOKEN, or a state dir that is not this kernel's" >&2; exit 1 ;;
+        404) echo "romp api-health: this kernel has no /api-health route (HTTP 404): it predates this command, restart romp" >&2; exit 1 ;;
+        *)   echo "romp api-health: the kernel answered HTTP $_code on :$_kport" >&2; exit 1 ;;
+    esac
 fi
 
 # Fork a session into a NEW parallel one (the user 2026-08-19, via the lab workflow: per-stage

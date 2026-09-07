@@ -399,6 +399,27 @@ class IngestsTheRealBranches(unittest.TestCase):
         self.assertEqual(s._ah_turn, 1)
 
 
+class FamilyAttribution(unittest.TestCase):
+    def test_ah_family_prefers_the_raw_id_and_falls_back_to_the_display_name(self):
+        """A retry carries no model, so it is filed under the session's current one: the raw id the
+        CLI reported when there is one, else the display badge (`Fable 5`), else `unknown`."""
+        be = _backend()
+        s = _session(be, model_id="claude-haiku-4-5-20251001")
+        s.model = "Fable 5"
+        self.assertEqual(s._ah_family(), "haiku", "the raw id wins over the badge")
+        s._model_id = ""
+        self.assertEqual(s._ah_family(), "fable", "no raw id yet: the badge names the family")
+        s.model = ""
+        self.assertEqual(s._ah_family(), "unknown", "nothing learned yet")
+
+    def test_a_retry_on_a_generation_first_id_files_under_its_family(self):
+        be = _backend()
+        s = _session(be, model_id="claude-3-5-sonnet-20241022")
+        _feed(s, FakeSystemMessage("api_retry", retry_frame()))
+        self.assertIsNotNone(_bucket(be, family="sonnet"), "the family, not the catch-all")
+        self.assertIsNone(_bucket(be, family="other"))
+
+
 class Windows(unittest.TestCase):
     """api_health_counts over hand-built events: (now - w, now], the three windows, completeness."""
 
@@ -1020,6 +1041,38 @@ class SaltedLabels(unittest.TestCase):
         self.assertNotIn("self.work_key", src, "never a source resolution at init time")
         self.assertIn("acct_digest()", inspect.getsource(sb.ApiHealth.auth_label))
 
+    def test_a_login_init_labels_from_the_account_digest_it_reads(self):
+        """The login arm EXECUTES acct_digest: an init whose CLI reports no key (the field absent, or
+        the literal 'none' in any casing and spacing) labels as login:<salted digest of the account the
+        usage bars stamp>, and the frames that follow file under it. The source-text pin above is not
+        enough on its own: with the call dropped, every login labelled login:unknown and the suite
+        stayed green."""
+        be = _backend()
+        real = sb.acct_digest
+        sb.acct_digest = lambda: "0123456789ab"
+        try:
+            want = "login:" + sb._api_health_digest(be.api_health.salt(), "0123456789ab")
+            for src in ("none", "", None, " None "):
+                s = _session(be, label="unknown")
+                s._launched_keyed = False
+                s._launched_key_fp = ""             # a login launch records no fingerprint
+                s.auth, s.api_key_auth, s.auth_live = "", False, ""
+                be._note_auth_source(s, src)
+                self.assertEqual(s.auth_label, want, repr(src))
+                self.assertRegex(s.auth_label, r"^login:[0-9a-f]{12}$")
+            _feed(s, FakeSystemMessage("api_retry", retry_frame()))
+            self.assertIn(want + "|fable", be.api_health_snapshot()["buckets"])
+            # no readable account: the arm still runs, and says so rather than inventing a name
+            sb.acct_digest = lambda: ""
+            s2 = _session(be, label="unknown")
+            s2._launched_keyed = False
+            s2._launched_key_fp = ""
+            s2.auth, s2.api_key_auth, s2.auth_live = "", False, ""
+            be._note_auth_source(s2, "none")
+            self.assertEqual(s2.auth_label, "login:unknown")
+        finally:
+            sb.acct_digest = real
+
 
 def _doc(d):
     """The persisted state file, STATE/api-health.json."""
@@ -1364,7 +1417,8 @@ class StateFile(unittest.TestCase):
     def test_every_transition_logs_one_line_in_the_kernel_log(self):
         """A read that finds a transition appends it, writes the state file and logs one stderr line
         in the existing `retry-pause:` style. The line names the bucket, the move and the why, so the
-        kernel log alone reconstructs an incident."""
+        kernel log reconstructs an incident as a polling reader observed it (a transition is derived
+        only by a read of the signal; nothing derives while nobody reads)."""
         d = tempfile.mkdtemp()
         lines = []
         ah = sb.ApiHealth(d, log=lines.append)

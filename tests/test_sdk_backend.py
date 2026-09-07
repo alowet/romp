@@ -152,6 +152,28 @@ class PureTranslation(unittest.TestCase):
         self.assertEqual(sb.pretty_model(""), "")
         self.assertEqual(sb.pretty_model("some-custom-id"), "some-custom-id")        # unrecognised → verbatim
 
+    def test_model_family(self):
+        # the /api-health bucket family a rate limit is scoped to: re.search, not pretty_model's anchored
+        # match, so a provider-prefixed Bedrock/Vertex id lands in its family; the badge form the session
+        # displays is accepted for the retry-attribution fallback; generation-first ids name the family
+        # after the generation and still file under it rather than pooling in `other`
+        for raw, fam in [
+            ("claude-fable-5-1", "fable"),
+            ("claude-fable-5", "fable"),
+            ("claude-haiku-4-5-20251001", "haiku"),
+            ("claude-opus-4-8", "opus"),
+            ("us.anthropic.claude-fable-5-20250101-v1:0", "fable"),   # provider-prefixed: not anchored
+            ("Fable 5", "fable"),                                      # the badge form
+            ("Opus 4.8", "opus"),
+            ("", "unknown"),                                           # nothing learned yet
+            (None, "unknown"),
+            ("some-custom-id", "other"),                               # non-empty, matching nothing
+            ("claude-3-5-sonnet-20241022", "sonnet"),                  # generation-first
+            ("claude-3-opus-20240229", "opus"),
+            ("anthropic.claude-3-haiku-20240307-v1:0", "haiku"),
+        ]:
+            self.assertEqual(sb.model_family(raw), fam, repr(raw))
+
     def test_model_label(self):
         # the live (init/assistant-echoed) name always wins once known
         self.assertEqual(sb.model_label("Opus 4.8", "opus"), "Opus 4.8")

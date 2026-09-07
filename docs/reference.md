@@ -1209,7 +1209,8 @@ kernel never holds.
   outside the signal on both sides of the ratio). A reader that sees `inTurn >
   0` and a `lastEventAt` minutes old should treat the signal as unknown rather
   than healthy.
-- `cliScope`: the per-session scopes (see "What survives a restart" and
+- `cliScope`: scope bookkeeping carried on this payload, not part of the API
+  signal itself: the per-session scopes (see "What survives a restart" and
   "Per-session memory limits").
   - `on`, true when the kernel chose at boot to run CLIs in scopes.
   - `fallbacks`, CLI launches since boot on which the scope wrapper's pre-flight

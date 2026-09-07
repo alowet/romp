@@ -1582,13 +1582,17 @@ def api_health_config() -> dict:
 def model_family(raw) -> str:
     """The model FAMILY a rate limit is scoped to: 'claude-fable-5-1', 'claude-fable-5' and
     'us.anthropic.claude-fable-5-…' are all `fable`. re.search, not pretty_model's anchored re.match,
-    so a Bedrock/Vertex id lands in its family rather than one 'other' bucket. The pretty badge form
-    ('Fable 5', the session's display model) is accepted too for the retry-attribution fallback.
-    '' → 'unknown' (nothing learned yet); a non-empty id matching nothing → 'other'."""
+    so a Bedrock/Vertex id lands in its family rather than one 'other' bucket. The generation-first ids
+    ('claude-3-5-sonnet-20241022', 'claude-3-opus-…') name the family AFTER the generation and file
+    under it too: a rate limit on one of those is still that family's, and `other` would pool it with
+    everything unrecognised. The pretty badge form ('Fable 5', the session's display model) is accepted
+    too for the retry-attribution fallback. '' → 'unknown' (nothing learned yet); a non-empty id
+    matching nothing → 'other'."""
     s = str(raw or "").strip()
     if not s:
         return "unknown"
-    m = re.search(r"claude-([a-z]+)-(\d+)", s.lower())
+    low = s.lower()
+    m = re.search(r"claude-([a-z]+)-\d", low) or re.search(r"claude-\d+(?:-\d+)*-([a-z]+)", low)
     if m:
         return m.group(1)
     m = re.match(r"([A-Za-z]+) \d", s)
@@ -2185,7 +2189,9 @@ class ApiHealth:
         NOT a filter of the global one — that shape let a neighbour churning through fifty transitions
         erase a quiet bucket's history from its own payload. The caller holds the lock and writes the
         state file once it has filed everything this read found. One kernel-log line per transition, in
-        the `retry-pause:` lines' style, so the log alone reconstructs an incident: bucket, move, why."""
+        the `retry-pause:` lines' style, so the log reconstructs an incident as a polling reader observed
+        it: bucket, move, why. A transition is derived, filed and logged only by a read (GET /api-health),
+        so a state entered and left between two reads leaves no line; nothing derives while nobody reads."""
         self._transitions.append(row)
         self._by_bucket.setdefault(row["bucket"], deque(maxlen=API_HEALTH_TRANSITIONS_KEEP)).append(row)
         if self._log:
