@@ -182,11 +182,13 @@ code {dir}                          # VS Code instead
 
 ### Model and effort, from the statusline or a typed command
 
-Typing `/model X`, `/effort X`, or `/fast on|off` into the chat composer, or
-sending one with `romp send`, is the same setting change as a pick from the
-statusline's model and effort dropdowns: the kernel takes it through its own
-setters, so what it remembers (the value a reconnect relaunches with, the
-defaults new sessions start from) follows the switch. A bare `/model` (the
+Typing `/model X` or `/effort X` into the chat composer, or sending one with
+`romp send`, is the same setting change as a pick from the statusline's model
+and effort dropdowns: the kernel takes it through its own setters, so what it
+remembers (the value a reconnect relaunches with, the defaults new sessions
+start from) follows the switch. A typed `/fast on|off` goes through the same
+setters and matches a pick from the fast badge the next section describes, a
+separate toggle rather than one of the two dropdowns. A bare `/model` (the
 CLI's own picker), a value the kernel cannot vouch for (a typo), or a longer
 message that merely opens with the command goes to the CLI verbatim, and the
 chat shows the CLI's own reply.

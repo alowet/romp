@@ -10,7 +10,7 @@
 [ "$(tmux show -v @romp 2>/dev/null)" = "1" ] || exit 0
 read -r -d '' CTX <<'TXT'
 You're in a romp session with sibling sessions you can message: use the postal MCP tools (send_message, list_agents, set_working, check_inbox, check_sent, recall_message) or `romp mail`. Each tool's description carries its norms. Two to know up front:
-- Message a peer only for something substantive (it wakes them and costs a turn), leading with DELEGATE:/COORDINATE:/QUESTION: and the whole point in the first sentence.
+- Message a peer only for something substantive (it wakes them and costs a turn); set `kind` to delegate, coordinate, or question, and put the whole point in the first sentence.
 - BEFORE editing shared files, run list_agents and check peers' branches + working-notes to avoid collisions (overlap only collides on the same branch); publish yours with set_working.
 For the full guide (shell CLI, remote-machine tunnel setup, coordination detail), invoke the romp-postal skill.
 TXT

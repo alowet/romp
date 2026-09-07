@@ -29,7 +29,11 @@ teardown() { rm -rf "$TEST_DIR"; }
     [[ "$output" == *'"additionalContext"'* ]]
     [[ "$output" == *'"hookEventName": "SessionStart"'* ]]
     [[ "$output" == *'postal MCP tools'* ]]
-    [[ "$output" == *'DELEGATE'* ]]        # the lead-with-intent norm is present up front
+    # the declare-your-intent norm is present up front — as send_message's REQUIRED `kind` parameter, never
+    # the retired DELEGATE:/COORDINATE:/QUESTION: body prefix the hook used to teach beside it (two
+    # instructions for one fact). The negative pin is deliberate: the prefix must not come back.
+    [[ "$output" == *'set `kind` to delegate, coordinate, or question'* ]]
+    [[ "$output" != *'DELEGATE'* ]]
     [[ "$output" == *'list_agents'* ]]     # the coordinate-before-editing norm is present up front
     [[ "$output" == *'romp-postal skill'* ]]   # points to the full guide, not inlined
 }
