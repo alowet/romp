@@ -2425,9 +2425,12 @@ else
     # it's up, so an external watcher is the only way to surface it. Background a
     # check that sets @claude-state=picker if the session stays stuck on the picker
     # (the feed treats that as NEEDS INPUT). We do NOT auto-answer it — guessing the
-    # key / "from summary" loses context; the user clears it by hand.
+    # key / "from summary" loses context; the user clears it by hand. Through the
+    # ROMP_POSTAL_BIN seam like `mail` and `refresh`: this script puts its own directory
+    # first on PATH, so a test can stand in for the service no other way, and the real
+    # one, detached here, minted a serve-token under a test HOME after its teardown.
     if $resume && [[ -n "$sid" ]]; then
-        ( romp-postal-service picker-check --name "$name" --id "$sid" >/dev/null 2>&1 & )
+        ( "${ROMP_POSTAL_BIN:-romp-postal-service}" picker-check --name "$name" --id "$sid" >/dev/null 2>&1 & )
     fi
 
     # Attach — or, when detaching, just report how to get there.
