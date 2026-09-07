@@ -18,6 +18,44 @@ from pathlib import Path
 from importlib.machinery import SourceFileLoader
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+
+# ── the judge workers' CPU, for the kernel's GET /perf ─────────────────────────────────────────────
+# Every tier fans its per-session work (parses, store loads, the model call's framing) out through a
+# ThreadPoolExecutor, so the tier thread's own CPU says little about what the judges cost; the
+# workers' does. _TimedPool wraps each submitted callable with a time.thread_time() delta into one
+# counter, and the name below rebinds so every `ThreadPoolExecutor(...)` in this module builds the
+# timed pool without touching the dozen pool sites. A worker blocked on a model call adds nothing:
+# thread_time is CPU, not wall.
+_JUDGE_CPU = {"worker_ms": 0.0}
+_JUDGE_CPU_LOCK = threading.Lock()
+
+
+def _judge_cpu_add(cpu_s):
+    with _JUDGE_CPU_LOCK:
+        _JUDGE_CPU["worker_ms"] += cpu_s * 1000.0
+
+
+def judge_worker_cpu_ms():
+    """CPU milliseconds spent so far in this module's pool workers (every future any tier submitted)."""
+    with _JUDGE_CPU_LOCK:
+        return _JUDGE_CPU["worker_ms"]
+
+
+class _TimedPool(ThreadPoolExecutor):
+    """ThreadPoolExecutor whose submitted callables account their CPU to _JUDGE_CPU."""
+
+    def submit(self, fn, /, *args, **kwargs):
+        def run():
+            c0 = time.thread_time()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _judge_cpu_add(time.thread_time() - c0)
+        return super().submit(run)
+
+
+ThreadPoolExecutor = _TimedPool      # every pool below is a timed one (see above)
+
 HERE = Path(__file__).resolve().parent
 em = SourceFileLoader("romp_event_model", str(HERE / "event_model.py")).load_module()
 _keysrc = sys.modules.get("romp_keysource") or SourceFileLoader(
@@ -3004,6 +3042,27 @@ def _guard_nodes(store):
     return store
 
 
+# ── goal-store I/O counters (the kernel's GET /perf reads them through goal_io_stats) ─────────────
+# How often the stores are read and written is the first question when the kernel is busy: every
+# judge stage, the feed build and the nudge tick load stores, so the load rate says whether a change
+# added a pass over every session. Plain counters, one lock, no formatting on the path.
+_GOAL_IO = {"loads": 0, "saves": 0, "writes": 0}
+_GOAL_IO_LOCK = threading.Lock()
+
+
+def _goal_io_bump(key):
+    with _GOAL_IO_LOCK:
+        _GOAL_IO[key] += 1
+
+
+def goal_io_stats():
+    """A copy of the goal-store I/O counters: load_goals calls (`loads`), save_goals calls (`saves`),
+    and the saves that wrote a file (`writes`; save_goals skips a byte-identical republish). The
+    counters stay private to this module; readers get a copy."""
+    with _GOAL_IO_LOCK:
+        return dict(_GOAL_IO)
+
+
 def _quarantine_store(path, reason, st):
     """Move an unparseable store file ASIDE (never delete it) so the evidence survives the fresh start
     that follows. The sidecar keeps the original name plus `.corrupt-<utc stamp>`, so the `*.json` globs
@@ -3087,6 +3146,7 @@ def _read_store_json(path, *, quarantine=False, _tries=3):
 
 
 def load_goals(fsid):
+    _goal_io_bump("loads")
     raw = _read_store_json(GOALDIR / (fsid + ".json"), quarantine=True)
     if raw is None:
         # a FRESH store is born at the current identity version — only stores with history recorded
@@ -3613,6 +3673,7 @@ def save_goals(fsid, store):
     fleet forever. Skipping is safe precisely BECAUSE nothing changed: we have no events to contribute, so
     declining to publish can neither lose our work nor clobber a concurrent writer's. `rev` does not advance
     on a no-op, which is the honest reading of a counter that means "publications"."""
+    _goal_io_bump("saves")
     GOALDIR.mkdir(parents=True, exist_ok=True)
     if "_baseRev" in store and _matches_disk(fsid, store):
         return                                       # nothing of ours to publish → leave the file (and its
@@ -3627,6 +3688,7 @@ def save_goals(fsid, store):
         store["rev"] = _disk_rev(fsid) + 1
     else:
         store["rev"] = int(store.get("rev") or 0) + 1
+    _goal_io_bump("writes")
     tmp = _publish_tmp(GOALDIR, fsid)
     tmp.write_text(json.dumps(store))
     tmp.rename(GOALDIR / (fsid + ".json"))            # atomic publish
