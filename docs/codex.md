@@ -25,7 +25,10 @@ Codex sessions need, once per machine:
     with its sandbox and code-mode helpers. Linux and macOS, x86-64 and ARM64,
     are supported. Neither system Python nor the SDK's own dependency is replaced.
     Sessions explicitly use this managed runtime even if another `codex` is on
-    PATH. Your existing CLI remains available for `codex login`.
+    PATH. To point both the sessions and the judges at a specific binary, set
+    `ROMP_CODEX_BIN`; unset, sessions take the managed runtime and the judges
+    resolve `ROMP_CODEX_BIN`, then PATH, then the bundled binary. Your existing
+    CLI remains available for `codex login`.
 
     Rerun setup to install the runtime when upgrading from an older ROMP version.
     Restart the ROMP kernel after setup if its Codex backend is already running.

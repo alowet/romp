@@ -9958,6 +9958,11 @@ def _codex():
                     push_session=_push_session_now,
                     # Let the backend choose ROMP's managed runtime and helpers.
                     # A separately installed CLI on PATH may use a different protocol.
+                    # …but honour the one EXPLICIT knob romp already has — ROMP_CODEX_BIN, which the judges read
+                    # (judge.py _judge_codex_bin) — so an operator who sets it governs both surfaces with one
+                    # switch: an opt-in override of the managed runtime, not the ambient PATH accident #929 closed
+                    # (review find, 2026-09-07). Unset → None → the backend picks the managed runtime.
+                    codex_bin=os.environ.get("ROMP_CODEX_BIN") or None,
                     log=lambda m: sys.stderr.write("codex-backend: %s\n" % m))
             except Exception:
                 sys.stderr.write("codex-backend unavailable: %s\n" % traceback.format_exc())
