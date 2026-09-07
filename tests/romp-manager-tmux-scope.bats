@@ -12,9 +12,10 @@
 # recording fake tmux answers the command either way; with FAKE_TMUX_FAIL set it exits 1 with tmux's
 # connect error on stderr, which is what tmux failing INSIDE a scope that did start looks like to the
 # manager. After a failed scoped start the manager also asks tmux for the server's pid and reads that
-# pid's cgroup to word the line that follows the bare call (the #953 review); the fake answers pid 1
-# (whose cgroup is never a romp-tmux scope) unless FAKE_TMUX_PID=none, tmux's answer when no server
-# runs. Nothing here reaches the real systemd-run or the user manager: the switch is turned on only
+# pid's cgroup to word the line that follows the bare call (the #953 review), compared with its own
+# (the #967 review); the fake answers pid 1 (whose cgroup is never a romp-tmux scope, and not the
+# manager's own outside a container) unless FAKE_TMUX_PID=none, tmux's answer when no server runs.
+# Nothing here reaches the real systemd-run or the user manager: the switch is turned on only
 # behind the fake, and the floor tmux_private_socket_dir sets (ROMP_CLI_SCOPE=0) stays for the case
 # that pins it.
 
@@ -26,11 +27,13 @@ setup() {
     MGR="$(cd "$(dirname "$BATS_TEST_FILENAME")/../bin" && pwd)/romp-manager"
     BIN="$TEST_DIR/bin"; mkdir -p "$BIN"
     export FAKE_TMUX_CALLS="$TEST_DIR/tmux-calls" FAKE_SYSTEMD_RUN_CALLS="$TEST_DIR/systemd-run-calls"
-    # The pid probe: pid 1 by default — its cgroup is never a romp-tmux scope, so the manager reads
-    # the server as unscoped; FAKE_TMUX_PID=none is tmux with no server (exit 1, its line on stderr).
-    # A fake cannot put a process in a scope, so the scoped answer is the node suite's. Never answer
-    # with $PPID: a suite run from a window on the manager's own default server has the manager
-    # sitting in a romp-tmux scope, and the case would read "scoped" on that box while passing in CI.
+    # The pid probe: pid 1 by default — its cgroup is never a romp-tmux scope and, outside a container,
+    # not the manager's own, so the manager reads the server as outside the service's cgroup (the
+    # login-session case of the #967 review); FAKE_TMUX_PID=none is tmux with no server (exit 1, its
+    # line on stderr). A fake cannot put a process in a scope or in the manager's cgroup, so the scoped
+    # and unscoped answers are the node suite's. Never answer with $PPID: a suite run from a window on
+    # the manager's own default server has the manager sitting in a romp-tmux scope, and the case
+    # would read "scoped" on that box while passing in CI.
     cat > "$BIN/tmux" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_TMUX_CALLS"
@@ -131,23 +134,30 @@ log_lacks() {   # $1: a grep pattern that must match no line of the manager's lo
     log_lacks 'launchd-rooted'
 }
 
-@test "switch on, systemd-run failing: the log names systemd-run and carries its first stderr line, the server starts bare, and the log reads it as unscoped" {
+@test "switch on, systemd-run failing: the log names systemd-run and carries its first stderr line, the server starts bare, and the log reads it as outside the service's cgroup" {
     need_tools
     [ "$(uname -s)" = Linux ] || skip "the scoped path is Linux-only by construction (tmuxStartArgv)"
     [ -r /proc/1/cgroup ] || skip "the placement is read from /proc/<pid>/cgroup (pid 1's here)"
+    # the manager started below inherits this process's cgroup; pid 1's must differ for the case to model a
+    # server outside the service (a container without systemd puts both at the root)
+    [ "$(cat /proc/1/cgroup)" != "$(cat /proc/self/cgroup)" ] || skip "pid 1 shares this process's cgroup"
     export ROMP_CLI_SCOPE=1 FAKE_SYSTEMD_RUN_FAIL=1
     start_manager
     [ "$(wc -l < "$FAKE_SYSTEMD_RUN_CALLS")" -eq 1 ]   # tried once...
     # ...then the bare call, once, then the pid probe: the fake answers pid 1, whose cgroup names no
-    # romp-tmux scope, so the line reads the server as unscoped — the line as it always was
+    # romp-tmux scope and is not the manager's own, so the line reads the server as outside the
+    # service's cgroup and predicts no loss — the login-session server of the #967 review, which the
+    # old classification called unscoped
     [ "$(cat "$FAKE_TMUX_CALLS")" = "$(printf '%s\n%s' "$BARE" "$PROBE")" ]
     # the failure line: systemd-run named, its first stderr line in the parenthesis, the second line not
     grep -q 'systemd-run could not start the tmux server in a scope (Failed to start transient scope unit: Failed to connect to bus: No such file or directory)' "$LOG"
     log_lacks 'second stderr line'
     log_lacks 'Command failed'
     grep -q 'starting it the plain way instead' "$LOG"
-    grep -q 'tmux server ensured without a scope' "$LOG"
-    grep -q 'a service restart will take it down' "$LOG"
+    grep -q "tmux server ensured — already running outside the service's cgroup, in /" "$LOG"
+    grep -q 'a service restart leaves it and its sessions' "$LOG"
+    log_lacks 'without a scope'
+    log_lacks 'will take it down'
     log_lacks 'could not be read'
     log_lacks 'failed inside the scope'
     log_lacks 'in its own transient scope'

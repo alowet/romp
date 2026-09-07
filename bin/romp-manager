@@ -653,17 +653,39 @@ function scopedStartFailure(e) {
 // display-message does not start a server (exit 1, "no server running on …", when there is none — tmux 3.4).
 const TMUX_SERVER_PID_ARGV = ['tmux', 'display-message', '-p', '#{pid}'];
 
-// PURE: where a /proc/<pid>/cgroup text places the server. cgroup v2 is one `0::/…/<unit>` line; v1 is one
-// line per controller, each ending in the unit — so every line is tried. Only the manager's own romp-tmux-*
-// scopes count: a romp-session-* scope is a session CLI's, not this feature's claim.
-function placementFromCgroup(text) {
+// PURE: the path of the hierarchy systemd manages, from a /proc/<pid>/cgroup text — the `0::<path>` line on
+// cgroup v2; on v1 (one `<id>:<controllers>:<path>` line per controller) the `name=systemd` controller's,
+// else the first path present. '' when the text carries none.
+function systemdCgroupPath(text) {
+  const rows = String(text || '').split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
+    const parts = l.split(':');
+    return parts.length >= 3 ? { id: parts[0], controllers: parts[1], path: parts.slice(2).join(':') } : null;
+  }).filter(Boolean);
+  const v2 = rows.find((r) => r.id === '0' && r.controllers === '');
+  const v1 = rows.find((r) => r.controllers.split(',').includes('name=systemd'));
+  return ((v2 || v1 || rows[0]) || { path: '' }).path;
+}
+
+// PURE: where a /proc/<pid>/cgroup text places the server, against the manager's own (/proc/self/cgroup).
+// Every line is tried for a romp-tmux-* scope (cgroup v1 has one per controller, each ending in the unit);
+// only the manager's own scopes count — a romp-session-* scope is a session CLI's, not this feature's claim.
+// Otherwise the server's cgroup is COMPARED with the manager's, not classified from the shape of its path
+// (the #967 review): the same cgroup, or one under it, is the service's own, which KillMode=control-group
+// takes down with the service — 'unscoped', the line as it always was. Any other cgroup is outside the
+// service's reach — a server the user started from a terminal sits in the login session's scope — and a
+// service restart leaves it alive, so 'outside' names the cgroup instead of predicting a loss.
+function placementFromCgroup(text, own) {
   const lines = String(text || '').split('\n');
   for (const line of lines) {
     const m = /\/(romp-tmux-\d+\.scope)\s*$/.exec(line);
     if (m) return { placement: 'scoped', unit: m[1] };
   }
-  if (lines.some((l) => l.trim())) return { placement: 'unscoped' };
-  return { placement: 'unknown', why: 'empty cgroup file' };
+  const server = systemdCgroupPath(text);
+  if (!server) return { placement: 'unknown', why: lines.some((l) => l.trim()) ? 'no cgroup path in the file' : 'empty cgroup file' };
+  const mine = systemdCgroupPath(own);
+  if (!mine) return { placement: 'unknown', why: "the manager's own cgroup file is empty" };
+  if (server === mine || server.startsWith(mine.replace(/\/$/, '') + '/')) return { placement: 'unscoped' };
+  return { placement: 'outside', cgroup: server };
 }
 
 function defaultServerPid() {
@@ -676,7 +698,8 @@ function defaultReadCgroup(pid) { return fs.readFileSync('/proc/' + pid + '/cgro
 // Never throws — a throw here would abort startManager before the control port binds — so every failure
 // of the probe is an 'unknown' placement carrying the failure's first line, bounded like the failure
 // line's detail. `serverPid` and `readCgroup` are injectable for the node suite; the defaults ask tmux
-// (bounded by the same timeout as the start) and read /proc.
+// (bounded by the same timeout as the start) and read /proc — the server's file, then the manager's own
+// (`self`), which the placement compares it with.
 function tmuxServerPlacement({ serverPid = defaultServerPid, readCgroup = defaultReadCgroup } = {}) {
   const why = (e) => {
     const first = String((e && e.stderr) || '').split('\n').map((s) => s.trim()).find(Boolean)
@@ -686,19 +709,22 @@ function tmuxServerPlacement({ serverPid = defaultServerPid, readCgroup = defaul
   let pid;
   try { pid = String(serverPid()).trim(); } catch (e) { return { placement: 'unknown', why: why(e) }; }
   if (!/^\d+$/.test(pid)) return { placement: 'unknown', why: 'tmux reported no server pid' };
-  let text;
-  try { text = readCgroup(pid); } catch (e) { return { placement: 'unknown', why: why(e) }; }
-  return placementFromCgroup(text);
+  let text, own;
+  try { text = readCgroup(pid); own = readCgroup('self'); } catch (e) { return { placement: 'unknown', why: why(e) }; }
+  return placementFromCgroup(text, own);
 }
 
 // PURE: the line the bare call's success logs, worded from where the server sits. The unscoped wording is
-// the line as it always was (its pins stay); the other two predict no loss.
-function bareEnsuredLine({ placement, unit, why }) {
+// the line as it always was (its pins stay); the other three predict no loss.
+function bareEnsuredLine({ placement, unit, cgroup, why }) {
   if (placement === 'scoped') {
     return `tmux server ensured — already running inside ${unit} (the scoped start had begun it, or an earlier one still holds it); a service restart leaves it and its sessions' jobs alive`;
   }
   if (placement === 'unscoped') {
     return 'tmux server ensured without a scope — under the service, a service restart will take it down';
+  }
+  if (placement === 'outside') {
+    return `tmux server ensured — already running outside the service's cgroup, in ${cgroup} (a server begun from a terminal sits in the login session's scope); a service restart leaves it and its sessions' jobs alive`;
   }
   return `tmux server ensured — whether it sits in a scope could not be read (${why}); under the service, a restart takes it down only if it is not in one`;
 }
