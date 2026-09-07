@@ -25930,16 +25930,18 @@ def _login_state():
 
 
 def _login_abort_locked(err=""):
-    pid, fd = _login_flow["pid"], _login_flow["fd"]
+    """End the flow: clear the record and SIGTERM the CLI. The PTY master fd is NOT closed here — the
+    reader thread owns it and closes it when it exits (within one 0.5 s select timeout once the pid
+    check fails). Closing it from here while the reader was parked in select on that fd number let the
+    next _login_start reuse the same number for ITS master, and the old thread's os.read then swallowed
+    the new flow's first output — the trust prompt never seen, the new flow hung until its timeout
+    (review find on #931, 2026-09-07; the PR's own flow tests tripped it: tearDown cancels, the next
+    test starts)."""
+    pid = _login_flow["pid"]
     _login_flow.update(state=("error" if err else ""), url="", err=err, pid=0, fd=-1)
     if pid:
         try:
             os.kill(pid, signal.SIGTERM)
-        except Exception:
-            pass
-    if fd >= 0:
-        try:
-            os.close(fd)
         except Exception:
             pass
 
@@ -26050,6 +26052,16 @@ def _login_reader(fd, proc):
     nothing from this stream is ever logged verbatim (the paste prompt window can contain the code
     echo), and the buffer dies with the thread."""
     import select as _select
+    try:
+        _login_reader_loop(fd, proc, _select)
+    finally:
+        try:
+            os.close(fd)                         # the reader is the fd's sole owner (see _login_abort_locked)
+        except OSError:
+            pass
+
+
+def _login_reader_loop(fd, proc, _select):
     buf = ""
     sent_login = sent_pick = trust_answered = False
     t0 = time.time()
@@ -26101,6 +26113,17 @@ def _login_reader(fd, proc):
         low0all = low.replace(" ", "")
         pidx = low0all.rfind("pastecodehere")
         low0v = low0all[pidx:] if pidx >= 0 else ""
+        if pidx >= 0 and not url:
+            # The CLI is already asking for the code, so it HAS printed its sign-in link — and _login_url
+            # found none it will stand behind (the allowlist rejected it, or the shape moved). Waiting on
+            # would only report a timeout ten minutes later; the event is here, so say what happened now
+            # (review find on #931, 2026-09-07).
+            with _login_lock:
+                if _login_flow["pid"] == proc.pid and _login_flow["state"] == "starting":
+                    _login_abort_locked("the sign-in link the CLI printed could not be read — log in from a "
+                                        "terminal with `claude /login`, or update the CLI")
+                    _push_soon()
+                    return
         if "loggedinas" in low0v or "loginsuccessful" in low0v:
             with _login_lock:
                 if _login_flow["pid"] == proc.pid:

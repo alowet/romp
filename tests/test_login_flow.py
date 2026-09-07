@@ -199,6 +199,43 @@ class LoginFlow(unittest.TestCase):
         self.assertEqual(km._login_start(), "", "…and a fresh start is allowed after")
         km._login_cancel()
 
+    def test_cancel_then_immediate_restart_reaches_the_url_again(self):
+        # the fd race (review find on #931, 2026-09-07): cancel used to close the PTY master while the old
+        # reader was parked in select on that fd number; the next start reused the number and the old
+        # thread's os.read swallowed the new flow's first output, so the new flow never saw the trust
+        # prompt and hung to its timeout. The reader owns the fd now; a restart right after a cancel lands.
+        for _ in range(3):
+            self.assertEqual(km._login_start(), "")
+            st = _wait_state("url")
+            self.assertEqual(st["state"], "url", "a fresh flow reaches its URL after a cancel: %r" % st)
+            km._login_cancel()
+
+    def test_a_paste_prompt_with_no_readable_link_fails_loudly_at_once(self):
+        # the CLI is already asking for the code, so it HAS printed its link — and _login_url found none it
+        # will stand behind (allowlist rejected it / the shape moved). Waiting on would only report a
+        # timeout ten minutes later; the event is the prompt, so the flow errors there (review find on
+        # #931, 2026-09-07). Driven on a private PTY pair with a fake child, no CLI involved.
+        import pty as _pty, select as _select, threading
+        m, sl = _pty.openpty()
+        class _Proc:
+            pid = 999999991
+            def poll(self): return None
+        proc = _Proc()
+        with km._login_lock:
+            km._login_flow.update(state="starting", url="", err="", t=time.time(), pid=proc.pid, fd=m)
+        th = threading.Thread(target=km._login_reader, args=(m, proc), daemon=True)
+        th.start()
+        os.write(sl, b"Browser did not open? Use this link instead:\r\nhttps://evil.example/oauth/authorize?x=1 \r\nPaste code here if prompted > ")
+        deadline = time.time() + 5
+        while time.time() < deadline and km._login_state()["state"] == "starting":
+            time.sleep(0.05)
+        st = km._login_state()
+        os.close(sl)
+        th.join(3)
+        self.assertEqual(st["state"], "error", "no waiting for the timeout: %r" % st)
+        self.assertIn("could not be read", st["err"])
+        self.assertFalse(th.is_alive(), "the reader exited and closed its fd")
+
     def test_code_without_a_flow_refuses(self):
         self.assertNotEqual(km._login_code("SYNTH-ORPHAN"), "")
 
