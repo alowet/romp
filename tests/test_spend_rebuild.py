@@ -195,6 +195,55 @@ class SpendRebuild(unittest.TestCase):
         self.assertEqual(self._read()["hours"][self.hour]["tokCacheR"], 5000)
         self.assertEqual(self._read()["hours"][self.hour]["usd"], 9.0)
 
+    def test_a_session_whose_transcript_is_gone_keeps_its_recorded_tokens(self):
+        # the never-lower rule holds PER SESSION (review find on #956, 2026-09-07): API's transcript is gone
+        # while WEB's recount lifts the bucket total past the bar — the bucket used to pass and API's bySid
+        # row (and its share of the key sub-count) was silently zeroed. Missing evidence for ANY recorded
+        # session keeps the whole bucket, and says so.
+        self._transcript(WEB, [(0, "m1", U1, False)])          # WEB recounts to 5410, above its recorded 100
+        self._reg(WEB, "web"); self._reg(API, "api")
+        b = {"usd": 2.0, "turns": 2, "tokIn": 10, "tokOut": 10, "tokCacheR": 100, "tokCacheW": 10,
+             "key": {"usd": 2.0, "turns": 2, "tok": 130},
+             "bySid": {WEB: {"usd": 1.0, "turns": 1, "tok": 100, "key": {"usd": 1.0, "turns": 1, "tok": 100}},
+                       API: {"usd": 1.0, "turns": 1, "tok": 30, "key": {"usd": 1.0, "turns": 1, "tok": 30}}}}
+        self._ledger({self.day: dict(b)}, {self.hour: dict(b)})
+        self.assertEqual(self._run("--apply"), 0)
+        self.assertEqual(self._read()["hours"][self.hour], b, "API has no evidence → the bucket is kept as recorded")
+        self.assertEqual(self._run("--apply", "--allow-lower"), 0)
+        h = self._read()["hours"][self.hour]
+        self.assertEqual(h["bySid"][API]["tok"], 0, "--allow-lower takes the lower figure on purpose")
+
+    def test_an_earlier_clear_episodes_transcript_is_counted(self):
+        # a /clear mints a new fsid; the previous conversation stays under the old one, which the kernel
+        # records in episodes/<sid>.jsonl — the rebuild must read it (review find on #956, 2026-09-07)
+        old_fsid = "11111111-2222-3333-4444-aaaaaaaaaaaa"
+        self._transcript(old_fsid, [(0, "m1", U1, False)])   # the pre-/clear episode
+        self._transcript(WEB, [(30, "m2", U2, False)])       # the current one
+        self._reg(WEB, "web")
+        (self.state / "episodes").mkdir()
+        (self.state / "episodes" / (WEB + ".jsonl")).write_text(json.dumps({"t": 1, "fsid": old_fsid}) + "\n")
+        b = {"usd": 2.0, "turns": 2, "tokIn": 0, "tokOut": 0, "tokCacheR": 0, "tokCacheW": 0}
+        self._ledger({self.day: dict(b)}, {self.hour: dict(b)})
+        self.assertEqual(self._run("--apply"), 0)
+        h = self._read()["hours"][self.hour]
+        self.assertEqual(h["tokCacheR"], 5000 + 5300, "both episodes' calls count toward the session")
+        self.assertEqual(h["bySid"][WEB]["tok"], _tok(U1) + _tok(U2))
+
+    def test_keyed_ness_comes_from_the_ledgers_own_row_before_the_registrys_current_auth(self):
+        # the registry holds only the CURRENT auth; an auth flip overwrote it and the rebuild then moved a
+        # session's whole history across the key split. The recorder wrote bySid[sid].key exactly when the
+        # sid billed the key in that bucket — that per-bucket truth wins (review find on #956, 2026-09-07).
+        self._transcript(WEB, [(0, "m1", U1, False)])
+        self._reg(WEB, "web", auth="login")                   # flipped to login SINCE this bucket was recorded
+        b = {"usd": 1.0, "turns": 1, "tokIn": 0, "tokOut": 0, "tokCacheR": 0, "tokCacheW": 0,
+             "key": {"usd": 1.0, "turns": 1, "tok": 0},
+             "bySid": {WEB: {"usd": 1.0, "turns": 1, "tok": 0, "key": {"usd": 1.0, "turns": 1, "tok": 0}}}}
+        self._ledger({self.day: dict(b)}, {self.hour: dict(b)})
+        self.assertEqual(self._run("--apply"), 0)
+        h = self._read()["hours"][self.hour]
+        self.assertEqual(h["key"]["tok"], _tok(U1), "the bucket says WEB billed the key then; today's auth does not rewrite that")
+        self.assertEqual(h["bySid"][WEB]["key"]["tok"], _tok(U1))
+
     def test_the_source_pins(self):
         src = open(os.path.join(os.path.dirname(HERE), "cli", "spend_rebuild.py")).read()
         self.assertIn("if mid in seen", src.replace("or mid in seen", "if mid in seen"), "streaming splits count once")

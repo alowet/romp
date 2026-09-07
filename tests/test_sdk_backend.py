@@ -2989,8 +2989,8 @@ class SpendRecord(unittest.TestCase):
             r = _ResultMessage()
             r.total_cost_usd = total
             r.model_usage = self._model_map(map_in)
-            r.usage = {"input_tokens": turn_in}      # the turn's own figure — consistent with the map's delta
-            return r
+            r.usage = {"input_tokens": 9999}         # deliberately NOT the map's delta: if the flat dict were read
+            return r                                 # or summed, tokIn would show it (review fold on #956)
         run(_result(1.0, 100, 100))    # first turn of the process: delta = the whole counter
         run(_result(2.5, 140, 40))     # second turn: deltas = 1.5 / 40 tokens, NOT another 2.5 / 140
         d = day()
@@ -3005,6 +3005,31 @@ class SpendRecord(unittest.TestCase):
         run(_result(0.5, 20, 20))      # a counter BELOW the watermark = a reset we missed → fold it whole
         self.assertAlmostEqual(day()["usd"], 3.8)
         self.assertEqual(day()["tokIn"], 190)
+
+    def test_a_clear_resets_the_watermarks_on_the_lastsid_flip_even_when_the_new_counter_is_higher(self):
+        # the /clear reset used to be inferred only from a counter that fell BELOW the watermark; a first
+        # post-clear turn larger than the whole pre-clear total was diffed against the old watermark and
+        # under-counted. The lastSid flip with `clearing` set IS the reset event (review find on #956,
+        # 2026-09-07): both watermarks go to zero there, so the next result folds whole.
+        s, run, day = self._spend_session()
+        def _result(total, map_in):
+            r = _ResultMessage(); r.total_cost_usd = total; r.model_usage = self._model_map(map_in)
+            r.usage = {"input_tokens": 9999}; return r
+        run(_result(1.0, 100))
+        self.assertEqual(day()["tokIn"], 100)
+        s._clearing = True                                    # a /clear was delivered…
+        class _Init:                                          # …and the CLI's init lands on a NEW fsid
+            subtype = "init"
+            data = {"session_id": "11111111-2222-3333-4444-cccccccccccc", "model": "claude-x"}
+        import asyncio
+        async def go():
+            s._on_message(_Init(), _AssistantMessage, _ResultMessage, _Init)
+            await asyncio.sleep(0)
+        asyncio.run(go())
+        self.assertEqual((s._last_cost_total, s._last_usage_totals), (0.0, {}), "reset on the event, not on a guess")
+        run(_result(2.0, 150))                                # HIGHER than the old watermark: the guess would diff it
+        self.assertEqual(day()["tokIn"], 250, "folded whole after the clear, not 150 - 100")
+        self.assertAlmostEqual(day()["usd"], 3.0)
 
     def test_the_model_usage_map_sums_across_models_and_all_four_kinds(self):
         # a mid-process model switch keeps BOTH models' running totals in the map — the process total

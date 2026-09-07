@@ -71,6 +71,24 @@ def _registry(state):
         ids = {sid}
         if d.get("lastSid"):
             ids.add(str(d["lastSid"]))     # a resumed session's transcript is named for the CLI's id
+        # …and every EARLIER episode: a /clear mints a new fsid and leaves the previous conversation under
+        # the old one (episodes/<sid>.jsonl, one fsid per row), and a resume fork records both ends
+        # (states/<sid>.jsonl resumeFork rows) — the same set the kernel's known_fsids() derives, without
+        # loading the SDK backend for it (review find on #956, 2026-09-07: those transcripts were skipped,
+        # so a session that /cleared lost its earlier tokens on rebuild)
+        for sub, pick in (("episodes", lambda r: [r.get("fsid")]),
+                          ("states", lambda r: [(r.get("resumeFork") or {}).get(k) for k in ("from", "to")])):
+            try:
+                lines = (state / sub / (sid + ".jsonl")).read_text().splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict):
+                    ids.update(str(v) for v in pick(r) if v)
         out[sid] = {"name": str(d.get("name") or sid[:8]),
                     "keyed": bool(d.get("apiKeyAuth")) or str(d.get("auth") or "") == "key",
                     "threadOf": str(d.get("threadOf") or ""), "ids": ids}
@@ -162,7 +180,15 @@ def rebuild(ledger, per, reg, now=None, allow_lower=False):
             counts = per.get((kind, key), {})
             old_tok = sum(int(e.get(k) or 0) for k, _ in KINDS)
             tot = {k: sum(c[k] for c in counts.values()) for k, _ in KINDS}
-            if sum(tot.values()) < old_tok and not allow_lower:
+            # The never-lower rule holds PER SESSION, not only for the bucket total: a session whose
+            # transcript is gone recounts to zero, and when a sibling's recount lifts the total past the
+            # bar the bucket used to pass while that session's bySid row and its share of the key
+            # sub-count were silently zeroed (review find on #956, 2026-09-07). Any recorded session
+            # that recounts lower is missing evidence, so the whole bucket is kept as recorded.
+            by_old = e.get("bySid") if isinstance(e.get("bySid"), dict) else {}
+            sid_lower = [s for s, se in by_old.items()
+                         if isinstance(se, dict) and int(se.get("tok") or 0) > sum((counts.get(s) or {}).values())]
+            if (sum(tot.values()) < old_tok or sid_lower) and not allow_lower:
                 out[kind][key] = e          # a lower recount is missing evidence, not a correction
                 kept.append((kind, key, old_tok, sum(tot.values())))
                 continue
@@ -204,6 +230,19 @@ def _now_key(kind, now):
 
 
 def _is_keyed(sid, reg, bucket):
+    """Did `sid` bill the API key in this bucket? The LEDGER already holds the per-turn truth: the
+    recorder writes bySid[sid].key exactly when that sid billed the key in that bucket. The registry
+    holds only the session's CURRENT auth, which an auth flip overwrites — so reading it first moved an
+    auth-flipped session's whole history across the key split on rebuild (review find on #956,
+    2026-09-07). Ledger first; the registry only for a sid with no bySid row in this bucket."""
+    by = bucket.get("bySid") if isinstance(bucket.get("bySid"), dict) else {}
+    se = by.get(sid) if isinstance(by.get(sid), dict) else None
+    if se is not None:
+        ske = se.get("key") if isinstance(se.get("key"), dict) else None
+        if ske is not None:
+            return int(ske.get("turns") or 0) > 0
+        if int(se.get("turns") or 0) > 0:
+            return False                     # turns recorded, none of them keyed
     info = reg.get(sid)
     if info is not None and info["keyed"] is not None:
         return bool(info["keyed"])

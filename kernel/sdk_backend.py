@@ -3651,6 +3651,13 @@ class SdkSession:
                 # clearing bracket ends here (event-based; the ResultMessage below is only the backstop).
                 clearing = self._clearing
                 self._clearing = False
+                if clearing:
+                    # The CLI zeroed total_cost_usd and modelUsage at this instant (a /clear resets both,
+                    # same lifecycle); reset the spend watermarks on the EVENT rather than waiting for the
+                    # next result to read below them (review find on #956, 2026-09-07). The shrunken-counter
+                    # rule in _turn_usage / the cost delta stays as the backstop for a reset we did not see.
+                    self._last_cost_total = 0.0
+                    self._last_usage_totals = {}
                 # A RESUME landing on a NEW fsid = a fresh-headed fork: record the old->new lineage
                 # (see append_resume_fork for the full story — the parser stitches the chain from it,
                 # the user 2026-08-14). A /clear's flip and a born-as-a-fork copy record nothing.
