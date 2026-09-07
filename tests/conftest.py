@@ -4,26 +4,85 @@ any test that skips its own rebind writes into the REAL ~/.local/state/romp (the
 judge-errors.jsonl lines from legacy-flag fixtures made that visible). conftest.py imports before every
 test module, so this is a suite-wide floor; per-class _rebind_state/tempdir isolation still layers on
 top exactly as before."""
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 
 import pytest
 
-os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="romp-tests-state-")   # recorded by tests/__init__.py's hook
-os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel exports this to its sessions; it outranks the XDG floor
+# Temp-directory hygiene, the child-process half (2026-09-06): every temp path a run creates lives
+# under ONE private root, removed when the run ends. tests/__init__.py's mkdtemp hook (the other
+# half; its comment has the leak's history) records and removes what THIS process mints through
+# tempfile.mkdtemp, but a test's children — kernels, git, `mktemp -d` in a shell — and mkstemp or
+# os.mkdir paths are outside its sight (a full run left ~5,600 of those per run at up to ten a
+# second). So the process's temp dir is redirected: tempfile.tempdir is set directly (gettempdir()
+# caches its first answer, and tests/__init__.py has already called it by the time this runs), and
+# TMPDIR is exported so every child inherits the same root. Import-time, not pytest_configure: this
+# module's own XDG floor below and every module-level mkdtemp at collection must land inside it.
+# The two removals compose without overlap: pytest_sessionfinish runs the hook's sweep, whose scope
+# is gettempdir() and so the inside of this root; pytest_unconfigure then removes the root whole
+# (whatever the sweep could not see) and tests/__init__.py's romp-tests-state-* dir — the package
+# imports first, so that dir and this root were minted before the redirect and are the two things a
+# run puts outside the root; the hook recorded both but skips them as outside its scope. Under
+# pytest-xdist both hooks run in the controller and in every worker: each imported this file and so
+# owns a root of its own (a worker's sits inside the controller's, since it inherits that TMPDIR).
+# The atexit registrations are silent fallbacks for a normal exit that skipped the hooks, each a
+# no-op on what the other removed; nothing runs after an os._exit (pytest-timeout's thread method
+# ends a hung run that way), so a hang leaves two top-level entries in the system temp dir, this
+# root and that state dir, both under the romp-tests- prefix.
+# The system temp dir — the one the RUN was handed, before any redirect — is recorded once, by the
+# first conftest to import: an xdist worker inherits the controller's record along with its TMPDIR
+# (setdefault, not an assignment: a worker's own gettempdir() is the controller's root, and
+# recording that put the worker's fallback one level deeper than a socket path can bear under a
+# long TMPDIR — four socket tests failed at bind under -n 2). A test that must leave the root (an
+# AF_UNIX socket path that would not fit sun_path under a nested root) falls back to it, and only
+# to it — a literal system path in a `dir=` would bypass the redirect (one did).
+os.environ.setdefault("ROMP_TESTS_SYSTEM_TMPDIR", tempfile.gettempdir())
+_TMP_ROOT = tempfile.mkdtemp(prefix="romp-tests-")
+tempfile.tempdir = _TMP_ROOT
+os.environ["TMPDIR"] = _TMP_ROOT
+_PACKAGE_STATE_DIR = getattr(sys.modules.get("tests"), "STATE_DIR", None)
 
 
+def _remove_run_dirs(report=False):
+    """Remove the root and the package state dir. A survivor is named on stderr when asked: rmtree
+    with ignore_errors swallows a child still writing under the root or a 000-mode directory a test
+    left behind, and the run would otherwise end green with the root standing. Only unconfigure
+    asks; the atexit fallback stays silent so it neither repeats the notice nor contradicts it."""
+    for d in (_TMP_ROOT, _PACKAGE_STATE_DIR):
+        if d:
+            shutil.rmtree(d, ignore_errors=True)
+            if report and os.path.isdir(d):
+                print("[tests] not removed at run end: %s" % d, file=sys.stderr)
+
+
+atexit.register(_remove_run_dirs)
+
+
+@pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
-    """Temp-directory hygiene (2026-09-06, see tests/__init__.py): remove every directory this
-    process made through tempfile.mkdtemp, this state root included, when the session ends. Runs in
-    the controller and in every xdist worker, since each is its own pytest session. The package's
-    atexit hook does the same at interpreter exit; both are idempotent."""
+    """The in-process half (tests/__init__.py): remove every directory this process made through
+    tempfile.mkdtemp inside the root, this module's state root included, when the session ends. Runs
+    in the controller and in every xdist worker, since each is its own pytest session, and last, after
+    pytest's own runner sessionfinish has performed the deferred teardown an interrupted run leaves
+    behind, so nothing is swept from under a fixture still closing. The package's atexit hook does the
+    same at interpreter exit; both are idempotent, and pytest_unconfigure below takes the root itself
+    afterwards."""
     try:
         from tests import remove_made_dirs
     except Exception:
         return
     remove_made_dirs()
+
+
+def pytest_unconfigure(config):
+    _remove_run_dirs(report=True)
+
+
+os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="romp-tests-state-")   # inside the root; the hook records it
+os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel exports this to its sessions; it outranks the XDG floor
 
 
 # No test may reach a REAL manager control port (2026-08-27): on a machine running a live romp,

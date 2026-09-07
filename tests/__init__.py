@@ -9,18 +9,25 @@ import os
 import shutil
 import tempfile
 
-# Temp-directory hygiene (2026-09-06): the suite used to leak every directory it made. This floor and
-# conftest.py's each minted a state root per process and never removed it (two per pytest process:
-# eighteen for a `pytest -n 8` run), and about three hundred test modules call tempfile.mkdtemp with
-# no cleanup of their own. On a developer machine that ran the suite many times a day that left about
-# 1.9 million directories under the system temp directory, enough that listing it took minutes and
-# tens of gigabytes of memory, and the out-of-memory kills that followed took a running romp kernel
-# down. The fix is at the source: every tempfile.mkdtemp call made in this process is recorded, and
-# everything recorded is removed at interpreter exit (and, under pytest, at session end; see
-# conftest.py). Only directories this process created, and only under the system temp directory, are
-# ever removed. tempfile.TemporaryDirectory goes through the same mkdtemp and cleans itself first, so
-# the exit sweep finds nothing of it. This package imports before conftest.py (pytest imports
-# `tests.conftest` through the package), so conftest's own root is recorded too.
+# Temp-directory hygiene, the in-process half (2026-09-06): the suite used to leak every directory it
+# made. This floor and conftest.py's each minted a state root per process and never removed it (two
+# per pytest process: eighteen for a `pytest -n 8` run), and about three hundred test modules call
+# tempfile.mkdtemp with no cleanup of their own. On a developer machine that ran the suite many times
+# a day that left about 1.9 million directories under the system temp directory, enough that listing
+# it took minutes and tens of gigabytes of memory, and the out-of-memory kills that followed took a
+# running romp kernel down. The fix is at the source: every tempfile.mkdtemp call made in THIS
+# process is recorded, and everything recorded is removed at interpreter exit (and, under pytest, at
+# session end; see conftest.py). Only directories this process created, and only under the process
+# temp dir, are ever removed: tempfile.gettempdir(), which is the system temp dir under a unittest
+# run and conftest's private per-run root under pytest. tempfile.TemporaryDirectory goes through the
+# same mkdtemp and cleans itself first, so the exit sweep finds nothing of it.
+# What this hook cannot see is the other half, conftest.py's: directories made by CHILD processes
+# (kernels, git, a shell's `mktemp -d`), files from mkstemp, and os.mkdir paths under the temp dir.
+# Under pytest those land in conftest's root because TMPDIR points there, and the root is removed
+# whole at run end; the two directories this process mints BEFORE that redirect (this package's
+# state dir below, and the root itself, both recorded here but outside the redirected gettempdir()
+# and so skipped by this sweep) are conftest's to remove. No such cover exists under a bare
+# unittest run, where the per-module cleanups (addCleanup, tearDownClass) are what there is.
 _MADE_DIRS = []
 _REAL_MKDTEMP = tempfile.mkdtemp
 
@@ -53,4 +60,10 @@ def remove_made_dirs():
 atexit.register(remove_made_dirs)
 
 os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="romp-tests-state-")
+# Recorded by the hook above, which removes it at exit under a unittest run. Under pytest it is
+# minted BEFORE conftest.py redirects the temp root (the package imports first), so it sits beside
+# the root in the system temp dir, outside the hook's redirected scope; conftest reads STATE_DIR
+# and removes it with the root when the run ends. Nothing runs after an os._exit (pytest-timeout's
+# thread method ends a hung run that way), so a hung run leaves this dir beside the root.
+STATE_DIR = os.environ["XDG_STATE_HOME"]
 os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel's export outranks the XDG floor
