@@ -4289,20 +4289,50 @@ def _heal_timeline_views(old_sid, new_sid):
     session): carry the old sid's tag memberships to the new one, exactly like the order-slot
     inheritance that detects the churn. Without this a tagged session would silently fall out of
     its tag on every /clear. (The hidden half retired with the set, 2026-08-24.)"""
-    v = _timeline_views()
     def _has(t):
         return any(m["host"] == "" and m["sid"] == old_sid for m in t["members"])
-    if not any(_has(t) for t in v["tags"]):
-        return
-    v = json.loads(json.dumps(v))                    # deep copy: never mutate the cached blob
-    # COPY, never move: stripping the old sid un-hid its DEAD lane, which lingers on the timeline for
-    # hours — and when the old sid is still alive (a fork beside a living parent, or an unrelated new
-    # session reusing a name), moving would steal the living session's state. A dead sid left in the
-    # lists is inert; the normalizer keeps them bounded.
-    for t in v["tags"]:
-        if _has(t):
-            t["members"] = t["members"] + [{"host": "", "sid": new_sid}]   # normalizer dedups + re-sorts
-    _set_timeline_views(v)
+    with _views_lock:   # RMW like _edit_tag: a write landing inside the read-to-write window is lost
+        v = _timeline_views()
+        if not any(_has(t) for t in v["tags"]):
+            return
+        v = json.loads(json.dumps(v))                    # deep copy: never mutate the cached blob
+        # COPY, never move: stripping the old sid un-hid its DEAD lane, which lingers on the timeline for
+        # hours — and when the old sid is still alive (a fork beside a living parent, or an unrelated new
+        # session reusing a name), moving would steal the living session's state. A dead sid left in the
+        # lists is inert; the normalizer keeps them bounded.
+        for t in v["tags"]:
+            if _has(t):
+                t["members"] = t["members"] + [{"host": "", "sid": new_sid}]   # normalizer dedups + re-sorts
+        _set_timeline_views(v)
+
+
+def _inherit_tag_membership(parent_sid, child_sid):
+    """A session SPAWNED from another — a fork, a `romp new` run from inside a session's shell, a
+    comment thread promoted to a session — joins every LOCAL tag holding its parent, at the creation
+    event (the user 2026-09-04: tab groups are tags, and a session's children land in its group).
+    The sibling of _heal_timeline_views, which copies membership for fsid churn of the SAME logical
+    session by name match: a child has a NEW name, so that heal never fires for it, and this runs
+    where the parent is known instead of being detected later. COPY, never move — the parent keeps
+    its tags. No-op when the parent holds none; idempotent (the normalizer dedups pairs). Local tags
+    only in v1: a parent held only by a REMOTE-homed tag is not inherited here (its home kernel
+    would have to be asked — the accepted gap). Returns the inherited tag names."""
+    parent_sid, child_sid = str(parent_sid or ""), str(child_sid or "")
+    if not parent_sid or not child_sid or parent_sid == child_sid:
+        return []
+    with _views_lock:   # RMW like _edit_tag: two unlocked copies would both write the same pre-state
+        v = _timeline_views()
+        def _has(t):
+            return any(m["host"] == "" and m["sid"] == parent_sid for m in t["members"])
+        names = [t["name"] for t in v["tags"] if _has(t)]
+        if not names:
+            return []
+        v = json.loads(json.dumps(v))                # deep copy: never mutate the cached blob
+        for t in v["tags"]:
+            if _has(t):
+                t["members"] = t["members"] + [{"host": "", "sid": child_sid}]
+        _set_timeline_views(v)
+    _mark_views_dirty()
+    return names
 
 
 def _b36(n):
@@ -4411,9 +4441,8 @@ def _move_tag_member(tid_from, tid_to, sids):
     """A session's MOVE between two local tags — off `tid_from`, onto `tid_to` — as ONE write under
     _views_lock: both halves land or neither does (the 2026-09-05 review: as two targeted ops, a
     refused second half left the session in no group, and the tab strip showed the half-moved state
-    until the user noticed). No client gesture posts it yet; a tab-strip "Move to <tag>" row is the
-    intended caller. Members arrive as the viewer-relative id strings every client posts
-    (_member_pair canonicalizes). Returns
+    until the user noticed). The strip's "Move to <tag>" posts this. Members arrive as the
+    viewer-relative id strings every client posts (_member_pair canonicalizes). Returns
     (tag-or-None, error-or-None) like _edit_tag; the tag is the destination's post-write row."""
     with _views_lock:
         v = json.loads(json.dumps(_timeline_views()))     # deep copy: never mutate the cached blob
@@ -4554,6 +4583,119 @@ def _ack_views_write(client, kind, write_id, ok, error=None, refused=None, info=
         client["send"](json.dumps(ack))
     except Exception:
         pass
+
+
+def _resolve_parent_sid(raw, live):
+    """The `parent` a /new body or a createSession op names — the session a new one is spawned FROM
+    (`romp new` sends its own ROMP_SID) — resolved to a sid: a LIVE name, or a sid this kernel knows
+    (a names/ entry, or a backend that owns it). Returns (sid, None); ("", None) when nothing was
+    named; (None, error) when nothing here answers to it — the caller refuses the WHOLE request
+    (fail loudly), never spawns a child that quietly inherited nothing."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return "", None
+    if raw in live:
+        return live[raw], None
+    if re.fullmatch(r"[0-9a-fA-F-]{32,36}", raw):
+        known = False
+        try:
+            known = (jd.STATE / "names" / raw).exists()
+        except OSError:
+            pass
+        if not known:
+            try:
+                be = Sessions.backend_for(raw)
+                known = bool(hasattr(be, "owns") and be.owns(raw))
+            except Exception:
+                known = False
+        if known:
+            return _tag_parent_of(raw), None
+    return None, ('parent "%s" is not a session this kernel knows (a live name, or the sid of one it has run)'
+                  % raw)
+
+
+def _tag_parent_of(sid):
+    """The session whose TAGS a child of `sid` inherits: `sid` itself, unless it is a comment thread —
+    a thread's CLI carries the thread's own sid as ROMP_SID, and a thread holds no tags (it has no
+    tab; it is tagged only when promoted), so a `romp new` run from inside a thread names the
+    tab-bearing session the thread lives in (its `threadOf`). Walks up at most once: threads hang
+    off sessions, never off threads."""
+    try:
+        be = Sessions.backend_for(sid)
+        up = str(be.thread_of(sid) or "") if hasattr(be, "thread_of") else ""
+    except Exception:
+        up = ""
+    return up or sid
+
+
+def _parent_from_request(body, live):
+    """The `parent` a /new body or a createSession op names, resolved (_resolve_parent_sid) with the
+    CLI's `parentAuto` marker honoured. `romp new` sends its own ROMP_SID as parent BY DEFAULT, so a
+    flagless `romp new` aimed at a kernel that never ran the calling session (a scratch kernel on
+    another port) would otherwise die with a 400 naming a sid the user never typed. An UNKNOWN auto
+    parent is "nothing to inherit": the session is created untagged and the ack echoes
+    `parentIgnored` (the sid) so the CLI can say so in one line. An unknown EXPLICIT parent — the
+    picker, a raw caller, no marker — still refuses the whole request. Returns (sid, error, ignored)."""
+    raw = (body or {}).get("parent")
+    psid, perr = _resolve_parent_sid(raw, live)
+    if perr and (body or {}).get("parentAuto"):
+        return "", None, str(raw or "").strip()
+    return psid, perr, ""
+
+
+def _tags_error(tags):
+    """Validate a /new or createSession `tags` list (tag NAMES the new session joins): a list of
+    non-empty strings, or the error the caller refuses the whole request with. Absent/None is
+    "not asked" and never reaches here."""
+    if not isinstance(tags, list):
+        return "tags must be a list of tag names"
+    for t in tags:
+        if not isinstance(t, str) or not t.strip():
+            return "tags must be non-empty tag names (got %r)" % (t,)
+    return None
+
+
+def _tag_ack(sid, parent_sid="", tags=()):
+    """The tag half of a creation event (tab groups on tags, the user 2026-09-04): the new session
+    inherits its parent's tag memberships (_inherit_tag_membership), then joins every tag the
+    request named — `romp new --in`, the picker's Tags row — created on first use exactly like
+    POST /tag (_edit_tag). Returns the keys the ack carries:
+      tags          — the session's tag names AFTER both, read back from the store: the echo whose
+                      PRESENCE tells a caller an older kernel did not drop the ask
+      tagsRequested — the names as sent, in request order
+      tagsApplied   — positionally, the STORED name each request landed as (None when refused). The
+                      store normalizes a name — trims it, clamps it to _VIEWS_MAX_NAME — so a raw
+                      request compared against `tags` read as "not applied" when it was; the CLI
+                      matches by position and says "applied as <name>" instead
+      tagError      — the first refused tag edit's reason, when any
+    The session exists by the time a tag edit can refuse (a same-named twin, the tag cap), so the
+    refusal rides beside the ack rather than undoing the spawn; the caller surfaces it."""
+    sid = str(sid)
+    tags = [str(t) for t in (tags or ())]
+    err = None
+    applied = []
+    if parent_sid:
+        _inherit_tag_membership(parent_sid, sid)
+    for name in tags:
+        row, e = _edit_tag(name.strip(), add=[sid])
+        applied.append(row["name"] if row else None)
+        if e and not err:
+            err = e
+    if tags:
+        _mark_views_dirty()
+    names = [t["name"] for t in _timeline_views()["tags"]
+             if any(m["host"] == "" and m["sid"] == sid for m in t["members"])]
+    out = {"tags": names, "tagsRequested": tags, "tagsApplied": applied}
+    if err:
+        out["tagError"] = err
+    return out
+
+
+def _tag_new_session(sid, parent_sid="", tags=()):
+    """_tag_ack's (names, error) shape — the session's tag names after inheriting and joining, and the
+    first refused tag edit. See _tag_ack for the full echo a creation ack carries."""
+    a = _tag_ack(sid, parent_sid, tags)
+    return a["tags"], a.get("tagError")
 
 
 # ── per-session view flags (the user 2026-06-19) ──────────────────────────────────────────────────
@@ -10295,7 +10437,7 @@ def _apply_new_session_prefs(sid, body):
     return out
 
 
-def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None, env=None):
+def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None, env=None, parent="", tags=()):
     """Create + open a new SDK-backed session, ACK-FAST (the user 2026-07-14, who asked why it took so long
     to open a new SDK session). spawn() is file writes and connect() is threaded (~0.4s to a booting
     CLI) — the 7-10s the user waited was the handler's inline _push_all(): a new session invalidates the
@@ -10329,6 +10471,15 @@ def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None, env=None):
     # skips the set — the echo still comes back through `extra`.
     sid = _sdk().spawn(nm, cwd, bg, fg, auth=auth, env=env)
     extra = _apply_new_session_prefs(sid, prefs or {})
+    # `parent` (a sid) + `tags` (names) — tab groups on tags (the user 2026-09-04): the child inherits
+    # the parent's tag memberships and joins the named tags BEFORE the direct push below, so the very
+    # first tabOrder frame (which carries the views blob) already sections the new tab under its
+    # group — applied a cycle later, the tab would land untagged and then jump. The `tags` echo (the
+    # child's names after both) rides `extra` like model/effort/env, so `romp new` is loud when a
+    # kernel drops the ask; the positional `tagsRequested`/`tagsApplied` pair lets it tell a
+    # normalized name from a dropped one, and a refused tag edit rides as `tagError` (see _tag_ack).
+    if parent or tags:
+        extra.update(_tag_ack(sid, parent, tags))
     _sdk().connect(sid)    # eager-connect so the model lists immediately, not only after the 1st message
     if client is not None:
         _reveal_chat_for(client, {"type": "focus", "id": sid})
@@ -10337,20 +10488,30 @@ def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None, env=None):
     return sid, extra
 
 
-def _create_codex_session(nm, cwd, client=None):
-    return _create_codex_session_inner(nm, cwd, client=client)
+def _create_codex_session(nm, cwd, client=None, parent="", tags=()):
+    return _create_codex_session_inner(nm, cwd, client=client, parent=parent, tags=tags)
 
 
-def _create_codex_session_inner(nm, cwd, client=None):
+def _create_codex_session_inner(nm, cwd, client=None, parent="", tags=()):
     """Create + open a new Codex-backed session — the same ACK-FAST shape as _create_sdk_session
     (focus first, dirty-mark wake, one direct push; never a synchronous fleet build here). spawn()
     starts the app-server thread, touches the materialized transcript (so discover() lists it
     immediately) and writes the shared names/ identity file. Focus rides _reveal_chat_for — the
     v1.3.6 merge renamed _reveal_chat and this caller kept the old name, so every Codex create
     raised NameError AFTER spawning (an orphan session + a failed /new; the user's audit,
-    2026-08-19, ruff's sole F821)."""
+    2026-08-19, ruff's sole F821).
+
+    `parent` (a sid) + `tags` (names) land exactly as in _create_sdk_session: the tag store keys on
+    the registry sid and knows nothing of backends, so a Codex child inherits its parent's tags and
+    joins the named ones BEFORE the direct push, and the same `tags`/`tagsRequested`/`tagsApplied`
+    echo (plus `tagError`) rides back — without this a plain `romp new <name>` from inside a session
+    on a Codex-default machine would land outside its parent's group while the CLI blamed an older
+    kernel. Returns (sid, echo)."""
     bg, fg = _pick_identity_color()
     sid = _codex().spawn(nm, cwd, bg, fg)
+    extra = {}
+    if parent or tags:
+        extra.update(_tag_ack(sid, parent, tags))
     if client is not None:
         # like _create_sdk_session/_fork_session: a client-less caller (POST /new — a headless
         # `romp new`) reveals to NOBODY; None fell through to the legacy every-window broadcast,
@@ -10358,7 +10519,7 @@ def _create_codex_session_inner(nm, cwd, client=None):
         _reveal_chat_for(client, {"type": "focus", "id": sid})
     _mark_views_dirty()
     _push_session_now(sid)
-    return sid
+    return sid, extra
 
 
 def _fork_session(parent_sid, cut_msg_uuid, new_name, now=None, client=None):
@@ -10400,6 +10561,10 @@ def _fork_session_inner(parent_sid, cut_msg_uuid, new_name, now=None, client=Non
         return err
     bg, fg = _pick_identity_color()
     be.fork(nm, parent_sid, cut_uuid, bg, fg, sid=sid)
+    # the fork inherits the parent's TAGS too (tab groups on tags, the user 2026-09-04) — the same
+    # "that conversation, continued elsewhere" contract be.fork applies to mode/effort/model/env —
+    # before the direct push below, so the first frame already sections the new tab under its group
+    _inherit_tag_membership(parent_sid, sid)
     be.connect(sid)          # eager-connect: the CLI copies the conversation and the tab fills in
     if client is not None:   # the asker's window follows its fork; nobody else's chat moves
         _reveal_chat_for(client, {"type": "focus", "id": sid})
@@ -11600,6 +11765,10 @@ def _comment_promote(parent_sid, tid, new_name, now=None, client=None):
     if not be.promote_thread(tsid, nm, bg, fg):
         return _revert("couldn't promote this thread.")
     _comment_update(parent_sid, tid, status="promoted", promotedName=nm)
+    # the thread becomes a TAB now, so it inherits the parent's tags here (tab groups on tags, the
+    # user 2026-09-04) — never at _comment_create, where it has no tab and a tagged hidden sid would
+    # only inflate the member lists
+    _inherit_tag_membership(parent_sid, tsid)
     started = be.connect(tsid)
     if client is not None:   # the promoter's window follows the new session; nobody else's chat moves
         _reveal_chat_for(client, {"type": "focus", "id": tsid})
@@ -40070,13 +40239,36 @@ class Handler(BaseHTTPRequestHandler):
                     if eerr:
                         return self._send(400, json.dumps({"ok": False, "error": eerr}),
                                           "application/json")
+                # `parent` + `tags` (tab groups on tags, the user 2026-09-04): the new session inherits
+                # its parent's tag memberships (`romp new` sends its own ROMP_SID as parent) and joins
+                # the named tags (`--in`). Validated HERE like env: an unknown parent or a malformed
+                # tags list refuses the WHOLE request (400) — never a child spawned quietly outside
+                # the group it was asked into. The one exception is the CLI's AUTO parent
+                # (`parentAuto`: ROMP_SID sent by default): unknown here means a kernel that never ran
+                # the caller, so the session is created untagged and `parentIgnored` says so
+                # (_parent_from_request). Echoed back as `tags` (the child's names after both) plus
+                # the positional `tagsRequested`/`tagsApplied` pair (_tag_ack) — the names go to the
+                # store AS SENT, which trims and clamps them, so the echo carries the stored spelling.
+                live = _live_names(_tmux_sessions())
+                psid, perr, pign = _parent_from_request(b, live)
+                if perr:
+                    return self._send(400, json.dumps({"ok": False, "error": perr}), "application/json")
+                # an ignored auto parent is still an ANSWERED ask: the empty tags echo rides with it
+                # (the CLI reads a missing echo as an older kernel), and an explicit `tags` list's
+                # own echo overrides these — hence **pextra before **extra below
+                pextra = {"parentIgnored": pign, "tags": [], "tagsRequested": [], "tagsApplied": []} if pign else {}
+                tags_req = (b or {}).get("tags")
+                if tags_req is not None:
+                    terr = _tags_error(tags_req)
+                    if terr:
+                        return self._send(400, json.dumps({"ok": False, "error": terr}), "application/json")
+                tags_req = list(tags_req or [])
                 # mkdir:true makes a missing dir (the WS op's "create it" answer, available headlessly too)
                 cwd, derr = _resolve_create_dir(b.get("dir"), create=bool(b.get("mkdir")))
                 if derr:
                     return self._send(200, json.dumps({"ok": False, "error": derr,
                                                        "dirStatus": _dir_status(b.get("dir"))}),
                                       "application/json")
-                live = _live_names(_tmux_sessions())
                 if nm in live:
                     if env_req is not None:
                         # env rides the per-sid flag-settings file, which only the SDK backend hands
@@ -40091,8 +40283,16 @@ class Handler(BaseHTTPRequestHandler):
                                 'per-session env needs an SDK session — "%s" runs on tmux, whose CLI '
                                 "reads the tmux server's environment" % nm}), "application/json")
                     extra = _apply_new_session_prefs(live[nm], b)
-                    return self._send(200, json.dumps({"ok": True, "id": live[nm], "existing": True, **extra}),
-                                      "application/json")
+                    # the idempotent open never INHERITS (no creation event — the ruling), but an
+                    # explicit --in re-asserts like model/effort/env do, and the echo tells the truth
+                    # about what the running session holds. (The picker's createSession op differs
+                    # here on purpose: its Tags row is a PREFILL from the active tab, not an ask, so
+                    # applying it to a running session would move that session into the active tab's
+                    # group unasked — the op warns instead of applying.)
+                    if psid or pign or tags_req:
+                        extra.update(_tag_ack(live[nm], "", tags_req))
+                    return self._send(200, json.dumps({"ok": True, "id": live[nm], "existing": True,
+                                                       **pextra, **extra}), "application/json")
                 names = _thread_names()
                 if names is None:
                     return self._send(503, json.dumps({"ok": False, "error": _thread_name_refusal(nm, None)}),
@@ -40102,8 +40302,16 @@ class Handler(BaseHTTPRequestHandler):
                     # a comment THREAD owns this name: the idempotent open lands on the thread (prefs
                     # applied to it — the sweep's intent) and no namesake is ever minted (T223)
                     extra = _apply_new_session_prefs(th[0], b)
+                    if psid or pign or tags_req:
+                        # a thread has no tab: nothing tagged, and the echo says so — every asked
+                        # name unapplied, with the reason, so the CLI's warning is not a bare one
+                        extra.update({"tags": [], "tagsRequested": [str(t) for t in tags_req],
+                                      "tagsApplied": [None] * len(tags_req)})
+                        if tags_req:
+                            extra["tagError"] = ('"%s" is a comment thread — it has no tab and holds no tags '
+                                                 "until it is broken out into a session" % nm)
                     return self._send(200, json.dumps({"ok": True, "id": th[0], "existing": True,
-                                                       "thread": True, "parent": th[1], **extra}),
+                                                       "thread": True, "parent": th[1], **pextra, **extra}),
                                       "application/json")
                 be_req = (b.get("backend") or _default_backend())
                 if be_req == "codex":             # parity with the WS op: same gate, same loud refusal
@@ -40112,14 +40320,23 @@ class Handler(BaseHTTPRequestHandler):
                         why = (getattr(cxbe, "_client_err", "") or CODEX_SETUP_HINT) if cxbe else CODEX_SETUP_HINT
                         return self._send(200, json.dumps({"ok": False, "error": why}),
                                           "application/json")
-                    sid = _create_codex_session(nm, cwd)
+                    if env_req is not None:
+                        # env rides the per-sid flag-settings file the SDK backend hands its CLI; a
+                        # Codex thread runs on the shared app-server and has no per-session
+                        # environment to take it — refuse, like the tmux arm, never a silent drop
+                        return self._send(200, json.dumps({"ok": False, "error":
+                            "per-session env needs the SDK backend — a Codex session runs on the "
+                            "shared app-server and takes no per-session environment"}), "application/json")
+                    # parent/tags ride the create like the SDK arm's (the tag store is backend-
+                    # agnostic), so the echo below carries the same `tags` the CLI checks
+                    sid, extra = _create_codex_session(nm, cwd, parent=psid, tags=tags_req)
                     if not sid:
                         return self._send(200, json.dumps({"ok": False,
                                                            "error": "the Codex session could not "
                                                                     "be created — is the codex "
                                                                     "app-server running?"}),
                                           "application/json")
-                    return self._send(200, json.dumps({"ok": True, "id": sid, "dir": cwd}),
+                    return self._send(200, json.dumps({"ok": True, "id": sid, "dir": cwd, **pextra, **extra}),
                                       "application/json")
                 if be_req == "sdk":
                     if not _sdk_ready():          # see _sdk_ready — a built backend is not a working one
@@ -40128,18 +40345,25 @@ class Handler(BaseHTTPRequestHandler):
                     a = (b or {}).get("auth")
                     sid, extra = _create_sdk_session(nm, cwd, auth=(a if a in ("login", "key") else ""),
                                                      prefs=b,   # pins ride the FIRST connect — see the def
-                                                     env=env_req)   # env is born into the spawn's reg
+                                                     env=env_req,   # env is born into the spawn's reg
+                                                     parent=psid, tags=tags_req)   # tags before the first push
                     if not sid:
                         return self._send(200, json.dumps({"ok": False,
                                                            "error": (extra or {}).get("error")
                                                            or "the session could not be created"}),
                                           "application/json")
-                    return self._send(200, json.dumps({"ok": True, "id": sid, "dir": cwd, **extra}),
+                    return self._send(200, json.dumps({"ok": True, "id": sid, "dir": cwd, **pextra, **extra}),
                                       "application/json")
                 if env_req is not None:
                     return self._send(200, json.dumps({"ok": False, "error":
                         "per-session env needs the SDK backend — a tmux session's CLI reads the "
                         "tmux server's environment"}), "application/json")
+                if psid or tags_req:
+                    # a tmux spawn is threaded and its sid is unknown at ack time, so nothing here could
+                    # tag it — refuse loudly rather than spawn it outside the group it was asked into
+                    return self._send(200, json.dumps({"ok": False, "error":
+                        "tags and parent need an SDK or Codex session — a terminal session's id is not "
+                        "known until it starts"}), "application/json")
                 threading.Thread(target=_spawn_session, args=(nm, cwd), daemon=True).start()
                 return self._send(200, json.dumps({"ok": True, "pending": True, "dir": cwd}),
                                   "application/json")
@@ -41344,6 +41568,12 @@ class Handler(BaseHTTPRequestHandler):
                 # "that folder doesn't exist" dialog and chose to make it (see createDirMissing below).
                 cwd, derr = _resolve_create_dir(msg.get("dir"), create=bool(msg.get("mkdir")))
                 live = _live_names(_tmux_sessions())
+                # `parent` / `tags` (tab groups on tags, the user 2026-09-04): validated up front, like
+                # POST /new — an unknown parent or a malformed tags list refuses the create loudly,
+                # BEFORE the live-name check, so a bad request is refused whether or not the name runs
+                psid, perr, _pign = _parent_from_request(msg, live)
+                ctags = [str(t).strip() for t in (msg.get("tags") or [])] if isinstance(msg.get("tags"), list) else []
+                terr = _tags_error(msg.get("tags")) if msg.get("tags") is not None else None
                 if derr:
                     st = _dir_status(msg.get("dir"))
                     if st["canCreate"] and not msg.get("mkdir"):
@@ -41356,9 +41586,20 @@ class Handler(BaseHTTPRequestHandler):
                                                    "dir": str(msg.get("dir") or ""), "status": st}))
                     else:
                         client["send"](json.dumps({"type": "warn", "text": derr}))
+                elif perr or terr:
+                    client["send"](json.dumps({"type": "warn", "text": perr or terr}))
                 elif nm in live:                 # already running → its tab is already up; just focus it
                     _reveal_chat_for(client, {"type": "focus", "id": live[nm]})
                     _mark_views_dirty()          # pusher ships the tab; never a synchronous fleet build here
+                    if ctags:
+                        # the picker's Tags row is a PREFILL from the active tab, not an ask: applying it
+                        # here would move a running session into the active tab's group unasked, and
+                        # dropping it silently is the fail-loudly rule broken — so it is neither applied
+                        # nor dropped quietly. (POST /new's existing:true arm differs on purpose: its
+                        # `tags` is always an explicit `--in`, which re-asserts like model/effort.) Sent
+                        # AFTER the focus so the client sees the running session first.
+                        client["send"](json.dumps({"type": "warn", "text":
+                            '"%s" is already running; its tags were not changed — use the tab\'s Tags menu' % nm}))
                 elif _thread_name_refusal(nm, _thread_names()):   # a thread's name (or unverifiable): never mint a namesake tab (T223)
                     client["send"](json.dumps({"type": "warn", "text": _thread_name_refusal(nm, _thread_names())}))
                 elif msg.get("backend") == "sdk":   # non-tmux: drive via the Agent SDK
@@ -41369,7 +41610,13 @@ class Handler(BaseHTTPRequestHandler):
                         # auth ('login'|'key') is the picker's per-session billing pick; anything else
                         # (older clients, no pick) means the remembered/ambient default (spawn's seed).
                         a = msg.get("auth")
-                        _create_sdk_session(nm, cwd, auth=(a if a in ("login", "key") else ""), client=client)
+                        # the picker's Tags row (prefilled from the active tab, editable) rides `tags`;
+                        # `parent` is accepted for API symmetry with /new — applied before the first
+                        # push, so the new tab lands sectioned under its group (see _create_sdk_session)
+                        _sid, extra = _create_sdk_session(nm, cwd, auth=(a if a in ("login", "key") else ""),
+                                                          client=client, parent=psid or "", tags=ctags)
+                        if extra.get("tagError"):
+                            client["send"](json.dumps({"type": "warn", "text": "tagging the new session: %s" % extra["tagError"]}))
                     else:
                         # NEVER silently fall back to tmux (the user asked for SDK and got a mystery tmux
                         # session on a remote host without the venv, 2026-07-02). Say what's missing.
@@ -41377,7 +41624,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif msg.get("backend") == "codex":   # an OpenAI Codex thread (plans/codex-backend.md)
                     if _codex_ready():
                         try:
-                            _create_codex_session(nm, cwd, client=client)
+                            # parent/tags land like the SDK arm's: the tag store keys on the registry
+                            # sid, so a Codex child sections under its group from its first frame
+                            _sid, extra = _create_codex_session(nm, cwd, client=client,
+                                                                parent=psid or "", tags=ctags)
                         except Exception as e:
                             # the generic dispatcher handler logs to stderr only — the picker's
                             # "Opening…" cue got no answer (the r28 verification). stderr FIRST:
@@ -41389,6 +41639,9 @@ class Handler(BaseHTTPRequestHandler):
                                                                    "failed: %s" % e}))
                             except Exception:
                                 pass
+                        else:
+                            if extra.get("tagError"):
+                                client["send"](json.dumps({"type": "warn", "text": "tagging the new session: %s" % extra["tagError"]}))
                     else:
                         # same rule as SDK: the user asked for Codex — refuse loudly, never a
                         # mystery tmux session. _codex_ready is False for a missing dep, a dead
@@ -41396,6 +41649,11 @@ class Handler(BaseHTTPRequestHandler):
                         be = _codex()
                         why = (getattr(be, "_client_err", "") or CODEX_SETUP_HINT) if be else CODEX_SETUP_HINT
                         client["send"](json.dumps({"type": "warn", "text": why}))
+                elif msg.get("parent") or msg.get("tags"):
+                    # a tmux spawn's sid is unknown at ack time — nothing could tag it (the /new
+                    # contract) — refuse loudly, never a spawn outside its group
+                    client["send"](json.dumps({"type": "warn", "text":
+                        "tags and parent need an SDK or Codex session — a terminal session's id is not known until it starts"}))
                 else:
                     threading.Thread(target=_spawn_session, args=(nm, cwd), daemon=True).start()
         elif msg and msg.get("type") == "cancelCreate" and msg.get("name"):
