@@ -112,7 +112,7 @@ STUB
     grep -q "pr merge" "$GH_LOG"
     # The version PR carries its tier label at creation: a required upstream check holds an
     # unlabeled PR red, so without it auto-merge never fires and the release stalls.
-    grep -q "pr create .*--label tests-only" "$GH_LOG"
+    grep -q "pr create .*--label docs" "$GH_LOG"
     # BY NUMBER, never by branch name (the user 2026-08-01): every PR here is fork-headed, because
     # rulesets block branch pushes upstream — and `gh pr merge <branch> --repo <upstream>` cannot
     # resolve a branch that lives on the fork. It failed with "no pull requests found for branch

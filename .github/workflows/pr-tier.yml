@@ -1,6 +1,6 @@
 name: PR tier
 
-# Every PR carries exactly one tier label: tests-only, fix, feature or
+# Every PR carries exactly one tier label: docs, fix, feature or
 # major-feature. The tier says who merges it and after what review, so a PR
 # with no label has not been sorted yet and a PR with two has been sorted two
 # ways; this check fails in both cases and passes otherwise.
@@ -29,9 +29,9 @@ jobs:
         env:
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
-          count=$(jq '[.[] | select(. == "tests-only" or . == "fix" or . == "feature" or . == "major-feature")] | length' <<<"$LABELS")
+          count=$(jq '[.[] | select(. == "docs" or . == "fix" or . == "feature" or . == "major-feature")] | length' <<<"$LABELS")
           if [ "$count" -eq 1 ]; then
             exit 0
           fi
-          echo "::error::This PR carries $count tier labels; exactly one is required: tests-only, fix, feature or major-feature."
+          echo "::error::This PR carries $count tier labels; exactly one is required: docs, fix, feature or major-feature."
           exit 1

@@ -108,18 +108,32 @@ broad `git add` will sweep up your work). Conventions:
   as `upstream` when the clone has one, else `origin` (`_release_remote` in
   `kernel/kernel.py`, `canonical_remote` in `scripts/release.sh`); never a literal
   `origin`, which in a fork layout is a stale mirror nobody advances.
-- **Every PR carries exactly one tier label** (maintainers' rule, 2026-09-06). A
-  required check holds a PR with no tier label, or two, red, so an unlabeled PR never
-  auto-merges. The author picks the tier at filing time:
-  - `tests-only` (tier 0): tests, docs, repo plumbing; no behavior change. Merges on green.
-  - `fix` (tier 1): a bug fix with a test that fails before it.
-  - `feature` (tier 2): a self-contained new capability inside romp's existing model;
-    put the design points in the body.
+- **Every PR carries exactly one tier label, and the tier is ENFORCED** (maintainers' rule
+  2026-09-06; the policy decided 2026-09-07). Two required checks: "Exactly one tier label"
+  holds a PR with no tier label, or two, red; "Tier policy" then holds it until the tier's
+  gate is met. The rules are a pure function (`scripts/ci/tier_policy.py`, pinned by
+  `tests/test_tier_policy.py`); the workflow only fetches PR data and posts the verdict. See
+  `docs/pr-tiers.md`. The author picks the tier at filing time:
+  - `docs` (tier 0; renamed from `tests-only`): documentation ONLY - files under `docs/` or
+    `*.md` anywhere, never `.github/` or `scripts/`. Merges on green.
+  - `fix` (tier 1): a bug fix with a test that fails before it. Merges on the other
+    maintainer's approval, or after seven days with the head unchanged and no changes
+    requested (the clock is the server-stamped first Tier policy run for the head, never a
+    commit date).
+  - `feature` (tier 2): a self-contained new capability inside romp's existing model; put the
+    design points in the body. Merges on the other maintainer's approval.
   - `major-feature` (tier 3): new functionality that changes what romp does or its
-    contracts. Discussed first (an issue, or the PR as the RFC) and merged only on
-    agreement, so file it **without** `--auto` and leave the merge to the user.
-  The line that matters is 2 vs 3: adds a capability inside the existing model, `feature`;
-  changes what romp is, `major-feature`, talk first.
+    contracts. Merges on the other maintainer's approval AND a discussion in a linked issue
+    (`#N` in the body, with a comment by someone other than the author). File it **without**
+    `--auto` and leave the merge to the maintainers.
+  "Approval" is the latest review by a maintainer other than the author, on the CURRENT head,
+  APPROVED - GitHub forbids self-approval and the user's sessions act under the user's
+  account, so it structurally means the other maintainer. Any PR touching `.github/` needs an
+  approval regardless of tier: the base-branch check cannot stop a PR's own copy from posting
+  a same-named success on `pull_request` events, so a human looks. Consequence for sessions:
+  `--auto` still lands `docs` on green; a `fix` lands on approval or its seventh day; `feature`
+  and `major-feature` wait for a human. The line that matters is 2 vs 3: adds a capability
+  inside the existing model, `feature`; changes what romp is, `major-feature`, talk first.
 - **Clean up when finished.** After publishing, remove the worktree
   (`git worktree remove ../romp-<session>`) and delete its branch — don't leave stale
   worktrees lying around.

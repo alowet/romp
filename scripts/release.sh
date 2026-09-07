@@ -165,12 +165,16 @@ if [ "$current" != "$target" ]; then
         # "no pull requests found for branch release-0.3.0" and the release died one step after
         # opening the PR, leaving VERSION merged-but-untagged, exactly the half-finished state this
         # script exists to prevent. A number is unambiguous in any repo.
-        # Every PR on the upstream carries exactly one tier label (tests-only / fix / feature /
+        # Every PR on the upstream carries exactly one tier label (docs / fix / feature /
         # major-feature), and a required check holds an unlabeled PR red, so auto-merge would
         # never fire and the release would stall one step after opening it. A version bump is
-        # repo plumbing with no behavior change: tier 0, `tests-only`.
+        # repo plumbing with no behavior change - but tier 0 (`docs`, renamed from tests-only on
+        # 2026-09-07 with the tier POLICY, a required "Tier policy" check) is documentation ONLY,
+        # and this PR touches VERSION: under the policy it is held until the maintainers decide its
+        # tier (an approval, the fix tier's seven-day clock, or an explicit allow-list). The label
+        # below is the mechanical rename, not a ruling on that question.
         pr_url="$("$GH" pr create --repo "$UPSTREAM" --title "VERSION $target" \
-            --label tests-only \
+            --label docs \
             --body "Version bump for \`$tag\`, opened by scripts/release.sh.")" \
             || die "could not open the version PR."
         pr="${pr_url##*/}"
