@@ -479,8 +479,9 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
         ev["tracked"] = True                         # additive (consumer contract above): report-back
         #                                              delegation — the row is the flag's ONE record;
         #                                              no header, no prose (the recipient reads nothing)
-    if from_host:
-        ev["from_host"] = from_host                  # additive (consumer contract above)
+    ev["from_host"] = from_host or ""                # additive (consumer contract above): "" says LOCAL
+    #                                                  outright — written only when set before, which left
+    #                                                  a local row and a pre-field relayed row the same shape
     if relay_mid:
         ev["originMid"] = relay_mid                  # the SENDER-side id for relayed mail (2026-08-28,
         #                                              the dead-session round): local delivery mints its
@@ -602,7 +603,11 @@ def _queue_read_receipt(meta, unread=False, dmid=""):
 #      kind stays "delegate" — whose sender-side view is primary: the kernel courier reads it off
 #      this row, never off the message prose). A CROSS-HOST relay row has to_id "peer:<host>" and
 #      adds toName ("<host>:<name>") + to_sid (the recipient's stable id — the wait readers key on
-#      it; rows from before 2026-09-08 lack it and fall back to the name alias).
+#      it; rows from before 2026-09-08 lack it and fall back to the name alias). from_host is written
+#      on EVERY row since 2026-09-06 — "" for local delivery, the origin host for relayed mail — so a
+#      row WITHOUT the key is one from before that, whose sender may be either; a reader that needs
+#      the distinction (the kernel's postal card, for the sender's repository) treats absence as
+#      unknown, not as local.
 # The HUMAN-FACING prose (banner text, headers, the "⏸ parked" tag, REPLY_HINT) is
 # NOT a contract — consumers must not parse it, so it stays free to change.
 

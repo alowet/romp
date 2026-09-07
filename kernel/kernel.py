@@ -2717,12 +2717,19 @@ def _clear_unresolved_live_note(sid):
 
 
 def _tab_order_frame(order, tabs, live):
-    """The ONE tabOrder frame shape (T258): the shared order, the tabs meta, the viewer's views blob, and
-    `live` — the sids the kernel affirms are LIVE this build (raw tmux/SDK liveness, independent of whether
-    discover could resolve each one's transcript). The pane keeps a live sid on the strip even if this frame's
-    `order` omits it: a transient read failure that drops a session from the order is not a close (render.ts
-    applyTabOrder). Older clients ignore the extra field."""
-    return {"type": "tabOrder", "order": list(order), "tabs": tabs,
+    """The ONE tabOrder frame shape (T258) for its four senders (the pusher's tabs-first send, _push_session_now,
+    _confirm_close_now, and the WS 'ready' handler's connect-time frame): the shared order, the tabs meta, the
+    viewer's views blob, `live` — the sids the kernel affirms are LIVE this build (raw tmux/SDK liveness,
+    independent of whether discover could resolve each one's transcript) — and `selfHost`, this kernel's own
+    name (_self_host). The pane keeps a live sid on the strip even if this frame's `order` omits it: a
+    transient read failure that drops a session from the order is not a close (render.ts applyTabOrder). The
+    chat reads a postal card's sender host against `selfHost` (its postalSenderHost). The session frame
+    carries the name too, but only a LOCAL session's frame teaches it, so a dashboard whose kernel runs no
+    sessions of its own — every session attached from elsewhere — never learned it until the + picker was
+    opened, and a remote card stamped with this kernel's name stayed plain text (review find, 2026-09-06).
+    Every chat client receives a tabOrder frame, first of all on connect (tabs-first), so the name is known
+    before any card renders. Older clients ignore the extra fields."""
+    return {"type": "tabOrder", "order": list(order), "tabs": tabs, "selfHost": _self_host(),
             "views": _views_client(), "live": sorted({str(x) for x in live})}
 
 
@@ -23455,7 +23462,10 @@ def _postal_index():
             continue
         if o.get("ev") == "sent" and o.get("id"):
             idx[o["id"]] = {"id": o["id"], "from": o.get("from", "?"), "fromId": o.get("from_id", ""),
-                            "fromHost": o.get("from_host", ""),
+                            # the sender's host as the log stamped it: "" for this kernel's own sessions,
+                            # a peer's name for relayed mail — and None when the row carries NO field, a
+                            # row from before the field existed, whose sender could be either (2026-09-06)
+                            "fromHost": o.get("from_host"),
                             "toId": o.get("to_id", ""), "body": o.get("body", ""), "kind": o.get("kind", ""),
                             "t": o["t"] if isinstance(o.get("t"), (int, float)) else 0, "park": bool(o.get("park"))}
     _postal_index_memo[0] = (key, idx, _postal_body_map(idx))
@@ -23677,12 +23687,21 @@ def _hydrate_postal(events, index, sid=None):
                         frm = _name_of(rec["fromId"]) or (
                             (rec.get("fromHost", "") + ":" if rec.get("fromHost") else "")
                             + (rec["fromId"][:8] if rec["fromId"] else "?"))
-                    cards.append({"kind": "postal-service", "direction": "in", "peer": frm,
-                                  "color": _name_color(rec["fromId"]) if rec["fromId"] else None,
-                                  "body": rec["body"], "summary": caption_for(rec["id"]),   # incoming caption (full body on expand)
-                                  "intent": _postal_intent(rec.get("kind"), rec.get("body")),
-                                  "mid": rec["id"], "t": rec["t"] or None,
-                                  "park": rec["park"], "ts": ev.get("ts"), "uuid": ev.get("uuid")})
+                    card = {"kind": "postal-service", "direction": "in", "peer": frm,
+                            "color": _name_color(rec["fromId"]) if rec["fromId"] else None,
+                            "body": rec["body"], "summary": caption_for(rec["id"]),   # incoming caption (full body on expand)
+                            "intent": _postal_intent(rec.get("kind"), rec.get("body")),
+                            "mid": rec["id"], "t": rec["t"] or None,
+                            "park": rec["park"], "ts": ev.get("ts"), "uuid": ev.get("uuid")}
+                    if rec.get("fromHost") is not None:
+                        # the sender's HOST as the log stamped it ("" = this kernel's own): the chat resolves
+                        # the sender's repository for the body's PR links by host AND name, so a remote
+                        # homonym never borrows a local session's repo (review find, 2026-09-06). A row with
+                        # NO field — from before the log stamped one — gets no peerHost: the chat then
+                        # resolves the name alone, as it did before the field, rather than reading absence
+                        # as "this kernel's own" and presenting a pre-field remote sender as local
+                        card["peerHost"] = rec["fromHost"]
+                    cards.append(card)
             if len(cards) == len(ids):                   # all-or-nothing: a partial log never half-renders
                 out.extend(cards); continue
             # NOT every id resolved. The turn still passes through unhydrated — a half-rendered card run
@@ -28996,6 +29015,12 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
             # (ui/webview/pr-links.ts; the user 2026-09-06). Top-level like gitBranch, so it is never
             # windowed off the wire; a memoized store-derived value, so the dedup-compared payload holds.
             "githubRepo": _github_repo_of(scwd),
+            # this machine's name, as its peers know it (_self_host; the feed frame carries the same): the
+            # chat reads an inbound postal card's sender host against it (a card stamped with the viewing
+            # kernel's own name resolves to ITS sessions). It learned the name only from the + picker's
+            # reply before, so that reading was inert until the picker had been opened (review find,
+            # 2026-09-06). Stable, so the dedup-compared payload holds.
+            "selfHost": _self_host(),
             "events": events, "status": status, "ledger": ledger,
             # SDK sessions gate the box on the backend's LIVE task set (the CLI's task lifecycle stream —
             # authoritative, terminal-cleared); the spawned_at heuristic remains the tmux/no-snapshot fallback.
@@ -36458,6 +36483,7 @@ def _note_chat_divergence(sid, name, chat_state, row_state, now):
             f.write(json.dumps(rec) + "\n")
     except OSError:
         pass
+
 
 
 def _push(targets, connect=False, tmux=None):

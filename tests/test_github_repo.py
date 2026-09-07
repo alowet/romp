@@ -16,12 +16,15 @@ stats), the pointer memos of a tree that dies or changes shape under a live sess
 and _vouch_tree forgetting a reshaped tree's memos — or unvouched ones, after its record's own bound; a
 pointer re-made within one mtime tick; a symlinked cwd re-pointed at another repository), what a
 memoized call costs in stats, the branch
-of a BARE repository, _git_config_file's hand-built layouts (a relative gitdir, a gitdir with no
-commondir), and _session_cwd — the one derivation of a session's directory the chat frame and the
-feed's session rows share, so a never-registered session links the same repo on both.
+of a BARE repository, the inbound postal card's `peerHost` (the chat resolves a sender's repo by host
+and name; a row from before the log stamped a host carries none), the session frame's `selfHost`,
+_git_config_file's hand-built layouts (a relative gitdir, a gitdir with no commondir), and
+_session_cwd — the one derivation of a session's directory the chat frame and the feed's session
+rows share, so a never-registered session links the same repo on both.
 """
 import builtins
 import inspect
+import io
 import json
 import os
 import shutil
@@ -792,6 +795,74 @@ class BareRepository(unittest.TestCase):
         self.assertEqual(self.forks, {"--show-toplevel": 1}, "not a tree, not bare: no branch query at all")
 
 
+class PostalCardSenderHost(unittest.TestCase):
+    """The inbound postal card carries the sender's HOST (`peerHost`, the message log's from_host: "" for
+    this kernel's own sessions, a peer's name otherwise) beside the sender's name, so the chat links the
+    body's `#123` against exactly the sender's session — the name alone let a remote homonym borrow a
+    local session's repo when its host was not attached to the dashboard (review find, 2026-09-06). A
+    log row with NO from_host at all — one from before the log stamped the field on every row — puts no
+    peerHost on the card: read as "", a pre-field REMOTE sender was presented as this kernel's own
+    (review find, 2026-09-06); the chat resolves such a card by the name alone, as before the field.
+    Synthetic records only (invented sessions, placeholder ids, TESTHOST)."""
+    ME = "11111111-2222-3333-4444-555555555555"
+    SENDER = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    MID = "1700000000.11111_22222.TESTHOST"
+
+    def _card(self, **rec):
+        row = {"id": self.MID, "from": "api", "fromId": self.SENDER, "fromHost": "", "toId": self.ME,
+               "body": "see #12", "kind": "coordinate", "t": 1700000000, "park": False}
+        row.update(rec)
+        ev = {"kind": "user", "md": "<!-- romp-msg-id: %s -->" % self.MID, "uuid": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+              "ts": "x", "human": False}
+        saved_sum, saved_err = km._msg_summaries, km.sys.stderr
+        km._msg_summaries, km.sys.stderr = (lambda: {}), io.StringIO()
+        try:
+            out = km._hydrate_postal([ev], {self.MID: row}, self.ME)
+        finally:
+            km._msg_summaries, km.sys.stderr = saved_sum, saved_err
+        self.assertEqual([e["kind"] for e in out], ["postal-service"])
+        return out[0]
+
+    def test_a_local_senders_card_names_this_kernels_own_host_as_the_empty_string(self):
+        card = self._card()
+        self.assertEqual((card["direction"], card["peer"], card["peerHost"]), ("in", "api", ""))
+
+    def test_a_remote_senders_card_names_the_host_the_log_stamped(self):
+        card = self._card(fromHost="TESTHOST")
+        self.assertEqual((card["peer"], card["peerHost"]), ("api", "TESTHOST"))
+
+    def test_a_nameless_remote_sender_keeps_its_host_stub_name_and_the_host_field(self):
+        card = self._card(**{"from": "?", "fromHost": "TESTHOST", "fromId": "77777777-8888-9999-aaaa-bbbbbbbbbbbb"})
+        self.assertEqual((card["peer"], card["peerHost"]), ("TESTHOST:77777777", "TESTHOST"))
+
+    def test_a_row_from_before_the_log_stamped_a_host_puts_no_host_on_the_card(self):
+        card = self._card(fromHost=None)
+        self.assertEqual((card["direction"], card["peer"]), ("in", "api"))
+        self.assertNotIn("peerHost", card, "absent, not '': the sender could be anyone's session")
+
+    def test_the_index_tells_a_row_without_the_field_from_a_local_one(self):
+        log = km.jd.STATE / "timeline" / "messages.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        rows = [{"t": 1700000000, "ev": "sent", "id": "1700000000.1_1.TESTHOST", "from": "api", "from_id": self.SENDER,
+                 "to_id": self.ME, "body": "see #12"},                                        # before the field
+                {"t": 1700000001, "ev": "sent", "id": "1700000001.1_1.TESTHOST", "from": "api", "from_id": self.SENDER,
+                 "to_id": self.ME, "body": "see #13", "from_host": ""},                       # local, stamped so
+                {"t": 1700000002, "ev": "sent", "id": "1700000002.1_1.TESTHOST", "from": "api", "from_id": self.SENDER,
+                 "to_id": self.ME, "body": "see #14", "from_host": "TESTHOST"}]               # relayed
+        saved = log.read_text() if log.exists() else None
+        km._postal_index_memo[0] = None
+        try:
+            log.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            idx = km._postal_index()
+            self.assertEqual([idx[r["id"]]["fromHost"] for r in rows], [None, "", "TESTHOST"])
+        finally:
+            km._postal_index_memo[0] = None
+            if saved is None:
+                log.unlink()
+            else:
+                log.write_text(saved)
+
+
 class ConfigFile(unittest.TestCase):
     """_git_config_file's layouts, built by hand under a private temp dir: the file is the memo's mtime
     source, so a layout it cannot resolve forks `git remote get-url` on every build. The live-worktree
@@ -944,6 +1015,17 @@ class FrameWiring(unittest.TestCase):
         self.assertIn('"githubRepo": _github_repo_of(scwd),', src,
                       "top-level like gitBranch — never windowed off the wire")
         self.assertLess(src.index('"gitBranch": sysinfo["gitBranch"]'), src.index('"githubRepo": _github_repo_of(scwd)'))
+
+    def test_the_session_frame_names_this_kernels_own_host(self):
+        # the chat reads a postal card's sender host against the viewing kernel's own name; it learned
+        # that name only from the + picker's reply before, so the reading was inert until the picker opened
+        src = inspect.getsource(km.build_session)
+        self.assertIn('"selfHost": _self_host(),', src, "top-level on the frame the chat receives for every session")
+        feed = inspect.getsource(km.build_feed)
+        self.assertIn('"selfHost": _self_host(),', feed, "the same name the feed frame carries")
+        # …and the tabOrder frame, which every chat receives first of all: a dashboard whose kernel runs no
+        # local session has no session frame to learn the name from (tests/test_kernel_tabs_first.py runs it)
+        self.assertEqual(km._tab_order_frame([], [], [])["selfHost"], km._self_host())
 
     def test_the_feed_session_rows_carry_the_repo(self):
         src = inspect.getsource(km.build_feed)
