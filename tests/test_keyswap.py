@@ -446,7 +446,7 @@ class KeyLineGone(_Backend):
         self.assertEqual(said.count("is GONE"), 1, said)
         self.assertIn("sha256:" + ks.fingerprint(OLD_KEY), said)
         self.assertIn(self.path, said)
-        self.assertIn("launch on the login", said)
+        self.assertIn("nothing of romp's injected, whatever their Billing pick", said)
         self.assertNotIn(OLD_KEY, said, "fingerprints only")
         # the line coming back re-arms the notice: a second removal is a second event
         self.write_env(NEW_KEY)

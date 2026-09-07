@@ -2033,10 +2033,11 @@ def work_api_key_source():
                        if source.kind == "file" and os.environ.get("ROMP_SUPERVISED") == "1"
                        else "%s selects the 1Password source" % _keysrc.REF_VAR if source.kind == "op"
                        else "the env file's key line is empty")
-                sys.stderr.write("work key: the startup key (sha256:%s) is IGNORED — %s. Sessions without an "
-                                 "explicit Billing pick %s.\n"
-                                 % (_keysrc.fingerprint(startup), why,
-                                    "launch on the login" if not source.configured else "use that source"))
+                tail = ("Sessions launch with nothing of romp's injected, whatever their Billing pick (Claude "
+                        "Code's own credential pays)." if not source.configured
+                        else "Sessions without an explicit Billing pick use that source.")
+                sys.stderr.write("work key: the startup key (sha256:%s) is IGNORED — %s. %s\n"
+                                 % (_keysrc.fingerprint(startup), why, tail))
             _WORK_KEY = ""
         # "error" (an unreadable or undecodable file) is not a selection: it fails the operation that asked
         # while it lasts, and the startup key stays claimed so a transient permission blemish cannot
@@ -2056,8 +2057,9 @@ def work_api_key() -> str:
 def _note_key_file_gone(live: str) -> None:
     """Say ONCE, on stderr, when the env file's static key line is REMOVED while this process runs. The
     file stays authoritative (select_source returns an empty file source, never the startup key), so
-    every session without an explicit Billing pick quietly starts launching on the login — a change of
-    who pays with nothing in the log to find it by (review find, 2026-09-06). Fingerprint and path only.
+    every session — whatever its Billing pick (2026-09-07) — quietly starts launching with nothing of
+    romp's injected, and Claude Code's own credential pays: a change of who pays with nothing in the
+    log to find it by (review find, 2026-09-06). Fingerprint and path only.
     A line that comes back re-arms the notice, so a second removal is said too."""
     global _FILE_KEY_SEEN_FP
     if live:
@@ -2066,8 +2068,8 @@ def _note_key_file_gone(live: str) -> None:
     if not _FILE_KEY_SEEN_FP:
         return
     sys.stderr.write("work key: the %s line (sha256:%s) is GONE from %s — the file stays authoritative, so "
-                     "sessions without an explicit Billing pick now launch on the login. Restore the line or "
-                     "select a source with `romp keyswap`.\n"
+                     "sessions now launch with nothing of romp's injected, whatever their Billing pick (Claude "
+                     "Code's own credential pays). Restore the line or select a source with `romp keyswap`.\n"
                      % (_keysrc.KEY_VAR, _FILE_KEY_SEEN_FP, _keysrc.service_env_path()))
     _FILE_KEY_SEEN_FP = ""
 
@@ -5054,6 +5056,7 @@ class SdkBackend:
         #   so a keyswap needs no kernel restart (the user 2026-09-04).
         self._key_fp_said = None                  # last key fingerprint written to the log (change-only)
         self._unkeyed_pick_said = False           # the "launching on Claude Code's own credential" row: once per process
+        self._seed_skip_said = False              # the "remembered key pick set aside, no key source" row: once per process
         # Backend PROBLEMS, kept in a bounded ring so the dashboard can show them (see _log): until
         # 2026-07-28 every SDK failure went to the kernel log alone, which nobody tails, so a session
         # whose stream died or whose model switch was refused just looked odd with no way to find out.
@@ -5191,6 +5194,19 @@ class SdkBackend:
                   "ANTHROPIC_API_KEY to %s if romp should manage the key" % _keysrc.service_env_path(),
                   problem=True)
 
+    def _note_seed_skipped(self) -> None:
+        """Said ONCE per process, as a problem row: the remembered Billing default is the API key, but romp holds
+        no key source, so new sessions are left unpicked (spawn) — they launch the same way either pick would
+        here (nothing of romp's injected; Claude Code's own credential pays), but their badge, judge billing and
+        cycling read an unpicked session, and a pick the user made is being set aside without a word otherwise."""
+        if self._seed_skip_said:
+            return
+        self._seed_skip_said = True
+        self._log("the remembered Billing pick is the API key but romp holds no key source, so new sessions start "
+                  "unpicked and launch on Claude Code's own credential (its apiKeyHelper or login) — add "
+                  "ROMP_API_KEY_REF=op://vault/item/field or ANTHROPIC_API_KEY to %s to apply the pick"
+                  % _keysrc.service_env_path(), problem=True)
+
     def cycle_key(self, sid: str, expected_source_fp: str | None = None, current_key_fp: str | None = None,
                   probe: bool = False, resolve_error: str | None = None) -> str:
         """Re-present the CURRENT work key to one LIVE session by reconnecting it — the apply half of
@@ -5238,6 +5254,12 @@ class SdkBackend:
         if s is None:
             return "dormant"
         source = self._work_key_source()
+        if not source.configured:
+            # romp holds no key source: every session launched with nothing of romp's injected, whatever its
+            # pick (Claude Code's own credential pays), so there is no key to re-present — the row reads
+            # `login`, as for a login pick, not the refusal it answered until 2026-09-07 (review find; the
+            # PR that made the launch un-injected had left --cycle on the old error)
+            return "login"
         if s.effective_auth(source.configured) != "key":
             return "login"
         with s._sub_lock:
@@ -6029,10 +6051,15 @@ class SdkBackend:
                           "session is billing the %s. Check the helper and service.env."
                           % (sess.name, what, source, "API key" if keyed else "login"), problem=True)
             else:
+                # an explicit key pick that launched with nothing injected landed on the login: the key it
+                # meant was Claude Code's own (apiKeyHelper), so that is what to check — not romp's login
+                remedy = ("Check Claude Code's apiKeyHelper (romp injected nothing) and service.env."
+                          if getattr(sess, "_launched_unkeyed_pick", False) and not keyed
+                          else "Check the login (claude /login) and service.env.")
                 self._log("auth (%s): launched for %s but the CLI reports apiKeySource=%r — this session "
-                          "is billing the %s. Check the login (claude /login) and service.env."
+                          "is billing the %s. %s"
                           % (sess.name, "the API key" if meant_key else "the login", source,
-                             "API key" if keyed else "login"), problem=True)
+                             "API key" if keyed else "login", remedy), problem=True)
         sess.auth_live = "key" if keyed else "login"   # the CLI's own report, for the Billing row
         if keyed == sess.api_key_auth:
             return
@@ -6535,12 +6562,16 @@ class SdkBackend:
         # session); unset stays unset — effective_auth's fallback IS the pre-selector behavior.
         a = auth if auth in ("login", "key") else (d.get("auth") if d.get("auth") in ("login", "key") else "")
         if a == "key" and not auth and not self.work_key_configured:
-            # A REMEMBERED key default on a box with no key source seeds nothing: _auth_avail already
-            # shows the picker "login" there, and a seeded pick would launch unkeyed with the once-row
-            # plus a per-init "launched for the API key" alarm for every new session (review find,
-            # 2026-09-07). A re-seed is never an explicit pick (_declared_auth); an EXPLICIT `auth` from
-            # the picker still lands as asked.
+            # A REMEMBERED key default on a box with no key source seeds nothing. Not because of the launch
+            # or the per-init check: both come out the same either way (nothing of romp's injected, and a
+            # login landing rings through the remembered pick in _declared_auth just as it would through a
+            # seeded one). Because the picker offers no key choice on this box (_auth_avail shows login), so
+            # a re-seed would apply a pick the user cannot make here, and because what the session SAYS
+            # about itself — Billing badge, judge billing, cycling — should read what it is: unpicked. A
+            # remembered pick set aside is said once, as a problem row (review find, 2026-09-07). A re-seed
+            # is never an explicit pick (_declared_auth); an EXPLICIT `auth` from the picker still lands.
             a = ""
+            self._note_seed_skipped()
         if a:
             reg["auth"] = a
         # Per-session env is a per-spawn ask, never a remembered default (a var one session needed is

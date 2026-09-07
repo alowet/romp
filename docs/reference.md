@@ -490,9 +490,10 @@ key inherited when the kernel started. After removing a selected provider,
 API-key operations fail until a valid source is selected; choose **Login**
 explicitly to use that mode. Removing a static `ANTHROPIC_API_KEY=` line
 while the kernel runs is different: the file stays authoritative and
-sessions without an explicit Billing pick launch on the login, and the
-kernel log says so once, with the removed key's fingerprint and the file's
-path. Removing a source does not revoke a credential already held by a
+sessions launch with nothing of Romp's injected, whatever their Billing
+pick, so Claude Code's own credential (its `apiKeyHelper` or login) applies;
+the kernel log says so once, with the removed key's fingerprint and the
+file's path. Removing a source does not revoke a credential already held by a
 running Claude process; reconnect or end those sessions too. Rotate a
 previously exposed key with its issuer as appropriate.
 

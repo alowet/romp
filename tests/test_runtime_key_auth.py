@@ -286,7 +286,7 @@ class OpCredentialAndDiscardNotice(unittest.TestCase):
         src = sb.work_api_key_source()
         self.assertEqual((src.kind, src.value, src.configured), ("file", "", False), "no file line: no key")
         out = self.err.getvalue()
-        self.assertIn("supervised managers read", out); self.assertIn("launch on the login", out)
+        self.assertIn("supervised managers read", out); self.assertIn("nothing of romp's injected", out)
         self.assertIn(ks.fingerprint("synthetic-old-startup-key"), out)
 
     def test_an_unreadable_file_fails_loudly_but_discards_nothing(self):
@@ -476,6 +476,12 @@ class UnkeyedPickLaunch(unittest.TestCase):
         sb._defaults_path(d).write_text(json.dumps({"auth": "key"}))
         sid = self.be.spawn("seeded", "/tmp")
         self.assertNotIn("auth", sb.read_reg(self.be.state_dir, sid), "the remembered key default seeds nothing here")
+        skipped = [l for l in self.logs if "remembered Billing pick is the API key but romp holds no key source" in l]
+        self.assertEqual(len(skipped), 1, "a pick set aside is said, once, as a problem row")
+        self.assertIn(str(self.path), skipped[0])
+        self.assertIn(skipped[0], self.problems())
+        self.be.spawn("seeded-again", "/tmp")
+        self.assertEqual(len([l for l in self.logs if "remembered Billing pick is the API key" in l]), 1, "once per process")
         sid2 = self.be.spawn("asked", "/tmp", auth="key")
         self.assertEqual(sb.read_reg(self.be.state_dir, sid2).get("auth"), "key", "an explicit ask still lands")
         self.configure_source()
@@ -497,7 +503,22 @@ class UnkeyedPickLaunch(unittest.TestCase):
         ring = [l for l in self.logs if "is billing the login" in l]
         self.assertEqual(len(ring), 1, "a login landing contradicts the pick and rings")
         self.assertIn("launched for the API key", ring[0])
+        self.assertIn("apiKeyHelper", ring[0], "the remedy names the credential the un-injected pick meant")
+        self.assertNotIn("claude /login", ring[0])
         self.assertIn(ring[0], [p["text"] for p in self.be._problems])
+
+    def test_cycling_a_key_picked_session_on_a_box_with_no_source_reads_login_instead_of_refusing(self):
+        """`romp keyswap --cycle` walks every live session through cycle_key. With no key source, a key-picked
+        session launched with nothing of romp's injected, so there is no key to re-present: its row reads
+        `login`, like a login pick's, rather than the "no API key source is configured" refusal the route
+        answered until 2026-09-07 (review find; the launch rule had moved and --cycle had not)."""
+        sess = self.session("key")
+        self.be._options(sess, dict)
+        self.be.sessions[sess.sid] = sess
+        self.assertEqual(self.be.cycle_key(sess.sid), "login")
+        self.assertEqual(self.be.cycle_key(sess.sid, probe=True), "login")
+        self.configure_source()                                    # with a source the pick is cycled as before
+        self.assertEqual(self.be.cycle_key(sess.sid, probe=True), "cycle")
 
     def test_a_configured_source_is_untouched(self):
         self.configure_source()
