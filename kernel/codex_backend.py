@@ -526,6 +526,7 @@ class CodexBackend:
                     candidate = CodexClient(config=cfg, approval_handler=self._handle_approval)
                     candidate.start()
                     candidate.initialize()
+                    self.log("app-server runtime: %s" % (self.codex_bin or "ROMP-managed %s" % getattr(_runtime, "VERSION", "")))
                 self._check_auth(candidate)
                 self._client = candidate
                 self._client_err = None
