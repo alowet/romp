@@ -2948,8 +2948,12 @@ class SdkSession:
         self._ctx_refreshing = True
         try:
             cu = await self.client.get_context_usage()
-        except Exception:
+        except Exception as e:
             cu = None
+            # say so: a control channel that keeps refusing otherwise shows only as a stale battery number
+            # (review find on #924, 2026-09-07); one line, not the problems ring, since a lone hiccup heals
+            # on the rerun below
+            self.backend._log("context refresh (%s) failed: %s: %s" % (self.name, type(e).__name__, e))
         finally:
             self._ctx_refreshing = False
         if not isinstance(cu, dict):

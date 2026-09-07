@@ -116,7 +116,13 @@ export function openFileBrowse(path: string, sid?: string | null): void {
     // the dim, backdrop click closes (the lightbox contract — content clicks never do).
     const wrap = el("div", "");
     wrap.id = "romp-filebrowse";
-    wrap.onclick = (ev) => { if (ev.target === wrap) closeFileBrowse(); };
+    // Arm on pointerdown: a `click` is dispatched on the nearest common ancestor when the press and the
+    // release land on different elements, so a drag that STARTED inside the card and ended over the dim
+    // read as a backdrop click and closed the browser mid-gesture (review find on #924, 2026-09-07).
+    // Close only when both ends were on the dim.
+    let downOnDim = false;
+    wrap.addEventListener("pointerdown", (e) => { downOnDim = e.target === wrap; });
+    wrap.onclick = (ev) => { const close = downOnDim && ev.target === wrap; downOnDim = false; if (close) closeFileBrowse(); };
     const box = el("div", "filebrowse");
     document.body.classList.add("filebrowse-open");
 
