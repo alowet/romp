@@ -290,8 +290,8 @@ PY
 # reads the banned strings from ~/.config/romp/private-strings.txt (so it arms
 # EVERY worktree, not just the one holding an untracked scanner) and reads the
 # PUSHED commits, not the working tree, which is not what gets published: each
-# pushed ref's TIP tree must be clean, and each commit new to the remote must
-# ADD no banned line — so a leak in an intermediate commit is caught even when
+# pushed ref's TIP tree must be clean, and each commit new to every fetched remote
+# must ADD no banned line — so a leak in an intermediate commit is caught even when
 # the tip is clean, while a tree that only inherits an older one is not refused.
 # No strings file → a no-op, so a contributor's clone is unaffected.
 # (ROMP_GITHOOK_DIR redirects install.sh's symlink target below; the behaviour

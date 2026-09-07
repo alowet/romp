@@ -44,26 +44,28 @@ while IFS= read -r line; do
 done < "$strings_file"
 [ ${#grep_args[@]} -gt 0 ] || exit 0
 
-# $1 is the remote being pushed to: a name, or a bare URL when pushing by URL.
-remote="${1:-}"
 zero=0000000000000000000000000000000000000000
 
-# The commits THIS push publishes for one ref: what the remote does not already
-# have. "Already has" means reachable from ANY of the remote's refs as this clone
-# last fetched them (refs/remotes/<remote>/*), not only from the ref being pushed.
-# The difference is a branch that merged main: its range holds main's commits,
-# every one of them on the remote already through main. Scanning those refuses
-# the push over a string that main itself published, and a string already on the
-# remote is fixed FORWARD, on main (redact, push main) — not by blocking every
-# branch that merged main before the redaction. The exclusion is scoped to the
-# remote being pushed to: a commit only another remote has is still new to this
-# one. With no remote-tracking refs for the remote (never fetched, or a push to a
-# bare URL) the exclusion matches nothing and the range falls back to everything
-# the remote ref lacks — for a new ref, the whole history.
+# The commits THIS push publishes for one ref: what no remote already has.
+# "Already has" means reachable from the remote ref's current value or from ANY
+# remote-tracking ref this clone holds (refs/remotes/*, as last fetched) — every
+# remote's, not only the pushed-to remote's or the ref being pushed. The
+# difference from the ref's plain update range is a branch that merged main: its
+# range holds main's commits, every one of them published already through main.
+# Scanning those refuses the push over a string that main itself published, and a
+# string already on a remote is fixed FORWARD, on main (redact, push main) — not
+# by blocking every branch that merged main before the redaction. Every remote
+# counts because that remedy exists only for a commit no remote has yet: in a
+# clone with a fork and the project it forked from, a clean branch cut from the
+# project's main is pushed to the fork as a new ref, and an exclusion scoped to
+# the fork left the project's own commits in the range — one named as adding a
+# string the project had since redacted, which no rewrite of the branch could
+# fix (the #968 review). With no remote-tracking refs at all (never fetched) the
+# exclusion matches nothing and the range falls back to everything the remote
+# ref lacks — for a new ref, the whole history.
 rev_range() {   # <local_sha> <remote_sha> → a rev-list argument list
-    local args="$1 --not"
+    local args="$1 --not --remotes"
     [ "$2" = "$zero" ] || args="$args $2"
-    [ -z "$remote" ] || args="$args --remotes=$remote"
     printf '%s' "$args"
 }
 
@@ -118,7 +120,8 @@ if [ "$blocked" -ne 0 ]; then
     echo "romp pre-push: BLOCKED — a banned string from $strings_file is in a pushed commit." >&2
     echo "  Replace it with synthetic data (see CONTRIBUTING.md), then push again." >&2
     echo "  If the string is only in an INTERMEDIATE commit, squash or rewrite the branch." >&2
-    echo "  If the tip only INHERITS a string an older commit added and main has since redacted, merge main." >&2
+    echo "  If the tip only INHERITS a string an older commit added, merge the main that has since redacted it." >&2
+    echo "  If the named commit is already on some remote, this clone has not fetched it: fetch, then push again." >&2
     echo "  To bypass for one push (you are sure it is fine): git push --no-verify" >&2
     exit 1
 fi
