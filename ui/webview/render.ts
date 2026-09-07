@@ -9052,12 +9052,29 @@ function runPrebuild(deadline: IdleDeadline): void {
   };
   const savedRenderingSid = renderingSid; // syncView sets this; restore it so nothing keys off a pre-built tab
   const savedOwnerSid = renderingOwnerSid;
+  let built = 0;
   for (const id of prebuildPlan(activeId, mru, order, viewState)) {
     if (!sessions.has(id)) continue;
-    if (deadline.timeRemaining() < 3 && !deadline.didTimeout) { schedulePrebuild(); break; } // budget gone → resume next idle
+    // Budget gone → resume next idle. A TIMED-OUT idle callback reports didTimeout true and
+    // timeRemaining() 0, so `!didTimeout` alone never broke and the loop then built EVERY planned
+    // tab in one synchronous task — the click-time cost this prebuild exists to remove (review find
+    // on #934, 2026-09-07). Keep chunking on a timed-out deadline too, but guarantee forward progress:
+    // build at least one tab per pass before yielding.
+    if (deadline.timeRemaining() < 3 && (!deadline.didTimeout || built > 0)) { schedulePrebuild(); break; }
     try {
       ensureView(id);
+      const v = views.get(id);
+      // Re-collapse an overgrown hidden view HERE, in idle, not on the click: the background chatTail
+      // branch lowers v.rendered and takes syncViewInner's incremental append path, which grows winEnd
+      // to total and never re-collapses, so a long-backgrounded tab's DOM grew without bound and
+      // showActive's WINDOW_CAP guard paid the full-window rebuild ON the switch (review find on #934,
+      // 2026-09-07). Same collapse showActive does, moved off the critical path.
+      if (v && !pendingAnchor && pendingAnchorT == null
+          && v.el.querySelectorAll(".turn").length > WINDOW_CAP) {
+        v.rendered = 0; v.winStart = 0; v.avgTurnH = undefined; v.stick = true;
+      }
       syncView(id); // build the hidden view now, off the critical path
+      built++;
     } catch { /* one malformed tab must not break idle pre-building of the rest */ }
   }
   renderingSid = savedRenderingSid;
