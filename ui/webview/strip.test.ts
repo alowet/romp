@@ -175,7 +175,7 @@ test("both bundles init the strip; the web pages never opt in", () => {
 // calendar-ish windows (the user 2026-08-13): 1 day + 1 month on the cell, 1 week in the hover.
 test("apiCell arms on the spend windows' presence and carries 1 day + 1 month", () => {
   const cell = apiCell({ spend: {
-    day: { usd: 12.34, tok: 3_456_000, turns: 5 },
+    day: { usd: 12.34, tok: 3_456_000, turns: 5, tokIn: 300, tokOut: 20_000, tokCacheR: 3_000_000, tokCacheW: 435_700 },
     week: { usd: 40.2, tok: 9_000_000, turns: 21 },
     month: { usd: 87.9, tok: 20_500_000, turns: 60 },
   } });
@@ -187,6 +187,10 @@ test("apiCell arms on the spend windows' presence and carries 1 day + 1 month", 
   assert.match(cell!.title, /^API-key spend\n/);
   assert.match(cell!.title, /1 week — \$40 · 9\.00M tok · 21 turns/, "the hover keeps the full breakdown");
   assert.match(cell!.title, /1 day — \$12 · 3\.46M tok · 5 turns/);   // 3 sig figs (the user 2026-08-13)
+  // the by-kind split under a window that carries one (the user 2026-09-06: the count is mostly cache
+  // reads, and the hover says so); a window without it (an older kernel) has no second line
+  assert.match(cell!.title, /1 day — \$12 · 3\.46M tok · 5 turns\n    3\.00M cache read · 436k cache write · 300 in · 20\.0k out\n1 week/);
+  assert.match(cell!.title, /1 week — \$40 · 9\.00M tok · 21 turns\n1 month/);
 });
 
 test("an older kernel's fiveHour window still arms the cell (version skew)", () => {

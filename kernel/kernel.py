@@ -27060,8 +27060,18 @@ def _spend_windows(keyed_only=False):
     days = d.get("days") if isinstance(d.get("days"), dict) else {}
     hours = d.get("hours") if isinstance(d.get("hours"), dict) else {}
 
+    KINDS = ("tokIn", "tokOut", "tokCacheR", "tokCacheW")
+
     def _sum(entries):
+        # {usd, tok, turns} plus the by-KIND split of `tok` (the user 2026-09-06, who read a day's
+        # token count and could not see how it was possible: cache reads — every API call of a turn
+        # re-reads the whole context — are most of it, at a tenth of the input price, and the hover
+        # now says so). The split is emitted only when EVERY contributing bucket carried it: a keyed
+        # sub-count written before 2026-09-06 has `tok` alone, and a half-split window would read as
+        # a whole one. Bucket totals have carried the four kinds since tokens were first recorded.
         out = {"usd": 0.0, "tok": 0, "turns": 0}
+        kinds = {k: 0 for k in KINDS}
+        complete = True
         for e in entries:
             if isinstance(e, dict):
                 if keyed_only:
@@ -27072,7 +27082,14 @@ def _spend_windows(keyed_only=False):
                 else:
                     out["usd"] = round(out["usd"] + float(e.get("usd") or 0), 4)
                     out["turns"] += int(e.get("turns") or 0)
-                    out["tok"] += sum(int(e.get(k) or 0) for k in ("tokIn", "tokOut", "tokCacheR", "tokCacheW"))
+                    out["tok"] += sum(int(e.get(k) or 0) for k in KINDS)
+                if any(k in e for k in KINDS):
+                    for k in KINDS:
+                        kinds[k] += int(e.get(k) or 0)
+                elif e:
+                    complete = False
+        if complete:
+            out.update(kinds)
         return out
 
     now = time.time()
@@ -33786,7 +33803,7 @@ var legacy=(sp.month&&typeof sp.month.usd==='number'&&!sp.monthToDate);
 if(legacy){det._spendLegacyMonth=true;}
 SPEND_WINS.forEach(function(w){var k=w[0];if(legacy&&k==='monthToDate')k='month';else if(legacy&&k==='month')return;
 var seg=sp[k];if(!seg||typeof seg.usd!=='number')return;
-var row=(det._spend=det._spend||{})[w[0]]={label:w[1],usd:seg.usd,tok:seg.tok||0,turns:seg.turns||0};
+var row=(det._spend=det._spend||{})[w[0]]={label:w[1],usd:seg.usd,tok:seg.tok||0,turns:seg.turns||0,tokIn:seg.tokIn,tokOut:seg.tokOut,tokCacheR:seg.tokCacheR,tokCacheW:seg.tokCacheW};
 if(w[0]==='month'&&typeof seg.since==='string')row.since=seg.since;});   // a ledger younger than the window says so
 if(u.spendSeries&&u.spendSeries.usd)det._spendSeries=u.spendSeries;}   // $/hour, for the hover graph (the user 2026-08-13)
 // One payload's WINDOW detail for the hover (used/elapsed/reset per window). Detail only, no markup:
@@ -33984,8 +34001,13 @@ function fleetSpendHTML(sets){var sum={},series=null,hosts=0,per=[],legacyN=0;
 sets.forEach(function(e){var sp=e.det&&e.det._spend;if(!sp)return;hosts++;
 if(sp.week&&typeof sp.week.usd==='number')per.push({host:e.host,usd:sp.week.usd});
 SPEND_WINS.forEach(function(w){var v=sp[w[0]];if(!v)return;
-var t=(sum[w[0]]=sum[w[0]]||{label:w[1],usd:0,tok:0,turns:0});
+var t=(sum[w[0]]=sum[w[0]]||{label:w[1],usd:0,tok:0,turns:0,tokIn:0,tokOut:0,tokCacheR:0,tokCacheW:0,split:true});
 t.usd+=v.usd;t.tok+=v.tok;t.turns+=v.turns;
+// the by-KIND split of the tokens (the user 2026-09-06, who read the day's count and could not see
+// how it was possible — cache reads, every API call of a turn re-reading the whole context, are most
+// of it at a tenth of the price). A host whose kernel ships no split (older build) leaves the summed
+// row UNSPLIT rather than half-split: a partial breakdown would read as a whole one.
+if(typeof v.tokCacheR==='number'){t.tokIn+=v.tokIn||0;t.tokOut+=v.tokOut||0;t.tokCacheR+=v.tokCacheR;t.tokCacheW+=v.tokCacheW||0;}else t.split=false;
 if(v.since&&(!t.since||v.since>t.since))t.since=v.since;});   // the YOUNGEST ledger bounds the sum (T235b): it is complete only from there
 if(e.det._spendLegacyMonth)legacyN++;
 var ss=e.det._spendSeries;
@@ -34005,8 +34027,12 @@ var h='<div class="ru-tip-win ru-tip-fleetspend"><div class=ru-tip-name><span>AP
 var lab=v.label;
 if(k==='month'&&v.since)lab+=' \u00b7 complete since '+esc(v.since);
 if(k==='month'&&legacyN)lab+=' \u00b7 '+legacyN+' machine'+(legacyN>1?'s':'')+' not counted (older build)';
-return '<div class=ru-tip-row><span class=ru-tip-k>'+lab+'</span>'
-+'<span class=ru-tip-v>'+fmtUsd(v.usd)+' \u00b7 '+fmtTok(v.tok)+' tok \u00b7 '+(v.turns||0)+' turns</span></div>';}).join('');
+var row='<div class=ru-tip-row><span class=ru-tip-k>'+lab+'</span>'
++'<span class=ru-tip-v>'+fmtUsd(v.usd)+' \u00b7 '+fmtTok(v.tok)+' tok \u00b7 '+(v.turns||0)+' turns</span></div>';
+// the split sits under its window, largest kind first, as a sub-line (the .ru-tip-reset annotation grammar)
+if(v.split&&(v.tokIn+v.tokOut+v.tokCacheR+v.tokCacheW)>0)row+='<div class="ru-tip-row ru-tip-sub"><span class=ru-tip-k></span>'
++'<span class=ru-tip-v>'+fmtTok(v.tokCacheR)+' cache read \u00b7 '+fmtTok(v.tokCacheW)+' cache write \u00b7 '+fmtTok(v.tokIn)+' in \u00b7 '+fmtTok(v.tokOut)+' out</span></div>';
+return row;}).join('');
 // every machine in the sum, BY NAME (the user 2026-08-13: a host with no login \u2014 the devbox \u2014 vanished
 // from the hover entirely when the per-host spend rows collapsed into this one section; '3 machines'
 // with two names visible reads as a bug). One line, largest first, week numbers like the graph.
@@ -35865,6 +35891,8 @@ def _landing():
             ".ru-tip-reset{font-weight:400;opacity:.6;font-size:10px}"
             ".ru-tip-row{display:flex;align-items:center;gap:6px;margin-top:3px}"
             ".ru-tip-k{opacity:.55;min-width:46px}"
+            # the by-kind token split under a spend row: the sub-annotation grammar .ru-tip-reset wears
+            ".ru-tip-sub{margin-top:0}.ru-tip-sub .ru-tip-v{opacity:.6;font-size:10px}"
             ".ru-tip-track{width:64px;height:6px;border-radius:3px;background:rgba(255,255,255,0.10);overflow:hidden;display:inline-block}"
             # the fleet $/h chart (the user 2026-08-14): full tip width, framed by a faint backing
             # plate, with overlay y-labels (px offsets against the fixed 56px plot) and a

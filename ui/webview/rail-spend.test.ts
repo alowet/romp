@@ -47,7 +47,13 @@ test("the kernel serves spend windows for BOTH payload shapes, keyed-only beside
   assert.ok(KERNEL.includes("k.startswith(month)"));
   // the accumulator: cumulative-per-process DELTAS, and each bucket splits out the key's own turns
   assert.ok(BACKEND.includes("delta = total - self._last_cost_total if total >= self._last_cost_total else total"));
-  assert.ok(BACKEND.includes("turn_u[k] = v - last if v >= last else v"));
+  // the TOKEN watermarks diff the cumulative modelUsage map, never the flat `usage` dict — that one is
+  // the TURN's own total on the current CLI, and diffing it recorded a fraction of every turn (the user
+  // 2026-09-06). Each spend window also carries the by-KIND split of its tokens for the hover.
+  assert.ok(BACKEND.includes("turn_u = self._turn_usage(msg)"));
+  assert.ok(BACKEND.includes('mu = getattr(msg, "model_usage", None)'));
+  assert.ok(BACKEND.includes("out[k] = v - last if v >= last else v"), "a shrunken running total is a reset we missed → fold whole");
+  assert.ok(KERNEL.includes('KINDS = ("tokIn", "tokOut", "tokCacheR", "tokCacheW")'));
   assert.ok(BACKEND.includes("sid=self.thread_of or self.sid)   # the rail's spend"),
     "the settle threads the OWNING sid — a comment thread bills its owner (T144), a plain session itself (T100)");
   assert.ok(BACKEND.includes("if keyed or ke:   # carry an existing key split forward even on a login turn"));

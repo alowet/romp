@@ -95,8 +95,38 @@ class SpendWindows(unittest.TestCase):
     def test_empty_ledger_stays_honest_zero_everywhere(self):
         self._ledger({}, {})
         w = km._spend_windows()
-        self.assertEqual(w["month"], {"usd": 0.0, "tok": 0, "turns": 0})
-        self.assertEqual(w["monthToDate"], {"usd": 0.0, "tok": 0, "turns": 0})
+        zero = {"usd": 0.0, "tok": 0, "turns": 0, "tokIn": 0, "tokOut": 0, "tokCacheR": 0, "tokCacheW": 0}
+        self.assertEqual(w["month"], zero)
+        self.assertEqual(w["monthToDate"], zero)
+
+    def test_windows_carry_the_by_kind_split_of_their_tokens(self):
+        # the user 2026-09-06 read a day's token count and could not see how it was possible: the count
+        # is every kind together, and cache reads (each API call of a turn re-reading the whole context)
+        # are most of it at a tenth of the price — so each window says how its count divides
+        b = {"usd": 1.0, "turns": 1, "tokIn": 3, "tokOut": 4, "tokCacheR": 500, "tokCacheW": 60}
+        self._ledger({_day(0): b}, {_hour(0): b, _hour(1): b})
+        w = km._spend_windows()
+        self.assertEqual(w["day"]["tok"], 2 * 567)
+        self.assertEqual((w["day"]["tokIn"], w["day"]["tokOut"], w["day"]["tokCacheR"], w["day"]["tokCacheW"]), (6, 8, 1000, 120))
+        self.assertEqual(sum(w["day"][k] for k in ("tokIn", "tokOut", "tokCacheR", "tokCacheW")), w["day"]["tok"],
+                         "the split accounts for the whole count")
+        self.assertEqual(w["month"]["tokCacheR"], 500, "the days ledger splits the same way")
+
+    def test_a_keyed_window_splits_only_when_every_bucket_carries_the_split(self):
+        # keyed sub-counts written before 2026-09-06 hold `tok` alone; a window folding one of those in
+        # shows NO split rather than a partial one that would read as whole. The bucket totals always
+        # carried the kinds, so the total-mode windows on the same ledger split regardless.
+        split = {"usd": 1.0, "turns": 1, "tok": 567, "tokIn": 3, "tokOut": 4, "tokCacheR": 500, "tokCacheW": 60}
+        new = {"usd": 1.0, "turns": 1, "tokIn": 3, "tokOut": 4, "tokCacheR": 500, "tokCacheW": 60, "key": dict(split)}
+        legacy = {"usd": 1.0, "turns": 1, "tokIn": 3, "tokOut": 4, "tokCacheR": 500, "tokCacheW": 60,
+                  "key": {"usd": 1.0, "turns": 1, "tok": 567}}
+        self._ledger({}, {_hour(0): new, _hour(30): legacy})
+        k = km._spend_windows(keyed_only=True)
+        self.assertEqual((k["day"]["tok"], k["day"]["tokCacheR"]), (567, 500), "a window of split buckets splits")
+        self.assertEqual(k["week"]["tok"], 1134)
+        self.assertNotIn("tokCacheR", k["week"], "…one legacy bucket in the window and it stays unsplit")
+        t = km._spend_windows()
+        self.assertEqual((t["week"]["tok"], t["week"]["tokCacheR"]), (1134, 1000), "the totals split either way")
 
 
 

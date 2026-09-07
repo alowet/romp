@@ -645,6 +645,7 @@ EOF
     _romp_cmd "romp up"                    romp-manager "Run the kernel manager in the foreground (rare — the login service runs it)"
     _romp_cmd "romp version"               romp-version "Versions across the parts (tree, kernel, served vs built bundles)"
     _romp_cmd "romp keyswap [<name>]"      romp-keyswap "Select a 1Password reference or legacy key (service.env.<name>; --cycle-all reconnects running sessions)"
+    _romp_cmd "romp spend-rebuild"         romp-spend-rebuild "Recount the spend ledger's token columns from the transcripts (dry run; --apply writes, dollars untouched)"
     _romp_cmd "romp uninstall"             romp-uninstall "Remove romp's installed footprint (--purge also deletes recorded state)"
     _romp_cmd "romp help"                  -            "Show this help"
     cat <<'EOF'
@@ -745,6 +746,15 @@ _romp_op_consumer() {
     done < "$_f"
     return 1
 }
+# `romp spend-rebuild [--apply] [--by-session]` — recount the TOKEN columns of spend.json from the
+# transcripts' own per-call usage (the user 2026-09-06: the ledger under-counted every turn but a
+# process's first, because the result's flat `usage` is per-turn on current Claude Code and was
+# diffed like a running total — see kernel/sdk_backend.py _turn_usage). Dollars and turn counts
+# stay the recorder's. Dry run by default; --apply keeps the old file as spend.json.bak-<stamp>.
+if [[ "${1:-}" == "spend-rebuild" ]]; then
+    shift
+    exec romp-spend-rebuild "$@"
+fi
 
 # The kernel serve token — required on EVERY kernel/bus request, loopback included (Jupyter's
 # model: the 0600 file, not the socket, is the same-user trust boundary). Same resolution order

@@ -107,6 +107,23 @@ class RailUsage(unittest.TestCase):
         ksrc = open(os.path.join(BIN, "romp-kernel")).read()
         self.assertEqual(ksrc.count('out["spendAt"] = sa'), 2, "the key-only arm and the mixed-host arm")
 
+    def test_the_spend_hover_splits_each_windows_tokens_by_kind(self):
+        # the user 2026-09-06 read the day's token count in the API cell and could not see how a handful
+        # of turns could cost that many tokens. They can: every API call of a turn (one per tool step)
+        # re-reads the whole context from the cache, and cache reads are most of the count at a tenth of
+        # the input price. So each window's row in the spend hover now carries a sub-line splitting its
+        # count by kind — largest first — wearing the sub-annotation grammar (.ru-tip-reset's size and
+        # opacity, no new font size). A host whose kernel ships no split leaves the summed row unsplit.
+        self.assertIn("tokCacheR:seg.tokCacheR,tokCacheW:seg.tokCacheW", self.html, "spendDet carries the split through")
+        self.assertIn("if(typeof v.tokCacheR==='number'){t.tokIn+=v.tokIn||0;t.tokOut+=v.tokOut||0;t.tokCacheR+=v.tokCacheR;t.tokCacheW+=v.tokCacheW||0;}else t.split=false;",
+                      self.html, "summed across hosts; one unsplit host unsplits the row rather than half-splitting it")
+        self.assertIn("if(v.split&&(v.tokIn+v.tokOut+v.tokCacheR+v.tokCacheW)>0)row+='<div class=\"ru-tip-row ru-tip-sub\"><span class=ru-tip-k></span>'",
+                      self.html)
+        self.assertIn("fmtTok(v.tokCacheR)+' cache read · '+fmtTok(v.tokCacheW)+' cache write · '+fmtTok(v.tokIn)+' in · '+fmtTok(v.tokOut)+' out</span></div>'",
+                      self.html, "cache read first — it is the number that explains the total (the landing is a "
+                                 "cooked Python string: the source's \\u00b7 renders as the character itself)")
+        self.assertIn(".ru-tip-sub{margin-top:0}.ru-tip-sub .ru-tip-v{opacity:.6;font-size:10px}", self.html)
+
     def test_the_tooltip_shows_the_snapshots_age(self):
         # "updated ... ago" (the user 2026-07-02): the bars lagged the CLI's own /usage with no cue the reading
         # was old — usage.json refreshes only when a statusline render or a rate-limit event produces a NEW
