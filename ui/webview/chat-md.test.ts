@@ -96,5 +96,5 @@ test("the user bubble renders the user's OWN words with userMd, harness notes an
   assert.doesNotMatch(RENDER, /bubble\.innerHTML = md\(t\.md\);/);
   // romp-authored surfaces keep the assistant grammar: nudges, notices, the Continue gesture, tagged sends
   assert.match(RENDER, /full\.innerHTML = md\(raw\);/, "the romp nudge fold");
-  assert.match(RENDER, /body\.innerHTML = md\(text\);\n\s*return noticeCard\(\{ variant: "romp"/, "the romp system notice");
+  assert.match(RENDER, /if \(more\) body\.innerHTML = md\(text\);[^\n]*\n\s*return noticeCard\(\{ variant: "romp"/, "the romp system notice (a one-liner gets no body, T243)");
 });

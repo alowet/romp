@@ -2296,9 +2296,10 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
       const firstLine = (text.split("\n").find((l) => l.trim()) || text).trim();
       const gist = firstLine.length > 90 ? firstLine.slice(0, 88).replace(/\s+\S*$/, "") + "…" : firstLine;
       const body = el("div", "notice-md md");
-      body.innerHTML = md(text);
+      const more = collapseWs(text) !== collapseWs(gist);
+      if (more) body.innerHTML = md(text);   // a one-line notice IS its gist — no body repeating the head (T243)
       return noticeCard({ variant: "romp", chip: "romp", logo: true, head: gist, body,
-                          collapsible: collapseWs(text) !== collapseWs(gist),
+                          collapsible: more,
                           key: ev.uuid ? "rsys:" + ev.uuid : undefined });
     }
     // Three flavors of a "user-role" turn: a GENUINE typed prompt → the blue right-aligned bubble; a
@@ -3421,10 +3422,11 @@ function renderSlashCmd(bubble: HTMLElement, text: string): boolean {
 // a "message" — the user 2026-07-01).
 // The "N queued …" count. Shared with the ✕'s immediate recount so the number on screen can never drift
 // from the bubbles under it while the cancel is in flight.
-function queuedCountText(n: number, nCmd: number, nRomp = 0): string {
-  // a notice romp itself queued is neither the user's message nor a command (T243): all notices → "notice";
-  // a notice among the user's messages → the mixed "item", never a claim of N "messages"
-  const noun = nCmd === n ? "command" : nRomp === n ? "notice" : (nCmd === 0 && nRomp === 0) ? "message" : "item";
+function queuedCountText(n: number, nCmd: number, nSys = 0, nNudge = 0): string {
+  // what romp itself queued is neither the user's message nor a command (T243): all system notices →
+  // "notice", all nudges/follow-ups → "nudge"; anything mixed → "item", never a claim of N "messages"
+  const noun = nCmd === n ? "command" : nSys === n ? "notice" : nNudge === n ? "nudge"
+    : (nCmd === 0 && nSys === 0 && nNudge === 0) ? "message" : "item";
   return `${n} queued ${noun}${n === 1 ? "" : "s"}`;
 }
 
@@ -3441,8 +3443,9 @@ function reflowQueuedGroup(turn: HTMLElement): void {
     return;
   }
   const nCmd = bubbles.filter((b) => b.querySelector(".slash-cmd-chip")).length;
-  const nRomp = bubbles.filter((b) => b.classList.contains("queued-romp")).length;
-  label.textContent = queuedCountText(bubbles.length, nCmd, nRomp) + (label.dataset.why || "");
+  const nSys = bubbles.filter((b) => b.classList.contains("queued-sys")).length;
+  const nNudge = bubbles.filter((b) => b.classList.contains("queued-romp") && !b.classList.contains("queued-sys")).length;
+  label.textContent = queuedCountText(bubbles.length, nCmd, nSys, nNudge) + (label.dataset.why || "");
 }
 
 function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
@@ -3466,7 +3469,8 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
   if (!ev.bare) {
     const n = ev.texts.length;
     const nCmd = ev.texts.filter((t) => SLASH_CMD_RE.test(t.md)).length;
-    const nRomp = ev.texts.filter((t) => !!t.romp).length;
+    const nSys = ev.texts.filter((t) => !!t.rompSystem).length;
+    const nNudge = ev.texts.filter((t) => !!t.romp && !t.rompSystem).length;
     const head = el("div", "queued-head");
     head.appendChild(hourglassIcon());
     // While a question is pending, say WHAT it's waiting on: a message you'd already written when the picker
@@ -3484,7 +3488,7 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
       : askNote;
     const label = el("span", "queued-count");
     label.dataset.why = why;      // the ✕'s recount rewrites the count and keeps this suffix as-is
-    label.textContent = queuedCountText(n, nCmd, nRomp) + why;
+    label.textContent = queuedCountText(n, nCmd, nSys, nNudge) + why;
     // `detail` is the CLI's OWN sentence about the limit (it carries the reset time as a wall clock, which
     // is why that flavor has no epoch to count down to). One level deeper on hover, per the compact-by-
     // default rule — the head keeps its one-line reason.
@@ -3493,8 +3497,9 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
     turn.appendChild(head);
   }
   for (const t of ev.texts) {
-    if (t.followUp) turn.appendChild(followUpHeader(t.goal, t.fuCtx, t.idx !== undefined ? "q:" + t.idx : undefined));
-    const bubble = el("div", "queued-bubble md" + (t.cancelable ? " cancelable" : "") + (t.romp ? " queued-romp" : ""));
+    if (t.followUp && !t.romp) turn.appendChild(followUpHeader(t.goal, t.fuCtx, t.idx !== undefined ? "q:" + t.idx : undefined));
+    const bubble = el("div", "queued-bubble md" + (t.cancelable ? " cancelable" : "")
+                      + (t.romp ? " queued-romp" : "") + (t.rompSystem ? " queued-sys" : ""));
     // one phrase separating OUR unconfirmed echo from a real queued message, which the session has accepted
     // and is holding (the user 2026-07-16)
     if (t.optimistic) bubble.title = "sent just now — romp hasn't confirmed the session has it yet";
@@ -3504,19 +3509,53 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
     else if (!t.cancelable && t.idx !== undefined)
       bubble.title = "queued in the session — it can't be recalled, and joins the conversation at the session's next step";
     const isCmd = renderSlashCmd(bubble, t.md);
-    if (t.romp) {
-      // a notice romp itself queued (a watch notice, a restart notice, a nudge) wears the LANDED romp grammar
-      // (T243, the user 2026-09-07): the same gray notice card the landed message becomes — chip, gist line,
-      // marker tail and "[romp]" prefix hidden, the full text one caret away — nested inside the queued bubble
-      // so the group's header, the ✕ and the recount keep working unchanged
+    // what romp itself queued wears the LANDED romp grammar (T243, the user 2026-09-07), split exactly as the
+    // landed message splits: a SYSTEM notice (restart / resume / a watch landing) is the gray notice card;
+    // any other romp message (an auto-nudge, the Nudge button's follow-up, a relay) is the gray romp bubble
+    // with its gist line — tag, gist, the full text one click away. Both nest inside the queued bubble so
+    // the group's header, the ✕ and the recount keep working unchanged. Folds are keyed per ENTRY (its queue
+    // slot), never by text alone: two identical notices must not share one expand state.
+    const qkey = t.idx !== undefined ? "i" + t.idx : t.park !== undefined ? "p" + t.park : "o";
+    if (t.rompSystem) {
       const text = t.md.replace(/<!--[\s\S]*?-->/g, "").replace(/^\s*\[romp\]\s*/i, "").trim();
       const firstLine = (text.split("\n").find((l) => l.trim()) || text).trim();
       const gist = firstLine.length > 90 ? firstLine.slice(0, 88).replace(/\s+\S*$/, "") + "…" : firstLine;
+      const more = collapseWs(text) !== collapseWs(gist);
       const nb = el("div", "notice-md md");
-      nb.innerHTML = md(text);
+      if (more) nb.innerHTML = md(text);   // a one-line notice IS its gist — no body repeating the head
       bubble.appendChild(noticeCard({ variant: "romp", chip: "romp", logo: true, head: gist, body: nb,
-                                      collapsible: collapseWs(text) !== collapseWs(gist),
-                                      key: "qromp:" + gist.slice(0, 60), nested: true }));
+                                      collapsible: more, key: "qromp:" + qkey + ":" + gist.slice(0, 24), nested: true }));
+    } else if (t.romp) {
+      const tag = el("div", "romp-tag");
+      const logo = el("img", "romp-tag-logo") as HTMLImageElement;
+      logo.src = mediaSrc("romp-swirl-glyph.svg"); logo.alt = ""; logo.onerror = () => logo.remove();
+      tag.appendChild(logo);
+      tag.appendChild(document.createTextNode("romp"));
+      bubble.appendChild(tag);
+      const rb = el("div", "romp-bubble md");
+      const raw = t.md.replace(/<!--[\s\S]*?-->/g, "").replace(/^\s*\[romp\]\s*/, "").trim();
+      const lines = raw.split("\n").map((l) => l.trim());
+      const firstLine = lines.find((l) => l && !l.startsWith(">")) || lines.find((l) => l) || raw;
+      const gist = t.followUp ? "follow-up" + (t.goal ? " · " + t.goal : "")
+        : t.rompAuto ? "nudged for a status update" + (t.goal ? " · " + t.goal : "")
+        : firstLine.length > 90 ? firstLine.slice(0, 88).replace(/\s+\S*$/, "") + "…" : firstLine;
+      const more = collapseWs(raw) !== collapseWs(gist);
+      const gistEl = el("div", "nudge-gist");
+      if (more) { const c = el("span", "nudge-caret"); c.textContent = "▸"; gistEl.appendChild(c); }
+      gistEl.appendChild(document.createTextNode(gist));
+      rb.appendChild(gistEl);
+      if (more) {
+        const full = el("div", "nudge-full md");
+        full.innerHTML = md(raw);
+        rb.appendChild(full);
+        rb.classList.add("nudge-collapsible");
+        rb.dataset.act = "nudgetoggle";   // the stable body delegate, never a per-render listener
+        const nkey = "qnudge:" + qkey + ":" + gist.slice(0, 24);
+        rb.dataset.nkey = nkey;
+        applyFold(rb, "expanded", nkey);
+        rb.title = rb.classList.contains("expanded") ? "click to collapse" : "click to expand";
+      }
+      bubble.appendChild(rb);
     }
     if (!t.romp && !isCmd) bubble.innerHTML = userMd(t.md);   // the user's words, newlines kept — byte-for-byte what the landed bubble shows
     // An optimistic echo's dragged images render as THUMBNAILS, not just their trailing paths (the
@@ -3536,7 +3575,8 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
     if (t.cancelable && (t.idx !== undefined || t.park !== undefined || t.optimistic)) {
       const x = el("button", "queued-x");
       x.textContent = "✕";
-      x.title = t.romp ? "cancel this queued notice" : isCmd ? "cancel this queued command" : "cancel this queued message and move it back to the composer";
+      x.title = t.rompSystem ? "cancel this queued notice" : t.romp ? "cancel this queued nudge"
+        : isCmd ? "cancel this queued command" : "cancel this queued message and move it back to the composer";
       x.dataset.act = "qx";
       if (t.romp) x.dataset.qromp = "1";   // romp's words, not the user's: cancelling never restores it to the composer (T243)
       if (t.idx !== undefined) x.dataset.qidx = String(t.idx);
