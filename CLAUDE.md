@@ -128,9 +128,12 @@ broad `git add` will sweep up your work). Conventions:
     `--auto` and leave the merge to the maintainers.
   "Approval" is the latest review by a maintainer other than the author, on the CURRENT head,
   APPROVED - GitHub forbids self-approval and the user's sessions act under the user's
-  account, so it structurally means the other maintainer. Any PR touching `.github/` needs an
-  approval regardless of tier: the base-branch check cannot stop a PR's own copy from posting
-  a same-named success on `pull_request` events, so a human looks. Consequence for sessions:
+  account, so it structurally means the other maintainer. Any PR touching `.github/` or
+  `scripts/ci/` - the gate's own workflow and code - needs an approval regardless of tier: the
+  base-branch check cannot stop a PR's own copy from posting a same-named success on
+  `pull_request` events, and a fix-tier PR must not be able to rewrite the policy through the
+  seven-day path, so a human looks. (The ruleset must require the check with the GitHub
+  Actions app as its source; a bare name match would accept anyone's commit status.) Consequence for sessions:
   `--auto` still lands `docs` on green; a `fix` lands on approval or its seventh day; `feature`
   and `major-feature` wait for a human. The line that matters is 2 vs 3: adds a capability
   inside the existing model, `feature`; changes what romp is, `major-feature`, talk first.

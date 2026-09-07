@@ -18,6 +18,7 @@ import importlib.util
 import os
 import tempfile
 import unittest
+import urllib.error
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 # Hermetic state BEFORE any romp code loads (the repo-wide rule the state-isolation meta-test
@@ -39,7 +40,7 @@ def pr(**kw):
     """A synthetic PR fixture with sensible defaults; override per test."""
     base = {"number": 42, "author": "author-a", "labels": ["fix"], "head_sha": HEAD,
             "files": ["kernel/kernel.py"], "reviews": [], "permissions": {},
-            "first_check_at": None, "created_at": NOW - DAY, "now": NOW, "body": "",
+            "first_check_at": None, "head_floor": None, "created_at": NOW - DAY, "now": NOW, "body": "",
             "issues": {}}
     base.update(kw)
     return base
@@ -121,6 +122,20 @@ class Approval(unittest.TestCase):
                                     review("maint-b", submitted=NOW - 60)]))
         self.assertEqual(v["conclusion"], "success")
 
+    def test_dismissing_a_later_objection_does_not_revive_an_earlier_approval(self):
+        # a DISMISSED review is the reviewer's latest word (a non-approval), never an erasure: anyone
+        # with write can dismiss, and both maintainers hold write - the review's catch
+        v = tp.evaluate(pr(labels=["feature"], permissions=MAINTAINERS,
+                           reviews=[review("maint-b", submitted=NOW - 600),
+                                    review("maint-b", state="CHANGES_REQUESTED", submitted=NOW - 60, dismissed=True)]))
+        self.assertEqual(v["conclusion"], "failure")
+
+    def test_a_dismissed_objection_does_not_close_the_seven_day_path(self):
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, created_at=NOW - 9 * DAY,
+                           permissions=MAINTAINERS,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED", dismissed=True)]))
+        self.assertEqual(v["conclusion"], "success", "a dismissed objection is not a standing objection")
+
     def test_a_dismissed_approval_does_not_count(self):
         v = tp.evaluate(pr(labels=["feature"], reviews=[review("maint-b", dismissed=True)],
                            permissions=MAINTAINERS))
@@ -138,7 +153,7 @@ class Fix(unittest.TestCase):
         self.assertEqual(v["conclusion"], "success")
 
     def test_a_fix_passes_after_seven_unchanged_days_from_the_first_check_run(self):
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 7 * DAY - 1))
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 7 * DAY - 1, created_at=NOW - 8 * DAY))
         self.assertEqual(v["conclusion"], "success")
         self.assertIn("seven", v["summary"].lower())
 
@@ -150,13 +165,36 @@ class Fix(unittest.TestCase):
         v = tp.evaluate(pr(labels=["fix"], first_check_at=None, created_at=NOW - 8 * DAY))
         self.assertEqual(v["conclusion"], "success")
 
+    def test_a_force_push_back_to_an_old_head_restarts_the_clock(self):
+        # the review's critical catch: check runs are keyed by sha, so a sha seen for a minute on
+        # day 0 and force-pushed back on day 7 read as seven days old. head_floor is the later of
+        # created_at and every force-push / reopen / ready-for-review event - the clock is bound to
+        # the head's time as THIS PR's reviewable head, not the sha's age
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 3600))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("became the PR's head", v["summary"])
+
+    def test_a_new_pr_reusing_an_old_head_starts_its_own_clock(self):
+        # PR B opened from PR A's branch: A's old check runs must not spend B's seven days
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 30 * DAY, created_at=NOW - DAY,
+                           head_floor=NOW - DAY))
+        self.assertEqual(v["conclusion"], "failure")
+
+    def test_the_clock_is_the_later_of_head_arrival_and_first_run(self):
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY))
+        self.assertEqual(v["conclusion"], "success", "both bounds are older than seven days")
+
     def test_the_record_carries_no_commit_date_for_the_clock_to_read(self):
-        # the clock's only inputs are first_check_at and created_at - the fetcher's record has no
-        # commit-date field at all (pinned in FetcherShapes below), so a forged commit date has no
-        # way into the policy
-        rec = tp.evaluate.__code__.co_names
-        self.assertIn("first_check_at", " ".join(str(c) for c in tp.evaluate.__code__.co_consts))
-        self.assertNotIn("committer", " ".join(str(c) for c in tp.evaluate.__code__.co_consts))
+        # the clock's only inputs are first_check_at, head_floor and created_at - the fetcher's record
+        # has no commit-date field at all (pinned in FetcherShapes below), so a forged commit date has
+        # no way into the policy
+        import types
+        consts = " ".join(str(c) for f in vars(tp).values() if isinstance(f, types.FunctionType)
+                          for c in f.__code__.co_consts)
+        self.assertIn("first_check_at", consts)
+        self.assertIn("head_floor", consts)
+        for forged in ("committer", "author_date", "commit_date"):
+            self.assertNotIn(forged, consts)
 
     def test_changes_requested_blocks_the_seven_day_path(self):
         v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, permissions=MAINTAINERS,
@@ -172,7 +210,7 @@ class Fix(unittest.TestCase):
 
 
 class MajorFeature(unittest.TestCase):
-    ISSUE_OK = {7: {"exists": True, "is_pr": False, "comments": ["maint-b"]}}
+    ISSUE_OK = {7: {"exists": True, "is_pr": False, "user": "author-a", "comments": ["maint-b"]}}
 
     def test_approval_plus_a_discussed_linked_issue_passes(self):
         v = tp.evaluate(pr(labels=["major-feature"], reviews=[review("maint-b")], permissions=MAINTAINERS,
@@ -192,12 +230,21 @@ class MajorFeature(unittest.TestCase):
 
     def test_a_linked_issue_with_only_the_authors_comments_is_not_a_discussion(self):
         v = tp.evaluate(pr(labels=["major-feature"], reviews=[review("maint-b")], permissions=MAINTAINERS,
-                           body="#7", issues={7: {"exists": True, "is_pr": False, "comments": ["author-a"]}}))
+                           body="#7", issues={7: {"exists": True, "is_pr": False, "user": "author-a",
+                                                   "comments": ["author-a"]}}))
         self.assertEqual(v["conclusion"], "failure")
+
+    def test_the_issue_opener_is_a_participant(self):
+        # the ordinary flow - a maintainer files the issue, the author replies and implements
+        v = tp.evaluate(pr(labels=["major-feature"], reviews=[review("maint-b")], permissions=MAINTAINERS,
+                           body="#7", issues={7: {"exists": True, "is_pr": False, "user": "maint-b",
+                                                   "comments": ["author-a"]}}))
+        self.assertEqual(v["conclusion"], "success")
 
     def test_a_linked_PR_number_is_not_an_issue(self):
         v = tp.evaluate(pr(labels=["major-feature"], reviews=[review("maint-b")], permissions=MAINTAINERS,
-                           body="#7", issues={7: {"exists": True, "is_pr": True, "comments": ["maint-b"]}}))
+                           body="#7", issues={7: {"exists": True, "is_pr": True, "user": "maint-b",
+                                                   "comments": ["maint-b"]}}))
         self.assertEqual(v["conclusion"], "failure")
 
     def test_a_discussed_issue_without_approval_fails(self):
@@ -206,8 +253,20 @@ class MajorFeature(unittest.TestCase):
 
 
 class GithubDir(unittest.TestCase):
+    def test_the_gates_own_code_needs_an_approval_regardless_of_tier(self):
+        # the review's catch: the policy is checked out from main and run with checks:write, so a
+        # fix-tier PR rewriting scripts/ci/tier_policy.py through the seven-day path would grade itself
+        v = tp.evaluate(pr(labels=["fix"], files=["scripts/ci/tier_policy.py"], first_check_at=NOW - 30 * DAY,
+                           head_floor=NOW - 30 * DAY))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("scripts/ci/tier_policy.py", v["summary"])
+        v = tp.evaluate(pr(labels=["fix"], files=["scripts/ci/tier_policy.py"], reviews=[review("maint-b")],
+                           permissions=MAINTAINERS))
+        self.assertEqual(v["conclusion"], "success")
+
     def test_touching_github_requires_approval_regardless_of_tier(self):
-        v = tp.evaluate(pr(labels=["fix"], files=[".github/workflows/ci.yml"], first_check_at=NOW - 30 * DAY))
+        v = tp.evaluate(pr(labels=["fix"], files=[".github/workflows/ci.yml"], first_check_at=NOW - 30 * DAY,
+                           head_floor=NOW - 30 * DAY))
         self.assertEqual(v["conclusion"], "failure", "the seven-day path never clears a .github change")
         self.assertIn(".github", v["summary"])
         v = tp.evaluate(pr(labels=["fix"], files=[".github/workflows/ci.yml"], reviews=[review("maint-b")],
@@ -285,11 +344,20 @@ class WorkflowPins(unittest.TestCase):
 
     def test_the_clock_reads_check_runs_not_commit_dates(self):
         self.assertIn('key="check_runs"', self.fetch, "the check-runs endpoint is an object; read its list")
+        self.assertIn("filter=all", self.fetch, "the default `latest` collapses the hourly runs to the newest")
         # the ONLY /commits/ request is the check-runs listing - no GET of the commit itself, whose
         # author/committer dates are the author's to set
         import re
         commits = re.findall(r'/commits/%s([^"]*)"', self.fetch)
-        self.assertEqual(commits, ["/check-runs?check_name=%s"], commits)
+        self.assertEqual(commits, ["/check-runs?check_name=%s&filter=all"], commits)
+        self.assertIn('RESET_EVENTS = ("head_ref_force_pushed", "reopened", "ready_for_review")', self.fetch,
+                      "the head's arrival is bounded by the server-stamped timeline events")
+
+    def test_the_job_name_is_the_check_name(self):
+        # the pull_request_target job's own check run is what stamps a head's arrival; the JOB (not
+        # just the workflow) must carry the check name - pinned at the jobs level explicitly
+        jobs = self.wf[self.wf.index("\njobs:"):]
+        self.assertIn("    name: Tier policy", jobs)
         self.assertNotIn('["committer"]', self.fetch)
         self.assertNotIn('["author"]["date"]', self.fetch)
 
@@ -330,12 +398,24 @@ class FetcherShapes(unittest.TestCase):
                 return [{"user": {"login": "maint-b"}, "state": "APPROVED", "commit_id": HEAD,
                          "submitted_at": "2026-09-02T00:00:00Z"}], {}
             if "/collaborators/" in path:
+                if test.perm_error:
+                    raise urllib.error.HTTPError(path, test.perm_error, "x", {}, None)
                 return {"permission": "write"}, {}
+            if path.endswith("/timeline"):
+                return test.timeline, {}
             if path.endswith("/issues/7/comments"):
-                return [{"user": {"login": "maint-b"}}], {}
+                return [{"user": {"login": "maint-b"}}, {"user": {"login": "stale[bot]", "type": "Bot"}}], {}
             if path.endswith("/issues/7"):
-                return {"number": 7}, {}
+                return {"number": 7, "user": {"login": "author-a"}}, {}
+            if "/issues/" in path and path.endswith("/comments"):
+                return [], {}
+            if "/issues/" in path:
+                test.issue_fetches.append(path)
+                return {"number": 0, "user": {"login": "author-a"}}, {}
             raise AssertionError("unexpected request " + path)
+        self.perm_error = None
+        self.timeline = []
+        self.issue_fetches = []
         self.tc._req = fake_req
 
     def test_build_record_survives_the_documented_shapes_and_has_no_commit_date(self):
@@ -343,13 +423,76 @@ class FetcherShapes(unittest.TestCase):
         self.assertEqual(rec["first_check_at"], self.tc._iso("2026-09-01T00:00:00Z"),
                          "the clock is the server-stamped first check run for this head")
         self.assertEqual(set(rec), {"number", "author", "labels", "head_sha", "files", "reviews", "permissions",
-                                    "first_check_at", "created_at", "now", "body", "issues"},
+                                    "first_check_at", "head_floor", "created_at", "now", "body", "issues"},
                          "the record has exactly the documented keys - no commit date can reach the policy")
         self.assertEqual(rec["permissions"], {"maint-b": "write"})
-        self.assertEqual(rec["issues"], {7: {"exists": True, "is_pr": False, "comments": ["maint-b"]}})
+        self.assertEqual(rec["issues"], {7: {"exists": True, "is_pr": False, "user": "author-a",
+                                             "comments": ["maint-b"]}}, "the bot commenter is filtered")
+        self.assertEqual(rec["head_floor"], rec["created_at"], "no reset events → the floor is created_at")
         self.assertEqual(self.tc.evaluate(rec)["conclusion"], "success")
         self.assertFalse(any("/commits/%s\"" % HEAD in p or p.endswith("/commits/" + HEAD) for _, p in self.calls),
                          "the commit itself is never fetched")
+
+    def test_a_force_push_on_the_timeline_raises_the_head_floor(self):
+        self.timeline = [{"event": "head_ref_force_pushed", "created_at": "2026-09-02T12:00:00Z"},
+                         {"event": "labeled", "created_at": "2026-09-03T12:00:00Z"}]
+        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        self.assertEqual(rec["head_floor"], self.tc._iso("2026-09-02T12:00:00Z"),
+                         "the latest reset event, not a label change, bounds the clock")
+
+    def test_issue_refs_are_deduped_and_capped(self):
+        # a 64 KiB body of "#1 #1 #1 ..." must not become tens of thousands of requests
+        pr_body = " ".join("#%d" % n for n in ([1] * 50 + list(range(2, 40))))
+        real = self.tc._req
+
+        def with_body(method, path, token, body=None):
+            if path.split("?")[0].endswith("/pulls/42"):
+                return {"head": {"sha": HEAD}, "user": {"login": "author-a"}, "labels": [{"name": "fix"}],
+                        "created_at": "2026-08-30T00:00:00Z", "body": pr_body}, {}
+            return real(method, path, token, body)
+        self.tc._req = with_body
+        self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        fetched = {p.split("/issues/")[1].split("/")[0] for p in self.issue_fetches}
+        self.assertLessEqual(len(fetched), self.tc.MAX_ISSUE_REFS)
+        self.assertEqual(len([p for p in self.issue_fetches if p.endswith("/issues/1")]), 1, "deduped")
+
+    def test_a_non_404_permission_error_is_loud_not_a_silent_denial(self):
+        self.perm_error = 403
+        with self.assertRaises(urllib.error.HTTPError):
+            self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+
+    def test_a_404_permission_means_not_a_collaborator(self):
+        self.perm_error = 404
+        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        self.assertEqual(rec["permissions"], {"maint-b": "none"})
+        self.assertFalse(tp._approved(rec)[0], "a non-collaborator never approves")
+
+    def test_all_open_isolates_one_prs_failure_from_the_rest(self):
+        posted = []
+        real = self.tc._req
+
+        def isolating(method, path, token, body=None):
+            p = path.split("?")[0]
+            if method == "POST":
+                posted.append(body["head_sha"][:4] + ":" + body["conclusion"])
+                return {}, {}
+            if p.endswith("/pulls"):
+                return [{"number": 41}, {"number": 42}], {}
+            if p.endswith("/pulls/41"):
+                return {"head": {"sha": "4" * 40}, "user": {"login": "author-a"}, "labels": [{"name": "fix"}],
+                        "created_at": "2026-08-30T00:00:00Z", "body": ""}, {}
+            if "/pulls/41/" in p:
+                raise urllib.error.HTTPError(path, 500, "boom", {}, None)
+            return real(method, path, token, body)
+        self.tc._req = isolating
+        os.environ["GITHUB_TOKEN"] = "tok"
+        try:
+            rc = self.tc.main(["--all-open"])
+        finally:
+            os.environ.pop("GITHUB_TOKEN", None)
+        self.assertEqual(rc, 1, "the run reads red because one PR could not be evaluated")
+        self.assertIn("4444:failure", posted, "…and that PR got a LOUD failing verdict, not silence")
+        self.assertIn(HEAD[:4] + ":success", posted, "…while the other PR still got its verdict")
 
 
 if __name__ == "__main__":
