@@ -763,10 +763,12 @@ def permission_to_live(tool_name: str, tool_input: dict, context=None) -> dict:
 _STATES = ("working", "waiting", "idle", "permission", "compacting", "picker")
 
 
-def append_state(state_dir: Path, sid: str, state: str, t: int | None = None) -> None:
+def append_state(state_dir: Path, sid: str, state: str, t: int | None = None, by: str = "") -> None:
     p = Path(state_dir) / "states" / (sid + ".jsonl")
     p.parent.mkdir(parents=True, exist_ok=True)
     rec = {"t": int(time.time()) if t is None else int(t), "state": state}
+    if by:
+        rec["by"] = by          # a romp-written settle (an interrupt), skipped by the turn-finished push (#937 fold)
     with open(p, "a") as f:
         f.write(json.dumps(rec) + "\n")
 
@@ -7144,7 +7146,7 @@ class SdkBackend:
         if not s:
             return False
         s.interrupt()
-        append_state(self.state_dir, sid, "idle", int(time.time()) - 1)
+        append_state(self.state_dir, sid, "idle", int(time.time()) - 1, by="interrupt")
         self._poke()
         return True
 

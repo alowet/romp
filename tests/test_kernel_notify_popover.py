@@ -544,6 +544,42 @@ class TurnFinishedPush(unittest.TestCase):
         _stamp_stop(SID_WEB, 1010)
         self.assertEqual(len(self._tick()[0]), 1, "…and with both on the next end fires")
 
+    def test_a_tmux_interrupt_settle_is_not_a_finished_turn(self):
+        # a Stop press writes an idle row (romp's _record_idle, tagged by:interrupt) — the user's own
+        # act, not a turn the session finished, so the fallback key must skip it (#937 fold). A tmux
+        # session has no lastStopAt, so the fallback is what decides.
+        km._set_notify_all(True)
+        km._set_notify_turns(True)
+        _append_state(SID_WEB, "working", 1000)
+        self._tick()                                       # baseline
+        d = jd.STATE / "states"
+        with open(d / (SID_WEB + ".jsonl"), "a") as f:
+            f.write(json.dumps({"t": 1001, "state": "idle", "by": "interrupt"}) + "\n")
+        self.assertEqual(self._tick()[0], [], "the interrupt's settle is not a turn end")
+        # a genuine stop the SESSION wrote (no `by`) does fire
+        with open(d / (SID_WEB + ".jsonl"), "a") as f:
+            f.write(json.dumps({"t": 1002, "state": "waiting"}) + "\n")
+        self.assertEqual(len(self._tick()[0]), 1, "a real stopped transition still fires")
+
+    def test_a_states_log_that_has_not_moved_is_not_reread(self):
+        # the tick asks _turn_end_key for every alive session every pusher cycle; a states log whose
+        # (mtime, size) is unchanged is answered from the memo, not re-scanned (#937 fold)
+        km._set_notify_all(True); km._set_notify_turns(True)
+        _append_state(SID_WEB, "waiting", 1000)
+        self._tick()
+        opens = {"n": 0}
+        import builtins
+        real_open = builtins.open
+        target = str(jd.STATE / "states" / (SID_WEB + ".jsonl"))
+        def counting_open(f, *a, **k):
+            if str(f) == target:
+                opens["n"] += 1
+            return real_open(f, *a, **k)
+        with mock.patch.object(builtins, "open", counting_open):
+            for _ in range(5):
+                self._tick()
+        self.assertEqual(opens["n"], 0, "the unchanged states log is served from the memo, never re-opened")
+
     def test_switching_on_later_never_replays_old_ends(self):
         _stamp_stop(SID_WEB, 1000)
         self._tick()
@@ -650,6 +686,16 @@ class OneBuzzPerTurnEnd(unittest.TestCase):
             pn.assert_not_called()
             pf.assert_not_called()
 
+    def test_the_yielding_bell_push_still_carries_the_badge_quietly(self):
+        # a card push that yields the BUZZ to an already-fired turn push must still deliver the badge,
+        # QUIET: a closed installed app learns the needs-you count only from a push (#937 fold)
+        import inspect
+        src = inspect.getsource(km._cached_feed)
+        self.assertIn('_push_notify(_t, _b, _sid, _badge, kind="card", card_id=_iid, quiet=True)', src,
+                      "the yielding branch still pushes, with the badge, quiet")
+        self.assertLess(src.index('quiet=True'), src.index('_push_notify(_t, _b, _sid, _badge, kind="card", card_id=_iid)'),
+                        "the quiet yield sits in the claim-failed branch, above the normal push")
+
     def test_the_feed_path_claims_before_it_pushes(self):
         import inspect
         src = inspect.getsource(km._cached_feed)
@@ -660,6 +706,14 @@ class OneBuzzPerTurnEnd(unittest.TestCase):
 
 
 class RelayOfTurnEvents(unittest.TestCase):
+    def setUp(self):
+        km._set_notify_all(True)                 # the receiver's switches must be on for a relay to land (#937 fold)
+        km._set_notify_turns(True)
+
+    def tearDown(self):
+        km._set_notify_all(False)
+        km._set_notify_turns(False)
+
     def test_a_turn_shaped_event_mirrors_with_the_origin_on_its_sid(self):
         # the relay's tolerant surgery (the federation test's contract): a session-named title
         # passes as composed, the sid gains the origin so a tap routes through the merged dashboard
@@ -713,7 +767,7 @@ class ShellPopover(unittest.TestCase):
         self.assertIn(">Also when a turn finishes<", h)
         self.assertIn("id=rbp-test data-act=test>Send a test notification<", h)
         # the "why" under each switch — the master's in two sentences: what off does, what the bells are
-        self.assertIn("The main switch: off silences every device, and the desktop of every machine you've attached. "
+        self.assertIn("The main switch: off silences every device subscribed to this romp, and this desktop. "
                       "The bells on sessions and cards are mutes under it.", h)
         self.assertIn("Buzzes every time any session finishes a turn. With many sessions running, that is a lot of buzzing.", h)
         self.assertIn("id=rbp-test-out", h)
