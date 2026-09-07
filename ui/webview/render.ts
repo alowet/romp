@@ -3460,6 +3460,15 @@ function reflowQueuedGroup(turn: HTMLElement): void {
   label.textContent = queuedCountText(bubbles.length, nCmd, nSys, nNudge) + (label.dataset.why || "");
 }
 
+// A stable per-text identity for the queued romp folds (T243 follow-up): the queue SLOT renumbers as entries
+// ahead land or are cancelled, which snapped an expanded fold shut with no user action; the text hash plus
+// its occurrence among identical texts survives the shift and still tells two identical notices apart.
+function strHash32(str: string): string {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
 function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
   const turn = el("div", "turn turn-queued");
   // A BARE group is romp's own optimistic echo with nothing else known-queued: "N queued messages" is a
@@ -3508,6 +3517,7 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
     head.appendChild(label);
     turn.appendChild(head);
   }
+  const seenSig = new Map<string, number>();   // text hash → how many identical texts precede this one
   for (const t of ev.texts) {
     if (t.followUp && !t.romp) turn.appendChild(followUpHeader(t.goal, t.fuCtx, t.idx !== undefined ? "q:" + t.idx : undefined));
     const bubble = el("div", "queued-bubble md" + (t.cancelable ? " cancelable" : "")
@@ -3526,8 +3536,13 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
     // any other romp message (an auto-nudge, the Nudge button's follow-up, a relay) is the gray romp bubble
     // with its gist line — tag, gist, the full text one click away. Both nest inside the queued bubble so
     // the group's header, the ✕ and the recount keep working unchanged. Folds are keyed per ENTRY (its queue
-    // slot), never by text alone: two identical notices must not share one expand state.
-    const qkey = t.idx !== undefined ? "i" + t.idx : t.park !== undefined ? "p" + t.park : "o";
+    // text plus its occurrence among identical texts), never by the queue slot (which renumbers as entries
+    // ahead land) and never by text alone (two identical notices must not share one expand state).
+    const sig = strHash32(t.md);
+    const nth = seenSig.get(sig) || 0;
+    seenSig.set(sig, nth + 1);
+    const qkey = sig + ":" + nth;
+    let xHost: HTMLElement = bubble;   // where the ✕ lives: the nudge's own bubble corner, else the wrapper
     if (t.rompSystem) {
       const text = t.md.replace(/<!--[\s\S]*?-->/g, "").replace(/^\s*\[romp\]\s*/i, "").trim();
       const firstLine = (text.split("\n").find((l) => l.trim()) || text).trim();
@@ -3568,6 +3583,7 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
         rb.title = rb.classList.contains("expanded") ? "click to collapse" : "click to expand";
       }
       bubble.appendChild(rb);
+      xHost = rb;   // the ✕ in the bubble's corner, as a landed bubble would wear it — never floating in the wrapper's gap
     }
     if (!t.romp && !isCmd) bubble.innerHTML = userMd(t.md);   // the user's words, newlines kept — byte-for-byte what the landed bubble shows
     // An optimistic echo's dragged images render as THUMBNAILS, not just their trailing paths (the
@@ -3596,7 +3612,7 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
       if (t.optimistic) x.dataset.qopt = "1";   // ✕ before confirmation → cancel-by-body (no park/idx yet)
       if (isCmd) x.dataset.qcmd = "1";
       (x as any)._qmd = t.md;   // the bubble's body — the kernel's drift guard + the composer restore read it
-      bubble.appendChild(x);
+      xHost.appendChild(x);
     }
     turn.appendChild(bubble);
   }

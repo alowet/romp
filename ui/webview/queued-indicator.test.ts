@@ -255,8 +255,14 @@ test("what romp itself queued wears the LANDED romp grammar, split as landed: no
   // any other romp message → the gray romp bubble with the landed gist rule (follow-up · goal / nudged for a status update · goal / first line)
   assert.match(body, /\} else if \(t\.romp\) \{[\s\S]*?el\("div", "romp-tag"\)[\s\S]*?const rb = el\("div", "romp-bubble md"\);[\s\S]*?const gist = t\.followUp \? "follow-up" \+ \(t\.goal \? " · " \+ t\.goal : ""\)\s*\n\s*: t\.rompAuto \? "nudged for a status update" \+ \(t\.goal \? " · " \+ t\.goal : ""\)/);
   assert.match(body, /rb\.dataset\.act = "nudgetoggle";[\s\S]*?const nkey = "qnudge:" \+ qkey \+ ":" \+ gist\.slice\(0, 24\);/);
-  // folds are keyed per queue slot, never by text alone
-  assert.match(body, /const qkey = t\.idx !== undefined \? "i" \+ t\.idx : t\.park !== undefined \? "p" \+ t\.park : "o";/);
+  // folds are keyed by the text's hash plus its occurrence — never the queue slot (it renumbers), never text alone
+  assert.match(RENDER, /function strHash32\(str: string\): string/);
+  assert.match(body, /const sig = strHash32\(t\.md\);\s*\n\s*const nth = seenSig\.get\(sig\) \|\| 0;\s*\n\s*seenSig\.set\(sig, nth \+ 1\);\s*\n\s*const qkey = sig \+ ":" \+ nth;/);
+  // the nudge's ✕ lives in its bubble's corner; the wrapper is the landed right-aligned column and the nested
+  // bubble sheds its own 72% cap (T243 follow-up — measured in queued-romp-layout.test.ts)
+  assert.match(body, /xHost = rb;/); assert.match(body, /xHost\.appendChild\(x\);/);
+  assert.match(CSS, /\.queued-bubble\.queued-romp:not\(\.queued-sys\) \{ display: flex; flex-direction: column; align-items: flex-end; \}/);
+  assert.match(CSS, /\.queued-bubble\.queued-romp > \.romp-bubble \{ max-width: none; position: relative; \}/);
   // the marker tail and the [romp] prefix are hidden exactly the way the landed forms hide them
   assert.match(body, /t\.md\.replace\(\/<!--\[\\s\\S\]\*\?-->\/g, ""\)\.replace\(\/\^\\s\*\\\[romp\\\]\\s\*\/i, ""\)\.trim\(\)/);
   // a romp entry never wears the ↩ follow-up header (the landed romp turn suppresses it too)
