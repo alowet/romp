@@ -11013,7 +11013,7 @@ def _drive(msg, client):
         # the chat's fast badge — /fast on|off delivered like any slash command; mid-compaction → parked.
         # LOUD on refusal (fail loudly, never degrade silently): a dormant SDK session has no live CLI to
         # apply it, and silently swallowing the click would leave a toggle that "did nothing".
-        if not _set_fast_or_park(be, sid, str(msg["value"])):
+        if not _set_fast_or_park(be, sid, str(msg["value"]))[0]:
             client["send"](json.dumps({"type": "warn",
                                        "text": "Couldn't toggle fast mode — the session isn't connected right now."}))
         _push_soon()
@@ -21665,16 +21665,20 @@ def _set_model_or_park(be, sid, value, floating=False):
         _forget_model_pick(value)
     _mark_model_pending(sid, value)
     _note_model_pick(value)          # a version pick becomes its family's remembered default (2026-08-25)
-    if not _gate_or_park(sid, ("model", value)):
+    parked = _gate_or_park(sid, ("model", value))
+    if not parked:
         be.set_model(sid, value)
+    return parked
 
 
 def _set_effort_or_park(be, sid, value):
     """Apply an effort change now — or park it while the session compacts (the user 2026-07-02: /effort
     is a slash command like /model, so it must queue the same way — it used to slip straight through,
     with no queued chip and the same derail risk the /model park was built for)."""
-    if not _gate_or_park(sid, ("effort", value)):
+    parked = _gate_or_park(sid, ("effort", value))
+    if not parked:
         be.set_effort(sid, value)
+    return parked
 
 
 def _set_env_or_park(be, sid, value):
@@ -21699,13 +21703,16 @@ def _set_auth_or_park(be, sid, value):
 
 def _set_fast_or_park(be, sid, value):
     """Apply a fast-mode toggle now — or park it while the session compacts, exactly like /model and
-    /effort (it is a slash command and must keep press order in the same FIFO). Returns the backend's
-    verdict so the caller can be loud when a live apply refuses (dormant SDK session)."""
+    /effort (it is a slash command and must keep press order in the same FIFO). Returns (took, parked):
+    `took` is False on a bad value or a dormant SDK session's refused live apply (the caller is loud);
+    `parked` is True when the toggle queued (mid-compaction or behind a queue), so POST /send answers
+    queued truthfully from the setter's own locked decision rather than a second advisory gate read
+    (review find on #954, 2026-09-07)."""
     if value not in ("on", "off"):
-        return False
+        return (False, False)
     if _gate_or_park(sid, ("fast", value)):
-        return True
-    return be.set_fast(sid, value)
+        return (True, True)
+    return (be.set_fast(sid, value), False)
 
 
 def _route_meta_command(be, sid, text, client=None, floating=False, state=None):
@@ -21735,16 +21742,16 @@ def _route_meta_command(be, sid, text, client=None, floating=False, state=None):
     # ours to swallow: it stays the CLI's, verbatim, and the user sees the CLI's own error.
     if not value or len(value.split()) != 1:
         return False
-    gate = _ops_gate(sid)                  # the setters park under exactly this gate; read here so `state` can say so
+    # each setter now DECIDES its park under the queue lock (#954) and returns it; read that verdict rather
+    # than a second, unlocked _ops_gate read that could disagree with the locked decision (review find on
+    # #954, 2026-09-07: a parked /model answered queued:false on POST /send). Also spares a redundant tmux
+    # fork + discover sweep + usage read per meta command.
     if head == "/model" and _vouched_model(value):
-        _set_model_or_park(be, sid, value, floating=floating)     # mid-compaction → parked as a queued command
-        parked = gate
+        parked = _set_model_or_park(be, sid, value, floating=floating)     # mid-compaction → parked as a queued command
     elif head == "/effort" and value in _EFFORT_VALUES:
-        _set_effort_or_park(be, sid, value)    # mid-compaction → parked as a queued command
-        parked = gate
+        parked = _set_effort_or_park(be, sid, value)    # mid-compaction → parked as a queued command
     elif head == "/fast" and value in ("on", "off"):
-        took = _set_fast_or_park(be, sid, value)                  # mid-compaction → parked
-        parked = bool(took) and gate
+        took, parked = _set_fast_or_park(be, sid, value)          # took: applied or parked; parked: queued
         if not took and client:
             client["send"](json.dumps({"type": "warn",
                                        "text": "Couldn't toggle fast mode — the session isn't connected right now."}))

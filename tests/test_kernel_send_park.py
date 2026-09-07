@@ -108,20 +108,20 @@ class OpQueueParkOrDeliver(unittest.TestCase):
         # gate holds (compaction/open turn), a re-pick replaces the earlier parked toggle in place, and
         # _apply_pending_ops hands it to the backend once the session is quiet.
         km._compacting_now = lambda sid: True
-        self.assertTrue(km._set_fast_or_park(self.be, SID, "on"))
+        self.assertTrue(km._set_fast_or_park(self.be, SID, "on")[0])   # (took, parked): took
         km._send_or_park(self.be, SID, "then this", echo=None)
-        self.assertTrue(km._set_fast_or_park(self.be, SID, "off"))   # re-pick → in-place replace
+        self.assertTrue(km._set_fast_or_park(self.be, SID, "off")[0])   # re-pick → in-place replace
         self.assertEqual(self.be.calls, [], "mid-compaction the backend is NOT touched")
         self.assertEqual(km._pending_ops.get(SID),
                          [("fast", "off"), ("send", "then this", None)])
-        self.assertFalse(km._set_fast_or_park(self.be, SID, "sideways"), "only on|off are /fast arguments")
+        self.assertEqual(km._set_fast_or_park(self.be, SID, "sideways"), (False, False), "only on|off are /fast arguments")
         km.Sessions.backend_for = lambda sid: self.be
         km._compacting_now = lambda sid: False
         km._apply_pending_ops()
         self.assertEqual(self.be.calls, [("fast", "off"), ("send", "then this")],
                          "the toggle applies and delivery continues; the send ends the pass")
         km._compacting_now = lambda sid: False
-        self.assertTrue(km._set_fast_or_park(self.be, SID, "on"), "quiet session → applies immediately")
+        self.assertEqual(km._set_fast_or_park(self.be, SID, "on"), (True, False), "quiet session → applies immediately, not parked")
         self.assertEqual(self.be.calls[-1], ("fast", "on"))
 
     def test_apply_delivers_sequentially_when_quiet_and_not_before(self):
