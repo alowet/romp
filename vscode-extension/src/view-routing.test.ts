@@ -51,6 +51,17 @@ test("timeline: openLink is handled locally by the host, never forwarded", () =>
   assert.equal(r.revealChat, null);
 });
 
+test("feed and outline panes: a PR link's openLink is handled locally by the host too, never forwarded", () => {
+  // pr-links.ts posts {type:"openLink"} from a feed card or an outline row in VS Code; the kernel has
+  // no handler for it, so a forwarded one would be a dead click
+  for (const app of ["feed", "fleet"] as const) {
+    const r = routeViewMessage(app, { type: "openLink", href: "https://github.com/example-org/notes-api/pull/12" });
+    assert.equal(r.openLinkLocally, "https://github.com/example-org/notes-api/pull/12", app);
+    assert.equal(r.forward, false, app);
+    assert.equal(r.revealChat, null, app);
+  }
+});
+
 test("timeline: drive ops (compact etc.) just forward", () => {
   const r = routeViewMessage("timeline", { type: "compact", name: "sess" });
   assert.equal(r.revealChat, null);

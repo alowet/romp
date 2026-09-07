@@ -682,7 +682,8 @@ function wireFeedPanel(p: vscode.WebviewPanel) {
     // opens/focuses the tab itself. The rules live in view-routing.ts.
     const r = routeViewMessage("feed", m);
     if (r.revealChat) openPanel(r.revealChat.preserveFocus);
-    pipe.send(m);
+    if (r.openLinkLocally) openLink(r.openLinkLocally);   // a PR link in a card (pr-links.ts): the host opens it; the kernel has no handler
+    if (r.forward) pipe.send(m);
   });
   p.onDidChangeViewState(() => updateStrips());
   p.onDidDispose(() => {
@@ -851,6 +852,7 @@ function wireFleetPanel(p: vscode.WebviewPanel) {
     if (m.type === "ready") pipe.webviewReady = true;
     const r = routeViewMessage("fleet", m);
     if (r.revealChat) openPanel(r.revealChat.preserveFocus);
+    if (r.openLinkLocally) openLink(r.openLinkLocally);   // a PR link in an outline row (pr-links.ts): the host opens it
     if (r.forward) pipe.send(m);
   });
   p.onDidChangeViewState(() => updateStrips());
