@@ -1663,6 +1663,85 @@ class EclipsedChainSelection(unittest.TestCase):
         self.assertIn("second persisted attempt", texts)
         self.assertNotIn("first persisted attempt", texts)
 
+    # ── the five-way membership on a fork holding every sibling kind at once: the oracle for the
+    # narrowed selection. _select_eclipsed_chains builds its child map and its text witness over
+    # the eclipse set alone; these literals were recorded from the whole-graph version before that
+    # change and must not move. ──
+
+    def _sibling_fork(self, reply=True, completed=True):
+        """One fork (remA) with three sibling branches: the bypassed reply branch (assistant-headed,
+        a tool cycle then text), a textless stub pair, and a user-headed branch carrying a reply.
+        `reply=False` drops the reply branch (no branch qualifies); `completed=False` ends the
+        spine at the api_error record (the "exhausted" terminal)."""
+        recs = self.base() + [reminder_line(T0 + 10, "remA", "u1")]
+        if reply:
+            recs += [aline(T0 + 20, "", "tuA1", "remA", tools=("Bash",), stop=None),
+                     trline(T0 + 25, "tu_tuA1_0", "trA1", "tuA1"),
+                     aline(T0 + 30, "the reply the user watched stream", "rpA", "trA1")]
+        recs += [aline(T0 + 21, "", "stubA", "remA", tools=("Read",), stop=None),
+                 trline(T0 + 26, "tu_stubA_0", "stubB", "stubA"),
+                 uline(T0 + 40, "prompt on a side branch", "ux", "remA", ps="typed"),
+                 aline(T0 + 50, "reply on that side branch", "ax", "ux"),
+                 api_error_line(T0 + 11, "eA1", "remA", attempt=1)]
+        if completed:
+            recs += [stop_hook_line(T0 + 31, "shA", "eA1"),
+                     uline(T0 + 100, "next ask", "u2", "shA"),
+                     aline(T0 + 130, "done", "a2", "u2")]
+        return recs
+
+    def _five_way(self, records):
+        """chain_membership's dict beside the same five sets derived from a FRESH FileAdapter with
+        no help from the exported predicate (PredicateParityGolden's oracle, all five sets)."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / (SID + ".jsonl")
+            path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+            mem = em.chain_membership(str(path))
+            ad = em.FileAdapter([str(path)], path)
+        active = ad.active_path()
+        fresh = {"kept": ad.kept_uuids(active), "rewind": set(), "clear": set(), "broken": set(),
+                 "eclipsed": set()}
+        for u, v in ad.chain_verdicts(active).items():
+            if v != "active":
+                fresh[v].add(u)
+        return mem, fresh
+
+    def test_sibling_fork_five_way_verdicts_are_pinned_and_match_a_fresh_adapter(self):
+        mem, fresh = self._five_way(self._sibling_fork())
+        self.assertEqual(mem, fresh)
+        self.assertEqual(mem, {
+            "kept": {"u1", "remA", "eA1", "shA", "u2", "a2", "tuA1", "trA1", "rpA"},
+            "eclipsed": {"tuA1", "trA1", "rpA"},
+            "rewind": {"stubA", "stubB", "ux", "ax"},
+            "clear": set(), "broken": set()})
+
+    def test_sibling_fork_with_no_qualifying_branch_demotes_only_the_user_headed_one(self):
+        mem, fresh = self._five_way(self._sibling_fork(reply=False))
+        self.assertEqual(mem, fresh)
+        self.assertEqual(mem, {
+            "kept": {"u1", "remA", "eA1", "shA", "u2", "a2", "stubA", "stubB"},
+            "eclipsed": {"stubA", "stubB"},
+            "rewind": {"ux", "ax"},
+            "clear": set(), "broken": set()})
+
+    def test_sibling_fork_at_a_tail_spur_still_picks_the_reply(self):
+        # the terminal decides only when NO branch qualifies; with the reply present the
+        # selection is the same at an exhausted spur as behind a completed flush
+        mem, fresh = self._five_way(self._sibling_fork(completed=False))
+        self.assertEqual(mem, fresh)
+        self.assertEqual(mem, {
+            "kept": {"u1", "remA", "eA1", "tuA1", "trA1", "rpA"},
+            "eclipsed": {"tuA1", "trA1", "rpA"},
+            "rewind": {"stubA", "stubB", "ux", "ax"},
+            "clear": set(), "broken": set()})
+
+    def test_sibling_fork_at_a_tail_spur_with_no_qualifying_branch_keeps_every_sibling(self):
+        mem, fresh = self._five_way(self._sibling_fork(reply=False, completed=False))
+        self.assertEqual(mem, fresh)
+        self.assertEqual(mem, {
+            "kept": {"u1", "remA", "eA1", "stubA", "stubB", "ux", "ax"},
+            "eclipsed": {"stubA", "stubB", "ux", "ax"},
+            "rewind": set(), "clear": set(), "broken": set()})
+
 
 class SlashCommandTurn(unittest.TestCase):
     def test_command_turn_is_tracked_and_flagged(self):

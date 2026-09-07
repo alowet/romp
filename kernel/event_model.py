@@ -1401,21 +1401,23 @@ class FileAdapter:
         and a late-written burst veto it). A branch qualifies when its fork-side HEAD is an
         assistant record (a user gesture's head is always the user's own record) and it
         carries reply text anywhere in the sub-tree; the winner is the branch with the
-        latest-written reply text, tiebroken by head seq. The text witness is landed_text_uuids
-        MINUS isApiErrorMessage records (error-as-text failure echoes, which atoms() likewise
-        refuses to treat as replies) — so junk carries no weight in the key, and no textless
-        tail can move the pick whatever its file position. The unit is deliberately the WHOLE
-        branch, never a leaf-chain within it: leaf-chains of one branch share records, and
-        every per-chain read of shared state proved breakable (a full-chain gate laundered a
-        junk tail's steal; a unique-suffix gate let a branch's own twin sub-branches strip
-        their turn's text and hand the keep to an older sibling — reply loss, this repo's one
-        fatal error). The accepted cost is cosmetic: a stub twin inside the winning branch
-        renders one output-less duplicate tool row, and a grafted burst inside it costs
-        nothing (system records never become atoms). The qualifying properties are the ones
-        every incident's salvaged branch has in the author's corpus scan (49/49 across 4,678
-        transcripts; the 2,809 non-eclipse rewind forks: 2,035 stub pairs, 700 superseded
-        retries, 42 user-gesture rollbacks, 32 other; zero overlap). Sibling branches demote
-        to "rewind", exactly as their on-spine twins classify.
+        latest-written reply text, tiebroken by head seq. The text witness is the eclipse
+        set's text-bearing assistant records (landed_text_uuids' own test, applied to the
+        eclipse set alone — the ranking reads it for sub-tree members only, and the sub-trees
+        lie inside that set) MINUS isApiErrorMessage records (error-as-text failure echoes,
+        which atoms() likewise refuses to treat as replies) — so junk carries no weight in the
+        key, and no textless tail can move the pick whatever its file position. The unit is
+        deliberately the WHOLE branch, never a leaf-chain within it: leaf-chains of one branch
+        share records, and every per-chain read of shared state proved breakable (a full-chain
+        gate laundered a junk tail's steal; a unique-suffix gate let a branch's own twin
+        sub-branches strip their turn's text and hand the keep to an older sibling — reply
+        loss, this repo's one fatal error). The accepted cost is cosmetic: a stub twin inside
+        the winning branch renders one output-less duplicate tool row, and a grafted burst
+        inside it costs nothing (system records never become atoms). The qualifying properties
+        are the ones every incident's salvaged branch has in the author's corpus scan (49/49
+        across 4,678 transcripts; the 2,809 non-eclipse rewind forks: 2,035 stub pairs, 700
+        superseded retries, 42 user-gesture rollbacks, 32 other; zero overlap). Sibling
+        branches demote to "rewind", exactly as their on-spine twins classify.
 
         When NO chain qualifies, the two eclipse terminals part ways, each on its own event:
           "user"      — the flush COMPLETED (the next prompt sits past the spur), so a machine-
@@ -1437,19 +1439,28 @@ class FileAdapter:
         ecl = {u for u, v in verdict.items() if v == "eclipsed"}
         if not ecl:
             return
-        children = {}
-        for u in self.by_uuid:
-            p = self.parent_of.get(u)
-            if p is not None:
-                children.setdefault(p, []).append(u)
+        # Everything below reads only uuids INSIDE the eclipse set, so build only that much: the
+        # child map over ecl (the component walk skips any popped uuid outside ecl, and a sub-tree
+        # walk skips anything outside its component, so children outside ecl were never followed)
+        # and the text witness over ecl (the ranking tests it for sub-tree members only). A
+        # whole-graph child map and landed_text_uuids() over every record made this walk a third
+        # of chain_membership's cost on a large transcript with a handful of eclipsed records; the
+        # verdicts are identical. Nothing here is cached on the adapter: _run_graph_passes mutates
+        # parent_of after ingest, so a per-adapter child map would go stale under the repair passes.
+        children = {}                     # parent -> its children in ecl
         forks = {}                        # fork uuid -> its eclipsed branch heads
         for u in ecl:
             p = self.parent_of.get(u)
+            if p is None:
+                continue
+            children.setdefault(p, []).append(u)
             if p in active:
                 forks.setdefault(p, []).append(u)
-        landed = None                     # text-bearing assistant uuids (the reply witness) — computed
-        #                                   lazily: chain_verdicts runs on every build of a held
-        #                                   session, and most transcripts carry no eclipse at all
+        landed = set()                    # text-bearing assistant uuids in ecl (the reply witness)
+        for u in ecl:
+            r = self.by_uuid.get(u) or {}
+            if r.get("type") == "assistant" and _text_of(_content(r.get("message"))).strip():
+                landed.add(u)
         for F, heads in forks.items():
             comp, stack = set(), list(heads)
             while stack:                  # the branch component: child-closure of the eclipsed heads
@@ -1458,8 +1469,6 @@ class FileAdapter:
                     continue
                 comp.add(x)
                 stack.extend(children.get(x, ()))
-            if landed is None:
-                landed = self.landed_text_uuids()
             # SELECTION IS PER BRANCH — the sub-tree under each fork-side head — never per
             # leaf-chain. Leaf-chains of one branch SHARE records, and any per-chain read of
             # shared state proved breakable by construction: a full-chain gate let a junk tail
