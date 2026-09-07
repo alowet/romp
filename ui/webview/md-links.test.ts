@@ -119,7 +119,7 @@ test("joinDocPath: absolute and ~-anchored refs, and refs with a scheme, are not
 });
 
 test("joinDocPath: the link is a URL by convention but the kernel wants a path — fragment off, percent-decoded", () => {
-  assert.equal(joinDocPath(LOCAL, "other.md#install"), "/srv/notes-api/docs/other.md", "no in-document anchors to land on");
+  assert.equal(joinDocPath(LOCAL, "other.md#install"), "/srv/notes-api/docs/other.md", "the path is what the kernel wants; the fragment rides separately");
   assert.equal(joinDocPath(LOCAL, "my%20notes.md"), "/srv/notes-api/docs/my notes.md");
   assert.equal(joinDocPath(LOCAL, "%ZZ.md"), "/srv/notes-api/docs/%ZZ.md", "a stray % keeps the bytes as written, never throws");
   assert.equal(joinDocPath(LOCAL, "#install"), "#install", "a bare fragment has no path to join (callers skip it anyway)");

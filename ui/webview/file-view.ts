@@ -318,7 +318,7 @@ export function closeFileView(): void {
 }
 
 /** Show `path` in a modal over this pane. Re-opening replaces whatever is up — never stacks. */
-export function openFileView(path: string, sid?: string | null): void {
+export function openFileView(path: string, sid?: string | null, frag?: string | null): void {
   // The replace path bypasses closeFileView, so it needs the same dirty ask: opening file B over an
   // edited-but-unsaved file A must not silently eat A's buffer.
   if (document.getElementById("romp-fileview") && closeGuard && !closeGuard()) return;
@@ -335,6 +335,10 @@ export function openFileView(path: string, sid?: string | null): void {
   wrap.id = "romp-fileview";
   wrap.onclick = (ev) => { if (ev.target === wrap) closeFileView(); };
   const box = el("div", "fileview");
+  // A sibling link's `#fragment` (`[see](report.md#results)`, stamped data-frag by mdBlock) lands on
+  // its heading after the FIRST rendered paint — once; a Raw view has no ids to land on, so the
+  // landing waits for the Rendered toggle rather than being spent (review find on #958, 2026-09-07).
+  let pendingFrag: string | null = frag || null;
   document.body.classList.add("fileview-open");
 
   const bar = el("div", "fileview-bar");
@@ -541,7 +545,7 @@ export function openFileView(path: string, sid?: string | null): void {
     "fv-open": (a, ev) => {
       ev.preventDefault();
       const target = a.dataset.path;
-      if (target) openFileView(target, sid);
+      if (target) openFileView(target, sid, a.dataset.frag || null);
     },
     // an in-document `[top](#evidence)` lands on its heading (mdBlock minted the ids) — never a tab
     "fv-anchor": (a, ev) => { ev.preventDefault(); scrollToFragment(body, a.getAttribute("href") || ""); },
@@ -613,7 +617,11 @@ export function openFileView(path: string, sid?: string | null): void {
       return;
     }
     if (text === null || editing) return;   // loading, or the textarea owns the body right now
-    body.replaceChildren(rendered ? mdBlock(text, { kind: "file", path, sid: sid || null }) : codeBlock(text, path, true));   // long lines always soft-wrap (the user 2026-08-24)
+    body.replaceChildren(rendered ? mdBlock(text, { kind: "file", path, sid: sid || null }) : codeBlock(text, path, true));
+    if (rendered && pendingFrag) {
+      const h = pendingFrag; pendingFrag = null;
+      requestAnimationFrame(() => { if (wrap.isConnected) scrollToFragment(body, h); });
+    }   // long lines always soft-wrap (the user 2026-08-24)
   };
 
   // Selection → labeled quote chip (the user 2026-08-23): mouseup is the gesture's settle point.
@@ -962,6 +970,19 @@ export function openUrlView(href: string): void {
   wrap.appendChild(box);
   document.body.appendChild(wrap);
 
+  // The URL's own #fragment (`evidence.md#results`) lands after the FIRST RENDERED paint — once. A
+  // Raw view has no heading ids, so a saved Raw preference does not SPEND the landing: it waits for
+  // the Rendered toggle (review find on #958, 2026-09-07: landed was set before the mode check).
+  let landed = false;
+  const landFragment = () => {
+    if (landed) return;
+    let hash = "";
+    try { hash = new URL(href).hash; } catch { /* not a URL — nothing to land on */ }
+    if (!hash) { landed = true; return; }
+    if (fmt.md !== "rendered") return;                 // nothing to land on yet; the next rendered paint tries again
+    landed = true;
+    requestAnimationFrame(() => { if (wrap.isConnected) scrollToFragment(body, hash); });
+  };
   const renderBody = () => {
     for (const [mode, b] of segBtns) {
       const on = fmt.md === mode;
@@ -972,6 +993,7 @@ export function openUrlView(href: string): void {
     body.replaceChildren(fmt.md === "rendered"
       ? mdBlock(text, { kind: "url", href: loc })      // relative refs resolve against where it LIVES
       : codeBlock(text, parts.base, true));            // basename → langFor → markdown highlighting
+    landFragment();                                    // after the paint, and only a rendered one lands
   };
   renderBody();
 
@@ -1004,21 +1026,15 @@ export function openUrlView(href: string): void {
     parts = urlTitleParts(loc);
     dir.textContent = parts.dir; base.textContent = parts.base; name.title = loc;
   };
-  // The URL's own #fragment (`evidence.md#results`) lands after the FIRST rendered paint — once, and
-  // only when there is a rendered body with heading ids to land on.
-  let landed = false;
-  const landFragment = () => {
-    if (landed) return;
-    landed = true;
-    let hash = "";
-    try { hash = new URL(href).hash; } catch { /* not a URL — nothing to land on */ }
-    if (hash && fmt.md === "rendered") requestAnimationFrame(() => { if (wrap.isConnected) scrollToFragment(body, hash); });
-  };
-
   // Same-origin, cookie-authed, cache: no-store like every viewer fetch, on this open's abort signal.
-  // No Content-Type sniffing: the URL was intercepted because its PATH is markdown, so the body is
-  // read as text and rendered as markdown, whatever the server labelled it.
-  fetch(href, { cache: "no-store", signal: ctrl.signal }).then(async (r) => {
+  // mode: "same-origin" holds the rule through REDIRECTS too: the clicked URL passed isMarkdownUrl, but
+  // a same-origin alias that 302s to a foreign host answering with a permissive CORS header would
+  // otherwise be fetched and rendered with that host as the base for every relative figure (review
+  // find on #958, 2026-09-07); the browser now rejects such a redirect and the .catch below says so.
+  // No Content-Type sniffing beyond one refusal: the URL was intercepted because its PATH is markdown,
+  // so the body is read as text and rendered as markdown whatever the server labelled it — except a
+  // 200 labelled text/html, which is a web page standing in for the document (settleUrlResponse).
+  fetch(href, { cache: "no-store", mode: "same-origin", signal: ctrl.signal }).then(async (r) => {
     // EVERY exit that stops short of consuming the body aborts this open's controller — once the
     // response has resolved that is what tears the transfer down (the review: a refused response's
     // bytes kept arriving for a modal already closed, because .finally had let go of the controller
@@ -1027,6 +1043,7 @@ export function openUrlView(href: string): void {
     relocate(r);
     const v = settleUrlResponse(r, URL_TEXT_MAX_BYTES, () => ctrl.abort());
     if (v.kind === "http") { fail("HTTP " + v.status + " from " + hostWord(loc)); return; }
+    if (v.kind === "not-document") { fail("the server answered with a web page, not a document (" + v.type + ")"); return; }
     if (v.kind === "declared-too-large") { fail(overCapWords(v.bytes, URL_TEXT_MAX_BYTES)); return; }
     if (v.kind === "no-body") { fail("this document could not be loaded from this page — the response carried no body"); return; }
     // Streamed under the cap: bytes counted as they arrive, the source cancelled the moment they pass
@@ -1036,8 +1053,7 @@ export function openUrlView(href: string): void {
     if (!wrap.isConnected) { ctrl.abort(); return; }
     if ("tooLarge" in got) { ctrl.abort(); fail(overCapWords(null, URL_TEXT_MAX_BYTES)); return; }
     text = got.text;
-    renderBody();
-    landFragment();
+    renderBody();                                      // paints, and lands the fragment if this paint is rendered
   }).catch((err) => {
     // Only the TEARDOWN's abort is silent (the modal is gone, or a refusal already painted its words);
     // an independently errored stream that merely wears the AbortError name still paints its failure.
@@ -1155,7 +1171,12 @@ function mdBlock(text: string, doc?: MdDocLoc): HTMLElement {
     const dirty = marked.parse(text) as string;
     // html + svg, in lockstep with the chat's md(): KaTeX draws stretchy glyphs (\sqrt radicals,
     // wide accents) as inline <svg> even in html output, and the html-only profile ate them.
-    box.innerHTML = DOMPurify.sanitize(dirty, { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"] });
+    // ALLOW_DATA_ATTR: false — a document's raw HTML must not carry data-* into the page: the viewer's
+    // body delegate lets an act it does not own bubble to render.ts's document-level delegate, so a
+    // `<span data-act="stopRetrying">` in a published report would interrupt the active session on a
+    // click (review find on #958, 2026-09-07). The viewer's own fv-open / fv-anchor stamps are set
+    // AFTER this sanitize, so they are unaffected.
+    box.innerHTML = DOMPurify.sanitize(dirty, { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"], ALLOW_DATA_ATTR: false });
   } catch {
     box.textContent = text;                            // a marked bug must never cost the content
   }
@@ -1199,6 +1220,8 @@ function mdBlock(text: string, doc?: MdDocLoc): HTMLElement {
         const joined = joinDocPath(doc.path, href);
         a.dataset.act = "fv-open";
         a.dataset.path = joined;
+        const hash = href.indexOf("#") >= 0 ? href.slice(href.indexOf("#")) : "";
+        if (hash.length > 1) a.dataset.frag = hash;          // `report.md#results`: the heading to land on, once open
         a.title = joined;
       }
     });

@@ -747,7 +747,10 @@ function el(tag: string, cls?: string): HTMLElement {
 // and the html-only profile silently ate them: $\sqrt{d}$ rendered as a bare serif "d", the radical gone.
 // DOMPurify's svg profile is still sanitized (no scripts, handlers, or foreignObject). Keep data: URIs on
 // <img> (the CSP allows them and inline transcript images rely on them).
-const MD_PURIFY: Config = { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"] };
+// ALLOW_DATA_ATTR: false (2026-09-07): transcript HTML must not mint data-* attributes — the chat's
+// document-level delegate keys every action off data-act, so a `<span data-act="stopRetrying">` in a
+// message would post an interrupt on a click. Nothing the renderer needs rides data-* through md().
+const MD_PURIFY: Config = { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"], ALLOW_DATA_ATTR: false };
 
 function md(src: string): string {
   // Transcript text (user prompts, assistant output, subagent reports, postal

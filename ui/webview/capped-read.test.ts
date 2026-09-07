@@ -184,3 +184,32 @@ test("settleUrlResponse: the order is status, then declared length, then body �
   assert.deepEqual(settleUrlResponse(r, CAP, s.stop), { kind: "http", status: 500 });
   assert.equal(s.calls.n, 1, "stopped once, not once per reason");
 });
+
+// ── a 200 that is a WEB PAGE, not the document (review find on #958, 2026-09-07) ──
+// A proxy's SPA fallback or an auth page answers a missing/gated .md with 200 text/html; rendering that
+// as the document showed a scrambled page under the document's name with no error.
+
+test("settleUrlResponse: a 200 labelled text/html → not-document with the bare type, transfer stopped", () => {
+  const { stream, state } = source([enc.encode("<!doctype html><html>app shell</html>")]);
+  const r = resp({ headers: { "Content-Type": "text/html; charset=utf-8" }, body: stream });
+  const s = stopper(r.body);
+  assert.deepEqual(settleUrlResponse(r, CAP, s.stop), { kind: "not-document", type: "text/html" });
+  assert.equal(s.calls.n, 1, "stop fired exactly once");
+  assert.equal(s.ac.signal.aborted, true);
+  return new Promise<void>((done) => setTimeout(() => { assert.equal(state.cancelled, true, "the page's bytes are not downloaded"); done(); }, 5));
+});
+
+test("settleUrlResponse: only text/html is refused — markdown, plain text, octet-stream and an ABSENT type all read", () => {
+  for (const type of ["text/markdown", "text/plain; charset=utf-8", "application/octet-stream", "text/x-markdown", null]) {
+    const r = resp({ headers: type === null ? {} : { "Content-Type": type }, body: source([enc.encode("# doc")]).stream });
+    const s = stopper(r.body);
+    assert.deepEqual(settleUrlResponse(r, CAP, s.stop), { kind: "read" }, String(type));
+    assert.equal(s.calls.n, 0, "read never stops the transfer: " + String(type));
+  }
+});
+
+test("settleUrlResponse: a non-OK text/html answer is still the http verdict (the status is the news)", () => {
+  const r = resp({ ok: false, status: 404, headers: { "Content-Type": "text/html" }, body: source([enc.encode("<h1>404</h1>")]).stream });
+  const s = stopper(r.body);
+  assert.deepEqual(settleUrlResponse(r, CAP, s.stop), { kind: "http", status: 404 });
+});

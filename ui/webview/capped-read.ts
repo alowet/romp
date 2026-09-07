@@ -68,15 +68,22 @@ export type ResponseLike = {
 export type UrlVerdict =
   | { kind: "read" }
   | { kind: "http"; status: number }
+  | { kind: "not-document"; type: string }
   | { kind: "declared-too-large"; bytes: number }
   | { kind: "no-body" };
 
-/** http (a non-OK status) → declared-too-large (a Content-Length past `cap`; absent or unparseable is
- *  not a refusal — the streamed read decides) → no-body (nothing to read) → read. `stop` fires on the
- *  first three, never on read. */
+/** http (a non-OK status) → not-document (a 200 labelled text/html: a proxy's SPA fallback or an
+ *  auth page standing in for a missing .md — rendering that as the document would show a scrambled
+ *  page under the document's name with no error, against the fail-loudly rule; review find on #958,
+ *  2026-09-07. Only text/html is refused: text/markdown, text/plain, application/octet-stream and an
+ *  ABSENT header all read, so a static server with an odd MIME map still works) → declared-too-large
+ *  (a Content-Length past `cap`; absent or unparseable is not a refusal — the streamed read decides)
+ *  → no-body (nothing to read) → read. `stop` fires on every verdict but read. */
 export function settleUrlResponse(r: ResponseLike, cap: number, stop: () => void): UrlVerdict {
   let v: UrlVerdict;
+  const type = (r.headers.get("Content-Type") || "").trim().toLowerCase();
   if (!r.ok) v = { kind: "http", status: r.status };
+  else if (type.startsWith("text/html")) v = { kind: "not-document", type: type.split(";")[0] };
   else {
     const declared = Number(r.headers.get("Content-Length") || "");
     if (declared > cap) v = { kind: "declared-too-large", bytes: declared };

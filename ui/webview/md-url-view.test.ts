@@ -82,7 +82,8 @@ test("openUrlView exists, fetches the given href from the browser (never fileUrl
   assert.ok(VIEW.indexOf("export function openUrlView") > VIEW.indexOf("function offersDownload"),
     "sits after offersDownload — outside the slice file-view.test.ts takes as openFileView's body");
   assert.doesNotMatch(OPEN_FN, /openUrlView|kind: "url"/, "the local viewer's body is untouched by URL mode");
-  assert.match(URL_FN, /fetch\(href, \{ cache: "no-store", signal: ctrl\.signal \}\)/);
+  assert.match(URL_FN, /fetch\(href, \{ cache: "no-store", mode: "same-origin", signal: ctrl\.signal \}\)/,
+    "same-origin MODE, so a redirect off the origin is refused rather than followed and rendered");
   assert.doesNotMatch(URL_FN, /fileUrl\(|kernelUrl\(|\/file\?|\/remote\//, "the URL is fetched as given — no kernel route, no relay");
   assert.doesNotMatch(URL_FN, /\bpost\(/, "nothing is asked of the kernel over the socket either");
   // …and the kernel gained no route for it
@@ -290,12 +291,14 @@ test("local file mode: a relative image is the sibling over the kernel's /file r
 
 test("local file mode: a relative link opens the sibling in the viewer via ONE delegated data-act listener on the body", () => {
   // the anchor carries the joined path as data, keeps its href for hover, and is not forced to _blank
-  assert.match(MD_FN, /const joined = joinDocPath\(doc\.path, href\);\s*\n\s*a\.dataset\.act = "fv-open";\s*\n\s*a\.dataset\.path = joined;\s*\n\s*a\.title = joined;/);
+  assert.match(MD_FN, /const joined = joinDocPath\(doc\.path, href\);\s*\n\s*a\.dataset\.act = "fv-open";\s*\n\s*a\.dataset\.path = joined;\s*\n\s*const hash = href\.indexOf\("#"\) >= 0 \? href\.slice\(href\.indexOf\("#"\)\) : "";\s*\n\s*if \(hash\.length > 1\) a\.dataset\.frag = hash;[^\n]*\n\s*a\.title = joined;/,
+    "the joined path rides data-path and the link's own #fragment rides data-frag (review fold 2026-09-07)");
   assert.match(MD_FN, /if \(a\.dataset\.act === "fv-open"\) return;/);
   // …the delegate: actions.ts's delegate, installed once per open on the body (stable across the
   // Rendered ⇄ Raw swaps that rebuild its children), preventDefault, then openFileView with this sid
   assert.match(VIEW, /import \{ delegate \} from "\.\/actions";/);
-  assert.match(OPEN_FN, /delegate\(body, \{\s*\n\s*"fv-open": \(a, ev\) => \{\s*\n\s*ev\.preventDefault\(\);\s*\n\s*const target = a\.dataset\.path;\s*\n\s*if \(target\) openFileView\(target, sid\);/);
+  assert.match(OPEN_FN, /delegate\(body, \{\s*\n\s*"fv-open": \(a, ev\) => \{\s*\n\s*ev\.preventDefault\(\);\s*\n\s*const target = a\.dataset\.path;\s*\n\s*if \(target\) openFileView\(target, sid, a\.dataset\.frag \|\| null\);/,
+    "the sibling opens in this viewer, for this sid, landing on its fragment");
   assert.equal((OPEN_FN.match(/delegate\(body/g) || []).length, 1, "one listener per open, never in a render path");
   assert.ok(OPEN_FN.indexOf("delegate(body") < OPEN_FN.indexOf("const renderBody ="), "installed before any render can run");
   // the chat's document-level delegate ignores scheme-less hrefs, so the click reaches the body listener
@@ -342,10 +345,13 @@ test("both viewers handle fv-anchor in their body delegate: preventDefault, then
 });
 
 test("the opened URL's own #fragment lands after the FIRST rendered paint — once, and only with a rendered body", () => {
-  assert.match(URL_FN, /let landed = false;\s*\n\s*const landFragment = \(\) => \{\s*\n\s*if \(landed\) return;\s*\n\s*landed = true;/);
+  assert.match(URL_FN, /let landed = false;\s*\n\s*const landFragment = \(\) => \{\s*\n\s*if \(landed\) return;\s*\n\s*let hash = "";/,
+    "the landing is one-shot, but only SPENT by a rendered paint (a Raw view waits for the toggle)");
+  assert.match(URL_FN, /if \(!hash\) \{ landed = true; return; \}\s*\n\s*if \(fmt\.md !== "rendered"\) return;[^\n]*\n\s*landed = true;/);
   assert.match(URL_FN, /try \{ hash = new URL\(href\)\.hash; \} catch \{/);
-  assert.match(URL_FN, /if \(hash && fmt\.md === "rendered"\) requestAnimationFrame\(\(\) => \{ if \(wrap\.isConnected\) scrollToFragment\(body, hash\); \}\);/);
-  assert.match(URL_FN, /text = got\.text;\s*\n\s*renderBody\(\);\s*\n\s*landFragment\(\);/, "after the paint, not before it");
+  assert.match(URL_FN, /landed = true;\s*\n\s*requestAnimationFrame\(\(\) => \{ if \(wrap\.isConnected\) scrollToFragment\(body, hash\); \}\);/);
+  assert.match(URL_FN, /codeBlock\(text, parts\.base, true\)\);[^\n]*\n\s*landFragment\(\);/, "after the paint, inside renderBody — so a later Rendered toggle lands too");
+  assert.doesNotMatch(URL_FN, /renderBody\(\);\s*\n\s*landFragment\(\);/, "no second, mode-blind landing after the bytes");
 });
 
 // ── 7. styling: no new rules — the URL viewer wears the viewer's existing chrome in BOTH sheets ──
@@ -368,4 +374,30 @@ test("a landed heading sits a breath below the title bar: scroll-margin-top on h
   assert.match(CHAT_CSS, /\.fileview-bar \{[^}]*padding: 7px 10px;/);
   assert.match(CHAT_CSS, /\.fileview-err-dl \{ display: block; margin-top: 10px; \}/);
   assert.doesNotMatch(RULE, /font-size|--/, "no font size, no token");
+});
+
+// ── review fold on #958 (2026-09-07): a web page is not a document, redirects stay home, data-* never rides ──
+
+test("URL mode: a 200 labelled text/html is refused as a web page, with the way out; the read is same-origin through redirects", () => {
+  assert.match(URL_FN, /if \(v\.kind === "not-document"\) \{ fail\("the server answered with a web page, not a document \(" \+ v\.type \+ "\)"\); return; \}/);
+  assert.match(URL_FN, /mode: "same-origin"/, "a same-origin alias that 302s off the origin is refused, not rendered with the foreign base");
+});
+
+test("rendered markdown never carries data-* attributes into the page, in the viewer and in the chat alike", () => {
+  // a document's or a message's raw HTML with data-act=\"stopRetrying\" would otherwise bubble to the
+  // document-level delegate and interrupt the active session on a click
+  const sanitizes = (MD_FN.match(/DOMPurify\.sanitize\([^)]*\)/g) || []);
+  assert.equal(sanitizes.length, 1);
+  assert.match(sanitizes[0], /ALLOW_DATA_ATTR: false/);
+  const chatMd = (RENDER.split("function md(src: string): string {")[1] || "").split("\nfunction ")[0];
+  assert.match(chatMd, /DOMPurify\.sanitize\(dirty, MD_PURIFY\)/);
+  assert.match(RENDER, /const MD_PURIFY: Config = \{.*ALLOW_DATA_ATTR: false \};/, "the chat's shared sanitizer config forbids data-*");
+  // the viewer's own stamps are set AFTER the sanitize, so they are unaffected
+  assert.ok(MD_FN.indexOf("DOMPurify.sanitize(") < MD_FN.indexOf('a.dataset.act = "fv-open"'));
+});
+
+test("local file mode: a sibling link's #fragment lands after the first RENDERED paint, once", () => {
+  assert.match(VIEW, /export function openFileView\(path: string, sid\?: string \| null, frag\?: string \| null\): void \{/);
+  assert.match(OPEN_FN, /let pendingFrag: string \| null = frag \|\| null;/);
+  assert.match(OPEN_FN, /if \(rendered && pendingFrag\) \{\s*\n\s*const h = pendingFrag; pendingFrag = null;\s*\n\s*requestAnimationFrame\(\(\) => \{ if \(wrap\.isConnected\) scrollToFragment\(body, h\); \}\);/);
 });

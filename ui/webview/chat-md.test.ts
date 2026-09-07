@@ -83,7 +83,7 @@ test("userMd() renders through the breaks:true instance and the SAME DOMPurify p
   assert.match(fn, /DOMPurify\.sanitize\(userMdHtml\(src\), MD_PURIFY\)/);
   const mdFn = RENDER.match(/function md\(src: string\): string \{[\s\S]*?\n\}/)?.[0] || "";
   assert.match(mdFn, /DOMPurify\.sanitize\(dirty, MD_PURIFY\)/, "md() sanitizes with the same shared profile");
-  assert.match(RENDER, /const MD_PURIFY: Config = \{ USE_PROFILES: \{ html: true, svg: true \}, ADD_DATA_URI_TAGS: \["img"\] \};/);
+  assert.match(RENDER, /const MD_PURIFY: Config = \{ USE_PROFILES: \{ html: true, svg: true \}, ADD_DATA_URI_TAGS: \["img"\], ALLOW_DATA_ATTR: false \};/);
 });
 
 test("the user bubble renders the user's OWN words with userMd, harness notes and everything else with md", () => {

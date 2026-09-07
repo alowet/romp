@@ -56,7 +56,7 @@ export function resolveDocRelative(ref: string, base: string): string {
 export function joinDocPath(docPath: string, rel: string): string {
   if (typeof rel !== "string" || !rel) return rel;
   if (SCHEME_RE.test(rel)) return rel;
-  let r = rel.replace(/#.*$/, "");                           // the viewer has no in-document anchors to land on
+  let r = rel.replace(/#.*$/, "");                           // the kernel wants a path; the fragment rides separately (data-frag)
   try { r = decodeURIComponent(r); } catch { /* a stray % — keep the bytes as written */ }
   if (!r) return rel;
   if (r.startsWith("/") || r.startsWith("~")) return r;
