@@ -5,9 +5,14 @@ queued nor landed, and the echo must own it (the user 2026-07-20: a reply sat in
 and one message was silently LOST across a kernel restart with no trace anywhere). Four durability
 guarantees, each pinned here:
   1. the live-tail overflow cap never evicts an echo (work atoms are disposable; echoes aren't),
-  2. the genuine-human-turn floor retires only PATH-BEARING echoes (the image-extraction case whose
-     text-match structurally fails) — a plain-text echo prunes only by its own text landing, and a
-     dropped send's echo PERSISTS so the loss shows (the tmux echo's semantics),
+  2. NO floor retires an SDK echo (2026-09-06): an echo prunes only by its own text landing, and a
+     dropped send's echo PERSISTS so the loss shows (the tmux echo's semantics). The genuine-human-turn
+     floor once retired path-bearing echoes for the image-extraction case — the CLI's composer paste
+     hook rewrites a pasted image path to "[Image #N]", so the text can never match — but that hook
+     runs only in the terminal composer; an SDK session's input is stream-json and the CLI takes the
+     text as typed, so on this backend the rule had only false positives (a `.png` echo retired with
+     its message still in the CLI's queue). `_path_bearing` stays, narrowed to the hook's set, for the
+     tmux settle that borrows it,
   3. unlanded echoes mirror to the registry (reg['echoes']) and reseed on backend construction, so a
      kernel restart cannot wipe the only evidence of an in-flight send,
   4. an echo that survives its holder is MARKED dropped at the event that orphaned it (boot reseed /
@@ -63,7 +68,17 @@ class OverflowCapSparesEchoes(unittest.TestCase):
         self.assertLessEqual(len(d), sb.LIVE_TAIL_CAP)
 
 
-class FloorOnlyRetiresPathBearingEchoes(unittest.TestCase):
+class NoFloorRetiresAnEcho(unittest.TestCase):
+    """Guarantee 2. The genuine-human-turn floor once retired path-bearing echoes — the image-extraction
+    case, where the CLI's composer paste hook rewrites a pasted image path to "[Image #N]" and the echo's
+    text can never match. That hook runs only in the terminal composer: an SDK session's input is
+    stream-json, and the CLI takes the text as typed (a count over one installation's SDK transcripts,
+    2026-09-06: 0 image blocks in 8,569 user records across 71 sessions; every image-path text landed
+    verbatim). So on this backend the rule had only false positives — a `.png` echo retired while its
+    message sat in the CLI's queue — and no echo is floored any more: an echo retires by its own text
+    landing or by the dropped marking. `_path_bearing` stays, narrowed to the hook's set, for the tmux
+    settle that borrows it (kernel._tmux_echo_settle): there a send IS a paste into the composer."""
+
     def _backend(self):
         return sb.SdkBackend(tempfile.mkdtemp(), "/bin/true", lambda *a, **k: None)
 
@@ -75,14 +90,13 @@ class FloorOnlyRetiresPathBearingEchoes(unittest.TestCase):
         self.assertIn(k, be._live.get(SID, {}),
                       "a plain echo must not be floored away — its message may still be inside the CLI")
 
-    def test_path_bearing_echo_retires_on_the_floor(self):
-        # the image-extraction case: the landed record's text can never match, so the floor is the
-        # only retire — exactly the 2026-06-25 screenshots-piling-up semantics, now scoped to it
+    def test_an_image_path_echo_survives_a_later_human_turn_too(self):
+        # pre-change: retired here as the image-extraction case, with the message still inside the CLI
         be = self._backend()
         k, e = _echo("look at ~/Screenshots/shot.png please")
         be._live[SID] = dict([(k, e)])
         be.prune_live(SID, tx_uuids=set(), tx_user_texts=set(), human_floor=e["t"] + 100)
-        self.assertNotIn(SID, be._live, "path-bearing echo floors away once a human turn postdates it")
+        self.assertIn(k, be._live.get(SID, {}), "no SDK echo is floored: the CLI takes the path as typed")
 
     def test_text_landing_still_prunes_any_echo(self):
         be = self._backend()
@@ -91,11 +105,136 @@ class FloorOnlyRetiresPathBearingEchoes(unittest.TestCase):
         be.prune_live(SID, tx_uuids=set(), tx_user_texts={"please refactor the parser"}, human_floor=0)
         self.assertNotIn(SID, be._live)
 
+    def test_an_image_path_echo_retires_when_its_text_lands(self):
+        # the record carries the path verbatim (no rewrite on this route), so the by-text prune is the retire
+        be = self._backend()
+        text = "look at ~/Screenshots/shot.png please"
+        k, e = _echo(text)
+        be._live[SID] = dict([(k, e)])
+        be.prune_live(SID, tx_uuids=set(), tx_user_texts={text: e["t"] + 5}, human_floor=0)
+        self.assertNotIn(SID, be._live)
+
     def test_path_bearing_predicate(self):
+        # the tmux settle's predicate: exactly the CLI paste hook's set, `/\.(png|jpe?g|gif|webp)$/i`
+        # (absolute or ~-rooted paths; tests/test_kernel_fed_echo_absorbed.py pins the set itself)
         self.assertTrue(sb._path_bearing("see /tmp/x.png"))
-        self.assertTrue(sb._path_bearing("~/notes/todo.md is stale"))
+        self.assertTrue(sb._path_bearing("look at ~/Screenshots/shot-2.PNG please"))
+        self.assertTrue(sb._path_bearing("(/tmp/notes-api/docs/fig.jpeg)"))
+        self.assertTrue(sb._path_bearing("and ~/Downloads/anim.GIF, then /srv/pics/x.webp"))
+        self.assertFalse(sb._path_bearing("compare with /tmp/notes-api/docs/diagram.svg"),
+                         "svg is not in the hook's set — the CLI never rewrites it")
+        self.assertFalse(sb._path_bearing("see /tmp/old.bmp"), "nor bmp")
+        self.assertFalse(sb._path_bearing("~/notes/todo.md is stale"),
+                         "a non-image path is never rewritten out of the record — not extraction")
         self.assertFalse(sb._path_bearing("just a plain reply, and/or nothing else"))
         self.assertFalse(sb._path_bearing(""))
+
+    def test_a_quote_chip_source_label_is_not_path_bearing(self):
+        # the 2026-09-06 incident: a staged comment's quote chip leads with where the passage came from
+        # (`path:line`), which the old any-path predicate called path-bearing — so the floor retired the
+        # echo of a message the CLI still held. The text has no image in it; it must prune by text only.
+        body = ("Replying to this highlighted code (/tmp/notes-api/notes/api.py:42):\n"
+                "> def list_notes():\n\nrename this to fetch_notes")
+        self.assertFalse(sb._path_bearing(body), "the tmux settle must not retire this as an extraction")
+        be = self._backend()
+        k, e = _echo(body, t=39)
+        be._live[SID] = dict([(k, e)])
+        be.prune_live(SID, tx_uuids=set(), tx_user_texts={"an earlier comment": 39}, human_floor=39)
+        self.assertIn(k, be._live.get(SID, {}), "a quote-chip echo survives its sibling's landing")
+        be.prune_live(SID, tx_uuids=set(), tx_user_texts={body: 69}, human_floor=69)
+        self.assertNotIn(SID, be._live, "…and retires when its own text lands")
+
+
+class FedEchoesOutliveTheFloor(unittest.TestCase):
+    """An echo whose text the session has fed to the CLI (SdkSession._inflight_texts, the fed-turn twin
+    of `inflight`) is in flight by construction — the CLI queues a mid-turn send behind the running turn
+    and splices it at the next tool boundary — so no floor may retire it. It retires on its text landing
+    (the absorbed atom's queued_command text) or on the CLI dying with it (the dropped marking). A
+    fed-texts guard once shielded exactly these echoes from the floor; the floor itself is gone now
+    (NoFloorRetiresAnEcho), so fed or unfed, dropped or live, an echo is never floored — these pin that
+    the fed lifecycle and the CLI-death marking still behave. SYNTHETIC fixtures only; the session is
+    registered without a thread."""
+
+    IMG = "compare against /tmp/notes-api/docs/before.png please"
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.state, "sdk"))
+        os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(self.state, "claude")
+        self.cwd = os.path.join(self.state, "proj")
+        os.makedirs(self.cwd, exist_ok=True)
+        tp = sb.transcript_path(self.cwd, SID)
+        os.makedirs(os.path.dirname(tp), exist_ok=True)
+        open(tp, "w").close()
+        self.be = sb.SdkBackend(self.state, "/bin/true", lambda *a, **k: None)
+        reg = {"sid": SID, "name": "web", "mode": "acceptEdits", "alive": True, "cwd": self.cwd, "lastSid": SID}
+        sb.write_reg(self.be.state_dir, SID, reg)
+        self.s = sb.SdkSession(self.be, dict(reg))
+        self.be.sessions[SID] = self.s
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+
+    def _fed_echo(self, text, t=38):
+        self.s.inflight = 1
+        self.s._inflight_texts.append(text)
+        k, e = _echo(text, t=t)
+        self.be._live[SID] = dict([(k, e)])
+        return k, e
+
+    def test_a_fed_image_echo_survives_the_floor(self):
+        # a human record at t=39 (the sibling's landing) postdates the fed echo at t=38; the old rule
+        # retired an image-bearing echo here — the CLI still has the message
+        k, e = self._fed_echo(self.IMG, t=38)
+        self.assertEqual(self.s.fed_texts(), [self.IMG])
+        self.be.prune_live(SID, tx_uuids=set(), tx_user_texts={"the first comment": 39}, human_floor=39)
+        self.assertIn(k, self.be._live.get(SID, {}), "a fed echo outranks the floor")
+
+    def test_it_still_retires_when_its_text_lands(self):
+        # the queued_command attachment lands the text (the kernel's _atom_user_texts covers that shape)
+        k, e = self._fed_echo(self.IMG, t=38)
+        self.be.prune_live(SID, tx_uuids=set(), tx_user_texts={self.IMG: 69}, human_floor=69)
+        self.assertNotIn(SID, self.be._live, "landing retires a fed echo as before")
+
+    def test_the_unfed_image_echo_survives_too(self):
+        # nothing fed, nothing landed: an image-path echo used to floor away here; with no floor at all
+        # it stays, like any echo of a message the transcript has not caught up on
+        k, e = _echo(self.IMG, t=38)
+        self.be._live[SID] = dict([(k, e)])
+        self.assertEqual(self.s.fed_texts(), [])
+        self.be.prune_live(SID, tx_uuids=set(), tx_user_texts=set(), human_floor=39)
+        self.assertIn(k, self.be._live.get(SID, {}))
+
+    def test_the_cli_dying_marks_the_loss_and_the_loss_stays(self):
+        # the reconnect teardown (a resumable conversation): the fed list empties and the echo is flagged
+        # dropped — the loss is visible, and it STAYS visible: a dropped echo retires by its text landing
+        # or by the user's dismissal, never by a later sibling's turn (pre-change, a dropped image echo
+        # floored away here and the loss record vanished)
+        k, e = self._fed_echo(self.IMG, t=38)
+        self.assertEqual(self.s.resume_sid, SID)
+        self.s._reconcile_stranded()
+        self.assertEqual(self.s.fed_texts(), [])
+        self.assertTrue(e.get("dropped"), "the CLI died holding it → never delivered, shown as such")
+        self.assertIn(k, self.be._live.get(SID, {}), "the flag path keeps the echo as the loss record")
+        self.be.prune_live(SID, tx_uuids=set(), tx_user_texts=set(), human_floor=39)
+        self.assertIn(k, self.be._live.get(SID, {}), "the loss record outlives the sibling's turn")
+        self.be.prune_live(SID, tx_uuids=set(), tx_user_texts={self.IMG: 69}, human_floor=69)
+        self.assertNotIn(SID, self.be._live, "…and retires when its own text lands (a resend)")
+
+    def test_a_dropped_echo_is_dismissed_not_floored(self):
+        # the only other retire for a dropped echo is the user's ✕ (dismiss_echo)
+        k, e = self._fed_echo(self.IMG, t=38)
+        e["dropped"] = True
+        self.be.prune_live(SID, tx_uuids=set(), tx_user_texts=set(), human_floor=39)
+        self.assertIn(k, self.be._live.get(SID, {}))
+        self.assertEqual(self.be.dismiss_echo(SID, uuid=k), self.IMG)
+        self.assertNotIn(SID, self.be._live)
+
+    def test_fed_texts_is_a_snapshot(self):
+        self.s._inflight_texts.append("one")
+        snap = self.s.fed_texts()
+        snap.append("two")
+        self.assertEqual(self.s.fed_texts(), ["one"])
 
 
 class EchoesSurviveARestart(unittest.TestCase):

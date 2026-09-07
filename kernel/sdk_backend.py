@@ -2568,6 +2568,15 @@ class SdkSession:
         with self._lock:
             return list(self._pending)
 
+    def fed_texts(self) -> list[str]:
+        """The texts FED to the current client whose ResultMessage has not landed (`_inflight_texts`,
+        oldest first); thread-safe. A mid-turn send lives here from the inputs() pop until the turn
+        settles: the CLI holds it, queued behind the running turn, to splice at the next tool boundary.
+        The observable twin of `inflight`, for diagnostics and tests; nothing gates on it (prune_live
+        floors no echo, so there is nothing to shield a fed echo from — its docstring)."""
+        with self._lock:
+            return list(self._inflight_texts)
+
     def unqueue(self, idx: int, expect: str | None = None) -> str | None:
         """Remove the queued turn at position `idx` (the chat's queued list is this same _pending order)
         and return its raw text, or None if it's gone. Lets the user CANCEL a message they queued
@@ -5099,15 +5108,29 @@ class SdkSession:
 
 LIVE_TAIL_CAP = 100
 
-# A path-looking token (absolute or ~-rooted): the one case where an echo's text-match against the
-# transcript can structurally FAIL — the transcript extracts an attached file's path out of the user
-# text (the user 2026-06-25) — so only these echoes stay eligible for the genuine-human-turn floor
-# retire in prune_live. Everything else prunes by its own text landing, or persists (a visible loss).
-_PATHY_RE = re.compile(r"(?:^|[\s'\"`(])(?:~/|/)[^\s'\"`)]+")
+# An IMAGE path (absolute or ~-rooted) with one of the extensions the CLI's composer paste hook
+# recognises. SOURCE OF TRUTH: the installed Claude Code bundle (2.1.261) carries exactly one image-path
+# test, `/\.(png|jpe?g|gif|webp)$/i`, and its callers are the terminal composer's bracketed-paste
+# handler — which reads a pasted path wearing one of those extensions and rewrites the token in the
+# submitted text to "[Image #N]", so the picture lands as an image block and the path is gone from the
+# record's text (the user 2026-06-25, the screenshots-piling-up bug) — and two attachment uploaders'
+# isImage. No bmp, no svg: the wider set this carried until 2026-09-06 (any absolute or ~-rooted path,
+# then an image set with both) classed a `.svg` path echo, or a quote chip's `path:line` label, as an
+# extraction the CLI never performs.
+# WHO READS IT. The kernel's _tmux_echo_settle borrows _path_bearing for the TMUX route, where a send
+# IS a paste into the composer and the hook runs. The SDK route never reaches it: its input is
+# stream-json and the CLI takes the text as typed (a count over one installation's SDK transcripts,
+# 2026-09-06: 0 image blocks in 8,569 user records across 71 sessions; every image-path text landed
+# verbatim), which is why prune_live below floors NO echo — see its docstring. Twin of the kernel's
+# _IMG_PATH_RE (_injected_img_paths waits on the CLI's rewrite; _user_images reads the extraction back);
+# tests/test_kernel_fed_echo_absorbed.py pins both twins to the CLI's set.
+_IMG_PATH_RE = re.compile(r"(?:^|[\s'\"`(])((?:~/|/)[^\s'\"`()]+\.(?:png|jpe?g|gif|webp))\b", re.I)
 
 
 def _path_bearing(text: str) -> bool:
-    return bool(_PATHY_RE.search(text or ""))
+    """True when `text` carries an image path the CLI's composer paste hook would extract (_IMG_PATH_RE).
+    Read by kernel._tmux_echo_settle through sys.modules — the tmux route's floor; keep the name."""
+    return bool(_IMG_PATH_RE.search(text or ""))
 
 
 _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -8868,16 +8891,30 @@ class SdkBackend:
         """Drop live atoms the transcript has now caught up on — by uuid (assistant/tool/user from the
         stream) or by text (the optimistic input echo, which has a synthetic uuid).
 
-        FIFO floor for echoes — PATH-BEARING ONLY (narrowed, the user 2026-07-20): an input echo whose text
-        can't match because the transcript EXTRACTED an image path out of the user text (`_atom_user_text`
-        no longer contains the echoed path — the screenshots-piling-up-at-the-bottom bug, the user
-        2026-06-25) is retired once the transcript's newest GENUINE-HUMAN turn is at/after the echo's send
-        time. The floor used to apply to EVERY echo, justified by "a still-queued send keeps showing via
-        the queued indicator" — but since queued sends FORWARD into the CLI mid-turn (2026-07-17) a message
-        can be neither queued nor landed, and the blanket floor hid exactly that in-flight message the
-        moment any other human record landed. A plain-text echo now prunes ONLY by its own text landing —
-        and a genuinely dropped send's echo PERSISTS, so the loss shows (the tmux echo's semantics).
-        (Echo-only: real stream atoms have no _echo_text and prune by uuid as before.)
+        NO FLOOR RETIRES AN ECHO ON THIS BACKEND (2026-09-06). An input echo retires on exactly two
+        events: its text LANDS — a native user record, or the queued_command attachment a mid-turn splice
+        leaves; the kernel's _atom_user_texts reads both, and `tx_user_texts` maps each text to the newest
+        record time carrying it, so the record must be stamped at or after the send — or the CLI DIES
+        holding it, when _mark_dropped_echoes / _reconcile_stranded flag it `dropped` and it stays as the
+        visible loss until the user dismisses it. A dropped echo that never lands persists on purpose
+        (the tmux echo's semantics): a genuinely lost send must show.
+
+        The floor this replaces: `human_floor` (the newest genuine-human atom's time) once retired every
+        echo it postdated, was narrowed to path-bearing echoes (the user 2026-07-20) — the image-
+        extraction case, where the CLI's composer paste hook rewrites a pasted image path to "[Image #N]"
+        and the echo's text can never match — and that predicate matched far more than image paths: it
+        retired a staged comment whose quote chip carried a `path:line` label while the CLI still held
+        the message, so nothing showed the message until the splice. Narrowing it to image paths left a
+        rule with no true positives here: the hook runs only in the terminal composer, and an SDK
+        session's input is stream-json, so the CLI takes the text as typed (0 image blocks in 8,569 user
+        records over 71 sessions of one installation; every image-path text landed verbatim). Its only
+        effect was the false kind — a `.png` echo retired while its text sat in the CLI's queue, or in
+        the gap between the turn's ResultMessage and the next turn's record, so the message blinked out
+        of every client but the sender's. The tmux route keeps its own floor in kernel._tmux_echo_settle,
+        borrowing _path_bearing: there a send is a paste into the composer.
+
+        `human_floor` still retires COMMAND atoms below. (Echo-only: real stream atoms have no
+        _echo_text and prune by uuid as before.)
 
         Pure dict work, so the whole sweep runs under the live-tail lock (the emptiness check and the
         sid-level pop included — one step, so a stash can never land in a dict this pops); the echo
@@ -8903,14 +8940,12 @@ class SdkBackend:
             for k, a in list(d.items()):   # a SNAPSHOT (belt-and-braces under the lock — _note_live_tail_race)
                 et = a.get("_echo_text")
                 landed = a.get("uuid") in tx_uuids or _by_text(a, et)
-                stale_echo = (bool(et) and human_floor and a.get("t", 0) <= human_floor
-                              and not a.get("command") and _path_bearing(et))
                 # A COMMAND atom (the CLI's streamed /model, /compact feedback) from a TURN-LESS control
                 # request may never get a transcript record to land against — retire it once a genuine human
                 # turn postdates it, so the stale confirmation line doesn't ride pinned inside every later
                 # turn forever (the user 2026-07-02, with the live_work command exemption).
                 stale_cmd = bool(a.get("command")) and human_floor and a.get("t", 0) <= human_floor
-                if landed or stale_echo or stale_cmd:
+                if landed or stale_cmd:
                     echo_removed = echo_removed or bool(et and not a.get("command"))
                     if d.pop(k, None) is None:
                         vanished += 1

@@ -392,23 +392,24 @@ class LiveTail(unittest.TestCase):
         self.assertIn("blocked = self.inflight > 0 and self._interrupted", src,
                       "inputs() holds queued turns while a turn is interrupted/wedged")
 
-    def test_image_echo_pruned_by_human_floor_when_text_cant_match(self):
-        # The screenshots-piling-up bug (the user 2026-06-25): an image send's echo text is the raw composer
-        # text (an image path), but the transcript extracts the path into an image block, so the echoed path
-        # is NOT in tx_user_texts and the text-prune can never retire it → every screenshot echo accumulates.
-        # The FIFO floor retires it once the transcript's newest genuine-human turn is at/after its send time.
+    def test_image_echo_is_never_floored_it_lands_by_text(self):
+        # The screenshots-piling-up bug (the user 2026-06-25) was the TMUX composer's: its paste hook
+        # rewrites a pasted image path to "[Image #N]", so the echoed path is never in tx_user_texts and a
+        # FIFO floor had to retire the echo once a later genuine-human turn landed. The SDK route never
+        # runs that hook — stream-json input lands the path as typed — so since 2026-09-06 no SDK echo is
+        # floored: an image echo retires when its own text lands (or when the CLI dies holding it, the
+        # dropped marking), exactly like a plain-text one. tests/test_sdk_echo_durability.py has the rest.
         be = sb.SdkBackend(tempfile.mkdtemp(), "/bin/true", lambda *a, **k: None)
         be._live["s"] = {"echo:img": {"uuid": "echo:img", "t": 100, "_echo_text": "/abs/shot.png"}}
-        be.prune_live("s", set(), set())               # no text/uuid match, no floor → echo persists (the bug)
+        be.prune_live("s", set(), set())               # nothing landed → the echo is the send's only record
         self.assertEqual([a["uuid"] for a in be.live_atoms("s")], ["echo:img"])
-        be.prune_live("s", set(), set(), human_floor=120)   # a later genuine-human turn landed → FIFO-retire it
+        be.prune_live("s", set(), set(), human_floor=120)   # a later genuine-human turn: not a retire here
+        self.assertEqual([a["uuid"] for a in be.live_atoms("s")], ["echo:img"],
+                         "the message may still sit in the CLI's queue; its path will land as typed")
+        be.prune_live("s", set(), {"/abs/shot.png": 130}, human_floor=130)   # its own record lands → retire
         self.assertEqual(be.live_atoms("s"), [])
-        # a not-yet-landed echo (send time AFTER the floor) must survive
-        be._live["s"] = {"echo:new": {"uuid": "echo:new", "t": 200, "_echo_text": "/abs/new.png"}}
-        be.prune_live("s", set(), set(), human_floor=120)
-        self.assertEqual([a["uuid"] for a in be.live_atoms("s")], ["echo:new"])
         # the floor must NOT retire a real stream atom (no _echo_text) — those prune by uuid only
-        be._live["s"]["a9"] = {"uuid": "a9", "t": 50}
+        be._live["s"] = {"a9": {"uuid": "a9", "t": 50}}
         be.prune_live("s", set(), set(), human_floor=300)
         self.assertEqual([a["uuid"] for a in be.live_atoms("s")], ["a9"])
 

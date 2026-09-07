@@ -19290,7 +19290,12 @@ def _split_reminders(text):
     return prompt.strip(), [r for r in reminders if r]
 
 
-_IMG_PATH_RE = re.compile(r"(?:^|[\s'\"`(])((?:~/|/)[^\s'\"`()]+\.(?:png|jpe?g|gif|webp|bmp|svg))\b", re.I)
+# The extension set is the CLI's, not romp's: the composer paste hook's one image-path test,
+# `/\.(png|jpe?g|gif|webp)$/i` (Claude Code 2.1.261 bundle) — the paths it reads and rewrites to
+# "[Image #N]" before the submit. No bmp, no svg: the wider set this carried until 2026-09-06 claimed
+# extractions the CLI never performs (a `.svg` send waited for a rewrite that never came). Twin of
+# sdk_backend._IMG_PATH_RE; tests/test_kernel_fed_echo_absorbed.py pins both to that set.
+_IMG_PATH_RE = re.compile(r"(?:^|[\s'\"`(])((?:~/|/)[^\s'\"`()]+\.(?:png|jpe?g|gif|webp))\b", re.I)
 def _user_images(blocks, text, human):
     """A user turn's images. Inline base64 → a data: URL; an image
     source path → "path:<abs>" (the webview hydrates it via imgRequest); and — the common case — a bare
@@ -22700,9 +22705,10 @@ def _atom_user_texts(a):
     the nudge body. _atom_user_text space-JOINS the blocks, so the echo's exact text was never a member of
     the transcript set and the landing check ("et in tx_user_texts") could not fire. The echo then never
     retired: it rode the bottom of the thread forever, still wearing its original SEND time, so a nudge
-    sent at 16:43 appeared BELOW a 17:00 answer (the user 2026-07-22). The FIFO floor can't save it either
-    — that was deliberately narrowed to PATH-BEARING echoes (2026-07-20) so a genuinely dropped send stays
-    visible. Per-block EXACT match, never a substring test: a bundled block is the very string that was
+    sent at 16:43 appeared BELOW a 17:00 answer (the user 2026-07-22). No floor can save it either —
+    sdk_backend.prune_live floors no echo (2026-09-06; before that the floor was narrowed to path-bearing
+    echoes, 2026-07-20), so a genuinely dropped send stays visible. Per-block EXACT match, never a
+    substring test: a bundled block is the very string that was
     echoed, so this retires the delivered nudge without ever guessing about containment."""
     if a.get("type") != "user":
         return ()
@@ -22754,8 +22760,9 @@ def _tmux_echo_prune(sid, tx_uuids, tx_texts):
 
 def _human_turn_floor(session):
     """The newest GENUINE-HUMAN user atom's timestamp in the parsed session, or 0. The one event that says
-    "the transcript has moved past anything typed before this": read by the SDK's echo floor
-    (sdk_backend.prune_live), by the tmux echo's settle below, and by the queued fold.
+    "the transcript has moved past anything typed before this": read by sdk_backend.prune_live (to retire
+    stale command-feedback atoms — since 2026-09-06 it floors no echo), by the tmux echo's settle below,
+    and by the queued fold.
 
     EXCLUDES the interrupt record (the user 2026-07-07): it authors 'human' but is a STOP event, not a
     message that landed and processed the echo. When a just-sent message hadn't hit disk yet, the
@@ -22785,11 +22792,14 @@ def _tmux_echo_settle(sid, human_floor, still_queued=()):
 
     Marking, NOT pruning: a tmux echo is the only record of a send the pane dropped, and that loss must
     stay on screen — the whole reason the echo outlives a later turn (see TmuxBackend.prune_live). The one
-    exception mirrors the SDK's own floor: a PATH-BEARING echo can fail the text match STRUCTURALLY,
-    because the transcript extracts image paths out of the user text, so that flavor is retired the way
-    sdk_backend.prune_live retires it rather than labelled a loss it may not be. With the SDK module
-    unavailable the predicate is simply unavailable too, and marking (the visible, reversible outcome)
-    covers every echo.
+    exception is an IMAGE-PATH echo: a tmux send is a paste into the composer, whose paste hook reads a
+    pasted image path and rewrites the token to "[Image #N]" (sdk_backend._IMG_PATH_RE names the hook's
+    extension set), so the echo's text can fail the match STRUCTURALLY and "overtaken" is not evidence of
+    loss — that flavor is retired rather than labelled a loss it may not be. The predicate is borrowed
+    from the SDK module (sdk_backend._path_bearing, kept for this reader: the SDK route itself floors no
+    echo since 2026-09-06, because stream-json input never reaches the hook). With that module
+    unavailable the predicate is unavailable too, and marking (the visible, reversible outcome) covers
+    every echo.
 
     STANDS DOWN for an echo whose text the queue ledger still lists as pending (`still_queued`,
     2026-08-27): the floor is a per-SESSION clock, so an OLDER queued sibling delivering raises it past
