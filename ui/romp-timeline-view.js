@@ -4823,7 +4823,12 @@ class TimelinePanel {
       const aw = (s.awaiting && s.awaiting.length) ? s.awaiting
                  : ((s.live && (s.state === 'permission' || s.state === 'needsInput' || s.state === 'awaiting') && s.since != null) ? [[s.since, t1]] : []);
       for (const span of aw) {
-        const a0 = span[0], b0 = span[1];
+        // OPEN = the session is STILL in the state: the kernel (_state_intervals) ends such a span at the
+        // payload's own clock, so an end within 2 s of data.now (or a null one) means open. Draw it to the
+        // live edge, the way barEndT draws an open work bar, so the stripe glides with the edge instead of
+        // sitting at the build clock until the next kernel rebuild.
+        const open = span[1] == null || span[1] >= data.now - 2;
+        const a0 = span[0], b0 = open ? Math.max(nowS, a0) : span[1];
         const sa = Math.max(a0, t0), sb = Math.min(b0, t1); if (sb <= sa) continue;
         // The awaiting interval (state log) and the work bars (transcript) come from different
         // sources, so a bar can end a few seconds BEFORE the permission prompt → a gap (made worse by
@@ -4847,7 +4852,7 @@ class TimelinePanel {
         const stripe = el('rect', { x: x(sa), y: y - BAR_H / 2, width: Math.max(2, x(sb) - x(sa)), height: BAR_H, fill: 'url(#vault-await-hatch)' });
         svg.appendChild(stripe);
         const sh = el('rect', { x: bx0, y: y - 7, width: Math.max(2, bx1 - bx0), height: 14, fill: 'transparent' }); sh.style.cursor = 'pointer';
-        const end = b0 >= data.now - 2 ? 'now' : clock(b0);
+        const end = open ? 'now' : clock(b0);
         const shtml = () => '<div class="r"><span class="chip" style="background:' + BADGE.attention.bg + '"></span><span class="who" style="color:' + s.color + '">' + esc(s.name) + '</span><span class="k">blocked</span></div><div class="b">blocked on your input · ' + clock(a0) + '–' + end + '</div>';
         const grow = (h) => { for (const r of [back, stripe]) { r.setAttribute('y', y - h / 2); r.setAttribute('height', h); } };
         sh.addEventListener('mouseenter', (e) => { grow(eh); this.showTip(shtml(), e); });
@@ -4863,7 +4868,8 @@ class TimelinePanel {
       const comp = (s.compacting && s.compacting.length) ? s.compacting
                    : ((s.live && s.state === 'compacting' && s.since != null) ? [[s.since, t1]] : []);
       for (const span of comp) {
-        const a0 = span[0], b0 = span[1];
+        const open = span[1] == null || span[1] >= data.now - 2;   // still compacting: to the live edge (see the awaiting loop)
+        const a0 = span[0], b0 = open ? Math.max(nowS, a0) : span[1];
         const sa = Math.max(a0, t0), sb = Math.min(b0, t1); if (sb <= sa) continue;
         const eh = BAR_H + 5, cx = x(sa), cw = Math.max(2, x(sb) - x(sa));
         const cback = el('rect', { x: cx, y: y - BAR_H / 2, width: cw, height: BAR_H, rx: 2, fill: s.color, opacity: 0.9 });
@@ -4871,7 +4877,7 @@ class TimelinePanel {
         const chx = el('rect', { x: cx, y: y - BAR_H / 2, width: cw, height: BAR_H, rx: 2, fill: 'url(#vault-compact-hatch)' });
         svg.appendChild(chx);
         const ch = el('rect', { x: cx, y: y - 7, width: cw, height: 14, fill: 'transparent' }); ch.style.cursor = 'pointer';
-        const live = b0 >= data.now - 2;
+        const live = open;
         const cw2 = live ? 'compacting' : 'compacted';
         const chtml = () => '<div class="r"><span class="chip" style="background:#86e1ff"></span><span class="who" style="color:' + s.color + '">' + esc(s.name) + '</span><span class="k">' + cw2 + '</span></div><div class="b">context ' + cw2 + ' · ' + clock(a0) + '–' + (live ? 'now' : clock(b0)) + '</div>';
         const cgrow = (h) => { for (const r of [cback, chx]) { r.setAttribute('y', y - h / 2); r.setAttribute('height', h); } };
