@@ -10,8 +10,10 @@ scripts/ci/ - the gate's own workflow and code - needs an approval regardless (t
 cannot stop a PR-branch job from posting a same-named success on pull_request events, and a fix-tier PR
 must not rewrite the policy through the seven-day path, so a human must look). Zero or two tier labels fail here too (belt and braces with the label
 check). An approval is a reviewer's STANDING - their latest APPROVED / CHANGES_REQUESTED / DISMISSED
-review (comment-only reviews never change standing; a DISMISSED one stands as a non-approval) - by a
-non-author holding write/admin/maintain, APPROVED, on the CURRENT head. The seven-day clock is the later
+review (comment-only reviews never change standing; a dismissed approval never counts, whoever dismissed
+it; a dismissed objection clears only when the reviewer dismissed it THEMSELVES, so the author cannot
+dismiss the peer's objection away) - by a non-author holding write/admin/maintain, APPROVED, on the
+CURRENT head. The seven-day clock is the later
 of the head's arrival on the PR and the start of the unbroken chain of hourly "Tier policy" verdicts THIS
 PR received on the head; a head with no verdict yet has not started its clock (never a commit date, which
 is free to forge; never created_at; never another PR's verdicts on the same sha).
@@ -51,9 +53,11 @@ def pr(**kw):
     return base
 
 
-def review(user, state="APPROVED", sha=HEAD, submitted=NOW - 60, dismissed=False):
+def review(user, state="APPROVED", sha=HEAD, submitted=NOW - 60, dismissed=False, dismissed_by=None):
+    """`state` is the review's ORIGINAL state (the fetcher recovers it from the review_dismissed
+    timeline event for a dismissed one); `dismissed_by` is the login that dismissed it."""
     return {"user": user, "state": state, "commit_id": sha, "submitted_at": submitted,
-            "dismissed": dismissed}
+            "dismissed": dismissed, "dismissed_by": dismissed_by}
 
 
 MAINTAINERS = {"maint-b": "write", "admin-c": "admin"}
@@ -144,19 +148,56 @@ class Approval(unittest.TestCase):
         # with write can dismiss, and both maintainers hold write - the review's catch
         v = tp.evaluate(pr(labels=["feature"], permissions=MAINTAINERS,
                            reviews=[review("maint-b", submitted=NOW - 600),
-                                    review("maint-b", state="CHANGES_REQUESTED", submitted=NOW - 60, dismissed=True)]))
+                                    review("maint-b", state="CHANGES_REQUESTED", submitted=NOW - 60, dismissed=True,
+                                           dismissed_by="maint-b")]))
         self.assertEqual(v["conclusion"], "failure")
 
-    def test_a_dismissed_objection_does_not_close_the_seven_day_path(self):
+    # Dismissals read fail-closed in both directions. A dismissed APPROVED never counts, whoever dismissed
+    # it: a review dismisses only once, so ignoring a third party's dismissal would let the author spend
+    # it first and lock the peer's approval in while the PR page shows it struck out (the review's catch
+    # against the symmetric rule), and on a fork PR "anyone else" is the OTHER maintainer, whose veto by
+    # dismissal would vanish. A dismissed CHANGES_REQUESTED clears only when the reviewer dismissed it
+    # themselves; the author (write access too) cannot dismiss the peer's objection to reopen the
+    # seven-day path (the maintainers' ruling, 2026-09-07).
+    def test_a_reviewer_dismissing_their_own_objection_clears_it(self):
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY,
+                           permissions=MAINTAINERS,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED", dismissed=True, dismissed_by="maint-b")]))
+        self.assertEqual(v["conclusion"], "success", "withdrawn by its author: not a standing objection")
+
+    def test_the_author_cannot_dismiss_the_peers_objection_to_reopen_the_seven_day_path(self):
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY,
+                           permissions=MAINTAINERS,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED", dismissed=True, dismissed_by="author-a")]))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("Changes requested by maint-b", v["summary"])
+
+    def test_a_reviewer_dismissing_their_own_approval_withdraws_it(self):
+        v = tp.evaluate(pr(labels=["feature"], reviews=[review("maint-b", dismissed=True, dismissed_by="maint-b")],
+                           permissions=MAINTAINERS))
+        self.assertEqual(v["conclusion"], "failure")
+
+    def test_an_approval_dismissed_by_anyone_never_counts(self):
+        for who in ("author-a", "admin-c"):          # the author; the other maintainer on a fork PR
+            v = tp.evaluate(pr(labels=["feature"], reviews=[review("maint-b", dismissed=True, dismissed_by=who)],
+                               permissions=MAINTAINERS))
+            self.assertEqual(v["conclusion"], "failure", "dismissed by %s: the PR page shows it struck out" % who)
+
+    def test_a_reviewer_whose_objection_was_dismissed_by_another_lifts_it_by_approving(self):
+        v = tp.evaluate(pr(labels=["fix"], permissions=MAINTAINERS,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED", submitted=NOW - 600, dismissed=True,
+                                           dismissed_by="author-a"),
+                                    review("maint-b", submitted=NOW - 60)]))
+        self.assertEqual(v["conclusion"], "success")
+
+    def test_a_dismissal_of_unknown_actor_fails_closed_both_ways(self):
+        # the fetcher raises before it builds such a record; the policy still fails closed on it
+        v = tp.evaluate(pr(labels=["feature"], reviews=[review("maint-b", dismissed=True)], permissions=MAINTAINERS))
+        self.assertEqual(v["conclusion"], "failure", "an approval dismissed by nobody-knows-who is no approval")
         v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY,
                            permissions=MAINTAINERS,
                            reviews=[review("maint-b", state="CHANGES_REQUESTED", dismissed=True)]))
-        self.assertEqual(v["conclusion"], "success", "a dismissed objection is not a standing objection")
-
-    def test_a_dismissed_approval_does_not_count(self):
-        v = tp.evaluate(pr(labels=["feature"], reviews=[review("maint-b", dismissed=True)],
-                           permissions=MAINTAINERS))
-        self.assertEqual(v["conclusion"], "failure")
+        self.assertEqual(v["conclusion"], "failure", "...and an objection dismissed by nobody-knows-who still stands")
 
     def test_a_comment_review_is_not_an_approval(self):
         v = tp.evaluate(pr(labels=["feature"], reviews=[review("maint-b", state="COMMENTED")],
@@ -539,6 +580,8 @@ class FetcherShapes(unittest.TestCase):
                 return {"permission": "write"}, {}
             if path.endswith("/timeline"):
                 return test.timeline, {}
+            if path.endswith("/events"):
+                return test.events, {}
             if path.endswith("/issues/7/comments"):
                 return [{"user": {"login": "maint-b"}}, {"user": {"login": "stale[bot]", "type": "Bot"}}], {}
             if path.endswith("/issues/7"):
@@ -559,9 +602,10 @@ class FetcherShapes(unittest.TestCase):
         self.run_pages = [[run(NOW - 8 * DAY)] + [run(NOW - k * 3600) for k in (3, 2, 1)]
                           + [run(NOW - k * 3600, ext="41") for k in range(1, 8 * 24)]
                           + [run(NOW - 30 * DAY, app=1)]]
-        self.reviews = [{"user": {"login": "maint-b"}, "state": "APPROVED", "commit_id": HEAD,
+        self.reviews = [{"id": 1, "user": {"login": "maint-b"}, "state": "APPROVED", "commit_id": HEAD,
                          "submitted_at": "2026-09-02T00:00:00Z"}]
         self.timeline = []
+        self.events = []
         self.issue_fetches = []
         self.tc._req = fake_req
 
@@ -652,12 +696,41 @@ class FetcherShapes(unittest.TestCase):
         rec["labels"] = ["docs"]
         self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure", "docs cannot vouch for unseen files")
 
+    DISMISSED_APPROVAL = {"id": 2, "user": {"login": "maint-b"}, "state": "DISMISSED", "commit_id": HEAD,
+                          "submitted_at": "2026-09-02T01:00:00Z"}
+
+    def _dismissal(self, actor, state="approved", review_id=2):
+        # the issue events API's review_dismissed event: the actor, and the dismissed review's id and
+        # ORIGINAL state, lowercase as documented (verified live 2026-09-07 on a public PR)
+        return {"event": "review_dismissed", "created_at": "2026-09-02T02:00:00Z", "actor": {"login": actor},
+                "dismissed_review": {"review_id": review_id, "state": state, "dismissal_message": "x"}}
+
     def test_a_dismissed_review_reads_as_the_latest_word(self):
-        self.reviews = self.reviews + [{"user": {"login": "maint-b"}, "state": "DISMISSED", "commit_id": HEAD,
-                                        "submitted_at": "2026-09-02T01:00:00Z"}]
+        self.reviews = self.reviews + [self.DISMISSED_APPROVAL]
+        self.events = [self._dismissal("maint-b")]
         rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-        self.assertTrue(rec["reviews"][1]["dismissed"])
-        self.assertFalse(tp._approved(rec)[0], "the dismissal is the reviewer's latest word")
+        r = rec["reviews"][1]
+        self.assertEqual((r["state"], r["dismissed"], r["dismissed_by"]), ("APPROVED", True, "maint-b"),
+                         "original state recovered from the event; the dismisser recorded")
+        self.assertFalse(tp._approved(rec)[0], "the reviewer withdrew it: the dismissal is their latest word")
+
+    def test_a_dismissal_by_the_author_is_recorded_and_read_fail_closed(self):
+        self.reviews = self.reviews + [self.DISMISSED_APPROVAL]
+        self.events = [self._dismissal("author-a")]
+        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        self.assertEqual(rec["reviews"][1]["dismissed_by"], "author-a")
+        self.assertFalse(tp._approved(rec)[0], "a dismissed approval never counts, whoever dismissed it")
+        self.events = [self._dismissal("author-a", state="changes_requested")]
+        self.served = set()                          # a second build in the same test re-pages legitimately
+        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        self.assertEqual(rec["reviews"][1]["state"], "CHANGES_REQUESTED")
+        self.assertEqual(tp._changes_requested(rec), ["maint-b"], "...and the peer's objection stands")
+
+    def test_a_dismissed_review_without_its_timeline_event_raises(self):
+        # the record cannot say who dismissed it: fail loudly rather than guess either way
+        self.reviews = self.reviews + [self.DISMISSED_APPROVAL]
+        with self.assertRaises(RuntimeError):
+            self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
 
     def test_a_server_error_on_the_file_listing_raises(self):
         self.files_error = 500

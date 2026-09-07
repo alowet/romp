@@ -9,7 +9,7 @@ Apply exactly one of these labels to the PR. The "Exactly one tier label" check 
 - [ ] `feature`: a self-contained new capability. Merges on the other maintainer's approval.
 - [ ] `major-feature`: new functionality that changes what romp does or its contracts. Merges on the other maintainer's approval AND a discussion in a linked issue (`#N` in this body, opened or commented on by someone other than the author).
 
-Any PR that touches `.github/` or `scripts/ci/` needs an approval regardless of tier. "Approval" means a maintainer other than the author has a standing APPROVED review on the current head (comment-only reviews never change standing; a dismissed review stands as a non-approval).
+Any PR that touches `.github/` or `scripts/ci/` needs an approval regardless of tier. "Approval" means a maintainer other than the author has a standing APPROVED review on the current head (comment-only reviews never change standing; a dismissed approval never counts, and a dismissed change request clears only when its reviewer dismissed it themselves).
 
 ## Tests
 

@@ -9,7 +9,9 @@ Record shape (every key the rules read):
   labels: [str]          author: login         head_sha: str
   files: [path]          (a renamed or copied file appears under BOTH its old and new path)
   files_truncated: bool  (the API lists at most 3000 files; True when the PR has more than it listed)
-  reviews: [{user, state, commit_id, submitted_at, dismissed}]      permissions: {login: permission}
+  reviews: [{user, state, commit_id, submitted_at, dismissed, dismissed_by}]   (state = the ORIGINAL state;
+            for a dismissed review the fetcher recovers it, and the dismisser, from the review_dismissed event)
+  permissions: {login: permission}
   first_check_at: epoch|None   (chain_start of THIS PR's hourly verdicts on this head, anchored at now)
   head_floor: epoch   now: epoch   body: str
   (the fetcher also records created_at; no rule reads it - head_floor already starts from it)
@@ -22,9 +24,15 @@ gate's own workflow and code — needs an approval whatever its tier; so does a 
 API truncated (the unseen files are assumed guarded and not documentation). Zero or two tier labels fail.
 
 An approval is a reviewer's STANDING — their latest APPROVED / CHANGES_REQUESTED / DISMISSED review; a
-COMMENTED review (GitHub files one per inline comment) never changes standing, and a DISMISSED one stands
-as a non-approval that never revives an earlier approval — that is APPROVED, by a non-author holding
-write/admin/maintain, on the CURRENT head.
+COMMENTED review (GitHub files one per inline comment) never changes standing — that is APPROVED, by a
+non-author holding write/admin/maintain, on the CURRENT head. Dismissals are read fail-closed, in both
+directions: a dismissed APPROVED never counts, whoever dismissed it (as the PR page shows it; a review
+dismisses only once, so were a third party's dismissal ignored, the author could spend it first and lock
+the peer's approval in with no way left for the peer to withdraw — the review's catch against the
+symmetric rule); a dismissed CHANGES_REQUESTED is cleared only when the reviewer dismissed it THEMSELVES,
+and a dismissal by anyone else leaves the objection standing, so the author (who holds write too) cannot
+dismiss the peer's objection to reopen the seven-day path (the maintainers' ruling, 2026-09-07). A
+reviewer whose objection someone else dismissed lifts it by approving.
 
 The seven-day clock: since = the later of head_floor and first_check_at. first_check_at is the start of
 the UNBROKEN chain of hourly "Tier policy" verdicts THIS PR received on this head (each verdict carries
@@ -62,13 +70,25 @@ def _is_doc(path):
     return path.startswith("docs/") or path.endswith(".md")
 
 
+def _standing(r):
+    """The state a review contributes to its reviewer's standing, dismissals read fail-closed. Undismissed:
+    its state. A dismissed APPROVED: DISMISSED, whoever dismissed it — an approval that the PR page shows
+    struck out never counts (ignoring a third party's dismissal would let the author spend the review's
+    one dismissal first and lock the approval in). A dismissed CHANGES_REQUESTED: DISMISSED only when the
+    reviewer dismissed it themselves (their own word); dismissed by anyone else — the author holds write
+    too — or by an unknown actor, the objection still stands."""
+    if not r.get("dismissed") or r.get("state") == "APPROVED":
+        return "DISMISSED" if r.get("dismissed") else r.get("state")
+    return "DISMISSED" if r.get("dismissed_by") == r.get("user") else r.get("state")
+
+
 def _latest_reviews(pr):
-    """{reviewer: standing} — the latest APPROVED / CHANGES_REQUESTED / DISMISSED review per reviewer. A
-    DISMISSED one stands (a non-approval, never an erasure that revives an earlier approval); a COMMENTED
-    or PENDING review is skipped, so one inline note after an approval (or an objection) leaves it standing."""
+    """{reviewer: latest standing-bearing review} — the latest APPROVED / CHANGES_REQUESTED / dismissed
+    review per reviewer; a COMMENTED or PENDING review is skipped, so one inline note after an approval
+    (or an objection) leaves it standing. Read the review's effect through _standing."""
     latest = {}
     for r in sorted(pr.get("reviews") or [], key=lambda r: r.get("submitted_at") or 0):
-        if r.get("dismissed") or r.get("state") in STANDING_STATES:
+        if r.get("state") in STANDING_STATES:            # `state` is the ORIGINAL state, dismissed or not
             latest[r["user"]] = r
     return latest
 
@@ -79,7 +99,7 @@ def _approved(pr):
     for user, r in _latest_reviews(pr).items():
         if user == pr.get("author") or perms.get(user) not in MAINTAINER_PERMS:
             continue
-        if r.get("dismissed") or r.get("state") != "APPROVED":
+        if _standing(r) != "APPROVED":
             continue
         if r.get("commit_id") != pr.get("head_sha"):
             seen_stale = True
@@ -94,7 +114,7 @@ def _changes_requested(pr):
     perms = pr.get("permissions") or {}
     return [u for u, r in _latest_reviews(pr).items()
             if u != pr.get("author") and perms.get(u) in MAINTAINER_PERMS
-            and not r.get("dismissed") and r.get("state") == "CHANGES_REQUESTED"]
+            and _standing(r) == "CHANGES_REQUESTED"]
 
 
 def _linked_issue_discussed(pr):

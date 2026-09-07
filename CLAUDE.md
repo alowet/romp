@@ -132,7 +132,10 @@ broad `git add` will sweep up your work). Conventions:
     `--auto` and leave the merge to the maintainers.
   "Approval" is a standing APPROVED review by a maintainer other than the author on the
   CURRENT head (standing = their latest approval, change request or dismissal; comment-only
-  reviews never change it) - GitHub forbids self-approval and the user's sessions act under
+  reviews never change it; a dismissed approval never counts, whoever dismissed it, and a
+  dismissed change request clears only when the reviewer dismissed it themselves, so the
+  author cannot dismiss the peer's objection away to reopen the seven-day path) -
+  GitHub forbids self-approval and the user's sessions act under
   the user's account, so it structurally means the other maintainer. A renamed file counts
   under both its paths. Any PR touching `.github/` or
   `scripts/ci/` - the gate's own workflow and code - needs an approval regardless of tier: the

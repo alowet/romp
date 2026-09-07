@@ -11,6 +11,9 @@ its timeline, and first_check_at is the start of the unbroken chain of hourly "T
 PR received on the head: every verdict this fetcher posts carries the PR number as external_id, and only
 runs the GitHub Actions app owns (app.id) with this PR's external_id count, listed with filter=all (every
 run, not the latest per suite) and stamped by the server-set completed_at (started_at as the fallback).
+A dismissed review's original state and its dismisser come from the issue events API's review_dismissed
+event (actor + dismissed_review.{review_id,state}; the reviews API itself only says DISMISSED); a dismissed
+review with no such event raises.
 The workflow's own job carries a DIFFERENT name so exactly one family of same-named runs exists. A renamed
 or copied file is recorded under both its paths, and a listing the API truncated (3000-file cap, checked
 against the PR's changed_files) is flagged; the head is re-read at the end so a push during evaluation
@@ -106,9 +109,23 @@ def build_record(repo, number, token, now=None):
                 files.append(p)
     changed = pr.get("changed_files")
     files_truncated = changed is not None and changed != len(entries)
-    reviews = [{"user": r["user"]["login"], "state": r["state"], "commit_id": r.get("commit_id"),
-                "submitted_at": _iso(r.get("submitted_at")), "dismissed": r["state"] == "DISMISSED"}
-               for r in _get_all("/repos/%s/pulls/%d/reviews" % (repo, number), token) if r.get("user")]
+    dismissals = {}                    # review id -> (who dismissed it, the review's ORIGINAL state)
+    for e in _get_all("/repos/%s/issues/%d/events" % (repo, number), token):
+        if e.get("event") == "review_dismissed":
+            d = e.get("dismissed_review") or {}
+            dismissals[d.get("review_id")] = ((e.get("actor") or {}).get("login"), str(d.get("state") or "").upper())
+    reviews = []
+    for r in _get_all("/repos/%s/pulls/%d/reviews" % (repo, number), token):
+        if not r.get("user"):
+            continue
+        rec = {"user": r["user"]["login"], "state": r["state"], "commit_id": r.get("commit_id"),
+               "submitted_at": _iso(r.get("submitted_at")), "dismissed": r["state"] == "DISMISSED", "dismissed_by": None}
+        if rec["dismissed"]:
+            if r.get("id") not in dismissals:
+                raise RuntimeError("review %s by %s is DISMISSED but no review_dismissed event says who dismissed it"
+                                   % (r.get("id"), rec["user"]))
+            rec["dismissed_by"], rec["state"] = dismissals[r["id"]]
+        reviews.append(rec)
     perms = {u: _permission(repo, u, token) for u in {r["user"] for r in reviews}}
     runs = _get_all("/repos/%s/commits/%s/check-runs?check_name=%s&filter=all"
                     % (repo, head, urllib.parse.quote(CHECK_NAME)), token, key="check_runs")
