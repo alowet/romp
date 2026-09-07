@@ -71,6 +71,7 @@ import { dragSlotIndex } from "./dragslot";
 import { perfFrameHandler } from "./perf-telemetry";
 import { linkifyPrRefs, senderPrRepo, postalSenderHost } from "./pr-links";
 import { listenForFrames } from "./frame-listener";
+import { highlightHtml } from "./highlight-cache";
 
 for (const [name, lang] of Object.entries({
   bash, sh: bash, shell: bash, python, py: python, javascript, js: javascript,
@@ -1128,9 +1129,7 @@ function highlight(container: HTMLElement, lineNos = true) {
     const raw = code.textContent || "";   // capture BEFORE we rewrite innerHTML: line-wrapping drops the \n joins, so the on-screen markup's textContent is NOT copy-safe
     const lang = (code.className.match(/language-([\w-]+)/) || [])[1];
     try {
-      code.innerHTML = lang && hljs.getLanguage(lang)
-        ? hljs.highlight(raw, { language: lang }).value
-        : hljs.highlightAuto(raw).value;
+      code.innerHTML = highlightHtml(hljs, lang, raw);   // by (language, source): a fence re-rendered by a tail, a tab switch or a scroll-back tokenizes once (highlight-cache.ts)
       code.classList.add("hljs");
       if (lineNos) wrapCodeLines(code);   // per-line gutter so a soft-wrap reads distinctly from a real newline
     } catch { /* leave as-is */ }
