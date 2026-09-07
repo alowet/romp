@@ -36,7 +36,10 @@ test("the other collapsibles pass stable keys (reminders, tool folds, thinking)"
   assert.match(RENDER, /"rem:" \+ ev\.uuid/, "system reminders key on the user turn uuid");
   assert.match(RENDER, /const fkey = ev\.uuid \? "tool:" \+ ev\.uuid : undefined;/, "tool folds key on the tool uuid");
   assert.match(RENDER, /"think:" \+ ev\.uuid/, "thinking clamp keys on the thinking uuid");
-  // the whole agent dispatch (prompt + report) collapses under ONE fold with one stable key, so a single
-  // click expands both halves together (the user 2026-06-22)
-  assert.match(RENDER, /fkey \+ ":agent"/);
+  // the whole agent dispatch (prompt, tool calls, report) collapses under ONE fold with one stable key,
+  // so a single click expands all of it together (the user 2026-06-22). The key is the tool's own fkey:
+  // the ":agent"-suffixed sub-keys went with the nested prompt/report boxes (2026-09-05 — everything
+  // inside the fold is open now, so there is nothing left to key separately).
+  assert.match(RENDER, /inlineFold\(head, turn, label, body, fkey\);/);
+  assert.doesNotMatch(RENDER, /fkey \+ ":agent"/, "no nested agent sub-folds to key");
 });

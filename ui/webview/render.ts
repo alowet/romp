@@ -37,6 +37,7 @@ import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional 
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
 import { parseAgentNotif, type AgentNotif } from "./agent-notif";
+import { subTabId, isSubId, subParts, subLabel, gistLines, stepLines, stepsNote, agentFoldLabel, subHeadParts, openIconSvg, pinIconSvg, type SubMeta, type AgentGist, type AgentGistRow, type GistLine } from "./subagent-view";
 import { previewKind, previewFull, canPreview, fileUrl, retryFailedPreviews, refreshSettledPreviews, installMdImgHeal, setLightboxNav, type LightboxNavEntry } from "./preview";
 import { openFileView } from "./file-view";
 // initFileView rides its OWN line: the import above is pinned verbatim by file-view.test.ts
@@ -121,6 +122,20 @@ type ChatEvent = (
       // Skill only: the skill's full instructions markdown (the isMeta content record / its live-stream
       // twin, joined by the kernel) → the tool's collapsed-by-default fold body (the user 2026-07-08).
       skillMd?: string;
+      // Subagent transcripts (plans/subagent-transcripts.md): the tool_use BLOCK id (uuid is the record's);
+      // for Agent/Task the agent the launch wrote (null when no sidecar/ack names one), whether the launch
+      // was a background one, whether it is still running, its tool calls so far (agentSteps: oldest
+      // first, the newest 200; stepsTotal the true count — shipped running OR finished, the fold lists
+      // them either way) and — only while running — the preview's clock (agentGist). The kernel clears
+      // `output` while a background agent runs (the launch ack is not a report) and fills it with the
+      // notification's <result> once it lands.
+      toolUseId?: string;
+      agentId?: string | null;
+      agentAsync?: boolean;
+      agentRunning?: boolean;
+      agentSteps?: AgentGistRow[];
+      stepsTotal?: number;
+      agentGist?: AgentGist;
     }
   | {
       kind: "postal-service";
@@ -237,14 +252,19 @@ interface Color { bg: string; fg: string; }
 // agent/workflow, `summary` is the dispatch's description (or the workflow meta's summary) and `command`
 // carries the full ask — the Agent prompt / the Workflow script — so the row's detail level says what the
 // work IS, not a generic label over an empty block (the user 2026-08-15).
-interface BgTask { id: string; status: string; summary: string; command?: string; output?: string; }
+interface BgTask { id: string; status: string; summary: string; command?: string; output?: string; agentId?: string; }   // agentId: an AGENT row (its own transcript is openable — plans/subagent-transcripts.md); absent on shell tasks
 // The box payload: count (total to surface → the "N background tasks" header) + up to 16 tasks (the list).
 interface BgTasks { count: number; tasks: BgTask[]; }
 // events is a contiguous TAIL of the transcript: global indices [headFrom, headTotal). On a fresh load the
 // kernel ships only the last WIRE_TAIL events (headFrom > 0) to keep startup light; older history streams in
 // on scroll-back (loadOlder → chatHead prepends, lowering headFrom). headFrom 0 = the whole transcript is
 // resident. chatTail's `from` is GLOBAL and mapped through headFrom.
-interface Session { id: string; name: string; color: Color | null; events: ChatEvent[]; status: Status; firstSeen?: number; cwd?: string; gitBranch?: string; workTree?: { dir: string; branch: string } | null; headFrom?: number; headTotal?: number; bgTasks?: BgTasks; hideFromFeed?: boolean; postalServiceOff?: boolean; notify?: boolean; branch?: { fromSid: string; fromName: string; cut: string; t: number } | null; branches?: { sid: string; name: string; cut: string; t: number }[] | null; }
+interface Session { id: string; name: string; color: Color | null; events: ChatEvent[]; status: Status; firstSeen?: number; cwd?: string; gitBranch?: string; workTree?: { dir: string; branch: string } | null; headFrom?: number; headTotal?: number; bgTasks?: BgTasks; hideFromFeed?: boolean; postalServiceOff?: boolean; notify?: boolean; branch?: { fromSid: string; fromName: string; cut: string; t: number } | null; branches?: { sid: string; name: string; cut: string; t: number }[] | null; sub?: SubInfo; }
+// A SUBAGENT VIEWER pseudo-session (plans/subagent-transcripts.md): a read-only tab whose events are one
+// agent's own transcript, fed by {type:"subagent"} frames. Client-only — the kernel never lists it in
+// tabOrder (reconcileTabOrder keeps a known, never-kernel-seen id), so it lives exactly as long as the
+// viewer. anchorUuid = the parent's Agent tool head, for the header's link back.
+interface SubInfo { parentId: string; agentId: string; meta: SubMeta | null; running: boolean; truncated: boolean; error: string | null; loaded: boolean; anchorUuid: string | null; }
 
 const vscodeApi =
   typeof (window as any).acquireVsCodeApi === "function" ? (window as any).acquireVsCodeApi() : undefined;
@@ -529,9 +549,16 @@ let peekId: string | null = null;
 // the CHAT surface keys on its own lens (per-surface selections, the user 2026-08-25) — the scalar
 // viewVisible stays for legacy callers; tabs and peeks decide through actives.chat
 function chatVisible(id: string): boolean {
+  // a subagent viewer is in the chat lens only once PINNED (its header's pin control): unpinned it is
+  // the peek — assertPeekFor's own derivation then dresses it .tab-peek and drops it on the next
+  // activation, with no second peek mechanism (plans/subagent-transcripts.md)
+  if (isSubId(id)) return pinnedSubs.has(id);
   const v = effViews();
   return lensVisible(surfaceLens(v, "chat"), viewTagUnion(v), id);
 }
+// Pinned subagent viewers ("keep this tab"). Client state like peekId: a pinned viewer does NOT survive
+// a reload in this slice (deliberate — the kernel has no tab-order entry to restore it from; see plan).
+const pinnedSubs = new Set<string>();
 function assertPeekFor(id: string): void {
   const next = chatVisible(id) ? null : id;
   if (next !== peekId) { peekId = next; renderTabs(); }
@@ -3769,28 +3796,37 @@ function renderTool(ev: Extract<ChatEvent, { kind: "tool" }>): HTMLElement {
     const signal = ev.name === "Task" || ev.name === "Agent";
     if (signal) {
       // Subagent (Task/Agent) = a delegated mini-conversation, disclosed PROGRESSIVELY (the user
-      // 2026-07-17: default compact, click to go deeper — everywhere). Level 0 is ONE head row (Task +
-      // its description, the amber/green rail dot carrying run-state); level 1 (the head's inline fold)
-      // reveals the PROMPT and REPORT as their own collapsed caret boxes; level 2 opens either box —
-      // each markdown-rendered (the user 2026-07-08; the prompt is the prompt field, not the tool JSON).
-      // Unlike the pre-07-08 head toggle this reveals fold LABELS, not the prompt itself, so nothing
-      // renders twice.
-      const akey = fkey ? fkey + ":agent" : undefined;
-      const halves = el("div", "agent-folds");
+      // 2026-07-17: default compact, click to go deeper — everywhere). Level 0 is ONE head row (Agent +
+      // its description, the amber/green rail dot carrying run-state) plus, while it runs, the three-row
+      // preview below. Level 1 — ONE click on the head's inline fold — reveals everything, all OPEN and
+      // in the label's order: the PROMPT as markdown (the prompt field, not the tool JSON — the user
+      // 2026-07-08), the FULL list of tool calls (one dim row each, the preview's own vocabulary, newest
+      // last, growing live while the agent runs), then the REPORT as markdown once it has finished. The
+      // 2026-07-08 cut nested prompt and report as collapsed caret boxes inside the fold, so reading the
+      // prompt took two clicks; the user found that odd (2026-09-05), hence one fold, nothing nested.
+      // The label says what the click reveals: "prompt · 12 tool calls" / "… · report · 3 lines".
+      const body = el("div", "agent-folds");
       if (ev.input) {
         let promptText = ev.input;   // ev.input is the tool's full JSON; show just the prompt the agent was given
         try { const o = JSON.parse(ev.input); if (o && typeof o.prompt === "string") promptText = o.prompt; } catch { /* truncated JSON → show raw */ }
         const box = el("div", "agent-report md"); box.innerHTML = md(promptText); highlight(box);
-        halves.appendChild(foldable("prompt", box, akey ? akey + ":prompt" : undefined));
+        body.appendChild(box);
+      }
+      const steps = ev.agentSteps || [];
+      if (steps.length) {
+        const list = el("div", "agent-gist agent-steps");
+        const note = stepsNote(steps.length, ev.stepsTotal);
+        if (note) { const n = el("div", "agent-steps-note"); n.textContent = note; list.appendChild(n); }
+        appendGistRows(list, stepLines(steps, ev.agentGist, Date.now()));
+        body.appendChild(list);
       }
       if (ev.output) {
-        // the report is the meatier half → its line count rides the fold label (else just "report")
         const box = el("div", "agent-report md"); box.innerHTML = md(ev.output); highlight(box);
-        halves.appendChild(foldable(`report · ${countLines(ev.output)} lines`, box, akey ? akey + ":report" : undefined));
+        body.appendChild(box);
       }
-      if (halves.childElementCount) {
-        const label = ev.output ? `prompt + report · ${countLines(ev.output)} line${countLines(ev.output) === 1 ? "" : "s"}` : "prompt";
-        inlineFold(head, turn, label, halves, fkey);
+      if (body.childElementCount) {
+        const label = agentFoldLabel({ stepsTotal: ev.stepsTotal ?? steps.length, reportLines: ev.output ? countLines(ev.output) : null });
+        inlineFold(head, turn, label, body, fkey);
       }
     } else if (!ev.output) {
       // No result text yet, OR a command that finished with no output (mkdir, git add, …). Keep the command
@@ -3817,7 +3853,53 @@ function renderTool(ev: Extract<ChatEvent, { kind: "tool" }>): HTMLElement {
   // No right-side status glyph: the LEFT rail dot already carries the outcome — a green ✓
   // disc on success, a red ✗ disc on error (the user 2026-06-13). The old in-head ✓/✗ sat
   // right beside an identical dot, so it was pure duplication.
+  if ((ev.name === "Task" || ev.name === "Agent") && ev.agentId) {
+    // Subagent transcripts (plans/subagent-transcripts.md): the arrow opens the agent's WHOLE
+    // conversation as a peek tab — running or finished, whenever the agent is known. While the agent
+    // runs (the kernel ships its clock), the preview under the head shows its last three tool calls
+    // (level 0) — but only while the head's fold is CLOSED: an open fold lists every call, so the
+    // preview would repeat its tail. The fold's state is read from the same store that keeps it across
+    // re-renders (openFolds, keyed by fkey) — no new state; the CSS twin (.fold-open hides
+    // .agent-preview) covers the click itself, before the next push rebuilds the turn. Everything here
+    // lives inside this turn, so a collapsed compact run hides it with the head.
+    head.appendChild(agentOpenButton(ev.agentId, ev.uuid || null, renderingOwnerSid || renderingSid || null));
+    if (ev.agentGist && !(fkey && openFolds.has(fkey))) head.insertAdjacentElement("afterend", renderAgentGist(ev.agentSteps, ev.agentGist));
+  }
   return turn;
+}
+
+// The house line-icon button that opens a subagent's transcript. Delegated (data-act on the stable
+// document.body delegate below), never a per-node listener: the tool head rebuilds on every push.
+function agentOpenButton(agentId: string, anchorUuid: string | null, ownerSid: string | null): HTMLElement {
+  const b = el("span", "tool-open-agent");
+  b.dataset.act = "openSubagent";
+  b.dataset.agent = agentId;
+  if (ownerSid) b.dataset.sid = ownerSid;
+  if (anchorUuid) b.dataset.uuid = anchorUuid;
+  b.innerHTML = openIconSvg();
+  b.setAttribute("role", "button"); b.tabIndex = 0;
+  setTip(b, "open transcript");
+  return b;
+}
+
+// The running agent's preview: up to three dim rows in the head vocabulary (`<tool> <desc>`), newest
+// last, the last row trailing "· N tool calls · elapsed". Wears the tool-fold-toggle's size (0.86em) —
+// no new font-size on the tool head. Gone once the kernel stops shipping the clock (the agent finished).
+function renderAgentGist(steps: AgentGistRow[] | undefined, g: AgentGist): HTMLElement {
+  const box = el("div", "agent-gist agent-preview");
+  appendGistRows(box, gistLines(steps, g, Date.now()));
+  return box;
+}
+
+// One dim row per tool call — the preview and the fold's full list share the rows, so they read alike.
+function appendGistRows(box: HTMLElement, lines: GistLine[]): void {
+  for (const line of lines) {
+    const row = el("div", "agent-gist-row");
+    const t = el("span", "agent-gist-tool"); t.textContent = line.tool; row.appendChild(t);
+    if (line.desc) { const d = el("span", "agent-gist-desc"); d.textContent = line.desc; row.appendChild(d); }
+    if (line.meta) { const m = el("span", "agent-gist-meta"); m.textContent = line.meta; row.appendChild(m); }
+    box.appendChild(row);
+  }
 }
 
 
@@ -4573,8 +4655,9 @@ function renderTabs() {
     tab.dataset.id = id;
     tab.dataset.act = "select";  // click → setActive, via the stable #tabs delegate (./actions), not a per-node handler
     tab.addEventListener("keydown", onTabKey);
-    // drag-to-reorder (synced with the timeline via the shared session-order file)
-    tab.draggable = true;
+    // drag-to-reorder (synced with the timeline via the shared session-order file). A subagent viewer
+    // stays put: it is client-only, and a reorder would post its id into the kernel's order.
+    tab.draggable = !s.sub;
     // Exactly ONE thing on screen may look like the dragged tab (T133, the user 2026-08-27: the
     // native drag image following the pointer PLUS the dimmed in-flow tab read as a ghost
     // duplicate — "not how most softwares show it"). The native image is blanked, and the dimmed
@@ -4677,15 +4760,18 @@ function renderTabs() {
     }
     // Rich hover tooltip (custom DOM — a native title can't colour/bold): backend in its own colour, the
     // full dir path, and mode/model/effort/context each on a line (the user 2026-06-23). See showTabTip.
-    tab.addEventListener("mouseenter", () => showTabTip(tab, s));
-    tab.addEventListener("mouseleave", hideTabTip);
+    if (!s.sub) {   // the rich tip reads a real session's dir/branch/model; a viewer has none of them
+      tab.addEventListener("mouseenter", () => showTabTip(tab, s));
+      tab.addEventListener("mouseleave", hideTabTip);
+    }
     const close = el("span", "tab-close");
     close.textContent = "×";
     // A dead (closed) session has nothing to end, so its ✕ just removes the read-only tab — no
     // "End session?" confirm (the user 2026-06-16). A live session still routes through the host's
-    // Close-tab / End-session confirm (closeSession → confirmClose).
+    // Close-tab / End-session confirm (closeSession → confirmClose). A subagent viewer likewise
+    // just closes (the tabs delegate's close handler routes it by isSubId).
     const dead = st === "closed";
-    close.title = dead ? "Close tab" : "End session";
+    close.title = dead || s.sub ? "Close tab" : "End session";
     // Click-safe (see ./actions): renderTabs() does `#tabs`.replaceChildren() on every kernel push, so a
     // handler hung on this ✕ is destroyed mid-click and the click is dropped (the "had to click End session
     // several times" bug). The action lives on the stable #tabs delegate instead; this node just declares it.
@@ -4695,8 +4781,8 @@ function renderTabs() {
     tab.appendChild(close);
     // double-click a tab to show/hide the ledger overview — same as the strip's caret
     tab.addEventListener("dblclick", (e) => { e.preventDefault(); toggleLedgerCollapsed(); });
-    // right-click → context menu; "Rename" edits the title in place
-    tab.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); showTabMenu(e, id); });
+    // right-click → context menu; "Rename" edits the title in place (not for a viewer: nothing to rename/hide/end)
+    if (!s.sub) tab.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); showTabMenu(e, id); });
     bar.appendChild(tab);
   }
   const add = el("div", "tab tab-add");
@@ -8500,6 +8586,8 @@ function syncViewInner(id: string, atBottom?: boolean): View {
   // non-append sync).
   renderingSid = id;          // so renderSystem can key the pinned card's persisted open-state by session
   renderingOwnerSid = id;     // preview/image URLs bake THIS session's id (host prefix included), never activeId's
+  const subOf = subParts(id);
+  if (subOf) renderingOwnerSid = subOf.parentId;   // …except a subagent VIEWER, whose files belong to its PARENT session
   const v = ensureView(id);
   const s = sessions.get(id);
   if (!s) return v;
@@ -8522,6 +8610,16 @@ function syncViewInner(id: string, atBottom?: boolean): View {
       if (failedRevives.has(id)) {
         ph.textContent = failedRevives.get(id) || "";
         ph.classList.add("tx-revive-failed");
+      } else if (s.sub && s.sub.error) {
+        // the kernel could not open the agent's file: its sentence, loud, in the pane (never a blank)
+        ph.textContent = s.sub.error;
+        ph.classList.add("tx-revive-failed");
+      } else if (s.sub && !s.sub.loaded) {
+        // the viewer's first frame is in flight → the romp loader holds the pane (the wait-state rule)
+        ph.classList.add("tx-starting");
+        ph.appendChild(rompLoaderInner("opening the agent's transcript…"));
+      } else if (s.sub) {
+        ph.textContent = "This agent has written nothing yet.";
       } else if (isProvisionalId(id) && failedProvisionals.has(id)) {
         ph.textContent = "This session couldn't start. What you typed is kept in the box below; "
           + "✕ on the tab discards both.";
@@ -8978,6 +9076,7 @@ function showActive() {
   const s = activeId ? sessions.get(activeId) : null;
   if (!s) {
     for (const v of views.values()) v.el.style.display = "none";
+    renderSubHead();   // no active viewer → the header goes
     // A KNOWN-LOADING tab (its meta arrived, its payload hasn't — the clicked placeholder): the
     // thread area holds the pane-local romp loader, and the first session frame renders in place —
     // you're already there (the user 2026-08-25). Everything else keeps the no-sessions copy.
@@ -9013,10 +9112,15 @@ function showActive() {
     // a FAILED provisional wears the closed treatment on its tab, but its composer stays LIVE: it holds
     // the only copy of what was typed, which must stay editable/copyable (the send path refuses loudly)
     const closed = s.status.state === "closed" && !failedProvisionals.has(activeId!);
-    composer.disabled = closed;
+    const viewer = !!s.sub;   // a SUBAGENT VIEWER is read-only by nature: there is no session behind it to message
+    composer.disabled = closed || viewer;
     composer.placeholder = closed ? "Session closed — read-only" : composerRestingPlaceholder();
     const sendBtn = document.getElementById("composer-send") as HTMLButtonElement | null;
-    if (sendBtn) sendBtn.disabled = closed;   // read-only session → the explicit send button is dead too
+    if (sendBtn) sendBtn.disabled = closed || viewer;   // read-only session/viewer → the explicit send button is dead too
+    // ONE read-only cue for the viewer: the statusline's dim line. The whole message box (input + send)
+    // goes, so the pane never says it twice and the transcript gets the vertical space back.
+    const composerBox = document.getElementById("composer");
+    if (composerBox) composerBox.style.display = viewer ? "none" : "";
   }
   // tint the whole-window border with the active session's identity color
   if (s.color && s.color.bg) document.body.style.setProperty("--active-accent", s.color.bg);
@@ -9037,6 +9141,7 @@ function showActive() {
     v.rendered = 0; v.winStart = 0; v.avgTurnH = undefined; v.stick = true;   // → firstBuild rebuilds the tail, lands at bottom
   }
   for (const [vid, vv] of views) vv.el.style.display = vid === activeId ? "" : "none";
+  renderSubHead();   // the viewer's header above its transcript (hidden for every real session)
   updateStatusline();
   // The transcript BUILD is the only expensive part of a switch. A view already built for the current
   // events renders instantly (cache / incremental); an UNBUILT one (first visit), or a compact view whose
@@ -9667,6 +9772,117 @@ function renderLedger() {
 const bgExpanded = new Set<string>();   // task ids whose details are open
 const bgFoldOpen = new Set<string>();   // session ids whose list is expanded
 const BG_RANK: Record<string, number> = { failed: 3, running: 2, completed: 1 };
+// ── SUBAGENT VIEWER (plans/subagent-transcripts.md, 2026-09-05) ─────────────────────────────────
+// The arrow on an Agent head (or an agent bg-task row) opens the agent's whole transcript as a PEEK tab:
+// a client-only pseudo-session in `sessions`/`order` with id `<parentId>/agent/<agentId>`, fed by the
+// kernel's {type:"subagent"} frames (openSubagent → first frame now, then a re-push whenever the agent's
+// file or liveness moves; closeSubagent stops them). Rendered through the SAME syncView/displayItems/
+// renderEvent path as the chat — Compact transcript, folds, day dividers, all of it — read-only. Peek
+// mechanics are the chat's own: chatVisible() says a viewer is in the lens only when pinned, so
+// assertPeekFor dresses it .tab-peek and pruneSubViews (from setActive) closes it on the next activation.
+function openSubagentView(parentId: string, agentId: string, anchorUuid: string | null): void {
+  const id = subTabId(parentId, agentId);
+  const parent = sessions.get(parentId);
+  const cur = sessions.get(id);
+  if (!cur) {
+    sessions.set(id, {
+      id, name: subLabel(null), color: parent?.color || null, events: [],
+      status: { state: "idle", sinceEpoch: null, backend: "sub" },
+      cwd: parent?.cwd,
+      sub: { parentId, agentId, meta: null, running: false, truncated: false, error: null, loaded: false, anchorUuid },
+    });
+    if (!order.includes(id)) order.push(id);
+    vscodeApi?.postMessage({ type: "openSubagent", id: parentId, agentId });
+  } else if (anchorUuid && cur.sub) cur.sub.anchorUuid = anchorUuid;
+  setActive(id);
+}
+
+function closeSubagentView(id: string): void {
+  const p = subParts(id);
+  if (p) vscodeApi?.postMessage({ type: "closeSubagent", id: p.parentId, agentId: p.agentId });
+  pinnedSubs.delete(id);
+  dismissSession(id, "close");
+}
+
+// Every UNPINNED viewer other than `keep` closes — the peek rule, applied at the one event that ends
+// a peek (an activation), never on a timer. A pinned viewer stays until its ✕.
+function pruneSubViews(keep: string): void {
+  for (const id of Array.from(sessions.keys())) {
+    if (id !== keep && isSubId(id) && !pinnedSubs.has(id)) closeSubagentView(id);
+  }
+}
+
+// A {type:"subagent"} frame: replace the viewer's events in place (the chat's own append/scroll rule
+// via appendActive when it is the active tab — follow the bottom only when already there), refresh the
+// header and the tab label. A frame for a viewer that is no longer open tells the kernel to stop.
+function applySubagentFrame(m: any): void {
+  const parentId = String(m.id || ""), agentId = String(m.agentId || "");
+  if (!parentId || !agentId) return;
+  const id = subTabId(parentId, agentId);
+  const s = sessions.get(id);
+  if (!s || !s.sub) { vscodeApi?.postMessage({ type: "closeSubagent", id: parentId, agentId }); return; }
+  s.sub.loaded = true;
+  s.sub.error = m.error ? String(m.error) : null;
+  s.sub.running = !!m.running;
+  s.sub.truncated = !!m.truncated;
+  if (m.meta && typeof m.meta === "object") s.sub.meta = m.meta as SubMeta;
+  s.name = subLabel(s.sub.meta);
+  if (!s.sub.error) s.events = Array.isArray(m.events) ? (m.events as ChatEvent[]) : [];
+  else s.events = [];
+  renderTabs();
+  if (activeId === id) {
+    const v = views.get(id);
+    const first = !v || v.rendered === 0;   // the pane held the loader/placeholder — this is the FIRST content
+    if (v && s.events.length === 0) { v.rendered = 0; v.stale = true; }   // placeholder → loader/error/empty re-derives
+    // the first content lands at the NEWEST end like a fresh tab (showActive → landActive); every later
+    // frame is an append that keeps the reader's spot (appendActive's follow-only-when-at-bottom rule)
+    if (first) { if (v) { v.stick = true; v.rendered = 0; } showActive(); }
+    else appendActive();
+    renderSubHead();
+  } else {
+    const v = views.get(id);
+    if (v) v.stale = true;
+  }
+}
+
+// The viewer's header, a sticky line above its transcript inside #content: "subagent of <parent> ·
+// <type> · running|finished", the parent name a link back to the Agent tool head (setActive with the
+// head's uuid as the anchor — the chat's own scroll-to-uuid), the pin control, and the "earlier part
+// not shown" note when the kernel cut the tail. Hidden whenever the active tab is a real session.
+function renderSubHead(): void {
+  const content = document.getElementById("content");
+  if (!content) return;
+  let host = document.getElementById("sub-head");
+  const s = activeId ? sessions.get(activeId) : null;
+  if (!s || !s.sub) { if (host) host.remove(); return; }
+  if (!host) { host = el("div", "sub-head"); host.id = "sub-head"; content.insertBefore(host, content.firstChild); }
+  host.replaceChildren();
+  const line = el("div", "sub-head-line");
+  const kicker = el("span", "sub-head-kicker"); kicker.textContent = "subagent of"; line.appendChild(kicker);
+  const parentName = sessions.get(s.sub.parentId)?.name || tabMeta.get(s.sub.parentId)?.name || "its session";
+  const link = el("span", "sub-head-parent");
+  link.dataset.act = "subParent"; link.dataset.sid = s.sub.parentId;
+  if (s.sub.anchorUuid) link.dataset.uuid = s.sub.anchorUuid;
+  link.replaceChildren(...hostNameNodes(parentName, s.sub.parentId));
+  setTip(link, "back to the launch in the parent session");
+  line.appendChild(link);
+  const parts = subHeadParts(s.sub.meta, s.sub.running);
+  const typ = el("span", "sub-head-type"); typ.textContent = "· " + parts.type; line.appendChild(typ);
+  const state = el("span", "sub-head-state " + parts.state); state.textContent = "· " + parts.state; line.appendChild(state);
+  const pin = el("span", "sub-head-pin" + (pinnedSubs.has(s.id) ? " pinned" : ""));
+  pin.dataset.act = "pinSubagent"; pin.dataset.id = s.id;
+  pin.innerHTML = pinIconSvg();
+  pin.setAttribute("role", "button"); pin.tabIndex = 0;
+  setTip(pin, pinnedSubs.has(s.id) ? "kept — click to let this tab close on its own" : "keep this tab");
+  line.appendChild(pin);
+  host.appendChild(line);
+  if (s.sub.truncated && !s.sub.error) {
+    const note = el("div", "sub-head-note");
+    note.textContent = "earlier part not shown";
+    host.appendChild(note);
+  }
+}
+
 function renderBgTasks() {
   const host = document.getElementById("bg-tasks");
   if (!host) return;
@@ -9707,6 +9923,14 @@ function renderBgTasks() {
     rh.dataset.act = "bg-toggle"; rh.dataset.id = t.id;   // the row header toggles; clicks in the detail body don't collapse it
     rh.appendChild(el("span", "bg-dot"));
     const sum = el("span", "bg-sum"); sum.textContent = t.summary || "Background task"; rh.appendChild(sum);
+    if (t.agentId) {
+      // an AGENT row: the same open-transcript arrow the Agent tool head wears (plans/subagent-transcripts.md).
+      // Nested inside the bg-toggle row; the body delegate's closest-[data-act] lookup finds the arrow first,
+      // so a click opens the viewer without toggling the row.
+      const open = agentOpenButton(t.agentId, null, sid);
+      open.classList.add("bg-open-agent");
+      rh.appendChild(open);
+    }
     const st = el("span", "bg-status"); st.textContent = t.status || "running"; rh.appendChild(st);
     if ((t.status || "running") === "running") {
       // Stop this ONE task (the SDK's stop_task control request — the user 2026-08-04). Rides the same
@@ -10904,6 +11128,14 @@ function updateStatusline() {
   }
   if (!s) return;
   sl.replaceChildren();
+  if (s.sub) {
+    // a subagent viewer has no session state, model or context to show — the header above the
+    // transcript says what it is; the statusline just says the pane is read-only
+    const ro = el("span", "sub-status-line");
+    ro.textContent = "read-only · a subagent's transcript";
+    sl.appendChild(ro);
+    return;
+  }
   // Left: the state chip — WORKING gets a sine color-pulse + elapsed timer; idle
   // states get the plain chip (no timer). Right: model + effort · ctx%, always.
   if (s.status.state === "working") {
@@ -11870,6 +12102,13 @@ function setActive(id: string, anchor?: string, anchorT?: number, anchorKind?: s
   // drops it. Before the already-active early-return, so a re-focus of a hidden session re-asserts
   // its peek even when nothing else changes.
   assertPeekFor(id);
+  pruneSubViews(id);   // an unpinned subagent viewer is a peek: any other activation closes it (and its kernel pushes)
+  if (isSubId(id) && !sessions.has(id)) {
+    // a viewer id from the nav trail / a stale state whose tab is gone → reopen it (openSubagentView
+    // lands back here with the pseudo-session in place)
+    const p = subParts(id);
+    if (p) { openSubagentView(p.parentId, p.agentId, null); return; }
+  }
   if (activeId === id && anchor == null && anchorT == null) return; // already active, nothing to do
   navHist.record();   // every real navigation records the spot being LEFT (the user 2026-08-14: Ctrl+M / Ctrl+, walk the trail)
   closeMetaMenu(); // an open model/effort menu targets the tab we're leaving
@@ -12528,6 +12767,7 @@ window.addEventListener("message", (e: MessageEvent) => {
   else if (m.type === "chatTail") chatTail(m);
   else if (m.type === "chatHead") chatHead(m);
   else if (m.type === "chatEpisode") chatEpisode(m);
+  else if (m.type === "subagent") applySubagentFrame(m);
   else if (m.type === "update") update(m);
   else if (m.type === "status") statusOnly(m);
   else if (m.type === "focus") {
@@ -13787,6 +14027,23 @@ setupSettings();
     document.addEventListener("click", dismiss);
   });
   delegate(document.body, {
+    // Subagent transcripts (plans/subagent-transcripts.md): the arrow on an Agent head / agent bg row
+    // opens the viewer; the viewer header's parent link jumps back to the tool head; its pin keeps the tab.
+    openSubagent: (el) => {
+      const agentId = el.dataset.agent; if (!agentId) return;
+      const owner = el.dataset.sid || activeId; if (!owner) return;
+      openSubagentView(owner, agentId, el.dataset.uuid || null);
+    },
+    subParent: (el) => {
+      const sid = el.dataset.sid; if (!sid) return;
+      setActive(sid, el.dataset.uuid || undefined);
+    },
+    pinSubagent: (el) => {
+      const id = el.dataset.id; if (!id) return;
+      if (pinnedSubs.has(id)) pinnedSubs.delete(id); else pinnedSubs.add(id);
+      assertPeekFor(id);   // pinned → in the chat lens → sheds the peek dress; unpinned → back to a peek
+      renderSubHead();
+    },
     openFolder: (el) => {
       const cwd = el.dataset.cwd; if (!cwd || !vscodeApi) return;
       const id = el.dataset.id;
@@ -13979,6 +14236,7 @@ setupSettings();
     select: (el) => { const id = el.dataset.id; if (id) { setActive(id); focusActiveTab(); } },
     close: (el) => {
       const id = el.dataset.id;
+      if (id && isSubId(id)) { closeSubagentView(id); return; }   // a subagent viewer: nothing to end, just close
       if (!id || !vscodeApi) return;
       // dead → just drop the read-only tab (optimistically too: it's the same kernel round-trip to wait
       // on). A failed provisional is local-only — the kernel never knew its id, so nothing to post.
