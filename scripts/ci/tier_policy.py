@@ -23,6 +23,10 @@ to the PR's created_at."""
 import re
 
 TIERS = ("docs", "fix", "feature", "major-feature")
+# TRANSITION (2026-09-07): `docs` is `tests-only` renamed; until the label itself is renamed on the
+# upstream, PRs still carry the old name. It reads as `docs` here and in the label check, so nothing
+# is stranded between this landing and the rename. Drop the alias once the label is renamed.
+TIER_ALIASES = {"tests-only": "docs"}
 MAINTAINER_PERMS = ("write", "admin", "maintain")
 SEVEN_DAYS = 7 * 86400
 _ISSUE_REF = re.compile(r"(?:^|[^\w/])#(\d+)\b|github\.com/romp-on/romp/issues/(\d+)\b")
@@ -89,7 +93,7 @@ def _linked_issue_discussed(pr):
 
 
 def evaluate(pr):
-    labels = [l for l in (pr.get("labels") or []) if l in TIERS]
+    labels = [TIER_ALIASES.get(l, l) for l in (pr.get("labels") or []) if TIER_ALIASES.get(l, l) in TIERS]
     if len(labels) != 1:
         return {"conclusion": "failure", "title": "Tier policy: %d tier labels" % len(labels),
                 "summary": "Exactly one tier label is required (docs, fix, feature, major-feature); this PR carries %d."
@@ -106,9 +110,6 @@ def evaluate(pr):
             return {"conclusion": "failure", "title": "Tier policy: docs",
                     "summary": "The docs tier is documentation only (docs/** or *.md, never .github/** or "
                                "scripts/**); these files are not: %s. Pick another tier." % ", ".join(bad)}
-        if touches_github:
-            return {"conclusion": "failure", "title": "Tier policy: docs",
-                    "summary": "A PR touching .github/ needs an approval regardless of tier."}
         return {"conclusion": "success", "title": "Tier policy: docs",
                 "summary": "Documentation only; merges on green."}
 

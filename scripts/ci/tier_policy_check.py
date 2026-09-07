@@ -46,13 +46,16 @@ def _req(method, path, token, body=None):
         return (json.loads(txt) if txt else None), r.headers
 
 
-def _get_all(path, token):
+def _get_all(path, token, key=None):
+    """Every page of a list endpoint. `key` names the list inside an OBJECT-shaped response - the
+    check-runs endpoint returns {"total_count", "check_runs": [...]} (the review's catch: extending
+    with the dict itself produced its two key strings and crashed every run before a verdict)."""
     out, url = [], path if path.startswith("http") else API + path
     sep = "&" if "?" in url else "?"
     url += sep + "per_page=100"
     while url:
         page, hdrs = _req("GET", url, token)
-        out.extend(page)
+        out.extend(page[key] if key else page)
         m = re.search(r'<([^>]+)>;\s*rel="next"', hdrs.get("Link", "") or "")
         url = m.group(1) if m else None
     return out
@@ -74,7 +77,7 @@ def build_record(repo, number, token, now=None):
         except urllib.error.HTTPError:
             perms[u] = "none"                     # not a collaborator: never an approver
     runs = _get_all("/repos/%s/commits/%s/check-runs?check_name=%s"
-                    % (repo, head, urllib.parse.quote(CHECK_NAME)), token)
+                    % (repo, head, urllib.parse.quote(CHECK_NAME)), token, key="check_runs")
     starts = [_iso(r.get("started_at")) for r in runs if r.get("started_at")]
     first_check_at = min(starts) if starts else None
     issues = {}

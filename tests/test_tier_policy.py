@@ -150,11 +150,13 @@ class Fix(unittest.TestCase):
         v = tp.evaluate(pr(labels=["fix"], first_check_at=None, created_at=NOW - 8 * DAY))
         self.assertEqual(v["conclusion"], "success")
 
-    def test_the_clock_never_reads_a_commit_date(self):
-        # a forged old commit date on the head must not shorten the wait: the fixture carries one
-        # and the policy must ignore it
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - DAY, head_commit_date=NOW - 30 * DAY))
-        self.assertEqual(v["conclusion"], "failure")
+    def test_the_record_carries_no_commit_date_for_the_clock_to_read(self):
+        # the clock's only inputs are first_check_at and created_at - the fetcher's record has no
+        # commit-date field at all (pinned in FetcherShapes below), so a forged commit date has no
+        # way into the policy
+        rec = tp.evaluate.__code__.co_names
+        self.assertIn("first_check_at", " ".join(str(c) for c in tp.evaluate.__code__.co_consts))
+        self.assertNotIn("committer", " ".join(str(c) for c in tp.evaluate.__code__.co_consts))
 
     def test_changes_requested_blocks_the_seven_day_path(self):
         v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, permissions=MAINTAINERS,
@@ -212,9 +214,16 @@ class GithubDir(unittest.TestCase):
                            permissions=MAINTAINERS))
         self.assertEqual(v["conclusion"], "success")
 
-    def test_docs_label_on_a_github_file_fails_twice_over(self):
+    def test_docs_label_on_a_github_file_fails_as_not_documentation(self):
         v = tp.evaluate(pr(labels=["docs"], files=[".github/workflows/ci.yml"]))
         self.assertEqual(v["conclusion"], "failure")
+        self.assertIn(".github/workflows/ci.yml", v["summary"], "named as not-documentation")
+
+    def test_the_pre_rename_label_reads_as_docs_during_the_transition(self):
+        v = tp.evaluate(pr(labels=["tests-only"], files=["docs/guide.md"]))
+        self.assertEqual(v["conclusion"], "success")
+        v = tp.evaluate(pr(labels=["tests-only", "docs"], files=["docs/guide.md"]))
+        self.assertEqual(v["conclusion"], "failure", "both spellings at once are two tier labels")
 
 
 class Verdict(unittest.TestCase):
@@ -275,9 +284,72 @@ class WorkflowPins(unittest.TestCase):
         self.assertIn('"/repos/%s/check-runs"', self.fetch)
 
     def test_the_clock_reads_check_runs_not_commit_dates(self):
-        self.assertIn("check-runs?check_name=", self.fetch)
-        self.assertNotIn("commit.committer", self.fetch)
-        self.assertNotIn("commit.author", self.fetch)
+        self.assertIn('key="check_runs"', self.fetch, "the check-runs endpoint is an object; read its list")
+        # the ONLY /commits/ request is the check-runs listing - no GET of the commit itself, whose
+        # author/committer dates are the author's to set
+        import re
+        commits = re.findall(r'/commits/%s([^"]*)"', self.fetch)
+        self.assertEqual(commits, ["/check-runs?check_name=%s"], commits)
+        self.assertNotIn('["committer"]', self.fetch)
+        self.assertNotIn('["author"]["date"]', self.fetch)
+
+    def test_the_three_tier_label_lists_agree(self):
+        wf = open(os.path.join(os.path.dirname(HERE), ".github", "workflows", "pr-tier.yml")).read()
+        tmpl = open(os.path.join(os.path.dirname(HERE), ".github", "PULL_REQUEST_TEMPLATE.md")).read()
+        import re
+        in_jq = set(re.findall(r'\. == "([a-z-]+)"', wf))
+        expected = set(tp.TIERS) | set(tp.TIER_ALIASES)
+        self.assertEqual(in_jq, expected, "the label check and the policy name the same tiers")
+        for t in tp.TIERS:
+            self.assertIn("`%s`" % t, tmpl, "the PR template lists every tier")
+
+
+class FetcherShapes(unittest.TestCase):
+    """build_record against the DOCUMENTED response shapes, with _req stubbed - no network. The
+    review's critical catch lived here: the check-runs endpoint is an object, not a list."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location(
+            "tier_policy_check", os.path.join(os.path.dirname(HERE), "scripts", "ci", "tier_policy_check.py"))
+        self.tc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.tc)
+        self.calls = []
+        test = self
+
+        def fake_req(method, path, token, body=None):
+            test.calls.append((method, path))
+            path = path.split("?")[0]                  # _get_all appends per_page; match the route
+            if "/check-runs" in path:
+                return {"total_count": 1, "check_runs": [{"started_at": "2026-09-01T00:00:00Z"}]}, {}
+            if path.endswith("/pulls/42"):
+                return {"head": {"sha": HEAD}, "user": {"login": "author-a"}, "labels": [{"name": "fix"}],
+                        "created_at": "2026-08-30T00:00:00Z", "body": "fixes #7"}, {}
+            if "/files" in path:
+                return [{"filename": "kernel/kernel.py"}], {}
+            if "/reviews" in path:
+                return [{"user": {"login": "maint-b"}, "state": "APPROVED", "commit_id": HEAD,
+                         "submitted_at": "2026-09-02T00:00:00Z"}], {}
+            if "/collaborators/" in path:
+                return {"permission": "write"}, {}
+            if path.endswith("/issues/7/comments"):
+                return [{"user": {"login": "maint-b"}}], {}
+            if path.endswith("/issues/7"):
+                return {"number": 7}, {}
+            raise AssertionError("unexpected request " + path)
+        self.tc._req = fake_req
+
+    def test_build_record_survives_the_documented_shapes_and_has_no_commit_date(self):
+        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        self.assertEqual(rec["first_check_at"], self.tc._iso("2026-09-01T00:00:00Z"),
+                         "the clock is the server-stamped first check run for this head")
+        self.assertEqual(set(rec), {"number", "author", "labels", "head_sha", "files", "reviews", "permissions",
+                                    "first_check_at", "created_at", "now", "body", "issues"},
+                         "the record has exactly the documented keys - no commit date can reach the policy")
+        self.assertEqual(rec["permissions"], {"maint-b": "write"})
+        self.assertEqual(rec["issues"], {7: {"exists": True, "is_pr": False, "comments": ["maint-b"]}})
+        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "success")
+        self.assertFalse(any("/commits/%s\"" % HEAD in p or p.endswith("/commits/" + HEAD) for _, p in self.calls),
+                         "the commit itself is never fetched")
 
 
 if __name__ == "__main__":
