@@ -1714,13 +1714,21 @@ case "${1:-}" in
                    RA_PPID="$PPID" \
                    RA_PARENT="$(ps -o command= -p "$PPID" 2>/dev/null | head -1)" \
                    RA_TTY="$(tty 2>/dev/null || true)" \
-                   RA_SID="$_ra_sid" RA_NAME="$_ra_name" \
+                   RA_SID="$_ra_sid" RA_NAME="$_ra_name" RA_WHEN="${2:-}" \
+                   RA_SHA="$(git -C "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)" rev-parse --short=8 HEAD 2>/dev/null || true)" \
                    python3 - >> "$_ra_dir/restart-audit.jsonl" <<'PYEOF'
 import json, os, time
-print(json.dumps({"t": int(time.time()), "ppid": int(os.environ.get("RA_PPID") or 0),
-                  "parent": os.environ.get("RA_PARENT") or "", "sid": os.environ.get("RA_SID") or "",
-                  "name": os.environ.get("RA_NAME") or "", "tty": os.environ.get("RA_TTY") or "",
-                  "tmux": os.environ.get("TMUX_PANE") or ""}))
+row = {"t": int(time.time()), "ppid": int(os.environ.get("RA_PPID") or 0),
+       "parent": os.environ.get("RA_PARENT") or "", "sid": os.environ.get("RA_SID") or "",
+       "name": os.environ.get("RA_NAME") or "", "tty": os.environ.get("RA_TTY") or "",
+       "tmux": os.environ.get("TMUX_PANE") or ""}
+if os.environ.get("RA_WHEN") == "--quiet":
+    # a PARKED restart: the kernel's drift check reads when + sha to stand down for it (T240d) —
+    # without them an immediate converge pre-empted the quiet window this flag asked for
+    row["when"] = "quiet"
+    if os.environ.get("RA_SHA"):
+        row["sha"] = os.environ["RA_SHA"]
+print(json.dumps(row))
 PYEOF
                } 2>/dev/null || true
                "${ROMP_POSTAL_BIN:-romp-postal-service}" restart >/dev/null 2>&1 || true

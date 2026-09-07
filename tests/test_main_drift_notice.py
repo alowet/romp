@@ -234,6 +234,168 @@ class DriftWiring(unittest.TestCase):
             km._STARTED = started
             audit.unlink()
 
+    def test_a_parked_quiet_deploy_for_the_checkouts_sha_stands_the_converge_down(self):
+        # T240d: a peer's p2p apply advanced the checkout and parked a QUIET restart at the manager;
+        # the drift check then saw the checkout ahead of the kernel and posted an IMMEDIATE
+        # restart-all — 16:23Z quiet park, 16:27Z converge/now, ten sessions cut — so the quiet
+        # window the peer asked for never ran. The restart is already on its way: stand down, once,
+        # keyed on the ledger row and its consumption (the row expires with the far manager's
+        # backstop, the same bound a pending quiet request already has for cut attribution).
+        import contextlib, io, json, time
+        now = time.time()
+        audit = km.jd.STATE / "restart-audit.jsonl"
+        ran = []
+        saved = (km._update_mode, km._origin_main_sha, km._checkout_sha, km._kernel_sha,
+                 km._run_main_update, km._LAST_AUTO_CONVERGE[0], km._MAIN_DRIFT[0], km._MAIN_DRIFT[1],
+                 km._kernel_code_changed, km._QUIET_PARKED_LOGGED[0], km._CONVERGE_COOLDOWN_S)
+        km._update_mode = lambda: "auto"
+        km._kernel_code_changed = lambda a, b: True
+        km._CONVERGE_COOLDOWN_S = 0.0      # isolate the stand-down: the cool-down is T240's own gate
+        km._run_main_update = lambda kind, immediate=False: ran.append(kind)
+        km._checkout_sha = lambda: "f3dc387a" + "0" * 32
+        km._origin_main_sha = km._checkout_sha
+        km._kernel_sha = lambda: "aaaaaaaa" + "0" * 32
+
+        def check():
+            km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
+            km._LAST_AUTO_CONVERGE[0] = 0.0
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                km._main_drift_check()
+            return err.getvalue()
+
+        try:
+            km._QUIET_PARKED_LOGGED[0] = ""
+            if km.RESTART_CUTS_FILE.exists():
+                km.RESTART_CUTS_FILE.unlink()
+            # the 16:23Z shape: checkout ahead of the kernel, a quiet p2p row for the checkout's sha
+            audit.write_text(json.dumps({"t": int(now - 240), "action": "p2p-update",
+                                         "reason": "from TESTHOST to f3dc387a", "when": "quiet"}) + "\n")
+            out = check()
+            self.assertEqual(ran, [], "a quiet deploy for this very code is parked: the converge stands down")
+            self.assertIn("already parked as a quiet deploy", out, "one line says why nothing happened")
+            self.assertEqual(km._MAIN_DRIFT[1], "", "the sha is not marked acted on — the next pass re-evaluates")
+            self.assertNotIn("already parked", check(), "…but says it once per sha, not once per pass")
+            self.assertEqual(ran, [])
+            # the 08:42Z shape: origin reads ahead of the checkout too (a stale fetch, or a merge
+            # that landed meanwhile) — the parked restart still delivers the code on disk first;
+            # one restart, not two, and the pull follows on the next pass after it lands
+            km._origin_main_sha = lambda: "bbbbbbbb" + "0" * 32
+            check()
+            self.assertEqual(ran, [], "a pull does not pre-empt the parked quiet deploy either")
+            km._origin_main_sha = km._checkout_sha
+            # CONSUMED: the cut row that landed the quiet deploy joined the row — nothing is parked
+            km.RESTART_CUTS_FILE.write_text(json.dumps({"t": int(now - 30), "reason": "p2p-update: from TESTHOST to f3dc387a",
+                                                        "cutTurns": [], "auditT": int(now - 240)}) + "\n")
+            check()
+            self.assertEqual(ran, ["restart"], "a consumed row parks nothing: the converge proceeds as today")
+            km.RESTART_CUTS_FILE.unlink()
+            # a quiet row for a DIFFERENT sha: not this code — proceeds
+            ran.clear()
+            audit.write_text(json.dumps({"t": int(now - 240), "action": "p2p-update",
+                                         "reason": "from TESTHOST to 99999999", "when": "quiet"}) + "\n")
+            check()
+            self.assertEqual(ran, ["restart"], "a quiet deploy of other code is not this converge")
+            # an IMMEDIATE p2p row (the no-owning-manager fallback): nothing is parked — proceeds
+            ran.clear()
+            audit.write_text(json.dumps({"t": int(now - 240), "action": "p2p-update",
+                                         "reason": "from TESTHOST to f3dc387a (immediate: no owning manager)"}) + "\n")
+            check()
+            self.assertEqual(ran, ["restart"], "an immediate request parks nothing")
+            # a quiet row older than the far manager's backstop bound: the park is gone (its manager
+            # died with it) — the converge proceeds rather than waiting forever
+            ran.clear()
+            audit.write_text(json.dumps({"t": int(now - km.RESTART_EXPECT_MAX_S - 30), "action": "p2p-update",
+                                         "reason": "from TESTHOST to f3dc387a", "when": "quiet"}) + "\n")
+            check()
+            self.assertEqual(ran, ["restart"], "past the backstop bound nothing can still be parked")
+            # a QUIET converge row from the explicit immediate=False door carries the sha it deploys:
+            # parked too (no production caller passes immediate=False today; the CLI door is below)
+            ran.clear()
+            km._QUIET_PARKED_LOGGED[0] = ""
+            audit.write_text(json.dumps({"t": int(now - 60), "action": "main-converge", "tag": "restart",
+                                         "when": "quiet", "sha": "f3dc387a" + "0" * 32}) + "\n")
+            check()
+            self.assertEqual(ran, [], "a quiet local converge for this sha is parked the same way")
+            # …a legacy quiet converge row without a sha cannot be matched: proceeds (never guesses)
+            audit.write_text(json.dumps({"t": int(now - 60), "action": "main-converge", "tag": "restart",
+                                         "when": "quiet"}) + "\n")
+            check()
+            self.assertEqual(ran, ["restart"], "no sha on the row, no stand-down")
+            # the CLI door (review find): `romp refresh --quiet` writes bin/romp's caller-attribution
+            # row — no action — now with when=quiet and the checkout sha; it parks the same way
+            ran.clear()
+            km._QUIET_PARKED_LOGGED[0] = ""
+            audit.write_text(json.dumps({"t": int(now - 60), "ppid": 4242, "parent": "bash", "sid": "", "name": "",
+                                         "tty": "/dev/pts/0", "tmux": "", "when": "quiet", "sha": "f3dc387a"}) + "\n")
+            check()
+            self.assertEqual(ran, [], "a quiet CLI refresh for this sha is a parked deploy too")
+            # a busy box (review find): fifty session self-closes write fifty end-on-idle rows after
+            # the quiet row — the reader walks past them; the park is still live
+            ran.clear()
+            audit.write_text(json.dumps({"t": int(now - 240), "action": "p2p-update",
+                                         "reason": "from TESTHOST to f3dc387a", "when": "quiet"}) + "\n"
+                             + "".join(json.dumps({"t": int(now - 200 + i), "action": "end-on-idle", "sid": "s%d" % i}) + "\n"
+                                       for i in range(50)))
+            check()
+            self.assertEqual(ran, [], "fifty no-restart rows do not hide a live park")
+            # LANDED, cut row lost (review find): the kernel already runs the checkout, the row is still
+            # unconsumed — nothing is owed, so a pull must not wait on it (and says nothing about a park)
+            ran.clear()
+            km._QUIET_PARKED_LOGGED[0] = ""
+            audit.write_text(json.dumps({"t": int(now - 240), "action": "p2p-update",
+                                         "reason": "from TESTHOST to f3dc387a", "when": "quiet"}) + "\n")
+            km._kernel_sha = km._checkout_sha
+            km._origin_main_sha = lambda: "bbbbbbbb" + "0" * 32
+            out = check()
+            self.assertEqual(ran, ["pull"], "the parked restart already delivered: the pull proceeds")
+            self.assertNotIn("already parked", out)
+            km._kernel_sha = lambda: "aaaaaaaa" + "0" * 32
+            km._origin_main_sha = km._checkout_sha
+            # a stand-down that ENDS without landing (the row expired: the park died with its manager)
+            # says so once, then the converge proceeds on its own terms (review find: silent expiry)
+            ran.clear()
+            km._QUIET_PARKED_LOGGED[0] = ""
+            check()
+            self.assertEqual(ran, [], "parked again")
+            audit.write_text(json.dumps({"t": int(now - km.RESTART_EXPECT_MAX_S - 30), "action": "p2p-update",
+                                         "reason": "from TESTHOST to f3dc387a", "when": "quiet"}) + "\n")
+            out = check()
+            self.assertEqual(ran, ["restart"])
+            self.assertIn("no longer pending", out, "the end of a stand-down is said, not silent")
+            self.assertNotIn("no longer pending", check(), "…once")
+        finally:
+            (km._update_mode, km._origin_main_sha, km._checkout_sha, km._kernel_sha,
+             km._run_main_update) = saved[:5]
+            km._LAST_AUTO_CONVERGE[0] = saved[5]
+            km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = saved[6], saved[7]
+            km._kernel_code_changed, km._QUIET_PARKED_LOGGED[0] = saved[8], saved[9]
+            km._CONVERGE_COOLDOWN_S = saved[10]
+            audit.unlink()
+            if km.RESTART_CUTS_FILE.exists():
+                km.RESTART_CUTS_FILE.unlink()
+
+    def test_the_quiet_deploy_rows_carry_what_the_stand_down_reads(self):
+        # T240d pins on the writers: the p2p apply's quiet audit row lands right after the reset that
+        # advances the checkout — BEFORE the owner check, whose manager status call is the window a
+        # drift pass could hit between "checkout ahead" and "row on disk" — and the local converge's
+        # row carries the sha it deploys, so a quiet `romp refresh` is matched, not guessed at
+        ksrc = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
+        reset = ksrc.index("reset --hard %s >/dev/null 2>&1 || {")
+        row = ksrc.index("\\'action\\':\\'p2p-update\\',")     # the shell script's escaped spelling
+        owned = ksrc.index("'OWNED=0; if command -v node")
+        self.assertLess(reset, row, "the row says the checkout IS at the sha: it follows the reset")
+        self.assertLess(row, owned, "and precedes the owner check, so the drift check sees it at once")
+        self.assertIn('_audit_restart_request("main-converge", tag=kind, when=("now" if immediate else "quiet"),\n'
+                      '                               sha=', ksrc,
+                      "the converge row names the sha it deploys")
+        # the CLI door: bin/romp's own caller-attribution row says when=quiet and names the checkout
+        # sha under --quiet (behavior pinned in tests/romp-refresh-audit.bats; the spelling here)
+        rsrc = open(os.path.join(os.path.dirname(HERE), "bin", "romp")).read()
+        self.assertIn('RA_WHEN="${2:-}"', rsrc)
+        self.assertIn('if os.environ.get("RA_WHEN") == "--quiet":\n    # a PARKED restart', rsrc)
+        self.assertIn('row["when"] = "quiet"', rsrc)
+
     def test_the_parent_watch_stands_down_under_a_graceful_term(self):
         # behavioral (review find: the source-order pin executed nothing): the manager is gone —
         # with the graceful term running the watchdog returns; without it, it exits the kernel
