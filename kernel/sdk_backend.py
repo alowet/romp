@@ -1490,6 +1490,809 @@ def acct_digest() -> str:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# API health — the GET /api-health signal (docs/reference.md, "The API-health signal").
+#
+# One aggregate view of how the API is treating the sessions this kernel runs, computed from frames the
+# backend already parses (SdkSession._on_message): the per-attempt `api_retry` SystemMessage, the
+# per-response AssistantMessage (one `ok` per distinct message_id) and the ResultMessage that settles a
+# turn the CLI gave up on (api_error_status). Events land in ONE in-memory ring keyed by
+# (auth-source label, model family); every window count and the thrash/degraded/recovering state are
+# computed from that ring when the route is read — no background tick, no derived-at stamp to go stale
+# (the kernel has had a pusher thread die quietly before). The state is derived from the ring AND the
+# last persisted (state, stateSince) — the hysteresis needs a memory the ring alone does not hold once a
+# storm has slid past the windows — and from nothing else. Only STATE TRANSITIONS a read observes are
+# written to disk (STATE/api-health.json: the per-bucket state plus a bounded transition tail, rewritten
+# whole and atomically on each), so the history survives a restart while the per-request events do not:
+# persisting every attempt would add a write per API call for a window that empties itself in 17
+# minutes, and a restart already announces itself through bootId/complete — every bucket comes back
+# `unknown` (an empty ring is no evidence) with its transitions continuous across the boot.
+#
+# What is deliberately NOT here: probes, actions, hooks, error text, paths, key material. The kernel
+# publishes what it observed; a consumer reads the signal and applies its own policy.
+#
+# Scope (v1): the MAIN THREAD of each session only, symmetrically. A subagent's retries never reach the
+# SDK as api_retry frames (the CLI folds them into a tool_progress frame the SDK discards), while its
+# tool-calling responses DO arrive as AssistantMessages tagged parent_tool_use_id — counting those `ok`s
+# without their retries would dilute every rate during exactly the storm this exists to see. So `ok`
+# requires parent_tool_use_id is None and api_retry is main-thread by construction; the payload says so
+# (coverage.sidechainExcluded). tmux-backed sessions and judge subprocesses have no SDK stream and are
+# outside the signal.
+#
+# `rate429` is an ATTEMPT share, not a request share: one stuck turn contributes up to max_retries
+# attempts. The payload names the basis (rate429Basis) and reports distinct sessions/turns retrying
+# beside the attempt counts so a reader can tell one stuck session from a saturated key.
+#
+# Note for anyone reading a storm on a machine with CLAUDE_CODE_RETRY_WATCHDOG's persistent-retry mode set:
+# that mode re-emits one api_retry frame per ~30 s for the SAME attempt, so `retries` would overcount
+# attempts there. Unset on the machine this was built on; a reader on such a machine should lean on
+# sessionsRetrying/turnsRetrying.
+# ---------------------------------------------------------------------------
+
+API_HEALTH_SCHEMA = 1
+API_HEALTH_STATE_FILE = "api-health.json"   # STATE/… — per-bucket (state, stateSince, …) + the transition tail; rewritten whole on each transition
+API_HEALTH_SALT_FILE = "api-health-salt"    # STATE/… — the per-install label salt (0600); EMPTY file = unsalted
+API_HEALTH_TRANSITIONS_KEEP = 50            # transitions kept, newest last
+
+# The constants, in one place, with defaults backtested against one rate-limit incident on one machine
+# (re-check them against the next). Each is overridable for tests through ROMP_API_HEALTH_<NAME>; the
+# payload echoes the values in force under `config` so a reader can recompute the state from the windows.
+_API_HEALTH_DEFAULTS = {
+    "windows": (60, 300, 900),   # fast / mid / slow, seconds; slow + holdS is the ring's retention
+    "minRequests": 10,           # a window with fewer attempts decides nothing
+    "fastMinRequests": 20,       # the 60 s path needs more: near a cap one request's outcome is random
+    "enter429": 0.20, "enter429Slow": 0.15, "enter429Fast": 0.50, "exit429": 0.10,
+    "enter5xx": 0.20, "enter5xxSlow": 0.15, "enter5xxFast": 0.50, "exit5xx": 0.10,
+    "holdS": 120,                # exit must hold this long → recovering, and this long again → healthy
+}
+_API_HEALTH_ENV = {
+    "windows": "WINDOWS", "minRequests": "MIN_REQUESTS", "fastMinRequests": "FAST_MIN_REQUESTS",
+    "enter429": "ENTER_429", "enter429Slow": "ENTER_429_SLOW", "enter429Fast": "ENTER_429_FAST",
+    "exit429": "EXIT_429", "enter5xx": "ENTER_5XX", "enter5xxSlow": "ENTER_5XX_SLOW",
+    "enter5xxFast": "ENTER_5XX_FAST", "exit5xx": "EXIT_5XX", "holdS": "HOLD_S",
+}
+
+
+def api_health_config() -> dict:
+    """The constants in force: the defaults above, each replaced by ROMP_API_HEALTH_<NAME> when set
+    (tests). Read fresh per call — a cached read would outlive a test's env change. A malformed
+    override is ignored, never a crash in a message handler."""
+    cfg = dict(_API_HEALTH_DEFAULTS)
+    for key, env in _API_HEALTH_ENV.items():
+        raw = os.environ.get("ROMP_API_HEALTH_" + env)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            if key == "windows":
+                ws = tuple(sorted({int(x) for x in raw.split(",") if x.strip()}))
+                if ws and all(w > 0 for w in ws):
+                    cfg[key] = ws
+            elif key in ("minRequests", "fastMinRequests", "holdS"):
+                cfg[key] = int(raw)
+            else:
+                cfg[key] = float(raw)
+        except ValueError:
+            pass
+    # the slow window at (asOf - holdS) reaches back holdS + slow seconds: exactly what the exit hold
+    # needs and nothing more (1020 s at the defaults; the ring is memory only)
+    cfg["retentionS"] = max(cfg["windows"]) + cfg["holdS"]
+    return cfg
+
+
+def model_family(raw) -> str:
+    """The model FAMILY a rate limit is scoped to: 'claude-fable-5-1', 'claude-fable-5' and
+    'us.anthropic.claude-fable-5-…' are all `fable`. re.search, not pretty_model's anchored re.match,
+    so a Bedrock/Vertex id lands in its family rather than one 'other' bucket. The pretty badge form
+    ('Fable 5', the session's display model) is accepted too for the retry-attribution fallback.
+    '' → 'unknown' (nothing learned yet); a non-empty id matching nothing → 'other'."""
+    s = str(raw or "").strip()
+    if not s:
+        return "unknown"
+    m = re.search(r"claude-([a-z]+)-(\d+)", s.lower())
+    if m:
+        return m.group(1)
+    m = re.match(r"([A-Za-z]+) \d", s)
+    return m.group(1).lower() if m else "other"
+
+
+def _api_health_digest(salt: str, material: str) -> str:
+    """The label's 12 hex from a credential's identity (`material`: a key's fingerprint, or the account
+    digest) and this install's salt. With a salt, sha256(salt + material)[:12]: a name that means nothing
+    outside this install. With an EMPTY salt, the material's own first 12 hex — the identity the rest
+    of romp already prints for that credential (the key's fingerprint in the kernel log and `romp
+    keyswap`; the account digest the usage bars stamp), so an operator can match a bucket to them."""
+    if not salt:
+        return material[:12]
+    return hashlib.sha256((salt + material).encode("utf-8")).hexdigest()[:12]
+
+
+def api_health_auth_label(source, *, salt: str, key_fp: str = "", launched_keyed: bool = False,
+                          acct: str = "") -> str:
+    """The bucket's auth-source label from an init's apiKeySource, resolved ONCE per init and cached on
+    the session (never per event: a per-event resolution would run on every session's own thread).
+
+    The label is a SALTED digest — sha256(install salt + material)[:12] — so two sessions on the same
+    key or login share a bucket within this install, while the label is not a cross-machine equality
+    oracle for a key (the account digest the /usage bars use is unsalted by design; this one need not
+    be). An EMPTY salt makes the label the material itself — the fingerprint or account digest the
+    kernel prints elsewhere (_api_health_digest): the salt file is the one switch. No fragment of the
+    key itself is ever in the label — that is the standing rule for every surface. The key's material
+    here is its FINGERPRINT (keysource.fingerprint, recorded at launch as _launched_key_fp), never the
+    key: resolving the key at init time would run a 1Password retrieval per init on a reference-sourced
+    machine, and the fingerprint is the identity the launch already computed.
+
+      login:<12 hex>   apiKeySource absent or 'none' (a subscription login); the material is the
+                       account digest the usage bars already stamp (acct_digest)
+      login:unknown    …with no readable account
+      key:<12 hex>     'ANTHROPIC_API_KEY' where the kernel itself injected the key (_options):
+                       the material is the launched key's fingerprint
+      key:env          'ANTHROPIC_API_KEY' the CLI found some other way (the kernel holds no material)
+      key:helper       'apiKeyHelper' — two accounts behind one helper are one bucket
+      key:managed      '/login managed key'
+      key:<source>     any other source word the CLI enumerates (user, project, temporary, oauth, …),
+                       lowercased and stripped to alphanumerics"""
+    s = str(source or "").strip()
+    low = s.lower()
+    if not s or low == "none":
+        return ("login:" + _api_health_digest(salt, acct)) if acct else "login:unknown"
+    if s == "ANTHROPIC_API_KEY":
+        return ("key:" + _api_health_digest(salt, key_fp)) if (key_fp and launched_keyed) else "key:env"
+    if s == "apiKeyHelper":
+        return "key:helper"
+    if s == "/login managed key":
+        return "key:managed"
+    return "key:" + (re.sub(r"[^a-z0-9]+", "", low)[:16] or "other")
+
+
+def api_health_status_class(status, category="") -> str:
+    """One attempt's outcome class from the wire's error_status (int|None), falling back to its error
+    category string ('overloaded' | 'rate_limit' | 'authentication_failed' | 'server_error' | 'unknown';
+    the AssistantMessage error stamp adds 'billing_error' / 'invalid_request'). Classes: '429' (rate
+    limited), '529' (overloaded), '5xx' (other server error), 'other' (any other status — a 4xx like
+    400/401/404), 'none' (no status at all: the machine's own connectivity, typically)."""
+    st = None
+    if isinstance(status, bool):
+        status = None
+    if isinstance(status, (int, float)):
+        st = int(status)
+    elif isinstance(status, str) and status.strip().isdigit():
+        st = int(status.strip())
+    if st is not None and st > 0:
+        if st == 429:
+            return "429"
+        if st == 529:
+            return "529"
+        if 500 <= st <= 599:
+            return "5xx"
+        return "other"
+    cat = str(category or "").strip().lower()
+    if cat == "rate_limit":
+        return "429"
+    if cat == "overloaded":
+        return "529"
+    if cat == "server_error":
+        return "5xx"
+    if cat in ("authentication_failed", "billing_error", "invalid_request"):
+        return "other"
+    return "none"
+
+
+class AhEvent(tuple):
+    """One API event in the ring: (t, auth, family, kind, cls, status, sid, turn, category).
+    kind: 'ok' (a response), 'retry' (one api_retry attempt), 'gaveup' (the turn's final failed
+    attempt, from the settle). cls: api_health_status_class for the failures, 'ok' for a response.
+    category: the wire's error category string ('rate_limit', 'overloaded', …; '' when none) — it
+    rides lastError, never the counters (cls is the counter)."""
+    __slots__ = ()
+
+    def __new__(cls, t, auth, family, kind, klass, status=None, sid="", turn=0, category=""):
+        return tuple.__new__(cls, (float(t), str(auth), str(family), str(kind), str(klass),
+                                   status, str(sid), int(turn), str(category or "")))
+
+    t = property(lambda s: s[0])
+    auth = property(lambda s: s[1])
+    family = property(lambda s: s[2])
+    kind = property(lambda s: s[3])
+    cls = property(lambda s: s[4])
+    status = property(lambda s: s[5])
+    sid = property(lambda s: s[6])
+    turn = property(lambda s: s[7])
+    category = property(lambda s: s[8])
+
+
+_AH_COUNTED = ("ok", "429", "529", "5xx", "other")   # the `requests` denominator; 'none' is outside it
+
+
+def _ah_rates(c: dict) -> tuple:
+    """(requests, rate429, rate5xx) from a class-count dict; rates are None at zero requests."""
+    n = sum(c.get(k, 0) for k in _AH_COUNTED)
+    if not n:
+        return 0, None, None
+    return n, c.get("429", 0) / n, (c.get("529", 0) + c.get("5xx", 0)) / n
+
+
+def api_health_counts(events, now: float, window: int, uptime_s=None) -> dict:
+    """One window's counters over `events` (AhEvent), for (now - window, now]. `requests` is the
+    attempt count with a status (ok + the four failure classes); noStatus and gaveUp sit outside that
+    sum — a give-up IS already one of the status counters (the exhausting attempt emits no api_retry
+    frame, so the settle is the only place it can be counted). sessionsRetrying / turnsRetrying are
+    distinct sids / (sid, turn) pairs with at least one api_retry attempt in the window — the
+    request-level companions to the attempt-level rate. `complete` is false while the window is longer
+    than this kernel has been up: the counts are right for what was observed, the window is shorter
+    than its name."""
+    lo = now - window
+    c = {}
+    retries = gave_up = 0
+    sids, turns = set(), set()
+    for e in events:
+        if not (lo < e.t <= now):
+            continue
+        if e.kind == "ok":
+            c["ok"] = c.get("ok", 0) + 1
+            continue
+        c[e.cls] = c.get(e.cls, 0) + 1
+        if e.kind == "retry":
+            retries += 1
+            sids.add(e.sid)
+            turns.add((e.sid, e.turn))
+        elif e.kind == "gaveup":
+            gave_up += 1
+    n, r429, r5xx = _ah_rates(c)
+    return {"complete": True if uptime_s is None else bool(uptime_s >= window),
+            "requests": n, "ok": c.get("ok", 0),
+            "rateLimited": c.get("429", 0), "overloaded": c.get("529", 0),
+            "serverErrors": c.get("5xx", 0), "otherErrors": c.get("other", 0),
+            "noStatus": c.get("none", 0), "gaveUp": gave_up,
+            "retries": retries, "sessionsRetrying": len(sids), "turnsRetrying": len(turns),
+            "rate429": None if r429 is None else round(r429, 4),
+            "rate5xx": None if r5xx is None else round(r5xx, 4)}
+
+
+API_HEALTH_SEVERITY = {"unknown": 0, "healthy": 1, "recovering": 2, "degraded": 3, "thrashing": 4}
+API_HEALTH_RESTART_WHY = "kernel restarted: the event ring is empty"
+
+
+def api_health_state(events, now: float, prev=None, cfg: dict | None = None) -> dict:
+    """The bucket's state at `now`, as a PURE function of three inputs: its events, the previous
+    persisted `(state, stateSince)` and `now`. Nothing else is consulted — not the transitions list —
+    so a consumer holding the same three computes the same answer and a test drives it with a list.
+    `prev` None means a bucket never classified: ("unknown", now).
+
+    Returns {"state", "since", "why", "evidence", "transitions"}. `since` is the read that entered the
+    state: `now` when this read did, else the previous stateSince. `transitions` is what THIS read
+    found — zero, one or two rows of {"from", "to", "why", "evidence"} — and `why` / `evidence` are the
+    newest of those, or None when nothing moved (the caller keeps the ones it recorded). For
+    `unknown`, `evidence` is always fresh: null window and rates, `n` = requests over the slow window.
+    `evidence` is the DECIDING window's numbers — {"window", "rate429", "rate5xx", "n"} — the same
+    numbers the row's `why` carries.
+
+    The machine (docs/reference.md, "Derived state"), evaluated at `now`:
+      unknown:           no window reaches minRequests — from ANY state. The first qualifying read after
+                         it classifies afresh (an enter condition, else healthy): unknown keeps no memory
+      enter thrashing:   rate429(mid) >= enter429, or rate429(slow) >= enter429Slow, or rate429(fast) >=
+                         enter429Fast with fast >= fastMinRequests; a window counts only when it
+                         qualifies. From healthy / recovering / unknown — AND from degraded, at once:
+                         thrashing wins whenever its enter condition holds
+      enter degraded:    the same on rate5xx while the 429 condition does not hold, from healthy /
+                         recovering / unknown. There is NO thrashing -> degraded: leaving thrashing goes
+                         through recovering, and recovering -> degraded fires IN THE SAME READ when the
+                         5xx condition holds (two rows, one `at`)
+      thrashing -> recovering:  rate429 <= exit429 on BOTH mid and slow, both qualifying, at every
+                         instant of the last holdS. degraded -> recovering: the same on rate5xx / exit5xx
+      recovering -> healthy:    BOTH exit conditions (429 and 5xx) held throughout the last holdS, and
+                         now - stateSince >= holdS. Both, because the input is (state, stateSince) alone:
+                         nothing says which state recovering came from. A bucket with one rate between
+                         its exit and enter thresholds stays recovering, which is the accurate label
+      recovering -> thrashing | degraded:  the enter condition again, immediately
+
+    "Held throughout the last holdS" is exact, not sampled: a window's counts change only at
+    BREAKPOINTS (an event arriving; an event leaving a window), so the exit test is evaluated at
+    now - holdS, at now, and at every breakpoint between — the piece containing now - holdS began
+    before it, so its start is an evaluation point of its own. The slow window at now - holdS reaches
+    back holdS + slow seconds, which is exactly what the ring retains (retentionS).
+
+    A sparse reader observes the state at its read times and the transitions those reads find: a
+    state entered and left between two reads is not recorded, a transition a sparse read finds is
+    stamped with that read's time, and recovering -> healthy needs a read at least holdS after the
+    read that entered recovering. Nothing derives while nobody reads."""
+    cfg = cfg or api_health_config()
+    windows = tuple(sorted(cfg["windows"]))
+    fast, slow = windows[0], windows[-1]
+    mid = windows[1] if len(windows) >= 3 else slow
+    min_r, fast_min, hold = cfg["minRequests"], cfg["fastMinRequests"], float(cfg["holdS"])
+    p_state, p_since = prev if prev else ("unknown", None)
+    p_state = p_state if p_state in API_HEALTH_SEVERITY else "unknown"
+    p_since = now if p_since is None else float(p_since)
+    lo = now - hold - slow                      # the oldest event any evaluation below needs
+    evs = sorted(((e.t, "ok" if e.kind == "ok" else e.cls) for e in events if lo < e.t <= now),
+                 key=lambda x: x[0])
+
+    def _counts_at(points, wins):
+        """{point: {w: (n, rate429, rate5xx)}} for ascending `points`, one sliding pass per window."""
+        out = {b: {} for b in points}
+        for w in wins:
+            c, i_in, i_out = {}, 0, 0
+            for b in points:
+                while i_in < len(evs) and evs[i_in][0] <= b:
+                    k = evs[i_in][1]
+                    c[k] = c.get(k, 0) + 1
+                    i_in += 1
+                while i_out < len(evs) and evs[i_out][0] <= b - w:
+                    c[evs[i_out][1]] -= 1
+                    i_out += 1
+                out[b][w] = _ah_rates(c)
+        return out
+
+    r = _counts_at([now], windows)[now]
+    sufficient = any(r[w][0] >= min_r for w in windows)
+
+    def _enter(key):
+        """(fired, window, n, rate) for the 429 (key=1) or 5xx (key=2) enter rule, in the reference's order:
+        the mid window, the slow one, then the fast path with its own larger minimum."""
+        e_mid, e_slow, e_fast = ((cfg["enter429"], cfg["enter429Slow"], cfg["enter429Fast"]) if key == 1
+                                 else (cfg["enter5xx"], cfg["enter5xxSlow"], cfg["enter5xxFast"]))
+        for w, thr, need in ((mid, e_mid, min_r), (slow, e_slow, min_r), (fast, e_fast, fast_min)):
+            n, rate = r[w][0], r[w][key]
+            if n >= need and rate is not None and rate >= thr:
+                return True, w, n, rate
+        return False, None, 0, None
+
+    thr, deg = _enter(1), _enter(2)
+    run = {}
+
+    def _exit_held(key, thr_exit):
+        """Exit true at every instant of the last holdS: rate <= threshold on both mid and slow, both
+        qualifying, at now - holdS, at now and at each breakpoint between (computed once, on demand)."""
+        if not run:
+            pts = {now - hold, now}
+            for t, _ in evs:
+                if now - hold <= t <= now:
+                    pts.add(t)
+                for w in (mid, slow):
+                    if now - hold <= t + w <= now:
+                        pts.add(t + w)
+            run["pts"] = sorted(pts)
+            run["at"] = _counts_at(run["pts"], (mid, slow))
+        for b in run["pts"]:
+            for w in (mid, slow):
+                n, rate = run["at"][b][w][0], run["at"][b][w][key]
+                if n < min_r or rate is None or rate > thr_exit:
+                    return False
+        return True
+
+    def _rd(x):
+        return None if x is None else round(x, 4)
+
+    def _ev(w):
+        return {"window": w, "rate429": _rd(r[w][1]), "rate5xx": _rd(r[w][2]), "n": r[w][0]}
+
+    def _ev_unknown():
+        return {"window": None, "rate429": None, "rate5xx": None, "n": r[slow][0]}
+
+    def _binding(key):
+        """Of the two windows an exit needs, the one whose rate was closer to the threshold."""
+        a, b = r[mid][key] or 0.0, r[slow][key] or 0.0
+        return mid if a >= b else slow
+
+    why_unknown = "fewer than %d attempts in every window" % min_r
+
+    def _why_enter(fired, key):
+        return "%s over %d s = %.2f, n = %d (attempts)" % ("rate429" if key == 1 else "rate5xx",
+                                                          fired[1], fired[3], fired[2])
+
+    def _why_exit(key, thr_exit):
+        rk = "rate429" if key == 1 else "rate5xx"
+        return ("%s over %d s and %d s <= %.2f throughout the last %d s (%d s: %.2f, n = %d; %d s: %.2f, n = %d)"
+                % (rk, mid, slow, thr_exit, int(hold), mid, r[mid][key], r[mid][0], slow, r[slow][key], r[slow][0]))
+
+    def _step(state, since):
+        """One transition from `state`, or None. Chained by the caller until nothing moves."""
+        if not sufficient:
+            return None if state == "unknown" else ("unknown", why_unknown, _ev_unknown())
+        if thr[0]:
+            return None if state == "thrashing" else ("thrashing", _why_enter(thr, 1), _ev(thr[1]))
+        if deg[0] and state != "thrashing":
+            return None if state == "degraded" else ("degraded", _why_enter(deg, 2), _ev(deg[1]))
+        if state == "unknown":
+            w = mid if r[mid][0] >= min_r else (slow if r[slow][0] >= min_r else fast)
+            return ("healthy", "no enter condition: rate429 over %d s = %.2f, rate5xx = %.2f, n = %d (attempts)"
+                    % (w, r[w][1], r[w][2], r[w][0]), _ev(w))
+        if state == "healthy":
+            return None
+        if state == "thrashing":
+            return ("recovering", _why_exit(1, cfg["exit429"]), _ev(_binding(1))) if _exit_held(1, cfg["exit429"]) else None
+        if state == "degraded":
+            return ("recovering", _why_exit(2, cfg["exit5xx"]), _ev(_binding(2))) if _exit_held(2, cfg["exit5xx"]) else None
+        # recovering
+        if now - since >= hold and _exit_held(1, cfg["exit429"]) and _exit_held(2, cfg["exit5xx"]):
+            w = mid if max(r[mid][1] or 0, r[mid][2] or 0) >= max(r[slow][1] or 0, r[slow][2] or 0) else slow
+            why = ("rate429 and rate5xx over %d s and %d s within exit throughout the last %d s; recovering for %d s "
+                   "(%d s: 429 %.2f, 5xx %.2f, n = %d; %d s: 429 %.2f, 5xx %.2f, n = %d)"
+                   % (mid, slow, int(hold), int(now - since), mid, r[mid][1], r[mid][2], r[mid][0],
+                      slow, r[slow][1], r[slow][2], r[slow][0]))
+            return ("healthy", why, _ev(w))
+        return None
+
+    state, since, trans = p_state, p_since, []
+    for _ in range(3):
+        nxt = _step(state, since)
+        if nxt is None:
+            break
+        to, why, ev = nxt
+        trans.append({"from": state, "to": to, "why": why, "evidence": ev})
+        state, since = to, now
+    if trans:
+        why, ev = trans[-1]["why"], trans[-1]["evidence"]
+    elif state == "unknown":
+        why, ev = why_unknown, _ev_unknown()
+    else:
+        why, ev = None, None
+    return {"state": state, "since": since, "why": why, "evidence": ev, "transitions": trans}
+
+
+def _pid_alive(pid: int) -> bool:
+    """Signal 0: True for a live process (ours or another user's), False for no such pid."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True                                     # exists; not ours to signal
+    return True
+
+
+class ApiHealth:
+    """The aggregator: one ring of AhEvent tuples, one seen-message-id map, one lock, the per-bucket
+    (state, stateSince, evidence) and the transition ledger. Owned by SdkBackend; fed from
+    SdkSession._on_message on each session's own thread; read by the kernel's /api-health handler on
+    the HTTP thread — hence the lock. Holds at most a few thousand tuples over the retention (the slow
+    window plus the hold); a snapshot is one pass per bucket, run with the lock RELEASED."""
+
+    def __init__(self, state_dir, log=None, boot_at=None):
+        self.state_dir = Path(state_dir)
+        self._log = log
+        self._lock = threading.Lock()
+        self._salt_lock = threading.Lock()
+        self._ring: deque = deque()
+        self._seen: dict = {}            # (sid, message_id) -> t; dedupes the CLI's one-frame-per-block replies
+        self._seq = 0
+        self._last_event_at = None
+        self._salt = None                # lazily read/minted: nothing is written until a label is needed
+        # bucket key -> {"state", "since", "why", "evidence", "auth", "family"}: the persisted half of
+        # the derivation's input is (state, since); the rest is what the newest transition recorded
+        self._last_state: dict = {}
+        self._transitions: deque = deque(maxlen=API_HEALTH_TRANSITIONS_KEEP)   # the global tail, newest last
+        self._by_bucket: dict = {}       # bucket key -> deque(maxlen=API_HEALTH_TRANSITIONS_KEEP): that bucket's own tail
+        self._seed(time.time() if boot_at is None else float(boot_at))
+
+    # ---- labels ----
+    def salt(self) -> str:
+        """The per-install label salt. Minted once into STATE/api-health-salt at 0600 (from birth: the
+        mode is the whole point of the file). An EMPTY file is the documented switch to unsalted labels;
+        an unreadable one falls back to unsalted for this process and says so.
+
+        The mint is serialised (one lock for the whole read-or-mint) AND published atomically: the
+        bytes go to a temp file first and the name is taken with a hard link, so no reader — a sibling
+        thread, or a second process on the same state dir — can ever observe the salt file EMPTY. The
+        first cut created the file and then wrote it, and a thread reading in between cached '' (the
+        unsalted switch) and labelled the same key differently from its siblings."""
+        with self._salt_lock:
+            if self._salt is not None:
+                return self._salt
+            p = self.state_dir / API_HEALTH_SALT_FILE
+            try:
+                self._salt = p.read_text().strip()
+                return self._salt
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                if self._log:
+                    self._log("api-health: salt file unreadable (%s) — labels unsalted this kernel life" % e)
+                self._salt = ""
+                return self._salt
+            v = uuid.uuid4().hex + uuid.uuid4().hex
+            tmp = p.with_name("%s.%d.%s.tmp" % (p.name, os.getpid(), uuid.uuid4().hex[:8]))
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                self._sweep_dead_salt_temps(p)
+                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    os.write(fd, v.encode())
+                finally:
+                    os.close(fd)
+                try:
+                    try:
+                        os.link(str(tmp), str(p))       # publish whole, or lose to a sibling that did
+                    except FileExistsError:
+                        try:
+                            self._salt = p.read_text().strip()   # one salt per install: theirs
+                        except OSError:
+                            self._salt = ""
+                    else:
+                        self._salt = v
+                finally:
+                    try:
+                        os.unlink(str(tmp))
+                    except OSError:
+                        pass
+            except OSError as e:
+                if self._log:
+                    self._log("api-health: could not mint the label salt (%s) — labels unsalted this kernel life" % e)
+                self._salt = ""
+            return self._salt
+
+    def _sweep_dead_salt_temps(self, p: Path):
+        """Remove `api-health-salt.<pid>.<hex>.tmp` leftovers whose writer is DEAD: a kernel that died
+        between creating its temp and linking it. Harmless clutter otherwise, but it accumulates in a
+        state dir that is never otherwise cleaned. A temp whose writer pid is alive — or our own pid: a
+        sibling instance in this process — is a mint in progress and stays; unlinking it would turn
+        that writer's link into FileNotFoundError and leave it unsalted for its life. Never raises."""
+        try:
+            for t in p.parent.glob(p.name + ".*.tmp"):
+                try:
+                    pid = int(t.name[len(p.name) + 1:].split(".", 1)[0])
+                except ValueError:
+                    continue                            # not a name we minted: not ours to remove
+                if pid == os.getpid() or _pid_alive(pid):
+                    continue
+                try:
+                    t.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def auth_label(self, source, *, key_fp: str = "", launched_keyed: bool = False) -> str:
+        """api_health_auth_label with this install's salt and the account digest the usage bars use."""
+        acct = ""
+        if not source or str(source).strip().lower() == "none":
+            acct = acct_digest()
+        return api_health_auth_label(source, salt=self.salt(), key_fp=key_fp,
+                                     launched_keyed=launched_keyed, acct=acct)
+
+    # ---- ingestion (each on the session's own thread) ----
+    def _push(self, ev: AhEvent):
+        with self._lock:
+            self._ring.append(ev)
+            self._seq += 1
+            self._last_event_at = ev.t if self._last_event_at is None else max(self._last_event_at, ev.t)
+            if self._seq % 256 == 0:
+                self._evict_locked(ev.t)
+
+    def _evict_locked(self, now: float):
+        keep = api_health_config()["retentionS"]
+        lo = now - keep
+        while self._ring and self._ring[0].t < lo:
+            self._ring.popleft()
+        if len(self._seen) > 512:
+            for k in [k for k, t in self._seen.items() if t < lo]:
+                del self._seen[k]
+
+    def note_retry(self, t, *, auth, family, status, category="", sid, turn):
+        """One api_retry ATTEMPT (main thread — the caller checked parent_tool_use_id)."""
+        self._push(AhEvent(t, auth, family, "retry", api_health_status_class(status, category),
+                           status if isinstance(status, int) and not isinstance(status, bool) else None,
+                           sid, turn, category))
+
+    def note_ok(self, t, *, auth, family, sid, message_id) -> bool:
+        """One successful RESPONSE, deduped on (sid, message_id): the CLI emits one AssistantMessage per
+        content block and every frame of one response carries the same id. Returns whether it counted."""
+        key = (sid, message_id) if message_id else None
+        with self._lock:
+            if key is not None:
+                if key in self._seen:
+                    return False
+                self._seen[key] = float(t)
+        self._push(AhEvent(t, auth, family, "ok", "ok", None, sid, 0))
+        return True
+
+    def note_gaveup(self, t, *, auth, family, status, category="", sid, turn):
+        """The turn's FINAL failed attempt — the CLI settled it with an error (AssistantMessage.error,
+        then ResultMessage.api_error_status). Ungated on any storm flag: most give-ups observed had no
+        retry frame before them, which is why the retriesGaveUp chat marker never fired for them."""
+        self._push(AhEvent(t, auth, family, "gaveup", api_health_status_class(status, category),
+                           status if isinstance(status, int) and not isinstance(status, bool) else None,
+                           sid, turn, category))
+
+    # ---- the state file ----
+    def _state_path(self) -> Path:
+        return self.state_dir / API_HEALTH_STATE_FILE
+
+    @staticmethod
+    def _row_ok(r) -> bool:
+        """A persisted transition row: a dict with a non-empty string `bucket` and `to` and a numeric `t`."""
+        if not isinstance(r, dict):
+            return False
+        b, to = r.get("bucket"), r.get("to")
+        if not (isinstance(b, str) and b and isinstance(to, str) and to):
+            return False
+        try:
+            float(r.get("t") or 0)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _seed(self, boot_at: float):
+        """Restore the per-bucket (state, stateSince, why, evidence) and the transition tail from
+        STATE/api-health.json and set EVERY persisted bucket to `unknown` as of `boot_at`: the ring
+        is empty, so there is no evidence for any other state and no held pre-restart state.
+        `<state> -> unknown` is filed for each bucket that was not already unknown, so the transitions
+        list is continuous across the restart and the first read with enough evidence records
+        `unknown -> <state>` after it. What the boot filed is written.
+
+        Never raises: this runs inside SdkBackend.__init__, and an exception here pinned the SDK backend
+        unavailable for the kernel's whole life. A row that is not JSON, lacks its fields, or carries a
+        non-numeric `t` or a non-string `bucket` is skipped; the skips are logged once."""
+        try:
+            rows, per, recs, bad = [], {}, {}, 0
+            try:
+                doc = json.loads(self._state_path().read_text())
+            except FileNotFoundError:
+                return
+            if not isinstance(doc, dict):
+                raise ValueError("not a JSON object")
+            for r in doc.get("transitions") or []:
+                if self._row_ok(r):
+                    rows.append(r)
+                else:
+                    bad += 1
+            for key, rec in (doc.get("buckets") or {}).items():
+                st = rec.get("state") if isinstance(rec, dict) else None
+                if not (isinstance(key, str) and key and isinstance(st, str) and st):
+                    bad += 1
+                    continue
+                try:
+                    since = float(rec.get("stateSince") or 0)
+                except (TypeError, ValueError):
+                    bad += 1
+                    continue
+                recs[key] = {"state": st, "since": since, "why": rec.get("why") or "", "evidence": rec.get("evidence"),
+                             "auth": rec.get("auth"), "family": rec.get("family")}
+                per[key] = []
+                for r in rec.get("transitions") or []:
+                    if self._row_ok(r):
+                        per[key].append(r)
+                    else:
+                        bad += 1
+            if bad and self._log:
+                self._log("api-health: %d malformed row(s) skipped at boot (%s)" % (bad, API_HEALTH_STATE_FILE))
+            filed = False
+            with self._lock:
+                self._transitions.extend(rows)
+                for key, rs in per.items():
+                    self._by_bucket[key] = deque(rs, maxlen=API_HEALTH_TRANSITIONS_KEEP)
+                for key, rec in recs.items():
+                    a, f = key.split("|", 1) if "|" in key else (key, "unknown")
+                    auth = rec["auth"] if isinstance(rec["auth"], str) and rec["auth"] else a
+                    fam = rec["family"] if isinstance(rec["family"], str) and rec["family"] else f
+                    ev = {"window": None, "rate429": None, "rate5xx": None, "n": 0}
+                    if rec["state"] != "unknown":
+                        self._file_locked({"t": round(boot_at, 3), "bucket": key, "auth": auth, "family": fam,
+                                           "from": rec["state"], "to": "unknown", "why": API_HEALTH_RESTART_WHY,
+                                           "evidence": ev})
+                        filed = True
+                    self._last_state[key] = {"state": "unknown", "since": boot_at, "why": API_HEALTH_RESTART_WHY,
+                                             "evidence": ev, "auth": auth, "family": fam}
+                if filed:
+                    self._write_state_locked()
+        except Exception as e:   # loud, and the backend still comes up
+            if self._log:
+                self._log("api-health: state file unreadable (%s) — starting with no history" % e)
+            self._last_state, self._transitions, self._by_bucket = {}, deque(maxlen=API_HEALTH_TRANSITIONS_KEEP), {}
+
+    def _file_locked(self, row: dict):
+        """Record one transition in both tails: the global one and its bucket's own. The bucket's tail is
+        NOT a filter of the global one — that shape let a neighbour churning through fifty transitions
+        erase a quiet bucket's history from its own payload. The caller holds the lock and writes the
+        state file once it has filed everything this read found. One kernel-log line per transition, in
+        the `retry-pause:` lines' style, so the log alone reconstructs an incident: bucket, move, why."""
+        self._transitions.append(row)
+        self._by_bucket.setdefault(row["bucket"], deque(maxlen=API_HEALTH_TRANSITIONS_KEEP)).append(row)
+        if self._log:
+            self._log("api-health: %s %s -> %s — %s" % (row["bucket"], row.get("from"), row["to"], row.get("why") or ""))
+
+    def _write_state_locked(self):
+        """Publish the persisted half of the signal — the per-bucket (state, stateSince, why, evidence)
+        and the transition tail — to STATE/api-health.json whole: a writer-unique temp in the same dir,
+        then os.replace (the kernel's _atomic_write idiom), so a reader or a crash never sees a partial
+        document. Called under the lock, at most once per read that filed something; the document is
+        bounded (one record per bucket, API_HEALTH_TRANSITIONS_KEEP rows in the global tail and in each
+        bucket's own), so rewriting it whole is a few KB. Never raises into a request handler."""
+        p = self._state_path()
+        doc = {"schema": API_HEALTH_SCHEMA,
+               "transitions": list(self._transitions),
+               "buckets": {k: {"state": v["state"], "stateSince": v["since"], "why": v["why"], "evidence": v["evidence"],
+                               "auth": v["auth"], "family": v["family"],
+                               "transitions": list(self._by_bucket.get(k, ()))} for k, v in self._last_state.items()}}
+        tmp = p.with_name("%s.%d.%s.tmp" % (p.name, os.getpid(), uuid.uuid4().hex[:8]))
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(doc))
+            os.replace(tmp, p)
+        except OSError as e:
+            if self._log:
+                self._log("api-health: state file write failed: %s" % e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    # ---- the read ----
+    def snapshot(self, now: float | None = None, uptime_s=None) -> dict:
+        """The /api-health payload minus boot identity (the kernel stamps bootId/bootAt from /version's
+        globals). Windows and states are computed here, from the ring and the last persisted
+        (state, stateSince), at read time; the transitions a read finds are the events that rewrite
+        the state file. Every KNOWN bucket is derived — one in the ring, or one the state file remembers
+        whose events have all aged out: absent from the ring is `unknown`, filed at the read that found
+        it so, which is how an episode closes when traffic stops between two reads.
+
+        Three phases around the lock: copy the ring under it; derive with it RELEASED (every session
+        thread's _push takes the same lock, and a derivation over tens of thousands of ring events
+        measured 70-376 ms); re-take it only to file. A concurrent read that filed the same bucket in
+        between wins — its record is adopted rather than a second row written."""
+        now = time.time() if now is None else float(now)
+        cfg = api_health_config()
+        with self._lock:
+            self._evict_locked(now)
+            events = list(self._ring)
+            seq, last_at = self._seq, self._last_event_at
+            known = {k: dict(v) for k, v in self._last_state.items()}
+        by_bucket: dict = {}
+        for e in events:
+            by_bucket.setdefault("%s|%s" % (e.auth, e.family), []).append(e)
+        derived = []
+        for key in sorted(set(by_bucket) | set(known)):
+            evs = by_bucket.get(key, [])
+            prev = known.get(key)
+            auth, fam = (evs[0].auth, evs[0].family) if evs else (prev["auth"], prev["family"])
+            st = api_health_state(evs, now, (prev["state"], prev["since"]) if prev else None, cfg)
+            wins = {str(w): api_health_counts(evs, now, w, uptime_s) for w in cfg["windows"]}
+            last_err = None
+            for e in reversed(evs):
+                if e.kind != "ok":
+                    last_err = {"at": round(e.t, 3), "status": e.status, "category": e.category or None,
+                                "class": e.cls, "kind": e.kind}
+                    break
+            derived.append((key, auth, fam, prev, st, wins, last_err))
+        buckets = {}
+        worst, worst_key = "unknown", None
+        filed = False
+        with self._lock:
+            for key, auth, fam, prev, st, wins, last_err in derived:
+                cur = self._last_state.get(key)
+                if cur != prev:
+                    rec = cur                    # a concurrent read filed this bucket first: its record stands
+                else:
+                    for tr in st["transitions"]:
+                        self._file_locked({"t": round(now, 3), "bucket": key, "auth": auth, "family": fam,
+                                           "from": tr["from"], "to": tr["to"], "why": tr["why"],
+                                           "evidence": tr["evidence"]})
+                        filed = True
+                    rec = {"state": st["state"], "since": st["since"], "auth": auth, "family": fam,
+                           "why": st["why"] if st["why"] is not None else ((prev or {}).get("why") or ""),
+                           "evidence": st["evidence"] if st["evidence"] is not None else (prev or {}).get("evidence")}
+                    self._last_state[key] = rec
+                buckets[key] = {"auth": auth, "family": fam, "windows": wins,
+                                "state": rec["state"], "stateSince": round(rec["since"], 3),
+                                "evidence": rec["evidence"], "why": rec["why"],
+                                "transitions": list(self._by_bucket.get(key, ())),
+                                "lastError": last_err}
+                if API_HEALTH_SEVERITY[rec["state"]] > API_HEALTH_SEVERITY[worst] or worst_key is None:
+                    worst, worst_key = rec["state"], key
+            if filed:
+                self._write_state_locked()       # once per read, after every bucket's record is current
+            transitions = list(self._transitions)
+        return {"schema": API_HEALTH_SCHEMA, "asOf": round(now, 3), "uptimeS": None if uptime_s is None else round(uptime_s, 1),
+                "complete": None if uptime_s is None else bool(uptime_s >= max(cfg["windows"])),
+                "seq": seq, "lastEventAt": None if last_at is None else round(last_at, 3),
+                "rate429Basis": "attempts",
+                "coverage": {"sidechainExcluded": True},
+                "config": {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.items()},
+                "overall": {"state": worst, "worstBucket": worst_key},
+                "buckets": buckets,
+                "transitions": transitions}
+
+
 def read_reg(state_dir: Path, sid: str) -> dict | None:
     try:
         return json.loads(_reg_path(state_dir, sid).read_text())
@@ -2679,6 +3482,13 @@ class SdkSession:
     # full line again once the ring has evicted it — so a handler failing on each message stays visible.
     _stream_fail_seen: dict = {}
     _stream_fail_lock = threading.Lock()
+    # Same idiom, the CONFIRMING side: the FIRST api_retry frame each kernel life logs its sorted keys,
+    # so the next storm settles which fields the installed CLI actually forwards (the /api-health hook
+    # reads two of them) — read from the emitter's source until now, never captured live.
+    _retry_shape_logged = False
+    # …and one line per SystemMessage subtype the handler has no branch for (per kernel life), so a
+    # CLI that starts forwarding a new frame kind is noticed in the log instead of silently dropped.
+    _sys_subtypes_seen: set = set()
 
     def __init__(self, backend: "SdkBackend", reg: dict):
         self.backend = backend
@@ -2771,6 +3581,14 @@ class SdkSession:
         self.retrying = False                        # an api_retry storm (API rate-limit/overload) is stalling the turn → 'retrying', not 'working'
         self.retry_count = 0                          # api_retry backoff attempts in the CURRENT storm; → the live 'attempt N' + the 'Recovered after N retries' note, reset each turn
         self.retry_info = None                        # the CURRENT storm's latest api_retry detail (attempt/max, error status+message, next-attempt epoch) → the chat retrying element's extra context (the user 2026-07-10); lives and dies with `retrying`
+        # /api-health attribution (see ApiHealth): the bucket label this session's API events file under —
+        # resolved ONCE per init by _note_auth_source (api_health_auth_label), 'unknown' until one lands;
+        # a main-thread turn counter for turnsRetrying (bumped at every settle, so a storm's attempts
+        # share one turn); and the pending give-up marker — the error-stamped AssistantMessage arrives
+        # BEFORE the ResultMessage that carries api_error_status, so the settle pairs the two.
+        self.auth_label = "unknown"
+        self._ah_turn = 0
+        self._ah_gaveup = None
         self._interrupted = False                    # user interrupted the in-flight turn → snapshot reads 'waiting' (display only; inflight stays event-driven)
         self._intr_level = 0                         # interrupt escalation rung this episode (interrupt_action); reset on settle / fresh turn
         self._launched_key_fp = None                 # fingerprint of the work key this session's CURRENT client launched on
@@ -4173,6 +4991,85 @@ class SdkSession:
                           % (self.name, type(e).__name__, _failing_site(e), kind, again,
                              _failure_consequence(msg, settled=settled),
                              type(e).__name__, _mask_ids(e), _compact_tb(e)), problem=True, key=key)
+    def _ah_family(self) -> str:
+        """The family a RETRY or GIVE-UP is filed under: the model this session last learned (the raw
+        id the CLI reported, else the display name). api_retry frames carry no model, so an attempt is
+        attributed to the session's CURRENT model — a capacity fallback mid-storm (the CLI moving the
+        session to another model) is learned only from the next successful reply, so the attempts
+        between the switch and that reply are filed under the previous family. Detection-grade;
+        an `ok` uses the response's own model and is exact."""
+        return model_family(getattr(self, "_model_id", "") or getattr(self, "model", "") or "")
+
+    def _ah_note_retry(self, d: dict, msg) -> None:
+        """One attempt from the api_retry frame. Reads exactly TWO of its fields, straight from the wire:
+        `error_status` (the CLI's `error.status ?? null`) and `error` (a category string). Not the chat
+        card's retry_info with its alternate spellings, and nothing else the frame carries — no field
+        of the signal uses them, and the one-shot sorted(msg.data) line shows they are present."""
+        ah = getattr(self.backend, "api_health", None)
+        if ah is None:
+            return
+        if getattr(msg, "parent_tool_use_id", None) or d.get("parent_tool_use_id"):
+            return   # a sidechain frame (should not exist for api_retry; symmetric with `ok` if one does)
+        status = d.get("error_status")
+        cat = d.get("error") if isinstance(d.get("error"), str) else ""
+        try:
+            ah.note_retry(time.time(), auth=getattr(self, "auth_label", "unknown") or "unknown",
+                          family=self._ah_family(), status=status, category=cat,
+                          sid=self.sid, turn=getattr(self, "_ah_turn", 0))
+        except Exception as e:   # the signal must never cost the session its turn
+            _lg = getattr(self.backend, "_log", None)
+            if _lg:
+                _lg("api-health: retry ingest failed: %s" % e)
+
+    def _ah_note_assistant(self, msg) -> None:
+        ah = getattr(self.backend, "api_health", None)
+        if ah is None:
+            return
+        if getattr(msg, "parent_tool_use_id", None):
+            return   # a subagent's response: its retries never reach us, so its `ok`s are not counted either
+        if getattr(msg, "error", None):
+            # the give-up's own frame: model is '<synthetic>', the status arrives with the ResultMessage
+            self._ah_gaveup = {"category": str(msg.error), "family": self._ah_family(), "t": time.time()}
+            return
+        m = str(getattr(msg, "model", None) or "")
+        if "claude" not in m.lower():
+            return   # injected / synthetic assistant records are not API responses
+        try:
+            ah.note_ok(time.time(), auth=getattr(self, "auth_label", "unknown") or "unknown",
+                       family=model_family(m), sid=self.sid,
+                       message_id=getattr(msg, "message_id", None) or getattr(msg, "uuid", None))
+        except Exception as e:
+            _lg = getattr(self.backend, "_log", None)
+            if _lg:
+                _lg("api-health: ok ingest failed: %s" % e)
+
+    def _ah_note_result(self, msg) -> None:
+        """The settle ends the turn (the counter behind turns/turnsRetrying) and completes a pending
+        give-up marker. `api_error_status` is defined only when `is_error` is true (the SDK's own comment,
+        types.py:1247-1249), so is_error GATES the read. is_error + a status + no marker files a give-up
+        in that status counter (the error AssistantMessage was not seen); is_error + a null status + no
+        marker files nothing — the CLI's other error results (max turns, budget, execution) are not API
+        failures; a pending marker with a null status is completed by its own category string."""
+        pend = getattr(self, "_ah_gaveup", None)
+        self._ah_gaveup = None
+        turn = getattr(self, "_ah_turn", 0)
+        self._ah_turn = turn + 1
+        ah = getattr(self.backend, "api_health", None)
+        if ah is None or getattr(msg, "parent_tool_use_id", None):
+            return
+        is_error = bool(getattr(msg, "is_error", False))
+        status = getattr(msg, "api_error_status", None) if is_error else None
+        status = status if isinstance(status, int) and not isinstance(status, bool) else None
+        if pend is None and status is None:
+            return
+        try:
+            ah.note_gaveup(time.time(), auth=getattr(self, "auth_label", "unknown") or "unknown",
+                           family=(pend or {}).get("family") or self._ah_family(), status=status,
+                           category=(pend or {}).get("category") or "", sid=self.sid, turn=turn)
+        except Exception as e:
+            _lg = getattr(self.backend, "_log", None)
+            if _lg:
+                _lg("api-health: give-up ingest failed: %s" % e)
 
     def _on_message(self, msg, AssistantMessage, ResultMessage, SystemMessage):
         if getattr(self, "_ping_feeding", False):   # getattr: __new__-built test doubles skip __init__
@@ -4330,6 +5227,16 @@ class SdkSession:
                     "romp: api_retry payload has no field this build understands — keys=%r. The retry "
                     "detail (attempt/max, status, countdown) will be blank until these are mapped.\n"
                     % (sorted(d)[:20],))
+            # The confirming diagnostic (one per kernel life): which keys the installed CLI's api_retry
+            # frame actually carries. Keys only — the values would include the error text.
+            if d and not SdkSession._retry_shape_logged:
+                SdkSession._retry_shape_logged = True
+                _lg = getattr(self.backend, "_log", None)
+                if _lg:
+                    _lg("api-health: first api_retry frame this kernel life — keys=%r" % (sorted(d)[:20],))
+            # ONE parse, TWO consumers: the same frame feeds the /api-health ring (ApiHealth) — never a
+            # second subscription, never the settle-time retriesRecovered ledger (no per-attempt status).
+            self._ah_note_retry(d, msg)
             self._mark("retrying")
             self.backend._poke()
         elif isinstance(msg, SystemMessage) and msg.subtype in (
@@ -4340,7 +5247,23 @@ class SdkSession:
             # off subtype+data (the typed subclasses need a newer SDK; the raw payload is identical).
             # Terminal statuses clear from EITHER message kind — a TaskStop can suppress the notification.
             self._on_task_event(msg.subtype, msg.data if isinstance(msg.data, dict) else {})
+        elif isinstance(msg, SystemMessage):
+            # A subtype no branch above handles. Logged ONCE per subtype per kernel life (keys only, no
+            # values): the CLI's stream-json allowlist decides what reaches us, and a frame kind it
+            # starts forwarding should be a line in the log, not a silent drop. Still forwarded below.
+            _st = str(getattr(msg, "subtype", "") or "")
+            if _st and _st not in SdkSession._sys_subtypes_seen:
+                SdkSession._sys_subtypes_seen.add(_st)
+                _lg = getattr(self.backend, "_log", None)
+                if _lg:
+                    _d = msg.data if isinstance(getattr(msg, "data", None), dict) else {}
+                    _lg("sdk: unhandled SystemMessage subtype %r (first seen this kernel life) — keys=%r"
+                        % (_st, sorted(_d)[:20]))
         elif isinstance(msg, AssistantMessage):
+            # /api-health: a response (one `ok` per message_id) or a give-up marker — main thread only;
+            # this hook checks parent_tool_use_id itself rather than inheriting the sidechain guard
+            # below, which sits AFTER the recovery-marker writes and so never protected them.
+            self._ah_note_assistant(msg)
             # The CLI's FAILURE settle wears an AssistantMessage too: when a storm exhausts its retries it
             # writes the error itself as the reply text ("API Error: 529 Overloaded…") and stamps the
             # message with `error` (the SDK's designed flag — "server_error", "rate_limit", …; the same
@@ -4398,6 +5321,8 @@ class SdkSession:
                 # body: it is the step most likely to raise on data (a NaN usage field, a failing spend
                 # write), and ahead of the others it skipped the rewind consumption and the live-tail
                 # sweep — 2026-09-07 review.)
+                # /api-health: the settle names a give-up's status (api_error_status) and ends the turn
+                self._ah_note_result(msg)
                 if self._rewind_to and getattr(self, "_rewind_wait", False):
                     # delete-while-busy: THIS settle is the interrupted turn ending — the flag is being
                     # ARMED here, not consumed. Second observer of the turn-end fact (the Stop hook is
@@ -5908,6 +6833,9 @@ class SdkBackend:
         # once, here, where the problem ring exists to carry it, before the boot reconcile below can
         # launch a session on the account the declaration says it does not bill.
         _check_env_file_vs_declaration(self._log, self.state_dir)
+        # The /api-health aggregator (one ring, one lock; see ApiHealth). Fed from _on_message on each
+        # session's thread, read by the kernel's route; the salt is minted lazily at the first label.
+        self.api_health = ApiHealth(self.state_dir, log=self._log)
         # The dependency check, done ONCE here: absent → every session this backend owns reports the same
         # launch error (launch_error), instead of each one silently dying at its own lazy import.
         self._sdk_missing = not sdk_importable()
@@ -6881,6 +7809,17 @@ class SdkBackend:
         (_expected_auth) and the session carries no explicit per-session pick — a pick outranks
         the declaration — else against _launched_keyed as before; see the comment at the check."""
         keyed = bool(source) and str(source).strip().lower() != "none"
+        # The /api-health bucket label, resolved here — once per init, from the init's own source word
+        # and what THIS session was launched with — and cached on the session (api_health_auth_label).
+        # The key's identity is the fingerprint _options recorded at launch (_launched_key_fp), not a
+        # fresh work_key read: that read resolves the source, and on a reference-sourced machine it
+        # would run one 1Password retrieval per init.
+        try:
+            sess.auth_label = self.api_health.auth_label(
+                source, key_fp=getattr(sess, "_launched_key_fp", "") or "",
+                launched_keyed=bool(getattr(sess, "_launched_keyed", False)))
+        except Exception as e:
+            self._log("api-health: auth label failed (%s): %s" % (sess.name, e))
         # The CLI landed on a DIFFERENT auth than EXPECTED — the expected side is the box-wide
         # ROMP_EXPECTED_AUTH declaration when one is set (an apiKeyHelper box injects no key at
         # launch, so _launched_keyed said "login" while key auth was the design and every init rang
@@ -7208,6 +8147,21 @@ class SdkBackend:
         starts, so nothing drains the tail). Not a fallback: the scope itself is there."""
         self._log("cli scope: session %s (%s) started its CLI without a per-session limit — %s"
                   % (sess.name, str(sess.sid)[:8], text), problem=True)
+
+    def api_health_snapshot(self, now: float | None = None, uptime_s=None) -> dict:
+        """The /api-health payload (ApiHealth.snapshot) plus what only the backend knows: how many SDK
+        sessions it holds and how many are in a retry storm right now — the cheapest direct thrash
+        indicator, independent of the ratio thresholds. Boot identity is the kernel's to stamp."""
+        out = self.api_health.snapshot(now, uptime_s=uptime_s)
+        with self._lock:
+            sess = list(self.sessions.values())
+        live = [s for s in sess if not getattr(s, "ended", False)]
+        out["coverage"]["sdkSessionsLive"] = len(live)
+        # inTurn: a turn in flight (working or retrying); retrying: inside an api_retry storm right now
+        out["coverage"]["inTurn"] = sum(1 for s in live if (getattr(s, "inflight", 0) or 0) > 0
+                                        or getattr(s, "retrying", False))
+        out["coverage"]["retrying"] = sum(1 for s in live if getattr(s, "retrying", False))
+        return out
 
     def _poke(self):
         if self._poke_cb:
