@@ -41,6 +41,8 @@ teardown() { rm -rf "$TEST_DIR"; }
 # STUB_FLAKY_VIEWS = report nothing for the first N `run view` calls, as a transient API
 # error looks to the poll loop, then the real conclusion.
 # STUB_PR_STATE = what `gh pr view` reports (default MERGED).
+# STUB_MERGE_REMOTE = the remote the simulated merge lands on (default origin; a fork layout
+# names its canonical remote `upstream`).
 _stub_gh() {
     cat > "$TEST_DIR/gh" <<STUB
 #!/usr/bin/env bash
@@ -61,7 +63,7 @@ case "\$1 \$2" in
   # every later call by that number (a fork-headed branch is unresolvable by name — see below).
   "pr create")  echo "https://github.com/romp-on/romp/pull/4242" ;;
   "pr merge")   if [ "\${STUB_PR_STATE:-MERGED}" = "MERGED" ]; then
-                    git -C "$REPO" push -q origin HEAD:main
+                    git -C "$REPO" push -q "\${STUB_MERGE_REMOTE:-origin}" HEAD:main
                 fi ;;
   "pr view")    echo "\${STUB_PR_STATE:-MERGED}" ;;
 esac
@@ -232,6 +234,28 @@ STUB
     # the tag really reached the remote — a local-only tag installs for nobody
     run git -C "$TEST_DIR/origin.git" tag -l
     [ "$output" = "v0.1.0" ]
+}
+
+@test "release: a fork layout pushes the branch to origin, and reads main + pushes the tag at upstream" {
+    # The remote convention (the user 2026-09-06): `origin` is the fork, `upstream` the canonical
+    # repo. The version PR merges on the canonical repo, so the post-merge fast-forward must read
+    # upstream/main: origin/main is the fork's stale main, and fast-forwarding onto it silently
+    # tags a commit that never got the bump. And the tag must land where installs look for it.
+    _stub_gh
+    git init -q --bare "$TEST_DIR/upstream.git"
+    git -C "$REPO" remote add upstream "$TEST_DIR/upstream.git"
+    git -C "$REPO" push -q upstream main
+    export STUB_MERGE_REMOTE=upstream
+    run "$REPO/scripts/release.sh" minor --skip-tests
+    [ "$status" -eq 0 ]
+    # the version branch went to the fork (origin: no pushDefault set here)
+    run git -C "$TEST_DIR/origin.git" branch --list release-0.2.0
+    [[ "$output" == *"release-0.2.0"* ]]
+    # local main was fast-forwarded from the canonical repo, so the tagged tree carries the bump
+    [ "$(cat "$REPO/VERSION")" = "0.2.0" ]
+    # the tag reached the canonical repo, and never the fork
+    [ "$(git -C "$TEST_DIR/upstream.git" tag -l)" = "v0.2.0" ]
+    [ -z "$(git -C "$TEST_DIR/origin.git" tag -l)" ]
 }
 
 @test "release: notes start at the PREVIOUS tag, never at the one being cut" {

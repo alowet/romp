@@ -44,6 +44,20 @@ PYTEST="${ROMP_RELEASE_PYTEST:-}"         # overridable suite runner (tests); em
 POLL="${ROMP_RELEASE_POLL:-5}"            # seconds between checks while the run starts
 REF="${ROMP_RELEASE_REF:-main}"
 UPSTREAM="${ROMP_RELEASE_UPSTREAM:-romp-on/romp}"
+
+# Which git remote is the canonical repo, and which one takes the branch push. The convention
+# (the user 2026-09-06): in a clone with a fork, `origin` is the fork and `upstream` is the
+# canonical repo; a plain clone has only `origin`, which is then both. So the canonical remote
+# is `upstream` when the clone has one, else `origin`; the branch push goes to
+# `remote.pushDefault` when set, else `origin`.
+canonical_remote() {
+    if git remote get-url upstream >/dev/null 2>&1; then echo upstream; else echo origin; fi
+}
+publish_remote() {
+    local p
+    p="$(git config --get remote.pushDefault || true)"
+    printf '%s\n' "${p:-origin}"
+}
 skip_macos=0
 skip_tests=0
 dry_run=0
@@ -134,10 +148,7 @@ say "releasing $tag (VERSION currently reads $current)."
 if [ "$current" != "$target" ]; then
     # Branch pushes to the upstream are blocked by rulesets, so publishing is always
     # push-to-a-fork then PR. remote.pushDefault is the configured answer when there is one.
-    publish="$(git config --get remote.pushDefault || true)"
-    if [ -z "$publish" ]; then
-        if git remote get-url fork >/dev/null 2>&1; then publish=fork; else publish=origin; fi
-    fi
+    publish="$(publish_remote)"
     branch="release-$target"
     say "VERSION $current → $target, via a PR on $branch (pushing to '$publish')."
     if [ "$dry_run" -eq 1 ]; then
@@ -180,8 +191,12 @@ if [ "$current" != "$target" ]; then
         done
         [ "$state" = "MERGED" ] || die "the version PR did not merge — check $UPSTREAM."
         git switch "$REF" >/dev/null 2>&1 || die "could not switch back to $REF."
-        git fetch -q origin
-        git merge --ff-only "origin/$REF" >/dev/null || die "could not fast-forward $REF after the merge."
+        # The merge landed on the CANONICAL repo. With a fork layout that is `upstream`, not
+        # `origin`: reading `origin/main` there would fast-forward onto the fork's stale main
+        # (a no-op) and then tag a commit that never got the bump.
+        canonical="$(canonical_remote)"
+        git fetch -q "$canonical"
+        git merge --ff-only "$canonical/$REF" >/dev/null || die "could not fast-forward $REF after the merge."
         say "version PR merged; $REF now carries $target."
     fi
 else
@@ -282,9 +297,11 @@ prev="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
 step git tag -a "$tag" -m "romp $tag"
 say "created tag $tag."
 
-# The tag goes to the UPSTREAM: rulesets block branch pushes there, but a tag is how a
-# release is published, and a tag that exists only locally installs for nobody.
-step git push -q origin "$tag" || die "could not push $tag to origin."
+# The tag goes to the CANONICAL repo (`upstream` in a fork layout, else `origin`): rulesets
+# block branch pushes there, but a tag is how a release is published, and a tag that lands
+# only on the fork, or only locally, installs for nobody.
+canonical="$(canonical_remote)"
+step git push -q "$canonical" "$tag" || die "could not push $tag to $canonical."
 say "pushed $tag."
 
 if [ -n "$prev" ]; then

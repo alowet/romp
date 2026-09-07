@@ -3766,11 +3766,30 @@ def _semver(tag):
     return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
 
+def _release_remote():
+    """The git remote that carries romp's releases and its main: `upstream` when the clone has one,
+    else `origin`. A bootstrap install clones the canonical repo directly, so `origin` IS it; a
+    maintainer's clone follows the fork convention (the user 2026-09-06: `origin` = their fork,
+    `upstream` = the canonical repo), where `origin/main` is a stale mirror nobody advances. Every
+    updater probe and walk below goes through this, so the rename could not point the release
+    check, the drift notice, or auto-converge's checkout at the fork. Unreadable remotes (not a
+    git checkout, git missing) resolve to `origin`, the plain-install answer."""
+    try:
+        out = subprocess.run(["git", "-C", str(ROOT), "remote"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and "upstream" in out.stdout.split():
+            return "upstream"
+    except Exception:
+        pass
+    return "origin"
+
+
 def _latest_release_tag():
-    """The newest release tag on the clone's `origin`, read from the REMOTE's refs (ls-remote) — never
-    from the local tag list, which says only what this clone last fetched (refs do not travel with
-    commits; _kernel_ver's lesson). Raises on any git/network failure so the caller can say so."""
-    r = subprocess.run(["git", "-C", str(ROOT), "ls-remote", "--tags", "origin"],
+    """The newest release tag on the clone's release remote (_release_remote), read from the REMOTE's
+    refs (ls-remote), never from the local tag list, which says only what this clone last fetched
+    (refs do not travel with commits; _kernel_ver's lesson). Raises on any git/network failure so
+    the caller can say so."""
+    r = subprocess.run(["git", "-C", str(ROOT), "ls-remote", "--tags", _release_remote()],
                        capture_output=True, text=True, timeout=20)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or "git ls-remote failed").strip()[:200])
@@ -3839,8 +3858,8 @@ def _run_update(tag):
         "cd %s || exit 1\n" % q(str(ROOT))
         + "{ echo; echo \"== romp self-update to %s ==\"; date; } >> %s 2>&1\n" % (tag, log)
         + advance
-        + "if git fetch origin refs/tags/%s:refs/tags/%s >> %s 2>&1 && advance "
-          "&& ./install.sh >> %s 2>&1; then\n" % (tag, tag, log, log)
+        + "if git fetch %s refs/tags/%s:refs/tags/%s >> %s 2>&1 && advance "
+          "&& ./install.sh >> %s 2>&1; then\n" % (_release_remote(), tag, tag, log, log)
         + "  printf '%%s' %s > %s\n" % (q(json.dumps(ok_rep)), rep)
         + restart
         + "else\n"
@@ -3895,7 +3914,7 @@ def _update_check():
     try:
         latest = _latest_release_tag()
     except Exception as e:
-        sys.stderr.write("romp-kernel: update check could not read origin's tags: %s\n" % e)
+        sys.stderr.write("romp-kernel: update check could not read the release remote's tags: %s\n" % e)
         return
     lv = _semver(latest)
     if not lv or lv <= cur:
@@ -3963,9 +3982,10 @@ _MAIN_DRIFT = ["", ""]                 # [origin sha a notice fired for, checkou
 
 
 def _origin_main_sha():
-    """origin/main's commit (short), '' when unreachable — offline is a normal state, never a crash."""
+    """The release remote's main commit (short; `upstream/main` in a fork layout, else `origin/main`),
+    '' when unreachable: offline is a normal state, never a crash."""
     try:
-        out = subprocess.run(["git", "ls-remote", "origin", "refs/heads/main"],
+        out = subprocess.run(["git", "ls-remote", _release_remote(), "refs/heads/main"],
                              cwd=str(ROOT), capture_output=True, text=True, timeout=15)
         return (out.stdout.split() or [""])[0][:8]
     except Exception:
@@ -4347,22 +4367,23 @@ def _run_main_update(kind, immediate=True, manager_port=_PORT_FROM_ENV):
         try:
             dirty = subprocess.run(["git", "status", "--porcelain"], cwd=str(ROOT),
                                    capture_output=True, text=True, timeout=10).stdout.strip()
+            remote = _release_remote()
             if dirty:
-                _sync_notice("main moved at origin, but the romp checkout has uncommitted work — "
-                             "not touching it. Commit or stash it, then Update again.", ok=False)
+                _sync_notice("main moved at %s, but the romp checkout has uncommitted work, so it "
+                             "was left alone. Commit or stash it, then Update again." % remote, ok=False)
                 _MAIN_DRIFT[0] = ""                   # let the notice re-fire once the tree is clean
                 return
-            subprocess.run(["git", "fetch", "origin", "main"], cwd=str(ROOT),
+            subprocess.run(["git", "fetch", remote, "main"], cwd=str(ROOT),
                            capture_output=True, text=True, timeout=60)
-            r = subprocess.run(["git", "checkout", "--detach", "origin/main"], cwd=str(ROOT),
+            r = subprocess.run(["git", "checkout", "--detach", "%s/main" % remote], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
-                _sync_notice("main moved at origin, but advancing the checkout failed: %s"
-                             % (r.stderr or r.stdout or "").strip()[-200:], ok=False)
+                _sync_notice("main moved at %s, but advancing the checkout failed: %s"
+                             % (remote, (r.stderr or r.stdout or "").strip()[-200:]), ok=False)
                 _MAIN_DRIFT[0] = ""
                 return
         except Exception as e:
-            _sync_notice("main moved at origin, but the pull step failed: %s" % e, ok=False)
+            _sync_notice("main moved at %s, but the pull step failed: %s" % (_release_remote(), e), ok=False)
             _MAIN_DRIFT[0] = ""
             return
     if kind == "pull":
