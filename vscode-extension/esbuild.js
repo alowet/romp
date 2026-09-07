@@ -74,11 +74,12 @@ const webview = {
   sourcemap: !production,
   // Whitespace and syntax are minified for a release; identifiers are NOT: the browser's
   // long-animation-frame reports name the callback they ran by its compile-time name, and perf-telemetry.ts
-  // keys its attribution on that, so a mangled build reports `feed.js:Qe` and a different letter after
-  // every rebuild (the ten-minute fold in `romp perf client` then splits one function across keys). Stack
-  // traces and DevTools profiles read better for the same reason. Measured cost (esbuild 0.21.5): +27% raw
-  // over all webview bundles (feed.js 368 KB to 460 KB, render.js 801 KB to 1026 KB) and +13% gzipped,
-  // which is what the kernel serves (feed.js 117 KB to 132 KB, render.js 247 KB to 280 KB).
+  // puts that name in its attribution key, so keeping identifiers keeps the function name readable across
+  // rebuilds (a mangled build reports `feed.js:Qe`, a letter that changes with every rebuild; the key's
+  // character position moves with any edit to the bundle either way). Stack traces and DevTools profiles
+  // read better for the same reason. Measured cost (esbuild 0.21.5): +27% raw over all webview bundles
+  // (feed.js 368 KB to 460 KB, render.js 801 KB to 1026 KB) and +13% gzipped, which is what the kernel
+  // serves (feed.js 117 KB to 132 KB, render.js 247 KB to 280 KB).
   minifyWhitespace: production,
   minifySyntax: production,
   minifyIdentifiers: false,

@@ -8,6 +8,8 @@ client-diag.jsonl.1 (replacing the previous .1) and a new file starts, so at mos
 Drives the REAL Handler's WS dispatch (_dispatch_ws with a clientDiag message, the way the pane shim delivers
 one) against a hermetic state directory, with the cap lowered for the test. Synthetic fixtures only: a
 placeholder dashboard id, invented numbers."""
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -41,6 +43,7 @@ class ClientDiagRotationTest(unittest.TestCase):
                 f.unlink()
         self.cap = km.CLIENT_DIAG_MAX_BYTES
         km.CLIENT_DIAG_MAX_BYTES = 600           # a handful of rows; the production value is asserted below
+        km._client_diag_rotate_failed = False    # the once-per-kernel stderr latch: each test is its own kernel
 
     def tearDown(self):
         km.CLIENT_DIAG_MAX_BYTES = self.cap
@@ -59,7 +62,10 @@ class ClientDiagRotationTest(unittest.TestCase):
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
     def test_a_row_lands_with_the_kernel_stamp(self):
-        self.post(1)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.post(1)
+        self.assertEqual(err.getvalue(), "", "a fresh state directory has no file yet: that is not a refused rotation")
         rows = self.rows(self.fp)
         self.assertEqual(len(rows), 1)
         self.assertEqual(sorted(rows[0]), ["data", "surface", "t", "what", "wid"])
@@ -97,20 +103,33 @@ class ClientDiagRotationTest(unittest.TestCase):
     def test_the_production_cap_is_eight_megabytes(self):
         self.assertEqual(self.cap, 8 * 1024 * 1024)
 
-    def test_a_rename_failure_still_appends(self):
+    def test_a_rename_failure_still_appends_and_is_said_once_on_stderr(self):
+        """A refused rotation (an unwritable state directory, a directory sitting at the .1 name) used to share one
+        silent `except OSError` with the absent-file case, so the size bound could fail with nothing saying so.
+        Now the rows still append, and stderr gets ONE line naming the file and the error, latched for the
+        kernel's lifetime: a rename that stays refused is a line per kernel, not a line per row (a minute per
+        pane)."""
         self.post(1)
         real = os.replace
         km.CLIENT_DIAG_MAX_BYTES = 1
 
         def refuse(*a, **k):
             raise OSError("read-only")
+        err = io.StringIO()
         os.replace = refuse
         try:
-            self.post(2)
+            with contextlib.redirect_stderr(err):
+                self.post(2)
+                self.post(3)
         finally:
             os.replace = real
-        self.assertEqual([r["data"]["i"] for r in self.rows(self.fp)], [1, 2])
+        self.assertEqual([r["data"]["i"] for r in self.rows(self.fp)], [1, 2, 3], "both rows past the cap still appended")
         self.assertFalse(self.fp1.exists())
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, "two refused renames, one stderr line: %r" % lines)
+        self.assertIn(str(self.fp), lines[0], "the line names the file")
+        self.assertIn("read-only", lines[0], "the line carries the error")
+        self.assertTrue(km._client_diag_rotate_failed)
 
     def test_concurrent_posts_rename_only_a_file_at_the_cap_and_lose_no_row(self):
         """Every pane's socket is its own handler thread, so rows arrive concurrently. Without one lock across

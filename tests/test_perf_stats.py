@@ -16,6 +16,7 @@ import inspect
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -180,12 +181,13 @@ class Collector(unittest.TestCase):
         self.assertEqual(d["other"]["count"], 40 - km._PerfStats.SLOTS)
 
     def test_http_keys_are_capped_and_ws_adds_no_time(self):
-        for i in range(100):
+        cap = km._PerfStats.HTTP_PATHS
+        for i in range(cap + 36):
             self.st.http_request("GET /scan/%d" % i, 0.001)
         self.st.http_request("GET /ws", None)
         h = self.st.snapshot()["http"]
-        self.assertEqual(len(h), km._PerfStats.HTTP_PATHS + 1, "64 keys plus the fold")
-        self.assertEqual(h["other"]["count"], 100 - km._PerfStats.HTTP_PATHS + 1,
+        self.assertEqual(len(h), cap + 1, "the cap's keys plus other")
+        self.assertEqual(h["other"]["count"], 36 + 1,
                          "the 36 keys past the cap and /ws, which arrived after it")
         st2 = km._PerfStats()
         st2.http_request("GET /ws", None); st2.http_request("POST /tick", 0.002)
@@ -193,6 +195,26 @@ class Collector(unittest.TestCase):
         self.assertEqual(h["GET /ws"], {"count": 1, "ms": 0.0}, "a socket's lifetime is not a request time")
         self.assertEqual(h["POST /tick"]["count"], 1)
         self.assertAlmostEqual(h["POST /tick"]["ms"], 2.0)
+
+    def test_the_http_cap_clears_the_kernels_own_route_table(self):
+        """HTTP_PATHS bounds the distinct keys for the kernel's LIFETIME (a scanner must not grow the dict), so it
+        has to sit comfortably above the kernel's own fixed routes, or a real route that first arrives after
+        the cap lands in "other" for good. The first cap, 64, was below the route table itself (88 literals
+        on 2026-09-07). The count comes from the do_* dispatch source (`p == "/x"`, `u.path == "/x"` and the
+        `in ("/x", "/y")` tuples; inspect.getsource unwraps the timing decorator), so this trips when routes
+        outgrow the headroom: 1.5x the literal count, room for the collapsed /dist/*, /media/* and /remote/*/…
+        families and an OPTIONS preflight per cross-origin POST route."""
+        lit = re.compile(r'(?:\bp|u\.path) (?:==|in) (?:"(/[^"]*)"|\(((?:"/[^"]*"(?:, )?)+)\))')
+        n = 0
+        for meth in ("do_GET", "do_HEAD", "do_OPTIONS", "do_POST"):
+            src = inspect.getsource(getattr(km.Handler, meth))
+            paths = set()
+            for m in lit.finditer(src):
+                paths.update([m.group(1)] if m.group(1) is not None else re.findall(r'"(/[^"]*)"', m.group(2)))
+            n += len(paths)
+        self.assertGreaterEqual(n, 80, "the derivation lost the route table (did the dispatch shape change?)")
+        self.assertGreaterEqual(km._PerfStats.HTTP_PATHS, int(n * 1.5),
+                                "%d fixed routes: raise HTTP_PATHS, or routes land in other for the kernel's lifetime" % n)
 
     def test_http_key_is_method_plus_normalized_path(self):
         key = km._perf_http_key

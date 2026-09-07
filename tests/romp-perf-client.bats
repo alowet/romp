@@ -16,6 +16,9 @@
 ROMP_SCRIPT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../bin" && pwd)/romp"
 
 setup() {
+    # bin/romp resolves the state directory as ${ROMP_STATE_DIR:-$XDG_STATE_HOME/romp} and the token as
+    # ${ROMP_SERVE_TOKEN:-<state>/serve-token}: a live kernel's exports outrank the redirection below
+    unset ROMP_STATE_DIR ROMP_SERVE_TOKEN
     TEST_DIR="$(mktemp -d)"
     export XDG_STATE_HOME="$TEST_DIR/state"
     mkdir -p "$XDG_STATE_HOME/romp"

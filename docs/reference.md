@@ -692,7 +692,9 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
 
 - `now`, `since`, `uptime_s`, `log`: the clock, when the counters started,
   seconds since the process started, and whether the `romp-perf` log is on.
-- `process`: `rss_kb`, `threads`, `cpu_s`, `pid`.
+- `process`: `rss_kb` (resident set size in KB: the current size on Linux,
+  read from `/proc`; the peak, `ru_maxrss`, on macOS, which has no `/proc`),
+  `threads`, `cpu_s`, `pid`.
 - `pusher`: `cycles`, `wakes` (every wake call; a burst of wakes runs one
   cycle), `wakes_event` and `wakes_backstop` (how the loop's wait ended),
   `cycle_ms_sum`, `cycle_ms_max` (since start), `cycle_ms_last`,
@@ -713,7 +715,7 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   per-session worker they run; the workers' share is `cpu_ms_workers`).
 - `http`: request `count` and `ms` per `METHOD /path` for GET, POST, HEAD and
   OPTIONS, the query string removed and `/dist/*`, `/media/*` and
-  `/remote/*/…` collapsed to one key each, for at most 64 keys; further keys
+  `/remote/*/…` collapsed to one key each, for at most 256 keys; further keys
   fold into `other`. A WebSocket upgrade is counted when it arrives and not
   timed, since its handler runs for the life of the socket.
 
@@ -732,10 +734,15 @@ frames it received is measured in the panes themselves, by
 `ui/webview/perf-telemetry.ts`:
 
 - The feed, Outline and chat bundles wrap their window `message` handler, so
-  each frame's synchronous handling time is recorded by frame type (`feed`,
-  `chatTail`, `session`, `tabOrder`, `bars`, a shell message as `shell`, a raw
-  delta as `delta:<slot>`, anything else as `other`; frames the handler ignores
-  count too). The federation layer, which every kernel page loads, times its
+  each frame's synchronous handling time is recorded by frame type: the
+  frame's `type` string as it is (`feed`, `chatTail`, `session`, `tabOrder`,
+  `bars`, or any other type that is a short identifier: letters, digits,
+  `_ . : -`, at most 32 characters), a raw delta as `delta:<slot>`
+  (`delta:other` when the slot is not such an identifier), a shell message (a
+  `romp` field and no `type`) as `shell`, and `other` for a frame with
+  neither, a `type` that is not a short identifier, or any type past the 32
+  distinct types a minute the pane tracks; frames the handler ignores count
+  too. The federation layer, which every kernel page loads, times its
   own prefixing, delta application and merge of each frame as `fed:<type>`,
   nested outside the pane's handler; each level records its own time, so
   `fed:feed` and `feed` add up to the frame's cost. The timeline's listener is
@@ -761,8 +768,9 @@ frames it received is measured in the panes themselves, by
   function, so a key is `<file>:<function>@<character position>`
   (`feed.js:render@1200`, `feed.js:(anonymous)@48213`), and an inline page
   script (the pane shim, whose socket callback runs for every frame) is
-  `page:<function>@<position>`. The release build keeps identifiers so a key
-  means the same thing after a rebuild; whitespace and syntax are still
+  `page:<function>@<position>`. The release build keeps identifiers, which
+  keeps the function name in a key readable across rebuilds (the position
+  still moves with any edit to the bundle); whitespace and syntax are still
   minified.
 - Once a minute the pane posts ONE `clientDiag` row on the socket it already
   uses for breadcrumbs, only when something happened that minute (a frame

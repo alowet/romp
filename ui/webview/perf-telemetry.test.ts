@@ -10,6 +10,8 @@
 // window the way federation-closed-store.test.ts does.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import {
   Ring, percentile, histBucket, histQuantileBucket, classifyFrame, scriptKey, sanitizeInvoker, uaClass, attributeScripts,
   createPerfTelemetry, installPerfTelemetry, perfFrameHandler,
@@ -686,4 +688,43 @@ test("installPerfTelemetry: one collector per page on window.__rompPerf, wired t
     delete g.window;
     delete g.document;
   }
+});
+
+// ── the wraps themselves ──
+// Everything above drives the collector through PerfDeps, so nothing in it fails when a pane bundle stops
+// wrapping its listener: the whole suite stayed green with a wrap removed (review, 2026-09-07). These pin the
+// source text, the way heal-on-hostup.test.ts pins the chat pane's listener, for all four panes and for the
+// collector install in federation's start().
+const UI = path.resolve(process.cwd(), "..", "ui", "webview");
+const readUi = (f: string) => fs.readFileSync(path.join(UI, f), "utf8");
+
+test("each pane bundle's one window message listener is installed through perfFrameHandler under its own app name", () => {
+  const panes: Array<[string, string]> = [["render.ts", "chat"], ["feed.ts", "feed"], ["fleet.ts", "fleet"], ["timeline-main.ts", "timeline"]];
+  for (const [file, app] of panes) {
+    const src = readUi(file);
+    assert.match(src, /import \{ perfFrameHandler \} from "\.\/perf-telemetry";/, file + " imports the wrapper");
+    const listeners = src.match(/window\.addEventListener\("message", /g) || [];
+    assert.equal(listeners.length, 1, file + " has one window message listener");
+    assert.ok(src.includes('window.addEventListener("message", perfFrameHandler("' + app + '", '),
+      file + " installs it through perfFrameHandler as app " + app);
+  }
+});
+
+test("federation's start() installs the page collector first: before __rompFed, whose inbound path times through it", () => {
+  const src = readUi("federation.ts");
+  assert.ok(src.includes('import { installPerfTelemetry, classifyFrame, type RompPerf } from "./perf-telemetry";'));
+  const at = src.indexOf("\n  start(): void {");
+  assert.ok(at > 0, "start() found");
+  const end = src.indexOf("\n  }\n", at);
+  assert.ok(end > at, "start() closes");
+  const body = src.slice(at, end);
+  const install = body.indexOf("this.perf = installPerfTelemetry(this.app);");
+  assert.ok(install > 0, "start() installs the collector");
+  const app = body.indexOf('this.app = w.__rompApp || "chat";');
+  assert.ok(app > 0 && app < install, "the app name is read first: the collector is keyed by it");
+  const fed = body.indexOf("w.__rompFed = {");
+  assert.ok(fed > install, "__rompFed (the shim's inbound entry, which runs inbound() and its fed: brackets) is published after the collector");
+  // nothing else runs before the install: the two lines above it are the window handle and the app name
+  const before = body.slice(0, install).split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("//"));
+  assert.deepEqual(before, ["start(): void {", "const w = window as any;", 'this.app = w.__rompApp || "chat";']);
 });

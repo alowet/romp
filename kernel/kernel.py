@@ -184,7 +184,9 @@ class _PerfStats:
     milliseconds of wall time, `*_s` seconds:
       now, since, uptime_s, log    clock; when the counters started (a restart resets them); seconds
                                    since the process started; whether the romp-perf stderr log is on
-      process                      rss_kb, threads, cpu_s (time.process_time), pid
+      process                      rss_kb (the CURRENT resident size on Linux, from /proc; the PEAK,
+                                   ru_maxrss, on macOS: _process_stats), threads, cpu_s
+                                   (time.process_time), pid
       pusher                       cycles (one per _pusher_cycle), wakes (every _pusher_wake.set()
                                    call; a burst coalesces into one cycle), wakes_event /
                                    wakes_backstop (how the loop's wait ended: flag set, or the 0.5 s
@@ -223,7 +225,12 @@ class _PerfStats:
                                    no ms: its handler returns when the socket closes, which is a
                                    connection's lifetime, not a request's."""
     RING = 256
-    HTTP_PATHS = 64
+    # The kernel's own route table is 88 fixed "METHOD /path" pairs (35 GET, 1 HEAD and 52 POST literals in
+    # the do_* dispatches, counted 2026-09-07), plus the collapsed /dist/*, /media/* and /remote/*/… families
+    # and an OPTIONS preflight per cross-origin POST route. The cap has to clear all of that with room, or
+    # routes that first arrive after it land in "other" for the kernel's lifetime (the first cap, 64, was
+    # below the table itself). test_perf_stats pins it at 1.5x the literal count.
+    HTTP_PATHS = 256
     SLOTS = 32
     STAGES = ("jobs", "push", "push.chat", "push.feed", "push.timeline", "push.send")
     BUILDS = ("chat", "feed", "timeline")
@@ -931,19 +938,35 @@ def _version_info():
 # are ever kept; `romp perf client` reads both. Checked on every append: one stat, under one lock.
 CLIENT_DIAG_MAX_BYTES = 8 * 1024 * 1024
 _client_diag_lock = threading.Lock()
+# Set once a rotation rename has been refused, so the stderr line in _client_diag_append is written once per
+# kernel: a rename that stays refused (an unwritable state directory, a directory sitting at the .1 name) would
+# otherwise say so on every row, a line a minute per pane.
+_client_diag_rotate_failed = False
 
 
 def _client_diag_append(fp, line):
     """Append one row to client-diag.jsonl, rotating it first once it is at the cap. One lock across the size
     check, the rename and the write: every pane's socket is its own handler thread, so rows arrive
     concurrently, and two threads finding the file at the cap at once would both rename, the second moving
-    the file the first had just started over the run the first had just rotated, and that run was gone."""
+    the file the first had just started over the run the first had just rotated, and that run was gone.
+    A refused rename is said on stderr (once, see _client_diag_rotate_failed) and the row is appended anyway:
+    the bound has failed, and a file growing past the cap with nothing saying why is the silent kind of
+    failure (review, 2026-09-07). Only the absent-file case of the size check is quiet: a fresh state
+    directory has no file yet, and the append creates it."""
+    global _client_diag_rotate_failed
     with _client_diag_lock:
         try:
-            if fp.stat().st_size >= CLIENT_DIAG_MAX_BYTES:
+            size = fp.stat().st_size
+        except FileNotFoundError:
+            size = 0
+        if size >= CLIENT_DIAG_MAX_BYTES:
+            try:
                 os.replace(str(fp), str(fp) + ".1")
-        except OSError:
-            pass   # no file yet (fresh state) or a failed rename: the append below still goes to the current file
+            except OSError as e:
+                if not _client_diag_rotate_failed:
+                    _client_diag_rotate_failed = True
+                    print("[client-diag] could not rotate %s to %s.1 (%s): the file keeps growing past %d bytes"
+                          % (fp, fp, e, CLIENT_DIAG_MAX_BYTES), file=sys.stderr)
         with open(fp, "a", encoding="utf-8") as f:
             f.write(line)
 
