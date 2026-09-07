@@ -5,12 +5,16 @@
 //
 // Rendering is KEYED + INCREMENTAL: cards are kept alive across the host's live
 // pushes and updated in place — never torn down — so hovering one doesn't flicker
-// when the fleet streams new deliverables in.
+// when the sessions stream new deliverables in. A kept card is REPAINTED only when
+// its inputs changed (feed-card-gate.ts): the kernel re-sent it, a board-level input
+// it reads moved, or a gesture touched it. Its column and order are re-applied on
+// every render regardless.
 import { distillText, distillInputs, applyDistillLine, distillPending, distillStaleNote } from "./distiller-line";
 import { flipNeeded } from "./feed-flip";
 import { delegate } from "./actions";
 import { paintHeld, paintReleased } from "./paint-gate";
 import { linkifyPrRefs, setLinkedText, senderPrRepo, installPrLinkOpener } from "./pr-links";
+import { cardInputsKey, cardNeedsUpdate, type GateEnv } from "./feed-card-gate";
 import { spinFor, waitedSuffix, awaitWord, groupRows, GROUP_TITLE, ROW_KIND_OF_LEGACY, type AwaitRow } from "./spin-caption";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { searchMatches, searchSids } from "./feed-search";
@@ -488,9 +492,19 @@ onExternalSettingsChange((s) => { applyTheme(document, s); render(); });
 // Card-display prefs read straight from the shared 'romp:settings' (the kernel's ⛭ gear writes it; same
 // document as this feed bundle). Default ON. These gate the CARDS only — the modal always shows everything
 // (the user 2026-06-17). `!== false` so a missing key defaults to shown.
-function feedPrefs(): { newestFirst: boolean; collapsed: boolean; grouped: boolean; stacked: boolean } {
+// Memoised on the RAW settings string: called per card per render, and each call parsed the blob. Keyed on
+// the raw string, the memo is exact and needs no invalidation. `colormap` rides along for the per-card
+// update gate (feed-card-gate.ts): a colormap pick repaints every card once, as the settings epoch did.
+type FeedPrefs = { newestFirst: boolean; collapsed: boolean; grouped: boolean; stacked: boolean; colormap: string };
+const PREFS_DEFAULT: FeedPrefs = { newestFirst: false, collapsed: false, grouped: true, stacked: false, colormap: "aurora" };
+let prefsRaw: string | null | undefined;
+let prefsMemo: FeedPrefs = PREFS_DEFAULT;
+function feedPrefs(): FeedPrefs {
+  let raw: string | null = null;
+  try { raw = localStorage.getItem("romp:settings"); } catch { return PREFS_DEFAULT; }
+  if (raw === prefsRaw) return prefsMemo;
   try {
-    const s = JSON.parse(localStorage.getItem("romp:settings") || "{}");
+    const s = JSON.parse(raw || "{}");
     // newestFirst + collapsed default OFF (=== true): the feed's natural order is oldest-first, and cards
     // arrive with their summary open (the user 2026-07-07). collapsed is the DEFAULT section state new cards
     // inherit — a per-card expand overrides just that card without turning the mode off. (Sub-goals is now one
@@ -498,9 +512,11 @@ function feedPrefs(): { newestFirst: boolean; collapsed: boolean; grouped: boole
     // grouped (the user 2026-07-13): each column groups its cards by SESSION (tab/lane order), a session-name
     // header on the backdrop between runs, the per-card name dropped — the compact by-session read.
     // Default ON (!== false, same day): grouping is the feed's normal reading mode; the toggle opts OUT.
-    return { newestFirst: s.newestFirst === true, collapsed: s.collapsed === true, grouped: s.grouped !== false,
-             stacked: s.stacked === true };
-  } catch { return { newestFirst: false, collapsed: false, grouped: true, stacked: false }; }
+    prefsMemo = { newestFirst: s.newestFirst === true, collapsed: s.collapsed === true, grouped: s.grouped !== false,
+                  stacked: s.stacked === true, colormap: String(s.colormap || "aurora").toLowerCase() };
+  } catch { prefsMemo = PREFS_DEFAULT; }
+  prefsRaw = raw;
+  return prefsMemo;
 }
 // The kernel's session order (session-order.json — the SAME order the chat tabs + timeline lanes hold; the
 // user 2026-07-13: grouped-mode sessions must match it). Rides every feed push; federation concatenates
@@ -594,6 +610,10 @@ function setFeedSearch(q: string): void {
 // same pair settings sync rides): the browser's same-origin iframes hear the localStorage write
 // (`storage` fires cross-document), and VS Code's extension fans {colorSync} to its other panels.
 // Apply it to every copy this pane holds and re-render; the kernel's own re-broadcast reconciles.
+// IN PLACE, deliberately: these objects are federation's held frame, so the write lands in the cache too
+// and a re-emit before the kernel's own rebuild keeps the new colour (copies in this pane's list alone
+// would hand the old colour back on the next merged emission). The per-card update gate cannot see an
+// in-place write through object identity, so the colour rides the card key instead (feed-card-gate.ts).
 function applyColorEcho(sid: string, bg: string): void {
   if (!sid || !bg) return;
   const color = { bg, fg: "#ffffff" };   // fg fixed white, matching the kernel's _name_color
@@ -689,6 +709,8 @@ let canUndoClear = false;   // host: cleared.jsonl has rows → the UndoClear bu
 // node) can't slide it and it would pop. We map the new card back to its predecessor's old rect so it slides
 // from there instead of appearing from nowhere. Rebuilt every render.
 let prevItemKey = new Map<string, string>();
+// Counts renders: the per-card update gate's key for a quarantine card carries it, so those cards never skip.
+let renderSeq = 0;
 
 function el(tag: string, cls?: string): HTMLElement {
   const e = document.createElement(tag);
@@ -900,7 +922,7 @@ function cardBellSvg(off: boolean): string {
     + '<path d="M6.6 11.6 A1.5 1.5 0 0 0 9.4 11.6"/>' + slash + "</svg>";
 }
 
-function cardNotifyOn(it: AskItem): boolean {
+function cardNotifyOn(it: { itemId: string; notify?: boolean | null }): boolean {
   return pendingNotify.has(it.itemId) ? !!pendingNotify.get(it.itemId) : !!it.notify;
 }
 
@@ -924,6 +946,23 @@ function setCardNotify(card: HTMLElement, it: AskItem, value: boolean): void {
   pendingNotify.set(it.itemId, value);               // sticky until the kernel's payload carries it
   paintCardBell(card, value);                        // acknowledge instantly, before the round-trip
   vscodeApi?.postMessage({ type: "cardNotify", itemId: it.itemId, sid: it.sid, value });
+}
+
+// Re-arm the card-face latches (Retry's "Retrying…", Revive's "Reviving…") on the kernel's reply to the
+// click: an err frame for the session, or for no session in particular. The click-safe rule holds the
+// acknowledgement until a deciding event; the per-card update gate no longer repaints every card on every
+// push, so the reply frame and a repaint of the card (a new object, a key flip) are those events. A refusal
+// the kernel answers with neither frame nor payload change leaves the latch until the card next repaints.
+function rearmLatches(sid: string): void {
+  for (const card of askEls.values()) {
+    const a = card as any;
+    const it = a._it as AskItem | undefined;
+    if (sid && it && it.sid !== sid) continue;
+    const r = a._apiRetry as HTMLButtonElement | undefined;
+    if (r && r.disabled) { r.disabled = false; r.textContent = "Retry"; }
+    const v = a._revive as HTMLButtonElement | undefined;
+    if (v && v.disabled) { v.disabled = false; v.textContent = (v as any)._idle || "Revive"; }
+  }
 }
 
 function showCardMenu(e: MouseEvent, card: HTMLElement): void {
@@ -1257,7 +1296,7 @@ function makeAskCard(it: AskItem): HTMLElement {
     card.dispatchEvent(new MouseEvent("mouseleave"));
     dressHeaderIfLast(card, it.sid);   // the run's last card takes its header with it — one motion (2026-08-24)
     pendingCleared.add(it.itemId);   // suppress from incoming pushes until the kernel confirms the clear
-    clearedStack.push([it]);         // cache for an instant optimistic Undo
+    clearedStack.push([(card as any)._it ?? it]);   // cache the FRESHEST payload copy for an instant optimistic Undo (the closure's `it` is the card's creation-time object)
     card.classList.add("dismissing");
     vscodeApi?.postMessage({ type: "askClear", itemId: it.itemId, sid: it.sid });
     setTimeout(() => { if (askEls.get(it.itemId) === card && card.classList.contains("dismissing")) { card.remove(); askEls.delete(it.itemId); dropDismissed([it.itemId]); } }, 180);
@@ -1715,36 +1754,13 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
   renderTree();
 }
 
-// The payload copy a card was last painted from, serialized — a card whose data did not change since is not
-// repainted. Every feed frame used to rewrite all ~155 cards (about a hundred DOM writes each) when the frame
-// changed one of them (2026-09-04). The display-side state a paint also reads (hover/pin focus, the pending
-// bell, the done ticks) is folded into the key, so a change to any of it repaints as before.
-// Bumped whenever a display-side input EVERY card reads changes: the view prefs (grouped, collapsed), the
-// working/awaiting/unknown status sets and the self host that the session dots and delegation lines read.
-// A card's key carries it, so such a change repaints every card once, as before. The coarse clock repaints
-// each card at most every 15 s so the durations it renders (waited, working for, paragraph ages) keep
-// ticking — the old cadence was every kernel push, at most 60 s apart.
-let paintEpoch = 0;
-let statusSig = "";
-function noteStatusInputs(): void {
-  const sig = [...workingSet].sort().join(",") + "|" + [...awaitingSet].sort().join(",") + "|" + [...unknownSet].sort().join(",") + "|" + feedSelfHost;
-  if (sig !== statusSig) { statusSig = sig; paintEpoch++; }
-}
-function cardPaintKey(it: AskItem): string {
-  return JSON.stringify(it) + "|" + (it.itemId === (hoverAskId ?? pinnedAskId) ? "f" : "") + (it.itemId === pinnedAskId ? "p" : "")
-    + "|" + (pendingNotify.has(it.itemId) ? String(pendingNotify.get(it.itemId)) : "") + "|" + [...pendingDone].join(",")
-    + "|" + paintEpoch + "|" + Math.floor(Date.now() / 15000);
-}
-
+// Paints a card's face from its payload copy. Whether to call it at all is reconcileCol's decision (the
+// per-card update gate, feed-card-gate.ts): a card is repainted when its object is a new one or a
+// board-level input it reads changed, and left alone otherwise. Everything this function reads outside
+// `it` is therefore in that key — an input added here is added there.
 function updateAskCard(card: HTMLElement, it: AskItem) {
   const a = card as any;
-  a._it = it;   // the freshest payload copy — the right-click bell menu reads this, never a stale closure
-  const pk = cardPaintKey(it);
-  // Nothing this card shows has changed → leave its DOM alone. Except a card with a LATCHED button (Approve →
-  // Delivering…, Retry → Retrying…, Revive → Reviving…): those rely on the next paint to re-enable when the
-  // refused action left the payload unchanged, so a card with a disabled button always repaints.
-  if (a._paintKey === pk && !card.querySelector("button[disabled]")) return;
-  a._paintKey = pk;
+  a._it = it;   // the freshest payload copy — the right-click bell menu reads this, never a stale closure; and the gate's identity
   // per-card bell: retire the optimistic value once the kernel's payload agrees (event-based, no timer),
   // then render whichever stands. Same sticky-optimism shape as the timeline lane's _pendingFlags.
   if (pendingNotify.has(it.itemId) && !!it.notify === pendingNotify.get(it.itemId)) pendingNotify.delete(it.itemId);
@@ -2214,10 +2230,16 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
       : it.blocked.status ? `⚠ API error · ${it.blocked.status}` : "⚠ API error";
     // a refusal's raw CLI text buries the remedy — the kernel's `what` states it plainly, so tip with that
     setTip(a._apiBadge as HTMLElement, (spendLimit || refusal) ? it.blocked.what : (it.blocked.text || it.blocked.what));
+    // The latched "Retrying…" re-arms on any repaint of this card — a new object or a key flip; the expected
+    // path is the session resuming, which moves the working set (the key) and hides the whole unit — and on
+    // the kernel's reply to the click (an err frame for the session, rearmLatches). Before the per-card update
+    // gate it re-armed on the next push of any card. The click is a MANUAL retry (the chat pane sends the
+    // same): the kernel fires it past every auto gate, so the button is never a dead no-op on a paused or
+    // suppressed thread. Revive below latches and re-arms the same way.
     a._apiRetry.disabled = false; a._apiRetry.textContent = "Retry";
     a._apiRetry.onclick = (ev: Event) => {
       ev.stopPropagation();
-      vscodeApi?.postMessage({ type: "apiRetry", id: it.sid });
+      vscodeApi?.postMessage({ type: "apiRetry", id: it.sid, manual: true });
       a._apiRetry.disabled = true; a._apiRetry.textContent = "Retrying…";
     };
   }
@@ -2273,6 +2295,7 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
   if (isParked && it.blocked) {
     const toSid = it.blocked.toSid || it.sid;
     a._revive.disabled = false; a._revive.textContent = `Revive ${it.blocked.toName || it.name}`;
+    (a._revive as any)._idle = a._revive.textContent;   // the label rearmLatches restores
     a._revive.onclick = (ev: Event) => {
       ev.stopPropagation();
       vscodeApi?.postMessage({ type: "reviveSession", id: toSid });
@@ -3520,6 +3543,10 @@ function makeUndoClearBtn(): HTMLElement {
       for (const it of batch) {
         pendingCleared.delete(it.itemId);
         pendingRestored.set(it.itemId, it);                                  // stay sticky until the kernel push carries it
+        // a card still inside its 180 ms collapse keeps its element AND its object, so the per-card update
+        // gate would leave `.dismissing` on it and the collapse timer would then remove the restored card:
+        // the Undo gesture is the event that takes the class off
+        askEls.get(it.itemId)?.classList.remove("dismissing");
         if (!asks.some((a) => a.itemId === it.itemId)) asks.push(it);        // show it NOW
       }
       render();
@@ -4250,7 +4277,7 @@ function clearSessionCards(sid: string): void {
   }, 180);
 }
 
-function reconcileCol(listEl: HTMLElement, entries: Entry[], globalDesired: Set<string>) {
+function reconcileCol(listEl: HTMLElement, entries: Entry[], globalDesired: Set<string>, gate: GateEnv) {
   const existing = new Map<string, HTMLElement>();
   for (const c of Array.from(listEl.children) as HTMLElement[]) {
     const k = c.dataset.key;
@@ -4264,7 +4291,14 @@ function reconcileCol(listEl: HTMLElement, entries: Entry[], globalDesired: Set<
       key = "a:" + e.ask.itemId;
       card = askEls.get(e.ask.itemId) || makeAskCard(e.ask);
       askEls.set(e.ask.itemId, card);
-      updateAskCard(card, e.ask);
+      // THE UPDATE GATE (feed-card-gate.ts): repaint only a card the kernel re-sent (a new object — the pane
+      // shim's delta reassembly and federation's merge keep an unchanged card's object by reference) or whose
+      // board-level inputs changed (the key). Everything below — placement, the insertBefore order walk, the
+      // cross-column removal — stays unconditional, so a card whose column or sort changed still moves. The
+      // key is stored only after updateAskCard returns: a throw mid-update leaves the card marked for another
+      // try, not recorded as painted.
+      const ik = cardInputsKey(e.ask, gate);
+      if (cardNeedsUpdate(card as any, e.ask, ik)) { updateAskCard(card, e.ask); (card as any)._ik = ik; }
     } else if (e.kind === "sess") {
       // grouped-mode session header — keyed per (column, sid): one session can head a run in EVERY column
       key = "s:" + listEl.id + ":" + e.sid;
@@ -4771,10 +4805,21 @@ function render() {
   prevCols = nextCols;
   const flipFirst = needFlip ? captureCardRects(cols) : new Map<string, FlipState>();
 
+  // The per-card update gate's inputs, resolved ONCE for this render (feed-card-gate.ts cardInputsKey):
+  // everything updateAskCard reads outside the ask object. A card is repainted when its object or this key
+  // changed, so a frame's cost scales with the cards the kernel re-sent and the cards a changed input
+  // reaches, not with the board.
+  const gprefs = feedPrefs();
+  const gate: GateEnv = {
+    dot: dotFor, working: (n) => workingSet.has(n),
+    focusId: hoverAskId ?? pinnedAskId, pinnedId: pinnedAskId, notifyOn: cardNotifyOn,
+    prefs: { grouped: gprefs.grouped, collapsed: gprefs.collapsed, colormap: gprefs.colormap },
+    hostDown: hostIsDown, selfHost: feedSelfHost, repo: prRepoOf, seq: ++renderSeq,
+  };
   const desired = new Set<string>();
-  reconcileCol(cols.asks, buckets.asks, desired);
-  reconcileCol(cols.needsInput, buckets.needsInput, desired);
-  reconcileCol(cols.completed, buckets.completed, desired);
+  reconcileCol(cols.asks, buckets.asks, desired, gate);
+  reconcileCol(cols.needsInput, buckets.needsInput, desired, gate);
+  reconcileCol(cols.completed, buckets.completed, desired, gate);
   // the count chip shows the number only when there ARE cards; an empty column shows nothing — not "0"
   // (the user 2026-06-25). Empty string collapses the chip (it has no padding/background of its own).
   const setCount = (elc: HTMLElement, n: number) => { elc.textContent = n ? String(n) : ""; elc.style.display = n ? "" : "none"; };
@@ -5007,7 +5052,6 @@ window.addEventListener("blur", () => { if (kbMode) kbExit(); });   // shell mov
 // same-page toggle both land here).
 let lastCollapsedPref = feedPrefs().collapsed;
 function onSettingsChanged(): void {
-  paintEpoch++;   // grouped/collapsed/stacked reach into every card's paint (name row, row2, sections)
   const p = feedPrefs();
   if (p.collapsed !== lastCollapsedPref) { lastCollapsedPref = p.collapsed; secChoice.clear(); }
   applyStacked(p.stacked);
@@ -5328,7 +5372,6 @@ function applyFeedPayload(m: any): void {
   }
   awaitingSet = new Set(Array.isArray(m.awaiting) ? m.awaiting : []);   // await-green awaiting dots (the user 2026-07-13)
   unknownSet = new Set(Array.isArray(m.stateUnknown) ? m.stateUnknown : []);   // listed-but-unreadable → gray ring, never a blank
-  noteStatusInputs();   // the dots and delegation lines every card paints read these → a change repaints every card
   bgServicesMap = m.bgServices && typeof m.bgServices === "object" ? m.bgServices : {};   // session name -> judge-classified service descs → the session-header chip (2026-07-24)
   if (Array.isArray(m.order)) sessionOrder = m.order.filter((x: any) => typeof x === "string");   // grouped-mode session rank (tab/lane order)
   pendingHosts = Array.isArray(m.pendingHosts) ? m.pendingHosts.filter((h: any) => typeof h === "string") : [];
@@ -5447,7 +5490,7 @@ listenForFrames(perfFrameHandler("feed", (m) => vscodeApi?.postMessage(m), (e: M
   } else if (m.type === "settingRefused" && typeof m.text === "string" && m.text) {
     // the kernel refused a bell toggle this page posted (its store could not be read): end the optimistic
     // state ON THIS EVENT — the card's sticky latch drops and the bell repaints to what the payload holds
-    // (the paint key reads the latch) — and say why. A SOFT refusal: nothing typed was lost, so the fading
+    // (the card gate's key reads the latch through cardNotifyOn) — and say why. A SOFT refusal: nothing typed was lost, so the fading
     // toast (the chat's weight for the same class), never the must-dismiss dialog; the shell's bell keeps the
     // durable record under its own `refused` kind, so muting judge warnings never mutes these. A `warn`
     // frame had no handler on this page, so the bell stayed painted as if the click had landed until a reload.
@@ -5466,6 +5509,7 @@ listenForFrames(perfFrameHandler("feed", (m) => vscodeApi?.postMessage(m), (e: M
                                  text: copy ? title + ": " + copy : title,
                                  sid: typeof m.sid === "string" ? m.sid : "" }, "*");
     showErrDialog(title, m.text, copy);
+    rearmLatches(typeof m.sid === "string" ? m.sid : typeof m.id === "string" ? m.id : "");   // the kernel's reply IS the event
   } else if (m.type === "pickerOptions" && typeof m.name === "string") {
     // the host read the blocked session's live resume-picker screen — show the
     // same options in-page; a choice goes back as keystrokes (transport only,

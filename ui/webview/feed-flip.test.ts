@@ -45,17 +45,23 @@ test("the fly reads every rect before it writes any transform", () => {
   assert.match(body, /const moves: \{ c: HTMLElement; dx: number; dy: number; crossed: boolean \}\[\] = \[\];/);
 });
 
-test("a card whose data and display state did not change is not repainted", () => {
-  assert.match(SRC, /function cardPaintKey\(it: AskItem\): string \{\n\s*return JSON\.stringify\(it\) \+ "\|"/);
-  assert.match(SRC, /const pk = cardPaintKey\(it\);[\s\S]*?if \(a\._paintKey === pk && !card\.querySelector\("button\[disabled\]"\)\) return;/,
-    "a latched (disabled) button always repaints: the next paint is what re-enables it");
-  // the inputs every card reads that live outside its item: prefs, the status sets + self host, the clock
-  assert.match(SRC, /\+ "\|" \+ paintEpoch \+ "\|" \+ Math\.floor\(Date\.now\(\) \/ 15000\);/);
-  assert.match(SRC, /function onSettingsChanged\(\): void \{\n\s*paintEpoch\+\+;/);
-  assert.match(SRC, /function noteStatusInputs\(\): void \{\n\s*const sig = \[\.\.\.workingSet\]\.sort\(\)\.join\(","\) \+ "\|" \+ \[\.\.\.awaitingSet\][\s\S]*?\[\.\.\.unknownSet\][\s\S]*?feedSelfHost;\n\s*if \(sig !== statusSig\) \{ statusSig = sig; paintEpoch\+\+; \}/);
-  assert.match(SRC, /unknownSet = new Set\([\s\S]*?\n\s*noteStatusInputs\(\);/, "the payload handler notes the sets right after setting them");
-  // the display-side inputs the paint reads are part of the key (a hover, a pin, a pending bell, a done tick)
-  assert.match(SRC, /hoverAskId \?\? pinnedAskId/);
-  assert.match(SRC, /pendingNotify\.has\(it\.itemId\)/);
-  assert.match(SRC, /\[\.\.\.pendingDone\]\.join\(","\)/, "an optimistic done tick anywhere repaints every card: the set is usually empty");
+test("a card repaints only when its object or a board-level input it reads changed (feed-card-gate.ts)", () => {
+  // the paint key that gated here before serialised every card per render and carried two whole-board terms
+  // (a 15 s clock, an epoch bumped by every status-set and settings change); none of it remains
+  assert.doesNotMatch(SRC, /cardPaintKey|paintEpoch|noteStatusInputs|_paintKey|button\[disabled\]/);
+  assert.match(SRC, /import \{ cardInputsKey, cardNeedsUpdate, type GateEnv \} from "\.\/feed-card-gate";/);
+  // reconcileCol gates the ask branch: a new object OR a new key repaints; the key is stored after the paint
+  assert.match(SRC, /function reconcileCol\(listEl: HTMLElement, entries: Entry\[\], globalDesired: Set<string>, gate: GateEnv\)/);
+  assert.match(SRC, /const ik = cardInputsKey\(e\.ask, gate\);\n\s*if \(cardNeedsUpdate\(card as any, e\.ask, ik\)\) \{ updateAskCard\(card, e\.ask\); \(card as any\)\._ik = ik; \}/);
+  assert.match(SRC, /function updateAskCard\(card: HTMLElement, it: AskItem\) \{\n\s*const a = card as any;\n\s*a\._it = it;/,
+    "updateAskCard stashes the object the gate compares, first thing");
+  // the env, built once per render from everything a card's paint reads outside its object
+  assert.match(SRC, /const gate: GateEnv = \{\n\s*dot: dotFor, working: \(n\) => workingSet\.has\(n\),\n\s*focusId: hoverAskId \?\? pinnedAskId, pinnedId: pinnedAskId, notifyOn: cardNotifyOn,\n\s*prefs: \{ grouped: gprefs\.grouped, collapsed: gprefs\.collapsed, colormap: gprefs\.colormap \},\n\s*hostDown: hostIsDown, selfHost: feedSelfHost, repo: prRepoOf, seq: \+\+renderSeq,\n\s*\};/);
+  assert.match(SRC, /reconcileCol\(cols\.asks, buckets\.asks, desired, gate\);\n\s*reconcileCol\(cols\.needsInput, buckets\.needsInput, desired, gate\);\n\s*reconcileCol\(cols\.completed, buckets\.completed, desired, gate\);/);
+  // the latches: the card's Retry is a manual retry, and Retry and Revive re-arm on the kernel's err frame for the session
+  assert.match(SRC, /vscodeApi\?\.postMessage\(\{ type: "apiRetry", id: it\.sid, manual: true \}\);/);
+  assert.match(SRC, /showErrDialog\(title, m\.text, copy\);\n\s*rearmLatches\(typeof m\.sid === "string" \? m\.sid : typeof m\.id === "string" \? m\.id : ""\);/);
+  assert.match(SRC, /\(a\._revive as any\)\._idle = a\._revive\.textContent;/);
+  // Undo takes .dismissing off a card restored inside its collapse window (the class rewrite no longer does)
+  assert.match(SRC, /askEls\.get\(it\.itemId\)\?\.classList\.remove\("dismissing"\);/);
 });
