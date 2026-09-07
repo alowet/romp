@@ -62,6 +62,22 @@ way a paper opens from OpenReview: full size, and it stays open beside the dashb
 you keep working. If the browser blocks that new tab, the PDF opens inside the dashboard
 instead; a PDF too large to show offers a download in its place.
 
+**Tags and groups.** A tag is a named, colored set of sessions; a session can be in
+several. Right-click a tab and open **Tags** to add or remove them. Tags filter every
+surface (the tag button in the strip narrows the tabs to the tags you pick), and they group
+the tabs: as soon as any session carries a tag, the strip shows one section per tag, in your
+tag order, each with a header in the tag's color, and the untagged sessions after a divider
+at the end. A session with several tags sits under the first of them in your tag order; its
+other tags still filter. Click a header to fold that section down to a count, plus one pip
+when a member is working or waiting on you; the section of the tab you are reading never
+folds (its header says so, and a click there changes nothing), and the `archived` section
+starts folded. Drag a header to reorder the groups, which
+reorders the tags on every surface (the timeline's tag table shows the same order). To move
+a tab into another group, right-click it and pick **Move to <tag>** under **Tags**: one click
+adds that tag and drops the tab's current group tag, leaving its other tags alone. The row's
+**+** adds the tag without moving the tab. **Group tabs by tag**, at the foot of the tag
+button's menu, turns the sections off for this browser.
+
 ### The feed
 
 The feed is Romp's task-management layer: a card for each task. Romp's
@@ -192,6 +208,20 @@ a subproject that became its own repository, right-click its tab and choose
 **Move to folder…** (or run `romp move <session> <dir>`): the conversation,
 name, mail and history stay with the session, and from the next turn on the
 agent works in the new folder and reads its `CLAUDE.md`.
+
+A session started from another one joins its tags. Forking a session, breaking
+a comment thread out into its own session, and running `romp new` inside a
+session's shell all put the new session in the parent's groups, so a session's
+children land beside it in the tab strip. `romp new --no-inherit` starts one
+outside them; `romp new --in <tag>` names the tags directly (repeatable). The
+**+** picker shows the tags of the tab you are looking at pre-selected in its
+**Tags** row, where you can unpick or add before creating. Opening a name that
+already runs inherits nothing: `romp new --in` still applies to it, while from
+the picker, a name that already runs is focused and the Tags row is not applied
+(a message says so; the row is a prefill, and applying it would move the
+running session). Comment threads have no tab and inherit nothing until they
+are broken out; `romp new` run inside a thread inherits from the session the
+thread belongs to.
 
 Search reaches inside sessions, not just across their names. As sessions run, a
 lightweight index judge writes each one a headline and an abstract of what it

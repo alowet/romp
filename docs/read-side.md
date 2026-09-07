@@ -344,19 +344,38 @@ from view tags.
 
 ## Tags and views
 
-Two grains, both directory-rooted, matching the "things in the same folder" model:
+A tag is a named, colored set of sessions. The kernel stores tags in
+`timeline-views.json` (name, color, members, and `tagOrder`, the order the user
+has dragged the tags into); a session may carry several, and a tag may span
+attached kernels, joined by name. Tags are edited from a tab's context menu, the
+timeline's tag table, the picker's **Tags** row, and `romp tag`. They do three
+jobs:
 
-- **Tag assignment**: a `directory → tag` map in settings auto-tags a session at
-  launch (e.g. `~/work/* → work`); a manual per-session override in the UI handles
-  reclassification. Tags are mutable identity metadata (alongside name / dir /
-  color).
-- **View selection**: the URL hash (`#work,personal`), ad-hoc and per-tab; a saved
-  default behind the settings gear; or a quick selector control at the timeline
-  bottom. The hash is the fast lever.
+- **Filtering.** Each surface (chat tabs, timeline lanes, outline) keeps its own
+  lens: every session, the untagged ones, or any set of tags.
+- **Grouping.** The chat tab strip sections by tag whenever a session carries
+  one: a header per tag in `tagOrder`, each tab under the first of its tags in
+  that order (its home tag), the untagged after a divider. Sections fold per
+  browser; dragging a header reorders `tagOrder` for every surface; **Move to
+  <tag>** in a tab's menu adds the target tag and drops the home tag in one
+  click. Groups are tags: there is no second store and no per-session group
+  field.
+- **Inheritance.** A session spawned from another joins the parent's tags at the
+  creation event: a fork, a promoted comment thread, and `romp new` run inside a
+  session (it sends its `ROMP_SID` as `parent`; `--no-inherit` withholds it and
+  `--in <tag>` adds tags; a thread's `ROMP_SID` resolves to the session the
+  thread belongs to). Opening a running session inherits nothing: `/new`
+  re-asserts an explicit `--in` on it, while the picker's createSession op
+  warns and leaves the running session's tags alone, because its Tags row is a
+  prefill from the active tab rather than an ask. A comment thread inherits
+  nothing until it is promoted, since it has no tab. Only the local kernel's
+  tags are inherited; a parent held only by a remote kernel's tag is a known gap.
+  Every writer of the views blob, the WS `setTimelineViews` full-blob write
+  included, runs under `_views_lock`.
 
-The exact project directory defines a **comms group**; a directory→tag rule defines
-the coarser **display label**. Both default from where you launched, both
-adjustable.
+The exact project directory still defines the **comms group** sketched above.
+The directory-to-tag auto-tagging rule and the URL-hash view selection once
+planned here did not ship; the per-surface lens took the hash's place.
 
 Every dashboard write of the views blob is acknowledged on the socket that posted
 it. A tag edit from the timeline's tag table, its lane gear menu, or a tab's Tags
