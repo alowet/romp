@@ -6,24 +6,38 @@ hand) and returns the check-run verdict: {"conclusion", "title", "summary"}. No 
 meaning of the gate lives in this file and in tests/test_tier_policy.py.
 
 Record shape (every key the rules read):
-  labels: [str]          author: login         head_sha: str          files: [path]
+  labels: [str]          author: login         head_sha: str
+  files: [path]          (a renamed or copied file appears under BOTH its old and new path)
+  files_truncated: bool  (the API lists at most 3000 files; True when the PR has more than it listed)
   reviews: [{user, state, commit_id, submitted_at, dismissed}]      permissions: {login: permission}
-  first_check_at: epoch|None   head_floor: epoch   created_at: epoch   now: epoch   body: str
+  first_check_at: epoch|None   (chain_start of THIS PR's hourly verdicts on this head, anchored at now)
+  head_floor: epoch   now: epoch   body: str
+  (the fetcher also records created_at; no rule reads it - head_floor already starts from it)
   issues: {number: {exists, is_pr, user, comments: [login]}}   (bots already filtered out by the fetcher)
 
 Tiers: docs (documentation only) passes on green; fix passes on an approval OR seven days with the head
 unchanged and no changes requested; feature passes on an approval; major-feature passes on an approval AND
 a linked issue someone other than the author took part in. A PR touching .github/ or scripts/ci/ — the
-gate's own workflow and code — needs an approval whatever its tier. Zero or two tier labels fail.
+gate's own workflow and code — needs an approval whatever its tier; so does a PR whose file listing the
+API truncated (the unseen files are assumed guarded and not documentation). Zero or two tier labels fail.
 
-An approval is the LATEST review per reviewer (a DISMISSED review stands as that reviewer's latest word
-and never approves) that is APPROVED, by a non-author holding write/admin/maintain, on the CURRENT head.
+An approval is a reviewer's STANDING — their latest APPROVED / CHANGES_REQUESTED / DISMISSED review; a
+COMMENTED review (GitHub files one per inline comment) never changes standing, and a DISMISSED one stands
+as a non-approval that never revives an earlier approval — that is APPROVED, by a non-author holding
+write/admin/maintain, on the CURRENT head.
 
-The seven-day clock: since = the later of head_floor and the first "Tier policy" check run for the head.
-head_floor is the server-stamped moment this head became THIS PR's reviewable head — the PR's created_at,
-raised by every force-push, reopen, and draft-to-ready event on its timeline — so a sha seen briefly at
-day 0 and force-pushed back on day 7, a reopened PR, a PR converted from draft, or a new PR reusing an old
-head all start over. Commit dates are never read: they are the author's to set."""
+The seven-day clock: since = the later of head_floor and first_check_at. first_check_at is the start of
+the UNBROKEN chain of hourly "Tier policy" verdicts THIS PR received on this head (each verdict carries
+the PR number as its external_id; the chain must reach to now, and a gap longer than VERDICT_GAP breaks
+it): seven days means seven consecutive days with this head visible as this PR's head. So a sibling PR's
+verdicts on the same sha lend nothing (the review's critical catch: fast-forwarding a second PR onto a
+head the other maintainer vetoed inherited the first PR's clock while the objection stayed invisible),
+and a sha pushed away and back starts over. head_floor is the server-stamped moment this head became THIS
+PR's reviewable head — the PR's created_at, raised by every force-push, reopen, and draft-to-ready event
+on its timeline — so a reopened PR or one converted from draft starts over too. A head with no verdict
+yet has NOT started its clock: the run that evaluates it posts the first (created_at is never a fallback
+— a stale PR's age would stand in for the gate's first look). Commit dates are never read: they are the
+author's to set."""
 
 TIERS = ("docs", "fix", "feature", "major-feature")
 # TRANSITION (2026-09-07): `docs` is `tests-only` renamed; until the label itself is renamed on the
@@ -31,6 +45,9 @@ TIERS = ("docs", "fix", "feature", "major-feature")
 # is stranded between this landing and the rename. Drop the alias once the label is renamed.
 TIER_ALIASES = {"tests-only": "docs"}
 MAINTAINER_PERMS = ("write", "admin", "maintain")
+# the review states that set a reviewer's standing; COMMENTED (one per inline comment) and PENDING do not
+STANDING_STATES = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+TRUNCATED = "files beyond the API's 3000-entry listing"
 SEVEN_DAYS = 7 * 86400
 # paths whose change needs an approval regardless of tier: the gate's own workflow and code (a PR that
 # rewrites the policy through the seven-day path would have graded itself)
@@ -46,11 +63,13 @@ def _is_doc(path):
 
 
 def _latest_reviews(pr):
-    """{reviewer: latest review} — the latest word per reviewer stands, a DISMISSED one included (it
-    is a non-approval, never an erasure that revives an earlier approval)."""
+    """{reviewer: standing} — the latest APPROVED / CHANGES_REQUESTED / DISMISSED review per reviewer. A
+    DISMISSED one stands (a non-approval, never an erasure that revives an earlier approval); a COMMENTED
+    or PENDING review is skipped, so one inline note after an approval (or an objection) leaves it standing."""
     latest = {}
     for r in sorted(pr.get("reviews") or [], key=lambda r: r.get("submitted_at") or 0):
-        latest[r["user"]] = r
+        if r.get("dismissed") or r.get("state") in STANDING_STATES:
+            latest[r["user"]] = r
     return latest
 
 
@@ -97,10 +116,30 @@ def _linked_issue_discussed(pr):
     return False, "the linked issue(s) have no participant other than the author (or are PRs / missing)"
 
 
+def chain_start(stamps, now, gap):
+    """The start of the unbroken run of verdict stamps that ends within `gap` of now, or None when there
+    is none or the latest is stale. The hourly sweep stamps a head every hour it is this PR's head, so a
+    longer gap means it was not (force-pushed away and back; a sibling branch fast-forwarded onto it) or
+    the gate was down - either way the clock restarts. Pure: the fetcher feeds it this PR's stamps."""
+    s = sorted(x for x in stamps or [] if x)
+    if not s or now - s[-1] > gap:
+        return None
+    start = s[-1]
+    for prev in reversed(s[:-1]):
+        if start - prev > gap:
+            break
+        start = prev
+    return start
+
+
 def _clock_since(pr):
-    floor = pr.get("head_floor") or pr.get("created_at") or pr.get("now") or 0
-    first = pr.get("first_check_at")
-    return max(floor, first) if first else floor
+    """When the seven-day clock started, or None when it has not: no verdict has stamped this head yet
+    (the run evaluating it posts the first), or the record lacks head_floor (the fetcher always sets it,
+    so fail closed on its absence)."""
+    first, floor = pr.get("first_check_at"), pr.get("head_floor")
+    if not first or not floor:
+        return None
+    return max(floor, first)
 
 
 def evaluate(pr):
@@ -111,11 +150,12 @@ def evaluate(pr):
                            % len(labels)}
     tier = labels[0]
     files = list(pr.get("files") or [])
-    guarded = [f for f in files if f.startswith(GUARDED_PREFIXES)]
+    truncated = bool(pr.get("files_truncated"))
+    guarded = [f for f in files if f.startswith(GUARDED_PREFIXES)] + ([TRUNCATED] if truncated else [])
     ok, who = _approved(pr)
 
     if tier == "docs":
-        bad = [f for f in files if not _is_doc(f)]
+        bad = [f for f in files if not _is_doc(f)] + ([TRUNCATED] if truncated else [])
         if bad:
             return {"conclusion": "failure", "title": "Tier policy: docs",
                     "summary": "The docs tier is documentation only (docs/** or *.md, never .github/** or "
@@ -137,7 +177,12 @@ def evaluate(pr):
             return {"conclusion": "failure", "title": "Tier policy: fix",
                     "summary": "Changes requested by %s; the seven-day path is closed until they say otherwise."
                                % ", ".join(objectors)}
-        waited = (pr.get("now") or 0) - _clock_since(pr)
+        since = _clock_since(pr)
+        if since is None:
+            return {"conclusion": "failure", "title": "Tier policy: fix",
+                    "summary": "%s; no Tier policy verdict has stamped this head yet, so the seven-day clock "
+                               "starts with this run." % who}
+        waited = (pr.get("now") or 0) - since
         if waited >= SEVEN_DAYS:
             return {"conclusion": "success", "title": "Tier policy: fix",
                     "summary": "Seven days with the head unchanged and no changes requested (clock: the later of "

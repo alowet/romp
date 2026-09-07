@@ -7,8 +7,14 @@ Trust model, stated once: the workflow that runs this is the BASE branch's copy 
 a PR cannot rewrite its own gate; the token holds checks:write (to post the verdict), pull-requests:read,
 issues:read, contents:read and nothing else. The seven-day clock is bound to THIS PR's head: head_floor is
 the later of the PR's created_at and every server-stamped force-push / reopen / ready-for-review event on
-its timeline, and first_check_at is the earliest "Tier policy" check run for the head (listed with
-filter=all - the default `latest` collapses the hourly runs to the newest). Commit dates are never read.
+its timeline, and first_check_at is the start of the unbroken chain of hourly "Tier policy" verdicts THIS
+PR received on the head: every verdict this fetcher posts carries the PR number as external_id, and only
+runs the GitHub Actions app owns (app.id) with this PR's external_id count, listed with filter=all (every
+run, not the latest per suite) and stamped by the server-set completed_at (started_at as the fallback).
+The workflow's own job carries a DIFFERENT name so exactly one family of same-named runs exists. A renamed
+or copied file is recorded under both its paths, and a listing the API truncated (3000-file cap, checked
+against the PR's changed_files) is flagged; the head is re-read at the end so a push during evaluation
+raises instead of grading a mixed record. Commit dates are never read.
 GITHUB_TOKEN is the GitHub Actions app's installation token, which is what the Checks API's "GitHub Apps
 only" write rule admits; the ruleset requiring this check must select the run posted by the GitHub Actions
 app (a bare context match would accept any write-holder's commit status of the same name).
@@ -22,20 +28,26 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
-from tier_policy import evaluate  # noqa: E402
+from tier_policy import chain_start, evaluate  # noqa: E402
 
 API = "https://api.github.com"
 CHECK_NAME = "Tier policy"
+GITHUB_ACTIONS_APP_ID = 15368      # the app whose installation token GITHUB_TOKEN is; verdicts carry its app.id
+VERDICT_GAP = 6 * 3600             # the sweep is hourly; a longer gap in this PR's verdicts on the head restarts the clock
 MAX_ISSUE_REFS = 5                 # a body can be 64 KiB of "#1 " - bound the work (and the token budget)
 RESET_EVENTS = ("head_ref_force_pushed", "reopened", "ready_for_review")
 
 
 def _iso(s):
     return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()) if s else None
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _req(method, path, token, body=None):
@@ -86,15 +98,26 @@ def build_record(repo, number, token, now=None):
     pr, _ = _req("GET", "/repos/%s/pulls/%d" % (repo, number), token)
     head = pr["head"]["sha"]
     author = pr["user"]["login"]
-    files = [f["filename"] for f in _get_all("/repos/%s/pulls/%d/files" % (repo, number), token)]
+    entries = _get_all("/repos/%s/pulls/%d/files" % (repo, number), token)
+    files = []
+    for f in entries:
+        for p in (f.get("filename"), f.get("previous_filename")):     # renamed/copied: judge the source too
+            if p and p not in files:
+                files.append(p)
+    changed = pr.get("changed_files")
+    files_truncated = changed is not None and changed != len(entries)
     reviews = [{"user": r["user"]["login"], "state": r["state"], "commit_id": r.get("commit_id"),
                 "submitted_at": _iso(r.get("submitted_at")), "dismissed": r["state"] == "DISMISSED"}
                for r in _get_all("/repos/%s/pulls/%d/reviews" % (repo, number), token) if r.get("user")]
     perms = {u: _permission(repo, u, token) for u in {r["user"] for r in reviews}}
     runs = _get_all("/repos/%s/commits/%s/check-runs?check_name=%s&filter=all"
                     % (repo, head, urllib.parse.quote(CHECK_NAME)), token, key="check_runs")
-    starts = [_iso(r.get("started_at")) for r in runs if r.get("started_at")]
-    first_check_at = min(starts) if starts else None
+    now = int(now or time.time())
+    stamps = [_iso(r.get("completed_at") or r.get("started_at")) for r in runs
+              if (r.get("completed_at") or r.get("started_at"))
+              and (r.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID
+              and r.get("external_id") == str(number)]         # THIS PR's verdicts only
+    first_check_at = chain_start(stamps, now, VERDICT_GAP)
     created_at = _iso(pr["created_at"])
     resets = [_iso(e.get("created_at")) for e in _get_all("/repos/%s/issues/%d/timeline" % (repo, number), token)
               if e.get("event") in RESET_EVENTS and e.get("created_at")]
@@ -118,14 +141,21 @@ def build_record(repo, number, token, now=None):
             if e.code != 404:
                 raise
             issues[n] = {"exists": False, "is_pr": False, "user": None, "comments": []}
+    again, _ = _req("GET", "/repos/%s/pulls/%d" % (repo, number), token)
+    if again["head"]["sha"] != head:
+        raise RuntimeError("the PR's head moved during evaluation (%s -> %s); the push's own run grades the new head"
+                           % (head[:8], again["head"]["sha"][:8]))
     return {"number": number, "author": author, "labels": [l["name"] for l in pr.get("labels") or []],
-            "head_sha": head, "files": files, "reviews": reviews, "permissions": perms,
+            "head_sha": head, "files": files, "files_truncated": files_truncated, "reviews": reviews,
+            "permissions": perms,
             "first_check_at": first_check_at, "head_floor": head_floor, "created_at": created_at,
-            "now": int(now or time.time()), "body": pr.get("body") or "", "issues": issues}
+            "now": now, "body": pr.get("body") or "", "issues": issues}
 
 
-def post_check(repo, head, verdict, token):
+def post_check(repo, head, verdict, token, number):
     body = {"name": CHECK_NAME, "head_sha": head, "status": "completed", "conclusion": verdict["conclusion"],
+            "external_id": str(number),    # binds the verdict to THIS PR: the clock counts only its own
+            "started_at": _utc_now(),      # completed_at is left for the server to stamp; the clock reads it
             "output": {"title": verdict["title"], "summary": verdict["summary"]}}
     _req("POST", "/repos/%s/check-runs" % repo, token, body)
 
@@ -145,9 +175,9 @@ def run_one(repo, n, token):
             post_check(repo, head, {"conclusion": "failure", "title": "Tier policy: evaluation failed",
                                     "summary": "The policy could not be evaluated for this head: %r. A maintainer "
                                                "can re-run the workflow; the verdict is not a ruling on the tier." % (e,)},
-                       token)
+                       token, n)
         raise
-    post_check(repo, head, v, token)
+    post_check(repo, head, v, token, n)
     print("PR #%d (%s): %s - %s" % (n, head[:8], v["conclusion"], v["title"]))
     return v
 

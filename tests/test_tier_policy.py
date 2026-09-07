@@ -5,18 +5,23 @@ pinned on fixtures so the gate's meaning lives in tests, not in a YAML step.
 
 Tiers: docs (documentation only) merges on green; fix needs an approval OR seven unchanged days with no
 changes requested; feature needs an approval; major-feature needs an approval AND a linked issue that
-someone other than the author has commented on. Any PR touching .github/ needs an approval regardless
-(the base-branch check cannot stop a PR-branch job from posting a same-named success on pull_request
-events, so a human must look). Zero or two tier labels fail here too (belt and braces with the label
-check). An approval is the LATEST review by a reviewer who is not the author, holds write/admin/maintain,
-is APPROVED, and reviewed the CURRENT head; dismissed reviews never count. The seven-day clock is the
-server-stamped first "Tier policy" check run for the current head (never a commit date, which is free
-to forge), falling back to the PR's created_at.
+someone other than the author took part in (opened, or commented on). Any PR touching .github/ or
+scripts/ci/ - the gate's own workflow and code - needs an approval regardless (the base-branch check
+cannot stop a PR-branch job from posting a same-named success on pull_request events, and a fix-tier PR
+must not rewrite the policy through the seven-day path, so a human must look). Zero or two tier labels fail here too (belt and braces with the label
+check). An approval is a reviewer's STANDING - their latest APPROVED / CHANGES_REQUESTED / DISMISSED
+review (comment-only reviews never change standing; a DISMISSED one stands as a non-approval) - by a
+non-author holding write/admin/maintain, APPROVED, on the CURRENT head. The seven-day clock is the later
+of the head's arrival on the PR and the start of the unbroken chain of hourly "Tier policy" verdicts THIS
+PR received on the head; a head with no verdict yet has not started its clock (never a commit date, which
+is free to forge; never created_at; never another PR's verdicts on the same sha).
+A renamed file counts under both paths; a file listing the API truncated makes the unseen files guarded.
 
 Synthetic only: invented logins, placeholder shas, TESTHOST-free."""
 import importlib.util
 import os
 import tempfile
+import time
 import unittest
 import urllib.error
 
@@ -40,8 +45,8 @@ def pr(**kw):
     """A synthetic PR fixture with sensible defaults; override per test."""
     base = {"number": 42, "author": "author-a", "labels": ["fix"], "head_sha": HEAD,
             "files": ["kernel/kernel.py"], "reviews": [], "permissions": {},
-            "first_check_at": None, "head_floor": None, "created_at": NOW - DAY, "now": NOW, "body": "",
-            "issues": {}}
+            "files_truncated": False, "first_check_at": None, "head_floor": NOW - 30 * DAY,
+            "created_at": NOW - 30 * DAY, "now": NOW, "body": "", "issues": {}}
     base.update(kw)
     return base
 
@@ -52,6 +57,18 @@ def review(user, state="APPROVED", sha=HEAD, submitted=NOW - 60, dismissed=False
 
 
 MAINTAINERS = {"maint-b": "write", "admin-c": "admin"}
+
+
+def iso(epoch):
+    import datetime
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run(epoch, ext="42", app=15368):
+    """A check-run object as the list endpoint returns it: server-stamped completed_at, the posting
+    app, and the external_id the verdict was posted with (the PR number)."""
+    return {"name": "Tier policy", "started_at": iso(epoch - 5), "completed_at": iso(epoch),
+            "app": {"id": app}, "external_id": ext}
 
 
 class Labels(unittest.TestCase):
@@ -131,7 +148,7 @@ class Approval(unittest.TestCase):
         self.assertEqual(v["conclusion"], "failure")
 
     def test_a_dismissed_objection_does_not_close_the_seven_day_path(self):
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, created_at=NOW - 9 * DAY,
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY,
                            permissions=MAINTAINERS,
                            reviews=[review("maint-b", state="CHANGES_REQUESTED", dismissed=True)]))
         self.assertEqual(v["conclusion"], "success", "a dismissed objection is not a standing objection")
@@ -146,6 +163,28 @@ class Approval(unittest.TestCase):
                            permissions=MAINTAINERS))
         self.assertEqual(v["conclusion"], "failure")
 
+    def test_a_later_comment_review_does_not_erase_an_approval(self):
+        # GitHub records every inline comment as a COMMENTED review; a reviewer's standing is their
+        # latest APPROVED / CHANGES_REQUESTED / DISMISSED and comments never change it - the review's
+        # catch: a maintainer who approved and then left one note read as "no approval"
+        v = tp.evaluate(pr(labels=["feature"], permissions=MAINTAINERS,
+                           reviews=[review("maint-b", submitted=NOW - 600),
+                                    review("maint-b", state="COMMENTED", submitted=NOW - 60)]))
+        self.assertEqual(v["conclusion"], "success")
+
+    def test_a_later_comment_review_does_not_lift_a_change_request(self):
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY,
+                           permissions=MAINTAINERS,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED", submitted=NOW - 600),
+                                    review("maint-b", state="COMMENTED", submitted=NOW - 60)]))
+        self.assertEqual(v["conclusion"], "failure", "the objection stands; a comment is not saying otherwise")
+
+    def test_a_pending_review_changes_nothing(self):
+        v = tp.evaluate(pr(labels=["feature"], permissions=MAINTAINERS,
+                           reviews=[review("maint-b", submitted=NOW - 600),
+                                    review("maint-b", state="PENDING", submitted=NOW - 60)]))
+        self.assertEqual(v["conclusion"], "success")
+
 
 class Fix(unittest.TestCase):
     def test_a_fix_with_approval_passes(self):
@@ -153,7 +192,7 @@ class Fix(unittest.TestCase):
         self.assertEqual(v["conclusion"], "success")
 
     def test_a_fix_passes_after_seven_unchanged_days_from_the_first_check_run(self):
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 7 * DAY - 1, created_at=NOW - 8 * DAY))
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 7 * DAY - 1, head_floor=NOW - 8 * DAY))
         self.assertEqual(v["conclusion"], "success")
         self.assertIn("seven", v["summary"].lower())
 
@@ -161,9 +200,27 @@ class Fix(unittest.TestCase):
         v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 7 * DAY + 3600))
         self.assertEqual(v["conclusion"], "failure")
 
-    def test_the_clock_falls_back_to_created_at_when_no_run_exists(self):
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=None, created_at=NOW - 8 * DAY))
-        self.assertEqual(v["conclusion"], "success")
+    def test_a_head_with_no_verdict_yet_has_not_started_its_clock(self):
+        # the run that first evaluates a head posts the verdict that stamps it; until then the clock has
+        # not started (since is None), so it can never be older than the gate's first look - and created_at is no longer a
+        # fallback that loosens the gate (the review's catch)
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=None, created_at=NOW - 8 * DAY, head_floor=NOW - 8 * DAY))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("starts with this run", v["summary"])
+
+    def test_a_record_without_a_head_floor_never_passes_the_clock(self):
+        # fail closed on a missing input: the fetcher always sets head_floor, so its absence is a bug
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 30 * DAY, head_floor=None))
+        self.assertEqual(v["conclusion"], "failure")
+
+    def test_the_seven_day_boundary_is_inclusive(self):
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 7 * DAY, head_floor=NOW - 8 * DAY))
+        self.assertEqual(v["conclusion"], "success", "exactly seven days passes")
+        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 7 * DAY + 1, head_floor=NOW - 8 * DAY))
+        self.assertEqual(v["conclusion"], "failure", "one second short waits")
+
+    def test_created_at_is_not_a_clock_input(self):
+        self.assertNotIn("created_at", " ".join(str(c) for c in tp._clock_since.__code__.co_consts))
 
     def test_a_force_push_back_to_an_old_head_restarts_the_clock(self):
         # the review's critical catch: check runs are keyed by sha, so a sha seen for a minute on
@@ -185,7 +242,7 @@ class Fix(unittest.TestCase):
         self.assertEqual(v["conclusion"], "success", "both bounds are older than seven days")
 
     def test_the_record_carries_no_commit_date_for_the_clock_to_read(self):
-        # the clock's only inputs are first_check_at, head_floor and created_at - the fetcher's record
+        # the clock's only inputs are first_check_at and head_floor (never created_at) - the fetcher's record
         # has no commit-date field at all (pinned in FetcherShapes below), so a forged commit date has
         # no way into the policy
         import types
@@ -193,6 +250,7 @@ class Fix(unittest.TestCase):
                           for c in f.__code__.co_consts)
         self.assertIn("first_check_at", consts)
         self.assertIn("head_floor", consts)
+        self.assertNotIn("created_at", " ".join(str(c) for c in tp._clock_since.__code__.co_consts))
         for forged in ("committer", "author_date", "commit_date"):
             self.assertNotIn(forged, consts)
 
@@ -252,7 +310,62 @@ class MajorFeature(unittest.TestCase):
         self.assertEqual(v["conclusion"], "failure")
 
 
+class ChainStart(unittest.TestCase):
+    """first_check_at is the start of the unbroken chain of THIS PR's hourly verdicts on the head, anchored
+    at now - the review's critical catch: check runs are keyed by sha, so a sibling PR fast-forwarded onto
+    a head the other maintainer had vetoed inherited the first PR's seven days while the veto (a review on
+    the OTHER PR) stayed invisible; and a sha force-pushed away and plain-pushed back kept its day-0 stamp."""
+    GAP = 6 * 3600
+    H = 3600
+
+    def test_no_stamps_means_no_clock(self):
+        self.assertIsNone(tp.chain_start([], NOW, self.GAP))
+
+    def test_an_unbroken_hourly_chain_starts_at_its_first_stamp(self):
+        stamps = [NOW - k * self.H for k in range(1, 200)]
+        self.assertEqual(tp.chain_start(stamps, NOW, self.GAP), NOW - 199 * self.H)
+
+    def test_a_gap_longer_than_the_tolerance_restarts_the_chain(self):
+        # day-0 stamps, the head away for a week, back for three hours: three hours of credit, not a week
+        stamps = [NOW - 8 * DAY - k * self.H for k in range(3)] + [NOW - k * self.H for k in range(1, 4)]
+        self.assertEqual(tp.chain_start(stamps, NOW, self.GAP), NOW - 3 * self.H)
+
+    def test_a_stale_chain_is_no_chain(self):
+        # the head carried verdicts for eight days, then was not the head; back now with no verdict yet
+        stamps = [NOW - 2 * DAY - k * self.H for k in range(1, 8 * 24)]
+        self.assertIsNone(tp.chain_start(stamps, NOW, self.GAP))
+
+    def test_missed_sweeps_within_the_tolerance_do_not_break_the_chain(self):
+        stamps = [NOW - self.H, NOW - 5 * self.H, NOW - 9 * self.H]
+        self.assertEqual(tp.chain_start(stamps, NOW, self.GAP), NOW - 9 * self.H)
+
+
+class OnlyFixHasAClock(unittest.TestCase):
+    """Mutation guard (the review's catch): the seven-day path copied into feature, or major-feature
+    relaxed to discussion-plus-seven-days, survived every fixture because each failing one was a day old."""
+
+    def test_an_old_unapproved_feature_still_fails(self):
+        v = tp.evaluate(pr(labels=["feature"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY))
+        self.assertEqual(v["conclusion"], "failure")
+
+    def test_an_old_discussed_unapproved_major_feature_still_fails(self):
+        v = tp.evaluate(pr(labels=["major-feature"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY,
+                           body="#7", issues=MajorFeature.ISSUE_OK))
+        self.assertEqual(v["conclusion"], "failure")
+
+
 class GithubDir(unittest.TestCase):
+    def test_a_file_listing_the_api_truncated_makes_the_unseen_files_guarded(self):
+        # the files endpoint returns at most 3000 entries; when the PR's changed_files says there are
+        # more, the unseen files are assumed guarded and not documentation
+        v = tp.evaluate(pr(labels=["docs"], files=["docs/a.md"], files_truncated=True))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("3000", v["summary"])
+        v = tp.evaluate(pr(labels=["fix"], files_truncated=True, first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY))
+        self.assertEqual(v["conclusion"], "failure", "the seven-day path never clears an unseen file")
+        v = tp.evaluate(pr(labels=["fix"], files_truncated=True, reviews=[review("maint-b")], permissions=MAINTAINERS))
+        self.assertEqual(v["conclusion"], "success", "an approval does")
+
     def test_the_gates_own_code_needs_an_approval_regardless_of_tier(self):
         # the review's catch: the policy is checked out from main and run with checks:write, so a
         # fix-tier PR rewriting scripts/ci/tier_policy.py through the seven-day path would grade itself
@@ -353,13 +466,20 @@ class WorkflowPins(unittest.TestCase):
         self.assertIn('RESET_EVENTS = ("head_ref_force_pushed", "reopened", "ready_for_review")', self.fetch,
                       "the head's arrival is bounded by the server-stamped timeline events")
 
-    def test_the_job_name_is_the_check_name(self):
-        # the pull_request_target job's own check run is what stamps a head's arrival; the JOB (not
-        # just the workflow) must carry the check name - pinned at the jobs level explicitly
+    def test_the_job_name_is_NOT_the_check_name(self):
+        # the job's own check run must not share the required check's name: two same-named runs per
+        # head (the job's, frozen at push time, and the API-posted verdict the hourly sweep moves) leave
+        # it undocumented which one the ruleset honors - so only the API-posted verdict carries the name
         jobs = self.wf[self.wf.index("\njobs:"):]
-        self.assertIn("    name: Tier policy", jobs)
+        self.assertIn("    name: Tier policy evaluation", jobs)
+        self.assertNotRegex(jobs, r"name: Tier policy[ \t]*\n")
         self.assertNotIn('["committer"]', self.fetch)
         self.assertNotIn('["author"]["date"]', self.fetch)
+
+    def test_the_clock_reads_only_the_actions_apps_verdicts(self):
+        # the run objects carry app.id; a same-named run from another app never stamps the head (the
+        # explicit started_at on the POSTED verdict is pinned on the request body in FetcherShapes)
+        self.assertIn("GITHUB_ACTIONS_APP_ID = 15368", self.fetch)
 
     def test_the_three_tier_label_lists_agree(self):
         wf = open(os.path.join(os.path.dirname(HERE), ".github", "workflows", "pr-tier.yml")).read()
@@ -384,19 +504,35 @@ class FetcherShapes(unittest.TestCase):
         self.calls = []
         test = self
 
+        def paged(pages, route, query):
+            # pages are served BY URL (the review's catch: a stub serving by call count let a fetcher
+            # that never follows the Link URL pass); a page asked for twice is a looping fetcher
+            import urllib.parse as up
+            n = int((up.parse_qs(query).get("page") or ["1"])[0])
+            test.assertNotIn((route, n), test.served, "page requested twice: not following Link")
+            test.served.add((route, n))
+            more = n < len(pages)
+            nxt = "%s/repos/romp-on/romp/pulls/42/%s?per_page=100&page=%d" % (test.tc.API, route, n + 1)
+            last = "%s/repos/romp-on/romp/pulls/42/%s?per_page=100&page=%d" % (test.tc.API, route, len(pages))
+            hdrs = {"Link": '<%s>; rel="next", <%s>; rel="last"' % (nxt, last)} if more else {}
+            return pages[n - 1], hdrs
+
         def fake_req(method, path, token, body=None):
             test.calls.append((method, path))
-            path = path.split("?")[0]                  # _get_all appends per_page; match the route
+            path, _, query = path.partition("?")       # _get_all appends per_page; match the route
             if "/check-runs" in path:
-                return {"total_count": 1, "check_runs": [{"started_at": "2026-09-01T00:00:00Z"}]}, {}
+                page, hdrs = paged(test.run_pages, "check-runs", query)
+                return {"total_count": sum(len(p) for p in test.run_pages), "check_runs": page}, hdrs
             if path.endswith("/pulls/42"):
                 return {"head": {"sha": HEAD}, "user": {"login": "author-a"}, "labels": [{"name": "fix"}],
-                        "created_at": "2026-08-30T00:00:00Z", "body": "fixes #7"}, {}
+                        "created_at": "2026-08-30T00:00:00Z", "body": "fixes #7",
+                        "changed_files": test.changed_files}, {}
             if "/files" in path:
-                return [{"filename": "kernel/kernel.py"}], {}
+                if test.files_error:
+                    raise urllib.error.HTTPError(path, test.files_error, "x", {}, None)
+                return paged(test.files_pages, "files", query)
             if "/reviews" in path:
-                return [{"user": {"login": "maint-b"}, "state": "APPROVED", "commit_id": HEAD,
-                         "submitted_at": "2026-09-02T00:00:00Z"}], {}
+                return test.reviews, {}
             if "/collaborators/" in path:
                 if test.perm_error:
                     raise urllib.error.HTTPError(path, test.perm_error, "x", {}, None)
@@ -414,16 +550,28 @@ class FetcherShapes(unittest.TestCase):
                 return {"number": 0, "user": {"login": "author-a"}}, {}
             raise AssertionError("unexpected request " + path)
         self.perm_error = None
+        self.files_error = None
+        self.files_pages = [[{"filename": "kernel/kernel.py", "status": "modified"}]]
+        self.served = set()
+        self.changed_files = 1
+        # this PR's verdicts: an unbroken hourly chain for the last three hours, plus a disconnected
+        # day-8 stamp; a sibling PR's week-long chain on the same sha; an older run from another app
+        self.run_pages = [[run(NOW - 8 * DAY)] + [run(NOW - k * 3600) for k in (3, 2, 1)]
+                          + [run(NOW - k * 3600, ext="41") for k in range(1, 8 * 24)]
+                          + [run(NOW - 30 * DAY, app=1)]]
+        self.reviews = [{"user": {"login": "maint-b"}, "state": "APPROVED", "commit_id": HEAD,
+                         "submitted_at": "2026-09-02T00:00:00Z"}]
         self.timeline = []
         self.issue_fetches = []
         self.tc._req = fake_req
 
     def test_build_record_survives_the_documented_shapes_and_has_no_commit_date(self):
         rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-        self.assertEqual(rec["first_check_at"], self.tc._iso("2026-09-01T00:00:00Z"),
-                         "the clock is the server-stamped first check run for this head")
-        self.assertEqual(set(rec), {"number", "author", "labels", "head_sha", "files", "reviews", "permissions",
-                                    "first_check_at", "head_floor", "created_at", "now", "body", "issues"},
+        self.assertEqual(rec["first_check_at"], NOW - 3 * 3600,
+                         "the clock is the start of THIS PR's unbroken chain: not its disconnected day-8 stamp, "
+                         "not the sibling PR's week on the same sha, not the other app's run")
+        self.assertEqual(set(rec), {"number", "author", "labels", "head_sha", "files", "files_truncated", "reviews",
+                                    "permissions", "first_check_at", "head_floor", "created_at", "now", "body", "issues"},
                          "the record has exactly the documented keys - no commit date can reach the policy")
         self.assertEqual(rec["permissions"], {"maint-b": "write"})
         self.assertEqual(rec["issues"], {7: {"exists": True, "is_pr": False, "user": "author-a",
@@ -432,6 +580,89 @@ class FetcherShapes(unittest.TestCase):
         self.assertEqual(self.tc.evaluate(rec)["conclusion"], "success")
         self.assertFalse(any("/commits/%s\"" % HEAD in p or p.endswith("/commits/" + HEAD) for _, p in self.calls),
                          "the commit itself is never fetched")
+
+    def test_a_sibling_prs_verdicts_on_the_same_head_never_start_this_prs_clock(self):
+        # the review's critical walk-through: PR A (vetoed) and PR B fast-forwarded onto A's head; B has
+        # no verdicts of its own on the sha yet, A has a week of them
+        self.run_pages = [[run(NOW - k * 3600, ext="41") for k in range(1, 8 * 24)]]
+        self.reviews = []
+        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        self.assertIsNone(rec["first_check_at"])
+        v = self.tc.evaluate(rec)
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("starts with this run", v["summary"])
+
+    def test_no_verdict_yet_means_no_clock_in_the_fetcher_too(self):
+        # the review's catch: a created_at fallback re-added in the FETCHER survived every test because
+        # no fetcher fixture ever had zero runs
+        self.run_pages = [[]]
+        self.reviews = []
+        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        self.assertIsNone(rec["first_check_at"])
+        self.assertIn("starts with this run", self.tc.evaluate(rec)["summary"])
+
+    def test_a_two_page_check_run_listing_is_read_whole(self):
+        # hourly verdicts for 150 hours: 100 per page, the chain's start on page two
+        stamps = [NOW - k * 3600 for k in range(1, 151)]
+        self.run_pages = [[run(s) for s in stamps[:100]], [run(s) for s in stamps[100:]]]
+        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        self.assertEqual(rec["first_check_at"], NOW - 150 * 3600)
+        self.assertTrue(any("check-runs" in p and "page=2" in p for _, p in self.calls), "the Link URL was followed")
+
+    def test_a_push_during_evaluation_raises_instead_of_grading_a_mixed_record(self):
+        real = self.tc._req
+        heads = iter([HEAD, OLD])
+
+        def moving(method, path, token, body=None):
+            if path.split("?")[0].endswith("/pulls/42"):
+                return {"head": {"sha": next(heads)}, "user": {"login": "author-a"}, "labels": [{"name": "fix"}],
+                        "created_at": "2026-08-30T00:00:00Z", "body": "", "changed_files": 1}, {}
+            return real(method, path, token, body)
+        self.tc._req = moving
+        with self.assertRaises(RuntimeError):
+            self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+
+    def test_a_rename_out_of_github_carries_both_paths(self):
+        # the review's HIGH: `git mv .github/workflows/tier-policy.yml docs/gate-notes.md` in a docs PR
+        # read as documentation-only and would have merged on green, removing the gate from main
+        self.files_pages = [[{"filename": "docs/gate-notes.md", "status": "renamed",
+                              "previous_filename": ".github/workflows/tier-policy.yml"}]]
+        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        self.assertEqual(rec["files"], ["docs/gate-notes.md", ".github/workflows/tier-policy.yml"])
+        self.assertFalse(rec["files_truncated"], "one entry, two paths: truncation counts entries, not paths")
+        rec["labels"] = ["docs"]
+        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure", "a .github change wearing a docs destination")
+        rec["labels"], rec["reviews"] = ["fix"], []
+        rec["first_check_at"] = rec["head_floor"] = NOW - 30 * DAY
+        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure", "…and the seven-day path is closed by the guard")
+
+    def test_a_two_page_file_listing_is_read_whole(self):
+        self.files_pages = [[{"filename": "a.py", "status": "modified"}], [{"filename": "b.py", "status": "added"}]]
+        self.changed_files = 2
+        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        self.assertEqual(rec["files"], ["a.py", "b.py"])
+        self.assertFalse(rec["files_truncated"])
+        self.assertTrue(any("/files" in p and "page=2" in p for _, p in self.calls), "the Link URL was followed")
+
+    def test_a_listing_shorter_than_changed_files_is_flagged_truncated(self):
+        self.changed_files = 3001
+        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        self.assertTrue(rec["files_truncated"])
+        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "success", "an approved fix still passes")
+        rec["labels"] = ["docs"]
+        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure", "docs cannot vouch for unseen files")
+
+    def test_a_dismissed_review_reads_as_the_latest_word(self):
+        self.reviews = self.reviews + [{"user": {"login": "maint-b"}, "state": "DISMISSED", "commit_id": HEAD,
+                                        "submitted_at": "2026-09-02T01:00:00Z"}]
+        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        self.assertTrue(rec["reviews"][1]["dismissed"])
+        self.assertFalse(tp._approved(rec)[0], "the dismissal is the reviewer's latest word")
+
+    def test_a_server_error_on_the_file_listing_raises(self):
+        self.files_error = 500
+        with self.assertRaises(urllib.error.HTTPError):
+            self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
 
     def test_a_force_push_on_the_timeline_raises_the_head_floor(self):
         self.timeline = [{"event": "head_ref_force_pushed", "created_at": "2026-09-02T12:00:00Z"},
@@ -466,6 +697,21 @@ class FetcherShapes(unittest.TestCase):
         rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
         self.assertEqual(rec["permissions"], {"maint-b": "none"})
         self.assertFalse(tp._approved(rec)[0], "a non-collaborator never approves")
+
+    def test_the_verdict_stamps_the_head_with_an_explicit_started_at(self):
+        # the seven-day clock reads the posted verdict's started_at; pinned on the REQUEST BODY (a
+        # source grep matched the read path and could not fail - the review's catch), and asserted
+        # after the call so no isolation loop can swallow it
+        bodies = []
+        self.tc._req = lambda method, path, token, body=None: (bodies.append((method, body)), ({}, {}))[1]
+        self.tc.post_check("romp-on/romp", HEAD, {"conclusion": "success", "title": "t", "summary": "s"}, "tok", 42)
+        self.assertEqual([m for m, _ in bodies], ["POST"])
+        stamp = bodies[0][1].get("started_at")
+        self.assertTrue(stamp, "the verdict carries an explicit started_at")
+        self.assertLess(abs(self.tc._iso(stamp) - time.time()), 300, "a well-formed timestamp, close to now")
+        self.assertEqual(bodies[0][1]["name"], self.tc.CHECK_NAME)
+        self.assertEqual(bodies[0][1]["external_id"], "42", "the verdict is bound to its PR: the clock counts only its own")
+        self.assertNotIn("completed_at", bodies[0][1], "left for the server to stamp")
 
     def test_all_open_isolates_one_prs_failure_from_the_rest(self):
         posted = []

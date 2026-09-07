@@ -111,7 +111,9 @@ STUB
     grep -q "pr create" "$GH_LOG"
     grep -q "pr merge" "$GH_LOG"
     # The version PR carries its tier label at creation: a required upstream check holds an
-    # unlabeled PR red, so without it auto-merge never fires and the release stalls.
+    # unlabeled PR red. (Under the tier policy the docs-labeled VERSION PR is held anyway until the
+    # maintainers decide its tier; the label is the mechanical rename, pinned so the release path
+    # names a real tier.)
     grep -q "pr create .*--label docs" "$GH_LOG"
     # BY NUMBER, never by branch name (the user 2026-08-01): every PR here is fork-headed, because
     # rulesets block branch pushes upstream — and `gh pr merge <branch> --repo <upstream>` cannot

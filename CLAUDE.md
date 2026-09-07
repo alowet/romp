@@ -101,8 +101,10 @@ broad `git add` will sweep up your work). Conventions:
      so a bare `git push` does the same. Never push to `upstream`: the server rejects
      it, and naming it in scripts bakes in a failure.
   2. `gh pr create --repo romp-on/romp --label <tier>` (gh detects the fork head), then
-     `gh pr merge --auto --merge`: it lands itself when the required Linux checks
-     pass. There is no way to move `main` except a green PR.
+     `gh pr merge --auto --merge`: it lands itself when the required checks pass, and
+     the Tier policy check is one of them, so green CI alone lands only `docs`; a `fix`
+     waits for an approval or its seventh day, and the rest wait for a human (the tier
+     list below). There is no way to move `main` except a green PR.
   Anything that reads the canonical repo (the release script's post-merge
   fast-forward and tag push, the kernel's update and drift probes) resolves the remote
   as `upstream` when the clone has one, else `origin` (`_release_remote` in
@@ -118,17 +120,21 @@ broad `git add` will sweep up your work). Conventions:
     `*.md` anywhere, never `.github/` or `scripts/`. Merges on green.
   - `fix` (tier 1): a bug fix with a test that fails before it. Merges on the other
     maintainer's approval, or after seven days with the head unchanged and no changes
-    requested (the clock is the server-stamped first Tier policy run for the head, never a
-    commit date).
+    requested (the clock is the unbroken chain of hourly Tier policy verdicts THIS PR received
+    on the current head, or the head's arrival on the PR if later, never a commit date; a
+    head with no verdict yet has not started its clock, and a sibling PR's verdicts on the
+    same sha lend nothing).
   - `feature` (tier 2): a self-contained new capability inside romp's existing model; put the
     design points in the body. Merges on the other maintainer's approval.
   - `major-feature` (tier 3): new functionality that changes what romp does or its
     contracts. Merges on the other maintainer's approval AND a discussion in a linked issue
-    (`#N` in the body, with a comment by someone other than the author). File it **without**
+    (`#N` in the body, opened or commented on by someone other than the author). File it **without**
     `--auto` and leave the merge to the maintainers.
-  "Approval" is the latest review by a maintainer other than the author, on the CURRENT head,
-  APPROVED - GitHub forbids self-approval and the user's sessions act under the user's
-  account, so it structurally means the other maintainer. Any PR touching `.github/` or
+  "Approval" is a standing APPROVED review by a maintainer other than the author on the
+  CURRENT head (standing = their latest approval, change request or dismissal; comment-only
+  reviews never change it) - GitHub forbids self-approval and the user's sessions act under
+  the user's account, so it structurally means the other maintainer. A renamed file counts
+  under both its paths. Any PR touching `.github/` or
   `scripts/ci/` - the gate's own workflow and code - needs an approval regardless of tier: the
   base-branch check cannot stop a PR's own copy from posting a same-named success on
   `pull_request` events, and a fix-tier PR must not be able to rewrite the policy through the
