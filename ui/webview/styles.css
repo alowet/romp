@@ -3514,6 +3514,9 @@ body.filebrowse-open { overflow: hidden; }
 .fileview-md h1, .fileview-md h2, .fileview-md h3, .fileview-md h4 {
   font-weight: 600; color: var(--fg); margin: 1em 0 0.4em; line-height: 1.3; }
 .fileview-md h1 { font-size: 1.3em; } .fileview-md h2 { font-size: 1.15em; } .fileview-md h3 { font-size: 1.05em; }
+/* a heading an in-document link lands on (scrollIntoView) sits a breath below the title bar's hairline
+   rather than flush against it — the bar's own 10px spacing */
+.fileview-md h1, .fileview-md h2, .fileview-md h3, .fileview-md h4, .fileview-md h5, .fileview-md h6 { scroll-margin-top: 10px; }
 .fileview-md ul, .fileview-md ol { margin: 0.4em 0; padding-left: 1.4em; }
 .fileview-md li { margin: 0.2em 0; }
 .fileview-md strong { color: var(--fg); font-weight: 600; }

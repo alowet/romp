@@ -43,6 +43,8 @@ import { previewKind, previewFull, canPreview, fileUrl, retryFailedPreviews, ref
 import { openFileView } from "./file-view";
 // initFileView rides its OWN line: the import above is pinned verbatim by file-view.test.ts
 import { initFileView, setFileViewIdentity, hostStub } from "./file-view";
+import { openUrlView } from "./file-view";                 // the URL mode of the same viewer (md-url-view.test.ts)
+import { isMarkdownUrl } from "./md-links";
 import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser is pane-local here now (the user 2026-08-24)
 import { pastedFilePath } from "./paste-path";
 import { insertAtCaret } from "./composer-insert";
@@ -745,7 +747,10 @@ function el(tag: string, cls?: string): HTMLElement {
 // and the html-only profile silently ate them: $\sqrt{d}$ rendered as a bare serif "d", the radical gone.
 // DOMPurify's svg profile is still sanitized (no scripts, handlers, or foreignObject). Keep data: URIs on
 // <img> (the CSP allows them and inline transcript images rely on them).
-const MD_PURIFY: Config = { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"] };
+// ALLOW_DATA_ATTR: false (2026-09-07): transcript HTML must not mint data-* attributes — the chat's
+// document-level delegate keys every action off data-act, so a `<span data-act="stopRetrying">` in a
+// message would post an interrupt on a click. Nothing the renderer needs rides data-* through md().
+const MD_PURIFY: Config = { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"], ALLOW_DATA_ATTR: false };
 
 function md(src: string): string {
   // Transcript text (user prompts, assistant output, subagent reports, postal
@@ -913,6 +918,16 @@ document.addEventListener("click", (e) => {
   e.preventDefault();
   e.stopPropagation();
   if (location.protocol === "http:" || location.protocol === "https:") {
+    // A markdown file on THIS origin (a published report, an evidence doc under the dashboard's own
+    // host) presents in the file viewer, rendered, instead of as raw text in a tab (the user
+    // 2026-09-06). Same origin ONLY — the viewer fetches from the browser, and a cross-origin fetch
+    // is a CORS guess; a .md on any other origin keeps the new tab exactly as before. Anchors inside
+    // the open viewer bubble through this same delegate, so a document's own same-origin .md links
+    // navigate in place too — except the viewer's own link-out, which marks itself data-new-tab
+    // because its href is that very document and the click means "in a tab, please". Only an
+    // UNMODIFIED primary click takes the viewer: a ctrl-, ⌘- or shift-click asked for a tab and gets
+    // the one it always got (middle-click is auxclick and was never intercepted).
+    if (!a.dataset.newTab && !e.ctrlKey && !e.metaKey && !e.shiftKey && isMarkdownUrl(href, location.origin)) { openUrlView(href); return; }
     window.open(href, "_blank", "noopener,noreferrer"); // web dashboard → open in the viewer's browser
   } else if (vscodeApi) {
     vscodeApi.postMessage({ type: "openLink", href });  // VS Code webview → host openExternal

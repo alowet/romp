@@ -264,7 +264,8 @@ test("Raw ⇄ Rendered exists for markdown ONLY, and nothing reaches innerHTML u
   assert.match(VIEW, /const rendered = isMd && fmt\.md === "rendered";/, "non-md never renders as prose");
   assert.match(VIEW, /import DOMPurify from "dompurify";/);
   // html + svg, in lockstep with the chat's md(): KaTeX draws stretchy glyphs as inline <svg>
-  assert.match(VIEW, /box\.innerHTML = DOMPurify\.sanitize\(dirty, \{ USE_PROFILES: \{ html: true, svg: true \}, ADD_DATA_URI_TAGS: \["img"\] \}\);/);
+  // …and data-* never rides in from a document's raw HTML: the page's delegates key actions off data-act
+  assert.match(VIEW, /box\.innerHTML = DOMPurify\.sanitize\(dirty, \{ USE_PROFILES: \{ html: true, svg: true \}, ADD_DATA_URI_TAGS: \["img"\], ALLOW_DATA_ATTR: false \}\);/);
   // a README's links open a NEW tab rather than navigating the hosting pane's document away
   assert.match(VIEW, /target = "_blank"/);
   assert.match(VIEW, /rel = "noopener"/);
@@ -685,7 +686,7 @@ test("the title bar carries a session chip resolved from the sid — never inven
   assert.match(openFn, /bar\.appendChild\(name\); if \(sess\) bar\.appendChild\(sess\); bar\.appendChild\(acts\);/,
     "between the path and the actions");
   // the signatures every opener and the relay pin depend on are exactly as they were
-  assert.match(VIEW, /export function openFileView\(path: string, sid\?: string \| null\): void \{/);
+  assert.match(VIEW, /export function openFileView\(path: string, sid\?: string \| null, frag\?: string \| null\): void \{/);   // frag: a sibling link's fragment lands after the render
   assert.match(VIEW, /export function initFileView\(poster: \(m: Record<string, unknown>\) => void\): void \{/);
 });
 
