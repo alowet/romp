@@ -33299,6 +33299,10 @@ if(m.romp==='browseFiles'){var bf=document.getElementById('f-feed');
 // opened for (m.sid beats the active tab there). The chat-hosted viewer posts to its own window and
 // never gets here.
 if(m.type==='editorSelection'&&typeof m.text==='string'){var fc=document.getElementById('f-chat');
+  // the chat pane may be toggled OFF (hidden by CSS, iframe still loaded): the chip would seed a composer
+  // nobody can see, a silent gesture (review find on #970, 2026-09-07). Bring the pane forward first, the
+  // way the browseFiles arm does for the feed — desktop only; the phone's one-pane tab swap is untouched.
+  if(!document.body.classList.contains('po-chat')){try{window.__rompPaneToggle&&window.__rompPaneToggle('chat',true);}catch(e){}}
   try{fc&&fc.contentWindow&&fc.contentWindow.postMessage(m,'*');}catch(e){}}
 // the browser owns the restore: browseClosed alone puts a brought-forward feed back the way it was
 if(m.romp==='browseClosed'&&window.__rompFeedWasOff){window.__rompFeedWasOff=false;

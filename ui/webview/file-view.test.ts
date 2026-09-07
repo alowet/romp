@@ -120,7 +120,10 @@ test("a viewer whose document has no composer seeds THROUGH the shell: the feed 
   // the shell's arm: the SAME message, forwarded whole into the chat frame — sid intact, so the chip
   // lands in the session the file was opened for (the 2026-08-19 routing rule holds across documents)
   const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
-  assert.match(KERNEL, /if\(m\.type==='editorSelection'&&typeof m\.text==='string'\)\{var fc=document\.getElementById\('f-chat'\);\n\s*try\{fc&&fc\.contentWindow&&fc\.contentWindow\.postMessage\(m,'\*'\);\}catch\(e\)\{\}\}/);
+  assert.match(KERNEL, /if\(m\.type==='editorSelection'&&typeof m\.text==='string'\)\{var fc=document\.getElementById\('f-chat'\);[\s\S]{0,700}?try\{fc&&fc\.contentWindow&&fc\.contentWindow\.postMessage\(m,'\*'\);\}catch\(e\)\{\}\}/);
+  // …and a chat pane toggled OFF is brought forward first, the browseFiles arm's rule for the feed: a chip
+  // seeded into a hidden composer is a silent gesture (review fold on #970, 2026-09-07)
+  assert.match(KERNEL, /if\(!document\.body\.classList\.contains\('po-chat'\)\)\{try\{window\.__rompPaneToggle&&window\.__rompPaneToggle\('chat',true\);\}catch\(e\)\{\}\}\n\s*try\{fc&&fc\.contentWindow&&fc\.contentWindow\.postMessage\(m,'\*'\);/);
   // …and the chat's existing window-message handler is the receiver: nothing new listens in feed.ts
   assert.match(RENDER, /else if \(m\.type === "editorSelection" && typeof m\.text === "string" && m\.text\.trim\(\)\) \{/);
   assert.doesNotMatch(FEED, /editorSelection/);
