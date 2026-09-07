@@ -82,7 +82,10 @@ class RouteGates(unittest.TestCase):
 
 
 class PolicyPins(unittest.TestCase):
-    """The norms declare an isolation refusal final — the residual a route gate can't close."""
+    """The norms declare an isolation refusal final — the residual a route gate can't close — and teach
+    send_message's `kind` parameter."""
+
+    SKILL = os.path.join(os.path.dirname(BIN), "claude", "skills", "romp-postal", "SKILL.md")
 
     def test_mcp_instructions_declare_refusal_final(self):
         src = open(os.path.join(BIN, "romp-postal-service")).read()
@@ -90,9 +93,18 @@ class PolicyPins(unittest.TestCase):
         self.assertIn("do NOT reroute", src)
 
     def test_skill_declares_refusal_final(self):
-        p = os.path.join(os.path.dirname(BIN), "claude", "skills", "romp-postal", "SKILL.md")
-        src = open(p).read()
+        src = open(self.SKILL).read()
         self.assertIn("An isolation refusal is final", src)
+
+    def test_skill_teaches_the_kind_parameter(self):
+        # the SessionStart hook's kind bullet is pinned in tests/romp-postal-context.bats; this pins the
+        # skill's (the #964 review): the REQUIRED `kind` parameter with its three values, never the retired
+        # DELEGATE:/COORDINATE:/QUESTION: body prefix beside it
+        src = open(self.SKILL).read()
+        self.assertIn("Set `kind` to `delegate`", src)
+        for kind in ("`delegate`", "`coordinate`", "`question`"):
+            self.assertIn(kind, src)
+        self.assertNotIn("DELEGATE:", src)
 
 
 if __name__ == "__main__":

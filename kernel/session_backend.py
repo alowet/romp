@@ -149,9 +149,10 @@ class SessionBackend(ABC):
         the badge's switching-dots and the chat's "Reloading session…" notice (SdkBackend.set_effort). tmux
         types '/effort X' into the pane, which the TUI applies in place: no reconnect, no confirmation, so
         no second Enter (TmuxBackend.set_effort). False when the backend can tell the change did not land,
-        so the kernel can be loud instead of pretending: the SDK refuses an unknown sid or a value outside
-        EFFORT_LEVELS, Codex a level its engine lacks. tmux cannot tell (it types the command; the TUI
-        answers a bad value in the pane), so TmuxBackend.set_effort returns True unconditionally and the
+        so the kernel can be loud instead of pretending: the SDK and Codex refuse an unknown sid (no
+        registry row, no session); the SDK also refuses a value outside EFFORT_LEVELS, Codex a level its
+        engine lacks. tmux cannot tell (it types the command; the TUI answers a bad value in the pane), so
+        TmuxBackend.set_effort returns True unconditionally and the
         caller vouches for the value first — _route_meta_command checks _EFFORT_VALUES and the picker
         offers only those; POST /new passes its effort through verbatim by design, so a typo there reaches
         the pane and the CLI answers it there."""
