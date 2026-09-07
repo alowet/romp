@@ -571,14 +571,16 @@ class TmuxBusyFromHookState(unittest.TestCase):
             km._pusher_cycle()
             self.assertEqual(self.sent, [(SID, "/compact"), (SID, "after the compaction")])
 
-    def test_the_cycle_refreshes_a_parked_sids_moved_transcript_before_the_drain(self):
+    def test_the_drain_refreshes_a_parked_tmux_sids_moved_transcript_before_its_busy_gate(self):
         # the headless defect (second review): busy() can overrule the hook only through _parse_cached, which
         # NEVER parses — the cache is filled by client builds and the client-gated warmer. With no client, every
         # live tmux session's cache is None from its first transcript write on, so busy() was the hook verbatim
-        # and a pane Esc parked every `romp send` for minutes. The cycle now re-parses the parked TMUX sids'
-        # moved transcripts before the drain — not a sid without parked ops, not a parked sid whose backend
-        # answers busy() authoritatively (SDK/Codex: re-parsing a streaming turn's transcript on every atom's
-        # wake was load the parent did not have — third review), and not again while the file is unmoved.
+        # and a pane Esc parked every `romp send` for minutes. The drain now re-parses a parked TMUX sid's
+        # moved transcript per-sid inside _apply_pending_ops, right before the gate that reads busy() and after
+        # the move/hold/account gates (#955 moved it off the retired whole-set _refresh_parked_parses pre-pass)
+        # — not a sid without parked ops, not a parked sid whose backend answers busy() authoritatively
+        # (SDK/Codex: re-parsing a streaming turn's transcript on every atom's wake was load the parent did not
+        # have — third review), and not again while the file is unmoved.
         # REAL transcript files, the real cache reader and the real cache-filling parse; only the paths, the
         # rows and the backend routing are stubbed.
         now = int(time.time())
