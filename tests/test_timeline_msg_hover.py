@@ -41,13 +41,15 @@ class TimelineMessageHover(unittest.TestCase):
         pass1 = self.src[start:end]
         self.assertIn("u.hit = hit", pass1, "the connector pass should hand its hit target to the final pass")
         self.assertNotIn(
-            "svg.appendChild(hit)", pass1,
+            "plot.appendChild(hit)", pass1,
             "appending the hit path in the connector pass buries it under every dot drawn afterwards, "
             "which is exactly the vertical-run hover bug",
         )
 
     def test_hit_paths_are_appended_after_the_arrival_dots(self):
-        """Z-order contract: arrival dots (PASS 2) → connector hit targets (PASS 3) → prompt dots."""
+        """Z-order contract: arrival dots (PASS 2) → connector hit targets (PASS 3) → prompt dots. All three
+        go into the plot group the live tick translates, which keeps the old svg paint order within it, so
+        the pin reads `plot.appendChild`."""
         i_dots = self.src.index("PASS 2: message arrival dots")
         i_hits = self.src.index("PASS 3: the connector hit targets")
         i_prompt = self.src.index("turn process-start (prompt) dots")
@@ -55,7 +57,7 @@ class TimelineMessageHover(unittest.TestCase):
         self.assertLess(i_hits, i_prompt, "prompt dots are appended last so they keep their own hover")
         # the final pass actually appends the stashed hit targets
         tail = self.src[i_hits:i_prompt]
-        self.assertRegex(tail, r"svg\.appendChild\(u\.hit\)", "the final pass must append each stashed hit path")
+        self.assertRegex(tail, r"plot\.appendChild\(u\.hit\)", "the final pass must append each stashed hit path")
 
     def test_hit_stroke_is_wide_and_round_capped(self):
         """A short vertical run needs a generous, fully-covering target."""
