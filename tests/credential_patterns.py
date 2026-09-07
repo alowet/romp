@@ -22,13 +22,17 @@ it, and a `--showlocals` line `name = '<token>'`. A match takes the dotted rest 
 (`.` and more token characters, any number of times), so a dotted token whose first run qualifies is
 taken whole (`<32 hex>.<signature>`, a JWT whose header is longer than the JWT rule's bound) rather
 than up to its first dot; a dot with nothing of a token after it (a sentence's, an ellipsis) is never
-taken. Two shapes it leaves alone: the segment after a pytest node id's `::` (a test's name, not a
-value), and a 40-hex git sha named as a commit (`commit: <sha>`, `{'commit': '<sha>'}`) or sitting
-in a path or after an `@`. It still matches a synthetic uuid in a value position and a test method
-name with a digit in it, so a failing dict comparison may show the marker where a test's placeholder
-sid was, and a digit-bearing file name in a value position loses its extension to the dotted rest
-(`file=<name>.py`, a uuid-named file alone on a line). That is the cost of catching a token of
-unknown format; the failure is still readable.
+taken. Three shapes it leaves alone: the segment after a pytest node id's `::` (a test's name, not a
+value); a 40-hex git sha named as a commit (`commit: <sha>`, `{'commit': '<sha>'}`) or sitting in a
+path or after an `@`; and a dated Anthropic model id (`claude-haiku-4-5-20251001`,
+`claude-3-5-sonnet-20241022`: 24 or more characters with digits, so the rule fires on it, and a
+failing comparison of two model ids rendered as one marker against another) when the token is that
+shape and nothing more (a dotted rest or a longer tail attached, and it is taken as any token is). It
+still matches a synthetic uuid in a value position and a test method name with a digit in it, so a
+failing dict comparison may show the marker where a test's placeholder sid was, and a digit-bearing
+file name in a value position loses its extension to the dotted rest (`file=<name>.py`, a uuid-named
+file alone on a line). That is the cost of catching a token of unknown format; the failure is still
+readable.
 
 A JWT (RFC 7519) has no provider prefix but a fixed shape: base64url segments joined by dots, the
 first the JOSE header, a JSON object, whose encoding therefore begins `eyJ` (`{"` in base64). The
@@ -250,6 +254,18 @@ def _is_git_sha_in_context(text, m):
     return bool(_GIT_SHA_RE.fullmatch(tok)) and bool(_GIT_SHA_CONTEXT.search(text[max(0, m.start() - 12):m.start()]))
 
 
+# A dated Anthropic model id is no credential: `claude`, an optional generation (`-3`, `-3-5`), a tier
+# (`-haiku`, `-sonnet`, `-opus`), an optional version (`-4-5`) and an 8-digit date. The dated ids are 24
+# characters or more with digits, so the generic rule fires on each, and a test comparing two of them
+# failed as `assert '[REDACTED-CREDENTIAL]' == '[REDACTED-CREDENTIAL]'` (2026-09-07). Exempt only when
+# the whole token is that shape: an id with a dotted rest or a longer tail attached is taken as before.
+_MODEL_ID_RE = re.compile(r"claude(?:-\d{1,2})*-[a-z]+(?:-\d{1,2})*-\d{8}")
+
+
+def _is_model_id(tok):
+    return bool(_MODEL_ID_RE.fullmatch(tok))
+
+
 def scrub(text):
     """`text` with every match replaced by REDACTED (a diff line keeps its marker and sign, a quoted
     element line its marker and quotes); anything that is not a str comes back as is."""
@@ -257,7 +273,8 @@ def scrub(text):
         return text
 
     def one(m):
-        if _is_git_sha_in_context(text, m):
+        pfx = m.group("pfx") or m.group("pfxq") or m.group("pfxc") or ""
+        if _is_git_sha_in_context(text, m) or _is_model_id(m.group(0)[len(pfx):]):
             return m.group(0)
-        return (m.group("pfx") or m.group("pfxq") or m.group("pfxc") or "") + REDACTED
+        return pfx + REDACTED
     return TOKEN_RE.sub(one, text)

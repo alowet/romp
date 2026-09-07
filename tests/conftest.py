@@ -7,6 +7,7 @@ top exactly as before."""
 import atexit
 import importlib.util
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -274,19 +275,26 @@ def _stub_place_llm(monkeypatch):
 #   * every value seen in this process's environment, 16 characters or longer, is replaced with one
 #     marker, and so is each whitespace-separated chunk of such a value that is 16 characters or
 #     longer (pprint renders a value with spaces as adjacent literals on separate lines, so a
-#     whole-value replace misses the pieces). Values are noted the moment they are WRITTEN into
+#     whole-value replace misses the pieces), and so is each piece of such a value that pytest or
+#     unittest left beside a cut (`'<head>...<tail>'`, `[N chars]`: a failed `==` keeps 12 and 13
+#     characters of each operand, so most of a 30-character value showed on the assert line and in
+#     the short summary, 2026-09-07). Values are noted the moment they are WRITTEN into
 #     os.environ (the mutation path is wrapped below: a plain assignment, update, setdefault,
 #     os.putenv, os.environb, mock.patch.dict), and sampled at import, around each test and at
 #     report time as well, for values that entered by another route (inherited from the parent
 #     process, written by a C extension). Exempt, and never when the name is credential-shaped: a
 #     path-valued variable by NAME (the shell's, this conftest's own dirs, the interpreter and
-#     workspace paths GitHub Actions exports); a name family that is never a credential (XDG_*, and
-#     pytest's own PYTEST_*: PYTEST_CURRENT_TEST holds the running test's node id and is written
-#     for every phase of every test, so noting it grew the set by one value per test, slowed every
-#     report's scrub in step and made the node id of every test already run a target in later
-#     reports); and any value that IS a path this machine has (one absolute path that exists, or a
-#     PATH-style list of them), because a traceback quotes the interpreter's prefix on every frame
-#     and a developer's shell names it under any variable (a pyenv root, a conda prefix).
+#     workspace paths GitHub Actions exports); a variable whose value is public by NAME (the ones
+#     GitHub Actions exports to describe the run: the server URLs, the sha, the ref, the workflow
+#     and job names, the repository and the actor, each of which a CI failure report was showing as
+#     the marker, 2026-09-07; and the synthetic git identity this conftest sets at import); a name
+#     family that is never a credential (XDG_*, and pytest's own PYTEST_*: PYTEST_CURRENT_TEST holds
+#     the running test's node id and is written for every phase of every test, so noting it grew the
+#     set by one value per test, slowed every report's scrub in step and made the node id of every
+#     test already run a target in later reports); and any value that IS a path this machine has
+#     (one absolute path that exists, or a PATH-style list of them), because a traceback quotes the
+#     interpreter's prefix on every frame and a developer's shell names it under any variable (a
+#     pyenv root, a conda prefix).
 #   * credential-shaped tokens by PATTERN (tests/credential_patterns.py: the public key prefixes, and
 #     a long token in a value position), whatever their provenance: a token that never touched the
 #     environment (read from a file, printed by a child) is caught by this one.
@@ -305,6 +313,20 @@ _ENV_VALUE_PATH_NAMES = frozenset((
     # exports under six names (every stdlib and site-packages frame of a CI traceback is under it)
     "GITHUB_WORKSPACE", "RUNNER_WORKSPACE", "RUNNER_TEMP", "RUNNER_TOOL_CACHE", "pythonLocation",
     "Python_ROOT_DIR", "Python2_ROOT_DIR", "Python3_ROOT_DIR", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH"))
+# Public by name, so never a value a report must hide. GitHub Actions describes the run in these (its
+# secrets are GITHUB_TOKEN, ACTIONS_RUNTIME_TOKEN and ACTIONS_ID_TOKEN_REQUEST_TOKEN, credential-shaped
+# names this set is never consulted for); without them a CI failure read `assert '[REDACTED-ENV-VALUE]'
+# == 'x'` where a test compared the ref, the repository or the actor. Listed by name rather than by the
+# GITHUB_ prefix so that a token GitHub adds under a name this list does not know still qualifies. The
+# GIT_* names are the synthetic identity this conftest writes at import (`romp tests`,
+# `tests@example.invalid`), under which every fixture commit is made.
+_ENV_VALUE_PUBLIC_NAMES = frozenset((
+    "GITHUB_SERVER_URL", "GITHUB_API_URL", "GITHUB_GRAPHQL_URL", "GITHUB_SHA", "GITHUB_REF", "GITHUB_REF_NAME",
+    "GITHUB_HEAD_REF", "GITHUB_BASE_REF", "GITHUB_EVENT_NAME", "GITHUB_WORKFLOW", "GITHUB_WORKFLOW_REF",
+    "GITHUB_WORKFLOW_SHA", "GITHUB_JOB", "GITHUB_ACTION", "GITHUB_ACTION_REF", "GITHUB_ACTION_REPOSITORY",
+    "GITHUB_REPOSITORY", "GITHUB_REPOSITORY_OWNER", "GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR", "RUNNER_NAME",
+    "RUNNER_ARCH",
+    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"))
 _ENV_VALUE_EXEMPT_PREFIXES = ("XDG_", "PYTEST_")   # never a credential: the XDG base dirs, pytest's bookkeeping
 _ENV_VALUES_SEEN: set = set()
 
@@ -339,14 +361,15 @@ def _is_existing_path(value: str) -> bool:
 
 def env_value_qualifies(name: str, value: str) -> bool:
     """Whether one environment entry's value is one a report must not show: ENV_VALUE_MIN_LEN
-    characters or more, unless the name is exempt (a path-valued variable by name, or a name family
-    that is never a credential) or the value is a path this machine has; a credential-shaped name is
-    never exempt. The one rule, for the sampler and for the write hook."""
+    characters or more, unless the name is exempt (a path-valued variable by name, a variable whose
+    value is public by name, or a name family that is never a credential) or the value is a path this
+    machine has; a credential-shaped name is never exempt. The one rule, for the sampler and for the
+    write hook."""
     if len(value) < ENV_VALUE_MIN_LEN:
         return False
     if _credential_shaped(name):
         return True
-    if name in _ENV_VALUE_PATH_NAMES or name.startswith(_ENV_VALUE_EXEMPT_PREFIXES):
+    if name in _ENV_VALUE_PATH_NAMES or name in _ENV_VALUE_PUBLIC_NAMES or name.startswith(_ENV_VALUE_EXEMPT_PREFIXES):
         return False
     return not _is_existing_path(value)
 
@@ -399,12 +422,33 @@ def _install_env_write_hook() -> None:
 _install_env_write_hook()
 
 
+# A piece of a value beside a cut pytest or unittest made: a maximal run of ENV_CUT_FRAGMENT_MIN_LEN or
+# more token characters that abuts `...` or `[N chars]` on at least one side (the marker before it, the
+# marker after it, or a quote on one side and the marker on the other). pytest renders a failed `==` at
+# default verbosity with each operand cut to 12 and 13 characters around `...` (`'abcdefghijkl...rstuvwxyzabcd'`
+# for a 30-character value), its saferepr of a local or a `+  where` operand keeps 117 on each side,
+# the short summary cuts the message at the terminal's width with `...` appended, a long explanation
+# is cut at 640 characters the same way, and unittest shortens a container repr with `[N chars]`; none
+# of those pieces is the whole value or a whitespace chunk of it, so the replace above left them
+# standing (2026-09-07). A candidate is replaced only when it is a substring of a noted value: exact,
+# never a guess from its shape (the pattern net's fragment rule does that for tokens of no known
+# provenance). Two alternatives so each maximal run is tried once from its start, which keeps the pass
+# linear on a long run that reaches no cut.
+ENV_CUT_FRAGMENT_MIN_LEN = 8
+_ENV_CUT_FRAG_RE = re.compile(
+    r"(?:(?<=\.\.\.)|(?<=chars\]))[A-Za-z0-9_\-]{%d,}"                                  # after a cut
+    r"|(?<![A-Za-z0-9_\-])[A-Za-z0-9_\-]{%d,}(?=\.\.\.|\[\d+ chars\])"                    # before one
+    % (ENV_CUT_FRAGMENT_MIN_LEN, ENV_CUT_FRAGMENT_MIN_LEN))
+
+
 def redact_env_values(text: str, values) -> str:
     """`text` with every occurrence of every value replaced by ENV_VALUE_REDACTED, longest first (a
-    value that contains another is replaced whole), and then every whitespace-separated chunk of a
-    value that is ENV_VALUE_MIN_LEN characters or more: pprint renders a long value with spaces as
+    value that contains another is replaced whole), then every whitespace-separated chunk of a
+    value that is ENV_VALUE_MIN_LEN characters or more (pprint renders a long value with spaces as
     adjacent string literals on separate lines, so the token half of `Authorization: Bearer <token>`
-    survived a whole-value replace, and unittest's shortened repr shows a differing tail on its own."""
+    survived a whole-value replace, and unittest's shortened repr shows a differing tail on its own),
+    and then every piece of a value left beside a cut (_ENV_CUT_FRAG_RE: a run of token characters
+    against `...` or `[N chars]` that is a substring of a value)."""
     parts = set()
     for v in values:
         if not v:
@@ -415,7 +459,13 @@ def redact_env_values(text: str, values) -> str:
             parts.update(c for c in chunks if len(c) >= ENV_VALUE_MIN_LEN)
     for v in sorted(parts, key=len, reverse=True):
         text = text.replace(v, ENV_VALUE_REDACTED)
-    return text
+    if not parts:
+        return text
+
+    def cut_piece(m):
+        frag = m.group(0)
+        return ENV_VALUE_REDACTED if any(frag in v for v in parts) else frag
+    return _ENV_CUT_FRAG_RE.sub(cut_piece, text)
 
 
 def redact_credential_tokens(text):

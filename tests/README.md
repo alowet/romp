@@ -102,17 +102,23 @@ fix is to test membership and name the key; the report hook in
 It redacts two things from every report's text and captured-output sections,
 whatever the outcome (so `-rA`/`-rP` output for passed tests too), and from
 collection reports: a value present in the process environment that is 16
-characters or longer becomes `[REDACTED-ENV-VALUE]`, whole and per
-whitespace-separated chunk (values are noted at the moment they are written
+characters or longer becomes `[REDACTED-ENV-VALUE]`, whole, per
+whitespace-separated chunk, and per piece left beside a cut pytest or
+unittest made (`'<head>...<tail>'`, `[N chars]`) when that piece is a
+substring of the value (values are noted at the moment they are written
 into `os.environ`, so one set inside `mock.patch.dict` and gone before the
 assertion is caught too; exempt, never when the name is credential-shaped,
 are path-valued names such as `PWD`, `HOME`, `TMPDIR` and the interpreter
-paths GitHub Actions exports, the `XDG_*` and `PYTEST_*` families, and any
-value that is an absolute path this machine has), and a credential-shaped
-token becomes `[REDACTED-CREDENTIAL]` wherever it came from, by the patterns
-in `tests/credential_patterns.py` (public key prefixes, a JWT by its shape, a
+paths GitHub Actions exports, the names whose values are public, the ones
+GitHub Actions describes a run in (`GITHUB_REF`, `GITHUB_REPOSITORY`,
+`GITHUB_ACTOR` and the rest) and the conftest's own synthetic git identity,
+the `XDG_*` and `PYTEST_*` families, and any value that is an absolute path
+this machine has), and a credential-shaped token becomes
+`[REDACTED-CREDENTIAL]` wherever it came from, by the patterns in
+`tests/credential_patterns.py` (public key prefixes, a JWT by its shape, a
 long token where a value sits, pytest's own renderings of a failed comparison
-included). A report the hook changes is rebuilt from the scrubbed text with
+included; a named git sha and a dated Anthropic model id are left alone). A
+report the hook changes is rebuilt from the scrubbed text with
 its crash location kept, so the short test summary still ends in the
 assertion message; that report loses pytest's colour and source highlighting.
 One it leaves alone keeps pytest's own rendering.
