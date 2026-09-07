@@ -19,6 +19,7 @@ import { ageColorReadable } from "./age-color";
 import { liveNow } from "./feed-age";
 import { TIP_GRACE_MS } from "./tip";
 import { perfFrameHandler } from "./perf-telemetry";
+import { linkifyPrRefs, installPrLinkOpener } from "./pr-links";
 
 type Color = { bg: string; fg: string } | null;
 interface LedgerNode {
@@ -36,6 +37,12 @@ interface FleetSession { sid: string; name: string; color: Color; status?: { sta
 
 const vscodeApi =
   typeof (window as any).acquireVsCodeApi === "function" ? (window as any).acquireVsCodeApi() : undefined;
+// A `#123` in a goal row links to the PR page of the repository its session works in (pr-links.ts; the
+// user 2026-09-06). The repo per session rides the feed frame's `sessions` rows (owner/repo, or null).
+let repoBySid = new Map<string, string | null>();
+// The link opens the PR and nothing else: capture-phase on the document, so the row's delegated jump
+// under it never fires. Web → the viewer's browser; VS Code → the host's openExternal (view-routing.ts).
+installPrLinkOpener(document, vscodeApi ? (m) => vscodeApi.postMessage(m) : undefined);
 
 let sessions: FleetSession[] = [];
 // Whether the FIRST feed payload has arrived (the user 2026-06-29): before it has, the fleet must NOT claim
@@ -345,6 +352,7 @@ function renderFleetNode(ctx: SessCtx, n: LedgerNode, depth: number, container: 
   const txt = el("span", "ledger-ttext lz-nav");
   txt.dataset.sid = s.sid; txt.dataset.nid = n.id; txt.dataset.act = "goprompt";   // text → the asking message
   highlightInto(txt, n.text, curSearch);   // search: highlight the matched substring (plain text otherwise)
+  linkifyPrRefs(txt, repoBySid.get(s.sid) || null);   // `#123` in the goal → its PR page; a search hit span is walked, not skipped
   // (The ⊕ distiller-summary expander was removed 2026-06-27 — the user: show just the goals, not the
   //  distiller takeaway / decision brief.)
   const time = el("span", "ledger-ttime");
@@ -744,6 +752,9 @@ window.addEventListener("message", perfFrameHandler("fleet", (m) => vscodeApi?.p
     hostNow = m.now;
     hostNowAt = typeof m.nowAt === "number" ? m.nowAt : Date.now();   // the pair travels together: the frame's clock, and when THAT frame arrived
   }
+  if (Array.isArray(m.sessions))
+    repoBySid = new Map(m.sessions.filter((s: any) => s && typeof s.sid === "string")
+      .map((s: any) => [s.sid as string, typeof s.githubRepo === "string" ? s.githubRepo : null] as const));
   if (!Array.isArray(m.ledgers)) return;
   loaded = true;
   sessions = m.ledgers as FleetSession[];

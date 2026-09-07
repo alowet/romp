@@ -78,11 +78,12 @@ test("the singleton stays breaks:false — assistant rendering is unchanged", ()
 });
 
 test("userMd() renders through the breaks:true instance and the SAME DOMPurify profile as md()", () => {
-  const fn = RENDER.match(/function userMd\(src: string\): string \{[\s\S]*?\n\}/)?.[0] || "";
+  // (both signatures grew an optional repo parameter for PR links — pr-links.ts — so match them loosely)
+  const fn = RENDER.match(/function userMd\(src: string[^\n]*?\): string \{[\s\S]*?\n\}/)?.[0] || "";
   assert.ok(fn, "userMd() must exist");
-  assert.match(fn, /DOMPurify\.sanitize\(userMdHtml\(src\), MD_PURIFY\)/);
-  const mdFn = RENDER.match(/function md\(src: string\): string \{[\s\S]*?\n\}/)?.[0] || "";
-  assert.match(mdFn, /DOMPurify\.sanitize\(dirty, MD_PURIFY\)/, "md() sanitizes with the same shared profile");
+  assert.match(fn, /DOMPurify\.sanitize\(userMdHtml\(src\), \{ \.\.\.MD_PURIFY, RETURN_DOM: true \}\)/);
+  const mdFn = RENDER.match(/function md\(src: string[^\n]*?\): string \{[\s\S]*?\n\}/)?.[0] || "";
+  assert.match(mdFn, /DOMPurify\.sanitize\(dirty, \{ \.\.\.MD_PURIFY, RETURN_DOM: true \}\)/, "md() sanitizes with the same shared profile");
   assert.match(RENDER, /const MD_PURIFY: Config = \{ USE_PROFILES: \{ html: true, svg: true \}, ADD_DATA_URI_TAGS: \["img"\], ALLOW_DATA_ATTR: false \};/);
 });
 

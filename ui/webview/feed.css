@@ -1510,6 +1510,11 @@ a.fileview-gh-note { border-style: dashed; }
 .fileview-md strong { color: var(--fg); font-weight: 600; }
 .fileview-md em { font-style: italic; }
 .fileview-md a { color: var(--link); text-decoration: none; }
+/* PR references linked in plain-text surfaces (pr-links.ts): card titles, distiller lines, checklists,
+   outline goal rows. Inside .md the generic anchor rule already inks them; this covers the rest, in the
+   same hyperlink ink. */
+.pr-link { color: var(--link); text-decoration: none; }
+.pr-link:hover { text-decoration: underline; }
 .fileview-md a:hover { text-decoration: underline; }
 .fileview-md blockquote { margin: 0.5em 0; padding-left: 12px;
   border-left: 2px solid var(--box-border); color: var(--dim); }
