@@ -461,13 +461,13 @@ class RestartReconcile(unittest.TestCase):
                 f.write(json.dumps(r) + "\n")
         km._bgall_cache.clear(); km._bgtasks_cache.clear()
 
-    def _seed(self, kind, why="waiting on a dispatched investigation", anchor=STAMP):
+    def _seed(self, kind, why="waiting on a dispatched investigation", anchor=STAMP, written=None):
         nd = {"id": self.gid, "text": "a goal", "parentId": None, "nodeComplete": False,
               "blocked": False, "cleared": False, "trail": [], "t": BORN, "mt": BORN,
               "awaitingWhy": why, "awaitingAt": anchor,
               **({"awaitingKind": kind} if kind else {}),
               "log": [{"ev_t": anchor, "src": "closer", "kind": "awaiting", "why": why,
-                       **({"awaitKind": kind} if kind else {}), "at": anchor}]}
+                       **({"awaitKind": kind} if kind else {}), "at": anchor if written is None else written}]}
         (km.jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
             {"rompUuid": SID, "seq": 1, "placements": {}, "status": {}, "nodes": {self.gid: nd}}))
 
@@ -508,6 +508,35 @@ class RestartReconcile(unittest.TestCase):
         self._seed("job")
         self._tick({"state": "", "bgTasks": []})
         self.assertIsNotNone(self._stamp(), "the slurm job may run on — only its terminal record lifts")
+
+    def test_a_restart_alone_does_not_lift_a_dispatchless_job_stamp(self):
+        # a JOB stamp names compute the kernel cannot observe (a CI run, a remote queue). A CLI respawn
+        # is the CARRIER dying, not the job ending — yet a routine kernel restart alone lifted a
+        # correctly-labelled job stamp that owned nothing (review find on #936, 2026-09-07). The same
+        # shape with kind=task DOES lift: an in-harness task died with its process.
+        self._transcript([])                              # nothing dispatched anywhere
+        self._seed("job", why="slurm 4821 regenerating the parts; verifies when done")
+        self.spawn = BACK                                 # the backend respawned AFTER the stamp
+        self._tick({"state": "", "bgTasks": []})
+        self.assertIsNotNone(self._stamp(), "a restart is not the external job returning")
+        self._seed("task", why="the background build finishing")
+        self._tick({"state": "", "bgTasks": []})
+        self.assertIsNone(self._stamp(), "an in-harness task stamp: the respawn killed what it watched")
+
+    def test_a_return_before_the_stamp_was_written_is_not_the_world_emptying_after_it(self):
+        # the dispatch-less branch measures endings from the stamp's WRITE time, not the audited turn's
+        # trigger: a background item that returned mid-turn, before the closer even wrote the stamp,
+        # used to lift it within one pusher cycle of its write (review find on #936, 2026-09-07)
+        self.spawn = STAMP - 50                           # no respawn after the stamp
+        # launched BEFORE the goal was born, so the stamp owns no dispatch and the dispatch-less branch
+        # (not the owned-dispatch rule) is what decides
+        self._transcript([_launch("t1", BORN - 50), _notification("t1", BACK)])   # returned at BACK…
+        self._seed("task", anchor=STAMP, written=BACK + 50)                        # …the stamp written AFTER it
+        self._tick({"state": "", "bgTasks": []}, now=BACK + 200)
+        self.assertIsNotNone(self._stamp(), "the return predates the stamp's write — not an ending after it")
+        self._seed("task", anchor=STAMP, written=STAMP)                         # written BEFORE the return
+        self._tick({"state": "", "bgTasks": []}, now=BACK + 200)
+        self.assertIsNone(self._stamp(), "a return after the write is the ending the stamp waited on")
 
     def test_a_dispatchless_agents_stamp_over_an_empty_registry_lifts(self):
         # the live 2026-08-24 shape: a closer misread peer sessions as agents and stamped kind=agents

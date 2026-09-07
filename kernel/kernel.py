@@ -6024,7 +6024,7 @@ def _lift_ev_t(nd, now):
     return nd.get("awaitingAt") or now
 
 
-def _bg_ended_after(every, tombs, sp, anchor, now):
+def _bg_ended_after(every, tombs, sp, anchor, now, kind="task"):
     """Did some in-harness background item END after `anchor`? The watermark for the dispatch-less
     task/job lift in _lift_spent_awaiting: the registry says nothing runs NOW, and this says the
     emptiness ARRIVED after the stamp — so the stamp stood over live work that has since ended, rather
@@ -6032,13 +6032,18 @@ def _bg_ended_after(every, tombs, sp, anchor, now):
     Every source is a recorded event, never a clock: a task's terminal record (`endT`), a Monitor's
     recorded ceiling passing (its kill moment — em._bg_expired, deadline past the anchor), a launch-
     ledger stop tombstone (`at`; a TaskStop suppresses the notification the transcript would pair), or
-    the CLI respawn `sp` that killed everything the stamp could have watched."""
-    if sp > anchor:
+    the CLI respawn `sp` that killed everything the stamp could have watched.
+
+    `kind` is the stamp's awaitingKind. For a JOB stamp (compute the kernel cannot observe: a CI run,
+    a remote queue) a CLI respawn and a Monitor's ceiling are CARRIER deaths, not the job ending — a
+    routine kernel restart alone used to lift a correctly-labelled job stamp that owned nothing (review
+    find on #936, 2026-09-07). A job lifts only on a real terminal record or a ledger stop tombstone."""
+    if kind != "job" and sp > anchor:
         return True
     for t in every:
         if (t.get("endT") or 0) > anchor:
             return True
-        if t.get("status") == "running" and em._bg_expired(t, now) and (t.get("deadline") or 0) > anchor:
+        if kind != "job" and t.get("status") == "running" and em._bg_expired(t, now) and (t.get("deadline") or 0) > anchor:
             return True
     return any((e.get("at") or 0) > anchor for e in tombs if isinstance(e, dict))
 
@@ -6276,7 +6281,11 @@ def _lift_spent_awaiting(now, tmux):
                             (_kind == "agents"
                              and (sp > _anchor0 or not any(t.get("status") == "running" for t in every)))
                             or (_kind in ("task", "job") and not _kernel_watch_armed(sid)
-                                and _bg_ended_after(every, tombs, sp, _anchor0, now))):
+                                # endings are measured from the stamp's WRITE time (_stamp_written_at), not
+                                # the audited turn's trigger: an item that returned mid-turn, before the
+                                # closer even wrote the stamp, is not the world emptying after it (review
+                                # find on #936, 2026-09-07)
+                                and _bg_ended_after(every, tombs, sp, _stamp_written_at(nd), now, kind=_kind))):
                         if jd.record_verdict(store, nd, "romp", "awaiting", _lift_ev_t(nd, now), lift=True):
                             changed = True
                             _drop_auto_nudge_rec(top)
