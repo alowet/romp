@@ -32965,7 +32965,17 @@ def _send_slot_delta(c, key, ftype, payload, pre, sig):
         if c.get("sent", {}).get(key, (None,))[0] == sig:      # it went (or was already held) → rebase
             states[ftype] = {"rev": 0, "rest": rest_sig,
                              "coll": {n: {kk: e[1] for kk, e in ents.items()} for n, (ents, _o) in colls.items()},
-                             "order": {n: list(o) for n, (_e, o) in colls.items()}, "at": now}
+                             "order": {n: list(o) for n, (_e, o) in colls.items()}, "at": now, "parts": parts}
+        return
+    if parts is st.get("parts") and now - st.get("at", 0) < _DEDUP_REPOST_S:
+        # `parts` is the split of the payload OBJECT (_delta_parts is a one-entry identity cache per slot), and
+        # st["parts"] is the split the client's held state was last written from or last compared equal to: the
+        # keyed full, the last delta that went, or the unchanged branch below. The same object means the same entry
+        # strings, key sets, order shape and remainder, so the compare below would end at its unchanged branch; the
+        # pusher hands an unchanged payload object across cycles (_bars_wire holds the bars by the cached timeline's
+        # identity), and that compare is what this skips. Counted as the unchanged branch counts it: built, not
+        # sent. Past the repost window the compare runs and the repost goes.
+        _PERF_STATS.send(key, "deduped", len(pre))
         return
     frame = {"type": "delta", "slot": ftype, "base": st["rev"], "rev": st["rev"] + 1, "coll": {}}
     changed = False
@@ -32998,6 +33008,14 @@ def _send_slot_delta(c, key, ftype, payload, pre, sig):
     if not changed:
         if now - st.get("at", 0) < _DEDUP_REPOST_S:    # unchanged: nothing to send (the repost keeps the fade alive)
             _PERF_STATS.send(key, "deduped", len(pre))   # built and compared, not sent — the same fact
+            # Adopt this split as the held one: the compare just showed the held entry strings, key sets, order
+            # shape and remainder equal it, so the same object next cycle is an identity hit above rather than
+            # another compare. A content-equal rebuild mints a new payload object (the view sig's 5 s bucket
+            # rebuilds the timeline on a quiet system; a feed differing only in `now`); without the adoption it
+            # would be re-compared every cycle until the repost, and the previous build's split, its whole
+            # entry-object graph, would stay referenced from here meanwhile. `at` stands: the repost timer counts
+            # from the last frame that went.
+            st["parts"] = parts
             return                                         # _send_client's dedup records for a whole-frame client
     s = json.dumps(frame, default=str)
     if len(s) >= _DELTA_MAX_FRACTION * len(pre):       # not worth a delta → the full frame, rebased
@@ -33009,7 +33027,7 @@ def _send_slot_delta(c, key, ftype, payload, pre, sig):
     _PERF_STATS.send(key, "delta", len(s))
     if not _client_send(c, s, key):
         return
-    st["rev"] += 1; st["rest"] = rest_sig; st["at"] = now
+    st["rev"] += 1; st["rest"] = rest_sig; st["at"] = now; st["parts"] = parts
     for name, (ents, _order) in colls.items():
         st["coll"][name] = {kk: e[1] for kk, e in ents.items()}
         st["order"][name] = next_order[name]

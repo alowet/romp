@@ -114,6 +114,48 @@ class PushSplit(unittest.TestCase):
         for k in ("judging", "messages"):
             self.assertIn(k, bars, "the whole time-plotted detail rides the bars message")
 
+    def test_a_steady_push_of_an_unchanged_timeline_sends_no_bars_and_a_rebuilt_one_sends_a_slotted_delta(self):
+        """The pusher hands _send_slot the same bars object while the cached timeline's identity holds (_bars_wire),
+        so a delta client's unchanged cycle runs no per-entry compare and sends nothing. When the timeline is
+        rebuilt the bars cross as a delta frame, with the slot key on the client while it goes."""
+        sent = []
+        client = {"app": "timeline", "sent": {}, "alive": True, "delta": True}
+        client["send"] = lambda s: sent.append((client.get("curSlot"), json.loads(s)))
+        SKEL = {"type": "timeline", "sessions": [{"id": "S"}], "turns": {}, "judging": [],
+                "messages": [], "now": 1, "usage": {}}
+        FULL1 = {"type": "timeline", "sessions": [{"id": "S"}], "turns": {"S": [{"id": "b1"}]},
+                 "judging": [], "messages": [], "now": 1}
+        FULL2 = {"type": "timeline", "sessions": [{"id": "S"}], "turns": {"S": [{"id": "b1"}, {"id": "b2"}]},
+                 "judging": [], "messages": [], "now": 2}
+        holder = {"tl": FULL1}
+        calls = []
+        o_bt, o_ct, o_tmux, o_sig, o_frac, o_order, o_wire = (km.build_timeline, km._cached_timeline, km._tmux_sessions,
+                                                             km._fleet_view_sig, km._DELTA_MAX_FRACTION, km._client_order,
+                                                             km._bars_wire)
+        km.build_timeline = lambda now, tmux, with_bars=True, live_only=False: (holder["tl"] if with_bars else SKEL)
+        km._cached_timeline = lambda now, tmux, sig, connect=False: holder["tl"]
+        km._tmux_sessions = lambda: {}
+        km._fleet_view_sig = lambda now, tmux: ("sig",)
+        km._DELTA_MAX_FRACTION = 10.0         # synthetic payloads are tiny: the size guard would send the whole instead
+        km._client_order = lambda *a: calls.append(1) or o_order(*a)
+        try:
+            km._push([client])                # the skeleton and the keyed full bars
+            km._push([client])                # the same timeline object: the same bars object
+            n_sent, n_calls = len(sent), len(calls)
+            km._push([client])
+            self.assertEqual(len(sent), n_sent, "an unchanged timeline sends no bars frame")
+            self.assertEqual(len(calls), n_calls, "…and runs no per-entry compare to find that out")
+            holder["tl"] = FULL2              # a rebuild: a new timeline object with one more bar
+            km._push([client])
+        finally:
+            (km.build_timeline, km._cached_timeline, km._tmux_sessions, km._fleet_view_sig, km._DELTA_MAX_FRACTION,
+             km._client_order, km._bars_wire) = o_bt, o_ct, o_tmux, o_sig, o_frac, o_order, o_wire
+        bars = [(k, m) for k, m in sent if m["type"] in ("bars", "delta")]
+        self.assertEqual([m["type"] for _k, m in bars], ["bars", "delta"])
+        self.assertEqual([k for k, _m in bars], [("timelinebars",), ("timelinebars",)],
+                         "both bars frames went with the slot key on the client")
+        self.assertEqual(set(bars[1][1]["coll"]["turns"]["set"]), {"S\u001fb2"}, "one bar crosses")
+
 
 class DeadLaneWindow(unittest.TestCase):
     """Dead lanes default to a 12h window and the FIRST cold paint reads no dead session at all (the user

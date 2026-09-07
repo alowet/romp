@@ -332,6 +332,80 @@ class BarsDeltas(unittest.TestCase):
         fr = st.push(_bars({S1: self._turn(S1, 2)}, [], [], now=1005))
         self.assertEqual([f["type"] for f in fr], ["delta"], "…and the stream continues as deltas the client can apply")
 
+    def test_n_the_same_payload_object_pushed_again_skips_the_per_entry_compare_until_the_repost(self):
+        """The builders reuse an unchanged payload object across cycles (the pusher holds the bars by the cached
+        timeline's identity), so the split the client's state was last written from is the split this cycle would
+        compare against it: the compare is skipped and nothing is sent. Past the repost window the compare runs and
+        the repost goes. An EQUAL payload in a new object (a content-equal rebuild) is compared once, which adopts its
+        split, and that object is short-circuited from then on."""
+        st = _Stream("bars")
+        p = _bars({S1: self._turn(S1, 3), S2: self._turn(S2, 2)}, [{"sid": S1, "judge": "closer", "t": 1, "t1": 2}], [])
+        st.push(p)
+        self.assertIs(st.c["dstate"]["bars"]["parts"], km._delta_parts("bars", p), "the keyed full records the split it went from")
+        real_order, real_shape, calls = km._client_order, km._order_shape, []
+        def order(*a): calls.append("_client_order"); return real_order(*a)
+        def shape(*a): calls.append("_order_shape"); return real_shape(*a)
+        with mock.patch.object(km, "_client_order", order), mock.patch.object(km, "_order_shape", shape):
+            self.assertEqual(st.push(p), [], "the same object: nothing to send")
+            self.assertEqual(st.push(p), [])
+            self.assertEqual(calls, [], "…and no per-entry compare ran to find that out")
+            st.c["dstate"]["bars"]["at"] -= km._DEDUP_REPOST_S + 1
+            fr = st.push(p)
+            self.assertEqual(len(fr), 1); self.assertEqual(fr[0]["type"], "delta"); self.assertEqual(fr[0]["coll"], {})
+            self.assertTrue(calls, "past the repost window the same object is compared and the repost goes")
+            self.assertIs(st.c["dstate"]["bars"]["parts"], km._delta_parts("bars", p), "a delta that went records its split")
+            del calls[:]
+            q = dict(p, now=1002)                              # an equal payload in a NEW object: a content-equal rebuild
+            self.assertEqual(st.push(q), [], "an equal payload in a new object still sends nothing…")
+            self.assertTrue(calls, "…by comparing once: identity is the short-circuit, not equality")
+            self.assertIs(st.c["dstate"]["bars"]["parts"], km._delta_parts("bars", q), "…and the compare adopts the new split")
+            del calls[:]
+            self.assertEqual(st.push(q), [], "the same new object again: nothing to send")
+            self.assertEqual(calls, [], "…and no compare: the adopted split is an identity hit")
+        p2 = json.loads(json.dumps(p)); p2["turns"][S2] = self._turn(S2, 3); p2["now"] = 1005
+        self.assertEqual([f["type"] for f in st.push(p2)], ["delta"])
+        self.assertIs(st.c["dstate"]["bars"]["parts"], km._delta_parts("bars", p2), "the held split follows the change")
+        self.assertEqual(st.push(p2), []); self.assertEqual(st.held, p2)
+
+    def test_o_a_raising_send_on_the_delta_path_leaves_the_revision_and_the_held_split_unchanged(self):
+        """A frame that did not go does not advance what the client holds: the revision stays, and the held split
+        stays the one the last frame that went was written from, so the payload that failed is not an identity hit
+        next cycle and the compare runs against the state the client really holds."""
+        st = _Stream("bars")
+        st.push(_bars({S1: self._turn(S1, 1)}, [], []))
+        fr = st.push(_bars({S1: self._turn(S1, 2)}, [], [], now=1005))
+        self.assertEqual([f["type"] for f in fr], ["delta"])
+        rev, held = st.c["dstate"]["bars"]["rev"], st.c["dstate"]["bars"]["parts"]
+        def boom(s): raise RuntimeError("synthetic socket failure")   # not a "bytes behind" drop: no bell row
+        st.c["send"] = boom
+        p3 = _bars({S1: self._turn(S1, 3)}, [], [], now=1010)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(st.push(p3), [])
+        self.assertFalse(st.c["alive"], "a failed send marks the client dead")
+        self.assertEqual(st.c["dstate"]["bars"]["rev"], rev, "a frame that did not go does not advance what the client holds")
+        self.assertIs(st.c["dstate"]["bars"]["parts"], held, "…nor the split its state was written from")
+        self.assertIsNot(st.c["dstate"]["bars"]["parts"], km._delta_parts("bars", p3))
+
+    def test_p_an_unchanged_compare_leaves_the_repost_timer_on_the_last_frame_that_went(self):
+        """The unchanged branch adopts the split but leaves `at` alone, and so does the identity short-circuit: the
+        repost timer counts from the last frame that WENT, so a content-equal rebuild every cycle cannot postpone the
+        repost that keeps the pane's clock and fade alive."""
+        st = _Stream("bars")
+        p = _bars({S1: self._turn(S1, 2)}, [], [])
+        st.push(p)                                                 # the keyed full: the frame that went
+        ds = st.c["dstate"]["bars"]
+        ds["at"] -= km._DEDUP_REPOST_S - 5                         # …55 s ago
+        at0 = ds["at"]
+        q = dict(p, now=1002)                                      # a content-equal rebuild: compared once, adopted
+        self.assertEqual(st.push(q), [])
+        self.assertIs(ds["parts"], km._delta_parts("bars", q), "the compare adopted the new split")
+        self.assertEqual(st.push(q), [], "…so the same object is an identity hit")
+        self.assertEqual(ds["at"], at0, "neither branch moved the repost timer")
+        with mock.patch.object(km, "_DEDUP_REPOST_S", km._DEDUP_REPOST_S - 10):   # the window closes on the 55 s old frame
+            fr = st.push(q)
+        self.assertEqual([f["type"] for f in fr], ["delta"], "the repost goes, timed from the frame that went")
+        self.assertEqual(fr[0]["coll"], {}); self.assertEqual(fr[0]["rest"], {"now": 1002})
+
 
     def test_g_a_bar_appended_to_an_earlier_lane_crosses_alone_and_lands_in_its_lane(self):
         """The flat key order changes (the new bar sits before the later lanes' bars) but the assembled
