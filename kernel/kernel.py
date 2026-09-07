@@ -4432,6 +4432,33 @@ def _last_deploy_restart_t():
     return best
 
 
+_QUIET_PARKED_LOGGED = [""]   # the checkout sha whose parked quiet deploy the drift check last said it was leaving alone
+
+
+def _parked_quiet_deploy(checkout, now=None):
+    """The `t` of a QUIET deploy request still pending for the code the checkout holds, else 0
+    (T240d): the newest restart-requesting audit row is a p2p-update (a peer's apply, which advanced
+    the checkout and asked the manager for a quiet restart) or a main-converge with when=quiet, its
+    sha is the checkout's, no cut row has consumed it (auditT), and it is inside the window a quiet
+    request stays pending — the far manager's backstop bound, exactly what _recent_restart_audit
+    already gives such a row for cut attribution. So a park lost with its manager self-heals at that
+    bound, and the cut row that lands the deploy consumes the row: events, not a timer of this
+    function's own. The p2p row's sha rides its reason ("from <host> to <sha>"); the converge row
+    carries `sha` outright; a quiet row naming no sha matches nothing (never guess)."""
+    rec = _recent_restart_audit(now=now)
+    if not isinstance(rec, dict) or rec.get("when") != "quiet" or not checkout:
+        return 0
+    if str(rec.get("action") or "") not in ("p2p-update", "main-converge"):
+        return 0
+    sha = str(rec.get("sha") or "")
+    if not sha:
+        m = re.search(r"\bto ([0-9a-f]{7,40})\b", str(rec.get("reason") or ""))
+        sha = m.group(1) if m else ""
+    if not sha or not (checkout.startswith(sha) or sha.startswith(checkout)):
+        return 0
+    return int(rec["t"]) if isinstance(rec.get("t"), (int, float)) else 0
+
+
 def _main_drift_check():
     """One origin/checkout/running comparison pass; fires the SAME banner as the release check (the
     shell's offer() renders the main-drift wording off kind:"main"). Re-fires only when the target sha
@@ -4443,7 +4470,8 @@ def _main_drift_check():
         # one notice per new TAG, from _update_check — and must never hear about dev commits.
         # The maintainer's mesh keeps this watcher through its own signals (_main_channel_verdict).
         return
-    kind, target = _main_drift_verdict(_origin_main_sha(), _checkout_sha(), _kernel_sha())
+    checkout = _checkout_sha()      # ONE read: the verdict's input and the parked-deploy match below
+    kind, target = _main_drift_verdict(_origin_main_sha(), checkout, _kernel_sha())
     if kind == "restart" and target == _REBUILT_FOR[0]:
         return                                        # already converged in place (UI-only rebuild)
     if kind == "restart" and not _kernel_code_changed(_kernel_sha(), target):
@@ -4473,6 +4501,24 @@ def _main_drift_check():
         # this process's memory: the converge's own restart forgets module state, and a p2p-update
         # restart from a peer resets it the same way (T240). Module memory still covers the seconds
         # before the ledger row exists.
+        #
+        # A QUIET deploy already parked for the code on disk STANDS THIS CHECK DOWN (T240d): a peer's
+        # p2p apply advanced the checkout and asked the manager for a quiet restart, then this check
+        # saw the checkout ahead of the kernel and posted an IMMEDIATE restart-all — 16:23Z quiet
+        # park, 16:27Z converge/now, ten sessions cut, the quiet window the peer asked for never ran
+        # (and 08:42Z the same, two seconds apart, on the pull side: origin read ahead of the just-reset
+        # checkout, and the pull's restart pre-empted the park). The restart is already on its way;
+        # leave it to the window — one restart, and any pull follows on the pass after it lands. Not
+        # marked acted on: the pass after the row is consumed (or expires) re-evaluates. Said once per
+        # sha, not once per pass. The immediate policy for a genuinely new pull (T160) and the
+        # cool-down are unchanged.
+        if _parked_quiet_deploy(checkout):
+            if _QUIET_PARKED_LOGGED[0] != checkout:
+                _QUIET_PARKED_LOGGED[0] = checkout
+                sys.stderr.write("romp-kernel: converge: %s already parked as a quiet deploy — leaving it "
+                                 "to the quiet window\n" % checkout[:8])
+            _MAIN_DRIFT[slot] = ""
+            return
         last = max(_LAST_AUTO_CONVERGE[0], _last_deploy_restart_t())
         if time.time() - last < _CONVERGE_COOLDOWN_S:
             _MAIN_DRIFT[slot] = ""
@@ -4550,7 +4596,8 @@ def _run_main_update(kind, immediate=True, manager_port=_PORT_FROM_ENV):
         import urllib.request
         # the reason joins the dying kernel's restart-cuts.jsonl row to WHO restarted it (see
         # _recent_restart_reason) — the auto converge used to leave the row anonymous
-        _audit_restart_request("main-converge", tag=kind, when=("now" if immediate else "quiet"))
+        _audit_restart_request("main-converge", tag=kind, when=("now" if immediate else "quiet"),
+                               sha=_checkout_sha())      # what a quiet row deploys (T240d: _parked_quiet_deploy)
         req = urllib.request.Request("http://127.0.0.1:%d/restart-all%s"
                                      % (int(manager_port or 7432),
                                         "" if immediate else "?when=quiet"), method="POST")
@@ -15142,8 +15189,13 @@ def _update_remote(host):
         'if [ ! -x "$R/bin/romp-serve" ]; then echo "NOLAUNCH:$NEW"; exit 0; fi; '
         # NEVER AN ANONYMOUS SIGTERM (T238, the T121 rule): a restart-audit row lands BEFORE whichever
         # restart happens, so the far kernel's cut row carries WHO and WHY (the p2p update, from this
-        # machine, to this sha) — nine restarts in three hours had no reason on record. The restart
-        # goes THROUGH THE FAR MANAGER'S QUIET WINDOW (restart-all --quiet: no in-flight turn is cut,
+        # machine, to this sha) — nine restarts in three hours had no reason on record. The QUIET row
+        # lands HERE, right after the reset and before the owner check (T240d): the far kernel's drift
+        # check stands down for a quiet deploy of the code its checkout holds by reading this row, and
+        # the owner check's manager status call was a window in which the checkout was already ahead
+        # with no row on disk. When no owning manager answers, the fallback below writes its own
+        # IMMEDIATE row, which is then the newest and supersedes this one for every reader. The
+        # restart goes THROUGH THE FAR MANAGER'S QUIET WINDOW (restart-all --quiet: no in-flight turn is cut,
         # the 15-minute backstop still lands the deploy, a second apply arriving while one is pending
         # coalesces into the same bounce) — but ONLY when that manager actually OWNS the kernel on the
         # polled port (its /status lists it): a manager owning nothing, or a bare kernel beside a
@@ -15152,12 +15204,12 @@ def _update_remote(host):
         # = the immediate path below ran (no owning manager reachable — node absent, no manager, or
         # the polled kernel is bare). The quiet audit row says when=quiet; the fallback writes its own
         # row without it, so the cut row joins the right request with the right window.
+        'python3 -c "import json,time;print(json.dumps({\'t\':int(time.time()),\'action\':\'p2p-update\','
+        '\'reason\':\'from %s to %s\',\'when\':\'quiet\'}))" >>"$LOGDIR/restart-audit.jsonl" 2>/dev/null || true; '
         'OWNED=0; if command -v node >/dev/null 2>&1 && [ -x "$R/bin/romp-manager" ]; then '
         'OWNED="$("$R/bin/romp-manager" status 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); '
         'print(1 if any(int(k.get(\'port\') or 0)==%d for k in (d.get(\'kernels\') or [])) else 0)" 2>/dev/null || echo 0)"; fi; '
         'if [ "$OWNED" = 1 ]; then '
-        'python3 -c "import json,time;print(json.dumps({\'t\':int(time.time()),\'action\':\'p2p-update\','
-        '\'reason\':\'from %s to %s\',\'when\':\'quiet\'}))" >>"$LOGDIR/restart-audit.jsonl" 2>/dev/null || true; '
         'if "$R/bin/romp-manager" restart-all --quiet >>"$LOGDIR/update.log" 2>&1; then echo "SYNCED:$NEW:QUIET"; exit 0; fi; fi; '
         # LAST RESORT (no owning manager answering on this host): the immediate path below — audit row,
         # kill, then `ensure` upgrades the host to a supervised kernel.
@@ -15177,7 +15229,7 @@ def _update_remote(host):
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
         'echo "SYNCED:$NEW:FALLBACK"'
     ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         kport, _local_machine_label(), (_local_head(short=True) or lfull[:8]),
+         _local_machine_label(), (_local_head(short=True) or lfull[:8]), kport,
          _local_machine_label(), (_local_head(short=True) or lfull[:8]), kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
