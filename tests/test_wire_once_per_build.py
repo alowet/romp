@@ -73,6 +73,18 @@ def _client(app, delta=True):
     return c
 
 
+class _RaisingLock:
+    """A client slot lock whose acquire raises, so a send fails inside _send_slot's `with _client_lock(c)` and the
+    test asserts on THIS message. A bare object() in the slot raises there too, but as AttributeError before 3.11
+    and TypeError from 3.11, so the interpreter's wording is not a stable marker across the CI matrix."""
+
+    def __enter__(self):
+        raise RuntimeError("synthetic send failure")
+
+    def __exit__(self, *exc):
+        return False
+
+
 def _delta(after, before):
     return {k: after[k] - before[k] for k in after if after[k] != before[k]}
 
@@ -371,6 +383,138 @@ class ANonJsonValueOnTheWireIsCountedAndSaidOnce(unittest.TestCase):
         self.assertEqual(_delta(km._wire_stats, s0)["default_str"], 1)
         self.assertEqual(_wire_lines(err), ["wire: set serialized via str() in _delta_parts"])
         self.assertIn('"extra": "{\'x\'}"', parts[2], "the remainder's signature carries the str() bytes")
+
+
+class ARaisingSerializerLeavesThePusherAlive(unittest.TestCase):
+    """The wire section of _push runs after its build try, and _push_all, _pusher_cycle_jobs, _pusher_cycle and
+    _pusher have no except around it: a raise there used to end the pusher thread for the life of the process,
+    every dashboard frozen until a restart. A fill that raises now stands its slot down for the cycle (one
+    traceback; the slot's other clients skipped without another), a send that raises skips that client, and the
+    next cycle retries; _pusher_cycle_jobs catches whatever escapes _push_all. Every raise here is synthetic and
+    asserted on its own marker text, never the interpreter's."""
+
+    TICK_JOBS = ("_apply_pending_ops", "_turn_notify_tick", "_lift_spent_awaiting", "_death_sweep_tick",
+                 "_end_on_idle_sweep", "_deferral_sweep_tick", "_auto_nudge_tick", "_interrupt_block_tick",
+                 "_auto_pause_on_limit", "_usage_poll_tick", "_auto_pause_on_spend_limit", "_auto_resume_retry",
+                 "_auto_resume_session_retry", "_auto_retry_tick", "_idle_queue_drive_tick",
+                 "_clear_done_working_notes")
+
+    @staticmethod
+    def _split_raising_for(ftype):
+        real = km._delta_parts
+
+        def split(kind, payload):
+            if kind == ftype:
+                raise KeyError("synthetic fill failure")
+            return real(kind, payload)
+        return split
+
+    def test_a_fill_that_raises_stands_its_slot_down_for_the_cycle_and_the_other_slot_is_served(self):
+        w = _World(self, feed=_feed(), timeline=_timeline())
+        dfeed, dfeed2, tl = _client("feed"), _client("feed"), _client("timeline")
+        err = io.StringIO()
+        with mock.patch.object(km, "_delta_parts", side_effect=self._split_raising_for("feed")), redirect_stderr(err):
+            km._push([dfeed, tl, dfeed2])                        # returns: nothing escapes
+        self.assertEqual(err.getvalue().count("push send feed (feed)"), 1,
+                         "one traceback for the fill; the slot's other client is skipped without another")
+        self.assertIn("synthetic fill failure", err.getvalue())
+        self.assertEqual(dfeed["frames"], []); self.assertEqual(dfeed2["frames"], [])
+        self.assertEqual([f["type"] for f in tl["frames"]], ["data", "bars"], "the bars slot is unaffected")
+        self.assertIsNone(km._feed_wire, "a fill that raised cached nothing")
+        w.feed = _feed(build_id=2)                               # the next build is sound: served
+        with redirect_stderr(err):
+            km._push([dfeed, tl, dfeed2])
+        self.assertEqual([f["type"] for f in dfeed["frames"]], ["feed"]); self.assertEqual([f["type"] for f in dfeed2["frames"]], ["feed"])
+        self.assertEqual(err.getvalue().count("push send"), 1, "the sound build logged nothing")
+
+    def test_a_bars_fill_that_raises_stands_the_bars_slot_down_and_the_feed_is_served(self):
+        w = _World(self, feed=_feed(), timeline=_timeline())
+        tl, dfeed, tl2 = _client("timeline"), _client("feed"), _client("timeline")
+        err = io.StringIO()
+        with mock.patch.object(km, "_delta_parts", side_effect=self._split_raising_for("bars")), redirect_stderr(err):
+            km._push([tl, dfeed, tl2])
+        self.assertEqual(err.getvalue().count("push send bars (timeline)"), 1)
+        self.assertIn("synthetic fill failure", err.getvalue())
+        self.assertEqual([f["type"] for f in tl["frames"]], ["data"], "the lanes frame went from the build section; no bars")
+        self.assertEqual([f["type"] for f in tl2["frames"]], ["data"])
+        self.assertEqual([f["type"] for f in dfeed["frames"]], ["feed"], "the feed slot is unaffected")
+        self.assertIsNone(km._bars_wire)
+        w.timeline = _timeline(now=2)
+        with redirect_stderr(err):
+            km._push([tl, dfeed, tl2])
+        self.assertEqual([f["type"] for f in tl["frames"]], ["data", "bars"]); self.assertEqual([f["type"] for f in tl2["frames"]], ["data", "bars"])
+
+    def test_a_board_clients_failed_fill_stands_the_feed_slot_down_not_the_bars(self):
+        # the sessions board (app "fleet", the pane's existing name) rides the feed payload: its fill's raise is the
+        # FEED slot's, logged once as such, and stands that slot down for the cycle (the second board client skipped
+        # without another traceback) while the bars slot is served
+        w = _World(self, feed=_feed(), timeline=_timeline())
+        board, tl, board2 = _client("fleet"), _client("timeline"), _client("fleet")
+        err = io.StringIO()
+        with mock.patch.object(km, "_delta_parts", side_effect=self._split_raising_for("feed")), redirect_stderr(err):
+            km._push([board, tl, board2])
+        self.assertEqual(err.getvalue().count("push send feed (fleet)"), 1, "logged as the feed slot, once")
+        self.assertEqual(err.getvalue().count("push send"), 1)
+        self.assertIn("synthetic fill failure", err.getvalue())
+        self.assertEqual(board["frames"], []); self.assertEqual(board2["frames"], [])
+        self.assertEqual([f["type"] for f in tl["frames"]], ["data", "bars"], "the bars slot is served")
+        self.assertIsNone(km._feed_wire); self.assertIsNotNone(km._bars_wire)
+        w.feed = _feed(build_id=2)
+        with redirect_stderr(err):
+            km._push([board, tl, board2])
+        self.assertEqual([f["type"] for f in board["frames"]], ["feed"]); self.assertEqual([f["type"] for f in board2["frames"]], ["feed"])
+        self.assertEqual(err.getvalue().count("push send"), 1, "the sound build logged nothing")
+
+    def test_a_send_that_raises_skips_that_client_and_the_next_is_served(self):
+        _World(self, feed=_feed())
+        c1, c2 = _client("feed"), _client("feed")
+        c1["dlock"] = _RaisingLock()                             # a synthetic raise inside this client's send path
+        err = io.StringIO()
+        with redirect_stderr(err):
+            km._push([c1, c2])
+        self.assertIn("push send feed (feed)", err.getvalue()); self.assertIn("synthetic send failure", err.getvalue())
+        self.assertEqual(c1["frames"], [])
+        self.assertEqual([f["type"] for f in c2["frames"]], ["feed"], "the next client is served")
+        self.assertIsNotNone(km._feed_wire, "the fill stood: only the send failed")
+
+    def test_a_whole_frame_whose_encode_raises_leaves_the_slot_for_a_retry(self):
+        _World(self, feed=_feed())
+        legacy, dfeed = _client("feed", delta=False), _client("feed")   # both take a whole frame on their first send
+
+        def encode_raises(cell):
+            raise ValueError("synthetic encode failure")
+        err = io.StringIO()
+        with mock.patch.object(km._LazyWire, "text", new=encode_raises), redirect_stderr(err):
+            km._push([legacy, dfeed])
+        self.assertEqual(err.getvalue().count("push send feed (feed)"), 2, "each whole-frame client's send raised, was logged, skipped")
+        self.assertIn("synthetic encode failure", err.getvalue())
+        self.assertEqual(err.getvalue().count("view-delta feed:"), 1,
+                         "the delta client's own fallback (a whole frame) met the same raise; the belt caught it")
+        self.assertEqual(legacy["frames"], []); self.assertEqual(dfeed["frames"], [])
+        self.assertNotIn(("feed",), legacy["sent"], "the dedup slot was not written: the next cycle retries")
+        self.assertNotIn(("feed",), dfeed["sent"]); self.assertNotIn("feed", dfeed.get("dstate", {}))
+        self.assertIsNotNone(km._feed_wire, "the fill stood"); self.assertFalse(km._feed_wire[3].materialized())
+        km._push([legacy, dfeed])                                # the encode works again: the same build's frame goes
+        self.assertEqual([f["type"] for f in legacy["frames"]], ["feed"]); self.assertEqual([f["type"] for f in dfeed["frames"]], ["feed"])
+        self.assertIn("_keys", dfeed["frames"][0])
+        self.assertTrue(km._feed_wire[3].materialized())
+
+    def test_the_cycle_loop_survives_a_push_all_that_raises(self):
+        err = io.StringIO()
+        with mock.patch.multiple(km, **{nm: lambda *a, **k: None for nm in self.TICK_JOBS}), \
+                mock.patch.object(km, "_push_all", side_effect=RuntimeError("synthetic push failure")), redirect_stderr(err):
+            km._pusher_cycle_jobs(NOW, {}, True)                 # returns: the belt logged it
+        self.assertIn("push: ", err.getvalue()); self.assertIn("synthetic push failure", err.getvalue())
+
+    def test_the_wire_section_and_the_belt_are_in_the_source(self):
+        src = open(os.path.join(BIN, "romp-kernel"), encoding="utf-8").read()
+        push = src[src.index("def _push(targets"):]; push = push[:push.index("\ndef ")]
+        i = push.index("for c in targets:")
+        self.assertIn("        try:\n            if c[\"app\"] in (\"feed\", \"fleet\"):", push[i:])
+        self.assertIn('sys.stderr.write("push send %s (%s): %s\\n"', push[i:])
+        jobs = src[src.index("def _pusher_cycle_jobs("):]; jobs = jobs[:jobs.index("\ndef ")]
+        i = jobs.index("_push_all(tmux=tmux)")
+        self.assertLess(i, jobs.index("except Exception:", i)); self.assertLess(jobs.index("except Exception:", i), jobs.index("finally:", i))
 
 
 if __name__ == "__main__":

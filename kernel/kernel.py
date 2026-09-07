@@ -35256,46 +35256,69 @@ def _push(targets, connect=False, tmux=None):
     # single slot still holding it: a connect push on a handler thread (_push([client], connect=True)
     # from the ws handler) can evict that slot between this fill and the send. An unkeyable payload
     # (said once by _delta_parts) keeps the whole dump and _dedup_sig, as before.
+    # This section runs AFTER the build try above, and nothing above it on the pusher thread catches:
+    # _push_all, _pusher_cycle_jobs, _pusher_cycle (a try/finally) and _pusher (a bare while-True) have
+    # no except, so a raise here used to end the pusher thread for the life of the process — every
+    # dashboard frozen until a restart. A whole-frame dump with no `default=` met a set in a card and
+    # raised; a build slot read as None by this loop raised too. Now a fill that raises stands its slot
+    # down for THIS cycle (one traceback; the slot's other clients are skipped without another), a send
+    # that raises skips that client, and the next cycle retries both. _pusher_cycle_jobs catches around
+    # _push_all for whatever escapes _push; _pusher itself stays unwrapped, since that belt and
+    # _pusher_cycle's finally cover the cycle.
     global _feed_wire, _bars_wire
     feed_ms = feed_sig = feed_parts = bars = bars_ms = bars_sig = bars_parts = None
+    feed_down = bars_down = False                        # this cycle's fill raised: the slot's clients are skipped
     _t_stage = time.monotonic()
     for c in targets:
-        if c["app"] in ("feed", "fleet"):   # the feed pane AND the Fleet view both ride the feed payload (Fleet reads feed.ledgers)
-            if feed_ms is None:
-                w = _feed_wire                           # tuple snapshot — rebound whole, never mutated (torn reads)
-                if w is not None and w[0] is feed_src and w[1] == feed.get("ledgers"):
-                    feed, feed_ms, feed_sig, feed_parts = w[2], w[3], w[4], w[5]
+        try:
+            if c["app"] in ("feed", "fleet"):   # the feed pane AND the Fleet view both ride the feed payload (Fleet reads feed.ledgers)
+                if feed_down:
+                    continue
+                if feed_ms is None:
+                    w = _feed_wire                           # tuple snapshot — rebound whole, never mutated (torn reads)
+                    if w is not None and w[0] is feed_src and w[1] == feed.get("ledgers"):
+                        feed, feed_ms, feed_sig, feed_parts = w[2], w[3], w[4], w[5]
+                    else:
+                        feed_parts = _delta_parts("feed", feed)   # the one per-entry encode, handed down to the delta path
+                        if feed_parts is not None:
+                            feed_sig = _parts_sig(feed_parts)
+                            feed_ms = _LazyWire(lambda f=feed: json.dumps(f, default=_wire_default_in("_push feed")),
+                                                _parts_est(feed_parts), "feed_body")
+                        else:                                # unkeyable: whole frames and the string signature, as before
+                            s = json.dumps(feed, default=_wire_default_in("_push feed"))
+                            feed_ms, feed_sig = _LazyWire(None, len(s), text=s), _dedup_sig(feed, s)
+                            _wire_bump("feed_sig_fallback")
+                        _feed_wire = (feed_src, feed.get("ledgers"), feed, feed_ms, feed_sig, feed_parts)
+                _send_slot(c, "feed", feed, feed_ms, feed_sig, feed_parts)
+            elif c["app"] == "timeline" and timeline is not None:
+                if bars_down:
+                    continue
+                if bars_ms is None:
+                    w = _bars_wire
+                    if w is not None and w[0] is timeline and w[1] == tl_warming:
+                        bars, bars_ms, bars_sig, bars_parts = w[2], w[3], w[4], w[5]
+                    else:
+                        bars = {"type": "bars", "turns": timeline["turns"], "judging": timeline["judging"],
+                                "messages": timeline["messages"], "now": timeline["now"], "warming": tl_warming}
+                        bars_parts = _delta_parts("bars", bars)   # the one per-entry encode, handed down to the delta path
+                        if bars_parts is not None:
+                            bars_sig = _parts_sig(bars_parts)
+                            bars_ms = _LazyWire(lambda b=bars: json.dumps(b, default=_wire_default_in("_push bars")),
+                                                _parts_est(bars_parts), "bars_body")
+                        else:                                # unkeyable: whole frames and the string signature, as before
+                            s = json.dumps(bars, default=_wire_default_in("_push bars"))
+                            bars_ms, bars_sig = _LazyWire(None, len(s), text=s), _dedup_sig(bars, s)
+                            _wire_bump("bars_sig_fallback")
+                        _bars_wire = (timeline, tl_warming, bars, bars_ms, bars_sig, bars_parts)
+                _send_slot(c, "bars", bars, bars_ms, bars_sig, bars_parts)
+        except Exception:
+            is_feed = c["app"] in ("feed", "fleet")
+            if (feed_ms if is_feed else bars_ms) is None:    # the FILL raised (nothing assigned): stand the slot down this cycle
+                if is_feed:
+                    feed_down = True
                 else:
-                    feed_parts = _delta_parts("feed", feed)   # the one per-entry encode, handed down to the delta path
-                    if feed_parts is not None:
-                        feed_sig = _parts_sig(feed_parts)
-                        feed_ms = _LazyWire(lambda f=feed: json.dumps(f, default=_wire_default_in("_push feed")),
-                                            _parts_est(feed_parts), "feed_body")
-                    else:                                # unkeyable: whole frames and the string signature, as before
-                        s = json.dumps(feed, default=_wire_default_in("_push feed"))
-                        feed_ms, feed_sig = _LazyWire(None, len(s), text=s), _dedup_sig(feed, s)
-                        _wire_bump("feed_sig_fallback")
-                    _feed_wire = (feed_src, feed.get("ledgers"), feed, feed_ms, feed_sig, feed_parts)
-            _send_slot(c, "feed", feed, feed_ms, feed_sig, feed_parts)
-        elif c["app"] == "timeline" and timeline is not None:
-            if bars_ms is None:
-                w = _bars_wire
-                if w is not None and w[0] is timeline and w[1] == tl_warming:
-                    bars, bars_ms, bars_sig, bars_parts = w[2], w[3], w[4], w[5]
-                else:
-                    bars = {"type": "bars", "turns": timeline["turns"], "judging": timeline["judging"],
-                            "messages": timeline["messages"], "now": timeline["now"], "warming": tl_warming}
-                    bars_parts = _delta_parts("bars", bars)   # the one per-entry encode, handed down to the delta path
-                    if bars_parts is not None:
-                        bars_sig = _parts_sig(bars_parts)
-                        bars_ms = _LazyWire(lambda b=bars: json.dumps(b, default=_wire_default_in("_push bars")),
-                                            _parts_est(bars_parts), "bars_body")
-                    else:                                # unkeyable: whole frames and the string signature, as before
-                        s = json.dumps(bars, default=_wire_default_in("_push bars"))
-                        bars_ms, bars_sig = _LazyWire(None, len(s), text=s), _dedup_sig(bars, s)
-                        _wire_bump("bars_sig_fallback")
-                    _bars_wire = (timeline, tl_warming, bars, bars_ms, bars_sig, bars_parts)
-            _send_slot(c, "bars", bars, bars_ms, bars_sig, bars_parts)
+                    bars_down = True
+            sys.stderr.write("push send %s (%s): %s\n" % ("feed" if is_feed else "bars", c.get("app"), traceback.format_exc()))
     _PERF_STATS.stage("push.send", time.monotonic() - _t_stage)
     with _clients_lock:
         _clients[:] = [c for c in _clients if c.get("alive", True)]
@@ -36551,6 +36574,10 @@ def _pusher_cycle_jobs(now, tmux, any_client):
         _t_push = time.monotonic()
         try:
             _push_all(tmux=tmux)
+        except Exception:                 # _push guards its build and its sends; anything escaping it rode
+            #                               _pusher_cycle's finally into _pusher's while-True and ended the
+            #                               pusher thread for the process's life (see _push's wire section)
+            sys.stderr.write("push: %s\n" % traceback.format_exc())
         finally:
             _t_push = time.monotonic() - _t_push
             _PERF_STATS.stage("push", _t_push)
