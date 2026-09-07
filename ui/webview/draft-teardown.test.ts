@@ -312,8 +312,12 @@ test("an active tab torn down under the user: stash first, prune the fallback, b
 });
 
 test("while the note holds the box, the type-from-anywhere defaults stand down; a click into the box ends the hold", () => {
-  // the printable-key default: no focus steal into the survivor's box + flash (the handler stays preventDefault-free, as pinned by composer-citation.test.ts)
-  assert.match(RENDER, /if \(composerNoteHolds\(\)\) return;[^\n]*\n\s*ta\.focus\(\{ preventScroll: true \}\);/);
+  // the printable-key default (and, since 2026-09-05, the paste default with it): the hold is the LAST
+  // gate of their shared typeFromAnywhereTarget — no focus steal into the survivor's box + flash; both
+  // handlers focus only a box that helper returned (the keydown stays preventDefault-free, as pinned by
+  // composer-citation.test.ts)
+  assert.match(RENDER, /if \(composerNoteHolds\(\)\) return null;[^\n]*\n\s*return ta;\s*\n\}/);
+  assert.equal(RENDER.match(/const ta = typeFromAnywhereTarget\(e\);\s*\n\s*if \(!ta\) return;\s*\n(\s*e\.preventDefault\(\);\s*\n)?(?:[^\n]*\n)*?\s*ta\.focus\(\{ preventScroll: true \}\);/g)?.length, 2, "keydown and paste both focus through the shared gate");
   // bare-area Enter: stands down before focusComposerOrAsk
   assert.match(RENDER, /if \(ae && ae !== document\.body\) return;\s*\n\s*if \(composerNoteHolds\(\)\) return;/);
   assert.match(RENDER, /function composerNoteHolds\(\): boolean \{\s*\n\s*if \(!composerNoteSid\) return false;\s*\n\s*flashComposerNote\(\);\s*\n\s*return true;/);
