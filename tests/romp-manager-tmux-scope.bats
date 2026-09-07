@@ -11,7 +11,10 @@
 # --scope mode does for real) or, with FAKE_SYSTEMD_RUN_FAIL set, exits 1 with a bus error on stderr. A
 # recording fake tmux answers the command either way; with FAKE_TMUX_FAIL set it exits 1 with tmux's
 # connect error on stderr, which is what tmux failing INSIDE a scope that did start looks like to the
-# manager. Nothing here reaches the real systemd-run or the user manager: the switch is turned on only
+# manager. After a failed scoped start the manager also asks tmux for the server's pid and reads that
+# pid's cgroup to word the line that follows the bare call (the #953 review); the fake answers pid 1
+# (whose cgroup is never a romp-tmux scope) unless FAKE_TMUX_PID=none, tmux's answer when no server
+# runs. Nothing here reaches the real systemd-run or the user manager: the switch is turned on only
 # behind the fake, and the floor tmux_private_socket_dir sets (ROMP_CLI_SCOPE=0) stays for the case
 # that pins it.
 
@@ -23,9 +26,22 @@ setup() {
     MGR="$(cd "$(dirname "$BATS_TEST_FILENAME")/../bin" && pwd)/romp-manager"
     BIN="$TEST_DIR/bin"; mkdir -p "$BIN"
     export FAKE_TMUX_CALLS="$TEST_DIR/tmux-calls" FAKE_SYSTEMD_RUN_CALLS="$TEST_DIR/systemd-run-calls"
+    # The pid probe: pid 1 by default — its cgroup is never a romp-tmux scope, so the manager reads
+    # the server as unscoped; FAKE_TMUX_PID=none is tmux with no server (exit 1, its line on stderr).
+    # A fake cannot put a process in a scope, so the scoped answer is the node suite's. Never answer
+    # with $PPID: a suite run from a window on the manager's own default server has the manager
+    # sitting in a romp-tmux scope, and the case would read "scoped" on that box while passing in CI.
     cat > "$BIN/tmux" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_TMUX_CALLS"
+if [ "$1" = display-message ]; then
+    if [ "${FAKE_TMUX_PID:-}" = none ]; then
+        echo 'no server running on /nonexistent/tmux-0/default' >&2
+        exit 1
+    fi
+    printf '%s\n' "${FAKE_TMUX_PID:-1}"
+    exit 0
+fi
 if [ -n "${FAKE_TMUX_FAIL:-}" ]; then
     echo 'error connecting to /nonexistent/tmux-0/default (No such file or directory)' >&2
     exit 1
@@ -86,6 +102,7 @@ start_manager() {
 }
 
 BARE='start-server ; set -g exit-empty off'
+PROBE='display-message -p #{pid}'
 
 # Absence, armed: `run` then a status test, the form tests/romp-cli-scope.bats uses. A bare `! grep -q`
 # that is not a test's last command is exempt from bats' errexit and asserts nothing — a manager that
@@ -110,16 +127,20 @@ log_lacks() {   # $1: a grep pattern that must match no line of the manager's lo
     log_lacks 'could not start the tmux server in a scope'
     log_lacks 'failed inside the scope'
     log_lacks 'ensured without a scope'
+    log_lacks 'could not be read'
     log_lacks 'launchd-rooted'
 }
 
-@test "switch on, systemd-run failing: the log names systemd-run and carries its first stderr line, the server starts bare, and the log says it is unscoped" {
+@test "switch on, systemd-run failing: the log names systemd-run and carries its first stderr line, the server starts bare, and the log reads it as unscoped" {
     need_tools
     [ "$(uname -s)" = Linux ] || skip "the scoped path is Linux-only by construction (tmuxStartArgv)"
+    [ -r /proc/1/cgroup ] || skip "the placement is read from /proc/<pid>/cgroup (pid 1's here)"
     export ROMP_CLI_SCOPE=1 FAKE_SYSTEMD_RUN_FAIL=1
     start_manager
     [ "$(wc -l < "$FAKE_SYSTEMD_RUN_CALLS")" -eq 1 ]   # tried once...
-    [ "$(cat "$FAKE_TMUX_CALLS")" = "$BARE" ]          # ...then the bare call, once
+    # ...then the bare call, once, then the pid probe: the fake answers pid 1, whose cgroup names no
+    # romp-tmux scope, so the line reads the server as unscoped — the line as it always was
+    [ "$(cat "$FAKE_TMUX_CALLS")" = "$(printf '%s\n%s' "$BARE" "$PROBE")" ]
     # the failure line: systemd-run named, its first stderr line in the parenthesis, the second line not
     grep -q 'systemd-run could not start the tmux server in a scope (Failed to start transient scope unit: Failed to connect to bus: No such file or directory)' "$LOG"
     log_lacks 'second stderr line'
@@ -127,9 +148,26 @@ log_lacks() {   # $1: a grep pattern that must match no line of the manager's lo
     grep -q 'starting it the plain way instead' "$LOG"
     grep -q 'tmux server ensured without a scope' "$LOG"
     grep -q 'a service restart will take it down' "$LOG"
+    log_lacks 'could not be read'
     log_lacks 'failed inside the scope'
     log_lacks 'in its own transient scope'
     log_lacks 'launchd-rooted'
+}
+
+@test "switch on, systemd-run failing, the server's place unreadable: the line says so and predicts no loss" {
+    # tmux answers "no server running" to the probe (the bare call's server is a fake here): the manager
+    # cannot tell where the server sits, and says that instead of asserting it is unscoped — the wrong
+    # prediction the #953 review named after a scoped call that timed out with the server alive inside
+    # its scope
+    need_tools
+    [ "$(uname -s)" = Linux ] || skip "the scoped path is Linux-only by construction (tmuxStartArgv)"
+    export ROMP_CLI_SCOPE=1 FAKE_SYSTEMD_RUN_FAIL=1 FAKE_TMUX_PID=none
+    start_manager
+    [ "$(cat "$FAKE_TMUX_CALLS")" = "$(printf '%s\n%s' "$BARE" "$PROBE")" ]
+    grep -q 'tmux server ensured — whether it sits in a scope could not be read (no server running on /nonexistent/tmux-0/default)' "$LOG"
+    log_lacks 'ensured without a scope'
+    log_lacks 'will take it down'
+    log_lacks 'in its own transient scope'
 }
 
 @test "switch on, tmux failing inside the scope: the log names tmux and carries its line, then the bare call is tried" {
@@ -161,5 +199,6 @@ log_lacks() {   # $1: a grep pattern that must match no line of the manager's lo
     grep -q 'tmux server ensured (launchd-rooted)' "$LOG"
     log_lacks 'transient scope'
     log_lacks 'without a scope'
+    log_lacks 'could not be read'
     log_lacks 'failed inside the scope'
 }

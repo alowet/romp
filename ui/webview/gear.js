@@ -818,6 +818,7 @@ function initGear(post) {
     if (act) {   // the toast's one action: a real button whose click also bubbles to the container's
       var b = document.createElement('button');   // delegated dismiss, so acting clears the toast too
       b.type = 'button'; b.className = 'rs-stale-toast-act'; b.textContent = act.label;
+      b.title = act.title;   // its own tooltip: the toast's reads "click to dismiss", which the button is not
       b.addEventListener('click', act.run);
       t.appendChild(b);
     }
@@ -830,49 +831,74 @@ function initGear(post) {
     setTimeout(function () { t.remove(); }, 12000);   // …then the self-clearing backstop; a click/Esc dismisses sooner
     return t;
   }
-  // The copy names the setting, the kernels that refused, and the value in force, and says the pick
-  // was not applied. It does NOT say who or where changed it: the kernel knows only that it holds a
-  // larger stamp, and with device clocks in the mix that is not the same as "someone changed it
-  // after you" (#879 review). The hosts ARE known: each refusal came from one of them.
-  function staleText(label, kept, hosts) {
-    return label + ': not applied on ' + hosts.join(', ') + '. A later pick'
-      + (kept ? ' (' + kept + ')' : '') + ' is already in place.';
+  // The copy names the setting, the value that was refused, the kernels that refused it and the value
+  // they kept, and says the pick was not applied. The refused value matters in the frozen-tab case: the
+  // pick is hours old and one click on Apply anyway sends it to every linked kernel, so the user must
+  // see what they would be applying (#945 review). It does NOT say who changed the setting, nor that
+  // the kept pick came after this one: the kernel knows only that it holds a larger stamp, and with
+  // device clocks in the mix that is not the same as "someone changed it after you" (#879 review; the
+  // #945 review retired the copy's recency claim on the same ground). The hosts ARE known: each
+  // refusal came from one of them. Either value may be absent (an older kernel echoes no gesture and
+  // sends no kept value); the copy drops that clause.
+  function staleText(label, refused, kept, hosts) {
+    return label + ': ' + (refused ? refused + ' was not applied on ' : 'not applied on ') + hosts.join(', ') + '.'
+      + (kept ? ' Keeping ' + kept + '.' : '');
+  }
+  // Values read as words: a boolean toggle's on/off, a string as itself, anything else as absent.
+  function staleWord(v) { return v === true ? 'on' : v === false ? 'off' : (typeof v === 'string' && v ? v : ''); }
+  // The value the refused gesture carried. Every emitter posts {type, <one value field>, gt} and the
+  // kernel echoes it without gt, so the value is the echo's one key beside type — read generically
+  // rather than through a third type→field map kept in step with STALE_TYPE. Trusted only for the
+  // setting the frame names (the whitelist Apply anyway uses: an echo for another setting is not this
+  // setting's value); an echo of any other shape (two value fields, none, or no echo from an older
+  // kernel) reads as no value, and the copy and the label take their value-less form.
+  function staleRefused(m) {
+    if (!m.gesture || typeof m.gesture !== 'object' || STALE_TYPE[m.setting] !== m.gesture.type) return '';
+    var keys = Object.keys(m.gesture).filter(function (k) { return k !== 'type'; });
+    return keys.length === 1 ? staleWord(m.gesture[keys[0]]) : '';
   }
   // One toast per refused GESTURE, not per refusing kernel: a dashboard's broadcast reaches every
   // linked kernel, so one stale flush used to draw N identical toasts naming no host. The fold key
   // is the gesture's identity — setting + its own gt, which the frame carries — an event key, never
   // a time window: N kernels refusing one flush share it, two different gestures never do. A frame
-  // without gt (an older kernel) keeps one toast per frame. Liveness is the node's parentNode at
-  // lookup, so a dismissed or expired toast never absorbs a later frame and no cleanup rides the
-  // timers. A remote kernel's frame arrives host-stamped (federation.ts prefixInbound); the local
-  // kernel's has no host and reads as this machine, the name the gear already uses for it.
-  var staleOpen = {};   // 'setting:gt' → { t: the toast node, hosts: [...] } while the toast is up
+  // without gt (an older kernel) keeps one toast per frame. Liveness is read at lookup — the node's
+  // parentNode, and not yet fading: a toast in its fade→remove second sits at opacity 0, so a frame
+  // written into it would never be seen (#945 review) — so a dismissed, expired or fading toast never
+  // absorbs a later frame, and still no cleanup rides the timers. A remote kernel's frame arrives
+  // host-stamped (federation.ts prefixInbound); the local kernel's has no host and reads as this
+  // machine, the name the gear already uses for it.
+  var staleOpen = {};   // 'setting:gt' → { t: the toast node, hosts: [...], refused: the value in words } while the toast is up
   function staleHost(m) { return (typeof m.host === 'string' && m.host) ? m.host : 'this machine'; }
+  function staleLive(t) { return !!t.parentNode && !(t.classList && t.classList.contains('fade')); }
   // Apply anyway re-issues the frame's echoed gesture as a NEW one, stamped above everything this
   // page has seen (the frame's storedGt included, learned just before): a fresh click is legitimate
   // new information, the event the ordering rule wants — never a clock heuristic. Offered only when
   // the echo's type is the setting the frame names, so a frame from any linked kernel may re-issue
   // that one setting and nothing else; an older kernel sends no echo and the toast shows without it.
-  function staleAction(m) {
+  // The label names the value one click would apply everywhere (the frozen-tab case again), and the
+  // button carries its own title: without one it inherited the toast's click-to-dismiss tooltip.
+  function staleAction(m, refused) {
     if (!m.gesture || typeof m.gesture !== 'object' || STALE_TYPE[m.setting] !== m.gesture.type) return null;
-    return { label: 'Apply anyway', run: function () { post(Object.assign({}, m.gesture, { gt: gclock.stamp(m.setting) })); } };
+    return { label: refused ? 'Apply ' + refused + ' anyway' : 'Apply anyway',
+             title: 'apply ' + (refused || 'this pick') + ' on every linked kernel, replacing the value they kept',
+             run: function () { post(Object.assign({}, m.gesture, { gt: gclock.stamp(m.setting) })); } };
   }
   window.addEventListener('message', function (e) {
     var m = e.data;
     if (!m || m.type !== 'settingStale') return;
     gclock.learn(m.setting, m.storedGt);   // the frame IS new information about that store's clock
     var label = STALE_LABELS[m.setting] || String(m.setting || 'A setting');
-    var kept = m.kept === true ? 'on' : m.kept === false ? 'off'
-      : (typeof m.kept === 'string' && m.kept ? m.kept : '');
+    var kept = staleWord(m.kept);
+    var refused = staleRefused(m);
     var key = typeof m.gt === 'number' ? m.setting + ':' + m.gt : '';
-    var live = key && staleOpen[key] && staleOpen[key].t.parentNode ? staleOpen[key] : null;
+    var live = key && staleOpen[key] && staleLive(staleOpen[key].t) ? staleOpen[key] : null;
     var where = staleHost(m);
     if (live) {   // the same gesture, refused by one more kernel: add the host to the toast on screen
       if (live.hosts.indexOf(where) < 0) live.hosts.push(where);
-      live.t.querySelector('.rs-stale-toast-msg').textContent = staleText(label, kept, live.hosts);
+      live.t.querySelector('.rs-stale-toast-msg').textContent = staleText(label, live.refused || refused, kept, live.hosts);
     } else {
-      var t = staleToast(staleText(label, kept, [where]), staleAction(m));
-      if (key) staleOpen[key] = { t: t, hosts: [where] };
+      var t = staleToast(staleText(label, refused, kept, [where]), staleAction(m, refused));
+      if (key) staleOpen[key] = { t: t, hosts: [where], refused: refused };
     }
     if (!p.hidden) fill();   // the open modal re-reads the kernel's values so it stops showing the refused pick
   });

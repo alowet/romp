@@ -6,7 +6,12 @@
 // only on Linux with systemd-run on PATH. A terminal-run manager scopes nothing unless asked. No tmux
 // on PATH → null: nothing to start, nothing to log (the behaviour before the scopes). scopedStartFailure
 // turns the scoped call's execFileSync error into the log line's content: the tool that failed and its
-// first stderr line, bounded (startTmuxServer pipes stderr on that call for it).
+// first stderr line, bounded (startTmuxServer pipes stderr on that call for it). After a failed scoped
+// start the bare call runs and the log then READS where the server sits (the #953 review: a timed-out
+// scoped call kills only tmux's client, the daemon it forked stays inside the scope, so the old fixed
+// line predicted a loss that would not happen): placementFromCgroup places a /proc/<pid>/cgroup text,
+// tmuxServerPlacement asks tmux for the server pid and reads that file (never throws), bareEnsuredLine
+// words the line from the answer.
 // Run: node --test tests/manager-*.test.js
 'use strict';
 const { test } = require('node:test');
@@ -16,7 +21,8 @@ const os = require('node:os');
 const path = require('node:path');
 
 process.env.ROMP_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'romp-mgr-tmux-scope-'));
-const { tmuxStartArgv, scopedStartFailure, commandOnPath, TMUX_START_ARGV } = require(path.join(__dirname, '..', 'bin', 'romp-manager'));
+const { tmuxStartArgv, scopedStartFailure, commandOnPath, TMUX_START_ARGV,
+        placementFromCgroup, tmuxServerPlacement, bareEnsuredLine, TMUX_SERVER_PID_ARGV } = require(path.join(__dirname, '..', 'bin', 'romp-manager'));
 
 const BARE = ['tmux', 'start-server', ';', 'set', '-g', 'exit-empty', 'off'];
 const both = (name) => name === 'systemd-run' || name === 'tmux';   // a Linux box with both installed
@@ -154,4 +160,83 @@ test("a spawn error (no exit at all): the error's own first line, systemd-run na
   const e = Object.assign(new Error('spawnSync systemd-run ENOENT'), { code: 'ENOENT', status: null, signal: null, stderr: null });
   assert.deepEqual(scopedStartFailure(e), { tool: 'systemd-run', detail: 'spawnSync systemd-run ENOENT' });
   assert.deepEqual(scopedStartFailure(null), { tool: 'systemd-run', detail: 'null' });
+});
+
+// Where the server sits after the bare call, read from its cgroup — never predicted. The old line after a
+// scoped failure always said "without a scope … a service restart will take it down"; on a scoped call
+// that timed out the server was already up inside the scope (systemd-run exec'd the client in place; the
+// timeout killed the client, not the daemon it forked), and after a service restart an earlier manager's
+// scope may still hold the server while systemd-run fails this time. Both predicted a loss that would not
+// happen.
+const UNSCOPED_LINE = 'tmux server ensured without a scope — under the service, a service restart will take it down';
+
+test('placementFromCgroup: a romp-tmux scope on the path is scoped, named; anything else is unscoped', () => {
+  assert.deepEqual(placementFromCgroup('0::/user.slice/user-1000.slice/user@1000.service/app.slice/romp-tmux-1725000000000.scope\n'),
+    { placement: 'scoped', unit: 'romp-tmux-1725000000000.scope' });
+  assert.deepEqual(placementFromCgroup('0::/user.slice/user-1000.slice/user@1000.service/app.slice/romp-manager.service\n'),
+    { placement: 'unscoped' });
+  assert.deepEqual(placementFromCgroup('0::/init.scope\n'), { placement: 'unscoped' }, "pid 1's cgroup: the bats fake's answer");
+});
+
+test('placementFromCgroup: cgroup v1 is one line per controller, each ending in the unit — every line is tried', () => {
+  const v1 = '12:pids:/user.slice/user-1000.slice/user@1000.service/romp-tmux-7.scope\n'
+    + '3:cpu,cpuacct:/user.slice/user-1000.slice/user@1000.service/romp-tmux-7.scope\n'
+    + '1:name=systemd:/user.slice/user-1000.slice/user@1000.service/romp-tmux-7.scope\n';
+  assert.deepEqual(placementFromCgroup(v1), { placement: 'scoped', unit: 'romp-tmux-7.scope' });
+});
+
+test("placementFromCgroup: a session's romp-session scope is not the manager's claim; an empty file is unknown", () => {
+  assert.deepEqual(placementFromCgroup('0::/user.slice/user-1000.slice/user@1000.service/app.slice/romp-session-11111111-2222-3333-4444-555555555555.scope\n'),
+    { placement: 'unscoped' });
+  assert.deepEqual(placementFromCgroup(''), { placement: 'unknown', why: 'empty cgroup file' });
+  assert.deepEqual(placementFromCgroup('\n  \n'), { placement: 'unknown', why: 'empty cgroup file' });
+});
+
+test("tmuxServerPlacement asks for the server pid, then reads THAT pid's cgroup", () => {
+  const read = [];
+  const r = tmuxServerPlacement({ serverPid: () => '4242\n', readCgroup: (pid) => { read.push(pid); return '0::/app.slice/romp-tmux-9.scope\n'; } });
+  assert.deepEqual(r, { placement: 'scoped', unit: 'romp-tmux-9.scope' });
+  assert.deepEqual(read, ['4242'], 'the pid as tmux printed it, trimmed');
+});
+
+test('tmuxServerPlacement never throws: every failure of the probe is unknown, with its first line as the why', () => {
+  const noServer = Object.assign(new Error('Command failed: tmux display-message -p #{pid}'),
+                                 { status: 1, stderr: Buffer.from('no server running on /nonexistent/tmux-0/default\n') });
+  assert.deepEqual(tmuxServerPlacement({ serverPid: () => { throw noServer; } }),
+    { placement: 'unknown', why: 'no server running on /nonexistent/tmux-0/default' });
+  const timedOut = Object.assign(new Error('spawnSync tmux ETIMEDOUT'), { code: 'ETIMEDOUT', stderr: Buffer.alloc(0) });
+  assert.deepEqual(tmuxServerPlacement({ serverPid: () => { throw timedOut; } }),
+    { placement: 'unknown', why: 'spawnSync tmux ETIMEDOUT' }, "nothing on stderr: the error's own first line");
+  assert.deepEqual(tmuxServerPlacement({ serverPid: () => '' }), { placement: 'unknown', why: 'tmux reported no server pid' });
+  assert.deepEqual(tmuxServerPlacement({ serverPid: () => 'abc' }), { placement: 'unknown', why: 'tmux reported no server pid' });
+  const gone = Object.assign(new Error("ENOENT: no such file or directory, open '/proc/4242/cgroup'"), { code: 'ENOENT' });
+  assert.deepEqual(tmuxServerPlacement({ serverPid: () => '4242', readCgroup: () => { throw gone; } }),
+    { placement: 'unknown', why: "ENOENT: no such file or directory, open '/proc/4242/cgroup'" });
+  const long = Object.assign(new Error('x'), { stderr: Buffer.from('no server ' + 'y'.repeat(500)) });
+  const { why } = tmuxServerPlacement({ serverPid: () => { throw long; } });
+  assert.equal(why.length, 200);
+  assert.ok(why.endsWith('…'), 'bounded like the failure line');
+});
+
+test('bareEnsuredLine: unscoped is the line as it always was, byte for byte', () => {
+  assert.equal(bareEnsuredLine({ placement: 'unscoped' }), UNSCOPED_LINE);
+});
+
+test('bareEnsuredLine: a scoped server names its unit and predicts no loss', () => {
+  const line = bareEnsuredLine({ placement: 'scoped', unit: 'romp-tmux-1725000000000.scope' });
+  assert.ok(line.startsWith('tmux server ensured'), line);
+  assert.ok(line.includes('romp-tmux-1725000000000.scope'), 'the unit that holds it');
+  assert.ok(line.includes('leaves it'), 'a restart leaves it alive');
+  assert.ok(!line.includes('will take it down') && !line.includes('without a scope'), 'no prediction of a loss');
+});
+
+test('bareEnsuredLine: an unreadable placement says so, carries the why, and predicts no loss', () => {
+  const line = bareEnsuredLine({ placement: 'unknown', why: 'no server running on /nonexistent/tmux-0/default' });
+  assert.ok(line.startsWith('tmux server ensured'), line);
+  assert.ok(line.includes('could not be read (no server running on /nonexistent/tmux-0/default)'), line);
+  assert.ok(!line.includes('will take it down') && !line.includes('without a scope'), 'no prediction of a loss');
+});
+
+test('the probe is tmux display-message -p #{pid}: the server pid, and no server started when there is none', () => {
+  assert.deepEqual(TMUX_SERVER_PID_ARGV, ['tmux', 'display-message', '-p', '#{pid}']);
 });

@@ -204,6 +204,8 @@ _UNKNOWN_MODEL_LOGGED = set()   # ids already announced as unplaceable (one stde
 _ALIAS_SERVED = {}              # family -> (major, minor) the CLI served for the BARE alias this process, read off
                                 #   result envelopes (_note_served_model); _adaptive_thinking asks it before the table
 _ALIAS_DRIFT_LOGGED = set()     # (family, served id) pairs already announced as off the table (one stderr line each)
+_NO_MODEL_USAGE_LOGGED = set()  # a result envelope carried no modelUsage map: said once per PROCESS (the field is a
+                                #   property of the CLI, not of the call), so a stale table is never trusted silently
 
 
 def _model_family_version(model):
@@ -275,15 +277,27 @@ def _note_served_model(model, wrap):
     The same-family entry with the most output tokens is the model that wrote the reply (a side call's
     entry cannot move the alias). Quiet when they agree, when `model` is a versioned id (a pin is a
     pin, never remapped), and when the envelope names no same-family model — that carries no evidence
-    either way, so the table's answer stands exactly as it did before this check. Every tier feeds the
-    record; only the index tier's lever reads it. Best-effort, never raises (mirrors _log_judge_usage —
-    bookkeeping must not cost the reply)."""
+    either way, so the table's answer stands exactly as it did before this check. An envelope with no
+    modelUsage map at all is a different case (the #948 review): the check cannot run for ANY alias, so
+    a stale table would be trusted with nothing in the log — said once per process
+    (_NO_MODEL_USAGE_LOGGED), the loud-failure rule's minimum; a map that names no same-family model
+    stays quiet. Every tier feeds the record; only the index tier's lever reads it. Best-effort, never
+    raises (mirrors _log_judge_usage — bookkeeping must not cost the reply)."""
     try:
         fam, ver = _model_family_version(model)
         if fam is None or ver is not None:
             return
         mu = wrap.get("modelUsage") if isinstance(wrap, dict) else None
         if not isinstance(mu, dict):
+            # no map (a CLI older than the field, a shape change) or a malformed non-dict value — the same
+            # failed precondition either way; the bare-alias gate above keeps a versioned pin silent, so
+            # only a call the check WOULD have served says this, and only the first one does
+            if not _NO_MODEL_USAGE_LOGGED:
+                _NO_MODEL_USAGE_LOGGED.add(True)
+                sys.stderr.write("romp-judge: the result envelope for the bare %s alias carries no modelUsage map, "
+                                 "so the version the CLI served cannot be checked — the index tier's lever answers "
+                                 "from the alias table until a CLI that reports the field (said once per process)\n"
+                                 % fam)
             return
         best = None                               # (output tokens, served id, served version)
         for mid, u in mu.items():

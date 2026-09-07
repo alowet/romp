@@ -58,7 +58,9 @@ class ManagerAndLauncher(unittest.TestCase):
         self.assertIn("if (!out.ROMP_API_KEY_REF && !serviceEnvHasRef(env)) return out;", src,
                       "a helper box keeps its environment; the env file's own line counts as configured")
         self.assertRegex(src, r"k === 'OP_SERVICE_ACCOUNT_TOKEN' \|\| k === 'OP_CONNECT_HOST' \|\| k === 'OP_CONNECT_TOKEN' \|\| k === 'OP_ACCOUNT' \|\| k\.startsWith\('OP_SESSION_'\)\s*\|\| k === 'ANTHROPIC_API_KEY'")
-        self.assertEqual(src.count("env: withoutOpCredentials(process.env) });"), 2, "the scoped and the bare start")
+        self.assertEqual(src.count("env: withoutOpCredentials(process.env) });"), 3,
+                         "the scoped start, the bare start, and the pid probe after a failed scoped start (a tmux "
+                         "client that starts no server, scrubbed all the same: every tmux exec here is)")
 
     def test_the_launcher_scrubs_the_servers_globals_before_the_pane_exists(self):
         src = _read("bin/romp")

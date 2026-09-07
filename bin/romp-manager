@@ -586,8 +586,10 @@ function withoutOpCredentials(env) {
 // starts the daemon outside the service cgroup; a session's later `tmux new-session` joins that server
 // and survives a service restart. The tmux CLIENT still exits at once (it only starts the daemon), so
 // execFileSync's semantics are unchanged, and when a server already runs the call is the same no-op and
-// the scope collects itself. Any failure of the scoped path falls back to the bare call. The macOS path
-// is as it was: launchd owns the lineage there and the TCC rationale above still applies.
+// the scope collects itself. Any failure of the scoped path falls back to the bare call, and the line after
+// it READS where the server actually sits (its cgroup) rather than assuming the bare call placed it: a
+// timed-out scoped call kills only tmux's client, the daemon it forked stays inside the scope. The macOS
+// path is as it was: launchd owns the lineage there and the TCC rationale above still applies.
 const TMUX_START_ARGV = ['tmux', 'start-server', ';', 'set', '-g', 'exit-empty', 'off'];
 
 // Is `name` an executable on the env's PATH? (Node has no `which`.)
@@ -641,6 +643,66 @@ function scopedStartFailure(e) {
   return { tool, detail };
 }
 
+// After a failed scoped start the bare call runs, and where the server then sits is READ, not predicted
+// (the #953 review): the old fixed line said the server was unscoped and a service restart would take it
+// down, which is wrong in two cases. A scoped call that times out — execFileSync SIGTERMs the tmux CLIENT
+// (systemd-run exec'd it in place) while the server daemon that client forked stays alive inside the
+// romp-tmux scope, so the bare retry is a no-op onto a scoped server. And after a service restart the
+// previous manager's server is still up in its old scope, so if systemd-run fails on THIS start (bus not
+// up yet, a refused unit) the bare call no-ops onto a scoped server again. `#{pid}` is the server's pid;
+// display-message does not start a server (exit 1, "no server running on …", when there is none — tmux 3.4).
+const TMUX_SERVER_PID_ARGV = ['tmux', 'display-message', '-p', '#{pid}'];
+
+// PURE: where a /proc/<pid>/cgroup text places the server. cgroup v2 is one `0::/…/<unit>` line; v1 is one
+// line per controller, each ending in the unit — so every line is tried. Only the manager's own romp-tmux-*
+// scopes count: a romp-session-* scope is a session CLI's, not this feature's claim.
+function placementFromCgroup(text) {
+  const lines = String(text || '').split('\n');
+  for (const line of lines) {
+    const m = /\/(romp-tmux-\d+\.scope)\s*$/.exec(line);
+    if (m) return { placement: 'scoped', unit: m[1] };
+  }
+  if (lines.some((l) => l.trim())) return { placement: 'unscoped' };
+  return { placement: 'unknown', why: 'empty cgroup file' };
+}
+
+function defaultServerPid() {
+  return execFileSync(TMUX_SERVER_PID_ARGV[0], TMUX_SERVER_PID_ARGV.slice(1),
+                      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: TMUX_START_TIMEOUT_MS,
+                        env: withoutOpCredentials(process.env) });
+}
+function defaultReadCgroup(pid) { return fs.readFileSync('/proc/' + pid + '/cgroup', 'utf8'); }
+
+// Never throws — a throw here would abort startManager before the control port binds — so every failure
+// of the probe is an 'unknown' placement carrying the failure's first line, bounded like the failure
+// line's detail. `serverPid` and `readCgroup` are injectable for the node suite; the defaults ask tmux
+// (bounded by the same timeout as the start) and read /proc.
+function tmuxServerPlacement({ serverPid = defaultServerPid, readCgroup = defaultReadCgroup } = {}) {
+  const why = (e) => {
+    const first = String((e && e.stderr) || '').split('\n').map((s) => s.trim()).find(Boolean)
+      || String(e && e.message || e).split('\n')[0];
+    return first.length > FAILURE_LINE_MAX ? first.slice(0, FAILURE_LINE_MAX - 1) + '…' : first;
+  };
+  let pid;
+  try { pid = String(serverPid()).trim(); } catch (e) { return { placement: 'unknown', why: why(e) }; }
+  if (!/^\d+$/.test(pid)) return { placement: 'unknown', why: 'tmux reported no server pid' };
+  let text;
+  try { text = readCgroup(pid); } catch (e) { return { placement: 'unknown', why: why(e) }; }
+  return placementFromCgroup(text);
+}
+
+// PURE: the line the bare call's success logs, worded from where the server sits. The unscoped wording is
+// the line as it always was (its pins stay); the other two predict no loss.
+function bareEnsuredLine({ placement, unit, why }) {
+  if (placement === 'scoped') {
+    return `tmux server ensured — already running inside ${unit} (the scoped start had begun it, or an earlier one still holds it); a service restart leaves it and its sessions' jobs alive`;
+  }
+  if (placement === 'unscoped') {
+    return 'tmux server ensured without a scope — under the service, a service restart will take it down';
+  }
+  return `tmux server ensured — whether it sits in a scope could not be read (${why}); under the service, a restart takes it down only if it is not in one`;
+}
+
 function startTmuxServer() {
   const pick = tmuxStartArgv();
   if (!pick) return;   // no tmux on PATH: nothing to start, and nothing to log (as before the scopes)
@@ -656,7 +718,8 @@ function startTmuxServer() {
     return;
   } catch (e) {
     if (!pick.scoped) return;   // a server is already up, or tmux itself failed — nothing more to do
-    // Say what failed and where the server will land: this may be a terminal run with no service cgroup.
+    // Say what failed; where the server sits is read from its cgroup after the bare call (bareEnsuredLine),
+    // not predicted here.
     const { tool, detail } = scopedStartFailure(e);
     log(tool === 'tmux'
       ? `tmux failed inside the scope systemd-run started for it (${detail}) — starting it the plain way instead`
@@ -664,7 +727,7 @@ function startTmuxServer() {
   }
   try {
     execFileSync(TMUX_START_ARGV[0], TMUX_START_ARGV.slice(1), { stdio: 'ignore', timeout: TMUX_START_TIMEOUT_MS, env: withoutOpCredentials(process.env) });
-    log('tmux server ensured without a scope — under the service, a service restart will take it down');
+    log(bareEnsuredLine(tmuxServerPlacement()));
   } catch (e) { /* a server is already up, or tmux itself failed — nothing to do */ }
 }
 
@@ -777,6 +840,7 @@ function ensureUp() {
 module.exports = { restartGate, quietGate, quietTick, loadSpecs, specEnv, fileStamp,
                    kernelToken, fetchBusy, resetDrainNotices, queueQuietRestart, clearPendingQuiet,
                    tmuxStartArgv, scopedStartFailure, commandOnPath, TMUX_START_ARGV,
+                   placementFromCgroup, tmuxServerPlacement, bareEnsuredLine, TMUX_SERVER_PID_ARGV,
                    withoutOpCredentials, serviceEnvHasRef };
 if (require.main === module) {
   const cmd = process.argv[2];

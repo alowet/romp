@@ -78,7 +78,7 @@ test("three kernels refusing one gesture draw ONE toast that names all three", (
   g.frame({ ...REFUSED, host: "api" });
   g.frame({ ...REFUSED });                         // the local kernel: no host key
   assert.equal(g.box().children.length, 1, "one toast for one refused gesture");
-  assert.deepEqual(g.texts(), ["Triage model: not applied on web, api, this machine. A later pick (fable) is already in place."]);
+  assert.deepEqual(g.texts(), ["Triage model: opus was not applied on web, api, this machine. Keeping fable."]);
   assert.deepEqual(g.learned.filter(([, gt]) => gt > 0), [["judge-model", 2000], ["judge-model", 2000], ["judge-model", 2000]],
     "every frame teaches the clock the stamp it lost to");
 });
@@ -87,12 +87,12 @@ test("the same host refusing twice is named once; a different gesture gets its o
   const g = lift();
   g.frame({ ...REFUSED, host: "web" });
   g.frame({ ...REFUSED, host: "web" });            // a duplicate delivery
-  assert.deepEqual(g.texts(), ["Triage model: not applied on web. A later pick (fable) is already in place."]);
+  assert.deepEqual(g.texts(), ["Triage model: opus was not applied on web. Keeping fable."]);
   g.frame({ ...REFUSED, gt: 999, host: "web" });   // an older click of the same setting — its own identity
   assert.equal(g.box().children.length, 2);
   g.frame({ ...REFUSED, setting: "auto-nudge", kept: false, gesture: { type: "setAutoNudge", enabled: true }, host: "web" });
   assert.equal(g.box().children.length, 3);
-  assert.equal(g.texts()[2], "Auto Nudge: not applied on web. A later pick (off) is already in place.", "booleans read as on/off");
+  assert.equal(g.texts()[2], "Auto Nudge: on was not applied on web. Keeping off.", "booleans read as on/off, the refused one too");
 });
 
 test("a frame without gt (an older kernel) keeps one toast per frame — no key, no fold", () => {
@@ -101,8 +101,8 @@ test("a frame without gt (an older kernel) keeps one toast per frame — no key,
   g.frame({ ...old, host: "web" });
   g.frame({ ...old, host: "api" });
   assert.equal(g.box().children.length, 2);
-  assert.deepEqual(g.texts(), ["Triage model: not applied on web. A later pick (fable) is already in place.",
-                               "Triage model: not applied on api. A later pick (fable) is already in place."]);
+  assert.deepEqual(g.texts(), ["Triage model: opus was not applied on web. Keeping fable.",
+                               "Triage model: opus was not applied on api. Keeping fable."]);
 });
 
 test("a dismissed or expired toast never absorbs a later frame: liveness is the node's presence, not a window", () => {
@@ -112,12 +112,27 @@ test("a dismissed or expired toast never absorbs a later frame: liveness is the 
   first.remove();                                  // click-dismissed (the container's delegated handler)
   g.frame({ ...REFUSED, host: "api" });
   assert.equal(g.box().children.length, 1, "a fresh toast, not a resurrection");
-  assert.deepEqual(g.texts(), ["Triage model: not applied on api. A later pick (fable) is already in place."]);
+  assert.deepEqual(g.texts(), ["Triage model: opus was not applied on api. Keeping fable."]);
   // the self-clearing backstop: run the 12000ms callbacks, then the same key again
   g.timers.filter((t) => t.ms === 12000).forEach((t) => t.fn());
   assert.equal(g.box().children.length, 0, "expired");
   g.frame({ ...REFUSED, host: "web" });
-  assert.deepEqual(g.texts(), ["Triage model: not applied on web. A later pick (fable) is already in place."]);
+  assert.deepEqual(g.texts(), ["Triage model: opus was not applied on web. Keeping fable."]);
+});
+
+test("a toast already fading does not absorb a later refusal of the same gesture: it gets its own toast", () => {
+  // the 11 s fade precedes the 12 s removal; with liveness read as parentNode alone, a refusal arriving
+  // in that second was written into a toast at opacity 0 and never seen (the #945 review). Event-keyed
+  // still: the fade class is read at the frame, no cleanup rides the timers.
+  const g = lift();
+  g.frame({ ...REFUSED, host: "web" });
+  g.timers.filter((t) => t.ms === 11000).forEach((t) => t.fn());   // the fade arms; the node is still on screen
+  g.frame({ ...REFUSED, host: "api" });
+  assert.equal(g.box().children.length, 2, "a fresh toast, not a write into the fading one");
+  assert.ok(g.box().children[0].classList.contains("fade"));
+  assert.ok(!g.box().children[1].classList.contains("fade"));
+  assert.deepEqual(g.texts(), ["Triage model: opus was not applied on web. Keeping fable.",
+                               "Triage model: opus was not applied on api. Keeping fable."]);
 });
 
 test("the folded toast keeps its Apply anyway: one click re-issues the echo with a fresh stamp", () => {
@@ -127,8 +142,10 @@ test("the folded toast keeps its Apply anyway: one click re-issues the echo with
   const t = g.box().children[0];
   const btn = t.children.find((c) => c.className === "rs-stale-toast-act")!;
   assert.ok(btn, "the action button rides the folded toast");
-  assert.equal(btn.textContent, "Apply anyway");
+  assert.equal(btn.textContent, "Apply opus anyway", "the label names the value one click would apply everywhere");
   assert.equal(btn.type, "button");
+  assert.ok(btn.title && btn.title !== "click to dismiss", "the button has its own tooltip, not the toast's dismiss one: " + btn.title);
+  assert.ok(btn.title.includes("opus"), "…and it names the value too");
   btn.clicks.forEach((fn) => fn({}));
   assert.deepEqual(g.posts, [{ type: "setJudgeModel", model: "opus", gt: 7777 }],
     "the echoed gesture, stamped through the clock (which has learned both refusals' storedGt)");
@@ -145,6 +162,19 @@ test("no action when the echo's type is not the setting's, or when there is no e
   assert.equal(g.box().children.length, 2);
   for (const t of g.box().children)
     assert.equal(t.children.find((c) => c.className === "rs-stale-toast-act"), undefined, "no Apply anyway");
+  // and neither shows a refused value: an echo for another setting is not this setting's value, and no
+  // echo carries none — the copy degrades to the value-less form
+  assert.deepEqual(g.texts(), ["Triage model: not applied on web. Keeping fable.", "Triage model: not applied on web. Keeping fable."]);
+});
+
+test("an echo of an unexpected shape shows no refused value: plain Apply anyway, value-less copy", () => {
+  // every emitter posts {type, <one value field>, gt}; a future two-field gesture reads as no value
+  // rather than guessing which field is the pick
+  const g = lift();
+  g.frame({ ...REFUSED, host: "web", gesture: { type: "setJudgeModel", model: "opus", scope: "all" } });
+  assert.deepEqual(g.texts(), ["Triage model: not applied on web. Keeping fable."]);
+  const btn = g.box().children[0].children.find((c) => c.className === "rs-stale-toast-act")!;
+  assert.equal(btn.textContent, "Apply anyway", "the action still rides: the echo's type is the setting's");
 });
 
 test("the open modal re-fills once per frame; a closed one never does", () => {

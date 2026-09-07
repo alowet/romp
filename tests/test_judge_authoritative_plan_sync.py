@@ -152,6 +152,28 @@ def rejected_plan_session(accepted=True):
     return build_session(recs)
 
 
+REJECTED_UPDATE = ("InputValidationError: TaskUpdate failed due to the following issue:\n"
+                   "The value of `status` must be one of pending, in_progress, completed")
+
+
+def rejected_update_session(status="done", then=None):
+    """One accepted create (Task #1) followed by a TaskUpdate the CLI REJECTED — a status outside its set,
+    answered by an is_error tool_result — so the store still holds the item open; `then`, when given, is
+    the status of an ACCEPTED update after it (the skip is per call, not per item)."""
+    recs = [uline(T0, "run the migration", "u1"),
+            tcreate(T0 + 5, "ac1", "u1", "Design v3", "Designing v3", "tc1"),
+            tres(T0 + 6, "rc1", "ac1", "tc1", "Task #1 created successfully. Use TaskUpdate to update it."),
+            tupdate(T0 + 7, "ax1", "rc1", "1", status, "tx1"),
+            tres(T0 + 8, "rx1", "ax1", "tx1", REJECTED_UPDATE, is_error=True)]
+    parent, t = "rx1", T0 + 9
+    if then is not None:
+        recs.append(tupdate(t, "au1", parent, "1", then, "tu1")); t += 1
+        recs.append(tres(t, "ru1", "au1", "tu1", "Task #1 updated.")); t += 1
+        parent = "ru1"
+    recs.append(aline(t, "On it.", "aend", parent, stop="end_turn"))
+    return build_session(recs)
+
+
 def fresh_store():
     return {"rompUuid": SID, "seq": 0, "nodes": {}, "placements": {}, "status": {}}
 
@@ -189,6 +211,14 @@ class DeclaredPlanAdapter(unittest.TestCase):
         items = em.declared_plan(rejected_plan_session())
         self.assertEqual([(it["key"], it["text"]) for it in items], [("1", "Design v3")],
                          "the accepted create (its result carries Task #N) still folds")
+
+    def test_a_rejected_taskupdate_moves_no_step(self):
+        """The TaskCreate skip's twin (the #942 review): a TaskUpdate the CLI rejected — its paired
+        tool_result carries is_error — wrote nothing to the store, so the step keeps the status the store
+        holds. Without the skip the refused value folded as the item's status. The skip is per call: an
+        accepted update after the rejected one still applies (mirroring the kernel's _fold_tasks)."""
+        self.assertEqual(em.declared_plan(rejected_update_session())[0]["status"], "pending")
+        self.assertEqual(em.declared_plan(rejected_update_session(then="in_progress"))[0]["status"], "in_progress")
 
 
 class SyncFindOrCreate(unittest.TestCase):
@@ -288,6 +318,19 @@ class SyncFindOrCreate(unittest.TestCase):
         self.assertEqual({k: nd["text"] for k, nd in agent_nodes(store).items()}, {"1": "Design v3"},
                          "only the accepted create is mirrored")
         self.assertNotIn("(declared step)", [nd["text"] for nd in store["nodes"].values()])
+
+    def test_a_rejected_taskupdate_leaves_the_mirrored_node_open(self):
+        """What the fold-path leak costs on the sync side: a rejected completing update read as the agent
+        crossing the item off, so the mirror flipped to authoritative-done for a task the store still holds
+        open. The node must stay open — the fold gave the sync no new status."""
+        store = fresh_store()
+        jd._sync_declared_plan(store, plan_session([("Design v3", "Designing v3", [])]), "seg1", T0 + 50)
+        nd = agent_nodes(store)["1"]
+        self.assertEqual(nd["agentTask"]["status"], "open")
+        self.assertFalse(jd._sync_declared_plan(store, rejected_update_session(status="completed"), "seg2", T0 + 100),
+                         "a rejected update is not new information: nothing to mutate")
+        self.assertEqual(nd["agentTask"]["status"], "open", "the store still holds the item open")
+        self.assertFalse(nd["nodeComplete"])
 
     def test_open_backlog_node_is_adopted_not_deleted(self):
         """A pre-fix OPEN agentTask node (marker absent) is ADOPTED (marker added), never deleted — so it

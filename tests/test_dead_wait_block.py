@@ -433,7 +433,10 @@ class DeadWaitOneObserver(_HermeticDeadWait):
     def test_a_mid_pass_ws_tick_leaves_the_transition_alone(self):
         # the racing interleave, deterministically: the pusher is MID-PASS (inside a candidate's
         # corroboration) when the WS handler's tick fires. The transition set must be exactly
-        # what the pusher's pass installed — untouched by the nested tick.
+        # what the pusher's pass installed — untouched by the nested tick. What holds it today is
+        # the single-flight guard: the pusher's pass holds _AUTO_NUDGE_TICK_LOCK (a plain Lock), so
+        # the nested tick returns at its try-acquire before run_dead_wait is even read. The
+        # run_dead_wait=False sweep skip is pinned by the sequential sibling above, not by this test.
         _seed_store()
         _write_state("idle", STAMP_T + 50)
         km._PREV_ALIVE = {SID}
@@ -444,7 +447,7 @@ class DeadWaitOneObserver(_HermeticDeadWait):
             if "ran" not in seen:
                 seen["ran"] = True
                 before = set(km._PREV_ALIVE)
-                km._auto_nudge_tick(STAMP_T + 901, {}, run_dead_wait=False)   # WS fires mid-pass
+                km._auto_nudge_tick(STAMP_T + 901, {}, run_dead_wait=False)   # WS fires mid-pass: returns at the lock
                 seen["moved"] = set(km._PREV_ALIVE) != before
             return real(sid, scan=scan, stats=stats)
 
@@ -460,19 +463,22 @@ class DeadWaitOneObserver(_HermeticDeadWait):
 
     def test_the_setautonudge_call_site_skips_the_sweep(self):
         # the ownership rule holds at every WS call site (setAutoNudge and setCompactSuggest),
-        # pinned the way test_wake_goal_routes_its_dormant_branch_here pins its wiring. The
-        # setAutoNudge arm is sliced out and checked on its own: a whole-source substring match
-        # stayed green while that arm's tick was missing, satisfied by setCompactSuggest's line
-        # (#846 inserted the new arm between the setter and its tick, re-parenting the tick).
+        # pinned the way test_wake_goal_routes_its_dormant_branch_here pins its wiring. Each arm is
+        # sliced out and checked on its own: a whole-source substring match stayed green while the
+        # setAutoNudge arm's tick was missing, satisfied by setCompactSuggest's line (#846 inserted
+        # the new arm between the setter and its tick, re-parenting the tick). Both arms tick
+        # through the one wrap, _ws_act_now_tick (the #943 review), which holds the one WS-shaped
+        # call — so the sweep skip is pinned there, and no arm may call the tick around the wrap.
         src = inspect.getsource(km.Handler._dispatch_ws)
-        arm = src[src.index('"setAutoNudge"'):src.index('"setCompactSuggest"')]
-        self.assertIn("_auto_nudge_tick(int(time.time()), _tmux_sessions(), run_dead_wait=False)", arm,
-                      "setAutoNudge's own arm re-ticks, and skips the sweep")
-        calls = src.count("_auto_nudge_tick(int(time.time())")
-        self.assertGreaterEqual(calls, 2, "both WS arms re-tick")
-        self.assertEqual(calls, src.count("_auto_nudge_tick(int(time.time()), _tmux_sessions(), "
-                                          "run_dead_wait=False)"),
-                         "no WS call site runs the one-observer sweep")
+        arm_a = src[src.index('"setAutoNudge"'):src.index('"setCompactSuggest"')]
+        arm_c = src[src.index('"setCompactSuggest"'):src.index('"setUpdateMode"')]
+        self.assertIn("_ws_act_now_tick()", arm_a, "setAutoNudge's own arm re-ticks, through the wrap")
+        self.assertIn("_ws_act_now_tick()", arm_c, "setCompactSuggest's arm re-ticks, through the wrap")
+        self.assertNotIn("_auto_nudge_tick(", src, "no WS call site ticks around the wrap")
+        wrap = inspect.getsource(km._ws_act_now_tick)
+        self.assertIn("_auto_nudge_tick(int(time.time()), _tmux_sessions(), run_dead_wait=False)", wrap,
+                      "the WS-shaped tick skips the one-observer sweep")
+        self.assertIn("except Exception", wrap, "…and a failure in it is logged, not a socket failure")
 
 
 if __name__ == "__main__":

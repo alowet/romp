@@ -2769,7 +2769,8 @@ def declared_plan(session):
     live task store, so downstream (the judge's plan-sync) sees a generic 'declared plan' shape
     instead of raw tool calls. Mirrors the kernel's _fold_tasks, with the same blind spots: only the
     MAIN agent's TaskCreate/TaskUpdate calls, and only those on the transcript's live chain — and the
-    same skip: a TaskCreate the CLI rejected (its paired tool_result carries is_error) is not a step.
+    same skips: a TaskCreate the CLI rejected (its paired tool_result carries is_error) is not a step,
+    and a rejected TaskUpdate moves none.
     `key` is the stable `Task #N` id lifted from TaskCreate's
     result text (a creation-order `cN` fallback if the result is unreadable); `status` rides each
     TaskUpdate. Only TaskCreate/TaskUpdate are folded — plain TodoWrite (no durable ids) is not
@@ -2810,6 +2811,8 @@ def declared_plan(session):
                                   "activeForm": str(af) if af else None, "status": "pending"}
                     order += 1
                 elif b.get("name") == "TaskUpdate":
+                    if b.get("id") in rejected:            # the same rejection-keyed skip as the kernel's
+                        continue                           # _fold_tasks: a refused update moved nothing
                     t = tasks.get(str(inp.get("taskId", "")))
                     if t:
                         t["status"] = str(inp.get("status") or t["status"])

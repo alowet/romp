@@ -5,6 +5,7 @@ re-ordering". The desktop's presentation order is the rail strip's left-to-right
 own choice, 2026-07-05); both the rail buttons and the mobile #mtabs now render from the one
 _PANE_ORDER constant, so the pin below survives any future reorder of that constant: it asserts
 the two BUILT surfaces agree, not any particular sequence."""
+import json
 import os
 import re
 import tempfile
@@ -64,11 +65,22 @@ class PaneOrderParity(unittest.TestCase):
 
     def test_labels_match_the_pn_map(self):
         # the JS-side PN map (key → user-facing label) and the constant must agree, or a pane
-        # wears one name in the shell chrome and another in the tabs
+        # wears one name in the shell chrome and another in the tabs. The map is JSON spliced into
+        # the bell's script from the constant at import (the #957 review: a hand-written PN was a
+        # second list, and drifted), so it parses as JSON here.
         html = km._landing()
         pn = re.search(r"var PN=\{([^}]*)\}", html).group(1)
-        js = dict(re.findall(r"(\w+):'([^']*)'", pn))
-        self.assertEqual(dict(km._PANE_ORDER), js)
+        self.assertEqual(dict(km._PANE_ORDER), json.loads("{" + pn + "}"))
+
+    def test_the_pn_map_is_built_from_the_constant(self):
+        # the mechanism, as test_both_surfaces_render_from_the_one_constant pins it for the HTML: the
+        # bell's map is derived, not typed, and the constant is defined before the string built from it
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        # assertTrue(needle in src), not assertIn: a failure must not print the kernel's source
+        self.assertTrue('var PN=""" + json.dumps(dict(_PANE_ORDER)) + """' in src, "PN is json.dumps of the constant")
+        self.assertFalse("var PN={chat:" in src, "no hand-written pane-label map remains")
+        self.assertLess(src.index("_PANE_ORDER = ("), src.index('_LANDING_ERRS_JS = """'),
+                        "the constant is defined before the script constant that is built from it")
 
 
 if __name__ == "__main__":

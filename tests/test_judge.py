@@ -6470,6 +6470,11 @@ class EffortCapability(unittest.TestCase):
            "claude-opus-4-0", "claude-sonnet-4-0", "claude-sonnet-4-5[1m]", "claude-sonnet-4-5-20250929",
            "claude-opus-4-20250514", "claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022")
 
+    def setUp(self):
+        # `haiku -> False` below reads the table only while the alias record is empty: cleared here so
+        # the pin does not depend on AliasHeadDrift's tearDown having run in the same xdist worker
+        jd._ALIAS_SERVED.clear()
+
     def test_the_catalog_rule_in_both_directions(self):
         with contextlib.redirect_stderr(io.StringIO()) as err:
             for m in self.ADAPTIVE:
@@ -6541,6 +6546,10 @@ class IndexTierLever(unittest.TestCase):
         (jd.STATE / "index-effort").unlink(missing_ok=True)
         jd._state_cache.clear()
         jd._LEVER_LOGGED.clear()
+        # the alias record and the no-modelUsage latch are per process: cleared here so this class's
+        # `haiku` pins do not depend on AliasHeadDrift's tearDown having run in the same xdist worker
+        jd._ALIAS_SERVED.clear()
+        jd._NO_MODEL_USAGE_LOGGED.clear()
         os.environ.pop("MAX_THINKING_TOKENS", None)
 
         class _P:
@@ -6655,6 +6664,8 @@ class IndexTierLever(unittest.TestCase):
         self.assertIn("--effort low", err, "the line names the lever that applied")
         self.calls.clear()
         _cmd, _env, err2 = self._run("fable")
+        # the stub carries no modelUsage, so the once-per-process line about that lands on the FIRST
+        # call of this test (setUp cleared the latch) and the second is quiet by the latch — in any order
         self.assertEqual(err2, "", "same model again → no second line (one line per lever change)")
         self.calls.clear()
         _cmd, _env, err3 = self._run("haiku")
@@ -6677,8 +6688,10 @@ class AliasHeadDrift(unittest.TestCase):
     (_ALIAS_SERVED), and _adaptive_thinking consults that ahead of the table from then on; a served
     version the table disagrees with is announced once per (alias, served id). Quiet when they agree, on
     a versioned pin (never remapped), and when the envelope names no same-family model — no evidence
-    either way, so the table's answer stands exactly as before. The subprocess is stubbed and its argv +
-    env captured — nothing runs."""
+    either way, so the table's answer stands exactly as before. An envelope with no modelUsage map at
+    all is the other case (the #948 review): the check cannot run for any alias, so a stale table would
+    be trusted with nothing logged — said once per process, latched in _NO_MODEL_USAGE_LOGGED. The
+    subprocess is stubbed and its argv + env captured — nothing runs."""
 
     def setUp(self):
         self.calls = []
@@ -6709,10 +6722,12 @@ class AliasHeadDrift(unittest.TestCase):
         jd._LEVER_LOGGED.clear()
         jd._ALIAS_SERVED.clear()
         jd._ALIAS_DRIFT_LOGGED.clear()
+        jd._NO_MODEL_USAGE_LOGGED.clear()
 
     def _run(self, model, model_usage=None, tier="index", judge="captioner"):
         """One stubbed call; the envelope carries `model_usage` under modelUsage when given (None: the
-        envelope names no model, the IndexTierLever stub's shape). Returns (argv, env, stderr text)."""
+        envelope carries no modelUsage map at all, the IndexTierLever stub's shape). Returns (argv, env,
+        stderr text)."""
         self.calls.clear()
         wrap = {"result": "a caption", "usage": {}}
         if model_usage is not None:
@@ -6732,6 +6747,10 @@ class AliasHeadDrift(unittest.TestCase):
     @staticmethod
     def _drift_lines(err):
         return [ln for ln in err.splitlines() if "_ALIAS_HEAD" in ln]
+
+    @staticmethod
+    def _missing_map_lines(err):
+        return [ln for ln in err.splitlines() if "modelUsage" in ln]
 
     def test_a_served_version_that_matches_the_table_is_quiet(self):
         cmd, env, err = self._run("haiku", {"claude-haiku-4-5-20251001": {"inputTokens": 100, "outputTokens": 15}})
@@ -6799,15 +6818,41 @@ class AliasHeadDrift(unittest.TestCase):
         self.assertEqual(env.get("MAX_THINKING_TOKENS"), "0")
 
     def test_an_envelope_naming_no_model_is_quiet(self):
-        # absence carries no evidence of drift: the table's answer stands exactly as before this check
-        # existed (and IndexTierLever's stub, which names no model, keeps its empty-stderr assertion)
-        for mu in (None, {}):
+        # a PRESENT map that names no same-family model carries no evidence of drift: the table's answer
+        # stands exactly as before this check existed, and nothing is said — the absence of a
+        # same-family entry is not the absence of the map (the next test)
+        for mu in ({}, {"claude-sonnet-5-20260201": {"outputTokens": 30}}):
             self._reset()
             cmd, env, err = self._run("haiku", mu)
             self.assertEqual(self._drift_lines(err), [], "modelUsage=%r" % (mu,))
-            self.assertEqual(jd._ALIAS_SERVED, {})
+            self.assertEqual(self._missing_map_lines(err), [], "modelUsage=%r" % (mu,))
+            self.assertNotIn("haiku", jd._ALIAS_SERVED)
             self.assertNotIn("--effort", cmd)
             self.assertEqual(env.get("MAX_THINKING_TOKENS"), "0")
+
+    def test_a_missing_model_usage_map_is_announced_once_per_process(self):
+        # No map at all — a CLI older than the field, or a shape change: the check's own precondition
+        # fails, so the index tier keeps choosing its lever from a table nothing has verified. Silent, that
+        # is the degradation the loud-failure rule forbids; one line per PROCESS is the whole signal (the
+        # field is a property of the CLI, not of the call), so IndexTierLever's stub, which carries no
+        # map, still keeps its second-call empty-stderr pin.
+        cmd, env, err = self._run("haiku", None)
+        lines = self._missing_map_lines(err)
+        self.assertEqual(len(lines), 1, "one line, got: %r" % err)
+        self.assertIn("haiku", lines[0], "the line names the alias whose call revealed it")
+        self.assertIn("alias table", lines[0], "…and says what the lever answers from meanwhile")
+        self.assertEqual(self._drift_lines(err), [], "not a drift line: the table was not contradicted")
+        self.assertEqual(jd._ALIAS_SERVED, {})
+        self.assertNotIn("--effort", cmd)
+        self.assertEqual(env.get("MAX_THINKING_TOKENS"), "0")
+        _cmd, _env, err = self._run("sonnet", None)
+        self.assertEqual(self._missing_map_lines(err), [], "once per process, not per alias")
+        self._reset()
+        _cmd, _env, err = self._run("claude-haiku-4-5", None)
+        self.assertEqual(self._missing_map_lines(err), [], "a versioned pin is never checked: nothing to announce")
+        self._reset()
+        _cmd, _env, err = self._run("haiku", None)
+        self.assertEqual(len(self._missing_map_lines(err)), 1, "the latch is the state the tests clear")
 
     def test_a_malformed_entry_cannot_cost_the_reply(self):
         # best-effort like _log_judge_usage: the reply is the call's product, the check is bookkeeping

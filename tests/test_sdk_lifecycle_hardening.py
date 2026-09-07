@@ -73,6 +73,7 @@ class LastStateValue(unittest.TestCase):
 
 class FindOrphanClis(unittest.TestCase):
     SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    OWN = 31337   # this kernel's pid in the fixtures; no fixture below uses it as a parent
 
     def test_matches_only_sdk_clis_resuming_ours(self):
         lines = [
@@ -85,7 +86,7 @@ class FindOrphanClis(unittest.TestCase):
             # junk / short lines are skipped, not crashed on
             "garbage", " 99", " 99 100", "",
         ]
-        self.assertEqual(sb.find_orphan_clis(lines, [self.SID]), [4242])
+        self.assertEqual(sb.find_orphan_clis(lines, [self.SID], self.OWN), [4242])
 
     def test_live_children_are_never_orphans(self):
         # Same command line as a true orphan, but still parented to a running kernel (the kernel's
@@ -96,7 +97,7 @@ class FindOrphanClis(unittest.TestCase):
             " 4242 38438 /x/claude --output-format stream-json --resume %s --input-format stream-json" % self.SID,
             " 4245 1 /x/claude --output-format stream-json --resume %s --input-format stream-json" % self.SID,
         ]
-        self.assertEqual(sb.find_orphan_clis(lines, [self.SID]), [4245])
+        self.assertEqual(sb.find_orphan_clis(lines, [self.SID], self.OWN), [4245])
 
     # Orphaned = the parent is not a live romp kernel (2026-09-05). Until then the check was ppid 1,
     # which is what an orphan gets under launchd — and never under `systemd --user`, whose
@@ -108,17 +109,17 @@ class FindOrphanClis(unittest.TestCase):
     def test_orphan_reparented_to_launchd(self):
         # macOS: pid 1 is launchd, present in the listing and not a kernel
         lines = [" 1 0 /sbin/launchd", self._cli(700, 1)]
-        self.assertEqual(sb.find_orphan_clis(lines, [self.SID]), [700])
+        self.assertEqual(sb.find_orphan_clis(lines, [self.SID], self.OWN), [700])
 
     def test_orphan_reparented_to_the_systemd_user_manager(self):
         # Linux under the service: the orphan's ppid is the `systemd --user` pid, never 1
         lines = [" 1 0 /sbin/init", " 901 1 /usr/lib/systemd/systemd --user", self._cli(701, 901)]
-        self.assertEqual(sb.find_orphan_clis(lines, [self.SID]), [701])
+        self.assertEqual(sb.find_orphan_clis(lines, [self.SID], self.OWN), [701])
 
     def test_orphan_whose_parent_is_absent_from_the_listing(self):
         # the parent died between the CLI's line and its own (ps is not atomic) — an orphan
         lines = [self._cli(702, 65000)]
-        self.assertEqual(sb.find_orphan_clis(lines, [self.SID]), [702])
+        self.assertEqual(sb.find_orphan_clis(lines, [self.SID], self.OWN), [702])
 
     def test_a_live_cli_parented_to_a_romp_kernel_is_never_reaped(self):
         for kernel in (" 500 901 /usr/bin/python3.12 /x/romp/bin/romp-kernel",
@@ -126,7 +127,7 @@ class FindOrphanClis(unittest.TestCase):
                        " 500 901 python3 kernel/kernel.py",
                        " 500 901 /usr/bin/python3 /x/romp/kernel/kernel.py"):
             lines = [" 901 1 /usr/lib/systemd/systemd --user", kernel, self._cli(703, 500)]
-            self.assertEqual(sb.find_orphan_clis(lines, [self.SID]), [], kernel)
+            self.assertEqual(sb.find_orphan_clis(lines, [self.SID], self.OWN), [], kernel)
 
     def test_a_cli_parented_to_a_different_live_kernel_is_that_kernels(self):
         # another kernel (an aux port, a second install) owns this CLI — not ours to reap, whatever
@@ -134,7 +135,32 @@ class FindOrphanClis(unittest.TestCase):
         lines = [" 901 1 /usr/lib/systemd/systemd --user",
                  " 600 901 /usr/bin/python3.12 /elsewhere/romp/bin/romp-kernel",
                  self._cli(704, 600), self._cli(705, 901)]
-        self.assertEqual(sb.find_orphan_clis(lines, [self.SID]), [705])
+        self.assertEqual(sb.find_orphan_clis(lines, [self.SID], self.OWN), [705])
+
+    # This kernel's own children are live by PID, not by how `ps` spells the kernel (the #941 review).
+    # _is_kernel_cmd knows the spellings romp-serve and a hand run produce; under any other (a `-c`
+    # runner, a renamed launcher, `python3 ./kernel.py`) it read the caller's own children as orphans —
+    # the unconditional protection the old `ppid != 1` test gave them, lost. A foreign kernel is still
+    # judged by its text: the pid shortcut is for the caller only.
+    def test_this_kernels_own_children_are_live_whatever_ps_calls_it(self):
+        for kernel in ("python3 ./kernel.py",
+                       "/usr/bin/python3 -c import runpy; runpy.run_path('kernel/kernel.py')",
+                       "/x/venv/bin/python /x/romp/bin/romp-kernel-dev"):
+            self.assertFalse(sb._is_kernel_cmd(kernel), kernel)     # so the pid path is what protects them
+            lines = [" 901 1 /usr/lib/systemd/systemd --user", " %d 901 %s" % (self.OWN, kernel),
+                     self._cli(707, self.OWN), self._cli(708, 901)]
+            self.assertEqual(sb.find_orphan_clis(lines, [self.SID], self.OWN), [708], kernel)
+
+    def test_own_children_stay_live_when_the_kernels_own_line_is_absent(self):
+        # unlike test_orphan_whose_parent_is_absent_from_the_listing (ppid 65000 is not us, so that one
+        # IS an orphan): a listing that missed our own line still protects our children, by pid
+        self.assertEqual(sb.find_orphan_clis([self._cli(709, self.OWN)], [self.SID], self.OWN), [])
+
+    def test_another_kernels_children_are_still_judged_by_its_text(self):
+        # the boundary #941 drew, unchanged: a kernel spelled in a way _is_kernel_cmd does not know
+        # shields nothing unless it is THIS kernel
+        lines = [" 901 1 /usr/lib/systemd/systemd --user", " 600 901 python3 ./kernel.py", self._cli(710, 600)]
+        self.assertEqual(sb.find_orphan_clis(lines, [self.SID], self.OWN), [710])
 
     def test_kernel_match_is_on_argv_tokens_not_substrings(self):
         self.assertTrue(sb._is_kernel_cmd("/usr/bin/python3.12 /x/romp/bin/romp-kernel"))
@@ -146,11 +172,11 @@ class FindOrphanClis(unittest.TestCase):
         self.assertFalse(sb._is_kernel_cmd("/usr/lib/systemd/systemd --user"))
         self.assertFalse(sb._is_kernel_cmd("python3 other/kernel.py"))
         lines = [" 800 1 tail -f /x/state/romp/romp-kernel.log", self._cli(706, 800)]
-        self.assertEqual(sb.find_orphan_clis(lines, [self.SID]), [706])
+        self.assertEqual(sb.find_orphan_clis(lines, [self.SID], self.OWN), [706])
 
     def test_empty_sids_match_nothing(self):
         lines = [" 1 1 claude --resume  --input-format stream-json"]
-        self.assertEqual(sb.find_orphan_clis(lines, [""]), [])
+        self.assertEqual(sb.find_orphan_clis(lines, [""], self.OWN), [])
 
     def test_equals_flag_spelling_matches(self):
         # The Agent SDK moved to `--resume=<sid>` (equals form); the space-only match was blind to
@@ -164,7 +190,7 @@ class FindOrphanClis(unittest.TestCase):
             # equals form but a foreign sid → still not ours
             " 5004 1 /x/claude --resume=ffffffff-0000-1111-2222-333333333333 --input-format stream-json",
         ]
-        self.assertEqual(sb.find_orphan_clis(lines, [self.SID]), [5001, 5002, 5003])
+        self.assertEqual(sb.find_orphan_clis(lines, [self.SID], self.OWN), [5001, 5002, 5003])
 
 
 class QueuePersistence(unittest.TestCase):
@@ -388,6 +414,29 @@ class BootReconcile(unittest.TestCase):
                          "the SDK orphan is reaped; the tmux CLI and the live (parented) CLI "
                          "on the same sid are untouched")
         self.assertEqual(run.call_args_list[0][0][0], sb.PS_ARGV, "the listing is read with PS_ARGV")
+
+    def test_the_reaper_shields_this_kernels_own_children_by_pid(self):
+        # The reconcile runs on a thread after the backend is up, concurrent with the kernel serving
+        # requests, so a session started before the thread's `ps` is THIS kernel's child carrying one
+        # of the lastsids. With the kernel spelled in a way _is_kernel_cmd does not know it was reaped
+        # as an orphan (the #941 review); the caller hands its own pid down, and the child is live by it.
+        d, be = self._setup()
+        sid = "11111111-aaaa-0000-0000-00000000000d"
+        _reg(d, sid)
+        sb.append_state(Path(d), sid, "working")
+        me = os.getpid()
+        ps = ("  901 1 /usr/lib/systemd/systemd --user\n"
+              "  %d 901 python3 ./kernel.py\n"
+              "  558 %d /x/claude --output-format stream-json --resume %s --input-format stream-json\n"
+              "  559 901 /x/claude --output-format stream-json --resume %s --input-format stream-json\n"
+              ) % (me, me, sid, sid)
+        killed = []
+        with mock.patch.object(sb.subprocess, "run", return_value=mock.Mock(stdout=ps)), \
+             mock.patch.object(sb.os, "kill", side_effect=lambda p, s: killed.append((p, s))):
+            be._boot_reconcile([sb.read_reg(Path(d), sid)])
+        self.assertEqual(killed, [(559, sb.signal.SIGTERM)],
+                         "a child this kernel already spawned is left alone whatever ps calls the kernel; "
+                         "the orphan under the user manager is still reaped")
 
     def test_reconcile_is_opt_in(self):
         # Constructing the backend plain (tests, ad-hoc) must NOT spawn a reconcile thread; the

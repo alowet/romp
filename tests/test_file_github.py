@@ -9,6 +9,7 @@ expects to read), or the sha when HEAD is detached. Real temp git repos, synthet
 (TESTORG / notes-api — the demo world); the one network query (ls-remote) is served by a LOCAL bare
 repo through a stand-in ssh, so no test reaches GitHub.
 """
+import http.server
 import json
 import os
 import shutil
@@ -580,6 +581,76 @@ class BranchOnOrigin(_WithOrigin):
         os.environ["GIT_SSH_COMMAND"] = _script(self.root, "probe-ssh", "touch '%s'\nexit 255\n" % marker)
         self.assertEqual(km._file_github_url(self.fp, None), self.URL % "wip")
         self.assertFalse(os.path.exists(marker), "_file_github_url pays no network query")
+
+
+class NoPromptOnOrigin(_WithOrigin):
+    """The origin check's git must never pop a prompt of any kind (the #947 review). GIT_TERMINAL_PROMPT=0
+    closes the terminal route only: the child inherited GIT_ASKPASS, core.askPass and SSH_ASKPASS, so an
+    https origin answering 401 asked for a username and a password through the first of those it found —
+    with a GUI askpass exported in the kernel's shell, a prompt on every viewer open of a file under such
+    an origin, then killed at the deadline. ssh's own SSH_ASKPASS use (DISPLAY set, no tty) was open too.
+    The chosen behaviour: such an origin reads "could not check" rather than a verdict, and an askpass
+    that would have answered silently for a signed-in user is refused with the rest."""
+
+    def test_the_transport_child_sees_every_prompt_route_closed(self):
+        # the environment git hands its transport child is the one its own askpass lookup read; the
+        # stand-in ssh dumps it. Set-EMPTY GIT_ASKPASS is what overrides core.askPass and SSH_ASKPASS: git
+        # tests the variable's presence before falling to either, so unset would not do — pinned as
+        # `${GIT_ASKPASS+set}:` so a later cleanup to a pop() reads as the regression it is.
+        _restore_env_after(self, "GIT_ASKPASS", "SSH_ASKPASS", "DISPLAY")
+        gui = os.path.join(self.root, "gui-askpass")          # a path only; nothing runs it on the ssh path
+        os.environ["GIT_ASKPASS"] = os.environ["SSH_ASKPASS"] = gui
+        os.environ["DISPLAY"] = ":0"
+        _git("checkout", "-q", "-b", "wip", cwd=self.tmp)
+        dump = os.path.join(self.root, "child-env")
+        os.environ["GIT_SSH_COMMAND"] = _script(
+            self.root, "env-ssh",
+            'printf "%%s\\n" "${GIT_ASKPASS+set}:$GIT_ASKPASS" "$SSH_ASKPASS_REQUIRE" "$GIT_TERMINAL_PROMPT" > "%s"\n'
+            'exit 255\n' % dump)
+        self.assertEqual(km._file_github_link(self.fp, None),
+                         (self.URL % "wip", "could not check whether branch wip is on origin"),
+                         "the stand-in refused, so the verdict is unchecked: the dump came from the kernel's query")
+        with open(dump) as f:
+            self.assertEqual(f.read().splitlines(), ["set:", "never", "0"],
+                             "GIT_ASKPASS set-empty (never unset), SSH_ASKPASS_REQUIRE=never, GIT_TERMINAL_PROMPT=0")
+
+    def test_a_credential_wanting_origin_pops_no_askpass_and_reads_unchecked(self):
+        # A loopback origin answering 401 with a Basic challenge is the credential-wanting private origin;
+        # a marker-writing askpass stands in for the GUI one. The control comes first: under
+        # GIT_TERMINAL_PROMPT=0 alone git DOES run the askpass, so the stand-in elicits the prompt this
+        # test is about. Then the kernel's query: no askpass run, and the verdict is unchecked.
+        # _origin_has_branch is called directly because _file_github_link's URL check reads a loopback
+        # origin as not GitHub before any ls-remote (and _local_origin's note says why an insteadOf
+        # rewrite cannot stand in for the URL).
+        exec_path = subprocess.run(["git", "--exec-path"], capture_output=True, text=True).stdout.strip()
+        if not os.path.exists(os.path.join(exec_path, "git-remote-https")):
+            self.skipTest("this git has no https transport")
+
+        class Challenge(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="notes-api"')
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Challenge)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)                        # cleanups run last-added first: shutdown, then close
+        marker = os.path.join(self.root, "asked")
+        _restore_env_after(self, "GIT_ASKPASS")
+        os.environ["GIT_ASKPASS"] = _script(self.root, "askpass", 'echo asked >> "%s"\necho user\n' % marker)
+        _git("remote", "set-url", "origin", "http://127.0.0.1:%d/TESTORG/notes-api.git" % srv.server_address[1],
+             cwd=self.tmp)
+        _git("checkout", "-q", "-b", "wip", cwd=self.tmp)
+        subprocess.run(["git", "-C", self.tmp, "ls-remote", "--heads", "origin", "refs/heads/wip"],
+                       env=dict(os.environ, GIT_TERMINAL_PROMPT="0"), capture_output=True, timeout=30)
+        self.assertTrue(os.path.exists(marker), "control: under GIT_TERMINAL_PROMPT=0 alone git runs the askpass")
+        os.remove(marker)
+        self.assertIsNone(km._origin_has_branch(self.tmp, "wip"), "a credential-wanting origin reads as unchecked")
+        self.assertFalse(os.path.exists(marker), "the kernel's query ran no askpass program")
 
 
 class GitLinkWire(_WithOrigin):

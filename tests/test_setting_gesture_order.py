@@ -898,6 +898,56 @@ class AutoNudgeTurnOnActsNow(_Base):
         self.assertEqual(len(self.ticks), 1, "only the turn-on ticked")
 
 
+class WsActNowTickIsWrapped(_Base):
+    """The act-now tick runs on the WS handler thread, and the reader loop (Handler._ws) re-raises
+    OSError as a socket failure whose outer handler tears the connection down silently — so an
+    OSError out of the pass head (the session-listing fork, a store read) closed the dashboard's
+    socket with no log line: since #846 for setCompactSuggest, for setAutoNudge once #943 restored
+    its tick. Both arms now tick through one wrap (_ws_act_now_tick) that logs the traceback the way
+    the pusher's own wrap does. The tick never writes to the delivering socket (its only push is
+    _push_soon(), a wake flag), which is what makes catching everything there safe: nothing caught
+    is that socket's own failure. Driven through the real dispatch, the incident's shape."""
+
+    ARMS = ({"type": "setAutoNudge", "enabled": True, "gt": T_NEW},
+            {"type": "setCompactSuggest", "enabled": True, "gt": T_NEW})
+
+    def _dispatch_with_failing_tick(self, exc):
+        def boom(*a, **k):
+            raise exc
+        km._auto_nudge_tick = boom                                # restored by _Base.tearDown
+        out = []
+        for msg in self.ARMS:
+            client = {"send": lambda s: None, "alive": True}
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                try:
+                    km.Handler._dispatch_ws(types.SimpleNamespace(), msg, client)
+                except OSError:
+                    self.fail("an OSError escaped _dispatch_ws (%s) — the reader loop re-raises it as a "
+                              "socket failure and silently tears the WebSocket down" % msg["type"])
+            self.assertTrue(client["alive"], "%s: the delivering client survives the failed tick" % msg["type"])
+            out.append(err.getvalue())
+        return out
+
+    def test_a_failing_act_now_tick_is_logged_not_a_socket_failure(self):
+        errs = self._dispatch_with_failing_tick(OSError(28, "No space left on device"))
+        for msg, err in zip(self.ARMS, errs):
+            self.assertIn("auto-nudge", err, "%s: the failure is loud and names the tick" % msg["type"])
+            self.assertIn("OSError", err, "%s: the traceback is logged, as the pusher's wrap logs it" % msg["type"])
+            self.assertIn("No space left on device", err)
+        km._autonudge_cache.clear()
+        self.assertTrue(km._auto_nudge_on(), "the flag write preceded the tick and stands")
+        self.assertTrue(km._compact_suggest_on(), "…for both arms")
+
+    def test_any_failure_of_the_tick_is_caught_the_same_way(self):
+        # the pusher's wrap catches Exception; so does this one — a TypeError in the pass head is no
+        # more a socket failure than an OSError is
+        errs = self._dispatch_with_failing_tick(RuntimeError("a bad store record"))
+        for err in errs:
+            self.assertIn("auto-nudge", err)
+            self.assertIn("RuntimeError: a bad store record", err)
+
+
 SF_SID = "11111111-2222-4333-8444-555555555555"   # the single-flight tests' one fake alive session
 
 

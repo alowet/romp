@@ -1391,7 +1391,7 @@ def _is_kernel_cmd(cmd: str) -> bool:
     return False
 
 
-def find_orphan_clis(ps_lines: list[str], lastsids: list[str]) -> list[int]:
+def find_orphan_clis(ps_lines: list[str], lastsids: list[str], own_pid: int) -> list[int]:
     """PIDs of ORPHANED SDK-driven `claude` CLIs holding one of OUR sessions (--resume/--session-id
     in either flag spelling, + the stream-json mark — see _cli_carries_sid). Orphaned = its PARENT
     is not a live romp kernel (absent from the listing, or a process that is not a kernel): a live
@@ -1399,7 +1399,13 @@ def find_orphan_clis(ps_lines: list[str], lastsids: list[str]) -> list[int]:
     zombie writer that would fight the resume for the transcript — has any other parent. The parent
     check is load-bearing: matching on the command line alone let a duplicate backend's reconcile
     reap freshly-resumed LIVE sessions mid-turn (2026-07-06); and a CLI parented to a DIFFERENT live
-    kernel is that kernel's, never reaped here.
+    kernel is that kernel's, never reaped here. `own_pid` is the calling kernel's pid: a CLI whose
+    ppid is own_pid is this kernel's live child whatever `ps` calls the kernel. _is_kernel_cmd knows
+    the spellings romp-serve and a hand run produce (`…/bin/romp-kernel`, `kernel/kernel.py`); the pid
+    check keeps this kernel's own children out of the reap under any other (`python3 ./kernel.py`, a
+    `-c` runner, a renamed launcher) — the unconditional protection the old `ppid != 1` test gave them
+    (the 2026-09-06 review of the parent-is-a-kernel definition). The reconcile runs on a thread after
+    the backend is up, so a session started before its `ps` is exactly such a child.
 
     Until 2026-09-05 "orphaned" meant ppid 1 (macOS: an orphan re-parents to launchd). Under
     `systemd --user` that never happens: the user manager sets PR_SET_CHILD_SUBREAPER, so a CLI left
@@ -1419,6 +1425,8 @@ def find_orphan_clis(ps_lines: list[str], lastsids: list[str]) -> list[int]:
     for pid, (ppid, cmd) in procs.items():
         if _SDK_CLI_MARK not in cmd or not _cli_carries_sid(cmd, lastsids):
             continue
+        if ppid == own_pid:
+            continue    # this kernel's own child, whatever ps calls this kernel (or with our line missing)
         parent = procs.get(ppid)
         if parent is not None and _is_kernel_cmd(parent[1]):
             continue    # a live kernel's child — ours or another kernel's, either way not an orphan
@@ -5224,7 +5232,7 @@ class SdkBackend:
             if lastsids:
                 try:
                     ps = subprocess.run(PS_ARGV, capture_output=True, text=True, timeout=10).stdout
-                    for pid in find_orphan_clis(ps.splitlines(), lastsids):
+                    for pid in find_orphan_clis(ps.splitlines(), lastsids, os.getpid()):
                         if pid == os.getpid():
                             continue
                         try:

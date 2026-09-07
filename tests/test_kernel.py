@@ -450,6 +450,40 @@ class ViewBuilder(unittest.TestCase):
         self.assertNotIn("todo", kinds_batch, "rejected {tasks} batch → no phantom to-do card, no error")
         self.assertTrue(todo and todo[0].get("error"), "control: an accepted create still surfaces the error")
 
+    def test_fold_ignores_a_rejected_taskupdate(self):
+        # The TaskCreate skip's twin (the #942 review): a TaskUpdate the CLI REJECTED — a status value
+        # outside its set, a transition it refused — answers with an is_error tool_result and writes nothing
+        # to the store, so it moves no checklist item. Before the skip the fold applied the refused status as
+        # if the store held it. Keyed on the result's is_error, exactly as the TaskCreate branch is, so this
+        # fold and event_model.declared_plan stay identical; an accepted update still applies, and so does
+        # one whose result has not landed yet (unchanged, pinned beside the skip).
+        def _tu(name, inp, rid):
+            return {"type": "tool_use", "id": rid, "name": name, "input": inp}
+        def _tr(rid, text, is_error=False):
+            b = {"type": "tool_result", "tool_use_id": rid, "content": text}
+            if is_error:
+                b["is_error"] = True
+            return {"type": "user", "message": {"content": [b]}}
+        def _asst(*blocks):
+            return {"type": "assistant", "message": {"content": list(blocks)}}
+        refused = ("InputValidationError: TaskUpdate failed due to the following issue:\n"
+                   "The value of `status` must be one of pending, in_progress, completed")
+        created = [_asst(_tu("TaskCreate", {"subject": "vet the pairs"}, "toolu_TEST0011")),
+                   _tr("toolu_TEST0011", "Task #1 created successfully. Use TaskUpdate to update it.")]
+        rejected = [_asst(_tu("TaskUpdate", {"taskId": "1", "status": "done"}, "toolu_TEST0012")),
+                    _tr("toolu_TEST0012", refused, is_error=True)]
+        s = {"turns": [{"atoms": created + rejected}]}
+        self.assertEqual(km._fold_tasks(s)[0]["status"], "pending", "a rejected update moves nothing")
+        # the skip is per call: an accepted update after the rejected one still applies
+        accepted = [_asst(_tu("TaskUpdate", {"taskId": "1", "status": "in_progress"}, "toolu_TEST0013")),
+                    _tr("toolu_TEST0013", "Task #1 updated.")]
+        s = {"turns": [{"atoms": created + rejected + accepted}]}
+        self.assertEqual(km._fold_tasks(s)[0]["status"], "in_progress")
+        # an update whose result has not landed (the turn is still open) applies as before
+        pending = [_asst(_tu("TaskUpdate", {"taskId": "1", "status": "completed"}, "toolu_TEST0014"))]
+        s = {"turns": [{"atoms": created + pending}]}
+        self.assertEqual(km._fold_tasks(s)[0]["status"], "completed", "no result yet is not a rejection")
+
     def test_fully_completed_store_drops_the_todo_card(self):
         # a done list is not a live to-do (the user 2026-06-10). At `track`'s screenshot time the store was
         # already all-completed, so the store-based card is correctly ABSENT — not a stale "3/5".

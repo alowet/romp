@@ -5653,6 +5653,24 @@ def _auto_nudge_tick(now, tmux, run_dead_wait=True):
         _AUTO_NUDGE_TICK_LOCK.release()
 
 
+def _ws_act_now_tick():
+    """The setAutoNudge / setCompactSuggest arms' act-now pass on the WS handler thread — ONE wrap for
+    both (PR #943 review). The reader loop (Handler._ws) re-raises OSError as a socket failure and its
+    outer handler tears the connection down silently, so an OSError out of the pass head (the
+    session-listing fork, a store read) closed the dashboard's socket with no log line — since #846 for
+    setCompactSuggest, for setAutoNudge once #943 restored its tick. Catches Exception as the pusher's
+    wrap does, and that is safe HERE because the tick never writes to the delivering socket: its only
+    push is _push_soon(), a wake flag, so nothing caught is that socket's own failure (a tick that wrote
+    to the client would have to let its socket errors through). Skips the dead-wait sweep: the death
+    transition has ONE observer, the pusher's tick (see _auto_nudge_tick), and this thread racing its
+    prev-swap could spend a transition uncorroborated. Single-flight against the pusher's pass through
+    _AUTO_NUDGE_TICK_LOCK, inside the call."""
+    try:
+        _auto_nudge_tick(int(time.time()), _tmux_sessions(), run_dead_wait=False)
+    except Exception:
+        sys.stderr.write("auto-nudge (ws act-now): %s\n" % traceback.format_exc())
+
+
 def _auto_nudge_pass(now, tmux, run_dead_wait):
     """The body of one pass — the walk, the sweeps, the push. Only _auto_nudge_tick calls it, under
     the single-flight guard (split out the way _pusher_cycle_jobs is from _pusher_cycle)."""
@@ -18689,7 +18707,7 @@ def _fold_tasks(session):
     """Fold a session's TaskCreate/TaskUpdate tool calls into ONE checklist — the FALLBACK for _read_task_store
     when a session has no live task store (mirrors the old TS transcript.foldTasks the Python rewrite dropped).
     Task id = the number in TaskCreate's RESULT text ('Task #N created…'); status rides each TaskUpdate
-    {taskId,status}. NOTE this is lossy — it can't see a completion a subagent wrote only to the store (see
+    {taskId,status} the CLI accepted. NOTE this is lossy — it can't see a completion a subagent wrote only to the store (see
     _read_task_store). Returns the tasks in creation
     order, or None if there were none. The webview renders this as a todo card (kind:'todo') and hides the
     raw Task* calls (ACK_TOOLS) — so the kernel emits the folded card and skips the raw tool events."""
@@ -18734,6 +18752,13 @@ def _fold_tasks(session):
                                   "activeForm": str(af) if af else None, "status": "pending"}
                     order += 1
                 elif b.get("name") == "TaskUpdate":
+                    # A TaskUpdate the CLI REJECTED — its paired tool_result carries is_error (a status value
+                    # outside its set, a transition it refused) — wrote nothing to the store, so it moves no
+                    # checklist item; applied, the refused status stood in for the store's. Keyed on the
+                    # result's is_error like the TaskCreate skip above, so this fold and event_model's
+                    # declared_plan stay identical. An update whose result has not landed still applies.
+                    if b.get("id") in rejected:
+                        continue
                     t = tasks.get(str(inp.get("taskId", "")))
                     if t:
                         t["status"] = str(inp.get("status") or t["status"])
@@ -28649,8 +28674,13 @@ def _git_net_out(args, cwd, timeout, env):
     """_git_out for the one query that leaves the machine (ls-remote): git runs in its OWN session, and
     the deadline kills the whole process group. subprocess.run's timeout kill reaches its direct child
     alone, and the ssh git had spawned sat in its TCP connect for minutes after the viewer had already
-    been told "could not check" (reproduced 2026-09-05). A fresh session also has no controlling
-    terminal, so an ssh that wants a passphrase fails instead of waiting for one."""
+    been told "could not check" (reproduced 2026-09-05). No prompt of any kind reaches the user: the
+    caller's env closes every route (GIT_TERMINAL_PROMPT=0 for the terminal; GIT_ASKPASS="" for git's
+    askpass, which also overrides core.askPass and git's SSH_ASKPASS fallback; SSH_ASKPASS_REQUIRE=never
+    for ssh's own), so a query that would need a credential fails at once and the viewer reads "could not
+    check". That is the choice made (the #947 review): an editor's askpass helper that would have
+    answered silently for a signed-in user is refused too, and such an origin reads "could not check"
+    rather than a verdict. A configured credential.helper is not disabled and may still answer silently."""
     try:
         p = subprocess.Popen(["git", "-C", cwd] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, text=True, start_new_session=True, env=env)
@@ -28780,7 +28810,8 @@ def _origin_has_branch(top, ref):
     locally), and any answer in a clone whose refspec leaves the branch untracked (`--single-branch`).
     The verdict is as fresh as this clone's refs, then: a branch deleted on GitHub reads as present
     until `fetch --prune`, one pushed from elsewhere as absent until a fetch. The query gets a short
-    timeout and no terminal prompt: the viewer must never hang on it. The pattern is the full ref and
+    timeout and no prompt of any kind (terminal, git's askpass, ssh's askpass): the viewer must never
+    hang on it. The pattern is the full ref and
     the answer is matched on it exactly, because ls-remote patterns match a ref's TAIL (`main` would
     also match `refs/heads/x/main`)."""
     key = (top, ref)
@@ -28801,8 +28832,14 @@ def _origin_has_branch(top, ref):
     on = None
     try:
         full = "refs/heads/" + ref
+        # GIT_TERMINAL_PROMPT=0 closes the terminal route only. git reads GIT_ASKPASS before core.askPass
+        # and before its SSH_ASKPASS fallback, and tests the variable's PRESENCE, so a set-EMPTY
+        # GIT_ASKPASS overrides all three (unsetting it would not); SSH_ASKPASS_REQUIRE=never closes
+        # ssh's own askpass (OpenSSH 8.4+, ignored by older ssh). Without these a kernel started from a
+        # shell exporting an askpass program showed a GUI prompt on every viewer open of a file under a
+        # credential-wanting private origin, and the deadline then killed it (the #947 review).
         out = _git_net_out(["ls-remote", "--heads", "origin", full], top, timeout=GH_LS_REMOTE_S,
-                           env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+                           env=dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="", SSH_ASKPASS_REQUIRE="never"))
         if out is not None:
             on = any(line.split("\t")[-1] == full for line in out.splitlines())
     finally:
@@ -31420,6 +31457,19 @@ setTimeout(hide,5000);})();
 # posts {romp:'wsState',app,state}; the timeline/feed/etc. are pushed from the kernel, so a drop silently
 # freezes them), the usage-limit + judge-degraded signatures (see _LANDING_USAGE_JS), and any
 # {romp:'notify',kind,text} a pane posts. window.__rompNotify(kind,text) is the one write path.
+#
+# THE pane presentation order (the user 2026-08-30: mobile must list the panes in the desktop
+# order — "mobile is a re-layout of the desktop, never a re-ordering"). This list is the desktop
+# rail strip's left-to-right order, which is the user's own choice (2026-07-05) and the desktop's
+# actual visible LIST of the named panes (the column layout cannot express it: Sessions/timeline
+# is a band, not a column). The desktop rail buttons (_rail_buttons_html), the mobile #mtabs buttons
+# (_mtab_buttons_html), the WS drop row (_note_ws_drop) and the bell's pane-label map (PN, in the
+# script below) all render from this one constant — reorder or rename here and every surface moves
+# together; a second hardcoded list is the bug this replaces (the bell's PN was the last one, the
+# #957 review). Defined above _LANDING_ERRS_JS because that string is built from it at import.
+# Keys stay internal (timeline/fleet); labels are the user-facing names.
+_PANE_ORDER = (("chat", "Chat"), ("timeline", "Sessions"), ("fleet", "Outline"), ("feed", "Feed"))
+
 _LANDING_ERRS_JS = """
 (function(){var icon=document.getElementById('rail-errs'),micon=document.getElementById('merr'),
 back=document.getElementById('rerr-back'),list=document.getElementById('rerr-list'),
@@ -31527,7 +31577,7 @@ if(m&&m.romp==='notify'&&m.text)window.__rompNotify(m.kind||'error',m.text,
 var st={};
 function shown(k){return document.body.classList.contains('po-'+k);}
 function liveDown(){for(var k in st){if(st[k]==='down'&&shown(k))return true;}return false;}
-var PN={chat:'Chat',feed:'Feed',timeline:'Sessions',fleet:'Outline'};   // timeline key stays internal; the pane outgrew the name (filter, tags, lane controls — the user 2026-08-24)
+var PN=""" + json.dumps(dict(_PANE_ORDER)) + """;   // key → rail label, from _PANE_ORDER (one list with the rail, the tabs and the drop row); timeline key stays internal — the pane outgrew the name (filter, tags, lane controls — the user 2026-08-24)
 window.addEventListener('message',function(e){var m=e&&e.data;if(!m||m.romp!=='wsState')return;
 var s=(m.state==='up')?'up':'down',prev=st[m.app];st[m.app]=s;
 if(s==='down'&&prev!=='down'&&shown(m.app))
@@ -33205,16 +33255,6 @@ _REFRESH_SVG = (
     # the arrowhead must READ at 18px (the user 2026-07-27: the first cut's ~3px triangle was invisible) —
     # a 4.4-wide, 3.4-deep triangle straddling the arc's end point, pointing along its clockwise tangent
     "<path d='M9.5 5.4 L11.7 1.6 L13.5 5.2 Z' fill='currentColor'/></svg>")
-
-
-# THE pane presentation order (the user 2026-08-30: mobile must list the panes in the desktop
-# order — "mobile is a re-layout of the desktop, never a re-ordering"). This list is the desktop
-# rail strip's left-to-right order, which is the user's own choice (2026-07-05) and the desktop's
-# actual visible LIST of the named panes (the column layout cannot express it: Sessions/timeline
-# is a band, not a column). BOTH the desktop rail buttons and the mobile #mtabs buttons render
-# from this one constant — reorder here and both surfaces move together; a second hardcoded list
-# is the bug this replaces. Keys stay internal (timeline/fleet); labels are the user-facing names.
-_PANE_ORDER = (("chat", "Chat"), ("timeline", "Sessions"), ("fleet", "Outline"), ("feed", "Feed"))
 
 
 def _rail_buttons_html():
@@ -36240,23 +36280,20 @@ class Handler(BaseHTTPRequestHandler):
             if _set_auto_nudge(bool(msg["enabled"]), gt=_gesture_ms(msg)) is not None:
                 # turn-ON acts at once instead of waiting out the pusher's 0.5 s backstop; turning off
                 # has nothing to act on (the tick is a no-op when off, so this also spares the WS
-                # thread the listing fork). The tick is single-flight against the pusher's pass
-                # (_AUTO_NUDGE_TICK_LOCK) and skips the dead-wait sweep: the death transition has ONE
-                # observer (the pusher's tick; see _auto_nudge_tick), and this WS thread racing its
-                # prev-swap could spend a transition uncorroborated
+                # thread the listing fork). The single-flight rule, the dead-wait sweep skip and the
+                # try/except that keeps a failing tick from reading as a socket failure are all
+                # _ws_act_now_tick's; the stale reply below stays outside it (a real client write)
                 if msg["enabled"]:
-                    _auto_nudge_tick(int(time.time()), _tmux_sessions(), run_dead_wait=False)
+                    _ws_act_now_tick()
             else:
                 _tell_stale_gesture(client, msg)
         elif msg and msg.get("type") == "setCompactSuggest" and msg.get("enabled") is not None:
             # T208 opt-in — kernel-side like autoNudge, gt-gated like every queued setting. Only a
-            # real apply acts at once on turn-on (instead of waiting out the pusher's 0.5 s backstop;
-            # single-flight against its pass, _AUTO_NUDGE_TICK_LOCK) — a stood-down toggle is not
-            # new information — and the tick skips the dead-wait sweep: the death transition has
-            # ONE observer (the pusher's tick; see _auto_nudge_tick), and this WS thread racing
-            # its prev-swap could spend a transition uncorroborated
+            # real apply acts at once on turn-on (instead of waiting out the pusher's 0.5 s backstop)
+            # — a stood-down toggle is not new information — through the same wrap as setAutoNudge
+            # (_ws_act_now_tick: single-flight, no dead-wait sweep, a failure logged not raised)
             if _set_compact_suggest(bool(msg["enabled"]), gt=_gesture_ms(msg)) is not None:
-                _auto_nudge_tick(int(time.time()), _tmux_sessions(), run_dead_wait=False)
+                _ws_act_now_tick()
             else:
                 _tell_stale_gesture(client, msg)
         elif msg and msg.get("type") == "setUpdateMode" and msg.get("mode") in _UPDATE_MODES:
