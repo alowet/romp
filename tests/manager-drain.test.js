@@ -319,8 +319,10 @@ test('the park records drain evidence and the backstop line names it (source pin
   const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'romp-manager'), 'utf8');
   assert.match(src, /drainRefusedCount/, 'the park counts refusals, never latching one bit');
   assert.match(src, /drainArmedCount/, 'the park counts arms, so a transient refusal reads true');
-  assert.ok(src.includes("fetchBusy(KERNEL_PORT, cb, '/busy?drain=1')"),
-    'the parked poll still binds the drain-refresh spelling of the probe');
+  assert.ok(src.includes("fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1' : '/busy')"),
+    'the parked poll still binds the drain-refresh spelling of the probe — while a turn is in flight (T240)');
   assert.match(src, /never armed/, 'the backstop apply line can still say the hold never armed');
   assert.match(src, /resetDrainNotices\(\)/, 'a fresh park re-arms the once-per-episode notices');
+  assert.ok(src.includes('if (draining === false && park.lastAsked) {'),
+    'only a poll that ASKED for the hold can record a refusal — a plain /busy answers draining:false by construction (T240)');
 });

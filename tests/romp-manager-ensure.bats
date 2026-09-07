@@ -259,3 +259,63 @@ PYEOF
     [ "$(grep -c spawn "$SPAWNS")" -eq 2 ]
     curl -fsS -X POST "http://127.0.0.1:$CPORT/stop" >/dev/null 2>&1 || true
 }
+
+@test "quiet-mode refresh defers on background work too, and asks for the drain hold only while turns are in flight" {
+    # T240: a session running a Workflow has no turn in flight between its own turns, so a quiet
+    # deploy applied instantly over it. The kernel now reports {busy, inflight, background}; the
+    # manager defers on either kind of busyness, but asks for the box-wide hold on NEW turn starts
+    # (/busy?drain=1) only while a turn is actually in flight — background work must never freeze
+    # other sessions' queued prompts.
+    command -v node >/dev/null 2>&1 || skip "node not available"
+    command -v python3 >/dev/null 2>&1 || skip "python3 not available"
+
+    local INF="$TEST_DIR/inflight" BG="$TEST_DIR/background" SPAWNS="$TEST_DIR/spawns" REQS="$TEST_DIR/reqs" FAKEK="$TEST_DIR/fake-kernel"
+    echo 0 > "$INF"; echo 1 > "$BG"; : > "$REQS"
+    cat > "$FAKEK" <<'PYEOF'
+#!/usr/bin/env python3
+import http.server, json, os
+with open(os.environ["SPAWN_LOG"], "a") as f:
+    f.write("spawn\n")
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(os.environ["REQ_LOG"], "a") as f:
+            f.write(self.path + "\n")
+        def rd(k):
+            try: return int(open(os.environ[k]).read().strip())
+            except Exception: return 0
+        i, g = rd("INF_FILE"), rd("BG_FILE")
+        b = json.dumps({"busy": i + g, "inflight": i, "background": g, "draining": False}).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers()
+        self.wfile.write(b)
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(os.environ["ROMP_SERVE_PORT"])), H).serve_forever()
+PYEOF
+    chmod +x "$FAKEK"
+
+    # 500 ms polls: a local answer always lands before the NEXT poll is issued, so "the first poll
+    # asks, no later poll does" cannot race on a slow CI box (review find)
+    env INF_FILE="$INF" BG_FILE="$BG" REQ_LOG="$REQS" SPAWN_LOG="$SPAWNS" ROMP_QUIET_POLL_MS=500 \
+        ROMP_MANAGER_PORT=$CPORT ROMP_SERVE_PORT=$MPORT ROMP_SERVE_BIN="$FAKEK" \
+        node "$MGR" up >/dev/null 2>&1 &
+    MGR_PID=$!
+    local i
+    for i in $(seq 1 50); do
+        curl -fsS "http://127.0.0.1:$CPORT/status" >/dev/null 2>&1 && [ -s "$SPAWNS" ] && break
+        sleep 0.1
+    done
+    [ "$(grep -c spawn "$SPAWNS")" -eq 1 ]
+
+    run curl -fsS -X POST "http://127.0.0.1:$CPORT/restart-all?when=quiet"
+    [[ "$output" == *'"deferred":true'* ]]
+    sleep 2.2
+    [ "$(grep -c spawn "$SPAWNS")" -eq 1 ]                    # background work alone DEFERS the restart
+    # the first poll asks for the hold (it knows nothing yet); every later poll, seeing 0 in flight,
+    # must not — the hold would freeze other sessions' queued prompts for nothing
+    [ "$(grep -c 'drain=1' "$REQS")" -le 1 ]
+    [ "$(grep -c '^/busy' "$REQS")" -ge 3 ]
+
+    echo 0 > "$BG"
+    for i in $(seq 1 60); do [ "$(grep -c spawn "$SPAWNS")" -ge 2 ] && break; sleep 0.1; done
+    [ "$(grep -c spawn "$SPAWNS")" -eq 2 ]                    # the work ended → the quiet event applies
+    curl -fsS -X POST "http://127.0.0.1:$CPORT/stop" >/dev/null 2>&1 || true
+}

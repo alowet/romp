@@ -5633,15 +5633,32 @@ class SdkBackend:
         run (the user 2026-07-28)."""
         return not self._sdk_missing
 
-    def busy_count(self) -> int:
-        """How many SDK sessions have a turn IN FLIGHT right now — the manager's quiet-window gate
-        for deferred deploy restarts (the kernel's /busy route). Authoritative: the same per-session
-        inflight counter the drain uses to count the turns a restart would cut. Queued-but-unstarted
-        turns don't count — the persisted queue survives a bounce losslessly; only an in-flight turn
-        gets interrupted."""
+    def busy_breakdown(self):
+        """(in-flight, background): how many SDK sessions have a turn IN FLIGHT, and how many OTHERS
+        have live BACKGROUND WORK — a Workflow run, a background agent or shell (_bg_tasks / _subagents)
+        — with no turn in flight between their own turns. Each session is counted once, in-flight
+        first. Background work counted nowhere was how a quiet deploy applied instantly over live
+        Workflow runs and killed them (T240: eight review runs lost in one night). Queued-but-
+        unstarted turns still don't count — the persisted queue survives a bounce losslessly."""
         with self._lock:
             sessions = list(self.sessions.values())
-        return sum(1 for s in sessions if s.inflight and not s.ended)
+        inflight = background = 0
+        for s in sessions:
+            if s.ended:
+                continue
+            if s.inflight:
+                inflight += 1
+            elif s._bg_tasks or s._subagents:
+                background += 1
+        return inflight, background
+
+    def busy_count(self) -> int:
+        """How many SDK sessions a restart would DISRUPT right now — a turn in flight OR live
+        background work (see busy_breakdown) — the manager's quiet-window gate for deferred deploy
+        restarts (the kernel's /busy route). Authoritative: the same per-session counters the drain
+        and the task stream keep."""
+        inflight, background = self.busy_breakdown()
+        return inflight + background
 
     # ── deploy-drain hold (T121 part 1) ─────────────────────────────────────
     # While a quiet deploy restart is PARKED at the manager, this kernel holds NEW turn starts so
@@ -5662,8 +5679,13 @@ class SdkBackend:
         now = time.time()
         with self._lock:
             first = self._drain_hold_until <= now
+            # a NEW episode, not a flap: the manager now drops the hold during background-only
+            # stretches and re-arms it when a turn starts (T240), so a lease that lapsed moments ago
+            # is the same park — its 5-minute ring and its "parked" line must not restart per flap
+            new_episode = first and (self._drain_hold_since == 0.0
+                                     or now - self._drain_hold_until > 2 * self.DRAIN_HOLD_TTL)
             self._drain_hold_until = now + self.DRAIN_HOLD_TTL
-            if first:
+            if new_episode:
                 self._drain_hold_since = now
                 self._drain_hold_rang = False
             t = self._drain_wake_timer
@@ -5673,17 +5695,17 @@ class SdkBackend:
         if t is not None:
             t.cancel()
         nt.start()
-        if first:
-            self._log("deploy restart parked: draining — %d in-flight turn(s); new turn starts held "
-                      "until this box quiets (queued prompts persist and start after the bounce)"
-                      % self.busy_count())
+        if new_episode:
+            self._log("deploy restart parked: draining — %d in-flight turn(s), %d session(s) with background "
+                      "work; new turn starts held until this box quiets (queued prompts persist and "
+                      "start after the bounce)" % self.busy_breakdown())
         elif now - self._drain_hold_since > self.DRAIN_LOUD_S and not self._drain_hold_rang:
             with self._lock:
                 self._drain_hold_rang = True
-            self._log("deploy restart still parked after %d min — %d in-flight turn(s) have not "
-                      "finished; new turn starts remain held (the manager's backstop will apply "
-                      "the restart regardless)" % (int((now - self._drain_hold_since) / 60),
-                                                   self.busy_count()), problem=True)
+            self._log("deploy restart still parked after %d min — %d in-flight turn(s), %d session(s) with "
+                      "background work have not finished; new turn starts remain held (the manager's "
+                      "backstop will apply the restart regardless)"
+                      % ((int((now - self._drain_hold_since) / 60),) + self.busy_breakdown()), problem=True)
 
     def drain_holding(self) -> bool:
         """Whether new turn starts are currently held for a parked deploy restart."""

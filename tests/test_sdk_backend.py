@@ -4304,6 +4304,28 @@ class LiveSubagentsRetire(unittest.TestCase):
             e["startedAt"] = 2
         return e
 
+    def test_background_work_counts_as_busy_for_the_quiet_gate(self):
+        # T240: busy_count counted only in-flight turns, so a quiet deploy applied INSTANTLY over a
+        # session running a Workflow (no turn in flight between its own turns) and killed it — eight
+        # review runs lost in one night. Background work makes the session busy; the breakdown is
+        # separate so the manager can hold new turn starts only for turns that are actually in flight.
+        s = self._sess()
+        be = s.backend
+        be.sessions[s.sid] = s
+        self.assertEqual(be.busy_breakdown(), (0, 0))
+        self.assertEqual(be.busy_count(), 0)
+        s._on_task_event("task_started", {"task_id": "w1", "task_type": "local_workflow"})
+        self.assertEqual(be.busy_breakdown(), (0, 1), "a live workflow with no turn in flight is background work")
+        self.assertEqual(be.busy_count(), 1)
+        s._on_task_event("task_notification", {"task_id": "w1", "status": "completed"})
+        self.assertEqual(be.busy_breakdown(), (0, 0), "ended → not busy")
+        self.assertEqual(be.busy_count(), 0)
+        self._start(s, "a1")
+        self.assertEqual(be.busy_breakdown(), (0, 1), "a live background agent counts the same way")
+        s.inflight = 1
+        self.assertEqual(be.busy_breakdown(), (1, 0), "a session is counted ONCE — in flight wins")
+        self.assertEqual(be.busy_count(), 1)
+
     def test_a_failed_workflow_agent_retires_on_the_runs_progress_list(self):
         """The shape the probe recorded: the run's task_progress re-ships the whole per-agent list on every
         state change; the failed agent's slot flips to "error" with no SubagentStop ever following."""

@@ -317,10 +317,14 @@ function restartAllOrSelf() {
 // Pure decision (time injected → unit-testable). `st` = {since}; `busy` = the kernel's in-flight
 // SDK turn count, or null when the kernel is unreachable — a kernel that isn't answering has no
 // turns a restart could cut, so unreachable counts as quiet.
-function quietGate(st, busy, now, opts) {
+function quietGate(st, busy, now, opts, bd) {
   if (busy === null || busy === 0) return { action: 'apply', reason: busy === null ? 'kernel unreachable' : 'quiet' };
   if (now - st.since >= opts.maxDeferMs) return { action: 'apply', reason: 'backstop cap' };
-  return { action: 'wait', reason: `${busy} turn(s) in flight` };
+  // T240: `busy` counts sessions with a turn in flight OR live background work (a Workflow run, a
+  // background agent) — either kind defers the restart; the breakdown says which
+  const why = bd ? `${bd.inflight} turn(s) in flight, ${bd.background} session(s) with background work`
+                 : `${busy} turn(s) in flight`;
+  return { action: 'wait', reason: why };
 }
 
 let pendingQuiet = null;   // {since, count, mode:'all'|<kernel id>, timer, drainRefusedCount, drainArmedCount, drainRefusedAfterArm}
@@ -382,11 +386,14 @@ function fetchBusy(port, cb, path) {
   const req = http.get({ host: HOST, port, path: path || '/busy', timeout: 2000, headers }, (res) => {
     let b = ''; res.on('data', (d) => (b += d));
     res.on('end', () => {
-      let n = null, draining = null;
+      let n = null, draining = null, bd = null;
       try {
         const j = JSON.parse(b);
         n = Number.isFinite(j.busy) ? j.busy : null;
         draining = typeof j.draining === 'boolean' ? j.draining : null;
+        // the breakdown (T240); an older kernel reports only `busy`, which then all counts as in flight
+        if (n !== null) bd = { inflight: Number.isFinite(j.inflight) ? j.inflight : n,
+                               background: Number.isFinite(j.background) ? j.background : 0 };
       } catch { n = null; }
       if (wantDrain && n !== null && draining === false && !drainNoticed) {
         drainNoticed = true;
@@ -398,11 +405,11 @@ function fetchBusy(port, cb, path) {
         drainNoticed = false;
         log('kernel armed the drain hold after the refusal above — new turn starts are held from here');
       }
-      cb(n, draining);
+      cb(n, draining, bd);
     });
   });
-  req.on('timeout', () => { req.destroy(); cb(null, null); });
-  req.on('error', () => cb(null, null));
+  req.on('timeout', () => { req.destroy(); cb(null, null, null); });
+  req.on('error', () => cb(null, null, null));
 }
 
 function clearPendingQuiet() {
@@ -434,7 +441,7 @@ function quietTick(deps) {
   if (!park) return;                      // an immediate restart satisfied it meanwhile
   schedule();                             // schedule-first: the chain outlives any probe failure
   let acted = false;
-  fetchBusy((busy) => {
+  fetchBusy((busy, bd) => {
     if (acted) return;
     acted = true;
     const cur = pending();
@@ -444,7 +451,7 @@ function quietTick(deps) {
       return;
     }
     try {
-      const g = quietGate(park, busy, now(), opts);
+      const g = quietGate(park, busy, now(), opts, bd);
       if (g.action === 'apply') apply(g);
     } catch (e) {
       log(`quiet-window evaluation failed (${e && e.message}) — the pending refresh stays queued`);
@@ -473,9 +480,15 @@ function queueQuietRestart(mode) {
       // reads fresh per poll, so a refusal can be transient (a token restored mid-park arms every
       // later poll), and the apply line below renders what this park's counts actually show.
       const park = pendingQuiet;
-      const cb = (busy, draining) => {
+      const cb = (busy, draining, bd) => {
         if (park && busy !== null) {
-          if (draining === false) {
+          // T240: remember whether any TURN is in flight — the drain hold (new turn starts held
+          // box-wide) is asked for only while one is; background-only busyness defers the restart
+          // without freezing other sessions' queued prompts for up to the backstop
+          park.lastInflight = bd ? bd.inflight : busy;
+          // a plain /busy poll (no hold asked) answers draining:false by construction — that is not
+          // a REFUSAL, and counting it as one made the backstop line blame a lost hold (review find)
+          if (draining === false && park.lastAsked) {
             park.drainRefusedCount++;
             // ORDER matters for the apply line (T227): two bare counters cannot tell "refused, then
             // armed" from "armed, then LOST" — a refusal that lands AFTER any arm is the loss, and
@@ -484,9 +497,13 @@ function queueQuietRestart(mode) {
             if (park.drainArmedCount > 0) park.drainRefusedAfterArm++;
           } else if (draining === true) park.drainArmedCount++;
         }
-        done(busy);
+        done(busy, bd);
       };
-      fetchBusy(KERNEL_PORT, cb, '/busy?drain=1');   // parked → hold new turn starts (T121)
+      // parked → hold new turn starts (T121) — but only while a turn is actually in flight (T240);
+      // the first poll, knowing nothing yet, asks for the hold as before
+      const holdTurns = park.lastInflight === undefined || park.lastInflight > 0;
+      park.lastAsked = holdTurns;            // what THIS poll asked for — the answer's refusal test reads it
+      fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1' : '/busy');
     },
     now: Date.now,
     opts: { maxDeferMs: QUIET_MAX_DEFER_MS },
