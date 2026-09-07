@@ -17611,15 +17611,23 @@ def _awaiting_live_rows(sid, path, live):
         agents.append(it)
     tasks = _bg_live_norm(sid, path)
     pending = _bg_pending(sid, path, tasks) if tasks else []
+    pending_tids = {t.get("tid") for t in pending}
     meta = None   # the subagents sidecar map, read once and only if an agent launch lacks its agentId
-    for t in pending:
-        # Sources 0.5/0.75 — only the PENDING tasks (launch not yet placed) count; a placed launch's
-        # story belongs to the judge's verdicts (see the docstring's 0.5 entry for the full rule).
-        # A dispatched agent/workflow is an AGENT row even through the task stream; a shell command or
-        # a Monitor is a COMMAND row. No collapse: two kinds present read as two groups, never "task".
+    for t in tasks:
+        # Sources 0.5/0.75 — a NEW row is added only for a PENDING task (launch not yet placed); a placed
+        # launch's story belongs to the judge's verdicts (see the docstring's 0.5 entry for the full
+        # rule). But the hook⋈stream JOIN runs over EVERY live agent task: once the judge places the
+        # launch turn (the ordinary idle-awaiting steady state) the launch left `pending`, the hook row
+        # never met its stream twin, and the row flapped between the hook's shape (id = agentId, label =
+        # the agent type) and the launch's (id = tid, label = the description) at each placement
+        # (review find on #938, 2026-09-07). A dispatched agent/workflow is an AGENT row even through the
+        # task stream; a shell command or a Monitor is a COMMAND row. No collapse: two kinds present read
+        # as two groups, never "task".
+        is_pending = t.get("tid") in pending_tids
         is_agent = _bg_is_agent(t.get("type"))
         if not is_agent:
-            commands.append(_awaiting_item("commands", t.get("tid") or "", t.get("desc") or "background command", t.get("t")))
+            if is_pending:
+                commands.append(_awaiting_item("commands", t.get("tid") or "", t.get("desc") or "background command", t.get("t")))
             continue
         aid = t.get("agentId")
         if not aid and path and t.get("tid"):
@@ -17636,7 +17644,8 @@ def _awaiting_live_rows(sid, path, live):
             if t.get("t") and (not hit.get("since") or int(t["t"]) < hit["since"]):
                 hit["since"] = int(t["t"])
             continue
-        agents.append(_awaiting_item("agents", t.get("tid") or "", t.get("desc") or "background agent", t.get("t"), agent_id=aid))
+        if is_pending:   # unmatched by the hook set: a new row only while its launch is still unplaced
+            agents.append(_awaiting_item("agents", t.get("tid") or "", t.get("desc") or "background agent", t.get("t"), agent_id=aid))
     # Source 0.9 — ARMED KERNEL WATCHES this session registered (`romp watch --cmd` / `romp watch-pr`):
     # kernel-owned and restart-proof like the rows themselves, event-true at both ends (armed at
     # registration, cleared when the predicate fires or the watch cancels/times out). The user's rule

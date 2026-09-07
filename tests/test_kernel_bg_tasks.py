@@ -516,6 +516,23 @@ class OneRowPerAgentAcrossTheHookAndTheStream(unittest.TestCase):
     def _snap(self, subs, tasks):
         km._tmux_sessions = lambda: {self.SID: {"subagents": subs, "bgTasks": tasks}}
 
+    def test_a_placed_launch_still_joins_its_hook_row(self):
+        # the ordinary idle-awaiting steady state: the judge has PLACED the launch turn, so the launch is
+        # no longer pending — the hook row must still meet its stream twin (one row, the launch's id and
+        # description), not flap back to {id: agentId, label: agent type} (review find on #938, 2026-09-07)
+        km._bg_pending = lambda sid, path, tasks: []          # everything placed
+        self._snap([{"type": "general-purpose", "since": 100, "agentId": self.A1}],
+                   [{"toolUseId": "toolu_01", "taskId": self.A1, "type": "local_agent", "since": 98,
+                     "desc": "Running Check the exporter for banned words", "lastTool": ""},
+                    {"toolUseId": "toolu_03", "taskId": "b3333", "type": "local_bash", "since": 110,
+                     "desc": "build the docs site", "lastTool": ""}])
+        aw = km._session_awaiting(self.SID, None, True)
+        self.assertEqual(aw["count"], 1, "the placed command adds no row; the hook agent is one joined row: %r" % aw["items"])
+        it = aw["items"][0]
+        self.assertEqual((it["kind"], it["id"], it["label"], it.get("agentId"), it["since"]),
+                         ("agents", "toolu_01", "Check the exporter for banned words", self.A1, 98),
+                         "joined over EVERY live agent task, not only the pending ones")
+
     def test_two_agents_seen_by_both_sources_and_a_shell_command_are_three_rows(self):
         # the live defect, reproduced on the REAL _bg_live_norm: hook rows (type-labelled) + stream rows
         # (the same two agents, the CLI's "Running <description>" wording, toolUseIds) + one shell task
