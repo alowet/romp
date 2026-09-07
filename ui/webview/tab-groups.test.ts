@@ -1322,7 +1322,8 @@ test("executed: prunePinned drops the pins of tags and sessions that no longer e
   // session still exists); the plan reads pins and never rewrites them — a prune per render could act
   // on a transient frame (a views blob mid-write, a host's tags not yet arrived) and put a tab away
   assert.equal(RENDER.split("prunePinned(").length - 1, 1, "one call site");
-  assert.match(RENDER, /writeTabGroups\(prunePinned\(togglePinned\(tabGroups\(\), sec, id\), unionFor\(\), knownTabIds\(\), reachableHosts\(\)\)\); build\(\);/);
+  assert.match(RENDER, /writeTabGroups\(prunePinned\(setPinned\(tabGroups\(\), sec, id, !on\), unionFor\(\), knownTabIds\(\), reachableHosts\(\)\)\); build\(\);/,
+    "the row SETS the state it rendered (!on) — a toggle would flip whatever a re-render stored between the render and the click");
   assert.match(RENDER, /function knownTabIds\(\): Set<string> \{ return new Set<string>\(\[\.\.\.order, \.\.\.tabMeta\.keys\(\)\]\); \}/);
   const TG = ui("webview", "tab-groups.ts");
   const plan = TG.slice(TG.indexOf("export function planStrip("), TG.indexOf("export function reorderTagOrder("));
@@ -1458,7 +1459,7 @@ test("the toggle is a row in the tab menu's Tags flyout beside the Move-to rows:
   assert.match(pin, /lb\.textContent = "Show when folded";/);
   assert.match(pin, /sb2\.textContent = on \? `stays on the strip while \$\{home\.name\} is folded` : `keep this tab on the strip while \$\{home\.name\} is folded`;/,
     "the copy speaks of the home section alone — and the write is per section, so it is the whole truth");
-  assert.match(pin, /writeTabGroups\(prunePinned\(togglePinned\(tabGroups\(\), sec, id\), unionFor\(\), knownTabIds\(\), reachableHosts\(\)\)\); build\(\);/,
+  assert.match(pin, /writeTabGroups\(prunePinned\(setPinned\(tabGroups\(\), sec, id, !on\), unionFor\(\), knownTabIds\(\), reachableHosts\(\)\)\); build\(\);/,
     "the write prunes, notifies (TABGROUPS_EVENT → renderTabs) and the flyout repaints its ✓ — no renderTabs() call of its own");
   assert.doesNotMatch(pin, /renderTabs\(\)|setTimeout/);
   // every store read on a path that WRITES passes the unions, so an entry in the earlier shape is migrated

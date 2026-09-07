@@ -31,7 +31,7 @@ import { isClearCmd, openTopTitles, clearConfirmDetail, endConfirmDetail } from 
 import { prebuildPlan, type ViewState } from "./prebuild";
 import { reconcileTabOrder } from "./tab-order";
 import { writeViewOrder } from "./view-order";
-import { planStrip, readTabGroups, writeTabGroups, setSectionCollapsed, sectionRef, isPinned, togglePinned, prunePinned, reachableFrom, headWords,
+import { planStrip, readTabGroups, writeTabGroups, setSectionCollapsed, sectionRef, isPinned, setPinned, prunePinned, reachableFrom, headWords,
          followAdoption, reorderTagOrder, TABGROUPS_KEY, TABGROUPS_EVENT, type TabSection } from "./tab-groups";
 import { tabStateClass, sectionPip, sectionPipMembers, sectionPipTitle } from "./tab-state";
 import { titleWithKey, chordOf, effectiveChord, loadOverrides } from "./keybindings";
@@ -5956,7 +5956,8 @@ function showTabMenu(e: MouseEvent, id: string) {
           sb2.textContent = on ? `stays on the strip while ${home.name} is folded` : `keep this tab on the strip while ${home.name} is folded`;
           bodyE.appendChild(sb2);
           row.appendChild(bodyE);
-          row.addEventListener("click", (e2) => { e2.stopPropagation(); writeTabGroups(prunePinned(togglePinned(tabGroups(), sec, id), unionFor(), knownTabIds(), reachableHosts())); build(); });
+          // the click SETS the state this row showed (!on): a toggle would flip whatever a re-render stored between the render and the click
+          row.addEventListener("click", (e2) => { e2.stopPropagation(); writeTabGroups(prunePinned(setPinned(tabGroups(), sec, id, !on), unionFor(), knownTabIds(), reachableHosts())); build(); });
           sub.appendChild(row);
         }
         if (holding().length || others.length) sub.appendChild(el("div", "ctx-sep"));
