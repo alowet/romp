@@ -1,0 +1,37 @@
+name: PR tier
+
+# Every PR carries exactly one tier label: tests-only, fix, feature or
+# major-feature. The tier says who merges it and after what review, so a PR
+# with no label has not been sorted yet and a PR with two has been sorted two
+# ways; this check fails in both cases and passes otherwise.
+#
+# It reads the labels from the event payload and nothing else: no checkout,
+# no token use, no third-party action, so a PR from a fork can run it safely.
+# It re-runs when the labels change, and on every push to the PR, so the
+# status on the PR is always about the labels it carries now. Making it a
+# REQUIRED check on main is a branch-ruleset setting in the repository
+# settings, which is the maintainers' call, not something this file can do.
+
+on:
+  pull_request:
+    types: [opened, reopened, labeled, unlabeled, synchronize, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  tier:
+    name: Exactly one tier label
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Count the tier labels on this PR
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          count=$(jq '[.[] | select(. == "tests-only" or . == "fix" or . == "feature" or . == "major-feature")] | length' <<<"$LABELS")
+          if [ "$count" -eq 1 ]; then
+            exit 0
+          fi
+          echo "::error::This PR carries $count tier labels; exactly one is required: tests-only, fix, feature or major-feature."
+          exit 1
