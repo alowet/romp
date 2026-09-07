@@ -102,7 +102,10 @@ test("an oversize PDF's tab is not a dead end, and the listing marks such a file
   assert.match(KERNEL, /if not head and mime == "application\/pdf" and self\._is_navigation\(\):/);
   assert.match(KERNEL, /return self\._send\(413, _too_large_page\(msg, os\.path\.basename\(fp\), q\), "text\/html; charset=utf-8",/);
   assert.match(KERNEL, /def _is_navigation\(self\):/);
-  assert.match(KERNEL, /\.get\("Sec-Fetch-Dest"\) or ""\)\.strip\(\)\.lower\(\) == "document"/);
+  assert.match(KERNEL, /dest = \(h\.get\("Sec-Fetch-Dest"\) or ""\)\.strip\(\)\.lower\(\)/);
+  assert.match(KERNEL, /return dest in \("document", "iframe"\)/, "a navigation OR the lightbox iframe gets the page");
+  // Fetch Metadata is sent only to trustworthy origins: on plain http the Accept header decides
+  assert.match(KERNEL, /return "text\/html" in \(h\.get\("Accept"\) or ""\)\.lower\(\)/);
   assert.match(KERNEL, /def _too_large_page\(msg, name, q, route="\/file"\):/);
   // the relay: an error verdict is prose (text/plain), and an oversize remote PDF's tab gets the page too
   assert.match(KERNEL, /route="\/remote\/%s\/file" % quote\(host, safe=""\)/);

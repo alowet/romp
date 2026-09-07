@@ -36632,8 +36632,9 @@ class Handler(BaseHTTPRequestHandler):
                 # inside the click — so an oversize one lands its whole tab on this refusal, with no viewer
                 # around it to offer the Download button the in-pane path used to (review find). A refusal
                 # to RENDER is never a dead end: the tab itself gets the sentence and the way out — a link to
-                # the download half of this very route. Only a top-level navigation (Sec-Fetch-Dest:
-                # document) gets the page; the viewer's fetch and the card's HEAD probe keep the plain text
+                # the download half of this very route. Only a request that will be SHOWN (a navigation,
+                # or the lightbox's <iframe> fallback — _is_navigation) gets the page; the viewer's fetch
+                # and the card's HEAD probe keep the plain text
                 # they parse. Static markup, every value escaped, no script — nosniff rides as always.
                 return self._send(413, _too_large_page(msg, os.path.basename(fp), q), "text/html; charset=utf-8",
                                   cache="no-cache")
@@ -36718,10 +36719,20 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, raw, mime, cache="no-cache", headers=extra)
 
     def _is_navigation(self):
-        """Is this request a browser NAVIGATING a tab to the URL (Sec-Fetch-Dest: document), as opposed to
-        a fetch, an <img>/<iframe> load or a HEAD probe? Every current browser sends the header on
-        same-origin requests; its absence reads as "not a navigation", the conservative answer."""
-        return ((getattr(self, "headers", None) or {}).get("Sec-Fetch-Dest") or "").strip().lower() == "document"
+        """Is this request going to be SHOWN as a page — a browser navigating a tab to the URL
+        (Sec-Fetch-Dest: document) or loading it into an <iframe> (the PDF card's lightbox fallback when
+        the popup is blocked) — as opposed to a fetch, an <img> load or a HEAD probe that parses the plain
+        text? Browsers attach the Sec-Fetch-* headers only to potentially trustworthy origins (https,
+        localhost); a dashboard reached over plain http on a LAN or through an http proxy sends none, and
+        reading that as "not a navigation" left the oversize-PDF tab on the bare text with no way out
+        (review find on #959, 2026-09-07). Without the header the Accept header decides: a navigation or
+        an iframe asks for text/html first, a fetch() sends */*. Absent both, "not a navigation" — the
+        conservative answer, the plain text the viewer's catch parses."""
+        h = getattr(self, "headers", None) or {}
+        dest = (h.get("Sec-Fetch-Dest") or "").strip().lower()
+        if dest:
+            return dest in ("document", "iframe")
+        return "text/html" in (h.get("Accept") or "").lower()
 
     def _file_download(self, fp, head=False):
         """GET/HEAD /file?download=1 — the SAVE half of the route (the user 2026-08-09): any file that

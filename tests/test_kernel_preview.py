@@ -133,6 +133,21 @@ class FilePreviewEndpoint(unittest.TestCase):
             self.assertTrue(body.startswith(b"too large to show:"), body[:40])
             code, hdrs, body = self._req(qp, method="HEAD", headers={"Sec-Fetch-Dest": "document"})
             self.assertEqual((code, body), (413, b""), "a HEAD carries the verdict, never a page")
+            # the lightbox's <iframe> fallback (popup blocked) is shown too, so it gets the page as well
+            code, hdrs, body = self._req(qp, headers={"Sec-Fetch-Dest": "iframe"})
+            self.assertEqual(code, 413)
+            self.assertTrue(hdrs.get("Content-Type", "").startswith("text/html"), "an iframe load is shown, not parsed")
+            self.assertIn('href="' + km._html_esc("/file?" + dq) + '"', body.decode("utf-8"))
+            # Fetch Metadata rides only to trustworthy origins (https, localhost): a dashboard on plain http
+            # sends no Sec-Fetch-Dest, so the Accept header decides — a navigation asks for text/html first
+            # (review find on #959, 2026-09-07), a fetch() sends */* and keeps the text
+            code, hdrs, body = self._req(qp, headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
+            self.assertEqual(code, 413)
+            self.assertTrue(hdrs.get("Content-Type", "").startswith("text/html"), "no Sec-Fetch-Dest, Accept text/html → the page")
+            code, hdrs, body = self._req(qp, headers={"Accept": "*/*"})
+            self.assertEqual((code, hdrs.get("Content-Type")), (413, "text/plain"), "a fetch() keeps the text")
+            code, hdrs, body = self._req(qp, headers={"Sec-Fetch-Dest": "empty", "Accept": "text/html"})
+            self.assertEqual((code, hdrs.get("Content-Type")), (413, "text/plain"), "a present non-shown dest wins over Accept")
             # an oversize IMAGE navigated to keeps the text — only a PDF opens in its own tab
             bigpng = os.path.join(self.tmp.name, "huge.png")
             with open(bigpng, "wb") as f:
