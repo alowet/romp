@@ -129,6 +129,16 @@ class FakeBox implements CaretBox {
   dispatchEvent(event: Event): boolean { this.events.push(event); return true; }
 }
 
+test("insertAtCaret prefers the browser's editing command on the focused box, so the paste is an undo step", () => {
+  // Chromium records setRangeText as a programmatic change (no undo step; the box's undo history dies);
+  // execCommand("insertText") is an editing command (review fold on #939, 2026-09-07). Source pin: the
+  // renderer has no DOM harness, and node has no document, so the fallback path is what the fake box tests.
+  const SRC = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "composer-insert.ts"), "utf8");
+  assert.match(SRC, /\(box as unknown\) === document\.activeElement/, "only the FOCUSED box takes the editing command");
+  assert.match(SRC, /document\.execCommand\("insertText", false, text\)\) return;/, "…and it returns: the command fires input itself");
+  assert.ok(SRC.indexOf('document.execCommand("insertText"') < SRC.indexOf("box.setRangeText("), "the programmatic path is the fallback");
+});
+
 test("insertAtCaret puts the text at the caret and leaves the caret after it", () => {
   const box = new FakeBox("hello world", 5);
   insertAtCaret(box, ", dictated");
