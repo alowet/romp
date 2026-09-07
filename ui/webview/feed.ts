@@ -24,7 +24,7 @@ import { initStrip } from "./strip";
 import { installSettingsSync, loadSettings, onExternalSettingsChange } from "./settings";
 import { applyTheme } from "./theme";
 import { canPreview } from "./preview";
-import { initFileView } from "./file-view";
+import { initFileView, setFileViewIdentity, hostStub } from "./file-view";
 import { initFileBrowse, openFileBrowse } from "./file-browse";
 import { VIEW_STATE_KEY, parseViewState, serializeViewState, pruneViewState, capViewState, type FeedViewState } from "./feed-view-state";
 import { wireTip, setTip, pruneTip } from "./tip";
@@ -5406,6 +5406,14 @@ setInterval(() => {
 }, 15000);
 
 initFileView((m) => vscodeApi?.postMessage(m));   // the file browser opens the viewer in this pane (and saves ride the poster)
+// …and how the viewer names the session a file was opened from: this pane's session list (the same tab
+// set the chat has, relayed per frame, dormant sessions included), else a card carrying the session's
+// name and colour — never sessionColors, which is keyed by NAME; a sid neither knows falls to the
+// kernel's 8-character stub.
+setFileViewIdentity((id) => {
+  const s = sessionsMeta.find((x) => x.sid === id) ?? asks.find((a) => a.sid === id);
+  return s && s.name ? { name: s.name, color: s.color ?? null } : hostStub(id);
+});
 initFileBrowse((m) => vscodeApi?.postMessage(m));   // …and a Browse files ask lands its sibling overlay
 
 vscodeApi?.postMessage({ type: "ready" });

@@ -15,7 +15,7 @@ const FEED = read("feed.css");
 
 const RULES = [
   "#romp-fileview {", ".fileview {", "body.fileview-open {", ".fileview-bar {", ".fileview-name {",
-  ".fileview-dir {", ".fileview-base {", ".fileview-acts {", ".fileview-btn {", ".fileview-btn:hover {",
+  ".fileview-dir {", ".fileview-base {", ".fileview-sess {", ".fileview-sess .host-prefix {", ".fileview-acts {", ".fileview-btn {", ".fileview-btn:hover {",
   "a.fileview-btn {", ".fileview-gh {", ".fileview-gh-why {", ".fileview-gh-dots {",
   ".fileview-gh .fileview-btn:disabled {", ".fileview-gh .fileview-btn:disabled:hover {",
   ".fileview-gh .fileview-btn:disabled:active {", "a.fileview-gh-note {", ".fileview-body {",

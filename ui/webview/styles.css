@@ -3279,6 +3279,22 @@ body.fileview-open { overflow: hidden; }
 .fileview-dir { flex: 0 1 auto; min-width: 0; color: var(--dim);
   overflow: hidden; text-overflow: ellipsis; }
 .fileview-base { flex: 0 0 auto; }
+/* the SESSION the file was opened from (the user 2026-09-03): a pill in the session's identity colour
+   (inline, from the resolved row — the colour its tab wears), a remote session's "host:" quiet inside.
+   Fixed width: the chip never yields to the path — only .fileview-dir above gives up room. Uncolored
+   when the session has no colour (a stub for a sid the document cannot name); absent when there is no
+   sid. The host: token takes the pill's OWN foreground (color: inherit): the global .host-prefix rule's
+   var(--dim) would otherwise beat the inline colour and sit near-invisible on a saturated pill.
+   Sized at the bar's button size — 0.82em of --fs, not a px value — so the chip scales with its
+   neighbours. A BLOCK container, not inline-flex: text-overflow acts on block containers only — on a flex
+   container the text sits in an anonymous flex item the property cannot reach, and an over-long name
+   hard-clipped at max-width (the review of #970). The bar's align-items centres the pill; its one nowrap
+   line centres within it. */
+.fileview-sess { flex: 0 0 auto; display: block; max-width: 38%; padding: 1px 8px;
+  border-radius: var(--radius-pill, 999px); font-size: 0.82em; font-weight: 600; line-height: 1.5;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  background: var(--overlay-10, rgba(255, 255, 255, 0.12)); color: var(--fg); }
+.fileview-sess .host-prefix { color: inherit; opacity: 0.75; }
 .fileview-acts { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
 .fileview-btn { font: inherit; font-size: 0.82em; cursor: pointer; flex: 0 0 auto;
   padding: 3px 9px; border-radius: 6px; background: transparent; color: var(--fg);   /* T151: the one button rest */

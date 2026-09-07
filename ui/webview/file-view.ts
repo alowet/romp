@@ -19,6 +19,7 @@ import hljs from "highlight.js/lib/core";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { fileUrl } from "./preview";
+import { hostOf, bareId, hostNameNodes } from "./host-prefix";
 import { kernelUrl } from "./media";
 import { quoteSrcLabel } from "./docreview";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -117,6 +118,26 @@ function el(tag: string, cls?: string): HTMLElement {
 // The save op rides the WS poster the pane's boot hands initFileView; replies route back to the OPEN
 // viewer through these module-level hooks (the viewer itself is a per-open closure).
 let post: (m: Record<string, unknown>) => void = () => { /* bound by initFileView */ };
+
+// ── the session the file was opened from (the user 2026-09-03) ────────────────────────────────────
+// The viewer knows only a sid, and its openers mostly know no more: the relay branch initFileView
+// keeps and the conflict Reload live in this module, the file browser hands over a bare sid. So the
+// session's name and colour are RESOLVED from the sid here, through a lookup each hosting document
+// registers once at boot beside initFileView (render.ts reads its tab set, feed.ts its session list).
+// Unregistered, or a sid the document cannot name, the title bar carries no chip: an identity is
+// looked up, never invented.
+export interface FileViewIdentity { name: string; color: { bg: string; fg: string } | null }
+let identityOf: (sid: string) => FileViewIdentity | null = () => null;
+export function setFileViewIdentity(fn: typeof identityOf): void { identityOf = fn; }
+/** The tail of a resolver's ladder when its lists hold no row for the sid — the kernel's own
+ *  _peer_identity fallback: the sid's first 8 characters as an uncolored stub, a remote sid's `host:`
+ *  kept in front so hostNameNodes still renders the host quiet. An empty sid names nothing. */
+export function hostStub(sid: string): FileViewIdentity | null {
+  const bare = bareId(sid);
+  if (!bare) return null;
+  const host = hostOf(sid);
+  return { name: (host ? host + ":" : "") + bare.slice(0, 8), color: null };
+}
 let saveSeq = 0;
 let editHooks: { reqId: number; saved: (mtimeNs: string) => void; failed: (err: string) => void } | null = null;
 // Set by the open viewer: returns false to VETO a close (an editor holding unsaved changes asks
@@ -301,6 +322,18 @@ export function openFileView(path: string, sid?: string | null): void {
     });
   }
   name.appendChild(dir); name.appendChild(base);
+  // The SESSION this file was opened from: a pill in the session's identity colour (the colour its
+  // tab wears), "host:" quiet for a remote session (and marked while its link is down). Resolved
+  // through the hosting document's registered lookup — no sid, or a sid it cannot name, and there is
+  // no chip.
+  const owner = sid ? identityOf(sid) : null;
+  let sess: HTMLElement | null = null;
+  if (owner) {
+    sess = el("span", "fileview-sess");
+    sess.replaceChildren(...hostNameNodes(owner.name, sid));
+    if (owner.color) { sess.style.background = owner.color.bg; sess.style.color = owner.color.fg; }
+    sess.title = "Opened from the " + owner.name + " session";
+  }
   const acts = el("div", "fileview-acts");
 
   // ── format toggles (the user 2026-08-09) ── A markdown file opens RENDERED, its Raw form one click
@@ -445,7 +478,7 @@ export function openFileView(path: string, sid?: string | null): void {
   close.setAttribute("aria-label", "Close the file viewer");
   close.addEventListener("click", closeFileView);
   acts.appendChild(copy); acts.appendChild(close);
-  bar.appendChild(name); bar.appendChild(acts);
+  bar.appendChild(name); if (sess) bar.appendChild(sess); bar.appendChild(acts);
 
   const body = el("div", "fileview-body");
   // Per the loading-state rule the first thing up is the romp loader, not a blank pane — a file coming

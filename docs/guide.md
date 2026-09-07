@@ -28,8 +28,11 @@ passage, and repeat — each staged note remembers its quote and its place. **�
 everything you staged along with whatever is in the box, so the session applies the lot
 in one pass, and you never copy a line out of the document by hand. The line in each
 label is checked against the file at the moment you select, so numbers that moved under
-you are caught rather than quietly carried. The title bar's **GitHub ↗** button opens the
-file on GitHub. While the check runs, the button waits dimmed with pulsing dots beside it.
+you are caught rather than quietly carried. When several sessions work in the same
+repository, or in worktrees of it, the viewer's title bar says which one you opened the
+file from: a chip with the session's name, in the same color as its tab. The title bar's
+**GitHub ↗** button opens the file on GitHub. While the check runs, the button waits dimmed
+with pulsing dots beside it.
 When there is nothing to open, the button stays in place, dimmed, and a caption beside it
 says why (the file is not in a git repository or not committed — untracked, staged but in no
 commit, or on a branch with no commits yet — the repository has no origin remote, its origin

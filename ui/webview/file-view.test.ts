@@ -622,3 +622,99 @@ test("the line gutter numbers every line and drops a trailing newline's phantom 
   assert.match(FEED_CSS, /\.fileview-gutter \{[\s\S]*?user-select: none;/);
   assert.match(CHAT_CSS, /\.fileview-gutter \{[\s\S]*?user-select: none;/);
 });
+
+// ── the session chip (the user 2026-09-03): the title bar names the session the file was opened
+// from. The viewer knows only a sid — and its openers mostly know no more (the relay branch and the
+// conflict Reload live inside this module, the file browser hands over a bare sid) — so the identity
+// is RESOLVED from the sid through a lookup each hosting document registers once at boot. The DOM
+// build itself runs for real in fileview-chip.test.ts; these are the source pins. ──
+
+test("the title bar carries a session chip resolved from the sid — never invented, absent when unknown", () => {
+  assert.match(VIEW, /import \{ hostOf, bareId, hostNameNodes \} from "\.\/host-prefix";/);
+  assert.match(VIEW, /export interface FileViewIdentity \{ name: string; color: \{ bg: string; fg: string \} \| null \}/);
+  assert.match(VIEW, /let identityOf: \(sid: string\) => FileViewIdentity \| null = \(\) => null;/,
+    "unregistered → nothing to show, not a guess");
+  assert.match(VIEW, /export function setFileViewIdentity\(fn: typeof identityOf\): void \{ identityOf = fn; \}/);
+  const openFn = VIEW.split("export function openFileView")[1].split("function offersDownload")[0];
+  assert.match(openFn, /const owner = sid \? identityOf\(sid\) : null;/, "no sid → the resolver is not even asked");
+  assert.match(openFn, /if \(owner\) \{\n\s*sess = el\("span", "fileview-sess"\);/, "no identity → no chip element at all");
+  assert.match(openFn, /sess\.replaceChildren\(\.\.\.hostNameNodes\(owner\.name, sid\)\);/, "host: quiet for a remote session");
+  assert.match(openFn, /if \(owner\.color\) \{ sess\.style\.background = owner\.color\.bg; sess\.style\.color = owner\.color\.fg; \}/,
+    "the session's identity colour, inline — an uncolored stub keeps the sheet's neutral pill");
+  assert.match(openFn, /sess\.title = "Opened from the " \+ owner\.name \+ " session";/,
+    "capitalized like this bar's other tooltips; 'session' so a name like web is not read as a place");
+  assert.match(openFn, /bar\.appendChild\(name\); if \(sess\) bar\.appendChild\(sess\); bar\.appendChild\(acts\);/,
+    "between the path and the actions");
+  // the signatures every opener and the relay pin depend on are exactly as they were
+  assert.match(VIEW, /export function openFileView\(path: string, sid\?: string \| null\): void \{/);
+  assert.match(VIEW, /export function initFileView\(poster: \(m: Record<string, unknown>\) => void\): void \{/);
+});
+
+test("both hosting documents register a resolver beside their initFileView boot", () => {
+  // the chat document: the tab set, the way renderTabs names a tab (the session first, then the
+  // kernel's tab meta, which keeps a dormant session's name and colour)
+  assert.match(RENDER, /import \{ initFileView, setFileViewIdentity, hostStub \} from "\.\/file-view";/);
+  assert.match(RENDER, /initFileView\(\(m\) => vscodeApi\?\.postMessage\(m\)\);\n(\/\/.*\n)*setFileViewIdentity\(\(id\) => \{\n\s*const s = sessions\.get\(id\) \?\? tabMeta\.get\(id\);\n\s*return s && s\.name \? \{ name: s\.name, color: s\.color \?\? null \} : hostStub\(id\);\n\}\);/);
+  // the feed document: its session list (the same tab set, relayed per frame), else a card carrying
+  // the session's name and colour — never sessionColors, which is keyed by NAME, not sid
+  assert.match(FEED, /import \{ initFileView, setFileViewIdentity, hostStub \} from "\.\/file-view";/);
+  assert.match(FEED, /initFileView\(\(m\) => vscodeApi\?\.postMessage\(m\)\);.*\n(\/\/.*\n)*setFileViewIdentity\(\(id\) => \{\n\s*const s = sessionsMeta\.find\(\(x\) => x\.sid === id\) \?\? asks\.find\(\(a\) => a\.sid === id\);\n\s*return s && s\.name \? \{ name: s\.name, color: s\.color \?\? null \} : hostStub\(id\);\n\}\);/);
+  const feedReg = FEED.split("setFileViewIdentity(")[1].split("});")[0];
+  assert.doesNotMatch(feedReg, /sessionColors/, "a name-keyed index cannot answer a sid");
+});
+
+// executed: the ladder each document's resolver runs — its own lists, then the kernel's
+// _peer_identity fallback (a remote sid's host + the sid's first 8 characters, uncolored), then no
+// chip at all. Synthetic rows: the notes-api world, TESTHOST for the remote kernel.
+test("resolver ladder: a named session, then a host-prefixed 8-char stub, then no chip", () => {
+  type Id = { name: string; color: { bg: string; fg: string } | null };
+  const hostOf = (id: string) => { const i = id.indexOf(":"); return i > 0 ? id.slice(0, i) : ""; };
+  const bareId = (id: string) => { const i = id.indexOf(":"); return i > 0 ? id.slice(i + 1) : id; };
+  const hostStub = (sid: string): Id | null => {
+    const bare = bareId(sid);
+    if (!bare) return null;
+    const host = hostOf(sid);
+    return { name: (host ? host + ":" : "") + bare.slice(0, 8), color: null };
+  };
+  const WEB = "11111111-2222-3333-4444-555555555555";
+  const API = "22222222-3333-4444-5555-666666666666";
+  const TESTS = "33333333-4444-5555-6666-777777777777";
+  const rows = new Map<string, Id>([
+    [WEB, { name: "web", color: { bg: "#3a7bd5", fg: "#ffffff" } }],
+    ["TESTHOST:" + API, { name: "TESTHOST:api", color: { bg: "#d53a7b", fg: "#ffffff" } }],   // federation prefixes sid AND name
+    [TESTS, { name: "", color: null }],                                                        // a placeholder tab, name not yet known
+  ]);
+  const resolve = (id: string): Id | null => {
+    const s = rows.get(id);
+    return s && s.name ? { name: s.name, color: s.color ?? null } : hostStub(id);
+  };
+  assert.deepEqual(resolve(WEB), { name: "web", color: { bg: "#3a7bd5", fg: "#ffffff" } });
+  assert.deepEqual(resolve("TESTHOST:" + API), { name: "TESTHOST:api", color: { bg: "#d53a7b", fg: "#ffffff" } },
+    "a remote row keeps its host: prefix — hostNameNodes renders it as quiet metadata");
+  assert.deepEqual(resolve("44444444-5555-6666-7777-888888888888"), { name: "44444444", color: null },
+    "an unknown local sid → the kernel's 8-character stub, uncolored");
+  assert.deepEqual(resolve("TESTHOST:44444444-5555-6666-7777-888888888888"), { name: "TESTHOST:44444444", color: null },
+    "an unknown remote sid → host: + stub, so the host still reads as metadata");
+  assert.deepEqual(resolve(TESTS), { name: "33333333", color: null },
+    "a row with no name yet is not a name — the stub, never an empty chip");
+  assert.equal(resolve(""), null, "no sid → no chip");
+  assert.equal(resolve("TESTHOST:"), null, "a host with no sid names nothing");
+  // replica ↔ source
+  assert.match(VIEW, /export function hostStub\(sid: string\): FileViewIdentity \| null \{\n\s*const bare = bareId\(sid\);\n\s*if \(!bare\) return null;\n\s*const host = hostOf\(sid\);\n\s*return \{ name: \(host \? host \+ ":" : ""\) \+ bare\.slice\(0, 8\), color: null \};\n\}/);
+});
+
+test("the chip's dress is in BOTH sheets: a fixed-width pill that never yields to the path", () => {
+  for (const css of [CHAT_CSS, FEED_CSS]) {
+    // A BLOCK container, not inline-flex: text-overflow acts on block containers only — on a flex container
+    // the text sits in an anonymous flex item the property cannot reach, and an over-long name hard-clipped
+    // at max-width (the review of #970). 0.82em of --fs, the size the bar's buttons wear, so the chip scales
+    // with its neighbours; a px value did not.
+    assert.match(css, /\.fileview-sess \{ flex: 0 0 auto; display: block; max-width: 38%;[^}]*font-size: 0\.82em;[^}]*overflow: hidden; white-space: nowrap; text-overflow: ellipsis;/);
+    const sess = css.slice(css.indexOf(".fileview-sess {"), css.indexOf("}", css.indexOf(".fileview-sess {")));
+    assert.doesNotMatch(sess, /inline-flex|align-items|font-size: [\d.]+px/, "no flex container around the text, no px size");
+    // color:inherit so the host: token takes the pill's own fg — the global .host-prefix{color:var(--dim)}
+    // otherwise wins over the inline foreground and the token is near-invisible on a coloured pill
+    // (~1:1 contrast for a remote session's chip). opacity keeps it quiet without dimming to gray.
+    assert.match(css, /\.fileview-sess \.host-prefix \{ color: inherit; opacity: 0\.75; \}/, "the host: token uses the pill's fg, quiet");
+  }
+});
