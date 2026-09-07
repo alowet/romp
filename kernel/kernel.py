@@ -32706,6 +32706,93 @@ def _dedup_sig(msg, s):
     return s
 
 
+# The pusher's wire caches, counted: whole frames serialized per slot (a _LazyWire made; at most once per build
+# each), builds whose payload could not be keyed and took the whole dump for their signature, and values a wire
+# encoder shipped as str() (_wire_default, one per encode). Bumped through _wire_bump, under a lock: the pusher
+# bumps the fallback counters, and whichever sender thread first materializes a _LazyWire bumps its counter, so
+# a bare `+= 1` here would be a read-modify-write across threads (the tests assert exact counts).
+_wire_stats = {"feed_body": 0, "bars_body": 0, "feed_sig_fallback": 0, "bars_sig_fallback": 0, "default_str": 0}
+_WIRE_STATS_LOCK = threading.Lock()
+_wire_default_said = set()   # type names _wire_default has written to stderr: a type is said once, not per value
+
+
+def _wire_bump(key, n=1):
+    with _WIRE_STATS_LOCK:
+        _wire_stats[key] = _wire_stats.get(key, 0) + n
+
+
+def _wire_default(o, enc="wire"):
+    """json.dumps's `default` for every wire encoder: the per-entry pass (_delta_split, _delta_parts' remainder),
+    the whole frames (_push) and the delta frames (_send_slot_delta). Returns str(o), the bytes the bare
+    `default=str` the delta paths carried produced, so the wire is unchanged. What changes is that the value is
+    no longer silent: _wire_stats["default_str"] counts every value shipped this way, one per encode (a value in
+    an entry is counted by the per-entry pass and again by the whole frame, if one goes), and the type is
+    written to stderr once, naming the encoder that met it first. A value json cannot encode (a set, a datetime,
+    a Path) is a builder's mistake, and str() of it is not what the pane expects; the whole-frame dumps used to
+    carry no `default` at all and raised on such a value, out of _push, on the pusher thread."""
+    _wire_bump("default_str")
+    tn = type(o).__name__
+    if tn not in _wire_default_said:
+        _wire_default_said.add(tn)
+        sys.stderr.write("wire: %s serialized via str() in %s\n" % (tn, enc))
+    return str(o)
+
+
+def _wire_default_in(enc):
+    """_wire_default bound to the encoder's name, for its `default=`."""
+    return lambda o: _wire_default(o, enc)
+
+
+class _LazyWire:
+    """A whole-frame serialization produced on the first send that needs it and kept for every later one: the
+    chat payload's `ms` (see _send_chat: None until a client takes the full-send branch, then materialized once
+    and reused) applied to the feed and the bars. Between rebuilds a frame's bytes are consumed only as a
+    LENGTH — the deduped byte counts, _send_slot_delta's size guard — and the whole frame itself goes a few
+    times an hour: a fresh socket, a re-base, a client without deltas, a delta past the guard. Serializing every
+    build for that was a second whole encode of each payload per rebuild.
+
+    text() materializes (once; two threads racing here compute the same bytes and one write wins) and size()
+    answers the length: exact once materialized, before that the caller's ESTIMATE — the per-entry strings'
+    byte total (_parts_est), which sits under the whole frame by what the entries do not carry, the frame's key
+    names and separators. The estimate only makes the size guard fall back to a whole frame slightly more
+    eagerly and the deduped byte counts read a little low; it never changes a frame's bytes.
+
+    The cell sits inside a wire tuple (_feed_wire, _bars_wire), which is rebound whole and never mutated:
+    materializing mutates the cell, not the tuple, so a handler-thread serve that materializes never clobbers
+    a refill the pusher made meanwhile. `stat` names the _wire_stats counter bumped on materialization; `text`
+    pre-fills the cell (an unkeyable build, whose whole dump the signature needed anyway)."""
+    __slots__ = ("_fn", "_s", "_est", "_stat")
+
+    def __init__(self, fn, est, stat=None, text=None):
+        self._fn, self._s, self._est, self._stat = fn, text, est, stat
+
+    def text(self):
+        s = self._s
+        if s is None:
+            s = self._fn()
+            self._s = s
+            if self._stat:
+                _wire_bump(self._stat)
+        return s
+
+    def size(self):
+        s = self._s
+        return len(s) if s is not None else self._est
+
+    def materialized(self):
+        return self._s is not None
+
+
+def _wire_text(pre):
+    """The bytes of a wire form that is either a str or a _LazyWire (materializing the latter)."""
+    return pre if isinstance(pre, str) else pre.text()
+
+
+def _wire_len(pre):
+    """The length of a wire form that is either a str or a _LazyWire — the latter's estimate until it is made."""
+    return len(pre) if isinstance(pre, str) else pre.size()
+
+
 # A dropped client is LOUD. _mk_ws_send raises when a client is WS_QUEUE_BYTES behind, and every caller
 # caught that with a bare `c["alive"] = False` — so a dashboard dropped every few minutes for a day (the
 # flashing "may be stale" prompt) left NO trace in the kernel log, the shim logged nothing on its side, and
@@ -32834,18 +32921,35 @@ _delta_parts_cache = {}        # frame type -> (payload object identity, parts) 
 _delta_unkeyable_said = set()  # (frame type, why) already written to stderr: an unkeyable shape is said once, not per cycle
 
 
-def _delta_key(kind, it, prefix=""):
-    """The key of one list item under `kind` ('byid' / 'bykeys:…'), or None when the item cannot be keyed
-    (then the caller falls back to a positional key, which is still exact)."""
-    if not isinstance(it, dict):
-        return None
+def _delta_keyer(kind):
+    """The key function of one collection kind — key(item, prefix="") gives the item's key under the table
+    above, or None when the item cannot be keyed (the caller then takes a positional key, still exact). The
+    kind string is parsed HERE, once per _delta_split call, not once per item: splitting "bykeys:sid,t,judge,t1"
+    and running its generator per entry was a visible share of the per-entry pass on a board of thousands of
+    bars. The keys are byte-identical to the per-item form's (_delta_key)."""
     if kind.startswith(("byid", "dictlist:")):
         field = "id" if kind == "byid" else kind.split(":", 1)[1]
-        v = it.get(field)
-        return None if v is None or v == "" else prefix + str(v)   # "" would spell a lane's bare-prefix marker
+
+        def key(it, prefix=""):
+            if not isinstance(it, dict):
+                return None
+            v = it.get(field)
+            return None if v is None or v == "" else prefix + str(v)   # "" would spell a lane's bare-prefix marker
+        return key
     if kind.startswith("bykeys:"):
-        return prefix + _DELTA_SEP.join(str(it.get(f)) for f in kind.split(":", 1)[1].split(","))
-    return None
+        fields = tuple(kind.split(":", 1)[1].split(","))
+
+        def key(it, prefix=""):
+            if not isinstance(it, dict):
+                return None
+            return prefix + _DELTA_SEP.join([str(it.get(f)) for f in fields])
+        return key
+    return lambda it, prefix="": None
+
+
+def _delta_key(kind, it, prefix=""):
+    """The key of one list item under `kind` ('byid' / 'bykeys:…'): _delta_keyer's per-item form."""
+    return _delta_keyer(kind)(it, prefix)
 
 
 def _delta_split(kind, value):
@@ -32853,7 +32957,8 @@ def _delta_split(kind, value):
     list item that cannot be keyed, or a duplicate key, takes a positional key ('#n') — exact, since the
     shim rebuilds in key order, just less delta-friendly."""
     ents, order = {}, []
-    enc = json.JSONEncoder(default=str).encode          # one encoder for the thousand entries, not one each
+    enc = json.JSONEncoder(default=_wire_default_in("_delta_split")).encode   # one encoder for the thousand entries, not one each
+    key = _delta_keyer(kind)                            # …and the kind parsed once, not per item
     def put(kk, v, pre=""):
         if kk is None or kk in ents:
             n = len(order)
@@ -32868,7 +32973,7 @@ def _delta_split(kind, value):
             put(str(kk), v)
     elif kind.startswith(("byid", "bykeys:")) and isinstance(value, list):
         for it in value:
-            put(_delta_key(kind, it), it)
+            put(key(it), it)
     elif kind.startswith("dictlist:") and isinstance(value, dict):
         for dk, lst in value.items():
             if _DELTA_SEP in str(dk):
@@ -32878,7 +32983,7 @@ def _delta_split(kind, value):
                 put(pre, lst)                      # an empty or non-list lane: one entry under its bare prefix
                 continue
             for it in lst:
-                put(_delta_key(kind, it, pre), it, pre)
+                put(key(it, pre), it, pre)
     else:
         # a value the kind cannot key (None where a list belongs, a list where a dict does): NOT zero entries —
         # that split carried the value nowhere, and the client kept its assembled [] / {} while the kernel held
@@ -32908,10 +33013,33 @@ def _delta_parts(ftype, payload):
             sys.stderr.write("view-delta %s: payload cannot be keyed (%s); sending whole frames\n" % (ftype, e))
     else:
         rest = {kk: v for kk, v in payload.items() if kk not in kinds}
-        rest_sig = json.dumps({kk: v for kk, v in rest.items() if kk not in _DEDUP_VOLATILE}, sort_keys=True, default=str)
+        rest_sig = json.dumps({kk: v for kk, v in rest.items() if kk not in _DEDUP_VOLATILE}, sort_keys=True,
+                              default=_wire_default_in("_delta_parts"))
         parts = (colls, rest, rest_sig)
     _delta_parts_cache[ftype] = (payload, parts)
     return parts
+
+
+def _parts_sig(parts):
+    """A slot payload's dedup signature from the split _delta_parts already made at the wire fill —
+    (rest_sig, ((collection, key order, entry strings), ...)) — in place of json.dumps(payload) plus _dedup_sig's
+    sort_keys re-dump of the payload minus its clock. The key order carries the lanes and ids, the entry strings
+    the entries themselves, rest_sig the remainder minus `now`/`buildId`: equal tuples mean equal bytes in every
+    entry and the remainder, so a suppressed change is impossible. Stricter than the sort_keys form in one way:
+    that dump was key-order-insensitive at every level (a turns lane dict included), so an equal-content reorder
+    deduped where it now re-sends once — an order-only delta for a delta client, one whole frame for a legacy
+    client, never a stale one — and then dedups. An unkeyable payload (parts None) keeps _dedup_sig over the
+    whole dump. A client's `sent` slot holds the tuple as it held the string; its strings are the split's own."""
+    colls, _rest, rest_sig = parts
+    return (rest_sig, tuple((name, tuple(order), tuple(e[1] for e in ents.values()))
+                            for name, (ents, order) in colls.items()))
+
+
+def _parts_est(parts):
+    """A whole frame's length before it is serialized (_LazyWire.size): the entry strings' byte total plus the
+    remainder's — the frame's key names and separators are not counted, so it reads a little under the frame."""
+    colls, _rest, rest_sig = parts
+    return sum(len(e[1]) for ents, _o in colls.values() for e in ents.values()) + len(rest_sig)
 
 
 def _js_key_order(keys):
@@ -32947,10 +33075,13 @@ def _order_shape(kind, order):
     return list(groups.items())
 
 
-def _send_slot(c, ftype, payload, pre, sig):
+def _send_slot(c, ftype, payload, pre, sig, parts=None):
     """Send a bars/feed payload to one client: whole for a client without delta support (exactly as before),
-    else as a delta against what that client holds. `pre`/`sig` are the shared full serialization and
-    dedup signature the pusher computed once per build.
+    else as a delta against what that client holds. `pre`/`sig` are the shared full serialization (a str, or a
+    _LazyWire serialized only if a whole frame goes) and dedup signature the pusher computed once per build;
+    `parts` is the payload's _delta_parts split when the caller made it at the wire fill (the pusher does), so
+    the delta path neither re-splits nor depends on _delta_parts_cache's single slot still holding it (a
+    handler-thread connect push can evict that between the fill and the send).
     One thread at a time per client (review find, 2026-09-04): the socket handler's connect push (`ready` →
     _push_one, on the handler thread) and the pusher's cycle both reach here for the same client, and both
     read and write its held delta state. Unserialized, one interleaving — both find nothing held, a rebuild
@@ -32959,16 +33090,16 @@ def _send_slot(c, ftype, payload, pre, sig):
     divergence until the next full. Before deltas the same race touched only the dedup dict, where a double
     full was harmless. Re-entrant: the size fallback in _send_slot_delta calls back in on the same thread."""
     with _client_lock(c):                             # one per client, made by _new_ws_client
-        _send_slot_locked(c, ftype, payload, pre, sig)
+        _send_slot_locked(c, ftype, payload, pre, sig, parts)
 
 
-def _send_slot_locked(c, ftype, payload, pre, sig):
+def _send_slot_locked(c, ftype, payload, pre, sig, parts=None):
     key = _DELTA_SLOTS[ftype][0]
     if not c.get("delta"):
         _send_client(c, key, payload, pre=pre, sig=sig)
         return
     try:
-        _send_slot_delta(c, key, ftype, payload, pre, sig)
+        _send_slot_delta(c, key, ftype, payload, pre, sig, parts)
     except Exception:
         # One client's frame must never take the pusher down with it (every dashboard would freeze until a
         # restart): say so, forget what that client holds, and send the whole payload — which carries no
@@ -32979,13 +33110,14 @@ def _send_slot_locked(c, ftype, payload, pre, sig):
         _send_client(c, key, payload, pre=pre, sig=sig)
 
 
-def _send_slot_delta(c, key, ftype, payload, pre, sig):
+def _send_slot_delta(c, key, ftype, payload, pre, sig, parts=None):
     rs = c.get("resync")
     if rs and ftype in rs:                             # the shim said it could not apply a delta (a base it does
         rs.discard(ftype)                              # not hold): forget what we believe it holds; whole, re-based
         c.get("dstate", {}).pop(ftype, None)
         c.get("sent", {}).pop(key, None)
-    parts = _delta_parts(ftype, payload)
+    if parts is None:
+        parts = _delta_parts(ftype, payload)
     states = c.setdefault("dstate", {})
     if parts is None:                                  # cannot be keyed: whole, and the client holds nothing
         states.pop(ftype, None)
@@ -32999,7 +33131,9 @@ def _send_slot_delta(c, key, ftype, payload, pre, sig):
         # bundle sees the message): every key is minted HERE, once — a shim deriving keys from field values
         # would spell null/None, true/True, 1/1.0 differently from Python and hold keys the kernel never sent.
         keys = json.dumps({n: o for n, (_e, o) in colls.items()})
-        pre_k = pre[:-1] + ',"_keys":' + keys + "}" if pre.endswith("}") else json.dumps(dict(payload, _keys=json.loads(keys)), default=str)
+        ps = _wire_text(pre)                           # a whole frame goes: the build's one whole encode, if not yet made
+        pre_k = (ps[:-1] + ',"_keys":' + keys + "}" if ps.endswith("}")
+                 else json.dumps(dict(payload, _keys=json.loads(keys)), default=_wire_default_in("_send_slot_delta")))
         # The keyed full must actually GO: a whole frame sent moments ago without keys (the failure path, or an
         # unkeyable build) filled the dedup slot with this same signature, and a deduped keyed full would leave
         # the kernel holding state for a client that holds nothing (review 2026-09-03).
@@ -33018,7 +33152,7 @@ def _send_slot_delta(c, key, ftype, payload, pre, sig):
         # pusher hands an unchanged payload object across cycles (_bars_wire holds the bars by the cached timeline's
         # identity), and that compare is what this skips. Counted as the unchanged branch counts it: built, not
         # sent. Past the repost window the compare runs and the repost goes.
-        _PERF_STATS.send(key, "deduped", len(pre))
+        _PERF_STATS.send(key, "deduped", _wire_len(pre))
         return
     frame = {"type": "delta", "slot": ftype, "base": st["rev"], "rev": st["rev"] + 1, "coll": {}}
     changed = False
@@ -33050,7 +33184,7 @@ def _send_slot_delta(c, key, ftype, payload, pre, sig):
             frame["coll"][name] = entry; changed = True
     if not changed:
         if now - st.get("at", 0) < _DEDUP_REPOST_S:    # unchanged: nothing to send (the repost keeps the fade alive)
-            _PERF_STATS.send(key, "deduped", len(pre))   # built and compared, not sent — the same fact
+            _PERF_STATS.send(key, "deduped", _wire_len(pre))   # built and compared, not sent — the same fact
             # Adopt this split as the held one: the compare just showed the held entry strings, key sets, order
             # shape and remainder equal it, so the same object next cycle is an identity hit above rather than
             # another compare. A content-equal rebuild mints a new payload object (the view sig's 5 s bucket
@@ -33060,11 +33194,11 @@ def _send_slot_delta(c, key, ftype, payload, pre, sig):
             # from the last frame that went.
             st["parts"] = parts
             return                                         # _send_client's dedup records for a whole-frame client
-    s = json.dumps(frame, default=str)
-    if len(s) >= _DELTA_MAX_FRACTION * len(pre):       # not worth a delta → the full frame, rebased
-        states.pop(ftype, None)
+    s = json.dumps(frame, default=_wire_default_in("_send_slot_delta"))   # the entry OBJECTS ride: re-encoded here
+    if len(s) >= _DELTA_MAX_FRACTION * _wire_len(pre):   # not worth a delta → the full frame, rebased (a lazy `pre`
+        states.pop(ftype, None)                          # answers its estimate here: a slightly eager fallback, never wrong)
         c.get("sent", {}).pop(key, None)
-        _send_slot(c, ftype, payload, pre, sig)
+        _send_slot(c, ftype, payload, pre, sig, parts)
         return
     _perf("send", slot=_perf_slot(key), bytes=len(s), deduped=0, delta=1)
     _PERF_STATS.send(key, "delta", len(s))
@@ -33182,9 +33316,20 @@ def _send_client(c, key, msg, pre=None, sig=None, kind="full"):
     WebSocket client; the log makes the next one obvious.
 
     `kind` is the /perf sends class the frame is counted under when it goes: "full" (the default: a
-    whole frame) or "delta" for a caller whose frame is a suffix or a diff (_send_chat's chatTail)."""
-    s = pre if pre is not None else json.dumps(msg)
-    sig = sig if sig is not None else _dedup_sig(msg, s)
+    whole frame) or "delta" for a caller whose frame is a suffix or a diff (_send_chat's chatTail).
+
+    `pre` may also be a _LazyWire (the feed, the bars): its bytes are produced only if the frame GOES — a
+    deduped frame costs its size() and nothing else."""
+    if pre is None:
+        s = json.dumps(msg)
+    elif isinstance(pre, str):
+        s = pre
+    else:
+        s = None                                          # lazy: serialized below only if the frame goes
+    if sig is None:
+        if s is None:
+            s = pre.text()
+        sig = _dedup_sig(msg, s)
     seqs = getattr(_VIEWS_SERVED, "seqs", None)
     if seqs is not None:
         # the ready handler is capturing ITS connect push (the caps frame's viewsSeq, see KERNEL_WS_CAPS):
@@ -33197,13 +33342,18 @@ def _send_client(c, key, msg, pre=None, sig=None, kind="full"):
         prev = c.setdefault("sent", {}).get(key)      # reset (_client_reset_chat_base) — one writer at a time
         now = time.time()
         if prev is not None and prev[0] == sig and (now - prev[1]) < _DEDUP_REPOST_S:
-            _perf("send", slot=_perf_slot(key), bytes=len(s), deduped=1)
-            _PERF_STATS.send(key, "deduped", len(s))
+            n = len(s) if s is not None else pre.size()   # deduped: the length only; a lazy frame stays unserialized
+            _perf("send", slot=_perf_slot(key), bytes=n, deduped=1)
+            _PERF_STATS.send(key, "deduped", n)
             return
+        if s is None:
+            s = pre.text()                            # the frame goes: the build's one whole encode (the cell keeps it) —
+            #                                           BEFORE the slot is written, so a raise here leaves it for a retry
         c["sent"][key] = (sig, now)
         _perf("send", slot=_perf_slot(key), bytes=len(s), deduped=0)
         _PERF_STATS.send(key, kind, len(s))
-        _client_send(c, s, key)                       # enqueue only (never blocks): the lock is held for microseconds
+        _client_send(c, s, key)                       # enqueue only (never blocks): the lock is held for microseconds,
+        #                                               or for the one whole encode when a lazy frame goes
 
 
 def _send_chat(c, m, ms, change_from, led_changed):
@@ -35088,39 +35238,64 @@ def _push(targets, connect=False, tmux=None):
     # Serialize the shared payloads once per BUILD, not per cycle (the 2026-08-10 CPU fix, round
     # three). Round two had brought feed/bars down to one dumps each per cycle — measured on a QUIET
     # fleet that was still ~357KB (feed) + ~1.65MB (bars) of json.dumps every cycle, ~4MB/s, nearly
-    # all of it discarded by the dedup because nothing had changed. The serialization is now keyed on
-    # the EVENT that can change the bytes: for bars, the cached timeline object's identity (a rebuild
+    # all of it discarded by the dedup because nothing had changed. The wire form is keyed on the
+    # EVENT that can change the bytes: for bars, the cached timeline object's identity (a rebuild
     # mints a new object; the cache slot holds the ref, so identity is stable and safe) + the warming
     # flag; for the feed, the cached pre-copy feed object's identity + a DEEP-EQUALITY check on the
     # per-cycle ledgers attach (rebuilt fresh each cycle around the always-rebuilt active tab, so its
     # OBJECT is always new but its content only changes when a session's ledger/status genuinely
     # moved — dict == is C-speed and allocation-free, far cheaper than re-serializing).
+    # And once per build means ONE encode. A rebuild used to serialize each payload three times over
+    # on this thread: the whole frame, _dedup_sig's sort_keys re-dump of the payload minus its clock
+    # (both frames carry `now`, so it always ran), and the per-entry split the delta path made on the
+    # first delta client's send. The per-entry split (_delta_parts) is now the one encode per build:
+    # the dedup signature is a tuple of its strings (_parts_sig), and the whole frame is a _LazyWire
+    # cell made on the first send that needs one — a fresh socket, a re-base, a client without deltas,
+    # a delta past the size guard — and kept in the wire tuple for the rest of the build. The split is
+    # handed down to _send_slot so the delta path neither re-splits nor depends on _delta_parts_cache's
+    # single slot still holding it: a connect push on a handler thread (_push([client], connect=True)
+    # from the ws handler) can evict that slot between this fill and the send. An unkeyable payload
+    # (said once by _delta_parts) keeps the whole dump and _dedup_sig, as before.
     global _feed_wire, _bars_wire
-    feed_ms = feed_sig = bars = bars_ms = bars_sig = None
+    feed_ms = feed_sig = feed_parts = bars = bars_ms = bars_sig = bars_parts = None
     _t_stage = time.monotonic()
     for c in targets:
         if c["app"] in ("feed", "fleet"):   # the feed pane AND the Fleet view both ride the feed payload (Fleet reads feed.ledgers)
             if feed_ms is None:
                 w = _feed_wire                           # tuple snapshot — rebound whole, never mutated (torn reads)
                 if w is not None and w[0] is feed_src and w[1] == feed.get("ledgers"):
-                    feed, feed_ms, feed_sig = w[2], w[3], w[4]
+                    feed, feed_ms, feed_sig, feed_parts = w[2], w[3], w[4], w[5]
                 else:
-                    feed_ms = json.dumps(feed)
-                    feed_sig = _dedup_sig(feed, feed_ms)
-                    _feed_wire = (feed_src, feed.get("ledgers"), feed, feed_ms, feed_sig)
-            _send_slot(c, "feed", feed, feed_ms, feed_sig)
+                    feed_parts = _delta_parts("feed", feed)   # the one per-entry encode, handed down to the delta path
+                    if feed_parts is not None:
+                        feed_sig = _parts_sig(feed_parts)
+                        feed_ms = _LazyWire(lambda f=feed: json.dumps(f, default=_wire_default_in("_push feed")),
+                                            _parts_est(feed_parts), "feed_body")
+                    else:                                # unkeyable: whole frames and the string signature, as before
+                        s = json.dumps(feed, default=_wire_default_in("_push feed"))
+                        feed_ms, feed_sig = _LazyWire(None, len(s), text=s), _dedup_sig(feed, s)
+                        _wire_bump("feed_sig_fallback")
+                    _feed_wire = (feed_src, feed.get("ledgers"), feed, feed_ms, feed_sig, feed_parts)
+            _send_slot(c, "feed", feed, feed_ms, feed_sig, feed_parts)
         elif c["app"] == "timeline" and timeline is not None:
             if bars_ms is None:
                 w = _bars_wire
                 if w is not None and w[0] is timeline and w[1] == tl_warming:
-                    bars, bars_ms, bars_sig = w[2], w[3], w[4]
+                    bars, bars_ms, bars_sig, bars_parts = w[2], w[3], w[4], w[5]
                 else:
                     bars = {"type": "bars", "turns": timeline["turns"], "judging": timeline["judging"],
                             "messages": timeline["messages"], "now": timeline["now"], "warming": tl_warming}
-                    bars_ms = json.dumps(bars)
-                    bars_sig = _dedup_sig(bars, bars_ms)
-                    _bars_wire = (timeline, tl_warming, bars, bars_ms, bars_sig)
-            _send_slot(c, "bars", bars, bars_ms, bars_sig)
+                    bars_parts = _delta_parts("bars", bars)   # the one per-entry encode, handed down to the delta path
+                    if bars_parts is not None:
+                        bars_sig = _parts_sig(bars_parts)
+                        bars_ms = _LazyWire(lambda b=bars: json.dumps(b, default=_wire_default_in("_push bars")),
+                                            _parts_est(bars_parts), "bars_body")
+                    else:                                # unkeyable: whole frames and the string signature, as before
+                        s = json.dumps(bars, default=_wire_default_in("_push bars"))
+                        bars_ms, bars_sig = _LazyWire(None, len(s), text=s), _dedup_sig(bars, s)
+                        _wire_bump("bars_sig_fallback")
+                    _bars_wire = (timeline, tl_warming, bars, bars_ms, bars_sig, bars_parts)
+            _send_slot(c, "bars", bars, bars_ms, bars_sig, bars_parts)
     _PERF_STATS.stage("push.send", time.monotonic() - _t_stage)
     with _clients_lock:
         _clients[:] = [c for c in _clients if c.get("alive", True)]
@@ -35368,12 +35543,13 @@ _VIEW_STATS = {"feedBuild": 0, "feedServe": 0, "tlBuild": 0, "tlServe": 0,
                "chatBuildActive": 0, "chatBuildBg": 0, "chatServeActive": 0, "chatServeBg": 0}
 _built_timeline = [None, None, 0.0, 0.0]          # [fleet_sig, payload, built_at, build_started_at]
 # Wire-form caches for the two heavy shared payloads (the 2026-08-10 CPU fix, round three): the last
-# (source-identity key, serialized bytes, dedup sig) for the feed and the timeline bars, so an unchanged
-# build is never re-serialized cycle after cycle (~357KB + ~1.65MB per cycle measured on a quiet fleet).
+# (source-identity key, lazy serialization, dedup sig, per-entry split) for the feed and the timeline bars,
+# so an unchanged build is never re-serialized cycle after cycle (~357KB + ~1.65MB per cycle measured with
+# every session quiet), and a rebuild is serialized once (see _push's wire section).
 # TUPLES, rebound whole — a concurrent connect push on a WS thread snapshots the ref and can never see a
 # torn entry; the identity keys stay alive because these tuples (and the build caches above) hold them.
-_feed_wire = None   # (feed_src, ledgers, wire_feed, ms, sig)
-_bars_wire = None   # (timeline, warming, bars, ms, sig)
+_feed_wire = None   # (feed_src, ledgers, wire_feed, ms, sig, parts) — ms = a _LazyWire of json.dumps(wire_feed), made on the first whole-frame send; sig = _parts_sig(parts), or _dedup_sig over the whole dump when parts is None (unkeyable); parts = _delta_parts("feed", wire_feed), handed to _send_slot
+_bars_wire = None   # (timeline, warming, bars, ms, sig, parts) — the same shape for the bars
 _skel_wire = None   # (timeline, frame, pre, sig) — the lanes {type:"data"} frame projected from the same cached build
 # Each build is intrinsically ~1-1.6s (re-segments every session); the IDEAL is a per-session lane/card cache
 # (only the changed session rebuilds), but that's a big refactor of build_feed/build_timeline. Interim cap: a

@@ -170,8 +170,12 @@ class LazyChatSerialization(unittest.TestCase):
             km._built_timeline[:] = [None, None, 0.0, 0.0]
             km._pusher_cycle()
             w_feed, w_bars = km._feed_wire, km._bars_wire
-            self.assertIsNotNone(w_feed, "the first cycle serialized the feed once")
-            self.assertIsInstance(w_feed[3], str)
+            self.assertIsNotNone(w_feed, "the first cycle made the feed's wire form once")
+            # the body is a lazy cell: this feed client announces no delta, so its whole frame went and the cell
+            # holds the one whole encode of the build; the signature is the split's tuple
+            self.assertIsInstance(w_feed[3], km._LazyWire)
+            self.assertTrue(w_feed[3].materialized(), "a legacy client took the whole frame: serialized once")
+            self.assertEqual(w_feed[4], km._parts_sig(w_feed[5]))
             n = len(frames)
             km._pusher_cycle()
             self.assertIs(km._feed_wire, w_feed, "unchanged feed → the SAME wire tuple, no re-dump")
