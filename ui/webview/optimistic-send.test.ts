@@ -10,14 +10,19 @@
 // bubble — retired its own entry in the very call that created it and showed nothing, and (B) the kernel's
 // own PROVISIONAL copy (queued bubble / "echo:" atom) counted as landed and deleted the entry one-way, so
 // when that provisional blinked in the echo→landed handoff nothing was left to cover the gap. Now: a
-// per-send `base` count makes only NEW landed user atoms retire it, kernel provisionals merely SUPPRESS
-// injection for the push they're visible on, and the TTL stays the backstop.
-// render.ts has import-time DOM side effects → source pins + an executed replica of the reconcile decision
-// (user-img-dedup.test.ts precedent).
+// per-send anchor makes only NEW landed user atoms retire it, kernel provisionals merely SUPPRESS
+// injection for the push they're visible on.
+// Reshaped again 2026-09-06 (the send-durability audits): the 20 s TTL backstop is GONE — an entry ends
+// on events only (a landing, the kernel's never-delivered verdict, the user's ✕) — and the decision
+// moved to send-pending.ts, a pure module this file executes directly (see also send-pending.test.ts,
+// which also covers the review's fixes: the anchor replaces the 30-event tail scan, exact text and
+// one landing per send, the lost verdict's anchor, the receipt proof that clears "not confirmed").
+// render.ts has import-time DOM side effects → source pins for the DOM half.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { newPending, reconcilePending, bareGroupLabel, type TailEvent } from "./send-pending";
 
 const RENDER = fs.readFileSync(
   path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
@@ -70,15 +75,20 @@ test("every push entry point re-asserts (or retires) the optimistic tail", () =>
   assert.ok(calls.length >= 4, "reconcile wired into send + all three push paths, got " + calls.length);
 });
 
-test("retire needs a NEW landed atom (base count); kernel provisionals only suppress", () => {
-  // base is stamped on the first reconcile after the send: pre-existing matches are background
-  assert.match(RENDER, /arr\.push\(\{ text, ts: Date\.now\(\), base: -1, imgPaths \}\);/);
-  assert.match(RENDER, /for \(const p of list\) if \(p\.base < 0\) p\.base = landedCount\(p\.text\);/);
-  // a landed atom is a user event WITHOUT the backend's "echo:" uuid prefix
-  assert.match(RENDER, /&& !String\(\(e as any\)\.uuid \|\| ""\)\.startsWith\("echo:"\)\)\.length;/);
-  // retire = TTL or growth past base; suppression is a separate, non-destructive filter
-  assert.match(RENDER, /const keep = list\.filter\(\(p\) => now - p\.ts < OPT_TTL_MS && landedCount\(p\.text\) <= p\.base\);/);
-  assert.match(RENDER, /const inject = keep\.filter\(\(p\) => !shownProvisional\(p\.text\)\);/);
+test("retire needs a NEW landed atom (after the send's anchor); kernel provisionals only suppress", () => {
+  // the entry is minted by the module (unanchored until the first reconcile stamps where the send sits)
+  assert.match(RENDER, /const p = newPending\(text, imgPaths\);\s*\n\s*arr\.push\(p\);/);
+  assert.equal(newPending("x", undefined, 5).at, undefined);
+  // the decision is the module's, read off KERNEL truth after our injections are stripped — the whole
+  // resident array from the anchor on, never a tail count (2026-09-06 review)
+  assert.match(RENDER, /const r = reconcilePending\(s\.events as TailEvent\[\], list\);/);
+  assert.doesNotMatch(RENDER, /OPT_TAIL_SCAN/);
+  assert.match(RENDER, /if \(r\.keep\.length\) pendingSent\.set\(s\.id, r\.keep\); else pendingSent\.delete\(s\.id\);/);
+  assert.match(RENDER, /const inject = r\.inject;/);
+  // and no clock anywhere in the file's decision: the TTL is gone for good
+  assert.doesNotMatch(RENDER, /OPT_TTL_MS/);
+  const SP = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "send-pending.ts"), "utf8");
+  assert.doesNotMatch(SP, /Date\.now\(\)(?! *\): PendingSend)/, "the module reads no clock in a decision (only the press stamp's default)");
 });
 
 // The optimistic echo rides the QUEUED idiom (the user 2026-07-16): to the reader an unconfirmed send and a
@@ -87,8 +97,10 @@ test("retire needs a NEW landed atom (base count); kernel provisionals only supp
 // queued send flip solid→dashed (backwards, as if it had un-landed).
 test("an optimistic echo is a tail-appended, kernel-invisible QUEUED event — never a solid user bubble", () => {
   const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
-  assert.match(RENDER, /const OPT_PREFIX = "optimistic:";/);
-  assert.match(RENDER, /const mk = \(p: \{ text: string; imgPaths\?: string\[\] \}\) => \(\{ md: p\.text, optimistic: true, cancelable: true, imgPaths: p\.imgPaths \}\);/);   // the echo carries its dragged-image paths (2026-08-25); cancelable from the press (2026-08-30)
+  const SP = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "send-pending.ts"), "utf8");
+  assert.match(SP, /export const OPT_PREFIX = "optimistic:";/);
+  assert.match(RENDER, /const isOptimistic = \(e: ChatEvent\): boolean => isOptimisticUuid\(e\.uuid\);/);
+  assert.match(RENDER, /const mk = \(p: PendingSend\) => \(\{ md: p\.text, optimistic: true, cancelable: true, imgPaths: p\.imgPaths, lost: p\.lost, qts: p\.ts \}\);/);   // the echo carries its dragged-image paths (2026-08-25); cancelable from the press (2026-08-30); `lost` after a connection drop, `qts` its identity for the ✕ (2026-09-06)
   // stale ones pop cheaply off the end (always tail-appended)
   assert.match(RENDER, /while \(s\.events\.length && isOptimistic\(s\.events\[s\.events\.length - 1\]\)\) s\.events\.pop\(\);/);
   // the abandoned dim/pending idiom is FULLY gone: render, guard fields, and stylesheet — the last
@@ -108,7 +120,11 @@ test("nothing known-queued → a bare group wearing the honest 'sending…' head
   // bug (a mid-compaction send sat unlabeled and uncuttable): the bare group now states exactly what
   // is known, and the reflow recounts it in the same vocabulary after a ✕
   assert.match(RENDER, /label\.dataset\.bare = "1";/);
-  assert.match(RENDER, /ev\.texts\.length === 1 \? "sending…" : `sending \$\{ev\.texts\.length\}…`/);
+  // the wording is the pure helper's (send-pending.ts bareGroupLabel, per-bubble since 2026-09-06), and
+  // the render feeds it the bubbles' own states
+  assert.match(RENDER, /fillBareLabel\(label, nLost, ev\.texts\.length - nLost\);/);
+  assert.deepEqual(bareGroupLabel(0, 1).parts.map((p) => p.text), ["sending…"]);
+  assert.deepEqual(bareGroupLabel(0, 2).parts.map((p) => p.text), ["sending 2…"]);
   assert.match(RENDER, /if \(label\.dataset\.bare === "1"\) \{/, "reflow keeps the bare vocabulary");
   assert.match(RENDER, /if \(!ev\.bare\) \{/, "the standard 'N queued' header still needs confirmation");
 });
@@ -138,7 +154,9 @@ test("EVERY ✕ stops our re-injection first; the optimistic one cancels by body
   // body (ws ordering puts it after the send it names); a miss comes back through the same loud
   // cancelResult, and the composer restore reverts (pendingCancelRestores).
   assert.match(RENDER, /if \(qmd\) \{/);
-  assert.match(RENDER, /const i = list\.findIndex\(\(p\) => p\.text === qmd\);/);
+  // …by the bubble's OWN identity when it has one (data-qts) — send-pending.test.ts runs the lookup
+  assert.match(RENDER, /const qts = el\.dataset\.qts !== undefined \? Number\(el\.dataset\.qts\) : undefined;\s*\n\s*if \(dropPending\(list, qmd, qts\)\)/);
+  assert.doesNotMatch(RENDER, /list\.findIndex\(\(p\) => p\.text === qmd\)/, "never 'the first entry with this text' for a bubble that names its entry");
   assert.match(RENDER, /echoShownSig\.delete\(sidQ\);/);
   assert.match(RENDER, /const msg: Record<string, unknown> = \{ type: "cancelQueued", id: sidQ, md: qmd \};/);
 });
@@ -150,61 +168,48 @@ test("chatTail speaks the KERNEL's coordinates — the injected tail is not part
   assert.match(RENDER, /if \(from > kernelLen\) \{/);
 });
 
-// Executed replica of reconcileOptimistic's decision, synced to the reshaped semantics: three outcomes
-// per entry per push — inject (payload has nothing), suppress (a kernel PROVISIONAL is visible: its
-// queued bubble or its "echo:" atom), retire (a NEW landed user atom beyond base, or the TTL).
+// The reconcile decision, EXECUTED through the real module: three outcomes per entry per push — inject
+// (payload has nothing), suppress (a kernel PROVISIONAL is visible: its queued bubble or its "echo:"
+// atom), retire (a NEW landed user atom beyond base). No fourth: the TTL is gone (send-pending.test.ts
+// pins the no-lifetime rule and the other retire event, the kernel's never-delivered verdict).
 test("reconcile: inject on nothing, suppress on kernel provisionals, retire only on NEW landings", () => {
-  type Ev = { kind: string; md?: string; uuid?: string; texts?: { md: string }[] };
-  const OPT_TTL_MS = 20_000, OPT_TAIL_SCAN = 30;
-  type P = { text: string; ts: number; base: number };
-  const reconcile = (events: Ev[], list: P[], now: number) => {
-    const tail = events.slice(-OPT_TAIL_SCAN);
-    const landedCount = (t: string) => tail.filter((e) =>
-      e.kind === "user" && typeof e.md === "string" && e.md.includes(t)
-      && !String(e.uuid || "").startsWith("echo:")).length;
-    const shownProvisional = (t: string) => tail.some((e) =>
-      (e.kind === "queued" && Array.isArray(e.texts) && e.texts.some((x) => typeof x.md === "string" && x.md.includes(t))) ||
-      (e.kind === "user" && typeof e.md === "string" && String(e.uuid || "").startsWith("echo:") && e.md.includes(t)));
-    for (const p of list) if (p.base < 0) p.base = landedCount(p.text);
-    const keep = list.filter((p) => now - p.ts < OPT_TTL_MS && landedCount(p.text) <= p.base);
-    return { keep, inject: keep.filter((p) => !shownProvisional(p.text)) };
-  };
   const T0 = 1_000_000;
-  const fresh = (): P[] => [{ text: "continue", ts: T0, base: -1 }];
+  const fresh = () => [newPending("continue", undefined, T0)];
+  const reconcile = (events: TailEvent[], list = fresh()) => reconcilePending(events, list);
 
   // gap: the payload carries nothing for it → keep AND inject
-  let r = reconcile([{ kind: "assistant", md: "working on the prior turn" }], fresh(), T0 + 500);
+  let r = reconcile([{ kind: "assistant", md: "working on the prior turn" }]);
   assert.equal(r.inject.length, 1);
 
   // DEFECT A (the resend): an OLDER identical message sits in the tail — base counts it as background,
   // so the new send still injects instead of retiring itself in the call that created it
-  r = reconcile([{ kind: "user", md: "continue", uuid: "u-old" }], fresh(), T0 + 500);
+  r = reconcile([{ kind: "user", md: "continue", uuid: "u-old" }]);
   assert.equal(r.inject.length, 1, "a resend must still show its own bubble");
 
   // …and the same protection for a short message that substrings an older bubble
-  r = reconcile([{ kind: "user", md: "test the continue button", uuid: "u-old" }], fresh(), T0 + 500);
+  r = reconcile([{ kind: "user", md: "test the continue button", uuid: "u-old" }]);
   assert.equal(r.inject.length, 1, "substring-of-history must not count as landed");
 
-  // kernel shows its QUEUED bubble → suppressed for this push, but NOT retired…
+  // kernel shows its QUEUED bubble for THIS send → suppressed for this push, but NOT retired… The press
+  // stamped a tail without the copy: a copy already listed AT the press is an older send's, background,
+  // and covers nothing (send-pending.test.ts, "what was already there at the press is background")
   const p = fresh();
-  r = reconcile([{ kind: "queued", texts: [{ md: "continue" }] }], p, T0 + 500);
+  reconcile([{ kind: "assistant", md: "working on the prior turn" }], p);   // the press
+  r = reconcile([{ kind: "queued", texts: [{ md: "continue" }] }], p);
   assert.equal(r.keep.length, 1);
   assert.equal(r.inject.length, 0, "no double render beside the kernel's own copy");
   // …same for the kernel's unlanded echo atom (uuid keeps the backend's echo: prefix)
-  r = reconcile([{ kind: "user", md: "continue", uuid: "echo:abc123" }], p, T0 + 800);
+  r = reconcile([{ kind: "user", md: "continue", uuid: "echo:abc123" }], p);
   assert.equal(r.keep.length, 1);
   assert.equal(r.inject.length, 0);
   // DEFECT B (the flash-out): the provisional blinks away in the echo→landed handoff — the entry
   // survived the suppression, so ours steps straight back in and the message never disappears
-  r = reconcile([{ kind: "assistant", md: "…" }], p, T0 + 1_100);
+  r = reconcile([{ kind: "assistant", md: "…" }], p);
   assert.equal(r.inject.length, 1, "the kept entry covers the kernel's own gap");
   // the real landing (a user atom with a real uuid, beyond base) finally retires it
-  r = reconcile([{ kind: "user", md: "continue", uuid: "u-new" }], p, T0 + 1_400);
+  r = reconcile([{ kind: "user", md: "continue", uuid: "u-new" }], p);
   assert.equal(r.keep.length, 0, "a NEW landed atom is the one retire event");
-
-  // TTL backstop: nothing ever surfaced, but past the window we stop asserting a possibly-dropped send
-  r = reconcile([{ kind: "assistant", md: "…" }], fresh(), T0 + OPT_TTL_MS + 1);
-  assert.equal(r.keep.length, 0);
+  assert.equal(r.landed.length, 1);
 });
 
 test("the echo renders dragged-image THUMBNAILS — composer → provisional → landed, one continuum", () => {
