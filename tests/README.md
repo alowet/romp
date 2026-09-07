@@ -93,5 +93,31 @@ the developer's git configuration (CI has none), and the env identity outranks
 exports its own `GIT_AUTHOR_*` after the floor. `tests/test_tempdir_hygiene.py`
 and `tests/git-hermetic.bats` pin all of it.
 
+**No test report shows a process-environment value or a credential-shaped
+token.** An assertion whose container is an environment mapping prints the
+whole mapping when it fails (`assertNotIn("X", os.environ)` renders every
+variable), and on a developer's machine that mapping can hold a live key. The
+fix is to test membership and name the key; the report hook in
+`tests/conftest.py` is the net for an assertion still written the other way.
+It redacts two things from every report's text and captured-output sections,
+whatever the outcome (so `-rA`/`-rP` output for passed tests too), and from
+collection reports: a value present in the process environment that is 16
+characters or longer becomes `[REDACTED-ENV-VALUE]`, whole and per
+whitespace-separated chunk (values are noted at the moment they are written
+into `os.environ`, so one set inside `mock.patch.dict` and gone before the
+assertion is caught too; exempt, never when the name is credential-shaped,
+are path-valued names such as `PWD`, `HOME`, `TMPDIR` and the interpreter
+paths GitHub Actions exports, the `XDG_*` and `PYTEST_*` families, and any
+value that is an absolute path this machine has), and a credential-shaped
+token becomes `[REDACTED-CREDENTIAL]` wherever it came from, by the patterns
+in `tests/credential_patterns.py` (public key prefixes, a JWT by its shape, a
+long token where a value sits, pytest's own renderings of a failed comparison
+included). A report the hook changes is rebuilt from the scrubbed text with
+its crash location kept, so the short test summary still ends in the
+assertion message; that report loses pytest's colour and source highlighting.
+One it leaves alone keeps pytest's own rendering.
+`tests/test_env_value_redaction.py` pins the rule, the write-time capture,
+the patterns, the scrub's cost and the hook end to end.
+
 `fixtures/` must stay SYNTHETIC: invented prompts, placeholder UUIDs, hostname
 `TESTHOST` — never real session data.
