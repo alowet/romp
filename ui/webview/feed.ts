@@ -30,6 +30,7 @@ import { initFileView, setFileViewIdentity, hostStub } from "./file-view";
 import { initFileBrowse, openFileBrowse } from "./file-browse";
 import { VIEW_STATE_KEY, parseViewState, serializeViewState, pruneViewState, capViewState, type FeedViewState } from "./feed-view-state";
 import { wireTip, setTip, pruneTip } from "./tip";
+import { perfFrameHandler } from "./perf-telemetry";
 
 // (The standalone-deliverable "FeedItem" subsystem was REMOVED 2026-07-07: the kernel had emitted
 // items: [] permanently — goal cards are the only feed unit — so its types, renderers, expand/detail
@@ -5259,7 +5260,9 @@ function applyFeedPayload(m: any): void {
 }
 
 
-window.addEventListener("message", (e: MessageEvent) => {
+// every frame's synchronous handling time is measured (perf-telemetry.ts: one clientDiag row a
+// minute, read by `romp perf client`); the handler itself is unchanged
+window.addEventListener("message", perfFrameHandler("feed", (m) => vscodeApi?.postMessage(m), (e: MessageEvent) => {
   const m = e.data;
   if (!m) return;
   if (m.type === "pipeState") { pipeBanner(!!m.up, Number(m.queued) || 0); return; }
@@ -5385,7 +5388,7 @@ window.addEventListener("message", (e: MessageEvent) => {
       ackFollowMove(top ? top.itemId : raw, !!m.ok, bid, ackHost);
     }
   }
-});
+}));
 
 // ---- quarantine decision dialog (the user 2026-07-26): the card is compact, so THIS is where the
 // whole held message is read and decided. Step 1: the full body, read-only (peer content, never
