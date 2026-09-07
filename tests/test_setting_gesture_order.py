@@ -986,7 +986,7 @@ class AutoNudgeTickIsSingleFlight(_Base):
             setattr(km, n, v)
         super().tearDown()
 
-    def _walk(self, s, now, tmux, nudged, waitfor, alive_ids=None):
+    def _walk(self, s, now, tmux, nudged, waitfor, alive_ids=None, wake_only=False):   # #936 adds the kwarg (toggle off → wake-only walk)
         """The per-session walk standing in for the SEND: the first pass to reach it holds here,
         mid-send, until the test releases it; every later pass records and returns at once."""
         self.sends.append(now)
