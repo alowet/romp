@@ -5809,8 +5809,8 @@ class ViewBuilder(unittest.TestCase):
             {"message": {"content": [{"type": "text", "text": "hi <!-- romp-msg-id: m1 -->"}]}},
             {"message": {"content": [{"type": "tool_result", "content": "inbox: <!-- romp-msg-id: m2 -->"}]}},
             {"message": {"content": "plain <!-- romp-msg-id: m3 -->"}}]}
-        self.assertEqual(set(km._seg_mids(seg)), {"m1", "m2", "m3"},
-                         "msg ids from text blocks, check_inbox tool_results, and string content")
+        self.assertEqual(km._seg_mids(seg), ["m1", "m2", "m3"],
+                         "msg ids from text blocks, check_inbox tool_results, and string content, in document order")
 
     def test_bind_message_exec_id_join(self):
         """A connector binds its exec to the recipient segment that carries its msg id (process-start),

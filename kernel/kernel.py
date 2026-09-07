@@ -22673,7 +22673,7 @@ def _fold_tasks(session):
     _read_task_store). Returns the tasks in creation
     order, or None if there were none. The webview renders this as a todo card (kind:'todo') and hides the
     raw Task* calls (ACK_TOOLS) — so the kernel emits the folded card and skips the raw tool events."""
-    out = {}                                              # tool_use_id → result text (carries 'Task #N')
+    out = {}                                              # tool_use_id → result content (a TaskCreate's carries 'Task #N')
     rejected = set()                                      # tool_use_ids whose result came back is_error
     for turn in session["turns"]:
         for a in turn["atoms"]:
@@ -22681,8 +22681,7 @@ def _fold_tasks(session):
                 continue
             for b in (a.get("message") or {}).get("content", []) or []:
                 if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id"):
-                    c = b.get("content")
-                    out[b["tool_use_id"]] = c if isinstance(c, str) else json.dumps(c)
+                    out[b["tool_use_id"]] = b.get("content")
                     if b.get("is_error"):
                         rejected.add(b["tool_use_id"])
     tasks, order = {}, 0
@@ -22707,7 +22706,12 @@ def _fold_tasks(session):
                     # id, as before.
                     if b.get("id") in rejected:
                         continue
-                    m = re.search(r"Task #(\d+)", out.get(b.get("id"), "") or "")
+                    # Only a TaskCreate's result is ever read, so only it is encoded, here, to the same text
+                    # the regex saw when every result was encoded up front. Encoding every Bash and Read
+                    # output (list-shaped ones, image blocks) for a value nothing read was 0.3% of the pusher
+                    # (cProfile of the push thread on a loaded kernel, 2026-09-06).
+                    r = out.get(b.get("id"), "")
+                    m = re.search(r"Task #(\d+)", (r if isinstance(r, str) else json.dumps(r)) or "")
                     tid = m.group(1) if m else "c%d" % order
                     af = inp.get("activeForm")
                     tasks[tid] = {"_order": order, "id": tid, "subject": str(inp.get("subject") or ""),
@@ -31055,10 +31059,37 @@ def _seg_prompt(seg):
     return blocks if isinstance(blocks, str) else ""
 
 
+def _encoded_mids(content, ids=None):
+    """POSTAL_RE's matches over json.dumps(content) — the search a list-shaped tool_result gets — computed
+    without encoding the whole result, appended to `ids` in document order. Only the strings the encoding
+    would write (dict keys and string values; every other value encodes to digits, true/false/null or
+    brackets) can carry a marker, and a match cannot cross the encoder's `, ` and `: ` separators (the id
+    admits no space), so encoding just the strings that hold the marker's literal and matching each alone
+    yields the same ids in the same order. A value json.dumps would refuse (an unexpected type) contributes
+    nothing instead of raising. Encoding every list-shaped result was 2.3% of the pusher (cProfile of the
+    push thread on a loaded kernel, 2026-09-06): those lists are mostly image and tool_reference blocks that
+    never carry a marker, and a base64 image block is the expensive part."""
+    if ids is None:
+        ids = []
+    if isinstance(content, str):
+        if "romp-msg-id" in content:
+            ids += jd.em.POSTAL_RE.findall(json.dumps(content))
+    elif isinstance(content, dict):
+        for k, v in content.items():
+            if isinstance(k, str) and "romp-msg-id" in k:
+                ids += jd.em.POSTAL_RE.findall(json.dumps(k))
+            _encoded_mids(v, ids)
+    elif isinstance(content, (list, tuple)):
+        for v in content:
+            _encoded_mids(v, ids)
+    return ids
+
+
 def _seg_mids(seg):
     """Postal message ids referenced anywhere in a segment (its romp-msg-id markers, in text blocks or
     a check_inbox tool_result) — joins a recipient's WORK segment to the message that triggered it, so
-    the timeline connector can bind to the true process-start."""
+    the timeline connector can bind to the true process-start. Called per segment on every timeline
+    build, so it reads the blocks in place (_encoded_mids) rather than encoding them."""
     ids = []
     for a in seg.get("atoms", []):
         msg = a.get("message") or {}
@@ -31070,10 +31101,15 @@ def _seg_mids(seg):
                 if not isinstance(b, dict):
                     continue
                 if b.get("type") == "text":
-                    ids += jd.em.POSTAL_RE.findall(b.get("text", ""))
+                    t = b.get("text")
+                    if isinstance(t, str):                # a null text field is skipped, not a TypeError
+                        ids += jd.em.POSTAL_RE.findall(t)
                 elif b.get("type") == "tool_result":
-                    c = b.get("content")
-                    ids += jd.em.POSTAL_RE.findall(c if isinstance(c, str) else json.dumps(c))
+                    c = b.get("content")                  # str | list[dict] | None from the SDK, as passed through
+                    if isinstance(c, str):
+                        ids += jd.em.POSTAL_RE.findall(c)
+                    elif c is not None:
+                        _encoded_mids(c, ids)
     return ids
 
 
