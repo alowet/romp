@@ -5434,6 +5434,20 @@ def _last_state(sid):
     return (val, vt)
 
 
+def _last_natural_state(sid):
+    """(value, t) of the most-recent state transition the SESSION itself produced — the rows romp
+    appended for a Stop press (`by` set: _record_idle and the SDK interrupt) skipped. A finished-turn
+    signal reads this one: a Stop press is the user's own act, not a turn the session finished (review
+    find on #937, 2026-09-07). Served from _states_rows, the append-incremental cache every other states
+    reader uses, so the turn tick's per-cycle ask is a stat while the log is quiet."""
+    val, vt = "", 0
+    for rec in _states_rows(sid):
+        if isinstance(rec, dict) and isinstance(rec.get("state"), str) and not rec.get("by"):
+            val = rec["state"]
+            vt = rec.get("t", vt)
+    return (val, vt)
+
+
 def _last_state_value(sid):
     """Just the value of _last_state — the most-recent STATE transition; '' when none."""
     return _last_state(sid)[0]
@@ -11573,7 +11587,7 @@ class TmuxBackend(sb.SessionBackend):
 
     def interrupt(self, sid):
         _interrupt(_name_of(sid) or sid)                  # Esc to stop + clear the restored prompt
-        _record_idle(str(sid), int(time.time()))          # Esc writes no end_turn → settle idle (was done in the
+        _record_idle(str(sid), int(time.time()), by="interrupt")   # Esc writes no end_turn → settle idle (was done in the
         return True                                       #   dispatch; here so tmux+SDK interrupt both settle idle)
 
     def dismiss_dialog(self, sid):
@@ -16392,19 +16406,28 @@ def _record_death(sid, now, by):
     return True
 
 
-def _record_idle(sid, now):
+def _record_idle(sid, now, by=""):
     """Append a state:"idle" transition to states/<sid>.jsonl so the session reads as DONE on the next build.
     The chat status chip is driven by the event-model open-turn signal (open turn + no idle atom): a normal
     turn flips it via the transcript's end_turn, but an Esc INTERRUPT writes no end_turn and the Stop hook
     doesn't fire — so without this the chip stays 'working' after Stop (the user 2026-06-20). Backdated 1s so
-    synthesize_idle's [start,end] span is non-empty on the very next build (end=now > start=now-1)."""
+    synthesize_idle's [start,end] span is non-empty on the very next build (end=now > start=now-1).
+
+    `by` tags who wrote it, for the ONE reader that must tell a romp-written settle from a turn the
+    session finished — the turn-finished push (_last_natural_state, #937 fold). Default "" writes the
+    plain row every other reader keys on by "state"; an Esc interrupt passes "interrupt". The death
+    path leaves it "" on purpose: a dead session is not in _alive_sessions, so it never reaches the
+    turn push, and the row stays byte-identical to a Stop-hook idle (one state vocabulary)."""
     if not sid:
         return
     try:
         sdir = jd.STATE / "states"
         sdir.mkdir(parents=True, exist_ok=True)
+        rec = {"t": int(now) - 1, "state": "idle"}
+        if by:
+            rec["by"] = by
         with open(sdir / (sid + ".jsonl"), "a") as f:
-            f.write(json.dumps({"t": int(now) - 1, "state": "idle"}) + "\n")
+            f.write(json.dumps(rec) + "\n")
     except Exception:
         pass
 
@@ -30924,6 +30947,12 @@ def _cached_feed(now, tmux, sig, connect=False):
         # whichever of the two files first buzzes, the other yields. The desktop notice above and
         # the badge below are not the buzz and never yield.
         if not _buzz_claim(_sid, _turn_end_key(_sid), "bell"):
+            # the turn push already buzzed for this turn end, but carried no badge — and a CLOSED
+            # installed app learns the needs-you count only from a push (review find on #937,
+            # 2026-09-07). Send the card push QUIET: no sound, no re-alert; the per-session tag
+            # replaces the turn notification with the more informative card one, and the icon count
+            # stays current. Local only — the count is this kernel's.
+            _push_notify(_t, _b, _sid, _badge, kind="card", card_id=_iid, quiet=True)
             continue
         # same events to subscribed phones (plans/ios-app.md); kind + card id are what the tap acts on
         _push_notify(_t, _b, _sid, _badge, kind="card", card_id=_iid)
@@ -31250,7 +31279,7 @@ def _push_test(endpoint, sid="", host="", label=""):
     return res
 
 
-def _push_payload(title, body, sid="", badge=None, kind="card", card_id="", host=""):
+def _push_payload(title, body, sid="", badge=None, kind="card", card_id="", host="", quiet=False):
     """The JSON one web push carries — the ONE builder every push kind goes through, so a tap on
     any of them lands the same way (the user 2026-09-06, who wants a tap to focus the romp
     window they already have open and put them on the session — and card — that buzzed).
@@ -31288,10 +31317,15 @@ def _push_payload(title, body, sid="", badge=None, kind="card", card_id="", host
          "data": {"sid": sid, "host": host, "kind": kind, "cardId": card_id, "url": url}}
     if badge is not None:
         d["badge"] = int(badge or 0)
+    if quiet:
+        # a card push that yields the BUZZ to an already-fired turn push, but still carries the badge
+        # (#937 fold): the worker shows it silent, without re-alerting, so the per-session tag replaces
+        # the turn notification and the icon count stays current
+        d["quiet"] = True
     return d
 
 
-def _push_notify(title, body, sid="", badge=None, kind="card", card_id="", host=""):
+def _push_notify(title, body, sid="", badge=None, kind="card", card_id="", host="", quiet=False):
     """_system_notify's sibling sink: the same (title, body) — the card's gist and nothing more —
     to every subscribed device, plus the ROUTING metadata _push_payload documents: sid, so
     tapping the notification lands on the session that fired (the user 2026-08-08); badge, the
@@ -31309,7 +31343,7 @@ def _push_notify(title, body, sid="", badge=None, kind="card", card_id="", host=
         print("romp: web push: %d subscription(s) on file but the python 'cryptography' package "
               "is missing — notification not delivered" % len(subs), file=sys.stderr)
         return
-    payload = json.dumps(_push_payload(title, body, sid, badge, kind, card_id, host)).encode()
+    payload = json.dumps(_push_payload(title, body, sid, badge, kind, card_id, host, quiet=quiet)).encode()
 
     def run():
         dead = []
@@ -31390,8 +31424,10 @@ def _turn_end_key(sid):
         t = 0
     if t:
         return t
-    val, vt = _last_state(sid)
+    val, vt = _last_natural_state(sid)          # the session's own settle — never the idle romp wrote for a Stop press
     return (vt or 0) if val in ("waiting", "idle") else 0
+
+
 
 
 def _buzz_claim(sid, key, kind):
@@ -31466,7 +31502,8 @@ var d={};try{d=e.data?e.data.json():{};}catch(err){}
 // lock screen instead of stacking (renotify keeps it audible); the kernel picks the tag.
 var opts={body:d.body||'',icon:'/media/romp-app-192.png',badge:'/media/romp-app-192.png',
 data:(d.data&&typeof d.data==='object')?d.data:{sid:d.sid||''}};
-if(d.tag){opts.tag=d.tag;opts.renotify=true;}
+if(d.tag){opts.tag=d.tag;opts.renotify=!d.quiet;}   // a quiet push replaces without re-alerting
+if(d.quiet)opts.silent=true;
 var work=[self.registration.showNotification(d.title||'romp',opts)];
 // the app-icon count, kept current while the app is CLOSED (the open shell re-paints it live over
 // its own WS). setAppBadge exists in the SW only where badging works at all (iOS installed apps).
@@ -35333,7 +35370,7 @@ def _landing():
             # phone can be set up before anything is switched on.
             "<div id=rbell-back hidden><div id=rbell-pop role=dialog aria-label='Notification settings'>"
             "<div class=rbp-row data-act=all role=switch aria-checked=false><div class=rbp-head>Notifications<span class=rbp-sw></span></div>"
-            "<div class=rbp-sub>The main switch: off silences every device, and the desktop of every machine you've attached. "
+            "<div class=rbp-sub>The main switch: off silences every device subscribed to this romp, and this desktop. "
             "The bells on sessions and cards are mutes under it.</div></div>"
             "<div class=rbp-nest>"
             "<div class=rbp-row data-act=dev role=switch aria-checked=false><div class=rbp-head>This device<span class=rbp-sw></span></div>"
@@ -36510,6 +36547,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, json.dumps({"ok": False, "mirrored": 0,
                                                        "tier": tier or "unknown"}), "application/json")
                 n = 0
+                held = {"all": 0, "turn": 0}
                 for ev in events[:16]:            # a bell mirror, not a bulk pipe — cap the fan-in
                     if not isinstance(ev, dict):
                         continue
@@ -36517,6 +36555,18 @@ class Handler(BaseHTTPRequestHandler):
                     b = str(ev.get("body") or "")
                     sid = str(ev.get("sid") or "")
                     if not (t or b):
+                        continue
+                    # THIS kernel's switches gate what reaches the devices subscribed HERE (review find on
+                    # #937, 2026-09-07): the origin gated on ITS switches, so a peer whose turn switch was
+                    # on buzzed a phone whose own kernel had the switch off — and the popover copy said the
+                    # main switch silenced every device. The subscriber's kernel is authoritative for its
+                    # own devices: the master drops everything, the turn switch drops the turn events.
+                    kind = str(ev.get("kind") or "card")
+                    if not _notify_all_on():
+                        held["all"] += 1
+                        continue
+                    if kind == "turn" and not _notify_turns_on():
+                        held["turn"] += 1
                         continue
                     # Wear the origin the way every federated surface wears it (host-prefix.ts):
                     # the sid gains "origin:" so a tap routes through the merged dashboard's own
@@ -36531,9 +36581,13 @@ class Handler(BaseHTTPRequestHandler):
                     # (an older peer sends neither → the card default, which is all it had);
                     # the card id is a goal id, globally unique and never host-prefixed
                     # (federation.ts), so the merged feed finds it as-is.
-                    _push_notify(t, b, sid, kind=str(ev.get("kind") or "card"),
-                                 card_id=str(ev.get("cardId") or ""), host=origin)
+                    _push_notify(t, b, sid, kind=kind, card_id=str(ev.get("cardId") or ""), host=origin)
                     n += 1
+                if held["all"] or held["turn"]:
+                    print("romp: web push: held %d event(s) relayed from '%s' — %d under this kernel's "
+                          "main notification switch (off), %d turn-finished event(s) under its turn switch "
+                          "(off); the switches here decide what reaches the devices subscribed here"
+                          % (held["all"] + held["turn"], origin, held["all"], held["turn"]), file=sys.stderr)
                 return self._send(200, json.dumps({"ok": True, "mirrored": n}), "application/json")
             if u.path == "/reveal":
                 # The cold-start half of a push tap (see _PENDING_REVEAL): the freshly opened

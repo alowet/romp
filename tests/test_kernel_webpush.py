@@ -131,7 +131,8 @@ class ServiceWorkerRoute(unittest.TestCase):
         js = body.decode()
         self.assertIn("data:(d.data&&typeof d.data==='object')?d.data:{sid:d.sid||''}", js,
                       "the routing block verbatim; an older kernel's flat sid still lands")
-        self.assertIn("opts.tag=d.tag;opts.renotify=true", js, "one notification per session, still audible")
+        self.assertIn("opts.tag=d.tag;opts.renotify=!d.quiet", js, "one notification per session, still audible unless it is the quiet card push that yields the buzz")
+        self.assertIn("if(d.quiet)opts.silent=true", js, "a quiet push carries the badge without re-alerting")
         self.assertIn("romp:'notificationClick'", js)
         self.assertIn("clients.openWindow(url)", js)
         self.assertIn("/?push-reveal=", js)              # the fallback deep link for a data block without one

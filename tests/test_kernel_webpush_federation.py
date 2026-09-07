@@ -130,9 +130,13 @@ class PushForward(unittest.TestCase):
 class RelayRoute(unittest.TestCase):
     def setUp(self):
         _clear_remotes()
+        km._set_notify_all(True)                # THIS kernel is authoritative for its devices (#937 fold):
+        km._set_notify_turns(True)              # a relayed event reaches them only while its switches are on
 
     def tearDown(self):
         _clear_remotes()
+        km._set_notify_all(False)
+        km._set_notify_turns(False)
 
     def _relay(self, body, token=True):
         headers = {"X-Romp-Token": km.TOKEN} if token else {}
@@ -160,6 +164,23 @@ class RelayRoute(unittest.TestCase):
             status, _, pn, _, _ = self._relay(bad)
             self.assertEqual(status, 400)
             pn.assert_not_called()
+
+    def test_the_receivers_switches_gate_a_relayed_event(self):
+        # the subscriber's own kernel decides what reaches its devices, not the origin's switches
+        # (#937 fold): master off drops everything, turn switch off drops the turn-kind events
+        _seed_remote("boxa", "trusted")
+        card = {"title": "romp: web", "body": "Needs you", "sid": "s", "kind": "card"}
+        turn = {"title": "web", "body": "Done", "sid": "s", "kind": "turn"}
+        km._set_notify_all(False)
+        status, parsed, pn, _, err = self._relay({"origin": "boxa", "events": [card, turn]})
+        self.assertEqual((status, parsed["mirrored"]), (200, 0), "master off holds both")
+        pn.assert_not_called()
+        self.assertIn("held 2 event(s) relayed from 'boxa'", err)
+        km._set_notify_all(True)
+        km._set_notify_turns(False)
+        status, parsed, pn, _, err = self._relay({"origin": "boxa", "events": [card, turn]})
+        self.assertEqual((status, parsed["mirrored"]), (200, 1), "turn switch off holds only the turn event")
+        pn.assert_called_once_with("romp: boxa:web", "Needs you", "boxa:s", kind="card", card_id="", host="boxa")
 
     def test_a_trusted_origin_mirrors_wearing_its_host_prefix(self):
         _seed_remote("boxa", "trusted")
