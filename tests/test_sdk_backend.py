@@ -4696,7 +4696,8 @@ class SettleBeforePoke(unittest.TestCase):
         # busy() is inflight>0 or _pending; the input generator pops _pending and must count the turn in
         # flight under the SAME lock, or a drain re-running right after a delivery reads the gap as idle
         src = open(os.path.join(BIN, "romp_sdk_backend.py"), encoding="utf-8").read()
-        body = src[src.index("async def inputs():"):src.index("async def drain(client):")]
+        body = src[src.index("async def inputs():"):src.index("# Reconnect loop:")]   # the generator, up to the
+        #   connect loop that follows it (the receive side is SdkSession._drain since 2026-09-06)
         self.assertLess(body.index("self.inflight += 1"), body.index("if item is None:"),
                         "the increment sits inside the lock block that popped the item")
         self.assertLess(body.index("self.inflight += 1"), body.index("self._persist_queue()"),
