@@ -245,17 +245,33 @@ registerFileViewAction(githubLinkAction);
 
 // ── quote a passage into the composer (the user 2026-08-23, the three-verbs consolidation) ────────
 // Selecting text in the viewer seeds the SAME labeled quote chip a VS Code editor highlight does:
-// the selection posts to our own window in the editorSelection shape, so render.ts's existing
-// handler owns the chip end to end (no import cycle — the browseFiles precedent), labeled path:line
-// via quoteSrcLabel. From there the flow is the chat's own: type a note (or none), Stage, keep
-// going, send once. This REPLACED the viewer's separate review layer — the per-file comment store
-// (romp:fileviewComments), the painted marks, and the one-shot Submit that assembled a message —
-// because batching notes for one hand-off is exactly what quote chips + ⌘⏎ staging already do,
-// and "comment" now means only the transcript's live threads.
+// the selection posts in the editorSelection shape to the composer's window — this document's, or
+// the shell's chat pane (composerWindow below) — so render.ts's existing handler owns the chip end
+// to end (no import cycle — the browseFiles precedent), labeled path:line via quoteSrcLabel. From
+// there the flow is the chat's own: type a note (or none), Stage, keep going, send once. This
+// REPLACED the viewer's separate review layer — the per-file comment store (romp:fileviewComments),
+// the painted marks, and the one-shot Submit that assembled a message — because batching notes for
+// one hand-off is exactly what quote chips + ⌘⏎ staging already do, and "comment" now means only
+// the transcript's live threads.
 
 // The retired store's data would otherwise sit in localStorage forever on every browser that
 // ever commented — sweep it on load.
 try { localStorage.removeItem("romp:fileviewComments"); } catch { /* storage may be denied */ }
+
+// Where a quote seed lands (2026-09-03): the composer in THIS document when there is one (the
+// chat-hosted viewer posts to its own window, and render.ts's editorSelection handler owns the chip
+// end to end); otherwise the SHELL, when this document is framed by one. The feed (the file browser's
+// document) hosts the viewer without a composer, and the shell forwards the seed into the chat pane
+// (the editorSelection arm in kernel.py's landing shell). Before this, a selection in the feed-hosted
+// viewer was dead air. No composer and no shell (a VS Code webview's cross-origin parent throws; a
+// standalone pane has none) → null, and the gesture stands down without a fresh read. Presence is the
+// DOM id, the Back button's import-free idiom (render.ts's inRompShell keys on the same node).
+function composerWindow(): Window | null {
+  if (document.getElementById("composer-input")) return window;
+  try { if (window.parent !== window && window.parent.document.getElementById("chat-pane")) return window.parent; }
+  catch { /* a cross-origin parent (VS Code) is not the romp shell */ }
+  return null;
+}
 
 export function closeFileView(): void {
   const wrap = document.getElementById("romp-fileview");
@@ -560,6 +576,12 @@ export function openFileView(path: string, sid?: string | null): void {
   let seedSeq = 0;                                 // last gesture wins if two fresh reads race
   box.addEventListener("mouseup", () => {
     if (editing) return;   // CodeMirror selections are edit gestures, not quotes
+    // No chip target reachable → no seed (the no-sink gating): the post would be dead air and the
+    // label's fresh read dead work. The target is this document's composer (the chat-hosted viewer)
+    // or, from a pane without one — the feed — the shell, which forwards the seed into the chat pane
+    // (composerWindow above).
+    const seedTarget = composerWindow();
+    if (!seedTarget) return;
     // RENDERED media has no honest text to quote — an <img>/iframe body owns its own selection
     // surface; the SVG SOURCE view is a real text view and quotes like any other (renderBody's
     // media gate, same rule).
@@ -580,8 +602,8 @@ export function openFileView(path: string, sid?: string | null): void {
       .catch(() => viewText())
       .then((doc) => {
         if (seq !== seedSeq) return;
-        try { window.postMessage({ type: "editorSelection", text: picked, sid: sid || undefined, src: quoteSrcLabel(path, doc, picked) }, "*"); }
-        catch { /* messaging our own window cannot really fail */ }
+        try { seedTarget.postMessage({ type: "editorSelection", text: picked, sid: sid || undefined, src: quoteSrcLabel(path, doc, picked) }, "*"); }
+        catch { /* messaging our own window or the same-origin shell cannot really fail */ }
       });
   });
 

@@ -78,10 +78,11 @@ test("the viewer is a singleton MODAL over its pane: ~95% card, dimmed backdrop,
 // chat already has. "Comment" means only the transcript's live threads now. ──
 
 test("selecting in the viewer seeds the composer's editor chip — the editorSelection shape, path:line label", () => {
-  // mouseup posts to our OWN window (the browseFiles precedent — no import cycle with render.ts),
+  // mouseup posts to the composer's window — this document's when it holds one (the browseFiles
+  // precedent — no import cycle with render.ts), else the shell's chat pane (composerWindow, below) —
   // and render.ts's existing editorSelection handler owns the chip end to end
   assert.match(VIEW, /box\.addEventListener\("mouseup", \(\) => \{/);
-  assert.match(VIEW, /window\.postMessage\(\{ type: "editorSelection", text: picked, sid: sid \|\| undefined, src: quoteSrcLabel\(path, doc, picked\) \}, "\*"\);/);
+  assert.match(VIEW, /seedTarget\.postMessage\(\{ type: "editorSelection", text: picked, sid: sid \|\| undefined, src: quoteSrcLabel\(path, doc, picked\) \}, "\*"\);/);
   // a collapsed or out-of-viewer selection seeds nothing, and CodeMirror selections are edits
   assert.match(VIEW, /if \(!sel \|\| sel\.isCollapsed \|\| !sel\.anchorNode \|\| !box\.contains\(sel\.anchorNode\)\) return;/);
   assert.match(VIEW, /if \(editing\) return;/);
@@ -107,14 +108,47 @@ test("the label's line is minted against a FRESH read, and a failed re-read fall
   assert.match(VIEW, /if \(seq !== seedSeq\) return;/, "two racing reads: the last gesture wins");
 });
 
-test("the FEED-hosted viewer stays inert: no editorSelection listener there, and no review layer anywhere", () => {
-  // the feed document has no composer — the posted message just lands unheard, by design
+test("a viewer whose document has no composer seeds THROUGH the shell: the feed reaches the chat's chip", () => {
+  // The feed document has no composer, so a post to its own window landed unheard — the guide's
+  // promise that any passage selected in the viewer lands in the composer was false for a file opened
+  // from the feed's file browser, and each selection still paid the fresh read. So the TARGET is
+  // resolved: this window when it holds the composer, else the same-origin shell, which forwards the
+  // unchanged message into the chat pane. No composer and no shell (VS Code's cross-origin parent, a
+  // standalone pane) still stands the gesture down before the fresh read (the no-sink gating).
+  assert.match(VIEW, /function composerWindow\(\): Window \| null \{\n\s*if \(document\.getElementById\("composer-input"\)\) return window;\n\s*try \{ if \(window\.parent !== window && window\.parent\.document\.getElementById\("chat-pane"\)\) return window\.parent; \}\n\s*catch \{[^}]*\}\n\s*return null;\n\}/);
+  assert.match(VIEW, /const seedTarget = composerWindow\(\);\n\s*if \(!seedTarget\) return;/);
+  // the shell's arm: the SAME message, forwarded whole into the chat frame — sid intact, so the chip
+  // lands in the session the file was opened for (the 2026-08-19 routing rule holds across documents)
+  const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
+  assert.match(KERNEL, /if\(m\.type==='editorSelection'&&typeof m\.text==='string'\)\{var fc=document\.getElementById\('f-chat'\);\n\s*try\{fc&&fc\.contentWindow&&fc\.contentWindow\.postMessage\(m,'\*'\);\}catch\(e\)\{\}\}/);
+  // …and the chat's existing window-message handler is the receiver: nothing new listens in feed.ts
+  assert.match(RENDER, /else if \(m\.type === "editorSelection" && typeof m\.text === "string" && m\.text\.trim\(\)\) \{/);
   assert.doesNotMatch(FEED, /editorSelection/);
   // the review layer is gone from every module and both sheets, and the orphaned store is swept
   for (const source of [VIEW, RENDER, FEED, CHAT_CSS, FEED_CSS]) {
     assert.doesNotMatch(source, /setCommentSink|buildReviewMessage|fv-hl|fileview-submit/);
   }
   assert.match(VIEW, /localStorage\.removeItem\("romp:fileviewComments"\)/);
+});
+
+// executed: composerWindow's ladder, lifted from the source (a hand copy would drift), run against
+// shimmed window/document pairs for each hosting situation
+test("composerWindow, executed: own composer → the same-origin shell's chat pane → nothing", () => {
+  const m = VIEW.match(/function composerWindow\(\): Window \| null \{[\s\S]*?\n\}/);
+  assert.ok(m, "composerWindow found");
+  const body = m![0].replace(/^function composerWindow\(\): Window \| null /, "");
+  const run = new Function("window", "document", "return (function()" + body + ")();") as (w: unknown, d: unknown) => unknown;
+  const doc = (ids: string[]) => ({ getElementById: (id: string) => (ids.includes(id) ? {} : null) });
+  const self: any = {}; self.parent = self;
+  assert.equal(run(self, doc(["composer-input"])), self, "the chat document: its own window");
+  const shell = { document: doc(["chat-pane"]) };
+  const framed = { parent: shell };
+  assert.equal(run(framed, doc([])), shell, "a pane inside the shell: the shell, which forwards into the chat");
+  assert.equal(run(framed, doc(["composer-input"])), framed, "a composer at hand always wins over the relay");
+  assert.equal(run({ parent: { get document() { throw new Error("cross-origin"); } } }, doc([])), null,
+    "VS Code's cross-origin parent is not the shell — the gesture stands down");
+  assert.equal(run({ parent: { document: doc([]) } }, doc([])), null, "a same-origin parent that is not the shell");
+  assert.equal(run(self, doc([])), null, "unframed and composer-less: nowhere to seed");
 });
 
 test("it waits with the romp loader and fails with the kernel's own words, never a blank pane", () => {
@@ -434,16 +468,18 @@ test("a 200 image renders ONE <img> at an object URL; the quote gesture stays of
 // a selection there seeds a labeled quote chip exactly as in any text view; a blanket media gate
 // would make an .svg's XML unquotable. ──
 test("the quote seed gates off RENDERED media only — the SVG Source view is a text view like any other", () => {
-  // executed: the seed offer across the view states
-  const seedable = (isImage: boolean, isPdf: boolean, srcView: boolean): boolean =>
-    !((isImage || isPdf) && !srcView);
-  assert.equal(seedable(true, false, true), true, "SVG Source view: the selection seeds a chip");
-  assert.equal(seedable(true, false, false), false, "the img view has no honest text to quote");
-  assert.equal(seedable(false, true, false), false, "the PDF iframe owns its own surface");
-  assert.equal(seedable(false, false, false), true, "plain text views are untouched");
-  // source: the media arm of the mouseup gate carves out the Source view, sitting right after the
-  // edit-mode gate (CodeMirror selections are edit gestures, not quotes)
-  assert.match(VIEW, /if \(editing\) return;[^\n]*\n(\s*\/\/[^\n]*\n)*\s*if \(\(isImage \|\| isPdf\) && !\(svgSource && svgText !== null\)\) return;/);
+  // executed: the seed offer across the view states (the no-target gate holds throughout — a
+  // reachable composer, own document or the chat's through the shell, is what makes a gesture)
+  const seedable = (target: boolean, isImage: boolean, isPdf: boolean, srcView: boolean): boolean =>
+    target && !((isImage || isPdf) && !srcView);
+  assert.equal(seedable(true, true, false, true), true, "SVG Source view: the selection seeds a chip");
+  assert.equal(seedable(true, true, false, false), false, "the img view has no honest text to quote");
+  assert.equal(seedable(true, false, true, false), false, "the PDF iframe owns its own surface");
+  assert.equal(seedable(false, true, false, true), false, "no composer reachable still gates everything off");
+  assert.equal(seedable(true, false, false, false), true, "plain text views are untouched");
+  // source: the media arm of the mouseup gate carves out the Source view, sitting AFTER the
+  // no-target gate (whose pin lives in the through-the-shell test above)
+  assert.match(VIEW, /if \(!seedTarget\) return;\n(\s*\/\/[^\n]*\n)*\s*if \(\(isImage \|\| isPdf\) && !\(svgSource && svgText !== null\)\) return;/);
   // anchoring reads the text THE VIEW SHOWS — the Source view's decoded XML, never the text
   // pipeline's null — so a quote on the XML earns its path:line label (viewText, pinned with the
   // fresh-read test above); renderBody's Source arm builds those text nodes through codeBlock

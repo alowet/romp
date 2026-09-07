@@ -260,6 +260,17 @@ class LandingShell(unittest.TestCase):
         self.assertIn("html.ios-standalone #mtabs{padding-bottom:env(safe-area-inset-bottom,0px)}", html)
         self.assertIn("#mtabs{display:flex;position:fixed;left:0;right:0;bottom:0", html)
 
+    def test_the_shell_forwards_a_quote_seed_from_a_composerless_pane_into_the_chat(self):
+        # A passage selected in the file viewer hosted by the FEED pane (the file browser's document)
+        # has no composer in its own document; file-view.ts posts the editorSelection message up to the
+        # shell, which forwards it whole into the chat iframe, whose existing handler seeds the labeled
+        # quote chip for m.sid. The arm sits in the same listener as the browseFiles relay, and the chat
+        # iframe carries the id it keys on.
+        js = km._LANDING_SETTINGS_JS
+        self.assertIn("if(m.type==='editorSelection'&&typeof m.text==='string'){var fc=document.getElementById('f-chat');", js)
+        self.assertIn("try{fc&&fc.contentWindow&&fc.contentWindow.postMessage(m,'*');}catch(e){}}", js)
+        self.assertIn("<iframe id=f-chat class=m-on src=/chat>", km._landing())
+
 
 class TimelineTouchSurface(unittest.TestCase):
     def test_timeline_fits_svg_and_drops_overflow_scroller_on_touch(self):

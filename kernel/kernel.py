@@ -31984,6 +31984,13 @@ if(m.romp==='browseFiles'){var bf=document.getElementById('f-feed');
     try{window.__rompPaneToggle&&window.__rompPaneToggle('feed',true);}catch(e){}}
   try{window.__rompMobileTab&&window.__rompMobileTab('feed');}catch(e){}   // phone: one pane at a time
   try{bf&&bf.contentWindow&&bf.contentWindow.postMessage({romp:'browseFiles',path:m.path,sid:m.sid},'*');}catch(e){}}
+// A passage selected in a viewer hosted by a pane with NO composer (the feed) posts up in the
+// editorSelection shape the chat already handles (file-view.ts composerWindow); the shell forwards it
+// whole into the chat pane, whose composer seeds the labeled quote chip for the session the file was
+// opened for (m.sid beats the active tab there). The chat-hosted viewer posts to its own window and
+// never gets here.
+if(m.type==='editorSelection'&&typeof m.text==='string'){var fc=document.getElementById('f-chat');
+  try{fc&&fc.contentWindow&&fc.contentWindow.postMessage(m,'*');}catch(e){}}
 // the browser owns the restore: browseClosed alone puts a brought-forward feed back the way it was
 if(m.romp==='browseClosed'&&window.__rompFeedWasOff){window.__rompFeedWasOff=false;
   try{window.__rompPaneToggle&&window.__rompPaneToggle('feed',false);}catch(e){}}});
