@@ -788,6 +788,14 @@ function initGear(post) {
     'index-model': 'setIndexModel', 'index-effort': 'setIndexEffort',
     'distill-model': 'setDistillModel', 'distill-effort': 'setDistillEffort',
     'comment-model': 'setCommentModel', 'comment-effort': 'setCommentEffort', 'comment-fast': 'setCommentFast' };
+  // store name → the words its select shows for the sentinel options whose value is not the word. The
+  // effort selects' Default is the EMPTY value (no effort flag), which read as no value at all, so a
+  // refused Default pick drew the value-less copy and a plain Apply anyway — in the frozen-tab case, the
+  // one pick the user most needs to see named (#967 review). Kept in step with paintChoices' option
+  // lists: setting-stale.test.ts pins every literal sentinel there against this map.
+  var STALE_WORDS = { 'judge-effort': { '': 'Default' }, 'index-effort': { '': 'Default' },
+    'distill-model': { 'triage': 'Follow triage' }, 'distill-effort': { 'triage': 'Follow triage', 'none': 'Default' },
+    'comment-model': { 'session': 'Same as the session', 'default': 'Default' }, 'comment-effort': { 'session': 'Same as the session' } };
   // Dismissal is the warn-toast FAMILY treatment (the user 2026-08-25: a notice with no visible
   // way out gets in the way — worst on touch, and this toast's mint site is a frozen phone tab
   // flushing on recovery): a visible ✕ in the chip-✕ dress, the whole toast still click-dismisses,
@@ -844,8 +852,13 @@ function initGear(post) {
     return label + ': ' + (refused ? refused + ' was not applied on ' : 'not applied on ') + hosts.join(', ') + '.'
       + (kept ? ' Keeping ' + kept + '.' : '');
   }
-  // Values read as words: a boolean toggle's on/off, a string as itself, anything else as absent.
-  function staleWord(v) { return v === true ? 'on' : v === false ? 'off' : (typeof v === 'string' && v ? v : ''); }
+  // Values read as words: a boolean toggle's on/off, a select's sentinel by the name the select shows for
+  // it (STALE_WORDS, per setting), any other string as itself, anything else as absent.
+  function staleWord(v, setting) {
+    var words = STALE_WORDS[setting];
+    if (words && typeof v === 'string' && Object.prototype.hasOwnProperty.call(words, v)) return words[v];
+    return v === true ? 'on' : v === false ? 'off' : (typeof v === 'string' && v ? v : '');
+  }
   // The value the refused gesture carried. Every emitter posts {type, <one value field>, gt} and the
   // kernel echoes it without gt, so the value is the echo's one key beside type — read generically
   // rather than through a third type→field map kept in step with STALE_TYPE. Trusted only for the
@@ -855,7 +868,7 @@ function initGear(post) {
   function staleRefused(m) {
     if (!m.gesture || typeof m.gesture !== 'object' || STALE_TYPE[m.setting] !== m.gesture.type) return '';
     var keys = Object.keys(m.gesture).filter(function (k) { return k !== 'type'; });
-    return keys.length === 1 ? staleWord(m.gesture[keys[0]]) : '';
+    return keys.length === 1 ? staleWord(m.gesture[keys[0]], m.setting) : '';
   }
   // One toast per refused GESTURE, not per refusing kernel: a dashboard's broadcast reaches every
   // linked kernel, so one stale flush used to draw N identical toasts naming no host. The fold key
@@ -888,7 +901,7 @@ function initGear(post) {
     if (!m || m.type !== 'settingStale') return;
     gclock.learn(m.setting, m.storedGt);   // the frame IS new information about that store's clock
     var label = STALE_LABELS[m.setting] || String(m.setting || 'A setting');
-    var kept = staleWord(m.kept);
+    var kept = staleWord(m.kept, m.setting);
     var refused = staleRefused(m);
     var key = typeof m.gt === 'number' ? m.setting + ':' + m.gt : '';
     var live = key && staleOpen[key] && staleLive(staleOpen[key].t) ? staleOpen[key] : null;

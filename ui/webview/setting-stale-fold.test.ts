@@ -167,6 +167,31 @@ test("no action when the echo's type is not the setting's, or when there is no e
   assert.deepEqual(g.texts(), ["Triage model: not applied on web. Keeping fable.", "Triage model: not applied on web. Keeping fable."]);
 });
 
+test("a refused Default effort pick reads by the name its select shows, not as no value (the #967 review)", () => {
+  // the effort selects' Default option is the EMPTY value (no effort flag); staleWord('') read it as no
+  // value, so a refused Default drew the value-less copy and a plain Apply anyway — the frozen-tab case
+  // the refused value exists for. Every sentinel option a select renders under another name reads by
+  // that name, the kept value included; the re-issue still sends the value, not the word.
+  const g = lift();
+  g.frame({ type: "settingStale", setting: "judge-effort", storedGt: 2000, gt: 1000, kept: "high",
+            gesture: { type: "setJudgeEffort", effort: "" }, host: "web" });
+  assert.deepEqual(g.texts(), ["Triage effort: Default was not applied on web. Keeping high."]);
+  const btn = g.box().children[0].children.find((c) => c.className === "rs-stale-toast-act")!;
+  assert.equal(btn.textContent, "Apply Default anyway", "the label names the pick");
+  assert.ok(btn.title.includes("Default"), "…and so does the tooltip: " + btn.title);
+  btn.clicks.forEach((fn) => fn({}));
+  assert.deepEqual(g.posts, [{ type: "setJudgeEffort", effort: "", gt: 7777 }], "the echo re-issued as sent: the empty value, never the word");
+  g.frame({ type: "settingStale", setting: "distill-effort", storedGt: 2000, gt: 1001, kept: "triage",
+            gesture: { type: "setDistillEffort", effort: "none" }, host: "web" });
+  assert.equal(g.texts()[1], "Distilling effort: Default was not applied on web. Keeping Follow triage.", "the distilling pair's two sentinels");
+  g.frame({ type: "settingStale", setting: "comment-model", storedGt: 2000, gt: 1002, kept: "default",
+            gesture: { type: "setCommentModel", model: "session" }, host: "web" });
+  assert.equal(g.texts()[2], "Comment model: Same as the session was not applied on web. Keeping Default.", "the comment pair's");
+  g.frame({ type: "settingStale", setting: "index-effort", storedGt: 2000, gt: 1003, kept: "",
+            gesture: { type: "setIndexEffort", effort: "low" }, host: "web" });
+  assert.equal(g.texts()[3], "Indexing effort: low was not applied on web. Keeping Default.", "a plain level reads as itself; the kept Default by name");
+});
+
 test("an echo of an unexpected shape shows no refused value: plain Apply anyway, value-less copy", () => {
   // every emitter posts {type, <one value field>, gt}; a future two-field gesture reads as no value
   // rather than guessing which field is the pick
