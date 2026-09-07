@@ -686,6 +686,11 @@ export class FederationManager {
       // you are reading a transcript that stopped updating with nothing telling you (the user
       // 2026-07-29). `lastSeen` dates what is on screen.
       down: () => [...this.downHosts],
+      // the attached hosts THIS pane is still waiting on, by its own channel (pendingFor): attached, and up
+      // as far as the kernel knows, but their sessions are not on this pane's screen yet — the chat's pin
+      // prune leaves their entries alone until they are (render.ts reachableHosts); the shell's network
+      // panel says "loading sessions…" from the same set
+      pending: () => this.pendingFor(),
       lastSeen: (h: string) => this.lastSeen[h] || 0,
     };
     // A drag in ANY pane rewrites the arrangement; every other pane hears it through `storage` (which fires

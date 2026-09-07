@@ -462,3 +462,19 @@ test("…but never drops an EMPTY merged feed onto a page still waiting for its 
     if (hadFetch) g.fetch = prevFetch; else delete g.fetch;
   }
 });
+
+test("the CHAT pane pends on the TAB LIST channel — the set its pin prune reads as __rompFed.pending (render.ts reachableHosts): an attached host pends from openRemote until its own tabOrder lands here, whatever else arrives; a detach retires it", async () => {
+  await withManager((fm) => {
+    fm.app = "chat";
+    fm.openRemote("TESTHOST", "tok", true);
+    assert.deepEqual(fm.pendingFor(), ["TESTHOST"], "attached and dialed, no tab list from it yet");
+    fm.inbound("", { type: "tabOrder", order: [U], tabs: [{ id: U, name: "web" }] });
+    assert.deepEqual(fm.pendingFor(), ["TESTHOST"], "the LOCAL list is not the remote's");
+    fm.inbound("TESTHOST", localFeed);
+    assert.deepEqual(fm.pendingFor(), ["TESTHOST"], "a feed payload from the host means nothing to the chat pane");
+    fm.inbound("TESTHOST", { type: "tabOrder", order: [], tabs: [] });
+    assert.deepEqual(fm.pendingFor(), [], "its first tab list — even an EMPTY one — retires it");
+    fm.closeRemote("TESTHOST");
+    assert.deepEqual(fm.pendingFor(), [], "detached: in no list at all");
+  });
+});
