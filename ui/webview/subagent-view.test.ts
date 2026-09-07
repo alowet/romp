@@ -208,9 +208,14 @@ test("the header: 'subagent of <parent>' links back to the launch (setActive + t
 
 test("frames: events replace in place through appendActive (the chat's scroll rule); error → the sentence in the pane; loader first", () => {
   assert.match(RENDER, /else if \(m\.type === "subagent"\) applySubagentFrame\(m\);/);
-  assert.match(RENDER, /function applySubagentFrame\(m: any\): void \{[\s\S]{0,1500}?if \(activeId === id\) \{[\s\S]{0,900}?else appendActive\(\);\s*\n\s*renderSubHead\(\);/);
+  assert.match(RENDER, /function applySubagentFrame\(m: any\): void \{[\s\S]{0,1800}?if \(activeId === id\) \{[\s\S]{0,2600}?else appendActive\(\);\s*\n\s*renderSubHead\(\);/);
+  // a same-length frame is NOT a no-op: the diff lowers v.rendered to the first changed event, and a slid
+  // tail (the cap) or a flipped truncation flag is a full rebuild (review fold on #935, 2026-09-07)
+  assert.match(RENDER, /const slid = prevEvents\.length > 0 && ident\(prevEvents\[0\]\) !== ident\(s\.events\[0\]\);/);
+  assert.match(RENDER, /if \(slid \|\| prevTruncated !== s\.sub\.truncated\) \{\s*\n\s*v\.stale = true; v\.rendered = 0;/);
+  assert.match(RENDER, /v\.rendered = Math\.min\(v\.rendered, idx\);/);
   // the FIRST content lands at the newest end like a fresh tab; later frames append and keep the reader's spot
-  assert.match(RENDER, /const first = !v \|\| v\.rendered === 0;[\s\S]{0,600}?if \(first\) \{ if \(v\) \{ v\.stick = true; v\.rendered = 0; \} showActive\(\); \}/);
+  assert.match(RENDER, /const first = !v \|\| v\.rendered === 0;[\s\S]{0,2400}?if \(first\) \{ if \(v\) \{ v\.stick = true; v\.rendered = 0; \} showActive\(\); \}/);
   // a frame for a viewer that is gone tells the kernel to stop pushing
   assert.match(RENDER, /if \(!s \|\| !s\.sub\) \{ vscodeApi\?\.postMessage\(\{ type: "closeSubagent", id: parentId, agentId \}\); return; \}/);
   // the empty-transcript placeholder: error sentence (loud), else the romp loader until the first frame

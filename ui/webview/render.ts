@@ -9827,6 +9827,9 @@ function applySubagentFrame(m: any): void {
   s.sub.truncated = !!m.truncated;
   if (m.meta && typeof m.meta === "object") s.sub.meta = m.meta as SubMeta;
   s.name = subLabel(s.sub.meta);
+  const prevEvents = s.events;
+  const prevTruncated = !!(s.sub as any)._wasTruncated;
+  (s.sub as any)._wasTruncated = s.sub.truncated;
   if (!s.sub.error) s.events = Array.isArray(m.events) ? (m.events as ChatEvent[]) : [];
   else s.events = [];
   renderTabs();
@@ -9834,6 +9837,26 @@ function applySubagentFrame(m: any): void {
     const v = views.get(id);
     const first = !v || v.rendered === 0;   // the pane held the loader/placeholder — this is the FIRST content
     if (v && s.events.length === 0) { v.rendered = 0; v.stale = true; }   // placeholder → loader/error/empty re-derives
+    // The frame REPLACES s.events wholesale, and syncViewInner's no-op fast path treats a same-length
+    // list as "nothing changed" — so once the kernel's fixed-size tail (SUBAGENT_EVENT_CAP) started
+    // sliding, every frame had the same length and the viewer froze; and a tool_result that only
+    // FILLED an existing event's output lagged a frame (review find on #935, 2026-09-07). Diff old vs
+    // new before syncing: the first index whose identity or fillable fields differ is where the
+    // repaint starts; a shifted head (the tail slid past the cap, or the truncation flag flipped) is a
+    // full rebuild that keeps the reader's spot rule (stick only when they were at the bottom).
+    if (v && !first && s.events.length > 0) {
+      const ident = (e: any) => String(e?.uuid || e?.toolUseId || "");
+      const key = (e: any) => ident(e) + "\u0000" + String(e?.output ?? "") + "\u0000" + String(e?.isError ?? "") + "\u0000" + String(e?.md ?? "");
+      const slid = prevEvents.length > 0 && ident(prevEvents[0]) !== ident(s.events[0]);
+      if (slid || prevTruncated !== s.sub.truncated) {
+        v.stale = true; v.rendered = 0;
+      } else {
+        let idx = 0;
+        const n = Math.min(prevEvents.length, s.events.length);
+        while (idx < n && key(prevEvents[idx]) === key(s.events[idx])) idx++;
+        v.rendered = Math.min(v.rendered, idx);
+      }
+    }
     // the first content lands at the NEWEST end like a fresh tab (showActive → landActive); every later
     // frame is an append that keeps the reader's spot (appendActive's follow-only-when-at-bottom rule)
     if (first) { if (v) { v.stick = true; v.rendered = 0; } showActive(); }
