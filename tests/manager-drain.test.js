@@ -232,6 +232,42 @@ test('kernelToken prefers the env, then the token file', () => {
 // baked above): evidence is counted per park, stamped only on the park that issued the poll, and
 // the apply line renders what the counts actually show.
 
+test('a park held only by background work polls plainly, carries its identity, and counts no refusal (T240c behavioral)', async () => {
+  // mutation check (review): forcing park.lastAsked = true left every source pin green while the
+  // backstop line blamed a lost hold — this drives the REAL park through the stub instead
+  fs.writeFileSync(TOKEN_FILE, 'drain-probe-credential\n');
+  kstub.seen.length = 0;
+  // the first, uninformed poll ASKS for the hold and the kernel arms it; every later poll is plain
+  // (0 in flight) and answers draining:false by construction — none of those may count as a refusal
+  kstub.answers = [JSON.stringify({ busy: 1, inflight: 0, background: 1, draining: true })];
+  kstub.fallback = JSON.stringify({ busy: 1, inflight: 0, background: 1, draining: false });
+  let logged;
+  try {
+    logged = await capturedUntil(/applying deferred refresh/, () => { queueQuietRestart('ghost'); });
+  } finally { clearPendingQuiet(); }
+  const applyLine = logged.split('\n').find((l) => /applying deferred refresh/.test(l));
+  assert.match(applyLine, /backstop cap/, 'background work never quiets here, so the backstop applies');
+  assert.doesNotMatch(applyLine, /refused|never armed|LOST/, 'plain polls answer draining:false by construction — no refusal');
+  const drainPolls = kstub.seen.filter((u) => /drain=1/.test(u));
+  assert.ok(drainPolls.length <= 1, 'only the first, uninformed poll asks for the hold: ' + kstub.seen.join(' '));
+  assert.ok(kstub.seen.length >= 2 && kstub.seen.every((u) => /[?&]park=\d+/.test(u)),
+    'every parked poll carries the park identity: ' + kstub.seen.join(' '));
+});
+
+test('a real refusal on a poll that ASKED for the hold is still counted (T240c behavioral)', async () => {
+  fs.writeFileSync(TOKEN_FILE, 'drain-probe-credential\n');
+  kstub.seen.length = 0;
+  kstub.answers = [];
+  kstub.fallback = JSON.stringify({ busy: 1, inflight: 1, background: 0, draining: false });   // a turn in flight, hold refused
+  let logged;
+  try {
+    logged = await capturedUntil(/applying deferred refresh/, () => { queueQuietRestart('ghost'); });
+  } finally { clearPendingQuiet(); }
+  const applyLine = logged.split('\n').find((l) => /applying deferred refresh/.test(l));
+  assert.match(applyLine, /never armed/, 'every asked poll was refused: the hold never armed');
+  assert.ok(kstub.seen.every((u) => /drain=1/.test(u)), 'a turn in flight: every poll asks for the hold');
+});
+
 test('a transient refusal (the hold arms later) renders the armed-after-refusal cause, never "never armed"', async () => {
   fs.writeFileSync(TOKEN_FILE, 'drain-probe-credential\n');
   kstub.answers = [JSON.stringify({ busy: 1, draining: false })];   // first poll: hold refused once…
@@ -319,8 +355,8 @@ test('the park records drain evidence and the backstop line names it (source pin
   const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'romp-manager'), 'utf8');
   assert.match(src, /drainRefusedCount/, 'the park counts refusals, never latching one bit');
   assert.match(src, /drainArmedCount/, 'the park counts arms, so a transient refusal reads true');
-  assert.ok(src.includes("fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1' : '/busy')"),
-    'the parked poll still binds the drain-refresh spelling of the probe — while a turn is in flight (T240)');
+  assert.ok(src.includes("fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1&' + pk : '/busy?' + pk)"),
+    'the parked poll still binds the drain-refresh spelling of the probe — while a turn is in flight (T240), carrying the park identity (T240c)');
   assert.match(src, /never armed/, 'the backstop apply line can still say the hold never armed');
   assert.match(src, /resetDrainNotices\(\)/, 'a fresh park re-arms the once-per-episode notices');
   assert.ok(src.includes('if (draining === false && park.lastAsked) {'),

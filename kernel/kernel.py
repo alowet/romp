@@ -4383,7 +4383,19 @@ def _last_deploy_restart_t():
     # the graceful term finished its drain and wrote the cut row — the very path THIS change's own
     # deploy takes. The old kernel writes its main-converge / self-update audit row BEFORE it posts
     # the restart, and a peer's p2p-update row lands before its apply restarts us, so the request
-    # time anchors the window when the landing row is missing. The newer of the two wins.
+    # time anchors the window when the landing row is missing. A request counts only once the
+    # restart it asked for LANDED — a boot row newer than it exists (event, not time): a self-update
+    # click whose detached script failed, or a p2p apply that never restarted anything, anchors
+    # nothing (review find). The newer of the two sources wins.
+    boot_t = 0.0
+    for line in reversed(lines):
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(r, dict) and r.get("bootSettled") and isinstance(r.get("t"), (int, float)):
+            boot_t = float(r["t"])
+            break
     try:
         alines = (jd.STATE / "restart-audit.jsonl").read_text().strip().splitlines()[-200:]
     except Exception:
@@ -4395,6 +4407,8 @@ def _last_deploy_restart_t():
             continue
         if not isinstance(a, dict) or not isinstance(a.get("t"), (int, float)) or a["t"] > horizon:
             continue
+        if a["t"] > boot_t:
+            continue                                  # requested, but nothing has booted since: not landed
         act, reason = str(a.get("action") or ""), str(a.get("reason") or "")
         deploy = (act == "main-converge" and a.get("when") == "now") or act in ("p2p-update", "self-update") \
             or (act == "kernel-asks-manager-restart-all" and reason.startswith("self-update"))
@@ -15533,12 +15547,18 @@ def _consumed_audit_t():
     inherited its reason and even counted as a deploy for the cool-down (T240 review)."""
     try:
         lines = RESTART_CUTS_FILE.read_text().strip().splitlines()
-        for line in reversed(lines[-20:]):
-            r = json.loads(line)
-            if isinstance(r, dict) and "cutTurns" in r:          # a cut row (boot rows carry no cuts)
-                return int(r.get("auditT") or 0)
     except Exception:
-        pass
+        return 0
+    for line in reversed(lines[-50:]):
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue                                  # a torn or glued line never disables the guard
+        if isinstance(r, dict) and "cutTurns" in r and r.get("auditT"):
+            # the newest cut that CONSUMED a row — walked back past anonymous cuts (a service stop, a
+            # Ctrl+C, a bare kill), which used to reset consumption to 0 and let the next anonymous cut
+            # re-inherit the still-in-window row (review find: rows alternated consumed/anonymous/consumed)
+            return int(r["auditT"])
     return 0
 
 
@@ -36130,11 +36150,18 @@ class Handler(BaseHTTPRequestHandler):
                 # busyness but asks for the drain hold only while turns are actually in flight —
                 # background work must never freeze other sessions' queued prompts
                 inflight, background = (be.busy_breakdown() if be and hasattr(be, "busy_breakdown") else (n, 0))
+                # ?park=<since> (T240c): the manager's park identity, on EVERY parked poll — the drain
+                # episode (its "parked" line, its 5-minute ring) keys on it, not on a time window, and a
+                # park held only by background work (plain polls, no hold) still rings. Bookkeeping and
+                # logging only — never a hold — so it rides the exempt read; an older manager sends none.
+                park = (q.get("park", [""])[0] or "")[:32]
+                if park and be is not None and hasattr(be, "note_parked_poll"):
+                    be.note_parked_poll(park)
                 draining = False
                 if be is not None and hasattr(be, "refresh_drain_hold"):
                     if q.get("drain", [""])[0] == "1":
                         if self._write_token_ok(q):
-                            be.refresh_drain_hold()
+                            be.refresh_drain_hold(park=park or None)
                             _note_drain_armed()
                         else:
                             _note_drain_refused()    # T224: the one event the gate exists for —

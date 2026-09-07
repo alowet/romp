@@ -69,7 +69,7 @@ test('an unreachable kernel applies only after three consecutive missed polls (T
   assert.equal(quietGate({ since: 1000 }, null, 2000, QOPTS, null, 1).action, 'wait', 'first miss waits');
   assert.match(quietGate({ since: 1000 }, null, 2000, QOPTS, null, 2).reason, /missed \(2\/3\)/);
   const gone = quietGate({ since: 1000 }, null, 2000, QOPTS, null, 3);
-  assert.equal(gone.action, 'apply', 'a genuinely wedged kernel still restarts within ~10 s');
+  assert.equal(gone.action, 'apply', 'a genuinely wedged kernel still restarts in ~6 s (dead) to ~11 s (accepts, never answers)');
   assert.match(gone.reason, /unreachable.*3.*miss/, 'the apply line names the misses');
   assert.equal(quietGate({ since: 1000 }, null, 1000 + QOPTS.maxDeferMs, QOPTS, null, 1).action, 'apply',
     'the backstop is the ultimate bound whatever the poll did');
@@ -183,8 +183,10 @@ test('quietTick: the answer to the CURRENT park still applies exactly as before'
 test('the parked quiet poll refreshes the kernel drain lease in the same probe', () => {
   const fs = require('node:fs');
   const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'romp-manager'), 'utf8');
-  assert.ok(src.includes("fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1' : '/busy')"),
-    'the quiet tick binds the drain-refresh spelling of the probe — while a turn is in flight (T240)');
+  assert.ok(src.includes("fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1&' + pk : '/busy?' + pk)"),
+    'the quiet tick binds the drain-refresh spelling of the probe — while a turn is in flight (T240), carrying the park identity (T240c)');
+  assert.ok(src.includes("const pk = 'park=' + Math.round(park.since);"),
+    'the park identity keys the kernel\'s drain episode (T240c)');
   assert.ok(src.includes('const holdTurns = park.lastInflight === undefined || park.lastInflight > 0;'),
     'the hold is asked for only while a turn is actually in flight (or on the first, uninformed poll) — background-only busyness defers without freezing other sessions');
   assert.ok(src.includes('path: path || \'/busy\''),

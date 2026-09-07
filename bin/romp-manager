@@ -203,8 +203,12 @@ const QUIET_POLL_MS = Number(process.env.ROMP_QUIET_POLL_MS) || 3000;
 // workflow's agents are running — the kernel answers /busy late, and one timed-out poll applied a
 // parked deploy over live background work ten minutes before the backstop (07:57Z 2026-09-07).
 // The tunnel supervisor's STALE_MISSES precedent: unreachable applies only after this many
-// CONSECUTIVE misses (~9 s of 3 s polls); any answer resets the streak. A wedged kernel still
-// restarts within ~10 s; the backstop stays the ultimate bound.
+// CONSECUTIVE unanswered probes; any answer resets the streak. Probes go out on the 3 s grid and
+// each carries its own 5 s timeout, so a DEAD kernel (connection refused, instant) applies at
+// ~6 s and one that accepts but never answers at ~11 s (timeouts at 5, 8, 11) — measured, not
+// "3 poll intervals". The stated trade-off: a live kernel whose /busy latency stays above 5 s for
+// three probes in a row (a stall of ~10 s) is indistinguishable from a wedged one and is cut; the
+// backstop stays the ultimate bound.
 const BUSY_MISS_LIMIT = Number(process.env.ROMP_BUSY_MISS_LIMIT) || 3;
 const QUIET_MAX_DEFER_MS = Number(process.env.ROMP_QUIET_MAX_DEFER_MS) || 15 * 60 * 1000;
 
@@ -529,7 +533,11 @@ function queueQuietRestart(mode) {
       // the first poll, knowing nothing yet, asks for the hold as before
       const holdTurns = park.lastInflight === undefined || park.lastInflight > 0;
       park.lastAsked = holdTurns;            // what THIS poll asked for — the answer's refusal test reads it
-      fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1' : '/busy');
+      // the park's identity rides every parked poll (T240c): the kernel keys its drain EPISODE — one
+      // "parked" line, one 5-minute ring — on it instead of a time window, and can ring from a plain
+      // poll while only background work holds the park
+      const pk = 'park=' + Math.round(park.since);
+      fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1&' + pk : '/busy?' + pk);
     },
     now: Date.now,
     opts: { maxDeferMs: QUIET_MAX_DEFER_MS },

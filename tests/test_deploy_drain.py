@@ -64,6 +64,30 @@ class DrainLease(unittest.TestCase):
         be.refresh_drain_hold()
         self.assertGreater(be._drain_hold_since, since0, "a new episode starts its own clock")
 
+    def test_the_episode_keys_on_the_managers_park_identity_not_a_window(self):
+        # T240c: the manager drops the hold for MINUTES during background-only stretches, so a time
+        # window mis-read the next in-flight re-arm as a new park; and a park held only by background
+        # work never reached refresh_drain_hold, so it never rang. The park identity on every parked
+        # poll fixes both: one "parked" line per park, the ring from a plain poll, a new park = new line.
+        logs = []
+        be = sb.SdkBackend(tempfile.mkdtemp(), "/bin/true", lambda *a, **k: None, log=logs.append)
+        be.note_parked_poll("1700000000")                 # a plain parked poll (background-only park)
+        self.assertEqual(sum("deploy restart parked" in str(l) for l in logs), 1)
+        since0 = be._drain_hold_since
+        be.DRAIN_HOLD_TTL = 0.2
+        be.refresh_drain_hold(park="1700000000")          # a turn started: the hold arms — same park
+        time.sleep(0.3)                                    # …and lapses for far longer than any window
+        be.note_parked_poll("1700000000")
+        be.refresh_drain_hold(park="1700000000")
+        self.assertEqual(be._drain_hold_since, since0, "the same park is the same episode, whatever the gaps")
+        self.assertEqual(sum("deploy restart parked" in str(l) for l in logs), 1, "one line per park")
+        be._drain_hold_since = time.time() - be.DRAIN_LOUD_S - 1
+        be.note_parked_poll("1700000000")                 # a PLAIN poll rings — background-only parks are not silent
+        self.assertTrue(any("still parked" in str(l) for l in logs))
+        be.note_parked_poll("1700000900")                 # a new park identity: a new episode, its own line
+        self.assertEqual(sum("deploy restart parked" in str(l) for l in logs), 2)
+        self.assertGreater(be._drain_hold_since, since0)
+
     def test_arming_is_visible_and_a_long_hold_rings(self):
         logs = []
         be = sb.SdkBackend(tempfile.mkdtemp(), "/bin/true", lambda *a, **k: None, log=logs.append)
@@ -86,7 +110,7 @@ class DrainLease(unittest.TestCase):
         # T224 split the gate into branches so a REFUSED drain can be counted and said loudly; the
         # arm still sits under the explicit-token check and nowhere else
         self.assertIn('if q.get("drain", [""])[0] == "1":\n                        if self._write_token_ok(q):\n'
-                      '                            be.refresh_drain_hold()', ksrc,
+                      '                            be.refresh_drain_hold(park=park or None)', ksrc,
                       "/busy?drain=1 refreshes the lease in the same round-trip that reads the count — "
                       "but the arm is a WRITE, gated on an explicit token (the behavioral pins live "
                       "in tests/test_kernel_auth_hardening.py::BusyDrainWriteGate); the READ stays exempt")
@@ -99,7 +123,7 @@ class DrainLease(unittest.TestCase):
         self.assertNotIn("/restart-all?when=quiet'", ksrc,
                          "no kernel-side deploy path defaults to the quiet window any more")
         msrc = open(os.path.join(BIN, "romp-manager")).read()
-        self.assertIn("fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1' : '/busy')", msrc,
+        self.assertIn("fetchBusy(KERNEL_PORT, cb, holdTurns ? '/busy?drain=1&' + pk : '/busy?' + pk)", msrc,
                       "the manager's PARKED poll is the lease's refresher")
 
 
