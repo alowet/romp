@@ -168,7 +168,7 @@ class StatesReaders(_StateSandbox):
         with _OpenCounter(self.path) as c:
             _append_rows(self.path, [{"t": NOW - 10, "state": "working"}])
             self.assertEqual(km._last_state(SID), ("working", NOW - 10))
-            self.assertEqual(km._state_intervals(SID, "working", NOW)[-1], [NOW - 10, NOW])
+            self.assertEqual(km._state_intervals(SID, "working", NOW)[-1], [NOW - 10, NOW, True])   # open: the build clock, marked
         self.assertEqual(c.n, 1, "the grown file is opened once, for its tail")
 
     def test_e_a_missing_file_reads_as_before(self):

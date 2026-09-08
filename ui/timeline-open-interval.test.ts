@@ -1,12 +1,15 @@
 // An awaiting or compacting interval the session is STILL in arrives with its end at the payload's own
-// clock (kernel _state_intervals ends an open span at `now`): the renderer reads an end within 2 s of
-// data.now — or a null end — as OPEN and draws it to the live edge, the way barEndT draws an open work
-// bar, so the stripe glides with the edge instead of sitting at the kernel's build clock until the next
-// rebuild (the lanes frame is projected from the cached build, so its clock can trail the live edge by
-// up to a rebuild). The end stays numeric on the wire: a null end was a wire break for every already-loaded
-// renderer (Math.min(null, t1) = 0 dropped the stripe). Headless draw() over a minimal DOM shim (the
-// timeline-render.test.ts pattern), with the live edge pushed MAX_INTERP_AHEAD past data.now so "to the
-// live edge" and "to the payload's end" land on different pixels.
+// clock (kernel _state_intervals ends an open span at `now`) AND an open mark as its third element
+// ([start, end, true]): the renderer reads the mark (or a null end) as OPEN and draws the stripe to the
+// live edge, the way barEndT draws an open work bar, so it glides with the edge instead of sitting at the
+// kernel's build clock until the next rebuild (the lanes frame is projected from the cached build, so its
+// clock can trail the live edge by up to a rebuild). The mark, not a clock compare (review find,
+// 2026-09-08): the renderer used to read an end within 2 s of data.now as open, and a connect frame
+// re-stamps the cycle clock over the cached build's lanes, so that distance was the cache's age and a lane
+// blocked right now drew closed. The end stays numeric on the wire: a null end was a wire break for every
+// already-loaded renderer (Math.min(null, t1) = 0 dropped the stripe). Headless draw() over a minimal DOM
+// shim (the timeline-render.test.ts pattern), with the live edge pushed MAX_INTERP_AHEAD past data.now so
+// "to the live edge" and "to the payload's end" land on different pixels.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -99,18 +102,18 @@ function livePanel(data: any) {
   return panel;
 }
 
-test("an open interval (end at the payload clock) draws to the live edge; a closed one stops at its end; a null end draws the same", () => {
+test("a marked-open interval draws to the live edge however far its end sits behind the clock; an unmarked one stops at its end; a null end draws open", () => {
   const ids = ["S1", "S2", "S3", "S4", "S5", "S6", "S7"];
   const panel = livePanel({
     now: NOW,
     sessions: [
-      lane("S1", "web", { state: "needsInput", awaiting: [[NOW - 100, NOW]] }),        // OPEN: the kernel's shape, end == now
+      lane("S1", "web", { state: "needsInput", awaiting: [[NOW - 100, NOW, true]] }),  // OPEN: the kernel's shape, end == now, marked
       lane("S2", "api", { awaiting: [[NOW - 100, NOW - 30]] }),                        // closed 30 s ago
       lane("S3", "tests", { awaiting: [[NOW - 100, NOW - 60]] }),                      // closed 60 s ago (with S2: px per second)
       lane("S4", "docs", { state: "needsInput", awaiting: [[NOW - 100, null]] }),      // a null end still reads as open
       lane("S5", "build", { compactions: [{ t: NOW }] }),                              // a marker ending at x(now): the reference pixel
-      lane("S6", "lint", { state: "needsInput", awaiting: [[NOW - 100, NOW - 1]] }),   // an end within 2 s of the clock: open (the kernel's clock and the payload's can differ by a second)
-      lane("S7", "deploy", { awaiting: [[NOW - 100, NOW - 3]] }),                      // 3 s: closed
+      lane("S6", "lint", { state: "needsInput", awaiting: [[NOW - 100, NOW - 30, true]] }),   // a connect frame: the cycle clock re-stamped over a cached build 30 s old; the mark says open
+      lane("S7", "deploy", { awaiting: [[NOW - 100, NOW - 1]] }),                      // unmarked, 1 s before the clock: closed (no clock tolerance)
     ],
     turns: Object.fromEntries(ids.map((id) => [id, [turn(id + ":1")]])),
     messages: [], activeChat: null, focus: null, hover: null, usage: null,
@@ -118,7 +121,7 @@ test("an open interval (end at the payload clock) draws to the live edge; a clos
   assert.doesNotThrow(() => panel.draw(), "draw() accepts numeric and null interval ends");
   const stripes = collect(panel.svg, hatch("url(#vault-await-hatch)"));
   assert.equal(stripes.length, 6, "every awaiting span draws (a null end used to draw nothing)");
-  const [open, closed30, closed60, openNull, open1, closed3] = stripes;
+  const [open, closed30, closed60, openNull, openMarked, closed1] = stripes;
   const marker = collect(panel.svg, hatch("url(#vault-compact-hatch)"));
   assert.equal(marker.length, 1, "one compaction marker");
   const xNow = right(marker[0]);
@@ -129,15 +132,17 @@ test("an open interval (end at the payload clock) draws to the live edge; a clos
     "the open span reaches the live edge, " + AHEAD + " s past the payload's now (it used to stop at x(now), the build clock)");
   assert.ok(Math.abs(right(openNull) - right(open)) < 0.01, "a null end lands on the same live edge");
   assert.equal(open.getAttribute("x"), openNull.getAttribute("x"), "…starting where the payload says");
-  assert.ok(Math.abs(right(open1) - (xNow + AHEAD * pps)) < 1, "an end 1 s before the clock reads open: to the live edge");
-  assert.ok(Math.abs(right(closed3) - (xNow - 3 * pps)) < 1, "an end 3 s before the clock reads closed: at its own end");
+  assert.ok(Math.abs(right(openMarked) - (xNow + AHEAD * pps)) < 1,
+    "a marked span whose end sits 30 s behind the clock (a re-stamped connect frame) reads open: to the live edge");
+  assert.ok(Math.abs(right(closed1) - (xNow - 1 * pps)) < 1, "an unmarked end 1 s before the clock reads closed: at its own end (no clock tolerance)");
+  assert.ok(right(closed1) < right(openMarked) - 1, "…nowhere near the live edge");
 });
 
-test("the awaiting tooltip reads 'now' for an open span (a payload-clock or null end) and a clock time for a closed one", () => {
+test("the awaiting tooltip reads 'now' for an open span (a marked or null end) and a clock time for a closed one", () => {
   const panel = livePanel({
     now: NOW,
     sessions: [
-      lane("S1", "web", { state: "needsInput", awaiting: [[NOW - 100, NOW]] }),
+      lane("S1", "web", { state: "needsInput", awaiting: [[NOW - 100, NOW - 30, true]] }),   // marked, its end 30 s behind the clock (a connect frame): still 'now'
       lane("S2", "api", { awaiting: [[NOW - 100, NOW - 30]] }),
       lane("S3", "tests", { state: "needsInput", awaiting: [[NOW - 100, null]] }),
     ],
@@ -154,31 +159,33 @@ test("the awaiting tooltip reads 'now' for an open span (a payload-clock or null
   assert.doesNotMatch(closed, /–now</);
 });
 
-test("an open compacting interval draws its cross-hatch to the live edge; a null end draws the same", () => {
+test("an open compacting interval draws its cross-hatch to the live edge; a null end draws the same; an unmarked recent end stops", () => {
   const panel = livePanel({
     now: NOW,
     sessions: [
-      lane("S1", "web", { state: "compacting", compacting: [[NOW - 50, NOW]] }),    // open: end at the payload clock
-      lane("S2", "api", { compactions: [{ t: NOW }] }),                             // the x(now) reference marker
-      lane("S3", "tests", { state: "compacting", compacting: [[NOW - 50, null]] }), // a null end reads as open too
+      lane("S1", "web", { state: "compacting", compacting: [[NOW - 50, NOW, true]] }),   // open: end at the payload clock, marked
+      lane("S2", "api", { compactions: [{ t: NOW }] }),                                  // the x(now) reference marker
+      lane("S3", "tests", { state: "compacting", compacting: [[NOW - 50, null]] }),      // a null end reads as open too
+      lane("S4", "docs", { state: "compacting", compacting: [[NOW - 50, NOW - 1]] }),    // unmarked, 1 s before the clock: closed; the wire's mark decides, not the chip and not a tolerance
     ],
-    turns: { S1: [turn("S1:1")], S2: [turn("S2:1")], S3: [turn("S3:1")] },
+    turns: { S1: [turn("S1:1")], S2: [turn("S2:1")], S3: [turn("S3:1")], S4: [turn("S4:1")] },
     messages: [], activeChat: null, focus: null, hover: null, usage: null,
   });
   assert.doesNotThrow(() => panel.draw());
   const hx = collect(panel.svg, hatch("url(#vault-compact-hatch)"));
-  assert.equal(hx.length, 3, "the two live compacting stripes and the marker (a null end used to draw nothing)");
-  const [stripe, marker, nullStripe] = hx;
+  assert.equal(hx.length, 4, "the three compacting stripes and the marker (a null end used to draw nothing)");
+  const [stripe, marker, nullStripe, recent] = hx;
   assert.ok(right(stripe) > right(marker) + 2, "the open compacting stripe runs past x(now) to the live edge");
   assert.ok(Math.abs(right(nullStripe) - right(stripe)) < 0.01, "a null end lands on the same live edge");
   assert.equal(nullStripe.getAttribute("x"), stripe.getAttribute("x"));
+  assert.ok(right(recent) <= right(marker) + 0.01, "an unmarked span ending 1 s before the clock stops at its end, not the live edge");
 });
 
 test("the compacting tooltip reads 'compacting' for an open span and 'compacted' for a closed one", () => {
   const panel = livePanel({
     now: NOW,
     sessions: [
-      lane("S1", "web", { state: "compacting", compacting: [[NOW - 50, NOW]] }),
+      lane("S1", "web", { state: "compacting", compacting: [[NOW - 50, NOW, true]] }),
       lane("S2", "api", { compacting: [[NOW - 100, NOW - 30]] }),
     ],
     turns: { S1: [turn("S1:1")], S2: [turn("S2:1")] },

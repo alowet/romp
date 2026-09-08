@@ -9,8 +9,10 @@ skeleton is tiny and lands immediately. (The dead `tokens` field — nothing rea
 The skeleton BUILD runs only on the cold live-first connect. A warm push PROJECTS the skeleton from the cached
 full build (_timeline_skeleton), serializes the frame once per build (_skel_wire) and dedups it on content the
 way every {type:"data"} frame is deduped (the nested clock stripped) — see SkeletonFromCache below. An interval
-a session is still in ends at the build's clock on the wire (OpenIntervals below); the renderer reads an end
-within 2 s of data.now as open.
+a session is still in ends at the build's clock on the wire and carries an explicit open mark as its third
+element (OpenIntervals below); the renderer reads the mark, never the distance between the end and data.now
+(review find, 2026-09-08: a connect frame re-stamps the cycle clock over a cached build, so that distance is
+the cache's age, not a fact about the lane).
 """
 import inspect
 import json
@@ -310,6 +312,8 @@ class SkeletonFromCache(unittest.TestCase):
         # clock; the next regular cycle's build-clock frame has the same content once the clock is stripped,
         # so it dedups and the pane keeps the sample it anchored on.
         km._built_timeline[:] = [("sig",), self.FULL, 1.0, 1.0]     # a warm cache whose build clock (FULL["now"] = 1) is ancient
+        km._views_dirty[0] = 0.0                        # …and FRESH by the kernel's own rule: built under the cycle's sig, no
+        #                                                 dirty mark since (a stale cache builds its lanes fresh: the tests below)
         c, frames = self._client()
         km._push([c], connect=True)
         self.assertEqual(self.builds, [], "a warm connect builds nothing: the cached lanes are served")
@@ -324,6 +328,36 @@ class SkeletonFromCache(unittest.TestCase):
         n = len(frames)
         km._push([c])
         self.assertEqual(self._data_frames(frames[n:]), [], "…and unchanged cycles send nothing after that")
+
+    def test_a_connect_over_a_stale_cache_builds_the_lanes_fresh_and_serves_the_cached_bars(self):
+        # The cache is as old as the last cycle that had a timeline client (hours, when the pane was closed),
+        # and a connect never rebuilds the full build. Re-stamping the cycle clock over lanes that old painted
+        # a lane dead for hours as live (and the reverse) until the next cycle's rebuild replaced them: a flap
+        # on every reload. The kernel's own freshness rule decides (_timeline_cache_fresh: built under the
+        # cycle's view signature or within REBUILD_MIN_S, no dirty mark since): a fresh cache is projected as
+        # above; a stale one gets its lanes built fresh, as every connect did before the projection, while the
+        # heavy bars still come from the cache (review find, 2026-09-08).
+        km._built_timeline[:] = [("older",), self.FULL, 1.0, 1.0]   # built under a signature the world has since left
+        km._views_dirty[0] = 0.0
+        c, frames = self._client()
+        km._push([c], connect=True)
+        self.assertEqual(self.builds, [(False, False)], "the lanes are built fresh (no bars); the full build is not")
+        data = self._data_frames(frames)
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["data"]["sessions"], self.rebuilt()["sessions"], "…and the fresh lanes are what goes")
+        self.assertEqual(data[0]["data"]["now"], self.rebuilt()["now"],
+                         "under the fresh build's own clock (the real build_timeline takes the cycle's), not a re-stamp")
+        bars = [json.loads(f) for f in frames if json.loads(f)["type"] == "bars"]
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0]["turns"], self.FULL["turns"], "the bars are the cached build's, as before")
+
+    def test_a_connect_over_a_cache_marked_dirty_since_its_build_builds_the_lanes_fresh(self):
+        km._built_timeline[:] = [("sig",), self.FULL, 1.0, 1.0]     # the cycle's own signature…
+        km._views_dirty[0] = 1.5                        # …but a writer marked the views dirty after the build started
+        c, frames = self._client()
+        km._push([c], connect=True)
+        self.assertEqual(self.builds, [(False, False)], "a dirty mark is staleness too")
+        self.assertEqual(self._data_frames(frames)[0]["data"]["sessions"], self.rebuilt()["sessions"])
 
     def test_a_dirty_mark_between_two_pushes_rebuilds_and_ships_the_new_lanes(self):
         km._cached_timeline = self.saved[1]             # the real cache, warmed with FULL under the stubbed sig
@@ -524,8 +558,11 @@ class ProjectionMatchesColdSkeleton(unittest.TestCase):
 
 
 class OpenIntervals(unittest.TestCase):
-    """An interval the session is STILL in ends at the build's clock on the wire — the contract the
-    renderer's open detection reads (an end within 2 s of the payload's `now` is open). Pinned because a null
+    """An interval the session is STILL in ends at the build's clock on the wire AND carries True as a third
+    element, the open mark the renderer's open detection reads (review find, 2026-09-08). The mark is the
+    lane's own state, not a clock compare: the renderer used to read an end within 2 s of the payload's `now`
+    as open, and a connect frame re-stamps the cycle clock over the cached build, so that distance was the
+    cache's age and a lane blocked right now drew closed. Pinned because a null
     end would be a wire break: every already-loaded renderer (an open dashboard, an installed extension) takes
     Math.min(null, t1) = 0 and drops the stripe for a lane blocked or compacting right now. The clock-stamped
     end costs no per-cycle work: the lanes frame is serialized once per build, and while the state lasts the
@@ -551,10 +588,11 @@ class OpenIntervals(unittest.TestCase):
     def test_an_open_interval_ends_at_the_build_clock_and_a_closed_one_at_its_transition(self):
         now = self.now
         self.assertEqual(km._state_intervals(self.SID, km._NEEDS_INPUT_STATES, now),
-                         [[now - 400, now - 300], [now - 100, now]])
+                         [[now - 400, now - 300], [now - 100, now, True]])
         self.assertEqual(km._state_intervals(self.SID, "compacting", now), [])
         wire = json.loads(json.dumps(km._state_intervals(self.SID, "permission", now)))
-        self.assertEqual(wire[-1][1], now, "the open end serializes as the numeric clock, never null")
+        self.assertEqual(wire[-1], [now - 100, now, True], "the open end serializes as the numeric clock, never null, marked open")
+        self.assertEqual(len(wire[0]), 2, "a closed interval carries no mark")
 
     def test_the_lane_payload_ends_the_open_interval_at_its_own_clock(self):
         o_ts = km._timeline_sessions
@@ -567,8 +605,48 @@ class OpenIntervals(unittest.TestCase):
         finally:
             km._timeline_sessions = o_ts
         lane = tl["sessions"][0]
-        self.assertEqual(lane["awaiting"], [[self.now - 400, self.now - 300], [self.now - 100, self.now]])
-        self.assertEqual(lane["awaiting"][-1][1], tl["now"], "the open end equals the payload's clock: what the renderer reads as open")
+        self.assertEqual(lane["awaiting"], [[self.now - 400, self.now - 300], [self.now - 100, self.now, True]])
+        self.assertEqual(lane["awaiting"][-1][1], tl["now"], "the open end equals the payload's clock")
+        self.assertIs(lane["awaiting"][-1][2], True, "…and the open mark is what the renderer reads as open")
+
+    def test_a_connect_frame_restamped_over_a_cached_build_keeps_the_open_mark(self):
+        # The connect push serves the cached lanes under the CYCLE's clock (SkeletonFromCache), so the open
+        # interval's end, still at the BUILD clock, sits behind the frame's `now` by the cache's age. The mark
+        # travels with the interval, so the renderer draws the stripe to the live edge however old the cache is
+        # (review find, 2026-09-08: the 2 s tolerance read a lane blocked right now as closed on every connect
+        # over a cache older than that).
+        built = int(time.time()) - 10                   # the cached build's clock: 10 s behind the connect
+        km._state_ev_cache.pop(str(self.p), None)
+        with open(self.p, "w") as f:
+            for row in ({"t": built - 400, "state": "permission"}, {"t": built - 300, "state": "working"},
+                        {"t": built - 100, "state": "permission"}):
+                f.write(json.dumps(row) + "\n")
+        live = {self.SID: {"state": "permission", "since": built - 100, "model": "", "effort": "",
+                           "context": None, "compactPct": None, "color": None, "mode": ""}}
+        saved = (km._timeline_sessions, km._tmux_sessions, km._fleet_view_sig, list(km._built_timeline),
+                 km._views_dirty[0], km._skel_wire, km._bars_wire)
+        try:
+            km._timeline_sessions = lambda now, tmux, live_only=False: [
+                {"sid": self.SID, "name": "web", "path": "/no/such/transcript-web"}]
+            cached = km.build_timeline(built, live, with_bars=False)
+            km._built_timeline[:] = [("sig",), cached, time.time(), time.time()]   # fresh by the kernel's own rule
+            km._views_dirty[0] = 0.0
+            km._skel_wire = km._bars_wire = None
+            km._tmux_sessions = lambda: {}
+            km._fleet_view_sig = lambda now, tmux: ("sig",)
+            frames = []
+            km._push([{"app": "timeline", "send": frames.append, "sent": {}, "alive": True}], connect=True)
+        finally:
+            km._timeline_sessions, km._tmux_sessions, km._fleet_view_sig = saved[0], saved[1], saved[2]
+            km._built_timeline[:] = saved[3]
+            km._views_dirty[0] = saved[4]
+            km._skel_wire, km._bars_wire = saved[5], saved[6]
+        data = [json.loads(f) for f in frames if json.loads(f)["type"] == "data"]
+        self.assertEqual(len(data), 1, "the connect frame went")
+        d = data[0]["data"]
+        span = d["sessions"][0]["awaiting"][-1]
+        self.assertGreater(d["now"] - span[1], 2, "the frame's clock is the cycle's, the open end the build's: the old tolerance read this closed")
+        self.assertEqual(span, [built - 100, built, True], "the open mark rides the re-stamped frame")
 
 
 class DeadLaneWindow(unittest.TestCase):

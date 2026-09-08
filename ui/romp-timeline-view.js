@@ -1837,14 +1837,22 @@ class TimelinePanel {
     // Click-safe: don't rebuild the SVG under a pressed pointer (a click in progress). The release event
     // (_release) restarts the loop — no polling for it. See the constructor.
     if (this._pointerHeld) { this._liveResume = true; return; }
-    const g = this._geom;
+    const g = this._geom, nowS = this._liveNow();
     // The look MOVES the view, it does not rebuild it: the last full build left a plot group and its live-edge
     // riders (draw(), `_tickPlot`), and advancing the edge is one transform write on that group plus a width write
     // per rider — _tickTranslate, which also owns the LIVE_MIN_PX guard, in COMPRESSED movement (inside a
     // collapsed trailing gap the edge does not move on screen at all, where a real-seconds guard redrew for
     // nothing). The full draw() stays for what a translate cannot express — no build yet, a glyph riding the live
-    // edge, the next gridline entering the window, a drift into the gutter — never for the clock's advance.
-    if (!g || this._lastLiveNow == null || !this._tickTranslate(this._liveNow())) this.draw();
+    // edge, the next gridline entering the window, a drift into the gutter, never for the clock's advance. A
+    // build that left NO handle (a glyph rode the live edge) has only the full draw for a look, and that look
+    // keeps the guard the loop always had (review find, 2026-09-08): the edge must have moved LIVE_MIN_PX since
+    // the build (_lastLiveNow, set by draw()). Without it such a board redrew the whole svg on every look, every
+    // 2 s at a wide window, where the edge moves a fraction of a pixel between looks and the redraw showed
+    // nothing new. The hand-backs from a handle (a gridline due, the drift cap) are events, not drift: they draw.
+    const tp = this._tickPlot;
+    if (!g || this._lastLiveNow == null) this.draw();
+    else if (!tp || !tp.g || !tp.g.parentNode) { if ((nowS - this._lastLiveNow) / g.winSec * g.plotW >= LIVE_MIN_PX) this.draw(); }
+    else if (!this._tickTranslate(nowS)) this.draw();
     this._sleep(this._liveWaitMs());
   }
   // Advance the live edge to `nowS` by moving the plot group (see draw()'s plot group and `_tickPlot`). Returns
@@ -4905,13 +4913,17 @@ class TimelinePanel {
       // input (historical, from the state-transition log), plus the current open one. The
       // dashed white overlay reads as a distinct texture vs a solid "still working" bar.
       const aw = (s.awaiting && s.awaiting.length) ? s.awaiting
-                 : ((s.live && (s.state === 'permission' || s.state === 'needsInput' || s.state === 'awaiting') && s.since != null) ? [[s.since, t1]] : []);
+                 : ((s.live && (s.state === 'permission' || s.state === 'needsInput' || s.state === 'awaiting') && s.since != null) ? [[s.since, t1, true]] : []);
       for (const span of aw) {
-        // OPEN = the session is STILL in the state: the kernel (_state_intervals) ends such a span at the
-        // payload's own clock, so an end within 2 s of data.now (or a null one) means open. Draw it to the
-        // live edge, the way barEndT draws an open work bar, so the stripe glides with the edge instead of
-        // sitting at the build clock until the next kernel rebuild.
-        const open = span[1] == null || span[1] >= data.now - 2;
+        // OPEN = the session is STILL in the state, which the kernel says outright: an interval with no later
+        // transition carries true as its third element ([start, end, true], _state_intervals) beside its
+        // numeric end at the build clock. Draw it to the live edge, the way barEndT draws an open work bar,
+        // so the stripe glides with the edge instead of sitting at the build clock until the next kernel
+        // rebuild. The mark, never the end's distance from data.now (review find, 2026-09-08): a connect
+        // frame carries the cycle's clock over the cached build's lanes, so that distance is the cache's age,
+        // and the 2 s tolerance this read used to be drew a lane blocked right now closed on every connect
+        // over a cache older than that. A null end reads open too (a span this renderer made itself, above).
+        const open = span[1] == null || span[2] === true;
         const a0 = span[0], b0 = open ? Math.max(nowS, a0) : span[1];
         const sa = Math.max(a0, t0), sb = Math.min(b0, t1); if (sb <= sa) continue;
         // The awaiting interval (state log) and the work bars (transcript) come from different
@@ -4951,9 +4963,9 @@ class TimelinePanel {
       // compacting RIGHT NOW. This is the in-progress indicator; the isCompactSummary marker below is the
       // after-the-fact one. Same figure-ground as the awaiting candy-cane.
       const comp = (s.compacting && s.compacting.length) ? s.compacting
-                   : ((s.live && s.state === 'compacting' && s.since != null) ? [[s.since, t1]] : []);
+                   : ((s.live && s.state === 'compacting' && s.since != null) ? [[s.since, t1, true]] : []);
       for (const span of comp) {
-        const open = span[1] == null || span[1] >= data.now - 2;   // still compacting: to the live edge (see the awaiting loop)
+        const open = span[1] == null || span[2] === true;   // still compacting (the kernel's open mark): to the live edge (see the awaiting loop)
         const a0 = span[0], b0 = open ? Math.max(nowS, a0) : span[1];
         const sa = Math.max(a0, t0), sb = Math.min(b0, t1); if (sb <= sa) continue;
         const eh = BAR_H + 5, cx = x(sa), cwRaw = x(sb) - x(sa), cw = Math.max(2, cwRaw);

@@ -424,6 +424,21 @@ class ANonJsonValueOnTheWireIsCountedAndSaidOnce(unittest.TestCase):
                                          "wire: frozenset serialized via str() in synthetic\n",
                          "one line per type, naming the encoder")
 
+    def test_the_first_sighting_of_a_type_files_one_refused_bell_row(self):
+        # A counter and a stderr line reach nobody at the dashboard: the repo's convention for a fault the
+        # user should see is one bell row of kind "refused" per distinct fault (#1020, the state readers).
+        # The type name is the fault's identity, so the row files once per type, beside the stderr line
+        # (review find, 2026-09-08).
+        notices = []
+        with mock.patch.object(km, "_sync_notice", lambda text, ok=True, kind="sync": notices.append((text, ok, kind))), \
+                redirect_stderr(io.StringIO()):
+            km._wire_default({1}, "synthetic"); km._wire_default({2}, "synthetic")
+            km._wire_default(frozenset(), "bars.body")
+        self.assertEqual([(ok, k) for _t, ok, k in notices], [(False, "refused"), (False, "refused")],
+                         "one row per distinct type, none for a repeat")
+        self.assertIn("set", notices[0][0]); self.assertIn("synthetic", notices[0][0])
+        self.assertIn("frozenset", notices[1][0]); self.assertIn("bars.body", notices[1][0])
+
     def test_a_bars_payload_carrying_a_set_ships_the_string_to_a_legacy_timeline_client(self):
         tl_build = _timeline(); tl_build["turns"][SID][0]["tags"] = {"a"}
         _World(self, timeline=tl_build)

@@ -393,6 +393,27 @@ test("a pending prompt's dot at the live edge leaves the build no handle either"
   assert.ok(created > before, "the tick fell back to a full draw");
 });
 
+test("a look the build left no handle for still honours LIVE_MIN_PX: a sub-pixel move redraws nothing", () => {
+  // The full-draw fallback is paced by the same guard the translate has (review find, 2026-09-08): without it a
+  // board with a pending prompt (no handle) rebuilt the whole svg on every look, every 2 s at a wide window,
+  // where the edge moves a fraction of a pixel between looks and the redraw shows nothing new.
+  const data = liveData();
+  data.turns[SID2].push(turn("p", NOW, NOW, { pending: true, open: true }));
+  const panel: any = new TimelinePanel(makeNode("div"));
+  panel._lockNow = true; panel._pinned = true; panel._winSec = 43200; panel.fitted = true;   // 12 h: 5 s is a fraction of a pixel
+  panel.update(data);
+  assert.equal(panel._tickPlot, null, "no handle: every look is a full draw or nothing");
+  assert.ok(5 / panel._geom.winSec * panel._geom.plotW < 1, "5 s is under a pixel at this zoom");
+  advance(panel, 5);
+  let before = created;
+  tick(panel);
+  assert.equal(created, before, "a sub-pixel move: no rebuild");
+  advance(panel, 120);   // a few pixels on
+  before = created;
+  tick(panel);
+  assert.ok(created > before, "a whole pixel moved: the full draw");
+});
+
 test("an un-arrived stub to a hidden lane spans to the live edge, so the build leaves the tick no handle", () => {
   const HID = "11111111-2222-3333-4444-aaaaaaaaaaa3";
   const data = liveData();
@@ -416,7 +437,7 @@ test("an un-arrived stub to a hidden lane spans to the live edge, so the build l
 
 test("an open compacting span rides the edge too", () => {
   const data = liveData();
-  data.sessions[1].state = "compacting"; data.sessions[1].compacting = [[NOW - 50, NOW]];   // the kernel's open-interval shape: the end at the payload clock
+  data.sessions[1].state = "compacting"; data.sessions[1].compacting = [[NOW - 50, NOW, true]];   // the kernel's open-interval shape: the end at the payload clock, the open mark third
   const panel: any = new TimelinePanel(makeNode("div"));
   panel._lockNow = true; panel._pinned = true; panel._winSec = 3600; panel.fitted = true;
   panel.update(data);

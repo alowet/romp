@@ -29855,11 +29855,16 @@ WIN_WEEK = 7 * 86400                           # The footer shows tokens per win
 def _state_intervals(sid, want, now):
     """Every [start,end] the session sat in `want` ('permission'/'picker' → awaiting candy-stripes,
     'compacting' → cross-hatch), from states/<sid>.jsonl: an entry runs until the next transition, or to
-    `now` (the build's clock) if the session is still in it. That open end IS the wire contract the
-    renderer reads (romp-timeline-view.js): an end within 2 s of the payload's `now` means open. The end
-    stays numeric on purpose: a null end would be a wire break — every already-loaded renderer (an open
-    dashboard, an installed extension) takes Math.min(null, t1) = 0 and drops the stripe for a lane
-    blocked or compacting right now. The clock-stamped end costs no per-cycle work: the lanes frame is
+    `now` (the build's clock) if the session is still in it, and that open interval carries True as a
+    third element, [start, end, True]: the open mark the renderer reads (romp-timeline-view.js) to draw the
+    stripe to the live edge. The mark is the lane's own state, never a clock compare (review find,
+    2026-09-08): the renderer used to read an end within 2 s of the payload's `now` as open, and a connect
+    push re-stamps the cycle's clock over the cached build's lanes (_push), so that distance was the
+    cache's age, and a lane blocked right now drew closed on every connect over a cache older than 2 s. The
+    end stays numeric on purpose: a null end would be a wire break, since every already-loaded renderer
+    (an open dashboard, an installed extension) takes Math.min(null, t1) = 0 and drops the stripe for a
+    lane blocked or compacting right now; a third element those renderers never read breaks nothing. The
+    clock-stamped end costs no per-cycle work: the lanes frame is
     serialized once per build and deduped on content, so while the state lasts the frame goes once per
     rebuild (the end moved), and an unchanged rebuild sends nothing. `want` is a single state or any
     collection of them (the awaiting band passes both needs-input states). Forward-only — periods
@@ -29874,10 +29879,11 @@ def _state_intervals(sid, want, now):
     for i, (t, st) in enumerate(ev):
         if st not in want:
             continue
-        end = ev[i + 1][0] if i + 1 < len(ev) else now     # still in it: the build clock, which the renderer reads as open
+        open_now = i + 1 >= len(ev)                       # no later transition: the session is still in it…
+        end = now if open_now else ev[i + 1][0]           # …so the interval runs to the build clock
         if end < cutoff:
             continue
-        out.append([max(t, cutoff), end])
+        out.append([max(t, cutoff), end, True] if open_now else [max(t, cutoff), end])   # …marked open for the renderer
     return out
 
 
@@ -32905,12 +32911,18 @@ def _wire_default(o, enc="wire"):
     an entry is counted by the per-entry pass and again by the whole frame, if one goes), and the type is
     written to stderr once, naming the encoder that met it first. A value json cannot encode (a set, a datetime,
     a Path) is a builder's mistake, and str() of it is not what the pane expects; the whole-frame dumps used to
-    carry no `default` at all and raised on such a value, out of _push, on the pusher thread."""
+    carry no `default` at all and raised on such a value, out of _push, on the pusher thread. The first
+    sighting of a type also files one bell row of kind "refused" (review find, 2026-09-08): a counter and a
+    stderr line reach nobody at the dashboard, and one refused row per distinct fault is how a fault the user
+    should see is surfaced (#1020, the state readers); the type name is the fault's identity, so a repeat
+    files nothing."""
     _wire_bump("default_str")
     tn = type(o).__name__
     if tn not in _wire_default_said:
         _wire_default_said.add(tn)
         sys.stderr.write("wire: %s serialized via str() in %s\n" % (tn, enc))
+        _sync_notice("a %s value in the %s frame cannot be encoded as json; it reached the dashboard as text "
+                     "(str() of it), a builder's mistake to fix" % (tn, enc), ok=False, kind="refused")
     return str(o)
 
 
@@ -35387,7 +35399,8 @@ def _push(targets, connect=False, tmux=None):
         # build clock (_state_intervals), so its frame goes once per rebuild while the state lasts — where the
         # per-cycle skeleton sent it every cycle. A CONNECT push is the other: it stamps the cached lanes with
         # the cycle's clock (below), since the pane anchors its live edge on its first sample and the cache
-        # can be hours old when no timeline client kept it warm.
+        # can be hours old when no timeline client kept it warm, when the cache is FRESH by the kernel's own
+        # rule (_timeline_cache_fresh); a stale one gets its lanes built fresh instead (below).
         global _skel_wire
         _PERF_STATS.stage("push.feed", time.monotonic() - _t_stage)
         _t_stage = time.monotonic()
@@ -35407,14 +35420,25 @@ def _push(targets, connect=False, tmux=None):
             else:
                 timeline = _cached_timeline(now, tmux, fsig, connect)
                 if connect:
-                    # A CONNECT serves the cached lanes under the CYCLE's clock: the pane anchors its live edge
-                    # and its window fit on the first data.now it sees, and the cache is as old as the last
-                    # cycle that had a timeline client — a bucket on a reload, hours after the pane was closed
-                    # — so the build clock would sit the axis in the past until the next rebuild. One
-                    # serialization per connect; the new client's dedup slot is empty, so the frame always
-                    # goes, and _send_client derives its content-only sig, so the next cycle's build-clock
-                    # frame dedups against it unless the lanes changed.
-                    frame = {"type": "data", "data": {**_timeline_skeleton(timeline), "now": now}}
+                    if _timeline_cache_fresh(fsig):
+                        # A CONNECT serves the cached lanes under the CYCLE's clock: the pane anchors its live
+                        # edge and its window fit on the first data.now it sees, and the cache is as old as the
+                        # last cycle that had a timeline client (a bucket on a reload), so the build clock
+                        # would sit the axis in the past until the next rebuild. One serialization per connect;
+                        # the new client's dedup slot is empty, so the frame always goes, and _send_client
+                        # derives its content-only sig, so the next cycle's build-clock frame dedups against it
+                        # unless the lanes changed.
+                        frame = {"type": "data", "data": {**_timeline_skeleton(timeline), "now": now}}
+                    else:
+                        # A STALE cache, built under a view signature the world has since left or marked dirty
+                        # since, is not what the pane should paint: the cache is as old as the last cycle that
+                        # had a timeline client (hours, when the pane was closed), and re-stamping the clock over
+                        # lanes that old painted a lane dead for hours as live (and the reverse) until the next
+                        # cycle's rebuild replaced them: a flap on every reload (review find, 2026-09-08). The
+                        # lanes are built fresh here, as every connect did before the projection (no transcript
+                        # parse: the skeleton), and the next cycle's rebuild dedups against them when unchanged;
+                        # the heavy bars still come from the cache, as they always did on a connect.
+                        frame = {"type": "data", "data": build_timeline(now, tmux, with_bars=False)}
                     skel_pre, skel_sig = json.dumps(frame), None
                 else:
                     w = _skel_wire                                  # tuple snapshot — rebound whole, never mutated
@@ -36597,8 +36621,7 @@ def _consume_pending_reveal(client):
 
 def _cached_timeline(now, tmux, sig, connect=False):
     e = _built_timeline
-    dirty = not connect and _views_dirty[0] > e[3]        # start-keyed, same as _cached_feed above
-    if e[1] is not None and not dirty and (connect or e[0] == sig or (time.time() - e[2]) < REBUILD_MIN_S):
+    if e[1] is not None and (connect or _timeline_cache_fresh(sig)):
         _VIEW_STATS["tlServe"] += 1
         _PERF_STATS.build("timeline", True)
         return e[1]
@@ -36609,6 +36632,18 @@ def _cached_timeline(now, tmux, sig, connect=False):
     _PERF_STATS.build("timeline", False, time.monotonic() - _t0)
     _built_timeline[:] = [sig, tl, time.time(), started]
     return tl
+
+
+def _timeline_cache_fresh(sig):
+    """The kernel's one rule for a cached full build a cycle may serve as it stands: built under the cycle's
+    view signature (nothing a lane reads has moved since) or within REBUILD_MIN_S of now, and no writer has
+    marked the views dirty since it started (start-keyed, same as _cached_feed). _cached_timeline rebuilds
+    when this is False; a connect push, which never rebuilds the full build on the handler thread, builds
+    its LANES fresh instead of projecting a stale cache (review find, 2026-09-08; see _push)."""
+    e = _built_timeline
+    if e[1] is None or _views_dirty[0] > e[3]:
+        return False
+    return e[0] == sig or (time.time() - e[2]) < REBUILD_MIN_S
 
 
 def _timeline_skeleton(tl):
