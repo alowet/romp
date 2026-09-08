@@ -19,6 +19,7 @@ and the kernel degrades gracefully when the SDK is absent.
 from __future__ import annotations
 import asyncio
 import difflib
+import errno
 import hashlib
 import json
 import os
@@ -8782,10 +8783,22 @@ class SdkBackend:
     def end_marker(self, sid: str):
         """What this backend's own DURABLE record says about `sid`, for a caller whose send it just
         refused — never a liveness probe. True: the reg is present and says alive=false, the explicit
-        end marker written at session end. False: the reg says alive (the refusal was something else;
-        the caller retries). None: no readable reg — absent, or unreadable right now, which one read
-        cannot tell apart; the caller counts such reads, never decides from one."""
-        reg = read_reg(self.state_dir, sid)
+        end marker written at session end. False: the record stands (the refusal was something else;
+        the caller retries): a reg that says alive, or a session RUNNING in this process, whatever the
+        disk says this instant (the proof owns() and _ensure already take). None: NO reg file, which is
+        durable, since this backend never unlinks a reg. A reg that EXISTS but would not read or parse
+        RAISES (EMFILE, EIO, EACCES, torn JSON: the transient class owns() was repaired for on
+        2026-09-07), so the caller waits on a reader's fault instead of counting it as no record. The
+        first version read through read_reg, which answers None for an unreadable reg exactly as for
+        an absent one, and never looked at self.sessions: a running session whose reg would not read
+        was classed as no record, its landing mail withheld, and its watch retired as ended (review
+        find, 2026-09-08)."""
+        s = self.sessions.get(sid)
+        if s is not None and s.thread.is_alive():
+            return False
+        reg = read_reg_for_rmw(self.state_dir, sid)
+        if reg is None:
+            raise OSError(errno.EIO, "reg for %s exists but would not read" % sid[:8])
         if not reg:
             return None
         return not bool(reg.get("alive"))

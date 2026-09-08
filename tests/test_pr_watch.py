@@ -585,8 +585,10 @@ class DeliveryTargets(unittest.TestCase):
     `tmux list-sessions` or a swallowed live_sessions error, and never lists a comment thread — so a
     blip diverted a running registrant's mail with a false "has ended". Now the durable records
     decide (an explicit end marker before any send; a uuid nobody holds is never sent; a record that
-    says alive sends first), refusals are classified from the same records, no record is counted
-    three checks, and an unresolved contact name only waits. Runs the REAL _pr_watch_deliver →
+    says alive sends first), refusals are classified from the same records, a uuid with no record has
+    ended on the first read (an absent reg is durable: the backend never unlinks one, and a reg it
+    cannot read RAISES, which waits uncounted), and an unresolved contact name waits, bounded. Runs
+    the REAL _pr_watch_deliver →
     _send_or_park → backend path, with the record readers and Sessions.backend_for routed to the fake
     and Sessions.live() EMPTY throughout (or raising). What the fake cannot stage — ownership by
     owns() falling through to tmux — RealRouting covers with real backends."""
@@ -633,6 +635,9 @@ class DeliveryTargets(unittest.TestCase):
     def _log(self):
         return [(r["ok"], r["text"]) for r in km._sync_notice_rows()]
 
+    def _kinds(self):
+        return [r["kind"] for r in km._sync_notice_rows()]
+
     # a live registrant refused by return: wait, said once per reason, closed on delivery
     def test_a_live_registrant_refused_by_return_keeps_the_row_and_retries(self):
         km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0)
@@ -647,6 +652,9 @@ class DeliveryTargets(unittest.TestCase):
         self.assertEqual([ok for ok, _ in log], [False], "the same reason twice is said once")
         self.assertIn("was not accepted by session 11111111 (its record says it is alive, yet the send was refused)",
                       log[0][1])
+        self.assertEqual(self._kinds(), ["refused"],
+                         "a notice that could not be placed is a fault, filed under the bell's refused kind "
+                         "(review find, 2026-09-08)")
         self.be.refuse = False
         km._pr_watch_tick(100.0 + 2 * km.PR_WATCH_EVERY)
         self.assertEqual([s for s, _ in self.be.sent], [SID])
@@ -655,6 +663,7 @@ class DeliveryTargets(unittest.TestCase):
         log = self._log()
         self.assertEqual([ok for ok, _ in log], [False, True], "the story that opened on the Log closes on it")
         self.assertIn("reached session 11111111 after the earlier refusal", log[1][1])
+        self.assertEqual(self._kinds(), ["refused", "sync"], "the closing row is news, not a fault")
 
     def test_a_changed_reason_is_said_once_more_and_a_repeated_one_stays_silent(self):
         km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0)
@@ -697,6 +706,7 @@ class DeliveryTargets(unittest.TestCase):
                      "no escalation contact is named", "dropped"):
             self.assertIn(must, log[0][1])
         self.assertNotIn("a copy may have gone out", log[0][1], "no restart happened — no such caveat")
+        self.assertEqual(self._kinds(), ["refused"], "a dropped notice is a fault the bell files under refused")
         self.assertIn("could not be delivered", err.getvalue())
 
     def test_an_ended_registrant_whose_contact_has_ended_too_retires_loudly(self):
@@ -756,37 +766,23 @@ class DeliveryTargets(unittest.TestCase):
         self.assertIn("you asked romp to watch", self.be.sent[0][1])
         self.assertEqual((km._pr_watches, self._log()), ([], []), "retired, nothing to log")
 
-    # no record for a uuid: never sent, counted, three checks
-    def test_a_uuid_with_no_record_is_never_sent_and_ends_after_three_checks(self):
+    # no record for a uuid: never sent, ended on the first read (an absent reg is durable)
+    def test_a_uuid_with_no_record_is_never_sent_and_ends_on_the_first_check(self):
+        # the three-check count this replaced stood in for an event the readers now report themselves:
+        # an absent reg is a durable fact, since the SDK backend never unlinks one, and a reg that
+        # exists but would not read RAISES and waits uncounted (review find, 2026-09-08)
         km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0)
         self.be.regs = {}                                     # the fake holds no record for the sid
-        with redirect_stderr(io.StringIO()):
+        with redirect_stderr(io.StringIO()) as err:
             km._pr_watch_tick(100.0)
-            self.assertEqual(len(km._pr_watches), 1, "check 1: kept")
-            km._pr_watch_tick(100.0 + km.PR_WATCH_EVERY)
-            self.assertEqual(len(km._pr_watches), 1, "check 2: kept")
-            log = self._log()
-            self.assertEqual([ok for ok, _ in log], [False, False], "each advanced count is a changed reason")
-            self.assertIn("was not sent to session 11111111 (no record of the session (check 1 of 3))", log[0][1])
-            self.assertIn("(check 2 of 3)", log[1][1])
-            km._pr_watch_tick(100.0 + 2 * km.PR_WATCH_EVERY)
-        self.assertEqual((km._pr_watches, self.be.sent), ([], []), "check 3: ended — and never once sent")
+        self.assertEqual((km._pr_watches, self.be.sent), ([], []), "ended on the first read, and never once sent")
         log = self._log()
-        self.assertEqual([ok for ok, _ in log], [False, False, False])
-        self.assertIn("has ended (no record of the session for 3 checks) and no escalation contact is named; "
-                      "the watch is dropped", log[2][1])
-
-    def test_a_record_that_reappears_alive_resets_the_no_record_count(self):
-        km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0)
-        self.be.regs = {}
-        with redirect_stderr(io.StringIO()):
-            km._pr_watch_tick(100.0)
-            km._pr_watch_tick(100.0 + km.PR_WATCH_EVERY)
-            self.be.regs, self.be.refuse = {SID: True}, True  # the record is back, alive (the send still declined)
-            km._pr_watch_tick(100.0 + 2 * km.PR_WATCH_EVERY)
-            self.be.regs = {}
-            km._pr_watch_tick(100.0 + 3 * km.PR_WATCH_EVERY)
-        self.assertEqual(len(km._pr_watches), 1, "the count restarted: one no-record check since, not four")
+        self.assertEqual([ok for ok, _ in log], [False], "one row tells the whole story")
+        self.assertIn("has ended (no record of the session) and no escalation contact is named; "
+                      "the watch is dropped", log[0][1])
+        self.assertNotIn("check", log[0][1], "no count to advance")
+        self.assertEqual(self._kinds(), ["refused"])
+        self.assertIn("could not be delivered", err.getvalue())
 
     def test_a_backend_without_a_record_reader_reads_as_no_record(self):
         self.be = _NoRecordBackend()                          # send refuses; nothing to read
@@ -795,8 +791,8 @@ class DeliveryTargets(unittest.TestCase):
         km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0)
         with redirect_stderr(io.StringIO()):
             km._pr_watch_tick(100.0)
-        self.assertEqual((self.be.sent, len(km._pr_watches)), ([], 1))
-        self.assertIn("(no record of the session (check 1 of 3))", self._log()[0][1])
+        self.assertEqual((self.be.sent, km._pr_watches), ([], []), "no reader, no record: ended, never sent")
+        self.assertIn("has ended (no record of the session) and no escalation contact", self._log()[0][1])
 
     # the live set is irrelevant: empty or raising, the send is attempted
     def test_a_live_set_that_reads_empty_or_raises_never_stops_the_send(self):
@@ -835,11 +831,36 @@ class DeliveryTargets(unittest.TestCase):
         log = self._log()
         self.assertEqual([ok for ok, _ in log], [False], "said once, however long it waits")
         self.assertIn("its escalation contact mgr does not resolve to a session; retrying", log[0][1])
+        self.assertEqual(self._kinds(), ["refused"])
         self.assertIn("mail pending", km._watch_awaiting(SID)["why"], "the box shows what is owed")
         self.be.names = {"mgr": MGR}                          # the durable record now carries the name
         self.be.regs[MGR] = True
         km._pr_watch_tick(100.0 + 5 * km.PR_WATCH_EVERY)
         self.assertEqual(([s for s, _ in self.be.sent], km._pr_watches), ([MGR], []))
+
+    def test_an_unresolved_contact_name_is_waited_on_to_the_bound_then_dropped_loudly(self):
+        # the wait above is BOUNDED (review find, 2026-09-08): a name that never resolves (mistyped, or
+        # a box default naming a session nobody starts again) otherwise kept the row armed forever, one
+        # tmux fork per tick with the once-said Log row its only trace. At PR_WATCH_ESCALATE_S from the
+        # first unresolved tick, the bound this module already keeps for waiting on the named contact,
+        # the row retires the loud way: one stderr line and one bell row under the refused kind
+        km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0, escalate="mgr")
+        km._sid_of = lambda who: who
+        self.be.regs = {SID: False}
+        with redirect_stderr(io.StringIO()) as err:
+            km._pr_watch_tick(100.0)                                            # the wait starts here
+            km._pr_watch_tick(100.0 + km.PR_WATCH_ESCALATE_S - 1)
+            self.assertEqual(len(km._pr_watches), 1, "inside the bound: still waiting")
+            self.assertEqual([ok for ok, _ in self._log()], [False], "…and still said once")
+            km._pr_watch_tick(100.0 + km.PR_WATCH_ESCALATE_S + km.PR_WATCH_EVERY)
+        self.assertEqual((self.be.sent, km._pr_watches), ([], []), "past the bound: dropped, never sent to a bare name")
+        log = self._log()
+        self.assertEqual([ok for ok, _ in log], [False, False], "the wait's one row, then the drop's one row")
+        for must in ("TESTORG/testrepo#7", "could not be delivered", "has ended (its record says it ended)",
+                     "its escalation contact mgr did not resolve to a session for 2h", "the watch is dropped"):
+            self.assertIn(must, log[1][1])
+        self.assertEqual(self._kinds(), ["refused", "refused"])
+        self.assertIn("did not resolve to a session for 2h", err.getvalue())
 
     def test_a_contact_name_resolves_through_the_backends_record_when_the_live_set_fails(self):
         km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0, escalate="mgr")
@@ -910,6 +931,9 @@ class RealRouting(unittest.TestCase):
     def _log(self):
         return [(r["ok"], r["text"]) for r in km._sync_notice_rows()]
 
+    def _kinds(self):
+        return [r["kind"] for r in km._sync_notice_rows()]
+
     def _dead_codex(self, sid):
         s = self.cb._Session(sid, "t1", "web", "/tmp")
         s.dead = True
@@ -973,28 +997,111 @@ class RealRouting(unittest.TestCase):
         km._pr_watch_tick(100.0)
         self.assertEqual(([n for n, _ in self.tmux], km._pr_watches), (["mgr"], []))
 
-    def test_an_absent_sdk_reg_for_a_uuid_sid_never_reaches_tmux_and_ends_after_three_checks(self):
+    def test_an_absent_sdk_reg_for_a_uuid_sid_never_reaches_tmux_and_ends_on_the_first_check(self):
         km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0)
         self.assertIs(km.Sessions.backend_for(SID), km._TMUX, "the routing fact: an absent reg falls to tmux")
+        self.assertIsNone(km._pr_watch_end_marker(SID), "no reg file: no record, a durable fact")
+        with redirect_stderr(io.StringIO()):
+            km._pr_watch_tick(100.0)
+        self.assertEqual((self.tmux, km._pr_watches), ([], []), "ended on the first read; never sent")
+        self.assertIn("has ended (no record of the session) and no escalation contact is named", self._log()[-1][1])
+
+    def _reg_path(self):
+        return Path(self.td.name) / "sdk" / (SID + ".json")
+
+    def _unreadable_reg(self):
+        """A reg that EXISTS but would not read: the path becomes a directory, so stat succeeds and
+        read_text raises (EISDIR, the OSError class EMFILE, EIO and EACCES belong to), root or not."""
+        p = self._reg_path()
+        if p.exists():
+            p.unlink()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.mkdir()
+
+    def _running(self, sid):
+        """A session running in THIS process, as SdkBackend.sessions holds one: a live thread. Its send
+        is recorded, never run (a real send there would spawn a CLI)."""
+        import types
+        self.sdk.sessions[sid] = types.SimpleNamespace(thread=types.SimpleNamespace(is_alive=lambda: True))
+        self.sdk_sent = []
+        self.sdk.send = lambda s, text: self.sdk_sent.append((s, text)) or True
+
+    def test_a_running_registrant_whose_reg_would_not_read_is_sent_its_mail_never_ended(self):
+        # BEFORE (review find, 2026-09-08): SdkBackend.end_marker read through read_reg, which answers
+        # None for an unreadable reg exactly as for an absent one, and never looked at the running
+        # sessions. A live registrant whose reg was transiently unreadable (EMFILE, EIO, EACCES) read
+        # as "no record": its mail was withheld and, three ticks later, its watch retired as ended.
+        # main delivered it: owns() takes the live thread as proof and _ensure serves it from memory
+        self.sb.write_reg(Path(self.td.name), SID, {"sid": SID, "alive": True, "name": "web"})
+        self._unreadable_reg()
+        self._running(SID)
+        km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0)
+        self.assertIs(km.Sessions.backend_for(SID), self.sdk, "the routing fact: a live thread is proof enough")
+        self.assertIs(km._pr_watch_end_marker(SID), False, "running in this process: the record stands")
+        km._pr_watch_tick(100.0)
+        self.assertEqual([s for s, _ in self.sdk_sent], [SID], "the mail went to the registrant, first tick")
+        self.assertIn("has MERGED", self.sdk_sent[0][1])
+        self.assertEqual((self.tmux, km._pr_watches, self._log()), ([], [], []), "retired; nothing false on the Log")
+
+    def test_a_reg_that_would_not_read_with_no_running_session_waits_uncounted_and_recovers(self):
+        self.sb.write_reg(Path(self.td.name), SID, {"sid": SID, "alive": True, "name": "web"})
+        self._unreadable_reg()
+        km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0)
+        self.assertFalse(self.sdk.owns(SID), "the routing fact: an unreadable reg with no thread is not owned")
+        with self.assertRaises(OSError):
+            self.sdk.end_marker(SID)
+        self.assertEqual(km._pr_watch_end_marker(SID), km._PR_WATCH_UNREAD, "a reader's fault, never no record")
         with redirect_stderr(io.StringIO()):
             km._pr_watch_tick(100.0)
             km._pr_watch_tick(100.0 + km.PR_WATCH_EVERY)
-            self.assertEqual((self.tmux, len(km._pr_watches)), ([], 1), "two checks: kept, never sent")
+        self.assertEqual((self.tmux, len(km._pr_watches)), ([], 1), "waits; never handed to tmux")
+        self.assertNotIn("_norec", km._pr_watches[0], "uncounted")
+        log = self._log()
+        self.assertEqual([ok for ok, _ in log], [False], "said once")
+        self.assertIn("its record could not be read", log[0][1])
+        self.assertEqual(self._kinds(), ["refused"])
+        self._reg_path().rmdir()                              # the read heals onto an ended reg
+        self.sb.write_reg(Path(self.td.name), SID, {"sid": SID, "alive": False, "name": "web"})
+        with redirect_stderr(io.StringIO()):
             km._pr_watch_tick(100.0 + 2 * km.PR_WATCH_EVERY)
         self.assertEqual((self.tmux, km._pr_watches), ([], []))
-        self.assertIn("no record of the session for 3 checks", self._log()[-1][1])
+        self.assertIn("has ended (its record says it ended)", self._log()[-1][1])
 
-    def test_a_corrupt_sdk_reg_reads_as_no_record_never_as_a_tmux_session(self):
-        p = Path(self.td.name) / "sdk" / (SID + ".json")
+    def test_a_corrupt_sdk_reg_is_a_readers_fault_that_waits_never_a_tmux_session_nor_an_ending(self):
+        # torn JSON reads like a read error: the file is there, so it is not "no record"
+        p = self._reg_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("{not json")
         km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0)
         self.assertFalse(self.sdk.owns(SID), "the routing fact: an unreadable reg is not owned")
         self.assertIs(km.Sessions.backend_for(SID), km._TMUX)
+        self.assertEqual(km._pr_watch_end_marker(SID), km._PR_WATCH_UNREAD)
         with redirect_stderr(io.StringIO()):
             km._pr_watch_tick(100.0)
         self.assertEqual((self.tmux, len(km._pr_watches)), ([], 1))
-        self.assertIn("(no record of the session (check 1 of 3))", self._log()[0][1])
+        self.assertIn("(its record could not be read)", self._log()[0][1])
+        self.assertNotIn("no record", self._log()[0][1])
+
+    def test_a_codex_registry_unreadable_at_load_leaves_a_uuid_registrant_waiting_never_ended(self):
+        # the Codex record-holder's twin of the SDK case: with its registry unreadable at load the
+        # backend holds NO sessions, so every uuid read as "no record" and a Codex registrant's watch
+        # ended (on the first read now; on the third before). Unreadable at load is a reader's fault
+        # the backend now reports for every sid it does not hold (review find, 2026-09-08)
+        p = self.cx._reg_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{not json")
+        self.cx = self.cb.CodexBackend(Path(self.td.name), notify=lambda *a, **k: None, log=lambda m: None)
+        km._codex = lambda: self.cx
+        with self.assertRaises(Exception):
+            self.cx.end_marker(SID)
+        self.assertEqual(km._pr_watch_end_marker(SID), km._PR_WATCH_UNREAD)
+        km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0)
+        with redirect_stderr(io.StringIO()):
+            km._pr_watch_tick(100.0)
+        self.assertEqual((self.tmux, len(km._pr_watches)), ([], 1), "waits, uncounted; never tmux, never ended")
+        self.assertIn("its record could not be read", self._log()[0][1])
+        self._dead_codex(SID)                                 # a session it DOES hold still answers from its mark
+        self.assertIs(self.cx.end_marker(SID), True)
 
     def test_a_name_shaped_registrant_goes_to_tmux_the_standing_gap(self):
         km.add_pr_watch(7, "TESTORG/testrepo", "web", now=0)
@@ -1023,7 +1130,9 @@ class RealRouting(unittest.TestCase):
 class EndMarkerReaders(unittest.TestCase):
     """The backends' own durable-record readers, executed against real files and real session
     objects: True = an explicit end marker, False = the record says the session stands, None = no
-    record. Only these three answers exist; a live set is never consulted."""
+    record. Three answers and a RAISE (a record that exists but would not read: a reader's fault the
+    caller waits on, review find 2026-09-08); a live set is never consulted, the RUNNING set is (a
+    thread in this process is a record too)."""
 
     @classmethod
     def setUpClass(cls):
@@ -1043,11 +1152,11 @@ class EndMarkerReaders(unittest.TestCase):
             self.sb.write_reg(Path(td), SID, {"sid": SID, "name": "mgr", "alive": False})
             self.assertEqual(self.sb.SdkBackend.sid_for_name(be, "mgr"), MGR, "an ended reg does not compete")
 
-    def test_the_sdk_reader_reads_the_reg_alive_flag_and_nothing_else(self):
+    def test_the_sdk_reader_reads_the_reg_alive_flag_the_running_set_and_nothing_else(self):
         import types
         with tempfile.TemporaryDirectory() as td:
-            be = types.SimpleNamespace(state_dir=Path(td))
-            self.assertIsNone(self.sb.SdkBackend.end_marker(be, SID), "no reg → no record")
+            be = types.SimpleNamespace(state_dir=Path(td), sessions={})
+            self.assertIsNone(self.sb.SdkBackend.end_marker(be, SID), "no reg file → no record (durable: never unlinked)")
             self.sb.write_reg(Path(td), SID, {"sid": SID, "alive": True})
             self.assertIs(self.sb.SdkBackend.end_marker(be, SID), False, "alive → the session stands")
             self.sb.write_reg(Path(td), SID, {"sid": SID, "alive": True, "threadOf": MGR})
@@ -1055,17 +1164,33 @@ class EndMarkerReaders(unittest.TestCase):
             self.sb.write_reg(Path(td), SID, {"sid": SID, "alive": False})
             self.assertIs(self.sb.SdkBackend.end_marker(be, SID), True, "alive=false → the explicit end marker")
             (Path(td) / "sdk" / (SID + ".json")).write_text("{not json")
-            self.assertIsNone(self.sb.SdkBackend.end_marker(be, SID), "unreadable → no record, never a verdict")
+            with self.assertRaises(OSError, msg="exists but would not read → a reader's fault, RAISED, never no record"):
+                self.sb.SdkBackend.end_marker(be, SID)
+            # a session running in this process stands whatever the disk says this instant, the proof
+            # owns() and _ensure already take (review find, 2026-09-08)
+            be.sessions[SID] = types.SimpleNamespace(thread=types.SimpleNamespace(is_alive=lambda: True))
+            self.assertIs(self.sb.SdkBackend.end_marker(be, SID), False, "running → stands, over an unreadable reg")
+            self.sb.write_reg(Path(td), SID, {"sid": SID, "alive": False})
+            self.assertIs(self.sb.SdkBackend.end_marker(be, SID), False, "…and over an alive=false reg, this instant")
+            be.sessions[SID].thread.is_alive = lambda: False
+            self.assertIs(self.sb.SdkBackend.end_marker(be, SID), True, "a finished thread is no proof: the disk decides")
 
     def test_the_codex_reader_reads_the_dead_mark(self):
         import types
         s = types.SimpleNamespace(lock=threading.RLock(), dead=False)
-        be = types.SimpleNamespace(_session=lambda sid: s)
+        be = types.SimpleNamespace(_session=lambda sid: s, _registry_unreadable=False)
         self.assertIs(self.cb.CodexBackend.end_marker(be, SID), False)
         s.dead = True
         self.assertIs(self.cb.CodexBackend.end_marker(be, SID), True)
-        self.assertIsNone(self.cb.CodexBackend.end_marker(types.SimpleNamespace(_session=lambda sid: None), SID),
-                          "no session by that id → no record")
+        none = types.SimpleNamespace(_session=lambda sid: None, _registry_unreadable=False)
+        self.assertIsNone(self.cb.CodexBackend.end_marker(none, SID), "no session by that id → no record")
+        # its registry unreadable at load: the backend holds none of the sessions it should, so "not
+        # held" is a reader's fault, raised, never no record (review find, 2026-09-08)
+        broken = types.SimpleNamespace(_session=lambda sid: None, _registry_unreadable=True)
+        with self.assertRaises(Exception):
+            self.cb.CodexBackend.end_marker(broken, SID)
+        held = types.SimpleNamespace(_session=lambda sid: s, _registry_unreadable=True)
+        self.assertIs(self.cb.CodexBackend.end_marker(held, SID), True, "a session it holds still answers from its mark")
 
 
 class Route(unittest.TestCase):
