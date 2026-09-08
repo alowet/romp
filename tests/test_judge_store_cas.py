@@ -73,6 +73,50 @@ class StoreCas(unittest.TestCase):
         self.assertNotIn("_baseRev", json.loads((jd.GOALDIR / (SID + ".json")).read_text()),
                          "the transient base revision is never written to disk")
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _reads_raise(target):
+        """Inside the block, every Path.read_text of `target` raises OSError (the EMFILE/EIO shape a
+        busy kernel meets); other paths read normally."""
+        real = Path.read_text
+        def boom(p, *a, **k):
+            if p == target:
+                raise OSError(errno.EMFILE, "synthetic: too many open files")
+            return real(p, *a, **k)
+        Path.read_text = boom
+        try:
+            yield
+        finally:
+            Path.read_text = real
+
+    def test_a_store_loaded_without_its_unreadable_journal_is_marked_and_the_mark_is_never_serialized(self):
+        # A store FILE that exists and cannot be read raises (ReadFaultCas), and an unparseable one is
+        # quarantined aside and legitimately fresh, so the one load that answers with less than the files
+        # hold is a parsed store whose override JOURNAL exists and could not be read: _replay_overrides
+        # returns it without the user's rows. A reader that caches "what the files hold" by their identity
+        # (the kernel's awaiting-lift gate) must tell that answer from a complete one, so it carries a
+        # transient `_unread` mark beside `_baseRev`: popped before a publish and outside the content hash.
+        self.assertNotIn("_unread", jd.load_goals(SID), "no file: an empty store IS the truth")
+        self._seed()
+        self.assertNotIn("_unread", jd.load_goals(SID), "a parsed store with no journal is what the files say")
+        jd.append_override(SID, self._nid(1), "resolve", T0 + 60)
+        with self._reads_raise(jd._overrides_dir() / (SID + ".jsonl")):
+            s = jd.load_goals(SID)
+        self.assertIn(self._nid(1), s["nodes"], "the store itself was read")
+        self.assertEqual(s.get("_unread"), "journal", "...but the journal was not: the user's gestures are missing")
+        self.assertFalse(s["nodes"][self._nid(1)].get("nodeComplete"), "the journaled resolve is not in this view")
+        self.assertEqual(s["_baseRev"], jd._disk_rev(SID), "the CAS base is the parsed store's, as before")
+        self.assertNotIn("_unread", json.loads(jd._store_content(s)), "not store content")
+        s["nodes"][self._nid(1)]["text"] = "A goal, retitled"
+        jd.save_goals(SID, s)
+        gp = jd.GOALDIR / (SID + ".json")
+        self.assertNotIn("_unread", json.loads(gp.read_text()), "the mark is never written to disk")
+        final = jd.load_goals(SID)
+        self.assertNotIn("_unread", final, "a journal that exists and reads leaves no mark")
+        nd = final["nodes"][self._nid(1)]
+        self.assertEqual(nd["text"], "A goal, retitled")
+        self.assertTrue(nd.get("nodeComplete"), "the journal replays on the next load: the publish lost nothing durable")
+
     def test_a_stale_pass_no_longer_erases_a_concurrent_block(self):
         # THE BUG: pass A loads, goes off to its model call; the nudge tick blocks the card and publishes;
         # pass A then saves its pre-block snapshot and wipes the block -> the card flashes back to working.

@@ -16,7 +16,9 @@ stamp (those remain the 6h backstop's job, the one case a timer is the only tool
 
 SYNTHETIC fixtures only: placeholder UUIDs, invented task descriptions.
 """
+import contextlib
 import errno
+import io
 import json
 import os
 import tempfile
@@ -1129,3 +1131,87 @@ class InHarnessWaitLift(unittest.TestCase):
         self._seed(None)
         self._tick({"state": "", "bgTasks": []})
         self.assertIsNotNone(self._stamp(), "a kindless stamp may be a peer wait — untouched, as before")
+
+
+class LiftGateFallback(unittest.TestCase):
+    """The lift's inputs gate (_lift_seen) records a session's fingerprint BEFORE the load and forgets it
+    when the ruling raises or the store read FAULTS (AwaitingLift's
+    test_a_faulting_store_forgets_the_gate_so_the_next_tick_retries). One more load is no better than
+    those: a store that parsed while its override JOURNAL could not be read. _replay_overrides logs
+    history-unreadable and returns the store WITHOUT the user's rows (a restore that carries the stamp,
+    here), so the ruling "nothing stamped" stood against a fingerprint that, for an idle session, may not
+    move for hours. The replay marks that store `_unread`, and the gate forgets its entry for a marked
+    store, so the next cycle retries."""
+
+    def setUp(self):
+        AwaitingLift.setUp(self)
+        km._lift_seen.pop(SID, None)                     # process-global; the harness never clears it
+        self.loads = []
+        real = km.jd.load_goals
+        km.jd.load_goals = lambda fsid: (self.loads.append(fsid), real(fsid))[1]
+        self.addCleanup(setattr, km.jd, "load_goals", real)
+
+    def tearDown(self):
+        km._lift_seen.pop(SID, None)
+        AwaitingLift.tearDown(self)
+
+    _transcript = AwaitingLift._transcript
+    _seed = AwaitingLift._seed
+    _tick = AwaitingLift._tick
+    _stamp = AwaitingLift._stamp
+
+    def _read_fails_once(self, target):
+        """Patch Path.read_text so the FIRST read of `target` (the journal, which _replay_overrides reads
+        that way) raises OSError (the EMFILE/EIO shape a busy kernel meets) and every later read is real.
+        Returns the counter of raised reads."""
+        real = Path.read_text
+        state = {"fired": 0}
+        def flaky(p, *a, **k):
+            if p == target and not state["fired"]:
+                state["fired"] += 1
+                raise OSError(errno.EMFILE, "synthetic: too many open files")
+            return real(p, *a, **k)
+        Path.read_text = flaky
+        self.addCleanup(setattr, Path, "read_text", real)
+        return state
+
+    def test_a_stamp_in_the_file_still_lifts_while_the_journal_does_not_read(self):
+        """The mark changes what the gate REMEMBERS, not what the lift RULES: a store that parsed with its
+        stamp in the file lifts as before and publishes without the mark; only the gate entry is forgotten,
+        so a stamp the unread journal held is retried next cycle."""
+        self._transcript([_launch("t1", LAUNCH), _launch("t2", LAUNCH + 5),
+                          _notification("t1", BACK), _notification("t2", BACK + 5)])
+        self._seed()                                     # the stamp lives in the store FILE
+        km.jd.append_override(SID, SID + ":g9", "resolve", BACK + 50)   # a journal exists: a row for a node the
+        #                                                                  store lacks, skipped on replay
+        state = self._read_fails_once(km.jd._overrides_dir() / (SID + ".jsonl"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._tick()
+        self.assertEqual(state["fired"], 1)
+        self.assertGreaterEqual(len(self.loads), 1)
+        self.assertNotIn(SID, km._lift_seen, "ruled without the journal: the gate forgets the entry")
+        self.assertIsNone(self._stamp(), "...and the ruling on the parsed store stands: every dispatch is back, the stamp lifts")
+        self.assertNotIn("_unread", json.loads((km.jd.GOALDIR / (SID + ".json")).read_text()),
+                         "the mark never reaches the file")
+
+    def test_a_swallowed_journal_read_failure_is_not_recorded_as_a_ruling(self):
+        self._transcript([_launch("t1", LAUNCH), _notification("t1", BACK)])
+        (km.jd.GOALDIR / (SID + ".json")).write_text(json.dumps(
+            {"rompUuid": SID, "seq": 1, "placements": {}, "status": {}, "nodes": {}}))
+        why = "waiting on two dispatched investigations; will act when they return"
+        nd = {"id": self.gid, "text": "a goal", "parentId": None, "nodeComplete": False,
+              "blocked": False, "cleared": False, "trail": [], "t": BORN, "mt": BORN,
+              "awaitingWhy": why, "awaitingAt": STAMP,
+              "log": [{"ev_t": STAMP, "src": "closer", "kind": "awaiting", "why": why, "at": STAMP}]}
+        km.jd.append_restore(SID, {self.gid: nd}, {}, BACK + 50)   # the stamp lives in the journal only
+        state = self._read_fails_once(km.jd._overrides_dir() / (SID + ".jsonl"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._tick()                                 # the replay logged history-unreadable and skipped
+        self.assertEqual(len(self.loads), 1)
+        self.assertEqual(state["fired"], 1)
+        self.assertNotIn(SID, km._lift_seen, "the journal was not read: no entry")
+        self._tick()                                     # nothing on disk moved
+        self.assertGreaterEqual(len(self.loads), 2, "the journal reads now, unchanged: loaded anyway")
+        nodes = json.loads((km.jd.GOALDIR / (SID + ".json")).read_text())["nodes"]
+        self.assertIn(self.gid, nodes, "the restore replayed and the node was saved back")
+        self.assertIsNone(nodes[self.gid].get("awaitingWhy") or None, "...with its stamp lifted")

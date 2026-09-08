@@ -3580,8 +3580,13 @@ def _replay_overrides(fsid, store):
     log gains exactly one user event no matter how many loads replay the journal. A journaled node the
     store lacks is skipped (resolve/followup/move: it was cleared and compacted to the archive, which
     kept its flags). An unreadable journal logs a loud judge-errors row instead of silently skipping;
-    the store is still returned. Entries are rare (one manual click each), so the journal is never
-    pruned — replay is a few dict lookups.
+    the store is still returned, MARKED: `store["_unread"] = "journal"`, a transient key beside `_baseRev`
+    (save_goals pops it; _store_content keeps it out of the content hash) that says the store returned is
+    not the files' content. A reader that caches a load's answer by the files' identity consults the mark
+    before caching (the kernel's awaiting-lift gate today); a store FILE that cannot be read never reaches
+    here (load_goals raises), and an unparseable one is quarantined aside and legitimately fresh, so this
+    is the one load that answers with less than the files hold. Entries are rare (one manual click each),
+    so the journal is never pruned — replay is a few dict lookups.
 
     The SUPERSEDE guard on the event ops: a STRICTLY-LATER user event means a newer gesture outranks
     the entry — replaying past it would undo what the user did next (e.g. re-complete a card they
@@ -3600,6 +3605,10 @@ def _replay_overrides(fsid, store):
     except OSError as e:
         _log_judge_error("romp", fsid, "history-unreadable",
                          note="override journal unreadable: %s — user actions may show undone until it reads" % e)
+        # the store parsed but the journal exists and did not read: the user's gestures are missing from
+        # this view until it does. The journal replays on every load, so a publish of this store loses
+        # nothing durable; the mark tells an identity-keyed reader not to cache it (see the docstring).
+        store["_unread"] = "journal"
         return False
     applied = False                                    # any write → load_goals re-runs rollup (one truth)
     arch_nodes = None                                  # the archive is read once, only if a restore entry needs it
@@ -3745,7 +3754,8 @@ def _replay_overrides(fsid, store):
     return applied
 
 
-_NONCONTENT_KEYS = ("rev", "_baseRev")   # the revision counter + the transient CAS base: not store CONTENT
+_NONCONTENT_KEYS = ("rev", "_baseRev", "_unread")   # the revision counter + the transient CAS base and
+#                                                      unread-journal mark (_replay_overrides): not store CONTENT
 
 
 def _store_content(store):
@@ -3965,6 +3975,7 @@ def save_goals(fsid, store):
     if mine is not None and _matches_disk(fsid, store, mine):
         return                                       # nothing of ours to publish → leave the file (and its
     base = store.pop("_baseRev", None)               # mtime) alone.  transient: never serialized
+    store.pop("_unread", None)                       # likewise transient (_replay_overrides' unread-journal mark)
     rebased = False
     if base is not None:
         disk = 0

@@ -8986,6 +8986,12 @@ def _lift_spent_awaiting(now, tmux):
             # reply), the SDK reg (the CLI epoch) and the backend's live task set. Unchanged since the
             # last cycle → the ruling is unchanged → skip the load (2026-09-03: this ran a full store
             # load + journal replay per live session per 0.5 s cycle on a quiet board).
+            # A recorded fingerprint stands for a ruling made from the files' CONTENT. A load that raises
+            # forgets its entry (the except below), a load that FAULTS forgets it (the boundary's (None,
+            # fault) answer below), and so does one whose store parsed but whose override JOURNAL did not
+            # read: _replay_overrides logs history-unreadable, returns the store without the user's rows
+            # and marks it `_unread`. A ruling on that store is not a ruling on the files (a stamp the
+            # journal restored is missing from it), so the entry is forgotten and the next cycle retries.
             snap = tmux.get(sid) or {}
             # …plus the two facts the ruling reads that no file records: the live subagent count, and
             # for every dispatch the transcript pairs, WHETHER its recorded deadline has passed (a
@@ -9005,6 +9011,8 @@ def _lift_spent_awaiting(now, tmux):
             if fault is not None:                     # its row is filed; forget the gate so the next cycle
                 _lift_seen.pop(sid, None)             # retries this session, and go on to the others
                 continue
+            if store.get("_unread"):                  # the store read but its journal did not (the mark):
+                _lift_seen.pop(sid, None)             # not a ruling on the files; the next cycle retries
             nodes = store.get("nodes") or {}
             stamped = [nd for nd in nodes.values()
                        if nd.get("awaitingWhy") and nd.get("awaitingAt") and not nd.get("rolledUp")]
