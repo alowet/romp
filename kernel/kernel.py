@@ -2887,9 +2887,10 @@ def _tab_order_frame(order, tabs, live):
     sessions of its own — every session attached from elsewhere — never learned it until the + picker was
     opened, and a remote card stamped with this kernel's name stayed plain text (review find, 2026-09-06).
     Every chat client receives a tabOrder frame, first of all on connect (tabs-first), so the name is known
-    before any card renders. Older clients ignore the extra fields."""
+    before any card renders. Older clients ignore the extra fields. Under a views read fault the blob is the last
+    one served, marked `viewsFault`, or absent with the marker alone (_views_payload)."""
     return {"type": "tabOrder", "order": list(order), "tabs": tabs, "selfHost": _self_host(),
-            "views": _views_client(), "live": sorted({str(x) for x in live})}
+            **_views_payload(), "live": sorted({str(x) for x in live})}
 
 
 def _alive_sessions(now, tmux):
@@ -3003,6 +3004,13 @@ _STATE_REPLACED = "replaced meanwhile; the new bytes get their own read"   # _st
 #                                        file is no longer the one whose bytes failed: the reader re-reads (bounded)
 
 
+# What a state file holds, for the quarantine notice: a quarantine resets the file to EMPTY, and the
+# notice says what starts over in the person's words. The views store holds the user's tags and lenses,
+# which are not settings (review find, 2026-09-08: its notice called them that); the flags, order and
+# bell stores are settings, the default.
+_STATE_FILE_HOLDS = {"timeline-views.json": "the tags and lenses"}
+
+
 def _state_quarantine(p, st, reason):
     """Move an unparseable state file ASIDE (never delete it) so the evidence survives the fresh
     start that follows: the sidecar keeps the original name plus `.corrupt-<utc stamp>` (a `-n`
@@ -3038,8 +3046,9 @@ def _state_quarantine(p, st, reason):
     # speaks exactly once. Guarded like _note_state_fault: a notice never turns a successful move
     # into a raise.
     try:
-        _sync_notice("%s could not be parsed and was moved aside to %s; the settings it held start over "
-                     "empty until you set them again" % (p.name, aside.name), ok=False, kind="refused")
+        _sync_notice("%s could not be parsed and was moved aside to %s; %s it held start over "
+                     "empty until you set them again"
+                     % (p.name, aside.name, _STATE_FILE_HOLDS.get(p.name, "the settings")), ok=False, kind="refused")
     except Exception:
         pass
     return None
@@ -3478,10 +3487,13 @@ def _ordered(sessions):
                     # the next pass. Never a raise out of _ordered -- it runs inside every build (the push,
                     # GET /feed.json, the WS clearAll arm) -- and never a fold: the heal read the display
                     # reader before this change, which folded the fault to an empty store, so the heal
-                    # carried nothing and said nothing. Said once per fork, like the order publish below.
+                    # carried nothing and said nothing. Said once per fork, like the order publish below:
+                    # the stderr line, and the bell row the fork and promotion sites file for the same
+                    # non-event (_note_views_heal_deferred; review find, 2026-09-08).
                     if sid not in _views_heal_pending:
                         sys.stderr.write("romp-kernel: views heal for %s skipped (%s) \u2014 deferred; the next pass "
                                          "retries it (lost if the kernel restarts first)\n" % (sid, e))
+                        _note_views_heal_deferred(a or sid, e)
                     _views_heal_pending[sid] = order[sib[-1]]
                 order.insert(sib[-1] + 1, sid)           # a fork inherits its session's slot, not the END
                 name_at.insert(sib[-1] + 1, a)           # keep name_at aligned with order as we splice
@@ -3790,12 +3802,28 @@ def _views_lost_notice(note, members):
 
 
 def _timeline_views():
-    """The DISPLAY read of the views store, cached under the file's (mtime_ns, size) key. Never raises
-    into a build (build_feed / build_timeline / build_session run under _push's one outer try, so a
-    reader that raised would abort every client's push): a MISSING store is legitimately empty; a
-    store that EXISTS but cannot be read (a stat or read fault: EIO, EACCES) serves the last blob this
-    kernel served or wrote when the cache holds one, else the empty default -- UNPROVED either way,
-    NEVER CACHED, and loud once per episode (_note_state_fault). Until this change a fault was folded
+    """The DISPLAY read of the views store as a blob every display caller can filter on: what
+    _timeline_views_display serves, with the empty default standing in when a fault left it nothing to
+    serve (a cold cache: a kernel that has never served the store). The display callers -- view
+    visibility, the tab sections, the union -- read here; a FRAME or an ACK reads _views_payload, which
+    carries the fault instead of that default (review find, 2026-09-08). Writers never read here: they
+    read _timeline_views_proved, which raises, and refuse."""
+    v, _fault = _timeline_views_display()
+    return v if v is not None else _norm_timeline_views({})
+
+
+def _timeline_views_display():
+    """The DISPLAY read of the views store, cached under the file's (mtime_ns, size) key, as (blob,
+    fault). Never raises into a build (build_feed / build_timeline / build_session run under _push's one
+    outer try, so a reader that raised would abort every client's push): a MISSING store is legitimately
+    empty; a store that EXISTS but cannot be read (a stat or read fault: EIO, EACCES) serves the last
+    blob this kernel served or wrote when the cache holds one, else None -- UNPROVED either way, NEVER
+    CACHED, loud once per episode (_note_state_fault), and NAMED: `fault` is the _StateUnreadable the
+    blob is served under, None after a read that proved the file state it served (a cache hit at the
+    file's key, a clean read, a missing store). The empty default is not served here (review find,
+    2026-09-08): carried on a frame it is a seq-less empty store that every dashboard adopts as the
+    store's word; _timeline_views stands it in for the filtering callers, and _views_payload carries the
+    fault instead. Until this change a fault was folded
     to an empty store and CACHED under the file's real key, so after one EIO the store read as {} on
     every call until the file's stat moved, and every read-modify-write door (which read here) then
     persisted that emptiness plus its one edit over the user's whole tag set under an ok:true ack --
@@ -3817,29 +3845,30 @@ def _timeline_views():
         # floor is kept (_VIEWS_SEQ_FLOOR): a recreated file is still ORDERED past what was served.
         _flags_cache.pop(str(p), None)
         _clear_state_fault(p)
-        return _norm_timeline_views({})
+        return _norm_timeline_views({}), None
     except OSError as e:
         # The store EXISTS but cannot be stat'ed (a state dir that cannot be searched): the last blob
-        # served, else the empty default -- unproved, uncached, the entry KEPT (the store is not gone);
-        # loud once per episode. Until this change this was the missing-store arm, so an EACCES forgot
-        # the entry and served {}.
-        _note_state_fault(_StateUnreadable(p, "stat failed: %s" % _errno_text(e)))
-        return hit[1] if hit is not None else _norm_timeline_views({})
+        # served, else nothing -- unproved, uncached, the entry KEPT (the store is not gone); loud once
+        # per episode, and the fault returned beside the blob. Until this change this was the
+        # missing-store arm, so an EACCES forgot the entry and served {}.
+        exc = _StateUnreadable(p, "stat failed: %s" % _errno_text(e))
+        _note_state_fault(exc)
+        return (hit[1] if hit is not None else None), exc
     if hit is not None and hit[0] == key:
         _clear_state_fault(p)
-        return hit[1]
+        return hit[1], None
     try:
         d = _read_state_json(p, st, expect=dict)
     except _StateUnreadable as e:
         _note_state_fault(e)
-        return hit[1] if hit is not None else _norm_timeline_views({})
+        return (hit[1] if hit is not None else None), e
     _clear_state_fault(p)
     if d is None:
         # gone between the stat and the read, or quarantined aside just now: the store IS empty from
         # here, and the entry is forgotten as for a missing store (a file that then appears is not
         # judged against one that no longer exists)
         _flags_cache.pop(str(p), None)
-        return _norm_timeline_views({})
+        return _norm_timeline_views({}), None
     fix = _views_restamp(d, hit)
     if fix is not None:
         # The file goes back through the write door BEFORE it is served (the cases in
@@ -3864,9 +3893,9 @@ def _timeline_views():
             try:
                 st2 = p.stat()
             except OSError:
-                return _timeline_views()      # gone, or faulting, under the lock: the arms above say which
+                return _timeline_views_display()      # gone, or faulting, under the lock: the arms above say which
             if (st2.st_mtime_ns, st2.st_size) != key:
-                return _timeline_views()
+                return _timeline_views_display()
             hit2 = _flags_cache.get(str(p))
             if hit2 is not None and hit2[0] == key:
                 # The same file state, served and cached by a reader that held the lock while this one
@@ -3876,7 +3905,7 @@ def _timeline_views():
                 # and two cold readers racing on a full disk each judged the file, each failed the
                 # write, and each filed the file-fact notice. The check the function opens with, run
                 # again under the lock; it serves nothing that check would not.
-                return hit2[1]
+                return hit2[1], None
             try:
                 floor = int(hit[1].get("seq") or 0) if hit is not None else 0
             except (TypeError, ValueError):
@@ -3974,11 +4003,11 @@ def _timeline_views():
                            "is" if len(lost) == 1 else "are"), ": ", names), members)
                 d = _norm_timeline_views(json.loads(json.dumps(judged)) if judge else d2)
                 _views_cache_put(p, key, d)
-                return d
-        return _timeline_views()          # the write refreshed the cache under the file's new key
+                return d, None
+        return _timeline_views_display()  # the write refreshed the cache under the file's new key
     d = _norm_timeline_views(d)
     _views_cache_put(p, key, d)
-    return d
+    return d, None
 
 
 def _timeline_views_proved():
@@ -4757,15 +4786,39 @@ def _row_op(row):
     return "delete" if row.get("delete") else ("rename" if row.get("rename") else "remove")
 
 
-def _views_client():
+def _views_payload():
+    """The views fields of a frame (the tabOrder frame, the feed, the timeline skeleton) and of a write's
+    ack (_ack_views_write), from ONE display read (_timeline_views_display): `views`, the rendered blob
+    (_views_client), and under a read fault `viewsFault`, the fault in the person's words
+    (_views_fault_text), which a pane can render as "tags unavailable: <reason>". With a last good blob
+    the frame carries it AND the marker: the blob is what this kernel last served or wrote, unproved by
+    this read and said so. With NONE (a cold cache: a kernel that has never served the store) the frame
+    carries no `views` at all -- every pane keeps what it holds on a frame without the blob (render.ts
+    captureViews, feed.ts, fleet.ts, the timeline's _takeViews) -- where the seq-less empty default it
+    carried until this change was adopted by every dashboard as the store's word: the tag bar emptied
+    with the fault said only on the bell, and the next lens click made it permanent (review find,
+    2026-09-08). A clean read adds no key, so a clean frame is byte-identical to before."""
+    v, fault = _timeline_views_display()
+    # a dict literal, not a subscript store of the views key: test_tag_federation_v2 counts that spelling across
+    # the module as a store of a REMOTE reading, which must go through _cache_remote_views; this is the local
+    # frame's own field
+    out = {"views": _views_client(v)} if v is not None else {}
+    if fault is not None:
+        out["viewsFault"] = _views_fault_text(fault)
+    return out
+
+
+def _views_client(v=None):
     """The views blob every client renders and matches against — the RENDERING of the canonical
     store (federation v0, the user 2026-08-24): local tags with members as viewer-relative strings
     (the pre-pairs contract, so no client re-learns anything), plus `remoteTags` — each ATTACHED
     kernel's own tags, read-only, host-stamped, members respelled for this viewer. Per-host maps
     joined at the viewer, never merged (the federation counter rule); same-name tags on two kernels
     stay two entries — the host disambiguates, nothing silently merges. Remote reads ride the
-    supervisor's cached /views poll; a kernel that is down simply contributes nothing this push."""
-    v = json.loads(json.dumps(_timeline_views()))
+    supervisor's cached /views poll; a kernel that is down simply contributes nothing this push.
+    `v`: the display blob to render, else the display read's own (_timeline_views); _views_payload hands
+    its read over, so a frame is built from ONE read and the fault it carries names that read."""
+    v = json.loads(json.dumps(_timeline_views() if v is None else v))
     for t in v["tags"]:
         t["members"] = [_member_str(m) for m in t["members"]]
     remote = []
@@ -4943,14 +4996,21 @@ def _b36(n):
 _TAG_GONE = "that tag no longer exists — it may have been deleted from another dashboard"
 
 
+def _views_fault_text(e):
+    """The views store's fault in the person's words: the store (never the file -- the once-per-episode
+    notice names it), the step that failed, and the errno and strerror. The head of every refusal
+    (_views_fault_refusal), the frame's marker of a blob it could not prove (_views_payload), and the
+    reason on the spawn sites' and the heal's bell rows."""
+    return "the tag store could not be %s (%s)" % ("written" if isinstance(e, _StateUnwritable) else "read", e.fault)
+
+
 def _views_fault_refusal(e):
     """The refusal a gesture on the views store gets when the STORE itself faulted (_StateUnreadable /
     _StateUnwritable out of a proved read or a publish) -- the tags dialog's tagEditAck, a lens write's
-    viewsAck, POST /tag's reply, the creation ack's `tagError`: the person's words, the fault's errno and
-    strerror, and what stands -- nothing changed, since a read that fails edits nothing and a publish
-    that fails never reached its replace. No file name: the once-per-episode notice names the file."""
-    return "the tag store could not be %s (%s); nothing was changed \u2014 retry" % (
-        "written" if isinstance(e, _StateUnwritable) else "read", e.fault)
+    viewsAck, POST /tag's reply, the creation ack's `tagError`: the fault (_views_fault_text) and what
+    stands -- nothing changed, since a read that fails edits nothing and a publish that fails never
+    reached its replace."""
+    return "%s; nothing was changed \u2014 retry" % _views_fault_text(e)
 
 
 def _note_tags_not_inherited(parent_sid, child_name, e):
@@ -4959,10 +5019,26 @@ def _note_tags_not_inherited(parent_sid, child_name, e):
     and what did NOT happen is said -- one stderr line, and one dashboard notice under the bell's `refused`
     kind naming the child, since the store's own once-per-episode notice cannot say which session landed
     outside its group. Tagging it again once the store reads puts it there."""
-    text = ('"%s" did not inherit the tags of "%s": the tag store could not be %s (%s) \u2014 tag it again once it can be'
-            % (child_name, _name_of(parent_sid) or parent_sid,
-               "written" if isinstance(e, _StateUnwritable) else "read", e.fault))
+    text = ('"%s" did not inherit the tags of "%s": %s \u2014 tag it again once it can be'
+            % (child_name, _name_of(parent_sid) or parent_sid, _views_fault_text(e)))
     sys.stderr.write("romp-kernel: %s\n" % text)
+    try:
+        _sync_notice(text, ok=False, kind="refused")
+    except Exception:
+        pass
+
+
+def _note_views_heal_deferred(name, e):
+    """A /clear or revive whose new session id could not inherit its session's tag memberships because
+    the views store faulted under the heal (_ordered's boundary deferred it, _views_heal_pending): the
+    dashboard hears it like the fork and promotion sites (_note_tags_not_inherited) -- one bell row under
+    the `refused` kind, once per deferral, beside the stderr line the boundary writes. Until this change
+    that line was the whole record, and it dies with the process while the session sits outside its tag
+    (review find, 2026-09-08). The row says what happens next: the heal is retried until it lands, and a
+    restart loses it, so tagging the session again is the remedy then. Guarded like the rest: a notice
+    never turns a placed fork into a raise out of a build."""
+    text = ('"%s" did not carry its tags across a /clear or revive: %s. Retried until it lands; '
+            'tag it again if the kernel restarts first' % (name, _views_fault_text(e)))
     try:
         _sync_notice(text, ok=False, kind="refused")
     except Exception:
@@ -5169,7 +5245,11 @@ def _ack_views_write(client, kind, write_id, ok, error=None, refused=None, info=
     kernel-minted `tid` and `name` here and opens its rename input on that id. `edited` is the
     write's own list (the whole-blob path): it orders the not-ok `error`, the poster's own refusals
     first. A dead socket is the client's problem, never the write's: the edit landed before this
-    runs."""
+    runs. Under a READ fault the store cannot be proved for the ack either (review find, 2026-09-08):
+    `views` is then the last blob this kernel served, marked by `viewsFault` (the fault in the person's
+    words), or absent with the marker alone when nothing was served yet -- so a poster reverting on the
+    refusal keeps what it holds instead of adopting a seq-less empty store as the base, and `seq` is
+    None. A publish fault's refusal read the store proved, so its ack carries the blob unmarked."""
     if not client or not callable(client.get("send")):
         return
     try:
@@ -5182,13 +5262,14 @@ def _views_write_ack(kind, write_id, ok, error=None, refused=None, info=None, ed
     """The ack document _ack_views_write sends, built without a socket: POST /views (the Obsidian
     panel's whole-blob write, _state_write_route) answers with this same document, so the panel feeds
     it to the viewsAck handler it already has and a refusal reads the same in every host."""
-    views = _views_client()
+    vp = _views_payload()
+    views = vp.get("views")
     ack = {"type": kind, "writeId": write_id if isinstance(write_id, str) else None,
-           "ok": bool(ok), "views": views,
+           "ok": bool(ok), **vp,
            # the store's write sequence after this write (the blob carries it too): the poster
            # orders this against the frames it receives — a frame with a lower seq predates the
-           # write and is ignored, whatever order the socket delivered them in
-           "seq": views.get("seq")}
+           # write and is ignored, whatever order the socket delivered them in; None with no blob
+           "seq": views.get("seq") if views is not None else None}
     for k in ("tid", "name"):
         if isinstance(info, dict) and info.get(k):
             ack[k] = info[k]
@@ -31751,7 +31832,7 @@ def build_feed(now, tmux=None):
     for _a in asks:
         _a["notify"] = True if _notify_card_effective(_ncards, _a["itemId"], str(_a.get("sid") or "")) else None
     return {"type": "feed", "asks": asks, "now": now,
-            "views": _views_client(),   # the rendered views blob — the outline + feed tag mounts read it (2026-08-25)
+            **_views_payload(),   # the rendered views blob — the outline + feed tag mounts read it (2026-08-25); under a read fault its marker rides too, or alone (2026-09-08)
             # usage-limit-down latch (judge-limit.json): analysis is paused because the account
             # cannot bill judge calls — the dashboard must SAY so, never fail quietly into retries
             # (the user 2026-08-18); self-expires at the window reset, cleared by the next success
@@ -34197,7 +34278,7 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
     # letting the bar slide through the map's hues as it compresses — mirroring the context battery fill.
     cmap_grad = [list(cm.ramp(v, ctx_stops)) for v in (0.12, 0.34, 0.56, 0.78, 1.0)]
     return {"type": "timeline", "now": now, "sessions": sessions, "turns": turns,
-            "views": _views_client(),
+            **_views_payload(),
             "palette": pal.colors(_palette_name()),   # tag color choices — the same set sessions draw identity colors from
             "messages": messages, "judging": judging,
             "cmapGrad": cmap_grad,

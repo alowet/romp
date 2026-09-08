@@ -791,9 +791,10 @@ class WriteSequence(_Wire):
         self.assertEqual(km._norm_timeline_views(json.loads(json.dumps(served)))["seq"], served["seq"],
                          "clients echo the blob wholesale — the stamp survives the round trip")
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        self.assertGreaterEqual(src.count('"views": _views_client()'), 3,
+        self.assertGreaterEqual(src.count('**_views_payload()'), 3,
                                 "the timeline skeleton, the feed frame and the tabOrder frames all embed the "
-                                "rendered blob — one carrier, so the seq rides every one of them")
+                                "rendered blob — one carrier (_views_payload since 2026-09-08: the blob, marked "
+                                "under a read fault, or the marker alone), so the seq rides every one of them")
 
     def test_a_store_recreated_from_nothing_starts_past_what_a_connected_client_holds(self):
         """The seq is seeded from the clock, then +1 per write: a deleted views file (or a new

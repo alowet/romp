@@ -39,7 +39,14 @@ DEAD = "33333333-4444-5555-6666-777777777777"                        # a sid no 
 REMOTE = "TESTHOST:11111111-2222-3333-4444-555555555555"             # a host-prefixed remote id
 
 
-class TagRoute(unittest.TestCase):
+class _TagRouteHarness(unittest.TestCase):
+    """The route harness alone -- the real Handler over HTTP, a private temp state dir per test, the
+    live-name stub and the HTTP helpers -- with NO tests of its own: a class that needs the harness for
+    cases of its own inherits this and runs only those. TagRoute below carries the route's fourteen cases;
+    the store-fault classes used to inherit TagRoute and re-ran them under eight more names, 112 runs that
+    told nothing new (review find, 2026-09-08). The door subclasses that predate them (HostForward and the
+    rest) still inherit TagRoute on purpose: each changes a door the fourteen exercise."""
+
     @classmethod
     def setUpClass(cls):
         cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), km.Handler)
@@ -84,6 +91,10 @@ class TagRoute(unittest.TestCase):
             headers={"X-Romp-Token": os.environ["ROMP_SERVE_TOKEN"]})
         with urllib.request.urlopen(req, timeout=10) as r:
             return r.status, json.loads(r.read().decode())
+
+
+class TagRoute(_TagRouteHarness):
+    """GET /views + POST /tag through the harness: the fourteen cases every route door must pass."""
 
     def test_get_views_serves_the_normalized_default(self):
         st, v = self._views()
@@ -606,8 +617,37 @@ def _writes_fault(target):
         Path.write_text = real
 
 
+class _ClockAhead:
+    """The kernel's `time` module with time() moved `by` seconds ahead and everything else delegated. The
+    store's stamps (each tag's mtime, the blob's `at`) are whole seconds off the kernel's clock, so a case
+    that needs a later write to land in a LATER second moves the clock instead of sleeping across the
+    boundary (review find, 2026-09-08: 1.1 s of wall clock per run; the stamps live inside the blob, so a
+    file utime would not move them). Kernel-local: km.time is the name the kernel's code reads; this
+    module's `time` and the HTTP machinery's are untouched."""
+
+    def __init__(self, by):
+        self._by = by
+
+    def time(self):
+        return time.time() + self._by
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+@contextlib.contextmanager
+def _clock_ahead(by):
+    saved = km.time
+    km.time = _ClockAhead(by)
+    try:
+        yield
+    finally:
+        km.time = saved
+
+
 class _ViewsFaultMixin:
-    """The store-fault harness on top of TagRoute (a mixin, so it is not collected on its own): the fault
+    """The store-fault harness on top of the route harness (_TagRouteHarness; a mixin, so it is not collected
+    on its own -- and the harness, not TagRoute, so its fourteen cases run once, review find 2026-09-08): the fault
     registries and the deferred-heal map start and end empty (process-wide state -- a fault filed here
     must not silence a later test's), the notice ring is captured WITH the kind the fault machinery files
     under (a two-argument stub raises on `kind=`, and the machinery's own try swallows the notice), and
@@ -654,7 +694,7 @@ class _ViewsFaultMixin:
         return [(t, k) for t, ok, k in self.notices if not ok and "timeline-views.json could not be %s" % what in t]
 
 
-class ViewsStoreUnreadableRefuses(_ViewsFaultMixin, TagRoute):
+class ViewsStoreUnreadableRefuses(_ViewsFaultMixin, _TagRouteHarness):
     """A store that EXISTS but cannot be read. The mutation path refuses in its own shape and writes nothing;
     the judge never folds; the display path serves what it last knew, caches nothing from the fault, and
     says so once per episode."""
@@ -718,6 +758,19 @@ class ViewsStoreUnreadableRefuses(_ViewsFaultMixin, TagRoute):
             self.assertEqual(km._timeline_views()["tags"], [], "the display reader agrees: empty now, not a fault")
         self.assertEqual(self._faults(), [], "a quarantine is a stated event, not a read fault")
 
+    def test_the_quarantine_notice_names_the_tags_and_lenses_it_held_not_settings(self):
+        # review find, 2026-09-08: the notice said "the settings it held start over", the words for the flags,
+        # order and bell stores; the views store holds the user's tags and lenses, and the notice says so
+        p = km._views_path()
+        p.write_bytes(b'{"active": "all", "tags": [ THIS IS NOT JSON')
+        km._flags_cache.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            km._timeline_views()
+        rows = [t for t, ok, k in self.notices if "moved aside" in t and k == "refused"]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("the tags and lenses it held start over empty until you set them again", rows[0])
+        self.assertNotIn("settings", rows[0])
+
     def test_enoent_views_reads_empty_with_no_quarantine_and_no_fault_filed(self):
         try:
             km._views_path().unlink()
@@ -732,15 +785,18 @@ class ViewsStoreUnreadableRefuses(_ViewsFaultMixin, TagRoute):
 
     def test_a_display_read_fault_never_raises_into_the_build_and_is_loud_once_per_episode(self):
         # build_feed / build_timeline / build_session run under _push's ONE outer try, so a display reader
-        # that RAISED would abort every client's push. The display path serves the empty default here (a
-        # cold cache: nothing known-good yet), UNPROVED, and files exactly ONE notice per fault episode.
+        # that RAISED would abort every client's push. The display path has nothing known-good here (a cold
+        # cache), so the feed carries the fault marker and NO blob (review find, 2026-09-08: the seq-less
+        # empty default it carried was adopted by every dashboard as the store's word), and files exactly
+        # ONE notice per fault episode.
         self._seed("workers")
         km._flags_cache.clear()
         with _reads_fault(km._views_path()):
             feed1 = km.build_feed(int(time.time()))
             self.assertEqual(feed1.get("type"), "feed", "build_feed still returns a payload: the board is not wedged")
-            self.assertIn("views", feed1)
-            self.assertEqual(feed1["views"]["tags"], [], "the unreadable store serves the empty default, not a crash")
+            self.assertNotIn("views", feed1, "nothing known-good: no blob, so no dashboard adopts an empty store")
+            self.assertIn("the tag store could not be read (read failed: [Errno 5]", feed1["viewsFault"],
+                          "the frame says why it carries no tags")
             self.assertEqual(len(self._faults()), 1, "exactly ONE notice the first time the fault is seen")
             self.assertIn("timeline-views.json could not be read (read failed: [Errno 5]", self._faults()[0][0])
             self.assertEqual(self._faults()[0][1], "refused")
@@ -807,7 +863,7 @@ class ViewsStoreUnreadableRefuses(_ViewsFaultMixin, TagRoute):
         self.assertEqual(p.read_text(), json.dumps(legacy), "no re-stamp was written")
 
 
-class ViewsWsRefusal(_ViewsFaultMixin, TagRoute):
+class ViewsWsRefusal(_ViewsFaultMixin, _TagRouteHarness):
     """The two dashboard doors under a store fault, through the real dispatcher: the poster is answered on
     its own socket with the fault in the person's words, the file is untouched, the socket lives."""
 
@@ -906,7 +962,7 @@ class ViewsWsRefusal(_ViewsFaultMixin, TagRoute):
         self.assertEqual(sorted(t["name"] for t in km._timeline_views()["tags"]), ["reviewers", "workers"])
 
 
-class ViewsStoreUnwritableRefuses(_ViewsFaultMixin, TagRoute):
+class ViewsStoreUnwritableRefuses(_ViewsFaultMixin, _TagRouteHarness):
     """The views store READS but its PUBLISH fails (ENOSPC, EROFS, EACCES): the write step is a fault
     boundary too. On main the OSError out of _atomic_write escaped _edit_tag to do_POST's catch-all -- a
     500 traceback, which `romp tag` (curl -sf) reports as an unreachable kernel and a federation forward
@@ -944,7 +1000,7 @@ class ViewsStoreUnwritableRefuses(_ViewsFaultMixin, TagRoute):
         self.assertFalse(km._views_path().exists(), "nothing was published")
 
 
-class HealHasABoundaryInTheBuild(_ViewsFaultMixin, TagRoute):
+class HealHasABoundaryInTheBuild(_ViewsFaultMixin, _TagRouteHarness):
     """_heal_timeline_views (a /clear or revive inherits its session's tag memberships) runs inside _ordered,
     inside every build. It reads PROVED once and hands its snapshot to the setter; a fault raises to
     _ordered's boundary, which places the fork, defers the heal and retries it on later passes -- the order
@@ -1075,8 +1131,60 @@ class HealHasABoundaryInTheBuild(_ViewsFaultMixin, TagRoute):
         # arm is (BrokenPipeError, ConnectionResetError, OSError) -- a plain Exception is logged, the socket kept
         self.assertFalse(issubclass(km._StateUnreadable, OSError))
 
+    def _heal_rows(self):
+        """The deferred heal's bell rows (text, kind): what the dashboard hears of a /clear'd session that sits
+        outside its tag while the store faults."""
+        return [(t, k) for t, ok, k in self.notices if not ok and "did not carry its tags" in t]
 
-class TagAckNamesTheFault(_ViewsFaultMixin, TagRoute):
+    def test_a_deferred_heal_rings_the_bell_once_and_the_retry_stays_quiet_while_the_store_still_faults(self):
+        # review find, 2026-09-08: the deferral was a stderr line alone, which dies with the process while the
+        # session sits outside its tag; the fork and promotion sites file a bell row for the same non-event. Now
+        # the boundary files one too, under the refused kind, naming the session -- ONCE: the two quiet arms of
+        # the retry (the fork re-detected as new while its heal is pending, as after a failed order publish; and
+        # the pending heal's retry while the store still faults) add no line and no row
+        self._seed_tag_with(SID)
+        self._stub_order([SID, SID2])
+        p = km._views_path()
+        before = p.read_bytes()
+        err = io.StringIO()
+        with _reads_fault(p), contextlib.redirect_stderr(err):
+            km._ordered(self._sessions())                                  # pass 1: deferred, said once
+            km._ordered(self._sessions())                                  # pass 2: the order still lacks the fork, heal pending
+            self._stub_order([SID, self.FORK, SID2])
+            km._ordered(self._sessions())                                  # pass 3: the retry, the store still faulting
+        self.assertEqual(err.getvalue().count("views heal for %s skipped" % self.FORK), 1, "the skip line once per deferral")
+        self.assertNotIn("landed", err.getvalue())
+        rows = self._heal_rows()
+        self.assertEqual([k for t, k in rows], ["refused"], "ONE bell row, under the refused kind, like the spawn sites: %r" % rows)
+        self.assertIn('"web" did not carry its tags across a /clear or revive: the tag store could not be read (read failed: [Errno 5]',
+                      rows[0][0])
+        self.assertIn("tag it again if the kernel restarts first", rows[0][0], "the row says what a restart costs")
+        self.assertEqual(km._views_heal_pending, {self.FORK: SID}, "still pending: the next pass retries it")
+        self.assertEqual(p.read_bytes(), before, "nothing written under the fault")
+
+    def test_a_retried_heal_with_nothing_to_carry_settles_and_says_which(self):
+        # the landing arm's other branch: the session held no tag, so the retry carries nothing and writes nothing,
+        # and the deferral is over -- the map entry is popped (without that the retry would run on every pass)
+        # and the bell keeps the deferral's one row
+        self._seed_tag_with(SID2)                                          # a store that exists; "web" is in no tag
+        self._stub_order([SID, SID2])
+        p = km._views_path()
+        with _reads_fault(p), contextlib.redirect_stderr(io.StringIO()):
+            km._ordered(self._sessions())
+        self.assertEqual(km._views_heal_pending, {self.FORK: SID})
+        self.assertEqual(len(self._heal_rows()), 1, "the deferral rang once")
+        before = p.read_bytes()
+        self._stub_order([SID, self.FORK, SID2])
+        err2 = io.StringIO()
+        with contextlib.redirect_stderr(err2):
+            km._ordered(self._sessions())
+        self.assertEqual(km._views_heal_pending, {}, "settled: nothing to carry is an answer, not a fault")
+        self.assertIn("views heal for %s retried: nothing to carry" % self.FORK, err2.getvalue())
+        self.assertEqual(p.read_bytes(), before, "no write: a heal with nothing to carry publishes nothing")
+        self.assertEqual(len(self._heal_rows()), 1, "the landing adds no row: the bell said what did not happen, once")
+
+
+class TagAckNamesTheFault(_ViewsFaultMixin, _TagRouteHarness):
     """The creation event's tag half (`romp new --in`, the picker's Tags row, a fork, a promoted thread):
     nothing is inherited or joined off a faulting store, and what did not happen is said -- in the ack's
     `tagError`, or at the spawn sites in a notice naming the child."""
@@ -1128,7 +1236,7 @@ class TagAckNamesTheFault(_ViewsFaultMixin, TagRoute):
         self.assertIn("did not inherit", err.getvalue())
 
 
-class LegacyHiddenEntriesSurviveAProvedRead(_ViewsFaultMixin, TagRoute):
+class LegacyHiddenEntriesSurviveAProvedRead(_ViewsFaultMixin, _TagRouteHarness):
     """The display reader migrates a legacy blob's `hidden` entries into the archived tag on first read and
     persists that; the normalizer DROPS `hidden`. A mutation snapshot that read the file raw would hand a
     writer a blob without the legacy entries, and its write -- before the display reader's first read
@@ -1178,7 +1286,7 @@ class LegacyHiddenEntriesSurviveAProvedRead(_ViewsFaultMixin, TagRoute):
         self.assertEqual(sorted(t["name"] for t in stored["tags"]), ["archived", "workers"])
 
 
-class ReaderRestampIsHousekeeping(_ViewsFaultMixin, TagRoute):
+class ReaderRestampIsHousekeeping(_ViewsFaultMixin, _TagRouteHarness):
     """The reader's re-stamp on read writes through the state files' door with note=False: a publish that
     fails there is the reader's own once-per-error log line, never a notice and never a write-fault
     episode -- the first GESTURE that fails is what the user hears about. test_tag_edit_ack.py's
@@ -1210,7 +1318,7 @@ class ReaderRestampIsHousekeeping(_ViewsFaultMixin, TagRoute):
             self.assertIn(str(p), km._state_write_fault_seen)
 
 
-class ForeignWriteBehindIsJudgedOnTheProvedRead(_ViewsFaultMixin, TagRoute):
+class ForeignWriteBehindIsJudgedOnTheProvedRead(_ViewsFaultMixin, _TagRouteHarness):
     """A file written OUTSIDE the kernel (the timeline's Electron/Obsidian branch writes
     timeline-views.json itself) from an older copy, in the window before the pusher's next display read:
     the display reader judges it against the last served blob and re-stamps it (ForeignWriteJudged in
@@ -1222,23 +1330,116 @@ class ForeignWriteBehindIsJudgedOnTheProvedRead(_ViewsFaultMixin, TagRoute):
         self._seed("workers")
         km._flags_cache.clear()
         older = json.loads(json.dumps(km._timeline_views()))          # a panel's copy: workers only, at T0, seq N1
-        time.sleep(1.1)                                                # tag mtimes are whole seconds
-        self._seed("reviewers")                                        # created since; the cache holds both at seq N2
-        served = km._timeline_views()
-        self.assertEqual(sorted(t["name"] for t in served["tags"]), ["reviewers", "workers"])
-        self.assertGreater(served["seq"], older["seq"])
+        with _clock_ahead(2):                                          # the stamps are whole seconds: what follows lands in a later second
+            self._seed("reviewers")                                    # created since; the cache holds both at seq N2
+            served = km._timeline_views()
+            self.assertEqual(sorted(t["name"] for t in served["tags"]), ["reviewers", "workers"])
+            self.assertGreater(served["seq"], older["seq"])
+            p = km._views_path()
+            km._atomic_write(p, json.dumps(older))                     # the panel writes its older copy: seq behind, no cache clear
+            st, resp = self._post({"name": "workers", "color": "#123456"})   # ONE edit, no fault, inside the window
+            self.assertTrue(resp.get("ok"), resp)
+            stored = json.loads(p.read_text())
+            self.assertEqual(sorted(t["name"] for t in stored["tags"]), ["reviewers", "workers"],
+                             "the store carries the last-served content plus the one edit: the tag the foreign copy lacked is back")
+            self.assertEqual(next(t for t in stored["tags"] if t["name"] == "workers")["color"], "#123456", "the edit landed")
+            self.assertGreater(stored["seq"], served["seq"], "ordered past everything served")
+            self.assertTrue(any("outside the kernel" in t for t, ok, k in self.notices), "the foreign copy's refusal is said")
+            km._flags_cache.clear()
+            self.assertEqual(sorted(t["name"] for t in km._timeline_views()["tags"]), ["reviewers", "workers"])
+
+
+class AFaultWithNothingGoodToShowSaysSo(_ViewsFaultMixin, _TagRouteHarness):
+    """The frames and the acks under a READ fault (review find, 2026-09-08). The display reader serves the
+    last blob this kernel served, UNPROVED, and every carrier -- the tabOrder frame, the feed, the timeline
+    skeleton, every write's ack -- embedded it as the store's word; with a COLD cache (a kernel that had never
+    served the store) they embedded the seq-less empty default, which every dashboard adopts: the tag bar
+    emptied with the fault said only on the bell, and a poster reverting on a refusal took that emptiness as
+    its base. Now _views_payload builds every carrier from ONE display read: a blob rides MARKED
+    (`viewsFault`, the fault in the person's words) when there is one, and with none the carrier holds the
+    marker alone and no `views` key, which every pane reads as "keep what you hold". A clean read adds no
+    key, so a clean frame and a clean ack are what they were."""
+
+    LENS = ViewsWsRefusal.LENS
+
+    def setUp(self):
+        super().setUp()
+        self._saved_alive = km._alive_sessions
+        km._alive_sessions = lambda now, tmux: []                          # build_feed with no sessions: the frame's views half is the subject
+
+    def tearDown(self):
+        km._alive_sessions = self._saved_alive
+        super().tearDown()
+
+    def test_a_cold_cache_fault_puts_the_marker_alone_on_every_frame_and_no_empty_store(self):
+        self._seed("workers", "reviewers")
+        km._flags_cache.clear()                                            # a kernel that never served the store
+        with _reads_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):
+            frame = km._tab_order_frame([SID], [{"id": SID}], {SID})
+            feed = km.build_feed(int(time.time()))
+            payload = km._views_payload()
+        self.assertEqual((frame["type"], feed["type"]), ("tabOrder", "feed"), "the build proceeded")
+        for f in (frame, feed, payload):
+            self.assertNotIn("views", f, "no blob: a seq-less empty default here is adopted by every dashboard as the store's word")
+            self.assertIn("the tag store could not be read (read failed: [Errno 5]", f["viewsFault"])
+        self.assertEqual(frame["live"], [SID], "the rest of the frame is whole")
+        self.assertEqual(len(self._faults()), 1, "the once-per-episode notice still rides the bell")
+
+    def test_a_warm_cache_fault_carries_the_last_served_blob_and_marks_it(self):
+        self._seed("workers", "reviewers")                                  # the writes primed the cache
+        good = km._timeline_views()
         p = km._views_path()
-        km._atomic_write(p, json.dumps(older))                         # the panel writes its older copy: seq behind, no cache clear
-        st, resp = self._post({"name": "workers", "color": "#123456"})   # ONE edit, no fault, inside the window
-        self.assertTrue(resp.get("ok"), resp)
-        stored = json.loads(p.read_text())
-        self.assertEqual(sorted(t["name"] for t in stored["tags"]), ["reviewers", "workers"],
-                         "the store carries the last-served content plus the one edit: the tag the foreign copy lacked is back")
-        self.assertEqual(next(t for t in stored["tags"] if t["name"] == "workers")["color"], "#123456", "the edit landed")
-        self.assertGreater(stored["seq"], served["seq"], "ordered past everything served")
-        self.assertTrue(any("outside the kernel" in t for t, ok, k in self.notices), "the foreign copy's refusal is said")
+        p.write_bytes(p.read_bytes() + b"\n")                               # the file moved under the cache (a write outside the
+        #                                                                     kernel): the next display read must read it, and cannot
+        with _reads_fault(p), contextlib.redirect_stderr(io.StringIO()):
+            frame = km._tab_order_frame([SID], [{"id": SID}], {SID})
+        self.assertEqual(sorted(t["name"] for t in frame["views"]["tags"]), ["reviewers", "workers"])
+        self.assertEqual(frame["views"]["seq"], good["seq"], "the last blob served, at its seq: no dashboard moves")
+        self.assertIn("the tag store could not be read (read failed: [Errno 5]", frame["viewsFault"], "and it is said to be unproved")
+        with _stat_fault(p), contextlib.redirect_stderr(io.StringIO()):      # the stat-fault arm: the same answer
+            frame2 = km._tab_order_frame([SID], [{"id": SID}], {SID})
+        self.assertEqual(frame2["views"], frame["views"])
+        self.assertIn("the tag store could not be read (stat failed:", frame2["viewsFault"])
+
+    def test_a_clean_read_adds_no_marker_so_a_clean_frame_is_what_it_was(self):
+        self._seed("workers")
+        frame = km._tab_order_frame([SID], [{"id": SID}], {SID})
+        self.assertNotIn("viewsFault", frame)
+        self.assertEqual([t["name"] for t in frame["views"]["tags"]], ["workers"])
+        self.assertEqual(set(km._views_payload()), {"views"})
+
+    def test_a_refusal_ack_on_a_cold_cache_carries_the_marker_and_no_blob(self):
+        before = self._seed("workers", "reviewers")
         km._flags_cache.clear()
-        self.assertEqual(sorted(t["name"] for t in km._timeline_views()["tags"]), ["reviewers", "workers"])
+        client, sent = self._client()
+        with _reads_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):
+            self._ws({"type": "setTimelineViews", "writeId": "w1", "edited": [], "views": dict(self.LENS)}, client)
+        ack = sent[0]
+        self.assertEqual((ack["type"], ack["ok"]), ("viewsAck", False))
+        self.assertNotIn("views", ack, "a poster reverting on this refusal keeps what it holds")
+        self.assertIsNone(ack["seq"])
+        self.assertIn("the tag store could not be read", ack["viewsFault"])
+        self.assertIn("nothing was changed", ack["error"])
+        self.assertEqual(self._bytes(), before)
+
+    def test_a_refusal_ack_on_a_warm_cache_carries_the_last_served_blob_marked_and_a_clean_ack_no_marker(self):
+        self._seed("workers", "reviewers")
+        good = km._timeline_views()
+        client, sent = self._client()
+        with _stat_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):   # a warm cache: the file's key cannot be checked
+            self._ws({"type": "tagEdit", "writeId": "w2", "edit": {"op": "create", "name": "api", "sids": [SID2]}}, client)
+        ack = sent[0]
+        self.assertEqual((ack["type"], ack["ok"]), ("tagEditAck", False))
+        self.assertEqual(sorted(t["name"] for t in ack["views"]["tags"]), ["reviewers", "workers"])
+        self.assertEqual(ack["seq"], good["seq"], "the ack's seq is the blob's, the last one served")
+        self.assertIn("the tag store could not be read (stat failed:", ack["viewsFault"])
+        self.assertIn("nothing was changed", ack["error"])
+        client2, sent2 = self._client()
+        self._ws({"type": "setTimelineViews", "writeId": "w3", "edited": [], "views": dict(self.LENS)}, client2)
+        clean = sent2[0]
+        self.assertTrue(clean["ok"], clean)
+        self.assertNotIn("viewsFault", clean, "a proved read carries no marker")
+        self.assertEqual(clean["seq"], clean["views"]["seq"])
 
 
 if __name__ == "__main__":
