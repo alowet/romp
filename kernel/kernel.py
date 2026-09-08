@@ -39936,7 +39936,7 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 
 # The WS bridge shim (ported verbatim from chat-view server.ts shimJs — same protocol).
 # ── the dashboard reloads ITSELF on a kernel restart and on a newer served bundle (T265) ──────────────────────
-# The user's ruling of 2026-09-08 (about 10:50 AM PT) supersedes their 2026-07-13 preference for a banner the
+# The user's ruling of 2026-09-08 supersedes their 2026-07-13 preference for a banner the
 # reader clicks: any restart of the kernel SERVING the page, and any bundle newer than the one the page loaded
 # with, reload the page by themselves. Two signals, both exact events, never a timer:
 #   (1) kernel restart — a socket REOPEN whose /version answers with a boot id other than the one baked into the
@@ -39944,61 +39944,79 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 #       reconnect); the 30 s /version poll the stale banner already ran is the backstop for a page whose socket
 #       never dropped (noteVersion, the same reading).
 #   (2) build drift — a `dv` on a keepalive, or /version's dist_ver, above the page's baked LOADEDV (noteDv).
-# Never mid-gesture: a pointer button held, a drag in flight, a text selection being made, or the composer
-# focused with text ARMS the reload, and the ending event (pointerup/pointercancel, dragend/drop,
-# selectionchange, input, focusout; a window blur releases every hold) fires it. The shell composes gesture state
-# across its same-origin panes, and a pane forwards its request to the shell when one is there, so ONE decision
-# reloads the top document; a standalone pane page decides for itself, and so does a pane under a foreign parent
-# (an iframe in another app can reload itself). Before reloading: every pane persists what a reload loses
-# (window.__rompPersistForReload — the chat pane's scroll position + follow mode; the draft and the active tab are
-# persisted already), the shell's lifted modals close (settings/picker), and a marker rides sessionStorage so the
-# fresh page leaves ONE notification-center line ("Reloaded onto build N — the kernel restarted / a newer romp
-# build was served"). If location.reload throws (a host that forbids it) the old banner is the fallback (the
-# `refused` hook). The VS Code webview never runs this: the extension loads its bundle from the installed VSIX
+# Never mid-gesture: a pointer button held, a touch pan (pointercancel converts a held pointer into a pan hold
+# that touchend/touchcancel/scrollend release — the finger is still on the glass), a drag in flight, a text
+# selection being made in the FOCUSED document (a highlight left in another pane is not a gesture), any focused
+# editable with text (the composer, the picker's inputs, the feed modal's follow-up box — a generic "typing"
+# hold), or a pane's sends still queued for its socket's reopen (the shim's window.__rompPaneBusy: a prompt typed
+# while the kernel was down must flush before the page goes) ARMS the reload, and the ending event fires it —
+# pointerup, touchend/touchcancel/scrollend, dragend/drop, selectionchange, input, focusout, the pane's own flush;
+# a window blur releases every hold. The fire is deferred one tick past the ending event so the click the same
+# press produces lands on its control first. The shell composes gesture state across its same-origin panes, and a
+# pane forwards its request to the shell when one is there, so ONE decision reloads the top document; a standalone
+# pane page decides for itself, and so does a pane under a foreign parent (an iframe in another app can reload
+# itself). Before reloading: every pane persists what a reload loses (window.__rompPersistForReload — the chat
+# pane's scroll position + follow mode, per tab in sessionStorage; the draft and the active tab are persisted
+# already); once location.reload has been accepted the shell's lifted modals close (settings/picker) and a marker
+# rides sessionStorage, stamped with the page's path, so the fresh LANDING leaves ONE notification-center line
+# ("Reloaded onto build N — the kernel restarted / a newer romp build was served") and a standalone pane's marker
+# is consumed by nobody else. If location.reload throws (a host that forbids it) the old banner is the fallback
+# (the `refused` hook) and the refusal LATCHES for that build/boot: no re-attempt on every gesture end or poll,
+# only a strictly newer dv or boot re-arms. The VS Code webview never runs this: the extension loads its bundle from the installed VSIX
 # and a webview reload cannot fix bundled-code drift, so its own reload prompt stays (vscode-extension/src/
 # extension.ts). Federated relay: a REMOTE kernel's restart must not reload the page — and cannot: the core reads
 # only THIS page's own socket and /version (federation.ts drops remote `ka` frames, so they never reach the shim's
 # dv check, and the relay never forwards a remote kernel's boot id). tests/test_dashboard_auto_reload.py runs
 # this code in node with fakes and pins the wiring.
 _RELOAD_CORE_JS = r"""/*reload-core*/(function(){if(window.__rompReload)return;
-var LOADED=__LOADEDVER__,BOOT=__ROMP_BOOT__,ptr=0,drag=false,owed=null,fired=false;
+var LOADED=__LOADEDVER__,BOOT=__ROMP_BOOT__,ptr=0,pan=false,drag=false,owed=null,fired=false,refusedFor=null;
 function shell(){try{var p=window.parent;if(p&&p!==window&&p.__rompReload)return p.__rompReload;}catch(e){}return null;}
-function busyHere(){if(ptr>0)return 'pointer';if(drag)return 'drag';
-try{var s=document.getSelection&&document.getSelection();if(s&&s.rangeCount&&!s.isCollapsed&&String(s).length)return 'selection';}catch(e){}
-try{var c=document.getElementById('composer-input');if(c&&document.activeElement===c&&(c.value||'').trim())return 'composer';}catch(e){}
+function editing(){try{var a=document.activeElement;if(!a)return false;var tag=(a.tagName||'').toUpperCase();
+var textual=tag==='TEXTAREA'||(tag==='INPUT'&&/^(text|search|url|email|number|password|tel)$/i.test(a.type||'text'))||!!a.isContentEditable;
+if(!textual)return false;var val=(a.value!=null?a.value:(a.textContent||''));return !!String(val).trim();}catch(e){return false;}}
+function busyHere(){if(ptr>0)return 'pointer';if(pan)return 'pan';if(drag)return 'drag';
+try{var s=document.getSelection&&document.getSelection();var focused=!document.hasFocus||document.hasFocus();
+if(focused&&s&&s.rangeCount&&!s.isCollapsed&&String(s).length)return 'selection';}catch(e){}
+if(editing())return 'typing';
+try{if(window.__rompPaneBusy){var b=window.__rompPaneBusy();if(b)return String(b);}}catch(e){}
 return '';}
 function panes(){var out=[],fs=document.querySelectorAll?document.querySelectorAll('iframe'):[];
 for(var i=0;i<fs.length;i++){try{var w=fs[i].contentWindow;if(w&&w.__rompReload)out.push(w);}catch(e){}}return out;}
 function busy(){var b=busyHere();if(b)return b;var ps=panes();for(var i=0;i<ps.length;i++){b=ps[i].__rompReload.busyHere();if(b)return b;}return '';}
 function persist(){try{if(window.__rompPersistForReload)window.__rompPersistForReload();}catch(e){}
 var ps=panes();for(var i=0;i<ps.length;i++){try{if(ps[i].__rompPersistForReload)ps[i].__rompPersistForReload();}catch(e){}}}
-function fire(){if(fired)return;fired=true;
-try{sessionStorage.setItem('romp:reloaded',JSON.stringify({reason:owed.reason,detail:owed.detail||'',from:LOADED,t:Date.now()}));}catch(e){}
-persist();
-try{document.body.classList.remove('settings-open','picker-open');}catch(e){}
-try{location.reload();}catch(e){fired=false;R.waiting='refused';if(R.refused)R.refused(owed);}}
-function tryFire(){if(!owed||fired)return;var b=busy();if(b){R.waiting=b;return;}R.waiting='';fire();}
+function key(o){return o?o.reason+':'+(o.detail||''):'';}
+function fire(){if(fired)return;fired=true;persist();
+try{location.reload();}catch(e){fired=false;refusedFor=key(owed);R.waiting='refused';if(R.refused)R.refused(owed);return;}
+try{sessionStorage.setItem('romp:reloaded',JSON.stringify({reason:owed.reason,detail:owed.detail||'',from:LOADED,path:location.pathname,t:Date.now()}));}catch(e){}
+try{document.body.classList.remove('settings-open','picker-open');}catch(e){}}
+function tryFire(){if(!owed||fired)return;if(refusedFor!==null&&refusedFor===key(owed))return;var b=busy();if(b){R.waiting=b;return;}R.waiting='';fire();}
 function request(reason,detail){var s=shell();if(s){s.request(reason,detail);return;}if(fired)return;
-if(!owed)owed={reason:reason,detail:detail||''};tryFire();}
+var next={reason:reason,detail:detail||''};if(refusedFor!==null&&key(next)!==refusedFor){refusedFor=null;owed=next;}
+if(!owed)owed=next;tryFire();}
 function noteDv(dv){if(LOADED&&dv&&dv>LOADED)request('build',String(dv));}
 function noteVersion(v){if(!v)return;if(v.boot&&BOOT&&v.boot!==BOOT)request('restart',String(v.boot));if(v.dist_ver)noteDv(v.dist_ver);}
 function checkBoot(){try{fetch('/version',{cache:'no-store'}).then(function(r){return r.json();}).then(noteVersion)['catch'](function(){});}catch(e){}}
 function announce(notify){var raw=null;try{raw=sessionStorage.getItem('romp:reloaded');if(raw)sessionStorage.removeItem('romp:reloaded');}catch(e){}
 if(!raw)return null;var d=null;try{d=JSON.parse(raw);}catch(e){return null;}if(!d)return null;
+if(d.path&&d.path!==location.pathname)return null;
 var why=d.reason==='restart'?'the kernel restarted':'a newer romp build was served';
 var txt='Reloaded onto build '+LOADED+' — '+why+'.';try{if(notify)notify('reload',txt);}catch(e){}return txt;}
 document.addEventListener('pointerdown',function(){ptr++;},true);
 document.addEventListener('pointerup',function(){ptr=Math.max(0,ptr-1);},true);
-document.addEventListener('pointercancel',function(){ptr=Math.max(0,ptr-1);},true);
+document.addEventListener('pointercancel',function(){if(ptr>0){ptr=0;pan=true;}},true);
+document.addEventListener('touchend',function(){pan=false;},true);
+document.addEventListener('touchcancel',function(){pan=false;},true);
+document.addEventListener('scrollend',function(){pan=false;},true);
 document.addEventListener('dragstart',function(){drag=true;},true);
 document.addEventListener('dragend',function(){drag=false;},true);
 document.addEventListener('drop',function(){drag=false;},true);
-var END=['pointerup','pointercancel','dragend','drop','selectionchange','input','focusout'];
-function ended(){var s=shell();if(s)s.tryFire();else tryFire();}
+var END=['pointerup','touchend','touchcancel','scrollend','dragend','drop','selectionchange','input','focusout'];
+function ended(){setTimeout(function(){var s=shell();if(s)s.tryFire();else tryFire();},0);}
 for(var k=0;k<END.length;k++)document.addEventListener(END[k],ended,true);
-window.addEventListener('blur',function(){ptr=0;drag=false;ended();});
-var R={request:request,tryFire:tryFire,busyHere:busyHere,busy:busy,noteDv:noteDv,noteVersion:noteVersion,checkBoot:checkBoot,announce:announce,
-inShell:function(){return !!shell();},owed:function(){return owed;},fired:function(){return fired;},refused:null,waiting:'',loaded:LOADED,boot:BOOT};
+window.addEventListener('blur',function(){ptr=0;pan=false;drag=false;ended();});
+var R={request:request,tryFire:tryFire,ended:ended,busyHere:busyHere,busy:busy,noteDv:noteDv,noteVersion:noteVersion,checkBoot:checkBoot,announce:announce,
+inShell:function(){return !!shell();},owed:function(){return owed;},fired:function(){return fired;},refusedFor:function(){return refusedFor;},refused:null,waiting:'',loaded:LOADED,boot:BOOT};
 window.__rompReload=R;})();/*end-reload-core*/"""
 
 
@@ -40023,9 +40041,11 @@ def _reload_core_js(v=0, boot=None):
 
 def _shim(app, v=0):
     # `v` = the dist build token this page was served with (its ?v= urls). The shim compares it against the
-    # `dv` riding every keepalive and raises the build banner on drift — so EVERY kernel-served page gets the
-    # "newer build" prompt, not just the dashboard landing's /version poll (the user 2026-07-13: a standalone
-    # pane sat silent through rebuilds).
+    # `dv` riding every keepalive and, on drift, asks the reload core it embeds as the template's first slot
+    # (window.__rompReload, _RELOAD_CORE_JS) to reload the page — never mid-gesture (the user 2026-09-08,
+    # superseding the 2026-07-13 banner; the build bar is only the refused fallback). EVERY kernel-served page
+    # notices, not just the dashboard landing's /version poll (the user 2026-07-13: a standalone pane sat
+    # silent through rebuilds).
     return """
 %s
 (function(){/*shim-core*/var queue=[],ws=null,everConnected=false;
@@ -40156,6 +40176,12 @@ function armStale(why){stalePending=why;staleKa=0;}
 // this page in place, never mid-gesture. selfBar is only the refused fallback (a host that forbids location.reload).
 // Latched: one request per page life.
 var buildRaised=false,freshPending=false,restartAnnounced=0;   // freshPending: a reconnect is awaiting its resync frame; restartAnnounced: the kernel's dying frame (T217)
+// T265: the reload core asks every pane before firing; a pane whose socket is down with sends queued for its
+// reopen (a prompt typed during a kernel restart) holds the reload — the shell's socket may reopen first, and a
+// reload then would take the queue with it. Diag rows never hold. The flush in ws.onopen is the ending event.
+window.__rompPaneBusy=function(){return (everConnected&&queue.length>queuedDiag)?"sends":"";};
+// …and a standalone page (no same-origin shell) consumes its own reload marker: nobody else would
+try{if(window.__rompReload&&!window.__rompReload.inShell())window.__rompReload.announce(null);}catch(e){}
 function raiseBuild(){if(buildRaised)return;buildRaised=true;var R=window.__rompReload;
 if(R){R.refused=function(){selfBar("A newer romp build is available.","build");};R.request("build","");}
 else selfBar("A newer romp build is available.","build");}
@@ -40176,6 +40202,7 @@ ws=new WebSocket(proto+location.host+"/ws?app=%s&delta=1&iid="+encodeURIComponen
 // first connect deliberately doesn't fire it — nothing is waiting on it, and the loader must stay up until
 // real content lands.
 ws.onopen=function(){lastRecv=Date.now();openT=lastRecv;openSock=this;netState("up");resumeProvisional=0;var wasReconn=everConnected;everConnected=true;for(var i=0;i<queue.length;i++)ws.send(queue[i]);queue=[];queuedDiag=0;
+try{if(window.__rompReload)window.__rompReload.ended();}catch(e){}   // T265: the flush is the ending event for the "sends" hold — a reload owed while a prompt sat in the queue goes now
 if(failedConnects){send({type:"clientDiag",surface:"pane-shim",what:"wsconnfail",data:{app:APP,attempts:failedConnects,firstFailMs:Date.now()-firstFailT}});failedConnects=0;firstFailT=0;}   // the redials that never opened since the last open, as ONE row: how many, and how long ago the first failed
 if(wasReconn){var ann=restartAnnounced&&Date.now()-restartAnnounced<30000;restartAnnounced=0;   // one-shot: spent here
 if(window.__rompReload&&!window.__rompReload.inShell())window.__rompReload.checkBoot();   // T265: a REOPEN is the restart signal — a standalone page asks /version whose kernel answered; inside the shell, the shell asks on its own socket
