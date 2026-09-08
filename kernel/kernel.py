@@ -4565,11 +4565,31 @@ def _run_update(tag):
     # detached script outlives this kernel, so the dying kernel's cut row can only join to a reason
     # written at curl time (auto deploys used to leave the row anonymous).
     aud = q(str(jd.STATE / "restart-audit.jsonl"))
-    restart = (("  printf '{\"t\": %%s, \"action\": \"self-update\", \"tag\": \"%s\"}\\n' \"$(date +%%s)\" >> %s\n"
-                % (tag, aud))
-               + "  curl -s -X POST 'http://127.0.0.1:%d/restart-all' >/dev/null 2>&1\n" % int(mport)) if mport.isdigit() \
-        else "  : # no manager — the new code arms on the next romp start (the report says so)\n"
-    ok_rep = {"ok": True, "tag": tag, "restarted": bool(mport.isdigit())}
+    # The report is written AFTER the restart request, saying what the request actually did. It
+    # used to be written first, claiming restarted:true whenever a manager port was known — so a
+    # manager that never took the request (gone, or a stale port) left an "updated and restarted"
+    # report on disk. /update-check deliberately leaves an ok+restarted report for the NEXT boot to
+    # file, and that boot never came: the in-flight latch held for the kernel's life, the banner
+    # read "updating…" forever, and every later update was refused. Now curl's exit decides:
+    # request taken → restarted:true (the next boot files it); refused → restarted:false with the
+    # reason, which the still-running kernel's poll consumes into "updated on disk — restart it
+    # yourself". curl's own error lands in update.log (-f: a non-2xx answer is not a restart).
+    def report(d):
+        return "printf '%%s' %s > %s\n" % (q(json.dumps(d)), rep)
+    if mport.isdigit():
+        restart = (("  printf '{\"t\": %%s, \"action\": \"self-update\", \"tag\": \"%s\"}\\n' \"$(date +%%s)\" >> %s\n"
+                    % (tag, aud))
+                   + "  if curl -fsS -X POST 'http://127.0.0.1:%d/restart-all' >/dev/null 2>>%s; then\n"
+                   % (int(mport), log)
+                   + "    " + report({"ok": True, "tag": tag, "restarted": True})
+                   + "  else\n"
+                   + "    " + report({"ok": True, "tag": tag, "restarted": False,
+                                      "why": "the manager on port %d did not take the restart request" % int(mport)})
+                   + "  fi\n")
+    else:
+        restart = ("  : # no manager — the new code arms on the next romp start (the report says so)\n"
+                   + "  " + report({"ok": True, "tag": tag, "restarted": False,
+                                    "why": "no manager is running this kernel"}))
     # advance() — the tree lands EXACTLY on the release commit. The fast-forward is the normal
     # release-to-release move, EXCEPT for an install sitting DETACHED off every tag: the
     # pre-2026-08-31 drift banner's Update ran `git checkout --detach origin/main` on plain
@@ -4596,14 +4616,21 @@ def _run_update(tag):
         + advance
         + "if git fetch %s refs/tags/%s:refs/tags/%s >> %s 2>&1 && advance "
           "&& ./install.sh >> %s 2>&1; then\n" % (_release_remote(), tag, tag, log, log)
-        + "  printf '%%s' %s > %s\n" % (q(json.dumps(ok_rep)), rep)
         + restart
         + "else\n"
-        + "  printf '%%s' %s > %s\n" % (q(json.dumps({"ok": False, "tag": tag,
-                                                      "why": "the fetch, fast-forward or install failed"})), rep)
+        + "  " + report({"ok": False, "tag": tag, "why": "the fetch, fast-forward or install failed"})
         + "fi\n")
-    subprocess.Popen(["bash", "-c", script], start_new_session=True, cwd=str(ROOT),
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        subprocess.Popen(["bash", "-c", script], start_new_session=True, cwd=str(ROOT),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        # the latch was taken above; a spawn that raises must give it back, or the kernel reads
+        # "running" for the rest of its life with nothing running — every later update refused,
+        # every banner waiting on a child that never existed. Loud, not silent: the Log says why.
+        _UPDATE_STATE[0] = ""
+        _sync_notice("romp could not start the update to %s: %s — nothing was launched and nothing "
+                     "moved" % (tag, e), ok=False)
+        return False
     return True
 
 
@@ -4617,6 +4644,21 @@ def _consume_update_report(running_only=False):
         rep = json.loads(p.read_text())
     except (OSError, ValueError):
         return None
+    if not isinstance(rep, dict):
+        # parses, but is not an object (null, [], a number): every .get below would raise — which
+        # 500'd every /update-check poll and crashed the boot that found it. The child wrote
+        # SOMETHING, so nothing is in flight any more: set the file aside as evidence (never
+        # deleted), say so once, and answer like any other ended update.
+        try:
+            p.rename(p.with_name(p.name + ".bad"))
+        except OSError:
+            return None
+        if running_only:
+            _UPDATE_STATE[0] = ""
+        why = ("the updater's report could not be read — it is kept as update-report.json.bad under "
+               "~/.local/state/romp, next to update.log, which says what actually happened")
+        _sync_notice("romp's self-update ended without a readable outcome: %s" % why, ok=False)
+        return {"ok": False, "tag": "", "why": why}
     try:
         p.rename(jd.STATE / "update-report-last.json")   # consumed — never re-filed on later boots
     except OSError:
@@ -4627,7 +4669,11 @@ def _consume_update_report(running_only=False):
     if rep.get("ok") and rep.get("restarted"):
         _sync_notice("romp updated itself to %s and restarted into it" % tag)
     elif rep.get("ok"):
-        _sync_notice("romp updated itself to %s — no manager is running, so restart romp yourself to run it" % tag)
+        # landed on disk, not running: the script says why (no manager, or a manager that did not
+        # take the restart request). Only a restart the user runs gets the new code running.
+        _sync_notice("romp updated itself to %s on disk, but %s — restart romp yourself (`romp refresh`, "
+                     "or `romp on` if no manager answers) to run it"
+                     % (tag, rep.get("why") or "it was not restarted"))
     else:
         _sync_notice("romp could not update itself to %s: %s — nothing was restarted; update.log under "
                      "~/.local/state/romp has the full output" % (tag, rep.get("why") or "the update failed"),
@@ -4674,8 +4720,15 @@ def _update_check():
                 _send_to_app("shell", {"type": "updateAvail", "cur": _kernel_ver() or "", "tag": latest,
                                        "boot": _BOOT_ID})
             return
+        if not _run_update(latest):
+            # a refused launch is not an attempt: nothing ran, so the once-only marker is not
+            # written — writing it first spent the version's one automatic try on a launch that
+            # never happened, and the next pass then reported it as "ran once without landing" —
+            # and the discovery slot re-arms so the next pass tries again instead of standing on
+            # a version it never attempted (the launch failure itself is already in the Log)
+            _UPDATE_AVAIL[0] = ""
+            return
         _atomic_write(jd.STATE / "update-attempted.json", json.dumps({"tag": latest, "t": int(time.time())}))
-        _run_update(latest)
     else:
         if latest in _dismissed_updates():
             return                    # Not-now'd THIS release, durably — a newer one offers again
@@ -36611,7 +36664,8 @@ _UPD_JS = (
     "if(!waiting)return;"
     "if(d.boot&&bootNow&&d.boot!==bootNow){location.reload();return;}"
     "if(d.failed){waiting=false;go.hidden=false;go.disabled=false;show('The update did not finish: '+d.failed);return;}"
-    "if(d.updated){waiting=false;show('romp updated to '+d.updated+' \\u2014 restart romp (the \\u21bb button) to run it.');return;}"
+    "if(d.updated){waiting=false;show('romp updated to '+d.updated+' on disk'+(d.why?', but '+d.why:'')"
+    "+' \\u2014 restart romp yourself (romp refresh) to run it.');return;}"
     "setTimeout(poll,3000);}).catch(function(){if(waiting)setTimeout(poll,3000);});}"
     "go.onclick=function(){go.disabled=true;dm.hidden=true;waiting=true;"
     "show('Updating romp \\u2014 this can take a minute; the dashboard reloads when it restarts\\u2026');"
@@ -38453,22 +38507,27 @@ class Handler(BaseHTTPRequestHandler):
                 # kernel answering after a successful update (same trick as the restart flow); polling
                 # this route is also what consumes a report the still-running kernel would otherwise
                 # sit on (the failure path, and the no-manager success).
-                failed = updated = ""
+                failed = updated = why = ""
                 if _UPDATE_STATE[0] == "running":
                     # PEEK before consuming: a success that is about to restart belongs to the NEXT
                     # kernel's boot — consuming it here would file the notice into this dying
                     # process's in-memory ring and the new kernel would find nothing to log. Only a
-                    # failure, or a success with no manager to restart, is this kernel's to file.
+                    # failure, or a success whose restart did not happen (no manager, or a manager
+                    # that did not take the request), is this kernel's to file. A report that is
+                    # not an object is as ended as a failure — the consume sets it aside; peeking
+                    # `.get` on it used to 500 every poll for the kernel's life.
                     try:
-                        _peek = json.loads((jd.STATE / "update-report.json").read_text())
+                        _peek, _have = json.loads((jd.STATE / "update-report.json").read_text()), True
                     except (OSError, ValueError):
-                        _peek = None
-                    if _peek is not None and not (_peek.get("ok") and _peek.get("restarted")):
+                        _peek, _have = None, False     # no report yet, or a write still in progress
+                    # `_have`, not `_peek is not None`: a report that parses to null is a report
+                    if _have and not (isinstance(_peek, dict) and _peek.get("ok") and _peek.get("restarted")):
                         rep = _consume_update_report(running_only=True)
                         if rep is not None and not rep.get("ok"):
                             failed = str(rep.get("why") or "the pull or install failed")
                         elif rep is not None:
                             updated = str(rep.get("tag") or "")
+                            why = str(rep.get("why") or "")     # why the new code is not running yet
                 # a DISMISSED identifier never re-derives an offer on a page load (the user
                 # 2026-08-31: the per-page-load re-offer was a notice-spam compounder)
                 dis = _dismissed_updates()
@@ -38479,7 +38538,7 @@ class Handler(BaseHTTPRequestHandler):
                     "cur": _kernel_ver() or "",
                     "tag": ("" if _UPDATE_AVAIL[0] in dis else _UPDATE_AVAIL[0]),
                     "mode": _update_mode(),
-                    "state": _UPDATE_STATE[0], "failed": failed, "updated": updated,
+                    "state": _UPDATE_STATE[0], "failed": failed, "updated": updated, "why": why,
                     # the pending MAIN-DRIFT offer (2026-08-15): a page loaded after the push can
                     # re-derive it, and a stale page can revalidate before acting
                     "drift": (("pull" if _MAIN_DRIFT[0] else "restart") if dsha else ""),
@@ -38617,7 +38676,14 @@ class Handler(BaseHTTPRequestHandler):
                 if tag:
                     if _UPDATE_STATE[0] != "running":
                         _audit_restart_request("self-update", tag=tag, addr=str(self.client_address[0]))
-                        _run_update(tag)
+                        if not _run_update(tag) and _UPDATE_STATE[0] != "running":
+                            # nothing launched (the spawn failed; the Log has the reason) and nothing
+                            # else is in flight: a 200 and a "running" push here would leave every
+                            # window waiting on a child that never existed. The banner shows this
+                            # text and re-offers. (A refusal because a concurrent click already
+                            # started it is the "running" answer below, truthfully.)
+                            return self._send(500, "romp could not start the update to %s; the Log has the reason"
+                                              % tag, "text/plain")
                         _send_to_app("shell", {"type": "updateAvail", "state": "running", "boot": _BOOT_ID})
                     return self._send(200, json.dumps({"ok": True, "state": _UPDATE_STATE[0]}), "application/json")
                 # ONE snapshot of what the kernel found: the kind and the commit it advertised come
