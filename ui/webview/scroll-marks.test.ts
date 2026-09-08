@@ -88,7 +88,7 @@ test("a rendered unit changing height re-runs the shared paint — the event the
   // the observer's first statement is still the paint; the same callback carries the tail-shrink rule (T262f)
   assert.match(ev, /v\.ro = new ResizeObserver\(\(entries\) => \{\s*\n\s*scheduleRailSticky\(\);[\s\S]*?\n\s*\}\);\s*\n\s*v\.ro\.observe\(elv\);/,
     "one observer per view element: a lazy figure sizing in or a fold toggling repaints notches AND rail ticks");
-  assert.match(RENDER, /ro\?: ResizeObserver; \}/, "the View carries its observer");
+  assert.match(RENDER, /ro\?: ResizeObserver; mo\?: MutationObserver; \}/, "the View carries its observers (the tail mutation one joined it, T262j)");
   assert.equal((RENDER.match(/v\.ro\?\.disconnect\(\); v\.el\.remove\(\);/g) || []).length, 2, "both view-removal sites disconnect it");
   assert.doesNotMatch(ev, /setTimeout|setInterval/, "no timer stands in for the event");
 });

@@ -47,6 +47,29 @@ export function classifyScroll(scrollTop: number, lastWriteAfter: number | null)
   return lastWriteAfter != null && Math.abs(scrollTop - lastWriteAfter) <= 1 ? "write-echo" : "gesture";
 }
 
+/** One childList mutation of a tail container, reduced to what the row needs: the classes of the nodes removed at
+ *  the END, the classes of the nodes added at the end, and whether a removed node came back in the same task. */
+export interface TailMutation { removed: Array<{ cls: string }>; added: Array<{ cls: string }>; atEnd: boolean; }
+export function summarizeTailMutations(records: TailMutation[]): { removedTail: string[]; addedTail: string[]; reAdded: boolean } | null {
+  const removedTail: Array<{ cls: string }> = [], addedTail: Array<{ cls: string }> = [];
+  for (const r of records) {
+    if (!r.atEnd) continue;
+    removedTail.push(...r.removed); addedTail.push(...r.added);
+  }
+  if (!removedTail.length) return null;
+  const reAdded = removedTail.some((n) => addedTail.indexOf(n) >= 0);
+  return { removedTail: removedTail.map((n) => String(n.cls || "").slice(0, 40)), addedTail: addedTail.map((n) => String(n.cls || "").slice(0, 40)), reAdded };
+}
+
+/** The breadcrumb for a tail element leaving the DOM (T262j, the user 2026-09-08): the remaining snap is a clamp
+ *  against a transcript momentarily shorter WITHIN a frame — a tail node removed, a layout forced, the node back
+ *  before the frame ends — which no ResizeObserver can see. `shBefore` = the last scroll height the pane recorded,
+ *  `shAfter` = the height once the mutations settled; `reAdded` = the same node came back in the same task. */
+export function tailMutRow(sid: string, m: { removedTail: string[]; addedTail: string[]; reAdded: boolean }, shBefore: number, shAfter: number, st: number, ch: number, where: "view" | "live-ask") {
+  const clip = (a: string[]) => a.slice(0, 4).map((c) => String(c).slice(0, 40));
+  return { sid, where, removed: clip(m.removedTail), added: clip(m.addedTail), reAdded: m.reAdded, shBefore, shAfter, st, ch };
+}
+
 /** The breadcrumb for one re-size of a view's virtualization spacers (T262j): a top spacer re-estimate paired with
  *  a bottom one leaves scrollHeight unchanged yet moves everything under the top spacer, and Chrome's scroll
  *  anchoring then moves the reader by the same amount with no pane write. `top`/`bot` = [before, after] heights. */

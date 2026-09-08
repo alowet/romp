@@ -27,8 +27,8 @@ test("the tail label is the last child that is not a virtualization spacer", () 
 });
 
 test("render.ts files the row from both tail observers, beside the tail-shrink rule, through the capped diag path", () => {
-  assert.match(RENDER, /import \{ ScrollDiagBudget, classifyScroll, scrollWriteRow, tailChangeRow, tailLabel, spacerRow, readScrollDiagCap \} from "\.\/scroll-write";/);   // + spacerRow, readScrollDiagCap (T262j)
-  assert.match(RENDER, /function scrollDiagRow\(kind: "scrollwrite" \| "scrollgesture" \| "tailchange" \| "spacer", data: any\): void \{/);   // + spacer (T262j)
+  assert.match(RENDER, /import \{ ScrollDiagBudget, classifyScroll, scrollWriteRow, tailChangeRow, tailLabel, spacerRow, readScrollDiagCap, summarizeTailMutations, tailMutRow \} from "\.\/scroll-write";/);   // + spacerRow, readScrollDiagCap (T262j)
+  assert.match(RENDER, /function scrollDiagRow\(kind: "scrollwrite" \| "scrollgesture" \| "tailchange" \| "spacer" \| "tailmut", data: any\): void \{/);   // + spacer (T262j)
   assert.match(RENDER, /if \(content && lastH >= 0 && activeId === id && view\.shown && h !== lastH\)\s*\n\s*scrollDiagRow\("tailchange", tailChangeRow\(id, h - lastH, tailLabel\(view\.el\.children\), view\.stick, content\.scrollHeight, content\.clientHeight\)\);/);
   assert.match(RENDER, /if \(content && tailLastH >= 0 && v && v\.shown && h !== tailLastH\)\s*\n\s*scrollDiagRow\("tailchange", tailChangeRow\(activeId \|\| "", h - tailLastH, "live-ask", v\.stick, content\.scrollHeight, content\.clientHeight\)\);/);
   assert.equal((RENDER.match(/"tailchange"/g) || []).length, 3, "the kind in the router's union and the two filings");
