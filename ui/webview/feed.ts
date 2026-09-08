@@ -680,6 +680,10 @@ const openBgSvc = new Set<string>();   // sids with the chip's process list expa
 // arrive collapsed too, and a card's column is not knowable when you fold the thread. Persisted across
 // reloads with the rest of the disclosure state, and deliberately NOT pruned when the cards go away.
 const collapsedThreads = new Set<string>();
+// itemId → the column its card RENDERS in this grouped render (T263d, review of T263c): a turn-group's
+// members render in the GROUP's column (buildGroup: the worst member's), not their own, so a jump into a
+// folded member must unfold the run that actually holds it. Rebuilt on every grouped render.
+const renderedCol = new Map<string, Column>();
 // names of sessions idle-but-AWAITING background work (the user 2026-07-13): the same dot in await-green —
 // matching the chat chip's Awaiting color — so a held session reads differently from a working one.
 let awaitingSet = new Set<string>();
@@ -4879,6 +4883,7 @@ function render() {
   // is stable, so per-session cards keep the column's newest/oldest order. Headers only where a run exists.
   if (feedPrefs().grouped) {
     const rank = new Map(sessionOrder.map((s, i) => [s, i] as const));
+    renderedCol.clear();   // rebuilt from this render's buckets (T263d)
     const eSid = (e: Entry) => e.kind === "ask" ? e.ask.sid : e.kind === "group" ? e.group.sid : e.sid;
     for (const k of Object.keys(buckets) as Column[]) {
       const extra = new Map<string, number>();   // sids the order list doesn't know → after it, first-seen order
@@ -4896,6 +4901,9 @@ function render() {
           head = { kind: "sess", t: e.t, sid: s, col: k, name: src.name, color: src.color || null, live: !!src.live, folded: 0 };
           withHeads.push(head);
         }
+        // where each card renders, for a jump into a folded run (unfoldThreadsFor): a group's members all sit in the group's column
+        if (e.kind === "ask") renderedCol.set(e.ask.itemId, k);
+        else if (e.kind === "group") for (const m of e.group.members) renderedCol.set(m.itemId, k);
         // A COLLAPSED thread contributes its header and nothing else — the run's cards are counted onto the
         // header instead of rendered, so the folded row still says how much is under it. CARDS, not rows
         // (entryCards): a turn-group folds as its member count, the same rule the section chip reads.
@@ -5855,7 +5863,9 @@ function unfoldThreadsFor(keys: Set<string>): void {
   if (!collapsedThreads.size) return;
   let opened = false;
   for (const a of asks) {
-    const tkey = threadKey(a.sid, askColumn(a));   // the run the card sits in — per (session, column), T263c
+    // the run the card RENDERS in — per (session, column), T263c; a turn-group member renders in the group's
+    // column, not its own (T263d), so the last grouped render's map wins over the card's own column
+    const tkey = threadKey(a.sid, renderedCol.get(a.itemId) ?? askColumn(a));
     if (collapsedThreads.has(tkey) && extHoverMatches("a:" + a.itemId, keys)) {
       collapsedThreads.delete(tkey); opened = true;
     }
