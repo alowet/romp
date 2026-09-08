@@ -58,6 +58,10 @@ export type SendBase = {
   queued: number;         // copies of the text the kernel's queued bubble(s) already listed at the press
 };
 
+/** A placement floor recorded from an earlier send's kernel event: found by uuid, else by the `ord`-th user
+ *  event after the anchor carrying `text` (the echo → landed swap keeps the position, changes the uuid). */
+export type Floor = { uuid: string; text?: string; ord: number };
+
 export type PendingSend = {
   text: string;        // the sent body, byte for byte — what the kernel echoes and the transcript lands
   body: string;        // `text` minus its image paths, whitespace-collapsed: an image send lands with the
@@ -70,9 +74,11 @@ export type PendingSend = {
   imgPaths?: string[]; // dragged images → the bubble's thumbnails, and the image-aware landing match
   lost?: string;       // an event after the press that makes non-delivery LIKELY ("connection": the
                        //   socket dropped) — the bubble says "not confirmed" instead of "sending…"
-  floors?: string[];   // uuids of kernel user events that belong to EARLIER-registered pending sends — their
-                       //   covering echoes and their landed atoms, recorded as they are claimed (T252b): an earlier
-                       //   send's message sits above this one whatever its text, so its bubble is drawn below them
+  floors?: Floor[];    // kernel user events that belong to EARLIER-registered pending sends — their covering
+                       //   echoes and their landed atoms, recorded as they are claimed (T252b): an earlier send's
+                       //   message sits above this one whatever its text, so its bubble is drawn below them. Each
+                       //   carries the event's text and its ordinal among same-text user events after this send's
+                       //   anchor, so the echo → landed swap is followed even when the earlier entry is gone (its ✕)
   received?: boolean;  // the kernel has shown a copy of the text attributed to THIS send (an echo atom or
                        //   a queued copy after the press that no earlier same-text send claimed): the send
                        //   reached it, so a connection drop before or after cannot have lost it — `lost` is
@@ -98,6 +104,20 @@ export const OPT_PREFIX = "optimistic:";
 export const isOptimisticUuid = (u?: string): boolean => !!u && u.startsWith(OPT_PREFIX);
 export const isKernelEchoUuid = (u?: string): boolean => !!u && u.startsWith("echo:");
 const collapse = (s: string): string => s.replace(/\s+/g, " ").trim();
+/** The text a kernel event and a queued copy share once the kernel's wrapping is set aside: the queued group
+ *  ships a romp nudge's split BODY, the landed atom keeps the full text — a leading `> ` goal quote, the body,
+ *  and `<!-- … -->` marker comments (the kernel splits a landed record only for a human author). Compared on
+ *  this key, the two are one text (T252b review). */
+const foreignKey = (s: string): string =>
+  collapse(s.replace(/<!--[\s\S]*?-->/g, " ").split("\n").filter((l) => !/^\s*>/.test(l)).join("\n"));
+/** Whether a user event carries `text` (on the foreignKey) in its md or any of its blocks — a record the CLI
+ *  wrote from several queued messages taken at one boundary lists each as a block (T252b review). */
+const carriesText = (e: TailEvent, text: string): boolean => {
+  if (e.kind !== "user" || isOptimisticUuid(e.uuid)) return false;
+  const k = foreignKey(text);
+  if (typeof e.md === "string" && foreignKey(e.md) === k) return true;
+  return Array.isArray(e.blocks) && e.blocks.some((b) => typeof b === "string" && foreignKey(b) === k);
+};
 
 /** `text` with its shipped image paths removed (quoted or bare, however the composer joined them). */
 export function pendingBody(text: string, imgPaths?: string[]): string {
@@ -260,7 +280,7 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
     if (e.kind !== "queued") continue;
     for (const t of e.texts || []) {
       if (typeof t.md !== "string" || t.hiddenByPending) continue;
-      if (sameText(t.md, p.text) || (pendingTexts && [...pendingTexts].some((x) => sameText(t.md!, x)))) continue;
+      if (foreignKey(t.md) === foreignKey(p.text) || (pendingTexts && [...pendingTexts].some((x) => foreignKey(t.md!) === foreignKey(x)))) continue;
       queuedForeign.push(t.md);
     }
     break;
@@ -325,11 +345,21 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
   const r: Reconciled = { keep: [], inject: [], unqueue: [], landed: [], lost: [] };
   const claimed = new Map<string, number>();           // "index\0text" → copies of that text in that landing taken by earlier entries THIS push
   const takenCopies = new Map<string, Set<number>>();  // text → queued-copy positions taken by an earlier entry THIS push
-  // an earlier entry's covering echo / landed atom is a FLOOR for every entry registered after it (T252b)
-  const floorFor = (owner: PendingSend, u: string | undefined) => {
+  // an earlier entry's covering echo / landed atom is a FLOOR for every entry registered after it (T252b),
+  // recorded with its text and its ordinal among same-text user events after THAT entry's anchor, so the
+  // echo → landed swap can be followed by text when the earlier entry is gone before its atom lands (its ✕)
+  const floorFor = (owner: PendingSend, at: number) => {
+    const u = events[at].uuid;
     if (!u) return;
     const i = list.indexOf(owner);
-    for (const q of list.slice(i + 1)) { if (!q.floors) q.floors = []; if (!q.floors.includes(u)) q.floors.push(u); }
+    for (const q of list.slice(i + 1)) {
+      if (!q.floors) q.floors = [];
+      if (q.floors.some((f) => f.uuid === u)) continue;
+      const text = typeof events[at].md === "string" ? events[at].md : undefined;
+      let ord = 0;
+      if (text !== undefined && q.at) for (let j = scanFrom(events, q.at); j <= at; j++) if (carriesText(events[j], text)) ord++;
+      q.floors.push({ uuid: u, text, ord });
+    }
   };
   for (const p of list) {
     const at = p.at!;
@@ -355,7 +385,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
       covered = true;
       const u = events[echoIdx].uuid;
       if (u) for (const q of list) if (q !== p && q.at && q.text === p.text && !q.at.seen.includes(u)) q.at.seen.push(u);
-      floorFor(p, u);
+      floorFor(p, echoIdx);
     } else if (copies > at.queued) {
       const taken = takenCopies.get(p.text) || new Set<number>();
       for (let k = at.queued; k < copies; k++) if (!taken.has(k)) { taken.add(k); covered = true; byQueued = true; break; }
@@ -367,7 +397,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
       const ck = landedIdx + "\0" + p.text;             // per text: a record of two DIFFERENT sends is one landing for each
       claimed.set(ck, (claimed.get(ck) || 0) + 1);
       r.landed.push({ p, idx: landedIdx });
-      floorFor(p, events[landedIdx].uuid);
+      floorFor(p, landedIdx);
       continue;
     }
     if (lostIdx >= 0) { r.lost.push(p); continue; }
@@ -459,22 +489,36 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
     }
     if (found > idx) idx = found;
   }
-  // an earlier pending send's echo or landed atom: below it, whatever its text
-  for (const u of p.floors || []) {
-    for (let j = events.length - 1; j >= base; j--) if (events[j].uuid === u) { if (j + 1 > idx) idx = j + 1; break; }
+  // the k-th user event after the anchor carrying `text` (md or a block) — the ordinal reading that never takes a
+  // LATER copy of the same words; -1 when fewer than k have landed
+  const kthCarrier = (text: string, k: number): { idx: number; count: number } => {
+    let n = 0, last = -1;
+    for (let j = base; j < events.length; j++) if (carriesText(events[j], text)) { n++; last = j; if (n === k) return { idx: j, count: n }; }
+    return { idx: last, count: n };
+  };
+  // an earlier pending send's echo or landed atom: below it, whatever its text — by uuid, else by its text's ordinal
+  for (const f of p.floors || []) {
+    let found = -1;
+    for (let j = events.length - 1; j >= base; j--) if (events[j].uuid === f.uuid) { found = j + 1; break; }
+    if (found < 0 && f.text !== undefined && f.ord > 0) { const k = kthCarrier(f.text, f.ord); if (k.idx >= 0) found = k.idx + 1; }
+    if (found > idx) idx = found;
   }
-  // the texts the kernel's queue held at the press: below the group while it holds them, below their atoms after
+  // the texts the kernel's queue held at the press, COUNTED per text: the press-time copies are the first k
+  // landings of that text, so the floor is the k-th carrier (never a later copy another client sent), and the
+  // group is a floor only while a press-time copy is still queued (fewer than k have landed)
   if (at.queuedForeign && at.queuedForeign.length) {
-    for (let j = events.length - 1; j >= base; j--) {
-      const e = events[j];
-      if (e.kind === "queued") {
-        if ((e.texts || []).some((t) => typeof t.md === "string" && !t.hiddenByPending && at.queuedForeign.some((f) => sameText(t.md!, f)))) { if (j + 1 > idx) idx = j + 1; }
-        break;
+    const counts = new Map<string, { text: string; n: number }>();
+    for (const f of at.queuedForeign) { const k = foreignKey(f); const c = counts.get(k); if (c) c.n++; else counts.set(k, { text: f, n: 1 }); }
+    let groupIdx = -1;
+    for (let j = events.length - 1; j >= base; j--) if (events[j].kind === "queued") { groupIdx = j; break; }
+    for (const { text, n } of counts.values()) {
+      const k = kthCarrier(text, n);
+      let floor = k.idx >= 0 ? k.idx + 1 : -1;
+      if (k.count < n && groupIdx >= 0) {
+        const g = events[groupIdx];
+        if ((g.texts || []).some((t) => typeof t.md === "string" && !t.hiddenByPending && foreignKey(t.md) === foreignKey(text))) floor = Math.max(floor, groupIdx + 1);
       }
-    }
-    for (let j = events.length - 1; j >= base; j--) {
-      const e = events[j];
-      if (e.kind === "user" && !isOptimisticUuid(e.uuid) && typeof e.md === "string" && at.queuedForeign.some((f) => sameText(e.md!, f))) { if (j + 1 > idx) idx = j + 1; break; }
+      if (floor > idx) idx = floor;
     }
   }
   return idx;

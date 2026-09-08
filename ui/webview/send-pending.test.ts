@@ -313,19 +313,19 @@ test("an earlier pending send's landing or echo is a floor for every later send,
   let r = reconcilePending(frame, [x, y]);
   assert.deepEqual(r.landed.map((l) => l.p), [x]);
   assert.deepEqual(r.keep, [y]);
-  assert.deepEqual(y.floors, ["uX"], "X's landing is recorded as Y's floor");
+  assert.deepEqual(y.floors?.map((f) => f.uuid), ["uX"], "X's landing is recorded as Y's floor");
   assert.deepEqual(injectionGroups(frame, r.inject), [{ idx: 2, sends: [y] }], "below uX, above t1");
   // the echo variant: X's echo arrives while both are pending — Y sits below it, and X is covered
   const [x2, y2] = press(tail, "first", "second");
   frame = [...tail, { kind: "user", md: "first", uuid: "echo:X" }];
   r = reconcilePending(frame, [x2, y2]);
   assert.deepEqual(r.inject, [y2]);
-  assert.deepEqual(y2.floors, ["echo:X"]);
+  assert.deepEqual(y2.floors?.map((f) => f.uuid), ["echo:X"]);
   assert.deepEqual(injectionGroups(frame, r.inject), [{ idx: 2, sends: [y2] }]);
   // …and when that echo becomes the landed atom, the landing takes over as the floor
   frame = [...tail, { kind: "user", md: "first", uuid: "uX2", absorbed: true }, { kind: "tool", uuid: "t1" }];
   r = reconcilePending(frame, [x2, y2]);
-  assert.deepEqual(y2.floors, ["echo:X", "uX2"]);
+  assert.deepEqual(y2.floors?.map((f) => f.uuid), ["echo:X", "uX2"]);
   assert.deepEqual(injectionGroups(frame, r.inject), [{ idx: 2, sends: [y2] }]);
   // a LATER send never becomes a floor for an earlier one: Z pressed after Y, lands first (a different route)
   const [y3, z3] = press(tail, "second", "third");
@@ -363,6 +363,46 @@ test("a send pressed while the kernel's queue holds OTHER texts is drawn below t
   // render.ts: the stale merge-into-the-group comment is gone; the tail group is described as a floor
   assert.doesNotMatch(RENDER, /Ours merges INTO it when present/);
   assert.match(RENDER, /a group holding OTHER texts is a floor/);
+});
+
+test("foreign and floor texts match the kernel's landed shapes: a nudge's quote and markers, a multi-block record, and by ordinal (T252b review)", () => {
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
+  // (1) a goal-marked romp nudge: the queued group ships the split BODY, the landed atom keeps the full text
+  const body = "where does this stand?";
+  const full = "> the goal's context line\n\n" + body + "\n\n<!-- romp-goal-id: g1 --><!-- romp-injected -->";
+  const x = newPending("mine", undefined, T0);
+  reconcilePending([...tail, { kind: "queued", texts: [{ md: body }, { md: "mine" }] }], [x]);
+  assert.deepEqual(x.at?.queuedForeign, [body]);
+  const nudgeLanded: TailEvent[] = [...tail, { kind: "user", md: full, uuid: "uN" }, { kind: "assistant", md: "…", uuid: "a2" }, { kind: "queued", texts: [{ md: "mine", hiddenByPending: true }] }];
+  assert.deepEqual(injectionGroups(nudgeLanded, reconcilePending(nudgeLanded, [x]).inject), [{ idx: 2, sends: [x] }], "below the landed nudge, whatever wrapping the kernel kept");
+  // (2) a multi-block record: two foreign texts taken at one boundary land as ONE user record
+  const y = newPending("mine", undefined, T0 + 1);
+  reconcilePending([...tail, { kind: "queued", texts: [{ md: "F" }, { md: "G" }, { md: "mine" }] }], [y]);
+  const blocks: TailEvent[] = [...tail, { kind: "user", md: "F G", uuid: "uFG", blocks: ["F", "G"] }, { kind: "tool", uuid: "t1" }];
+  assert.deepEqual(injectionGroups(blocks, reconcilePending(blocks, [y]).inject), [{ idx: 2, sends: [y] }], "below the record that holds both");
+  // (3) by ordinal: one copy of F queued at the press; F lands; another client queues F AGAIN, and later echoes it —
+  // the press-time copy is the first landing, and the newer copies are later than this send
+  const z = newPending("mine", undefined, T0 + 2);
+  reconcilePending([...tail, { kind: "queued", texts: [{ md: "F" }, { md: "mine" }] }], [z]);
+  const again: TailEvent[] = [...tail, { kind: "user", md: "F", uuid: "uF1" }, { kind: "tool", uuid: "t1" }, { kind: "queued", texts: [{ md: "mine", hiddenByPending: true }, { md: "F" }] }];
+  assert.deepEqual(injectionGroups(again, reconcilePending(again, [z]).inject), [{ idx: 2, sends: [z] }], "below the first F, above the newer queued F");
+  const echoed: TailEvent[] = [...tail, { kind: "user", md: "F", uuid: "uF1" }, { kind: "tool", uuid: "t1" }, { kind: "user", md: "F", uuid: "echo:F2" }];
+  assert.deepEqual(injectionGroups(echoed, reconcilePending(echoed, [z]).inject), [{ idx: 2, sends: [z] }], "…and above the newer F's echo");
+  // two copies of F at the press: the second landing is the floor
+  const w = newPending("mine", undefined, T0 + 3);
+  reconcilePending([...tail, { kind: "queued", texts: [{ md: "F" }, { md: "F" }, { md: "mine" }] }], [w]);
+  const twoLanded: TailEvent[] = [...tail, { kind: "user", md: "F", uuid: "uF1" }, { kind: "user", md: "F", uuid: "uF2" }, { kind: "tool", uuid: "t1" }];
+  assert.deepEqual(injectionGroups(twoLanded, reconcilePending(twoLanded, [w]).inject), [{ idx: 3, sends: [w] }]);
+  const oneLanded: TailEvent[] = [...tail, { kind: "user", md: "F", uuid: "uF1" }, { kind: "queued", texts: [{ md: "F" }, { md: "mine", hiddenByPending: true }] }];
+  assert.deepEqual(injectionGroups(oneLanded, reconcilePending(oneLanded, [w]).inject), [{ idx: 3, sends: [w] }], "one press-time copy still queued: below the group");
+  // (4) an earlier send's ECHO floor survives the earlier send's ✕: when its atom lands under a new uuid the floor
+  // is followed by text and ordinal, with no entry left to record the landing
+  const [x4, y4] = press(tail, "first", "second");
+  reconcilePending([...tail, { kind: "user", md: "first", uuid: "echo:X" }], [x4, y4]);
+  assert.deepEqual(y4.floors?.map((f) => [f.uuid, f.text, f.ord]), [["echo:X", "first", 1]]);
+  dropPending([x4, y4], "first", x4.ts);   // the ✕ the kernel could not honour: the CLI had taken it
+  const afterX: TailEvent[] = [...tail, { kind: "user", md: "first", uuid: "uX", absorbed: true }, { kind: "tool", uuid: "t1" }];
+  assert.deepEqual(injectionGroups(afterX, reconcilePending(afterX, [y4]).inject), [{ idx: 2, sends: [y4] }], "below X's atom, under its new uuid");
 });
 
 test("a bubble that changes slot marks the view stale, so the incremental repaint never trusts a shifted prefix (second review)", () => {
