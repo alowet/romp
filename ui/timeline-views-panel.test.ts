@@ -474,6 +474,61 @@ test("executed: the union dispatcher — add prefers local, remove reaches every
   assert.deepEqual(remote.map((r: any) => r[1].delete), [true, true], "…and every remote home");
 });
 
+test("executed: with no remote bridge, a union edit leaves the LOCAL half untouched and says why (review find, 2026-09-08)", () => {
+  // The Obsidian panel has no window.__rompTimelineEditTag, so _editRemoteTag refuses synchronously. Before
+  // 2026-09-08 _editTagUnion had already committed the local half by then — the tag renamed, its member
+  // dropped or the tag deleted in the local store alone, the remote halves untouched — under an error that
+  // named only the remote. The remote halves go first now and the local half commits only when every one
+  // of them was taken, so the error's "nothing was changed" is the truth.
+  const w = (globalThis as any).window;
+  assert.notEqual(typeof (w && w.__rompTimelineEditTag), "function", "this harness has no remote bridge (the Obsidian panel's shape)");
+  const p: any = Object.create(TimelinePanel.prototype);
+  const local: any[] = [];
+  p._setViews = (v: any) => local.push(v);   // the legacy local write _postTagEdit falls to without a targeted bridge
+  p.draw = () => {};
+  p._pendingViews = null; p._pendingTagEdits = {}; p._tagEditErr = null;
+  const rtA = { id: "TESTHOST-A:g1", host: "TESTHOST-A", name: "team", color: "#123456", members: ["m1"] };
+  const localTag = { id: "gL", name: "team", color: "#123456", members: ["m1", "m2"] };
+  p._views = { active: "all", hidden: [], tags: [localTag], remoteTags: [rtA] };
+  const g = { name: "team", color: "#123456", members: ["m1", "m2"], ids: ["gL", rtA.id], localId: "gL",
+              homes: ["TESTHOST-A"], remotes: [rtA] };
+  const refused = (gesture: string) => {
+    assert.equal(local.length, 0, gesture + ": the remote half was refused, so the local half did not commit");
+    assert.ok(p._tagEditErr, gesture + ": the refusal shows");
+    assert.equal(p._tagEditErr.host, "TESTHOST-A", gesture + ": it names the remote");
+    assert.match(p._tagEditErr.error, /cannot reach TESTHOST-A/, gesture + ": …and why");
+    assert.match(p._tagEditErr.error, /nothing was changed/, gesture + ": …and that the edit landed nowhere");
+    assert.match(p._tagEditErr.error, /romp tag --host TESTHOST-A/, gesture + ": …and the way to make it");
+    p._tagEditErr = null;
+  };
+  p._editTagUnion(g, { rename: "crew" }); refused("rename");
+  p._editTagUnion(g, { color: "#DD42FF" }); refused("recolor");
+  p._editTagUnion(g, { delete: true }); refused("delete");
+  p._editTagUnion(g, { remove: ["m1"] }); refused("remove of a member both halves hold");
+  assert.deepEqual(p._curViews().tags[0], localTag, "the local tag reads exactly as the store has it");
+  // a REMOVE of a member only the local half holds asks nothing of the remotes: the local half commits, as before
+  p._editTagUnion(g, { remove: ["m2"] });
+  assert.equal(local.length, 1, "no remote holds m2, nothing to refuse — the local half commits");
+  assert.deepEqual(local[0].tags[0].members, ["m1"]);
+  assert.equal(p._tagEditErr, null, "…and nothing is said");
+  // WITH a bridge (the web dashboard) both halves post — every remote half first, the local commit last; one
+  // refused remote half among several still holds the local half back
+  local.length = 0;
+  const order: string[] = [];
+  const rtB = { id: "TESTHOST-B:g7", host: "TESTHOST-B", name: "team", color: "#123456", members: ["m1"] };
+  const g2 = { ...g, ids: ["gL", rtA.id, rtB.id], homes: ["TESTHOST-A", "TESTHOST-B"], remotes: [rtA, rtB] };
+  p._editRemoteTag = (rt: any) => { order.push(rt.host); return rt.host !== "TESTHOST-B"; };
+  p._setViews = (v: any) => { order.push("local"); local.push(v); };
+  p._editTagUnion(g2, { rename: "crew" });
+  assert.deepEqual(order, ["TESTHOST-A", "TESTHOST-B"], "every remote half is still attempted; the local half waits");
+  assert.equal(local.length, 0, "one refused remote half: no local commit");
+  order.length = 0;
+  p._editRemoteTag = (rt: any) => { order.push(rt.host); return true; };
+  p._editTagUnion(g2, { rename: "crew" });
+  assert.deepEqual(order, ["TESTHOST-A", "TESTHOST-B", "local"], "all taken: remote halves first, the local commit last");
+  assert.equal(local[0].tags[0].name, "crew");
+});
+
 test("the lane gear carries the SAME tag editor — the shared builders, never a fork (the user 2026-08-24)", () => {
   // both surfaces call the one chip builder and the one join menu
   assert.ok((SRC.match(/this\._tagChips\(/g) || []).length >= 2, "dialog rows AND the gear");

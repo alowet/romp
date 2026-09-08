@@ -79,6 +79,24 @@ test("setSessionFlag still posts via the web host hook, with a Node-fs fallback 
   assert.match(SRC, /session-flags\.json/, "Obsidian/headless writes the same file the kernel reads");
 });
 
+test("the Obsidian fallback wears the discipline of its two sibling writers (PR #1020; audited 2026-09-07)", () => {
+  // Pinned on the writer's OWN slice: the guard the order writer's pin (timeline-render.test.ts) matches
+  // anywhere in the file is required HERE too. The audited writer had none, wrote a hardcoded
+  // ~/.local/state/romp the kernel never reads under ROMP_STATE_DIR, folded a read fault into an empty
+  // store, and truncated the live file in place. The write itself is RUN with a stubbed fs from
+  // tests/test_kernel_session_flags.py (TimelineFallbackFlagWriter): a read fault, torn bytes or the
+  // wrong shape write nothing; a missing store publishes through tmp + rename under ROMP_STATE_DIR.
+  const w = SRC.slice(SRC.indexOf("_setSessionFlag(s, flag, value) {"), SRC.indexOf("_dismissLane(id) {"));
+  assert.ok(w.length > 0 && w.length < 4000, "the writer's slice");
+  assert.match(w, /if \(typeof process === 'undefined' \|\| !process\.versions \|\| !process\.versions\.electron\) return;/,
+    "Electron-or-nothing: a bare-node run never touches the real file");
+  assert.match(w, /process\.env\.ROMP_STATE_DIR\n?\s*\|\| path\.join\(process\.env\.XDG_STATE_HOME \|\| path\.join\(os\.homedir\(\), '\.local', 'state'\), 'romp'\)/,
+    "the kernel's state root, resolved as the kernel resolves it");
+  assert.match(w, /fs\.writeFileSync\(tmp, JSON\.stringify\(cur\)\);\s*\n\s*fs\.renameSync\(tmp, fp\);/, "tmp + rename: a reader never sees a torn or empty file");
+  assert.doesNotMatch(w, /fs\.writeFileSync\(fp,/, "never the live file in place");
+  assert.doesNotMatch(w, /catch \(e\) \{\}/, "a read fault is never folded into an empty store");
+});
+
 test("the sticky-flag machinery survives: pendingFlags reconcile on every update (no flicker-back)", () => {
   assert.match(SRC, /this\._pendingFlags = \{\};/);
   assert.match(SRC, /this\.data = data;\s*\n(?:[^\n]*\n){0,4}\s*this\._reconcilePendingFlags\(\);/);

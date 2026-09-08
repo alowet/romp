@@ -3063,11 +3063,13 @@ class TimelinePanel {
   // one remote-tag edit, dispatched to its HOME kernel and rendered optimistically meanwhile.
   // Ids ride viewer-relative; the kernel sends only the bare sid tails (sids are global) and the
   // owner resolves them into ITS frame. No hook (the Obsidian panel) → the tag stays read-only
-  // and the refusal is immediate and visible, never a silent drop.
+  // and the refusal is immediate and visible, never a silent drop — and, since _editTagUnion
+  // holds the local half back until every remote half was taken, the refusal IS the outcome:
+  // nothing was changed anywhere, which the text says.
   _editRemoteTag(rt, edit) {
     if (typeof window === 'undefined' || typeof window.__rompTimelineEditTag !== 'function') {
       this._tagEditErr = { host: rt.host, name: rt.name,
-                           error: 'this panel cannot reach ' + (rt.host || 'the owner') + " — edit with: romp tag --host " + (rt.host || '<kernel>') };
+                           error: 'this panel cannot reach ' + (rt.host || 'the owner') + ", so nothing was changed — edit with: romp tag --host " + (rt.host || '<kernel>') };
       this.draw();
       return false;
     }
@@ -3138,16 +3140,24 @@ class TimelinePanel {
   // write, and the renames and assignments were lost; by NAME, a recolor queued behind a refused
   // rename went looking for the name the rename would have given the tag and found the other tag
   // that already had it); remote writes ride _editRemoteTag (optimistic overlay + loud
-  // tagEditFailed, federation v1).
+  // tagEditFailed, federation v1). The REMOTE halves go first, and the local half commits only
+  // once every one of them was taken (review find, 2026-09-08): with no remote bridge (the
+  // Obsidian panel) _editRemoteTag refuses at once, and before this the local half had already
+  // been written — the tag renamed, its member dropped or the tag deleted in the local store
+  // alone, under an error that named only the remote. A refusal now leaves every store as it
+  // was, and the error text says so.
   _editTagUnion(g, edit) {
     // a create still in flight has no id to address (its row wears the placeholder the ack
     // replaces): the builders offer no gesture on it, and one that arrives anyway does nothing
     // rather than posting a tid the kernel refuses as a tag that does not exist
     if (g.pending) return;
     const meta = { name: g.name, tid: g.localId };
+    // the local half's optimistic copy, taken BEFORE the remote fan-out: _curViews overlays the
+    // remote halves' pending copies, and those must not ride a local post
+    const localCopy = () => (g.localId ? JSON.parse(JSON.stringify(this._curViews())) : null);
     if (edit.add && edit.add.length) {
-      if (g.localId) {
-        const nv = JSON.parse(JSON.stringify(this._curViews()));
+      const nv = localCopy();
+      if (nv) {
         const t = viewTags(nv).find((x) => x.id === g.localId);
         if (t) {
           t.members = Array.from(new Set((t.members || []).concat(edit.add)));
@@ -3156,21 +3166,25 @@ class TimelinePanel {
       } else if (g.remotes.length) this._editRemoteTag(g.remotes[0], { add: edit.add.slice() });
     }
     if (edit.remove && edit.remove.length) {
-      if (g.localId) {
-        const nv = JSON.parse(JSON.stringify(this._curViews()));
+      const nv = localCopy();
+      let ok = true;
+      for (const rt of g.remotes)
+        if ((rt.members || []).some((m) => edit.remove.indexOf(m) >= 0))
+          ok = this._editRemoteTag(rt, { remove: edit.remove.slice() }) && ok;
+      if (ok && nv) {
         const t = viewTags(nv).find((x) => x.id === g.localId);
         if (t && (t.members || []).some((m) => edit.remove.indexOf(m) >= 0)) {
           t.members = (t.members || []).filter((m) => edit.remove.indexOf(m) < 0);
           this._postTagEdit(nv, { op: 'removeMember', tid: g.localId, sids: edit.remove.slice() }, meta);
         }
       }
-      for (const rt of g.remotes)
-        if ((rt.members || []).some((m) => edit.remove.indexOf(m) >= 0))
-          this._editRemoteTag(rt, { remove: edit.remove.slice() });
     }
     if (edit.rename || edit.color || edit.delete) {
-      if (g.localId) {
-        const nv = JSON.parse(JSON.stringify(this._curViews()));
+      const nv = localCopy();
+      let ok = true;
+      for (const rt of g.remotes)
+        ok = this._editRemoteTag(rt, { rename: edit.rename, color: edit.color, delete: !!edit.delete }) && ok;
+      if (ok && nv) {
         if (edit.delete) {
           nv.tags = viewTags(nv).filter((x) => x.id !== g.localId); delete nv.groups;
           if (nv.active === g.localId) nv.active = 'all';
@@ -3185,8 +3199,6 @@ class TimelinePanel {
           }
         }
       }
-      for (const rt of g.remotes)
-        this._editRemoteTag(rt, { rename: edit.rename, color: edit.color, delete: !!edit.delete });
     }
   }
 
