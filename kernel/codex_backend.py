@@ -301,6 +301,7 @@ class CodexBackend:
         return self.root / "registry.lock"
 
     def _load_registry(self):
+        self._registry_unreadable = False   # end_marker: while set, "not held" is a reader's fault, not no record
         try:
             rows = json.loads(self._reg_path().read_text())
             if not isinstance(rows, dict):
@@ -313,6 +314,7 @@ class CodexBackend:
             # as unrelated-looking spawn/send errors (2026-08-14 review)
             self.log("codex registry unreadable at load — existing sessions will be missing "
                      "until it is repaired: %s" % e)
+            self._registry_unreadable = True
             rows = {}
         with self._sessions_lock:
             for sid, r in rows.items():
@@ -710,6 +712,23 @@ class CodexBackend:
         return (c or "").strip() if isinstance(c, str) else ""
 
     # ── liveness / identity ──────────────────────────────────────────────────────────────────────
+    def end_marker(self, sid):
+        """What this backend's own record says about `sid` after it refused a send — never a liveness
+        probe: True when the session is marked dead (the end marker set when its client dies or the
+        session is ended), None when it holds no session by that id, False when the session stands
+        (the refusal was something else; the caller retries). With the registry UNREADABLE at load the
+        backend holds none of the sessions it should, so "not held" RAISES instead of answering None:
+        a reader's fault the caller waits on, never a record's absence it can act on (review find,
+        2026-09-08; before it, a corrupt registry.json read every uuid as no record and ended a Codex
+        registrant's watch). The flag lasts the process: the registry is read once, at load."""
+        s = self._session(sid)
+        if not s:
+            if getattr(self, "_registry_unreadable", False):
+                raise RuntimeError("Codex registry was unreadable at load: no record of %s can be read" % sid)
+            return None
+        with s.lock:
+            return bool(s.dead)
+
     def owns(self, sid):
         s = self._session(sid)
         if not s:

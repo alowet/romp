@@ -19,6 +19,7 @@ and the kernel degrades gracefully when the SDK is absent.
 from __future__ import annotations
 import asyncio
 import difflib
+import errno
 import hashlib
 import json
 import os
@@ -8830,6 +8831,41 @@ class SdkBackend:
         if a in ("login", "key"):
             return a
         return "key" if self.work_key_configured else "login"
+
+    def sid_for_name(self, name: str) -> str:
+        """The sid of the ONE alive session (not a comment thread) whose reg carries `name`, else "".
+        The regs are this backend's durable record of its sessions, so a name resolves here without
+        the live set; two alive regs with the same name resolve to nothing — a guess would mail the
+        wrong session."""
+        name = str(name or "")
+        if not name:
+            return ""
+        hits = [str(reg.get("sid")) for reg in list_regs(self.state_dir)
+                if reg.get("alive") and not reg.get("threadOf") and reg.get("name") == name and reg.get("sid")]
+        return hits[0] if len(hits) == 1 else ""
+
+    def end_marker(self, sid: str):
+        """What this backend's own DURABLE record says about `sid`, for a caller whose send it just
+        refused — never a liveness probe. True: the reg is present and says alive=false, the explicit
+        end marker written at session end. False: the record stands (the refusal was something else;
+        the caller retries): a reg that says alive, or a session RUNNING in this process, whatever the
+        disk says this instant (the proof owns() and _ensure already take). None: NO reg file, which is
+        durable, since this backend never unlinks a reg. A reg that EXISTS but would not read or parse
+        RAISES (EMFILE, EIO, EACCES, torn JSON: the transient class owns() was repaired for on
+        2026-09-07), so the caller waits on a reader's fault instead of counting it as no record. The
+        first version read through read_reg, which answers None for an unreadable reg exactly as for
+        an absent one, and never looked at self.sessions: a running session whose reg would not read
+        was classed as no record, its landing mail withheld, and its watch retired as ended (review
+        find, 2026-09-08)."""
+        s = self.sessions.get(sid)
+        if s is not None and s.thread.is_alive():
+            return False
+        reg = read_reg_for_rmw(self.state_dir, sid)
+        if reg is None:
+            raise OSError(errno.EIO, "reg for %s exists but would not read" % sid[:8])
+        if not reg:
+            return None
+        return not bool(reg.get("alive"))
 
     def owns(self, sid: str) -> bool:
         """Whether this backend has a registry entry for `sid`. Memoized on the reg file's (mtime, size):

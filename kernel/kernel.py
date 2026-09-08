@@ -16833,7 +16833,12 @@ def _cache_remote_views(r, rviews):
 # A session registers interest in a PR; the KERNEL polls gh for the terminal state and delivers the
 # outcome as one [romp] notice to the registering session. Registrations persist (pr-watches.json)
 # and re-arm on boot exactly like the reconnect intent — a kernel restart moves the watch, never
-# kills it. Polling an external system is the legitimate acquisition of an unobservable event (the
+# kills it. Durability is the contract at both ends: a registration is acknowledged only once it is
+# ON DISK (a failed save refuses it, retryably), and a landing's notice retires the row only once
+# its injection is accepted, with the verdict stamped into the file BEFORE the injection (see
+# _pr_watch_deliver_stamped) so a crash in between can never lose the one mail a delegating session
+# is waiting on, nor mail it twice without saying so. Polling an external system is the legitimate
+# acquisition of an unobservable event (the
 # USAGE_POLL precedent): modest cadence, a touch slower while checks visibly run. Terminal means
 # MERGED, CLOSED, or a FAILED check — both ends of the standing watcher rule — and a gh failure is
 # LOUD: three consecutive errors deliver a failure notice and retire the watch, never a silent dead
@@ -16857,7 +16862,18 @@ PR_WATCH_MAX_FAILS = 3       # consecutive gh failures before the loud retire
 # reset on each would never fire.
 PR_WATCH_ESCALATE_S = 2 * 3600
 _pr_watches = []             # [{pr, repo, sid, at} + runtime {_next, _fails, _busy}]
-_pr_watch_lock = threading.Lock()
+_pr_watch_lock = threading.Lock()   # held across the DISK WRITE too (_pr_watches_save_locked), so two saves
+#                              cannot land out of order and resurrect a retired row, and a registration is
+#                              acknowledged only once it is on disk: a rolled-back row is never observed. The
+#                              trade, stated (review find, 2026-09-08): a hung state-dir write on the HTTP
+#                              handler holds this lock for the write's duration, and with it the pusher's
+#                              awaiting lift (_kernel_watch_armed) and the supervisor's tick. _atomic_write
+#                              has no timeout of its own; bounding it would take a writer thread, which is
+#                              more machinery than the stall is worth today.
+_PR_WATCH_KEYS = ("pr", "repo", "sid", "at", "escalate", "failedAt", "escalated", "sent", "sentDetail")
+_pr_watch_save_faults = {}   # fault text → True: the save faults already said this episode. A failed save is
+#                              told ONCE per fault episode (one stderr line, one Log row) and the episode ends
+#                              on the EVENT — a save that lands clears the registry — never on a clock.
 
 
 def _pr_watches_load():
@@ -16873,6 +16889,16 @@ def _pr_watches_load():
         # boot re-arm (the reconnect-intent precedent): fresh counters, poll immediately
         for r in _pr_watches:
             r["_next"], r["_fails"], r["_busy"] = 0, 0, False
+            if r.get("sent") not in ("merged", "closed", "error"):
+                # a stamp is one of the three verdicts the tick files, or it is not a stamp: a torn or
+                # hand-edited value would otherwise replay as a notice the tick never wrote (the strict
+                # reader's rule — _read_state_json — applied to one field)
+                r.pop("sent", None)
+                r.pop("sentDetail", None)
+            # a row stamped `sent` was mid-delivery when the last kernel died (stamp → mail → retire,
+            # and it got as far as the stamp): whether its mail landed is unknowable, so it goes out
+            # once more with the notice SAYING so — never silently twice, never silently dropped
+            r["_replay"] = bool(r.get("sent"))
 
 
 def _kernel_watch_armed(sid):
@@ -16884,34 +16910,71 @@ def _kernel_watch_armed(sid):
         return any(str(r.get("sid")) == str(sid) for r in _pr_watches)
 
 
-def _pr_watches_save():
-    with _pr_watch_lock:
-        rows = [{k: r[k] for k in ("pr", "repo", "sid", "at", "escalate", "failedAt", "escalated")
-                 if k in r} for r in _pr_watches]
+def _pr_watches_save_locked():
+    """Persist the rows; the caller HOLDS _pr_watch_lock, so the write itself sits under it (two
+    concurrent saves cannot land out of order and resurrect a retired row). Returns the FAULT TEXT
+    when the write did not land, "" when it did — the caller that owns a gesture names the fault to
+    the user, and reads it from its own save, never from the shared registry. A failed write is said
+    ONCE per fault episode — one stderr line with the traceback and one Log row under the bell's
+    `refused` kind (a state file that could not be written, like every other), keyed on the errno
+    text (_errno_text: never str(e), whose temp path carries a per-call sequence) — and the next
+    landed write ends the episode: a save that fails every tick for an hour says so once, not sixty
+    times, and never silently."""
+    rows = [{k: r[k] for k in _PR_WATCH_KEYS if k in r} for r in _pr_watches]
     try:
         _atomic_write(PR_WATCH_FILE, json.dumps(rows))
-    except Exception:
-        sys.stderr.write("pr-watches save: %s\n" % traceback.format_exc())
+    except Exception as e:
+        fault = _errno_text(e)
+        if fault not in _pr_watch_save_faults:
+            _pr_watch_save_faults[fault] = True
+            line = ("pr-watches: could not save %s (%s) — a watch registered now is refused, and a landed "
+                    "PR's notice waits until the file takes writes again" % (PR_WATCH_FILE.name, fault))
+            sys.stderr.write("%s\n%s" % (line, traceback.format_exc()))
+            _sync_notice(line, ok=False, kind="refused")
+        return fault
+    _pr_watch_save_faults.clear()
+    return ""
+
+
+def _pr_watches_save():
+    """True when the rows are on disk (the tick's stamp and retire saves ask only that)."""
+    with _pr_watch_lock:
+        return not _pr_watches_save_locked()
 
 
 def add_pr_watch(pr, repo, sid, now=None, escalate=""):
     """Register (idempotently) a landing watch: one mail to `sid` when repo#pr reaches a terminal
     state. `escalate` names the session pinged if a FAILED check sits unresolved past the bound
-    (T143 — the delegating manager registers itself; the kernel infers nothing). Returns the row."""
+    (T143 — the delegating manager registers itself; the kernel infers nothing). Returns (row, fault)
+    like add_watch: (row, "") once the registration is ON DISK; (None, fault) when a fresh row could
+    not be saved — lookup, append, persist and rollback are ONE locked transaction, so a row a restart
+    would forget is never acknowledged, never seen by a concurrent registration, and never on disk to
+    resurrect at boot; and (row, fault) when the watch already stands but a NEW escalation target
+    could not be saved (rolled back too) — the caller tells the two apart, because "nothing is
+    watching" would be false in the second case. The disk write sits inside the lock on purpose: a
+    hung state-dir write holds the tick and _kernel_watch_armed for its duration, which is the price
+    of never observing, acknowledging, or persisting a row the transaction then rolls back."""
     pr, repo, sid = int(pr), str(repo).strip(), str(sid).strip()
     with _pr_watch_lock:
         for r in _pr_watches:
             if r["pr"] == pr and r["repo"] == repo and r["sid"] == sid:
+                fault = ""
                 if escalate and not r.get("escalate"):
                     r["escalate"] = str(escalate).strip()
-                return {k: r[k] for k in ("pr", "repo", "sid", "at")}
+                    fault = _pr_watches_save_locked()
+                    if fault:
+                        r.pop("escalate", None)
+                return {k: r[k] for k in ("pr", "repo", "sid", "at")}, fault
         row = {"pr": pr, "repo": repo, "sid": sid, "at": int(now if now is not None else time.time()),
                "_next": 0, "_fails": 0, "_busy": False}
         if escalate:
             row["escalate"] = str(escalate).strip()
         _pr_watches.append(row)
-    _pr_watches_save()
-    return {k: row[k] for k in ("pr", "repo", "sid", "at")}
+        fault = _pr_watches_save_locked()
+        if fault:
+            _pr_watches.remove(row)          # rolled back under the same lock: refused means gone
+            return None, fault
+        return {k: row[k] for k in ("pr", "repo", "sid", "at")}, ""
 
 
 def _pr_watch_verdict(d):
@@ -16955,24 +17018,33 @@ def _pr_watch_verdict(d):
     return None, ("busy" if busy else "")
 
 
-def _pr_watch_notice(verdict, repo, pr, detail=""):
+def _pr_watch_notice(verdict, repo, pr, detail="", replay=False, ended_owner=""):
     """The one mail a landing watch sends — the [romp] mechanics-notice family (it is ABOUT romp's
     own watch service, like the restart notice): plain, practical, no reply expected. PURE for the
-    voice test."""
+    voice test. `replay`: the delivery stamp outlived a kernel restart, so an earlier copy may have
+    landed — the notice says so rather than pretending to be the first. `ended_owner`: the sid that
+    registered the watch has ENDED and this copy goes to its escalation contact, who never asked —
+    the notice names the session it was watching for and says why it arrives here."""
     ref = "%s#%s" % (repo, pr)
+    who = (("romp was watching for session %s" % str(ended_owner)[:8]) if ended_owner
+           else "you asked romp to watch")
     if verdict == "merged":
-        body = "[romp] The pull request you asked romp to watch has MERGED: %s. This watch is done." % ref
+        body = "[romp] The pull request %s has MERGED: %s. This watch is done." % (who, ref)
     elif verdict == "closed":
-        body = ("[romp] The pull request you asked romp to watch was CLOSED without merging: %s. "
-                "This watch is done." % ref)
+        body = ("[romp] The pull request %s was CLOSED without merging: %s. "
+                "This watch is done." % (who, ref))
     elif verdict == "failed":
-        body = ("[romp] The pull request you asked romp to watch has a FAILED check (%s): %s. "
+        body = ("[romp] The pull request %s has a FAILED check (%s): %s. "
                 "It will not land on its own — it needs your attention. This watch is done."
-                % (detail or "a check", ref))
+                % (who, detail or "a check", ref))
     else:   # the loud gh-failure retire
         body = ("[romp] romp could not read %s (gh said: %s) after several tries, so this watch was "
                 "dropped — check `gh auth status` on this machine and re-register with `romp watch-pr` "
                 "if you still need it." % (ref, detail or "an unknown error"))
+    if ended_owner:
+        body += " That session has ended, so this comes to you as the escalation contact named for it."
+    if replay:
+        body += " This may repeat a notice sent just before romp last restarted."
     # romp-injected: the chat classifies by MARKER, never by prose (T130) — without it this notice
     # rendered as a generic tagged machine message instead of wearing the romp attribution the
     # nudges wear; romp-system marks the mechanics-notice family; the tag stays as the shape's id.
@@ -17015,31 +17087,276 @@ def _pr_watch_read(pr, repo):
 
 
 def _pr_watch_deliver(sid, text):
-    """The landing mail, through the same park-aware injection /send uses (a rate-limited or
-    compacting session gets it when it can take it). Best-effort by design: a dead session's mail
-    has no recipient, and the watch is already done."""
+    """One watch notice, through the same park-aware injection /send uses (a rate-limited or
+    compacting session gets it when it can take it). Returns whether the BACKEND accepted it —
+    parked, or handed over and not refused. False when the backend refused the handover
+    (_send_or_park's None: be.send returned False for a session it no longer holds) or raised. The
+    watch ticks keep their row on False and retry; the PR tick classifies the refusal from the
+    backend's own record (_pr_watch_refusal), so it never retries forever against a session that
+    has ended. A uuid-shaped sid is never handed to tmux, whichever way it got there (the record
+    read said nothing, or a reader's fault left it unread): SDK and Codex sids are uuids and tmux
+    sids are names, so a uuid the router disowns is a session no record-holding backend holds — tmux
+    would "accept" the notice for a shell that never existed. It reads as refused instead, and the
+    caller classifies it from the records."""
     try:
-        _send_or_park(Sessions.backend_for(sid), sid, text)
-        return True
+        be = Sessions.backend_for(sid)
+        if be is _TMUX and _PR_WATCH_UUID_RE.fullmatch(str(sid)):
+            return False
+        return _send_or_park(be, sid, text) is not None
     except Exception:
         return False
 
 
+_PR_WATCH_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+_PR_WATCH_UNREAD = "unread"      # _pr_watch_end_marker: a record reader raised and no other backend answered
+
+
+def _pr_watch_record_backends():
+    """The backends that keep a DURABLE record of their sessions — the SDK backend (regs on disk) and
+    the Codex backend (its registry and dead marks) — whichever are built. tmux keeps none: a tmux
+    session's identity is its NAME, held by tmux itself. Read directly, never through
+    Sessions.backend_for: ownership routes by owns(), and owns() is False for exactly the records that
+    decide a landing mail's fate — an SDK reg that is absent or unreadable, a Codex session marked
+    dead — so those sids fall to tmux, whose send accepts anything."""
+    return [b for b in (_sdk(), _codex()) if b]
+
+
+def _pr_watch_end_marker(sid):
+    """What the durable records say about `sid`, independent of ownership. True from the first
+    backend whose record is an explicit end marker (an SDK reg with alive=false, a Codex session
+    marked dead — both written at session end); False when a record says the session stands; None
+    when no backend holds a record (no reg file at all, or a name-shaped tmux sid), a durable fact:
+    the SDK backend never unlinks a reg, and a reg that exists but would not read is RAISED by its
+    reader, never answered None (review find, 2026-09-08);
+    _PR_WATCH_UNREAD when a reader raised and no other backend answered — a reader's fault can
+    neither end nor clear a watch. A durable end marker IS authority, where a liveness probe is not,
+    so the tick reads it BEFORE any send: a notice addressed to a uuid no backend holds live must
+    never fall to tmux and read as accepted."""
+    sid = str(sid)
+    raised = False
+    for be in _pr_watch_record_backends():
+        fn = getattr(be, "end_marker", None)
+        if not fn:
+            continue
+        try:
+            m = fn(sid)
+        except Exception:
+            raised = True
+            continue
+        if m is not None:
+            return bool(m)
+    return _PR_WATCH_UNREAD if raised else None
+
+
+def _pr_watch_refusal(r, sid):
+    """Classify a send that `sid`'s backend just REFUSED by return: ("ended", why) or ("wait", why),
+    from the durable records (_pr_watch_end_marker), never from a liveness probe: a slow `tmux
+    list-sessions` or a swallowed live_sessions error reads as an EMPTY live set, and an empty set
+    must never end a watch or divert its mail. An explicit end marker → ended. A record that says
+    alive → wait (the refusal was something else). No record → ended, on the first read: an absent
+    reg is a durable fact (the backend never unlinks one), and the three-check count that once stood
+    here approximated the event the readers now report themselves, since a reg that exists but would
+    not read RAISES (review find, 2026-09-08). A record that could not be read → wait, uncounted: a
+    reader's fault never ends a watch."""
+    sid = str(sid)
+    m = _pr_watch_end_marker(sid)
+    if m is True:
+        return "ended", "its record says it ended"
+    if m is False:
+        return "wait", "its record says it is alive, yet the send was refused"
+    if m == _PR_WATCH_UNREAD:
+        return "wait", "its record could not be read"
+    return "ended", "no record of the session"
+
+
+def _pr_watch_contact_sid(target):
+    """The escalation contact's sid, or "" when `target` cannot be resolved this tick. A sid is taken
+    as-is (a uuid, or a tmux session name the names registry knows). A NAME resolves first through
+    _sid_of — which for an SDK/Codex session reads the LIVE SET, the probe this module distrusts —
+    and, when that hands the name back unchanged, through the durable record the SDK backend keeps:
+    its regs carry the session's name (SdkBackend.sid_for_name: exactly one alive reg with that name,
+    else nothing). Unresolved is "": the caller WAITS and says so once, and never counts it toward
+    ending — a name the live set failed to list is not a session that ended, and a send to a bare
+    name would fall to tmux, whose send accepts anything."""
+    try:
+        tsid = _sid_of(target)
+    except Exception:
+        tsid = target
+    if tsid != target or _name_of(tsid):
+        return tsid
+    for be in _pr_watch_record_backends():
+        fn = getattr(be, "sid_for_name", None)
+        if not fn:
+            continue
+        try:
+            hit = fn(target)
+        except Exception:
+            hit = ""
+        if hit:
+            return str(hit)
+    return ""
+
+
+def _pr_watch_undelivered_once(r, reason, line):
+    """A notice the row could not place, said once per REASON per kernel run — stderr and the Log —
+    so a retrying row is visible without a line every 60 s, a changed reason (a contact that stopped
+    answering, a record that turned) is said once more, and a repeated one stays silent. The set of
+    reasons said is what the closing notice reads: a story that opened on the Log closes on it.
+    Filed under the bell's `refused` kind, like every notice this module could not place and every
+    state file it could not write: a mute on the machine-sync kind must not hide a fault (review
+    find, 2026-09-08)."""
+    said = r.setdefault("_undelivered", set())
+    if reason in said:
+        return
+    said.add(reason)
+    sys.stderr.write(line + "\n")
+    _sync_notice(line, ok=False, kind="refused")
+
+
+def _pr_watch_deliver_stamped(r, verdict, detail, now=None):
+    """Deliver a watch's ONE terminal mail and say whether the row is SETTLED; the tick retires the
+    row only on True. The order is STAMP → decide from the records → send → classify a refusal →
+    retire. The verdict is written into the row (`sent`/`sentDetail`) and SAVED before anything
+    else, so the file always says whether a delivery was attempted; a stamp that does not land never
+    delivers (with the mail out and the stamp lost, a crash before the retire would replay the row at
+    boot as a fresh verdict and mail it again with no way to say so).
+
+    Then the durable records (_pr_watch_end_marker, every record-holding backend, ownership aside):
+    an explicit end marker means the registrant has ENDED — no send, straight to the contact leg.
+    No record at all splits on the sid's SHAPE, a structural fact of the backends: SDK and Codex
+    sids are uuids, tmux sids are session NAMES. A uuid nobody holds is not sent — routed to tmux it
+    would be "accepted" by a shell that never existed — and has ENDED, decided on the first read: no
+    reg file is a durable fact (the SDK backend never unlinks one), and a reg that exists but would
+    not read is a reader's fault its reader RAISES, so the three-check count that once stood here
+    approximated an event the readers now report (review find, 2026-09-08). A name-shaped sid with no
+    record is a tmux registrant and is sent as ever; tmux's send never refuses (a missing session is
+    reported only on stderr, in its own thread), so a dead tmux registrant's notice still reads as
+    accepted — the gap that stood before this change stands, stated, and a liveness probe is not its
+    fix. Otherwise the SEND goes first — the backend's own send path handles what no live set can show
+    (a dormant reg it wakes, a comment thread that SdkBackend.live_sessions never lists) — and only a
+    send REFUSED by return is classified (_pr_watch_refusal): "wait" keeps the stamp and the row for
+    the next tick, said once per reason on the Log, with no repeat warning (a known failure, nothing
+    landed); "ended" takes the contact leg. A PARK counts as acceptance (an account-wide hold or a
+    queue ahead parks the notice for the drain, whose be.send return is dropped) — pre-existing, and
+    the refusal signal now exists for a follow-up.
+
+    The contact leg: the escalation contact (per-watch `escalate` or the box default) resolved by
+    _pr_watch_contact_sid, then the same records-first order — its end marker, its shape, a send,
+    its refusal classified — worded for the contact and logged where it went. An UNRESOLVED contact
+    name is waited on, said once, with the awaiting box showing the mail pending (a name the live set
+    failed to list is not a session that ended), and the wait is BOUNDED (review find, 2026-09-08): a
+    name that never resolves (mistyped, or a box default naming a session nobody starts again) kept
+    the row armed forever, one tmux fork per tick with the once-said Log row its only trace. The wait
+    starts at the first unresolved tick (runtime, like _fails: a restart re-arms it, which only
+    lengthens the wait) and ends at PR_WATCH_ESCALATE_S, the bound this module already keeps for
+    waiting on the named contact. Only when the registrant has ended AND no contact can take it (none
+    named, the same session, ended or unrecorded too, or unresolved past the bound) does the row
+    retire LOUDLY: one stderr line and one Log row under the bell's `refused` kind (a notice that
+    could not be placed is a fault, like a state file that could not be written), naming repo#n, why
+    the registrant counts as ended, and why no contact could. Never silently; the waits left
+    open-ended are a record that says alive yet refuses the send, and a record that could not be
+    read, each ending on its own event (the send taken, the read healed, the record turning into an
+    end marker). A row whose refusals were logged and is then delivered files one ok row closing the
+    story. A stamped row that outlives a RESTART goes out with the notice saying it may repeat, and a
+    loud retire of such a row says a copy may have gone out."""
+    if r.get("sent") != verdict:
+        r["sent"], r["sentDetail"] = verdict, detail
+        if not _pr_watches_save():
+            r.pop("sent", None)
+            r.pop("sentDetail", None)
+            return False
+    now = time.time() if now is None else float(now)
+    sid, ref, replay = str(r["sid"]), "%s#%s" % (r["repo"], r["pr"]), bool(r.get("_replay"))
+    said_before = bool(r.get("_undelivered"))
+    m = _pr_watch_end_marker(sid)
+    if m is True:
+        state, why = "ended", "its record says it ended"
+    elif m is None and _PR_WATCH_UUID_RE.fullmatch(sid):
+        state, why = "ended", "no record of the session"
+    else:
+        if _pr_watch_deliver(sid, _pr_watch_notice(verdict, r["repo"], r["pr"], detail, replay=replay)):
+            if said_before:
+                _sync_notice("pr-watches: the %s notice for %s reached session %s after the earlier refusal"
+                             % (verdict, ref, sid[:8]))
+            return True
+        state, why = _pr_watch_refusal(r, sid)
+        held = "was not accepted by session %s (%s)" % (sid[:8], why)
+    if state == "wait":
+        _pr_watch_undelivered_once(r, why, "pr-watches: the %s notice for %s %s — the watch stays armed and "
+                                           "retries every %ds" % (verdict, ref, held, PR_WATCH_EVERY))
+        return False
+    ended = "the session that registered the watch (%s) has ended (%s)" % (sid[:8], why)
+    target = str(r.get("escalate") or _watch_escalate_default() or "").strip()
+    tsid = _pr_watch_contact_sid(target) if target else ""
+    if tsid and tsid != sid:
+        tm = _pr_watch_end_marker(tsid)
+        if tm is True:
+            tstate, twhy = "ended", "its record says it ended"
+        elif tm is None and _PR_WATCH_UUID_RE.fullmatch(tsid):
+            tstate, twhy = "ended", "no record of the contact"
+        else:
+            if _pr_watch_deliver(tsid, _pr_watch_notice(verdict, r["repo"], r["pr"], detail, replay=replay,
+                                                        ended_owner=sid)):
+                _sync_notice("pr-watches: the %s notice for %s went to %s%s — %s"
+                             % (verdict, ref, target, " after the earlier refusal" if said_before else "", ended))
+                return True
+            tstate, twhy = _pr_watch_refusal(r, tsid)
+            held = "was not accepted by the escalation contact %s (%s)" % (target, twhy)
+        if tstate == "wait":
+            _pr_watch_undelivered_once(r, twhy, "pr-watches: the %s notice for %s %s; %s — retrying every %ds"
+                                                % (verdict, ref, held, ended, PR_WATCH_EVERY))
+            return False
+        contact = "its escalation contact %s has ended too (%s)" % (target, twhy)
+    elif target and tsid == sid:
+        contact = "its escalation contact is that same session"
+    elif target:
+        # unresolved: WAIT, said once (a name the live set failed to list is not a session that ended;
+        # the name shows as pending in the awaiting box), BOUNDED at PR_WATCH_ESCALATE_S from the first
+        # unresolved tick: a name that never resolves is not a wait but a drop with nobody told, and
+        # the loud retire below is what tells them (review find, 2026-09-08)
+        since = r.setdefault("_unresolvedAt", now)
+        if now - since < PR_WATCH_ESCALATE_S:
+            _pr_watch_undelivered_once(r, "contact unresolved",
+                                       "pr-watches: the %s notice for %s is waiting — %s, and its escalation contact "
+                                       "%s does not resolve to a session; retrying every %ds until it does, for up to %dh"
+                                       % (verdict, ref, ended, target, PR_WATCH_EVERY, PR_WATCH_ESCALATE_S // 3600))
+            return False
+        contact = ("its escalation contact %s did not resolve to a session for %dh"
+                   % (target, max(1, int((now - since) // 3600))))
+    else:
+        contact = "no escalation contact is named"
+    line = ("pr-watches: the %s notice for %s could not be delivered — %s and %s; the watch is dropped%s"
+            % (verdict, ref, ended, contact,
+               " (a copy may have gone out before the last restart)" if replay else ""))
+    sys.stderr.write(line + "\n")
+    _sync_notice(line, ok=False, kind="refused")
+    return True
+
+
 def _pr_watch_tick(now):
-    """One supervisor-pass sweep over the registered watches (rate-gated per row)."""
+    """One supervisor-pass sweep over the registered watches (rate-gated per row). Every retiring
+    notice goes through _pr_watch_deliver_stamped, and a row retires only on its True."""
     with _pr_watch_lock:
         rows = list(_pr_watches)
     done = []
     for r in rows:
         if now < r.get("_next", 0):
             continue
+        if r.get("sent"):
+            # a filed verdict whose mail is still owed (a refused injection, or a restart between the
+            # stamp and the retire): deliver THAT, never re-derive it from gh — the stamp is the event
+            if _pr_watch_deliver_stamped(r, r["sent"], str(r.get("sentDetail") or ""), now=now):
+                done.append(r)
+            else:
+                r["_next"] = now + PR_WATCH_EVERY
+            continue
         verdict, detail = _pr_watch_read(r["pr"], r["repo"])
         if verdict == "error":
             r["_fails"] = int(r.get("_fails") or 0) + 1
             r["_next"] = now + PR_WATCH_EVERY
             if r["_fails"] >= PR_WATCH_MAX_FAILS:
-                _pr_watch_deliver(r["sid"], _pr_watch_notice("error", r["repo"], r["pr"], detail))
-                done.append(r)
+                if _pr_watch_deliver_stamped(r, "error", detail, now=now):
+                    done.append(r)
             continue
         r["_fails"] = 0
         if verdict is None:
@@ -17069,14 +17386,16 @@ def _pr_watch_tick(now):
                     _pr_watch_deliver(tsid, _pr_watch_stalled_notice(r, now))
             r["_next"] = now + PR_WATCH_EVERY
             continue
-        _pr_watch_deliver(r["sid"], _pr_watch_notice(verdict, r["repo"], r["pr"], detail))
-        done.append(r)
+        if _pr_watch_deliver_stamped(r, verdict, detail, now=now):
+            done.append(r)
+        else:
+            r["_next"] = now + PR_WATCH_EVERY
     if done:
         with _pr_watch_lock:
             for r in done:
                 if r in _pr_watches:
                     _pr_watches.remove(r)
-        _pr_watches_save()
+        _pr_watches_save()       # a retire that fails to land replays at boot, told (the _replay sentence)
 
 
 # ── kernel-owned GENERIC watches (T121 part 2, 2026-08-27): the pr-watch machinery, generalized —
@@ -17207,6 +17526,14 @@ def _watch_awaiting(sid):
             it["watchId"] = str(r["id"])
         items.append(it)
     for r in prs:
+        if r.get("sent"):
+            # the PR reached its verdict; what is owed now is the NOTICE (a refused injection, or a
+            # restart between the stamp and the retire) — the box says so instead of "to land"
+            what = "PR #%s (%s): %s — mail pending" % (
+                r.get("pr"), r.get("repo"), {"merged": "merged", "closed": "closed"}.get(r["sent"], "gh unreadable"))
+            descs.append(what)
+            items.append(_awaiting_item("watches", "pr:%s#%s" % (r.get("repo"), r.get("pr")), what, r.get("at")))
+            continue
         descs.append("PR #%s (%s) to land" % (r.get("pr"), r.get("repo")))
         items.append(_awaiting_item("watches", "pr:%s#%s" % (r.get("repo"), r.get("pr")),
                                     "PR #%s (%s)" % (r.get("pr"), r.get("repo")), r.get("at")))
@@ -24875,7 +25202,10 @@ def _send_or_park(be, sid, text, echo=None):
     at turn end (never folded into a send batch, which would bury it as text the same way).
 
     Returns True when PARKED, False when handed over now, so a route can tell its caller which: POST
-    /send answers `queued` and `romp send` prints it. An agent sending ITSELF a slash command from inside
+    /send answers `queued` and `romp send` prints it — and None when the backend REFUSED the handover
+    (be.send returned False: a session it no longer holds), which is falsy like a handover for the
+    callers that only ask "queued?" and distinct for the one that must know (a watch notice retires
+    only on acceptance). Nothing is echoed for a refused send: the session never got it. An agent sending ITSELF a slash command from inside
     its own turn otherwise read 'ok' and had no way to know the command was waiting for that turn to end
     (2026-09-03, a /clear that then never fired).
 
@@ -24899,7 +25229,8 @@ def _send_or_park(be, sid, text, echo=None):
         return True
     if _park_behind_queue(sid, op):
         return True
-    be.send(sid, text)
+    if be.send(sid, text) is False:
+        return None                                      # refused by the backend: not parked, not delivered
     if echo:
         _optimistic_echo(sid, text, author=echo)
     return False
@@ -42232,7 +42563,22 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, json.dumps({"ok": False, "error":
                         'no session answers to "%s"' % who}), "application/json")
                 esc = str(b.get("escalate") or "").strip()
-                row = add_pr_watch(prn, repo, tsid, escalate=esc)
+                row, fault = add_pr_watch(prn, repo, tsid, escalate=esc)
+                if fault:
+                    # the save failed (ENOSPC, EACCES, …). A fresh watch acknowledged now would be
+                    # forgotten at the next restart, so nothing is registered; a watch that already
+                    # STANDS keeps standing and only the new escalation target is refused — two
+                    # different truths, told apart. The ok:false shape of the refusals above, plus
+                    # `retryable` (the disk, not the ask); the fault is the one THIS save raised.
+                    err = ("the watch on %s#%d stands, but the escalation target could not be saved (%s) — "
+                           "retry once romp's state directory takes writes again" % (repo, prn, fault)
+                           if row is not None else
+                           "the watch could not be saved (%s) — nothing is watching %s#%d; retry once romp's "
+                           "state directory takes writes again" % (fault, repo, prn))
+                    res = {"ok": False, "retryable": True, "error": err}
+                    if row is not None:
+                        res["watch"] = row
+                    return self._send(200, json.dumps(res), "application/json")
                 return self._send(200, json.dumps({"ok": True, "watch": row}), "application/json")
             if u.path == "/watch":
                 # Register a GENERIC predicate watch (T121 part 2): the kernel runs `cmd` on a

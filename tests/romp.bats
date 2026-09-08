@@ -160,6 +160,10 @@ for a in "$@"; do [[ "$a" == http* ]] && url="$a"; done
 if [[ -n "${MOCK_CURL_FAIL_SEND:-}" && "$url" == */send ]]; then exit 22; fi
 if [[ -n "${MOCK_CURL_FAIL_NEW:-}" && "$url" == */new ]]; then exit 7; fi
 if [[ -n "${MOCK_CURL_SEND_QUEUED:-}" && "$url" == */send ]]; then echo '{"ok": true, "queued": true}'; exit 0; fi
+if [[ -n "${MOCK_CURL_WATCH_PR_REFUSE:-}" && "$url" == */watch-pr ]]; then
+  echo '{"ok": false, "retryable": true, "error": "the watch could not be saved ([Errno 28] No space left on device) - nothing is watching TESTORG/testrepo#7; retry once the state directory takes writes again"}'
+  exit 0
+fi
 if [[ -n "${MOCK_CURL_NEW_400:-}" && "$url" == */new ]]; then
   for a in "$@"; do
     if [[ "$a" == "-f" || "$a" == -[!-]*f* ]]; then exit 22; fi
@@ -413,6 +417,18 @@ MOCK
     [[ "$output" == *"--session <name> required"* ]]
     run run_romp watch-pr
     [ "$status" -eq 2 ]
+}
+
+@test "watch-pr: a refused registration is relayed, never reported as watching" {
+    # the kernel refuses a watch whose save failed (ok:false, retryable): the CLI prints that
+    # refusal and exits non-zero — the caller must never read "watching" for a watch nobody holds
+    _stub_curl
+    touch "$MOCK_LOG"
+    export ROMP_SERVE_TOKEN=testtok
+    run env ROMP_SID=11111111-2222-3333-4444-555555555555 MOCK_CURL_WATCH_PR_REFUSE=1 "$ROMP_SCRIPT" watch-pr 7 --repo TESTORG/testrepo
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp watch-pr: refused — the watch could not be saved ([Errno 28]"* ]]
+    [[ "$output" != *"romp watch-pr: watching"* ]]
 }
 
 @test "tag: --rename rides the payload and counts as an edit" {
