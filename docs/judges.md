@@ -381,8 +381,11 @@ session does. A login-billed call passes `--settings '{"apiKeyHelper": ""}'`,
 which disables the helper for that one process, and gets back the login tokens
 the kernel claimed out of its own environment at boot. The same selection
 applies to standalone `romp-judge --once`. A helper that fails inside a judge's
-CLI fails that call with a credential error; it cannot silently use the login
-or a stale key. See [Service environment and
+CLI cannot silently use the login or a stale key; what the call files depends on
+how the CLI fails: a credential error the CLI reports within the call's 120 s
+alarm latches judge-auth-down below, and a call the CLI never answers (a helper
+that hangs, or a rejected key the CLI keeps retrying) is killed at the alarm and
+files as a timeout row. See [Service environment and
 credentials](reference.md#service-environment-and-credentials) for the helper's
 setup and the billing declaration.
 

@@ -455,7 +455,10 @@ into a session, a judge child or a tmux pane, runs no key command, reads no
 secret-manager reference, and keeps no key in `service.env`.
 
 A retired key path stops the kernel at boot. A `service.env` that still carries
-`ROMP_API_KEY_CMD`, `ROMP_API_KEY_REF` or `ANTHROPIC_API_KEY`, a
+`ROMP_API_KEY_CMD`, `ROMP_API_KEY_REF` or `ANTHROPIC_API_KEY`, or one of the
+1Password CLI's names (`OP_SERVICE_ACCOUNT_TOKEN`, `OP_CONNECT_HOST`,
+`OP_CONNECT_TOKEN`, `OP_ACCOUNT`, `OP_SESSION_*`: romp no longer runs `op`, and a
+helper that needs that token reads it from a file of its own), a
 `service.env.source` marker beside it, or a kernel environment that carries one
 of those names at boot is a boot failure: the kernel stops before anything is
 spawned, and the message names the file and the variable names, never a value,
@@ -526,7 +529,13 @@ and no surface of romp's fetches it.
     [Per-session billing](#per-session-billing-login-vs-api-key)). The kernel
     reads the files fresh on every check, so a helper added later counts at
     once; a settings file that cannot be read or parsed is a problem row in the
-    Log panel, and the box reads as having no helper until it reads.
+    Log panel, and the box reads as having no helper until it reads. A helper
+    set in the MANAGED file outranks the per-session layer, so no login pick can
+    disable it: on such a box the Billing picker offers no login choice and a
+    login pick is refused with that reason, never billed to the key quietly.
+    The kernel keeps the value its own two calls fetch only within the helper's
+    TTL: it is cleared when the TTL ends, when a run fails, and when the helper
+    is removed from the settings.
 
 3. Declare the billing in `service.env`: `ROMP_EXPECTED_AUTH=key`. On a box
    with a helper every session without a login pick bills the key, so the

@@ -6869,6 +6869,7 @@ class SdkBackend:
         #   key-billed one included. romp holds no API key (credentials.py, 2026-09-08).
         self._seed_skip_said = False              # the "remembered key pick set aside, no helper" row: once per process
         self._helper_read_said = False            # the "Claude Code settings unreadable" row: once per process
+        self._managed_login_said = False          # the "login pick cannot apply, managed helper" row: once per process
         # Backend PROBLEMS, kept in a bounded ring so the dashboard can show them (see _log): until
         # 2026-07-28 every SDK failure went to the kernel log alone, which nobody tails, so a session
         # whose stream died or whose model switch was refused just looked odd with no way to find out.
@@ -8292,19 +8293,36 @@ class SdkBackend:
         # every login form, so without this a login pick on a helper box would bill the key. A key pick, or
         # no pick, launches plain and the CLI runs the helper itself; romp injects no key, ever.
         login = sess.auth == "login"
+        keyed_box = self.key_available
+        if login and _cred.helper_source() == "managed":
+            # a MANAGED helper outranks the per-session layer in the CLI's precedence, so the suppression
+            # below cannot apply and this launch bills the key despite the pick: said, once per process,
+            # in the problem ring (set_auth refuses a new login pick on such a box; this is a pick that
+            # predates the managed helper). Never quiet (the user 2026-08-08: a session billing the wrong
+            # account must never pass silently).
+            if not self._managed_login_said:
+                self._managed_login_said = True
+                self._log("auth (%s): the login pick cannot apply, the apiKeyHelper is set in managed settings, "
+                          "which outrank the per-session layer; the session bills the key" % sess.name, problem=True)
         fs = flag_settings_path(self.state_dir, sess.sid,
                                 ultracode=(sess.effort or "") == "ultracode", fast=sess.fast_opt,
                                 env=env_vars, no_helper=login, log=self._log)
         if fs:
             kw["settings"] = fs
-        if login:
-            kw["env"] = dict(kw["env"], **startup_auth_env())   # the login tokens claimed at boot ride a login launch
-        else:
-            kw["env"] = dict(kw["env"], **helper_fast_org_env(self._log, sess.cwd))
         # What the launch MEANT, for _note_auth_source's per-init check: keyed when the box's helper will
         # bill the key for this session; an explicit key pick with no helper anywhere leaves the CLI to
         # decide, and a login landing then is the pick contradicted.
-        launch_keyed = not login and self.key_available
+        launch_keyed = not login and keyed_box
+        if login or (sess.auth != "key" and not keyed_box):
+            # The login tokens claimed at boot ride every launch that bills the login: a login pick, and an
+            # unpicked session on a box with no helper (its effective billing IS the login, and the judges'
+            # login path restores the same tokens; review 2026-09-08: the first cut restored them for the
+            # explicit pick only, and a login box carrying its token in the manager environment lost auth
+            # for unpicked sessions). A key-billed launch, picked or by the box's helper, gets no token: a
+            # bearer would outrank the helper in the CLI's precedence.
+            kw["env"] = dict(kw["env"], **startup_auth_env())
+        else:
+            kw["env"] = dict(kw["env"], **helper_fast_org_env(self._log, sess.cwd))
         sess._launched_keyed = launch_keyed
         sess._launched_unkeyed_pick = sess.auth == "key" and not launch_keyed
         return ClaudeAgentOptions(**kw)
@@ -10126,6 +10144,12 @@ class SdkBackend:
             return False
         if value == "key" and not self.key_available:
             return False   # no apiKeyHelper on this box: the UI never offers this; refuse rather than half-apply
+        if value == "login" and _cred.helper_source() == "managed":
+            # a managed helper outranks the per-session layer, so a login pick could not disable it and the
+            # session would bill the key despite the pick: refuse, and say why (review 2026-09-08)
+            self._log("auth: a login pick cannot apply on this box, the apiKeyHelper is set in managed settings, "
+                      "which outrank the per-session layer; remove it there to bill the login", problem=True)
+            return False
         if value == "login" and not self.login_ok():
             # the SAME bar the key side always had (T124: set_auth accepted 'login' unconditionally,
             # so on a login-less box the pick sat in the UI as applied fact while the reconnect

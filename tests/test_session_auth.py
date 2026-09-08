@@ -82,6 +82,10 @@ class _Keyed(unittest.TestCase):
         sb._fetch_key_fast_org = lambda key: None
         sb._FAST_ORG_VERDICTS.clear()
         sb._cred.forget_helper_key()
+        self._managed_before = sb._cred.managed_settings_path         # a bare run must not read the box's managed file
+        sb._cred.managed_settings_path = lambda: os.path.join(self.cfg, "no-managed-settings.json")
+        self._tokens_before = sb._STARTUP_AUTH_ENV
+        sb._STARTUP_AUTH_ENV = {}                                     # no login token claimed unless a test stages one
         if self.KEY:
             _stage_helper(self.cfg, self.KEY)
         self.be = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None)
@@ -90,6 +94,8 @@ class _Keyed(unittest.TestCase):
         sb._fetch_key_fast_org = self._fetch_before
         sb._FAST_ORG_VERDICTS.clear()
         sb._cred.forget_helper_key()
+        sb._cred.managed_settings_path = self._managed_before
+        sb._STARTUP_AUTH_ENV = self._tokens_before
         os.environ["CLAUDE_CONFIG_DIR"] = self._cfg_before
         os.environ.pop("ROMP_EXPECTED_AUTH", None)
         if self._exp_auth_before is not None:
@@ -194,6 +200,42 @@ class OptionsInjection(_OptionsHarness):
         s2 = self._sess(4, auth="login")
         self._options_kw(s2)
         self.assertFalse(s2._launched_keyed)
+
+    def test_the_claimed_login_tokens_ride_every_launch_that_bills_the_login(self):
+        """The kernel claims ANTHROPIC_AUTH_TOKEN and CLAUDE_CODE_OAUTH_TOKEN out of its environment at boot;
+        they ride a login pick AND an unpicked session on a box with no helper (its billing IS the login, and
+        the judges' login path restores the same tokens), never a key-billed launch (a bearer outranks the
+        helper). Review 2026-09-08: the first cut restored them for the explicit pick only."""
+        sb._STARTUP_AUTH_ENV = {"CLAUDE_CODE_OAUTH_TOKEN": "synthetic-login-token"}
+        kw = self._options_kw(self._sess(1, auth="login"))
+        self.assertEqual(kw["env"].get("CLAUDE_CODE_OAUTH_TOKEN"), "synthetic-login-token", "a login pick")
+        kw = self._options_kw(self._sess(2))
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", kw["env"], "unpicked on a helper box: the key, no bearer beside it")
+        kw = self._options_kw(self._sess(3, auth="key"))
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", kw["env"], "a key pick")
+        self._no_helper()
+        kw = self._options_kw(self._sess(4))
+        self.assertEqual(kw["env"].get("CLAUDE_CODE_OAUTH_TOKEN"), "synthetic-login-token",
+                         "unpicked on a helper-less box: the login is what it bills, so its token rides")
+        kw = self._options_kw(self._sess(5, auth="key"))
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", kw["env"], "an explicit key pick meant the key even here")
+        self.assertNotIn("ANTHROPIC_API_KEY", kw["env"])
+
+    def test_a_login_pick_cannot_apply_under_a_managed_helper_and_says_so(self):
+        """A managed helper outranks the per-session layer in the CLI's precedence, so a login pick could not
+        disable it: set_auth refuses with the reason, and a pick that predates the managed helper is said once
+        at launch, never billed quietly (review 2026-09-08)."""
+        managed = os.path.join(self.cfg, "managed.json")
+        Path(managed).write_text(json.dumps({"apiKeyHelper": os.path.join(self.cfg, "helper.sh")}))
+        sb._cred.managed_settings_path = lambda: managed
+        sid = self.be.spawn("n", "/tmp")
+        self.assertFalse(self.be.set_auth(sid, "login"))
+        rows = [p["text"] for p in self.be.problems(10) if "managed settings" in p["text"]]
+        self.assertEqual(len(rows), 1, "refused with the reason, in the problem ring")
+        self._options_kw(self._sess(6, auth="login"))
+        self._options_kw(self._sess(7, auth="login"))
+        rows = [p["text"] for p in self.be.problems(20) if "cannot apply" in p["text"] and "bills the key" in p["text"]]
+        self.assertEqual(len(rows), 1, "a pre-existing login pick is said once at launch")
 
     def test_a_key_pick_with_no_helper_anywhere_leaves_the_cli_to_decide(self):
         """An explicit key pick on a box with no helper launches plain and records that it MEANT the key
@@ -462,14 +504,23 @@ class Availability(unittest.TestCase):
 
     def setUp(self):
         self.real_sdk, self.real_acct, self.real_label = km._sdk, km._claude_account, km._claude_account_label
+        self.real_source = km.jd._cred.helper_source
 
     def tearDown(self):
         km._sdk, km._claude_account, km._claude_account_label = self.real_sdk, self.real_acct, self.real_label
+        km.jd._cred.helper_source = self.real_source
 
-    def _world(self, key, acct, label="user@example.com"):
+    def _world(self, key, acct, label="user@example.com", managed=False):
         km._sdk = lambda: type("B", (), {"key_available": bool(key)})()
         km._claude_account = lambda: acct
         km._claude_account_label = lambda: (label if acct else "")
+        km.jd._cred.helper_source = lambda: ("managed" if managed else ("user" if key else None))
+
+    def test_a_managed_helper_removes_the_login_choice(self):
+        self._world(FAKE_KEY, "aaaaaaaaaaaa", managed=True)
+        a = km._auth_avail()
+        self.assertEqual((a["login"], a["key"]), (False, True), "no per-session layer can disable a managed helper")
+        self.assertFalse(km._auth_both())
 
     def test_both_gates_the_selector_and_no_key_material_travels(self):
         self._world(FAKE_KEY, "aaaaaaaaaaaa")

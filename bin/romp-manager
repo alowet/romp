@@ -601,14 +601,24 @@ function runManager() {
 // claude` would read a leftover ANTHROPIC_API_KEY from there even though the kernel refuses to boot on the
 // same variable (kernel/credentials.py check_boot_environment). The manager is what receives service.env
 // (systemd's EnvironmentFile=, bin/romp-node-launch), so this is the check that covers the tmux path.
+// The retired provider variables, then the 1Password CLI's own names (the retired reference kind read
+// them; romp no longer runs op, and a token left here would ride into every pane): kernel/credentials.py
+// RETIRED_VARS, OP_ENV_NAMES and OP_ENV_PREFIX, mirrored.
 const RETIRED_CREDENTIAL_NAMES = ['ROMP_API_KEY_CMD', 'ROMP_API_KEY_REF', 'ANTHROPIC_API_KEY'];
+const OP_ENV_NAMES = ['OP_SERVICE_ACCOUNT_TOKEN', 'OP_CONNECT_HOST', 'OP_CONNECT_TOKEN', 'OP_ACCOUNT'];
+const OP_ENV_PREFIX = 'OP_SESSION_';
 function retiredCredentialNames(env) {
-  return RETIRED_CREDENTIAL_NAMES.filter((k) => Object.prototype.hasOwnProperty.call(env, k));
+  const has = (k) => Object.prototype.hasOwnProperty.call(env, k);
+  return RETIRED_CREDENTIAL_NAMES.filter(has)
+    .concat(Object.keys(env).filter((k) => OP_ENV_NAMES.includes(k) || k.startsWith(OP_ENV_PREFIX)).sort());
 }
 function retiredCredentialMessage(names) {
+  const op = names.some((k) => OP_ENV_NAMES.includes(k) || k.startsWith(OP_ENV_PREFIX))
+    ? ' The 1Password CLI\'s names go too: romp no longer runs op, and a helper that needs that token reads it from a file of its own.'
+    : '';
   return `romp-manager did NOT start: its environment carries ${names.join(', ')}. romp no longer holds an API key ` +
     '(a key romp holds is a key a session can print). Remove the line from service.env (and any exported variable), ' +
-    'configure apiKeyHelper in Claude Code\'s settings, declare the billing with ROMP_EXPECTED_AUTH=key, then start again.';
+    'configure apiKeyHelper in Claude Code\'s settings, declare the billing with ROMP_EXPECTED_AUTH=key, then start again.' + op;
 }
 function withoutOpCredentials(env) {
   return Object.assign({}, env);

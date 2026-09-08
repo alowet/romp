@@ -82,12 +82,12 @@ def service_env_path() -> str:
     return os.path.join(base, "romp", "service.env")
 
 
-def env_file_assignments(text, names) -> dict:
-    """The literal NAME=VALUE assignments in an env file's text for the given names: the last assignment
-    wins, one layer of matching quotes is stripped (systemd strips one too), comments and blank lines are
-    skipped. Never sourced, never expanded."""
+def env_file_assignments(text, names=None) -> dict:
+    """The literal NAME=VALUE assignments in an env file's text for the given names (every name when None):
+    the last assignment wins, one layer of matching quotes is stripped (systemd strips one too), comments
+    and blank lines are skipped. Never sourced, never expanded."""
     out = {}
-    want = set(names)
+    want = set(names) if names is not None else None
     for raw in str(text or "").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -96,7 +96,7 @@ def env_file_assignments(text, names) -> dict:
             line = line[len("export "):].lstrip()
         name, sep, value = line.partition("=")
         name = name.strip()
-        if not sep or name not in want:
+        if not sep or not name or (want is not None and name not in want):
             continue
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
@@ -105,9 +105,17 @@ def env_file_assignments(text, names) -> dict:
     return out
 
 
+def is_op_env_name(name) -> bool:
+    """The 1Password CLI's own credential names, the ones the retired reference kind read: romp no longer
+    runs `op`, so they are refused at boot like the provider variables (a token beside a retired line was
+    the documented shape, and a token left in the manager's environment would ride into every session)."""
+    return name in OP_ENV_NAMES or str(name).startswith(OP_ENV_PREFIX)
+
+
 def retired_in_env_file(path=None) -> list:
-    """The retired provider NAMES a service.env still assigns (an empty value counts: the line is what the
-    migration removes). [] for a missing file. An unreadable file is a boot failure in its own words."""
+    """The retired NAMES a service.env still assigns (an empty value counts: the line is what the migration
+    removes): the provider variables first, then the 1Password CLI's names. [] for a missing file. An
+    unreadable file is a boot failure in its own words."""
     p = path or service_env_path()
     try:
         with open(p, encoding="utf-8", errors="replace") as f:
@@ -117,8 +125,8 @@ def retired_in_env_file(path=None) -> list:
     except OSError as e:
         raise RuntimeError("%s: cannot read the service environment file (%s). romp did NOT start. Fix the "
                            "file's permissions, then start again." % (p, e.__class__.__name__))
-    found = env_file_assignments(text, RETIRED_VARS)
-    return [n for n in RETIRED_VARS if n in found]
+    found = env_file_assignments(text)
+    return [n for n in RETIRED_VARS if n in found] + sorted(n for n in found if is_op_env_name(n))
 
 
 def check_boot_environment(path=None, environ=None) -> None:
@@ -133,7 +141,7 @@ def check_boot_environment(path=None, environ=None) -> None:
     in_file = retired_in_env_file(p)
     marker = p + RETIRED_MARKER_SUFFIX
     has_marker = os.path.exists(marker)
-    in_env = [n for n in RETIRED_VARS if n in env]
+    in_env = [n for n in RETIRED_VARS if n in env] + sorted(n for n in env if is_op_env_name(n))
     if not (in_file or has_marker or in_env):
         return
     found = []
@@ -143,12 +151,15 @@ def check_boot_environment(path=None, environ=None) -> None:
         found.append("%s (the retired provider marker) exists" % marker)
     if in_env:
         found.append("the manager's environment carries %s" % ", ".join(in_env))
+    op_line = ("; the 1Password CLI's names (OP_SERVICE_ACCOUNT_TOKEN and the rest) go too, since romp no longer "
+               "runs op, and a helper that needs that token reads it from a file of its own"
+               if any(is_op_env_name(n) for n in in_file + in_env) else "")
     several = (len(in_file) + len(in_env) + int(has_marker)) > 1
     raise RuntimeError(
         "%s. romp no longer holds an API key (a key romp holds is a key a session can print), so romp did NOT "
-        "start. Remove %s, configure apiKeyHelper in Claude Code's settings (%s: {\"apiKeyHelper\": \"<a script "
+        "start. Remove %s%s, configure apiKeyHelper in Claude Code's settings (%s: {\"apiKeyHelper\": \"<a script "
         "that prints the key>\"}), declare the billing with ROMP_EXPECTED_AUTH=key in %s, then start again."
-        % ("; ".join(found), "them" if several else "it", os.path.join(claude_config_dir(), "settings.json"), p))
+        % ("; ".join(found), "them" if several else "it", op_line, os.path.join(claude_config_dir(), "settings.json"), p))
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +228,21 @@ def api_key_helper(cwd=None, operator_only=False):
     return None
 
 
+def helper_source():
+    """Which operator file defines the helper the box runs: "managed", "user", or None when neither defines a
+    non-empty one. A MANAGED helper outranks the per-session settings layer in the CLI's precedence, so a
+    login pick cannot disable it: the backend refuses the pick with that reason instead of billing the key
+    quietly (review 2026-09-08)."""
+    for label, p in (("managed", managed_settings_path()), ("user", os.path.join(claude_config_dir(), "settings.json"))):
+        d = _read_settings(p)
+        if d is None or HELPER_KEY not in d:
+            continue
+        v = d.get(HELPER_KEY)
+        if isinstance(v, str):
+            return label if v.strip() else None
+    return None
+
+
 def key_available() -> bool:
     """Whether this box has a key side: an apiKeyHelper is configured in the OPERATOR's settings (managed or
     user). Read, never run. A project's own .claude/settings.json may carry a helper too; Claude Code runs
@@ -276,7 +302,8 @@ def run_helper(cmd) -> str:
 
 
 _HELPER_LOCK = threading.Lock()
-_HELPER_MEMO = {"cmd": None, "value": "", "at": 0.0}    # in process memory only; forget_helper_key drops it
+_HELPER_MEMO = {"cmd": None, "value": "", "at": 0.0}    # in process memory only, and only within the TTL
+_HELPER_TIMER = [None]                                   # the expiry that clears the value when the TTL ends
 
 
 def helper_key(now=None) -> str:
@@ -288,18 +315,45 @@ def helper_key(now=None) -> str:
     rotated vault item is picked up within the TTL. `now` is a monotonic clock, injectable by tests."""
     cmd = api_key_helper(None, operator_only=True)
     if not cmd:
+        forget_helper_key()                  # the helper is gone: so is its value
         return ""
     now = time.monotonic() if now is None else now
+    ttl = helper_ttl_s()
     with _HELPER_LOCK:
         m = _HELPER_MEMO
-        if m["cmd"] == cmd and m["value"] and now - m["at"] < helper_ttl_s():
+        if m["cmd"] == cmd and m["value"] and now - m["at"] < ttl:
             return m["value"]
-    value = run_helper(cmd)
+    forget_helper_key()                      # expired, or another helper's: nothing stale is held while we run
+    try:
+        value = run_helper(cmd)
+    except CredentialError:
+        forget_helper_key()                  # a failed run leaves no value behind
+        raise
     with _HELPER_LOCK:
         _HELPER_MEMO.update(cmd=cmd, value=value, at=now)
+        # The value lives exactly as long as the CLI would keep its own copy: a timer forgets it at the TTL
+        # even if nothing asks again (the user's principle: romp holds no key material beyond what one call
+        # needs). Daemon, so it never holds the kernel open.
+        t = _HELPER_TIMER[0]
+        if t is not None:
+            t.cancel()
+        t = threading.Timer(ttl, _forget_if_still, args=(cmd, now))
+        t.daemon = True
+        _HELPER_TIMER[0] = t
+        t.start()
     return value
+
+
+def _forget_if_still(cmd, at) -> None:
+    with _HELPER_LOCK:
+        if _HELPER_MEMO["cmd"] == cmd and _HELPER_MEMO["at"] == at:
+            _HELPER_MEMO.update(cmd=None, value="", at=0.0)
 
 
 def forget_helper_key() -> None:
     with _HELPER_LOCK:
         _HELPER_MEMO.update(cmd=None, value="", at=0.0)
+        t = _HELPER_TIMER[0]
+        if t is not None:
+            t.cancel()
+            _HELPER_TIMER[0] = None

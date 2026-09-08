@@ -168,13 +168,23 @@ _scrub_key_source_env()
 os.environ.pop("ROMP_SUPERVISED", None)
 
 
+# No test may read the box's REAL managed settings (2026-09-08): credentials.py reads
+# /etc/claude-code/managed-settings.json (or the macOS path) as the top of Claude Code's precedence, so a
+# test asserting "no helper" would lie on a box whose administrator set one there. Every loaded copy of the
+# module is pointed at a path inside the temp state root that is never created; a test that wants a managed
+# file stubs managed_settings_path itself in setUp, after this fixture.
+_NO_MANAGED_SETTINGS = os.path.join(os.environ["XDG_STATE_HOME"], "no-such-managed-settings.json")
+
+
 def _reset_credential_state():
     """credentials.py memoizes the helper's value in process memory for its TTL; under one pytest process
-    that memo would leak between test modules. Every loaded copy of the module is reset."""
+    that memo would leak between test modules. Every loaded copy of the module is reset, and its managed
+    settings path floored (above)."""
     import sys
     for name, m in list(sys.modules.items()):
         if "credentials" in name and hasattr(m, "forget_helper_key"):
             m.forget_helper_key()
+            m.managed_settings_path = lambda: _NO_MANAGED_SETTINGS
 
 
 @pytest.fixture(autouse=True)

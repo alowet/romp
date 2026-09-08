@@ -316,20 +316,24 @@ class CredentialErrorNote(_JudgeAuthBase):
         self.assertEqual(jd._credential_error_note(RuntimeError("synthetic-sensitive-output")),
                          "API credential source failed")
 
-    def test_a_failed_billing_resolution_pauses_the_call_and_latches_the_settings_file(self):
-        jd._judge_ctx.fsid = SID
+    def test_unreadable_settings_bill_the_login_and_say_so_once(self):
+        """_judge_auth raises nothing for a settings fault: an unreadable Claude Code settings file reads as
+        no helper, so unpicked calls bill the login, and the judge says so once per process on stderr (the
+        SDK backend says the same once in its problem ring); never a silent fall to the other account
+        (review 2026-09-08)."""
+        import io
+        from contextlib import redirect_stderr
+        jd._SETTINGS_UNREADABLE_SAID.clear()
         exc = jd._cred.CredentialError("Claude Code settings file cannot be read: /synthetic/settings.json")
-        with patch.object(jd, "_judge_engine", return_value="claude"), \
-                patch.object(jd, "_judge_auth", side_effect=exc), \
-                patch.object(jd.subprocess, "run") as run, \
-                patch.object(jd, "_log_judge_error") as log:
-            self.assertEqual(jd._judge_run("sonnet", "SYS", "input", judge="planner"), "")
-        run.assert_not_called()
-        self.assertTrue(jd._judge_ctx.paused, "a configuration outage must not consume summary give-up attempts")
-        row = jd._auth_down_map()[SID]
-        self.assertEqual(row["mode"], "key")
-        self.assertEqual(row["note"], str(exc))
-        self.assertEqual(log.call_args.args[2], "auth")
+        with patch.object(jd._cred, "key_available", side_effect=exc):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(jd._judge_auth(SID), "login")
+                self.assertEqual(jd._judge_auth(SID), "login")
+        self.assertIn("cannot be read: /synthetic/settings.json", err.getvalue())
+        self.assertIn("bill the login until it reads", err.getvalue())
+        self.assertEqual(err.getvalue().count("romp-judge:"), 1, "said once per process")
+        jd._SETTINGS_UNREADABLE_SAID.clear()
 
     def test_an_unexpected_env_failure_never_quotes_its_cause_and_never_falls_back_to_ambient_auth(self):
         private_output = "synthetic-sensitive-provider-output"

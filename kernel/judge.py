@@ -1088,11 +1088,17 @@ def _key_available():
     in the operator's settings, managed or user (credentials.key_available: read, never run). romp holds no key of
     its own since 2026-09-08 (the user, after a contributor PR's test printed a key from a session's
     environment); the child resolves the helper itself. An unreadable settings file reads as no helper here;
-    the SDK backend says so once in its problem ring."""
+    said once per process on stderr (the SDK backend says the same once in its problem ring)."""
     try:
         return _cred.key_available()
-    except _cred.CredentialError:
+    except _cred.CredentialError as e:
+        if not _SETTINGS_UNREADABLE_SAID:
+            _SETTINGS_UNREADABLE_SAID.add(True)
+            sys.stderr.write("romp-judge: %s; judge calls without an explicit pick bill the login until it reads\n" % e)
         return False
+
+
+_SETTINGS_UNREADABLE_SAID = set()   # the unreadable-settings line: once per process, never silent
 
 
 def _login_auth_env():

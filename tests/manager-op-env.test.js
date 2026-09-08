@@ -16,8 +16,7 @@ process.env.ROMP_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'romp-mgr-op-
 const mgr = require(path.join(__dirname, '..', 'bin', 'romp-manager'));
 const { withoutOpCredentials, retiredCredentialNames, retiredCredentialMessage } = mgr;
 
-const ENV = { PATH: '/usr/bin', HOME: '/nonexistent', ANTHROPIC_AUTH_TOKEN: 'synthetic-bearer', OP_ACCOUNT: 'acct',
-              ROMP_EXPECTED_AUTH: 'key' };
+const ENV = { PATH: '/usr/bin', HOME: '/nonexistent', ANTHROPIC_AUTH_TOKEN: 'synthetic-bearer', ROMP_EXPECTED_AUTH: 'key' };
 
 test('the tmux start environment is a plain copy: nothing scrubbed, nothing mutated', () => {
   const out = withoutOpCredentials(ENV);
@@ -40,6 +39,18 @@ test('a retired provider variable in the environment is named, never valued, and
   }
   assert.deepEqual(retiredCredentialNames({ ...ENV, ANTHROPIC_API_KEY: '', ROMP_API_KEY_REF: 'op://v/i/f' }),
                    ['ROMP_API_KEY_REF', 'ANTHROPIC_API_KEY'], 'an empty value is still the variable');
+});
+
+test('the 1Password CLI names are refused like the provider variables, and the message says why', () => {
+  const clean = { PATH: '/usr/bin', HOME: '/nonexistent', ROMP_EXPECTED_AUTH: 'key' };
+  assert.deepEqual(retiredCredentialNames(clean), []);
+  const found = retiredCredentialNames({ ...clean, OP_SERVICE_ACCOUNT_TOKEN: 'synthetic-op-token', OP_SESSION_acct: 'synthetic-session' });
+  assert.deepEqual(found, ['OP_SERVICE_ACCOUNT_TOKEN', 'OP_SESSION_acct']);
+  const msg = retiredCredentialMessage(found);
+  assert.match(msg, /did NOT start/);
+  assert.match(msg, /OP_SERVICE_ACCOUNT_TOKEN/);
+  assert.match(msg, /no longer runs op/);
+  assert.doesNotMatch(msg, /synthetic-/, 'names only');
 });
 
 test('startManager refuses before the tmux server starts (source pin: the check is its first statement)', () => {

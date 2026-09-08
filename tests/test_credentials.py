@@ -18,6 +18,7 @@ import json
 import os
 import stat
 import tempfile
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -130,6 +131,19 @@ class SettingsPrecedence(_Settings):
         self.assertEqual(cred.api_key_helper(self.cwd), "/u/helper.sh", "null is not defined here: the CLI reads on")
         self.assertFalse(cred.project_helper_differs(self.cwd))
 
+    def test_helper_source_names_the_operator_file_that_defines_it(self):
+        self.assertIsNone(cred.helper_source())
+        self._write("user", {"apiKeyHelper": "/u/helper.sh"})
+        self.assertEqual(cred.helper_source(), "user")
+        self._write("managed", {"apiKeyHelper": "/m/helper.sh"})
+        self.assertEqual(cred.helper_source(), "managed", "managed outranks user, and no per-session layer can disable it")
+        self._write("managed", {"apiKeyHelper": ""})
+        self.assertIsNone(cred.helper_source(), "a managed disable is no helper at all")
+        self._write("project", {"apiKeyHelper": "/p/helper.sh"})
+        self.assertIsNone(cred.helper_source(), "a project's helper is not the operator's")
+        self.assertEqual(cred.settings_files("/nonexistent/one", operator_only=True),
+                         cred.settings_files("/nonexistent/two", operator_only=True), "cwd-independent")
+
     def test_the_kernel_acts_only_on_the_operators_helper(self):
         """The kernel reads a project's settings to know what the CLI will do, but never RUNS a helper a
         repository checked in (review 2026-09-08): its own calls use the managed or user helper only."""
@@ -169,6 +183,28 @@ class HelperRun(_Settings):
         cred.forget_helper_key()
         cred.helper_key(now=1000.0 + 302.0)
         self.assertEqual(_runs(marker), 3)
+
+    def test_the_value_is_held_only_within_the_ttl(self):
+        """romp holds no key material beyond what one call needs (the user): the memo clears at expiry on its
+        own, a failed re-run leaves nothing behind, and a helper removed from the settings takes its value."""
+        script, marker = _helper_script(tempfile.mkdtemp())
+        self._write("user", {"apiKeyHelper": script})
+        with patch.dict(os.environ, {"CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "150"}):
+            self.assertEqual(cred.helper_key(), HELPER_OUT)
+            self.assertEqual(cred._HELPER_MEMO["value"], HELPER_OUT, "held within the TTL")
+            time.sleep(0.5)
+            self.assertEqual(cred._HELPER_MEMO["value"], "", "cleared at expiry with nobody asking")
+        self.assertEqual(cred.helper_key(now=0.0), HELPER_OUT)
+        script2, _ = _helper_script(tempfile.mkdtemp(), "h.sh", body="#!/bin/sh\nexit 1\n")
+        self._write("user", {"apiKeyHelper": script2})
+        with self.assertRaises(cred.CredentialError):
+            cred.helper_key(now=1.0)
+        self.assertEqual(cred._HELPER_MEMO["value"], "", "a failed run leaves no value behind")
+        self._write("user", {"apiKeyHelper": script})
+        self.assertEqual(cred.helper_key(now=2.0), HELPER_OUT)
+        self._write("user", {"permissions": {}})
+        self.assertEqual(cred.helper_key(now=3.0), "", "the helper is gone")
+        self.assertEqual(cred._HELPER_MEMO["value"], "", "and so is its value")
 
     def test_the_ttl_is_the_clis_variable_in_milliseconds(self):
         script, marker = _helper_script(tempfile.mkdtemp())
@@ -250,6 +286,22 @@ class BootCheck(unittest.TestCase):
             self.assertIn("did NOT start", msg)
             self.assertIn("apiKeyHelper", msg)
             self.assertIn("ROMP_EXPECTED_AUTH=key", msg)
+
+    def test_the_1password_names_are_refused_in_the_file_and_the_environment(self):
+        """The retired reference kind read the 1Password CLI's token beside it; romp no longer runs op, and a
+        token left in service.env would ride into every session and the tmux server (review 2026-09-08)."""
+        self._file("ROMP_EXPECTED_AUTH=key\nOP_SERVICE_ACCOUNT_TOKEN=synthetic-value-never-printed\nOP_SESSION_acct=synthetic-2\n")
+        with self.assertRaises(RuntimeError) as cm:
+            cred.check_boot_environment(self.p, environ={})
+        msg = str(cm.exception)
+        self.assertIn("OP_SERVICE_ACCOUNT_TOKEN, OP_SESSION_acct", msg)
+        self.assertIn("no longer runs op", msg)
+        self.assertNotIn("synthetic", msg)
+        self._file("ROMP_EXPECTED_AUTH=key\n")
+        with self.assertRaises(RuntimeError) as cm:
+            cred.check_boot_environment(self.p, environ={"OP_CONNECT_TOKEN": "synthetic-value-never-printed"})
+        self.assertIn("the manager's environment carries OP_CONNECT_TOKEN", str(cm.exception))
+        cred.check_boot_environment(self.p, environ={"OPENAI_API_KEY": "not ours", "OPTION": "x"})   # the prefix is exact
 
     def test_the_marker_alone_stops_the_kernel(self):
         self._file("ROMP_EXPECTED_AUTH=key\n")

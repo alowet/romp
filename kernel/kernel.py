@@ -14049,7 +14049,7 @@ def _auth_both():
     """True when this machine offers BOTH billing choices (a signed-in login and a manager-env key) —
     the condition for the per-session auth selector to exist anywhere (picker, gear). Cheap per-push:
     _claude_account is mtime-cached and the key is an attribute read."""
-    return _auth_key_present() and bool(_claude_account())
+    return _auth_key_present() and bool(_claude_account()) and jd._cred.helper_source() != "managed"
 
 
 def _auth_avail():
@@ -14073,7 +14073,10 @@ def _auth_avail():
     default = d.get("auth") if d.get("auth") in ("login", "key") else ("key" if key else "login")
     if default == "key" and not key:
         default = "login"
-    return {"login": bool(_claude_account()), "key": key,
+    # a MANAGED helper outranks the per-session layer, so no login pick could apply there: the login side is
+    # not offered on such a box (set_auth refuses it too, with the reason; review 2026-09-08)
+    login_ok = bool(_claude_account()) and jd._cred.helper_source() != "managed"
+    return {"login": login_ok, "key": key,
             "acct": _claude_account_label(), "default": default}
 
 

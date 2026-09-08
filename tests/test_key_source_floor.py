@@ -69,6 +69,12 @@ class KeySourceFloor(unittest.TestCase):
         self.assertIn("\n_scrub_key_source_env()\n", head, "the import-time floor, before any test module loads")
         self.assertIn("    _scrub_key_source_env()\n", body, "the per-test re-assert")
 
+    def test_conftest_floors_the_managed_settings_path_per_test(self):
+        src = open(os.path.join(HERE, "conftest.py")).read()
+        self.assertIn("m.managed_settings_path = lambda: _NO_MANAGED_SETTINGS", src,
+                      "a box's real managed settings must never make a 'no helper' test lie")
+        self.assertIn("no-such-managed-settings.json", src)
+
     def test_the_floor_holds_for_a_bare_run_under_a_configured_shell(self):
         """A subprocess whose environment carries a synthetic value under EVERY name on the list, plus an
         OP_SESSION_ name, runs only this module's behavioural check, which passes only if conftest's floor
