@@ -339,11 +339,13 @@ class ThreadProjection(CommentBase):
                 aline(t + 110, "Jitter prevents thundering herds.", "ca1", parent="cu1"),
                 aline(t + 111, "It also spreads retries across the window.", "ca2", parent="ca1")]
 
-    def _seed_thread(self, records=None, seen=None):
-        self._write(THREAD, records or self._thread_records())
+    def _seed_thread(self, records=None, seen=None, last_sid=None):
+        """`last_sid` names the transcript the reg points at when it is not the thread sid itself: what a
+        resume (a new fsid) or a /clear leaves behind. The default is the fresh fork, lastSid == sid."""
+        self._write(last_sid or THREAD, records or self._thread_records())
         (jd.SDKDIR / (THREAD + ".json")).write_text(json.dumps(
             {"sid": THREAD, "name": "thread-x", "cwd": self.cdir,
-             "lastSid": THREAD, "alive": True, "threadOf": PARENT}))
+             "lastSid": last_sid or THREAD, "alive": True, "threadOf": PARENT}))
         km._save_comments(PARENT, {"threads": [
             {"tid": THREAD, "sid": THREAD, "anchorUuid": "a1", "cutUuid": "a1",
              "exact": "exponential backoff", "status": "open",
@@ -376,6 +378,67 @@ class ThreadProjection(CommentBase):
             km._views_dirty[0] = time.time() + 1       # a kernel-side optimistic mutation rebuilds too
             km._comments_frame(PARENT)
             self.assertEqual(len(calls), n1 + 2)
+        finally:
+            km.build_session = real
+            km._views_dirty[0] = 0.0
+            km._built_thread.clear()
+
+    def test_a_build_that_raises_stores_nothing_and_the_next_frame_rebuilds(self):
+        # a transient read fault mid-build must not be served as the thread's (empty) events: nothing is stored
+        # for it, the next frame builds again, and that good build is what gets served (review 2026-09-08)
+        self._seed_thread()
+        km._built_thread.clear()
+        km._views_dirty[0] = 0.0
+        calls = []
+        real = km.build_session
+
+        def flaky(sid, now, tm=None, **kw):
+            calls.append(sid)
+            if calls.count(THREAD) == 1 and sid == THREAD:
+                raise OSError(errno.EIO, "a transient read fault")
+            return real(sid, now, tm, **kw)
+
+        km.build_session = flaky
+        try:
+            fr1 = km._comments_frame(PARENT)
+            self.assertEqual(calls.count(THREAD), 1, "premise: the first frame built the thread once, and it raised")
+            self.assertEqual(fr1["threads"][0]["events"], [], "the raised build reads as no events this frame")
+            self.assertNotIn(THREAD, km._built_thread, "a raised build stores nothing")
+            km._comments_frame(PARENT)
+            self.assertEqual(calls.count(THREAD), 2, "the next frame rebuilds")
+            self.assertIn(THREAD, km._built_thread, "the good build is cached")
+            km._comments_frame(PARENT)
+            self.assertEqual(calls.count(THREAD), 2, "and served from then on")
+        finally:
+            km.build_session = real
+            km._views_dirty[0] = 0.0
+            km._built_thread.clear()
+
+    def test_a_states_write_under_the_thread_sid_rebuilds_a_thread_whose_lastsid_moved(self):
+        # After a resume or a /clear the reg's lastSid names a NEW transcript while the backend keeps writing the
+        # thread's state rows under the romp sid; keyed on the transcript's fsid alone, a states-only write (an
+        # interrupt settle's idle row, a retry marker) changed the events with no key change (review 2026-09-08)
+        resumed = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
+        self._seed_thread(last_sid=resumed)
+        km._built_thread.clear()
+        km._views_dirty[0] = 0.0
+        calls = []
+        real = km.build_session
+        km.build_session = lambda sid, now, tm=None, **kw: (calls.append(sid), real(sid, now, tm, **kw))[1]
+        try:
+            km._comments_frame(PARENT)
+            n1 = calls.count(THREAD)
+            self.assertGreaterEqual(n1, 1, "premise: the first frame builds the thread from the resumed transcript")
+            km._comments_frame(PARENT)
+            self.assertEqual(calls.count(THREAD), n1, "premise: served while nothing moved")
+            states = jd.STATE / "states" / (THREAD + ".jsonl")
+            states.parent.mkdir(parents=True, exist_ok=True)
+            with open(states, "a") as fh:
+                fh.write(json.dumps({"t": self.now, "state": "idle"}) + "\n")
+            km._comments_frame(PARENT)
+            self.assertEqual(calls.count(THREAD), n1 + 1, "a states-only write under the thread's own sid rebuilds")
+            km._comments_frame(PARENT)
+            self.assertEqual(calls.count(THREAD), n1 + 1, "and is served again afterwards")
         finally:
             km.build_session = real
             km._views_dirty[0] = 0.0

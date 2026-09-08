@@ -11299,11 +11299,22 @@ def _working_notes():
     # Read once per directory VERSION (2026-09-08): GET /sessions is polled about once a second by the
     # postal services of every live session, and each call re-read every note file; the key is every
     # entry's (name, mtime_ns, size, ino), so a rewritten or removed note misses exactly.
+    entries = []
     try:
         with os.scandir(WORKING_DIR) as it:
-            entries = sorted((e.name, e.path, e.stat().st_mtime_ns, e.stat().st_size, e.stat().st_ino) for e in it)
+            for e in it:
+                try:
+                    st = e.stat()
+                except OSError:
+                    continue        # unlinked between readdir and stat (a clear, an atomic write's temp renamed
+                    #                 away): that note is gone and the others still stand. One try around the whole
+                    #                 listing returned {} here instead, so for that call every live session read as
+                    #                 owning nothing, which the postal contract takes as free ownership (review
+                    #                 2026-09-08). The idiom is _task_store_fp's.
+                entries.append((e.name, e.path, st.st_mtime_ns, st.st_size, st.st_ino))
     except OSError:
         return {}
+    entries.sort()
     key = tuple((n, m, s, i) for n, _p, m, s, i in entries)
     hit = _working_notes_memo[0]
     if hit is not None and hit[0] == key:
@@ -12766,7 +12777,19 @@ def _thread_events(tsid, cut_uuid, now, tmux):
     try:
         base = _chat_build_sig(sess, tm)
         asig = _active_chat_sig(sess, tm, now, base=base) if base is not None else None
-        key = ("exact", asig) if asig is not None else (("stat", base) if base is not None else None)
+        sig = ("exact", asig) if asig is not None else (("stat", base) if base is not None else None)
+        if sig is not None:
+            # plus the thread's OWN state rows (review 2026-09-08): the backend writes states/<tsid>.jsonl under
+            # the romp sid, while the key above stats states/<fsid>.jsonl for the reg's lastSid (_sdk_sess hands
+            # over no anchor). The two are one file only until a resume mints a new fsid or a /clear moves
+            # lastSid; after that a states-only write (an interrupt settle's idle row, a retry marker, an
+            # orphan-reply salvage) changed the thread's events with no key change. None when absent.
+            try:
+                ss = os.stat(jd.STATESDIR / (tsid + ".jsonl"))
+                states = (ss.st_mtime_ns, ss.st_size, ss.st_ino)
+            except OSError:
+                states = None
+            key = sig + (states,)
     except Exception:
         key = None                              # an input we cannot key → build, never cache
     hit = _built_thread.get(tsid)
@@ -24688,8 +24711,9 @@ def _task_store_dir(fsid):
 
 
 _task_dir_hint = {}   # fsid → content-joined store dir NAME (see _task_store_resolve); reset per kernel run
-_task_join_miss = {}  # fsid → the fold pairs that failed to join — skip re-scanning until the pairs CHANGE
-#                       (event-based retry: new task activity reshapes the fold; a kernel restart clears both)
+_task_join_miss = {}  # fsid → (fold pairs, tasks-root listing) that failed to join: skip re-reading the stores
+#                       until EITHER changes (event-based retry: new task activity reshapes the fold, a store
+#                       appearing or gaining a file reshapes the root listing; a kernel restart clears both)
 
 
 def _task_store_known(fsid):
@@ -24723,7 +24747,10 @@ def _task_store_resolve(fsid, fold):
     the session's OWN record of creating the tasks: the transcript fold's (id, subject) pairs. A
     candidate store that contains them ALL is the session's store; no match or SEVERAL matches → None,
     and the caller stays loud (never guess). The join runs at most once per session per kernel run
-    (_task_dir_hint caches the winner)."""
+    (_task_dir_hint caches the winner). A MISS is remembered too (_task_join_miss), keyed on the pairs and
+    on the tasks root's listing (each store dir's name and mtime_ns): the root scan and a stat per dir run
+    on every call, cheap; the per-file reads are what the memo saves. A miss that a read fault produced (a
+    store listing that failed, a task file mid-rewrite) is never remembered, so the next call retries."""
     d = _task_store_known(fsid)
     if d is not None:
         return d
@@ -24731,23 +24758,38 @@ def _task_store_resolve(fsid, fold):
              if t.get("subject") and str(t["id"]).isdigit()}   # synthetic cN ids (no 'Task #N' result) can't join
     if not pairs:
         return None
-    if _task_join_miss.get(fsid) == pairs:
-        return None                                            # same fold already failed to join → no re-scan
     try:
         cands = [e for e in os.scandir(_task_store_dir(fsid).parent) if e.is_dir()]
     except OSError:
         return None
+    # The root's listing rides the memo's key beside the pairs (review 2026-09-08): a dir's mtime moves when a
+    # file is added or removed inside it, and the set of names moves when a store APPEARS, which Claude Code
+    # does a moment after the TaskCreate the fold already saw. Keyed on the pairs alone, the miss held until
+    # the next TaskCreate or a kernel restart (status updates never change the pairs), and the todo card
+    # showed the store as unreadable for the rest of the session.
+    root_key = []
+    for e in cands:
+        try:
+            root_key.append((e.name, e.stat().st_mtime_ns))
+        except OSError:
+            root_key.append((e.name, None))
+    root_key = tuple(sorted(root_key))
+    if _task_join_miss.get(fsid) == (pairs, root_key):
+        return None                                # the same fold under the same root already failed → no re-read
     hits = []
+    faulted = False                                # a store we could not read whole: the verdict is not evidence
     for e in cands:
         have = set()
         try:
             names = [n for n in os.listdir(e.path) if n.endswith(".json")]
         except OSError:
+            faulted = True
             continue
         for n in names:
             try:
                 t = json.loads((Path(e.path) / n).read_text())
             except (OSError, ValueError):
+                faulted = True                     # a task file mid-rewrite: its pair is missing from `have`
                 continue
             if isinstance(t, dict):
                 have.add((str(t.get("id") or n.rsplit(".", 1)[0]), str(t.get("subject") or "")))
@@ -24757,8 +24799,11 @@ def _task_store_resolve(fsid, fold):
         # the negative memo the gate above reads (2026-09-08): it was declared and consulted since the join
         # landed but never WRITTEN, so a session whose store cannot be joined re-read and re-decoded every
         # store under the tasks root on every build (39 dirs, 301 files here) — for every comment thread,
-        # every cycle. Same fold pairs → same verdict until the fold changes (the docstring's own rule).
-        _task_join_miss[fsid] = pairs
+        # every cycle. Same fold pairs under the same root listing → same verdict until either changes. A
+        # miss a read fault produced is TRANSIENT and is not remembered: remembered, it latched as a
+        # permanent miss until the fold next changed (review 2026-09-08).
+        if not faulted:
+            _task_join_miss[fsid] = (pairs, root_key)
         return None
     _task_join_miss.pop(fsid, None)
     _task_dir_hint[fsid] = hits[0]
@@ -38392,14 +38437,17 @@ def _push(targets, connect=False, tmux=None):
             # …and every fold entry for a sid no longer shown (loadOlder / connect-push builds) — EXCEPT the
             # comment THREADS the loop below is about to rebuild (2026-09-08): evicting their prefixes here
             # made every thread build a cold reshape of the fork's whole copied history, every cycle. The
-            # keep set is what last cycle's comments loop touched; a thread that stops being built (resolved,
-            # promoted, its parent closed) ages out of it after one cycle and is evicted as before.
+            # keep set is what LAST cycle's comments loop touched, swapped in here, BEFORE the eviction: with
+            # the swap after it the set consulted was two cycles old, so a thread first built in cycle N was
+            # evicted once more in N+1 and a stopped thread lingered a cycle longer (review 2026-09-08). A
+            # thread that stops being built (resolved, promoted, its parent closed) ages out of the set after
+            # one cycle and is evicted as before.
+            _thread_fold_keep[0], _thread_fold_keep[1] = _thread_fold_keep[1], set()
             keep = shown_sids | _thread_fold_keep[0]
             with _chat_fold_lock:
                 for sid in list(_chat_fold):
                     if sid not in keep:
                         _chat_fold.pop(sid, None)
-            _thread_fold_keep[0], _thread_fold_keep[1] = _thread_fold_keep[1], set()
             _retry_parked_creates()   # lag-parked comment creates ride every pusher cycle (T106)
             # COMMENT THREADS: one {type:"comments"} frame per session that has ever had one (its
             # comments/ store exists — an ~free stat for everyone else). Each frame rides its OWN
