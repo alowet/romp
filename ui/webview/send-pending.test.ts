@@ -229,11 +229,56 @@ test("a send pressed while an earlier send's echo is the newest event is placed 
   const lost: TailEvent[] = [...tail, { kind: "user", md: "older", uuid: "echo:9", undelivered: true, ts: isoAt(S - 5) }];
   const p = press(lost, "newer");
   assert.deepEqual(injectionGroups(lost, reconcilePending(lost, p).inject), [{ idx: 2, sends: [p[0]] }]);
-  // a user event stamped AFTER the press is a later send: the bubble stays above it
+  // a user event that arrives AFTER the press is a later send: the bubble stays above it
   const later: TailEvent[] = [...tail, { kind: "user", md: "someone else's later message", uuid: "u7", ts: isoAt(S + 30) }];
   const q = newPending("mine", undefined, T0);
   reconcilePending(tail, [q]);                                  // pressed against the tail before u7 arrived
   assert.deepEqual(injectionGroups(later, reconcilePending(later, [q]).inject), [{ idx: 1, sends: [q] }]);
+});
+
+test("the placement floor is the last user event AT THE PRESS, by identity, never a clock (second review)", () => {
+  // a press-time frame already proves precedence: every event resident at the press is older than the send. Comparing
+  // the client's press second with the kernel host's stamps re-inverted the order whenever the kernel clock led by more
+  // than the gap between two presses (a phone, a remote browser), and misplaced a bubble below a later-received event
+  // when the client clock led. So the press records the last user event's uuid (an echo counts) as the floor.
+  const isoAt = (s: number) => new Date(s * 1000).toISOString();
+  const S = Math.floor(T0 / 1000);
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1", ts: isoAt(S - 30) }];
+  // kernel host 3 s AHEAD: the first send's echo is stamped after the second press's second
+  const echoed: TailEvent[] = [...tail, { kind: "user", md: "first", uuid: "echo:1", ts: isoAt(S + 3) }];
+  const second = newPending("second", undefined, T0);
+  let r = reconcilePending(echoed, [second]);
+  assert.equal(second.at?.place, "echo:1", "the floor is recorded at the press");
+  assert.deepEqual(injectionGroups(echoed, r.inject), [{ idx: 2, sends: [second] }], "below the echo, whatever the clocks say");
+  // the echo → landed swap: the floor's uuid is gone, the landed atom carries its text — still the floor
+  const landedFirst: TailEvent[] = [...tail, { kind: "user", md: "first", uuid: "u1", absorbed: true, ts: isoAt(S + 3) }, { kind: "tool", uuid: "t1" }];
+  r = reconcilePending(landedFirst, [second]);
+  assert.deepEqual(injectionGroups(landedFirst, r.inject), [{ idx: 2, sends: [second] }], "below the landed first message, above the later tool");
+  // client clock AHEAD: a peer's message the kernel receives after the press, stamped at or before the press second,
+  // was not resident at the press — the bubble stays above it
+  const peerLater: TailEvent[] = [...tail, { kind: "user", md: "a peer's message", uuid: "u9", ts: isoAt(S - 1) }];
+  const mine = newPending("mine", undefined, T0);
+  reconcilePending(tail, [mine]);
+  assert.deepEqual(injectionGroups(peerLater, reconcilePending(peerLater, [mine]).inject), [{ idx: 1, sends: [mine] }]);
+  // no user event at the press: no floor, the anchor rules
+  const bare = press(tail, "alone");
+  assert.equal(bare[0].at?.place, null);
+  assert.deepEqual(injectionGroups(tail, reconcilePending(tail, bare).inject), [{ idx: 1, sends: [bare[0]] }]);
+  // a LATE entry (pressed against no frame) reads the frame's own stamps for its floor, like its anchor
+  const lateFrame: TailEvent[] = [...tail, { kind: "user", md: "older", uuid: "echo:5", ts: isoAt(S - 2) }, { kind: "user", md: "newer", uuid: "echo:6", ts: isoAt(S + 2) }];
+  const late: PendingSend = { ...newPending("late one", undefined, T0), late: true };
+  reconcilePending(lateFrame, [late]);
+  assert.equal(late.at?.place, "echo:5", "the last user event the kernel stamped before the press");
+  assert.doesNotMatch(read("send-pending.ts").split("export function placementIndex(")[1].split("\n}")[0], /eventSecond|pressS|p\.ts/, "placement reads no clock");
+});
+
+test("a bubble that changes slot marks the view stale, so the incremental repaint never trusts a shifted prefix (second review)", () => {
+  // chatTail lowers v.rendered to the kernel index and the normal-mode append path re-renders from there, assuming
+  // the DOM prefix still matches s.events — which also requires the bubble's SLOT to be unchanged. The settle
+  // signature therefore carries each group's slot beside its texts.
+  const fn = RENDER.split("function reconcileOptimistic(")[1].split("\nfunction ")[0];
+  assert.match(fn, /settle\(groups\.flatMap\(\(g\) => g\.sends\.map\(\(p\) => g\.idx \+ ":" \+ p\.text\)\)\);/);
+  assert.match(fn, /const groups = injectionGroups\(s\.events as TailEvent\[\], inject\);/);
 });
 
 test("queuedCopyToHide: the newest not-yet-hidden copy of the text, never a copy the kernel marked non-cancelable", () => {
@@ -267,7 +312,7 @@ test("the kernel's queued copy at the tail is hidden for a send drawn in place �
 });
 
 test("render.ts draws the bubble at its slot, strips its own injections before applying kernel indices, and carries no header or cue", () => {
-  assert.match(RENDER, /for \(const g of injectionGroups\(s\.events as TailEvent\[\], inject\)\)\s*\n?\s*s\.events\.splice\(g\.idx, 0, \{ kind: "queued", bare: true, texts: g\.sends\.map\(mk\), uuid: OPT_PREFIX \+ g\.sends\[0\]\.ts/,
+  assert.match(RENDER, /const groups = injectionGroups\(s\.events as TailEvent\[\], inject\);\s*\n\s*for \(const g of groups\)\s*\n\s*s\.events\.splice\(g\.idx, 0, \{ kind: "queued", bare: true, texts: g\.sends\.map\(mk\), uuid: OPT_PREFIX \+ g\.sends\[0\]\.ts/,
     "the bare group is spliced at the slot, never pushed at the tail");
   assert.doesNotMatch(RENDER, /s\.events\.push\(\{ kind: "queued", bare: true/, "no tail push remains");
   assert.match(RENDER, /function stripOptimistic\(s: Session\): void \{/, "one strip, used by every ingest path");
@@ -532,7 +577,7 @@ test("a send pressed against no frame (a placeholder tab): the first frame's cop
   // a first frame that predates the send entirely stamps exactly as a press-time stamp would
   list = [late()];
   reconcilePending([frame[0], frame[1]], list);
-  assert.deepEqual(list[0].at, { after: "a1", seen: ["u-old"], queued: 0 });
+  assert.deepEqual(list[0].at, { after: "a1", place: "u-old", placeText: TEXT, seen: ["u-old"], queued: 0 });
   // a press-time stamp reads no stamp: its frame predates the press by construction, so an identical
   // message that landed within the press's own second is still background
   const prompt = press([frame[1], { kind: "user", md: TEXT, uuid: "u-same-second", ts: isoAt(Math.floor(T0 / 1000)) }], TEXT);
@@ -582,7 +627,7 @@ test("a late stamp presumes the first frame's newest queued copy of the text is 
   // follows covers it, exactly as at a press-time stamp
   const early = [late()];
   let r = reconcilePending([step], early);
-  assert.deepEqual(early[0].at, { after: "a1", seen: [], queued: 0 });
+  assert.deepEqual(early[0].at, { after: "a1", place: null, placeText: undefined, seen: [], queued: 0 });
   assert.equal(r.inject.length, 1);
   r = reconcilePending([step, { kind: "queued", texts: [{ md: TEXT }] }], early);
   assert.equal(r.inject.length, 1);

@@ -16,7 +16,9 @@
 // visible on — the durable record is the kernel's (a persisted echo, the dropped marking, the fed-text
 // guard in prune_live), but if it blinks, ours steps straight back in; a copy seen after the press also
 // proves the kernel RECEIVED that one send (`received`, attributed per send like a landing). Nothing here
-// reads a clock: the one comparison of stamps (a late stamp, stampBase) orders two events.
+// reads a clock for a press-time entry: the frame resident at the press is older than the send by
+// construction, so its anchor AND its placement floor are recorded by identity; only a LATE stamp (stampBase)
+// compares stamps to order events.
 //
 // THE ANCHOR (2026-09-06 review): every decision is read from the events AFTER the send, never from a
 // count of tail events. At the first reconcile after the press the entry records the uuid of the last
@@ -34,6 +36,12 @@
 
 export type SendBase = {
   after: string | null;   // uuid of the last stable kernel event at the press; null → nothing to anchor on, scan from the head
+  place: string | null;   // PLACEMENT FLOOR: uuid of the last USER event at the press, an echo included (T252 second
+                          //   review) — older than this send, so the bubble is drawn below it; the anchor skips echoes
+                          //   (not a stable place to bound the landing scan), but for placement an echo is exactly the
+                          //   earlier send the bubble must follow. null → no user event at the press, the anchor rules
+  placeText?: string;     // that event's text: when its uuid leaves (the echo → landed swap), the landed atom carrying
+                          //   the same text after the anchor is the floor
   seen: string[];         // uuids of the user events carrying the text that are background for this send: what
                           //   the press found, and what an earlier same-text entry claimed since — ONE ENTRY PER
                           //   COPY (a record of several sends lists its uuid once per spoken-for block)
@@ -210,6 +218,11 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
   const beforeSend = (e: TailEvent): boolean => { const s = eventSecond(e); return s === null || s < pressS; };
   let after: string | null = null;
   for (let i = events.length - 1; i >= 0; i--) if (stableUuid(events[i]) && beforeSend(events[i])) { after = events[i].uuid!; break; }
+  let place: string | null = null, placeText: string | undefined;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.kind === "user" && e.uuid && !isOptimisticUuid(e.uuid) && beforeSend(e)) { place = e.uuid; placeText = typeof e.md === "string" ? e.md : undefined; break; }
+  }
   const seen: string[] = [];
   let queued = 0;
   for (const e of events) {
@@ -221,7 +234,7 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
   // the queued presumption (above): a late stamp's newest `own` copies are this press's, so the count of
   // background copies stops short of them — at zero when the frame lists fewer than presumed (the kernel
   // had not received every press yet; the copies still to come cover those entries in order)
-  return { after, seen, queued: Math.max(0, queued - (p.late ? own : 0)) };
+  return { after, place, placeText, seen, queued: Math.max(0, queued - (p.late ? own : 0)) };
 }
 
 /** The first index AFTER the send's anchor — or 0 when there is no anchor, or when the anchor has left the
@@ -365,22 +378,26 @@ export function injectionGroups(events: TailEvent[], inject: PendingSend[]): Inj
   return [...byIdx.entries()].sort((x, y) => y[0] - x[0]).map(([idx, sends]) => ({ idx, sends }));
 }
 
-/** The slot for one send: after its scan anchor, and after every USER event the kernel stamped at or before
- *  the press — an earlier send's echo atom, a never-delivered bubble, a landed atom — which the anchor rule
- *  skips (an echo is not a stable place to bound the LANDING scan, since the landed atom replaces it under a
- *  new uuid) but which is older than this send all the same. Without this a second message pressed while the
- *  first's echo was the newest event sat ABOVE it until both landed (review of the first cut). The rule is the
- *  kernel's own: it places the absorbed atom by its send time, so the bubble sits where the atom will land.
- *  A user event stamped after the press is a later send and stays below the bubble. */
+/** The slot for one send: after its scan anchor, and after its PLACEMENT FLOOR — the last user event at the
+ *  press (an earlier send's echo atom, a never-delivered bubble, a landed atom), which the anchor rule skips
+ *  (an echo is not a stable place to bound the LANDING scan, since the landed atom replaces it under a new
+ *  uuid) but which is older than this send all the same. Without it a second message pressed while the
+ *  first's echo was the newest event sat ABOVE it until both landed (review of the first cut). The floor is
+ *  found by identity: its uuid, or — once the echo has become the landed atom — the last user event after
+ *  the anchor carrying its text. Never by comparing the client's clock with the kernel's stamps: the frame
+ *  resident at the press is older than the send by construction, and a clock comparison re-inverted the
+ *  order whenever the kernel clock led the client by more than the gap between two presses (second
+ *  review). A user event that arrives after the press is a later send and stays below the bubble. */
 export function placementIndex(events: TailEvent[], p: PendingSend): number {
   const at = p.at!;
   let idx = scanFrom(events, at);
-  const pressS = Math.floor(p.ts / 1000);
-  for (let j = events.length - 1; j >= idx; j--) {
-    const e = events[j];
-    if (e.kind !== "user" || isOptimisticUuid(e.uuid)) continue;
-    const s = eventSecond(e);
-    if (s !== null && s <= pressS) { idx = j + 1; break; }
+  if (!at.place) return idx;
+  for (let j = events.length - 1; j >= idx; j--) if (events[j].uuid === at.place) return j + 1;
+  if (at.placeText !== undefined) {
+    for (let j = events.length - 1; j >= idx; j--) {
+      const e = events[j];
+      if (e.kind === "user" && !isOptimisticUuid(e.uuid) && typeof e.md === "string" && sameText(e.md, at.placeText)) return j + 1;
+    }
   }
   return idx;
 }

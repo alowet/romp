@@ -381,10 +381,14 @@ function reconcileOptimistic(s: Session): void {
   // no "N queued messages" header to claim what we can't back. Groups come highest slot first, so each
   // splice leaves the lower slots valid. A copy hidden out of a HELD kernel group (a usage limit holds
   // every send) hands its reason to our bubble, so the wait still says what it is waiting for.
-  for (const g of injectionGroups(s.events as TailEvent[], inject))
+  const groups = injectionGroups(s.events as TailEvent[], inject);
+  for (const g of groups)
     s.events.splice(g.idx, 0, { kind: "queued", bare: true, texts: g.sends.map(mk), uuid: OPT_PREFIX + g.sends[0].ts,
                                 held: g.sends.map((p) => heldBy.get(p)).find((h) => !!h) });
-  settle(inject.map((p) => p.text));
+  // the signature carries each group's SLOT beside its texts: chatTail repaints from the kernel index it was
+  // handed, trusting the DOM prefix — which also needs the bubble's slot unchanged. A slot that moves (a floor
+  // event arriving) marks the view stale, so the window is rebuilt (second review).
+  settle(groups.flatMap((g) => g.sends.map((p) => g.idx + ":" + p.text)));
 }
 
 // Undo our own injections wherever they sit — the bare groups we spliced in (T252: at their send slots, no
