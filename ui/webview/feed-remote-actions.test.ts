@@ -9,9 +9,11 @@ import * as path from "node:path";
 const FEED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.ts"), "utf8");
 
 test("every askClear send carries the card's sid (routes a remote clear to its kernel)", () => {
-  const sends = FEED.match(/type: "askClear"[^}]*/g) || [];
-  assert.ok(sends.length >= 4, `found ${sends.length} askClear sends — expected the 4 known sites (standalone card removed 2026-07-07)`);
-  for (const s of sends) assert.match(s, /sid: (it|m|mem)\.sid/, `askClear send missing sid: ${s}`);
+  // single-card clears post askClear; the group card, the modal's group clear and the session header post
+  // ONE askClearMany for the batch (2026-09-08) — every one of them carries the session id
+  const sends = FEED.match(/type: "askClear(?:Many)?"[^}]*/g) || [];
+  assert.ok(sends.length >= 5, `found ${sends.length} clear sends — expected the 5 known sites`);
+  for (const s of sends) assert.match(s, /,\s*sid(: (it|m|mem|cur|grp)\.sid)?\s*$/, `clear send missing sid: ${s}`);   // explicit or shorthand property
 });
 
 test("every showAskPath send carries a sid (a remote card's hover highlight routes to its kernel)", () => {

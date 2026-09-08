@@ -46077,6 +46077,20 @@ class Handler(BaseHTTPRequestHandler):
             _gesture_store_refusal(client, "clear", _clear_ask(msg["itemId"]))
             _send_to_app("chat", {"type": "dropCitation", "itemId": str(msg["itemId"]), "itemIds": _gone})
             _mark_views_dirty()                # cleared.jsonl is invisible to the fleet sig → dirty-rebuild now
+        elif msg and msg.get("type") == "askClearMany" and isinstance(msg.get("itemIds"), list):
+            # ONE batch for a multi-card gesture (the feed's session Clear and the ask-group Clear): one
+            # cleared.jsonl stamp, so ONE UndoClear restores the whole gesture. N single askClear posts
+            # stamped N batches, and Undo brought back only the last-posted card while the client had
+            # optimistically restored all N: N-1 phantom cards the kernel had archived (the review of the
+            # session Clear, 2026-09-08). Same citation drop as askClear, over every card's subtree.
+            _ids = [str(i) for i in msg["itemIds"] if i]
+            _gone = []
+            for _i in _ids:
+                _gone.extend(x for x in _subtree_item_ids(_i) if x not in _gone)
+            _gesture_store_refusal(client, "clear", _clear_all(_ids))
+            if _ids:
+                _send_to_app("chat", {"type": "dropCitation", "itemId": _ids[0], "itemIds": _gone})
+            _mark_views_dirty()
         elif msg and msg.get("type") == "quarantineDecision" and msg.get("mid"):
             # Human verdict on a DIRECTED peer's held message (per-host trust): approve delivers it
             # (optionally with human-edited text), deny drops it. The bus owns delivery + the held-message
