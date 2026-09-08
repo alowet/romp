@@ -593,14 +593,22 @@ export function mergeHostBars(perHost: Record<string, any>, hostSeq: readonly st
 export const REMOTE_STALE_MS = 30000;
 export const REMOTE_CONNECT_MS = 15000;
 export const REMOTE_REDIAL_MS = 8000;
+// A resumed keep is PROVISIONAL (review find, 2026-09-08), the pane shim's PROVISIONAL_MS byte for byte: 1.5
+// kernel keepalive periods (KEEPALIVE_S is 10 s, so 15 s: one beat may be in flight, two missing is silence).
+// The `resume` stamp (resumed() below) re-bases a socket the browser still holds OPEN, but the far end can
+// have died without a FIN reaching the browser (a laptop sleep across a network change, a tunnel whose local
+// end stays open), and only the kernel's next frame can tell; until one lands the watchdog runs at this bound
+// instead of REMOTE_STALE_MS.
+export const REMOTE_PROVISIONAL_MS = 15000;
 
 /** What the watchdog should do about ONE remote socket, from its state alone (pure, unit-tested):
  *  "close" — force-close so the onclose→redial chain runs (open but silent past the keepalive bound,
  *  or a hung handshake); "redial" — CLOSED with no fresh attempt: dial directly; "" — leave it be.
  *  `lastRecv` is stamped at open and on every frame, so an open socket's silence is measured from
- *  its own open, never from an earlier socket's traffic. */
-export function socketVerdict(readyState: number, lastRecv: number, connT: number, now: number): "close" | "redial" | "" {
-  if (readyState === 1) return now - (lastRecv || connT) > REMOTE_STALE_MS ? "close" : "";
+ *  its own open, never from an earlier socket's traffic. `staleMs` is the silence bound for an OPEN
+ *  socket: REMOTE_STALE_MS, or REMOTE_PROVISIONAL_MS while a resumed keep awaits its confirming frame. */
+export function socketVerdict(readyState: number, lastRecv: number, connT: number, now: number, staleMs = REMOTE_STALE_MS): "close" | "redial" | "" {
+  if (readyState === 1) return now - (lastRecv || connT) > staleMs ? "close" : "";
   if (readyState === 0) return now - connT > REMOTE_CONNECT_MS ? "close" : "";
   if (readyState === 3) return now - connT > REMOTE_REDIAL_MS ? "redial" : "";
   return "";
@@ -620,6 +628,7 @@ interface Conn {
   closed: boolean;
   live: boolean; // kernel reports this tunnel "up" — the only state in which its port is dialed
   lastRecv: number; // epoch ms of the last frame on the CURRENT socket (keepalives count); 0 = none yet
+  resumeProvisional: number; // the `resume` stamp lastRecv rests on until a frame confirms it (the watchdog runs at REMOTE_PROVISIONAL_MS meanwhile); 0 = confirmed, or no stamp
   connT: number;    // when the current socket's connect() attempt started — the watchdog's reference point
   // KERNEL_SETTING messages that arrived while this host's socket was down, newest per type only —
   // flushed on the socket's open event (sendRemote/flushPending). Bounded by construction: at most
@@ -631,6 +640,7 @@ interface Conn {
 export class FederationManager {
   app = "chat";
   private conns = new Map<string, Conn>();
+  private frozeAt = 0;   // the Page Lifecycle `freeze` before the current thaw: a socket already overdue at that moment is not stamped by resumed()
   private perHostOrder: Record<string, string[]> = {};
   private perHostTabs: Record<string, any[]> = {};
   private localViews: any = null;   // the LOCAL kernel's session-views blob, carried on merged tabOrder re-emits
@@ -685,8 +695,46 @@ export class FederationManager {
     // remote socket that is not open, or has gone quiet past the bound, is closed and redialed now
     // rather than waited out — the phone's re-foreground is exactly the audited case.
     try {
-      document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") this.watchdog(Date.now(), true); });
+      this.watchLifecycle(document);
     } catch (e) { /* no document — the node tests construct the manager bare */ }
+  }
+
+  /** The Page Lifecycle listeners on the document (public and parameterised so the tests install them
+   *  on a fake and fire the events in the browser's order). `freeze` → frozeAt; `resume` → resumed(); `visibilitychange`
+   *  to visible → the foreground watchdog pass, exactly as before. */
+  watchLifecycle(doc: { addEventListener(type: string, listener: () => void): void; readonly visibilityState: string }): void {
+    doc.addEventListener("freeze", () => { this.frozeAt = Date.now(); });
+    doc.addEventListener("resume", () => this.resumed(Date.now()));
+    doc.addEventListener("visibilitychange", () => { if (doc.visibilityState === "visible") this.watchdog(Date.now(), true); });
+  }
+
+  /** The Page Lifecycle `resume` event (the user 2026-09-07, whose dashboard froze every time they came
+   *  back to its tab): stamp every OPEN relay socket's lastRecv to now. A Chromium tab left in the
+   *  background is FROZEN — no JS runs at all — so no frame could stamp lastRecv even though the socket
+   *  stayed open and the kernel kept heartbeating. lastRecv therefore measured "JS did not run", not
+   *  "the socket went silent", and the foreground pass (watchdog(now, true), fired by visibilitychange
+   *  right after the thaw) read the frozen stretch as 30s+ of silence and abandoned+redialed EVERY
+   *  attached host on EVERY return — each redial a full resend from that kernel. Chromium fires
+   *  `resume` before `visibilitychange`, so the stamp lands first and socketVerdict (unchanged) sees a
+   *  fresh socket and keeps it; the frames queued during the freeze then dispatch on the same socket.
+   *  This re-BASES the measurement, it does not disarm it: a socket that stays silent after the thaw is
+   *  still put down by the regular tick, and sooner than REMOTE_STALE_MS (review find, 2026-09-08): an
+   *  OPEN readyState says only that the browser has seen no FIN, and a peer that died while the tab was
+   *  frozen leaves the socket looking exactly like a healthy one, so the stamp is PROVISIONAL
+   *  (resumeProvisional: the watchdog runs at REMOTE_PROVISIONAL_MS until a frame confirms it), and a
+   *  socket already overdue BEFORE the freeze is not stamped at all: its silence began while JS was
+   *  running, so that gap is real and the foreground pass redials it as it did before the stamp
+   *  existed. Only readyState 1 is stamped — a socket
+   *  still CONNECTING is a handshake the frozen tab never finished, and the foreground pass still kills
+   *  it. Where no `resume` fires (Firefox, Safari, a hidden-but-running tab) stale lastRecv IS real
+   *  silence, and today's instant abandon on foreground is unchanged. */
+  resumed(now: number): void {
+    for (const c of this.conns.values()) {
+      if (!c.ws || c.ws.readyState !== 1) continue;
+      if (this.frozeAt && this.frozeAt - (c.lastRecv || c.connT) > REMOTE_STALE_MS) continue;   // overdue before the freeze: real silence, no stamp
+      c.lastRecv = now;
+      c.resumeProvisional = now;
+    }
   }
 
   /** One pass of the remote-socket watchdog (public so the tests can tick it with their own clock):
@@ -696,7 +744,7 @@ export class FederationManager {
     for (const c of this.conns.values()) {
       if (c.closed || !c.ws) continue;
       const rs = c.ws.readyState;
-      let v = socketVerdict(rs, c.lastRecv, c.connT, now);
+      let v = socketVerdict(rs, c.lastRecv, c.connT, now, c.resumeProvisional ? REMOTE_PROVISIONAL_MS : REMOTE_STALE_MS);
       if (foreground && rs === 0) v = "close";
       if (v === "close") {
         // the same breadcrumb family as open/close/detach, so a "cards came back late" report reads
@@ -1089,7 +1137,7 @@ export class FederationManager {
     const w = dashboardWid();
     const url = `${proto}${location.host}/remote/${encodeURIComponent(host)}/ws?app=${encodeURIComponent(this.app)}&token=${encodeURIComponent(token)}`
       + (w ? `&wid=${encodeURIComponent(w)}` : "");
-    const conn: Conn = { host, ws: null, url, closed: false, live, lastRecv: 0, connT: 0, pending: new Map() };
+    const conn: Conn = { host, ws: null, url, closed: false, live, lastRecv: 0, resumeProvisional: 0, connT: 0, pending: new Map() };
     this.conns.set(host, conn);
     this.ensureHost(host);
     this.connect(conn);
@@ -1110,6 +1158,7 @@ export class FederationManager {
     let ws: WebSocket;
     conn.connT = Date.now();
     conn.lastRecv = 0;
+    conn.resumeProvisional = 0;   // a fresh socket starts unmarked: the provisional rule was the resumed socket's
     try {
       ws = new WebSocket(conn.url);
     } catch (e) {
@@ -1137,6 +1186,7 @@ export class FederationManager {
     };
     ws.onmessage = (ev: MessageEvent) => {
       conn.lastRecv = Date.now();   // every frame counts, the keepalive included — that is the heartbeat
+      conn.resumeProvisional = 0;   // and any frame, the keepalive included, confirms a resumed keep
       let msg: any;
       try {
         msg = JSON.parse(ev.data);

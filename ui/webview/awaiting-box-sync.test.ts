@@ -33,7 +33,9 @@ test("a status-only frame re-renders the awaiting box when its fields change —
   // the chatTail delta is the frame a status-only change actually rides (kernel _send_chat)
   const tail = RENDER.split("function chatTail(msg: any) {")[1].split("\n}")[0];
   assert.match(tail, /const before = awaitKey\(s\.status\);\s*\n\s*if \(msg\.status\) s\.status = msg\.status;/);
-  assert.match(tail, /appendActive\(\);\s*\n\s*renderLedger\(\);[\s\S]{0,900}?if \(awaitKey\(s\.status\) !== before\) renderBgTasks\(\);/,
+  // (2026-09-07: the active tab's repaint is scheduled per animation frame — scheduleAppendActive carries
+  // appendActive + renderLedger — while the awaited-agents box still keys on THIS frame's status change)
+  assert.match(tail, /scheduleAppendActive\(\);[\s\S]{0,900}?if \(awaitKey\(s\.status\) !== before\) renderBgTasks\(\);/,
     "the box renders from the SAME chatTail frame that flipped the chip");
   // the `update` delta and the host-side status frame render it the same way
   const upd = RENDER.split("function update(msg: any) {")[1].split("\n}")[0];

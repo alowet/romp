@@ -61,7 +61,10 @@ class PaneLoaderReconnect(unittest.TestCase):
     def test_the_loader_comes_down_when_the_socket_comes_back(self):
         """The event-based exit for the re-show path. Without it the only way down is the failsafe, i.e.
         30 seconds of romp logo over a pane whose socket reconnected in under two."""
-        self.assertIn("window.addEventListener('romp:wsup',function(){badge(false);hide();});", self.js)
+        self.assertIn("window.addEventListener('romp:wsup',function(){hide();});", self.js)
+        # …while the corner BADGE (a pane that has content) waits for the first fresh frame instead
+        # (2026-09-07; test_pane_shim_return.py owns that half)
+        self.assertIn("window.addEventListener('romp:wsfresh',function(){badge(false);});", self.js)
         self.assertIn("window.addEventListener('romp:wsdown',function(){if(ready()){badge(true);}else{show();}});", self.js,
                       "the drop still raises SOMETHING — a matched pair; since T217 a pane with "
                       "content gets the translucent badge and only an empty pane the opaque sheet")
@@ -84,10 +87,11 @@ class PaneLoaderReconnect(unittest.TestCase):
         bars-area loader instead, the user 2026-06-26) — it still carries the shim, so it gets the event
         whether or not anything listens today."""
         for page in (km._chat_page(), km._feed_page(), km._fleet_page()):
-            self.assertIn("window.addEventListener('romp:wsup',function(){badge(false);hide();});", page)
+            self.assertIn("window.addEventListener('romp:wsup',function(){hide();});", page)
+            self.assertIn("window.addEventListener('romp:wsfresh',function(){badge(false);});", page)
             self.assertIn('new Event("romp:wsup")', page)
         self.assertIn('new Event("romp:wsup")', km._timeline_page())
-        self.assertNotIn("window.addEventListener('romp:wsup',function(){badge(false);hide();});", km._timeline_page(),
+        self.assertNotIn("window.addEventListener('romp:wsup',function(){hide();});", km._timeline_page(),
                          "the timeline still owns no _pane_spin overlay")
 
 

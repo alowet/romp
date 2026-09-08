@@ -56,7 +56,13 @@ completed); the feed just paints columns. (Reflected in `docs/judges.md`.)
   contract.
 - **Liveness is a keepalive, and staleness is event-keyed.** The kernel sends a
   `ka` frame to every socket every 10 s; the pane shim abandons a socket that has
-  gone 30 s without any frame and redials at once. After a reconnect the shim
+  gone 30 s without any frame and redials at once, the silence measured from the
+  later of the last frame and a Chromium `resume` (the thaw of a frozen tab) on a
+  still-open socket. A socket kept on the strength of that stamp is provisional:
+  if no frame confirms it within 15 s (1.5 keepalive periods) the watchdog puts
+  it down there instead, a socket already 30 s overdue when the tab froze is not
+  stamped and is redialed at the return, and a browser without `resume` behaves
+  as before. After a reconnect the shim
   raises the "what you see may be stale" prompt only on the SECOND `ka` arriving
   before the resync frame — one full heartbeat period, bracketed by two kernel
   heartbeats on that socket with no resync between them (a single `ka` can be a
@@ -73,11 +79,17 @@ completed); the feed just paints columns. (Reflected in `docs/judges.md`.)
   browser reports for a socket that opened leaves a `wsclose` breadcrumb (code,
   reason, socket age) in `client-diag.jsonl`; a socket the shim abandons leaves
   none — the watchdog's own `watchdog-close` row went down the quiet socket
-  before the abandon (the foreground path's abandon sends none), so an armed
-  socket's raise, `reconnect-quiet` or `foreground-quiet`, queued for the redial,
-  is the record that survives; the redials an outage refuses are counted and
-  reported as one `wsconnfail` row on the next open, and at most 20 breadcrumbs
-  wait in the shim's queue for it.
+  before the abandon (the foreground path's abandon sends none, but its `return`
+  row queues for the redial), so an armed socket's raise, `reconnect-quiet` or
+  `foreground-quiet`, queued for the redial, is the record that survives; the
+  redials an outage refuses are counted and reported as one `wsconnfail` row on
+  the next open, and at most 20 breadcrumbs wait in the shim's queue for it.
+  Every return to the tab leaves its own rows: `return` with the decision
+  (`keep`, `redial-closed` or `redial-stale`) and the hidden, frozen and quiet
+  gaps, `return-fresh` with the wait for the first fresh frame, and `page-load`
+  for a reload or a tab the browser discarded; a `resent: true` copy of the
+  `return` row means the kept socket proved dead and the row was re-filed onto
+  the redial.
 - **The Outline pane's ages run on the kernel's clock.** Its timestamps are the
   kernel's, so the pane never reads the browser's clock against them: it anchors
   on the frame's `now` paired with the moment that frame arrived from the wire

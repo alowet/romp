@@ -76,6 +76,11 @@ class Harness {
       MessageEvent: class { type: string; data: any; constructor(t: string, o: any) { this.type = t; this.data = o.data; } },
       setTimeout: (f: () => void) => { h.timers.push(f); return h.timers.length; },
       clearTimeout: () => {}, setInterval: (f: () => void) => { h.interval = f; return 1; },
+      // 2026-09-07: the shim hands frames to the bundle through a MessageChannel-flushed queue. Delivered
+      // synchronously here, so `toBundle` reads in wire order exactly as before; the slicing has its own tests
+      // (tests/test_pane_shim_return.py). `performance` backs the page-load breadcrumb's navigation type.
+      MessageChannel: class { port1: any = { onmessage: null }; port2: any; constructor() { const p1 = this.port1; this.port2 = { postMessage: (d: any) => { p1.onmessage?.({ data: d }); } }; } },
+      performance: { getEntriesByType: () => [] },
     };
     sandbox.window.window = sandbox.window;
     this.win = sandbox.window;
