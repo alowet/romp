@@ -4680,6 +4680,9 @@ def _forward_tag_edit(host, body):
 # tag EDITED there after the ruling (the v2 mtime stamp) — is new information and survives, loudly.
 _PENDING_TAG_LOCK = threading.Lock()
 _PENDING_TAG_CACHE = {"rows": None}          # None = not loaded; kept in sync under the lock
+_pending_tag_faults = {}   # _pending_tag_row_key -> faulting passes so far, for each row whose host answered a retryable
+                           # store fault: the stderr line AND the dial record are written once per row per episode, and the
+                           # count rides the record that ends the episode (the apply prunes the map to the live rows)
 
 
 def _pending_tag_path():
@@ -4829,8 +4832,32 @@ def _apply_pending_tag_edits(r):
                         outcome="transport failed — retrying next pass")
             continue
         ok = bool(ans.get("ok"))
+        if not ok and ans.get("retryable"):
+            # The host ANSWERED, but did not rule: `retryable` on an ok:false body is the kernel's shape
+            # for a store fault (the /tag route's tag store unreadable or unwritable at that moment; the
+            # PR-watch route's save fault wears the same key) -- the disk's answer, not the host's. A
+            # refusal WITHOUT it is the host's own words (no such tag, a name already taken) and stays
+            # terminal below. Until this arm (review find, 2026-09-08) the fault retired the row as a
+            # refusal, and a pending delete or rename was lost to a transient disk fault on the host --
+            # the very case the journal exists to survive. Kept for the next pass, like a transport
+            # failure. Said ONCE per row per episode -- the stderr line and the dial record alike (a
+            # host whose disk stays bad would otherwise write a record every 15 s pass and rotate every
+            # host's dial history away within days); the passes are counted, and the count rides the
+            # record that ends the episode below.
+            fault = ans.get("error") or "?"
+            key = _pending_tag_row_key(row)
+            _pending_tag_faults[key] = _pending_tag_faults.get(key, 0) + 1
+            if _pending_tag_faults[key] == 1:
+                _tunnel_log(host, "pending-tag-edit", name=row.get("name"), op=_row_op(row),
+                            outcome="the host's tag store faulted: %s — kept; retried every pass, recorded once" % fault)
+                sys.stderr.write('pending-tag-edits: the %s of "%s" on %s stays queued \u2014 the host answered but '
+                                 'could not use its tag store just now (%s); retrying next pass\n'
+                                 % (_row_op(row), row.get("name"), host, fault))
+            continue
+        faults = _pending_tag_faults.pop(_pending_tag_row_key(row), 0)     # the episode ends with the host's answer
         _tunnel_log(host, "pending-tag-edit", name=row.get("name"), op=_row_op(row),
-                    outcome=("applied" if ok else "refused by the host: %s" % (ans.get("error") or "?")))
+                    outcome=("applied" if ok else "refused by the host: %s" % (ans.get("error") or "?"))
+                    + (" after %d faulting pass%s" % (faults, "" if faults == 1 else "es") if faults else ""))
         retired.append(row)                      # a refusal is the host's own answer — terminal
         applied += 1 if ok else 0
     if retired:
@@ -4838,7 +4865,19 @@ def _apply_pending_tag_edits(r):
         _save_pending_tag_rows(keep)
         r.pop("_views_at", None)                 # re-read the post-apply truth next pass
         _mark_views_dirty()
+    # a fault episode ends with its row: landed or retired here, or superseded by a later ruling
+    # (_queue_pending_tag_edit coalesces) -- a row queued afresh for the same tag is said afresh
+    live = {_pending_tag_row_key(x) for x in _pending_tag_rows()}
+    for k in [k for k in _pending_tag_faults if k not in live]:
+        del _pending_tag_faults[k]
     return applied
+
+
+def _pending_tag_row_key(row):
+    """One journaled row's identity for the once-per-episode fault line: host, name basis, op and the
+    ruling's moment (a re-ruling after a supersede is a new row, and a new episode; a same-op re-rule
+    within the same wall-clock second shares the key -- degenerate, and it only folds two lines into one)."""
+    return (row.get("host") or "", _tag_name_basis(row.get("name")), _row_op(row), row.get("ruledAt"))
 
 
 def _row_op(row):
