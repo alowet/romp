@@ -3,7 +3,7 @@
 spend breakdown and a stacked histogram of spend over time colored by session. The data is GET
 /spend/detail: the ledger's bySid maps (T100's per-session attribution) with names and identity colors
 resolved kernel-side, two ranges at the ledger's own granularity (192 hours, 90 days), the top-N sessions
-as stacks plus ONE "other" and ONE "unattributed" stack — spend recorded before attribution existed, or
+as stacks (every session its own, since T247e) plus ONE "unattributed" stack — spend recorded before attribution existed, or
 the part of a bucket no sid accounts for, is shown as such, never dropped (fail loudly). Hermetic state
 root, synthetic ledger, the notes-api demo sessions (web/api/tests), placeholder uuids, TESTHOST."""
 import inspect
@@ -117,12 +117,15 @@ class SpendDetail(unittest.TestCase):
         self.assertEqual(names, ["web", "api", "tests"], "sorted by dollars, largest first")
         web, api, tests = d["sessions"]
         self.assertEqual((web["bg"], web["fg"]), ("#1EA1EB", "#ffffff"), "identity color from the registry")
-        self.assertEqual(tests["bg"], "", "a session without an identity color says so (the client draws neutral)")
+        self.assertTrue(tests["bg"].startswith("#"), "a session without an identity color still gets one (see below)")
         self.assertTrue(web["live"] and api["live"] and not tests["live"], "a dead session keeps its name, flagged")
         self.assertAlmostEqual(web["usd"], 24.0 * 40, places=3)
         self.assertEqual(web["turns"], 48 * 40)
         self.assertEqual(api["tok"], 96000 * 40)
-        self.assertEqual(d["topN"], km._DETAIL_TOP_N)
+        self.assertNotIn("topN", d, "T247e: no top-N — every session is its own stack and row")
+        self.assertTrue(tests.get("bgDerived") and tests["bg"] in km.pal.colors(km.pal.active_name(km.jd.STATE)),
+                        "a session the registry never colored gets a deterministic swatch of the active palette")
+        self.assertEqual(tests["bg"], km._spend_detail(now=NOW)["sessions"][2]["bg"], "…the same one every open")
         self.assertNotIn("windows", d, "the modal's window rows are the hover's own (no second parse, no dead payload)")
         self.assertEqual(d["tzOffsetMin"], int((time.localtime(NOW).tm_gmtoff or 0) // 60))
 
@@ -152,17 +155,26 @@ class SpendDetail(unittest.TestCase):
         self.assertEqual(web["tok"][hk.index(_hour(5))], 20000)
         self.assertFalse(web["usd"][hk.index(_hour(100))], "an hour with nothing recorded is a true zero")
 
-    def test_beyond_the_top_n_sessions_fold_into_one_other_stack(self):
+    def test_every_session_is_its_own_stack_no_other_fold(self):
+        # T247e (the user 2026-09-08): no top-N, no "other (N sessions)" — the list is the legend
         write_ledger(km.jd.STATE, extra_sids=12)
         d = km._spend_detail(now=NOW)
         self.assertEqual(len(d["sessions"]), 15, "the table lists EVERY session")
         kinds = [s["kind"] for s in d["days"]["stacks"]]
-        self.assertEqual(kinds.count("sid"), km._DETAIL_TOP_N)
-        self.assertEqual(kinds[-2:], ["other", "unattributed"])
-        other = d["days"]["stacks"][-2]
-        self.assertEqual(other["count"], 15 - km._DETAIL_TOP_N)
+        self.assertEqual(kinds.count("sid"), 15, "one stack per session")
+        self.assertNotIn("other", kinds)
+        self.assertEqual(kinds[-1], "unattributed")
         keys = d["days"]["keys"]
-        self.assertAlmostEqual(other["usd"][keys.index(_day(1))], 0.1 * (15 - km._DETAIL_TOP_N), places=3)
+        small = [s for s in d["days"]["stacks"] if s.get("sid", "").endswith("0111")][0]
+        self.assertAlmostEqual(small["usd"][keys.index(_day(1))], 0.1, places=3, msg="a small session keeps its own series")
+        self.assertTrue(all(s["bg"].startswith("#") for s in d["days"]["stacks"] if s["kind"] == "sid"), "every stack has a color")
+        # derived colors never take a swatch an identity-colored session here holds while a free one remains
+        # (review find: a plain hash gave a dead session web's blue)
+        ident = {s["bg"] for s in d["sessions"] if not s.get("bgDerived")}
+        derived = [s["bg"] for s in d["sessions"] if s.get("bgDerived")]
+        free = len(km.pal.colors(km.pal.active_name(km.jd.STATE))) - len(ident)
+        self.assertTrue(all(c not in ident for c in derived[:free]), "the free swatches go first")
+        self.assertEqual(len(set(derived[:free])), free, "…each once")
         self.assertEqual(d["hours"]["stacks"][0]["name"], "web", "stack order is the table's: top by dollars")
 
     def test_the_keyed_scope_reads_each_sids_key_split_like_the_rail(self):
@@ -302,10 +314,8 @@ class SpendDetail(unittest.TestCase):
         d = km._spend_detail(now=NOW)
         self.assertEqual(d["scope"], "keyed")
         self.assertEqual(len(d["sessions"]), 12, "the table lists the key-billed sessions only")
-        other = [s for s in d["days"]["stacks"] if s["kind"] == "other"][0]
-        self.assertEqual(other["count"], 2, "the legend's count is the table's fold: sessions that contributed")
+        self.assertEqual([s["kind"] for s in d["days"]["stacks"]], ["sid"] * 12, "twelve stacks, no fold (T247e)")
         self.assertEqual(d["unattributed"]["usd"], 0.0, "every key dollar is a session's: nothing unattributed")
-        self.assertEqual([s["kind"] for s in d["days"]["stacks"]][-1], "other")
 
     # ── T247c: every attached kernel's sessions, merged kernel-side ──────────────────────────────
     def _peer_server(self, payload=None, status=200, token="peer-tok", hang=False, seen=None):
@@ -361,7 +371,8 @@ class SpendDetail(unittest.TestCase):
         i5 = n - 1 - 5
         usd[i5] = 7.0; tok[i5] = 70000
         una = [0.0] * n; una[n - 1 - 9] = 2.0
-        pd = {"host": "PEERHOST", "scope": "total", "tz": "PEER", "tzOffsetMin": off_min, "topN": 10,
+        pd = {"host": "PEERHOST", "scope": "total", "tz": "PEER", "tzOffsetMin": off_min,
+              "order": ["22222222-3333-4444-5555-000000000001"],
               "sessions": [{"sid": "22222222-3333-4444-5555-000000000001", "name": "worker", "bg": "#C2410C", "fg": "#fff",
                             "live": True, "usd": 300.0, "tok": 3000000, "turns": 30}],
               "unattributed": {"usd": 2.0, "tok": 0, "turns": 1},
@@ -456,9 +467,21 @@ class SpendDetail(unittest.TestCase):
         self.assertAlmostEqual(wh["usd"][-1], 7.0, places=3)
         self.assertEqual(len(d["hours"]["keys"]), len(d["hours"]["epochs"]))
 
-    def test_the_merged_other_count_names_contributors_in_that_range_only(self):
-        # review find: the merged "other (N sessions)" counted every non-top session from the roster,
-        # whatever it spent in the range — the single-host reader counts contributors only
+    def test_an_older_peers_other_fold_survives_as_that_hosts_own_stack(self):
+        # a peer on the previous build still folds beyond a top-N into "other"; its dollars are kept as a
+        # stack named with its host rather than dropped (T247e keeps nothing but sid stacks of its own)
+        pd = self._peer_payload(0)
+        n = len(pd["hours"]["keys"])
+        pd["hours"]["stacks"].append({"kind": "other", "name": "other", "count": 3, "usd": [0.0] * (n - 1) + [1.5], "tok": [0] * n})
+        self._attach("PEERHOST", self._peer_server(pd))
+        d = km._spend_detail(now=NOW)
+        oth = [s for s in d["hours"]["stacks"] if s["kind"] == "other"]
+        self.assertEqual(len(oth), 1)
+        self.assertEqual((oth[0]["host"], oth[0]["count"]), ("PEERHOST", 3))
+        self.assertAlmostEqual(oth[0]["usd"][-1], 1.5, places=3)
+
+    def test_a_small_session_keeps_its_own_hourly_stack_across_hosts(self):
+        # T247e: with no top-N there is no fold to count — a small session's hour is its own stack
         write_ledger(km.jd.STATE, extra_sids=12)
         led = json.loads((km.jd.STATE / "spend.json").read_text())
         sid = "11111111-2222-3333-4444-000000000111"   # the last extra: outside the merged top ten
@@ -468,11 +491,31 @@ class SpendDetail(unittest.TestCase):
         (km.jd.STATE / "spend.json").write_text(json.dumps(led))
         self._attach("PEERHOST", self._peer_server(self._peer_payload(0)))
         d = km._spend_detail(now=NOW)
-        other_h = [s for s in d["hours"]["stacks"] if s["kind"] == "other"]
-        self.assertEqual(len(other_h), 1)
-        self.assertEqual(other_h[0]["count"], 1, "one non-top session spent in the hourly range")
-        other_d = [s for s in d["days"]["stacks"] if s["kind"] == "other"][0]
-        self.assertEqual(other_d["count"], 16 - 10, "every non-top session spent in the daily range")
+        self.assertEqual([s["kind"] for s in d["hours"]["stacks"] if s["kind"] == "other"], [], "no fold anywhere")
+        small = [s for s in d["hours"]["stacks"] if s.get("sid", "").endswith("0111")]
+        self.assertEqual(len(small), 1, "the small session's hour is its own stack")
+        self.assertEqual(small[0]["host"], "TESTHOST")
+        self.assertEqual(len([s for s in d["days"]["stacks"] if s["kind"] == "sid"]), 16, "sixteen sessions across two hosts, sixteen stacks")
+
+    def test_the_payload_carries_the_shared_session_order_by_host(self):
+        # T247f: "your order" is the tab strip's and the lanes' order — the kernel's shared seed
+        # (session-order.json) per host, hosts local-first then the remotes listing's order; an older peer
+        # that ships no order contributes nothing (its sessions trail, client-side)
+        (km.jd.STATE / "session-order.json").write_text(json.dumps([API, TESTS, WEB]))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual(d["order"], [["TESTHOST", API], ["TESTHOST", WEB]],
+                         "one host: its seed, host-tagged — restricted to what the tab strip renders (tests is dead: the "
+                         "file keeps its slot while its transcript is in the window, the strip shows no such tab, so it trails)")
+        self._attach("PEERHOST", self._peer_server(self._peer_payload(0)))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual(d["order"], [["TESTHOST", API], ["TESTHOST", WEB], ["PEERHOST", "22222222-3333-4444-5555-000000000001"]])
+        km._remotes.clear()
+        pd = self._peer_payload(0)
+        del pd["order"]
+        self._attach("OLDPEER", self._peer_server(pd))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual(d["order"], [["TESTHOST", API], ["TESTHOST", WEB]], "no order from an older peer")
+        (km.jd.STATE / "session-order.json").unlink()
 
     def test_an_older_peer_without_epochs_still_aligns_through_its_offset(self):
         off = int((time.localtime(NOW).tm_gmtoff or 0) // 60) + 180
@@ -542,13 +585,38 @@ class SpendDetail(unittest.TestCase):
         self.assertIn("var spAbort=new AbortController()", html)
         self.assertIn("setTimeout(function(){spAbort.abort();}", html)
         self.assertIn("signal:spAbort.signal", html)
-        # T247b: dimmed rows dim ONCE — the annotation inside a dimmed row stays at the row's level, and
-        # the fold row's "show all" is a control, never dimmed
+        # T247b: dimmed rows dim ONCE — the annotation inside a dimmed row stays at the row's level
         self.assertIn(".rsp-dead td{opacity:.55}", html)
         self.assertIn(".rsp-dead .ru-tip-reset{opacity:1}", html)
-        self.assertNotIn("<tr class=rsp-dead><td><i class=rsp-sw style=\"background:'+SP_OTHER+'\"></i></td><td class=rsp-name>'+rest.length+' more session", html,
-                         "the fold row is not a dead row")
-        self.assertIn("<tr class=rsp-fold>", html)
+        # T247e: the chart precedes the list; the list is a scroll pane under a sticky header holding
+        # every session (no fold), each row its TAB TITLE (the strip's classes, the identity color as
+        # --chip-bg), no swatch, no legend
+        js = html
+        self.assertLess(js.index("<span>Spend over time</span>"), js.index("<span>By session"), "the chart comes first")
+        self.assertNotIn("more session", js, "no fold")
+        self.assertNotIn("rsp-leg", js, "no legend: the list is the legend")
+        self.assertIn("#rsp-table{max-height:38vh;overflow-y:auto", js)
+        self.assertIn(".rsp-tbl thead th{position:sticky;top:0;background:#252526;z-index:1}", js)
+        self.assertIn("body.theme-light .rsp-tbl thead th{background:#FFFFFF}", js)
+        self.assertIn('<span class="tab-label colored" style="--chip-bg:\'+spColor(s)+\'">', js, "a row's title wears the tab strip's classes")
+        # T247f: the order chips beside the measure chips; the choice persists with the other toggles
+        self.assertIn('data-act=order:spend>by spend</button>', js)
+        self.assertIn('data-act=order:yours>your order</button>', js)
+        self.assertIn("var SP_PREFS_KEY='romp:spendModal';", js)
+        self.assertIn("localStorage.getItem('romp:vieworder')", js, "the viewer's arrangement is the strip's own key")
+        # the landing page loads no stylesheet, so the strip's two rules are inlined as a TWIN; this pins the
+        # twin's declarations against the source so the two cannot drift
+        import re as _re
+        css = open(os.path.join(os.path.dirname(HERE), "ui", "webview", "styles.css")).read()
+        def decls(sel):
+            m = _re.search(_re.escape(sel) + r"\s*\{([^}]*)\}", css)
+            self.assertIsNotNone(m, sel + " missing from styles.css")
+            return _re.sub(r"\s+", "", m.group(1)).rstrip(";")
+        self.assertIn(".rsp-name .tab-label.colored{" + decls(".tab.colored .tab-label") + "}", js,
+                      "the modal row's title declarations are the tab strip's, byte for byte")
+        hp = decls(".host-prefix").replace("var(--dim)", "var(--dim,#9aa0a6)")
+        self.assertIn(".rsp-name .host-prefix{" + hp + "}", js,
+                      "the host prefix declarations are the strip's (with the dark fallback the landing needs)")
         # T247b: the phone's door is its own row at the hover's button size, full opacity — not an
         # annotation inside .ru-tip-age (10px, .55)
         self.assertIn("<div class=ru-tip-more><button class=rsp-btn id=ru-bysession>", html)
