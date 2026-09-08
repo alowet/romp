@@ -112,6 +112,9 @@ def _session(be, sid=SID, label=LABEL, model_id="claude-fable-5-1"):
     s._input_wake, s._reconnect_when_idle, s.ended = None, False, False
     s._interrupted, s._intr_level = False, 0
     s.api_key_auth, s.thread_of = True, ""
+    # what _options records at launch and the init's billing check reads bare (meant_key): a login
+    # launch by default — the SaltedLabels tests set the keyed pair per case
+    s._launched_keyed, s._launched_key_fp, s._launched_unkeyed_pick = False, "", False
     s._do_refresh_context = _noop_coro
     s._do_refresh_usage = _noop_coro
     return s
@@ -292,11 +295,17 @@ class IngestsTheRealBranches(unittest.TestCase):
         self.assertEqual(s.inflight, 0)
 
     def test_the_settle_branch_calls_the_hook(self):
+        """At the top of the branch, before the settle's own work: between the branch head and the hook
+        there is nothing but the try that contains the whole branch (its finally IS the settle, so the
+        hook sits inside it) and comments — no bookkeeping step, no early return."""
         src = inspect.getsource(sb.SdkSession._on_message)
         i_branch = src.index("elif isinstance(msg, ResultMessage):")
         i_hook = src.index("self._ah_note_result(msg)")
         self.assertLess(i_branch, i_hook)
-        self.assertLess(i_hook - i_branch, 200, "at the top of the branch, before the settle's own work")
+        between = src[i_branch:i_hook].splitlines()[1:]
+        code = [ln.strip() for ln in between
+                if ln.strip() and not ln.strip().startswith("#") and ln.strip() != "try:"]
+        self.assertEqual(code, [], "a statement runs ahead of the hook: %r" % (code,))
 
     def test_is_error_gates_the_status_read(self):
         """api_error_status is defined only when is_error is true (SDK types.py:1247-1249).
