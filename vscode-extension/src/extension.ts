@@ -1033,7 +1033,9 @@ async function diffSessionChanges() {
   if (!s || !s.dir) return;
   let files;
   try {
-    files = parsePorcelain(await gitIn(s.dir, ["status", "--porcelain"]));
+    // -z: NUL-separated records with raw paths (no C-quoting), a rename's source after its
+    // destination — the one shape session-diff.ts parses.
+    files = parsePorcelain(await gitIn(s.dir, ["status", "--porcelain=v1", "-z"]));
   } catch {
     vscode.window.showWarningMessage(`romp: ${s.dir} is not a git repository (or git failed).`);
     return;
