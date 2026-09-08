@@ -675,49 +675,53 @@ class SyncNoticeRowsCarryAKind(unittest.TestCase):
 NODE = shutil.which("node")
 VIEW_JS = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "ui", "romp-timeline-view.js")
 
-# The timeline's Obsidian-desktop fallback writer of session-flags.json, executed in node with a stubbed
+# The timeline's Obsidian-desktop flag writer, executed in node against a stubbed _kernelPost and a stubbed
 # fs (the tests/test_timeline_touch.py harness shape). Synthetic sids; ROMP_STATE_DIR is a temp dir and fs
 # is stubbed besides, so no real file is ever touched.
 _WRITER_HARNESS = r"""
 const { TimelinePanel } = require(process.argv[1]);
-const fs = require('fs'), path = require('path');
+const fs = require('fs');
 process.env.ROMP_STATE_DIR = process.argv[2];
-const fp = path.join(process.argv[2], 'session-flags.json');
-const SID = '11111111-2222-3333-4444-555555555555', OTHER = '99999999-8888-7777-6666-555555555555';
-const real = { readFileSync: fs.readFileSync, writeFileSync: fs.writeFileSync, renameSync: fs.renameSync, mkdirSync: fs.mkdirSync };
-function run(readImpl) {
-  const writes = [], renames = [];
-  fs.readFileSync = function (p) { if (String(p) === fp) return readImpl(); return real.readFileSync.apply(fs, arguments); };
+const SID = '11111111-2222-3333-4444-555555555555';
+const real = { writeFileSync: fs.writeFileSync, renameSync: fs.renameSync, readFileSync: fs.readFileSync };
+function run(answer) {
+  const writes = [], renames = [], reads = [], posts = [];
   fs.writeFileSync = function (p, data) { writes.push([String(p), String(data)]); };
   fs.renameSync = function (a, b) { renames.push([String(a), String(b)]); };
-  fs.mkdirSync = function () {};
-  try {
-    const v = Object.create(TimelinePanel.prototype);
-    v._setSessionFlag({ id: SID }, 'hideFromFeed', true);
-  } finally { Object.assign(fs, real); }
-  return { writes, renames };
+  fs.readFileSync = function (p) { reads.push(String(p)); return real.readFileSync.apply(fs, arguments); };
+  const v = Object.create(TimelinePanel.prototype);
+  v.draw = () => {};
+  v.data = { sessions: [{ id: SID, hideFromFeed: true }] };            // the gear's optimistic click, already painted…
+  v._pendingFlags = { [SID]: { hideFromFeed: true } };                  // …and held sticky
+  v._laneRefusal = null; v._laneMenu = null; v._laneMenuBuild = null;
+  v._kernelPost = (route, body) => { posts.push([route, body]); return Promise.resolve(answer); };
+  try { v._setSessionFlag({ id: SID }, 'hideFromFeed', true); } finally { Object.assign(fs, real); }
+  return new Promise((res) => setImmediate(() => res({ writes, renames, reads, posts, refusal: v._laneRefusal,
+                                                          painted: v.data.sessions[0].hideFromFeed, pending: v._pendingFlags })));
 }
-const err = (code) => Object.assign(new Error(code), { code });
-const r = {};
-process.versions.electron = '1.0.0-test';                   // the Electron guard: the writer runs at all
-r.eio = run(() => { throw err('EIO'); });                   // a read fault
-r.torn = run(() => '{"' + OTHER + '": {"postalServiceOff": tr');   // torn bytes
-r.list = run(() => '["' + OTHER + '"]');                   // valid JSON of the wrong shape
-r.enoent = run(() => { throw err('ENOENT'); });             // a legitimately missing store
-r.clean = run(() => JSON.stringify({ [OTHER]: { postalServiceOff: true } }));
-delete process.versions.electron;
-r.noElectron = run(() => { throw err('ENOENT'); });         // a bare-node run: nothing at all
-process.stdout.write(JSON.stringify({ fp, ...r }));
+(async () => {
+  const r = {};
+  process.versions.electron = '1.0.0-test';                   // the Electron guard: the writer runs at all
+  r.ok = await run({ ok: true, body: { ok: true, id: SID, flag: 'hideFromFeed', value: true } });
+  r.refused = await run({ ok: false, refusal: true, body: { ok: false, value: false },
+                          error: "couldn't save that setting — session-flags.json could not be read (read failed: [Errno 5] injected EIO); try again" });
+  r.down = await run({ ok: false, unreachable: true, error: 'the kernel is not running; start romp and try again' });
+  delete process.versions.electron;
+  r.noElectron = await run({ ok: true, body: { ok: true } });   // a bare-node run: nothing at all
+  process.stdout.write(JSON.stringify(r));
+})();
 """
 
 
 @unittest.skipUnless(NODE, "node not available")
-class TimelineFallbackFlagWriter(unittest.TestCase):
-    """The timeline's Obsidian-desktop fallback writer of session-flags.json (review find, 2026-09-08)
-    had the exact shape the kernel dropped: any read fault or torn bytes became {} and was written over
-    EVERY session's flags, in place -- so the kernel's strict reader could observe 0 bytes mid-write
-    and quarantine the very file being written. It now refuses on anything but a missing file, and
-    publishes tmp + rename, like _persistOrder."""
+class TimelineFlagWriterPostsThroughTheKernel(unittest.TestCase):
+    """The timeline's Obsidian-desktop flag writer (2026-09-08). Until this change it read-modify-wrote
+    session-flags.json itself (PR #1020 had made that write honest: the Electron guard, the kernel's
+    state root, tmp + rename) -- a SECOND WRITER of the flags with no lock against the kernel's own
+    setter. It now posts the kernel's /flag, which lands through _set_session_flag with the socket op's
+    validation, and a refusal takes the settingRefused door the lane gear already renders from: the
+    optimistic state ends, the toggle repaints to what the kernel still paints, the reason shows. With
+    no kernel answering the gesture is refused and says so; the panel never writes the file."""
 
     @classmethod
     def setUpClass(cls):
@@ -732,26 +736,36 @@ class TimelineFallbackFlagWriter(unittest.TestCase):
     def tearDownClass(cls):
         cls.td.cleanup()
 
-    def test_a_read_fault_torn_bytes_or_the_wrong_shape_write_nothing(self):
-        for case in ("eio", "torn", "list"):
-            self.assertEqual(self.r[case]["writes"], [], "%s: never written over a store that could not be read" % case)
-            self.assertEqual(self.r[case]["renames"], [], case)
+    def test_the_toggle_is_one_post_through_the_kernel_and_never_a_file(self):
+        for case in ("ok", "refused", "down"):
+            self.assertEqual(self.r[case]["posts"], [["/flag", {"id": "11111111-2222-3333-4444-555555555555",
+                                                                 "flag": "hideFromFeed", "value": True}]], case)
+            self.assertEqual((self.r[case]["writes"], self.r[case]["renames"]), ([], []),
+                             "%s: the panel writes no state file of its own, kernel up or down" % case)
+            self.assertFalse(any(p.endswith("session-flags.json") for p in self.r[case]["reads"]),
+                             "%s: nor does it read one to modify" % case)
 
-    def test_a_missing_store_is_written_atomically(self):
-        fp = self.r["fp"]
-        writes, renames = self.r["enoent"]["writes"], self.r["enoent"]["renames"]
-        self.assertEqual(len(writes), 1)
-        self.assertEqual(writes[0][0], fp + ".tmp", "the bytes go to the temp, never the live file")
-        self.assertEqual(json.loads(writes[0][1]), {"11111111-2222-3333-4444-555555555555": {"hideFromFeed": True}})
-        self.assertEqual(renames, [[fp + ".tmp", fp]], "one atomic publish")
+    def test_an_accepted_write_holds_its_optimistic_state_until_the_poll_confirms_it(self):
+        ok = self.r["ok"]
+        self.assertEqual((ok["painted"], ok["pending"], ok["refusal"]),
+                         (True, {"11111111-2222-3333-4444-555555555555": {"hideFromFeed": True}}, None))
 
-    def test_a_clean_read_keeps_the_other_sessions_flags(self):
-        writes = self.r["clean"]["writes"]
-        self.assertEqual(json.loads(writes[0][1]), {"99999999-8888-7777-6666-555555555555": {"postalServiceOff": True},
-                                                    "11111111-2222-3333-4444-555555555555": {"hideFromFeed": True}})
+    def test_the_kernels_refusal_ends_the_optimistic_state_in_the_kernels_words(self):
+        rf = self.r["refused"]
+        self.assertEqual(rf["pending"], {}, "the sticky copy is released")
+        self.assertIs(rf["painted"], False, "the toggle repaints to what the kernel still paints (the value it sent)")
+        self.assertEqual(rf["refusal"], {"sid": "11111111-2222-3333-4444-555555555555", "flag": "hideFromFeed",
+                                         "text": "couldn't save that setting — session-flags.json could not be read (read failed: [Errno 5] injected EIO); try again"})
 
-    def test_without_electron_nothing_is_touched(self):
-        self.assertEqual((self.r["noElectron"]["writes"], self.r["noElectron"]["renames"]), ([], []))
+    def test_no_kernel_is_a_refusal_that_says_so_with_the_toggle_back_where_the_click_found_it(self):
+        dn = self.r["down"]
+        self.assertEqual(dn["pending"], {})
+        self.assertIs(dn["painted"], False)
+        self.assertEqual(dn["refusal"]["text"], "couldn't save that setting — the kernel is not running; start romp and try again")
+
+    def test_without_electron_nothing_is_posted_or_touched(self):
+        ne = self.r["noElectron"]
+        self.assertEqual((ne["posts"], ne["writes"], ne["renames"]), ([], [], []))
 
 
 if __name__ == "__main__":

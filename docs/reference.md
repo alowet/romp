@@ -67,6 +67,24 @@ and `false` apply, an absent field or an explicit `null` reads as the route's
 default, and anything else (the string `"false"`, `0`, `1`) is a 400 naming the
 field, with nothing acted on.
 
+Three routes exist for the Obsidian timeline panel, which has the state
+directory but no socket to the kernel: `POST /flag` (`{id, flag, value}`: one
+of the lane gear's toggles, `hideFromFeed`, `postalServiceOff` or `notify`,
+with a JSON boolean; here `value` is required, and an absent or `null` value is
+a 400, never a default, since a missing value must not read as "off"), `POST
+/views` (`{views, edited?, writeId?}`: the whole views blob, judged as the
+dashboards' write is and answered with the same `viewsAck` document, `ok`, the
+post-write `views` and `seq`, any `refused` tags and an `error` line), and
+`POST /order` (`{order: [sid, …]}`, merged into the saved order so lanes the
+drag did not carry keep their slots). Each lands through the setter its socket
+op uses; a store that cannot be read or written answers 200 with `ok:false` and
+the reason the dashboards see, and an unknown key or a wrong type is a 400
+naming it. The panel finds the kernel through the `serve-port` record the
+kernel writes beside `serve-token` in the state directory once its socket is
+bound; with no record, or nothing answering on it, the panel refuses the
+gesture and says the kernel is not running rather than writing a file the
+kernel cannot check.
+
 `--env` gives one session its own environment, so two sessions in the same
 directory can run with different toggles (a `FEATURE_FLAG=1`, a `CLAUDE_CODE_*`
 switch) without editing the directory's `.claude/settings*.json`, which reaches

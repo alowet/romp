@@ -72,11 +72,33 @@ test("the icon drawers survive (they render inside the menu now): ON = romp blue
   assert.match(SRC, /t\.icon\(!on, 8\.5, 8\.5, on \? ACCENT : MODEL_FG\)/);   // ACCENT = ROMP_BLUE in dark; clay under body.theme-light
 });
 
-test("setSessionFlag still posts via the web host hook, with a Node-fs fallback for Obsidian", () => {
+test("setSessionFlag posts via the web host hook, and through the kernel's POST /flag in Obsidian", () => {
   assert.match(SRC, /_setSessionFlag\(s, flag, value\)/);
   assert.match(SRC, /window\.__rompTimelineSetFlag === 'function'/);
   assert.match(SRC, /window\.__rompTimelineSetFlag\(s\.id, flag, value\)/);
-  assert.match(SRC, /session-flags\.json/, "Obsidian/headless writes the same file the kernel reads");
+  assert.match(SRC, /this\._kernelPost\('\/flag', \{ id: s\.id, flag, value: !!value \}\)/, "Obsidian: the kernel's setter, through its route");
+  assert.doesNotMatch(SRC, /writeFileSync|renameSync/, "the panel writes none of the kernel's state files itself (2026-09-08)");
+});
+
+test("the Obsidian writer is the kernel's route, never a file of its own (2026-09-08; PR #1020's fallback superseded)", () => {
+  // Pinned on the writer's OWN slice. PR #1020 gave the old fallback writer the discipline of its two
+  // siblings (the Electron guard, the kernel's state root, tmp + rename); this change removes the
+  // fallback: the panel was a SECOND WRITER of session-flags.json with no lock against the kernel's own
+  // setter, and now posts through it, with the kernel's refusal landing in the settingRefused door the
+  // lane gear already renders from. Kernel down → the gesture is refused and says so, never written to a
+  // file the kernel cannot check. The writer is RUN from tests/test_kernel_session_flags.py
+  // (TimelineFlagWriterPostsThroughTheKernel) and ui/timeline-kernel-post.test.ts.
+  const w = SRC.slice(SRC.indexOf("_setSessionFlag(s, flag, value) {"), SRC.indexOf("_kernelHost() {"));
+  assert.ok(w.length > 0 && w.length < 4000, "the writer's slice");
+  assert.match(w, /if \(!this\._kernelHost\(\)\) return;/, "Electron-or-nothing, through the one shared guard");
+  assert.match(w, /this\._kernelPost\('\/flag'/);
+  assert.match(w, /this\.settingRefused\(\{ gesture: 'flag', sid: s\.id, flag, value: painted,/, "a refusal takes the door the socket op's refusal takes");
+  assert.doesNotMatch(w, /readFileSync|writeFileSync|renameSync|session-flags\.json'/, "no file of its own, read or written");
+  const h = SRC.slice(SRC.indexOf("_kernelHost() {"), SRC.indexOf("_kernelPost(route, body) {"));
+  assert.match(h, /if \(typeof process === 'undefined' \|\| !process\.versions \|\| !process\.versions\.electron\) return null;/,
+    "a bare-node run never posts");
+  assert.match(h, /const base = process\.env\.XDG_STATE_HOME \|\| path\.join\(os\.homedir\(\), '\.local', 'state'\);\s*\n\s*const root = process\.env\.ROMP_STATE_DIR \|\| path\.join\(base, 'romp'\);/,
+    "the kernel's state root, resolved as the kernel resolves it — where its serve-token and serve-port records are (the exact line tests/test_state_dir_override.py pins)");
 });
 
 test("the sticky-flag machinery survives: pendingFlags reconcile on every update (no flicker-back)", () => {
