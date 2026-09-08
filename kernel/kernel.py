@@ -16367,9 +16367,16 @@ def _pr_watch_deliver(sid, text):
     (_send_or_park's None: be.send returned False for a session it no longer holds) or raised. The
     watch ticks keep their row on False and retry; the PR tick classifies the refusal from the
     backend's own record (_pr_watch_refusal), so it never retries forever against a session that
-    has ended."""
+    has ended. A uuid-shaped sid is never handed to tmux, whichever way it got there (the record
+    read said nothing, or a reader's fault left it unread): SDK and Codex sids are uuids and tmux
+    sids are names, so a uuid the router disowns is a session no record-holding backend holds — tmux
+    would "accept" the notice for a shell that never existed. It reads as refused instead, and the
+    caller classifies it from the records."""
     try:
-        return _send_or_park(Sessions.backend_for(sid), sid, text) is not None
+        be = Sessions.backend_for(sid)
+        if be is _TMUX and _PR_WATCH_UUID_RE.fullmatch(str(sid)):
+            return False
+        return _send_or_park(be, sid, text) is not None
     except Exception:
         return False
 

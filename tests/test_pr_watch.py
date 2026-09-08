@@ -930,6 +930,31 @@ class RealRouting(unittest.TestCase):
         self.assertEqual([ok for ok, _ in log], [False])
         self.assertIn("has ended (its record says it ended) and no escalation contact is named", log[0][1])
 
+    def test_a_uuid_whose_record_reader_raises_waits_and_never_reaches_tmux(self):
+        # the SDK reader raising leaves the marker UNREAD, so the send still goes to the router —
+        # which disowns the sid (owns() stats the reg) and picks tmux. The deliver guard refuses a
+        # uuid there, the refusal classifies as "could not be read", and the row waits, uncounted
+        km.add_pr_watch(7, "TESTORG/testrepo", SID, now=0)
+
+        def boom(sid):
+            raise OSError(5, "input/output error")
+        self.sdk.end_marker = boom                       # the fresh instance's reader faults this tick
+        with redirect_stderr(io.StringIO()):
+            km._pr_watch_tick(100.0)
+        del self.sdk.end_marker                          # the class's real reader is back
+        self.assertEqual(self.tmux, [], "a uuid is never handed to tmux, however it reached the router")
+        self.assertEqual(len(km._pr_watches), 1, "the row waits")
+        self.assertIsNone(km._pr_watches[0].get("_norec", {}).get(SID), "a reader's fault is not counted")
+        log = self._log()
+        self.assertEqual([ok for ok, _ in log], [False])
+        self.assertIn("its record could not be read", log[0][1])
+        # the reader recovering resolves it: the reg says alive=false → ended → loud retire (no contact)
+        self.sb.write_reg(Path(self.td.name), SID, {"sid": SID, "alive": False, "name": "web"})
+        with redirect_stderr(io.StringIO()):
+            km._pr_watch_tick(200.0)
+        self.assertEqual((self.tmux, km._pr_watches), ([], []))
+        self.assertIn("has ended (its record says it ended)", self._log()[-1][1])
+
     def test_a_dead_codex_registrant_with_a_tmux_contact_hands_off(self):
         self._dead_codex(SID)
         self._tmux_contact("mgr")
