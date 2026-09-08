@@ -16,7 +16,9 @@ test("the session Status type carries the backend the kernel publishes", () => {
 
 test("the tab tooltip is a custom DOM tooltip shown on hover, not a native title", () => {
   assert.match(RENDER, /function showTabTip\(tab: HTMLElement, s: Session\)/);
-  assert.match(RENDER, /tab\.addEventListener\("mouseenter", \(\) => showTabTip\(tab, s\)\)/);
+  // the session is looked up fresh at hover time: an unchanged strip is no longer rebuilt (tab-strip-skip), so
+  // the tab node can outlive a frame that replaced the session object it was built from
+  assert.match(RENDER, /tab\.addEventListener\("mouseenter", \(\) => showTabTip\(tab, sessions\.get\(id\) \?\? s\)\)/);
   assert.match(RENDER, /tab\.addEventListener\("mouseleave", hideTabTip\)/);
   assert.doesNotMatch(RENDER, /tab\.title = s\.name \+ " · " \+ beLabel/);
 });

@@ -5063,6 +5063,13 @@ let renderPendingAfterRename = false;
 // dispatches right after pointerup, fires against the still-present node first.
 let tabPointerHeld = false;
 let renderPendingWhilePressed = false;
+// The strip's last rendered SIGNATURE (renderTabs): every input the strip paints, as one string. renderTabs
+// runs on every kernel push, and on a board of a few dozen tabs most pushes are tails for tabs that are not
+// active; rebuilding every tab node with its listeners and then reading each one's offsetTop
+// (paintTabRowLines forces a layout) was those tails' whole 2-4 ms floor. An unchanged signature returns
+// before the rebuild. Reset ("") wherever the strip's DOM is changed outside renderTabs — a tab drag's live
+// reorder — so the next render rebuilds whatever the inputs say.
+let tabStripSig = "";
 // Release the press-hold and flush any deferred rebuild. Hoisted so the DRAG handlers can call it
 // too: a native drag swallows the pointerup, so without this a finished drag would leave the strip
 // frozen against pushes until the next unrelated press (see the dragend handler).
@@ -5345,18 +5352,6 @@ function renderTabs() {
   if (tabPointerHeld) { renderPendingWhilePressed = true; return; }   // don't destroy a tab mid-click (see tabPointerHeld)
   const bar = document.getElementById("tabs");
   if (!bar) return;
-  // Preserve TAB-MODE keyboard focus across the rebuild (the user 2026-06-29). renderTabs runs on EVERY kernel
-  // push (0.5–3s), and replaceChildren() destroys the focused tab — dropping focus out of the strip (often out
-  // of the chat iframe entirely), which silently killed ←/→/Enter nav after a send or any push: you were left
-  // focused on nothing, so the keyboard model was dead until you clicked again. If a tab held focus, re-focus
-  // the active tab after the rebuild so "tab mode" survives the repaint.
-  // A focused section HEADER (a label the keyboard folds; headers live only in this bar) re-focuses by
-  // its group name after the rebuild, so a push mid-read does not kick the user from the header onto
-  // the active tab. Captured before the tab rule below, which keeps its pinned two-line shape.
-  const focusedEl = document.activeElement as HTMLElement | null;
-  const focusedGroup = (focusedEl?.closest(".tab-group-head") as HTMLElement | null)?.dataset.group;
-  const refocusTab = bar.contains(document.activeElement);
-  bar.replaceChildren();
   // TABS-FIRST (the user 2026-06-26): render the WHOLE strip up front, in `order` — the kernel's order
   // verbatim (applyTabOrder), plus any just-arrived tab not yet pushed. An id whose session hasn't landed yet
   // draws as a placeholder (name+color, non-interactive) that fills in when build_session arrives — so tabs
@@ -5406,6 +5401,50 @@ function renderTabs() {
   const plan = planStrip(visibleIds, unions, readTabGroups(unions), activeId, phoneLayout(),
                          provisionalId ? { id: provisionalId, tags: provisionalTags } : null);
   collapsedTabIds = plan.folded;
+  // AN UNCHANGED STRIP IS NOT REBUILT. The signature is every input the loop below and the controls after
+  // it paint: the active and peek tabs, the ids and the visible ids in order, whether the active tab is in
+  // view (the all-hidden blank reads it), the strip plan — each section's tag, color and members, whether
+  // it is folded or holds the active tab, and the members its folded header stands in for (the header's
+  // chip, count and pip read those; the pip's state and names come from the per-id records) — and per
+  // visible id either a placeholder's meta or the session's name, color, state and its tab class, faded,
+  // context and its tint, viewer flag, host-down mark and note; plus the context-gauge setting, the theme
+  // and the colormap (the gauge's tone and fallback read the theme — pickTone, ctxFallbackColor — and the
+  // compacting sweep's gradient the colormap, so a settings change repaints through this signature), the +
+  // tab's key hint, and the tag lens and unions the filter chips render. Equal string, same DOM: the guards
+  // above (a rename in flight, a pressed tab) still stand, the placeholder and the all-hidden blank still
+  // reconcile (stripAftermath), and the mobile slot's once-only mount still happens. Anything that mutates
+  // the strip's DOM outside this function resets tabStripSig (the tab dragstart: its live reorder moves
+  // nodes; a group drag moves none — its drop is a views write the plan reads). scheduleRenderTabs already
+  // folds one frame's pushes into one call; this is the complement, for the call that finds nothing
+  // changed. Any input the strip gains later joins this list — tab-strip-skip.test.ts is the list, and an
+  // input missing here is a repaint that never happens.
+  const stripSig = JSON.stringify([
+    activeId, peekId, ids, visibleIds, activeId ? tabInView(activeId) : null, plan.items,
+    settings.tabCtx, settings.theme, settings.colormap, titleWithKey("Open a session", "session.new"),
+    surfaceLens(effViews(), "chat"), unions,
+    visibleIds.map((id) => {
+      const s = sessions.get(id), down = hostIsDown(id), note = down ? hostDownNote(id) : "";
+      if (!s) { const m = tabMeta.get(id); return ["p", m?.name, m?.color?.bg, m?.color?.fg, down, note]; }   // makePlaceholderTab's reads
+      const st = s.status;
+      return [s.name, s.color?.bg, s.color?.fg, st.state, tabStateClass(st), !!st.faded,
+              st.ctx, st.ctxColor, st.ctxTone, !!s.sub, down, note];
+    }),
+  ]);
+  const mslotEl = document.getElementById("mtag-slot");
+  if (stripSig === tabStripSig && !(mslotEl && !mslotEl.firstChild)) { stripAftermath(visibleIds, ids); return; }
+  tabStripSig = stripSig;
+  // Preserve TAB-MODE keyboard focus across the rebuild (the user 2026-06-29). renderTabs runs on EVERY kernel
+  // push (0.5–3s), and replaceChildren() destroys the focused tab — dropping focus out of the strip (often out
+  // of the chat iframe entirely), which silently killed ←/→/Enter nav after a send or any push: you were left
+  // focused on nothing, so the keyboard model was dead until you clicked again. If a tab held focus, re-focus
+  // the active tab after the rebuild so "tab mode" survives the repaint.
+  // A focused section HEADER (a label the keyboard folds; headers live only in this bar) re-focuses by
+  // its group name after the rebuild, so a push mid-read does not kick the user from the header onto
+  // the active tab. Captured before the tab rule below, which keeps its pinned two-line shape.
+  const focusedEl = document.activeElement as HTMLElement | null;
+  const focusedGroup = (focusedEl?.closest(".tab-group-head") as HTMLElement | null)?.dataset.group;
+  const refocusTab = bar.contains(document.activeElement);
+  bar.replaceChildren();
   // A session under several tags has a COPY in each group (T264b, the user 2026-09-08: tags are
   // equivalent, none takes precedence). Every copy below is the full tab of the ONE session — same
   // identity colour, same state class and dot, the active highlight on all of them (the loop reads
@@ -5447,6 +5486,7 @@ function renderTabs() {
     // snapshots it), hence the fixed off-viewport 1px div installed once below.
     tab.addEventListener("dragstart", (e) => {
       draggedId = id; draggedEl = tab; tabDragCommitted = false;
+      tabStripSig = "";   // the drag live-reorders the strip's DOM: whatever the order ends up, the next render rebuilds
       if (e.dataTransfer) { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setDragImage(dragImageBlank(), 0, 0); }
       tab.classList.add("dragging");
       hideTabTip();                        // defect 2 (2026-08-28): the hover popover pinned open through the gesture
@@ -5477,7 +5517,8 @@ function renderTabs() {
     const st = s.status.state;
     // the state class — working gold, an on-YOU block alarm-red dashed vs a transient API error's
     // amber auto-retry, awaiting, compacting, closed — is tab-state.ts's rule, shared with the
-    // folded section header's pip so the two can never disagree on what is red
+    // folded section header's pip so the two can never disagree on what is red, and read by the
+    // strip's signature above so a state whose class changed always repaints
     const stateCls = tabStateClass(s.status);
     if (stateCls) tab.classList.add(stateCls);
     if (s.status.faded) tab.classList.add("at-rest");
@@ -5537,7 +5578,7 @@ function renderTabs() {
     // Rich hover tooltip (custom DOM — a native title can't colour/bold): backend in its own colour, the
     // full dir path, and mode/model/effort/context each on a line (the user 2026-06-23). See showTabTip.
     if (!s.sub) {   // the rich tip reads a real session's dir/branch/model; a viewer has none of them
-      tab.addEventListener("mouseenter", () => showTabTip(tab, s));
+      tab.addEventListener("mouseenter", () => showTabTip(tab, sessions.get(id) ?? s));   // fresh: the node outlives a frame that replaced the session object (the unchanged-strip skip)
       tab.addEventListener("mouseleave", hideTabTip);
     }
     const close = el("span", "tab-close");
@@ -5569,7 +5610,7 @@ function renderTabs() {
   // tooltip carries the CURRENT binding (the user 2026-08-10: shortcuts discoverable by hover). True on
   // every surface: the shell dispatches the effective chord from the same store this reads, and outside
   // the shell (VS Code / standalone, their own localStorage → the default) the in-page Cmd+O fallback
-  // below answers it. Rebuilt with the strip each push, so a rebind shows on the next render.
+  // below answers it. The hint is in the strip's signature, so a rebind shows on the next render.
   add.title = titleWithKey("Open a session", "session.new");
   add.addEventListener("click", () => openPicker());
   bar.appendChild(add);
@@ -5641,12 +5682,22 @@ function renderTabs() {
   }
   paintTabRowLines(bar);
   ensureTabRowObserver(bar);
-  // Restore tab-mode focus if a tab held it before this rebuild (see the top of renderTabs).
+  // Restore tab-mode focus if a tab held it before this rebuild (see the focus capture above the wipe).
   if (focusedGroup !== undefined) {
     const h = Array.from(bar.querySelectorAll<HTMLElement>(".tab-group-head")).find((x) => x.dataset.group === focusedGroup);
     // the group gone, or now holding the active tab (no stop): the old rule
     if (h && h.tabIndex >= 0) h.focus(); else focusActiveTab();
   } else if (refocusTab) focusActiveTab();
+  stripAftermath(visibleIds, ids);
+  // (The Fleet toggle that briefly lived here as a tab-bar pill was removed 2026-06-24: Fleet/Chat are now
+  // the rotated toggles in the chat pane's vertical strip — see _LANDING_FLEET_JS — so the pill was redundant.)
+  // (The collapse caret moved OFF the tab bar into the #ledger strip's title row — the strip now always
+  // shows the session title + caret, expanding to goals / working-on / done. See renderLedger. 2026-06-16)
+}
+/** What follows a strip render whether or not the strip was rebuilt: the no-sessions placeholder and the
+ *  all-hidden blank. Both are idempotent, and both read live state a skipped rebuild must not leave behind:
+ *  the active view is built lazily, so it can appear between two renders whose strips are equal. */
+function stripAftermath(visibleIds: readonly string[], ids: readonly string[]): void {
   syncNoSessionsPlaceholder(visibleIds.length, ids.length);
   // Hiding the LAST visible session must also blank its transcript: a strip with no tabs cannot sit
   // over a hidden session's live chat (the ghost would show exactly what the hide asked to put away).
@@ -5657,10 +5708,6 @@ function renderTabs() {
     if (av && blank && av.el.style.display !== "none") { av.el.style.display = "none"; allHiddenBlanked = true; }
     else if (av && !blank && allHiddenBlanked) { av.el.style.display = ""; allHiddenBlanked = false; }
   }
-  // (The Fleet toggle that briefly lived here as a tab-bar pill was removed 2026-06-24: Fleet/Chat are now
-  // the rotated toggles in the chat pane's vertical strip — see _LANDING_FLEET_JS — so the pill was redundant.)
-  // (The collapse caret moved OFF the tab bar into the #ledger strip's title row — the strip now always
-  // shows the session title + caret, expanding to goals / working-on / done. See renderLedger. 2026-06-16)
 }
 
 // Right-click context menu on a tab. Webviews can't use VS Code's native menus,
