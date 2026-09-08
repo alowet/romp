@@ -39,7 +39,7 @@ import { DEFAULT_CHORDS } from "./commands";
 import { NavHistory } from "./nav-history";
 import { StagedStack } from "./staged-messages";
 import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, queuedCopyToHide, dropPending, bareGroupLabel, sentAtLabel } from "./send-pending";
-import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued } from "./queued-held";
+import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued, type HeldMemory } from "./queued-held";
 import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional } from "./provisional";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
@@ -451,12 +451,38 @@ function stripOptimistic(s: Session, keepHeld = false): void {
 // pending sends are reconciled (a held copy of OUR text is then hidden for our bubble like any kernel copy).
 const HELD_PREFIX = "held:";
 const isHeldGroup = (e: ChatEvent): boolean => e.kind === "queued" && !!e.uuid && e.uuid.startsWith(HELD_PREFIX);
-const heldQueued = new Map<string, { prev: HeldQueued[]; held: HeldCopy[] }>();
+const heldQueued = new Map<string, HeldMemory>();
+// the copies the user cancelled with the ✕ on this client, per session (their qid, or their text when the kernel
+// gave none): the kernel drops them and nothing lands, so a vanished cancelled copy is never held; the entry is
+// forgotten once the queue no longer lists the copy (the cancel took effect) — event-based, no timer
+const cancelledQueued = new Map<string, { qid?: string; md: string }[]>();
+function noteCancelledQueued(sid: string, md: string, qid?: string): void {
+  const list = cancelledQueued.get(sid) || [];
+  list.push({ qid, md });
+  cancelledQueued.set(sid, list);
+}
 function reconcileHeldCopies(s: Session): void {
-  const mem = heldQueued.get(s.id) || { prev: [], held: [] };
+  // idempotent: a frame that kept the resident events (an empty full frame) still carries the previous pass's held
+  // marks and group — cleared first, so the pass recomputes from the kernel's copies alone
+  for (let i = s.events.length - 1; i >= 0; i--) {
+    const e = s.events[i];
+    if (isHeldGroup(e)) { s.events.splice(i, 1); continue; }
+    if (e.kind === "queued" && e.texts.some((t) => t.landing)) s.events[i] = { ...e, texts: e.texts.filter((t) => !t.landing) };
+  }
+  const mem = heldQueued.get(s.id) || { prev: [], anchor: null, held: [] };
   const qi = tailQueuedIdx(s.events);
   const cur = qi >= 0 ? ((s.events[qi] as Extract<ChatEvent, { kind: "queued" }>).texts as HeldQueued[]) : [];
-  const r = reconcileHeld(mem.prev, mem.held, s.events as any, cur);
+  const cancelled = cancelledQueued.get(s.id) || [];
+  const settled = !(s.status.state === "working" || s.status.state === "compacting");
+  const r = reconcileHeld(mem, s.events as any, cur, {
+    settled,
+    cancelled: (c) => cancelled.some((x) => x.qid && c.qid ? x.qid === c.qid : x.md.trim() === c.md.trim()),
+  });
+  // a cancel has taken effect once the kernel's queue no longer lists the copy: forget it
+  if (cancelled.length) {
+    const still = cancelled.filter((x) => cur.some((t) => x.qid && t.qid ? t.qid === x.qid : (typeof t.md === "string" && t.md.trim() === x.md.trim())));
+    if (still.length) cancelledQueued.set(s.id, still); else cancelledQueued.delete(s.id);
+  }
   heldQueued.set(s.id, r);
   // the held set changed (a copy taken, a copy landed): the frame may keep its LENGTH while a held card gives way to
   // the landed atom, and the repaint's no-op fast path reads length alone — so the view is marked stale here
@@ -1876,6 +1902,10 @@ function renderEvent(ev: ChatEvent, prevEpoch?: number | null, worked?: number |
     const hid = el("div", "turn turn-user turn-echo-hidden"); hid.style.display = "none"; return hid;
   }
   const turn = renderEventInner(ev);
+  // OUR cached pending group comes back as the SAME element on every push (renderPendingGroup): its anchors, hover
+  // wiring and rail chrome were attached the first time and must not accumulate (T262h follow-up)
+  if (turn.dataset.wired === "1") return turn;
+  if (ev.kind === "queued" && isOptimistic(ev) && ev.bare) turn.dataset.wired = "1";
   // pending-rewind overlay (reconcileRewind): this turn sits AFTER an edited message — it belongs to
   // the branch being abandoned, so it dims until the kernel's rewound payload replaces it
   if ((ev as any).rewound) turn.classList.add("rewound");
@@ -3965,7 +3995,8 @@ function fillBareLabel(label: HTMLElement, nLost: number, nSending: number): voi
 const pendingGroupNode = new Map<string, { sig: string; node: HTMLElement }>();
 function renderPendingGroup(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
   const sid = renderingSid || activeId || "";
-  const sig = JSON.stringify(ev.texts.map((t) => [t.md, !!t.lost, t.qts, t.imgPaths || null])) + "|" + JSON.stringify(ev.held || null);
+  const sig = JSON.stringify(ev.texts.map((t) => [t.md, !!t.lost, t.qts, t.imgPaths || null])) + "|" + JSON.stringify(ev.held || null)
+    + (ev.held && ev.held.resetsAt ? "|" + Math.floor(Date.now() / 60000) : "");   // a held countdown reads the minute: re-rendered as it ticks
   const fresh = renderQueued(ev);
   const cached = pendingGroupNode.get(sid);
   if (cached && cached.node.isConnected !== undefined) {
@@ -4033,7 +4064,8 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
       : askNote;
     const label = el("span", "queued-count");
     label.dataset.why = why;      // the ✕'s recount rewrites the count and keeps this suffix as-is
-    label.textContent = queuedCountText(n, nCmd, nSys, nNudge) + why;
+    // every copy taken but not landed (T262i): the head says so, so a held card never reads as a queued one
+    label.textContent = (texts.every((t) => t.landing) ? `${n} ${n === 1 ? "message" : "messages"} landing…` : queuedCountText(n, nCmd, nSys, nNudge)) + why;
     // `detail` is the CLI's OWN sentence about the limit (it carries the reset time as a wall clock, which
     // is why that flavor has no epoch to count down to). One level deeper on hover, per the compact-by-
     // default rule — the head keeps its one-line reason.
@@ -15834,6 +15866,7 @@ setupSettings();
       const provisional = isProvisionalId(sidQ);
       if (provisional && qmd) forgetProvisionalSend(qmd);
       const msg: Record<string, unknown> = { type: "cancelQueued", id: sidQ, md: qmd };
+      if (qmd && el.dataset.qopt !== "1") noteCancelledQueued(sidQ, qmd, el.dataset.qid || undefined);   // a kernel copy: never held once it vanishes (T262i)
       if (el.dataset.qidx !== undefined) msg.idx = Number(el.dataset.qidx);
       if (el.dataset.qpark !== undefined) msg.park = Number(el.dataset.qpark);
       if (!provisional) vscodeApi.postMessage(msg);
