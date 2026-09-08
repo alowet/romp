@@ -131,6 +131,21 @@ test("a tail change or spacer row of the WRONG size does not explain the move", 
   assert.equal(moves[0].by, undefined);
 });
 
+test("a read while the view has nothing to scroll (emptied for a rebuild, clamped to 0) is neither a move nor a position", () => {
+  const rows = [
+    write(1000, "land-bottom", 0, BOTTOM, true),
+    gesture(40000, 0, 800, 800),                          // the view is empty: scrollHeight == clientHeight, top clamps to 0
+    write(40100, "land-bottom", 0, BOTTOM, true),         // the rebuild lands
+    gesture(40200, BOTTOM),                               // its echo
+  ];
+  assert.deepEqual(unwrittenMoves(rows), []);
+  // …and it does not seed the next comparison either: a real snap after it is measured from the land, not from 0
+  const withSnap = [...rows, gesture(43000, BOTTOM - 64)];
+  const moves = unwrittenMoves(withSnap);
+  assert.equal(moves.length, 1);
+  assert.equal(moves[0].from, BOTTOM);
+});
+
 test("rows of several tabs are audited per tab; `sid` picks one", () => {
   const rows = [
     write(1000, "land-bottom", 0, BOTTOM, true),

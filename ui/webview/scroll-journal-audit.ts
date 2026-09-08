@@ -21,7 +21,9 @@
 //
 // Limits, stated so a quiet result is read correctly: a move inside a gesture (the snap landed mid-burst once) is not
 // separable from the burst by position alone and is not reported; a reader's single fast flick after a pause is
-// reported as a move with `explained: "none"` — repeatedLandings tells the two apart, since a flick lands anywhere.
+// reported as a move with `explained: "none"` — repeatedLandings tells the two apart, since a flick lands anywhere. A
+// scroll event read while the view has nothing to scroll (scrollHeight <= clientHeight: a view emptied for a rebuild
+// clamps to 0) is neither a move nor a position; the rebuild's own land is the next position.
 
 export type JournalRow = { t: number; what: string; data: any };
 
@@ -73,6 +75,8 @@ function auditOne(rows: JournalRow[], o: Required<Omit<AuditOptions, "sid">> & {
     if (r.what === "tailchange" || r.what === "spacer") { since.push(r); continue; }
     if (r.what !== "scrollgesture" || typeof d.top !== "number") continue;
     const top = d.top;
+    const sh0 = Number(d.sh) || 0, ch0 = Number(d.ch) || 0;
+    if (sh0 > 0 && ch0 > 0 && sh0 <= ch0) continue;                 // nothing to scroll: an emptied view mid-rebuild clamps to 0; not a move, not a position
     if (pos != null) {
       const delta = top - pos, idle = r.t - posT;
       const next = nextGesture(rows, i + 1);
