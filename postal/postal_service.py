@@ -2404,19 +2404,26 @@ def quarantine_decide(mid, action, text=None, feedback=None):
                 # it — the same id-strict rule intake applies (_relay_in: "never a name fallback,
                 # which could hand the mail to a same-named sibling"). Before this, approve
                 # re-matched by NAME unconditionally, and id-addressed mail whose recipient had
-                # ended went to whatever session now wore the name. Nothing live by that id →
-                # refuse loudly; the record stays held (deny carries a note back to the sender).
-                match = [a for a in agents if str(a.get("id") or "") == wire and not _postal_off(a["id"])]
-                if not match:
-                    return False, ("the session this message was addressed to ('%s', id %s) has ended — "
-                                   "nothing by that id is live, and a session that now wears the name "
-                                   "is not the one the sender chose, so it was not delivered. It stays "
-                                   "held: deny it (with a note, so the sender hears) or leave it."
-                                   % (rec.get("to") or "?", wire[:8]))
-            else:                                     # NAME-addressed (an older sender): the name still rules
-                match = [a for a in agents if a["name"] == rec.get("to") and not _postal_off(a["id"])]
-                if not match:
-                    return False, "recipient '%s' is no longer a live local session" % (rec.get("to") or "?")
+                # ended went to whatever session now wore the name. The held sid IS the wire id
+                # (intake matched the wire's toId exactly and held that match), so a held sid the
+                # listing no longer carries means nothing live answers to the id the sender chose:
+                # there is no second candidate to look for (review find, 2026-09-08: a re-match on
+                # the wire id here could never succeed). Refuse loudly; the record stays held (deny
+                # carries a note back to the sender). Worded on what the listing proved, no live
+                # session by that id, never "ended": a dormant session is absent from it too.
+                return False, ("no live session carries the id this message was addressed to ('%s', "
+                               "id %s), and a session that now wears the name is not the one the "
+                               "sender chose, so it was not delivered. It stays held: deny it (with a "
+                               "note, so the sender hears) or leave it."
+                               % (rec.get("to") or "?", wire[:8]))
+            # NAME-addressed (an older sender): the name still rules. A record held BEFORE
+            # 2026-09-08 lands here too even when its wire chose a sid, the hold kept only the
+            # resolved sid then, so nothing on the record can tell the two apart; that name
+            # re-match is a known residual for holds from before the upgrade, and it drains with
+            # their next approve/deny (review find, 2026-09-08).
+            match = [a for a in agents if a["name"] == rec.get("to") and not _postal_off(a["id"])]
+            if not match:
+                return False, "recipient '%s' is no longer a live local session" % (rec.get("to") or "?")
             to_id = match[0]["id"]
         deliver(to_id, rec.get("frm") or "?", rec.get("frmId") or "", body, kind=rec.get("kind") or "",
                 from_host=rec.get("origin") or "",

@@ -209,6 +209,35 @@ class MailKeyedByStableId(_AwaitBase):
         self.assertIn((A, self.Y), last_ask)
         self.assertIn((A, self.X), last_ask, "…while the old ask keeps its own key")
 
+    def test_upgrade_time_a_legacy_ask_to_a_recreated_peer_stays_keyed_to_the_prior_wearer(self):
+        # review find, 2026-09-08: the residual the PR body names, pinned so the boundary is visible:
+        # an ask sent BEFORE the upgrade (no to_sid) to a name a recreated session now wears, where the
+        # new wearer's FIRST sighting on this host is its own reply. The anchor can only pick the prior
+        # wearer (the log records no wearer deaths, and nothing sighted the new one before the send), so
+        # the ask reads open on both readers; main's last-write-wins happened to read it answered. The
+        # same exchange on a post-upgrade row keys by to_sid and reads answered: new rows cannot recur.
+        W1 = self.X                                   # wore "api" before the ask; never replied to it
+        W2 = self.Y                                   # recreated under the name; its first row is the reply
+        legacy = [
+            {"from_id": W1, "to_id": self.C, "t": 50, "kind": "coordinate", "body": "hello from the first api",
+             "from_host": "TESTHOST", "from": "api"},
+            {"from_id": A, "to_id": "peer:TESTHOST", "toName": "TESTHOST:api", "t": 100,
+             "kind": "question", "body": "status?"},
+            {"from_id": W2, "to_id": A, "t": 150, "kind": "coordinate", "body": "shipped",
+             "from_host": "TESTHOST", "from": "api"},
+        ]
+        self._write(legacy)
+        km.jd._PEER_ASK_CACHE[:] = [None, ({}, {}, {})]
+        _any, last_ask, _aw = km._postal_wait_maps()
+        self.assertIn((A, W1), last_ask, "anchored at the send: the prior wearer (main: W2, the answerer)")
+        self.assertEqual(km._peer_answered_at(A), 0, "the documented residual: open until the 6h wake (main: 150)")
+        self.assertEqual(km.jd._open_ask_peers(A), [W1], "the judge's gate agrees with the wait maps")
+        # the same exchange as a post-upgrade row: the relay wrote the recipient's id, no alias involved
+        self._write([dict(legacy[1], to_sid=W2)] + [legacy[0], legacy[2]])
+        km.jd._PEER_ASK_CACHE[:] = [None, ({}, {}, {})]
+        self.assertEqual(km._peer_answered_at(A), 150, "to_sid keys the row to W2; W2's reply answers it")
+        self.assertEqual(km.jd._open_ask_peers(A), [])
+
     def test_to_sid_keys_the_row_without_any_alias(self):
         # a relay row since 2026-09-08 carries the sid the send resolved: no peer row is needed to
         # place it, and a later name reuse cannot move it

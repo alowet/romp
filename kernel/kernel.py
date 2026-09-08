@@ -20082,17 +20082,37 @@ def _peer_identity(psid):
     wait names the ACTUAL session — 'a peer' is a bug to trace, not a style). Accepts the three
     recorded shapes — a bare sid, the courier's cross-host "<host>:<tail>" composite, the wait map's
     "peer:<host>:<name>" key — and resolves {name, host, sid, color}: the names REGISTRY first
-    (identity persists for DORMANT sessions; liveness is never a prerequisite for naming), else the
+    (identity persists for DORMANT sessions; liveness is never a prerequisite for naming), else, a
+    bare sid another kernel owns (review find, 2026-09-08: the wait maps key a cross-host ask on the
+    row's to_sid, and the registry knows no remote sid, so every such chip read an eight-hex stub with
+    no host), what its host calls it in the tunnel supervisor's snapshot of that host's /sessions
+    (_remote_name_of, the ladder the user ruled on 2026-09-06 for a federated session), else the
+    "<host>:<name>" the postal log itself paired with the sid (_postal_peer_names: the relay row's
+    to_sid + toName, or the peer's own from_host + from stamp, the only source for a host reached
+    through gossip, which the supervisor never polls), else the
     composite's own parts (display-join on the canonical pair, per the federation rule — a name tail
-    reads whole, a sid tail stubs to 8), else the sid stub. Color is registry-only: a peer another
-    kernel owns keeps color None (its identity colors live on its home kernel), so the UIs render an
-    uncolored host-prefixed name rather than a guessed hue."""
+    reads whole, a sid tail stubs to 8), else the sid stub, host-prefixed when the supervisor at
+    least knows which host owns the sid. Color is registry-only: a peer another kernel owns keeps
+    color None (its identity colors live on its home kernel), so the UIs render an uncolored
+    host-prefixed name rather than a guessed hue."""
     raw = str(psid or "")
     if raw.startswith("peer:"):
         raw = raw[len("peer:"):]
     pn = _name_of(raw)
     if pn:
         return {"name": pn, "host": "", "sid": raw, "color": _name_color(raw)}
+    if _UUIDISH_RE.match(raw):
+        r = _host_for_sid(raw)
+        host = str((r or {}).get("host") or "")
+        rn = _remote_name_of(host, raw) if r else None
+        if rn:
+            return {"name": rn, "host": host, "sid": raw, "color": None}
+        hn = _postal_peer_names().get(raw) or ""
+        if hn:
+            h, _, tail = hn.partition(":")
+            return {"name": tail or raw[:8], "host": h, "sid": raw, "color": None}
+        if host:
+            return {"name": raw[:8], "host": host, "sid": raw, "color": None}   # owner known, name not (yet)
     if ":" in raw:
         h, _, tail = raw.partition(":")
         return {"name": (tail[:8] if _UUIDISH_RE.match(tail) else tail) or raw[:8],
@@ -28098,6 +28118,7 @@ def _blocked_placeholder(s, name, color, fsid, live, now, perm_state, since):
 # body regex is only the fallback for old log rows (the user 2026-06-22 / the 2026-07-22 unification).
 _WAIT_Q_RE = re.compile(r"^\s*(?:QUESTION|ASK|Q)\b", re.I)
 _POSTAL_WAIT_CACHE = [None, None]   # (mtime_ns, size) , (last_any, last_ask, last_await) — one log scan per file change
+_POSTAL_PEER_NAMES = [None, {}]     # (mtime_ns, size) , {remote sid: "<host>:<name>"}: the same scan's display join
 
 
 def _postal_wait_maps():
@@ -28124,15 +28145,28 @@ def _postal_wait_maps():
     Cross-host rows key on the recipient's STABLE id: `to_sid` when the row carries it (relay rows since
     2026-09-08), else the name alias AT the row's own send time (jd._alias_at — last-write-wins re-keyed
     every old message to whichever session most recently wore the name), else the raw
-    "peer:<host>:<name>"."""
+    "peer:<host>:<name>".
+
+    The sid is the KEY, not the label (review find, 2026-09-08): a bare remote sid names nothing on this
+    kernel (the names registry is local), so a to_sid-keyed wait's chip fell to the eight-hex stub with no
+    host. The same scan therefore keeps the display join beside the maps, _POSTAL_PEER_NAMES, {remote
+    sid: "<host>:<name>"} from every row that pairs the two (a relay row's to_sid + toName, a remote
+    sender's from_id + from_host + from), newest sighting winning, and _peer_identity reads it
+    (_postal_peer_names) so the chip names the peer the row named."""
     try:
         st = jd.MESSAGES.stat()
         key = (st.st_mtime_ns, st.st_size)
     except OSError:
+        _POSTAL_PEER_NAMES[:] = [None, {}]
         return {}, {}, {}
     if _POSTAL_WAIT_CACHE[0] == key:
         return _POSTAL_WAIT_CACHE[1]
     last_any, last_ask, last_await = {}, {}, {}
+    peer_names = {}   # remote sid -> (t, "<host>:<name>"): the display join, newest sighting wins
+
+    def _saw(sid, at, hn):
+        if sid and hn and at >= peer_names.get(sid, (-1, ""))[0]:
+            peer_names[sid] = (at, hn)
     try:
         rows = []
         alias = {}   # "host:name" -> [(t, sid), …], learned from every row a remote sender stamped
@@ -28142,6 +28176,9 @@ def _postal_wait_maps():
             rows.append(o)
             jd._learn_alias(alias, o)
         jd._alias_settle(alias)
+        for hn, hist in alias.items():                # the peer's own stamps, inverted: sid -> what it wore
+            for at, sid in hist:
+                _saw(sid, at, hn)
         for o in rows:
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
@@ -28156,6 +28193,7 @@ def _postal_wait_maps():
             if isinstance(t_, str) and t_.startswith("peer:"):
                 if o.get("to_sid"):
                     t_ = str(o["to_sid"])
+                    _saw(t_, ts, str(o.get("toName") or ""))   # the send resolved this name for this sid
                 elif o.get("toName"):
                     # unresolvable (the peer never sent a row, so the alias map can't know its sid) →
                     # key on the NAMED recipient rather than the bare relay: two asks to different
@@ -28176,8 +28214,17 @@ def _postal_wait_maps():
                 last_await[(f, t_)] = max(last_await.get((f, t_), 0), ts)
     except OSError:
         pass
+    _POSTAL_PEER_NAMES[:] = [key, {sid: hn for sid, (_at, hn) in peer_names.items()}]
     _POSTAL_WAIT_CACHE[:] = [key, (last_any, last_ask, last_await)]
     return last_any, last_ask, last_await
+
+
+def _postal_peer_names():
+    """{remote sid: "<host>:<name>"}: the postal log's own display join for the recipients the wait maps
+    key by stable id (review find, 2026-09-08; see _postal_wait_maps). Warms the maps' scan when the log
+    changed (a no-op on the cached key), so it costs a stat per call."""
+    _postal_wait_maps()
+    return _POSTAL_PEER_NAMES[1]
 
 
 def _wait_for_graph(now, alive_sids):

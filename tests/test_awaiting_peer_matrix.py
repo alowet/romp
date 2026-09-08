@@ -250,6 +250,35 @@ class TwinsKeyMailByStableId(_Base):
         self.assertEqual(jd._alias_at(hist, "TESTHOST:api", 9_000), self.Y)
         self.assertIsNone(jd._alias_at(hist, "TESTHOST:web", 100), "a name never seen resolves to nothing")
 
+    def test_alias_settle_rule(self):
+        # review find, 2026-09-08 (untested until now): the settle SORTS each name's sightings by t and
+        # keeps one entry per WEARER CHANGE, so a chatty peer name is one entry, not one per row, and a
+        # name that went X -> Y -> X keeps all three changes. Result-identical for _alias_at at every t.
+        raw = {"TESTHOST:api": [(400, self.Y), (150, self.X), (450, self.Y), (200, self.X), (900, self.X)],
+               "TESTHOST:web": [(300, self.C), (100, self.C)]}
+        probe = {k: [(t, jd._alias_at({k: sorted(v)}, k, t)) for t in (50, 150, 200, 400, 450, 900, 5_000)]
+                 for k, v in raw.items()}                       # the sorted, uncollapsed reading
+        jd._alias_settle(raw)
+        self.assertEqual(raw["TESTHOST:api"], [(150, self.X), (400, self.Y), (900, self.X)],
+                         "sorted; consecutive sightings of one sid collapse; a returning wearer is a new entry")
+        self.assertEqual(raw["TESTHOST:web"], [(100, self.C)], "one wearer, however many rows")
+        for k, want in probe.items():
+            self.assertEqual([(t, jd._alias_at(raw, k, t)) for t, _ in want], want,
+                             "the sid in force at every t is unchanged by the collapse: %s" % k)
+
+    def test_learn_alias_reads_only_rows_a_remote_sender_stamped(self):
+        # the history is built from the peer's OWN stamps (from_host + from + from_id); a local row, a
+        # relay row (no from_host) and a row without a name file nothing, and a garbage t reads as 0
+        alias = {}
+        for o in ({"from": "web", "from_id": SID, "to_id": MGR, "t": 10},                  # local: no from_host
+                  {"from": "web", "from_id": SID, "to_id": "peer:TESTHOST", "toName": "TESTHOST:api",
+                   "to_sid": self.X, "t": 20},                                              # a relay row
+                  {"from_host": "TESTHOST", "from_id": self.X, "t": 30},                    # no name
+                  {"from_host": "TESTHOST", "from": "api", "from_id": self.X, "t": "nope"},
+                  {"from_host": "TESTHOST", "from": "api", "from_id": self.Y, "t": 40}):
+            jd._learn_alias(alias, o)
+        self.assertEqual(alias, {"TESTHOST:api": [(0, self.X), (40, self.Y)]})
+
 
 class MatrixPlannerGate(_Base):
     """The nudge planner's awaiting op: kind=peer demotes to kindless without an open ask (the op's
@@ -407,11 +436,14 @@ class CrossHostDelegation(_Base):
     RHOST, RNAME = "TESTHOST-B", "web"
     RSID = "eeeeeeee-ffff-0000-1111-222222222222"     # the remote recipient's sid, learned on reply
 
-    def _xrow(self, i, ts, kind="delegate", body="own the exporter work"):
-        return json.dumps({"id": "px-%d.mail.TESTHOST-A" % i, "ev": "sent", "from": "api",
-                           "from_id": SID, "to_id": "peer:%s" % self.RHOST,
-                           "toName": "%s:%s" % (self.RHOST, self.RNAME), "t": ts,
-                           "kind": kind, "body": body})
+    def _xrow(self, i, ts, kind="delegate", body="own the exporter work", to_sid=None):
+        r = {"id": "px-%d.mail.TESTHOST-A" % i, "ev": "sent", "from": "api",
+             "from_id": SID, "to_id": "peer:%s" % self.RHOST,
+             "toName": "%s:%s" % (self.RHOST, self.RNAME), "t": ts,
+             "kind": kind, "body": body}
+        if to_sid:
+            r["to_sid"] = to_sid                       # a relay row since 2026-09-08 names the recipient by id
+        return json.dumps(r)
 
     def _reply(self, i, ts):
         return json.dumps({"id": "rx-%d.mail.%s" % (i, self.RHOST), "ev": "sent", "from": self.RNAME,
@@ -483,6 +515,44 @@ class CrossHostDelegation(_Base):
         jd.run_propagate(now=T0 + 400)
         self.assertFalse(self._handoffs()[0].get("nodeComplete"),
                          "only the delegated peer's own reply is the report-back event")
+
+    def test_a_row_that_carries_to_sid_plants_it_as_the_trackers_exact_key(self):
+        # review find, 2026-09-08: the plant had the row's to_sid in hand and dropped it, so the remote
+        # arm re-derived the recipient by NAME while the kernel's wait maps read the same row by sid
+        self._fleet_stub()
+        # two real dispatches, so each keeps its own tracker: the plant collapses a byte-identical
+        # OPEN twin (same peer, label AND recorded body) into one node by design (2026-08-28)
+        self._log([self._xrow(1, T0 + 10, to_sid=self.RSID),
+                   self._xrow(2, T0 + 20, body="own the importer work")])
+        jd.run_courier(now=T0 + 100)
+        by_mid = {nd["handoff"]["msgId"]: nd["handoff"] for nd in self._handoffs()}
+        h = by_mid["px-1.mail.TESTHOST-A"]
+        self.assertEqual((h["peer"], h["toSid"]), ("TESTHOST-B:web", self.RSID),   # KeyError before the fix
+                         "the display identity stays toName; the exact key rides beside it")
+        self.assertNotIn("toSid", by_mid["px-2.mail.TESTHOST-A"],
+                         "a legacy row plants no toSid: the arm falls to the send-time alias for it")
+
+    def test_both_readers_complete_a_to_sid_handoff_on_the_recreated_peers_first_mail(self):
+        # the twins rule, for handoffs (review find, 2026-09-08): a peer recreated under the same name
+        # (new sid RSID) whose FIRST mail to this host is its report-back. The kernel's wait maps key
+        # the row on to_sid and read it answered; the courier must agree, anchoring the NAME at send
+        # time picked the old wearer, found no reply, and left the tracker open while the stamp lifted.
+        self._fleet_stub()
+        old = "eeeeeeee-ffff-0000-1111-333333333333"    # the name's earlier wearer, sighted before the send
+        rows = [json.dumps({"id": "rx-0.mail.%s" % self.RHOST, "ev": "sent", "from": self.RNAME,
+                            "from_id": old, "from_host": self.RHOST, "to_id": SID, "t": T0 - 500,
+                            "kind": "coordinate", "body": "hello from the first web"}),
+                self._xrow(1, T0 + 10, to_sid=self.RSID)]
+        self._log(rows)
+        jd.run_courier(now=T0 + 100)
+        rows.append(self._reply(1, T0 + 300))            # RSID's first sighting is the report-back
+        self._log(rows)
+        self.assertEqual(km._peer_answered_at(SID), T0 + 300, "the wait maps read the row answered")
+        self.assertEqual(jd.run_propagate(now=T0 + 400), 1,
+                         "the courier agrees (name-anchored: 0: keyed to the old wearer, who never replied)")
+        nd = self._handoffs()[0]
+        self.assertTrue(nd.get("nodeComplete"))
+        self.assertIn("reported back by TESTHOST-B:web", nd.get("doneWhy") or "")
 
 
 if __name__ == "__main__":

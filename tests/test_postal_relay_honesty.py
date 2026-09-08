@@ -444,12 +444,19 @@ class QuarantineApproveIsIdStrict(_RelayBase):
         ok, err = pm.quarantine_decide(m["mid"], "approve")
         self.assertFalse(ok, "main delivers to the squatter here")
         self.assertEqual(self.delivered, [], "nothing reached the same-named stranger")
-        self.assertIn("has ended", err)
+        self.assertIn("no live session carries the id", err,
+                      "worded on what the listing proved (review find, 2026-09-08: it said 'has ended', "
+                      "which a dormant session is not)")
+        self.assertNotIn("has ended", err)
         self.assertIn("'web'", err, "the refusal names the session the mail was addressed to")
         self.assertIn(GHOST[:8], err, "…and its id")
         self.assertIsNotNone(pm.quarantine_get(m["mid"]), "the record stays held (deny carries a note back)")
 
     def test_id_addressed_mail_whose_recipient_renamed_still_delivers_to_it(self):
+        # a GUARD, not the id-strict branch: the held sid is still live, so approve never enters the
+        # gone-sid arm at all (the rename changes nothing the record keys on). Passes on main too.
+        # There is no positive arm to reach in that branch (review find, 2026-09-08): the held sid is
+        # the wire id, so once it is gone nothing live can match it: see the id-strict refusal above.
         _set_live([{"id": GHOST, "name": "web"}])
         m = dict(self._msg("web"), toId=GHOST)
         self._hold(m)
@@ -457,6 +464,28 @@ class QuarantineApproveIsIdStrict(_RelayBase):
         ok, err = pm.quarantine_decide(m["mid"], "approve")
         self.assertTrue(ok, err)
         self.assertEqual(self.delivered[0][0][0], GHOST, "the sid picks the session, not the name")
+
+    def test_id_addressed_mail_whose_recipient_is_gone_refuses_with_nobody_wearing_the_name_too(self):
+        # the same refusal with no squatter in the listing: the branch never looks for one
+        _set_live([{"id": GHOST, "name": "web"}])
+        m = dict(self._msg("web"), toId=GHOST)
+        self._hold(m)
+        _set_live([{"id": ALPHA, "name": "api"}])
+        ok, err = pm.quarantine_decide(m["mid"], "approve")
+        self.assertFalse(ok)
+        self.assertIn("no live session carries the id", err)
+        self.assertEqual(self.delivered, [])
+        self.assertIsNotNone(pm.quarantine_get(m["mid"]), "still held")
+
+    def test_the_id_strict_branch_has_no_name_fallback_and_no_dead_arm(self):
+        # structural pin (review find, 2026-09-08): between reading toWireId and the name re-match
+        # there is exactly one statement path, the refusal, and no re-match on the wire id
+        import inspect
+        src = inspect.getsource(pm.quarantine_decide)
+        body = src[src.index('wire = str(rec.get("toWireId")'):src.index("NAME-addressed")]
+        self.assertNotIn("== wire", body, "no candidate scan on the wire id: it cannot succeed")
+        self.assertNotIn('a["name"] == rec.get("to")', body, "no name re-match for id-addressed mail")
+        self.assertEqual(body.count("return False"), 1)
 
     def test_name_addressed_mail_still_rematches_by_name(self):
         # a GUARD (passes on main too): an older sender parks no toId, so the name is all there is
