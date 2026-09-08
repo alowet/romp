@@ -54,16 +54,19 @@ class _Kernel:
     def __init__(self):
         self.td = tempfile.TemporaryDirectory()
         self.root = Path(self.td.name)
+        self._saved = []   # a STACK: `with k:` nests (a helper called inside a block re-enters the same
+        #                    kernel), and a single slot left jd.STATE on this root after the outer exit — the
+        #                    next module then wrote under a deleted temp dir (CI + the full run, 2026-09-08)
 
     def __enter__(self):
-        self._saved = jd.STATE
+        self._saved.append(jd.STATE)
         jd.STATE = self.root
         km._autonudge_cache.clear()
         return self
 
     def __exit__(self, *a):
         km._autonudge_cache.clear()
-        jd.STATE = self._saved
+        jd.STATE = self._saved.pop()
 
     def version(self):
         """What this kernel's /version says to a polling peer: the settings dict + every store's stamp."""
