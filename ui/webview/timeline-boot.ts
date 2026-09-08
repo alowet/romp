@@ -45,6 +45,9 @@ export function dispatchFrame(panel: any, m: any): boolean {
   // the kernel's pick memory moved (a pin, a Latest un-pin, a refused pin dropped — from any surface or
   // dashboard) or its catalog grew: the lane picker re-reads /models so its family rows send the fresh default
   if (m.type === "models" && panel.refreshModels) { panel.refreshModels(); return true; }
+  // the kernel refused a gesture this page posted (a lane flag whose store could not be read): the panel
+  // ends its optimistic state on this event and shows the reason in the gear
+  if (m.type === "settingRefused" && panel.settingRefused) { panel.settingRefused(m); return true; }
   if (m.type === "tagEditFailed" && panel.tagEditFailed) { panel.tagEditFailed(m); return true; }
   return false;
 }

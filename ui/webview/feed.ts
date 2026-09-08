@@ -5294,6 +5294,19 @@ window.addEventListener("message", (e: MessageEvent) => {
     renderModal();
     applyExtHover();
     if (extHoverEid) document.querySelector(".dot-hl[data-eid]")?.scrollIntoView({ block: "center" });
+  } else if (m.type === "settingRefused" && typeof m.text === "string" && m.text) {
+    // the kernel refused a bell toggle this page posted (its store could not be read): end the optimistic
+    // state ON THIS EVENT — the card's sticky latch drops and the bell repaints to what the payload holds
+    // (the paint key reads the latch) — and say why. A SOFT refusal: nothing typed was lost, so the fading
+    // toast (the chat's weight for the same class), never the must-dismiss dialog; the shell's bell keeps the
+    // durable record under its own `refused` kind, so muting judge warnings never mutes these. A `warn`
+    // frame had no handler on this page, so the bell stayed painted as if the click had landed until a reload.
+    if (m.gesture === "bell" && typeof m.itemId === "string" && m.itemId) pendingNotify.delete(m.itemId);
+    render();
+    window.parent?.postMessage({ romp: "notify", kind: "refused", text: m.text,
+                                 sid: typeof m.sid === "string" ? m.sid : "",
+                                 itemId: typeof m.itemId === "string" ? m.itemId : "" }, "*");
+    feedToast(m.text);
   } else if (m.type === "err" && typeof m.text === "string" && m.text) {
     // the dialog interrupts; the bell KEEPS it (the user 2026-07-29) — dismissing the modal must not erase
     // the fact that a message never landed. Same {romp:'notify'} bridge the card-badge mirror below uses.

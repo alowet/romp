@@ -196,5 +196,292 @@ class SessionOrder(unittest.TestCase):
         self.assertEqual(out, [OBS2, B, C], "the fork renders in obsidian's slot (first), not at the end")
 
 
+class OrderStoreUnreadableRefuses(unittest.TestCase):
+    """The state-readers audit (rank 8): _session_order used to fold ANY read fault to [], and both
+    _merge_session_order (a drag) and _ordered (per push) persisted the result — so a transient EIO
+    turned every session "new", overwriting the user's saved lane order with plain discovery order
+    under no gesture. The mutation paths now read PROVED: a drag is refused loudly and _ordered
+    renders last-known and persists nothing on a fault. Synthetic sids only."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        # _session_order_lkg is new on the fix; guard so this module still IMPORTS + runs on origin/main
+        # (where the primary test must fail by SHOWING the erasure, not erroring in setUp)
+        self._lkg = km._session_order_lkg[0] if hasattr(km, "_session_order_lkg") else None
+        self._saved_state = km.jd.STATE
+        km.jd.STATE = Path(self.td.name)
+        if hasattr(km, "_session_order_lkg"):
+            km._session_order_lkg[0] = None
+
+    def tearDown(self):
+        km.jd.STATE = self._saved_state
+        if hasattr(km, "_session_order_lkg"):
+            km._session_order_lkg[0] = self._lkg
+        self.td.cleanup()
+
+    def _path(self):
+        return km.jd.STATE / "session-order.json"
+
+    def _fault_reads_of(self, target):
+        """Fail BOTH read_bytes (the fix's proved reader) and read_text (origin/main's reader) for one
+        path — green on the fix, RED on main where the fold-to-[] overwrites the order with a drag's
+        subset (or discovery order)."""
+        import errno
+        real_rb, real_rt = Path.read_bytes, Path.read_text
+        tgt = str(target)
+        def rb(self, *a, **k):
+            if str(self) == tgt:
+                raise OSError(errno.EIO, "injected EIO")
+            return real_rb(self, *a, **k)
+        def rt(self, *a, **k):
+            if str(self) == tgt:
+                raise OSError(errno.EIO, "injected EIO")
+            return real_rt(self, *a, **k)
+        Path.read_bytes, Path.read_text = rb, rt
+        return (real_rb, real_rt)
+
+    def test_a_drag_is_refused_and_the_order_untouched_when_the_store_cannot_be_read(self):
+        km._write_session_order([A, B, C])                 # the user's saved lane order
+        before = self._path().read_bytes()
+        saved = self._fault_reads_of(self._path())
+        raised = None
+        try:
+            # a chat-tab drag publishing only [C, B]: on origin/main _merge_session_order reads a
+            # fabricated [] and returns [C, B], which _write_session_order then persists — DROPPING A's
+            # slot. Here we persist the merge result exactly as the WS branch does, so the erasure shows.
+            merged = km._merge_session_order([C, B])
+            km._write_session_order(merged)
+        except Exception as e:                             # noqa: BLE001 — on main it never raises
+            raised = e
+        finally:
+            Path.read_bytes, Path.read_text = saved
+        # THE erasure: on main the file is now [C, B] (A gone); the fix refuses before any write.
+        self.assertEqual(self._path().read_bytes(), before,
+                         "the order file must be unchanged when its file can't be read (main drops A here)")
+        self.assertEqual(type(raised).__name__, "_StateUnreadable",
+                         "the drag is refused LOUDLY, not spliced into a fabricated [] (got %r)" % raised)
+
+    def test_ordered_renders_last_known_and_persists_nothing_on_a_fault(self):
+        km._write_session_order([A, B, C])
+        _ = km._session_order()                            # prime the last-known-good
+        before = self._path().read_bytes()
+        saved = self._fault_reads_of(self._path())
+        try:
+            out = [s["sid"] for s in km._ordered([sess(C, 300), sess(A, 100), sess(B, 200)])]
+        finally:
+            Path.read_bytes, Path.read_text = saved
+        self.assertEqual(out, [A, B, C], "renders the last-known order, not discovery order")
+        self.assertEqual(self._path().read_bytes(), before,
+                         "a display fault persists NOTHING — the saved order is not overwritten")
+
+    def test_a_torn_order_file_is_quarantined_aside_not_overwritten(self):
+        torn = b'["aaaa", THIS IS NOT JSON'
+        self._path().write_bytes(torn)
+        self.assertEqual(km._session_order_proved(), [], "the store starts empty only after the bytes are saved")
+        q = list(km.jd.STATE.glob("session-order.json.corrupt-*"))
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0].read_bytes(), torn, "the quarantine holds the ORIGINAL bytes")
+        self.assertFalse(self._path().exists())
+
+    def test_enoent_order_still_reads_empty_with_no_quarantine(self):
+        self.assertEqual(km._session_order(), [], "a missing store is legitimately empty")
+        self.assertEqual(km._session_order_proved(), [])
+        self.assertEqual(list(km.jd.STATE.glob("session-order.json.corrupt-*")), [])
+
+
+import contextlib
+import errno
+import time
+from unittest import mock
+
+
+@contextlib.contextmanager
+def _reads_fault(target):
+    """Fail every byte read of ONE path with an EIO for the duration of the block."""
+    real_rb, real_rt = Path.read_bytes, Path.read_text
+    tgt = str(target)
+    def rb(self, *a, **k):
+        if str(self) == tgt:
+            raise OSError(errno.EIO, "injected EIO")
+        return real_rb(self, *a, **k)
+    def rt(self, *a, **k):
+        if str(self) == tgt:
+            raise OSError(errno.EIO, "injected EIO")
+        return real_rt(self, *a, **k)
+    Path.read_bytes, Path.read_text = rb, rt
+    try:
+        yield
+    finally:
+        Path.read_bytes, Path.read_text = real_rb, real_rt
+
+
+class OrderDisplayReaderServesUnproved(unittest.TestCase):
+    """The DISPLAY reader of the lane order under a fault serves the last order this kernel read or
+    wrote -- and never latches what the fault produced as the new known-good. A reader that latched
+    [] would render discovery order on the second faulted build and hand the mutation path a
+    fabricated 'last known' to fall back on."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self._saved_state, self._lkg = km.jd.STATE, km._session_order_lkg[0]
+        km.jd.STATE = Path(self.td.name)
+        km._session_order_lkg[0] = None
+        km._state_fault_seen.clear()
+
+    def tearDown(self):
+        km.jd.STATE = self._saved_state
+        km._session_order_lkg[0] = self._lkg
+        km._state_fault_seen.clear()
+        self.td.cleanup()
+
+    def _path(self):
+        return km.jd.STATE / "session-order.json"
+
+    def test_a_fault_serves_the_last_known_order_on_every_faulted_read(self):
+        km._write_session_order([A, B, C])
+        self.assertEqual(km._session_order(), [A, B, C])                # primes the known-good
+        with _reads_fault(self._path()):
+            self.assertEqual(km._session_order(), [A, B, C])
+            self.assertEqual(km._session_order(), [A, B, C], "the second faulted read serves the same -- nothing was latched")
+            self.assertEqual(km._session_order_lkg[0], [A, B, C])
+        self.assertEqual(km._session_order(), [A, B, C])
+
+    def test_a_fault_with_no_known_good_serves_empty_and_latches_nothing(self):
+        km._write_session_order([A, B, C])
+        km._session_order_lkg[0] = None                                # a cold start: nothing read yet
+        with _reads_fault(self._path()):
+            self.assertEqual(km._session_order(), [], "no known-good: the empty default, unproved")
+            self.assertIsNone(km._session_order_lkg[0], "the fault's [] is NOT latched as the known-good")
+        self.assertEqual(km._session_order(), [A, B, C], "the real order reads once the fault clears")
+
+    def test_the_display_read_returns_a_copy_so_a_caller_cannot_mutate_the_known_good(self):
+        km._write_session_order([A, B])
+        got = km._session_order(); got.append(C)
+        self.assertEqual(km._session_order_lkg[0], [A, B])
+
+
+class OrderWsRefusal(unittest.TestCase):
+    """The reorderTabs / writeOrder WS arm under a store fault: the order file is untouched, the
+    poster gets a `settingRefused` frame on its own socket, nothing escapes _dispatch_ws."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self._saved = (km.jd.STATE, km._mark_views_dirty, km._session_order_lkg[0])
+        km.jd.STATE = Path(self.td.name)
+        self.dirty = []
+        km._mark_views_dirty = lambda: self.dirty.append(1)
+
+    def tearDown(self):
+        km.jd.STATE, km._mark_views_dirty, km._session_order_lkg[0] = self._saved
+        self.td.cleanup()
+
+    def test_a_refused_drag_answers_the_poster_and_leaves_the_order_alone(self):
+        km._write_session_order([A, B, C])
+        p = km.jd.STATE / "session-order.json"
+        before = p.read_bytes()
+        sent = []
+        client = {"app": "chat", "wid": "w1", "alive": True, "send": lambda raw: sent.append(json.loads(raw))}
+        with _reads_fault(p):
+            km.Handler._dispatch_ws(None, {"type": "reorderTabs", "order": [C, B]}, client)
+        self.assertEqual(p.read_bytes(), before, "the order file is byte-for-byte unchanged (a fold-to-[] would have dropped A)")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual((sent[0]["type"], sent[0]["gesture"], sent[0]["value"]), ("settingRefused", "order", None))
+        self.assertIn("couldn't save the new order", sent[0]["text"])
+        self.assertIn("session-order.json could not be read", sent[0]["text"])
+        self.assertEqual(self.dirty, [])
+
+    def test_a_clean_drag_still_lands(self):
+        km._write_session_order([A, B, C])
+        sent = []
+        client = {"app": "chat", "wid": "w1", "alive": True, "send": lambda raw: sent.append(json.loads(raw))}
+        km.Handler._dispatch_ws(None, {"type": "reorderTabs", "order": [C, B]}, client)
+        self.assertEqual(sent, [])
+        self.assertEqual(km._session_order_proved(), [A, C, B], "the drag merged: the untouched lane keeps its slot, the dragged pair reorders in place")
+        self.assertEqual(self.dirty, [1])
+
+
+class StateQuarantineShape(unittest.TestCase):
+    """The quarantine wears the shape the goal-store and ledger quarantines wear: `<file>.corrupt-<utc
+    stamp>` with a `-n` suffix for a second collision, an os.replace, and a same-file re-check
+    (inode, mtime, size) before the move -- so an atomic publish that landed between the read and
+    the rename is never moved aside, and bytes that cannot be moved leave the store UNREADABLE (a
+    writer refuses) rather than read as empty over evidence that was not preserved."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self._saved_state = km.jd.STATE
+        km.jd.STATE = Path(self.td.name)
+
+    def tearDown(self):
+        km.jd.STATE = self._saved_state
+        self.td.cleanup()
+
+    def _path(self):
+        return km.jd.STATE / "session-order.json"
+
+    def test_a_second_corrupt_file_in_the_same_second_gets_a_numbered_suffix(self):
+        fixed = time.gmtime(1_800_000_000)
+        with mock.patch.object(km.time, "gmtime", return_value=fixed):
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", fixed)
+            first = self._path().with_name("session-order.json.corrupt-" + stamp)
+            first.write_bytes(b"earlier corrupt bytes")
+            torn = b'["aaaa", NOT JSON'
+            self._path().write_bytes(torn)
+            self.assertIsNone(km._read_state_json(self._path()))
+        self.assertEqual(first.read_bytes(), b"earlier corrupt bytes", "the earlier quarantine is never overwritten")
+        second = self._path().with_name("session-order.json.corrupt-" + stamp + "-1")
+        self.assertEqual(second.read_bytes(), torn, "the collision takes the -1 suffix")
+        self.assertFalse(self._path().exists())
+
+    def test_a_file_republished_between_the_read_and_the_rename_is_not_moved_aside(self):
+        # the torn bytes are read, and BEFORE the quarantine's rename an atomic publish replaces the
+        # file with a good one (a writer on another thread): the re-check sees a different inode /
+        # mtime / size and leaves the new file exactly where it is -- the caller gets a transient
+        # UNREADABLE (its next read is a fresh one), never a good file quarantined
+        good = json.dumps([A, B]).encode()
+        p = self._path()
+        p.write_bytes(b'["aaaa", NOT JSON')
+        real_rb = Path.read_bytes
+        def rb(self_, *a, **k):
+            raw = real_rb(self_, *a, **k)
+            if str(self_) == str(p):
+                km._atomic_write(p, good.decode())                 # the publish lands after our read
+            return raw
+        Path.read_bytes = rb
+        try:
+            with self.assertRaises(km._StateUnreadable) as cm:
+                km._read_state_json(p)
+        finally:
+            Path.read_bytes = real_rb
+        self.assertIn("replaced meanwhile", str(cm.exception))
+        self.assertEqual(p.read_bytes(), good, "the republished good file is untouched")
+        self.assertEqual(list(km.jd.STATE.glob("session-order.json.corrupt-*")), [], "nothing was moved aside")
+        self.assertEqual(km._read_state_json(p), [A, B], "the next read is a fresh, clean one")
+
+    def test_bytes_that_cannot_be_moved_aside_leave_the_store_unreadable_not_empty(self):
+        p = self._path()
+        torn = b'["aaaa", NOT JSON'
+        p.write_bytes(torn)
+        with mock.patch.object(km.os, "replace", side_effect=PermissionError(errno.EACCES, "Permission denied")):
+            with self.assertRaises(km._StateUnreadable) as cm:
+                km._read_state_json(p)
+            self.assertIn("could not be moved aside: [Errno 13] Permission denied", str(cm.exception))
+            self.assertEqual(p.read_bytes(), torn, "the evidence stays in place; the store is not read as empty over it")
+            with self.assertRaises(km._StateUnreadable):
+                km._session_order_proved()                             # so a writer refuses, exactly as for an EIO
+        self.assertEqual(p.read_bytes(), torn)
+
+    def test_the_move_is_an_os_replace_and_the_fault_text_carries_no_stamp_or_path(self):
+        # the fault text feeds the once-per-fault-text registries: a path or a per-second stamp in it
+        # would defeat the dedupe (the ledgers' lesson), so it is errno + strerror only
+        e = km._StateUnreadable(self._path(), "read failed: %s" % km._errno_text(OSError(errno.EIO, "Input/output error", "/some/where")))
+        self.assertEqual(e.fault, "read failed: [Errno 5] Input/output error")
+        self.assertNotIn("/some/where", str(e))
+        with mock.patch.object(km.os, "replace", wraps=os.replace) as rep:
+            self._path().write_bytes(b"{ not json")
+            self.assertIsNone(km._read_state_json(self._path()))
+        self.assertEqual(rep.call_count, 1, "the quarantine moves with os.replace, like its siblings")
+
+
 if __name__ == "__main__":
     unittest.main()

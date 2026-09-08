@@ -13081,6 +13081,19 @@ window.addEventListener("message", (e: MessageEvent) => {
   }
   else if (m.type === "nextTab") cycleTab(1);
   else if (m.type === "prevTab") cycleTab(-1);
+  else if (m.type === "settingRefused" && typeof m.text === "string" && m.text) {
+    // the kernel refused a gesture this page posted (its store could not be read): the optimistic state ends
+    // on THIS event, not on the next push, and the reason toasts (the warn toast is this pane's soft-refusal
+    // surface; nothing typed was lost) and is filed in the shell's bell under its own `refused` kind
+    if (m.gesture === "flag" && typeof m.sid === "string" && typeof m.flag === "string" && m.sid && m.flag) {
+      // a tab-menu flag: repaint the local copy to the value the kernel still paints (the frame carries it —
+      // what the next push shows), not to a value recorded at the click, which a second click made wrong
+      const s = sessions.get(m.sid);
+      if (s && typeof m.value === "boolean") (s as any)[m.flag] = m.value;
+    }
+    notifyShell("refused", m.text, typeof m.sid === "string" ? m.sid : "");
+    warnToast(m.text);
+  }
   else if (m.type === "warn" && typeof m.text === "string" && m.text) {
     // A warn arriving while a create is in flight IS that create's verdict (a name the kernel won't take,
     // an unreadable parent, the SDK setup hint). It gets a dialog naming the reason and takes the

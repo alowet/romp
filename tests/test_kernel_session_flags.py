@@ -103,6 +103,315 @@ class AutoNudgeWiring(unittest.TestCase):
             td.cleanup()
 
 
+class FlagsStoreUnreadableRefuses(unittest.TestCase):
+    """The state-readers audit (rank 5): the session-flags reader used to fold ANY read fault to {}
+    and CACHE it, so _set_session_flag copied that empty, applied one edit, and atomically wrote it
+    back — erasing every session's flags (including the postalServiceOff isolation boundaries) under
+    a silent success. The setters now read PROVED: a read fault refuses the write loudly and the
+    file is left exactly as it was. Synthetic sids only."""
+    SID = "11111111-2222-3333-4444-555555555555"
+    OTHER = "99999999-8888-7777-6666-555555555555"
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.saved = jd.STATE
+        jd.STATE = Path(self.td.name)
+        km._flags_cache.clear()
+
+    def tearDown(self):
+        jd.STATE = self.saved
+        km._flags_cache.clear()
+        self.td.cleanup()
+
+    def _path(self):
+        return jd.STATE / "session-flags.json"
+
+    def _fault_reads_of(self, target):
+        """Fail BOTH read_bytes (the fix's proved reader) and read_text (origin/main's reader) for one
+        path, so the same test injects the fault on either tree — green on the fix, RED on main where
+        the fold-to-{} erases the flags."""
+        import errno
+        real_rb, real_rt = Path.read_bytes, Path.read_text
+        tgt = str(target)
+        def rb(self, *a, **k):
+            if str(self) == tgt:
+                raise OSError(errno.EIO, "injected EIO")
+            return real_rb(self, *a, **k)
+        def rt(self, *a, **k):
+            if str(self) == tgt:
+                raise OSError(errno.EIO, "injected EIO")
+            return real_rt(self, *a, **k)
+        Path.read_bytes, Path.read_text = rb, rt
+        return (real_rb, real_rt)
+
+    def test_a_flag_toggle_is_refused_when_the_flags_store_cannot_be_read(self):
+        # a populated store: the OTHER session is isolated from the postal bus — a safety boundary
+        km._set_session_flag(self.OTHER, "postalServiceOff", True)
+        km._flags_cache.clear()
+        before = self._path().read_bytes()
+        saved = self._fault_reads_of(self._path())
+        raised = None
+        try:
+            km._set_session_flag(self.SID, "hideFromFeed", True)   # a fresh edit on another sid
+        except Exception as e:                                     # noqa: BLE001 — on main it never raises
+            raised = e
+        finally:
+            Path.read_bytes, Path.read_text = saved
+        km._flags_cache.clear()
+        # THE erasure the audit is about: on origin/main the read folds to {}, the setter writes
+        # {SID:{hideFromFeed}} and the OTHER session's isolation boundary is GONE — this assertion is
+        # what turns RED there. The fix refuses the write, so the file is byte-for-byte unchanged.
+        self.assertEqual(self._path().read_bytes(), before,
+                         "the flags file must be unchanged when its file can't be read (main erases it here)")
+        self.assertTrue(km._session_flag(self.OTHER, "postalServiceOff"),
+                        "the pre-existing isolation flag survives the refused toggle")
+        self.assertEqual(type(raised).__name__, "_StateUnreadable",
+                         "the write is refused LOUDLY, not folded to a fabricated empty (got %r)" % raised)
+
+    def test_a_torn_flags_file_is_quarantined_aside_not_overwritten(self):
+        torn = b'{"sid": {"hideFromFeed": true'
+        self._path().write_bytes(torn)
+        km._flags_cache.clear()
+        self.assertEqual(km._session_flags_proved(), {}, "the store starts empty only after the bytes are saved")
+        q = list(jd.STATE.glob("session-flags.json.corrupt-*"))
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0].read_bytes(), torn, "the quarantine holds the ORIGINAL bytes")
+        self.assertFalse(self._path().exists())
+
+    def test_enoent_flags_still_reads_empty_with_no_quarantine(self):
+        self.assertEqual(km._session_flags(), {}, "a missing store is legitimately empty")
+        self.assertEqual(km._session_flags_proved(), {})
+        self.assertEqual(list(jd.STATE.glob("session-flags.json.corrupt-*")), [])
+
+
+import contextlib
+import errno
+import json
+
+
+@contextlib.contextmanager
+def _reads_fault(target):
+    """Fail every byte read of ONE path with an EIO (the proved reader's read_bytes and the pre-fix
+    reader's read_text alike) for the duration of the block; everything else reads normally."""
+    real_rb, real_rt = Path.read_bytes, Path.read_text
+    tgt = str(target)
+    def rb(self, *a, **k):
+        if str(self) == tgt:
+            raise OSError(errno.EIO, "injected EIO")
+        return real_rb(self, *a, **k)
+    def rt(self, *a, **k):
+        if str(self) == tgt:
+            raise OSError(errno.EIO, "injected EIO")
+        return real_rt(self, *a, **k)
+    Path.read_bytes, Path.read_text = rb, rt
+    try:
+        yield
+    finally:
+        Path.read_bytes, Path.read_text = real_rb, real_rt
+
+
+class StateUnreadableIsAPlainException(unittest.TestCase):
+    """The WS receive loop re-raises (BrokenPipeError, ConnectionResetError, OSError) as a genuine
+    socket failure and tears the connection down; every other exception falls to its logging arm
+    and the next message still processes. A store-read fault must be the second kind: one handler
+    branch that forgets to catch it costs a logged line, never the dashboard's socket."""
+
+    def test_it_is_an_exception_but_never_an_oserror(self):
+        self.assertTrue(issubclass(km._StateUnreadable, Exception))
+        self.assertFalse(issubclass(km._StateUnreadable, OSError),
+                         "as an OSError the WS loop would classify a read fault as a socket failure")
+
+    def test_it_names_the_file_and_the_fault_in_plain_words(self):
+        e = km._StateUnreadable(Path("/tmp/x/session-flags.json"), "read failed: [Errno 5] Input/output error")
+        self.assertEqual(str(e), "session-flags.json could not be read (read failed: [Errno 5] Input/output error)")
+        self.assertEqual((e.path.name, e.fault), ("session-flags.json", "read failed: [Errno 5] Input/output error"))
+
+
+class FlagsDisplayReaderServesUnproved(unittest.TestCase):
+    """The DISPLAY reader under a fault: the last value this kernel read if it holds one, else {}
+    -- and NEITHER is cached under the file's stat key. A reader that cached what a fault produced
+    would keep serving it after the disk recovered (same key, a cache HIT never reads), which is how
+    the pre-fix reader turned a transient EIO into a permanent empty."""
+    SID = "11111111-2222-3333-4444-555555555555"
+    OTHER = "99999999-8888-7777-6666-555555555555"
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.saved = jd.STATE
+        jd.STATE = Path(self.td.name)
+        km._flags_cache.clear()
+        km._state_fault_seen.clear()
+        self.notices = []
+        self._notice = km._sync_notice
+        km._sync_notice = lambda text, ok=True: self.notices.append((text, ok))
+
+    def tearDown(self):
+        km._sync_notice = self._notice
+        jd.STATE = self.saved
+        km._flags_cache.clear()
+        km._state_fault_seen.clear()
+        self.td.cleanup()
+
+    def _path(self):
+        return jd.STATE / "session-flags.json"
+
+    def test_a_fault_serves_the_last_read_value_and_caches_nothing_new(self):
+        km._set_session_flag(self.OTHER, "postalServiceOff", True)
+        km._flags_cache.clear()
+        first = km._session_flags()                                    # a clean read primes the cache
+        key1 = km._flags_cache[str(self._path())][0]
+        self.assertEqual(first, {self.OTHER: {"postalServiceOff": True}})
+        # the file moves on (a second session's flag lands), so the stat key changes and the next
+        # read is a MISS -- a primed cache under the same key would be a hit and never read at all
+        km._set_session_flag(self.SID, "hideFromFeed", True)
+        key2 = self._path().stat(); key2 = (key2.st_mtime_ns, key2.st_size)
+        self.assertNotEqual(key1, key2, "the write must move the stat key, or this test reads nothing")
+        with _reads_fault(self._path()):
+            served = km._session_flags()
+            self.assertEqual(served, {self.OTHER: {"postalServiceOff": True}},
+                             "the fault serves the LAST value this kernel read, not the unread file and not {}")
+            self.assertEqual(km._flags_cache[str(self._path())][0], key1,
+                             "nothing is cached under the NEW key -- the fault produced no value worth keeping")
+        # the disk recovers: the reader reads the real, newer file (a reader that had cached the
+        # fault's value under key2 would serve the stale copy here forever)
+        self.assertEqual(km._session_flags(), {self.OTHER: {"postalServiceOff": True}, self.SID: {"hideFromFeed": True}})
+
+    def test_a_fault_on_a_cold_cache_serves_the_empty_default_uncached(self):
+        km._set_session_flag(self.OTHER, "postalServiceOff", True)
+        km._flags_cache.clear()
+        with _reads_fault(self._path()):
+            self.assertEqual(km._session_flags(), {}, "no known-good yet: the empty default, unproved")
+            self.assertNotIn(str(self._path()), km._flags_cache, "…and it is NOT cached")
+        self.assertEqual(km._session_flags(), {self.OTHER: {"postalServiceOff": True}},
+                         "the real flags read once the fault clears -- the empty was never latched")
+
+    def test_the_fault_is_loud_once_per_episode_and_a_clean_read_rearms_it(self):
+        km._set_session_flag(self.OTHER, "postalServiceOff", True)
+        km._flags_cache.clear()
+        with _reads_fault(self._path()):
+            km._session_flags(); km._session_flags(); km._session_flags()
+        bad = [t for t, ok in self.notices if not ok]
+        self.assertEqual(len(bad), 1, "one notice per fault episode, however many builds read the store")
+        self.assertIn("session-flags.json could not be read", bad[0])
+        self.assertIn("[Errno 5]", bad[0])
+        km._session_flags()                                            # the clean read ends the episode
+        self.assertNotIn(str(self._path()), km._state_fault_seen)
+        with _reads_fault(self._path()):
+            km._flags_cache.clear()
+            km._session_flags()
+        self.assertEqual(len([t for t, ok in self.notices if not ok]), 2, "a fresh episode speaks again")
+
+
+class FlagsWsRefusal(unittest.TestCase):
+    """The setSessionFlag WS arm under a store fault: the file is untouched, the poster gets a
+    `settingRefused` frame addressed to its toggle (sid + flag) on its OWN socket, and nothing
+    escapes _dispatch_ws. A `warn` frame did not reach the timeline page (no handler) so the lane
+    gear kept showing the refused state until a reload."""
+    SID = "11111111-2222-3333-4444-555555555555"
+    OTHER = "99999999-8888-7777-6666-555555555555"
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.saved = (jd.STATE, km._mark_views_dirty)
+        jd.STATE = Path(self.td.name)
+        km._flags_cache.clear()
+        self.dirty = []
+        km._mark_views_dirty = lambda: self.dirty.append(1)
+
+    def tearDown(self):
+        jd.STATE, km._mark_views_dirty = self.saved
+        km._flags_cache.clear()
+        self.td.cleanup()
+
+    def _client(self):
+        sent = []
+        return {"app": "timeline", "wid": "w1", "alive": True,
+                "send": lambda raw: sent.append(json.loads(raw))}, sent
+
+    def test_a_refused_toggle_answers_the_poster_and_leaves_the_file_alone(self):
+        km._set_session_flag(self.OTHER, "postalServiceOff", True)
+        km._flags_cache.clear()
+        p = jd.STATE / "session-flags.json"
+        before = p.read_bytes()
+        for flag in ("hideFromFeed", "notify"):                       # both arms of the branch: the plain setter and the tri-state bell
+            client, sent = self._client()
+            with _reads_fault(p):
+                km.Handler._dispatch_ws(None, {"type": "setSessionFlag", "id": self.SID, "flag": flag, "value": True}, client)
+            self.assertEqual(p.read_bytes(), before, "%s: the flags file is byte-for-byte unchanged" % flag)
+            self.assertEqual(len(sent), 1, "%s: exactly one frame, on the delivering socket" % flag)
+            fr = sent[0]
+            self.assertEqual((fr["type"], fr["sid"], fr["flag"], fr["itemId"]), ("settingRefused", self.SID, flag, ""))
+            self.assertEqual(fr["gesture"], "flag", "the frame names its gesture; no pane infers it from empty fields")
+            self.assertIs(fr["value"], False, "the value the kernel still paints for this flag rides along (here: unset -> off)")
+            self.assertIn("couldn't save that setting", fr["text"])
+            self.assertIn("session-flags.json could not be read", fr["text"])
+            self.assertNotIn("warn", fr["type"])
+        self.assertEqual(self.dirty, [], "a refused write marks nothing dirty -- there is nothing new to push")
+
+    def test_a_clean_toggle_still_lands_and_sends_no_refusal(self):
+        client, sent = self._client()
+        km.Handler._dispatch_ws(None, {"type": "setSessionFlag", "id": self.SID, "flag": "hideFromFeed", "value": True}, client)
+        self.assertEqual(sent, [], "no frame on success -- the next push carries the value")
+        self.assertTrue(km._session_flag(self.SID, "hideFromFeed"))
+        self.assertEqual(self.dirty, [1])
+
+
+class SessionBellJudgedAgainstAProvedMaster(unittest.TestCase):
+    """_set_notify_session judges the click against the MASTER bell, which lives in the OTHER store
+    (notify-cards.json). Read through the display reader, a fault there folded the master to off, so a
+    click matching that fabricated master popped the session's stored override and rewrote
+    session-flags.json without it -- the user's mute erased under the success path. The master is read
+    PROVED now: a fault on the bells file refuses the flags write exactly like a fault on the flags file."""
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.saved = (jd.STATE, km._mark_views_dirty)
+        jd.STATE = Path(self.td.name)
+        km._flags_cache.clear(); km._notify_cards_cache.clear()
+        self.dirty = []
+        km._mark_views_dirty = lambda: self.dirty.append(1)
+
+    def tearDown(self):
+        jd.STATE, km._mark_views_dirty = self.saved
+        km._flags_cache.clear(); km._notify_cards_cache.clear()
+        self.td.cleanup()
+
+    def test_a_session_bell_click_is_refused_when_the_bells_store_cannot_be_read(self):
+        km._set_notify_all(True)                                   # the master is ON …
+        km._set_notify_session(self.SID, False)                    # … and this session is MUTED (a stored override)
+        km._flags_cache.clear(); km._notify_cards_cache.clear()
+        flags_p, cards_p = jd.STATE / "session-flags.json", jd.STATE / "notify-cards.json"
+        self.assertEqual(json.loads(flags_p.read_text()), {self.SID: {"notify": False}})
+        before = flags_p.read_bytes()
+        raised = None
+        with _reads_fault(cards_p):                                # the OTHER store faults
+            try:
+                km._set_notify_session(self.SID, False)            # the user clicks mute again (or the pane re-sends it)
+            except Exception as e:                                 # noqa: BLE001 -- before the fix it never raises
+                raised = e
+        # before the fix: the master folded to off, False == off, the override was POPPED and the flags file
+        # rewritten as {} -- the mute gone. Now the write is refused and the file is byte-for-byte unchanged.
+        self.assertEqual(flags_p.read_bytes(), before, "the flags file must be unchanged when the bells file can't be read")
+        self.assertEqual(type(raised).__name__, "_StateUnreadable", "refused loudly (got %r)" % raised)
+        self.assertIn("notify-cards.json", str(raised), "the refusal names the store that faulted")
+
+    def test_the_ws_arm_refuses_a_session_bell_on_the_other_store_s_fault(self):
+        km._set_notify_all(True); km._set_notify_session(self.SID, False)
+        km._flags_cache.clear(); km._notify_cards_cache.clear()
+        flags_p, cards_p = jd.STATE / "session-flags.json", jd.STATE / "notify-cards.json"
+        before = flags_p.read_bytes()
+        sent = []
+        client = {"app": "timeline", "wid": "w1", "alive": True, "send": lambda raw: sent.append(json.loads(raw))}
+        with _reads_fault(cards_p):
+            km.Handler._dispatch_ws(None, {"type": "setSessionFlag", "id": self.SID, "flag": "notify", "value": False}, client)
+        self.assertEqual(flags_p.read_bytes(), before)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual((sent[0]["type"], sent[0]["gesture"], sent[0]["flag"]), ("settingRefused", "flag", "notify"))
+        self.assertIn("notify-cards.json could not be read", sent[0]["text"])
+        self.assertEqual(self.dirty, [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -227,12 +227,15 @@ class ErrorCenterExecutes(unittest.TestCase):
         # 'fleet sync' joined on 2026-07-30: romp moves commits between machines on its own, and the
         # network panel's phase line is live-only — so an unwatched push left no record either way,
         # the success least of all. It is the one kind here that logs wins as well as failures.
+        # 'not saved' joined with the state-readers change: a setting, bell, tag or order the kernel REFUSED
+        # because it could not read the file that holds it files an entry of its own kind, so muting the
+        # judge's 'warning' never mutes a change of yours that did not land.
         a = self.out["filterBar"]
-        self.assertEqual(a["n"], 13)
+        self.assertEqual(a["n"], 14)
         self.assertEqual(a["first"], "offline")
         self.assertEqual(a["labels"],
                          "offline|limit|judge|warning|stalled|follow-up failed|retrying|api error|"
-                         "sdk|fleet sync|jump failed|cleared|not sent")
+                         "sdk|fleet sync|jump failed|cleared|not saved|not sent")
 
     def test_muting_a_kind_hides_counts_and_live_cue_but_keeps_the_entries(self):
         a = self.out["afterMute"]
