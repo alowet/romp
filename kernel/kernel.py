@@ -1270,6 +1270,23 @@ def _persist_repo_root():
 
 _persist_repo_root()
 
+
+def _persist_serve_port(port):
+    """The port this kernel serves on, written into state beside serve-token (state/romp/serve-port)
+    once the socket is BOUND (main): the AUTHORITATIVE answer for a same-user client that has the
+    state dir but no shell environment to read ROMP_KERNEL_PORT from -- the Obsidian timeline panel,
+    an Electron app launched from the dock, which posts its flag, views and order edits to the
+    routes below (_state_write_route) rather than writing the state files itself. A client that
+    finds no record, or a record nothing answers on, treats the kernel as not running and refuses the
+    gesture visibly, never guessing a port or falling back to a write the kernel cannot check. An
+    atomic publish (a reader never sees a torn number); best-effort, like the serve-token mint and
+    the repo-root record above."""
+    try:
+        _atomic_write(jd.STATE / "serve-port", "%d\n" % int(port))
+    except OSError:
+        pass
+
+
 def _ct_eq(a, b):
     """Constant-time string compare (no timing oracle on the serve token); never
     raises on odd input."""
@@ -3136,6 +3153,13 @@ def _clear_state_fault(path):
     _state_fault_seen.pop(str(path), None)
 
 
+def _setting_refusal_text(what, exc):
+    """The one sentence a refused gesture shows: what could not be saved, the store's fault or the
+    validator's complaint, and that a retry is the way on. Composed here so the WS door
+    (_refuse_setting) and the Obsidian panel's POST routes (_state_write_route) say the same thing."""
+    return "couldn't save %s \u2014 %s; try again" % (what, exc)
+
+
 def _refuse_setting(client, exc, what, gesture, sid="", item_id="", flag="", value=None, log=None):
     """A dashboard gesture (a lane/tab flag, a card bell, a drag, a view change) that this kernel
     REFUSED because the store it edits could not be read -- or, since the maintainer's fold on PR
@@ -3153,7 +3177,7 @@ def _refuse_setting(client, exc, what, gesture, sid="", item_id="", flag="", val
     the client's problem: the refusal already stands. `log`, when given, is what stderr gets INSTEAD of
     `text`: a flag refusal's text echoes the client's value for the client, and the log line names only
     the field and its type (_flag_type_note; review find, 2026-09-08)."""
-    text = "couldn't save %s \u2014 %s; try again" % (what, exc)
+    text = _setting_refusal_text(what, exc)
     sys.stderr.write("romp-kernel: %s\n" % (log or text))
     if not client or not callable(client.get("send")):
         return
@@ -4961,6 +4985,16 @@ def _ack_views_write(client, kind, write_id, ok, error=None, refused=None, info=
     runs."""
     if not client or not callable(client.get("send")):
         return
+    try:
+        client["send"](json.dumps(_views_write_ack(kind, write_id, ok, error=error, refused=refused, info=info, edited=edited)))
+    except Exception:
+        pass
+
+
+def _views_write_ack(kind, write_id, ok, error=None, refused=None, info=None, edited=None):
+    """The ack document _ack_views_write sends, built without a socket: POST /views (the Obsidian
+    panel's whole-blob write, _state_write_route) answers with this same document, so the panel feeds
+    it to the viewsAck handler it already has and a refusal reads the same in every host."""
     views = _views_client()
     ack = {"type": kind, "writeId": write_id if isinstance(write_id, str) else None,
            "ok": bool(ok), "views": views,
@@ -4994,10 +5028,7 @@ def _ack_views_write(client, kind, write_id, ok, error=None, refused=None, info=
                                           cap=_ACK_ERROR_CAP, joiner="; ") or "refused"
     if error:
         ack["error"] = str(error)
-    try:
-        client["send"](json.dumps(ack))
-    except Exception:
-        pass
+    return ack
 
 
 def _resolve_parent_sid(raw, live):
@@ -42955,6 +42986,121 @@ def _landing():
 _BOOT_ID = "%d.%d" % (os.getpid(), int(time.time()))
 
 
+_LANE_FLAGS = ("hideFromFeed", "postalServiceOff", "notify")   # the per-session toggles the lane gear offers
+#                                    (LANE_TOGGLES in ui/romp-timeline-view.js) and the tab menu's typed union
+#                                    (setSessionFlag in ui/webview/render.ts)
+
+
+def _unknown_keys_error(b, allowed):
+    """A typed body's refusal of keys the route does not read (the /restart helper's rule): a typo key
+    must never pass as "not asked" while the caller reads ok:true as its field applying."""
+    extra = sorted(set(b) - set(allowed))
+    if not extra:
+        return None
+    return "unknown key(s) %s \u2014 this route reads only %s" % (
+        ", ".join(repr(k[:60] + "\u2026" if len(k) > 60 else k) for k in extra[:8]),
+        ", ".join(repr(k) for k in allowed))
+
+
+def _state_write_route(path, b):
+    """POST /flag, /views and /order -> (status, payload): the Obsidian timeline panel's three state
+    writes as routes. The panel runs in Obsidian's Electron with Node's fs and the state dir and has
+    no socket to this kernel, so until these routes it wrote session-flags.json, timeline-views.json
+    and session-order.json ITSELF -- a second writer beside the kernel: its whole-blob views write
+    bypassed _set_timeline_views (the judge and the stale-writer guard never saw it, and a concurrent
+    dashboard edit could be rolled back), its flag write read-modify-wrote the flags with no lock
+    against _set_session_flag, and its order write skipped _merge_session_order (every lane the drag
+    did not carry lost its slot). Each route lands through the SAME setter the socket op calls
+    (setSessionFlag, setTimelineViews, reorderTabs in _dispatch_ws), with that op's validation, and
+    refuses the way it refuses; the panel writes none of the files any more (with no kernel to post
+    to, it refuses the gesture and says so). `b` is the typed body (_json_object_body, already a dict).
+
+    Contracts. /flag {id, flag, value}: `flag` one of _LANE_FLAGS, `value` a JSON boolean (_as_bool
+    -- bool("false") once undid a mute); a store fault answers 200 {ok:false, error, value} where
+    `value` is what the display path still paints (_painted_flag_value), the settingRefused frame's
+    field. /views {views, edited?, writeId?}: the setTimelineViews op as a POST -- under _views_lock,
+    through the judge, `edited` bounding what the write may change -- answered with the viewsAck
+    document the op sends (_views_write_ack: ok, the post-write views and seq, refused rows, an error
+    line), writeId echoed. /order {order: [sid, ...]}: _merge_session_order then _write_session_order,
+    exactly the reorderTabs arm; a store fault answers 200 {ok:false, error}. A wrong type, a missing
+    field or an unknown key is a 400 naming it (the #1038 body convention); a 200 with ok:false is
+    the kernel's own refusal, in the words the dashboards see."""
+    if path == "/flag":
+        err = _unknown_keys_error(b, ("id", "flag", "value"))
+        if err:
+            return 400, {"ok": False, "error": err}
+        sid = b.get("id")
+        if not isinstance(sid, str) or not sid.strip():
+            return 400, {"ok": False, "error": "id (the session's id) required"}
+        sid = sid.strip()
+        flag = b.get("flag")
+        if flag not in _LANE_FLAGS:
+            return 400, {"ok": False, "error": "flag must be one of %s, got %s"
+                         % (", ".join(_LANE_FLAGS), _clip_json(flag))}
+        if b.get("value") is None:
+            return 400, {"ok": False, "error": "value (true or false) required"}
+        value, ferr = _as_bool(b.get("value"), "value")
+        if ferr:
+            return 400, {"ok": False, "error": ferr}
+        try:
+            if flag == "notify":
+                _set_notify_session(sid, value)      # tri-state override on the master bell: its own setter
+            else:
+                _set_session_flag(sid, flag, value)
+        except (_StateUnreadable, _StateUnwritable) as e:
+            # the flags store could not be read, or its publish failed: the op's refusal, as a body --
+            # the text the lane gear shows, and the value it repaints the toggle to
+            text = _setting_refusal_text("that setting", e)
+            sys.stderr.write("romp-kernel: POST /flag refused: %s\n" % e)
+            return 200, {"ok": False, "error": text, "value": _painted_flag_value(sid, flag)}
+        _mark_views_dirty()
+        return 200, {"ok": True, "id": sid, "flag": flag, "value": value}
+    if path == "/views":
+        err = _unknown_keys_error(b, ("views", "edited", "writeId"))
+        if err:
+            return 400, {"ok": False, "error": err}
+        views = b.get("views")
+        if not isinstance(views, dict):
+            return 400, {"ok": False, "error": "views (an object) required, got %s" % _clip_json(views)}
+        edited = b.get("edited")
+        edited = [x for x in edited if isinstance(x, str)] if isinstance(edited, list) else None
+        write_id = b.get("writeId") if isinstance(b.get("writeId"), str) else None
+        try:
+            with _views_lock:
+                refused = _set_timeline_views(views, edited=edited)   # the setter files the notice by the same rule
+            if edited is not None:
+                ok = not any(_refusal_is_the_posters(r, edited) for r in refused)
+            else:
+                ok = not refused
+            err = None
+        except Exception as e:
+            # the setTimelineViews arm's refusal, word for word; once PR #1075's dedicated store-fault
+            # arm lands (_views_fault_refusal), this route and that arm should share it
+            sys.stderr.write("POST /views: %s\n" % traceback.format_exc())
+            refused, ok, err = [], False, "the write failed on the kernel: %s" % (str(e) or type(e).__name__)
+        _mark_views_dirty()
+        return 200, _views_write_ack("viewsAck", write_id, ok, error=err, refused=refused or [], edited=edited)
+    if path == "/order":
+        err = _unknown_keys_error(b, ("order",))
+        if err:
+            return 400, {"ok": False, "error": err}
+        order = b.get("order")
+        if not isinstance(order, list) or not all(isinstance(x, str) for x in order):
+            return 400, {"ok": False, "error": "order (a list of session ids) required, got %s" % _clip_json(order)}
+        try:
+            merged = _merge_session_order(order)
+            _write_session_order(merged)
+        except (_StateUnreadable, _StateUnwritable) as e:
+            # the order file could not be read, or its publish failed: the drag must not splice against a
+            # fabricated [] and persist discovery order over the saved one (the reorderTabs arm's rule)
+            text = _setting_refusal_text("the new order", e)
+            sys.stderr.write("romp-kernel: POST /order refused: %s\n" % e)
+            return 200, {"ok": False, "error": text}
+        _mark_views_dirty()
+        return 200, {"ok": True, "order": merged}
+    return 404, {"ok": False, "error": "no such route"}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -44796,6 +44942,17 @@ class Handler(BaseHTTPRequestHandler):
                 if hint:
                     resp["hint"] = hint
                 return self._send(200, json.dumps(resp), "application/json")
+            if u.path in ("/flag", "/views", "/order"):
+                # The Obsidian timeline panel's state writes -- the setSessionFlag / setTimelineViews /
+                # reorderTabs socket ops for a client with no socket (_state_write_route has the why and
+                # the contracts). Same-user trust boundary as every client: the panel reads the 0600
+                # serve-token file and this kernel's serve-port record (_persist_serve_port) from the
+                # state dir and sends X-Romp-Token; _authorize above already ruled on it.
+                b, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
+                st, payload = _state_write_route(u.path, b)
+                return self._send(st, json.dumps(payload), "application/json")
             if u.path in ("/tag", "/group"):
                 # Headless tag edit (`romp tag`, the user 2026-08-23, the manager/worker workflow:
                 # the worker roster IS a session tag, so an agent needs to keep one current — and can
@@ -46822,6 +46979,8 @@ def main():
     threading.Thread(target=_ensure_postal_bus, daemon=True).start()   # a sessionless machine still needs its bus
     threading.Thread(target=_tunnel_supervisor, daemon=True).start()   # keep ssh tunnels alive + poll host↔sid map
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    _persist_serve_port(srv.server_address[1])     # the port record the Obsidian panel posts to, written
+    #                                                once the bind SUCCEEDED (a failed bind leaves no lie)
     url = "http://127.0.0.1:%d" % PORT
     sys.stderr.write("romp-kernel: serving the ported UI at %s  (Ctrl-C to stop)\n" % url)
     sys.stderr.write("romp-kernel: records under %s ; bundles from %s\n" % (jd.STATE, DIST))

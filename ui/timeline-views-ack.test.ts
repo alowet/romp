@@ -1016,7 +1016,8 @@ test("pins: no frame count settles a stamped kernel's write; the legacy exact ec
   assert.equal((rec.match(/>= 3/g) || []).length, 1, "one legacy yield, nowhere else");
   assert.match(SRC, /_postTagEdit\(nv, edit, meta\) \{\s*\n\s*if \(!this\._tagEditsTargeted\(\)\) \{\s*\n\s*if \(!nv\) return;[\s\S]{0,1200}?const edited = \[edit\.tid, edit\.tid_from, edit\.tid_to\]\.filter\(Boolean\);[\s\S]{0,400}?this\._setViews\(nv, edited\);\s*\n\s*return;\s*\n\s*\}/,
     "a targeted op needs the capability AND a bridge; otherwise the whole-blob write, naming the tags it changed (a create's row included)");
-  assert.match(SRC, /window\.__rompTimelineSetViews\(v, writeId, Array\.isArray\(edited\) \? edited : \[\]\);/, "the whole-blob hook carries the writeId and the edited tag ids");
+  assert.match(SRC, /const ed = Array\.isArray\(edited\) \? edited : \[\];\s*\n\s*if \(hook\) window\.__rompTimelineSetViews\(v, writeId, ed\);/,
+    "the whole-blob hook carries the writeId and the edited tag ids (the same list rides the Obsidian panel's POST /views, 2026-09-08)");
   assert.match(SRC, /window\.__rompTimelineTagEdit\(writeId, edit\);/, "the targeted hook carries the writeId beside the NESTED op");
   assert.doesNotMatch(SRC, /op: '(?:rename|recolor|addMember|removeMember|delete)', name:/, "no op but create carries a name — every one addresses by tid");
 });
@@ -1055,10 +1056,13 @@ test("executed: a lens or order write is built from the STORE's blob — a renam
   assert.deepEqual(o.v.tagOrder, ["api", "web"]);
   assert.deepEqual(panel._curViews().tagOrder, ["api", "web"]);
   // every lens and order site goes through _setLens: the pane-filter row, the pill drag, the corner chip, the menu
-  assert.match(SRC, /this\._setLens\(\{ actives: Object\.assign\(\{\}, this\._curViews\(\)\.actives, upd\) \}\);/, "the dialog's pane filters");
-  assert.match(SRC, /this\._setLens\(\{ tagOrder: names \}\);/, "the pill drag");
+  // …each naming what it is ABOUT (`own`), the keys a write no kernel takes keeps local and a ruled one
+  // releases (the Obsidian panel's local lens, 2026-09-08); the map is built over the WRITE base's, never the shown one
+  assert.match(SRC, /this\._setLens\(\{ actives: Object\.assign\(this\._lensBaseActives\(\), upd\) \}, \{ surfaces: Object\.keys\(upd\) \}\);/, "the dialog's pane filters");
+  assert.match(SRC, /this\._setLens\(\{ tagOrder: names \}, \{ tagOrder: true \}\);/, "the pill drag");
   assert.equal((SRC.match(/this\._setViews\(nv\);/g) || []).length, 0, "no whole-blob write from a copy remains outside the legacy tag path");
-  assert.match(SRC, /_setLens\(fields\) \{\s*\n\s*this\._setViews\(lensBlob\(this\._views, fields\), \[\], fields\);/, "built from this._views, the store's blob");
+  assert.match(SRC, /_setLens\(fields, own\) \{\s*\n\s*own = own \|\| \{ surfaces: Object\.keys\(fields\.actives \|\| \{\}\), tagOrder: 'tagOrder' in fields, active: 'active' in fields \};\s*\n\s*this\._setViews\(lensBlob\(this\._views, fields\), \[\], fields, own\);/,
+    "built from this._views, the store's blob; `own` defaults to every key the fields carry");
 });
 
 test("executed: a tag whose create is in flight takes no gesture — the dialog row reads creating… with no actions, its chip has no ✕, the join menu does not offer it; the ack restores them", () => {

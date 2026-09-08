@@ -153,7 +153,7 @@ test("the trigger sits in the corner strip and opens on pointerdown, like every 
 test("an active tag is a REMOVABLE CHIP: outline only in its colour, a dim separate ✕, air below (the user 2026-08-24)", () => {
   // the chip's own pointerdown clears the filter without a menu trip; stopPropagation keeps the
   // text element's menu handler out of it (both are pointerdown — the redraw-eats-click rule)
-  assert.match(SRC, /this\._setLens\(\{ actives: Object\.assign\(\{\}, v\.actives, \{ timeline: lensToggle\(lens, c\.pick\) \}\) \}\);/,
+  assert.match(SRC, /this\._setLens\(\{ actives: Object\.assign\(this\._lensBaseActives\(\), \{ timeline: lensToggle\(lens, c\.pick\) \}\) \}, \{ surfaces: \['timeline'\] \}\);/,
     "each chip's ✕ unselects THAT pick (per-selection chips, the user 2026-08-25)");
   // OUTLINE only on the page's own ground (the tinted fill was too much — the user 2026-08-24),
   // and the ✕ is dim and SEPARATE, the composer context chip's read — never baked into the name
@@ -285,8 +285,8 @@ test("membership rows drag-reorder into the SHARED session order (the user 2026-
   assert.match(SRC, /nameCell\._sid = s\.id;/);
   assert.match(SRC, /cells\[toIdx\]\.style\[toIdx > fromIdx \? 'borderBottom' : 'borderTop'\] = '2px solid #9cd2ff';/,
     "the accent insertion cue rides the target cell's border — no mid-drag rebuild");
-  assert.match(SRC, /const full = this\._mergeVisibleOrder\(vis\);\s*\/\/ only the shown rows permute within the full order\n\s*this\._applyOrderToData\(full\);[\s\S]{0,200}this\._persistOrder\(full\);/,
-    "drop = merge, apply, persist — the lane-drag's exact sequence");
+  assert.match(SRC, /const full = this\._mergeVisibleOrder\(vis\);\s*\/\/ only the shown rows permute within the full order\n\s*this\._applyOrderToData\(full\);[\s\S]{0,200}this\._persistOrder\(full, prev, vis\[toIdx\], 'dialog'\);/,
+    "drop = merge, apply, persist — the lane-drag's exact sequence (the pre-drag order and the moved row ride along, for the revert a refused persist makes)");
   assert.match(SRC, /renderRows\(\);\n\s*\};\n\s*nameCell\.addEventListener\('pointermove', onMove\);/,
     "the rebuild happens on the drop, after the persist");
 });
@@ -344,17 +344,19 @@ test("the two display toggles write the host's own romp:settings — reachable i
   assert.match(SRC, /localStorage\.setItem\('romp:settings', JSON\.stringify\(s\)\);/);
 });
 
-test("_setViews posts through the host hook with a GUARDED, atomic Obsidian fallback", () => {
+test("_setViews posts through the host hook, or through the kernel's POST /views in Obsidian (2026-09-08)", () => {
   assert.match(SRC, /window\.__rompTimelineSetViews === 'function'/);
-  // Electron-gated (a bare-node test run must never touch the real file — the 2026-07-02 lesson),
-  // env-aware state root, tmp+rename so a reader never sees a torn blob
-  assert.match(SRC, /process\.versions && process\.versions\.electron/);
-  assert.match(SRC, /process\.env\.ROMP_STATE_DIR\n?\s*\|\| path\.join\(process\.env\.XDG_STATE_HOME \|\| path\.join\(os\.homedir\(\), '\.local', 'state'\), 'romp'\)/);
-  assert.match(SRC, /fs\.renameSync\(fp \+ '\.tmp', fp\);/);
-  // the file IS the store on that path: the write settles on the spot (no kernel ack to wait for)
-  assert.match(SRC, /fs\.renameSync\(fp \+ '\.tmp', fp\);\s*\n\s*this\._views = v; this\._pendingViews = null;/);
-  assert.match(SRC, /_setViews\(v, edited, lens\) \{\s*\n\s*this\._pendingViews = lens \? applyLensFields\(this\._curViews\(\), lens\) : v;/,
-    "a lens or order write shows the current copy with its fields applied; a whole-blob write shows the blob");
+  // Obsidian used to write timeline-views.json itself here — a whole-blob write the judge and the
+  // stale-writer guard never saw. Now it posts the kernel's /views (the setTimelineViews op as a route)
+  // and feeds the viewsAck document the route answers with to the door the socket's ack takes, so the
+  // copy clears or reverts on the ack in every host. Electron-gated through _kernelHost (a bare-node
+  // test run must never reach the real state — the 2026-07-02 lesson); executed in ui/timeline-kernel-post.test.ts.
+  assert.match(SRC, /const hook = typeof window !== 'undefined' && typeof window\.__rompTimelineSetViews === 'function';\s*\n\s*if \(hook \|\| this\._kernelHost\(\)\) \{/);
+  assert.match(SRC, /if \(hook\) window\.__rompTimelineSetViews\(v, writeId, ed\);\s*\n\s*else settled = this\._kernelPost\('\/views', \{ views: v, edited: ed, writeId \}\)\.then\(\(r\) => this\._kernelViewsAnswer\(r, writeId, lens, own\)\);/,
+    "…answered through _kernelViewsAnswer: a kernel's ruling feeds viewsAck; a lens no kernel took stays local and is said (ui/timeline-kernel-post.test.ts)");
+  assert.doesNotMatch(SRC, /renameSync|writeFileSync/, "no file write of its own remains");
+  assert.match(SRC, /_setViews\(v, edited, lens, own\) \{\s*\n(?:\s*\/\/[^\n]*\n){0,6}\s*this\._pendingViews = lens \? applyLensFields\(this\._writeBase\(\), lens\) : v;/,
+    "a lens or order write shows the WRITE base with its fields applied (never the shown blob, whose local lens must not ride the next write); a whole-blob write shows the blob");
   assert.match(SRC, /this\._reconcileViews\(\);\s*\/\/ \.\.\.and an optimistic view edit/);
 });
 
@@ -763,7 +765,7 @@ test("the corner grew two icon buttons and the menus split (the user 2026-08-25)
   assert.match(SRC, /apply\(lensToggle\(lens, \{ tag: g\.name \}\), false\)/,
     "tag rows TOGGLE and the menu stays open (repaint in place)");
   assert.match(SRC, /apply\(\{ all: true \}, true\)/, "All is a plain pick and closes");
-  assert.match(SRC, /this\._setLens\(\{ actives: Object\.assign\(\{\}, v\.actives, \{ timeline: nl \}\) \}\)/,
+  assert.match(SRC, /this\._setLens\(\{ actives: Object\.assign\(this\._lensBaseActives\(\), \{ timeline: nl \}\) \}, \{ surfaces: \['timeline'\] \}\)/,
     "writes land on THIS surface's lens only");
 });
 

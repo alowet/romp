@@ -653,10 +653,16 @@ test("vertical click-drag reorders the lane (not pan), leaving the lock alone", 
   }
 });
 
-test("_persistOrder without a host hook refuses the direct file write outside Electron", () => {
+test("_persistOrder without a host hook posts through the kernel — inside Electron only, and never a file of its own", () => {
+  // The direct session-order.json write is gone (2026-09-08): Obsidian posts the kernel's /order, whose
+  // merge keeps the slots of lanes the drag did not carry. The Electron-or-nothing rule stands where it
+  // always did — plain node (the test runner) must never reach the real state, and now cannot: there is
+  // no fs writer to reach (ui/timeline-kernel-post.test.ts runs the writer both ways).
   const src = require("node:fs").readFileSync(viewPath, "utf8");
-  assert.match(src, /if \(typeof process === 'undefined' \|\| !process\.versions \|\| !process\.versions\.electron\) return;/,
-    "the direct session-order.json write is Electron-only (Obsidian desktop) — plain node (the test runner) must never touch the real state file");
+  assert.match(src, /if \(typeof process === 'undefined' \|\| !process\.versions \|\| !process\.versions\.electron\) return null;/,
+    "the one Electron guard (_kernelHost), which every writer takes");
+  assert.match(src, /_persistOrder\(order, prev, sid, from\) \{[\s\S]{0,600}if \(!this\._kernelHost\(\)\) return;\s*\n\s*return this\._kernelPost\('\/order', \{ order \}\)/);
+  assert.doesNotMatch(src, /writeFileSync|renameSync/, "no direct write of any state file remains");
 });
 
 // ── judging band (2026-06-17): a compact second timeline under the lanes, one row per summarizer
