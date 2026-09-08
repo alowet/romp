@@ -4865,6 +4865,7 @@ function auditTabOrder(ids: string[]) {
   lastTabIds = ids.slice();
 }
 let draggedId: string | null = null;
+let draggedEl: HTMLElement | null = null;   // the very tab being dragged: a session under several tags has a copy per group (T264b), so the id alone no longer names it
 let tabDragCommitted = false;   // set by the strip's drop handler; dragend without it = a cancel (Escape / dropped outside)
 // The drag hit-test's stable inputs (the drag-flap fix, 2026-08-28): every tab's outer width and
 // the strip's geometry, measured ONCE at dragstart. The pointer is then hit-tested against a
@@ -4901,12 +4902,15 @@ function dragImageBlank(): HTMLElement {
 function flipTabs(mutate: () => void): void {
   const bar = document.getElementById("tabs");
   if (!bar) { mutate(); return; }
+  // keyed per COPY — id plus the group it sits in (data-copy, T264b) — since a session under several
+  // tags has a tab in each group and one rect per id would animate every copy from the last one's place
+  const key = (t: HTMLElement) => t.dataset.id + "\0" + (t.dataset.copy ?? "");
   const before = new Map<string, DOMRect>();
-  bar.querySelectorAll<HTMLElement>(".tab[data-id]").forEach((t) => { if (t.dataset.id) before.set(t.dataset.id, t.getBoundingClientRect()); });
+  bar.querySelectorAll<HTMLElement>(".tab[data-id]").forEach((t) => { if (t.dataset.id) before.set(key(t), t.getBoundingClientRect()); });
   mutate();
   if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
   bar.querySelectorAll<HTMLElement>(".tab[data-id]").forEach((t) => {
-    const a = t.dataset.id ? before.get(t.dataset.id) : undefined;
+    const a = t.dataset.id ? before.get(key(t)) : undefined;
     if (!a) return;
     const b = t.getBoundingClientRect();
     const dx = a.left - b.left, dy = a.top - b.top;
@@ -5400,12 +5404,21 @@ function renderTabs() {
   const plan = planStrip(visibleIds, unions, readTabGroups(unions), activeId, phoneLayout(),
                          provisionalId ? { id: provisionalId, tags: provisionalTags } : null);
   collapsedTabIds = plan.folded;
+  // A session under several tags has a COPY in each group (T264b, the user 2026-09-08: tags are
+  // equivalent, none takes precedence). Every copy below is the full tab of the ONE session — same
+  // identity colour, same state class and dot, the active highlight on all of them (the loop reads
+  // activeId per item), the ✕ on all of them (ending the one session); a click on any copy selects
+  // the session (the #tabs delegate reads data-id). data-copy names the copy's group so a per-copy
+  // reader (flipTabs) can tell them apart; every by-id reader (focus, the menu, the tip) lands on the
+  // first copy, which is the same session.
+  let copyGroup: string | null | undefined;
   for (const item of plan.items) {
     if ("head" in item) {
       // every group on its own line (T264): a row break ahead of each header — except the strip's
       // first item, which already opens the first row; the untagged trail's header IS a break
       if (item.head.name !== null && bar.childElementCount) bar.appendChild(makeRowBreak(false));
       bar.appendChild(makeGroupHead(item.head, item.folded, item.active, item.hidden));
+      copyGroup = item.head.name;
       continue;
     }
     const id = item.id;
@@ -5414,6 +5427,7 @@ function renderTabs() {
     const tab = el("div", "tab" + (id === activeId ? " active" : ""));
     tab.tabIndex = 0;            // focusable for keyboard nav
     tab.dataset.id = id;
+    if (copyGroup !== undefined) tab.dataset.copy = copyGroup ?? "";   // sectioned strip: which group this copy sits in
     tab.dataset.act = "select";  // click → setActive, via the stable #tabs delegate (./actions), not a per-node handler
     tab.addEventListener("keydown", onTabKey);
     // drag-to-reorder (synced with the timeline via the shared session-order file). A subagent viewer
@@ -5426,7 +5440,7 @@ function renderTabs() {
     // visual, browser-style. dragImageBlank must be a rendered DOM node at dragstart (Chromium
     // snapshots it), hence the fixed off-viewport 1px div installed once below.
     tab.addEventListener("dragstart", (e) => {
-      draggedId = id; tabDragCommitted = false;
+      draggedId = id; draggedEl = tab; tabDragCommitted = false;
       if (e.dataTransfer) { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setDragImage(dragImageBlank(), 0, 0); }
       tab.classList.add("dragging");
       hideTabTip();                        // defect 2 (2026-08-28): the hover popover pinned open through the gesture
@@ -5440,7 +5454,7 @@ function renderTabs() {
     // already asked for its render; it ran deferred, so flush it.
     tab.addEventListener("dragend", () => {
       const cancelled = !tabDragCommitted;
-      draggedId = null; tabDragCommitted = false;
+      draggedId = null; draggedEl = null; tabDragCommitted = false;
       tab.classList.remove("dragging");
       tabPointerHeld = false;
       const pending = renderPendingWhilePressed;
@@ -5527,7 +5541,10 @@ function renderTabs() {
     // Close-tab / End-session confirm (closeSession → confirmClose). A subagent viewer likewise
     // just closes (the tabs delegate's close handler routes it by isSubId).
     const dead = st === "closed";
-    close.title = dead || s.sub ? "Close tab" : "End session";
+    // a session shown in several groups (T264b) has a ✕ on every copy, and any of them ends THE session —
+    // the tip says so, since a user may expect the ✕ to take the tab out of just this group
+    const copies = plan.items.reduce((n, it) => n + ("id" in it && it.id === id ? 1 : 0), 0);
+    close.title = dead || s.sub ? "Close tab" : copies > 1 ? "End session (it is the one session, shown in every group it is tagged with)" : "End session";
     // Click-safe (see ./actions): renderTabs() does `#tabs`.replaceChildren() on every kernel push, so a
     // handler hung on this ✕ is destroyed mid-click and the click is dropped (the "had to click End session
     // several times" bug). The action lives on the stable #tabs delegate instead; this node just declares it.
@@ -15674,7 +15691,7 @@ setupSettings();
     if (!draggedId || !dragGeom) return;
     e.preventDefault();   // the whole strip is a valid drop target
     if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-    const dragged = tabs.querySelector<HTMLElement>(`.tab[data-id="${CSS.escape(draggedId)}"]`);
+    const dragged = draggedEl && draggedEl.isConnected ? draggedEl : null;   // THIS copy, not the first tab wearing the id (T264b)
     if (!dragged) return;
     // native feel: a pointer still inside the dragged tab's own box moves nothing (without this,
     // the virtual mapping — which removes the dragged tab — can read the untouched start position
@@ -15726,12 +15743,15 @@ setupSettings();
     }
     if (!draggedId) return;
     e.preventDefault();
-    const dragged = tabs.querySelector<HTMLElement>(`.tab[data-id="${CSS.escape(draggedId)}"]`);
+    const dragged = draggedEl && draggedEl.isConnected ? draggedEl : null;   // THIS copy, not the first tab wearing the id (T264b)
     if (!dragged) return;
     // the neighbours are TABS: a section header or separator beside the dropped tab is skipped, so
     // a drop at a section's edge still names the nearest tab and its side
-    const tabBefore = (n: Element | null) => { while (n && !(n as HTMLElement).dataset?.id) n = n.previousElementSibling; return n as HTMLElement | null; };
-    const tabAfter = (n: Element | null) => { while (n && !(n as HTMLElement).dataset?.id) n = n.nextElementSibling; return n as HTMLElement | null; };
+    // …and never the dragged SESSION's own copy in the group next door (T264b): reorderTo against itself
+    // would move nothing, so the neighbour beyond it names the slot instead
+    const own = (n: Element | null) => !!n && (n as HTMLElement).dataset?.id === draggedId;
+    const tabBefore = (n: Element | null) => { while (n && (!(n as HTMLElement).dataset?.id || own(n))) n = n.previousElementSibling; return n as HTMLElement | null; };
+    const tabAfter = (n: Element | null) => { while (n && (!(n as HTMLElement).dataset?.id || own(n))) n = n.nextElementSibling; return n as HTMLElement | null; };
     const prev = tabBefore(dragged.previousElementSibling);
     const next = tabAfter(dragged.nextElementSibling);
     if (prev?.dataset?.id) reorderTo(draggedId, prev.dataset.id, true);

@@ -9,7 +9,8 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { viewTagUnion, type TagUnion } from "./session-views";
-import { sectionTabs, anySectioned, homeTag, parseTabGroups, readTabGroups, writeTabGroups, isSectionCollapsed,
+import * as TG_MOD from "./tab-groups";
+import { sectionTabs, anySectioned, parseTabGroups, readTabGroups, writeTabGroups, isSectionCollapsed,
          toggleSectionCollapsed, setSectionCollapsed, planStrip, reorderTagOrder, applyTagOrder, TABGROUPS_KEY,
          DEFAULT_COLLAPSED, sectionRef, isPinned, setPinned, togglePinned, prunePinned, reachableFrom, tagRenames, followTagRenames, followAdoption,
          sameTagNames, headWords, type TabSection, type SectionRef, type TabGroupsState } from "./tab-groups";
@@ -34,20 +35,24 @@ const V = {
   remoteTags: [{ id: "TESTHOST-A:r1", host: "TESTHOST-A", name: "remotepool", color: "#7aa2f7", members: ["TESTHOST-A:m1"] }],
 };
 
-test("executed: the home-tag rule — one section per tab, its FIRST holder in tagOrder; sections in union order; the untagged trail", () => {
+test("executed: the every-tag rule (T264b) — a section per tag holding EVERY visible member it carries; sections in union order; the untagged trail", () => {
+  // the user 2026-09-08: tags are equivalent, so a session under two tags appears under both — the
+  // home-tag rule (first holder in tagOrder) is retired
   const unions = viewTagUnion(V);
   const secs = sectionTabs(["web", "api", "loose", "tests"], unions);
   assert.deepEqual(secs.map((s) => [s.name, s.ids]),
-    [["qa", ["api", "tests"]], ["infra", ["web"]], [null, ["loose"]]],
-    "api holds qa AND infra — qa is first in the union order, so qa is its home; tabs keep strip order inside; the loose one trails");
+    [["qa", ["api", "tests"]], ["infra", ["web", "api"]], [null, ["loose"]]],
+    "api holds qa AND infra — it appears under both; tabs keep strip order inside; the loose one trails");
   assert.equal(secs[0].color, "#DD42FF", "the section wears its tag's colour");
-  assert.equal(homeTag("api", unions)!.name, "qa");
-  // the SAME rule revealIn keys on (session-views.ts) — the two must never disagree
+  assert.equal(typeof (TG_MOD as Record<string, unknown>).homeTag, "undefined", "homeTag is retired: nothing sections by a first holder any more");
+  // revealIn (session-views.ts) adds the session's FIRST holder to the lens — any holder reveals it now that every tag shows it
   assert.match(VIEWS, /const holder = unions\.find\(\(u\) => u\.members\.includes\(id\)\);/);
-  // reorder the tags and api moves home with them — this is why reordering is first-class
+  // reorder the tags and the sections follow — this is why reordering is first-class; api stays in both
   const flipped = viewTagUnion({ ...V, tagOrder: ["infra", "qa"] });
   assert.deepEqual(sectionTabs(["web", "api", "tests"], flipped).map((s) => [s.name, s.ids]),
-    [["infra", ["web", "api"]], ["qa", ["tests"]]]);
+    [["infra", ["web", "api"]], ["qa", ["api", "tests"]]]);
+  // the trail holds only ids in NO tag
+  assert.deepEqual(sectionTabs(["api", "loose"], unions).map((s) => [s.name, s.ids]), [["qa", ["api"]], ["infra", ["api"]], [null, ["loose"]]]);
   // a tag with no visible member yields no section; a remote-homed tag sections by NAME like any other
   assert.ok(!secs.some((s) => s.name === "empty"));
   assert.deepEqual(sectionTabs(["TESTHOST-A:m1"], unions).map((s) => s.name), ["remotepool"]);
@@ -118,8 +123,8 @@ test("the strip renders sections when the switch is on and some tag holds a visi
   assert.match(RENDER, /const unions = viewTagUnion\(effViews\(\)\);\s*\n\s*const plan = planStrip\(visibleIds, unions, readTabGroups\(unions\), activeId, phoneLayout\(\),/,
     "the pure module owns the rule; the phone layout and the create in flight are its inputs");
   assert.match(RENDER, /collapsedTabIds = plan\.folded;/);
-  assert.match(RENDER, /if \("head" in item\) \{\s*\n(?:\s*\/\/[^\n]*\n)*\s*if \(item\.head\.name !== null && bar\.childElementCount\) bar\.appendChild\(makeRowBreak\(false\)\);\s*\n\s*bar\.appendChild\(makeGroupHead\(item\.head, item\.folded, item\.active, item\.hidden\)\);\s*\n\s*continue;\s*\n\s*\}/,
-    "a header paints from the plan (T264: on its own line — the break ahead of it)");
+  assert.match(RENDER, /if \("head" in item\) \{\s*\n(?:\s*\/\/[^\n]*\n)*\s*if \(item\.head\.name !== null && bar\.childElementCount\) bar\.appendChild\(makeRowBreak\(false\)\);\s*\n\s*bar\.appendChild\(makeGroupHead\(item\.head, item\.folded, item\.active, item\.hidden\)\);\s*\n\s*copyGroup = item\.head\.name;\s*\n\s*continue;\s*\n\s*\}/,
+    "a header paints from the plan (T264: on its own line — the break ahead of it; T264b: it names the group the copies below sit in)");
 });
 
 test("executed: planStrip — sections + folds; the flat strip when off or untagged; the ACTIVE tab's section never folds", () => {
@@ -210,8 +215,8 @@ test("executed: a create in flight sections under the FIRST requested tag in tag
   const unions = viewTagUnion(V);
   const st = parseTabGroups(null);
   const p = planStrip(["web", "prov1", "loose"], unions, st, "prov1", false, { id: "prov1", tags: ["infra", "qa"] });
-  assert.deepEqual(p.items.map((i) => ("head" in i ? "#" + i.head.name : i.id)), ["#qa", "prov1", "#infra", "web", "#null", "loose"],
-    "qa is first in tagOrder of the requested tags → qa is its home (the kernel's own home-tag rule)");
+  assert.deepEqual(p.items.map((i) => ("head" in i ? "#" + i.head.name : i.id)), ["#qa", "prov1", "#infra", "web", "prov1", "#null", "loose"],
+    "the provisional tab appears under BOTH requested tags from the first paint (the every-tag rule, T264b)");
   const none = planStrip(["web", "prov1"], unions, st, "prov1", false, { id: "prov1", tags: [] });
   assert.deepEqual(none.items.map((i) => ("head" in i ? "#" + i.head.name : i.id)), ["#infra", "web", "#null", "prov1"], "no tags asked → the untagged trail");
   assert.deepEqual(V.tags.map((t) => t.members), [["tests", "api"], ["web", "api"], []], "the unions themselves are untouched");
@@ -395,17 +400,21 @@ test("the tab drag's virtual layout wraps where the strip wraps: headers after a
   assert.match(DS, /const needsWrap = row !== null && cx > 0 && \(b\.br === true \|\| cx \+ b\.w > containerW\);/, "dragslot honours br (executed in dragslot.test.ts)");
 });
 
-test("executed: a session under two tags is placed ONCE, under its home tag — the duplicate question stays the user's (T264)", () => {
-  // the manager's note (2026-09-08): sectionTabs homes each id under homeTag; the user has been asked
-  // whether a two-tag session should show under both. Until they rule, this pins today's behaviour so
-  // the line-per-group layout does not change it by accident.
+test("executed: a session under two tags is placed under BOTH — the user's ruling (T264b); folded away only when every copy is", () => {
+  // the user 2026-09-08: tags are equivalent; neither takes precedence, so the session appears under
+  // every tag it carries (the T264 once-per-session pin flipped to this rule)
   const unions = viewTagUnion({ tags: [{ id: "t-infra", name: "infra", color: "#1EA1EB", members: ["web", "api"] },
                                        { id: "t-qa", name: "qa", color: "#54B204", members: ["api", "tests"] }] });
-  const p = planStrip(["web", "api", "tests"], unions, parseTabGroups(null, unions), "web", false);
+  const st = parseTabGroups(null, unions);
+  const p = planStrip(["web", "api", "tests"], unions, st, "web", false);
   const tabs = p.items.filter((i) => "id" in i).map((i) => (i as { id: string }).id);
-  assert.deepEqual(tabs, ["web", "api", "tests"], "each session once");
-  const heads = p.items.map((i, k) => ("head" in i ? { name: i.head.name, ids: i.head.ids, at: k } : null)).filter(Boolean);
-  assert.deepEqual(heads.map((h) => [h!.name, h!.ids]), [["infra", ["web", "api"]], ["qa", ["tests"]]], "api sits under its home tag only");
+  assert.deepEqual(tabs, ["web", "api", "api", "tests"], "api has a copy in each of its groups");
+  const heads = p.items.map((i) => ("head" in i ? { name: i.head.name, ids: i.head.ids } : null)).filter(Boolean);
+  assert.deepEqual(heads.map((h) => [h!.name, h!.ids]), [["infra", ["web", "api"]], ["qa", ["api", "tests"]]], "counts per group count the group's own copies");
+  // fold qa: tests is folded away (its only copy), api is NOT (its infra copy is on screen) — the keyboard order keeps it
+  const folded = planStrip(["web", "api", "tests"], unions, setSectionCollapsed(st, "qa", true), "web", false);
+  assert.deepEqual([...folded.folded], ["tests"], "an id leaves the keyboard order only when every copy is folded");
+  assert.deepEqual(folded.items.filter((i) => "id" in i).map((i) => (i as { id: string }).id), ["web", "api"]);
 });
 
 
@@ -628,12 +637,12 @@ test("executed: SHARED — a member a local tag and a same-named remote tag both
   const st2 = followTagRenames(st, renames, ru);
   assert.deepEqual(st2.pinned, [{ sid: "web", name: "ops", id: "g7" }, { sid: "web", name: "infra" }], "the rewritten entry, and the old-name half");
   assert.equal(followTagRenames(st2, renames, ru), st2, "idempotent: a second pane adopting the same frame after the first has written finds nothing to change — the same object, no second write");
-  assert.deepEqual(strip(vis, ru, st2, "loose"), [["#ops(folded)", "web", "#null", "loose"], ["api"]], "web homes in ops and is pinned there; no member homes in infra, so it has no header");
+  assert.deepEqual(strip(vis, ru, st2, "loose"), [["#ops(folded)", "web", "#infra(folded)", "web", "#null", "loose"], ["api"]], "web shows under ops AND infra (every-tag rule, T264b), pinned in both");
   // the user had dragged infra into place before the rename: the kernel leaves tagOrder alone, so infra
   // keeps its slot and ops falls behind — web homes in the remote-only infra, and the kept half matches
   const infraFirst = viewTagUnion({ ...renamedV, tagOrder: ["infra"] });
   assert.deepEqual(infraFirst.map((u) => u.name), ["infra", "ops"]);
-  assert.deepEqual(strip(vis, infraFirst, st2, "loose"), [["#infra(folded)", "web", "#ops(folded)", "#null", "loose"], ["api"]], "web pinned under infra; api under ops");
+  assert.deepEqual(strip(vis, infraFirst, st2, "loose"), [["#infra(folded)", "web", "#ops(folded)", "web", "#null", "loose"], ["api"]], "web pinned under infra; api under ops");
   assert.equal(isPinned(st2, secOf(ru, "ops"), "web"), true, "the menu row reads on under ops…");
   assert.equal(isPinned(st2, secOf(infraFirst, "infra"), "web"), true, "…and under infra");
   // the prune keeps both halves while both hold web, and drops the infra half once the remote tag lets go
@@ -643,13 +652,13 @@ test("executed: SHARED — a member a local tag and a same-named remote tag both
   const letGo = viewTagUnion({ ...renamedV, remoteTags: [{ ...A, members: [] }] });
   assert.deepEqual(prunePinned(st2, letGo, known, HOSTS).pinned, [{ sid: "web", name: "ops", id: "g7" }], "no union named infra holds web: that half is dead");
   // the same rename with no client watching: the id half is found; the infra half is only the kept one
-  assert.deepEqual(strip(vis, ru, st, "loose"), [["#ops(folded)", "web", "#null", "loose"], ["api"]], "missed: the id finds ops");
-  assert.deepEqual(strip(vis, infraFirst, st, "loose"), [["#infra(folded)", "web", "#ops(folded)", "#null", "loose"], ["api"]], "missed, infra first: the stored name IS infra — the section the user pinned in");
+  assert.deepEqual(strip(vis, ru, st, "loose"), [["#ops(folded)", "web", "#infra(folded)", "web", "#null", "loose"], ["api"]], "missed: the id finds ops, the stored name finds infra — web shows under both");
+  assert.deepEqual(strip(vis, infraFirst, st, "loose"), [["#infra(folded)", "web", "#ops(folded)", "web", "#null", "loose"], ["api"]], "missed, infra first: the stored name IS infra — the section the user pinned in");
   // OFF IS PER SECTION: off under ops clears the ops entry alone; the infra pin is the infra row's to
   // clear, and the row there reads on
   const off = setPinned(st2, secOf(ru, "ops"), "web", false);
   assert.deepEqual(off.pinned, [{ sid: "web", name: "infra" }]);
-  assert.deepEqual(strip(vis, ru, off, "loose"), [["#ops(folded)", "#null", "loose"], ["web", "api"]], "web folded away under ops");
+  assert.deepEqual(strip(vis, ru, off, "loose"), [["#ops(folded)", "#infra(folded)", "web", "#null", "loose"], ["api"]], "web folded away under ops, shown under infra where its pin stands");
   assert.deepEqual(strip(vis, infraFirst, off, "loose"), [["#infra(folded)", "web", "#ops(folded)", "#null", "loose"], ["api"]], "infra dragged first: web shows through infra's fold — the pin set there stands until cleared there");
   assert.equal(isPinned(off, secOf(infraFirst, "infra"), "web"), true, "the row under infra reads on");
   assert.deepEqual(setPinned(off, secOf(infraFirst, "infra"), "web", false).pinned, [], "off under infra: cleared");
@@ -669,7 +678,7 @@ test("executed: a LOCAL-ONLY member of a MIXED union — the remote same-named t
   const renamedV = { active: "all", tags: [local("ops")], remoteTags: [A] };
   const st2 = followTagRenames(st, tagRenames(mixedV, renamedV), viewTagUnion(renamedV));
   assert.deepEqual(st2.pinned, [{ sid: "api", name: "ops", id: "g7" }], "no infra half: A's infra does not hold api");
-  assert.deepEqual(strip(["web", "api", "loose"], viewTagUnion(renamedV), st2, "loose"), [["#ops(folded)", "api", "#null", "loose"], ["web"]]);
+  assert.deepEqual(strip(["web", "api", "loose"], viewTagUnion(renamedV), st2, "loose"), [["#ops(folded)", "api", "#infra(folded)", "#null", "loose"], ["web"]]);
   assert.deepEqual(strip(["web", "api", "loose"], viewTagUnion({ ...renamedV, tagOrder: ["infra"] }), st2, "loose"), [["#infra(folded)", "#ops(folded)", "api", "#null", "loose"], ["web"]],
     "infra dragged first: web homes in the remote infra (unpinned there), api in ops, pinned");
 });
@@ -687,19 +696,19 @@ test("executed: TWO TAGS WITH DIFFERENT NAMES holding one tab — a pin under ea
   st = setPinned(st, secOf(aFirst, "a"), "web", true);   // 1. Show when folded under a
   assert.deepEqual(st.pinned, [{ sid: "web", name: "a", id: "gA" }]);
   assert.deepEqual(strip(vis, aFirst, st, "loose"), [["#a(folded)", "web", "#b(folded)", "#null", "loose"], ["x1", "x2"]]);
-  // 2. b dragged first: web's home is b, where nothing pins it (a move starts unpinned) — the row reads off
-  assert.deepEqual(strip(vis, bFirst, st, "loose"), [["#b(folded)", "#a(folded)", "#null", "loose"], ["web", "x2", "x1"]]);
+  // 2. b dragged first: web shows under b too (every-tag rule), where nothing pins it — hidden there, shown under a; the b row reads off
+  assert.deepEqual(strip(vis, bFirst, st, "loose"), [["#b(folded)", "#a(folded)", "web", "#null", "loose"], ["x2", "x1"]]);
   assert.equal(isPinned(st, secOf(bFirst, "b"), "web"), false);
   // 3. Show when folded under b: b's entry is added; a's stands
   st = setPinned(st, secOf(bFirst, "b"), "web", true);
   assert.deepEqual(st.pinned, [{ sid: "web", name: "a", id: "gA" }, { sid: "web", name: "b", id: "gB" }]);
-  assert.deepEqual(strip(vis, bFirst, st, "loose"), [["#b(folded)", "web", "#a(folded)", "#null", "loose"], ["x2", "x1"]]);
+  assert.deepEqual(strip(vis, bFirst, st, "loose"), [["#b(folded)", "web", "#a(folded)", "web", "#null", "loose"], ["x2", "x1"]]);
   // 4. a dragged first again: the pin set under a is still there
-  assert.deepEqual(strip(vis, aFirst, st, "loose"), [["#a(folded)", "web", "#b(folded)", "#null", "loose"], ["x1", "x2"]], "no gesture turned it off");
+  assert.deepEqual(strip(vis, aFirst, st, "loose"), [["#a(folded)", "web", "#b(folded)", "web", "#null", "loose"], ["x1", "x2"]], "no gesture turned it off");
   // off under a clears a's entry alone
   const off = setPinned(st, secOf(aFirst, "a"), "web", false);
   assert.deepEqual(off.pinned, [{ sid: "web", name: "b", id: "gB" }]);
-  assert.deepEqual(strip(vis, aFirst, off, "loose"), [["#a(folded)", "#b(folded)", "#null", "loose"], ["web", "x1", "x2"]], "folded away under a");
+  assert.deepEqual(strip(vis, aFirst, off, "loose"), [["#a(folded)", "#b(folded)", "web", "#null", "loose"], ["x1", "x2"]], "folded away under a, shown under b where its pin stands — so not skipped by the keyboard");
   assert.deepEqual(strip(vis, bFirst, off, "loose"), [["#b(folded)", "web", "#a(folded)", "#null", "loose"], ["x2", "x1"]], "still pinned under b");
   assert.equal(prunePinned(off, aFirst, new Set(vis), HOSTS), off, "both tags still hold web: nothing dead");
 });
@@ -725,8 +734,8 @@ test("executed: MIRROR A — pinned BEFORE the second holder: a remote host's sa
   const ru = viewTagUnion(renamedV);
   const st2 = followTagRenames(st, tagRenames(mixedV, renamedV), ru);
   assert.deepEqual(st2.pinned, [{ sid: "web", name: "ops", id: "g7" }, { sid: "web", name: "infra" }]);
-  assert.deepEqual(strip(vis, ru, st2, "loose"), [["#infra(folded)", "web", "#ops(folded)", "#null", "loose"], ["api"]], "pinned under infra, the home the drag order gives it");
-  assert.deepEqual(strip(vis, viewTagUnion({ ...renamedV, tagOrder: [] }), st2, "loose"), [["#ops(folded)", "web", "#null", "loose"], ["api"]], "and under ops, the default home");
+  assert.deepEqual(strip(vis, ru, st2, "loose"), [["#infra(folded)", "web", "#ops(folded)", "web", "#null", "loose"], ["api"]], "pinned under infra, the home the drag order gives it");
+  assert.deepEqual(strip(vis, viewTagUnion({ ...renamedV, tagOrder: [] }), st2, "loose"), [["#ops(folded)", "web", "#infra(folded)", "web", "#null", "loose"], ["api"]], "and under ops, the default home");
 });
 
 test("executed: MIRROR B — a remote pin, then a local same-name tag comes to hold the tab, then that tag's rename: the entry follows the local tag and gains its id, and the old-name half stays while the host's tag holds the tab", () => {
@@ -746,11 +755,11 @@ test("executed: MIRROR B — a remote pin, then a local same-name tag comes to h
   const st2 = followTagRenames(st, tagRenames(mixedV, renamedV), ru);
   assert.deepEqual(st2.pinned, [{ sid: "TESTHOST-A:m1", name: "ops", id: "g9" }, { sid: "TESTHOST-A:m1", name: "infra" }],
     "the renamed tag holds the tab, so the no-id entry follows it and gains the id; A's infra still holds the tab, so the infra half stays");
-  assert.deepEqual(strip(vis, ru, st2, "loose"), [["#ops(folded)", "TESTHOST-A:m1", "#null", "loose"], ["web"]], "default order: home ops, pinned");
-  assert.deepEqual(strip(vis, viewTagUnion({ ...renamedV, tagOrder: ["infra"] }), st2, "loose"), [["#infra(folded)", "TESTHOST-A:m1", "#ops(folded)", "#null", "loose"], ["web"]], "infra dragged first: home infra, pinned");
+  assert.deepEqual(strip(vis, ru, st2, "loose"), [["#ops(folded)", "TESTHOST-A:m1", "#infra(folded)", "TESTHOST-A:m1", "#null", "loose"], ["web"]], "default order: home ops, pinned");
+  assert.deepEqual(strip(vis, viewTagUnion({ ...renamedV, tagOrder: ["infra"] }), st2, "loose"), [["#infra(folded)", "TESTHOST-A:m1", "#ops(folded)", "TESTHOST-A:m1", "#null", "loose"], ["web"]], "infra dragged first: home infra, pinned");
   // the id it gained: a second rename, watched by no client, is found by id
   const againV = { ...renamedV, tags: [{ ...renamedV.tags[0], name: "platform" }] };
-  assert.deepEqual(strip(vis, viewTagUnion(againV), st2, "loose"), [["#platform(folded)", "TESTHOST-A:m1", "#null", "loose"], ["web"]]);
+  assert.deepEqual(strip(vis, viewTagUnion(againV), st2, "loose"), [["#platform(folded)", "TESTHOST-A:m1", "#infra(folded)", "TESTHOST-A:m1", "#null", "loose"], ["web"]]);
   // a same-named tag on another host holding another member is not this rename's to move
   const B = rt("TESTHOST-B", "t2", "infra", ["TESTHOST-B:m1"]);
   const other = setPinned(foldAll(parseTabGroups(null), "infra"), { name: "infra", localId: null }, "TESTHOST-B:m1", true);
@@ -780,7 +789,7 @@ test("executed: a rename is followed ONCE PER BROWSER — the store remembers, b
   assert.deepEqual(off.pinned, [{ sid: "web", name: "infra" }]);
   assert.deepEqual(off.followed, { g7: "ops" }, "the memory rides every write");
   assert.equal(followTagRenames(off, tagRenames(V0, V1), u1), off, "the late pane stands down: this browser already carried g7's pins to ops");
-  assert.deepEqual(strip(vis, u1, off, "loose"), [["#ops(folded)", "#null", "loose"], ["web", "api"]], "web stays folded away under ops, as the user left it");
+  assert.deepEqual(strip(vis, u1, off, "loose"), [["#ops(folded)", "#infra(folded)", "web", "#null", "loose"], ["api"]], "web stays folded away under ops, as the user left it — and shows under infra, where the kept pin stands");
   assert.equal(followTagRenames(off, tagRenames(V0, V2), u2), off, "…and a LATER frame adopted from the stale base — the same rename, coalesced — stands down too (a seq gate on the frame would have let it through)");
   // the id face: infra dragged first, the user turns the pin off under the kept infra half instead
   const offInfra = setPinned(st1, secOf(viewTagUnion({ ...V1, tagOrder: ["infra"] }), "infra"), "web", false);
@@ -863,7 +872,7 @@ test("executed: the follow's memory is pruned PER HOST — a detached host's tag
   // A reattaches. A background pane whose held blob predates A's rename adopts the frame and computes
   // infra → platform again — already followed, so it stands down, and web stays folded away under platform
   assert.equal(followTagRenames(away, tagRenames(V0, V4), viewTagUnion(V4)), away, "the stale pane stands down");
-  assert.deepEqual(strip(vis, viewTagUnion(V4), away, "loose"), [["#platform(folded)", "#infra(folded)", "#y(folded)", "#null", "loose"], ["web", "api", "tests"]]);
+  assert.deepEqual(strip(vis, viewTagUnion(V4), away, "loose"), [["#platform(folded)", "#infra(folded)", "web", "#y(folded)", "#null", "loose"], ["api", "tests"]]);
   assert.deepEqual(followTagRenames({ ...away, followed: { g8: "y" } }, tagRenames(V0, V4), viewTagUnion(V4)).pinned, [{ sid: "web", name: "infra", id: "g7" }, { sid: "web", name: "platform" }],
     "(without A's memory, the late pane re-applies the pin the user turned off)");
   // A DOWN instead of detached: the kernel keeps a down host's cached tags in the blob, so its ids are live and the memory stood already
@@ -1290,9 +1299,9 @@ test("executed: a REMOTE host's rename of a MIXED section — the entry carries 
   const ru = viewTagUnion(renamedV);
   const st2 = followTagRenames(st, tagRenames(mixedV, renamedV), ru);
   assert.deepEqual(st2.pinned, [{ sid: "TESTHOST-A:m1", name: "infra", id: "g9" }, { sid: "TESTHOST-A:m1", name: "ops" }], "the kept entry, and the remote half — no id: the tag is A's");
-  assert.deepEqual(strip(vis, ru, st2, "loose"), [["#infra(folded)", "TESTHOST-A:m1", "#null", "loose"], ["web"]], "default order: home infra, pinned; no member homes in ops, so it has no header");
+  assert.deepEqual(strip(vis, ru, st2, "loose"), [["#infra(folded)", "TESTHOST-A:m1", "#ops(folded)", "TESTHOST-A:m1", "#null", "loose"], ["web"]], "default order: shown under infra AND ops (every-tag rule), pinned in both");
   const opsFirst = viewTagUnion({ ...renamedV, tagOrder: ["ops"] });
-  assert.deepEqual(strip(vis, opsFirst, st2, "loose"), [["#ops(folded)", "TESTHOST-A:m1", "#infra(folded)", "#null", "loose"], ["web"]], "ops dragged first: home ops, pinned there too");
+  assert.deepEqual(strip(vis, opsFirst, st2, "loose"), [["#ops(folded)", "TESTHOST-A:m1", "#infra(folded)", "TESTHOST-A:m1", "#null", "loose"], ["web"]], "ops dragged first: home ops, pinned there too");
   assert.equal(isPinned(st2, secOf(opsFirst, "ops"), "TESTHOST-A:m1"), true);
   assert.equal(prunePinned(st2, opsFirst, new Set(vis), HOSTS), st2, "both halves hold the tab: both stand");
   // the same start with the LOCAL tag renamed instead — the mirror, as before
@@ -1308,7 +1317,7 @@ test("executed: a REMOTE host's rename of a MIXED section — the entry carries 
   assert.deepEqual(strip(vis2, viewTagUnion(beforeV), st, "loose"), [["#ops(folded)", "#infra(folded)", "TESTHOST-A:m1", "#null", "loose"], ["x", "web"]]);
   const st3 = followTagRenames(st, tagRenames(beforeV, afterV), au);
   assert.deepEqual(st3.pinned, [{ sid: "TESTHOST-A:m1", name: "infra", id: "g9" }, { sid: "TESTHOST-A:m1", name: "ops" }]);
-  assert.deepEqual(strip(vis2, au, st3, "loose"), [["#ops(folded)", "TESTHOST-A:m1", "#infra(folded)", "#null", "loose"], ["x", "web"]], "home ops now — the union g3 and A's tag make — and on the strip");
+  assert.deepEqual(strip(vis2, au, st3, "loose"), [["#ops(folded)", "TESTHOST-A:m1", "#infra(folded)", "TESTHOST-A:m1", "#null", "loose"], ["x", "web"]], "home ops now — the union g3 and A's tag make — and on the strip");
   assert.equal(isPinned(st3, secOf(au, "ops"), "TESTHOST-A:m1"), true, "the section's local id is g3, the entry's name is ops: matched by name");
 });
 
@@ -1330,8 +1339,8 @@ test("executed: TWO same-named tags both holding the tab, renamed in ONE frame �
   const twice = followTagRenames(followTagRenames(st, tagRenames(V0, V1), viewTagUnion(V1)), tagRenames(V1, V2), u2);
   assert.deepEqual(twice.pinned, once.pinned, "the same two renames a frame apart: the same entries");
   assert.deepEqual(once.followed, twice.followed);
-  assert.deepEqual(strip(vis, viewTagUnion({ ...V2, tagOrder: ["platform"] }), once, "loose"), [["#platform(folded)", "web", "#null", "api", "loose"], []], "platform first: pinned there");
-  assert.deepEqual(strip(vis, u2, once, "loose"), [["#ops(folded)", "web", "#null", "api", "loose"], []], "ops first: pinned there");
+  assert.deepEqual(strip(vis, viewTagUnion({ ...V2, tagOrder: ["platform"] }), once, "loose"), [["#platform(folded)", "web", "#ops(folded)", "web", "#null", "api", "loose"], []], "platform first: pinned there");
+  assert.deepEqual(strip(vis, u2, once, "loose"), [["#ops(folded)", "web", "#platform(folded)", "web", "#null", "api", "loose"], []], "ops first: pinned there");
   // the id face: local g7 infra and A's infra both hold web, both renamed in one frame
   const g7 = (name: string) => ({ id: "g7", name, color: "#4EC9B0", members: ["web", "api"] });
   const M0 = { active: "all", tags: [g7("infra")], remoteTags: [A] };
@@ -1342,7 +1351,7 @@ test("executed: TWO same-named tags both holding the tab, renamed in ONE frame �
   assert.deepEqual(onceM.pinned, [{ sid: "web", name: "ops", id: "g7" }, { sid: "web", name: "platform" }], "its own tag's rename by id, A's by the old name — one entry each; no infra half, nothing is named infra now");
   const M1 = { active: "all", tags: [g7("ops")], remoteTags: [A] };
   assert.deepEqual(followTagRenames(followTagRenames(pinned, tagRenames(M0, M1), viewTagUnion(M1)), tagRenames(M1, M2), m2).pinned, onceM.pinned, "a frame apart: the same");
-  assert.deepEqual(strip(vis, viewTagUnion({ ...M2, tagOrder: ["platform"] }), onceM, "loose"), [["#platform(folded)", "web", "#ops(folded)", "#null", "loose"], ["api"]]);
+  assert.deepEqual(strip(vis, viewTagUnion({ ...M2, tagOrder: ["platform"] }), onceM, "loose"), [["#platform(folded)", "web", "#ops(folded)", "web", "#null", "loose"], ["api"]]);
 });
 
 test("executed: tagRenames — a tag that keeps its id under a new name, local or a remote host's; a new tag, a deleted one, an unchanged name and a missing blob yield none; followTagRenames rewrites by id whatever the stored name, collapses duplicates, and returns the same state when no rename is new", () => {
@@ -1575,7 +1584,7 @@ test("executed: a folded section whose EVERY member is pinned stays folded — t
   const p = planStrip(["web", "api", "tests"], unions, st, "tests", false);
   const h = headsOf(p).find((x) => x.head.name === "infra")!;
   assert.deepEqual([h.folded, h.hidden], [true, []], "folded — the stored state the click acts on, so the header still opens it — with nothing hidden");
-  assert.deepEqual(p.items.map((i) => ("head" in i ? `#${i.head.name}${i.folded ? "(folded)" : ""}` : i.id)), ["#infra(folded)", "web", "api", "#qa", "tests"]);
+  assert.deepEqual(p.items.map((i) => ("head" in i ? `#${i.head.name}${i.folded ? "(folded)" : ""}` : i.id)), ["#infra(folded)", "web", "api", "#qa", "api", "tests"]);
   assert.deepEqual([...p.folded], [], "every tab reachable");
   // the words render.ts paints for that header
   assert.deepEqual(headWords("infra", 2, 0, true, false), {
@@ -1628,4 +1637,49 @@ test("the group header wears the SHARED tag chip — one vocabulary with the tag
   const head = RENDER.slice(RENDER.indexOf("function makeGroupHead("), RENDER.indexOf("function sectionHeadOf("));
   assert.match(head, /chip\.classList\.add\("tab-group-chip"\);/);
   assert.ok(!/font-size/.test(head), "the header sets no size of its own — the chip inherits the header's 0.82em (no nested em)");
+});
+
+// ── T264b (the user 2026-09-08): a session under several tags has a copy in every group ──────────────────
+test("every copy is the full tab of the ONE session, and the by-copy readers tell copies apart (T264b)", () => {
+  const loop = RENDER.slice(RENDER.indexOf("collapsedTabIds = plan.folded;"), RENDER.indexOf('const close = el("span", "tab-close");'));
+  // the active highlight, the state class and the dot come from the same per-item loop, so every copy wears them
+  assert.match(loop, /const tab = el\("div", "tab" \+ \(id === activeId \? " active" : ""\)\);/);
+  assert.match(loop, /if \(copyGroup !== undefined\) tab\.dataset\.copy = copyGroup \?\? "";/, "data-copy names the copy's group (sectioned strip only)");
+  assert.match(loop, /tab\.dataset\.act = "select";/, "a click on any copy selects the session through the #tabs delegate, by id");
+  // the ✕ on a copy ends THE session, and its tip says so
+  const close = RENDER.slice(RENDER.indexOf('const close = el("span", "tab-close");'), RENDER.indexOf('close.dataset.act = "close";'));
+  assert.match(close, /const copies = plan\.items\.reduce\(\(n, it\) => n \+ \("id" in it && it\.id === id \? 1 : 0\), 0\);/);
+  assert.match(close, /copies > 1 \? "End session \(it is the one session, shown in every group it is tagged with\)" : "End session"/);
+  // FLIP animates each copy from ITS rect: keyed per copy, not per id
+  const flip = RENDER.slice(RENDER.indexOf("function flipTabs("), RENDER.indexOf("function reorderTo("));
+  assert.match(flip, /const key = \(t: HTMLElement\) => t\.dataset\.id \+ "\\0" \+ \(t\.dataset\.copy \?\? ""\);/);
+  assert.match(flip, /before\.set\(key\(t\), t\.getBoundingClientRect\(\)\)/);
+  assert.match(flip, /before\.get\(key\(t\)\)/);
+});
+
+test("the tab drag moves THIS copy and reorders within its group's neighbours (T264b)", () => {
+  // the dragged element rides beside the id — the id alone names every copy
+  assert.match(RENDER, /let draggedEl: HTMLElement \| null = null;/);
+  assert.match(RENDER, /draggedId = id; draggedEl = tab; tabDragCommitted = false;/, "set at dragstart");
+  assert.match(RENDER, /draggedId = null; draggedEl = null; tabDragCommitted = false;/, "cleared at dragend");
+  assert.equal((RENDER.match(/const dragged = draggedEl && draggedEl\.isConnected \? draggedEl : null;/g) || []).length, 2, "dragover and drop both move the very copy under the pointer");
+  assert.doesNotMatch(RENDER, /tabs\.querySelector<HTMLElement>\(`\.tab\[data-id="\$\{CSS\.escape\(draggedId\)\}"\]`\)/, "never the first tab wearing the id");
+  // the drop's neighbours skip the session's own copy in the group next door — reorderTo against itself moves nothing
+  const drop = RENDER.slice(RENDER.indexOf('tabs.addEventListener("drop"'), RENDER.indexOf("tabDragCommitted = true;"));
+  assert.match(drop, /const own = \(n: Element \| null\) => !!n && \(n as HTMLElement\)\.dataset\?\.id === draggedId;/);
+  assert.match(drop, /const tabBefore = \(n: Element \| null\) => \{ while \(n && \(!\(n as HTMLElement\)\.dataset\?\.id \|\| own\(n\)\)\) n = n\.previousElementSibling;/);
+  assert.match(drop, /const tabAfter = \(n: Element \| null\) => \{ while \(n && \(!\(n as HTMLElement\)\.dataset\?\.id \|\| own\(n\)\)\) n = n\.nextElementSibling;/);
+  // a drop still changes no membership: a copy dragged into another group's row re-sections home on the next render
+  const over = RENDER.slice(RENDER.indexOf('tabs.addEventListener("dragover"'), RENDER.indexOf('tabs.addEventListener("drop"'));
+  assert.match(over, /A drop changes\s*\n?\s*\/\/ no membership/);
+});
+
+test("executed: the keyboard order keeps a session while any copy is on screen (T264b)", () => {
+  const unions = viewTagUnion({ tags: [{ id: "t-a", name: "alpha", color: "#1EA1EB", members: ["web", "api"] },
+                                       { id: "t-b", name: "beta", color: "#54B204", members: ["api"] }] });
+  const st = setSectionCollapsed(parseTabGroups(null, unions), "alpha", true);
+  const p = planStrip(["web", "api"], unions, st, null, false);
+  assert.deepEqual([...p.folded], ["web"], "web's only copy is folded; api's beta copy is on screen");
+  const both = planStrip(["web", "api"], unions, setSectionCollapsed(st, "beta", true), null, false);
+  assert.deepEqual([...both.folded].sort(), ["api", "web"], "every copy folded → skipped");
 });

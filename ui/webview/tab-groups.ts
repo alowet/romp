@@ -69,26 +69,22 @@ export function sectionRef(u: TagUnion): SectionRef {
   return { name: u.name, localId: u.localId };
 }
 
-/** THE home-tag rule: the first union (they arrive in tagOrder) holding the id, or null. */
-export function homeTag(id: string, unions: readonly TagUnion[]): TagUnion | null {
-  return unions.find((u) => u.members.includes(id)) || null;
-}
-
-/** Section the visible ids: one section per home tag, sections in UNION order (tagOrder governs —
- *  which is why reordering tags is first-class), tabs inside keep their strip order, the untagged
- *  trail last. A tag holding no visible id yields no section. */
+/** Section the visible ids: one section per TAG, holding EVERY visible member it carries (T264b, the
+ *  user 2026-09-08: tags are equivalent — no tag takes precedence, so a session under N tags appears
+ *  in N groups; the "home tag" rule that placed it under its first holder is retired). Sections in
+ *  UNION order (tagOrder governs — which is why reordering tags is first-class), tabs inside keep
+ *  their strip order, the untagged trail — the ids in NO tag — last. A tag holding no visible id
+ *  yields no section. */
 export function sectionTabs(visibleIds: readonly string[], unions: readonly TagUnion[]): TabSection[] {
-  const byName = new Map<string, TabSection>();
-  const loose: string[] = [];
-  for (const id of visibleIds) {
-    const home = homeTag(id, unions);
-    if (!home) { loose.push(id); continue; }
-    let s = byName.get(home.name);
-    if (!s) { s = { name: home.name, localId: home.localId, color: home.color || "", ids: [] }; byName.set(home.name, s); }
-    s.ids.push(id);
-  }
   const out: TabSection[] = [];
-  for (const u of unions) { const s = byName.get(u.name); if (s && !out.includes(s)) out.push(s); }
+  const tagged = new Set<string>();
+  for (const u of unions) {
+    const ids = visibleIds.filter((id) => u.members.includes(id));
+    if (!ids.length) continue;
+    for (const id of ids) tagged.add(id);
+    out.push({ name: u.name, localId: u.localId, color: u.color || "", ids });
+  }
+  const loose = visibleIds.filter((id) => !tagged.has(id));
   if (loose.length) out.push({ name: null, localId: null, color: "", ids: loose });
   return out;
 }
@@ -96,7 +92,7 @@ export function sectionTabs(visibleIds: readonly string[], unions: readonly TagU
 /** Does any tag hold a visible tab? Sectioning is on by default exactly then — an untagged world
  *  renders the flat strip it always had. */
 export function anySectioned(visibleIds: readonly string[], unions: readonly TagUnion[]): boolean {
-  return visibleIds.some((id) => homeTag(id, unions) !== null);
+  return visibleIds.some((id) => unions.some((u) => u.members.includes(id)));
 }
 
 const fresh = (): TabGroupsState => ({ on: true, collapsed: [], expanded: [], pinned: [] });
@@ -589,7 +585,8 @@ export function headWords(name: string, total: number, hidden: number, folded: b
 
 /** One strip item: a section header (folded or open; `active` = it holds the active tab; `hidden` =
  *  the member ids a folded header stands in for — its members less the pinned ones, [] when open) or
- *  a tab. */
+ *  a tab. The same id may appear as a tab under several headers (T264b: a session under N tags has N
+ *  copies); render.ts paints each copy as a full tab of the one session. */
 export type StripItem = { head: TabSection; folded: boolean; active: boolean; hidden: string[] } | { id: string };
 export interface StripPlan {
   items: StripItem[];
@@ -634,6 +631,9 @@ export function planStrip(visibleIds: readonly string[], unions: readonly TagUni
     items.push({ head: sec, folded: f, active, hidden });
     for (const id of sec.ids) { if (hidden.includes(id)) folded.add(id); else items.push({ id }); }
   }
+  // a session under several tags (T264b) has a copy in each: it is folded away — skipped by the
+  // keyboard — only when EVERY copy is; one copy on screen keeps it in the order
+  for (const it of items) if ("id" in it) folded.delete(it.id);
   return { items, folded, sectioned };
 }
 
