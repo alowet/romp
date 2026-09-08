@@ -56,8 +56,8 @@ class AskGate(unittest.TestCase):
 
     def _gate(self, behind, ahead, checkin=True, ood=True):
         saved = (km._remote_out_of_date, km._behind_info)
-        km._remote_out_of_date = lambda r: ood
-        km._behind_info = lambda sha: {"behind": behind, "ahead": ahead, "date": ""}
+        km._remote_out_of_date = lambda r, head=None: ood
+        km._behind_info = lambda sha, head=None: {"behind": behind, "ahead": ahead, "date": ""}
         try:
             return km._is_ask_pull(_row(checkin_peer=checkin))
         finally:
@@ -78,8 +78,8 @@ class AskGate(unittest.TestCase):
 
     def test_the_row_publishes_the_verdict(self):
         saved = (km._remote_out_of_date, km._behind_info)
-        km._remote_out_of_date = lambda r: True
-        km._behind_info = lambda sha: {"behind": 3, "ahead": 0, "date": "2026-07-28"}
+        km._remote_out_of_date = lambda r, head=None: True
+        km._behind_info = lambda sha, head=None: {"behind": 3, "ahead": 0, "date": "2026-07-28"}
         try:
             pub = km._remote_public(_row())
         finally:

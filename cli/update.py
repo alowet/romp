@@ -74,7 +74,7 @@ def main(argv):
     hosts = [a for a in argv if not a.startswith("-")]
     if not hosts:                                                   # no host → the out-of-date attached remotes
         try:
-            tuns = _get(u, "/tunnels").get("tunnels", [])
+            tuns = _get(u, "/tunnels?fresh=1").get("tunnels", [])    # judged against the head this checkout is at NOW, not the dashboard's 15 s cache
         except Exception as e:
             sys.stderr.write("romp update: couldn't list remotes: %s\n" % e)
             return 2

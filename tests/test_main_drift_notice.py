@@ -436,7 +436,7 @@ class DriftWiring(unittest.TestCase):
         # drift pass could hit between "checkout ahead" and "row on disk" — and the local converge's
         # row carries the sha it deploys, so a quiet `romp refresh` is matched, not guessed at
         ksrc = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
-        reset = ksrc.index("reset --hard %s >/dev/null 2>&1 || {")
+        reset = ksrc.index('reset --hard "$WANT" >/dev/null 2>&1 || {')
         row = ksrc.index("\\'action\\':\\'p2p-update\\',")     # the shell script's escaped spelling
         owned = ksrc.index("'OWNED=0; if command -v node")
         self.assertLess(reset, row, "the row says the checkout IS at the sha: it follows the reset")

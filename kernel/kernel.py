@@ -16376,6 +16376,36 @@ def list_remotes():
         return [_remote_public(r) for r in _remotes.values()]
 
 
+def _tunnels_listing(fresh=False):
+    """The GET /tunnels payload. `fresh` re-reads this checkout's HEAD first, for a caller about to ACT on
+    the rows' `outOfDate` — the CLI's no-host `romp update` picks the hosts it pushes to from this listing.
+    The dashboard's polls read the 15 s head cache (a poll must not fork git), and a listing built from
+    that cache within 15 s of a local commit says every peer sitting on the previous commit is up to date,
+    so that command prints "all attached remotes are up to date" and pushes nothing. `known` = hosts
+    attached before but not now, so the popover can list them as persistent re-attach rows instead of
+    making you retype them."""
+    if fresh:
+        _fresh_local_head()
+    return {"tunnels": list_remotes(),
+            "known": list_known(),
+            "viaReach": _bus_via_reach(),   # hosts one relay hop away (trust-by-origin rows hang here)
+            "remoteHolds": _bus_remote_holds(),   # quarantine holds on OTHER machines (direct peers + one relay hop)
+            "autoUpdate": _auto_update_remotes_on(),   # the popover checkbox reflects the KERNEL, not this tab
+            "peerTiers": _bus_peer_tiers(),   # host → how IT holds OUR mail (both-direction display)
+            # THIS machine's build, top-level so the panel can name it with no hosts attached: a remote's
+            # sha is unreadable without your own beside it (the user 2026-07-30), which is the comparison
+            # every other line in the panel is implicitly asking you to make.
+            "local": {"ver": _kernel_ver() or "", "sha": _kernel_sha() or "", "host": _self_host()},
+            "peersMode": _postal_peers_on()}
+
+
+def _fresh_listing_asked(q):
+    """Whether a GET /tunnels query asks for the listing judged against the head this checkout is at now:
+    exactly `?fresh=1`. parse_qs hands back ["0"] for `?fresh=0`, so a truthiness test would re-read HEAD
+    for `0` and `no` while a blank `?fresh=` read as not fresh; the contract is the one spelling."""
+    return q.get("fresh", [""])[0] == "1"
+
+
 def _poll_remote_sessions(r):
     """GET the remote kernel's /sessions THROUGH the -L tunnel; return its id-bearing rows (each `{id, name,
     …}` — the same unified list _session_rows serves here). None on any failure — leave the last-known
@@ -17152,20 +17182,43 @@ def _local_head(short=False):
     rarely moves."""
     now = time.time()
     if now - _HEAD_CACHE["ts"] > 15:
-        full = short_s = None
-        try:
-            r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
-                               capture_output=True, text=True, timeout=3)
-            if r.returncode == 0:
-                full = r.stdout.strip() or None
-            if full:
-                s = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
-                                   capture_output=True, text=True, timeout=3)
-                short_s = (s.stdout.strip() if s.returncode == 0 else "") or full[:8]
-        except Exception:
-            pass
+        full, short_s = _read_head()
         _HEAD_CACHE.update(ts=now, full=full, short=short_s)
     return _HEAD_CACHE["short"] if short else _HEAD_CACHE["full"]
+
+
+def _read_head():
+    """One read of this checkout's HEAD straight from git → (full, short); (None, None) outside a checkout.
+    The poll cache and the transport both fill from here, so they can never disagree on HOW HEAD is read."""
+    full = short_s = None
+    try:
+        r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            full = r.stdout.strip() or None
+        if full:
+            s = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+                               capture_output=True, text=True, timeout=3)
+            short_s = (s.stdout.strip() if s.returncode == 0 else "") or full[:8]
+    except Exception:
+        pass
+    return full, short_s
+
+
+def _fresh_local_head():
+    """The committed HEAD as it is RIGHT NOW, for a decision about to act on it: a push, a pull, the
+    restart-all plan, the listing `romp update` chooses hosts from. `_local_head` serves the dashboard's
+    polls from a 15 s cache, which is exactly wrong there: a commit made seconds before `romp update` is
+    the one the user means, and the cached read still names its parent, so the peer came back "already up
+    to date" one commit behind, or the restart it was told to expect carried the old sha. This reads git
+    ITSELF and then writes the cache: the value acted on is the value read, never a cache entry that a
+    poller's own in-flight read could refill with the older head across a bare invalidation; and the
+    write puts that same value in front of every display in the call (the audit-row sha, the detail, the
+    expectation) and the dashboard's next poll. Returns the full 40-hex sha, or "" when this is not a
+    checkout (the caller says so)."""
+    full, short_s = _read_head()
+    _HEAD_CACHE.update(ts=time.time(), full=full, short=short_s)
+    return full if full and re.fullmatch(r"[0-9a-f]{40}", full) else ""
 
 
 def _shas_agree(a, b):
@@ -17175,26 +17228,29 @@ def _shas_agree(a, b):
     return bool(a and b and (a.startswith(b) or b.startswith(a)))
 
 
-def _remote_out_of_date(r):
+def _remote_out_of_date(r, head=None):
     """True iff this remote is running a DIFFERENT commit than the local kernel's HEAD — i.e. a push would
     change it. Compared against the LIVE HEAD (what `_update_remote` actually pushes), NOT the kernel's cached
     startup sha, so pushing HEAD makes the remote match HEAD and the flag CLEARS afterward (the user 2026-07-04
-    — mixing the cached compare with a live-HEAD push is exactly why the banner never went away)."""
-    return bool(r.get("kernel_sha") and _local_head(short=True)
-                and not _shas_agree(r.get("kernel_sha"), _local_head(short=True)))
+    — mixing the cached compare with a live-HEAD push is exactly why the banner never went away). `head` is
+    the sha to compare against when the caller holds one (the restart-all run judges every row against the
+    single head it read); None reads the polls' cache, as the dashboard does."""
+    lh = head if head is not None else _local_head(short=True)
+    return bool(r.get("kernel_sha") and lh and not _shas_agree(r.get("kernel_sha"), lh))
 
 
 _BEHIND_CACHE = {}   # (remote sha base, local full HEAD) → drift dict; both key parts name immutable commits
 
 
-def _behind_info(remote_sha):
+def _behind_info(remote_sha, head=None):
     """HOW an out-of-date remote's commit relates to local HEAD, for the popover row: `behind` = commits a
     push would deliver, `ahead` = commits the REMOTE has that this repo lacks (a push would clobber them, and
     _update_remote refuses — so the row must say 'ahead'/'diverged', never a false 'behind'), `date` = the
     remote commit's date. behind/ahead are None when the remote's sha isn't in this repo at all (it was
     updated from some other machine) — the row says so instead of guessing. Memoized per (remote sha, local
-    HEAD): git runs only when either commit actually changes, not on every /tunnels poll."""
-    base, lfull = _sha_base(remote_sha), _local_head()
+    HEAD): git runs only when either commit actually changes, not on every /tunnels poll. `head` = the local
+    sha to relate to when the caller holds one (see _remote_out_of_date); None reads the polls' cache."""
+    base, lfull = _sha_base(remote_sha), (head if head is not None else _local_head())
     if not base or not lfull:
         return {"behind": None, "ahead": None, "date": ""}
     key = (base, lfull)
@@ -17225,7 +17281,7 @@ def _behind_info(remote_sha):
     return info
 
 
-def _is_fast_forward(r):
+def _is_fast_forward(r, head=None):
     """Whether pushing local HEAD to this remote would be a STRAIGHT FAST-FORWARD — the remote's commit is an
     ancestor of ours, so the push only ADDS commits and can destroy nothing (the user 2026-07-24, who wanted
     the automatic push to fire exactly when that is observed).
@@ -17235,10 +17291,10 @@ def _is_fast_forward(r):
     as zero: an unknown relationship is precisely the case we must not auto-push into, since we cannot show it
     would clobber nothing. Same for diverged (ahead > 0) — `_update_remote` refuses those anyway, so
     auto-firing them would just manufacture failures. Those cases keep the manual Push button, which explains
-    the situation and lets the user decide."""
-    if not _remote_out_of_date(r):
+    the situation and lets the user decide. `head` pins the comparison, as in _remote_out_of_date."""
+    if not _remote_out_of_date(r, head=head):
         return False
-    d = _behind_info(r.get("kernel_sha") or "")
+    d = _behind_info(r.get("kernel_sha") or "", head=head)
     b, a = d.get("behind"), d.get("ahead")
     return isinstance(b, int) and isinstance(a, int) and b > 0 and a == 0
 
@@ -17343,7 +17399,16 @@ def _auto_push_remote(host):
     (CLAUDE.md: fail loudly) — a silently failing auto-push would look exactly like an up-to-date remote."""
     _set_auto_push(host, "pushing", "pushing this machine's build over SSH")
     try:
-        ok, detail = _update_remote(host)
+        head = _fresh_local_head()
+        with _remotes_lock:
+            base = _sha_base((_remotes.get(host) or {}).get("kernel_sha") or "")
+        with _auto_push_lock:
+            # _maybe_auto_push keyed this attempt on the polls' CACHED head, but the push uses the head read
+            # just now, which that read also wrote into the cache: the next supervisor pass then computed a
+            # new key for the same advance and fired a second push, which came back "already up to date" and
+            # logged "pushed" twice (review find, 2026-09-08). Key the attempt on the sha the push uses.
+            _auto_push_tried[host] = (base, head)
+        ok, detail = _update_remote(host, head=head)
     except Exception as e:
         ok, detail = False, str(e)
     if ok:
@@ -17447,7 +17512,13 @@ def _discover_remote_clone(host):
     overrides) — then a romp-serve found on PATH (non-login, then login shell) resolved to the repo
     that holds it, then conventional dirs. KEEP the source order IN SYNC with _start_remote_kernel.
     Returns (dir, head, dirty, error) — error set (and the rest blank) on any failure, naming
-    everything tried. Shared by the push (_update_remote) and pull (_pull_remote) directions."""
+    everything tried; `dirty` is "" (clean), "1" (uncommitted changes of any kind: an unstaged edit's
+    porcelain line starts with a SPACE, so the first character alone is not a verdict), or "STATERR" when
+    `git status` itself failed there (a corrupt index, an I/O error; NOT an index lock, which `git status`
+    reads through unbothered, so a lock surfaces later as RESETFAIL when the reset cannot take it): a
+    command that could not see the tree must never answer "clean", because that answer green-lights a
+    reset of it. Shared by
+    the push (_update_remote) and pull (_pull_remote) directions."""
     disc = (
         'R=""; SR="${ROMP_REPO_ROOT:-$(cat "${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}/repo-root" 2>/dev/null)}"; '
         'if [ -n "$SR" ] && [ -d "$SR/.git" ]; then R="$SR"; fi; '
@@ -17458,7 +17529,8 @@ def _discover_remote_clone(host):
         'if [ -d "$d/.git" ]; then R="$d"; break; fi; done; fi; '
         'if [ -z "$R" ]; then echo NOROMP; exit 0; fi; '
         'echo "DIR:$R"; echo "HEAD:$(git -C "$R" rev-parse HEAD 2>/dev/null)"; '
-        'echo "DIRTY:$(git -C "$R" status --porcelain 2>/dev/null | head -c 1)"')
+        'if ds=$(git -C "$R" status --porcelain 2>/dev/null); then '
+        'if [ -n "$ds" ]; then echo DIRTY:1; else echo DIRTY:; fi; else echo DIRTY:STATERR; fi')
     try:
         d = subprocess.run([SSH_BIN] + _SSH_OPTS + ["--", host, disc], capture_output=True, text=True, timeout=25)
     except Exception as e:
@@ -17475,19 +17547,24 @@ def _discover_remote_clone(host):
     return rdir, rhead, rdirty, ""
 
 
-def _update_remote(host):
+def _update_remote(host, head=None):
     """PEER-TO-PEER update (the user 2026-07-04, who wanted p2p pushing by default, no GH backstop — just take what is
     committed on local). Push THIS kernel's committed HEAD straight to `host` over ssh and restart it, so the
     remote runs exactly the local code — GitHub/origin is never involved. Three steps, all over the same
     BatchMode/no-multiplexing ssh every other remote call uses:
       1. ssh-discover the remote romp clone (conventional dirs, mirrors _start_remote_kernel) + its HEAD; REFUSE
          on a dirty remote tree (won't silently clobber uncommitted remote work).
-      2. `git push --force` local HEAD to a scratch ref on the remote (a NON-checked-out ref, so no bare-repo /
-         denyCurrentBranch dance).
-      3. ssh: REFUSE if the remote has DIVERGED (its own commits not in local — don't clobber), else reset the
-         remote to that ref, delete the scratch ref, and `romp refresh` to restart.
+      2. `git push --force` the local HEAD's exact sha to a scratch ref on the remote (a NON-checked-out ref,
+         so no bare-repo / denyCurrentBranch dance).
+      3. ssh: bind to that sha (REFUSE unless the scratch ref resolves to the commit this call advertised — any
+         concurrent sender force-pushes the same ref), REFUSE if the remote has DIVERGED (its own commits not
+         in local — don't clobber), re-check its tree IN THE SAME SHELL (step 1's answer is an ssh round-trip
+         old; a status that fails, or an edit that landed since, refuses), else reset the remote to that sha,
+         delete the scratch ref (only while it still names that sha), and restart it.
     Returns (ok, detail), fail-loud. Requires a CLEAN local tree — we push COMMITS, so uncommitted local work
-    isn't sent; the caller is told to commit first."""
+    isn't sent; the caller is told to commit first. `head` = the full sha to push when the caller has already
+    read it with _fresh_local_head (the automatic push keys its once-per-advance gate on that same value);
+    None reads it here."""
     host = str(host or "").strip()
     if not host:
         return False, "no host"
@@ -17502,7 +17579,7 @@ def _update_remote(host):
                        "When it is behind this build, Update asks it to fast-forward itself; otherwise "
                        "sync from that machine's own dashboard" % host)
     kport = int((_rr or {}).get("kernel_port") or _REMOTE_KERNEL_PORT)   # for the restart's port poll
-    lfull = _local_head()
+    lfull = head if head is not None else _fresh_local_head()   # the head the user HAS, not the one the dashboard last polled
     if not lfull:
         return False, "local kernel isn't a git checkout — nothing to push"
     # We push the committed HEAD; uncommitted local edits are not sent ("just take what is committed on local"
@@ -17511,6 +17588,9 @@ def _update_remote(host):
     rdir, rhead, rdirty, derr = _discover_remote_clone(host)
     if derr:
         return False, derr
+    if rdirty == "STATERR":
+        return False, ("could not read the tree state on %s (git status failed there) — not touching a "
+                       "checkout whose state is unknown" % host)
     if rdirty:
         return False, "remote %s has uncommitted changes — commit or discard them there first (won't clobber)" % host
     if rhead and rhead == lfull:
@@ -17523,26 +17603,46 @@ def _update_remote(host):
                 # restart, or one nobody asked for) — expect it again rather than read its gap as death
                 rr["restartExpected"] = {"sha": lfull, "t": time.time(), "quiet": None}
                 return True, ("already up to date (%s) — that kernel has not restarted into it yet"
-                              % (_local_head(short=True) or lfull[:8]))
-        return True, "already up to date (%s)" % (_local_head(short=True) or lfull[:8])
+                              % lfull[:8])
+        return True, "already up to date (%s)" % lfull[:8]
     # (2) push local HEAD to a scratch ref on the remote (non-checked-out → no denyCurrentBranch issue)
     env = dict(os.environ, GIT_SSH_COMMAND="%s %s" % (SSH_BIN, " ".join(_SSH_OPTS)))
     push_url = "%s:%s" % (host, rdir)
     try:
         p = subprocess.run(["git", "-C", str(ROOT), "push", "--force", push_url,
-                            "HEAD:refs/heads/%s" % _P2P_REF],
+                            "%s:refs/heads/%s" % (lfull, _P2P_REF)],   # the advertised sha, not a HEAD that may move
                            capture_output=True, text=True, timeout=120, env=env)
     except Exception as e:
         return False, "git push to %s failed: %s" % (host, str(e)[:160])
     if p.returncode != 0:
         return False, "git push to %s failed: %s" % (host, (_ssh_err(p.stderr) or p.stdout or "").strip()[:160])
-    # (3) verify no divergence, reset the remote to the pushed HEAD, clean up, restart
+    # (3) bind to the advertised sha, verify no divergence, re-check the tree, reset the remote to that sha,
+    #     clean up, restart
     apply_cmd = (
-        'LOGDIR="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"; mkdir -p "$LOGDIR"; R=%s; '
-        'if ! git -C "$R" merge-base --is-ancestor HEAD %s 2>/dev/null; then '
-        'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo DIVERGED; exit 0; fi; '
-        'git -C "$R" reset --hard %s >/dev/null 2>&1 || { git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; echo RESETFAIL; exit 0; }; '
-        'git -C "$R" update-ref -d refs/heads/%s 2>/dev/null; '
+        'LOGDIR="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}"; mkdir -p "$LOGDIR"; R=%s; WANT=%s; '
+        # Every git step below names WANT, the exact commit this call pushed, never the scratch ref: that ref
+        # is force-pushed by any sender, so between our push and this apply another machine can have moved
+        # it, and "reset to the ref" would install THEIR build under OUR report. A ref that does not resolve
+        # to WANT is left alone (it is that other sender's to apply) and this call refuses.
+        'GOT="$(git -C "$R" rev-parse --verify --quiet refs/heads/%s 2>/dev/null)"; '
+        'if [ "$GOT" != "$WANT" ]; then echo "REFMISMATCH:$GOT"; exit 0; fi; '
+        # Every cleanup below is GUARDED by WANT (`update-ref -d <ref> <old>` deletes only while the ref still
+        # holds <old>): the gate above is one read, and a concurrent sender's push can land under the same
+        # name right after it. An unguarded delete removed THEIR ref and handed their apply a REFMISMATCH on
+        # nothing (review find, 2026-09-08). A guard that fails sets K, which trails the outcome tag so the
+        # detail can say the ref was left for that sender's own apply.
+        'K=""; '
+        'if ! git -C "$R" merge-base --is-ancestor HEAD "$WANT" 2>/dev/null; then '
+        'git -C "$R" update-ref -d refs/heads/%s "$WANT" 2>/dev/null || K=":REFKEPT"; echo "DIVERGED$K"; exit 0; fi; '
+        # Re-check dirtiness HERE, in the same shell as the reset: the discover probe's answer is an ssh
+        # round-trip old, and an edit that landed since would be destroyed by `reset --hard` on the strength
+        # of a stale "clean". A status that FAILS is its own refusal, not a clean tree.
+        'if ! AS=$(git -C "$R" status --porcelain 2>/dev/null); then '
+        'git -C "$R" update-ref -d refs/heads/%s "$WANT" 2>/dev/null || K=":REFKEPT"; echo "STATERR$K"; exit 0; fi; '
+        'if [ -n "$AS" ]; then '
+        'git -C "$R" update-ref -d refs/heads/%s "$WANT" 2>/dev/null || K=":REFKEPT"; echo "DIRTYNOW$K"; exit 0; fi; '
+        'git -C "$R" reset --hard "$WANT" >/dev/null 2>&1 || { git -C "$R" update-ref -d refs/heads/%s "$WANT" 2>/dev/null || K=":REFKEPT"; echo "RESETFAIL$K"; exit 0; }; '
+        'git -C "$R" update-ref -d refs/heads/%s "$WANT" 2>/dev/null || K=":REFKEPT"; '
         'NEW="$(git -C "$R" rev-parse --short HEAD)"; '
         # RESTART the kernel THROUGH THE MANAGER (the user 2026-07-04: the manager is romp's durable supervisor —
         # "there is never an invisible orphan" — so a restart should keep/leave the remote MANAGER-owned, not
@@ -17552,7 +17652,7 @@ def _update_remote(host):
         # which spawns a SUPERVISED kernel — UPGRADING the orphan to properly managed. ensure needs node; if it
         # can't run (or the port never returns) we relaunch romp-serve bare as a last resort so the host isn't
         # left dead. The port poll confirms whichever path brought it back.
-        'if [ ! -x "$R/bin/romp-serve" ]; then echo "NOLAUNCH:$NEW"; exit 0; fi; '
+        'if [ ! -x "$R/bin/romp-serve" ]; then echo "NOLAUNCH:$NEW$K"; exit 0; fi; '
         # NEVER AN ANONYMOUS SIGTERM (T238, the T121 rule): a restart-audit row lands BEFORE whichever
         # restart happens, so the far kernel's cut row carries WHO and WHY (the p2p update, from this
         # machine, to this sha) — nine restarts in three hours had no reason on record. The QUIET row
@@ -17576,7 +17676,7 @@ def _update_remote(host):
         'OWNED="$("$R/bin/romp-manager" status 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); '
         'print(1 if any(int(k.get(\'port\') or 0)==%d for k in (d.get(\'kernels\') or [])) else 0)" 2>/dev/null || echo 0)"; fi; '
         'if [ "$OWNED" = 1 ]; then '
-        'if "$R/bin/romp-manager" restart-all --quiet >>"$LOGDIR/update.log" 2>&1; then echo "SYNCED:$NEW:QUIET"; exit 0; fi; fi; '
+        'if "$R/bin/romp-manager" restart-all --quiet >>"$LOGDIR/update.log" 2>&1; then echo "SYNCED:$NEW:QUIET$K"; exit 0; fi; fi; '
         # LAST RESORT (no owning manager answering on this host): the immediate path below — audit row,
         # kill, then `ensure` upgrades the host to a supervised kernel.
         'python3 -c "import json,time;print(json.dumps({\'t\':int(time.time()),\'action\':\'p2p-update\','
@@ -17593,10 +17693,10 @@ def _update_remote(host):
         'if command -v node >/dev/null 2>&1 && [ -x "$R/bin/romp-manager" ]; then "$R/bin/romp-manager" ensure >>"$LOGDIR/update.log" 2>&1 || true; fi; '
         'UP=0; for i in 1 2 3 4 5 6 7 8; do sleep 1; if bash -c "exec 3<>/dev/tcp/127.0.0.1/%d" 2>/dev/null; then UP=1; break; fi; done; '
         'if [ "$UP" = 0 ]; then nohup "$R/bin/romp-serve" >>"$LOGDIR/kernel.log" 2>&1 </dev/null &  sleep 1; fi; '
-        'echo "SYNCED:$NEW:FALLBACK"'
-    ) % (shlex.quote(rdir), _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
-         _local_machine_label(), (_local_head(short=True) or lfull[:8]), kport,
-         _local_machine_label(), (_local_head(short=True) or lfull[:8]), kport)
+        'echo "SYNCED:$NEW:FALLBACK$K"'
+    ) % (shlex.quote(rdir), lfull, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF, _P2P_REF,
+         _local_machine_label(), lfull[:8], kport,
+         _local_machine_label(), lfull[:8], kport)
     # The apply KILLS the running kernel before booting its replacement, so it must be immune to the
     # ssh dying between the two halves — exactly what a flaky link does (the user 2026-07-11:
     # every drop mid-apply left the host kernel-LESS, and each banner Retry re-killed whatever a
@@ -17633,48 +17733,72 @@ def _update_remote(host):
         _unexpect()
         return False, "pushed, but the remote reset/restart failed: " + str(e)[:150]
     aout = (a.stdout or "").strip()
+    # ":REFKEPT" trails any outcome whose cleanup found the scratch ref no longer at WANT: another sender's
+    # push landed under the name after the gate, and the guarded delete left it for that sender's own apply
+    kept = aout.endswith(":REFKEPT")
+    if kept:
+        aout = aout[:-len(":REFKEPT")]
     tag, _, rest = aout.partition(":")
     tag, rest = tag.strip(), rest.strip()
-    if tag == "SYNCED":
-        short, _, mode = rest.partition(":")
-        mode = mode.strip()
-        _expect(mode == "QUIET")
-        short = short.strip() or _local_head(short=True) or "HEAD"
-        if mode == "QUIET":
-            return True, "synced to %s — restarting at its next quiet window" % short
-        if mode == "FALLBACK":
-            return True, ("synced to %s + restarting now (no manager owns that kernel there — an "
-                          "immediate restart)" % short)
-        return True, "synced to %s + restarting" % short
-    _unexpect()                                   # nothing restarted: DIVERGED / RESETFAIL / NOLAUNCH / error
-    if tag == "DIVERGED":
-        # Two very different causes land here, and the old wording only described the first, which is
-        # why a rewritten local history read as an unexplained refusal (the user 2026-07-22): either the
-        # remote really has its own commits, or LOCAL history was rewritten (rebase/filter-repo/amend),
-        # after which the remote's HEAD is an ancestor of nothing and the guard fires forever. Name both
-        # and give the exact way out, so the fix doesn't need a code read.
-        return False, ("remote %s has diverged — not clobbering. Either it has its own commits, or local "
-                       "history was rewritten (rebase/filter-repo), which orphans the remote's HEAD. To "
-                       "discard what's on %s and force it to match local: "
-                       "git push --force %s:<remote-romp-dir> HEAD:refs/heads/%s "
-                       "then, on %s: git reset --hard %s && git update-ref -d refs/heads/%s"
-                       % (host, host, host, _P2P_REF, host, _P2P_REF, _P2P_REF))
-    if tag == "RESETFAIL":
-        return False, "pushed, but the remote couldn't check out the new code"
-    if tag == "NOLAUNCH":
-        return False, "pushed + reset, but found no romp/romp-serve launcher to restart the kernel"
-    return False, (_ssh_err(a.stderr) or aout or "remote apply failed").strip()[:180]
+
+    def _verdict():
+        if tag == "SYNCED":
+            short, _, mode = rest.partition(":")
+            mode = mode.strip()
+            _expect(mode == "QUIET")
+            short = short.strip() or lfull[:8]
+            if mode == "QUIET":
+                return True, "synced to %s — restarting at its next quiet window" % short
+            if mode == "FALLBACK":
+                return True, ("synced to %s + restarting now (no manager owns that kernel there — an "
+                              "immediate restart)" % short)
+            return True, "synced to %s + restarting" % short
+        _unexpect()                       # nothing restarted: REFMISMATCH / DIVERGED / STATERR / DIRTYNOW / RESETFAIL / NOLAUNCH / error
+        if tag == "REFMISMATCH":
+            return False, ("pushed %s, but the scratch ref on %s now holds %s — another push moved it between "
+                           "ours and the apply; nothing was reset there. Push again."
+                           % (lfull[:8], host, (rest[:8] if rest else "nothing")))
+        if tag == "DIVERGED":
+            # Two very different causes land here, and the old wording only described the first, which is
+            # why a rewritten local history read as an unexplained refusal (the user 2026-07-22): either the
+            # remote really has its own commits, or LOCAL history was rewritten (rebase/filter-repo/amend),
+            # after which the remote's HEAD is an ancestor of nothing and the guard fires forever. Name both
+            # and give the exact way out, so the fix doesn't need a code read.
+            return False, ("remote %s has diverged — not clobbering. Either it has its own commits, or local "
+                           "history was rewritten (rebase/filter-repo), which orphans the remote's HEAD. To "
+                           "discard what's on %s and force it to match local: "
+                           "git push --force %s:<remote-romp-dir> HEAD:refs/heads/%s "
+                           "then, on %s: git reset --hard %s && git update-ref -d refs/heads/%s"
+                           % (host, host, host, _P2P_REF, host, _P2P_REF, _P2P_REF))
+        if tag == "STATERR":
+            return False, ("pushed, but reading the tree state on %s failed right before the apply — not resetting "
+                           "a checkout whose state is unknown" % host)
+        if tag == "DIRTYNOW":
+            return False, ("pushed, but the tree on %s has uncommitted changes — nothing was reset there; commit "
+                           "or discard them, then push again" % host)
+        if tag == "RESETFAIL":
+            return False, "pushed, but the remote couldn't check out the new code"
+        if tag == "NOLAUNCH":
+            return False, "pushed + reset, but found no romp/romp-serve launcher to restart the kernel"
+        return False, (_ssh_err(a.stderr) or aout or "remote apply failed").strip()[:180]
+
+    ok, detail = _verdict()
+    if kept:
+        detail += ("; the scratch ref on %s now holds another sender's push, left alone for that sender's own "
+                   "apply" % host)
+    return ok, detail
 
 
-def _is_fast_pull(r):
+def _is_fast_pull(r, head=None):
     """Whether pulling this remote's commits would be a STRAIGHT FAST-FORWARD of the local checkout —
     the remote is strictly AHEAD (it has commits we lack, we have none it lacks), both counts actually
     known. The mirror of _is_fast_forward, for the other direction (the user 2026-07-27: the attaching
     side owns BOTH directions of sync — the remote has no ssh route back). None is NOT zero, same as
-    the push gate: an unprovable relationship is exactly what must not be pulled automatically."""
-    if not _remote_out_of_date(r):
+    the push gate: an unprovable relationship is exactly what must not be pulled automatically. `head`
+    pins the comparison, as in _remote_out_of_date."""
+    if not _remote_out_of_date(r, head=head):
         return False
-    d = _behind_info(r.get("kernel_sha") or "")
+    d = _behind_info(r.get("kernel_sha") or "", head=head)
     b, a = d.get("behind"), d.get("ahead")
     return isinstance(b, int) and isinstance(a, int) and a > 0 and b == 0
 
@@ -17708,7 +17832,7 @@ def _pull_remote(host):
     if _rr is not None and _rr.get("checkin_peer"):
         return False, ("no ssh path to %s from this machine (it checked in here over its own tunnel) — "
                        "sync from that machine's own dashboard" % host)
-    lfull = _local_head()
+    lfull = _fresh_local_head()          # the head this tree is AT, not the one the dashboard last polled
     if not lfull:
         return False, "local kernel isn't a git checkout — nowhere to pull to"
     try:
@@ -17726,7 +17850,11 @@ def _pull_remote(host):
     if derr:
         return False, derr
     if rhead and rhead == lfull:
-        return True, "already up to date (%s)" % (_local_head(short=True) or lfull[:8])
+        return True, "already up to date (%s)" % lfull[:8]
+    if not re.fullmatch(r"[0-9a-f]{40}", rhead):
+        # nothing to bind the merge to: without the commit the peer reported, "whatever the fetch brought
+        # back" is the only target, and that is exactly the thing a concurrent fetch can swap under us
+        return False, "%s did not report which commit it is on — nothing fetched" % host
     env = dict(os.environ, GIT_SSH_COMMAND="%s %s" % (SSH_BIN, " ".join(_SSH_OPTS)))
     try:
         f = subprocess.run(["git", "-C", str(ROOT), "fetch", "%s:%s" % (host, rdir), "HEAD"],
@@ -17736,15 +17864,24 @@ def _pull_remote(host):
     if f.returncode != 0:
         return False, "git fetch from %s failed: %s" % (host, (_ssh_err(f.stderr) or f.stdout or "").strip()[:160])
     try:
-        anc = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"],
+        # Every step binds to the EXACT commit the peer reported, and the fetch only has to have brought
+        # it: FETCH_HEAD never enters the decision (it is a mutable name — any other fetch into this
+        # checkout, a second peer or a hand-run `git fetch`, rewrites it between our fetch and our merge).
+        # The one refusal left is the honest one: the peer no longer stands where it said it did.
+        got = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", "--quiet", rhead + "^{commit}"],
+                             capture_output=True, text=True, timeout=10)
+        if got.returncode != 0 or (got.stdout or "").strip() != rhead:
+            return False, ("%s has moved off the commit it reported (%s) — nothing merged; try again"
+                           % (host, rhead[:8]))
+        anc = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", "HEAD", rhead],
                              capture_output=True, text=True, timeout=10)
         if anc.returncode != 0:
             return False, ("local and %s have diverged — a pull would need a merge, which is yours to "
                            "do by hand" % host)
-        n = subprocess.run(["git", "-C", str(ROOT), "rev-list", "--count", "HEAD..FETCH_HEAD"],
+        n = subprocess.run(["git", "-C", str(ROOT), "rev-list", "--count", "HEAD..%s" % rhead],
                            capture_output=True, text=True, timeout=10)
         count = (n.stdout or "").strip() or "?"
-        m = subprocess.run(["git", "-C", str(ROOT), "merge", "--ff-only", "FETCH_HEAD"],
+        m = subprocess.run(["git", "-C", str(ROOT), "merge", "--ff-only", rhead],
                            capture_output=True, text=True, timeout=30)
     except Exception as e:
         return False, str(e)[:200]
@@ -17916,7 +18053,7 @@ def _restart_remote_kernel(host):
     return False, (_ssh_err(a.stderr) or out or "remote restart failed").strip()[:180]
 
 
-def _fleet_restart_plan(r):
+def _fleet_restart_plan(r, head=None):
     """What a fleet restart would do to ONE remote row → (action, reason). Pure decision, so the report
     and the tests can both read it without any ssh happening:
       sync-push  — it is strictly behind us and the push can only add commits
@@ -17924,24 +18061,26 @@ def _fleet_restart_plan(r):
       ask        — a checked-in peer we can only ASK to fast-forward itself (no ssh route from here)
       restart    — same build: nothing to sync, just bring the process back
       skip       — anything we cannot prove is safe; the reason says which
+    `head` = the local sha the row is judged against, handed down by _fleet_restart_run so every row of one
+    run is judged against the same commit; None reads the polls' cache.
     """
     host = r.get("host") or "?"
     if r.get("status") != "up":
         return "skip", "not connected right now (romp is still dialing it)"
-    if not _remote_out_of_date(r):
+    if not _remote_out_of_date(r, head=head):
         return ("ask", "checked in here; asking it to restart itself") if r.get("checkin_peer") \
             else ("restart", "already on this build")
     if r.get("checkin_peer"):
-        return ("ask", "checked in here; asking it to fast-forward itself") if _is_ask_pull(r) \
+        return ("ask", "checked in here; asking it to fast-forward itself") if _is_ask_pull(r, head=head) \
             else ("skip", "checked in over its own tunnel and not provably behind — sync it from its own "
                           "dashboard")
-    if _is_fast_forward(r):
+    if _is_fast_forward(r, head=head):
         return "sync-push", "behind this build; pushing and restarting"
-    if _is_fast_pull(r):
+    if _is_fast_pull(r, head=head):
         if _local_branch() != "main":
             return "skip", "%s is ahead, but this checkout isn't on main — pull it yourself" % host
         return "sync-pull", "ahead of this build; fast-forwarding this machine onto it"
-    d = _behind_info(r.get("kernel_sha") or "")
+    d = _behind_info(r.get("kernel_sha") or "", head=head)
     b, a = d.get("behind"), d.get("ahead")
     if isinstance(b, int) and isinstance(a, int) and b > 0 and a > 0:
         return "skip", "diverged (it has %d commit(s) this machine lacks) — not clobbering either side" % a
@@ -17957,9 +18096,18 @@ def _fleet_restart_run(manager_port=_PORT_FROM_ENV):
     rows = []
     with _remotes_lock:
         remotes = [dict(x) for x in _remotes.values()]
+    # The head every row is planned against: read from git ONCE here and carried as a VALUE, never re-read
+    # through the polls' cache per row. The cache can be 15 s behind a commit made just before Restart (a peer
+    # sitting on that commit then reads as "already on this build" and gets a restart where a push was owed),
+    # and a row is minutes of ssh, so per-row cache reads judged later rows against whatever HEAD had become
+    # by then and the report against a third reading (review find, 2026-09-08). The one event that moves it
+    # on purpose is a sync-pull below, which fast-forwards this checkout: it is re-read right there, so the
+    # rows after it are judged against the commit the pull brought in (a peer still on the old head is owed
+    # a push of it, not a bare restart).
+    head = _fresh_local_head()
     for r in remotes:
         host = r.get("host") or "?"
-        action, reason = _fleet_restart_plan(r)
+        action, reason = _fleet_restart_plan(r, head=head)
         try:
             if action == "skip":
                 rows.append({"host": host, "ok": None, "action": "skipped", "detail": reason})
@@ -17970,6 +18118,7 @@ def _fleet_restart_run(manager_port=_PORT_FROM_ENV):
                 ok, detail = _pull_remote(host)
                 if ok:
                     detail += "; this machine restarts below"
+                    head = _fresh_local_head()          # HEAD moved by design: later rows are judged against it
             elif action == "ask":
                 ok, detail = _ask_peer_to_pull(host)
             else:
@@ -17978,7 +18127,7 @@ def _fleet_restart_run(manager_port=_PORT_FROM_ENV):
         except Exception as e:                    # one bad host must never strand the rest of the fleet
             rows.append({"host": host, "ok": False, "action": action, "detail": str(e)[:180]})
     report = {"t": int(time.time()), "boot": _BOOT_ID, "rows": rows,
-              "local": {"head": _local_head(short=True) or "", "branch": _local_branch() or ""}}
+              "local": {"head": head[:7] if head else "", "branch": _local_branch() or ""}}
     try:
         _atomic_write(FLEET_REPORT, json.dumps(report))
     except OSError:
@@ -18200,11 +18349,12 @@ def _restart_this_kernel(reason="", manager_port=_PORT_FROM_ENV):
         pass                                       # no manager reachable → nothing to restart
 
 
-def _is_ask_pull(r):
+def _is_ask_pull(r, head=None):
     """Whether this remote can be TOLD to fast-forward itself: a checked-in peer (no ssh from here) that is
     strictly BEHIND us, so what it pulls only ADDS commits. Same provable-fast-forward bar as the push gate
-    — a diverged or unknown relationship is never driven automatically, and never offered as one click."""
-    return bool(r.get("checkin_peer")) and _is_fast_forward(r)
+    — a diverged or unknown relationship is never driven automatically, and never offered as one click.
+    `head` pins the comparison, as in _remote_out_of_date."""
+    return bool(r.get("checkin_peer")) and _is_fast_forward(r, head=head)
 
 
 def _start_remote(host):
@@ -40104,21 +40254,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"hosts": _ssh_config_hosts()}),
                                   "application/json", cache="no-cache")
             if p == "/tunnels":                               # attached remote kernels + state (drives the federated dashboard)
-                # `known` = hosts attached before but not now, so the popover can list them as persistent
-                # re-attach rows instead of making you retype them.
-                return self._send(200, json.dumps({"tunnels": list_remotes(),
-                                                   "known": list_known(),
-                                                   "viaReach": _bus_via_reach(),   # hosts one relay hop away (trust-by-origin rows hang here)
-                                                   "remoteHolds": _bus_remote_holds(),   # quarantine holds on OTHER machines (direct peers + one relay hop)
-                                                   "autoUpdate": _auto_update_remotes_on(),   # the popover checkbox reflects the KERNEL, not this tab
-                                                   "peerTiers": _bus_peer_tiers(),   # host → how IT holds OUR mail (both-direction display)
-                                                   # THIS machine's build, top-level so the panel can name it with
-                                                   # no hosts attached: a remote's sha is unreadable without your
-                                                   # own beside it (the user 2026-07-30), which is the comparison
-                                                   # every other line in the panel is implicitly asking you to make.
-                                                   "local": {"ver": _kernel_ver() or "", "sha": _kernel_sha() or "",
-                                                             "host": _self_host()},
-                                                   "peersMode": _postal_peers_on()}),
+                # `?fresh=1` = the caller is about to ACT on `outOfDate` (the CLI's `romp update`), so the
+                # listing is judged against the head this checkout is at now, not the polls' cache
+                return self._send(200, json.dumps(_tunnels_listing(fresh=_fresh_listing_asked(q))),
                                   "application/json", cache="no-cache")
             if p == "/tunnels/pairs":                         # how attached machines hold EACH OTHER's mail —
                 # read live from each machine's kernel through its tunnel (the popover's "Between your
