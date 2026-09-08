@@ -72,7 +72,7 @@ test("the chat strip and the outline both mount the shared component (source pin
   assert.match(FLEET, /Object\.assign\(\{\}, v\.actives, \{ outline: l \}\)/);
   assert.match(FLEET, /if \(!lensVisible\(outlineLens, outlineUnions, s\.sid\)\) continue;/);
   assert.match(FLEET, /fleetViews = m\.views as SessionViews/, "the outline reads views off the feed payload");
-  assert.match(KERNEL, /"views": _views_client\(\),   # the rendered views blob — the outline \+ feed tag mounts read it/);
+  assert.match(KERNEL, /\*\*_views_payload\(\),   # the rendered views blob — the outline \+ feed tag mounts read it/);
 });
 
 test("the chat's menu carries the 'Group tabs by tag' switch at its foot; the phone mount does not (its strip is hidden)", () => {
