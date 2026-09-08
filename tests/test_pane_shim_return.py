@@ -494,7 +494,8 @@ out({pre:pre,ret:rows(sock(),"return").length,kinds:rows(sock()).map(function(m)
         src = open(os.path.join(BIN, "romp-kernel"), encoding="utf-8").read()
         self.assertIn('elif msg and msg.get("type") == "clientDiag":', src)
         self.assertIn('"data": msg.get("data")}', src)
-        self.assertIn('with open(jd.STATE / "client-diag.jsonl", "a", encoding="utf-8") as f:', src)
+        # #1009 routes the append through _client_diag_append (rotation at the cap); the pin follows the call
+        self.assertIn('_client_diag_append(jd.STATE / "client-diag.jsonl", json.dumps(rec) + "\\n")', src)
 
 
 class TimeSlicedFlush(unittest.TestCase):
