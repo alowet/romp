@@ -47,8 +47,8 @@ fi
 
 # Extra service environment (parity with the systemd unit's EnvironmentFile=-):
 # plain KEY=VALUE lines exported to the manager, so variables available only in
-# a login shell also reach the kernel. ROMP_API_KEY_REF remains a reference here;
-# the kernel resolves it through op when needed. Parsed line-by-line, never sourced: a
+# a login shell also reach the kernel. ROMP_API_KEY_CMD / ROMP_API_KEY_REF remain a command
+# line / a reference here; the kernel runs them when a key is needed. Parsed line-by-line, never sourced: a
 # malformed line is skipped instead of executing code or (under set -eu)
 # taking the manager, and the whole kernel, down with it. Whitespace around the
 # value (a trailing space after a closing quote, a CRLF line ending) is discarded and

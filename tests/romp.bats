@@ -590,6 +590,31 @@ _stale_server_globals() {
     grep -q 'tmux set-environment -gu ANTHROPIC_API_KEY' "$MOCK_LOG"
 }
 
+@test "new -t: a key command line (ROMP_API_KEY_CMD) in the env FILE alone is a provider too and scrubs the tmux server" {
+    # 2026-09-07: the generic provider. With a key command governing, ANTHROPIC_API_KEY must still leave
+    # the server's globals (a keyswap retired it), and op's names go too if they are present.
+    _stale_server_globals
+    unset ROMP_API_KEY_REF ROMP_API_KEY_CMD
+    export ROMP_SERVICE_ENV_FILE="$TEST_DIR/service.env"     # CI runners export XDG_CONFIG_HOME: pin the path
+    printf '%s\n' "ROMP_PERF=1" "ROMP_API_KEY_CMD=fetch-synthetic-key --field api" > "$ROMP_SERVICE_ENV_FILE"
+    run run_romp new -t myproject
+    [ "$status" -eq 0 ]
+    grep -q 'tmux set-environment -gu ANTHROPIC_API_KEY' "$MOCK_LOG"
+    grep -q 'tmux set-environment -gu OP_SERVICE_ACCOUNT_TOKEN' "$MOCK_LOG"
+    [ "$(grep -n 'set-environment -gu ANTHROPIC_API_KEY' "$MOCK_LOG" | cut -d: -f1)" -lt \
+      "$(grep -n 'tmux new-session' "$MOCK_LOG" | cut -d: -f1)" ]
+}
+
+@test "new -t: a key command in the CLIENT env scrubs the tmux server too" {
+    _stale_server_globals
+    unset ROMP_API_KEY_REF
+    export ROMP_SERVICE_ENV_FILE="$TEST_DIR/service.env"
+    printf '%s\n' "ROMP_PERF=1" > "$ROMP_SERVICE_ENV_FILE"
+    ROMP_API_KEY_CMD="fetch-synthetic-key --field api" run run_romp new -t myproject
+    [ "$status" -eq 0 ]
+    grep -q 'tmux set-environment -gu ANTHROPIC_API_KEY' "$MOCK_LOG"
+}
+
 @test "new -t: no reference anywhere leaves the tmux server's environment alone (static-key and helper boxes)" {
     _stale_server_globals
     unset ROMP_API_KEY_REF

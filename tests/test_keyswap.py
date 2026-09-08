@@ -996,6 +996,82 @@ class KeyswapCli(_EnvFile):
         self.assertEqual(self.posted[-1][2]["expectedSourceFp"], source.fingerprint())
 
 
+    # ---- a key command profile (ROMP_API_KEY_CMD, 2026-09-07): the generic provider, same CLI rules ----
+
+    CMD = "fetch-synthetic-key --field api"
+
+    def test_a_key_command_profile_is_listed_by_fingerprint_and_never_run(self):
+        self.sibling("cmd", "ROMP_API_KEY_CMD=%s\n" % self.CMD)
+        before = open(self.path).read()
+        rc, said = self.run_cli()          # setUp's resolve() patch proves nothing ran
+        self.assertEqual(rc, 0)
+        self.assertIn("cmd", said)
+        self.assertIn("key command " + ks.KeySource("command", self.CMD).fingerprint(), said)
+        self.assertNotIn(self.CMD, said, "the command line may name a vault or a path; only its fingerprint shows")
+        self.assertEqual(open(self.path).read(), before)
+
+    def test_selecting_a_key_command_profile_writes_the_command_line_and_arms_the_marker(self):
+        self.sibling("cmd", "ANTHROPIC_API_KEY=%s\nROMP_API_KEY_CMD=%s\n" % (NEW_KEY, self.CMD))
+        rc, said = self.run_cli("cmd")
+        self.assertEqual(rc, 0)
+        body = open(self.path).read()
+        self.assertIn("ROMP_API_KEY_CMD=" + self.CMD, body)
+        self.assertNotIn("ANTHROPIC_API_KEY=", body, "the profile's stale static key is not copied along")
+        self.assertNotIn(OLD_KEY, body); self.assertNotIn(NEW_KEY, body)
+        self.assertEqual(ks.read_source(self.path), ks.KeySource("command", self.CMD))
+        for line in self.OTHER_LINES:
+            self.assertIn(line, body)
+        self.assertEqual(open(self.path + ".source").read(), "command\n", "the durable marker holds the kind")
+        self.assertIn("runs the key command at runtime; no key was copied to disk", said)
+        self.assertNotIn(self.CMD, said)
+        # and back to a reference profile: the command line goes, the marker follows
+        ref = "op://test-vault/test-item/api-key"
+        self.sibling("vault", "ROMP_API_KEY_REF=%s\n" % ref)
+        rc, said = self.run_cli("vault")
+        self.assertEqual(rc, 0)
+        body = open(self.path).read()
+        self.assertNotIn("ROMP_API_KEY_CMD=", body); self.assertIn("ROMP_API_KEY_REF=" + ref, body)
+        self.assertEqual(open(self.path + ".source").read(), "op\n")
+
+    def test_a_key_command_profile_cycles_and_compares_configuration_not_values(self):
+        source = ks.KeySource("command", self.CMD)
+        self.sibling("cmd", "ROMP_API_KEY_CMD=%s\n" % self.CMD)
+        cli._kernel = lambda: "http://127.0.0.1:29855"
+        cli._post = lambda u, p, b: self.posted.append((u, p, b)) or {
+            "ok": True, "sourceFp": source.fingerprint(), "keyFp": "",
+            "rows": [{"session": "web", "status": "cycling"}, {"session": "api", "status": "current"}]}
+        rc, said = self.run_cli("cmd", "--cycle", "web,api")
+        self.assertEqual(rc, 0)
+        self.assertEqual(ks.read_source(self.path), source)
+        self.assertEqual([b for _, _, b in self.posted],
+                         [{"sessions": []}, {"sessions": ["web", "api"], "expectedSourceFp": source.fingerprint()}])
+        self.assertIn("key command matches", said)
+        self.assertIn("reconnecting now", said)
+        self.assertNotIn(self.CMD, json.dumps(self.posted) + said)
+        # --cycle-all after the swap, and a kernel on another source refuses
+        self.posted.clear()
+        rc, said = self.run_cli("--cycle-all")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.posted[-1][2], {"all": True, "expectedSourceFp": source.fingerprint()})
+        cli._post = lambda u, p, b: self.posted.append((u, p, b)) or {
+            "ok": True, "sourceFp": ks.KeySource("op", "op://test-vault/test-item/api-key").fingerprint(), "rows": []}
+        rc, said = self.run_cli("--cycle-all")
+        self.assertEqual(rc, 1)
+        self.assertIn("MISMATCH", said)
+
+    def test_a_profile_with_both_provider_lines_is_refused_untouched(self):
+        self.sibling("both", "ROMP_API_KEY_CMD=%s\nROMP_API_KEY_REF=op://test-vault/test-item/api-key\n" % self.CMD)
+        import io
+        from contextlib import redirect_stderr
+        before = open(self.path).read()
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            rc, said = self.run_cli("both")
+        self.assertEqual(rc, 2)
+        self.assertIn("not both", errors.getvalue())
+        self.assertEqual(open(self.path).read(), before)
+
+
 class KeycycleRoute(unittest.TestCase):
     """POST /keycycle over the REAL kernel handler on loopback (the HeadlessRoutes pattern). The
     route takes NO key from the caller — not a value, not a path — so the door cannot be used to

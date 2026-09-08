@@ -714,3 +714,221 @@ def test_op_read_gets_a_minimal_environment(env, tmp_path, monkeypatch):
     for present in ("PATH", "HOME", "XDG_CONFIG_HOME", "LC_ALL", "OP_SERVICE_ACCOUNT_TOKEN"):
         assert present in names, present
     assert not any(n.startswith("ROMP_") for n in names), "nothing of romp's reaches op"
+
+
+# ---- the generic key command (ROMP_API_KEY_CMD, 2026-09-07) -------------------------------------------
+#
+# romp must not know about 1Password specifically: a key source may be ANY command that prints the key
+# (Claude Code's apiKeyHelper contract), and the op reference is a thin shorthand over the same runner.
+# The fake scripts below stand in for a secret manager's CLI; every value is synthetic.
+
+CMD = "fetch-synthetic-key --field api"
+
+
+def _script(tmp_path, monkeypatch, name, body):
+    """A fake CLI on a temp PATH — the shape an operator's key command has."""
+    shim = tmp_path / "bin"; shim.mkdir(exist_ok=True)
+    (shim / name).write_text("#!/bin/sh\n" + body + "\n")
+    (shim / name).chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    return name
+
+
+def test_a_command_source_parses_validates_and_fingerprints_without_running_anything(env):
+    env.path.write_text(f"ROMP_PERF=1\nROMP_API_KEY_CMD={CMD}\n")
+    source = ks.select_source(BOOT_KEY)
+    assert (source.kind, source.value) == ("command", CMD)
+    assert source.configured
+    source.validate()
+    assert source.fingerprint() == ks.fingerprint("cmd:" + CMD)
+    assert source.fingerprint() != ks.KeySource("op", CMD).fingerprint(), "the kind is part of the identity"
+    assert source == ks.parse_source(env.path.read_text())
+    assert ks.is_provider_kind("command") and ks.is_provider_kind("op") and not ks.is_provider_kind("file")
+    assert ks.read_key() == "", "a command line is never a raw key"
+    assert ks.runtime_reserved_names("key", source) == ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+    # a quoted line reads the same way systemd hands it over
+    assert ks.parse_source(f'ROMP_API_KEY_CMD="{CMD}"\n').value == CMD
+    env.op.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["", "   ", "cmd\nPRIVATE_CMD_MARKER", "cmd\0PRIVATE_CMD_MARKER"])
+def test_an_invalid_command_line_never_runs_and_stays_an_explicit_choice(env, command):
+    source = ks.KeySource("command", command)
+    assert source.configured, "an invalid provider is not permission to fall to the login"
+    safe_failure(source.resolve, "PRIVATE_CMD_MARKER")
+    env.op.assert_not_called()
+
+
+def test_a_command_source_resolves_through_sh_with_bounded_noninteractive_io(env):
+    """The contract: `/bin/sh -c <line>` (a pipeline or a helper script an operator already has works
+    as-is), stdin and stderr to /dev/null, the same timeout every provider gets, never a shell-less argv."""
+    env.op.side_effect = None
+    env.op.return_value = subprocess.CompletedProcess(CMD, 0, stdout=NEW_KEY.encode() + b"\n", stderr=b"")
+    assert ks.KeySource("command", CMD).resolve() == NEW_KEY, "one trailing newline is forgiven"
+    args, kwargs = env.op.call_args
+    assert args == (CMD,) and kwargs["shell"] is True
+    assert kwargs["stdin"] == subprocess.DEVNULL and kwargs["stderr"] == subprocess.DEVNULL
+    assert kwargs["stdout"] == subprocess.PIPE and kwargs["check"] is False
+    assert kwargs["timeout"] == ks.KEY_CMD_TIMEOUT == ks.OP_TIMEOUT
+    assert not any(k.startswith("ROMP_") for k in kwargs["env"])
+
+
+def test_the_op_shorthand_runs_through_the_same_runner_in_argv_form(env, monkeypatch):
+    """`KeySource("op", ref)` is `op read --no-newline <ref>` handed to the shared runner: same env, same
+    timeout, the reference as ONE argument. Proved by making the runner the observation point."""
+    seen = []
+    real = ks._run_key_command
+
+    def spy(cmd, **kw):
+        seen.append((cmd, kw))
+        return real(cmd, **kw)
+    monkeypatch.setattr(ks, "_run_key_command", spy)
+    env.op.side_effect = None
+    env.op.return_value = result(OLD_KEY.encode())
+    assert ks.KeySource("op", REF).resolve() == OLD_KEY
+    (cmd, kw), = seen
+    assert cmd == ["op", "read", "--no-newline", REF] and kw["shell"] is False
+    assert kw["tolerate_newline"] is False, "--no-newline promised none; a newline is a malformed key"
+    env.op.return_value = result(OLD_KEY.encode() + b"\n")
+    safe_failure(ks.KeySource("op", REF).resolve)
+
+
+def test_a_key_command_on_a_real_shell_strips_one_trailing_newline(env, tmp_path, monkeypatch):
+    _script(tmp_path, monkeypatch, "fetch-synthetic-key", 'echo "%s"' % NEW_KEY)   # echo adds the newline
+    env.op.side_effect = _REAL_RUN
+    assert ks.KeySource("command", CMD).resolve() == NEW_KEY
+    _script(tmp_path, monkeypatch, "fetch-synthetic-key", 'printf "%s\\r\\n"' % NEW_KEY)   # a CRLF one too
+    assert ks.KeySource("command", CMD).resolve() == NEW_KEY
+
+
+@pytest.mark.parametrize("body,expect", [
+    ('echo "%s" >&2; echo "%s" >&2; exit 1' % (SECRET_STDERR, OLD_KEY), "failed"),   # stderr is a credential hazard: never quoted
+    ("exit 0", "empty"),                                                             # printed nothing
+    ('printf "%s\\nsecond-line\\n"' % OLD_KEY, "invalid"),                            # two lines
+    ('printf "%s  \\n"' % OLD_KEY, "invalid"),                                        # inner whitespace beyond the newline
+    ("no-such-binary-anywhere-synthetic", "not found"),                             # sh: 127
+])
+def test_key_command_failures_are_static_safe_messages(env, tmp_path, monkeypatch, body, expect):
+    _script(tmp_path, monkeypatch, "fetch-synthetic-key", body)
+    env.op.side_effect = _REAL_RUN
+    error = safe_failure(ks.KeySource("command", CMD).resolve)
+    assert "key command" in str(error) and expect in str(error), str(error)
+    assert CMD not in str(error), "the command line itself may name a vault or a path; it stays out too"
+
+
+def test_a_key_command_that_hangs_is_cut_off_at_the_shared_timeout(env, tmp_path, monkeypatch):
+    _script(tmp_path, monkeypatch, "fetch-synthetic-key", "sleep 5; echo never")
+    monkeypatch.setattr(ks, "KEY_CMD_TIMEOUT", 1)
+    env.op.side_effect = _REAL_RUN
+    error = safe_failure(ks.KeySource("command", CMD).resolve)
+    assert "timed out" in str(error)
+
+
+def test_the_key_command_gets_the_same_minimal_environment_as_op(env, tmp_path, monkeypatch):
+    """A whitelist, not a copy: PATH/HOME and the ordinary-CLI names, op's claimed credential names if
+    any were claimed, and NOTHING of romp's — a key command is expected to fetch its own credential."""
+    _script(tmp_path, monkeypatch, "fetch-synthetic-key", "env | cut -d= -f1 | sort | paste -sd, -")
+    monkeypatch.setenv("ROMP_SERVE_TOKEN", "synthetic-serve-token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-startup-key")
+    monkeypatch.setenv("ROMP_API_KEY_CMD", CMD)
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "synthetic-op-token")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("LC_ALL", "C")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ks._OP_ENV.clear(); ks._OP_CLAIM_SAID = False
+    env.op.side_effect = _REAL_RUN
+    try:
+        names = set(ks.KeySource("command", CMD).resolve().split(","))
+        assert "OP_SERVICE_ACCOUNT_TOKEN" not in os.environ, "a command source claims op's names too"
+    finally:
+        ks._OP_ENV.clear(); ks._OP_CLAIM_SAID = False
+    for absent in ("ROMP_SERVE_TOKEN", "ANTHROPIC_API_KEY", "ROMP_API_KEY_CMD", "ROMP_SERVICE_ENV_FILE"):
+        assert absent not in names, absent
+    for present in ("PATH", "HOME", "XDG_CONFIG_HOME", "LC_ALL", "OP_SERVICE_ACCOUNT_TOKEN"):
+        assert present in names, present
+    assert not any(n.startswith("ROMP_") for n in names), "nothing of romp's reaches the key command"
+    assert ks.key_command_env is ks.op_subprocess_env, "the old name is the same function"
+
+
+def test_both_provider_lines_is_an_error_not_a_precedence_rule(env, monkeypatch):
+    env.path.write_text(f"ROMP_API_KEY_CMD={CMD}\nROMP_API_KEY_REF={REF}\nANTHROPIC_API_KEY={BOOT_KEY}\n")
+    source = ks.select_source(BOOT_KEY)
+    assert source.kind == "error" and source.configured
+    assert "one of ROMP_API_KEY_CMD or ROMP_API_KEY_REF, not both" in source.error
+    safe_failure(source.resolve)
+    assert ks.provider_consumer(), "an invalid provider configuration is still a provider choice"
+    # the same rule for the manager's environment
+    env.path.unlink(); ks._CACHE = ((), "")
+    monkeypatch.setenv("ROMP_API_KEY_CMD", CMD); monkeypatch.setenv("ROMP_API_KEY_REF", REF)
+    assert ks.select_source(BOOT_KEY).kind == "error"
+    env.op.assert_not_called()
+
+
+def test_a_static_key_line_beside_a_command_line_is_ignored_and_removed_on_swap(env):
+    env.path.write_text(f"ANTHROPIC_API_KEY={BOOT_KEY}\nROMP_API_KEY_CMD={CMD}\n")
+    assert ks.select_source(BOOT_KEY) == ks.KeySource("command", CMD)
+    ks.write_source(ks.KeySource("command", CMD + " --other"), str(env.path))
+    body = env.path.read_text()
+    assert body == f"ROMP_API_KEY_CMD={CMD} --other\n" and BOOT_KEY not in body
+    ks.write_source(ks.KeySource("op", REF), str(env.path))
+    assert env.path.read_text() == f"ROMP_API_KEY_REF={REF}\n", "a provider swap replaces the other provider's line"
+
+
+def test_the_durable_marker_round_trips_the_command_kind(env):
+    """The `service.env.source` marker holds the provider KIND: a supervised restart after the command
+    line vanished must refuse to fall to the login, exactly as it does for a vanished reference."""
+    env.path.write_text(f"ROMP_PERF=1\nROMP_API_KEY_CMD={CMD}\n")
+    assert ks.select_source().kind == "command"
+    marker = env.root / "service.env.source"
+    assert marker.read_text() == "command\n" and stat.S_IMODE(marker.stat().st_mode) == 0o600
+    assert ks.read_marker(str(env.path)) == "command"
+    ks._AUTHORITATIVE_PATHS.clear(); ks._CACHE = ((), "")          # the restart
+    env.path.write_text("ROMP_PERF=1\n")
+    src = ks.select_source(BOOT_KEY)
+    assert src.kind == "error" and "key command was removed" in src.error
+    safe_failure(src.resolve)
+    ks.write_source(ks.KeySource("op", REF), str(env.path))       # provider to provider: the word follows
+    assert marker.read_text() == "op\n"
+    ks.write_source(ks.KeySource("command", CMD), str(env.path))
+    assert marker.read_text() == "command\n"
+    ks.write_source(ks.KeySource("file", NEW_KEY), str(env.path))
+    assert not marker.exists(), "an intentional switch to a static key clears it"
+    env.op.assert_not_called()
+
+
+def test_a_command_in_the_environment_selects_and_its_removal_is_an_error(env, monkeypatch):
+    monkeypatch.setenv("ROMP_API_KEY_CMD", CMD)
+    assert ks.select_source(BOOT_KEY) == ks.KeySource("command", CMD)
+    monkeypatch.delenv("ROMP_API_KEY_CMD")
+    src = ks.select_source(BOOT_KEY)
+    assert src.kind == "error" and "key command was removed from the environment" in src.error
+    # supervised: the file alone governs, and a command in the environment is not a fallback
+    monkeypatch.setenv("ROMP_SUPERVISED", "1"); monkeypatch.setenv("ROMP_API_KEY_CMD", CMD)
+    ks._ENV_PROVIDER_PATHS.clear(); ks._AUTHORITATIVE_PATHS.clear()
+    src = ks.select_source(BOOT_KEY)
+    assert src.kind == "error" and "key command was removed" in src.error
+    env.op.assert_not_called()
+
+
+def test_a_command_source_makes_romp_the_provider_consumer_and_scrubs_tmux(env, monkeypatch):
+    """The tmux gate generalizes: with a key command configured, ANTHROPIC_API_KEY must still leave tmux
+    launches and the server's globals (a keyswap retired it), and op's names are scrubbed if present."""
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "synthetic-op-token")
+    monkeypatch.setenv("ROMP_TMUX_SOCKET", "probe")
+    env.path.write_text("ANTHROPIC_API_KEY=%s\n" % OLD_KEY)
+    ks._OP_ENV.clear(); ks._OP_CLAIM_SAID = False
+    child = {"OP_SERVICE_ACCOUNT_TOKEN": "x", "ANTHROPIC_API_KEY": "synthetic-stale-key", "PATH": "/bin"}
+    try:
+        assert not ks.provider_consumer() and ks.op_consumer is ks.provider_consumer
+        assert ks.strip_tmux_env(dict(child)) == child
+        env.path.write_text("ROMP_API_KEY_CMD=%s\n" % CMD); ks._CACHE = ((), "")     # the keyswap, no restart
+        assert ks.provider_consumer()
+        assert ks.strip_tmux_env(dict(child)) == {"PATH": "/bin"}
+        assert set(ks.claim_op_env()) == {"OP_SERVICE_ACCOUNT_TOKEN"}
+        assert _tmux_unsets(env.tmux) == ["ANTHROPIC_API_KEY", "OP_SERVICE_ACCOUNT_TOKEN"]
+    finally:
+        ks._OP_ENV.clear(); ks._OP_CLAIM_SAID = False
+    env.path.unlink(); ks._CACHE = ((), "")
+    monkeypatch.setenv("ROMP_API_KEY_CMD", CMD)
+    assert ks.provider_consumer(), "the manager's environment counts too"
+    env.op.assert_not_called()

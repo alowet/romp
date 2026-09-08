@@ -52,7 +52,7 @@ no separate implementation to point at.
 |---|---|---|
 | `romp-update` | `cli/update.py` | Pushes this machine's committed romp to attached remote kernels and restarts them (`romp update [host]`). |
 | `romp-version` | `cli/version.py` | Version report across the moving parts (`romp version`). |
-| `romp-keyswap` | `cli/keyswap.py` | Switches `ROMP_API_KEY_REF` references or legacy API keys using sibling `service.env.<name>` profiles without restarting the manager. Listing/selection never fetch secrets; `--cycle`/`--cycle-all` reconnects running sessions onto the source (`romp keyswap`). |
+| `romp-keyswap` | `cli/keyswap.py` | Switches key sources — `ROMP_API_KEY_CMD` key commands, `ROMP_API_KEY_REF` 1Password references or legacy API keys — using sibling `service.env.<name>` profiles without restarting the manager. Listing/selection never fetch secrets; `--cycle`/`--cycle-all` reconnects running sessions onto the source (`romp keyswap`). |
 | `romp-idle-dots` | `cli/idle_dots.py` | tmux backend only: heals stranded `working` state / fades idle tab dots by inspecting tmux panes. Fired from `hooks/tmux-status.sh`. |
 | `romp-spend-rebuild` | `cli/spend_rebuild.py` | Recounts the token columns of the spend ledger (`spend.json`) from the transcripts' per-call usage; dollars and turn counts untouched. Dry run by default, `--apply` writes with a backup (`romp spend-rebuild`). |
 

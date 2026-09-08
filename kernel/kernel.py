@@ -38953,7 +38953,7 @@ class Handler(BaseHTTPRequestHandler):
                         sourcefp = source.fingerprint()
                         # A status read must never fetch a provider. Its reference identity is
                         # sufficient to confirm that keyswap and this kernel see the same source.
-                        keyfp = "" if source.kind == "op" else sourcefp
+                        keyfp = "" if jd._keysrc.is_provider_kind(source.kind) else sourcefp
                     else:
                         keyfp = sourcefp = _work_key_fp()  # older backend/test doubles
                 except Exception as e:

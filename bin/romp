@@ -644,7 +644,7 @@ EOF
     _romp_cmd "romp update [host]"         romp-update  "Push this machine's committed romp to attached remotes and restart them"
     _romp_cmd "romp up"                    romp-manager "Run the kernel manager in the foreground (rare — the login service runs it)"
     _romp_cmd "romp version"               romp-version "Versions across the parts (tree, kernel, served vs built bundles)"
-    _romp_cmd "romp keyswap [<name>]"      romp-keyswap "Select a 1Password reference or legacy key (service.env.<name>; --cycle-all reconnects running sessions)"
+    _romp_cmd "romp keyswap [<name>]"      romp-keyswap "Select a key command, 1Password reference or legacy key (service.env.<name>; --cycle-all reconnects running sessions)"
     _romp_cmd "romp spend-rebuild"         romp-spend-rebuild "Recount the spend ledger's token columns from the transcripts (dry run; --apply writes, dollars untouched)"
     _romp_cmd "romp uninstall"             romp-uninstall "Remove romp's installed footprint (--purge also deletes recorded state)"
     _romp_cmd "romp help"                  -            "Show this help"
@@ -721,8 +721,8 @@ if [[ "${1:-}" == "update" ]]; then
     exec romp-update "$@"
 fi
 
-# `romp keyswap [<name>] [--cycle <session,...> | --cycle-all]` selects ROMP_API_KEY_REF or a legacy
-# ANTHROPIC_API_KEY from a sibling service.env.<name>, removing the competing assignment. Listing
+# `romp keyswap [<name>] [--cycle <session,...> | --cycle-all]` selects ROMP_API_KEY_CMD, ROMP_API_KEY_REF
+# or a legacy ANTHROPIC_API_KEY from a sibling service.env.<name>, removing the competing assignment. Listing
 # and selection inspect sources without fetching secrets; --cycle asks the kernel to reconnect
 # sessions, resolving provider keys at launch. Delegates to romp-keyswap (python); never prints keys.
 if [[ "${1:-}" == "keyswap" ]]; then
@@ -730,13 +730,15 @@ if [[ "${1:-}" == "keyswap" ]]; then
     exec romp-keyswap "$@"
 fi
 
-# Is romp itself the one running `op`? Yes when a 1Password reference is configured — in this
-# environment, or as a ROMP_API_KEY_REF= line of the service env file (the same file and the same
-# line-by-line read as bin/romp-node-launch and bin/romp-service, never sourced). The kernel's
-# keysource.op_consumer answers the same question from Python; a kernel-spawned `romp new` may lack
-# the variable when the reference was swapped in with no manager restart, so the file decides too.
+# Is romp itself the one fetching the key? Yes when a key PROVIDER is configured — a key command
+# (ROMP_API_KEY_CMD, 2026-09-07) or a 1Password reference (ROMP_API_KEY_REF) — in this environment, or as
+# a line of the service env file (the same file and the same line-by-line read as bin/romp-node-launch
+# and bin/romp-service, never sourced). The kernel's keysource.provider_consumer answers the same
+# question from Python; a kernel-spawned `romp new` may lack the variable when the provider was swapped
+# in with no manager restart, so the file decides too. The name predates the command kind.
 _romp_op_consumer() {
     [[ -n "${ROMP_API_KEY_REF:-}" ]] && return 0
+    [[ -n "${ROMP_API_KEY_CMD:-}" ]] && return 0
     local _f="${ROMP_SERVICE_ENV_FILE:-${ROMP_SERVICE_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/romp/service.env}}"
     [[ -f "$_f" ]] || return 1
     local _line
@@ -744,6 +746,7 @@ _romp_op_consumer() {
         _line="${_line#"${_line%%[![:space:]]*}"}"
         case "$_line" in
             ROMP_API_KEY_REF=*) return 0 ;;
+            ROMP_API_KEY_CMD=*) return 0 ;;
         esac
     done < "$_f"
     return 1
@@ -2724,12 +2727,13 @@ else
     # op's credential never rides a session: when romp itself runs `op` (a reference is configured), the
     # tmux SERVER's globals — what every new pane inherits — are scrubbed of it before the pane exists
     # (review, 2026-09-05: the server the manager started carried service.env's token to `exec claude`).
-    # The manager's startup ANTHROPIC_API_KEY goes with it: once a reference governs, a pane billing the
-    # key the manager started with bills a key nobody chose (a keyswap retired it); without the variable
-    # the pane falls to Claude Code's own auth. A box with no reference keeps both — static-key panes rely
-    # on the inheritance. "Configured" is the client's environment OR the env file's own line
-    # (2026-09-06): a kernel-spawned `romp new` on a box that swapped to a reference without a manager
-    # restart carries no ROMP_API_KEY_REF, and the guard on the variable alone left the token in place.
+    # The manager's startup ANTHROPIC_API_KEY goes with it: once a provider (a key command or a reference)
+    # governs, a pane billing the key the manager started with bills a key nobody chose (a keyswap retired
+    # it); without the variable the pane falls to Claude Code's own auth. A box with no provider keeps
+    # both — static-key panes rely on the inheritance. "Configured" is the client's environment OR the env
+    # file's own line (2026-09-06): a kernel-spawned `romp new` on a box that swapped to a provider without
+    # a manager restart carries no ROMP_API_KEY_* variable, and the guard on the variable alone left the
+    # token in place.
     # The name list mirrors kernel/keysource.py is_tmux_scrub_name.
     if _romp_op_consumer; then
         tmux show-environment -g 2>/dev/null \
