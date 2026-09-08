@@ -371,5 +371,108 @@ class GroupAliasSurvives(TagRoute):
         self.assertEqual(resp["tag"]["members"], [SID], "a live name resolved through the alias route too")
 
 
+class HttpFlagsMustBeBooleans(TagRoute):
+    """The kernel's HTTP flag fields take JSON true/false and nothing else. Each used to be coerced with
+    bool(), so the STRING "false" deleted a tag, turned a master bell on, armed auto-update, flipped
+    check-in on a host and made a directory. Now a non-boolean is a 400 naming the field and the
+    setting is untouched; `romp tag` / `romp checkin` and the pages send real booleans, so their calls
+    are unchanged."""
+
+    def _post_to(self, path, body):
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (self.port, path), data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "X-Romp-Token": os.environ["ROMP_SERVE_TOKEN"]})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode() or "{}")
+
+    def test_a_string_delete_refuses_and_the_tag_survives(self):
+        self._post({"name": "pool", "add": ["web"]})
+        for bad in ("false", "true", 1, "no"):
+            st, r = self._post({"name": "pool", "delete": bad})
+            self.assertEqual(st, 400, (bad, r))
+            self.assertEqual(r.get("error"), "'delete' must be true or false, got %s" % json.dumps(bad))
+            self.assertEqual([g["name"] for g in self._views()[1]["tags"]], ["pool"],
+                             "the tag survives a refused delete (a string used to delete it)")
+        st, r = self._post({"name": "pool", "delete": False})
+        self.assertTrue(r.get("ok"), r)
+        self.assertEqual(r["tag"]["name"], "pool", "a real false is an edit, not a delete")
+        st, r = self._post({"name": "pool", "delete": True})
+        self.assertTrue(r.get("deleted"), r)
+        self.assertEqual(self._views()[1]["tags"], [])
+
+    def test_the_master_bells_take_only_booleans(self):
+        for path, reader in (("/notify-all", km._notify_all_on), ("/notify-turns", km._notify_turns_on)):
+            self.assertFalse(reader(), path)
+            for bad in ("false", "true", 1, "no", "on"):
+                st, r = self._post_to(path, {"on": bad})
+                self.assertEqual(st, 400, (path, bad, r))
+                self.assertEqual(r.get("error"), "'on' must be true or false, got %s" % json.dumps(bad))
+                self.assertFalse(reader(), "%s: a refused flip leaves the bell as it was" % path)
+            st, r = self._post_to(path, {"on": True})
+            self.assertEqual((st, r.get("ok"), r.get("on")), (200, True, True), (path, r))
+            self.assertTrue(reader(), path)
+            st, r = self._post_to(path, {"on": False})
+            self.assertEqual((st, r.get("on")), (200, False), (path, r))
+            self.assertFalse(reader(), path)
+
+    def test_a_long_flag_value_echoes_clipped_and_well_formed(self):
+        st, r = self._post_to("/notify-all", {"on": "a" * 5000})
+        self.assertEqual(st, 400, r)
+        self.assertEqual(r.get("error"), "'on' must be true or false, got \"" + "a" * 60 + '\u2026"',
+                         "the cut lands inside the quotes, marked -- never an unclosed quote or 5000 chars")
+        self.assertLess(len(r["error"]), 100)
+        self.assertFalse(km._notify_all_on())
+
+    def test_auto_update_takes_only_a_boolean(self):
+        self.assertFalse(km._auto_update_remotes_on())
+        for bad in ("false", "true", 1, "yes"):
+            st, r = self._post_to("/tunnels/autoupdate", {"on": bad})
+            self.assertEqual(st, 400, (bad, r))
+            self.assertEqual(r.get("error"), "'on' must be true or false, got %s" % json.dumps(bad))
+            self.assertFalse(km._auto_update_remotes_on(), "a refused flip never starts pushing code")
+        st, r = self._post_to("/tunnels/autoupdate", {"on": True})
+        self.assertEqual((st, r.get("on")), (200, True), r)
+        self.assertTrue(km._auto_update_remotes_on())
+        st, r = self._post_to("/tunnels/autoupdate", {"on": False})
+        self.assertFalse(km._auto_update_remotes_on())
+
+    def test_checkin_refuses_a_string_before_looking_the_host_up(self):
+        calls = []
+        saved = km.checkin_set
+        km.checkin_set = lambda host, on: calls.append((host, on)) or {"host": host}
+        try:
+            for bad in ("false", "true", 0):
+                st, r = self._post_to("/tunnels/checkin", {"host": "TESTHOST", "on": bad})
+                self.assertEqual(st, 400, (bad, r))
+                self.assertEqual(r.get("error"), "'on' must be true or false, got %s" % json.dumps(bad))
+            self.assertEqual(calls, [], "nothing reaches the tunnel while the flag is malformed")
+            st, r = self._post_to("/tunnels/checkin", {"host": "TESTHOST", "on": False})
+            self.assertEqual((st, r.get("ok")), (200, True), r)
+            self.assertEqual(calls, [("TESTHOST", False)], "a real boolean rides through as itself")
+        finally:
+            km.checkin_set = saved
+
+    def test_new_refuses_a_string_mkdir_before_touching_the_disk(self):
+        calls = []
+        saved = km._resolve_create_dir
+        km._resolve_create_dir = (lambda raw, create=False:
+                                  calls.append((raw, create)) or ("", "stubbed: no directory here"))
+        try:
+            for bad in ("true", "false", 1):
+                st, r = self._post_to("/new", {"name": "fresh", "dir": "/nonexistent/TESTHOST", "mkdir": bad})
+                self.assertEqual(st, 400, (bad, r))
+                self.assertEqual(r.get("error"), "'mkdir' must be true or false, got %s" % json.dumps(bad))
+            self.assertEqual(calls, [], "no directory is resolved, let alone created, on a malformed flag")
+            st, r = self._post_to("/new", {"name": "fresh", "dir": "/nonexistent/TESTHOST", "mkdir": True})
+            self.assertEqual(calls, [("/nonexistent/TESTHOST", True)], "a real true asks for the create")
+            self.assertEqual((st, r.get("ok"), r.get("error")), (200, False, "stubbed: no directory here"))
+        finally:
+            km._resolve_create_dir = saved
+
+
 if __name__ == "__main__":
     unittest.main()

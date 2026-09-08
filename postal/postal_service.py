@@ -1330,21 +1330,94 @@ def _wake_when_ready(sid):
     except Exception as e:
         _log("wake wait failed for %s: %s" % (sid, e))
 
+# The most a POST body may carry -- the kernel's bound, mirrored: every bus route takes a JSON control
+# request (one mail, a peer table, an exchange of presence and acks), tens of KB at most.
+_POST_MAX_BYTES = 1024 * 1024
+
+
+def _clip_json(v, n=60):
+    """A BOUNDED, WELL-FORMED echo of an offending request value for an error message: a large body must
+    never come back as a large error. The cut lands INSIDE a string's quotes and is marked, so a long
+    string still echoes as one complete quoted thing (a slice of the serialized text took the closing
+    quote with it); ensure_ascii is off, or the marker itself comes back as \\u2026. The kernel's shape."""
+    if isinstance(v, str):
+        return json.dumps(v[:n] + "\u2026" if len(v) > n else v, ensure_ascii=False)
+    try:
+        s = json.dumps(v, ensure_ascii=False)
+    except (TypeError, ValueError):
+        s = repr(v)
+    return s if len(s) <= n else s[:n] + "\u2026"
+
+
+def _as_bool(v, field, default=False):
+    """A request flag as the boolean it claims to be -> (value, error). Absent (None) is `default`; JSON
+    true/false pass through; anything else -- the string "false", 0/1, "no" -- is refused with `error`
+    naming the field, and the caller must NOT act. Never coerces: bool("false") is True, which is how a
+    string used to arm a tracked delegation and mark a down peer bus up."""
+    if v is None:
+        return default, None
+    if v is True or v is False:
+        return v, None
+    return None, "'%s' must be true or false, got %s" % (field, _clip_json(v))
+
+
+class _RefusedBody(Exception):
+    """A request body Handler._body refused before or instead of parsing it: `status` and `error` are the
+    answer, and the connection closes with it (the body is unread or unusable, so the socket cannot
+    carry a next request)."""
+
+    def __init__(self, status, error):
+        super().__init__(error)
+        self.status, self.error = status, error
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass   # keep stdout/stderr clean; the bus log is for real events only
 
-    def _send(self, obj, code=200):
+    def _send(self, obj, code=200, close=False):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if close:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
     def _body(self):
-        n = int(self.headers.get("Content-Length", 0) or 0)
-        return json.loads(self.rfile.read(n)) if n else {}
+        """The request body as the JSON object every route expects, read only within bounds -- the
+        kernel's _read_post_body, mirrored. Refused as _RefusedBody(status, error), each before or
+        instead of parsing: a Transfer-Encoding request (411; bodies are delimited by Content-Length
+        alone), more than one Content-Length (400), a non-decimal one or a digit run past 20 (400), a
+        length past _POST_MAX_BYTES (413, before a byte is read), a body shorter than announced (400,
+        naming the shortfall), and a decodable body that is not an object (400, naming what arrived). It
+        used to be `json.loads(rfile.read(int(Content-Length)))` unchecked: the first of two lengths was
+        trusted, nothing was capped, and a non-object came back parsed so the route's first `.get`
+        raised AttributeError out of the handler -- the connection dropped with a traceback on stderr
+        instead of the 400 do_POST answers for undecodable JSON."""
+        if self.headers.get("Transfer-Encoding"):
+            raise _RefusedBody(411, "Transfer-Encoding is not accepted; send the body with a Content-Length")
+        get_all = getattr(self.headers, "get_all", None)   # an HTTPMessage in service; a plain dict in unit tests
+        if callable(get_all):
+            lengths = get_all("Content-Length") or []
+        else:
+            lengths = [] if self.headers.get("Content-Length") is None else [self.headers.get("Content-Length")]
+        if len(lengths) > 1:
+            raise _RefusedBody(400, "body could not be read: more than one Content-Length header")
+        cl = str(lengths[0]).strip() if lengths else "0"
+        if not re.fullmatch(r"[0-9]{1,20}", cl):
+            raise _RefusedBody(400, "body could not be read: Content-Length %s is an invalid literal for a byte count (decimal digits only)" % _clip_json(cl))
+        n = int(cl)
+        if n > _POST_MAX_BYTES:
+            raise _RefusedBody(413, "request body of %d bytes exceeds the %d-byte limit" % (n, _POST_MAX_BYTES))
+        raw = self.rfile.read(n) if n else b""
+        if len(raw) < n:
+            raise _RefusedBody(400, "body could not be read: read %d of the %d bytes Content-Length announced" % (len(raw), n))
+        data = json.loads(raw) if raw else {}
+        if not isinstance(data, dict):
+            raise _RefusedBody(400, "body must be a JSON object, got %s" % _clip_json(data))
+        return data
 
     def _authorized(self):
         """Serve-token gate, every route but /ping (see the SERVE_TOKEN block). Local clients send
@@ -1421,6 +1494,9 @@ class Handler(BaseHTTPRequestHandler):
                                "~/.local/state/romp/serve-token)"}, 403)
         try:
             data = self._body()
+        except _RefusedBody as e:
+            self.close_connection = True
+            return self._send({"error": e.error}, e.status, close=True)
         except Exception:
             return self._send({"error": "bad json"}, 400)
         if u.path == "/peer":                      # the kernel's tunnel-transition notify (peer-bus mode)
@@ -1447,7 +1523,10 @@ class Handler(BaseHTTPRequestHandler):
             kind = str(data.get("kind", "")).strip().lower()
             if kind not in ("delegate", "coordinate", "question"):
                 kind = ""                              # legacy/CLI mail may be undeclared; never invent one
-            tracked = bool(data.get("tracked")) and kind == "delegate"   # report-back delegation
+            tracked, terr = _as_bool(data.get("tracked"), "tracked")   # report-back delegation
+            if terr:                                   # a string here armed tracking on a plain send
+                return self._send({"error": terr}, 400)
+            tracked = tracked and kind == "delegate"
             #   (the user 2026-08-24): only a delegate can be tracked; wire metadata only — nothing
             #   about the flag ever appears in message prose (the injected-voice rule)
             if _postal_off(frm_id):                # the sender is in isolation → sending is disabled
@@ -1791,7 +1870,10 @@ def peer_update(data):
     prev = PEERS.get(host) or {}
     tok = str(data.get("token") or "") or prev.get("token") or ""
     trust = str(data.get("trust") or "") or prev.get("trust") or "directed"
-    PEERS[host] = {"port": port, "up": bool(data.get("up")), "at": int(time.time()),
+    up, uerr = _as_bool(data.get("up"), "up")
+    if uerr:                                           # a string here marked a DOWN tunnel up
+        return {"error": uerr}, 400
+    PEERS[host] = {"port": port, "up": up, "at": int(time.time()),
                    "token": tok, "trust": trust}
     _peer_threads_reconcile(host)                    # an up peer gets its dialer; a down one is woken to exit
     return {"ok": True, "up": sum(1 for p in PEERS.values() if p["up"])}, 200
@@ -2988,7 +3070,10 @@ def _mcp_call(name, args):
             return ("Cannot send: this session's own identity did not resolve (no session id), so "
                     "the mail would arrive anonymously and the recipient could not place or answer "
                     "it. This is a session-identity bug worth surfacing to the user.", True)
-        tracked = bool(args.get("tracked")) and kind == "delegate"
+        tracked, terr = _as_bool(args.get("tracked"), "tracked")
+        if terr:
+            return ("Cannot send: %s. Pass a JSON boolean (tracked: true), not a string." % terr, True)
+        tracked = tracked and kind == "delegate"
         try:
             payload = {"to": to, "from": me or "unknown", "from_id": mid, "body": body, "kind": kind}
             if tracked:

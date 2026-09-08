@@ -18,7 +18,11 @@ Mirrors tests/test_kernel_ws_auth.py's module load order.
 import io
 import json
 import os
+import socket
+import threading
 import unittest
+from http.client import HTTPMessage
+from http.server import ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
 import tempfile
 
@@ -377,6 +381,197 @@ class BusyDrainWriteGate(unittest.TestCase):
         self.assertEqual(status, 200, "the count is a healthz-style probe — no token needed")
         self.assertEqual(json.loads(body).get("busy"), 3)
         self.assertEqual(self.spy.refreshed, 0, "a plain /busy never holds")
+
+
+class _RfileSpy:
+    """A request body that RECORDS every read: the gate under test must refuse before reading any of it."""
+
+    def __init__(self, data=b""):
+        self.data, self.reads = data, []
+
+    def read(self, n=-1):
+        self.reads.append(n)
+        out, self.data = self.data[:n], self.data[n:]
+        return out
+
+
+def _serve_post(path, headers=None, body=b"", rfile=None):
+    """Drive the REAL do_POST dispatcher over a fake socket -> (status, response headers, body text,
+    handler). `headers` is a dict or an http.client.HTTPMessage -- the type the live server parses
+    into, and the one that can carry a header TWICE (a dict cannot)."""
+    h = km.Handler.__new__(km.Handler)
+    h.client_address = ("127.0.0.1", 0)
+    h.headers = headers if headers is not None else {}
+    h.path = path
+    h.command = "POST"
+    h.request_version = "HTTP/1.1"
+    h.wfile = io.BytesIO()
+    h.rfile = rfile if rfile is not None else io.BytesIO(body)
+    h.close_connection = False                       # keep-alive until the handler says otherwise
+    captured = {"headers": {}}
+
+    def send_response(code, *a):
+        captured["status"] = code
+
+    def send_header(k, v):
+        captured["headers"][k] = v
+
+    h.send_response = send_response
+    h.send_header = send_header
+    h.end_headers = lambda: None
+    h.log_message = lambda *a: None
+    h.do_POST()
+    return captured.get("status"), captured["headers"], h.wfile.getvalue().decode("utf-8", "replace"), h
+
+
+class PostBodyGate(unittest.TestCase):
+    """POST bodies are read only AFTER _authorize passes, and only within bounds. do_POST used to read
+    the whole body FIRST -- `int(Content-Length or 0)` inside a bare except, no cap -- so a token-less
+    loopback or tailnet client could make the kernel buffer any number of bytes and pin one handler
+    thread per oversize POST (the server is threaded); a non-decimal or duplicate Content-Length was
+    silently read as no body; a Transfer-Encoding request had its chunk framing parsed as the next
+    request; and a denied request left its unread body on a keep-alive socket. Every refusal here
+    wears the route family's JSON shape and closes the connection."""
+    TEN_MB = str(10 * 1024 * 1024)
+
+    def test_an_unauthenticated_post_is_denied_before_its_body_is_read(self):
+        spy = _RfileSpy()
+        st, hdrs, body, h = _serve_post("/send", {"Content-Length": self.TEN_MB}, rfile=spy)
+        self.assertEqual(st, 403)
+        self.assertEqual(spy.reads, [], "no byte of an unauthenticated body is read")
+        self.assertTrue(h.close_connection, "an unread body cannot stay on a keep-alive socket")
+        self.assertEqual(hdrs.get("Connection"), "close")
+
+    def test_an_oversize_post_is_413_before_any_read_and_a_bounded_one_is_served(self):
+        spy = _RfileSpy()
+        st, hdrs, body, h = _serve_post("/perf", {"X-Romp-Token": TOK,
+                                                 "Content-Length": str(km._POST_MAX_BYTES + 1)}, rfile=spy)
+        self.assertEqual(st, 413)
+        r = json.loads(body)
+        self.assertIs(r["ok"], False)
+        self.assertIn(str(km._POST_MAX_BYTES), r["error"], "the refusal names the limit")
+        self.assertEqual(spy.reads, [], "refused on the declared length, before a byte is read")
+        self.assertTrue(h.close_connection)
+        self.assertEqual(hdrs.get("Connection"), "close")
+        # the same route, an in-bounds body: read, parsed and served (the cap is a cap, not a lockout)
+        raw = b'{"log": false}'
+        st, hdrs, body, h = _serve_post("/perf", {"X-Romp-Token": TOK, "Content-Length": str(len(raw))}, body=raw)
+        self.assertEqual(st, 200)
+        self.assertEqual(json.loads(body), {"ok": True, "log": False})
+
+    def test_a_non_decimal_content_length_is_400_and_unread(self):
+        for cl in ("12abc", "-1", "0x10", " ", "1e3", "\u0661\u0662"):   # the last: Arabic-Indic digits, which str.isdigit accepts
+            spy = _RfileSpy(b"{}")
+            st, hdrs, body, h = _serve_post("/perf", {"X-Romp-Token": TOK, "Content-Length": cl}, rfile=spy)
+            self.assertEqual(st, 400, cl)
+            self.assertIn("Content-Length", json.loads(body)["error"], cl)
+            self.assertEqual(spy.reads, [], cl)
+            self.assertTrue(h.close_connection, cl)
+
+    def test_two_content_length_headers_are_400_and_unread(self):
+        m = HTTPMessage()
+        m["X-Romp-Token"] = TOK
+        m["Content-Length"] = "2"
+        m["Content-Length"] = "4"                        # Message.__setitem__ APPENDS: two headers, as on the wire
+        spy = _RfileSpy(b"{}{}")
+        st, hdrs, body, h = _serve_post("/perf", m, rfile=spy)
+        self.assertEqual(st, 400)
+        self.assertIn("more than one Content-Length", json.loads(body)["error"])
+        self.assertEqual(spy.reads, [], "neither length is trusted")
+        self.assertTrue(h.close_connection)
+
+    def test_transfer_encoding_is_411_and_unread(self):
+        spy = _RfileSpy(b"2\r\n{}\r\n0\r\n\r\n")
+        st, hdrs, body, h = _serve_post("/perf", {"X-Romp-Token": TOK, "Transfer-Encoding": "chunked"}, rfile=spy)
+        self.assertEqual(st, 411)
+        self.assertIn("Transfer-Encoding", json.loads(body)["error"])
+        self.assertEqual(spy.reads, [], "chunk framing is never read as a body")
+        self.assertTrue(h.close_connection)
+
+    def test_a_digit_run_past_any_byte_count_is_400_not_a_conversion_error(self):
+        # 5000 digits pass a bare [0-9]+ and then int() raises past the interpreter's conversion limit
+        # (4300 digits on 3.11+) -- into do_POST's catch-all as a 500 traceback with the socket left open
+        spy = _RfileSpy(b"{}")
+        st, hdrs, body, h = _serve_post("/perf", {"X-Romp-Token": TOK, "Content-Length": "9" * 5000}, rfile=spy)
+        self.assertEqual(st, 400)
+        err = json.loads(body)["error"]
+        self.assertIn("Content-Length", err)
+        self.assertLess(len(err), 200, "the offending value echoes clipped, not in full")
+        self.assertEqual(spy.reads, [])
+        self.assertTrue(h.close_connection)
+
+    def test_an_absent_content_length_is_an_empty_body_never_a_read(self):
+        # the hook's bodiless POST /tick, and any bodiless POST: served on an empty body without a read
+        spy = _RfileSpy(b"")
+        st, hdrs, body, h = _serve_post("/tick", {"X-Romp-Token": TOK}, rfile=spy)
+        self.assertEqual((st, json.loads(body)), (200, {"ok": True, "woke": True}))
+        self.assertEqual(spy.reads, [], "nothing to read: no read")
+        self.assertFalse(h.close_connection, "a served request keeps its keep-alive")
+        spy = _RfileSpy(b"")
+        st, hdrs, body, h = _serve_post("/perf", {"X-Romp-Token": TOK}, rfile=spy)
+        self.assertEqual(st, 400)
+        self.assertEqual(json.loads(body)["error"], 'body must be {"log": true|false}',
+                         "the route saw an EMPTY body (its own refusal), not a gate refusal")
+        self.assertEqual(spy.reads, [])
+
+
+def _raw_post(port, path, headers, body=b"", half_close=True):
+    """One hand-built POST over a real socket -> (status, JSON body, response head). `headers` is a list
+    of (name, value) pairs, so a header can be sent twice; `half_close` ends the client's sending side
+    after `body`, so the server's read of an announced-but-short body sees EOF rather than hanging.
+    Connection: close on the request, so the response is followed by EOF and the read loop ends."""
+    lines = ["POST %s HTTP/1.1" % path, "Host: 127.0.0.1", "Connection: close"] + \
+            ["%s: %s" % kv for kv in headers]
+    req = ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    try:
+        s.sendall(req)
+        if half_close:
+            s.shutdown(socket.SHUT_WR)
+        data = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        s.close()
+    head, _, payload = data.partition(b"\r\n\r\n")
+    return int(head.split(b" ", 2)[1]), json.loads(payload.decode() or "{}"), head.decode()
+
+
+class PostBodyGateOverTheWire(unittest.TestCase):
+    """The same gate against the REAL server and a real socket: the header object is the HTTPMessage
+    the live server parses into, and the body arrives (or does not) over TCP."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), km.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def test_a_body_shorter_than_announced_is_refused_naming_the_shortfall(self):
+        # a dead client / short read: 100 bytes announced, 10 arrive, then EOF. The 10 bytes must not
+        # pass as the body (here they would have been "body is not JSON" -- a guess at a truncated
+        # request); the refusal names the shortfall and closes.
+        st, r, head = _raw_post(self.port, "/rename", [("X-Romp-Token", TOK), ("Content-Length", "100")],
+                                body=b'{"target":')
+        self.assertEqual(st, 400, r)
+        self.assertEqual(r, {"ok": False, "error": "body could not be read: read 10 of the 100 bytes Content-Length announced"})
+        self.assertIn("Connection: close", head)
+
+    def test_two_content_length_headers_on_the_wire_are_400(self):
+        st, r, head = _raw_post(self.port, "/rename",
+                                [("X-Romp-Token", TOK), ("Content-Length", "2"), ("Content-Length", "4")],
+                                body=b"{}{}")
+        self.assertEqual(st, 400, r)
+        self.assertEqual(r["error"], "body could not be read: more than one Content-Length header")
+        self.assertIn("Connection: close", head)
 
 
 if __name__ == "__main__":

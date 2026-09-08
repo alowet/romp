@@ -95,5 +95,62 @@ class RenameRoute(unittest.TestCase):
         self.assertEqual(st, 400)
 
 
+class NonObjectBodies(unittest.TestCase):
+    """Every session-management route takes a JSON OBJECT. A body that decodes to anything else -- an
+    array, a string, a number, null -- used to reach `(b or {}).get(...)` (a truthy non-dict passes the
+    `or`) and raise AttributeError into do_POST's catch-all: a 500 whose body was a Python traceback
+    naming absolute paths. Now every one of them answers 400 in the route family's JSON shape, naming
+    what arrived, and acts on nothing."""
+    ROUTES = ("/new", "/fork", "/rename", "/move", "/color", "/watch-pr", "/watch", "/tag", "/group",
+              "/update-dismiss", "/working", "/deliver", "/picker-check", "/walk-root", "/redial")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), km.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def _post_raw(self, path, raw):
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (self.port, path), data=raw,
+            headers={"Content-Type": "application/json",
+                     "X-Romp-Token": os.environ["ROMP_SERVE_TOKEN"]})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def test_a_non_object_body_is_a_400_naming_what_arrived_never_a_500(self):
+        for path in self.ROUTES:
+            for raw, echo in ((b"[]", "[]"), (b'"x"', '"x"'), (b"1", "1"), (b"null", "null"), (b"[1]", "[1]")):
+                st, body = self._post_raw(path, raw)
+                self.assertEqual(st, 400, "%s %r -> %s %s" % (path, raw, st, body[:160]))
+                self.assertNotIn("Traceback", body)
+                r = json.loads(body)
+                self.assertIs(r.get("ok"), False, (path, raw))
+                self.assertEqual(r.get("error"), "body must be a JSON object, got " + echo, (path, raw))
+
+    def test_an_undecodable_body_is_a_400_too_not_a_guess_at_its_fields(self):
+        for path in self.ROUTES:
+            st, body = self._post_raw(path, b"{not json")
+            self.assertEqual(st, 400, (path, st, body[:160]))
+            self.assertEqual(json.loads(body).get("error"), "body is not JSON", path)
+
+    def test_a_long_string_body_echoes_clipped_inside_its_quotes(self):
+        # a 100 KB string must not come back as a 100 KB error, and the cut must land INSIDE the quotes
+        # with a marker -- a slice of the serialized text took the closing quote with it
+        st, body = self._post_raw("/rename", json.dumps("x" * 100_000).encode())
+        self.assertEqual(st, 400)
+        err = json.loads(body)["error"]
+        self.assertEqual(err, 'body must be a JSON object, got "' + "x" * 60 + '\u2026"')
+        self.assertLess(len(err), 100)
+
+
 if __name__ == "__main__":
     unittest.main()

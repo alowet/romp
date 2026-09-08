@@ -88,7 +88,9 @@ class PostalTrackedWire(unittest.TestCase):
         # source pins on the /send route: coordinate/question can never carry it, and the
         # cross-host relay branch deliberately drops it (a satellite with an unreachable primary
         # would hide work)
-        self.assertIn('tracked = bool(data.get("tracked")) and kind == "delegate"', PSRC)
+        self.assertIn('tracked, terr = _as_bool(data.get("tracked"), "tracked")', PSRC,
+                      "a checked boolean: the string \"false\" used to arm tracking")
+        self.assertIn('tracked = tracked and kind == "delegate"', PSRC)
         self.assertIn("`tracked` deliberately does NOT ride the relay", PSRC)
         self.assertIn('mid = deliver(a0["id"], frm, frm_id, body, kind=kind, tracked=tracked)', PSRC)
 

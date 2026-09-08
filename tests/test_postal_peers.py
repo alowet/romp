@@ -54,6 +54,16 @@ class PeerMode(unittest.TestCase):
                          "a down transition keeps the row for introspection, marked down")
         self.assertEqual(payload["up"], 0)
 
+    def test_peer_update_refuses_a_non_boolean_up_and_records_nothing(self):
+        # `up` used to be coerced with bool(), so a notify carrying the STRING "false" marked the peer UP
+        for bad in ("false", "true", 1, 0, "up"):
+            payload, status = pm.peer_update({"host": "TESTHOST", "port": 50002, "up": bad})
+            self.assertEqual(status, 400, (bad, payload))
+            self.assertEqual(payload["error"], "'up' must be true or false, got %s" % json.dumps(bad))
+        self.assertEqual(pm.PEERS, {}, "a refused notify records no row")
+        payload, status = pm.peer_update({"host": "TESTHOST", "port": 50002, "up": False})
+        self.assertEqual((status, pm.PEERS["TESTHOST"]["up"]), (200, False), "a real false rides through as itself")
+
     def test_peer_update_validates(self):
         for bad in ({}, {"host": "", "port": 1}, {"host": "h"}, {"host": "h", "port": "x"},
                     {"host": "h", "port": 0}, {"host": "h", "port": True}):

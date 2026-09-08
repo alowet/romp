@@ -30,7 +30,10 @@ class TabFlags(unittest.TestCase):
     def test_kernel_handles_a_chat_side_setSessionFlag(self):
         text = open(KPATH).read()
         self.assertIn('msg.get("type") == "setSessionFlag"', text)
-        self.assertIn("_set_session_flag(str(msg[\"id\"]), str(msg[\"flag\"]), bool(msg.get(\"value\")))", text)
+        # the value is a checked boolean, never a bool() coercion: bool("false") is True (the string a
+        # third-party client sent used to flip the flag ON)
+        self.assertIn('value, ferr = _as_bool(msg.get("value"), "value")', text)
+        self.assertIn("_set_session_flag(str(msg[\"id\"]), str(msg[\"flag\"]), value)", text)
 
     def test_set_session_flag_round_trips(self):
         sid = "11111111-2222-3333-4444-555555555555"

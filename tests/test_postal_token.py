@@ -11,6 +11,7 @@ Synthetic only — hermetic temp state dir, placeholder names, no real session d
 """
 import json
 import os
+import socket
 import tempfile
 import threading
 import unittest
@@ -111,6 +112,144 @@ class PeerTokenPlumbing(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
         self.assertEqual(seen.get("path"), "/peer-exchange?token=peer-tok")
+
+
+class _BusServer(unittest.TestCase):
+    """A live bus for the request-body classes below (no tests of its own): one server per class."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), ps.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def _post(self, path, raw):
+        req = urllib.request.Request("http://127.0.0.1:%d%s" % (self.port, path), data=raw, method="POST",
+                                     headers={"X-Romp-Token": TOK, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode() or "{}")
+        except Exception as e:                        # the handler raised and the socket closed under us
+            return None, {"error": repr(e)}
+
+    def _raw(self, path, headers, body=b"", half_close=True):
+        """One hand-built POST over a real socket -> (status, JSON body, response head): a header can be
+        sent twice, and `half_close` ends the sending side after `body` so a short body reads as EOF."""
+        lines = ["POST %s HTTP/1.1" % path, "Host: 127.0.0.1", "Connection: close",
+                 "X-Romp-Token: " + TOK] + ["%s: %s" % kv for kv in headers]
+        req = ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        try:
+            s.sendall(req)
+            if half_close:
+                s.shutdown(socket.SHUT_WR)
+            data = b""
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            s.close()
+        head, _, payload = data.partition(b"\r\n\r\n")
+        return int(head.split(b" ", 2)[1]), json.loads(payload.decode() or "{}"), head.decode()
+
+
+class BusBodiesAreObjects(_BusServer):
+    """Every bus route takes a JSON OBJECT. _body() used to hand back whatever json.loads produced, so
+    an array, string, number or null body reached `data.get(...)` and raised AttributeError out of the
+    handler: the connection dropped with a traceback on the bus's stderr. Now: the bus's own JSON 400,
+    naming what arrived; undecodable JSON keeps its refusal."""
+
+    def test_a_non_object_body_is_a_400_naming_what_arrived(self):
+        for raw, echo in ((b"[]", "[]"), (b'"x"', '"x"'), (b"1", "1"), (b"null", "null")):
+            for path in ("/send", "/peer", "/peer-exchange"):
+                st, r = self._post(path, raw)
+                self.assertEqual(st, 400, (path, raw, r))
+                self.assertEqual(r.get("error"), "body must be a JSON object, got " + echo, (path, raw))
+        st, r = self._post("/send", b"{nope")
+        self.assertEqual((st, r.get("error")), (400, "bad json"), "undecodable JSON keeps its refusal")
+
+    def test_a_long_string_body_echoes_clipped_inside_its_quotes(self):
+        st, r = self._post("/send", json.dumps("x" * 100_000).encode())
+        self.assertEqual(st, 400, r)
+        self.assertEqual(r["error"], 'body must be a JSON object, got "' + "x" * 60 + '\u2026"')
+        self.assertLess(len(r["error"]), 100)
+
+
+class BusBodyGate(_BusServer):
+    """The bus reads a body only within bounds -- the kernel's gate, mirrored. _body() used to trust the
+    first of two Content-Length headers, cap nothing, and pass whatever bytes arrived as the body."""
+
+    def test_two_content_length_headers_are_400_and_close(self):
+        st, r, head = self._raw("/send", [("Content-Length", "2"), ("Content-Length", "4")], body=b"{}{}")
+        self.assertEqual((st, r.get("error")), (400, "body could not be read: more than one Content-Length header"))
+        self.assertIn("Connection: close", head)
+
+    def test_a_non_decimal_content_length_is_400(self):
+        st, r, head = self._raw("/send", [("Content-Length", "12abc")], body=b"{}")
+        self.assertEqual(st, 400, r)
+        self.assertIn("invalid literal for a byte count", r.get("error", ""))
+
+    def test_an_oversize_announcement_is_413_before_any_read(self):
+        # announced past the cap, nothing sent: refused on the declared length before any read (the old
+        # bus read to EOF, got b"", and answered "bad json")
+        st, r, head = self._raw("/send", [("Content-Length", str(ps._POST_MAX_BYTES + 1))])
+        self.assertEqual(st, 413, r)
+        self.assertIn(str(ps._POST_MAX_BYTES), r.get("error", ""))
+        self.assertIn("Connection: close", head)
+
+    def test_a_body_shorter_than_announced_is_400_naming_the_shortfall(self):
+        st, r, head = self._raw("/send", [("Content-Length", "100")], body=b'{"to": "ap')
+        self.assertEqual((st, r.get("error")), (400, "body could not be read: read 10 of the 100 bytes Content-Length announced"))
+        self.assertIn("Connection: close", head)
+
+    def test_transfer_encoding_is_411(self):
+        st, r, head = self._raw("/send", [("Transfer-Encoding", "chunked")], body=b"2\r\n{}\r\n0\r\n\r\n")
+        self.assertEqual(st, 411, r)
+        self.assertIn("Transfer-Encoding", r.get("error", ""))
+
+
+class TrackedIsABoolean(_BusServer):
+    """`tracked` arms a report-back delegation. Both doors coerced it with bool(), so the STRING "false"
+    tracked a send. Now a non-boolean is refused -- HTTP /send with a 400 naming the field, the MCP tool
+    in its error return -- before any recipient is resolved or the bus dialed. The MCP schema declares
+    the field boolean and `romp mail send --tracked` sends True, so real callers are unchanged."""
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def test_http_send_refuses_a_string_tracked_before_resolving_anyone(self):
+        for bad in ("false", "true", 1, "yes"):
+            st, r = self._post("/send", json.dumps({"to": "api", "from": "web", "from_id": self.SID,
+                                                    "body": "hello", "kind": "delegate", "tracked": bad}).encode())
+            self.assertEqual(st, 400, (bad, r))
+            self.assertEqual(r.get("error"), "'tracked' must be true or false, got %s" % json.dumps(bad))
+
+    def test_the_mcp_tool_refuses_a_string_tracked_before_dialing_the_bus(self):
+        dialed = []
+
+        def http(*a, **k):
+            dialed.append(a)
+            raise ps.BusError("stubbed: the bus is not dialed here")
+        saved = (ps._http, ps.my_name, ps.my_id, ps._heartbeat)
+        ps._http, ps.my_name, ps.my_id, ps._heartbeat = http, (lambda: "web"), (lambda: self.SID), (lambda mid, me: None)
+        try:
+            for bad in ("false", "true", 1):
+                text, is_err = ps._mcp_call("send_message", {"to": "api", "body": "hello", "kind": "delegate", "tracked": bad})
+                self.assertTrue(is_err, (bad, text))
+                self.assertIn("'tracked' must be true or false, got %s" % json.dumps(bad), text)
+            self.assertEqual(dialed, [], "the bus is never dialed with a malformed flag")
+            ps._mcp_call("send_message", {"to": "api", "body": "hello", "kind": "delegate", "tracked": True})
+            self.assertEqual(dialed[0][:2], ("POST", "/send"))
+            self.assertIs(dialed[0][2]["tracked"], True, "a real true rides the wire as itself")
+        finally:
+            ps._http, ps.my_name, ps.my_id, ps._heartbeat = saved
 
 
 if __name__ == "__main__":
