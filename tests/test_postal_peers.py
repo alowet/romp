@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
@@ -683,11 +684,14 @@ _RCP = "22222222-3333-4444-5555-666666666666"
 
 class LedgerBeforeTheDelete(unittest.TestCase):
     """The accounting rows are the ONE record anyone reads (the sender's receipts, the timeline, the
-    kernel's courier), so they land before the irreversible step, never after it (2026-09-08):
-    deliver() writes the sent row and only then publishes — a row that cannot land refuses the send
-    with nothing in new/ — and _bounce_apply / _ack_arrived write the terminal row and only then
-    delete the outbox record. On origin/main the publish and the delete came first and the row was
-    best-effort after them: mail with no row anywhere, and records gone before their receipt existed."""
+    kernel's courier), so nothing irreversible stands without its row (2026-09-08): deliver()
+    publishes first (the publish is the claim on the name) and writes the sent row second, and a row
+    that cannot land takes the mail back out of new/ and refuses the send; _bounce_apply / _ack_arrived
+    write the terminal row and only then delete the outbox record. On origin/main the row after the
+    publish was best-effort and the delete came before its row: mail with no row anywhere, and records
+    gone before their receipt existed. The two take-back outcomes that leave a delivered message with
+    no row (a reader claimed it first; the file could not be removed) answer the id and are said to
+    the user (a bell row), not only on stderr."""
 
     def setUp(self):
         os.environ["ROMP_POSTAL_PEERS"] = "1"
@@ -695,21 +699,29 @@ class LedgerBeforeTheDelete(unittest.TestCase):
         shutil.rmtree(pm.OUTBOX, ignore_errors=True)
         shutil.rmtree(pm.MAILROOT, ignore_errors=True)
         shutil.rmtree(pm.MAILPENDING, ignore_errors=True)
-        self._tl, self._log = pm.TLDIR, pm._log
-        self.logged = []
+        self._tl, self._log, self._post = pm.TLDIR, pm._log, pm._kernel_post
+        self.logged, self.told = [], []
         pm._log = lambda m: self.logged.append(m)
+        pm._kernel_post = lambda path, body, timeout=2: self.told.append((path, body)) or {"ok": True}
         try:
             (pm.TLDIR / "messages.jsonl").unlink()
         except OSError:
             pass
         if hasattr(pm, "_TL_FAULT"):
             pm._TL_FAULT[0] = False
+        pm._DASHBOARD_MISSED[0] = False
+        pm._REFUSAL_SAID.clear()
 
     def tearDown(self):
-        pm.TLDIR, pm._log = self._tl, self._log
+        pm.TLDIR, pm._log, pm._kernel_post = self._tl, self._log, self._post
         if hasattr(pm, "_TL_FAULT"):
             pm._TL_FAULT[0] = False
+        pm._DASHBOARD_MISSED[0] = False
+        pm._REFUSAL_SAID.clear()
         os.environ.pop("ROMP_POSTAL_PEERS", None)
+
+    def _notices(self):
+        return [b["text"] for p, b in self.told if p == "/postal-notice"]
 
     def _break_the_log(self):
         # TLDIR under a regular FILE: mkdir raises (ENOTDIR), so the REAL _tl_append fails the way a
@@ -735,7 +747,7 @@ class LedgerBeforeTheDelete(unittest.TestCase):
         self.assertIn("retry", str(cm.exception))
         newd, tmpd = pm.MAILROOT / _RCP / "new", pm.MAILROOT / _RCP / "tmp"
         self.assertEqual([p.name for p in newd.iterdir()] if newd.is_dir() else [], [],
-                         "no mail is published without its row")
+                         "mail whose row cannot land is taken back out of new/")
         self.assertEqual([p.name for p in tmpd.iterdir()] if tmpd.is_dir() else [], [], "the temp is removed")
         self.assertFalse((pm.MAILPENDING / _RCP).exists(), "no pending marker for mail that never landed")
 
@@ -778,6 +790,116 @@ class LedgerBeforeTheDelete(unittest.TestCase):
         self.assertEqual(claimed, [mid], "the reader took the message")
         self.assertTrue((pm.MAILROOT / _RCP / "cur" / mid).is_file(), "…and holds it")
         self.assertTrue(any(mid in m and "no record" in m for m in self.logged), "the missing row is said, by id")
+        self.assertEqual(len([n for n in self._notices() if mid in n and "no record" in n]), 1,
+                         "…and to the user, as one bell row (a delivered message the ledger will never carry)")
+
+    def test_a_row_that_fails_when_the_mail_cannot_be_taken_back_answers_the_id_and_says_so(self):
+        # the take-back's other failure: the row failed (the REAL _tl_append against a broken log) and
+        # new/<id> stands, but its unlink is refused with something other than ENOENT (EROFS staged
+        # on that one path; no chmod, so root runs it too). The message WILL be read, so the answer
+        # is the id, the marker stands, no row was written, and the gap is said by name on stderr
+        # AND as a bell row. Mutants: the arm removed (the error escapes deliver and the sender
+        # delivers it twice); the arm returning without _mark_pending (mail in new/ with no marker).
+        import errno
+        import pathlib
+        self._break_the_log()
+        newd = pm.MAILROOT / _RCP / "new"
+        real, refused = pathlib.Path.unlink, []
+
+        def refuse_in_new(p, *a, **k):
+            if p.parent == newd:
+                refused.append(p.name)
+                raise OSError(errno.EROFS, os.strerror(errno.EROFS), str(p))
+            return real(p, *a, **k)
+
+        pathlib.Path.unlink = refuse_in_new
+        try:
+            mid = pm.deliver(_RCP, "web", _SND, "hello")
+        finally:
+            pathlib.Path.unlink = real
+        self.assertEqual(refused, [mid], "the take-back was attempted on the published name and refused")
+        self.assertTrue((newd / mid).is_file(), "the message stands in new/: it could not be taken back")
+        self.assertTrue((pm.MAILPENDING / _RCP).exists(), "the pending marker stands: the mail will be delivered")
+        self.assertFalse((pm.TLDIR / "messages.jsonl").exists(), "no row was written")
+        said = [m for m in self.logged if mid in m and "could not be taken back" in m]
+        self.assertEqual(len(said), 1, "the failed take-back is said, by id, with the errno")
+        self.assertIn("[Errno %d]" % errno.EROFS, said[0])
+        self.assertEqual(len([n for n in self._notices() if mid in n and "could not be taken back" in n]), 1,
+                         "…and as one bell row")
+
+    def test_a_refused_publish_rings_the_bell_once_per_recipient_episode(self):
+        # a refused publish writes no row, so the log says every refusal, and the USER hears it once
+        # per recipient episode: the first refusal to a recipient is a bell row, the refusals that
+        # follow it are log lines only, another recipient's refusal is its own episode, and a publish
+        # to that recipient that lands re-arms it. Mutants: a bell per refusal (the dialer re-relays
+        # a refused message every exchange, so a lasting fault would ring every few seconds); no
+        # re-arm (the second episode is silent); one gate for every recipient.
+        other = "33333333-4444-5555-6666-777777777777"
+        first = pm.deliver(_RCP, "web", _SND, "the standing message")
+        second = pm.deliver(other, "web", _SND, "another standing message")
+        saved = pm._unique
+
+        def collide(mid, to):
+            pm._unique = lambda: mid                                   # the publish meets a standing name
+            try:
+                with self.assertRaises(pm.DeliveryNotRecorded):
+                    pm.deliver(to, "web", _SND, "an impostor")
+            finally:
+                pm._unique = saved
+
+        def bells():
+            return [n for n in self._notices() if "refused, nothing recorded" in n]
+
+        collide(first, _RCP)
+        collide(first, _RCP)
+        self.assertEqual(len([m for m in self.logged if "refused, nothing recorded" in m]), 2,
+                         "the log says every refusal (no row does)")
+        self.assertEqual(len(bells()), 1, "the user hears the recipient's episode once")
+        self.assertIn(_RCP, bells()[0])
+        self.assertIn("retries", bells()[0])
+        collide(second, other)
+        self.assertEqual(len(bells()), 2, "another recipient's refusal is its own episode")
+        self.assertIn(other, bells()[1])
+        collide(first, _RCP)
+        self.assertEqual(len(bells()), 2, "the first recipient's episode is still open: no new bell")
+        pm.deliver(_RCP, "web", _SND, "this one lands")               # re-arms that recipient's episode
+        collide(first, _RCP)
+        self.assertEqual(len(bells()), 3, "a refusal after a publish that landed is a new episode")
+        self.assertEqual(len([m for m in self.logged if "refused, nothing recorded" in m]), 5)
+        self.assertEqual(sorted(m["body"] for m in pm.read_box(_RCP, consume=False)),
+                         ["the standing message", "this one lands"], "no impostor ever replaced the standing mail")
+
+    def test_read_box_tolerates_a_file_the_take_back_removed_under_it(self):
+        # the take-back is a deleter of new/ files on the live path (recall and the orphan sweep
+        # already were): a reader that listed and read a file the instant before it vanished used to
+        # raise out of the whole read at the rename into cur/, so /inbox and /drain answered nothing
+        # for the rest of the box. The vanished message is nobody's to hand over (its sender was
+        # refused and retries; a recalled one was unsent; a second reader has it), so it is dropped
+        # from the listing with no exec row, and the rest of the box is served.
+        kept = pm.deliver(_RCP, "web", _SND, "the one that stays")
+        gone = pm.deliver(_RCP, "web", _SND, "the one taken back")
+        newd = pm.MAILROOT / _RCP / "new"
+        from pathlib import Path
+        orig = Path.read_text
+
+        def read_then_vanish(self_, *a, **k):
+            text = orig(self_, *a, **k)
+            if self_.name == gone and self_.parent.name == "new":
+                os.unlink(self_)                                  # the take-back races in after the read
+            return text
+
+        Path.read_text = read_then_vanish
+        try:
+            got = pm.read_box(_RCP, consume=True)
+        finally:
+            Path.read_text = orig
+        self.assertEqual([m["id"] for m in got], [kept], "the vanished message is not handed over; the rest is")
+        curd = pm.MAILROOT / _RCP / "cur"
+        self.assertEqual(sorted(p.name for p in curd.iterdir()), [kept])
+        self.assertEqual(sorted(p.name for p in newd.iterdir()), [])
+        rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines() if l]
+        self.assertEqual([r["id"] for r in rows if r["ev"] == "exec"], [kept], "no exec row for a message nobody got")
+        self.assertFalse((pm.MAILPENDING / _RCP).exists(), "the box is empty: the marker is dropped")
 
     def test_bounce_apply_writes_the_terminal_row_and_the_note_before_the_delete(self):
         pm.outbox_put("srv", {"mid": "b1", "to": "beta", "frm": "alpha", "frm_id": _SND,
@@ -1093,6 +1215,7 @@ class _LoudBus(unittest.TestCase):
         pm._DASHBOARD_MISSED[0] = False
         pm._NOTE_FAILED_SAID.clear()
         pm._UNREADABLE_SAID.clear()
+        pm._REFUSAL_SAID.clear()
         pm._peer_pending.clear()
 
     def tearDown(self):
@@ -1100,6 +1223,7 @@ class _LoudBus(unittest.TestCase):
         pm._TL_FAULT[0] = False
         pm._DASHBOARD_MISSED[0] = False
         pm._NOTE_FAILED_SAID.clear()
+        pm._REFUSAL_SAID.clear()
         pm._peer_pending.clear()
         os.environ.pop("ROMP_POSTAL_PEERS", None)
 
@@ -1233,10 +1357,172 @@ class StoreFaultsAreLoud(_LoudBus):
 
 
 class BusStartSweepsUnfinishedWrites(_LoudBus):
-    """A crash between the sent row and the publish (or the park) left a phantom: a row that says
-    "sent" and a temp nothing listed, nothing removed, nothing reported (review find, 2026-09-08).
-    At bus start every temp is a write that never finished: removed, its ledger closed once when a
-    sent row stands open, said once per file and once as a bell row. Sidecars are evidence and stay."""
+    """Bus start is the one moment no writer of ours runs, so the sweep reconciles what a crash left
+    (review find, 2026-09-08): a temp is removed, and its id is closed as refused only when a sent
+    row stands with the message nowhere (a phantom whichever order wrote it); a temp beside a message
+    that stands in new/ or cur/ is the leftover of a publish that landed (deliver tolerates a temp
+    it cannot remove), so the ledger is left alone; a message in new/ with no sent row is the crash
+    window between the publish and the row, and gets its row now; each is said once per file and
+    once as a bell row. Sidecars are evidence and stay."""
+
+    def _rows_for(self, mid):
+        return [r["ev"] for r in self._rows() if r.get("id") == mid]
+
+    def test_a_temp_beside_a_standing_message_is_removed_and_its_ledger_left_alone(self):
+        # the planted state: two delivered messages (one read, one not) whose publish could not remove
+        # its temp, the only way this writer leaves a temp beside a sent row. Before the fix the sweep
+        # closed both as refused: a message the recipient had READ read refused to its sender and
+        # dropped out of the kernel's ask maps after every bus restart.
+        mb = pm._mailbox(_RCP)
+        for mid in ("m-read", "m-unread"):
+            pm._tl_append("messages.jsonl", {"t": 10, "ev": "sent", "id": mid, "from": "alpha", "from_id": _SND,
+                                             "to_id": _RCP, "body": "hi", "kind": "question"})
+            (mb / "tmp" / mid).write_text("From: alpha\n\nhi\n")
+        pm._tl_append("messages.jsonl", {"t": 11, "ev": "exec", "id": "m-read"})
+        (mb / "cur" / "m-read").write_text("From: alpha\n\nhi\n")
+        (mb / "new" / "m-unread").write_text("From: alpha\n\nhi\n")
+        pm._sweep_unfinished_writes()
+        self.assertEqual([p.name for p in (mb / "tmp").iterdir()], [], "the temps are gone")
+        self.assertTrue((mb / "cur" / "m-read").is_file() and (mb / "new" / "m-unread").is_file(), "the mail stands")
+        self.assertEqual(self._rows_for("m-read"), ["sent", "exec"], "a read message stays read: no bounced row")
+        self.assertEqual(self._rows_for("m-unread"), ["sent"], "an unread message stays pending: no bounced row")
+        recs = {r["id"]: r for r in pm._sent_receipts(_SND)}
+        self.assertEqual([recs["m-read"]["bounced"], recs["m-unread"]["bounced"]], [None, None])
+        self.assertIn("read", pm.format_receipts([recs["m-read"]]))
+        self.assertIn("pending", pm.format_receipts([recs["m-unread"]]))
+        said = [m for m in self.logged if "removed at start" in m]
+        self.assertEqual(len(said), 2, "one line per temp")
+        self.assertTrue(all("reached the inbox" in m for m in said), "…each saying the message itself stands")
+        self.assertEqual(len(self._notices()), 1)
+        self.assertIn("2 unfinished mail write(s)", self._notices()[0])
+        self.assertIn("0 sender receipt(s) now read refused", self._notices()[0])
+        self.assertIn("2 of them the temp of a message that had reached the inbox", self._notices()[0])
+        self.assertEqual([m["id"] for m in pm.read_box(_RCP, consume=False)], ["m-unread"], "still delivered")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "chmod cannot refuse root the unlink")
+    def test_a_temp_the_publish_could_not_remove_is_read_as_a_finished_publish(self):
+        # the real path, no mock on unlink: tmp/ is made read-only the instant link() has placed the
+        # message in new/, so _publish_new's tmp.unlink() meets a real EACCES and tolerates it (the
+        # message is out), the sent row lands, the recipient reads it, and the bus restarts.
+        import errno
+        tmpd = pm._mailbox(_RCP) / "tmp"
+        saved_link = os.link
+
+        def link_then_lock(src, dst, *a, **k):
+            saved_link(src, dst, *a, **k)
+            os.chmod(tmpd, 0o555)
+
+        os.link = link_then_lock
+        try:
+            mid = pm.deliver(_RCP, "web", _SND, "please review the schema", kind="question")
+        finally:
+            os.link = saved_link
+            os.chmod(tmpd, 0o755)
+        self.assertEqual([p.name for p in tmpd.iterdir()], [mid], "the temp lingered (its unlink was refused)")
+        lingered = [m for m in self.logged if "its temp could not be removed" in m]
+        self.assertEqual(len(lingered), 1)
+        self.assertIn(os.strerror(errno.EACCES), lingered[0])
+        self.assertEqual([m["id"] for m in pm.read_box(_RCP, consume=True)], [mid], "the recipient reads it")
+        pm._sweep_unfinished_writes()
+        self.assertEqual([p.name for p in tmpd.iterdir()], [], "the temp is gone")
+        self.assertTrue((pm.MAILROOT / _RCP / "cur" / mid).is_file(), "the read message stands in cur/")
+        self.assertEqual(self._rows_for(mid), ["sent", "exec"], "a finished publish is not closed as refused")
+        rec = pm._sent_receipts(_SND)[0]
+        self.assertEqual((rec["id"], rec["bounced"]), (mid, None))
+        self.assertTrue(rec["exec"], "the sender's receipt still reads read")
+        self.assertEqual(len(self._notices()), 1)
+        self.assertIn("0 sender receipt(s) now read refused", self._notices()[0])
+
+    def test_mail_in_new_with_no_sent_row_gets_its_row_at_start(self):
+        # the crash window between the publish and the row: the message stands in new/ (it WILL be
+        # delivered by the next read) and the ledger has never heard of it. The state is made by the
+        # writer itself with the row's append swallowed: a local question, a parked handoff and a
+        # relayed message, so every header deliver writes is recovered into the row.
+        saved = pm._tl_append
+        pm._tl_append = lambda f, o: True                         # the row "lands" nowhere: the crash window
+        try:
+            q = pm.deliver(_RCP, "web", _SND, "please review the schema", kind="question")
+            h = pm.deliver(_RCP, "web", _SND, "take over the api tests", park=True, kind="delegate")
+            r = pm.deliver(_RCP, "api", "33333333-4444-5555-6666-777777777777", "from afar", kind="coordinate",
+                           from_host="TESTHOST", relay_mid="px-far-1", relay_via="TESTHOST")
+        finally:
+            pm._tl_append = saved
+        ok = pm.deliver(_RCP, "web", _SND, "this one has its row")
+        self.assertEqual(self._rows_for(q) + self._rows_for(h) + self._rows_for(r), [], "the ledger knows none of the three")
+        pm._sweep_unfinished_writes()
+        rows = {r_["id"]: r_ for r_ in self._rows() if r_["ev"] == "sent"}
+        self.assertEqual(sorted(rows), sorted([q, h, r, ok]), "every message in new/ now has exactly one sent row")
+        self.assertEqual(len([r_ for r_ in self._rows() if r_["ev"] == "sent" and r_["id"] == ok]), 1,
+                         "a message with its row is not rowed again")
+        got = rows[q]
+        self.assertEqual((got["from"], got["from_id"], got["to_id"], got["body"], got["kind"], got["from_host"]),
+                         ("web", _SND, _RCP, "please review the schema", "question", ""))
+        self.assertTrue(got["recovered"], "the row says it was written at start, not by the send")
+        self.assertTrue(abs(got["t"] - int(time.time())) < 120, "t comes from the message's Date header")
+        self.assertTrue(rows[h]["park"] and rows[h]["kind"] == "delegate")
+        self.assertNotIn("park", rows[q])
+        self.assertEqual((rows[r]["from"], rows[r]["from_host"], rows[r]["originMid"], rows[r]["kind"]),
+                         ("api", "TESTHOST", "px-far-1", "coordinate"))
+        self.assertTrue(pm.peer_seen_check("px-far-1"),
+                        "the relayed one's origin mid is marked seen: the dialer's re-relay is acked as a duplicate")
+        self.assertNotIn("originMid", rows[q], "a local message has no origin mid")
+        recs = {r_["id"]: r_ for r_ in pm._sent_receipts(_SND)}
+        self.assertEqual(sorted(recs), sorted([q, h, ok]), "the sender's receipts now list them")
+        self.assertIn("pending", pm.format_receipts([recs[q]]))
+        self.assertEqual(len([m for m in self.logged if "no record" in m and "row written at start" in m]), 3,
+                         "one stderr line per recovered message")
+        self.assertEqual(len(self._notices()), 1, "one bell row for the sweep")
+        self.assertIn("3 delivered message(s)", self._notices()[0])
+        self.assertEqual(len(pm.read_box(_RCP, consume=False)), 4, "all four still stand for delivery")
+        pm._sweep_unfinished_writes()
+        self.assertEqual((len(self._rows()), len(self._notices())), (4, 1), "the next start finds nothing to do")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads through chmod 0")
+    def test_mail_in_new_with_no_sent_row_that_cannot_be_read_is_moved_aside(self):
+        # the unreadable branch: the file's fields cannot be recovered, so it goes the way read_box
+        # sends an unreadable inbox file (aside, once, with a terminal row and a bell row), and it
+        # counts as nothing recovered.
+        mb = pm._mailbox(_RCP)
+        bad = mb / "new" / "m-bad"
+        bad.write_text("From: alpha\n\nhi\n")
+        os.chmod(bad, 0o000)
+        good = pm.deliver(_RCP, "web", _SND, "fine")
+        pm._sweep_unfinished_writes()
+        self.assertEqual([p.name for p in (mb / "new").iterdir()], [good], "the unreadable file is out of new/")
+        aside = [p.name for p in mb.iterdir() if p.name.startswith("m-bad.corrupt-")]
+        self.assertEqual(len(aside), 1, "…moved aside beside new/, never deleted")
+        os.chmod(mb / aside[0], 0o644)
+        self.assertEqual(self._rows_for("m-bad"), ["bounced"])
+        self.assertEqual(self._rows_for(good), ["sent"])
+        self.assertEqual(len(self._notices()), 1, "the move-aside's bell row, and no recovery row to report")
+        self.assertIn("could not be read", self._notices()[0])
+        self.assertNotIn("delivered message(s)", self._notices()[0])
+
+    def test_a_row_that_cannot_be_written_at_start_leaves_the_mail_and_says_so(self):
+        # the log is faulted at start too: the message stays in new/ (it is still delivered), nothing
+        # claims a row was written, and the next start with a working log writes it.
+        saved = pm._tl_append
+        pm._tl_append = lambda f, o: True
+        try:
+            q = pm.deliver(_RCP, "web", _SND, "please review the schema", kind="question")
+        finally:
+            pm._tl_append = saved
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(lambda: os.unlink(path))
+        good_tl = pm.TLDIR
+        pm.TLDIR = type(pm.TLDIR)(path) / "timeline"                 # mkdir raises: the real _tl_append fails
+        try:
+            pm._sweep_unfinished_writes()
+        finally:
+            pm.TLDIR = good_tl
+        self.assertEqual(self._rows_for(q), [], "no row landed")
+        self.assertTrue((pm.MAILROOT / _RCP / "new" / q).is_file(), "the mail stands")
+        self.assertEqual(len([m for m in self.logged if q in m and "could not be written" in m]), 1)
+        self.assertEqual(self._notices(), [], "nothing claims a row was written")
+        pm._sweep_unfinished_writes()
+        self.assertEqual(self._rows_for(q), ["sent"], "the next start with a working log writes it")
+        self.assertEqual(len(self._notices()), 1)
 
     def test_temps_are_removed_ledgers_closed_and_said_once_and_sidecars_kept(self):
         for mid, to in (("m-tmp", _RCP), ("m-done", _RCP), ("px-tmp", "peer:srv")):

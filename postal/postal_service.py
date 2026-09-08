@@ -629,10 +629,13 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
     # the publish is the one act that proves the name is ours; a refused publish therefore records
     # nothing (the retry lands under a fresh name with its own row). The sender-side rule "row
     # before park" is not contradicted: that row is the sender's receipt under the sender's OWN mid;
-    # this one is the recipient's record of a message that landed. What keeps new/ honest — before
-    # 2026-09-08 a best-effort append after the publish left mail in the inbox that nothing else
-    # knew about — is the take-back below: a row that cannot land pulls the mail back out before
-    # it is read, and the caller answers a retryable refusal while the sender still holds the text.
+    # this one is the recipient's record of a message that landed. What keeps new/ honest while the
+    # bus runs (before 2026-09-08 a best-effort append after the publish left mail in the inbox that
+    # nothing else knew about) is the take-back below: a row that cannot land pulls the mail back out
+    # before it is read, and the caller answers a retryable refusal while the sender still holds the
+    # text. The one gap the take-back cannot reach is a bus killed between the publish and the row:
+    # that message stands in new/ with no record until _sweep_unfinished_writes rebuilds its row from
+    # the file's headers at the next start (review find, 2026-09-08).
     dst = mb / "new" / name
     try:
         _publish_new(tmp, dst)
@@ -644,28 +647,43 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
         # A collision — a standing new/<name> — is the one case named apart: impossible in practice
         # with 128-bit ids, so if it ever shows up it is evidence of something badly wrong, not a
         # tiebreak. Either way the name was never this message's, so nothing is written under it.
+        # No row says this, so the log says it on every refusal, and the USER hears it once per
+        # recipient episode as a bell row (review find, 2026-09-08: a refusal on the relay leg has
+        # the dialer re-relay the message every exchange while the sender's receipt reads queued, so
+        # a fault that lasted had no surface anyone watched); the next publish to that recipient
+        # that lands re-arms it.
         why = ("a message with this id already stands in the recipient's inbox; refusing to replace it"
                if isinstance(e, FileExistsError) else str(e))
-        _log("deliver to %s: %s was not published (%s) — refused, nothing recorded" % (to_id, name, why))
+        text = "deliver to %s: %s was not published (%s): refused, nothing recorded" % (to_id, name, why)
+        site = "deliver:%s" % to_id
+        if _REFUSAL_SAID.get(site):
+            _log(text)
+        else:
+            _REFUSAL_SAID[site] = True
+            _refused_notice(text + "; the sender holds the text and retries until the inbox can be written")
         raise DeliveryNotRecorded("the message could not be placed in the recipient's inbox (%s) — "
                                   "nothing was delivered; retry" % why)
+    _refusal_over("deliver:%s" % to_id)          # a publish landed: the next refusal here is a new episode
     if not _tl_append("messages.jsonl", ev):
         # The mail is out but its row is not: take it back, so nothing stands in new/ that the
-        # ledger does not know, and refuse — the sender still holds the text. The one interleaving
-        # the take-back cannot undo is a reader claiming the file in the instant between the publish
-        # and the row (read_box renames it into cur/): the message IS in the recipient's hands then,
-        # so the truthful answer is the id — said loudly, by name, because the ledger will never
-        # carry this message (the log fault itself was already said by _tl_append).
+        # ledger does not know, and refuse: the sender still holds the text. Two outcomes the
+        # take-back cannot undo leave a DELIVERED message the ledger will never carry, and each
+        # answers the id, because the message is in (or on its way to) the recipient's hands: a
+        # reader claimed the file in the instant between the publish and the row (read_box renamed
+        # it into cur/), or the unlink itself was refused (the file stands in new/ and the next read
+        # gets it; the start sweep rebuilds that one's row if the bus restarts first). Both are said
+        # by name on stderr AND as a bell row, since no row will ever say it (the log fault itself
+        # was already said by _tl_append).
         try:
             dst.unlink()
         except FileNotFoundError:
-            _log("deliver to %s: %s was read before its row could be written — delivered, and the "
-                 "ledger has no record of it" % (to_id, name))
+            _refused_notice("deliver to %s: %s was read before its row could be written; delivered, and "
+                            "the ledger has no record of it" % (to_id, name))
             _mark_pending(to_id)
             return name
         except OSError as e:
-            _log("deliver to %s: %s stands in the inbox without its row and could not be taken back "
-                 "(%s) — the ledger has no record of it" % (to_id, name, e))
+            _refused_notice("deliver to %s: %s stands in the inbox without its row and could not be taken "
+                            "back (%s); delivered, and the ledger has no record of it" % (to_id, name, e))
             _mark_pending(to_id)
             return name
         _mark_pending(to_id)        # new/ may be empty again -> reconcile the marker
@@ -754,16 +772,23 @@ def read_box(sid, consume):
         for line in head.splitlines():
             k, _, v = line.partition(": ")
             meta[k.lower()] = v
-        out.append({"from": meta.get("from", "?"), "from_id": meta.get("from-id", ""),
-                    "date": meta.get("date", ""), "body": body.rstrip("\n"), "id": f.name,
-                    "park": bool(meta.get("x-park")), "kind": meta.get("x-kind", ""),
-                    "from_host": meta.get("x-from-host", "")})
         if consume:
-            f.rename(mb / "cur" / f.name)
+            try:
+                f.rename(mb / "cur" / f.name)
+            except FileNotFoundError:
+                # gone between the read and the claim: recalled, taken back by a deliver() whose row
+                # could not land, or claimed by a second reader (2026-09-08). Nobody's to hand over,
+                # so no exec row and no entry; the rest of the box is served (an unguarded rename
+                # here raised out of the whole read, and /inbox and /drain answered nothing).
+                continue
             _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "exec", "id": f.name})
             _queue_read_receipt(meta, dmid=f.name)   # cross-host mail: the sender's host learns it was read
             #   dmid = THIS host's delivery mid — the id the recipient's transcript markers carry, so the
             #   sender's timeline can join the connector to the true process turn (the user 2026-08-06)
+        out.append({"from": meta.get("from", "?"), "from_id": meta.get("from-id", ""),
+                    "date": meta.get("date", ""), "body": body.rstrip("\n"), "id": f.name,
+                    "park": bool(meta.get("x-park")), "kind": meta.get("x-kind", ""),
+                    "from_host": meta.get("x-from-host", "")})
     if consume:
         _mark_pending(sid)         # cleared the box -> drop the marker (no-op if more arrived)
     return out
@@ -2491,19 +2516,94 @@ def _reconcile_markers():
 WHY_STOPPED_BEFORE_PUBLISH = WHY_NOT_PUBLISHED + "the mail service stopped before the message reached the inbox"
 WHY_STOPPED_BEFORE_PARK = "not parked: the mail service stopped before the outbox record was written"
 
+def _rebuild_rows_for_rowless_mail(box, sent, ended):
+    """The start sweep's pass over <box>/new/ (see _sweep_unfinished_writes): every file whose id the
+    ledger has never heard of gets its sent row now, rebuilt from the headers deliver() wrote (From,
+    From-Id, Date, X-Park, X-Kind, X-From-Host, X-Peer-Mid) and the body after the blank line, and
+    marked `recovered`. The file is never removed and never bounced. Returns how many rows landed."""
+    newd = box / "new"
+    try:
+        files = sorted((f for f in newd.iterdir() if f.is_file()), key=lambda p: p.name) if newd.is_dir() else []
+    except OSError:
+        return 0
+    n = 0
+    for f in files:
+        if f.name in sent or f.name in ended:
+            continue
+        try:
+            text = f.read_text(errors="replace")
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            _mail_unreadable(f, box.name, e)         # its fields cannot be recovered: aside, said, closed
+            continue
+        head, _, body = text.partition("\n\n")
+        meta = {}
+        for ln in head.splitlines():
+            k, _, v = ln.partition(": ")
+            meta[k.lower()] = v
+        try:
+            t = int(datetime.strptime(meta.get("date", ""), "%Y-%m-%dT%H:%M:%S%z").timestamp())
+        except (ValueError, TypeError, OverflowError):
+            try:
+                t = int(f.stat().st_mtime)
+            except OSError:
+                t = int(time.time())
+        row = {"t": t, "ev": "sent", "id": f.name, "from": meta.get("from", "?"),
+               "from_id": meta.get("from-id", ""), "to_id": box.name,
+               "body": body[:-1] if body.endswith("\n") else body,   # deliver() adds exactly one newline
+               "recovered": True}                                    # written at start, not by the send
+        if meta.get("x-park"):
+            row["park"] = True
+        if meta.get("x-kind"):
+            row["kind"] = meta["x-kind"]
+        row["from_host"] = meta.get("x-from-host", "")
+        if meta.get("x-peer-mid"):
+            row["originMid"] = meta["x-peer-mid"]
+        if not _tl_append("messages.jsonl", row):
+            _log("mail %s for %s stands in the inbox with no record of it and its row could not be "
+                 "written at start; it stays for the next start" % (f.name, box.name))
+            continue
+        sent.add(f.name)
+        n += 1
+        if row.get("originMid"):
+            peer_seen_add(row["originMid"])         # the dialer's re-relay of the unacked mid: a duplicate
+        _log("mail %s for %s stood in the inbox with no record of it (the restart cut the delivery "
+             "between the publish and the row); sent row written at start from its headers (a tracked "
+             "flag or a user-ask record lived only on the row and cannot be recovered)" % (f.name, box.name))
+    return n
+
 def _sweep_unfinished_writes():
-    """Bus start: the one event at which no writer of ours is running, so every temp on disk is a
-    write that never finished (review find, 2026-09-08). A maildir temp is a message that stopped
-    before its publish; deliver() publishes first and writes its row second (the collision fold),
-    so such a temp normally has no row and is simply removed — a row saying "sent" beside one (a
-    bus that wrote row-first) is closed the same way, so no receipt reads pending forever for a
-    message nothing lists. The relay leg (row, then outbox_put) has that window still, leaving a
-    `<mid>.json.tmp-*` temp and no record;
-    _atomic_json_put's own failure path removes its temp, so only a crash leaves one. Each temp is
-    removed (never published: it may be half-written), its id's ledger is closed with a terminal
-    `bounced` row when a sent row stands with no terminal row yet, each is said on stderr, and one
-    bell row reports the sweep. A readbox temp is removed and said; a receipt is not a message. The
-    `.corrupt-*` sidecars are evidence and are never touched."""
+    """Bus start: the one event at which no writer of ours is running, so what a crash left on disk
+    is reconciled with the ledger (review find, 2026-09-08). Three passes.
+
+    A maildir temp is a message that stopped before its publish, or the leftover of one that landed.
+    deliver() publishes first (link, then the temp's unlink) and writes its row second, so a temp
+    with no row is a message that never reached the inbox and is simply removed. A temp beside a
+    message that STANDS in new/ or cur/ is a publish that landed whose temp could not be removed
+    (_publish_new tolerates that unlink's failure): the temp goes and the ledger is left alone. The
+    first cut closed such an id as refused, so a message the recipient had already read read refused
+    to its sender after every restart. A temp beside a sent row with the message nowhere (a bus that
+    wrote row-first) is closed with a terminal `bounced` row, so no receipt reads pending forever for
+    a message nothing lists.
+
+    A message in new/ with NO sent row is the residual of the publish-first order: a bus killed
+    between the publish and the row, or a take-back whose unlink was refused. The mail is legitimate
+    and the next read delivers it, so it is never removed and never bounced (a bounced row with no
+    sent row is invisible to the sender's receipts): its sent row is rebuilt from the file's headers
+    (_rebuild_rows_for_rowless_mail), marked `recovered`, so the sender's receipt, the timeline and
+    the courier see it. A tracked flag or a user-ask record lived only on the row and cannot be
+    recovered. A relayed message's origin mid is marked seen, so the dialer's re-relay of the unacked
+    mid is acked as a duplicate instead of delivered twice. A file that cannot be read goes aside the
+    way read_box sends one (_mail_unreadable). A row that cannot be written now leaves the file for
+    the next start.
+
+    The relay leg (row, then outbox_put) has its window still, leaving a `<mid>.json.tmp-*` temp and
+    no record; _atomic_json_put's own failure path removes its temp, so only a crash leaves one. Each
+    temp is removed (never published: it may be half-written), its id's ledger is closed when a sent
+    row stands with no terminal row yet, each is said on stderr, and one bell row reports the sweep.
+    A readbox temp is removed and said; a receipt is not a message. The `.corrupt-*` sidecars are
+    evidence and are never touched."""
     sent, ended = set(), set()
     try:
         for line in (TLDIR / "messages.jsonl").read_text(errors="replace").splitlines():
@@ -2528,7 +2628,7 @@ def _sweep_unfinished_writes():
                 return True
         return False
 
-    removed, closed = 0, 0
+    removed, closed, standing, recovered = 0, 0, 0, 0
     try:
         boxes = [b for b in MAILROOT.iterdir() if b.is_dir()] if MAILROOT.is_dir() else []
     except OSError:
@@ -2538,19 +2638,26 @@ def _sweep_unfinished_writes():
         try:
             temps = [f for f in tmpd.iterdir() if f.is_file()] if tmpd.is_dir() else []
         except OSError:
-            continue
+            temps = []
         for f in temps:
+            published = (box / "new" / f.name).exists() or (box / "cur" / f.name).exists()
             try:
                 f.unlink()
             except OSError as e:
                 _log("unfinished mail %s for %s could not be removed (%s)" % (f.name, box.name, e))
                 continue
             removed += 1
+            if published:
+                standing += 1
+                _log("unfinished mail %s for %s removed at start; the message itself had reached the inbox "
+                     "(a temp its publish could not remove), its ledger left alone" % (f.name, box.name))
+                continue
             done = _close(f.name, {"to_id": box.name, "why": WHY_STOPPED_BEFORE_PUBLISH})
             closed += done
             _log("unfinished mail %s for %s removed at start%s"
                  % (f.name, box.name, "; its sent row stood with no message published, now closed as refused"
                     if done else ""))
+        recovered += _rebuild_rows_for_rowless_mail(box, sent, ended)
     for store, why in ((OUTBOX, WHY_STOPPED_BEFORE_PARK), (READBOX, None)):
         try:
             hostdirs = [h for h in store.iterdir() if h.is_dir()] if store.is_dir() else []
@@ -2572,9 +2679,18 @@ def _sweep_unfinished_writes():
                 if why:
                     closed += _close(mid, {"host": hostdir.name, "why": why})
                 _log("unfinished %s record %s for %s removed at start" % (store.name, f.name, hostdir.name))
+    parts = []
     if removed:
-        _refused_notice("mail service start: %d unfinished mail write(s) from before the restart removed; "
-                        "%d sender receipt(s) now read refused (the log names each)" % (removed, closed))
+        parts.append("%d unfinished mail write(s) from before the restart removed; %d sender receipt(s) now "
+                     "read refused" % (removed, closed))
+        if standing:
+            parts.append("%d of them the temp of a message that had reached the inbox, its ledger left alone"
+                         % standing)
+    if recovered:
+        parts.append("%d delivered message(s) stood in an inbox with no sent row (the restart cut the delivery "
+                     "after the publish); each has its row now" % recovered)
+    if parts:
+        _refused_notice("mail service start: %s (the log names each)" % "; ".join(parts))
 
 def serve():
     STATE.mkdir(parents=True, exist_ok=True)
