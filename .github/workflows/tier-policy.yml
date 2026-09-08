@@ -32,8 +32,10 @@ name: Tier policy
 #   job still checks out only the BASE branch and executes nothing from the PR head. A label added with
 #   GITHUB_TOKEN fires no `labeled` run (events the token causes create none, save dispatches), so the
 #   fetcher re-runs the "Exactly one tier label" run on that head through the Actions API instead.
-# - Nothing in the policy is timed: the fetcher reads no check-run history, no timeline and no commit
-#   date, so there is no clock for a forged date, a reopen or a sibling PR's head to feed.
+# - Nothing in the policy is timed: for the verdict the fetcher reads no check-run history, no issue
+#   timeline for dates and no commit date, so there is no clock for a forged date, a reopen or a sibling
+#   PR's head to feed. Beyond the verdict it writes the body's declared tier as a label and lists and
+#   re-runs the label counter's workflow run on the head; neither reaches the record the policy grades.
 # - The job below is named "Tier policy evaluation", NOT "Tier policy": the required check is the
 #   API-posted verdict alone. Were the job named the same, every head would carry two same-named runs
 #   (the job's, frozen at push time, and the verdict the hourly sweep moves) and which one the ruleset

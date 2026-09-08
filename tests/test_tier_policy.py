@@ -681,6 +681,16 @@ class WorkflowPins(unittest.TestCase):
         for t in tp.TIERS:
             self.assertIn("`%s`" % t, tmpl, "the PR template lists every tier")
 
+    def test_the_standing_sentences_admit_the_label_write(self):
+        # the trust-model sentences that said the fetcher "only fetches PR data and posts the verdict" and
+        # "reads no check-run history" now name the label write and the counter re-run (the manager's review)
+        doc = open(os.path.join(os.path.dirname(HERE), "docs", "pr-tiers.md")).read()
+        self.assertNotIn("only fetches PR data and posts the verdict", doc)
+        for text, name in ((doc, "docs"), (self.wf, "workflow"), (self.fetch, "fetcher")):
+            self.assertIn("label", text, name)
+            self.assertNotRegex(text, r"reads no check-run history, no timeline and no commit date, so there is no clock",
+                                name + " still carries the pre-T273 sentence")
+
     def test_the_docs_describe_the_body_line(self):
         # docs/pr-tiers.md has the section; the repo CLAUDE.md's tier bullet names the line in a sentence
         doc = open(os.path.join(os.path.dirname(HERE), "docs", "pr-tiers.md")).read()
@@ -885,6 +895,28 @@ class FetcherShapes(unittest.TestCase):
         self.assertEqual(v["conclusion"], "success")
         self.assertIn("could not be re-run", v["summary"])
         self.assertIn("403", v["summary"])
+
+    def test_a_non_http_failure_of_the_refresh_is_said_too(self):
+        # a URLError (DNS, the 30 s timeout), a reset connection or a bad JSON body on the re-run path must
+        # not surface as "evaluation failed" on a PR whose label just landed (the manager's review)
+        for exc in (urllib.error.URLError("dns"), TimeoutError("30 s"), ConnectionResetError(), ValueError("bad json")):
+            real = self.tc._req
+
+            def failing(method, path, token, body=None, exc=exc):
+                if "/actions/" in path:
+                    raise exc
+                return real(method, path, token, body)
+            self.tc._req = failing
+            self.labels = []
+            self.body = "Tier: fix"
+            self.posted = []
+            self.served = set()
+            v = self.tc.run_one("romp-on/romp", 42, "tok")
+            self.tc._req = real
+            self.assertEqual(self._labels_posted(), [{"labels": ["fix"]}], repr(exc))
+            self.assertEqual(v["conclusion"], "success", repr(exc))
+            self.assertIn("could not be re-run", v["summary"], repr(exc))
+            self.assertIn(type(exc).__name__, v["summary"], repr(exc))
 
     def test_a_red_counter_beside_one_correct_label_is_rerun_on_any_later_pass(self):
         # the in-progress race (the counter read the labels a second before the write) and a refused
@@ -1114,6 +1146,27 @@ class DeclaredTier(unittest.TestCase):
     def test_trailing_punctuation_and_crlf_are_tolerated(self):
         for body in ("Tier: fix.", "Tier: fix,\r\n", "Tier: `fix`.\r\nmore\r\n"):
             self.assertEqual(tp.declared_tier(body)[0], "fix", repr(body))
+
+    def test_crlf_bodies_keep_the_declaration_behind_a_fenced_block(self):
+        # GitHub's web editor writes CRLF; a fence's closing line then ends in \r, which a `$`-anchored
+        # close could not match, so the fence read as unclosed and swallowed the declaration (the
+        # manager's review, 2026-09-08). Line endings are normalised before any pattern runs
+        self.assertEqual(tp.declared_tier("Summary\r\n\r\n```\r\ncode\r\n```\r\n\r\nTier: fix\r\n"), ("fix", ""))
+        self.assertEqual(tp.declared_tier("<!-- note\r\n-->\r\nTier: docs\r\n"), ("docs", ""))
+        self.assertEqual(tp.declared_tier("```\rcode\r```\rTier: feature\r"), ("feature", ""), "bare CR too")
+
+    def test_the_odd_excerpt_cannot_render_as_markdown_in_the_check_summary(self):
+        # the summary is rendered as Markdown in the Checks tab under the gate's own identity: a link, a
+        # tracking image or text that reads like an approval must come back as literal text (a code span,
+        # with any backtick of its own removed so the span cannot be broken out of)
+        for raw in ("<img src=https://x.example/p.png>", "[fix](https://x.example) approved", "fix` **APPROVED** `"):
+            tier, why = tp.declared_tier("Tier: " + raw)
+            self.assertIsNone(tier)
+            shown = raw.replace("`", "").strip()          # the excerpt drops the value's own backticks, then trims
+            self.assertIn("`%s`" % shown, why, why)
+            self.assertNotRegex(why, r"(?<!`)\[fix\]\(", "no bare link")
+            self.assertNotRegex(why, r"(?<!`)<img", "no bare tag")
+        self.assertIn("`(empty)`", tp.declared_tier("Tier:")[1])
 
     def test_the_odd_value_echoed_back_is_bounded(self):
         tier, why = tp.declared_tier("Tier: " + "x" * 65000)

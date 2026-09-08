@@ -90,6 +90,16 @@ _TIER_LINE = re.compile(r"^ {0,3}(?:[-*]\s+)?[*_`]*tier[*_`]*\s*:[*_`]*\s*(.*?)\
 _ODD_MAX, _ODD_LEN = 3, 40    # the check summary quotes a bounded excerpt of a line that names no tier
 
 
+def _excerpt(raw):
+    """A line's value quoted back into the check summary, which the Checks tab renders as Markdown under
+    the gate's own identity: a code span, with the value's own backticks removed so it cannot break out of
+    the span, so a link, an image tag or text that reads like an approval comes back as literal text."""
+    shown = (raw or "").replace("`", "").strip() or "(empty)"
+    if len(shown) > _ODD_LEN:
+        shown = shown[:_ODD_LEN] + "…"
+    return "`%s`" % shown
+
+
 def declared_tier(body):
     """The tier the PR body declares on a `Tier: <tier>` line, as (tier, why): (tier, "") when exactly one
     tier is named (the same tier on two lines still agrees; the tests-only alias reads as docs); (None, "")
@@ -98,7 +108,10 @@ def declared_tier(body):
     untouched placeholder, a typo, an empty line) is quoted back. Pure over the body text; HTML comments are
     not read."""
     found, odd = [], []
-    text = _CODE_FENCE.sub("", _HTML_COMMENT.sub("", body or ""))
+    # line endings first: GitHub's web editor writes CRLF, and a fence's closing line ending in \r would
+    # miss a `$`-anchored close, reading as unclosed and swallowing the declaration (the manager's review)
+    text = (body or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = _CODE_FENCE.sub("", _HTML_COMMENT.sub("", text))
     for line in text.splitlines():
         m = _TIER_LINE.match(line)
         if not m:
@@ -109,7 +122,7 @@ def declared_tier(body):
         if tier in TIERS:
             found.append(tier)
         elif len(odd) < _ODD_MAX:
-            odd.append((raw[:_ODD_LEN] + "…") if len(raw) > _ODD_LEN else (raw or "(empty)"))
+            odd.append(_excerpt(raw))
     distinct = list(dict.fromkeys(found))
     if len(distinct) > 1:
         return None, "the body's tier lines disagree (%s): one line, one tier" % ", ".join(distinct)

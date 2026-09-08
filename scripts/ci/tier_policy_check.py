@@ -9,8 +9,10 @@ a PR cannot rewrite its own gate; the token holds checks:write (to post the verd
 that head), issues:read, contents:read and nothing else. The PR body is DATA read through the API, never
 executed. Nothing in the policy is timed (the owner's rules of
 2026-09-08: the gate depends on the tier and on the author's role, and no tier has a time-based path), so
-this fetcher reads no check-run history, no timeline and no commit date; the record it builds carries no
-time field at all. The collaborator permission is fetched for the AUTHOR as well as for every reviewer: the
+this fetcher reads nothing for the VERDICT that could time it: no check-run history, no issue timeline for
+dates and no commit date; the record it builds carries no time field at all. Its writes are the verdict,
+the body's declared tier as a label, and a re-run of the label counter's run on the head (the workflow
+runs it lists for that are never read into the record). The collaborator permission is fetched for the AUTHOR as well as for every reviewer: the
 policy reads the author's role from the same map (admin is the repository owner; a non-collaborator's 404
 reads as "none", a contributor).
 A dismissed review's original state and its dismisser come from the issue events API's review_dismissed
@@ -241,10 +243,14 @@ def _refresh_label_counter(repo, head, token, head_repo=None, head_branch=None, 
             return ""
         _req("POST", "/repos/%s/actions/runs/%d/rerun" % (repo, int(run["id"])), token)
         return " The %s run on this head was re-run to count it." % COUNTER
-    except urllib.error.HTTPError as e:
-        sys.stderr.write("label counter refresh for %s: HTTP %s\n" % (head[:8], e.code))
-        return (" The %s run on this head could not be re-run (HTTP %s): re-run it from the Actions tab, or push or "
-                "edit once more." % (COUNTER, e.code))
+    except Exception as e:
+        # anything on this path: a refused re-run (HTTP 403/409), DNS or the 30 s timeout (URLError,
+        # TimeoutError), a reset connection, a bad JSON body. The label is already on, so the verdict must
+        # be the real one; the failed refresh is said here and on stderr, never raised into "evaluation failed"
+        what = "HTTP %s" % e.code if isinstance(e, urllib.error.HTTPError) else type(e).__name__
+        sys.stderr.write("label counter refresh for %s: %s: %s\n" % (head[:8], what, e))
+        return (" The %s run on this head could not be re-run (%s): re-run it from the Actions tab, or push or "
+                "edit once more." % (COUNTER, what))
 
 
 def run_one(repo, n, token):
