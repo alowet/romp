@@ -13,6 +13,12 @@ const { chromium } = require('playwright');
   await pg.waitForSelector('#rail-usage', { timeout: 20000 });
   await pg.evaluate(() => { const bt = document.getElementById('romp-boot'); if (bt) bt.remove(); });
   await pg.waitForFunction(() => document.getElementById('rail-usage').children.length > 0, null, { timeout: 20000 });
+  // T247d: the desktop hover ends in the affordance line, and a screenshot of the tip
+  await pg.hover('#rail-usage');
+  await pg.waitForFunction(() => { const t = document.getElementById('ru-tip'); return t && t.style.display === 'block'; }, null, { timeout: 5000 });
+  const hoverHint = await pg.evaluate(() => { const t = document.getElementById('ru-tip'); const last = t.lastElementChild; return { text: last ? last.textContent : '', cls: last ? last.className : '', font: last ? getComputedStyle(last).fontSize : '', opacity: last ? getComputedStyle(last).opacity : '' }; });
+  if (shots) { const tipEl = await pg.$('#ru-tip'); if (tipEl) await tipEl.screenshot({ path: shots + '-hover.png' }); }
+  await pg.mouse.move(5, 400);
   const hiddenBefore = await pg.evaluate(() => document.getElementById('rsp-back').hidden);
   await pg.evaluate(() => document.getElementById('rail-usage').click());
   await pg.waitForFunction(() => !document.getElementById('rsp-back').hidden, null, { timeout: 5000 });
@@ -138,7 +144,8 @@ const { chromium } = require('playwright');
   await pg.waitForFunction(() => !document.getElementById('rsp-back').hidden && !document.getElementById('ru-back').classList.contains('on'), null, { timeout: 5000 });
   await pg.waitForSelector('#rsp-panel .rsp-tbl', { timeout: 10000 });
   if (shots) await pg.screenshot({ path: shots + '-phone.png' });
-  const mobile = { railHidden, panelOpened: true, modalOpened: true, btn };
-  console.log(JSON.stringify({ hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, hiddenAfterDrag, lightErr, lightBtn, dim, timeout, mobile, foldBefore, foldAfter, errs }));
+  const panelHint = await pg.evaluate(() => document.getElementById('ru-tip').textContent.includes('Click for the full breakdown'));
+  const mobile = { railHidden, panelOpened: true, modalOpened: true, btn, panelHint };
+  console.log(JSON.stringify({ hoverHint, hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, hiddenAfterDrag, lightErr, lightBtn, dim, timeout, mobile, foldBefore, foldAfter, errs }));
   await b.close();
 })().catch((e) => { console.error(e); process.exit(1); });

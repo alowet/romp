@@ -89,6 +89,21 @@ class RailUsage(unittest.TestCase):
         # and drops the old explanatory prose ("...rate-limit window") — no extra stuff
         self.assertNotIn("rate-limit window", self.html, "no explanatory prose, just the bars + %")
 
+    def test_the_desktop_hover_says_the_click_opens_the_full_breakdown(self):
+        # T247d (the user 2026-09-08): the readout's click opens the per-session spend modal, so the
+        # hover — the compact level — must say there is more underneath (progressive disclosure: never
+        # a dead end). One footnote line in the hover's own footnote style (.ru-tip-age size and
+        # opacity, no new font size), on the DESKTOP tip only: the phone panel has its "By session" button.
+        js = self.html.split('_LANDING_USAGE_JS')[0] if False else self.html
+        self.assertIn("Click for the full breakdown by session.", js)
+        self.assertIn("tip.classList.remove('ru-modal');tip.innerHTML=h+'<div class=ru-tip-hint>Click for the full breakdown by session.</div>';", js,
+                      "the desktop tip ends in the affordance line")
+        self.assertIn("tip.innerHTML=h+'<div class=ru-tip-more><button class=rsp-btn id=ru-bysession>", js,
+                      "the phone panel keeps its button and gets no click hint (a tap there opens nothing)")
+        self.assertEqual(js.count("Click for the full breakdown by session."), 1, "one place, the desktop tip")
+        self.assertIn(".ru-tip-hint{margin-top:5px;opacity:.55;font-size:10px}", js,
+                      "the footnote style: .ru-tip-age's size and opacity, without a second rule line")
+
     def test_the_spend_section_owns_its_age_and_never_speaks_for_rate_limits(self):
         # Pins from the 2026-08-24 spend-staleness screenshot — minus the telemetry note, which the
         # user later the same day had DELETED entirely (they know which machines are key-only; no

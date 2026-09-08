@@ -124,6 +124,10 @@ class SpendModalServed(unittest.TestCase):
         self.assertEqual(r.returncode, 0, "the driver failed:\n" + r.stderr[-3000:])
         o = json.loads(r.stdout.strip().splitlines()[-1])
         self.assertTrue(o["hiddenBefore"], "closed until the click")
+        # T247d: the desktop hover ends in the affordance line, in the footnote style; the phone panel does not carry it
+        self.assertEqual(o["hoverHint"]["text"], "Click for the full breakdown by session.", o["hoverHint"])
+        self.assertEqual((o["hoverHint"]["cls"], o["hoverHint"]["font"], o["hoverHint"]["opacity"]), ("ru-tip-hint", "10px", "0.55"), o["hoverHint"])
+        self.assertIs(o["mobile"]["panelHint"], False, "the phone panel keeps its button and no click hint")
         self.assertTrue(o["loaderSeen"], "the loader (or the content) is up the instant the modal opens")
         self.assertEqual(o["out"]["backdrop"], "rgba(0, 0, 0, 0.55)", "the panel rule's backdrop")
         self.assertEqual(o["out"]["head"], "API spend · TESTHOST")

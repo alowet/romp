@@ -40610,7 +40610,10 @@ return h;}
 // container's RIGHT edge, nowhere near a hover on the left end of a wide multi-account rail).
 function showTip(ev){var h=tipHTML();
 if(!h){tip.style.display='none';return;}
-tip.classList.remove('ru-modal');tip.innerHTML=h;
+// the compact level says there is more underneath (T247d, the user 2026-09-08): the click opens the
+// per-session breakdown — one footnote line in the hover's own footnote style; the phone panel has
+// its "By session" button instead (openIt), because a tap there opens nothing
+tip.classList.remove('ru-modal');tip.innerHTML=h+'<div class=ru-tip-hint>Click for the full breakdown by session.</div>';
 var r=el.getBoundingClientRect();tip.style.display='block';
 var x=(ev&&typeof ev.clientX==='number')?ev.clientX:(r.left+r.width/2);
 tip.style.left=Math.max(6,Math.min(window.innerWidth-tip.offsetWidth-6,x-tip.offsetWidth/2))+'px';
@@ -42690,6 +42693,7 @@ def _landing():
             # spend rows (no track span, the user 2026-08-08) read as one table.
             ".ru-tip-v{min-width:30px;text-align:right;font-variant-numeric:tabular-nums;margin-left:auto}"
             ".ru-tip-more{margin-top:8px;text-align:center}"   # the phone panel's door into the spend modal (T247b)
+            ".ru-tip-hint{margin-top:5px;opacity:.55;font-size:10px}"   # the hover's click affordance (T247d): the footnote's size and opacity, no rule line
             ".ru-tip-age{margin-top:7px;padding-top:5px;border-top:1px solid rgba(255,255,255,0.08);"
             "opacity:.55;font-size:10px}"
             # (The per-host .ru-set/.ru-host rail sets are gone, the user 2026-08-08: the collapsed rail
