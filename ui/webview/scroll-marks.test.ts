@@ -85,10 +85,11 @@ test("marks translate EVENT indices to DISPLAY UNITS before asking the frame", (
 // ── T245 (the user 2026-09-07): a notch sat below the thumb while its message was on screen ───────────────
 test("a rendered unit changing height re-runs the shared paint — the event the frame was missing (T245)", () => {
   const ev = RENDER.split("function ensureView(id: string): View {")[1].split("\n}")[0];
-  assert.match(ev, /v\.ro = new ResizeObserver\(\(\) => scheduleRailSticky\(\)\);\s*\n\s*v\.ro\.observe\(elv\);/,
+  // the observer's first statement is still the paint; the same callback carries the tail-shrink rule (T262f)
+  assert.match(ev, /v\.ro = new ResizeObserver\(\(entries\) => \{\s*\n\s*scheduleRailSticky\(\);[\s\S]*?\n\s*\}\);\s*\n\s*v\.ro\.observe\(elv\);/,
     "one observer per view element: a lazy figure sizing in or a fold toggling repaints notches AND rail ticks");
-  assert.match(RENDER, /ro\?: ResizeObserver; \}/, "the View carries its observer");
-  assert.equal((RENDER.match(/v\.ro\?\.disconnect\(\); v\.el\.remove\(\);/g) || []).length, 2, "both view-removal sites disconnect it");
+  assert.match(RENDER, /ro\?: ResizeObserver; mo\?: MutationObserver; \}/, "the View carries its observers (the tail mutation one joined it, T262j)");
+  assert.equal((RENDER.match(/v\.ro\?\.disconnect\(\); v\.mo\?\.disconnect\(\); v\.el\.remove\(\);/g) || []).length, 2, "both view-removal sites disconnect it (and the tail mutation observer beside it, T262j)");
   assert.doesNotMatch(ev, /setTimeout|setInterval/, "no timer stands in for the event");
 });
 
@@ -163,7 +164,7 @@ test("the wheel over a notch scrolls the transcript — the box forwards it (T26
   // scroll chain ended at the page — the scrollbar stopped scrolling exactly where a notch sat
   assert.match(ENSURE, /scrollMarks\.addEventListener\("wheel", \(e\) => \{/, "one listener on the stable box, never per notch");
   assert.match(ENSURE, /const k = e\.deltaMode === 1 \? 16 : e\.deltaMode === 2 \? c\.clientHeight : 1;/, "lines and pages scaled to pixels");
-  assert.match(ENSURE, /c\.scrollBy\(\{ top: e\.deltaY \* k, left: e\.deltaX \* k \}\);\s*\n\s*\}, \{ passive: true \}\);/, "passive: the wheel is never blocked");
+  assert.match(ENSURE, /scrollContentBy\(c, e\.deltaY \* k, "wheel-scale"\);\s*\n\s*\}, \{ passive: true \}\);/, "passive: the wheel is never blocked; the move rides the write helper as wheel-scale (T262j)");
 });
 
 test("only the NOTCH takes the pointer — the box stays passive over the native scrollbar (T260)", () => {

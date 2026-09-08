@@ -131,7 +131,7 @@ class CourierTracked(unittest.TestCase):
         jd.ERRORS = td / "judge-errors.jsonl"
         jd.courier_llm = lambda *a, **k: self.reply
         self.reply = DELEGATING
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._discover_cache["fp"] = None
         jd._discover_cache["result"] = None
         jd._postal_from_memo["key"] = None
@@ -155,7 +155,7 @@ class CourierTracked(unittest.TestCase):
             # the sender must be a DISCOVERED local session for tracked to qualify
             (self.dirs[SENDER] / (SENDER + ".jsonl")).write_text(
                 json.dumps(uline(T0 - 60, "kick off the exporter", "s1")) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._discover_cache["fp"] = None
         jd._postal_from_memo["key"] = None
         jd.run_courier(now=T0 + 100)

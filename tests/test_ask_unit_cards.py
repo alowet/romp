@@ -96,7 +96,7 @@ class CourierWorld(unittest.TestCase):
         jd.discover = lambda now, window=None, forks=True: fleet
         self._llm = jd.courier_llm
         jd.courier_llm = lambda text, menu, declared=None: '{"verdict": "delegating", "goal": 1, "text": "drag-range selection"}'
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def tearDown(self):
         jd._delegate_user_rooted = self._rooted
@@ -168,7 +168,7 @@ class CourierWorld(unittest.TestCase):
              "to_id": WK1, "kind": "delegate", "body": BODY1},
             {"t": T0 + 120, "ev": "sent", "id": MID2, "from": "web", "from_id": MGR,
              "to_id": WK1, "kind": "delegate", "body": BODY2}]) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd.run_courier(now=NOW)
         self.assertEqual(len(self._trackers_under(MGR + ":g1")), 1)
         self.assertEqual(len(self._trackers_under(MGR + ":g2")), 1,

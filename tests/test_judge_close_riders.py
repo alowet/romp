@@ -88,7 +88,7 @@ class _Riders(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.mkdtemp()
         jd._rebind_state(Path(self.td))
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         self._llm, self._menu_text = jd.closer_llm, jd._menu_text
         self.menus = []                                  # [[node id, ...] per closer call], as sent
         self.stamped_at_call = []                        # ids carrying closerLookT when each call was built

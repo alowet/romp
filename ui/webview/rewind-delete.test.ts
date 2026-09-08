@@ -40,8 +40,10 @@ test("the armed second click fires rewindDelete and paints the bare overlay", ()
 });
 
 test("the bare overlay dims the deleted bubble itself, not just the tail", () => {
-  assert.match(RENDER, /if \(pr\.bare\) \{/);
-  assert.match(RENDER, /for \(let j = idx; j < s\.events\.length; j\+\+\) \(s\.events\[j\] as any\)\.rewound = true;/);
+  // the pass lives in rewind-reconcile.ts (executed there: "a bare delete dims from the deleted bubble itself")
+  const PASS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "rewind-reconcile.ts"), "utf8");
+  assert.match(PASS, /\} else if \(pr\.bare\) \{/);
+  assert.match(PASS, /for \(let j = idx; j < events\.length; j\+\+\) events\[j\]\.rewound = true;/);
 });
 
 test("the delete button dresses like edit, with a destructive armed state", () => {

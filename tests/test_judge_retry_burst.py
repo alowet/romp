@@ -56,7 +56,7 @@ class RetryBurstPlansOnce(unittest.TestCase):
             jd.plan_llm = jd.opener_llm = lambda *a, **k: (calls.append(1), llm())[1]
             jd._group_store = lambda *a, **k: None    # don't fire the real grouper model after a placement
             try:
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
             finally:

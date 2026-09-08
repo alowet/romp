@@ -81,7 +81,7 @@ class PlannerEpisodeFloor(unittest.TestCase):
     def _plan(self):
         tpath = self.proj / (SID + ".jsonl")
         tpath.write_text("\n".join(json.dumps(r) for r in RECS) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._plan_session(SID, str(tpath), NOW)
         return jd.load_goals(SID)
 

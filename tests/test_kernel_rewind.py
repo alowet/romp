@@ -535,8 +535,9 @@ class TwoPhaseRewindTiming(unittest.TestCase):
         # asks for the whole armed window — unbounded on a bare delete
         src = inspect.getsource(km.build_session)
         # the read goes through the per-session boundary (a faulting store renders an EMPTY tree
-        # instead of failing every tab's build), and the hold filter is applied to what it read
-        self.assertIn("gstore, gfault = jd.load_goals_or_fault(sid)", src)
+        # instead of failing every tab's build) onto the shared read-only view, and the hold filter is
+        # applied to what it read
+        self.assertIn("gstore, gfault = jd.load_goals_shared_or_fault(sid)", src)
         self.assertIn("gstore = _apply_rewind_hold(sid, gstore)", src)
 
     def test_the_boot_pass_resolves_a_hold_the_transcript_moved_past_out_of_band(self):

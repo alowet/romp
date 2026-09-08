@@ -435,15 +435,11 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 /* a folded header IS its whole group, so it takes the bottom margin the run of cards would have had —
    without it, consecutive folded threads jam into one unreadable stack of names. */
 .feed-sess-head.folded { margin-bottom: 7px; }
-/* the session-wide CLEAR (the user 2026-09-08): far right of the header row (margin-left:auto, before the
-   full-width process list that wraps below), the header's own size (font: inherit — no new size on this
-   surface) and the caret's quiet treatment — bare word, no chip box, dim at rest and full strength on
-   hover/focus, un-bolded from the header's 600 so the name stays the thing you read. Monochrome on
-   purpose: red is the card-level Clear's hover, and a whole run leaving is announced by the cards' own
-   exit, not by a coloured button on every header. The hit area is padded for a thumb. */
-.feed-sess-clear { flex: none; margin-left: auto; padding: 0 5px; color: var(--dim); background: transparent;
-  border: 0; font: inherit; font-weight: 400; line-height: 1; cursor: pointer; transition: color 0.12s ease; }
-.feed-sess-clear:hover, .feed-sess-clear:focus-visible { color: var(--fg); }
+/* the session-wide CLEAR (the user 2026-09-08, twice): it IS the card's Clear (.fdismiss: the outline, the
+   0.72em size, the accent hover), built by the same builder; this class carries its POSITION only — far
+   right of the header row, before the full-width process list that wraps below. No size, colour, border
+   or hover of its own: any of those here would be a second button that drifts. */
+.feed-sess-clear { flex: none; margin-left: auto; }
 /* the neutral background-process chip on the header (kernel bgServices): a process the session KEEPS
    (a dev server the judge classified as nobody-waits). Reuses the .fask-secbtn chip vocabulary — dim,
    0.74em, accent only while its list is open (a selected toggle, the accent's job) — and un-bolds from
@@ -1080,7 +1076,9 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 }
 /* controls row — the "+" expand toggle (left, below the title) + Dismiss to its
    right; replaces the old right-rail button stack. */ .fdismiss {
-  font: inherit; font-size: 0.72em; cursor: pointer; white-space: nowrap;
+  font: inherit; font-size: 0.72em; font-weight: 400; cursor: pointer; white-space: nowrap;
+  /* ^ weight pinned, not inherited: the session header renders at 600 and its Clear is THIS button
+     (the user 2026-09-08: identical to the card's); cards already sat at 400, so nothing moves there */
   color: var(--dim); background: transparent;
   border: 1px solid var(--card-border); border-radius: 6px;
   transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease, transform 0.08s ease;

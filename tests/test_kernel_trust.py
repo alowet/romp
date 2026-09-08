@@ -218,6 +218,40 @@ class QuarantineCards(unittest.TestCase):
         self.assertEqual(km._quarantine_cards(2000, set()), [])
 
 
+class QuarantineRefusal(unittest.TestCase):
+    """The bus refusing a verdict answers the asking pane BY THE MESSAGE it was about (review find,
+    2026-09-08). The feed latches Approve/Deny ("Delivering…") on the click and re-arms them on the kernel's
+    reply for that request. The reply used to be a bare `warn`, which the feed never handled, so a refused
+    verdict left both buttons disabled until the card was re-sent, and a held message the bus refused to
+    act on is exactly the card that is never re-sent."""
+
+    def setUp(self):
+        self._saved = km._bus_quarantine_act, km._mark_views_dirty
+        self.sent, self.dirtied = [], []
+        km._mark_views_dirty = lambda: self.dirtied.append(True)
+        self.client = {"app": "feed", "wid": "w1", "alive": True,
+                       "send": lambda raw: self.sent.append(json.loads(raw))}
+
+    def tearDown(self):
+        km._bus_quarantine_act, km._mark_views_dirty = self._saved
+
+    def test_a_refused_verdict_names_the_message_it_answers(self):
+        km._bus_quarantine_act = lambda body: (False, "the recipient is no longer live")
+        km.Handler._dispatch_ws(None, {"type": "quarantineDecision", "mid": "qc-7", "action": "approve",
+                                       "sid": "11111111-2222-3333-4444-555555555555"}, self.client)
+        self.assertEqual(self.sent, [{"type": "quarantineRefused", "mid": "qc-7",
+                                      "text": "quarantine: the recipient is no longer live"}],
+                         "the reply carries the held message's id, so the feed re-arms that card's buttons alone")
+        self.assertEqual(self.dirtied, [], "a refused verdict changes no view")
+
+    def test_an_accepted_verdict_answers_nothing_and_rebuilds_the_views(self):
+        # the bus removed the held file: the next build drops the card (event-based), nothing to say
+        km._bus_quarantine_act = lambda body: (True, "")
+        km.Handler._dispatch_ws(None, {"type": "quarantineDecision", "mid": "qc-8", "action": "deny"}, self.client)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.dirtied, [True])
+
+
 class MirrorTrust(unittest.TestCase):
     """mirror_trust (the user 2026-07-26): sets OUR level for a host as ITS level for US, through the
     tunnel forward + that machine's serve token — the human with both tokens acting on both kernels.

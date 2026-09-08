@@ -31,12 +31,13 @@ ROOT = os.path.dirname(HERE)
 BIN = os.path.join(ROOT, "bin")
 EXT = os.path.join(ROOT, "vscode-extension")
 
-# name → (sid, tag) ; the web tag is wide enough to wrap at a 640px viewport; "archived" folds by default
+# name → (sid, tags) ; the web tag is wide enough to wrap at a 640px viewport; "archived" folds by default;
+# web-search carries TWO tags and appears under both (T264b: tags are equivalent, no home tag)
 SESSIONS = [
     ("web-frontend", "aaaaaaaa-1111-2222-3333-000000000001", "web"),
     ("web-backend", "aaaaaaaa-1111-2222-3333-000000000002", "web"),
     ("web-gateway", "aaaaaaaa-1111-2222-3333-000000000003", "web"),
-    ("web-search", "aaaaaaaa-1111-2222-3333-000000000004", "web"),
+    ("web-search", "aaaaaaaa-1111-2222-3333-000000000004", "web infra"),
     ("web-billing", "aaaaaaaa-1111-2222-3333-000000000005", "web"),
     ("infra-ci", "aaaaaaaa-1111-2222-3333-000000000006", "infra"),
     ("infra-deploy", "aaaaaaaa-1111-2222-3333-000000000007", "infra"),
@@ -91,6 +92,8 @@ const survey = () => page.evaluate(() => {
   };
   return {
     items: kids.map(item),
+    active: Array.from(document.querySelectorAll("#tabs .tab.active[data-id]")).map((t) => ({ id: t.dataset.id, copy: t.dataset.copy })),
+    dots: Array.from(document.querySelectorAll("#tabs .tab[data-id]")).map((t) => ({ id: t.dataset.id, copy: t.dataset.copy, dot: !!t.querySelector(".tab-dot"), close: t.querySelector(".tab-close")?.title || null })),
     barLeft: 0, barW: bar.clientWidth,
     theme: document.body.className,
     seps: Array.from(document.querySelectorAll("#tabs .tab-group-sep")).map((e) => ({ w: e.getBoundingClientRect().width, h: e.getBoundingClientRect().height })),
@@ -100,13 +103,20 @@ const survey = () => page.evaluate(() => {
   };
 });
 const open = await survey();
+// T264b: the two-tag session's copy under infra — click it, and the ONE session activates: both copies wear .active
+await page.click(`#tabs .tab[data-id="${cfg.twoTag}"][data-copy="infra"]`);
+await page.waitForFunction((id) => document.querySelectorAll(`#tabs .tab.active[data-id="${id}"]`).length === 2, cfg.twoTag, { timeout: 8000 });
+await page.waitForTimeout(400);
+const clicked = await survey();
+await page.mouse.move(320, 400);   // off the strip, so no hover tip rides the screenshots
+await page.waitForTimeout(200);
 if (cfg.shots) await page.screenshot({ path: cfg.shots + "-dark.png", clip: { x: 0, y: 0, width: 640, height: 130 } });
 // LIGHT theme: the classes applyTheme sets for the light theme
 await page.evaluate(() => document.body.classList.add("chat-theme-yatharth", "theme-light"));
 await page.waitForTimeout(300);
 const light = await survey();
 if (cfg.shots) await page.screenshot({ path: cfg.shots + "-light.png", clip: { x: 0, y: 0, width: 640, height: 130 } });
-fs.writeSync(1, "RESULT:" + JSON.stringify({ open, light }) + "\n");
+fs.writeSync(1, "RESULT:" + JSON.stringify({ open, clicked, light }) + "\n");
 await browser.close();
 process.exit(0);
 """
@@ -144,7 +154,7 @@ class ServedGroupsOnOwnLines(unittest.TestCase):
             Path(proj, sid + ".jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
         Path(cls.state, "usage.json").write_text(json.dumps({"five_hour": {"pct": 100}, "seven_day": {"pct": 10}}))
         # the kernel's session-views blob: three tags, members by sid (the legacy spelling it reads losslessly)
-        tags = [{"id": tid, "name": tname, "color": color, "members": [sid for (_n, sid, t) in SESSIONS if t == tname]}
+        tags = [{"id": tid, "name": tname, "color": color, "members": [sid for (_n, sid, t) in SESSIONS if tname in (t or "").split()]}
                 for (tid, tname, color) in TAGS]
         Path(cls.state, "timeline-views.json").write_text(json.dumps({"tags": tags, "tagOrder": [t[1] for t in TAGS]}))
         cls.port = _free_port()
@@ -178,7 +188,8 @@ class ServedGroupsOnOwnLines(unittest.TestCase):
         cfg = os.path.join(self.lab, name + ".json")
         with open(cfg, "w") as f:
             json.dump({"chat": "http://127.0.0.1:%d/chat?token=%s" % (self.port, self.token),
-                       "visible": len([s for s in SESSIONS if s[2] != "archived"]),
+                       "visible": len([s for s in SESSIONS if s[2] != "archived"]) + 1,   # web-search has two copies
+                       "twoTag": next(sid for (n, sid, _t) in SESSIONS if n == "web-search"),
                        "shots": os.environ.get("TABROWS_SHOTS", "")}, f)
         driver = os.path.join(self.lab, name + ".mjs")
         with open(driver, "w") as f:
@@ -239,11 +250,11 @@ class ServedGroupsOnOwnLines(unittest.TestCase):
 
     def test_every_group_starts_on_its_own_line_and_a_fold_leaves_the_header_row_alone(self):
         r = self._drive(DRIVER, "rows")
-        o, l = r["open"], r["light"]
+        o, clicked, l = r["open"], r["clicked"], r["light"]
         # the world: eight visible tabs (the archived group starts folded, its one member hidden), three headers,
         # no visible separator, one break per header after the first plus the trail's
         visible = [s for s in SESSIONS if s[2] != "archived"]
-        self.assertEqual(len([i for i in o["items"] if i["id"]]), len(visible), "every visible session has its tab: %r" % [i["name"] for i in o["items"]])
+        self.assertEqual(len([i for i in o["items"] if i["id"]]), len(visible) + 1, "every visible session has its tab, the two-tag one twice: %r" % [i["name"] for i in o["items"]])
         self.assertEqual([h["group"] for h in o["heads"]], ["web", "infra", "archived"])
         self.assertEqual(o["breaks"], 3, "a break before infra, before archived, and the trail's: %r" % o["breaks"])
         for sp in o["seps"]:
@@ -262,6 +273,19 @@ class ServedGroupsOnOwnLines(unittest.TestCase):
         # the per-row hairlines (T134, kept): one under every row but the last, none at the strip's top edge
         self.assertNotIn(0.0, o["lines"], "no hairline at the top edge (a break is not a row): %r" % o["lines"])
         self.assertTrue(o["lines"], "rows are still grounded by hairlines: %r" % o["lines"])
+        # T264b: the two-tag session appears under BOTH its groups, each copy a full tab (same status dot, a ✕ that
+        # says it ends the one session); a click on the infra copy activates the ONE session — both copies highlight
+        two = next(sid for (n, sid, _t) in SESSIONS if n == "web-search")
+        copies = [d for d in o["dots"] if d["id"] == two]
+        self.assertEqual(sorted(c["copy"] for c in copies), ["infra", "web"], "one copy per tag it carries: %r" % copies)
+        self.assertEqual(len({c["dot"] for c in copies}), 1, "every copy wears the same state dot: %r" % copies)
+        for c in copies:
+            self.assertIn("one session", c["close"] or "", "the ✕ on a copy says it ends the one session: %r" % c)
+        self.assertEqual([c["copy"] for c in clicked["active"] if c["id"] == two], ["web", "infra"], "the active highlight sits on every copy: %r" % clicked["active"])
+        self.assertEqual(len(clicked["active"]), 2, "…and on nothing else: %r" % clicked["active"])
+        infra_tabs = next(t for g, _h, t in self._sections(clicked["items"]) if g == "infra")
+        self.assertIn(two, [t["id"] for t in infra_tabs], "the copy sits in the infra group: %r" % infra_tabs)
+        self._check_rows(clicked, "clicked")
         # LIGHT theme: the same geometry
         self.assertIn("theme-light", l["theme"])
         self._check_rows(l, "light")

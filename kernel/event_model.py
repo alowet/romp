@@ -1548,21 +1548,23 @@ class FileAdapter:
         and a late-written burst veto it). A branch qualifies when its fork-side HEAD is an
         assistant record (a user gesture's head is always the user's own record) and it
         carries reply text anywhere in the sub-tree; the winner is the branch with the
-        latest-written reply text, tiebroken by head seq. The text witness is landed_text_uuids
-        MINUS isApiErrorMessage records (error-as-text failure echoes, which atoms() likewise
-        refuses to treat as replies) — so junk carries no weight in the key, and no textless
-        tail can move the pick whatever its file position. The unit is deliberately the WHOLE
-        branch, never a leaf-chain within it: leaf-chains of one branch share records, and
-        every per-chain read of shared state proved breakable (a full-chain gate laundered a
-        junk tail's steal; a unique-suffix gate let a branch's own twin sub-branches strip
-        their turn's text and hand the keep to an older sibling — reply loss, this repo's one
-        fatal error). The accepted cost is cosmetic: a stub twin inside the winning branch
-        renders one output-less duplicate tool row, and a grafted burst inside it costs
-        nothing (system records never become atoms). The qualifying properties are the ones
-        every incident's salvaged branch has in the author's corpus scan (49/49 across 4,678
-        transcripts; the 2,809 non-eclipse rewind forks: 2,035 stub pairs, 700 superseded
-        retries, 42 user-gesture rollbacks, 32 other; zero overlap). Sibling branches demote
-        to "rewind", exactly as their on-spine twins classify.
+        latest-written reply text, tiebroken by head seq. The text witness is the eclipse
+        set's text-bearing assistant records (landed_text_uuids' own test, applied to the
+        eclipse set alone — the ranking reads it for sub-tree members only, and the sub-trees
+        lie inside that set) MINUS isApiErrorMessage records (error-as-text failure echoes,
+        which atoms() likewise refuses to treat as replies) — so junk carries no weight in the
+        key, and no textless tail can move the pick whatever its file position. The unit is
+        deliberately the WHOLE branch, never a leaf-chain within it: leaf-chains of one branch
+        share records, and every per-chain read of shared state proved breakable (a full-chain
+        gate laundered a junk tail's steal; a unique-suffix gate let a branch's own twin
+        sub-branches strip their turn's text and hand the keep to an older sibling — reply
+        loss, this repo's one fatal error). The accepted cost is cosmetic: a stub twin inside
+        the winning branch renders one output-less duplicate tool row, and a grafted burst
+        inside it costs nothing (system records never become atoms). The qualifying properties
+        are the ones every incident's salvaged branch has in the author's corpus scan (49/49
+        across 4,678 transcripts; the 2,809 non-eclipse rewind forks: 2,035 stub pairs, 700
+        superseded retries, 42 user-gesture rollbacks, 32 other; zero overlap). Sibling
+        branches demote to "rewind", exactly as their on-spine twins classify.
 
         When NO chain qualifies, the two eclipse terminals part ways, each on its own event:
           "user"      — the flush COMPLETED (the next prompt sits past the spur), so a machine-
@@ -1584,19 +1586,28 @@ class FileAdapter:
         ecl = {u for u, v in verdict.items() if v == "eclipsed"}
         if not ecl:
             return
-        children = {}
-        for u in self.by_uuid:
-            p = self.parent_of.get(u)
-            if p is not None:
-                children.setdefault(p, []).append(u)
+        # Everything below reads only uuids INSIDE the eclipse set, so build only that much: the
+        # child map over ecl (the component walk skips any popped uuid outside ecl, and a sub-tree
+        # walk skips anything outside its component, so children outside ecl were never followed)
+        # and the text witness over ecl (the ranking tests it for sub-tree members only). A
+        # whole-graph child map and landed_text_uuids() over every record made this walk a third
+        # of chain_membership's cost on a large transcript with a handful of eclipsed records; the
+        # verdicts are identical. Nothing here is cached on the adapter: _run_graph_passes mutates
+        # parent_of after ingest, so a per-adapter child map would go stale under the repair passes.
+        children = {}                     # parent -> its children in ecl
         forks = {}                        # fork uuid -> its eclipsed branch heads
         for u in ecl:
             p = self.parent_of.get(u)
+            if p is None:
+                continue
+            children.setdefault(p, []).append(u)
             if p in active:
                 forks.setdefault(p, []).append(u)
-        landed = None                     # text-bearing assistant uuids (the reply witness) — computed
-        #                                   lazily: chain_verdicts runs on every build of a held
-        #                                   session, and most transcripts carry no eclipse at all
+        landed = set()                    # text-bearing assistant uuids in ecl (the reply witness)
+        for u in ecl:
+            r = self.by_uuid.get(u) or {}
+            if r.get("type") == "assistant" and _text_of(_content(r.get("message"))).strip():
+                landed.add(u)
         for F, heads in forks.items():
             comp, stack = set(), list(heads)
             while stack:                  # the branch component: child-closure of the eclipsed heads
@@ -1605,8 +1616,6 @@ class FileAdapter:
                     continue
                 comp.add(x)
                 stack.extend(children.get(x, ()))
-            if landed is None:
-                landed = self.landed_text_uuids()
             # SELECTION IS PER BRANCH — the sub-tree under each fork-side head — never per
             # leaf-chain. Leaf-chains of one branch SHARE records, and any per-chain read of
             # shared state proved breakable by construction: a full-chain gate let a junk tail
@@ -1685,25 +1694,45 @@ class FileAdapter:
                               if v in ("broken", "eclipsed")}
 
     def _absorbed_atom(self, full, t, seq, auid, rompuuid, postal_index):
-        """One synthesized user atom for a mid-turn splice. The atom carries the FULL text — any
-        whitespace-collapsed form is for MATCHING only (the user 2026-07-08: collapsing ate the blank
-        line between a follow-up's quoted context and the typed reply, so markdown folded the reply
-        INTO the blockquote; and the kernel's optimistic echo could never text-prune against the
-        collapsed copy, so the message rendered TWICE)."""
+        """One synthesized user atom for a mid-turn splice, placed where the model READ it (T252d, the
+        user 2026-09-08): its `t` is the LANDING time — the moment the CLI took the message off its
+        queue, the file-order predecessor's stamp (_landing_t) — so the atom sits BELOW the steps that
+        ran while the message waited, and the order on screen is the order the model saw. The SEND time
+        stays on the atom as `sentAt` (the chat's bubble hover). Ordering rule: atoms sort by (t, _seq)
+        (parse_session), and the attachment's FILE ORDER is the authority — the atom sorts after every
+        record the CLI wrote before taking it (the witness's stamp, and a higher seq than the witness)
+        and before the assistant record that answers it (written after the attachment, stamped no
+        earlier); several sends the CLI took at one boundary share that boundary's stamp and keep
+        their send order, which is their file order. A send the CLI took AFTER a witness stamped
+        before the send clamps to the send time (no truthful landing precedes it); an attachment with
+        no predecessor in the read keeps its send time as the only truthful place. Before T252d the
+        atom sat at its send time, above those steps (the T252 in-place rule); the user's call was
+        that the read position is the one that matches what the model actually saw.
+
+        DEPLOY RULE: `t` is half of the segment id (fsid:t:texthash), so moving it changed placement
+        identity for every absorbed atom whose landing differs from its send — PLACEMENTS_V 12 (the
+        seal keeps dormant sessions from replaying the moved atoms as new goals);
+        tests/test_placements_canary.py pins the new derivation.
+
+        The atom carries the FULL text — any whitespace-collapsed form is for MATCHING only (the user
+        2026-07-08: collapsing ate the blank line between a follow-up's quoted context and the typed
+        reply, so markdown folded the reply INTO the blockquote; and the kernel's optimistic echo could
+        never text-prune against the collapsed copy, so the message rendered TWICE)."""
         blocks = [{"type": "text", "text": full}]
         arec = self.by_uuid.get(auid) or {}
         origin = _record_origin(arec)   # a queued_command attachment carries its own origin / commandMode
         atom = {
             "type": "user", "uuid": auid, "session_id": rompuuid,
-            "t": t, "fsid": self.fsid_of.get(auid),
+            "t": t, "sentAt": t, "fsid": self.fsid_of.get(auid),
             "parentUuid": arec.get("parentUuid"),
             "message": {"role": "user", "content": blocks},
             "author": author_of(blocks, None, postal_index, getattr(self, "sdk_human", False), origin),
-            "absorbed": True,   # a mid-turn splice: the turn's FOLLOWING atoms are the interrupted
-            #                     ask's continuing work, not provably a reply to this — judges must
-            #                     not read them as one (jd._seg_spliced / _strip_unevidenced_dones).
-            #                     Metadata only: the atom set and seg ids are unchanged (no
-            #                     PLACEMENTS_V bump).
+            "absorbed": True,   # a mid-turn splice, placed where the model read it (T252d): the
+            #                     atoms that FOLLOW it are the model's work after reading it — its
+            #                     reply, as for any ask. (Until T252d the atom sat at its SEND time and
+            #                     the following atoms were the interrupted turn's work, which the judges
+            #                     had to refuse as evidence; that leg is gone with the placement.) The
+            #                     flag still tells the chat and the judges how the message arrived.
             "_seq": seq,
         }
         if origin:
@@ -1723,7 +1752,7 @@ class FileAdapter:
                 # synthetic shape with no tool_result before the attachment.)
                 _ASM_STATS["landedT-clamp"] = _ASM_STATS.get("landedT-clamp", 0) + 1
                 landed_t = t
-            atom["landedT"] = landed_t   # when the CLI TOOK it (metadata, like `absorbed`; see _landing_t)
+            atom["t"] = landed_t         # placed where the model READ it (T252d); `sentAt` keeps the send
         if ROMP_AUTO_RE.search(full):   # an AUTO-nudge → flag it, mirroring the native user-record path
             atom["rompAuto"] = True
         return atom
@@ -1731,18 +1760,17 @@ class FileAdapter:
     def _landing_t(self, seq):
         """When the CLI TOOK a mid-turn prompt: the repaired stamp of the record written just BEFORE
         the queued_command attachment in file order. The attachment's own stamp is the ENQUEUE time
-        (the moment the user sent it — where the atom is placed, above the steps that ran while it
-        waited), but the CLI writes the record at the splice, right after the tool boundary it waited
-        for, so that boundary's own record — the file-order predecessor — is the landing moment to
-        within the boundary's latency. The chat's mid-turn cue reads it (kernel `landedAt`): "the
-        session took this at HH:MM" is a different fact from "sent at HH:MM", and the rail already
-        shows the latter. The PREDECESSOR, not the successor, on purpose: it is always ingested when
+        (the moment the user sent it — kept on the atom as `sentAt`), but the CLI writes the record at
+        the splice, right after the tool boundary it waited for, so that boundary's own record — the
+        file-order predecessor — is the landing moment to within the boundary's latency, and since
+        T252d it is where the atom is PLACED (its `t`): below the steps that ran while the message
+        waited, where the model read it. The PREDECESSOR, not the successor, on purpose: it is always ingested when
         the atom is emitted, so a fold that sees the attachment as the newest record still stamps
         it — a successor read would find nothing there, and no later fold re-emits the atom (the
         (ts, text) dedup). Attachment records are skipped as witnesses (a run of splices at one
         boundary all read that boundary). None only when nothing precedes the attachment in the
         read. The caller clamps the result to the atom's own send time (never earlier — see
-        _absorbed_atom). Metadata only: no atom-set or seg-id change, no PLACEMENTS_V bump."""
+        _absorbed_atom). Placement, not metadata, since T252d: it is half of the atom's segment id."""
         i = bisect.bisect_left(self._seq_ts, (seq,)) - 1
         return self._seq_ts[i][1] if i >= 0 else None
 
@@ -1752,7 +1780,8 @@ class FileAdapter:
         carrying the FULL prompt text and stamped with the ENQUEUE timestamp — and writes
         NONE for a dequeued prompt (that resurfaces as a native user line), a still-pending
         one, or a popAll (a recall: the queue is cleared, nothing spliced). So each
-        attachment becomes one user atom, at its own timestamp: the moment the user sent it.
+        attachment becomes one user atom, placed at its LANDING time (_absorbed_atom, T252d) with
+        the send time beside it; the (send ts, text) pair stays the dedup key below.
 
         The queue-operation ledger is deliberately NOT read at all: its dequeue/remove
         records are anonymous, and a CLI killed with items queued never writes their
@@ -2750,7 +2779,8 @@ def _asm_heal(entry, rompuuid, postal_index):
         for i, a in enumerate(entry["atoms"]):
             if not a.get("absorbed"):
                 continue
-            key = (a["t"], " ".join(_text_of(_content(a.get("message"))).split()))
+            key = (a.get("sentAt", a["t"]), " ".join(_text_of(_content(a.get("message"))).split()))   # the (send ts, text)
+            #                                                                                          key: `t` is the landing (T252d)
             if key not in st["postal_miss_att"]:
                 continue
             q = next((q for q in ad.qatts if q["ts"] == key[0]

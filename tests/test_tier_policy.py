@@ -1,29 +1,38 @@
 #!/usr/bin/env python3
-"""The PR tier POLICY (the maintainers' decisions of 2026-09-07), as a pure function over synthetic PR
-fixtures — scripts/ci/tier_policy.py. The workflow only fetches data and calls it; every rule here is
-pinned on fixtures so the gate's meaning lives in tests, not in a YAML step.
+"""The PR tier POLICY as a pure function over synthetic PR fixtures: scripts/ci/tier_policy.py, the
+repository owner's rules of 2026-09-08, by tier and by the AUTHOR's role. The workflow only fetches data
+and calls it; every rule here is pinned on fixtures so the gate's meaning lives in tests, not in a YAML step.
 
-Tiers: docs (documentation only) merges on green; fix needs an approval OR seven unchanged days with no
-changes requested; feature needs an approval; major-feature needs an approval AND a linked issue that
-someone other than the author has commented on (the opener alone does not count). Any PR touching .github/ or
-scripts/ci/ - the gate's own workflow and code - needs an approval regardless (the base-branch check
-cannot stop a PR-branch job from posting a same-named success on pull_request events, and a fix-tier PR
-must not rewrite the policy through the seven-day path, so a human must look). Zero or two tier labels fail here too (belt and braces with the label
-check). An approval is a reviewer's STANDING - their latest APPROVED / CHANGES_REQUESTED / DISMISSED
-review (comment-only reviews never change standing; a dismissed approval never counts, whoever dismissed
-it; a dismissed objection clears only when the reviewer dismissed it THEMSELVES, so the author cannot
-dismiss the peer's objection away) - by a non-author holding write/admin/maintain, APPROVED, on the
-CURRENT head. The seven-day clock is the later
-of the head's arrival on the PR and the start of the unbroken chain of hourly "Tier policy" verdicts THIS
-PR received on the head; a head with no verdict yet has not started its clock (never a commit date, which
-is free to forge; never created_at; never another PR's verdicts on the same sha).
-A renamed file counts under both paths; a file listing the API truncated makes the unseen files guarded.
+Roles are read from the author's collaborator permission in the record's permissions map: admin is the
+repository owner, write or maintain a member, anyone else (including an author the map lacks, as a fork
+PR's author is) a contributor. Members and contributors are gated alike; admin is the role that changes a
+gate.
+
+Tiers: docs and fix are ONE tier under two labels (tests-only is the pre-rename spelling of docs) and merge
+on green for every author: the check requires no approval. feature merges on green when the author is an
+admin (the owner's features merge straight away); by anyone else it needs an APPROVED review by an admin
+other than the author on the current head (the owner looks first). major-feature needs, for every author,
+a linked issue that someone other than the author has commented on (the opener alone does not count); a
+non-admin author additionally needs that admin approval. Any PR touching .github/ or scripts/ci/, the
+gate's own workflow and code, needs an admin's approval regardless of tier when the author is not an admin
+(the base-branch check cannot stop a PR-branch job from posting a same-named success on pull_request
+events, and nobody but the owner may rewrite the policy through a PR the check cannot see); an admin author
+is exempt. A standing CHANGES_REQUESTED by a maintainer (write, maintain or admin) other than the author
+holds a PR of any tier until that reviewer lifts it. No tier has a time-based path: the record carries no
+time field and nothing in the policy reads one. Zero or two tier labels fail here too (belt and braces
+with the label check). An approval is a reviewer's STANDING, their latest APPROVED / CHANGES_REQUESTED /
+DISMISSED review (comment-only reviews never change standing; a dismissed approval never counts, whoever
+dismissed it; a dismissed objection clears only when the reviewer dismissed it THEMSELVES, so the author
+cannot dismiss the peer's objection away), by an admin other than the author, APPROVED, on the CURRENT
+head. A renamed file counts under both paths; a file listing the API truncated makes the unseen files
+guarded.
 
 Synthetic only: invented logins, placeholder shas, TESTHOST-free."""
 import importlib.util
 import os
+import re
 import tempfile
-import time
+import types
 import unittest
 import urllib.error
 
@@ -39,16 +48,16 @@ SPEC.loader.exec_module(tp)
 
 HEAD = "1111111111111111111111111111111111111111"
 OLD = "2222222222222222222222222222222222222222"
-NOW = 1_800_000_000
-DAY = 86400
+NOW = 1_800_000_000   # orders one reviewer's reviews (submitted_at); the policy has no clock to compare it to
+DAY = 86400           # only for the stale clock keys NoTimePath feeds the policy, which must ignore them
 
 
 def pr(**kw):
-    """A synthetic PR fixture with sensible defaults; override per test."""
+    """A synthetic PR fixture with sensible defaults; override per test. No time field: the fetcher
+    records none (pinned in FetcherShapes) and the policy reads none (pinned in NoTimePath)."""
     base = {"number": 42, "author": "author-a", "labels": ["fix"], "head_sha": HEAD,
             "files": ["kernel/kernel.py"], "reviews": [], "permissions": {},
-            "files_truncated": False, "first_check_at": None, "head_floor": NOW - 30 * DAY,
-            "created_at": NOW - 30 * DAY, "now": NOW, "body": "", "issues": {}}
+            "files_truncated": False, "body": "", "issues": {}}
     base.update(kw)
     return base
 
@@ -60,19 +69,15 @@ def review(user, state="APPROVED", sha=HEAD, submitted=NOW - 60, dismissed=False
             "dismissed": dismissed, "dismissed_by": dismissed_by}
 
 
+# Roles as the check reads them, from the collaborator permission the fetcher records: admin-c holds admin
+# (the repository owner); maint-b holds write (a member). author-a, the default author, is absent from
+# MAINTAINERS (a contributor, as a fork PR's author is); MEMBER_AUTHOR and ADMIN_AUTHOR are the same map
+# with the default author given write or admin, so a test varies the author's role the way the check
+# reads it, through the map, never through the login.
 MAINTAINERS = {"maint-b": "write", "admin-c": "admin"}
-
-
-def iso(epoch):
-    import datetime
-    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def run(epoch, ext="42", app=15368):
-    """A check-run object as the list endpoint returns it: server-stamped completed_at, the posting
-    app, and the external_id the verdict was posted with (the PR number)."""
-    return {"name": "Tier policy", "started_at": iso(epoch - 5), "completed_at": iso(epoch),
-            "app": {"id": app}, "external_id": ext}
+MEMBER_AUTHOR = dict(MAINTAINERS, **{"author-a": "write"})
+ADMIN_AUTHOR = dict(MAINTAINERS, **{"author-a": "admin"})
+ROLES = (("a contributor", MAINTAINERS), ("a member", MEMBER_AUTHOR), ("an admin", ADMIN_AUTHOR))
 
 
 class Labels(unittest.TestCase):
@@ -90,97 +95,255 @@ class Labels(unittest.TestCase):
         self.assertEqual(v["conclusion"], "success")
 
 
-class Docs(unittest.TestCase):
-    def test_docs_dir_and_markdown_anywhere_pass_on_green(self):
-        v = tp.evaluate(pr(labels=["docs"], files=["docs/guide.md", "README.md", "kernel/README.md"]))
+class Roles(unittest.TestCase):
+    """The author's role is the collaborator permission the fetcher recorded for them; a login the map
+    lacks is not an admin (the stricter gate applies, fail closed)."""
+
+    def test_admin_is_read_from_the_permissions_map(self):
+        self.assertTrue(tp._is_admin(pr(permissions=ADMIN_AUTHOR)))
+        self.assertFalse(tp._is_admin(pr(permissions=MEMBER_AUTHOR)), "write is a member, not an admin")
+        self.assertFalse(tp._is_admin(pr(permissions=dict(MAINTAINERS, **{"author-a": "maintain"}))),
+                         "maintain is a member too")
+        self.assertFalse(tp._is_admin(pr(permissions=MAINTAINERS)), "absent from the map: a contributor")
+        self.assertFalse(tp._is_admin(pr(permissions={})), "an empty map makes nobody an admin")
+        self.assertTrue(tp._is_admin(pr(permissions=MAINTAINERS), "admin-c"))
+        self.assertFalse(tp._is_admin(pr(permissions=MAINTAINERS), "maint-b"))
+
+    def test_members_and_contributors_are_gated_alike(self):
+        # the gates below differ by admin or not; a member and a contributor grade the same on every
+        # tier and on the guard, with and without an admin's approval
+        for kw in (dict(labels=["feature"]),
+                   dict(labels=["feature"], reviews=[review("admin-c")]),
+                   dict(labels=["major-feature"], body="#7", issues=MajorFeature.ISSUE_OK),
+                   dict(labels=["major-feature"], body="#7", issues=MajorFeature.ISSUE_OK, reviews=[review("admin-c")]),
+                   dict(labels=["fix"], files=[".github/workflows/ci.yml"]),
+                   dict(labels=["fix"], files=[".github/workflows/ci.yml"], reviews=[review("admin-c")])):
+            a = tp.evaluate(pr(permissions=MAINTAINERS, **kw))
+            b = tp.evaluate(pr(permissions=MEMBER_AUTHOR, **kw))
+            self.assertEqual(a["conclusion"], b["conclusion"], kw)
+
+
+class OnGreen(unittest.TestCase):
+    """docs and fix: one tier under two labels, merging on green for every author (the owner, 2026-09-08).
+    The check requires no approval; a standing change request by a maintainer other than the author is the
+    one hold, and only that reviewer's next word lifts it."""
+
+    def test_a_fix_passes_on_green_with_no_reviews(self):
+        v = tp.evaluate(pr(labels=["fix"]))
+        self.assertEqual(v["conclusion"], "success")
+        self.assertIn("merges on green", v["summary"])
+        self.assertIn("no approval is required", v["summary"])
+
+    def test_a_docs_pr_passes_the_same_way(self):
+        v = tp.evaluate(pr(labels=["docs"], files=["docs/guide.md"]))
+        self.assertEqual(v["conclusion"], "success")
+        self.assertIn("merges on green", v["summary"])
+
+    def test_every_author_role_merges_on_green(self):
+        for role, perms in ROLES:
+            for tier in ("docs", "fix"):
+                v = tp.evaluate(pr(labels=[tier], permissions=perms))
+                self.assertEqual(v["conclusion"], "success", "%s by %s" % (tier, role))
+                self.assertIn("every author", v["summary"])
+
+    def test_docs_and_fix_are_one_tier(self):
+        # the label names the tier; it does not filter files. The 2026-09-07 text made docs
+        # documentation-only because it alone merged on green; with fix merging on green too the two
+        # labels are one tier to the check, and the same record grades the same under either
+        for files in (["docs/guide.md", "README.md"], ["kernel/kernel.py"], ["VERSION"]):
+            a = tp.evaluate(pr(labels=["docs"], files=files))
+            b = tp.evaluate(pr(labels=["fix"], files=files))
+            self.assertEqual((a["conclusion"], b["conclusion"]), ("success", "success"), files)
+
+    def test_the_pre_rename_label_is_the_same_tier(self):
+        v = tp.evaluate(pr(labels=["tests-only"], files=["docs/guide.md"]))
+        self.assertEqual(v["conclusion"], "success")
+        v = tp.evaluate(pr(labels=["tests-only", "docs"], files=["docs/guide.md"]))
+        self.assertEqual(v["conclusion"], "failure", "both spellings at once are two tier labels")
+        v = tp.evaluate(pr(labels=["docs", "fix"]))
+        self.assertEqual(v["conclusion"], "failure", "one tier, still two labels: the count rule is unchanged")
+
+    def test_an_approval_is_not_required_and_changes_nothing(self):
+        for who in ("maint-b", "admin-c"):
+            v = tp.evaluate(pr(labels=["fix"], reviews=[review(who)], permissions=MAINTAINERS))
+            self.assertEqual(v["conclusion"], "success")
+            self.assertIn("merges on green", v["summary"])
+
+    def test_a_standing_change_request_by_another_maintainer_holds_a_fix(self):
+        v = tp.evaluate(pr(labels=["fix"], permissions=MAINTAINERS,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED")]))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("Changes requested by maint-b", v["summary"])
+        self.assertIn("until they say otherwise", v["summary"])
+
+    def test_the_same_objection_holds_a_docs_pr(self):
+        v = tp.evaluate(pr(labels=["docs"], files=["docs/guide.md"], permissions=MAINTAINERS,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED")]))
+        self.assertEqual(v["conclusion"], "failure")
+
+    def test_the_objection_holds_an_admin_authors_fix_too(self):
+        # a standing objection by a maintainer other than the author blocks every tier for every author
+        v = tp.evaluate(pr(labels=["fix"], permissions=ADMIN_AUTHOR,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED")]))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("maint-b", v["summary"])
+
+    def test_an_objection_on_an_older_head_still_holds(self):
+        # an objection asks "did a maintainer object?"; a push does not answer it, that reviewer does
+        v = tp.evaluate(pr(labels=["fix"], permissions=MAINTAINERS,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED", sha=OLD)]))
+        self.assertEqual(v["conclusion"], "failure")
+
+    def test_another_maintainers_approval_does_not_lift_the_objection(self):
+        # the check requires no approval, so an approval has no role in this tier: an objection is an
+        # objection until its reviewer says otherwise, an admin's approval included
+        v = tp.evaluate(pr(labels=["fix"], permissions=MAINTAINERS,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED"), review("admin-c")]))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("maint-b", v["summary"])
+
+    def test_the_objectors_own_approval_lifts_it(self):
+        v = tp.evaluate(pr(labels=["fix"], permissions=MAINTAINERS,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED", submitted=NOW - 600),
+                                    review("maint-b", submitted=NOW - 60)]))
         self.assertEqual(v["conclusion"], "success")
 
-    def test_a_non_doc_file_breaks_the_docs_tier(self):
-        v = tp.evaluate(pr(labels=["docs"], files=["docs/guide.md", "kernel/kernel.py"]))
-        self.assertEqual(v["conclusion"], "failure")
-        self.assertIn("kernel/kernel.py", v["summary"])
+    def test_an_objection_by_a_reviewer_without_write_does_not_hold(self):
+        v = tp.evaluate(pr(labels=["fix"], permissions={"drive-by-d": "read"},
+                           reviews=[review("drive-by-d", state="CHANGES_REQUESTED")]))
+        self.assertEqual(v["conclusion"], "success", "the rule names a maintainer other than the author")
 
-    def test_markdown_under_github_or_scripts_is_never_docs(self):
-        for f in (".github/PULL_REQUEST_TEMPLATE.md", "scripts/ci/README.md"):
-            v = tp.evaluate(pr(labels=["docs"], files=[f]))
-            self.assertEqual(v["conclusion"], "failure", f)
+    def test_the_authors_own_change_request_is_not_an_objection(self):
+        v = tp.evaluate(pr(labels=["fix"], permissions=MEMBER_AUTHOR,
+                           reviews=[review("author-a", state="CHANGES_REQUESTED")]))
+        self.assertEqual(v["conclusion"], "success", "the rule names a maintainer OTHER than the author")
 
-    def test_VERSION_is_not_docs(self):
-        # the release script's PR touches exactly this file — the open question for the maintainers
-        v = tp.evaluate(pr(labels=["docs"], files=["VERSION"]))
+
+class Feature(unittest.TestCase):
+    """feature: by an admin author, merges on green (the owner's features merge straight away); by a member
+    or a contributor, one approval by an admin other than the author on the current head (the owner looks
+    first). No issue, no discussion, no waiting period."""
+
+    def test_an_admin_authors_feature_passes_with_no_reviews(self):
+        v = tp.evaluate(pr(labels=["feature"], permissions=ADMIN_AUTHOR))
+        self.assertEqual(v["conclusion"], "success")
+        self.assertIn("admin author merges on green", v["summary"])
+
+    def test_an_admin_authors_feature_is_still_held_by_a_standing_objection(self):
+        v = tp.evaluate(pr(labels=["feature"], permissions=ADMIN_AUTHOR,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED")]))
         self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("Changes requested by maint-b", v["summary"])
+
+    def test_a_member_authors_feature_fails_without_an_admin_approval(self):
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("no approval by an admin", v["summary"])
+
+    def test_a_member_authors_feature_fails_with_a_write_holders_approval(self):
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR, reviews=[review("maint-b")]))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("maint-b approved but does not hold admin", v["summary"])
+
+    def test_a_member_authors_feature_passes_with_an_admin_approval_on_the_current_head(self):
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR, reviews=[review("admin-c")]))
+        self.assertEqual(v["conclusion"], "success")
+        self.assertIn("Approved by admin-c", v["summary"])
+
+    def test_a_member_authors_feature_fails_with_an_admin_approval_on_an_older_head(self):
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR, reviews=[review("admin-c", sha=OLD)]))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("older head", v["summary"])
+
+    def test_a_contributors_feature_is_gated_like_a_members(self):
+        v = tp.evaluate(pr(labels=["feature"], permissions=MAINTAINERS))
+        self.assertEqual(v["conclusion"], "failure")
+        v = tp.evaluate(pr(labels=["feature"], permissions=MAINTAINERS, reviews=[review("maint-b")]))
+        self.assertEqual(v["conclusion"], "failure", "a write-holder's approval meets no gate")
+        v = tp.evaluate(pr(labels=["feature"], permissions=MAINTAINERS, reviews=[review("admin-c")]))
+        self.assertEqual(v["conclusion"], "success")
+
+    def test_an_author_the_permissions_map_lacks_is_not_an_admin(self):
+        # an older fetcher's record, or a hand-built one, without the author's permission: fail closed
+        v = tp.evaluate(pr(labels=["feature"], permissions={}))
+        self.assertEqual(v["conclusion"], "failure")
+
+    def test_a_discussed_issue_is_not_asked_of_a_feature_and_does_not_stand_in_for_the_approval(self):
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR, body="#7", issues=MajorFeature.ISSUE_OK))
+        self.assertEqual(v["conclusion"], "failure")
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR, reviews=[review("admin-c")]))
+        self.assertEqual(v["conclusion"], "success", "no issue linked, and none needed")
 
 
 class Approval(unittest.TestCase):
-    def test_a_maintainer_approval_on_the_current_head_counts(self):
-        v = tp.evaluate(pr(labels=["feature"], reviews=[review("maint-b")], permissions=MAINTAINERS))
+    """What counts as an approval, and how a reviewer's standing is read. Exercised on a member author's
+    feature (which needs an admin's approval) and on fix (where only an objection matters)."""
+
+    def test_an_admin_approval_on_the_current_head_counts(self):
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR, reviews=[review("admin-c")]))
         self.assertEqual(v["conclusion"], "success")
 
     def test_the_author_cannot_approve_their_own_pr(self):
-        v = tp.evaluate(pr(labels=["feature"], author="maint-b", reviews=[review("maint-b")],
-                           permissions=MAINTAINERS))
-        self.assertEqual(v["conclusion"], "failure")
+        # no gate asks an admin author for an approval, so this is pinned on the helper: were one added,
+        # the author's own word still would not meet it
+        ok, why = tp._approved_by_admin(pr(author="admin-c", permissions=MAINTAINERS, reviews=[review("admin-c")]))
+        self.assertFalse(ok)
+        self.assertIn("no approval by an admin other than the author", why)
 
     def test_a_reviewer_without_write_does_not_count(self):
         v = tp.evaluate(pr(labels=["feature"], reviews=[review("drive-by-d")],
                            permissions={"drive-by-d": "read"}))
         self.assertEqual(v["conclusion"], "failure")
-
-    def test_an_approval_on_an_older_head_needs_re_approval(self):
-        v = tp.evaluate(pr(labels=["feature"], reviews=[review("maint-b", sha=OLD)], permissions=MAINTAINERS))
-        self.assertEqual(v["conclusion"], "failure")
-        self.assertIn("head", v["summary"].lower())
+        self.assertNotIn("drive-by-d", v["summary"], "a read-only reviewer is not the nearest miss to name")
 
     def test_only_the_LATEST_review_per_reviewer_counts(self):
         # approved, then changes requested: the latest word stands
-        v = tp.evaluate(pr(labels=["feature"], permissions=MAINTAINERS,
-                           reviews=[review("maint-b", submitted=NOW - 600),
-                                    review("maint-b", state="CHANGES_REQUESTED", submitted=NOW - 60)]))
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR,
+                           reviews=[review("admin-c", submitted=NOW - 600),
+                                    review("admin-c", state="CHANGES_REQUESTED", submitted=NOW - 60)]))
         self.assertEqual(v["conclusion"], "failure")
         # changes requested, then approved: also the latest word
-        v = tp.evaluate(pr(labels=["feature"], permissions=MAINTAINERS,
-                           reviews=[review("maint-b", state="CHANGES_REQUESTED", submitted=NOW - 600),
-                                    review("maint-b", submitted=NOW - 60)]))
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR,
+                           reviews=[review("admin-c", state="CHANGES_REQUESTED", submitted=NOW - 600),
+                                    review("admin-c", submitted=NOW - 60)]))
         self.assertEqual(v["conclusion"], "success")
 
     def test_dismissing_a_later_objection_does_not_revive_an_earlier_approval(self):
         # a DISMISSED review is the reviewer's latest word (a non-approval), never an erasure: anyone
-        # with write can dismiss, and both maintainers hold write - the review's catch
-        v = tp.evaluate(pr(labels=["feature"], permissions=MAINTAINERS,
-                           reviews=[review("maint-b", submitted=NOW - 600),
-                                    review("maint-b", state="CHANGES_REQUESTED", submitted=NOW - 60, dismissed=True,
-                                           dismissed_by="maint-b")]))
+        # with write can dismiss - the review's catch
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR,
+                           reviews=[review("admin-c", submitted=NOW - 600),
+                                    review("admin-c", state="CHANGES_REQUESTED", submitted=NOW - 60, dismissed=True,
+                                           dismissed_by="admin-c")]))
         self.assertEqual(v["conclusion"], "failure")
 
     # Dismissals read fail-closed in both directions. A dismissed APPROVED never counts, whoever dismissed
     # it: a review dismisses only once, so ignoring a third party's dismissal would let the author spend
-    # it first and lock the peer's approval in while the PR page shows it struck out (the review's catch
-    # against the symmetric rule), and on a fork PR "anyone else" is the OTHER maintainer, whose veto by
-    # dismissal would vanish. A dismissed CHANGES_REQUESTED clears only when the reviewer dismissed it
-    # themselves; the author (write access too) cannot dismiss the peer's objection to reopen the
-    # seven-day path (the maintainers' ruling, 2026-09-07).
+    # it first and lock the approval in while the PR page shows it struck out (the review's catch
+    # against the symmetric rule). A dismissed CHANGES_REQUESTED clears only when the reviewer dismissed it
+    # themselves; an author with write access cannot dismiss the peer's objection to merge on green
+    # (the maintainers' ruling of 2026-09-07, kept through the owner's rules of 2026-09-08).
     def test_a_reviewer_dismissing_their_own_objection_clears_it(self):
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY,
-                           permissions=MAINTAINERS,
+        v = tp.evaluate(pr(labels=["fix"], permissions=MAINTAINERS,
                            reviews=[review("maint-b", state="CHANGES_REQUESTED", dismissed=True, dismissed_by="maint-b")]))
         self.assertEqual(v["conclusion"], "success", "withdrawn by its author: not a standing objection")
 
-    def test_the_author_cannot_dismiss_the_peers_objection_to_reopen_the_seven_day_path(self):
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY,
-                           permissions=MAINTAINERS,
-                           reviews=[review("maint-b", state="CHANGES_REQUESTED", dismissed=True, dismissed_by="author-a")]))
-        self.assertEqual(v["conclusion"], "failure")
-        self.assertIn("Changes requested by maint-b", v["summary"])
+    def test_the_author_cannot_dismiss_the_peers_objection_to_merge_on_green(self):
+        for perms in (MEMBER_AUTHOR, ADMIN_AUTHOR):
+            v = tp.evaluate(pr(labels=["fix"], permissions=perms,
+                               reviews=[review("maint-b", state="CHANGES_REQUESTED", dismissed=True, dismissed_by="author-a")]))
+            self.assertEqual(v["conclusion"], "failure")
+            self.assertIn("Changes requested by maint-b", v["summary"])
 
     def test_a_reviewer_dismissing_their_own_approval_withdraws_it(self):
-        v = tp.evaluate(pr(labels=["feature"], reviews=[review("maint-b", dismissed=True, dismissed_by="maint-b")],
-                           permissions=MAINTAINERS))
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR,
+                           reviews=[review("admin-c", dismissed=True, dismissed_by="admin-c")]))
         self.assertEqual(v["conclusion"], "failure")
 
     def test_an_approval_dismissed_by_anyone_never_counts(self):
-        for who in ("author-a", "admin-c"):          # the author; the other maintainer on a fork PR
-            v = tp.evaluate(pr(labels=["feature"], reviews=[review("maint-b", dismissed=True, dismissed_by=who)],
-                               permissions=MAINTAINERS))
+        for who in ("author-a", "maint-b"):          # the author; another maintainer
+            v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR,
+                               reviews=[review("admin-c", dismissed=True, dismissed_by=who)]))
             self.assertEqual(v["conclusion"], "failure", "dismissed by %s: the PR page shows it struck out" % who)
 
     def test_a_reviewer_whose_objection_was_dismissed_by_another_lifts_it_by_approving(self):
@@ -192,143 +355,95 @@ class Approval(unittest.TestCase):
 
     def test_a_dismissal_of_unknown_actor_fails_closed_both_ways(self):
         # the fetcher raises before it builds such a record; the policy still fails closed on it
-        v = tp.evaluate(pr(labels=["feature"], reviews=[review("maint-b", dismissed=True)], permissions=MAINTAINERS))
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR, reviews=[review("admin-c", dismissed=True)]))
         self.assertEqual(v["conclusion"], "failure", "an approval dismissed by nobody-knows-who is no approval")
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY,
-                           permissions=MAINTAINERS,
+        v = tp.evaluate(pr(labels=["fix"], permissions=MAINTAINERS,
                            reviews=[review("maint-b", state="CHANGES_REQUESTED", dismissed=True)]))
         self.assertEqual(v["conclusion"], "failure", "...and an objection dismissed by nobody-knows-who still stands")
 
     def test_a_comment_review_is_not_an_approval(self):
-        v = tp.evaluate(pr(labels=["feature"], reviews=[review("maint-b", state="COMMENTED")],
-                           permissions=MAINTAINERS))
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR, reviews=[review("admin-c", state="COMMENTED")]))
         self.assertEqual(v["conclusion"], "failure")
 
     def test_a_later_comment_review_does_not_erase_an_approval(self):
         # GitHub records every inline comment as a COMMENTED review; a reviewer's standing is their
         # latest APPROVED / CHANGES_REQUESTED / DISMISSED and comments never change it - the review's
         # catch: a maintainer who approved and then left one note read as "no approval"
-        v = tp.evaluate(pr(labels=["feature"], permissions=MAINTAINERS,
-                           reviews=[review("maint-b", submitted=NOW - 600),
-                                    review("maint-b", state="COMMENTED", submitted=NOW - 60)]))
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR,
+                           reviews=[review("admin-c", submitted=NOW - 600),
+                                    review("admin-c", state="COMMENTED", submitted=NOW - 60)]))
         self.assertEqual(v["conclusion"], "success")
 
     def test_a_later_comment_review_does_not_lift_a_change_request(self):
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY,
-                           permissions=MAINTAINERS,
+        v = tp.evaluate(pr(labels=["fix"], permissions=MAINTAINERS,
                            reviews=[review("maint-b", state="CHANGES_REQUESTED", submitted=NOW - 600),
                                     review("maint-b", state="COMMENTED", submitted=NOW - 60)]))
         self.assertEqual(v["conclusion"], "failure", "the objection stands; a comment is not saying otherwise")
 
     def test_a_pending_review_changes_nothing(self):
-        v = tp.evaluate(pr(labels=["feature"], permissions=MAINTAINERS,
-                           reviews=[review("maint-b", submitted=NOW - 600),
-                                    review("maint-b", state="PENDING", submitted=NOW - 60)]))
+        v = tp.evaluate(pr(labels=["feature"], permissions=MEMBER_AUTHOR,
+                           reviews=[review("admin-c", submitted=NOW - 600),
+                                    review("admin-c", state="PENDING", submitted=NOW - 60)]))
         self.assertEqual(v["conclusion"], "success")
-
-
-class Fix(unittest.TestCase):
-    def test_a_fix_with_approval_passes(self):
-        v = tp.evaluate(pr(labels=["fix"], reviews=[review("maint-b")], permissions=MAINTAINERS))
-        self.assertEqual(v["conclusion"], "success")
-
-    def test_a_fix_passes_after_seven_unchanged_days_from_the_first_check_run(self):
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 7 * DAY - 1, head_floor=NOW - 8 * DAY))
-        self.assertEqual(v["conclusion"], "success")
-        self.assertIn("seven", v["summary"].lower())
-
-    def test_a_fix_under_seven_days_waits(self):
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 7 * DAY + 3600))
-        self.assertEqual(v["conclusion"], "failure")
-
-    def test_a_head_with_no_verdict_yet_has_not_started_its_clock(self):
-        # the run that first evaluates a head posts the verdict that stamps it; until then the clock has
-        # not started (since is None), so it can never be older than the gate's first look - and created_at is no longer a
-        # fallback that loosens the gate (the review's catch)
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=None, created_at=NOW - 8 * DAY, head_floor=NOW - 8 * DAY))
-        self.assertEqual(v["conclusion"], "failure")
-        self.assertIn("starts with this run", v["summary"])
-
-    def test_a_record_without_a_head_floor_never_passes_the_clock(self):
-        # fail closed on a missing input: the fetcher always sets head_floor, so its absence is a bug
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 30 * DAY, head_floor=None))
-        self.assertEqual(v["conclusion"], "failure")
-
-    def test_the_seven_day_boundary_is_inclusive(self):
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 7 * DAY, head_floor=NOW - 8 * DAY))
-        self.assertEqual(v["conclusion"], "success", "exactly seven days passes")
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 7 * DAY + 1, head_floor=NOW - 8 * DAY))
-        self.assertEqual(v["conclusion"], "failure", "one second short waits")
-
-    def test_created_at_is_not_a_clock_input(self):
-        self.assertNotIn("created_at", " ".join(str(c) for c in tp._clock_since.__code__.co_consts))
-
-    def test_a_force_push_back_to_an_old_head_restarts_the_clock(self):
-        # the review's critical catch: check runs are keyed by sha, so a sha seen for a minute on
-        # day 0 and force-pushed back on day 7 read as seven days old. head_floor is the later of
-        # created_at and every force-push / reopen / ready-for-review event - the clock is bound to
-        # the head's time as THIS PR's reviewable head, not the sha's age
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 3600))
-        self.assertEqual(v["conclusion"], "failure")
-        self.assertIn("became the PR's head", v["summary"])
-
-    def test_a_new_pr_reusing_an_old_head_starts_its_own_clock(self):
-        # PR B opened from PR A's branch: A's old check runs must not spend B's seven days
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 30 * DAY, created_at=NOW - DAY,
-                           head_floor=NOW - DAY))
-        self.assertEqual(v["conclusion"], "failure")
-
-    def test_the_clock_is_the_later_of_head_arrival_and_first_run(self):
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY))
-        self.assertEqual(v["conclusion"], "success", "both bounds are older than seven days")
-
-    def test_the_record_carries_no_commit_date_for_the_clock_to_read(self):
-        # the clock's only inputs are first_check_at and head_floor (never created_at) - the fetcher's record
-        # has no commit-date field at all (pinned in FetcherShapes below), so a forged commit date has
-        # no way into the policy
-        import types
-        consts = " ".join(str(c) for f in vars(tp).values() if isinstance(f, types.FunctionType)
-                          for c in f.__code__.co_consts)
-        self.assertIn("first_check_at", consts)
-        self.assertIn("head_floor", consts)
-        self.assertNotIn("created_at", " ".join(str(c) for c in tp._clock_since.__code__.co_consts))
-        for forged in ("committer", "author_date", "commit_date"):
-            self.assertNotIn(forged, consts)
-
-    def test_changes_requested_blocks_the_seven_day_path(self):
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, permissions=MAINTAINERS,
-                           reviews=[review("maint-b", state="CHANGES_REQUESTED")]))
-        self.assertEqual(v["conclusion"], "failure")
-
-    def test_changes_requested_on_an_OLD_head_still_blocks_the_clock(self):
-        # the seven-day path asks "did any reviewer object?" — an objection on an older head is
-        # still an objection until that reviewer says otherwise
-        v = tp.evaluate(pr(labels=["fix"], first_check_at=NOW - 8 * DAY, permissions=MAINTAINERS,
-                           reviews=[review("maint-b", state="CHANGES_REQUESTED", sha=OLD)]))
-        self.assertEqual(v["conclusion"], "failure")
 
 
 class MajorFeature(unittest.TestCase):
+    """major-feature: for every author, a linked issue someone other than the author commented on (the
+    write-up and its discussion); a member or a contributor additionally needs an admin's approval on the
+    current head."""
     ISSUE_OK = {7: {"exists": True, "is_pr": False, "user": "author-a", "comments": ["maint-b"]}}
 
-    def test_approval_plus_a_discussed_linked_issue_passes(self):
-        v = tp.evaluate(pr(labels=["major-feature"], reviews=[review("maint-b")], permissions=MAINTAINERS,
+    def test_an_admin_authors_major_feature_passes_on_a_discussed_issue_alone(self):
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=ADMIN_AUTHOR,
                            body="Design discussion in #7.", issues=self.ISSUE_OK))
+        self.assertEqual(v["conclusion"], "success")
+        self.assertIn("issue #7", v["summary"])
+
+    def test_an_admin_authors_major_feature_fails_without_the_discussion(self):
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=ADMIN_AUTHOR))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("discussed linked issue", v["summary"])
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=ADMIN_AUTHOR, reviews=[review("admin-c")]))
+        self.assertEqual(v["conclusion"], "failure", "another admin's approval does not stand in for the write-up")
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=ADMIN_AUTHOR, body="#7",
+                           issues={7: {"exists": True, "is_pr": False, "user": "author-a", "comments": ["author-a"]}}))
+        self.assertEqual(v["conclusion"], "failure", "the author's own comments are not a discussion")
+
+    def test_a_member_authors_major_feature_needs_both(self):
+        discussed = dict(labels=["major-feature"], permissions=MEMBER_AUTHOR, body="#7", issues=self.ISSUE_OK)
+        v = tp.evaluate(pr(**discussed))
+        self.assertEqual(v["conclusion"], "failure", "discussed, unapproved")
+        self.assertIn("needs an admin's approval", v["summary"])
+        v = tp.evaluate(pr(**dict(discussed, reviews=[review("maint-b")])))
+        self.assertEqual(v["conclusion"], "failure", "a write-holder's approval meets no gate")
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=MEMBER_AUTHOR, reviews=[review("admin-c")]))
+        self.assertEqual(v["conclusion"], "failure", "approved, undiscussed")
+        self.assertIn("discussed linked issue is required", v["summary"])
+        v = tp.evaluate(pr(**dict(discussed, reviews=[review("admin-c")])))
+        self.assertEqual(v["conclusion"], "success")
+        self.assertIn("Approved by admin-c", v["summary"])
+        self.assertIn("issue #7", v["summary"])
+
+    def test_a_contributors_major_feature_needs_both_as_well(self):
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=MAINTAINERS, body="#7", issues=self.ISSUE_OK))
+        self.assertEqual(v["conclusion"], "failure")
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=MAINTAINERS, body="#7", issues=self.ISSUE_OK,
+                           reviews=[review("admin-c")]))
         self.assertEqual(v["conclusion"], "success")
 
     def test_an_issue_url_counts_too(self):
-        v = tp.evaluate(pr(labels=["major-feature"], reviews=[review("maint-b")], permissions=MAINTAINERS,
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=ADMIN_AUTHOR,
                            body="See https://github.com/romp-on/romp/issues/7 for the discussion.",
                            issues=self.ISSUE_OK))
         self.assertEqual(v["conclusion"], "success")
 
     def test_approval_without_a_linked_issue_fails(self):
-        v = tp.evaluate(pr(labels=["major-feature"], reviews=[review("maint-b")], permissions=MAINTAINERS))
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=MEMBER_AUTHOR, reviews=[review("admin-c")]))
         self.assertEqual(v["conclusion"], "failure")
         self.assertIn("issue", v["summary"].lower())
 
     def test_a_linked_issue_with_only_the_authors_comments_is_not_a_discussion(self):
-        v = tp.evaluate(pr(labels=["major-feature"], reviews=[review("maint-b")], permissions=MAINTAINERS,
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=MEMBER_AUTHOR, reviews=[review("admin-c")],
                            body="#7", issues={7: {"exists": True, "is_pr": False, "user": "author-a",
                                                    "comments": ["author-a"]}}))
         self.assertEqual(v["conclusion"], "failure")
@@ -337,109 +452,130 @@ class MajorFeature(unittest.TestCase):
         # the maintainers' ruling (2026-09-07, the discussion issue's third point): discussion means a
         # COMMENT by someone other than the author; an issue a maintainer filed and the author answered
         # alone is not one, and the fetcher no longer records the opener
-        v = tp.evaluate(pr(labels=["major-feature"], reviews=[review("maint-b")], permissions=MAINTAINERS,
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=MEMBER_AUTHOR, reviews=[review("admin-c")],
                            body="#7", issues={7: {"exists": True, "is_pr": False, "user": "maint-b",
                                                    "comments": ["author-a"]}}))
         self.assertEqual(v["conclusion"], "failure")
         self.assertIn("comment by someone other than the author", v["summary"])
 
     def test_a_linked_PR_number_is_not_an_issue(self):
-        v = tp.evaluate(pr(labels=["major-feature"], reviews=[review("maint-b")], permissions=MAINTAINERS,
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=ADMIN_AUTHOR,
                            body="#7", issues={7: {"exists": True, "is_pr": True, "user": "maint-b",
                                                    "comments": ["maint-b"]}}))
         self.assertEqual(v["conclusion"], "failure")
 
-    def test_a_discussed_issue_without_approval_fails(self):
-        v = tp.evaluate(pr(labels=["major-feature"], body="#7", issues=self.ISSUE_OK))
+    def test_an_approval_on_an_older_head_fails_here_too(self):
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=MEMBER_AUTHOR, reviews=[review("admin-c", sha=OLD)],
+                           body="#7", issues=self.ISSUE_OK))
         self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("older head", v["summary"])
+
+    def test_a_standing_objection_holds_a_discussed_and_approved_major_feature(self):
+        for perms in (MEMBER_AUTHOR, ADMIN_AUTHOR):
+            v = tp.evaluate(pr(labels=["major-feature"], permissions=perms, body="#7", issues=self.ISSUE_OK,
+                               reviews=[review("admin-c"), review("maint-b", state="CHANGES_REQUESTED")]))
+            self.assertEqual(v["conclusion"], "failure")
+            self.assertIn("maint-b", v["summary"])
 
 
-class ChainStart(unittest.TestCase):
-    """first_check_at is the start of the unbroken chain of THIS PR's hourly verdicts on the head, anchored
-    at now - the review's critical catch: check runs are keyed by sha, so a sibling PR fast-forwarded onto
-    a head the other maintainer had vetoed inherited the first PR's seven days while the veto (a review on
-    the OTHER PR) stayed invisible; and a sha force-pushed away and plain-pushed back kept its day-0 stamp."""
-    GAP = 6 * 3600
-    H = 3600
+class NoTimePath(unittest.TestCase):
+    """No tier has a time-based path (the owner, 2026-09-08). Mutation guard in both directions: the
+    seven-day clock the 2026-09-07 text gave fix is gone from the module, and a record still carrying the
+    old clock keys (an older fetcher, a hand-built fixture) changes no verdict."""
 
-    def test_no_stamps_means_no_clock(self):
-        self.assertIsNone(tp.chain_start([], NOW, self.GAP))
+    def test_the_module_has_no_clock(self):
+        for gone in ("SEVEN_DAYS", "chain_start", "_clock_since", "_is_doc"):
+            self.assertFalse(hasattr(tp, gone), gone)
+        consts = " ".join(str(c) for f in vars(tp).values() if isinstance(f, types.FunctionType)
+                          for c in f.__code__.co_consts)
+        for key in ("first_check_at", "head_floor", "created_at", "now", "seven", "days",
+                    "committer", "author_date", "commit_date"):
+            self.assertIsNone(re.search(r"\b%s\b" % key, consts), key)
 
-    def test_an_unbroken_hourly_chain_starts_at_its_first_stamp(self):
-        stamps = [NOW - k * self.H for k in range(1, 200)]
-        self.assertEqual(tp.chain_start(stamps, NOW, self.GAP), NOW - 199 * self.H)
-
-    def test_a_gap_longer_than_the_tolerance_restarts_the_chain(self):
-        # day-0 stamps, the head away for a week, back for three hours: three hours of credit, not a week
-        stamps = [NOW - 8 * DAY - k * self.H for k in range(3)] + [NOW - k * self.H for k in range(1, 4)]
-        self.assertEqual(tp.chain_start(stamps, NOW, self.GAP), NOW - 3 * self.H)
-
-    def test_a_stale_chain_is_no_chain(self):
-        # the head carried verdicts for eight days, then was not the head; back now with no verdict yet
-        stamps = [NOW - 2 * DAY - k * self.H for k in range(1, 8 * 24)]
-        self.assertIsNone(tp.chain_start(stamps, NOW, self.GAP))
-
-    def test_missed_sweeps_within_the_tolerance_do_not_break_the_chain(self):
-        stamps = [NOW - self.H, NOW - 5 * self.H, NOW - 9 * self.H]
-        self.assertEqual(tp.chain_start(stamps, NOW, self.GAP), NOW - 9 * self.H)
-
-
-class OnlyFixHasAClock(unittest.TestCase):
-    """Mutation guard (the review's catch): the seven-day path copied into feature, or major-feature
-    relaxed to discussion-plus-seven-days, survived every fixture because each failing one was a day old."""
-
-    def test_an_old_unapproved_feature_still_fails(self):
-        v = tp.evaluate(pr(labels=["feature"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY))
-        self.assertEqual(v["conclusion"], "failure")
-
-    def test_an_old_discussed_unapproved_major_feature_still_fails(self):
-        v = tp.evaluate(pr(labels=["major-feature"], first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY,
-                           body="#7", issues=MajorFeature.ISSUE_OK))
-        self.assertEqual(v["conclusion"], "failure")
+    def test_stale_clock_keys_on_a_record_change_nothing(self):
+        stale = {"first_check_at": NOW - 30 * DAY, "head_floor": NOW - 30 * DAY,
+                 "created_at": NOW - 30 * DAY, "now": NOW}
+        for perms in (MAINTAINERS, MEMBER_AUTHOR):
+            v = tp.evaluate(pr(labels=["feature"], permissions=perms, **stale))
+            self.assertEqual(v["conclusion"], "failure", "a month-old unapproved feature still waits for its approval")
+            v = tp.evaluate(pr(labels=["major-feature"], permissions=perms, body="#7", issues=MajorFeature.ISSUE_OK, **stale))
+            self.assertEqual(v["conclusion"], "failure", "...and a month-old discussed one too")
+            v = tp.evaluate(pr(labels=["fix"], files=["scripts/ci/tier_policy.py"], permissions=perms, **stale))
+            self.assertEqual(v["conclusion"], "failure", "nor is the guard on the gate's own code outwaited")
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=ADMIN_AUTHOR, **stale))
+        self.assertEqual(v["conclusion"], "failure", "an admin author's month-old undiscussed major feature still waits")
+        v = tp.evaluate(pr(labels=["fix"], permissions=MAINTAINERS,
+                           reviews=[review("maint-b", state="CHANGES_REQUESTED")], **stale))
+        self.assertEqual(v["conclusion"], "failure", "an objection is not outwaited")
+        for label in ("fix", "feature", "major-feature"):
+            self.assertNotIn("seven", tp.evaluate(pr(labels=[label], **stale))["summary"].lower())
 
 
 class GithubDir(unittest.TestCase):
+    """The gate's own files: a member or a contributor needs an admin's approval whatever the tier (merging
+    on green never clears them, and a write-holder's approval meets no gate); an admin author, the owner,
+    is exempt."""
+
     def test_a_file_listing_the_api_truncated_makes_the_unseen_files_guarded(self):
         # the files endpoint returns at most 3000 entries; when the PR's changed_files says there are
-        # more, the unseen files are assumed guarded and not documentation
+        # more, the unseen files are assumed guarded
         v = tp.evaluate(pr(labels=["docs"], files=["docs/a.md"], files_truncated=True))
-        self.assertEqual(v["conclusion"], "failure")
+        self.assertEqual(v["conclusion"], "failure", "docs merges on green, but not with unseen files")
         self.assertIn("3000", v["summary"])
-        v = tp.evaluate(pr(labels=["fix"], files_truncated=True, first_check_at=NOW - 8 * DAY, head_floor=NOW - 9 * DAY))
-        self.assertEqual(v["conclusion"], "failure", "the seven-day path never clears an unseen file")
+        v = tp.evaluate(pr(labels=["fix"], files_truncated=True))
+        self.assertEqual(v["conclusion"], "failure", "the same for fix")
         v = tp.evaluate(pr(labels=["fix"], files_truncated=True, reviews=[review("maint-b")], permissions=MAINTAINERS))
-        self.assertEqual(v["conclusion"], "success", "an approval does")
+        self.assertEqual(v["conclusion"], "failure", "a write-holder's approval does not clear it")
+        v = tp.evaluate(pr(labels=["fix"], files_truncated=True, reviews=[review("admin-c")], permissions=MAINTAINERS))
+        self.assertEqual(v["conclusion"], "success", "an admin's approval clears it")
+        v = tp.evaluate(pr(labels=["fix"], files_truncated=True, permissions=ADMIN_AUTHOR))
+        self.assertEqual(v["conclusion"], "success", "an admin author is exempt: the unseen files are the owner's own")
 
-    def test_the_gates_own_code_needs_an_approval_regardless_of_tier(self):
-        # the review's catch: the policy is checked out from main and run with checks:write, so a
-        # fix-tier PR rewriting scripts/ci/tier_policy.py through the seven-day path would grade itself
-        v = tp.evaluate(pr(labels=["fix"], files=["scripts/ci/tier_policy.py"], first_check_at=NOW - 30 * DAY,
-                           head_floor=NOW - 30 * DAY))
-        self.assertEqual(v["conclusion"], "failure")
-        self.assertIn("scripts/ci/tier_policy.py", v["summary"])
-        v = tp.evaluate(pr(labels=["fix"], files=["scripts/ci/tier_policy.py"], reviews=[review("maint-b")],
-                           permissions=MAINTAINERS))
-        self.assertEqual(v["conclusion"], "success")
+    def test_the_gates_own_code_needs_an_admins_approval_from_a_non_admin_author(self):
+        # the policy is checked out from main and run with checks:write, so a PR rewriting
+        # scripts/ci/tier_policy.py and merging on green would have graded itself
+        for perms in (MAINTAINERS, MEMBER_AUTHOR):
+            for tier in ("docs", "fix"):
+                v = tp.evaluate(pr(labels=[tier], files=["scripts/ci/tier_policy.py"], permissions=perms))
+                self.assertEqual(v["conclusion"], "failure", tier)
+                self.assertIn("scripts/ci/tier_policy.py", v["summary"])
+                self.assertIn("admin's approval", v["summary"])
+            v = tp.evaluate(pr(labels=["fix"], files=["scripts/ci/tier_policy.py"], reviews=[review("maint-b")],
+                               permissions=perms))
+            self.assertEqual(v["conclusion"], "failure", "a write-holder's approval does not meet the guard")
+            v = tp.evaluate(pr(labels=["fix"], files=["scripts/ci/tier_policy.py"], reviews=[review("admin-c")],
+                               permissions=perms))
+            self.assertEqual(v["conclusion"], "success")
 
-    def test_touching_github_requires_approval_regardless_of_tier(self):
-        v = tp.evaluate(pr(labels=["fix"], files=[".github/workflows/ci.yml"], first_check_at=NOW - 30 * DAY,
-                           head_floor=NOW - 30 * DAY))
-        self.assertEqual(v["conclusion"], "failure", "the seven-day path never clears a .github change")
+    def test_touching_github_requires_an_admins_approval_regardless_of_tier(self):
+        v = tp.evaluate(pr(labels=["fix"], files=[".github/workflows/ci.yml"], permissions=MEMBER_AUTHOR))
+        self.assertEqual(v["conclusion"], "failure", "merging on green never clears a .github change")
         self.assertIn(".github", v["summary"])
-        v = tp.evaluate(pr(labels=["fix"], files=[".github/workflows/ci.yml"], reviews=[review("maint-b")],
-                           permissions=MAINTAINERS))
+        v = tp.evaluate(pr(labels=["docs"], files=[".github/PULL_REQUEST_TEMPLATE.md"], permissions=MEMBER_AUTHOR))
+        self.assertEqual(v["conclusion"], "failure", "markdown under .github is still .github")
+        v = tp.evaluate(pr(labels=["fix"], files=[".github/workflows/ci.yml"], reviews=[review("admin-c")],
+                           permissions=MEMBER_AUTHOR))
         self.assertEqual(v["conclusion"], "success")
+        v = tp.evaluate(pr(labels=["feature"], files=[".github/workflows/ci.yml"], reviews=[review("admin-c")],
+                           permissions=MEMBER_AUTHOR))
+        self.assertEqual(v["conclusion"], "success", "one admin approval meets the guard and the feature gate")
 
-    def test_docs_label_on_a_github_file_fails_as_not_documentation(self):
-        v = tp.evaluate(pr(labels=["docs"], files=[".github/workflows/ci.yml"]))
+    def test_an_admin_author_is_exempt_from_the_guard(self):
+        # the owner may change the gate; the guard exists so that nobody else rewrites it unread
+        for tier in ("docs", "fix", "feature"):
+            v = tp.evaluate(pr(labels=[tier], permissions=ADMIN_AUTHOR,
+                               files=[".github/workflows/tier-policy.yml", "scripts/ci/tier_policy.py"]))
+            self.assertEqual(v["conclusion"], "success", tier)
+        v = tp.evaluate(pr(labels=["major-feature"], permissions=ADMIN_AUTHOR, files=[".github/workflows/ci.yml"],
+                           body="#7", issues=MajorFeature.ISSUE_OK))
+        self.assertEqual(v["conclusion"], "success", "the tier's own gate still applies, the guard does not")
+
+    def test_an_objection_holds_a_guarded_fix_even_when_an_admin_approved(self):
+        # the approval meets the guard; the objection still holds the tier
+        v = tp.evaluate(pr(labels=["fix"], files=[".github/workflows/ci.yml"], permissions=MAINTAINERS,
+                           reviews=[review("admin-c"), review("maint-b", state="CHANGES_REQUESTED")]))
         self.assertEqual(v["conclusion"], "failure")
-        self.assertIn(".github/workflows/ci.yml", v["summary"], "named as not-documentation")
-
-    def test_the_pre_rename_label_reads_as_docs_during_the_transition(self):
-        v = tp.evaluate(pr(labels=["tests-only"], files=["docs/guide.md"]))
-        self.assertEqual(v["conclusion"], "success")
-        v = tp.evaluate(pr(labels=["tests-only", "docs"], files=["docs/guide.md"]))
-        self.assertEqual(v["conclusion"], "failure", "both spellings at once are two tier labels")
+        self.assertIn("maint-b", v["summary"])
 
 
 class Verdict(unittest.TestCase):
@@ -460,6 +596,11 @@ class WorkflowPins(unittest.TestCase):
     def test_the_check_run_is_named_tier_policy(self):
         self.assertIn("name: Tier policy", self.wf)
         self.assertIn('CHECK_NAME = "Tier policy"', self.fetch)
+
+    def test_the_header_states_the_rules_by_the_authors_role(self):
+        head = self.wf[:self.wf.index("\non:")]
+        for phrase in ("author's role", "admin", "merge on green for every author"):
+            self.assertIn(phrase, head, phrase)
 
     def _triggers(self):
         # the trigger MAPPING, not a grep of the file: the comments deliberately name the events they
@@ -484,6 +625,12 @@ class WorkflowPins(unittest.TestCase):
         self.assertIn("schedule", trig)
         self.assertIn("workflow_dispatch", trig)
 
+    def test_the_schedule_exists_for_approval_propagation_only(self):
+        m = re.search(r'- cron: "[^"]+"\s*#\s*(.*)', self.wf)
+        self.assertTrue(m, "the schedule line carries its reason")
+        self.assertIn("approval propagation", m.group(1))
+        self.assertNotIn("seven", self.wf.lower(), "no clock rides the schedule")
+
     def test_the_token_holds_only_what_the_verdict_needs(self):
         self.assertIn("checks: write", self.wf)
         for line in ("pull-requests: read", "issues: read", "contents: read"):
@@ -499,16 +646,13 @@ class WorkflowPins(unittest.TestCase):
         self.assertEqual(self.fetch.count('_req("POST"'), 1, "exactly one write: the verdict")
         self.assertIn('"/repos/%s/check-runs"', self.fetch)
 
-    def test_the_clock_reads_check_runs_not_commit_dates(self):
-        self.assertIn('key="check_runs"', self.fetch, "the check-runs endpoint is an object; read its list")
-        self.assertIn("filter=all", self.fetch, "the default `latest` collapses the hourly runs to the newest")
-        # the ONLY /commits/ request is the check-runs listing - no GET of the commit itself, whose
-        # author/committer dates are the author's to set
-        import re
-        commits = re.findall(r'/commits/%s([^"]*)"', self.fetch)
-        self.assertEqual(commits, ["/check-runs?check_name=%s&filter=all"], commits)
-        self.assertIn('RESET_EVENTS = ("head_ref_force_pushed", "reopened", "ready_for_review")', self.fetch,
-                      "the head's arrival is bounded by the server-stamped timeline events")
+    def test_the_fetcher_reads_no_clock_input(self):
+        # nothing in the policy is timed, so the fetcher lists no check-run history, no timeline and
+        # never the commit itself (whose author/committer dates are the author's to set)
+        for gone in ("/commits/", "/timeline", "chain_start", "first_check_at", "head_floor",
+                     "RESET_EVENTS", "VERDICT_GAP", "import time", '["committer"]', '["author"]["date"]'):
+            self.assertNotIn(gone, self.fetch, gone)
+        self.assertNotIn("seven", self.fetch.lower())
 
     def test_the_job_name_is_NOT_the_check_name(self):
         # the job's own check run must not share the required check's name: two same-named runs per
@@ -517,18 +661,10 @@ class WorkflowPins(unittest.TestCase):
         jobs = self.wf[self.wf.index("\njobs:"):]
         self.assertIn("    name: Tier policy evaluation", jobs)
         self.assertNotRegex(jobs, r"name: Tier policy[ \t]*\n")
-        self.assertNotIn('["committer"]', self.fetch)
-        self.assertNotIn('["author"]["date"]', self.fetch)
-
-    def test_the_clock_reads_only_the_actions_apps_verdicts(self):
-        # the run objects carry app.id; a same-named run from another app never stamps the head (the
-        # explicit started_at on the POSTED verdict is pinned on the request body in FetcherShapes)
-        self.assertIn("GITHUB_ACTIONS_APP_ID = 15368", self.fetch)
 
     def test_the_three_tier_label_lists_agree(self):
         wf = open(os.path.join(os.path.dirname(HERE), ".github", "workflows", "pr-tier.yml")).read()
         tmpl = open(os.path.join(os.path.dirname(HERE), ".github", "PULL_REQUEST_TEMPLATE.md")).read()
-        import re
         in_jq = set(re.findall(r'\. == "([a-z-]+)"', wf))
         expected = set(tp.TIERS) | set(tp.TIER_ALIASES)
         self.assertEqual(in_jq, expected, "the label check and the policy name the same tiers")
@@ -537,8 +673,10 @@ class WorkflowPins(unittest.TestCase):
 
 
 class FetcherShapes(unittest.TestCase):
-    """build_record against the DOCUMENTED response shapes, with _req stubbed - no network. The
-    review's critical catch lived here: the check-runs endpoint is an object, not a list."""
+    """build_record against the DOCUMENTED response shapes, with _req stubbed - no network. A request the
+    stub does not know (a check-run listing, a timeline, the commit itself) is an AssertionError: the
+    fetcher reads nothing the policy would time. Collaborator permissions are served per login (admin-c
+    admin, maint-b and author-a write); an unknown login is the API's 404, a non-collaborator."""
 
     def setUp(self):
         spec = importlib.util.spec_from_file_location(
@@ -564,11 +702,8 @@ class FetcherShapes(unittest.TestCase):
         def fake_req(method, path, token, body=None):
             test.calls.append((method, path))
             path, _, query = path.partition("?")       # _get_all appends per_page; match the route
-            if "/check-runs" in path:
-                page, hdrs = paged(test.run_pages, "check-runs", query)
-                return {"total_count": sum(len(p) for p in test.run_pages), "check_runs": page}, hdrs
             if path.endswith("/pulls/42"):
-                return {"head": {"sha": HEAD}, "user": {"login": "author-a"}, "labels": [{"name": "fix"}],
+                return {"head": {"sha": HEAD}, "user": {"login": test.author}, "labels": [{"name": l} for l in test.labels],
                         "created_at": "2026-08-30T00:00:00Z", "body": "fixes #7",
                         "changed_files": test.changed_files}, {}
             if "/files" in path:
@@ -580,9 +715,10 @@ class FetcherShapes(unittest.TestCase):
             if "/collaborators/" in path:
                 if test.perm_error:
                     raise urllib.error.HTTPError(path, test.perm_error, "x", {}, None)
-                return {"permission": "write"}, {}
-            if path.endswith("/timeline"):
-                return test.timeline, {}
+                login = path.split("/collaborators/")[1].split("/")[0]
+                if login not in test.perms:
+                    raise urllib.error.HTTPError(path, 404, "x", {}, None)
+                return {"permission": test.perms[login]}, {}
             if path.endswith("/events"):
                 return test.events, {}
             if path.endswith("/issues/7/comments"):
@@ -597,64 +733,70 @@ class FetcherShapes(unittest.TestCase):
             raise AssertionError("unexpected request " + path)
         self.perm_error = None
         self.files_error = None
+        self.perms = {"author-a": "write", "maint-b": "write", "admin-c": "admin"}
+        self.author = "author-a"
+        self.labels = ["fix"]
         self.files_pages = [[{"filename": "kernel/kernel.py", "status": "modified"}]]
         self.served = set()
         self.changed_files = 1
-        # this PR's verdicts: an unbroken hourly chain for the last three hours, plus a disconnected
-        # day-8 stamp; a sibling PR's week-long chain on the same sha; an older run from another app
-        self.run_pages = [[run(NOW - 8 * DAY)] + [run(NOW - k * 3600) for k in (3, 2, 1)]
-                          + [run(NOW - k * 3600, ext="41") for k in range(1, 8 * 24)]
-                          + [run(NOW - 30 * DAY, app=1)]]
-        self.reviews = [{"id": 1, "user": {"login": "maint-b"}, "state": "APPROVED", "commit_id": HEAD,
+        self.reviews = [{"id": 1, "user": {"login": "admin-c"}, "state": "APPROVED", "commit_id": HEAD,
                          "submitted_at": "2026-09-02T00:00:00Z"}]
-        self.timeline = []
         self.events = []
         self.issue_fetches = []
         self.tc._req = fake_req
 
-    def test_build_record_survives_the_documented_shapes_and_has_no_commit_date(self):
-        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-        self.assertEqual(rec["first_check_at"], NOW - 3 * 3600,
-                         "the clock is the start of THIS PR's unbroken chain: not its disconnected day-8 stamp, "
-                         "not the sibling PR's week on the same sha, not the other app's run")
+    def test_build_record_survives_the_documented_shapes_and_has_no_time_field(self):
+        rec = self.tc.build_record("romp-on/romp", 42, "tok")
         self.assertEqual(set(rec), {"number", "author", "labels", "head_sha", "files", "files_truncated", "reviews",
-                                    "permissions", "first_check_at", "head_floor", "created_at", "now", "body", "issues"},
-                         "the record has exactly the documented keys - no commit date can reach the policy")
-        self.assertEqual(rec["permissions"], {"maint-b": "write"})
+                                    "permissions", "body", "issues"},
+                         "the record has exactly the documented keys: no time field, no commit date")
+        self.assertEqual(rec["permissions"], {"admin-c": "admin", "author-a": "write"},
+                         "every reviewer AND the author: the policy reads the author's role from this map")
         self.assertEqual(rec["issues"], {7: {"exists": True, "is_pr": False, "comments": ["maint-b"]}},
                          "the bot commenter is filtered; the opener is not recorded (they do not count)")
-        self.assertEqual(rec["head_floor"], rec["created_at"], "no reset events → the floor is created_at")
         self.assertEqual(self.tc.evaluate(rec)["conclusion"], "success")
-        self.assertFalse(any("/commits/%s\"" % HEAD in p or p.endswith("/commits/" + HEAD) for _, p in self.calls),
-                         "the commit itself is never fetched")
+        self.assertFalse(any("/commits/" in p or p.endswith("/timeline") for _, p in self.calls),
+                         "no check-run history, no timeline, no commit: nothing the policy would time")
 
-    def test_a_sibling_prs_verdicts_on_the_same_head_never_start_this_prs_clock(self):
-        # the review's critical walk-through: PR A (vetoed) and PR B fast-forwarded onto A's head; B has
-        # no verdicts of its own on the sha yet, A has a week of them
-        self.run_pages = [[run(NOW - k * 3600, ext="41") for k in range(1, 8 * 24)]]
+    def test_an_unreviewed_fix_passes_through_the_fetcher_too(self):
         self.reviews = []
-        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-        self.assertIsNone(rec["first_check_at"])
+        rec = self.tc.build_record("romp-on/romp", 42, "tok")
         v = self.tc.evaluate(rec)
-        self.assertEqual(v["conclusion"], "failure")
-        self.assertIn("starts with this run", v["summary"])
+        self.assertEqual(v["conclusion"], "success")
+        self.assertIn("merges on green", v["summary"])
 
-    def test_no_verdict_yet_means_no_clock_in_the_fetcher_too(self):
-        # the review's catch: a created_at fallback re-added in the FETCHER survived every test because
-        # no fetcher fixture ever had zero runs
-        self.run_pages = [[]]
+    def test_the_authors_role_reaches_the_policy(self):
+        # a member's feature waits for the admin's approval; the same PR by an admin merges on green
+        self.labels = ["feature"]
         self.reviews = []
-        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-        self.assertIsNone(rec["first_check_at"])
-        self.assertIn("starts with this run", self.tc.evaluate(rec)["summary"])
+        rec = self.tc.build_record("romp-on/romp", 42, "tok")
+        self.assertEqual(rec["permissions"], {"author-a": "write"}, "no reviewer: the author alone is looked up")
+        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure")
+        self.perms["author-a"] = "admin"
+        self.served = set()                  # a second, independent build: the page ledger starts over
+        rec = self.tc.build_record("romp-on/romp", 42, "tok")
+        self.assertEqual(rec["permissions"], {"author-a": "admin"})
+        v = self.tc.evaluate(rec)
+        self.assertEqual(v["conclusion"], "success")
+        self.assertIn("admin author merges on green", v["summary"])
 
-    def test_a_two_page_check_run_listing_is_read_whole(self):
-        # hourly verdicts for 150 hours: 100 per page, the chain's start on page two
-        stamps = [NOW - k * 3600 for k in range(1, 151)]
-        self.run_pages = [[run(s) for s in stamps[:100]], [run(s) for s in stamps[100:]]]
-        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-        self.assertEqual(rec["first_check_at"], NOW - 150 * 3600)
-        self.assertTrue(any("check-runs" in p and "page=2" in p for _, p in self.calls), "the Link URL was followed")
+    def test_a_non_collaborator_author_reads_as_none(self):
+        # a fork PR by an outside contributor: the permission endpoint 404s, recorded as "none"
+        self.author = "outsider-x"
+        self.labels = ["feature"]
+        self.reviews = []
+        rec = self.tc.build_record("romp-on/romp", 42, "tok")
+        self.assertEqual(rec["permissions"], {"outsider-x": "none"})
+        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure", "a contributor's feature waits for the admin")
+        rec["labels"] = ["fix"]
+        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "success", "a contributor's fix merges on green")
+
+    def test_a_permission_lookup_error_other_than_404_raises(self):
+        # a 403 or 5xx mapped to "none" would deny every approval (and read every author as a contributor)
+        # while posting a normal-looking verdict; the fetcher fails loudly instead
+        self.perm_error = 403
+        with self.assertRaises(urllib.error.HTTPError):
+            self.tc.build_record("romp-on/romp", 42, "tok")
 
     def test_a_push_during_evaluation_raises_instead_of_grading_a_mixed_record(self):
         real = self.tc._req
@@ -667,155 +809,37 @@ class FetcherShapes(unittest.TestCase):
             return real(method, path, token, body)
         self.tc._req = moving
         with self.assertRaises(RuntimeError):
-            self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+            self.tc.build_record("romp-on/romp", 42, "tok")
 
     def test_a_rename_out_of_github_carries_both_paths(self):
         # the review's HIGH: `git mv .github/workflows/tier-policy.yml docs/gate-notes.md` in a docs PR
         # read as documentation-only and would have merged on green, removing the gate from main
         self.files_pages = [[{"filename": "docs/gate-notes.md", "status": "renamed",
                               "previous_filename": ".github/workflows/tier-policy.yml"}]]
-        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        rec = self.tc.build_record("romp-on/romp", 42, "tok")
         self.assertEqual(rec["files"], ["docs/gate-notes.md", ".github/workflows/tier-policy.yml"])
         self.assertFalse(rec["files_truncated"], "one entry, two paths: truncation counts entries, not paths")
-        rec["labels"] = ["docs"]
-        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure", "a .github change wearing a docs destination")
-        rec["labels"], rec["reviews"] = ["fix"], []
-        rec["first_check_at"] = rec["head_floor"] = NOW - 30 * DAY
-        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure", "…and the seven-day path is closed by the guard")
+        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "success", "approved by an admin: the guard is met")
+        rec["reviews"] = []
+        for tier in ("docs", "fix"):
+            rec["labels"] = [tier]
+            self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure",
+                             "a .github change wearing a docs destination does not merge on green as %s" % tier)
 
     def test_a_two_page_file_listing_is_read_whole(self):
         self.files_pages = [[{"filename": "a.py", "status": "modified"}], [{"filename": "b.py", "status": "added"}]]
         self.changed_files = 2
-        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        rec = self.tc.build_record("romp-on/romp", 42, "tok")
         self.assertEqual(rec["files"], ["a.py", "b.py"])
         self.assertFalse(rec["files_truncated"])
         self.assertTrue(any("/files" in p and "page=2" in p for _, p in self.calls), "the Link URL was followed")
 
     def test_a_listing_shorter_than_changed_files_is_flagged_truncated(self):
         self.changed_files = 3001
-        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
+        rec = self.tc.build_record("romp-on/romp", 42, "tok")
         self.assertTrue(rec["files_truncated"])
-        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "success", "an approved fix still passes")
+        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "success", "an admin-approved fix still passes")
+        rec["reviews"] = []
+        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure", "unapproved, the unseen files hold it")
         rec["labels"] = ["docs"]
-        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure", "docs cannot vouch for unseen files")
-
-    DISMISSED_APPROVAL = {"id": 2, "user": {"login": "maint-b"}, "state": "DISMISSED", "commit_id": HEAD,
-                          "submitted_at": "2026-09-02T01:00:00Z"}
-
-    def _dismissal(self, actor, state="approved", review_id=2):
-        # the issue events API's review_dismissed event: the actor, and the dismissed review's id and
-        # ORIGINAL state, lowercase as documented (verified live 2026-09-07 on a public PR)
-        return {"event": "review_dismissed", "created_at": "2026-09-02T02:00:00Z", "actor": {"login": actor},
-                "dismissed_review": {"review_id": review_id, "state": state, "dismissal_message": "x"}}
-
-    def test_a_dismissed_review_reads_as_the_latest_word(self):
-        self.reviews = self.reviews + [self.DISMISSED_APPROVAL]
-        self.events = [self._dismissal("maint-b")]
-        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-        r = rec["reviews"][1]
-        self.assertEqual((r["state"], r["dismissed"], r["dismissed_by"]), ("APPROVED", True, "maint-b"),
-                         "original state recovered from the event; the dismisser recorded")
-        self.assertFalse(tp._approved(rec)[0], "the reviewer withdrew it: the dismissal is their latest word")
-
-    def test_a_dismissal_by_the_author_is_recorded_and_read_fail_closed(self):
-        self.reviews = self.reviews + [self.DISMISSED_APPROVAL]
-        self.events = [self._dismissal("author-a")]
-        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-        self.assertEqual(rec["reviews"][1]["dismissed_by"], "author-a")
-        self.assertFalse(tp._approved(rec)[0], "a dismissed approval never counts, whoever dismissed it")
-        self.events = [self._dismissal("author-a", state="changes_requested")]
-        self.served = set()                          # a second build in the same test re-pages legitimately
-        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-        self.assertEqual(rec["reviews"][1]["state"], "CHANGES_REQUESTED")
-        self.assertEqual(tp._changes_requested(rec), ["maint-b"], "...and the peer's objection stands")
-
-    def test_a_dismissed_review_without_its_timeline_event_raises(self):
-        # the record cannot say who dismissed it: fail loudly rather than guess either way
-        self.reviews = self.reviews + [self.DISMISSED_APPROVAL]
-        with self.assertRaises(RuntimeError):
-            self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-
-    def test_a_server_error_on_the_file_listing_raises(self):
-        self.files_error = 500
-        with self.assertRaises(urllib.error.HTTPError):
-            self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-
-    def test_a_force_push_on_the_timeline_raises_the_head_floor(self):
-        self.timeline = [{"event": "head_ref_force_pushed", "created_at": "2026-09-02T12:00:00Z"},
-                         {"event": "labeled", "created_at": "2026-09-03T12:00:00Z"}]
-        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-        self.assertEqual(rec["head_floor"], self.tc._iso("2026-09-02T12:00:00Z"),
-                         "the latest reset event, not a label change, bounds the clock")
-
-    def test_issue_refs_are_deduped_and_capped(self):
-        # a 64 KiB body of "#1 #1 #1 ..." must not become tens of thousands of requests
-        pr_body = " ".join("#%d" % n for n in ([1] * 50 + list(range(2, 40))))
-        real = self.tc._req
-
-        def with_body(method, path, token, body=None):
-            if path.split("?")[0].endswith("/pulls/42"):
-                return {"head": {"sha": HEAD}, "user": {"login": "author-a"}, "labels": [{"name": "fix"}],
-                        "created_at": "2026-08-30T00:00:00Z", "body": pr_body}, {}
-            return real(method, path, token, body)
-        self.tc._req = with_body
-        self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-        fetched = {p.split("/issues/")[1].split("/")[0] for p in self.issue_fetches}
-        self.assertLessEqual(len(fetched), self.tc.MAX_ISSUE_REFS)
-        self.assertEqual(len([p for p in self.issue_fetches if p.endswith("/issues/1")]), 1, "deduped")
-
-    def test_a_non_404_permission_error_is_loud_not_a_silent_denial(self):
-        self.perm_error = 403
-        with self.assertRaises(urllib.error.HTTPError):
-            self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-
-    def test_a_404_permission_means_not_a_collaborator(self):
-        self.perm_error = 404
-        rec = self.tc.build_record("romp-on/romp", 42, "tok", now=NOW)
-        self.assertEqual(rec["permissions"], {"maint-b": "none"})
-        self.assertFalse(tp._approved(rec)[0], "a non-collaborator never approves")
-
-    def test_the_verdict_stamps_the_head_with_an_explicit_started_at(self):
-        # the seven-day clock reads the posted verdict's started_at; pinned on the REQUEST BODY (a
-        # source grep matched the read path and could not fail - the review's catch), and asserted
-        # after the call so no isolation loop can swallow it
-        bodies = []
-        self.tc._req = lambda method, path, token, body=None: (bodies.append((method, body)), ({}, {}))[1]
-        self.tc.post_check("romp-on/romp", HEAD, {"conclusion": "success", "title": "t", "summary": "s"}, "tok", 42)
-        self.assertEqual([m for m, _ in bodies], ["POST"])
-        stamp = bodies[0][1].get("started_at")
-        self.assertTrue(stamp, "the verdict carries an explicit started_at")
-        self.assertLess(abs(self.tc._iso(stamp) - time.time()), 300, "a well-formed timestamp, close to now")
-        self.assertEqual(bodies[0][1]["name"], self.tc.CHECK_NAME)
-        self.assertEqual(bodies[0][1]["external_id"], "42", "the verdict is bound to its PR: the clock counts only its own")
-        self.assertNotIn("completed_at", bodies[0][1], "left for the server to stamp")
-
-    def test_all_open_isolates_one_prs_failure_from_the_rest(self):
-        posted = []
-        real = self.tc._req
-
-        def isolating(method, path, token, body=None):
-            p = path.split("?")[0]
-            if method == "POST":
-                posted.append(body["head_sha"][:4] + ":" + body["conclusion"])
-                return {}, {}
-            if p.endswith("/pulls"):
-                return [{"number": 41}, {"number": 42}], {}
-            if p.endswith("/pulls/41"):
-                return {"head": {"sha": "4" * 40}, "user": {"login": "author-a"}, "labels": [{"name": "fix"}],
-                        "created_at": "2026-08-30T00:00:00Z", "body": ""}, {}
-            if "/pulls/41/" in p:
-                raise urllib.error.HTTPError(path, 500, "boom", {}, None)
-            return real(method, path, token, body)
-        self.tc._req = isolating
-        os.environ["GITHUB_TOKEN"] = "tok"
-        try:
-            rc = self.tc.main(["--all-open"])
-        finally:
-            os.environ.pop("GITHUB_TOKEN", None)
-        self.assertEqual(rc, 1, "the run reads red because one PR could not be evaluated")
-        self.assertIn("4444:failure", posted, "…and that PR got a LOUD failing verdict, not silence")
-        self.assertIn(HEAD[:4] + ":success", posted, "…while the other PR still got its verdict")
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure", "docs cannot vouch for unseen files either")

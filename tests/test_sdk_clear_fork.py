@@ -60,7 +60,7 @@ class SdkClearForkBase(unittest.TestCase):
         jd.PROJECTS = Path(self._td) / "projects"
         jd._discover_cache["fp"] = None
         jd._discover_cache["result"] = None
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         self.now = int(time.time())
         self.cdir = str(Path(self._td) / "work")
         self.proj = jd._proj_dir(self.cdir)

@@ -62,7 +62,12 @@ class SpendModalServed(unittest.TestCase):
         km._claude_account = lambda: ""
         km._auth_key_present = lambda: True
         (state / "usage.json").write_text(json.dumps({"apiKey": True}))
-        write_ledger(state, extra_sids=12)
+        write_ledger(state, extra_sids=20)     # enough sessions to scroll the pane (T247e)
+        (state / "session-order.json").write_text(json.dumps([API, WEB]))   # the tab strip's order: api before web (T247f)
+        # T247g: two tags — "team" (web + api) and "ops" (api + the peer's worker): api is under both
+        (state / "timeline-views.json").write_text(json.dumps({"active": "all", "tags": [
+            {"id": "g1", "name": "team", "color": "#C2410C", "members": [WEB, API]},
+            {"id": "g2", "name": "ops", "color": "#0F766E", "members": [API, "PEERHOST:22222222-3333-4444-5555-000000000001"]}]}))
         # T247c: a two-host world — a peer kernel whose sessions merge in, and an older peer reported by name
         self._saved_remotes = dict(km._remotes)
         km._remotes.clear()
@@ -147,24 +152,56 @@ class SpendModalServed(unittest.TestCase):
         self.assertEqual(o["out"]["head"], "API spend · 2 machines", "the header names the machines when several contribute (review find)")
         rows = o["out"]["rows"]
         # T247c: two hosts contribute, so every row names its host in the tab strip's host-prefix voice
-        self.assertTrue(rows[0].startswith("TESTHOST:web") or rows[0].startswith("TESTHOST: web"), rows[0])
-        self.assertTrue(rows[1].startswith("PEERHOST:worker") or rows[1].startswith("PEERHOST: worker"), rows[1])
-        self.assertTrue(rows[2].startswith("TESTHOST:api") or rows[2].startswith("TESTHOST: api"), rows[2])
+        self.assertTrue(rows[0].startswith("TESTHOST:web"), rows[0])
+        self.assertTrue(rows[1].startswith("PEERHOST:worker"), rows[1])
+        self.assertTrue(rows[2].startswith("TESTHOST:api"), rows[2])
         self.assertTrue(any("OLDHOST" in n and "older build" in n for n in o["out"]["notes"]), o["out"]["notes"])
         self.assertFalse(any("this machine only" in n for n in o["out"]["notes"]))
         self.assertTrue(any("aligned by clock time" in n for n in o["out"]["notes"]), "hosts in different zones: the timezone rule is stated")
-        self.assertTrue(any(c.startswith("PEERHOST") for c in o["out"]["legend"]), o["out"]["legend"])
+        # T247e: the chart comes first, has no legend; the list is a scroll pane of EVERY session under a
+        # sticky header, each row its tab title in its identity color, no swatch, no fold
+        self.assertTrue(o["out"]["chartFirst"], "the chart section precedes the session list")
+        self.assertEqual(o["out"]["legendNodes"], 0, "no legend")
+        self.assertEqual(o["out"]["swatches"], 0, "no swatch in a session row")
+        self.assertEqual(len(rows), 3 + 20 + 1 + 1, "every session across both hosts, plus the unattributed row")
+        self.assertEqual(o["out"]["title"]["color"], "rgb(30, 161, 235)", "web's title wears its identity color")
+        self.assertEqual(o["out"]["title"]["weight"], "600")
+        self.assertEqual(o["out"]["title"]["prefix"], "TESTHOST:")
+        self.assertTrue(o["out"]["pane"]["scrolls"], o["out"]["pane"])
+        self.assertEqual(o["out"]["pane"]["sticky"], "sticky")
+        self.assertEqual(o["out"]["pane"]["thOpacity"], "1", "the sticky header occludes: muted by color, not opacity (review find)")
+        self.assertFalse(o["out"]["pane"]["panelScrolls"], "the card itself does not scroll at 820px: the pane takes the room under the chart (review find)")
+        # T247f: "your order" — the strip's order (api before web from session-order.json, then the peer's own
+        # order), unknown sessions trailing by spend; the chart's bottom stack follows; a viewer arrangement
+        # (the strip's localStorage key) reorders both; the choice persists with the other toggles
+        yo = o["yourOrder"]
+        self.assertTrue(yo["rows"][0].startswith("TESTHOST:api") and yo["rows"][1].startswith("TESTHOST:web"), yo["rows"][:3])
+        self.assertTrue(yo["rows"][2].startswith("PEERHOST:worker"), yo["rows"][:3])
+        self.assertTrue(yo["rows"][3].startswith("TESTHOST:tests"), "sessions the order does not know trail, by spend: " + yo["rows"][3])
+        self.assertEqual(yo["bottomFill"], "#54B204", "the chart's bottom stack is the first row (api)")
+        self.assertTrue(yo["viewRows"][0].startswith("TESTHOST:web"), "the viewer's own arrangement wins over the seed: " + yo["viewRows"][0])
+        self.assertEqual(yo["prefs"].get("order"), "yours")
+        self.assertTrue(yo["pressed"])
+        self.assertTrue(o["mobile"]["persisted"]["pressed"], "the persisted choice is read back on a reload (review find: only the write was pinned)")
+        # T247g: merge by tag — one row per tag (summed, tag color), untagged sessions as themselves, a session
+        # under two tags counted in each with the footer saying so; the stacks follow; "1 day" is 24 hourly buckets
+        mg = o["merge"]
+        self.assertTrue(mg["rows"][0].startswith("team · 2 sessions"), mg["rows"][:3])
+        self.assertTrue(mg["rows"][1].startswith("ops · 2 sessions"), mg["rows"][:3])
+        self.assertFalse(any(r.startswith("TESTHOST:web") or r.startswith("TESTHOST:api") or r.startswith("PEERHOST:worker") for r in mg["rows"]), "tagged sessions merge away")
+        self.assertIn("$1200", mg["rows"][0].replace(",", ""), "team = web 960 + api 240")
+        self.assertIn("$540", mg["rows"][1].replace(",", ""), "ops = api 240 + worker 300")
+        self.assertEqual(mg["tagColor"], "rgb(194, 65, 12)", "the tag row wears the tag store's color")
+        self.assertTrue(any("1 session carries several tags" in n for n in mg["notes"]), mg["notes"])
+        self.assertIn("team", mg["stackNames"]); self.assertIn("ops", mg["stackNames"])
+        self.assertLessEqual(mg["dayBuckets"], 24, "1 day · by hour = the last 24 hourly buckets")
+        self.assertTrue(any(":00" in x for x in mg["dayLabels"]), mg["dayLabels"])
+        self.assertEqual(mg["prefs"].get("merge"), True)
+        self.assertTrue(o["mobile"]["persisted"]["first"].strip().startswith("TESTHOST:api"), o["mobile"]["persisted"])
         self.assertTrue(any("tests" in r and "not running" in r for r in rows), "a dead session keeps its name, dimmed")
-        self.assertTrue(any(r.startswith("unattributed") for r in rows), "pre-attribution spend is a row of its own")
+        self.assertTrue(any(r.strip().startswith("unattributed") for r in rows), "pre-attribution spend is a row of its own (its hatch mark leads)")
         self.assertGreaterEqual(o["out"]["deadRows"], 2)
-        self.assertEqual(o["foldBefore"], 10 + 1 + 1, "the table folds to the top-N, a '6 more' row, and the unattributed row")
-        self.assertEqual(o["foldAfter"], 16 + 1, "show all: every session across both hosts, plus the unattributed row")
-        self.assertTrue(any("6 more sessions" in r for r in rows), rows)
-        leg = o["out"]["legend"]
-        self.assertEqual([c.split(":")[-1].strip() for c in leg], ["web", "worker", "api", "tests", "unattributed"],
-                         "the hourly legend names only the stacks the hourly chart draws, across hosts, in dollar order")
-        self.assertIn("other (6 sessions)", o["days"]["legend"], "beyond the top-N the daily range folds them into one stack")
-        self.assertEqual(o["days"]["legend"][-1], "unattributed")
+        self.assertGreater(o["days"]["segs"], 24 * 30, "every session's daily bars, no fold")
         self.assertGreater(o["out"]["segs"], 60)
         self.assertGreaterEqual(o["out"]["hatched"], 1, "the unattributed stack wears the hatch, not a hue")
         self.assertIn("1 hour", o["out"]["windows"], "the same window rows the hover shows")
@@ -182,22 +219,15 @@ class SpendModalServed(unittest.TestCase):
         self.assertEqual(o["lightErr"], "rgb(154, 51, 36)", "the error line has a light-theme step")
         # T247b: the pressed toggle in the light theme wears the accent chip with --accent-fg text and no hairline
         self.assertEqual(o["lightBtn"], {"color": "rgb(255, 248, 242)", "border": "rgba(0, 0, 0, 0)", "bg": "rgb(194, 65, 12)"}, o["lightBtn"])
-        # T247b: dim once — the annotation inside a dead row is at the row's level; the fold row is a control row
+        # T247b: dim once — the annotation inside a dead row is at the row's level
         self.assertEqual(o["dim"]["row"], "0.55", o["dim"])
         self.assertEqual(o["dim"]["ann"], "1", "no second dimming inside a dimmed row")
-        self.assertIs(o["dim"]["btnRowDead"], False, "the 'show all' row is not dimmed")
-        self.assertEqual(o["dim"]["btnOpacity"], "1")
         # T247b: the loader's backstop lands on the error + retry path, and names the timeout (the AbortError
         # mapping is pinned, not just the shared prefix — review find); a re-open over a pending fetch keeps
         # the loader up: the superseded fetch's abort paints nothing (review find)
         self.assertTrue(o["timeout"]["err"] and "no answer from the kernel after 1 s" in o["timeout"]["err"], o["timeout"])
         self.assertTrue(o["timeout"]["retry"])
         self.assertEqual(o["timeout"]["early"], {"err": False, "loader": True}, o["timeout"])
-        # the unattributed chip dims like its row (review find: same class, two weights)
-        self.assertIn("unattributed:0.55", o["out"]["chipOpacity"], o["out"]["chipOpacity"])
-        self.assertIn("TESTHOST: web:1", o["out"]["chipOpacity"], "a live session's chip at full strength, host-prefixed (T247c)")
-        self.assertIn("TESTHOST: tests:0.55", o["out"]["chipOpacity"])
-        self.assertIn("PEERHOST: worker:1", o["out"]["chipOpacity"], "the peer's session wears its own host")
         # T247b: the phone's door is a real button — the hover's size, full opacity, not an annotation
         self.assertEqual(o["mobile"]["btn"]["font"], "11px", o["mobile"]["btn"])
         self.assertEqual(o["mobile"]["btn"]["opacity"], "1", o["mobile"]["btn"])

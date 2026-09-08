@@ -189,7 +189,7 @@ test("the viewer is READ-ONLY: the message box is hidden, send disabled, one dim
   // the tab: no drag (a reorder would post the id into the kernel's order), no rename menu, ✕ = Close tab
   assert.match(RENDER, /tab\.draggable = !s\.sub;/);
   assert.match(RENDER, /if \(!s\.sub\) tab\.addEventListener\("contextmenu"/);
-  assert.match(RENDER, /close\.title = dead \|\| s\.sub \? "Close tab" : "End session";/);
+  assert.match(RENDER, /close\.title = dead \|\| s\.sub \? "Close tab" : copies > 1 \? "End session \(it is the one session, shown in every group it is tagged with\)" : "End session";/);
   assert.match(RENDER, /if \(id && isSubId\(id\)\) \{ closeSubagentView\(id\); return; \}/);
 });
 

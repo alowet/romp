@@ -260,13 +260,15 @@ class TimelineViews(unittest.TestCase):
 
     def test_payloads_echo_the_views_blob(self):
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        self.assertIn('"views": _views_client(),', src, "the timeline payload carries the RENDERED shape")
+        self.assertIn('**_views_payload(),', src, "the timeline payload carries the RENDERED shape (through the one carrier, which marks "
+                      "a blob a read fault left unproved or sends the marker alone, 2026-09-08)")
         self.assertIn('"palette": pal.colors(_palette_name()),', src, "and the palette, for tag colors in every host")
         self.assertIn('_tab_order_frame(tab_order, tab_meta, tmux)', src, "tabOrder pushes carry it (the one frame builder, T258)")
-        # every tabOrder frame is built by ONE helper (2026-09-06: the frame also carries selfHost)
+        # every tabOrder frame is built by ONE helper (2026-09-06: the frame also carries selfHost; 2026-09-08: the
+        # views ride the one carrier, which marks a blob a read fault left unproved or sends the marker alone)
         self.assertIn('return {"type": "tabOrder", "order": list(order), "tabs": tabs, "selfHost": _self_host(),\n'
-                      '            "views": _views_client(), "live": sorted({str(x) for x in live})}', src, "tabOrder frames carry it")
-        self.assertIn('"views": _views_client(), "live":', src, "…which carries the blob")
+                      '            **_views_payload(), "live": sorted({str(x) for x in live})}', src, "tabOrder frames carry it")
+        self.assertIn('**_views_payload(), "live":', src, "…which carries the blob")
         self.assertIn('_frame = _tab_order_frame(_o, _tabs, _tm)', src, "the connect-time tabOrder carries it")
 
     def test_web_boot_exposes_the_set_views_hook(self):
@@ -786,7 +788,7 @@ class TagInheritance(unittest.TestCase):
         km._atomic_write(km._views_path(), json.dumps(served))
         km._flags_cache.clear()
         entered, release = threading.Event(), threading.Event()
-        real_read = km._timeline_views
+        real_read = km._timeline_views_proved   # the RMW doors' seam (a proved read)
         inheriting = []
         def stalled_read():
             v = real_read()
@@ -794,7 +796,7 @@ class TagInheritance(unittest.TestCase):
                 entered.set()             # parked INSIDE the locked window: after the read, before the write
                 release.wait(5)
             return v
-        km._timeline_views = stalled_read
+        km._timeline_views_proved = stalled_read
         got = []
         def inherit():
             inheriting.append(threading.current_thread())
@@ -816,7 +818,7 @@ class TagInheritance(unittest.TestCase):
             release.set()
             t1.join(5)
             t2.join(5)
-            km._timeline_views = real_read
+            km._timeline_views_proved = real_read
         self.assertEqual(got, [["pool"]])
         self.assertIn(self.C, self._members("pool"), "the inherit's write landed; the dashboard's stale copy could not strip it")
 
@@ -835,7 +837,7 @@ class TagInheritance(unittest.TestCase):
         km._atomic_write(km._views_path(), json.dumps(served))
         km._flags_cache.clear()
         entered, release = threading.Event(), threading.Event()
-        real_read = km._timeline_views
+        real_read = km._timeline_views_proved   # the RMW doors' seam (a proved read)
         healing = []
         def stalled_read():
             v = real_read()
@@ -843,7 +845,7 @@ class TagInheritance(unittest.TestCase):
                 entered.set()             # parked INSIDE the heal's window: after its read, before its write
                 release.wait(5)
             return v
-        km._timeline_views = stalled_read
+        km._timeline_views_proved = stalled_read
         def heal():
             healing.append(threading.current_thread())
             km._heal_timeline_views("old", "new")
@@ -861,7 +863,7 @@ class TagInheritance(unittest.TestCase):
             release.set()
             t1.join(5)
             t2.join(5)
-            km._timeline_views = real_read
+            km._timeline_views_proved = real_read
         self.assertEqual(sorted(self._members("pool")), ["new", "old", "other"], "both writers landed whole, in turn")
         self.assertEqual(len(edited), 1)
         self.assertIsNone(edited[0][1], "the edit was not refused")

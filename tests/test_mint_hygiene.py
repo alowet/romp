@@ -209,7 +209,7 @@ class _PlanWorld(unittest.TestCase):
             if task_plan is not None:
                 em.task_store_plan = lambda fsid: task_plan
             try:
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
             finally:

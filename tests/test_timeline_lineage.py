@@ -55,7 +55,7 @@ class TimelineLineageBase(unittest.TestCase):
         jd._rebind_state(Path(self._td))
         jd.PROJECTS = Path(self._td) / "projects"
         jd._discover_cache.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         km._parse_cache.clear()
         km._dismissed_lanes.clear()   # a durable module-level set: an earlier test file dismissing
         #                               the shared placeholder sid silently filtered these lanes

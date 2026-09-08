@@ -610,7 +610,10 @@ class ReviveDoor(_Base):
         self.live = {"web": SID2}
         km._revive_session(SID, self.client)
         self.assertEqual([c[:3] for c in self.sdk.calls], [], "the dead session came up beside a live namesake")
-        self.assertEqual([(a, m["type"], m["id"], w) for a, m, w in self.sent], [("chat", "reviveFailed", SID, "win-A")])
+        # the asker's chat AND feed hear it (the feed's parked card latched Revive on the click and re-arms
+        # on the refusal for its own sid; review find 2026-09-08), the shape every other revive refusal takes
+        self.assertEqual([(a, m["type"], m["id"], w) for a, m, w in self.sent],
+                         [("chat", "reviveFailed", SID, "win-A"), ("feed", "reviveFailed", SID, "win-A")])
         self.assertIn("already running", self.sent[0][1]["text"])
         self.assertEqual(self.reveals, [], "a refused revive focuses nothing")
 
@@ -619,6 +622,7 @@ class ReviveDoor(_Base):
         self.hold("web")
         km._revive_session(SID, self.client)
         self.assertEqual(self.sdk.calls, [])
+        self.assertEqual([a for a, _, _ in self.sent], ["chat", "feed"], "the asker's chat and feed both hear it")
         self.assertIn("being created", self.sent[0][1]["text"])
 
     def test_a_free_name_is_held_through_the_resume_and_released_after(self):

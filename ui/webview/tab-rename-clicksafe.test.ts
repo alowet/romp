@@ -19,13 +19,13 @@ const rename = RENDER.slice(RENDER.indexOf("function startTabRename"),
                             RENDER.indexOf("// Keyboard nav on a focused tab"));
 
 test("the menu's Rename hands over the id alone — no captured nodes", () => {
-  assert.match(RENDER, /dismissTabMenu\(\); startTabRename\(id\); \}\);/,
+  assert.match(RENDER, /dismissTabMenu\(\); startTabRename\(id, copy\); \}\);/,
                "the click resolves the tab itself; a node captured at menu-open time may be detached");
   assert.doesNotMatch(RENDER, /startTabRename\(tab, label, id\)/);
 });
 
 test("startTabRename resolves the live tab by data-id at call time", () => {
-  assert.match(rename, /function startTabRename\(id: string\)/);
+  assert.match(rename, /function startTabRename\(id: string, copy\?: string\)/, "the id, plus which copy of a multi-tag session to edit (T264b)");
   assert.match(rename, /dataset\.id === id/, "the strip is searched for the CURRENT node wearing this id");
   assert.match(rename, /querySelector<HTMLElement>\("\.tab-label"\)/, "…and its label is taken from that node");
 });

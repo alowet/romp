@@ -12,7 +12,7 @@ import * as path from "node:path";
 
 const SRC = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.ts"), "utf8");
 const BLK = SRC.slice(SRC.indexOf("if (it.handoffTo && it.handoffTo.peerSid) {"),
-                      SRC.indexOf("a._time.textContent"));
+                      SRC.indexOf("stampAge(a._time, it.t"));
 
 test("the badge is additive on the type — a payload without it renders exactly as before", () => {
   assert.match(SRC, /handoffTo\?: \{ peer: string; peerSid: string; peerHost\?: string; color\?: \{ bg: string; fg: string \} \| null \} \| null;/);

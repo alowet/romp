@@ -20,7 +20,7 @@ test("the default board hides satellites; the session filter is the one-click pa
 
 test("the primary names its recipients with the board's own live dot, STACKING after any ↪ from", () => {
   const BLK = SRC.slice(SRC.indexOf("if (it.delegTracked && it.delegTracked.length) {"),
-                        SRC.indexOf("a._time.textContent"));
+                        SRC.indexOf("stampAge(a._time, it.t"));
   // an else-if hid a MIDDLEMAN's tracked handoff behind its own ↪ from badge (review 2026-08-24):
   // origin and delegTracked are different facts about one card, so they stack on the slot
   assert.match(BLK, /const hadOrigin = !!\(it\.origin && it\.origin\.peer\);/);

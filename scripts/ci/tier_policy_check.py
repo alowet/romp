@@ -5,12 +5,12 @@ check run named "Tier policy" on the PR's head sha. API reads only - it never ch
 
 Trust model, stated once: the workflow that runs this is the BASE branch's copy (pull_request_target), so
 a PR cannot rewrite its own gate; the token holds checks:write (to post the verdict), pull-requests:read,
-issues:read, contents:read and nothing else. The seven-day clock is bound to THIS PR's head: head_floor is
-the later of the PR's created_at and every server-stamped force-push / reopen / ready-for-review event on
-its timeline, and first_check_at is the start of the unbroken chain of hourly "Tier policy" verdicts THIS
-PR received on the head: every verdict this fetcher posts carries the PR number as external_id, and only
-runs the GitHub Actions app owns (app.id) with this PR's external_id count, listed with filter=all (every
-run, not the latest per suite) and stamped by the server-set completed_at (started_at as the fallback).
+issues:read, contents:read and nothing else. Nothing in the policy is timed (the owner's rules of
+2026-09-08: the gate depends on the tier and on the author's role, and no tier has a time-based path), so
+this fetcher reads no check-run history, no timeline and no commit date; the record it builds carries no
+time field at all. The collaborator permission is fetched for the AUTHOR as well as for every reviewer: the
+policy reads the author's role from the same map (admin is the repository owner; a non-collaborator's 404
+reads as "none", a contributor).
 A dismissed review's original state and its dismisser come from the issue events API's review_dismissed
 event (actor + dismissed_review.{review_id,state}; the reviews API itself only says DISMISSED); a dismissed
 review with no such event raises.
@@ -26,7 +26,6 @@ import json
 import os
 import re
 import sys
-import time
 import traceback
 import urllib.error
 import urllib.parse
@@ -35,14 +34,11 @@ from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
-from tier_policy import chain_start, evaluate  # noqa: E402
+from tier_policy import evaluate  # noqa: E402
 
 API = "https://api.github.com"
 CHECK_NAME = "Tier policy"
-GITHUB_ACTIONS_APP_ID = 15368      # the app whose installation token GITHUB_TOKEN is; verdicts carry its app.id
-VERDICT_GAP = 6 * 3600             # the sweep is hourly; a longer gap in this PR's verdicts on the head restarts the clock
 MAX_ISSUE_REFS = 5                 # a body can be 64 KiB of "#1 " - bound the work (and the token budget)
-RESET_EVENTS = ("head_ref_force_pushed", "reopened", "ready_for_review")
 
 
 def _iso(s):
@@ -66,15 +62,14 @@ def _req(method, path, token, body=None):
         return (json.loads(txt) if txt else None), r.headers
 
 
-def _get_all(path, token, key=None):
-    """Every page of a list endpoint. `key` names the list inside an OBJECT-shaped response - the
-    check-runs endpoint returns {"total_count", "check_runs": [...]}."""
+def _get_all(path, token):
+    """Every page of a list endpoint, following the Link header."""
     out, url = [], path if path.startswith("http") else API + path
     sep = "&" if "?" in url else "?"
     url += sep + "per_page=100"
     while url:
         page, hdrs = _req("GET", url, token)
-        out.extend(page[key] if key else page)
+        out.extend(page)
         m = re.search(r'<([^>]+)>;\s*rel="next"', hdrs.get("Link", "") or "")
         url = m.group(1) if m else None
     return out
@@ -97,7 +92,7 @@ def _permission(repo, login, token):
         raise
 
 
-def build_record(repo, number, token, now=None):
+def build_record(repo, number, token):
     pr, _ = _req("GET", "/repos/%s/pulls/%d" % (repo, number), token)
     head = pr["head"]["sha"]
     author = pr["user"]["login"]
@@ -126,19 +121,8 @@ def build_record(repo, number, token, now=None):
                                    % (r.get("id"), rec["user"]))
             rec["dismissed_by"], rec["state"] = dismissals[r["id"]]
         reviews.append(rec)
-    perms = {u: _permission(repo, u, token) for u in {r["user"] for r in reviews}}
-    runs = _get_all("/repos/%s/commits/%s/check-runs?check_name=%s&filter=all"
-                    % (repo, head, urllib.parse.quote(CHECK_NAME)), token, key="check_runs")
-    now = int(now or time.time())
-    stamps = [_iso(r.get("completed_at") or r.get("started_at")) for r in runs
-              if (r.get("completed_at") or r.get("started_at"))
-              and (r.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID
-              and r.get("external_id") == str(number)]         # THIS PR's verdicts only
-    first_check_at = chain_start(stamps, now, VERDICT_GAP)
-    created_at = _iso(pr["created_at"])
-    resets = [_iso(e.get("created_at")) for e in _get_all("/repos/%s/issues/%d/timeline" % (repo, number), token)
-              if e.get("event") in RESET_EVENTS and e.get("created_at")]
-    head_floor = max([created_at] + resets)
+    # every reviewer AND the author: the policy reads the author's role (admin = the owner) from this map
+    perms = {u: _permission(repo, u, token) for u in {r["user"] for r in reviews} | {author}}
     issues = {}
     seen = []
     for a, b in re.findall(r"(?:^|[^\w/])#(\d+)\b|github\.com/%s/issues/(\d+)\b" % re.escape(repo), pr.get("body") or ""):
@@ -163,15 +147,13 @@ def build_record(repo, number, token, now=None):
                            % (head[:8], again["head"]["sha"][:8]))
     return {"number": number, "author": author, "labels": [l["name"] for l in pr.get("labels") or []],
             "head_sha": head, "files": files, "files_truncated": files_truncated, "reviews": reviews,
-            "permissions": perms,
-            "first_check_at": first_check_at, "head_floor": head_floor, "created_at": created_at,
-            "now": now, "body": pr.get("body") or "", "issues": issues}
+            "permissions": perms, "body": pr.get("body") or "", "issues": issues}
 
 
 def post_check(repo, head, verdict, token, number):
     body = {"name": CHECK_NAME, "head_sha": head, "status": "completed", "conclusion": verdict["conclusion"],
-            "external_id": str(number),    # binds the verdict to THIS PR: the clock counts only its own
-            "started_at": _utc_now(),      # completed_at is left for the server to stamp; the clock reads it
+            "external_id": str(number),    # names the PR this verdict is for (one sha can head several PRs)
+            "started_at": _utc_now(),      # completed_at is left for the server to stamp
             "output": {"title": verdict["title"], "summary": verdict["summary"]}}
     _req("POST", "/repos/%s/check-runs" % repo, token, body)
 

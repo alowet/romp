@@ -12,13 +12,14 @@ import * as path from "node:path";
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
 const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
 
-test("windowing constants are sane: tail > recheck, a render radius and a re-window margin, a switch cap", () => {
+test("windowing constants are sane: a tail, a render radius and a re-window margin, a switch cap", () => {
+  // (the trailing re-check window, TAIL_RECHECK, is gone: the tail path re-renders exactly from the kernel's
+  // first changed event — chat-exact-tail.test.ts)
   const tail = Number(/const WINDOW_TAIL = (\d+);/.exec(RENDER)?.[1]);
-  const recheck = Number(/const TAIL_RECHECK = (\d+);/.exec(RENDER)?.[1]);
   const radius = Number(/const WINDOW_RADIUS = (\d+);/.exec(RENDER)?.[1]);
   const margin = Number(/const REVIRT_MARGIN = (\d+);/.exec(RENDER)?.[1]);
   const cap = Number(/const WINDOW_CAP = (\d+);/.exec(RENDER)?.[1]);
-  assert.ok(tail > recheck, `WINDOW_TAIL ${tail} > TAIL_RECHECK ${recheck}`);
+  assert.ok(tail > 0, "a tail window");
   assert.ok(radius > margin && margin > 0, "radius > margin > 0");
   assert.ok(cap > tail, "cap > tail");
 });
@@ -44,8 +45,8 @@ test("renderWindowItems renders [unitStart, unitEnd) with a TOP and a BOTTOM spa
 
 test("sizeSpacers sizes BOTH spacers by hidden-unit count × avg, caching only a visible measurement", () => {
   assert.match(RENDER, /function sizeSpacers\(v: View\): void/);
-  assert.match(RENDER, /if \(top\) top\.style\.height = Math\.max\(0, Math\.round\(\(v\.spacerCount \?\? 0\) \* avg\)\)/);
-  assert.match(RENDER, /if \(bot\) bot\.style\.height = Math\.max\(0, Math\.round\(\(v\.spacerCountBot \?\? 0\) \* avg\)\)/);
+  assert.match(RENDER, /const topAfter = top \? Math\.max\(0, Math\.round\(\(v\.spacerCount \?\? 0\) \* avg\)\) : 0, botAfter = bot \? Math\.max\(0, Math\.round\(\(v\.spacerCountBot \?\? 0\) \* avg\)\) : 0;/);
+  assert.match(RENDER, /if \(top\) top\.style\.height = topAfter \+ "px";\s*\n\s*if \(bot\) bot\.style\.height = botAfter \+ "px";/);
   assert.match(RENDER, /if \(h > 0 && n > 0\) v\.avgTurnH = h \/ n;/);   // don't cache a display:none 0
 });
 

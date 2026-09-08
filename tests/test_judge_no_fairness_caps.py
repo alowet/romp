@@ -33,7 +33,7 @@ class NoFairnessCaps(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.mkdtemp()
         jd._rebind_state(Path(self.td))
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def test_caps_are_unbounded(self):
         # None → list[:None] is the whole list, so no per-pass/per-session throttle survives.

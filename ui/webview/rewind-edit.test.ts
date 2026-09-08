@@ -17,9 +17,11 @@ test("the edit affordance renders only on bubbles the backend can address", () =
   // gate: genuine human bubble + transcript uuid + the session's _editable set (reconcileRewind:
   // SDK backend only, newer than the last compaction, not an optimistic echo)
   assert.match(RENDER, /if \(!romp && !injected && ev\.uuid && editSid\s*\n\s*&& \(sessions\.get\(editSid\) as any\)\?\._editable\?\.has\(ev\.uuid\)\)/);
-  assert.match(RENDER, /if \(s\.status\?\.backend === "sdk"\) \{/);           // tmux sessions get no edit affordance
-  assert.match(RENDER, /if \(s\.events\[i\]\.kind === "compact"\) lastCompact = i;/);   // pre-compaction bubbles excluded
-  assert.match(RENDER, /!e\.uuid\.startsWith\(OPT_PREFIX\)/);                 // optimistic echoes excluded
+  // the set is computed by rewind-reconcile.ts (executed there); render.ts hands it the backend and the echo prefix
+  assert.match(RENDER, /sdk: s\.status\?\.backend === "sdk", now: Date\.now\(\), ttlMs: REWIND_TTL_MS, optPrefix: OPT_PREFIX/);   // tmux sessions get no edit affordance; echoes are excluded
+  const PASS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "rewind-reconcile.ts"), "utf8");
+  assert.match(PASS, /if \(events\[i\]\.kind === "compact"\) lastCompact = i;/);   // pre-compaction bubbles excluded
+  assert.match(PASS, /!e\.uuid\.startsWith\(opts\.optPrefix\)/);              // optimistic echoes excluded
   // the button arms the composer's edit mode
   assert.match(RENDER, /edit\.addEventListener\("click", \(e\) => \{ e\.stopPropagation\(\); beginComposerEdit\(editSid, uuid, orig\); \}\);/);
 });
@@ -46,12 +48,16 @@ test("the composer edit chip cancels via its x and via Escape", () => {
 });
 
 test("the pending-rewind overlay is wired into every ingest path and repaints mid-window", () => {
-  const calls = RENDER.match(/reconcileRewind\(s\);/g) || [];
+  const calls = RENDER.match(/reconcileRewind\(s(, from)?\);/g) || [];   // chatTail passes its from: the signature's bound (chat-exact-tail.test.ts)
   assert.ok(calls.length >= 4, "reconcileRewind wired into upsert + update + chatTail + the edit send, got " + calls.length);
-  // the overlay touches MID-window turns — the append fast path won't repaint them without stale
-  assert.match(RENDER, /if \(v\) v\.stale = true;\s*\/\/ the overlay touches MID-window turns/);
-  // chatTail reuses prefix event objects across pushes → stale rewound flags are stripped first
-  assert.match(RENDER, /for \(const e of s\.events\) if \(\(e as any\)\.rewound\) delete \(e as any\)\.rewound;/);
+  // the overlay touches MID-window turns — the append fast path won't repaint them without stale; stale is set
+  // when the overlay or the editable set CHANGED (the tail path re-renders exactly what the kernel named, so
+  // this signal is what repaints a prefix bubble — chat-exact-tail.test.ts)
+  assert.match(RENDER, /if \(v && r\.stale\) v\.stale = true;\s*\/\/ the overlay or the editable set changed: MID-window turns repaint/);
+  // chatTail reuses prefix event objects across pushes → stale rewound flags are stripped first (the pass
+  // itself is rewind-reconcile.ts, executed by its own tests)
+  const PASS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "rewind-reconcile.ts"), "utf8");
+  assert.match(PASS, /for \(const e of events\) if \(e\.rewound\) delete e\.rewound;/);
   // abandoned turns dim via a class on the rendered turn
   assert.match(RENDER, /if \(\(ev as any\)\.rewound\) turn\.classList\.add\("rewound"\);/);
   assert.match(CSS, /\.turn\.rewound \{ opacity: 0\.35;/);

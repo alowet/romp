@@ -55,26 +55,6 @@
      "uuid": "a1"
     },
     {
-     "absorbed": true,
-     "author": "human",
-     "fsid": "11111111-2222-3333-4444-555555555555",
-     "landedT": 1781096455,
-     "message": {
-      "content": [
-       {
-        "text": "also rename the digest file",
-        "type": "text"
-       }
-      ],
-      "role": "user"
-     },
-     "parentUuid": "tr1",
-     "session_id": "11111111-2222-3333-4444-555555555555",
-     "t": 1781096440,
-     "type": "user",
-     "uuid": "att1"
-    },
-    {
      "fsid": "11111111-2222-3333-4444-555555555555",
      "message": {
       "content": [
@@ -91,6 +71,26 @@
      "t": 1781096455,
      "type": "user",
      "uuid": "tr1"
+    },
+    {
+     "absorbed": true,
+     "author": "human",
+     "fsid": "11111111-2222-3333-4444-555555555555",
+     "message": {
+      "content": [
+       {
+        "text": "also rename the digest file",
+        "type": "text"
+       }
+      ],
+      "role": "user"
+     },
+     "parentUuid": "tr1",
+     "sentAt": 1781096440,
+     "session_id": "11111111-2222-3333-4444-555555555555",
+     "t": 1781096455,
+     "type": "user",
+     "uuid": "att1"
     },
     {
      "fsid": "11111111-2222-3333-4444-555555555555",

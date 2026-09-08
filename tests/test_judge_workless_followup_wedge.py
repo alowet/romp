@@ -69,7 +69,7 @@ class WorklessFollowupWedge(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.mkdtemp()
         jd._rebind_state(Path(self.td))
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         # an OPEN top the user just replied to: the optimistic msg-reopen is the latch
         self.store = {"rompUuid": SID, "seq": 1, "placementsV": jd.PLACEMENTS_V,
                       "nodes": {GID: {"id": GID, "text": "Ship the notes-api deploy", "parentId": None,
@@ -116,7 +116,7 @@ class WorklessFollowupWedge(unittest.TestCase):
         ]
         path = os.path.join(self.td, SID + ".jsonl")
         open(path, "w").write("\n".join(json.dumps(r) for r in recs) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         return path
 
     def _fold(self):
@@ -187,7 +187,7 @@ class WorklessFollowupWedge(unittest.TestCase):
         ]
         path = os.path.join(self.td, SID + ".jsonl")
         open(path, "w").write("\n".join(json.dumps(r) for r in recs) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._plan_session(SID, path, NOW)
         self.assertFalse(self.fu_calls, "a nudge is never a follow-up unit")
         store = jd.load_goals(SID)

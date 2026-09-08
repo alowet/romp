@@ -314,7 +314,7 @@ class PushCycle(unittest.TestCase):
 
     def _clear_build_state(self):
         km._parse_cache.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         km._built_chat.clear()
         km._prev_chat_events.clear()
         km._prev_chat_ledger.clear()

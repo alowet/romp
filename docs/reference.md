@@ -82,9 +82,15 @@ op uses; a store that cannot be read or written answers 200 with `ok:false` and
 the reason the dashboards see, and an unknown key or a wrong type is a 400
 naming it. The panel finds the kernel through the `serve-port` record the
 kernel writes beside `serve-token` in the state directory once its socket is
-bound; with no record, or nothing answering on it, the panel refuses the
-gesture and says the kernel is not running rather than writing a file the
-kernel cannot check.
+bound; with a record nothing answers on, the panel refuses the gesture and says
+the kernel is not running rather than writing a file the kernel cannot check.
+With no record at all (a kernel older than the panel wrote the token and no
+port) it tries the port the command line resolves, `ROMP_KERNEL_PORT`, then
+`ROMP_SERVE_PORT`, else `29855`, and its refusal says so when nothing answers
+there. Record or fallback, the panel first asks the port to prove itself: a
+`GET /healthz` with no token, on `127.0.0.1` only, must answer `200 ok` with
+the kernel's `X-Romp-Boot` identity before the token is sent, and a port that
+answers as anything else is refused by name and never sees the token.
 
 `--env` gives one session its own environment, so two sessions in the same
 directory can run with different toggles (a `FEATURE_FLAG=1`, a `CLAUDE_CODE_*`
@@ -191,6 +197,26 @@ romp mail remote                 # legacy singleton scheme only (ROMP_POSTAL_PEE
 | `set_working(text)` | Publish what you hold so peers steer clear |
 | `check_sent()` | Whether your sent messages were read yet |
 | `recall_message(to, id?)` | Unsend a message the recipient hasn't read |
+
+### When a send is refused
+
+A send whose record cannot be written, or that cannot be placed in the
+recipient's inbox, is refused: the bus answers `503` with `ok: false` and the
+reason, nothing is delivered and nothing is recorded, and the sender still
+holds the text to retry. Two outcomes are not refusals, because the message is
+already in the recipient's hands: the recipient read it in the instant before
+its record failed, or the bus could not take it back out of the inbox. The
+send then answers the id, and the bus says on stderr and on the dashboard that
+the message log has no record of that message. A bus stopped between placing a
+message and recording it writes the missing record from the message's own
+headers at its next start. `check_sent` and `romp mail sent`
+show a message the bus had to give up on later (a cross-host record it could
+not write, a file it could not read, a write a restart found unfinished) as
+`bounced`, marked `refused` with the reason; a peer's refusal that did come
+back as a note still reads `undeliverable, returned to you`. A message file the bus cannot read, in a
+recipient's inbox or in the cross-host outbox, is moved aside once (see the
+state files below), its sender's receipt reads refused, and the dashboard's
+error center says so under the `refused` kind.
 
 ### Claude Code 2.1.224 or newer
 
@@ -1039,8 +1065,19 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
 - `sends`: `full`, `delta`, `deduped`, each a map from slot name (`chat`,
   `feed`, `bars`, `taborder`, ...) to `count` and `bytes`. A deduplicated frame
   was built and compared, then not sent.
-- `goals`: `loads`, `saves`, `writes` on the goal stores. A save that would
-  rewrite identical bytes is a save without a write.
+- `goals`: `loads`, `saves`, `writes` on the goal stores through the writer's
+  loader (`load_goals`) and `save_goals`; the pusher's read-only loads go
+  through the shared store cache and show under `memos.shared`, not here. A
+  save that would rewrite identical bytes is a save without a write.
+- `memos`: the three identity memos on the goal-store path. `pass` is the
+  judge pass's stat-keyed store memo (`hit`, `miss`, `fail`, `evict`, `punch`,
+  and its occupancy `entries`, `bytes`); `shared` is the pusher's shared
+  read-only store cache (`hit`, `miss`, `compare_miss`, `refuse`, `dup`,
+  `absent`, `corrupt`, `unreadable_journal`, `evict`, `fallback`, `poisoned`,
+  with `entries`, `bytes` and `off`); `chain` is the write-moment chain memo
+  (`hit`, `miss`, `populate`, `bypass`). The compaction sweep after each judge
+  pass evicts from `pass` and `shared` the entries of stores no session in the
+  discover window owns, so both stay bounded by the live board.
 - `judge`: `passes`, `ms_sum`, `ms_last`, `ms_mean` (wall time; a pass waits
   on model calls), `cpu_ms_sum` (CPU time of the judge tier threads and every
   per-session worker they run; the workers' share is `cpu_ms_workers`).
@@ -1076,11 +1113,22 @@ frames it received is measured in the panes themselves, by
   too. The federation layer, which every kernel page loads, times its
   own prefixing, delta application and merge of each frame as `fed:<type>`,
   nested outside the pane's handler; each level records its own time, so
-  `fed:feed` and `feed` add up to the frame's cost. The timeline's listener is
-  wrapped the same way on both hosts (the VS Code bundle directly; the kernel
-  page's inline boot through the `window.__rompPerf` that `federation.js`
-  publishes before it runs), so `data`, `bars`, `hover`, `activeChat`,
-  `revealEvent` and `models` are timed like any pane's frames.
+  `fed:feed` and `feed` add up to the frame's cost. The federation layer hands
+  its merged frames (`feed`, `tabOrder`, `data`, `bars`) to the pane's handler
+  by direct call once the pane has registered it (`window.__rompFed.onFrame`,
+  through `ui/webview/frame-listener.ts`), so `fed:<type>` is that layer's own
+  compute; it dispatches them on `window` only when nothing registered, and
+  every other frame still arrives as a `window` `message` event. A `message`
+  listener from another JavaScript world (a browser extension's content
+  script) that reads `event.data` receives a structured clone of every frame
+  dispatched on `window`, tens of milliseconds for a multi-megabyte board; the
+  direct call keeps the merged frames out of its reach. See "A message
+  listener from another world" in `CONTRIBUTING.md` for the check that finds
+  such a listener. The timeline's listener is wrapped the same way on both
+  hosts (the VS Code bundle directly; the kernel page's inline boot through
+  the `window.__rompPerf` that `federation.js` publishes before it runs), so
+  `data`, `bars`, `hover`, `activeChat`, `revealEvent` and `models` are timed
+  like any pane's frames.
 - Per type and minute: count, summed and maximum handler time, the exact
   number of frames over 16.7 ms (one dropped frame at 60 Hz) and at or over
   100 ms, and a 14-bucket log2 histogram (under 1 ms, 1-2, 2-4, ..., 2048-4096,
@@ -1499,6 +1547,19 @@ lands in the same second; the `remotes.json` sidecar is 0600, since its rows
 carry tokens), the file is rewritten without them, and one stderr line plus one
 Log entry under the `refused` kind names each host as a clipped repr, never the
 raw string.
+
+The postal service's own files live under `postal/` there: `mail/<session>/`
+(a maildir per recipient), `outbox/<host>/` and `readbox/<host>/` (cross-host
+mail and read receipts awaiting their peer). A record or message file the bus
+cannot parse or read is moved aside once, never deleted, to
+`<name>.corrupt-<UTC stamp>` beside the original (an inbox file lands beside
+its `new/` directory, out of every listing; a `-1`, `-2` suffix when two land
+in the same second), the rest of the store is served, the sender's receipt for
+that message reads refused, and the error center says so under the `refused`
+kind. At start the bus removes the temporary files a crash left behind (a
+message written but never placed, a store record never finished), closes each
+one's receipt as refused, and says so once. The sidecars are yours to inspect
+or delete.
 
 ## Switches
 

@@ -55,46 +55,6 @@
      "uuid": "a1"
     },
     {
-     "absorbed": true,
-     "author": "human",
-     "fsid": "11111111-2222-3333-4444-555555555555",
-     "landedT": 1781096450,
-     "message": {
-      "content": [
-       {
-        "text": "first queued note",
-        "type": "text"
-       }
-      ],
-      "role": "user"
-     },
-     "parentUuid": "tr1",
-     "session_id": "11111111-2222-3333-4444-555555555555",
-     "t": 1781096430,
-     "type": "user",
-     "uuid": "att1"
-    },
-    {
-     "absorbed": true,
-     "author": "human",
-     "fsid": "11111111-2222-3333-4444-555555555555",
-     "landedT": 1781096450,
-     "message": {
-      "content": [
-       {
-        "text": "second queued note",
-        "type": "text"
-       }
-      ],
-      "role": "user"
-     },
-     "parentUuid": "att1",
-     "session_id": "11111111-2222-3333-4444-555555555555",
-     "t": 1781096440,
-     "type": "user",
-     "uuid": "att2"
-    },
-    {
      "fsid": "11111111-2222-3333-4444-555555555555",
      "message": {
       "content": [
@@ -111,6 +71,46 @@
      "t": 1781096450,
      "type": "user",
      "uuid": "tr1"
+    },
+    {
+     "absorbed": true,
+     "author": "human",
+     "fsid": "11111111-2222-3333-4444-555555555555",
+     "message": {
+      "content": [
+       {
+        "text": "first queued note",
+        "type": "text"
+       }
+      ],
+      "role": "user"
+     },
+     "parentUuid": "tr1",
+     "sentAt": 1781096430,
+     "session_id": "11111111-2222-3333-4444-555555555555",
+     "t": 1781096450,
+     "type": "user",
+     "uuid": "att1"
+    },
+    {
+     "absorbed": true,
+     "author": "human",
+     "fsid": "11111111-2222-3333-4444-555555555555",
+     "message": {
+      "content": [
+       {
+        "text": "second queued note",
+        "type": "text"
+       }
+      ],
+      "role": "user"
+     },
+     "parentUuid": "att1",
+     "sentAt": 1781096440,
+     "session_id": "11111111-2222-3333-4444-555555555555",
+     "t": 1781096450,
+     "type": "user",
+     "uuid": "att2"
     },
     {
      "fsid": "11111111-2222-3333-4444-555555555555",

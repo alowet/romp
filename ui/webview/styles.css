@@ -488,6 +488,9 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 /* WORKING: a small yellow dot left of the name (replaces the old yellow outline). */
 .tab-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--st-working-bg); }   /* solid — dot oscillation was distracting (the user 2026-06-16) */
 .tab-dot.await { background: var(--st-awaitbg-bg); }   /* awaiting-bg: the dot matches the await-green chip (the user 2026-07-13) */
+/* the slot with no dot to show (idle, blocked, closed…): laid out, invisible — a tab's width must not change with its
+   state, or the strip's row count flaps at a wrap boundary and the transcript slides under the reader (T262g, 2026-09-08) */
+.tab-dot.none { visibility: hidden; }
 /* state UNKNOWN: a hollow ring in the same "can't see it" gray the network strip paints a down host
    (the `#8a8a8a` in strip.ts's status-dot colour pick) — no-information rendered as itself, so a
    bare tab never has to carry that meaning. */
@@ -726,6 +729,11 @@ body.chat-theme-yatharth .tab.active.colored:not(.tab-blocked) {
    (overflow-y:auto alone makes overflow-x compute to auto, which allowed it) */
 /* overflow-y: scroll (not auto) so the chat scrollbar + its gutter are ALWAYS shown and never
    auto-hide on the side — and the content doesn't shift when it would appear (the user 2026-06-16). */
+/* The browser's scroll anchoring stays ON here (measured 2026-09-08, T262e): after a scroll that slides the
+   virtualization window, the pane's rewindow write keeps the focus unit still and Chrome's anchoring then absorbs
+   the LATER layout changes the pane does not compensate (spacer re-measures, late-sizing rows). With
+   overflow-anchor: none the visible line drifted 194-246 px after every such scroll on a headless run; with it on,
+   0 px on every row. Do not add overflow-anchor: none to #content. */
 #content { flex: 1 1 auto; overflow-y: scroll; overflow-x: hidden; padding: 8px 0 12px; }
 /* a clearly-visible always-on thumb for the chat pane (brighter than the faint global thumb) */
 #content::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.04); }
