@@ -43,3 +43,24 @@ test("degenerate inputs stay sane", () => {
   assert.equal(dragSlotIndex([], 300, 0, 30, 50, 50), 0);
   assert.equal(dragSlotIndex(boxes(400), 300, 0, 30, 10, -20), 0, "negative y clamps to row 0");
 });
+
+test("a `br` box opens a row even when it would have fit — the line-per-group strip's headers (T264)", () => {
+  // T264 (the user 2026-09-08): every tag group starts on its own line, so the real strip breaks
+  // before each header whatever the remaining width; the simulation must wrap at the same places or
+  // the pointer's slot would read against rows the strip does not have
+  const boxes = [{ id: "a", w: 50 }, { id: "b", w: 50 }, { id: "\0head:api", w: 40, br: true }, { id: "c", w: 50 }];
+  // row 0: a, b (100 of 400 used — b's row had room for the header, but the header opens row 1)
+  assert.equal(dragSlotIndex(boxes, 400, 0, 20, 10, 5), 0, "row 0, left of a");
+  assert.equal(dragSlotIndex(boxes, 400, 0, 20, 60, 5), 1, "row 0, between a and b");
+  assert.equal(dragSlotIndex(boxes, 400, 0, 20, 300, 5), 2, "row 0, past b: the header's slot (the end of row 0)");
+  assert.equal(dragSlotIndex(boxes, 400, 0, 20, 10, 25), 2, "row 1, left of the header: the same slot");
+  assert.equal(dragSlotIndex(boxes, 400, 0, 20, 60, 25), 3, "row 1, between the header and c");
+  assert.equal(dragSlotIndex(boxes, 400, 0, 20, 300, 25), 4, "row 1, past c: the end");
+  // a zero-width br box (the untagged trail's break) is a row opener too: the slot past the previous
+  // row's last tab and the slot before the trail's first tab stay two distinct slots
+  const trail = [{ id: "a", w: 50 }, { id: "\0sep", w: 0, br: true }, { id: "c", w: 50 }];
+  assert.equal(dragSlotIndex(trail, 400, 4, 20, 300, 5), 1, "past a: before the break (the end of a's row)");
+  assert.equal(dragSlotIndex(trail, 400, 4, 20, 10, 25), 2, "row 1, left of c's middle: the head of the trail");
+  // br on the FIRST box is a no-op (nothing to break from)
+  assert.equal(dragSlotIndex([{ id: "\0head:web", w: 40, br: true }, { id: "a", w: 50 }], 400, 0, 20, 100, 5), 2);
+});

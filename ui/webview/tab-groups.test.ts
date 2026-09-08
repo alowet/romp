@@ -118,7 +118,8 @@ test("the strip renders sections when the switch is on and some tag holds a visi
   assert.match(RENDER, /const unions = viewTagUnion\(effViews\(\)\);\s*\n\s*const plan = planStrip\(visibleIds, unions, readTabGroups\(unions\), activeId, phoneLayout\(\),/,
     "the pure module owns the rule; the phone layout and the create in flight are its inputs");
   assert.match(RENDER, /collapsedTabIds = plan\.folded;/);
-  assert.match(RENDER, /if \("head" in item\) \{ bar\.appendChild\(makeGroupHead\(item\.head, item\.folded, item\.active, item\.hidden\)\); continue; \}/);
+  assert.match(RENDER, /if \("head" in item\) \{\s*\n(?:\s*\/\/[^\n]*\n)*\s*if \(item\.head\.name !== null && bar\.childElementCount\) bar\.appendChild\(makeRowBreak\(false\)\);\s*\n\s*bar\.appendChild\(makeGroupHead\(item\.head, item\.folded, item\.active, item\.hidden\)\);\s*\n\s*continue;\s*\n\s*\}/,
+    "a header paints from the plan (T264: on its own line — the break ahead of it)");
 });
 
 test("executed: planStrip — sections + folds; the flat strip when off or untagged; the ACTIVE tab's section never folds", () => {
@@ -256,7 +257,7 @@ test("a folded section renders its header alone with the folded-away count and o
   assert.ok(head.indexOf('el("span", "tab-group-count")') < head.indexOf("sectionPip("), "after the count");
   assert.ok(!head.includes("tabStateClass("), "the header itself wears no state class");
   assert.ok(!head.includes('"tab-dot"'), "never a .tab-dot — the kernel's mobile scrape keys on the tab pips' vocabulary");
-  assert.match(head, /const sep = el\("div", "tab-group-sep"\);/, "the untagged trail is UNLABELED (the ruling): a separator, not a header");
+  assert.match(head, /if \(sec\.name === null\) return makeRowBreak\(true\);/, "the untagged trail is UNLABELED (the ruling): its own row with no chip, not a header (T264)");
   // the tab's own class comes from the same function
   assert.match(RENDER, /const stateCls = tabStateClass\(s\.status\);\s*\n\s*if \(stateCls\) tab\.classList\.add\(stateCls\);/);
   assert.match(CSS, /\.tab-group-pip \{ flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; background: var\(--st-working-bg\); \}/, "small: subordinate to the label");
@@ -264,12 +265,12 @@ test("a folded section renders its header alone with the folded-away count and o
   assert.match(CSS, /\.tab-group-pip\.retrying \{ background: #e67e22; \}/, "amber, the tab's .tab-retrying hue");
 });
 
-test("row hairlines count section headers and the separator as row members (T134's floating look must not return)", () => {
+test("row hairlines count section headers as row members (T134's floating look must not return), never the row breaks", () => {
   // a wrapped row made only of folded headers got no line: the painter grouped `.tab` children only
   const painter = RENDER.slice(RENDER.indexOf("function paintTabRowLines("), RENDER.indexOf("let tabRowObserver"));
-  assert.match(painter, /if \(!\(t\.classList\.contains\("tab"\) \|\| t\.classList\.contains\("tab-group-head"\) \|\| t\.classList\.contains\("tab-group-sep"\)\)\) continue;/);
-  // the separator's offsetTop is the row's: gutters are padding, not margin (see the drag-live pin)
-  assert.match(CSS, /\.tab-group-sep \{ flex: 0 0 auto; box-sizing: border-box; width: 13px; padding: 8px 6px; background: var\(--box-border\); background-clip: content-box; \}/);
+  assert.match(painter, /if \(!\(t\.classList\.contains\("tab"\) \|\| t\.classList\.contains\("tab-group-head"\)\)\) continue;/);
+  // the zero-height row breaks (T264) are not rows: counting one drew a hairline at the strip's top edge
+  assert.doesNotMatch(painter, /tab-group-sep|tab-group-break/);
 });
 
 test("the picker's Tags row is for SDK and Codex sessions: disabled behind a note on the tmux pick, and no `tags` ride a tmux create", () => {
@@ -357,8 +358,56 @@ test("the section chrome is a LABEL's (the user 2026-09-06): the surface's sub-l
   assert.doesNotMatch(CSS, /\.tab-group-dot/, "the dot is gone");
   const sizes = new Set(Array.from(CSS.matchAll(/\n\.tab-group-[^{\n]*\{[^}]*font-size: ([^;]+);/g)).map((m) => m[1]));
   assert.deepEqual([...sizes], ["0.82em"], "one font-size across every section rule");
-  assert.match(CSS, /\.tab-group-sep \{ flex: 0 0 auto; box-sizing: border-box; width: 13px; padding: 8px 6px;/, "a 1px line inside 6px gutters (padding, so its rect is its footprint)");
+  assert.doesNotMatch(CSS, /\.tab-group-sep \{/, "the visible separator is gone (T264): the untagged trail opens its own row instead");
 });
+
+// ── T264 (the user 2026-09-08): every tag group on its own line ──────────────────────────────────────────
+test("every group opens a new line: a zero-height full-width break ahead of each header, the trail's break doubling as the boundary (T264)", () => {
+  // the strip read as one long concatenation; now the chip sits at the left edge, its tabs follow it
+  // and wrap onto further rows as they need, and the next group starts a fresh line
+  const loop = RENDER.slice(RENDER.indexOf("collapsedTabIds = plan.folded;"), RENDER.indexOf("const id = item.id;"));
+  assert.match(loop, /if \(item\.head\.name !== null && bar\.childElementCount\) bar\.appendChild\(makeRowBreak\(false\)\);\s*\n\s*bar\.appendChild\(makeGroupHead\(item\.head, item\.folded, item\.active, item\.hidden\)\);/,
+    "a break before every header but the strip's first item (which already opens the first row)");
+  const brk = RENDER.slice(RENDER.indexOf("function makeRowBreak("), RENDER.indexOf("function sectionHeadOf("));
+  assert.match(brk, /el\("div", "tab-group-break" \+ \(untagged \? " tab-group-sep" : ""\)\)/,
+    "the untagged trail's break keeps the .tab-group-sep class — the boundary sectionHeadOf reads");
+  assert.match(brk, /brk\.setAttribute\("aria-hidden", "true"\);/, "layout only: nothing to read aloud");
+  assert.doesNotMatch(brk, /\.title = /, "no tooltip on a zero-height item");
+  assert.match(CSS, /\.tab-group-break \{ flex: 0 0 100%; height: 0; margin: 0; padding: 0; pointer-events: none; \}/,
+    "a full-row, zero-height item: the next item wraps; no rhythm of its own; takes no drop and no hover");
+  // sectionHeadOf still stops at the untagged boundary and walks past a plain break
+  const sh = RENDER.slice(RENDER.indexOf("function sectionHeadOf("), RENDER.indexOf("function makePlaceholderTab("));
+  assert.match(sh, /if \(h\.classList\.contains\("tab-group-sep"\)\) return null;/);
+  // the header's own rule is unchanged: flex-none, the chip first in its row
+  assert.match(CSS, /\.tab-group-head \{ display: flex; flex: 0 0 auto; align-items: center;/);
+});
+
+test("the tab drag's virtual layout wraps where the strip wraps: headers after a break and the trail's break open rows (T264)", () => {
+  const over = RENDER.slice(RENDER.indexOf('tabs.addEventListener("dragover"'), RENDER.indexOf('tabs.addEventListener("drop"'));
+  assert.match(over, /const isBreak = \(n: Element \| null\) => !!n && n\.classList\.contains\("tab-group-break"\);/);
+  assert.match(over, /const before = \(t: HTMLElement\) => \{ let p = t\.previousElementSibling; while \(p && p === dragged\) p = p\.previousElementSibling; return p; \};/,
+    "the box before, skipping the dragged tab (it is out of the virtual layout)");
+  assert.match(over, /w: isBreak\(t\) \? 0 : /, "the trail's break is a zero-width row opener, not a full-row box");
+  assert.match(over, /br: isBreak\(t\) \|\| isBreak\(before\(t\)\) \}\)\);/, "a header after a break, and the break itself, open a row");
+  assert.match(over, /if \(ref && ref\.classList\.contains\("tab-group-head"\) && isBreak\(before\(ref as HTMLElement\)\)\) ref = before\(ref as HTMLElement\);/,
+    "the slot before a header is the end of the previous row — never between the break and the chip");
+  const DS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "dragslot.ts"), "utf8");
+  assert.match(DS, /const needsWrap = row !== null && cx > 0 && \(b\.br === true \|\| cx \+ b\.w > containerW\);/, "dragslot honours br (executed in dragslot.test.ts)");
+});
+
+test("executed: a session under two tags is placed ONCE, under its home tag — the duplicate question stays the user's (T264)", () => {
+  // the manager's note (2026-09-08): sectionTabs homes each id under homeTag; the user has been asked
+  // whether a two-tag session should show under both. Until they rule, this pins today's behaviour so
+  // the line-per-group layout does not change it by accident.
+  const unions = viewTagUnion({ tags: [{ id: "t-infra", name: "infra", color: "#1EA1EB", members: ["web", "api"] },
+                                       { id: "t-qa", name: "qa", color: "#54B204", members: ["api", "tests"] }] });
+  const p = planStrip(["web", "api", "tests"], unions, parseTabGroups(null, unions), "web", false);
+  const tabs = p.items.filter((i) => "id" in i).map((i) => (i as { id: string }).id);
+  assert.deepEqual(tabs, ["web", "api", "tests"], "each session once");
+  const heads = p.items.map((i, k) => ("head" in i ? { name: i.head.name, ids: i.head.ids, at: k } : null)).filter(Boolean);
+  assert.deepEqual(heads.map((h) => [h!.name, h!.ids]), [["infra", ["web", "api"]], ["qa", ["tests"]]], "api sits under its home tag only");
+});
+
 
 test("the header's structure and gestures read as a label: chevron (flips with the fold) → color bar → name → count; a keyboard button; hover/focus say fold, never open; tokens only (the user 2026-09-06)", () => {
   const head = RENDER.slice(RENDER.indexOf("function makeGroupHead("), RENDER.indexOf("function sectionHeadOf("));
