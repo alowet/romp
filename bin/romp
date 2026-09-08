@@ -2364,9 +2364,9 @@ case "${1:-}" in
                            # NAME=VALUE, split on the FIRST '=' (values may carry '='); an empty
                            # VALUE is meaningful (explicitly setting empty), but a missing '=' or a
                            # NAME outside [A-Za-z_][A-Za-z0-9_]* is a usage error, never a silent
-                           # skip. Toggles only (FEATURE_FLAG=1, CLAUDE_CODE_*) — real secrets stay
-                           # behind ROMP_API_KEY_REF or the apiKeyHelper, since this payload is copied into
-                           # per-sid files and the session registry.
+                           # skip. Toggles only (FEATURE_FLAG=1, CLAUDE_CODE_*): real secrets stay
+                           # behind Claude Code's apiKeyHelper (romp holds no key, and a credential name is
+                           # refused here), since this payload is copied into per-sid files and the registry.
                            if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then
                                echo "usage: romp new [-t] [-d <dir>] [-m <text>] [--tag <label>] [--model <id>] [--effort <level>] [--env NAME=VALUE] [--no-env] [--in <tag>] [--no-inherit] <name>" >&2; exit 2
                            fi
@@ -2896,6 +2896,14 @@ if tmux has-session -t "=$name" 2>/dev/null; then
         tmux attach-session -t "$name"
     fi
 else
+    # A pane inherits the tmux SERVER's globals, and romp holds no API key (2026-09-08): a leftover
+    # ANTHROPIC_API_KEY there would bill this terminal session to a key nobody chose and could be printed
+    # from inside it, while the kernel alone refused to boot on the same variable. Refuse, loudly, and say
+    # where the variable comes from; never scrub it quietly.
+    if tmux show-environment -g 2>/dev/null | grep -q '^ANTHROPIC_API_KEY='; then
+        echo "[romp] refusing to start '$name': the tmux server's environment carries ANTHROPIC_API_KEY. romp holds no API key; remove it from service.env (and any exported variable), restart the manager (romp on restart) so the server starts clean, and configure apiKeyHelper in Claude Code's settings instead (docs/reference.md)." >&2
+        exit 1
+    fi
     # Create new detached session in working directory
     tmux new-session -d -s "$name" -c "$work_dir"
 

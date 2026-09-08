@@ -1648,9 +1648,9 @@ def api_health_auth_label(source, *, salt: str, key_fp: str = "", launched_keyed
       login:<12 hex>   apiKeySource absent or 'none' (a subscription login); the material is the
                        account digest the usage bars already stamp (acct_digest)
       login:unknown    …with no readable account
-      key:<12 hex>     'ANTHROPIC_API_KEY' where the kernel itself injected the key (_options):
-                       the material is the launched key's fingerprint
-      key:env          'ANTHROPIC_API_KEY' the CLI found some other way (the kernel holds no material)
+      key:<12 hex>     'ANTHROPIC_API_KEY' with a launch fingerprint handed in (`key_fp` and
+                       `launched_keyed`): no production caller does since 2026-09-08 (romp holds no key)
+      key:env          'ANTHROPIC_API_KEY' the CLI found on its own (the kernel holds no material)
       key:helper       'apiKeyHelper' — two accounts behind one helper are one bucket
       key:managed      '/login managed key'
       key:<source>     any other source word the CLI enumerates (user, project, temporary, oauth, …),
@@ -3302,7 +3302,12 @@ def helper_fast_org_env(log, cwd=None) -> dict:
     environment. No helper configured for `cwd`: the CLI's own check stands and nothing is said (the session
     bills whatever the CLI resolves). A helper that fails is a problem row in the helper's static words."""
     try:
-        key = _cred.helper_key(cwd)
+        if _cred.project_helper_differs(cwd):
+            # the session's project settings name their own helper (or disable the operator's): the CLI will
+            # bill whatever that resolves, which is not the key the operator's helper prints, and the kernel
+            # runs no command a repository checked in. The CLI's own check stands for that session.
+            return {}
+        key = _cred.helper_key()
     except _cred.CredentialError as e:
         log("fast-mode org check (key account): %s; the CLI's own check stands" % e, problem=True)
         return {}
@@ -6951,16 +6956,14 @@ class SdkBackend:
     @property
     def key_available(self) -> bool:
         """Whether a session with no login pick bills the API key on this box: an apiKeyHelper is configured in
-        Claude Code's settings for the kernel's working directory (credentials.api_key_helper: read, never
-        run). romp holds no key of its own (2026-09-08); this is the picker's key-availability signal, the
-        spawn seed's gate and the judges' default. A settings file that cannot be read is a problem row,
-        once, and reads as no helper until it reads."""
-        return self.key_available_for(None)
-
-    def key_available_for(self, cwd) -> bool:
-        """key_available for a session launched in `cwd`: its project settings may carry the helper."""
+        the operator's Claude Code settings (managed or user; credentials.key_available: read, never run).
+        romp holds no key of its own (2026-09-08); this is the picker's key-availability signal, the spawn
+        seed's gate, the launch's record of what it meant and the judges' default. A project's own settings
+        file is Claude Code's business (it runs that helper behind its trust prompt); the per-init auth check
+        reports where such a session landed. A settings file that cannot be read is a problem row, once, and
+        reads as no helper until it reads."""
         try:
-            return _cred.key_available(cwd)
+            return _cred.key_available()
         except _cred.CredentialError as e:
             if not self._helper_read_said:
                 self._helper_read_said = True
@@ -7714,9 +7717,7 @@ class SdkBackend:
         # romp records no key identity (it holds no key since 2026-09-08), so a CLI-found ANTHROPIC_API_KEY
         # labels key:env and a helper key:helper; the login's account digest labels the login side.
         try:
-            sess.auth_label = self.api_health.auth_label(
-                source, key_fp=getattr(sess, "_launched_key_fp", "") or "",
-                launched_keyed=bool(getattr(sess, "_launched_keyed", False)))
+            sess.auth_label = self.api_health.auth_label(source)   # romp records no key identity: the source word labels
         except Exception as e:
             self._log("api-health: auth label failed (%s): %s" % (sess.name, e))
         # The CLI landed on a DIFFERENT auth than EXPECTED — the expected side is the box-wide
@@ -8303,7 +8304,7 @@ class SdkBackend:
         # What the launch MEANT, for _note_auth_source's per-init check: keyed when the box's helper will
         # bill the key for this session; an explicit key pick with no helper anywhere leaves the CLI to
         # decide, and a login landing then is the pick contradicted.
-        launch_keyed = not login and self.key_available_for(sess.cwd)
+        launch_keyed = not login and self.key_available
         sess._launched_keyed = launch_keyed
         sess._launched_unkeyed_pick = sess.auth == "key" and not launch_keyed
         return ClaudeAgentOptions(**kw)

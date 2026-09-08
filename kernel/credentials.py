@@ -164,16 +164,23 @@ def managed_settings_path() -> str:
     return MANAGED_SETTINGS.get(sys.platform, MANAGED_SETTINGS_DEFAULT)
 
 
-def settings_files(cwd=None) -> list:
+def settings_files(cwd=None, operator_only=False) -> list:
     """The settings files a `claude` launched in `cwd` reads, highest precedence first, in Claude Code's own
     order: managed settings, the project's local file, the project's shared file, the user's file. The
     per-session --settings layer (sdk_backend.flag_settings_path) sits between the first two and is romp's
-    own, so it is not listed here."""
-    cwd = os.path.realpath(cwd or os.getcwd())
-    return [managed_settings_path(),
-            os.path.join(cwd, ".claude", "settings.local.json"),
-            os.path.join(cwd, ".claude", "settings.json"),
-            os.path.join(claude_config_dir(), "settings.json")]
+    own, so it is not listed here. `operator_only` keeps the two files the OPERATOR of this box controls
+    (managed and user) and drops the project pair: that is the scope the kernel itself acts on (below)."""
+    files = [managed_settings_path()]
+    if not operator_only:
+        try:
+            cwd = os.path.realpath(cwd or os.getcwd())
+        except OSError:
+            cwd = None              # a working directory removed under the process: no project files to read
+        if cwd:
+            files += [os.path.join(cwd, ".claude", "settings.local.json"),
+                      os.path.join(cwd, ".claude", "settings.json")]
+    files.append(os.path.join(claude_config_dir(), "settings.json"))
+    return files
 
 
 def _read_settings(path):
@@ -193,14 +200,14 @@ def _read_settings(path):
     return d if isinstance(d, dict) else {}
 
 
-def api_key_helper(cwd=None):
+def api_key_helper(cwd=None, operator_only=False):
     """The `apiKeyHelper` command Claude Code would run for a process in `cwd`: the value in the
     highest-precedence settings file that DEFINES it as a string. "" when that file sets it to "" (the
     value that disables the helper; a login launch's per-session layer uses it), None when no file defines
     it (a null falls through to the next file, as it does in the CLI). Read fresh on every call, never
     cached: Claude Code hot-reloads its settings files, and a helper the user just added must count at
-    once; the cost is four stats."""
-    for p in settings_files(cwd):
+    once; the cost is four stats. `operator_only`: see settings_files."""
+    for p in settings_files(cwd, operator_only):
         d = _read_settings(p)
         if d is None or HELPER_KEY not in d:
             continue
@@ -210,10 +217,20 @@ def api_key_helper(cwd=None):
     return None
 
 
-def key_available(cwd=None) -> bool:
-    """Whether a session launched in `cwd` bills the key by Claude Code's own resolution: an apiKeyHelper is
-    configured there. Read, never run."""
-    return bool(api_key_helper(cwd))
+def key_available() -> bool:
+    """Whether this box has a key side: an apiKeyHelper is configured in the OPERATOR's settings (managed or
+    user). Read, never run. A project's own .claude/settings.json may carry a helper too; Claude Code runs
+    it for sessions in that project (behind its trust prompt), and the per-init auth check reports the
+    landing, but romp neither counts it as the box's key side nor ever runs it (review 2026-09-08: a
+    checked-in settings file must never be a command the kernel executes)."""
+    return bool(api_key_helper(None, operator_only=True))
+
+
+def project_helper_differs(cwd) -> bool:
+    """True when a session launched in `cwd` would resolve a DIFFERENT helper than the operator's (a project
+    or local settings file defines its own, or disables the operator's). The kernel's own calls then stand
+    down for that session rather than ask with a key the session does not bill."""
+    return api_key_helper(cwd) != api_key_helper(None, operator_only=True)
 
 
 def helper_ttl_s() -> float:
@@ -262,13 +279,14 @@ _HELPER_LOCK = threading.Lock()
 _HELPER_MEMO = {"cmd": None, "value": "", "at": 0.0}    # in process memory only; forget_helper_key drops it
 
 
-def helper_key(cwd=None, now=None) -> str:
-    """The key Claude Code's configured helper prints, for the kernel's OWN API calls (the model catalog,
+def helper_key(now=None) -> str:
+    """The key the OPERATOR's configured helper prints (managed or user settings, never a project's: the
+    kernel executes no command a repository checked in), for the kernel's OWN API calls (the model catalog,
     the fast-mode org probe). "" when no helper is configured, so the caller says so in its own words.
     Memoized in process memory for the helper's TTL (CLAUDE_CODE_API_KEY_HELPER_TTL_MS, five minutes by
     default, the CLI's own interval) keyed on the helper command: a changed helper re-runs at once, a
     rotated vault item is picked up within the TTL. `now` is a monotonic clock, injectable by tests."""
-    cmd = api_key_helper(cwd)
+    cmd = api_key_helper(None, operator_only=True)
     if not cmd:
         return ""
     now = time.monotonic() if now is None else now

@@ -1085,7 +1085,7 @@ _LOGIN_AUTH_ENV_FN = None      # login tokens claimed out of the manager's ambie
 
 def _key_available():
     """Whether an unpicked judge call bills the key: an apiKeyHelper is configured in Claude Code's settings
-    for this process's working directory (credentials.api_key_helper: read, never run). romp holds no key of
+    in the operator's settings, managed or user (credentials.key_available: read, never run). romp holds no key of
     its own since 2026-09-08 (the user, after a contributor PR's test printed a key from a session's
     environment); the child resolves the helper itself. An unreadable settings file reads as no helper here;
     the SDK backend says so once in its problem ring."""
@@ -1112,7 +1112,7 @@ def _judge_auth(fsid):
     put on the key is the same wrong-account failure the per-session picker exists to prevent).
     Same resolution as the picker (sdk_backend default_auth / effective_auth), read from the same
     registry file: an explicit 'login' pick → login; anything else → the key when Claude Code's
-    settings carry an apiKeyHelper, else login. A call with no session (fleet-level rows) takes the same default a
+    settings carry an apiKeyHelper, else login. A call with no session (rows with no session) takes the same default a
     fresh session would."""
     a = ""
     if fsid:

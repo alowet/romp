@@ -462,8 +462,12 @@ spawned, and the message names the file and the variable names, never a value,
 says that romp did not start, and gives the fix (remove the lines, configure
 the helper, declare the billing, start again). The supervised manager retries
 and writes the message to its `manager.log` each time until the file is
-repaired. A key romp holds is a key a session can print, so there is no quiet
-fallback.
+repaired. The manager refuses in the same way, before it starts the tmux
+server, when its own environment carries one of the names (it is what receives
+`service.env`, and every terminal pane inherits the server's globals), and
+`romp new -t` refuses to start a terminal session while the tmux server's
+globals carry `ANTHROPIC_API_KEY`. A key romp holds is a key a session can
+print, so there is no quiet fallback anywhere.
 
 #### A key from a secret manager
 
@@ -501,20 +505,28 @@ and no surface of romp's fetches it.
 
         { "apiKeyHelper": "/path/to/fetch-api-key" }
 
-    Claude Code reads its settings files in a fixed precedence, and the kernel
-    reads the helper from the same files in the same order for its working
-    directory: managed settings (`/etc/claude-code/managed-settings.json`;
-    `/Library/Application Support/ClaudeCode/managed-settings.json` on macOS),
-    then `.claude/settings.local.json` and `.claude/settings.json` in the
-    working directory, then `$CLAUDE_CONFIG_DIR/settings.json`
-    (`~/.claude/settings.json` by default). The highest file that defines
-    `apiKeyHelper` as a string wins; a `null` falls through to the next file.
-    The per-session settings layer romp writes for a login pick sits above the
-    project files, which is how a login pick disables the helper for one
-    session (see [Per-session billing](#per-session-billing-login-vs-api-key)).
-    The kernel reads the files fresh on every check, so a helper added later
-    counts at once; a settings file that cannot be read or parsed is a problem
-    row in the Log panel, and the box reads as having no helper until it reads.
+    Claude Code reads its settings files in a fixed precedence: managed
+    settings (`/etc/claude-code/managed-settings.json`; `/Library/Application
+    Support/ClaudeCode/managed-settings.json` on macOS), then a project's
+    `.claude/settings.local.json` and `.claude/settings.json`, then
+    `$CLAUDE_CONFIG_DIR/settings.json` (`~/.claude/settings.json` by default).
+    The highest file that defines `apiKeyHelper` as a string wins; a `null`
+    falls through to the next file. The kernel acts on the two files the
+    operator of the box controls, the managed and the user file: they decide
+    whether the box has a key side at all (the Billing picker's key choice,
+    the default for unpicked sessions and judge calls), and they name the one
+    helper the kernel runs in-process for its own two calls. A project's own
+    `.claude/settings.json` is Claude Code's business: the CLI runs that helper
+    for sessions in the project, behind its trust prompt, and the per-init auth
+    check reports where such a session landed, but the kernel never runs a
+    command a repository checked in, and its fast-mode probe stands down for a
+    session whose project would resolve a different helper. The per-session
+    settings layer romp writes for a login pick sits above the project files,
+    which is how a login pick disables the helper for one session (see
+    [Per-session billing](#per-session-billing-login-vs-api-key)). The kernel
+    reads the files fresh on every check, so a helper added later counts at
+    once; a settings file that cannot be read or parsed is a problem row in the
+    Log panel, and the box reads as having no helper until it reads.
 
 3. Declare the billing in `service.env`: `ROMP_EXPECTED_AUTH=key`. On a box
    with a helper every session without a login pick bills the key, so the

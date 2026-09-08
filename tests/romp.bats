@@ -977,24 +977,34 @@ MOCK
     grep -q 'tmux attach-session -t myproject' "$MOCK_LOG"
 }
 
-# The tmux SERVER's globals are what a new pane inherits; when romp itself runs `op` (a reference is
-# configured) the launcher unsets op's credential names AND the manager's startup ANTHROPIC_API_KEY
-# there before `new-session` — a pane on a reference-governed box never bills a stale key (2026-09-06).
+# The tmux SERVER's globals are what a new pane inherits. romp holds no API key (2026-09-08), so a leftover
+# ANTHROPIC_API_KEY there is refused before the pane exists: the kernel alone refusing to boot on the same
+# variable left this path open (a review find), and a quiet scrub would hide the misconfiguration.
 _stale_server_globals() {
     export MOCK_TMUX_GLOBALS_FILE="$TEST_DIR/mock_globals.txt"
     printf '%s\n' "OP_SERVICE_ACCOUNT_TOKEN=synthetic-op-token" "OP_SESSION_acct=synthetic-session" \
         "ANTHROPIC_API_KEY=synthetic-stale-key" "PATH=/usr/bin" "HOME=/nonexistent" > "$MOCK_TMUX_GLOBALS_FILE"
 }
 
-@test "new -t: no reference anywhere leaves the tmux server's environment alone (static-key and helper boxes)" {
+@test "new -t: a leftover ANTHROPIC_API_KEY in the tmux server's globals refuses the session, loudly, without scrubbing" {
     _stale_server_globals
-    unset ROMP_API_KEY_REF
-    export ROMP_SERVICE_ENV_FILE="$TEST_DIR/service.env"
-    printf '%s\n' "ANTHROPIC_API_KEY=synthetic-static-key" > "$ROMP_SERVICE_ENV_FILE"
+    run run_romp new -t myproject
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"ANTHROPIC_API_KEY"* ]]
+    [[ "$output" == *"apiKeyHelper"* ]]
+    [[ "$output" != *"synthetic-stale-key"* ]]
+    ! grep -q 'new-session' "$MOCK_LOG"
+    ! grep -q 'set-environment' "$MOCK_LOG"
+}
+
+@test "new -t: clean server globals (op's names, a login token) start the session and touch nothing" {
+    export MOCK_TMUX_GLOBALS_FILE="$TEST_DIR/mock_globals.txt"
+    printf '%s\n' "OP_SERVICE_ACCOUNT_TOKEN=synthetic-op-token" "ANTHROPIC_AUTH_TOKEN=synthetic-bearer" \
+        "PATH=/usr/bin" > "$MOCK_TMUX_GLOBALS_FILE"
     run run_romp new -t myproject
     [ "$status" -eq 0 ]
-    ! grep -q 'set-environment -gu' "$MOCK_LOG"
-    ! grep -q 'show-environment' "$MOCK_LOG"
+    grep -q 'new-session' "$MOCK_LOG"
+    ! grep -q 'set-environment' "$MOCK_LOG"
 }
 
 @test "new -t on a 2.1.224+ claude: inbound-accept setting + @romp-inbound-accept tag" {

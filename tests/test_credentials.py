@@ -106,8 +106,8 @@ class SettingsPrecedence(_Settings):
 
     def test_no_file_defines_the_helper(self):
         self.assertIsNone(cred.api_key_helper(self.cwd))
-        self.assertFalse(cred.key_available(self.cwd))
-        self.assertEqual(cred.helper_key(self.cwd), "", "no helper: an empty answer, and the caller says so")
+        self.assertFalse(cred.key_available())
+        self.assertEqual(cred.helper_key(), "", "no helper: an empty answer, and the caller says so")
 
     def test_the_user_file_defines_it_and_each_higher_layer_overrides(self):
         self._write("user", {"apiKeyHelper": "/u/helper.sh"})
@@ -118,15 +118,34 @@ class SettingsPrecedence(_Settings):
         self.assertEqual(cred.api_key_helper(self.cwd), "/l/helper.sh")
         self._write("managed", {"apiKeyHelper": "/m/helper.sh"})
         self.assertEqual(cred.api_key_helper(self.cwd), "/m/helper.sh")
-        self.assertTrue(cred.key_available(self.cwd))
+        self.assertTrue(cred.key_available())
 
     def test_an_empty_string_disables_and_a_null_falls_through(self):
         self._write("user", {"apiKeyHelper": "/u/helper.sh"})
         self._write("local", {"apiKeyHelper": ""})
         self.assertEqual(cred.api_key_helper(self.cwd), "", "the CLI's disable value, the one a login launch writes")
-        self.assertFalse(cred.key_available(self.cwd))
+        self.assertTrue(cred.key_available(), "the box's key side is the operator's helper, whatever a project says")
+        self.assertTrue(cred.project_helper_differs(self.cwd), "and that project would resolve differently")
         self._write("local", {"apiKeyHelper": None})
         self.assertEqual(cred.api_key_helper(self.cwd), "/u/helper.sh", "null is not defined here: the CLI reads on")
+        self.assertFalse(cred.project_helper_differs(self.cwd))
+
+    def test_the_kernel_acts_only_on_the_operators_helper(self):
+        """The kernel reads a project's settings to know what the CLI will do, but never RUNS a helper a
+        repository checked in (review 2026-09-08): its own calls use the managed or user helper only."""
+        proj_script, proj_marker = _helper_script(tempfile.mkdtemp(), out="synthetic-project-output")
+        self._write("project", {"apiKeyHelper": proj_script})
+        self.assertEqual(cred.api_key_helper(self.cwd), proj_script, "the CLI would run it for that project")
+        self.assertFalse(cred.key_available(), "but it is not the box's key side")
+        self.assertEqual(cred.helper_key(), "", "and the kernel does not run it")
+        self.assertEqual(_runs(proj_marker), 0)
+        self.assertEqual(cred.settings_files(self.cwd, operator_only=True),
+                         [self.managed, os.path.join(self.cfg, "settings.json")])
+        user_script, user_marker = _helper_script(tempfile.mkdtemp(), out="synthetic-user-output")
+        self._write("user", {"apiKeyHelper": user_script})
+        self.assertEqual(cred.helper_key(), "synthetic-user-output", "the operator's helper is the one that runs")
+        self.assertEqual((_runs(user_marker), _runs(proj_marker)), (1, 0))
+        self.assertTrue(cred.project_helper_differs(self.cwd))
 
     def test_a_file_without_the_key_is_skipped_and_a_broken_file_is_loud(self):
         self._write("user", {"apiKeyHelper": "/u/helper.sh"})
@@ -142,23 +161,23 @@ class HelperRun(_Settings):
     def test_the_helper_runs_once_per_ttl_and_the_value_stays_in_memory(self):
         script, marker = _helper_script(tempfile.mkdtemp())
         self._write("user", {"apiKeyHelper": script})
-        self.assertEqual(cred.helper_key(self.cwd, now=1000.0), HELPER_OUT)
-        self.assertEqual(cred.helper_key(self.cwd, now=1000.0 + 299.0), HELPER_OUT)
+        self.assertEqual(cred.helper_key(now=1000.0), HELPER_OUT)
+        self.assertEqual(cred.helper_key(now=1000.0 + 299.0), HELPER_OUT)
         self.assertEqual(_runs(marker), 1, "within the TTL the memo answers")
-        self.assertEqual(cred.helper_key(self.cwd, now=1000.0 + 301.0), HELPER_OUT)
+        self.assertEqual(cred.helper_key(now=1000.0 + 301.0), HELPER_OUT)
         self.assertEqual(_runs(marker), 2, "past the TTL (five minutes by default) the helper runs again")
         cred.forget_helper_key()
-        cred.helper_key(self.cwd, now=1000.0 + 302.0)
+        cred.helper_key(now=1000.0 + 302.0)
         self.assertEqual(_runs(marker), 3)
 
     def test_the_ttl_is_the_clis_variable_in_milliseconds(self):
         script, marker = _helper_script(tempfile.mkdtemp())
         self._write("user", {"apiKeyHelper": script})
         with patch.dict(os.environ, {"CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "1000"}):
-            cred.helper_key(self.cwd, now=0.0)
-            cred.helper_key(self.cwd, now=0.9)
+            cred.helper_key(now=0.0)
+            cred.helper_key(now=0.9)
             self.assertEqual(_runs(marker), 1)
-            cred.helper_key(self.cwd, now=1.1)
+            cred.helper_key(now=1.1)
             self.assertEqual(_runs(marker), 2)
 
     def test_a_changed_helper_runs_at_once(self):
@@ -166,16 +185,16 @@ class HelperRun(_Settings):
         s1, m1 = _helper_script(d, "one.sh", "synthetic-one")
         s2, m2 = _helper_script(d, "two.sh", "synthetic-two")
         self._write("user", {"apiKeyHelper": s1})
-        self.assertEqual(cred.helper_key(self.cwd, now=0.0), "synthetic-one")
+        self.assertEqual(cred.helper_key(now=0.0), "synthetic-one")
         self._write("user", {"apiKeyHelper": s2})
-        self.assertEqual(cred.helper_key(self.cwd, now=1.0), "synthetic-two", "the memo is keyed on the command")
+        self.assertEqual(cred.helper_key(now=1.0), "synthetic-two", "the memo is keyed on the command")
 
     def test_the_helper_never_sees_the_kernels_environment(self):
         d = tempfile.mkdtemp()
         script, _ = _helper_script(d, body="#!/bin/sh\necho \"x${ROMP_SERVE_TOKEN}${ROMP_SECRET_PROBE}\"\n")
         self._write("user", {"apiKeyHelper": script})
         with patch.dict(os.environ, {"ROMP_SECRET_PROBE": "leaked"}):
-            self.assertEqual(cred.helper_key(self.cwd), "x", "a whitelist: PATH, HOME, the config dir and the like")
+            self.assertEqual(cred.helper_key(), "x", "a whitelist: PATH, HOME, the config dir and the like")
 
     def test_failures_are_static_words(self):
         d = tempfile.mkdtemp()
@@ -188,14 +207,14 @@ class HelperRun(_Settings):
             self._write("user", {"apiKeyHelper": script})
             cred.forget_helper_key()
             with self.assertRaisesRegex(cred.CredentialError, pattern):
-                cred.helper_key(self.cwd)
+                cred.helper_key()
 
     def test_a_timeout_is_a_static_word_too(self):
         script, _ = _helper_script(tempfile.mkdtemp(), body="#!/bin/sh\nsleep 5\necho late\n")
         self._write("user", {"apiKeyHelper": script})
         with patch.object(cred, "HELPER_TIMEOUT_S", 1):
             with self.assertRaisesRegex(cred.CredentialError, "timed out"):
-                cred.helper_key(self.cwd)
+                cred.helper_key()
 
 
 class BootCheck(unittest.TestCase):

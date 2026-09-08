@@ -273,13 +273,12 @@ def _no_cli_scope():
     yield
 
 
-# No test may reach the machine's REAL tmux server (2026-09-06): keysource.claim_op_env scrubs the tmux
-# server's globals the moment romp becomes the op consumer, which any test that configures a reference
-# and constructs the SDK backend (or resolves a key) does — and on a developer's box that `tmux
-# set-environment -gu` would land on the live server every session runs in. The same private socket
-# directory the bats suites use (tests/tmux-private.bash): tmux puts every socket, `-L` ones included,
-# under $TMUX_TMPDIR/tmux-<uid>/, and the directory must exist or tmux 3.4 silently falls back to the
-# default. No server ever exists there, so a scrub from a test exits with "no server running".
+# No test may reach the machine's REAL tmux server (2026-09-06; the reason changed on 2026-09-08): the
+# retired key-source module used to scrub the live server's globals from inside a test, and any tmux-backed
+# test still runs its commands somewhere. The same private socket directory the bats suites use
+# (tests/tmux-private.bash): tmux puts every socket, `-L` ones included, under $TMUX_TMPDIR/tmux-<uid>/,
+# and the directory must exist or tmux 3.4 silently falls back to the default. No server ever exists
+# there, so a tmux command from a test exits with "no server running" instead of touching the live one.
 os.environ["TMUX_TMPDIR"] = tempfile.mkdtemp(prefix="romp-tests-tmux-")
 os.environ.pop("TMUX", None)
 os.environ.pop("ROMP_TMUX_SOCKET", None)
