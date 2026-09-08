@@ -113,7 +113,8 @@ class UpdateRemote(unittest.TestCase):
         push = next(a for a in calls if a[0] == "git" and "push" in a)
         self.assertIn("--force", push)
         self.assertIn("TESTHOST:/home/u/romp", push)
-        self.assertTrue(any(str(x).startswith("HEAD:refs/heads/") for x in push), "pushes HEAD to a scratch ref")
+        self.assertIn(self.LFULL + ":refs/heads/" + km._P2P_REF, push,
+                      "pushes the exact advertised sha to the scratch ref, not a HEAD that may move under it")
 
     def test_the_apply_restarts_through_the_manager_quiet_window_with_an_audit_row(self):
         # T238: the remote apply used to `pkill` the far kernel outright — an anonymous, immediate
@@ -258,6 +259,67 @@ class UpdateRemote(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("already up to date", detail)
 
+    def test_a_commit_made_just_before_the_update_is_what_gets_pushed(self):
+        # The dashboard's polls read HEAD through a 15 s cache. A `romp update` inside that window used to
+        # read the SAME cache, so a commit made a second earlier was invisible to it: the peer sat on the
+        # previous commit, which equalled the cached head, and the update returned "already up to date"
+        # having pushed nothing (and when it did push, the restart it told itself to expect named the old
+        # sha). The transport reads the head the user actually has.
+        stale, fresh = "3" * 40, "4" * 40
+        calls = self._wire(rhead=stale, apply_out="SYNCED:4444444:QUIET")   # the peer is on the OLD commit
+        km._HEAD_CACHE.update(ts=9e18, full=stale, short=stale[:8])          # the cache still says so too
+        km._remotes["TESTHOST"] = {"host": "TESTHOST"}
+        self.addCleanup(km._remotes.pop, "TESTHOST", None)
+        real = km.subprocess.run
+        def fake(argv, **kw):
+            if argv[0] == "git" and "rev-parse" in argv and "HEAD" in argv:
+                calls.append(argv)
+                return _R(out=fresh)                                          # what git says NOW
+            return real(argv, **kw)
+        km.subprocess.run = fake
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertTrue(ok, detail)
+        self.assertNotIn("already up to date", detail)
+        push = next(a for a in calls if a[0] == "git" and "push" in a)
+        self.assertIn(fresh + ":refs/heads/" + km._P2P_REF, push, "the head the user has is what travels")
+        self.assertEqual(km._remotes["TESTHOST"]["restartExpected"]["sha"], fresh,
+                         "and it is the sha the far kernel is expected to come back on")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "reset --hard" in a[-1])
+        self.assertIn("WANT=" + fresh, apply, "the apply is bound to the same sha")
+        self.assertEqual(km._local_head(), fresh, "the polling cache was refreshed by the same read")
+
+    def test_a_head_that_is_not_a_full_sha_is_refused_not_pushed(self):
+        # the transport insists on the exact 40-hex commit it binds the peer to; anything else (a truncated
+        # or garbled rev-parse answer) is "not a checkout", said so, and nothing is pushed
+        calls = self._wire()
+        real = km.subprocess.run
+        def fake(argv, **kw):
+            if argv[0] == "git" and "rev-parse" in argv:
+                return _R(out="abc1234")
+            return real(argv, **kw)
+        km.subprocess.run = fake
+        self.assertEqual(km._fresh_local_head(), "")
+        ok, detail = km._update_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("git checkout", detail)
+        self.assertFalse(any(a[0] == "git" and "push" in a for a in calls), "nothing pushed")
+
+    def test_a_refusal_at_the_apply_reaches_the_row_and_the_log_as_a_failure(self):
+        # the apply's refusals are not successes: the automatic push publishes them on the row's phase
+        # and in the Log ring with the reason, never as a bare tag and never as "pushed"
+        self._wire(apply_out="DIRTYNOW")
+        self.addCleanup(km._set_auto_push, "TESTHOST", None)
+        before = km._sync_notice_count()
+        ok = km._auto_push_remote("TESTHOST")
+        self.assertFalse(ok)
+        st = km._auto_push_state("TESTHOST")
+        self.assertEqual(st["phase"], "failed")
+        self.assertIn("uncommitted changes", st["detail"])
+        self.assertIn("TESTHOST", st["detail"])
+        rows = [r for r in km._sync_notice_rows(limit=5) if r["text"].find("TESTHOST") >= 0]
+        self.assertTrue(rows and rows[-1]["ok"] is False and "uncommitted changes" in rows[-1]["text"], rows)
+        self.assertEqual(km._sync_notice_count(), before + 1)
+
     def test_a_dirty_local_is_not_refused_it_pushes_committed_head(self):
         # "just take what is committed on local" (the user 2026-07-04): a dirty working tree is NOT a blocker —
         # _update_remote pushes the committed HEAD and never asks you to commit first.
@@ -359,6 +421,221 @@ class UpdateRemote(unittest.TestCase):
         self.assertIn("running", detail)
 
 
+class ApplyHonesty(unittest.TestCase):
+    """The scripts the p2p updater ships over ssh, EXECUTED against a real throwaway git repo (SSH_BIN is
+    swapped for a stub that runs the command locally under a scrubbed env — the same harness the clone
+    discovery tests use). The probe used to answer a FAILING `git status` as a clean tree; the apply used to
+    go from the ancestry check straight to `reset --hard <scratch ref>` with no look at the tree it was about
+    to overwrite and no check that the ref still named the commit this machine pushed. Synthetic repo, no
+    real machine data; the only faked calls are the LOCAL `git push` (the scratch ref is planted directly)
+    and the local head read."""
+
+    def setUp(self):
+        self._run, self._hc, self._ssh = km.subprocess.run, dict(km._HEAD_CACHE), km.SSH_BIN
+        km._HEAD_CACHE.update(ts=0.0, full=None, short=None)
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.repo = os.path.join(self.home, "romp")
+        env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", HOME=self.home)
+        def g(*a, **kw):
+            return subprocess.run(["git", "-C", self.repo] + list(a), capture_output=True, text=True,
+                                  env=env, check=True, **kw).stdout.strip()
+        self.g = g
+        os.makedirs(self.repo)
+        subprocess.run(["git", "init", "-q", "-b", "main", self.repo], check=True, env=env)
+        self.f = os.path.join(self.repo, "f")
+        def commit(text, msg):
+            with open(self.f, "w") as fh:
+                fh.write(text)
+            g("add", "f"); g("-c", "user.name=romp-test", "-c", "user.email=romp-test@TESTHOST", "commit", "-qm", msg)
+            return g("rev-parse", "HEAD")
+        self.A = commit("a\n", "A")            # where the peer sits
+        self.B = commit("b\n", "B")            # this machine's head, a child of A
+        g("reset", "-q", "--hard", self.A)
+        self.C = commit("c\n", "C")            # another sender's build: also a child of A, not B
+        g("reset", "-q", "--hard", self.A)
+        stub = os.path.join(self.home, "ssh")
+        with open(stub, "w") as fh:            # run the probe/apply locally, scrubbed env, fixture HOME
+            fh.write('#!/usr/bin/env bash\nfor last in "$@"; do :; done\n'
+                     'exec env -i HOME="%s" PATH="/usr/bin:/bin" ROMP_REPO_ROOT="%s" bash -c "$last"\n'
+                     % (self.home, self.repo))
+        os.chmod(stub, 0o755)
+        km.SSH_BIN = stub
+        km._remotes["TESTHOST"] = {"host": "TESTHOST"}
+
+    def tearDown(self):
+        km.subprocess.run, km.SSH_BIN = self._run, self._ssh
+        km._HEAD_CACHE.clear(); km._HEAD_CACHE.update(self._hc)
+        km._remotes.pop("TESTHOST", None)
+
+    def _drive(self, lfull, landed=None, between=None):
+        """Run _update_remote with the local head at `lfull`; the faked `git push` plants the scratch ref at
+        `landed` (what actually arrived on the peer) and runs `between` (an event in the window between the
+        probe and the apply). Returns (ok, detail, argv list)."""
+        calls, real, g = [], self._run, self.g
+        def fake(argv, **kw):
+            calls.append(argv)
+            if argv[0] == "git" and "push" in argv:
+                if landed:
+                    g("update-ref", "refs/heads/" + km._P2P_REF, landed)
+                if between:
+                    between()
+                return _R()
+            if argv[0] == "git" and "rev-parse" in argv and "HEAD" in argv:
+                return _R(out=lfull)
+            return real(argv, **kw)                 # the ssh legs run for real through the stub
+        km.subprocess.run = fake
+        try:
+            ok, detail = km._update_remote("TESTHOST")
+        finally:
+            km.subprocess.run = real                # the repo reads below must see the REAL git
+        return ok, detail, calls
+
+    def _scratch(self):
+        r = subprocess.run(["git", "-C", self.repo, "rev-parse", "--verify", "--quiet", "refs/heads/" + km._P2P_REF],
+                           capture_output=True, text=True)
+        return r.stdout.strip()
+
+    def test_an_edit_landing_after_the_probe_is_refused_and_survives(self):
+        # the probe saw a clean tree; an edit lands before the apply; the apply must see it itself
+        def edit():
+            with open(self.f, "w") as fh:
+                fh.write("late edit\n")
+        ok, detail, calls = self._drive(self.B, landed=self.B, between=edit)
+        self.assertFalse(ok, detail)
+        self.assertIn("uncommitted changes", detail)
+        self.assertIn("TESTHOST", detail)
+        self.assertEqual(self.g("rev-parse", "HEAD"), self.A, "nothing was reset")
+        self.assertEqual(open(self.f).read(), "late edit\n", "the late edit is intact")
+        self.assertEqual(self._scratch(), "", "the scratch ref is cleaned up")
+        self.assertNotIn("restartExpected", km._remotes["TESTHOST"], "no restart is expected of it")
+
+    def test_an_unstaged_edit_already_there_is_refused_at_the_probe(self):
+        # the most common dirty state: an unstaged edit to a tracked file, whose porcelain line starts with
+        # a SPACE (" M f"). The probe used to report the first character, the parser stripped it, and the
+        # peer read as CLEAN: the push went ahead, and the apply's re-check then blamed the peer for an
+        # edit that predated the probe.
+        with open(self.f, "w") as fh:
+            fh.write("edit before the probe\n")
+        ok, detail, calls = self._drive(self.B, landed=self.B)
+        self.assertFalse(ok, detail)
+        self.assertIn("uncommitted changes", detail)
+        self.assertFalse(any(a[0] == "git" and "push" in a for a in calls), "refused at the probe: nothing pushed")
+        self.assertEqual(self.g("rev-parse", "HEAD"), self.A)
+        self.assertEqual(open(self.f).read(), "edit before the probe\n")
+        self.assertEqual(self._scratch(), "")
+
+    def test_a_status_that_fails_right_before_the_apply_refuses_and_cleans_up(self):
+        # the probe saw a healthy tree; by the apply its index is unreadable (a lock, a corruption). The
+        # same-shell re-check answers STATERR: nothing is reset, the scratch ref is removed, no restart is
+        # expected, and the row says the tree state could not be read — never the bare tag, never "synced"
+        def corrupt():
+            with open(os.path.join(self.repo, ".git", "index"), "w") as fh:
+                fh.write("garbage")
+        ok, detail, calls = self._drive(self.B, landed=self.B, between=corrupt)
+        self.assertFalse(ok, detail)
+        self.assertIn("TESTHOST", detail)
+        self.assertIn("right before the apply", detail)
+        self.assertIn("state is unknown", detail)
+        self.assertEqual(self.g("rev-parse", "HEAD"), self.A, "nothing was reset")
+        self.assertEqual(self._scratch(), "", "the scratch ref is cleaned up")
+        self.assertNotIn("restartExpected", km._remotes["TESTHOST"])
+
+    def test_a_failing_status_on_the_peer_is_unknown_never_clean(self):
+        # an index git cannot read: `git status` dies while `rev-parse HEAD` still answers, so the old
+        # probe printed an empty (clean) DIRTY field and the push went ahead
+        with open(os.path.join(self.repo, ".git", "index"), "w") as fh:
+            fh.write("garbage")
+        ok, detail, calls = self._drive(self.B, landed=self.B)
+        self.assertFalse(ok, detail)
+        self.assertIn("state is unknown", detail)
+        self.assertIn("TESTHOST", detail)
+        self.assertFalse(any(a[0] == "git" and "push" in a for a in calls), "nothing was pushed")
+        self.assertEqual(self.g("rev-parse", "HEAD"), self.A)
+
+    def test_the_apply_binds_to_the_advertised_commit_not_the_scratch_ref(self):
+        # another sender force-pushed the scratch ref between our push and our apply: the ref names THEIR
+        # build. The old apply reset to the ref and reported our sha as synced.
+        ok, detail, calls = self._drive(self.B, landed=self.C)
+        self.assertFalse(ok, detail)
+        self.assertIn("another push moved it", detail)
+        self.assertIn(self.B[:8], detail)
+        self.assertIn(self.C[:8], detail)
+        self.assertEqual(self.g("rev-parse", "HEAD"), self.A, "nothing was reset")
+        self.assertEqual(self._scratch(), self.C, "the other sender's ref is left for its own apply")
+        self.assertNotIn("restartExpected", km._remotes["TESTHOST"])
+
+    def test_a_clean_apply_resets_to_exactly_the_advertised_commit(self):
+        # the positive path of the same script: clean tree, ref at our sha → the checkout lands on it (the
+        # fixture has no launcher, so the script stops at NOLAUNCH after the reset, before any restart)
+        ok, detail, calls = self._drive(self.B, landed=self.B)
+        self.assertFalse(ok)
+        self.assertIn("launcher", detail)
+        self.assertEqual(self.g("rev-parse", "HEAD"), self.B)
+        self.assertEqual(self._scratch(), "", "the scratch ref is cleaned up after the reset")
+        apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "reset --hard" in a[-1])
+        self.assertIn("WANT=" + self.B, apply)
+        self.assertIn('reset --hard "$WANT"', apply)
+        self.assertNotIn("reset --hard " + km._P2P_REF, apply, "never the mutable scratch ref")
+        self.assertNotIn("reset --hard %s" % km._P2P_REF, apply)
+        # order inside the one shell: bind, ancestry, tree re-check, then the reset
+        i = apply.index
+        self.assertLess(i('rev-parse --verify --quiet refs/heads/' + km._P2P_REF), i("merge-base --is-ancestor"))
+        self.assertLess(i("merge-base --is-ancestor"), i("status --porcelain"))
+        self.assertLess(i("status --porcelain"), i('reset --hard "$WANT"'))
+        self.assertLess(i("STATERR"), i("DIRTYNOW"), "a failed status refuses before the content is even looked at")
+
+
+class UpdateListing(unittest.TestCase):
+    """The listing the no-host `romp update` chooses hosts from (GET /tunnels?fresh=1) is judged against
+    the head this checkout is at NOW; the dashboard's polls keep reading the 15 s cache (a poll must not
+    fork git)."""
+    STALE, FRESH = "3" * 40, "4" * 40
+
+    def setUp(self):
+        self._run, self._hc = km.subprocess.run, dict(km._HEAD_CACHE)
+        km._BEHIND_CACHE.clear()
+        km._remotes["TESTHOST"] = {"host": "TESTHOST", "kernel_port": 29855, "local_port": 8801, "token": "t",
+                                   "status": "up", "sids": [], "kernel_sha": self.STALE[:7]}   # on the OLD commit
+        km._HEAD_CACHE.update(ts=9e18, full=self.STALE, short=self.STALE[:7])                    # what the polls last read
+        fresh = self.FRESH
+        def fake(argv, **kw):
+            if argv[0] == "git" and "rev-parse" in argv and "HEAD" in argv:
+                return _R(out=fresh[:7] if "--short" in argv else fresh)                       # what git says NOW
+            return _R(rc=1)
+        km.subprocess.run = fake
+
+    def tearDown(self):
+        km.subprocess.run = self._run
+        km._HEAD_CACHE.clear(); km._HEAD_CACHE.update(self._hc)
+        km._BEHIND_CACHE.clear()
+        km._remotes.pop("TESTHOST", None)
+
+    def test_a_fresh_listing_is_judged_against_the_head_the_user_has(self):
+        polled = next(t for t in km._tunnels_listing()["tunnels"] if t["host"] == "TESTHOST")
+        self.assertFalse(polled["outOfDate"], "the polls' listing reads the cache")
+        acted = next(t for t in km._tunnels_listing(fresh=True)["tunnels"] if t["host"] == "TESTHOST")
+        self.assertTrue(acted["outOfDate"], "the listing a command acts on sees the commit made just now")
+        self.assertEqual(acted["localSha"], self.FRESH[:7])
+
+    def test_the_route_and_the_cli_agree_on_the_flag(self):
+        import inspect
+        from urllib.parse import parse_qs
+        self.assertIn('_tunnels_listing(fresh=_fresh_listing_asked(q))', inspect.getsource(km.Handler))
+        self.assertIn('_get(u, "/tunnels?fresh=1")', open(os.path.join(BIN, "romp-update")).read())
+        # the contract is the one spelling the CLI sends: parse_qs yields ["0"] for ?fresh=0, so a
+        # truthiness test re-read HEAD for 0 and no while a blank ?fresh= did not
+        self.assertTrue(km._fresh_listing_asked(parse_qs("fresh=1")))
+        for query in ("fresh=0", "fresh=", "fresh=no", "", "other=1"):
+            self.assertFalse(km._fresh_listing_asked(parse_qs(query)), query)
+            row = next(t for t in km._tunnels_listing(fresh=km._fresh_listing_asked(parse_qs(query)))["tunnels"]
+                       if t["host"] == "TESTHOST")
+            self.assertFalse(row["outOfDate"], "%r must not re-read HEAD" % query)
+        row = next(t for t in km._tunnels_listing(fresh=km._fresh_listing_asked(parse_qs("fresh=1")))["tunnels"]
+                   if t["host"] == "TESTHOST")
+        self.assertTrue(row["outOfDate"])
+
+
 class UpdateEndpoint(unittest.TestCase):
     def test_post_tunnels_update_calls_update_remote_and_reports(self):
         import inspect
@@ -442,6 +719,15 @@ class RompUpdateCLI(unittest.TestCase):
                                                {"host": "gpu1", "outOfDate": False}]}
         self.assertEqual(ru.main([]), 0)
         self.assertEqual(self.posted, [("/tunnels/update", {"host": "TESTHOST"})], "only the stale remote is updated")
+
+    def test_no_arg_asks_for_a_listing_judged_against_the_current_head(self):
+        # the hosts this command pushes to are chosen from the listing's outOfDate; a listing built from
+        # the polls' 15 s head cache within 15 s of a local commit says "all up to date" and pushes nothing
+        seen = []
+        ru._get = lambda u, path: seen.append(path) or {"tunnels": [{"host": "TESTHOST", "outOfDate": True}]}
+        self.assertEqual(ru.main([]), 0)
+        self.assertEqual(seen, ["/tunnels?fresh=1"], "the kernel re-reads HEAD for the listing this command acts on")
+        self.assertEqual(self.posted, [("/tunnels/update", {"host": "TESTHOST"})])
 
     def test_no_arg_all_current_updates_nothing(self):
         ru._get = lambda u, path: {"tunnels": [{"host": "gpu1", "outOfDate": False}]}

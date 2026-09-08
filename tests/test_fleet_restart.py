@@ -15,6 +15,7 @@ Synthetic only — placeholder hosts/shas, no ssh, no restarts.
 import inspect
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -147,6 +148,40 @@ class ReportSurvivesTheRestart(unittest.TestCase):
             self.assertFalse(x["ok"])
             self.assertIn("ssh exploded", x["detail"])
         self.assertEqual(report["local"]["head"], "abc1234")
+
+    def test_the_plan_is_judged_against_the_head_this_checkout_is_at_now(self):
+        # the polls' head cache can be 15 s behind a commit made just before Restart: a peer sitting on the
+        # previous commit then reads as "already on this build" and gets a bare restart where a push was owed
+        stale, fresh = "3" * 40, "4" * 40
+        saved = {n: getattr(km, n) for n in ("_update_remote", "_restart_remote_kernel", "_restart_this_kernel",
+                                            "_behind_info", "_local_branch")}
+        hc, run = dict(km._HEAD_CACHE), km.subprocess.run
+        did = []
+        km._update_remote = lambda h: did.append(("push", h)) or (True, "synced")
+        km._restart_remote_kernel = lambda h: did.append(("restart", h)) or (True, "restarted")
+        km._restart_this_kernel = lambda reason="", manager_port=None: None
+        km._behind_info = lambda sha: {"behind": 1, "ahead": 0, "date": ""}   # strictly behind: a push only adds
+        km._local_branch = lambda: "main"
+        km._HEAD_CACHE.update(ts=9e18, full=stale, short=stale[:7])             # what the polls last read
+        def fake(argv, **kw):
+            if argv[0] == "git" and "rev-parse" in argv:                        # what git says NOW
+                return subprocess.CompletedProcess(argv, 0, fresh[:7] if "--short" in argv else fresh, "")
+            return run(argv, **kw)
+        km.subprocess.run = fake
+        km._remotes.clear()
+        km._remotes["TESTHOST"] = row(kernel_sha=stale[:7])                      # the peer is on the OLD commit
+        try:
+            km._fleet_restart_run()
+            report = json.loads(km.FLEET_REPORT.read_text())
+        finally:
+            for n, v in saved.items():
+                setattr(km, n, v)
+            km.subprocess.run = run
+            km._HEAD_CACHE.clear(); km._HEAD_CACHE.update(hc)
+            km._remotes.clear()
+        self.assertEqual(did, [("push", "TESTHOST")], "behind the head the user has: pushed, not merely restarted")
+        self.assertEqual(report["rows"][0]["action"], "sync-push")
+        self.assertEqual(report["local"]["head"], fresh[:7], "the report names the head the plan was judged against")
 
     def test_the_route_hands_the_report_back_and_the_page_shows_it_once(self):
         src = inspect.getsource(km.Handler)

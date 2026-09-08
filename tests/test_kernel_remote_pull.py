@@ -68,7 +68,8 @@ class PullRemote(unittest.TestCase):
         km._HEAD_CACHE.clear(); km._HEAD_CACHE.update(self._hc)
         km._remotes.clear()
 
-    def _wire(self, dirty="", rhead=REMOTE, ancestor_rc=0, merge_rc=0, count="3", status_rc=0):
+    def _wire(self, dirty="", rhead=REMOTE, ancestor_rc=0, merge_rc=0, count="3", status_rc=0, present=True,
+              head=LOCAL):
         calls = []
 
         def fake(argv, **kw):
@@ -83,8 +84,12 @@ class PullRemote(unittest.TestCase):
                 return _R(out=count)
             if argv[0] == "git" and "merge" in argv:
                 return _R(rc=merge_rc, err="not a fast-forward" if merge_rc else "")
-            if argv[0] == "git" and "rev-parse" in argv:
+            if argv[0] == "git" and "rev-parse" in argv and any(str(x).endswith("^{commit}") for x in argv):
+                return _R(out=rhead) if present else _R(rc=1)   # is the reported commit here after the fetch?
+            if argv[0] == "git" and "rev-parse" in argv and "--short" in argv:
                 return _R(out="bbbbbbb")
+            if argv[0] == "git" and "rev-parse" in argv:
+                return _R(out=head)                     # this checkout's HEAD, read by the pull itself
             cmd = argv[-1]                          # ssh: the clone discovery
             if "for d in" in cmd:
                 return _R(out="DIR:/home/u/romp\nHEAD:%s\nDIRTY:" % rhead)
@@ -150,6 +155,51 @@ class PullRemote(unittest.TestCase):
         ok, detail = km._pull_remote("TESTHOST")
         self.assertTrue(ok)
         self.assertIn("already up to date", detail)
+
+    def test_the_merge_binds_to_the_commit_the_peer_reported_never_FETCH_HEAD(self):
+        # FETCH_HEAD is a mutable name: any other fetch into this checkout rewrites it between our fetch
+        # and our merge. Every step after the fetch names the exact sha the peer reported, and FETCH_HEAD
+        # enters no decision at all.
+        calls = self._wire()
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertTrue(ok, detail)
+        for step in ("merge-base", "rev-list", "merge"):
+            argv = next(a for a in calls if a[0] == "git" and step in a)
+            self.assertTrue(any(REMOTE in str(x) for x in argv), "%s binds to the sha: %r" % (step, argv))
+        self.assertFalse(any("FETCH_HEAD" in str(x) for a in calls for x in a), "FETCH_HEAD is never consulted")
+        verify = next(a for a in calls if a[0] == "git" and "rev-parse" in a and "--verify" in a)
+        self.assertIn(REMOTE + "^{commit}", verify, "the fetch must have brought the reported commit itself")
+
+    def test_a_peer_that_moved_off_the_commit_it_reported_is_refused(self):
+        # the fetch did not bring the commit the peer reported (it rewound or was rewritten since the
+        # probe): the one honest refusal, naming the peer and that commit — a LOCAL fetch that rewrote
+        # FETCH_HEAD in the meantime can no longer be blamed on it
+        calls = self._wire(present=False)
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("moved off", detail)
+        self.assertIn(REMOTE[:8], detail)
+        self.assertIn("nothing merged", detail)
+        self.assertFalse(any(a[0] == "git" and "merge" in a for a in calls), "no merge of an absent commit")
+
+    def test_a_local_move_since_the_last_poll_does_not_hide_a_pull(self):
+        # the polls' cache says this tree is at the peer's commit; git says it was moved back since (a
+        # reset within the 15 s window). The cached gate answered "already up to date" and skipped a pull
+        # that would have moved the tree; the pull reads the head this tree is AT.
+        km._HEAD_CACHE.update(ts=9e18, full=REMOTE, short=REMOTE[:8])
+        self._wire(rhead=REMOTE, head=LOCAL)
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertTrue(ok, detail)
+        self.assertNotIn("already up to date", detail)
+        self.assertIn("pulled 3 commits from TESTHOST", detail)
+
+    def test_a_peer_that_reports_no_commit_is_not_pulled(self):
+        # with no reported commit there is nothing to bind the merge to — refuse before fetching
+        calls = self._wire(rhead="")
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("did not report", detail)
+        self.assertFalse(any(a[0] == "git" and "fetch" in a for a in calls), "nothing fetched")
 
 
 class AutoPullFiring(unittest.TestCase):
