@@ -20,10 +20,14 @@ cd "$REPO"
 
 # HEAD plus the hash of every tracked+untracked doc input: catches merges,
 # checkouts, and stashes, which are exactly what the mkdocs watcher sleeps through.
+# --no-optional-locks: a plain `git status` refreshes the index as a side effect,
+# under .git/index.lock, and this runs every poll — so it raced any concurrent
+# `git add`/`git commit` for the lock ("Unable to create .git/index.lock: File
+# exists"). A watcher only reads; it must never hold the lock a writer needs.
 tree_id() {
   {
     git rev-parse HEAD 2>/dev/null || true
-    git status --porcelain -- docs mkdocs.yml overrides 2>/dev/null || true
+    git --no-optional-locks status --porcelain -- docs mkdocs.yml overrides 2>/dev/null || true
   } | shasum | cut -d' ' -f1
 }
 

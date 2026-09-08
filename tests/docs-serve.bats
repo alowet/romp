@@ -79,6 +79,18 @@ runs() { [ -f "$RUNS" ] && wc -l < "$RUNS" | tr -d ' ' || echo 0; }
     [ "$(runs)" -ge 2 ]
 }
 
+@test "the watcher polls git status without taking the index lock" {
+    # A plain `git status` refreshes the index under .git/index.lock as a side
+    # effect, and the loop runs one every ROMP_DOCS_POLL seconds — so each poll
+    # raced any concurrent `git add`/`git commit` for the lock (the second test
+    # above runs one against a 0.2 s poll), and the loser died with "Unable to
+    # create .git/index.lock: File exists". The collision is a scheduling race
+    # between two processes that no test can force deterministically, so the
+    # read-only flag is pinned at the source: a watcher reads, it never holds
+    # the lock a writer needs.
+    grep -qF -- '--no-optional-locks status --porcelain' "$ROMP_DIR/scripts/docs-serve.sh"
+}
+
 @test "a crashed mkdocs is brought back, never a dead port answering nothing" {
     "$REPO/scripts/docs-serve.sh" 8099 >/dev/null 2>&1 &
     LOOP_PID=$!
