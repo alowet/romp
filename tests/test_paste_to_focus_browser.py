@@ -17,6 +17,7 @@ dev box with the extension installed, which is where ships are gated. All fixtur
 """
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -139,7 +140,10 @@ class ServedPaste(unittest.TestCase):
             {"sid": SID, "name": "web", "cwd": cwd, "mode": "auto", "effort": "high",
              "lastSid": SID, "alive": True, "model": "claude-fable-5-1", "liveModel": "Fable 5.1"}))
         claude = os.path.join(cls.lab, "claude")
-        proj = os.path.join(claude, "projects", cwd.replace("/", "-"))
+        # the kernel finds a session's transcript under Claude's project dir: EVERY non-alphanumeric char of the
+        # realpath becomes '-' (jd._proj_dir). A slashes-only munge missed the '_' pytest's temp root can carry,
+        # so the kernel found no transcript and drew an API-error turn instead (the batch-only flake, 2026-09-08).
+        proj = os.path.join(claude, "projects", re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(cwd)))
         os.makedirs(proj, exist_ok=True)
         # a CLOSED turn: an open one would invite the boot reconcile to resume it — no real CLI here
         Path(proj, SID + ".jsonl").write_text(

@@ -234,8 +234,10 @@ export function scanFrom(events: TailEvent[], at: SendBase): number {
 
 export type Reconciled = {
   keep: PendingSend[];                        // still pending after this push
-  inject: PendingSend[];                      // …and not covered by a kernel provisional → show ours
-  landed: { p: PendingSend; idx: number }[];  // retired by a landing; idx = the landed event's index
+  inject: PendingSend[];                      // …and drawn by us: not covered by the kernel's echo atom (a queued
+                                              //   copy does not cover — ours stays in place and the copy is hidden, T252)
+  unqueue: PendingSend[];                     // …whose kernel cover is a QUEUED copy: the caller hides that copy
+  landed: { p: PendingSend; idx: number }[];  // retired by a landing; idx = the landed event's index — the slot the bubble held
   lost: PendingSend[];                        // retired by the kernel's never-delivered verdict
 };
 
@@ -272,7 +274,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
   const lateOwn = new Map<string, number>();
   for (const p of list) if (!p.at && p.late) lateOwn.set(p.text, (lateOwn.get(p.text) || 0) + 1);
   for (const p of list) if (!p.at) p.at = stampBase(events, p, p.late ? lateOwn.get(p.text) || 1 : 0);
-  const r: Reconciled = { keep: [], inject: [], landed: [], lost: [] };
+  const r: Reconciled = { keep: [], inject: [], unqueue: [], landed: [], lost: [] };
   const claimed = new Map<string, number>();           // "index\0text" → copies of that text in that landing taken by earlier entries THIS push
   const takenCopies = new Map<string, Set<number>>();  // text → queued-copy positions taken by an earlier entry THIS push
   for (const p of list) {
@@ -294,14 +296,14 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
     // a ✕ on it must not hand its echo to the next entry; an echo is one text, so one entry in `seen` is
     // the whole of it) — else the first queued copy beyond this entry's press-time count that no
     // earlier entry took this push.
-    let covered = false;
+    let covered = false, byQueued = false;
     if (echoIdx >= 0) {
       covered = true;
       const u = events[echoIdx].uuid;
       if (u) for (const q of list) if (q !== p && q.at && q.text === p.text && !q.at.seen.includes(u)) q.at.seen.push(u);
     } else if (copies > at.queued) {
       const taken = takenCopies.get(p.text) || new Set<number>();
-      for (let k = at.queued; k < copies; k++) if (!taken.has(k)) { taken.add(k); covered = true; break; }
+      for (let k = at.queued; k < copies; k++) if (!taken.has(k)) { taken.add(k); covered = true; byQueued = true; break; }
       takenCopies.set(p.text, taken);
     }
     if (covered) p.received = true;             // the kernel holds this send: proven once, latched
@@ -314,7 +316,11 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
     }
     if (lostIdx >= 0) { r.lost.push(p); continue; }
     r.keep.push(p);
-    if (!covered) r.inject.push(p);
+    // The kernel's ECHO atom covers ours: the kernel draws that atom itself, at the send time. A QUEUED copy
+    // does not: it sits in the kernel's group at the tail, and the bubble the user watches is ours, at its
+    // send slot — so ours stays drawn and the caller hides that copy, one bubble per message (T252).
+    if (!covered || byQueued) r.inject.push(p);
+    if (covered && byQueued) r.unqueue.push(p);
   }
   // Every landing claimed this push is spoken for: one copy per claim becomes background for every
   // pending send with the same text that STAYS, on every push after (the retired entry's claim would
@@ -340,19 +346,23 @@ export function dropPending(list: PendingSend[], text: string, ts?: number): Pen
   return i >= 0 ? list.splice(i, 1)[0] : undefined;
 }
 
-/** Where the pending bubble SAT when its message landed higher up: the uuid of the last RENDERED kernel
- *  event after `landedIdx` (the bubble rode the tail, under that event). null when the landed atom is
- *  itself the tail — the swap happened in place and no cue is owed. The client's own injections and the
- *  kernel's echo atoms are skipped: neither is a stable place to hang a note. `rendered` says which
- *  events the chat draws in its current mode — compact mode (the default) hides thinking, and a cue
- *  anchored to a hidden event is never drawn and can never be dismissed (2026-09-06 review). */
-export function cueAnchor(events: TailEvent[], landedIdx: number, rendered: (e: TailEvent) => boolean = () => true): string | null {
-  for (let j = events.length - 1; j > landedIdx; j--) {
-    const e = events[j];
-    if (!stableUuid(e) || !rendered(e)) continue;
-    return e.uuid!;
+/** Where the caller draws the pending bubbles: each at the index right AFTER its anchor — the last stable
+ *  kernel event at the press — so the steps that stream in afterwards land below it and the absorbed atom,
+ *  which the kernel places at the send time, replaces it in the same slot (T252, the user 2026-09-07: the
+ *  bubble used to ride the tail and then vanish, its message reappearing higher up under a header and a
+ *  cue). Sends that share an anchor form ONE group, in send order; groups come highest index first, so a
+ *  caller splicing them into the events array bottom-up keeps every lower index valid. No anchor (nothing
+ *  stable at the press) or an anchor that left the resident window puts the bubble at the head: everything
+ *  resident is later than the send (scanFrom). */
+export type InjectionGroup = { idx: number; sends: PendingSend[] };
+export function injectionGroups(events: TailEvent[], inject: PendingSend[]): InjectionGroup[] {
+  const byIdx = new Map<number, PendingSend[]>();
+  for (const p of inject) {
+    const idx = p.at ? scanFrom(events, p.at) : events.length;
+    const g = byIdx.get(idx);
+    if (g) g.push(p); else byIdx.set(idx, [p]);
   }
-  return null;
+  return [...byIdx.entries()].sort((x, y) => y[0] - x[0]).map(([idx, sends]) => ({ idx, sends }));
 }
 
 /** The bare group's one-line header, from its bubbles' OWN states: the lost ones (the connection dropped

@@ -93,7 +93,7 @@ test("with every unit rendered the frame is the scrollbar's own truth: real midd
   const frameBody = RENDER.split("function contentOffsetFrame(")[1].split("\nfunction ")[0];
   assert.match(frameBody, /const nodes = Array\.from\(v\.el\.querySelectorAll<HTMLElement>\("\.turn\[data-unit\]"\)\);/);
   assert.match(frameBody, /exact\.set\(u, content\.scrollTop \+ \(r\.top - cRect\.top\) \+ r\.height \/ 2\);/, "scroll-space middle, invariant under scrolling");
-  // one unit may own several .turn nodes (an expanded tool group's children, absorbed cues — appendItem tags them
+  // one unit may own several .turn nodes (an expanded tool group's children — appendItem tags them
   // all with the unit): the unit's FIRST node is its root, and the gate counts UNITS against a spacer-free view,
   // never nodes — the first cut's node count dropped the frame back to the sum whenever a group stood open
   assert.match(frameBody, /if \(Number\.isFinite\(u\) && !exact\.has\(u\)\) \{/, "first node per unit");

@@ -95,14 +95,14 @@ test("retire needs a NEW landed atom (after the send's anchor); kernel provision
 // queued one are the same state, so they wear the same dashed bubble — and the look then only ever moves
 // provisional→settled. It first shipped as a 0.6-opacity SOLID bubble, which invented a third look and made a
 // queued send flip solid→dashed (backwards, as if it had un-landed).
-test("an optimistic echo is a tail-appended, kernel-invisible QUEUED event — never a solid user bubble", () => {
+test("an optimistic echo is a kernel-invisible QUEUED event at its send slot — never a solid user bubble", () => {
   const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
   const SP = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "send-pending.ts"), "utf8");
   assert.match(SP, /export const OPT_PREFIX = "optimistic:";/);
   assert.match(RENDER, /const isOptimistic = \(e: ChatEvent\): boolean => isOptimisticUuid\(e\.uuid\);/);
   assert.match(RENDER, /const mk = \(p: PendingSend\) => \(\{ md: p\.text, optimistic: true, cancelable: true, imgPaths: p\.imgPaths, lost: p\.lost, qts: p\.ts \}\);/);   // the echo carries its dragged-image paths (2026-08-25); cancelable from the press (2026-08-30); `lost` after a connection drop, `qts` its identity for the ✕ (2026-09-06)
-  // stale ones pop cheaply off the end (always tail-appended)
-  assert.match(RENDER, /while \(s\.events\.length && isOptimistic\(s\.events\[s\.events\.length - 1\]\)\) s\.events\.pop\(\);/);
+  // stale ones are stripped wherever they sit — since T252 a bubble is spliced at its send slot, not the tail
+  assert.match(RENDER, /if \(isOptimistic\(e\)\) \{ s\.events\.splice\(i, 1\); continue; \}/);
   // the abandoned dim/pending idiom is FULLY gone: render, guard fields, and stylesheet — the last
   // leftovers (a `!e.pending` guard on a field no event carries, and a stylesheet paragraph describing
   // the deleted rendering as if it shipped) misdirected the 2026-08-09 bug hunt and are pinned out
@@ -115,24 +115,31 @@ test("an optimistic echo is a tail-appended, kernel-invisible QUEUED event — n
 });
 
 test("nothing known-queued → a bare group wearing the honest 'sending…' header", () => {
-  assert.match(RENDER, /s\.events\.push\(\{ kind: "queued", bare: true, texts: inject\.map\(mk\), uuid: OPT_PREFIX \+ inject\[0\]\.ts \}\);/);
+  assert.match(RENDER, /s\.events\.splice\(g\.idx, 0, \{ kind: "queued", bare: true, texts: g\.sends\.map\(mk\), uuid: OPT_PREFIX \+ g\.sends\[0\]\.ts,/,
+    "one bare group per send slot (T252: right after the send's anchor, never the tail)");
   // "N queued messages" stays unclaimable pre-confirmation — but NO label was the user's 2026-08-30
   // bug (a mid-compaction send sat unlabeled and uncuttable): the bare group now states exactly what
   // is known, and the reflow recounts it in the same vocabulary after a ✕
   assert.match(RENDER, /label\.dataset\.bare = "1";/);
   // the wording is the pure helper's (send-pending.ts bareGroupLabel, per-bubble since 2026-09-06), and
   // the render feeds it the bubbles' own states
-  assert.match(RENDER, /fillBareLabel\(label, nLost, ev\.texts\.length - nLost\);/);
+  assert.match(RENDER, /fillBareLabel\(label, nLost, texts\.length - nLost\);/);
   assert.deepEqual(bareGroupLabel(0, 1).parts.map((p) => p.text), ["sending…"]);
   assert.deepEqual(bareGroupLabel(0, 2).parts.map((p) => p.text), ["sending 2…"]);
   assert.match(RENDER, /if \(label\.dataset\.bare === "1"\) \{/, "reflow keeps the bare vocabulary");
   assert.match(RENDER, /if \(!ev\.bare\) \{/, "the standard 'N queued' header still needs confirmation");
 });
 
-test("something IS queued → ours merges into that group, counted under its header", () => {
-  assert.match(RENDER, /s\.events\[qj\] = \{ \.\.\.q, texts: \[\.\.\.q\.texts, \.\.\.inject\.map\(mk\)\] \};/);
-  // and the extension is undone before the counts run, so reconcile only ever reads kernel truth
-  assert.match(RENDER, /if \(q\.texts\.some\(\(t\) => t\.optimistic\)\) s\.events\[qi\] = \{ \.\.\.q, texts: q\.texts\.filter\(\(t\) => !t\.optimistic\) \};/);
+test("something IS queued → the kernel's copy of OUR text is hidden and ours stays at its slot (T252)", () => {
+  // one bubble per message: the kernel's queued group at the tail keeps its OTHER texts, our copy in it is
+  // hidden (a client-only mark), and the hide is undone with every other injection before the counts run
+  assert.match(RENDER, /function hideQueuedCopy\(s: Session, p: PendingSend\)/);
+  assert.match(RENDER, /for \(const p of r\.unqueue\) \{ const h = hideQueuedCopy\(s, p\); if \(h\) heldBy\.set\(p, h\); \}/);
+  assert.match(RENDER, /texts\[k\] = \{ \.\.\.t, hiddenByPending: true \};/);
+  assert.match(RENDER, /const texts = ev\.texts\.filter\(\(t\) => !t\.hiddenByPending\);/, "the renderer draws the visible copies only");
+  assert.match(RENDER, /map\(\(t\) => t\.hiddenByPending \? \{ \.\.\.t, hiddenByPending: undefined \} : t\)/, "the strip clears the marks");
+  // a copy hidden out of a HELD group hands the hold's reason to our bubble
+  assert.match(RENDER, /held: g\.sends\.map\(\(p\) => heldBy\.get\(p\)\)\.find\(\(h\) => !!h\)/);
 });
 
 test("an unconfirmed echo keeps its tooltip AND carries a ✕ from the press (the 2026-08-30 rule)", () => {
@@ -164,7 +171,7 @@ test("EVERY ✕ stops our re-injection first; the optimistic one cancels by body
 test("chatTail speaks the KERNEL's coordinates — the injected tail is not part of its space", () => {
   // counting the injected bubble in the gap check masked a genuine 1-event desync (the repair never
   // fired) and let a delta land PAST the bubble, freezing it into resident events as fake history
-  assert.match(RENDER, /let kernelLen = s\.events\.length;\s*\n\s*while \(kernelLen > 0 && isOptimistic\(s\.events\[kernelLen - 1\]\)\) kernelLen--;/);
+  assert.match(RENDER, /stripOptimistic\(s\);\s*\n\s*const kernelLen = s\.events\.length;/);
   assert.match(RENDER, /if \(from > kernelLen\) \{/);
 });
 
@@ -197,7 +204,8 @@ test("reconcile: inject on nothing, suppress on kernel provisionals, retire only
   reconcile([{ kind: "assistant", md: "working on the prior turn" }], p);   // the press
   r = reconcile([{ kind: "queued", texts: [{ md: "continue" }] }], p);
   assert.equal(r.keep.length, 1);
-  assert.equal(r.inject.length, 0, "no double render beside the kernel's own copy");
+  assert.equal(r.inject.length, 1, "ours stays drawn at its slot (T252)…");
+  assert.equal(r.unqueue.length, 1, "…and the kernel's copy is the one hidden: one bubble per message");
   // …same for the kernel's unlanded echo atom (uuid keeps the backend's echo: prefix)
   r = reconcile([{ kind: "user", md: "continue", uuid: "echo:abc123" }], p);
   assert.equal(r.keep.length, 1);
