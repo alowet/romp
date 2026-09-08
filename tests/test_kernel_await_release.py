@@ -296,5 +296,106 @@ class RefusedSendsAreNoAsk(_AwaitBase):
         self.assertEqual(km._peer_answered_at(B), 0)
 
 
+class ReturnedSendEndsTheWait(_AwaitBase):
+    """The bus RETURNING a reply-requiring send is the pair's other ending event (2026-09-08). A
+    terminal `bounced` row names the message's id when the send is over with nothing ever coming back
+    (refused by the peer, recipient gone, never left). The answered clock walked replies only, so a
+    closer stamp awaiting that peer stood — the card parked on a wait no event could end — until the
+    6h backstop. Now the return supersedes a stamp filed before it, exactly as a reply does, and only
+    for the message it names."""
+
+    def _stamp(self, written_at):
+        return {"awaitingAt": written_at, "awaitingKind": "peer", "awaitingPeers": [B],
+                "awaitingWhy": "asked the api session which port", "log": [{"kind": "awaiting", "at": written_at}]}
+
+    @staticmethod
+    def _back(mid, t, **extra):
+        r = {"ev": "bounced", "id": mid, "t": t, "to": "api", "host": "",
+             "why": "recipient exited; unread mail destroyed by the orphan sweep"}
+        r.update(extra)
+        return r
+
+    def test_a_returned_question_ends_the_wait_at_the_return(self):
+        self._write([
+            {"id": "m1", "from_id": A, "to_id": B, "t": 100, "kind": "question", "body": "which port?"},
+            self._back("m1", 150),
+        ])
+        self.assertEqual(km._peer_answered_at(A), 150, "main: 0 — the pair read as still waiting")
+        self.assertEqual(km._peer_answered(A), (150, {B: 150}), "…pair-aware alike")
+        self.assertTrue(km._peer_stamp_superseded(self._stamp(120), km._peer_answered(A)),
+                        "a stamp written before the return is ended by it (main: stands)")
+        self.assertFalse(km._peer_stamp_superseded(self._stamp(160), km._peer_answered(A)),
+                         "a stamp written AFTER the return is fresher than it — it stands")
+
+    def test_a_returned_delegate_ends_the_handoff_wait_too(self):
+        self._write([
+            {"id": "m1", "from_id": A, "to_id": B, "t": 100, "kind": "delegate", "body": "own the exporter"},
+            self._back("m1", 150),
+        ])
+        self.assertEqual(km._peer_answered_at(A), 150, "a handoff that came back is over, like an answered one")
+
+    def test_the_return_ends_only_the_send_it_names(self):
+        # an older ask comes back after a newer one went out: the live ask holds the pair open
+        self._write([
+            {"id": "m1", "from_id": A, "to_id": B, "t": 100, "kind": "question", "body": "which port?"},
+            {"id": "m2", "from_id": A, "to_id": B, "t": 200, "kind": "question", "body": "and the host?"},
+            self._back("m1", 300),
+        ])
+        self.assertEqual(km._peer_answered_at(A), 0, "the newer ask still waits")
+        self.assertEqual(km._peer_answered(A), (0, {}))
+        self.assertFalse(km._peer_stamp_superseded(self._stamp(250), km._peer_answered(A)))
+
+    def test_a_reply_then_a_later_return_the_newer_ends_the_pair(self):
+        # m1 answered at 250; m2 (sent 200) came back at 300: the pair's last obligation ended at 300
+        self._write([
+            {"id": "m1", "from_id": A, "to_id": B, "t": 100, "kind": "question", "body": "which port?"},
+            {"id": "m2", "from_id": A, "to_id": B, "t": 200, "kind": "delegate", "body": "own the exporter"},
+            {"id": "r1", "from_id": B, "to_id": A, "t": 250, "kind": "coordinate", "body": "8080"},
+            self._back("m2", 300),
+        ])
+        self.assertEqual(km._peer_answered_at(A), 300)
+        self.assertTrue(km._peer_stamp_superseded(self._stamp(270), km._peer_answered(A)),
+                        "a stamp filed after the answer, about the handoff, ends when the handoff comes back")
+
+    def test_a_returned_coordinate_ends_nothing(self):
+        # a heads-up opened no wait; its return is not an ending event for the pair
+        self._write([
+            {"id": "m1", "from_id": A, "to_id": B, "t": 100, "kind": "coordinate", "body": "fyi"},
+            self._back("m1", 150),
+        ])
+        self.assertEqual(km._peer_answered_at(A), 0)
+        self.assertEqual(km._peer_answered(A), (0, {}))
+
+    def test_a_delivery_ack_is_not_an_ending(self):
+        self._write([
+            {"id": "m1", "from_id": A, "to_id": B, "t": 100, "kind": "question", "body": "which port?"},
+            {"ev": "relayed", "id": "m1", "t": 150, "host": "TESTHOST-B"},
+        ])
+        self.assertEqual(km._peer_answered_at(A), 0, "delivered is not answered, and not returned either")
+
+    def test_the_return_clock_is_keyed_like_the_maps(self):
+        # a cross-host ask keyed on to_sid: the return lands on the pair key the stamp recorded
+        rsid = "11111111-2222-3333-4444-000000000009"
+        self._write([
+            {"id": "m1", "from_id": A, "to_id": "peer:TESTHOST-B", "toName": "TESTHOST-B:api", "to_sid": rsid,
+             "t": 100, "kind": "question", "body": "which port?"},
+            self._back("m1", 150, host="TESTHOST-B", why="refused"),
+        ])
+        self.assertEqual(km._peer_answered(A), (150, {rsid: 150}))
+        self.assertEqual(km._postal_returned(), {(A, rsid): {100: 150}},
+                         "keyed by pair, then by the send's own time: the debt readers join a record's ask time to it")
+
+    def test_a_reply_after_the_return_is_not_credited(self):
+        # the return came first; a later B→A row finds no live reply-requiring send to answer, so the
+        # pair's ending stays the return's t (no live send, no reply credit — _pair_wait_ended's contract)
+        self._write([
+            {"id": "m1", "from_id": A, "to_id": B, "t": 100, "kind": "question", "body": "which port?"},
+            self._back("m1", 150),
+            {"id": "r1", "from_id": B, "to_id": A, "t": 200, "kind": "coordinate", "body": "8080"},
+        ])
+        self.assertEqual(km._peer_answered_at(A), 150)
+        self.assertEqual(km._peer_answered(A), (150, {B: 150}))
+
+
 if __name__ == "__main__":
     unittest.main()

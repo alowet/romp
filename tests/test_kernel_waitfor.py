@@ -99,9 +99,6 @@ class WaitFor(unittest.TestCase):
         self.assertEqual(g[X]["peerSid"], Z, "X's primary wait is its most-recent unanswered outbound")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class DeclaredKindWins(unittest.TestCase):
     """The schema `kind` field is the designed intent source (send_message REQUIRES it); the body regex
@@ -140,3 +137,98 @@ class DeclaredKindWins(unittest.TestCase):
         self.assertEqual(km._wait_for_graph(0, {X, Y}).get(X, {}).get("peerSid"), Y)
         self._msgs([(X, Y, 100, "heads-up: landed the thing", "")])
         self.assertEqual(km._wait_for_graph(0, {X, Y}), {})
+
+
+class ReturnedSendClosesTheWait(unittest.TestCase):
+    """A send that came back is not an open ask (2026-09-08). The bus writes a terminal `bounced` row
+    naming the message's id when a send is over with nothing ever coming back — the peer refused it, the
+    recipient exited and its unread mail was destroyed, the send was refused before it left. The wait
+    reader skipped that row (no from_id/to_id), so the sender wore "Awaiting <peer>" for a question the
+    peer never received, and its card parked as waiting on a peer while the person may have needed to
+    act. The row is the closing EVENT, keyed to the message it names. The two guards this class leans on
+    live above: a sent question alone waits (test_unanswered_outbound_to_live_peer_is_a_wait) and a
+    reply of any kind answers it (test_a_reply_of_any_kind_answers_the_question)."""
+
+    RSID = "dddddddd-0000-0000-0000-000000000004"   # a remote recipient, keyed by the relay row's to_sid
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.saved = jd.MESSAGES
+        jd.MESSAGES = Path(self.td.name) / "messages.jsonl"
+        km._POSTAL_WAIT_CACHE[:] = [None, None]
+
+    def tearDown(self):
+        jd.MESSAGES = self.saved
+        km._POSTAL_WAIT_CACHE[:] = [None, None]
+        self.td.cleanup()
+
+    def _log(self, rows):
+        jd.MESSAGES.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        km._POSTAL_WAIT_CACHE[:] = [None, None]
+
+    @staticmethod
+    def _ask(i, t, to=Y, **extra):
+        r = {"ev": "sent", "id": "m%d" % i, "from_id": X, "to_id": to, "t": t, "kind": "question",
+             "body": "which port should the api use?"}
+        r.update(extra)
+        return r
+
+    @staticmethod
+    def _back(i, t, why="recipient exited; unread mail destroyed by the orphan sweep", **extra):
+        # the bus's terminal return as the orphan sweep shapes it: the ORIGINAL id, a `to` name, a `why`
+        r = {"ev": "bounced", "id": "m%d" % i, "t": t, "to": "api", "host": "", "why": why}
+        r.update(extra)
+        return r
+
+    def test_a_returned_question_is_no_longer_a_wait(self):
+        self._log([self._ask(1, 100), self._back(1, 150)])
+        self.assertEqual(km._wait_for_graph(0, {X, Y}), {},
+                         "main: X wears Awaiting Y for a question Y never received")
+        last_any, last_ask, last_await = km._postal_wait_maps()
+        self.assertNotIn((X, Y), last_ask, "the ask is closed on the chip's map…")
+        self.assertNotIn((X, Y), last_await, "…and on the stamp clock's")
+        self.assertNotIn((X, Y), last_any, "…and it is no message either: neither an ask nor an answer (#1071's rule)")
+
+    def test_every_return_shape_the_bus_writes_closes_by_id_alone(self):
+        # the writers differ in their side fields (the orphan sweep: to/why; a peer's refusal: to/host/why;
+        # the oversize bounce: host ""; a failed publish: to_id/why; an unreadable outbox record:
+        # host/why) — the join is ev + id and nothing else
+        shapes = [
+            {"ev": "bounced", "id": "m1", "t": 150, "to": "api", "why": "recipient exited; unread mail destroyed by the orphan sweep"},
+            {"ev": "bounced", "id": "m1", "t": 150, "to": "api", "host": "TESTHOST-B", "why": "refused"},
+            {"ev": "bounced", "id": "m1", "t": 150, "to": "api", "host": "", "why": "your message is 90000 bytes as delivered, over the limit"},
+            {"ev": "bounced", "id": "m1", "t": 150, "to_id": Y, "why": "not published: a message with this id already stands"},
+            {"ev": "bounced", "id": "m1", "t": 150, "host": "TESTHOST-B", "why": "the outbox record was unreadable"},
+        ]
+        for row in shapes:
+            self._log([self._ask(1, 100), row])
+            self.assertEqual(km._wait_for_graph(0, {X, Y}), {}, "still waiting after: %s" % row)
+
+    def test_a_refused_cross_host_send_closes_the_same_way(self):
+        # the relay shape: the row is addressed to the relay and keyed on to_sid; the far host refused it
+        self._log([self._ask(1, 100, to="peer:TESTHOST-B", toName="TESTHOST-B:api", to_sid=self.RSID),
+                   self._back(1, 160, why="refused", host="TESTHOST-B")])
+        self.assertEqual(km._wait_for_graph(0, {X, self.RSID}), {},
+                         "main: the asker waits on a live peer whose kernel refused the message")
+
+    def test_the_return_closes_the_message_it_names_not_the_pair(self):
+        # an OLDER ask comes back after a newer one went out: the newer, live ask still waits
+        self._log([self._ask(1, 100), self._ask(2, 200), self._back(1, 300)])
+        g = km._wait_for_graph(0, {X, Y})
+        self.assertEqual(g.get(X, {}).get("peerSid"), Y, "the live ask is untouched by the older return")
+        self.assertEqual(g[X]["since"], 200, "…and the chip dates from it")
+
+    def test_a_delivery_ack_is_not_a_return(self):
+        # `relayed` says the far host took delivery; the ask is as open as before — only `bounced` closes
+        self._log([self._ask(1, 100), {"ev": "relayed", "id": "m1", "t": 150, "host": "TESTHOST-B"}])
+        self.assertEqual(km._wait_for_graph(0, {X, Y}).get(X, {}).get("peerSid"), Y)
+
+    def test_a_returned_coordinate_changes_nothing(self):
+        # a heads-up opened no wait, so its return has none to close — and must not invent one
+        self._log([self._ask(1, 100, kind="coordinate"), self._back(1, 150)])
+        self.assertEqual(km._wait_for_graph(0, {X, Y}), {})
+        self.assertEqual(km._postal_returned(), {}, "no reply-requiring send came back → no return clock")
+
+
+if __name__ == "__main__":
+    unittest.main()
