@@ -506,8 +506,8 @@ class Routes(Fresh):
         km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = "aaaa1111", ""
         ran = []
         with mock.patch.object(km, "_run_main_update",   # the route hands over its ack-time port too
-                               side_effect=lambda kind, immediate=False, manager_port=None:
-                                   ran.append((kind, immediate))):
+                               side_effect=lambda kind, immediate=False, manager_port=None, target="":
+                                   ran.append((kind, immediate, target))):
             code, body = self._post("/update")
             self.assertEqual(code, 200)
             self.assertIn("converging", body)
@@ -515,7 +515,8 @@ class Routes(Fresh):
                 if ran:
                     break
                 time.sleep(0.01)
-        self.assertEqual(ran, [("pull", True)], "the banner click is the user's own deliberate cut")
+        self.assertEqual(ran, [("pull", True, "aaaa1111")],
+                         "the banner click is the user's own deliberate cut, onto the commit the banner named")
         km._MAIN_DRIFT[0] = ""
 
 

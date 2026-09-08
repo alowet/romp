@@ -4113,17 +4113,46 @@ def _dismiss_update(ident):
         sys.stderr.write("update-dismiss: store write failed\n")
 
 
+def _sha8(s):
+    """The eight-character spelling of a sha for STATE and DISPLAY — the drift slots (_MAIN_DRIFT), the
+    in-place latch, the banner — with any '-dirty' suffix stripped; '' stays ''. Never use it to
+    COMPARE two shas (that is _sha_same): it only clamps downward, and a sha that came out SHORTER
+    than eight would still disagree with its own eight-character spelling."""
+    return (_sha_base(s) or "")[:8]
+
+
+def _sha_same(a, b):
+    """Whether two drift-verdict inputs name the SAME commit: '-dirty' stripped, then the shorter is a
+    prefix of the longer — _shas_agree's rule (the p2p path's) with a floor: the shorter must be at
+    least seven characters, git's own minimum for an auto abbreviation; below that, exact equality
+    (nothing git prints is that short, and a stray fragment must not agree with everything). The
+    verdict's three readers shorten INDEPENDENTLY — `rev-parse --short` for the running build floors
+    at seven on a small object store (a `--depth 1` clone) and widens past eight on a large one, and
+    carries '-dirty' on an uncommitted tree; `--short=8` for the checkout and the ls-remote slice for
+    origin sit at eight — so compared as strings, a checkout at the very commit the kernel runs read
+    as permanent drift: a 'ready on disk' banner that never cleared in ask mode, and in auto mode an
+    unwarranted full restart (every in-flight turn cut) once per cool-down, forever."""
+    a, b = _sha_base(a) or "", _sha_base(b) or ""
+    if not a or not b:
+        return False
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return long_.startswith(short) if len(short) >= 7 else a == b
+
+
 def _main_drift_verdict(origin, checkout, running):
     """(kind, target) — the pure decision. kind: "pull" (origin ahead of the checkout: fetch + advance
     + restart), "restart" (the checkout is ahead of the running kernel: restart alone), or "" (in sync
     or unknowable). A sha that could not be read ('' anywhere) is unknown → no verdict: guessing would
-    invent a notice. Comparison is by INEQUALITY, not ancestry — the checkout only ever moves by
-    fast-forwarding to origin/main here, so a differing sha IS new information, and a wrongly-diverged
-    checkout surfaces in the pull step's own fast-forward refusal rather than being guessed at."""
-    if origin and checkout and origin != checkout:
-        return ("pull", origin)
-    if checkout and running and checkout != running:
-        return ("restart", checkout)
+    invent a notice. Comparison is by prefix AGREEMENT (_sha_same: dirty-stripped, width-tolerant),
+    not ancestry — the checkout only ever moves by fast-forwarding to origin/main here, so a differing
+    commit IS new information, and a wrongly-diverged checkout is refused by the pull step's own
+    fast-forward check (_run_main_update) rather than being guessed at. The target is the eight-
+    character spelling (_sha8): the slots, the latch and the banner all carry that one form."""
+    origin, checkout, running = _sha_base(origin) or "", _sha_base(checkout) or "", _sha_base(running) or ""
+    if origin and checkout and not _sha_same(origin, checkout):
+        return ("pull", _sha8(origin))
+    if checkout and running and not _sha_same(checkout, running):
+        return ("restart", _sha8(checkout))
     return ("", "")
 
 
@@ -4521,7 +4550,7 @@ def _main_drift_check():
         # for the rest of the window, and a pull must not wait on a park that already delivered
         # (review find). When a stand-down ends without that landing — the row expired, the park
         # died with its manager — say so once and let the converge proceed on its own terms.
-        if running != checkout and _parked_quiet_deploy(checkout):
+        if not _sha_same(running, checkout) and _parked_quiet_deploy(checkout):
             if _QUIET_PARKED_LOGGED[0] != checkout:
                 _QUIET_PARKED_LOGGED[0] = checkout
                 sys.stderr.write("romp-kernel: converge: %s already parked as a quiet deploy — leaving it "
@@ -4537,7 +4566,7 @@ def _main_drift_check():
             _MAIN_DRIFT[slot] = ""
             return
         _LAST_AUTO_CONVERGE[0] = time.time()
-        _run_main_update(kind)
+        _run_main_update(kind, target=target)
     else:
         if target in _dismissed_updates():
             return                    # Not-now'd THIS sha, durably — a NEW sha offers again
@@ -4555,36 +4584,74 @@ def _main_drift_check():
 _PORT_FROM_ENV = object()
 
 
-def _run_main_update(kind, immediate=True, manager_port=_PORT_FROM_ENV):
+def _run_main_update(kind, immediate=True, manager_port=_PORT_FROM_ENV, target=""):
     """Converge on newest main: advance the checkout (fast-forward only; a DIRTY shared tree refuses
     LOUDLY — peer sessions' uncommitted work is never discarded) and bounce every kernel through the
     manager. `kind` "restart" skips the pull (the checkout is already ahead). The bounce is IMMEDIATE
     for every caller (T160, the user 2026-08-28: deploys cut in-flight turns now; the parked quiet
     window cost minutes per push and boot reconcile resumes cut turns either way) — pass
     immediate=False to ride the manager's quiet-window gate explicitly.
-    `manager_port` is the value the /update handler resolved before its ack (see _PORT_FROM_ENV)."""
+    `manager_port` is the value the /update handler resolved before its ack (see _PORT_FROM_ENV).
+    `target` is the commit the verdict ADVERTISED (the notice's sha, or the one auto mode acted on):
+    the pull moves the checkout onto exactly that commit, never onto the remote's ref — a ref can
+    move (or, after a failed fetch, sit stale) between the verdict and the move, and a ref checkout
+    is not a fast-forward operation, so it landed on a rewound or diverged main without a word.
+    Every step reads its own exit code: a failing `git status` is UNKNOWN, never clean (a tree that
+    cannot be read is not a tree that may be moved), and a failed fetch aborts instead of checking
+    out whatever the stale local ref points at. Every refusal is said on the sync surface
+    (_sync_notice, ok=False — the row every updater failure already lands on) and re-arms the notice."""
     if kind == "pull":
+        remote = _release_remote()
+        target = _sha8(target)
+
+        def refuse(why, r=None):
+            # the OUTCOME first: the row is capped downstream (300 chars on the wire, 240 in the
+            # badge), so git's own words come LAST and trimmed, never pushing "left alone" off the end
+            if r is not None:
+                said = (r.stderr or r.stdout or "").strip()[-120:]
+                why += (" (git: %s)" % said) if said else (" (git exited %d)" % r.returncode)
+            _sync_notice("main moved at %s, but %s." % (remote, why), ok=False)
+            _MAIN_DRIFT[0] = ""                   # every refusal re-arms: the notice re-fires once cured
         try:
-            dirty = subprocess.run(["git", "status", "--porcelain"], cwd=str(ROOT),
-                                   capture_output=True, text=True, timeout=10).stdout.strip()
-            remote = _release_remote()
-            if dirty:
-                _sync_notice("main moved at %s, but the romp checkout has uncommitted work, so it "
-                             "was left alone. Commit or stash it, then Update again." % remote, ok=False)
-                _MAIN_DRIFT[0] = ""                   # let the notice re-fire once the tree is clean
+            if not target:
+                refuse("the checkout was left alone: no commit was named for the move. Update again "
+                       "once the next check has read main")
                 return
-            subprocess.run(["git", "fetch", remote, "main"], cwd=str(ROOT),
-                           capture_output=True, text=True, timeout=60)
-            r = subprocess.run(["git", "checkout", "--detach", "%s/main" % remote], cwd=str(ROOT),
+            st = subprocess.run(["git", "status", "--porcelain"], cwd=str(ROOT),
+                                capture_output=True, text=True, timeout=10)
+            if st.returncode != 0:
+                refuse("the checkout was left alone: its state could not be read, so it was not "
+                       "assumed clean", st)
+                return
+            if st.stdout.strip():
+                refuse("the romp checkout has uncommitted work, so it was left alone. Commit or "
+                       "stash it, then Update again")
+                return
+            f = subprocess.run(["git", "fetch", remote, "main"], cwd=str(ROOT),
+                               capture_output=True, text=True, timeout=60)
+            if f.returncode != 0:
+                refuse("the checkout was left alone: the fetch failed", f)
+                return
+            anc = subprocess.run(["git", "merge-base", "--is-ancestor", "HEAD", target], cwd=str(ROOT),
+                                 capture_output=True, text=True, timeout=10)
+            if anc.returncode == 1:
+                # a real non-ancestor: the histories diverged — never merged on the user's behalf
+                refuse("the checkout was left alone: %s is not a fast-forward of it — the histories "
+                       "diverged, which is yours to move by hand" % target)
+                return
+            if anc.returncode != 0:
+                # git could not even name it (128): the fetch did not bring the advertised commit
+                # (main was rewound), or the short prefix is ambiguous — the next check re-reads main
+                refuse("the checkout was left alone: the fetch did not bring %s, so it could not be "
+                       "verified; the next check re-reads main" % target, anc)
+                return
+            r = subprocess.run(["git", "checkout", "--detach", target], cwd=str(ROOT),
                                capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
-                _sync_notice("main moved at %s, but advancing the checkout failed: %s"
-                             % (remote, (r.stderr or r.stdout or "").strip()[-200:]), ok=False)
-                _MAIN_DRIFT[0] = ""
+                refuse("the checkout did not advance onto %s" % target, r)
                 return
         except Exception as e:
-            _sync_notice("main moved at %s, but the pull step failed: %s" % (_release_remote(), e), ok=False)
-            _MAIN_DRIFT[0] = ""
+            refuse("the pull step failed: %s" % e)
             return
     if kind == "pull":
         pulled = _checkout_sha()   # ONE read: verdict input and converge target must be the same
@@ -4606,15 +4673,20 @@ def _run_main_update(kind, immediate=True, manager_port=_PORT_FROM_ENV):
     if manager_port is _PORT_FROM_ENV:
         manager_port = os.environ.get("ROMP_MANAGER_PORT")
     try:
-        import urllib.request
         # the reason joins the dying kernel's restart-cuts.jsonl row to WHO restarted it (see
         # _recent_restart_reason) — the auto converge used to leave the row anonymous
         _audit_restart_request("main-converge", tag=kind, when=("now" if immediate else "quiet"),
                                sha=_checkout_sha())      # what a quiet row deploys (T240d: _parked_quiet_deploy)
-        req = urllib.request.Request("http://127.0.0.1:%d/restart-all%s"
-                                     % (int(manager_port or 7432),
-                                        "" if immediate else "?when=quiet"), method="POST")
-        urllib.request.urlopen(req, timeout=5).read()
+        # http.client, the way _restart_this_kernel dials: urllib's default opener honours
+        # HTTP_PROXY / http_proxy, so under a proxy environment this loopback POST went to the
+        # proxy and the code on disk never restarted — reported only as "restart request failed"
+        c = http.client.HTTPConnection("127.0.0.1", int(manager_port or 7432), timeout=5)
+        c.request("POST", "/restart-all%s" % ("" if immediate else "?when=quiet"))
+        resp = c.getresponse()
+        resp.read()
+        c.close()
+        if resp.status >= 400:
+            raise RuntimeError("the manager answered HTTP %d" % resp.status)
     except Exception as e:
         _sync_notice("romp is updated on disk but the restart request failed (%s) — "
                      "restart it yourself: romp refresh" % e, ok=False)
@@ -15367,6 +15439,10 @@ def _pull_remote(host):
                             capture_output=True, text=True, timeout=10)
     except Exception as e:
         return False, str(e)[:200]
+    if st.returncode != 0:
+        # a tree whose state cannot be read is UNKNOWN, never clean: the fast-forward rewrites it
+        return False, "reading this machine's tree state failed (%s) — nothing pulled" % (
+            (st.stderr or st.stdout or "").strip()[:160] or "git status exited %d" % st.returncode)
     if (st.stdout or "").strip():
         return False, "this machine's tree has uncommitted changes — commit or stash them first (won't clobber)"
     rdir, rhead, _rdirty, derr = _discover_remote_clone(host)   # a DIRTY remote is fine: we take its COMMITS
@@ -37468,14 +37544,19 @@ class Handler(BaseHTTPRequestHandler):
                         _run_update(tag)
                         _send_to_app("shell", {"type": "updateAvail", "state": "running", "boot": _BOOT_ID})
                     return self._send(200, json.dumps({"ok": True, "state": _UPDATE_STATE[0]}), "application/json")
-                kind = "pull" if _MAIN_DRIFT[0] else ("restart" if _MAIN_DRIFT[1] else "")
+                # ONE snapshot of what the kernel found: the kind and the commit it advertised come
+                # from the same read, so a slot emptied meanwhile (a refusal re-arming, a sync
+                # landing) can never pair a "pull" with an empty target — an unbound move
+                d0, d1 = _MAIN_DRIFT[0], _MAIN_DRIFT[1]
+                kind = "pull" if d0 else ("restart" if d1 else "")
                 if kind:
-                    _audit_restart_request("main-converge", tag=_MAIN_DRIFT[0] or _MAIN_DRIFT[1],
+                    _audit_restart_request("main-converge", tag=d0 or d1,
                                            addr=str(self.client_address[0]))
                     # same ack-time port resolution as /restart: the daemon thread's env read could
                     # otherwise land after this response, on a value the caller has already restored
                     threading.Thread(target=_run_main_update, args=(kind, True),
-                                     kwargs={"manager_port": os.environ.get("ROMP_MANAGER_PORT")},
+                                     kwargs={"manager_port": os.environ.get("ROMP_MANAGER_PORT"),
+                                             "target": d0 or d1},
                                      daemon=True).start()
                     _send_to_app("shell", {"type": "updateAvail", "state": "running", "boot": _BOOT_ID})
                     return self._send(200, json.dumps({"ok": True, "state": "converging"}), "application/json")

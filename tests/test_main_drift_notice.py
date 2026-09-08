@@ -84,13 +84,58 @@ class DriftVerdict(unittest.TestCase):
         self.assertEqual(km._main_drift_verdict("aaaa1111", "", "bbbb2222"), ("", ""))
         self.assertEqual(km._main_drift_verdict("", "", ""), ("", ""))
 
+    def test_a_dirty_tree_at_the_running_commit_is_in_sync(self):
+        # the running build's sha carries '-dirty' whenever the checkout had uncommitted work when the
+        # kernel resolved it (_kernel_sha); the checkout's reader never appends it. On a shared
+        # main-tracking tree that is the normal state — and it read as permanent drift: a 'ready on
+        # disk' banner that never cleared in ask mode, and in auto mode a full restart, every
+        # in-flight turn cut, once per cool-down for as long as the tree stayed dirty
+        self.assertEqual(km._main_drift_verdict("aaaa1111", "aaaa1111", "aaaa1111-dirty"), ("", ""))
+
+    def test_sha_width_never_reads_as_drift(self):
+        # `rev-parse --short` auto-widens past eight characters on a big repo; `--short=8` and the
+        # ls-remote slice never do — the same commit spelled at two widths is not two commits
+        self.assertEqual(km._main_drift_verdict("aaaa1111", "aaaa1111", "aaaa11112"), ("", ""))
+        self.assertEqual(km._main_drift_verdict("aaaa1111", "aaaa1111" + "0" * 32, "aaaa1111"), ("", ""))
+
+    def test_a_seven_char_running_sha_at_the_checkouts_commit_is_in_sync(self):
+        # the other direction: git's auto abbreviation FLOORS at seven on a small object store — a
+        # `--depth 1` clone (an install shape the repo's own bug template names) spells the running
+        # build at seven while `--short=8` spells the checkout at eight. A downward clamp to eight
+        # cannot see that these agree; prefix agreement can
+        self.assertEqual(km._main_drift_verdict("aaaa1111", "aaaa1111", "aaaa111"), ("", ""))
+        self.assertEqual(km._main_drift_verdict("aaaa1111", "aaaa1111", "aaaa111-dirty"), ("", ""))
+        self.assertEqual(km._main_drift_verdict("aaaa1111", "aaaa111", "aaaa111"), ("", ""),
+                         "and origin vs a seven-character checkout the same way")
+
+    def test_seven_against_eight_is_still_drift_when_the_commits_differ(self):
+        # agreement is a prefix match, never a shrug: a different seven-character commit restarts,
+        # and the target keeps the eight-character spelling the slots and the banner carry
+        self.assertEqual(km._main_drift_verdict("aaaa1111", "aaaa1111", "cccc333"), ("restart", "aaaa1111"))
+        self.assertEqual(km._main_drift_verdict("aaaa1111", "aaaa1111", "cccc333-dirty"), ("restart", "aaaa1111"))
+        self.assertEqual(km._main_drift_verdict("bbbb222", "aaaa1111", "aaaa1111"), ("pull", "bbbb222"))
+
+    def test_below_gits_floor_only_exact_equality_agrees(self):
+        # nothing git prints is shorter than seven; a stray fragment must not agree with everything
+        self.assertFalse(km._sha_same("aaaa11", "aaaa1111"), "six characters: a fragment, not a prefix match")
+        self.assertTrue(km._sha_same("aaa", "aaa"), "equal strings still agree (the cool-down tests' fixtures)")
+        self.assertFalse(km._sha_same("", "aaaa1111"), "unknown agrees with nothing")
+        self.assertTrue(km._sha_same("aaaa111", "aaaa1111" + "0" * 32), "seven against forty")
+
+    def test_a_dirty_tree_behind_the_checkout_still_wants_a_restart(self):
+        # normalization strips the suffix, never the disagreement: real drift is still drift, and the
+        # target it names is the eight-character spelling the banner and the in-place latch compare
+        self.assertEqual(km._main_drift_verdict("aaaa1111", "aaaa1111", "cccc3333-dirty"), ("restart", "aaaa1111"))
+        self.assertEqual(km._main_drift_verdict("bbbb2222", "aaaa1111", "aaaa1111-dirty"), ("pull", "bbbb2222"))
+
 
 class DriftWiring(unittest.TestCase):
     def test_off_mode_silences_the_watcher_and_auto_converges_unattended(self):
         src = inspect.getsource(km._main_drift_check)
         self.assertIn('if _update_mode() == "off":', src)
         self.assertIn('if _update_mode() == "auto":', src)
-        self.assertIn("_run_main_update(kind)", src)
+        self.assertIn("_run_main_update(kind, target=target)", src,
+                      "the auto converge hands down the commit it advertised — the move is bound to it")
         self.assertIn('"kind": "main"', src, "ask mode fires the shared banner with the drift variant")
 
     def test_a_dirty_shared_tree_refuses_loudly_and_rearms(self):
@@ -98,7 +143,9 @@ class DriftWiring(unittest.TestCase):
         self.assertIn('"status", "--porcelain"', src)
         self.assertIn("uncommitted work", src, "the refusal names the real problem")
         self.assertIn('_MAIN_DRIFT[0] = ""', src, "the notice re-fires once the tree is clean")
-        self.assertIn('"checkout", "--detach", "%s/main" % remote', src, "advance is the repo's own convention")
+        self.assertIn('"checkout", "--detach", target', src,
+                      "the move lands on the ADVERTISED commit, never the remote's ref (ConvergePullStep drives it)")
+        self.assertNotIn('"%s/main" % remote', src, "a ref can move, or sit stale after a failed fetch")
         self.assertIn("remote = _release_remote()", src,
                       "the walk targets the RELEASE remote, never a literal origin (a fork layout's stale mirror)")
 
@@ -128,7 +175,7 @@ class DriftWiring(unittest.TestCase):
         km._update_mode = lambda: "auto"
         km._checkout_sha = lambda: "aaa"
         km._kernel_sha = lambda: "aaa"
-        km._run_main_update = lambda kind, immediate=False: ran.append(kind)
+        km._run_main_update = lambda kind, immediate=False, target="": ran.append(kind)
         try:
             km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
             km._LAST_AUTO_CONVERGE[0] = 0.0
@@ -162,7 +209,7 @@ class DriftWiring(unittest.TestCase):
         km._checkout_sha = lambda: "aaa"
         km._kernel_sha = lambda: "aaa"
         km._origin_main_sha = lambda: "bbb"
-        km._run_main_update = lambda kind, immediate=False: ran.append(kind)
+        km._run_main_update = lambda kind, immediate=False, target="": ran.append(kind)
         try:
             km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
             km._LAST_AUTO_CONVERGE[0] = 0.0                       # a FRESH process: module memory is empty
@@ -251,7 +298,7 @@ class DriftWiring(unittest.TestCase):
         km._update_mode = lambda: "auto"
         km._kernel_code_changed = lambda a, b: True
         km._CONVERGE_COOLDOWN_S = 0.0      # isolate the stand-down: the cool-down is T240's own gate
-        km._run_main_update = lambda kind, immediate=False: ran.append(kind)
+        km._run_main_update = lambda kind, immediate=False, target="": ran.append(kind)
         km._checkout_sha = lambda: "f3dc387a" + "0" * 32
         km._origin_main_sha = km._checkout_sha
         km._kernel_sha = lambda: "aaaaaaaa" + "0" * 32
@@ -340,15 +387,23 @@ class DriftWiring(unittest.TestCase):
             check()
             self.assertEqual(ran, [], "fifty no-restart rows do not hide a live park")
             # LANDED, cut row lost (review find): the kernel already runs the checkout, the row is still
-            # unconsumed — nothing is owed, so a pull must not wait on it (and says nothing about a park)
+            # unconsumed — nothing is owed, so a pull must not wait on it (and says nothing about a park).
+            # "Runs the checkout" is read the way the verdict reads it (_sha_same): the running sha
+            # carries '-dirty' on a shared tree with uncommitted work, and is seven characters on a
+            # shallow clone — a raw string compare called both "restart still owed" and stood the
+            # pull down behind a park that had already delivered
             ran.clear()
             km._QUIET_PARKED_LOGGED[0] = ""
             audit.write_text(json.dumps({"t": int(now - 240), "action": "p2p-update",
                                          "reason": "from TESTHOST to f3dc387a", "when": "quiet"}) + "\n")
-            km._kernel_sha = km._checkout_sha
+            km._kernel_sha = lambda: "f3dc387a" + "0" * 32 + "-dirty"
             km._origin_main_sha = lambda: "bbbbbbbb" + "0" * 32
             out = check()
             self.assertEqual(ran, ["pull"], "the parked restart already delivered: the pull proceeds")
+            self.assertNotIn("already parked", out)
+            km._kernel_sha = lambda: "f3dc387"                     # the shallow clone's seven-character spelling
+            out = check()
+            self.assertEqual(ran, ["pull", "pull"], "spelled at seven, the kernel still runs the checkout")
             self.assertNotIn("already parked", out)
             km._kernel_sha = lambda: "aaaaaaaa" + "0" * 32
             km._origin_main_sha = km._checkout_sha
@@ -453,8 +508,11 @@ class DriftWiring(unittest.TestCase):
 
     def test_the_route_acts_only_on_what_the_kernel_itself_found(self):
         src = inspect.getsource(km)
-        self.assertIn('kind = "pull" if _MAIN_DRIFT[0] else ("restart" if _MAIN_DRIFT[1] else "")', src,
+        self.assertIn('d0, d1 = _MAIN_DRIFT[0], _MAIN_DRIFT[1]', src,
+                      "one snapshot: a re-read could pair a pull with an emptied target — an unbound move")
+        self.assertIn('kind = "pull" if d0 else ("restart" if d1 else "")', src,
                       "no version or kind is ever taken from the client")
+        self.assertIn('"target": d0 or d1', src, "the click converges onto the commit the banner named")
 
 
 if __name__ == "__main__":
@@ -656,3 +714,180 @@ class PlainInstallCopy(unittest.TestCase):
         self.assertNotIn("restarts every kernel", src)
         self.assertIn("Update pulls them and restarts romp.", src)
         self.assertIn("Update restarts romp onto it.", src)
+
+
+class ConvergePullStep(unittest.TestCase):
+    """The pull step DRIVEN, every subprocess scripted: each guard stops the sequence where it claims,
+    nothing is checked out or restarted past a refusal, and the move lands on the commit the verdict
+    advertised — never on the remote's ref. Before this, the fetch's exit code went unread (a failed
+    fetch re-checked-out the stale local ref and reported success), `git status` read as CLEAN
+    whenever it failed, the checkout followed `<remote>/main` with no ancestry check, and the restart
+    POST rode urllib, whose default opener honours HTTP_PROXY. Every refusal lands on the sync
+    surface (_sync_notice, ok=False) — the row the updater's failures already use — and re-arms."""
+
+    TARGET = "abcd1234"
+
+    def setUp(self):
+        self._saved = (km._MAIN_DRIFT[0], km._MAIN_DRIFT[1], km._INPLACE_TRIED[0])
+        km._MAIN_DRIFT[0], km._MAIN_DRIFT[1] = self.TARGET, ""
+        km._INPLACE_TRIED[0] = ""
+        self.notices, self.posts, self.calls, self.dials = [], [], [], []
+
+    def tearDown(self):
+        km._MAIN_DRIFT[0], km._MAIN_DRIFT[1], km._INPLACE_TRIED[0] = self._saved
+
+    def _drive(self, target=TARGET, fail=(), status_out="", status_rc=0, proxy="", err="", answer=200):
+        """`fail`: step names that exit 1, or a {step: rc} dict; `err`: the stderr a failing step
+        prints (default '<step>: boom'); `answer`: the manager's HTTP status to the restart POST."""
+        import subprocess
+        import urllib.request
+        from unittest import mock
+        rec = self
+        rcs = fail if isinstance(fail, dict) else {s: 1 for s in fail}
+
+        def fake_run(argv, **kw):
+            step = ("status" if "status" in argv else "fetch" if "fetch" in argv
+                    else "merge-base" if "merge-base" in argv else "checkout" if "checkout" in argv
+                    else "rev-parse" if "rev-parse" in argv else "other")
+            rec.calls.append((step, list(argv)))
+            rc, out = rcs.get(step, 0), ""
+            if step == "status":
+                rc, out = status_rc, status_out
+            elif step == "rev-parse":
+                out = rec.TARGET + "\n"
+            return subprocess.CompletedProcess(argv, rc, stdout=out,
+                                               stderr=(err or "%s: boom" % step) if rc else "")
+
+        class FakeConn:
+            def __init__(self, host, port, timeout=0):
+                rec.dials.append((host, int(port)))
+
+            def request(self, method, path, *a, **k):
+                rec.posts.append((method, path))
+
+            def getresponse(self):
+                r = mock.MagicMock()
+                r.status = answer
+                r.read = lambda: b""
+                return r
+
+            def close(self):
+                pass
+
+        env = {"HTTP_PROXY": proxy, "http_proxy": proxy} if proxy else {}
+        with mock.patch.object(km.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(km, "_sync_notice", side_effect=lambda m, ok=True: rec.notices.append((m, ok))), \
+             mock.patch.object(km, "_kernel_sha", return_value="cur-sha"), \
+             mock.patch.object(km, "_kernel_code_changed", return_value=True), \
+             mock.patch.object(km, "_rebuild_dist", return_value=(True, "")), \
+             mock.patch.object(km, "_audit_restart_request", lambda *a, **k: None), \
+             mock.patch.object(km.http.client, "HTTPConnection", FakeConn), \
+             mock.patch.object(urllib.request, "urlopen",
+                               side_effect=AssertionError("the restart POST must not ride urllib")), \
+             mock.patch.dict(km.os.environ, env):
+            km._run_main_update("pull", immediate=True, manager_port="1", target=target)
+        return [s for s, _ in self.calls if s != "other"]
+
+    def _refusals(self):
+        return [m for m, ok in self.notices if not ok]
+
+    def test_the_happy_path_moves_onto_the_advertised_commit_and_restarts(self):
+        steps = self._drive()
+        self.assertEqual(steps[:4], ["status", "fetch", "merge-base", "checkout"], steps)
+        self.assertEqual(set(steps[4:]), {"rev-parse"}, "after the move, only the checkout re-reads")
+        fetch = next(a for s, a in self.calls if s == "fetch")
+        self.assertEqual(fetch[-3:], ["fetch", "origin", "main"],
+                         "main from the release remote (the scripted `git remote` lists none: a plain install's origin)")
+        anc = next(a for s, a in self.calls if s == "merge-base")
+        self.assertEqual(anc[-3:], ["--is-ancestor", "HEAD", self.TARGET], "a fast-forward from HEAD, proven")
+        co = next(a for s, a in self.calls if s == "checkout")
+        self.assertEqual(co[-2:], ["--detach", self.TARGET], "the move lands on the sha the verdict named")
+        self.assertFalse(any(a.endswith("/main") for a in co), "never the ref: it can move, or sit stale")
+        self.assertEqual(self.posts, [("POST", "/restart-all")])
+        self.assertEqual(self.dials, [("127.0.0.1", 1)])
+        self.assertEqual(self._refusals(), [], "nothing refused; the restart went out")
+
+    def test_the_restart_post_ignores_a_proxy_environment(self):
+        # urllib's default opener would have sent this loopback POST to the proxy — the updated code
+        # on disk then never restarted, and the only trace was "restart request failed"
+        self._drive(proxy="http://proxy.invalid:3128")
+        self.assertEqual(self.posts, [("POST", "/restart-all")])
+        self.assertEqual(self.dials, [("127.0.0.1", 1)], "dialled direct, whatever HTTP_PROXY says")
+        self.assertEqual(self._refusals(), [])
+
+    def test_a_refused_restart_answer_is_said_not_swallowed(self):
+        # urlopen raised on a 4xx/5xx; http.client hands the status back — an answer of 500 from the
+        # manager is still a restart that did not happen, and the notice must say so
+        self._drive(answer=500)
+        self.assertEqual(self.posts, [("POST", "/restart-all")], "the POST went out")
+        said = [m for m, ok in self.notices if not ok and "restart request failed" in m]
+        self.assertEqual(len(said), 1, self.notices)
+        self.assertIn("HTTP 500", said[0])
+        self.assertIn("romp refresh", said[0], "and names the way out")
+
+    def test_a_failed_fetch_aborts_before_any_move(self):
+        # a realistic ssh failure is ~190 chars of stderr; the row is capped at 300 on the wire and
+        # 240 in the badge, so the OUTCOME leads and git's words come last, trimmed
+        ssh_err = "ssh: connect to host git.example.invalid port 22: Connection timed out\n" * 4
+        steps = self._drive(fail=("fetch",), err=ssh_err)
+        self.assertEqual(steps, ["status", "fetch"], "the sequence stops AT the fetch")
+        self.assertEqual(self.posts, [], "nothing restarted onto an unmoved checkout")
+        said = [m for m in self._refusals() if "the fetch failed" in m]
+        self.assertEqual(len(said), 1, self.notices)
+        self.assertIn("left alone", said[0], "the outcome survives a long git error")
+        self.assertLess(said[0].index("left alone"), said[0].index("git:"), "outcome first, git's words after")
+        self.assertIn("Connection timed out", said[0], "and git's words are still there")
+        self.assertLessEqual(len(said[0]), 240, "inside the badge's cap")
+        self.assertEqual(km._MAIN_DRIFT[0], "", "the notice re-arms")
+
+    def test_a_commit_that_is_not_a_fast_forward_of_head_is_refused(self):
+        # merge-base --is-ancestor exits 1: a real non-ancestor — the histories diverged, which is
+        # never merged on the user's behalf; the checkout stays where it is
+        steps = self._drive(fail=("merge-base",))
+        self.assertEqual(steps, ["status", "fetch", "merge-base"])
+        self.assertEqual(self.posts, [])
+        said = [m for m in self._refusals() if "not a fast-forward" in m and self.TARGET in m]
+        self.assertEqual(len(said), 1, "the refusal names the commit: %r" % self.notices)
+        self.assertIn("diverged", said[0])
+        self.assertIn("yours to move by hand", said[0])
+        self.assertNotIn("did not bring", said[0], "a divergence is not a missing commit")
+        self.assertEqual(km._MAIN_DRIFT[0], "")
+
+    def test_a_commit_the_fetch_did_not_bring_is_said_as_such(self):
+        # merge-base exits 128: git cannot name the advertised commit — main was rewound after the
+        # verdict, or the short prefix is ambiguous. Not a divergence: the next check re-reads main
+        steps = self._drive(fail={"merge-base": 128}, err="fatal: Not a valid commit name abcd1234")
+        self.assertEqual(steps, ["status", "fetch", "merge-base"])
+        self.assertEqual(self.posts, [])
+        said = [m for m in self._refusals() if "did not bring" in m and self.TARGET in m]
+        self.assertEqual(len(said), 1, self.notices)
+        self.assertIn("re-reads main", said[0])
+        self.assertIn("Not a valid commit name", said[0], "git's words, after the outcome")
+        self.assertNotIn("diverged", said[0])
+        self.assertEqual(km._MAIN_DRIFT[0], "")
+
+    def test_a_failing_status_is_unknown_never_clean(self):
+        # rc 128 with nothing on stdout: the old `.stdout.strip()` read saw "" and called it clean,
+        # then moved a tree whose state nobody had actually read
+        steps = self._drive(status_rc=128)
+        self.assertEqual(steps, ["status"], "stops at the status read")
+        self.assertEqual(self.posts, [])
+        refusals = self._refusals()
+        self.assertTrue(any("its state could not be read" in m and "left alone" in m for m in refusals), refusals)
+        self.assertFalse(any("uncommitted work" in m for m in refusals), "not mistaken for a dirty tree either")
+        self.assertEqual(km._MAIN_DRIFT[0], "")
+
+    def test_a_dirty_tree_still_refuses_with_the_standing_wording(self):
+        steps = self._drive(status_out=" M kernel/kernel.py\n")
+        self.assertEqual(steps, ["status"])
+        self.assertEqual(self.posts, [])
+        self.assertTrue(any("uncommitted work" in m for m in self._refusals()))
+        self.assertEqual(km._MAIN_DRIFT[0], "")
+
+    def test_an_empty_target_refuses_before_touching_git(self):
+        # binding is mandatory: with no advertised commit there is nothing to bind the move to
+        steps = self._drive(target="")
+        self.assertEqual(steps, [], "no status, no fetch, no move")
+        self.assertEqual(self.posts, [])
+        self.assertTrue(any("no commit was named" in m for m in self._refusals()), self.notices)
+        self.assertEqual(km._MAIN_DRIFT[0], "")
