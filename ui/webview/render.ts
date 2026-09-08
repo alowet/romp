@@ -54,7 +54,7 @@ import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser
 import { pastedFilePath } from "./paste-path";
 import { insertAtCaret } from "./composer-insert";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
-import { followReader, keepPlaceAcrossShow } from "./scroll-keep";
+import { followReader, keepPlaceAcrossShow, followTail } from "./scroll-keep";
 import { retainLiveOmitted } from "./tab-order";
 import { userTurnShows } from "./user-turn-content";
 import { ScrollDiagBudget, classifyScroll, scrollWriteRow } from "./scroll-write";
@@ -10333,11 +10333,17 @@ function appendActive() {
   // bottom keeps the existing stick; scrolled-up keeps its never-yank rule.
   const stick = content.scrollHeight > content.clientHeight + 2 && nearBottom(content);
   const before = content.scrollTop;
+  const heightBefore = content.scrollHeight;
+  const distBefore = heightBefore - before - content.clientHeight;
   const anchor = !stick && v ? captureScrollAnchor(content, v) : null;
   syncView(activeId, stick);
   syncHostOfflineFoot();                 // before the scroll maths: it changes scrollHeight
   updateStatusline();
-  if (stick) writeScroll(content, content.scrollHeight, "append-stick", true);
+  // Follow-mode pins the bottom only when there is something new to follow (T262, the user 2026-09-08): a
+  // status-only tail changes no content, and pinning on it snapped a reader wheeling up from the tail of a
+  // busy session back down within the first 80 px, frame after frame. Decision in scroll-keep.ts followTail.
+  if (stick && followTail(distBefore, heightBefore, content.scrollHeight)) writeScroll(content, content.scrollHeight, "append-stick", true);
+  else if (stick) { /* near the bottom, nothing new: the reader stays where they are */ }
   else if (!(v && restoreScrollAnchor(content, v, anchor))) writeScroll(content, before, "append-raw");
   scheduleRailSticky();
   updateJumpBtn();   // appends can cross the overflow boundary either way — re-read the chip's truth
