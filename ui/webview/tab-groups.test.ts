@@ -1,5 +1,5 @@
-// TAB GROUPS ARE TAGS (the user 2026-09-04): the chat tab strip sections by HOME tag — the first
-// holder in tagOrder, the rule revealIn states — with the untagged trailing, per-browser on/off and
+// TAB GROUPS ARE TAGS (the user 2026-09-04): the chat tab strip sections by tag — every tag a
+// session carries (T264b, 2026-09-08; the home-tag rule is retired) — with the untagged trailing, per-browser on/off and
 // per-section fold state under romp:tabgroups, and the section headers draggable to reorder
 // tagOrder (the kernel-persisted union order the timeline's pill drag writes too). Executed tests on
 // the pure module + source pins on render.ts / tag-menu.ts / styles.css (the tab-order.ts pattern;
@@ -208,7 +208,7 @@ test("executed + pinned: the section holding the ACTIVE tab is unfoldable while 
   assert.match(CSS, /\.tab-group-head\.holds-active \{ cursor: default; \}/);
 });
 
-test("executed: a create in flight sections under the FIRST requested tag in tagOrder — its future home — from the first paint", () => {
+test("executed: a create in flight sections under EVERY requested tag from the first paint (T264b)", () => {
   // the kernel tags a new session before its first push so the tab never lands untagged and jumps;
   // the client's provisional tab used to land in the untagged trail (a client-minted id in no
   // union) and move into its group when the frame arrived — the very jump the kernel avoids
@@ -1645,6 +1645,7 @@ test("every copy is the full tab of the ONE session, and the by-copy readers tel
   // the active highlight, the state class and the dot come from the same per-item loop, so every copy wears them
   assert.match(loop, /const tab = el\("div", "tab" \+ \(id === activeId \? " active" : ""\)\);/);
   assert.match(loop, /if \(copyGroup !== undefined\) tab\.dataset\.copy = copyGroup \?\? "";/, "data-copy names the copy's group (sectioned strip only)");
+  assert.match(loop, /const ph = makePlaceholderTab\(id\);\s*\n\s*if \(copyGroup !== undefined\) ph\.dataset\.copy = copyGroup \?\? "";/, "…on a placeholder copy too (a create in flight under two tags), so flipTabs keys never collide");
   assert.match(loop, /tab\.dataset\.act = "select";/, "a click on any copy selects the session through the #tabs delegate, by id");
   // the ✕ on a copy ends THE session, and its tip says so
   const close = RENDER.slice(RENDER.indexOf('const close = el("span", "tab-close");'), RENDER.indexOf('close.dataset.act = "close";'));
@@ -1665,10 +1666,16 @@ test("the tab drag moves THIS copy and reorders within its group's neighbours (T
   assert.equal((RENDER.match(/const dragged = draggedEl && draggedEl\.isConnected \? draggedEl : null;/g) || []).length, 2, "dragover and drop both move the very copy under the pointer");
   assert.doesNotMatch(RENDER, /tabs\.querySelector<HTMLElement>\(`\.tab\[data-id="\$\{CSS\.escape\(draggedId\)\}"\]`\)/, "never the first tab wearing the id");
   // the drop's neighbours skip the session's own copy in the group next door — reorderTo against itself moves nothing
-  const drop = RENDER.slice(RENDER.indexOf('tabs.addEventListener("drop"'), RENDER.indexOf("tabDragCommitted = true;"));
+  const drop = RENDER.slice(RENDER.indexOf('tabs.addEventListener("drop"'), RENDER.indexOf("tabDragCommitted = true; }"));
   assert.match(drop, /const own = \(n: Element \| null\) => !!n && \(n as HTMLElement\)\.dataset\?\.id === draggedId;/);
-  assert.match(drop, /const tabBefore = \(n: Element \| null\) => \{ while \(n && \(!\(n as HTMLElement\)\.dataset\?\.id \|\| own\(n\)\)\) n = n\.previousElementSibling;/);
-  assert.match(drop, /const tabAfter = \(n: Element \| null\) => \{ while \(n && \(!\(n as HTMLElement\)\.dataset\?\.id \|\| own\(n\)\)\) n = n\.nextElementSibling;/);
+  // the neighbours come from the dragged copy's OWN group first: the walk stops at a header or a row break,
+  // and only a group holding no other tab falls back to the nearest tab across groups (a drop at a group's
+  // head used to anchor on the group above's last tab, so the session's other copy jumped)
+  assert.match(drop, /const edge = \(n: Element\) => n\.classList\.contains\("tab-group-head"\) \|\| n\.classList\.contains\("tab-group-break"\);/);
+  assert.match(drop, /while \(n && \(!\(n as HTMLElement\)\.dataset\?\.id \|\| own\(n\)\)\) \{ if \(inGroup && edge\(n\)\) return null; n = step\(n\); \}/);
+  assert.match(drop, /const prev = prevIn \?\? \(nextIn \? null : walk\(dragged\.previousElementSibling, back, false\)\);/);
+  assert.match(drop, /const next = nextIn \?\? \(prevIn \? null : walk\(dragged\.nextElementSibling, fwd, false\)\);/);
+  assert.doesNotMatch(drop, /\n\s*tabDragCommitted = true;\s*\/\//, "no unconditional commit: a drop that moved nothing takes dragend's cancel path");
   // a drop still changes no membership: a copy dragged into another group's row re-sections home on the next render
   const over = RENDER.slice(RENDER.indexOf('tabs.addEventListener("dragover"'), RENDER.indexOf('tabs.addEventListener("drop"'));
   assert.match(over, /A drop changes\s*\n?\s*\/\/ no membership/);
@@ -1682,4 +1689,50 @@ test("executed: the keyboard order keeps a session while any copy is on screen (
   assert.deepEqual([...p.folded], ["web"], "web's only copy is folded; api's beta copy is on screen");
   const both = planStrip(["web", "api"], unions, setSectionCollapsed(st, "beta", true), null, false);
   assert.deepEqual([...both.folded].sort(), ["api", "web"], "every copy folded → skipped");
+});
+
+test("↑/↓ measure from the focused copy and never land on the session's own other copy (T264b review)", () => {
+  const fn = RENDER.slice(RENDER.indexOf("function tabInAdjacentRow("), RENDER.indexOf("// ---- session picker overlay"));
+  assert.match(fn, /const focused = document\.activeElement as HTMLElement \| null;/);
+  assert.match(fn, /focused && focused\.classList\.contains\("tab"\) && focused\.dataset\.id === id && bar\?\.contains\(focused\)\s*\n\s*\? focused : bar\?\.querySelector/,
+    "the origin is the copy the user is on, else the first copy");
+  assert.match(fn, /if \(t\.dataset\.id === id\) continue;/, "the session's own other copy is never the answer (setActive would no-op: a dead key)");
+});
+
+test("the tab menu speaks for the right-clicked copy's group: Move to drops THAT tag, Show when folded pins THAT section, Rename edits THAT copy (T264b review)", () => {
+  assert.match(RENDER, /showTabMenu\(e, id, tab\.dataset\.copy\); \}\);/, "the copy's group rides the contextmenu call");
+  assert.match(RENDER, /function showTabMenu\(e: MouseEvent, id: string, copy\?: string\)/);
+  assert.match(RENDER, /const home0 = readTabGroups\(\)\.on \? \(\(copy !== undefined \? holding\(\)\.find\(\(g\) => g\.name === copy\) : undefined\) \?\? holding\(\)\[0\]\) : undefined;/,
+    "the copy's own group, else the first holder (the flat strip names no copy)");
+  assert.match(RENDER, /startTabRename\(id, copy\)/);
+  assert.match(RENDER, /function startTabRename\(id: string, copy\?: string\)/);
+  assert.match(RENDER, /t\.dataset\.id === id && \(copy === undefined \|\| t\.dataset\.copy === copy\)\)\s*\n\s*\?\? Array\.from\(bar\.children\)\.find\(\(t\): t is HTMLElement => t instanceof HTMLElement && t\.dataset\.id === id\)\);/,
+    "the right-clicked copy edits in place, the first copy when that one is gone");
+  assert.match(RENDER, /plus\.title = "add this tag too — the session keeps its other tags";/);
+});
+
+test("executed: activating a session under several tags springs no fold — only the open holders are active; all folded → the first opens (T264b review)", () => {
+  // web=[s1,s2], archived=[s2,s3,s4], archived folded by default: activating s2 (a live session also
+  // tagged archived to put it away later) must not spring the whole archived row open
+  const unions = viewTagUnion({ tags: [{ id: "t-web", name: "web", color: "#1EA1EB", members: ["s1", "s2"] },
+                                       { id: "t-arch", name: "archived", color: "#4EA8A9", members: ["s2", "s3", "s4"] }] });
+  const st = parseTabGroups(null, unions);
+  const marks = (active: string | null, state = st) => planStrip(["s1", "s2", "s3", "s4"], unions, state, active, false).items
+    .map((i) => ("head" in i ? `#${i.head.name}${i.active ? "(active)" : ""}${i.folded ? "(folded)" : ""}` : i.id));
+  assert.deepEqual(marks("s2"), ["#web(active)", "s1", "s2", "#archived(folded)"], "archived stays folded: s2 shows under web");
+  assert.deepEqual(marks("s1"), ["#web(active)", "s1", "s2", "#archived(folded)"]);
+  assert.deepEqual([...planStrip(["s1", "s2", "s3", "s4"], unions, st, "s2", false).folded], ["s3", "s4"], "s2 is on screen (under web): not skipped");
+  // both holders folded, nothing pinned: exactly one — the first in tagOrder — opens, as a single holder always did
+  const both = setSectionCollapsed(st, "web", true);
+  assert.deepEqual(marks("s2", both), ["#web(active)", "s1", "s2", "#archived(folded)"], "web forced open for the active tab; archived left as stored");
+  // a copy pinned through a fold counts as shown: no holder is forced open, the pinned copy carries focus
+  const pinned = setPinned(both, { name: "archived", localId: "t-arch" }, "s2", true);
+  assert.deepEqual(marks("s2", pinned), ["#web(folded)", "#archived(folded)", "s2"], "both folds stand; s2 shows through archived's fold");
+  // a single holder is unchanged: open and unfoldable whatever the store says
+  assert.deepEqual(marks("s3", both), ["#web(folded)", "#archived(active)", "s2", "s3", "s4"]);
+});
+
+test("the guide states the every-tag rule (T264b)", () => {
+  assert.match(GUIDE, /A session with several tags appears under each of them; every copy is the same\s+session/);
+  assert.doesNotMatch(GUIDE, /sits under the first of them in your tag order/, "the retired home-tag sentence is gone");
 });

@@ -847,8 +847,8 @@ function reachableHosts(): Set<string> { return reachableFrom((window as any).__
  *  only looks at `.on` needs none. */
 function tabGroups() { return readTabGroups(viewTagUnion(effViews())); }
 let draggedGroup: string | null = null;   // a section header mid-drag (reorders tagOrder) — never a tab
-// the tags a create in flight named (openProvisional): the provisional tab sections under its future
-// home from the first paint (planStrip's `pending`), instead of landing loose and jumping on the frame
+// the tags a create in flight named (openProvisional): the provisional tab sections under every tag it
+// named from the first paint (planStrip's `pending`), instead of landing loose and jumping on the frame
 let provisionalTags: string[] = [];
 function visibleOrder(): string[] { return order.filter((id) => tabInView(id) && !collapsedTabIds.has(id)); }
 // THE PHONE LAYOUT: the kernel's chat page swaps the tab strip for its own session list (#mhdr/#mlist,
@@ -5391,8 +5391,9 @@ function renderTabs() {
   }
   // TAB SECTIONS (the user 2026-09-04): groups are tags. With sectioning on (per browser — the
   // tag-lens menu's "Group tabs by tag") and some tag holding a visible tab, the strip renders one
-  // header per HOME tag in tagOrder — the rule revealIn already states, so a tab's section and its
-  // reveal agree — then that section's tabs, and the untagged trail behind a plain separator
+  // header per tag in tagOrder holding a visible tab, each tab under EVERY tag it carries (T264b, the
+  // user 2026-09-08: tags are equivalent — a session under N tags has a copy in N groups), then that
+  // section's tabs, and the untagged trail — the sessions in no tag — on its own line
   // (tab-groups.ts owns the rule). A folded section renders its header alone, with the count and
   // a pip when a member is working or blocked, so the gist survives the fold (progressive
   // disclosure). The ACTIVE tab's section never renders folded — keyboard focus must never land
@@ -5423,7 +5424,11 @@ function renderTabs() {
     }
     const id = item.id;
     const s = sessions.get(id);
-    if (!s) { bar.appendChild(makePlaceholderTab(id)); continue; }
+    if (!s) {
+      const ph = makePlaceholderTab(id);
+      if (copyGroup !== undefined) ph.dataset.copy = copyGroup ?? "";   // a placeholder copy per group too — flipTabs keys per copy (T264b)
+      bar.appendChild(ph); continue;
+    }
     const tab = el("div", "tab" + (id === activeId ? " active" : ""));
     tab.tabIndex = 0;            // focusable for keyboard nav
     tab.dataset.id = id;
@@ -5555,7 +5560,7 @@ function renderTabs() {
     // double-click a tab to show/hide the ledger overview — same as the strip's caret
     tab.addEventListener("dblclick", (e) => { e.preventDefault(); toggleLedgerCollapsed(); });
     // right-click → context menu; "Rename" edits the title in place (not for a viewer: nothing to rename/hide/end)
-    if (!s.sub) tab.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); showTabMenu(e, id); });
+    if (!s.sub) tab.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); showTabMenu(e, id, tab.dataset.copy); });   // the copy's group rides along (T264b)
     bar.appendChild(tab);
   }
   const add = el("div", "tab tab-add");
@@ -5762,7 +5767,7 @@ function ctxIcon(kind: "feed" | "mail" | "bell" | "bill" | "folder" | "tag" | "p
   return span;
 }
 
-function showTabMenu(e: MouseEvent, id: string) {
+function showTabMenu(e: MouseEvent, id: string, copy?: string) {   // `copy`: the group the right-clicked copy sits in (T264b), a plain string so the menu stays id-keyed
   dismissTabMenu();
   const menu = el("div", "ctx-menu");
   // Rename leads ONE top section with the session controls (the user 2026-08-24: it sat alone and
@@ -5779,7 +5784,7 @@ function showTabMenu(e: MouseEvent, id: string) {
     const l = el("span", "ctx-item-label"); l.textContent = "Rename"; bodyEl.appendChild(l);
     const sb = el("span", "ctx-item-sub"); sb.textContent = "the name is a label — mail, goals and history follow the session"; bodyEl.appendChild(sb);
     rename.appendChild(bodyEl);
-    rename.addEventListener("click", (ev) => { ev.stopPropagation(); dismissTabMenu(); startTabRename(id); });
+    rename.addEventListener("click", (ev) => { ev.stopPropagation(); dismissTabMenu(); startTabRename(id, copy); });
     menu.appendChild(rename);
   }
   // Move to folder… sits with Rename (the user 2026-09-01: a subproject became its own repo and the
@@ -6049,14 +6054,16 @@ function showTabMenu(e: MouseEvent, id: string) {
         }
         const others = unionFor().filter((g) => !g.members.includes(id) && !g.pending);   // a tag being created is not joinable yet
         if (holding().length && others.length) sub.appendChild(el("div", "ctx-sep"));
-        // ONE-CLICK MOVE (tab groups on tags, the user 2026-09-04): a session's section is its HOME
-        // tag — the first holder in tagOrder — so while the strip is sectioned and the session has
-        // one, each other tag's row reads "Move to <name>": one click adds that tag and drops the
-        // home tag, leaving any other tag alone (they filter, they do not section). The row's "+"
-        // adds without moving. With no home tag, "+ <name>" IS the move. A home tag whose create is
-        // still in flight cannot be moved out of (no id to address); the rows read "+ <name>" until
-        // the ack.
-        const home0 = readTabGroups().on ? holding()[0] : undefined;
+        // ONE-CLICK MOVE (tab groups on tags, the user 2026-09-04): while the strip is sectioned, each
+        // other tag's row reads "Move to <name>": one click adds that tag and drops THE GROUP THIS COPY
+        // SITS IN (T264b: a session under several tags has a copy in each group, and the menu opened
+        // from a copy speaks for that copy's group — the copy the user right-clicked is the one that
+        // moves; its other tags are left alone). No copy named (an older caller): the first holder in
+        // tagOrder. The row's "+" adds without moving. With no tag, "+ <name>" IS the move. A tag
+        // whose create is still in flight cannot be moved out of (no id to address); the rows read
+        // "+ <name>" until the ack. Whether "move" between equivalent tags is the right verb at all is
+        // the user's call (flagged with T264b); the mechanics are unchanged here.
+        const home0 = readTabGroups().on ? ((copy !== undefined ? holding().find((g) => g.name === copy) : undefined) ?? holding()[0]) : undefined;
         const home = home0 && !home0.pending ? home0 : undefined;
         for (const g of others) {
           const row = el("div", "ctx-item ctx-item-toggle");
@@ -6067,7 +6074,7 @@ function showTabMenu(e: MouseEvent, id: string) {
             lb.textContent = "Move to " + g.name; bodyE.appendChild(lb);
             row.appendChild(bodyE);
             const plus = el("button", "ctx-tag-x ctx-tag-plus") as HTMLButtonElement;
-            plus.type = "button"; plus.textContent = "+"; plus.title = "add this tag too — the session stays in its current group";
+            plus.type = "button"; plus.textContent = "+"; plus.title = "add this tag too — the session keeps its other tags";
             plus.addEventListener("click", (e2) => { e2.stopPropagation(); editUnion(g, { add: [id] }); build(); sb.textContent = subText(); });
             row.appendChild(plus);
             row.addEventListener("click", (e2) => { e2.stopPropagation(); moveUnion(home, g); build(); sb.textContent = subText(); });
@@ -6225,7 +6232,7 @@ window.addEventListener("blur", () => dismissTabMenu());
 // "Rename" (tab context menu): swap the tab's label for an inline input. Enter
 // or clicking away commits (the host renames the tmux session and confirms with
 // a "renamed" message — the label only changes once that lands), Esc cancels.
-function startTabRename(id: string) {
+function startTabRename(id: string, copy?: string) {   // `copy`: which copy of a multi-tag session to edit in place (T264b); the first one when it is gone
   const s = sessions.get(id);
   if (!s) return;
   // Resolve the tab NOW, by id. The old signature took the nodes captured at menu-open time, and a
@@ -6235,8 +6242,9 @@ function startTabRename(id: string) {
   // attempt always worked, and why committing it healed everything (the user 2026-08-08: "rename only
   // takes on the second try"). A vanished tab (session closed mid-menu) bails out BEFORE the flag.
   const bar = document.getElementById("tabs");
-  const tab = bar && Array.from(bar.children).find(
-    (t): t is HTMLElement => t instanceof HTMLElement && t.dataset.id === id);
+  const tab = bar && (Array.from(bar.children).find(
+    (t): t is HTMLElement => t instanceof HTMLElement && t.dataset.id === id && (copy === undefined || t.dataset.copy === copy))
+    ?? Array.from(bar.children).find((t): t is HTMLElement => t instanceof HTMLElement && t.dataset.id === id));   // the right-clicked copy (T264b), else the first
   const label = tab && tab.querySelector<HTMLElement>(".tab-label");
   if (!tab || !label || tab.querySelector(".tab-rename")) return;
   // A remote session displays as "host:name", where "host:" is METADATA this viewer added (see
@@ -6492,12 +6500,17 @@ window.addEventListener("keydown", (e) => {
 // Nearest tab in the row above (dir<0) or below (dir>0) the given tab, by column.
 function tabInAdjacentRow(id: string, dir: number): string | null {
   const bar = document.getElementById("tabs");
-  const cur = bar?.querySelector(`.tab[data-id="${id}"]`) as HTMLElement | null;
+  // a session under several tags has a tab in each group (T264b): the origin is the FOCUSED copy when
+  // it wears the id — the row the user is looking at — else the first copy
+  const focused = document.activeElement as HTMLElement | null;
+  const cur = focused && focused.classList.contains("tab") && focused.dataset.id === id && bar?.contains(focused)
+    ? focused : bar?.querySelector(`.tab[data-id="${id}"]`) as HTMLElement | null;
   if (!bar || !cur) return null;
   const cr = cur.getBoundingClientRect();
   const cx = cr.left + cr.width / 2;
   let best: { id: string; score: number } | null = null;
   for (const t of Array.from(bar.querySelectorAll(".tab[data-id]")) as HTMLElement[]) {
+    if (t.dataset.id === id) continue;   // never the session's own other copy: setActive would no-op and the key would read dead (T264b)
     const r = t.getBoundingClientRect();
     const vGap = dir < 0 ? cr.top - r.bottom : r.top - cr.bottom; // >0 only if on a row in that direction
     if (vGap < -1) continue;
@@ -6558,7 +6571,7 @@ function openProvisional(req: CreateReq): void {
   pendingNewSession = display;
   const id = mintProvisionalId(Date.now().toString(36) + Math.random().toString(36).slice(2));
   provisionalId = id;
-  provisionalTags = req.tags?.slice() ?? [];   // its future home: the strip sections it there from the first paint
+  provisionalTags = req.tags?.slice() ?? [];   // the strip sections it under each of these from the first paint
   // state "opening", NOT "working": updateStatusline renders the working chip with an elapsed timer off
   // sinceEpoch, and a provisional tab has no honest work clock — the seed showed "Working" + a giant
   // number for however long the first kernel payload took (the user 2026-08-10, who read it as "a random
@@ -15745,18 +15758,28 @@ setupSettings();
     e.preventDefault();
     const dragged = draggedEl && draggedEl.isConnected ? draggedEl : null;   // THIS copy, not the first tab wearing the id (T264b)
     if (!dragged) return;
-    // the neighbours are TABS: a section header or separator beside the dropped tab is skipped, so
-    // a drop at a section's edge still names the nearest tab and its side
-    // …and never the dragged SESSION's own copy in the group next door (T264b): reorderTo against itself
-    // would move nothing, so the neighbour beyond it names the slot instead
+    // the neighbours are TABS IN THE DRAGGED COPY'S OWN GROUP first (T264b): a drop at a group's head
+    // used to anchor on the group above's last tab — a tab whose place in the global order says
+    // nothing about the group dragged in — so the drop landed elsewhere and the session's other copy
+    // jumped. The walk stops at a header or a row break; only a group holding no other tab falls back
+    // to the nearest tab across groups (the flat strip has no edges, so it walks as it always did).
+    // Never the dragged SESSION's own copy: reorderTo against itself would move nothing.
     const own = (n: Element | null) => !!n && (n as HTMLElement).dataset?.id === draggedId;
-    const tabBefore = (n: Element | null) => { while (n && (!(n as HTMLElement).dataset?.id || own(n))) n = n.previousElementSibling; return n as HTMLElement | null; };
-    const tabAfter = (n: Element | null) => { while (n && (!(n as HTMLElement).dataset?.id || own(n))) n = n.nextElementSibling; return n as HTMLElement | null; };
-    const prev = tabBefore(dragged.previousElementSibling);
-    const next = tabAfter(dragged.nextElementSibling);
-    if (prev?.dataset?.id) reorderTo(draggedId, prev.dataset.id, true);
-    else if (next?.dataset?.id) reorderTo(draggedId, next.dataset.id, false);
-    tabDragCommitted = true;   // dragend must not treat this as a cancel (it fires next)
+    const edge = (n: Element) => n.classList.contains("tab-group-head") || n.classList.contains("tab-group-break");
+    const walk = (n: Element | null, step: (x: Element) => Element | null, inGroup: boolean): HTMLElement | null => {
+      while (n && (!(n as HTMLElement).dataset?.id || own(n))) { if (inGroup && edge(n)) return null; n = step(n); }
+      return n as HTMLElement | null;
+    };
+    const back = (x: Element) => x.previousElementSibling, fwd = (x: Element) => x.nextElementSibling;
+    const tabBefore = (n: Element | null) => walk(n, back, true);
+    const tabAfter = (n: Element | null) => walk(n, fwd, true);
+    const prevIn = tabBefore(dragged.previousElementSibling), nextIn = tabAfter(dragged.nextElementSibling);
+    const prev = prevIn ?? (nextIn ? null : walk(dragged.previousElementSibling, back, false));
+    const next = nextIn ?? (prevIn ? null : walk(dragged.nextElementSibling, fwd, false));
+    // committed only when a reorder actually ran: with no neighbour to name the slot (a group holding
+    // only this session's copies) dragend takes the cancel path and FLIPs the copy home
+    if (prev?.dataset?.id) { reorderTo(draggedId, prev.dataset.id, true); tabDragCommitted = true; }
+    else if (next?.dataset?.id) { reorderTo(draggedId, next.dataset.id, false); tabDragCommitted = true; }
   });
 })();
 // right-click a selection in the transcript → Reply (quote it) / Copy
