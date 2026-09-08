@@ -111,7 +111,7 @@ class SpendDetail(unittest.TestCase):
     def test_sessions_are_named_colored_sorted_and_flagged_live(self):
         d = km._spend_detail(now=NOW)
         self.assertEqual(d["host"], "TESTHOST")
-        self.assertEqual(d["hosts"], 1)
+        self.assertEqual([(h["host"], h["status"]) for h in d["hosts"]], [("TESTHOST", "ok")])
         self.assertEqual(d["scope"], "total")
         names = [s["name"] for s in d["sessions"]]
         self.assertEqual(names, ["web", "api", "tests"], "sorted by dollars, largest first")
@@ -191,14 +191,22 @@ class SpendDetail(unittest.TestCase):
         self.assertEqual(by2["web"]["key"], {"usd": 2.0, "tok": 20000, "turns": 2})
         self.assertNotIn("key", by2["api"])
 
-    def test_other_machines_are_counted_so_the_modal_can_say_this_machine_only(self):
-        # the hover's predicate exactly: a remote counts when it reports SPEND windows (review find: a
-        # login-only remote contributes bars, not spend, and must not be named as a machine "in the totals")
-        km._remotes["peer"] = {"host": "peer", "status": "up", "usage": {"apiKey": True, "spend": {"day": {"usd": 1}}}}
+    def test_the_hosts_asked_are_the_hovers_spend_hosts(self):
+        # the hover's predicate exactly: a remote joins when it reports SPEND windows (a login-only
+        # remote contributes bars, not spend, and is not asked); a down one is reported, never omitted
+        km._remotes["peer"] = {"host": "peer", "status": "up", "local_port": 1, "token": "t",
+                               "usage": {"apiKey": True, "spend": {"day": {"usd": 1}}}}
         km._remotes["bars"] = {"host": "bars", "status": "up", "usage": {"fiveHour": {"pct": 5}}}
         km._remotes["down"] = {"host": "down", "status": "down", "usage": {"apiKey": True, "spend": {"day": {"usd": 1}}}}
-        d = km._spend_detail(now=NOW)
-        self.assertEqual(d["hosts"], 2, "one live peer with spend joins the totals; its bySid does not reach us")
+        saved = km._PEER_SPEND_TIMEOUT_S
+        km._PEER_SPEND_TIMEOUT_S = 0.5
+        try:
+            d = km._spend_detail(now=NOW)
+        finally:
+            km._PEER_SPEND_TIMEOUT_S = saved
+        self.assertEqual([h["host"] for h in d["hosts"]], ["TESTHOST", "peer", "down"], "bars has no spend: not asked, not listed")
+        self.assertEqual(d["hosts"][1]["status"], "unreachable", "nothing answers on port 1")
+        self.assertEqual(d["hosts"][2]["status"], "unreachable")
 
     def test_a_login_without_a_key_is_the_computed_scope(self):
         # the rail's THIRD arm: windows present, no key → the rail shows no spend at all; the modal must
@@ -299,6 +307,209 @@ class SpendDetail(unittest.TestCase):
         self.assertEqual(d["unattributed"]["usd"], 0.0, "every key dollar is a session's: nothing unattributed")
         self.assertEqual([s["kind"] for s in d["days"]["stacks"]][-1], "other")
 
+    # ── T247c: every attached kernel's sessions, merged kernel-side ──────────────────────────────
+    def _peer_server(self, payload=None, status=200, token="peer-tok", hang=False, seen=None):
+        """A stand-in peer kernel: /spend/detail behind the peer's own serve token (the transport
+        mirror_trust uses), answering `payload` — or, for an older build, the real kernel's unknown-route
+        answer (a plain-text 404 "not found"), or never (hang). `seen` collects the paths it was asked."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        body = json.dumps(payload or {}).encode()
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if seen is not None:
+                    seen.append(self.path)
+                if self.headers.get("X-Romp-Token") != token:
+                    self.send_response(401); self.end_headers(); return
+                if hang:
+                    time.sleep(5); return
+                if status == 404 or self.path.split("?")[0] != "/spend/detail":
+                    nf = b"not found"
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(nf)))
+                    self.end_headers()
+                    self.wfile.write(nf)
+                    return
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def _attach(self, host, port, token="peer-tok", status="up"):
+        km._remotes[host] = {"host": host, "status": status, "local_port": port, "token": token,
+                             "usage": {"apiKey": True, "spend": {"day": {"usd": 1}}}}
+
+    def _peer_payload(self, off_min, epochs=True):
+        """A peer's own /spend/detail, three hours east of us: the same absolute hours, LOCAL keys that
+        read three hours later, and one session of its own (plus a pre-attribution hour)."""
+        local = km._spend_detail_local(now=NOW)
+        keys, eps = local["hours"]["keys"], local["hours"]["epochs"]
+        pk = [time.strftime("%Y-%m-%dT%H", time.gmtime(e * 3600 + off_min * 60)) for e in eps]
+        n = len(keys)
+        usd = [0.0] * n; tok = [0] * n
+        i5 = n - 1 - 5
+        usd[i5] = 7.0; tok[i5] = 70000
+        una = [0.0] * n; una[n - 1 - 9] = 2.0
+        pd = {"host": "PEERHOST", "scope": "total", "tz": "PEER", "tzOffsetMin": off_min, "topN": 10,
+              "sessions": [{"sid": "22222222-3333-4444-5555-000000000001", "name": "worker", "bg": "#C2410C", "fg": "#fff",
+                            "live": True, "usd": 300.0, "tok": 3000000, "turns": 30}],
+              "unattributed": {"usd": 2.0, "tok": 0, "turns": 1},
+              "hours": {"keys": pk, "stacks": [
+                  {"kind": "sid", "sid": "22222222-3333-4444-5555-000000000001", "name": "worker", "bg": "#C2410C", "live": True, "usd": usd, "tok": tok},
+                  {"kind": "unattributed", "name": "unattributed", "usd": una, "tok": [0] * n}]},
+              "days": {"keys": local["days"]["keys"], "stacks": [
+                  {"kind": "sid", "sid": "22222222-3333-4444-5555-000000000001", "name": "worker", "bg": "#C2410C", "live": True,
+                   "usd": [0.0] * 89 + [300.0], "tok": [0] * 89 + [3000000]}]}}
+        if epochs:
+            pd["hours"]["epochs"] = eps
+        return pd
+
+    def test_a_peers_sessions_merge_in_with_their_host_and_hours_align_by_absolute_time(self):
+        off = int((time.localtime(NOW).tm_gmtoff or 0) // 60) + 180
+        self._attach("PEERHOST", self._peer_server(self._peer_payload(off)))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual([h["host"] for h in d["hosts"]], ["TESTHOST", "PEERHOST"])
+        self.assertEqual([h["status"] for h in d["hosts"]], ["ok", "ok"])
+        names = [(s["host"], s["name"]) for s in d["sessions"]]
+        self.assertEqual(names[0], ("TESTHOST", "web"))
+        self.assertIn(("PEERHOST", "worker"), names, "the peer's session is a row, tagged with its host")
+        self.assertEqual(names[1], ("PEERHOST", "worker"), "sorted by dollars across hosts: 300 sits between web's 960 and api's 240")
+        hk = d["hours"]["keys"]
+        worker = [s for s in d["hours"]["stacks"] if s.get("name") == "worker"][0]
+        self.assertEqual(worker["host"], "PEERHOST")
+        self.assertAlmostEqual(worker["usd"][len(hk) - 1 - 5], 7.0, places=3,
+                               msg="the peer's hour lands on the same ABSOLUTE hour, though its local key reads three hours later")
+        self.assertEqual(sum(1 for v in worker["usd"] if v), 1)
+        una = [s for s in d["hours"]["stacks"] if s["kind"] == "unattributed"][0]
+        self.assertAlmostEqual(una["usd"][len(hk) - 1 - 9], 2.0, places=3, msg="the peer's pre-attribution hour joins the one unattributed stack")
+        self.assertAlmostEqual(una["hosts"]["PEERHOST"]["usd"][len(hk) - 1 - 9], 2.0, places=3, msg="…with its host named for the tooltip")
+        self.assertAlmostEqual(d["unattributed"]["byHost"]["PEERHOST"]["usd"], 2.0, places=3)
+        self.assertAlmostEqual(d["unattributed"]["usd"], 86.0 + 2.0, places=3)
+        dk = d["days"]["keys"]
+        wd = [s for s in d["days"]["stacks"] if s.get("name") == "worker"][0]
+        self.assertAlmostEqual(wd["usd"][len(dk) - 1], 300.0, places=3, msg="daily buckets align by each machine's own date")
+
+    def test_a_peer_is_asked_for_its_local_half_only_and_the_route_serves_it(self):
+        # review find: the route served the MERGED payload to a peer too, so two kernels attached to each
+        # other asked each other back until the socket timeouts unwound hundreds of nested requests, and
+        # the healthy peer read as timed out. The ask carries ?local=1 and the route never fans out for it.
+        seen = []
+        self._attach("PEERHOST", self._peer_server(self._peer_payload(0), seen=seen))
+        km._spend_detail(now=NOW)
+        self.assertEqual(seen, ["/spend/detail?local=1"], "the peer is asked for its own half, nothing more")
+        ksrc = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
+        self.assertIn('if (q.get("local") or [""])[0]:\n                    return self._send(200, json.dumps(_spend_detail_local())', ksrc,
+                      "a peer's ask is served the local reader — the fan-out never runs on a peer's behalf")
+
+    def test_a_merged_shaped_answer_from_a_peer_counts_only_its_own_rows(self):
+        # review find: a peer answering with a MERGED payload (a third host it reaches, or us) had every
+        # row re-tagged as the peer's, doubling a host reachable both ways and our own sessions
+        pd = self._peer_payload(0)
+        pd["hosts"] = [{"host": "PEERHOST", "status": "ok"}, {"host": "TESTHOST", "status": "ok"}, {"host": "THIRDHOST", "status": "ok"}]
+        pd["sessions"][0]["host"] = "PEERHOST"
+        pd["sessions"] += [{"sid": WEB, "name": "web", "host": "TESTHOST", "bg": "#1EA1EB", "fg": "#fff", "live": True, "usd": 960.0, "tok": 1, "turns": 1},
+                           {"sid": "22222222-3333-4444-5555-000000000009", "name": "builder", "host": "THIRDHOST", "bg": "", "fg": "", "live": True, "usd": 50.0, "tok": 1, "turns": 1}]
+        for st in pd["hours"]["stacks"] + pd["days"]["stacks"]:
+            if st["kind"] == "sid":
+                st["host"] = "PEERHOST"
+        pd["days"]["stacks"].append({"kind": "sid", "sid": WEB, "name": "web", "host": "TESTHOST", "bg": "#1EA1EB", "live": True,
+                                     "usd": [0.0] * 89 + [960.0], "tok": [0] * 90})
+        self._attach("PEERHOST", self._peer_server(pd))
+        d = km._spend_detail(now=NOW)
+        rows = [(s["host"], s["name"]) for s in d["sessions"]]
+        self.assertEqual(rows.count(("TESTHOST", "web")), 1, "our own session arrives once, as ours")
+        self.assertNotIn(("PEERHOST", "web"), rows)
+        self.assertNotIn(("PEERHOST", "builder"), rows, "a third host's row is not the peer's")
+        self.assertEqual([s for s in d["days"]["stacks"] if s.get("name") == "web"][0]["host"], "TESTHOST")
+
+    def test_a_peers_bucket_beyond_our_axis_extends_it_instead_of_vanishing(self):
+        # review find: a peer east of us has a "today" our 90-day axis lacks, and a peer whose hour ticked
+        # over after ours ships an epoch beyond our newest — both were dropped without a trace
+        pd = self._peer_payload(0)
+        import datetime as _dt
+        tomorrow = (_dt.date.fromisoformat(pd["days"]["keys"][-1]) + _dt.timedelta(days=1)).isoformat()
+        pd["days"]["keys"] = pd["days"]["keys"][1:] + [tomorrow]
+        pd["days"]["stacks"][0]["usd"] = [0.0] * 89 + [300.0]
+        last_e = pd["hours"]["epochs"][-1]
+        pd["hours"]["epochs"] = pd["hours"]["epochs"][1:] + [last_e + 1]
+        pd["hours"]["keys"] = pd["hours"]["keys"][1:] + [time.strftime("%Y-%m-%dT%H", time.gmtime((last_e + 1) * 3600))]
+        n = len(pd["hours"]["keys"])
+        pd["hours"]["stacks"][0]["usd"] = [0.0] * (n - 1) + [7.0]
+        self._attach("PEERHOST", self._peer_server(pd))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual(d["days"]["keys"][-1], tomorrow, "the peer's day joins the axis")
+        wd = [s for s in d["days"]["stacks"] if s.get("name") == "worker"][0]
+        self.assertAlmostEqual(wd["usd"][-1], 300.0, places=3)
+        self.assertEqual(d["hours"]["epochs"][-1], last_e + 1, "the peer's newest hour joins the axis")
+        wh = [s for s in d["hours"]["stacks"] if s.get("name") == "worker"][0]
+        self.assertAlmostEqual(wh["usd"][-1], 7.0, places=3)
+        self.assertEqual(len(d["hours"]["keys"]), len(d["hours"]["epochs"]))
+
+    def test_the_merged_other_count_names_contributors_in_that_range_only(self):
+        # review find: the merged "other (N sessions)" counted every non-top session from the roster,
+        # whatever it spent in the range — the single-host reader counts contributors only
+        write_ledger(km.jd.STATE, extra_sids=12)
+        led = json.loads((km.jd.STATE / "spend.json").read_text())
+        sid = "11111111-2222-3333-4444-000000000111"   # the last extra: outside the merged top ten
+        led["hours"][_hour(3)]["bySid"][sid] = {"usd": 0.2, "turns": 1, "tok": 200}
+        led["hours"][_hour(3)]["usd"] += 0.2
+        led["hours"][_hour(3)]["tokIn"] += 200
+        (km.jd.STATE / "spend.json").write_text(json.dumps(led))
+        self._attach("PEERHOST", self._peer_server(self._peer_payload(0)))
+        d = km._spend_detail(now=NOW)
+        other_h = [s for s in d["hours"]["stacks"] if s["kind"] == "other"]
+        self.assertEqual(len(other_h), 1)
+        self.assertEqual(other_h[0]["count"], 1, "one non-top session spent in the hourly range")
+        other_d = [s for s in d["days"]["stacks"] if s["kind"] == "other"][0]
+        self.assertEqual(other_d["count"], 16 - 10, "every non-top session spent in the daily range")
+
+    def test_an_older_peer_without_epochs_still_aligns_through_its_offset(self):
+        off = int((time.localtime(NOW).tm_gmtoff or 0) // 60) + 180
+        self._attach("PEERHOST", self._peer_server(self._peer_payload(off, epochs=False)))
+        d = km._spend_detail(now=NOW)
+        hk = d["hours"]["keys"]
+        worker = [s for s in d["hours"]["stacks"] if s.get("name") == "worker"][0]
+        self.assertAlmostEqual(worker["usd"][len(hk) - 1 - 5], 7.0, places=3, msg="local keys converted with the peer's offset, never string-equal")
+
+    def test_a_down_an_older_and_a_hanging_peer_are_reported_by_name_never_omitted(self):
+        self._attach("DOWNHOST", 1, status="down")
+        self._attach("OLDHOST", self._peer_server(status=404))
+        self._attach("SLOWHOST", self._peer_server(hang=True))
+        self._attach("PEERHOST", self._peer_server(self._peer_payload(int((time.localtime(NOW).tm_gmtoff or 0) // 60))))
+        saved = km._PEER_SPEND_TIMEOUT_S
+        km._PEER_SPEND_TIMEOUT_S = 0.6
+        try:
+            t0 = time.time()
+            d = km._spend_detail(now=NOW)
+            took = time.time() - t0
+        finally:
+            km._PEER_SPEND_TIMEOUT_S = saved
+        by = {h["host"]: h for h in d["hosts"]}
+        self.assertEqual(by["DOWNHOST"]["status"], "unreachable")
+        self.assertEqual(by["OLDHOST"]["status"], "older", "no /spend/detail route: an older build, said so by name")
+        self.assertEqual(by["SLOWHOST"]["status"], "unreachable", "past the bounded timeout: reported, and the rest renders")
+        self.assertIn("timed out", by["SLOWHOST"]["detail"])
+        self.assertEqual(by["PEERHOST"]["status"], "ok", "a slow host holds nobody hostage")
+        self.assertIn(("PEERHOST", "worker"), [(s["host"], s["name"]) for s in d["sessions"]])
+        self.assertLess(took, 3.0, "the peer calls run in parallel under one bounded timeout")
+
+    def test_a_peer_that_rejects_our_token_is_unreachable_by_name(self):
+        self._attach("PEERHOST", self._peer_server(self._peer_payload(0)), token="wrong")
+        d = km._spend_detail(now=NOW)
+        by = {h["host"]: h for h in d["hosts"]}
+        self.assertEqual(by["PEERHOST"]["status"], "unreachable")
+
     def test_the_route_and_the_shell_are_wired(self):
         ksrc = inspect.getsource(km.Handler.do_GET) if hasattr(km.Handler, "do_GET") else open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
         self.assertIn('if p == "/spend/detail":', ksrc, "the kernel route exists")
@@ -315,7 +526,10 @@ class SpendDetail(unittest.TestCase):
         self.assertNotIn("__ROMP_LOADER__", html.split("_LANDING_JS")[0] if "_LANDING_JS" in html else html,
                          "the loader markup is spliced, not left as a placeholder")
         self.assertIn("rl-word", html)
-        self.assertIn("this machine only", html)
+        self.assertNotIn("this machine only", html, "T247c: every attached kernel's sessions are in — no such note")
+        self.assertIn("not reachable", html)
+        self.assertIn("older build", html)
+        self.assertIn("aligned by clock time across machines", html)
         self.assertIn("recorded before per-session tracking", html, "unattributed spend is named, never folded")
         self.assertIn("var rows=spendRowsHTML(LAST||[]);", html, "the modal's window numbers are the hover's own renderer")
         self.assertIn("function fleetSpendHTML(sets){", html, "…whose signature the other suites pin, untouched")

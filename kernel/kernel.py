@@ -32416,8 +32416,11 @@ def _spend_scope():
     #                     ledger's figures are computed costs nobody is billed — the modal says so (review find)
 
 
-def _spend_detail(now=None):
-    """GET /spend/detail — the usage modal's per-SESSION story (T247, the user 2026-09-07, who wanted
+_PEER_SPEND_TIMEOUT_S = 6.0   # one bounded wait for every attached kernel's /spend/detail, asked in parallel
+
+
+def _spend_detail_local(now=None):
+    """THIS kernel's half of GET /spend/detail — the usage modal's per-SESSION story (T247, the user 2026-09-07, who wanted
     to click the usage readout and see how much each session used, with a stacked histogram colored
     by session). Read from spend.json's bySid maps (T100's per-session attribution) — the ledger, never
     a transcript recount — with names and identity colors resolved HERE from the names registry
@@ -32556,25 +32559,256 @@ def _spend_detail(now=None):
         return {"keys": keys, "stacks": stacks}
 
     h0 = int(now // 3600) - (_SERIES_HOURS - 1)
-    hour_keys = []
+    hour_keys, epochs = [], []
     for i in range(_SERIES_HOURS):
         # the recorder keys by local hour, so a fall-back transition writes two epoch hours under ONE
-        # key: one slot for it here too, not a labeled empty twin (review find)
+        # key: one slot for it here too, not a labeled empty twin (review find). Each key also carries
+        # its ABSOLUTE hour (T247c): a peer in another zone merges by that, never by the key's spelling.
         k = time.strftime("%Y-%m-%dT%H", time.localtime((h0 + i) * 3600))
         if not hour_keys or hour_keys[-1] != k:
             hour_keys.append(k)
-    with _remotes_lock:
-        # the machines the hover's spend totals include: the same predicate as its rows — a remote
-        # that reports spend windows — never any remote with a usage payload (review find)
-        up = sum(1 for r in _remotes.values()
-                 if r.get("status") == "up" and isinstance((r.get("usage") or {}).get("spend"), dict))
+            epochs.append(h0 + i)
     lt = time.localtime(now)
-    return {"host": _self_host(), "hosts": 1 + up, "scope": scope,
+    hrs = _series(hours, hour_keys)
+    hrs["epochs"] = epochs
+    return {"host": _self_host(), "scope": scope,
             "tz": time.strftime("%Z", lt), "tzOffsetMin": int((getattr(lt, "tm_gmtoff", 0) or 0) // 60),
             "recordedAt": _spend_recorded_at(),
             "topN": _DETAIL_TOP_N, "sessions": sessions,
             "unattributed": {"usd": round(un[0], 4), "tok": un[1], "turns": un[2]},
-            "hours": _series(hours, hour_keys), "days": _series(days, day_keys)}
+            "hours": hrs, "days": _series(days, day_keys)}
+
+
+def _epoch_of_local_hour(key, off_min):
+    """The absolute epoch-hour of a peer's LOCAL hour key, given the offset (minutes east of UTC) that
+    peer reported — the fallback for a peer whose build ships keys without epochs."""
+    try:
+        import calendar
+        return int((calendar.timegm(time.strptime(key, "%Y-%m-%dT%H")) - int(off_min) * 60) // 3600)
+    except Exception:
+        return None
+
+
+def _peer_spend_call(row, timeout):
+    """GET /spend/detail?local=1 on an attached kernel — mirror_trust's transport (the tunnel's local
+    forward, THAT machine's serve token), asking for the peer's LOCAL half only: the route never fans out
+    when serving a peer, so a mutual attachment (the ordinary pairing: an ssh attach one way and the
+    check-in row the other) cannot recurse (review find: one modal open ping-ponged between two kernels
+    until the socket timeouts unwound it, hundreds of nested requests deep, and the healthy peer read as
+    timed out). Tolerant of a NON-JSON body: an older kernel's unknown-route answer is a plain-text 404,
+    which the shared transport reports as a parse error — here it is (404, None, None), so the caller can
+    say "older build" rather than "not reachable" (review find). Returns (status, json_or_None, err)."""
+    host = row.get("host") or "?"
+    port, tok = row.get("local_port") or 0, row.get("token") or ""
+    if not port or not tok:
+        return None, None, "no admin path to '%s' (missing forward or token)" % host
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=timeout)
+        conn.request("GET", "/spend/detail?local=1", None, {"X-Romp-Token": tok})
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        try:
+            j = json.loads(data.decode() or "null")
+        except Exception:
+            j = None
+        return resp.status, j, None
+    except Exception as e:
+        return None, None, "could not reach %s's kernel: %s" % (host, e)
+
+
+def _spend_detail(now=None):
+    """GET /spend/detail — EVERY attached kernel's sessions, merged here (T247c, the user 2026-09-08:
+    the per-session breakdown covered this machine only, and the federated kernels' sessions matter).
+    Each kernel owns its spend.json and resolves its own names and colors, so a host's story comes
+    from THAT host's kernel: for every attached host the hover's spend totals include (the same
+    predicate as its rows — a remote reporting spend windows) this kernel calls its /spend/detail over
+    the tunnel with that machine's serve token (mirror_trust's transport, asking for that kernel's LOCAL
+    half so nothing recurses), all in parallel under one bounded timeout, and merges by host. A host that is down, that times out, that refuses the token,
+    or whose older build lacks the route is REPORTED in `hosts` by name and status — never omitted
+    (fail loudly) — and the rest renders. Hours align by ABSOLUTE time (each host's epochs, or its
+    offset for an older peer), never by the spelling of local-hour keys; days align by each machine's
+    own calendar date. Sessions and stacks carry their host; the top-N is taken across hosts; per-host
+    unattributed folds into one stack with a per-host breakdown for the tooltip."""
+    now = time.time() if now is None else now
+    local = _spend_detail_local(now)
+    me = local["host"]
+    with _remotes_lock:
+        peers = [dict(r) for r in _remotes.values()
+                 if isinstance((r.get("usage") or {}).get("spend"), dict)]
+    results = {}
+    threads = []
+    for r in peers:
+        if r.get("status") != "up":
+            results[r["host"]] = (None, None, "not connected")
+            continue
+
+        def _ask(row=r):
+            results[row["host"]] = _peer_spend_call(row, _PEER_SPEND_TIMEOUT_S)
+        t = threading.Thread(target=_ask, daemon=True)
+        t.start()
+        threads.append(t)
+    deadline = time.time() + _PEER_SPEND_TIMEOUT_S + 0.5
+    for t in threads:
+        t.join(max(0.0, deadline - time.time()))
+    hosts = [{"host": me, "status": "ok", "scope": local["scope"], "tz": local["tz"], "tzOffsetMin": local["tzOffsetMin"]}]
+    payloads = [(me, local)]
+    for r in peers:
+        host = r["host"]
+        got = results.get(host)
+        if got is None:
+            hosts.append({"host": host, "status": "unreachable", "detail": "timed out after %d s" % int(_PEER_SPEND_TIMEOUT_S)})
+            continue
+        st, j, err = got
+        if err or st is None:
+            hosts.append({"host": host, "status": "unreachable", "detail": str(err or "no answer")})
+        elif st == 401 or st == 403:
+            hosts.append({"host": host, "status": "unreachable", "detail": "its kernel refused our token (HTTP %s)" % st})
+        elif st != 200 or not isinstance(j, dict) or "sessions" not in j:
+            hosts.append({"host": host, "status": "older", "detail": "HTTP %s" % st})   # the modal says what "older" means
+        else:
+            hosts.append({"host": host, "status": "ok", "scope": j.get("scope"), "tz": j.get("tz"), "tzOffsetMin": j.get("tzOffsetMin")})
+            payloads.append((host, j))
+    if len(payloads) == 1:
+        out = dict(local)
+        out["hosts"] = hosts
+        return out
+    return _merge_spend_details(payloads, hosts, local)
+
+
+def _merge_spend_details(payloads, hosts, local):
+    """Fold every host's /spend/detail into one payload on the LOCAL kernel's axes (see _spend_detail)."""
+    def _own(host, p, item):
+        """A peer's payload is its LOCAL half by request; should a build ever answer with a MERGED
+        payload anyway, only the rows it tagged as its own count here — a third host reachable both
+        ways would otherwise arrive twice under two names (review find)."""
+        tag = item.get("host") if isinstance(item, dict) else None
+        return not tag or tag == host or tag == p.get("host")
+
+    sessions = []
+    for host, p in payloads:
+        for s in p.get("sessions") or []:
+            if isinstance(s, dict) and _own(host, p, s):
+                row = dict(s)
+                row["host"] = host
+                sessions.append(row)
+    sessions.sort(key=lambda s: (-float(s.get("usd") or 0), -int(s.get("tok") or 0), str(s.get("name") or "")))
+    top_n = int(local.get("topN") or _DETAIL_TOP_N)
+    top = [(s["host"], s["sid"]) for s in sessions[:top_n]]
+    top_set = set(top)
+    meta = {(s["host"], s["sid"]): s for s in sessions}
+    un = {"usd": 0.0, "tok": 0, "turns": 0, "byHost": {}}
+    for host, p in payloads:
+        u = p.get("unattributed") if isinstance(p.get("unattributed"), dict) else {}
+        hu = {"usd": round(float(u.get("usd") or 0), 4), "tok": int(u.get("tok") or 0), "turns": int(u.get("turns") or 0)}
+        if hu["usd"] or hu["tok"] or hu["turns"]:
+            un["byHost"][host] = hu
+        un["usd"] = round(un["usd"] + hu["usd"], 4); un["tok"] += hu["tok"]; un["turns"] += hu["turns"]
+
+    def _merge_range(name):
+        axis = local.get(name) or {}
+        keys = list(axis.get("keys") or [])
+        epochs = list(axis.get("epochs") or []) if name == "hours" else []
+        # each peer's axis in OUR terms: epochs for hours (its own, or through its offset for an older
+        # build that ships none), the date string for days
+        peer_axes = []
+        for host, p in payloads:
+            rng = p.get(name) if isinstance(p.get(name), dict) else {}
+            pkeys = list(rng.get("keys") or [])
+            if name == "hours":
+                peps = rng.get("epochs")
+                if not (isinstance(peps, list) and len(peps) == len(pkeys)):
+                    off = next((h.get("tzOffsetMin") for h in hosts if h["host"] == host), None) or 0
+                    peps = [_epoch_of_local_hour(k, off) for k in pkeys]
+                peer_axes.append((host, p, rng, peps))
+            else:
+                peer_axes.append((host, p, rng, pkeys))
+        # a peer's bucket BEYOND our newest — its current hour after ours ticked over, or its "today"
+        # east of our date line — extends the axis rather than vanishing (review find: the peer's
+        # freshest spend, the one most likely to hold money, was dropped without a trace); bounded
+        # so a wild clock cannot stretch the chart
+        last = (epochs[-1] if epochs else None) if name == "hours" else (keys[-1] if keys else None)
+        beyond = set()
+        for _h, _p, _r, ax in peer_axes:
+            for a in ax:
+                if a is not None and last is not None and a > last:
+                    beyond.add(a)
+        cap = 24 if name == "hours" else 7
+        for a in sorted(beyond)[:cap]:
+            if name == "hours":
+                epochs.append(a)
+                keys.append(time.strftime("%Y-%m-%dT%H", time.localtime(a * 3600)))
+            else:
+                keys.append(a)
+        n = len(keys)
+        pos = {e: i for i, e in enumerate(epochs)} if name == "hours" else {k: i for i, k in enumerate(keys)}
+        per = {}           # (host, sid) -> [usd[], tok[]]
+        other = ([0.0] * n, [0] * n)
+        other_count = 0    # "other (N sessions)" counts CONTRIBUTORS in this range only, like the local reader:
+        #                    each payload's own fold plus the top-N sessions of its own the merge folded
+        una = ([0.0] * n, [0] * n)
+        una_hosts = {}
+        for host, p, rng, ax in peer_axes:
+            idx = [pos.get(a) for a in ax]
+            for s in rng.get("stacks") or []:
+                if not isinstance(s, dict) or not _own(host, p, s):
+                    continue
+                usd, tok = s.get("usd") or [], s.get("tok") or []
+                kind = s.get("kind")
+                if kind == "sid":
+                    key = (host, str(s.get("sid") or ""))
+                    if key in top_set:
+                        dst = per.setdefault(key, ([0.0] * n, [0] * n))
+                    else:
+                        dst = other
+                        if any(usd) or any(tok):
+                            other_count += 1
+                elif kind == "other":
+                    dst = other
+                    other_count += int(s.get("count") or 0)
+                elif kind == "unattributed":
+                    dst = una
+                    hu = una_hosts.setdefault(host, ([0.0] * n, [0] * n))
+                    # a merged-shaped answer breaks its unattributed stack down by host: take the peer's own share
+                    if isinstance(s.get("hosts"), dict) and isinstance(s["hosts"].get(p.get("host") or host), dict):
+                        own = s["hosts"][p.get("host") or host]
+                        usd, tok = own.get("usd") or [], own.get("tok") or []
+                else:
+                    continue
+                for j, i in enumerate(idx):
+                    if i is None or j >= len(usd):
+                        continue
+                    v = float(usd[j] or 0); t = int((tok[j] if j < len(tok) else 0) or 0)
+                    dst[0][i] += v; dst[1][i] += t
+                    if kind == "unattributed":
+                        hu[0][i] += v; hu[1][i] += t
+        stacks = []
+        for key in top:
+            arr = per.get(key)
+            if not arr:
+                continue
+            u = [round(v, 4) for v in arr[0]]
+            if not (any(u) or any(arr[1])):
+                continue
+            m = meta[key]
+            stacks.append({"kind": "sid", "host": key[0], "sid": key[1], "name": m.get("name") or "", "bg": m.get("bg") or "",
+                           "live": bool(m.get("live")), "usd": u, "tok": arr[1]})
+        ou = [round(v, 4) for v in other[0]]
+        if any(ou) or any(other[1]):
+            stacks.append({"kind": "other", "name": "other", "count": other_count, "usd": ou, "tok": other[1]})
+        uu = [round(v, 4) for v in una[0]]
+        if any(uu) or any(una[1]):
+            stacks.append({"kind": "unattributed", "name": "unattributed", "usd": uu, "tok": una[1],
+                           "hosts": {h: {"usd": [round(v, 4) for v in a[0]], "tok": a[1]} for h, a in una_hosts.items()}})
+        out = {"keys": keys, "stacks": stacks}
+        if name == "hours":
+            out["epochs"] = epochs
+        return out
+
+    out = dict(local)
+    out.update({"hosts": hosts, "sessions": sessions, "unattributed": un,
+                "hours": _merge_range("hours"), "days": _merge_range("days")})
+    return out
 
 
 def _spend_windows(keyed_only=False):
@@ -40668,8 +40902,14 @@ var spBack=document.getElementById('rsp-back'),spPanel=document.getElementById('
 var SP={data:null,err:'',range:'hours',measure:'usd',open:false,allRows:false};
 var SP_OTHER='#4a5361',SP_NONE='#6b7a8c';   // "other" and a session with no identity color: neutrals, never a hue
 function spName(s){return s.name||('session '+String(s.sid||'').slice(0,8));}
+// T247c: when more than one machine contributes, a row or chip names its host the way a federated
+// session's tab does — the shared .host-prefix treatment (quiet, italic, a step smaller)
+function spHosts(d){return ((d&&d.hosts)||[]).filter(function(h){return h.status==='ok';});}
+function spMany(d){return spHosts(d).length>1;}
+function spLabel(s,many){return (many&&s.host?'<span class=host-prefix>'+esc(s.host)+':</span> ':'')+esc(spName(s));}
 function spColor(s){return (s.bg&&/^#[0-9a-fA-F]{3,8}$/.test(s.bg))?s.bg:SP_NONE;}
-function spHead(){return '<div class=rsp-top><span>'+(SP.data&&SP.data.scope==='computed'?'Spend (computed)':'API spend')+(SP.data&&SP.data.host?' \u00b7 '+esc(SP.data.host):'')+'</span>'
+function spHead(){var d=SP.data,ok=d?spHosts(d):[];return '<div class=rsp-top><span>'+(d&&d.scope==='computed'?'Spend (computed)':'API spend')
++(ok.length>1?' \u00b7 '+ok.length+' machines':(d&&d.host?' \u00b7 '+esc(d.host):''))+'</span>'
 +'<button class=rsp-x data-act=close aria-label=Close>\u00d7</button></div>';}
 var spPending=null;   // the in-flight detail fetch's controller: a close or a re-open aborts it
 function openSpend(){if(!spBack||!spPanel)return;SP.open=true;spBack.hidden=false;SP.data=null;SP.err='';SP.allRows=false;
@@ -40718,9 +40958,9 @@ var h='<table class=rsp-tbl><thead><tr><th></th><th>session</th><th class=n>doll
 +'<th class=n>turns</th><th class=n>tokens</th></tr></thead><tbody>';
 // the table folds to the histogram's own top-N (progressive disclosure: the chart stays in view under
 // a long roster); one click shows every session
-var lim=(SP.allRows||ss.length<=(d.topN||10)+2)?ss.length:(d.topN||10),shown=ss.slice(0,lim);
+var lim=(SP.allRows||ss.length<=(d.topN||10)+2)?ss.length:(d.topN||10),shown=ss.slice(0,lim),many=spMany(d);
 shown.forEach(function(s){h+='<tr'+(s.live?'':' class=rsp-dead')+'><td><i class=rsp-sw style="background:'+spColor(s)+'"></i></td>'
-+'<td class=rsp-name>'+esc(spName(s))+(s.live?'':'<span class=ru-tip-reset> \u00b7 not running</span>')+'</td>'
++'<td class=rsp-name>'+spLabel(s,many)+(s.live?'':'<span class=ru-tip-reset> \u00b7 not running</span>')+'</td>'
 +'<td class=n>'+fmtUsd(s.usd)+'</td>'+(keyCol?'<td class=n>'+(s.key?fmtUsd(s.key.usd):'\u2014')+'</td>':'')
 +'<td class=n>'+(s.turns||0)+'</td><td class=n>'+fmtTok(s.tok||0)+'</td></tr>';});
 if(lim<ss.length){var rest=ss.slice(lim),ru=0,rt=0,rn=0;rest.forEach(function(s){ru+=s.usd||0;rt+=s.tok||0;rn+=s.turns||0;});
@@ -40746,11 +40986,16 @@ if(!d){h+='<div class=rsp-err>Couldn\u2019t load the spend detail'+(SP.err?': '+
 +'<button class=rsp-btn data-act=retry>Try again</button></div>';spPanel.innerHTML=h;return;}
 var computed=d.scope==='computed';
 h+='<div class=rsp-sec id=rsp-totals>'+totalsHTML(d)+'</div>';
-// 2. per session — THIS machine's ledger; when other machines join the totals above, say so
-var many=(d.hosts||1)>1;
-h+='<div class=rsp-sec><div class=ru-tip-name><span>By session'+(many?' \u00b7 this machine only':'')+'</span>'
-+'<span class=ru-tip-reset>'+(d.scope==='keyed'?'key-billed turns':computed?'computed cost, not billed':'all turns')+' \u00b7 last '+((d.days&&d.days.keys)?d.days.keys.length:90)+' days</span></div>';
-if(many)h+='<div class=rsp-note>Per-session detail covers '+esc(d.host||'this machine')+' only; the other '+(d.hosts-1)+' machine'+(d.hosts>2?'s':'')+' in the totals above do not share theirs yet.</div>';
+// 2. per session — EVERY attached kernel's sessions (T247c), each machine's own story merged here;
+// the billing rule is named when every contributing machine shares one, else each keeps its own
+var ok=spHosts(d),many=ok.length>1;
+var scopes={};ok.forEach(function(x){scopes[x.scope||d.scope]=1;});var sk=Object.keys(scopes);
+var rule=sk.length===1?(sk[0]==='keyed'?'key-billed turns':sk[0]==='computed'?'computed cost, not billed':'all turns'):'each machine\u2019s own billing rule';
+h+='<div class=rsp-sec><div class=ru-tip-name><span>By session'+(many?' \u00b7 '+ok.length+' machines':'')+'</span>'
++'<span class=ru-tip-reset>'+rule+' \u00b7 last '+((d.days&&d.days.keys)?d.days.keys.length:90)+' days</span></div>';
+// a machine that could not join is NAMED, never silently missing: down, timed out, refused, or too old
+((d.hosts)||[]).forEach(function(x){if(x.status==='ok')return;
+h+='<div class=rsp-note>'+esc(x.host)+': '+(x.status==='older'?'older build, no per-session data':'not reachable')+(x.detail?' \u2014 '+esc(x.detail):'')+'</div>';});
 h+='<div id=rsp-table>'+sessionTable(d)+'</div></div>';
 // 3. the histogram — the two ranges the ledger itself holds; dollars by default, tokens on a toggle
 h+='<div class=rsp-sec><div class=ru-tip-name><span>Spend over time</span></div>'
@@ -40766,6 +41011,12 @@ spPanel.innerHTML=h;renderChart();}
 function niceTop(mx){if(!(mx>0))return 1;var p=Math.pow(10,Math.floor(Math.log(mx)/Math.LN10)),f=mx/p;return (f<=1?1:f<=2?2:f<=5?5:10)*p;}
 function spFill(s){return s.kind==='unattributed'?'url(#rsp-hatch)':s.kind==='other'?SP_OTHER:spColor(s);}
 function spStackName(s){return s.kind==='other'?('other ('+(s.count||0)+' session'+(s.count===1?'':'s')+')'):s.kind==='unattributed'?'unattributed':spName(s);}
+// the plain-text form for the tooltip: host · name when more than one machine contributes; the
+// unattributed stack names each machine's share of the hovered bucket
+function spStackText(s,many,meas,i){if(s.kind==='sid')return (many&&s.host?s.host+' \u00b7 ':'')+spName(s);
+if(s.kind==='unattributed'&&many&&s.hosts){var parts=[];Object.keys(s.hosts).forEach(function(hn){var v=(s.hosts[hn][meas]||[])[i]||0;if(v>0)parts.push(hn+' '+(meas==='usd'?fmtUsd(v):fmtTok(Math.round(v))));});
+return 'unattributed'+(parts.length?' ('+parts.join(', ')+')':'');}
+return spStackName(s);}
 function spTipShow(x,y,name,val,sub){if(!spTip){spTip=document.createElement('div');spTip.id='rsp-tip';document.body.appendChild(spTip);}
 // values lead, labels follow; built with textContent — a session name is user data
 spTip.textContent='';var b=document.createElement('b');b.textContent=val;spTip.appendChild(b);
@@ -40820,17 +41071,21 @@ var xlab='';for(var i=0;i<n;i++){var k=ser.keys[i],m;
 if(SP.range==='hours'){m=/^(\\d{4})-(\\d\\d)-(\\d\\d)T00$/.exec(k);if(m){var dd=new Date(+m[1],+m[2]-1,+m[3]);
 xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+['S','M','T','W','T','F','S'][dd.getDay()]+'</span>';}}
 else{m=/^(\\d{4})-(\\d\\d)-(01|15)$/.exec(k);if(m)xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+Number(m[2])+'/'+Number(m[3])+'</span>';}}
+var many=spMany(d);
 var leg='<div class=rsp-leg>'+stacks.map(function(s){return '<span class="rsp-chip'+((s.kind==='sid'&&!s.live)||s.kind==='unattributed'?' rsp-dead':'')+'"><i class="rsp-sw'+(s.kind==='unattributed'?' rsp-hatch':'')+'"'
-+(s.kind==='unattributed'?'':' style="background:'+(s.kind==='other'?SP_OTHER:spColor(s))+'"')+'></i>'+esc(spStackName(s))+'</span>';}).join('')+'</div>';
++(s.kind==='unattributed'?'':' style="background:'+(s.kind==='other'?SP_OTHER:spColor(s))+'"')+'></i>'+(s.kind==='sid'?spLabel(s,many):esc(spStackName(s)))+'</span>';}).join('')+'</div>';
 var tzNote='';var mine=-(new Date().getTimezoneOffset());
-if(typeof d.tzOffsetMin==='number'&&d.tzOffsetMin!==mine)tzNote='<div class=rsp-note>Bucket times are '+esc(d.tz||'the kernel\u2019s clock')+' (the machine that recorded them), not your local time.</div>';
+if(typeof d.tzOffsetMin==='number'&&d.tzOffsetMin!==mine)tzNote+='<div class=rsp-note>Bucket times are '+esc(d.tz||'the kernel\u2019s clock')+' (the machine that recorded them), not your local time.</div>';
+// machines in different zones (T247c): the rule is stated, not left to be guessed
+var offs={};spHosts(d).forEach(function(x){offs[String(x.tzOffsetMin)]=1;});
+if(Object.keys(offs).length>1)tzNote+='<div class=rsp-note>Hourly buckets are aligned by clock time across machines; daily buckets follow each machine\u2019s own calendar day.</div>';
 box.innerHTML=svg+ylab+'<div class=ru-tip-gx>'+xlab+'</div>'+leg+tzNote;
 // the per-segment hover: session · value · bucket, the mark itself the hit target
 var svgEl=box.querySelector('svg');if(!svgEl)return;
 svgEl.onpointermove=function(e){var t=e.target;if(!t||!t.classList||!t.classList.contains('rsp-seg')){spTipHide();return;}
 var i=+t.getAttribute('data-i'),si=+t.getAttribute('data-s'),s=stacks[si];if(!s)return;
 var v=(s[meas]&&s[meas][i])||0,o=(s[meas==='usd'?'tok':'usd']&&s[meas==='usd'?'tok':'usd'][i])||0;
-spTipShow(e.clientX,e.clientY,spStackName(s),fmt(v),(meas==='usd'?fmtTok(Math.round(o))+' tok':fmtUsd(o))+' \u00b7 '+spBucketLabel(ser.keys[i],SP.range));};
+spTipShow(e.clientX,e.clientY,spStackText(s,many,meas,i),fmt(v),(meas==='usd'?fmtTok(Math.round(o))+' tok':fmtUsd(o))+' \u00b7 '+spBucketLabel(ser.keys[i],SP.range));};
 svgEl.onpointerleave=spTipHide;}
 window.addEventListener('resize',function(){if(SP.open&&SP.data)renderChart();});
 el.addEventListener('click',function(){pull(true);openSpend();});
@@ -43987,7 +44242,12 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/spend/detail":                          # the usage MODAL's per-session breakdown (T247):
                 # who spent what and spend over time stacked by session, read from the ledger's bySid
                 # maps with names + colors resolved kernel-side — the same read class as /usage, and
-                # the shell fetches it on open rather than scraping the hover's HTML.
+                # the shell fetches it on open rather than scraping the hover's HTML. Every attached
+                # kernel's sessions ride along, asked over the tunnel and merged here (T247c) — and a
+                # PEER's ask (?local=1) gets this kernel's own half, never a fan-out: two kernels attached
+                # to each other would otherwise ask each other forever (review find).
+                if (q.get("local") or [""])[0]:
+                    return self._send(200, json.dumps(_spend_detail_local()), "application/json", cache="no-cache")
                 return self._send(200, json.dumps(_spend_detail()), "application/json", cache="no-cache")
             if p == "/api-health":
                 # The API-health signal (docs/reference.md): per-(auth label, model family) attempt /

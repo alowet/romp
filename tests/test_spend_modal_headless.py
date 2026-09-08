@@ -63,6 +63,16 @@ class SpendModalServed(unittest.TestCase):
         km._auth_key_present = lambda: True
         (state / "usage.json").write_text(json.dumps({"apiKey": True}))
         write_ledger(state, extra_sids=12)
+        # T247c: a two-host world — a peer kernel whose sessions merge in, and an older peer reported by name
+        self._saved_remotes = dict(km._remotes)
+        km._remotes.clear()
+        sd = _sd.SpendDetail("test_the_route_and_the_shell_are_wired")
+        off = int((time.localtime(_sd.NOW).tm_gmtoff or 0) // 60) + 180
+        peer_port = sd._peer_server.__func__(self, sd._peer_payload.__func__(self, off))
+        km._remotes["PEERHOST"] = {"host": "PEERHOST", "status": "up", "local_port": peer_port, "token": "peer-tok",
+                                   "usage": {"apiKey": True, "spend": {"day": {"usd": 1}}}}
+        km._remotes["OLDHOST"] = {"host": "OLDHOST", "status": "up", "local_port": sd._peer_server.__func__(self, status=404), "token": "peer-tok",
+                                  "usage": {"apiKey": True, "spend": {"day": {"usd": 1}}}}
         html = km._landing().encode()
         blank = b"<!doctype html><html><body style='margin:0;background:#1e1e1e'></body></html>"
 
@@ -92,6 +102,8 @@ class SpendModalServed(unittest.TestCase):
                     return self._out(200, json.dumps(km._usage() or {}).encode(), "application/json")
                 if p.startswith("/media/") or p.startswith("/dist/"):
                     f = os.path.join(ROOT, p.lstrip("/"))
+                    if p == "/dist/styles.css" and not os.path.isfile(f):
+                        f = os.path.join(ROOT, "ui", "webview", "styles.css")   # the source, when no build ran here
                     if os.path.isfile(f):
                         ct = "image/svg+xml" if f.endswith(".svg") else "application/javascript" if f.endswith(".js") else "application/octet-stream"
                         return self._out(200, open(f, "rb").read(), ct)
@@ -114,6 +126,8 @@ class SpendModalServed(unittest.TestCase):
         if hasattr(self, "_saved"):
             (km.jd.STATE, km.NAMES, km._live_names, km._tmux_sessions, km._self_host,
              km._claude_account, km._auth_key_present) = self._saved
+            km._remotes.clear()
+            km._remotes.update(getattr(self, "_saved_remotes", {}))
             self.td.cleanup()
 
     def test_click_opens_the_modal_with_table_and_stacked_histogram_and_escape_closes_it(self):
@@ -126,22 +140,26 @@ class SpendModalServed(unittest.TestCase):
         self.assertTrue(o["hiddenBefore"], "closed until the click")
         self.assertTrue(o["loaderSeen"], "the loader (or the content) is up the instant the modal opens")
         self.assertEqual(o["out"]["backdrop"], "rgba(0, 0, 0, 0.55)", "the panel rule's backdrop")
-        self.assertEqual(o["out"]["head"], "API spend · TESTHOST")
+        self.assertEqual(o["out"]["head"], "API spend · 2 machines", "the header names the machines when several contribute (review find)")
         rows = o["out"]["rows"]
-        self.assertTrue(rows[0].startswith("web"), rows[0])
-        self.assertTrue(rows[1].startswith("api"), rows[1])
-        self.assertTrue(any(r.startswith("tests") and "not running" in r for r in rows), "a dead session keeps its name, dimmed")
-        self.assertTrue(o["out"]["rows"][2].startswith("tests"), "the top rows are the histogram's stacks, in order")
+        # T247c: two hosts contribute, so every row names its host in the tab strip's host-prefix voice
+        self.assertTrue(rows[0].startswith("TESTHOST:web") or rows[0].startswith("TESTHOST: web"), rows[0])
+        self.assertTrue(rows[1].startswith("PEERHOST:worker") or rows[1].startswith("PEERHOST: worker"), rows[1])
+        self.assertTrue(rows[2].startswith("TESTHOST:api") or rows[2].startswith("TESTHOST: api"), rows[2])
+        self.assertTrue(any("OLDHOST" in n and "older build" in n for n in o["out"]["notes"]), o["out"]["notes"])
+        self.assertFalse(any("this machine only" in n for n in o["out"]["notes"]))
+        self.assertTrue(any("aligned by clock time" in n for n in o["out"]["notes"]), "hosts in different zones: the timezone rule is stated")
+        self.assertTrue(any(c.startswith("PEERHOST") for c in o["out"]["legend"]), o["out"]["legend"])
+        self.assertTrue(any("tests" in r and "not running" in r for r in rows), "a dead session keeps its name, dimmed")
         self.assertTrue(any(r.startswith("unattributed") for r in rows), "pre-attribution spend is a row of its own")
         self.assertGreaterEqual(o["out"]["deadRows"], 2)
-        self.assertEqual(o["foldBefore"], 10 + 1 + 1, "the table folds to the top-N, a '5 more' row, and the unattributed row")
-        self.assertEqual(o["foldAfter"], 15 + 1, "show all: every session, plus the unattributed row")
-        self.assertTrue(any("5 more sessions" in r for r in rows), rows)
+        self.assertEqual(o["foldBefore"], 10 + 1 + 1, "the table folds to the top-N, a '6 more' row, and the unattributed row")
+        self.assertEqual(o["foldAfter"], 16 + 1, "show all: every session across both hosts, plus the unattributed row")
+        self.assertTrue(any("6 more sessions" in r for r in rows), rows)
         leg = o["out"]["legend"]
-        self.assertEqual(leg, ["web", "api", "tests", "unattributed"],
-                         "the hourly legend names only the stacks the hourly chart draws — no chip for a "
-                         "top-N session with nothing in this range, no empty 'other' (review find)")
-        self.assertIn("other (5 sessions)", o["days"]["legend"], "beyond the top-N the daily range folds them into one stack")
+        self.assertEqual([c.split(":")[-1].strip() for c in leg], ["web", "worker", "api", "tests", "unattributed"],
+                         "the hourly legend names only the stacks the hourly chart draws, across hosts, in dollar order")
+        self.assertIn("other (6 sessions)", o["days"]["legend"], "beyond the top-N the daily range folds them into one stack")
         self.assertEqual(o["days"]["legend"][-1], "unattributed")
         self.assertGreater(o["out"]["segs"], 60)
         self.assertGreaterEqual(o["out"]["hatched"], 1, "the unattributed stack wears the hatch, not a hue")
@@ -173,8 +191,9 @@ class SpendModalServed(unittest.TestCase):
         self.assertEqual(o["timeout"]["early"], {"err": False, "loader": True}, o["timeout"])
         # the unattributed chip dims like its row (review find: same class, two weights)
         self.assertIn("unattributed:0.55", o["out"]["chipOpacity"], o["out"]["chipOpacity"])
-        self.assertIn("web:1", o["out"]["chipOpacity"])
-        self.assertIn("tests:0.55", o["out"]["chipOpacity"])
+        self.assertIn("TESTHOST: web:1", o["out"]["chipOpacity"], "a live session's chip at full strength, host-prefixed (T247c)")
+        self.assertIn("TESTHOST: tests:0.55", o["out"]["chipOpacity"])
+        self.assertIn("PEERHOST: worker:1", o["out"]["chipOpacity"], "the peer's session wears its own host")
         # T247b: the phone's door is a real button — the hover's size, full opacity, not an annotation
         self.assertEqual(o["mobile"]["btn"]["font"], "11px", o["mobile"]["btn"])
         self.assertEqual(o["mobile"]["btn"]["opacity"], "1", o["mobile"]["btn"])
