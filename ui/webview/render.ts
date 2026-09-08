@@ -58,6 +58,7 @@ import { followReader, keepPlaceAcrossShow, followTail, atBottomDist, followBoxB
 import { retainLiveOmitted } from "./tab-order";
 import { userTurnShows } from "./user-turn-content";
 import { ScrollDiagBudget, classifyScroll, scrollWriteRow } from "./scroll-write";
+import { reloadScrollRecord, takeReloadScroll, type ReloadScroll } from "./reload-restore";
 import { keepResidentEvents } from "./frame-merge";
 import { activeTabToReannounce } from "./relay-active";
 import { dirStatusHint, nextDirActive, createDirPrompt, type DirStatus } from "./dir-complete";
@@ -10378,7 +10379,16 @@ function landActive(content: HTMLElement | null, v: View): void {
     }
   }
   if (!scrolled) {
-    if (!v.shown || v.stick) writeScroll(content, content.scrollHeight, "land-bottom", true);
+    // a page reload's one-shot restore (T265): the tab that was active when the page went down lands where its
+    // reader was — the bottom for a follow-mode reader, else their anchor turn, else the raw saved scrollTop
+    const rs = takeReloadScroll(pendingReloadScroll, activeId);
+    if (rs) {
+      pendingReloadScroll = null;
+      v.stick = rs.stick;
+      if (rs.stick) writeScroll(content, content.scrollHeight, "reload-restore", true);
+      else if (!(rs.anchor && restoreScrollAnchor(content, v, rs.anchor))) writeScroll(content, rs.top, "reload-restore");
+    }
+    else if (!v.shown || v.stick) writeScroll(content, content.scrollHeight, "land-bottom", true);
     else writeScroll(content, v.scrollTop, "land-saved");
   }
   v.shown = true;
@@ -10394,6 +10404,31 @@ function landActive(content: HTMLElement | null, v: View): void {
 // turn still visible at the viewport top, keyed by its STABLE data-uuid, and after the rebuild put THAT
 // element back at its exact offset — then content changing anywhere else, above or below, cannot move what
 // the user is reading. The raw scrollTop stays as the fallback for an anchor the render window evicted.
+// ── a page reload keeps the reader's place (T265, the user 2026-09-08) ───────────────────────────────────
+// The dashboard now reloads itself on a kernel restart and on a newer served bundle (the shell's reload core,
+// kernel.py _RELOAD_CORE_JS). The core calls window.__rompPersistForReload on every pane SYNCHRONOUSLY before
+// location.reload (a posted message could miss the unload); `pagehide` is the belt for any other navigation.
+// The record rides the persisted webview state beside the drafts and the active tab, is taken out of the state
+// the moment the page loads (one reload, one restore) and is consumed by landActive's first show of that tab.
+let pendingReloadScroll: ReloadScroll | null = (() => {
+  try {
+    const st = (vscodeApi?.getState?.() || {}) as any;
+    const r = st.reloadScroll || null;
+    if (r && vscodeApi?.setState) vscodeApi.setState({ ...st, reloadScroll: undefined });
+    return r;
+  } catch { return null; }
+})();
+function persistScrollForReload(): void {
+  const content = document.getElementById("content");
+  const v = activeId ? views.get(activeId) : null;
+  if (!content || !v || !v.shown || content.clientHeight <= 0) return;
+  const stick = content.scrollHeight - content.scrollTop - content.clientHeight <= 2;   // the true bottom
+  const rec = reloadScrollRecord(activeId, content.scrollTop, stick, stick ? null : captureScrollAnchor(content, v));
+  try { if (vscodeApi?.setState) vscodeApi.setState({ ...(vscodeApi.getState() || {}), reloadScroll: rec }); } catch { /* ignore */ }
+}
+(window as any).__rompPersistForReload = persistScrollForReload;
+window.addEventListener("pagehide", persistScrollForReload);
+
 function captureScrollAnchor(content: HTMLElement, v: View): { uuid: string; y: number } | null {
   const cTop = content.getBoundingClientRect().top;
   const turns = v.el.querySelectorAll("[data-uuid]");
