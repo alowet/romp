@@ -45,7 +45,7 @@ class TabsFirst(unittest.TestCase):
         text = open(KPATH).read()
         self.assertEqual(text.count('_send_client(c, ("taborder",), _tab_order_frame(tab_order, tab_meta, tmux))'), 2)
         self.assertEqual(text.count("frame = _tab_order_frame(tab_order, tab_meta, tmux)"), 1)
-        self.assertEqual(text.count("json.dumps(_tab_order_frame(_o, _tabs))"), 1)
+        self.assertEqual(text.count("_frame = _tab_order_frame(_o, _tabs, _tm)"), 1)
         self.assertEqual(text.count('{"type": "tabOrder"'), 1, "the literal lives in _tab_order_frame alone")
         self.assertIn("_tab_order_frame(tab_order, tab_meta, tmux)", inspect.getsource(km._push_session_now))
         self.assertIn("_tab_order_frame(tab_order, tab_meta, tmux)", inspect.getsource(km._confirm_close_now))
