@@ -84,7 +84,7 @@ test("retire needs a NEW landed atom (after the send's anchor); kernel provision
   assert.match(RENDER, /const r = reconcilePending\(s\.events as TailEvent\[\], list\);/);
   assert.doesNotMatch(RENDER, /OPT_TAIL_SCAN/);
   assert.match(RENDER, /if \(r\.keep\.length\) pendingSent\.set\(s\.id, r\.keep\); else pendingSent\.delete\(s\.id\);/);
-  assert.match(RENDER, /const inject = r\.inject;/);
+  assert.match(RENDER, /const inject = r\.inject\.filter\(\(p\) => !covered\.has\(p\)\);/);
   // and no clock anywhere in the file's decision: the TTL is gone for good
   assert.doesNotMatch(RENDER, /OPT_TTL_MS/);
   const SP = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "send-pending.ts"), "utf8");
@@ -134,8 +134,8 @@ test("something IS queued → the kernel's copy of OUR text is hidden and ours s
   // one bubble per message: the kernel's queued group at the tail keeps its OTHER texts, our copy in it is
   // hidden (a client-only mark), and the hide is undone with every other injection before the counts run
   assert.match(RENDER, /function hideQueuedCopy\(s: Session, p: PendingSend\)/);
-  assert.match(RENDER, /for \(const p of r\.unqueue\) \{ const h = hideQueuedCopy\(s, p\); if \(h\) heldBy\.set\(p, h\); \}/);
-  assert.match(RENDER, /texts\[k\] = \{ \.\.\.t, hiddenByPending: true \};/);
+  assert.match(RENDER, /for \(const p of r\.unqueue\) \{\s*\n\s*const hid = hideQueuedCopy\(s, p\);/);
+  assert.match(RENDER, /texts\[k\] = \{ \.\.\.texts\[k\], hiddenByPending: true \};/);
   assert.match(RENDER, /const texts = ev\.texts\.filter\(\(t\) => !t\.hiddenByPending\);/, "the renderer draws the visible copies only");
   assert.match(RENDER, /map\(\(t\) => t\.hiddenByPending \? \{ \.\.\.t, hiddenByPending: undefined \} : t\)/, "the strip clears the marks");
   // a copy hidden out of a HELD group hands the hold's reason to our bubble
@@ -171,7 +171,7 @@ test("EVERY ✕ stops our re-injection first; the optimistic one cancels by body
 test("chatTail speaks the KERNEL's coordinates — the injected tail is not part of its space", () => {
   // counting the injected bubble in the gap check masked a genuine 1-event desync (the repair never
   // fired) and let a delta land PAST the bubble, freezing it into resident events as fake history
-  assert.match(RENDER, /stripOptimistic\(s\);\s*\n\s*const kernelLen = s\.events\.length;/);
+  assert.match(RENDER, /const kernelLen = s\.events\.reduce\(\(n, e\) => n \+ \(isOptimistic\(e\) \? 0 : 1\), 0\);/);
   assert.match(RENDER, /if \(from > kernelLen\) \{/);
 });
 

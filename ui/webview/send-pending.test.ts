@@ -21,7 +21,7 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { newPending, pendingBody, reconcilePending, dropPending, injectionGroups, scanFrom, landedIn, provisionalIn, bareGroupLabel, type TailEvent, type PendingSend } from "./send-pending";
+import { newPending, pendingBody, reconcilePending, dropPending, injectionGroups, scanFrom, queuedCopyToHide, landedIn, provisionalIn, bareGroupLabel, type TailEvent, type PendingSend } from "./send-pending";
 
 const read = (f: string) => fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", f), "utf8");
 const RENDER = read("render.ts");
@@ -208,6 +208,51 @@ test("several pending sends: each after its own anchor, in send order; same anch
   assert.equal(scanFrom([{ kind: "tool", uuid: "zz" }], { after: "gone", seen: [], queued: 0 }), 0);
 });
 
+test("a send pressed while an earlier send's echo is the newest event is placed BELOW that echo (review of the first cut)", () => {
+  // the anchor skips the kernel's echo atoms (an echo is not a stable place to bound the landing scan), but as a
+  // PLACEMENT that inverted consecutive sends: the second message sat above the first until both landed. A user
+  // event the kernel stamped at or before the press — an echo, a never-delivered bubble, a landed atom — is
+  // older than this send, so the bubble goes below it, exactly where the absorbed atom will be placed by time.
+  const isoAt = (s: number) => new Date(s * 1000).toISOString();
+  const S = Math.floor(T0 / 1000);
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1", ts: isoAt(S - 30) }];
+  const first = press(tail, "first message");
+  const echoed: TailEvent[] = [...tail, { kind: "user", md: "first message", uuid: "echo:1", ts: isoAt(S - 2) }];
+  reconcilePending(echoed, first);                              // the kernel's echo covers the first send
+  const second = newPending("second message", undefined, T0);   // pressed with the echo as the newest event
+  const list = [...first, second];
+  const r = reconcilePending(echoed, list);
+  assert.equal(second.at?.after, "a1", "the scan anchor still skips the echo");
+  assert.deepEqual(r.inject, [second]);
+  assert.deepEqual(injectionGroups(echoed, r.inject), [{ idx: 2, sends: [second] }], "…but the bubble is placed below it");
+  // a never-delivered bubble from an earlier send: older than this press, so below it too
+  const lost: TailEvent[] = [...tail, { kind: "user", md: "older", uuid: "echo:9", undelivered: true, ts: isoAt(S - 5) }];
+  const p = press(lost, "newer");
+  assert.deepEqual(injectionGroups(lost, reconcilePending(lost, p).inject), [{ idx: 2, sends: [p[0]] }]);
+  // a user event stamped AFTER the press is a later send: the bubble stays above it
+  const later: TailEvent[] = [...tail, { kind: "user", md: "someone else's later message", uuid: "u7", ts: isoAt(S + 30) }];
+  const q = newPending("mine", undefined, T0);
+  reconcilePending(tail, [q]);                                  // pressed against the tail before u7 arrived
+  assert.deepEqual(injectionGroups(later, reconcilePending(later, [q]).inject), [{ idx: 1, sends: [q] }]);
+});
+
+test("queuedCopyToHide: the newest not-yet-hidden copy of the text, never a copy the kernel marked non-cancelable", () => {
+  // the kernel marks a queued copy cancelable:false when no recall exists (a tmux queue): that copy stays the
+  // one bubble shown, with its honest "can't be recalled" tooltip, and ours is suppressed as before — hiding it
+  // behind our bubble's ✕ offered a cancel the kernel would refuse (review of the first cut)
+  const texts = [{ md: "a" }, { md: "b", cancelable: false }, { md: "a", hiddenByPending: true }, { md: "a" }];
+  assert.equal(queuedCopyToHide(texts, "a"), 3, "the newest visible copy");
+  assert.equal(queuedCopyToHide(texts.slice(0, 3), "a"), 0, "…skipping one already hidden");
+  assert.equal(queuedCopyToHide(texts, "b"), -1, "a non-cancelable copy is never hidden");
+  assert.equal(queuedCopyToHide(texts, "zzz"), -1);
+  assert.equal(queuedCopyToHide([{ md: " a " }], "a"), 0, "trimmed match, like every other text test");
+  // render.ts: a copy the helper refuses keeps covering our bubble (the send leaves `inject`)
+  assert.match(RENDER, /const k = queuedCopyToHide\(q\.texts, p\.text\);/);
+  assert.match(RENDER, /if \(k < 0\) return null;\s*\/\/ no copy to hide/);
+  assert.match(RENDER, /const hid = hideQueuedCopy\(s, p\);\s*\n\s*if \(hid === null\) covered\.add\(p\); else if \(hid\.held\) heldBy\.set\(p, hid\.held\);/);
+  assert.match(RENDER, /const inject = r\.inject\.filter\(\(p\) => !covered\.has\(p\)\);/);
+});
+
 test("the kernel's queued copy at the tail is hidden for a send drawn in place — one bubble per message (T252)", () => {
   const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
   const list = press(tail, TEXT);
@@ -228,6 +273,12 @@ test("render.ts draws the bubble at its slot, strips its own injections before a
   assert.match(RENDER, /function stripOptimistic\(s: Session\): void \{/, "one strip, used by every ingest path");
   const tail = RENDER.slice(RENDER.indexOf("function chatTail(msg: any) {"), RENDER.indexOf("s.events.length = from;"));
   assert.match(tail, /stripOptimistic\(s\);/, "the delta's kernel index is applied to KERNEL events only — a mid-array bubble would shift it");
+  // …but only once the delta is going to be applied: stripping before the gap/head early returns left s.events
+  // without the bubble while the DOM still showed it (review of the first cut)
+  const afterReturns = tail.slice(tail.indexOf("if (from < 0) return;"));
+  assert.match(afterReturns, /stripOptimistic\(s\);/, "the strip sits after both early returns");
+  assert.doesNotMatch(tail.slice(0, tail.indexOf("if (from > kernelLen) {")), /stripOptimistic\(s\);/, "…and not before the gap check");
+  assert.match(tail, /const kernelLen = s\.events\.reduce\(\(n, e\) => n \+ \(isOptimistic\(e\) \? 0 : 1\), 0\);/, "the gap check counts kernel events without mutating");
   for (const gone of ["absorbedHeader", "absorbedCues", "noteAbsorbedLanding", "renderAbsorbedCue", "appendAbsorbedCues", "dismissAbsorbedCue", "cueRendered", "abjump", "abdismiss", "absorbed-tag", "turn-absorbed-cue"])
     assert.ok(!RENDER.includes(gone), gone + " is gone from render.ts");
   for (const gone of [".absorbed-tag", ".turn-absorbed-cue", ".absorbed-cue-line", ".absorbed-cue-act"])

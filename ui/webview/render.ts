@@ -38,7 +38,7 @@ import { titleWithKey, chordOf, effectiveChord, loadOverrides } from "./keybindi
 import { DEFAULT_CHORDS } from "./commands";
 import { NavHistory } from "./nav-history";
 import { StagedStack } from "./staged-messages";
-import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, injectionGroups, scanFrom, dropPending, bareGroupLabel } from "./send-pending";
+import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, injectionGroups, queuedCopyToHide, dropPending, bareGroupLabel } from "./send-pending";
 import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional } from "./provisional";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
@@ -363,8 +363,12 @@ function reconcileOptimistic(s: Session): void {
   const r = reconcilePending(s.events as TailEvent[], list);
   if (r.keep.length) pendingSent.set(s.id, r.keep); else pendingSent.delete(s.id);
   const heldBy = new Map<PendingSend, NonNullable<Extract<ChatEvent, { kind: "queued" }>["held"]>>();
-  for (const p of r.unqueue) { const h = hideQueuedCopy(s, p); if (h) heldBy.set(p, h); }
-  const inject = r.inject;
+  const covered = new Set<PendingSend>();   // a kernel copy that stays shown (non-cancelable: no recall exists) covers ours
+  for (const p of r.unqueue) {
+    const hid = hideQueuedCopy(s, p);
+    if (hid === null) covered.add(p); else if (hid.held) heldBy.set(p, hid.held);
+  }
+  const inject = r.inject.filter((p) => !covered.has(p));
   if (!inject.length) { settle([]); return; }
   // cancelable from the PRESS (the user 2026-08-30, who sent mid-compaction and sat in an unlabeled,
   // uncancellable beat until the kernel's park round-tripped): the ✕ on an optimistic bubble drops our
@@ -396,21 +400,19 @@ function stripOptimistic(s: Session): void {
   }
 }
 
-// Hide ONE copy of this send's text in the kernel's queued group (the newest copy — the kernel's group
-// lists the queue in order and ours is the latest press with that text): ours is drawn at its slot, so the
-// tail copy would be the same message twice. Returns the group's `held` so the bubble can carry the reason.
-function hideQueuedCopy(s: Session, p: PendingSend): Extract<ChatEvent, { kind: "queued" }>["held"] | undefined {
+// Hide ONE copy of this send's text in the kernel's queued group (send-pending.ts queuedCopyToHide picks
+// it: the newest not-yet-hidden copy, never one the kernel marked non-cancelable): ours is drawn at its
+// slot, so the tail copy would be the same message twice. Returns the group's `held` so the bubble can
+// carry the reason — or null when no copy is hidden, in which case the kernel's copy keeps covering ours.
+function hideQueuedCopy(s: Session, p: PendingSend): { held?: Extract<ChatEvent, { kind: "queued" }>["held"] } | null {
   const qi = tailQueuedIdx(s.events);
-  if (qi < 0) return undefined;
+  if (qi < 0) return { held: undefined };            // nothing queued at the tail: nothing to hide, ours shows
   const q = s.events[qi] as Extract<ChatEvent, { kind: "queued" }>;
-  for (let k = q.texts.length - 1; k >= 0; k--) {
-    const t = q.texts[k];
-    if (t.hiddenByPending || t.optimistic || t.md.trim() !== p.text.trim()) continue;
-    const texts = q.texts.slice(); texts[k] = { ...t, hiddenByPending: true };
-    s.events[qi] = { ...q, texts };
-    return q.held || undefined;
-  }
-  return undefined;
+  const k = queuedCopyToHide(q.texts, p.text);
+  if (k < 0) return null;                            // no copy to hide (or a non-cancelable one): the kernel's bubble stays
+  const texts = q.texts.slice(); texts[k] = { ...texts[k], hiddenByPending: true };
+  s.events[qi] = { ...q, texts };
+  return { held: q.held || undefined };
 }
 
 // Record a composer send as in-flight and show its optimistic bubble NOW (before any kernel push).
@@ -13420,9 +13422,10 @@ function chatTail(msg: any) {
   // fired, PR #107's desync class), and a delta starting exactly one past kernel truth landed BEYOND
   // the injected bubble, freezing it into the resident events as fake history the reconcile's strip
   // loop could never pop (the user 2026-08-09). Since T252 a bubble sits at its send slot, mid-array,
-  // where it would also SHIFT every kernel index after it — so strip first, then read kernel lengths.
-  stripOptimistic(s);
-  const kernelLen = s.events.length;
+  // where it would also SHIFT every kernel index after it — so the gap check COUNTS kernel events here,
+  // and the strip itself waits until the delta is going to be applied: stripping ahead of the two early
+  // returns left s.events without the bubble while the DOM still showed it (review of the first cut).
+  const kernelLen = s.events.reduce((n, e) => n + (isOptimistic(e) ? 0 : 1), 0);
   if (from > kernelLen) {
     // GAP: the delta starts PAST what we hold, so the events in between never reached us. Applying it would
     // fabricate a transcript that silently skips them. This used to just `return` and "wait for the next
@@ -13438,6 +13441,7 @@ function chatTail(msg: any) {
     return;
   }
   if (from < 0) return;                            // below the loaded head → our resident tail is still valid
+  stripOptimistic(s);                              // kernel coordinates from here on (re-injected below)
   const wasLen = s.events.length;
   s.events.length = from;                          // drop the (now superseded) tail...
   for (const e of (msg.events || [])) s.events.push(e);   // ...and append the freshly-changed suffix

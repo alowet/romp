@@ -358,11 +358,47 @@ export type InjectionGroup = { idx: number; sends: PendingSend[] };
 export function injectionGroups(events: TailEvent[], inject: PendingSend[]): InjectionGroup[] {
   const byIdx = new Map<number, PendingSend[]>();
   for (const p of inject) {
-    const idx = p.at ? scanFrom(events, p.at) : events.length;
+    const idx = p.at ? placementIndex(events, p) : events.length;
     const g = byIdx.get(idx);
     if (g) g.push(p); else byIdx.set(idx, [p]);
   }
   return [...byIdx.entries()].sort((x, y) => y[0] - x[0]).map(([idx, sends]) => ({ idx, sends }));
+}
+
+/** The slot for one send: after its scan anchor, and after every USER event the kernel stamped at or before
+ *  the press — an earlier send's echo atom, a never-delivered bubble, a landed atom — which the anchor rule
+ *  skips (an echo is not a stable place to bound the LANDING scan, since the landed atom replaces it under a
+ *  new uuid) but which is older than this send all the same. Without this a second message pressed while the
+ *  first's echo was the newest event sat ABOVE it until both landed (review of the first cut). The rule is the
+ *  kernel's own: it places the absorbed atom by its send time, so the bubble sits where the atom will land.
+ *  A user event stamped after the press is a later send and stays below the bubble. */
+export function placementIndex(events: TailEvent[], p: PendingSend): number {
+  const at = p.at!;
+  let idx = scanFrom(events, at);
+  const pressS = Math.floor(p.ts / 1000);
+  for (let j = events.length - 1; j >= idx; j--) {
+    const e = events[j];
+    if (e.kind !== "user" || isOptimisticUuid(e.uuid)) continue;
+    const s = eventSecond(e);
+    if (s !== null && s <= pressS) { idx = j + 1; break; }
+  }
+  return idx;
+}
+
+/** Which copy of `text` in a kernel queued group the caller hides for a send drawn at its own slot: the NEWEST
+ *  copy not already hidden (the group lists the queue in order; ours is the latest press with that text), or -1
+ *  when there is none — including when the only copies are ones the kernel marked cancelable:false (no recall
+ *  exists there: a tmux queue). That copy stays the one bubble shown, with its honest tooltip, and ours is
+ *  suppressed as before: hidden behind our bubble's ✕ it offered a cancel the kernel would refuse (review of the
+ *  first cut). */
+export function queuedCopyToHide(texts: { md?: string; cancelable?: boolean; hiddenByPending?: boolean; optimistic?: boolean }[], text: string): number {
+  for (let k = texts.length - 1; k >= 0; k--) {
+    const t = texts[k];
+    if (t.hiddenByPending || t.optimistic || typeof t.md !== "string" || !sameText(t.md, text)) continue;
+    if (t.cancelable === false) return -1;
+    return k;
+  }
+  return -1;
 }
 
 /** The bare group's one-line header, from its bubbles' OWN states: the lost ones (the connection dropped
