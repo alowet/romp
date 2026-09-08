@@ -7,7 +7,7 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { spinFor, kindWord } from "./spin-caption";
+import { spinFor, kindWord, workingFor } from "./spin-caption";
 import { distillInputs, distillText, distillPending } from "./distiller-line";
 
 // --- THE REGRESSION: a re-judging card always spins ----------------------------------------------
@@ -167,11 +167,16 @@ test("a settled card displaced to Working loses its line but never its caption",
 const FEED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.ts"), "utf8");
 
 test("feed.ts routes the card's swirl through spinFor and keeps no inline copy of the ladder", () => {
-  assert.match(FEED, /import \{ spinFor, waitedSuffix, awaitWord, groupRows, GROUP_TITLE, ROW_KIND_OF_LEGACY, type AwaitRow \} from "\.\/spin-caption";/);   // slice 2: the rows' vocabulary rides the same import
+  assert.match(FEED, /import \{ spinFor, awaitWord, groupRows, GROUP_TITLE, ROW_KIND_OF_LEGACY, type AwaitRow \} from "\.\/spin-caption";/);   // slice 2: the rows' vocabulary rides the same import
   // the elapsed readout reaches the OTHER two awaiting surfaces through the same helper: the
-  // "Awaiting task" pill and the "Awaiting <peer>" chip (the user 2026-08-23)
-  assert.match(FEED, /const pillWaited = waitedSuffix\(it\.awaiting && it\.awaiting\.since, Date\.now\(\) \/ 1000\);/);
-  assert.match(FEED, /const woWaited = waitedSuffix\(wo\.since, Date\.now\(\) \/ 1000\);/);
+  // "Awaiting task" pill and the "Awaiting <peer>" chip (the user 2026-08-23). That helper is durNodes —
+  // waitedSuffix's rule (" · " + the duration for a known start, nothing otherwise) rendered as a stamped
+  // element the 15 s live pass keeps moving (feed-age.ts fmt "dur")
+  assert.match(FEED, /function durNodes\(since: number \| null \| undefined\): \(string \| HTMLElement\)\[\] \{\n\s*return since && since > 0 \? \[" · ", durSpan\(since\)\] : \[\];/);
+  assert.match(FEED, /pillLbl\.append\(\.\.\.durNodes\(it\.awaiting && it\.awaiting\.since\)\);\s*\/\/ the waited time, live/);
+  assert.match(FEED, /const woDur = durNodes\(wo\.since\);/);
+  // …and the ladder itself runs on the kernel's clock, like every other age on the board
+  assert.match(FEED, /dCompleted, nowSec\(\)\);/);
   assert.match(FEED, /const spin = spinFor\(it, distillPending\(/);
   assert.match(FEED, /const spinCaption = spin\.caption, spinTip = spin\.tip, awaitingBg = spin\.awaitingBg;/);
   // the inline ladder is gone — no second, drifting copy of the rule
@@ -181,7 +186,7 @@ test("feed.ts routes the card's swirl through spinFor and keeps no inline copy o
   // …and it still drives the same DOM
   assert.match(FEED, /a\._awaitSpin\.style\.display = spinCaption \? "" : "none";/);
   assert.match(FEED, /a\._awaitSpin\.classList\.toggle\("await-paused", awaitingBg\);/);
-  assert.match(FEED, /\} else a\._awaitWhy\.textContent = spinCaption;\n\s*a\._awaitSpin\.title = spinTip \|\| spinCaption;/);
+  assert.match(FEED, /else a\._awaitWhy\.textContent = spinCaption;\n\s*a\._awaitSpin\.title = spinTip \|\| spinCaption;/);
 });
 
 // --- the working narration (the user 2026-08-13): the previously-mute ordinary working card ---------
@@ -317,4 +322,39 @@ test("the spin caption derives its word from the kernel's count", () => {
   assert.equal(two.caption, "Awaiting agents");
   const legacy = spinFor({ awaiting: { why: "", kind: "agents" }, column: "working" }, false, false);
   assert.equal(legacy.caption, "Awaiting agents", "an older kernel with no count reads as before");
+});
+
+// --- the caption's running duration as a separate part -----------------------------------------------
+test("a caption that ends in a duration also says where the duration starts: caption === dur.text + workingFor(now - since)", () => {
+  const NOW = 100_000;
+  const check = (s: ReturnType<typeof spinFor>) => {
+    assert.ok(s.dur, "the duration part is present");
+    assert.equal(s.caption, s.dur!.text + workingFor(NOW - s.dur!.since), "the two renderings agree to the character");
+  };
+  check(spinFor({ awaiting: { why: "", since: NOW - 42 * 60 }, column: "working" }, false, false, NOW));
+  check(spinFor({ awaiting: { why: "waiting on 3 subagents", since: NOW - 3 * 3600 - 5 * 60 }, column: "working" }, false, false, NOW));
+  check(spinFor({ column: "working", working: { since: NOW - 8 * 60, toolUses: 23 } }, false, false, NOW));
+  check(spinFor({ column: "working", working: { since: NOW - 3 * 60, toolUses: 0 } }, false, false, NOW));
+  assert.equal(spinFor({ column: "working", working: { since: NOW - 3 * 60, toolUses: 0 } }, false, false, NOW).dur!.text, "Working — ",
+    "no count: the duration alone follows the dash");
+  assert.equal(spinFor({ column: "working", working: { since: NOW - 8 * 60, toolUses: 23 } }, false, false, NOW).dur!.text, "Working — 23 tool uses · ");
+});
+
+test("a wait that started this very second, or whose clock runs ahead of the kernel's, reads 0m — still a live part", () => {
+  const NOW = 100_000;
+  for (const since of [NOW, NOW + 30]) {
+    const s = spinFor({ awaiting: { why: "", since }, column: "working" }, false, false, NOW);
+    assert.equal(s.caption, "Awaiting agents · 0m");
+    assert.deepEqual(s.dur, { text: "Awaiting agents · ", since });
+    const w = spinFor({ column: "working", working: { since, toolUses: 1 } }, false, false, NOW);
+    assert.equal(w.caption, "Working — 1 tool use · 0m");
+    assert.deepEqual(w.dur, { text: "Working — 1 tool use · ", since });
+  }
+});
+
+test("no start, no duration part: the caption stands alone", () => {
+  assert.equal(spinFor({ awaiting: { why: "" }, column: "working" }, false, false, 5000).dur, null);
+  assert.equal(spinFor({ awaiting: { why: "", since: 1000 }, column: "working" }, false, false).dur, null, "no clock, no duration");
+  assert.equal(spinFor({ column: "working", working: { toolUses: 2 } }, false, false, 5000).dur, null);
+  assert.equal(spinFor({ column: "working", judging: true }, false, false, 5000).dur, undefined, "the other rungs carry none");
 });

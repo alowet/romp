@@ -1113,11 +1113,22 @@ frames it received is measured in the panes themselves, by
   too. The federation layer, which every kernel page loads, times its
   own prefixing, delta application and merge of each frame as `fed:<type>`,
   nested outside the pane's handler; each level records its own time, so
-  `fed:feed` and `feed` add up to the frame's cost. The timeline's listener is
-  wrapped the same way on both hosts (the VS Code bundle directly; the kernel
-  page's inline boot through the `window.__rompPerf` that `federation.js`
-  publishes before it runs), so `data`, `bars`, `hover`, `activeChat`,
-  `revealEvent` and `models` are timed like any pane's frames.
+  `fed:feed` and `feed` add up to the frame's cost. The federation layer hands
+  its merged frames (`feed`, `tabOrder`, `data`, `bars`) to the pane's handler
+  by direct call once the pane has registered it (`window.__rompFed.onFrame`,
+  through `ui/webview/frame-listener.ts`), so `fed:<type>` is that layer's own
+  compute; it dispatches them on `window` only when nothing registered, and
+  every other frame still arrives as a `window` `message` event. A `message`
+  listener from another JavaScript world (a browser extension's content
+  script) that reads `event.data` receives a structured clone of every frame
+  dispatched on `window`, tens of milliseconds for a multi-megabyte board; the
+  direct call keeps the merged frames out of its reach. See "A message
+  listener from another world" in `CONTRIBUTING.md` for the check that finds
+  such a listener. The timeline's listener is wrapped the same way on both
+  hosts (the VS Code bundle directly; the kernel page's inline boot through
+  the `window.__rompPerf` that `federation.js` publishes before it runs), so
+  `data`, `bars`, `hover`, `activeChat`, `revealEvent` and `models` are timed
+  like any pane's frames.
 - Per type and minute: count, summed and maximum handler time, the exact
   number of frames over 16.7 ms (one dropped frame at 60 Hz) and at or over
   100 ms, and a 14-bucket log2 histogram (under 1 ms, 1-2, 2-4, ..., 2048-4096,

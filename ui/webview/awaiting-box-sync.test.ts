@@ -80,7 +80,7 @@ test("the chip and the box gist take the kind word from ONE count (T225 rider)",
   assert.match(RENDER, /const word = awaitWord\(s\.status\.awaitingKind, s\.status\.awaitingCount, items\);/);   // `s` is narrowed by the one renderer's gate since 2026-09-06 (no `s!`)
   assert.match(RENDER, /lab\.textContent = "Awaiting" \+ \(word \? " " \+ word : ""\) \+ " · " \+ why\.replace/);
   // the feed pill and the spin caption derive their word the same way
-  assert.match(FEED, /import \{ spinFor, waitedSuffix, awaitWord, groupRows, GROUP_TITLE, ROW_KIND_OF_LEGACY, type AwaitRow \} from "\.\/spin-caption";/);
+  assert.match(FEED, /import \{ spinFor, awaitWord, groupRows, GROUP_TITLE, ROW_KIND_OF_LEGACY, type AwaitRow \} from "\.\/spin-caption";/);
   assert.match(FEED, /const pillWord = awaitWord\(awKind, \(it\.awaiting && it\.awaiting\.count\) \?\? taskRows\.length, taskRows\);/);
   assert.match(SPIN, /const word = kindWord\(aw\.kind, aw\.count\);/);
   assert.match(SPIN, /export function kindWord\(kind: string \| null \| undefined, count: number \| null \| undefined\): string \{/);

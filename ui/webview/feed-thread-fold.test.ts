@@ -21,7 +21,7 @@ test("the caret sits to the RIGHT of the session name, where it was asked for", 
 });
 
 test("it is a caret, and it says which way it will go", () => {
-  assert.match(FEED, /fold\.textContent = shut \? "▸" : "▾";/);
+  assert.match(FEED, /setText\(fold, shut \? "▸" : "▾"\);/);   // compare-first: headers repaint every render
   assert.match(FEED, /fold\.setAttribute\("aria-expanded", shut \? "false" : "true"\);/);
   assert.match(FEED, /fold\.setAttribute\("aria-label", \(shut \? "expand " : "collapse "\) \+ e\.name\);/);
 });
@@ -29,7 +29,7 @@ test("it is a caret, and it says which way it will go", () => {
 test("folding hides that thread's cards and counts them onto the header", () => {
   // the header stands in for the run: entries are counted, not rendered
   assert.match(FEED, /if \(collapsedThreads\.has\(s\)\) \{ if \(head\) head\.folded \+= entryCards\(e\); continue; \}/);
-  assert.match(FEED, /foldn\.textContent = String\(e\.folded\);/, "bare number (the user 2026-08-26) — words on hover only");
+  assert.match(FEED, /setText\(foldn, String\(e\.folded\)\);/, "bare number (the user 2026-08-26) — words on hover only");
   assert.match(FEED, /foldn\.style\.display = shut && e\.folded \? "" : "none";/);
 });
 

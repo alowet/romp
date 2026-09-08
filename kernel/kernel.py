@@ -14259,8 +14259,12 @@ def _fire_api_retry(sid, be, manual=False):
     # message, force-pinning a junk goal per retry via the never-skip hard guard ("retry — kept on the
     # board…", 71 of them in one API-error storm). The marker makes author_of return 'romp' (ROMP_INJECT_RE)
     # so the echo + transcript render gray and the planner skips a work-less retry instead of minting a goal.
-    be.send(sid, RETRY_MSG)
+    delivered = be.send(sid, RETRY_MSG)
     _note_retry_sent(sid, manual=manual)
+    # the send's own verdict, for the manual route's reply (review find, 2026-09-08): SdkBackend.send and
+    # CodexBackend.send return False for a session they cannot reach (no live registry row, no client);
+    # TmuxBackend.send always True. Only an explicit False is a refusal; a backend answering None sent.
+    return delivered is not False
 
 
 def _auto_retry_tick(now, tmux):
@@ -14485,8 +14489,12 @@ def _refuse_drive(client, op, sid, msg):
         # `sid` rides along so the shell's error-center entry carries the session it was meant for, the way
         # every card-badge entry does — the bell is a log you read later, and "which one?" is the first thing
         # you ask of it.
+        # `op` and `itemId` name the REQUEST (review find, 2026-09-08): the feed latches a button on the click
+        # (Retry → "Retrying…", Continue → "Sent") and re-arms it on the kernel's reply for that post alone,
+        # not every latch the session holds, and never on a clock, so the reply says which post it answers.
         client["send"](json.dumps({"type": "err", "title": "That %s was not delivered" % what,
-                                   "text": detail, "copy": text, "sid": sid}))
+                                   "text": detail, "copy": text, "sid": sid,
+                                   "op": op, "itemId": msg.get("itemId") or ""}))
     except Exception:
         pass
 
@@ -14741,7 +14749,14 @@ def _drive(msg, client):
         # ONE retry decision, all of it kernel state — see _fire_api_retry (shared with the kernel's own
         # _auto_retry_tick, which drives recovery unattended since 2026-08-11; this route remains for the
         # manual Retry-now button and the dashboard tick's redundant asks, both idempotent against it).
-        _fire_api_retry(sid, be, manual=bool(msg.get("manual")))
+        if not _fire_api_retry(sid, be, manual=bool(msg.get("manual"))) and msg.get("manual"):
+            # the backend refused the send (review find, 2026-09-08): the feed's Retry latched "Retrying…" on
+            # the click and re-arms on the kernel's reply for that request, matched by sid. Nothing answered a
+            # refused send before, so the button stayed latched until the card happened to be re-sent. A SOFT
+            # refusal (nothing typed was lost), so a typed reply the feed toasts, not the must-dismiss `err`.
+            # The auto path stays silent: no pane asked, and the kernel's own tick asks again.
+            client["send"](json.dumps({"type": "retryRefused", "sid": sid,
+                                       "text": "Couldn't retry: the session isn't connected right now."}))
     elif t == "setModel" and msg.get("value"):
         # mid-compaction → parked as a queued command; `floating` is the version submenu's Latest row —
         # forget the family's remembered pin and send the alias
@@ -15112,8 +15127,12 @@ def _revive_session(sid, client=None):
     refusal = _claim_session_name(name, "revive", sid, own=sid)
     if refusal:
         sys.stderr.write("revive '%s' (%s): refused — %s\n" % (name, sid, refusal))
-        _send_to_view("chat", {"type": "reviveFailed", "id": sid, "name": name, "text": refusal},
-                      (client or {}).get("wid") or "")
+        # the asking dashboard's chat AND feed, like every other revive refusal (_revive_session_inner): the
+        # feed's parked card latched "Reviving…" on the click and re-arms only on the reply for its own sid.
+        failed = {"type": "reviveFailed", "id": sid, "name": name, "text": refusal}
+        wid = (client or {}).get("wid") or ""
+        _send_to_view("chat", failed, wid)
+        _send_to_view("feed", failed, wid)
         return
     try:
         _revive_session_inner(sid, client)
@@ -15166,8 +15185,15 @@ def _revive_session_inner(sid, client=None):
         ok, detail = False, str(e)[:200]
     if not ok:
         sys.stderr.write("revive '%s' (%s): %s\n" % (name, sid, detail))
-        _send_to_view("chat", {"type": "reviveFailed", "id": sid, "name": name,
-                               "text": detail or "unknown error"}, (client or {}).get("wid") or "")
+        failed = {"type": "reviveFailed", "id": sid, "name": name, "text": detail or "unknown error"}
+        wid = (client or {}).get("wid") or ""
+        _send_to_view("chat", failed, wid)
+        # …and the same dashboard's FEED (review find, 2026-09-08): its parked-handoff card latched "Reviving…"
+        # on the click and re-arms on this reply, the reply for ITS request, matched by the revived sid, which
+        # is the card's own. With the notice aimed at the chat alone the feed heard nothing, and since the feed
+        # repaints a card only when the kernel re-sends it, a refusal that changes no card left that button
+        # latched until the parked card's colour ticked: never, past the colour ramp's ceiling.
+        _send_to_view("feed", failed, wid)
         return
     _kept_open.discard(sid)       # it's live again → no longer a read-only kept tab
     _push_soon()                  # surface it promptly — the woken pusher builds it off this thread
@@ -40299,8 +40325,19 @@ if(kind==="dict"){items[kk]=v[kk];}
 else if(kind.indexOf("dictlist:")===0){var cut=kk.indexOf(SEP),dk=cut<0?kk:kk.slice(0,cut),rest=cut<0?"":kk.slice(cut+1),lane=v[dk];if(rest===""){items[kk]=lane;}else{var j=pos[dk]||0;pos[dk]=j+1;items[kk]=lane[j];}}
 else{items[kk]=v[i];}}
 maps[name]={order:order,items:items};}return maps;}
-function assemble(kind,map){var i,kk;if(kind==="dict"){var o={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))o[kk]=map.items[kk];}return o;}
+// dictlist lanes keep their ARRAY IDENTITY across a delta that did not touch them: the lane prefix of
+// every set/del key names a touched lane, and an order that crosses touches every lane whose key
+// subsequence differs from the held order. An untouched lane assembles elementwise-identical to the
+// array the pane already holds, so assemble hands back that same array — turns[sid] identity then means
+// "unchanged", and a per-lane cache in the pane can key on it. The assembled VALUE is what it always
+// was; only object identity differs.
+function laneOf(kk){var cut=kk.indexOf(SEP);return cut<0?kk:kk.slice(0,cut);}
+function laneSeqs(order){var s={};for(var i=0;i<order.length;i++){var kk=order[i],ln=laneOf(kk);(s[ln]||(s[ln]=[])).push(kk);}return s;}
+function touchedLanes(c,oldOrder,newOrder){var t={},k;if(c.del)for(k=0;k<c.del.length;k++)t[laneOf(c.del[k])]=1;if(c.set)for(k in c.set)t[laneOf(k)]=1;
+if(c.order){var a=laneSeqs(oldOrder),b=laneSeqs(newOrder),ln;for(ln in a)if(!(ln in b)||JSON.stringify(a[ln])!==JSON.stringify(b[ln]))t[ln]=1;for(ln in b)if(!(ln in a))t[ln]=1;}return t;}
+function assemble(kind,map,prev,touched){var i,kk;if(kind==="dict"){var o={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))o[kk]=map.items[kk];}return o;}
 if(kind.indexOf("dictlist:")===0){var d={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(!map.items.hasOwnProperty(kk))continue;var cut=kk.indexOf(SEP);var dk=cut<0?kk:kk.slice(0,cut),rest=cut<0?"":kk.slice(cut+1);
+if(prev&&touched&&!touched[dk]&&Object.prototype.hasOwnProperty.call(prev,dk)){if(!d.hasOwnProperty(dk))d[dk]=prev[dk];continue;}   // an untouched lane: the held array itself, not a copy
 if(rest===""){d[dk]=map.items[kk];continue;}   // a bare-prefix entry: the lane's own (empty or non-list) value
 if(!d.hasOwnProperty(dk))d[dk]=[];d[dk].push(map.items[kk]);}return d;}
 var out=[];for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))out.push(map.items[kk]);}return out;}
@@ -40310,7 +40347,8 @@ var coll=d.coll||{};for(var name in coll){var kind=kinds[name];if(!kind)continue
 if(c.del){for(var x=0;x<c.del.length;x++){delete items[c.del[x]];}}
 if(c.set){for(var sk in c.set){if(!items.hasOwnProperty(sk))order.push(sk);items[sk]=c.set[sk];}}
 if(c.order){order=c.order.slice();}else{order=order.filter(function(kk){return items.hasOwnProperty(kk);});}
-last.maps[name]={order:order,items:items};m[name]=assemble(kind,last.maps[name]);}
+var touched=kind.indexOf("dictlist:")===0?touchedLanes(c,map.order,order):null;
+last.maps[name]={order:order,items:items};m[name]=assemble(kind,last.maps[name],last.msg[name],touched);}
 last.rev=d.rev;last.msg=m;return m;}
 window.__rompLocalSend=send;window.__rompApp=APP;   // federation.ts (the multi-kernel manager) routes local sends + knows the app through these
 var SK="romp-vscode-state-%s";   // persist webview state to localStorage so UI prefs survive a refresh
@@ -40782,7 +40820,11 @@ else if(m.type==="caps"&&panel.setCaps)panel.setCaps(m);
 else if(m.type==="unknownOp"&&panel.unknownOp)panel.unknownOp(m);
 else if(m.type==="tagEditFailed"&&panel.tagEditFailed)panel.tagEditFailed(m);
 else if(m.type==="openViewsDialog"&&panel._openViewsDialog)panel._openViewsDialog(null);};
-window.addEventListener("message",(window.__rompPerf&&window.__rompPerf.wrapFrameHandler)?window.__rompPerf.wrapFrameHandler(onFrame):onFrame);
+var frameListener=(window.__rompPerf&&window.__rompPerf.wrapFrameHandler)?window.__rompPerf.wrapFrameHandler(onFrame):onFrame;
+window.addEventListener("message",frameListener);
+// the merged data/bars frames come by direct call from federation.js once the listener is registered with it (federation.ts
+// onFrame/emit; the pane bundles register through frame-listener.ts) — without the registry the window dispatch carries them
+if(window.__rompFed&&window.__rompFed.onFrame)window.__rompFed.onFrame(frameListener);
 window.__rompTimelineOpenExternal=function(url){try{var u=new URL(url);if(u.protocol==="vscode:"){var q=u.searchParams;
 post({type:"deepLink",session:q.get("session"),anchor:q.get("anchor")||undefined,anchorT:Number(q.get("anchorT"))||undefined,anchorKind:q.get("anchorKind")||undefined,compose:q.get("compose")==="1"});
 if(window.parent!==window)window.parent.postMessage({romp:"reveal",pane:"chat"},"*");return;}}catch(e){}window.open(url,"_blank");};
@@ -47176,7 +47218,7 @@ class Handler(BaseHTTPRequestHandler):
             # Human verdict on a DIRECTED peer's held message (per-host trust): approve delivers it
             # (optionally with human-edited text), deny drops it. The bus owns delivery + the held-message
             # store, so proxy there; on success the bus removes the held file, so _quarantine_cards drops
-            # the card on the next build (event-based — no cleared.jsonl needed). Failure warn-toasts.
+            # the card on the next build (event-based — no cleared.jsonl needed). Failure answers the asker by mid.
             _qmid = str(msg["mid"])
             _qbody = {"mid": _qmid, "action": str(msg.get("action") or "").strip().lower()}
             if msg.get("text") is not None:
@@ -47187,7 +47229,12 @@ class Handler(BaseHTTPRequestHandler):
             if _qok:
                 _mark_views_dirty()
             else:
-                client["send"](json.dumps({"type": "warn", "text": "quarantine: " + _qerr}))
+                # the refusal answers the asking pane BY THE MESSAGE it was about (review find, 2026-09-08): the
+                # feed latched Approve/Deny ("Delivering…") on the click and re-arms them on this reply, matched
+                # by mid. It was a bare `warn` before, which the feed never handled, so a refused verdict left
+                # both buttons disabled until the card was re-sent, and a card the bus refused to act on is
+                # exactly the one that is never re-sent. The feed is the only poster of this op.
+                client["send"](json.dumps({"type": "quarantineRefused", "mid": _qmid, "text": "quarantine: " + _qerr}))
         elif msg and msg.get("type") == "nodeOverride" and msg.get("sid") and msg.get("nodeId"):
             # modal surgical override: cross a node off (op:resolve → nodeComplete) or drop it
             # (op:clear → the user-authority clear verdict, same seam as a card Clear, scoped to the

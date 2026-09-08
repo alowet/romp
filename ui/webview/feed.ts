@@ -5,13 +5,17 @@
 //
 // Rendering is KEYED + INCREMENTAL: cards are kept alive across the host's live
 // pushes and updated in place — never torn down — so hovering one doesn't flicker
-// when the fleet streams new deliverables in.
+// when the sessions stream new deliverables in. A kept card is REPAINTED only when
+// its inputs changed (feed-card-gate.ts): the kernel re-sent it, a board-level input
+// it reads moved, a gesture touched it, or the 15 s live pass aged it. Its column and
+// order are re-applied on every render regardless.
 import { distillText, distillInputs, applyDistillLine, distillPending, distillStaleNote } from "./distiller-line";
 import { flipNeeded } from "./feed-flip";
 import { delegate } from "./actions";
 import { paintHeld, paintReleased } from "./paint-gate";
 import { linkifyPrRefs, setLinkedText, senderPrRepo, installPrLinkOpener } from "./pr-links";
-import { spinFor, waitedSuffix, awaitWord, groupRows, GROUP_TITLE, ROW_KIND_OF_LEGACY, type AwaitRow } from "./spin-caption";
+import { cardInputsKey, cardNeedsUpdate, type GateEnv } from "./feed-card-gate";
+import { spinFor, awaitWord, groupRows, GROUP_TITLE, ROW_KIND_OF_LEGACY, type AwaitRow } from "./spin-caption";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { searchMatches, searchSids } from "./feed-search";
 import { TagLens, lensAll, lensLabel, lensVisible, lensUnions } from "./tag-lens";
@@ -22,6 +26,7 @@ import { hostNameNodes, hostPartsNodes, hostIsDown, hostDownNote, hostOf } from 
 import { extHoverMatches } from "./card-key";
 import { provenanceRows, provenanceGroupRows, rootStart, type ProvFmt, type ProvRow } from "./provenance";
 import { ageColorReadable } from "./age-color";
+import { liveNow, liveRefresher, refreshAges, stampAge } from "./feed-age";
 import { badgeNotices, clearBoundaryNotices, sdkProblemNotices, syncNotices,
   type ClearNoticeRow, type SdkNoticeRow, type SyncNoticeRow } from "./badge-mirror";
 import { initStrip } from "./strip";
@@ -33,6 +38,7 @@ import { initFileBrowse, openFileBrowse } from "./file-browse";
 import { VIEW_STATE_KEY, parseViewState, serializeViewState, pruneViewState, capViewState, type FeedViewState } from "./feed-view-state";
 import { wireTip, setTip, pruneTip } from "./tip";
 import { perfFrameHandler } from "./perf-telemetry";
+import { listenForFrames } from "./frame-listener";
 
 // (The standalone-deliverable "FeedItem" subsystem was REMOVED 2026-07-07: the kernel had emitted
 // items: [] permanently — goal cards are the only feed unit — so its types, renderers, expand/detail
@@ -251,6 +257,9 @@ function reconcilePendingDone(asks: AskItem[]) {
 }
 type MoveKind = "followup" | "answer";
 const pendingMoveKind = new Map<string, MoveKind>();
+// card itemId → the payload's own object the predicted copy replaced in `asks` (applyFollowMove), so the
+// kernel's refusal of the post can put it back (revertFollowMove) instead of waiting for the next frame
+const predictedFrom = new Map<string, AskItem>();
 // COLUMN-FLIP TRIPWIRE (the user 2026-07-28, who watched a just-replied card bounce Working →
 // Completed → Working and could not be told afterwards WHICH layer bounced it — every candidate
 // mechanism checked out sound post-hoc, and no surface records what the view actually SHOWED).
@@ -291,7 +300,19 @@ function auditShownColumns(list: AskItem[]) {
 function clearFollowMove(itemId: string, why = "") {
   const t = pendingFollowMove.get(itemId); if (t) clearTimeout(t);
   pendingFollowMove.delete(itemId); pendingMoveKind.delete(itemId); pendingMoveAck.delete(itemId);
+  predictedFrom.delete(itemId);
   if (why) lastFeedEvent = "clear:" + why;             // tripwire attribution only; behavior unchanged
+}
+// The kernel REFUSED the post a prediction rode on (an `err` naming the card's askFollowUp; review find,
+// 2026-09-08): the card goes back to what the payload says NOW, on that reply, rather than sitting in Working
+// until the next frame. The refusal is the event the no-answer backstop only approximated; the backstop's own
+// toast blamed silence, and here the kernel has spoken. Puts the payload's object back in the slot the copy
+// took, so the render shows the kernel's state and the gate repaints that card alone (a new identity).
+function revertFollowMove(itemId: string): void {
+  const orig = predictedFrom.get(itemId);
+  clearFollowMove(itemId, "refused");
+  if (orig) { const i = asks.findIndex((a) => a.itemId === itemId); if (i >= 0 && asks[i] !== orig) asks[i] = orig; }
+  render();
 }
 function optimisticFollowMove(itemId: string, kind: MoveKind = "followup") {
   const prev = pendingFollowMove.get(itemId); if (prev) clearTimeout(prev);
@@ -392,6 +413,7 @@ function applyFollowMove(list: AskItem[]) {
     const c: AskItem = { ...a, column: "working" };
     if ((pendingMoveKind.get(a.itemId) ?? "followup") === "followup") { c.recheck = true; c.followupPending = true; }   // plain move / answer: no chip
     if (c.t < nowSec) c.t = nowSec;   // sort to the bottom (newest); the group's repr follows via buildGroup
+    predictedFrom.set(a.itemId, a);   // what a refusal of the post puts back (revertFollowMove)
     list[i] = c;
   }
 }
@@ -487,9 +509,19 @@ onExternalSettingsChange((s) => { applyTheme(document, s); render(); });
 // Card-display prefs read straight from the shared 'romp:settings' (the kernel's ⛭ gear writes it; same
 // document as this feed bundle). Default ON. These gate the CARDS only — the modal always shows everything
 // (the user 2026-06-17). `!== false` so a missing key defaults to shown.
-function feedPrefs(): { newestFirst: boolean; collapsed: boolean; grouped: boolean; stacked: boolean } {
+// Memoised on the RAW settings string: called per card per render, and each call parsed the blob. Keyed on
+// the raw string, the memo is exact and needs no invalidation. `colormap` rides along for the per-card
+// update gate (feed-card-gate.ts): a colormap pick repaints every card once, as the settings epoch did.
+type FeedPrefs = { newestFirst: boolean; collapsed: boolean; grouped: boolean; stacked: boolean; colormap: string };
+const PREFS_DEFAULT: FeedPrefs = { newestFirst: false, collapsed: false, grouped: true, stacked: false, colormap: "aurora" };
+let prefsRaw: string | null | undefined;
+let prefsMemo: FeedPrefs = PREFS_DEFAULT;
+function feedPrefs(): FeedPrefs {
+  let raw: string | null = null;
+  try { raw = localStorage.getItem("romp:settings"); } catch { return PREFS_DEFAULT; }
+  if (raw === prefsRaw) return prefsMemo;
   try {
-    const s = JSON.parse(localStorage.getItem("romp:settings") || "{}");
+    const s = JSON.parse(raw || "{}");
     // newestFirst + collapsed default OFF (=== true): the feed's natural order is oldest-first, and cards
     // arrive with their summary open (the user 2026-07-07). collapsed is the DEFAULT section state new cards
     // inherit — a per-card expand overrides just that card without turning the mode off. (Sub-goals is now one
@@ -497,9 +529,11 @@ function feedPrefs(): { newestFirst: boolean; collapsed: boolean; grouped: boole
     // grouped (the user 2026-07-13): each column groups its cards by SESSION (tab/lane order), a session-name
     // header on the backdrop between runs, the per-card name dropped — the compact by-session read.
     // Default ON (!== false, same day): grouping is the feed's normal reading mode; the toggle opts OUT.
-    return { newestFirst: s.newestFirst === true, collapsed: s.collapsed === true, grouped: s.grouped !== false,
-             stacked: s.stacked === true };
-  } catch { return { newestFirst: false, collapsed: false, grouped: true, stacked: false }; }
+    prefsMemo = { newestFirst: s.newestFirst === true, collapsed: s.collapsed === true, grouped: s.grouped !== false,
+                  stacked: s.stacked === true, colormap: String(s.colormap || "aurora").toLowerCase() };
+  } catch { prefsMemo = PREFS_DEFAULT; }
+  prefsRaw = raw;
+  return prefsMemo;
 }
 // The kernel's session order (session-order.json — the SAME order the chat tabs + timeline lanes hold; the
 // user 2026-07-13: grouped-mode sessions must match it). Rides every feed push; federation concatenates
@@ -593,6 +627,10 @@ function setFeedSearch(q: string): void {
 // same pair settings sync rides): the browser's same-origin iframes hear the localStorage write
 // (`storage` fires cross-document), and VS Code's extension fans {colorSync} to its other panels.
 // Apply it to every copy this pane holds and re-render; the kernel's own re-broadcast reconciles.
+// IN PLACE, deliberately: these objects are federation's held frame, so the write lands in the cache too
+// and a re-emit before the kernel's own rebuild keeps the new colour (copies in this pane's list alone
+// would hand the old colour back on the next merged emission). The per-card update gate cannot see an
+// in-place write through object identity, so the colour rides the card key instead (feed-card-gate.ts).
 function applyColorEcho(sid: string, bg: string): void {
   if (!sid || !bg) return;
   const color = { bg, fg: "#ffffff" };   // fg fixed white, matching the kernel's _name_color
@@ -679,6 +717,12 @@ function setWorkDot(nameEl: HTMLElement | null, state: DotState | boolean) {
 }
 
 let hostNow = Math.floor(Date.now() / 1000);
+// …and WHEN that clock was read (ms, the browser's clock): the frame's `nowAt` when federation stamped one,
+// else the handling. Every age and duration on a card reads the kernel's clock through nowSec() (feed-age.ts
+// liveNow): the frame's `now` plus the local time since it landed, so the browser's skew from the kernel
+// never enters an age, and a quiet board's ages keep moving between frames.
+let hostNowAt = Date.now();
+function nowSec(): number { return liveNow(hostNow, hostNowAt, Date.now()); }
 let showDismissed = false;
 let dismissedCount = 0;
 let canUndoClear = false;   // host: cleared.jsonl has rows → the UndoClear button shows
@@ -688,6 +732,8 @@ let canUndoClear = false;   // host: cleared.jsonl has rows → the UndoClear bu
 // node) can't slide it and it would pop. We map the new card back to its predecessor's old rect so it slides
 // from there instead of appearing from nowhere. Rebuilt every render.
 let prevItemKey = new Map<string, string>();
+// Counts renders: the per-card update gate's key for a quarantine card carries it, so those cards never skip.
+let renderSeq = 0;
 
 // ONE builder for every Clear on the feed (the user 2026-09-08): the card's, the turn-group's and the
 // session header's wear the same element, class set, label and hover, so they cannot drift apart. Callers
@@ -704,6 +750,11 @@ function el(tag: string, cls?: string): HTMLElement {
   if (cls) e.className = cls;
   return e;
 }
+// A text write that compares first. In a document that has created a MutationObserver — gear.js creates
+// several at boot — Blink treats an identical textContent write as a real Text-node replacement and dirties
+// layout (feed-age.ts has the mechanism). The grouped-mode session headers repaint on every render (they are
+// not behind the per-card update gate), so their labels write through here.
+function setText(e: HTMLElement, s: string): void { if (e.textContent !== s) e.textContent = s; }
 
 // A lightweight yes/no overlay for the feed. Separate from the ask #feed-modal
 // (a different state machine); Esc or a backdrop click cancels.
@@ -833,7 +884,7 @@ function clockHM(t: number): string {
 // a disabled control (the buttons rule) — the label itself stays one word.
 function contTitle(latched: boolean, verb: string, at?: number | null): string {
   return latched
-    ? verb + " sent" + (at ? " " + relAge(hostNow - at) : "") +
+    ? verb + " sent" + (at ? " " + relAge(nowSec() - at) : "") +
       " — waiting for the session's reply to be judged; this re-arms then, and the card moves on its own"
     : verb === "a continue"
       ? "nothing needed from you — asks the session to keep going"
@@ -848,6 +899,22 @@ function relAge(sec: number): string {
   if (s < 3600) return `${Math.round(s / 60)}m ago`;
   if (s < 86400) return `${Math.round(s / 3600)}h ago`;
   return `${Math.round(s / 86400)}d ago`;
+}
+
+// A RUNNING duration as its own stamped element (feed-age.ts fmt "dur"): "42m" / "1h 5m" since an event
+// time, repainted by the 15 s live pass like every other age. Every elapsed label on a card renders through
+// here — the awaiting box, the Awaiting-task pill, the waiting-on chip, the working narration — because the
+// per-card update gate repaints a card only when its inputs change, and a duration baked into a caption
+// string would freeze on a card the kernel has no reason to re-send (a long wait whose record does not
+// change). On the kernel's clock (nowSec), like every other age here; these read Date.now() before.
+function durSpan(since: number): HTMLElement {
+  const d = el("span", "fask-dur");
+  stampAge(d, since, "dur", false, nowSec(), relAge, ageColorReadable);
+  return d;
+}
+/** waitedSuffix's live twin: [" · ", <duration>] for a known start, [] otherwise — no since, no duration, never a guess. */
+function durNodes(since: number | null | undefined): (string | HTMLElement)[] {
+  return since && since > 0 ? [" · ", durSpan(since)] : [];
 }
 
 function dayLabel(t: number, now: number): string {
@@ -909,7 +976,7 @@ function cardBellSvg(off: boolean): string {
     + '<path d="M6.6 11.6 A1.5 1.5 0 0 0 9.4 11.6"/>' + slash + "</svg>";
 }
 
-function cardNotifyOn(it: AskItem): boolean {
+function cardNotifyOn(it: { itemId: string; notify?: boolean | null }): boolean {
   return pendingNotify.has(it.itemId) ? !!pendingNotify.get(it.itemId) : !!it.notify;
 }
 
@@ -933,6 +1000,50 @@ function setCardNotify(card: HTMLElement, it: AskItem, value: boolean): void {
   pendingNotify.set(it.itemId, value);               // sticky until the kernel's payload carries it
   paintCardBell(card, value);                        // acknowledge instantly, before the round-trip
   vscodeApi?.postMessage({ type: "cardNotify", itemId: it.itemId, sid: it.sid, value });
+}
+
+// The kernel's reply to a latched click re-arms THAT button (review find, 2026-09-08). Each card-face latch
+// (Retry → "Retrying…", Revive → "Reviving…", Approve/Deny → "Delivering…", Continue → "Sent") holds the
+// acknowledgement until the kernel answers its own post (the click-safe rule), and since the per-card update
+// gate repaints a card only when the kernel re-sends it, the reply IS the event on a refusal (a success
+// re-sends the card, and that repaint re-arms it). Every refusal names the request it answers, and only the
+// latch that made that request lets go: `reviveFailed` names the revived id (the parked card's sid IS that id,
+// and its blocked.toSid), `retryRefused` and an `err` whose op is apiRetry name the session, `quarantineRefused`
+// names the held message's mid, an `err` whose op is askFollowUp names the card. A reply that names a session
+// but no request (an `err` from a kernel older than the op field) releases the session's Retry and Revive, as
+// it did before; one that names neither releases nothing: it answers no request, so every latch stays a
+// request the kernel has not answered. No clock anywhere. Returns how many buttons let go, so a caller can
+// speak only when this page's own click was the one answered (the chat pane voices its own).
+type LatchReply =
+  | { kind: "revive"; id: string }
+  | { kind: "retry"; sid: string }
+  | { kind: "quarantine"; mid: string }
+  | { kind: "followup"; itemId: string }
+  | { kind: "session"; sid: string };
+function rearmLatches(reply: LatchReply): number {
+  let n = 0;
+  const arm = (b: HTMLButtonElement | undefined, label: string) => {
+    if (b && b.disabled) { b.disabled = false; b.textContent = label; n++; }
+  };
+  for (const card of askEls.values()) {
+    const a = card as any;
+    const it = a._it as AskItem | undefined;
+    if (!it) continue;
+    const reviveIdle = () => (a._revive && (a._revive as any)._idle) || "Revive";
+    switch (reply.kind) {
+      case "revive": if ((it.blocked?.toSid || it.sid) === reply.id) arm(a._revive, reviveIdle()); break;
+      case "retry": if (it.sid === reply.sid) arm(a._apiRetry, "Retry"); break;
+      case "quarantine": if (it.blocked?.mid === reply.mid) { arm(a._qApprove, "Approve"); arm(a._qDeny, "Deny"); } break;
+      case "followup":
+        if (it.itemId === reply.itemId && a._cont && (a._cont as HTMLButtonElement).disabled) {
+          arm(a._cont, "Continue");
+          (a._cont as HTMLButtonElement).title = contTitle(false, "a continue", it.followupAt);
+        }
+        break;
+      case "session": if (it.sid === reply.sid) { arm(a._apiRetry, "Retry"); arm(a._revive, reviveIdle()); } break;
+    }
+  }
+  return n;
 }
 
 function showCardMenu(e: MouseEvent, card: HTMLElement): void {
@@ -1266,7 +1377,7 @@ function makeAskCard(it: AskItem): HTMLElement {
     card.dispatchEvent(new MouseEvent("mouseleave"));
     dressHeaderIfLast(card, it.sid);   // the run's last card takes its header with it — one motion (2026-08-24)
     pendingCleared.add(it.itemId);   // suppress from incoming pushes until the kernel confirms the clear
-    clearedStack.push([it]);         // cache for an instant optimistic Undo
+    clearedStack.push([(card as any)._it ?? it]);   // cache the FRESHEST payload copy for an instant optimistic Undo (the closure's `it` is the card's creation-time object)
     card.classList.add("dismissing");
     vscodeApi?.postMessage({ type: "askClear", itemId: it.itemId, sid: it.sid });
     setTimeout(() => { if (askEls.get(it.itemId) === card && card.classList.contains("dismissing")) { card.remove(); askEls.delete(it.itemId); dropDismissed([it.itemId]); } }, 180);
@@ -1576,9 +1687,6 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
   // class in the visible label (tooltips are dead on the touch PWA). ONE rule with the chat chip and
   // the awaiting box (awaitWord, slice 2): one row → its word, several of a kind → count + word, mixed
   // kinds → the number alone ("Awaiting 4"); a single named peer → its name in identity colour.
-  // the wait's elapsed time rides the pill exactly as it rides the awaiting box and the working
-  // narration — a stuck wait must be glanceable everywhere the state shows (the user 2026-08-23)
-  const pillWaited = waitedSuffix(it.awaiting && it.awaiting.since, Date.now() / 1000);
   const pillPeers = (it.awaiting && it.awaiting.peers) || [];
   const pillWord = awaitWord(awKind, (it.awaiting && it.awaiting.count) ?? taskRows.length, taskRows);
   const pillLbl = a._taskLbl as HTMLElement;
@@ -1589,7 +1697,10 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
     if (pillPeers[0].color && pillPeers[0].color.bg) nm.style.color = pillPeers[0].color.bg;
     pillLbl.appendChild(nm);
   } else pillLbl.append(pillWord);
-  pillLbl.append(pillWaited);
+  // the wait's elapsed time rides the pill exactly as it rides the awaiting box and the working
+  // narration — a stuck wait must be glanceable everywhere the state shows (the user 2026-08-23) —
+  // as a stamped duration the 15 s live pass keeps moving (durNodes, the live twin of waitedSuffix)
+  pillLbl.append(...durNodes(it.awaiting && it.awaiting.since));   // the waited time, live (durSpan)
   taskBtn.classList.toggle("on", choice === "tasks");
   taskBtn.setAttribute("aria-pressed", choice === "tasks" ? "true" : "false");
   taskBtn.title = choice === "tasks" ? "hide the tasks" : "show the tasks";
@@ -1724,36 +1835,13 @@ function applySections(a: any, it: AskItem, distillShown: boolean): void {
   renderTree();
 }
 
-// The payload copy a card was last painted from, serialized — a card whose data did not change since is not
-// repainted. Every feed frame used to rewrite all ~155 cards (about a hundred DOM writes each) when the frame
-// changed one of them (2026-09-04). The display-side state a paint also reads (hover/pin focus, the pending
-// bell, the done ticks) is folded into the key, so a change to any of it repaints as before.
-// Bumped whenever a display-side input EVERY card reads changes: the view prefs (grouped, collapsed), the
-// working/awaiting/unknown status sets and the self host that the session dots and delegation lines read.
-// A card's key carries it, so such a change repaints every card once, as before. The coarse clock repaints
-// each card at most every 15 s so the durations it renders (waited, working for, paragraph ages) keep
-// ticking — the old cadence was every kernel push, at most 60 s apart.
-let paintEpoch = 0;
-let statusSig = "";
-function noteStatusInputs(): void {
-  const sig = [...workingSet].sort().join(",") + "|" + [...awaitingSet].sort().join(",") + "|" + [...unknownSet].sort().join(",") + "|" + feedSelfHost;
-  if (sig !== statusSig) { statusSig = sig; paintEpoch++; }
-}
-function cardPaintKey(it: AskItem): string {
-  return JSON.stringify(it) + "|" + (it.itemId === (hoverAskId ?? pinnedAskId) ? "f" : "") + (it.itemId === pinnedAskId ? "p" : "")
-    + "|" + (pendingNotify.has(it.itemId) ? String(pendingNotify.get(it.itemId)) : "") + "|" + [...pendingDone].join(",")
-    + "|" + paintEpoch + "|" + Math.floor(Date.now() / 15000);
-}
-
+// Paints a card's face from its payload copy. Whether to call it at all is reconcileCol's decision (the
+// per-card update gate, feed-card-gate.ts): a card is repainted when its object is a new one or a
+// board-level input it reads changed, and left alone otherwise. Everything this function reads outside
+// `it` is therefore in that key — an input added here is added there.
 function updateAskCard(card: HTMLElement, it: AskItem) {
   const a = card as any;
-  a._it = it;   // the freshest payload copy — the right-click bell menu reads this, never a stale closure
-  const pk = cardPaintKey(it);
-  // Nothing this card shows has changed → leave its DOM alone. Except a card with a LATCHED button (Approve →
-  // Delivering…, Retry → Retrying…, Revive → Reviving…): those rely on the next paint to re-enable when the
-  // refused action left the payload unchanged, so a card with a disabled button always repaints.
-  if (a._paintKey === pk && !card.querySelector("button[disabled]")) return;
-  a._paintKey = pk;
+  a._it = it;   // the freshest payload copy — the right-click bell menu reads this, never a stale closure; and the gate's identity
   // per-card bell: retire the optimistic value once the kernel's payload agrees (event-based, no timer),
   // then render whichever stands. Same sticky-optimism shape as the timeline lane's _pendingFlags.
   if (pendingNotify.has(it.itemId) && !!it.notify === pendingNotify.get(it.itemId)) pendingNotify.delete(it.itemId);
@@ -1874,7 +1962,7 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
       og.append(peer);
     });
   }
-  a._time.textContent = relAge(hostNow - it.t);
+  stampAge(a._time, it.t, "plain", false, nowSec(), relAge, ageColorReadable);   // stamped: the 15 s live pass moves it
   // hover the stamp for provenance (the user 2026-07-27): the age marks the NEWEST event (a done card's
   // age is its completion), so the popover tells where the thread came from — started when, each sub +
   // its time, what the stamp marks.
@@ -1952,10 +2040,10 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
     a._waitOn.append(woPre, woName);
     // elapsed since the unanswered ask went out (kernel _wait_for_graph's since) — the same readout the
     // working narration and awaiting box wear, so a wait stuck for hours is glanceable (the user 2026-08-23)
-    const woWaited = waitedSuffix(wo.since, Date.now() / 1000);
-    if (woWaited) {
-      const woDur = el("span", "fask-waiton-dur"); woDur.textContent = woWaited;
-      a._waitOn.append(woDur);
+    const woDur = durNodes(wo.since);
+    if (woDur.length) {
+      const woWrap = el("span", "fask-waiton-dur"); woWrap.append(...woDur);
+      a._waitOn.append(woWrap);
     }
     a._waitOn.title = wo.inCycle
       ? "MUTUAL WAIT — this session and " + wo.name + " are each waiting on the other (a deadlock); auto-nudge surfaces it instead of nudging"
@@ -1985,7 +2073,7 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
   // The card is not left mute in that window: the Working displacement only happens under recheck/rejudging,
   // and both raise the "Analyzing…" swirl below, which says the judge is looking at it again.
   const spin = spinFor(it, distillPending(dCompleted, dBlocked, it.summary, it.blockSummary, !!it.blocked),
-                       dCompleted, Date.now() / 1000);
+                       dCompleted, nowSec());
   const spinCaption = spin.caption, spinTip = spin.tip, awaitingBg = spin.awaitingBg;
   a._awaitSpin.style.display = spinCaption ? "" : "none";
   // The AWAITING case gets a rounded box (its distinct read); the swirl spins in every case now —
@@ -2014,8 +2102,9 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
         }
         a._awaitWhy.appendChild(nm);
       });
-      a._awaitWhy.append(waitedSuffix(it.awaiting && it.awaiting.since, Date.now() / 1000));
-    } else a._awaitWhy.textContent = spinCaption;
+      a._awaitWhy.append(...durNodes(it.awaiting && it.awaiting.since));
+    } else if (spin.dur) a._awaitWhy.replaceChildren(spin.dur.text, durSpan(spin.dur.since));   // the caption's running duration, live
+    else a._awaitWhy.textContent = spinCaption;
     a._awaitSpin.title = spinTip || spinCaption;
     // HONEST fallback (the user 2026-08-26): a peer-kind wait with no named session says WHY the
     // name is missing, instead of presenting "peer" as a style — identity is only truly unknowable
@@ -2093,13 +2182,14 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
     if (stampOk || anchOk) {
       const dle = a._distill as HTMLElement;
       dle.textContent = "";
-      const nowS = Date.now() / 1000;
+      const nowS = nowSec();
       paras.forEach((p, i) => {
         const para = el("div", "fask-para");
         para.textContent = p;
         if (stampOk && i < bp!.length) {
           const age = el("span", "fask-para-age");
-          age.textContent = relAge(nowS - (bp![i].since || nowS));
+          if (bp![i].since) stampAge(age, bp![i].since, "plain", false, nowS, relAge, ageColorReadable);   // stamped: the live pass moves it
+          else age.textContent = relAge(0);   // no event time → the static "<1m ago" this chip always showed; nothing to count from
           para.append(" ", age);
         }
         // T220 first: the paragraph's own citation, with its located span riding the landing
@@ -2223,10 +2313,17 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
       : it.blocked.status ? `⚠ API error · ${it.blocked.status}` : "⚠ API error";
     // a refusal's raw CLI text buries the remedy — the kernel's `what` states it plainly, so tip with that
     setTip(a._apiBadge as HTMLElement, (spendLimit || refusal) ? it.blocked.what : (it.blocked.text || it.blocked.what));
+    // The latched "Retrying…" re-arms on any repaint of this card — a new object or a key flip; the expected
+    // path is the session resuming, which moves the working set (the key) and hides the whole unit — and on
+    // the kernel's reply to THIS click (rearmLatches): `retryRefused` when the backend could not take the
+    // send, or an `err` naming this session's apiRetry when the kernel has no such session. Before the
+    // per-card update gate it re-armed on the next push of any card. The click is a MANUAL retry (the chat
+    // pane sends the same): the kernel fires it past every auto gate, so the button is never a dead no-op on
+    // a paused or suppressed thread. Revive below latches the same way and re-arms on `reviveFailed`.
     a._apiRetry.disabled = false; a._apiRetry.textContent = "Retry";
     a._apiRetry.onclick = (ev: Event) => {
       ev.stopPropagation();
-      vscodeApi?.postMessage({ type: "apiRetry", id: it.sid });
+      vscodeApi?.postMessage({ type: "apiRetry", id: it.sid, manual: true });
       a._apiRetry.disabled = true; a._apiRetry.textContent = "Retrying…";
     };
   }
@@ -2282,6 +2379,7 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
   if (isParked && it.blocked) {
     const toSid = it.blocked.toSid || it.sid;
     a._revive.disabled = false; a._revive.textContent = `Revive ${it.blocked.toName || it.name}`;
+    (a._revive as any)._idle = a._revive.textContent;   // the label rearmLatches restores on the kernel's reviveFailed for toSid
     a._revive.onclick = (ev: Event) => {
       ev.stopPropagation();
       vscodeApi?.postMessage({ type: "reviveSession", id: toSid });
@@ -2576,7 +2674,7 @@ function updateGroupCard(card: HTMLElement, g: AskGroup) {
   a._name.replaceChildren(...hostNameNodes(g.name, g.sid));
   if (g.color) a._name.style.color = g.color.bg;
   setWorkDot(a._name, dotFor(g.name));   // working/awaiting dot before the session name
-  a._time.textContent = relAge(hostNow - g.t);
+  stampAge(a._time, g.t, "plain", false, nowSec(), relAge, ageColorReadable);
   wireAgeTip(a._time, () => provenanceGroupRows(g.members.map(rootStart), g.t, hostNow, PROV_FMT));
   // member lines — rebuilt only when the member set or any member's status changes
   const memSig = g.members.map((m) => m.itemId + ":" + memberStatus(m)).join("|");
@@ -3459,9 +3557,15 @@ function makeSessHead(): HTMLElement {
   return h;
 }
 function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
-  h.setAttribute("data-fsid", e.sid);   // the hover-freeze badge painter finds headers by sid
+  // the hover-freeze badge painter finds headers by sid; compare first, like the labels below — the DOM's
+  // change-an-attribute steps queue a mutation record for a same-value write too
+  if (h.getAttribute("data-fsid") !== e.sid) h.setAttribute("data-fsid", e.sid);
   const nm = (h as any)._name as HTMLElement;
-  nm.replaceChildren(...hostNameNodes(e.name, e.sid));
+  // the name nodes are minted only when what they show changes: headers repaint every render (they are not
+  // behind the per-card update gate), and each mint is a Text-node replacement — the same reason cards are
+  // gated. hostNameNodes reads the name, the sid's host prefix and whether that host's link is down.
+  const nmSig = e.name + "\u0000" + e.sid + "\u0000" + (hostIsDown(e.sid) ? "d" : "");
+  if ((h as any)._nmSig !== nmSig) { (h as any)._nmSig = nmSig; nm.replaceChildren(...hostNameNodes(e.name, e.sid)); }
   if (e.color) nm.style.color = e.color.bg;
   nm.classList.toggle("dead", !e.live);
   nm.onclick = (ev) => { ev.stopPropagation(); openOrReviveSession(e.sid, e.live, e.name); };
@@ -3470,13 +3574,13 @@ function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
   const fold = (h as any)._fold as HTMLElement, foldn = (h as any)._foldn as HTMLElement;
   const shut = collapsedThreads.has(e.sid);
   h.classList.toggle("folded", shut);
-  fold.textContent = shut ? "▸" : "▾";           // ▸ folded / ▾ open
+  setText(fold, shut ? "▸" : "▾");               // ▸ folded / ▾ open
   fold.title = shut ? "show this session's cards" : "collapse this session to its name — new cards stay folded too";
   fold.setAttribute("aria-expanded", shut ? "false" : "true");
   fold.setAttribute("aria-label", (shut ? "expand " : "collapse ") + e.name);
   foldn.style.display = shut && e.folded ? "" : "none";
   // just the number (the user 2026-08-26) — the section chips' own vocabulary; the words live on hover
-  foldn.textContent = String(e.folded);
+  setText(foldn, String(e.folded));
   foldn.title = e.folded === 1 ? "1 card folded under this session" : e.folded + " cards folded under this session";
   fold.onclick = (ev) => {
     ev.stopPropagation();   // the fold IS the acknowledgement: local state + an immediate re-render
@@ -3494,7 +3598,7 @@ function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
   const procs = e.live ? bgServicesMap[e.name] || [] : [];
   const open = procs.length > 0 && openBgSvc.has(e.sid);
   svc.style.display = procs.length ? "" : "none";
-  svc.textContent = procs.length === 1 ? "background process" : procs.length + " background processes";
+  setText(svc, procs.length === 1 ? "background process" : procs.length + " background processes");
   svc.title = open ? "hide the processes" : "processes this session keeps running — click to list";
   svc.classList.toggle("on", open);
   svc.setAttribute("aria-pressed", open ? "true" : "false");
@@ -3531,6 +3635,10 @@ function makeUndoClearBtn(): HTMLElement {
       for (const it of batch) {
         pendingCleared.delete(it.itemId);
         pendingRestored.set(it.itemId, it);                                  // stay sticky until the kernel push carries it
+        // a card still inside its 180 ms collapse keeps its element AND its object, so the per-card update
+        // gate would leave `.dismissing` on it and the collapse timer would then remove the restored card:
+        // the Undo gesture is the event that takes the class off
+        askEls.get(it.itemId)?.classList.remove("dismissing");
         if (!asks.some((a) => a.itemId === it.itemId)) asks.push(it);        // show it NOW
       }
       render();
@@ -4261,7 +4369,7 @@ function clearSessionCards(sid: string): void {
   }, 180);
 }
 
-function reconcileCol(listEl: HTMLElement, entries: Entry[], globalDesired: Set<string>) {
+function reconcileCol(listEl: HTMLElement, entries: Entry[], globalDesired: Set<string>, gate: GateEnv) {
   const existing = new Map<string, HTMLElement>();
   for (const c of Array.from(listEl.children) as HTMLElement[]) {
     const k = c.dataset.key;
@@ -4275,7 +4383,14 @@ function reconcileCol(listEl: HTMLElement, entries: Entry[], globalDesired: Set<
       key = "a:" + e.ask.itemId;
       card = askEls.get(e.ask.itemId) || makeAskCard(e.ask);
       askEls.set(e.ask.itemId, card);
-      updateAskCard(card, e.ask);
+      // THE UPDATE GATE (feed-card-gate.ts): repaint only a card the kernel re-sent (a new object — the pane
+      // shim's delta reassembly and federation's merge keep an unchanged card's object by reference) or whose
+      // board-level inputs changed (the key). Everything below — placement, the insertBefore order walk, the
+      // cross-column removal — stays unconditional, so a card whose column or sort changed still moves. The
+      // key is stored only after updateAskCard returns: a throw mid-update leaves the card marked for another
+      // try, not recorded as painted.
+      const ik = cardInputsKey(e.ask, gate);
+      if (cardNeedsUpdate(card as any, e.ask, ik)) { updateAskCard(card, e.ask); (card as any)._ik = ik; }
     } else if (e.kind === "sess") {
       // grouped-mode session header — keyed per (column, sid): one session can head a run in EVERY column
       key = "s:" + listEl.id + ":" + e.sid;
@@ -4328,6 +4443,7 @@ function columnsOf(buckets: Record<Column, Entry[]>): Map<string, string> {
   return m;
 }
 const FLY_COLS: ("asks" | "needsInput" | "completed")[] = ["asks", "needsInput", "completed"];
+let flySeq = 0;   // the fly token: the element remembers the newest fly's number (see the write phase)
 function captureCardRects(cols: ReturnType<typeof ensureCols>): Map<string, FlipState> {
   const m = new Map<string, FlipState>();
   for (const key of FLY_COLS) {
@@ -4351,35 +4467,64 @@ function flyColumnChanges(first: Map<string, FlipState>, cols: ReturnType<typeof
       const k = c.dataset.key; if (!k) continue;
       const prev = first.get(k);
       if (!prev) continue;                                 // brand-new card → no FLIP (nothing to glide from)
+      // a card nobody could see — its column folded to the header (display:none) — has a zero First rect:
+      // nothing to glide from, and a fly from (0,0) zooms in from the pane's corner
+      if (!prev.rect.width && !prev.rect.height) continue;
       const now = c.getBoundingClientRect();
+      // …and a target nobody can see has a zero Last rect and no transition to run, so a fly written to it
+      // would never end: the class it wears, pointer-events:none, stayed until the card's next repaint, and
+      // the per-card update gate no longer rewrites className every render. Nothing to glide to; leave it.
+      if (!now.width && !now.height) continue;
       const dx = prev.rect.left - now.left, dy = prev.rect.top - now.top;
       if (!dx && !dy) continue;                            // didn't move → leave it alone
       moves.push({ c, dx, dy, crossed: prev.col !== colEl.id });
     }
   }
   for (const { c, dx, dy, crossed } of moves) {
-    {
-      // Two flavors of move, ONE FLIP (the user 2026-06-29): a card that CHANGED COLUMN flies in the BACK
-      // layer (z-index:-1 → behind the other cards, so it never sails over them); a card that STAYED in its
-      // column but shifted — because the card that left it vacated a slot — glides IN PLACE in normal flow, so
-      // the remaining cards reflow smoothly to their new spots instead of snapping there in a discrete jump.
-      if (crossed) c.classList.add("fitem-flying");
-      // Invert: jump the card back to its old spot, instantly.
-      c.style.transition = "none";
-      c.style.transform = `translate(${dx}px, ${dy}px)`;
-      // Play: next frame, release the offset with a transition → it glides to its new home.
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        c.style.transition = "transform .42s cubic-bezier(.22, .61, .36, 1)";
-        c.style.transform = "translate(0, 0)";
-      }));
-      const done = (ev: TransitionEvent) => {
-        if (ev.propertyName !== "transform") return;
-        c.removeEventListener("transitionend", done);
-        if (crossed) c.classList.remove("fitem-flying");
-        c.style.transition = ""; c.style.transform = "";   // back to normal flow + stacking
-      };
-      c.addEventListener("transitionend", done);
-    }
+    // Two flavors of move, ONE FLIP (the user 2026-06-29): a card that CHANGED COLUMN flies in the BACK
+    // layer (z-index:-1 → behind the other cards, so it never sails over them); a card that STAYED in its
+    // column but shifted — because the card that left it vacated a slot — glides IN PLACE in normal flow, so
+    // the remaining cards reflow smoothly to their new spots instead of snapping there in a discrete jump.
+    // ONE fly owns an element at a time: a second render can fly the same card while the first fly's 420 ms
+    // transition still runs — two deltas within half a second on an active board. The second Invert cancels
+    // the first transition, and the browser delivers that transitioncancel to EVERY listener on the element
+    // before the second fly's Play frame. Two guards: a per-element token, so a superseded fly's
+    // end/cancel/backstop removes its own listeners and touches nothing else; and `played`, so a fly ignores
+    // transition events that arrive before its own Play wrote the transition — those belong to the fly it
+    // cancelled. Without them the older fly's cancel handler wiped the newer Invert and the card snapped
+    // where it should have glided (reproduced in Chromium).
+    const mine = ++flySeq;
+    (c as any)._flySeq = mine;
+    if (crossed) c.classList.add("fitem-flying");
+    // Invert: jump the card back to its old spot, instantly.
+    c.style.transition = "none";
+    c.style.transform = `translate(${dx}px, ${dy}px)`;
+    // the fly ends on its own event — end OR cancel (a card re-inserted or hidden mid-flight gets
+    // transitioncancel, never transitionend) — with a backstop so a lost event can never leave the card in
+    // the back layer, pointer-events off (absorbIntoParent's idiom). Idempotent: whichever fires first.
+    let flown = false, played = false;
+    const done = (ev?: TransitionEvent) => {
+      if (flown) return;
+      if (ev && (ev.propertyName !== "transform" || !played)) return;   // not this fly's transition
+      flown = true;
+      c.removeEventListener("transitionend", done);
+      c.removeEventListener("transitioncancel", done);
+      if ((c as any)._flySeq !== mine) return;             // superseded: the newer fly owns the element's styles
+      c.classList.remove("fitem-flying");                  // whichever fly added it — the element is settled now
+      c.style.transition = ""; c.style.transform = "";     // back to normal flow + stacking
+    };
+    c.addEventListener("transitionend", done);
+    c.addEventListener("transitioncancel", done);
+    window.setTimeout(done, 650);
+    // Play: next frame, release the offset with a transition → it glides to its new home. Unless the fly
+    // already ended or was superseded (a hidden tab pauses animation frames while the backstop's timer
+    // still runs): a release after that would leave an inline identity transform on a settled card.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (flown || (c as any)._flySeq !== mine) return;
+      played = true;
+      c.style.transition = "transform .42s cubic-bezier(.22, .61, .36, 1)";
+      c.style.transform = "translate(0, 0)";
+    }));
   }
 }
 
@@ -4644,6 +4789,7 @@ function watchFeedVisibility(list: HTMLElement): void {
   new IntersectionObserver((entries) => {
     feedIntersecting = entries.some((e) => e.isIntersecting);
     releasePaint();
+    live.catchUp();   // the 15 s age pass skipped while off screen (feed-age.ts liveRefresher); one pass, same measure
   }).observe(list);
 }
 // The owed paint, settled the moment both measures say the pane can be seen. Synchronous on purpose (no
@@ -4782,10 +4928,21 @@ function render() {
   prevCols = nextCols;
   const flipFirst = needFlip ? captureCardRects(cols) : new Map<string, FlipState>();
 
+  // The per-card update gate's inputs, resolved ONCE for this render (feed-card-gate.ts cardInputsKey):
+  // everything updateAskCard reads outside the ask object. A card is repainted when its object or this key
+  // changed, so a frame's cost scales with the cards the kernel re-sent and the cards a changed input
+  // reaches, not with the board.
+  const gprefs = feedPrefs();
+  const gate: GateEnv = {
+    dot: dotFor, working: (n) => workingSet.has(n),
+    focusId: hoverAskId ?? pinnedAskId, pinnedId: pinnedAskId, notifyOn: cardNotifyOn,
+    prefs: { grouped: gprefs.grouped, collapsed: gprefs.collapsed, colormap: gprefs.colormap },
+    hostDown: hostIsDown, selfHost: feedSelfHost, repo: prRepoOf, seq: ++renderSeq,
+  };
   const desired = new Set<string>();
-  reconcileCol(cols.asks, buckets.asks, desired);
-  reconcileCol(cols.needsInput, buckets.needsInput, desired);
-  reconcileCol(cols.completed, buckets.completed, desired);
+  reconcileCol(cols.asks, buckets.asks, desired, gate);
+  reconcileCol(cols.needsInput, buckets.needsInput, desired, gate);
+  reconcileCol(cols.completed, buckets.completed, desired, gate);
   // the count chip shows the number only when there ARE cards; an empty column shows nothing — not "0"
   // (the user 2026-06-25). Empty string collapses the chip (it has no padding/background of its own).
   const setCount = (elc: HTMLElement, n: number) => { elc.textContent = n ? String(n) : ""; elc.style.display = n ? "" : "none"; };
@@ -5018,7 +5175,6 @@ window.addEventListener("blur", () => { if (kbMode) kbExit(); });   // shell mov
 // same-page toggle both land here).
 let lastCollapsedPref = feedPrefs().collapsed;
 function onSettingsChanged(): void {
-  paintEpoch++;   // grouped/collapsed/stacked reach into every card's paint (name row, row2, sections)
   const p = feedPrefs();
   if (p.collapsed !== lastCollapsedPref) { lastCollapsedPref = p.collapsed; secChoice.clear(); }
   applyStacked(p.stacked);
@@ -5339,7 +5495,6 @@ function applyFeedPayload(m: any): void {
   }
   awaitingSet = new Set(Array.isArray(m.awaiting) ? m.awaiting : []);   // await-green awaiting dots (the user 2026-07-13)
   unknownSet = new Set(Array.isArray(m.stateUnknown) ? m.stateUnknown : []);   // listed-but-unreadable → gray ring, never a blank
-  noteStatusInputs();   // the dots and delegation lines every card paints read these → a change repaints every card
   bgServicesMap = m.bgServices && typeof m.bgServices === "object" ? m.bgServices : {};   // session name -> judge-classified service descs → the session-header chip (2026-07-24)
   if (Array.isArray(m.order)) sessionOrder = m.order.filter((x: any) => typeof x === "string");   // grouped-mode session rank (tab/lane order)
   pendingHosts = Array.isArray(m.pendingHosts) ? m.pendingHosts.filter((h: any) => typeof h === "string") : [];
@@ -5352,7 +5507,13 @@ function applyFeedPayload(m: any): void {
     // event: the session left the tab list), rather than leaving the board silently pinned to nothing
     if (feedOnlySid && !sessionsMeta.some((s) => s.sid === feedOnlySid)) setFeedOnly(null);
   }
-  hostNow = typeof m.now === "number" ? m.now : Math.floor(Date.now() / 1000);
+  if (typeof m.now === "number") {
+    hostNow = m.now;
+    hostNowAt = typeof m.nowAt === "number" ? m.nowAt : Date.now();   // the pair travels together: the frame's clock, and when THAT frame arrived (federation stamps it, so a re-emit of a held frame does not re-anchor)
+  } else {
+    hostNow = Math.floor(Date.now() / 1000);   // an older kernel's frame carries no clock: the browser's own, from here
+    hostNowAt = Date.now();
+  }
   mirrorBadges(incomingAsks, Array.isArray(m.clearNotices) ? m.clearNotices : [],
     Array.isArray(m.sdkNotices) ? m.sdkNotices : [],
     Array.isArray(m.syncNotices) ? m.syncNotices : []);   // card trouble chips + /clear drops + SDK failures + fleet syncs also log in the shell's bell (chips stay on the cards)
@@ -5373,7 +5534,8 @@ function applyFeedPayload(m: any): void {
 
 // every frame's synchronous handling time is measured (perf-telemetry.ts: one clientDiag row a
 // minute, read by `romp perf client`); the handler itself is unchanged
-window.addEventListener("message", perfFrameHandler("feed", (m) => vscodeApi?.postMessage(m), (e: MessageEvent) => {
+// …and handed the merged frames by direct call from federation.js when this page has it (frame-listener.ts)
+listenForFrames(perfFrameHandler("feed", (m) => vscodeApi?.postMessage(m), (e: MessageEvent) => {
   const m = e.data;
   if (!m) return;
   if (m.type === "pipeState") { pipeBanner(!!m.up, Number(m.queued) || 0); return; }
@@ -5457,7 +5619,7 @@ window.addEventListener("message", perfFrameHandler("feed", (m) => vscodeApi?.po
   } else if (m.type === "settingRefused" && typeof m.text === "string" && m.text) {
     // the kernel refused a bell toggle this page posted (its store could not be read): end the optimistic
     // state ON THIS EVENT — the card's sticky latch drops and the bell repaints to what the payload holds
-    // (the paint key reads the latch) — and say why. A SOFT refusal: nothing typed was lost, so the fading
+    // (the card gate's key reads the latch through cardNotifyOn) — and say why. A SOFT refusal: nothing typed was lost, so the fading
     // toast (the chat's weight for the same class), never the must-dismiss dialog; the shell's bell keeps the
     // durable record under its own `refused` kind, so muting judge warnings never mutes these. A `warn`
     // frame had no handler on this page, so the bell stayed painted as if the click had landed until a reload.
@@ -5467,6 +5629,22 @@ window.addEventListener("message", perfFrameHandler("feed", (m) => vscodeApi?.po
                                  sid: typeof m.sid === "string" ? m.sid : "",
                                  itemId: typeof m.itemId === "string" ? m.itemId : "" }, "*");
     feedToast(m.text);
+  } else if (m.type === "reviveFailed" && typeof m.id === "string" && m.id) {
+    // the kernel's reply to a Revive (review find, 2026-09-08): the parked card whose button this page latched
+    // lets go, and the reason rides the fading toast, only when a latch here was the one answered; the chat
+    // pane of the same dashboard shows the failure in the revived session's own pane either way, so a revive
+    // clicked there says nothing twice.
+    if (rearmLatches({ kind: "revive", id: m.id })) {
+      feedToast("Couldn't revive " + String(m.name || m.id) + ": " + String(m.text || "unknown error"));
+    }
+  } else if (m.type === "retryRefused" && typeof m.sid === "string" && m.sid) {
+    // the backend could not take the manual retry's send: the Retry this page latched lets go, and says why
+    if (rearmLatches({ kind: "retry", sid: m.sid })) feedToast(String(m.text || "Couldn't retry: the kernel refused it."));
+  } else if (m.type === "quarantineRefused" && typeof m.mid === "string" && m.mid) {
+    // the bus refused a verdict on a held message: that card's Approve and Deny let go, and the reason is said
+    // (this was a bare `warn` before, which this page never handled). The feed is the only poster of verdicts.
+    rearmLatches({ kind: "quarantine", mid: m.mid });
+    feedToast(String(m.text || "the held message could not be acted on"));
   } else if (m.type === "err" && typeof m.text === "string" && m.text) {
     // the dialog interrupts; the bell KEEPS it (the user 2026-07-29) — dismissing the modal must not erase
     // the fact that a message never landed. Same {romp:'notify'} bridge the card-badge mirror below uses.
@@ -5476,6 +5654,19 @@ window.addEventListener("message", perfFrameHandler("feed", (m) => vscodeApi?.po
                                  text: copy ? title + ": " + copy : title,
                                  sid: typeof m.sid === "string" ? m.sid : "" }, "*");
     showErrDialog(title, m.text, copy);
+    const sid = typeof m.sid === "string" ? m.sid : typeof m.id === "string" ? m.id : "";
+    // the kernel's reply IS the event, for the request it names (rearmLatches): a refused apiRetry releases
+    // that session's Retry; a refused askFollowUp releases that card's Continue, and its predicted move yields
+    // to the kernel's answer (revertFollowMove; the no-answer backstop would have bounced it later with a toast
+    // that blamed silence). A reply naming a session and no request is an older kernel's: the session's Retry
+    // and Revive, as before. One naming neither answers no request here.
+    const op = typeof m.op === "string" ? m.op : "";
+    const itemId = typeof m.itemId === "string" ? m.itemId : "";
+    if (op === "apiRetry" && sid) rearmLatches({ kind: "retry", sid });
+    else if (op === "askFollowUp" && itemId) {
+      rearmLatches({ kind: "followup", itemId });
+      if (pendingFollowMove.has(itemId)) revertFollowMove(itemId);
+    } else if (!op && sid) rearmLatches({ kind: "session", sid });
   } else if (m.type === "pickerOptions" && typeof m.name === "string") {
     // the host read the blocked session's live resume-picker screen — show the
     // same options in-page; a choice goes back as keystrokes (transport only,
@@ -5677,18 +5868,61 @@ function revealCards(keys: Set<string>) {
     c.classList.remove("card-pulse");
     void c.offsetWidth;
     c.classList.add("card-pulse");
+    // and off again when the animation ends (the per-card update gate no longer rewrites className every
+    // render, which used to strip it); under reduced motion no animation runs and the class paints a steady
+    // accent ring, so a backstop a little past the animation's 1.4 s takes it off. animationend bubbles, so
+    // only the pulse's own end counts — a button's acted flash inside the card must not end it. One pulse per
+    // element at a time: a second reveal inside the window re-arms the same handle, so the first reveal's
+    // backstop cannot cut the second's animation short.
+    const prev = (c as any)._pulse as { off: (ev?: AnimationEvent) => void; t: number } | undefined;
+    if (prev) { window.clearTimeout(prev.t); c.removeEventListener("animationend", prev.off); }
+    const off = (ev?: AnimationEvent) => {
+      if (ev && ev.animationName !== "romp-card-pulse") return;
+      c.removeEventListener("animationend", off); window.clearTimeout(cur.t); (c as any)._pulse = undefined; c.classList.remove("card-pulse");
+    };
+    const cur = { off, t: window.setTimeout(off, 1500) };
+    (c as any)._pulse = cur;
+    c.addEventListener("animationend", off);
   }
 }
 
-// Keep "Xm ago" honest between host pushes (host reposts ~1×/min for color fade).
-setInterval(() => {
-  const now = Math.floor(Date.now() / 1000);
-  for (const [id, card] of askEls) {
-    const it = asks.find((a) => a.itemId === id);
-    const t = (card as any)._time as HTMLElement | undefined;
-    if (it && t) t.textContent = relAge(now - it.t);
+// ── the 15 s LIVE PASS ────────────────────────────────────────────────────────────────────────────
+// Keep every "Xm ago" and every running duration honest between host pushes, on the kernel's clock (nowSec):
+// on the delta path a quiet board sends a pane nothing between the 60 s reposts, and the per-card update gate
+// (feed-card-gate.ts) repaints a card only when its inputs change, so this pass is what moves time on every
+// card the kernel does not re-send. Every age-bearing label on a card face is stamped (feed-age.ts stampAge)
+// and the pass repaints them all from one clock, rather than each render path owning a copy of the
+// formatting.
+//
+// The pass WRITES ONLY WHAT CHANGED: relAge rounds to the minute and then the hour, so a handful of labels
+// move per tick on a board of hundreds, and in a document that has ever created a MutationObserver — gear.js
+// creates several at boot — Blink treats an identical textContent write as a real Text-node replacement that
+// dirties layout (paintAge compares first). A pane nobody can see skips the pass and catches up once when
+// shown (liveRefresher, the Outline pane's pattern), by the paint gate's own two measures (paint-gate.ts):
+// the tab hidden, or #feed-list off screen by the observer's word, which is how a pane the shell has
+// display:none'd reads. The two events that release an owed paint catch the pass up, so the feed has one
+// definition of "hidden".
+function livePass(): void {
+  const now = nowSec();
+  for (const card of askEls.values()) {
+    const it = (card as any)._it as AskItem | undefined;
+    if (!it) continue;
+    // the latched Continue's hover title names how long ago it was sent (contTitle, T150): a title, so it
+    // cannot be stamped — refreshed here for the few latched buttons, compare-then-write like the rest, and
+    // only once the payload itself carries the latch (the same test updateAskCard re-arms on): a click
+    // latches the button before any frame lands, and the stale object's followupAt would name an older
+    // follow-up
+    const cont = (card as any)._cont as HTMLButtonElement | undefined;
+    if (cont && cont.disabled && (it.followupPending || it.recheck || it.rejudging)) {
+      const ct = contTitle(true, "a continue", it.followupAt);
+      if (cont.title !== ct) cont.title = ct;
+    }
   }
-}, 15000);
+  refreshAges(document.querySelectorAll<HTMLElement>("[data-age-t]"), now, relAge, ageColorReadable);
+}
+const live = liveRefresher({ hidden: () => paintHeld(document.hidden, feedIntersecting, true), pass: livePass });
+setInterval(live.tick, 15000);
+document.addEventListener("visibilitychange", live.catchUp);
 
 initFileView((m) => vscodeApi?.postMessage(m));   // the file browser opens the viewer in this pane (and saves ride the poster)
 // …and how the viewer names the session a file was opened from: this pane's session list (the same tab
