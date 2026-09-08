@@ -56,6 +56,7 @@ import { insertAtCaret } from "./composer-insert";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
 import { followReader, keepPlaceAcrossShow } from "./scroll-keep";
 import { retainLiveOmitted } from "./tab-order";
+import { userTurnShows } from "./user-turn-content";
 import { keepResidentEvents } from "./frame-merge";
 import { activeTabToReannounce } from "./relay-active";
 import { dirStatusHint, nextDirActive, createDirPrompt, type DirStatus } from "./dir-complete";
@@ -2688,6 +2689,15 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
     const romp = kind === "romp";
     const injected = kind === "injected";
     const tagged = kind === "tagged";
+    // A rail dot never stands alone (T261, the user 2026-09-08): a user record the kernel stripped to nothing
+    // (romp's own markers, an injected reminder) used to get its blue dot here and then no bubble below — a dot
+    // claiming a message nobody could see. Nothing to show renders nothing: a zero-height unit, like a queued
+    // group with nothing visible, so the scroll↔unit map still counts it. Decision in user-turn-content.ts.
+    if (!userTurnShows(ev)) {
+      const hid = el("div", "turn turn-user turn-user-empty");
+      hid.style.display = "none";
+      return hid;
+    }
     const turn = el("div", "turn turn-user" + (romp ? " romp" : injected ? " injected" : ""));
     // Unresolved postal ids ride the raw turn so a timeline message arc can still land on it. Without
     // this the arc pointed at a turn with nothing to match and the click died silently (the user
