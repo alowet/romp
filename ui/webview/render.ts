@@ -13884,6 +13884,9 @@ const queuedEdits = new Map<string, QueuedEditRef>();
 // the typed text + the entry it replaced, keyed sid + " " + old body, so a failed edit can give the words
 // back and undo the optimistic repaint (one-shot, ok or not — pendingCancelRestores' twin)
 const pendingEditRestores = new Map<string, { typed: string; ref: QueuedEditRef }>();
+// the in-progress draft the ✎ displaced, per session, handed back when the edit ends (cancelled or sent) so
+// correcting a queued message never costs a half-typed one (review find, 2026-09-08)
+const queuedEditHeld = new Map<string, string>();
 
 function beginQueuedEdit(sid: string, ref: QueuedEditRef): void {
   if (composerEdits.has(sid)) cancelComposerEdit(sid);   // one edit at a time: a rewind edit yields to this one
@@ -13891,16 +13894,28 @@ function beginQueuedEdit(sid: string, ref: QueuedEditRef): void {
   composerCitations.delete(sid);   // the queued text carries its own context (a follow-up keeps it kernel-side)
   if (sid !== activeId) return;
   const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
-  if (ta) { ta.value = ref.md; growComposer(ta); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+  if (ta) {
+    if (ta.value.trim()) queuedEditHeld.set(sid, ta.value);   // hold the draft this edit displaces
+    ta.value = ref.md; growComposer(ta); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+  }
   renderComposerChips(sid);
 }
 
 function cancelQueuedEdit(sid: string): void {
   if (!queuedEdits.delete(sid)) return;
+  restoreHeldDraft(sid);
+}
+
+// The queued edit is over (cancelled, or sent): the box goes back to the draft the ✎ displaced, or empties,
+// and the pill goes with it. The draft store follows either way, so a tab switch or a reload sees the same.
+function restoreHeldDraft(sid: string): void {
+  const held = queuedEditHeld.get(sid) || "";
+  queuedEditHeld.delete(sid);
+  if (held) drafts.set(sid, held); else { drafts.delete(sid); draftStartedAt.delete(sid); }
+  persistDrafts();
   if (sid !== activeId) return;
   const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
-  if (ta) { ta.value = ""; composerManualH = null; ta.style.height = ""; }
-  drafts.delete(sid); persistDrafts();
+  if (ta) { ta.value = held; composerManualH = null; ta.style.height = ""; if (held) growComposer(ta); }
   renderComposerChips(sid);
 }
 
@@ -15099,6 +15114,7 @@ function dismissSession(id: string, why: DismissWhy, doomed?: ReadonlySet<string
     // closed session was ACTIVE: the shared chip strip above the composer still shows its chip until
     // someone repaints it, and that stale chip's ✕ targets the dead id (whose map entry is gone), so the
     // click early-returns and the chip can't even be dismissed — hence the repaint below.
+    queuedEdits.delete(id); queuedEditHeld.delete(id);   // a queued edit goes with the rewind edit's pill (review find, 2026-09-08)
     drafts.delete(id); composerCitations.delete(id); composerEdits.delete(id); composerFiles.delete(id); persistDrafts();
   } else {
     persistDrafts();   // a host drop / omission KEEPS it all (see DismissWhy) — the stash above may have updated the copy
@@ -15336,6 +15352,13 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       if (stash) {
         applyQueuedEditLocally(m.id, stash.ref, stash.typed, true);
         if (m.id === activeId) restoreToComposer(stash.typed);
+        else {
+          // the tab changed mid-round-trip (review find, 2026-09-08): the words land in THAT session's draft,
+          // which setActive puts back in the box on the next switch to it, as the paste-verify restore does
+          const d = drafts.get(m.id);
+          drafts.set(m.id, d && d.trim() ? d.replace(/\s*$/, "") + "\n" + stash.typed : stash.typed);
+          persistDrafts();
+        }
       }
       const rv = m.id === activeId && activeId ? views.get(activeId) : null;
       if (rv) { rv.stale = true; appendActive(); }
@@ -15692,7 +15715,8 @@ function setupComposer() {
   // ⌘/Ctrl+⏎ — STAGE the box instead of sending (the user 2026-08-15): the text and its citation
   // chips move to the staged strip, the box clears, focus stays for the next highlight-and-comment.
   // The states that already own the box refuse loudly rather than staging a lie: a picker answer
-  // answers NOW or sends normally; an edit replaces a past message; attachments ride a normal send.
+  // answers NOW or sends normally; an edit replaces a past message, or a queued one; attachments ride a
+  // normal send.
   const stageComposer = () => {
     if (!activeId) return;
     const typed = ta.value.trim();
@@ -15701,6 +15725,7 @@ function setupComposer() {
     if (!typed && !(composerCitations.get(activeId) || []).some((c) => c.quote)) return;
     if (composerAnswersAsk()) { warnToast("A picker is waiting on this box — answer it, or send normally."); return; }
     if (composerEdits.has(activeId)) { warnToast("An edit replaces a past message — send it normally."); return; }
+    if (queuedEdits.has(activeId)) { warnToast("This edit replaces a queued message. Send it normally."); return; }   // staged, the words would go as a NEW message behind the unchanged original (review find, 2026-09-08)
     if ((composerFiles.get(activeId) || []).length) { warnToast("Attachments can't be staged — send them with a normal message."); return; }
     stagedMsgs.push(activeId, { text: typed, cites: (composerCitations.get(activeId) || []).slice() });
     composerCitations.delete(activeId); renderComposerChips(activeId);   // the chips now live on the staged item
@@ -15787,16 +15812,27 @@ function setupComposer() {
     const qedit = queuedEdits.get(activeId);
     if (qedit) {
       if (!typed) return;   // an empty edit is not a send — to drop the message, use its ✕
+      // Two refusals that leave the box exactly as it is (review finds, 2026-09-08). A down host DROPS the
+      // frame (federation posts nothing to a closed socket) and no editResult ever comes back to hand the
+      // words over, so the plain send's deliver() guard applies here, BEFORE the box is cleared; a provisional
+      // tab has no session behind it and nothing queued. And a slash command cannot be edited INTO a queued
+      // message: the kernel would deliver it as text, skipping the routing every typed command gets (the
+      // fire-alone park, the /model and /effort setters, the /clear confirm below), so the kernel refuses it
+      // too; this mirror keeps the words in the box instead of round-tripping them.
+      if (hostIsDown(activeId) || isProvisionalId(activeId)) {
+        if (hostIsDown(activeId)) vscodeApi?.postMessage({ type: "redial", host: String(activeId).slice(0, String(activeId).indexOf(":")) });
+        warnToast("Can't reach the session right now, so the edit wasn't sent. It's still in the box: send again when the link is back.");
+        return;
+      }
+      if (SLASH_CMD_RE.test(typed)) { warnToast("A queued message cannot become a command. Cancel it with its ✕ and type the command."); return; }
       const qmsg: Record<string, unknown> = { type: "editQueued", id: activeId, md: qedit.md, text: typed };
       if (qedit.idx !== undefined) qmsg.idx = qedit.idx;
       if (qedit.park !== undefined) qmsg.park = qedit.park;
       vscodeApi?.postMessage(qmsg);
       pendingEditRestores.set(activeId + " " + qedit.md, { typed, ref: qedit });
       queuedEdits.delete(activeId);
-      renderComposerChips(activeId);
       applyQueuedEditLocally(activeId, qedit, typed);
-      drafts.delete(activeId); draftStartedAt.delete(activeId); persistDrafts();
-      ta.value = ""; composerManualH = null; ta.style.height = "";
+      restoreHeldDraft(activeId);   // the pill goes; the box gets back the draft the ✎ displaced, or empties
       return;
     }
     const sid = activeId;   // the session this send (and any confirm below) was armed for

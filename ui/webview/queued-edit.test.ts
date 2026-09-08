@@ -83,3 +83,47 @@ test("the kernel replaces the entry in place at every stage and answers with an 
   assert.match(SDKBE, /def edit_queued\(self, sid: str, idx: int, text: str, expect: str \| None = None\) -> str \| None:/);
   assert.match(SDKBE, /a\["_echo_text"\] = text/, "the optimistic echo is re-worded, so the live tail shows the edited message");
 });
+
+// ---- review finds (2026-09-08) --------------------------------------------------------------------------
+// The qedit branch of sendComposer, from its head to the editQueued post: every refusal below must sit in
+// this window, so the words are still in the box (and the bubble unchanged) when the branch bails.
+const QEDIT_BRANCH = RENDER.slice(RENDER.indexOf("const qedit = queuedEdits.get(activeId);\n    if (qedit) {"),
+                                  RENDER.indexOf('const qmsg: Record<string, unknown> = { type: "editQueued"'));
+
+test("a queued edit cannot become a command: the kernel refuses in both arms and the composer keeps the words", () => {
+  assert.ok(QEDIT_BRANCH.length > 0, "the qedit branch precedes the editQueued post");
+  assert.match(QEDIT_BRANCH, /if \(SLASH_CMD_RE\.test\(typed\)\) \{ warnToast\("A queued message cannot become a command\. Cancel it with its ✕ and type the command\."\); return; \}/,
+    "the words stay in the box under the pill; nothing is posted (the kernel would deliver a command as text)");
+  for (const head of ["def _edit_parked(sid, park, md, text):", "def _edit_backend_queued(be, sid, idx, md, text):"]) {
+    const arm = KERNEL.slice(KERNEL.indexOf(head));
+    assert.match(arm, /^[\s\S]*?if not body:\s*\n\s*return "nothing to send[^\n]*\n\s*if _is_slash_command\(body\):\s*\n(?:\s*#[^\n]*\n)*\s*return "a queued message cannot become a command: cancel it with its ✕ and type the command"/,
+      head + " refuses a slash-command body right after the empty-body check, before anything is replaced");
+  }
+});
+
+test("⌘/Ctrl+⏎ cannot stage a queued edit as a NEW message while the original stays queued", () => {
+  assert.match(RENDER, /if \(composerEdits\.has\(activeId\)\) \{ warnToast\("An edit replaces a past message[^\n]*\n\s*if \(queuedEdits\.has\(activeId\)\) \{ warnToast\("This edit replaces a queued message\. Send it normally\."\); return; \}/,
+    "staging is refused while a queued edit owns the box, as it is for a rewind edit");
+});
+
+test("an editQueued is refused BEFORE the box is cleared when the host is down or the tab is provisional", () => {
+  assert.match(QEDIT_BRANCH, /if \(hostIsDown\(activeId\) \|\| isProvisionalId\(activeId\)\) \{\s*\n\s*if \(hostIsDown\(activeId\)\) vscodeApi\?\.postMessage\(\{ type: "redial"/,
+    "deliver()'s guard: a down host drops the frame and no editResult would ever hand the words back");
+  assert.match(QEDIT_BRANCH, /It's still in the box/);
+});
+
+test("editResult ok:false lands the typed words in that session's draft when the tab changed mid-round-trip", () => {
+  assert.match(RENDER, /if \(m\.id === activeId\) restoreToComposer\(stash\.typed\);\s*\n\s*else \{\n(?:[^\n]*\n){0,4}?\s*drafts\.set\(m\.id, [^\n]*stash\.typed[^\n]*\);\s*\n\s*persistDrafts\(\);/,
+    "neither the bubble nor the box holds them, so the draft store must; the next switch back shows them");
+});
+
+test("the ✎ holds the draft it displaces and gives it back when the edit ends; a closed session forgets its edit", () => {
+  assert.match(RENDER, /const queuedEditHeld = new Map<string, string>\(\);/);
+  assert.match(RENDER, /function beginQueuedEdit\(sid: string, ref: QueuedEditRef\): void \{[\s\S]*?if \(ta\.value\.trim\(\)\) queuedEditHeld\.set\(sid, ta\.value\);[\s\S]*?ta\.value = ref\.md;/,
+    "the in-progress draft is held BEFORE the queued text overwrites the box");
+  assert.match(RENDER, /function cancelQueuedEdit\(sid: string\): void \{\s*\n\s*if \(!queuedEdits\.delete\(sid\)\) return;\s*\n\s*restoreHeldDraft\(sid\);/);
+  assert.match(RENDER, /applyQueuedEditLocally\(activeId, qedit, typed\);\s*\n\s*restoreHeldDraft\(activeId\);/, "…and after a send");
+  assert.match(RENDER, /function restoreHeldDraft\(sid: string\): void \{[\s\S]*?if \(held\) drafts\.set\(sid, held\); else \{ drafts\.delete\(sid\); draftStartedAt\.delete\(sid\); \}/);
+  assert.match(RENDER, /queuedEdits\.delete\(id\); queuedEditHeld\.delete\(id\);[^\n]*\n\s*drafts\.delete\(id\); composerCitations\.delete\(id\); composerEdits\.delete\(id\);/,
+    "a close clears the queued edit with the rewind edit, so a stale pill never survives its session");
+});

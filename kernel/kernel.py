@@ -28216,9 +28216,17 @@ def _replace_followup_body(text, body):
         i += 1
     head = "\n".join(lines[:i])
     rest = "\n".join(lines[i:])
-    m = re.search(r"((?:\s*<!--.*?-->)+\s*)$", rest, flags=re.S)     # the trailing marker block, as composed
-    tail = m.group(1) if m else ""
-    return (head + "\n\n" if head else "") + body + tail
+    # The trailing marker block, one comment at a time: a comment can never span another's close, so an
+    # inline <!-- x --> INSIDE the old body cannot anchor the tail and drag old words behind the new body
+    # (review find, 2026-09-08: the .*? form under re.S did exactly that). Of the block, only the WRAPPER's
+    # own markers survive (romp-note / romp-injected / romp-auto / romp-goal-id, _followup_body's tail): a
+    # marker that described the old BODY, like the Continue button's romp-canned, would make the typed
+    # replacement render as the canned gesture row, so it goes with the words it described.
+    cmt = r"<!--(?:(?!-->).)*-->"
+    m = re.search(r"((?:\s*%s)+\s*)$" % cmt, rest, flags=re.S)
+    keep = [c for c in re.findall(cmt, m.group(1), flags=re.S)
+            if re.match(r"<!--\s*romp-(?:note|injected|auto|goal-id)\b", c)] if m else []
+    return (head + "\n\n" if head else "") + body + ("\n\n" + "".join(keep) if keep else "")
 
 
 def _edit_parked(sid, park, md, text):
@@ -28235,6 +28243,11 @@ def _edit_parked(sid, park, md, text):
     body = (text or "").strip()
     if not body:
         return "nothing to send — to drop the message, use its ✕"
+    if _is_slash_command(body):
+        # an edit swaps the WORDS of a ("send", ...) op and nothing else, so a command edited in would stay a
+        # send and reach the model as text, skipping the fire-alone park and the kernel-side setters every
+        # typed command gets (review find, 2026-09-08). The composer mirrors this refusal (SLASH_CMD_RE).
+        return "a queued message cannot become a command: cancel it with its ✕ and type the command"
     with _pending_ops_lock:
         ops = _pending_ops.get(sid) or []
         inflight_head = bool(ops) and ops[0] is _inflight_ops.get(sid)   # the head is with the backend this instant
@@ -28264,6 +28277,10 @@ def _edit_backend_queued(be, sid, idx, md, text):
     body = (text or "").strip()
     if not body:
         return "nothing to send — to drop the message, use its ✕"
+    if _is_slash_command(body):
+        # replace_queued swaps the queued text in place, so SdkBackend.send's /compact and /clear cues would
+        # never fire for a command edited in; same refusal as _edit_parked (review find, 2026-09-08)
+        return "a queued message cannot become a command: cancel it with its ✕ and type the command"
     try:
         pending = be.pending_queued(sid)
     except Exception:
