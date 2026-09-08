@@ -110,7 +110,7 @@ export type TailEvent = {
   md?: string;
   uuid?: string;
   qid?: string;         // a landed user atom: the id of the queued copy it lands (T252c; the kernel pairs them)
-  qids?: string[];      // a record of SEVERAL sends: one id (or null) per text block, in block order
+  qids?: (string | null)[];   // a record of SEVERAL sends: one id (or null) per text block, in block order
   ts?: string;          // the kernel's stamp for the event, ISO-8601 UTC (kernel.py `iso(t)`, whole seconds)
   absorbed?: boolean;
   undelivered?: boolean;
@@ -202,8 +202,10 @@ function textCopies(e: TailEvent, p: PendingSend): number {
  *  its quotes behind, so those are set aside on both sides). */
 export function landedCopies(e: TailEvent, p: PendingSend): number {
   if (e.kind !== "user" || typeof e.md !== "string" || isKernelEchoUuid(e.uuid)) return 0;
-  if (p.qid && (e.qid || (Array.isArray(e.qids) && e.qids.length)))   // identity decides (T252c): ours only if it carries THIS send's id
-    return e.qid === p.qid || (Array.isArray(e.qids) && e.qids.includes(p.qid)) ? 1 : 0;
+  if (p.qid) {   // identity decides where the record carries it (T252c): ours if a block wears THIS send's id; not ours
+    if (e.qid === p.qid || (Array.isArray(e.qids) && e.qids.includes(p.qid))) return 1;   // when every block wears another's
+    if (e.qid || (Array.isArray(e.qids) && e.qids.length > 0 && e.qids.every((q) => !!q))) return 0;
+  }   // a block the kernel could not pair (null): text decides for it, below
   const n = textCopies(e, p);
   if (n) return n;
   if (p.imgPaths && p.imgPaths.length && Array.isArray(e.images) && e.images.length > 0) {
@@ -403,6 +405,23 @@ export type Reconciled = {
  *  When the kernel hides a fed send's echo behind a same-text queued copy (its chat dedups by text), a
  *  received send can read "not confirmed" after a drop until a copy of its own shows; that clears on the
  *  next kernel copy, and the error is toward "not confirmed", never toward a false "sending…". */
+/** Where the frame SHOWS a send's identity, from its anchor on: the landed atom that carries it, a queued copy or an
+ *  echo wearing it (the echo's uuid IS the id), or nowhere. Identity decides only where the frame shows it (second
+ *  review): a send whose id is nowhere in the frame — the kernel never showed it, an older kernel sends none, or a
+ *  restart re-minted the mirrors an older kernel kept text-only — is read by TEXT for that push, exactly as before
+ *  ids existed, rather than left with a bubble nothing can ever retire. */
+function locateId(events: TailEvent[], from: number, qid: string): { where: "landed"; idx: number } | { where: "provisional" | "none" } {
+  let provisional = false;
+  for (let i = from; i < events.length; i++) {
+    const e = events[i];
+    if (e.kind === "queued") { if ((e.texts || []).some((t) => t.qid === qid)) provisional = true; continue; }
+    if (e.kind !== "user") continue;
+    if (e.uuid === qid) { provisional = true; continue; }   // the echo, delivered or flagged
+    if (!isKernelEchoUuid(e.uuid) && (e.qid === qid || (Array.isArray(e.qids) && e.qids.includes(qid)))) return { where: "landed", idx: i };
+  }
+  return { where: provisional ? "provisional" : "none" };
+}
+
 export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reconciled {
   // First reconcile after the send: whatever the events ALREADY hold for this text is background — an
   // older identical message, an old echo, an undismissed never-delivered bubble — not this send. Only
@@ -416,6 +435,8 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
   for (const p of list) if (!p.at) p.at = stampBase(events, p, p.late ? lateOwn.get(p.text) || 1 : 0);
   const r: Reconciled = { keep: [], inject: [], unqueue: [], landed: [], lost: [] };
   const claimed = new Map<string, number>();           // "index\0text" → copies of that text in that landing taken by earlier entries THIS push
+  const owned = new Set<string>();                     // the identities pending sends have latched: an echo wearing one is that send's, never a text match
+  for (const p of list) if (p.qid) owned.add(p.qid);
   const takenCopies = new Map<string, Set<number>>();  // text → queued-copy positions taken by an earlier entry THIS push
   // an earlier entry's covering echo / landed atom is a FLOOR for every entry registered after it (T252b),
   // recorded with its text and its ordinal among same-text user events after THAT entry's anchor, so the
@@ -437,7 +458,14 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
     const at = p.at!;
     const from = scanFrom(events, at);
     let landedIdx = -1, lostIdx = -1, echoIdx = -1, copies = 0, idCopy = -1;
-    for (let i = from; i < events.length; i++) {
+    // identity decides where the frame shows it (T252c): the atom carrying our id is our landing, whatever the
+    // text arithmetic says (an identical send retired on the same record this push claimed the text once);
+    // while a queued copy or an echo wears it, no landing is ours; and an id the frame carries NOWHERE leaves
+    // this push to text, the reading every frame had before ids — `pv` is this send as text reads it
+    const loc = p.qid ? locateId(events, from, p.qid) : { where: "none" as const };
+    const pv: PendingSend = loc.where === "none" && p.qid ? { ...p, qid: undefined } : p;
+    if (loc.where === "landed") landedIdx = loc.idx;
+    else for (let i = from; i < events.length; i++) {
       const e = events[i];
       if (e.kind === "queued") {
         copies += queuedCopies(e, p);
@@ -445,12 +473,16 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
         if (p.qid && (e.texts || []).some((t) => t.qid === p.qid)) idCopy = i;
         continue;
       }
+      // an echo another pending send owns by id is not this one's, whatever its text says
+      if (!pv.qid && e.kind === "user" && isKernelEchoUuid(e.uuid) && owned.has(e.uuid!)) continue;
       // the copies of this event that are NOT this send's: background at the stamp, or claimed by an
       // entry retired since (`seen`); a landing an earlier entry took this push is counted in `claimed`
       const spoken = e.uuid ? spokenFor(at, e.uuid) : 0;
-      if (landedIdx < 0 && landedCopies(e, p) > spoken + (claimed.get(i + "\0" + p.text) || 0)) { landedIdx = i; continue; }
-      if (lostIdx < 0 && lostCopies(e, p) > spoken) { lostIdx = i; continue; }
-      if (echoIdx < 0 && provisionalCopies(e, p) > spoken) echoIdx = i;   // the first echo no earlier entry claimed (`seen`)
+      // a send that landed needs no cover and no verdict: scanning on would claim a later echo (another send's
+      // cover) as its own, and mark it spoken for that send (second review)
+      if (loc.where === "none" && landedIdx < 0 && landedCopies(e, pv) > spoken + (claimed.get(i + "\0" + p.text) || 0)) { landedIdx = i; break; }
+      if (lostIdx < 0 && lostCopies(e, pv) > spoken) { lostIdx = i; continue; }
+      if (echoIdx < 0 && provisionalCopies(e, pv) > spoken) echoIdx = i;   // the first echo no earlier entry claimed (`seen`)
     }
     // ONE kernel copy covers ONE send: an unclaimed echo atom first — its uuid is then background for
     // every later same-text entry, this push and every push after (the claim must outlive the claimant:
@@ -466,7 +498,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
       floorFor(p, echoIdx);
     } else if (p.qid && idCopy >= 0) {
       covered = true; byQueued = true;              // our identified copy is in the queue: exact, whatever its position
-    } else if (!p.qid && copies > at.queued) {
+    } else if (!pv.qid && copies > at.queued) {
       const taken = takenCopies.get(p.text) || new Set<number>();
       for (let k = at.queued; k < copies; k++) if (!taken.has(k)) { taken.add(k); covered = true; byQueued = true; break; }
       takenCopies.set(p.text, taken);
@@ -477,7 +509,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
           if (e.kind !== "queued") continue;
           for (const t of e.texts || []) {
             if (typeof t.md !== "string" || !sameText(t.md, p.text)) continue;
-            if (seen === [...taken].sort((a, b) => a - b).pop()) { if (t.qid) p.qid = t.qid; break outer; }
+            if (seen === [...taken].sort((a, b) => a - b).pop()) { if (t.qid && !p.qid) p.qid = t.qid; break outer; }
             seen++;
           }
         }

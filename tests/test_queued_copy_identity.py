@@ -175,17 +175,22 @@ class TheSdkQueueCarriesIds(unittest.TestCase):
         self.assertEqual([m["md"] for m in after], ["a", "c"])
         self.assertEqual([m["qid"] for m in after], [before[0]["qid"], before[2]["qid"]])
 
-    def test_a_copy_the_backend_queued_itself_and_a_restored_queue_carry_no_id(self):
+    def test_a_copy_the_backend_queued_itself_carries_no_id_and_a_restored_queue_keeps_what_its_mirror_carries(self):
         self.w.be.send(SID, "typed")
         self.w.s.enqueue_if_empty("ping")           # the queue is not empty: refused, nothing changes
         self.w.s.enqueue("a backend-minted notice")  # no id: the chat falls back to text for it
         meta = self.w.be.pending_queued_meta(SID)
         self.assertEqual([m["md"] for m in meta], ["typed", "a backend-minted notice"])
         self.assertIsNotNone(meta[0]["qid"]); self.assertIsNone(meta[1]["qid"])
-        # a queue restored from the registry after a kernel death: texts only
+        # a queue restored from the registry after a kernel death: the mirror carries each identified copy's id
+        # (second review: a chat that latched the id before the death must find it in the new life)
         del self.w.be.sessions[SID]
         self.assertEqual(self.w.be.pending_queued(SID), ["typed", "a backend-minted notice"], "the persisted mirror")
-        self.assertIsNone(self.w.be.pending_queued_meta(SID), "…and it carries no ids (legacy)")
+        self.assertEqual([(m["md"], m["qid"]) for m in self.w.be.pending_queued_meta(SID)],
+                         [("typed", meta[0]["qid"]), ("a backend-minted notice", None)], "…with the ids it carried")
+        # an older kernel's mirror (texts only) restores id-less copies: legacy, text decides
+        reg = sb.read_reg(self.w.be.state_dir, SID); reg.pop("queueMeta", None); sb.write_reg(self.w.be.state_dir, SID, reg)
+        self.assertEqual([m["qid"] for m in self.w.be.pending_queued_meta(SID)], [None, None])
 
     def test_the_feed_moves_the_id_to_the_fed_ledger_and_the_landing_is_paired_fifo_per_text(self):
         self.w.be.send(SID, "ok"); self.w.be.send(SID, "other"); self.w.be.send(SID, "ok")
@@ -342,6 +347,88 @@ class TheTmuxQueueCarriesStamps(unittest.TestCase):
         # so an id only the ledger copy wore would make the chat reject the echo as another send's (review)
         self.assertIsNone(meta[0]["qid"])
         td.cleanup()
+
+
+class IdentitySurvivesTheKernelsDeath(unittest.TestCase):
+    """A kernel restart used to re-mint everything (second review): the queue mirror carried texts only, so the
+    restored copies were id-less; the echo mirror carried no uuid, so the reseeded echo wore a new one; and a fed
+    copy re-headed or re-delivered after the death lost its id on the way back into the queue. A chat that had
+    latched the copy's id before the death then found nothing in the frame wearing it. Both mirrors carry the
+    identity now, and the two ways back into the queue carry it too, so the restored copy, the reseeded echo and
+    the eventual landing still share one id."""
+
+    def setUp(self):
+        self.w = _World()
+        self.w.write(RUNNING, shift=self.w.now - T0)   # at the clock: a landing must follow the feed in time
+        self._parks = []
+
+    def tearDown(self):
+        for park in self._parks:
+            park.set()
+        self.w.close()
+
+    def _restart(self):
+        """The kernel dies and boots: a fresh backend over the same state root re-seeds the echo mirror (its
+        __init__), and the session is rebuilt from its registry record, the way the boot reconcile seeds it."""
+        import threading
+        self.w._park.set()
+        self.w.be.sessions.pop(SID, None)
+        be2 = sb.SdkBackend(self.w.be.state_dir, "/bin/true", lambda *a, **k: None)
+        s2 = sb.SdkSession(be2, dict(sb.read_reg(be2.state_dir, SID)))
+        park = threading.Event(); self._parks.append(park)
+        s2.thread = threading.Thread(target=park.wait, daemon=True); s2.thread.start()
+        be2.sessions[SID] = s2
+        km._sdk = lambda: be2
+        return be2, s2
+
+    def test_the_restored_queue_and_the_reseeded_echo_keep_the_copys_id_and_the_landing_pairs_with_it(self):
+        self.assertTrue(self.w.be.send(SID, "rename it"))
+        [qid] = [m["qid"] for m in self.w.be.pending_queued_meta(SID)]
+        be2, s2 = self._restart()
+        self.assertEqual([(m["md"], m["qid"]) for m in be2.pending_queued_meta(SID)], [("rename it", qid)],
+                         "the queue mirror carries the id across the death")
+        self.assertEqual([(a["uuid"], bool(a.get("dropped"))) for a in be2.live_atoms(SID) if a.get("_echo_text")], [(qid, False)],
+                         "the reseeded echo keeps its uuid, which IS the id")
+        with s2._lock:
+            s2._pop_for_feed_locked()
+        self.w.write(RUNNING + [uline(T0 + 55, "rename it", "u3", "tr1")], shift=self.w.now - T0)
+        m = self.w.build()
+        landed = [e for e in m["events"] if e.get("kind") == "user" and e.get("uuid") == "u3"]
+        self.assertEqual([e.get("qid") for e in landed], [qid], "the landing pairs with the same id in the new life")
+
+    def test_a_fed_copy_the_dead_cli_was_holding_is_re_delivered_under_its_own_id(self):
+        self.assertTrue(self.w.be.send(SID, "go on"))
+        [qid] = [m["qid"] for m in self.w.be.pending_queued_meta(SID)]
+        with self.w.s._lock:
+            self.w.s._pop_for_feed_locked()           # the CLI took it…
+        self.w.s._persist_queue()                     # …so the mirror holds an empty queue and the unlanded echo
+        be2, s2 = self._restart()                     # boot: the echo's text is in no queue and never landed: re-delivered
+        self.assertEqual([(m["md"], m["qid"]) for m in be2.pending_queued_meta(SID)], [("go on", qid)],
+                         "back in the queue under the echo's own uuid")
+        self.assertEqual([(a["uuid"], bool(a.get("dropped"))) for a in be2.live_atoms(SID) if a.get("_echo_text")], [(qid, False)])
+
+    def test_a_dead_spawns_re_delivery_into_a_live_session_carries_the_id_and_clears_the_stale_ledger_entry(self):
+        self.assertTrue(self.w.be.send(SID, "go on"))
+        [qid] = [m["qid"] for m in self.w.be.pending_queued_meta(SID)]
+        with self.w.s._lock:
+            self.w.s._pop_for_feed_locked()
+        self.assertEqual([f["qid"] for f in self.w.s._fed_meta], [qid])
+        self.w.be._mark_dropped_echoes(SID, self.w.s.pending())    # the dead-spawn caller: the live session re-queues it
+        self.assertEqual([(m["md"], m["qid"]) for m in self.w.s.pending_meta()], [("go on", qid)])
+        self.assertEqual(self.w.s._fed_meta, [], "a copy back in the queue is no longer fed: its stale entry cannot pair a later landing")
+
+    def test_a_stranded_fed_copy_re_heads_the_queue_with_its_id(self):
+        self.assertTrue(self.w.be.send(SID, "go on"))
+        self.assertTrue(self.w.be.send(SID, "then this"))
+        [qid, later] = [m["qid"] for m in self.w.be.pending_queued_meta(SID)]
+        s = self.w.s
+        with s._lock:
+            s._pop_for_feed_locked()
+        s._inflight_texts.append("go on"); s.inflight = 1; s.resume_sid = None   # fed to a client that is now gone
+        s._reconcile_stranded()
+        self.assertEqual([(m["md"], m["qid"]) for m in s.pending_meta()], [("go on", qid), ("then this", later)],
+                         "the fed copy is back at the head under its own id")
+        self.assertEqual(s._fed_meta, [], "…and out of the fed ledger")
 
 
 if __name__ == "__main__":
