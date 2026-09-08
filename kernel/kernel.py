@@ -15591,7 +15591,12 @@ def _ask_peer_to_pull(host):
     if not j.get("ok"):
         return False, "%s refused: %s" % (host, j.get("detail") or j.get("error") or ("HTTP %s" % st))
     detail = str(j.get("detail") or "pulled this machine's commits")
-    rst, _rj = _peer_call(r, "POST", "/restart", {}, timeout=10)
+    # Peer-only scope, said outright. The peer's /restart defaults to the broad kind — every machine
+    # IT holds a row for, and it always holds at least this hub — so the empty body this used to send
+    # made the peer we had just updated fan out: it restarted the hub back (mid-sweep, before the
+    # report was written) and cut in-flight turns on machines nobody asked to restart. This step
+    # exists so THAT peer runs what it just pulled; the hub walks its own rows (_fleet_restart_run).
+    rst, _rj = _peer_call(r, "POST", "/restart", {"fleet": False}, timeout=10)
     if rst != 200:
         return True, detail + "; it took the commits but did not ack the restart — restart romp on %s" % host
     return True, detail + "; restarting it"
@@ -15732,6 +15737,35 @@ def _fleet_restart_run(manager_port=_PORT_FROM_ENV):
     except OSError:
         sys.stderr.write("fleet-restart: could not write the report: %s\n" % traceback.format_exc())
     _restart_this_kernel("fleet-restart: the local half of the fleet Restart", manager_port=manager_port)
+
+
+def _restart_scope_from_body(raw_body):
+    """What a POST /restart body asks for → (broad, error). Empty body: the default, every reachable
+    kernel — each dashboard's ↻ sends a bodiless POST. Otherwise the body must be a JSON object holding
+    at most a boolean `fleet` (false = this kernel only); anything else comes back as `error`, naming
+    what was wrong, and the caller restarts NOTHING. The refusal is the point: this used to be a bare
+    `except Exception: pass` around `.get("fleet", True)`, so junk, a JSON array, null, a non-boolean
+    value or a typo key ({"fleat": false}) all silently took the BROADEST action with a 200."""
+    if not raw_body:
+        return True, None
+    try:
+        b = json.loads(raw_body)
+    except Exception:
+        return None, "body is not JSON"
+
+    def clip(v):   # a BOUNDED echo of the offending value: a 1 MB body must not come back as a 1 MB error
+        if isinstance(v, (str, list)):
+            v = v[:80]                                # slice before serializing where the value allows it
+        return json.dumps(v)[:80]
+    if not isinstance(b, dict):
+        return None, "body must be a JSON object, got %s" % clip(b)
+    extra = sorted(set(b) - {"fleet"})
+    if extra:
+        return None, ("unknown key(s) %s — only 'fleet' is understood"
+                      % ", ".join(repr(k[:80]) for k in extra[:8])[:80])
+    if "fleet" in b and not isinstance(b["fleet"], bool):
+        return None, "'fleet' must be true or false, got %s" % clip(b["fleet"])
+    return bool(b.get("fleet", True)), None
 
 
 def _audit_restart_request(action, **kw):
@@ -37806,11 +37840,13 @@ class Handler(BaseHTTPRequestHandler):
                 # nothing saying so. The remote half runs in a thread (each host is seconds of network)
                 # and writes its report to disk BEFORE restarting this kernel, because this process does
                 # not survive to report anything. `fleet:false` keeps the local-only behaviour.
-                _fleet = True
-                try:
-                    _fleet = json.loads(raw_body or b"{}").get("fleet", True)
-                except Exception:
-                    pass
+                #
+                # The body is a JSON object with at most a boolean `fleet`, or empty (every ↻ button);
+                # anything else is a 400 that names the problem and restarts NOTHING. A malformed body
+                # must never widen the action — it used to fall through to the broad default.
+                _fleet, _bad = _restart_scope_from_body(raw_body)
+                if _bad:
+                    return self._send(400, json.dumps({"ok": False, "error": _bad}), "application/json")
                 # WHO ASKED, on the record (the user 2026-07-31): a restart blinks every dashboard, and
                 # a run of them traced to this route was unattributable — the CLI path audits itself
                 # (bin/romp → restart-audit.jsonl) but the HTTP door was silent. Same file, so one log

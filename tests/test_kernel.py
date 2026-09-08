@@ -4,6 +4,7 @@ consume). The WS transport + HTTP serving aren't unit-tested; the projection —
 (chat), goals→feed cards, ledger→TOC — is. Synthetic fleet only: invented text, placeholder
 UUIDs; no real session data.
 """
+import contextlib
 import json
 import os
 import re
@@ -6771,6 +6772,98 @@ class ServeSecurity(unittest.TestCase):
         finally:
             if saved is not None:
                 os.environ["ROMP_MANAGER_PORT"] = saved
+
+    def _post_restart(self, data):
+        """POST /restart with `data` as the body → (status, decoded JSON). Content-Type says JSON the
+        way _peer_call does (the ↻ buttons send no body and no headers); the handler never reads it,
+        the body decides."""
+        import urllib.request, urllib.error, json as _json
+        req = urllib.request.Request("http://127.0.0.1:%d/restart?token=testtok" % self.port,
+                                     method="POST", data=data,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, _json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, _json.loads(e.read().decode())
+
+    @contextlib.contextmanager
+    def _restart_legs_faked(self):
+        """Both restart legs replaced by recorders (NOTHING may restart under a test), and one
+        synthetic attached row so the broad leg is reachable: with no rows the handler folds every
+        scope to the local leg and the two would be indistinguishable. Yields the recorders; each
+        leg sets its Event, because the handler ACKS FIRST and acts after — a client can hold the
+        200 before the leg has run, so callers wait on the Event rather than peeking at the list."""
+        import threading
+        legs = {"local": [], "broad": [], "localDone": threading.Event(), "broadDone": threading.Event()}
+        saved = (km._restart_this_kernel, km._fleet_restart_run, dict(km._remotes),
+                 os.environ.pop("ROMP_MANAGER_PORT", None))   # belt and braces: no manager to reach either
+
+        def _local(reason="", manager_port=None):
+            legs["local"].append(reason); legs["localDone"].set()
+
+        def _broad(manager_port=None):
+            legs["broad"].append(manager_port); legs["broadDone"].set()
+        km._restart_this_kernel, km._fleet_restart_run = _local, _broad
+        km._remotes.clear()
+        km._remotes["TESTHOST"] = {"host": "TESTHOST", "status": "up", "kernel_port": 29855}
+        try:
+            yield legs
+        finally:
+            km._restart_this_kernel, km._fleet_restart_run = saved[0], saved[1]
+            km._remotes.clear(); km._remotes.update(saved[2])
+            if saved[3] is not None:
+                os.environ["ROMP_MANAGER_PORT"] = saved[3]
+
+    def test_restart_body_picks_the_scope_and_a_bodiless_post_keeps_its_default(self):
+        """The body says WHICH restart: nothing (every ↻ button — the landing rail, gear.js, strip.ts
+        all send a bodiless POST) keeps the broad default; {"fleet": false} is this kernel only —
+        the scope the hub asks of a peer it just updated (_ask_peer_to_pull); {"fleet": true} says
+        the default out loud. The ack's `fleet` and the leg that actually runs must agree."""
+        with self._restart_legs_faked() as legs:
+            code, ack = self._post_restart(b"")
+            self.assertEqual((code, ack["ok"], ack["restarting"], ack["fleet"]), (200, True, True, True))
+            self.assertTrue(legs["broadDone"].wait(5), "a bodiless POST takes the broad leg, as before")
+            legs["broadDone"].clear()
+            code, ack = self._post_restart(b'{"fleet": true}')
+            self.assertEqual((code, ack["fleet"]), (200, True))
+            self.assertTrue(legs["broadDone"].wait(5))
+            self.assertEqual(legs["local"], [], "neither well-formed broad request touched the local leg")
+            code, ack = self._post_restart(b'{"fleet": false}')
+            self.assertEqual((code, ack["ok"], ack["restarting"], ack["fleet"]), (200, True, True, False))
+            self.assertTrue(legs["localDone"].wait(5), "fleet:false restarts THIS kernel only")
+            self.assertEqual(legs["local"], ["http /restart (local-only)"])
+            self.assertEqual(len(legs["broad"]), 2, "the peer-only request never fanned out")
+
+    def test_restart_refuses_a_malformed_body_instead_of_restarting_everything(self):
+        """Anything that is not a JSON object with at most a boolean `fleet` is a 400 whose JSON error
+        names the problem, and NOTHING restarts. Before this, the parse sat in a bare except that
+        fell through to the default, so every one of these took the BROADEST action with a 200:
+        junk, an array, null, a string, a non-boolean value, a typo key, a stray extra key."""
+        cases = [(b"not json", "not JSON"),
+                 (b"[]", "JSON object"),
+                 (b"null", "JSON object"),
+                 (b'"x"', "JSON object"),
+                 (b'{"fleet": "no"}', "true or false"),
+                 (b'{"fleet": 1}', "true or false"),
+                 (b'{"fleet": null}', "true or false"),
+                 (b'{"fleat": false}', "'fleat'"),
+                 (b'{"fleet": false, "x": 1}', "'x'")]
+        with self._restart_legs_faked() as legs:
+            for body, names in cases:
+                with self.subTest(body=body):
+                    code, ack = self._post_restart(body)
+                    self.assertEqual(code, 400, "%r must be refused, not acted on" % body)
+                    self.assertFalse(ack["ok"])
+                    self.assertIn(names, ack["error"], "the error says what was wrong with %r" % body)
+                    self.assertNotIn("restarting", ack)
+            # A well-formed request AFTER the refusals is the first and only thing that runs: had any
+            # refusal queued a restart, its leg would be on record ahead of this one.
+            code, ack = self._post_restart(b'{"fleet": false}')
+            self.assertEqual((code, ack["fleet"]), (200, False))
+            self.assertTrue(legs["localDone"].wait(5))
+            self.assertEqual(legs["local"], ["http /restart (local-only)"])
+            self.assertEqual(legs["broad"], [], "no malformed body ever reached the broad leg")
 
     def test_tick_endpoint_wakes_producer(self):
         """POST /tick is the event-driven judge trigger: the Stop / UserPromptSubmit hooks poke it the

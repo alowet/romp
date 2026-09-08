@@ -115,6 +115,9 @@ class AskingThePeer(unittest.TestCase):
         self.assertEqual([c[1] for c in calls], ["/tunnels/pull", "/restart"],
                          "a pull alone leaves the OLD kernel running and still reporting the old sha")
         self.assertEqual(calls[0][2], {"host": "hubname"}, "the peer is handed the name it knows us by")
+        self.assertEqual(calls[1][2], {"fleet": False},
+                         "and told to restart ITSELF only — its /restart defaults to the broad kind, "
+                         "which would fan back out onto this hub (tests/test_fleet_restart.py)")
         self.assertIn("pulled 8 commits", detail)
         self.assertIn("restarting it", detail)
 

@@ -170,6 +170,56 @@ class ReportSurvivesTheRestart(unittest.TestCase):
                       "manager_port=_mport)", src)
 
 
+class AnAskStaysOnThatPeer(unittest.TestCase):
+    """The sweep's "ask" leg tells a checked-in peer to pull and then to restart — and that restart
+    must name the peer-only scope. The peer's /restart defaults to the broad kind, and the peer always
+    holds at least one row: this hub. So the empty body the ask used to send made the freshly updated
+    peer fan out and restart the hub back, mid-sweep, before the report was on disk — a restart that
+    cascaded onto machines nobody asked to restart. The hub walks its own rows; each ask is one host."""
+
+    def setUp(self):
+        self._saved = {n: getattr(km, n) for n in
+                       ("_fleet_restart_plan", "_peer_call", "_peer_hub_name", "_local_head",
+                        "_local_branch", "_restart_this_kernel")}
+        self._remotes = dict(km._remotes)
+        km._fleet_restart_plan = lambda r: ("ask", "checked in here; asking it to fast-forward itself")
+        km._peer_hub_name = lambda r: "hubname"
+        km._local_head = lambda short=False: ("abc1234" if short else LOCAL_SHA)
+        km._local_branch = lambda: "main"
+        km._restart_this_kernel = lambda reason="", manager_port=None: None   # never a real restart
+        self.calls = []
+
+        def _peer_call(r, method, path, body=None, timeout=8):
+            self.calls.append((method, path, body))
+            return 200, ({"ok": True, "detail": "pulled 3 commits from hubname"}
+                         if path == "/tunnels/pull" else {"ok": True, "restarting": True, "fleet": False})
+        km._peer_call = _peer_call
+        km._remotes.clear()
+        km._remotes["TESTHOST"] = row(checkin_peer=True, kernel_sha=REMOTE_SHA, local_port=52025,
+                                      token="peertok")
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(km, n, v)
+        km._remotes.clear()
+        km._remotes.update(self._remotes)
+
+    def test_the_sweep_asks_each_peer_for_a_restart_of_itself_only(self):
+        km._fleet_restart_run()
+        report = json.loads(km.FLEET_REPORT.read_text())
+        self.assertEqual([(m, p) for m, p, _ in self.calls], [("POST", "/tunnels/pull"), ("POST", "/restart")])
+        self.assertEqual(self.calls[1][2], {"fleet": False},
+                         "the peer restarts ITSELF; an empty body would let it fan out onto this hub")
+        self.assertEqual([(x["host"], x["ok"], x["action"]) for x in report["rows"]],
+                         [("TESTHOST", True, "ask")])
+        self.assertIn("restarting it", report["rows"][0]["detail"])
+
+    def test_the_ask_alone_carries_the_same_scope(self):
+        ok, detail = km._ask_peer_to_pull("TESTHOST")
+        self.assertTrue(ok)
+        self.assertEqual(self.calls[-1], ("POST", "/restart", {"fleet": False}))
+
+
 class GlyphSaysTheFleetState(unittest.TestCase):
     """The rail's network glyph carries the whole verdict, so drift/disconnection reads without opening
     the panel (the user 2026-07-29): top node = this machine, the two below = the remotes."""
