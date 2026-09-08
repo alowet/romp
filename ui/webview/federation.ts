@@ -290,6 +290,8 @@ export function routeOutbound(msg: any, knownHosts?: ReadonlySet<string>): Route
   if (host !== LOCAL) {
     const out: any = { ...msg };
     for (const k of SCALAR_ID) if (typeof out[k] === "string") out[k] = bareId(out[k]);
+    // a batched clear (askClearMany) carries the session's card ids too — the remote kernel wants them bare
+    if (Array.isArray(out.itemIds)) out.itemIds = out.itemIds.map((x: any) => typeof x === "string" ? bareId(x) : x);
     return [{ host, msg: out }];
   }
 
@@ -1082,7 +1084,7 @@ export class FederationManager {
       return;
     }
     const routes = routeOutbound(m, new Set(this.hostSeq.filter((h) => h !== LOCAL)));
-    if (m && m.type === "askClear") this.lastClearHost = routes[0] ? routes[0].host : LOCAL;
+    if (m && (m.type === "askClear" || m.type === "askClearMany")) this.lastClearHost = routes[0] ? routes[0].host : LOCAL;
     for (const r of routes) {
       if (r.host === LOCAL) {
         const s = (window as any).__rompLocalSend;
