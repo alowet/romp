@@ -198,5 +198,55 @@ class RefusedNotesKeepTheMail(unittest.TestCase):
         self.assertTrue((pm.MAILROOT / RECIP / "new" / mid).exists(), "the stuck message itself is left for delivery")
 
 
+class TheSweepMovesAnUnreadableFileAside(unittest.TestCase):
+    """A DEAD recipient's box has no drain to meet an unreadable file, so the orphan sweep moves it
+    aside the way read_box does (review find, 2026-09-08): before, the sweep skipped it on every pass
+    and the pending marker stayed latched for a session that will never read. The sidecar is
+    evidence: the tidy that removes an emptied box leaves a box holding one. Mutants: the sweep's
+    catch-all `except Exception: continue` kept for OSError (the file stays); the tidy guard removed
+    (the sidecar goes with the box)."""
+
+    def setUp(self):
+        self._seamfile = os.path.join(tempfile.mkdtemp(), "sessions.json")
+        os.environ["ROMP_SESSIONS_FILE"] = self._seamfile
+        for d in (pm.MAILROOT, pm.WARNED, pm.MAILPENDING):
+            shutil.rmtree(d, ignore_errors=True)
+        self._saved = (pm.TLDIR, pm._log, pm._kernel_post)
+        self.logged, self.told = [], []
+        pm._log = lambda m: self.logged.append(m)
+        pm._kernel_post = lambda path, body, timeout=2: self.told.append((path, body)) or {"ok": True}
+        try:
+            (pm.TLDIR / "messages.jsonl").unlink()
+        except OSError:
+            pass
+        pm._DASHBOARD_MISSED[0] = False
+
+    def tearDown(self):
+        pm.TLDIR, pm._log, pm._kernel_post = self._saved
+        pm._DASHBOARD_MISSED[0] = False
+        os.environ.pop("ROMP_SESSIONS_FILE", None)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-0 file; the fault cannot be staged")
+    def test_the_file_is_moved_aside_the_marker_drops_and_the_box_keeps_its_evidence(self):
+        Path(self._seamfile).write_text(json.dumps([{"id": SENDER, "name": "alice", "state": "idle"}]))   # bob is dead
+        mid = pm.deliver(RECIP, "alice", SENDER, "please review my PR", kind="question")
+        f = pm.MAILROOT / RECIP / "new" / mid
+        os.chmod(f, 0)
+        self.assertTrue((pm.MAILPENDING / RECIP).exists())
+        pm._sweep_orphans()
+        self.assertFalse(f.exists(), "the unreadable file leaves new/")
+        aside = [p.name for p in (pm.MAILROOT / RECIP).iterdir() if p.name.startswith(mid + ".corrupt-")]
+        self.assertEqual(len(aside), 1, "moved aside beside new/, never deleted")
+        self.assertFalse((pm.MAILPENDING / RECIP).exists(), "the marker drops: nothing readable is pending")
+        rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines() if l]
+        self.assertEqual([r["ev"] for r in rows if r.get("id") == mid], ["sent", "bounced"])
+        self.assertTrue([r for r in rows if r.get("id") == mid][-1]["why"].startswith(pm.WHY_INBOX_UNREADABLE))
+        self.assertEqual(len([p for p, b in self.told if p == "/postal-notice"]), 1, "one bell row")
+        self.assertEqual(pm.read_box(SENDER, consume=False), [], "no bounce note: the sender's receipt carries it")
+        pm._sweep_orphans()
+        self.assertTrue((pm.MAILROOT / RECIP).is_dir(), "the emptied box is not tidied away while it holds evidence")
+        self.assertEqual(len([p for p, b in self.told if p == "/postal-notice"]), 1, "said once")
+
+
 if __name__ == "__main__":
     unittest.main()

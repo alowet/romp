@@ -625,30 +625,58 @@ class _LiveBus(unittest.TestCase):
 class InboxSurvivesAnUnreadableFile(_LiveBus):
     """One unreadable file in new/ (EACCES here; EIO in the wild) used to raise out of read_box, and
     do_GET has no handler: socketserver printed the traceback and closed the socket with NO HTTP
-    answer — on every /inbox and /drain — so the session got no mail at all (2026-09-08). Now the
-    file is skipped and left in place, the rest of the box is served, and the fault is said once per
-    file per bus run."""
+    answer, on every /inbox and /drain, so the session got no mail at all (2026-09-08). The rest of
+    the box is served, and the file is moved ASIDE once (review find, 2026-09-08): to
+    `<mailbox>/<name>.corrupt-<stamp>`, beside new/ and out of every listing, never deleted; with one
+    log line, one bell row through the kernel, a terminal row that closes the sender's receipt as
+    refused, and the pending marker no longer latched. The first cut left the file in place, said
+    once: re-skipped every poll, the marker up forever, the receipt pending forever, and nothing the
+    user could see. Mutants: the move dropped (the file stays, the marker latches); the row dropped
+    (the receipt reads pending); the notice dropped (the log alone knows)."""
 
     @unittest.skipIf(os.geteuid() == 0, "root reads a mode-0 file; the fault cannot be staged")
-    def test_the_rest_of_the_box_is_served_and_the_fault_is_said_once(self):
+    def test_the_file_is_moved_aside_once_the_rest_is_served_and_the_sender_hears_refused(self):
         import errno
         import shutil
         shutil.rmtree(ps.MAILROOT / _RCP, ignore_errors=True)
+        shutil.rmtree(ps.MAILPENDING, ignore_errors=True)
+        td = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(td, ignore_errors=True))
+        ps.TLDIR = Path(td)
+        told, saved_post = [], ps._kernel_post
+        ps._kernel_post = lambda path, body, timeout=2: told.append((path, body)) or {"ok": True}
+        self.addCleanup(lambda: setattr(ps, "_kernel_post", saved_post))
         ps.deliver(_RCP, "web", _SND, "the readable one", kind="coordinate")
-        bad = ps.MAILROOT / _RCP / "new" / "0-unreadable.TESTHOST"    # sorts FIRST: the fault hits before any row
-        bad.write_text("From: web\nFrom-Id: %s\nDate: t\n\nnever readable\n" % _SND)
-        os.chmod(bad, 0)
-        self.addCleanup(lambda: (os.chmod(bad, 0o600), bad.unlink()))
+        bad = ps.deliver(_RCP, "web", _SND, "never readable", kind="question")   # a real send: its sent row stands
+        badf = ps.MAILROOT / _RCP / "new" / bad
+        os.chmod(badf, 0)
         status, body = _call(self.port, "/inbox?id=%s&peek=1" % _RCP)
         self.assertEqual(status, 200, "the inbox answers")
         self.assertEqual([m["body"] for m in body["messages"]], ["the readable one"],
                          "the rest of the box is served")
-        self.assertTrue(bad.exists(), "the unreadable file is left in place, never deleted")
+        self.assertFalse(badf.exists(), "the unreadable file leaves new/")
+        aside = [p.name for p in (ps.MAILROOT / _RCP).iterdir() if p.name.startswith(bad + ".corrupt-")]
+        self.assertEqual(len(aside), 1, "moved aside beside new/, kept as evidence")
         status, body = _call(self.port, "/inbox?id=%s&peek=1" % _RCP)
         self.assertEqual((status, [m["body"] for m in body["messages"]]), (200, ["the readable one"]))
-        said = [m for m in self.logged if "0-unreadable.TESTHOST" in m]
+        said = [m for m in self.logged if bad in m]
         self.assertEqual(len(said), 1, "said once across two polls, not per poll")
-        self.assertIn("errno %d" % errno.EACCES, said[0], "…naming the errno")
+        self.assertIn("errno %d" % errno.EACCES, said[0], "naming the errno")
+        self.assertIn(aside[0], said[0], "and where it went")
+        self.assertEqual([(p, "moved aside" in b.get("text", "")) for p, b in told], [("/postal-notice", True)],
+                         "one bell row through the kernel, not one per poll")
+        rows = [json.loads(l) for l in (Path(td) / "messages.jsonl").read_text().splitlines() if l]
+        self.assertEqual([r["ev"] for r in rows if r.get("id") == bad], ["sent", "bounced"],
+                         "the ledger closes on the id nobody can read")
+        rec = [r for r in ps._sent_receipts(_SND) if r["id"] == bad][0]
+        self.assertTrue(rec["bounced"])
+        self.assertTrue(rec["bouncedWhy"].startswith(ps.WHY_INBOX_UNREADABLE))
+        txt = ps.format_receipts([rec])
+        self.assertIn("refused", txt)
+        self.assertNotIn("returned to you", txt, "no return note exists for a refusal")
+        _call(self.port, "/inbox?id=%s" % _RCP)                        # the drain consumes the readable one
+        self.assertFalse((ps.MAILPENDING / _RCP).exists(),
+                         "the pending marker is not latched by a file nobody can read")
 
 
 class SendRefusesWhenTheRowCannotLand(_LiveBus):

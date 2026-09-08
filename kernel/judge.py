@@ -9553,19 +9553,27 @@ def _postal_ask_maps():
     if _PEER_ASK_CACHE[0] == key:
         return _PEER_ASK_CACHE[1]
     last_any, last_ask, rows, alias = {}, {}, [], {}
+    ended = set()   # ids a terminal `bounced` row closed: mail that never reached anyone
     try:
         for line in MESSAGES.read_text(errors="replace").splitlines():
             try:
                 o = json.loads(line)
             except Exception:
                 continue
+            if not isinstance(o, dict):
+                continue
             rows.append(o)
             _learn_alias(alias, o)
+            if o.get("ev") == "bounced" and o.get("id"):
+                ended.add(str(o["id"]))
         _alias_settle(alias)
         for o in rows:
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
                 continue
+            if str(o.get("id") or "") in ended:
+                continue   # refused or destroyed: never reached the recipient, so neither an ask nor an
+                #            answer (review find, 2026-09-08): the kernel's _postal_wait_maps rule, mirrored
             ts = int(ts)
             if isinstance(t_, str) and t_.startswith("peer:"):
                 if o.get("to_sid"):

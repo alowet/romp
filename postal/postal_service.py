@@ -448,7 +448,30 @@ NOT_RECORDED_TEXT = ("the send was not recorded (the message log could not be wr
 WHY_NOT_PUBLISHED = "not published: "
 WHY_NOT_PARKED = "not parked: the outbox record could not be written"
 WHY_OUTBOX_UNREADABLE = "outbox record unreadable, moved aside"
-REFUSAL_WHYS = (WHY_NOT_PUBLISHED, "not parked:", WHY_OUTBOX_UNREADABLE)
+WHY_INBOX_UNREADABLE = "inbox file unreadable, moved aside"    # read_box's move-aside (review find, 2026-09-08)
+REFUSAL_WHYS = (WHY_NOT_PUBLISHED, "not parked:", WHY_OUTBOX_UNREADABLE, WHY_INBOX_UNREADABLE)
+
+_DASHBOARD_MISSED = [False]   # transition-only logging for _refused_notice's kernel leg
+
+def _refused_notice(text):
+    """A fault the USER should see, not only whoever reads server.log (review find, 2026-09-08): the
+    bus has no dashboard surface of its own, so the text goes to the kernel (POST /postal-notice),
+    which files it as one bell row under the `refused` kind, the kind every state file the kernel
+    could not read or write already wears, so a mute on machine-sync notices never hides it. The
+    stderr line is written here too: a caller says a fault once, in one place, and both surfaces
+    carry it. Best-effort toward the kernel: one that is down, or too old to know the route, leaves
+    the log line and the ledger row standing, and the miss is said once per episode."""
+    _log(text)
+    r = _kernel_post("/postal-notice", {"text": text})
+    if r is not None and r.get("ok"):
+        if _DASHBOARD_MISSED[0]:
+            _DASHBOARD_MISSED[0] = False
+            _log("the dashboard hears the mail service's notices again")
+        return
+    if not _DASHBOARD_MISSED[0]:
+        _DASHBOARD_MISSED[0] = True
+        _log("the dashboard could not be told (the kernel %s); the log and the ledger still carry it"
+             % ("refused the notice" if r else "did not answer"))
 
 _REFUSAL_SAID = {}       # site -> True while that site's refusal episode is open (said once, not per pass)
 
@@ -475,21 +498,29 @@ def _publish_new(tmp, dst):
     back to an exists-check + rename, said once: that check is not atomic, but a collision there
     needs two writers minting the same 128-bit name in the same instant, so the protection is the
     same in practice. Raises OSError (FileExistsError on a collision); the caller accounts and
-    refuses."""
+    refuses.
+
+    EVERY link() refusal but a collision takes the fallback (review find, 2026-09-08). The first
+    cut named six errnos as "no hard links here" (EPERM, EOPNOTSUPP, ENOTSUP, ENOSYS, EMLINK,
+    EXDEV) and re-raised the rest as real faults, but filesystems answer that question in more
+    ways than six (EACCES and EINVAL on some network and FUSE mounts), and an errno off the list
+    turned EVERY send on such a machine into a refusal. The checked rename is the right answer to
+    all of them: a real fault (EIO, ENOSPC) fails the rename the same way, so nothing is ever
+    delivered over a fault, and the fallback line names the errno so a fault reads as one."""
     try:
         os.link(tmp, dst)
     except FileExistsError:
         raise
     except OSError as e:
-        if e.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS,
-                           errno.EMLINK, errno.EXDEV):
-            raise                                    # a real fault (EIO, ENOSPC…), not "no links here"
         if not _LINK_FALLBACK_SAID[0]:
             _LINK_FALLBACK_SAID[0] = True
             _log("mail publish: hard links unavailable here (%s) — falling back to a checked rename" % e)
         if dst.exists():
             raise FileExistsError(str(dst))
-        tmp.rename(dst)
+        # os.rename, not Path.rename: on Python 3.10 pathlib binds os.rename at import, so a fault
+        # staged on os.rename never reaches Path.rename there and a real fault would publish over it
+        # (review find, 2026-09-08: the fallback test was green on 3.11+ and red on 3.10 for this alone).
+        os.rename(tmp, dst)
         return
     try:
         tmp.unlink()
@@ -618,15 +649,51 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
 _UNREADABLE_SAID = set()   # (path, errno) already logged this bus run — said once, not per poll
 
 def _say_unreadable_once(path, exc, where):
-    """One _log line per (file, errno) per bus run for a file a listing had to skip. A poll loop
-    (/inbox, /drain, every exchange) re-meets the same file every pass; the registry keeps the
-    fact loud and the log readable."""
+    """One _log line per (file, errno) per bus run for a file a listing had to skip AND could not move
+    aside (the fallback under _mail_unreadable / _list_json_records). A poll loop (/inbox, /drain,
+    every exchange) re-meets the same file every pass; the registry keeps the fact loud and the log
+    readable."""
     key = (str(path), getattr(exc, "errno", None))
     if key in _UNREADABLE_SAID:
         return
     _UNREADABLE_SAID.add(key)
-    _log("%s: %s is unreadable (errno %s: %s) — skipped and left in place; the rest is served"
-         % (where, path.name, exc.errno, exc.strerror or exc))
+    _log("%s: %s is unreadable (errno %s: %s) and could not be moved aside: skipped and left in place; "
+         "the rest is served" % (where, path.name, exc.errno, exc.strerror or exc))
+
+def _aside_name(f):
+    """`<name>.corrupt-<utc stamp>[-n]` beside `f`: the kernel stores' quarantine naming, so one
+    convention reads across every store romp moves a bad file aside in."""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    aside, n = f.with_name("%s.corrupt-%s" % (f.name, stamp)), 0
+    while aside.exists():                            # a second one in the same second
+        n += 1
+        aside = f.with_name("%s.corrupt-%s-%d" % (f.name, stamp, n))
+    return aside
+
+def _mail_unreadable(f, sid, exc):
+    """One inbox file in new/ that cannot be read (EACCES, EIO): moved ASIDE, once, to
+    `<mailbox>/<name>.corrupt-<utc stamp>`, beside new/, so no listing (read_box, the sweeps,
+    restore) meets it again, and never deleted, so the evidence survives; with a terminal
+    `bounced` row (WHY_INBOX_UNREADABLE) closing the sender's receipt as refused, one stderr line
+    and one bell row on the dashboard (review find, 2026-09-08). The first cut skipped the file in
+    place and said it once in the log: that left the pending marker latched (the retry pass
+    re-pushed a no-op every interval), the sender's receipt pending forever, the stuck-mail
+    warning and the orphan sweep unable to touch it, and nothing the user could see. A file that
+    cannot be moved either is the fallback: skipped, said once per (file, errno)."""
+    aside = _aside_name(f.parent.parent / f.name)
+    try:
+        os.replace(f, aside)
+    except FileNotFoundError:
+        return                                       # consumed or recalled meanwhile: nothing to account
+    except OSError:
+        _say_unreadable_once(f, exc, "inbox %s" % sid)
+        return
+    who = _name_for_id(sid) or sid[:8]
+    _refused_notice("mail for %s: %s could not be read (errno %s: %s); moved aside to %s; the sender's "
+                    "receipt reads refused" % (who, f.name, exc.errno, exc.strerror or exc, aside.name))
+    _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": f.name, "to_id": sid,
+                                  "why": "%s (errno %s)" % (WHY_INBOX_UNREADABLE, exc.errno)})
+    _mark_pending(sid)                               # new/ may be empty now → drop the marker
 
 def read_box(sid, consume):
     if not _safe_id(sid):            # reject traversal in the id from /inbox, /drain
@@ -645,13 +712,15 @@ def read_box(sid, consume):
             continue
         try:
             text = f.read_text(errors="replace")
+        except FileNotFoundError:
+            continue                                 # consumed or recalled between the listing and the read
         except OSError as e:
             # One unreadable file (EACCES, EIO) used to raise out of the whole read — and do_GET
             # has no handler, so /inbox and /drain answered NOTHING, on every poll, and the session
-            # got no mail at all while the Stop-hook drain hid the traceback (2026-09-08). Skip the
-            # file and serve the rest. It stays in place as evidence, never deleted, and is said
-            # ONCE per file per bus run — not per poll.
-            _say_unreadable_once(f, e, "inbox %s" % sid)
+            # got no mail at all while the Stop-hook drain hid the traceback (2026-09-08). The file
+            # is moved aside once, said once, and its ledger closed (_mail_unreadable); the rest of
+            # the box is served.
+            _mail_unreadable(f, sid, e)
             continue
         head, _, body = text.partition("\n\n")
         meta = {}
@@ -1489,6 +1558,14 @@ def _sweep_orphans():
                 continue
             try:
                 text = f.read_text(errors="replace")
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                # a dead recipient's box has no drain to meet an unreadable file, so the sweep moves
+                # it aside the way read_box does (review find, 2026-09-08); before, it skipped the
+                # file on every pass and the marker stayed latched for a session that will never read
+                _mail_unreadable(f, box.name, e)
+                continue
             except Exception:
                 continue
             meta = {}
@@ -1536,7 +1613,10 @@ def _sweep_orphans():
                 pass
         _mark_pending(box.name)                         # bounced orphans may have emptied new/
         try:                                            # tidy: drop the mailbox if nothing's left
-            if all(not any((box / d).iterdir()) for d in ("new", "cur", "tmp") if (box / d).is_dir()):
+            if all(not any((box / d).iterdir()) for d in ("new", "cur", "tmp") if (box / d).is_dir()) \
+                    and not any(p.is_file() for p in box.iterdir()):
+                # …and no `.corrupt-*` sidecar beside the three dirs: a file moved aside is evidence
+                # the tidy must not sweep away with the empty box (review find, 2026-09-08)
                 shutil.rmtree(box, ignore_errors=True)
         except Exception:
             pass
@@ -2381,10 +2461,97 @@ def _reconcile_markers():
     except Exception as e:
         _log("marker reconcile failed: %s" % e)
 
+WHY_STOPPED_BEFORE_PUBLISH = WHY_NOT_PUBLISHED + "the mail service stopped before the message reached the inbox"
+WHY_STOPPED_BEFORE_PARK = "not parked: the mail service stopped before the outbox record was written"
+
+def _sweep_unfinished_writes():
+    """Bus start: the one event at which no writer of ours is running, so every temp on disk is a
+    write that never finished (review find, 2026-09-08). deliver() writes the sent row and THEN
+    publishes: a crash between the two left the row saying "sent" and the message in <mailbox>/tmp/,
+    where nothing lists it, a phantom the sender's receipt read as pending forever. The relay leg
+    (row, then outbox_put) had the same window, leaving a `<mid>.json.tmp-*` temp and no record;
+    _atomic_json_put's own failure path removes its temp, so only a crash leaves one. Each temp is
+    removed (never published: it may be half-written), its id's ledger is closed with a terminal
+    `bounced` row when a sent row stands with no terminal row yet, each is said on stderr, and one
+    bell row reports the sweep. A readbox temp is removed and said; a receipt is not a message. The
+    `.corrupt-*` sidecars are evidence and are never touched."""
+    sent, ended = set(), set()
+    try:
+        for line in (TLDIR / "messages.jsonl").read_text(errors="replace").splitlines():
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(o, dict) or not o.get("id"):
+                continue
+            if o.get("ev") == "sent":
+                sent.add(str(o["id"]))
+            elif o.get("ev") in ("bounced", "recall"):
+                ended.add(str(o["id"]))
+    except OSError:
+        pass
+
+    def _close(mid, row):
+        if mid in sent and mid not in ended:
+            row.update({"t": int(time.time()), "ev": "bounced", "id": mid})
+            if _tl_append("messages.jsonl", row):
+                ended.add(mid)
+                return True
+        return False
+
+    removed, closed = 0, 0
+    try:
+        boxes = [b for b in MAILROOT.iterdir() if b.is_dir()] if MAILROOT.is_dir() else []
+    except OSError:
+        boxes = []
+    for box in boxes:
+        tmpd = box / "tmp"
+        try:
+            temps = [f for f in tmpd.iterdir() if f.is_file()] if tmpd.is_dir() else []
+        except OSError:
+            continue
+        for f in temps:
+            try:
+                f.unlink()
+            except OSError as e:
+                _log("unfinished mail %s for %s could not be removed (%s)" % (f.name, box.name, e))
+                continue
+            removed += 1
+            done = _close(f.name, {"to_id": box.name, "why": WHY_STOPPED_BEFORE_PUBLISH})
+            closed += done
+            _log("unfinished mail %s for %s removed at start%s"
+                 % (f.name, box.name, "; its sent row stood with no message published, now closed as refused"
+                    if done else ""))
+    for store, why in ((OUTBOX, WHY_STOPPED_BEFORE_PARK), (READBOX, None)):
+        try:
+            hostdirs = [h for h in store.iterdir() if h.is_dir()] if store.is_dir() else []
+        except OSError:
+            continue
+        for hostdir in hostdirs:
+            try:
+                temps = sorted(hostdir.glob("*.json.tmp-*"))
+            except OSError:
+                continue
+            for f in temps:
+                try:
+                    f.unlink()
+                except OSError as e:
+                    _log("unfinished %s record %s could not be removed (%s)" % (store.name, f.name, e))
+                    continue
+                removed += 1
+                mid = f.name.split(".json.tmp-", 1)[0]
+                if why:
+                    closed += _close(mid, {"host": hostdir.name, "why": why})
+                _log("unfinished %s record %s for %s removed at start" % (store.name, f.name, hostdir.name))
+    if removed:
+        _refused_notice("mail service start: %d unfinished mail write(s) from before the restart removed; "
+                        "%d sender receipt(s) now read refused (the log names each)" % (removed, closed))
+
 def serve():
     STATE.mkdir(parents=True, exist_ok=True)
     MAILROOT.mkdir(parents=True, exist_ok=True)
     _reconcile_markers()
+    _sweep_unfinished_writes()             # temps a crash left: removed, said, their ledgers closed (2026-09-08)
     if peers_on():
         _seed_peers_from_kernel()          # a restarted bus re-learns its peers without waiting for a transition
     try:
@@ -2850,19 +3017,23 @@ def _list_json_records(d, where, close_ledger_for=None):
     outbox record was mail parked for nobody with no trace anywhere (2026-09-08). The file's stat is
     fingerprinted BEFORE the read: if it changed by the time the parse failed, a writer's atomic
     rewrite raced the read and the file is left alone for the next pass — a torn read of a healthy
-    record is never moved aside. An unreadable file (EACCES, EIO) is not corruption: skipped, said
-    once per bus run.
+    record is never moved aside. An unreadable file (EACCES, EIO) is moved aside the same way
+    (review find, 2026-09-08): the first cut skipped it in place, said once, which re-skipped it
+    on every exchange with its mail parked for nobody, the shape the quarantine exists to end. Only
+    a file that cannot be moved either stays, skipped and said once per (file, errno).
 
     `close_ledger_for` (the OUTBOX's host): a parked message's filename IS its mid, and moving the
     record aside is that message's terminal event — without a row the sender's receipt reads
     "pending (not read yet)" forever. A terminal `bounced` row (WHY_OUTBOX_UNREADABLE) is appended
-    best-effort after the move; the quarantine itself never depends on the row landing."""
+    best-effort after the move; the quarantine itself never depends on the row landing. The move is
+    said on stderr and as one bell row on the dashboard (_refused_notice)."""
     out = []
     try:
         files = sorted(d.glob("*.json"))
     except OSError:
         return out
     for f in files:
+        st = None
         try:
             st = f.stat()
             rec = json.loads(f.read_text())
@@ -2873,27 +3044,30 @@ def _list_json_records(d, where, close_ledger_for=None):
         except FileNotFoundError:
             continue                                 # gone between the glob and the read (deleted, moved)
         except OSError as e:
-            _say_unreadable_once(f, e, where)
-            continue
+            if st is None:                           # the stat itself failed: no fingerprint to move by
+                _say_unreadable_once(f, e, where)
+                continue
+            reason = "unreadable, errno %s: %s" % (e.errno, e.strerror or e)
+            fault = e
         except ValueError as e:
-            reason = e
+            reason, fault = e, None
         try:
             cur = f.stat()
             if (cur.st_ino, cur.st_mtime_ns, cur.st_size) != (st.st_ino, st.st_mtime_ns, st.st_size):
                 continue                             # rewritten under us: a torn read, not a torn file
-            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            aside, n = f.with_name("%s.corrupt-%s" % (f.name, stamp)), 0
-            while aside.exists():                    # a second corrupt file in the same second
-                n += 1
-                aside = f.with_name("%s.corrupt-%s-%d" % (f.name, stamp, n))
+            aside = _aside_name(f)
             os.replace(f, aside)
         except FileNotFoundError:
             continue                                 # a sibling lister moved it first
         except OSError as e:
-            _log("%s: %s could not be parsed (%s) and could not be moved aside (%s)" % (where, f.name, reason, e))
+            if fault is not None:
+                _say_unreadable_once(f, fault, where)
+            else:
+                _say_unreadable_once(f, e, where)    # said once per (file, errno), not per pass
             continue
-        _log("%s: %s could not be parsed (%s); moved aside to %s — the rest is served"
-             % (where, f.name, reason, aside.name))
+        _refused_notice("%s: %s could not be %s (%s); moved aside to %s; the rest is served%s"
+                        % (where, f.name, "read" if fault is not None else "parsed", reason, aside.name,
+                           "; the sender's receipt reads refused" if close_ledger_for else ""))
         if close_ledger_for:
             _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": f.stem,
                                           "host": close_ledger_for, "why": WHY_OUTBOX_UNREADABLE})
@@ -2979,10 +3153,18 @@ def _read_arrived(host, r):
     """One read receipt from a peer: ours → log the exec (or its unexec retraction) into
     messages.jsonl, where _sent_receipts joins it to the cross-host sent event by the relay mid.
     Origin-stamped (the mail was forwarded through us) → re-queue one hop backward with the stamp
-    stripped, so it can never loop — the same one-hop-max rule relays live by."""
+    stripped, so it can never loop — the same one-hop-max rule relays live by.
+
+    Returns True iff the receipt was APPLIED (the row landed, or the forward is parked) and False
+    when it was not, so the caller keeps it ON THE WIRE (review find, 2026-09-08): the dialer
+    withholds its readAck, the dialed side names it in the response's `readsKept`, and the peer
+    re-sends it next exchange. Before this readbox_put's new False was ignored: a forwarded receipt
+    the store could not take was acked and gone, where the base's raised OSError had aborted the
+    exchange and left it to retry. A receipt that can NEVER apply (an unaddressable mid, an origin
+    no peer of ours owns) reads as applied: there is nothing a retry could change."""
     mid = (r or {}).get("mid") or ""
     if not _safe_id(mid):
-        return
+        return True
     origin = str((r or {}).get("origin") or "")
     if origin and origin != self_host():
         if PEERS.get(origin):                    # only toward a peer the kernel told us about
@@ -2991,14 +3173,14 @@ def _read_arrived(host, r):
                 fwd["dmid"] = r.get("dmid")
             if r.get("unread"):
                 fwd["unread"] = True
-            readbox_put(origin, fwd)
-        return
+            return readbox_put(origin, fwd)      # False (said by readbox_put) → the peer re-sends it
+        return True
     ev = "unexec" if r.get("unread") else "exec"
     row = {"t": int(r.get("t") or time.time()), "ev": ev, "id": mid}
     d = str((r or {}).get("dmid") or "")
     if _safe_id(d):
         row["dmid"] = d   # the recipient's own delivery mid → the timeline's exact turn join (2026-08-06)
-    _tl_append("messages.jsonl", row)
+    return _tl_append("messages.jsonl", row)
 
 def _bounce_apply(host, b):
     """A peer refused one of our parked messages — return it to the SENDER as a bus-authored note,
@@ -3008,7 +3190,15 @@ def _bounce_apply(host, b):
     the outbox only once the ledger holds its last word and the sender holds the note; before this
     the delete came FIRST and a crash between it and the row lost the accounting entirely. If either
     step fails the record stays: the next exchange re-relays it, the peer's dedupe re-bounces it,
-    and the attempt repeats (a repeated terminal row is harmless — _sent_receipts keys by id)."""
+    and the attempt repeats (a repeated terminal row is harmless — _sent_receipts keys by id).
+
+    Any OTHER failure of the note is bounded the same way (review find, 2026-09-08): a mailbox that
+    cannot be made, a temp that cannot be written (ENOSPC lands here, before the row), an unsafe
+    sender id: each used to escape this function and abort the WHOLE exchange, and with the record
+    now kept until it is accounted the peer re-bounced it next exchange and the abort recurred
+    forever, every other relay, ack and receipt in that exchange lost with it. The record stays, the
+    exchange goes on, the next one retries the note; said once per message, on stderr and as a bell
+    row, since a fault that recurs on every exchange is one the user should see."""
     mid = (b or {}).get("mid") or ""
     msg = outbox_get(host, mid)
     if not msg:
@@ -3028,7 +3218,18 @@ def _bounce_apply(host, b):
         except DeliveryNotRecorded as e:
             _log("bounce for %s from %s: the return note was refused (%s) — the record stays parked" % (mid, host, e))
             return
+        except Exception as e:
+            if mid not in _NOTE_FAILED_SAID:
+                _NOTE_FAILED_SAID.add(mid)
+                _refused_notice("bounce for %s from %s: the return note to %s could not be delivered (%s: %s); "
+                                "the record stays parked and the note is retried next exchange"
+                                % (mid, host, _name_for_id(msg["frm_id"]) or str(msg["frm_id"])[:8],
+                                   type(e).__name__, e))
+            return
+        _NOTE_FAILED_SAID.discard(mid)
     outbox_del(host, mid)
+
+_NOTE_FAILED_SAID = set()   # mids whose return note failed outright (not a refusal); said once each
 
 _LOCAL_PRESENCE_GOOD = [[], False]   # [rows, ever_answered] — the last ANSWERED local listing
 _PRESENCE_SERVE_WARNED = [False]     # transition-only logging, the _REG_SERVE_WARNED idiom
@@ -3192,7 +3393,6 @@ def quarantine_decide(mid, action, text=None, feedback=None):
     if rec is None:
         return False, "no held message '%s'" % mid
     if action == "deny":
-        quarantine_del(mid)
         note = " ".join(str(feedback or "").split())
         if note and rec.get("origin") and rec.get("frm"):
             gist = " ".join(str(rec.get("body") or "").split())[:60]
@@ -3200,9 +3400,18 @@ def quarantine_decide(mid, action, text=None, feedback=None):
                     "delivered. Note from the reviewer: %s"
                     % (rec.get("to") or "?", gist, "…" if len(gist) == 60 else "", note))
             fb_mid = _unique()
-            outbox_put(rec["origin"], {"mid": fb_mid, "to": rec["frm"], "frm": "Romp Postal Service",
-                                       "frm_id": "", "body": body, "kind": "coordinate"})
+            # The note parks BEFORE the hold is dropped, and a park that fails refuses the deny
+            # (review find, 2026-09-08): outbox_put's False was ignored here, so a deny whose note
+            # the outbox could not take dropped the held message, answered ok, and the reviewer's
+            # words went nowhere with nothing saying so. The hold stands; the user retries, or
+            # denies without a note.
+            if not outbox_put(rec["origin"], {"mid": fb_mid, "to": rec["frm"], "frm": "Romp Postal Service",
+                                              "frm_id": "", "body": body, "kind": "coordinate"}):
+                return False, ("the note to the sender could not be parked for %s (the outbox could not be "
+                               "written), so nothing was done: the held message is untouched; retry, or "
+                               "deny without a note" % rec["origin"])
             _peer_wake(rec["origin"]).set()
+        quarantine_del(mid)
         return True, None
     if action == "approve":
         body = str(text) if (text is not None and str(text).strip()) else (rec.get("body") or "")
@@ -3353,7 +3562,11 @@ def _relay_in(host, m, token_proven=False):
         fh, hit = (peer_route(to_id) if to_id else peer_route(to))
         if fh and fh != host and not (hit or {}).get("via"):
             if outbox_get(fh, mid) is None:          # a resend while we hold it forwards nothing twice
-                outbox_put(fh, dict(m, origin=host))
+                if not outbox_put(fh, dict(m, origin=host)):
+                    # not parked (said by outbox_put): 'hold' would tell the sender its mail is on
+                    # its way when nothing holds it (review find, 2026-09-08); silence instead, so
+                    # the sender's outbox keeps it and re-relays it next exchange
+                    return "retry", None
             return "hold", None
     # death-ruling gate — the relay leg's honesty arms (2026-08-31; the sending resolver got these
     # in the answered-but-absent round, this inbound leg never did): an UNANSWERED listing proves
@@ -3507,9 +3720,11 @@ def peer_exchange_handle(data):
         _bounce_arrived(host, b)
     for ra in data.get("readAcks") or []:            # the dialer confirmed response-carried receipts
         readbox_del(host, ra)
-    for r in data.get("reads") or []:                # read receipts flowing back — ours or one hop onward
-        _read_arrived(host, r)
-    acks, bounces = [], []
+    reads_kept = []                                  # request-carried receipts we could NOT apply: named in
+    for r in data.get("reads") or []:                # the response so the dialer keeps them for its next
+        if not _read_arrived(host, r):               # request (additive; an older dialer ignores the key
+            reads_kept.append({"mid": (r or {}).get("mid"), "unread": bool((r or {}).get("unread"))})
+    acks, bounces = [], []                           # and drops them, exactly as before)
     for m in data.get("relays") or []:
         verdict, bounce = _relay_in(host, m, token_proven=True)   # past the HTTP gate = showed OUR serve token
         if verdict == "ack":
@@ -3540,7 +3755,8 @@ def peer_exchange_handle(data):
     return {"host": self_host(), "epoch": BUS_EPOCH, "proto": PEER_PROTO, "busId": BUS_ID,
             "presence": fleet_presence(host), "holds": holds_payload(host),
             "tier": my_tier_of(host),                # how WE hold the dialer's mail (display/mirror, never the gate)
-            "relays": rel, "acks": acks, "bounces": bounces, "reads": reads}, 200
+            "relays": rel, "acks": acks, "bounces": bounces, "reads": reads,
+            "readsKept": reads_kept}, 200            # see _read_arrived (2026-09-08)
 
 def build_exchange_request(host, wait=True):
     """The DIALER's request for one exchange. The relays are the outbox's oldest-first prefix under
@@ -3562,13 +3778,20 @@ def peer_exchange_apply(host, req_sent, resp):
     """The DIALER's half: fold one exchange response in. `req_sent` is the request that produced it —
     its included acks/bounces/readAcks are now delivered and leave the pending queue (kept on send
     failure), and its reads leave the readbox: a response means the dialed side processed the whole
-    request before answering, so request-carried receipts need no explicit ack."""
+    request before answering, so request-carried receipts need no explicit ack, except the ones the
+    dialed side names in `readsKept` (review find, 2026-09-08): those it could not apply, and they
+    stay parked for the next request. Likewise a response-carried read WE could not apply gets no
+    readAck, so the dialed side keeps it and re-sends it."""
     p = _pending(host)
     with _peer_lock:
         p["acks"] = [a for a in p["acks"] if a not in (req_sent.get("acks") or [])]
         p["bounces"] = [b for b in p["bounces"] if b not in (req_sent.get("bounces") or [])]
         p["readAcks"] = [a for a in p.get("readAcks") or [] if a not in (req_sent.get("readAcks") or [])]
+    kept = {(str(k.get("mid") or ""), bool(k.get("unread")))
+            for k in (resp.get("readsKept") or []) if isinstance(k, dict)}
     for r in req_sent.get("reads") or []:
+        if (str((r or {}).get("mid") or ""), bool((r or {}).get("unread"))) in kept:
+            continue                                 # the dialed side could not take it: it rides again
         readbox_del(host, r)
     PEER_STATE[host] = {"presence": resp.get("presence") or [], "epoch": resp.get("epoch"),
                         "holds": resp.get("holds") or [], "seenAt": int(time.time())}
@@ -3584,7 +3807,8 @@ def peer_exchange_apply(host, req_sent, resp):
     for b in resp.get("bounces") or []:
         _bounce_arrived(host, b)
     for r in resp.get("reads") or []:                # response-carried receipts: apply, ack on the NEXT dial
-        _read_arrived(host, r)
+        if not _read_arrived(host, r):
+            continue                                 # not applied → no readAck: the dialed side re-sends it
         with _peer_lock:
             p["readAcks"].append({"mid": r.get("mid"), "unread": bool(r.get("unread"))})
     for m in resp.get("relays") or []:

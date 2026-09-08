@@ -172,7 +172,7 @@ class ExchangeUnkeyableHostGate(_HostnameSeams):
         super().setUp()
         self._peers, self._pstate = dict(pm.PEERS), dict(pm.PEER_STATE)
         self._agents = pm.local_agents
-        pm.local_agents = lambda: []          # presence enumeration is not under test; stay hermetic
+        pm.local_agents = lambda threads=False: []          # presence enumeration is not under test; stay hermetic
 
     def tearDown(self):
         pm.local_agents = self._agents
@@ -367,14 +367,18 @@ class MessageIdsNeverCollide(unittest.TestCase):
             shutil.rmtree(td, ignore_errors=True)
 
     def test_publish_without_hard_links_falls_back_once_and_real_faults_refuse(self):
-        # mutants: the fallback errno set widened to every OSError → EIO/ENOSPC would publish by rename
-        # over a real fault; narrowed to none → a link-less filesystem could never deliver at all
+        # Every link() refusal but a collision takes the checked rename (review find, 2026-09-08: the
+        # first cut named six errnos as "no hard links here" and re-raised the rest, so a mount that
+        # answers link() with EACCES or EINVAL refused EVERY send). A real fault fails the rename the
+        # same way, so it still refuses with the ledger closed. Mutants: the fallback narrowed back to
+        # a list (EACCES/EINVAL refuse); the rename's failure swallowed (a fault "delivers" nothing and
+        # leaves the sent row open); the collision folded into the fallback (a standing message replaced).
         import errno
         import json
         import shutil
         shutil.rmtree(pm.MAILROOT, ignore_errors=True)
         td = tempfile.mkdtemp()
-        saved_tl, saved_link, saved_log = pm.TLDIR, os.link, pm._log
+        saved_tl, saved_link, saved_rename, saved_log = pm.TLDIR, os.link, os.rename, pm._log
         pm.TLDIR = type(pm.TLDIR)(td)
         logged = []
         pm._log = lambda m: logged.append(m)
@@ -390,24 +394,26 @@ class MessageIdsNeverCollide(unittest.TestCase):
             t = pm.MAILROOT / self.RCP / "tmp"
             return [p.name for p in t.iterdir()] if t.is_dir() else []
 
-        def link_raising(code):
-            def _link(src, dst, *a, **k):
+        def raising(code):
+            def _f(*a, **k):
                 raise OSError(code, "staged by the test")
-            return _link
+            return _f
 
         try:
-            for code in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK, errno.EXDEV):
-                os.link = link_raising(code)
+            for code in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK, errno.EXDEV,
+                         errno.EACCES, errno.EINVAL):
+                os.link = raising(code)
                 pm._LINK_FALLBACK_SAID[0] = False
                 logged.clear()
                 mid = pm.deliver(self.RCP, "web", self.SND, "via rename (%d)" % code)
                 self.assertIn(mid, box(), "errno %d: delivered by the checked rename" % code)
                 self.assertEqual(tmpd(), [], "errno %d: no temp left" % code)
                 pm.deliver(self.RCP, "web", self.SND, "again (%d)" % code)
-                self.assertEqual(len([m for m in logged if "hard links unavailable" in m]), 1,
-                                 "errno %d: said once per bus run, not per send" % code)
-            for code in (errno.EACCES, errno.EIO, errno.ENOSPC, errno.EEXIST):
-                os.link = link_raising(code)
+                fallback = [m for m in logged if "hard links unavailable" in m]
+                self.assertEqual(len(fallback), 1, "errno %d: said once per bus run, not per send" % code)
+                self.assertIn("[Errno %d]" % code, fallback[0], "errno %d: the line names the errno" % code)
+            for code in (errno.EIO, errno.ENOSPC):
+                os.link, os.rename = raising(code), raising(code)     # a REAL fault: the rename meets it too
                 before = box()
                 with self.assertRaises(pm.DeliveryNotRecorded):
                     pm.deliver(self.RCP, "web", self.SND, "never lands (%d)" % code)
@@ -416,8 +422,15 @@ class MessageIdsNeverCollide(unittest.TestCase):
                 self.assertEqual([r["ev"] for r in rows()[-2:]], ["sent", "bounced"],
                                  "errno %d: the ledger closes on the refused id" % code)
                 self.assertTrue(rows()[-1]["why"].startswith(pm.WHY_NOT_PUBLISHED))
+            os.rename = saved_rename
+            os.link = raising(errno.EEXIST)                          # EEXIST IS the collision: never a fallback
+            before = box()
+            with self.assertRaises(pm.DeliveryNotRecorded) as cm:
+                pm.deliver(self.RCP, "web", self.SND, "a collision at the link")
+            self.assertIn("refusing to replace", str(cm.exception))
+            self.assertEqual(box(), before)
             # a forced collision under the fallback is refused too, and the first message stands
-            os.link = link_raising(errno.EPERM)
+            os.link = raising(errno.EPERM)
             saved_unique = pm._unique
             pm._unique = lambda: "1700000000.4242_c0ffee.TESTHOST"
             try:
@@ -430,7 +443,7 @@ class MessageIdsNeverCollide(unittest.TestCase):
             standing = [m["body"] for m in pm.read_box(self.RCP, consume=False) if m["id"] == first]
             self.assertEqual(standing, ["first under the fallback"])
         finally:
-            os.link, pm.TLDIR, pm._log = saved_link, saved_tl, saved_log
+            os.link, os.rename, pm.TLDIR, pm._log = saved_link, saved_rename, saved_tl, saved_log
             pm._LINK_FALLBACK_SAID[0] = False
             shutil.rmtree(td, ignore_errors=True)
 

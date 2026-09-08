@@ -39,6 +39,11 @@ def _msg(i, f, t_, ts, kind=None, body="x"):
     return json.dumps(r)
 
 
+def _bounced(i, ts, why="not published: the mail service stopped before the message reached the inbox"):
+    """The bus's terminal row for message m<i>: refused, or destroyed unread (review find, 2026-09-08)."""
+    return json.dumps({"id": "m%d" % i, "ev": "bounced", "t": ts, "why": why})
+
+
 class _Base(unittest.TestCase):
     def setUp(self):
         self._saved = jd.STATE
@@ -178,6 +183,8 @@ class MatrixCloserGate(_Base):
             [_msg(1, SID, MGR, T0, "question"), _msg(2, MGR, SID, T0 + 5, "delegate")],
             [_msg(1, SID, MGR, T0, None, "QUESTION: which port?")],       # legacy kindless ask
             [_msg(1, SID, "peer:otherbox", T0, "question")],              # cross-host, relay-keyed
+            [_msg(1, SID, MGR, T0, "question"), _bounced(1, T0 + 1)],     # refused: never reached anyone
+            [_msg(1, SID, MGR, T0, "question"), _msg(2, MGR, SID, T0 + 5, "coordinate"), _bounced(2, T0 + 6)],
         ]
         for rows in grid:
             self._log(rows)
@@ -186,6 +193,23 @@ class MatrixCloserGate(_Base):
         # and where the peer IS alive, the user-facing graph agrees with the gate too
         self._log([_msg(1, SID, MGR, T0, "question")])
         self.assertTrue(jd._open_peer_asks(SID) and SID in km._wait_for_graph(NOW, {SID, MGR}))
+
+    def test_a_refused_question_is_no_open_ask_for_either_reader(self):
+        # A sent row a terminal `bounced` row closed never reached the recipient (review find,
+        # 2026-09-08): the bus refused it (its publish failed after the row) or destroyed it unread, so
+        # neither reader counts it as an ask, nor as an answer. Mutant: either reader's `ended` filter
+        # removed (the agreement test above would still pass with both wrong).
+        def km_open(sid):
+            last_any, last_ask, _aw = km._postal_wait_maps()
+            return any(f == sid and last_any.get((p, sid), 0) < meta[0]
+                       for (f, p), meta in last_ask.items())
+        self._log([_msg(1, SID, MGR, T0, "question"), _bounced(1, T0 + 1)])
+        self.assertFalse(jd._open_peer_asks(SID), "the gate: no open ask")
+        self.assertFalse(km_open(SID), "the wait maps: no open ask")
+        self.assertNotIn(SID, km._wait_for_graph(NOW, {SID, MGR}), "the card wears none")
+        self._log([_msg(1, SID, MGR, T0, "question"), _msg(2, MGR, SID, T0 + 5, "coordinate"), _bounced(2, T0 + 6)])
+        self.assertTrue(jd._open_peer_asks(SID), "a bounced reply answers nothing: the gate")
+        self.assertTrue(km_open(SID), "a bounced reply answers nothing: the wait maps")
 
 
 class TwinsKeyMailByStableId(_Base):

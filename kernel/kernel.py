@@ -30394,11 +30394,14 @@ def _postal_wait_maps():
     try:
         rows = []
         alias = {}   # "host:name" -> [(t, sid), …], learned from every row a remote sender stamped
+        ended = set()   # ids a terminal `bounced` row closed: mail that never reached anyone
         for o in _messages_rows():                    # append-incremental rows (2026-09-03); the fold
             if not isinstance(o, dict):               # itself stays whole-log: aliases learned from LATER
                 continue                              # rows resolve EARLIER peer: rows
             rows.append(o)
             jd._learn_alias(alias, o)
+            if o.get("ev") == "bounced" and o.get("id"):
+                ended.add(str(o["id"]))
         jd._alias_settle(alias)
         for hn, hist in alias.items():                # the peer's own stamps, inverted: sid -> what it wore
             for at, sid in hist:
@@ -30406,6 +30409,15 @@ def _postal_wait_maps():
         for o in rows:
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
+                continue
+            if str(o.get("id") or "") in ended:
+                # A REFUSED or DESTROYED send is neither an ask nor an answer (review find,
+                # 2026-09-08): the bus writes the sent row BEFORE it publishes and closes a publish
+                # that then failed, or a peer's refusal, or the orphan sweep's destroy, with a
+                # terminal `bounced` row on the same id. The recipient never saw that message, so
+                # counting its row here made the asker wear an open ask (and the debt reminder
+                # count a debt) that no reply could ever close, and let a bounced reply read as
+                # answering the pair. The judge's _postal_ask_maps applies the same rule.
                 continue
             ts = int(ts)
             # a CROSS-HOST row is addressed to the RELAY ("peer:<host>"), not the recipient's sid —
@@ -45402,6 +45414,22 @@ class Handler(BaseHTTPRequestHandler):
                 h = str(body.get("host") or "")
                 if h:
                     _demand_redial(h, "timeout")
+                return self._send(200, json.dumps({"ok": True}), "application/json")
+            if u.path == "/postal-notice":
+                # The postal bus files a fault the USER should see (review find, 2026-09-08): a mail
+                # file it had to move aside, a return note it could not deliver, temps a crash left.
+                # The bus has no dashboard surface of its own, so the text lands here as one row on
+                # the ring the bell mirrors, under its `refused` kind, the kind a state file that
+                # could not be read or written wears, so a mute on machine-sync notices never hides
+                # it. The kernel adds nothing to the text: the bus wrote it for the user. Bounded to
+                # what the ring serves whole; a body with no text is a 400 that files nothing.
+                body, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
+                text = " ".join(str(body.get("text") or "").split())
+                if not text:
+                    return self._send(400, json.dumps({"ok": False, "error": "text required"}), "application/json")
+                _sync_notice(text[:300], ok=False, kind="refused")
                 return self._send(200, json.dumps({"ok": True}), "application/json")
             if u.path == "/tunnels/autoupdate":
                 # The popover's "Automatically update" checkbox. Body: {"on": bool}. Fleet-wide, not per-host

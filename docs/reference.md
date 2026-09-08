@@ -192,6 +192,18 @@ romp mail remote                 # legacy singleton scheme only (ROMP_POSTAL_PEE
 | `check_sent()` | Whether your sent messages were read yet |
 | `recall_message(to, id?)` | Unsend a message the recipient hasn't read |
 
+### When a send is refused
+
+A send whose record cannot be written is refused, never half-done: the bus
+answers `503` with `ok: false` and the reason, nothing is delivered, and the
+sender still holds the text to retry. `check_sent` and `romp mail sent` show
+a message the bus refused, or could not place, as `bounced`, marked `refused`
+with the reason; a peer's refusal that did come back as a note still reads
+`undeliverable, returned to you`. A message file the bus cannot read, in a
+recipient's inbox or in the cross-host outbox, is moved aside once (see the
+state files below), its sender's receipt reads refused, and the dashboard's
+error center says so under the `refused` kind.
+
 ### Claude Code 2.1.224 or newer
 
 Mail to a terminal (tmux) session delivers through Claude Code's per-session
@@ -1499,6 +1511,19 @@ lands in the same second; the `remotes.json` sidecar is 0600, since its rows
 carry tokens), the file is rewritten without them, and one stderr line plus one
 Log entry under the `refused` kind names each host as a clipped repr, never the
 raw string.
+
+The postal service's own files live under `postal/` there: `mail/<session>/`
+(a maildir per recipient), `outbox/<host>/` and `readbox/<host>/` (cross-host
+mail and read receipts awaiting their peer). A record or message file the bus
+cannot parse or read is moved aside once, never deleted, to
+`<name>.corrupt-<UTC stamp>` beside the original (an inbox file lands beside
+its `new/` directory, out of every listing; a `-1`, `-2` suffix when two land
+in the same second), the rest of the store is served, the sender's receipt for
+that message reads refused, and the error center says so under the `refused`
+kind. At start the bus removes the temporary files a crash left behind (a
+message written but never placed, a store record never finished), closes each
+one's receipt as refused, and says so once. The sidecars are yours to inspect
+or delete.
 
 ## Switches
 
