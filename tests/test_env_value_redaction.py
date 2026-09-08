@@ -31,11 +31,14 @@ for the assertion nobody wrote that way. Pinned here:
     key bounded at the widest cut a tool makes, and a wider head taken with its cut and tail by the
     format rule, quoted or bare; the `hf_` and `rpa_` rules' letters-and-digits class and its cost;
     the fragment rule's documented costs (a camelCase name or a digit-bearing run against a cut is
-    redacted, a Capitalised word or a single-case identifier is not); and the two shapes the generic
-    rule fires on but leaves alone, a named git sha and a dated Anthropic model id.
+    redacted, a Capitalised word or a single-case identifier is not); the two runs on the sides of one
+    cut taken together when either qualifies, whatever the other's alphabet (a letters-only hex tail
+    stood in the clear beside its redacted head on CI, 2026-09-08), with the floor on both sides and a
+    pair where neither qualifies left alone; and the two shapes the generic rule fires on but leaves
+    alone, a named git sha and a dated Anthropic model id.
   ScrubCost: the scrub is linear: a 200 KB adversarial line (a run of repeated prefixes, of one case,
-    of digits, of dashes, of dots) is scrubbed within a generous budget; the first of them took 80
-    seconds before the cut-key rule's head was bounded.
+    of digits, of dashes, of dots, a pair of runs around one cut) is scrubbed within a generous budget;
+    the first of them took 80 seconds before the cut-key rule's head was bounded.
   ReportShapes: the hook's work on a report object of each outcome (a failure's longrepr, a skip's
     tuple, a passed test's sections); a changed failure keeps its crash location, its message scrubbed
     in pytest's E-marked rendering, through xdist's serialization round trip.
@@ -54,7 +57,11 @@ for the assertion nobody wrote that way. Pinned here:
 
 Every probe value is synthetic and assembled at run time ("romp-test-fixture-" + a uuid; a
 pattern-shaped probe is a public key prefix joined to uuids), so no literal in this file is a
-credential.
+credential. A case whose assertion depends on which characters a piece carries (the fragment rule
+wants a digit or mixed case) draws nothing: its value is the hex digest of a fixed tag, the same on
+every run, and a letters-only piece is the hex alphabet's six letters cycled. A uuid's 13-character
+piece lacks a digit one draw in 345,000 and an 8-character one in 2,560, and one such draw failed
+this module on CI (2026-09-08).
 """
 import base64
 import hashlib
@@ -132,6 +139,20 @@ def _letters(n):
     while len(out) < n:
         out += "".join(alphabet[b % 26] for b in uuid.uuid4().bytes)
     return out[:n]
+
+
+def _fixed_hex(tag):
+    """64 hex characters that are the same on every run: the sha256 digest of a fixed tag, assembled at
+    run time so no token-shaped literal sits in this file. For a case whose assertion depends on which
+    characters a piece carries: a uuid's 8-character piece lacks a digit one draw in 2,560 (0.375**8),
+    a 13-character one in 345,000, and one such draw failed this module on CI (2026-09-08)."""
+    return hashlib.sha256(b"romp-test-fixture-" + tag.encode()).hexdigest()
+
+
+def _hex_letters(n):
+    """`n` characters from the hex alphabet's letters alone (`abcdef`, cycled): the shape of a hex piece
+    with no digit, which the fragment rule's digit test cannot see."""
+    return ("abcdef" * (n // 6 + 1))[:n]
 
 
 def _copy_hook(d):
@@ -541,8 +562,12 @@ class CredentialPattern(_WithConftest):
         # of the value: a known prefix against the cut is a truncated key whatever follows it, and 8 or more
         # token characters against the cut are a fragment when they carry a digit or mixed case
         red, R = self.cf.redact_credential_tokens, self.cf.CREDENTIAL_REDACTED
-        k = patterned_probe()                                      # a public prefix and 64 hex
-        a = uuid.uuid4().hex + uuid.uuid4().hex                    # 64 hex, no known prefix
+        # the same values every run: a drawn piece lacks a digit one time in thousands, and a 13-character
+        # tail of letters alone stood in the clear on CI (2026-09-08). Every piece cut below carries a digit
+        k = "sk-ant-api03-" + _fixed_hex("ellipsized-key")        # a public prefix and 64 hex
+        a = _fixed_hex("ellipsized")                               # 64 hex, no known prefix
+        for piece in (a[:11], a[:12], a[:17], a[:41], a[-9:], a[-11:], a[-12:], a[-13:], a[-30:]):
+            self.assertTrue(any(c.isdigit() for c in piece), piece)
         # pytest's assert line for two keys: the prefix and 5 characters, the cut, 13 of the tail
         self.assertEqual(red("assert '%s...%s' == '%s...%s'" % (k[:12], k[-13:], k[:12], k[-13:])),
                          "assert '%s' == '%s'" % (R, R))
@@ -565,6 +590,28 @@ class CredentialPattern(_WithConftest):
         self.assertEqual(red("['sk-[13 chars]%s']" % a[-30:]), "['sk-[13 chars]%s']" % R)
         self.assertEqual(red("'[13 chars]%s[20 chars]%s'" % (a[:12], a[-9:])), "'[13 chars]%s[20 chars]%s'" % (R, R))
         self.assertEqual(red("['%s[101 chars]%s']" % (k[:54], k[-3:])), "['%s']" % R)
+        # the two runs on the sides of one cut are pieces of one value: when either carries a digit the other
+        # is taken with it whatever its alphabet, the cut kept between two markers. A 13-character hex tail of
+        # letters alone stood in the clear beside its redacted head (CI, 2026-09-08); a letters-only head
+        # beside a redacted tail showed the same way, and so did unittest's `[N chars]` pieces
+        t, h = _hex_letters(13), _hex_letters(12)
+        self.assertEqual(red("assert '%s...%s' == '%s...%s'" % (a[:12], t, a[:12], t)),
+                         "assert '%s...%s' == '%s...%s'" % (R, R, R, R), "a letters-only tail beside a redacted head")
+        self.assertEqual(red("assert '%s...%s' == '%s...%s'" % (h, a[-13:], h, a[-13:])),
+                         "assert '%s...%s' == '%s...%s'" % (R, R, R, R), "a letters-only head beside a redacted tail")
+        self.assertEqual(red("assert ['%s...%s'] == ['%s...%s']" % (a[:11], h, a[:11], h)),
+                         "assert ['%s...%s'] == ['%s...%s']" % (R, R, R, R))
+        self.assertEqual(red("FAILED test_x.py::test_y - AssertionError: assert '%s...%s..." % (a[:12], t)),
+                         "FAILED test_x.py::test_y - AssertionError: assert '%s...%s..." % (R, R), "the short summary's second cut")
+        self.assertEqual(red("'[13 chars]%s[20 chars]%s'" % (a[:12], _hex_letters(9))), "'[13 chars]%s[20 chars]%s'" % (R, R))
+        self.assertEqual(red("'[13 chars]%s[20 chars]%s'" % (h, a[-9:])), "'[13 chars]%s[20 chars]%s'" % (R, R))
+        self.assertEqual(red("Lists differ: ['%s[5 chars]%s'] != ['%s[5 chars]%s']" % (a[:12], t, h, a[-13:])),
+                         "Lists differ: ['%s[5 chars]%s'] != ['%s[5 chars]%s']" % (R, R, R, R))
+        # the floor holds on both sides: a piece under 8 beside a redacted one shows, as the 3-character tail
+        # above does; and a pair where neither run qualifies is outside the rule's promise, as one such run is
+        self.assertEqual(red("'%s...%s'" % (a[:12], _hex_letters(6))), "'%s...%s'" % (R, _hex_letters(6)))
+        for text in ("'%s...%s'" % (h, t), "'%s...'" % h, "'[13 chars]%s[20 chars]%s'" % (h, _hex_letters(9))):
+            self.assertEqual(red(text), text, text)
         # a mixed-case fragment without a digit qualifies when the upper-case letter is not its first
         self.assertEqual(red("'abcdEfghijk...'"), "'%s...'" % R)
         # what stays: a Capitalised word, a single-case identifier, words, a fragment under the floor, a bare
@@ -653,15 +700,22 @@ class CredentialPattern(_WithConftest):
         # the fragment rule cannot tell a camelCase or PascalCase name from a base64 tail without a digit
         # (one 8-character fragment in 25 has that shape), nor a cut date from a hex tail, so both are
         # redacted against a cut: a readability cost the module docstring names, pinned so it is a measured
-        # one. A Capitalised word and a single-case identifier stay, with or without dots
+        # one. The pair rule's cost is pinned the same way: the legible half of a cut identifier goes with its
+        # other half when that half qualifies. A Capitalised word and a single-case identifier stay, with or
+        # without dots, and so does a cut whose two halves are both legible
         red, R = self.cf.redact_credential_tokens, self.cf.CREDENTIAL_REDACTED
         for text in ("'SessionStart...'", "'HookEndToEnd...'", "'getUserById...'", "'python38...'", "'2026-09-06...'"):
             self.assertEqual(red(text), "'%s...'" % R, text)
         self.assertEqual(red("assert 'HookEndToEnd...rTheFirstTime' == 'HookEndToEnd...TheSecondTime'"),
                          "assert '%s...%s' == '%s...%s'" % (R, R, R, R), "a diff of two hook names loses both")
         self.assertEqual(red("'2026-09-06T1...6+00:00'"), "'%s...6+00:00'" % R, "the head is a fragment; the tail is under the floor")
+        tail = _fixed_hex("cut-identifier")[-13:]                  # a digit-bearing tail, the same every run
+        self.assertTrue(any(c.isdigit() for c in tail), tail)
+        for text in ("'test_a_long_...%s'" % tail, "'romp-session...2026-09-08T1'", "'HookEndToEnd...st_something'", "'Connecting...%s'" % tail):
+            self.assertEqual(red(text), "'%s...%s'" % (R, R), "the pair rule's cost: the legible half goes with the qualifying one: " + text)
         for text in ("'Connecting...'", "'Abcdefgh...'", "'test_a_long_...ithout_digits'", "'snake_case_id...'", "'deadbeef...'",
-                     "'ABCDEFGHIJKL...'", "'2.1.261...'", "'python3.12.3...'"):
+                     "'ABCDEFGHIJKL...'", "'2.1.261...'", "'python3.12.3...'", "'Connecting t...n port 8080'", "'the quick br...the lazy dog'",
+                     "'kernel.sdk_b...ckend.thing2'", "'https://exam...ple.com/a1b2c3d4'", "'v1.2.3-abcdef12...transcript'"):
             self.assertEqual(red(text), text, text)
 
     def test_a_diff_line_pytest_truncated_mid_token_is_a_fragment_position(self):
@@ -671,7 +725,8 @@ class CredentialPattern(_WithConftest):
         # and sign stay; the same floor and letter rules as any fragment apply; a `...` that does not end
         # the line is not pytest's cut
         red, R = self.cf.redact_credential_tokens, self.cf.CREDENTIAL_REDACTED
-        a = uuid.uuid4().hex + uuid.uuid4().hex
+        a = _fixed_hex("diff-line")                                # the same every run: a drawn 8-character piece lacks a digit one time in 2,560
+        self.assertTrue(any(c.isdigit() for c in a[:8]), a[:8])
         for pre in ("E         + ", "E         - ", "E       -  "):
             self.assertEqual(red("%s%s..." % (pre, a[:60])), "%s%s..." % (pre, R), pre)
             self.assertEqual(red("%s%s..." % (pre, a[:8])), "%s%s..." % (pre, R), "8 characters is the floor")
@@ -801,7 +856,7 @@ class CredentialPattern(_WithConftest):
         tok = "%s...%s" % (hdr, wide[-40:])                 # the whole header before the cut: a head past the bound
         self.assertEqual(red("x %s y" % tok), "x %s y" % tok, "bare: nothing takes it")
         self.assertEqual(red("log: %s" % tok), "log: %s...%s" % (R, wide[-40:]), "a value position: the head; the tail shows")
-        self.assertEqual(red("'%s'" % tok), "'%s...%s'" % (R, R), "quoted: the fragment rule, twice")
+        self.assertEqual(red("'%s'" % tok), "'%s...%s'" % (R, R), "quoted: the fragment rule, both sides in one paired match")
         self.assertTrue(pay.startswith("eyJ"), "a JSON payload begins with `eyJ` as the header does")
         tok = "%s...%s" % (wide[:M + 4 + 1 + 150], wide[-40:])   # the same header whole, a payload cut deep
         self.assertEqual(red("x %s y" % tok), "x %s.%s y" % (hdr, R), "bare: the header shows; the payload's `eyJ` starts the cut rule's match")
@@ -848,6 +903,9 @@ class ScrubCost(_WithConftest):
             "sk-ant- + 121 + ...": rep("sk-ant-" + "a" * 121 + "..."), "hf_ + 121 + [1 chars]": rep("hf_" + "a" * 121 + "[1 chars]"),
             "sk-ant- + 20 + ..": rep("sk-ant-" + "a" * 20 + ".."), "sk-ant- + 20 + [x chars]": rep("sk-ant-" + "a" * 20 + "[x chars]"),
             "eyJ + 300 + ...": rep("eyJ" + "a" * 300 + ".b" + "..."), "one huge cut key": "sk-ant-" + "a" * (n // 2) + "..." + "b" * (n // 2),
+            # the two runs around one cut as a pair: a hex head and a one-case tail, closed by a quote and not
+            "hex head, one-case tail": "'" + hexrun[:n // 2] + "..." + rep("a")[:n // 2] + "'",
+            "hex head, one-case tail, unclosed": "'" + hexrun[:n // 2] + "..." + rep("a")[:n // 2] + " x",
         }
         for name, line in lines.items():
             t0 = time.perf_counter()

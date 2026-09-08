@@ -88,8 +88,9 @@ bound) is the JWT rule's, which takes the cut and its dotted tail the same way. 
 a cut token with more than JWT_HEADER_MAX characters between `eyJ` and the first dot or the cut,
 whichever comes first — a header past the bound with the cut anywhere after its first JWT_HEADER_MAX
 characters (a cut inside such a header within them is the cut rule's match: the bound is on the head,
-not the header): in a quoted repr the fragment rule takes its head and its tail as two matches, in a
-value position the generic rule takes the head and the tail shows, and in bare text the header shows
+not the header): in a quoted repr the fragment rule takes its head and its tail in one paired match (a
+marker on each side of the cut), in a value position the generic rule takes the head and the tail
+shows, and in bare text the header shows
 — whole, with the cut and the tail, when the cut is inside it; up to its dot when the cut is in the
 payload, where the payload's own `eyJ` (a JSON payload begins with one too) is the cut rule's match
 with the cut and the tail. No enumerated tool leaves a head of that width (pytest's widest default
@@ -105,7 +106,18 @@ camelCase or PascalCase name (`'SessionStart...'`, `'HookEndToEnd...'`), a cut I
 (`'python38...'`) are redacted. That is a readability cost in a cut repr, taken on purpose: a
 PascalCase name's letters are a shape a base64 tail without a digit takes for one 8-character
 fragment in 25 (one in 200 at 13), and a digit-bearing run is the shape of a hex tail, so an
-exclusion for either would pass fragments of a key.
+exclusion for either would pass fragments of a key. The two runs on the sides of one cut are pieces of
+ONE value (pytest cuts one operand's repr, unittest one element's), so when either qualifies the other
+is a piece of the same value whatever its alphabet, and the pair is taken in one match with the cut
+kept between two markers, as the two single matches rendered it: a hex tail of 13 characters is
+letters alone one time in 345,000 (an 8-character piece one in 2,560), and such a tail stood in the
+clear beside its redacted head on CI (2026-09-08). The floor is 8 on both sides, so a shorter piece
+beside a cut (unittest's 3 after `[88 chars]`) is what it always was, and a pair where neither run
+qualifies (`'test_a_long_...ithout_digits'`) stays, as one such run does. The pair has a readability
+cost of its own, taken for the same reason: the legible half of a cut identifier goes with its other
+half when that half qualifies, so a test or session name's head beside a digit-bearing tail
+(`'test_a_long_...1a2b3c4d5e6f7'`, `'romp-session...2026-09-08T1'`) and a Capitalised word before a
+hex tail (`'Connecting...1a2b3c4d5e6f7'`) are two markers where the qualifying half alone was one.
 
 Nothing here is a credential: the file holds prefixes and character classes only.
 """
@@ -170,7 +182,8 @@ _QUOTED_LINE = r"^(?P<pfxq>E[ \t]+['\"])" + _GENERIC + r"(?=['\"]$)"
 # of the cut; a known prefix against one, whatever follows; a JWT against one, its head and tail dotted;
 # and a fragment of an unknown-format value: a run of 8 or more token characters against an ellipsis, a
 # quote or another ellipsis on its far side, with a digit, or with a lower-case letter and an upper-case
-# one after its first, and the dotted rest of it.
+# one after its first, and the dotted rest of it; and the two runs on the sides of one cut as one match
+# when either is such a fragment (_PAIRED, below).
 #
 # CUT_HEAD_MAX bounds the head between a prefix and the cut. The widest head a tool leaves is pytest's
 # saferepr at its default 240: 118 characters of the repr, 117 of a quoted string; unittest's `[N chars]`
@@ -214,7 +227,22 @@ _JWT_ELLIPSIZED = (r"eyJ(?:" + _atomic_run("hj", r"{1,%d}" % JWT_HEADER_MAX) + r
                    + r"|" + _ELLIPSIS + _TOKEN_CHARS + r"+" + _DOTTED + r")")
 _FRAGMENT = (r"(?:(?=" + _TOKEN_CHARS + r"*\d)" + _TOKEN_CHARS + r"{8,}"
              r"|(?=" + _TOKEN_CHARS + r"*[a-z])(?=" + _TOKEN_CHARS + r"+[A-Z])" + _TOKEN_CHARS + r"{8,})" + _DOTTED)
-_ELLIPSIZED = (r"(?:(?<=['\"])" + _FRAGMENT + r"(?=" + _ELLIPSIS + r")"
+# The two runs on the sides of one cut are pieces of one value (pytest cuts one operand's repr, unittest
+# one element's): when either qualifies as a fragment, the other is a piece of the same value whatever
+# its alphabet. A hex tail of 13 characters is letters alone one time in 345,000, an 8-character piece
+# one in 2,560, and such a tail stood in the clear beside its redacted head (CI, 2026-09-08); a
+# letters-only head beside a qualifying tail showed the same way. Tried before the single-fragment forms;
+# the cut is captured (pcut, pcut2: a group name cannot repeat, so one per alternative) and scrub() keeps
+# it between two markers, the rendering the two single matches gave. The floor stays 8 on both sides. The
+# runs are greedy and disjoint from what follows them (a cut, a quote), so the pair costs one bounded scan
+# at each quote or cut, as the single forms do (ScrubCost times a hex head against a one-case tail).
+_RUN8 = _TOKEN_CHARS + r"{8,}" + _DOTTED
+_PAIRED = (r"(?:(?<=['\"])|(?<=\.\.\.)|(?<=chars\]))"
+           r"(?:" + _FRAGMENT + r"(?P<pcut>" + _ELLIPSIS + r")" + _RUN8
+           + r"|" + _RUN8 + r"(?P<pcut2>" + _ELLIPSIS + r")" + _FRAGMENT + r")"
+           r"(?=" + _ELLIPSIS + r"|['\"])")
+_ELLIPSIZED = (r"(?:" + _PAIRED
+               + r"|(?<=['\"])" + _FRAGMENT + r"(?=" + _ELLIPSIS + r")"
                r"|(?:(?<=\.\.\.)|(?<=chars\]))" + _FRAGMENT + r"(?=" + _ELLIPSIS + r"|['\"]))")
 # The last line of an explanation pytest truncated (over 8 lines or 640 characters: `...` is appended to
 # it, then `use '-vv' to show`). A diff line so cut ends in `...` instead of the token's end, which
@@ -268,7 +296,8 @@ def _is_model_id(tok):
 
 def scrub(text):
     """`text` with every match replaced by REDACTED (a diff line keeps its marker and sign, a quoted
-    element line its marker and quotes); anything that is not a str comes back as is."""
+    element line its marker and quotes, a pair of fragments the cut between two markers); anything that
+    is not a str comes back as is."""
     if not isinstance(text, str):
         return text
 
@@ -276,5 +305,8 @@ def scrub(text):
         pfx = m.group("pfx") or m.group("pfxq") or m.group("pfxc") or ""
         if _is_git_sha_in_context(text, m) or _is_model_id(m.group(0)[len(pfx):]):
             return m.group(0)
+        cut = m.group("pcut") or m.group("pcut2")
+        if cut:                                                 # a paired fragment: a marker on each side of its cut
+            return REDACTED + cut + REDACTED
         return pfx + REDACTED
     return TOKEN_RE.sub(one, text)
