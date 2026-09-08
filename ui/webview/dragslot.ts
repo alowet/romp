@@ -8,11 +8,17 @@
 // response to the insert they cause. Monotone pointer motion crosses each boundary once by
 // construction; no debounce, no heuristics.
 
-export interface SlotBox { id: string; w: number; }
+export interface SlotBox {
+  id: string; w: number;
+  /** T264: this box STARTS A ROW — the real strip breaks the line before it (a tag group's header, or
+   *  the untagged trail's boundary), so the simulation must too, even when the box would have fit. */
+  br?: boolean;
+}
 
 /** Simulate the strip's wrap layout (row fill left-to-right up to `containerW`, `gapX` between
- *  tabs, uniform `rowH`) over the non-dragged boxes, and return the insertion index for pointer
- *  (x, y) in the container's content space: 0..boxes.length, where boxes.length = the end. */
+ *  tabs, uniform `rowH`; a `br` box always opens a row) over the non-dragged boxes, and return the
+ *  insertion index for pointer (x, y) in the container's content space: 0..boxes.length, where
+ *  boxes.length = the end. */
 export function dragSlotIndex(boxes: readonly SlotBox[], containerW: number, gapX: number,
                               rowH: number, x: number, y: number): number {
   if (!boxes.length) return 0;
@@ -20,7 +26,7 @@ export function dragSlotIndex(boxes: readonly SlotBox[], containerW: number, gap
   const rows: { start: number; mids: number[] }[] = [];
   let cx = 0, row: { start: number; mids: number[] } | null = null;
   boxes.forEach((b, i) => {
-    const needsWrap = row !== null && cx + b.w > containerW && cx > 0;
+    const needsWrap = row !== null && cx > 0 && (b.br === true || cx + b.w > containerW);
     if (row === null || needsWrap) { row = { start: i, mids: [] }; rows.push(row); cx = 0; }
     row.mids.push(cx + b.w / 2);
     cx += b.w + gapX;

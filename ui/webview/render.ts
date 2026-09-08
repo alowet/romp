@@ -5087,11 +5087,7 @@ function releaseTabStrip(): void {
 // unplanned; and the header holding the active tab is a labeled group, not a button — it takes no
 // action and no focus, and "button, expanded" promised both.
 function makeGroupHead(sec: TabSection, collapsed: boolean, holdsActive: boolean, hidden: readonly string[]): HTMLElement {
-  if (sec.name === null) {
-    const sep = el("div", "tab-group-sep");
-    sep.title = "sessions in no tag";
-    return sep;
-  }
+  if (sec.name === null) return makeRowBreak(true);
   const name = sec.name;
   const head = el("div", "tab-group-head" + (collapsed ? " collapsed" : "") + (holdsActive ? " holds-active" : ""));
   head.dataset.group = name;
@@ -5174,8 +5170,20 @@ function makeGroupHead(sec: TabSection, collapsed: boolean, holdsActive: boolean
   });
   return head;
 }
+/** A ROW BREAK (T264, the user 2026-09-08): a zero-height item spanning the strip, so whatever follows
+ *  opens a new line — every tag group starts on its own row (chip at the left edge, its tabs after
+ *  it, wrapping as they need) instead of the groups running on as one long concatenation. The
+ *  untagged trail's break also wears .tab-group-sep, the boundary sectionHeadOf reads (the trail
+ *  stays unlabeled by the user's ruling — its own line, with no chip, says "in no tag"). Breaks are
+ *  layout only: no drop, no hover, not a row for paintTabRowLines, and in the tab drag's virtual
+ *  layout the box AFTER a break starts a row (`br`) so the simulation wraps where the strip does. */
+function makeRowBreak(untagged: boolean): HTMLElement {
+  const brk = el("div", "tab-group-break" + (untagged ? " tab-group-sep" : ""));
+  brk.setAttribute("aria-hidden", "true");
+  return brk;
+}
 /** The section header a strip node belongs to: itself for a header, else the nearest header before
- *  it; null past the untagged separator or on a flat strip. */
+ *  it; null past the untagged boundary (the trail's row break) or on a flat strip. */
 function sectionHeadOf(node: HTMLElement): HTMLElement | null {
   let n: Element | null = node;
   while (n) {
@@ -5281,10 +5289,11 @@ function paintTabRowLines(bar: HTMLElement): void {
   for (const old of Array.from(bar.querySelectorAll(":scope > .tab-row-line"))) old.remove();
   const rows = new Map<number, number>();   // rowTop → rowBottom (max tab bottom in that row)
   for (const t of Array.from(bar.children) as HTMLElement[]) {
-    // tabs, and the section headers + untagged separator (tab groups): a wrapped row made only of
-    // folded headers is a row too — without a line under it the headers sat directly on the tabs
-    // below, reading as captions for tabs that are not theirs (the T134 floating look, back)
-    if (!(t.classList.contains("tab") || t.classList.contains("tab-group-head") || t.classList.contains("tab-group-sep"))) continue;
+    // tabs, and the section headers (tab groups): a wrapped row made only of folded headers is a
+    // row too — without a line under it the headers sat directly on the tabs below, reading as
+    // captions for tabs that are not theirs (the T134 floating look, back). The zero-height row
+    // BREAKS (T264) are not rows: one would draw a line at the strip's very top edge.
+    if (!(t.classList.contains("tab") || t.classList.contains("tab-group-head"))) continue;
     const top = t.offsetTop, bot = t.offsetTop + t.offsetHeight;
     rows.set(top, Math.max(rows.get(top) ?? 0, bot));
   }
@@ -5392,7 +5401,13 @@ function renderTabs() {
                          provisionalId ? { id: provisionalId, tags: provisionalTags } : null);
   collapsedTabIds = plan.folded;
   for (const item of plan.items) {
-    if ("head" in item) { bar.appendChild(makeGroupHead(item.head, item.folded, item.active, item.hidden)); continue; }
+    if ("head" in item) {
+      // every group on its own line (T264): a row break ahead of each header — except the strip's
+      // first item, which already opens the first row; the untagged trail's header IS a break
+      if (item.head.name !== null && bar.childElementCount) bar.appendChild(makeRowBreak(false));
+      bar.appendChild(makeGroupHead(item.head, item.folded, item.active, item.hidden));
+      continue;
+    }
     const id = item.id;
     const s = sessions.get(id);
     if (!s) { bar.appendChild(makePlaceholderTab(id)); continue; }
@@ -15668,17 +15683,27 @@ setupSettings();
     if (e.clientX >= dr.left && e.clientX <= dr.right && e.clientY >= dr.top && e.clientY <= dr.bottom) return;
     // the virtual layout: the OTHER tabs in current DOM order, widths from the dragstart snapshot —
     // boundaries that cannot move in response to the insert they cause (dragslot.ts owns the math)
-    // …plus the section headers and separator (tab groups): they take width in the real layout, so
-    // they join the virtual one as boxes — the simulated wrap then matches the strip's, and a slot
-    // just before a header is the end of the previous section. A drop changes no membership (the
-    // tab re-sections on the next render); "Move to" in the tab menu is the membership path.
+    // …plus the section headers (tab groups): they take width in the real layout, so they join the
+    // virtual one as boxes — the simulated wrap then matches the strip's. One group per line (T264):
+    // a header preceded by a row break OPENS a row in the simulation (`br`), as does the untagged
+    // trail's break itself — a zero-width row opener, so the slot past a group's last tab (the end
+    // of its row) and the slot before the trail's first tab (the head of the next row) stay two
+    // distinct slots, as they were when the trail stood behind a visible separator. A drop changes
+    // no membership (the tab re-sections on the next render); "Move to" in the tab menu is the
+    // membership path.
     const others = Array.from(tabs.querySelectorAll<HTMLElement>(".tab[data-id], .tab-group-head, .tab-group-sep")).filter((t) => t !== dragged);
+    const isBreak = (n: Element | null) => !!n && n.classList.contains("tab-group-break");
+    const before = (t: HTMLElement) => { let p = t.previousElementSibling; while (p && p === dragged) p = p.previousElementSibling; return p; };
     const boxes = others.map((t) => ({ id: t.dataset.id || " head:" + (t.dataset.group || ""),
-                                       w: (t.dataset.id ? dragGeom!.widths.get(t.dataset.id) : undefined) ?? t.getBoundingClientRect().width }));
+                                       w: isBreak(t) ? 0 : (t.dataset.id ? dragGeom!.widths.get(t.dataset.id) : undefined) ?? t.getBoundingClientRect().width,
+                                       br: isBreak(t) || isBreak(before(t)) }));
     const br = tabs.getBoundingClientRect();
     const idx = dragSlotIndex(boxes, dragGeom.containerW, dragGeom.gapX, dragGeom.rowH,
                               e.clientX - br.left, e.clientY - br.top);
-    const ref = idx < others.length ? others[idx] : dragged.parentElement === tabs ? tabs.querySelector(".tab-add") : null;
+    let ref = idx < others.length ? others[idx] : dragged.parentElement === tabs ? tabs.querySelector(".tab-add") : null;
+    // the slot before a header is the END OF THE PREVIOUS ROW: insert ahead of the header's break, never
+    // between the break and the chip (a tab there would sit left of the chip on the group's own line)
+    if (ref && ref.classList.contains("tab-group-head") && isBreak(before(ref as HTMLElement))) ref = before(ref as HTMLElement);
     if (ref !== dragged && dragged.nextElementSibling !== ref)
       flipTabs(() => tabs.insertBefore(dragged, ref));
   });
