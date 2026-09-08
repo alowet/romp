@@ -40,7 +40,7 @@ import { titleWithKey, chordOf, effectiveChord, loadOverrides } from "./keybindi
 import { DEFAULT_CHORDS } from "./commands";
 import { NavHistory } from "./nav-history";
 import { StagedStack, quoteReplyBody, stagedPosts } from "./staged-messages";
-import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, queuedCopyToHide, dropPending, bareGroupLabel, sentAtLabel } from "./send-pending";
+import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, queuedCopyToHide, dropPending, bareGroupLabel, sentAtLabel, pendingBody } from "./send-pending";
 import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued, type HeldMemory } from "./queued-held";
 import { reloadHoldReason } from "./reload-hold";
 import { liveNotices, keepReloadNotices, takeReloadNotices } from "./reload-notices";
@@ -4300,6 +4300,25 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
       if (isCmd) x.dataset.qcmd = "1";
       (x as any)._qmd = t.md;   // the bubble's body — the kernel's drift guard + the composer restore read it
       xHost.appendChild(x);
+    }
+    // EDITABLE — a ✎ beside the ✕ (the user 2026-09-08): a message that has not reached the session is
+    // still the user's to change. The same three stages the ✕ covers (backend queue, parked, optimistic),
+    // and the same recall gate (cancelable); romp's own words and slash commands are not edited — a
+    // command is cancelled and typed again, and romp's notices are not the user's to reword. Delegated
+    // like the ✕ (data-act="qedit"); the composer takes the text under an editing pill (beginQueuedEdit),
+    // and send replaces the message where it sits — see the editQueued path in sendComposer.
+    if (t.cancelable && !t.romp && !isCmd && (t.idx !== undefined || t.park !== undefined || t.optimistic)) {
+      bubble.classList.add("editable");
+      const ed = el("button", "queued-edit");
+      ed.textContent = "✎";
+      ed.title = "edit this queued message — it keeps its place in the queue";
+      ed.dataset.act = "qedit";
+      if (t.idx !== undefined) ed.dataset.qidx = String(t.idx);
+      if (t.park !== undefined) ed.dataset.qpark = String(t.park);
+      if (t.optimistic) ed.dataset.qopt = "1";
+      if (t.optimistic && t.qts !== undefined) ed.dataset.qts = String(t.qts);   // OUR entry's identity, as on the ✕: a kernel copy's qts is its enqueue stamp, not an entry (T252c)
+      (ed as any)._qmd = t.md;
+      xHost.appendChild(ed);
     }
     turn.appendChild(bubble);
   }
@@ -13852,7 +13871,70 @@ function renderStagedStrip(id: string | null, opts?: { reveal?: "last" }): void 
   list.scrollTop = opts?.reveal === "last" ? list.scrollHeight : (stagedScroll.get(id) || 0);
 }
 
+// ---- editing a QUEUED message (the user 2026-09-08) --------------------------------------------------
+// A message that has not reached the session yet — parked in romp's FIFO, held in the SDK backend's own
+// queue, or still at the optimistic "sending…" stage — is the user's to change until it goes. The ✎ on its
+// bubble loads the text into the composer under an EDITING pill (the rewind edit's grammar, one level
+// deeper: "Editing queued message"), and send REPLACES it in place: same queue slot, same follow-up
+// context, only the words. The kernel verifies the entry by body (editQueued's md — the ✕'s drift guard)
+// and answers editResult; ok:false means the message left the queue meanwhile, so the typed words go
+// back to the composer and the queue repaints from the kernel — nothing is lost, nothing is sent twice.
+type QueuedEditRef = { md: string; idx?: number; park?: number; qts?: number; optimistic?: boolean };
+const queuedEdits = new Map<string, QueuedEditRef>();
+// the typed text + the entry it replaced, keyed sid + " " + old body, so a failed edit can give the words
+// back and undo the optimistic repaint (one-shot, ok or not — pendingCancelRestores' twin)
+const pendingEditRestores = new Map<string, { typed: string; ref: QueuedEditRef }>();
+
+function beginQueuedEdit(sid: string, ref: QueuedEditRef): void {
+  if (composerEdits.has(sid)) cancelComposerEdit(sid);   // one edit at a time: a rewind edit yields to this one
+  queuedEdits.set(sid, ref);
+  composerCitations.delete(sid);   // the queued text carries its own context (a follow-up keeps it kernel-side)
+  if (sid !== activeId) return;
+  const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
+  if (ta) { ta.value = ref.md; growComposer(ta); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+  renderComposerChips(sid);
+}
+
+function cancelQueuedEdit(sid: string): void {
+  if (!queuedEdits.delete(sid)) return;
+  if (sid !== activeId) return;
+  const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
+  if (ta) { ta.value = ""; composerManualH = null; ta.style.height = ""; }
+  drafts.delete(sid); persistDrafts();
+  renderComposerChips(sid);
+}
+
+// The optimistic half of an edit: the queued bubble shows the NEW words at once (the acknowledge-the-click
+// rule) — in the client's copy of the kernel events and in our own pending-send entry, so neither the next
+// re-render nor the pending reconcile paints the old text back before the kernel's push confirms. `back`
+// reverses it (editResult ok:false: the session has the old words).
+function applyQueuedEditLocally(sid: string, ref: QueuedEditRef, text: string, back = false): void {
+  const from = back ? text : ref.md, to = back ? ref.md : text;
+  for (const p of pendingSent.get(sid) || []) {
+    if (p.text === from && (ref.qts === undefined || p.ts === ref.qts)) { p.text = to; p.body = pendingBody(to, p.imgPaths); }
+  }
+  const s = sessions.get(sid);
+  if (s) {
+    for (let i = s.events.length - 1, n = 0; i >= 0 && n < 10; i--, n++) {   // a queued group only ever sits at the tail
+      const e = s.events[i];
+      if (e.kind !== "queued") continue;
+      for (const t of e.texts) {
+        if (t.md !== from) continue;
+        if (ref.idx !== undefined && t.idx !== undefined && t.idx !== ref.idx) continue;
+        if (ref.park !== undefined && t.park !== undefined && t.park !== ref.park) continue;
+        t.md = to;
+      }
+    }
+  }
+  // the held-copy memory follows too (T262i): reconcileHeld keys an id-less copy by TEXT, so a previous-push copy
+  // left with the old words would read as vanished on the next push and be held as a phantom of them
+  const mem = heldQueued.get(sid);
+  if (mem) for (const c of mem.prev) if (c.md === from) c.md = to;
+  if (sid === activeId) { const v = views.get(sid); if (v) { v.stale = true; appendActive(); } }
+}
+
 function beginComposerEdit(sid: string, uuid: string, orig: string): void {
+  if (queuedEdits.has(sid)) cancelQueuedEdit(sid);   // …and a queued edit yields to a rewind edit
   composerEdits.set(sid, { uuid, orig });
   composerCitations.delete(sid);   // an edit replaces the message wholesale — mixed goal/quote context would mislead
   if (sid !== activeId) return;
@@ -13903,6 +13985,22 @@ function renderComposerChips(id: string | null): void {
     chip.appendChild(label);
     const x = el("button", "composer-chip-x"); x.setAttribute("aria-label", "Cancel edit"); x.textContent = "✕";
     x.addEventListener("click", (e) => { e.stopPropagation(); cancelComposerEdit(id); });
+    chip.appendChild(x);
+    strip.appendChild(chip);
+    return;
+  }
+  // the QUEUED edit's pill (the user 2026-09-08): the rewind pill's grammar, saying what send does instead
+  const qedit = id ? queuedEdits.get(id) : undefined;
+  if (qedit && id) {
+    strip.style.display = "flex";
+    const chip = el("div", "composer-chip composer-chip-edit");
+    chip.title = "the message keeps its place in the queue and goes as edited — ✕ (or Esc) leaves it as it was";
+    const mark = el("span", "composer-chip-mark"); mark.textContent = "✎"; chip.appendChild(mark);
+    const label = el("span", "composer-chip-label");
+    label.textContent = "Editing queued message — send replaces it in the queue";
+    chip.appendChild(label);
+    const x = el("button", "composer-chip-x"); x.setAttribute("aria-label", "Cancel edit"); x.textContent = "✕";
+    x.addEventListener("click", (e) => { e.stopPropagation(); cancelQueuedEdit(id); });
     chip.appendChild(x);
     strip.appendChild(chip);
     return;
@@ -15225,6 +15323,24 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       if (rv) { rv.stale = true; appendActive(); }
     }
   }
+  // The kernel's verdict on an editQueued (the user 2026-09-08) — cancelResult's twin. ok:false: the message
+  // left the queue before the edit reached it (or the chip was never a message), so the optimistic repaint is
+  // reversed, the typed words go back to the composer (never lost, never sent twice), and the queue repaints
+  // from the kernel's events, which hold what the session actually has.
+  else if (m.type === "editResult" && typeof m.id === "string") {
+    const key = m.id + " " + (typeof m.md === "string" ? m.md : "");
+    const stash = pendingEditRestores.get(key);
+    pendingEditRestores.delete(key);
+    if (!m.ok) {
+      if (typeof m.text === "string" && m.text) warnToast(m.text);
+      if (stash) {
+        applyQueuedEditLocally(m.id, stash.ref, stash.typed, true);
+        if (m.id === activeId) restoreToComposer(stash.typed);
+      }
+      const rv = m.id === activeId && activeId ? views.get(activeId) : null;
+      if (rv) { rv.stale = true; appendActive(); }
+    }
+  }
   // The identity palette changed (gear → Session colors): refresh the right-click menu's swatch set so a
   // menu opened after the switch offers the NEW palette (the kernel remaps + repaints sessions itself).
   else if (m.type === "palette" && Array.isArray(m.colors)) paletteColors = m.colors;
@@ -15664,6 +15780,25 @@ function setupComposer() {
       ta.value = ""; composerManualH = null; ta.style.height = "";
       return;
     }
+    // A QUEUED-message edit → editQueued: the entry is replaced in place, kernel-side. No registerOptimistic
+    // (nothing new is sent — the bubble already exists and only changes words; applyQueuedEditLocally shows
+    // them now). The kernel's push confirms; editResult ok:false (the message left the queue meanwhile)
+    // hands the typed words back to the composer. Attachments wait for the next normal send, as for an edit.
+    const qedit = queuedEdits.get(activeId);
+    if (qedit) {
+      if (!typed) return;   // an empty edit is not a send — to drop the message, use its ✕
+      const qmsg: Record<string, unknown> = { type: "editQueued", id: activeId, md: qedit.md, text: typed };
+      if (qedit.idx !== undefined) qmsg.idx = qedit.idx;
+      if (qedit.park !== undefined) qmsg.park = qedit.park;
+      vscodeApi?.postMessage(qmsg);
+      pendingEditRestores.set(activeId + " " + qedit.md, { typed, ref: qedit });
+      queuedEdits.delete(activeId);
+      renderComposerChips(activeId);
+      applyQueuedEditLocally(activeId, qedit, typed);
+      drafts.delete(activeId); draftStartedAt.delete(activeId); persistDrafts();
+      ta.value = ""; composerManualH = null; ta.style.height = "";
+      return;
+    }
     const sid = activeId;   // the session this send (and any confirm below) was armed for
     const deliver = () => {
       if (activeId !== sid) return;   // a confirm outlived a tab switch — never send into the wrong session
@@ -16064,6 +16199,7 @@ function setupComposer() {
       // for "tab mode" — focus the active tab so ←/→ switch sessions (the user 2026-06-25). Enter on a
       // tab drops back in (onTabKey). Any draft text stays in the box, untouched.
       e.preventDefault();
+      if (activeId && queuedEdits.has(activeId)) { cancelQueuedEdit(activeId); return; }
       if (activeId && composerEdits.has(activeId)) { cancelComposerEdit(activeId); return; }
       focusActiveTab();
       return;
@@ -16527,6 +16663,23 @@ setupSettings();
       bub?.remove();
       if (grp) reflowQueuedGroup(grp);
       if (contentX && wasAtBottom) writeScroll(contentX, contentX.scrollHeight, "queued-x", true);
+    },
+    // ✎ on a queued bubble (the user 2026-09-08): edit the message while it is still romp's to change.
+    // Delegated like the ✕ (the tail rebuilds every push). The edit rides the ACTIVE composer, so a bubble
+    // owned by another session (a comment thread's popover) is declined with a pointer rather than edited
+    // in the wrong box. The acknowledgement is the composer filling + the editing pill, at once.
+    qedit: (el) => {
+      if (!activeId) return;
+      const qmd = (el as any)._qmd as string | undefined;
+      if (!qmd) return;
+      const sidQ = owningSidOf(el) || activeId;
+      if (sidQ !== activeId) { warnToast("open that session's chat to edit its queued message"); return; }
+      const ref: QueuedEditRef = { md: qmd };
+      if (el.dataset.qidx !== undefined) ref.idx = Number(el.dataset.qidx);
+      if (el.dataset.qpark !== undefined) ref.park = Number(el.dataset.qpark);
+      if (el.dataset.qts !== undefined) ref.qts = Number(el.dataset.qts);
+      if (el.dataset.qopt === "1") ref.optimistic = true;
+      beginQueuedEdit(sidQ, ref);
     },
     // a comment highlight or its turn badge (the user 2026-08-13): open the thread's popover at the
     // click. Delegated — marks and badges are re-created on every transcript rebuild — and so is
