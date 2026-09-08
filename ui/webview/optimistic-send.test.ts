@@ -35,17 +35,17 @@ test("the plain send registers an optimistic bubble; follow-up/quote sends keep 
   assert.match(RENDER, /function registerOptimistic\(id: string, text: string, imgPaths\?: string\[\]\): void/);   // + the dragged-image paths → echo thumbnails (2026-08-25)
   // the active-tab arm still paints via appendActive (the snap gate moved ahead of it, 2026-08-30)
   assert.match(RENDER, /if \(v\) v\.stale = true;\s*\n\s*if \(id === activeId\) \{/);
-  assert.match(RENDER, /const wasAtBottom = !!content && nearBottom\(content\);\s*\n\s*appendActive\(\);/);
+  assert.match(RENDER, /const wasAtBottom = !!content && nearBottomForSend\(content\);[^\n]*\s*\n\s*appendActive\(\);/);
 });
 
 test("your OWN send reveals itself from the TAIL only — scrolled up, the viewport stays put", () => {
   // The 2026-08-09 always-reveal snap (Enter = intent to see the message) survives where it belongs:
-  // at — or within the stick rule's 80px of — the bottom. Scrolled UP reading history, the user's
+  // at — or within nearBottomForSend's 80px of — the bottom (the send band; follow mode itself reads the true bottom since T262c). Scrolled UP reading history, the user's
   // 2026-08-30 ruling overrules it: the send must not move the scroll position at all, so the snap
-  // is gated on a nearBottom read taken BEFORE appendActive lands the bubble (the append grows
+  // is gated on a nearBottomForSend read taken BEFORE appendActive lands the bubble (the append grows
   // scrollHeight, which would misread a tail-sitter as scrolled-up). Behavioral scenarios live in
   // send-scroll-preserve.test.ts.
-  assert.match(RENDER, /const wasAtBottom = !!content && nearBottom\(content\);\s*\n\s*appendActive\(\);\s*\n\s*if \(content && wasAtBottom\) writeScroll\(content, content\.scrollHeight, "optimistic-send", true\);/);
+  assert.match(RENDER, /const wasAtBottom = !!content && nearBottomForSend\(content\);[^\n]*\s*\n\s*appendActive\(\);\s*\n\s*if \(content && wasAtBottom\) writeScroll\(content, content\.scrollHeight, "optimistic-send", true\);/);
   // the unconditional form is retired everywhere — nothing snaps a scrolled-up reader on send
   assert.doesNotMatch(RENDER, /if \(content\) (?:content\.scrollTop = content\.scrollHeight|writeScroll\(content, content\.scrollHeight)/);
 });

@@ -1,5 +1,5 @@
 // T262 (the user 2026-09-08, "jumped up slightly on my scroll in many, many sessions"): appendActive pinned a
-// reader within the 80 px follow threshold to the bottom on EVERY frame — a status-only chatTail included — so
+// reader within the then 80 px follow threshold to the bottom on EVERY frame — a status-only chatTail included — so
 // wheeling up from the tail of a working session snapped back within the first 80 px, over and over. The
 // two-kernel harness reproduced it: a stop 60 px above the bottom moved 60 px to the bottom in a quiet window
 // with scrollHeight unchanged (compact mode), and both modes snapped on the next frame. Rule: follow the tail
@@ -23,7 +23,7 @@ test("the harness case: 60 px above the bottom, a frame that adds nothing → no
 });
 
 test("render.ts appendActive measures before the rebuild and pins only when followTail says so", () => {
-  assert.match(RENDER, /import \{ followReader, keepPlaceAcrossShow, followTail \} from "\.\/scroll-keep";/);
+  assert.match(RENDER, /import \{ followReader, keepPlaceAcrossShow, followTail, atBottomDist \} from "\.\/scroll-keep";/);
   const m = RENDER.match(/^function appendActive\(\) \{([\s\S]*?)\n\}/m);
   assert.ok(m, "appendActive");
   const body = m![1];
