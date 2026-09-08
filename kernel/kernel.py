@@ -7505,11 +7505,29 @@ def _run_main_update(kind, immediate=True, manager_port=_PORT_FROM_ENV, target="
                 refuse("the checkout was left alone: the fetch did not bring %s, so it could not be "
                        "verified; the next check re-reads main" % target, anc)
                 return
-            r = subprocess.run(["git", "checkout", "--detach", target], cwd=str(ROOT),
-                               capture_output=True, text=True, timeout=30)
+            # The local `main` BRANCH moves too (the user 2026-09-08): the converge used to check the
+            # target out DETACHED and never touch `main`, so a later `git checkout main` landed on a
+            # months-old pointer and the user pulled "an enormous amount". When main is an ANCESTOR of the
+            # target (it has nothing the target lacks) it is moved onto the target and checked out — a
+            # fast-forward by construction, so nothing of the user's is rewritten. When main has commits
+            # the target does not (diverged), it is the user's to move: the target is checked out
+            # detached as before and the notice says main was left where it is. No main at all (a
+            # bootstrap install detached at a release tag): detached, as before.
+            mb = subprocess.run(["git", "merge-base", "--is-ancestor", "main", target], cwd=str(ROOT),
+                                capture_output=True, text=True, timeout=10)
+            if mb.returncode == 0:
+                r = subprocess.run(["git", "checkout", "-B", "main", target], cwd=str(ROOT),
+                                   capture_output=True, text=True, timeout=30)
+            else:
+                r = subprocess.run(["git", "checkout", "--detach", target], cwd=str(ROOT),
+                                   capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 refuse("the checkout did not advance onto %s" % target, r)
                 return
+            if mb.returncode == 1:
+                _sync_notice("main moved at %s: the checkout is at %s, detached. Your local main branch has "
+                             "commits that are not on %s/main, so it was left where it is; merge or rebase it "
+                             "yourself when you want it on the new main." % (remote, target, remote), ok=True)
         except Exception as e:
             refuse("the pull step failed: %s" % e)
             return

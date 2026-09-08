@@ -793,15 +793,20 @@ class ConvergePullStep(unittest.TestCase):
 
     def test_the_happy_path_moves_onto_the_advertised_commit_and_restarts(self):
         steps = self._drive()
-        self.assertEqual(steps[:4], ["status", "fetch", "merge-base", "checkout"], steps)
-        self.assertEqual(set(steps[4:]), {"rev-parse"}, "after the move, only the checkout re-reads")
+        # two ancestry checks since 2026-09-08: HEAD against the target (the refusal gate) and the local
+        # main branch against it (moved and checked out when it is an ancestor; see the checkout step)
+        self.assertEqual(steps[:5], ["status", "fetch", "merge-base", "merge-base", "checkout"], steps)
+        self.assertEqual(set(steps[5:]), {"rev-parse"}, "after the move, only the checkout re-reads")
         fetch = next(a for s, a in self.calls if s == "fetch")
         self.assertEqual(fetch[-3:], ["fetch", "origin", "main"],
                          "main from the release remote (the scripted `git remote` lists none: a plain install's origin)")
         anc = next(a for s, a in self.calls if s == "merge-base")
         self.assertEqual(anc[-3:], ["--is-ancestor", "HEAD", self.TARGET], "a fast-forward from HEAD, proven")
         co = next(a for s, a in self.calls if s == "checkout")
-        self.assertEqual(co[-2:], ["--detach", self.TARGET], "the move lands on the sha the verdict named")
+        # the scripted git answers every ancestry check yes, so local main is an ancestor here: it is moved
+        # onto the sha the verdict named and checked out (2026-09-08); the diverged case detaches instead
+        # (tests/test_converge_main_branch.py, over real repositories)
+        self.assertEqual(co[-3:], ["-B", "main", self.TARGET], "the move lands on the sha the verdict named, on main")
         self.assertFalse(any(a.endswith("/main") for a in co), "never the ref: it can move, or sit stale")
         self.assertEqual(self.posts, [("POST", "/restart-all")])
         self.assertEqual(self.dials, [("127.0.0.1", 1)])
