@@ -329,8 +329,10 @@ covered by the picker: their CLI lives in the tmux server's environment, which
 the kernel does not control, and resolves its credential the way any `claude`
 in a terminal does.
 
-Each chat tab's hover tooltip carries the same fact as a `Billing` row,
-`API key`, or `Login (name@example.com)`, whenever the session's backend
+A tab not yet loaded after a reconnect says "Not loaded yet — click to load"
+instead, until its transcript arrives. Each chat tab's hover tooltip carries
+the same fact as a `Billing` row, `API key`, or `Login (name@example.com)`,
+whenever the session's backend
 reports it, one-auth machines included; only tmux sessions, whose billing romp
 cannot know, show no row. When the CLI's own report disagrees with what the
 session was launched for (a login pick whose CLI reports a key, a key pick

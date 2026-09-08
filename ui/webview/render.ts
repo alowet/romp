@@ -5453,7 +5453,12 @@ function makeSkeletonTab(id: string): HTMLElement {
   tab.title = "Not loaded yet — click to load";
   const closeBtn = el("span", "tab-close");
   closeBtn.textContent = "×";
-  closeBtn.title = "End session";   // a live session: its ✕ routes through the same End-session confirm as a loaded tab
+  // a live session: its ✕ routes through the same End-session confirm as a loaded tab; a DEAD one (the kernel's
+  // status frame says `closed` — a kept read-only tab) drops like a dead loaded tab, with no confirm to end
+  // what is already over (review find 2026-09-08: the skeleton offered "End session" on a session that had ended)
+  const dead = status?.state === "closed";
+  closeBtn.title = dead ? "Close tab" : "End session";
+  if (dead) closeBtn.dataset.dead = "1";
   closeBtn.dataset.act = "close";
   closeBtn.dataset.id = id;
   tab.appendChild(closeBtn);
@@ -12875,9 +12880,9 @@ function stopButton(state?: ChipState): HTMLElement {
 // The "Opening session" line + three staggered accent dots (the loading-state rule's small form): shown
 // while a tab has NO session payload yet AND while the kernel itself reports state "opening" (spawned,
 // transcript not on disk). Both clear on real events — the first payload, the first record.
-function openingLine(): HTMLElement {
+function openingLine(text = "Opening session"): HTMLElement {
   const c = el("span", "compacting-line opening-line");
-  c.appendChild(document.createTextNode("Opening session"));
+  c.appendChild(document.createTextNode(text));
   const dots = el("span", "opening-line-dots");
   for (let i = 0; i < 3; i++) dots.appendChild(el("span"));
   c.appendChild(dots);
@@ -12891,8 +12896,11 @@ function updateStatusline() {
   if (activeId && !s) {
     // the tab is a loading placeholder (its session payload hasn't arrived) — the statusline said
     // whatever the PREVIOUS tab said, or a spawn stub's "Working" over a broken clock (the user
-    // 2026-08-05, who wanted "opening" and animated dots until it's ready)
-    sl.replaceChildren(openingLine());
+    // 2026-08-05, who wanted "opening" and animated dots until it's ready). A skeleton tab is a RUNNING
+    // session whose transcript is on its way, not one being opened: its line says so, the word the
+    // tab's own loader uses (review find 2026-09-08: "Opening session" over a "loading" tab)
+    const loading = skeletonTabs.ids.has(activeId) || skeletonLoading === activeId;
+    sl.replaceChildren(openingLine(loading ? "Loading session" : "Opening session"));
     return;
   }
   if (!s) return;

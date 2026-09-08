@@ -78,6 +78,8 @@ test("makeSkeletonTab: the loaded-tab chrome minus what it does not know — no 
   assert.match(sk, /const status = skeletonTabs\.status\.get\(id\) as Status \| undefined;\s*\n\s*applyTabStatus\(tab, \{ status: status \?\? \{\} \}\);/,
     "the chip reads ONLY the kernel's status frames; none yet → an empty status → the unknown ring");
   assert.match(sk, /if \(status\) appendTabCtxGauge\(tab, \{ status \}\);/, "the gauge only from a kernel-sent status");
+  assert.match(sk, /const dead = status\?\.state === "closed";\s*\n\s*closeBtn\.title = dead \? "Close tab" : "End session";\s*\n\s*if \(dead\) closeBtn\.dataset\.dead = "1";/,
+    "a dead session drawn as a skeleton drops like a dead loaded tab (the delegate's dead branch), no End confirm (review find 2026-09-08)");
   assert.match(sk, /tab\.title = "Not loaded yet — click to load";/);
   assert.match(sk, /closeBtn\.dataset\.act = "close";\s*\n\s*closeBtn\.dataset\.id = id;/, "the ✕ is delegated too");
   assert.doesNotMatch(sk, /tab-ph-swirl/, "NO swirl: that means 'romp is generating this', a transient");
@@ -190,4 +192,10 @@ test("the click path's loader latch: showActive latches the skeleton it is loadi
   assert.match(show, /const skeleton = skeletonTabs\.ids\.has\(activeId\);\s*\n\s*skeletonLoading = skeleton \? activeId : null;/);
   assert.match(show, /document\.getElementById\("tab-loading"\)\?\.remove\(\);[^\n]*\n\s*skeletonLoading = null;/);
   assert.doesNotMatch(RENDER, /window\.addEventListener\("romp:wsup", \(\) => \{ onSocketUp/, "the socket flip is a frame now, never the onopen event");
+});
+
+test("the statusline over a skeleton tab says Loading, the word its loader uses, not Opening", () => {
+  const usl = fn("updateStatusline");
+  assert.match(usl, /const loading = skeletonTabs\.ids\.has\(activeId\) \|\| skeletonLoading === activeId;\s*\n\s*sl\.replaceChildren\(openingLine\(loading \? "Loading session" : "Opening session"\)\);/);
+  assert.match(RENDER, /function openingLine\(text = "Opening session"\): HTMLElement \{/);
 });

@@ -24,9 +24,9 @@ export function newSkeletonState(): SkeletonState {
 }
 
 /** A tabOrder frame landed. An ARRAY is the kernel's authoritative set → REPLACE (a second reconnect while
- *  skeletons are outstanding re-lists tabs that had loaded — they are stale again, the honest state). NOT an
- *  array (an older kernel, or the set emptied so the kernel dropped the key) → KEEP what we hold, pruned to
- *  the ids still on the strip. Status entries for ids no longer held are dropped. Returns whether anything
+ *  skeletons are outstanding re-lists tabs that had loaded — they are stale again, the honest state; once a set
+ *  has existed the kernel attaches the key on EVERY strip, an empty list after it empties). NOT an array (an
+ *  older kernel, which never sends the key) → KEEP what we hold, pruned to the ids still on the strip. Status entries for ids no longer held are dropped. Returns whether anything
  *  changed, so the caller can key a repaint / re-show on it.
  *
  *  One exception to "array = authoritative": an id whose FULL frame already arrived on this socket is never
@@ -34,8 +34,9 @@ export function newSkeletonState(): SkeletonState {
  *  one lock, so a tabOrder that still names X can only be AHEAD of X's full on the wire, never behind it — a
  *  list naming X after X's full is therefore a stale relay, not new information. The federation merge is
  *  exactly such a relay: it keeps a per-host copy of the list and re-attaches it to every merged strip, and
- *  when the kernel's set empties its key simply disappears, so that copy is never told the last id loaded.
- *  Without this filter the last skeleton on the strip re-skeletoned on every push, asked for its full, loaded,
+ *  a merge can re-present a copy taken ahead of the full that released the last id (review find 2026-09-08:
+ *  the kernel does send an empty list once the set empties, so the copy is eventually told; the filter is
+ *  about ORDER, not about a missing key). Without this filter the last skeleton on the strip re-skeletoned on every push, asked for its full, loaded,
  *  and re-skeletoned again — a flap the user's eye follows forever. `onSocketUp` clears the record: a new
  *  socket's list IS new information about every tab. */
 export function applyTabOrderSkeleton(st: SkeletonState, skeleton: unknown, order: readonly string[]): boolean {
