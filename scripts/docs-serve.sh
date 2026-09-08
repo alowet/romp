@@ -31,6 +31,16 @@ tree_id() {
   } | shasum | cut -d' ' -f1
 }
 
+# A git older than 2.15 has no --no-optional-locks: every poll would fail, the
+# `|| true` above would swallow it, and the watcher would run on without ever
+# seeing an uncommitted doc edit. Probe the exact poll once and refuse loudly
+# instead. (review find, 2026-09-08)
+if ! err="$(git --no-optional-locks status --porcelain -- docs mkdocs.yml overrides 2>&1 >/dev/null)"; then
+  echo "docs-serve: the read-only poll failed: $err" >&2
+  echo "docs-serve: needs git 2.15 or newer for --no-optional-locks; found: $(git --version 2>&1)" >&2
+  exit 1
+fi
+
 MKDOCS="${ROMP_MKDOCS:-mkdocs}"     # stubbable, so the test never runs a real server
 POLL="${ROMP_DOCS_POLL:-2}"
 

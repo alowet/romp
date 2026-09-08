@@ -80,15 +80,57 @@ runs() { [ -f "$RUNS" ] && wc -l < "$RUNS" | tr -d ' ' || echo 0; }
 }
 
 @test "the watcher polls git status without taking the index lock" {
-    # A plain `git status` refreshes the index under .git/index.lock as a side
-    # effect, and the loop runs one every ROMP_DOCS_POLL seconds — so each poll
-    # raced any concurrent `git add`/`git commit` for the lock (the second test
-    # above runs one against a 0.2 s poll), and the loser died with "Unable to
-    # create .git/index.lock: File exists". The collision is a scheduling race
-    # between two processes that no test can force deterministically, so the
-    # read-only flag is pinned at the source: a watcher reads, it never holds
-    # the lock a writer needs.
-    grep -qF -- '--no-optional-locks status --porcelain' "$ROMP_DIR/scripts/docs-serve.sh"
+    # A plain `git status` takes .git/index.lock on every run and, whenever a
+    # tracked file's stat info is stale, rewrites the index under it. So each
+    # poll raced any concurrent `git add`/`git commit` for the lock, and the
+    # writer died with "Unable to create .git/index.lock: File exists" (status
+    # itself just skips its refresh when it loses). That collision is a
+    # scheduling race no test can force; the write behind it is not. Back-date
+    # one tracked doc (content unchanged, stat stale): the old poll rewrote
+    # .git/index on its very first pass, a read-only poll leaves it
+    # byte-identical. (review find, 2026-09-08: behaviour, not a source grep)
+    touch -t 200001010000 "$REPO/docs/guide.md"
+    before="$(shasum "$REPO/.git/index" | cut -d' ' -f1)"
+    LOG="$TEST_DIR/serve.log"
+    "$REPO/scripts/docs-serve.sh" 8099 >"$LOG" 2>&1 &
+    LOOP_PID=$!
+    # The banner prints only after the startup tree_id() returned: wait on that
+    # event, not a timer. The loop's later polls can only add a write to catch.
+    for _ in $(seq 1 100); do grep -q 'docs on http' "$LOG" 2>/dev/null && break; sleep 0.1; done
+    grep -q 'docs on http' "$LOG"
+    [ "$(shasum "$REPO/.git/index" | cut -d' ' -f1)" = "$before" ]
+    [ ! -e "$REPO/.git/index.lock" ]
+}
+
+@test "a git too old for --no-optional-locks refuses at startup instead of polling blind" {
+    # git older than 2.15 rejects the flag ("unknown option", exit 129). Inside
+    # tree_id the `|| true` would swallow that on every poll, so the watcher
+    # would run on and never notice an uncommitted doc edit. A fake git first on
+    # PATH plays that version and forwards everything else to the real one. The
+    # script must exit before starting mkdocs and name the minimum git.
+    # (review find, 2026-09-08)
+    BIN="$TEST_DIR/bin"; mkdir -p "$BIN"
+    REAL_GIT="$(command -v git)"
+    cat > "$BIN/git" <<EOF
+#!/usr/bin/env bash
+[ "\$1" = "--version" ] && { echo "git version 2.14.0"; exit 0; }
+[ "\$1" = "--no-optional-locks" ] && { echo "unknown option: --no-optional-locks" >&2; exit 129; }
+exec "$REAL_GIT" "\$@"
+EOF
+    chmod +x "$BIN/git"
+    LOG="$TEST_DIR/serve.log"
+    PATH="$BIN:$PATH" "$REPO/scripts/docs-serve.sh" 8099 >"$LOG" 2>&1 &
+    LOOP_PID=$!
+    # Wait for the exit itself, bounded so a watcher that wrongly keeps polling
+    # fails this test rather than hanging it.
+    for _ in $(seq 1 50); do kill -0 "$LOOP_PID" 2>/dev/null || break; sleep 0.1; done
+    run kill -0 "$LOOP_PID"
+    [ "$status" -ne 0 ]
+    rc=0; wait "$LOOP_PID" || rc=$?
+    LOOP_PID=""
+    [ "$rc" -ne 0 ]
+    grep -q '2\.15' "$LOG"
+    [ "$(runs)" = "0" ]
 }
 
 @test "a crashed mkdocs is brought back, never a dead port answering nothing" {
