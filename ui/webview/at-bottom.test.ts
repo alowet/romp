@@ -84,9 +84,10 @@ test("follow mode and the chip read atBottom at every site", () => {
     /\(!atBottom\(content\) \? captureScrollAnchor\(content, v\) : null\)\) : null;/,                       // showActive's keep
     /content\.clientHeight > 0 && !atBottom\(content\)\) \{\s*\n\s*writeScroll\(content, content\.scrollTop \+ \(h - lastH\), "box-resize"\);/,   // box-resize compensation
     /stick = !!content && atBottom\(content\);/,                                                          // tab-strip drag
+    /const wasAtBottom = !!contentX && contentX\.scrollHeight > contentX\.clientHeight \+ 2 && atBottom\(contentX\);/,   // the ✕ on a pending bubble (T262h)
   ];
   for (const re of follow) assert.match(RENDER, re, String(re));
-  assert.equal((RENDER.match(/\batBottom\(/g) || []).length, 10, "nine call sites plus the definition");
+  assert.equal((RENDER.match(/\batBottom\(/g) || []).length, 11, "ten call sites plus the definition");
 });
 
 test("only the user's own send reveal keeps the 80 px band", () => {

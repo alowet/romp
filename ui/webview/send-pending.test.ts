@@ -66,7 +66,8 @@ test("it clears on the kernel's echo (suppressed) and ends on the landing (retir
   const list = press([{ kind: "assistant", md: "…", uuid: "a1" }], TEXT);
   let r = reconcilePending([{ kind: "assistant", md: "…", uuid: "a1" }, { kind: "user", md: TEXT, uuid: "echo:1" }], list);
   assert.equal(r.keep.length, 1, "the kernel's provisional never retires the entry");
-  assert.equal(r.inject.length, 0, "…but ours steps aside while it is visible");
+  assert.equal(r.inject.length, 1, "…and ours stays drawn: the echo is hidden for it, one bubble at the tail (T262h)");
+  assert.deepEqual(r.echoHide, [1], "the caller hides the kernel's echo");
   r = reconcilePending([
     { kind: "assistant", md: "…", uuid: "a1" },
     { kind: "user", md: TEXT, uuid: "att1", absorbed: true },
@@ -207,7 +208,7 @@ test("identity edges: a copy without an id beside an echo, a landing carrying se
   assert.equal(p.qid, undefined, "no id to latch");
   assert.deepEqual(r.unqueue, [p]);
   r = reconcilePending([...tail, { kind: "user", md: "go on", uuid: "echo:random" }], [p]);
-  assert.equal(r.inject.length, 0, "the echo covers by text");
+  assert.deepEqual([r.inject.length, r.echoHide], [1, [1]], "the echo is attributed by text: hidden, ours stays (T262h)");
   r = reconcilePending([...tail, { kind: "user", md: "go on", uuid: "uL" }], [p]);
   assert.deepEqual(r.landed.map((l) => l.idx), [1]);
   // a record the CLI wrote from two sends lands with one id per block: ours retires on its own block's id
@@ -242,19 +243,20 @@ test("the kernel's queued copy at the tail is hidden for a send drawn as our own
   assert.equal(list[0].received, true, "the kernel's copy proves receipt");
   assert.deepEqual(r.inject, [list[0]], "…but ours stays drawn, at the tail");
   assert.deepEqual(r.unqueue, [list[0]], "and the caller drops the kernel's tail copy for it");
-  // an ECHO atom covers ours as before: the kernel draws that atom itself, at the send time
+  // an ECHO atom proves receipt and is hidden in turn (T262h): ours is the one bubble, at the tail, until the landing
   const r2 = reconcilePending([...tail, { kind: "user", md: TEXT, uuid: "echo:1" }], press(tail, TEXT));
-  assert.equal(r2.inject.length, 0);
+  assert.equal(r2.inject.length, 1);
   assert.equal(r2.unqueue.length, 0);
+  assert.deepEqual(r2.echoHide, [1]);
 });
 
 test("render.ts appends the pending sends as ONE bare group at the tail, in send order; strips its own injections before applying kernel indices; carries no header or cue (T252d)", () => {
   assert.match(RENDER, /s\.events\.push\(\{ kind: "queued", bare: true, texts: inject\.map\(mk\), uuid: OPT_PREFIX \+ inject\[0\]\.ts/,
     "one bare group pushed at the tail, the sends in list (send) order");
   assert.doesNotMatch(RENDER, /injectionGroups|placementIndex/, "the send-slot placement machinery is gone from render.ts");
-  const fn = RENDER.split("function reconcileOptimistic(")[1].split("\nfunction ")[0];
+  const fn = RENDER.split("function reconcileOptimisticInner(")[1].split("\nfunction ")[0];   // the guarded body (T262h)
   assert.match(fn, /settle\(inject\.map\(\(p\) => p\.text\)\);/, "the repaint signature is the texts alone: the tail slot moves with every push by design");
-  assert.match(RENDER, /function stripOptimistic\(s: Session\): void \{/, "one strip, used by every ingest path");
+  assert.match(RENDER, /function stripOptimistic\(s: Session, keepHeld = false\): void \{/, "one strip, used by every ingest path (keepHeld: the pending reconcile leaves the held kernel copies in, T262i)");
   const tail = RENDER.slice(RENDER.indexOf("function chatTail(msg: any) {"), RENDER.indexOf("s.events.length = from;"));
   assert.match(tail, /stripOptimistic\(s\);/, "the delta's kernel index is applied to KERNEL events only — a mid-array bubble would shift it");
   // …but only once the delta is going to be applied: stripping before the gap/head early returns left s.events
@@ -262,7 +264,7 @@ test("render.ts appends the pending sends as ONE bare group at the tail, in send
   const afterReturns = tail.slice(tail.indexOf("if (from < 0) return;"));
   assert.match(afterReturns, /stripOptimistic\(s\);/, "the strip sits after both early returns");
   assert.doesNotMatch(tail.slice(0, tail.indexOf("if (from > kernelLen) {")), /stripOptimistic\(s\);/, "…and not before the gap check");
-  assert.match(tail, /const kernelLen = s\.events\.reduce\(\(n, e\) => n \+ \(isOptimistic\(e\) \? 0 : 1\), 0\);/, "the gap check counts kernel events without mutating");
+  assert.match(tail, /const kernelLen = s\.events\.reduce\(\(n, e\) => n \+ \(isOptimistic\(e\) \|\| isHeldGroup\(e\) \? 0 : 1\), 0\);/, "the gap check counts kernel events without mutating");
   for (const gone of ["absorbedHeader", "absorbedCues", "noteAbsorbedLanding", "renderAbsorbedCue", "appendAbsorbedCues", "dismissAbsorbedCue", "cueRendered", "abjump", "abdismiss", "absorbed-tag", "turn-absorbed-cue"])
     assert.ok(!RENDER.includes(gone), gone + " is gone from render.ts");
   for (const gone of [".absorbed-tag", ".turn-absorbed-cue", ".absorbed-cue-line", ".absorbed-cue-act"])
@@ -283,7 +285,7 @@ test("a resend of a never-delivered message is not retired by the old verdict �
   assert.equal(provisionalIn(tail[1], list[0]), false, "a never-delivered echo never suppresses");
   // the kernel's echo for the resend, then ITS verdict — that one ends the entry
   r = reconcilePending([...tail, { kind: "user", md: TEXT, uuid: "echo:new" }], list);
-  assert.equal(r.inject.length, 0);
+  assert.deepEqual([r.inject.length, r.echoHide], [1, [tail.length]], "ours stays, the echo is hidden (T262h)");
   r = reconcilePending([...tail, { kind: "user", md: TEXT, uuid: "echo:new", undelivered: true }], list);
   assert.equal(r.lost.length, 1);
   // a shorter send that the old never-delivered text merely contains is not its resend at all
@@ -393,7 +395,8 @@ test("two identical sends, one kernel echo: the first is received and covered; t
   const list = press(tail, "continue", "continue");
   let r = reconcilePending([...tail, { kind: "user", md: "continue", uuid: "echo:1" }], list);
   assert.deepEqual(list.map((p) => p.received), [true, undefined], "one echo is one send's receipt");
-  assert.deepEqual(r.inject, [list[1]], "the kernel's copy covers one bubble; ours shows for the other");
+  assert.deepEqual(r.inject, [list[0], list[1]], "both bubbles stay ours; the echo that proved the first's receipt is hidden (T262h)");
+  assert.deepEqual(r.echoHide, [1]);
   assert.deepEqual(list[1].at?.seen, ["echo:1"], "the claimed echo is background for the later send");
   // the drop (as render.ts markPendingLost writes it): only the unconfirmed send is marked
   for (const p of list) if (!p.lost && !p.received) p.lost = "connection";
@@ -504,7 +507,7 @@ test("a send pressed against no frame (a placeholder tab): the first frame's cop
   assert.equal(list[0].at?.after, "a1", "the anchor is the last stable event stamped BEFORE the press — not a2");
   assert.deepEqual(list[0].at?.seen, ["u-old"], "the old message is background; this send's echo is not");
   assert.equal(list[0].received, true);
-  assert.equal(r.inject.length, 0, "the kernel's echo covers our bubble: no double bubble");
+  assert.deepEqual([r.inject.length, r.echoHide], [1, [2]], "the kernel's echo is hidden for our bubble: no double bubble (T262h)");
   const landed: TailEvent[] = [frame[0], frame[1], { kind: "user", md: TEXT, uuid: "u1", ts: isoAt(S) }, frame[3]];
   r = reconcilePending(landed, list);
   assert.equal(r.keep.length, 0, "the echo→landed handoff retires it");
@@ -678,7 +681,7 @@ test("an id the frame no longer carries leaves the decision to text: a restart t
   assert.deepEqual([r.unqueue, r.inject], [[p], [p]], "one bubble, never ours beside the kernel's copy");
   // (2) an echo under a new uuid covers by text, and the first identity stays latched: nothing in the frame contradicts it
   r = reconcilePending([...tail, { kind: "user", md: "rename it", uuid: "echo:new" }], [p]);
-  assert.deepEqual([r.inject, r.keep], [[], [p]], "the echo covers");
+  assert.deepEqual([r.inject, r.keep, r.echoHide], [[p], [p], [1]], "the echo is attributed by text and hidden; ours stays");
   assert.equal(p.qid, "echo:old" + T0);
   // (3) that echo flagged never-delivered is the verdict, by text
   r = reconcilePending([...tail, { kind: "user", md: "rename it", uuid: "echo:new", undelivered: true }], [p]);
@@ -700,13 +703,14 @@ test("an id the frame still shows queued or echoed refuses a same-text landing t
   // the same with the second copy fed: its echo shows the id — and the first send, landed, does not go on to claim
   // that echo as its own cover on the way out
   r = reconcilePending([...tail, { kind: "user", md: "ok", uuid: "u1" }, { kind: "user", md: "ok", uuid: "echo:q2" }], [a, b]);
-  assert.deepEqual([r.landed.map((l) => l.p), r.keep, r.inject], [[a], [b], []]);
+  assert.deepEqual([r.landed.map((l) => l.p), r.keep, r.inject, r.echoHide], [[a], [b], [b], [2]]);
   // a send read by text (its id is nowhere in the frame) never takes an echo another send owns by id
   const [c, d] = press(tail, "go", "go");
   reconcilePending([...tail, { kind: "queued", texts: [{ md: "go", qid: "echo:c1", qts: 1 }, { md: "go", qid: "echo:d1", qts: 2 }] }], [c, d]);
   assert.deepEqual([c.qid, d.qid], ["echo:c1", "echo:d1"]);
   r = reconcilePending([...tail, { kind: "user", md: "go", uuid: "echo:d1" }], [c, d]);
-  assert.deepEqual([r.keep, r.inject], [[c, d], [c]], "the echo is the second send's cover; the first, unshown, is drawn by us");
+  assert.deepEqual([r.keep, r.inject, r.echoHide], [[c, d], [c, d], [1]], "the echo is the second send's, by id: hidden for it; both bubbles are ours, and the first never claimed it");
+  assert.deepEqual([c.received, d.received], [true, true], "both were received by their queued copies earlier; the echo added nothing to the first");
 });
 
 test("a send covered by its identified copy holds that copy's position: a later same-text send never latches the same id, nor takes the copy (T252c third review)", () => {

@@ -40,6 +40,8 @@ function liftChatTail(): (hooks: TailHooks) => TailApi {
     const isOptimistic = (e) => !!e.opt;
     const stripOptimistic = (s) => { s.events = s.events.filter((e) => !e.opt); H.strips++; };
     const reconcileRewind = (s, bound) => { H.rewinds.push([s.id, bound]); };
+    const isHeldGroup = (e) => !!e.held;                 // a group the client made for held kernel copies (T262i): not kernel coordinates
+    const reconcileHeldCopies = () => {};                // the held-copy pass runs between the rewind and the pending sends (T262i)
     const reconcileOptimistic = () => { H.optRecs++; };
     const awaitKey = (st) => JSON.stringify((st && st.awaitingWhy) || "");
     const scheduleRenderTabs = () => { H.tabRenders++; };

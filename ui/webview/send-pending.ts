@@ -272,6 +272,10 @@ export function scanFrom(events: TailEvent[], at: SendBase): number {
 
 export type Reconciled = {
   keep: PendingSend[];                        // still pending after this push
+  echoHide: number[];                         // the kernel's ECHO atoms covering a kept send (T262h): the caller hides them and
+                                              //   draws ours — one bubble per message, OURS, at the tail, the same node until the
+                                              //   landing; an echo sits at its send time, above the steps that ran since, so
+                                              //   swapping ours for it shrank the tail under a bottom reader
   inject: PendingSend[];                      // …and drawn by us, at the tail: not covered by the kernel's echo atom (a
                                               //   queued copy does not cover — ours stays drawn and the copy is hidden, T252)
   unqueue: PendingSend[];                     // …whose kernel cover is a QUEUED copy: the caller hides that copy
@@ -333,7 +337,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
   const lateOwn = new Map<string, number>();
   for (const p of list) if (!p.at && p.late) lateOwn.set(p.text, (lateOwn.get(p.text) || 0) + 1);
   for (const p of list) if (!p.at) p.at = stampBase(events, p, p.late ? lateOwn.get(p.text) || 1 : 0);
-  const r: Reconciled = { keep: [], inject: [], unqueue: [], landed: [], lost: [] };
+  const r: Reconciled = { keep: [], inject: [], unqueue: [], landed: [], lost: [], echoHide: [] };
   const claimed = new Map<string, number>();           // "index\0text" → copies of that text in that landing taken by earlier entries THIS push
   const owned = new Set<string>();                     // the identities pending sends have latched: an echo, a queued copy or a landing wearing one is that send's, never a text match
   for (const p of list) if (p.qid) owned.add(p.qid);
@@ -386,9 +390,9 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
     // a ✕ on it must not hand its echo to the next entry; an echo is one text, so one entry in `seen` is
     // the whole of it) — else the first queued copy beyond this entry's press-time count that no
     // earlier entry took this push.
-    let covered = false, byQueued = false;
+    let covered = false, byQueued = false, byEcho = false;
     if (echoIdx >= 0) {
-      covered = true;
+      covered = true; byEcho = true;
       const u = events[echoIdx].uuid;
       if (u) for (const q of list) if (q !== p && q.at && q.text === p.text && !q.at.seen.includes(u)) q.at.seen.push(u);
       if (!p.qid && u) p.qid = u;                  // the echo's uuid is the copy's id: latched (T252c)
@@ -422,11 +426,14 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
     }
     if (lostIdx >= 0) { r.lost.push(p); continue; }
     r.keep.push(p);
-    // The kernel's ECHO atom covers ours: the kernel draws that atom itself. A QUEUED copy does not: it sits
-    // in the kernel's group at the tail, and the bubble the user watches is ours, right below — so ours stays
-    // drawn and the caller hides that copy, one bubble per message (T252).
-    if (!covered || byQueued) r.inject.push(p);
+    // The kernel's copy of a pending send never replaces OUR bubble (T252, T262h): a QUEUED copy sits in the
+    // kernel's group at the tail and the caller hides it; an ECHO atom sits at its SEND time, above the steps
+    // that ran since, and the caller hides it too — swapping ours (at the tail) for it shrank the tail under a
+    // bottom reader by the bubble's height, the clamp the user watched. Ours stays drawn, one node, until the
+    // landing takes its place; the kernel's copies only prove receipt (`received`).
+    r.inject.push(p);
     if (covered && byQueued) r.unqueue.push(p);
+    if (covered && byEcho && echoIdx >= 0 && !r.echoHide.includes(echoIdx)) r.echoHide.push(echoIdx);
   }
   // Every landing claimed this push is spoken for: one copy per claim becomes background for every
   // pending send with the same text that STAYS, on every push after (the retired entry's claim would

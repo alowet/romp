@@ -175,7 +175,7 @@ test("EVERY ✕ stops our re-injection first; the optimistic one cancels by body
 test("chatTail speaks the KERNEL's coordinates — the injected tail is not part of its space", () => {
   // counting the injected bubble in the gap check masked a genuine 1-event desync (the repair never
   // fired) and let a delta land PAST the bubble, freezing it into resident events as fake history
-  assert.match(RENDER, /const kernelLen = s\.events\.reduce\(\(n, e\) => n \+ \(isOptimistic\(e\) \? 0 : 1\), 0\);/);
+  assert.match(RENDER, /const kernelLen = s\.events\.reduce\(\(n, e\) => n \+ \(isOptimistic\(e\) \|\| isHeldGroup\(e\) \? 0 : 1\), 0\);/);
   assert.match(RENDER, /if \(from > kernelLen\) \{/);
 });
 
@@ -210,10 +210,13 @@ test("reconcile: inject on nothing, suppress on kernel provisionals, retire only
   assert.equal(r.keep.length, 1);
   assert.equal(r.inject.length, 1, "ours stays drawn at its slot (T252)…");
   assert.equal(r.unqueue.length, 1, "…and the kernel's copy is the one hidden: one bubble per message");
-  // …same for the kernel's unlanded echo atom (uuid keeps the backend's echo: prefix)
+  // the kernel's unlanded echo atom (uuid keeps the backend's echo: prefix) proves receipt but does not replace ours
+  // (T262h): the echo sits at its send time, above the steps that ran since, so swapping ours out for it shrank the
+  // tail under a bottom reader; ours stays, the echo is hidden
   r = reconcile([{ kind: "user", md: "continue", uuid: "echo:abc123" }], p);
   assert.equal(r.keep.length, 1);
-  assert.equal(r.inject.length, 0);
+  assert.equal(r.inject.length, 1, "ours stays drawn");
+  assert.deepEqual(r.echoHide, [0], "…and the caller hides the kernel's echo");
   // DEFECT B (the flash-out): the provisional blinks away in the echo→landed handoff — the entry
   // survived the suppression, so ours steps straight back in and the message never disappears
   r = reconcile([{ kind: "assistant", md: "…" }], p);
@@ -246,7 +249,7 @@ test("the landing SWAP repaints even when it replaces the echo 1:1 — no linger
   assert.match(RENDER, /const echoShownSig = new Map<string, string>\(\);/);
   assert.match(RENDER, /if \(\(echoShownSig\.get\(s\.id\) \|\| ""\) !== sig\) \{/);
   assert.match(RENDER, /if \(sig\) echoShownSig\.set\(s\.id, sig\); else echoShownSig\.delete\(s\.id\);/);
-  const fn = RENDER.split("function reconcileOptimistic(")[1].split("\nfunction ")[0];
+  const fn = RENDER.split("function reconcileOptimisticInner(")[1].split("\nfunction ")[0];   // the guarded body (T262h)
   const settles = (fn.match(/settle\(/g) || []).length;
   assert.ok(settles >= 3, "every exit settles the signature (early returns included), got " + settles);
 });

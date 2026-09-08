@@ -39,6 +39,7 @@ import { DEFAULT_CHORDS } from "./commands";
 import { NavHistory } from "./nav-history";
 import { StagedStack } from "./staged-messages";
 import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, queuedCopyToHide, dropPending, bareGroupLabel, sentAtLabel } from "./send-pending";
+import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued } from "./queued-held";
 import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional } from "./provisional";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
@@ -104,7 +105,7 @@ type TaskOutputs = Record<string, { command: string; output: string }>;
 type ChatEvent = (
   // mid/mids: postal message ids the kernel could NOT resolve into cards, carried on the raw turn so a
   // timeline arc into it still lands (see _hydrate_postal's unresolved path)
-  | { kind: "user"; md: string; uuid?: string; ts?: string; reminders?: string[]; taskOutputs?: TaskOutputs; human?: boolean; romp?: boolean; rompAuto?: boolean; rompSystem?: boolean; followUp?: boolean; goal?: string; fuCtx?: string; canned?: string; tag?: string; mid?: string; mids?: string[]; images?: { src: string; path?: string }[]; undelivered?: boolean; echoT?: number; absorbed?: boolean; sentAt?: number; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }
+  | { kind: "user"; md: string; uuid?: string; ts?: string; reminders?: string[]; taskOutputs?: TaskOutputs; human?: boolean; romp?: boolean; rompAuto?: boolean; rompSystem?: boolean; followUp?: boolean; goal?: string; fuCtx?: string; canned?: string; tag?: string; mid?: string; mids?: string[]; images?: { src: string; path?: string }[]; undelivered?: boolean; echoT?: number; absorbed?: boolean; sentAt?: number; hiddenByPending?: boolean; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }
   | { kind: "assistant"; md: string; uuid?: string; ts?: string; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }   // spacePaths: backticked filenames WITH spaces the kernel verified exist (build_session _space_paths) → whole-span links. pathLinks: path-shaped tokens the kernel verified against the filesystem, token → real open target (build_session _path_links) — the linkifier's gate
   | { kind: "thinking"; text: string; encrypted: boolean; uuid?: string; ts?: string }
   | {
@@ -182,7 +183,7 @@ type ChatEvent = (
   // `held` DOES come from the kernel (_limit_hold): the queue is stuck on the ACCOUNT rather than on this
   // session — a usage limit or a monthly spend cap holds every send — so the head names what it is waiting
   // for, and how long is left when the API reported a reset (the user 2026-07-24).
-  | { kind: "queued"; texts: { md: string; followUp?: boolean; goal?: string; fuCtx?: string; idx?: number; park?: number; cancelable?: boolean; optimistic?: boolean; romp?: boolean; rompSystem?: boolean; rompAuto?: boolean; imgPaths?: string[]; lost?: string; qts?: number; qid?: string; hiddenByPending?: boolean }[]; ts?: string; uuid?: string; bare?: boolean; held?: { reason: string; resetsAt?: number | null; what: string; detail?: string } }   // imgPaths: an optimistic echo's dragged-image attachments → thumbnails, the landed form's own renderer (the user 2026-08-25); lost: client-only, the connection dropped after this unconfirmed send; qts: on OUR optimistic copy the pending entry's identity (its press time) so the ✕ removes ITS entry, on a kernel copy its enqueue stamp (T252c); qid: a kernel copy's identity, the ✕ drops the send that owns it (send-pending.ts)
+  | { kind: "queued"; texts: { md: string; followUp?: boolean; goal?: string; fuCtx?: string; idx?: number; park?: number; cancelable?: boolean; optimistic?: boolean; romp?: boolean; rompSystem?: boolean; rompAuto?: boolean; imgPaths?: string[]; lost?: string; qts?: number; qid?: string; hiddenByPending?: boolean; landing?: boolean }[]; ts?: string; uuid?: string; bare?: boolean; held?: { reason: string; resetsAt?: number | null; what: string; detail?: string } }   // imgPaths: an optimistic echo's dragged-image attachments → thumbnails, the landed form's own renderer (the user 2026-08-25); lost: client-only, the connection dropped after this unconfirmed send; qts: on OUR optimistic copy the pending entry's identity (its press time) so the ✕ removes ITS entry, on a kernel copy its enqueue stamp (T252c); qid: a kernel copy's identity, the ✕ drops the send that owns it (send-pending.ts)
   // The turn stopped on an API error (event-based: transcript isApiErrorMessage). The session is BLOCKED
   // until retried — a red-dot card at the bottom with a Retry button (the user 2026-06-16).
   | { kind: "apiError"; text: string; status?: number; ts?: string; uuid?: string }
@@ -357,6 +358,19 @@ function tailQueuedIdx(evs: ChatEvent[]): number {
 const echoShownSig = new Map<string, string>();
 
 function reconcileOptimistic(s: Session): void {
+  // The strip and the re-inject are ONE step: an exception between them would leave the events without our
+  // bubble until the next push, and the frame painted meanwhile would let the browser clamp a bottom reader by
+  // the bubble's height (T262h). So the group as it was is put back on any failure, and the failure is filed.
+  const prevGroup = s.events.filter((e) => isOptimistic(e));
+  try {
+    reconcileOptimisticInner(s);
+  } catch (err) {
+    if (!s.events.some((e) => isOptimistic(e))) s.events.push(...prevGroup);
+    vscodeApi?.postMessage({ type: "clientDiag", surface: "chat", what: "reconcile-optimistic-failed",
+                             data: { sid: s.id, error: String(err && (err as any).message || err).slice(0, 200) } });
+  }
+}
+function reconcileOptimisticInner(s: Session): void {
   const settle = (after: string[]) => {
     const sig = after.join("\u0000");
     if ((echoShownSig.get(s.id) || "") !== sig) {
@@ -365,7 +379,7 @@ function reconcileOptimistic(s: Session): void {
       if (v) v.stale = true;
     }
   };
-  stripOptimistic(s);   // kernel truth only below: our bubbles and our hide marks are re-derived from it
+  stripOptimistic(s, true);   // kernel truth (plus the held copies, T262i) below: our bubbles and our hide marks are re-derived from it
   const list = pendingSent.get(s.id);
   if (!list || !list.length) { settle([]); return; }
   // The decision reads KERNEL truth only (our injections are stripped above) — send-pending.ts: a
@@ -386,6 +400,9 @@ function reconcileOptimistic(s: Session): void {
     const hid = hideQueuedCopy(s, p);
     if (hid === null) covered.add(p); else if (hid.held) heldBy.set(p, hid.held);
   }
+  // the kernel's ECHO of a pending send is hidden the way its queued copy is (T262h): ours is the one bubble,
+  // at the tail, on the same node until the landing takes its place
+  for (const i of r.echoHide) { const e = s.events[i]; if (e && e.kind === "user" && !e.hiddenByPending) s.events[i] = { ...e, hiddenByPending: true }; }
   const inject = r.inject.filter((p) => !covered.has(p));
   if (!inject.length) { settle([]); return; }
   // cancelable from the PRESS (the user 2026-08-30, who sent mid-compaction and sat in an unlabeled,
@@ -411,12 +428,47 @@ function reconcileOptimistic(s: Session): void {
 // their send slots mid-array, and the strip stays position-agnostic), the optimistic texts we once merged
 // into a kernel group, and the hide marks on the kernel's queued copies — so every reader below sees KERNEL
 // truth only. Every ingest path that applies a kernel INDEX (chatTail's `from`) strips first.
-function stripOptimistic(s: Session): void {
+// `keepHeld`: the pending-send reconcile strips only ITS OWN marks (our bubbles, the hidden copies and echoes) and
+// leaves the held kernel copies (T262i) in place, which the ingest paths derive fresh from the kernel's frame first.
+function stripOptimistic(s: Session, keepHeld = false): void {
   for (let i = s.events.length - 1; i >= 0; i--) {
     const e = s.events[i];
     if (isOptimistic(e)) { s.events.splice(i, 1); continue; }
-    if (e.kind === "queued" && e.texts.some((t) => t.optimistic || t.hiddenByPending))
-      s.events[i] = { ...e, texts: e.texts.filter((t) => !t.optimistic).map((t) => t.hiddenByPending ? { ...t, hiddenByPending: undefined } : t) };
+    if (!keepHeld && isHeldGroup(e)) { s.events.splice(i, 1); continue; }   // a group we made for held copies alone
+    if (e.kind === "queued" && e.texts.some((t) => t.optimistic || t.hiddenByPending || (!keepHeld && t.landing))) {
+      const texts = e.texts.filter((t) => !t.optimistic && (keepHeld || !t.landing)).map((t) => t.hiddenByPending ? { ...t, hiddenByPending: undefined } : t);
+      s.events[i] = { ...e, texts };
+    }
+    if (e.kind === "user" && e.hiddenByPending) s.events[i] = { ...e, hiddenByPending: undefined };   // a hidden echo (T262h)
+  }
+}
+
+// ── held kernel copies (T262i, the user 2026-09-08) ──────────────────────────────────────────────────
+// A copy the kernel listed queued on the previous push and no longer lists, whose landed record is not in the
+// events yet, is HELD in the tail group — the same card, marked landing — so the tail never loses its height
+// between the queue frame and the transcript frame (the decisions: queued-held.ts). Per session: the previous
+// push's kernel copies and the copies held so far. Runs on every ingest path right after the strip, before the
+// pending sends are reconciled (a held copy of OUR text is then hidden for our bubble like any kernel copy).
+const HELD_PREFIX = "held:";
+const isHeldGroup = (e: ChatEvent): boolean => e.kind === "queued" && !!e.uuid && e.uuid.startsWith(HELD_PREFIX);
+const heldQueued = new Map<string, { prev: HeldQueued[]; held: HeldCopy[] }>();
+function reconcileHeldCopies(s: Session): void {
+  const mem = heldQueued.get(s.id) || { prev: [], held: [] };
+  const qi = tailQueuedIdx(s.events);
+  const cur = qi >= 0 ? ((s.events[qi] as Extract<ChatEvent, { kind: "queued" }>).texts as HeldQueued[]) : [];
+  const r = reconcileHeld(mem.prev, mem.held, s.events as any, cur);
+  heldQueued.set(s.id, r);
+  // the held set changed (a copy taken, a copy landed): the frame may keep its LENGTH while a held card gives way to
+  // the landed atom, and the repaint's no-op fast path reads length alone — so the view is marked stale here
+  const key = (h: HeldCopy[]) => h.map((c) => c.qid || c.md).join("\u0000");
+  if (key(mem.held) !== key(r.held)) { const v = views.get(s.id); if (v) v.stale = true; }
+  if (!r.held.length) return;
+  const add = r.held.map(heldAsQueued);
+  if (qi >= 0) {
+    const q = s.events[qi] as Extract<ChatEvent, { kind: "queued" }>;
+    s.events[qi] = { ...q, texts: [...q.texts, ...(add as any)] };
+  } else {
+    s.events.push({ kind: "queued", texts: add as any, uuid: HELD_PREFIX + s.id });   // the group the card sat in, kept for it
   }
 }
 
@@ -1820,6 +1872,9 @@ function linkifyFileUris(root: HTMLElement, skipThumbs?: string[], spacePaths?: 
 }
 
 function renderEvent(ev: ChatEvent, prevEpoch?: number | null, worked?: number | null): HTMLElement {
+  if (ev.kind === "user" && ev.hiddenByPending) {   // the kernel's echo of a send OUR bubble draws (T262h): the unit stays, invisible
+    const hid = el("div", "turn turn-user turn-echo-hidden"); hid.style.display = "none"; return hid;
+  }
   const turn = renderEventInner(ev);
   // pending-rewind overlay (reconcileRewind): this turn sits AFTER an edited message — it belongs to
   // the branch being abandoned, so it dims until the kernel's rewound payload replaces it
@@ -3060,7 +3115,7 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
   if (ev.kind === "postal-service") return renderPostalService(ev);
   if (ev.kind === "teammate") return renderTeammate(ev);
   if (ev.kind === "todo") return renderTodo(ev);
-  if (ev.kind === "queued") return renderQueued(ev);
+  if (ev.kind === "queued") return isOptimistic(ev) && ev.bare ? renderPendingGroup(ev) : renderQueued(ev);
   if (ev.kind === "apiError") return renderApiError(ev);
   if (ev.kind === "compacting") return renderCompacting();
   if (ev.kind === "clearing") return renderClearing();
@@ -3901,6 +3956,30 @@ function fillBareLabel(label: HTMLElement, nLost: number, nSending: number): voi
   label.title = title;
 }
 
+// OUR pending group keeps ONE DOM node for as long as it is pending (T262h, the user 2026-09-08): every kernel push
+// re-renders the tail window, and a group re-created from scratch left the DOM for the removal → re-add gap of
+// the repaint. The node is cached per session and reconciled IN PLACE — its children replaced from a fresh render
+// only when the group's content changed (a second send, a ✕, a "not confirmed" label, a held reason) — so the
+// element the scroll geometry rests on is the same element frame after frame; the caller re-appends it where the
+// group belongs (appendChild moves an attached node, one DOM operation, no frame without it).
+const pendingGroupNode = new Map<string, { sig: string; node: HTMLElement }>();
+function renderPendingGroup(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
+  const sid = renderingSid || activeId || "";
+  const sig = JSON.stringify(ev.texts.map((t) => [t.md, !!t.lost, t.qts, t.imgPaths || null])) + "|" + JSON.stringify(ev.held || null);
+  const fresh = renderQueued(ev);
+  const cached = pendingGroupNode.get(sid);
+  if (cached && cached.node.isConnected !== undefined) {
+    if (cached.sig !== sig) {
+      cached.node.className = fresh.className;
+      cached.node.replaceChildren(...Array.from(fresh.childNodes));
+      cached.sig = sig;
+    }
+    return cached.node;
+  }
+  pendingGroupNode.set(sid, { sig, node: fresh });
+  return fresh;
+}
+
 function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
   // a copy hidden for a send drawn at its own slot (T252 hideQueuedCopy) is not rendered here; a group left
   // with nothing visible renders as a zero-height unit (the unit still exists for the scroll↔unit map)
@@ -3977,6 +4056,7 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
     // and is holding (the user 2026-07-16)
     if (t.optimistic && t.lost) bubble.title = "not confirmed — the connection dropped after this was sent; ✕ moves it back to the composer to send again";
     else if (t.optimistic) bubble.title = "sent just now — romp hasn't confirmed the session has it yet";
+    else if (t.landing) { bubble.classList.add("landing"); bubble.title = "the session has taken this — it joins the conversation as soon as its record lands"; }
     // a queued entry with NO ✕ (the user 2026-07-20): the queue lives inside the session's own CLI —
     // there is no recall — so instead of a cancel that would only ever say "too late", the tooltip says
     // where the message actually is. (SDK mid-turn forwards and every tmux queued message land here.)
@@ -13735,6 +13815,7 @@ function upsert(msg: any) {
   const tm = tabMeta.get(msg.id);
   if (tm) applyMetaToSession(s, tm, pendingTabMeta.get(msg.id));
   reconcileRewind(s);       // pending-rewind overlay + the editable-bubble set, from the fresh payload
+  reconcileHeldCopies(s);   // a queued copy the kernel no longer lists but has not landed keeps its slot (T262i)
   reconcileOptimistic(s);   // re-assert (or retire) any in-flight optimistic sends across the rebuild
   // The kernel re-sends the FULL "session" payload on every push. Distinguish an APPEND (more turns
   // on the SAME transcript — the common case) from a FORK (the tab re-pointed onto a NEW transcript,
@@ -13829,6 +13910,7 @@ function update(msg: any) {
   s.status = msg.status || s.status;
   if (msg.events) { const v0 = views.get(msg.id); if (v0) v0.stale = true; }   // events replaced wholesale: the window rebuilds (the tail path trusts v.rendered)
   reconcileRewind(s);                    // pending-rewind overlay + the editable-bubble set, from the fresh payload
+  reconcileHeldCopies(s);                // a queued copy the kernel no longer lists but has not landed keeps its slot (T262i)
   reconcileOptimistic(s);                // re-assert (or retire) any in-flight optimistic sends on this push
   renderTabs();                          // status/chip change only — repaint, never re-order (the user 2026-06-27)
   if (msg.id === activeId) {
@@ -13893,7 +13975,7 @@ function chatTail(msg: any) {
   // is not one of them), and the strip itself waits until the delta is going to be applied: stripping
   // ahead of the two early returns left s.events without the bubble while the DOM still showed it (review
   // of the first cut).
-  const kernelLen = s.events.reduce((n, e) => n + (isOptimistic(e) ? 0 : 1), 0);
+  const kernelLen = s.events.reduce((n, e) => n + (isOptimistic(e) || isHeldGroup(e) ? 0 : 1), 0);
   if (from > kernelLen) {
     // GAP: the delta starts PAST what we hold, so the events in between never reached us. Applying it would
     // fabricate a transcript that silently skips them. This used to just `return` and "wait for the next
@@ -13914,6 +13996,7 @@ function chatTail(msg: any) {
   s.events.length = from;                          // drop the (now superseded) tail...
   for (const e of (msg.events || [])) s.events.push(e);   // ...and append the freshly-changed suffix
   reconcileRewind(s, from);                        // pending-rewind overlay + the editable-bubble set, judged below the tail's start (see there)
+  reconcileHeldCopies(s);                          // a queued copy the kernel no longer lists but has not landed keeps its slot (T262i)
   reconcileOptimistic(s);                          // re-assert (or retire) any in-flight optimistic sends
   // A delta that SHRINKS the tail (an event retired with nothing replacing it — cancelling the last queued
   // message is the everyday case) lands on `from === new length`, so lowering v.rendered to `from` leaves it
@@ -15725,8 +15808,13 @@ setupSettings();
       // the bubble alone leaves its "1 queued message" header behind, still counting what just went.
       const bub = el.closest(".queued-bubble") as HTMLElement | null;
       const grp = bub?.closest(".turn-queued") as HTMLElement | null;
+      // a bubble leaving the tail shrinks it: a bottom reader is written to the new bottom in the same task, so the
+      // move is the pane's own (journaled), never a clamp the follow-mode latch never saw (T262h)
+      const contentX = document.getElementById("content");
+      const wasAtBottom = !!contentX && contentX.scrollHeight > contentX.clientHeight + 2 && atBottom(contentX);
       bub?.remove();
       if (grp) reflowQueuedGroup(grp);
+      if (contentX && wasAtBottom) writeScroll(contentX, contentX.scrollHeight, "queued-x", true);
     },
     // a comment highlight or its turn badge (the user 2026-08-13): open the thread's popover at the
     // click. Delegated — marks and badges are re-created on every transcript rebuild — and so is
