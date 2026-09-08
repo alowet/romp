@@ -35,7 +35,7 @@ no separate implementation to point at.
 | `romp-judge` | `kernel/judge.py` | Layer 2: the judge engine + all judge prompts (captioner, archiver, planner, …). `docs/judges.md`. |
 | `romp-askparse` | `kernel/askparse.py` | Parses the AskUserQuestion picker out of a captured tmux pane (tmux backend only; SDK sessions get the picker natively). |
 | `romp_sdk_backend.py` | `kernel/sdk_backend.py` | The **SDK session backend** (current default): drives sessions via the Claude Agent SDK. |
-| _(no bin entry)_ | `kernel/keysource.py` | The live API key source: an optional `ROMP_API_KEY_REF` resolved by `op` at runtime, or a legacy key. Source inspection never fetches secrets. Shared by the kernel and `romp keyswap`. |
+| _(no bin entry)_ | `kernel/credentials.py` | romp's whole contact with API credentials since 2026-09-08: reads Claude Code's `apiKeyHelper` from its settings files in the CLI's precedence, runs it in-process for the kernel's two API calls (model catalog, fast-mode probe) with an in-memory TTL memo, and stops the kernel at boot when `service.env` or the environment still carries a retired provider line. romp holds no key. |
 | `romp_session_backend.py` | `kernel/session_backend.py` | The `SessionBackend` ABC — the one seam both backends (SDK, tmux) implement. |
 | `romp_colormap.py` | `kernel/colormap.py` | The recency colormaps, single source of truth shared with the web bundles. |
 | `romp_palette.py` | `kernel/palette.py` | The session-identity color palettes. |
@@ -52,7 +52,6 @@ no separate implementation to point at.
 |---|---|---|
 | `romp-update` | `cli/update.py` | Pushes this machine's committed romp to attached remote kernels and restarts them (`romp update [host]`). |
 | `romp-version` | `cli/version.py` | Version report across the moving parts (`romp version`). |
-| `romp-keyswap` | `cli/keyswap.py` | Switches key sources — `ROMP_API_KEY_CMD` key commands, `ROMP_API_KEY_REF` 1Password references or legacy API keys — using sibling `service.env.<name>` profiles without restarting the manager. Listing/selection never fetch secrets; `--cycle`/`--cycle-all` reconnects running sessions onto the source (`romp keyswap`). |
 | `romp-idle-dots` | `cli/idle_dots.py` | tmux backend only: heals stranded `working` state / fades idle tab dots by inspecting tmux panes. Fired from `hooks/tmux-status.sh`. |
 | `romp-spend-rebuild` | `cli/spend_rebuild.py` | Recounts the token columns of the spend ledger (`spend.json`) from the transcripts' per-call usage; dollars and turn counts untouched. Dry run by default, `--apply` writes with a backup (`romp spend-rebuild`). |
 

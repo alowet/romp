@@ -11,9 +11,10 @@
 # agent (no root). PATH + ROMP_DIR are baked into the unit so the service finds
 # node / python3 / claude / the romp bins (reinstall after a PATH change to refresh).
 # Service configuration goes in ~/.config/romp/service.env, never baked into the
-# unit. ROMP_API_KEY_CMD names a key command (any secret manager's CLI) and
-# ROMP_API_KEY_REF a 1Password reference; the kernel runs either only when a key is
-# needed. See SERVICE_ENV_FILE below and docs/reference.md.
+# unit: ROMP_EXPECTED_AUTH=key|login declares the billing, and service knobs ride
+# beside it. Never an API key: romp holds none (the kernel stops at boot on a key
+# line; sessions authenticate through Claude Code's own apiKeyHelper). See
+# SERVICE_ENV_FILE below and docs/reference.md.
 set -euo pipefail
 
 # Resolve the repo root through any symlink (matches the other bin/ consumers).
@@ -49,11 +50,10 @@ UNIT="$SYSTEMD_DIR/romp-manager.service"
 # Extra service environment: plain KEY=VALUE lines loaded when the manager STARTS
 # (not baked at install) — systemd reads the file via EnvironmentFile=-, the macOS
 # login agent's launcher (romp-node-launch) parses it before exec. This is the
-# documented seam for env a login shell has but a service doesn't. Prefer an
-# optional ROMP_API_KEY_CMD (a key command run at use time; ROMP_API_KEY_REF is the
-# 1Password shorthand) for API keys fetched at runtime; legacy ANTHROPIC_API_KEY is
-# also supported. The kernel re-reads key source assignments
-# live. Other values are read fresh on every manager (re)start.
+# documented seam for env a login shell has but a service doesn't. ROMP_EXPECTED_AUTH
+# declares which account the sessions bill; an API key never goes here (romp holds none,
+# and a ROMP_API_KEY_CMD, ROMP_API_KEY_REF or ANTHROPIC_API_KEY line stops the kernel at
+# boot with the migration text). Values are read fresh on every manager (re)start.
 # chmod 600 the file; ROMP_SERVICE_ENV_FILE overrides the path (tests).
 SERVICE_ENV_FILE="${ROMP_SERVICE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/romp/service.env}"
 
@@ -91,12 +91,12 @@ _instance_env_block() {
     printf '%s' "$out"
 }
 
-# The kernel resolves the env file's path from ITS OWN environment (kernel/keysource.py reads
+# The kernel resolves the env file's path from ITS OWN environment (kernel/credentials.py reads
 # ROMP_SERVICE_ENV_FILE, else ${XDG_CONFIG_HOME:-~/.config}/romp/service.env) — and the service gets
 # neither variable from the installing shell. So a non-default path baked into EnvironmentFile= below
-# would be read by systemd/launchd and NOT by the kernel's live key read: `romp keyswap` would rewrite
-# a file the kernel never looks at (review find, 2026-09-04). Carry the resolved path across whenever
-# it is not the kernel's own default; a default install writes the same unit it always did.
+# would be read by systemd/launchd and NOT by the kernel's boot check of the same file (review find,
+# 2026-09-04). Carry the resolved path across whenever it is not the kernel's own default; a default
+# install writes the same unit it always did.
 _service_env_override() {
     [[ "$SERVICE_ENV_FILE" != "$HOME/.config/romp/service.env" ]] || return 0
     if [[ "$1" == plist ]]; then
@@ -263,7 +263,7 @@ case "${1:-status}" in
         fi
         echo "  Installed launchd agent: $PLIST"
         echo "  romp-manager now auto-starts at login — just open the browser."
-        echo "  Extra service env (e.g. ROMP_API_KEY_CMD or ROMP_API_KEY_REF): $SERVICE_ENV_FILE"
+        echo "  Service env (ROMP_EXPECTED_AUTH=key|login and service knobs; never an API key): $SERVICE_ENV_FILE"
         echo "      KEY=VALUE lines, chmod 600, picked up at manager (re)start."
         if [[ -x "$ROMP_NODE" ]]; then
             echo
@@ -281,7 +281,7 @@ case "${1:-status}" in
         fi
         echo "  Installed systemd --user service: $UNIT"
         echo "  romp-manager now auto-starts at login — just open the browser."
-        echo "  Extra service env (e.g. ROMP_API_KEY_CMD or ROMP_API_KEY_REF): $SERVICE_ENV_FILE"
+        echo "  Service env (ROMP_EXPECTED_AUTH=key|login and service knobs; never an API key): $SERVICE_ENV_FILE"
         echo "      KEY=VALUE lines, chmod 600, picked up at manager (re)start." ;;
       *) echo "romp-service: unsupported OS '$os'" >&2; exit 1 ;;
     esac ;;

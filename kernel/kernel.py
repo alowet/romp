@@ -1671,17 +1671,14 @@ def _load_model_catalog_cache():
 
 
 def _models_api_credential():
-    """(header, value) for the kernel's OWN credential path, or None when the box has none the kernel
-    may use: the manager-env API key the SDK backend claimed out of os.environ (sdk_backend.work_api_key
-    — the key the judges ride), else an ANTHROPIC_AUTH_TOKEN bearer. A login-only box (Claude Code's
-    OAuth, no key) has no HTTP credential the kernel can borrow: the refresh says so once and serves
-    the seed — the CLI's own alias table still tracks each family's newest there."""
-    fn = getattr(jd, "_WORK_KEY_FN", None)
-    key = ""
-    if fn is not None:
-        key = fn() or ""  # A selected provider's failure must not borrow another credential.
-    else:
-        key = jd._keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "").resolve()
+    """(header, value) for the kernel's OWN credential path, or None when the box has none the kernel may
+    use: the key Claude Code's configured apiKeyHelper prints (credentials.helper_key: the same helper the
+    sessions and judges resolve, run in-process and held in memory for its TTL, never in an environment or a
+    file, 2026-09-08), else an ANTHROPIC_AUTH_TOKEN bearer the kernel claimed at startup. A login-only box (no
+    helper, no bearer) has no HTTP credential the kernel can borrow: the refresh says so once and serves the
+    seed; the CLI's own alias table still tracks each family's newest there. A helper that fails raises its
+    static note, and the caller's loudness owns it."""
+    key = jd._cred.helper_key()
     if key:
         return ("x-api-key", key)
     tok = jd._login_auth_env().get("ANTHROPIC_AUTH_TOKEN", "") or ""
@@ -1731,9 +1728,9 @@ def _refresh_model_catalog(reason, _async=True):
             try:
                 cred = _models_api_credential()
                 if cred is None:
-                    _catalog_status["lastError"] = "no API credential in the kernel's environment"
-                    sys.stderr.write("model catalog (%s): no API credential the kernel can use — serving the "
-                                     "%s list; configure an API key source to refresh it\n"
+                    _catalog_status["lastError"] = "no apiKeyHelper in Claude Code's settings"
+                    sys.stderr.write("model catalog (%s): no apiKeyHelper in Claude Code's settings for the kernel "
+                                     "to run, serving the %s list; configure apiKeyHelper to refresh it\n"
                                      % (reason, _catalog_status["source"]))
                     return
                 rows = _fetch_models_api(cred)
@@ -12052,8 +12049,6 @@ def _spawn_session(name, cwd=None):
     cwd = cwd or _default_create_dir()
     _commands_for_cwd(cwd)   # pre-warm the slash-command list — a new session predicts a composer (the user 2026-08-13)
     env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
-    jd._keysrc.strip_tmux_env(env)   # op's credential stays with the kernel (a tmux launch may predate the backend's
-                                     # claim), and so does the startup key once a reference governs (2026-09-06)
     try:
         subprocess.run([str(BIN / "romp"), "new", "-t", "--detach", name], cwd=cwd, env=env, timeout=25,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -12127,9 +12122,11 @@ def _env_error(env, auth=""):
         if k in _ENV_RESERVED_NAMES:
             return ("env: %s is reserved — romp sets the session's identity env "
                     "(ROMP_SID, ROMP_SESSION_NAME) itself" % k)
-        if (k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
-                and k in jd._keysrc.runtime_reserved_names(auth or "", jd._keysrc.select_source())):
-            return "env: %s is reserved while runtime API key retrieval is configured" % k
+        if k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+            # always, whatever the pick (2026-09-08): romp holds no key, and a session's credential is Claude
+            # Code's own resolution; a value handed to romp here is the leak path this design removed
+            return ("env: %s is reserved: a session's credential is Claude Code's own (its apiKeyHelper or "
+                    "login), never a value handed to romp" % k)
         if not isinstance(v, str):
             return "env: the value for %r must be a string" % (k,)
         if "\x00" in v:
@@ -13884,15 +13881,12 @@ def _sdk_locked():
                 # that, a fresh install whose romp-sdk-setup had bailed looked like romp silently eating
                 # every message (the user 2026-07-28).
             sbmod = SourceFileLoader("romp_sdk_backend", str(HERE / "sdk_backend.py")).load_module()
-            # ONE claimer for the manager env's API key: the backend's work_api_key pops it out of
-            # os.environ (so no session CLI inherits it ambiently), and judges read that same stash
-            # through this wire. Before it lands the key is still in os.environ and judge._work_key
-            # reads it there — the handoff is order-independent, no second claim to race (2026-08-12:
-            # the unwired judges inherited the post-claim env on a login-less host and every call
-            # refused "Not logged in" for 13 hours while the cards sat parked in Working).
-            jd._WORK_KEY_FN = sbmod.work_api_key
-            jd._WORK_KEY_CONFIGURED_FN = lambda: sbmod.work_api_key_source().configured
-            jd._LOGIN_AUTH_ENV_FN = sbmod.startup_auth_env
+            # The backend claims the login tokens out of os.environ once (startup_auth_env), and the judges
+            # read that same stash through this wire for their login-billed children. No key rides here:
+            # romp holds none (credentials.py, 2026-09-08), and every child resolves Claude Code's own
+            # apiKeyHelper itself.
+            jd._LOGIN_AUTH_ENV_FN = sbmod.startup_auth_env   # the login tokens the backend claimed at boot; romp
+            #                                                  holds no key to wire (credentials.py, 2026-09-08)
             # T222: the live model catalog — the last fetched list installs before any picker asks,
             # then the BOOT event refreshes it (async; the key is claimable from here on)
             try:
@@ -14043,26 +14037,12 @@ def _sdk_problem(text):
 
 
 def _auth_key_present():
-    """Whether the manager's environment carried an API key (now held by the SDK backend). A bool on
-    purpose: no fragment of the key — not even a last-4 tail — leaves the kernel process for a label
-    (the user 2026-08-08, who judged even a tail more key than any surface needs; 'API key' is the
-    display everywhere, and host names already tell keys apart in the per-host hover). Cheap: an
-    attribute read off the backend singleton, safe per-push."""
+    """Whether a session with no login pick bills the API key on this box: an apiKeyHelper is configured in
+    Claude Code's settings (the SDK backend's key_available: read, never run). A bool on purpose: romp holds
+    no key since 2026-09-08, and before that no fragment of one ever left the kernel for a label (the user
+    2026-08-08). Cheap: four stats behind the backend singleton, safe per-push."""
     be = _sdk()
-    return bool(getattr(be, "work_key_configured", False)) if be else False
-
-
-def _work_key_fp():
-    """The first 12 hex of the sha256 of the key sessions currently launch on — "" when there is
-    none. The ONE renderable form of a key (keysource.fingerprint): enough for an operator to
-    confirm a keyswap landed and that the kernel reads the same value `romp keyswap` wrote, useless
-    to anyone who reads it. Never a fragment of the key itself — the same rule _auth_key_present
-    keeps for the browser, applied to the terminal."""
-    be = _sdk()
-    try:
-        return getattr(be, "work_key_fp", lambda: "")()
-    except Exception:
-        return ""
+    return bool(getattr(be, "key_available", False)) if be else False
 
 
 def _auth_both():
@@ -14079,9 +14059,8 @@ def _auth_avail():
     not a one-option selector (which is what the earlier disappearing rule was really against, the user
     2026-08-08). login = the credential store names a signed-in account (_claude_account — the same
     authority the usage bars trust; a stale login still fails LOUDLY per session via apiKeySource/authErr
-    rather than being second-guessed here). key = the manager's environment carried ANTHROPIC_API_KEY,
-    now held by the SDK backend (work_api_key claimed it out of os.environ) — a bool only, never any
-    fragment of the key (see _auth_key_present). acct = the login's display name (_claude_account_label),
+    rather than being second-guessed here). key = an apiKeyHelper is configured in Claude Code's settings
+    (read, never run; romp holds no key: see _auth_key_present). acct = the login's display name (_claude_account_label),
     so 'Login' can say WHICH account it means. default = what a fresh session would use absent an
     explicit pick."""
     key = _auth_key_present()
@@ -15355,7 +15334,7 @@ def _revive_session_inner(sid, client=None):
             workdir = cwd if cwd and os.path.isdir(cwd) else os.path.expanduser("~")
             r = subprocess.run([str(BIN / "romp"), "resume", sid, "--name", name, "--detach"],
                                cwd=workdir, capture_output=True, text=True, timeout=40,
-                               env=jd._keysrc.strip_tmux_env(dict(os.environ)))
+                               env=dict(os.environ))
             ok = r.returncode == 0
             if not ok:
                 detail = (r.stderr or r.stdout or "romp exited %d" % r.returncode).strip()[:200]
@@ -25401,12 +25380,7 @@ def _external_sig(sid, path=None):
     meta = _session_meta(path) if path else {}
     cwd = _cwd_of(sid) or (meta.get("cwd") if isinstance(meta, dict) else "") or ""
     paths = [os.path.expanduser("~/.claude.json")]
-    _ks = getattr(jd, "_keysrc", None)                  # the env file's key line decides authBoth (read live since b4ca13e7)
-    if _ks is not None:
-        try:
-            paths.append(_ks.service_env_path())
-        except Exception:
-            pass
+    paths += jd._cred.settings_files(cwd or None)       # the settings files' apiKeyHelper decides authBoth (2026-09-08)
     tops = []
     for d in (os.path.expanduser(cwd) if cwd else "",
               os.path.dirname((meta.get("lastEditPath") if isinstance(meta, dict) else "") or "")):
@@ -32491,7 +32465,7 @@ def build_feed(now, tmux=None):
                             # refused, so the copy blames the judges, not the session (the user 2026-08-12)
                             else {"state": "judgeAuth", "mode": jerr.get("mode"),
                                   "since": jerr.get("t"), "text": jerr.get("note") or "",
-                                  "what": ("romp can't analyze this session — the API key its judges bill is being refused. Fix the key (service.env) or switch which account this session bills"
+                                  "what": ("romp can't analyze this session — the API key its judges bill is being refused. Fix the key behind Claude Code's apiKeyHelper (rotate the vault item) or switch which account this session bills"
                                            if jerr.get("mode") == "key" else
                                            "romp can't analyze this session — the login its judges bill is being refused. Sign in again (claude /login) or switch which account this session bills")} if nid == jauth_top
                             else {"state": perm_state,
@@ -46232,109 +46206,6 @@ class Handler(BaseHTTPRequestHandler):
                 res = _compact_request(who)
                 status = res.pop("_status", 200)
                 return self._send(status, json.dumps(res), "application/json")
-            if u.path == "/keycycle":
-                # `romp keyswap … --cycle <names>` / `--cycle-all` (the user 2026-09-04). The API key
-                # rides a session's LAUNCH environment, so a running CLI keeps the key it started with;
-                # this reconnects the named sessions so they re-present the CURRENT one, each resuming
-                # its own conversation with history intact. It is the alternative to restarting the
-                # manager, which would cut every open turn and kill every subagent under it.
-                #
-                # The kernel takes NO key from the client — not a value, not a path. The swap is a file
-                # the operator (or `romp keyswap`) rewrote; all this route does is make live sessions
-                # re-read it. So the door cannot be used to point a session at a key of the caller's
-                # choosing, and the response carries only a FINGERPRINT (sha256 head) so the caller can
-                # confirm that the kernel reads what it just wrote without either side printing a key.
-                # Body: {"sessions": [<id-or-name>…]} or {"all": true}.
-                try:
-                    b = json.loads(raw_body or b"{}")
-                except Exception:
-                    b = {}
-                b = b if isinstance(b, dict) else {}
-                be = _sdk()
-                if be is None:
-                    return self._send(503, json.dumps({"ok": False, "error": "no SDK backend"}),
-                                      "application/json")
-                try:
-                    source_reader = getattr(be, "_work_key_source", None)
-                    if source_reader is not None:
-                        source = source_reader()
-                        source.validate()
-                        sourcefp = source.fingerprint()
-                        # A status read must never fetch a provider. Its reference identity is
-                        # sufficient to confirm that keyswap and this kernel see the same source.
-                        keyfp = "" if jd._keysrc.is_provider_kind(source.kind) else sourcefp
-                    else:
-                        keyfp = sourcefp = _work_key_fp()  # older backend/test doubles
-                except Exception as e:
-                    return self._send(200, json.dumps({"ok": False,
-                        "error": jd._credential_error_note(e)}), "application/json")
-                expected_source_fp = b.get("expectedSourceFp")
-                if "expectedSourceFp" in b:
-                    if not isinstance(expected_source_fp, str):
-                        return self._send(400, json.dumps({"ok": False,
-                            "error": "expectedSourceFp must be a string"}), "application/json")
-                    if expected_source_fp != sourcefp:
-                        return self._send(409, json.dumps({"ok": False,
-                            "error": "API key source changed; check it before cycling again"}), "application/json")
-                rows = []
-                if b.get("all"):
-                    # every LIVE SDK session: the dormant ones need nothing (their next launch reads
-                    # the file), and cycle_key says so per session rather than guessing here
-                    who_list = [(getattr(s, "name", "") or sid, sid)
-                                for sid, s in list(be.sessions.items())]
-                else:
-                    raw = b.get("sessions") or []
-                    if not isinstance(raw, list):   # a bare string would iterate its CHARACTERS
-                        return self._send(400, json.dumps({"ok": False,
-                                                           "error": "sessions must be a list"}),
-                                          "application/json")
-                    who_list = [(str(w), _sid_of(str(w))) for w in raw if str(w or "").strip()]
-                # Resolve the key ONCE for the whole request (an `op read` may take seconds): every session
-                # below is compared against this fingerprint instead of each retrieving its own — a dozen
-                # quiet sessions used to mean a dozen serial retrievals on this thread, past the CLI's
-                # timeout (review find, 2026-09-05). Only when there is a session to cycle: a status read
-                # retrieves nothing. A failure, or a source that changed while retrieving, is reported on
-                # every row and reconnects nothing — the per-session contract, kept. The reconnects this
-                # schedules still resolve afresh at launch.
-                current_key_fp, resolve_error = None, None
-                probes = {}
-                if source_reader is not None and hasattr(be, "_work_key_and_source"):
-                    for who, sid in who_list:
-                        try:
-                            probes[sid] = be.cycle_key(sid, probe=True)
-                        except Exception as e:
-                            probes[sid] = "error: %s" % jd._credential_error_note(e)
-                needs_key = any(v == "cycle" for v in probes.values())
-                if needs_key:
-                    try:
-                        key, _src = be._work_key_and_source(source)
-                        if not key:
-                            raise jd._keysrc.KeySourceError("API key billing selected but no API key source is configured")
-                        after = source_reader()
-                        after.validate()
-                        if after.fingerprint() != sourcefp:
-                            raise jd._keysrc.KeySourceError("API key source changed during retrieval; check it before cycling again")
-                        current_key_fp = jd._keysrc.fingerprint(key)
-                    except Exception as e:
-                        resolve_error = jd._credential_error_note(e)
-                for who, sid in who_list:
-                    try:
-                        pre = probes.get(sid)
-                        if pre is not None and pre != "cycle":
-                            status = pre                       # unknown / dormant / login / working: needs no key
-                        elif source_reader is not None and hasattr(be, "_work_key_and_source"):
-                            status = be.cycle_key(sid, expected_source_fp=expected_source_fp,
-                                                  current_key_fp=current_key_fp, resolve_error=resolve_error)
-                        else:
-                            status = be.cycle_key(sid)
-                    except Exception as e:
-                        status = "error: %s" % jd._credential_error_note(e)
-                    rows.append({"session": _name_of(sid) or who, "status": status})
-                if any(r["status"] == "cycling" for r in rows):
-                    _push_soon()                      # something changed; a fingerprint READ ({"sessions": []}) did not
-                return self._send(200, json.dumps({"ok": True, "keyFp": keyfp,
-                                                  "sourceFp": sourcefp, "rows": rows}),
-                                  "application/json")
             if u.path in ("/interrupt", "/end"):
                 # Headless session control (2026-07-05): interrupt/end existed ONLY as WS drive ops, so
                 # a session could be FED without a browser (POST /send, postal) but never STOPPED — a
@@ -48822,13 +48693,11 @@ def main():
     # (a federated host) has no ~/.local/bin on PATH — bare `claude` exec-failed silently there.
     os.environ.setdefault("ROMP_CLAUDE_BIN", _claude_bin())
     signal.signal(signal.SIGTERM, _graceful_term)             # drain, don't die mid-flight (see _graceful_term)
-    # op's own credential (a service-account token in service.env) leaves the environment BEFORE anything
-    # is spawned — the bundler, the postal bus, tmux launches, the SDK backend's own claim later is a
-    # no-op re-assert — and the tmux server the manager started with that environment is scrubbed too,
-    # since every pane inherits the SERVER's globals, not the launching client's (review, 2026-09-05).
-    # The scrub lives INSIDE the claim since 2026-09-06 (keysource.claim_op_env): a keyswap to a reference
-    # with no restart makes romp the op consumer mid-run, and the server must be scrubbed then too.
-    jd._keysrc.claim_op_env()
+    # romp holds no API key (credentials.py, 2026-09-08). A retired provider line in service.env, the marker
+    # beside it, or a key in this process's environment stops the kernel HERE, before the bundler, the
+    # postal bus, tmux launches or the SDK backend spawn anything that could inherit it. RuntimeError: the
+    # manager crash-loops the traceback into manager.log until the file is repaired (the serve token's shape).
+    jd._cred.check_boot_environment()
     _ensure_bundles()
     try:                                                      # the diary boot sweep (2026-07-07): migrate every
         _death_boot_pass()                                    # deaths no kernel was up to see: stamp them

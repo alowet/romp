@@ -4804,9 +4804,9 @@ class TimelinePanel {
     catch (e) {
       if (!e || e.code !== 'ENOENT') return unreadable('port record', at('serve-port'), e);
       // no record: a kernel older than this panel writes the token and no port. Resolve the port the way
-      // the CLI does — the environment in cli/keyswap.py _kernel_urls' order (ROMP_KERNEL_PORT, then
+      // the CLI does — the environment in the CLI's order (ROMP_KERNEL_PORT, then
       // ROMP_SERVE_PORT; an empty value is unset), else bin/romp's default, ${ROMP_KERNEL_PORT:-29855}
-      // (keyswap alone goes on to probe two older ports; this panel does not) — and try it; only a
+      // (this panel probes no older ports) — and try it; only a
       // refused connection then reads as down. An unusable override is refused, never silently replaced
       // by the default (_kernel_urls' rule: that replacement hands the token to whatever answers there).
       recorded = false;

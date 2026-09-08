@@ -141,7 +141,7 @@ class JudgeSystemPromptDistrust(unittest.TestCase):
         describing sections that aren't there."""
         seen = {}
         saved = jd._judge_cmd
-        jd._judge_cmd = lambda model, sys_prompt, effort=None: (seen.update(sys=sys_prompt) or ["true"])
+        jd._judge_cmd = lambda model, sys_prompt, effort=None, **kw: (seen.update(sys=sys_prompt) or ["true"])
         try:
             jd._judge_run("sonnet", "BASE PROMPT.", "plain payload", judge="closer")
         finally:

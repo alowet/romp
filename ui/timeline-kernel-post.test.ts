@@ -139,7 +139,7 @@ test("executed: the token rides the header from the kernel's 0600 file, the port
   assert.match(kp, /e\.code !== 'ENOENT'\) return unreadable\('port record'/, "…an unreadable record is said, never read as 'not running'…");
   assert.match(kp, /envVar = pick\('ROMP_KERNEL_PORT'\) \? 'ROMP_KERNEL_PORT' : \(pick\('ROMP_SERVE_PORT'\) \? 'ROMP_SERVE_PORT' : ''\);\s*\n\s*envRaw = envVar \? pick\(envVar\) : '29855';/,
     "…and only a MISSING record falls to the CLI's resolution: the environment in _kernel_urls' order, else bin/romp's one default");
-  assert.match(kp, /bin\/romp's default, \$\{ROMP_KERNEL_PORT:-29855\}/, "the comment names the rule the panel actually mirrors (keyswap alone probes two more ports)");
+  assert.match(kp, /bin\/romp's default, \$\{ROMP_KERNEL_PORT:-29855\}/, "the comment names the rule the panel actually mirrors");
   assert.match(kp, /require\('http'\)\.request\(/, "Node's http, not fetch: no CORS preflight from Obsidian's app:// origin can read as a kernel that is down");
 });
 
@@ -219,7 +219,7 @@ test("executed: no serve-port record → the CLI's port (env, else 29855) is tri
       assert.deepEqual([k.seen[0].method, k.seen[0].url], ["GET", "/healthz"], "the fallback port proves itself first, like the recorded one");
       delete process.env.ROMP_KERNEL_PORT; process.env.ROMP_SERVE_PORT = String(k.port);
       const r2 = await panel()._kernelPost("/flag", { id: SID, flag: "hideFromFeed", value: true });
-      assert.equal(r2.ok, true, "ROMP_SERVE_PORT too, as cli/keyswap.py resolves it");
+      assert.equal(r2.ok, true, "ROMP_SERVE_PORT too, as the CLI resolves it");
       assert.equal(posts(k).length, 2);
     });
   } finally { await k.close(); }

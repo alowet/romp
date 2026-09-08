@@ -2,12 +2,12 @@
 """Per-session billing (the user 2026-08-08): some sessions on the Claude login, some on the API key.
 
 The mechanics under test:
-  * The manager environment's ANTHROPIC_API_KEY is CLAIMED OUT of os.environ once per process
-    (work_api_key) — the SDK's transport hands the CLI this process's env wholesale, so an ambient
-    key would bill every session regardless of its pick. Injection is explicit per session: _options
-    adds the key only when the session's effective auth says so, and a login session launches with a
-    genuinely clean env (the CLI treats even an EMPTY var as key-mode-without-a-key and refuses with
-    "Not logged in" — verified live 2026-08-08 — so removal is the only correct strip).
+  * romp holds no API key (2026-09-08): the key side of the pick is Claude Code's own apiKeyHelper,
+    read from its settings and never run for a launch. _options injects no key for any pick; a LOGIN
+    pick disables the box's helper for that one process through the per-session settings layer
+    ("apiKeyHelper": "", the value the CLI takes as unset, verified on 2.1.257), because in the CLI's
+    precedence the helper outranks every login form. A launched session's environment never carries
+    ANTHROPIC_API_KEY.
   * set_auth mirrors set_effort: persist + authPending + reconnect to apply (auth is connect-time).
   * The CLI's init apiKeySource is compared against what _options actually launched with — a landing
     on the wrong side is a session billing the wrong account, flagged into the problems ring.
@@ -17,9 +17,9 @@ The mechanics under test:
   * An auth failure ("Not logged in", a 401 key) is an ON-YOU api-error class (authErr): retrying
     re-presents the same dead credential forever, so it blocks visibly and is never auto-retried.
   * Availability gates every selector: the kernel offers the choice only when BOTH a signed-in login
-    (_claude_account) and a manager-env key exist — one choice is no choice, the control disappears.
+    (_claude_account) and a configured helper exist — one choice is no choice, the control disappears.
 
-Synthetic sids/paths only; no real key material (the fixture key is an invented string).
+Synthetic sids/paths only; the fixture helper prints an invented string no validator would take for a key.
 """
 import json
 import os
@@ -38,72 +38,93 @@ os.environ.setdefault("ROMP_SERVE_TOKEN", "testtok")
 os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
 os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel's export outranks the XDG floor
 os.environ.pop("ROMP_SUPERVISED", None)  # a romp-managed shell inherits it; these tests stage the unsupervised startup-key case
-# The manager env file is a LIVE key source now (kernel/keysource.py), so floor it too: without this
-# a bare (non-pytest) run of this file on a machine with a real ~/.config/romp/service.env resolves
-# the developer's actual key instead of the fixture's. conftest.py holds the same floor for pytest.
+# The kernel's boot check reads the manager env file, and the helper lives in Claude Code's settings:
+# floor both, so a bare (non-pytest) run on a configured box reads neither the developer's service.env
+# nor their real settings. conftest.py holds the same floors for pytest.
 os.environ["ROMP_SERVICE_ENV_FILE"] = os.path.join(os.environ["XDG_STATE_HOME"], "no-such-service.env")
 os.environ["ROMP_SERVICE_ENV"] = os.environ["ROMP_SERVICE_ENV_FILE"]
-os.environ.pop("ROMP_API_KEY_REF", None)
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()
+for _n in ("ANTHROPIC_API_KEY", "ROMP_API_KEY_CMD", "ROMP_API_KEY_REF"):
+    os.environ.pop(_n, None)
 sb = SourceFileLoader("romp_sdk_backend_auth", os.path.join(BIN, "romp_sdk_backend.py")).load_module()
 km = SourceFileLoader("romp_kernel_auth", os.path.join(BIN, "romp-kernel")).load_module()
 
-FAKE_KEY = "sk-ant-api03-TESTFIXTUREKEYNOTREAL-wxyz"
+FAKE_KEY = "synthetic-helper-output-auth"           # what the fixture helper prints: not key-shaped on purpose
+
+
+def _stage_helper(cfg, out=FAKE_KEY):
+    """A fixture apiKeyHelper in a synthetic user settings.json under `cfg`: read for availability, run
+    only by the kernel-side probes that ask for the key."""
+    script = Path(cfg) / "helper.sh"
+    script.write_text("#!/bin/sh\necho '%s'\n" % out)
+    script.chmod(0o700)
+    (Path(cfg) / "settings.json").write_text(json.dumps({"apiKeyHelper": str(script)}))
 
 
 class _Keyed(unittest.TestCase):
-    """Base: a backend whose process env carried the fixture key (the stash is module-global and
-    once-per-process, so each test re-arms it explicitly and restores the world after)."""
+    """Base: a backend on a box whose Claude Code settings carry a fixture apiKeyHelper (KEY truthy), or
+    none (KEY ""). The settings live in a per-test CLAUDE_CONFIG_DIR, so no test reads a real one."""
 
     KEY = FAKE_KEY
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
-        self._env_before = os.environ.pop("ANTHROPIC_API_KEY", None)
+        self.cfg = tempfile.mkdtemp()
+        self._cfg_before = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = self.cfg
         # These classes pin the UNDECLARED launch-intent comparison: a box-wide declaration in the
         # runner's shell (a deployed box exports it, and kernel-spawned sessions inherit it) must
         # not flip the mismatch pins.
         self._exp_auth_before = os.environ.pop("ROMP_EXPECTED_AUTH", None)
-        self._stash_before = sb._WORK_KEY
-        sb._WORK_KEY = None                       # force a fresh claim from the env
         # the key-account fast-mode probe is a real HTTPS GET — never from a test. Cases that
         # exercise the policy arm their own answers (FastOrgPermissionFollowsBilling).
         self._fetch_before = sb._fetch_key_fast_org
         sb._fetch_key_fast_org = lambda key: None
         sb._FAST_ORG_VERDICTS.clear()
+        sb._cred.forget_helper_key()
         if self.KEY:
-            os.environ["ANTHROPIC_API_KEY"] = self.KEY
+            _stage_helper(self.cfg, self.KEY)
         self.be = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None)
 
     def tearDown(self):
-        sb._WORK_KEY = self._stash_before
         sb._fetch_key_fast_org = self._fetch_before
         sb._FAST_ORG_VERDICTS.clear()
-        os.environ.pop("ANTHROPIC_API_KEY", None)
-        if self._env_before is not None:
-            os.environ["ANTHROPIC_API_KEY"] = self._env_before
+        sb._cred.forget_helper_key()
+        os.environ["CLAUDE_CONFIG_DIR"] = self._cfg_before
         os.environ.pop("ROMP_EXPECTED_AUTH", None)
         if self._exp_auth_before is not None:
             os.environ["ROMP_EXPECTED_AUTH"] = self._exp_auth_before
+
+    def _no_helper(self):
+        """Remove the fixture helper: the box now has no key side."""
+        try:
+            os.unlink(os.path.join(self.cfg, "settings.json"))
+        except OSError:
+            pass
+        sb._cred.forget_helper_key()
+
+    def _settings_of(self, kw):
+        """The per-session settings payload a launch handed the CLI, {} when none."""
+        p = kw.get("settings")
+        return json.loads(Path(p).read_text()) if p else {}
 
     def _sess(self, n=1, **reg):
         return sb.SdkSession(self.be, {"sid": "11111111-2222-3333-4444-%012d" % n,
                                        "name": "s%d" % n, "cwd": "/tmp", **reg})
 
 
-class WorkKeyStash(_Keyed):
-    def test_the_key_is_claimed_out_of_the_environment_exactly_once(self):
-        self.assertEqual(self.be.work_key, FAKE_KEY)
-        self.assertNotIn("ANTHROPIC_API_KEY", os.environ,
-                         "an ambient key would bill EVERY session — the transport merges options.env "
-                         "over this process's env, so the strip must happen here")
-        # a re-constructed backend (the WS handler's lazy construction, tests) still finds it
-        be2 = sb.SdkBackend(tempfile.mkdtemp(), "/bin/true", lambda *a, **k: None)
-        self.assertEqual(be2.work_key, FAKE_KEY)
+class HelperAvailability(_Keyed):
+    """The key side exists exactly when Claude Code's settings carry a helper; romp never holds the value."""
 
-    def test_an_empty_var_counts_as_no_key(self):
-        sb._WORK_KEY = None
-        os.environ["ANTHROPIC_API_KEY"] = ""
-        self.assertEqual(sb.work_api_key(), "")
+    def test_a_configured_helper_makes_the_key_side_available_without_running_it(self):
+        self.assertTrue(self.be.key_available)
+        self.assertNotIn("ANTHROPIC_API_KEY", os.environ, "no key ever enters this process's environment")
+        self.assertFalse(hasattr(self.be, "work_key"), "the backend holds no key attribute at all")
+
+    def test_no_helper_means_no_key_side(self):
+        self._no_helper()
+        self.assertFalse(self.be.key_available)
+        self.assertEqual(self.be.default_auth({}), "login")
 
 
 class EffectiveAuth(_Keyed):
@@ -153,12 +174,18 @@ class _OptionsHarness(_Keyed):
 
 
 class OptionsInjection(_OptionsHarness):
-    def test_a_key_session_gets_the_key_and_a_login_session_a_clean_env(self):
+    def test_no_pick_ever_puts_a_key_in_the_environment_and_a_login_pick_disables_the_helper(self):
         kw = self._options_kw(self._sess(1, auth="key"))
-        self.assertEqual(kw["env"].get("ANTHROPIC_API_KEY"), FAKE_KEY)
+        self.assertNotIn("ANTHROPIC_API_KEY", kw["env"], "a key pick launches plain: the CLI runs the helper itself")
+        self.assertNotIn("apiKeyHelper", self._settings_of(kw), "and nothing disables it")
         kw2 = self._options_kw(self._sess(2, auth="login"))
-        self.assertNotIn("ANTHROPIC_API_KEY", kw2["env"],
-                         "removal, not blanking: an empty var reads as key-mode-without-a-key")
+        self.assertNotIn("ANTHROPIC_API_KEY", kw2["env"])
+        self.assertEqual(self._settings_of(kw2).get("apiKeyHelper"), "",
+                         "the login pick disables the box's helper for this one process (the CLI's precedence "
+                         "puts the helper above every login form)")
+        kw3 = self._options_kw(self._sess(3))
+        self.assertNotIn("ANTHROPIC_API_KEY", kw3["env"], "unpicked: the CLI decides, romp injects nothing")
+        self.assertNotIn("apiKeyHelper", self._settings_of(kw3))
 
     def test_options_records_what_it_launched_with_for_the_init_check(self):
         s = self._sess(3, auth="key")
@@ -168,21 +195,15 @@ class OptionsInjection(_OptionsHarness):
         self._options_kw(s2)
         self.assertFalse(s2._launched_keyed)
 
-    def test_a_key_pick_with_no_key_launches_on_claude_codes_own_credential(self):
-        """Until 2026-09-07 this refused the launch (#932: an explicit key pick must never silently bill
-        the login). The maintainer's direction since: given no key, romp injects nothing and defers to
-        Claude Code's own credential resolution (its apiKeyHelper or its login) — the pre-#932 launch, so
-        a box that never handed romp a key keeps working — and says so once, as a problem row."""
-        self.be.work_key = ""
+    def test_a_key_pick_with_no_helper_anywhere_leaves_the_cli_to_decide(self):
+        """An explicit key pick on a box with no helper launches plain and records that it MEANT the key
+        (_launched_unkeyed_pick), so a login landing rings in the per-init check as the pick contradicted."""
+        self._no_helper()
         s = self._sess(3, auth="key")
         kw = self._options_kw(s)
-        self.assertNotIn("ANTHROPIC_API_KEY", kw["env"], "nothing injected — not an empty var either")
+        self.assertNotIn("ANTHROPIC_API_KEY", kw["env"], "nothing injected, not an empty var either")
         self.assertFalse(s._launched_keyed)
         self.assertTrue(s._launched_unkeyed_pick)
-        self._options_kw(self._sess(4, auth="key"))
-        rows = [p["text"] for p in self.be.problems(20) if "Claude Code's own credential" in p["text"]]
-        self.assertEqual(len(rows), 1, "said once per process")
-        self.assertIn(sb._keysrc.service_env_path(), rows[0])
 
 
 class FastOrgPermissionFollowsBilling(_OptionsHarness):
@@ -193,15 +214,24 @@ class FastOrgPermissionFollowsBilling(_OptionsHarness):
     skips the CLI's wrong-account probe, a disabled one forces fast mode off."""
 
     def _env(self, answer, n=1):
-        sb._fetch_key_fast_org = lambda key: answer
+        self.asked = []
+        sb._fetch_key_fast_org = lambda key: self.asked.append(key) or answer
+        sb._cred.forget_helper_key()
         return self._options_kw(self._sess(n, auth="key"))["env"]
 
     def test_an_enabled_key_account_skips_the_clis_wrong_account_probe(self):
         env = self._env(True)
         self.assertEqual(env.get("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK"), "1")
         self.assertNotIn("CLAUDE_CODE_DISABLE_FAST_MODE", env)
-        self.assertEqual(env.get("ANTHROPIC_API_KEY"), FAKE_KEY,
-                         "the skip rides WITH the key — same connect, same account")
+        self.assertEqual(self.asked, [FAKE_KEY], "the probe asks with the helper's own output, run in-process")
+        self.assertNotIn("ANTHROPIC_API_KEY", env, "and the value never reaches the session's environment")
+
+    def test_no_helper_means_no_probe_and_the_cli_default(self):
+        self._no_helper()
+        env = self._env(True)
+        self.assertEqual(self.asked, [], "nothing to ask with")
+        self.assertNotIn("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK", env)
+        self.assertNotIn("CLAUDE_CODE_DISABLE_FAST_MODE", env)
 
     def test_a_disabled_key_account_forces_fast_mode_off(self):
         env = self._env(False)
@@ -268,12 +298,12 @@ class SetAuth(_Keyed):
         sid = self.be.spawn("n", "/tmp", auth="key")
         self.assertEqual(sb.read_reg(self.be.state_dir, sid)["auth"], "key")
 
-    def test_refuses_junk_and_a_key_pick_on_a_keyless_manager(self):
+    def test_refuses_junk_and_a_key_pick_on_a_helperless_box(self):
         sid = self.be.spawn("n", "/tmp")
         self.assertFalse(self.be.set_auth(sid, "credit-card"))
-        self.be.work_key = ""
+        self._no_helper()
         self.assertFalse(self.be.set_auth(sid, "key"),
-                         "nothing to inject — refuse rather than half-apply; the UI never offers it")
+                         "no helper on this box: refuse rather than half-apply; the UI never offers it")
 
     def test_a_live_session_reconnects_and_gets_the_ack_chip(self):
         sid = self.be.spawn("n", "/tmp")
@@ -437,7 +467,7 @@ class Availability(unittest.TestCase):
         km._sdk, km._claude_account, km._claude_account_label = self.real_sdk, self.real_acct, self.real_label
 
     def _world(self, key, acct, label="user@example.com"):
-        km._sdk = lambda: type("B", (), {"work_key_configured": bool(key)})()
+        km._sdk = lambda: type("B", (), {"key_available": bool(key)})()
         km._claude_account = lambda: acct
         km._claude_account_label = lambda: (label if acct else "")
 
@@ -528,8 +558,8 @@ class SwitchCycleTruthTable(_Keyed):
         sb.write_reg(Path(self.d), sid, {"sid": sid, "name": "misc", "cwd": "/tmp"})
         s = self._sess(41, sid=sid)
         self.be.sessions[sid] = s
-        # rest: keyed (the env key), confirmed by an init
-        self.be._note_auth_source(s, "ANTHROPIC_API_KEY")
+        # rest: keyed (the box's helper), confirmed by an init
+        self.be._note_auth_source(s, "apiKeyHelper")
         self.assertEqual(self._state(s), ("key", "key", False), "rest: confirmed key, row says API key")
         # SWITCH key->login: the pending window renders as pending — never applied fact
         self.assertTrue(self.be.set_auth(sid, "login"))
@@ -542,7 +572,7 @@ class SwitchCycleTruthTable(_Keyed):
         # SWITCH login->key, landing shape 2: the CLI lands on the WRONG side (an apiKeyHelper world:
         # picked login again later, but a helper re-injects the key) — the contradiction is VISIBLE
         self.assertTrue(self.be.set_auth(sid, "key"))
-        s._launched_keyed = True                              # the applying reconnect injected the key (_options)
+        s._launched_keyed = True                              # the applying reconnect meant the key (_options)
         s._auth_pending = ""
         self.be._note_auth_source(s, "none")                  # picked key; the CLI reports login
         auth, live, pending = self._state(s)
@@ -552,12 +582,12 @@ class SwitchCycleTruthTable(_Keyed):
                         "…and the problems ring names it")
 
     def test_the_cycle_on_a_login_less_box(self):
-        self.be.login_ok = lambda: False                     # THIS devbox's real shape (env-key-only)
+        self.be.login_ok = lambda: False                     # a helper-only box with no login
         sid = "11111111-2222-3333-4444-00000000t125"
         sb.write_reg(Path(self.d), sid, {"sid": sid, "name": "misc2", "cwd": "/tmp"})
         s = self._sess(42, sid=sid)
         self.be.sessions[sid] = s
-        self.be._note_auth_source(s, "ANTHROPIC_API_KEY")
+        self.be._note_auth_source(s, "apiKeyHelper")
         self.assertFalse(self.be.set_auth(sid, "login"),
                          "the pick the box cannot apply refuses AT PICK TIME — never accept-then-fail")
         self.assertEqual(self._state(s), ("key", "key", False),

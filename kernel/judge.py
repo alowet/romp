@@ -58,8 +58,8 @@ ThreadPoolExecutor = _TimedPool      # every pool below is a timed one (see abov
 
 HERE = Path(__file__).resolve().parent
 em = SourceFileLoader("romp_event_model", str(HERE / "event_model.py")).load_module()
-_keysrc = sys.modules.get("romp_keysource") or SourceFileLoader(
-    "romp_keysource", str(HERE / "keysource.py")).load_module()
+_cred = sys.modules.get("romp_credentials") or SourceFileLoader(
+    "romp_credentials", str(HERE / "credentials.py")).load_module()
 
 HOME     = Path.home()
 STATE    = Path(os.environ.get("ROMP_STATE_DIR")   # per-kernel state root override (plans/multi-kernel.md)
@@ -772,7 +772,7 @@ UNTRUSTED_SYS = (
     "prompt and from text outside the marked sections.")
 
 
-def _judge_cmd(model, sys_prompt, effort=None):
+def _judge_cmd(model, sys_prompt, effort=None, auth=None):
     """The `claude -p` argv for ONE judge call, isolated so the model sees ONLY its own prompt. Three
     flags do it (verified by token count: a probe call drops 8334 -> ~165 input tokens):
       --system-prompt (REPLACE, not --append) — drops Claude Code's static base prompt (~6k tokens);
@@ -787,6 +787,12 @@ def _judge_cmd(model, sys_prompt, effort=None):
            "--output-format", "json"]                 # stdout = {"result", "usage", "duration_ms", "total_cost_usd"}
     if effort:
         cmd += ["--effort", effort]
+    if auth == "login":
+        # A login-billed call must not bill the key (2026-09-08): in the CLI's precedence apiKeyHelper outranks
+        # every login form, so the per-call settings layer disables the helper. The empty string is the value
+        # the CLI takes as unset (null falls through to the settings files; verified on 2.1.257), the same
+        # lever a login-picked session's launch uses (sdk_backend.flag_settings_path).
+        cmd += ["--settings", '{"apiKeyHelper": ""}']
     return cmd
 
 
@@ -1073,61 +1079,30 @@ def _log_judge_usage(judge, tier, model, fsid, wrap, sent=None, recv=None):
         pass
 
 
-_WORK_KEY_FN = None   # the kernel wires this to sdk_backend.work_api_key when it loads that module
-                      # (_sdk_locked), so judges read the SAME once-per-process stash sessions bill from
-_WORK_KEY_CONFIGURED_FN = None  # metadata only; never retrieve a secret to decide billing
-_LOGIN_AUTH_ENV_FN = None      # login tokens claimed out of the manager's ambient environment
+_LOGIN_AUTH_ENV_FN = None      # login tokens claimed out of the manager's ambient environment: the kernel
+                               # wires sdk_backend.startup_auth_env; standalone reads the environment
 
 
-def _work_key():
-    """The manager-environment API key available for key-mode judge billing — READ, never claimed.
-    In the kernel process the SDK backend is the one claimer (work_api_key pops os.environ so its
-    transport can't hand session CLIs an ambient key), and the kernel wires _WORK_KEY_FN to that
-    stash; until that wire lands — or standalone (romp-judge --once/--test, tests) — the key is
-    still sitting in os.environ and the plain read returns the same value. Neither path mutates the
-    environment: _judge_env strips the ambient var from every child env itself, and a second claimer
-    would only race the backend's pop (whoever popped second would stash "" — sessions or judges
-    losing the key on thread timing). This is what broke on 2026-08-12: judges inherited the
-    post-claim environment on a host with no login, and every call refused "Not logged in" for
-    13 hours (~53k errors) while the cards sat parked in Working."""
-    if _WORK_KEY_FN is not None:
-        return _WORK_KEY_FN() or ""
-    return _keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "").resolve()
-
-
-def _work_key_configured():
-    if _WORK_KEY_CONFIGURED_FN is not None:
-        return bool(_WORK_KEY_CONFIGURED_FN())
-    # Compatibility for standalone callers wiring only the original callback.
-    if _WORK_KEY_FN is not None:
-        return bool(_work_key())
-    return _keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "").configured
-
-
-def _key_source_unconfigured():
-    """True only when the selected key source is KNOWN to be unconfigured without retrieving anything: the
-    kernel's configured wire when it is up; a standalone caller wiring the key callback alone leaves the
-    verdict to the retrieval (as before); no wire at all reads the source descriptor. Never _work_key():
-    a resolve here would run outside the per-pass gate."""
-    if _WORK_KEY_CONFIGURED_FN is not None:
-        return not _WORK_KEY_CONFIGURED_FN()
-    if _WORK_KEY_FN is not None:
+def _key_available():
+    """Whether an unpicked judge call bills the key: an apiKeyHelper is configured in Claude Code's settings
+    for this process's working directory (credentials.api_key_helper: read, never run). romp holds no key of
+    its own since 2026-09-08 (the user, after a contributor PR's test printed a key from a session's
+    environment); the child resolves the helper itself. An unreadable settings file reads as no helper here;
+    the SDK backend says so once in its problem ring."""
+    try:
+        return _cred.key_available()
+    except _cred.CredentialError:
         return False
-    return not _keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "").configured
-
-
-_UNKEYED_SAID = set()   # the key-billed-calls-run-on-the-CLI's-own-credential line: said once per process
 
 
 def _login_auth_env():
     if _LOGIN_AUTH_ENV_FN is not None:
         return _LOGIN_AUTH_ENV_FN()
-    return {k: os.environ[k] for k in ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
-            if os.environ.get(k)}
+    return {k: os.environ[k] for k in _cred.LOGIN_TOKEN_VARS if os.environ.get(k)}
 
 
 def _credential_error_note(exc):
-    return str(exc) if isinstance(exc, _keysrc.KeySourceError) else "API credential source failed"
+    return str(exc) if isinstance(exc, _cred.CredentialError) else "API credential source failed"
 
 
 def _judge_auth(fsid):
@@ -1136,8 +1111,8 @@ def _judge_auth(fsid):
     never a silent fall to the other one — a judge quietly billing the login on a session the user
     put on the key is the same wrong-account failure the per-session picker exists to prevent).
     Same resolution as the picker (sdk_backend default_auth / effective_auth), read from the same
-    registry file: an explicit 'login' pick → login; anything else → the key when the environment
-    carries one, else login. A call with no session (fleet-level rows) takes the same default a
+    registry file: an explicit 'login' pick → login; anything else → the key when Claude Code's
+    settings carry an apiKeyHelper, else login. A call with no session (fleet-level rows) takes the same default a
     fresh session would."""
     a = ""
     if fsid:
@@ -1147,7 +1122,7 @@ def _judge_auth(fsid):
             a = ""
     if a in ("login", "key"):
         return a
-    return "key" if _work_key_configured() else "login"
+    return "key" if _key_available() else "login"
 
 
 def _is_auth_error(text):
@@ -1366,16 +1341,18 @@ def _judge_env(tier, auth="login", model=None):
     serial), so this is the captioner's biggest single lever — and it's what makes any future batching
     latency-safe.
 
-    `auth` is the call's resolved billing (_judge_auth). The ambient ANTHROPIC_API_KEY is stripped
-    unconditionally — in the kernel process the SDK backend already claimed it out of os.environ, and
-    standalone the var is still there, where a login-mode child would otherwise bill the key by mere
-    inheritance — and injected back EXPLICITLY for a key-mode call only. Removal, not blanking, same
-    rule as sdk_backend._options: the CLI treats even an empty var as key-mode-without-a-key and
-    refuses with "Not logged in"."""
+    `auth` is the call's resolved billing (_judge_auth). The three credential names are stripped
+    unconditionally, and a KEY-billed call injects nothing back (2026-09-08: romp holds no key; the child
+    resolves Claude Code's apiKeyHelper itself, and the first pass after boot runs exactly like every later
+    one). A LOGIN-billed call gets the claimed login tokens back and, in _judge_cmd, the helper suppression.
+    Removal, not blanking: the CLI treats even an empty var as key-mode-without-a-key and refuses with
+    "Not logged in"."""
     env = dict(os.environ)
     for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
         env.pop(k, None)                             # billing is an explicit choice per call
-    _keysrc.strip_op_env(env)                        # op's own credential never rides a judge child (2026-09-05)
+    for k in list(env):                              # the 1Password CLI's own names never ride a judge child
+        if k in _cred.OP_ENV_NAMES or k.startswith(_cred.OP_ENV_PREFIX):
+            env.pop(k, None)
     if auth == "login":
         env.update(_login_auth_env())
     for k in ("TMUX", "TMUX_PANE"):
@@ -1399,74 +1376,7 @@ def _judge_env(tier, auth="login", model=None):
         # where the CLI drops it (Fable, Mythos, strangers) it is a harmless no-op and `--effort` in
         # _judge_run is the lever that lands. Both ride together; neither can hurt the other.
         env["MAX_THINKING_TOKENS"] = "0"
-    if auth == "key":
-        # No source configured at all (a supervised box whose env file carries no key line: the session's
-        # `key` pick outlived the line) is decided BEFORE any retrieval, so a retrieval FAILURE keeps its own
-        # gated path below. The child then runs on Claude Code's own credential — its apiKeyHelper or its
-        # login — the shape every judge had before #932's hard error, which logged err=auth on every pass
-        # and took a board down (the maintainer's direction, 2026-09-07: given no key, romp defers to
-        # Claude Code's default); said once per process. The login tokens ride along exactly as for a
-        # login call (the session half restores them the same way): before #932 the child simply
-        # inherited the manager's, and a box whose login lives in those tokens would otherwise hand the
-        # judge no credential at all and floor its cards with an auth-down mark.
-        if _key_source_unconfigured():
-            env.update(_login_auth_env())
-            if not _UNKEYED_SAID:
-                _UNKEYED_SAID.add(True)
-                sys.stderr.write("romp-judge: key-billed judge calls run on Claude Code's own credential — "
-                                 "romp holds no key source\n")
-            return env
-        wk = _resolve_work_key_gated()               # resolve only at the call boundary — once per pass on failure
-        if not wk:
-            raise _keysrc.KeySourceError("No API key source is configured for this judge call")
-        env["ANTHROPIC_API_KEY"] = wk
     return env
-
-
-# A failed retrieval is remembered for the rest of the PASS it happened in, keyed on the source's
-# identity: the next key-billed call in that pass fails at once with the same note instead of spawning
-# `op` and waiting out its 15 s timeout again (six judge threads, hundreds of calls a pass — review
-# find, 2026-09-05). The deciding events that retry are exact, not timed: the source changes (another
-# fingerprint), or a new pass begins (begin_pass_frame). Standalone callers with no pass frame retry
-# every call, as before.
-_KEY_GATE = {"fp": None, "gen": None, "note": ""}
-_PASS_GEN = [0]
-_KEY_GATE_CV = threading.Condition()                 # guards _KEY_GATE and the in-flight first retrieval of a pass
-_KEY_INFLIGHT = [None]                               # (fp, gen) being retrieved right now, or None
-
-
-def _resolve_work_key_gated():
-    try:
-        src = _keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "")
-        fp = src.fingerprint() if src.kind != "error" else "error"
-    except Exception:
-        fp = None
-    gen = _PASS_GEN[0]
-    key = (fp, gen) if (fp is not None and gen) else None
-    if key is None:
-        return _work_key()                           # no pass frame (standalone) or no source identity: as before
-    with _KEY_GATE_CV:
-        # The first wave: six judge threads reach a pass's first key call together, and every one of them
-        # would spawn `op` and wait out its own timeout. The first to arrive retrieves; the others wait for
-        # its verdict — then raise the remembered failure, or retrieve for themselves (no value is shared).
-        while _KEY_INFLIGHT[0] == key:
-            _KEY_GATE_CV.wait(timeout=_keysrc.KEY_CMD_TIMEOUT + 1)
-        if _KEY_GATE["fp"] == fp and _KEY_GATE["gen"] == gen:
-            raise _keysrc.KeySourceError(_KEY_GATE["note"] or "API credential retrieval failed earlier in this pass")
-        first = _KEY_INFLIGHT[0] is None
-        if first:
-            _KEY_INFLIGHT[0] = key
-    try:
-        return _work_key()
-    except _keysrc.KeySourceError as e:
-        with _KEY_GATE_CV:
-            _KEY_GATE.update(fp=fp, gen=gen, note=str(e))
-        raise
-    finally:
-        if first:
-            with _KEY_GATE_CV:
-                _KEY_INFLIGHT[0] = None
-                _KEY_GATE_CV.notify_all()
 
 
 _RATE_GATE_LOGGED = {}                   # bucket -> resets_at already announced (one line per window)
@@ -1715,7 +1625,7 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
             _judge_ctx.paused = True
             return ""
         try:
-            p = subprocess.run(_judge_cmd(model, sys_prompt, effort), input=user,
+            p = subprocess.run(_judge_cmd(model, sys_prompt, effort, auth=auth), input=user,
                                capture_output=True, text=True, cwd=JUDGE_SCRATCH, env=env,
                                timeout=CALL_ALARM_S + 5)
         except Exception as e:
@@ -2431,7 +2341,6 @@ def begin_pass_frame():
         if _frame is not None:
             return False                             # a joiner shares the creator's pass — and its key gate
         _frame = {"parses": {}, "keys": {}}
-        _PASS_GEN[0] += 1                            # a CREATED pass is the event that lets a failed key retrieval retry
         return True
 
 
