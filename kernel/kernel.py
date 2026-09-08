@@ -22934,6 +22934,44 @@ WIRE_TAIL = 250                                  # events shipped on a full chat
 WIRE_CHUNK = 250                                 # events per loadOlder (chatHead) response
 
 
+# ── an EMPTY chat build never describes a session that has content (T249b, the user 2026-09-07) ─────────────
+# build_session parses whatever path the session resolves to; a path that is unreadable for one cycle — a resumed
+# SDK session whose registry already names its new leaf while the CLI has not created the file, a transcript moved
+# aside by hand — parses to ZERO events, and that build went out as a full {type:"session"} frame with events: [].
+# The pane took it as the new transcript (a placeholder flash), and the content frame that followed a cycle later
+# was a "first build" that re-landed the reader through the full-show route: the recorded scroll snap (T249). An
+# empty build for a session whose previous build had events is NOT new information about the conversation — it
+# is a read that failed — so the previous build stands until content returns, and the episode is said once on
+# stderr (fail loudly, never degrade silently). A session that genuinely has nothing (a fresh one, a never-run
+# SDK session) has no previous events and is untouched; a /clear is never events-empty (its boundary card).
+_EMPTY_BUILD_NOTED = set()      # sids inside an empty-build episode (one stderr line per episode)
+
+
+def _empty_build_regresses(m, prev_events):
+    """Would sending build `m` blank a session the clients hold WITH content? True when the build carries no events
+    while the previous push's build for the sid did."""
+    return not (m.get("events") or []) and bool(prev_events)
+
+
+def _note_empty_build(sid, path, n_prev):
+    """One stderr line per episode naming the sid, what the previous build held and whether the transcript path is
+    even there; a romp-perf `chatempty` line every time, for the harness/perf log."""
+    sid = str(sid or "")
+    _perf("chatempty", sid=sid[:8], prev=int(n_prev or 0))
+    if sid in _EMPTY_BUILD_NOTED:
+        return
+    _EMPTY_BUILD_NOTED.add(sid)
+    exists = bool(path) and os.path.exists(str(path))
+    sys.stderr.write("romp-kernel: the chat build for %s came back EMPTY while its previous build had %d events "
+                     "(transcript %s) — keeping the previous build until content returns; an empty frame would blank "
+                     "the pane and re-land the reader\n"
+                     % (sid[:8], int(n_prev or 0), "present" if exists else "missing at %s" % path))
+
+
+def _clear_empty_build_note(sid):
+    _EMPTY_BUILD_NOTED.discard(str(sid or ""))
+
+
 def _chat_diff(prev, cur):
     """First index where the freshly-built events `cur` differ from the previously-sent `prev` — i.e. the
     suffix to re-send. Append-only growth returns len(prev) (just the new tail); a tool output filling an
@@ -34497,6 +34535,16 @@ def _push(targets, connect=False, tmux=None):
                               why=_chat_fold_last_info().get("why", ""))         # the demote reason on a full build
                 if not m:
                     continue
+                if _empty_build_regresses(m, _prev_chat_events.get(m["id"])):
+                    # a failed read, not a conversation that emptied (see _empty_build_regresses): the last cached
+                    # build stands in — same events, so the diff below finds nothing to send — or, with nothing
+                    # cached, this cycle sends nothing for the sid; the file's return busts the stat key and rebuilds
+                    _note_empty_build(s["sid"], s.get("path"), len(_prev_chat_events.get(m["id"]) or ()))
+                    if hit is None:
+                        continue
+                    m, ms = hit[1], hit[2]
+                else:
+                    _clear_empty_build_note(s["sid"])
                 _note_chat_divergence(s["sid"], m.get("name") or "",
                                       ((m.get("status") or {}).get("state") or ""),
                                       ((tmux.get(s["sid"]) or {}).get("state") or ""), now)
@@ -34754,6 +34802,10 @@ def _push_session_now(sid):
         m = build_session(sid, now, tmux)
         if not m:
             return
+        if _empty_build_regresses(m, _prev_chat_events.get(sid)):
+            _note_empty_build(sid, next((s.get("path") for s in chat_list if s["sid"] == sid), None),
+                              len(_prev_chat_events.get(sid) or ()))
+            return                                   # the periodic pusher owns the sid until content returns
         ms = None                                    # lazy: the first full send materializes it, the rest reuse
         for c in targets:
             _send_client(c, ("taborder",), {"type": "tabOrder", "order": tab_order, "tabs": tab_meta, "views": _views_client()})
