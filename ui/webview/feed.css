@@ -431,7 +431,7 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
    without it, consecutive folded threads jam into one unreadable stack of names. */
 .feed-sess-head.folded { margin-bottom: 7px; }
 /* the session-wide CLEAR (the user 2026-09-08, twice): it IS the card's Clear (.fdismiss: the outline, the
-   0.72em size, the accent hover), built by the same builder; this class carries its POSITION only — far
+   0.72em size, the accent hover), built by the same builder, reading "Clear all" (T271); this class carries its POSITION only — far
    right of the header row, before the full-width process list that wraps below. No size, colour, border
    or hover of its own: any of those here would be a second button that drifts. */
 .feed-sess-clear { flex: none; margin-left: auto; }
@@ -483,14 +483,15 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 .fitem.ask, .fitem.fgroup { border-color: rgba(var(--card-r, 255), var(--card-g, 255), var(--card-b, 255), 0.5); }
 .fitem.ask.pinned  { border-color: rgba(var(--card-r, 255), var(--card-g, 255), var(--card-b, 255), 0.85); }   /* pinned: bolded, persistent */
 /* effective focus: full-opacity same colour, thickened a touch — plus the hover lift (the user 2026-07-15).
-   The extra 1px is the BORDER growing with a compensating negative margin, ONE paint with the card body
-   (T221, the user 2026-09-01: the old 1px box-shadow ring was a second paint laid against the border, and
-   the contact between two adjacent paints is renderer- and zoom-dependent — their Mac browser opened a
-   1px dark seam between ring and border across the whole top edge; a single paint cannot seam at any
-   zoom or radius). Under the global border-box sizing with auto width/height, border 2→3px plus
-   margin -1px grows the OUTER edge by exactly the 1px the ring occupied while the flow position and the
-   content box stay byte-identical — verified by rect comparison, so no layout-shifting border change
-   (the original rule's own constraint, kept by construction).
+   The bolding is PAINT ONLY: the same 2px border at the identity colour's full alpha (rest is 0.5α), plus
+   the lifted shadow. No width change and no ring. History, so neither comes back: the first cut drew a 1px
+   box-shadow ring against the border, a second paint whose contact line is renderer- and zoom-dependent —
+   the user's Mac browser opened a dark seam between ring and border (T221, 2026-09-01); the second cut grew
+   the border 2→3px with a compensating margin -1px, which keeps the CSS content box byte-identical but not
+   the RENDERED text — on the user's display the hovered card's body text moved 1px right and down and the
+   card below dropped 1px (T270, 2026-09-08: a fractional border/margin pair snaps to device pixels
+   differently from the rest state). A colour change alone touches no layout property, so nothing inside or
+   below can move, at any zoom.
    A CROSS-PANE hover (a chat rail dot, a timeline bar) lands on this same rule rather than wearing a look
    of its own (the user 2026-07-23): it used to paint the neutral white .dot-hl outline, which read as a
    different kind of event from hovering the card with the mouse when it means exactly the same thing.
@@ -498,7 +499,6 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
    specificity, so a pinned card still bolds to full when another pane hovers it. */
 .fitem.ask.focused, .fitem.ask.dot-hl, .fitem.fgroup.dot-hl {
   border-color: rgb(var(--card-r, 255), var(--card-g, 255), var(--card-b, 255));
-  border-width: 3px; margin: -1px;
   box-shadow: 0 2px 7px rgba(0, 0, 0, 0.30);
 }
 
