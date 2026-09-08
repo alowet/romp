@@ -12,7 +12,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
 import { planStrip, parseTabGroups, headWords } from "./tab-groups";
-import { tabStateClass, sectionPip, sectionPipMembers, sectionPipTitle } from "./tab-state";
+import { tabStateClass, tabDotClass, sectionPip, sectionPipMembers, sectionPipTitle } from "./tab-state";
 import type { TagUnion } from "./session-views";
 
 const requireCjs = createRequire(__filename);
@@ -62,7 +62,7 @@ type Hooks = {
   phone: boolean;             // the phone layout: the plan is the flat strip there
   heads: HeadCall[];          // every group header the paint minted, in order
   planStrip: typeof planStrip; parseTabGroups: typeof parseTabGroups; headWords: typeof headWords;
-  tabStateClass: typeof tabStateClass; sectionPip: typeof sectionPip; sectionPipMembers: typeof sectionPipMembers; sectionPipTitle: typeof sectionPipTitle;
+  tabStateClass: typeof tabStateClass; tabDotClass: typeof tabDotClass; sectionPip: typeof sectionPip; sectionPipMembers: typeof sectionPipMembers; sectionPipTitle: typeof sectionPipTitle;
 };
 type Api = {
   renderTabs: () => void; sig: () => string; folded: () => Set<string>;
@@ -97,7 +97,7 @@ function lift(): (hooks: Hooks) => Api {
     const readTabGroups = (u) => H.parseTabGroups(H.groupsRaw, u);
     const tabGroups = () => readTabGroups(H.unions); const writeTabGroups = () => {};
     const phoneLayout = () => H.phone;
-    const tabStateClass = H.tabStateClass, sectionPip = H.sectionPip, sectionPipMembers = H.sectionPipMembers, sectionPipTitle = H.sectionPipTitle;
+    const tabStateClass = H.tabStateClass, tabDotClass = H.tabDotClass, sectionPip = H.sectionPip, sectionPipMembers = H.sectionPipMembers, sectionPipTitle = H.sectionPipTitle;   // tabDotClass: the state-dot slot every tab carries (the tab-strip fix, 2026-09-08)
     function makeGroupHead(sec, folded, active, hidden) {
       const h = el("div", "tab-group-head" + (folded ? " collapsed" : ""));
       h.dataset.group = String(sec.name);
@@ -139,7 +139,7 @@ function world(): { H: Hooks; api: Api; sessions: Map<string, any>; tabMeta: Map
   const H: Hooks = { FakeEl, bar: new FakeEl("div"), mslot: null, only: "", hidden: new Set(), down: new Set(), notes: {},
                      keyHint: "Open a session (K)", lens: { all: true }, unions: [], tips: [], aftermaths: [], rowPaints: 0, tagSyncs: 0, placeholders: 0,
                      groupsRaw: null, phone: false, heads: [],
-                     planStrip, parseTabGroups, headWords, tabStateClass, sectionPip, sectionPipMembers, sectionPipTitle };
+                     planStrip, parseTabGroups, headWords, tabStateClass, tabDotClass, sectionPip, sectionPipMembers, sectionPipTitle };
   const api = lift()(H);
   const sessions = new Map<string, any>([["a", session("web", "ready")], ["b", session("api", "working")]]);
   const tabMeta = new Map<string, any>([["p", { name: "tests", color: { bg: "#112233", fg: "#ffffff" } }]]);
