@@ -357,12 +357,12 @@ jobs:
 - **Filtering.** Each surface (chat tabs, timeline lanes, outline) keeps its own
   lens: every session, the untagged ones, or any set of tags.
 - **Grouping.** The chat tab strip sections by tag whenever a session carries
-  one: a header per tag in `tagOrder`, each tab under the first of its tags in
-  that order (its home tag), the untagged after a divider. Sections fold per
-  browser; dragging a header reorders `tagOrder` for every surface; **Move to
-  <tag>** in a tab's menu adds the target tag and drops the home tag in one
-  click. Groups are tags: there is no second store and no per-session group
-  field.
+  one: a header per tag in `tagOrder`, each tab under every tag it carries (a
+  session under two tags appears under both), the untagged on a line of their
+  own. Sections fold per browser; dragging a header reorders `tagOrder` for every
+  surface; **Move to <tag>** in a tab's menu adds the target tag and drops the
+  tag of the group that copy sits in, in one click. Groups are tags: there is no
+  second store and no per-session group field.
 - **Inheritance.** A session spawned from another joins the parent's tags at the
   creation event: a fork, a promoted comment thread, and `romp new` run inside a
   session (it sends its `ROMP_SID` as `parent`; `--no-inherit` withholds it and

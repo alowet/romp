@@ -84,11 +84,11 @@ test("presentation: one chip per NAME, identity dot, ✕ — and never a host pr
 
 test("one-click MOVE between groups (tab groups, 2026-09-04): 'Move to <name>' adds the target and drops the HOME tag on ONE blob; '+' adds without moving", () => {
   const fly = RENDER.slice(RENDER.indexOf('const sub = el("div", "ctx-menu ctx-sub ctx-sub-tags");'), RENDER.indexOf("// New tag… — an inline input"));
-  assert.match(fly, /const home0 = readTabGroups\(\)\.on \? holding\(\)\[0\] : undefined;\s*\n\s*const home = home0 && !home0\.pending \? home0 : undefined;/,
-    "the home tag is the FIRST holder in the union order — the same rule that sections the strip; only while the strip is sectioned, and never a home whose create is still in flight");
+  assert.match(fly, /const home0 = readTabGroups\(\)\.on \? \(\(copy !== undefined \? holding\(\)\.find\(\(g\) => g\.name === copy\) : undefined\) \?\? holding\(\)\[0\]\) : undefined;\s*\n\s*const home = home0 && !home0\.pending \? home0 : undefined;/,
+    "the group THIS COPY sits in (T264b: a session under several tags has a copy per group, and the menu speaks for the right-clicked copy's group), else the first holder; only while the strip is sectioned, and never a tag whose create is still in flight");
   assert.match(fly, /lb\.textContent = "Move to " \+ g\.name; bodyE\.appendChild\(lb\);/);
   assert.match(fly, /moveUnion\(home, g\); build\(\); sb\.textContent = subText\(\);/, "the row IS the move");
-  assert.match(fly, /plus\.title = "add this tag too — the session stays in its current group";/, "…and multi-tag stays one click away");
+  assert.match(fly, /plus\.title = "add this tag too — the session keeps its other tags";/, "…and multi-tag stays one click away");
   assert.match(fly, /lb\.textContent = "\+ " \+ g\.name; bodyE\.appendChild\(lb\);/, "with no home tag, + <name> is the move");
   const mv = RENDER.slice(RENDER.indexOf("const moveUnion = (from: TagUnion, to: TagUnion)"), RENDER.indexOf("// HOVER-INTENT open"));
   assert.match(mv, /const a = applyUnionEdit\(nv, to, \{ add: \[id\] \}\);\s*\n\s*const r = applyUnionEdit\(nv, from, \{ remove: \[id\] \}\);/,
