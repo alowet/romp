@@ -382,8 +382,36 @@ test("the header's structure and gestures read as a label: chevron (flips with t
     "captured before the tab rule (chat-focus-model.test pins that rule's two-line shape)");
   assert.match(RENDER, /if \(h && h\.tabIndex >= 0\) h\.focus\(\); else focusActiveTab\(\);/,
     "…falling back to the active tab when the group is gone or now holds it");
-  // hover/focus: the label brightens and the chevron takes the accent — no row wash (that reads "select me")
+  // hover/focus: the count brightens to --fg, the chevron takes the accent, and the CHIP brightens by a
+  // filter on its own identity colour (T251b — a --fg swap would erase the tag) — no row wash ("select me")
   assert.match(CSS, /\.tab-group-head:hover, \.tab-group-head:focus-visible \{ color: var\(--fg\); \}/);
+  assert.match(CSS, /\.tab-group-head:hover \.tab-group-chip, \.tab-group-head:focus-visible \.tab-group-chip \{ filter: brightness\(1\.3\); \}/);
+  {
+    // the RENDERED outcome, not the sheet's text: the chip's inline style is what the header's colour rule
+    // cannot reach (inline beats class), so the cue must be a property the chip never sets inline. Run the
+    // real builder against a stub document and read the style it writes.
+    const created: { tag: string; attrs: Record<string, string>; kids: unknown[] }[] = [];
+    const g = globalThis as any;
+    const saved = g.document;
+    const savedWin = g.window;
+    g.document = {
+      createElement: (tag: string) => { const n = { tag, attrs: {} as Record<string, string>, kids: [] as unknown[],
+        setAttribute(k: string, v: string) { this.attrs[k] = v; }, appendChild(c: unknown) { this.kids.push(c); },
+        addEventListener() { /* unused by tagChip */ } }; created.push(n); return n; },
+      createTextNode: (t: string) => ({ text: t }),
+      addEventListener() { /* the module wires its closers + the menu-echo writer at load (T107) */ },
+    };
+    g.window = { addEventListener() { /* the storage listener at load */ } };
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { tagChip } = require("./tag-menu");
+      const chip = tagChip("infra", "#54B204", { inheritSize: true });
+      const style: string = chip.attrs.style;
+      assert.match(style, /color:#54B204;/, "the identity colour rides inline — the header's --fg rule cannot recolour it…");
+      assert.ok(!/filter\s*:/.test(style), "…so the fold cue is a FILTER, a property the chip never sets inline: the class rule wins by construction");
+      assert.ok(!/font-size/.test(style), "and the header-hosted chip inherits the header's size");
+    } finally { g.document = saved; g.window = savedWin; }
+  }
   assert.match(CSS, /\.tab-group-head:hover \.tab-group-caret, \.tab-group-head:focus-visible \.tab-group-caret \{ color: var\(--accent\); \}/);
   for (const m of CSS.matchAll(/\n\.tab-group-head:hover[^{\n]*\{([^}]*)\}/g)) assert.doesNotMatch(m[1], /background/, "no wash on hover");
   assert.match(CSS, /\.tab-group-head:focus-visible \{ outline: 1px solid var\(--accent\); outline-offset: -1px; \}/);

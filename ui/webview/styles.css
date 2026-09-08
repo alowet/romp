@@ -359,11 +359,13 @@ body.chat-theme-yatharth #tabs .tab-row-line { display: none; }
 body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 /* TAB SECTIONS — groups are tags (the user 2026-09-04): one header per home tag in the strip, the
    untagged trail behind a plain separator. A header reads as a LABEL, not a session (the user
-   2026-09-06): a disclosure chevron that flips with the fold, the tag's color as a short bar, the name
-   small and letter-spaced, and the member count (the folded-away count while folded). No state class,
-   no close, no pip of its own — none of a tab's dress; folded, one small MEMBER-derived mark follows the
-   count (the state pip below), and hover/focus brighten the label and color the chevron in the accent
-   (a fold cue), never a row wash (a "select me" cue). The header is focusable (Enter or Space fold),
+   2026-09-06): a disclosure chevron that flips with the fold, the tag as THE CHIP it wears everywhere
+   (T251), and the member count (the folded-away count while folded). No state class, no close, no pip
+   of its own — none of a tab's dress; folded, one small MEMBER-derived mark follows the count (the
+   state pip below), and hover/focus brighten the label and color the chevron in the accent (a fold
+   cue), never a row wash (a "select me" cue). The chip is coloured by IDENTITY, so it brightens by a
+   filter rather than to --fg (T251b: --fg would erase the tag; the chip's inline colour is what the
+   header's colour rule cannot reach) — the same lift the plain name used to get, on the tag's own hue. The header is focusable (Enter or Space fold),
    drags to reorder the groups (tagOrder), and the header under a dragged group wears the accent
    insertion cue. 0.82em is the surface's sub-line size (the menus' sub-lines) — labels match labels,
    and nothing here nests an em inside it. Tokens only, so the header reads in every theme without a
@@ -373,6 +375,10 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
   user-select: none; border-radius: 6px 6px 0 0; outline: none; }
 .tab-group-head:hover, .tab-group-head:focus-visible { color: var(--fg); }
 .tab-group-head:hover .tab-group-caret, .tab-group-head:focus-visible .tab-group-caret { color: var(--accent); }
+/* the chip's fold cue (T251b): a brightness lift keeps the tag's identity colour (a --fg swap would erase
+   it) and, unlike a background wash, is a property the chip's inline style never sets — so the rule wins
+   by construction; the uncoloured "(no tags)" chip lifts from --dim toward --fg, the old label's exact cue */
+.tab-group-head:hover .tab-group-chip, .tab-group-head:focus-visible .tab-group-chip { filter: brightness(1.3); }
 .tab-group-head:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
 /* the section holding the active tab: unfoldable while active (no fold action on its header), so no
    pointer cursor promising a click — it still drags to reorder the groups */
