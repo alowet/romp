@@ -52,7 +52,7 @@ function dashboardWid(): string {
 // The shapes a kernel→browser message can carry a session id in. Kept generic (by field name, not by
 // message type) so a new message type that reuses these field names is covered automatically:
 const SCALAR_ID = ["id", "sid"]; //               a single session id
-const ARRAY_ID = ["order", "names", "working", "awaiting", "stateUnknown"]; // an array of session ids
+const ARRAY_ID = ["order", "names", "working", "awaiting", "stateUnknown", "live"]; // an array of session ids
 const OBJ_SID = ["asks", "items", "ledgers", "sessions"]; //  an array of objects keyed by `.sid`
 const OBJ_ID = ["tabs"]; //                       an array of objects keyed by `.id`
 
@@ -658,6 +658,7 @@ export class FederationManager {
   private frozeAt = 0;   // the Page Lifecycle `freeze` before the current thaw: a socket already overdue at that moment is not stamped by resumed()
   private perHostOrder: Record<string, string[]> = {};
   private perHostTabs: Record<string, any[]> = {};
+  private perHostLive: Record<string, string[]> = {};   // each host's affirmed-live sids (T258): the merged tabOrder carries their union
   private localViews: any = null;   // the LOCAL kernel's session-views blob, carried on merged tabOrder re-emits
   private localViewsRejected: any = null;   // the last LOCAL tabOrder blob the seq gate turned away since it last adopted one — the caps frame adopts it (inbound)
   private tlViewsRejected: any = null;      // the same for the LOCAL lanes payload's blob (perHostTl[LOCAL].views)
@@ -864,6 +865,7 @@ export class FederationManager {
       const gone = m.id;
       if (this.perHostOrder[host]) this.perHostOrder[host] = this.perHostOrder[host].filter((x) => x !== gone);
       if (this.perHostTabs[host]) this.perHostTabs[host] = this.perHostTabs[host].filter((t: any) => !(t && t.id === gone));
+      if (this.perHostLive[host]) this.perHostLive[host] = this.perHostLive[host].filter((x) => x !== gone);
       this.perHostSids[host]?.delete(gone);
       window.dispatchEvent(new MessageEvent("message", { data: m }));
       this.emitMergedOrder();
@@ -874,6 +876,7 @@ export class FederationManager {
       const prevTabs = this.perHostTabs[host] || [];
       this.perHostOrder[host] = Array.isArray(m.order) ? m.order.filter((x: any) => typeof x === "string") : [];
       this.perHostTabs[host] = Array.isArray(m.tabs) ? m.tabs : [];
+      this.perHostLive[host] = Array.isArray(m.live) ? m.live.filter((x: any) => typeof x === "string") : [];
       // session VIEWS (the user 2026-08-18): the blob is the LOCAL kernel's viewer pref (ids arrive
       // host-prefixed inside it already) — remote kernels' copies are their own dashboards' prefs.
       // Without this passthrough the merged re-emit silently dropped the field and the browser
@@ -1016,8 +1019,9 @@ export class FederationManager {
   private emitMergedOrder(fresh = false, freshHost: string = LOCAL): void {
     const order = mergeHostOrder(this.perHostOrder, this.hostSeq, this.view());
     const tabs = this.hostSeq.flatMap((h) => this.perHostTabs[h] || []);
+    const live = this.hostSeq.flatMap((h) => this.perHostLive[h] || []);   // T258: the union the pane's omission guard reads
     this.publishPending();
-    const data: any = { type: "tabOrder", order, tabs, views: this.localViews ?? undefined };
+    const data: any = { type: "tabOrder", order, tabs, live, views: this.localViews ?? undefined };
     // Provenance for the chat's close backstop (T233): a FRESH emission is driven by one host's own
     // tabOrder push and names that host (`freshHost`) — only ITS ids are that kernel's current word; the
     // other hosts' slices ride along from the store. A SYNTHETIC re-emit (a view-order storage event, a
@@ -1324,6 +1328,7 @@ export class FederationManager {
     }
     delete this.perHostOrder[host];
     delete this.perHostTabs[host];
+    delete this.perHostLive[host];
     delete this.perHostSids[host];
     delete this.perHostFeed[host];
     delete this.perHostFeedAt[host];

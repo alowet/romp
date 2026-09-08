@@ -29,6 +29,33 @@
  * @param known       whether the client actually has a tab for this id (a session arrived / is a placeholder)
  * @param kernelSeen  whether ANY kernel tabOrder push has ever carried this id (kernel-owned → no keep)
  */
+/**
+ * A live session the kernel affirms (frame `live`) but that this tabOrder push's `order` OMITS is a
+ * TRANSIENT read failure, never a close (T258, the user 2026-09-08: a live session whose transcript file was
+ * briefly unreadable dropped off the kernel's order and the pane tore its tab down through the T236 omission
+ * path). The kernel-side fix keeps such a session in `order`, so this is defense in depth: return the kernel
+ * order with every live-but-omitted local id spliced back in at the slot it holds locally (after its nearest
+ * surviving predecessor), so the tab neither tears down nor jumps while the next frame re-lists it in place.
+ * `live` empty (an older kernel that sends no marker) → the kernel order verbatim, exactly as before.
+ */
+export function retainLiveOmitted(
+  kernelOrder: readonly string[],
+  local: readonly string[],
+  live: ReadonlySet<string>,
+): string[] {
+  if (!live.size) return kernelOrder.filter((id): id is string => typeof id === "string");
+  const inKernel = new Set(kernelOrder.filter((id): id is string => typeof id === "string"));
+  const out = kernelOrder.filter((id): id is string => typeof id === "string");
+  for (let i = 0; i < local.length; i++) {
+    const id = local[i];
+    if (typeof id !== "string" || inKernel.has(id) || !live.has(id) || out.includes(id)) continue;
+    let at = 0;                                   // insert after the nearest preceding local id that survived
+    for (let j = i - 1; j >= 0; j--) { const k = out.indexOf(local[j]); if (k >= 0) { at = k + 1; break; } }
+    out.splice(at, 0, id);
+  }
+  return out;
+}
+
 export function reconcileTabOrder(
   kernelOrder: readonly string[],
   local: readonly string[],

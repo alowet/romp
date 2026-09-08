@@ -55,6 +55,7 @@ import { pastedFilePath } from "./paste-path";
 import { insertAtCaret } from "./composer-insert";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
 import { followReader, keepPlaceAcrossShow } from "./scroll-keep";
+import { retainLiveOmitted } from "./tab-order";
 import { keepResidentEvents } from "./frame-merge";
 import { activeTabToReannounce } from "./relay-active";
 import { dirStatusHint, nextDirActive, createDirPrompt, type DirStatus } from "./dir-complete";
@@ -4672,7 +4673,7 @@ function ackClosingTabs(kernelOrder: readonly string[], report?: OrderReport): v
 // looking alive). Add-only, never pruned: dropping an entry would hand a late stale `session` frame the
 // never-listed keep and re-mint the ghost. Client-minted ids (the create placeholder) never enter it.
 const kernelListed = new Set<string>();
-function applyTabOrder(o: any, tabs?: any, report?: OrderReport) {
+function applyTabOrder(o: any, tabs?: any, report?: OrderReport, live?: any) {
   // name+color per tab → renderTabs paints placeholders for tabs whose session hasn't arrived yet (tabs-first).
   // The payload is the kernel's AUTHORITATIVE current tab set, so REBUILD (not merge) — a closed tab drops out
   // and never lingers as a stale placeholder. Absent tabs (older kernel) → keep what we have.
@@ -4700,11 +4701,21 @@ function applyTabOrder(o: any, tabs?: any, report?: OrderReport) {
   // federation the merged order only omits an id when its OWNING host affirmatively reported it gone
   // (per-host slices persist across down/detached hosts), so this never fires on a tunnel blip.
   const inKernel = new Set<string>(kernelOrder);
-  const omitted = new Set(order.filter((id) => kernelListed.has(id) && !inKernel.has(id)));   // all of them first: no fallback onto one going in the same breath
+  // A kernel-owned id the push no longer carries but that the kernel STILL affirms LIVE (frame `live`) is a
+  // transient read failure, never a close (T258, the user 2026-09-08): its transcript was briefly unreadable.
+  // Exclude it from the teardown AND keep it on the strip at its slot (retainLiveOmitted) until the next frame
+  // re-lists it. The kernel-side fix keeps it in `order` already, so this is the second line of defense; an
+  // older kernel sends no `live` and this is a no-op. One clientDiag row names any id it saves, so a kernel
+  // that omits a live session is seen, never silently papered over.
+  const liveSet = new Set<string>(Array.isArray(live) ? live.filter((x: any) => typeof x === "string") : []);
+  const omitted = new Set(order.filter((id) => kernelListed.has(id) && !inKernel.has(id) && !liveSet.has(id)));   // all of them first: no fallback onto one going in the same breath
+  const keptLive = order.filter((id) => kernelListed.has(id) && !inKernel.has(id) && liveSet.has(id));
+  if (keptLive.length && vscodeApi) vscodeApi.postMessage({ type: "clientDiag", surface: "chat", what: "live-omitted-kept", data: { ids: keptLive } });
   for (const id of order.slice()) {
     if (omitted.has(id)) dismissSession(id, "omitted", omitted);
   }
-  const next = reconcileTabOrder(kernelOrder, order, (id) => sessions.has(id) || tabMeta.has(id),
+  const next = reconcileTabOrder(retainLiveOmitted(kernelOrder, order, liveSet), order,
+                                 (id) => sessions.has(id) || tabMeta.has(id),
                                  (id) => kernelListed.has(id));
   order.length = 0;
   for (const id of next) order.push(id);
@@ -14091,7 +14102,7 @@ window.addEventListener("message", perfFrameHandler("chat", (m) => vscodeApi?.po
   else if (m.type === "imgData" && typeof m.path === "string") onImgData(m.path, typeof m.url === "string" ? m.url : null, typeof m.sid === "string" ? m.sid : null);
   else if (m.type === "tabOrder") {
     captureViews(m.views || null);
-    applyTabOrder(m.order, m.tabs, { reemit: m.reemit === true, freshHost: typeof m.freshHost === "string" ? m.freshHost : undefined });
+    applyTabOrder(m.order, m.tabs, { reemit: m.reemit === true, freshHost: typeof m.freshHost === "string" ? m.freshHost : undefined }, m.live);
   }
   else if (m.type === "renamed" && m.id && typeof m.name === "string") {
     notePendingMeta(pendingTabMeta, m.id, { name: m.name });   // kernel truth — hold it against a push built pre-rename
