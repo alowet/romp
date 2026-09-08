@@ -115,6 +115,9 @@ class AskingThePeer(unittest.TestCase):
         self.assertEqual([c[1] for c in calls], ["/tunnels/pull", "/restart"],
                          "a pull alone leaves the OLD kernel running and still reporting the old sha")
         self.assertEqual(calls[0][2], {"host": "hubname"}, "the peer is handed the name it knows us by")
+        self.assertEqual(calls[1][2], {"fleet": False},
+                         "and told to restart ITSELF only — its /restart defaults to the broad kind, "
+                         "which would fan back out onto this hub (tests/test_fleet_restart.py)")
         self.assertIn("pulled 8 commits", detail)
         self.assertIn("restarting it", detail)
 
@@ -140,6 +143,19 @@ class AskingThePeer(unittest.TestCase):
         (ok, detail), _ = self._ask([(200, {"ok": True, "detail": "pulled 2 commits"}), (0, {"error": "gone"})])
         self.assertTrue(ok, "the commits DID land — that is not a failure")
         self.assertIn("restart romp on %s" % PEER, detail, "and it says what is left to do")
+        self.assertIn("gone", detail, "and why the restart never acked, in _peer_call's own words")
+
+    def test_a_restart_the_peer_refuses_comes_back_with_its_reason(self):
+        """The peer's /restart refuses a body it cannot take with a 400 naming why (it no longer
+        takes a malformed one as the broad default). This function was that text's only reader and
+        it discarded it, leaving "did not ack" with no why (review find, 2026-09-08)."""
+        (ok, detail), calls = self._ask([(200, {"ok": True, "detail": "pulled 2 commits"}),
+                                         (400, {"ok": False, "error": "body is not JSON"})])
+        self.assertTrue(ok, "the commits DID land")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("did not ack the restart", detail)
+        self.assertIn("body is not JSON", detail, "the peer's own words, not a bare 'did not ack'")
+        self.assertIn("restart romp on %s" % PEER, detail)
 
     def test_an_ssh_attached_host_is_refused_with_the_direction_that_works(self):
         km._remotes[PEER] = _row(checkin_peer=False)

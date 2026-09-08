@@ -4,6 +4,7 @@ consume). The WS transport + HTTP serving aren't unit-tested; the projection —
 (chat), goals→feed cards, ledger→TOC — is. Synthetic fleet only: invented text, placeholder
 UUIDs; no real session data.
 """
+import contextlib
 import json
 import os
 import re
@@ -6771,6 +6772,191 @@ class ServeSecurity(unittest.TestCase):
         finally:
             if saved is not None:
                 os.environ["ROMP_MANAGER_PORT"] = saved
+
+    def _post_restart(self, data):
+        """POST /restart with `data` as the body → (status, decoded JSON). Content-Type says JSON the
+        way _peer_call does (the ↻ buttons send no body and no headers); the handler never reads it,
+        the body decides."""
+        import urllib.request, urllib.error, json as _json
+        req = urllib.request.Request("http://127.0.0.1:%d/restart?token=testtok" % self.port,
+                                     method="POST", data=data,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, _json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, _json.loads(e.read().decode())
+
+    @contextlib.contextmanager
+    def _restart_legs_faked(self):
+        """Both restart legs replaced by recorders (NOTHING may restart under a test), and one
+        synthetic attached row so the broad leg is reachable: with no rows the handler folds every
+        scope to the local leg and the two would be indistinguishable. Yields the recorders; each
+        leg sets its Event, because the handler ACKS FIRST and acts after — a client can hold the
+        200 before the leg has run, so callers wait on the Event rather than peeking at the list."""
+        import threading
+        legs = {"local": [], "broad": [], "localDone": threading.Event(), "broadDone": threading.Event()}
+        saved = (km._restart_this_kernel, km._fleet_restart_run, dict(km._remotes),
+                 os.environ.get("ROMP_MANAGER_PORT"))
+        # A DEAD manager port, never an absent one (tests/conftest.py: absent is the one unsafe state,
+        # since _run_main_update maps it to the live default; the poison "1" is safe against every
+        # consumer). Both legs are faked below, so nothing dials it either way; the handler hands the
+        # value it acked with to whichever leg runs, and the tests check that (review find, 2026-09-08).
+        os.environ["ROMP_MANAGER_PORT"] = "1"
+
+        def _local(reason="", manager_port=None):
+            legs["local"].append(reason); legs["localDone"].set()
+
+        def _broad(manager_port=None):
+            legs["broad"].append(manager_port); legs["broadDone"].set()
+        km._restart_this_kernel, km._fleet_restart_run = _local, _broad
+        km._remotes.clear()
+        km._remotes["TESTHOST"] = {"host": "TESTHOST", "status": "up", "kernel_port": 29855}
+        try:
+            yield legs
+        finally:
+            km._restart_this_kernel, km._fleet_restart_run = saved[0], saved[1]
+            km._remotes.clear(); km._remotes.update(saved[2])
+            if saved[3] is None:
+                os.environ.pop("ROMP_MANAGER_PORT", None)
+            else:
+                os.environ["ROMP_MANAGER_PORT"] = saved[3]
+
+    def test_restart_body_picks_the_scope_and_a_bodiless_post_keeps_its_default(self):
+        """The body says WHICH restart: nothing (every ↻ button — the landing rail, gear.js, strip.ts
+        all send a bodiless POST) keeps the broad default; {"fleet": false} is this kernel only —
+        the scope the hub asks of a peer it just updated (_ask_peer_to_pull); {"fleet": true} says
+        the default out loud. The ack's `fleet` and the leg that actually runs must agree."""
+        with self._restart_legs_faked() as legs:
+            code, ack = self._post_restart(b"")
+            self.assertEqual((code, ack["ok"], ack["restarting"], ack["fleet"]), (200, True, True, True))
+            self.assertTrue(legs["broadDone"].wait(5), "a bodiless POST takes the broad leg, as before")
+            legs["broadDone"].clear()
+            code, ack = self._post_restart(b'{"fleet": true}')
+            self.assertEqual((code, ack["fleet"]), (200, True))
+            self.assertTrue(legs["broadDone"].wait(5))
+            legs["broadDone"].clear()
+            # `{}` is what a not-yet-updated hub's _ask_peer_to_pull still sends: it handed {} to
+            # _peer_call, which serializes any non-None body, so the wire carries the two bytes `{}`,
+            # not an empty body. A well-formed object with no key keeps the broad default; tightening
+            # _restart_scope_from_body to REQUIRE the key would 400 every mixed-version sweep with
+            # nothing else here going red (review find, 2026-09-08).
+            code, ack = self._post_restart(b"{}")
+            self.assertEqual((code, ack["ok"], ack["restarting"], ack["fleet"]), (200, True, True, True))
+            self.assertTrue(legs["broadDone"].wait(5), "an older hub's {} still takes the broad leg")
+            self.assertEqual(legs["local"], [], "no well-formed broad request touched the local leg")
+            code, ack = self._post_restart(b'{"fleet": false}')
+            self.assertEqual((code, ack["ok"], ack["restarting"], ack["fleet"]), (200, True, True, False))
+            self.assertTrue(legs["localDone"].wait(5), "fleet:false restarts THIS kernel only")
+            self.assertEqual(legs["local"], ["http /restart (local-only)"])
+            self.assertEqual(legs["broad"], ["1", "1", "1"],
+                             "three broad requests, no more, each handed the dead port conftest floors "
+                             "(an absent port is the unsafe state, never what a test runs under)")
+
+    def test_restart_refuses_a_malformed_body_instead_of_restarting_everything(self):
+        """Anything that is not a JSON object with at most a boolean `fleet` is a 400 whose JSON error
+        names the problem, and NOTHING restarts. Before this, the parse sat in a bare except that
+        fell through to the default, so every one of these took the BROADEST action with a 200:
+        junk, an array, null, a string, a non-boolean value, a typo key, a stray extra key."""
+        cases = [(b"not json", "not JSON"),
+                 (b"[]", "JSON object"),
+                 (b"null", "JSON object"),
+                 (b'"x"', "JSON object"),
+                 (b'{"fleet": "no"}', "true or false"),
+                 (b'{"fleet": 1}', "true or false"),
+                 (b'{"fleet": null}', "true or false"),
+                 (b'{"fleat": false}', "'fleat'"),
+                 (b'{"fleet": false, "x": 1}', "'x'")]
+        with self._restart_legs_faked() as legs:
+            for body, names in cases:
+                with self.subTest(body=body):
+                    code, ack = self._post_restart(body)
+                    self.assertEqual(code, 400, "%r must be refused, not acted on" % body)
+                    self.assertFalse(ack["ok"])
+                    self.assertIn(names, ack["error"], "the error says what was wrong with %r" % body)
+                    self.assertNotIn("restarting", ack)
+            # A well-formed request AFTER the refusals is the first and only thing that runs: had any
+            # refusal queued a restart, its leg would be on record ahead of this one.
+            code, ack = self._post_restart(b'{"fleet": false}')
+            self.assertEqual((code, ack["fleet"]), (200, False))
+            self.assertTrue(legs["localDone"].wait(5))
+            self.assertEqual(legs["local"], ["http /restart (local-only)"])
+            self.assertEqual(legs["broad"], [], "no malformed body ever reached the broad leg")
+
+    def _post_restart_raw(self, announced, body):
+        """POST /restart announcing `announced` as its Content-Length and sending `body`, then
+        half-closing the socket so the handler's read meets EOF instead of waiting for the rest:
+        the shape a client that died mid-upload, or one whose Content-Length lies, leaves behind.
+        urllib cannot send that, it always tells the truth about the length. → (status, JSON)."""
+        import socket, json as _json
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            s.sendall(("POST /restart?token=testtok HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                       "Content-Type: application/json\r\nContent-Length: %s\r\n\r\n" % announced).encode()
+                      + body)
+            s.shutdown(socket.SHUT_WR)
+            data = b""
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            s.close()
+        head, _, payload = data.partition(b"\r\n\r\n")
+        return int(head.split(b" ")[1]), _json.loads(payload.decode() or "{}")
+
+    def test_restart_refuses_a_body_that_did_not_arrive_whole(self):
+        """A body that was ANNOUNCED but could not be read whole is a 400 that names the shortfall, and
+        nothing restarts. The do_POST read used to fold a short read, a dead client or an unparsable
+        Content-Length into an EMPTY body, and on this route empty means the broad default: a client
+        that announced a peer-only body and died before sending it restarted every reachable kernel,
+        and one cut off mid-body was read as whatever prefix arrived (review find, 2026-09-08)."""
+        cases = [("64", b"", "0 of the 64"),                        # announced, never sent: WAS the broad default
+                 ("64", b'{"fleet": false}', "16 of the 64"),       # cut short: WAS taken as a complete request
+                 ("abc", b"", "invalid literal")]                   # a Content-Length int() cannot read
+        with self._restart_legs_faked() as legs:
+            for announced, body, names in cases:
+                with self.subTest(announced=announced, body=body):
+                    code, ack = self._post_restart_raw(announced, body)
+                    self.assertEqual(code, 400, "an unreadable body must be refused, not acted on")
+                    self.assertFalse(ack["ok"])
+                    self.assertIn("body could not be read", ack["error"])
+                    self.assertIn(names, ack["error"], "the error says what the read got: %r" % ack)
+                    self.assertNotIn("restarting", ack)
+            # A well-formed request AFTER the refusals is the first and only leg on record.
+            code, ack = self._post_restart(b'{"fleet": false}')
+            self.assertEqual((code, ack["fleet"]), (200, False))
+            self.assertTrue(legs["localDone"].wait(5))
+            self.assertEqual(legs["local"], ["http /restart (local-only)"])
+            self.assertEqual(legs["broad"], [], "no unreadable body ever took the broad default")
+
+    def test_restart_error_echo_is_bounded_and_keeps_its_explanation(self):
+        """The refusal echoes the offending key or value, BOUNDED (a 1 MB body must not come back as
+        a 1 MB error), and the cut lands INSIDE the quotes, marked: the echo still reads as one
+        complete quoted thing and the explanation after it survives. The first cut sliced the
+        serialized text, so a long key came back as an unclosed `'kkkk` and a long value as an
+        unclosed `"xxxx` (review find, 2026-09-08)."""
+        long_key = "k" * 300
+        broad, err = km._restart_scope_from_body(json.dumps({long_key: 1}).encode())
+        self.assertIsNone(broad)
+        self.assertLess(len(err), 200, "bounded: %d chars" % len(err))
+        self.assertTrue(err.endswith("only 'fleet' is understood"), "the explanation survives: %r" % err)
+        self.assertIn("'" + "k" * 60 + "…'", err, "the key is clipped, marked, and still quoted: %r" % err)
+        broad, err = km._restart_scope_from_body(json.dumps({"fleet": "x" * 300}).encode())
+        self.assertIsNone(broad)
+        self.assertLess(len(err), 200)
+        self.assertTrue(err.startswith("'fleet' must be true or false, got \"xxx"), err)
+        self.assertTrue(err.endswith('…"'), "the echoed value keeps its closing quote: %r" % err)
+        broad, err = km._restart_scope_from_body(json.dumps(["x" * 300]).encode())
+        self.assertLess(len(err), 200)
+        self.assertTrue(err.startswith('body must be a JSON object, got ["xxx'), err)
+        # and through the door, since the caller reads the message, not the tuple
+        with self._restart_legs_faked() as legs:
+            code, ack = self._post_restart(json.dumps({long_key: 1}).encode())
+            self.assertEqual(code, 400)
+            self.assertTrue(ack["error"].endswith("only 'fleet' is understood"), ack["error"])
+            self.assertEqual(legs["broad"], [])
 
     def test_tick_endpoint_wakes_producer(self):
         """POST /tick is the event-driven judge trigger: the Stop / UserPromptSubmit hooks poke it the
