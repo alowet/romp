@@ -510,6 +510,60 @@ Plaintext keys remain supported for compatibility, but do not meet policies
 that require secrets to be fetched from 1Password at runtime. File permissions
 do not change that distinction.
 
+#### A key from a secret manager, with none held by Romp
+
+If your key lives in a secret manager and you would rather Romp not hold it,
+configure no key source in Romp and point Claude Code's
+[`apiKeyHelper`](https://code.claude.com/docs/en/settings-reference#apikeyhelper)
+at the secret manager instead. Romp passes a key to a session only when it has
+one itself, so with no source configured every session and every API-key-billed
+judge call uses Claude Code's own authentication. Romp cannot see that key: the
+Billing picker offers no API-key choice, a session's Billing row reads
+`Login (CLI reports API key)`, and `romp keyswap --cycle` skips every session
+as billing the login.
+
+1. Write a script that prints the key from your secret manager, and make it
+   executable. With 1Password, for example:
+
+        #!/bin/sh
+        exec op read --no-newline "op://<vault>/<item>/credential"
+
+    The helper runs inside each session's Claude Code process (and each judge
+    call), a child of the service, so the secret manager's CLI needs a
+    credential that works without a desktop app: for 1Password,
+    `OP_SERVICE_ACCOUNT_TOKEN=` in `service.env`, scoped to the one vault. With
+    no reference configured Romp leaves that token in the sessions'
+    environment, where the helper needs it and where an agent's shell can read
+    it. Any secret manager whose CLI can print the key works the same way.
+
+2. Point Claude Code at the script in `~/.claude/settings.json`:
+
+        { "apiKeyHelper": "/path/to/anthropic-key.sh" }
+
+3. Leave `service.env` with no `ANTHROPIC_API_KEY` and no `ROMP_API_KEY_REF`
+   line, and set `ROMP_EXPECTED_AUTH=key` so the per-init auth check knows the
+   key arrives through the helper and stays quiet (see
+   [Per-session billing](#per-session-billing-login-vs-api-key)). If a
+   1Password reference was ever selected on this box, also remove the
+   `service.env.source` marker beside the file: with it in place the removed
+   reference stays an error rather than an absent source (see [API keys from
+   1Password at runtime](#api-keys-from-1password-at-runtime)).
+4. Restart the service once.
+
+Rotating the key is then a change in the secret manager alone: Claude Code
+re-runs the helper on its own refresh interval
+(`CLAUDE_CODE_API_KEY_HELPER_TTL_MS`), so running sessions pick up the new key
+with no Romp restart and no `romp keyswap`.
+
+The model-catalog refresh is the one call Romp makes itself rather than
+through a session. It reads only a key source Romp holds (or an
+`ANTHROPIC_AUTH_TOKEN` in the service's environment, which would also change
+what the sessions bill), so on a helper-only box it has no credential. Romp
+then serves its built-in list, or the last one it fetched and cached, and the
+kernel log says so at each refresh attempt (boot, and once per model id it does
+not know); the pickers still work, and Claude Code's own alias table still
+tracks each family's newest. Nothing else Romp does on such a box needs a key.
+
 ### Switching which API key the sessions bill (`romp keyswap`)
 
 The key a session bills rides its launch environment, and Romp checks the
