@@ -205,7 +205,7 @@ test("several pending sends: each after its own anchor, in send order; same anch
   const none = press([], "hello");
   assert.deepEqual(injectionGroups([], reconcilePending([], none).inject), [{ idx: 0, sends: [none[0]] }]);
   // an anchor that left the resident window: everything resident is later than the send, so the slot is the head
-  assert.equal(scanFrom([{ kind: "tool", uuid: "zz" }], { after: "gone", seen: [], queued: 0 }), 0);
+  assert.equal(scanFrom([{ kind: "tool", uuid: "zz" }], { after: "gone", place: null, seen: [], queued: 0 }), 0);
 });
 
 test("a send pressed while an earlier send's echo is the newest event is placed BELOW that echo (review of the first cut)", () => {
