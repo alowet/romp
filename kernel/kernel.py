@@ -8156,7 +8156,7 @@ def _open_top_goal(sid):
     their notes lifted while they still held exactly those). Was _working_top_goal ('working' only), whose
     sole caller was that expiry."""
     try:
-        store = jd.load_goals(sid)
+        store = jd.load_goals_shared(sid)           # read-only: a top's status
     except Exception:
         return None
     nodes = store.get("nodes", {}); status = store.get("status", {})
@@ -10121,7 +10121,7 @@ def _deferral_sweep_tick(now):
     drop = []
     for sid, recs in by_sid.items():
         try:
-            store = jd.load_goals(sid)
+            store = jd.load_goals_shared(sid)           # read-only: nodes, status, confirming, log rows
         except Exception:
             continue                                   # unreadable store → records stand; nothing silent
         nodes, status = store.get("nodes", {}) or {}, store.get("status", {}) or {}
@@ -21872,7 +21872,7 @@ def _session_stamp_read(sid):
         return hit[1]
     full, tops, deleg = (None, None, None, None, ()), set(), ()
     try:                                               # load_goals (not a raw read) so overrides replay —
-        store = jd.load_goals(sid)                     # the same view _goal_awaiting_stamp sees on the card
+        store = jd.load_goals_shared(sid)              # the same view _goal_awaiting_stamp sees on the card
         nodes = store.get("nodes", {})
         status = store.get("status", {}) or {}
         best = None
@@ -22781,7 +22781,7 @@ def _owned_yield_why(sid, path):
     if not owned:
         return None
     try:
-        store = jd.load_goals(sid)
+        store = jd.load_goals_shared(sid)           # read-only: nodes + status
         nodes = store.get("nodes", {})
         status = store.get("status", {}) or {}
     except Exception:
@@ -28397,8 +28397,9 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
     events, by_tool = [], {}                  # by_tool: tool_use_id → its tool event (fill output later)
     uuid2seg, seg_anchors = {}, {}            # atom uuid → seg id; seg id → (promptId, workId) for the dot/bar split
     seg_trig, seg_work = {}, {}               # goal-node DEEP-LINK anchors: prompt = the segment's trigger
-    _bs_store, _bs_fault = jd.load_goals_or_fault(sid)   # seam-aware seg ids (mirror the judge's split); a
-    #                                                      FAULT (row filed) → None → seams off, the tab still builds
+    _bs_store, _bs_fault = jd.load_goals_shared_or_fault(sid)   # seam-aware seg ids (mirror the judge's split):
+    #                                                             the shared read-only view; a FAULT (row filed) →
+    #                                                             None → seams off, the tab still builds
     #                                          (the per-turn seg loop runs below, after the fold decision)
     last_t = None
     last_model = ""                           # the model on the most recent assistant message (system-card meta)
@@ -29282,9 +29283,9 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
     # LEAF: its descendants are hidden even if open. Skip cleared nodes. `current` marks the focus node
     # being worked on (the graph's lastNode) so render can point a line at it; done nodes carry their
     # time for a recency-coloured "(Xm ago)" on the right.
-    gstore, gfault = jd.load_goals_or_fault(sid)   # a FAULT (row filed) → None: this tab's ledger tree
-    if gfault is None:                             # renders EMPTY instead of every tab's build failing
-        gstore = _apply_rewind_hold(sid, gstore)   # a pending rewind's cards hide on EVERY
+    gstore, gfault = jd.load_goals_shared_or_fault(sid)   # the shared read-only view; a FAULT (row filed) →
+    if gfault is None:                                    # None: this tab's ledger tree renders EMPTY instead
+        gstore = _apply_rewind_hold(sid, gstore)          # of every tab's build failing. A pending rewind's cards hide on EVERY
     #                                            surface — this ledger tree (and the tab-hover
     #                                            recents derived from it) used to keep showing the
     #                                            doomed asks for the whole armed window while the
@@ -30140,6 +30141,7 @@ def _compact_goal_stores():
     moved = 0
     try:
         jd._disk_memo_evict_absent()                   # save_goals' disk-side memo: drop removed stores' entries
+        jd._shared_evict_absent()                      # ...and the shared read-only views of removed stores
     except Exception:
         pass
     try:
@@ -31378,7 +31380,7 @@ def build_feed(now, tmux=None):
                 # offered Continue. Badges persist for the card's life, so one absorbed badge
                 # poisoned the session's whole card tail.
                 psid, gid = o["peer"], o.get("goalId")
-                pstore, pfault = jd.load_goals_or_fault(psid) if gid else (None, None)
+                pstore, pfault = jd.load_goals_shared_or_fault(psid) if gid else (None, None)   # read-only peer view
                 sgoal = pstore.get("nodes", {}).get(gid) if pstore is not None else None
                 origin_live = bool(sgoal and not sgoal.get("nodeComplete") and not sgoal.get("cleared")
                                    and gid not in cleared)   # a sender whose store faults reads absorbed (dimmed,
@@ -33042,7 +33044,7 @@ def _msg_sum_scan_session(sid, path, now):
         return {}
     sub = {}
     session = _parse(path, sid, now)
-    mstore = jd.load_goals(sid)
+    mstore = jd.load_goals_shared(sid)               # read-only: the seams for the seg ids
     for turn in session["turns"]:
         for seg in _segs_seam(turn, mstore):
             cap = _seg_work_caption(caps, seg["id"])     # drift-safe: the store id came from the judge's parse
@@ -34352,9 +34354,9 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
         tm = tmux.get(sid)
         live = tm is not None
         hexcol = (tm and tm["color"]) or (_name_color(sid) or {}).get("bg", "#888888")
-        goals, gfault = jd.load_goals_or_fault(sid)  # a FAULT (row filed) → None: this lane renders without
-        if gfault is not None:                       # goal-derived data (blocked state, seams, judging marks)
-            _bars_complain(sid, "goals", gfault)     # and the frame ships for every other lane
+        goals, gfault = jd.load_goals_shared_or_fault(sid)   # read-only view (seams + judging marks); a FAULT (row
+        if gfault is not None:                       # filed) → None: this lane renders without goal-derived data
+            _bars_complain(sid, "goals", gfault)     # (blocked state, seams, marks) and the frame ships for every other lane
         if with_bars:
             try:
                 session = _parse(s["path"], sid, now)
@@ -37689,7 +37691,15 @@ def _push(targets, connect=False, tmux=None):
                     _VIEW_STATS["chatBuildActive" if is_active else "chatBuildBg"] += 1
                     started = time.time()                # the _views_dirty floor for this build (start-keyed)
                     _t0 = time.monotonic()
-                    m = build_session(s["sid"], now, tmux)
+                    try:
+                        m = build_session(s["sid"], now, tmux)
+                    except Exception:
+                        # One session's failed chat build costs that session's frame this cycle, not every
+                        # client's whole push: the cycle-level catch below ("push build:") would return
+                        # before the feed and the timeline were built, and a build that fails the same way
+                        # every cycle would freeze the board for as long as its input stands (2026-09-06).
+                        sys.stderr.write("push build: chat %s: %s\n" % (str(s["sid"])[:8], traceback.format_exc()))
+                        continue
                     # The full serialization is LAZY (the 2026-08-10 CPU fix, round two): steady state
                     # sends only chatTail suffixes, so an eager json.dumps of the WHOLE payload — multi-MB
                     # for a busy active tab, re-dumped every cycle just to be discarded — was the largest

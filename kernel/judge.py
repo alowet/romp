@@ -13,7 +13,7 @@ CLI:
   romp-judge --once               # one caption pass over the live fleet (writes captions/)
   romp-judge --test <transcript>  # caption one transcript's recent units, print them (no write)
 """
-import contextlib, hashlib, json, os, re, secrets, shutil, signal, stat, sys, time, subprocess, threading
+import contextlib, copy, hashlib, json, os, re, secrets, shutil, signal, stat, sys, time, subprocess, threading, traceback
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -174,6 +174,8 @@ def _rebind_state(path):
     #                         entries could never hit under the new one; cleared anyway so a rebind starts empty
     with _ABSENT_FLAGS_LOCK:
         _ABSENT_FLAGS.clear()   # the absent-store predicate memo: same full-path keys, same reasoning
+    _shared_clear()             # the shared read-only store cache: same path keying, same reason; also lifts
+    #                         a test's deliberate write-guard trip (the poison flag) so the next class starts clean
     # (the override journal needs no rebinding: _overrides_dir() derives from GOALDIR at call time, so
     #  ANY isolation style — _rebind_state OR a bare GOALDIR reassignment — scopes it automatically)
 
@@ -3251,18 +3253,22 @@ def _read_store_json(path, *, quarantine=False, _tries=3):
     return _read_store_json(path, quarantine=True, _tries=_tries - 1)   # declined: the file changed under us
 
 
-def load_goals(fsid):
-    _goal_io_bump("loads")
-    raw = _read_store_json(GOALDIR / (fsid + ".json"), quarantine=True)
-    if raw is None:
-        # a FRESH store is born at the current identity version — only stores with history recorded
-        # under an OLDER derivation are ever sealed (see _migrate_placements)
-        store = {"rompUuid": fsid, "seq": 0, "nodes": {}, "placements": {}, "status": {},
-                 "placementsV": PLACEMENTS_V}
-        store["_baseRev"] = 0            # no file yet; a writer that CREATES one still trips the CAS
-        return store
-    store = _guard_nodes(raw)
-    if _replay_overrides(fsid, store):
+def _fresh_store(fsid):
+    """The store a session has before its first publish: no file at the path (or the unparseable one that was
+    there was just moved aside by _read_store_json). Born at the current identity version — only stores with
+    history recorded under an OLDER derivation are ever sealed (see _migrate_placements). Carries _baseRev 0:
+    a writer that CREATES the file still trips the CAS. Never marked: the empty store IS what disk holds."""
+    store = {"rompUuid": fsid, "seq": 0, "nodes": {}, "placements": {}, "status": {},
+             "placementsV": PLACEMENTS_V}
+    store["_baseRev"] = 0
+    return store
+
+
+def _finish_load(fsid, store, lines=None):
+    """The tail every loader runs on a freshly parsed, node-guarded store: replay the override journal
+    (`lines` when the caller already read it, else from the file), re-derive the rollup when the replay
+    wrote, and stamp the CAS base. One function so load_goals and load_goals_shared cannot drift."""
+    if _replay_overrides(fsid, store, lines=lines):
         # the replay WROTE (a clobbered user resolve/clear re-flagged): the published status/confirming
         # predate it, and every reader now trusts those exports as the one truth (no raw-flag second
         # opinions since 2026-08-13) — so re-derive them at the replay's own write, never serve stale
@@ -3272,6 +3278,24 @@ def load_goals(fsid):
     # minutes-long model call). Transient — popped before the store is ever serialized.
     store["_baseRev"] = int(store.get("rev") or 0)
     return store
+
+
+def load_goals(fsid):
+    """The WRITER's loader: a private, mutable store the caller may mutate and hand to save_goals. Read-only
+    callers on the pusher thread take load_goals_shared instead (one parse per file version, shared).
+
+    The session's goal store: the file parsed, the override journal replayed onto it, and two TRANSIENT
+    keys that are never serialized (save_goals pops both; _store_content keeps both out of the content hash):
+    `_baseRev`, the revision read, for save_goals' CAS; and `_unread` ("journal"), set by _replay_overrides
+    when the journal exists and could not be read. A store file that cannot be read RAISES, never an empty
+    store (load_goals_or_fault is the per-session boundary that catches it); an unparseable one is moved
+    aside by _read_store_json and the fresh store is the legitimate answer; an ABSENT file is the fresh
+    store, unmarked (empty IS its content)."""
+    _goal_io_bump("loads")
+    raw = _read_store_json(GOALDIR / (fsid + ".json"), quarantine=True)
+    if raw is None:
+        return _fresh_store(fsid)
+    return _finish_load(fsid, _guard_nodes(raw))
 
 
 _STORE_FAULTS = {}                       # fsid -> the fault text of its CURRENT unreadable episode (load_goals_or_fault)
@@ -3299,11 +3323,20 @@ def load_goals_or_fault(fsid):
     return _or_fault(fsid, load_goals)
 
 
+def load_goals_shared_or_fault(fsid):
+    """load_goals_or_fault for the pusher's read-only sites: the same boundary (one `store-unreadable` row per
+    fault episode, `(None, exc)` on a fault, never an empty store) around load_goals_shared, so the builders
+    that share one parsed store per file version keep the per-session containment. A read fault raises out
+    of load_goals_shared exactly as it does out of load_goals, and the cache keeps nothing for it."""
+    return _or_fault(fsid, load_goals_shared)
+
+
 def _or_fault(fsid, loader):
     """load_goals_or_fault's boundary around any reader of `fsid`'s store: `loader(fsid)` is load_goals
-    itself there, and a pass's shared per-store read elsewhere (run_propagate's _get, so a recipient read
-    through the boundary is still the one read that pass takes of the store). Same episode table, same
-    `store-unreadable` row once per fault episode, same `(store, None)` / `(None, exc)` answer."""
+    itself there, load_goals_shared for the pusher's read-only sites, and a pass's shared per-store read
+    elsewhere (run_propagate's _get, so a recipient read through the boundary is still the one read that
+    pass takes of the store). Same episode table, same `store-unreadable` row once per fault episode, same
+    `(store, None)` / `(None, exc)` answer."""
     try:
         store = loader(fsid)
     except OSError as e:
@@ -3584,7 +3617,7 @@ def append_restore(fsid, nodes, status, t):
                             "status": dict(status)}) + "\n")
 
 
-def _replay_overrides(fsid, store):
+def _replay_overrides(fsid, store, lines=None):
     """Re-apply journaled user overrides to a freshly loaded store. Idempotent: an entry whose effect
     is already in the store (the normal case — the kernel's own save survived) is a no-op, so a node's
     log gains exactly one user event no matter how many loads replay the journal. A journaled node the
@@ -3606,20 +3639,26 @@ def _replay_overrides(fsid, store):
     a card reply in the same second are two gestures, and the old >= guard silently dropped the
     reply's replay, bouncing the card back mid-pass). Judge events do not cancel a replay: the user
     event is appended anyway and the fold's authority rules arbitrate. `block` keeps at-or-after: a
-    user reply in the same second as a nudge stamp genuinely answers it."""
-    fp = _overrides_dir() / (fsid + ".jsonl")
-    if not fp.is_file():
-        return False
-    try:
-        lines = fp.read_text().splitlines()
-    except OSError as e:
-        _log_judge_error("romp", fsid, "history-unreadable",
-                         note="override journal unreadable: %s — user actions may show undone until it reads" % e)
-        # the store parsed but the journal exists and did not read: the user's gestures are missing from
-        # this view until it does. The journal replays on every load, so a publish of this store loses
-        # nothing durable; the mark tells an identity-keyed reader not to cache it (see the docstring).
-        store["_unread"] = "journal"
-        return False
+    user reply in the same second as a nudge stamp genuinely answers it.
+
+    `lines`: the journal's lines when the caller has already read them (load_goals_shared reads the
+    journal from a descriptor it also takes the file's identity from, so the replayed rows and the key
+    that stands for them are one file version); None reads the file here, and a journal that exists but
+    cannot be read marks the store `_unread` (see above) after the judge-errors row."""
+    if lines is None:
+        fp = _overrides_dir() / (fsid + ".jsonl")
+        if not fp.is_file():
+            return False
+        try:
+            lines = fp.read_text().splitlines()
+        except OSError as e:
+            _log_judge_error("romp", fsid, "history-unreadable",
+                             note="override journal unreadable: %s — user actions may show undone until it reads" % e)
+            # the store parsed but the journal exists and did not read: the user's gestures are missing from
+            # this view until it does. The journal replays on every load, so a publish of this store loses
+            # nothing durable; the mark tells an identity-keyed reader not to cache it (see the docstring).
+            store["_unread"] = "journal"
+            return False
     applied = False                                    # any write → load_goals re-runs rollup (one truth)
     arch_nodes = None                                  # the archive is read once, only if a restore entry needs it
     for ln in lines:
@@ -3950,6 +3989,431 @@ def _matches_disk(fsid, store, mine=None):
     return mine is not None and ent[1] == mine
 
 
+# ── the shared read-only goal-store cache (2026-09-06) ───────────────────────────────────────────────
+# The pusher thread loads a goal store at nine read-only sites per cycle (the timeline's per-lane load,
+# the feed's peer-origin badge, the chat's seams and ledger tree, the stamp readers, the working-note
+# expiry, the deferral sweep, the message-summary scan), and every one of those loads parsed the file
+# again: on a self-hosted 30-session deployment about 7% of the kernel's interpreter time went to
+# re-parsing stores that had not changed since the previous cycle. load_goals_shared serves those sites
+# ONE parsed object per file version; every writer stays on load_goals (a private copy it may mutate and
+# hand to save_goals).
+#
+# A hit is a proof about CONTENT, not identity. Each call opens the store, takes the file's identity
+# (inode, mtime_ns, size) from the descriptor, reads the bytes from the same descriptor and compares
+# them to the entry's (a memcmp, about 6% of a parse), so the coarse-timestamp blind spot the judge
+# pass's stat-keyed snapshot memo documents (kernel.py: an equal-size republish onto a recycled inode
+# inside one clock tick reproduces the stat key) cannot serve a stale parse here. The override journal
+# is keyed on its (inode, mtime_ns, size) alone: its only writers append (append_override / append_block
+# / append_restore), so an equal key is an equal content. The goals-archive is keyed the same way; it is
+# read only when a restore row replays, and its key has no byte compare, so the equal-size same-tick
+# recycled-inode case is the one blind spot left — it needs a restore row in the journal AND a kernel
+# without multigrain timestamps (Linux before 6.13).
+#
+# The entry is the view load_goals gives (same guard, same replay, same rollup, same _baseRev, so a
+# shallow copy handed to save_goals still meets the CAS), deep-frozen: the store, its nested maps
+# (nodes, status, placements, rewindSwept, rewindRestored, ...), every node, and every list (log,
+# warns, seams, confirming, ...) are dict and list SUBCLASSES whose write methods raise
+# FrozenStoreError. Subclasses, not proxies or tuples: consumers isinstance-test dict and list and
+# json.dumps the store, and a proxy or a tuple is neither. A write attempt is a bug in a reader, and it
+# is handled so the bug is loud and the board keeps rendering: the guard files a judge-errors row that
+# names the call site, switches the cache OFF for the process (every later load_goals_shared takes its
+# own load_goals) and raises, so the shared object is never corrupted and shared_store_stats reports
+# `off`. copy.copy / copy.deepcopy of a frozen container hand back plain, writable ones.
+#
+# Documented drift: record_verdict's `at` on a row the replay appends and a replay-triggered seam's `t`
+# are stamped at fill time and then shared, where every load_goals re-stamps them on each load. `at` is
+# an arrival stamp nothing reads back. The seam's `t` is not: apply_seams splits segments at it, so the
+# shared view and a writer's private load can place that split at different seconds until the next
+# writer publish (which persists the writer's stamp and moves the store's identity) makes the two
+# loaders agree again. The view's verdicts, flags and status are identical throughout, and no writer
+# persists a stamp from a read-only load.
+#
+# Invalidation is exact by construction: a store publish is a rename to a new inode (save_goals), a
+# journal write an append, an archive publish a rename. save_goals also pops its path after the rename
+# (the writer's object is never the shared one), _rebind_state and migrate_all_stores clear, and the
+# kernel's compaction sweep evicts absent paths (_shared_evict_absent). Two fills of one path race
+# harmlessly: the second checks under the lock for an entry with its exact keys and bytes and returns
+# that object, so concurrent readers of one file version receive one object.
+_SHARED = {}                                     # store path → (keys, store bytes, frozen store)
+_SHARED_LOCK = threading.Lock()
+_SHARED_OFF = [False]                            # a write attempt on a shared object switches the cache off (see _shared_poison)
+_SHARED_STATS = {"hit": 0, "miss": 0, "compare_miss": 0, "refuse": 0, "dup": 0, "absent": 0, "corrupt": 0,
+                 "unreadable_journal": 0, "evict": 0, "fallback": 0, "poisoned": 0}
+
+
+class FrozenStoreError(TypeError):
+    """A write to a goal store served by load_goals_shared. Writers load their own copy with load_goals."""
+
+
+def _shared_bump(key, n=1):
+    with _SHARED_LOCK:
+        _SHARED_STATS[key] += n
+
+
+_FROZEN_INTERNAL = frozenset(("_frozen_write", "_shared_poison", "_write_site", "_frozen_sid", "__setitem__", "__delitem__",
+                              "pop", "popitem", "setdefault", "update", "clear", "__ior__", "__iadd__",
+                              "__imul__", "append", "extend", "insert", "remove", "sort", "reverse"))
+
+
+def _write_site():
+    """The frames that wrote to a frozen container, outermost first, as `file:line function()` joined by
+    ` -> `: the innermost frame above the frozen classes' own methods, and, when that frame is in this
+    module (a judge helper such as rollup_status handed a shared store by a kernel site), the nearest frame
+    outside this module — the site to fix, not only the helper that wrote:
+    `kernel.py:8037 _open_top_goal() -> judge.py:5432 rollup_status()`."""
+    frames = [fr for fr in reversed(traceback.extract_stack())
+              if not (fr.filename == __file__ and fr.name in _FROZEN_INTERNAL)]
+    if not frames:
+        return "?"
+    chain = [frames[0]]
+    if frames[0].filename == __file__:
+        outer = next((fr for fr in frames[1:] if fr.filename != __file__), None)
+        if outer is not None:
+            chain.insert(0, outer)
+    return " -> ".join("%s:%d %s()" % (os.path.basename(fr.filename), fr.lineno, fr.name) for fr in chain)
+
+
+def _frozen_sid(container):
+    """The session whose shared store a written container belongs to: the store's own `_fsid` when the
+    container IS the store, a node's id prefix (`<sid>:gN`) when it is a node, else "" — a nested map or
+    list (a status map, a log) carries no way back to its store."""
+    if isinstance(container, FrozenStore):
+        return getattr(container, "_fsid", None) or ""
+    if isinstance(container, FrozenGuardedNode):
+        return str(container.get("id") or "").rsplit(":", 1)[0]
+    return ""
+
+
+def _shared_poison(what, container=None):
+    """A reader tried to write a shared object. File the row that names the site chain and, when the
+    container can say, the sid (once), switch the cache off for the process and count the attempt; the raise
+    follows in the caller and the object is untouched."""
+    with _SHARED_LOCK:
+        first = not _SHARED_OFF[0]
+        _SHARED_OFF[0] = True
+        _SHARED_STATS["poisoned"] += 1
+    if first:
+        _log_judge_error("romp", _frozen_sid(container), "frozen-store-write",
+                         note="%s at %s — a reader wrote to the shared read-only goal store; the shared cache is "
+                              "off until the kernel restarts (every reader takes its own load)" % (what, _write_site()))
+
+
+def _frozen_write(container, what):
+    _shared_poison(what, container)
+    raise FrozenStoreError("%s on a shared read-only goal store (load_goals_shared); a writer loads its own "
+                           "copy with load_goals" % what)
+
+
+class FrozenDict(dict):
+    """A dict whose every write path raises FrozenStoreError after reporting the site (_shared_poison).
+    Reads, iteration, isinstance(x, dict) and json.dumps behave as on a dict; copy.copy and copy.deepcopy
+    hand back plain, writable containers; pickling writes a plain dict."""
+    __slots__ = ()
+
+    def __setitem__(self, k, v):
+        _frozen_write(self, "assignment of %r" % (k,))
+
+    def __delitem__(self, k):
+        _frozen_write(self, "deletion of %r" % (k,))
+
+    def pop(self, *a):
+        _frozen_write(self, "pop of %r" % (a[0] if a else None,))
+
+    def popitem(self):
+        _frozen_write(self, "popitem")
+
+    def setdefault(self, k, default=None):
+        _frozen_write(self, "setdefault of %r" % (k,))
+
+    def update(self, *a, **kw):
+        _frozen_write(self, "update")
+
+    def clear(self):
+        _frozen_write(self, "clear")
+
+    def __ior__(self, other):
+        _frozen_write(self, "|= update")
+
+    def __copy__(self):
+        return dict(self)
+
+    def __deepcopy__(self, memo):
+        return copy.deepcopy(dict(self), memo)
+
+    def __reduce_ex__(self, protocol):
+        return (dict, (dict(self),))
+
+
+class FrozenList(list):
+    """The list twin of FrozenDict: every write path raises after reporting the site. isinstance(x, list)
+    holds, `+` with a list yields a plain list, slicing and copy() yield plain lists."""
+    __slots__ = ()
+
+    def __setitem__(self, i, v):
+        _frozen_write(self, "list assignment")
+
+    def __delitem__(self, i):
+        _frozen_write(self, "list deletion")
+
+    def __iadd__(self, other):
+        _frozen_write(self, "list +=")
+
+    def __imul__(self, n):
+        _frozen_write(self, "list *=")
+
+    def append(self, v):
+        _frozen_write(self, "list append")
+
+    def extend(self, it):
+        _frozen_write(self, "list extend")
+
+    def insert(self, i, v):
+        _frozen_write(self, "list insert")
+
+    def pop(self, *a):
+        _frozen_write(self, "list pop")
+
+    def remove(self, v):
+        _frozen_write(self, "list remove")
+
+    def clear(self):
+        _frozen_write(self, "list clear")
+
+    def sort(self, *a, **kw):
+        _frozen_write(self, "list sort")
+
+    def reverse(self):
+        _frozen_write(self, "list reverse")
+
+    def __copy__(self):
+        return list(self)
+
+    def __deepcopy__(self, memo):
+        return copy.deepcopy(list(self), memo)
+
+    def __reduce_ex__(self, protocol):
+        return (list, (list(self),))
+
+
+class FrozenGuardedNode(FrozenDict, GuardedNode):
+    """A node of a shared store: a GuardedNode for every consumer that isinstance-tests one, whose every
+    write raises — PROTECTED key or not, inside _authority() or not. record_verdict and rollup_status on a
+    shared node fail instead of unlocking it."""
+    __slots__ = ()
+
+
+class FrozenStore(FrozenDict):
+    """The top-level object load_goals_shared returns: a FrozenDict by behavior, its own class so save_goals
+    can name the misuse. `_fsid`: the session's id, set by _freeze_store, so the write-guard's row can name
+    the store a top-level write reached."""
+    __slots__ = ("_fsid",)
+
+
+def _freeze(o):
+    """Freeze a parsed store's object graph: every dict becomes a FrozenDict, every GuardedNode a
+    FrozenGuardedNode, every list a FrozenList, leaves stay. Containers are re-typed bottom-up in place
+    (one C-level copy each), and only EXACT types convert — a parse plus the replay yields nothing else."""
+    t = type(o)
+    if t is dict or t is GuardedNode:
+        for k, v in o.items():
+            tv = type(v)
+            if tv is dict or tv is list or tv is GuardedNode:
+                dict.__setitem__(o, k, _freeze(v))       # bypass GuardedNode's key guard: this re-types a value
+        return FrozenGuardedNode(o) if t is GuardedNode else FrozenDict(o)
+    if t is list:
+        for i, v in enumerate(o):
+            tv = type(v)
+            if tv is dict or tv is list or tv is GuardedNode:
+                o[i] = _freeze(v)
+        return FrozenList(o)
+    return o
+
+
+def _freeze_store(store, fsid=None):
+    for k, v in store.items():
+        tv = type(v)
+        if tv is dict or tv is list or tv is GuardedNode:
+            store[k] = _freeze(v)
+    fs = FrozenStore(store)
+    fs._fsid = fsid if fsid is not None else store.get("rompUuid")
+    return fs
+
+
+def _file_key(path_s):
+    """(inode, mtime_ns, size) of a regular file by path; None when there is none; a fresh sentinel when it
+    exists but cannot be stat'ed or is not a regular file, so no entry matches and the fill reports it."""
+    try:
+        st = os.stat(path_s)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return object()
+    if not stat.S_ISREG(st.st_mode):
+        return None                                  # _replay_overrides' is_file(): not a file is no journal
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _journal_key(fsid):
+    return _file_key(str(_overrides_dir() / (fsid + ".jsonl")))
+
+
+def _archive_key(fsid):
+    return _file_key(str(GOALARCHDIR / (fsid + ".json")))
+
+
+def _journal_read(fsid):
+    """(identity, lines) of the override journal from ONE descriptor — (None, ()) when there is none.
+    Raises OSError when it exists but cannot be read; the caller does not memoize then."""
+    p = str(_overrides_dir() / (fsid + ".jsonl"))
+    try:
+        fd = os.open(p, os.O_RDONLY)
+    except FileNotFoundError:
+        return None, ()
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, ()
+        data = _disk_read(fd, p)
+    finally:
+        os.close(fd)
+    return (st.st_ino, st.st_mtime_ns, st.st_size), data.decode().splitlines()
+
+
+def _shared_forget(path_s):
+    with _SHARED_LOCK:
+        _SHARED.pop(path_s, None)
+
+
+def _shared_clear():
+    """Drop every entry and lift the off switch: a rebind or the boot sweep changed the world."""
+    with _SHARED_LOCK:
+        _SHARED.clear()
+        _SHARED_OFF[0] = False
+
+
+def _shared_evict_absent():
+    """Drop entries whose store file is gone (a removed session); the kernel's compaction sweep calls this
+    beside _disk_memo_evict_absent."""
+    with _SHARED_LOCK:
+        gone = [k for k in _SHARED if not os.path.exists(k)]
+        for k in gone:
+            del _SHARED[k]
+        _SHARED_STATS["evict"] += len(gone)
+    return len(gone)
+
+
+def shared_store_stats():
+    """The cache's counters plus its occupancy. hit: identity and bytes matched. miss: no entry, or its keys
+    moved. compare_miss: identity matched and the bytes did not. refuse: a fill not published because the
+    archive moved under it. dup: a fill discarded for a concurrent fill's identical entry. absent: no store
+    file. corrupt: bytes that did not parse, handed to load_goals (which moves them aside); nothing cached.
+    unreadable_journal: served uncached from load_goals. evict:
+    entries dropped for gone files. fallback: calls served by load_goals because the cache is off. poisoned:
+    write attempts on a shared object (the first switched the cache off). Gauges: entries, bytes (the raw
+    store bytes held for the compare), off."""
+    with _SHARED_LOCK:
+        out = dict(_SHARED_STATS)
+        out["entries"] = len(_SHARED)
+        out["bytes"] = sum(len(e[1]) for e in _SHARED.values())
+        out["off"] = int(_SHARED_OFF[0])
+    return out
+
+
+def store_key(fsid):
+    """The store file's identity (inode, mtime_ns, size) from a fresh stat, None when absent — the per-session
+    key a view signature can carry. Independent of the cache: one stat, no entry consulted."""
+    return _file_key(str(GOALDIR / (fsid + ".json")))
+
+
+def load_goals_shared(fsid):
+    """A READ-ONLY view of a session's goal store, shared by every caller until the store, its override
+    journal or the goals-archive changes: exactly what load_goals returns (guarded nodes, journal replayed,
+    rollup re-derived when the replay wrote, _baseRev), deep-frozen — see the note above. Callers must not
+    write to it (a write raises FrozenStoreError and switches the cache off) and must not hand it to
+    save_goals (refused). A writer, and anything that calls rollup_status or record_verdict on the object,
+    stays on load_goals.
+
+    No store file: load_goals' fresh store (private, mutable; nothing to share). A store file that cannot be
+    read: the OSError RAISES, exactly as load_goals raises it, and nothing is cached for the path; the
+    pusher's builders call this through load_goals_shared_or_fault, the per-session boundary that files one
+    store-unreadable row per fault episode. Unreadable journal: not memoized; load_goals' own result, so its
+    judge-errors row keeps logging until the journal reads. Bytes that do not parse: handed to load_goals,
+    which moves the file aside (a stderr line and a store-quarantined row, once: the path then reads as
+    absent) and answers the legitimate fresh store; nothing is cached for it. A store carrying `_unread` is
+    never published: a view missing the journal's rows is not the files' content."""
+    if _SHARED_OFF[0]:
+        _shared_bump("fallback")
+        return load_goals(fsid)
+    path_s = str(GOALDIR / (fsid + ".json"))
+    jkey0, akey0 = _journal_key(fsid), _archive_key(fsid)   # BEFORE the store read: see the fill below
+    try:
+        fd = os.open(path_s, os.O_RDONLY)
+    except FileNotFoundError:
+        _shared_forget(path_s)
+        _shared_bump("absent")
+        return load_goals(fsid)                      # the fresh store: private, nothing to share
+    except OSError:
+        _shared_forget(path_s)                       # a read FAULT raises, as load_goals' does (the caller's
+        raise                                        # boundary files it); nothing is cached for the path
+    try:
+        skey = _disk_ident(fd)
+        data = _disk_read(fd, path_s)
+    except OSError:
+        _shared_forget(path_s)
+        raise
+    finally:
+        os.close(fd)
+    keys = (skey, jkey0, akey0)
+    with _SHARED_LOCK:
+        ent = _SHARED.get(path_s)
+    if ent is not None and ent[0] == keys:
+        if ent[1] == data:
+            _shared_bump("hit")
+            return ent[2]
+        _shared_bump("compare_miss")                 # same identity, other bytes: the blind spot, closed here
+    else:
+        _shared_bump("miss")
+    # FILL. The journal's rows and identity come from one descriptor, as the store's bytes and identity
+    # did above, so both keys stand for exactly what the entry replayed. The archive is read by path
+    # inside the replay (only when a restore row needs it), between the stat above and the one below:
+    # equal keys bracket the read, so the entry describes what it holds; unequal, it is not published.
+    try:
+        jkey, lines = _journal_read(fsid)
+    except OSError:
+        _shared_bump("unreadable_journal")
+        _shared_forget(path_s)
+        return load_goals(fsid)                      # uncached: its replay files history-unreadable every load
+    try:
+        store = _guard_nodes(_disk_parse(path_s, data))
+    except ValueError:
+        _shared_bump("corrupt")
+        _shared_forget(path_s)
+        return load_goals(fsid)                      # load_goals moves the bytes aside (one stderr line, one
+                                                     # store-quarantined row) and answers the fresh store; the
+                                                     # path then reads as absent, so nothing is cached for it
+    store = _finish_load(fsid, store, lines=lines)   # a malformed row raises, as in load_goals
+    if store.get("_unread"):
+        # the replay marked the store (its journal did not read): not the files' content, so not shared.
+        # Unreachable while the journal's rows arrive as `lines` (the only marker left is the lines-is-None
+        # OSError path, taken above through load_goals); kept so the invariant holds at the write moment
+        _shared_bump("unreadable_journal")
+        _shared_forget(path_s)
+        return store
+    frozen = _freeze_store(store, fsid)
+    akey1 = _archive_key(fsid)
+    keys = (skey, jkey, akey1)
+    with _SHARED_LOCK:
+        cur = _SHARED.get(path_s)
+        if cur is not None and cur[0] == keys and cur[1] == data:
+            _SHARED_STATS["dup"] += 1                # a concurrent fill of this version published first:
+            return cur[2]                            # one object for every reader of it
+        if akey1 != akey0:
+            _SHARED_STATS["refuse"] += 1             # the archive moved under the replay: right for this
+            return frozen                            # caller, unproven for the next, so not published
+        _SHARED[path_s] = (keys, data, frozen)
+    return frozen
+
+
 def save_goals(fsid, store):
     """Publish the store, REBASING first if anyone else published while we held it (the user 2026-07-22).
 
@@ -3978,8 +4442,19 @@ def save_goals(fsid, store):
     serialization of our own store, not a parse of the file, and the write seeds the entry for the next check
     when no rebase changed what we wrote. The CAS below reads the file's revision from the file (_disk_rev),
     never from the memo, so a real publish parses once, for the CAS. Both readers raise on a read fault or a
-    corrupt file, as _rebase_onto_disk does: nothing is published over bytes this save could not read."""
+    corrupt file, as _rebase_onto_disk does: nothing is published over bytes this save could not read.
+
+    A store served by load_goals_shared (or a shallow copy of one, whose nodes map is still the shared one)
+    is refused here, FIRST — before the no-op check, which would otherwise take a shared view for a
+    writer's, and before any write that the frozen containers would turn into a cache-poisoning raise.
+    The row makes the misuse visible through the except-Exception wrappers around every tick job."""
     _goal_io_bump("saves")
+    if isinstance(store, FrozenDict) or isinstance(store.get("nodes"), FrozenDict):
+        _log_judge_error("romp", fsid, "frozen-store-save",
+                         note="save_goals was handed the shared read-only store (load_goals_shared); a writer "
+                              "loads its own copy with load_goals — nothing was published")
+        raise FrozenStoreError("save_goals refuses a shared read-only store (load_goals_shared); load the "
+                               "writer's copy with load_goals")
     GOALDIR.mkdir(parents=True, exist_ok=True)
     mine = _own_hash(store) if "_baseRev" in store else None
     if mine is not None and _matches_disk(fsid, store, mine):
@@ -4005,6 +4480,8 @@ def save_goals(fsid, store):
     if mine is not None and not rebased:             # a rebase changed the content `mine` describes
         _disk_seed(GOALDIR / (fsid + ".json"), tmp, mine)
     tmp.rename(GOALDIR / (fsid + ".json"))            # atomic publish
+    _shared_forget(str(GOALDIR / (fsid + ".json")))   # the shared read-only view of the old version goes with
+    #                                                   it (its identity check would miss anyway; this frees the bytes)
 
 
 def load_goal_archive(fsid):
@@ -7989,6 +8466,7 @@ def migrate_all_stores():
                 tmp.write_text(json.dumps(store))
                 tmp.rename(p)                         # atomic publish
                 n += 1
+    _shared_clear()                                   # the shared read-only views predate the sweep's publishes
     return n
 
 

@@ -155,6 +155,28 @@ class ReasonsRetireOnTheirEvents(SweepBase):
                          "a live captioner call must not re-dress a durable hold")
 
 
+class SharedViewRead(SweepBase):
+    """The sweep's one store read per session takes the shared read-only view (kernel/judge.py
+    load_goals_shared): it reads nodes, status and confirming and writes nothing, so two ticks over an
+    unchanged store parse it once."""
+
+    def test_the_sweep_reads_the_shared_view(self):
+        self._rec("a reason a future reviver minted")       # an unknown why stands: the record survives both ticks
+        jd._shared_clear()
+        private, o_load = [], jd.load_goals
+        jd.load_goals = lambda fsid: (private.append(fsid), o_load(fsid))[1]
+        stats0 = jd.shared_store_stats()
+        try:
+            km._deferral_sweep_tick(NOW)
+            km._deferral_sweep_tick(NOW)
+        finally:
+            jd.load_goals = o_load
+        stats = jd.shared_store_stats()
+        self.assertIn(GID, self._d["deferred"])
+        self.assertEqual(private, [], "the writer's loader is never asked")
+        self.assertEqual((stats["miss"] - stats0["miss"], stats["hit"] - stats0["hit"]), (1, 1), "one parse, then a hit")
+
+
 class HardRuleAndRoutingPins(unittest.TestCase):
     """build_feed's presentation, pinned by source (the build_feed test pattern)."""
 
