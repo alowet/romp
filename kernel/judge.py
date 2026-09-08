@@ -180,6 +180,12 @@ def _rebind_state(path):
         _ABSENT_FLAGS.clear()   # the absent-store predicate memo: same full-path keys, same reasoning
     _shared_clear()             # the shared read-only store cache: same path keying, same reason; also lifts
     #                         a test's deliberate write-guard trip (the poison flag) so the next class starts clean
+    with _STAGE_LOCK:
+        _STAGE_STAMP.clear()    # the evidence gate's stamps describe the OLD root's files; a new root is a new world
+    with _TIER_LOCK:
+        for _d in _TIER_STATS.values():
+            for _k in _d:
+                _d[_k] = 0      # a test reads the gate's counters from zero
     # (the override journal needs no rebinding: _overrides_dir() derives from GOALDIR at call time, so
     #  ANY isolation style — _rebind_state OR a bare GOALDIR reassignment — scopes it automatically)
 
@@ -1030,6 +1036,232 @@ def pass_done(tier, fsid):
 def pass_watermark(tier, fsid):
     """When `tier` last completed a per-session pass over fsid this boot, or None."""
     return _PASS_DONE.get((str(tier), str(fsid)))
+
+
+# ── the EVIDENCE GATE (2026-09-07) ─────────────────────────────────────────────────────────────────
+# Every planner and closer pass ran every discovered session in full: a parse, a store load, the unit
+# walk, the closed-turn walk, a rollup and an unconditional save, per session, per pass, with about
+# two of thirty-three sessions holding anything new per pass on the live kernel. The gate skips a
+# (tier, session) run when nothing it would read has changed. It is exact by construction, not a
+# heuristic: a run is skipped only when EVERY input the tier's decision path reads is identical, by
+# identity, to what the tier last judged TO COMPLETION, and no clock input it holds has crossed its
+# recorded instant. Three rules carry that:
+#  1. Key before read, one key per pass. The transcript component is the (fileset, cut) pair the pass
+#     pinned together with the parse it judged (_frame_parse_key), captured no later than the parse's
+#     content was read, so judged content can be newer than the stamped key (one redundant run next
+#     pass) and never older (a missed run). Every other component is stat'd by the gate before the
+#     stage reads it, at the tier's own moment: stores flow through the pass on purpose (the closer
+#     must see the planner's publish), so each tier keys on what it is about to read.
+#  2. The stamp is written after the stage returns normally with a clean completeness bit
+#     (_judge_ctx.stage_incomplete, set by the _judge_run wrapper on any empty reply and by the stage
+#     sites that defer without writing), from the signature computed BEFORE the run. A stage that
+#     deferred, was paused, failed a call, had a reply rejected without a write, raised, or was cut
+#     leaves no stamp, and so runs again next pass.
+#  3. Every writer re-arms by moving an identity: a judge publish is a rename (save_goals), a user
+#     gesture appends the override journal, kernel-side blocks and lifts publish through save_goals,
+#     a rewind appends the transcript or the states file, a bare rollback rides the cut in the pinned
+#     pair, a death marker is rewritten, a to-do item moves its file. A write racing the stat-then-run
+#     window is stamped under the pre-write identity and costs one redundant run; the tier's OWN write
+#     re-arms it once (the follow-on run makes no call, writes nothing, and stamps). Stamping a
+#     post-write identity would assume the tier is a fixpoint of its own output, which nothing
+#     guarantees.
+# The one clock input is a background launch's deadline (em._bg_expiry_t): the stamp carries the
+# earliest future expiry, and the run is due once the pass's `now` passes it. The invariant every test
+# of this protects (CLAUDE.md, cards move on new information): the gate never withholds a verdict the
+# ungated pass would have filed from NEW evidence. In-memory only, empty at boot: the first pass after a
+# restart is a full walk, as before.
+# Accepted lag, stated once: under an open frame every parsed_session caller sees the pass-start world
+# (a cache hit too, since the warm-touch pin of 2026-09-06), so the six pusher tick jobs that read the
+# judge parse (_interrupt_block_tick, _closer_pending, _awaiting_wake_outcomes, _deferral_sweep_tick,
+# _auto_nudge_session, _clear_done_working_notes) see a world up to one pass old for every session, and
+# a turn that ends after a pass's first touch is judged next pass, whole. That is the frame's design
+# (2026-07-21); the gate adds no lag of its own beyond the producer's 3 s backstop for the clock input.
+GATED_TIERS = ("plan", "close", "unblock", "group", "consolidate", "distill")
+_STAGE_STAMP = {}        # (tier, fsid) -> (sig, not_before): the inputs the tier last judged to completion
+_STAGE_LOCK = threading.Lock()
+_STAGE_STAMP_MAX = 4096  # belt: a wholesale clear at the cap (one full walk next pass)
+_TIER_STATS = {t: {"ran": 0, "skipped": 0, "stamped": 0, "bypassed": 0, "incomplete": 0, "due_clock": 0}
+               for t in GATED_TIERS}
+_TIER_LOCK = threading.Lock()
+
+
+def _tier_bump(tier, key, n=1):
+    with _TIER_LOCK:
+        _TIER_STATS[tier][key] += n
+
+
+def tier_stats():
+    """The gate's counters, per tier: ran (stage runs), skipped (runs the gate declined:
+    stamp matched, clock not due), stamped (runs that ended complete and wrote a stamp), bypassed (runs
+    with no signature to stamp, or whose parse was served under another cut), incomplete (runs the
+    completeness bit voided), due_clock (runs the clock input made due); plus `stamps`, the number of
+    stamps held. ran == stamped + bypassed + incomplete over any window."""
+    with _TIER_LOCK:
+        out = {t: dict(d) for t, d in _TIER_STATS.items()}
+    with _STAGE_LOCK:
+        out["stamps"] = len(_STAGE_STAMP)
+    return out
+
+
+def _ident(p):
+    """(st_ino, st_mtime_ns, st_size) of `p`, None when absent. Every other OSError propagates: the
+    gate reads it as run-and-do-not-stamp."""
+    try:
+        st = os.stat(p)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _reg_spawned_at(fsid):
+    """The spawnedAt VALUE of STATE/sdk/<fsid>.json, the only field _cli_epoch reads from it: model
+    picks, task writes, push notes and subagent events rewrite the reg and leave spawnedAt alone (40
+    rewrites in 90 s live), and keying the signature on the value rather than the file's identity is
+    what keeps those from re-arming the planner and closer. Read directly each time, never through an
+    identity memo: (inode, mtime_ns, size) is exact for the rename and append writers the identity
+    components rely on, but a rewrite in place of equal size within one mtime tick keeps all three, and a
+    memo keyed on them served the previous content (the kernel publishes the reg by os.replace, so it
+    never does that; a test fixture writing in place did, 2026-09-07). The reg is small; one read per
+    session per tier is the whole cost. None when the reg is absent, unreadable, or carries no number
+    (the value _cli_epoch derives too)."""
+    try:
+        v = json.loads((STATE / "sdk" / (fsid + ".json")).read_text()).get("spawnedAt")
+    except Exception:
+        return None
+    return v if isinstance(v, (int, float)) else None
+
+
+def _stall_slice(fsid):
+    """This session's stall records as a comparable tuple: what rollup_status's stall-warn retire reads
+    (stalled_facts). A record appearing or ending for THIS sid moves it; another sid's does not. Read by
+    value from the file each time, for the reason _reg_spawned_at gives."""
+    return tuple(sorted((g, r.get("why"), r.get("since")) for g, r in stalled_facts(fsid).items()))
+
+
+def _pair_key(pair):
+    """A parse pair as a comparable tuple: _fileset_key returns lists."""
+    return (tuple(tuple(x) for x in pair[0]), pair[1])
+
+
+def _sig_inputs(tier, fsid, path):
+    """The side files `tier`'s signature reads for `fsid` beyond the parse pair: (by_identity, by_value).
+    by_identity are stat'd; by_value are read for one derived value (the sdk reg for spawnedAt through
+    _reg_spawned_at, auto-nudge.json for this sid's stall slice, the task-store dir for its item
+    fingerprint). Exactly the files the tier's decision path reads: load_goals reads the store, the
+    override journal and (for restore rows) the archive; the planner's heal reads captions
+    (_prompt_gist), its pre-episode retire reads the episode log (episode_floor), _cli_epoch reads the
+    gone marker and the reg, plan_units reads cleared.jsonl (_live_anchor_gone -> _view_cleared),
+    rollup_status reads the stall slice, _sync_declared_plan reads the LEAF stem's task store; the
+    closer's idle path is the parse, the store, the marker, the reg, cleared.jsonl and the stall slice.
+    Kept apart from _stage_sig so the completeness test can hold a stage's reads against it."""
+    ident = [GOALDIR / (fsid + ".json"), _overrides_dir() / (fsid + ".jsonl"), GOALARCHDIR / (fsid + ".json")]
+    value = []
+    if tier in ("plan", "close"):
+        ident += [GONEDIR / (fsid + ".json"), STATE / "cleared.jsonl"]
+        value += [STATE / "sdk" / (fsid + ".json"), STATE / "auto-nudge.json"]
+    if tier == "plan":
+        ident += [CAPDIR / (fsid + ".jsonl"), EPIDIR / (fsid + ".jsonl")]
+        value += [em.task_store_dir(Path(path).stem)]
+    return ident, value
+
+
+def _stage_sig(tier, fsid, path):
+    """The identity of every input `tier`'s decision path reads for `fsid`, taken BEFORE the stage runs:
+    the pass's pinned parse pair with the candidate files it names (a path swap with a coincidentally
+    equal fileset key cannot match), the store trio, and the tier's side files (_sig_inputs). Raises
+    OSError when a component cannot be computed (a vanished candidate, an unlistable task dir, a pinned
+    None pair): the caller runs the stage and stamps nothing, never a raise out of the submit loop."""
+    pair, _cut, _fr = _frame_parse_key(fsid, [path])
+    if pair is None:
+        raise OSError("no parse pair for %s this pass" % fsid)
+    parse = (tuple(_judge_candidates(fsid, [path])), _pair_key(pair))
+    ident, _value = _sig_inputs(tier, fsid, path)
+    side = tuple(_ident(p) for p in ident)
+    extra = ()
+    if tier in ("plan", "close"):
+        extra = (_reg_spawned_at(fsid), _sdk_owned(fsid), _stall_slice(fsid))
+    if tier == "plan":
+        extra += (em.task_store_fp(Path(path).stem),)
+    return (parse, side, extra)
+
+
+def _gate_check(tier, fsid, path, now):
+    """Runner thread, before submit: (skip, sig). skip: the stamp matches and the clock input has not
+    crossed, so the runner stamps pass_done (a skip is a completed no-op pass: the wedged-reviver bound
+    in the kernel reads it) and submits nothing. sig None with skip False: no signature could be
+    computed; run, stamp nothing."""
+    try:
+        sig = _stage_sig(tier, fsid, path)
+    except OSError:
+        return False, None
+    with _STAGE_LOCK:
+        st = _STAGE_STAMP.get((tier, fsid))
+    if st is not None and st[0] == sig:
+        if st[1] is None or now <= st[1]:              # <=: em._bg_expired reads `now > expiry`, so at the
+            _tier_bump(tier, "skipped")                #  instant itself nothing has changed yet
+            pass_done(tier, fsid)
+            return True, None
+        _tier_bump(tier, "due_clock")
+    return False, sig
+
+
+def _gated(tier, fn, fsid, path, now, sig, settle=True, parse=True):
+    """Pool worker: run the stage, then stamp `sig` when the run was COMPLETE: it returned normally, set
+    no completeness bit, and (parse tiers) the frame served its parse under the very pair the signature
+    holds (a cut that moved between the pin and the parse means the judged world is not the stamped
+    one: no stamp). `settle`: the tier rolls up, so the stamp carries the clock input
+    (_settle_not_before). A stage that raises is counted `incomplete` (the run did not complete and
+    keyed nothing new) and the exception goes on to the runner's pass-crash row, so ran == stamped +
+    bypassed + incomplete holds through a crash.
+
+    No frame, no stamp: the served pair the frame records is what makes a stamp exact. A runner
+    outside a pass frame (romp-judge's --plan, a test calling run_plan alone) therefore never writes a
+    stamp: every session runs and counts as bypassed, and the signature's stats are still paid. It DOES
+    honour a stamp a framed pass left: _gate_check reads the live signature either way, so an unframed
+    run after a framed one skips the sessions nothing has changed for, exactly as a framed run would."""
+    _judge_ctx.stage_incomplete = False
+    _tier_bump(tier, "ran")
+    try:
+        out = fn(fsid, path, now)
+    except Exception:
+        _tier_bump(tier, "incomplete")                # the run did not complete; the runner logs the crash
+        raise
+    try:
+        if sig is None:
+            _tier_bump(tier, "bypassed")
+            return out
+        if getattr(_judge_ctx, "stage_incomplete", False):
+            _tier_bump(tier, "incomplete")
+            return out
+        if parse:
+            fr = _frame
+            served = None
+            if fr is not None:
+                with _frame_lock:
+                    served = fr["served"].get(fsid)
+            if served is None or _pair_key(served) != sig[0][1]:
+                _tier_bump(tier, "bypassed")
+                return out
+        nb = _settle_not_before(fsid, path, now) if settle else None
+        with _STAGE_LOCK:
+            if len(_STAGE_STAMP) >= _STAGE_STAMP_MAX:
+                _STAGE_STAMP.clear()
+            _STAGE_STAMP[(tier, fsid)] = (sig, nb)
+        _tier_bump(tier, "stamped")
+    except Exception as e:                            # a stamping failure is never a failed pass
+        _tier_bump(tier, "bypassed")
+        _log_judge_error(tier, fsid, "gate-stamp", note=repr(e))
+    return out
+
+
+def _gate_evict(tier, keep):
+    """After a tier's pass: drop the stamps of sids the pass did not list (a session outside the discover
+    window, or hidden from the feed, leaves and its stamp with it)."""
+    with _STAGE_LOCK:
+        for k in [k for k in _STAGE_STAMP if k[0] == tier and k[1] not in keep]:
+            del _STAGE_STAMP[k]
+
+
 _active_lock = threading.Lock()
 _active_seq = [0]
 _active_change = [0]      # bumped on EVERY begin and end — the exact "the set of in-flight judge calls
@@ -1499,6 +1731,18 @@ def _call_shape(model, sys_prompt, user, sent):
 
 
 def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", mark=None):
+    """Run ONE judge model call (_judge_run_impl) and mark the stage INCOMPLETE when it comes back empty
+    (the evidence gate's belt): a pause skip, the rate gate, a scratch refusal, a subprocess error, a
+    dead CLI, an error envelope, a timeout, and a whitespace-only reply all leave the stage's work
+    undone, so the gate must not stamp the pass as having judged this session. Stages set the same bit
+    at their own no-write deferrals (the suites patch the helpers above this belt)."""
+    out = _judge_run_impl(model, sys_prompt, user, effort=effort, judge=judge, tier=tier, mark=mark)
+    if not (out or "").strip():
+        _judge_ctx.stage_incomplete = True
+    return out
+
+
+def _judge_run_impl(model, sys_prompt, user, effort=None, judge=None, tier="triage", mark=None):
     """Run ONE judge model call. `mark` is the caller's per-call section mark (see _mark/_sec): passing
     it appends UNTRUSTED_SYS, which tells the model that marked sections are material, not orders. It
     rides the SYSTEM prompt, the half no transcript content can reach, and goes on LAST — see below."""
@@ -5988,6 +6232,10 @@ def apply_plan_guarded(fsid, path, store, seg_id, seg_t, ops, menu, place_key=No
     fresh parses carry the leaf_override, so the deferred unit never reaches the nudge gate."""
     away = _rewound_away(fsid, path, prompt_uuid) if prompt_uuid else False
     if away == "pending":
+        _judge_ctx.stage_incomplete = True         # deferred with no write: the evidence gate must not stamp
+        #                                             this run, or the unit waits for an unrelated re-arm
+        #                                             (a rollback arming during the model call reaches this
+        #                                             leg past the unit loop's own check; review 2026-09-07)
         _log_judge_error("planner", fsid, "rewind-stand-down-pending", seg=seg_id,
                          note="the unit's prompt is abandoned only under a still-pending cut — "
                               "deferred, not retired (the rewind can still fail)")
@@ -7416,8 +7664,9 @@ def _bg_unresolved(path, now=None):
     """The transcript's still-RUNNING background launches (em._scan_bg_tasks pairing), folded append-incrementally.
     The DURABLE awaited-work source: the pairing lives in the transcript, so unlike any live backend
     snapshot it survives a kernel restart and covers tmux CLIs whose tasks outlive the kernel.
-    `now`: the pass's clock when the planner hands it in (one clock for its key's expiry term and the
-    settle that term gates, so the two cannot disagree at the crossing); the wall clock otherwise."""
+    `now`: the pass's clock when a gated tier hands it in (one clock for the stage's expiry view, the
+    planner key's expiry term and the gate's not-before, so none of them can disagree at the crossing);
+    the wall clock otherwise."""
     # folds append-incrementally since 2026-09-03: a changed transcript steps only its appended records
     tasks = em.scan_bg_tasks_cached(path, _BG_SCAN_CACHE)
     # expiry is applied OUTSIDE the cache with a fresh now: a monitor whose CLI died mid-watch has no
@@ -7445,6 +7694,32 @@ def _bg_expiry_key(path, now):
                             for t in em.scan_bg_tasks_cached(path, _BG_SCAN_CACHE)))
     except Exception:
         return object()
+
+
+def _settle_not_before(fsid, path, now):
+    """The evidence gate's one clock input: the earliest instant AT OR AFTER `now` at which one of this
+    session's running background launches expires (em._bg_expiry_t) and the settle can change with no
+    file moving, or None. At-or-after, because em._bg_expired is strict (`now > expiry`): a launch whose
+    expiry equals this pass's `now` has NOT expired yet, the run that just completed judged it as still
+    running, and the pass after this one is the first that sees it expired, so the stamp must carry it
+    (the review's boundary case, 2026-09-07: run_triage's `now` is a whole second and transcript
+    timestamps are whole seconds, so an expiry equal to `now` is an ordinary pass, and dropping it left a
+    stamp with no clock that skipped every later pass while the settle waited). Ghost launches (before
+    the live CLI's epoch) are filtered by the rule _awaiting_bg_hold applies, so an expiry that could not
+    change a verdict never re-arms one. Read after a complete run from the live fold, which holds every
+    launch the judged world held (the transcript is append-only; a launch that landed after the pass's
+    pin moves the parse pair anyway). Never recomputed on a skip: with an unchanged signature the task
+    set is unchanged, so the stored instant is exact."""
+    tasks = em.scan_bg_tasks_cached(path, _BG_SCAN_CACHE)
+    sp = _cli_epoch(fsid)
+    nb = None
+    for t in tasks:
+        if sp and t.get("t") and t["t"] < sp:
+            continue
+        x = em._bg_expiry_t(t)
+        if x is not None and x >= now and (nb is None or x < nb):
+            nb = x
+    return nb
 
 
 def _death_marker(sid):
@@ -7530,7 +7805,8 @@ def _awaiting_bg_hold(fsid, path, session, store, now=None):
 def _session_settled(fsid, path, session, store, now=None):
     """The rollup's settled gate: the turn ended AND nothing the session dispatched is still awaited.
     _session_closed alone read the 'ended' proxy; this keys the settle on the event it was
-    approximating — the session actually handing back the floor."""
+    approximating — the session actually handing back the floor. `now`: the pass's clock (the gated
+    planner and closer hand theirs in, so the expiry they judge under is the one their stamp holds)."""
     return _session_closed(session) and not _awaiting_bg_hold(fsid, path, session, store, now)
 
 
@@ -9371,6 +9647,7 @@ def _plan_session(fsid, path, now):
             # abandoned only under an ARMED, unconsumed cut: DEFER without writing — a retirement
             # is permanent, and this rewind can still fail/dissolve (the apply_plan_guarded
             # contract's pending leg). The next pass re-decides from the resolved world.
+            _judge_ctx.stage_incomplete = True         # deferred without a write: the gate must not stamp
             _log_judge_error("planner", fsid, "rewind-stand-down-pending", seg=seg_id,
                              note="the unit's prompt is abandoned only under a still-pending cut — "
                                   "deferred, not retired (the rewind can still fail)")
@@ -9675,6 +9952,7 @@ def _plan_session(fsid, path, now):
         raw = plan_llm(text, _menu_text(store, menu), human=human, goal_num=pgi)
         ops = _parse_plan(raw, len(menu))
         if not ops and not raw:
+            _judge_ctx.stage_incomplete = True         # the unit stays due: no stamp for this pass
             continue                                   # the CALL failed (gate skip / error envelope / timeout),
             #                                            already logged upstream — retry next pass. It must not
             #                                            burn a PLAN_PARSE_RETRIES try: a rate-limit window
@@ -9751,6 +10029,7 @@ def _plan_session(fsid, path, now):
         # parse with an on-chain anchor. (Task-store mirrors of abandoned-turn to-dos are otherwise
         # LEFT AS-IS by decision: the task store is the authoritative source and a rewind does not
         # roll it back — the agent may genuinely still hold those to-dos.)
+        _judge_ctx.stage_incomplete = True             # skipped without a write: the gate must not stamp
         _log_judge_error("planner", fsid, "rewind-stand-down",
                          note="plan-sync skipped this pass: the latest segment was rewound away mid-pass")
     elif _sync_declared_plan(store, session, (latest_seg or {}).get("id"), (latest_seg or {}).get("t") or now,
@@ -9802,13 +10081,18 @@ def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=Fal
         _PLANNER_SEEN.pop(_gone, None)                # the planner gate, bounded by the sessions this pass discovered
     placed = 0
     with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
-        futs = {ex.submit(_plan_session, fsid, str(path), now): fsid for fsid, path, anchor, name in fleet}
+        futs = {}
+        for fsid, path, anchor, name in fleet:
+            skip, sig = _gate_check("plan", fsid, str(path), now)   # the evidence gate: nothing new, no run
+            if not skip:
+                futs[ex.submit(_gated, "plan", _plan_session, fsid, str(path), now, sig)] = fsid
         for fut in as_completed(futs):
             try:
                 placed += fut.result()
                 pass_done("plan", futs[fut])          # the pass over THIS fsid completed (W2c's event)
             except Exception as e:                    # fail LOUDLY, never silently skip the store (T111)
                 _log_judge_error("planner", futs[fut], "pass-crash", note=repr(e))
+    _gate_evict("plan", {f[0] for f in fleet})
     if verbose:
         sys.stderr.write("romp-judge: planner placed %d segments across %d sessions\n" % (placed, len(fleet)))
     return placed
@@ -11845,6 +12129,11 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
         _judge_ctx.close_menu = None                   # …nor a stale menu shape describe this turn's call
         res = _close_turn(store, turn, seg_by_id=seg_by_id)
         if res is None:
+            # Every leg below is "retry next pass" for this turn (a failed call, a parse reject under
+            # the cap, a strike under the cap, a transient cut): the walk is incomplete, so the evidence
+            # gate must not stamp it. The at-cap adoptions write the store and re-arm on their own; the
+            # mark costs them one extra run.
+            _judge_ctx.stage_incomplete = True
             # SAFEGUARDS TOMBSTONE (the user 2026-08-18): a safeguards refusal is the filter ruling on
             # this turn's CONTENT — deterministic per prompt — so the retry-next-pass contract for
             # transient failures burned one doomed call per pass, forever (2,955 refusals in six days,
@@ -11939,7 +12228,7 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
         swept.add(tid); sig[tid] = fp; did += 1        # remember the size we judged at → detect later growth
     store["closedTurns"] = sorted(swept)
     store["closedSig"] = sig
-    settled = _session_settled(fsid, path, session, store)
+    settled = _session_settled(fsid, path, session, store, now)
     rollup_status(store, settled)
     save_goals(fsid, store)
     # A CUT walk left end-known turns unswept, and a dead session is swept ONLY through the death drain
@@ -12108,14 +12397,22 @@ def run_close(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=Fa
                     _write_death_marker(sid, m)
     n = 0
     with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
-        futs = {ex.submit(_close_session, fsid, str(path), now): fsid
-                for fsid, path, anchor, name in fleet}
+        futs = {}
+        for fsid, path, anchor, name in fleet:
+            # the evidence gate, the death drain's sids included: a pending marker without endedAt is
+            # ordinary evidence (_death_finalize is a function of the parse, the store, the marker, the
+            # states file and the clock input, all in the closer's signature), and _death_rotate's utime
+            # moves the marker's identity, so a cut walk stays due through the marker as well
+            skip, sig = _gate_check("close", fsid, str(path), now)
+            if not skip:
+                futs[ex.submit(_gated, "close", _close_session, fsid, str(path), now, sig)] = fsid
         for fut in as_completed(futs):
             try:
                 n += len(fut.result())
                 pass_done("close", futs[fut])         # the pass over THIS fsid completed (W2c's event)
             except Exception as e:                    # fail LOUDLY, never silently skip the store (T111)
                 _log_judge_error("closer", futs[fut], "pass-crash", note=repr(e))
+    _gate_evict("close", {f[0] for f in fleet})
     if verbose:
         sys.stderr.write("romp-judge: closer completed %d nodes\n" % n)
     return n
