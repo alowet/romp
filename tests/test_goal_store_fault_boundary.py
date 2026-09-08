@@ -509,7 +509,9 @@ class TriagePassBoundary(_World):
     def test_run_propagate_continues_past_a_faulting_session(self):
         with _fault_on(self.a_file):
             jd.run_propagate(now=NOW)
-        self.assertGreaterEqual(self.seen.count(B), 2, "both arms of the pass reached the healthy session")
+        self.assertEqual(self.seen.count(B), 1, "the healthy session is read once per pass, shared by both arms")
+        self.assertGreaterEqual(self.seen.count(A), 2,
+                                "both arms of the pass reached the faulting session (a read that raised is not kept)")
         rows = self._rows("pass-crash")
         self.assertTrue(rows, "the faulting session's rows are filed")
         self.assertEqual({(r["judge"], r["fsid"]) for r in rows}, {("propagate", A)},

@@ -172,6 +172,8 @@ def _rebind_state(path):
     with _DISK_CONTENT_LOCK:
         _DISK_CONTENT.clear()   # save_goals' disk-side memo is keyed on full store paths, so an old root's
     #                         entries could never hit under the new one; cleared anyway so a rebind starts empty
+    with _ABSENT_FLAGS_LOCK:
+        _ABSENT_FLAGS.clear()   # the absent-store predicate memo: same full-path keys, same reasoning
     # (the override journal needs no rebinding: _overrides_dir() derives from GOALDIR at call time, so
     #  ANY isolation style — _rebind_state OR a bare GOALDIR reassignment — scopes it automatically)
 
@@ -3294,8 +3296,16 @@ def load_goals_or_fault(fsid):
 
     NEVER hands back an empty store: a caller that gets `(None, exc)` skips that session's goal-derived
     work for this build or pass, and writes nothing."""
+    return _or_fault(fsid, load_goals)
+
+
+def _or_fault(fsid, loader):
+    """load_goals_or_fault's boundary around any reader of `fsid`'s store: `loader(fsid)` is load_goals
+    itself there, and a pass's shared per-store read elsewhere (run_propagate's _get, so a recipient read
+    through the boundary is still the one read that pass takes of the store). Same episode table, same
+    `store-unreadable` row once per fault episode, same `(store, None)` / `(None, exc)` answer."""
     try:
-        store = load_goals(fsid)
+        store = loader(fsid)
     except OSError as e:
         _file_store_fault(fsid, e, "store-unreadable",
                           "goals store cannot be read; this session's goal-derived work is skipped until it "
@@ -12947,6 +12957,125 @@ def rearm_failed_summaries(now=None, auto=False):
             save_goals(fsid, store)
     return n
 
+# ── the absent-store predicate memo (the two triage sweeps over stores no discovered session owns) ──
+# run_propagate's sender-coverage sweep and _drain_undiscovered each walk every goal store OUTSIDE the
+# discover set to evaluate one predicate over the loaded store: "holds an open handoff tracker" and
+# "owes a distill". Absent stores are the dead sessions, and dead stores change only when one of these
+# sweeps writes them, so at steady state both sweeps parsed the same unchanged files every pass (41 stores,
+# about 8 MB, twice per pass on the audited kernel, 2026-09-06). The answers are memoized on the identity of
+# the THREE files load_goals reads for a sid — the store, its override journal (replayed on every load) and
+# its archive (a journaled restore consults it) — so a memoized answer is exactly what the load would have
+# produced for those file versions, and any write to any of the three is a miss. Every romp publish is a
+# tmp+rename and every gesture appends the journal, so a version change moves the identity.
+#
+# Precision of the key: (ino, mtime_ns, size) tells two versions apart when the filesystem's timestamps are
+# fine-grained (Linux 6.13+ multigrain timestamps; the audited kernel is one). A rename gives the store a
+# new inode too, but a freed inode number can be reused by the next temp file, so on a coarse-timestamp
+# kernel two same-size publishes inside one tick can alias — and a wrong "no open tracker" for a dead
+# store would pin until its next write, because the gated sweep is that store's only writer. That is the
+# one known exception, pinned in tests/test_judge_propagate_loads.py (a same-size in-place rewrite with the
+# mtime put back); no romp writer produces it. Keyed by the store's FULL PATH, so a rebind or a bare
+# GOALDIR reassignment can never serve the old root's answer; cleared in _rebind_state; entries for stores
+# gone from the GOALDIR glob are evicted at the start of each sweep.
+_ABSENT_FLAGS = {}        # store path string -> (identity from _store_identity, (open_handoff, owed_distill))
+_ABSENT_FLAGS_LOCK = threading.Lock()
+
+
+def _store_identity(fsid):
+    """The identity of every file load_goals(fsid) reads, taken by stat BEFORE any read: the store
+    goals/<fsid>.json, its override journal and its goals-archive entry, each (ino, mtime_ns, size) or
+    None when absent, behind the store's full path. Stat-then-read is the safe order: a publish landing
+    between the stat and the read pairs an OLD identity with NEW content, which _absent_store_flags
+    catches by re-taking the identity after the read (and declines to memoize); read-then-stat would pair
+    the new identity with old content and never heal."""
+    def _ident(p):
+        try:
+            st = os.stat(str(p))
+        except OSError:
+            return None
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+    path_s = str(GOALDIR / (fsid + ".json"))
+    return (path_s, _ident(path_s), _ident(_overrides_dir() / (fsid + ".jsonl")),
+            _ident(GOALARCHDIR / (fsid + ".json")))
+
+
+def _open_handoff_flag(store):
+    """run_propagate's absent-sender predicate: the store holds a handoff tracker that is neither complete
+    nor cleared, so the recipient's reply may still need to check it off. Pure over the loaded store."""
+    return any(isinstance(v, dict) and isinstance(v.get("handoff"), dict)
+               and not v.get("nodeComplete") and not v.get("cleared")
+               for v in (store.get("nodes") or {}).values())
+
+
+def _owed_distill_flag(store):
+    """_drain_undiscovered's predicate: a completed (or confirming) top, not cleared, whose summary is
+    still None owes a distill. Pure over the loaded store."""
+    status, nodes = store.get("status", {}), store.get("nodes", {})
+    confirming = set(store.get("confirming") or ())
+    return any((st == "completed" or nid in confirming)
+               and isinstance(nodes.get(nid), dict)
+               and not nodes[nid].get("cleared")
+               and nodes[nid].get("summary") is None
+               for nid, st in status.items())
+
+
+def _absent_flags_evict(present):
+    """Drop memo entries for store paths not in `present` (this sweep's GOALDIR glob): a deleted or
+    compacted-away store, or an old root's entries after a bare GOALDIR reassignment."""
+    with _ABSENT_FLAGS_LOCK:
+        for path_s in [k for k in _ABSENT_FLAGS if k not in present]:
+            del _ABSENT_FLAGS[path_s]
+
+
+def _absent_store_flags(fsid, loaded=None, idents=None):
+    """(open_handoff, owed_distill) for a store no discovered session owns, or None when the load
+    itself raised (the caller skips the store this pass, as the sweeps always did; a store file that
+    cannot be read raises out of load_goals). Memoized on _store_identity; a miss loads once and
+    evaluates both predicates, so the two sweeps of one pass share one load and an unchanged store costs
+    three stats per sweep. Two answers are served but NOT memoized: a store loaded without its unreadable
+    override journal (the `_unread` mark, _replay_overrides), and one whose files moved between the
+    identity and the read (the identity is re-taken after the load and must match). `loaded`/`idents` are
+    run_propagate's per-pass dicts: a store this pass already read (identity taken before the read,
+    object unmutated — every dirty sender is saved and dropped before the sweep) is evaluated from
+    that object instead of read again, and a store read here is left in `loaded` for the sender loop."""
+    if loaded is not None and fsid in loaded and fsid in idents:
+        key, store = idents[fsid], loaded[fsid]
+    else:
+        key, store = _store_identity(fsid), None
+    path_s = key[0]
+    with _ABSENT_FLAGS_LOCK:
+        ent = _ABSENT_FLAGS.get(path_s)
+    if ent is not None and ent[0] == key:
+        return ent[1]
+    if store is None:
+        try:
+            store = load_goals(fsid)
+        except Exception:
+            return None
+        if loaded is not None:
+            loaded[fsid] = store
+            idents[fsid] = key
+    flags = (_open_handoff_flag(store), _owed_distill_flag(store))
+    if store.get("_unread"):
+        # The object is NOT what its files say: the store parsed but its override journal exists and did
+        # not read (_replay_overrides), so a tracker the user resolved still shows open. Answer this pass
+        # from it, as the sweeps always did, but never memoize: nothing on disk need change before the
+        # next read succeeds (an EMFILE, an EIO), so an entry here would serve the un-resolved tracker
+        # until the store's next write, which for a dead store may never come. (A store FILE that cannot
+        # be read raises out of load_goals and is answered None above; an unparseable one is quarantined
+        # aside by load_goals, and the identity check below sees the file go.)
+        return flags
+    if _store_identity(fsid) != key:
+        # The files moved under the read: a publish or a journal append landed between the identity and
+        # the read (the entry would pair the OLD identity with the NEW content and heal only at the next
+        # write), or load_goals moved an unparseable store aside and answered the legitimate fresh store
+        # (the key still names the corrupt file, which is gone). Answer this pass, memoize nothing; the
+        # next call takes the new identity and reads again.
+        return flags
+    with _ABSENT_FLAGS_LOCK:
+        _ABSENT_FLAGS[path_s] = (key, flags)
+    return flags
+
 
 def _drain_undiscovered(now, fleet_sids):
     """Stragglers the fleet walk can't reach (the user 2026-08-26, T110): a completed top whose
@@ -12961,23 +13090,17 @@ def _drain_undiscovered(now, fleet_sids):
     through _distill_session's own no-work branch, the "" sentinel plus the history-unreadable
     warn, loud instead of an eternal spinner. Self-retiring: the sentinel is non-null, so a drained
     store never re-enters the predicate and the steady state costs one status read per absent
-    store. Returns goals distilled."""
+    store — three stats since the predicate moved onto _absent_store_flags (memoized on file
+    identity, shared with run_propagate's sweep over the same stores). Returns goals distilled."""
     stuck = []
-    for f in sorted(GOALDIR.glob("*.json")):
+    files = sorted(GOALDIR.glob("*.json"))
+    _absent_flags_evict({str(f) for f in files})
+    for f in files:
         sid = f.stem
         if sid in fleet_sids:
             continue
-        try:
-            store = load_goals(sid)
-        except Exception:
-            continue
-        status, nodes = store.get("status", {}), store.get("nodes", {})
-        confirming = set(store.get("confirming") or ())
-        if any((st == "completed" or nid in confirming)
-               and isinstance(nodes.get(nid), dict)
-               and not nodes[nid].get("cleared")
-               and nodes[nid].get("summary") is None
-               for nid, st in status.items()):
+        flags = _absent_store_flags(sid)
+        if flags is not None and flags[1]:
             stuck.append(sid)
     if not stuck:
         return 0
@@ -13954,19 +14077,65 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
     origin.goalId DONE too — so a '↪ delegated to B' item checks off the instant B finishes and reports. NO
     LLM: the closer already judged G done on B; this just follows the origin pointer (origin.goalId points at
     the sender's precise tracking node, planted by _plant_handoff_track). Forward-only + idempotent: it never
-    reopens the sender's node, and a node already done (or gone) is a no-op. Returns completions propagated."""
+    reopens the sender's node, and a node already done (or gone) is a no-op. Returns completions propagated.
+
+    Every store is read at most ONCE per pass (2026-09-06): `loaded` holds this pass's load_goals objects
+    and serves the recipient scan, the per-ref done check, _ref_goal's recipient maps and the sender loop;
+    the archive reads ride `archives` the same way. The pass used to load every recipient, load the sender
+    again per ref BEFORE checking whether the tracker was already done (it was, for every live ref), and
+    load every sender a third time in the sender loop. Now the done check reads the shared object and a
+    sender is read only when nothing this pass has read it yet. A ref's verdict lands on the shared object
+    with today's per-ref rollup, and each dirty sender is PUBLISHED ONCE, after the recipient loop (the
+    rebase unions per-node logs by (ev_t, src, kind), so one publish carrying several courier rows merges
+    exactly as several publishes did). A saved object leaves `loaded` in a finally: it is dropped so the
+    next touch reloads with a fresh CAS base (save_goals pops the base on publish), and a failed publish
+    drops it too, never leaving a base-less object for the sender loop. The absent-store sweep answers from
+    _absent_store_flags, memoized across passes on file identity. The per-session catches stand around the
+    shared read: a store that raises files its `pass-crash` row where it is reached (the recipient scan, a
+    ref's sender read, the sender loop) and is not kept, so the next touch retries the read; _ref_goal's
+    recipient read goes through the store-fault boundary (_or_fault) as before."""
     if now is None:
         now = int(time.time())
     n = 0
-    for fsid, path, anchor, name in discover(now)[:sessions_cap]:
+    sessions = discover(now)[:sessions_cap]
+    seen = {f for f, _p, _a, _n in sessions}
+    loaded, idents, archives = {}, {}, {}   # sid -> store / its pre-read identity (absent sids only) / archive
+
+    def _get(sid):
+        """This pass's one load_goals of `sid`."""
+        st = loaded.get(sid)
+        if st is None:
+            if sid not in seen:
+                idents[sid] = _store_identity(sid)      # an absent store read here can fill the predicate
+            st = loaded[sid] = load_goals(sid)          # memo below: its identity is taken BEFORE the read
+        return st
+
+    def _arch(sid):
+        a = archives.get(sid)
+        if a is None:
+            a = archives[sid] = load_goal_archive(sid)
+        return a
+
+    def _publish(sid):
+        """Save the shared object once and forget it: the next touch reloads with a fresh CAS base
+        (save_goals pops the base on publish)."""
+        try:
+            save_goals(sid, loaded[sid])
+        finally:
+            loaded.pop(sid, None)
+            idents.pop(sid, None)
+
+    closed = {}                                         # sender sid -> _presumed_closed, once per pass
+    dirty = {}                                          # sender sids with verdicts to publish, in order
+    for fsid, path, anchor, name in sessions:
         # live + ARCHIVE merged for the RECIPIENT-side scan (2026-08-26, the working-column audit):
         # a recipient goal that completed and was then ARCHIVED (the user cleared the done card)
         # vanished from the live-only scan, so the sender's tracker never checked off — a live
         # specimen sat open seven hours with its completion event already fired and recorded.
         # Read-only on this side: propagate writes SENDER stores only.
-        rnodes = dict(load_goal_archive(fsid).get("nodes") or {})
+        rnodes = dict(_arch(fsid).get("nodes") or {})
         try:
-            rnodes.update(load_goals(fsid).get("nodes") or {})
+            rnodes.update(_get(fsid).get("nodes") or {})
         except Exception as e:                         # an unreadable store: this session's row, the next session's turn
             _log_judge_error("propagate", fsid, "pass-crash", note="store: %r" % e)
             continue
@@ -13980,7 +14149,7 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
             for ref in refs:
                 a_sid, a_gid = ref["peer"], ref["goalId"]
                 try:
-                    a_store = load_goals(a_sid)
+                    a_store = _get(a_sid)               # the shared read: no load when this pass has it
                 except Exception as e:                 # the sender's store faulted: its tracker waits for the next pass
                     _log_judge_error("propagate", fsid, "pass-crash", note="sender %s store: %r" % (a_sid[:8], e))
                     continue
@@ -14001,13 +14170,20 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
                     why += ": " + sub[:220]
                 record_verdict(a_store, a_store["nodes"][a_gid], "courier", "done", now, why=why)
                 _mark_node_done(a_store, a_gid, why, now, src="courier")
-                rollup_status(a_store, _presumed_closed(a_sid, now))   # sender just had work close →
+                if a_sid not in closed:
+                    closed[a_sid] = _presumed_closed(a_sid, now)
+                rollup_status(a_store, closed[a_sid])   # sender just had work close →
                 #                                        recompute its columns, SETTLING them when the
                 #                                        sender is determined dead (2026-08-28: a live
                 #                                        sender's own pass settles as before; a dead one
-                #                                        has no pass, so this write is its only settler)
-                save_goals(a_sid, a_store)
+                #                                        has no pass, so this write is its only settler).
+                #                                        Per ref, as before: a later recipient in this
+                #                                        loop reads the shared object, and this keeps it
+                #                                        exactly what the per-ref publish used to leave.
+                dirty[a_sid] = True
                 n += 1
+    for a_sid in list(dirty):
+        _publish(a_sid)                                 # one publish per dirty sender
     # REMOTE recipients (the user 2026-08-24): their goal stores live on another kernel, so the
     # origin back-link above can never fire for them. The local log still records the exact
     # report-back event: the recipient's REPLY mail — any kind — at/after the delegate's send, the
@@ -14029,11 +14205,14 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
     _rmemo = {}                                        # recipient sid -> merged nodes (per-pass, read-only)
 
     def _ref_goal(peer_sid, mid):
-        """The recipient goal a tracker's msgId joins to (origin or links), live+archive merged."""
+        """The recipient goal a tracker's msgId joins to (origin or links), live+archive merged. The
+        values are COPIES of the shared objects' nodes, taken at first use: the sender loop below
+        mutates the shared store, and this map must read as the snapshot it always was."""
         if peer_sid not in _rmemo:
-            m = dict(load_goal_archive(peer_sid).get("nodes") or {})
-            live, fault = load_goals_or_fault(peer_sid)   # a faulting recipient joins to nothing this pass
-            m.update((live or {}).get("nodes") or {})     # (forward-only: the tracker simply stays open)
+            m = {k: dict(v) for k, v in (_arch(peer_sid).get("nodes") or {}).items() if isinstance(v, dict)}
+            live, fault = _or_fault(peer_sid, _get)      # a faulting recipient joins to nothing this pass
+            m.update({k: dict(v) for k, v in ((live or {}).get("nodes") or {}).items()   # (forward-only: the
+                      if isinstance(v, dict)})                                            #  tracker stays open)
             _rmemo[peer_sid] = m
         for rd in _rmemo[peer_sid].values():
             if not isinstance(rd, dict):
@@ -14051,24 +14230,21 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
     # forever (the audited board: 18 of 23 stale cards, all on exactly these sids). The recipient's
     # reply is the event and this sweep is its only writer for such stores, so absent stores that
     # still hold open trackers join the walk (the T110 straggler-drain shape; self-retiring — a
-    # closed tracker leaves the predicate).
-    _sw_fleet = discover(now)[:sessions_cap]
-    _sw_seen = {f for f, _p, _a, _n in _sw_fleet}
-    _sw_senders = [f for f, _p, _a, _n in _sw_fleet]
-    for _f in sorted(GOALDIR.glob("*.json")):
-        if _f.stem in _sw_seen:
+    # closed tracker leaves the predicate). The predicate is answered by _absent_store_flags: an
+    # unchanged absent store costs three stats, not a parse, and a store it does read stays in
+    # `loaded` for the loop below.
+    _sw_senders = [f for f, _p, _a, _n in sessions]
+    _sw_files = sorted(GOALDIR.glob("*.json"))
+    _absent_flags_evict({str(f) for f in _sw_files})
+    for _f in _sw_files:
+        if _f.stem in seen:
             continue
-        try:
-            _st0 = load_goals(_f.stem)
-        except Exception:
-            continue
-        if any(isinstance(v, dict) and isinstance(v.get("handoff"), dict)
-               and not v.get("nodeComplete") and not v.get("cleared")
-               for v in (_st0.get("nodes") or {}).values()):
+        _flags = _absent_store_flags(_f.stem, loaded, idents)
+        if _flags is not None and _flags[0]:
             _sw_senders.append(_f.stem)
     for fsid in _sw_senders:
         try:
-            store = load_goals(fsid)
+            store = _get(fsid)
         except Exception as e:
             _log_judge_error("propagate", fsid, "pass-crash", note="store: %r" % e)
             continue
@@ -14118,8 +14294,8 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
                     changed = True
                     n += 1
         if changed:
-            rollup_status(store, fsid not in _sw_seen and _presumed_closed(fsid, now))
-            save_goals(fsid, store)
+            rollup_status(store, fsid not in seen and _presumed_closed(fsid, now))
+            _publish(fsid)
     if verbose:
         sys.stderr.write("romp-judge: propagated %d delegation completions\n" % n)
     return n
