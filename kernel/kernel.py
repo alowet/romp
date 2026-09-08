@@ -9560,12 +9560,15 @@ def _comments_frame(sid, tmux=None):
                 # LOST — a reconnect with it in flight; the popover shows "never delivered") owes nothing.
                 user_atoms = [a for tr in turns for a in (tr.get("atoms") or []) if a.get("type") == "user"]
                 def _landed(e):
-                    et = (e.get("_echo_text") or "").strip()
+                    et = sb.echo_text_key(e.get("_echo_text"))
                     since = float(e.get("t") or 0)                     # the send's own stamp: the record the CLI writes for
                     return any(et in _atom_user_texts(a) for a in user_atoms if float(a.get("t") or 0) >= since)   # it is at or after it
                 floor = _human_turn_floor({"turns": turns}) if turns else 0
-                held = [a for a in live if (a.get("_echo_text") or "").strip() and not a.get("command")
-                        and not a.get("dropped") and not _landed(a) and not _echo_overtaken(a, floor)]
+                # `_landed` on the atom: the backend's boot/spawn scan read the landing off the transcript
+                # itself (sdk_backend._mark_dropped_echoes) — delivered, so nothing is held for it
+                held = [a for a in live if sb.echo_text_key(a.get("_echo_text")) and not a.get("command")
+                        and not a.get("dropped") and not a.get("_landed") and not _landed(a)
+                        and not _echo_overtaken(a, floor)]
                 queued = max(queued, len(held))
         # the newest record the projection shows (or the transcript holds): the client's "did the transcript
         # move?" datum, independent of the 80-event / 40-message caps on the shipped projections
@@ -19437,12 +19440,22 @@ def _split_reminders(text):
     return prompt.strip(), [r for r in reminders if r]
 
 
-_IMG_PATH_RE = re.compile(r"(?:^|[\s'\"`(])((?:~/|/)[^\s'\"`()]+\.(?:png|jpe?g|gif|webp|bmp|svg))\b", re.I)
+# The extension set is the CLI's, not romp's: the composer paste hook's one image-path test,
+# `/\.(png|jpe?g|gif|webp)$/i` (Claude Code 2.1.261 bundle) — the paths it reads and rewrites to
+# "[Image #N]" before the submit. No bmp, no svg: the wider set this carried until 2026-09-06 claimed
+# extractions the CLI never performs (a `.svg` send waited for a rewrite that never came). Twin of
+# sdk_backend._IMG_PATH_RE; tests/test_kernel_fed_echo_absorbed.py pins both to that set. Its reader is
+# the one that WAITS ON the CLI's rewrite: _injected_img_paths (the tmux pre-Enter wait). The bare-path
+# PREVIEW in _user_images is romp's own feature and reads _PREVIEW_IMG_RE (beside _IMG_MIME) instead —
+# it never claims a CLI extraction, so it is not bound to the CLI's set.
+_IMG_PATH_RE = re.compile(r"(?:^|[\s'\"`(])((?:~/|/)[^\s'\"`()]+\.(?:png|jpe?g|gif|webp))\b", re.I)
 def _user_images(blocks, text, human):
     """A user turn's images. Inline base64 → a data: URL; an image
     source path → "path:<abs>" (the webview hydrates it via imgRequest); and — the common case — a bare
     image PATH typed or dragged into the composer arrives as PLAIN TEXT, so scan a human turn's text for
-    absolute / ~ paths with a known image extension. Capped at 4."""
+    absolute / ~ paths with an extension the imgRequest route can serve (_PREVIEW_IMG_RE, built from
+    _IMG_MIME's keys — bmp and svg included; on an SDK session every image path lands as text, so this
+    scan is the only way a referenced picture gets shown). Capped at 4."""
     imgs = []
     for b in (blocks or []):
         if isinstance(b, dict) and b.get("type") == "image":
@@ -19452,7 +19465,7 @@ def _user_images(blocks, text, human):
             elif s.get("path"):
                 imgs.append({"src": "path:" + s["path"], "path": s["path"]})
     if human and not imgs:                            # a bare image path typed/dragged in → plain text
-        for m in _IMG_PATH_RE.finditer(text or ""):
+        for m in _PREVIEW_IMG_RE.finditer(text or ""):
             p = m.group(1)
             if not any(im.get("path") == p for im in imgs):
                 imgs.append({"src": "path:" + p, "path": p})
@@ -22831,13 +22844,15 @@ def _claudemd_docs(cwd):
 
 
 def _atom_user_text(a):
-    """The plain text of a user atom (for deduping the optimistic input echo against the transcript)."""
+    """The plain text of a user atom (for deduping the optimistic input echo against the transcript), keyed
+    by sb.echo_text_key — the ONE rule the SDK backend's by-text prune and its landing scan share with the
+    keys built here (2026-09-06: the scan matched a collapsed text the prune's raw comparison never could)."""
     if a.get("type") != "user":
         return None
     c = (a.get("message") or {}).get("content")
     if isinstance(c, list):
-        return " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text").strip() or None
-    return (c.strip() if isinstance(c, str) else None) or None
+        return sb.echo_text_key(" ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")) or None
+    return sb.echo_text_key(c) or None
 
 
 def _atom_user_texts(a):
@@ -22847,9 +22862,10 @@ def _atom_user_texts(a):
     the nudge body. _atom_user_text space-JOINS the blocks, so the echo's exact text was never a member of
     the transcript set and the landing check ("et in tx_user_texts") could not fire. The echo then never
     retired: it rode the bottom of the thread forever, still wearing its original SEND time, so a nudge
-    sent at 16:43 appeared BELOW a 17:00 answer (the user 2026-07-22). The FIFO floor can't save it either
-    — that was deliberately narrowed to PATH-BEARING echoes (2026-07-20) so a genuinely dropped send stays
-    visible. Per-block EXACT match, never a substring test: a bundled block is the very string that was
+    sent at 16:43 appeared BELOW a 17:00 answer (the user 2026-07-22). No floor can save it either —
+    sdk_backend.prune_live floors no echo (2026-09-06; before that the floor was narrowed to path-bearing
+    echoes, 2026-07-20), so a genuinely dropped send stays visible. Per-block EXACT match, never a
+    substring test: a bundled block is the very string that was
     echoed, so this retires the delivered nudge without ever guessing about containment."""
     if a.get("type") != "user":
         return ()
@@ -22861,7 +22877,7 @@ def _atom_user_texts(a):
     if isinstance(c, list):
         for b in c:
             if isinstance(b, dict) and b.get("type") == "text":
-                t = (b.get("text") or "").strip()
+                t = sb.echo_text_key(b.get("text") or "")
                 if t and t != joined:
                     out.append(t)
     return tuple(out)
@@ -22888,12 +22904,20 @@ def _tmux_echo_atoms(sid):
     return list(_tmux_echo.get(sid, {}).values())
 
 def _tmux_echo_prune(sid, tx_uuids, tx_texts):
-    """Drop an echo once the transcript has its real user atom (by uuid or text); pop the sid when empty."""
+    """Drop an echo once the transcript has its real user atom (by uuid or text); pop the sid when empty.
+    The text side compares under sb.echo_text_key — `tx_texts` are the keys _atom_user_texts built (outer
+    whitespace stripped), and the echo stores the send's text verbatim, so a raw comparison never matched a
+    trailing-newline send (`romp send` passes its argument verbatim): the delivered echo stayed, hidden by
+    the display dedup, and the settle then marked it `dropped` once a later human turn landed — a "never
+    delivered" bubble for a message the transcript holds (2026-09-06)."""
     d = _tmux_echo.get(sid)
     if not d:
         return
-    for k in [k for k, a in d.items()
-              if a.get("uuid") in tx_uuids or (a.get("_echo_text") and a["_echo_text"] in tx_texts)]:
+
+    def _landed(a):
+        et = sb.echo_text_key(a.get("_echo_text"))
+        return a.get("uuid") in tx_uuids or (et and et in tx_texts)
+    for k in [k for k, a in d.items() if _landed(a)]:
         d.pop(k, None)
     if not d:
         _tmux_echo.pop(sid, None)
@@ -22901,8 +22925,9 @@ def _tmux_echo_prune(sid, tx_uuids, tx_texts):
 
 def _human_turn_floor(session):
     """The newest GENUINE-HUMAN user atom's timestamp in the parsed session, or 0. The one event that says
-    "the transcript has moved past anything typed before this": read by the SDK's echo floor
-    (sdk_backend.prune_live), by the tmux echo's settle below, and by the queued fold.
+    "the transcript has moved past anything typed before this": read by sdk_backend.prune_live (to retire
+    stale command-feedback atoms — since 2026-09-06 it floors no echo), by the tmux echo's settle below,
+    and by the queued fold.
 
     EXCLUDES the interrupt record (the user 2026-07-07): it authors 'human' but is a STOP event, not a
     message that landed and processed the echo. When a just-sent message hadn't hit disk yet, the
@@ -22932,11 +22957,14 @@ def _tmux_echo_settle(sid, human_floor, still_queued=()):
 
     Marking, NOT pruning: a tmux echo is the only record of a send the pane dropped, and that loss must
     stay on screen — the whole reason the echo outlives a later turn (see TmuxBackend.prune_live). The one
-    exception mirrors the SDK's own floor: a PATH-BEARING echo can fail the text match STRUCTURALLY,
-    because the transcript extracts image paths out of the user text, so that flavor is retired the way
-    sdk_backend.prune_live retires it rather than labelled a loss it may not be. With the SDK module
-    unavailable the predicate is simply unavailable too, and marking (the visible, reversible outcome)
-    covers every echo.
+    exception is an IMAGE-PATH echo: a tmux send is a paste into the composer, whose paste hook reads a
+    pasted image path and rewrites the token to "[Image #N]" (sdk_backend._IMG_PATH_RE names the hook's
+    extension set), so the echo's text can fail the match STRUCTURALLY and "overtaken" is not evidence of
+    loss — that flavor is retired rather than labelled a loss it may not be. The predicate is borrowed
+    from the SDK module (sdk_backend._path_bearing, kept for this reader: the SDK route itself floors no
+    echo since 2026-09-06, because stream-json input never reaches the hook). With that module
+    unavailable the predicate is unavailable too, and marking (the visible, reversible outcome) covers
+    every echo.
 
     STANDS DOWN for an echo whose text the queue ledger still lists as pending (`still_queued`,
     2026-08-27): the floor is a per-SESSION clock, so an OLDER queued sibling delivering raises it past
@@ -23049,9 +23077,13 @@ def _merge_live_atoms(session, sid, shown_texts=()):
                 tx_text_t[t] = max(tx_text_t.get(t, 0), float(a.get("t") or 0))
     human_floor = _human_turn_floor(session)
     be.prune_live(sid, tx_uuids, tx_text_t, human_floor)
-    hide = tx_texts | {t.strip() for t in shown_texts if t}    # transcript dups + already-shown queued msgs
+    hide = tx_texts | {sb.echo_text_key(t) for t in shown_texts if t}    # transcript dups + already-shown queued msgs
+    # `live` was snapshotted before the prune, so each of prune_live's three exits has its paint-side twin
+    # here: by uuid (tx_uuids), by text (hide), and the recorded landing (`_landed`: the backend's boot/spawn
+    # scan read the record off the transcript — the prune just retired it, and painting it once more would
+    # show a delivered message as a pending bubble for one build)
     fresh = [a for a in live if a.get("uuid") not in tx_uuids
-             and not (a.get("_echo_text") and a["_echo_text"].strip() in hide)]
+             and not (a.get("_echo_text") and (a.get("_landed") or sb.echo_text_key(a["_echo_text"]) in hide))]
     if not fresh:
         return session
     # Reopen the turn ONLY for genuine live ASSISTANT work (a streaming reply), never for a lone input echo.
@@ -23406,7 +23438,7 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
         tx_user = {t for turn in parsed["turns"] for a in turn["atoms"] for t in _atom_user_texts(a)}
         echo_floor = _human_turn_floor(parsed)
         for a in be.live_atoms(sid):
-            et = (a.get("_echo_text") or "").strip()
+            et = sb.echo_text_key(a.get("_echo_text"))
             if et and et not in already and et not in tx_user and not _echo_overtaken(a, echo_floor):
                 queued = queued + [et]; already.add(et)
     session = parsed if path_override else _merge_live_atoms(parsed, sid, shown_texts=queued)
@@ -23739,6 +23771,31 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                         if prompt or reminders or imgs:
                             ev = {"kind": "user", "md": prompt, "uuid": a.get("uuid"), "ts": ts,
                                   "human": author == "human" or bool(imgs), "reminders": reminders}
+                            if a.get("absorbed"):
+                                # A mid-turn splice (event_model._absorbed): the CLI queued this send
+                                # behind the running turn and took it at a later tool boundary, so the
+                                # atom sits at its SEND time, above the steps that ran while it waited.
+                                # The client marks it ("joined mid-turn") and, when the landing retires
+                                # a pending bubble that sat at the tail, leaves a cue where the bubble
+                                # was — the user 2026-09-05 watched a message vanish from the bottom
+                                # and reappear higher up with no explanation. `landedAt`: when the CLI
+                                # took it (the attachment's file-order predecessor; `ts` is the send).
+                                ev["absorbed"] = True
+                                if a.get("landedT"):
+                                    ev["landedAt"] = int(a["landedT"])
+                            # Several back-to-back sends the CLI took together land as ONE user record
+                            # with a text block each — the shape _atom_user_texts prunes the kernel's
+                            # echoes against. The chat's own pending bubbles end on an EXACT text match
+                            # with a landed event, and `md` is the blocks joined, which matches none of
+                            # them: without the blocks none of those bubbles ever ended (2026-09-07
+                            # review). Shipped only when there are two or more, each under the one text
+                            # key; the client counts one copy per matching block. (Not `texts`: the
+                            # queued event uses that name for another shape.)
+                            btexts = [sb.echo_text_key(b.get("text")) for b in blocks
+                                      if isinstance(b, dict) and b.get("type") == "text"]
+                            btexts = [t for t in btexts if t]
+                            if len(btexts) >= 2:
+                                ev["blocks"] = btexts
                             sp = _space_paths(prompt, sid, a.get("uuid"))
                             if sp:
                                 ev["spacePaths"] = sp   # backticked filenames WITH spaces, filesystem-verified → whole-span links
@@ -30299,6 +30356,16 @@ def _tell_stale_gesture(client, msg):
 #      hydrated and OS drops did nothing — the user 2026-06-16) ----
 _IMG_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
              ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp", ".svg": "image/svg+xml"}
+# The bare-path PREVIEW scan's extension set (_user_images): exactly the extensions this route can
+# serve, derived from _IMG_MIME so the two cannot drift — a path the scan proposed but _img_data_url
+# refused would leave a chip with no picture. Same path shape as _IMG_PATH_RE (absolute or ~-rooted,
+# delimited), but NOT that regex: _IMG_PATH_RE is the CLI paste hook's set, read by the code that waits
+# on the CLI's "[Image #N]" rewrite, and the preview claims no such extraction. Until 2026-09-06 both
+# readers shared one regex; narrowing it to the CLI's set for the extraction reader would have silently
+# dropped svg/bmp previews, so the preview got its own.
+_PREVIEW_IMG_RE = re.compile(
+    r"(?:^|[\s'\"`(])((?:~/|/)[^\s'\"`()]+\.(?:%s))\b"
+    % "|".join(re.escape(k[1:]) for k in sorted(_IMG_MIME)), re.I)
 _IMG_MAX_BYTES = 8_000_000
 _img_cache = {}                                  # "path:mtime:size" → dataURL | None
 

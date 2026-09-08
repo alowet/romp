@@ -1843,13 +1843,23 @@ body.chat-theme-yatharth .meta-btn.mode-risky, body.chat-theme-yatharth .meta-it
   font-size: 0.82em; color: var(--vscode-errorForeground, #f48771);
   letter-spacing: 0.02em; margin-right: 4px;
 }
+.absorbed-cue-act,
 .undelivered-act {
   font-family: var(--sans); font-size: 11px; line-height: 1; padding: 3px 7px; border-radius: 4px;
   border: 1px solid var(--card-border); background: transparent; color: var(--dim);   /* T141: the one button rest */
-  cursor: pointer; user-select: none;
+  cursor: pointer; user-select: none; font-style: normal;
   transition: color 0.12s ease, border-color 0.12s ease;
 }
-.undelivered-act:hover { color: var(--fg); border-color: var(--accent); }
+.absorbed-cue-act:hover, .undelivered-act:hover { color: var(--fg); border-color: var(--accent); }
+/* "joined mid-turn" header (kernel ev.absorbed): the CLI took this message at a later tool boundary and the
+   transcript places it at its SEND time, so it reads above steps that were already running — the header says
+   why. The follow-up header's size and alignment (one header family over an outgoing bubble); dim, not the
+   accent: a note, not a link. */
+.absorbed-tag { max-width: 72%; margin-bottom: 1px; font-size: 0.82em; color: var(--dim); }
+/* a pending bubble whose confirmation is in doubt — the connection dropped after the press (send-pending.ts
+   `lost`): the bare group's label counts it in a warn-amber "not confirmed" part; the group's other bubbles
+   keep their dim "sending…" part beside it (one label, per-bubble state) */
+.queued-head .queued-count .lost { color: var(--warn); }
 /* compact "↩ Follow-up · <goal>" header above a message that resumed a goal — landed user turns AND pending
    queued messages, so the two render the same (the user 2026-06-27). Right-aligned with the outgoing bubble. */
 /* ONE font size across the whole header + its context box (the user 2026-07-02: the header was a soup of
@@ -2804,9 +2814,11 @@ body.picker-lifted > #picker.kb-tight { align-items: flex-start; padding: 12px 1
 .chip-interrupting { background: var(--st-working-bg); color: var(--st-working-fg, #332600); opacity: 0.75; }
 /* the stop button's click-ack is now REMOVAL + the optimistic chip flip (the user 2026-07-05): the word
    "interrupting…" no longer rides the fixed-width button (it overflowed onto the elapsed timer). */
-/* the transcript's interrupt MARKER — the compact-divider's language for "you stopped it here" */
-.turn-interrupt .dot { background: var(--dim); border: none; }
-.interrupt-line { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 0.82em; font-style: italic; }
+/* the transcript's interrupt MARKER — the compact-divider's language for "you stopped it here". The mid-turn
+   CUE (.turn-absorbed-cue: where a pending bubble sat when its message landed higher up) wears the same
+   chrome — a rail ring and one dim italic line — plus jump/✕ in .absorbed-cue-act's small-button rest. */
+.turn-absorbed-cue .dot, .turn-interrupt .dot { background: var(--dim); border: none; }
+.absorbed-cue-line, .interrupt-line { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 0.82em; font-style: italic; }
 .interrupt-square { width: 8px; height: 8px; border-radius: 2px; background: var(--dim); flex: none; }
 
 /* rail dots are nav handles: hover white-highlights this turn's event on the
