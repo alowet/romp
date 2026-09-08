@@ -54,6 +54,7 @@ import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser
 import { pastedFilePath } from "./paste-path";
 import { insertAtCaret } from "./composer-insert";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
+import { followReader, keepPlaceAcrossShow } from "./scroll-keep";
 import { activeTabToReannounce } from "./relay-active";
 import { dirStatusHint, nextDirActive, createDirPrompt, type DirStatus } from "./dir-complete";
 import { mediaSrc, kernelUrl } from "./media";
@@ -10017,6 +10018,14 @@ function showActive() {
   syncHostOfflineFoot();   // the tab we just switched to may sit on an unreachable host
   touchMru(activeId!); // record activation order so close returns to the previous tab
   const v = ensureView(activeId!);
+  // A RE-SHOW of the view already on screen keeps the reader's place across its rebuild (T249, the user
+  // 2026-09-07: a full show of a shown tab landed on the spot saved when the tab was last LEFT — a bubble
+  // they had read minutes ago — three seconds after they had scrolled to the bottom). Captured BEFORE the
+  // rebuild the way appendActive does, restored after landActive; a tab switch is not a re-show (the
+  // entering view is still display:none), so the leaving-tab save, the nav trail's spot and the jump
+  // button keep their explicit semantics. The decision and the saved-spot rule live in scroll-keep.ts.
+  const reshow = keepPlaceAcrossShow(v, v.el.style.display !== "none", content.clientHeight > 0, !!pendingAnchor || pendingAnchorT != null);
+  const keepAnchor = reshow && !nearBottom(content) ? captureScrollAnchor(content, v) : null;
   // Bound the switch. A view the user scrolled to the top of has had its window expanded to the WHOLE
   // transcript (winStart crept to 0 via lazy-expand), and compact mode renders the whole folded stream —
   // either way, revealing thousands of nodes is the big-session switch lag (the user 2026-06-25: 4144 turns
@@ -10025,8 +10034,8 @@ function showActive() {
   // scrolling up lazily reloads. Both render paths honour winStart, so this works in either mode. Skip when
   // a deep-link is pending (its target may be in the collapsed head). A small view (≤ cap) is left untouched
   // → the no-op fast path reveals it instantly.
-  if (!pendingAnchor && pendingAnchorT == null
-      && v.el.querySelectorAll(".turn").length > WINDOW_CAP) {
+  if (!reshow && !pendingAnchor && pendingAnchorT == null
+      && v.el.querySelectorAll(".turn").length > WINDOW_CAP) {   // a SWITCH rule: a re-show of the view on screen never snaps it to the tail (T249)
     v.rendered = 0; v.winStart = 0; v.avgTurnH = undefined; v.stick = true;   // → firstBuild rebuilds the tail, lands at bottom
   }
   for (const [vid, vv] of views) vv.el.style.display = vid === activeId ? "" : "none";
@@ -10040,7 +10049,11 @@ function showActive() {
   // the "Loading transcript…" hint — so it renders synchronously below via syncView, never deferred. The
   // `length > 0` guard is what stops a zero-event session from flashing (or sticking on) "Loading…".
   const heavy = s.events.length > 0 && (v.el.childNodes.length === 0 || (settings.compact && (v.rendered !== s.events.length || v.stale)));
-  if (!heavy) { syncView(activeId!); landActive(content, v); return; }
+  if (!heavy) {
+    syncView(activeId!); landActive(content, v);
+    if (keepAnchor) restoreScrollAnchor(content, v, keepAnchor);   // the line being read stays put across the rebuild (T249)
+    return;
+  }
   if (v.el.childNodes.length === 0) {   // truly empty → the ROMP LOADER holds the spot (the standing
     // wait-state rule: swirl + wordmark + pulsing accent dots — never a bare hint). Removed by the
     // deferred build replacing this view's children — the content event — and that build always
@@ -10060,8 +10073,10 @@ function showActive() {
     if (activeId !== target) return;    // switched away before the build ran → don't build the tab we left
     const vv = views.get(target);
     if (!vv || !sessions.has(target)) return;
+    const cc = document.getElementById("content");
     syncView(target);                   // the heavy build now (clears the loading hint)
-    landActive(document.getElementById("content"), vv);
+    landActive(cc, vv);
+    if (keepAnchor && cc) restoreScrollAnchor(cc, vv, keepAnchor);   // same keep on the deferred path (T249)
   });
 }
 
@@ -10305,6 +10320,21 @@ jumpBtn.onclick = () => {
   }
 }
 window.addEventListener("resize", updateJumpBtn);
+// The per-view saved spot FOLLOWS the reader (T249, the user 2026-09-07). landActive lands every show no
+// anchor scrolled on `v.stick ? bottom : v.scrollTop`, and until now those were written only by a tab
+// switch (the tab being LEFT), the jump button, the box-resize compensation and the nav trail — never by
+// the reader's own scrolling. So the spot named where the tab was when last left, and a full show of a
+// shown tab (a fork/first-build frame, a settings rerender, a revive failure, a dismissal's fallback)
+// snapped the reader back there. Every scroll of the active view now records its position and its
+// follow-mode (the same nearBottom threshold appendActive and the jump chip read), passive, no timer.
+// Programmatic scrolls (a land, an anchor restore) fire the same event, so the record is always the truth.
+{
+  const c = document.getElementById("content");
+  if (c) c.addEventListener("scroll", () => {
+    if (c.clientHeight <= 0) return;
+    followReader(activeId ? views.get(activeId) : null, c.scrollTop, nearBottom(c));
+  }, { passive: true });
+}
 // Boxes ABOVE the transcript grow/shrink → keep the chat text visually anchored (the user 2026-06-30 for
 // #tabbar; extended to #ledger 2026-07-05). Both are `flex: 0 0 auto` directly above the `flex: 1 1 auto`
 // #content scroll area, so when one grows — a working dot wraps the tab strip to a second row, a ledger
