@@ -54,12 +54,12 @@ class _Env(unittest.TestCase):
         self.path = os.path.join(self.d, "service.env")
         self._before = {v: os.environ.get(v) for v in ("ROMP_SERVICE_ENV_FILE", "ROMP_SERVICE_ENV",
                                                        "ROMP_EXPECTED_AUTH", "ANTHROPIC_API_KEY",
-                                                       "ROMP_API_KEY_REF", "ROMP_API_KEY_CMD")}
+                                                       "ROMP_API_KEY_REF", "ROMP_API_KEY_CMD", "ROMP_SUPERVISED")}
         os.environ["ROMP_SERVICE_ENV_FILE"] = self.path
         os.environ["ROMP_SERVICE_ENV"] = self.path
         # every source variable, the key command included: a box that runs its manager on
         # ROMP_API_KEY_CMD exports it to every shell, and the environment fallback would read it
-        for v in ("ROMP_EXPECTED_AUTH", "ANTHROPIC_API_KEY", "ROMP_API_KEY_REF", "ROMP_API_KEY_CMD"):
+        for v in ("ROMP_EXPECTED_AUTH", "ANTHROPIC_API_KEY", "ROMP_API_KEY_REF", "ROMP_API_KEY_CMD", "ROMP_SUPERVISED"):
             os.environ.pop(v, None)
         self._checked = sb._ENV_FILE_AUTH_CHECKED
         sb._ENV_FILE_AUTH_CHECKED = False
@@ -74,6 +74,7 @@ class _Env(unittest.TestCase):
         sb._ENV_FILE_AUTH_CHECKED = self._checked
         ks._CACHE = ((), "")
         ks._AUTHORITATIVE_PATHS.pop(self.path, None)
+        getattr(ks, "_ENV_PROVIDER_PATHS", {}).pop(self.path, None)
 
     def write_env(self, body, path=None):
         p = path or self.path
@@ -181,6 +182,68 @@ class EnvFileVsDeclaration(_Backend):
         self.assertNotIn(CMD, text)
         self.assertTrue(sb._ENV_FILE_AUTH_CHECKED, "said once: the one shot is spent")
         self.assertEqual(sb._check_env_file_vs_declaration(log, self.state), "")
+
+    # The check judges the source the LAUNCH would select (keysource.select_source), not the file's lines
+    # alone: the durable provider marker beside the file and, for a foreground manager, the exported
+    # sources are part of that decision, and a silence that ignored them read "the sessions fall to
+    # Claude Code's own credential" where they would in fact try a removed provider, or bill an exported
+    # key (the review of the merged check, 2026-09-08).
+    def test_login_declared_over_a_removed_provider_whose_marker_remains_says_the_source_cannot_be_used(self):
+        # the shape the invalid-file branch exists for: the reference line is gone, the marker beside the
+        # file still names the provider, so every unpicked session tries it and fails to launch
+        self.write_env("ROMP_PERF=1\n")
+        ks.remember_file_source(self.path, "op")
+        os.environ["ROMP_EXPECTED_AUTH"] = "login"
+        said = []
+        log = lambda m, problem=None: said.append((str(m), problem))
+        self.assertEqual(sb._check_env_file_vs_declaration(log, self.state), "error")
+        self.assertEqual(len(said), 1)
+        text, problem = said[0]
+        self.assertTrue(problem)
+        self.assertIn("cannot be used", text)
+        self.assertIn("was removed", text)
+        self.assertIn(self.path, text, "the marker sits beside the file: the file is named")
+
+    def test_login_declared_over_an_exported_provider_names_the_environment(self):
+        # a foreground `romp up` from a shell that exported the key command: the file selects nothing, the
+        # environment does, and unpicked sessions bill the key
+        os.environ[ks.CMD_VAR] = CMD
+        os.environ["ROMP_EXPECTED_AUTH"] = "login"
+        be = self.construct()
+        lines = self.flagged(be)
+        self.assertEqual(len(lines), 1, be.problems())
+        self.assertIn(ks.CMD_VAR, lines[0])
+        self.assertIn("environment", lines[0])
+        self.assertNotIn(self.path, lines[0], "the file selected nothing; it is not what is named")
+        self.assertFalse(any(CMD in m for m in self.logged))
+        self.assertEqual(be.default_auth({}), "key", "the sentence describes what the launch does")
+
+    def test_login_declared_over_a_startup_key_names_the_key_variable_and_never_claims_it(self):
+        # the startup key the manager's environment carried: the launch claims it later; the check only
+        # PEEKS, so the claim's once-only semantics (tests/test_session_auth.py) are untouched
+        sb._WORK_KEY = None                    # not yet claimed
+        os.environ[ks.KEY_VAR] = KEY
+        os.environ["ROMP_EXPECTED_AUTH"] = "login"
+        said = []
+        log = lambda m, problem=None: said.append((str(m), problem))
+        self.assertEqual(sb._check_env_file_vs_declaration(log, self.state), ks.KEY_VAR)
+        self.assertIn("environment", said[0][0])
+        self.assertEqual(os.environ.get(ks.KEY_VAR), KEY, "peeked, not claimed")
+        self.assertIsNone(sb._WORK_KEY)
+        self.assertFalse(any(KEY in m for m, _ in said))
+
+    def test_a_supervised_manager_ignores_the_environment_here_too(self):
+        # under the service unit keysource reads the file only (an inherited export cannot establish a
+        # fallback), so the launch selects nothing and the check is rightly quiet
+        os.environ["ROMP_SUPERVISED"] = "1"
+        sb._WORK_KEY = KEY
+        os.environ["ROMP_EXPECTED_AUTH"] = "login"
+        try:
+            be = self.construct()
+            self.assertEqual(self.flagged(be), [], be.problems())
+            self.assertFalse(sb._ENV_FILE_AUTH_CHECKED)
+        finally:
+            os.environ.pop("ROMP_SUPERVISED", None)
 
     def test_the_direct_call_returns_the_variable_it_named_and_files_a_problem(self):
         self.write_env("%s=%s\n" % (ks.REF_VAR, REF))
