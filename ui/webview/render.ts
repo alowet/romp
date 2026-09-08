@@ -54,6 +54,7 @@ import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser
 import { pastedFilePath } from "./paste-path";
 import { insertAtCaret } from "./composer-insert";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
+import { activeTabToReannounce } from "./relay-active";
 import { dirStatusHint, nextDirActive, createDirPrompt, type DirStatus } from "./dir-complete";
 import { mediaSrc, kernelUrl } from "./media";
 import { initStrip, fmtReset } from "./strip";
@@ -12402,12 +12403,28 @@ function reshipPendingUploads(hosts?: readonly string[]): void {
     }
   }
 }
-window.addEventListener("romp:wsup", () => reshipPendingUploads());
+window.addEventListener("romp:wsup", () => {
+  reshipPendingUploads();
+  // …and the LOCAL kernel's active tab (the twin of the relay re-arm below; review fold, T246): the shim's
+  // redial carries ?active= from the PERSISTED activeId, which a dismissal's fallback and a sole-tab adoption
+  // change without setActive — so a restarted local kernel could key a tab the user had left and serve the
+  // one they are looking at as a background tab. The live activeId is re-announced on the socket's open.
+  if (activeTabToReannounce(activeId, "")) notifyActive();
+});
 // federation dispatches this on a host relay socket (re)connect — the exact event that makes that
 // host's owed acks reachable again; the detail names the host, so only its entries re-ship
 window.addEventListener("romp:hostRelayUp", (e) => {
   const h = String((((e as CustomEvent).detail || {}) as any).host || "");
   if (h) reshipPendingUploads([h]);
+  // …and the tab this pane is LOOKING AT, when that host owns it (T246, the user 2026-09-07): the relay's
+  // open is the moment the remote kernel holds a FRESH client for this pane — after that kernel restarted,
+  // one with no active tab at all. Its pusher keys only a client's active tab on the live change key (the
+  // backend's stream, its queue, the snapshot row); every other session is served from the file-stat
+  // cache, so the session the user was watching streamed nothing until their next send moved a file
+  // input. The pane shim's local socket re-arms the LOCAL kernel with its ?active= connect hint on every
+  // dial; the relay has no hint, so the same fact is re-sent here as the activeTab message every tab
+  // switch sends (notifyActive; routeOutbound strips the host prefix). Decision in relay-active.ts.
+  if (activeTabToReannounce(activeId, h)) notifyActive();
 });
 
 // Sids whose SEND is HELD until every pending ship acks (the user 2026-08-16: sending mid-upload
