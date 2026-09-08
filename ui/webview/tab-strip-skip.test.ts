@@ -57,7 +57,7 @@ test("every input the strip renders is in the signature", () => {
   // the state class the paint adds is the signature's own reading of the state: one rule for both — and for
   // the folded header's pip (tab-state.ts, the shared module)
   assert.match(fn, /const stateCls = tabStateClass\(s\.status\);\s*\n\s*if \(stateCls\) tab\.classList\.add\(stateCls\);/);
-  assert.match(RENDER, /^import \{ tabStateClass, sectionPip, sectionPipMembers, sectionPipTitle \} from "\.\/tab-state";/m);
+  assert.match(RENDER, /^import \{ tabStateClass, tabDotClass, sectionPip, sectionPipMembers, sectionPipTitle \} from "\.\/tab-state";/m);   // + tabDotClass: the dot slot every tab carries derives from st.state, already in the signature (the tab-strip fix, 2026-09-08)
 });
 
 test("a tab drag resets the signature (its live reorder changes the strip's DOM outside renderTabs), and the tooltip reads the session fresh", () => {
