@@ -229,9 +229,8 @@ class DeliveredMeansDelivered(unittest.TestCase):
     """A relayed or parked message is not a delivered one, and the tool surface has to say which."""
 
     def setUp(self):
-        self._saved = {k: getattr(pm, k) for k in ("_http", "my_name", "my_id", "_heartbeat")}
-        pm.my_name = lambda: "web"
-        pm.my_id = lambda: ME
+        self._saved = {k: getattr(pm, k) for k in ("_http", "_self_identity", "_heartbeat")}
+        pm._self_identity = lambda: (ME, "web")     # the one resolver every tool call reads (2026-09-06)
         pm._heartbeat = lambda *a, **k: None
 
     def tearDown(self):

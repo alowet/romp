@@ -283,24 +283,35 @@ def _self_row():
     return (next((a for a in agents if a.get("id") == sid), None)
             or next((a for a in agents if a.get("lastSid") == sid), None))
 
-def my_id():
+def _self_identity():
+    """(id, name) of THIS session from ONE _self_row() resolution — one GET /sessions, where the
+    `my_name(), my_id()` pair a caller used to write cost two (2026-09-06: with about 30 sessions
+    beating every 30 s the heartbeat was nearly all of the kernel's GET /sessions traffic, and this
+    pair two of the three fetches each beat cost). Both fallbacks kept: no row → the env fsid as the
+    id (mail still routes by id) and the names registry for the name (kernel-down fallback; a
+    comment-thread session withholds its names entry, which is why the row comes first). (None,
+    None) when not in a romp session (no tmux fallback: the bus never shells tmux). Nothing is
+    memoized: a resolution that missed (kernel mid-restart) is retried in full by the next call."""
     row = _self_row()
-    return row["id"] if row else _self_id()
+    sid = row["id"] if row else _self_id()
+    if row and row.get("name"):
+        return sid, row["name"]
+    fsid = _self_id()
+    if not fsid:
+        return sid, None
+    try:
+        return sid, ((NAMES_DIR / fsid).read_text().split("\t")[0].strip() or None)
+    except Exception:
+        return sid, None
+
+def my_id():
+    return _self_identity()[0]
 
 def my_name():
     # The live agent row first (it tracks renames AND survives transcript forks); the names registry as
-    # the kernel-down fallback. None when not in a romp session (no tmux fallback: the bus never shells
-    # tmux).
-    row = _self_row()
-    if row and row.get("name"):
-        return row["name"]
-    sid = _self_id()
-    if not sid:
-        return None
-    try:
-        return (NAMES_DIR / sid).read_text().split("\t")[0].strip() or None
-    except Exception:
-        return None
+    # the kernel-down fallback. A caller that needs BOTH halves calls _self_identity() once instead of
+    # this pair — each of these is a full resolution.
+    return _self_identity()[1]
 
 # ───────────────────────── maildir store ─────────────────────────
 
@@ -852,8 +863,8 @@ def _publish_working(sid, text):
     r = _kernel_post("/working", {"id": str(sid), "text": text})
     return r is not None and r.get("ok") is not False        # None: unreachable; ok false: the kernel refused
 
-def all_agents(threads=False):
-    agents = local_agents(threads=threads)
+def _with_remote_presence(agents):
+    """The local rows plus every heartbeat-known REMOTE session (within HEARTBEAT_TTL, not already local)."""
     local_ids = {a["id"] for a in agents}
     now = time.time()
     for sid, (name, ts) in list(HEARTBEATS.items()):
@@ -861,17 +872,46 @@ def all_agents(threads=False):
             agents.append({"name": name, "id": sid, "remote": True})
     return agents
 
+def all_agents(threads=False):
+    return _with_remote_presence(local_agents(threads=threads))
+
 def _record_heartbeat(sid, name):
     """Record remote-presence for an incoming heartbeat — but ONLY for a sid the local kernel does NOT already
     own. A local session is already visible via the kernel's /sessions, so recording its heartbeat would leave
     it lingering as a phantom [remote] peer for the TTL after it dies. A genuine REMOTE (federated) session,
-    reaching us over an -R tunnel, is NOT in the local kernel — heartbeats are its only presence signal."""
-    if sid and _safe_id(sid) and sid not in {a["id"] for a in local_agents()}:
-        HEARTBEATS[sid] = (name or "?", time.time())
+    reaching us over an -R tunnel, is NOT in the local kernel — heartbeats are its only presence signal.
+
+    Returns True iff the sid is LOCAL: the bus's own listing ANSWERED and contains it (thread rows
+    included — a comment thread heartbeats under its own row, and until 2026-09-06 the thread-less
+    listing read here filed every live thread as REMOTE presence, a phantom that also reached
+    STATE/remote-sids; the by-name consumers that used to find a thread through that phantom,
+    _recip_id_for for recall, now read the listing with thread rows). The /heartbeat route hands that bit
+    back so a local session's MCP can stop heartbeating (2026-09-06: every local beat cost the kernel
+    three GET /sessions for a no-op). An UNANSWERED listing (kernel mid-restart) is False and records
+    the beat exactly as before — the answer is derived from the listing only, never from the
+    client's claim, so a remote session never hears "local" and never stops."""
+    local = False
+    if sid and _safe_id(sid):
+        rows, answered = local_agents_checked(threads=True)
+        if answered and any(a["id"] == sid for a in rows):
+            local = True
+        else:
+            HEARTBEATS[sid] = (name or "?", time.time())
     _write_remote_sids()                           # presence changed → refresh the deadness mirror
+    return local
+
+def present_count_checked():
+    """(present count, answered) for the autostop gate: local rows plus heartbeat presence, and whether
+    the kernel's listing ANSWERED. An answered listing is also remembered (_remember_presence: the
+    in-memory last-good rows and their disk twin), which is the evidence _idle_tick reads when a later
+    listing does not answer."""
+    rows, answered = local_agents_checked()
+    if answered:
+        _remember_presence(rows)
+    return len(_with_remote_presence(list(rows))), answered
 
 def present_count():
-    return len(all_agents())
+    return present_count_checked()[0]
 
 def _postal_off(sid):
     """True if the session toggled POSTAL ISOLATION on (the timeline lane's mailbox icon → postalServiceOff): it's
@@ -898,10 +938,17 @@ def _git_branch(d):
     except Exception:
         return ""
 
-def _name_for_id(sid):
+def _name_for_id(sid, rows=None):
+    """A session's display name: its live row (thread rows included — a comment thread's name lives
+    only on its row, no names entry), else the names registry, else the short id. `rows` is a listing
+    the caller already holds, so an operation that names many ids fetches GET /sessions once, not once
+    per id (2026-09-06: the orphan sweep named every dead mailbox with its own fetch, 28 per 30 s poll
+    on a box with 58 mailboxes; a recall by a dead name fetched once per mailbox). None fetches."""
     if not sid:
         return "?"
-    for a in local_agents():
+    if rows is None:
+        rows = local_agents(threads=True)
+    for a in rows:
         if a["id"] == sid:
             return a["name"]
     try:
@@ -909,11 +956,16 @@ def _name_for_id(sid):
     except Exception:
         return sid[:8]
 
-def _recip_id_for(to):
+def _recip_id_for(to, rows=None):
     """A recipient reference (live name, or UUID with an existing mailbox) -> session
     UUID, or None. Addressing is LIVE-only: a name that isn't a currently-live session
-    fails (no dead-session resurrection)."""
-    for a in all_agents():
+    fails (no dead-session resurrection). Thread rows included, the 2026-08-22 rule every
+    by-name resolver follows (resolve_recipient, GET /agents): a comment thread is addressable
+    by its own name, and recall of mail parked for it must find it (2026-09-06: it used to be
+    found through a phantom remote-presence row its heartbeat left; that phantom is gone).
+    `rows`: a listing the caller already holds (recall shares one across its lookups)."""
+    agents = _with_remote_presence(list(rows)) if rows is not None else all_agents(threads=True)
+    for a in agents:
         if a["name"] == to:
             return a["id"]
     if _safe_id(to) and (MAILROOT / to).is_dir():  # already an id with a mailbox (in-flight mail)
@@ -1096,8 +1148,15 @@ def _recall(from_id, to, mid):
     mail has left `new/` and can't be recalled. Returns [{to, id, body}] removed."""
     if not from_id:
         return []
+    listing = []                                 # ONE listing per recall, at first need; every name lookup reads it
+
+    def _rows():
+        if not listing:
+            listing.append(local_agents(threads=True))
+        return listing[0]
+
     if to:
-        rid = _recip_id_for(to)
+        rid = _recip_id_for(to, rows=_rows())
         if not rid and MAILROOT.is_dir():
             # Addressing is live-only, but RECALL is not addressing: the sender is unsending their
             # own bytes, not raising the dead. Mail parked for a session that has since died sits
@@ -1105,7 +1164,7 @@ def _recall(from_id, to, mid):
             # durable name map so parked mail stays recallable (sighting 2026-08-29: a handoff
             # parked for a dead session could not be unsent by name; only the raw id worked).
             hits = [b.name for b in MAILROOT.iterdir()
-                    if b.is_dir() and _name_for_id(b.name) == to]
+                    if b.is_dir() and _name_for_id(b.name, rows=_rows()) == to]
             rid = hits[0] if len(hits) == 1 else None    # two dead boxes, one name: refuse, stay scoped
         boxes = [rid] if rid else []
     elif MAILROOT.is_dir():
@@ -1134,7 +1193,7 @@ def _recall(from_id, to, mid):
                 f.unlink()
             except Exception:
                 continue
-            removed.append({"to": _name_for_id(rid), "id": f.name, "body": " ".join(body.split())[:120]})
+            removed.append({"to": _name_for_id(rid, rows=_rows()), "id": f.name, "body": " ".join(body.split())[:120]})
             _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "recall", "id": f.name})
         _mark_pending(rid)         # recall may have emptied new/ -> reconcile the marker
     if peers_on() and OUTBOX.is_dir():
@@ -1197,9 +1256,16 @@ def _sent_receipts(mid):
                 return h
         return None
 
+    listing = []                                 # one GET /sessions for every row without toName, at first need
+
+    def _name(sid):
+        if not listing:
+            listing.append(local_agents(threads=True))
+        return _name_for_id(sid, rows=listing[0])
+
     def _row(i, e):
         h = _parked(i, e)
-        r = {"to": e.get("toName") or _name_for_id(e.get("to_id", "")), "id": i, "sent": e["t"],
+        r = {"to": e.get("toName") or _name(e.get("to_id", "")), "id": i, "sent": e["t"],
              "exec": execs.get(i), "recalled": recalls.get(i),
              "relayed": relays.get(i), "bounced": bounced.get(i), "parked": h}
         if h:
@@ -1263,7 +1329,7 @@ def _sweep_orphans():
         newd = box / "new"
         if not newd.is_dir():
             continue
-        recip = _name_for_id(box.name)
+        recip = _name_for_id(box.name, rows=live)  # dead by construction: the registry names it, no fetch
         for f in list(newd.iterdir()):
             if not f.is_file():
                 continue
@@ -1935,8 +2001,8 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=_wake_when_ready, args=(sid,), daemon=True).start()
             return self._send({"ok": True})
         if u.path == "/heartbeat":
-            _record_heartbeat(data.get("id"), data.get("name", "?"))
-            return self._send({"ok": True})
+            local = _record_heartbeat(data.get("id"), data.get("name", "?"))
+            return self._send({"ok": True, "local": local})
         if u.path == "/quarantine/act":            # human verdict on a held message (approve/deny), from the
             mid = str(data.get("mid") or "")       # blocked card via the kernel; approve delivers, deny drops
             action = str(data.get("action") or "").strip().lower()
@@ -1993,14 +2059,62 @@ def _maybe_restart_for_code(boot_fp):
         return True
     return False
 
-def _idle_tick(n, idle):
+def _idle_tick(n, idle, answered=True):
     """One autostop decision: (new_idle, stop). Factored out so the gate is unit-testable (the
     monitor loop sleeps). Local clients OR a live local kernel reset the count — a hub with zero
-    local sessions still serves inbound peer exchanges as long as its kernel runs (_kernel_up)."""
+    local sessions still serves inbound peer exchanges as long as its kernel runs (_kernel_up).
+
+    `answered` False means the kernel's listing did not answer. That HOLDS the count only when the
+    bus has evidence that sessions existed: the last ANSWERED listing — in memory, or its disk twin
+    for a bus that started during the blink — was non-empty (_sessions_were_listed). The outage then
+    protects the sessions that were listed before it: the kernel does not own a tmux session's life
+    and lists them again when it returns. Until 2026-09-06 local sessions' heartbeats masked an
+    outage as presence; with those loops ended in peer mode the gate reads the bit itself. A bus
+    that never saw an answered non-empty listing — a kernel-less `romp mail` bus, a box whose kernel
+    stopped after its sessions had all gone — keeps the autostop: the count advances every poll and
+    stops at IDLE_GRACE. The kernel-less case holds only on a box whose twin holds no rows: a twin left
+    by an earlier kernel primes the hold in a bus spawned later the same way. The hold has ONE release,
+    the next answered listing (which rewrites the twin): a kernel gone for good after listing sessions
+    leaves the bus up until a manual stop or the returning kernel's first answer, and a code-staleness
+    re-exec does not end it (the fresh process re-primes the hold from the twin, which outlives the
+    re-exec by design) (review find, 2026-09-08; pinned by tests/test_postal_bus_lifetime.py). In
+    production an answered listing implies a live kernel (both are the same process), so `answered and
+    n == 0` with the kernel down is reached only through the ROMP_SESSIONS_FILE seam; the stop that
+    matters is the unanswered one without evidence."""
     if n > 0 or _kernel_up():
         return 0, False
+    if not answered and _sessions_were_listed():
+        return idle, False
     idle += 1
     return idle, idle >= IDLE_GRACE
+
+
+def _sessions_were_listed():
+    """True iff the last ANSWERED local listing this bus knows of was non-empty: the evidence the
+    autostop gate needs before an unanswered listing counts as an outage rather than an absence.
+    Primed from the disk twin (_PRESENCE_GOOD_FILE) when this process has not answered yet, so a
+    bus that started during the blink is covered."""
+    _presence_good_load()
+    return bool(_LOCAL_PRESENCE_GOOD[1] and _LOCAL_PRESENCE_GOOD[0])
+
+
+def _monitor_tick(idle):
+    """One poll of _monitor after its sleep: the mail sweeps, the deadness-mirror refresh, and the
+    autostop decision. Returns (idle, stop). Factored out so a tick is unit-testable."""
+    try:
+        _sweep_orphans()    # bounce mail stuck unread in dead recipients' mailboxes
+    except Exception:
+        pass
+    try:
+        _warn_stuck_mail()  # warn the sender when a LIVE-but-idle recipient still hasn't read (backstop)
+    except Exception:
+        pass
+    _write_remote_sids()    # the TTL prunes only at write time; the poll is the write that needs no beat to arrive
+    try:
+        n, answered = present_count_checked()
+    except Exception:
+        n, answered = 1, True   # on error, err on the side of staying up
+    return _idle_tick(n, idle, answered)
 
 
 def _monitor(httpd, boot_fp=""):
@@ -2008,19 +2122,7 @@ def _monitor(httpd, boot_fp=""):
     while True:
         time.sleep(POLL)
         _maybe_restart_for_code(boot_fp)   # reload if the on-disk code changed under us (does not return on restart)
-        try:
-            _sweep_orphans()    # bounce mail stuck unread in dead recipients' mailboxes
-        except Exception:
-            pass
-        try:
-            _warn_stuck_mail()  # warn the sender when a LIVE-but-idle recipient still hasn't read (backstop)
-        except Exception:
-            pass
-        try:
-            n = present_count()
-        except Exception:
-            n = 1   # on error, err on the side of staying up
-        idle, stop = _idle_tick(n, idle)
+        idle, stop = _monitor_tick(idle)
         if stop:
             _log("no romp clients remain (and no local kernel); shutting down")
             threading.Thread(target=httpd.shutdown, daemon=True).start()
@@ -2043,15 +2145,18 @@ def _retry_pending():
     revival); a stale marker (new/ already empty) is reconciled away."""
     if not MAILPENDING.is_dir():
         return
-    live = {a["id"]: a for a in local_agents()}
-    for m in list(MAILPENDING.iterdir()):
-        if not m.is_file():
-            continue
+    markers = [m for m in MAILPENDING.iterdir() if m.is_file()]
+    if not markers:
+        return                                 # nothing pending: no GET /sessions this pass (2026-09-06)
+    live = None                                # fetched once, and only for a marker that still holds mail
+    for m in markers:
         sid = m.name
         newd = MAILROOT / sid / "new"
         if not (newd.is_dir() and any(newd.iterdir())):
             _mark_pending(sid)                 # stale marker -> clear it
             continue
+        if live is None:
+            live = {a["id"]: a for a in local_agents()}
         if sid in live:
             try:
                 _push(sid, live[sid])          # re-attempt; the kernel defers again if still unsafe
@@ -2317,7 +2422,14 @@ def _write_remote_sids():
     kernel/judge DEADNESS rule (2026-08-28, the dead-session round): a sid absent from the local
     registry but present here is a live REMOTE session whose local mirror store must never be
     presumed closed. The FILE's existence means the bus has spoken; readers treat a missing file
-    as "cannot determine" and stay conservative."""
+    as "cannot determine" and stay conservative.
+
+    The TTL is applied at WRITE time, so an expired heartbeat leaves the file only when something
+    writes it: every recorded heartbeat, every peer exchange, and (since 2026-09-06) every _monitor
+    poll. In peer mode (the default) a local session's beats end once its bus confirms it local, and
+    remote presence arrives through the peer exchange, which writes here. In legacy singleton mode
+    the beats continue; the poll-time write is the backstop for a hub whose local sessions have all
+    gone quiet while a dead remote's sid waits out its TTL."""
     try:
         now = time.time()
         ids = {sid for sid, (_nm, ts) in HEARTBEATS.items() if now - ts < HEARTBEAT_TTL}
@@ -2637,6 +2749,19 @@ def _presence_good_load():
         pass                                         # no twin yet (fresh box) → nothing to prime
 
 
+def _remember_presence(rows):
+    """Record an ANSWERED local listing as the last-good rows, in memory and in the disk twin
+    (_PRESENCE_GOOD_FILE). Read by _local_presence while the kernel does not answer, and by the
+    autostop gate's _sessions_were_listed."""
+    _LOCAL_PRESENCE_GOOD[0], _LOCAL_PRESENCE_GOOD[1] = rows, True
+    try:
+        tmp = _PRESENCE_GOOD_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows))
+        os.replace(tmp, _PRESENCE_GOOD_FILE)     # the disk twin follows every answered read
+    except Exception:
+        pass
+
+
 def _local_presence():
     """Local agent rows for an exchange payload, blink-honest: an UNANSWERED kernel listing (a
     mid-restart blink) must never gossip as "nobody lives here" — the far boxes' PEER_STATE flaps
@@ -2647,13 +2772,7 @@ def _local_presence():
     including ones running older code, because the honesty lands in the payload itself."""
     rows, answered = local_agents_checked()
     if answered:
-        _LOCAL_PRESENCE_GOOD[0], _LOCAL_PRESENCE_GOOD[1] = rows, True
-        try:
-            tmp = _PRESENCE_GOOD_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(rows))
-            os.replace(tmp, _PRESENCE_GOOD_FILE)     # the disk twin follows every answered read
-        except Exception:
-            pass
+        _remember_presence(rows)
         if _PRESENCE_SERVE_WARNED[0]:
             _PRESENCE_SERVE_WARNED[0] = False
             sys.stderr.write("postal: the local listing answers again — presence serves live rows\n")
@@ -3322,7 +3441,9 @@ def looks_remote():
     return bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"))
 
 def _unreachable_hint():
-    if is_client_only() or looks_remote():
+    # the tunnel hint belongs to the legacy singleton scheme: in peer mode (the default) an SSH'd box runs
+    # its own bus and `romp mail remote` refuses, so pointing at it would be a dead end (review find, 2026-09-08)
+    if not peers_on() and (is_client_only() or looks_remote()):
         return "can't reach your laptop's Romp Postal Service bus — is the SSH tunnel up? run: romp mail remote"
     return "can't reach the Romp Postal Service bus (see ~/.local/state/romp/postal/server.log)"
 
@@ -3379,27 +3500,78 @@ def restart():
     return ensure()
 
 def _heartbeat(sid, name):
-    if sid:
-        try:
-            _http("POST", "/heartbeat", {"id": sid, "name": name or "?"})
-        except Exception:
-            pass
+    """POST this session's presence to the bus. Returns the bus's answer ({ok, local}) or None when
+    there was none (bus unreachable, no sid); callers that only want the side effect ignore it."""
+    if not sid:
+        return None
+    try:
+        return _http("POST", "/heartbeat", {"id": sid, "name": name or "?"})
+    except Exception:
+        return None
 
-def _heartbeat_loop():
+_LOCAL_CONFIRMED = [False]   # this MCP's session is local to its bus, per a peer-mode `local: true` answer
+
+def _heartbeat_once():
+    """One beat of _heartbeat_loop: ONE identity resolution (one GET /sessions) and one POST /heartbeat.
+    Returns True iff the bus answered `local: true` — its own answered listing holds this sid, so the
+    kernel already publishes this session's presence. A bus that did not answer, answered without the
+    bit (an older bus), or said local=false (a remote session, or a kernel mid-restart that left the
+    listing unanswered) is False: keep beating.
+
+    In peer mode a true answer also latches _LOCAL_CONFIRMED, which _mcp_call reads to skip its
+    per-call beat: there the bus behind BASE is this box's own for the life of the process, so the
+    verdict cannot go stale. It is never latched from an unanswered or false answer, and never in
+    legacy singleton mode (ROMP_POSTAL_PEERS=0), where `romp mail remote` can replace the local bus
+    with the hub's over an -R tunnel under a running session — the beats are then its only presence.
+    The peer-mode premise, that `romp mail remote` never swaps the bus behind BASE there, is enforced:
+    setup_remote refuses in peer mode, --force included (review find, 2026-09-08: run after the latch
+    it silenced the session on the hub), as _remote_nudge already treated the command as moot."""
+    sid, name = _self_identity()
+    if not sid:
+        return False
+    resp = _heartbeat(sid, name)
+    local = bool(isinstance(resp, dict) and resp.get("local") is True)
+    if local and peers_on():
+        _LOCAL_CONFIRMED[0] = True
+    return local
+
+def _heartbeat_loop(interval=None, stop=None):
     """Keep THIS session present to the bus while it's alive, so an IDLE session that hasn't touched a postal
     tool is still addressable. This is essential for a REMOTE (federated) session: it appears to the laptop's
     bus ONLY via heartbeats over the -R tunnel (a local session is already visible through the kernel's
-    /sessions). Cadence well under HEARTBEAT_TTL. The bus ignores heartbeats from LOCAL sids, so this costs a
-    local session nothing and is the presence mechanism for remote ones. Runs from the stdio MCP server, which
-    lives exactly as long as the Claude session."""
-    while True:
+    /sessions). Cadence well under HEARTBEAT_TTL. Runs from the stdio MCP server, which lives exactly as long
+    as the Claude session.
+
+    The bus ignores heartbeats from LOCAL sids, and since 2026-09-06 says so in its answer. In PEER mode
+    (the default) the loop ends on the first `local: true`: every box runs its own bus, a session stays
+    local to it for the life of the process, and every further beat would be a no-op that cost the kernel
+    GET /sessions calls (about 30 sessions beating every 30 s were 3 requests per second on a saturated
+    kernel). In legacy singleton mode (ROMP_POSTAL_PEERS=0) the loop never ends: `romp mail remote`
+    replaces the local bus with the hub's over an -R tunnel while sessions run, and from then on these
+    beats are the only presence the hub sees. A remote (client-only box) session never hears "local"
+    from the hub's bus in either mode. `interval` and `stop` (a threading.Event) are test seams; the
+    defaults are the production cadence and no external stop.
+
+    What the ended loop changes for a peer's send during a KERNEL BLINK (review find, 2026-09-08): a
+    local session's beat that landed while the listing was unanswered used to be filed as remote
+    presence (the bus could not call it local), so a send to its name during the blink resolved to that
+    row and delivered into its mailbox with no wake, and the mail sat there unannounced until the
+    kernel returned. With the loop ended and the per-call beat skipped no such row appears, and
+    resolve_recipient's standing blink refusal (503, retry shortly, never a death ruling) covers every
+    local peer alike: the mail stays with the sender, who is told so. Pinned by
+    tests/test_postal_heartbeat_fetches.py."""
+    if interval is None:
+        interval = max(15, HEARTBEAT_TTL // 3)
+    while not (stop is not None and stop.is_set()):
         try:
-            sid = my_id()
-            if sid:
-                _heartbeat(sid, my_name())
+            if _heartbeat_once() and peers_on():
+                return
         except Exception:
             pass
-        time.sleep(max(15, HEARTBEAT_TTL // 3))
+        if stop is not None:
+            stop.wait(interval)
+        else:
+            time.sleep(interval)
 
 # ───────────────────────── stdio MCP server ─────────────────────────
 
@@ -3460,8 +3632,9 @@ MCP_TOOLS = [
 ]
 
 def _mcp_call(name, args):
-    me, mid = my_name(), my_id()
-    _heartbeat(mid, me)
+    mid, me = _self_identity()               # one GET /sessions for both halves, not one each
+    if not _LOCAL_CONFIRMED[0]:              # a confirmed-local session's beat is a no-op the bus pays a fetch for
+        _heartbeat(mid, me)
     if name == "send_message":
         to, body = args.get("to", ""), args.get("body", "")
         kind = str(args.get("kind", "")).strip().lower()
@@ -3560,7 +3733,8 @@ def mcp():
     ONLY protocol messages; everything else goes to stderr."""
     ensure()
     # Heartbeat presence while this session lives, so an idle REMOTE (federated) session stays addressable
-    # over the -R tunnel even before it uses a postal tool. No-op for local sids (the bus ignores those).
+    # over the -R tunnel even before it uses a postal tool. A LOCAL session's loop ends on the bus's first
+    # `local: true` answer (the bus ignores local beats anyway; see _heartbeat_loop).
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     out = sys.stdout
 
@@ -3638,7 +3812,7 @@ def cli_send(argv):
         sys.stderr.write("[romp mail] refusing to send an empty message\n"); return 2
     if not ensure():
         sys.stderr.write("[romp mail] %s\n" % _unreachable_hint()); return 1
-    me, mid = my_name(), my_id()
+    mid, me = _self_identity()
     if frm_label:
         me, mid = frm_label, "ext:" + frm_label
     if not mid:
@@ -3682,7 +3856,7 @@ def cli_inbox(peek=False):
 def cli_agents():
     if not ensure():
         sys.stderr.write("[romp mail] %s\n" % _unreachable_hint()); return 1
-    me, mid = my_name(), my_id()
+    mid, me = _self_identity()
     try:
         res = _http("GET", "/agents?me=%s" % urllib.parse.quote(me or ""))
     except BusError as e:
@@ -3785,7 +3959,25 @@ def cli_drain(argv):
 def setup_remote(force=False):
     """Point THIS machine at the laptop's Romp Postal Service over an SSH reverse
     tunnel: configure the client side automatically, then guide + verify the one
-    manual step (the tunnel, which can only be opened from the laptop)."""
+    manual step (the tunnel, which can only be opened from the laptop). Legacy
+    singleton scheme only: peer mode refuses, --force included (see below)."""
+    if peers_on():
+        # Peer mode (the default since 2026-07-20) has no laptop bus to point at, and since the
+        # heartbeat latch (2026-09-06) the command would do harm here: a local session's MCP stops
+        # beating for good once its own bus confirms it local, so a hub's bus swapped in behind the
+        # port would never hear of this box's sessions, and the local bus this command stops is the
+        # one carrying their mail. Refuse before any side effect, --force included, and say why
+        # (review find, 2026-09-08: `romp mail remote --force` after the latch silenced the session
+        # on the hub). _remote_nudge already treats the command as moot in peer mode.
+        print("romp mail remote is off in peer mode (the default): every machine runs its own Romp")
+        print("Postal Service bus and cross-host mail rides the kernel's peer tunnels, so there is no")
+        print("laptop bus to point this machine at. Nothing was changed.")
+        print("")
+        print("--force does not override this: a session's heartbeats end for good once its own bus")
+        print("confirms it local, so a hub's bus swapped in behind the port would never see this box's")
+        print("sessions, and the local bus this command would stop is what carries their mail.")
+        print("This command belongs to the legacy singleton scheme (ROMP_POSTAL_PEERS=0).")
+        return 2
     if not force and not looks_remote():
         print("This looks like your Romp Postal Service host (no SSH session detected);")
         print("the bus runs here automatically, so there's nothing to set up.")
@@ -3839,7 +4031,7 @@ USAGE = """romp-postal-service — the Romp Postal Service
   romp mail working <text>          publish what you're working on (empty to clear)
   romp mail sent                    show your sent messages + whether each was read
   romp mail recall <to> [id]        unsend an unread message you sent to <to>
-  romp mail remote                  connect this (remote) machine to your laptop's bus
+  romp mail remote                  connect this (remote) machine to your laptop's bus (legacy scheme, ROMP_POSTAL_PEERS=0)
 (internal: serve | ensure | restart | mcp | drain --id <id> | wake --id <id> | picker-check --name <n> --id <id>)"""
 
 def main(argv):

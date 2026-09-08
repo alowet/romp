@@ -432,6 +432,319 @@ class PostalCards(_Fold):
         card2 = next(ev for ev in inc2["events"] if ev.get("kind") == "postal-service")
         self.assertEqual(card2.get("summary"), "peer: api tests green")
 
+    # ── the seal keeps only REAL postal Bash events raw (2026-09-06) ──────────────────────────────────
+    def _bash_turn(self, i, command, result="ok\n"):
+        """One complete turn whose single tool round is a Bash call running `command`, its result `result`.
+        build_session stores the input as JSON ({"command", "description"}), truncated at 4000 chars."""
+        recs = self.s.turn(i, tools=("Bash",))
+        recs[1]["message"]["content"][1]["input"] = {"command": command, "description": "step %d" % i}
+        recs[2]["message"]["content"][0]["content"] = result
+        return recs
+
+    def _count_hydrate(self):
+        """Every _hydrate_postal call build_session makes from here on, as the event lists it was handed."""
+        calls = []
+        orig = km._hydrate_postal
+        def counting(events, index, sid=None):
+            calls.append(list(events))
+            return orig(events, index, sid)
+        km._hydrate_postal = counting
+        self.addCleanup(setattr, km, "_hydrate_postal", orig)
+        return calls
+
+    def test_sealing_plain_bash_turns_leaves_no_raw_postal_event(self):
+        # Every plain Bash event used to ride the sealed entry's postal_raw and be re-hydrated on every
+        # judge pass, to the same raw row each time. Only a send or a mail read belongs there.
+        s = self.s
+        self._log()
+        for m in MODS:
+            m._msg_summaries = lambda: {}
+        s.append(self._bash_turn(0, "uv run pytest -q"))
+        self.equiv("plain bash")
+        s.append(self._bash_turn(1, "echo " + "x" * 5000))        # its stored input is cut at 4000 chars: not JSON
+        self.equiv("truncated bash")
+        # a marker in a plain Bash OUTPUT is text the agent read (a grep hit), not mail: the row stays raw
+        s.append(self._bash_turn(2, "grep -rn romp-msg-id notes.md",
+                                 result="notes.md:3:<!-- romp-msg-id: %s -->\n" % self.MID))
+        self.equiv("marker in a bash output")
+        s.append(self._bash_turn(3, "uv run pytest -q"))
+        inc = self.equiv("sealed")
+        entry = km._chat_fold_get(SID)
+        self.assertEqual(entry["n"], 3, "three ended turns sealed; the last is never")
+        self.assertEqual(entry["postal_raw"], [], "no plain Bash event rides the entry raw")
+        self.assertEqual(entry["postal_cards"], [])
+        bash_rows = [e for e in entry["events"] if e.get("kind") == "tool" and e.get("name") == "Bash"]
+        self.assertEqual(len(bash_rows), 3, "the three Bash events are sealed as rendered rows")
+        self.assertTrue(any(self.MID in (e.get("output") or "") for e in bash_rows), "the grep hit is one of them")
+        self.assertEqual([e for e in inc["events"] if e.get("kind") == "postal-service"], [])
+
+    def test_a_warm_build_hydrates_once_with_and_without_a_judge_pass(self):
+        # With nothing postal sealed, the tail pass is the ONE hydration a warm build makes: the gate has
+        # nothing to re-hydrate on a judge pass and the re-commit has nothing to hydrate either.
+        s = self.s
+        for i in range(4):
+            s.append(self._bash_turn(i, "uv run pytest -q"))
+        self.equiv("sealed")
+        self.assertEqual(km._chat_fold_get(SID)["postal_raw"], [])
+        calls = self._count_hydrate()
+        n_fold, n_postal = km._CHAT_FOLD_STATS["fold"], km._CHAT_FOLD_STATS.get("g:postal", 0)
+        s.build()
+        self.assertEqual(km._CHAT_FOLD_STATS["fold"], n_fold + 1, "the warm build folded")
+        self.assertEqual(len(calls), 1, "one hydration: the tail pass")
+        for m in MODS:
+            m._judge_gen[0] += 1
+        s.build()
+        self.assertEqual(km._CHAT_FOLD_STATS["fold"], n_fold + 2, "the judge pass did not demote")
+        self.assertEqual(len(calls), 2, "a judge pass with nothing postal sealed adds no hydration")
+        self.assertEqual(km._CHAT_FOLD_STATS.get("g:postal", 0), n_postal, "and filed no postal demotion")
+
+    def test_a_bash_send_stays_raw_and_is_rehydrated_when_the_judges_run(self):
+        # The `romp mail send` twin of the caption-rewrite test above: the send is the one Bash event the
+        # seal keeps raw in this transcript, and a judge pass re-hydrates exactly it, so its card can pick up the recipient's
+        # caption. The card's caption itself is pinned at the hydrator level (PostalRelevance): build_session
+        # stores a Bash input as JSON, which _cli_send_card does not unwrap, so no card renders here (a
+        # limit that predates this change and is not widened by it).
+        s = self.s
+        self._log()
+        for m in MODS:
+            m._msg_summaries = lambda: {}
+        s.append(self._bash_turn(0, "uv run pytest -q"))
+        s.append(self._bash_turn(1, 'romp mail send api "the api tests are green now"',
+                                 result="[romp mail] delivered to api\n"))
+        s.append(self._bash_turn(2, "uv run pytest -q"))
+        s.append(self._bash_turn(3, "uv run pytest -q"))
+        self.equiv("send sealed")
+        raw = km._chat_fold_get(SID)["postal_raw"]
+        self.assertEqual(len(raw), 1, "the send, and only the send, rides the entry raw")
+        self.assertEqual((raw[0]["kind"], raw[0]["name"]), ("tool", "Bash"))
+        self.assertIsNotNone(km._cli_send_match(raw[0]), "kept by the matcher the card renders from")
+        calls = self._count_hydrate()
+        s.build()
+        # the tail pass, plus the re-commit hydrating the entry's raw list (the send alone)
+        self.assertEqual([len(c) == 1 and c[0] is raw[0] for c in calls], [False, True])
+        for m in MODS:
+            m._judge_gen[0] += 1
+        s.build()
+        # the gate re-hydrates the sealed send against the new captions, then the tail pass and the re-commit
+        self.assertEqual([len(c) == 1 and c[0] is raw[0] for c in calls[2:]], [True, False, True])
+        self.assertEqual(len(calls), 5)
+
+
+class PostalRelevance(_Fold):
+    """_chat_postal_relevant decides what the fold keeps raw; _hydrate_postal decides what renders. The
+    invariant tying them: an event the predicate rejects comes back from hydration as the same object."""
+    MID = PostalCards.MID
+    PEER = PostalCards.PEER
+    BODY = "the api tests are green now"
+
+    def _index(self, **rows):
+        idx = {self.MID: {"id": self.MID, "from": "api", "fromId": self.PEER, "fromHost": "", "toId": SID,
+                          "body": self.BODY, "kind": "coordinate", "t": 1788400000, "park": False}}
+        idx.update(rows)
+        return idx
+
+    def _cases(self):
+        """(label, event, relevant, renders a card) — one row per shape the plan names, plus the neighbours
+        that must NOT count: an echo of a marker in an assistant reply, a Read whose output carries one."""
+        marker = "<!-- romp-msg-id: %s -->" % self.MID
+        ts = iso(1788400010)
+        def bash(command, output="ok\n", input=None):
+            inp = input if input is not None else json.dumps({"command": command, "description": "d"})
+            return {"kind": "tool", "name": "Bash", "input": inp, "output": output, "isError": False,
+                    "uuid": "t", "ts": ts}
+        def tool(name, output, **inp):
+            return {"kind": "tool", "name": name, "input": json.dumps(inp), "output": output,
+                    "isError": False, "uuid": "t", "ts": ts}
+        return [
+            ("plain bash", bash("uv run pytest -q"), False, False),
+            ("truncated bash", bash(None, input=json.dumps({"command": "echo " + "x" * 5000})[:4000]), False, False),
+            ("bash output carrying a marker", bash("grep -rn romp-msg-id notes.md", output="notes.md:3:" + marker), False, False),
+            ("bash send, raw input", bash(None, input='romp mail send api "%s"' % self.BODY,
+                                          output="[romp mail] delivered to api"), True, True),
+            ("bash send, json input", bash('romp mail send api "%s"' % self.BODY,
+                                           output="[romp mail] delivered to api"), True, False),
+            ("bash inbox read", bash("romp mail inbox", output="from api:\n" + marker), True, True),
+            ("check_inbox", tool("mcp__romp-postal-service__check_inbox", marker), True, True),
+            ("send_message", tool("mcp__romp-postal-service__send_message", "Delivered to 'api'.",
+                                  to="api", body=self.BODY), True, True),
+            ("read whose output carries a marker", tool("Read", marker, file_path="/tmp/notes-api/notes.md"), False, False),
+            ("user text with a marker", {"kind": "user", "md": "####\nfrom api\n####\n%s\n%s" % (self.BODY, marker),
+                                         "uuid": "u", "ts": ts, "human": False}, True, True),
+            ("plain user text", {"kind": "user", "md": "please run the tests", "uuid": "u", "ts": ts, "human": True}, False, False),
+            ("assistant echo of a marker", {"kind": "assistant", "md": "noted " + marker, "uuid": "a", "ts": ts}, False, False),
+        ]
+
+    def test_only_postal_events_are_relevant_and_the_rest_pass_through_by_identity(self):
+        for m in MODS:
+            m._msg_summaries = lambda: {}
+        index = self._index()
+        for label, ev, relevant, renders in self._cases():
+            with self.subTest(label):
+                self.assertEqual(km._chat_postal_relevant(ev), relevant, label)
+                out = km._hydrate_postal([ev], index, SID)
+                self.assertEqual(len(out), 1)
+                if not relevant:
+                    self.assertIs(out[0], ev, "a rejected event comes back as the same object")
+                self.assertEqual(out[0].get("kind") == "postal-service", renders, label)
+                if ev.get("name") == "Bash":
+                    # the two Bash predicates agree with the renderers they stand for
+                    self.assertEqual(km._cli_send_match(ev) is not None or km._reads_mail(ev), relevant)
+                    if km._cli_send_card(ev) is not None:
+                        self.assertTrue(relevant, "a Bash event that renders a send card is never sealed away")
+
+    def test_a_bash_send_card_follows_the_recipients_caption(self):
+        # the hydrator-level half of PostalCards' Bash-send test: the card joins the log row wearing its
+        # body and wears whatever caption the recipient's judge has filed by now
+        ev = {"kind": "tool", "name": "Bash", "input": 'romp mail send api "%s"' % self.BODY,
+              "output": "[romp mail] delivered to api", "isError": False, "uuid": "t", "ts": iso(1788400010)}
+        caps = {self.MID: "peer: tests green (live)"}
+        for m in MODS:
+            m._msg_summaries = lambda caps=caps: dict(caps)
+        card = km._hydrate_postal([ev], self._index(), SID)[0]
+        self.assertEqual((card["kind"], card["direction"], card["mid"], card["summary"]),
+                         ("postal-service", "out", self.MID, "peer: tests green (live)"))
+        caps[self.MID] = "peer: api tests green"
+        card2 = km._hydrate_postal([ev], self._index(), SID)[0]
+        self.assertEqual(card2["summary"], "peer: api tests green")
+
+    def test_the_body_map_joins_the_row_the_linear_scan_found(self):
+        # enrich_out used to scan every index row per outgoing card; the body-keyed map must pick the
+        # same row: closest in time to the send, the FIRST such row on a tie, the last row when the send
+        # carries no time
+        body = "please pick up the notes-api deploy"
+        def row(mid, t, b=body):
+            return {"id": mid, "from": "web", "fromId": "", "fromHost": "", "toId": "", "body": b,
+                    "kind": "", "t": t, "park": False}
+        index = {"m1": row("m1", 100), "m2": row("m2", 5000), "m9": row("m9", 5000, "a different message"),
+                 "m3": row("m3", 9000), "m4": row("m4", 5000)}
+        def linear(et):
+            recs = [r for r in index.values() if r["body"] == body]
+            return (min(recs, key=lambda r: abs((r["t"] or 0) - et)) if et else recs[-1])["id"]
+        def send(ts):
+            return {"kind": "tool", "name": "mcp__romp-postal-service__send_message",
+                    "input": json.dumps({"to": "api", "body": body}), "output": "Delivered to 'api'.",
+                    "isError": False, "uuid": "t", "ts": ts}
+        for m in MODS:
+            m._msg_summaries = lambda: {}
+        for et, want in ((4980, "m2"), (120, "m1"), (8000, "m3"), (2550, "m1"), (0, "m4")):
+            with self.subTest(et=et):
+                card = km._hydrate_postal([send(iso(et) if et else None)], index)[0]
+                self.assertEqual(card["mid"], want)
+                self.assertEqual(card["mid"], linear(et), "the same row the linear scan picked")
+        plain = km._hydrate_postal([send(iso(4980))], {"m9": index["m9"]})[0]
+        self.assertNotIn("mid", plain, "no row wearing the body: the card stays unjoined")
+
+    def test_the_memoized_index_carries_one_body_map_per_version(self):
+        self.addCleanup(km._postal_index_memo.__setitem__, 0, None)
+        d = jd.STATE / "timeline"; d.mkdir(exist_ok=True)
+        log = d / "messages.jsonl"
+        def line(mid, t):
+            return json.dumps({"ev": "sent", "id": mid, "from": "web", "from_id": self.PEER, "to_id": SID,
+                               "body": "deploy please", "kind": "coordinate", "t": t}) + "\n"
+        log.write_text(line("m1", 100) + line("m2", 5000))
+        idx = km._postal_index()
+        bm = km._postal_body_rows(idx)
+        self.assertIs(km._postal_body_rows(km._postal_index()), bm, "one map per index version, not per call")
+        self.assertEqual([r["id"] for r in bm["deploy please"]], ["m1", "m2"])
+        with open(log, "a") as f:
+            f.write(line("m3", 9000))
+        idx2 = km._postal_index()
+        self.assertIsNot(idx2, idx, "the log grew: a new index version")
+        bm2 = km._postal_body_rows(idx2)
+        self.assertIsNot(bm2, bm)
+        self.assertEqual([r["id"] for r in bm2["deploy please"]], ["m1", "m2", "m3"])
+        own = dict(idx2)                                  # a caller's own dict never borrows the memo's map
+        self.assertIsNot(km._postal_body_rows(own), bm2)
+        self.assertEqual(km._postal_body_rows(own), bm2)
+
+    def test_a_sent_row_whose_body_is_not_a_string_neither_breaks_the_index_nor_the_join(self):
+        # the far-host relay logs a /send request's body with no type check, so a sent row can carry a
+        # JSON list or object; the body map must skip it (unhashable) rather than raise inside every
+        # session's chat build, and an outgoing card still joins its own string-bodied row
+        self.addCleanup(km._postal_index_memo.__setitem__, 0, None)
+        d = jd.STATE / "timeline"; d.mkdir(exist_ok=True)
+        def line(mid, body):
+            return json.dumps({"ev": "sent", "id": mid, "from": "web", "from_id": self.PEER, "to_id": SID,
+                               "body": body, "kind": "coordinate", "t": 5000}) + "\n"
+        (d / "messages.jsonl").write_text(line("m1", "deploy please") + line("m2", ["not", "a", "string"])
+                                          + line("m3", {"text": "an object"}))
+        idx = km._postal_index()
+        self.assertEqual(sorted(idx), ["m1", "m2", "m3"], "every row is indexed, as before")
+        bm = km._postal_body_rows(idx)
+        self.assertEqual({k: [r["id"] for r in v] for k, v in bm.items()}, {"deploy please": ["m1"]})
+        for m in MODS:
+            m._msg_summaries = lambda: {}
+        def send(body):
+            return {"kind": "tool", "name": "mcp__romp-postal-service__send_message",
+                    "input": json.dumps({"to": "api", "body": body}), "output": "Delivered to 'api'.",
+                    "isError": False, "uuid": "t", "ts": iso(5010)}
+        card = km._hydrate_postal([send("deploy please")], idx, SID)[0]
+        self.assertEqual((card["kind"], card["direction"], card["mid"]), ("postal-service", "out", "m1"))
+        other = km._hydrate_postal([send("a body no row wears")], idx, SID)[0]
+        self.assertEqual(other["kind"], "postal-service")
+        self.assertNotIn("mid", other, "no row wearing the body: the card passes through unjoined")
+
+
+    def test_outgoing_cards_join_through_one_body_map_not_a_scan_per_card(self):
+        # the saving the body map buys, pinned: a hydration walks a caller's own index ONCE to build the
+        # map, and the memoized index not at all (its map rides the memo entry) — never a walk of every
+        # row per outgoing card, which the linear scan it replaces did
+        body = "please pick up the notes-api deploy"
+        def row(mid, t, b=body):
+            return {"id": mid, "from": "web", "fromId": "", "fromHost": "", "toId": "", "body": b,
+                    "kind": "", "t": t, "park": False}
+        def send(t):
+            return {"kind": "tool", "name": "mcp__romp-postal-service__send_message",
+                    "input": json.dumps({"to": "api", "body": body}), "output": "Delivered to 'api'.",
+                    "isError": False, "uuid": "t", "ts": iso(t)}
+        sends = [send(t) for t in (1010, 2010, 3010, 4010, 5010)]
+        for m in MODS:
+            m._msg_summaries = lambda: {}
+        walks = [0]
+        class Counting(dict):
+            def values(self):
+                walks[0] += 1
+                return super().values()
+        own = Counting({"m1": row("m1", 1000), "x1": row("x1", 1500, "another message"), "m2": row("m2", 3000),
+                        "x2": row("x2", 3500, "a third message"), "m3": row("m3", 5000), "x3": row("x3", 5500, "a fourth")})
+        cards = km._hydrate_postal(sends, own, SID)
+        self.assertEqual([c.get("kind") for c in cards], ["postal-service"] * 5)
+        self.assertEqual([c["mid"] for c in cards], ["m1", "m2", "m2", "m3", "m3"])
+        self.assertEqual(walks[0], 1, "one walk of the index builds the map; no card walks it again")
+        # the memoized index: its map was built beside it, so a hydration builds none at all
+        self.addCleanup(km._postal_index_memo.__setitem__, 0, None)
+        d = jd.STATE / "timeline"; d.mkdir(exist_ok=True)
+        (d / "messages.jsonl").write_text("".join(
+            json.dumps({"ev": "sent", "id": mid, "from": "web", "from_id": self.PEER, "to_id": SID,
+                        "body": body, "kind": "coordinate", "t": t}) + "\n"
+            for mid, t in (("m1", 1000), ("m2", 2000), ("m3", 3000))))
+        idx = km._postal_index()
+        builds = []
+        orig = km._postal_body_map
+        km._postal_body_map = lambda index: (builds.append(len(index)), orig(index))[1]
+        self.addCleanup(setattr, km, "_postal_body_map", orig)
+        cards = km._hydrate_postal(sends, idx, SID)
+        self.assertEqual([c["mid"] for c in cards], ["m1", "m2", "m3", "m3", "m3"])
+        self.assertEqual(builds, [], "the memo's map is reused: no build per hydration, none per card")
+
+    def test_a_send_awaiting_its_result_is_relevant_but_renders_no_card_yet(self):
+        # relevance reads only the input: a `romp mail send` whose tool_result has not landed is kept raw
+        # (relevant) and renders no card until the CLI confirms delivery; the same event with its result
+        # hydrates to the card. Had relevance read the output, the fold would have sealed the pending
+        # send as a plain Bash row and its card could never appear.
+        ev = {"kind": "tool", "name": "Bash", "input": 'romp mail send api "%s"' % self.BODY,
+              "output": "", "isError": False, "uuid": "t", "ts": iso(1788400010)}
+        for m in MODS:
+            m._msg_summaries = lambda: {}
+        self.assertTrue(km._chat_postal_relevant(ev), "a send is postal before its result lands")
+        self.assertIsNone(km._cli_send_card(ev), "no delivery confirmed: no card yet")
+        self.assertIs(km._hydrate_postal([ev], {}, SID)[0], ev, "and the raw event passes through as itself")
+        landed = dict(ev, output="[romp mail] delivered to api")
+        self.assertTrue(km._chat_postal_relevant(landed), "the verdict did not move with the result")
+        card = km._hydrate_postal([landed], self._index(), SID)[0]
+        self.assertEqual((card["kind"], card["direction"], card["peer"], card["mid"]),
+                         ("postal-service", "out", "api", self.MID))
+
 
 class TaskOutputs(_Fold):
     def test_a_notification_whose_output_file_grows_after_the_seal_demotes(self):

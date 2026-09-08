@@ -22,7 +22,7 @@ From the shell (also how the human drives it): `romp mail send --kind delegate|c
 
 ## On a remote machine
 
-If you SSH'd into another machine and are running romp there, run `romp mail remote` to connect it to the laptop's bus. It configures the remote side and prints the one tunnel command to run from the laptop (an `ssh -R` reverse forward, or a `~C` escape on the open connection), then auto-detects when it connects. Messaging before this setup nudges you to run it.
+Nothing to set up in peer mode (the default): every machine runs its own bus, cross-host mail rides the kernel's peer tunnels, and `romp mail agents` lists a peer's sessions with their host. `romp mail remote` belongs to the legacy singleton scheme (`ROMP_POSTAL_PEERS=0`), where it connects an SSH'd machine to the laptop's bus over a reverse tunnel; in peer mode it refuses and says why (the command would stop the local bus that carries this box's mail).
 
 ## Norms
 
