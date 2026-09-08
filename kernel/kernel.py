@@ -32389,7 +32389,8 @@ def _spend_recorded_at():
         return None
 
 
-_DETAIL_TOP_N = 10       # stacks the histogram names; every further session folds into ONE "other" stack
+# (T247e, the user 2026-09-08: EVERY session is its own stack in its own color and its own row in a
+# scrolling list — no top-N, no "other" fold, no legend; the list below the chart is the legend)
 _DETAIL_DAYS = 90        # the day ledger's own depth (the recorder prunes to 90 days)
 _SPEND_GRAIN = 5e-5      # a bucket's dollars minus its sids' dollars below this is rounding, not spend: the recorder
 #                          rounds the bucket sum and each sid's sum to 6 places INDEPENDENTLY, so a fully attributed
@@ -32502,16 +32503,28 @@ def _spend_detail_local(now=None):
     except Exception:
         live = set()
     sessions = []
+    swatches = pal.colors(pal.active_name(jd.STATE))
     for sid, (u, t, n) in totals.items():
         bg, fg = _identity_of(sid)
+        derived = False
+        if not bg:
+            # a session the registry never colored (a legacy or tmux one) still needs a color of its
+            # own for its stack and its row (T247e): a deterministic swatch of the active palette, by
+            # sid, so it reads the same on every open; flagged so a client can tell it from an identity
+            import zlib
+            bg = swatches[zlib.crc32(str(sid).encode()) % len(swatches)] if swatches else ""
+            fg = pal.fg_for(bg) if bg else ""
+            derived = True
         row = {"sid": sid, "name": _name_of(sid) or "", "bg": bg, "fg": fg, "live": sid in live,
                "usd": round(u, 4), "tok": t, "turns": n}
+        if derived:
+            row["bgDerived"] = True
         if sid in keyt:
             k = keyt[sid]
             row["key"] = {"usd": round(k[0], 4), "tok": k[1], "turns": k[2]}
         sessions.append(row)
     sessions.sort(key=lambda s: (-s["usd"], -s["tok"], s["name"]))
-    top = [s["sid"] for s in sessions[:_DETAIL_TOP_N]]
+    top = [s["sid"] for s in sessions]          # every session (T247e): the list IS the legend
     meta = {s["sid"]: s for s in sessions}
 
     def _series(buckets, keys):
@@ -32574,7 +32587,7 @@ def _spend_detail_local(now=None):
     return {"host": _self_host(), "scope": scope,
             "tz": time.strftime("%Z", lt), "tzOffsetMin": int((getattr(lt, "tm_gmtoff", 0) or 0) // 60),
             "recordedAt": _spend_recorded_at(),
-            "topN": _DETAIL_TOP_N, "sessions": sessions,
+            "sessions": sessions,
             "unattributed": {"usd": round(un[0], 4), "tok": un[1], "turns": un[2]},
             "hours": hrs, "days": _series(days, day_keys)}
 
@@ -32693,8 +32706,7 @@ def _merge_spend_details(payloads, hosts, local):
                 row["host"] = host
                 sessions.append(row)
     sessions.sort(key=lambda s: (-float(s.get("usd") or 0), -int(s.get("tok") or 0), str(s.get("name") or "")))
-    top_n = int(local.get("topN") or _DETAIL_TOP_N)
-    top = [(s["host"], s["sid"]) for s in sessions[:top_n]]
+    top = [(s["host"], s["sid"]) for s in sessions]   # every session is a stack (T247e)
     top_set = set(top)
     meta = {(s["host"], s["sid"]): s for s in sessions}
     un = {"usd": 0.0, "tok": 0, "turns": 0, "byHost": {}}
@@ -32743,9 +32755,9 @@ def _merge_spend_details(payloads, hosts, local):
         n = len(keys)
         pos = {e: i for i, e in enumerate(epochs)} if name == "hours" else {k: i for i, k in enumerate(keys)}
         per = {}           # (host, sid) -> [usd[], tok[]]
-        other = ([0.0] * n, [0] * n)
-        other_count = 0    # "other (N sessions)" counts CONTRIBUTORS in this range only, like the local reader:
-        #                    each payload's own fold plus the top-N sessions of its own the merge folded
+        others = {}        # host -> ([usd], [tok], count): an OLDER peer's own "other" fold (its build still
+        #                    folds beyond a top-N); kept as that host's stack so its dollars are not lost, and
+        #                    named with the host — a current build folds nothing (T247e)
         una = ([0.0] * n, [0] * n)
         una_hosts = {}
         for host, p, rng, ax in peer_axes:
@@ -32757,15 +32769,13 @@ def _merge_spend_details(payloads, hosts, local):
                 kind = s.get("kind")
                 if kind == "sid":
                     key = (host, str(s.get("sid") or ""))
-                    if key in top_set:
-                        dst = per.setdefault(key, ([0.0] * n, [0] * n))
-                    else:
-                        dst = other
-                        if any(usd) or any(tok):
-                            other_count += 1
+                    if key not in top_set:
+                        continue          # a stack for a session the roster does not know: nothing to draw it as
+                    dst = per.setdefault(key, ([0.0] * n, [0] * n))
                 elif kind == "other":
-                    dst = other
-                    other_count += int(s.get("count") or 0)
+                    o = others.setdefault(host, ([0.0] * n, [0] * n, [0]))
+                    o[2][0] += int(s.get("count") or 0)
+                    dst = o
                 elif kind == "unattributed":
                     dst = una
                     hu = una_hosts.setdefault(host, ([0.0] * n, [0] * n))
@@ -32792,10 +32802,11 @@ def _merge_spend_details(payloads, hosts, local):
                 continue
             m = meta[key]
             stacks.append({"kind": "sid", "host": key[0], "sid": key[1], "name": m.get("name") or "", "bg": m.get("bg") or "",
-                           "live": bool(m.get("live")), "usd": u, "tok": arr[1]})
-        ou = [round(v, 4) for v in other[0]]
-        if any(ou) or any(other[1]):
-            stacks.append({"kind": "other", "name": "other", "count": other_count, "usd": ou, "tok": other[1]})
+                           "live": bool(m.get("live")), "bgDerived": bool(m.get("bgDerived")), "usd": u, "tok": arr[1]})
+        for oh, o in others.items():
+            ou = [round(v, 4) for v in o[0]]
+            if any(ou) or any(o[1]):
+                stacks.append({"kind": "other", "host": oh, "name": "other", "count": o[2][0], "usd": ou, "tok": o[1]})
         uu = [round(v, 4) for v in una[0]]
         if any(uu) or any(una[1]):
             stacks.append({"kind": "unattributed", "name": "unattributed", "usd": uu, "tok": una[1],
@@ -40902,7 +40913,7 @@ pullFleet().then(done,function(){if(ROWS.length)renderRows(ROWS,SELF);done();});
 // kernel-side, the ledger's bySid series — fetched on open behind the romp loader, never scraped from
 // the hover's HTML. The click still kicks the hover's own refresh (pull), so both levels are fresh.
 var spBack=document.getElementById('rsp-back'),spPanel=document.getElementById('rsp-panel'),spTip=null;
-var SP={data:null,err:'',range:'hours',measure:'usd',open:false,allRows:false};
+var SP={data:null,err:'',range:'hours',measure:'usd',open:false};
 var SP_OTHER='#4a5361',SP_NONE='#6b7a8c';   // "other" and a session with no identity color: neutrals, never a hue
 function spName(s){return s.name||('session '+String(s.sid||'').slice(0,8));}
 // T247c: when more than one machine contributes, a row or chip names its host the way a federated
@@ -40910,12 +40921,16 @@ function spName(s){return s.name||('session '+String(s.sid||'').slice(0,8));}
 function spHosts(d){return ((d&&d.hosts)||[]).filter(function(h){return h.status==='ok';});}
 function spMany(d){return spHosts(d).length>1;}
 function spLabel(s,many){return (many&&s.host?'<span class=host-prefix>'+esc(s.host)+':</span> ':'')+esc(spName(s));}
+// a session row reads like its TAB TITLE (T247e, the user 2026-09-08): the tab strip's own classes —
+// .tab-label with the identity color as --chip-bg (styles.css keys the color and weight on the SAME
+// rule the strip uses, so the two cannot drift) and the quiet .host-prefix — no swatch
+function spTitle(s,many){return '<span class="tab-label colored" style="--chip-bg:'+spColor(s)+'">'+(many&&s.host?'<span class=host-prefix>'+esc(s.host)+':</span>':'')+esc(spName(s))+'</span>';}
 function spColor(s){return (s.bg&&/^#[0-9a-fA-F]{3,8}$/.test(s.bg))?s.bg:SP_NONE;}
 function spHead(){var d=SP.data,ok=d?spHosts(d):[];return '<div class=rsp-top><span>'+(d&&d.scope==='computed'?'Spend (computed)':'API spend')
 +(ok.length>1?' \u00b7 '+ok.length+' machines':(d&&d.host?' \u00b7 '+esc(d.host):''))+'</span>'
 +'<button class=rsp-x data-act=close aria-label=Close>\u00d7</button></div>';}
 var spPending=null;   // the in-flight detail fetch's controller: a close or a re-open aborts it
-function openSpend(){if(!spBack||!spPanel)return;SP.open=true;spBack.hidden=false;SP.data=null;SP.err='';SP.allRows=false;
+function openSpend(){if(!spBack||!spPanel)return;SP.open=true;spBack.hidden=false;SP.data=null;SP.err='';
 spPanel.innerHTML=spHead()+'<div class=rsp-load>'+__ROMP_LOADER__+'</div>';   // the loader FIRST (the loader rule)
 // the loader ends on the EVENT (the answer) — with a backstop that cannot trap (T247b review: a hung
 // socket spun the loader forever): a generous timer aborts the fetch onto the error + retry path
@@ -40946,7 +40961,6 @@ while(t&&t!==spPanel){if(t.getAttribute&&t.getAttribute('data-act')){b=t;break;}
 if(!b)return;var a=b.getAttribute('data-act');
 if(a==='close'){closeSpend();return;}
 if(a==='retry'){openSpend();return;}
-if(a==='table:all'){SP.allRows=true;var tb=document.getElementById('rsp-table');if(tb)tb.innerHTML=sessionTable(SP.data);return;}
 var m=/^(range|measure):(\\w+)$/.exec(a);if(!m)return;
 SP[m[1]]=m[2];
 var sib=b.parentNode.querySelectorAll('[data-act^="'+m[1]+':"]');
@@ -40957,22 +40971,20 @@ if(!ss.length&&!(un&&(un.usd>0||un.tok>0)))return '<div class=rsp-note>No per-se
 // the key-billed split shows where the hover would show it: the TOTAL scope on a mixed host, where a
 // session's key dollars differ from its computed total
 var keyCol=d.scope!=='keyed'&&ss.some(function(s){return s.key&&typeof s.key.usd==='number'&&Math.round(s.key.usd)!==Math.round(s.usd);});
-var h='<table class=rsp-tbl><thead><tr><th></th><th>session</th><th class=n>dollars</th>'+(keyCol?'<th class=n>key-billed</th>':'')
+// EVERY session, in a pane that scrolls under a sticky header (T247e): the list is the chart's legend,
+// each row its tab title in its identity color; no fold, no swatch
+var h='<table class=rsp-tbl><thead><tr><th>session</th><th class=n>dollars</th>'+(keyCol?'<th class=n>key-billed</th>':'')
 +'<th class=n>turns</th><th class=n>tokens</th></tr></thead><tbody>';
-// the table folds to the histogram's own top-N (progressive disclosure: the chart stays in view under
-// a long roster); one click shows every session
-var lim=(SP.allRows||ss.length<=(d.topN||10)+2)?ss.length:(d.topN||10),shown=ss.slice(0,lim),many=spMany(d);
-shown.forEach(function(s){h+='<tr'+(s.live?'':' class=rsp-dead')+'><td><i class=rsp-sw style="background:'+spColor(s)+'"></i></td>'
-+'<td class=rsp-name>'+spLabel(s,many)+(s.live?'':'<span class=ru-tip-reset> \u00b7 not running</span>')+'</td>'
+var many=spMany(d);
+ss.forEach(function(s){h+='<tr'+(s.live?'':' class=rsp-dead')+'>'
++'<td class=rsp-name>'+spTitle(s,many)+(s.live?'':'<span class=ru-tip-reset> \u00b7 not running</span>')+'</td>'
 +'<td class=n>'+fmtUsd(s.usd)+'</td>'+(keyCol?'<td class=n>'+(s.key?fmtUsd(s.key.usd):'\u2014')+'</td>':'')
 +'<td class=n>'+(s.turns||0)+'</td><td class=n>'+fmtTok(s.tok||0)+'</td></tr>';});
-if(lim<ss.length){var rest=ss.slice(lim),ru=0,rt=0,rn=0;rest.forEach(function(s){ru+=s.usd||0;rt+=s.tok||0;rn+=s.turns||0;});
-h+='<tr class=rsp-fold><td><i class=rsp-sw style="background:'+SP_OTHER+'"></i></td><td class=rsp-name><span class=rsp-muted>'+rest.length+' more session'+(rest.length===1?'':'s')
-+'</span> <button class=rsp-btn data-act=table:all>show all</button></td><td class=n>'+fmtUsd(ru)+'</td>'+(keyCol?'<td class=n></td>':'')+'<td class=n>'+rn+'</td><td class=n>'+fmtTok(rt)+'</td></tr>';}
 // spend recorded before per-session attribution existed (T100, 2026-08-24), or the part of a bucket no
-// session accounts for: shown as its own row, never dropped or folded into a session (fail loudly)
-if(un&&(un.usd>0||un.tok>0))h+='<tr class=rsp-dead><td><i class="rsp-sw rsp-hatch"></i></td>'
-+'<td class=rsp-name>unattributed<span class=ru-tip-reset> \u00b7 recorded before per-session tracking</span></td>'
+// session accounts for: shown as its own row, never dropped or folded into a session (fail loudly);
+// its hatch mark is the chart's hatched stack, not a session swatch
+if(un&&(un.usd>0||un.tok>0))h+='<tr class=rsp-dead>'
++'<td class=rsp-name><i class="rsp-sw rsp-hatch"></i> unattributed<span class=ru-tip-reset> \u00b7 recorded before per-session tracking</span></td>'
 +'<td class=n>'+fmtUsd(un.usd)+'</td>'+(keyCol?'<td class=n>\u2014</td>':'')+'<td class=n>'+(un.turns||0)+'</td><td class=n>'+fmtTok(un.tok||0)+'</td></tr>';
 return h+'</tbody></table>';}
 // 1. the SAME window numbers the hover shows — the sums across every machine, rows only (one renderer).
@@ -40989,7 +41001,17 @@ if(!d){h+='<div class=rsp-err>Couldn\u2019t load the spend detail'+(SP.err?': '+
 +'<button class=rsp-btn data-act=retry>Try again</button></div>';spPanel.innerHTML=h;return;}
 var computed=d.scope==='computed';
 h+='<div class=rsp-sec id=rsp-totals>'+totalsHTML(d)+'</div>';
-// 2. per session — EVERY attached kernel's sessions (T247c), each machine's own story merged here;
+// 2. the histogram FIRST (T247e, the user 2026-09-08): the two ranges the ledger itself holds; dollars
+// by default, tokens on a toggle; the session list below is its legend
+h+='<div class=rsp-sec><div class=ru-tip-name><span>Spend over time</span></div>'
++'<div class=rsp-ctl>'
++'<button class="rsp-btn'+(SP.range==='hours'?' on':'')+'" data-act=range:hours>8 days \u00b7 by hour</button>'
++'<button class="rsp-btn'+(SP.range==='days'?' on':'')+'" data-act=range:days>90 days \u00b7 by day</button>'
++'<span class=rsp-gap></span>'
++'<button class="rsp-btn'+(SP.measure==='usd'?' on':'')+'" data-act=measure:usd>dollars</button>'
++'<button class="rsp-btn'+(SP.measure==='tok'?' on':'')+'" data-act=measure:tok>tokens</button>'
++'</div><div id=rsp-chart></div></div>';
+// 3. per session — EVERY attached kernel's sessions (T247c), each machine's own story merged here;
 // the billing rule is named when every contributing machine shares one, else each keeps its own
 var ok=spHosts(d),many=ok.length>1;
 var scopes={};ok.forEach(function(x){scopes[x.scope||d.scope]=1;});var sk=Object.keys(scopes);
@@ -41000,20 +41022,11 @@ h+='<div class=rsp-sec><div class=ru-tip-name><span>By session'+(many?' \u00b7 '
 ((d.hosts)||[]).forEach(function(x){if(x.status==='ok')return;
 h+='<div class=rsp-note>'+esc(x.host)+': '+(x.status==='older'?'older build, no per-session data':'not reachable')+(x.detail?' \u2014 '+esc(x.detail):'')+'</div>';});
 h+='<div id=rsp-table>'+sessionTable(d)+'</div></div>';
-// 3. the histogram — the two ranges the ledger itself holds; dollars by default, tokens on a toggle
-h+='<div class=rsp-sec><div class=ru-tip-name><span>Spend over time</span></div>'
-+'<div class=rsp-ctl>'
-+'<button class="rsp-btn'+(SP.range==='hours'?' on':'')+'" data-act=range:hours>8 days \u00b7 by hour</button>'
-+'<button class="rsp-btn'+(SP.range==='days'?' on':'')+'" data-act=range:days>90 days \u00b7 by day</button>'
-+'<span class=rsp-gap></span>'
-+'<button class="rsp-btn'+(SP.measure==='usd'?' on':'')+'" data-act=measure:usd>dollars</button>'
-+'<button class="rsp-btn'+(SP.measure==='tok'?' on':'')+'" data-act=measure:tok>tokens</button>'
-+'</div><div id=rsp-chart></div></div>';
 spPanel.innerHTML=h;renderChart();}
 // 1-2-5 ceilings: the y-axis top is the nearest clean number above the tallest bucket
 function niceTop(mx){if(!(mx>0))return 1;var p=Math.pow(10,Math.floor(Math.log(mx)/Math.LN10)),f=mx/p;return (f<=1?1:f<=2?2:f<=5?5:10)*p;}
 function spFill(s){return s.kind==='unattributed'?'url(#rsp-hatch)':s.kind==='other'?SP_OTHER:spColor(s);}
-function spStackName(s){return s.kind==='other'?('other ('+(s.count||0)+' session'+(s.count===1?'':'s')+')'):s.kind==='unattributed'?'unattributed':spName(s);}
+function spStackName(s){return s.kind==='other'?('other ('+(s.count||0)+' session'+(s.count===1?'':'s')+(s.host?' on '+s.host:'')+')'):s.kind==='unattributed'?'unattributed':spName(s);}
 // the plain-text form for the tooltip: host · name when more than one machine contributes; the
 // unattributed stack names each machine's share of the hovered bucket
 function spStackText(s,many,meas,i){if(s.kind==='sid')return (many&&s.host?s.host+' \u00b7 ':'')+spName(s);
@@ -41075,14 +41088,13 @@ if(SP.range==='hours'){m=/^(\\d{4})-(\\d\\d)-(\\d\\d)T00$/.exec(k);if(m){var dd=
 xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+['S','M','T','W','T','F','S'][dd.getDay()]+'</span>';}}
 else{m=/^(\\d{4})-(\\d\\d)-(01|15)$/.exec(k);if(m)xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+Number(m[2])+'/'+Number(m[3])+'</span>';}}
 var many=spMany(d);
-var leg='<div class=rsp-leg>'+stacks.map(function(s){return '<span class="rsp-chip'+((s.kind==='sid'&&!s.live)||s.kind==='unattributed'?' rsp-dead':'')+'"><i class="rsp-sw'+(s.kind==='unattributed'?' rsp-hatch':'')+'"'
-+(s.kind==='unattributed'?'':' style="background:'+(s.kind==='other'?SP_OTHER:spColor(s))+'"')+'></i>'+(s.kind==='sid'?spLabel(s,many):esc(spStackName(s)))+'</span>';}).join('')+'</div>';
+// no legend (T247e): the session list under the chart is the legend, each row in its stack's color
 var tzNote='';var mine=-(new Date().getTimezoneOffset());
 if(typeof d.tzOffsetMin==='number'&&d.tzOffsetMin!==mine)tzNote+='<div class=rsp-note>Bucket times are '+esc(d.tz||'the kernel\u2019s clock')+' (the machine that recorded them), not your local time.</div>';
 // machines in different zones (T247c): the rule is stated, not left to be guessed
 var offs={};spHosts(d).forEach(function(x){offs[String(x.tzOffsetMin)]=1;});
 if(Object.keys(offs).length>1)tzNote+='<div class=rsp-note>Hourly buckets are aligned by clock time across machines; daily buckets follow each machine\u2019s own calendar day.</div>';
-box.innerHTML=svg+ylab+'<div class=ru-tip-gx>'+xlab+'</div>'+leg+tzNote;
+box.innerHTML=svg+ylab+'<div class=ru-tip-gx>'+xlab+'</div>'+tzNote;
 // the per-segment hover: session · value · bucket, the mark itself the hit target
 var svgEl=box.querySelector('svg');if(!svgEl)return;
 svgEl.onpointermove=function(e){var t=e.target;if(!t||!t.classList||!t.classList.contains('rsp-seg')){spTipHide();return;}
@@ -42892,7 +42904,20 @@ def _landing():
             ".rsp-note{opacity:.6;font-size:10px;margin:4px 0 6px}"
             ".rsp-err{color:#f2b8b5;margin:10px 0}"
             ".rsp-load{display:flex;justify-content:center;padding:40px 0}"
-            ".rsp-tbl{width:100%;border-collapse:collapse;margin-top:4px}"
+            # the session list is a SCROLL PANE under a sticky header (T247e): every session, the modal a
+            # centered card that keeps its size; the pane scrolls inside it
+            "#rsp-table{max-height:38vh;overflow-y:auto;margin-top:4px}"
+            ".rsp-tbl{width:100%;border-collapse:collapse}"
+            ".rsp-tbl thead th{position:sticky;top:0;background:#252526;z-index:1}"
+            # a row's title is its TAB TITLE, under the strip's own class names. The landing page loads no
+            # stylesheet (the panes do), so the two declarations are INLINED here as the strip's twin —
+            # `.tab.colored .tab-label` and `.host-prefix` from ui/webview/styles.css, byte for byte in
+            # their declarations — and tests/test_spend_detail.py pins the twin against the source, so the
+            # two cannot drift (the timeline's MENU_STYLE twin is the precedent). --dim is the strip's
+            # variable; a fallback carries the dark value where the landing defines none.
+            ".rsp-name .tab-label{font-size:inherit;line-height:inherit}"
+            ".rsp-name .tab-label.colored{color:var(--chip-bg);font-weight:600}"
+            ".rsp-name .host-prefix{color:var(--dim,#9aa0a6);font-weight:400;font-style:italic;font-size:0.86em}"
             ".rsp-tbl th{text-align:left;font-weight:400;opacity:.55;padding:2px 6px 4px 0;border-bottom:1px solid rgba(255,255,255,0.08)}"
             ".rsp-tbl td{padding:3px 6px 3px 0;border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap}"
             ".rsp-tbl .n{text-align:right;font-variant-numeric:tabular-nums}"
@@ -42901,8 +42926,7 @@ def _landing():
             # cells carry the dimming, the annotation inside stays at the row's level (it used to compound
             # .55 × .6 to a 2.3:1 read), and a legend chip dims on its own; the fold row is a CONTROL row —
             # its count is muted, its "show all" is never dimmed (it read as disabled)
-            ".rsp-dead td{opacity:.55}.rsp-dead .ru-tip-reset{opacity:1}.rsp-chip.rsp-dead{opacity:.55}"
-            ".rsp-fold .rsp-muted{opacity:.55}"
+            ".rsp-dead td{opacity:.55}.rsp-dead .ru-tip-reset{opacity:1}"
             ".rsp-sw{display:inline-block;width:10px;height:10px;border-radius:3px;vertical-align:-1px;background:#6b7a8c}"
             # unattributed spend wears a TEXTURE, not a hue: it is not a session, and texture is the
             # dataviz fallback for a class that must never be confused with one
@@ -42914,7 +42938,6 @@ def _landing():
             "#rsp-chart{position:relative}.rsp-svg{display:block;width:100%;background:rgba(255,255,255,0.04);border-radius:3px}"
             ".rsp-grid{stroke:rgba(255,255,255,0.10);stroke-width:1}"
             ".rsp-seg{cursor:pointer}.rsp-seg:hover{filter:brightness(1.18)}"
-            ".rsp-leg{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:6px}.rsp-chip{display:inline-flex;align-items:center;gap:5px}"
             "#rsp-tip{position:fixed;z-index:310;pointer-events:none;display:none;background:#1e1e1e;border:1px solid #3a3a3a;"
             "border-radius:6px;padding:5px 8px;color:#cfd6dd;font:500 11px 'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;"
             "box-shadow:0 5px 18px rgba(0,0,0,0.45)}#rsp-tip b{color:#e8eef5;font-weight:700}"
@@ -43216,6 +43239,8 @@ def _landing():
             "body.theme-light .rsp-top{color:#1F1E1D;border-bottom-color:rgba(0,0,0,0.10)}"
             "body.theme-light .rsp-x{color:#5D574E}body.theme-light .rsp-x:hover{color:#1F1E1D}"
             "body.theme-light .rsp-tbl th{border-bottom-color:rgba(0,0,0,0.10)}body.theme-light .rsp-tbl td{border-bottom-color:rgba(0,0,0,0.06)}"
+            "body.theme-light .rsp-tbl thead th{background:#FFFFFF}"
+            "body.theme-light .rsp-name .host-prefix{color:var(--dim,#5D574E)}"
             "body.theme-light .rsp-btn{border-color:rgba(0,0,0,0.18);color:#1F1E1D}"
             # the PRESSED toggle's light step, written out (T247b review): `.rsp-btn.on` (0,2,0) lost to
             # `body.theme-light .rsp-btn` (0,2,1 — two classes and the body type) and painted dark text

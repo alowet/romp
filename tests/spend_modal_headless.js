@@ -27,8 +27,11 @@ const { chromium } = require('playwright');
   await pg.waitForSelector('#rsp-chart .rsp-svg', { timeout: 15000 });
   const out = await pg.evaluate(() => ({
     head: document.querySelector('#rsp-panel .rsp-top span').textContent,
-    legend: Array.from(document.querySelectorAll('#rsp-chart .rsp-chip')).map((e) => e.textContent),
-    chipOpacity: Array.from(document.querySelectorAll('#rsp-chart .rsp-chip')).map((e) => e.textContent + ':' + getComputedStyle(e).opacity),
+    legendNodes: document.querySelectorAll('#rsp-chart .rsp-leg, #rsp-chart .rsp-chip').length,
+    chartFirst: (() => { const secs = Array.from(document.querySelectorAll('#rsp-panel .rsp-sec')); const ci = secs.findIndex((s) => s.querySelector('#rsp-chart')); const ti = secs.findIndex((s) => s.querySelector('#rsp-table')); return ci >= 0 && ti > ci; })(),
+    swatches: document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr .rsp-sw:not(.rsp-hatch)').length,
+    title: (() => { const t = document.querySelector('#rsp-panel .rsp-tbl tbody tr .tab-label'); const cs = t ? getComputedStyle(t) : null; const hp = t ? t.querySelector('.host-prefix') : null; return { color: cs ? cs.color : null, weight: cs ? cs.fontWeight : null, prefix: hp ? hp.textContent : null }; })(),
+    pane: (() => { const p = document.getElementById('rsp-table'); const th = document.querySelector('#rsp-panel .rsp-tbl thead th'); return { scrolls: !!p && p.scrollHeight > p.clientHeight + 4, sticky: th ? getComputedStyle(th).position : null, h: p ? p.clientHeight : null }; })(),
     rows: Array.from(document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr')).map((tr) => tr.textContent),
     deadRows: document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr.rsp-dead').length,
     segs: document.querySelectorAll('#rsp-chart .rsp-seg').length,
@@ -41,16 +44,11 @@ const { chromium } = require('playwright');
     railOpacity: getComputedStyle(document.getElementById('rail-usage')).opacity,
   }));
   if (shots) { await pg.screenshot({ path: shots + '-dark.png' }); const ch = await pg.$('#rsp-chart'); if (ch) await ch.screenshot({ path: shots + '-chart.png' }); }
-  const foldBefore = await pg.evaluate(() => document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr').length);
-  const foldBtn = await pg.$('#rsp-panel [data-act="table:all"]');
-  if (foldBtn) { await foldBtn.click(); await pg.waitForFunction((n) => document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr').length > n, foldBefore, { timeout: 5000 }); }
-  const foldAfter = await pg.evaluate(() => document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr').length);
   await pg.click('#rsp-panel [data-act="measure:tok"]');
   await pg.click('#rsp-panel [data-act="range:days"]');
   await pg.waitForFunction(() => document.querySelector('#rsp-panel [data-act="range:days"]').classList.contains('on')
     && document.querySelector('#rsp-panel [data-act="measure:tok"]').classList.contains('on'), null, { timeout: 5000 });
   const days = await pg.evaluate(() => ({
-    legend: Array.from(document.querySelectorAll('#rsp-chart .rsp-chip')).map((e) => e.textContent),
     segs: document.querySelectorAll('#rsp-chart .rsp-seg').length,
     ylabels: Array.from(document.querySelectorAll('#rsp-chart .ru-tip-gy')).map((e) => e.textContent),
     xlabels: Array.from(document.querySelectorAll('#rsp-chart .ru-tip-gx span')).map((e) => e.textContent),
@@ -104,9 +102,7 @@ const { chromium } = require('playwright');
   const dim = await pg.evaluate(() => {
     const dead = document.querySelector('#rsp-panel tr.rsp-dead td.rsp-name');
     const ann = dead && dead.querySelector('.ru-tip-reset');
-    const btn = document.querySelector('#rsp-panel [data-act="table:all"]');
-    return { row: dead ? getComputedStyle(dead).opacity : null, ann: ann ? getComputedStyle(ann).opacity : null,
-             btnRowDead: btn ? btn.closest('tr').classList.contains('rsp-dead') : null, btnOpacity: btn ? getComputedStyle(btn).opacity : null };
+    return { row: dead ? getComputedStyle(dead).opacity : null, ann: ann ? getComputedStyle(ann).opacity : null };
   });
   // the loader's backstop: a fetch that never answers ends on the error + retry path (T247b)
   const timeout = await pg.evaluate(async () => {
@@ -147,6 +143,6 @@ const { chromium } = require('playwright');
   if (shots) await pg.screenshot({ path: shots + '-phone.png' });
   const panelHint = await pg.evaluate(() => document.getElementById('ru-tip').textContent.includes('Click for the full breakdown'));
   const mobile = { railHidden, panelOpened: true, modalOpened: true, btn, panelHint };
-  console.log(JSON.stringify({ hoverHint, hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, hiddenAfterDrag, lightErr, lightBtn, dim, timeout, mobile, foldBefore, foldAfter, errs }));
+  console.log(JSON.stringify({ hoverHint, hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, hiddenAfterDrag, lightErr, lightBtn, dim, timeout, mobile, errs }));
   await b.close();
 })().catch((e) => { console.error(e); process.exit(1); });
