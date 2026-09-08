@@ -64,6 +64,10 @@ class SpendModalServed(unittest.TestCase):
         (state / "usage.json").write_text(json.dumps({"apiKey": True}))
         write_ledger(state, extra_sids=20)     # enough sessions to scroll the pane (T247e)
         (state / "session-order.json").write_text(json.dumps([API, WEB]))   # the tab strip's order: api before web (T247f)
+        # T247g: two tags — "team" (web + api) and "ops" (api + the peer's worker): api is under both
+        (state / "timeline-views.json").write_text(json.dumps({"active": "all", "tags": [
+            {"id": "g1", "name": "team", "color": "#C2410C", "members": [WEB, API]},
+            {"id": "g2", "name": "ops", "color": "#0F766E", "members": [API, "PEERHOST:22222222-3333-4444-5555-000000000001"]}]}))
         # T247c: a two-host world — a peer kernel whose sessions merge in, and an older peer reported by name
         self._saved_remotes = dict(km._remotes)
         km._remotes.clear()
@@ -179,6 +183,20 @@ class SpendModalServed(unittest.TestCase):
         self.assertEqual(yo["prefs"].get("order"), "yours")
         self.assertTrue(yo["pressed"])
         self.assertTrue(o["mobile"]["persisted"]["pressed"], "the persisted choice is read back on a reload (review find: only the write was pinned)")
+        # T247g: merge by tag — one row per tag (summed, tag color), untagged sessions as themselves, a session
+        # under two tags counted in each with the footer saying so; the stacks follow; "1 day" is 24 hourly buckets
+        mg = o["merge"]
+        self.assertTrue(mg["rows"][0].startswith("team · 2 sessions"), mg["rows"][:3])
+        self.assertTrue(mg["rows"][1].startswith("ops · 2 sessions"), mg["rows"][:3])
+        self.assertFalse(any(r.startswith("TESTHOST:web") or r.startswith("TESTHOST:api") or r.startswith("PEERHOST:worker") for r in mg["rows"]), "tagged sessions merge away")
+        self.assertIn("$1200", mg["rows"][0].replace(",", ""), "team = web 960 + api 240")
+        self.assertIn("$540", mg["rows"][1].replace(",", ""), "ops = api 240 + worker 300")
+        self.assertEqual(mg["tagColor"], "rgb(194, 65, 12)", "the tag row wears the tag store's color")
+        self.assertTrue(any("1 session carries several tags" in n for n in mg["notes"]), mg["notes"])
+        self.assertIn("team", mg["stackNames"]); self.assertIn("ops", mg["stackNames"])
+        self.assertLessEqual(mg["dayBuckets"], 24, "1 day · by hour = the last 24 hourly buckets")
+        self.assertTrue(any(":00" in x for x in mg["dayLabels"]), mg["dayLabels"])
+        self.assertEqual(mg["prefs"].get("merge"), True)
         self.assertTrue(o["mobile"]["persisted"]["first"].strip().startswith("TESTHOST:api"), o["mobile"]["persisted"])
         self.assertTrue(any("tests" in r and "not running" in r for r in rows), "a dead session keeps its name, dimmed")
         self.assertTrue(any(r.strip().startswith("unattributed") for r in rows), "pre-attribution spend is a row of its own (its hatch mark leads)")

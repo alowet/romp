@@ -282,7 +282,10 @@ class DriftWiring(unittest.TestCase):
             audit.unlink()
 
     def test_a_parked_quiet_deploy_for_the_checkouts_sha_stands_the_converge_down(self):
-        # T240d: a peer's p2p apply advanced the checkout and parked a QUIET restart at the manager;
+        # T240d: a peer's p2p apply advanced the checkout and parked a QUIET restart at the manager
+        # (the apply asked for the quiet window then; since T269 it asks for an immediate bounce and
+        # writes no quiet row, so this shape now comes from older peers, a quiet converge and
+        # `romp refresh --quiet` — the stand-down reads the row, not the writer);
         # the drift check then saw the checkout ahead of the kernel and posted an IMMEDIATE
         # restart-all — 16:23Z quiet park, 16:27Z converge/now, ten sessions cut — so the quiet
         # window the peer asked for never ran. The restart is already on its way: stand down, once,
@@ -343,7 +346,8 @@ class DriftWiring(unittest.TestCase):
                                          "reason": "from TESTHOST to 99999999", "when": "quiet"}) + "\n")
             check()
             self.assertEqual(ran, ["restart"], "a quiet deploy of other code is not this converge")
-            # an IMMEDIATE p2p row (the no-owning-manager fallback): nothing is parked — proceeds
+            # an IMMEDIATE p2p row (a peer's apply since T269, or the no-owning-manager fallback):
+            # nothing is parked — proceeds; the bounce it asked for lands within the manager's ack
             ran.clear()
             audit.write_text(json.dumps({"t": int(now - 240), "action": "p2p-update",
                                          "reason": "from TESTHOST to f3dc387a (immediate: no owning manager)"}) + "\n")
@@ -431,9 +435,10 @@ class DriftWiring(unittest.TestCase):
                 km.RESTART_CUTS_FILE.unlink()
 
     def test_the_quiet_deploy_rows_carry_what_the_stand_down_reads(self):
-        # T240d pins on the writers: the p2p apply's quiet audit row lands right after the reset that
-        # advances the checkout — BEFORE the owner check, whose manager status call is the window a
-        # drift pass could hit between "checkout ahead" and "row on disk" — and the local converge's
+        # T240d pins on the writers: the p2p apply's audit row (quiet then, immediate since T269) lands
+        # right after the reset that advances the checkout — BEFORE the owner check, whose manager
+        # status call is the window a drift pass could hit between "checkout ahead" and "row on disk",
+        # so a cut in that window still finds its request on disk — and the local converge's
         # row carries the sha it deploys, so a quiet `romp refresh` is matched, not guessed at
         ksrc = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
         reset = ksrc.index('reset --hard "$WANT" >/dev/null 2>&1 || {')
@@ -793,15 +798,20 @@ class ConvergePullStep(unittest.TestCase):
 
     def test_the_happy_path_moves_onto_the_advertised_commit_and_restarts(self):
         steps = self._drive()
-        self.assertEqual(steps[:4], ["status", "fetch", "merge-base", "checkout"], steps)
-        self.assertEqual(set(steps[4:]), {"rev-parse"}, "after the move, only the checkout re-reads")
+        # two ancestry checks since 2026-09-08: HEAD against the target (the refusal gate) and the local
+        # main branch against it (moved and checked out when it is an ancestor; see the checkout step)
+        self.assertEqual(steps[:5], ["status", "fetch", "merge-base", "merge-base", "checkout"], steps)
+        self.assertEqual(set(steps[5:]), {"rev-parse"}, "after the move, only the checkout re-reads")
         fetch = next(a for s, a in self.calls if s == "fetch")
         self.assertEqual(fetch[-3:], ["fetch", "origin", "main"],
                          "main from the release remote (the scripted `git remote` lists none: a plain install's origin)")
         anc = next(a for s, a in self.calls if s == "merge-base")
         self.assertEqual(anc[-3:], ["--is-ancestor", "HEAD", self.TARGET], "a fast-forward from HEAD, proven")
         co = next(a for s, a in self.calls if s == "checkout")
-        self.assertEqual(co[-2:], ["--detach", self.TARGET], "the move lands on the sha the verdict named")
+        # the scripted git answers every ancestry check yes, so local main is an ancestor here: it is moved
+        # onto the sha the verdict named and checked out (2026-09-08); the diverged case detaches instead
+        # (tests/test_converge_main_branch.py, over real repositories)
+        self.assertEqual(co[-3:], ["-B", "main", self.TARGET], "the move lands on the sha the verdict named, on main")
         self.assertFalse(any(a.endswith("/main") for a in co), "never the ref: it can move, or sit stale")
         self.assertEqual(self.posts, [("POST", "/restart-all")])
         self.assertEqual(self.dials, [("127.0.0.1", 1)])

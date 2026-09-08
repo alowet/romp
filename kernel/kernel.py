@@ -11,6 +11,7 @@ zero protocol change at switchover. WS is hand-rolled on the stdlib socket (no d
 
 Run:  bin/romp-kernel   → opens http://127.0.0.1:29855
 """
+import copy
 import math
 import contextlib, json, os, queue, random, re, signal, socket, sys, time, threading, traceback, base64, bisect, errno, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid, tempfile, stat, gzip, collections, functools, fcntl
 from pathlib import Path
@@ -242,7 +243,7 @@ class _PerfStats:
     HTTP_PATHS = 256
     SLOTS = 32
     STAGES = ("jobs", "push", "push.chat", "push.feed", "push.timeline", "push.send")
-    BUILDS = ("chat", "feed", "timeline", "feedJson")
+    BUILDS = ("chat", "feed", "timeline", "feedJson", "thread")
     SEND_KINDS = ("full", "delta", "deduped")
 
     def __init__(self):
@@ -2677,7 +2678,11 @@ def _debt_reminder_outcomes(sid, lt, now):
     debtor's ENDED past the reminder's fire escalates to the asker's card and retires — the debtor had
     its chance and moved on without replying (the reminder's own response turn included: both honest
     exits it offered were postal replies, so a reply-less end IS the failure). A debtor that never turns
-    again is the backstop's case (_debt_backstop_tick)."""
+    again is the backstop's case (_debt_backstop_tick). An ask returned or withdrawn (a terminal bounced or
+    maildir-recall row) retires the record too and never escalates (2026-09-08: the debtor exited before the reminder's turn read the ask; ORPHAN_GRACE
+    later the orphan sweep destroyed the mail and wrote the terminal bounced row; the asker got the bus
+    note; 6h on, the backstop flipped its card to blocked for an ask that had already come back) — the
+    debtor never had it, the return is the outcome, and the asker was told (_ask_returned)."""
     dn0 = _auto_nudge_data().get("debtNudged") or {}
     if not dn0:
         return
@@ -2691,6 +2696,9 @@ def _debt_reminder_outcomes(sid, lt, now):
         asker, _debtor, ts = parsed
         if last_any.get((sid, asker), 0) >= ts:        # answered → the reminder worked
             drop.append(key)
+            continue
+        if _ask_returned(asker, sid, ts):              # the ask came back: the debtor never had it, the
+            drop.append(key)                           # return is the outcome, the bus told the asker
             continue
         if isinstance(fire_t, (int, float)) and lt_end > fire_t:
             _debt_escalate(asker, sid, ts, now)        # moved on without replying → the user's turn
@@ -2722,6 +2730,9 @@ def _debt_backstop_tick(now):
             continue
         asker, debtor, ts = parsed
         if last_any.get((debtor, asker), 0) >= ts:
+            drop.append(key)
+            continue
+        if _ask_returned(asker, debtor, ts):           # came back → retired, never escalated (see above)
             drop.append(key)
             continue
         if isinstance(fire_t, (int, float)) and now - fire_t > NUDGE_DEFER_BACKSTOP_SECS:
@@ -4670,6 +4681,9 @@ def _forward_tag_edit(host, body):
 # tag EDITED there after the ruling (the v2 mtime stamp) — is new information and survives, loudly.
 _PENDING_TAG_LOCK = threading.Lock()
 _PENDING_TAG_CACHE = {"rows": None}          # None = not loaded; kept in sync under the lock
+_pending_tag_faults = {}   # _pending_tag_row_key -> faulting passes so far, for each row whose host answered a retryable
+                           # store fault: the stderr line AND the dial record are written once per row per episode, and the
+                           # count rides the record that ends the episode (the apply prunes the map to the live rows)
 
 
 def _pending_tag_path():
@@ -4819,8 +4833,32 @@ def _apply_pending_tag_edits(r):
                         outcome="transport failed — retrying next pass")
             continue
         ok = bool(ans.get("ok"))
+        if not ok and ans.get("retryable"):
+            # The host ANSWERED, but did not rule: `retryable` on an ok:false body is the kernel's shape
+            # for a store fault (the /tag route's tag store unreadable or unwritable at that moment; the
+            # PR-watch route's save fault wears the same key) -- the disk's answer, not the host's. A
+            # refusal WITHOUT it is the host's own words (no such tag, a name already taken) and stays
+            # terminal below. Until this arm (review find, 2026-09-08) the fault retired the row as a
+            # refusal, and a pending delete or rename was lost to a transient disk fault on the host --
+            # the very case the journal exists to survive. Kept for the next pass, like a transport
+            # failure. Said ONCE per row per episode -- the stderr line and the dial record alike (a
+            # host whose disk stays bad would otherwise write a record every 15 s pass and rotate every
+            # host's dial history away within days); the passes are counted, and the count rides the
+            # record that ends the episode below.
+            fault = ans.get("error") or "?"
+            key = _pending_tag_row_key(row)
+            _pending_tag_faults[key] = _pending_tag_faults.get(key, 0) + 1
+            if _pending_tag_faults[key] == 1:
+                _tunnel_log(host, "pending-tag-edit", name=row.get("name"), op=_row_op(row),
+                            outcome="the host's tag store faulted: %s — kept; retried every pass, recorded once" % fault)
+                sys.stderr.write('pending-tag-edits: the %s of "%s" on %s stays queued \u2014 the host answered but '
+                                 'could not use its tag store just now (%s); retrying next pass\n'
+                                 % (_row_op(row), row.get("name"), host, fault))
+            continue
+        faults = _pending_tag_faults.pop(_pending_tag_row_key(row), 0)     # the episode ends with the host's answer
         _tunnel_log(host, "pending-tag-edit", name=row.get("name"), op=_row_op(row),
-                    outcome=("applied" if ok else "refused by the host: %s" % (ans.get("error") or "?")))
+                    outcome=("applied" if ok else "refused by the host: %s" % (ans.get("error") or "?"))
+                    + (" after %d faulting pass%s" % (faults, "" if faults == 1 else "es") if faults else ""))
         retired.append(row)                      # a refusal is the host's own answer — terminal
         applied += 1 if ok else 0
     if retired:
@@ -4828,7 +4866,19 @@ def _apply_pending_tag_edits(r):
         _save_pending_tag_rows(keep)
         r.pop("_views_at", None)                 # re-read the post-apply truth next pass
         _mark_views_dirty()
+    # a fault episode ends with its row: landed or retired here, or superseded by a later ruling
+    # (_queue_pending_tag_edit coalesces) -- a row queued afresh for the same tag is said afresh
+    live = {_pending_tag_row_key(x) for x in _pending_tag_rows()}
+    for k in [k for k in _pending_tag_faults if k not in live]:
+        del _pending_tag_faults[k]
     return applied
+
+
+def _pending_tag_row_key(row):
+    """One journaled row's identity for the once-per-episode fault line: host, name basis, op and the
+    ruling's moment (a re-ruling after a supersede is a new row, and a new episode; a same-op re-rule
+    within the same wall-clock second shares the key -- degenerate, and it only folds two lines into one)."""
+    return (row.get("host") or "", _tag_name_basis(row.get("name")), _row_op(row), row.get("ruledAt"))
 
 
 def _row_op(row):
@@ -7335,7 +7385,10 @@ def _parked_quiet_deploy(checkout, now=None):
     function's own. The p2p row's sha rides its reason ("from <host> to <sha>"); the converge row
     carries `sha` outright, and so does the CLI's `romp refresh --quiet` row, which names no action
     (bin/romp's caller-attribution row, review find: that door parked a quiet restart the check
-    pre-empted just the same); a quiet row naming no sha matches nothing (never guess)."""
+    pre-empted just the same); a quiet row naming no sha matches nothing (never guess). Since T269 a
+    peer's apply asks for an IMMEDIATE bounce and writes no when=quiet, so it parks nothing here (its
+    restart lands within the manager's ack, inside one drift cadence); the quiet rows this reads come
+    from peers still on older code, a quiet converge and `romp refresh --quiet`."""
     rec = _recent_restart_audit(now=now)
     if not isinstance(rec, dict) or rec.get("when") != "quiet" or not checkout:
         return 0
@@ -7396,7 +7449,10 @@ def _main_drift_check():
         # restart from a peer resets it the same way (T240). Module memory still covers the seconds
         # before the ledger row exists.
         #
-        # A QUIET deploy already parked for the code on disk STANDS THIS CHECK DOWN (T240d): a peer's
+        # A QUIET deploy already parked for the code on disk STANDS THIS CHECK DOWN (T240d, when the
+        # p2p apply still asked for the quiet window; since T269 it asks for an immediate bounce and
+        # writes no quiet row, so a new peer's apply never parks — the park below now comes from older
+        # peers, a quiet converge, or `romp refresh --quiet`). The 2026-09 shape: a peer's
         # p2p apply advanced the checkout and asked the manager for a quiet restart, then this check
         # saw the checkout ahead of the kernel and posted an IMMEDIATE restart-all — 16:23Z quiet
         # park, 16:27Z converge/now, ten sessions cut, the quiet window the peer asked for never ran
@@ -7505,11 +7561,29 @@ def _run_main_update(kind, immediate=True, manager_port=_PORT_FROM_ENV, target="
                 refuse("the checkout was left alone: the fetch did not bring %s, so it could not be "
                        "verified; the next check re-reads main" % target, anc)
                 return
-            r = subprocess.run(["git", "checkout", "--detach", target], cwd=str(ROOT),
-                               capture_output=True, text=True, timeout=30)
+            # The local `main` BRANCH moves too (the user 2026-09-08): the converge used to check the
+            # target out DETACHED and never touch `main`, so a later `git checkout main` landed on a
+            # months-old pointer and the user pulled "an enormous amount". When main is an ANCESTOR of the
+            # target (it has nothing the target lacks) it is moved onto the target and checked out — a
+            # fast-forward by construction, so nothing of the user's is rewritten. When main has commits
+            # the target does not (diverged), it is the user's to move: the target is checked out
+            # detached as before and the notice says main was left where it is. No main at all (a
+            # bootstrap install detached at a release tag): detached, as before.
+            mb = subprocess.run(["git", "merge-base", "--is-ancestor", "main", target], cwd=str(ROOT),
+                                capture_output=True, text=True, timeout=10)
+            if mb.returncode == 0:
+                r = subprocess.run(["git", "checkout", "-B", "main", target], cwd=str(ROOT),
+                                   capture_output=True, text=True, timeout=30)
+            else:
+                r = subprocess.run(["git", "checkout", "--detach", target], cwd=str(ROOT),
+                                   capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 refuse("the checkout did not advance onto %s" % target, r)
                 return
+            if mb.returncode == 1:
+                _sync_notice("main moved at %s: the checkout is at %s, detached. Your local main branch has "
+                             "commits that are not on %s/main, so it was left where it is; merge or rebase it "
+                             "yourself when you want it on the new main." % (remote, target, remote), ok=True)
         except Exception as e:
             refuse("the pull step failed: %s" % e)
             return
@@ -11295,18 +11369,42 @@ def _working_notes():
     """{sid: note} for every session with a NON-EMPTY published working-note, from the backend-agnostic store
     (working/<sid> files). The note is the set_working ownership claim the postal bus shows in list_agents;
     _session_rows attaches it per live sid. Empty/absent → omitted."""
-    out = {}
+    # Read once per directory VERSION (2026-09-08): GET /sessions is polled about once a second by the
+    # postal services of every live session, and each call re-read every note file; the key is every
+    # entry's (name, mtime_ns, size, ino), so a rewritten or removed note misses exactly.
+    entries = []
     try:
-        for f in WORKING_DIR.iterdir():
-            try:
-                note = f.read_text().strip()
-            except OSError:
-                continue
-            if note:
-                out[f.name] = note
+        with os.scandir(WORKING_DIR) as it:
+            for e in it:
+                try:
+                    st = e.stat()
+                except OSError:
+                    continue        # unlinked between readdir and stat (a clear, an atomic write's temp renamed
+                    #                 away): that note is gone and the others still stand. One try around the whole
+                    #                 listing returned {} here instead, so for that call every live session read as
+                    #                 owning nothing, which the postal contract takes as free ownership (review
+                    #                 2026-09-08). The idiom is _task_store_fp's.
+                entries.append((e.name, e.path, st.st_mtime_ns, st.st_size, st.st_ino))
     except OSError:
-        pass
-    return out
+        return {}
+    entries.sort()
+    key = tuple((n, m, s, i) for n, _p, m, s, i in entries)
+    hit = _working_notes_memo[0]
+    if hit is not None and hit[0] == key:
+        return dict(hit[1])
+    out = {}
+    for name, path, _m, _s, _i in entries:
+        try:
+            note = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if note:
+            out[name] = note
+    _working_notes_memo[0] = (key, out)
+    return dict(out)
+
+
+_working_notes_memo = [None]      # ((name, mtime_ns, size, ino) per entry, {sid: note})
 
 
 def _set_working_note(sid, text):
@@ -12374,6 +12472,33 @@ def _load_comments(sid):
         return {"threads": []}
 
 
+_comments_memo = {}      # sid -> ((mtime_ns, size, ino), dict) — the store decoded once per file version
+
+
+def _load_comments_cached(sid):
+    """_load_comments for the READ-ONLY per-push callers (_comments_frame, _comment_markers), decoded once
+    per file version: the store is published by _save_comments through _atomic_write (a rename), so its
+    (mtime_ns, size, ino) is an exact key. Every caller gets its own deep copy — the memo's dict is never
+    handed out, so no reader can leak a write into the next reader. A missing or unreadable store reads
+    as {"threads": []} exactly as _load_comments does, and drops any memo (the file is gone).
+    Writers (_comment_thread and the handlers under _comments_lock) keep reading fresh through
+    _load_comments. Idle cost before this: twelve stores re-read and re-decoded on every pusher cycle."""
+    p = _comments_path(sid)
+    try:
+        st = os.stat(p)
+        key = (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        _comments_memo.pop(sid, None)
+        return {"threads": []}
+    hit = _comments_memo.get(sid)
+    if hit is None or hit[0] != key:
+        if len(_comments_memo) > 512:
+            _comments_memo.clear()
+        hit = (key, _load_comments(sid))
+        _comments_memo[sid] = hit
+    return copy.deepcopy(hit[1])
+
+
 def _save_comments(sid, data):
     _atomic_write(_comments_path(sid), json.dumps(data))
 
@@ -12693,30 +12818,83 @@ def _thread_messages(tsid, cut_uuid, floor_t=0):
     return merged
 
 
+_built_thread = {}       # thread sid -> (key, cut_uuid, events, build_started_at): the popover's chat build,
+#                          served while the thread's exact change key stands (the active tab's own idiom)
+_thread_fold_keep = [set(), set()]   # [last cycle's thread sids, this cycle's]: _push's fold eviction keeps them
+
+
 def _thread_events(tsid, cut_uuid, now, tmux):
     """The thread rendered with the CHAT's own builder (the user 2026-08-17: the popover shows the
     same thing the chat shows), sliced to AFTER the branch point: build_session on the thread sid
     (reachable via _sdk_sess's reg fallback — no names/ entry), events after the cut record's, the
     head system card never included (it sits before the cut by construction). [] pre-fork, same
-    guard as the plain projection."""
+    guard as the plain projection.
+
+    SERVED, not rebuilt, while the thread's inputs stand (2026-09-08): this ran a full build_session
+    for every non-promoted thread on every pusher cycle — fifty-odd cold reshapes of forked
+    transcripts per cycle on an idle box, the single largest slice of the pusher's burn (py-spy: the
+    _comments_frame → _thread_events → build_session → _read_task_store chain). The key is the WATCHED
+    tab's own exact key, _active_chat_sig (transcript and states stats, judge generation, task store,
+    pending cut, the backend's live revision and queue, the snapshot row), falling back to the
+    file-stat _chat_build_sig when the exact one cannot be formed, and the serve yields to _views_dirty
+    like every other served build. A thread with no keyable input (no transcript yet) is built every
+    time, never cached."""
     reg = _thread_reg(tsid)
     if reg.get("forkOf"):
         return []
+    tmux = tmux if tmux is not None else {}
+    _thread_fold_keep[1].add(tsid)              # this cycle's thread: _push keeps its fold prefix
+    sess = _sdk_sess(tsid, now)
+    tm = tmux.get(tsid)
+    key = None
     try:
-        m = build_session(tsid, now, tmux if tmux is not None else {})
+        base = _chat_build_sig(sess, tm)
+        asig = _active_chat_sig(sess, tm, now, base=base) if base is not None else None
+        sig = ("exact", asig) if asig is not None else (("stat", base) if base is not None else None)
+        if sig is not None:
+            # plus the thread's OWN state rows (review 2026-09-08): the backend writes states/<tsid>.jsonl under
+            # the romp sid, while the key above stats states/<fsid>.jsonl for the reg's lastSid (_sdk_sess hands
+            # over no anchor). The two are one file only until a resume mints a new fsid or a /clear moves
+            # lastSid; after that a states-only write (an interrupt settle's idle row, a retry marker, an
+            # orphan-reply salvage) changed the thread's events with no key change. None when absent.
+            try:
+                ss = os.stat(jd.STATESDIR / (tsid + ".jsonl"))
+                states = (ss.st_mtime_ns, ss.st_size, ss.st_ino)
+            except OSError:
+                states = None
+            key = sig + (states,)
+    except Exception:
+        key = None                              # an input we cannot key → build, never cache
+    hit = _built_thread.get(tsid)
+    if key is not None and hit is not None and hit[0] == key and hit[1] == cut_uuid and _views_dirty[0] <= hit[3]:
+        _PERF_STATS.build("thread", True)
+        return list(hit[2])
+    started = time.time()
+    _t0 = time.monotonic()
+    try:
+        m = build_session(tsid, now, tmux)
     except Exception:
         return []
+    _PERF_STATS.build("thread", False, time.monotonic() - _t0)
     evs = (m or {}).get("events") or []
     if cut_uuid:
         at = next((i for i, e in enumerate(evs)
                    if e.get("uuid") == cut_uuid or e.get("resultUuid") == cut_uuid), None)
         if at is None:
-            return []                              # the cut isn't in this transcript — never the copy
-        evs = evs[at + 1:]
+            evs = []                                 # the cut isn't in this transcript: never the copy
+        else:
+            evs = evs[at + 1:]                       # sliced to AFTER the branch point (the extension's source pin)
     else:
         floor = int((_comment_thread_row_created(tsid) or 0))
         evs = [e for e in evs if not e.get("ts") or int(em.parse_z(e.get("ts")) or 0) >= floor]
-    return evs[-80:]
+    evs = evs[-80:]
+    # an EMPTY result for these inputs is as settled as a full one and is served the same way; only a
+    # build that RAISED (above) stays uncached, so a transient read fault retries on the next cycle
+    if key is not None:
+        if len(_built_thread) > 256:               # bounded by the thread count; evict oldest-inserted, never clear
+            _built_thread.pop(next(iter(_built_thread)))
+        _built_thread[tsid] = (key, cut_uuid, evs, started)
+    return list(evs)
 
 
 _comment_created_memo = {}                          # tsid -> createdT, for the tip-fork event floor
@@ -12912,7 +13090,7 @@ def _comments_frame(sid, tmux=None):
     be = _sdk()
     now = int(time.time())
     threads = []
-    for th in _load_comments(sid).get("threads") or []:
+    for th in _load_comments_cached(sid).get("threads") or []:
         tsid = str(th.get("sid") or "")
         status = th.get("status") or "open"
         _comment_created_memo[tsid] = int(th.get("createdT") or 0)
@@ -13070,7 +13248,7 @@ def _comment_markers(sid):
     if not p.exists():
         return []
     out = []
-    for th in _load_comments(sid).get("threads") or []:
+    for th in _load_comments_cached(sid).get("threads") or []:
         if (th.get("status") or "open") not in ("open", "resolved"):
             continue
         out.append({"t": th.get("anchorT") or th.get("createdT") or 0,
@@ -19747,28 +19925,27 @@ def _update_remote(host, head=None):
         'if [ ! -x "$R/bin/romp-serve" ]; then echo "NOLAUNCH:$NEW$K"; exit 0; fi; '
         # NEVER AN ANONYMOUS SIGTERM (T238, the T121 rule): a restart-audit row lands BEFORE whichever
         # restart happens, so the far kernel's cut row carries WHO and WHY (the p2p update, from this
-        # machine, to this sha) — nine restarts in three hours had no reason on record. The QUIET row
-        # lands HERE, right after the reset and before the owner check (T240d): the far kernel's drift
-        # check stands down for a quiet deploy of the code its checkout holds by reading this row, and
-        # the owner check's manager status call was a window in which the checkout was already ahead
-        # with no row on disk. When no owning manager answers, the fallback below writes its own
-        # IMMEDIATE row, which is then the newest and supersedes this one for every reader. The
-        # restart goes THROUGH THE FAR MANAGER'S QUIET WINDOW (restart-all --quiet: no in-flight turn is cut,
-        # the 15-minute backstop still lands the deploy, a second apply arriving while one is pending
-        # coalesces into the same bounce) — but ONLY when that manager actually OWNS the kernel on the
-        # polled port (its /status lists it): a manager owning nothing, or a bare kernel beside a
-        # crash-looping managed one, answers 202 and restarts nothing, which would have turned this
-        # into a silent never-restart (review find). SYNCED:<sha>:QUIET = deferred; SYNCED:<sha>:FALLBACK
-        # = the immediate path below ran (no owning manager reachable — node absent, no manager, or
-        # the polled kernel is bare). The quiet audit row says when=quiet; the fallback writes its own
-        # row without it, so the cut row joins the right request with the right window.
+        # machine, to this sha) — nine restarts in three hours had no reason on record. The row lands
+        # HERE, right after the reset and before the owner check (T240d), so the far kernel's drift check
+        # reads the request the moment its checkout is ahead. When no owning manager answers, the
+        # fallback below writes its own row, which is then the newest and supersedes this one for every
+        # reader. The restart goes THROUGH THE FAR MANAGER and lands AT ONCE (T269, the user 2026-09-08:
+        # every deploy restart bounces immediately — the parked quiet window held the devbox unusable
+        # for the full 15-minute backstop on 26 of 32 restarts in a morning, and boot reconcile resumes
+        # the cut turns with their history either way, so an immediate bounce costs seconds; the quiet
+        # window survives only as the explicit `romp refresh --quiet`) — but ONLY when that manager
+        # actually OWNS the kernel on the polled port (its /status lists it): a manager owning nothing,
+        # or a bare kernel beside a crash-looping managed one, answers 202 and restarts nothing, which
+        # would have turned this into a silent never-restart (review find). SYNCED:<sha>:MANAGED = the
+        # manager bounced it; SYNCED:<sha>:FALLBACK = the kill path below ran (no owning manager
+        # reachable — node absent, no manager, or the polled kernel is bare).
         'python3 -c "import json,time;print(json.dumps({\'t\':int(time.time()),\'action\':\'p2p-update\','
-        '\'reason\':\'from %s to %s\',\'when\':\'quiet\'}))" >>"$LOGDIR/restart-audit.jsonl" 2>/dev/null || true; '
+        '\'reason\':\'from %s to %s\'}))" >>"$LOGDIR/restart-audit.jsonl" 2>/dev/null || true; '
         'OWNED=0; if command -v node >/dev/null 2>&1 && [ -x "$R/bin/romp-manager" ]; then '
         'OWNED="$("$R/bin/romp-manager" status 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); '
         'print(1 if any(int(k.get(\'port\') or 0)==%d for k in (d.get(\'kernels\') or [])) else 0)" 2>/dev/null || echo 0)"; fi; '
         'if [ "$OWNED" = 1 ]; then '
-        'if "$R/bin/romp-manager" restart-all --quiet >>"$LOGDIR/update.log" 2>&1; then echo "SYNCED:$NEW:QUIET$K"; exit 0; fi; fi; '
+        'if "$R/bin/romp-manager" restart-all >>"$LOGDIR/update.log" 2>&1; then echo "SYNCED:$NEW:MANAGED$K"; exit 0; fi; fi; '
         # LAST RESORT (no owning manager answering on this host): the immediate path below — audit row,
         # kill, then `ensure` upgrades the host to a supervised kernel.
         'python3 -c "import json,time;print(json.dumps({\'t\':int(time.time()),\'action\':\'p2p-update\','
@@ -19837,10 +20014,14 @@ def _update_remote(host, head=None):
         if tag == "SYNCED":
             short, _, mode = rest.partition(":")
             mode = mode.strip()
-            _expect(mode == "QUIET")
+            # every deploy restart is immediate (T269). `quiet` is RECORDED on the expectation, not read:
+            # the tunnel's reinterpretation keys on sha and t (RESTART_EXPECT_MAX_S caps a restart that
+            # never comes). The far kernel's own cut attribution takes the short window from the ROW,
+            # which no longer carries when=quiet (_recent_restart_audit).
+            _expect(False)
             short = short.strip() or lfull[:8]
-            if mode == "QUIET":
-                return True, "synced to %s — restarting at its next quiet window" % short
+            if mode == "MANAGED":
+                return True, "synced to %s + restarting now (through its manager)" % short
             if mode == "FALLBACK":
                 return True, ("synced to %s + restarting now (no manager owns that kernel there — an "
                               "immediate restart)" % short)
@@ -24609,8 +24790,9 @@ def _task_store_dir(fsid):
 
 
 _task_dir_hint = {}   # fsid → content-joined store dir NAME (see _task_store_resolve); reset per kernel run
-_task_join_miss = {}  # fsid → the fold pairs that failed to join — skip re-scanning until the pairs CHANGE
-#                       (event-based retry: new task activity reshapes the fold; a kernel restart clears both)
+_task_join_miss = {}  # fsid → (fold pairs, tasks-root listing) that failed to join: skip re-reading the stores
+#                       until EITHER changes (event-based retry: new task activity reshapes the fold, a store
+#                       appearing or gaining a file reshapes the root listing; a kernel restart clears both)
 
 
 def _task_store_known(fsid):
@@ -24644,7 +24826,10 @@ def _task_store_resolve(fsid, fold):
     the session's OWN record of creating the tasks: the transcript fold's (id, subject) pairs. A
     candidate store that contains them ALL is the session's store; no match or SEVERAL matches → None,
     and the caller stays loud (never guess). The join runs at most once per session per kernel run
-    (_task_dir_hint caches the winner)."""
+    (_task_dir_hint caches the winner). A MISS is remembered too (_task_join_miss), keyed on the pairs and
+    on the tasks root's listing (each store dir's name and mtime_ns): the root scan and a stat per dir run
+    on every call, cheap; the per-file reads are what the memo saves. A miss that a read fault produced (a
+    store listing that failed, a task file mid-rewrite) is never remembered, so the next call retries."""
     d = _task_store_known(fsid)
     if d is not None:
         return d
@@ -24652,30 +24837,54 @@ def _task_store_resolve(fsid, fold):
              if t.get("subject") and str(t["id"]).isdigit()}   # synthetic cN ids (no 'Task #N' result) can't join
     if not pairs:
         return None
-    if _task_join_miss.get(fsid) == pairs:
-        return None                                            # same fold already failed to join → no re-scan
     try:
         cands = [e for e in os.scandir(_task_store_dir(fsid).parent) if e.is_dir()]
     except OSError:
         return None
+    # The root's listing rides the memo's key beside the pairs (review 2026-09-08): a dir's mtime moves when a
+    # file is added or removed inside it, and the set of names moves when a store APPEARS, which Claude Code
+    # does a moment after the TaskCreate the fold already saw. Keyed on the pairs alone, the miss held until
+    # the next TaskCreate or a kernel restart (status updates never change the pairs), and the todo card
+    # showed the store as unreadable for the rest of the session.
+    root_key = []
+    for e in cands:
+        try:
+            root_key.append((e.name, e.stat().st_mtime_ns))
+        except OSError:
+            root_key.append((e.name, None))
+    root_key = tuple(sorted(root_key))
+    if _task_join_miss.get(fsid) == (pairs, root_key):
+        return None                                # the same fold under the same root already failed → no re-read
     hits = []
+    faulted = False                                # a store we could not read whole: the verdict is not evidence
     for e in cands:
         have = set()
         try:
             names = [n for n in os.listdir(e.path) if n.endswith(".json")]
         except OSError:
+            faulted = True
             continue
         for n in names:
             try:
                 t = json.loads((Path(e.path) / n).read_text())
             except (OSError, ValueError):
+                faulted = True                     # a task file mid-rewrite: its pair is missing from `have`
                 continue
             if isinstance(t, dict):
                 have.add((str(t.get("id") or n.rsplit(".", 1)[0]), str(t.get("subject") or "")))
         if pairs <= have:
             hits.append(e.name)
     if len(hits) != 1:
+        # the negative memo the gate above reads (2026-09-08): it was declared and consulted since the join
+        # landed but never WRITTEN, so a session whose store cannot be joined re-read and re-decoded every
+        # store under the tasks root on every build (39 dirs, 301 files here) — for every comment thread,
+        # every cycle. Same fold pairs under the same root listing → same verdict until either changes. A
+        # miss a read fault produced is TRANSIENT and is not remembered: remembered, it latched as a
+        # permanent miss until the fold next changed (review 2026-09-08).
+        if not faulted:
+            _task_join_miss[fsid] = (pairs, root_key)
         return None
+    _task_join_miss.pop(fsid, None)
     _task_dir_hint[fsid] = hits[0]
     return _task_store_dir(hits[0])
 
@@ -30925,6 +31134,7 @@ def _blocked_placeholder(s, name, color, fsid, live, now, perm_state, since):
 _WAIT_Q_RE = re.compile(r"^\s*(?:QUESTION|ASK|Q)\b", re.I)
 _POSTAL_WAIT_CACHE = [None, None]   # (mtime_ns, size) , (last_any, last_ask, last_await) — one log scan per file change
 _POSTAL_PEER_NAMES = [None, {}]     # (mtime_ns, size) , {remote sid: "<host>:<name>"}: the same scan's display join
+_POSTAL_RETURNED = [None, {}]       # (mtime_ns, size) , {(from_id, peer key): {send t: return t}}: the same scan's returns — _postal_returned
 
 
 def _postal_wait_maps():
@@ -30958,17 +31168,51 @@ def _postal_wait_maps():
     host. The same scan therefore keeps the display join beside the maps, _POSTAL_PEER_NAMES, {remote
     sid: "<host>:<name>"} from every row that pairs the two (a relay row's to_sid + toName, a remote
     sender's from_id + from_host + from), newest sighting winning, and _peer_identity reads it
-    (_postal_peer_names) so the chip names the peer the row named."""
+    (_postal_peer_names) so the chip names the peer the row named.
+
+    A send that CAME BACK, or that its sender WITHDREW unread, is neither an ask nor an answer
+    (2026-09-08, two rules that agree). The bus writes a terminal row naming the message's id when a
+    send is over with nobody ever receiving it: `bounced` — a peer refused it, the recipient exited and
+    its unread mail was destroyed, an inbox file it could not read, a write a crash cut short, an
+    oversize push (every bounced row the bus writes is terminal; a parked message awaiting relay has no
+    row, its state is outbox residency) — or a MAILDIR `recall`, written when the sender unlinks the
+    message unread from the recipient's new/ (jd._learn_return, the shared recognizer; it reads an
+    OUTBOX recall, a row naming a relay mid, as nothing: that item may already have been carried and
+    delivered, so a recalled cross-host send stays an open ask). The scan used to skip those rows (they
+    carry no from_id/to_id) and count the sent row, so the sender wore "Awaiting <peer>" for a question
+    the peer never received, or one it had itself withdrawn, its card parked as waiting on a peer while
+    the person may have needed to act, and a bounced reply read as answering the pair. A sent row whose
+    id such a row names now makes no entry at all — not last_any, not last_ask, not last_await (the
+    #1071 review's rule: one skip, before last_any) — and a reply-requiring one records the return by
+    pair and send time (_POSTAL_RETURNED, read by _postal_returned) so the stamp readers' ending clock
+    and the debt reminder's outcome readers see it. The row is the closing EVENT: the card moves once,
+    when it lands. Keyed to the message it names, never the pair — a newer live ask keeps waiting
+    whatever came back for an older one.
+
+    The no-last_any half is what makes a returned or withdrawn REPLY answer nothing: a reply of Y's that
+    the bus returned (the oversize push bounces it to Y without putting it back in X's box) or that Y
+    recalled before X read it was never received, so it must not clear X's chip edge, settle Y's debt,
+    end the pair for the stamp clock, or read as "reported back" to the courier's local arm; the judge's
+    _postal_ask_maps applies the same rule, so the twins keep agreeing. Cross-host it bites on the
+    replier's own host for a refused relay (the bounce lands in the replier's log; the asker's host never
+    held a row), and on the ASKER's host when its own orphan sweep destroys the delivered copy unread (a
+    relayed reply is a local sent row there, and the sweep's bounce names its id) — the two hosts then
+    disagree, honestly: the replier's host holds a `relayed` ack and reads the debt settled, and the
+    remote replier is not told (the sweep's note reaches local senders only). The peer-names display
+    join and the alias history still learn from the row — identity is not word."""
     try:
         st = jd.MESSAGES.stat()
         key = (st.st_mtime_ns, st.st_size)
     except OSError:
         _POSTAL_PEER_NAMES[:] = [None, {}]
+        _POSTAL_RETURNED[:] = [None, {}]
         return {}, {}, {}
     if _POSTAL_WAIT_CACHE[0] == key:
         return _POSTAL_WAIT_CACHE[1]
     last_any, last_ask, last_await = {}, {}, {}
     peer_names = {}   # remote sid -> (t, "<host>:<name>"): the display join, newest sighting wins
+    returned = {}     # mid -> t of its terminal row (bounced, or a maildir recall): the sends that came back or were withdrawn (jd._learn_return)
+    ended = {}        # (from_id, peer key) -> {send t: return t} for the pair's reply-requiring sends that came back
 
     def _saw(sid, at, hn):
         if sid and hn and at >= peer_names.get(sid, (-1, ""))[0]:
@@ -30976,14 +31220,12 @@ def _postal_wait_maps():
     try:
         rows = []
         alias = {}   # "host:name" -> [(t, sid), …], learned from every row a remote sender stamped
-        ended = set()   # ids a terminal `bounced` row closed: mail that never reached anyone
         for o in _messages_rows():                    # append-incremental rows (2026-09-03); the fold
             if not isinstance(o, dict):               # itself stays whole-log: aliases learned from LATER
                 continue                              # rows resolve EARLIER peer: rows
             rows.append(o)
             jd._learn_alias(alias, o)
-            if o.get("ev") == "bounced" and o.get("id"):
-                ended.add(str(o["id"]))
+            jd._learn_return(returned, o)
         jd._alias_settle(alias)
         for hn, hist in alias.items():                # the peer's own stamps, inverted: sid -> what it wore
             for at, sid in hist:
@@ -30991,16 +31233,6 @@ def _postal_wait_maps():
         for o in rows:
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
-                continue
-            if str(o.get("id") or "") in ended:
-                # A REFUSED or DESTROYED send is neither an ask nor an answer (review find,
-                # 2026-09-08): the bus closes a message it had to give up on — a peer's refusal, the
-                # orphan sweep's destroy, an inbox file it could not read, a write a crash cut short
-                # — with a terminal `bounced` row on the same id (a publish it refuses outright
-                # writes no row at all). The recipient never saw that message, so
-                # counting its row here made the asker wear an open ask (and the debt reminder
-                # count a debt) that no reply could ever close, and let a bounced reply read as
-                # answering the pair. The judge's _postal_ask_maps applies the same rule.
                 continue
             ts = int(ts)
             # a CROSS-HOST row is addressed to the RELAY ("peer:<host>"), not the recipient's sid —
@@ -31021,19 +31253,39 @@ def _postal_wait_maps():
                     # 29.6h-invisible ask eaten this way). The maps rebuild from the full log, so the
                     # moment the peer speaks the alias resolves and every row re-keys to the real sid.
                     t_ = jd._alias_at(alias, str(o["toName"]), ts) or "peer:" + str(o["toName"])
-            last_any[(f, t_)] = max(last_any.get((f, t_), 0), ts)
             k = o.get("kind")                            # the sender's DECLARED intent (schema field) wins
             is_ask = (k == "question") if k else bool(_WAIT_Q_RE.match(o.get("body") or ""))
+            is_await = (k in ("question", "delegate")) if k else is_ask   # reply-requiring; kindless rows by the ask prefix
+            mid = str(o.get("id") or "")
+            if mid and mid in returned:
+                # A REFUSED, DESTROYED or WITHDRAWN send is neither an ask nor an answer (review find,
+                # 2026-09-08): the bus closes a message it had to give up on — a peer's refusal, the
+                # orphan sweep's destroy, an inbox file it could not read, a write a crash cut short
+                # — with a terminal `bounced` row on the same id (a publish it refuses outright
+                # writes no row at all), and a sender's MAILDIR recall unlinks it unread with a
+                # `recall` row (an outbox recall is not terminal — jd._learn_return). The recipient
+                # never saw that message, so counting its row here made the asker wear an open ask
+                # (and the debt reminder count a debt) that no reply could ever close, and let a
+                # bounced or recalled reply read as answering the pair. The judge's _postal_ask_maps
+                # applies the same rule. A reply-requiring one also records the RETURN on the pair,
+                # by send time: the stamp readers' other ending event beside the reply
+                # (_pair_wait_ended) and the debt outcome readers' join (_ask_returned). A
+                # coordinate opened no wait to end.
+                if is_await:
+                    pr = ended.setdefault((f, t_), {})
+                    pr[ts] = max(pr.get(ts, 0), returned[mid])
+                continue
+            last_any[(f, t_)] = max(last_any.get((f, t_), 0), ts)
             if is_ask and ts >= last_ask.get((f, t_), (0, ""))[0]:
                 # the ask's HEAD rides along (the user 2026-07-26): the debt reminder quotes the asker's
                 # own first words back at the debtor, so the reminder needs no second log scan
                 last_ask[(f, t_)] = (ts, k or "question", str(o.get("body") or "")[:300])
-            is_await = (k in ("question", "delegate")) if k else is_ask   # reply-requiring; kindless rows by the ask prefix
             if is_await:
                 last_await[(f, t_)] = max(last_await.get((f, t_), 0), ts)
     except OSError:
         pass
     _POSTAL_PEER_NAMES[:] = [key, {sid: hn for sid, (_at, hn) in peer_names.items()}]
+    _POSTAL_RETURNED[:] = [key, ended]
     _POSTAL_WAIT_CACHE[:] = [key, (last_any, last_ask, last_await)]
     return last_any, last_ask, last_await
 
@@ -31046,11 +31298,63 @@ def _postal_peer_names():
     return _POSTAL_PEER_NAMES[1]
 
 
+def _postal_returned():
+    """{(from_id, peer key): {send t: return t}}: per pair, each reply-requiring send of the sender's that
+    was returned or withdrawn (a terminal bounced or maildir-recall row); the send is over and nothing will
+    answer it (2026-09-08;
+    see _postal_wait_maps) — keyed by the send's own time. Kept by the same scan beside the maps, the
+    _postal_peer_names idiom, so the three-tuple every caller unpacks keeps its shape. The stamp readers'
+    ending clock reads the pair's newest return through _pair_wait_ended; the debt reminder's outcome
+    readers join a record's ask time to it through _ask_returned. Warms the scan when the log changed; a
+    stat per call otherwise."""
+    _postal_wait_maps()
+    return _POSTAL_RETURNED[1]
+
+
+def _pair_wait_ended(last_any, last_await, returned, f, t_):
+    """When the pair f → t_ stopped waiting, or 0 while it still does — THE ending clock both stamp
+    supersede readers (_peer_answered_at, _peer_answered) share. Two exact ending events, the newer
+    wins: the peer's reply at/after f's newest LIVE reply-requiring send (last_any[(t_, f)] at/after
+    last_await[(f, t_)]), and such a send coming back (returned[(f, t_)], the pair's returned sends by
+    send time: each returned or withdrawn, a terminal bounced or maildir-recall row, jd._learn_return —
+    nothing will ever answer it,
+    so the wait it opened is over). A late reply after a return is not credited: with no live send there is nothing for it to
+    answer, so the pair's ending stays the return's t. A live send still unanswered
+    holds the pair open whatever came back for an older one: the return is keyed to the message it
+    names, never to the pair (2026-09-08)."""
+    sent = last_await.get((f, t_), 0)
+    reply = last_any.get((t_, f), 0)
+    if sent and reply < sent:
+        return 0                                     # a live reply-requiring send still waits
+    return max([reply if sent else 0] + list((returned.get((f, t_)) or {}).values()))
+
+
+def _ask_returned(asker, debtor, ask_ts):
+    """True when the ask `asker` sent `debtor` at `ask_ts` was returned or withdrawn (a terminal bounced or
+    maildir-recall row named it) and
+    no live ask of theirs shares that second — the join the debt reminder's outcome readers
+    (_debt_reminder_outcomes, _debt_backstop_tick) make for a debtNudged record ("asker>debtor:ts", ts the
+    ask's own send time). The return is the outcome: the debtor never had the ask, so no reply is owed and
+    nothing escalates to the asker's card, and the bus's own note already told the asker the message came
+    back (2026-09-08). The reminder itself is injected through the session backend, never the bus, so only
+    the ask can be returned. The join is per SEND TIME, not per message: the record carries the ask's
+    second and the returns table keys a returned send by its second, so a live reply-expecting twin sent
+    in that same second keeps the record open — a returned m1 must not retire the reminder a live m2 still
+    owes. The twin check reads last_ask, the chip's own map and question-only like the record; a newer
+    live ask on the pair carries its own record, so the pair's newest live ask is the one that matters."""
+    ts = int(ask_ts)
+    if ts not in (_postal_returned().get((asker, debtor)) or {}):
+        return False
+    _any, last_ask, _aw = _postal_wait_maps()
+    return last_ask.get((asker, debtor), (0,))[0] != ts     # a live twin in the same second keeps the record
+
+
 def _wait_for_graph(now, alive_sids):
     """The fleet's WAIT-FOR graph from the postal log (the user 2026-06-22): a session X 'waits on' peer Y
     when X's latest REPLY-EXPECTING message to Y (a postal QUESTION, or a DELEGATE handoff whose result X
-    acts on — NOT a COORDINATE/FYI heads-up) has no answer back since (any later Y→X record answers it)
-    AND Y is ALIVE (a dead peer won't reply). Each X points to its single most-recent such Y (a functional
+    acts on — NOT a COORDINATE/FYI heads-up) has no answer back since (any later Y→X record answers it;
+    a send that came back or was withdrawn unread — a terminal bounced or maildir-recall row — is
+    neither an ask nor an answer, see _postal_wait_maps) AND Y is ALIVE (a dead peer won't reply). Each X points to its single most-recent such Y (a functional
     graph), so following the edges detects CYCLES (X→Y→…→X = a mutual-wait deadlock). Returns
     {sid: {peerSid, name, color, inCycle, since, kind}} for every waiting session — the goal card's chip
     (kind picks its label: "Awaiting <peer>" vs "Handed off to <peer>") + the auto-nudge gate read it.
@@ -31082,8 +31386,10 @@ def _wait_for_graph(now, alive_sids):
 
 
 def _peer_answered_at(sid):
-    """The latest time a peer that `sid` had ASKED (question) or DELEGATED to REPLIED, over pairs with no
-    newer outstanding ask: max of last_any[(Y, sid)] where that reply is at/after sid's latest ask to Y.
+    """The latest time a peer that `sid` had ASKED (question) or DELEGATED to REPLIED — or that send was
+    returned or withdrawn (a terminal bounced or maildir-recall row, 2026-09-08) — over pairs with no newer
+    outstanding ask: max of
+    last_any[(Y, sid)] where that reply is at/after sid's latest ask to Y, and of the pair's return.
     0 when nothing qualifies. The durable ⏳ awaiting-stamp readers treat a stamp OLDER than this as
     SUPERSEDED — the awaited answer arrived after the closer spoke, which is exactly the event the stamp
     was waiting for (the user 2026-07-25: a stamp filed at 13:12 kept a card on "Awaiting background
@@ -31092,6 +31398,7 @@ def _peer_answered_at(sid):
     stamp was really about non-peer work (subagents, a build), the LIVE sources that outrank it still
     carry the wait, and the closer's next pass can re-stamp with a fresh awaitingAt."""
     last_any, _ask, last_await = _postal_wait_maps()
+    returned = _postal_returned()
     best = 0
     # OUTBOUND rides last_await, not last_ask (2026-08-18 audit): the 2026-08-15 change that stopped
     # DELEGATES from making chip edges also emptied last_ask of them — which silently removed this
@@ -31101,17 +31408,19 @@ def _peer_answered_at(sid):
     # exact ending event for both; the chip edge stays question-only, exactly as #430 intended. Not
     # last_any (2026-09-08): a COORDINATE the asker sent after the answer landed ("thanks") counted as
     # a newer outbound awaiting a reply, so the answer read as stale and the stamp stood.
-    for (f, t_), sent in last_await.items():
+    # The send returned or withdrawn (2026-09-08, a terminal bounced or maildir-recall row) is the pair's
+    # other ending event: the peer never got the ask and nothing will come back, so a stamp filed before it is
+    # superseded by it exactly as by a reply (_pair_wait_ended, the clock _peer_answered shares).
+    for f, t_ in set(last_await) | set(returned):
         if f != sid:
             continue
-        r = last_any.get((t_, f), 0)
-        if r >= sent:                                    # the pair's newest reply-requiring send is answered
-            best = max(best, r)
+        best = max(best, _pair_wait_ended(last_any, last_await, returned, f, t_))
     return best
 
 
 def _peer_answered(sid):
-    """(answered_any, {peer_key: reply_t}) — _peer_answered_at with the PAIR kept (2026-08-24): the
+    """(answered_any, {peer_key: t the wait on that peer ENDED — its reply, or the ask returned or withdrawn})
+    — _peer_answered_at with the PAIR kept (2026-08-24): the
     pair-blind scalar let ANY answered exchange supersede ANY peer stamp, so an unrelated coordinate
     from the same log hid a real wait (three stuck stamps, one ~14h). Stamps that record WHICH
     peer(s) they await (awaitingPeers, written by the closer's admit gate) are matched against their
@@ -31120,13 +31429,14 @@ def _peer_answered(sid):
     the admit gate derives them from, so the two sides can never disagree."""
     best = _peer_answered_at(sid)        # the scalar rides the existing name — the tests' stub seam
     last_any, _la, last_await = _postal_wait_maps()
+    returned = _postal_returned()
     per = {}
-    for (f, t_), sent in last_await.items():   # reply-requiring sends only — see _peer_answered_at
+    for f, t_ in set(last_await) | set(returned):   # reply-requiring sends only — see _peer_answered_at
         if f != sid:
             continue
-        r = last_any.get((t_, f), 0)
-        if r >= sent:
-            per[t_] = max(per.get(t_, 0), r)
+        ended = _pair_wait_ended(last_any, last_await, returned, f, t_)   # the reply, or the return / withdrawal
+        if ended:
+            per[t_] = max(per.get(t_, 0), ended)
     return best, per
 
 
@@ -33182,6 +33492,50 @@ def _peer_spend_call(row, timeout):
         return None, None, "could not reach %s's kernel: %s" % (host, e)
 
 
+def _spend_tags():
+    """The tags the usage modal's "merge by tag" groups by (T247g, the user 2026-09-08): this viewer's
+    own tags and every attached host's cached ones, as _views_client renders them, unioned by NAME —
+    the user ruled tags equivalent, no home tag, so a same-named tag on two kernels is one here (the
+    strip's sections union the same way) — members as the viewer sees them (a bare local sid, host:sid
+    for a remote session: the modal's own keys), the first color a same-named tag carries. A tag with
+    no color of its own gets the least-used swatch of the active palette among the tags, ties by the
+    name's hash, so it reads the same on every open; flagged colorDerived."""
+    try:
+        v = _views_client()
+    except Exception:
+        return []
+    out = {}
+    for t in (v.get("tags") or []) + (v.get("remoteTags") or []):
+        if not isinstance(t, dict):
+            continue
+        name = str(t.get("name") or "").strip()
+        if not name:
+            continue
+        e = out.setdefault(name, {"name": name, "color": "", "members": []})
+        if not e["color"] and t.get("color"):
+            e["color"] = str(t["color"])[:16]
+        for m in t.get("members") or []:
+            if isinstance(m, str) and m not in e["members"]:
+                e["members"].append(m)
+    tags = sorted(out.values(), key=lambda t: t["name"].lower())
+    swatches = pal.colors(pal.active_name(jd.STATE))
+    if swatches:
+        import zlib
+        used = {}
+        for t in tags:
+            if t["color"]:
+                used[t["color"]] = used.get(t["color"], 0) + 1
+        for t in tags:
+            if t["color"]:
+                continue
+            h = zlib.crc32(t["name"].encode()) % len(swatches)
+            ranked = sorted(range(len(swatches)), key=lambda i: (used.get(swatches[i], 0), (i - h) % len(swatches)))
+            t["color"] = swatches[ranked[0]]
+            t["colorDerived"] = True
+            used[t["color"]] = used.get(t["color"], 0) + 1
+    return tags
+
+
 def _spend_detail(now=None):
     """GET /spend/detail — EVERY attached kernel's sessions, merged here (T247c, the user 2026-09-08:
     the per-session breakdown covered this machine only, and the federated kernels' sessions matter).
@@ -33238,6 +33592,7 @@ def _spend_detail(now=None):
         out = dict(local)
         out["hosts"] = hosts
         out["order"] = [[me, s] for s in (local.get("order") or []) if isinstance(s, str)]
+        out["tags"] = _spend_tags()
         return out
     return _merge_spend_details(payloads, hosts, local)
 
@@ -33378,7 +33733,7 @@ def _merge_spend_details(payloads, hosts, local):
             if isinstance(sid, str):
                 order.append([host, sid])
     out = dict(local)
-    out.update({"hosts": hosts, "sessions": sessions, "unattributed": un, "order": order,
+    out.update({"hosts": hosts, "sessions": sessions, "unattributed": un, "order": order, "tags": _spend_tags(),
                 "hours": _merge_range("hours"), "days": _merge_range("days")})
     return out
 
@@ -38259,9 +38614,19 @@ def _push(targets, connect=False, tmux=None):
                     _built_chat.pop(sid, None)
                     _prev_chat_events.pop(sid, None)
                     _prev_chat_ledger.pop(sid, None)
-            with _chat_fold_lock:                        # …and every fold entry for a sid no longer shown,
-                for sid in list(_chat_fold):             # including ones _built_chat never held (thread sids,
-                    if sid not in shown_sids:            # loadOlder / connect-push builds)
+            # …and every fold entry for a sid no longer shown (loadOlder / connect-push builds) — EXCEPT the
+            # comment THREADS the loop below is about to rebuild (2026-09-08): evicting their prefixes here
+            # made every thread build a cold reshape of the fork's whole copied history, every cycle. The
+            # keep set is what LAST cycle's comments loop touched, swapped in here, BEFORE the eviction: with
+            # the swap after it the set consulted was two cycles old, so a thread first built in cycle N was
+            # evicted once more in N+1 and a stopped thread lingered a cycle longer (review 2026-09-08). A
+            # thread that stops being built (resolved, promoted, its parent closed) ages out of the set after
+            # one cycle and is evicted as before.
+            _thread_fold_keep[0], _thread_fold_keep[1] = _thread_fold_keep[1], set()
+            keep = shown_sids | _thread_fold_keep[0]
+            with _chat_fold_lock:
+                for sid in list(_chat_fold):
+                    if sid not in keep:
                         _chat_fold.pop(sid, None)
             _retry_parked_creates()   # lag-parked comment creates ride every pusher cycle (T106)
             # COMMENT THREADS: one {type:"comments"} frame per session that has ever had one (its
@@ -41659,11 +42024,11 @@ pullFleet().then(done,function(){if(ROWS.length)renderRows(ROWS,SELF);done();});
 // kernel-side, the ledger's bySid series — fetched on open behind the romp loader, never scraped from
 // the hover's HTML. The click still kicks the hover's own refresh (pull), so both levels are fresh.
 var spBack=document.getElementById('rsp-back'),spPanel=document.getElementById('rsp-panel'),spTip=null;
-var SP={data:null,err:'',range:'hours',measure:'usd',order:'spend',open:false};
+var SP={data:null,err:'',range:'hours',measure:'usd',order:'spend',merge:false,open:false};
 // the toggles persist across opens and reloads (T247f): range, measure, and the list's order
 var SP_PREFS_KEY='romp:spendModal';
-function spLoadPrefs(){try{var p=JSON.parse(localStorage.getItem(SP_PREFS_KEY)||'{}')||{};if(p.range==='days')SP.range='days';if(p.measure==='tok')SP.measure='tok';if(p.order==='yours')SP.order='yours';}catch(e){}}
-function spSavePrefs(){try{localStorage.setItem(SP_PREFS_KEY,JSON.stringify({range:SP.range,measure:SP.measure,order:SP.order}));}catch(e){}}
+function spLoadPrefs(){try{var p=JSON.parse(localStorage.getItem(SP_PREFS_KEY)||'{}')||{};if(p.range==='days'||p.range==='day')SP.range=p.range;if(p.measure==='tok')SP.measure='tok';if(p.order==='yours')SP.order='yours';if(p.merge===true)SP.merge=true;}catch(e){}}
+function spSavePrefs(){try{localStorage.setItem(SP_PREFS_KEY,JSON.stringify({range:SP.range,measure:SP.measure,order:SP.order,merge:SP.merge}));}catch(e){}}
 spLoadPrefs();
 // "your order" (T247f, the user 2026-09-08): the order the tab strip and the timeline lanes show — the
 // kernel's shared seed per host (session-order.json; hosts local-first then attach order, remote ids
@@ -41694,6 +42059,34 @@ function spMany(d){return spHosts(d).length>1;}
 // .tab-label with the identity color as --chip-bg (styles.css keys the color and weight on the SAME
 // rule the strip uses, so the two cannot drift) and the quiet .host-prefix — no swatch
 function spTitle(s,many){return '<span class="tab-label colored" style="--chip-bg:'+spColor(s)+'">'+(many&&s.host?'<span class=host-prefix>'+esc(s.host)+':</span>':'')+esc(spName(s))+'</span>';}
+// ── T247g (the user 2026-09-08): three ranges, and "merge by tag"
+// the series for the range: "1 day" is the hourly series' last 24 buckets (the ledger holds hours and
+// days; a day is a slice of the hours, never a third ledger)
+function spSeries(d){var ser=d[SP.range==='day'?'hours':SP.range];if(!ser)return null;if(SP.range!=='day')return ser;
+var n=(ser.keys||[]).length,cut=Math.max(0,n-24);
+return {keys:(ser.keys||[]).slice(cut),epochs:(ser.epochs||[]).slice(cut),stacks:(ser.stacks||[]).map(function(s){var o={};for(var k in s)o[k]=s[k];o.usd=(s.usd||[]).slice(cut);o.tok=(s.tok||[]).slice(cut);
+if(s.hosts){o.hosts={};Object.keys(s.hosts).forEach(function(h){o.hosts[h]={usd:(s.hosts[h].usd||[]).slice(cut),tok:(s.hosts[h].tok||[]).slice(cut)};});}return o;})};}
+// the rows: the ordered sessions, or — merged by tag — one row per tag holding sessions here (named
+// by the tag, colored by the tag store's color, the strip's chip color) and the untagged sessions as
+// themselves. A session under several tags counts under EACH (the user's ruling: tags are equivalent,
+// no home tag); the footer says how many do, because the rows then sum past the totals.
+function spRows(d){var ss=spOrdered(d);if(!SP.merge||!(d.tags&&d.tags.length))return {rows:ss.map(function(s,i){return {kind:'sid',s:s,sid:s.sid,name:s.name,bg:s.bg,live:s.live,usd:s.usd,tok:s.tok,turns:s.turns,host:s.host,key:s.key,rank:i};}),multi:0};
+var byKey={},counts={},tagged={},rows=[];ss.forEach(function(s,i){byKey[spKey(d,s)]={s:s,i:i};});
+d.tags.forEach(function(t){var mem=[];(t.members||[]).forEach(function(m){var e=byKey[m];if(e){mem.push(e);counts[m]=(counts[m]||0)+1;}});if(!mem.length)return;
+var usd=0,tok=0,turns=0,live=false,hosts={},minI=1e9;mem.forEach(function(e){usd+=e.s.usd||0;tok+=e.s.tok||0;turns+=e.s.turns||0;live=live||!!e.s.live;hosts[String(e.s.host)]=1;if(e.i<minI)minI=e.i;tagged[spKey(d,e.s)]=1;});
+var hk=Object.keys(hosts);rows.push({kind:'tag',sid:'tag:'+t.name,name:t.name,bg:t.color||'',live:live,usd:usd,tok:tok,turns:turns,members:mem.map(function(e){return e.s;}),host:(hk.length===1?hk[0]:''),rank:minI});});
+ss.forEach(function(s,i){if(!tagged[spKey(d,s)])rows.push({kind:'sid',s:s,sid:s.sid,name:s.name,bg:s.bg,live:s.live,usd:s.usd,tok:s.tok,turns:s.turns,host:s.host,key:s.key,rank:i});});
+if(SP.order==='yours')rows.sort(function(a,b){return a.rank-b.rank;});else rows.sort(function(a,b){return ((b.usd||0)-(a.usd||0))||((b.tok||0)-(a.tok||0));});
+var multi=0;Object.keys(counts).forEach(function(k){if(counts[k]>1)multi++;});return {rows:rows,multi:multi};}
+// the stacks follow the rows: a tag row's stack is its members' stacks summed; untagged sessions keep
+// their own; unattributed (and an older peer's fold) stay last
+function spStacks(d,ser,model){var stacks=ser.stacks||[];if(!SP.merge||!(d.tags&&d.tags.length))return spStackOrder(d,stacks);
+var byKey={};stacks.forEach(function(s){if(s.kind==='sid')byKey[spKey(d,s)]=s;});var out=[];
+model.rows.forEach(function(r){if(r.kind==='tag'){var usd=null,tok=null;r.members.forEach(function(m){var st=byKey[spKey(d,m)];if(!st)return;
+if(!usd){usd=st.usd.slice();tok=st.tok.slice();}else{for(var i=0;i<usd.length;i++){usd[i]+=st.usd[i]||0;tok[i]+=st.tok[i]||0;}}});
+if(usd&&(usd.some(function(v){return v>0;})||tok.some(function(v){return v>0;})))out.push({kind:'tag',name:r.name,bg:r.bg,live:r.live,usd:usd,tok:tok});}
+else{var st=byKey[spKey(d,r)];if(st)out.push(st);}});
+stacks.forEach(function(s){if(s.kind!=='sid')out.push(s);});return out;}
 function spColor(s){return (s.bg&&/^#[0-9a-fA-F]{3,8}$/.test(s.bg))?s.bg:SP_NONE;}
 function spHead(){var d=SP.data,ok=d?spHosts(d):[];return '<div class=rsp-top><span>'+(d&&d.scope==='computed'?'Spend (computed)':'API spend')
 +(ok.length>1?' \u00b7 '+ok.length+' machines':(d&&d.host?' \u00b7 '+esc(d.host):''))+'</span>'
@@ -41730,6 +42123,8 @@ while(t&&t!==spPanel){if(t.getAttribute&&t.getAttribute('data-act')){b=t;break;}
 if(!b)return;var a=b.getAttribute('data-act');
 if(a==='close'){closeSpend();return;}
 if(a==='retry'){openSpend();return;}
+if(a==='merge:toggle'){SP.merge=!SP.merge;spSavePrefs();if(SP.merge)b.classList.add('on');else b.classList.remove('on');
+var tb2=document.getElementById('rsp-table');if(tb2){tb2.innerHTML=sessionTable(SP.data);tb2.scrollTop=0;}renderChart();return;}
 var m=/^(range|measure|order):(\\w+)$/.exec(a);if(!m)return;
 SP[m[1]]=m[2];spSavePrefs();
 if(m[1]==='order'){var tb=document.getElementById('rsp-table');if(tb){tb.innerHTML=sessionTable(SP.data);tb.scrollTop=0;}}   // the new order's head rows, not a mid-list slice (review find)
@@ -41746,8 +42141,9 @@ var keyCol=d.scope!=='keyed'&&ss.some(function(s){return s.key&&typeof s.key.usd
 var h='<table class=rsp-tbl><thead><tr><th>session</th><th class=n>dollars</th>'+(keyCol?'<th class=n>key-billed</th>':'')
 +'<th class=n>turns</th><th class=n>tokens</th></tr></thead><tbody>';
 var many=spMany(d);
-spOrdered(d).forEach(function(s){h+='<tr data-sid="'+esc(s.sid||'')+'"'+(s.live?' class=rsp-live':' class=rsp-dead')+'>'
-+'<td class=rsp-name>'+spTitle(s,many)+(s.live?'':'<span class=ru-tip-reset> \u00b7 not running</span>')+'</td>'
+var model=spRows(d);
+model.rows.forEach(function(s){h+='<tr data-sid="'+esc(s.sid||'')+'"'+(s.live?' class=rsp-live':' class=rsp-dead')+(s.kind==='tag'?' data-tag="'+esc(s.name)+'"':'')+'>'
++'<td class=rsp-name>'+(s.kind==='tag'?('<span class="tab-label colored" style="--chip-bg:'+spColor(s)+'">'+esc(s.name)+'</span><span class=ru-tip-reset> \u00b7 '+s.members.length+' session'+(s.members.length===1?'':'s')+'</span>'):spTitle(s.s,many))+(s.live?'':'<span class=ru-tip-reset> \u00b7 not running</span>')+'</td>'
 +'<td class=n>'+fmtUsd(s.usd)+'</td>'+(keyCol?'<td class=n>'+(s.key?fmtUsd(s.key.usd):'\u2014')+'</td>':'')
 +'<td class=n>'+(s.turns||0)+'</td><td class=n>'+fmtTok(s.tok||0)+'</td></tr>';});
 // spend recorded before per-session attribution existed (T100, 2026-08-24), or the part of a bucket no
@@ -41756,7 +42152,9 @@ spOrdered(d).forEach(function(s){h+='<tr data-sid="'+esc(s.sid||'')+'"'+(s.live?
 if(un&&(un.usd>0||un.tok>0))h+='<tr class=rsp-dead>'
 +'<td class=rsp-name><i class="rsp-sw rsp-hatch"></i> unattributed<span class=ru-tip-reset> \u00b7 recorded before per-session tracking</span></td>'
 +'<td class=n>'+fmtUsd(un.usd)+'</td>'+(keyCol?'<td class=n>\u2014</td>':'')+'<td class=n>'+(un.turns||0)+'</td><td class=n>'+fmtTok(un.tok||0)+'</td></tr>';
-return h+'</tbody></table>';}
+h+='</tbody></table>';
+if(model.multi)h+='<div class=rsp-note>'+model.multi+(model.multi===1?' session carries':' sessions carry')+' several tags and count'+(model.multi===1?'s':'')+' under each of them, so the rows add up past the totals.</div>';
+return h;}
 // 1. the SAME window numbers the hover shows — the sums across every machine, rows only (one renderer).
 // Its own node: renderRows re-renders it whenever fresh rows land while the modal is open, so the
 // two levels agree at every moment, not only at the instant the modal opened (review find)
@@ -41775,6 +42173,7 @@ h+='<div class=rsp-sec id=rsp-totals>'+totalsHTML(d)+'</div>';
 // by default, tokens on a toggle; the session list below is its legend
 h+='<div class=rsp-sec><div class=ru-tip-name><span>Spend over time</span></div>'
 +'<div class=rsp-ctl>'
++'<button class="rsp-btn'+(SP.range==='day'?' on':'')+'" data-act=range:day>1 day \u00b7 by hour</button>'
 +'<button class="rsp-btn'+(SP.range==='hours'?' on':'')+'" data-act=range:hours>8 days \u00b7 by hour</button>'
 +'<button class="rsp-btn'+(SP.range==='days'?' on':'')+'" data-act=range:days>90 days \u00b7 by day</button>'
 +'<span class=rsp-gap></span>'
@@ -41783,6 +42182,8 @@ h+='<div class=rsp-sec><div class=ru-tip-name><span>Spend over time</span></div>
 +'<span class=rsp-gap></span>'
 +'<button class="rsp-btn'+(SP.order==='spend'?' on':'')+'" data-act=order:spend>by spend</button>'
 +'<button class="rsp-btn'+(SP.order==='yours'?' on':'')+'" data-act=order:yours>your order</button>'
++'<span class=rsp-gap></span>'
++'<button class="rsp-btn'+(SP.merge?' on':'')+'" data-act=merge:toggle>merge by tag</button>'
 +'</div><div id=rsp-chart></div></div>';
 // 3. per session — EVERY attached kernel's sessions (T247c), each machine's own story merged here;
 // the billing rule is named when every contributing machine shares one, else each keeps its own
@@ -41809,7 +42210,7 @@ function spFill(s){return s.kind==='unattributed'?'url(#rsp-hatch)':s.kind==='ot
 function spStackName(s){return s.kind==='other'?('other ('+(s.count||0)+' session'+(s.count===1?'':'s')+(s.host?' on '+s.host:'')+')'):s.kind==='unattributed'?'unattributed':spName(s);}
 // the plain-text form for the tooltip: host · name when more than one machine contributes; the
 // unattributed stack names each machine's share of the hovered bucket
-function spStackText(s,many,meas,i){if(s.kind==='sid')return (many&&s.host?s.host+' \u00b7 ':'')+spName(s);
+function spStackText(s,many,meas,i){if(s.kind==='tag')return s.name;if(s.kind==='sid')return (many&&s.host?s.host+' \u00b7 ':'')+spName(s);
 if(s.kind==='unattributed'&&many&&s.hosts){var parts=[];Object.keys(s.hosts).forEach(function(hn){var v=(s.hosts[hn][meas]||[])[i]||0;if(v>0)parts.push(hn+' '+(meas==='usd'?fmtUsd(v):fmtTok(Math.round(v))));});
 return 'unattributed'+(parts.length?' ('+parts.join(', ')+')':'');}
 return spStackName(s);}
@@ -41826,9 +42227,9 @@ function spBucketLabel(k,range){if(range==='hours'){var m=/^(\\d{4})-(\\d\\d)-(\
 return m?(Number(m[2])+'/'+Number(m[3])+' '+m[4]+':00\u2013'+(('0'+((Number(m[4])+1)%24)).slice(-2))+':00'):k;}
 var n=/^(\\d{4})-(\\d\\d)-(\\d\\d)$/.exec(k);return n?(Number(n[2])+'/'+Number(n[3])):k;}
 function renderChart(){var box=document.getElementById('rsp-chart');if(!box||!SP.data)return;
-var d=SP.data,ser=d[SP.range],meas=SP.measure;
+var d=SP.data,ser=spSeries(d),meas=SP.measure;
 if(!ser||!ser.keys||!ser.keys.length){box.innerHTML='<div class=rsp-note>No history yet.</div>';return;}
-var stacks=spStackOrder(d,ser.stacks||[]),n=ser.keys.length,W=Math.max(320,box.clientWidth||600),H=200;
+var stacks=spStacks(d,ser,spRows(d)),n=ser.keys.length,W=Math.max(320,box.clientWidth||600),H=200;
 var tots=[],mx=0;for(var i=0;i<n;i++){var t=0;for(var s=0;s<stacks.length;s++){t+=(stacks[s][meas]&&stacks[s][meas][i])||0;}tots.push(t);if(t>mx)mx=t;}
 if(!(mx>0)){box.innerHTML='<div class=rsp-note>Nothing recorded in this range.</div>';return;}
 var top=niceTop(mx),slot=W/n,gap=Math.min(2,slot*0.3),bw=Math.max(1,slot-gap),PADT=6;
@@ -41864,7 +42265,8 @@ svg+='</svg>';
 // x labels: hourly range → weekday initials at the ledger's local midnights (the hover graph's rule);
 // daily range → the 1st and 15th. The keys are the KERNEL's local time — named when the viewer's differs.
 var xlab='';for(var i=0;i<n;i++){var k=ser.keys[i],m;
-if(SP.range==='hours'){m=/^(\\d{4})-(\\d\\d)-(\\d\\d)T00$/.exec(k);if(m){var dd=new Date(+m[1],+m[2]-1,+m[3]);
+if(SP.range==='day'){m=/T(\\d\\d)$/.exec(k);if(m&&(+m[1])%6===0)xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+m[1]+':00</span>';}
+else if(SP.range==='hours'){m=/^(\\d{4})-(\\d\\d)-(\\d\\d)T00$/.exec(k);if(m){var dd=new Date(+m[1],+m[2]-1,+m[3]);
 xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+['S','M','T','W','T','F','S'][dd.getDay()]+'</span>';}}
 else{m=/^(\\d{4})-(\\d\\d)-(01|15)$/.exec(k);if(m)xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+Number(m[2])+'/'+Number(m[3])+'</span>';}}
 var many=spMany(d);
@@ -41880,7 +42282,7 @@ var svgEl=box.querySelector('svg');if(!svgEl)return;
 svgEl.onpointermove=function(e){var t=e.target;if(!t||!t.classList||!t.classList.contains('rsp-seg')){spTipHide();return;}
 var i=+t.getAttribute('data-i'),si=+t.getAttribute('data-s'),s=stacks[si];if(!s)return;
 var v=(s[meas]&&s[meas][i])||0,o=(s[meas==='usd'?'tok':'usd']&&s[meas==='usd'?'tok':'usd'][i])||0;
-spTipShow(e.clientX,e.clientY,spStackText(s,many,meas,i),fmt(v),(meas==='usd'?fmtTok(Math.round(o))+' tok':fmtUsd(o))+' \u00b7 '+spBucketLabel(ser.keys[i],SP.range));};
+spTipShow(e.clientX,e.clientY,spStackText(s,many,meas,i),fmt(v),(meas==='usd'?fmtTok(Math.round(o))+' tok':fmtUsd(o))+' \u00b7 '+spBucketLabel(ser.keys[i],SP.range==='day'?'hours':SP.range));};
 svgEl.onpointerleave=spTipHide;}
 var spResizeRaf=0;
 window.addEventListener('resize',function(){if(!(SP.open&&SP.data)||spResizeRaf)return;

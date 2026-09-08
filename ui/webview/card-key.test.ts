@@ -106,11 +106,12 @@ test("a cross-pane hover bolds the card's own session colour, sharing the .focus
   const i = FEEDCSS.indexOf(".fitem.ask.focused, .fitem.ask.dot-hl");
   const rule = FEEDCSS.slice(i, FEEDCSS.indexOf("}", i));
   assert.match(rule, /border-color: rgb\(var\(--card-r/, "full-opacity session colour, as on mouse hover");
-  // T221: the extra 1px is the BORDER growing (one paint with the body — a box-shadow ring was a
-  // second paint whose contact with the border seamed on the user's renderer), with the negative
-  // margin keeping flow position and content box identical.
-  assert.match(rule, /border-width: 3px; margin: -1px;/, "the bolding is single-paint");
-  assert.doesNotMatch(rule, /box-shadow: 0 0 0 1px/, "…never a second ring paint laid against the border");
+  // T270 (the user 2026-09-08): the bolding is PAINT ONLY — colour and shadow. The T221 cut grew the
+  // border 2→3px with a compensating margin -1px, which kept the CSS boxes still but moved the RENDERED
+  // text a device pixel on the user's display; no layout property may change with the hover.
+  assert.doesNotMatch(rule, /border-width|margin|padding/, "no layout property changes with the hover");
+  assert.match(rule, /box-shadow: 0 2px 7px/, "the lift shadow is the other half of the bolding");
+  assert.doesNotMatch(rule, /box-shadow: 0 0 0 1px/, "…never a second ring paint laid against the border (T221's seam)");
 });
 
 test("the white outline no longer lands on a card, only on the modal rows that have no colour", () => {

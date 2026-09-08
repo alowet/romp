@@ -478,6 +478,9 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 /* WORKING: a small yellow dot left of the name (replaces the old yellow outline). */
 .tab-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--st-working-bg); }   /* solid — dot oscillation was distracting (the user 2026-06-16) */
 .tab-dot.await { background: var(--st-awaitbg-bg); }   /* awaiting-bg: the dot matches the await-green chip (the user 2026-07-13) */
+/* the slot with no dot to show (idle, blocked, closed…): laid out, invisible — a tab's width must not change with its
+   state, or the strip's row count flaps at a wrap boundary and the transcript slides under the reader (T262g, 2026-09-08) */
+.tab-dot.none { visibility: hidden; }
 /* state UNKNOWN: a hollow ring in the same "can't see it" gray the network strip paints a down host
    (the `#8a8a8a` in strip.ts's status-dot colour pick) — no-information rendered as itself, so a
    bare tab never has to carry that meaning. */

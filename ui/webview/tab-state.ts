@@ -81,3 +81,18 @@ export function sectionPipTitle(kind: SectionPip, names: readonly string[]): str
   const phrase = names.length === 1 ? SECTION_PIP_TITLE[kind] : SECTION_PIP_TITLE_MANY[kind](names.length);
   return `${phrase}: ${names.join(", ")}`;
 }
+
+/** The state dot every tab carries (T262g, the user 2026-09-08: the strip's row count flapped with a tab's state).
+ *  A tab's width must not depend on its state: the dot's slot is laid out in EVERY state and merely hidden when the
+ *  state has no dot ("tab-dot none"), so a session starting or finishing work cannot add or remove a row of the strip
+ *  and slide the transcript under the reader by a row's height. working → the solid dot; awaitingBg → the await-green
+ *  dot; a missing state → the gray ring; opening → the accent loader dot; compacting → null (its animated bar takes
+ *  the slot); everything else → the hidden slot. */
+export function tabDotClass(st: string | undefined | null): string | null {
+  if (st === "compacting") return null;
+  if (st === "working") return "tab-dot";
+  if (st === "awaitingBg") return "tab-dot await";
+  if (!st) return "tab-dot unknown";
+  if (st === "opening") return "tab-dot opening";
+  return "tab-dot none";
+}
