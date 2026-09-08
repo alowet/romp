@@ -16,6 +16,11 @@ Two defects, both from the post-outage forensics:
     retires the ride — an unstamped rider would re-nominate every pass forever, the exact one-shot
     defect this cluster deletes.
 
+CloserLiftHorizon (review find, 2026-09-08): the closer's own endings, its lift and its done, journal
+the audited turn's last EVENT time as the evidence horizon they ruled on, threaded by _close_turn into
+apply_close as t_end. Exercised through the real turn parse (the one production caller had been pinned
+by source text alone), including the idle-terminated tail turn whose `end` is the parse clock.
+
 All fixtures synthetic (placeholder UUIDs, invented text).
 """
 import json
@@ -54,13 +59,15 @@ def aline(t, text, uuid, parent=None):
                         "stop_reason": "end_turn"}}
 
 
-def _turn():
+def _turn(states=None):
+    # `states`: optional states/<sid>.jsonl rows (idle transitions), parsed with the clock at NOW
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / (SID + ".jsonl")
         recs = [uline(T0, "wire the widget end to end", "u1"),
                 aline(T0 + 20, "Shipped: the widget wiring merged and deployed.", "a1", "u1")]
         p.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
-        return em.parse_session(str(p), rompuuid=SID, candidate_files=[str(p)], now=NOW)["turns"][0]
+        return em.parse_session(str(p), rompuuid=SID, candidate_files=[str(p)], now=NOW,
+                                states=states)["turns"][0]
 
 
 def _store():
@@ -198,6 +205,65 @@ class LiftRiders(unittest.TestCase):
         s = self._lifted_store()
         jd.rollup_status(s, session_closed=False)
         self.assertNotEqual(s["status"].get(SID + ":g1"), "completed")
+
+
+class CloserLiftHorizon(unittest.TestCase):
+    """The closer's endings, its lift and its done, journal the audited turn's last EVENT time as the
+    evidence horizon they ruled on (record_verdict end_ev), threaded by _close_turn into apply_close as
+    t_end (review find, 2026-09-08: the one production caller was pinned by source text only). Through
+    the real turn parse, so a wrong field threaded (the trigger, the clock, or none) fails here."""
+
+    WHY = "watching the rebuild; picks the result up when it lands"
+
+    def setUp(self):
+        self._llm = jd.closer_llm
+
+    def tearDown(self):
+        jd.closer_llm = self._llm
+
+    def _stamped(self, turn):
+        # a task-kind stamp from an EARLIER turn, on a goal THIS turn touched (placed on its segment)
+        s = _store()
+        nd = _node(s, "g1", "rebuild the notes-api index")
+        jd.apply_close(s, [nd], {"done": {}, "block": {},
+                                 "awaiting": {1: {"why": self.WHY, "kind": "task"}}}, t=T0 - 50, touched=1)
+        self.assertEqual(nd.get("awaitingWhy"), self.WHY, "fixture: stamped on an earlier turn")
+        s["placements"][em.segments(turn)[0]["id"]] = nd["id"]
+        return s, nd
+
+    def test_a_the_closers_lift_through_close_turn_journals_the_turns_last_event(self):
+        turn = _turn()
+        s, nd = self._stamped(turn)
+        self.assertNotEqual(turn["t"], turn["end"], "fixture: a trigger-for-horizon mutant must be visible")
+        jd.closer_llm = lambda tt, mt, *_a: '{"done": [], "block": []}'   # no re-assert: the wait is lifted
+        self.assertEqual(jd._close_turn(s, turn), [])
+        row = nd["log"][-1]
+        self.assertEqual((row.get("kind"), row.get("lift"), row.get("ev_t"), row.get("endEv")),
+                         ("awaiting", True, turn["t"], T0 + 20),
+                         "anchored at the trigger; the horizon is the reply, the turn's last event")
+
+    def test_b_the_closers_done_through_close_turn_journals_the_same_horizon(self):
+        turn = _turn()
+        s, nd = self._stamped(turn)
+        jd.closer_llm = lambda tt, mt, *_a: ('{"done": [{"goal": 1, "why": "the index rebuilt and shipped"}],'
+                                             ' "block": []}')
+        self.assertEqual(jd._close_turn(s, turn), [nd["id"]])
+        row = next(e for e in reversed(nd["log"]) if e.get("kind") == "done")
+        self.assertEqual((row.get("src"), row.get("ev_t"), row.get("endEv")), ("closer", turn["t"], T0 + 20),
+                         "the done ruled on the whole turn too: the same horizon as the lift")
+
+    def test_c_an_idle_tail_turns_horizon_is_the_stop_transition_not_the_parse_clock(self):
+        # the session went idle after the reply (a real Stop transition in states/) and nothing followed:
+        # the idle atom runs to the parse clock, so turn["end"] IS the clock, arrival by another name.
+        # The horizon is the newest recorded EVENT the closer's transcript could show it: the transition
+        turn = _turn(states=[{"t": T0 + 25, "state": "waiting"}])
+        self.assertEqual(turn["end"], NOW, "fixture: the tail turn's end is the parse clock")
+        s, nd = self._stamped(turn)
+        jd.closer_llm = lambda tt, mt, *_a: '{"done": [], "block": []}'
+        self.assertEqual(jd._close_turn(s, turn), [])
+        row = nd["log"][-1]
+        self.assertTrue(row.get("lift"), "fixture: the closer's lift")
+        self.assertEqual(row.get("endEv"), T0 + 25, "the Stop transition, a recorded event, never the clock")
 
 
 class DeadlockedChainHeals(unittest.TestCase):
