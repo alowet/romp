@@ -2299,12 +2299,14 @@ def _fire_debt_reminder(sid, now, alive_ids):
     """Send the reminder for every not-yet-reminded ask this session owes; True when one went out. The
     per-ask dedup key (asker>debtor:ts) makes this once-per-ask-EVER — escalation past an ignored
     reminder belongs to the sender's card (the nudge-failed ladder), not to repeat reminders.
-    Records AFTER the send, so a failed send retries (_mark_auto_nudged's direction) — and the record
-    write RE-READS the blob fresh under _NUDGE_LOCK and mutates only debtNudged, the key this writer
-    owns. The old shape held a pre-send snapshot across the live send and wrote the whole blob back:
-    last-writer-wins over every key, so it erased whatever a concurrent writer landed in the gap —
-    including _compact_suggest_tick's claim-before-send latch, which re-opened the double send the
-    claim exists to close (2026-09-01)."""
+    Records BEFORE the send and sends only when the record landed (review find, 2026-09-08, the nudge
+    fire site's rule: it recorded after, so a failed send would retry, but a record the writer refused
+    on a full disk let an unrecorded reminder out again every tick), and the record write RE-READS the
+    blob fresh under _NUDGE_LOCK and mutates only debtNudged, the key this writer owns. The old shape
+    held a pre-send snapshot across the live send and wrote the whole blob back: last-writer-wins over
+    every key, so it erased whatever a concurrent writer landed in the gap, including
+    _compact_suggest_tick's claim-before-send latch, which re-opened the double send the claim exists
+    to close (2026-09-01)."""
     asks = _debt_asks(sid, alive_ids)
     if not asks:
         return False
@@ -2317,14 +2319,19 @@ def _fire_debt_reminder(sid, now, alive_ids):
            if ("%s>%s:%d" % (asker, sid, ts)) not in dn0]
     if not due:
         return False
+    try:
+        with _NUDGE_LOCK:
+            d = dict(_auto_nudge_data())
+            dn = dict(d.get("debtNudged") or {})
+            for asker, _n, ts, _k, _h in due:
+                dn["%s>%s:%d" % (asker, sid, ts)] = int(now)
+            d["debtNudged"] = dn
+            landed = _write_auto_nudge(d)
+    except OSError:
+        landed = False                                 # said once per fault episode by the writer
+    if not landed:
+        return False                                   # nothing sent whose record could not land
     Sessions.backend_for(sid).send(sid, _debt_reminder_body([(n, t, k, h) for _a, n, t, k, h in due]))
-    with _NUDGE_LOCK:
-        d = dict(_auto_nudge_data())
-        dn = dict(d.get("debtNudged") or {})
-        for asker, _n, ts, _k, _h in due:
-            dn["%s>%s:%d" % (asker, sid, ts)] = int(now)
-        d["debtNudged"] = dn
-        _write_auto_nudge(d)
     return True
 
 
@@ -4234,7 +4241,7 @@ def _ledger_read(p, cache, default, what, normalize=None, lock=None, _tries=3):
     except FileNotFoundError:
         return _ledger_proved(what, default())
     except OSError as e:
-        return _ledger_unproved(p, cache, default, what, "stat failed: %s" % e)
+        return _ledger_unproved(p, cache, default, what, "stat failed: %s" % _oserror_text(e))
     key = (st.st_mtime_ns, st.st_size)
     hit = cache.get(str(p))
     if hit is not None and hit[0] == key:
@@ -4245,7 +4252,7 @@ def _ledger_read(p, cache, default, what, normalize=None, lock=None, _tries=3):
     except FileNotFoundError:
         return _ledger_proved(what, default())   # removed between the stat and the read: absent
     except OSError as e:
-        return _ledger_unproved(p, cache, default, what, "read failed: %s" % e)
+        return _ledger_unproved(p, cache, default, what, "read failed: %s" % _oserror_text(e))
     except UnicodeError as e:
         reason = "not UTF-8: %s" % e
     if reason is None:
@@ -4294,6 +4301,15 @@ def _ledger_unproved(p, cache, default, what, fault):
     d = dict(hit[1]) if hit is not None else default()
     d[UNPROVED] = fault
     return d
+
+
+def _oserror_text(e):
+    """errno + strerror ONLY — never str(e): that names the path(s), and a quarantine destination or a
+    write's temp file carries a per-second stamp or a per-call sequence, so a text built from it changed
+    on every fault and every once-per-fault-text dedupe fired every time. The reader's stat/read faults
+    wear it too (review find, 2026-09-08): their text rides the settingStale frame's `why` and the error
+    center, and an absolute state path has no business there."""
+    return ("[Errno %d] %s" % (e.errno, e.strerror)) if getattr(e, "errno", None) is not None else type(e).__name__
 
 
 def _ledger_quarantine(p, st, what, reason):
@@ -4354,8 +4370,12 @@ def _ledger_write_proved(p, what, d, cache, normalize=None):
     stderr line and one error-center row, keyed on the stamp-free errno text in the writer's OWN registry
     (_ledger_write_failed: a proved read clears the read registries, but only a landed write proves the disk
     takes writes again) — and then re-raised, so the caller that owns a gesture answers its socket (the
-    setting toggles through _note_refused_gesture, the interrupt through its warn toast) and a tick's caller
-    is covered by its own wrap. Left silent at the caller, a refused write looked like one that landed."""
+    setting toggles through _note_refused_gesture, the interrupt through its warn toast), and a tick's leg
+    that RECORDS what it sends writes the record FIRST and sends only when it landed (_auto_nudge_session,
+    _wake_goal, _fire_debt_reminder; the walk-gate journal, re-derived every tick, just waits for the next
+    one). A wrap around the tick is no boundary (review find, 2026-09-08): it hides the traceback after the
+    unrecorded message has gone out, and the next cycle sends it again. Left silent at the caller, a refused
+    write looked like one that landed."""
     fault = d.get(UNPROVED) if isinstance(d, dict) else None
     if fault:
         if _ledger_refusal_warned.get(what) != fault:
@@ -6005,7 +6025,10 @@ def _mark_auto_nudged(gid, turn_id, count, arm_atoms=None, at=None):
     failed-stamp's response-arrival gate compares against it (the 2026-07-19 network g1 race). `at` is the
     fire time — the failed-stamp's parse-lag guard measures its 6h backstop from it (the user 2026-07-24:
     a stamp raced the parse of a second, still-landing nudge turn and blocked two goals whose response
-    resolved them; the guard waits for the response segment to become VISIBLE, bounded by the backstop)."""
+    resolved them; the guard waits for the response segment to become VISIBLE, bounded by the backstop).
+    Returns the writer's verdict (True landed, False refused over an unproved snapshot) and lets a write
+    fault's OSError propagate: the fire site records BEFORE it sends and sends only on True (review find,
+    2026-09-08; see _auto_nudge_session)."""
     with _NUDGE_LOCK:
         d = dict(_auto_nudge_data())
         nudged = dict(d.get("nudged", {}))
@@ -6019,7 +6042,7 @@ def _mark_auto_nudged(gid, turn_id, count, arm_atoms=None, at=None):
         if len(nudged) > 3000:                                  # bounded; drop the oldest
             nudged = dict(list(nudged.items())[-3000:])
         d["nudged"] = nudged
-        _write_auto_nudge(d)
+        return _write_auto_nudge(d)
 
 
 _auto_nudge_drops_pending = set()   # gids whose spent-record drop was refused under a fault; replayed by the first proved pass
@@ -6984,8 +7007,9 @@ def _compact_suggest_tick(sid, tm, now):
 
 # The tick is SINGLE-FLIGHT (PR #943 review): it has two concurrent entry points — the pusher's
 # periodic pass (0.5 s backstop) and the setAutoNudge / setCompactSuggest arms' act-now pass on the
-# WS handler thread — and the nudge send has no claim-before-send (_mark_auto_nudged records AFTER
-# the send so a failed send retries; _compact_suggest_tick's latch covers only its own seam), so two
+# WS handler thread, and the nudge's record is no CLAIM (_mark_auto_nudged writes it before the send
+# since 2026-09-08, but not as a compare-and-set on the arm; _compact_suggest_tick's latch covers only
+# its own seam), so two
 # passes that overlapped each derived the same due goal from the same store and injected the same
 # nudge twice into one session — reproduced from two threads at the 0.5 s cadence. A non-blocking
 # try-acquire, never a wait: the loser stands down whole, and loses nothing. The flag write precedes
@@ -7189,13 +7213,15 @@ AWAITING_BACKSTOP_TEXT = (
 
 def _put_nudged(gid, rec):
     """Persist ONE nudge/wake record into auto-nudge.json's `nudged` ledger — the read-modify-write the
-    failed stamp already does inline, shared so the wake's answered/fired records take the same shape."""
+    failed stamp already does inline, shared so the wake's answered/fired records take the same shape.
+    Returns the writer's verdict and lets a write fault propagate (_mark_auto_nudged's contract): the wake's
+    fire site gates its send on it."""
     with _NUDGE_LOCK:
         d = dict(_auto_nudge_data())
         nudged = dict(d.get("nudged", {}))
         nudged[gid] = rec
         d["nudged"] = nudged
-        _write_auto_nudge(d)
+        return _write_auto_nudge(d)
 
 
 # The walk→sweep handoff journal (the user 2026-08-24, retiring the 6h ownership window): the walk
@@ -7215,7 +7241,10 @@ WALK_GATES_WEDGE = ("api-error", "parse-failed", "empty-parse", "all-delegated",
 def _put_walk_gate(key, gate, now):
     """Journal the gate the nudge walk returned on for `key` (a sid, or a gid for per-goal skips).
     Write-on-change only, and the FIRST gate's `at` is kept when only the name flaps (the deferral
-    map's precedent), so a flapping compacting bit can't churn the file at the 0.5-3s tick."""
+    map's precedent), so a flapping compacting bit can't churn the file at the 0.5-3s tick.
+    A write fault is the writer's line, once per episode, and nothing more here (review find, 2026-09-08):
+    the entry is re-derived by every walk, so a journal write that did not land is simply written next
+    tick; it used to rise into the pass's per-session wrap as a traceback per tick."""
     with _NUDGE_LOCK:
         d = dict(_auto_nudge_data())
         gates = dict(d.get("walkGates", {}))
@@ -7224,17 +7253,24 @@ def _put_walk_gate(key, gate, now):
             return
         gates[key] = {"gate": gate, "at": int((cur or {}).get("at") or now)}
         d["walkGates"] = gates
-        _write_auto_nudge(d)
+        try:
+            _write_auto_nudge(d)
+        except OSError:
+            pass                                             # said once per episode by the writer; retried next tick
 
 
 def _pop_walk_gate(key):
-    """The walk got PAST the gate for `key` — the entry's own retirement event."""
+    """The walk got PAST the gate for `key`: the entry's own retirement event. A refused write waits
+    for the next walk past the gate, as _put_walk_gate's does."""
     with _NUDGE_LOCK:
         d = dict(_auto_nudge_data())
         gates = dict(d.get("walkGates", {}))
         if gates.pop(key, None) is not None:
             d["walkGates"] = gates
-            _write_auto_nudge(d)
+            try:
+                _write_auto_nudge(d)
+            except OSError:
+                pass                                         # said once per episode by the writer; retried next tick
 
 
 def _last_awaiting_is_lift(nd):
@@ -8048,12 +8084,23 @@ def _wake_goal(sid, gid, stamp, nudged, turns, store, now, lt, tmux, wake_only=F
         _mark_views_dirty()
         _drop_auto_nudge_rec(gid)                    # the spent episode's residue goes with the wait
         return True
+    # RECORD BEFORE SEND (review find, 2026-09-08), the nudge fire site's rule (_auto_nudge_session): a
+    # wake whose record the writer refused (a full or read-only disk raising out of _put_nudged) had
+    # already gone out, so the same wake went out again every tick the session read idle, with no record
+    # to judge its response against. Nothing is sent whose record did not land; the writer said the fault
+    # once per episode, and the next tick re-derives the same due wake against the healed disk.
+    wake = {"wake": True, "anchor": at, "count": (rec.get("count") or 0) + 1,
+            "lastTurnId": lt.get("id"), "armAtoms": len(lt.get("atoms") or []), "at": int(now)}
+    try:
+        landed = _put_nudged(gid, wake)
+    except OSError:
+        landed = False                               # said once per fault episode by the writer
+    if not landed:
+        return False
+    nudged[gid] = wake                               # mirror in-memory for the rest of this tick
     Sessions.backend_for(sid).send(sid, _followup_body(gid, None, AWAITING_BACKSTOP_TEXT,
                                                        injected=True, auto=True, wake=True))
     _nudge_deferred_ok(gid, "", now, sid)            # the hold is over — drop any deferral record
-    nudged[gid] = {"wake": True, "anchor": at, "count": (rec.get("count") or 0) + 1,
-                   "lastTurnId": lt.get("id"), "armAtoms": len(lt.get("atoms") or []), "at": int(now)}
-    _put_nudged(gid, nudged[gid])
     _log_nudge_event(sid, gid, now, 0)               # timeline romp-logo dot (count 0 marks a wake, not an escalation)
     return True
 
@@ -9048,6 +9095,26 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only
             _bnodes = _fr.get("nodes") or nodes      # the bundle body renders the same fresh world
         except Exception:
             pass
+    if to_fire:
+        # RECORD BEFORE SEND (review find, 2026-09-08). The record used to follow the send so a failed send
+        # would retry, but a record the WRITER refused (a full or read-only disk: _ledger_write_proved
+        # raises) left a nudge already out with no ledger row behind it. The goal then read as never
+        # nudged, so the same stall was nudged again after every response cycle for as long as the disk
+        # refused writes, the redundancy judge's skip (its own _put_nudged refused) fell through to a fire,
+        # and with no record to climb from the escalation ladder never reached needs-you: the every-cycle
+        # re-nudge the read-fault pause exists to prevent, on the write side, hidden under the per-session
+        # wrap's traceback. Now every due record lands FIRST ({count, lastTurnId, armAtoms, at}: re-arm
+        # only on the next GENUINE ended-working turn; a fresh record resets `failed`), and nothing goes
+        # out whose record did not. The writer said the fault once per episode, so this leg says nothing
+        # and the next tick re-derives the same due goal against the healed disk. A send that raises after
+        # its record landed reaches the per-session wrap as before; the record stands, so it is not repeated.
+        try:
+            landed = all([_mark_auto_nudged(gid, arm_id, count, len(arm.get("atoms") or []), at=now)
+                          for gid, count, _stalled in to_fire])
+        except OSError:
+            landed = False                           # said once per fault episode by the writer
+        if not landed:
+            return fired                             # nothing sent whose record could not land
     if len(to_fire) == 1:
         gid, count, stalled = to_fire[0]
         text = _nudge_text(count, stalled)             # variant by escalation count — a repeat re-asks in fresh words
@@ -9060,7 +9127,6 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only
     for gid, count, stalled in to_fire:
         _nudge_deferred_ok(gid, "", now, sid)        # the hold is over — drop any deferral record so a stale
         #                                              why can never outlive the wait it described
-        _mark_auto_nudged(gid, arm_id, count, len(arm.get("atoms") or []), at=now)   # {count, lastTurnId, armAtoms, at} → re-arm only on the next GENUINE ended-working turn; a fresh record resets `failed`
         _log_nudge_event(sid, gid, now, count,       # timeline romp-logo dot + escalation count; the row
                          verdict=_verdicts.get(gid, ("fired",))[0],   # says HOW it fired and what evidence
                          ev_t=recent_ts)             # it survived (the 2026-08-25 instrumentation)

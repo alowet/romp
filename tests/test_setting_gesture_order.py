@@ -541,12 +541,17 @@ class StoreWriteFailureIsLoudAndContained(_Base):
 
     def _fail_writes(self, exc=None):
         """Patch Path.write_text to raise OSError on every call from now (both stores publish
-        via _atomic_write, whose temp-file write funnels through it)."""
+        via _atomic_write, whose temp-file write funnels through it). The raise carries the REAL
+        shape (errno, strerror and the path being written, which for a publish is the temp file
+        with its per-call sequence), so a fault text built from str(e) would differ on every call
+        and the once-per-episode and never-the-temp-path assertions below would catch it (review
+        find, 2026-09-08). Default: a read-only STATE dir."""
         import pathlib
         orig = pathlib.Path.write_text
+        e = exc or OSError(errno.EROFS, "Read-only file system")
 
         def failing(p, *a, **k):
-            raise exc or OSError("simulated full disk")
+            raise OSError(e.errno, e.strerror, str(p))
 
         pathlib.Path.write_text = failing
         return lambda: setattr(pathlib.Path, "write_text", orig)
@@ -660,6 +665,38 @@ class StoreWriteFailureIsLoudAndContained(_Base):
             restore()
         self.assertEqual(err.getvalue().count("write failed"), 1, "a landed write ended the episode: a new fault speaks again")
         self.assertEqual(len(km._SDK_BOOT_PROBLEMS), 2)
+
+    def test_a_direct_setter_refusal_never_rides_an_unrelated_gesture(self):
+        """A setter called OUTSIDE a WS arm (a direct call: nothing pops its verdict) leaves the refused-write
+        verdict on the thread. The next gt-gated gesture on that thread clears it at its own stand-down check
+        (_setting_stale clears `refused` alongside `last`), so an unrelated gesture that then reaches
+        _tell_stale_gesture (its own write refused under the same fault, or applied) never answers its
+        socket with a frame naming a setting it did not touch (review find, 2026-09-08)."""
+        self.assertEqual(km._set_auto_nudge(True, gt=T_OLD), T_OLD)
+        sent = []
+        client = {"send": lambda s: sent.append(json.loads(s)), "alive": True}
+        restore = self._fail_writes()
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(km._set_auto_nudge(False, gt=T_NEW), "refused: the write failed")
+                self.assertEqual((km._stale_seen.refused or {}).get("setting"), "auto-nudge",
+                                 "a direct call leaves its verdict on the thread: nothing popped it")
+                # an UNRELATED gesture, its own write refused under the same fault: the frame it answers, if
+                # any, must be about update-mode; a leaked auto-nudge verdict would ride out here
+                km.Handler._dispatch_ws(types.SimpleNamespace(), {"type": "setUpdateMode", "mode": "auto", "gt": T_NEW}, client)
+                self.assertEqual([m.get("setting") for m in sent if m.get("type") == "settingStale"], [],
+                                 "update-mode's refused write records no notice of its own, and auto-nudge's never rides it")
+                self.assertIsNone(km._stale_seen.refused, "the unrelated gesture's check cleared the stale verdict")
+                self.assertIsNone(km._set_auto_nudge(False, gt=T_NEW + 1), "refused again: a fresh verdict on the thread")
+                self.assertEqual((km._stale_seen.refused or {}).get("setting"), "auto-nudge")
+        finally:
+            restore()
+        # the disk healed: an unrelated APPLYING gesture pops nothing (the setter returned a stamp), and the
+        # stale verdict must not be waiting there for whichever refusal comes next
+        km.Handler._dispatch_ws(types.SimpleNamespace(), {"type": "setUpdateMode", "mode": "off", "gt": T_NEW + 2}, client)
+        self.assertEqual([m for m in sent if m.get("type") == "settingStale"], [], "an APPLYING gesture answers no frame")
+        self.assertIsNone(km._stale_seen.refused, "…and its check cleared the verdict left by the direct call")
+        self.assertEqual(km._update_mode(), "off", "…and applied")
 
 
 class StaleGestureAnswersTheDeliveringSocket(_Base):

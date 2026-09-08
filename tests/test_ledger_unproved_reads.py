@@ -150,6 +150,17 @@ class ReadFault(_Ledger):
         self.assertEqual(self.p.read_bytes(), before)
         self.assertTrue(str(d.get(UNPROVED, "")).startswith("stat failed"))
 
+    def test_the_fault_text_carries_the_errno_never_the_path(self):
+        # the tag rides the settingStale frame's `why` and the error-center row: errno + strerror only, the
+        # writer's shaping (_oserror_text), so no absolute path leaves the kernel (review find, 2026-09-08)
+        self._seed()
+        for method, arm in (("stat", "stat failed"), ("read_text", "read failed")):
+            self._fail(method, OSError(errno.EIO, "Input/output error", str(self.p)))
+            with contextlib.redirect_stderr(io.StringIO()):
+                d = km._auto_nudge_data()
+            self._heal()
+            self.assertEqual(d.get(UNPROVED), "%s: [Errno 5] Input/output error" % arm, method)
+
     def test_the_snapshot_is_a_copy_of_the_last_proved_one_tagged_with_the_fault(self):
         self._seed()
         proved = km._auto_nudge_data()                     # a proved read fills the cache
@@ -456,8 +467,8 @@ class _InterruptTickRig(unittest.TestCase):
         km._interrupt_marks = lambda turns, sid="": self.marks
         self.recorded, self.lifted, self.pushes = [], [], []
         km._record_interrupt_block = lambda sid, ev: self.recorded.append((sid, ev)) or GID
-        km._lift_interrupt_block = lambda sid, gid, ev: self.lifted.append((sid, gid, ev)) or True   # True: spent (the
-        #                                                  #1019 contract; False keeps the marker for a goals-store fault)
+        km._lift_interrupt_block = lambda sid, gid, ev: self.lifted.append((sid, gid, ev)) or True   # spent; the real
+        #                                            one returns False only on a goal-store read fault, keeping the marker (PR #1019)
         km._intr_block_stands = lambda sid, gid: True
         km._push_all = lambda *a, **k: self.pushes.append(1)
         self._undo = []

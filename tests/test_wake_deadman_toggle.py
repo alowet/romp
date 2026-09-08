@@ -398,5 +398,135 @@ class UnreadableLedgerPausesThePass(_Base):
                           "the head gate proved: the leg refused on its own, not the pause")
 
 
+class UnwritableLedgerSendsNothing(_Base):
+    """…and nothing goes out whose record cannot LAND (review find, 2026-09-08). The pass gates on the READ
+    tag, but a WRITE fault (a full or read-only disk) refused the record only AFTER the nudge had gone out:
+    the OSError rose into the per-session wrap as a traceback every tick, the unrecorded goal read as never
+    nudged, and the same stall was nudged again after every response cycle for as long as the disk refused
+    writes, with the redundancy judge's skip falling through to a fire and the escalation ladder never
+    climbing. Now the nudge and the wake record BEFORE they send and send only when the record landed; the
+    walk-gate journal, re-derived every tick, waits quietly for the next one. The writer says the fault once
+    per episode (stderr + the error center); the first pass after the disk heals sends once and records it."""
+
+    def setUp(self):
+        super().setUp()
+        vars(km).get("_auto_nudge_paused", [None])[0] = None
+        for reg in ("_ledger_fault_warned", "_ledger_refusal_warned", "_ledger_write_failed"):
+            vars(km).get(reg, {}).clear()
+        self.problems = len(km._SDK_BOOT_PROBLEMS)
+        self.ledger = jd.STATE / "auto-nudge.json"
+
+    def _write_fault(self, exc):
+        """km._atomic_write raises `exc`'s errno for the ledger only, naming a temp path with a per-call
+        sequence the way the real publish does: a fault text built from str(e) would then differ on every
+        call, and the once-per-episode assertions below would catch it."""
+        real, target, calls = km._atomic_write, str(self.ledger), [0]
+
+        def failing(path, text, mode=None):
+            if str(path) == target:
+                calls[0] += 1
+                raise OSError(exc.errno, exc.strerror, "%s.tmp.1.2.%d" % (target, calls[0]))
+            return real(path, text, mode)
+        km._atomic_write = failing
+        self.addCleanup(setattr, km, "_atomic_write", real)
+        return lambda: setattr(km, "_atomic_write", real)
+
+    ENOSPC = OSError(errno.ENOSPC, "No space left on device")
+    EACCES = OSError(errno.EACCES, "Permission denied")
+
+    def _nothing_until_the_heal(self, exc, what):
+        """Three faulted passes send nothing and say the fault once; the first pass after the heal sends
+        once. Returns the goal's landed record."""
+        before = self.ledger.read_bytes()
+        heal = self._write_fault(exc)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._tick(); self._tick(NOW + 5); self._tick(NOW + 10)
+        self.assertEqual(self.fb.sent, [], "a %s whose record cannot land is not sent" % what)
+        self.assertEqual(self.ledger.read_bytes(), before, "the file keeps what it holds")
+        self.assertEqual(err.getvalue().count("write failed"), 1, "said once per fault episode, not per tick")
+        self.assertNotIn("Traceback", err.getvalue(), "no per-session traceback per tick: the leg stood down itself")
+        self.assertEqual(len(km._SDK_BOOT_PROBLEMS), self.problems + 1, "one error-center row per episode")
+        self.assertIn(exc.strerror, km._SDK_BOOT_PROBLEMS[-1]["text"])
+        self.assertNotIn(".tmp.", km._SDK_BOOT_PROBLEMS[-1]["text"], "errno + strerror only: never the temp path")
+        heal()
+        with contextlib.redirect_stderr(err):
+            self._tick(NOW + 60)
+        self.assertEqual(len(self.fb.sent), 1, "the first pass after the heal sends once: the landed write is the event")
+        self.assertEqual(err.getvalue().count("write failed"), 1, "…and says nothing more")
+        return km._auto_nudge_data()["nudged"][self.gid]
+
+    def test_control_a_stalled_goal_draws_one_nudge_when_the_ledger_writes(self):
+        self._toggle(True)
+        self._seed(stamped=False, delegated=False)       # an unstamped working top: the plain nudge's shape
+        self._tick(); self._tick(NOW + 5)
+        self.assertEqual(len(self.fb.sent), 1, "the path is reached: one status check goes out, once")
+        self.assertEqual(km._auto_nudge_data()["nudged"][self.gid].get("lastTurnId"), "t1", "…and is recorded")
+
+    def test_enospc_a_nudge_is_not_sent_until_its_record_lands(self):
+        self._toggle(True)
+        self._seed(stamped=False, delegated=False)
+        rec = self._nothing_until_the_heal(self.ENOSPC, "nudge")
+        self.assertEqual((rec.get("count"), rec.get("lastTurnId")), (1, "t1"), "the healed pass's record")
+        self.assertNotIn(km.AWAITING_BACKSTOP_TEXT, self.fb.sent[0][1], "…for the plain nudge it sent")
+
+    def test_eacces_a_nudge_is_not_sent_until_its_record_lands(self):
+        self._toggle(True)
+        self._seed(stamped=False, delegated=False)
+        rec = self._nothing_until_the_heal(self.EACCES, "nudge")
+        self.assertEqual(rec.get("count"), 1)
+
+    def test_a_wake_is_not_sent_until_its_record_lands(self):
+        self._toggle(True)
+        self._seed(kind="job", age=7 * H)                # the shape NudgesOnKeepTheCheckIn fires one wake for
+        rec = self._nothing_until_the_heal(self.ENOSPC, "wake")
+        self.assertTrue(rec.get("wake"), "the healed pass's wake record")
+        self.assertEqual(len(self._wakes()), 1)
+
+    def test_a_debt_reminder_is_not_sent_until_its_record_lands(self):
+        # the same shape on the debt leg: it recorded after the send, and a refused record let the reminder
+        # out again every tick (the read-tag check above it covers only a fault the READER saw)
+        self._toggle(True)
+        orig = km._debt_asks
+        km._debt_asks = lambda sid, alive: [("66666666-7777-8888-9999-000000000000", "web", NOW - 1800,
+                                              "question", "Which port should the staging server use?")]
+        self.addCleanup(setattr, km, "_debt_asks", orig)
+        before = self.ledger.read_bytes()
+        heal = self._write_fault(self.ENOSPC)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._tick(); self._tick(NOW + 5)
+        self.assertEqual(self.fb.sent, [], "a reminder whose record cannot land is not sent")
+        self.assertEqual(self.ledger.read_bytes(), before)
+        self.assertEqual(err.getvalue().count("write failed"), 1)
+        self.assertNotIn("Traceback", err.getvalue())
+        heal()
+        with contextlib.redirect_stderr(err):
+            self._tick(NOW + 60); self._tick(NOW + 65)
+        self.assertEqual(len(self.fb.sent), 1, "the first pass after the heal sends once, and the record dedupes the next")
+        self.assertIn("web", self.fb.sent[0][1])
+        self.assertEqual(len(km._auto_nudge_data().get("debtNudged") or {}), 1)
+
+    def test_the_walk_gate_journal_waits_for_the_next_tick_without_a_traceback(self):
+        # a gated session journals its gate (walkGates) on the way out of the walk; that entry is
+        # re-derived every tick, so a refused write is simply written next time, never a traceback per tick
+        self._toggle(True)
+        self._seed(stamped=False, delegated=False)
+        km._compacting_now = lambda sid: True             # the session is gated: no nudge, a journal entry
+        heal = self._write_fault(self.ENOSPC)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._tick(); self._tick(NOW + 5)
+        self.assertEqual(self.fb.sent, [])
+        self.assertEqual(err.getvalue().count("write failed"), 1)
+        self.assertNotIn("Traceback", err.getvalue(), "the journal write's fault is the writer's line, nothing more")
+        self.assertNotIn(SID, km._auto_nudge_data().get("walkGates", {}), "nothing landed while the disk refused")
+        heal()
+        with contextlib.redirect_stderr(err):
+            self._tick(NOW + 60)
+        self.assertEqual(km._auto_nudge_data()["walkGates"][SID]["gate"], "needs-input", "the next tick journals it")
+        self.assertEqual(self.fb.sent, [], "still gated: nothing sent")
+
+
 if __name__ == "__main__":
     unittest.main()

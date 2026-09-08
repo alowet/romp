@@ -871,7 +871,11 @@ parse: the file is renamed `<name>.corrupt-<UTC stamp>` beside the original
 error center says so, and the ledger reads as a fresh install until you
 restore it from that file. Nothing is deleted. Any other read fault leaves the
 file untouched: the kernel serves the last copy it read, writes nothing to it,
-and says so once, until the file reads again.
+and says so once, until the file reads again. A write that fails (a full or
+read-only disk) is told to the gesture that asked, the gear's toast or the
+stop button's warning, and said once per fault episode in the error center;
+the automatic pass sends nothing whose record could not land, and the file
+keeps what it holds.
 
 ## Switches
 

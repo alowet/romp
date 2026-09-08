@@ -209,6 +209,18 @@ class LedgerFaultsNeverEraseSiblings(unittest.TestCase):
     def _aside(self):
         return sorted(n for n in os.listdir(self.dir) if n.startswith("retry-suppressed.json.corrupt-"))
 
+    @staticmethod
+    def _full_disk():
+        """A stand-in for km._atomic_write on a full disk: ENOSPC naming the TEMP path with a per-call
+        sequence, the shape the real publish raises: a fault text built from str(e) would then differ on
+        every call, and the once-per-episode assertions below would catch it (review find, 2026-09-08)."""
+        calls = [0]
+
+        def full(path, text, mode=None):
+            calls[0] += 1
+            raise OSError(errno.ENOSPC, "No space left on device", "%s.tmp.1.2.%d" % (path, calls[0]))
+        return full
+
     def test_a_missing_file_reads_as_nobody_suppressed_with_no_log(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -254,8 +266,7 @@ class LedgerFaultsNeverEraseSiblings(unittest.TestCase):
     def test_enospc_on_the_write_is_reported_to_the_click_not_raised(self):
         before = self._seed()
 
-        def full(*a, **k):
-            raise OSError(errno.ENOSPC, "No space left on device")
+        full = self._full_disk()
         km._atomic_write = full
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -278,8 +289,7 @@ class LedgerFaultsNeverEraseSiblings(unittest.TestCase):
         km.Sessions.backend_for = lambda sid: types.SimpleNamespace(interrupt=lambda sid: cuts.append(sid))
         real_write = km._atomic_write
 
-        def full(*a, **k):
-            raise OSError(errno.ENOSPC, "No space left on device")
+        full = self._full_disk()
         km._atomic_write = full
         sent, err = [], io.StringIO()
         client = {"app": "chat", "alive": True, "send": lambda s: sent.append(json.loads(s))}
@@ -310,8 +320,7 @@ class LedgerFaultsNeverEraseSiblings(unittest.TestCase):
         before = self._seed()
         self.assertTrue(km._session_retry_suppressed("s1"))
 
-        def full(*a, **k):
-            raise OSError(errno.ENOSPC, "No space left on device")
+        full = self._full_disk()
         km._atomic_write = full
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
