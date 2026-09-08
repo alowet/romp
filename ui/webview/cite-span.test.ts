@@ -34,7 +34,7 @@ test("the landing highlights with zero DOM surgery, and falls back honestly", ()
     "the CSS Custom Highlight API — the ever-re-rendering turn list is never mutated");
   assert.match(fn, /if \(!H \|\| typeof Highlight === "undefined"\) return;/, "no API → today's whole-message landing");
   assert.match(fn, /if \(!m\) return;\s*\/\/ unfindable in the rendered text → no highlight, no guess/);
-  assert.match(fn, /scrollIntoView\(\{ block: "center", behavior: "auto" \}\)/, "land ON the sentence, not the message top");
+  assert.match(fn, /scrollElInto\(content0, el0, "center", "land-on"\)/, "land ON the sentence, not the message top — through the write helper, attributed (T262j)");
   assert.match(CSS, /::highlight\(cite-span\) \{ background-color: color-mix\(in srgb, var\(--accent\) 30%, transparent\);/,
     "accent-tinted, never a status colour (via the token, so the light theme re-inks it)");
 });
