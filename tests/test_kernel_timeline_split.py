@@ -17,6 +17,8 @@ the cache's age, not a fact about the lane).
 import inspect
 import json
 import os
+import shutil
+import subprocess
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -70,6 +72,48 @@ class BuildGating(unittest.TestCase):
         self.assertIn("if(window.__rompFed&&window.__rompFed.onFrame)window.__rompFed.onFrame(frameListener);", boot)
         self.assertLess(boot.index('window.addEventListener("message",frameListener);'),
                         boot.index("window.__rompFed.onFrame(frameListener)"), "window first, the registry after it")
+
+    def test_the_host_shim_run_one_wrapped_listener_registered_with_federation_reaches_the_panel(self):
+        # The boot RUN (review find, 2026-09-08; moved here from the TypeScript lane, which must not break on a
+        # kernel edit): the self-contained IIFE under node's vm with the three window slots it reads stood in.
+        # One window listener, the perf-wrapped one; the registry gets that same function, so a frame arrives
+        # once whichever path carries it; a frame through the registry reaches the connected panel.
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        fx = tempfile.mkdtemp()
+        with open(os.path.join(fx, "boot.js"), "w") as f:
+            f.write(km._TIMELINE_BOOT)
+        with open(os.path.join(fx, "run.js"), "w") as f:
+            f.write(r"""
+var vm = require("vm"), fs = require("fs");
+var boot = fs.readFileSync(process.argv[2], "utf8");
+var listeners = [], registered = [], updates = [], posted = [], wrapped = new Map();
+var win = {
+  acquireVsCodeApi: function () { return { postMessage: function (m) { posted.push(m); } }; },
+  addEventListener: function (t, h) { if (t === "message") listeners.push(h); },
+  __rompPerf: { wrapFrameHandler: function (h) { var w = function (e) { return h(e); }; wrapped.set(w, h); return w; } },
+  __rompFed: { onFrame: function (h) { registered.push(h); return function () {}; } },
+};
+win.window = win;
+vm.runInNewContext(boot, { window: win, HTMLElement: { prototype: {} }, document: {}, URL: URL });
+var out = { listeners: listeners.length, wrappedIsListener: wrapped.has(listeners[0]),
+            registeredSame: registered.length === 1 && registered[0] === listeners[0] };
+win.__rompConnectTimeline({ update: function (d) { updates.push(d); } });
+out.posted = posted.map(function (m) { return m.type; });
+registered[0]({ data: { type: "data", data: { lanes: 1 } } });
+out.updates = updates;
+process.stdout.write(JSON.stringify(out));
+""")
+        r = subprocess.run([node, os.path.join(fx, "run.js"), os.path.join(fx, "boot.js")],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out["listeners"], 1, "one window listener")
+        self.assertTrue(out["wrappedIsListener"], "…the wrapped one, so its frames are timed by type")
+        self.assertTrue(out["registeredSame"], "the SAME function is registered with federation: no frame arrives twice")
+        self.assertEqual(out["posted"], ["ready"], "the connect handshake")
+        self.assertEqual(out["updates"], [{"lanes": 1}], "a frame through the registry reached the panel")
 
     def test_the_lanes_skeleton_does_not_parse_any_transcript(self):
         # cold-start speed (the user 2026-06-26): a fresh kernel (the refresh button = POST /restart) re-parses

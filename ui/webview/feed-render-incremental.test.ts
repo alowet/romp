@@ -347,24 +347,33 @@ test("column placement and the order walk are not gated: a changed session order
   assert.deepEqual(nameRebuilds(), before);
 });
 
-test("Revive latches on the click and re-arms on the kernel's err frame for the card's session, its idle label restored; a re-emit and another session's err leave the latch", async () => {
-  const parked = { ...card("g3")._it, blocked: { state: "parkedHandoff", toSid: API, toName: "api", what: "api is offline" } };
-  await dispatch(frame([g1, card("g2")._it, parked], { working: ["web"] }));
-  const revive = card("g3")._revive;
+test("Revive latches on the click and re-arms on the kernel's reviveFailed for the revived session, its idle label restored and the reason toasted; a re-emit, another session's failure and an err for a different request leave the latch", async () => {
+  // the kernel's parked-handoff card (build_feed): its sid IS the recipient the button revives (sid and blocked.toSid
+  // are both the parked message's toId), so the kernel's reviveFailed, keyed by the revived id, names this card
+  const p1 = cardOf("parked:m1", API, "api", "#cc6633", "Hand-off parked for api (offline)", "needs_input",
+    { live: false, tree: [], blocked: { state: "parkedHandoff", toSid: API, toName: "api", what: "a handoff from web is parked: revive api to deliver it" } });
+  await dispatch(frame([g1, card("g2")._it, g3, p1], { working: ["web"] }));
+  const revive = card("parked:m1")._revive;
   assert.equal(revive.style.display, ""); assert.equal(revive.disabled, false); assert.equal(revive.textContent, "Revive api");
   const sent = posted.length;
   revive.onclick(ev);
   assert.deepEqual(posted.slice(sent).filter((m) => m.type === "reviveSession"), [{ type: "reviveSession", id: API }]);
   assert.equal(revive.disabled, true); assert.equal(revive.textContent, "Reviving…");
-  await dispatch(frame([g1, card("g2")._it, parked], { working: ["web"] }));   // the same objects again: nothing decided
+  await dispatch(frame([g1, card("g2")._it, g3, p1], { working: ["web"] }));   // the same objects again: nothing decided
   assert.equal(revive.disabled, true, "a re-emit is not a deciding event");
-  await dispatch({ type: "err", sid: API, text: "the recipient's own business" });
-  assert.equal(revive.disabled, true, "an err for another session is not this card's event");
-  await dispatch({ type: "err", sid: TESTS, text: "the revive was refused" });
-  assert.equal(revive.disabled, false, "the kernel's reply for the card's session re-arms it");
+  const toastBefore = body.querySelector(".feed-toast")?.textContent ?? null;
+  await dispatch({ type: "reviveFailed", id: WEB, name: "web", text: "the SDK backend could not resume it" });
+  assert.equal(revive.disabled, true, "another session's revive failing is not this card's event");
+  assert.equal(body.querySelector(".feed-toast")?.textContent ?? null, toastBefore, "…and nothing to say about it here");
+  await dispatch({ type: "err", sid: API, op: "sendMessage", title: "That message was not delivered", text: "Nothing was sent." });
+  assert.equal(revive.disabled, true, "a refusal of a DIFFERENT request on the same session is not this button's reply");
+  await dispatch({ type: "reviveFailed", id: API, name: "api", text: "the SDK backend could not resume it (see the kernel log)" });
+  assert.equal(revive.disabled, false, "the kernel's reply to the revive this page asked for re-arms it");
   assert.equal(revive.textContent, "Revive api", "…with the label it wore before the click");
-  await dispatch(frame([g1, card("g2")._it, g3], { working: ["web"] }));   // the handoff is no longer parked: the button hides
-  assert.equal(card("g3")._revive.style.display, "none");
+  assert.equal(body.querySelector(".feed-toast")?.textContent, "Couldn't revive api: the SDK backend could not resume it (see the kernel log)",
+    "…and says why here, where the button is (the chat pane shows the same failure in the session's own pane)");
+  await dispatch(frame([g1, card("g2")._it, g3], { working: ["web"] }));   // delivered or dismissed elsewhere: the parked card leaves
+  assert.ok(!card("parked:m1"));
 });
 
 test("the bell: a click acknowledges at once and its optimistic state is a paint input, so that card alone repaints on the next frame; a refused toggle releases the latch and repaints that card alone", async () => {
@@ -411,6 +420,26 @@ test("a quarantine card never skips: its sender's colour, looked up by name in t
   await dispatch(frame([g1, recoloured, g3, q1], { working: ["web"] }));   // q1 is the very same object
   assert.equal(sender().style.color, "#112233", "the held-mail card repainted although nothing of its own changed");
   await dispatch(frame([g1, { ...recoloured, color: g2.color }, g3], { working: ["web"] }));   // decided elsewhere; api's colour as before
+  assert.ok(!card("q1"));
+});
+
+test("Approve and Deny latch on the click and re-arm on the kernel's quarantineRefused for that held message, the reason toasted; another message's refusal leaves them", async () => {
+  const q1 = cardOf("q1", WEB, "web", "#3366cc", "New message", "needs_input",
+    { blocked: { state: "quarantine", mid: "m1", frm: "api", origin: "", to: "web", body: "the README draft is ready for a look", gist: "the README draft is ready" } });
+  await dispatch(frame([g1, card("g2")._it, g3, q1], { working: ["web"] }));
+  const approve = card("q1")._qApprove, deny = card("q1")._qDeny;
+  assert.deepEqual([approve.disabled, deny.disabled, approve.textContent, deny.textContent], [false, false, "Approve", "Deny"]);
+  const sent = posted.length;
+  approve.onclick(ev);
+  assert.deepEqual(posted.slice(sent).filter((m) => m.type === "quarantineDecision").map((m) => [m.mid, m.action, m.sid]), [["m1", "approve", WEB]]);
+  assert.deepEqual([approve.disabled, deny.disabled, approve.textContent], [true, true, "Delivering…"], "both latch; the one clicked says what it is doing");
+  await dispatch({ type: "quarantineRefused", mid: "m2", text: "quarantine: not that one" });
+  assert.equal(approve.disabled, true, "another held message's refusal is not this card's reply");
+  await dispatch({ type: "quarantineRefused", mid: "m1", text: "quarantine: the recipient is no longer live" });
+  assert.deepEqual([approve.disabled, deny.disabled, approve.textContent, deny.textContent], [false, false, "Approve", "Deny"],
+    "the kernel's reply for this message re-arms both");
+  assert.equal(body.querySelector(".feed-toast")?.textContent, "quarantine: the recipient is no longer live", "…and says why (the bare warn it replaced had no handler here)");
+  await dispatch(frame([g1, card("g2")._it, g3], { working: ["web"] }));
   assert.ok(!card("q1"));
 });
 
@@ -739,17 +768,54 @@ test("Retry latches on the click and re-arms only on a deciding event: the kerne
   assert.equal(retry.disabled, true); assert.equal(retry.textContent, "Retrying…");
   await dispatch(frame([blockedG1, card("g2")._it, card("g3")._it]));   // the same objects again: nothing decided
   assert.equal(retry.disabled, true, "a re-emit is not a deciding event");
-  await dispatch({ type: "err", sid: API, text: "another session's business" });
+  await dispatch({ type: "err", sid: API, op: "apiRetry", text: "another session's business" });
   assert.equal(retry.disabled, true, "another session's reply is not this card's event");
-  await dispatch({ type: "err", sid: WEB, text: "the retry was not delivered" });
-  assert.equal(retry.disabled, false, "the kernel's reply for this session re-arms it");
+  await dispatch({ type: "err", text: "a reply that names no session" });
+  assert.equal(retry.disabled, true, "a reply naming no session answers no request: nothing re-arms");
+  await dispatch({ type: "err", sid: WEB, op: "askFollowUp", itemId: "g1", text: "this session's reply to a DIFFERENT request" });
+  assert.equal(retry.disabled, true, "the reply to another request of this session is not this button's");
+  await dispatch({ type: "err", sid: WEB, op: "apiRetry", text: "the retry was not delivered" });
+  assert.equal(retry.disabled, false, "the kernel's refusal of THIS session's retry re-arms it");
   assert.equal(retry.textContent, "Retry");
+  retry.onclick(ev);
+  assert.equal(retry.disabled, true);
+  await dispatch({ type: "retryRefused", sid: WEB, text: "Couldn't retry: the session isn't connected right now." });
+  assert.equal(retry.disabled, false, "the backend's refusal of the manual retry (the kernel's retryRefused) re-arms it");
+  assert.equal(body.querySelector(".feed-toast")?.textContent, "Couldn't retry: the session isn't connected right now.", "…and says why");
+  retry.onclick(ev);
+  assert.equal(retry.disabled, true);
+  await dispatch({ type: "err", sid: WEB, text: "an older kernel's refusal names the session and no request" });
+  assert.equal(retry.disabled, false, "a reply naming the session but no request releases the session's Retry, as before the op field");
   retry.onclick(ev);
   assert.equal(retry.disabled, true);
   await dispatch(frame([{ ...blockedG1 }, card("g2")._it, card("g3")._it]));   // a new object for the card: it repaints
   assert.equal(retry.disabled, false, "a repaint re-arms it too");
   await dispatch(frame([g1, card("g2")._it, card("g3")._it]));   // the block is gone: the unit hides
   assert.equal(card("g1")._apiRetry.style.display, "none");
+});
+
+test("Continue latches on the click and predicts the move; the kernel's refusal of THAT post re-arms it and returns the card, a refusal of another card's post leaves both", async () => {
+  const needsG1 = { ...g1, column: "needs_input" };
+  await dispatch(frame([needsG1, card("g2")._it, card("g3")._it], { working: ["api"] }));   // web is live and waiting on you, no live ask
+  const cont = card("g1")._cont;
+  assert.equal(cont.style.display, ""); assert.equal(cont.disabled, false); assert.equal(cont.textContent, "Continue");
+  assert.equal(colOf("g1"), "col-needsInput-list");
+  const sent = posted.length;
+  cont.onclick(ev);
+  assert.deepEqual(posted.slice(sent).filter((m) => m.type === "askFollowUp"), [{ type: "askFollowUp", itemId: "g1", sid: WEB, cont: true }]);
+  assert.equal(cont.disabled, true); assert.equal(cont.textContent, "Sent");
+  assert.equal(colOf("g1"), "col-asks-list", "the predicted move: the card goes to Working ahead of the kernel");
+  await dispatch(frame([needsG1, card("g2")._it, card("g3")._it], { working: ["api"] }));   // the same objects: nothing decided
+  assert.equal(cont.disabled, true, "a re-emit is not a deciding event");
+  assert.equal(colOf("g1"), "col-asks-list", "…and the prediction holds");
+  await dispatch({ type: "err", sid: WEB, op: "askFollowUp", itemId: "g1a", title: "That reply was not delivered", text: "Nothing was sent." });
+  assert.equal(cont.disabled, true, "a refusal of another card's post is not this button's reply");
+  await dispatch({ type: "err", sid: WEB, op: "askFollowUp", itemId: "g1", title: "That reply was not delivered", text: "Nothing was sent." });
+  assert.equal(cont.disabled, false, "the kernel's refusal of this card's post re-arms it");
+  assert.equal(cont.textContent, "Continue");
+  assert.equal(colOf("g1"), "col-needsInput-list", "…and the predicted move yields to the kernel's answer: the card is back where the payload says");
+  await dispatch(frame([g1, card("g2")._it, card("g3")._it]));   // web back to Working
+  assert.equal(colOf("g1"), "col-asks-list");
 });
 
 test("a reveal pulse comes off when its animation ends, and a child's animation ending inside the card does not end it", async () => {

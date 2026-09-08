@@ -14216,8 +14216,12 @@ def _fire_api_retry(sid, be, manual=False):
     # message, force-pinning a junk goal per retry via the never-skip hard guard ("retry — kept on the
     # board…", 71 of them in one API-error storm). The marker makes author_of return 'romp' (ROMP_INJECT_RE)
     # so the echo + transcript render gray and the planner skips a work-less retry instead of minting a goal.
-    be.send(sid, RETRY_MSG)
+    delivered = be.send(sid, RETRY_MSG)
     _note_retry_sent(sid, manual=manual)
+    # the send's own verdict, for the manual route's reply (review find, 2026-09-08): SdkBackend.send and
+    # CodexBackend.send return False for a session they cannot reach (no live registry row, no client);
+    # TmuxBackend.send always True. Only an explicit False is a refusal; a backend answering None sent.
+    return delivered is not False
 
 
 def _auto_retry_tick(now, tmux):
@@ -14442,8 +14446,12 @@ def _refuse_drive(client, op, sid, msg):
         # `sid` rides along so the shell's error-center entry carries the session it was meant for, the way
         # every card-badge entry does — the bell is a log you read later, and "which one?" is the first thing
         # you ask of it.
+        # `op` and `itemId` name the REQUEST (review find, 2026-09-08): the feed latches a button on the click
+        # (Retry → "Retrying…", Continue → "Sent") and re-arms it on the kernel's reply for that post alone,
+        # not every latch the session holds, and never on a clock, so the reply says which post it answers.
         client["send"](json.dumps({"type": "err", "title": "That %s was not delivered" % what,
-                                   "text": detail, "copy": text, "sid": sid}))
+                                   "text": detail, "copy": text, "sid": sid,
+                                   "op": op, "itemId": msg.get("itemId") or ""}))
     except Exception:
         pass
 
@@ -14698,7 +14706,14 @@ def _drive(msg, client):
         # ONE retry decision, all of it kernel state — see _fire_api_retry (shared with the kernel's own
         # _auto_retry_tick, which drives recovery unattended since 2026-08-11; this route remains for the
         # manual Retry-now button and the dashboard tick's redundant asks, both idempotent against it).
-        _fire_api_retry(sid, be, manual=bool(msg.get("manual")))
+        if not _fire_api_retry(sid, be, manual=bool(msg.get("manual"))) and msg.get("manual"):
+            # the backend refused the send (review find, 2026-09-08): the feed's Retry latched "Retrying…" on
+            # the click and re-arms on the kernel's reply for that request, matched by sid. Nothing answered a
+            # refused send before, so the button stayed latched until the card happened to be re-sent. A SOFT
+            # refusal (nothing typed was lost), so a typed reply the feed toasts, not the must-dismiss `err`.
+            # The auto path stays silent: no pane asked, and the kernel's own tick asks again.
+            client["send"](json.dumps({"type": "retryRefused", "sid": sid,
+                                       "text": "Couldn't retry: the session isn't connected right now."}))
     elif t == "setModel" and msg.get("value"):
         # mid-compaction → parked as a queued command; `floating` is the version submenu's Latest row —
         # forget the family's remembered pin and send the alias
@@ -15069,8 +15084,12 @@ def _revive_session(sid, client=None):
     refusal = _claim_session_name(name, "revive", sid, own=sid)
     if refusal:
         sys.stderr.write("revive '%s' (%s): refused — %s\n" % (name, sid, refusal))
-        _send_to_view("chat", {"type": "reviveFailed", "id": sid, "name": name, "text": refusal},
-                      (client or {}).get("wid") or "")
+        # the asking dashboard's chat AND feed, like every other revive refusal (_revive_session_inner): the
+        # feed's parked card latched "Reviving…" on the click and re-arms only on the reply for its own sid.
+        failed = {"type": "reviveFailed", "id": sid, "name": name, "text": refusal}
+        wid = (client or {}).get("wid") or ""
+        _send_to_view("chat", failed, wid)
+        _send_to_view("feed", failed, wid)
         return
     try:
         _revive_session_inner(sid, client)
@@ -15123,8 +15142,15 @@ def _revive_session_inner(sid, client=None):
         ok, detail = False, str(e)[:200]
     if not ok:
         sys.stderr.write("revive '%s' (%s): %s\n" % (name, sid, detail))
-        _send_to_view("chat", {"type": "reviveFailed", "id": sid, "name": name,
-                               "text": detail or "unknown error"}, (client or {}).get("wid") or "")
+        failed = {"type": "reviveFailed", "id": sid, "name": name, "text": detail or "unknown error"}
+        wid = (client or {}).get("wid") or ""
+        _send_to_view("chat", failed, wid)
+        # …and the same dashboard's FEED (review find, 2026-09-08): its parked-handoff card latched "Reviving…"
+        # on the click and re-arms on this reply, the reply for ITS request, matched by the revived sid, which
+        # is the card's own. With the notice aimed at the chat alone the feed heard nothing, and since the feed
+        # repaints a card only when the kernel re-sends it, a refusal that changes no card left that button
+        # latched until the parked card's colour ticked: never, past the colour ramp's ceiling.
+        _send_to_view("feed", failed, wid)
         return
     _kept_open.discard(sid)       # it's live again → no longer a read-only kept tab
     _push_soon()                  # surface it promptly — the woken pusher builds it off this thread
@@ -46982,7 +47008,7 @@ class Handler(BaseHTTPRequestHandler):
             # Human verdict on a DIRECTED peer's held message (per-host trust): approve delivers it
             # (optionally with human-edited text), deny drops it. The bus owns delivery + the held-message
             # store, so proxy there; on success the bus removes the held file, so _quarantine_cards drops
-            # the card on the next build (event-based — no cleared.jsonl needed). Failure warn-toasts.
+            # the card on the next build (event-based — no cleared.jsonl needed). Failure answers the asker by mid.
             _qmid = str(msg["mid"])
             _qbody = {"mid": _qmid, "action": str(msg.get("action") or "").strip().lower()}
             if msg.get("text") is not None:
@@ -46993,7 +47019,12 @@ class Handler(BaseHTTPRequestHandler):
             if _qok:
                 _mark_views_dirty()
             else:
-                client["send"](json.dumps({"type": "warn", "text": "quarantine: " + _qerr}))
+                # the refusal answers the asking pane BY THE MESSAGE it was about (review find, 2026-09-08): the
+                # feed latched Approve/Deny ("Delivering…") on the click and re-arms them on this reply, matched
+                # by mid. It was a bare `warn` before, which the feed never handled, so a refused verdict left
+                # both buttons disabled until the card was re-sent, and a card the bus refused to act on is
+                # exactly the one that is never re-sent. The feed is the only poster of this op.
+                client["send"](json.dumps({"type": "quarantineRefused", "mid": _qmid, "text": "quarantine: " + _qerr}))
         elif msg and msg.get("type") == "nodeOverride" and msg.get("sid") and msg.get("nodeId"):
             # modal surgical override: cross a node off (op:resolve → nodeComplete) or drop it
             # (op:clear → the user-authority clear verdict, same seam as a card Clear, scoped to the

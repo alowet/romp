@@ -58,9 +58,11 @@ test("a card repaints only when its object or a board-level input it reads chang
   // the env, built once per render from everything a card's paint reads outside its object
   assert.match(SRC, /const gate: GateEnv = \{\n\s*dot: dotFor, working: \(n\) => workingSet\.has\(n\),\n\s*focusId: hoverAskId \?\? pinnedAskId, pinnedId: pinnedAskId, notifyOn: cardNotifyOn,\n\s*prefs: \{ grouped: gprefs\.grouped, collapsed: gprefs\.collapsed, colormap: gprefs\.colormap \},\n\s*hostDown: hostIsDown, selfHost: feedSelfHost, repo: prRepoOf, seq: \+\+renderSeq,\n\s*\};/);
   assert.match(SRC, /reconcileCol\(cols\.asks, buckets\.asks, desired, gate\);\n\s*reconcileCol\(cols\.needsInput, buckets\.needsInput, desired, gate\);\n\s*reconcileCol\(cols\.completed, buckets\.completed, desired, gate\);/);
-  // the latches: the card's Retry is a manual retry, and Retry and Revive re-arm on the kernel's err frame for the session
+  // the latches: the card's Retry is a manual retry, and each latch re-arms on the kernel's reply for ITS request
+  // (review find, 2026-09-08): a refused apiRetry names the session, reviveFailed names the revived id
   assert.match(SRC, /vscodeApi\?\.postMessage\(\{ type: "apiRetry", id: it\.sid, manual: true \}\);/);
-  assert.match(SRC, /showErrDialog\(title, m\.text, copy\);\n\s*rearmLatches\(typeof m\.sid === "string" \? m\.sid : typeof m\.id === "string" \? m\.id : ""\);/);
+  assert.match(SRC, /showErrDialog\(title, m\.text, copy\);[\s\S]*?if \(op === "apiRetry" && sid\) rearmLatches\(\{ kind: "retry", sid \}\);/);
+  assert.match(SRC, /m\.type === "reviveFailed" && typeof m\.id === "string" && m\.id\) \{[\s\S]*?rearmLatches\(\{ kind: "revive", id: m\.id \}\)/);
   assert.match(SRC, /\(a\._revive as any\)\._idle = a\._revive\.textContent;/);
   // Undo takes .dismissing off a card restored inside its collapse window (the class rewrite no longer does)
   assert.match(SRC, /askEls\.get\(it\.itemId\)\?\.classList\.remove\("dismissing"\);/);

@@ -2,14 +2,13 @@
 // outside the ask object must flip the key, equal inputs must give equal keys, a quarantine card must
 // never skip, and cardNeedsUpdate must fire on a new object OR a new key. A missed input here is a stale
 // badge on an unchanged card, so the test walks the inputs one at a time. The gate's premise — an unchanged
-// card keeps its OBJECT through the delivery path — is run against the pane shim's delta reassembly (the JS
-// kernel.py inlines into every pane page, lifted and executed in a sandbox) and pinned on federation's
-// merge. Synthetic notes-api world.
+// card keeps its OBJECT through the delivery path — is run against the pane shim's delta reassembly in the
+// lane that owns the shim (tests/test_view_deltas.py, under node) and pinned here on federation's merge.
+// Synthetic notes-api world.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as vm from "node:vm";
 import { cardInputsKey, cardNeedsUpdate, type GateEnv, type GateItem } from "./feed-card-gate";
 
 const WEB = "11111111-2222-3333-4444-555555555555";
@@ -112,72 +111,11 @@ test("cardNeedsUpdate: false for the same object under the same key; true for a 
 });
 
 // --- the gate's premise: an unchanged card keeps its OBJECT through the delivery path -----------------
-// The pane shim (kernel.py _shim) applies a `{type:"delta"}` frame itself and hands the bundle a full
-// message; its template is lifted from the kernel source the way pane-shim-stale.test.ts does and run in a
-// sandbox with a fake socket, so what reaches the bundle is what the shim's own code builds.
-const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
-function shimJs(app: string): string {
-  const def = KERNEL.indexOf("def _shim(app, v=0):");
-  assert.ok(def > 0, "the shim renderer exists");
-  const start = KERNEL.indexOf('return """', def) + 'return """'.length;
-  const end = KERNEL.indexOf('""" % (app, int(v), app, app)', start);
-  assert.ok(end > start, "the template's format tuple is the one the test substitutes");
-  const args = [app, "5", app, app];
-  let i = 0;
-  return KERNEL.slice(start, end).replace(/%[sd]/g, () => args[i++]).replace(/%%/g, "%");
-}
-
-test("the pane shim reassembles a feed delta reusing every untouched card object; only the re-sent card is a new one — the identity the gate reads", () => {
-  const toBundle: any[] = [];
-  const sockets: any[] = [];
-  class FakeWS {
-    url: string; readyState = 0; onopen: any; onmessage: any; onclose: any; onerror: any;
-    constructor(url: string) { this.url = url; sockets.push(this); }
-    send() {}
-    close() {}
-    open() { this.readyState = 1; this.onopen?.(); }
-    msg(o: any) { this.onmessage?.({ data: JSON.stringify(o) }); }
-  }
-  const sandbox: any = {
-    window: {
-      parent: { postMessage() {} },
-      sessionStorage: { getItem: () => "" },
-      dispatchEvent: (e: any) => { if (e && e.data !== undefined) toBundle.push(e.data); return true; },   // no federation on this page: the shim dispatches on window
-      addEventListener() {}, innerWidth: 800, innerHeight: 600,
-    },
-    document: { addEventListener() {}, visibilityState: "visible", getElementById: () => null },
-    localStorage: { getItem: () => null, setItem() {} },
-    location: { protocol: "http:", host: "TESTHOST:29855", search: "" },
-    URLSearchParams: class { get() { return ""; } },
-    WebSocket: FakeWS, Date, JSON, console, encodeURIComponent,
-    Event: class { type: string; constructor(t: string) { this.type = t; } },
-    MessageEvent: class { type: string; data: any; constructor(t: string, o: any) { this.type = t; this.data = o.data; } },
-    setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1,
-    // the shim hands frames to the bundle through a MessageChannel-flushed queue (deltas are still reassembled
-    // synchronously, in wire order, before they are queued); delivered synchronously here so `toBundle` reads
-    // in wire order. `performance` backs the shim's page-load breadcrumb. The same stubs as pane-shim-stale.test.ts.
-    MessageChannel: class { port1: any = { onmessage: null }; port2: any; constructor() { const p1 = this.port1; this.port2 = { postMessage: (d: any) => { p1.onmessage?.({ data: d }); } }; } },
-    performance: { getEntriesByType: () => [] },
-  };
-  sandbox.window.window = sandbox.window;
-  vm.runInNewContext(shimJs("feed"), sandbox);
-  const ws = sockets[0];
-  assert.match(ws.url, /[?&]delta=1(&|$)/, "the page asks for deltas");
-  ws.open();
-  const a = card({ itemId: "g1" }), b = card({ itemId: "g2", sid: API, name: "api" });
-  ws.msg({ type: "feed", asks: [a, b], _keys: { asks: ["g1", "g2"] } });          // the keyed full frame
-  ws.msg({ type: "delta", slot: "feed", base: 0, rev: 1, coll: { asks: { set: { g2: { ...b, column: "completed" } } } } });
-  assert.equal(toBundle.length, 2, "both frames reached the bundle as full messages");
-  const [full, next] = toBundle;
-  assert.equal(next.type, "feed");
-  assert.notEqual(next, full, "a delta builds a NEW message object (the bundle may still hold the previous one)");
-  assert.equal(next.asks.length, 2);
-  assert.equal(next.asks[0], full.asks[0], "the untouched card is the same object: the gate skips it");
-  assert.notEqual(next.asks[1], full.asks[1], "the re-sent card is a new object: the gate repaints it");
-  assert.equal(next.asks[1].column, "completed");
-  assert.equal(next.asks[1].itemId, "g2");
-});
-
+// The pane shim (kernel.py _shim) applies a `{type:"delta"}` frame itself and hands the bundle a full message,
+// reusing every untouched card object and minting a new one only for a card the delta set. That is the shim's
+// behaviour, so its own lane holds it: tests/test_view_deltas.py runs the kernel's shim JavaScript under node
+// against the kernel's own frames (review find, 2026-09-08: a kernel edit must not break this lane, and a test
+// that lifts kernel.py by source text is one that can). Federation's merge, the other hop, is pinned below.
 test("federation's merge pushes each host's cards by reference (a defensive copy there would silently turn the gate into always-update)", () => {
   const FED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "federation.ts"), "utf8");
   assert.match(FED, /if \(Array\.isArray\(f\.asks\)\) merged\.asks\.push\(\.\.\.f\.asks\);/);

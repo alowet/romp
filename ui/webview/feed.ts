@@ -257,6 +257,9 @@ function reconcilePendingDone(asks: AskItem[]) {
 }
 type MoveKind = "followup" | "answer";
 const pendingMoveKind = new Map<string, MoveKind>();
+// card itemId → the payload's own object the predicted copy replaced in `asks` (applyFollowMove), so the
+// kernel's refusal of the post can put it back (revertFollowMove) instead of waiting for the next frame
+const predictedFrom = new Map<string, AskItem>();
 // COLUMN-FLIP TRIPWIRE (the user 2026-07-28, who watched a just-replied card bounce Working →
 // Completed → Working and could not be told afterwards WHICH layer bounced it — every candidate
 // mechanism checked out sound post-hoc, and no surface records what the view actually SHOWED).
@@ -297,7 +300,19 @@ function auditShownColumns(list: AskItem[]) {
 function clearFollowMove(itemId: string, why = "") {
   const t = pendingFollowMove.get(itemId); if (t) clearTimeout(t);
   pendingFollowMove.delete(itemId); pendingMoveKind.delete(itemId); pendingMoveAck.delete(itemId);
+  predictedFrom.delete(itemId);
   if (why) lastFeedEvent = "clear:" + why;             // tripwire attribution only; behavior unchanged
+}
+// The kernel REFUSED the post a prediction rode on (an `err` naming the card's askFollowUp; review find,
+// 2026-09-08): the card goes back to what the payload says NOW, on that reply, rather than sitting in Working
+// until the next frame. The refusal is the event the no-answer backstop only approximated; the backstop's own
+// toast blamed silence, and here the kernel has spoken. Puts the payload's object back in the slot the copy
+// took, so the render shows the kernel's state and the gate repaints that card alone (a new identity).
+function revertFollowMove(itemId: string): void {
+  const orig = predictedFrom.get(itemId);
+  clearFollowMove(itemId, "refused");
+  if (orig) { const i = asks.findIndex((a) => a.itemId === itemId); if (i >= 0 && asks[i] !== orig) asks[i] = orig; }
+  render();
 }
 function optimisticFollowMove(itemId: string, kind: MoveKind = "followup") {
   const prev = pendingFollowMove.get(itemId); if (prev) clearTimeout(prev);
@@ -398,6 +413,7 @@ function applyFollowMove(list: AskItem[]) {
     const c: AskItem = { ...a, column: "working" };
     if ((pendingMoveKind.get(a.itemId) ?? "followup") === "followup") { c.recheck = true; c.followupPending = true; }   // plain move / answer: no chip
     if (c.t < nowSec) c.t = nowSec;   // sort to the bottom (newest); the group's repr follows via buildGroup
+    predictedFrom.set(a.itemId, a);   // what a refusal of the post puts back (revertFollowMove)
     list[i] = c;
   }
 }
@@ -976,21 +992,48 @@ function setCardNotify(card: HTMLElement, it: AskItem, value: boolean): void {
   vscodeApi?.postMessage({ type: "cardNotify", itemId: it.itemId, sid: it.sid, value });
 }
 
-// Re-arm the card-face latches (Retry's "Retrying…", Revive's "Reviving…") on the kernel's reply to the
-// click: an err frame for the session, or for no session in particular. The click-safe rule holds the
-// acknowledgement until a deciding event; the per-card update gate no longer repaints every card on every
-// push, so the reply frame and a repaint of the card (a new object, a key flip) are those events. A refusal
-// the kernel answers with neither frame nor payload change leaves the latch until the card next repaints.
-function rearmLatches(sid: string): void {
+// The kernel's reply to a latched click re-arms THAT button (review find, 2026-09-08). Each card-face latch
+// (Retry → "Retrying…", Revive → "Reviving…", Approve/Deny → "Delivering…", Continue → "Sent") holds the
+// acknowledgement until the kernel answers its own post (the click-safe rule), and since the per-card update
+// gate repaints a card only when the kernel re-sends it, the reply IS the event on a refusal (a success
+// re-sends the card, and that repaint re-arms it). Every refusal names the request it answers, and only the
+// latch that made that request lets go: `reviveFailed` names the revived id (the parked card's sid IS that id,
+// and its blocked.toSid), `retryRefused` and an `err` whose op is apiRetry name the session, `quarantineRefused`
+// names the held message's mid, an `err` whose op is askFollowUp names the card. A reply that names a session
+// but no request (an `err` from a kernel older than the op field) releases the session's Retry and Revive, as
+// it did before; one that names neither releases nothing: it answers no request, so every latch stays a
+// request the kernel has not answered. No clock anywhere. Returns how many buttons let go, so a caller can
+// speak only when this page's own click was the one answered (the chat pane voices its own).
+type LatchReply =
+  | { kind: "revive"; id: string }
+  | { kind: "retry"; sid: string }
+  | { kind: "quarantine"; mid: string }
+  | { kind: "followup"; itemId: string }
+  | { kind: "session"; sid: string };
+function rearmLatches(reply: LatchReply): number {
+  let n = 0;
+  const arm = (b: HTMLButtonElement | undefined, label: string) => {
+    if (b && b.disabled) { b.disabled = false; b.textContent = label; n++; }
+  };
   for (const card of askEls.values()) {
     const a = card as any;
     const it = a._it as AskItem | undefined;
-    if (sid && it && it.sid !== sid) continue;
-    const r = a._apiRetry as HTMLButtonElement | undefined;
-    if (r && r.disabled) { r.disabled = false; r.textContent = "Retry"; }
-    const v = a._revive as HTMLButtonElement | undefined;
-    if (v && v.disabled) { v.disabled = false; v.textContent = (v as any)._idle || "Revive"; }
+    if (!it) continue;
+    const reviveIdle = () => (a._revive && (a._revive as any)._idle) || "Revive";
+    switch (reply.kind) {
+      case "revive": if ((it.blocked?.toSid || it.sid) === reply.id) arm(a._revive, reviveIdle()); break;
+      case "retry": if (it.sid === reply.sid) arm(a._apiRetry, "Retry"); break;
+      case "quarantine": if (it.blocked?.mid === reply.mid) { arm(a._qApprove, "Approve"); arm(a._qDeny, "Deny"); } break;
+      case "followup":
+        if (it.itemId === reply.itemId && a._cont && (a._cont as HTMLButtonElement).disabled) {
+          arm(a._cont, "Continue");
+          (a._cont as HTMLButtonElement).title = contTitle(false, "a continue", it.followupAt);
+        }
+        break;
+      case "session": if (it.sid === reply.sid) { arm(a._apiRetry, "Retry"); arm(a._revive, reviveIdle()); } break;
+    }
   }
+  return n;
 }
 
 function showCardMenu(e: MouseEvent, card: HTMLElement): void {
@@ -2262,10 +2305,11 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
     setTip(a._apiBadge as HTMLElement, (spendLimit || refusal) ? it.blocked.what : (it.blocked.text || it.blocked.what));
     // The latched "Retrying…" re-arms on any repaint of this card — a new object or a key flip; the expected
     // path is the session resuming, which moves the working set (the key) and hides the whole unit — and on
-    // the kernel's reply to the click (an err frame for the session, rearmLatches). Before the per-card update
-    // gate it re-armed on the next push of any card. The click is a MANUAL retry (the chat pane sends the
-    // same): the kernel fires it past every auto gate, so the button is never a dead no-op on a paused or
-    // suppressed thread. Revive below latches and re-arms the same way.
+    // the kernel's reply to THIS click (rearmLatches): `retryRefused` when the backend could not take the
+    // send, or an `err` naming this session's apiRetry when the kernel has no such session. Before the
+    // per-card update gate it re-armed on the next push of any card. The click is a MANUAL retry (the chat
+    // pane sends the same): the kernel fires it past every auto gate, so the button is never a dead no-op on
+    // a paused or suppressed thread. Revive below latches the same way and re-arms on `reviveFailed`.
     a._apiRetry.disabled = false; a._apiRetry.textContent = "Retry";
     a._apiRetry.onclick = (ev: Event) => {
       ev.stopPropagation();
@@ -2325,7 +2369,7 @@ function updateAskCard(card: HTMLElement, it: AskItem) {
   if (isParked && it.blocked) {
     const toSid = it.blocked.toSid || it.sid;
     a._revive.disabled = false; a._revive.textContent = `Revive ${it.blocked.toName || it.name}`;
-    (a._revive as any)._idle = a._revive.textContent;   // the label rearmLatches restores
+    (a._revive as any)._idle = a._revive.textContent;   // the label rearmLatches restores on the kernel's reviveFailed for toSid
     a._revive.onclick = (ev: Event) => {
       ev.stopPropagation();
       vscodeApi?.postMessage({ type: "reviveSession", id: toSid });
@@ -5573,6 +5617,22 @@ listenForFrames(perfFrameHandler("feed", (m) => vscodeApi?.postMessage(m), (e: M
                                  sid: typeof m.sid === "string" ? m.sid : "",
                                  itemId: typeof m.itemId === "string" ? m.itemId : "" }, "*");
     feedToast(m.text);
+  } else if (m.type === "reviveFailed" && typeof m.id === "string" && m.id) {
+    // the kernel's reply to a Revive (review find, 2026-09-08): the parked card whose button this page latched
+    // lets go, and the reason rides the fading toast, only when a latch here was the one answered; the chat
+    // pane of the same dashboard shows the failure in the revived session's own pane either way, so a revive
+    // clicked there says nothing twice.
+    if (rearmLatches({ kind: "revive", id: m.id })) {
+      feedToast("Couldn't revive " + String(m.name || m.id) + ": " + String(m.text || "unknown error"));
+    }
+  } else if (m.type === "retryRefused" && typeof m.sid === "string" && m.sid) {
+    // the backend could not take the manual retry's send: the Retry this page latched lets go, and says why
+    if (rearmLatches({ kind: "retry", sid: m.sid })) feedToast(String(m.text || "Couldn't retry: the kernel refused it."));
+  } else if (m.type === "quarantineRefused" && typeof m.mid === "string" && m.mid) {
+    // the bus refused a verdict on a held message: that card's Approve and Deny let go, and the reason is said
+    // (this was a bare `warn` before, which this page never handled). The feed is the only poster of verdicts.
+    rearmLatches({ kind: "quarantine", mid: m.mid });
+    feedToast(String(m.text || "the held message could not be acted on"));
   } else if (m.type === "err" && typeof m.text === "string" && m.text) {
     // the dialog interrupts; the bell KEEPS it (the user 2026-07-29) — dismissing the modal must not erase
     // the fact that a message never landed. Same {romp:'notify'} bridge the card-badge mirror below uses.
@@ -5582,7 +5642,19 @@ listenForFrames(perfFrameHandler("feed", (m) => vscodeApi?.postMessage(m), (e: M
                                  text: copy ? title + ": " + copy : title,
                                  sid: typeof m.sid === "string" ? m.sid : "" }, "*");
     showErrDialog(title, m.text, copy);
-    rearmLatches(typeof m.sid === "string" ? m.sid : typeof m.id === "string" ? m.id : "");   // the kernel's reply IS the event
+    const sid = typeof m.sid === "string" ? m.sid : typeof m.id === "string" ? m.id : "";
+    // the kernel's reply IS the event, for the request it names (rearmLatches): a refused apiRetry releases
+    // that session's Retry; a refused askFollowUp releases that card's Continue, and its predicted move yields
+    // to the kernel's answer (revertFollowMove; the no-answer backstop would have bounced it later with a toast
+    // that blamed silence). A reply naming a session and no request is an older kernel's: the session's Retry
+    // and Revive, as before. One naming neither answers no request here.
+    const op = typeof m.op === "string" ? m.op : "";
+    const itemId = typeof m.itemId === "string" ? m.itemId : "";
+    if (op === "apiRetry" && sid) rearmLatches({ kind: "retry", sid });
+    else if (op === "askFollowUp" && itemId) {
+      rearmLatches({ kind: "followup", itemId });
+      if (pendingFollowMove.has(itemId)) revertFollowMove(itemId);
+    } else if (!op && sid) rearmLatches({ kind: "session", sid });
   } else if (m.type === "pickerOptions" && typeof m.name === "string") {
     // the host read the blocked session's live resume-picker screen — show the
     // same options in-page; a choice goes back as keystrokes (transport only,

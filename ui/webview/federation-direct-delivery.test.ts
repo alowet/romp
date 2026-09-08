@@ -14,7 +14,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as vm from "node:vm";
 import { FederationManager, reportListenerError } from "./federation";
 import { listenForFrames } from "./frame-listener";
 
@@ -292,7 +291,9 @@ test("listenForFrames installs the one handler on window and in the registry; wi
   }
 });
 
-// ── source pins: every pane installs through the helper; the kernel's inline boot registers the same way ──
+// ── source pins: every pane installs through the helper. (The kernel's inline timeline boot registers the same way;
+// that is the Python lane's to hold (tests/test_kernel_timeline_split.py pins the registration and RUNS the boot
+// under node), so a kernel edit cannot break this lane. Review find, 2026-09-08.) ──
 
 test("feed, Outline, chat and the VS Code timeline install their frame handler through listenForFrames, none through a bare window listener", () => {
   for (const [file, app] of [["feed.ts", "feed"], ["fleet.ts", "fleet"], ["render.ts", "chat"], ["timeline-main.ts", "timeline"]]) {
@@ -304,42 +305,6 @@ test("feed, Outline, chat and the VS Code timeline install their frame handler t
   const helper = fs.readFileSync(path.join(UI, "frame-listener.ts"), "utf8");
   assert.doesNotMatch(helper, /^import /m, "the helper stays import-free: importing federation.ts would boot a second manager in the pane bundle");
   assert.ok(helper.indexOf('window.addEventListener("message", handler)') < helper.indexOf("fed.onFrame(handler)"), "window first, the registry after");
-});
-
-test("the kernel's inline timeline boot registers its wrapped listener with the registry when federation.js published one", () => {
-  const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
-  const bootStart = KERNEL.indexOf("_TIMELINE_BOOT = ");
-  const boot = KERNEL.slice(bootStart, KERNEL.indexOf('"""', bootStart + 60));
-  assert.match(boot, /var frameListener=\(window\.__rompPerf&&window\.__rompPerf\.wrapFrameHandler\)\?window\.__rompPerf\.wrapFrameHandler\(onFrame\):onFrame;\nwindow\.addEventListener\("message",frameListener\);/);
-  assert.ok(boot.includes("if(window.__rompFed&&window.__rompFed.onFrame)window.__rompFed.onFrame(frameListener);"), "the same listener, registered");
-  assert.equal((boot.match(/addEventListener\("message"/g) || []).length, 1, "one window listener");
-});
-
-test("the kernel's inline timeline boot, RUN: the one window listener is the perf-wrapped one, the registry gets that same function, and a frame through the registry reaches the panel", () => {
-  // the boot is a self-contained IIFE (kernel.py _TIMELINE_BOOT, served inline on the browser's timeline page);
-  // it runs here in a bare vm context with the three window slots it reads stood in
-  const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
-  const open = '_TIMELINE_BOOT = """';
-  const bootStart = KERNEL.indexOf(open);
-  assert.ok(bootStart > 0, "kernel _TIMELINE_BOOT block not found");
-  const boot = KERNEL.slice(bootStart + open.length, KERNEL.indexOf('"""', bootStart + open.length));
-  const listeners: Function[] = [], registered: Function[] = [], updates: any[] = [], posted: any[] = [];
-  const wrapped = new Map<Function, Function>();
-  const win: any = {
-    acquireVsCodeApi: () => ({ postMessage: (m: any) => posted.push(m) }),
-    addEventListener: (t: string, h: Function) => { if (t === "message") listeners.push(h); },
-    __rompPerf: { wrapFrameHandler: (h: Function) => { const w = (e: any) => h(e); wrapped.set(w, h); return w; } },   // perf-telemetry.ts's slot
-    __rompFed: { onFrame: (h: Function) => { registered.push(h); return () => {}; } },                               // federation.ts's slot
-  };
-  win.window = win;
-  vm.runInNewContext(boot, { window: win, HTMLElement: { prototype: {} }, document: {}, URL });
-  assert.equal(listeners.length, 1, "one window listener");
-  assert.ok(wrapped.has(listeners[0]), "…the wrapped one, so its frames are timed by type");
-  assert.deepEqual(registered, listeners, "the SAME function is registered with federation: the brackets nest on both paths, and no frame arrives twice");
-  win.__rompConnectTimeline({ update: (d: any) => updates.push(d) });
-  assert.equal(posted.length, 1); assert.equal(posted[0].type, "ready");   // (built in the vm realm: compared by field, not by prototype)
-  registered[0]({ data: { type: "data", data: { lanes: 1 } } });   // federation's direct call: a merged lanes frame
-  assert.deepEqual(updates, [{ lanes: 1 }], "the frame reached the panel through the registered function");
 });
 
 test("the three merged emissions go through emit and no other dispatch does", () => {

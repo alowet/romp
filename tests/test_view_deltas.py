@@ -608,6 +608,48 @@ process.stdout.write(JSON.stringify(out));"""
         self.assertEqual((steps[3]["same"], steps[3]["renewed"]), (sorted([S1, S2]), [S3]))       # S3's keys reordered: same set, new array
         self.assertEqual((steps[4]["same"], steps[4]["renewed"]), (sorted([S1, S2, S3]), [S4]))   # S4 appeared; nothing else moved
 
+    def test_e_untouched_feed_cards_keep_their_object_identity_across_a_delta(self):
+        """The feed's per-card update gate (ui/webview/feed-card-gate.ts) repaints a card when its OBJECT changed,
+        so the shim's reassembly must hand every untouched card through as the very object the previous message
+        held (===) and mint a new one only for a card the delta set. Held here, in the lane that owns the shim
+        (review find, 2026-09-08: the TypeScript lane had lifted kernel.py's shim by source text to check this,
+        and a kernel edit must not break that lane). The assembled VALUE is the kernel's payload either way."""
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        km._delta_parts_cache.clear()
+        frac = km._DELTA_MAX_FRACTION; km._DELTA_MAX_FRACTION = 10.0
+        self.addCleanup(setattr, km, "_DELTA_MAX_FRACTION", frac)
+        def ask(i, column="working"):
+            return {"itemId": "awaiting:g%d" % i, "sid": S1, "column": column, "text": "do the thing", "color": None, "trail": [1, 2, 3]}
+        st = _Stream("feed")
+        payloads = [_feed([ask(1), ask(2), ask(3)]),
+                    _feed([ask(1), ask(2, column="done"), ask(3)], now=1005)]   # one card moves; the other two are untouched
+        frames = []
+        for p in payloads:
+            frames += st.push(p)
+        self.assertEqual([f["type"] for f in frames], ["feed", "delta"])
+        self.assertEqual(set(frames[1]["coll"]["asks"]["set"]), {"awaiting:g2"}, "only the moved card crosses")
+        fx = tempfile.mkdtemp()
+        with open(os.path.join(fx, "frames.json"), "w") as f:
+            json.dump(frames, f)
+        script = self._shim_functions() + r"""
+var frames=JSON.parse(require("fs").readFileSync(process.argv[2],"utf8"));
+var full=frames[0],keys=full._keys;delete full._keys;LAST[full.type]={rev:0,msg:full,maps:buildMaps(full,keys)};
+var next=applyDelta(frames[1]);if(!next){process.stdout.write(JSON.stringify({error:"rejected"}));process.exit(0);}
+var same=[];for(var i=0;i<next.asks.length;i++)same.push(next.asks[i]===full.asks[i]);
+process.stdout.write(JSON.stringify({newMessage:next!==full,same:same,asks:next.asks}));"""
+        with open(os.path.join(fx, "run.js"), "w") as f:
+            f.write(script)
+        r = subprocess.run([node, os.path.join(fx, "run.js"), os.path.join(fx, "frames.json")], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertNotIn("error", out, "the delta applies over the keyed full frame")
+        self.assertTrue(out["newMessage"], "a delta builds a NEW message object (the bundle may still hold the previous one)")
+        self.assertEqual(out["same"], [True, False, True],
+                         "the untouched cards are the same objects (the gate skips them); the moved card is a new one (the gate repaints it)")
+        self.assertEqual(out["asks"], payloads[1]["asks"], "…and the value is the kernel's")
+
     def test_d_a_lane_that_only_loses_a_bar_is_renewed_and_carries_the_shorter_array(self):
         """A lane whose delta is `del` alone (no `set`, no `order`: a bar retired with nothing replacing it and
         no key crossing another) is a TOUCHED lane: it is renewed and carries the shorter array. Without the
