@@ -79,7 +79,7 @@ class CourierOriginHost(unittest.TestCase):
         jd.MESSAGES = self.tl / "messages.jsonl"
         jd.ERRORS = td / "judge-errors.jsonl"
         jd.courier_llm = lambda *a, **k: '{"verdict": "delegating", "goal": 0, "text": "wire up the export button"}'
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._discover_cache["fp"] = None
         jd._discover_cache["result"] = None
         jd._postal_from_memo["key"] = None

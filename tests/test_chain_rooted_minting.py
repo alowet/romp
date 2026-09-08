@@ -518,7 +518,7 @@ class CourierMintMatrix(unittest.TestCase):
         jd.discover = lambda now, window=None, forks=True: fleet
         self._llm = jd.courier_llm
         jd.courier_llm = lambda text, menu, declared=None: LINK_REPLY
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def tearDown(self):
         jd.MESSAGES = self._msgs
@@ -609,7 +609,7 @@ class CourierMintMatrix(unittest.TestCase):
         self.mpath.write_text("\n".join(json.dumps(r) for r in [
             uline(T0 - 600, "please verify the staged run references", "hu"),
             aline(T0 - 540, "Dispatching.", "ha", "hu")]) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd.run_courier(now=NOW)
         w = jd.load_goals(WKR)
         planted = [nd for nd in w["nodes"].values() if isinstance(nd.get("origin"), dict)]
@@ -638,7 +638,7 @@ class CourierMintMatrix(unittest.TestCase):
                                origin={"peer": GRAND, "goalId": GRAND + ":t1", "msgId": "m0"})},
             "placements": {}, "status": {}})
         self.mpath.write_text(json.dumps(aline(T0 - 540, "Working the round.", "ha")) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd.run_courier(now=NOW)
         w = jd.load_goals(WKR)
         planted = [nd for nd in w["nodes"].values() if isinstance(nd.get("origin"), dict)]
@@ -664,7 +664,7 @@ class CourierMintMatrix(unittest.TestCase):
                                origin={"peer": GRAND, "goalId": GRAND + ":t1", "msgId": "m0"})},
             "placements": {}, "status": {}})
         self.mpath.write_text(json.dumps(aline(T0 - 540, "Working the round.", "ha")) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd.run_courier(now=NOW)
         w = jd.load_goals(WKR)
         planted = [nd for nd in w["nodes"].values() if isinstance(nd.get("origin"), dict)]
@@ -749,7 +749,7 @@ class FanOutDedupe(unittest.TestCase):
         self._llm = jd.courier_llm
         jd.courier_llm = lambda text, menu, declared=None: LINK_REPLY
         self.gpath.write_text(json.dumps(aline(T0 - 1000, "quiet.", "gz")) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def tearDown(self):
         jd.MESSAGES = self._msgs
@@ -785,7 +785,7 @@ class FanOutDedupe(unittest.TestCase):
              "to_id": WKR, "kind": "delegate", "body": BODY.split("\n")[0]},
             {"t": T0 + 120, "ev": "sent", "id": MID_B, "from": "web", "from_id": MGR,
              "to_id": WKR, "kind": "delegate", "body": BODY_B.split("\n")[0]}]) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd.run_courier(now=NOW)
         w = jd.load_goals(WKR)
         planted = [nd for nd in w["nodes"].values() if isinstance(nd.get("origin"), dict)]
@@ -821,7 +821,7 @@ class FanOutDedupe(unittest.TestCase):
         jd.MESSAGES.write_text(json.dumps(
             {"t": T0, "ev": "sent", "id": MID, "from": "web", "from_id": MGR,
              "to_id": WKR, "kind": "delegate", "body": BODY.split("\n")[0]}) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd.run_courier(now=NOW)
         w = jd.load_goals(WKR)
         self.assertEqual([nd for nd in w["nodes"].values() if isinstance(nd.get("origin"), dict)],

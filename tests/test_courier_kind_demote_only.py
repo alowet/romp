@@ -83,7 +83,7 @@ class CourierKindDemoteOnly(unittest.TestCase):
         self.calls = []
         jd.courier_llm = lambda *a, **k: self.calls.append(k.get("declared", "")) or self.reply
         self.reply = DELEGATING
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._discover_cache["fp"] = None
         jd._discover_cache["result"] = None
         jd._postal_from_memo["key"] = None
@@ -100,7 +100,7 @@ class CourierKindDemoteOnly(unittest.TestCase):
                 aline(T0 + 30, "It's on the flat /24.", "a1", "u1")]
         (self.proj_dir / (RECIP + ".jsonl")).write_text(
             "\n".join(json.dumps(r) for r in recs) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._discover_cache["fp"] = None
         jd.run_courier(now=T0 + 100)
         store = jd.load_goals(RECIP)

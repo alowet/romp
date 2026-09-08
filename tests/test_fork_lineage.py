@@ -127,7 +127,7 @@ class BuildSessionLineage(unittest.TestCase):
         jd._rebind_state(Path(self._td))
         jd.PROJECTS = Path(self._td) / "projects"
         jd._discover_cache.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         self.now = int(time.time())
         self.cdir = str(Path(self._td) / "work")
         self.proj = jd._proj_dir(self.cdir)

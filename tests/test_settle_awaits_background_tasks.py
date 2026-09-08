@@ -101,7 +101,7 @@ class SettleAwaitsBackgroundTasks(unittest.TestCase):
         with open(self.path, "w") as f:
             for r in recs:
                 f.write(json.dumps(r) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._BG_SCAN_CACHE.clear()
 
     def _store(self, **node_extra):

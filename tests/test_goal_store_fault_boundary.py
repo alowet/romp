@@ -14,6 +14,7 @@ made it.
 
 SYNTHETIC fixtures only: private synthetic sids, the notes-api demo world (`web` / `api` / `tests`),
 message ids stamped TESTHOST; the per-sid override journals are cleaned in tearDown."""
+import contextlib
 import errno
 import itertools
 import json
@@ -81,15 +82,24 @@ def _store(sid, text, **node):
             "lastNode": gid}
 
 
+@contextlib.contextmanager
 def _fault_on(path):
-    """Path.read_text raises EIO for `path` alone; every other read is untouched."""
-    orig = Path.read_text
+    """Every reader of `path` raises EIO; every other read is untouched. Path.read_text is the load path's
+    reader; the save path's memoized readers (_disk_entry, _disk_rev) open a descriptor of their own and
+    read from it (_disk_read), so os.open faults for the path as well."""
+    orig_read_text, orig_open = Path.read_text, os.open
 
     def faulting(p, *a, **kw):
         if p == path:
             raise OSError(errno.EIO, "Input/output error", str(p))
-        return orig(p, *a, **kw)
-    return mock.patch.object(Path, "read_text", faulting)
+        return orig_read_text(p, *a, **kw)
+
+    def faulting_open(p, *a, **kw):
+        if os.fspath(p) == str(path):
+            raise OSError(errno.EIO, "Input/output error", str(path))
+        return orig_open(p, *a, **kw)
+    with mock.patch.object(Path, "read_text", faulting), mock.patch.object(os, "open", faulting_open):
+        yield
 
 
 class _World(unittest.TestCase):
@@ -104,7 +114,7 @@ class _World(unittest.TestCase):
         self._write(A, _store(A, "the faulting session's goal"))
         self._write(B, _store(B, "the healthy session's goal"))
         km._parse_cache.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def tearDown(self):
         for sid in (A, B, P):
@@ -121,7 +131,7 @@ class _World(unittest.TestCase):
         p = Path(self.td.name) / (sid + ".jsonl")
         p.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
         km._parse_cache.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         return str(p)
 
     def _rows(self, err=None):
@@ -273,7 +283,7 @@ class InterruptLiftBoundary(_World):
             f.write(json.dumps(_uline(self.RESUME_T, "use the staging host for now", "u3", "u2")) + "\n")
             f.write(json.dumps(_aline(self.RESUME_T + 40, "done", "a2", "u3")) + "\n")
         km._parse_cache.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def test_a_fault_at_the_reengage_tick_keeps_the_marker_so_the_next_tick_lifts(self):
         gid = A + ":g1"
@@ -312,7 +322,7 @@ class InterruptLiftBoundary(_World):
             for r in recs:
                 f.write(json.dumps(r) + "\n")
         km._parse_cache.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def test_a_second_stop_during_the_fault_keeps_the_marker_so_the_block_is_still_lifted_after(self):
         """The kept-marker promise has to survive the block branch too: a SECOND genuine stop while the
@@ -499,7 +509,9 @@ class TriagePassBoundary(_World):
     def test_run_propagate_continues_past_a_faulting_session(self):
         with _fault_on(self.a_file):
             jd.run_propagate(now=NOW)
-        self.assertGreaterEqual(self.seen.count(B), 2, "both arms of the pass reached the healthy session")
+        self.assertEqual(self.seen.count(B), 1, "the healthy session is read once per pass, shared by both arms")
+        self.assertGreaterEqual(self.seen.count(A), 2,
+                                "both arms of the pass reached the faulting session (a read that raised is not kept)")
         rows = self._rows("pass-crash")
         self.assertTrue(rows, "the faulting session's rows are filed")
         self.assertEqual({(r["judge"], r["fsid"]) for r in rows}, {("propagate", A)},

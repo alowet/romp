@@ -479,17 +479,17 @@ class LiveWorkCaption(_FleetHarness, unittest.TestCase):
                 self.assertEqual(len(lives()), 1, "the first live caption fires once a CHUNK of work has accrued")
                 self.assertEqual(lives()[0]["grain"], "segment", "no turn-grain while open")
                 # grow by ONE atom (< CHUNK) → throttled, NO re-caption
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 self._tpath.write_text("\n".join(json.dumps(r) for r in self._opened(CHUNK + 2)) + "\n")
                 jd.run_index(now=now + 10)
                 self.assertEqual(len(lives()), 1, "a sub-chunk growth does NOT re-caption (throttled)")
                 # grow by a full CHUNK more → re-caption
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 self._tpath.write_text("\n".join(json.dumps(r) for r in self._opened(2 * CHUNK + 2)) + "\n")
                 jd.run_index(now=now + 20)
                 self.assertEqual(len(lives()), 2, "re-captioned once a full new chunk of atoms accrues")
                 # CLOSE the turn → a FINAL non-live segment caption, and the seg id becomes deduped
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 self._tpath.write_text("\n".join(json.dumps(r) for r in [
                     uline(T0, "investigate the crash", "u1", ps="typed"),
                     aline(T0 + 30, "Fixed the off-by-one crash.", "a1", "u1", tools=("Bash", "Edit"), stop="end_turn")]) + "\n")
@@ -733,11 +733,11 @@ class PlanParseStorm(unittest.TestCase):
             jd._group_store = lambda *a, **k: None         # don't fire the real grouper model after a placement
             try:
                 tpath.write_text("\n".join(json.dumps(r) for r in recs1) + "\n")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 if recs2 is not None:
                     tpath.write_text("\n".join(json.dumps(r) for r in recs2) + "\n")
-                    jd._PARSE_CACHE.clear()
+                    jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                     jd._plan_session(SID, str(tpath), NOW + 100)
                 store = jd.load_goals(SID)
             finally:
@@ -1124,7 +1124,7 @@ class SegKeyDrift(unittest.TestCase):
             jd._group_store = lambda *a, **k: None
             try:
                 tpath.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd.plan_llm = lambda *a, **k: '{"ops":[{"why":"asked","do":"mint","text":"Ship the exporter"}]}'
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
@@ -1140,7 +1140,7 @@ class SegKeyDrift(unittest.TestCase):
 
                 calls = []
                 jd.plan_llm = lambda *a, **k: (calls.append(1), '{"ops":[{"why":"dup","do":"mint","text":"DUP"}]}')[1]
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW + 100)
                 self.assertEqual(calls, [], "a drift-shifted placement still dedups — the planner is not re-run")
                 self.assertEqual(len(jd.load_goals(SID)["nodes"]), 1, "no duplicate goal was minted")
@@ -1684,7 +1684,7 @@ class Grouper(unittest.TestCase):
         (names / SID).write_text("testsess\t%s\t#abcdef\n" % str(cdir))
         saved = (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.plan_llm, jd.group_llm)
         jd.NAMES, jd.PROJECTS, jd.GOALDIR = names, proj, td / "goals"
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         gcalls = []
         try:
             jd.plan_llm = (lambda text, menu, human=False, **_kw:
@@ -1701,7 +1701,7 @@ class Grouper(unittest.TestCase):
             self.assertGreaterEqual(len(gcalls), 1, "the planner invoked the grouper after a placement")
         finally:
             (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.plan_llm, jd.group_llm) = saved
-            jd._PARSE_CACHE.clear()
+            jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
 
 class Consolidator(unittest.TestCase):
@@ -2300,7 +2300,7 @@ class PostalDelegation(unittest.TestCase):
                 jd.save_goals(SID, store)
                 if view_cleared and gid:
                     jd._view_cleared = lambda g=gid: {g}   # the user crossed G off the feed → _reopen won't unseal it
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 for _ in range(passes):
                     jd._plan_session(SID, str(tpath), NOW)
                 return jd.load_goals(SID), seg_id, gid
@@ -2404,7 +2404,7 @@ class PostalDelegation(unittest.TestCase):
                 for s in peers:                            # the courier marked every one coordination
                     store["placements"][s["id"]] = "fyi"
                 jd.save_goals(SID, store)
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)     # ONE pass
                 store = jd.load_goals(SID)
                 tops = [nd for nd in store["nodes"].values() if nd["parentId"] is None]
@@ -2467,7 +2467,7 @@ class NudgeMustResolve(unittest.TestCase):
                                          "nodeComplete": False, "blocked": False, "cleared": False,
                                          "trail": ["seed"], "t": T0, "mt": T0}}}
                 jd.save_goals(SID, store)
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 return jd.load_goals(SID), gid
             finally:
@@ -2550,7 +2550,7 @@ class NudgeMustResolve(unittest.TestCase):
                 self.assertEqual([n for n in mid["nodes"].values() if n.get("parentId") == gid], [],
                                  "no stub node is minted — the reopen event alone holds the top open")
                 self.assertEqual(mid["status"][gid], "working", "held at working through the optimistic window")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
                 subs = [n for n in store["nodes"].values() if n.get("parentId") == gid]
@@ -4372,13 +4372,13 @@ class SettledGateStates(unittest.TestCase):
         statesdir = td / "states"; statesdir.mkdir()
         self._saved = (jd.STATESDIR, dict(jd._PARSE_CACHE))
         jd.STATESDIR = statesdir
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         return str(path), statesdir
 
     def tearDown(self):
         if hasattr(self, "_saved"):
             jd.STATESDIR = self._saved[0]
-            jd._PARSE_CACHE.clear(); jd._PARSE_CACHE.update(self._saved[1])
+            jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear(); jd._PARSE_CACHE.update(self._saved[1])
 
     def test_ended_turn_is_settled_without_idle(self):
         # the fix: an ended turn (assistant handed back the floor) is settled immediately — no idle needed.
@@ -4424,7 +4424,7 @@ class SettledGateStates(unittest.TestCase):
         Path(path).write_text("\n".join(json.dumps(r) for r in
                               [uline(T0, "ship it", "u1", ps="typed"),
                                aline(T0 + 10, "shipped", "a1", "u1", stop="end_turn")]) + "\n")
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd.rollup_status(s, jd._session_closed(jd.parsed_session(SID, [path], now)))
         self.assertEqual(s["status"][g["id"]], "completed", "turn ended → focus goal finalizes (no prompt, no idle)")
 
@@ -4455,14 +4455,14 @@ class FollowUp(unittest.TestCase):
         (names / SID).write_text("testsess\t%s\t#abcdef\n" % str(cdir))
         self._saved = (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.plan_llm, jd.group_llm)
         jd.NAMES, jd.PROJECTS, jd.GOALDIR = names, proj, td / "goals"
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd.migrate_store(store)                        # fixtures are legacy-shaped: adopt their diaries
         jd.save_goals(SID, store)
 
     def tearDown(self):
         if hasattr(self, "_saved"):
             (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.plan_llm, jd.group_llm) = self._saved
-            jd._PARSE_CACHE.clear()
+            jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def _completed_top(self, gid, blocked=False):
         return {"rompUuid": SID, "seq": 1, "placementsV": jd.PLACEMENTS_V, "status": {gid: "blocked" if blocked else "completed"},
@@ -5370,11 +5370,11 @@ class KnownTargetContext(unittest.TestCase):
             jd._group_store = lambda *a, **k: None
             try:
                 tpath.write_text("\n".join(json.dumps(r) for r in recs1) + "\n")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd.plan_llm = plan1
                 jd._plan_session(SID, str(tpath), NOW)
                 tpath.write_text("\n".join(json.dumps(r) for r in recs2) + "\n")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd.plan_llm = plan2
                 jd._plan_session(SID, str(tpath), NOW + 200)
                 return jd.load_goals(SID)
@@ -5649,13 +5649,13 @@ class Distiller(unittest.TestCase):
         (names / SID).write_text("testsess\t%s\t#abcdef\n" % str(cdir))
         self._saved = (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.STATESDIR, jd.distill_llm, jd.brief_llm)
         jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.STATESDIR = names, proj, td / "goals", td / "states"
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         return str(path)
 
     def tearDown(self):
         if hasattr(self, "_saved"):
             (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.STATESDIR, jd.distill_llm, jd.brief_llm) = self._saved
-            jd._PARSE_CACHE.clear()
+            jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def test_distills_completed_top_from_its_discontinuous_trail(self):
         records = [uline(T0, "do part one", "u1", ps="typed"),
@@ -6319,6 +6319,194 @@ class Distiller(unittest.TestCase):
             self.assertIn("\njust one thing\n</owed ", seen["user"], "a lone string renders as before")
         finally:
             jd._judge_run = saved
+
+
+class JudgeFailureScanMemo(unittest.TestCase):
+    """judge_failure_scan's per-store memo. The kernel asks for the give-up count on every timeline build
+    once any store is saved, and the scan used to parse EVERY store each time. Now a store is parsed only
+    when its file identity (inode, mtime_ns, size) changed. What makes that sound is st_mtime_ns strictly
+    increasing across publishes of one path; the inode alone does not, because tmp+rename recycles inode
+    numbers on the second publish (measured on ext4), so the inode distinguishes one publish only. Linux
+    6.13+ multigrain timestamps guarantee the mtime ordering (the scan's own stat marks the prior inode as
+    queried); a coarse-timestamp kernel has a one-tick aliasing window, smaller than the one-second window
+    of kernel.py's _jf_cache gate. Raw stores under PRIVATE synthetic sids (CLAUDE.md, goal-store
+    fixtures); nothing here goes through load_goals, and the scan must not either (it counts raw file
+    content)."""
+
+    A = "b9b9b9b9-0000-4000-8000-00000000000a"
+    B = "b9b9b9b9-0000-4000-8000-00000000000b"
+    C = "b9b9b9b9-0000-4000-8000-00000000000c"
+
+    def setUp(self):
+        self.td = Path(tempfile.mkdtemp())
+        self.saved_state = jd.STATE
+        self.saved = (jd._jf_store_memo, jd._jf_cause_memo, jd._giveup_cause, jd._failed_nodes, jd.load_goals)
+        jd._rebind_state(self.td)
+        jd._jf_store_memo, jd._jf_cause_memo = {}, (None, None)
+        self.parses, self.causes = [], []
+        real = jd._failed_nodes
+        jd._failed_nodes = lambda store: (self.parses.append(1), real(store))[1]      # one call per parsed store
+        jd._giveup_cause = lambda: (self.causes.append(1), ("the summarizer kept hitting errors or timeouts", False))[1]
+        jd.load_goals = lambda *a, **k: self.fail("the scan counts raw file content, never a load_goals-replayed store")
+
+    def tearDown(self):
+        jd._jf_store_memo, jd._jf_cause_memo, jd._giveup_cause, jd._failed_nodes, jd.load_goals = self.saved
+        jd._rebind_state(self.saved_state)
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _store(self, sid, failed, mt=T0 + 10, kind="summary-failed"):
+        """`kind` is the warn's kind; one outside _FAILED_WARN_KINDS of the same length ("summary-landed")
+        publishes a store of the same byte size that counts nothing."""
+        nid = sid + ":g1"
+        nd = {"id": nid, "text": "Ship the notes-api tests", "parentId": None, "nodeComplete": True,
+              "blocked": False, "cleared": False, "trail": [], "t": T0, "mt": mt, "summary": ""}
+        if failed:
+            nd["warns"] = [{"kind": kind, "t": T0 + 20, "msg": "the summary gave up"}]
+        jd.save_goals(sid, {"rompUuid": sid, "seq": 1, "placementsV": jd.PLACEMENTS_V, "placements": {},
+                            "status": {nid: "completed"}, "nodes": {nid: nd}})
+
+    def _path(self, sid):
+        return str(jd.GOALDIR / (sid + ".json"))
+
+    def test_parses_each_store_once_until_its_file_changes(self):
+        self._store(self.A, failed=True); self._store(self.B, failed=False); self._store(self.C, failed=False)
+        self.assertEqual(jd.judge_failure_scan()["count"], 1)
+        self.assertEqual(len(self.parses), 3, "the first call parses every store")
+        self.assertEqual(jd.judge_failure_scan()["count"], 1)
+        self.assertEqual(len(self.parses), 3, "no store changed: nothing is parsed")
+        self._store(self.B, failed=False, mt=T0 + 500)         # one store republished: a new mtime_ns
+        self.assertEqual(jd.judge_failure_scan()["count"], 1)
+        self.assertEqual(len(self.parses), 4, "only the changed store is parsed")
+
+    def test_the_count_clears_when_the_warn_clears(self):
+        self._store(self.A, failed=True)
+        self.assertEqual(jd.judge_failure_scan()["count"], 1)
+        self._store(self.A, failed=False)                       # a landed summary drops the warn
+        self.assertIsNone(jd.judge_failure_scan(), "the rewritten store is re-read and the count clears")
+        self._store(self.A, failed=True)
+        self.assertEqual(jd.judge_failure_scan()["count"], 1, "and a fresh give-up counts again")
+
+    def test_a_deleted_store_drops_from_the_sum(self):
+        self._store(self.A, failed=True); self._store(self.B, failed=True)
+        self.assertEqual(jd.judge_failure_scan()["count"], 2)
+        os.unlink(self._path(self.B))
+        self.assertEqual(jd.judge_failure_scan()["count"], 1)
+        self.assertNotIn(self._path(self.B), jd._jf_store_memo, "the memo is rebuilt from the glob, so the deleted store is gone")
+        self.assertEqual(len(self.parses), 2, "the surviving store was not re-parsed")
+
+    def test_the_cause_is_named_once_per_store_change(self):
+        self._store(self.A, failed=True); self._store(self.C, failed=False)
+        first = jd.judge_failure_scan()
+        self.assertEqual(jd.judge_failure_scan(), first)
+        self.assertEqual(len(self.causes), 1, "no store changed: the cause is not recomputed, so count|cause holds")
+        self._store(self.C, failed=False, mt=T0 + 500)         # any store's change re-names the cause
+        self.assertEqual(jd.judge_failure_scan()["count"], 1)
+        self.assertEqual(len(self.causes), 2)
+
+    def test_an_unparseable_store_counts_nothing_and_is_retried(self):
+        self._store(self.A, failed=True)
+        Path(self._path(self.B)).write_bytes(b"{not a store")
+        self.assertEqual(jd.judge_failure_scan()["count"], 1)
+        self.assertEqual(jd.judge_failure_scan()["count"], 1)
+        self.assertNotIn(self._path(self.B), jd._jf_store_memo, "a parse failure is not memoized")
+        self.assertEqual(len(self.parses), 1, "the good store is parsed once; the broken one never reaches _failed_nodes")
+        self._store(self.B, failed=True)                        # repaired and republished: a new mtime_ns, read like any change
+        self.assertEqual(jd.judge_failure_scan()["count"], 2)
+
+    def test_the_scan_returns_none_when_no_store_is_failing(self):
+        self._store(self.A, failed=False); self._store(self.B, failed=False)
+        self.assertIsNone(jd.judge_failure_scan())
+        self.assertIsNone(jd.judge_failure_scan())
+        self.assertEqual(len(self.parses), 2, "nothing failing is the common case: the memo is kept on a None "
+                                              "return too, so the second call parses nothing")
+        self.assertEqual(self.causes, [], "no give-up: the cause is never asked for")
+
+    def _rewrite_in_place(self, path, body, mtime_ns):
+        """Rewrite a store IN PLACE (same inode) and pin its mtime_ns, so one key component moves at a time
+        without depending on inode recycling or on the clock's granularity."""
+        st = os.stat(path)
+        with open(path, "r+b") as f:
+            f.write(body)
+            f.truncate()
+        os.utime(path, ns=(st.st_atime_ns, mtime_ns))
+        return os.stat(path)
+
+    def test_a_newer_mtime_ns_alone_re_reads_a_store_of_the_same_inode_and_size(self):
+        """st_mtime_ns is what keeps the memo sound once tmp+rename has recycled an inode number (two
+        publishes back on ext4): a version with the memo's inode and size but a later mtime_ns is re-read."""
+        self._store(self.A, failed=True)
+        path = self._path(self.A)
+        self.assertEqual(jd.judge_failure_scan()["count"], 1)
+        st1 = os.stat(path)
+        st2 = self._rewrite_in_place(path, Path(path).read_bytes().replace(b"summary-failed", b"summary-landed"),
+                                     st1.st_mtime_ns + 1)
+        self.assertEqual((st2.st_ino, st2.st_size), (st1.st_ino, st1.st_size), "precondition: only mtime_ns moved")
+        self.assertIsNone(jd.judge_failure_scan(), "a later mtime_ns alone is a new version: re-read, and the count clears")
+        self.assertEqual(len(self.parses), 2)
+
+    def test_the_inode_distinguishes_a_publish_when_the_clock_does_not_move(self):
+        """A coarse-timestamp kernel (Linux < 6.13) gives two same-size publishes inside one tick the same
+        mtime_ns; st_ino tells them apart for one publish. save_goals' tmp+rename takes a fresh inode; the
+        new file's mtime_ns is pinned back to the memo's value explicitly."""
+        self._store(self.A, failed=True)
+        path = self._path(self.A)
+        self.assertEqual(jd.judge_failure_scan()["count"], 1)
+        st1 = os.stat(path)
+        self._store(self.A, failed=True, kind="summary-landed")      # same size, not a give-up kind, new inode
+        os.utime(path, ns=(st1.st_atime_ns, st1.st_mtime_ns))
+        st2 = os.stat(path)
+        self.assertEqual((st2.st_size, st2.st_mtime_ns), (st1.st_size, st1.st_mtime_ns), "precondition: size and mtime_ns held")
+        self.assertNotEqual(st2.st_ino, st1.st_ino, "precondition: the publish took a fresh inode")
+        self.assertIsNone(jd.judge_failure_scan(), "the inode alone is a new version")
+        self.assertEqual(len(self.parses), 2)
+
+    def test_a_size_change_alone_is_a_new_version(self):
+        """st_size is defense in depth: romp's writers publish by tmp+rename, so a size change never arrives
+        without a new inode. The one deterministic way to isolate it models a non-rename writer under a clock
+        that does not move: an in-place rewrite at another size with mtime_ns pinned to the memo's."""
+        self._store(self.A, failed=True)
+        path = self._path(self.A)
+        self.assertEqual(jd.judge_failure_scan()["count"], 1)
+        st1 = os.stat(path)
+        st2 = self._rewrite_in_place(path, Path(path).read_bytes().replace(b"summary-failed", b"landed"), st1.st_mtime_ns)
+        self.assertEqual((st2.st_ino, st2.st_mtime_ns), (st1.st_ino, st1.st_mtime_ns), "precondition: only the size moved")
+        self.assertNotEqual(st2.st_size, st1.st_size)
+        self.assertIsNone(jd.judge_failure_scan(), "the size alone is a new version")
+        self.assertEqual(len(self.parses), 2)
+
+    def test_the_key_names_the_version_that_was_read(self):
+        """A publish landing between the listing's stat and the open: the bytes read are the new version's,
+        so the key must be taken by fstat on that descriptor. Keyed on the pre-open stat, the next call
+        would re-parse a store that did not change again (one wasted parse, never a wrong count)."""
+        self._store(self.A, failed=True)
+        path = self._path(self.A)
+        real_open, fired = open, []
+
+        def hooked(fp, *a, **k):
+            if not fired and str(fp) == path:
+                fired.append(1)
+                self._store(self.A, failed=False, mt=T0 + 500)   # a writer lands between the stat and the open
+            return real_open(fp, *a, **k)
+
+        jd.open = hooked                                         # module global shadows the builtin
+        try:
+            self.assertIsNone(jd.judge_failure_scan(), "the bytes read are the new version's")
+        finally:
+            del jd.open
+        self.assertEqual(fired, [1])
+        self.assertEqual(len(self.parses), 1)
+        self.assertIsNone(jd.judge_failure_scan())
+        self.assertEqual(len(self.parses), 1, "the memo key names the version read, so nothing is re-parsed")
+
+    def test_a_store_gone_between_the_glob_and_the_stat_is_skipped(self):
+        import glob
+        self._store(self.A, failed=True)
+        ghost = self._path(self.B)                               # listed, never written
+        real_glob = glob.glob
+        with mock.patch.object(glob, "glob", lambda *a, **k: real_glob(*a, **k) + [ghost]):
+            self.assertEqual(jd.judge_failure_scan()["count"], 1)
+        self.assertEqual(len(self.parses), 1)
+        self.assertNotIn(ghost, jd._jf_store_memo)
 
 
 class RunTriage(unittest.TestCase):
@@ -7395,7 +7583,7 @@ class LiveReplan(unittest.TestCase):
         jd.GOALDIR.mkdir()
         jd._group_store = lambda *a, **k: None           # never fire the real grouper model
         jd.opener_llm = self._boom                  # the deduped prompt-run must never re-fire
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def tearDown(self):
         (jd.GOALDIR, jd.GOALARCHDIR, jd.PCACHE, jd.STATE,
@@ -7501,7 +7689,7 @@ class LiveReplan(unittest.TestCase):
         tpath.write_text("\n".join(json.dumps(r) for r in (recs or self.OPEN_RECS)) + "\n")
         (jd.GOALDIR / (SID + ".json")).write_text(json.dumps(store))
         jd.plan_llm = llm
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._plan_session(SID, str(tpath), now)
         return jd.load_goals(SID)
 
@@ -7529,7 +7717,7 @@ class LiveReplan(unittest.TestCase):
         self.assertEqual(store["placements"].get(seg + "#live"), tops[0]["id"],
                          "keyed seg#live so it runs exactly once")
         jd.plan_llm = self._boom                        # a second pass must not re-fire the live run
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._plan_session(SID, str(Path(self.td.name) / (SID + ".jsonl")), NOW + 5)
 
     def test_live_phase_skip_is_coerced_the_invariant_is_hard(self):
@@ -7557,7 +7745,7 @@ class LiveReplan(unittest.TestCase):
             calls.append(k)
             return '{"ops":[{"why":"the work landed","do":"sub","under":%d,"text":"Reworked the grid"}]}' % k["goal_num"]
         jd.plan_llm = work_llm
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._plan_session(SID, str(tpath), NOW + 1000)
         store = jd.load_goals(SID)
         self.assertEqual(len(calls), 1, "one work-run call for the ended segment")
@@ -8348,7 +8536,7 @@ class FollowupContinuationCarry(unittest.TestCase):
                 recs1 = [uline(T0, "add a GUI control for the deep-sleep window", "u1", ps="typed"),
                          aline(T0 + 10, "Built it, pushed, verified.", "a1", "u1", stop="end_turn")]
                 tpath.write_text("\n".join(json.dumps(r) for r in recs1) + "\n")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
                 gid = next(iter(store["nodes"]))
@@ -8358,7 +8546,7 @@ class FollowupContinuationCarry(unittest.TestCase):
                                  aline(T0 + 110, "Confirmed: defaults to off, verified on device.",
                                        "a2", "u2", stop="end_turn")]
                 tpath.write_text("\n".join(json.dumps(r) for r in recs2) + "\n")
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW + 200)
                 return jd.load_goals(SID), gid
             finally:

@@ -211,9 +211,15 @@ class _PerfStats:
       sends                        full / delta / deduped -> {slot: {count, bytes}} per dedup-slot
                                    name (chat, feed, bars, taborder, ...; at most SLOTS names, the rest
                                    under "other"). A deduped frame was built and compared, not sent
-      goals                        loads, saves, writes: judge.load_goals calls, save_goals calls,
-                                   and the saves that reached the disk (a byte-identical republish
-                                   is a save without a write)
+      goals                        loads, saves, writes: judge.load_goals calls (the writer's loader;
+                                   the pusher's read-only loads ride load_goals_shared and show under
+                                   memos.shared), save_goals calls, and the saves that reached the
+                                   disk (a byte-identical republish is a save without a write)
+      memos                        pass / shared / chain: the judge pass's stat-keyed store memo
+                                   (_goals_memo_report: hit, miss, fail, evict, punch, entries,
+                                   bytes), the pusher's shared read-only store cache
+                                   (judge.shared_store_stats) and the write-moment chain memo
+                                   (judge.chain_memo_stats)
       judge                        passes (one per _producer pass), ms_sum / ms_last / ms_mean (wall:
                                    a pass is a join over the tier threads, so this is mostly model
                                    latency), cpu_ms_sum (CPU: the two tier threads' own time, from
@@ -364,10 +370,20 @@ class _PerfStats:
             goals = jd.goal_io_stats()
         except Exception:
             goals = {}
+        # The three identity memos' readers land here (review find, 2026-09-08: they had no consumer): the
+        # judge pass's stat-keyed store memo, the pusher's shared read-only store cache and the write-moment
+        # chain memo. `goals.loads` is the writer's loader alone; the pusher's loads show under memos.shared.
+        memos = {}
+        for key, read in (("pass", _goals_memo_report), ("shared", jd.shared_store_stats),
+                          ("chain", jd.chain_memo_stats)):
+            try:
+                memos[key] = read()
+            except Exception:
+                memos[key] = {}
         now = time.time()
         return {"now": now, "since": since, "uptime_s": now - _STARTED, "log": _PERF,
                 "process": _process_stats(), "pusher": pusher, "stages_ms": stages,
-                "builds": builds, "sends": sends, "goals": goals, "judge": judge, "http": http}
+                "builds": builds, "sends": sends, "goals": goals, "memos": memos, "judge": judge, "http": http}
 
 
 _PERF_STATS = _PerfStats()
@@ -8156,7 +8172,7 @@ def _open_top_goal(sid):
     their notes lifted while they still held exactly those). Was _working_top_goal ('working' only), whose
     sole caller was that expiry."""
     try:
-        store = jd.load_goals(sid)
+        store = jd.load_goals_shared(sid)           # read-only: a top's status
     except Exception:
         return None
     nodes = store.get("nodes", {}); status = store.get("status", {})
@@ -8986,6 +9002,12 @@ def _lift_spent_awaiting(now, tmux):
             # reply), the SDK reg (the CLI epoch) and the backend's live task set. Unchanged since the
             # last cycle → the ruling is unchanged → skip the load (2026-09-03: this ran a full store
             # load + journal replay per live session per 0.5 s cycle on a quiet board).
+            # A recorded fingerprint stands for a ruling made from the files' CONTENT. A load that raises
+            # forgets its entry (the except below), a load that FAULTS forgets it (the boundary's (None,
+            # fault) answer below), and so does one whose store parsed but whose override JOURNAL did not
+            # read: _replay_overrides logs history-unreadable, returns the store without the user's rows
+            # and marks it `_unread`. A ruling on that store is not a ruling on the files (a stamp the
+            # journal restored is missing from it), so the entry is forgotten and the next cycle retries.
             snap = tmux.get(sid) or {}
             # …plus the two facts the ruling reads that no file records: the live subagent count, and
             # for every dispatch the transcript pairs, WHETHER its recorded deadline has passed (a
@@ -9005,6 +9027,8 @@ def _lift_spent_awaiting(now, tmux):
             if fault is not None:                     # its row is filed; forget the gate so the next cycle
                 _lift_seen.pop(sid, None)             # retries this session, and go on to the others
                 continue
+            if store.get("_unread"):                  # the store read but its journal did not (the mark):
+                _lift_seen.pop(sid, None)             # not a ruling on the files; the next cycle retries
             nodes = store.get("nodes") or {}
             stamped = [nd for nd in nodes.values()
                        if nd.get("awaitingWhy") and nd.get("awaitingAt") and not nd.get("rolledUp")]
@@ -10113,7 +10137,7 @@ def _deferral_sweep_tick(now):
     drop = []
     for sid, recs in by_sid.items():
         try:
-            store = jd.load_goals(sid)
+            store = jd.load_goals_shared(sid)           # read-only: nodes, status, confirming, log rows
         except Exception:
             continue                                   # unreadable store → records stand; nothing silent
         nodes, status = store.get("nodes", {}) or {}, store.get("status", {}) or {}
@@ -19052,8 +19076,9 @@ SYNC_RING = 40
 def _sync_notice(text, ok=True, kind="sync"):
     """One row on the ring the shell's bell mirrors. `kind` is the bell kind the row is filed under:
     "sync" (the default, the ring's original tenant: a machine sync) or "refused" (a state file that
-    could not be read or written, or was moved aside), so a mute on one never hides the other (review
-    find, 2026-09-08). The shell allowlists the value; anything it does not know reads as sync."""
+    could not be read or written, or was moved aside, or a session's chat frame that could not be
+    built), so a mute on one never hides the other (review find, 2026-09-08). The shell allowlists the
+    value; anything it does not know reads as sync."""
     global _SYNC_SEQ
     with _SYNC_LOCK:
         _SYNC_SEQ += 1
@@ -21864,7 +21889,7 @@ def _session_stamp_read(sid):
         return hit[1]
     full, tops, deleg = (None, None, None, None, ()), set(), ()
     try:                                               # load_goals (not a raw read) so overrides replay —
-        store = jd.load_goals(sid)                     # the same view _goal_awaiting_stamp sees on the card
+        store = jd.load_goals_shared(sid)              # the same view _goal_awaiting_stamp sees on the card
         nodes = store.get("nodes", {})
         status = store.get("status", {}) or {}
         best = None
@@ -22773,7 +22798,7 @@ def _owned_yield_why(sid, path):
     if not owned:
         return None
     try:
-        store = jd.load_goals(sid)
+        store = jd.load_goals_shared(sid)           # read-only: nodes + status
         nodes = store.get("nodes", {})
         status = store.get("status", {}) or {}
     except Exception:
@@ -24537,7 +24562,72 @@ _judge_gen = [0]                                 # bumped when a producer pass C
 _goals_snap = [None]                             # {sid: store} while a judge pass is mid-flight, else None
 _goals_snap_at = [0.0]                           # when that snapshot's file reads STARTED (see _feed_goals)
 _goals_snap_done = {}                            # sid → the user-write mark already punched onto THIS snapshot
+_goals_snap_owned = set()                        # sids whose snapshot entry is THIS pass's private copy (copy-on-punch)
 _goals_snap_lock = threading.Lock()
+# STAT-KEYED STORE MEMO (2026-09-06). The snapshot used to json.loads EVERY goals/<fsid>.json at the
+# start of every pass — on one busy kernel 72 files of up to 1.3 MB, about 3% of its interpreter time
+# and most of the producer thread's cost — although a pass changes only a few of them. Every writer
+# publishes by rename (save_goals), so the bytes under an inode never change once it is at its path. The
+# memo keeps the parsed object per path under (st_ino, st_mtime_ns, st_size); a pass stats every file,
+# decodes only the ones whose key moved, and builds the snapshot from memo REFERENCES. Consequence: a
+# snapshot entry is shared with later passes, so nothing may mutate it — _feed_goals copies an entry
+# before punching a user gesture onto it (the _apply_rewind_hold idiom), and build_feed only reads. A
+# version that fails to decode is remembered under its key too, so a corrupt store is decoded (and
+# reported) once per file version rather than once per pass; its sid stays out of the snapshot and the
+# feed reads it live. A read that fails (EMFILE under descriptor pressure, EIO) is not remembered: that
+# is the pass's failure, not the version's, so the next pass reads the file again, as every pass did
+# before the memo. Entries for paths gone from the directory are evicted at the next pass, and the
+# compaction sweep after each pass evicts the entries of stores no discovered session owns
+# (_goals_memo_evict_unowned), so the resident set is bounded by the live board.
+# WHAT THE KEY RESTS ON: st_mtime_ns moving between publishes, not the inode. Inode numbers recycle
+# (on ext4, consecutive tmp+rename publishes of one path alternate between two numbers, so the third
+# version can sit on the first's inode), and equal sizes are common (a digit bump, a same-length
+# status word). On Linux 6.13+ (multigrain timestamps) the move is guaranteed: the pass's own stat
+# marks the inode as queried, so the next publish gets a fine-grained stamp. On a coarse-timestamp
+# kernel, two equal-size publishes of one store inside one clock tick after the pass's stat reproduce
+# the memoized key and pin the earlier parse until the store's next publish — a known blind spot. A byte
+# compare on a stat hit closes it; this memo does not carry one, so the cost is one pass serving the
+# earlier parse (a stale card until the store's next publish, never a wrong write).
+_goals_memo = [{}]                               # path → ((st_ino, st_mtime_ns, st_size), parsed store | _GOALS_MEMO_BAD)
+_GOALS_MEMO_BAD = object()                       # a file version that did not decode: no snapshot entry, no retry until it changes
+# Bare `+= 1` increments with one writer per key: hit/miss/fail/evict are written only by the producer thread
+# (_begin_goals_pass runs only from _producer) and punch only under _goals_snap_lock, so no key has two writers.
+_goals_memo_stats = {"hit": 0, "miss": 0, "fail": 0, "evict": 0, "punch": 0}   # read by tests and GET /perf (memos.pass)
+
+
+def _goals_memo_decode(data):
+    """The memo's one decode: a raw parse of the file's bytes, exactly what the snapshot always held
+    (no _guard_nodes, no replay — those are load_goals' business). A module function so tests count
+    decodes here rather than by patching json.loads."""
+    return json.loads(data)
+
+
+def _goals_memo_report():
+    """The memo's counters plus its current occupancy: `entries` memoized paths and `bytes` their summed
+    on-disk size (a proxy for the parsed objects' footprint). GET /perf reports it as memos.pass."""
+    memo = _goals_memo[0]
+    out = dict(_goals_memo_stats)
+    out["entries"] = len(memo)
+    out["bytes"] = sum(k[2] for k, v in memo.values() if v is not _GOALS_MEMO_BAD)
+    return out
+
+
+def _goals_memo_evict_unowned(owned):
+    """Drop the entries of stores no session in `owned` (the discover set's sids) holds. The memo had no
+    cap: every store the directory held stayed decoded in memory between passes, tens of MB on a large
+    board (review find, 2026-09-08). The compaction sweep calls this after the tiers, on the producer
+    thread, the memo's one writer. The price is one decode at the next pass for such a store the pass
+    still lists (what every pass paid before the memo); the stores a discovered session owns keep their
+    entries. A swap, never an in-place mutation: a /perf reader may be iterating the old dict."""
+    memo = _goals_memo[0]
+    kept = {path: ent for path, ent in memo.items() if os.path.basename(path)[:-5] in owned}
+    gone = len(memo) - len(kept)
+    if gone:
+        _goals_memo[0] = kept
+        _goals_memo_stats["evict"] += gone
+    return gone
+
+
 # A USER gesture (card reply, Move to Working, resolve) must NEVER wait out a pass (the user 2026-07-21).
 # The snapshot above exists to hide half-applied JUDGE writes; it was also hiding the user's own, because
 # optimistic_followup writes the LIVE store while the feed reads the frozen copy. A reply landing
@@ -24552,27 +24642,77 @@ def _note_user_goal_write(sid):
     _user_goal_write[str(sid)] = time.time()
 
 def _begin_goals_pass():
-    """Capture the PRE-pass goal stores so build_feed serves a pass-boundary-consistent view for the pass."""
-    at = time.time()          # stamped BEFORE the reads: a write racing this loop must count as AFTER them,
-    snap = {}                 # so it gets replayed onto the snapshot rather than lost to the read order
+    """Capture the PRE-pass goal stores so build_feed serves a pass-boundary-consistent view for the pass.
+
+    Stat-keyed (see the memo note above): each store is decoded only when its (ino, mtime_ns, size)
+    moved since the last pass; an unchanged one is served as the memoized object. The key is taken by
+    fstat on the fd the bytes are read from, so key and content are the same file version: a rename
+    landing between the listing's stat and the open is read whole from the new inode and keyed as
+    such. Any race the other way (content newer than its key) only costs one extra decode next pass;
+    it can never pin a stale parse, because the next stat sees a moved key. The one way a stale parse
+    CAN pin is the coarse-timestamp blind spot in the memo note above (equal size, recycled inode, same
+    clock tick); on a multigrain-timestamp kernel it does not occur."""
+    # ui/webview/feed-move-ack.test.ts pins the next line's comment text ("stamped BEFORE the reads").
+    at = time.time()          # stamped BEFORE the reads and the stats that gate them: a write racing this loop
+    snap = {}                 # must count as AFTER them, so it is replayed onto the snapshot, not lost to the read order
+    prev = _goals_memo[0]
+    memo = {}
+    hit = miss = fail = 0
     try:
-        for p in jd.GOALDIR.glob("*.json"):
-            try:
-                snap[p.stem] = json.loads(p.read_text())
-            except Exception:
-                pass
-    except Exception:
-        pass
+        entries = [e for e in os.scandir(jd.GOALDIR) if e.name.endswith(".json") and e.is_file()]
+    except OSError:
+        entries = []
+    for ent in entries:
+        path, sid = ent.path, ent.name[:-5]
+        try:
+            st = ent.stat()
+            key = (st.st_ino, st.st_mtime_ns, st.st_size)
+            old = prev.get(path)
+            if old is not None and old[0] == key:
+                hit += 1                                   # same file version → the memoized parse (or its
+                memo[path] = old                           # remembered decode failure) stands
+                if old[1] is not _GOALS_MEMO_BAD:
+                    snap[sid] = old[1]
+                continue
+            with open(path, "rb") as fh:
+                st = os.fstat(fh.fileno())
+                key = (st.st_ino, st.st_mtime_ns, st.st_size)
+                data = fh.read()
+            store = _goals_memo_decode(data)
+        except FileNotFoundError:
+            continue                                       # gone between the listing and the read: no store
+        except OSError as e:                               # unreadable (EMFILE, EIO): out of the snapshot for THIS
+            fail += 1                                      # pass and not remembered, so the next pass reads it again
+            sys.stderr.write("goals-pass: %s: %s: %s (not in the pass snapshot; served live, read again next pass)\n"
+                             % (ent.name, type(e).__name__, e))
+            continue
+        except Exception as e:                             # undecodable: out of the snapshot (the feed reads it
+            fail += 1                                      # live, as before), said once per version
+            memo[path] = (key, _GOALS_MEMO_BAD)
+            sys.stderr.write("goals-pass: %s: %s: %s (not in the pass snapshot; served live until the file changes)\n"
+                             % (ent.name, type(e).__name__, e))
+            continue
+        miss += 1
+        memo[path] = (key, store)
+        snap[sid] = store
+    _goals_memo[0] = memo
+    _goals_memo_stats["hit"] += hit
+    _goals_memo_stats["miss"] += miss
+    _goals_memo_stats["fail"] += fail
+    _goals_memo_stats["evict"] += len(prev.keys() - memo.keys())
     with _goals_snap_lock:
         _goals_snap[0] = snap
         _goals_snap_at[0] = at
         _goals_snap_done.clear()
+        _goals_snap_owned.clear()
 
 def _end_goals_pass():
-    """Pass over — drop the snapshot so reads go live again (post-pass results + any user writes show now)."""
+    """Pass over — drop the snapshot so reads go live again (post-pass results + any user writes show now).
+    The memo keeps its parsed stores: they are the next pass's cache hits."""
     with _goals_snap_lock:
         _goals_snap[0] = None
         _goals_snap_done.clear()
+        _goals_snap_owned.clear()
 
 def _feed_goals(sid):
     """Goal store for the FEED, frozen at the pre-pass snapshot while a judge pass is mid-flight (so a card
@@ -24591,6 +24731,14 @@ def _feed_goals(sid):
         if snap is not None and sid in snap:
             store, mark = snap[sid], _user_goal_write.get(str(sid), 0.0)
             if mark >= _goals_snap_at[0] and _goals_snap_done.get(sid) != mark:
+                if sid not in _goals_snap_owned:
+                    # COPY-ON-PUNCH: the entry is the memo's object, shared with every later pass that
+                    # finds the file unchanged, so the replay and rollup below must land on a copy of it
+                    # (the _apply_rewind_hold idiom). Once per pass per sid: a second gesture in the
+                    # same pass punches the copy this one made.
+                    store = snap[sid] = json.loads(json.dumps(store))
+                    _goals_snap_owned.add(sid)
+                    _goals_memo_stats["punch"] += 1
                 try:
                     jd._replay_overrides(sid, store)   # the reopen/move/resolve/unclear event, applied by the judge's own code
                     jd.rollup_status(store, False)     # …and the card's column follows it (the user just acted → working)
@@ -28286,8 +28434,9 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
     events, by_tool = [], {}                  # by_tool: tool_use_id → its tool event (fill output later)
     uuid2seg, seg_anchors = {}, {}            # atom uuid → seg id; seg id → (promptId, workId) for the dot/bar split
     seg_trig, seg_work = {}, {}               # goal-node DEEP-LINK anchors: prompt = the segment's trigger
-    _bs_store, _bs_fault = jd.load_goals_or_fault(sid)   # seam-aware seg ids (mirror the judge's split); a
-    #                                                      FAULT (row filed) → None → seams off, the tab still builds
+    _bs_store, _bs_fault = jd.load_goals_shared_or_fault(sid)   # seam-aware seg ids (mirror the judge's split):
+    #                                                             the shared read-only view; a FAULT (row filed) →
+    #                                                             None → seams off, the tab still builds
     #                                          (the per-turn seg loop runs below, after the fold decision)
     last_t = None
     last_model = ""                           # the model on the most recent assistant message (system-card meta)
@@ -29171,9 +29320,9 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
     # LEAF: its descendants are hidden even if open. Skip cleared nodes. `current` marks the focus node
     # being worked on (the graph's lastNode) so render can point a line at it; done nodes carry their
     # time for a recency-coloured "(Xm ago)" on the right.
-    gstore, gfault = jd.load_goals_or_fault(sid)   # a FAULT (row filed) → None: this tab's ledger tree
-    if gfault is None:                             # renders EMPTY instead of every tab's build failing
-        gstore = _apply_rewind_hold(sid, gstore)   # a pending rewind's cards hide on EVERY
+    gstore, gfault = jd.load_goals_shared_or_fault(sid)   # the shared read-only view; a FAULT (row filed) →
+    if gfault is None:                                    # None: this tab's ledger tree renders EMPTY instead
+        gstore = _apply_rewind_hold(sid, gstore)          # of every tab's build failing. A pending rewind's cards hide on EVERY
     #                                            surface — this ledger tree (and the tab-hover
     #                                            recents derived from it) used to keep showing the
     #                                            doomed asks for the whole armed window while the
@@ -30024,9 +30173,26 @@ _compact_seen = {}                                     # fsid → live-store mti
 
 def _compact_goal_stores():
     """Sweep every session's goal store, archiving newly-cleared tops. Cheap: skips a store whose live file
-    hasn't changed since the last sweep (no new clears, no judge write), so the steady state is just stats."""
+    hasn't changed since the last sweep (no new clears, no judge write), so the steady state is just stats.
+    Runs on the producer thread after the tiers join (its caller's single-writer slot): the pass memo it
+    evicts from has that thread as its one writer."""
     import glob
     moved = 0
+    try:
+        jd._disk_memo_evict_absent()                   # save_goals' disk-side memo: drop removed stores' entries
+        jd._shared_evict_absent()                      # ...and the shared read-only views of removed stores
+    except Exception:
+        pass
+    try:
+        # ...and, for the two memos that hold PARSED stores, the entries of stores no discovered session
+        # owns: neither had a cap (review find, 2026-09-08). discover is cached behind the transcript
+        # directory's fingerprint, so this is the tiers' own list, not a second walk. A discover that
+        # raises evicts nothing: with no owner list there is no unowned.
+        owned = {f for f, _p, _a, _n in jd.discover(int(time.time()))}
+        jd._shared_evict_unowned(owned)
+        _goals_memo_evict_unowned(owned)
+    except Exception:
+        sys.stderr.write("compact: memo eviction: %s\n" % traceback.format_exc())
     try:
         paths = glob.glob(str(jd.GOALDIR / "*.json"))
     except Exception:
@@ -31263,7 +31429,7 @@ def build_feed(now, tmux=None):
                 # offered Continue. Badges persist for the card's life, so one absorbed badge
                 # poisoned the session's whole card tail.
                 psid, gid = o["peer"], o.get("goalId")
-                pstore, pfault = jd.load_goals_or_fault(psid) if gid else (None, None)
+                pstore, pfault = jd.load_goals_shared_or_fault(psid) if gid else (None, None)   # read-only peer view
                 sgoal = pstore.get("nodes", {}).get(gid) if pstore is not None else None
                 origin_live = bool(sgoal and not sgoal.get("nodeComplete") and not sgoal.get("cleared")
                                    and gid not in cleared)   # a sender whose store faults reads absorbed (dimmed,
@@ -32927,7 +33093,7 @@ def _msg_sum_scan_session(sid, path, now):
         return {}
     sub = {}
     session = _parse(path, sid, now)
-    mstore = jd.load_goals(sid)
+    mstore = jd.load_goals_shared(sid)               # read-only: the seams for the seg ids
     for turn in session["turns"]:
         for seg in _segs_seam(turn, mstore):
             cap = _seg_work_caption(caps, seg["id"])     # drift-safe: the store id came from the judge's parse
@@ -34237,9 +34403,9 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
         tm = tmux.get(sid)
         live = tm is not None
         hexcol = (tm and tm["color"]) or (_name_color(sid) or {}).get("bg", "#888888")
-        goals, gfault = jd.load_goals_or_fault(sid)  # a FAULT (row filed) → None: this lane renders without
-        if gfault is not None:                       # goal-derived data (blocked state, seams, judging marks)
-            _bars_complain(sid, "goals", gfault)     # and the frame ships for every other lane
+        goals, gfault = jd.load_goals_shared_or_fault(sid)   # read-only view (seams + judging marks); a FAULT (row
+        if gfault is not None:                       # filed) → None: this lane renders without goal-derived data
+            _bars_complain(sid, "goals", gfault)     # (blocked state, seams, marks) and the frame ships for every other lane
         if with_bars:
             try:
                 session = _parse(s["path"], sid, now)
@@ -37495,6 +37661,38 @@ def _note_chat_divergence(sid, name, chat_state, row_state, now):
         pass
 
 
+_chat_build_faults = {}   # sid -> the fault text of its CURRENT chat-build episode; ONE stderr traceback + bell row per episode
+_chat_build_faults_lock = threading.Lock()   # the pusher and a connect push both run _push, on their own threads
+
+
+def _chat_build_fault(s, exc):
+    """Name a session whose chat build raised, on stderr (with the traceback) AND as a dashboard bell row,
+    ONCE per fault episode. _push skips the session's frame for the cycle (see its catch), so without this
+    the user's only sign was a pane that stopped updating, and a build that fails the same way every cycle
+    (its input stands) wrote a full traceback every 0.5-3 s (review find, 2026-09-08). The episode is the
+    fault TEXT, the _git_file_fault rule: an identical repeat says nothing, a different fault on the same
+    session is a new episode, and a build that succeeds ends it (_chat_build_ok). The bell row wears the
+    kind a state file that cannot be read wears. Never raises: the bell is a courtesy inside the push."""
+    sid = str(s.get("sid") or "")
+    text = "%s: %s" % (type(exc).__name__, exc)
+    with _chat_build_faults_lock:                     # check-and-set as ONE step: two _push threads faulting
+        if _chat_build_faults.get(sid) == text:       # the same session must not both speak
+            return
+        _chat_build_faults[sid] = text
+    sys.stderr.write("push build: chat %s: %s\n" % (sid[:8], traceback.format_exc()))
+    try:
+        _sync_notice("chat: the pane for %s cannot be built (%s); it keeps its last frame until a build succeeds"
+                     % (s.get("name") or sid[:8], text), ok=False, kind="refused")
+    except Exception:
+        pass
+
+
+def _chat_build_ok(sid):
+    """A chat build that succeeded ends the session's fault episode, so the same fault later is said anew."""
+    if _chat_build_faults:                            # the common case (no episode open) pays no lock
+        with _chat_build_faults_lock:
+            _chat_build_faults.pop(str(sid), None)
+
 
 def _push(targets, connect=False, tmux=None):
     """Build the payloads once (cached parses) and send each target only the pieces that CHANGED for it.
@@ -37574,7 +37772,18 @@ def _push(targets, connect=False, tmux=None):
                     _VIEW_STATS["chatBuildActive" if is_active else "chatBuildBg"] += 1
                     started = time.time()                # the _views_dirty floor for this build (start-keyed)
                     _t0 = time.monotonic()
-                    m = build_session(s["sid"], now, tmux)
+                    try:
+                        m = build_session(s["sid"], now, tmux)
+                    except Exception as e:
+                        # One session's failed chat build costs that session's frame this cycle, not every
+                        # client's whole push: the cycle-level catch below ("push build:") would return
+                        # before the feed and the timeline were built, and a build that fails the same way
+                        # every cycle would freeze the board for as long as its input stands (2026-09-06).
+                        # Said ONCE per fault episode, on stderr and as a dashboard bell row, so the pane
+                        # that stopped updating is not a silent degrade (review find, 2026-09-08).
+                        _chat_build_fault(s, e)
+                        continue
+                    _chat_build_ok(s["sid"])             # a build that succeeds ends its fault episode
                     # The full serialization is LAZY (the 2026-08-10 CPU fix, round two): steady state
                     # sends only chatTail suffixes, so an eager json.dumps of the WHOLE payload — multi-MB
                     # for a busy active tab, re-dumped every cycle just to be discarded — was the largest

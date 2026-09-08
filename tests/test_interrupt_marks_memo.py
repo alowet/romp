@@ -210,7 +210,7 @@ class _MemoHarness(unittest.TestCase):
         km._autonudge_cache.clear()
         km._pending_ops.clear()
         km._intr_marks_memo.clear()
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def tearDown(self):
         jd._rebind_state(self.saved[0])
