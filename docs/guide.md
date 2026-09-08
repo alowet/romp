@@ -551,6 +551,15 @@ user account). Local tools (the CLI, hooks, the bus, the editor extension) read
 that file and send it automatically, so you never type it. Only liveness probes
 (`/healthz`, `/version`, `/busy`, and the bus's `/ping`) are exempt.
 
+The kernel and the bus mint that file when it is missing, one mint between them
+under a sibling lock file, `serve-token.lock`. An existing token is never
+replaced: a file left looser than `0600` is tightened at the next start (its
+value is kept, so every client stays valid), and a token that exists but cannot
+be read, or a symlink at that path, refuses to start instead of minting a
+replacement nobody else holds. Under the service that refusal repeats in
+`manager.log` every 10 seconds until you repair the file; the kernel then comes
+back on its own.
+
 A browser cannot read that file, which is why the link `romp` prints carries the
 token in it. The first visit trades it for a year-long cookie, so the bare
 `http://127.0.0.1:29855/` works from then on; `romp url` prints the link again

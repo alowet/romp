@@ -13,10 +13,12 @@ kernel's tests pin in tests/test_kernel_serve_token_mode.py, whose docstring car
 born 0600 by rename of a finished temp with the live path never opened for writing, one mint among
 racing starters under serve-token.lock, an unreadable existing token is a refusal, never a rotation
 (the old bus loader minted its OWN token on any read fault, and every request it then made was a
-silent 403), a loose token is tightened and kept, an empty file is minted over aloud, and without the
-lock only a good 0600 token is returned. The last three each kill a postal-only mutant that the
-kernel tests' invariant pins let through in review; the kernel tests' AST-identity pin now catches
-any such drift as well, and these say what it broke.
+silent 403), a loose token is tightened and kept (only the bits outside 0600 go; a tighter 0400 is
+left alone), a symlink at the token path is refused with its target untouched, an empty file is
+minted over aloud, and without the lock only a token with nothing to tighten is returned, the
+refusal otherwise naming the lock. The tighten, empty-file and lock-failure cases each kill a
+postal-only mutant that the kernel tests' invariant pins let through in review; the kernel tests'
+AST-identity pin now catches any such drift as well, and these say what it broke.
 
 Synthetic only — hermetic temp state dir, placeholder names, no real session data.
 """
@@ -45,9 +47,25 @@ os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel's export outranks the XD
 _SESS = os.path.join(os.environ["XDG_STATE_HOME"], "sessions.json")
 Path(_SESS).write_text("[]")
 os.environ["ROMP_SESSIONS_FILE"] = _SESS
-ps = SourceFileLoader("romp_postal_token", os.path.join(BIN, "romp-postal-service")).load_module()
+# An INVENTED token, assigned (not setdefault) for the load only: with the runner's own ROMP_SERVE_TOKEN
+# exported, TOK was that real token, and _PostalTokenFile._restore wrote it to disk under the test's
+# state dir (review find, 2026-09-08). Nothing real ever reaches this file now. The variable is put
+# back the moment the bus has captured it: pytest imports every collected module before any test
+# runs, so an import-time write that STAYED would change what every sibling module sends or captures
+# from os.environ (the hazard test_color_route.py and test_perf_stats.py describe); a write this
+# module made for itself must not outlive its own import.
+_prev_serve_token = os.environ.get("ROMP_SERVE_TOKEN")
+os.environ["ROMP_SERVE_TOKEN"] = "bus-test-token-DO-NOT-USE"
+try:
+    ps = SourceFileLoader("romp_postal_token", os.path.join(BIN, "romp-postal-service")).load_module()
+finally:
+    if _prev_serve_token is None:
+        os.environ.pop("ROMP_SERVE_TOKEN", None)
+    else:
+        os.environ["ROMP_SERVE_TOKEN"] = _prev_serve_token
 
 TOK = ps.SERVE_TOKEN
+assert TOK == "bus-test-token-DO-NOT-USE", "the gate's constant is the invented token, never the runner's"
 
 
 def _code(port, path, headers=None, method="GET", data=None):
@@ -308,9 +326,9 @@ def _mode(p):
 
 class _PostalTokenFile(unittest.TestCase):
     """Drives _load_serve_token against the file the kernel mints (STATE.parent / "serve-token").
-    SERVE_TOKEN, the module constant the gate compares against, was minted at import and is not
-    touched; each case ends by putting TOK back so the file and the constant agree again. The umask
-    is 0 so only the loader's own modes protect what it writes."""
+    SERVE_TOKEN, the module constant the gate compares against, is the invented TOK from import and
+    is not touched; each case ends by putting TOK back so the file and the constant agree again. The
+    umask is 0 so only the loader's own modes protect what it writes."""
 
     def setUp(self):
         self.f = ps.STATE.parent / "serve-token"
@@ -325,7 +343,7 @@ class _PostalTokenFile(unittest.TestCase):
         for p in [self.f, self.lock] + list(self.f.parent.glob("serve-token.*.tmp")):
             if p.is_dir():
                 p.rmdir()                    # PostalLockFailureIsFailClosed plants a directory at the lock path
-            elif p.exists():
+            elif p.is_symlink() or p.exists():   # PostalSymlinkIsRefused plants a link
                 p.unlink()
 
     def _restore(self):
@@ -456,6 +474,47 @@ class PostalTightenMode(_PostalTokenFile):
         self.assertIn("0600", err.getvalue())
         self.assertEqual(self._temps(), [])
 
+    def test_a_tighter_token_is_left_alone_and_only_loose_bits_are_stripped(self):
+        """0400 has nothing outside 0600 and is left as is, silently; 0640 loses its group read and
+        keeps its owner bits. The equality check widened 0400 to 0600 and called it a repair (review
+        find, 2026-09-08). Expected first error on that shape: 0o600 != 0o400."""
+        self.f.write_text("tight-DO-NOT-USE\n")
+        os.chmod(self.f, 0o400)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(ps._load_serve_token(), "tight-DO-NOT-USE")
+        self.assertEqual(_mode(self.f), 0o400, "a mode tighter than 0600 is not widened")
+        self.assertEqual(err.getvalue(), "", "and nothing is said: nothing was changed")
+        self._clear()
+        self.f.write_text("keep-me-DO-NOT-USE\n")
+        os.chmod(self.f, 0o640)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(ps._load_serve_token(), "keep-me-DO-NOT-USE")
+        self.assertEqual(_mode(self.f), 0o600)
+        self.assertIn("0640", err.getvalue())
+        self.assertIn("0600", err.getvalue())
+
+
+class PostalSymlinkIsRefused(_PostalTokenFile):
+    def test_a_symlink_at_the_token_path_is_a_fault_and_its_target_is_untouched(self):
+        """stat and chmod follow a link, so the following shape read some other file as the token and
+        rewrote that file's mode (review find, 2026-09-08). Expected first error on it: RuntimeError
+        not raised."""
+        target = self.f.parent / "elsewhere-DO-NOT-USE"
+        target.write_text("linked-DO-NOT-USE\n")
+        os.chmod(target, 0o644)
+        self.addCleanup(target.unlink)
+        self.f.symlink_to(target)
+        with self.assertRaises(RuntimeError) as cm:
+            ps._load_serve_token()
+        self.assertIn(str(self.f), str(cm.exception), "the refusal names the token path")
+        self.assertIn("symlink", str(cm.exception))
+        self.assertEqual(_mode(target), 0o644, "the target's mode is not rewritten through the link")
+        self.assertEqual(target.read_text(), "linked-DO-NOT-USE\n")
+        self.assertTrue(self.f.is_symlink(), "the link is left for the operator to remove")
+        self.assertEqual(self._temps(), [])
+
 
 class PostalEmptyFileMints(_PostalTokenFile):
     def test_an_empty_or_whitespace_file_is_a_torn_mint_and_is_minted_over_aloud(self):
@@ -493,9 +552,16 @@ class PostalLockFailureIsFailClosed(_PostalTokenFile):
         self.assertIn(str(self.lock), str(cm.exception), "the refusal names the lock path")
         self.assertIn("EISDIR", str(cm.exception))
         self.assertEqual(_mode(self.f), 0o644, "no unlocked write of any kind, not even a chmod")
+        os.chmod(self.f, 0o400)               # (d) tighter than 0600: nothing to tighten, so returned like a 0600 one
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ps._load_serve_token(), "good-DO-NOT-USE")
+        self.assertEqual(_mode(self.f), 0o400)
         self.f.unlink()
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(RuntimeError) as cm:
             ps._load_serve_token()
+        self.assertIn(str(self.lock), str(cm.exception), "with no token file, the refusal names the lock and the fault")
+        self.assertIn("no token file", str(cm.exception))
+        self.assertNotIn("Make the file yours", str(cm.exception), "not a token file that does not exist (review find, 2026-09-08)")
         self.assertFalse(self.f.exists(), "nothing minted unlocked")
         self.assertEqual(self._temps(), [])
 

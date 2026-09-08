@@ -15,7 +15,14 @@ The old loader failed the second job in three ways, each pinned here by a case t
 TightenMode (a loose existing file is chmod'd, its value kept), EmptyFileMints (a 0-byte or
 whitespace file is a torn earlier mint and is minted over, aloud), LockFailureIsFailClosed (no
 lock: a good 0600 token is returned, anything else is a refusal) and StaleTempsAreSwept (a crashed
-attempt's temp, any pid's, is removed before the mint) pin the rest of the contract, and
+attempt's temp, any pid's, is removed before the mint) pin the rest of the contract. From review
+(2026-09-08): CheckinCarriesServedToken (the handshake announces TOKEN and never touches the file),
+TempIsExclusive (O_EXCL is behaviour, not source text: a file already at the temp path is never
+written over), SymlinkIsRefused (a link at the token path is a fault, its target untouched),
+LockWaitIsAnnounced (a starter blocked by another holder says so before waiting), ImportRefusalIsLoud
+(a read fault at import exits the kernel non-zero with the file untouched, in a subprocess), and the
+tighter-mode cases in TightenMode and LockFailureIsFailClosed (0400 is left alone; only bits outside
+0600 go).
 ServeTokenLoadersMatch pins the bus's copy of the routine to the kernel's, since the bus imports
 nothing from kernel/ and carries its own: AST identity with the docstring stripped (any divergence
 is red), plus the named invariants as a readable second layer.
@@ -28,12 +35,16 @@ Synthetic only: hermetic temp STATE, placeholder tokens.
 """
 import ast
 import contextlib
+import fcntl
 import io
 import os
 import re
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -73,7 +84,7 @@ class _TokenFile(unittest.TestCase):
         for p in [self.f, self.lock] + list(km.jd.STATE.glob("serve-token.*.tmp")):
             if p.is_dir():
                 p.rmdir()                    # LockFailureIsFailClosed plants a directory at the lock path
-            elif p.exists():
+            elif p.is_symlink() or p.exists():   # SymlinkIsRefused plants links, one of them dangling
                 p.unlink()
 
     def _restore(self):
@@ -114,10 +125,11 @@ class ServeTokenFileMode(_TokenFile):
                          "place, so there is no pre-existing inode to tighten (TightenMode covers the "
                          "one case where there is)")
 
-    def test_a_pre_existing_loose_file_is_still_tightened(self):
+    def test_a_loose_empty_file_is_minted_over_and_the_new_inode_is_born_0600(self):
         # An empty serve-token left at 0644 (a torn earlier mint, or one written before this change)
         # is minted over: the rename swaps in a NEW inode born 0600, so the loose mode goes with the
-        # old one.
+        # old one. (Named for what it exercises, the mint-over path, not the tighten: review find,
+        # 2026-09-08. TightenMode covers a NON-empty loose file.)
         self.f.write_text("")                # empty → a torn earlier mint → falls through to the mint
         os.chmod(self.f, 0o644)
         with contextlib.redirect_stderr(io.StringIO()):
@@ -197,25 +209,32 @@ class TokenBirth(_TokenFile):
         torn window a concurrent reader fell into). Expected first error on the old loader: the
         rename count is 0, because it wrote the live file in place."""
         os.umask(0o022)
-        swaps, opens = [], []
-        real_replace, real_open = os.replace, os.open
+        swaps, opens, synced = [], [], []
+        real_replace, real_open, real_fsync = os.replace, os.open, os.fsync
 
         def _replace(src, dst, *a, **k):
-            swaps.append((str(src), str(dst), _mode(src), Path(src).read_text()))
+            # what had been fsynced by the instant of the swap: the inode list is behaviour the source-text
+            # pin on `os.fsync(` cannot see (review find, 2026-09-08)
+            swaps.append((str(src), str(dst), _mode(src), Path(src).read_text(), os.stat(src).st_ino, list(synced)))
             return real_replace(src, dst, *a, **k)
 
         def _open(path, flags, *a, **k):
             opens.append((str(path), flags))
             return real_open(path, flags, *a, **k)
 
-        os.replace, os.open = _replace, _open
+        def _fsync(fd):
+            synced.append(os.fstat(fd).st_ino)
+            return real_fsync(fd)
+
+        os.replace, os.open, os.fsync = _replace, _open, _fsync
         try:
             tok = km._load_token()
         finally:
-            os.replace, os.open = real_replace, real_open
+            os.replace, os.open, os.fsync = real_replace, real_open, real_fsync
 
         self.assertEqual(len(swaps), 1, "the mint must land by one rename of a finished temp file")
-        src, dst, mode, body = swaps[0]
+        src, dst, mode, body, ino, synced_before_swap = swaps[0]
+        self.assertIn(ino, synced_before_swap, "the temp is fsynced BEFORE it is swapped in, or a crash right after the rename can leave an empty token")
         self.assertEqual(dst, str(self.f))
         self.assertEqual(mode, 0o600, "the temp is born 0600 under a 022 umask: the open mode, not the umask, decides")
         self.assertEqual(body, tok, "the temp already holds the whole token when it is swapped in")
@@ -295,6 +314,37 @@ class TightenMode(_TokenFile):
         self.assertIn("0600", err.getvalue())
         self.assertEqual(self._temps(), [], "no mint happened")
 
+    def test_a_tighter_token_is_left_alone(self):
+        """0400 has no bit outside 0600, so there is nothing to tighten. The check used to be EQUALITY
+        with 0600, which widened a read-only token to 0600 and reported the change as a repair
+        (review find, 2026-09-08). Expected first error on that shape: 0o600 != 0o400."""
+        self.f.write_text("tight-DO-NOT-USE\n")
+        os.chmod(self.f, 0o400)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(km._load_token(), "tight-DO-NOT-USE")
+        self.assertEqual(_mode(self.f), 0o400, "a mode tighter than 0600 is not widened")
+        self.assertEqual(err.getvalue(), "", "and nothing is said: nothing was changed")
+        self.assertEqual(self.f.read_text(), "tight-DO-NOT-USE\n")
+
+    def test_only_the_bits_outside_0600_are_stripped(self):
+        """0640 keeps its owner bits and loses the group read; 0444 keeps the owner's read only. The
+        repair removes what is loose and adds nothing, and the notice names both modes. Expected
+        first error on the equality shape: 0o600 != 0o400 at the 0444 case (it was widened)."""
+        for before, after in ((0o640, 0o600), (0o444, 0o400)):
+            with self.subTest(mode="%04o" % before):
+                self._clear()
+                self.f.write_text("keep-me-DO-NOT-USE\n")
+                os.chmod(self.f, before)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(km._load_token(), "keep-me-DO-NOT-USE")
+                self.assertEqual(_mode(self.f), after)
+                self.assertIn("%04o" % before, err.getvalue(), "the notice names the mode it found")
+                self.assertIn("%04o" % after, err.getvalue(), "and the one it left")
+                self.assertEqual(self.f.read_text(), "keep-me-DO-NOT-USE\n", "tightening the mode rewrites nothing")
+                self.assertEqual(self._temps(), [])
+
     def test_a_good_0600_token_is_returned_silently(self):
         self.f.write_text("fine-DO-NOT-USE\n")
         os.chmod(self.f, 0o600)
@@ -347,13 +397,203 @@ class LockFailureIsFailClosed(_TokenFile):
             km._load_token()
         self.assertIn(str(self.lock), str(cm.exception), "the refusal names the lock path")
         self.assertIn("EISDIR", str(cm.exception))
+        self.assertIn("0644", str(cm.exception), "and says what the lock was needed for: tightening that mode")
         self.assertEqual(_mode(self.f), 0o644, "no unlocked write of any kind, not even a chmod")
-        # (c) no token: cannot be minted without the lock, so it is a refusal, and nothing appears
+        # (d) a TIGHTER token (0400): nothing to tighten either, so it is returned under the missing
+        # lock like a 0600 one (the equality check refused it: review find, 2026-09-08)
+        os.chmod(self.f, 0o400)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(km._load_token(), "good-DO-NOT-USE")
+        self.assertEqual(_mode(self.f), 0o400)
+        # (c) no token: cannot be minted without the lock, so it is a refusal, and nothing appears.
+        # The refusal names the LOCK and the fault it hit, and says there is no token file: the old
+        # message sent the operator to make a file that did not exist 0600 (review find, 2026-09-08).
         self.f.unlink()
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(RuntimeError) as cm:
             km._load_token()
+        msg = str(cm.exception)
+        self.assertIn(str(self.lock), msg, "the lock is the thing to repair, and it is named")
+        self.assertIn("EISDIR", msg, "with the actual fault")
+        self.assertIn("no token file", msg, "and the fact that there is nothing on disk to fall back on")
+        self.assertNotIn("Make the file yours", msg, "it does not send the operator to fix a token file that does not exist")
         self.assertFalse(self.f.exists(), "nothing minted unlocked")
         self.assertEqual(self._temps(), [])
+
+
+class LockWaitIsAnnounced(_TokenFile):
+    def test_a_starter_blocked_by_another_holder_says_so_before_waiting(self):
+        """The kernel and the bus boot together, so the second starter blocks on serve-token.lock
+        until the first has read or minted. Blocking flock is the right (event-based) wait, but it
+        said nothing, so a starter stuck behind a wedged holder looked hung (review find,
+        2026-09-08): the lock is probed LOCK_NB first and one stderr line names it before the
+        blocking take. Expected first error on the silent shape: the line never appears while the
+        loader sits in flock, and the wait below runs out."""
+        self.f.write_text("held-DO-NOT-USE\n")
+        os.chmod(self.f, 0o600)
+        holder = os.open(str(self.lock), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)   # a separate open file description, so the loader's flock conflicts
+        err, out = io.StringIO(), []
+
+        def run():
+            with contextlib.redirect_stderr(err):
+                out.append(km._load_token())
+
+        t = threading.Thread(target=run, daemon=True)
+        try:
+            t.start()
+            deadline = time.monotonic() + 5
+            while str(self.lock) not in err.getvalue() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertIn(str(self.lock), err.getvalue(), "the wait is said on stderr, naming the lock")
+            self.assertIn("waiting", err.getvalue())
+            self.assertTrue(t.is_alive(), "and the starter IS waiting: the line announces the block, it does not skip it")
+            self.assertEqual(out, [])
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            os.close(holder)
+        t.join(10)
+        self.assertEqual(out, ["held-DO-NOT-USE"], "the holder's release lets it through to the token")
+
+
+class SymlinkIsRefused(_TokenFile):
+    def test_a_symlink_at_the_token_path_is_a_fault_and_its_target_is_untouched(self):
+        """chmod and stat follow a link, so a symlink at the token path had the loader reading some
+        other file as the token and rewriting THAT file's mode (review find, 2026-09-08). A link is
+        refused outright by lstat before any read, naming the path; the target keeps its bytes and
+        its mode. Expected first error on the following shape: RuntimeError not raised (it returned
+        the target's content and chmod'd the target to 0600)."""
+        target = km.jd.STATE / "elsewhere-DO-NOT-USE"
+        target.write_text("linked-DO-NOT-USE\n")
+        os.chmod(target, 0o644)
+        self.addCleanup(target.unlink)
+        self.f.symlink_to(target)
+        with self.assertRaises(RuntimeError) as cm:
+            km._load_token()
+        msg = str(cm.exception)
+        self.assertIn(str(self.f), msg, "the refusal names the token path")
+        self.assertIn("symlink", msg, "and says what is wrong with it")
+        self.assertEqual(_mode(target), 0o644, "the target's mode is not rewritten through the link")
+        self.assertEqual(target.read_text(), "linked-DO-NOT-USE\n", "nor its bytes")
+        self.assertTrue(self.f.is_symlink(), "the link is left for the operator to remove")
+        self.assertEqual(self._temps(), [])
+
+    def test_a_dangling_symlink_is_refused_too_not_minted_over(self):
+        """A link to nothing reads as FileNotFoundError, the one mint trigger, so the following shape
+        minted and os.replace'd the fresh file over the link. It is a symlink all the same, and the
+        same refusal; nothing is minted."""
+        self.f.symlink_to(km.jd.STATE / "nowhere-DO-NOT-USE")
+        with self.assertRaises(RuntimeError) as cm:
+            km._load_token()
+        self.assertIn("symlink", str(cm.exception))
+        self.assertTrue(self.f.is_symlink(), "the link is still a link: nothing was renamed over it")
+        self.assertFalse(self.f.exists(), "and nothing was minted at its target")
+        self.assertEqual(self._temps(), [])
+
+
+class TempIsExclusive(_TokenFile):
+    def test_a_file_already_at_this_pids_temp_path_is_not_written_over(self):
+        """O_EXCL on the temp was pinned by source text alone, and an O_EXCL-to-O_TRUNC mutant passed
+        every behavioural case, because the sweep removes any temp before the open ever meets one
+        (review find, 2026-09-08). With the sweep held off (os.unlink interposed to leave the planted
+        file), a file already at this pid's temp path must make the open fail EEXIST, not be
+        truncated and written over. Expected first error on the O_TRUNC mutant: RuntimeError not
+        raised (the planted bytes were replaced by a fresh token and the mint went through)."""
+        planted = self.f.with_name("serve-token.%d.tmp" % os.getpid())
+        planted.write_text("planted-DO-NOT-USE")
+        real_unlink = os.unlink
+
+        def _keep_planted(path, *a, **k):
+            if str(path) == str(planted):
+                return                        # the sweep (and the failed mint's cleanup) would remove it
+            return real_unlink(path, *a, **k)
+
+        os.unlink = _keep_planted
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                km._load_token()
+        finally:
+            os.unlink = real_unlink
+        self.assertIn("EEXIST", str(cm.exception), "the exclusive open met the existing file and said so")
+        self.assertEqual(planted.read_text(), "planted-DO-NOT-USE", "the existing temp was not truncated or written")
+        self.assertFalse(self.f.exists(), "and no token was minted from it")
+
+
+class CheckinCarriesServedToken(_TokenFile):
+    """The check-in handshake hands the hub the token this kernel SERVES: `TOKEN`, the value the request
+    gate compares against (ROMP_SERVE_TOKEN is already folded into it at import). `_checkin_payload`
+    used to call `_load_token()` at runtime, so a token file missing at handshake time minted a fresh
+    one onto disk and announced it: the hub and every local reader of the file then held a token this
+    kernel refused; and a read fault there raised into `_checkin_handshake`'s broad except and became
+    a silent 15 s retry (review find, 2026-09-08). Expected first error on that shape: the file exists
+    after the call, holding a token that is not km.TOKEN."""
+    ROW = {"rk_port": 50003, "rb_port": 50004, "local_port": 50001}
+
+    def setUp(self):
+        super().setUp()
+        self._host = os.environ.get("ROMP_HOST_NAME")
+        os.environ["ROMP_HOST_NAME"] = "TESTHOST"    # keeps _self_host() off the machine's name and its fallback file
+
+    def tearDown(self):
+        if self._host is None:
+            os.environ.pop("ROMP_HOST_NAME", None)
+        else:
+            os.environ["ROMP_HOST_NAME"] = self._host
+
+    def test_with_no_token_file_the_payload_carries_TOKEN_and_mints_nothing(self):
+        p = km._checkin_payload(dict(self.ROW))
+        self.assertEqual(p["token"], km.TOKEN, "the hub gets the token this kernel's gate accepts")
+        self.assertFalse(self.f.exists(), "the handshake never mints: a runtime mint is a token nobody serves")
+        self.assertEqual(self._temps(), [])
+        self.assertFalse(self.lock.exists(), "nor takes the lock: the handshake touches nothing on disk")
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads through mode 0, so the fault cannot be staged")
+    def test_an_unreadable_token_file_is_neither_read_nor_a_swallowed_refusal(self):
+        self.f.write_text("on-disk-DO-NOT-USE\n")
+        os.chmod(self.f, 0)
+        p = km._checkin_payload(dict(self.ROW))     # must not raise: the payload reads no file at all
+        self.assertEqual(p["token"], km.TOKEN)
+        os.chmod(self.f, 0o600)
+        self.assertEqual(self.f.read_text(), "on-disk-DO-NOT-USE\n", "the file is untouched")
+        self.assertEqual(self._temps(), [])
+        self.assertFalse(self.lock.exists(), "the handshake never touches the file, so it never needs the lock")
+
+
+class ImportRefusalIsLoud(unittest.TestCase):
+    """The docstrings say a read fault at import refuses to start the daemon, and that under
+    bin/romp-manager the refusal repeats on the respawn backoff until the file is repaired (review find,
+    2026-09-08: the sentence used to call it one visible message). The import half is pinned here, in a
+    subprocess since the in-process `km` is already loaded: a mode-0 token under a fresh ROMP_STATE_DIR
+    makes the kernel's import exit non-zero with the refusal on stderr, and the file's bytes and mode
+    are as they were, no temp minted beside it. The manager half is bin/romp-manager's own contract
+    (MAX_BACKOFF_MS), not this module's. Expected first error on a loader that mints over a read fault:
+    returncode 0, the file holding a fresh token."""
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads through mode 0, so the fault cannot be staged")
+    def test_a_read_fault_at_import_exits_nonzero_with_the_refusal_and_leaves_the_file(self):
+        state = Path(tempfile.mkdtemp())
+        f = state / "serve-token"
+        f.write_text("old-token-DO-NOT-USE\n")
+        os.chmod(f, 0)
+        self.addCleanup(lambda: (os.chmod(f, 0o600), f.unlink()))
+        env = dict(os.environ)
+        env.pop("ROMP_SERVE_TOKEN", None)    # with it set the loader never touches the file
+        env["ROMP_STATE_DIR"] = str(state)
+        env["ROMP_KERNEL_NO_OPEN"] = "1"
+        loads = [("romp_event_model", os.path.join(BIN, "romp-event-model")),
+                 ("romp_judge", os.path.join(BIN, "romp-judge")),
+                 ("romp_kernel", os.path.join(BIN, "romp-kernel"))]   # the same three loads as this module's own
+        code = ("from importlib.machinery import SourceFileLoader\n"
+                "for name, path in %r:\n"
+                "    SourceFileLoader(name, path).load_module()\n" % (loads,))
+        r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(r.returncode, 0, "the import refuses to start the kernel; stderr:\n%s" % r.stderr[-2000:])
+        self.assertIn("did NOT replace the serve token", r.stderr, "and says so, in the loader's own words")
+        self.assertIn(str(f), r.stderr, "naming the path")
+        self.assertEqual(stat.S_IMODE(os.stat(f).st_mode), 0, "the file's mode is as it was")
+        os.chmod(f, 0o600)
+        self.assertEqual(f.read_text(), "old-token-DO-NOT-USE\n", "and so are its bytes: nothing was rotated")
+        self.assertEqual(sorted(p.name for p in state.glob("serve-token.*.tmp")), [],
+                         "no temp beside it: nothing was minted (the 0600 lock the read was taken under may stay)")
 
 
 class ServeTokenLoadersMatch(unittest.TestCase):
@@ -409,6 +649,9 @@ class ServeTokenLoadersMatch(unittest.TestCase):
                 self.assertIn("n != len(data)", body, "the short-write check")
                 self.assertIn("os.fsync(", body)
                 self.assertIn("os.replace(", body, "the mint lands by rename")
+                self.assertIn("os.lstat(", body, "the mode is the token's own: a link at the path is refused, never followed")
+                self.assertNotIn("os.stat(", body, "stat follows a link")
+                self.assertIn("fcntl.LOCK_NB", body, "the lock is probed before the blocking take, so a wait is said")
                 self.assertNotIn("O_TRUNC", body, "the live path is never truncated")
                 self.assertNotIn("write_text(", body, "no umask-mode write of the token")
 

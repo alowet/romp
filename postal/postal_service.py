@@ -92,21 +92,33 @@ SESSION_FLAGS = STATE.parent / "session-flags.json"   # the kernel's per-session
 # one line: FileNotFoundError is the only mint trigger, the mint lands by rename of a 0600 temp,
 # and it all happens under serve-token.lock. A fault raises RuntimeError, which at import refuses to
 # start the bus (or a session's MCP process): the old loader minted its OWN token on any read fault
-# and every request it then made was a silent 403.
+# and every request it then made was a silent 403. The refusal is not one message: the bus is started
+# again by whatever needs it (a kernel boot's _ensure_postal_bus, a session's MCP process running
+# `ensure`), and the kernel's own copy of this refusal repeats on bin/romp-manager's respawn backoff
+# (a traceback in manager.log every 10 s at the cap), so both repeat until the file is repaired and
+# stop by themselves once it is, with the token every client holds untouched throughout (review
+# find, 2026-09-08).
 def _serve_token_read_or_mint(f, who):
     lock = f.with_name(f.name + ".lock")
 
-    def fault(path, what, e):
+    def fault(path, what, e, fix="Make the file yours and mode 0600 (or set ROMP_SERVE_TOKEN)"):
         code = getattr(e, "errno", None)
         why = ("%s, errno %s" % (errno.errorcode.get(code, type(e).__name__), code) if code is not None
                else type(e).__name__)
         raise RuntimeError(
             "%s: cannot %s (%s). romp did NOT replace the serve token, so every client holding it "
-            "stays valid. Make the file yours and mode 0600 (or set ROMP_SERVE_TOKEN), then start "
-            "again." % (path, what, why)) from e
+            "stays valid. %s, then start again." % (path, what, why, fix)) from e
 
     def read():
         try:
+            if stat.S_ISLNK(os.lstat(f).st_mode):
+                # refused BEFORE anything reads or chmods through it: both land on the target, some
+                # other file (review find, 2026-09-08). lstat sees a dangling link too; read_text
+                # would call that absent and mint over it.
+                fault(f, "use it: the token path is a symlink, and romp reads or tightens no token "
+                         "through a link", OSError(errno.ELOOP, os.strerror(errno.ELOOP)),
+                      fix="Replace the link with a regular file that is yours and mode 0600 (or set "
+                          "ROMP_SERVE_TOKEN)")
             return f.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             return None
@@ -115,9 +127,12 @@ def _serve_token_read_or_mint(f, who):
 
     def mode():
         try:
-            return stat.S_IMODE(os.stat(f).st_mode)
+            return stat.S_IMODE(os.lstat(f).st_mode)   # lstat, like read(): the file's own mode, never a link target's
         except OSError as e:
             fault(f, "stat it", e)
+
+    def loose(m):
+        return m & ~0o600                    # any bit outside rw-------: group, other, execute, set-id, sticky
 
     def mint(why):
         if why:
@@ -157,7 +172,15 @@ def _serve_token_read_or_mint(f, who):
     try:
         f.parent.mkdir(parents=True, exist_ok=True)
         lfd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(lfd, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # another starter (the kernel and the bus boot together) is reading or minting: say so
+            # once, then wait for it. The blocking take is the right wait; it was just silent, and a
+            # starter stuck behind a wedged holder looked hung (review find, 2026-09-08).
+            print("[%s] serve token: waiting for the holder of %s (another starter is reading or "
+                  "minting it)" % (who, lock), file=sys.stderr)
+            fcntl.flock(lfd, fcntl.LOCK_EX)
     except OSError as e:
         if lfd is not None:
             try:
@@ -165,11 +188,18 @@ def _serve_token_read_or_mint(f, who):
             except OSError:
                 pass
         v = read()                           # a read fault is its own RuntimeError
-        if v and mode() == 0o600:
-            print("[%s] serve token: could not lock %s (%s); using the existing 0600 token as is"
-                  % (who, lock, e), file=sys.stderr)
+        m = mode() if v else None
+        if v and not loose(m):
+            print("[%s] serve token: could not lock %s (%s); using the existing token as is (mode "
+                  "%04o, nothing to tighten)" % (who, lock, e, m), file=sys.stderr)
             return v
-        fault(lock, "take the lock, which minting or tightening the token needs", e)
+        # the refusal names the LOCK, the fault, and what the lock was needed for. It used to send the
+        # operator to make the token file 0600, also when no such file existed (review find, 2026-09-08).
+        need = ("that minting a token needs; no token file exists to fall back on" if v is None else
+                "that minting a token needs; the token file is empty, a torn earlier mint" if not v else
+                "that tightening the token file from mode %04o needs" % m)
+        fault(lock, "take the lock %s" % need, e,
+              fix="Make the lock file yours, or remove it (or set ROMP_SERVE_TOKEN)")
     try:
         v = read()
         if v is None:
@@ -177,12 +207,13 @@ def _serve_token_read_or_mint(f, who):
         if not v:
             return mint("the file is empty, a torn earlier mint that no client can be holding")
         m = mode()
-        if m != 0o600:
+        if loose(m):
+            want = m & 0o600                 # strip what is loose, add nothing: 0640 -> 0600, 0444 -> 0400
             try:
-                os.chmod(f, 0o600)
+                os.chmod(f, want)
             except OSError as e:
-                fault(f, "tighten its mode from %o to 0600" % m, e)
-            print("[%s] serve token %s was mode %o; tightened to 0600" % (who, f, m), file=sys.stderr)
+                fault(f, "tighten its mode from %04o to %04o" % (m, want), e)
+            print("[%s] serve token %s was mode %04o; tightened to %04o" % (who, f, m, want), file=sys.stderr)
         return v
     finally:
         try:
