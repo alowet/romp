@@ -122,7 +122,7 @@ class JudgeSystemPromptDistrust(unittest.TestCase):
     def test_judge_run_appends_it_to_the_system_prompt_not_the_payload(self):
         seen = {}
 
-        def fake_cmd(model, sys_prompt, effort=None):
+        def fake_cmd(model, sys_prompt, effort=None, **kw):
             seen["sys"] = sys_prompt
             return ["true"]                                    # a no-op argv; the call itself is not the point
 
