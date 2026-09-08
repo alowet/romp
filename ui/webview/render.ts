@@ -38,7 +38,7 @@ import { titleWithKey, chordOf, effectiveChord, loadOverrides } from "./keybindi
 import { DEFAULT_CHORDS } from "./commands";
 import { NavHistory } from "./nav-history";
 import { StagedStack } from "./staged-messages";
-import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, injectionGroups, queuedCopyToHide, dropPending, bareGroupLabel } from "./send-pending";
+import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, queuedCopyToHide, dropPending, bareGroupLabel, sentAtLabel } from "./send-pending";
 import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional } from "./provisional";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
@@ -99,7 +99,7 @@ type TaskOutputs = Record<string, { command: string; output: string }>;
 type ChatEvent = (
   // mid/mids: postal message ids the kernel could NOT resolve into cards, carried on the raw turn so a
   // timeline arc into it still lands (see _hydrate_postal's unresolved path)
-  | { kind: "user"; md: string; uuid?: string; ts?: string; reminders?: string[]; taskOutputs?: TaskOutputs; human?: boolean; romp?: boolean; rompAuto?: boolean; rompSystem?: boolean; followUp?: boolean; goal?: string; fuCtx?: string; canned?: string; tag?: string; mid?: string; mids?: string[]; images?: { src: string; path?: string }[]; undelivered?: boolean; echoT?: number; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }
+  | { kind: "user"; md: string; uuid?: string; ts?: string; reminders?: string[]; taskOutputs?: TaskOutputs; human?: boolean; romp?: boolean; rompAuto?: boolean; rompSystem?: boolean; followUp?: boolean; goal?: string; fuCtx?: string; canned?: string; tag?: string; mid?: string; mids?: string[]; images?: { src: string; path?: string }[]; undelivered?: boolean; echoT?: number; absorbed?: boolean; sentAt?: number; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }
   | { kind: "assistant"; md: string; uuid?: string; ts?: string; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }   // spacePaths: backticked filenames WITH spaces the kernel verified exist (build_session _space_paths) → whole-span links. pathLinks: path-shaped tokens the kernel verified against the filesystem, token → real open target (build_session _path_links) — the linkifier's gate
   | { kind: "thinking"; text: string; encrypted: boolean; uuid?: string; ts?: string }
   | {
@@ -301,12 +301,13 @@ const order: string[] = [];           // positional tab order (for cycling)
 // ── client-side optimistic echo (the user 2026-07-15) ── a composer send clears the box instantly, but the
 // message only reappears in the chat once the kernel round-trips it back (its own provisional). Sending to a
 // busy/slow thread, the kernel's provisional could briefly VANISH in the echo→landed gap — so a just-sent
-// message looked lost for a beat. We drop a local optimistic bubble the moment you hit Enter — AT ITS SEND
-// POSITION, right after the last kernel event at the press (T252, the user 2026-09-07), so the steps that
-// stream in while the CLI holds the send land below it and the absorbed atom the kernel places at the send
-// time replaces it in the same spot — and keep RE-injecting it on every push until the kernel's payload
-// demonstrably carries the message, then let it go — the immediacy is client-owned, independent of every
-// server-side timing subtlety.
+// message looked lost for a beat. We drop a local optimistic bubble the moment you hit Enter — at the TAIL,
+// below every event the kernel has shown, where the model will READ it (T252d, the user 2026-09-08: the
+// steps that stream in while the CLI holds the send land above it, and the absorbed atom the kernel places
+// at the LANDING time replaces it in that same tail position, so nothing moves on landing and the order on
+// screen is the order the model saw; T252 had drawn it at the send slot, above those steps) — and keep
+// RE-injecting it on every push until the kernel's payload demonstrably carries the message, then let it
+// go — the immediacy is client-owned, independent of every server-side timing subtlety.
 // It rides the QUEUED idiom (the user 2026-07-16): to the reader an unconfirmed send and a queued one are the
 // same state — sent, nothing's happened yet — so they wear the same dashed bubble. That also means the look
 // only ever moves provisional→settled: dashed→solid when it lands, dashed→dashed (invisible) when it really
@@ -329,11 +330,10 @@ const pendingSent = new Map<string, PendingSend[]>();
 const isOptimistic = (e: ChatEvent): boolean => isOptimisticUuid(e.uuid);
 
 // The kernel's own queued group, if one is at the tail. Since T252 ours is never merged into it: a copy of
-// OUR text in it is hidden (hideQueuedCopy — one bubble per message, ours at its send slot), and
-// a group holding OTHER texts is a floor — a send pressed while they were queued runs after them, so its
-// bubble is drawn below the group (send-pending.ts placementIndex, T252b; the user's 2026-07-16 rule that
-// a send queues behind what the session already holds, kept in placement rather than by merging).
-// Tail-scanned; a queued group only ever sits at the bottom.
+// OUR text in it is hidden (hideQueuedCopy — one bubble per message, ours in its own bare group right below
+// the kernel's), and a group holding OTHER texts simply sits above ours — a send pressed while they were
+// queued runs after them (the user's 2026-07-16 rule that a send queues behind what the session already
+// holds). Tail-scanned; a queued group only ever sits at the bottom.
 function tailQueuedIdx(evs: ChatEvent[]): number {
   for (let i = evs.length - 1, n = 0; i >= 0 && n < 10; i--, n++) if (evs[i].kind === "queued") return i;
   return -1;
@@ -371,8 +371,8 @@ function reconcileOptimistic(s: Session): void {
   // the text and the resend); its PROVISIONAL — echo atom or queued bubble — suppresses ours for this
   // push and nothing more, so if it blinks, ours steps straight back in, and proves the kernel has the
   // send (a "not confirmed" label is cleared). The kernel's QUEUED copy of a send is different (T252): it
-  // sits in the kernel's group at the tail while the bubble the user watches is ours, at its send slot —
-  // so that copy is hidden and ours stays, one bubble per message; the group keeps its other texts.
+  // sits in the kernel's group at the tail while the bubble the user watches is ours, right below it — so
+  // that copy is hidden and ours stays, one bubble per message; the group keeps its other texts.
   const r = reconcilePending(s.events as TailEvent[], list);
   if (r.keep.length) pendingSent.set(s.id, r.keep); else pendingSent.delete(s.id);
   const heldBy = new Map<PendingSend, NonNullable<Extract<ChatEvent, { kind: "queued" }>["held"]>>();
@@ -390,24 +390,22 @@ function reconcileOptimistic(s: Session): void {
   // `qts` is the entry's identity: the ✕ removes THAT entry, never the first with the same text (two
   // identical sends can sit in different states — one lost, one received).
   const mk = (p: PendingSend) => ({ md: p.text, optimistic: true, cancelable: true, imgPaths: p.imgPaths, lost: p.lost, qts: p.ts });
-  // A BARE dashed bubble at each send's slot — right after its anchor (send-pending.ts injectionGroups):
-  // no "N queued messages" header to claim what we can't back. Groups come highest slot first, so each
-  // splice leaves the lower slots valid. A copy hidden out of a HELD kernel group (a usage limit holds
-  // every send) hands its reason to our bubble, so the wait still says what it is waiting for.
-  const groups = injectionGroups(s.events as TailEvent[], inject);
-  for (const g of groups)
-    s.events.splice(g.idx, 0, { kind: "queued", bare: true, texts: g.sends.map(mk), uuid: OPT_PREFIX + g.sends[0].ts,
-                                held: g.sends.map((p) => heldBy.get(p)).find((h) => !!h) });
-  // the signature carries each group's SLOT beside its texts: chatTail repaints from the kernel index it was
-  // handed, trusting the DOM prefix — which also needs the bubble's slot unchanged. A slot that moves (a floor
-  // event arriving) marks the view stale, so the window is rebuilt (second review).
-  settle(groups.flatMap((g) => g.sends.map((p) => g.idx + ":" + p.text)));
+  // ONE BARE dashed group at the TAIL, the sends in send order (T252d): below every event the kernel has
+  // shown, where the model will read them; the landed atom, placed at its landing time, takes that same
+  // position. No "N queued messages" header to claim what we can't back. A copy hidden out of a HELD kernel
+  // group (a usage limit holds every send) hands its reason to our bubble, so the wait still says what it is
+  // waiting for.
+  s.events.push({ kind: "queued", bare: true, texts: inject.map(mk), uuid: OPT_PREFIX + inject[0].ts,
+                  held: inject.map((p) => heldBy.get(p)).find((h) => !!h) });
+  // the signature is the texts alone: the tail slot moves with every kernel push by design, and chatTail's
+  // incremental repaint strips our group before applying a kernel index, so the slot is never trusted
+  settle(inject.map((p) => p.text));
 }
 
-// Undo our own injections wherever they sit — the bare groups we spliced in (T252: at their send slots, no
-// longer only at the tail), the optimistic texts we once merged into a kernel group, and the hide marks on
-// the kernel's queued copies — so every reader below sees KERNEL truth only. Every ingest path that applies
-// a kernel INDEX (chatTail's `from`) strips first: a bubble sitting mid-array would shift that index.
+// Undo our own injections wherever they sit — the bare group at the tail (T252d; T252 had spliced groups at
+// their send slots mid-array, and the strip stays position-agnostic), the optimistic texts we once merged
+// into a kernel group, and the hide marks on the kernel's queued copies — so every reader below sees KERNEL
+// truth only. Every ingest path that applies a kernel INDEX (chatTail's `from`) strips first.
 function stripOptimistic(s: Session): void {
   for (let i = s.events.length - 1; i >= 0; i--) {
     const e = s.events[i];
@@ -418,8 +416,8 @@ function stripOptimistic(s: Session): void {
 }
 
 // Hide ONE copy of this send's text in the kernel's queued group (send-pending.ts queuedCopyToHide picks
-// it: the newest not-yet-hidden copy, never one the kernel marked non-cancelable): ours is drawn at its
-// slot, so the tail copy would be the same message twice. Returns the group's `held` so the bubble can
+// it: ours by id, else the newest not-yet-hidden copy, never one the kernel marked non-cancelable): ours is
+// drawn in its own bare group right below, so the kernel's copy would be the same message twice. Returns the group's `held` so the bubble can
 // carry the reason — or null when no copy is hidden, in which case the kernel's copy keeps covering ours.
 function hideQueuedCopy(s: Session, p: PendingSend): { held?: Extract<ChatEvent, { kind: "queued" }>["held"] } | null {
   const qi = tailQueuedIdx(s.events);
@@ -2795,6 +2793,10 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
         turn.appendChild(tchip);
       }
       const bubble = el("div", (romp ? "romp-bubble" : tagged ? "romp-bubble tag-bubble" : injected ? "user-note" : "user-bubble") + " md");
+      // a mid-turn send sits where the model READ it (T252d): the hover says when it was SENT, once the two differ
+      // by more than a minute (both kernel stamps: the atom's landing `ts` and its `sentAt`)
+      const sentTip = sentAtLabel(ev.ts, ev.sentAt);
+      if (sentTip) bubble.title = sentTip;
       // A slash COMMAND you sent reads as a special keyword, not prose (the user 2026-06-29): render the leading
       // "/cmd" token as a monospace chip. Genuine human bubbles only (a romp/injected note is never a command).
       // paths this turn already renders as full in-bubble images (both the caption path and a
@@ -13652,10 +13654,10 @@ function chatTail(msg: any) {
   // Comparing `from` against the inflated length masked a genuine 1-event gap (the repair below never
   // fired, PR #107's desync class), and a delta starting exactly one past kernel truth landed BEYOND
   // the injected bubble, freezing it into the resident events as fake history the reconcile's strip
-  // loop could never pop (the user 2026-08-09). Since T252 a bubble sits at its send slot, mid-array,
-  // where it would also SHIFT every kernel index after it — so the gap check COUNTS kernel events here,
-  // and the strip itself waits until the delta is going to be applied: stripping ahead of the two early
-  // returns left s.events without the bubble while the DOM still showed it (review of the first cut).
+  // loop could never pop (the user 2026-08-09). The gap check COUNTS kernel events (our group at the tail
+  // is not one of them), and the strip itself waits until the delta is going to be applied: stripping
+  // ahead of the two early returns left s.events without the bubble while the DOM still showed it (review
+  // of the first cut).
   const kernelLen = s.events.reduce((n, e) => n + (isOptimistic(e) ? 0 : 1), 0);
   if (from > kernelLen) {
     // GAP: the delta starts PAST what we hold, so the events in between never reached us. Applying it would

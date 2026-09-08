@@ -1897,14 +1897,16 @@ class PopAll(unittest.TestCase):
 
 
 class AbsorbedLandingNeverPrecedesTheSend(unittest.TestCase):
-    """`landedT` — when the CLI took a mid-turn send — is read off the attachment's file-order
-    predecessor, whose stamp can precede the attachment's own (the ENQUEUE time) only by clock
-    granularity: the live corpus's worst case is -0.2 s, which whole-second stamps can turn into a 1 s
-    inversion. No truthful landing precedes the send, so the event model clamps landedT to the send
-    and counts the clamp in parse stats (`landedT-clamp`): the chat's cue can never read "delivered at"
-    a time before the bubble's own send. Pinned across every golden, because the two goldens that carry
-    absorbed atoms once pinned the inverted value (2026-09-06 review) from a scenario shape with no
-    tool_result before the attachment."""
+    """An absorbed atom's `t` is its LANDING — when the CLI took the mid-turn send, read off the
+    attachment's file-order predecessor — and `sentAt` is the send (T252d, 2026-09-08: placed where the
+    model read it, below the steps that ran while it waited). The predecessor's stamp can precede the
+    attachment's own (the ENQUEUE time) only by clock granularity: the live corpus's worst case is
+    -0.2 s, which whole-second stamps can turn into a 1 s inversion. No truthful landing precedes the
+    send, so the event model clamps the placement to the send and counts the clamp in parse stats
+    (`landedT-clamp`): the atom never sits before its own send. Pinned across every golden, because the
+    two goldens that carry absorbed atoms once pinned the inverted value (2026-09-06 review) from a
+    scenario shape with no tool_result before the attachment. The ORDER is pinned too: the atom sorts
+    after the record the CLI wrote before taking it and before the assistant record that answers it."""
 
     def _absorbed(self, out):
         return [a for t in out["turns"] for a in t["atoms"] if a.get("absorbed")]
@@ -1914,16 +1916,21 @@ class AbsorbedLandingNeverPrecedesTheSend(unittest.TestCase):
         for name in ALL_SCENARIOS:
             for a in self._absorbed(run_scenario(name)):
                 seen += 1
-                self.assertGreaterEqual(a["landedT"], a["t"], (name, a["uuid"]))
+                self.assertGreaterEqual(a["t"], a["sentAt"], (name, a["uuid"]))
         self.assertGreaterEqual(seen, 3, "multi_input_absorbed and popall carry the absorbed atoms this pins")
 
     def test_the_realistic_shape_lands_at_the_boundary_after_the_send(self):
-        a = self._absorbed(run_scenario("multi_input_absorbed"))
-        self.assertEqual([(x["t"], x["landedT"]) for x in a], [(T0 + 40, T0 + 55)],
-                         "placed at the enqueue, taken at the tool_result that followed it in file order")
-        a = self._absorbed(run_scenario("popall"))
-        self.assertEqual([(x["t"], x["landedT"]) for x in a], [(T0 + 30, T0 + 50), (T0 + 40, T0 + 50)],
-                         "two splices at one boundary both read that boundary")
+        out = run_scenario("multi_input_absorbed")
+        a = self._absorbed(out)
+        self.assertEqual([(x["sentAt"], x["t"]) for x in a], [(T0 + 40, T0 + 55)],
+                         "sent at the enqueue, placed at the tool_result that followed it in file order")
+        order = [x["uuid"] for t in out["turns"] for x in t["atoms"]]
+        self.assertLess(order.index("tr1"), order.index("att1"), "after the record the CLI wrote before taking it")
+        self.assertLess(order.index("att1"), order.index("a2"), "before the assistant record that answers it")
+        out = run_scenario("popall")
+        a = self._absorbed(out)
+        self.assertEqual([(x["uuid"], x["sentAt"], x["t"]) for x in a], [("att1", T0 + 30, T0 + 50), ("att2", T0 + 40, T0 + 50)],
+                         "two splices at one boundary both sit at that boundary, in send order")
 
     def test_an_inverted_witness_clamps_to_the_send_and_is_counted(self):
         # the tool_result stamped before the attachment's enqueue stamp: clock granularity at worst, an
@@ -1935,7 +1942,7 @@ class AbsorbedLandingNeverPrecedesTheSend(unittest.TestCase):
                 aline(T0 + 90, "Done.", "a2", "att1", stop="end_turn")]
         before = em._ASM_STATS.get("landedT-clamp", 0)
         a = self._absorbed(run_recs(recs))
-        self.assertEqual([(x["t"], x["landedT"]) for x in a], [(T0 + 40, T0 + 40)])
+        self.assertEqual([(x["sentAt"], x["t"]) for x in a], [(T0 + 40, T0 + 40)])
         self.assertEqual(em._ASM_STATS.get("landedT-clamp", 0), before + 1,
                          "counted in parse stats, beside ts-repair — a run of these is a CLI write-order change")
 
@@ -1947,7 +1954,7 @@ class AbsorbedLandingNeverPrecedesTheSend(unittest.TestCase):
                 aline(T0 + 90, "Done.", "a2", "att1", stop="end_turn")]
         before = em._ASM_STATS.get("landedT-clamp", 0)
         a = self._absorbed(run_recs(recs))
-        self.assertEqual([(x["t"], x["landedT"]) for x in a], [(T0 + 40, T0 + 40)])
+        self.assertEqual([(x["sentAt"], x["t"]) for x in a], [(T0 + 40, T0 + 40)])
         self.assertEqual(em._ASM_STATS.get("landedT-clamp", 0), before, "equal stamps are a landing, not an inversion")
 
 

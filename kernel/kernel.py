@@ -29069,16 +29069,15 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                                     ev["qid"] = _qs[0]
                             if a.get("absorbed"):
                                 # A mid-turn splice (event_model._absorbed): the CLI queued this send
-                                # behind the running turn and took it at a later tool boundary, so the
-                                # atom sits at its SEND time, above the steps that ran while it waited.
-                                # The client marks it ("joined mid-turn") and, when the landing retires
-                                # a pending bubble that sat at the tail, leaves a cue where the bubble
-                                # was — the user 2026-09-05 watched a message vanish from the bottom
-                                # and reappear higher up with no explanation. `landedAt`: when the CLI
-                                # took it (the attachment's file-order predecessor; `ts` is the send).
+                                # behind the running turn and took it at a later tool boundary. The
+                                # atom sits at its LANDING time (`ts`), below the steps that ran while
+                                # it waited — where the model read it (T252d, the user 2026-09-08), and
+                                # where the chat's pending bubble already was (the tail), so nothing
+                                # moves when it lands. `sentAt`: when the user sent it, for the
+                                # bubble's hover when the two differ by more than a minute.
                                 ev["absorbed"] = True
-                                if a.get("landedT"):
-                                    ev["landedAt"] = int(a["landedT"])
+                                if a.get("sentAt"):
+                                    ev["sentAt"] = int(a["sentAt"])
                             # Several back-to-back sends the CLI took together land as ONE user record
                             # with a text block each — the shape _atom_user_texts prunes the kernel's
                             # echoes against. The chat's own pending bubbles end on an EXACT text match

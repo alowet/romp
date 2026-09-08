@@ -235,12 +235,19 @@ events, read from the events after the send (a landing of the text, the kernel's
 never-delivered verdict, or the user's ✕), and a record the CLI wrote from several
 back-to-back sends retires one bubble per text block (`blocks` on the user event).
 While the socket is down the bubble is labelled "not confirmed", until a kernel
-copy of the send clears the label. A send that landed mid-turn (`absorbed` and
-`landedAt` on the user chat event) is placed at its send time, and the chat's
-pending bubble is drawn at that same slot from the press — right after the last
-kernel event at the press, below an earlier send's echo or landing and below any
-texts the kernel already held queued — so the landing replaces it in place; there
-is no header and no cue (T252). The CLI extracts
+copy of the send clears the label. A send that landed mid-turn (`absorbed` on the
+user chat event) is placed where the model READ it: at its landing time, the
+moment the CLI took it off its queue, below the steps that ran while it waited
+(T252d, the user 2026-09-08). Their reasoning: the pane used to draw the message
+at its send position, above those steps, while the model read it only after them,
+so the order on screen contradicted the order the model saw; the read position is
+the one that matches. So the chat's pending bubble sits at the TAIL while pending,
+below every streaming step, and the landed atom appears in that same tail
+position, so nothing moves on landing; the send time rides along as `sentAt` for
+the bubble's hover ("sent at HH:MM", shown once landed when it differs from the
+landing by more than a minute). No header, no cue. This supersedes the
+in-place-at-send-position rule of T252/T252b; the kernel's per-copy identities
+(T252c) stay and decide landing, cover and hiding. The CLI extracts
 no image paths on the stream-json route (its only image-path test belongs to the
 interactive composer's paste handler), so an image path in an SDK send lands as
 typed and the echo's text matches. `_path_bearing` and the extension set it tests
