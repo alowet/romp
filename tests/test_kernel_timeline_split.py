@@ -38,6 +38,18 @@ class BuildGating(unittest.TestCase):
         self.assertIn('m.type==="bars"', boot)
         self.assertIn("panel.applyBars(m)", boot)
 
+    def test_the_host_shim_wraps_its_listener_through_the_page_collector_when_there_is_one(self):
+        # The page's performance collector (ui/webview/perf-telemetry.ts) is published on window.__rompPerf by
+        # federation.js, which the timeline page loads before this boot (test_browser_owned_order pins the
+        # order). Wrapped, the frames the boot dispatches are timed by type like every pane's, so the view's
+        # hover/activeChat/revealEvent/models handling is not left inside federation's fed:<type> bracket
+        # (2026-09-06); without a collector the plain listener is registered.
+        boot = km._TIMELINE_BOOT
+        self.assertIn("var onFrame=function(ev){var m=ev.data;if(!m||!panel)return;", boot)
+        self.assertIn('window.addEventListener("message",(window.__rompPerf&&window.__rompPerf.wrapFrameHandler)'
+                      "?window.__rompPerf.wrapFrameHandler(onFrame):onFrame);", boot)
+        self.assertEqual(boot.count('addEventListener("message"'), 1, "one listener, the wrapped one")
+
     def test_the_lanes_skeleton_does_not_parse_any_transcript(self):
         # cold-start speed (the user 2026-06-26): a fresh kernel (the refresh button = POST /restart) re-parses
         # every transcript (~1.3s). The lanes don't need it — derive them from tmux + goals + the transcript

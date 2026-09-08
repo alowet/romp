@@ -4,7 +4,9 @@ a HUMAN send whose CLI died holding it — provably lost (not in the surviving q
 never-landed by a direct transcript scan — is RE-DELIVERED through the persisted queue in send
 order, recreating the pre-restart state, instead of parking as a never-delivered bubble waiting on
 a manual restore. romp-authored echoes keep the flag path (re-delivering a nudge double-nudges),
-and a landed-but-unpruned echo never re-delivers (the scan is the duplicate guard). SYNTHETIC."""
+and a landed-but-unpruned echo never re-delivers (the scan is the duplicate guard) — nor is it flagged
+lost: it landed, the next build's by-text prune retires it (2026-09-06; the scan also reads the
+queued_command attachment an absorbed send leaves — tests/test_sdk_echo_durability.py). SYNTHETIC."""
 import json
 import os
 import tempfile
@@ -43,6 +45,7 @@ class Redelivery(unittest.TestCase):
             state_dir = None
             _live = {}
             _reg_lock = __import__("threading").RLock()
+            _live_lock = __import__("threading").RLock()   # the live tail's lock (_mark_dropped_echoes selects under it)
             _persisted = []
             _logs = []
 
@@ -94,8 +97,8 @@ class Redelivery(unittest.TestCase):
         self._echo("already landed words")
         self.be._mark_dropped_echoes(SID, [])
         self.assertEqual(self._reg_queue(), [], "the transcript scan is the duplicate guard")
-        self.assertTrue(any(a.get("dropped") for a in self.be._live[SID].values()),
-                        "…so it takes the flag path (self-correcting on the next build)")
+        self.assertFalse(any(a.get("dropped") for a in self.be._live[SID].values()),
+                         "…and a found text is not flagged either: it landed, the by-text prune retires it")
 
     def test_romp_authored_echoes_keep_the_flag_path(self):
         self._echo("a nudge body", author="romp")

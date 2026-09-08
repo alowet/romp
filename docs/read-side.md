@@ -56,7 +56,13 @@ completed); the feed just paints columns. (Reflected in `docs/judges.md`.)
   contract.
 - **Liveness is a keepalive, and staleness is event-keyed.** The kernel sends a
   `ka` frame to every socket every 10 s; the pane shim abandons a socket that has
-  gone 30 s without any frame and redials at once. After a reconnect the shim
+  gone 30 s without any frame and redials at once, the silence measured from the
+  later of the last frame and a Chromium `resume` (the thaw of a frozen tab) on a
+  still-open socket. A socket kept on the strength of that stamp is provisional:
+  if no frame confirms it within 15 s (1.5 keepalive periods) the watchdog puts
+  it down there instead, a socket already 30 s overdue when the tab froze is not
+  stamped and is redialed at the return, and a browser without `resume` behaves
+  as before. After a reconnect the shim
   raises the "what you see may be stale" prompt only on the SECOND `ka` arriving
   before the resync frame — one full heartbeat period, bracketed by two kernel
   heartbeats on that socket with no resync between them (a single `ka` can be a
@@ -71,13 +77,20 @@ completed); the feed just paints columns. (Reflected in `docs/judges.md`.)
   push did; and a row in the dashboard's bell (at most five drop rows, none older
   than an hour, so they never crowd out a backend problem). Every close the
   browser reports for a socket that opened leaves a `wsclose` breadcrumb (code,
-  reason, socket age) in `client-diag.jsonl`; a socket the shim abandons leaves
-  none — the watchdog's own `watchdog-close` row went down the quiet socket
-  before the abandon (the foreground path's abandon sends none), so an armed
-  socket's raise, `reconnect-quiet` or `foreground-quiet`, queued for the redial,
-  is the record that survives; the redials an outage refuses are counted and
-  reported as one `wsconnfail` row on the next open, and at most 20 breadcrumbs
-  wait in the shim's queue for it.
+  reason, socket age) in `client-diag.jsonl` (rotated to `.1` at 8 MB); a socket
+  the shim abandons leaves none — the watchdog's own `watchdog-close` row went
+  down the quiet socket before the abandon (the foreground path's abandon sends
+  none, but its `return` row queues for the redial), so an armed socket's raise,
+  `reconnect-quiet` or `foreground-quiet`, queued for the redial, is the record
+  that survives; the redials an outage refuses are counted and reported as one
+  `wsconnfail` row on the next open, and at most 20 breadcrumbs wait in the
+  shim's queue for it.
+  Every return to the tab leaves its own rows: `return` with the decision
+  (`keep`, `redial-closed` or `redial-stale`) and the hidden, frozen and quiet
+  gaps, `return-fresh` with the wait for the first fresh frame, and `page-load`
+  for a reload or a tab the browser discarded; a `resent: true` copy of the
+  `return` row means the kept socket proved dead and the row was re-filed onto
+  the redial.
 - **The Outline pane's ages run on the kernel's clock.** Its timestamps are the
   kernel's, so the pane never reads the browser's clock against them: it anchors
   on the frame's `now` paired with the moment that frame arrived from the wire
@@ -208,6 +221,48 @@ widget per block), with **no second transcript parser** — the event model alre
 produced the tree. Plus the live chip from the state read, and the TOC ledger below
 the tabs.
 
+**A send stays visible from the press until its record lands, and each layer
+retires on an event, never a timer.** The kernel keeps an input echo (a synthetic
+user atom in the backend's live store, mirrored to the registry so a restart cannot
+lose it) from `send()` until the transcript carries the same text. For a message fed
+into a running turn that record is the `queued_command` attachment the CLI writes
+when it splices the message in at its next tool boundary. On the SDK route no floor
+retires an echo: it retires when its text lands in a record stamped at or after the
+send (a user record or that attachment), or when the CLI dies holding it (`dropped`,
+which the chat shows as never delivered, with restore and dismiss). The chat's own
+pending bubble, painted at the press, has no lifetime either: it ends on the same
+events, read from the events after the send (a landing of the text, the kernel's
+never-delivered verdict, or the user's ✕), and a record the CLI wrote from several
+back-to-back sends retires one bubble per text block (`blocks` on the user event).
+While the socket is down the bubble is labelled "not confirmed", until a kernel
+copy of the send clears the label. A send that landed mid-turn (`absorbed` and
+`landedAt` on the user chat event) wears a "joined mid-turn" header and, when its
+bubble sat at the tail, leaves a cue where the bubble was. The CLI extracts
+no image paths on the stream-json route (its only image-path test belongs to the
+interactive composer's paste handler), so an image path in an SDK send lands as
+typed and the echo's text matches. `_path_bearing` and the extension set it tests
+(png, jpe?g, gif, webp, case-insensitive: the CLI bundle's single image-path test,
+pinned equal between kernel and backend) remain for the tmux settle path only, where
+the paste hook does run and rewrites the path to `[Image #N]`. The chat's own image
+previews (`_user_images`) use a separate set, built from the served MIME table
+(`_IMG_MIME`, svg and bmp included), so a preview is never proposed for a file the
+image route cannot serve.
+
+**A kernel restart does not re-run a mid-turn send.** The boot duplicate guard
+(`_text_landed`) reads the `queued_command` attachment too, and it scans from the
+transcript's byte size at the moment of the send (recorded on the echo as
+`_echo_off` with the file id `_echo_fsid`, mirrored in the registry as `off` and
+`fsid`) to the end of the file, so a landed send is neither re-queued nor flagged as
+undelivered however much the session wrote afterwards. A mark from another file (a
+/clear or a fork since), a mark past the end of the file, or an echo with no mark
+reads the whole file. The found verdict is recorded on the echo (`_landed`), and
+`prune_live` and the chat merge retire the echo on it without a text match, so a
+found echo always has an exit and a later boot never re-scans it. Every by-text
+comparison of an echo against a record (the guard's scan, `prune_live`'s retire, the
+kernel's `_atom_user_texts` and its folds, and the tmux echo's prune
+`_tmux_echo_prune`) uses one key, `echo_text_key` in `session_backend.py`: outer
+whitespace stripped, nothing else.
+
 **The ledger is a table of contents** (pure projection of captions + archive):
 - top: the archiver's one-sentence headline for the session,
 - then **turn captions** as top-level bullets, the whole session (not just recent),
@@ -289,19 +344,310 @@ from view tags.
 
 ## Tags and views
 
-Two grains, both directory-rooted, matching the "things in the same folder" model:
+A tag is a named, colored set of sessions. The kernel stores tags in
+`timeline-views.json` (name, color, members, and `tagOrder`, the order the user
+has dragged the tags into); a session may carry several, and a tag may span
+attached kernels, joined by name. Tags are edited from a tab's context menu, the
+timeline's tag table, the picker's **Tags** row, and `romp tag`. They do three
+jobs:
 
-- **Tag assignment**: a `directory → tag` map in settings auto-tags a session at
-  launch (e.g. `~/work/* → work`); a manual per-session override in the UI handles
-  reclassification. Tags are mutable identity metadata (alongside name / dir /
-  color).
-- **View selection**: the URL hash (`#work,personal`), ad-hoc and per-tab; a saved
-  default behind the settings gear; or a quick selector control at the timeline
-  bottom. The hash is the fast lever.
+- **Filtering.** Each surface (chat tabs, timeline lanes, outline) keeps its own
+  lens: every session, the untagged ones, or any set of tags.
+- **Grouping.** The chat tab strip sections by tag whenever a session carries
+  one: a header per tag in `tagOrder`, each tab under the first of its tags in
+  that order (its home tag), the untagged after a divider. Sections fold per
+  browser; dragging a header reorders `tagOrder` for every surface; **Move to
+  <tag>** in a tab's menu adds the target tag and drops the home tag in one
+  click. Groups are tags: there is no second store and no per-session group
+  field.
+- **Inheritance.** A session spawned from another joins the parent's tags at the
+  creation event: a fork, a promoted comment thread, and `romp new` run inside a
+  session (it sends its `ROMP_SID` as `parent`; `--no-inherit` withholds it and
+  `--in <tag>` adds tags; a thread's `ROMP_SID` resolves to the session the
+  thread belongs to). Opening a running session inherits nothing: `/new`
+  re-asserts an explicit `--in` on it, while the picker's createSession op
+  warns and leaves the running session's tags alone, because its Tags row is a
+  prefill from the active tab rather than an ask. A comment thread inherits
+  nothing until it is promoted, since it has no tab. Only the local kernel's
+  tags are inherited; a parent held only by a remote kernel's tag is a known gap.
+  Every writer of the views blob, the WS `setTimelineViews` full-blob write
+  included, runs under `_views_lock`.
 
-The exact project directory defines a **comms group**; a directory→tag rule defines
-the coarser **display label**. Both default from where you launched, both
-adjustable.
+The exact project directory still defines the **comms group** sketched above.
+The directory-to-tag auto-tagging rule and the URL-hash view selection once
+planned here did not ship; the per-surface lens took the hash's place.
+
+Every dashboard write of the views blob is acknowledged on the socket that posted
+it. A tag edit from the timeline's tag table, its lane gear menu, or a tab's Tags
+flyout is one `tagEdit` WS op, `{writeId, edit: {op, tid, …}}`, where `op` is
+create, rename, recolor, addMember, removeMember, delete or move. It is applied
+through the same read-modify-write merge as `romp tag`, so the stale-writer guard
+never refuses it. Every op but create names the tag by its stored id, never by
+name; a create takes an optional name, and the kernel mints the id and, given no
+name, the lowest free "tag N". A move (off one tag, onto another) is one write:
+both halves land or neither does. The kernel answers `tagEditAck` with `ok`, the
+post-write client blob, the tag's `tid` and `name`, or a plain refusal. A lens or
+order change still posts the whole blob (`setTimelineViews`) together with
+`edited`, the tag ids the write changed (none for a lens or order write).
+`edited` bounds what the write may change. An empty list changes no tag: the
+store's tags stand whatever tags the blob carries, and only the lens, order and
+active fields land, with nothing judged and nothing logged (a lens write built
+from a copy taken in the same second as a targeted edit used to revert that
+edit, since the guard's stamps have one-second resolution). A list of ids may
+change those tags only; a differing copy of any other tag, or its absence, is
+kept from the store and listed in the ack. The guard may also keep the store's
+copy of a stale edited tag; the kernel answers `viewsAck` listing each kept tag
+with a reason, and `ok` is false only when a kept tag is one the client edited.
+The kernel's own dashboard notice follows the same rule: a kept tag the client
+edited is a lost edit and raises a dashboard notice; a kept tag it did not edit
+is one stderr line and nothing on the dashboard. A write without `edited` (an
+older client) is judged whole by the stamps, as before.
+The lens, order and active fields are not judged under any value of `edited`:
+the write's copies land whole, with no comparison of its `seq` or `at` to the
+store's, so across dashboards the last writer wins for them. They are display
+preferences a user sets by gesture, not tag data, and a surface's lens should
+read as the last gesture made on it. The cost is stated here rather than
+hidden: a dashboard whose adopted base predates another dashboard's lens
+change carries the older lenses for the other surfaces along with its own
+change and writes them back, so the other dashboard's filter reverts on its
+next frame. Tightening this would mean naming the surfaces a write changed,
+the way `edited` names tags. The one check made is on `active`: it is
+validated against the tags that stand after the write, so a stale copy whose
+active names a tag deleted since stores "all", not a dangling id.
+`edited` also settles a case the guard could not judge before: a tag absent
+from the store. Named in `edited`, it is a create (the no-capability path's
+client-minted `g…` id) and lands; not named, it is a stale copy re-creating a
+tag another dashboard deleted, and is kept out with a reason. A write without
+`edited` keeps every unknown tag as new. The door also refuses a tag renamed to,
+or created under, a name another tag in the resulting set holds, with a reason
+naming the collision: a renamed tag stands as the store has it and keeps its claim
+on that name, so a tag created under it in the same write is refused too; a new one
+is kept out. Names address edits, so the store holds one tag per name, and a
+name is clamped and stripped at both doors, so a padded spelling is the same
+name. The store caps at 32 tags, and the cap never drops a kept store tag: when
+the tags that stand after a write would exceed it, the write's own creates are
+refused instead, last in array order first, each with a reason naming the cap
+(`_edit_tag` refuses a 33rd create the same way). The door reads a posted blob
+to 64 tags, so a 33rd reaches that pass, and a posted entry with a valid id
+past that bound is always reported. The first 64 such entries get a row each:
+one the store lacks is not created ("a write is read to 64 tags and it was past
+that bound, so it was not created"), one the store holds keeps the store's copy
+("a write is read to 64 tags and its copy was past that bound, so the store's
+copy was kept"). Past those 64, the rest are counted in one summary row with no
+`tid` or `name`, `{reason, more, moreEdited}`, whose reason reads "N more
+entries past the 64-tag read bound were not read", with " (M of them this write
+edited)" appended when `edited` names any of them; the reason stands on its own
+because it can lead the ack's one-line `error`. The bound exists because the rows,
+the loud notice and the ack's `error` all grew with the posted array: a
+100k-entry post drew an ack of about 22 MB, which overran the socket's queue
+and dropped the poster's own socket. Every unread store tag is kept, wherever
+its copy sat past the read bound, and nothing past the read bound is stored. A
+duplicate entry consumes a slot. `ok` is false when a refused tag is one
+`edited` names or the summary row counts one (`moreEdited`), and on any refusal
+when the write carries no `edited`. The ack's one-line `error` leads with the
+rows for the tags `edited` names (or the summary row when it counts one), then
+the rest, joined with "; " (a nameless row is its reason alone) up to 1000
+characters, then "and N more"; without `edited` the rows appear in the judge's
+order. The rows carry every reason in full and are never reordered; a client
+composes the same shape from them, in their order, when the line is absent.
+Until the 2026-09-05 review the line followed the judge's order,
+which files rows in the posted array's order, quiet (kept copies of tags the
+poster did not edit) and loud interleaved, with the cap pass last, so with
+enough quiet rows ahead of it the bound cut the one row that made `ok` false
+and the line named only tags the poster never edited. The loud notice gives the
+count of refused tags and lists each with its cause. A remote tag's rendered name is on the
+same stored basis (clamped, then stripped; "tag" when empty) as the lens and
+order entries, so a padded name a remote kernel serves raw reads as the name a
+lens stores: a lens can select it, and it joins the union of a local tag of that
+name. A lens or order write (`edited: []`) touches no tag whatever the blob carries and
+files none of these rows; it is built from the store's blob the client last
+adopted plus the fields it sets. It never carries a targeted edit still in
+flight, which is that edit's own claim; the copy the client shows keeps such
+edits, and a refusal of one reverts it alone. Both acks carry the write's `writeId` and the blob's `seq`.
+
+`seq` is the store's write sequence. `_set_timeline_views` stamps every accepted
+write with a number greater than the last (seeded from the clock, so a store
+recreated from nothing starts past what any connected client holds), and every
+frame that embeds the blob (the timeline skeleton, the feed frame, the tabOrder
+frames) carries it. A client adopts a blob only when its `seq` is at least the
+one it holds, or when either side carries no seq, so a frame the pusher built
+from its warmed cache before a write cannot replace the ack's newer blob,
+whatever order the socket delivered them in. The gate keeps the last blob it
+turned away and lets it go on its next adoption; the caps frame is the one
+event that adopts a kept blob, and the one that announces a seq at which the
+gate adopts a later blob even below the held one. The optimistic copy a gesture shows clears
+on the ack; a refusal reverts
+its own write at once and shows the reason (a notice in the dialog and the lane
+gear menu, a toast in the chat pane), and a later write still in flight keeps
+its change: the copy is re-derived from the store's blob plus the remaining
+writes. Each surface allows one create in flight at a time: the dialog's
+[+ New tag] reads "creating…" and the new-tag inputs are disabled until the
+ack. The row the create draws meanwhile takes no gesture (no rename, delete,
+recolor, drag, join, or move) until the ack names the tag's id. The join menu's
+new-tag draft belongs to the open [+], survives repaints however the listed rows
+change, and is dropped when the menu or the dialog closes. No count
+of frames settles a write. The one frame-driven clear left is the exact-echo
+match, kept together with the old three-frame yield for blobs without a `seq`:
+a kernel from before the stamp acks nothing.
+
+Reader-side rules keep the sequence consistent. A store from before the stamp
+is stamped once on its first read, so the gate protects the first write after
+an upgrade (a store that does not exist is left alone: its first write starts
+past whatever a client holds). The same first read gives every tag the file
+holds an mtime (the file's `at`, else the time of the stamp), and the
+hidden-to-archived migration does the same for the tags it carries over, so
+every stored tag carries the mark that tells it from a client's own create.
+That stamp is the file's last write time, not each tag's own (a legacy store
+recorded no per-tag time, so there is nothing truer to use), and it has a
+one-time cost: a whole-blob writer whose copy predates the store's last
+pre-upgrade write is refused on any legacy tag it edits, even one that write
+never touched, because the guard compares the tag's mtime to the writer's
+evidence. The refusal is loud, the client adopts the ack's blob, and its next
+write carries the new `at`, so it happens once per stale copy; a copy taken
+at that last write lands (the comparison is strict). Targeted edits read the
+store first and are never affected. For the first-read stamp and the migration
+the file is normalized under the disk cap of 32 before the judge sees it, as
+every read normalizes what it serves, so a read never runs the door's
+create-refusal pass and never files a refusal worded as a dashboard's. What the
+cap leaves out is named once per file state, in a sync notice worded as a fact
+about the file, whether or not the stamp's write lands. The count holds when
+readers race: a reader that waited for the file lock re-checks the read cache
+under it and serves the blob the first reader judged and cached, so when two
+readers that start with the cache empty race on a full disk, the notice is
+filed once. Until the 2026-09-05 review each judged the file, failed
+the write and filed it. The notice is a
+template that puts the cause and the count first and the dropped tags after.
+It opens "the views file held N tags, over the store's 32-tag cap; no dashboard
+wrote this." When the stamp was written it continues "K tags were dropped when
+it was re-stamped on read (<why the file was stamped>): " and lists the dropped
+tags, each with its member count. When the stamp's write failed (an unwritable
+or full state dir) it continues "Its re-stamp could not be written — K tags are
+not served and are lost at the next write unless the file is brought under the
+cap first: " and the same list, because the served blob is what the next write
+persists. The verbs agree with the count: one tag reads "1 tag was dropped" and
+"1 tag is not served and is lost". Stderr carries the notice and every dropped
+tag's members. The judge
+carries a `writer` label apart from `foreign`, because `foreign` is also the
+judging mode for unknown tags and would refuse every freshly stamped tag as a
+re-creation. The loud notice is a template of the same shape: the writer, the
+count and the remedy first, the refused tags after. It reads "<writer> was
+partially refused: its changes to N tags were not applied and the store's state
+was kept; <remedy>. Refused: " and then each refused tag with its cause. The
+writer is "a stale dashboard write", "a stale write to the views file from
+outside the kernel" or "the views file's re-stamp on read". The remedy is
+offered only when there is something to reload: "reload that dashboard to
+resync" for a dashboard's, "reload the panel that wrote it to resync" for a
+foreign file's, and none for the re-stamp's, whose head ends at "kept." One tag
+reads "its changes to 1 tag were not applied". Each label carries its cause:
+"(stale copy)", "(deletion)", "(re-creation)", "(unread)", "(name collision)"
+or "(over the cap)". The quiet stderr line for kept tags the client did not
+edit carries the same kind of label on every tag, "(differing copy)" among
+them; until the 2026-09-05 review a kept differing copy was the one
+entry on it without a cause. Both notices bound their lists to fit the 240 characters
+the dashboard's bell shows, under the 300 the kernel serves (`SYNC_NOTICE_FIT`,
+`_notice_list`): as many entries as fit, then "and M more" for the rest, and
+when not even the first fits, the head alone, which carries the count. Until
+the 2026-09-05 review both notices put the cause clause and the
+remedy last, after one entry per tag, and with two or more tags the bell cut
+them away. A file written
+outside the kernel (the timeline's Electron branch writes `timeline-views.json`
+itself, with the seq it holds) can carry a seq behind the last one served. By its own seq the writer
+held an older copy, so the reader judges the file against the last served blob
+through the stale-writer guard, then re-stamps it past that seq: a tag deleted
+since is not brought back (an unknown tag carrying an mtime existed in a store
+once; one without is the writer's own create and lands), a member added since
+is kept, and each refusal is reported through the sync notice. With nothing
+served, the file is ordered as written: the highest seq the kernel has served
+or written outlives the read cache's entry (a store read as missing forgets the
+entry), so a file restored from an older copy is still re-stamped past it, and
+every write orders past it. A kernel write also refreshes the read
+cache with the blob it wrote, so the ack's blob is never a stale cache hit. The
+hidden-to-archived migration works on a copy of the file, so the tag it fills
+is stamped and a pre-migration copy cannot strip it. It finds an existing
+archived tag on the stored name basis (a padded spelling is the same tag), so
+the hidden entries land in it rather than in a second archived tag the
+collision pass would refuse. When the re-stamp write
+itself fails (an unwritable or full state dir), the read serves the judged
+blob when the file was judged (the judgment is a step apart from the write,
+so the refused foreign copy is neither served nor cached, and the next write
+that lands persists the judged state) and the file as read otherwise, logs
+once per distinct error, and stops retrying until the file changes or a
+write succeeds.
+
+The kernel announces what it can do in a `{type: "caps", caps, viewsSeq}` frame
+in reply to every `ready` and lists the caps on `/version`; `tagEdit` covers the
+targeted op, the acks and the `seq`. A client uses the targeted op only when the
+cap is present and posts the whole blob otherwise. A message no handler takes is
+answered `{type: "unknownOp", op, writeId}`, which the client treats as a refusal
+of that write and as withdrawing the cap. The caps frame is also the reconnect
+signal, and the `ready` handler sends it after its own connect push. `viewsSeq`
+is the write seq of the views blob that push put on the socket: the tabOrder
+frame's, the timeline skeleton's or the feed frame's, the highest when the push
+carried more than one. When the push carried no views frame (a chat page that
+reconnects on a sentinel cycle gets no tabOrder), it is the store's current
+seq at the time of the caps frame, the seq the next push serves. It is null
+only when the store has no seq: no store at all, or a legacy store whose first
+stamp could not be written. The kernel reads a
+served seq from the frames the handler's own thread enqueued, so a write
+landing between the push and the caps frame does not skew it, and a
+pusher-thread frame is never what it names. A client applies one rule to the
+frame. It adopts the blob its gate kept when that blob's seq equals `viewsSeq`
+and discards the kept blob otherwise. When nothing kept matches, a numeric
+`viewsSeq` is remembered as the seq the kernel announced for its current store:
+one slot per store, overwritten by each caps frame and cleared by the client's
+next adoption that changes the held blob. An adoption counts as changing it
+when the blob arrives at a seq other than the held one, without a seq, or at
+the announced seq itself; a re-arrival of the blob the client already holds,
+at the same seq, is otherwise not new information and leaves the slot
+standing. A later blob whose seq equals the announced seq is
+adopted even below the held one, because the kernel said at connect which store
+it holds and a blob carrying that seq is that store, not a stale frame. Null
+and a missing field announce nothing; a frame without the field still adopts
+the kept blob outright (a kernel from before the field). The kernel's seq floor
+lives for its process, so a store restored from an older copy while the kernel
+was down is served under its old seq after the restart. A page that stayed open
+holds the higher seq. When its connect push carried the blob, the gate turns
+the push away and keeps it, the caps frame names that blob, and the restored
+store is adopted on the caps frame itself, with nothing to wait for. When the
+push carried no blob, nothing is kept to match, and the announced seq covers
+it: the pusher's next frame carries the restored store under that seq and is
+adopted, and a frame at any other lower seq is still turned away. A pusher
+frame built before a concurrent write carries a seq older than the connect
+push's, so whether it lands before the caps frame (kept, then discarded) or
+after it (turned away), it is never adopted: the gate is never open. Clearing
+the slot when the held blob changes rules out a wrong adoption later: a write
+that lands first stamps the store past the announced seq (a write's seq is
+seeded from the clock), and a frame at the announced seq is then stale. Writes still
+in flight when the caps frame arrives cannot be answered, so the client drops
+them after that adoption, reverts the copy to the adopted base, and says so. A
+remote kernel's caps frame describes that kernel and is dropped by the
+federation router before it reaches a pane. The router's own two replayed
+stores, the merged tabOrder's blob and the merged lanes payload's, keep, adopt
+and remember by the same rule. A store that adopted on the caps frame re-emits
+before it hands the frame on: a pane sees the local blob only through those
+re-emits, so the restored blob must meet the pane's own gate, and be turned
+away there, before the pane's caps door adopts it. A pane fills the same
+announced slot from the same frame. The router re-emits on a remote host's
+push or lanes payload, a `closed` frame, a view-order storage event and a host
+drop; every merged re-emit between that frame and the pusher's next one hands
+the pane the router's stored blob at the pane's own held seq, and that
+re-arrival leaves the pane's slot standing, so when the router adopts the
+pusher's frame at the announced seq and re-emits it, the pane adopts it by the
+same rule. Until the
+2026-09-05 review any adoption cleared the slot, so a re-emit in that window
+cleared the pane's; the pane turned the restored store away while the router
+held it, and the two diverged until the next write.
+
+The Outline pane's tag filter posts its lens the same way: the frame copy it
+holds with only the outline lens changed, with a `writeId` and `edited: []`, so
+the kernel applies the lens only. It ignores the ack and settles from the next
+feed frame.
+
+Until 2026-09-05 the dialog posted the whole blob for every edit from its own
+un-echoed copy, so the guard refused a rename typed right after a create against
+the dialog's own first write, the refusal reached only stderr and the sync
+notices, and the dialog dropped its copy after three frames; renames and
+assignments made in a burst were lost.
 
 ## The UI progress surface
 

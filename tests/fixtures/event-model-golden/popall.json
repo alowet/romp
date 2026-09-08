@@ -58,6 +58,7 @@
      "absorbed": true,
      "author": "human",
      "fsid": "11111111-2222-3333-4444-555555555555",
+     "landedT": 1781096450,
      "message": {
       "content": [
        {
@@ -67,9 +68,9 @@
       ],
       "role": "user"
      },
-     "parentUuid": "a1",
+     "parentUuid": "tr1",
      "session_id": "11111111-2222-3333-4444-555555555555",
-     "t": 1781096450,
+     "t": 1781096430,
      "type": "user",
      "uuid": "att1"
     },
@@ -77,6 +78,7 @@
      "absorbed": true,
      "author": "human",
      "fsid": "11111111-2222-3333-4444-555555555555",
+     "landedT": 1781096450,
      "message": {
       "content": [
        {
@@ -88,9 +90,27 @@
      },
      "parentUuid": "att1",
      "session_id": "11111111-2222-3333-4444-555555555555",
-     "t": 1781096451,
+     "t": 1781096440,
      "type": "user",
      "uuid": "att2"
+    },
+    {
+     "fsid": "11111111-2222-3333-4444-555555555555",
+     "message": {
+      "content": [
+       {
+        "content": "ok",
+        "tool_use_id": "tu_a1_0",
+        "type": "tool_result"
+       }
+      ],
+      "role": "user"
+     },
+     "parentUuid": "a1",
+     "session_id": "11111111-2222-3333-4444-555555555555",
+     "t": 1781096450,
+     "type": "user",
+     "uuid": "tr1"
     },
     {
      "fsid": "11111111-2222-3333-4444-555555555555",

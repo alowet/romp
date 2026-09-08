@@ -305,10 +305,19 @@ class LiveSpawnEnv(_Backend):
             ks.read_source = orig
         self.assertEqual(len(reads), 1, "two reads could return two different keys")
 
-    def test_an_empty_key_line_refuses_an_explicit_key_launch(self):
+    def test_an_empty_key_line_launches_an_explicit_key_pick_with_nothing_injected(self):
+        """Until 2026-09-07 this refused the launch (#932). The maintainer's direction since: given no
+        key, romp injects nothing and Claude Code's own credential resolution applies — its apiKeyHelper
+        or its login — so a box that never handed romp a key keeps launching, said once as a problem
+        row. A source that cannot be READ (the op marker, a garbled line) still refuses."""
         self.write_env("", lines=["ROMP_PERF=1"])       # `ANTHROPIC_API_KEY=` with nothing after it
-        with self.assertRaisesRegex(ks.KeySourceError, "no API key source"):
-            self._launch_env(4)
+        env = self._launch_env(4)
+        self.assertNotIn("ANTHROPIC_API_KEY", env, "nothing injected: the CLI's own credential pays")
+        self._launch_env(5)
+        rows = [l for l in self.logged if "Claude Code's own credential" in l]
+        self.assertEqual(len(rows), 1, "one row per process")
+        self.assertIn(self.path, rows[0])
+        self.assertNotIn(OLD_KEY, "\n".join(self.logged))
 
     def test_the_live_key_reaches_the_has_a_key_bool_and_the_auth_default(self):
         self.assertEqual(self.be.default_auth({}), "key")
@@ -329,12 +338,18 @@ class StartupFallback(_Backend):
     BOOT = BOOT_KEY
 
     def test_removing_a_previously_selected_file_key_does_not_restore_the_startup_key(self):
+        """The file once carried the key, so it stays authoritative: with the line gone, an explicit key
+        pick launches with NOTHING injected (the maintainer's direction, 2026-09-07: given no key, romp
+        defers to Claude Code's default) — never the key the manager started with, the fallback this
+        rule exists to end. Until 2026-09-07 the launch refused instead (#932)."""
         with open(self.path, "w") as fh:                # genuinely no assignment, not an empty one
             fh.write("ROMP_PERF=1\n")
         ks._CACHE = ((), "")
         self.assertEqual(self.be.work_key, "")
-        with self.assertRaises(ks.KeySourceError):
-            self._launch_env(1)
+        env = self._launch_env(1)
+        self.assertNotIn("ANTHROPIC_API_KEY", env, "not the startup key — not anything")
+        self.assertNotIn(BOOT_KEY, repr(env))
+        self.assertTrue([l for l in self.logged if "Claude Code's own credential" in l])
 
     def test_an_empty_key_line_does_not_restore_the_startup_key(self):
         self.write_env("", lines=["ROMP_PERF=1"])       # `ANTHROPIC_API_KEY=` with nothing after it
@@ -431,7 +446,7 @@ class KeyLineGone(_Backend):
         self.assertEqual(said.count("is GONE"), 1, said)
         self.assertIn("sha256:" + ks.fingerprint(OLD_KEY), said)
         self.assertIn(self.path, said)
-        self.assertIn("launch on the login", said)
+        self.assertIn("nothing of romp's injected, whatever their Billing pick", said)
         self.assertNotIn(OLD_KEY, said, "fingerprints only")
         # the line coming back re-arms the notice: a second removal is a second event
         self.write_env(NEW_KEY)
@@ -981,6 +996,82 @@ class KeyswapCli(_EnvFile):
         self.assertEqual(self.posted[-1][2]["expectedSourceFp"], source.fingerprint())
 
 
+    # ---- a key command profile (ROMP_API_KEY_CMD, 2026-09-07): the generic provider, same CLI rules ----
+
+    CMD = "fetch-synthetic-key --field api"
+
+    def test_a_key_command_profile_is_listed_by_fingerprint_and_never_run(self):
+        self.sibling("cmd", "ROMP_API_KEY_CMD=%s\n" % self.CMD)
+        before = open(self.path).read()
+        rc, said = self.run_cli()          # setUp's resolve() patch proves nothing ran
+        self.assertEqual(rc, 0)
+        self.assertIn("cmd", said)
+        self.assertIn("key command " + ks.KeySource("command", self.CMD).fingerprint(), said)
+        self.assertNotIn(self.CMD, said, "the command line may name a vault or a path; only its fingerprint shows")
+        self.assertEqual(open(self.path).read(), before)
+
+    def test_selecting_a_key_command_profile_writes_the_command_line_and_arms_the_marker(self):
+        self.sibling("cmd", "ANTHROPIC_API_KEY=%s\nROMP_API_KEY_CMD=%s\n" % (NEW_KEY, self.CMD))
+        rc, said = self.run_cli("cmd")
+        self.assertEqual(rc, 0)
+        body = open(self.path).read()
+        self.assertIn("ROMP_API_KEY_CMD=" + self.CMD, body)
+        self.assertNotIn("ANTHROPIC_API_KEY=", body, "the profile's stale static key is not copied along")
+        self.assertNotIn(OLD_KEY, body); self.assertNotIn(NEW_KEY, body)
+        self.assertEqual(ks.read_source(self.path), ks.KeySource("command", self.CMD))
+        for line in self.OTHER_LINES:
+            self.assertIn(line, body)
+        self.assertEqual(open(self.path + ".source").read(), "command\n", "the durable marker holds the kind")
+        self.assertIn("runs the key command at runtime; no key was copied to disk", said)
+        self.assertNotIn(self.CMD, said)
+        # and back to a reference profile: the command line goes, the marker follows
+        ref = "op://test-vault/test-item/api-key"
+        self.sibling("vault", "ROMP_API_KEY_REF=%s\n" % ref)
+        rc, said = self.run_cli("vault")
+        self.assertEqual(rc, 0)
+        body = open(self.path).read()
+        self.assertNotIn("ROMP_API_KEY_CMD=", body); self.assertIn("ROMP_API_KEY_REF=" + ref, body)
+        self.assertEqual(open(self.path + ".source").read(), "op\n")
+
+    def test_a_key_command_profile_cycles_and_compares_configuration_not_values(self):
+        source = ks.KeySource("command", self.CMD)
+        self.sibling("cmd", "ROMP_API_KEY_CMD=%s\n" % self.CMD)
+        cli._kernel = lambda: "http://127.0.0.1:29855"
+        cli._post = lambda u, p, b: self.posted.append((u, p, b)) or {
+            "ok": True, "sourceFp": source.fingerprint(), "keyFp": "",
+            "rows": [{"session": "web", "status": "cycling"}, {"session": "api", "status": "current"}]}
+        rc, said = self.run_cli("cmd", "--cycle", "web,api")
+        self.assertEqual(rc, 0)
+        self.assertEqual(ks.read_source(self.path), source)
+        self.assertEqual([b for _, _, b in self.posted],
+                         [{"sessions": []}, {"sessions": ["web", "api"], "expectedSourceFp": source.fingerprint()}])
+        self.assertIn("key command matches", said)
+        self.assertIn("reconnecting now", said)
+        self.assertNotIn(self.CMD, json.dumps(self.posted) + said)
+        # --cycle-all after the swap, and a kernel on another source refuses
+        self.posted.clear()
+        rc, said = self.run_cli("--cycle-all")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.posted[-1][2], {"all": True, "expectedSourceFp": source.fingerprint()})
+        cli._post = lambda u, p, b: self.posted.append((u, p, b)) or {
+            "ok": True, "sourceFp": ks.KeySource("op", "op://test-vault/test-item/api-key").fingerprint(), "rows": []}
+        rc, said = self.run_cli("--cycle-all")
+        self.assertEqual(rc, 1)
+        self.assertIn("MISMATCH", said)
+
+    def test_a_profile_with_both_provider_lines_is_refused_untouched(self):
+        self.sibling("both", "ROMP_API_KEY_CMD=%s\nROMP_API_KEY_REF=op://test-vault/test-item/api-key\n" % self.CMD)
+        import io
+        from contextlib import redirect_stderr
+        before = open(self.path).read()
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            rc, said = self.run_cli("both")
+        self.assertEqual(rc, 2)
+        self.assertIn("not both", errors.getvalue())
+        self.assertEqual(open(self.path).read(), before)
+
+
 class KeycycleRoute(unittest.TestCase):
     """POST /keycycle over the REAL kernel handler on loopback (the HeadlessRoutes pattern). The
     route takes NO key from the caller — not a value, not a path — so the door cannot be used to
@@ -1286,12 +1377,13 @@ class NothingLeaksTheKey(_Backend):
                          "the one-claimer property: an ambient key bills every session")
 
     def test_the_problem_ring_the_dashboard_reads_never_carries_a_key(self):
-        self.write_env("", lines=["ROMP_PERF=1"])       # a key pick with no key: the loudest path
-        with self.assertRaises(ks.KeySourceError):
-            self._launch_env(1)
+        self.write_env("", lines=["ROMP_PERF=1"])       # a key pick with no key: the loudest path — since
+        self._launch_env(1)                             # 2026-09-07 a problem row, not a refusal
         self.write_env(NEW_KEY)
         self._launch_env(2)
-        for p in self.be.problems(50):
+        rows = self.be.problems(50)
+        self.assertTrue([p for p in rows if "Claude Code's own credential" in p["text"]], "the path was walked")
+        for p in rows:
             self.assertNotIn(NEW_KEY, p["text"])
             self.assertNotIn(OLD_KEY, p["text"])
 

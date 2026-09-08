@@ -15,6 +15,7 @@ Synthetic only — placeholder hosts/shas, no ssh, no restarts.
 import inspect
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -51,11 +52,11 @@ class Plan(unittest.TestCase):
             setattr(km, n, v)
 
     def _stub(self, out_of_date=False, ff=False, pull=False, ask=False, behind=None, ahead=None):
-        km._remote_out_of_date = lambda r: out_of_date
-        km._is_fast_forward = lambda r: ff
-        km._is_fast_pull = lambda r: pull
-        km._is_ask_pull = lambda r: ask
-        km._behind_info = lambda sha: {"behind": behind, "ahead": ahead}
+        km._remote_out_of_date = lambda r, head=None: out_of_date
+        km._is_fast_forward = lambda r, head=None: ff
+        km._is_fast_pull = lambda r, head=None: pull
+        km._is_ask_pull = lambda r, head=None: ask
+        km._behind_info = lambda sha, head=None: {"behind": behind, "ahead": ahead}
 
     def test_a_disconnected_host_is_skipped_and_says_romp_is_still_dialing(self):
         self._stub()
@@ -124,12 +125,12 @@ class ReportSurvivesTheRestart(unittest.TestCase):
 
     def test_a_failing_host_lands_in_the_report_and_the_sweep_continues(self):
         saved = {n: getattr(km, n) for n in ("_fleet_restart_plan", "_restart_remote_kernel",
-                                            "_restart_this_kernel", "_local_head", "_local_branch")}
-        km._fleet_restart_plan = lambda r: ("restart", "already on this build")
+                                            "_restart_this_kernel", "_fresh_local_head", "_local_branch")}
+        km._fleet_restart_plan = lambda r, head=None: ("restart", "already on this build")
         km._restart_remote_kernel = lambda h: (_ for _ in ()).throw(RuntimeError("ssh exploded"))
         # audits its reason since 2026-07-31; carries the handler's ack-time port since 2026-08-27
         km._restart_this_kernel = lambda reason="", manager_port=None: None
-        km._local_head = lambda short=False: "abc1234"
+        km._fresh_local_head = lambda: "abc1234" + "0" * 33     # the run reads the head once, from git
         km._local_branch = lambda: "main"
         km._remotes.clear()
         km._remotes["web"] = row(host="web")
@@ -147,6 +148,114 @@ class ReportSurvivesTheRestart(unittest.TestCase):
             self.assertFalse(x["ok"])
             self.assertIn("ssh exploded", x["detail"])
         self.assertEqual(report["local"]["head"], "abc1234")
+
+    def test_the_plan_is_judged_against_the_head_this_checkout_is_at_now(self):
+        # the polls' head cache can be 15 s behind a commit made just before Restart: a peer sitting on the
+        # previous commit then reads as "already on this build" and gets a bare restart where a push was owed
+        stale, fresh = "3" * 40, "4" * 40
+        saved = {n: getattr(km, n) for n in ("_update_remote", "_restart_remote_kernel", "_restart_this_kernel",
+                                            "_behind_info", "_local_branch")}
+        hc, run = dict(km._HEAD_CACHE), km.subprocess.run
+        did = []
+        km._update_remote = lambda h: did.append(("push", h)) or (True, "synced")
+        km._restart_remote_kernel = lambda h: did.append(("restart", h)) or (True, "restarted")
+        km._restart_this_kernel = lambda reason="", manager_port=None: None
+        km._behind_info = lambda sha, head=None: {"behind": 1, "ahead": 0, "date": ""}   # strictly behind: a push only adds
+        km._local_branch = lambda: "main"
+        km._HEAD_CACHE.update(ts=9e18, full=stale, short=stale[:7])             # what the polls last read
+        def fake(argv, **kw):
+            if argv[0] == "git" and "rev-parse" in argv:                        # what git says NOW
+                return subprocess.CompletedProcess(argv, 0, fresh[:7] if "--short" in argv else fresh, "")
+            return run(argv, **kw)
+        km.subprocess.run = fake
+        km._remotes.clear()
+        km._remotes["TESTHOST"] = row(kernel_sha=stale[:7])                      # the peer is on the OLD commit
+        try:
+            km._fleet_restart_run()
+            report = json.loads(km.FLEET_REPORT.read_text())
+        finally:
+            for n, v in saved.items():
+                setattr(km, n, v)
+            km.subprocess.run = run
+            km._HEAD_CACHE.clear(); km._HEAD_CACHE.update(hc)
+            km._remotes.clear()
+        self.assertEqual(did, [("push", "TESTHOST")], "behind the head the user has: pushed, not merely restarted")
+        self.assertEqual(report["rows"][0]["action"], "sync-push")
+        self.assertEqual(report["local"]["head"], fresh[:7], "the report names the head the plan was judged against")
+
+    def _run_two_rows(self, first, second, git_head, on_restart=None, on_pull=None, drift=None):
+        """Drive _fleet_restart_run over peers `web` (on `first`) and `api` (on `second`) with git answering
+        `git_head[0]` for HEAD; the mocked actions record what happened and may move `git_head` or the cache
+        as a real row's minutes of ssh would. `drift` = how a peer's sha relates to the head it is judged
+        against (strictly behind unless given). Returns (actions done, the report)."""
+        saved = {n: getattr(km, n) for n in ("_update_remote", "_pull_remote", "_restart_remote_kernel",
+                                            "_restart_this_kernel", "_behind_info", "_local_branch")}
+        hc, run = dict(km._HEAD_CACHE), km.subprocess.run
+        did = []
+        def restart(h):
+            did.append(("restart", h))
+            if on_restart:
+                on_restart()
+            return True, "restarted"
+        def pull(h):
+            did.append(("pull", h))
+            if on_pull:
+                on_pull()
+            return True, "pulled"
+        km._update_remote = lambda h, **kw: did.append(("push", h)) or (True, "synced")
+        km._pull_remote, km._restart_remote_kernel = pull, restart
+        km._restart_this_kernel = lambda reason="", manager_port=None: None
+        km._behind_info = drift or (lambda sha, head=None: {"behind": 1, "ahead": 0, "date": ""})
+        km._local_branch = lambda: "main"
+        def fake(argv, **kw):
+            if argv[0] == "git" and "rev-parse" in argv:                         # what git says NOW
+                h = git_head[0]
+                return subprocess.CompletedProcess(argv, 0, h[:7] if "--short" in argv else h, "")
+            return run(argv, **kw)
+        km.subprocess.run = fake
+        km._remotes.clear()
+        km._remotes["web"] = row(host="web", kernel_sha=first[:7])
+        km._remotes["api"] = row(host="api", kernel_sha=second[:7])
+        try:
+            km._fleet_restart_run()
+            return did, json.loads(km.FLEET_REPORT.read_text())
+        finally:
+            for n, v in saved.items():
+                setattr(km, n, v)
+            km.subprocess.run = run
+            km._HEAD_CACHE.clear(); km._HEAD_CACHE.update(hc)
+            km._remotes.clear()
+
+    def test_every_row_is_judged_against_the_one_head_read_before_the_plan(self):
+        # Two peers in the identical state, both on the head this checkout is at. The first row's ssh runs
+        # long enough for the polls' 15 s head cache to expire, and a commit lands locally meanwhile. Judged
+        # per row THROUGH the cache, the second peer read as behind the new commit and was pushed to where its
+        # twin got a bare restart, and the report named a head neither row had been planned against. The run
+        # reads the head once and carries the value (review find, 2026-09-08).
+        before, after = "5" * 40, "6" * 40
+        git_head = [before]
+        def twenty_seconds_of_ssh():
+            git_head[0] = after                    # a commit lands mid-run...
+            km._HEAD_CACHE["ts"] -= 20             # ...and the first row outlives the cache's TTL
+        did, report = self._run_two_rows(before, before, git_head, on_restart=twenty_seconds_of_ssh)
+        self.assertEqual(did, [("restart", "web"), ("restart", "api")], "twins get the same verdict")
+        self.assertEqual([x["action"] for x in report["rows"]], ["restart", "restart"])
+        self.assertEqual(report["local"]["head"], before[:7], "the report names the head every row was judged against")
+
+    def test_a_sync_pull_moves_the_head_the_rows_after_it_are_judged_against(self):
+        # web is one commit ahead; api sits where this checkout started. The pull fast-forwards this machine
+        # onto web's commit, and that IS new information: api is now behind it and owed a push. A head pinned
+        # across the pull would have called api "already on this build" and bare-restarted it one commit
+        # behind, so the run re-reads the head after a pull and only there.
+        old, new = "7" * 40, "8" * 40
+        git_head = [old]
+        def fast_forwarded():
+            git_head[0] = new
+        ahead = lambda sha, head=None: ({"behind": 0, "ahead": 1, "date": ""} if sha == new[:7]   # web, before the pull
+                                        else {"behind": 1, "ahead": 0, "date": ""})              # api, judged after it
+        did, report = self._run_two_rows(new, old, git_head, on_pull=fast_forwarded, drift=ahead)
+        self.assertEqual(did, [("pull", "web"), ("push", "api")], "the peer still on the old head is pushed the pulled commit")
+        self.assertEqual(report["local"]["head"], new[:7], "the report names the head this machine restarts on")
 
     def test_the_route_hands_the_report_back_and_the_page_shows_it_once(self):
         src = inspect.getsource(km.Handler)
@@ -168,6 +277,78 @@ class ReportSurvivesTheRestart(unittest.TestCase):
         self.assertIn("if _fleet and _remotes:", src)
         self.assertIn("else:\n                    _restart_this_kernel(\"http /restart (local-only)\", "
                       "manager_port=_mport)", src)
+
+
+class AnAskStaysOnThatPeer(unittest.TestCase):
+    """The sweep's "ask" leg tells a checked-in peer to pull and then to restart — and that restart
+    must name the peer-only scope. The peer's /restart defaults to the broad kind, and the peer always
+    holds at least one row: this hub. So the empty body the ask used to send made the freshly updated
+    peer fan out and restart the hub back, mid-sweep, before the report was on disk — a restart that
+    cascaded onto machines nobody asked to restart. The hub walks its own rows; each ask is one host."""
+
+    def setUp(self):
+        self._saved = {n: getattr(km, n) for n in
+                       ("_fleet_restart_plan", "_peer_call", "_peer_hub_name", "_local_head",
+                        "_local_branch", "_restart_this_kernel")}
+        self._remotes = dict(km._remotes)
+        # the sweep hands the plan the head it read once (#1025); the stub takes it like the real function
+        km._fleet_restart_plan = lambda r, head=None: ("ask", "checked in here; asking it to fast-forward itself")
+        km._peer_hub_name = lambda r: "hubname"
+        km._local_head = lambda short=False: ("abc1234" if short else LOCAL_SHA)
+        km._local_branch = lambda: "main"
+        km._restart_this_kernel = lambda reason="", manager_port=None: None   # never a real restart
+        self.calls = []
+
+        def _peer_call(r, method, path, body=None, timeout=8):
+            self.calls.append((method, path, body))
+            return 200, ({"ok": True, "detail": "pulled 3 commits from hubname"}
+                         if path == "/tunnels/pull" else {"ok": True, "restarting": True, "fleet": False})
+        km._peer_call = _peer_call
+        km._remotes.clear()
+        km._remotes["TESTHOST"] = row(checkin_peer=True, kernel_sha=REMOTE_SHA, local_port=52025,
+                                      token="peertok")
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(km, n, v)
+        km._remotes.clear()
+        km._remotes.update(self._remotes)
+
+    def test_the_sweep_asks_each_peer_for_a_restart_of_itself_only(self):
+        km._fleet_restart_run()
+        report = json.loads(km.FLEET_REPORT.read_text())
+        self.assertEqual([(m, p) for m, p, _ in self.calls], [("POST", "/tunnels/pull"), ("POST", "/restart")])
+        self.assertEqual(self.calls[1][2], {"fleet": False},
+                         "the peer restarts ITSELF; an empty body would let it fan out onto this hub")
+        self.assertEqual([(x["host"], x["ok"], x["action"]) for x in report["rows"]],
+                         [("TESTHOST", True, "ask")])
+        self.assertIn("restarting it", report["rows"][0]["detail"])
+
+    def test_the_ask_alone_carries_the_same_scope(self):
+        ok, detail = km._ask_peer_to_pull("TESTHOST")
+        self.assertTrue(ok)
+        self.assertEqual(self.calls[-1], ("POST", "/restart", {"fleet": False}))
+
+    def test_a_restart_the_peer_refuses_lands_in_the_report_with_its_reason(self):
+        """The peer's /restart can refuse (a 400 naming why, since it stopped taking a malformed body
+        as the broad default), and the sweep's report row is that answer's only reader. It used to
+        drop the text and say just "did not ack": the row keeps the peer's own words, next to what is
+        left to do by hand (review find, 2026-09-08)."""
+        def _peer_call(r, method, path, body=None, timeout=8):
+            self.calls.append((method, path, body))
+            if path == "/tunnels/pull":
+                return 200, {"ok": True, "detail": "pulled 3 commits from hubname"}
+            return 400, {"ok": False, "error": "body could not be read: read 0 of the 16 bytes announced"}
+        km._peer_call = _peer_call
+        km._fleet_restart_run()
+        report = json.loads(km.FLEET_REPORT.read_text())
+        [x] = report["rows"]
+        self.assertEqual((x["host"], x["ok"], x["action"]), ("TESTHOST", True, "ask"),
+                         "the commits DID land; that is not a failed row")
+        self.assertIn("pulled 3 commits", x["detail"])
+        self.assertIn("did not ack the restart", x["detail"])
+        self.assertIn("body could not be read", x["detail"], "the peer's reason, not a bare 'did not ack'")
+        self.assertIn("restart romp on TESTHOST", x["detail"], "and what is left to do")
 
 
 class GlyphSaysTheFleetState(unittest.TestCase):

@@ -12,7 +12,7 @@ const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "
 
 test("queued payload is per-message {md, followUp?, goal?, fuCtx?}, not raw strings", () => {
   // `optimistic` (romp's own unconfirmed echo) rides along at the end — see optimistic-send.test.ts
-  assert.match(SRC, /kind: "queued"; texts: \{ md: string; followUp\?: boolean; goal\?: string; fuCtx\?: string; idx\?: number; park\?: number; cancelable\?: boolean; optimistic\?: boolean; imgPaths\?: string\[\] \}\[\]/);
+  assert.match(SRC, /kind: "queued"; texts: \{ md: string; followUp\?: boolean; goal\?: string; fuCtx\?: string; idx\?: number; park\?: number; cancelable\?: boolean; optimistic\?: boolean; romp\?: boolean; rompSystem\?: boolean; rompAuto\?: boolean; imgPaths\?: string\[\]; lost\?: string; qts\?: number \}\[\]/);
 });
 
 test("renderQueued renders markdown (not raw text) + the follow-up header", () => {
@@ -20,7 +20,7 @@ test("renderQueued renders markdown (not raw text) + the follow-up header", () =
   const qStart = SRC.indexOf("function renderQueued");
   const fn = SRC.slice(qStart, SRC.indexOf("function renderApiError", qStart));
   assert.ok(fn.length > 0, "found renderQueued");
-  assert.match(fn, /if \(t\.followUp\) turn\.appendChild\(followUpHeader\(t\.goal, t\.fuCtx, t\.idx !== undefined \? "q:" \+ t\.idx : undefined\)\);/);
+  assert.match(fn, /if \(t\.followUp && !t\.romp\) turn\.appendChild\(followUpHeader\(t\.goal, t\.fuCtx, t\.idx !== undefined \? "q:" \+ t\.idx : undefined\)\);/);   // a romp entry never wears the header (T243)
   assert.match(fn, /bubble\.innerHTML = userMd\(t\.md\);/);   // markdown, through the user-text renderer (newlines kept)
   assert.doesNotMatch(fn, /textContent = t\b/, "no more raw textContent dump");
 });

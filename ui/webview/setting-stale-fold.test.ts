@@ -212,3 +212,45 @@ test("the open modal re-fills once per frame; a closed one never does", () => {
   g.frame({ ...REFUSED, gt: 5, host: "gpu1" });
   assert.equal(g.fills(), 2, "open: the frame IS the event — one re-read per frame, folded or not");
 });
+
+test("a write refused because the kernel could not read the setting's file offers no Apply anyway and says why", () => {
+  // the kernel answers a refused ledger write with the same frame plus `why` (kernel/kernel.py
+  // _tell_stale_gesture); re-issuing the gesture cannot succeed while the file is unreadable, so the
+  // toast drops the button (offered, it was a click that could only draw the same refusal) and names
+  // the reason beside the kept value (review find on #1018, 2026-09-08)
+  const g = lift();
+  g.frame({ type: "settingStale", setting: "auto-nudge", storedGt: 2000, gt: 1000, kept: false,
+            why: "read failed: [Errno 5] Input/output error", gesture: { type: "setAutoNudge", enabled: true } });
+  assert.equal(g.box().children.length, 1);
+  const t = g.box().children[0];
+  assert.equal(t.children.filter((c) => c.className === "rs-stale-toast-act").length, 0, "no Apply anyway: it could not succeed");
+  assert.match(g.texts()[0], /on was not applied on this machine\. Keeping off\./, "the stand-down copy is exactly true of it");
+  assert.match(g.texts()[0], /could not be read \(read failed: \[Errno 5\] Input\/output error\)/, "…and the reason is on the toast");
+  // an ordering stand-down (no why) keeps its button, the frozen-tab case the button exists for
+  g.frame({ ...REFUSED });
+  const t2 = g.box().children[1];
+  assert.equal(t2.children.filter((c) => c.className === "rs-stale-toast-act").length, 1);
+  assert.doesNotMatch(g.texts()[1], /could not be read/);
+});
+
+test("a write refused because the publish itself failed names THAT cause: could not be written, not read", () => {
+  // the kernel answers a ledger write that FAILED (ENOSPC, EROFS, EACCES out of the publish) with the same
+  // frame, its `why` starting "write failed:" (kernel/kernel.py _set_auto_nudge / _set_compact_suggest,
+  // the maintainer's fold on PR #1019: the write step is a fault boundary too). The clause hardcoded
+  // "could not be read", so a full disk read as an unreadable file; the toast names the cause it carries
+  // (review find, 2026-09-08). No Apply anyway either: a re-issue cannot land while the disk refuses.
+  const g = lift();
+  g.frame({ type: "settingStale", setting: "auto-nudge", storedGt: 2000, gt: 1000, kept: true,
+            why: "write failed: [Errno 28] No space left on device", gesture: { type: "setAutoNudge", enabled: false } });
+  assert.equal(g.box().children.length, 1);
+  const t = g.box().children[0];
+  assert.equal(t.children.filter((c) => c.className === "rs-stale-toast-act").length, 0, "no Apply anyway: it could not succeed");
+  assert.match(g.texts()[0], /off was not applied on this machine\. Keeping on\./);
+  assert.match(g.texts()[0], /could not be written \(write failed: \[Errno 28\] No space left on device\)/, "the cause the frame carries");
+  assert.doesNotMatch(g.texts()[0], /could not be read/, "a full disk is not an unreadable file");
+  // the read-fault clause is unchanged beside it
+  g.frame({ type: "settingStale", setting: "compact-suggest", storedGt: 2000, gt: 1001, kept: false,
+            why: "read failed: [Errno 5] Input/output error", gesture: { type: "setCompactSuggest", enabled: true } });
+  assert.match(g.texts()[1], /could not be read \(read failed: \[Errno 5\] Input\/output error\)/);
+  assert.doesNotMatch(g.texts()[1], /could not be written/);
+});

@@ -357,6 +357,55 @@ body.chat-theme-yatharth #tabs .tab-row-line { display: none; }
 }
 #tabbar-resize:hover::after, #tabbar-resize.dragging::after { background: var(--accent); width: 52px; }
 body.tabbar-resizing { cursor: ns-resize; user-select: none; }
+/* TAB SECTIONS — groups are tags (the user 2026-09-04): one header per home tag in the strip, the
+   untagged trail behind a plain separator. A header reads as a LABEL, not a session (the user
+   2026-09-06): a disclosure chevron that flips with the fold, the tag as THE CHIP it wears everywhere
+   (T251), and the member count (the folded-away count while folded). No state class, no close, no pip
+   of its own — none of a tab's dress; folded, one small MEMBER-derived mark follows the count (the
+   state pip below), and hover/focus brighten the label and color the chevron in the accent (a fold
+   cue), never a row wash (a "select me" cue). The chip is coloured by IDENTITY, so it brightens by a
+   filter rather than to --fg (T251b: --fg would erase the tag; the chip's inline colour is what the
+   header's colour rule cannot reach) — the same lift the plain name used to get, on the tag's own hue. The header is focusable (Enter or Space fold),
+   drags to reorder the groups (tagOrder), and the header under a dragged group wears the accent
+   insertion cue. 0.82em is the surface's sub-line size (the menus' sub-lines) — labels match labels,
+   and nothing here nests an em inside it. Tokens only, so the header reads in every theme without a
+   light override. */
+.tab-group-head { display: flex; flex: 0 0 auto; align-items: center; gap: 5px; padding: 6px 7px 6px 6px;
+  font-size: 0.82em; letter-spacing: 0.04em; color: var(--dim); cursor: pointer; white-space: nowrap;
+  user-select: none; border-radius: 6px 6px 0 0; outline: none; }
+.tab-group-head:hover, .tab-group-head:focus-visible { color: var(--fg); }
+.tab-group-head:hover .tab-group-caret, .tab-group-head:focus-visible .tab-group-caret { color: var(--accent); }
+/* the chip's fold cue (T251b): a brightness lift keeps the tag's identity colour (a --fg swap would erase
+   it) and, unlike a background wash, is a property the chip's inline style never sets — so the rule wins
+   by construction; the uncoloured "(no tags)" chip lifts from --dim toward --fg, the old label's exact cue */
+.tab-group-head:hover .tab-group-chip, .tab-group-head:focus-visible .tab-group-chip { filter: brightness(1.3); }
+.tab-group-head:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+/* the section holding the active tab: unfoldable while active (no fold action on its header), so no
+   pointer cursor promising a click — it still drags to reorder the groups */
+.tab-group-head.holds-active { cursor: default; }
+.tab-group-head.dragging { opacity: 0.45; }
+.tab-group-head.drop-target { box-shadow: inset 2px 0 0 var(--accent); }
+/* the disclosure chevron: ▸ folded, turned down while open — the fold-caret idiom (a CSS transition on
+   the flip, no timer) */
+.tab-group-caret { display: inline-block; flex: 0 0 auto; width: 0.9em; text-align: center; transition: transform 0.12s ease; }
+.tab-group-head:not(.collapsed) .tab-group-caret { transform: rotate(90deg); }
+/* the tag's color as a short bar, not a dot: a dot beside a name is a session pip */
+/* the tag's CHIP (T251) — the shared tag-menu builder's pill, sized by the header (no nested em); flex-none
+   so a wrapping strip never squeezes it, and a tab's own vertical rhythm stays the ceiling */
+.tab-group-chip { flex: 0 0 auto; font-weight: 600; line-height: 1.2; }
+.tab-group-count { opacity: 0.7; }
+/* the folded header's member-state pip (after the count, small — subordinate to the label): the tab's
+   status colors by the tab's own rule (tab-state.ts) — working gold, blocked/waiting red, retrying the
+   tab's own amber (#e67e22, the status literal .tab.tab-retrying keeps raw; status colors keep their
+   meaning). Not the header's own status: the header wears no state class. */
+.tab-group-pip { flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; background: var(--st-working-bg); }
+.tab-group-pip.blocked { background: var(--st-blocked-bg); }
+.tab-group-pip.retrying { background: #e67e22; }
+/* the separator's 6px gutters are PADDING, not margin, and the 1px line is the content box: its box
+   is then the full 13px it occupies in the row, so the tab drag's virtual layout (which measures
+   getBoundingClientRect widths) wraps where the real strip wraps, and paintTabRowLines reads its
+   offsetTop as the row's. */
+.tab-group-sep { flex: 0 0 auto; box-sizing: border-box; width: 13px; padding: 8px 6px; background: var(--box-border); background-clip: content-box; }
 /* (the settings gear + modal live on the TIMELINE now — see ui/romp-timeline-view.js) */
 
 .tab {
@@ -1814,6 +1863,21 @@ body.chat-theme-yatharth .meta-btn.mode-risky, body.chat-theme-yatharth .meta-it
   color: var(--dim); background: transparent; border: 0; border-radius: 6px; padding: 0;
 }
 .queued-x:hover { color: var(--vscode-errorForeground, #f48771); background: rgba(255, 255, 255, 0.08); }
+/* A notice romp itself queued (T243) wears the LANDED romp notice card nested inside the queued bubble: the
+   dashed "you" dress comes off the wrapper (the card brings its own gray tone), and the ✕ moves inside the
+   card's corner so it reads as the card's control. */
+.queued-bubble.queued-romp { background: transparent; border: 0; padding: 0; opacity: 1; }
+.queued-bubble.queued-romp.cancelable { padding-right: 0; }
+.queued-bubble.queued-romp.cancelable:hover { border-color: transparent; }
+.queued-bubble.queued-romp > .notice-card { margin-top: 0; }
+/* The queued NUDGE nests the landed .romp-tag + .romp-bubble: the wrapper is the landed romp turn's own
+   right-aligned column (tag above, bubble flush right), the nested bubble sheds its own 72% cap (the
+   wrapper already carries it — nested, it shrank to 72% of 72% and wrapped one-line gists) and anchors the
+   ✕ in ITS corner, not the wrapper's (T243 follow-up, measured in queued-romp-layout.test.ts). */
+.queued-bubble.queued-romp:not(.queued-sys) { display: flex; flex-direction: column; align-items: flex-end; }
+.queued-bubble.queued-romp > .romp-bubble { max-width: none; position: relative; }
+.queued-bubble.queued-romp.cancelable > .notice-card,
+.queued-bubble.queued-romp.cancelable > .romp-bubble { padding-right: 30px; }   /* room for the ✕ only when there is one */
 /* NEVER-DELIVERED send (ev.undelivered): a message whose CLI died holding it — kept, because the bubble
    is the only surviving copy of the text, but marked as a LOSS instead of posing as delivered history
    (the user 2026-07-29). Dashed like the queued family (a send that never became a turn), red-edged like
@@ -1828,13 +1892,23 @@ body.chat-theme-yatharth .meta-btn.mode-risky, body.chat-theme-yatharth .meta-it
   font-size: 0.82em; color: var(--vscode-errorForeground, #f48771);
   letter-spacing: 0.02em; margin-right: 4px;
 }
+.absorbed-cue-act,
 .undelivered-act {
   font-family: var(--sans); font-size: 11px; line-height: 1; padding: 3px 7px; border-radius: 4px;
   border: 1px solid var(--card-border); background: transparent; color: var(--dim);   /* T141: the one button rest */
-  cursor: pointer; user-select: none;
+  cursor: pointer; user-select: none; font-style: normal;
   transition: color 0.12s ease, border-color 0.12s ease;
 }
-.undelivered-act:hover { color: var(--fg); border-color: var(--accent); }
+.absorbed-cue-act:hover, .undelivered-act:hover { color: var(--fg); border-color: var(--accent); }
+/* "joined mid-turn" header (kernel ev.absorbed): the CLI took this message at a later tool boundary and the
+   transcript places it at its SEND time, so it reads above steps that were already running — the header says
+   why. The follow-up header's size and alignment (one header family over an outgoing bubble); dim, not the
+   accent: a note, not a link. */
+.absorbed-tag { max-width: 72%; margin-bottom: 1px; font-size: 0.82em; color: var(--dim); }
+/* a pending bubble whose confirmation is in doubt — the connection dropped after the press (send-pending.ts
+   `lost`): the bare group's label counts it in a warn-amber "not confirmed" part; the group's other bubbles
+   keep their dim "sending…" part beside it (one label, per-bubble state) */
+.queued-head .queued-count .lost { color: var(--warn); }
 /* compact "↩ Follow-up · <goal>" header above a message that resumed a goal — landed user turns AND pending
    queued messages, so the two render the same (the user 2026-06-27). Right-aligned with the outgoing bubble. */
 /* ONE font size across the whole header + its context box (the user 2026-07-02: the header was a soup of
@@ -2648,6 +2722,12 @@ body.picker-lifted > #picker.kb-tight { align-items: flex-start; padding: 12px 1
 /* the Billing row's single-choice text: written out where the buttons would sit (the user 2026-08-09) —
    the buttons' 0.82em, plain, no button chrome (it is a fact, not a control) */
 .picker-auth-fixed { flex: 0 0 auto; color: var(--fg); font-size: 0.82em; padding: 4px 0; }
+/* the picker's Tags row (tab groups, the user 2026-09-04): the Backend row's chips, each with its
+   tag's identity dot; several may be selected — a session can hold several tags */
+.picker-tags { flex-wrap: wrap; }
+.picker-tag-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+/* the tmux pick: the chips stay in place, disabled, behind the note (tags apply to SDK and Codex sessions) */
+.picker-tags.disabled .picker-be-opt { opacity: 0.45; cursor: default; pointer-events: none; }
 .picker-list { overflow-y: auto; }
 /* The resume list's heading (the user 2026-08-12): the list sits LAST in the dialog — typing in the
    name box re-filters it, and its changing height used to jump every control below it — so this line
@@ -2789,9 +2869,11 @@ body.picker-lifted > #picker.kb-tight { align-items: flex-start; padding: 12px 1
 .chip-interrupting { background: var(--st-working-bg); color: var(--st-working-fg, #332600); opacity: 0.75; }
 /* the stop button's click-ack is now REMOVAL + the optimistic chip flip (the user 2026-07-05): the word
    "interrupting…" no longer rides the fixed-width button (it overflowed onto the elapsed timer). */
-/* the transcript's interrupt MARKER — the compact-divider's language for "you stopped it here" */
-.turn-interrupt .dot { background: var(--dim); border: none; }
-.interrupt-line { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 0.82em; font-style: italic; }
+/* the transcript's interrupt MARKER — the compact-divider's language for "you stopped it here". The mid-turn
+   CUE (.turn-absorbed-cue: where a pending bubble sat when its message landed higher up) wears the same
+   chrome — a rail ring and one dim italic line — plus jump/✕ in .absorbed-cue-act's small-button rest. */
+.turn-absorbed-cue .dot, .turn-interrupt .dot { background: var(--dim); border: none; }
+.absorbed-cue-line, .interrupt-line { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 0.82em; font-style: italic; }
 .interrupt-square { width: 8px; height: 8px; border-radius: 2px; background: var(--dim); flex: none; }
 
 /* rail dots are nav handles: hover white-highlights this turn's event on the

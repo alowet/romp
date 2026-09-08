@@ -33,7 +33,8 @@ test("the recovery set is computed BEFORE downHosts is overwritten with this pol
 });
 
 test("render.ts's message listener heals previews unconditionally at the top, so hostUp needs no case of its own", () => {
-  const at = RENDER.indexOf('window.addEventListener("message", (e: MessageEvent) => {');
+  // the listener is installed through perf-telemetry's per-frame timing wrapper; the handler body is unchanged
+  const at = RENDER.indexOf('window.addEventListener("message", perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: MessageEvent) => {');
   assert.ok(at >= 0);
   const heal = RENDER.indexOf("retryFailedPreviews();", at);
   const firstCase = RENDER.indexOf('if (m.type === "session")', at);

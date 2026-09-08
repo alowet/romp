@@ -12,12 +12,15 @@ with no events to contribute can neither lose its own work nor clobber a concurr
 
 All fixtures SYNTHETIC: placeholder UUID, invented goal text.
 """
+import contextlib
+import io
 import json
 import os
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin")
 # Hermetic state BEFORE the loads — they resolve their state root at import time, and only
@@ -120,13 +123,132 @@ class NoOpPublish(unittest.TestCase):
         self.assertEqual(jd._store_content(s), jd._store_content(t),
                          "same content, different revision + key order → the same publish")
 
-    def test_an_unreadable_file_falls_through_to_a_real_write(self):
+
+
+class UnparseableStore(unittest.TestCase):
+    """An UNPARSEABLE goals file is quarantined aside, and only then does the session start fresh.
+
+    The old test here (`test_an_unreadable_file_falls_through_to_a_real_write`) asserted the defect: it
+    wrote "{not json" over a published store and expected load_goals + save_goals to REPLACE the file with
+    a fresh one. That replacement destroyed the only copy of whatever the file held, and the same branch
+    fired for a torn write, a permission fault and an I/O error alike (see test_judge_store_cas.py for the
+    fault half). Now the bad bytes are moved to <file>.corrupt-<stamp> first, the event is logged on both
+    channels the repo uses, and the fresh store is published to the empty path.
+
+    Mints goals, so it uses a PRIVATE synthetic sid (CLAUDE.md, 2026-08-24) and cleans that sid's override
+    journal in tearDown."""
+    QSID = "6a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9"
+
+    def setUp(self):
+        self._saved = jd.STATE
+        self.td = tempfile.TemporaryDirectory()
+        jd._rebind_state(Path(self.td.name))
+
+    def tearDown(self):
+        (jd._overrides_dir() / (self.QSID + ".jsonl")).unlink(missing_ok=True)
+        jd._rebind_state(self._saved)
+        (jd._overrides_dir() / (self.QSID + ".jsonl")).unlink(missing_ok=True)
+        self.td.cleanup()
+
+    def _file(self):
+        return jd.GOALDIR / (self.QSID + ".json")
+
+    def _sidecars(self):
+        return sorted(jd.GOALDIR.glob(self.QSID + ".json.corrupt-*"))
+
+    def _error_rows(self):
+        if not jd.ERRORS.exists():
+            return []
+        return [json.loads(l) for l in jd.ERRORS.read_text().splitlines()]
+
+    def _seed(self):
+        s = {"rompUuid": self.QSID, "seq": 0, "placementsV": jd.PLACEMENTS_V, "nodes": {},
+             "placements": {}, "status": {}}
+        jd.apply_plan(s, "s1", T0, [{"do": "mint", "why": "x", "text": "A goal"}], [])
+        jd.rollup_status(s, session_closed=False)
+        jd.save_goals(self.QSID, s)
+
+    def test_an_unparseable_file_is_quarantined_aside_then_a_fresh_store_is_written(self):
         self._seed()
         self._file().write_text("{not json")
-        s = jd.load_goals(SID)                          # load recovers a fresh store
-        jd.save_goals(SID, s)
-        self.assertEqual(json.loads(self._file().read_text())["rompUuid"], SID,
-                         "an unparseable file is republished, never mistaken for a match")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            s = jd.load_goals(self.QSID)
+        self.assertEqual(s["nodes"], {}, "the session starts fresh...")
+        self.assertEqual(s["_baseRev"], 0)
+        aside = self._sidecars()
+        self.assertEqual(len(aside), 1, "...but ONLY after the bad bytes were moved aside")
+        self.assertEqual(aside[0].read_text(), "{not json", "the sidecar holds the original bytes")
+        self.assertFalse(self._file().exists(), "the live path is empty until the next publish")
+        self.assertIn(str(self._file()), err.getvalue(), "one stderr line names the file...")
+        self.assertIn("invalid JSON", err.getvalue(), "...and the reason")
+        self.assertEqual([(r["err"], r["fsid"]) for r in self._error_rows()],
+                         [("store-quarantined", self.QSID)], "and one judge-errors row carries it")
+        jd.save_goals(self.QSID, s)
+        self.assertEqual(json.loads(self._file().read_text())["rompUuid"], self.QSID,
+                         "the fresh store is then published to the empty path")
+        self.assertEqual(aside[0].read_text(), "{not json", "...without touching the sidecar")
+        self.assertEqual(self._sidecars(), aside, "and quarantines nothing further")
+
+    def test_every_unparseable_shape_is_quarantined_not_replaced(self):
+        """A torn write, bytes that are not UTF-8, and valid JSON whose top level is not an object all
+        used to read as 'no file'. Each is moved aside; same-second quarantines get distinct names."""
+        self._seed()
+        for i, (payload, reason) in enumerate([(b"{\"rompUuid\": \"", "invalid JSON"),
+                                                (b"\xff\xfe{}", "not UTF-8"),
+                                                (b"[1, 2]", "not an object")], start=1):
+            with self.subTest(payload=payload):
+                self._file().write_bytes(payload)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    s = jd.load_goals(self.QSID)
+                self.assertEqual(s["nodes"], {})
+                self.assertEqual(len(self._sidecars()), i, "one more sidecar per quarantine")
+                held = [p for p in self._sidecars() if p.read_bytes() == payload]
+                self.assertEqual(len(held), 1, "the bytes survive verbatim in exactly one sidecar")
+                self.assertIn(reason, err.getvalue())
+        self.assertEqual([r["err"] for r in self._error_rows()], ["store-quarantined"] * 3)
+
+    def test_a_store_republished_between_the_read_and_the_rename_is_left_alone(self):
+        """No lock guards the rename, so a peer can publish a VALID store to the path between the read that
+        failed to parse and the move aside; moving what is there now would quarantine the peer's good store
+        and start the session fresh over it. The quarantine re-checks the file's identity (inode, mtime,
+        size) against the stat taken before the read and declines when it changed; the reader then reads
+        what is there now (review find, 2026-09-08)."""
+        self._seed()
+        good = self._file().read_bytes()
+        self._file().write_text("{not json")
+        orig, fired, test = Path.read_text, [], self
+
+        def read_then_a_peer_publishes(p, *a, **kw):
+            raw = orig(p, *a, **kw)
+            if p == test._file() and not fired:          # the first read sees the bad bytes; a peer's atomic
+                fired.append(1)                          # publish then replaces the file before our rename
+                tmp = p.with_name(p.name + ".peer")
+                tmp.write_bytes(good)
+                os.replace(tmp, p)
+            return raw
+        err = io.StringIO()
+        with mock.patch.object(Path, "read_text", read_then_a_peer_publishes), contextlib.redirect_stderr(err):
+            s = jd.load_goals(self.QSID)
+        self.assertEqual(self._sidecars(), [], "the peer's valid store was not moved aside")
+        self.assertEqual(self._file().read_bytes(), good, "and sits untouched at the path")
+        self.assertEqual(self._error_rows(), [], "no row: nothing was quarantined")
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(len(s["nodes"]), 1, "the reader returns what is there now, not a fresh store")
+
+    def test_an_absent_file_is_a_fresh_store_with_no_quarantine_and_no_error(self):
+        self.assertFalse(self._file().exists())
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            s = jd.load_goals(self.QSID)
+        self.assertEqual(s["nodes"], {})
+        self.assertEqual(s["_baseRev"], 0, "a writer that CREATES the file still trips the CAS")
+        self.assertEqual(self._sidecars(), [], "nothing to move aside")
+        self.assertEqual(err.getvalue(), "", "nothing to complain about")
+        self.assertEqual(self._error_rows(), [])
+        jd.save_goals(self.QSID, s)
+        self.assertTrue(self._file().exists(), "an absent file is a create, exactly as before")
 
 
 if __name__ == "__main__":

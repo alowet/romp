@@ -603,25 +603,27 @@ function runManager() {
 // op's own credential (a service-account token in service.env, for the kernel's `op read`) must not
 // become the tmux SERVER's environment: every pane the server ever creates inherits the server's
 // globals, not the launching client's, so a scrubbed `romp new` client still handed the token to
-// `exec claude` (review, 2026-09-05). Scrubbed only when romp is the op consumer (a reference is
-// configured); a box whose sessions run `op` through Claude Code's apiKeyHelper keeps its environment.
-// The manager's own ANTHROPIC_API_KEY goes with it (2026-09-06): once a reference governs, a pane billing
-// the key the manager started with bills a key nobody chose; without the variable the pane falls to
-// Claude Code's own auth (login or apiKeyHelper). Static-key boxes (no reference) keep it — their panes
-// rely on the inheritance. "Configured" is the manager's environment OR the env file's own line: the
-// file is what `romp keyswap` rewrites without a manager restart, and it must decide here too. The
-// name list mirrors kernel/keysource.py is_tmux_scrub_name.
+// `exec claude` (review, 2026-09-05). Scrubbed only when romp is the key-provider consumer — a key
+// command (ROMP_API_KEY_CMD, 2026-09-07) or a 1Password reference (ROMP_API_KEY_REF) is configured; a box
+// whose sessions run `op` through Claude Code's apiKeyHelper keeps its environment. The manager's own
+// ANTHROPIC_API_KEY goes with it (2026-09-06): once a provider governs, a pane billing the key the manager
+// started with bills a key nobody chose; without the variable the pane falls to Claude Code's own auth
+// (login or apiKeyHelper). Static-key boxes (no provider) keep it — their panes rely on the inheritance.
+// "Configured" is the manager's environment OR the env file's own line: the file is what `romp keyswap`
+// rewrites without a manager restart, and it must decide here too. The name list mirrors
+// kernel/keysource.py is_tmux_scrub_name; the provider variables mirror its SOURCE_VARS.
+const PROVIDER_VARS = ['ROMP_API_KEY_CMD', 'ROMP_API_KEY_REF'];
 function serviceEnvHasRef(env) {
   const file = env.ROMP_SERVICE_ENV_FILE || env.ROMP_SERVICE_ENV
     || path.join(env.XDG_CONFIG_HOME || path.join(env.HOME || os.homedir(), '.config'), 'romp', 'service.env');
   let text;
-  try { text = fs.readFileSync(file, 'utf8'); } catch (e) { return false; }   // no file: no reference
+  try { text = fs.readFileSync(file, 'utf8'); } catch (e) { return false; }   // no file: no provider
   // the same line-by-line read as bin/romp-node-launch: literal assignments, never sourced
-  return text.split('\n').some((line) => line.trimStart().startsWith('ROMP_API_KEY_REF='));
+  return text.split('\n').some((line) => PROVIDER_VARS.some((v) => line.trimStart().startsWith(v + '=')));
 }
 function withoutOpCredentials(env) {
   const out = Object.assign({}, env);
-  if (!out.ROMP_API_KEY_REF && !serviceEnvHasRef(env)) return out;
+  if (!PROVIDER_VARS.some((v) => out[v]) && !serviceEnvHasRef(env)) return out;
   for (const k of Object.keys(out)) {
     if (k === 'OP_SERVICE_ACCOUNT_TOKEN' || k === 'OP_CONNECT_HOST' || k === 'OP_CONNECT_TOKEN' || k === 'OP_ACCOUNT' || k.startsWith('OP_SESSION_')
         || k === 'ANTHROPIC_API_KEY') delete out[k];

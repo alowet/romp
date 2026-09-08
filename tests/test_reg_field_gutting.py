@@ -12,6 +12,7 @@ here against a CORRUPT reg file and pinned: the file's bytes survive untouched. 
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -34,6 +35,7 @@ CORRUPT = b'{"sid": "trunca'          # a torn read: exists, does not parse
 class ReadRegForRmw(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
 
     def test_absent_reg_is_a_writable_empty(self):
         self.assertEqual(sb.read_reg_for_rmw(self.d, SID), {},
@@ -57,6 +59,7 @@ class _Hooked(unittest.TestCase):
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
         self.logs = []
         self.be = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None, log=self.logs.append)
         sb.write_reg(Path(self.d), SID, {"sid": SID, "name": "gut", "cwd": "/tmp", "alive": True,

@@ -52,7 +52,7 @@ test("the anchor delegate routes a same-origin .md href to the viewer BEFORE the
   const vsArm = HANDLER.slice(HANDLER.indexOf("} else if (vscodeApi) {"));
   assert.doesNotMatch(vsArm, /openUrlView/, "the webview cannot reach the kernel origin — no viewer there");
   // the helpers arrive on their own import lines (the openFileView import is pinned verbatim elsewhere)
-  assert.match(RENDER, /import \{ openFileView \} from "\.\/file-view";/);
+  assert.match(RENDER, /import \{ openFileClick \} from "\.\/file-view";/);   // the chat opens files through the gesture reader (pdf-new-tab.test.ts)
   assert.match(RENDER, /import \{ openUrlView \} from "\.\/file-view";/);
   assert.match(RENDER, /import \{ isMarkdownUrl \} from "\.\/md-links";/);
 });
@@ -62,8 +62,12 @@ test("a ctrl-, meta- or shift-click on a same-origin .md keeps the tab: the modi
   for (const mod of ["!e.ctrlKey", "!e.metaKey", "!e.shiftKey"]) assert.ok(branch.includes(mod), mod + " gates the viewer");
   // the fall-through is the SAME window.open the cross-origin path takes — one new-tab call, no second one
   assert.equal((HANDLER.match(/window\.open\(/g) || []).length, 1, "exactly one window.open in the delegate");
-  // middle-click is auxclick and was never intercepted — no auxclick listener was added anywhere
-  assert.doesNotMatch(RENDER, /addEventListener\("auxclick"/);
+  // middle-click on a LINK is auxclick and is never intercepted: the anchor delegate has no auxclick
+  // listener. The ONE auxclick listener in render.ts is onMiddleClick, on the path PILLS (spans, not
+  // anchors), where a middle-click opens a PDF in a tab of its own — pdf-new-tab.test.ts pins it
+  assert.doesNotMatch(HANDLER, /addEventListener\("auxclick"/);
+  assert.equal((RENDER.match(/addEventListener\("auxclick"/g) || []).length, 2,
+    "only onMiddleClick (path pills) and the composer ✕'s stopper — both on spans/buttons, never on an anchor");
   assert.match(GUIDE, /ctrl- or ⌘-click still opens the file in\s+a tab/, "the guide says so");
 });
 

@@ -17,7 +17,9 @@ test("the bars-loaded gate starts false and flips true when applyBars lands real
 });
 
 test("a full one-shot data object through update() also marks the bars loaded (test harness / older clients)", () => {
-  assert.match(SRC, /if \(data\.turns && Object\.keys\(data\.turns\)\.length\) this\._barsLoaded = true;/);
+  // 2026-09-07: the verdict is named (`ownBars`) because update() also uses it to decide whether a bars frame
+  // parked ahead of its skeleton is older than this full object (timeline-hidden-hold.test.ts)
+  assert.match(SRC, /const ownBars = !!\(data\.turns && Object\.keys\(data\.turns\)\.length\);\s*\n\s*if \(ownBars\) this\._barsLoaded = true;/);
 });
 
 test("draw() shows ONLY the loader and returns early until bars are ready (no lanes, no gridlines)", () => {

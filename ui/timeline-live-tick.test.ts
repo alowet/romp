@@ -33,9 +33,10 @@ test("the live wait is bounded and scales with the zoom", () => {
   assert.equal(fn.call({ _geom: null }), 1000, "no geometry yet: a plain second");
 });
 
-// (The skeleton and bars frames of one cycle are NOT coalesced client-side: update()/applyBars() draw
-// synchronously, which the view's tests rely on. The kernel stops re-sending an unchanged skeleton instead —
-// tests/test_timeline_skeleton_dedup.py — so in steady state only the bars frame lands, and only when it changed.)
+// (A skeleton and its bars frame are two draws: update()/applyBars() draw synchronously while the pane can be
+// seen, which the view's tests rely on — out of sight they hold to one catch-up, timeline-hidden-hold.test.ts.
+// The kernel stops re-sending an unchanged skeleton instead — tests/test_timeline_skeleton_dedup.py — so in
+// steady state only the bars frame lands, and only when it changed.)
 
 test("the prompt-dot pass indexes processed messages by recipient instead of scanning them per turn", () => {
   assert.doesNotMatch(SRC, /data\.messages\.some\(\(mm\) => mm\.toId === s\.id && !mm\.pending/);
@@ -61,16 +62,19 @@ test("sortedHasWithin answers the ±1 s question exactly", () => {
   for (let t = -2; t < 40; t += 0.37) assert.equal(f(xs, t, 1), xs.some((v) => Math.abs(v - t) <= 1), "t=" + t);
 });
 
-test("a hidden pane keeps the loop alive on a long sleep; a held pointer yields to the release event", () => {
+test("a hidden pane stops the loop (the paint hold's release re-arms it); a held pointer yields to the release event", () => {
   const tick = /  _tickLive\(\) \{([\s\S]*?)\n  \}/.exec(SRC)![1];
-  assert.match(tick, /if \(!this\._isVisible\(\)\) \{ this\._sleep\(2000\); return; \}/);
+  // 2026-09-07: the old 2 s sleep re-entered _isVisible()'s forced layout every wake for a pane nobody could
+  // see; the loop now stops and _releasePaintHold re-arms it on visibilitychange / the pane's observer.
+  assert.match(tick, /if \(!this\._isVisible\(\)\) return;/);
+  assert.doesNotMatch(tick, /_sleep\(2000\)/);
   assert.match(tick, /if \(this\._pointerHeld\) \{ this\._liveResume = true; return; \}/);
   assert.match(SRC, /if \(this\._liveResume\) \{ this\._liveResume = false; this\._startLiveTick\(\); \}/, "_release restarts it");
   assert.match(SRC, /this\._liveRAF = null; this\._liveTO = null; this\._liveResume = false;/, "the constructor knows every handle");
 });
 
 test("a bars frame re-anchors the live edge, and the glide cap outlasts the kernel's 60 s repost", () => {
-  const bars = /  applyBars\(m\) \{([\s\S]*?)\n  \}/.exec(SRC)![1];
+  const bars = /  _mergeBars\(m\) \{([\s\S]*?)\n  \}/.exec(SRC)![1];   // the state half of applyBars (2026-09-07)
   assert.match(bars, /this\._anchorNow\(this\.data\.now\);/);
   assert.match(SRC, /_anchorNow\(sample\) \{[\s\S]*?reanchorEdge\(this\._nowBaseSec, this\._nowBaseMs, tMs, sample, this\._wasLive\)/);
   const cap = Number(/const MAX_INTERP_AHEAD = (\d+);/.exec(SRC)![1]);

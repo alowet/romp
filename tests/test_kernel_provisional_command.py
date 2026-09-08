@@ -18,6 +18,7 @@ data.
 """
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -43,6 +44,7 @@ def _iso(ep):
 class ProvisionalCommand(unittest.TestCase):
     def _session(self, recs):
         td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         p = os.path.join(td, SID + ".jsonl")
         open(p, "w").write("\n".join(json.dumps(r) for r in recs) + "\n")
         return {"path": p, "sid": SID, "name": "JLD"}

@@ -79,7 +79,7 @@ test("rows carry an honest verdict: download-only files are dimmed and download 
   assert.match(BROWSE, /if \(row\.dataset\.act === "dl"\) startDownload\(p\);/);
   assert.match(FEED_CSS, /\.fb-dlonly \.fb-name \{ color: var\(--dim\); \}/);
   // viewable files open through the EXISTING viewer — one leaf open action for the whole dashboard
-  assert.match(BROWSE, /if \(row\.dataset\.act === "file"\) \{ openFileView\(p, curSid\); return; \}/);
+  assert.match(BROWSE, /if \(row\.dataset\.act === "file"\) \{ openFileClick\(ev, p, curSid\); return; \}/);   // with the row's click: a modified click on a PDF takes a browser tab
 });
 
 test("clicks are delegated to stable roots and the cap is stated in-band", () => {
@@ -138,7 +138,7 @@ test("the feed boots both overlays side by side", () => {
 test("opening the browser CLOSES an open viewer — the stack is one-directional", () => {
   // a browser painted under the opaque viewer was a dead click, and viewer-first registration made
   // one Escape close both overlays; closing the viewer at browse-open kills both failure modes
-  assert.match(BROWSE, /import \{ openFileView, closeFileView \} from "\.\/file-view";/);
+  assert.match(BROWSE, /import \{ closeFileView, openFileClick \} from "\.\/file-view";/);   // the row opens through the gesture reader only
   assert.match(BROWSE, /if \(document\.getElementById\("romp-fileview"\)\) closeFileView\(\);/);
 });
 

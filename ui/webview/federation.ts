@@ -13,7 +13,9 @@
 
 import { adoptArrivals, applyViewOrder, applyViewOrderTo, churnSwaps, healOrder, pruneViewOrder,
          readViewOrder, writeViewOrder, VIEW_ORDER_KEY, VIEW_ORDER_EVENT } from "./view-order";
+import { adoptViews, capsAdopts, announcedSeq, announcedAfter } from "./views-writes";
 import { hostOf, bareId } from "./host-prefix";
+import { installPerfTelemetry, classifyFrame, type RompPerf } from "./perf-telemetry";
 
 export const SEP = ":";
 export const LOCAL = ""; // the local kernel's host key — no prefix, so the single-kernel path is untouched
@@ -63,12 +65,18 @@ const OBJ_ID = ["tabs"]; //                       an array of objects keyed by `
 // default-comment trio (setCommentModel/Effort/Fast, the user 2026-08-29) rides the same way. Broadcast in
 // routeOutbound rather than routed. setFileEditing is the viewer's edit opt-in (the user 2026-08-22:
 // one consent popup answers for the mesh — every kernel's save route gates on its own copy, so the
-// broadcast is what makes the one yes reach them all). Deliberately NOT here: setDefaultDir (a path on
-// one machine, meaningless on another) and setColormap/setPalette (the viewer's display prefs, which the
-// local kernel persists for this browser).
+// broadcast is what makes the one yes reach them all). setCompactSuggest rides the same way (T248, the
+// user 2026-09-07: it shipped per-install and a session on an attached machine, whose kernel's own copy
+// was on, received the suggestion while their gear showed the box off with the mixed mark — they want
+// no mixed state for this setting, ever; one click writes every machine, so the mark can only be
+// transient). Deliberately NOT here: setDefaultDir (a path on one machine, meaningless on another),
+// setColormap/setPalette (the viewer's display prefs, which the local kernel persists for this browser)
+// and the Thinking summaries toggle (per-install: whoever reads the summaries turns it on where they read
+// them).
 const KERNEL_SETTING = new Set(["setAutoNudge", "setJudgeModel", "setIndexModel",
                                 "setJudgeEffort", "setIndexEffort", "setUpdateMode",
                                 "setDistillModel", "setDistillEffort", "setFileEditing",
+                                "setCompactSuggest",
                                 "setCommentModel", "setCommentEffort", "setCommentFast"]);
 
 /** Return a COPY of an inbound message with every session-id field prefixed by `host`. The local host
@@ -233,6 +241,13 @@ export function routeOutbound(msg: any, knownHosts?: ReadonlySet<string>): Route
     const { host, ...rest } = msg;
     return [{ host: host || LOCAL, msg: rest }];
   }
+
+  // The VIEWS store is per kernel and a dashboard edits only its LOCAL one: a tag edit or a whole-blob
+  // views write goes to the local socket whatever fields it carries (the 2026-09-05 review: the tag
+  // op's fields rode at the top level, so a tag `name` that happened to look like a remote lane's
+  // display name would have taken the name-addressed route below to that host — tag names and
+  // session names share a field name, not a meaning).
+  if (msg.type === "tagEdit" || msg.type === "setTimelineViews") return [{ host: LOCAL, msg }];
 
   // order[] (reorderTabs / the timeline's writeOrder): split across the hosts it touches.
   if (Array.isArray(msg.order) && msg.order.some((x: any) => typeof x === "string")) {
@@ -593,14 +608,22 @@ export function mergeHostBars(perHost: Record<string, any>, hostSeq: readonly st
 export const REMOTE_STALE_MS = 30000;
 export const REMOTE_CONNECT_MS = 15000;
 export const REMOTE_REDIAL_MS = 8000;
+// A resumed keep is PROVISIONAL (review find, 2026-09-08), the pane shim's PROVISIONAL_MS byte for byte: 1.5
+// kernel keepalive periods (KEEPALIVE_S is 10 s, so 15 s: one beat may be in flight, two missing is silence).
+// The `resume` stamp (resumed() below) re-bases a socket the browser still holds OPEN, but the far end can
+// have died without a FIN reaching the browser (a laptop sleep across a network change, a tunnel whose local
+// end stays open), and only the kernel's next frame can tell; until one lands the watchdog runs at this bound
+// instead of REMOTE_STALE_MS.
+export const REMOTE_PROVISIONAL_MS = 15000;
 
 /** What the watchdog should do about ONE remote socket, from its state alone (pure, unit-tested):
  *  "close" — force-close so the onclose→redial chain runs (open but silent past the keepalive bound,
  *  or a hung handshake); "redial" — CLOSED with no fresh attempt: dial directly; "" — leave it be.
  *  `lastRecv` is stamped at open and on every frame, so an open socket's silence is measured from
- *  its own open, never from an earlier socket's traffic. */
-export function socketVerdict(readyState: number, lastRecv: number, connT: number, now: number): "close" | "redial" | "" {
-  if (readyState === 1) return now - (lastRecv || connT) > REMOTE_STALE_MS ? "close" : "";
+ *  its own open, never from an earlier socket's traffic. `staleMs` is the silence bound for an OPEN
+ *  socket: REMOTE_STALE_MS, or REMOTE_PROVISIONAL_MS while a resumed keep awaits its confirming frame. */
+export function socketVerdict(readyState: number, lastRecv: number, connT: number, now: number, staleMs = REMOTE_STALE_MS): "close" | "redial" | "" {
+  if (readyState === 1) return now - (lastRecv || connT) > staleMs ? "close" : "";
   if (readyState === 0) return now - connT > REMOTE_CONNECT_MS ? "close" : "";
   if (readyState === 3) return now - connT > REMOTE_REDIAL_MS ? "redial" : "";
   return "";
@@ -620,6 +643,7 @@ interface Conn {
   closed: boolean;
   live: boolean; // kernel reports this tunnel "up" — the only state in which its port is dialed
   lastRecv: number; // epoch ms of the last frame on the CURRENT socket (keepalives count); 0 = none yet
+  resumeProvisional: number; // the `resume` stamp lastRecv rests on until a frame confirms it (the watchdog runs at REMOTE_PROVISIONAL_MS meanwhile); 0 = confirmed, or no stamp
   connT: number;    // when the current socket's connect() attempt started — the watchdog's reference point
   // KERNEL_SETTING messages that arrived while this host's socket was down, newest per type only —
   // flushed on the socket's open event (sendRemote/flushPending). Bounded by construction: at most
@@ -631,9 +655,14 @@ interface Conn {
 export class FederationManager {
   app = "chat";
   private conns = new Map<string, Conn>();
+  private frozeAt = 0;   // the Page Lifecycle `freeze` before the current thaw: a socket already overdue at that moment is not stamped by resumed()
   private perHostOrder: Record<string, string[]> = {};
   private perHostTabs: Record<string, any[]> = {};
   private localViews: any = null;   // the LOCAL kernel's session-views blob, carried on merged tabOrder re-emits
+  private localViewsRejected: any = null;   // the last LOCAL tabOrder blob the seq gate turned away since it last adopted one — the caps frame adopts it (inbound)
+  private tlViewsRejected: any = null;      // the same for the LOCAL lanes payload's blob (perHostTl[LOCAL].views)
+  private localViewsAnnounced: number | null = null;   // the seq the last LOCAL caps frame announced as the kernel's current store when the tabOrder store adopted no kept blob — a LATER blob at exactly that seq is adopted below the stored one (announcedSeq); cleared by the next adoption that changes the stored blob (announcedAfter)
+  private tlViewsAnnounced: number | null = null;      // the same for the lanes payload's store
   private perHostSids: Record<string, Set<string>> = {};
   private perHostFeed: Record<string, any> = {}; // last feed snapshot per host — merged so they don't clobber
   private perHostFeedAt: Record<string, number> = {}; // host -> local ms its snapshot ARRIVED: the merged frame's clock anchor (mergeHostFeeds `nowAt`), so a re-emit anchors exactly as the arrival did
@@ -642,10 +671,18 @@ export class FederationManager {
   private hostSeq: string[] = [LOCAL]; // local first, then attach order — fixes the group order in the strip
   private downHosts = new Set<string>(); // attached, but its tunnel isn't up: what's on screen is a memory
   private lastSeen: Record<string, number> = {}; // host -> epoch secs of its last `up` poll
+  // the page's performance collector (ui/webview/perf-telemetry.ts), set by start(); inbound() times its own
+  // merge and dispatch through it as fed:<type>, nested outside the pane's handler. Public so a test can hand
+  // it a stand-in.
+  perf: RompPerf | null = null;
 
   start(): void {
     const w = window as any;
     this.app = w.__rompApp || "chat";
+    // the page's performance collector (perf-telemetry.ts), published as window.__rompPerf: the pane bundle
+    // installs its own on load, but the kernel-served timeline page has no bundle beyond this one, and its
+    // inline boot (kernel.py _TIMELINE_BOOT) wraps its message listener through the window slot
+    this.perf = installPerfTelemetry(this.app);
     w.__rompFed = {
       inbound: (h: string, m: any) => this.inbound(h, m),
       outbound: (m: any) => this.outbound(m),
@@ -655,6 +692,11 @@ export class FederationManager {
       // you are reading a transcript that stopped updating with nothing telling you (the user
       // 2026-07-29). `lastSeen` dates what is on screen.
       down: () => [...this.downHosts],
+      // the attached hosts THIS pane is still waiting on, by its own channel (pendingFor): attached, and up
+      // as far as the kernel knows, but their sessions are not on this pane's screen yet — the chat's pin
+      // prune leaves their entries alone until they are (render.ts reachableHosts); the shell's network
+      // panel says "loading sessions…" from the same set
+      pending: () => this.pendingFor(),
       lastSeen: (h: string) => this.lastSeen[h] || 0,
     };
     // A drag in ANY pane rewrites the arrangement; every other pane hears it through `storage` (which fires
@@ -685,8 +727,46 @@ export class FederationManager {
     // remote socket that is not open, or has gone quiet past the bound, is closed and redialed now
     // rather than waited out — the phone's re-foreground is exactly the audited case.
     try {
-      document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") this.watchdog(Date.now(), true); });
+      this.watchLifecycle(document);
     } catch (e) { /* no document — the node tests construct the manager bare */ }
+  }
+
+  /** The Page Lifecycle listeners on the document (public and parameterised so the tests install them
+   *  on a fake and fire the events in the browser's order). `freeze` → frozeAt; `resume` → resumed(); `visibilitychange`
+   *  to visible → the foreground watchdog pass, exactly as before. */
+  watchLifecycle(doc: { addEventListener(type: string, listener: () => void): void; readonly visibilityState: string }): void {
+    doc.addEventListener("freeze", () => { this.frozeAt = Date.now(); });
+    doc.addEventListener("resume", () => this.resumed(Date.now()));
+    doc.addEventListener("visibilitychange", () => { if (doc.visibilityState === "visible") this.watchdog(Date.now(), true); });
+  }
+
+  /** The Page Lifecycle `resume` event (the user 2026-09-07, whose dashboard froze every time they came
+   *  back to its tab): stamp every OPEN relay socket's lastRecv to now. A Chromium tab left in the
+   *  background is FROZEN — no JS runs at all — so no frame could stamp lastRecv even though the socket
+   *  stayed open and the kernel kept heartbeating. lastRecv therefore measured "JS did not run", not
+   *  "the socket went silent", and the foreground pass (watchdog(now, true), fired by visibilitychange
+   *  right after the thaw) read the frozen stretch as 30s+ of silence and abandoned+redialed EVERY
+   *  attached host on EVERY return — each redial a full resend from that kernel. Chromium fires
+   *  `resume` before `visibilitychange`, so the stamp lands first and socketVerdict (unchanged) sees a
+   *  fresh socket and keeps it; the frames queued during the freeze then dispatch on the same socket.
+   *  This re-BASES the measurement, it does not disarm it: a socket that stays silent after the thaw is
+   *  still put down by the regular tick, and sooner than REMOTE_STALE_MS (review find, 2026-09-08): an
+   *  OPEN readyState says only that the browser has seen no FIN, and a peer that died while the tab was
+   *  frozen leaves the socket looking exactly like a healthy one, so the stamp is PROVISIONAL
+   *  (resumeProvisional: the watchdog runs at REMOTE_PROVISIONAL_MS until a frame confirms it), and a
+   *  socket already overdue BEFORE the freeze is not stamped at all: its silence began while JS was
+   *  running, so that gap is real and the foreground pass redials it as it did before the stamp
+   *  existed. Only readyState 1 is stamped — a socket
+   *  still CONNECTING is a handshake the frozen tab never finished, and the foreground pass still kills
+   *  it. Where no `resume` fires (Firefox, Safari, a hidden-but-running tab) stale lastRecv IS real
+   *  silence, and today's instant abandon on foreground is unchanged. */
+  resumed(now: number): void {
+    for (const c of this.conns.values()) {
+      if (!c.ws || c.ws.readyState !== 1) continue;
+      if (this.frozeAt && this.frozeAt - (c.lastRecv || c.connT) > REMOTE_STALE_MS) continue;   // overdue before the freeze: real silence, no stamp
+      c.lastRecv = now;
+      c.resumeProvisional = now;
+    }
   }
 
   /** One pass of the remote-socket watchdog (public so the tests can tick it with their own clock):
@@ -696,7 +776,7 @@ export class FederationManager {
     for (const c of this.conns.values()) {
       if (c.closed || !c.ws) continue;
       const rs = c.ws.readyState;
-      let v = socketVerdict(rs, c.lastRecv, c.connT, now);
+      let v = socketVerdict(rs, c.lastRecv, c.connT, now, c.resumeProvisional ? REMOTE_PROVISIONAL_MS : REMOTE_STALE_MS);
       if (foreground && rs === 0) v = "close";
       if (v === "close") {
         // the same breadcrumb family as open/close/detach, so a "cards came back late" report reads
@@ -722,9 +802,54 @@ export class FederationManager {
 
   // kernel → browser: prefix this host's ids, merge tab orders, hand the rest to the panes.
   inbound(host: string, msg: any): void {
+    // timed as fed:<wire type>: the prefixing, delta application and merge this layer does on a frame before
+    // the pane's own handler runs (that handler is timed under <type>, nested inside; the collector records
+    // each level's own time, so the two add up to the frame's cost). No collector: the plain path.
+    const p = this.perf;
+    if (!p) { this.inboundNow(host, msg); return; }
+    p.timed("fed:" + classifyFrame(msg), () => this.inboundNow(host, msg));
+  }
+
+  private inboundNow(host: string, msg: any): void {
     const m = prefixInbound(host, msg);
     if (m && m.type === "session" && typeof m.id === "string") {
       (this.perHostSids[host] ||= new Set()).add(m.id);
+    }
+    // a kernel's `caps` frame describes THAT kernel; the panes hold only the LOCAL kernel's (its views
+    // store is the one they write). A remote's would read as the local kernel's — dropped here.
+    if (m && m.type === "caps" && host !== LOCAL) return;
+    // The local kernel's caps frame is the reconnect event: each replayed views store adopts the blob its
+    // gate last turned away when the frame names it (the 2026-09-05 review; capsAdopts),
+    // as the panes do — the kernel sends its connect push before this frame and `viewsSeq` is the seq of
+    // the views blob that push served, so a push a restarted kernel served under an OLDER seq (a store
+    // restored while it was down) was rejected a frame ago and is adopted here; a healthy reconnect's push
+    // was adopted, nothing is kept, and the stores stand; a pusher frame kept because it arrived between
+    // the push and this frame carries a seq the frame does not name and is discarded. A store that adopted
+    // RE-EMITS before the caps frame is handed on: the panes see the local blob only through these re-emits
+    // (a rejected push reached them wearing the stored blob), so the restored blob must meet their own gate
+    // — and be turned away there — before their caps door adopts it. Nothing is re-emitted otherwise. When a
+    // store kept nothing the frame names (the connect push carried no blob for it — a sentinel cycle sends no
+    // tabOrder), the frame's viewsSeq is remembered as the kernel's announced store for that store, and the
+    // later blob carrying exactly that seq is adopted below the stored one on arrival (the review;
+    // announcedSeq): one slot per store, overwritten by each local caps frame, cleared by the next adoption
+    // that CHANGES the stored blob and never by a re-arrival of the blob already stored (announcedAfter);
+    // null (no store at all) and a missing field announce nothing. The panes hold the same slot from the same
+    // frame, handed on below; the merged re-emits between that frame and the pusher's next one (a remote host's
+    // push, a `closed` frame, a storage event, a host drop) hand them the STORED blob at their own held seq,
+    // which leaves their slot standing by the same rule, so the re-emit of that later adoption meets an open
+    // door there too.
+    if (m && m.type === "caps") {
+      if (capsAdopts(this.localViewsRejected, m.viewsSeq)) {
+        this.localViews = this.localViewsRejected; this.localViewsAnnounced = null;
+        this.emitMergedOrder();
+      } else this.localViewsAnnounced = announcedSeq(m.viewsSeq);
+      this.localViewsRejected = null;
+      const tl = this.perHostTl[LOCAL];
+      if (tl && capsAdopts(this.tlViewsRejected, m.viewsSeq)) {
+        this.perHostTl[LOCAL] = { ...tl, views: this.tlViewsRejected }; this.tlViewsAnnounced = null;
+        this.emitMergedTimeline(false);
+      } else this.tlViewsAnnounced = announcedSeq(m.viewsSeq);
+      this.tlViewsRejected = null;
     }
     // A kernel's `closed` frame is ITS OWN report that the session is gone — the one other writer allowed
     // to touch the per-host store (T233, the user 2026-09-03). The 2026-08-02 rule below forbids
@@ -752,8 +877,15 @@ export class FederationManager {
       // session VIEWS (the user 2026-08-18): the blob is the LOCAL kernel's viewer pref (ids arrive
       // host-prefixed inside it already) — remote kernels' copies are their own dashboards' prefs.
       // Without this passthrough the merged re-emit silently dropped the field and the browser
-      // dashboard's chat never learned the views at all.
-      if (host === LOCAL && m.views && typeof m.views === "object") this.localViews = m.views;
+      // dashboard's chat never learned the views at all. Kept ONLY when its write sequence is at
+      // least the stored one (2026-09-05): the re-emit below replays this copy on every merged order,
+      // and a frame the kernel built before a write must not roll the replayed blob back behind an
+      // ack the pane already adopted. The last blob turned away is kept for the caps frame (above), and a
+      // blob at the seq the last caps frame announced is adopted below the stored one.
+      if (host === LOCAL && m.views && typeof m.views === "object") {
+        if (adoptViews(this.localViews, m.views, this.localViewsAnnounced)) { this.localViewsAnnounced = announcedAfter(this.localViews, m.views, this.localViewsAnnounced); this.localViews = m.views; this.localViewsRejected = null; }
+        else this.localViewsRejected = m.views;
+      }
       this.ensureHost(host);
       this.absorbHostReport(host, prevOrder, prevTabs);   // a host just reported its sessions → the one
       this.emitMergedOrder(true, host);                   //   moment the stored arrangement may be touched
@@ -768,7 +900,18 @@ export class FederationManager {
     }
     // timeline snapshots replace the panel's state wholesale (update/applyBars) — merge per host like the feed.
     if (m && m.type === "data" && m.data && typeof m.data === "object") {
-      this.perHostTl[host] = m.data;
+      // the LOCAL lanes payload carries the views blob the merged re-emit replays: a payload whose blob
+      // has a LOWER write sequence than the stored one keeps the stored blob (its lanes still land) —
+      // the same rule the tabOrder store applies above (2026-09-05), the same keep of the last blob
+      // turned away, for the caps frame, the same door for the blob at the announced seq, and the same
+      // slot rule on adoption (a re-arrival of the stored blob leaves the slot)
+      const held = host === LOCAL ? this.perHostTl[LOCAL] : null;
+      if (held && held.views && m.data.views && !adoptViews(held.views, m.data.views, this.tlViewsAnnounced)) {
+        this.perHostTl[host] = { ...m.data, views: held.views }; this.tlViewsRejected = m.data.views;
+      } else {
+        this.perHostTl[host] = m.data;
+        if (host === LOCAL && m.data.views) { this.tlViewsRejected = null; this.tlViewsAnnounced = announcedAfter(held && held.views, m.data.views, this.tlViewsAnnounced); }
+      }
       this.ensureHost(host);
       this.emitMergedTimeline(false);
       return;
@@ -1089,7 +1232,7 @@ export class FederationManager {
     const w = dashboardWid();
     const url = `${proto}${location.host}/remote/${encodeURIComponent(host)}/ws?app=${encodeURIComponent(this.app)}&token=${encodeURIComponent(token)}`
       + (w ? `&wid=${encodeURIComponent(w)}` : "");
-    const conn: Conn = { host, ws: null, url, closed: false, live, lastRecv: 0, connT: 0, pending: new Map() };
+    const conn: Conn = { host, ws: null, url, closed: false, live, lastRecv: 0, resumeProvisional: 0, connT: 0, pending: new Map() };
     this.conns.set(host, conn);
     this.ensureHost(host);
     this.connect(conn);
@@ -1110,6 +1253,7 @@ export class FederationManager {
     let ws: WebSocket;
     conn.connT = Date.now();
     conn.lastRecv = 0;
+    conn.resumeProvisional = 0;   // a fresh socket starts unmarked: the provisional rule was the resumed socket's
     try {
       ws = new WebSocket(conn.url);
     } catch (e) {
@@ -1137,6 +1281,7 @@ export class FederationManager {
     };
     ws.onmessage = (ev: MessageEvent) => {
       conn.lastRecv = Date.now();   // every frame counts, the keepalive included — that is the heartbeat
+      conn.resumeProvisional = 0;   // and any frame, the keepalive included, confirms a resumed keep
       let msg: any;
       try {
         msg = JSON.parse(ev.data);

@@ -63,7 +63,7 @@ test("the client keys the green wash on the kernel's replyOwed; the gesture latc
   assert.match(RENDER, /cmtAwaitBase\.set\(synth\.tid, \{ \.\.\.CMT_LATCH_ZERO \}\);/, "the create gesture latches its synthetic thread");
   assert.match(COMMENTS, /queued\?: number;/); assert.match(COMMENTS, /unreachable\?: boolean \| null;/); assert.match(COMMENTS, /lastUuid\?: string;/);
   assert.match(KERNEL, /"queued": queued,/); assert.match(KERNEL, /"unreachable": unreachable or None,/); assert.match(KERNEL, /"lastUuid": last_uuid,/);
-  assert.match(KERNEL, /held = \[a for a in live if \(a\.get\("_echo_text"\) or ""\)\.strip\(\) and not a\.get\("command"\)/, "echo-held sends count as owed, the chat's own fold");
+  assert.match(KERNEL, /held = \[a for a in live if sb\.echo_text_key\(a\.get\("_echo_text"\)\) and not a\.get\("command"\)/, "echo-held sends count as owed, the chat's own fold (under the one echo text key, session_backend.echo_text_key)");
   assert.match(KERNEL, /def _settle\(a\):/, "the stop's settle record is skipped when reading the landing");
   assert.match(KERNEL, /reply_owed = status == "open" and \(turn_open or queued > 0 or owes_first/);
   assert.match(RENDER, /else if \(m\.type === "commentSendFailed" && m\.tid\) \{\s*\n\s*cmtAwaitBase\.delete\(String\(m\.tid\)\);/, "a refused send releases its latch");

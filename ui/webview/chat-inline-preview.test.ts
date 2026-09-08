@@ -26,7 +26,9 @@ test("previewFull renders the image itself; a PDF is a click-to-view CARD, never
   const pf = PREVIEW.slice(PREVIEW.indexOf("export function previewFull"));
   assert.doesNotMatch(pf, /createElement\("iframe"\)/, "no auto-loading PDF frame in the chat strip");
   assert.match(pf, /box\.classList\.add\("path-full-pdfcard"\);/);
-  assert.match(pf, /box\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); openLightbox\(path, sid\); \};/);
+  // a plain click opens the PDF in the lightbox, like an image; a Cmd/Ctrl- or middle-click opens it in
+  // its OWN browser tab (openPdf → openPdfTab, the user 2026-09-07) — pdf-new-tab.test.ts runs the opener
+  assert.match(pf, /box\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); openPdf\(path, sid, ev\); \};/);   // the gesture rides along: a modified click → its own tab (pdf-new-tab.test.ts)
   // the HEAD probe (headers only — never a download) HIDES a failed UNVERIFIED card and keeps it
   // registered for the heal events (2026-08-24 — self-removal erased the spot until a send); a
   // kernel-verified card skips the probe — the kernel already stat'd the file

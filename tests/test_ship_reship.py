@@ -57,7 +57,9 @@ class SourcePins(unittest.TestCase):
     def test_payload_retained_and_reshipped_on_the_reconnect_event(self):
         self.assertIn("interface PendingShip { name: string; shipId: string; b64?: string }", RENDER)
         self.assertIn("if (entry) entry.b64 = b64;", RENDER)
-        self.assertIn('window.addEventListener("romp:wsup", () => reshipPendingUploads());', RENDER)
+        # the listener grew a body (T246: the local active-tab re-arm rides the same open event); the re-ship
+        # is still its first statement
+        self.assertIn('window.addEventListener("romp:wsup", () => {\n  reshipPendingUploads();', RENDER)
         # …and the federated twin (review finding 2026-09-01): the relay's own (re)open re-ships THAT
         # host's entries — scoped by ack socket. The kernel-reported hostUp does NOT: it fires in the
         # tick federation re-dials the relay, before the socket is open (second review, same day)

@@ -55,8 +55,10 @@ class ManagerAndLauncher(unittest.TestCase):
     def test_the_manager_starts_the_tmux_server_without_op_credentials_when_romp_runs_op(self):
         src = _read("bin/romp-manager")
         self.assertIn("function withoutOpCredentials(env)", src)
-        self.assertIn("if (!out.ROMP_API_KEY_REF && !serviceEnvHasRef(env)) return out;", src,
+        self.assertIn("if (!PROVIDER_VARS.some((v) => out[v]) && !serviceEnvHasRef(env)) return out;", src,
                       "a helper box keeps its environment; the env file's own line counts as configured")
+        self.assertIn("const PROVIDER_VARS = ['ROMP_API_KEY_CMD', 'ROMP_API_KEY_REF'];", src,
+                      "a key command is a provider too (2026-09-07)")
         self.assertRegex(src, r"k === 'OP_SERVICE_ACCOUNT_TOKEN' \|\| k === 'OP_CONNECT_HOST' \|\| k === 'OP_CONNECT_TOKEN' \|\| k === 'OP_ACCOUNT' \|\| k\.startsWith\('OP_SESSION_'\)\s*\|\| k === 'ANTHROPIC_API_KEY'")
         self.assertEqual(src.count("env: withoutOpCredentials(process.env) });"), 3,
                          "the scoped start, the bare start, and the pid probe after a failed scoped start (a tmux "
@@ -70,7 +72,9 @@ class ManagerAndLauncher(unittest.TestCase):
         self.assertIn("OP_SESSION_[A-Za-z0-9_]*|ANTHROPIC_API_KEY", block, "the startup key too")
         helper = src[src.index("_romp_op_consumer() {"):src.index("# The kernel serve token")]
         self.assertIn('[[ -n "${ROMP_API_KEY_REF:-}" ]] && return 0', helper)
+        self.assertIn('[[ -n "${ROMP_API_KEY_CMD:-}" ]] && return 0', helper, "a key command is a provider too")
         self.assertIn("ROMP_API_KEY_REF=*) return 0 ;;", helper, "the env file's own line")
+        self.assertIn("ROMP_API_KEY_CMD=*) return 0 ;;", helper, "the env file's own command line")
         self.assertIn("${ROMP_SERVICE_ENV_FILE:-${ROMP_SERVICE_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/romp/service.env}}", helper)
 
 

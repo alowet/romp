@@ -179,6 +179,21 @@ test("routeOutbound: a global message (no session id) goes local", () => {
   assert.deepEqual(routes, [{ host: "", msg: { type: "setColormap", name: "viridis" } }]);
 });
 
+test("routeOutbound: a views write goes to the LOCAL kernel whatever it carries — the views store is per kernel", () => {
+  const hosts = new Set(["gpu1"]);
+  // the tag op rides NESTED under `edit`; even a tag named like a remote lane cannot take the name-addressed route
+  const edit = { type: "tagEdit", writeId: "w1", edit: { op: "rename", tid: "g7", newName: "gpu1:api" } };
+  assert.deepEqual(routeOutbound(edit, hosts), [{ host: "", msg: edit }]);
+  // and the router routes the TYPE local explicitly: a flat legacy shape with a remote-looking name stays local too
+  const flat = { type: "tagEdit", writeId: "w2", name: "gpu1:api", newName: "x" };
+  assert.deepEqual(routeOutbound(flat, hosts), [{ host: "", msg: flat }], "tag names and session names share a field name, not a meaning");
+  const whole = { type: "setTimelineViews", writeId: "w3", views: { active: "all", tags: [] } };
+  assert.deepEqual(routeOutbound(whole, hosts), [{ host: "", msg: whole }]);
+  // …while a remote session's edit inside a LOCAL tag keeps its viewer-relative id: the local kernel stores the pair as-is
+  const member = { type: "tagEdit", writeId: "w4", edit: { op: "addMember", tid: "g7", sids: ["gpu1:" + U] } };
+  assert.deepEqual(routeOutbound(member, hosts), [{ host: "", msg: member }]);
+});
+
 test("routeOutbound: a cross-host reorder fans out one route per host with its own sids", () => {
   const order = [U, "gpu1:" + V, "gpu1:" + U, V]; // local U, gpu1 V, gpu1 U, local V
   const routes = routeOutbound({ type: "reorderTabs", order });
@@ -492,7 +507,8 @@ test("routeOutbound: the gear's kernel-side settings reach EVERY attached kernel
                      { type: "setCommentModel", model: "claude-opus-5" },
                      { type: "setCommentEffort", effort: "high" },
                      { type: "setCommentFast", fast: "on" },
-                     { type: "setFileEditing", enabled: true }]) {
+                     { type: "setFileEditing", enabled: true },
+                     { type: "setCompactSuggest", enabled: true }]) {   // T248: no longer per-install
     const routes = routeOutbound(msg, new Set(["TESTHOST", "gpu1"]));
     assert.deepEqual(routes.map((r) => r.host).sort(), ["", "TESTHOST", "gpu1"].sort(), msg.type);
     for (const r of routes) assert.deepEqual(r.msg, msg, "the kernels are host-blind: same message to each");

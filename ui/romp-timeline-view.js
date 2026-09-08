@@ -39,6 +39,129 @@ function _rompOnlyTag() {
 // record; this is its mirror for the lanes. The kernel emits `tags`; `groups` is honored as the
 // pre-rename key an un-updated kernel still pushes, in ONE place so every rule reads through it.
 function viewTags(views) { return (views && (views.tags || views.groups)) || []; }
+// the views blob's write sequence (the kernel stamps one per accepted write, 2026-09-05), or null for a
+// blob from a kernel that does not — and whether an incoming blob may replace the held one: yes when
+// its seq is at least the held seq, or when either side carries none, or when its seq is the one the
+// kernel ANNOUNCED as its current store at connect (`announced`, the slot setCaps fills; a blob
+// carrying it IS that store, not a stale frame, however far below the held seq). The hand-mirror of
+// views-writes.ts seqOf/adoptViews (this file cannot import TS; timeline-views-ack.test.ts pins them).
+function viewsSeq(v) { const s = v && v.seq; return (typeof s === 'number' && isFinite(s)) ? s : null; }
+// a union's stable key for the dialog's open rename editor: its first tag id (the local tag's when one
+// exists — the id a create's ack hands back), else its name (a remote-only union). An id survives the
+// rename the editor exists to make; the name it replaced would not.
+function unionKey(g) { return (g && g.ids && g.ids[0]) || (g && g.name) || ''; }
+function viewsAdopts(held, incoming, announced) {
+  if (!incoming) return false;
+  const h = viewsSeq(held), i = viewsSeq(incoming);
+  return h === null || i === null || i >= h || (typeof announced === 'number' && i === announced);
+}
+// whether the kernel's `caps` frame, the reconnect event, adopts the blob the gate last REJECTED since
+// its last adoption — the hand-mirror of views-writes.ts capsAdopts (the 2026-09-05
+// review). The connect push precedes the caps frame and `served` is the frame's viewsSeq, the seq of the
+// views blob that push put on this socket (null when it carried none; undefined on a frame from a kernel
+// before the field). A push a restarted kernel served under an OLDER seq (a store restored while it was
+// down; its seq floor lives for its process) was turned away a frame ago and is the kept blob: its seq
+// matches, it is adopted. A pusher-thread frame built before a concurrent write and kept because it
+// arrived between the push and the caps frame carries an older seq: no match, discarded, the gate stands.
+// A frame without the field adopts the kept blob outright (the pre-field rule).
+function viewsCapsAdopts(rejected, served) {
+  if (!rejected) return false;
+  if (served === undefined) return true;
+  return typeof served === 'number' && isFinite(served) && viewsSeq(rejected) === served;
+}
+// the seq a caps frame ANNOUNCES as the kernel's current store, remembered when the frame adopted no kept
+// blob — the hand-mirror of views-writes.ts announcedSeq (the 2026-09-05 review): its viewsSeq
+// when a number (the served blob's seq, or the store's current seq when the push carried no views frame),
+// null when null (no store at all) or absent (a kernel from before the field). Kept in one slot per store
+// (_announcedViewsSeq), overwritten by each caps frame and cleared by the next adoption that changes the
+// held blob (viewsAnnouncedAfter); a LATER blob at exactly that seq is adopted below the held one (_takeViews). Without it, a restart over a store restored
+// from an older copy, met by a reconnect whose push carried no blob, left nothing kept for the caps frame
+// to match: the pusher's next frame was turned away and no second caps frame comes.
+function viewsAnnouncedSeq(served) { return (typeof served === 'number' && isFinite(served)) ? served : null; }
+// the slot AFTER an adoption — the hand-mirror of views-writes.ts announcedAfter (the review):
+// cleared only by an adoption that CHANGES the held blob (a seq other than the held one — a newer write, or
+// the announced seq itself below it — a seq-less side, or the announced seq arriving at the held seq), and
+// left standing through a re-arrival of the blob already held, which is no new information. The federation
+// router replays its stored blob into the merged lanes payload on every re-emit (a remote host's lanes, a
+// view-order storage event, a host drop); the earlier clear on any adoption let such a re-emit, landing between
+// the caps frame and the pusher's next frame, spend the slot, and the restored store the router then adopted
+// and re-emitted at the announced seq was turned away here: router and pane silently diverged until the next
+// write.
+function viewsAnnouncedAfter(held, incoming, announced) {
+  if (typeof announced !== 'number') return null;
+  const h = viewsSeq(held), i = viewsSeq(incoming);
+  return (i !== null && i === h && i !== announced) ? announced : null;
+}
+// The hand-mirror of views-writes.ts applyTagEdit / rederiveViews (the 2026-09-05
+// review): one targeted op applied to a blob's LOCAL tags the way the gesture applied it (a copy;
+// an unknown tid is a no-op — the kernel refuses it), and the optimistic copy rebuilt from the base
+// plus the writes still in flight, oldest first — a whole-blob write IS the state it posted, a
+// targeted op applies on top — so a refusal of ONE write reverts only that write's change. Null
+// when nothing is in flight: the base itself is what shows.
+function applyTagEditOp(v, edit, newId) {
+  const nv = JSON.parse(JSON.stringify(v || {}));
+  const tags = viewTags(nv).slice(); delete nv.groups;
+  const byId = (tid) => tags.find((t) => t.id === tid);
+  const sids = (edit.sids || []).concat(edit.sid ? [edit.sid] : []);
+  let t;
+  switch (edit.op) {
+    case 'create': tags.push({ id: newId || 'pending-' + Date.now().toString(36), name: edit.name || '', color: edit.color || '', members: sids.slice() }); break;
+    case 'rename': t = byId(edit.tid); if (t && edit.newName) t.name = edit.newName; break;
+    case 'recolor': t = byId(edit.tid); if (t && edit.color) t.color = edit.color; break;
+    case 'delete': { const i = tags.findIndex((x) => x.id === edit.tid); if (i >= 0) tags.splice(i, 1); if (nv.active === edit.tid) nv.active = 'all'; break; }
+    case 'addMember': t = byId(edit.tid); if (t) t.members = Array.from(new Set((t.members || []).concat(sids))); break;
+    case 'removeMember': t = byId(edit.tid); if (t) t.members = (t.members || []).filter((m) => sids.indexOf(m) < 0); break;
+    case 'move': {
+      const from = byId(edit.tid_from), to = byId(edit.tid_to);
+      if (from) from.members = (from.members || []).filter((m) => sids.indexOf(m) < 0);
+      if (to) to.members = Array.from(new Set((to.members || []).concat(sids)));
+      break;
+    }
+  }
+  nv.tags = tags;
+  return nv;
+}
+function rederiveViews(base, writes) {
+  if (!writes || !writes.length) return null;
+  let p = JSON.parse(JSON.stringify(base || { active: 'all', tags: [] }));
+  for (const w of writes) {
+    if (w.lens) p = applyLensFields(p, w.lens);
+    else if (w.blob) p = JSON.parse(JSON.stringify(w.blob));
+    else if (w.edit) p = applyTagEditOp(p, w.edit, w.newId);
+  }
+  return p;
+}
+// The placeholder id an optimistic create's row wears until the kernel's ack names the real one
+// (views-writes.ts isPlaceholderId): such a row takes no gesture — an op addressed by it is
+// refused as a tag that does not exist (the 2026-09-05 review).
+function isPendingTagId(id) { return typeof id === 'string' && /^pending-/.test(id); }
+// A lens or order write's own content — {active?, actives?, tagOrder?} — applied to a blob (a copy),
+// and the blob such a write POSTS: the STORE's blob (the last one adopted, never the pending copy)
+// with the fields set, the tags array re-sorted to a given order — the pill-drag contract that the
+// stored array reads in the dragged order too: over the socket the kernel's door orders the stored
+// array by the write's tagOrder itself; on the Electron path, where the posted blob IS the file,
+// this re-sort does it. The
+// hand-mirrors of views-writes.ts applyLensFields / lensBlob (the 2026-09-05 review: a
+// whole-blob write built from the pending copy carried every targeted edit still in flight as this
+// page's claim on those tags, and a rename the kernel had refused landed through a lens toggle).
+function applyLensFields(v, fields) {
+  const nv = JSON.parse(JSON.stringify(v || { active: 'all', tags: [] }));
+  nv.tags = viewTags(nv).slice(); delete nv.groups;
+  if (fields.active !== undefined) nv.active = fields.active;
+  if (fields.actives !== undefined) nv.actives = JSON.parse(JSON.stringify(fields.actives));
+  if (fields.tagOrder !== undefined) nv.tagOrder = fields.tagOrder.slice();
+  return nv;
+}
+function lensBlob(base, fields) {
+  const v = applyLensFields(base, fields);
+  if (fields.tagOrder) {
+    const pos = Object.create(null);           // null-prototype (the prototype-key name hazard)
+    fields.tagOrder.forEach((n, i) => { if (!(n in pos)) pos[n] = i; });
+    const n = fields.tagOrder.length;
+    v.tags = v.tags.slice().sort((a, b) => ((a.name in pos) ? pos[a.name] : n) - ((b.name in pos) ? pos[b.name] : n));
+  }
+  return v;
+}
 // A tag IS its NAME, everywhere (user ruling 2026-08-24: "if the UX requires understanding that
 // tags exist across different kernels, it is not good"): one name = one identity, membership the
 // UNION across every kernel defining that name, the LOCAL store's color winning the render. The
@@ -53,7 +176,9 @@ function viewTagUnion(views) {
   for (const t of viewTags(views)) {
     const g = byName[t.name] || (byName[t.name] = { name: t.name || 'tag', color: '', members: [],
                                                     ids: [], localId: null, homes: [], remotes: [] });
-    if (!g.localId) { g.localId = t.id; g.color = t.color || g.color; }
+    // `pending`: the local tag is a create still in flight (its placeholder id) — the union renders
+    // and takes no gesture until the ack (isPendingTagId); every action builder checks it
+    if (!g.localId) { g.localId = t.id; g.color = t.color || g.color; if (isPendingTagId(t.id)) g.pending = true; }
     g.ids.push(t.id);
     for (const m of (t.members || [])) if (g.members.indexOf(m) < 0) g.members.push(m);
     if (out.indexOf(g) < 0) out.push(g);
@@ -831,6 +956,11 @@ class TimelinePanel {
     // so draw() paints the romp swirl loader there. Set true the instant applyBars runs (or a full one-shot
     // data object arrives through update()), and the loader is gone on the next draw. CLAUDE.md loader rule.
     this._barsLoaded = false;
+    // A bars frame that arrived BEFORE any lanes skeleton (the user 2026-09-07, who came back to a frozen
+    // dashboard tab): the pane shim now coalesces same-type frames, so on a first connect [data1, bars1,
+    // data2] can reach the pane as [bars1, data2] — and applyBars used to drop bars1 on `!this.data`. It is
+    // parked here instead and lands with the next skeleton (update()). Newest parked frame wins.
+    this._pendingBars = null;
     // per-LANE bars evidence (the user 2026-08-15: after a restart, a live WORKING lane vanished from
     // the active-only view, then reappeared bar-less): every with_bars build writes a turns entry for
     // EVERY lane it covered (empty for a quiet one), so a lane's key appearing is the exact "its
@@ -863,12 +993,19 @@ class TimelinePanel {
     this._lockNow = false;
     this._compactClicked = {};   // sid → click ts: show the compacting cue OPTIMISTICALLY until the real state catches up
     this._pendingFlags = {};     // sid → {flag: value}: an optimistic eye-toggle held STICKY across pushes until the kernel's data confirms it (no flicker-back)
+    this._laneRefusal = null;    // {sid, flag, text}: the kernel's refusal of the last lane-gear toggle, shown in the gear until dismissed or retried
+    this._laneMenuBuild = null;  // the last-opened lane gear's rebuild-in-place, so a refusal arriving while it is open repaints it (like _viewsDialogBuild; every use is gated on _laneMenu being open)
     this._dismissed = new Set(); // sids cleared via the dead-lane Clear pill, held STICKY the same way (see _reconcileDismissed)
     this._views = null;          // the kernel-echoed views blob (data.views); null until the first push
-    this._pendingViews = null;   // an optimistic edit held sticky until a push echoes it (see _reconcileViews)
+    this._rejectedViews = null;  // the last blob the seq gate turned away since it last adopted one — what the caps frame adopts (setCaps)
+    this._announcedViewsSeq = null; // the seq the last caps frame announced as the kernel's current store when it adopted no kept blob — a LATER blob at exactly that seq is adopted below the held one (_takeViews); cleared by the next adoption that changes the held blob (viewsAnnouncedAfter)
+    this._pendingViews = null;   // an optimistic edit held until the kernel ACKS the write (viewsAck) or echoes it exactly (_reconcileViews)
+    this._viewsWrites = [];      // the writes in flight, oldest first: {id, name, tid, op, openRename} — the pending copy clears when the LAST one is acked
+    this._viewsWriteSeq = 0;     // writeId mint — a per-page counter beside the ms stamp, so two same-ms gestures never share one
+    this._legacyViewsAge = 0;    // LEGACY kernels only (no `seq`, no acks): frames since the write — the old three-frame yield (_reconcileViews)
+    this._caps = new Set();      // what the LOCAL kernel announced at `ready` ({type:"caps"}); 'tagEdit' = targeted ops, acks, seq (setCaps)
     this._pendingTagEdits = {};  // remote-tag edits held optimistically until the owner's poll echoes (federation v1): id → {tag: shape|null(=deleted), age}
-    this._tagEditErr = null;     // the LOUD failure of the last remote-tag edit ({host, name, error}), shown in the dialog until dismissed
-    this._pendingViewsAge = 0;   // pushes since the edit — the kernel is authoritative, so a stale pending yields
+    this._tagEditErr = null;     // the LOUD failure of the last tag edit ({host, name, error}), shown in the dialog until dismissed
     this._viewsMenu = null;      // the Show-dropdown element, when open
     this._viewsDialog = null;    // the sessions/group dialog backdrop, when open
     this._viewsDialogKey = null; // its Escape hook {doc, fn}, removed on every close path
@@ -1064,6 +1201,25 @@ class TimelinePanel {
       if (this.tip && this.tip.classList && this.tip.classList.contains('show')) this.hideTip();
       _release();
     });
+    // Paint only when the pane can be seen (the user 2026-09-07, who came back to the dashboard's browser tab
+    // after it sat in the background and found the page frozen): every frame the kernel pushed while the tab
+    // was hidden was parsed AND fully drawn — N frames, N whole-SVG rebuilds — so the return paid for all of
+    // them at once. update()/applyBars() now apply their STATE unconditionally (this.data, the live edge's
+    // clock, the loader latch) but hold the draw while hidden, on the same _dirtyWhileTip path the tooltip
+    // and click holds use, and this is that hold's RELEASE: the tab coming back (visibilitychange → visible)
+    // or the pane itself coming into view (IntersectionObserver on the wrap — a display:none pane, a hidden
+    // Obsidian leaf, where the tab never changed state). One catch-up draw per return, never one per frame.
+    // Both are events; no timer polls for visibility. The observer is optional (Obsidian / a bare host may
+    // lack it) — see _hiddenForPaint for what the hold keys on without it.
+    this._onVis = () => this._releasePaintHold();
+    if (typeof document !== 'undefined' && document.addEventListener) document.addEventListener('visibilitychange', this._onVis);
+    this._io = null;
+    if (typeof IntersectionObserver !== 'undefined') {
+      try {
+        this._io = new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) this._releasePaintHold(); });
+        this._io.observe(this.wrap);
+      } catch (e) { this._io = null; }
+    }
 
     // controls row BELOW the time axis. Layout (the user 2026-06-11): usage bars LEFT-justified,
     // then a flexible spacer, then RIGHT-justified "collapse idle gaps" with the 🔒 lock-to-now
@@ -1236,7 +1392,7 @@ class TimelinePanel {
     this._hover = null; // feed→timeline hover highlight {ids,...} (set by update from data.hover OR setHover; null = none)
     this._hoverNonce = null;  // highest hover nonce applied — gates the direct push vs the file poll so neither clobbers the other (the same monotonic nonce rides both; see setHover)
     this._frozeFromPin = false;  // freeze-on-hover: true while a tooltip has paused live-follow that WAS pinned (so hideTip knows to resume)
-    this._dirtyWhileTip = false; // a data poll arrived while a tooltip was up (draw was skipped) → hideTip repaints the catch-up
+    this._dirtyWhileTip = false; // a data poll arrived while a tooltip was up (draw was skipped) → hideTip repaints the catch-up; also set under a pressed pointer (_release repaints) and while the pane is out of sight (_releasePaintHold repaints, 2026-09-07)
     this._unfreezeTimer = null;  // deferred hideTip resume — cancelled by a quick glyph→glyph hover handoff
     this.wrap.tabIndex = 0; this.wrap.style.outline = 'none';
     this._onKey = (e) => this.onKey(e);
@@ -1302,6 +1458,8 @@ class TimelinePanel {
       this.wrap.removeEventListener('touchstart', this._onTouchStart); this.wrap.removeEventListener('touchmove', this._onTouchMove); this.wrap.removeEventListener('touchend', this._onTouchEnd); this.wrap.removeEventListener('touchcancel', this._onTouchEnd); }
     if (this._drawRAF) cancelAnimationFrame(this._drawRAF);
     this._stopLiveTick();
+    if (this._onVis && typeof document !== 'undefined' && document.removeEventListener) document.removeEventListener('visibilitychange', this._onVis);
+    if (this._io) { try { this._io.disconnect(); } catch (e) {} this._io = null; }
     if (this._autoOpenT) clearTimeout(this._autoOpenT);
     if (this._unfreezeTimer) clearTimeout(this._unfreezeTimer);
     if (this._onDragMove) window.removeEventListener('mousemove', this._onDragMove, true);
@@ -1607,6 +1765,27 @@ class TimelinePanel {
     const w = this.wrap;
     return !!(w && w.offsetParent !== null);
   }
+  // Out of sight, for the PAINT hold in update()/applyBars() (2026-09-07)? Says "hidden" only for a reason
+  // whose RELEASE event is wired: the tab's visibilityState always (visibilitychange); the pane's own layout
+  // (offsetParent null — a display:none iframe, a hidden Obsidian leaf) only where the IntersectionObserver
+  // could be installed to notice it coming back. Without the observer an offsetParent-null pane keeps
+  // painting as it always did, rather than freezing on a stale frame with nothing to wake it — the
+  // 2026-06-25 stuck-hold bug in a new coat (a held pane must always have a release).
+  _hiddenForPaint() {
+    if (this._io) return !this._isVisible();
+    return typeof document !== 'undefined' && document.visibilityState === 'hidden';
+  }
+  // The paint hold's release (2026-09-07): the tab came back or the pane came into view. Repaint the held
+  // frames as ONE catch-up — exactly what hideTip / _release do for their holds — and re-arm the live tick,
+  // which _tickLive stopped while hidden. Still hidden by the OTHER criterion (tab visible, pane display:none,
+  // or the reverse) → that criterion's own event releases later. A shown tip or a pressed pointer keeps its
+  // own hold and its own release repaints; the tick re-arm is safe under both (it self-gates).
+  _releasePaintHold() {
+    if (this._hiddenForPaint()) return;
+    const tipUp = this.tip && this.tip.classList && this.tip.classList.contains('show');
+    if (this._dirtyWhileTip && !tipUp && !this._pointerHeld) { this._dirtyWhileTip = false; this.draw(); }
+    this._startLiveTick();
+  }
   // The effective `now` draw() renders the right edge at: data.now plus wall-clock since that poll while
   // live-following, else the raw data.now (a held/frozen view must NOT creep as time passes).
   _liveNow() {
@@ -1623,8 +1802,10 @@ class TimelinePanel {
   // The live-follow loop: a look (draw if the edge moved LIVE_MIN_PX; see _tickLive), then a sleep sized to
   // the edge's speed, then the next look on an animation frame. Restarted by update()/applyBars() (each frame
   // re-paces it: a pending sleep computed for the old zoom or data is dropped), by gestures, and by the
-  // pointer release when a look was skipped under a held pointer. Hidden pane: it keeps sleeping (long) so it
-  // resumes by itself when shown; not live-following: it stops until a gesture pins the edge again.
+  // pointer release when a look was skipped under a held pointer. Hidden pane: the loop STOPS (its old 2 s
+  // sleep re-entered _isVisible()'s forced offsetParent layout every wake, for a pane nobody could see —
+  // 2026-09-07) and the paint hold's release (_releasePaintHold) re-arms it; not live-following: it stops
+  // until a gesture pins the edge again.
   _startLiveTick() {
     if (!this._liveFollowing() || !this._isVisible()) return;
     if (this._liveRAF != null) return;                                        // a look is already imminent
@@ -1648,7 +1829,7 @@ class TimelinePanel {
   _tickLive() {
     this._liveRAF = null; this._liveTO = null;
     if (!this._liveFollowing() || !this.data) return;          // gate closed → stop; a gesture or a frame re-arms
-    if (!this._isVisible()) { this._sleep(2000); return; }      // hidden pane: stay alive cheaply, resume when shown
+    if (!this._isVisible()) return;                             // hidden pane: stop; _releasePaintHold re-arms when it shows (no 2 s layout poll)
     // Click-safe: don't rebuild the SVG under a pressed pointer (a click in progress). The release event
     // (_release) restarts the loop — no polling for it. See the constructor.
     if (this._pointerHeld) { this._liveResume = true; return; }
@@ -1799,7 +1980,8 @@ class TimelinePanel {
     // A FULL data object (the test harness / an older one-shot) carries its own turns, so the bars are
     // already present → no loader. The two-message path leaves turns empty here; the loader shows until
     // applyBars lands. Read the RAW turns BEFORE the prev-carry below back-fills them.
-    if (data.turns && Object.keys(data.turns).length) this._barsLoaded = true;
+    const ownBars = !!(data.turns && Object.keys(data.turns).length);
+    if (ownBars) this._barsLoaded = true;
     if (data.turns) for (const k of Object.keys(data.turns)) this._barsSeen.add(k);
     const prev = this.data;
     if (prev && (!data.turns || !Object.keys(data.turns).length)) {
@@ -1808,7 +1990,7 @@ class TimelinePanel {
     }
     this.data = data;
     if (data.cmapGrad) this._cmapGrad = data.cmapGrad;   // compaction-sweep colormap gradient (persists across the lighter {type:bars} pushes)
-    if (data.views) this._views = data.views;            // the views blob rides every push (skeleton included)
+    if (data.views) this._takeViews(data.views);         // the views blob rides every push (skeleton included) — adopted in store order, never wire order
     if (Array.isArray(data.palette) && data.palette.length) this._palette = data.palette;
     this._reconcilePendingFlags();   // hold an optimistic eye-toggle sticky until THIS push (or a later one) confirms it
     this._reconcileDismissed();      // ...and a Cleared dead lane, so a stale/merged push can't pop it back
@@ -1831,6 +2013,11 @@ class TimelinePanel {
       this._nowBaseSec = data.now; this._nowBaseMs = _tMs;
     }
     this._wasLive = _live;
+    // A bars frame parked ahead of its skeleton (see applyBars) lands now that lanes exist — the skeleton
+    // arriving IS the event. Merged AFTER this frame's clock so the newer skeleton's `now` wins the edge, and
+    // BEFORE the fit + draw below so the first paint carries the bars. A skeleton that brought its own turns
+    // (a full one-shot) is newer than anything parked before it, so the parked frame is dropped (2026-09-07).
+    if (this._pendingBars) { const pb = this._pendingBars; this._pendingBars = null; if (!ownBars) this._mergeBars(pb); }
     if (!this.fitted && Object.keys(this.data.turns || {}).length && this.fitWindow()) this.fitted = true;   // fit once bars exist (a skeleton-only first paint waits for applyBars); no latch without a clock sample
     // first paint with a chat already open → seed the highlight from it (don't override a later local pick)
     if (this.selectedSid == null) { const sid = this._sidForActiveChat(data.activeChat); if (sid) this.selectedSid = sid; }
@@ -1859,9 +2046,11 @@ class TimelinePanel {
     // every x-position = the jump the user saw under the held edge. Keep the last frame; hideTip repaints
     // the buffered data as ONE catch-up. (Also skips the focus-jump + live-tick below — both move the view.)
     // Hold the SVG layout while it's deliberately frozen: a tooltip is up (freeze-on-hover) OR a pointer is
-    // pressed (a click in progress — click-safe, see the constructor). Buffer the data; repaint the catch-up
-    // when the hold ends (hideTip / pointer release). Skips the focus-jump + live-tick below — both move the view.
-    if ((this.tip && this.tip.classList && this.tip.classList.contains('show')) || this._pointerHeld) { this._dirtyWhileTip = true; return; }
+    // pressed (a click in progress — click-safe, see the constructor) OR the pane is out of sight (a hidden tab,
+    // a display:none pane — 2026-09-07; nobody sees a paint there, and the return used to pay for every held
+    // frame's rebuild at once). Buffer the data; repaint the catch-up when the hold ends (hideTip / pointer
+    // release / _releasePaintHold). Skips the focus-jump + live-tick below — both move the view.
+    if ((this.tip && this.tip.classList && this.tip.classList.contains('show')) || this._hiddenForPaint() || this._pointerHeld) { this._dirtyWhileTip = true; return; }
     this.draw();
     // feed→timeline locate: a NEW focus nonce (update_feed wrote timeline-focus.json on a card click)
     // → pan/scroll/pulse to that event. Adopt the nonce silently on first load (don't jump to a stale
@@ -1890,7 +2079,23 @@ class TimelinePanel {
     this._wasLive = live;
   }
   applyBars(m) {
-    if (!m || !this.data || !this.data.sessions) return;
+    if (!m) return;
+    // No skeleton yet → PARK the frame, don't drop it (2026-09-07): the pane shim coalesces same-type frames,
+    // so a first connect's [data1, bars1, data2] can arrive here as [bars1, data2]; dropping bars1 left the
+    // loader up until the next bars push. update() merges the parked frame when the skeleton lands.
+    if (!this.data || !this.data.sessions) { this._pendingBars = m; return; }
+    this._pendingBars = null;   // anything parked is older than this frame
+    this._mergeBars(m);
+    // honor the same freeze-on-hover / click-hold / out-of-sight guard update() uses (don't relayout under a
+    // held pointer or tip, nor for a pane nobody can see — _releasePaintHold repaints the catch-up)
+    if ((this.tip && this.tip.classList && this.tip.classList.contains('show')) || this._hiddenForPaint() || this._pointerHeld) { this._dirtyWhileTip = true; return; }
+    this.draw();
+    this._startLiveTick();   // bars are up now → resume the smooth-advance loop (gated off while the loader showed)
+  }
+  // The STATE half of a bars frame — everything that must land whether or not the pane can be seen: the
+  // turns/judging/messages, the loader latch, the live edge's clock (2026-09-07). applyBars() paints after
+  // it; update() runs it for a frame that was parked ahead of its skeleton.
+  _mergeBars(m) {
     this.data.turns = m.turns || {};
     for (const k of Object.keys(this.data.turns)) this._barsSeen.add(k);
     this.data.judging = m.judging || [];
@@ -1919,10 +2124,6 @@ class TimelinePanel {
       this._anchorNow(this.data.now);
     }
     if (!this.fitted && Object.keys(this.data.turns).length && this.fitWindow()) this.fitted = true;   // no latch without a clock sample (see fitWindow)
-    // honor the same freeze-on-hover / click-hold guard update() uses (don't relayout under a held pointer/tip)
-    if ((this.tip && this.tip.classList && this.tip.classList.contains('show')) || this._pointerHeld) { this._dirtyWhileTip = true; return; }
-    this.draw();
-    this._startLiveTick();   // bars are up now → resume the smooth-advance loop (gated off while the loader showed)
   }
 
   // Direct hover push from the kernel (server.ts pushHover) — the FAST path that skips the
@@ -2787,7 +2988,13 @@ class TimelinePanel {
     this._metaMenu = menu;
   }
 
-  _closeLaneMenu() { if (this._laneMenu) { this._laneMenu.remove(); this._laneMenu = null; } }
+  // closing a surface that held the join menu drops its new-tag draft (the 2026-09-05
+  // review: the draft outlived the menu and reappeared in the next one opened for the same rows)
+  _closeLaneMenu() {
+    if (!this._laneMenu) return;
+    this._laneMenu.remove(); this._laneMenu = null;
+    this._tagNewDraft = null; this._tagNewInput = null;
+  }
 
   // The per-lane settings drop-down is BACK (the user 2026-07-28, superseding their 2026-06-22 removal:
   // that rule held for ONE flag, where a direct icon beat a menu — at THREE flags the icons crowded the
@@ -2885,7 +3092,39 @@ class TimelinePanel {
     for (const id of Object.keys(this._pendingTagEdits || {}))
       if (id.split(':')[0] === m.host) delete this._pendingTagEdits[id];   // edits are name-addressed per host — revert them all
     this._tagEditErr = { host: m.host || '', name: m.name || '', error: m.error || 'refused' };
-    if (this._viewsDialog && this._viewsDialogBuild) this._viewsDialogBuild();
+    this._repaintTagSurfaces();
+    this.draw();
+  }
+
+  // the kernel's refusal of a gesture this page posted (the store it edits could not be read), answered on
+  // THIS page's socket and naming the gesture. A lane-gear flag (gesture 'flag', sid + flag): end the
+  // optimistic state ON THIS EVENT — the flag's sticky latch drops and the lane repaints to the value the
+  // kernel still paints (the frame carries it: what the next push shows; not a value recorded at the click,
+  // which a second click before the first refusal made wrong) — and the reason shows in the gear (rebuilt in
+  // place if it is open, on its next open otherwise) until dismissed or until the toggle is tried again.
+  // Filed in the shell's bell under its own `refused` kind, so it is findable after the fact and muting judge
+  // warnings never mutes it. Before this the kernel sent a `warn`, which this page never rendered, so the
+  // gear kept showing the refused state until a reload. The feed's bell and the chat's tab menu handle the
+  // same frame for their gestures.
+  settingRefused(m) {
+    const sid = String((m && m.sid) || ''), flag = String((m && m.flag) || '');
+    const text = String((m && m.text) || "couldn't save that setting");
+    if (m && m.gesture === 'flag' && sid && flag) {
+      const pend = this._pendingFlags[sid];
+      if (pend) { delete pend[flag]; if (!Object.keys(pend).length) delete this._pendingFlags[sid]; }
+      if (typeof m.value === 'boolean') {
+        // both copies a click may have written: the current frame's session, and the one the open gear built from
+        const targets = [((this.data && this.data.sessions) || []).find((x) => x.id === sid),
+                         this._laneMenu && this._laneMenu._sid === sid ? this._laneMenu._session : null];
+        for (const s of targets) if (s) s[flag] = m.value;
+      }
+      this._laneRefusal = { sid, flag, text };
+      if (this._laneMenu && this._laneMenu._sid === sid && this._laneMenuBuild) this._laneMenuBuild();
+    }
+    try {
+      if (typeof window !== 'undefined' && window.parent && window.parent !== window)
+        window.parent.postMessage({ romp: 'notify', kind: 'refused', text, sid }, '*');
+    } catch (e) { /* no parent frame (Obsidian, headless) */ }
     this.draw();
   }
 
@@ -2893,14 +3132,27 @@ class TimelinePanel {
   // One union group = one tag identity. Edits stay routed under the hood: an ADD lands on the LOCAL
   // store when the name exists locally, else the tag's single home; a REMOVE removes the
   // (name, member) pair from EVERY store holding it — a removal never half-works; rename/recolor/
-  // delete fan out to every home the same way. Local writes post the whole blob (unchanged);
-  // remote writes ride _editRemoteTag (optimistic overlay + loud tagEditFailed, federation v1).
+  // delete fan out to every home the same way. Local writes are TARGETED ops addressed by the local
+  // tag's stored id (_postTagEdit — the user 2026-09-05: posting the whole blob from the un-echoed
+  // copy made the kernel judge a create-then-rename burst stale against this dialog's own first
+  // write, and the renames and assignments were lost; by NAME, a recolor queued behind a refused
+  // rename went looking for the name the rename would have given the tag and found the other tag
+  // that already had it); remote writes ride _editRemoteTag (optimistic overlay + loud
+  // tagEditFailed, federation v1).
   _editTagUnion(g, edit) {
+    // a create still in flight has no id to address (its row wears the placeholder the ack
+    // replaces): the builders offer no gesture on it, and one that arrives anyway does nothing
+    // rather than posting a tid the kernel refuses as a tag that does not exist
+    if (g.pending) return;
+    const meta = { name: g.name, tid: g.localId };
     if (edit.add && edit.add.length) {
       if (g.localId) {
         const nv = JSON.parse(JSON.stringify(this._curViews()));
         const t = viewTags(nv).find((x) => x.id === g.localId);
-        if (t) { t.members = Array.from(new Set((t.members || []).concat(edit.add))); this._setViews(nv); }
+        if (t) {
+          t.members = Array.from(new Set((t.members || []).concat(edit.add)));
+          this._postTagEdit(nv, { op: 'addMember', tid: g.localId, sids: edit.add.slice() }, meta);
+        }
       } else if (g.remotes.length) this._editRemoteTag(g.remotes[0], { add: edit.add.slice() });
     }
     if (edit.remove && edit.remove.length) {
@@ -2909,7 +3161,7 @@ class TimelinePanel {
         const t = viewTags(nv).find((x) => x.id === g.localId);
         if (t && (t.members || []).some((m) => edit.remove.indexOf(m) >= 0)) {
           t.members = (t.members || []).filter((m) => edit.remove.indexOf(m) < 0);
-          this._setViews(nv);
+          this._postTagEdit(nv, { op: 'removeMember', tid: g.localId, sids: edit.remove.slice() }, meta);
         }
       }
       for (const rt of g.remotes)
@@ -2922,11 +3174,16 @@ class TimelinePanel {
         if (edit.delete) {
           nv.tags = viewTags(nv).filter((x) => x.id !== g.localId); delete nv.groups;
           if (nv.active === g.localId) nv.active = 'all';
+          this._postTagEdit(nv, { op: 'delete', tid: g.localId }, meta);
         } else {
           const t = viewTags(nv).find((x) => x.id === g.localId);
-          if (t) { if (edit.rename) t.name = edit.rename; if (edit.color) t.color = edit.color; }
+          if (t) {
+            // two ops when both arrive (the kernel applies them in order on one socket), each by
+            // the tag's id — a refused rename leaves the recolor addressing the SAME tag
+            if (edit.rename) { t.name = edit.rename; this._postTagEdit(nv, { op: 'rename', tid: g.localId, newName: edit.rename }, meta); }
+            if (edit.color) { t.color = edit.color; this._postTagEdit(nv, { op: 'recolor', tid: g.localId, color: edit.color }, meta); }
+          }
         }
-        this._setViews(nv);
       }
       for (const rt of g.remotes)
         this._editRemoteTag(rt, { rename: edit.rename, color: edit.color, delete: !!edit.delete });
@@ -2946,6 +3203,14 @@ class TimelinePanel {
       ch.addEventListener('mouseenter', () => { ch.style.background = HOVER_BG; });
       ch.addEventListener('mouseleave', () => { ch.style.background = 'transparent'; });
       ch.createSpan({ text: g.name });
+      if (g.pending) {
+        // a create still in flight: the chip shows, with no ✕ and no click, until the ack names the
+        // tag (the 2026-09-05 review) — the "creating…" the inputs read, in the tooltip
+        ch.style.cursor = 'default';
+        ch.setAttribute('title', 'creating "' + g.name + '"…');
+        ch.setAttribute('aria-disabled', 'true');
+        continue;
+      }
       const chx = ch.createSpan({ text: '✕' });
       chx.setAttribute('style', 'color:' + MODEL_FG + ';opacity:0.75;font-size:0.9em;');
       ch.setAttribute('title', 'tagged "' + g.name + '"'
@@ -2956,9 +3221,13 @@ class TimelinePanel {
   }
 
   // the join menu for one-or-many sessions: one option per union tag some rowId lacks, plus the
-  // new-tag input (a new tag mints LOCALLY, as always)
-  _tagJoinMenu(box, rowIds, rebuild) {
+  // new-tag input (a new tag mints LOCALLY, as always). `menuKey` is the menu's identity for the
+  // new-tag draft below: which [+] is open (this._tagAddFor — a sid, or '*' for the bulk bar),
+  // stable across repaints however the row set changes; callers that build the menu for other
+  // rows name their own.
+  _tagJoinMenu(box, rowIds, rebuild, menuKey) {
     for (const g of viewTagUnion(this._curViews())) {
+      if (g.pending) continue;   // a create still in flight cannot be joined yet: no id to address
       if (!rowIds.some((id) => g.members.indexOf(id) < 0)) continue;
       const tc = g.color || MENU_FG;
       const opt = box.createSpan({ text: g.name });
@@ -2967,48 +3236,260 @@ class TimelinePanel {
       opt.addEventListener('mouseenter', () => { opt.style.background = HOVER_BG; });
       opt.addEventListener('mouseleave', () => { opt.style.background = 'transparent'; });
       opt.addEventListener('click', () => {
-        this._tagAddFor = null;
+        this._tagAddFor = null; this._tagNewDraft = null;
         this._editTagUnion(g, { add: rowIds.filter((id) => g.members.indexOf(id) < 0) }); rebuild();
       });
     }
+    // The new-tag input's text and caret SURVIVE a repaint (the 2026-09-05 review — the
+    // rename draft did not cover it): an ack or refusal for some other write rebuilds the whole
+    // surface while the user is typing here. The draft is kept on the instance per MENU (the [+]
+    // that is open, not the rows it lists — before this change keyed by the row set, the bulk menu's draft
+    // hid whenever the search filter or a session's liveness changed the rows, and came back when
+    // they changed back); the live input is read before the rebuild tears it down, and the rebuilt
+    // input restores text and caret. Submitting, or closing the menu or the dialog, drops it.
+    const key = menuKey !== undefined ? String(menuKey) : String(this._tagAddFor);
+    const live = this._tagNewInput && this._tagNewInput.key === key ? this._tagNewInput.el : null;   // another row's input says nothing about this draft
+    if (live && this._tagNewDraft && this._tagNewDraft.key === key) {
+      this._tagNewDraft.value = live.value;
+      if (typeof live.selectionStart === 'number') { this._tagNewDraft.selStart = live.selectionStart; this._tagNewDraft.selEnd = live.selectionEnd; }
+    }
+    this._tagNewInput = null;
+    const draft = this._tagNewDraft && this._tagNewDraft.key === key ? this._tagNewDraft : null;
     const ni = document.createElement('input');
     ni.placeholder = 'new tag…'; ni.maxLength = 40;
     ni.setAttribute('style', 'width:90px;background:' + INPUT_BG + ';color:' + INPUT_FG + ';border:1px solid ' + HAIRLINE + ';'
       + 'border-radius:9px;padding:1px 7px;font:inherit;font-size:0.82em;');
+    if (draft) ni.value = draft.value;
+    // one create at a time: while one is in flight the input is disabled and says so; the ack's
+    // repaint re-arms it (a second Enter before the ack made a second tag)
+    if (this._createInFlight()) { ni.disabled = true; ni.placeholder = 'creating…'; }
+    ni.addEventListener('input', () => {
+      this._tagNewDraft = { key, value: ni.value, selStart: ni.selectionStart, selEnd: ni.selectionEnd };
+    });
     ni.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter' || !ni.value.trim()) return;
+      if (e.key !== 'Enter' || !ni.value.trim() || ni.disabled || this._createInFlight()) return;
       const nv = JSON.parse(JSON.stringify(this._curViews()));
       const used = new Set(viewTags(nv).map((t) => t.color));
       const color = (this._palette || []).find((c) => !used.has(c)) || (this._palette || [])[0] || '#1EA1EB';
-      nv.tags = viewTags(nv).concat([{ id: 'g' + Date.now().toString(36),
-        name: ni.value.trim().slice(0, 40), color, members: rowIds.slice() }]);
+      // the optimistic row wears a PLACEHOLDER id: the kernel mints the tag's id, and the ack's blob
+      // (which carries it) replaces this copy — no client-minted id can collide with a store it has
+      // not read (the legacy path re-ids it: _postTagEdit)
+      const tg = { id: 'pending-' + Date.now().toString(36), name: ni.value.trim().slice(0, 40), color, members: rowIds.slice() };
+      nv.tags = viewTags(nv).concat([tg]);
       delete nv.groups;
-      this._tagAddFor = null;
-      this._setViews(nv); rebuild();
+      this._tagAddFor = null; this._tagNewDraft = null; this._tagNewInput = null;
+      ni.disabled = true; ni.placeholder = 'creating…';
+      // ONE targeted create carrying the first members — the tag and its membership land together
+      this._postTagEdit(nv, { op: 'create', name: tg.name, color, sids: rowIds.slice() }, { name: tg.name, newId: tg.id }); rebuild();
     });
     box.appendChild(ni);
+    this._tagNewInput = { key, el: ni };   // the live input, read at the next repaint of the SAME menu for its text and caret
     ni.focus();
+    if (draft && typeof draft.selStart === 'number' && typeof draft.selEnd === 'number') {
+      try { ni.setSelectionRange(draft.selStart, draft.selEnd); } catch (e) {}
+    }
   }
 
+  // An arriving views blob (a frame's or an ack's) becomes the base only if its write sequence is at
+  // least the held one (the hand-mirror of views-writes.ts adoptViews, 2026-09-05): the pusher builds
+  // frames from a warmed cache that can predate a write whose ack already arrived, and federation
+  // re-emits stored blobs, so wire order decides nothing — the store's own order does. An ignored
+  // blob logs once per page, so a kernel serving stale frames is a visible fact. The last ignored blob
+  // is KEPT (and let go by the next adoption): a kernel restarted over a store restored from an older
+  // copy serves it under the old seq, so its connect push is turned away here — and the caps frame
+  // that follows it adopts it (setCaps; the 2026-09-05 review). When that push carried no
+  // blob to keep, the caps frame's viewsSeq is remembered instead (_announcedViewsSeq) and the later
+  // blob carrying exactly that seq is adopted below the held one (viewsAnnouncedSeq). The slot
+  // clears when an adoption CHANGES the held blob, never on a re-arrival of the blob already held — the
+  // federation router replays its stored blob into the merged lanes payload on every re-emit, and a slot
+  // spent on one of those missed the restored store the router adopted next (viewsAnnouncedAfter).
+  _takeViews(v) {
+    if (!v) return false;
+    if (viewsAdopts(this._views, v, this._announcedViewsSeq)) { this._announcedViewsSeq = viewsAnnouncedAfter(this._views, v, this._announcedViewsSeq); this._views = v; this._rejectedViews = null; return true; }
+    this._rejectedViews = v;
+    if (!this._staleViewsLogged) {
+      this._staleViewsLogged = true;
+      try { console.warn('romp timeline: ignored a views blob older than the one held (seq ' + viewsSeq(v) + ' < ' + viewsSeq(this._views) + ')'); } catch (e) {}
+    }
+    return false;
+  }
+
+  // LEGACY kernels only — a blob without a write sequence comes from a kernel that acks nothing, so
+  // the PRE-2026-09-05 reconciliation stays for that path alone: the write's own exact echo clears the
+  // copy, and three silent frames yield it (with no ack ever coming, an unechoed copy would otherwise
+  // pin forever). A kernel that stamps `seq` answers every write (viewsAck below), and the ack is the
+  // event that settles the copy: a frame, matching or not, says nothing about a write it cannot name —
+  // a net-zero burst (add, then remove) leaves frames equal to the copy while its writes are still in
+  // flight, so an exact match there cleared them early (the user 2026-09-05) — and a count of frames
+  // is not information: it dropped good edits and kept refused ones alike.
   _reconcileViews() {
     if (!this._pendingViews) return;
-    if (this._views && this._viewsKey(this._views) === this._viewsKey(this._pendingViews)) {
-      this._pendingViews = null; this._pendingViewsAge = 0; return;
+    if (this._views && viewsSeq(this._views) === null
+        && (this._viewsKey(this._views) === this._viewsKey(this._pendingViews)
+            || (this._legacyViewsAge = (this._legacyViewsAge || 0) + 1) >= 3)) {
+      this._pendingViews = null; this._viewsWrites = []; this._legacyViewsAge = 0;
     }
-    // the kernel is authoritative: if three pushes came back without echoing the edit (it normalized
-    // differently, or another dashboard overwrote it), adopt the kernel's blob rather than pinning
-    // a stale optimistic view forever
-    if (++this._pendingViewsAge >= 3) { this._pendingViews = null; this._pendingViewsAge = 0; }
   }
 
-  // Persist the whole views blob. Web/VS Code: the host WS hook (→ kernel setTimelineViews, which
-  // normalizes + rebroadcasts). Obsidian/headless fallback: write the same timeline-views.json the
-  // kernel reads (it re-normalizes on read). Optimistic + sticky, like the lane flags.
-  _setViews(v) {
-    this._pendingViews = v; this._pendingViewsAge = 0;
+  // The LOCAL kernel's capabilities ({type:"caps", caps:[...]}), sent on every `ready` — the page's
+  // own at load, and the shim's re-send on a reconnected socket. A reconnect is the one event that
+  // can lose an ack (the socket died between the write and its answer), so writes still in flight
+  // when this frame arrives are unknowable: they are dropped, the copy reverts to what the kernel's
+  // frames show, and the dialog says so — never a pinned copy faking success, never a silent revert.
+  // It is also the event that adopts the blob the gate last turned away, when the frame names it
+  // (viewsCapsAdopts, on its `viewsSeq`): the connect push a restarted kernel served under an OLDER
+  // seq (a store restored while it was down) was rejected a frame ago and is adopted here, the gate
+  // re-arming at its seq; a healthy reconnect's push was adopted, nothing is kept, and the gate stands;
+  // a pusher frame kept because it arrived between the push and this frame carries a seq the frame
+  // does not name and is discarded. When nothing kept matches, viewsSeq (a number: the served blob's
+  // seq, or the store's current seq when the push carried no views frame) is remembered as the
+  // kernel's announced store and _takeViews adopts the later blob that carries it even below the held
+  // seq (viewsAnnouncedSeq): one slot, overwritten by each caps frame, cleared by the next
+  // adoption that changes the held blob; null (no store at all) and a missing field announce nothing. A write in flight is
+  // dropped whatever the base became: its ack cannot reach this socket, and one that somehow did is
+  // an ack for a write this page no longer tracks — its blob meets the gate like any other arrival,
+  // and nothing is re-pinned (viewsAck).
+  setCaps(m) {
+    this._caps = new Set((m && Array.isArray(m.caps)) ? m.caps.filter((c) => typeof c === 'string') : []);
+    const served = m ? m.viewsSeq : undefined;
+    const adopted = viewsCapsAdopts(this._rejectedViews, served);
+    if (adopted) this._views = this._rejectedViews;
+    this._announcedViewsSeq = adopted ? null : viewsAnnouncedSeq(served);
+    this._rejectedViews = null;
+    if (this._viewsWrites.length) {
+      this._viewsWrites = []; this._pendingViews = null;
+      this._tagEditErr = { host: '', name: '', error: 'the connection was re-established; an edit made just before it may not have landed — check the list' };
+    } else if (!adopted) return;   // nothing in flight, nothing adopted: the caps changed, nothing shown did
+    this._repaintTagSurfaces();
+    this.draw();
+  }
+
+  // the two surfaces that show a tag-edit notice, repainted in place when one arrives or clears: the
+  // dialog (its build closure) and the lane gear menu (menu._build) — whichever is open
+  _repaintTagSurfaces() {
+    if (this._viewsDialog && this._viewsDialogBuild) this._viewsDialogBuild();
+    if (this._laneMenu && typeof this._laneMenu._build === 'function') this._laneMenu._build();
+  }
+
+  // the kernel does not know an op this page posted (a dashboard newer than its kernel): the write is
+  // refused — the copy reverts and the dialog says why — and the capability is withdrawn, so the next
+  // gesture takes the path that kernel does know (the whole-blob write, below)
+  unknownOp(m) {
+    if (!m) return;
+    if (typeof m.op === 'string' && this._caps) this._caps.delete(m.op);
+    if (typeof m.writeId === 'string' && this._viewsWrites.some((w) => w.id === m.writeId))
+      this.viewsAck({ type: 'unknownOp', writeId: m.writeId, ok: false,
+                      error: 'the kernel does not know the ' + m.op + ' operation, so the edit was not applied — try again; this dialog now uses the older path' });
+  }
+
+  // targeted tag ops need both the kernel's `tagEdit` capability and a host bridge to carry them; with
+  // either missing (an older kernel; an Obsidian panel writing the file) a gesture takes the whole-blob path
+  _tagEditsTargeted() {
+    return !!(this._caps && this._caps.has('tagEdit')
+      && typeof window !== 'undefined' && typeof window.__rompTimelineTagEdit === 'function');
+  }
+
+  // One TARGETED tag edit: `nv` is the optimistic copy (the gesture already applied) shown until
+  // the kernel answers — null when there is nothing to show yet (a create the kernel names and
+  // ids); `edit` is the op — {op: create|rename|recolor|addMember|removeMember|delete, tid?, name?,
+  // newName?, color?, sids?} — which the kernel applies by the tag's stored id through its /tag
+  // merge, so it is never judged stale against this dialog's own earlier writes (the 2026-09-05
+  // loss); `meta` rides on the in-flight record: {name, tid} for the refusal notice, `openRename`
+  // to open the rename input on the tid the create's ack returns, `newId` a create's optimistic row
+  // id (the `pending-…` placeholder the ack's blob replaces). The record keeps the op itself, so a
+  // refusal of some OTHER write can rebuild the copy without it (rederiveViews). Answered on this
+  // socket by tagEditAck → viewsAck below. No `tagEdit` capability or no targeted bridge (an older
+  // kernel; an Obsidian panel writing the file; a headless run) → the PRE-2026-09-05 whole-blob
+  // write, reconciled by _reconcileViews's legacy branch (_tagEditsTargeted).
+  _postTagEdit(nv, edit, meta) {
+    if (!this._tagEditsTargeted()) {
+      if (!nv) return;
+      // LEGACY: the whole blob IS the store write here, so a create's placeholder id would be
+      // persisted as-is (the 2026-09-05 review) — the row takes a client-minted `g…` id,
+      // the scheme the dialog's own pre-2026-09-05 create used, and the write names it as edited,
+      // which a kernel that reads `edited` needs to tell a create from a stale copy re-creating a
+      // deleted tag
+      const edited = [edit.tid, edit.tid_from, edit.tid_to].filter(Boolean);
+      const row = meta && meta.newId ? viewTags(nv).find((t) => t.id === meta.newId) : null;
+      if (row) { if (/^pending-/.test(row.id)) row.id = 'g' + Date.now().toString(36); edited.push(row.id); }
+      this._setViews(nv, edited);
+      return;
+    }
+    if (nv) this._pendingViews = nv;
+    const writeId = this._mintWriteId();
+    this._viewsWrites.push(Object.assign({ id: writeId, name: '', op: edit.op, edit }, meta || {}));
+    try { window.__rompTimelineTagEdit(writeId, edit); } catch (e) { /* the host hook threw — the ack never comes; the reconnect's caps frame clears what is left in flight */ }
+    this.draw();
+  }
+
+  // a create is in flight: the gate on a second [+ New tag] or new-tag Enter before the first is
+  // answered (the 2026-09-05 review: two clicks before the ack made two tags)
+  _createInFlight() {
+    return this._viewsWrites.some((w) => w.edit && w.edit.op === 'create');
+  }
+
+  _mintWriteId() {
+    this._viewsWriteSeq = (this._viewsWriteSeq || 0) + 1;
+    return 'w' + Date.now().toString(36) + '-' + this._viewsWriteSeq.toString(36);
+  }
+
+  // The kernel's answer to ONE of this page's writes — {type: tagEditAck|viewsAck, writeId, ok,
+  // views, seq, error?, refused?: [{tid, name, reason}], tid?, name?}. `views` is the post-write
+  // client blob: adopted as the base whatever the verdict, unless a newer frame already overtook it
+  // (the seq decides). ok → this write is settled; the optimistic copy clears once NOTHING is in
+  // flight (a later gesture may still be pending); a create's ack names the kernel-minted tag, and
+  // a [+ New tag] create opens the rename input on that id — unless the user is already renaming
+  // some other row, whose editor is left alone. Refused → THIS write's change reverts AT ONCE: with
+  // nothing else in flight the store's blob is what stands; with other writes still pending the copy
+  // is rebuilt from that blob plus them (rederiveViews), so a later gesture never flaps off and back
+  // on (the 2026-09-05 review: a refusal cleared the whole list). The reason shows in the
+  // dialog, rebuilt in place if open (the tagEditFailed door's rendering).
+  viewsAck(m) {
+    if (!m) return;
+    const i = this._viewsWrites.findIndex((w) => w.id === m.writeId);
+    const mine = i >= 0 ? this._viewsWrites.splice(i, 1)[0] : null;
+    this._takeViews(m.views);
+    if (m.ok === false) {
+      this._pendingViews = this._viewsWrites.length ? rederiveViews(this._views, this._viewsWrites) : null;
+      const names = (m.refused || []).map((r) => r && r.name).filter(Boolean);
+      this._tagEditErr = { host: '', name: names.join(', ') || (mine && mine.name) || '',
+                           error: m.error || (m.refused || []).map((r) => r.reason).filter(Boolean).join('; ') || 'refused' };
+      this._repaintTagSurfaces();
+    } else {
+      if (!this._viewsWrites.length) this._pendingViews = null;
+      if (mine && mine.op === 'create' && typeof m.tid === 'string') {
+        if (mine.openRename && !this._tagEditorFor) this._tagEditorFor = m.tid;   // the new row opens straight into its rename input
+        this._repaintTagSurfaces();   // the row exists now; a [+ New tag] or join input gated on the create re-arms
+      }
+    }
+    this.draw();
+  }
+
+  // Persist the whole views blob — the lens and order edits, which have no targeted op. Web/VS
+  // Code: the host WS hook (→ kernel setTimelineViews, which normalizes + rebroadcasts, and answers
+  // viewsAck with the stale-writer guard's refusals, if any). Obsidian/headless fallback: write the
+  // same timeline-views.json the kernel reads (it re-normalizes on read) — the write IS the store
+  // write there, so the copy is adopted as the base on the spot. Optimistic, like the lane flags.
+  // A LENS or ORDER write — {active?, actives?, tagOrder?}: the whole blob is built from the STORE's
+  // blob (this._views, the last one adopted) plus these fields, never from the pending copy (the 2026-09-05 review: a copy carrying targeted edits still in flight posted them as this
+  // dialog's claim on those tags, and a rename the kernel had refused as a duplicate landed through
+  // the next lens toggle). The pending copy SHOWN is the current one with the same fields applied,
+  // so in-flight edits stay visible; the in-flight record keeps the fields for rederiveViews.
+  _setLens(fields) {
+    this._setViews(lensBlob(this._views, fields), [], fields);
+  }
+
+  _setViews(v, edited, lens) {
+    this._pendingViews = lens ? applyLensFields(this._curViews(), lens) : v; this._legacyViewsAge = 0;
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetViews === 'function') {
-        window.__rompTimelineSetViews(v);
+        const writeId = this._mintWriteId();
+        // the record is what this write DID: its lens/order fields, else the blob IS its state (rederiveViews)
+        this._viewsWrites.push(lens ? { id: writeId, name: '', lens } : { id: writeId, name: '', blob: v });
+        // `edited`: the tag ids this write CHANGED — none for a lens or order edit — so the kernel acks a
+        // refusal on a tag this dialog never touched (a stale copy of it) as ok, with the refusal listed:
+        // the newer blob is adopted and no notice shows, since nothing the user did was refused
+        window.__rompTimelineSetViews(v, writeId, Array.isArray(edited) ? edited : []);
       } else if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
         // Obsidian only — the Electron guard keeps a bare-node test run from ever touching the real
         // file (the 2026-07-02 _persistOrder lesson). Resolve the state root the way the kernel does
@@ -3021,6 +3502,7 @@ class TimelinePanel {
         const fp = path.join(root, 'timeline-views.json');
         fs.writeFileSync(fp + '.tmp', JSON.stringify(v));
         fs.renameSync(fp + '.tmp', fp);
+        this._views = v; this._pendingViews = null;   // the file IS the store: the write settled, no ack to wait for
       }
     } catch (e) { /* no host hook + no Node fs → session-local only */ }
     this.draw();
@@ -3119,9 +3601,7 @@ class TimelinePanel {
       x.title = 'remove \u201c' + c.label + '\u201d from this timeline\u2019s filter';
       x.addEventListener('pointerdown', (e) => {
         e.preventDefault(); e.stopPropagation();
-        const nv = JSON.parse(JSON.stringify(v));
-        nv.actives = Object.assign({}, nv.actives, { timeline: lensToggle(lens, c.pick) });
-        this._setViews(nv);
+        this._setLens({ actives: Object.assign({}, v.actives, { timeline: lensToggle(lens, c.pick) }) });
       });
       x.addEventListener('click', (e) => e.stopPropagation());
       chip.appendChild(x);
@@ -3145,6 +3625,7 @@ class TimelinePanel {
   _closeViewsDialog() {
     if (!this._viewsDialog) return;
     this._viewsDialog.remove(); this._viewsDialog = null; this._viewsDialogBuild = null;
+    this._tagNewDraft = null; this._tagNewInput = null;   // the join menu's draft dies with the dialog (_closeLaneMenu's rule)
     if (this._viewsDialogKey) {   // the Escape hook dies with the dialog on EVERY close path, not just Escape
       try { this._viewsDialogKey.doc.removeEventListener('keydown', this._viewsDialogKey.fn); } catch (e) {}
       this._viewsDialogKey = null;
@@ -3197,9 +3678,7 @@ class TimelinePanel {
       const v = this._curViews();
       const lens = timelineLens(v);
       const apply = (nl, close) => {
-        const nv = JSON.parse(JSON.stringify(v));
-        nv.actives = Object.assign({}, nv.actives, { timeline: nl });
-        this._setViews(nv);
+        this._setLens({ actives: Object.assign({}, v.actives, { timeline: nl }) });
         if (close) this._closeViewsMenu(); else build();
       };
       item('All', { current: lensAll(lens) }).addEventListener('click', () => apply({ all: true }, true));
@@ -3313,6 +3792,14 @@ class TimelinePanel {
       return [null, s.name || String(s.id || '').slice(0, 8)];
     };
     const build = () => {
+      // the open rename input's text and caret, read from the live element before it is torn down —
+      // the `input` listener keeps the text current, but the caret can move without one (arrow keys)
+      const live = this._tagRenameInput;
+      if (live && this._tagRenameDraft && this._tagRenameDraft.key === this._tagEditorFor) {
+        this._tagRenameDraft.value = live.value;
+        if (typeof live.selectionStart === 'number') { this._tagRenameDraft.selStart = live.selectionStart; this._tagRenameDraft.selEnd = live.selectionEnd; }
+      }
+      this._tagRenameInput = null;
       card.textContent = '';
       const v = this._curViews();
       // NAME-KEYED (user ruling 2026-08-24): whichever store's id opened this, the header is the
@@ -3356,18 +3843,22 @@ class TimelinePanel {
           return a;
         };
         for (const tg of viewTagUnion(v)) {
-          const editable = tg.localId || canEdit;
+          // a create still in flight (`pending`) is not editable and not draggable: its row wears
+          // the placeholder id the ack replaces, and an op addressed by it would be refused as a tag
+          // that does not exist (the 2026-09-05 review) — it reads "creating…" instead
+          const editable = !tg.pending && (tg.localId || canEdit);
           const tc = tg.color || MODEL_FG;
           // the tag itself: the normal pill, NO ✕ — actions live beside it, never on it.
           // DRAGGABLE (the user 2026-08-25): grab a pill to reorder the tags — the drop writes
-          // tagOrder (the union display order, viewer-side) AND re-sorts the local tags array to
-          // match (the natural store for local-only readers). The membership drag's discipline:
+          // tagOrder (the union display order, viewer-side); the kernel orders the stored tags
+          // array by it, so a reader without this tagOrder sees the same order. The membership
+          // drag's discipline:
           // pointer capture, an accent border cue that moves WITHOUT rebuilding mid-drag (the
           // redraw-eats-pointer rule); the rebuild and the write happen on the drop. The rename
           // input keeps the cell — no drag while editing.
           const pillCell = tgrid.createDiv();
           pillCell._tname = tg.name;
-          if (this._tagEditorFor !== tg.name || !editable) {
+          if (!tg.pending && (this._tagEditorFor !== unionKey(tg) || !editable)) {
             pillCell.style.cursor = 'grab';
             pillCell.addEventListener('pointerdown', (e) => {
               e.preventDefault();
@@ -3397,14 +3888,10 @@ class TimelinePanel {
                 if (toIdx === fromIdx) return;
                 const names = cells.map((c) => c._tname);
                 names.splice(toIdx, 0, names.splice(fromIdx, 1)[0]);
-                const nv = JSON.parse(JSON.stringify(this._curViews()));
-                nv.tagOrder = names;                       // the union display order, remote-homed names included
-                const pos = Object.create(null);           // null-prototype (the prototype-key name hazard)
-                names.forEach((n, i) => { pos[n] = i; });
-                nv.tags = viewTags(nv).slice().sort((a, b) =>
-                  ((a.name in pos) ? pos[a.name] : names.length) - ((b.name in pos) ? pos[b.name] : names.length));
-                delete nv.groups;
-                this._setViews(nv);
+                // the union display order, remote-homed names included; the kernel orders the
+                // stored tags array by it (lensBlob's own re-sort matters on the Electron path,
+                // where the posted blob is the file)
+                this._setLens({ tagOrder: names });
                 build();
               };
               pillCell.addEventListener('pointermove', onMove);
@@ -3412,20 +3899,38 @@ class TimelinePanel {
               pillCell.addEventListener('pointercancel', onUp);
             });
           }
-          if (this._tagEditorFor === tg.name && editable) {
+          if (this._tagEditorFor === unionKey(tg) && editable) {
             const nameIn = document.createElement('input');
-            nameIn.value = tg.name; nameIn.maxLength = 40;
+            // an in-progress rename SURVIVES a repaint (the 2026-09-05 review): a refusal or an ack for
+            // some other row rebuilds the whole dialog while the user is typing here, and a fresh input
+            // seeded with the stored name would throw the typed text away. The draft (text and caret)
+            // is kept on the instance per editor key; a rebuild restores it and puts the caret back
+            // rather than selecting all, which the NEXT keystroke would have replaced.
+            const draft = this._tagRenameDraft && this._tagRenameDraft.key === unionKey(tg) ? this._tagRenameDraft : null;
+            nameIn.value = draft ? draft.value : tg.name; nameIn.maxLength = 40;
             nameIn.setAttribute('style', 'width:130px;background:' + INPUT_BG + ';color:' + INPUT_FG + ';'
               + 'border:1px solid ' + HAIRLINE + ';border-radius:5px;padding:2px 6px;font:inherit;');
+            const noteDraft = () => {
+              this._tagRenameDraft = { key: unionKey(tg), value: nameIn.value,
+                                       selStart: nameIn.selectionStart, selEnd: nameIn.selectionEnd };
+            };
+            nameIn.addEventListener('input', noteDraft);
             nameIn.addEventListener('change', () => {
               const nv2 = nameIn.value.slice(0, 40).trim();
-              this._tagEditorFor = null;
+              this._tagEditorFor = null; this._tagRenameDraft = null; this._tagRenameInput = null;
               if (nv2 && nv2 !== tg.name) this._editTagUnion(tg, { rename: nv2 });
               build();
             });
-            nameIn.addEventListener('keydown', (e) => { if (e.key === 'Escape') { this._tagEditorFor = null; build(); } });
+            nameIn.addEventListener('keydown', (e) => { if (e.key === 'Escape') { this._tagEditorFor = null; this._tagRenameDraft = null; this._tagRenameInput = null; build(); } });
             pillCell.appendChild(nameIn);
-            setTimeout(() => { try { nameIn.focus(); nameIn.select(); } catch (e) {} }, 0);
+            this._tagRenameInput = nameIn;   // the live input, read at the next repaint for its caret
+            setTimeout(() => {
+              try {
+                nameIn.focus();
+                if (draft && typeof draft.selStart === 'number' && typeof draft.selEnd === 'number') nameIn.setSelectionRange(draft.selStart, draft.selEnd);
+                else nameIn.select();
+              } catch (e) {}
+            }, 0);
           } else {
             const pill = pillCell.createSpan({ text: tg.name });
             pill.setAttribute('style', 'display:inline-flex;align-items:center;padding:2px 9px;'
@@ -3441,6 +3946,12 @@ class TimelinePanel {
                 text: pend.map((rt) => 'pending ' + rt.pending + ' on ' + (rt.host || '?')).join(', ') });
               note.setAttribute('style', 'margin-left:6px;font-size:0.82em;opacity:0.6;font-style:italic;white-space:nowrap;');
             }
+            if (tg.pending) {
+              // the create is in flight: the row shows the tag and says so, with no actions beside
+              // it until the ack (the same words the [+ New tag] row and the inputs use)
+              const note = pillCell.createSpan({ text: 'creating…' });
+              note.setAttribute('style', 'margin-left:6px;font-size:0.82em;opacity:0.6;font-style:italic;white-space:nowrap;');
+            }
           }
           // delete — the destructive convention: dim at rest, red on hover
           const del = tgrid.createDiv();
@@ -3449,7 +3960,7 @@ class TimelinePanel {
             d.addEventListener('mouseenter', () => { d.style.color = '#F85B5A'; d.style.opacity = '1'; });
             d.addEventListener('mouseleave', () => { d.style.color = MENU_FG; d.style.opacity = '0.7'; });
             d.addEventListener('click', () => {
-              if (this._tagEditorFor === tg.name) this._tagEditorFor = null;
+              if (this._tagEditorFor === unionKey(tg)) { this._tagEditorFor = null; this._tagRenameDraft = null; }
               this._editTagUnion(tg, { delete: true });
               build();
             });
@@ -3460,7 +3971,7 @@ class TimelinePanel {
             const r = action(ren, 'rename', 'rename this tag (everywhere it is defined)');
             r.addEventListener('mouseenter', () => { r.style.opacity = '1'; });
             r.addEventListener('mouseleave', () => { r.style.opacity = '0.7'; });
-            r.addEventListener('click', () => { this._tagEditorFor = this._tagEditorFor === tg.name ? null : tg.name; build(); });
+            r.addEventListener('click', () => { this._tagEditorFor = this._tagEditorFor === unionKey(tg) ? null : unionKey(tg); this._tagRenameDraft = null; build(); });
           }
           // the color — the identity-palette swatches inline in the row's last column
           const colCell = tgrid.createDiv();
@@ -3479,23 +3990,47 @@ class TimelinePanel {
             }
           }
         }
-        // [+ New tag] — the table's final row, at the dialog's own scale
+        // [+ New tag] — the table's final row, at the dialog's own scale. While a create is in flight
+        // the row reads "creating…" and takes no click (the 2026-09-05 review: a second
+        // click before the ack made a second tag); the ack's repaint brings the button back.
         const ntRow = tgrid.createDiv();
         ntRow.setAttribute('style', 'grid-column:1 / -1;');
+        if (this._createInFlight()) {
+          const busy = ntRow.createSpan({ text: 'creating…' });
+          busy.setAttribute('style', 'display:inline-flex;align-items:center;justify-content:center;padding:1px 9px;'
+            + 'border-radius:5px;border:1px solid ' + OUTLINE_FG + ';color:' + MENU_FG + ';opacity:0.45;cursor:default;background:transparent;');
+          busy.setAttribute('aria-disabled', 'true');
+        } else {
         const ntBtn = ntRow.createSpan({ text: '+ New tag' });
         ntBtn.setAttribute('style', 'display:inline-flex;align-items:center;justify-content:center;padding:1px 9px;'
           + 'border-radius:5px;border:1px solid ' + OUTLINE_FG + ';color:' + MENU_FG + ';opacity:0.7;cursor:pointer;background:transparent;');
         hover(ntBtn, 'background:' + HOVER_BG + ';opacity:1;', 'background:transparent;opacity:0.7;');
         ntBtn.addEventListener('click', () => {
-          const nv = JSON.parse(JSON.stringify(this._curViews()));
-          const used = new Set(viewTags(nv).map((t) => t.color));
+          if (this._createInFlight()) return;   // a click that beat the repaint
+          const used = new Set(viewTags(v).map((t) => t.color));
           const color = (this._palette || []).find((c) => !used.has(c)) || (this._palette || [])[0] || '#1EA1EB';
-          const tg = { id: 'g' + Date.now().toString(36), name: 'tag ' + (viewTags(nv).length + 1), color, members: [] };
+          // a TARGETED create the KERNEL names and ids: the ack returns the minted tid and name, and
+          // the row opens straight into its rename input on that tid (openRename). Nothing is drawn
+          // optimistically — there is no id to draw it under, and a dialog-minted "tag N" from a row
+          // count collided with a leftover default-named tag (the 2026-09-05 review). The name
+          // typed next is a rename by tid — never a whole-blob post the kernel could judge stale
+          // against this very create (the 2026-09-05 loss).
+          if (this._tagEditsTargeted()) { this._postTagEdit(null, { op: 'create', color }, { openRename: true }); build(); return; }
+          // LEGACY (no `tagEdit` capability, or no bridge — an older kernel, an Obsidian panel): the
+          // pre-2026-09-05 whole-blob create, named and id'd here, the row opened for renaming. The
+          // name skips the ones in use rather than counting rows. The write names the new id as
+          // edited: a kernel that reads `edited` takes an unnamed unknown tag for a stale copy
+          // re-creating a deleted one.
+          const nv = JSON.parse(JSON.stringify(v));
+          const names = new Set(viewTags(nv).map((t) => t.name));
+          let n = 1; while (names.has('tag ' + n)) n++;
+          const tg = { id: 'g' + Date.now().toString(36), name: 'tag ' + n, color, members: [] };
           nv.tags = viewTags(nv).concat([tg]); delete nv.groups;
-          this._tagEditorFor = tg.name;   // a new tag opens straight into its rename input
-          this._setViews(nv);
+          this._tagEditorFor = tg.id;
+          this._setViews(nv, [tg.id]);
           build();
         });
+        }
       }
       // ── PANE FILTERS — five rows (the user 2026-08-25 redesign, superseding the one-line
       // strip): All surfaces, then Chat / Sessions / Outline / Feed — the pane names. Each row is
@@ -3524,11 +4059,9 @@ class TimelinePanel {
         };
         const applyFor = (key, lens) => {
           if (key === '*' || key !== 'feed') {
-            const nv = JSON.parse(JSON.stringify(this._curViews()));
             const upd = key === '*' ? { chat: lens, timeline: lens, outline: lens } : {};
             if (key !== '*') upd[key] = lens;
-            nv.actives = Object.assign({}, nv.actives, upd);
-            this._setViews(nv);
+            this._setLens({ actives: Object.assign({}, this._curViews().actives, upd) });
           }
           if (key === '*' || key === 'feed') {
             try { localStorage.setItem('romp:feedTags-set', JSON.stringify({ lens, t: Date.now() })); } catch (e) {}
@@ -3595,7 +4128,7 @@ class TimelinePanel {
       tagAll.setAttribute('style', btnStyle);
       hover(tagAll, 'background:' + HOVER_BG + ';', 'background:transparent;');
       tagAll.setAttribute('title', 'add a tag to every session the search shows');
-      tagAll.addEventListener('click', () => { this._tagAddFor = this._tagAddFor === '*' ? null : '*'; renderRows(); });
+      tagAll.addEventListener('click', () => { this._tagAddFor = this._tagAddFor === '*' ? null : '*'; this._tagNewDraft = null; renderRows(); });
       // (the mute-feed-for-all control left with the feed column, the user 2026-08-25 — the
       // per-session flag lives on in the lane gear)
       const gridBox = card.createDiv();
@@ -3682,7 +4215,7 @@ class TimelinePanel {
             + 'border-radius:5px;border:1px solid ' + OUTLINE_FG + ';color:' + MENU_FG + ';opacity:0.7;cursor:pointer;background:transparent;');
           hover(plus, 'background:' + HOVER_BG + ';opacity:1;', 'background:transparent;opacity:0.7;');
           plus.setAttribute('title', 'add a tag');
-          plus.addEventListener('click', () => { this._tagAddFor = this._tagAddFor === s.id ? null : s.id; renderRows(); });
+          plus.addEventListener('click', () => { this._tagAddFor = this._tagAddFor === s.id ? null : s.id; this._tagNewDraft = null; renderRows(); });
           // TAGS — one solid chip per union tag holding this session (user ruling 2026-08-24:
           // a tag is its NAME; kernels are plumbing — the twin dashed/solid render is gone), ✕ =
           // remove-everywhere. The shared builder; the lane gear renders the identical editor.
@@ -3720,6 +4253,7 @@ class TimelinePanel {
     menu.setAttribute('style', 'position:fixed;z-index:1001;width:280px;' + MENU_STYLE);
     menu.dataset.rompMenu = '1';   // the echo writers skip in-menu presses (T213)
     menu._sid = s.id;
+    menu._session = s;             // the copy build() reads; a refusal restores it alongside the frame's
     menu.addEventListener('click', (e) => e.stopPropagation());   // inside clicks must not reach the doc closer
     const build = () => {
       menu.textContent = '';
@@ -3742,6 +4276,7 @@ class TimelinePanel {
         row.addEventListener('click', (e) => {
           e.stopPropagation();
           const next = t.value(!on);                 // the flag value that flips this toggle
+          if (this._laneRefusal && this._laneRefusal.sid === s.id && this._laneRefusal.flag === t.flag) this._laneRefusal = null;   // a retry retires the last refusal
           s[t.flag] = next;                          // optimistic …
           (this._pendingFlags[s.id] = this._pendingFlags[s.id] || {})[t.flag] = next;   // … sticky until the kernel confirms
           this._setSessionFlag(s, t.flag, next);
@@ -3749,6 +4284,17 @@ class TimelinePanel {
           this.draw();
           build();                                   // repaint states in place; the panel stays open
         });
+      }
+      // the kernel's refusal of this lane's last toggle (settingRefused): the same dismissible row the
+      // views dialog wears for a refused tag edit, here because the gear is where the click was made
+      if (this._laneRefusal && this._laneRefusal.sid === s.id) {
+        const er = menu.createDiv();
+        er.setAttribute('style', 'display:flex;align-items:center;gap:6px;margin:4px 8px;padding:4px 8px;'
+          + 'border:1px solid #F85B5A;border-radius:5px;color:#F85B5A;font-size:0.82em;line-height:1.3;');
+        er.createSpan({ text: '⚠ ' + this._laneRefusal.text });
+        const ex = er.createSpan({ text: '✕' });
+        ex.setAttribute('style', 'margin-left:auto;cursor:pointer;opacity:0.7;flex:0 0 auto;');
+        ex.addEventListener('click', (e) => { e.stopPropagation(); this._laneRefusal = null; build(); });
       }
       // ── Tags (the user 2026-08-24: taggable from the gear too, not only the filter dialog) ──
       // The SAME name-keyed editor the dialog rows carry — the shared builders, never a fork:
@@ -3769,15 +4315,29 @@ class TimelinePanel {
       plus.setAttribute('title', 'add a tag');
       plus.addEventListener('click', (e) => {
         e.stopPropagation();
-        this._tagAddFor = this._tagAddFor === s.id ? null : s.id; build();
+        this._tagAddFor = this._tagAddFor === s.id ? null : s.id; this._tagNewDraft = null; build();
       });
       if (this._tagAddFor === s.id) {
         const am = menu.createDiv();
         am.setAttribute('style', 'display:flex;gap:5px;flex-wrap:wrap;align-items:center;padding:2px 10px 6px 24px;');
         this._tagJoinMenu(am, [s.id], build);
       }
+      // a refused tag edit made FROM this menu shows here too (the 2026-09-05 review): the dialog's
+      // notice, in the menu's compact idiom — the reason, ✕ to dismiss. viewsAck and setCaps repaint
+      // the open menu (menu._build) the way they repaint the open dialog.
+      if (this._tagEditErr) {
+        const er = menu.createDiv();
+        er.setAttribute('style', 'display:flex;align-items:center;gap:6px;margin:2px 8px 4px;padding:3px 8px;'
+          + 'border:1px solid #F85B5A;border-radius:5px;color:#F85B5A;font-size:0.82em;');
+        er.createSpan({ text: '⚠ ' + (this._tagEditErr.host ? this._tagEditErr.host + ': ' : '') + this._tagEditErr.error });
+        const ex = er.createSpan({ text: '✕' });
+        ex.setAttribute('style', 'margin-left:auto;cursor:pointer;opacity:0.7;');
+        ex.addEventListener('click', (e) => { e.stopPropagation(); this._tagEditErr = null; build(); });
+      }
     };
     build();
+    this._laneMenuBuild = build;    // a settingRefused arriving while the gear is open repaints it in place
+    menu._build = build;   // viewsAck / setCaps / tagEditFailed repaint the open menu with a refusal
     const h = this._menuHost(anchorEl.getBoundingClientRect());
     h.doc.body.appendChild(menu);   // a cross-document append ADOPTS the node; its listeners are kept
     const left = Math.min(Math.round(h.rect.left), (h.win.innerWidth || 9999) - 300);   // clamp on-screen
@@ -3824,22 +4384,35 @@ class TimelinePanel {
   }
 
   // Persist a per-session flag. Web dashboard: the host WS hook (→ kernel setSessionFlag → rebuild feed).
-  // Obsidian/headless fallback: write the same session-flags.json the kernel's build_feed reads.
+  // Obsidian desktop fallback: write the same session-flags.json the kernel's build_feed reads, with the
+  // discipline the kernel's own writer has (review find, 2026-09-08). Before this it was the exact shape
+  // the kernel dropped: any read fault or torn bytes became {} and was written over EVERY session's flags
+  // (postal isolation included), and the write truncated the live file in place, so the kernel's strict
+  // reader could observe 0 bytes mid-write and quarantine the very file being written. Now it mirrors
+  // _persistOrder / _setViews: Electron-or-nothing (a bare-node test run must never touch the real file),
+  // the kernel's state root, a refusal on any read fault or non-object parse (only a MISSING file reads as
+  // empty; the kernel quarantines torn bytes on its own next read), and an atomic tmp + rename publish.
   _setSessionFlag(s, flag, value) {
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetFlag === 'function') {
         window.__rompTimelineSetFlag(s.id, flag, value); return;
       }
+      if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
       const fs = require('fs'), os = require('os'), path = require('path');
-      const dir = path.join(os.homedir(), '.local', 'state', 'romp');
+      const dir = process.env.ROMP_STATE_DIR
+        || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'romp');
       const fp = path.join(dir, 'session-flags.json');
       let cur = {};
-      try { cur = JSON.parse(fs.readFileSync(fp, 'utf8')) || {}; } catch (e) {}
+      try { cur = JSON.parse(fs.readFileSync(fp, 'utf8')); }
+      catch (e) { if (!e || e.code !== 'ENOENT') return; }   // unreadable or torn: never write over a store we could not read
+      if (!cur || typeof cur !== 'object' || Array.isArray(cur)) return;   // valid JSON of the wrong shape: not ours to overwrite
       const f = (cur[s.id] && typeof cur[s.id] === 'object') ? cur[s.id] : {};
       if (value) f[flag] = true; else delete f[flag];
       if (Object.keys(f).length) cur[s.id] = f; else delete cur[s.id];
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(fp, JSON.stringify(cur));
+      const tmp = fp + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(cur));
+      fs.renameSync(tmp, fp);
     } catch (e) { /* no host hook + no Node fs → can't persist */ }
   }
 

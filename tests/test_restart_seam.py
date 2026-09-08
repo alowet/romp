@@ -166,8 +166,11 @@ class ShimSeam(unittest.TestCase):
         self.assertIn('if(msg&&msg.type==="restarting"){restartAnnounced=Date.now();', self.js)
 
     def test_an_announced_death_redials_tight_and_a_blind_drop_keeps_the_cadence(self):
-        self.assertIn('setTimeout(connect,(restartAnnounced&&Date.now()-restartAnnounced<30000)?250:1500);',
-                      self.js)
+        # 2026-09-07 added a second tight-redial event (a close within STALE_MS of a foreground) beside T217's
+        self.assertIn("var inWin=Date.now()-foregroundedAt<STALE_MS,d=1500;", self.js)
+        self.assertIn("if(inWin){d=eagerDial?0:250;eagerDial=false;}", self.js)   # the FIRST close after a foreground redials now; every further one in the window waits 250 ms
+        self.assertIn("if(restartAnnounced&&Date.now()-restartAnnounced<30000)d=Math.min(d,250);", self.js)
+        self.assertIn("setTimeout(connect,d);", self.js)
 
     def test_the_announced_reconnect_skips_the_stale_arm_once(self):
         self.assertIn("var ann=restartAnnounced&&Date.now()-restartAnnounced<30000;restartAnnounced=0;",
@@ -187,7 +190,10 @@ class ShimSeam(unittest.TestCase):
         self.assertIn("window.addEventListener('romp:wsdown',function(){if(ready()){badge(true);}else{show();}});",
                       self.spin, "content stays legible under a translucent corner affordance; the "
                                  "opaque loader is only for a genuinely empty pane")
-        self.assertIn("window.addEventListener('romp:wsup',function(){badge(false);hide();});", self.spin)
+        # 2026-09-07: the badge ends on the first FRESH frame (romp:wsfresh), not on the socket opening —
+        # over a slow link the resync ran for seconds with no cue; wsup still ends the empty-pane sheet
+        self.assertIn("window.addEventListener('romp:wsup',function(){hide();});", self.spin)
+        self.assertIn("window.addEventListener('romp:wsfresh',function(){badge(false);});", self.spin)
         self.assertIn("id=pane-reconn", self.spin)
         self.assertIn("pointer-events:none", self.spin,
                       "clicks pass through to the content and queue in the shim, by design")

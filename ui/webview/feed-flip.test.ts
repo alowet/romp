@@ -27,7 +27,9 @@ test("the first paint never flies", () => {
 
 const SRC = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.ts"), "utf8");
 test("render() gates both forced layouts on the flip decision, and remembers the columns it painted", () => {
-  assert.match(SRC, /const nextCols = columnsOf\(buckets\);\n\s*const needFlip = flipNeeded\(prevCols, nextCols\);\n\s*prevCols = nextCols;\n\s*const flipFirst = needFlip \? captureCardRects\(cols\) : new Map<string, FlipState>\(\);/);
+  // 2026-09-07: the release paint after a hidden stretch skips the pass once (skipFlipOnce, pinned with its
+  // release path in feed-hidden-paint.test.ts); prevCols still records every painted render
+  assert.match(SRC, /const nextCols = columnsOf\(buckets\);\n(\s*\/\/[^\n]*\n)*\s*const needFlip = !skipFlipOnce && flipNeeded\(prevCols, nextCols\);\n\s*skipFlipOnce = false;\n\s*prevCols = nextCols;\n\s*const flipFirst = needFlip \? captureCardRects\(cols\) : new Map<string, FlipState>\(\);/);
   assert.match(SRC, /if \(needFlip\) flyColumnChanges\(flipFirst, cols\);/);
   // columnsOf keys every entry kind (a header per column, so one that changes column counts as moved) and
   // records column AND position, so the gate sees reorders; the keys only need to be consistent with

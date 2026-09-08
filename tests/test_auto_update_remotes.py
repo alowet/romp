@@ -31,8 +31,8 @@ class FastForwardGate(unittest.TestCase):
 
     def _patched(self, behind, ahead, ood=True):
         saved = (km._remote_out_of_date, km._behind_info)
-        km._remote_out_of_date = lambda r: ood
-        km._behind_info = lambda sha: {"behind": behind, "ahead": ahead, "date": ""}
+        km._remote_out_of_date = lambda r, head=None: ood
+        km._behind_info = lambda sha, head=None: {"behind": behind, "ahead": ahead, "date": ""}
         return saved
 
     def _restore(self, saved):
@@ -100,8 +100,8 @@ class AutoPushFiring(unittest.TestCase):
         km._auto_push.clear()
         km._auto_push_tried.clear()
         self._saved = (km._remote_out_of_date, km._behind_info, km._local_head)
-        km._remote_out_of_date = lambda r: True
-        km._behind_info = lambda sha: {"behind": 2, "ahead": 0, "date": ""}
+        km._remote_out_of_date = lambda r, head=None: True
+        km._behind_info = lambda sha, head=None: {"behind": 2, "ahead": 0, "date": ""}
         km._local_head = lambda short=False: (LOCAL[:8] if short else LOCAL)
         self.calls = []
 
@@ -155,14 +155,14 @@ class AutoPushFiring(unittest.TestCase):
         self.assertEqual(self.calls, [], "off means off")
 
     def test_a_diverged_remote_never_fires(self):
-        km._behind_info = lambda sha: {"behind": 1, "ahead": 1, "date": ""}
+        km._behind_info = lambda sha, head=None: {"behind": 1, "ahead": 1, "date": ""}
         self._run(self._row())
         self.assertEqual(self.calls, [], "a push that could clobber is never automatic")
 
     def test_an_up_to_date_host_clears_a_settled_phase(self):
         # the EVENT that ends a push is the remote reporting our sha — never a timer
         km._set_auto_push("TESTHOST", "waiting", "pushed; waiting for it to restart")
-        km._remote_out_of_date = lambda r: False
+        km._remote_out_of_date = lambda r, head=None: False
         self._run(self._row())
         self.assertIsNone(km._auto_push_state("TESTHOST"), "the restarted remote matching us ends the phase")
 
@@ -181,8 +181,8 @@ class PublishedToTheClient(unittest.TestCase):
 
     def test_the_row_publishes_the_fast_forward_verdict_and_live_phase(self):
         saved = (km._remote_out_of_date, km._behind_info)
-        km._remote_out_of_date = lambda r: True
-        km._behind_info = lambda sha: {"behind": 2, "ahead": 0, "date": "2026-07-24"}
+        km._remote_out_of_date = lambda r, head=None: True
+        km._behind_info = lambda sha, head=None: {"behind": 2, "ahead": 0, "date": "2026-07-24"}
         km._set_auto_push("TESTHOST", "pushing", "pushing this machine's build over SSH")
         try:
             pub = km._remote_public({"host": "TESTHOST", "kernel_port": 1, "local_port": 2,

@@ -62,7 +62,7 @@ test("an image thumbnail renders per surface; other files wear an ext + name chi
   assert.match(RENDER, /nm\.textContent = p\.split\("\/"\)\.pop\(\) \|\| p;/);
   // click opens the file — routed by openPath (VS Code editor / the feed pane's viewer on the web);
   // the ✕ removes exactly that attachment
-  assert.match(fn, /openPath\(p, id \|\| null\);/);
+  assert.match(fn, /openPath\(p, id \|\| null, e\);/);   // with its click: a modified click on a PDF takes a browser tab
   assert.match(fn, /if \(id\) removeComposerFile\(id, i\);/);
   // the same file dropped twice attaches once
   assert.match(RENDER, /if \(!list\.includes\(path\)\) list\.push\(path\);/);

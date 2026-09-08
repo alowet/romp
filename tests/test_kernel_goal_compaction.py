@@ -7,6 +7,7 @@ cleared (exactly the cards the feed already hides), so the live store stays ≈ 
 (segment-id, phase) dedup lives in store["placements"], which compaction LEAVES in the live store, so the judge
 never re-mints an archived node. Undo-clear restores from the archive. Synthetic stores only (no live data).
 """
+import errno
 import json
 import os
 import shutil
@@ -14,6 +15,7 @@ import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
@@ -116,6 +118,31 @@ class GoalCompactionTest(unittest.TestCase):
             self.assertNotIn(SID, calls, "an unchanged store is not re-swept (steady state is just stats)")
         finally:
             km._compact_goal_store = orig
+
+    def test_g_an_unreadable_store_is_not_marked_seen_so_the_next_sweep_retries_it(self):
+        """A store the sweep could not READ (EIO, EACCES) is skipped for that sweep only: recording it as
+        swept would gate on an mtime that never moves (a permission fix changes no mtime), so it would
+        never be looked at again. Private synthetic sid; its journal lives in this test's temp root."""
+        other = "5d4c3b2a-1f0e-4d9c-8b7a-6f5e4d3c2b1a"
+        g = lambda n: "%s:%s" % (other, n)
+        jd.save_goals(other, {"rompUuid": other, "seq": 1, "lastNode": g("g1"), "placements": {},
+                              "nodes": {g("g1"): _node(g("g1"), None, cleared=True)},
+                              "status": {g("g1"): "cleared"}})
+        target, orig = jd.GOALDIR / (other + ".json"), Path.read_text
+
+        def faulting(path, *a, **kw):
+            if path == target:
+                raise OSError(errno.EIO, "Input/output error", str(path))
+            return orig(path, *a, **kw)
+        with mock.patch.object(Path, "read_text", faulting):
+            km._compact_goal_stores()
+        self.assertNotIn(other, km._compact_seen, "an unreadable store is not recorded as swept...")
+        self.assertFalse((jd.GOALARCHDIR / (other + ".json")).exists(), "...and nothing moved out of it")
+        self.assertIn(SID, km._compact_seen, "the other store was swept as usual")
+        km._compact_goal_stores()                     # the fault cleared; the file's mtime never moved
+        self.assertIn(other, km._compact_seen, "...so the next sweep retries it")
+        self.assertIn(g("g1"), json.loads((jd.GOALARCHDIR / (other + ".json")).read_text())["nodes"],
+                      "and archives its cleared top")
 
     def test_f_undo_clear_wires_in_the_archive_restore_before_unsetting_the_flag(self):
         import inspect

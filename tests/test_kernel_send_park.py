@@ -219,10 +219,11 @@ class OpQueueParkOrDeliver(unittest.TestCase):
 
 
 class _FakeForwardBackend:
-    """An SDK-like backend: forwards_sends() True, and send() enqueues into an in-memory queue exposed by
-    pending_queued (the SDK's _pending). The actual mid-turn forward / fold happens inside the SDK, not here
-    — for the kernel gate what matters is that a working send is HANDED OVER (lands in send()/the queue),
-    not parked in the kernel FIFO."""
+    """An SDK-like backend for sends: forwards_sends() True, and send() enqueues into an in-memory queue
+    exposed by pending_queued (the SDK's _pending). The actual mid-turn forward / fold happens inside the SDK,
+    not here — for the kernel gate what matters is that a working send is HANDED OVER (lands in send()/the
+    queue), not parked in the kernel FIFO. It also declares model_switches_live, so the live-pick ordering
+    can be pinned; the real SdkBackend says False for now (see its docstring)."""
 
     def __init__(self):
         self.calls = []
@@ -230,6 +231,10 @@ class _FakeForwardBackend:
 
     def forwards_sends(self):
         return True
+
+    def model_switches_live(self):
+        return True     # a backend that CAN switch mid-turn — the shape the SDK's control channel would take once the
+                        # CLI persists a mid-turn switch correctly; the real SdkBackend declares False for now (#923)
 
     def send(self, sid, text):
         self.calls.append(("send", text))
@@ -252,7 +257,9 @@ class SdkForwardsAndBatch(unittest.TestCase):
     """The user 2026-07-17: get typed messages in AS SOON AS POSSIBLE (no interrupt), and when a pile is
     queued, send them ALL AT ONCE — the SDK folds them into one turn, tmux merges them. A backend that
     forwards its own sends (forwards_sends) takes a composer send even MID-TURN, instead of the kernel
-    parking it until the turn ends; slash-command drive ops still park in press order. Synthetic only."""
+    parking it until the turn ends; slash-command drive ops still park in press order — except a model
+    pick on a backend that declares model_switches_live, which fires and keeps order by going first
+    (#923; no shipped backend declares it yet). Synthetic only."""
 
     def setUp(self):
         self.be = _FakeBackend()                       # tmux-like (no forwards_sends)
@@ -286,11 +293,26 @@ class SdkForwardsAndBatch(unittest.TestCase):
                          "all three reach the SDK queue → its inputs() folds them into one turn")
         self.assertNotIn(SID, km._pending_ops)
 
-    def test_a_send_after_a_parked_drive_op_chains_behind_it_even_for_the_sdk(self):
-        # press-order beats mid-turn forwarding: once a /model is parked, a later message stays behind it
-        # (the user 2026-07-17, who asked to be careful with that aspect). The drive op parks (a queue exists), so the
-        # send parks too — it does NOT jump ahead by forwarding mid-turn.
+    def test_a_send_after_a_live_model_pick_still_reaches_the_model_second(self):
+        # press-order beats mid-turn forwarding (the user 2026-07-17, who asked to be careful with that
+        # aspect) — and on a backend that can apply a model change mid-turn (model_switches_live) it is
+        # kept by DELIVERING in order rather than by deferring both: the pick's control request goes over
+        # first, the send that follows is handed over next (see tests/test_model_live_midturn.py). What must
+        # never happen — the message reaching the model BEFORE the switch — still cannot. The parked shape
+        # this test used to pin is still pinned wherever the pick DOES park: tmux, Codex, the real SDK for
+        # now, a compaction, an existing queue, a limit hold (all in test_model_live_midturn.py).
         km._working_now = lambda sid: True
+        km._set_model_or_park(self.fbe, SID, "opus")
+        km._send_or_park(self.fbe, SID, "after the model", echo="human")
+        self.assertEqual(self.fbe.calls, [("model", "opus"), ("send", "after the model")],
+                         "model first, then the message — press order, both immediate")
+        self.assertNotIn(SID, km._pending_ops, "nothing needed to park")
+
+    def test_a_send_after_a_PARKED_drive_op_still_chains_behind_it(self):
+        # the original 2026-07-17 shape, on the path where the pick still parks: a compaction. The send must
+        # not forward past it.
+        km._working_now = lambda sid: True
+        km._compacting_now = lambda sid: True
         km._set_model_or_park(self.fbe, SID, "opus")
         km._send_or_park(self.fbe, SID, "after the model", echo="human")
         self.assertEqual(self.fbe.calls, [], "nothing fires: model parked, the send chained behind it")
@@ -395,7 +417,7 @@ class QueuedBubble(unittest.TestCase):
                       "the queued indicator shows even when a parked op is the only pending item")
         self.assertIn("for j, op in enumerate(pending_ops):", src,
                       "ONE loop, park order — rendering IS execution order")
-        self.assertIn('{"md": _parked_md(op), "park": j, "cancelable": True}', src,
+        self.assertIn('{"md": _parked_md(op), "park": j, "cancelable": True, **(_queued_romp_flags(op[1]) if op[0] == "send" else {})}', src,
                       "parked ops are CANCELABLE (the user 2026-07-08): park index + shared body renderer")
 
     def test_drive_routes_park_cancels(self):
@@ -405,6 +427,13 @@ class QueuedBubble(unittest.TestCase):
         self.assertIn('_cancel_parked(sid, int(msg["park"]), str(msg.get("md") or ""))', src)
         self.assertIn('_cancel_backend_queued(be, sid, int(msg["idx"]), str(msg.get("md") or ""))', src,
                       "the backend-queue cancel goes through the drift guard now")
+
+    def test_a_body_only_cancel_that_finds_nothing_is_logged(self):
+        # T244 (the user 2026-09-07): a ✕ on a "sending…" bubble left no evidence of which way the cancel went.
+        # The body-only arm now logs a miss (sid only — the body is the user's text) so the next report carries it.
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        arm = src.split('elif t == "cancelQueued" and msg.get("md"):')[1].split("\n    elif ")[0]
+        self.assertIn('sys.stderr.write("queued-cancel miss: %s (body-only)\\n" % sid)', arm)
 
     def test_drive_answers_every_cancel_with_an_authoritative_result_frame(self):
         # the user 2026-07-20: a ✕ whose target had already been handed to the CLI silently no-opped

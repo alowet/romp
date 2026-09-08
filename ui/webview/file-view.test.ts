@@ -21,18 +21,18 @@ const FEED_CSS = web("feed.css");
 const CHAT_CSS = web("styles.css");
 
 test("openPath routes by HOST: the in-pane viewer modal on the web, the editor in VS Code", () => {
-  assert.match(RENDER, /function openPath\(path: string, sid\?: string \| null\): void/);
+  assert.match(RENDER, /function openPath\(path: string, sid\?: string \| null, ev\?: MouseEvent \| null\): void/);   // ev: the click, for a PDF's modified-click tab
   // web → the viewer opens in THIS document, framed or standalone alike — no shell relay, no fallback
-  assert.match(RENDER, /openFileView\(path, sid \|\| activeId \|\| null\);/);
-  assert.match(RENDER, /import \{ openFileView \} from "\.\/file-view";/);
+  assert.match(RENDER, /openFileClick\(ev, path, sid \|\| activeId \|\| null\);/);   // via the gesture reader: a plain click is openFileView (pdf-new-tab.test.ts)
+  assert.match(RENDER, /import \{ openFileClick \} from "\.\/file-view";/);   // the gesture reader is the chat's only way in; openFileView is not imported
   assert.doesNotMatch(RENDER, /romp: "viewFile"/, "the chat→shell→feed relay is gone");
   // VS Code keeps the host editor
   assert.match(RENDER, /vscodeApi\.postMessage\(sid \? \{ type: "openFile", path, id: sid \} : \{ type: "openFile", path \}\);/);
 });
 
 test("every file-link surface in the chat goes through openPath — no direct openFile posts left", () => {
-  for (const call of [/openPath\(path\);/, /openPath\(open, relative \? activeId : null\);/,
-                      /openPath\(p, id \|\| null\);/]) assert.match(RENDER, call);
+  for (const call of [/openPath\(path, null, e\);/, /openPath\(open, relative \? activeId : null, e\);/,
+                      /openPath\(p, id \|\| null, e\);/]) assert.match(RENDER, call);   // each with its click (a PDF's modified-click tab)
   // the ONLY openFile postMessage left in render.ts is openPath's own fallback branch
   assert.equal((RENDER.match(/type: "openFile"/g) || []).length, 2,
                "both remaining mentions are the two arms of openPath's fallback");
@@ -167,6 +167,7 @@ test("it waits with the romp loader and fails with the kernel's own words, never
 
 test("it reuses fileUrl, so a REMOTE session's file is relayed from the host that owns it", () => {
   assert.match(VIEW, /import \{ fileUrl \} from "\.\/preview";/);
+  assert.match(VIEW, /import \{ openPdfTab, wantsOwnTab \} from "\.\/preview";/);   // + the PDF tab opener and its gesture test (2026-09-06/07)
   assert.match(VIEW, /fetch\(fileUrl\(path, sid\), \{ cache: "no-store" \}\)/);
 });
 

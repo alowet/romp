@@ -9,8 +9,10 @@
 // only (host TESTHOST, placeholder uuids).
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { FederationManager, mergeHostTimelines, socketVerdict,
-         REMOTE_STALE_MS, REMOTE_CONNECT_MS, REMOTE_REDIAL_MS } from "./federation";
+         REMOTE_STALE_MS, REMOTE_CONNECT_MS, REMOTE_REDIAL_MS, REMOTE_PROVISIONAL_MS } from "./federation";
 
 const U = "11111111-2222-3333-4444-555555555555";
 
@@ -37,6 +39,7 @@ test("the bounds are the pane shim's, byte for byte (kernel keepalive 10s → st
   assert.equal(REMOTE_STALE_MS, 30000);
   assert.equal(REMOTE_CONNECT_MS, 15000);
   assert.equal(REMOTE_REDIAL_MS, 8000);
+  assert.equal(REMOTE_PROVISIONAL_MS, 15000, "a resumed keep no frame has confirmed: 1.5 keepalive periods");
 });
 
 // ── the manager, end to end, with a fake WebSocket ──────────────────────────────────────────────
@@ -165,6 +168,212 @@ test("a detached host is never touched by the watchdog, and a DOWN tunnel is nev
   });
 });
 
+// ── the Page Lifecycle `resume` stamp (the user 2026-09-07, whose dashboard froze on return) ─────
+// A Chromium tab left in the background is FROZEN: no JS runs, so no frame can stamp lastRecv even
+// while the socket underneath stays open and the kernel keeps heartbeating. lastRecv then measures
+// "JS did not run", not "the socket went silent" — and the foreground fast-path above read that as
+// 30s+ of silence and abandoned+redialed EVERY attached host on every thaw, each redial a full resend.
+// The thaw fires `resume` before `visibilitychange`; stamping every OPEN socket there makes the
+// foreground pass see fresh sockets and keep them. socketVerdict itself is unchanged.
+test("`resume` stamps every OPEN relay socket's lastRecv — and only the open ones", async () => {
+  await withManager((fm) => {
+    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("HOSTB", "tok", true);
+    fm.openRemote("HOSTC", "tok", true);
+    const [a, b, c] = FakeWS.made;
+    a.open(); b.open();                                   // c never finishes its handshake (CONNECTING)
+    clock += 45_000;                                      // frozen: no JS ran, so no frame was stamped
+    fm.resumed(clock);
+    assert.equal(fm.conns.get("TESTHOST").lastRecv, clock, "an open socket is stamped at the thaw");
+    assert.equal(fm.conns.get("HOSTB").lastRecv, clock, "…every open socket, not just the first");
+    assert.equal(fm.conns.get("HOSTC").lastRecv, 0, "a CONNECTING socket is NOT stamped — the foreground pass must still kill it");
+    assert.equal(c.readyState, 0);
+    for (const h of ["TESTHOST", "HOSTB", "HOSTC"]) fm.conns.get(h).closed = true;
+  });
+});
+
+test("thaw: `resume` then the foreground watchdog pass closes NOTHING — and silence AFTER the resume still counts", async () => {
+  await withManager((fm, _e, diag) => {
+    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("HOSTB", "tok", true);
+    const [a, b] = FakeWS.made;
+    a.open(); b.open();
+    clock += 45_000;                                      // well past REMOTE_STALE_MS with no frame
+    fm.resumed(clock);
+    fm.watchdog(clock, true);                             // the visibilitychange fast-path, as on every thaw
+    assert.equal(a.closed, 0, "the open socket is kept: the resume re-based its silence to now");
+    assert.equal(b.closed, 0, "…for every attached host");
+    assert.equal(FakeWS.made.length, 2, "no redial → no full resend from either kernel");
+    assert.equal(diag.filter((d) => d.data && d.data.ev === "watchdog-close").length, 0, "nothing was put down, so no crumb");
+    clock += 5000;
+    fm.watchdog(clock);
+    assert.equal(a.closed, 0, "the next plain tick keeps it too");
+    // the stamp re-BASES the watchdog, it does not disarm it: a socket that stays silent after the
+    // thaw (dead on arrival, FIN never delivered) is still abandoned (at the provisional bound since
+    // 2026-09-08, see below; this tick is past either)
+    clock += REMOTE_STALE_MS;
+    fm.watchdog(clock);
+    assert.equal(a.closed, 1, "30s+ of real silence after the resume → abandoned as before");
+    assert.equal(b.closed, 1);
+    assert.equal(FakeWS.made.length, 4, "…and redialed");
+    for (const h of ["TESTHOST", "HOSTB"]) fm.conns.get(h).closed = true;
+  });
+});
+
+test("no `resume` (a browser without Page Lifecycle, or a tab that was hidden but running): the stale verdict still closes on foreground", async () => {
+  await withManager((fm, _e, diag) => {
+    fm.openRemote("TESTHOST", "tok", true);
+    const ws = FakeWS.made[0];
+    ws.open();
+    clock += 45_000;                                      // 45s with no frame and no resume = real silence
+    fm.watchdog(clock, true);
+    assert.equal(ws.closed, 1, "abandoned exactly as before the resume stamp existed");
+    assert.equal(FakeWS.made.length, 2, "…and a fresh socket dialed in the same pass");
+    const crumb = diag.find((d) => d.data && d.data.ev === "watchdog-close");
+    assert.equal(crumb.data.why, "quiet");
+    assert.equal(crumb.data.foreground, true);
+    fm.conns.get("TESTHOST").closed = true;
+  });
+});
+
+test("a CONNECTING socket is still killed on foreground after a `resume` — the stamp never reaches an unfinished handshake", async () => {
+  await withManager((fm, _e, diag) => {
+    fm.openRemote("TESTHOST", "tok", true);
+    const ws = FakeWS.made[0];                            // never opens
+    clock += 1000;
+    fm.resumed(clock);
+    assert.equal(fm.conns.get("TESTHOST").lastRecv, 0, "not stamped");
+    fm.watchdog(clock, true);
+    assert.equal(ws.closed, 1, "the foreground pass closes it now, resume or not");
+    assert.equal(FakeWS.made.length, 2, "…and dials a fresh one");
+    assert.equal(diag.filter((d) => d.data && d.data.ev === "watchdog-close" && d.data.why === "connecting" && d.data.foreground).length, 1);
+    fm.conns.get("TESTHOST").closed = true;
+  });
+});
+
+test("the document wiring: `resume` then `visibilitychange`→visible keeps an open socket; `visibilitychange` alone abandons a quiet one; hidden fires nothing", async () => {
+  await withManager((fm) => {
+    // a fake document that records the listeners and lets the test fire them in the browser's order
+    const listeners: Record<string, Array<() => void>> = {};
+    const doc = {
+      visibilityState: "visible",
+      addEventListener(t: string, fn: () => void) { (listeners[t] ||= []).push(fn); },
+      fire(t: string) { for (const fn of listeners[t] || []) fn(); },
+    };
+    fm.watchLifecycle(doc);
+    assert.equal((listeners.resume || []).length, 1, "one resume listener");
+    assert.equal((listeners.visibilitychange || []).length, 1, "one visibilitychange listener");
+    fm.openRemote("TESTHOST", "tok", true);
+    const ws = FakeWS.made[0];
+    ws.open();
+    clock += 45_000;
+    doc.fire("resume");                                   // Chromium's thaw order: resume, then visibilitychange
+    doc.fire("visibilitychange");
+    assert.equal(ws.closed, 0, "kept: the resume stamped it before the foreground pass ran");
+    assert.equal(FakeWS.made.length, 1);
+    clock += 45_000;
+    doc.visibilityState = "hidden";
+    doc.fire("visibilitychange");
+    assert.equal(ws.closed, 0, "going HIDDEN is not a foreground pass");
+    doc.visibilityState = "visible";
+    doc.fire("visibilitychange");                         // no resume this time: real silence
+    assert.equal(ws.closed, 1, "abandoned on foreground, exactly today's behaviour");
+    assert.equal(FakeWS.made.length, 2);
+    fm.conns.get("TESTHOST").closed = true;
+  });
+});
+
+// A resumed keep is PROVISIONAL (review find, 2026-09-08): the stamp re-bases the watchdog, it does not vouch
+// for the far end. A peer that died without a FIN reaching the browser (a laptop sleep across a network change,
+// a tunnel whose local end stays open) leaves the relay socket OPEN at the thaw, so the stamp kept it and the
+// host sat absent until the tick crossed REMOTE_STALE_MS, 30 s later. Now the kernel's next frame confirms the
+// keep, and until one lands the watchdog runs at REMOTE_PROVISIONAL_MS; a socket already overdue BEFORE the
+// freeze is not stamped at all, its gap is real and the foreground pass redials it as it did before the stamp.
+test("a resumed keep is provisional: silence after the thaw is put down at REMOTE_PROVISIONAL_MS, a frame confirms it to the full bound", async () => {
+  await withManager((fm, _e, diag) => {
+    const listeners: Record<string, Array<() => void>> = {};
+    const doc = {
+      visibilityState: "visible",
+      addEventListener(t: string, fn: () => void) { (listeners[t] ||= []).push(fn); },
+      fire(t: string) { for (const fn of listeners[t] || []) fn(); },
+    };
+    fm.watchLifecycle(doc);
+    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("HOSTB", "tok", true);
+    const [a, b] = FakeWS.made;
+    a.open(); b.open();
+    clock += 1000;
+    doc.fire("freeze");
+    clock += 45_000;
+    doc.fire("resume");                                   // Chromium's thaw order: resume, then visibilitychange
+    doc.fire("visibilitychange");
+    const stamp = clock;
+    assert.equal(a.closed, 0, "the thaw itself keeps both sockets: the healthy case pays nothing");
+    assert.equal(b.closed, 0);
+    assert.equal(fm.conns.get("TESTHOST").resumeProvisional, stamp, "the keep records the stamp it rests on");
+    clock += 2000;
+    b.frame({ type: "ka", dv: 1 });                       // HOSTB's kernel speaks: its keep is confirmed, a keepalive is enough
+    assert.equal(fm.conns.get("HOSTB").resumeProvisional, 0);
+    assert.equal(fm.conns.get("TESTHOST").resumeProvisional, stamp, "TESTHOST's is still waiting on a frame");
+    clock += 10_000;                                      // 12 s since the stamp
+    fm.watchdog(clock);
+    assert.equal(a.closed, 0, "inside the provisional bound the socket stands");
+    clock += 3001;                                        // 15.001 s since the stamp, no beat from that kernel
+    fm.watchdog(clock);
+    assert.equal(a.closed, 1, "put down at the provisional bound, not at 30 s: the kept socket was dead all along");
+    assert.equal(b.closed, 0, "the confirmed socket stands");
+    assert.equal(FakeWS.made.length, 3, "…and TESTHOST is redialed at once");
+    const crumb = diag.find((d) => d.what === "hostconn" && d.data && d.data.ev === "watchdog-close");
+    assert.equal(crumb.data.host, "TESTHOST");
+    assert.equal(crumb.data.why, "quiet");
+    assert.equal(crumb.data.quietMs, 15_001, "silence measured from the stamp");
+    assert.equal(fm.conns.get("TESTHOST").resumeProvisional, 0, "the fresh socket starts unmarked: the rule was the resumed socket's");
+    clock += 15_999;                                      // 29 s since HOSTB's confirming frame
+    fm.watchdog(clock);
+    assert.equal(b.closed, 0, "confirmed: the shorter bound no longer applies");
+    clock += 1001;                                        // 30.001 s since that frame
+    fm.watchdog(clock);
+    assert.equal(b.closed, 1, "real silence after the confirmation is still put down at REMOTE_STALE_MS");
+    for (const h of ["TESTHOST", "HOSTB"]) fm.conns.get(h).closed = true;
+  });
+});
+
+test("a socket already overdue before the freeze is not stamped by `resume`: the foreground pass redials it at once", async () => {
+  await withManager((fm, _e, diag) => {
+    const listeners: Record<string, Array<() => void>> = {};
+    const doc = {
+      visibilityState: "visible",
+      addEventListener(t: string, fn: () => void) { (listeners[t] ||= []).push(fn); },
+      fire(t: string) { for (const fn of listeners[t] || []) fn(); },
+    };
+    fm.watchLifecycle(doc);
+    fm.openRemote("TESTHOST", "tok", true);
+    const ws = FakeWS.made[0];
+    ws.open();
+    const opened = clock;
+    clock += 31_000;                                      // silent past REMOTE_STALE_MS while JS still ran: that gap is real
+    doc.fire("freeze");
+    clock += 45_000;
+    doc.fire("resume");
+    assert.equal(fm.conns.get("TESTHOST").lastRecv, opened, "not stamped: the resume vouches for nothing here");
+    assert.equal(fm.conns.get("TESTHOST").resumeProvisional, 0);
+    doc.fire("visibilitychange");
+    assert.equal(ws.closed, 1, "abandoned on foreground, exactly as before the stamp existed");
+    assert.equal(FakeWS.made.length, 2, "…and a fresh socket dialed in the same pass");
+    const crumb = diag.find((d) => d.data && d.data.ev === "watchdog-close");
+    assert.equal(crumb.data.quietMs, 76_000);
+    fm.conns.get("TESTHOST").closed = true;
+  });
+});
+
+test("source pin: start() installs the lifecycle listeners through watchLifecycle(document), guarded for a document-less host", () => {
+  const src = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "federation.ts"), "utf8");
+  const start = src.slice(src.indexOf("  start(): void {"), src.indexOf("  watchLifecycle("));
+  assert.ok(start.length > 0, "start() precedes watchLifecycle()");
+  assert.match(start, /try \{\s*this\.watchLifecycle\(document\);\s*\} catch/, "installed once, inside the no-document guard");
+  assert.ok(!/document\.addEventListener/.test(start), "no second, un-testable listener install in start()");
+});
+
 // ── the pending-host signal: what the panes and the shell read while a host is still coming ────
 test("mergeHostTimelines names attached hosts that have no lanes payload yet, and which of those sit on a dead link", () => {
   const local = { sessions: [{ id: U, name: "web" }], turns: {}, messages: [], judging: [], now: 1000 };
@@ -252,4 +461,20 @@ test("…but never drops an EMPTY merged feed onto a page still waiting for its 
   } finally {
     if (hadFetch) g.fetch = prevFetch; else delete g.fetch;
   }
+});
+
+test("the CHAT pane pends on the TAB LIST channel — the set its pin prune reads as __rompFed.pending (render.ts reachableHosts): an attached host pends from openRemote until its own tabOrder lands here, whatever else arrives; a detach retires it", async () => {
+  await withManager((fm) => {
+    fm.app = "chat";
+    fm.openRemote("TESTHOST", "tok", true);
+    assert.deepEqual(fm.pendingFor(), ["TESTHOST"], "attached and dialed, no tab list from it yet");
+    fm.inbound("", { type: "tabOrder", order: [U], tabs: [{ id: U, name: "web" }] });
+    assert.deepEqual(fm.pendingFor(), ["TESTHOST"], "the LOCAL list is not the remote's");
+    fm.inbound("TESTHOST", localFeed);
+    assert.deepEqual(fm.pendingFor(), ["TESTHOST"], "a feed payload from the host means nothing to the chat pane");
+    fm.inbound("TESTHOST", { type: "tabOrder", order: [], tabs: [] });
+    assert.deepEqual(fm.pendingFor(), [], "its first tab list — even an EMPTY one — retires it");
+    fm.closeRemote("TESTHOST");
+    assert.deepEqual(fm.pendingFor(), [], "detached: in no list at all");
+  });
 });

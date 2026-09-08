@@ -12,7 +12,10 @@
 
 ROMP_DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 
+load git-hermetic
+
 setup() {
+    git_hermetic
     TEST_DIR="$(mktemp -d)"
     REPO="$TEST_DIR/repo"
     mkdir -p "$REPO/scripts"

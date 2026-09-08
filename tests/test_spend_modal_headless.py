@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""T247, the served-page pins: the landing page is served from a hermetic kernel module (its own
+_landing() HTML, /spend/detail and /usage/fleet answered from a synthetic ledger — placeholder uuids,
+TESTHOST, the notes-api demo sessions), and a real browser clicks the usage readout. Pins the modal's
+open/close contract (click opens over the 0.55 backdrop; Escape and a backdrop tap close), the table
+and the stacked histogram with its unattributed stack, the toggles, and the segment tooltip. Skips
+LOUDLY without a playwright: set ROMP_PLAYWRIGHT_NODE_PATH to a node_modules holding it (CI does
+not; this is the maintainer's screenshot harness too — pass ROMP_SHOTS=<path-prefix> for PNGs)."""
+import json
+import os
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+BIN = os.path.join(ROOT, "bin")
+os.environ["ROMP_KERNEL_NO_OPEN"] = "1"
+os.environ.setdefault("ROMP_SERVE_TOKEN", "testtok")
+os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
+os.environ.pop("ROMP_STATE_DIR", None)
+km = SourceFileLoader("romp_kernel_spendmodal", os.path.join(BIN, "romp-kernel")).load_module()
+
+import sys
+sys.path.insert(0, HERE)
+import test_spend_detail as _sd   # noqa: E402  the same synthetic world (the module, not its classes:
+#                                   an imported TestCase would be collected here a second time)
+write_ledger, WEB, API, TESTS = _sd.write_ledger, _sd.WEB, _sd.API, _sd.TESTS
+
+
+def _node_path():
+    for cand in (os.environ.get("ROMP_PLAYWRIGHT_NODE_PATH", ""), os.path.join(ROOT, "vscode-extension", "node_modules")):
+        if cand and os.path.isdir(os.path.join(cand, "playwright")):
+            return cand
+    return ""
+
+
+class SpendModalServed(unittest.TestCase):
+    def setUp(self):
+        np = _node_path()
+        if not np:
+            self.skipTest("no playwright: set ROMP_PLAYWRIGHT_NODE_PATH to a node_modules that holds it")
+        self.node_path = np
+        self.td = tempfile.TemporaryDirectory()
+        state = Path(self.td.name)
+        self._saved = (km.jd.STATE, km.NAMES, km._live_names, km._tmux_sessions, km._self_host,
+                       km._claude_account, km._auth_key_present)
+        km.jd.STATE = state
+        km.NAMES = state / "names"
+        km.NAMES.mkdir()
+        (km.NAMES / WEB).write_text("web\t/tmp/notes-api\t#1EA1EB\t#ffffff\n")
+        (km.NAMES / API).write_text("api\t/tmp/notes-api\t#54B204\t#ffffff\n")
+        (km.NAMES / TESTS).write_text("tests\t/tmp/notes-api\t#4EA8A9\t#ffffff\n")
+        km._live_names = lambda tm: {"web": WEB, "api": API}
+        km._tmux_sessions = lambda: []
+        km._self_host = lambda: "TESTHOST"
+        km._claude_account = lambda: ""
+        km._auth_key_present = lambda: True
+        (state / "usage.json").write_text(json.dumps({"apiKey": True}))
+        write_ledger(state, extra_sids=12)
+        html = km._landing().encode()
+        blank = b"<!doctype html><html><body style='margin:0;background:#1e1e1e'></body></html>"
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _out(self, code, body, ctype):
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                p = self.path.split("?", 1)[0]
+                if p == "/":
+                    return self._out(200, html, "text/html; charset=utf-8")
+                if p == "/spend/detail":
+                    # the fixture's OWN clock (review find: served with the wall clock, the 192-hour window
+                    # slid off the anchored ledger within days and the hourly pins became a time bomb)
+                    return self._out(200, json.dumps(km._spend_detail(now=_sd.NOW)).encode(), "application/json")
+                if p == "/usage/fleet":
+                    return self._out(200, json.dumps({"rows": [{"host": "", "acct": "", "usage": km._usage()}],
+                                                      "host": "TESTHOST"}).encode(), "application/json")
+                if p == "/usage":
+                    return self._out(200, json.dumps(km._usage() or {}).encode(), "application/json")
+                if p.startswith("/media/") or p.startswith("/dist/"):
+                    f = os.path.join(ROOT, p.lstrip("/"))
+                    if os.path.isfile(f):
+                        ct = "image/svg+xml" if f.endswith(".svg") else "application/javascript" if f.endswith(".js") else "application/octet-stream"
+                        return self._out(200, open(f, "rb").read(), ct)
+                    return self._out(404, b"", "text/plain")
+                if p in ("/chat", "/feed", "/timeline", "/fleet", "/dashboard"):
+                    return self._out(200, blank, "text/html; charset=utf-8")
+                return self._out(200, b"{}", "application/json")
+
+            def do_POST(self):
+                return self._out(200, b"{}", "application/json")
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        if hasattr(self, "srv"):
+            self.srv.shutdown()
+            self.srv.server_close()
+        if hasattr(self, "_saved"):
+            (km.jd.STATE, km.NAMES, km._live_names, km._tmux_sessions, km._self_host,
+             km._claude_account, km._auth_key_present) = self._saved
+            self.td.cleanup()
+
+    def test_click_opens_the_modal_with_table_and_stacked_histogram_and_escape_closes_it(self):
+        shots = os.environ.get("ROMP_SHOTS", "")
+        env = dict(os.environ, NODE_PATH=self.node_path)
+        r = subprocess.run(["node", os.path.join(HERE, "spend_modal_headless.js"), "http://127.0.0.1:%d/" % self.port, shots],
+                           capture_output=True, text=True, timeout=180, env=env)
+        self.assertEqual(r.returncode, 0, "the driver failed:\n" + r.stderr[-3000:])
+        o = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertTrue(o["hiddenBefore"], "closed until the click")
+        self.assertTrue(o["loaderSeen"], "the loader (or the content) is up the instant the modal opens")
+        self.assertEqual(o["out"]["backdrop"], "rgba(0, 0, 0, 0.55)", "the panel rule's backdrop")
+        self.assertEqual(o["out"]["head"], "API spend · TESTHOST")
+        rows = o["out"]["rows"]
+        self.assertTrue(rows[0].startswith("web"), rows[0])
+        self.assertTrue(rows[1].startswith("api"), rows[1])
+        self.assertTrue(any(r.startswith("tests") and "not running" in r for r in rows), "a dead session keeps its name, dimmed")
+        self.assertTrue(o["out"]["rows"][2].startswith("tests"), "the top rows are the histogram's stacks, in order")
+        self.assertTrue(any(r.startswith("unattributed") for r in rows), "pre-attribution spend is a row of its own")
+        self.assertGreaterEqual(o["out"]["deadRows"], 2)
+        self.assertEqual(o["foldBefore"], 10 + 1 + 1, "the table folds to the top-N, a '5 more' row, and the unattributed row")
+        self.assertEqual(o["foldAfter"], 15 + 1, "show all: every session, plus the unattributed row")
+        self.assertTrue(any("5 more sessions" in r for r in rows), rows)
+        leg = o["out"]["legend"]
+        self.assertEqual(leg, ["web", "api", "tests", "unattributed"],
+                         "the hourly legend names only the stacks the hourly chart draws — no chip for a "
+                         "top-N session with nothing in this range, no empty 'other' (review find)")
+        self.assertIn("other (5 sessions)", o["days"]["legend"], "beyond the top-N the daily range folds them into one stack")
+        self.assertEqual(o["days"]["legend"][-1], "unattributed")
+        self.assertGreater(o["out"]["segs"], 60)
+        self.assertGreaterEqual(o["out"]["hatched"], 1, "the unattributed stack wears the hatch, not a hue")
+        self.assertIn("1 hour", o["out"]["windows"], "the same window rows the hover shows")
+        self.assertIn("1 month", "".join(o["out"]["windows"]))
+        self.assertTrue(o["out"]["ylabels"] and o["out"]["ylabels"][0].startswith("$"), o["out"]["ylabels"])
+        self.assertTrue(o["out"]["xlabels"], "weekday initials at the ledger's midnights")
+        self.assertTrue(o["days"]["segs"] > 0 and not o["days"]["ylabels"][0].startswith("$"), "tokens on the toggle")
+        self.assertTrue(any("/" in x for x in o["days"]["xlabels"]), "date labels on the daily range")
+        self.assertIn("·", o["tip"], "a segment hover names value · session · bucket")
+        self.assertTrue(o["hiddenAfter"], "Escape closes it")
+        self.assertTrue(o["hiddenAfterTap"], "a backdrop tap closes it")
+        self.assertFalse(o["hiddenAfterDrag"], "…but a drag-select that ends over the backdrop does not (review find)")
+        self.assertTrue(o["mobile"]["railHidden"] and o["mobile"]["panelOpened"] and o["mobile"]["modalOpened"],
+                        "on a phone the Usage panel's 'By session' button is the door (review find): " + json.dumps(o["mobile"]))
+        self.assertEqual(o["lightErr"], "rgb(154, 51, 36)", "the error line has a light-theme step")
+        own = [e for e in o["errs"] if "rsp" in e or "Spend" in e or "spend" in e]
+        self.assertEqual(own, [], "no page errors from the modal's own code")
+
+
+if __name__ == "__main__":
+    unittest.main()

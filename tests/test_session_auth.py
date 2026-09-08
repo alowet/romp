@@ -168,10 +168,21 @@ class OptionsInjection(_OptionsHarness):
         self._options_kw(s2)
         self.assertFalse(s2._launched_keyed)
 
-    def test_a_key_pick_with_no_key_refuses_to_launch_on_the_login(self):
+    def test_a_key_pick_with_no_key_launches_on_claude_codes_own_credential(self):
+        """Until 2026-09-07 this refused the launch (#932: an explicit key pick must never silently bill
+        the login). The maintainer's direction since: given no key, romp injects nothing and defers to
+        Claude Code's own credential resolution (its apiKeyHelper or its login) — the pre-#932 launch, so
+        a box that never handed romp a key keeps working — and says so once, as a problem row."""
         self.be.work_key = ""
-        with self.assertRaisesRegex(sb._keysrc.KeySourceError, "no API key source"):
-            self._options_kw(self._sess(3, auth="key"))
+        s = self._sess(3, auth="key")
+        kw = self._options_kw(s)
+        self.assertNotIn("ANTHROPIC_API_KEY", kw["env"], "nothing injected — not an empty var either")
+        self.assertFalse(s._launched_keyed)
+        self.assertTrue(s._launched_unkeyed_pick)
+        self._options_kw(self._sess(4, auth="key"))
+        rows = [p["text"] for p in self.be.problems(20) if "Claude Code's own credential" in p["text"]]
+        self.assertEqual(len(rows), 1, "said once per process")
+        self.assertIn(sb._keysrc.service_env_path(), rows[0])
 
 
 class FastOrgPermissionFollowsBilling(_OptionsHarness):
@@ -567,7 +578,8 @@ class DrivePlumbing(unittest.TestCase):
 
     def test_create_paths_pass_the_pick_through(self):
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        self.assertIn("def _create_sdk_session(nm, cwd, auth=\"\", prefs=None, client=None, env=None):", src)
+        # (parent + tags joined the signature with tab groups, 2026-09-04 — auth's slot is unchanged)
+        self.assertIn("def _create_sdk_session(nm, cwd, auth=\"\", prefs=None, client=None, env=None, parent=\"\", tags=()):", src)
         self.assertEqual(src.count('auth=(a if a in ("login", "key") else "")'), 2,
                          "the WS op and POST /new both pass it")
 

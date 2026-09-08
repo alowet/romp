@@ -35,19 +35,26 @@ test("peek AUTO-CLOSE: activating any other tab drops it — same derivation, no
   assert.match(RENDER, /let peekId: string \| null = null;/);
   // …and the DERIVATION call sites, each named (the census, extended 2026-08-24 with the two
   // views-arrival paths): setActive (every activation), the focus fast path (already-active),
-  // captureViews (kernel-pushed views), postViews (local optimistic edit). Nothing else derives.
+  // captureViews (kernel-pushed views), holdViews (local optimistic edit — postViews/postTagEdit),
+  // onViewsAck (the kernel's answer to a write, 2026-09-05), onKernelCaps (a reconnect dropping the
+  // in-flight copy — a views arrival in effect). Nothing else derives.
   const sites = RENDER.match(/assertPeekFor\(/g) || [];
   // 6 → 7 on 2026-09-05: the subagent viewer's PIN control re-derives its own tab (pinned → in the chat
   // lens → sheds the peek dress; unpinned → back to a peek) through the same derivation — no second
-  // peek mechanism (plans/subagent-transcripts.md; chatVisible() answers pinnedSubs for a viewer id)
-  assert.equal(sites.length, 7, "definition + 6 call sites: setActive, focus fast path, captureViews, postViews, the feed click echo (2026-08-24 — the instant ack derives the peek before the kernel frame), and the subagent viewer's pin toggle (2026-09-05)");
+  // peek mechanism (plans/subagent-transcripts.md; chatVisible() answers pinnedSubs for a viewer id).
+  // 7 → 8 with the acknowledged views writes: holdViews, onViewsAck and onKernelCaps replace the
+  // single postViews site.
+  assert.equal(sites.length, 9, "definition + 8 call sites: setActive, focus fast path, captureViews, holdViews, onViewsAck, onKernelCaps, the feed click echo (2026-08-24 — the instant ack derives the peek before the kernel frame), and the subagent viewer's pin toggle (2026-09-05)");
 });
 
 test("a view change that excludes the ACTIVE session converts it into the peek — never a bounce (the user 2026-08-24)", () => {
   // both views-arrival paths re-derive the active session's peek: the kernel-pushed blob…
-  assert.match(RENDER, /pendingSessionViews = null; pendingViewsAge = 0;\s*\n\s*\}[\s\S]{0,700}?if \(activeId\) assertPeekFor\(activeId\);\s*\n\}/);
-  // …and the local optimistic edit, BEFORE its renderTabs so the repaint sees the fresh peek state
-  assert.match(RENDER, /pendingSessionViews = v; pendingViewsAge = 0;\s*\n\s*if \(activeId\) assertPeekFor\(activeId\);[\s\S]{0,200}?renderTabs\(\);/);
+  assert.match(RENDER, /pendingSessionViews = null; viewsWrites = \[\]; legacyViewsAge = 0;\s*\n\s*\}[\s\S]{0,700}?if \(activeId\) assertPeekFor\(activeId\);\s*\n\}/);
+  // …and the local optimistic edit (holdViews, shared by postViews/postTagEdit), BEFORE the
+  // renderTabs that follows in either poster so the repaint sees the fresh peek state
+  assert.match(RENDER, /pendingSessionViews = v; legacyViewsAge = 0;\s*\n\s*if \(activeId\) assertPeekFor\(activeId\);[\s\S]{0,900}?renderTabs\(\);/);
+  // …and the kernel's ack, a views arrival like the pushed frame
+  assert.match(RENDER, /if \(out\.clearPending\) pendingSessionViews = null;[\s\S]{0,300}?if \(activeId\) assertPeekFor\(activeId\);[\s\S]{0,200}?renderTabs\(\);/);
   // the derivation is symmetric, so a view that now INCLUDES the active peek sheds the dress — the
   // same next-null branch the auto-close pin above holds; and the fallback's fire-time revalidation
   // (below) re-checks tabInView, so a converted peek can never be bounced by an in-flight timeout
@@ -97,5 +104,6 @@ test("the peek is a PEEK, not a view edit: the client never posts a views change
   const focusBlock = (RENDER.match(/else if \(m\.type === "focus"\) \{[\s\S]*?\n  \}/) || [""])[0];
   assert.ok(focusBlock.length > 100, "found the focus handler");
   assert.doesNotMatch(focusBlock, /postViews|setTimelineViews|revealSession/);
-  assert.match(RENDER, /function revealSession\(id: string\) \{ postViews\(revealIn\(effViews\(\), id\)\); \}/);
+  assert.match(RENDER, /function revealSession\(id: string\) \{ const r = revealIn\(effViews\(\), id\); postLens\(\{ active: r\.active, actives: r\.actives \}\); \}/,
+    "the reveal is a LENS write: its fields ride on the store's blob, never the pending copy (the 2026-09-05 review)");
 });

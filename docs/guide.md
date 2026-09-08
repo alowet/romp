@@ -54,6 +54,37 @@ beside it shows, and a link to a sibling document opens in the same viewer. Link
 on other sites open in a new tab, as before — and a ctrl- or ⌘-click still opens the file in
 a tab.
 
+**Opening a PDF.** A PDF the session mentions, or one you click in the file browser, opens
+inside the dashboard like an image: the chat's PDF card opens it full-view, a path or a
+file-browser row opens it in the file viewer. Cmd-click it instead (Ctrl on Windows and
+Linux), or middle-click, and it opens in a new browser tab in the browser's own viewer, the
+way a paper opens from OpenReview: full size, and it stays open beside the dashboard while
+you keep working. If the browser blocks that new tab, the PDF opens inside the dashboard
+instead; a PDF too large to show offers a download in its place.
+
+**Tags and groups.** A tag is a named, colored set of sessions; a session can be in
+several. Right-click a tab and open **Tags** to add or remove them. Tags filter every
+surface (the tag button in the strip narrows the tabs to the tags you pick), and they group
+the tabs: as soon as any session carries a tag, the strip shows one section per tag, in your
+tag order, each with a header in the tag's color, and the untagged sessions after a divider
+at the end. A session with several tags sits under the first of them in your tag order; its
+other tags still filter. Each header shows a chevron, the tag's color, its name, and a
+member count. Click a header, or press Enter on it, to fold its section down to the header
+alone; the count then says how many tabs are folded away, and a small dot after it says when
+one of them is working or waiting on you (hover it for their names). To keep one tab visible
+while its section is folded, right-click the tab and pick **Show when folded** under **Tags**;
+the header's count then leaves that tab out; when every tab in a section is set to
+show, the folded header shows the full count and its tooltip says nothing is hidden. Pick it
+again to fold the tab with the rest. A tab set to show when folded keeps that setting when its
+group is renamed. The section of the tab you are reading never
+folds (its header says so, and a click there changes nothing), and the `archived` section
+starts folded. Drag a header to reorder the groups, which
+reorders the tags on every surface (the timeline's tag table shows the same order). To move
+a tab into another group, right-click it and pick **Move to <tag>** under **Tags**: one click
+adds that tag and drops the tab's current group tag, leaving its other tags alone. The row's
+**+** adds the tag without moving the tab. **Group tabs by tag**, at the foot of the tag
+button's menu, turns the sections off for this browser.
+
 ### The feed
 
 The feed is Romp's task-management layer: a card for each task. Romp's
@@ -185,6 +216,20 @@ a subproject that became its own repository, right-click its tab and choose
 name, mail and history stay with the session, and from the next turn on the
 agent works in the new folder and reads its `CLAUDE.md`.
 
+A session started from another one joins its tags. Forking a session, breaking
+a comment thread out into its own session, and running `romp new` inside a
+session's shell all put the new session in the parent's groups, so a session's
+children land beside it in the tab strip. `romp new --no-inherit` starts one
+outside them; `romp new --in <tag>` names the tags directly (repeatable). The
+**+** picker shows the tags of the tab you are looking at pre-selected in its
+**Tags** row, where you can unpick or add before creating. Opening a name that
+already runs inherits nothing: `romp new --in` still applies to it, while from
+the picker, a name that already runs is focused and the Tags row is not applied
+(a message says so; the row is a prefill, and applying it would move the
+running session). Comment threads have no tab and inherit nothing until they
+are broken out; `romp new` run inside a thread inherits from the session the
+thread belongs to.
+
 Search reaches inside sessions, not just across their names. As sessions run, a
 lightweight index judge writes each one a headline and an abstract of what it
 did, so searching for the work finds the session that did it, months later.
@@ -306,7 +351,10 @@ Your sessions now show up in its interface from whatever network you are on.
 Because the laptop is the end that connects, the always-on machine never holds a
 way in to it; untick the box and it forgets you. Romp calls this checking in,
 and the always-on machine the hub, which is where `romp checkin` and
-`romp checkout` get their names.
+`romp checkout` get their names. Restarting Romp from the hub's interface
+restarts the machines linked to it as well, and a checked-in machine is asked to
+restart itself only: anything attached to that machine alone is restarted from
+its own interface.
 
 #### Hand the connection to a different machine
 

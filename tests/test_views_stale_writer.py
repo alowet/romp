@@ -113,17 +113,29 @@ class StaleWriterGuard(unittest.TestCase):
         self.assertEqual(km._timeline_views()["tags"], [])
         self.assertEqual(len(self.notices), 0)
 
-    def test_an_mtime_less_legacy_tag_keeps_last_writer_wins(self):
-        # a tag never touched since before the mtime feature has no stamp — the guard cannot
-        # prove staleness, so the legacy behavior stands for it (any future edit stamps it)
+    def test_a_legacy_tag_is_stamped_on_its_first_read_so_an_evidence_less_writer_stands_down(self):
+        # a tag never touched since before the mtime feature has no stamp in the FILE; the first
+        # read gives it one (the 2026-09-05 review — so the foreign-file rule can tell it
+        # from a client's own create), and from then on the guard judges it like any other tag: a
+        # blob with no evidence at all (no `at`, no mtimes) cannot de-member it, loudly, while a
+        # copy echoing the served `at` can. Before this change the file's tag stayed unstamped and the
+        # legacy last-writer-wins stood for it.
         km._atomic_write(km._views_path(), json.dumps(
             {"active": "all", "tags": [{"id": "gL", "name": "legacy", "color": "",
                                         "members": [{"host": "", "sid": "s1"}]}]}))
         km._flags_cache.clear()
+        served = km._timeline_views()
+        self.assertTrue(served["tags"][0].get("mtime"), "stamped on the first read")
         km._set_timeline_views({"active": "all", "tags": [
             {"id": "gL", "name": "legacy", "color": "", "members": []}]})
         km._flags_cache.clear()
-        self.assertEqual(km._timeline_views()["tags"][0]["members"], [])
+        self.assertEqual(len(km._timeline_views()["tags"][0]["members"]), 1, "no evidence, no de-membering")
+        self.assertTrue(self.notices and not self.notices[0][1], "…and the refusal is loud")
+        fresh = json.loads(json.dumps(km._timeline_views()))
+        fresh["tags"][0]["members"] = []
+        km._set_timeline_views(fresh)
+        km._flags_cache.clear()
+        self.assertEqual(km._timeline_views()["tags"][0]["members"], [], "an informed removal lands")
 
     def test_the_at_stamp_is_served_and_survives_the_normalizer(self):
         self._seed()

@@ -55,5 +55,5 @@ test("pre-building is wired into the lifecycle: switch, content arrival, updates
   const staleRebuilds = RENDER.match(/schedulePrebuild\(\); \/\/ rebuild the now-stale off-screen view/g) || [];
   assert.ok(staleRebuilds.length >= 2, "both update() and chatTail() re-warm a now-stale off-screen view");
   // a compact-mode flip resets every view → cancel the stale plan, then re-warm under the new setting
-  assert.match(RENDER, /cancelPrebuild\(\);[\s\S]*showActive\(\);\s*\n\s*schedulePrebuild\(\); \/\/ rebuild every off-screen view/);
+  assert.match(RENDER, /cancelPrebuild\(\);[\s\S]*showActive\(keep\);\s*\n\s*schedulePrebuild\(\); \/\/ rebuild every off-screen view/);   // rerenderAll hands showActive the anchor it captured before the clear (T249 review fold)
 });

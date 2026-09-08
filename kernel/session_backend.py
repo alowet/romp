@@ -29,6 +29,21 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 
+def echo_text_key(text) -> str:
+    """The one rule under which an input echo's text and a transcript record's user text are compared:
+    outer whitespace stripped, nothing else. Every reader shares it and must agree: the kernel's
+    _atom_user_text(s) (the keys of the `tx_user_texts` mapping prune_live receives, and the sets the
+    queued fold, _merge_live_atoms, _comments_frame and _tmux_echo_prune compare against),
+    SdkBackend.prune_live's by-text retire (the echo side of that comparison), and SdkBackend._text_landed
+    / _landed_texts (the transcript scan behind the boot and dead-spawn duplicate guard). Until 2026-09-06
+    the scan collapsed internal whitespace while the prune compared the raw echo text against stripped
+    keys, so a send whose text carried a trailing newline (`romp send` passes its argument verbatim) was
+    FOUND by the scan, neither re-fed nor flagged, and never pruned or dismissable. Strip is as wide as
+    the data needs: the CLI stores user text verbatim (checked against recorded SDK transcripts,
+    2026-09-06 — double spaces, bare CRs and line-trailing blanks all preserved). Not a str → ""."""
+    return text.strip() if isinstance(text, str) else ""
+
+
 class SessionBackend(ABC):
     # True when busy() may be overruled by the cached transcript parse, so the parked-op drain must keep that
     # parse current for a sid before it reads busy() (_refresh_parked_parse); a backend whose busy() is the
@@ -109,9 +124,20 @@ class SessionBackend(ABC):
         + its inputs() generator). The kernel then hands composer sends straight to send() the instant they
         arrive (the user 2026-07-17, who wanted them in as soon as possible), instead of parking them itself.
         False (default) means the backend has no such queue, so the kernel holds sends while a turn runs and
-        merges them into one message at turn end (tmux). Slash-command drive ops (/compact, /model, /effort)
-        still park in the kernel FIFO on BOTH backends to preserve press-order — this flag governs plain text
-        sends only."""
+        merges them into one message at turn end (tmux). Slash-command drive ops (/compact, /effort, …) still
+        park in the kernel FIFO on BOTH backends to preserve press-order — this flag governs plain text sends
+        only; a model pick has its own capability, model_switches_live."""
+        return False
+
+    def model_switches_live(self) -> bool:
+        """True if a model pick may be applied to a RUNNING session mid-turn — then the kernel fires it into
+        an open turn instead of parking it in the FIFO until the turn ends (PR #923). False (default) means
+        the pick waits for the turn: tmux TYPES /model into the pane; Codex's set_model lands at the next
+        turn_start while its sends steer the live turn, so a send typed after a mid-turn pick would reach
+        the OLD model first; and the SDK, whose set_model does ride the CLI's control channel, still says
+        False because the CLI mis-parents a mid-turn switch's transcript breadcrumbs and orphans the rest of
+        the turn (see SdkBackend.model_switches_live for the evidence and the flip conditions). Deliberately
+        distinct from forwards_sends: forwarding a plain send says nothing about how a model change applies."""
         return False
 
     @abstractmethod

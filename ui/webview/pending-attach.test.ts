@@ -88,7 +88,7 @@ test("a kernel restart between ship and ack RE-SHIPS the retained bytes on recon
   assert.match(RENDER, /interface PendingShip \{ name: string; shipId: string; b64\?: string \}/);
   assert.match(RENDER, /if \(entry\) entry\.b64 = b64;/);
   assert.match(RENDER, /function reshipPendingUploads\(hosts\?: readonly string\[\]\): void \{/);
-  assert.match(RENDER, /window\.addEventListener\("romp:wsup", \(\) => reshipPendingUploads\(\)\);/);
+  assert.match(RENDER, /window\.addEventListener\("romp:wsup", \(\) => \{\n  reshipPendingUploads\(\);/);   // the listener grew a body (T246: the local active-tab re-arm rides it too)
   // an entry still ENCODING has no payload — its own onload ships on the fresh socket, never doubled
   assert.match(RENDER, /if \(!p\.b64\) continue;/);
   // the re-ship rides the same dropFile shape, same shipId, routed to the owning session

@@ -1,7 +1,8 @@
 // TAG DRAG-TO-REORDER (the user 2026-08-25): grab a pill in the Sessions & tags dialog's tag
 // table to put the tags in your order. The drop writes tagOrder — the union DISPLAY order,
 // viewer-side, so a REMOTE-HOMED tag holds its dragged position without any cross-kernel write —
-// and re-sorts the local tags array to match (the natural store for local-only readers). This
+// and the posted local tags array re-sorts to match (over the socket the kernel orders the stored
+// array by the write's tagOrder itself; on the Electron path the posted blob is the file). This
 // EXECUTES the drag over the house fake-DOM shim: dialog open, pointer capture, cue math, drop,
 // and asserts the posted blob + that a rebuild from that blob (the reload) keeps the order.
 import { test } from "node:test";

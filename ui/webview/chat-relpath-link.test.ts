@@ -27,7 +27,7 @@ test("a relative path click carries the active session id so whoever resolves it
   assert.match(RENDER, /function openPathLink\(raw: string, open: string, relative = false\)/);
   // relative → send the session id; absolute/file:// → none needed. Both go through openPath, which
   // picks the host (VS Code editor vs the feed pane's viewer) — see the openPath test below.
-  assert.match(RENDER, /openPath\(open, relative \? activeId : null\);/);
+  assert.match(RENDER, /openPath\(open, relative \? activeId : null, e\);/);   // + the click itself: a modified click on a PDF takes a browser tab (pdf-new-tab.test.ts)
 });
 
 test("the cheap pre-filter keys on a slash — or, inside inline code, a dot", () => {

@@ -80,7 +80,7 @@ var GEAR_HTML =
   '</span></label>' +
   "<label class='rs-row'><input type=checkbox id=rs-suggestcompact>" +
   '<span><b>Suggest /compact</b><span class=rs-mixed hidden></span>' +
-  '<span class=rs-sub>When a session has been idle over an hour with a lot of context built up (first past 400k tokens, again past 800k), send it ONE suggestion to /compact at a natural boundary — its call, once per fill-up. Never sent to workers, muted sessions, or anything mid-turn. Off by default for a fresh install; this kernel keeps its own copy.</span>' +
+  '<span class=rs-sub>When a session has been idle over an hour with a lot of context built up (first past 400k tokens, again past 800k), send it ONE suggestion to /compact at a natural boundary — its call, once per fill-up. Never sent to muted sessions or anything mid-turn. Off by default for a fresh install. Applies on every connected machine’s kernel.</span>' +
   '</span></label>' +
   "<label class='rs-row'><input type=checkbox id=rs-conserve>" +
   '<span><b>Conserve memory</b><span class=rs-mixed hidden></span>' +
@@ -447,9 +447,9 @@ function initGear(post) {
   // applies by it and stands a stale flush down instead of walking the mesh back to an hours-old
   // pick (a frozen tab's flush did exactly that). Stamp in the message literal, never at send/flush
   // time.
-  // Thinking summaries and Suggest /compact are kernel-side but PER-INSTALL: each post goes to the
-  // LOCAL kernel only — deliberately not in federation's KERNEL_SETTING set (gear.test.ts pins the
-  // membership), so neither queues for or reaches another machine. Stamped all the same: two
+  // Thinking summaries is kernel-side but PER-INSTALL: the post goes to the LOCAL kernel only —
+  // deliberately not in federation's KERNEL_SETTING set (thinking-summaries.test.ts pins the
+  // membership), so it neither queues for nor reaches another machine. Stamped all the same: two
   // dashboards on one kernel still race, and the kernel orders every setting by `gt`.
   if (ths) ths.addEventListener('change', function () { post({ type: 'setThinkingSummaries', enabled: ths.checked, gt: gclock.stamp('thinking-summaries') }); });
   // Auto Nudge / judge tiers are SERVER-SIDE (the kernel runs them): post the
@@ -887,6 +887,9 @@ function initGear(post) {
   // machine, the name the gear already uses for it.
   var staleOpen = {};   // 'setting:gt' → { t: the toast node, hosts: [...], refused: the value in words } while the toast is up
   function staleHost(m) { return (typeof m.host === 'string' && m.host) ? m.host : 'this machine'; }
+  // The kernel's reason a write was refused OUTRIGHT as a clause for the copy: its file could not be READ, or
+  // (a `why` starting "write failed:", the fold on PR #1019) WRITTEN — one clause per cause; absent on a stand-down
+  function staleWhy(m) { return (typeof m.why === 'string' && m.why) ? ' Its settings file could not be ' + (m.why.indexOf('write failed:') === 0 ? 'written' : 'read') + ' (' + m.why + ').' : ''; }
   function staleLive(t) { return !!t.parentNode && !(t.classList && t.classList.contains('fade')); }
   // Apply anyway re-issues the frame's echoed gesture as a NEW one, stamped above everything this
   // page has seen (the frame's storedGt included, learned just before): a fresh click is legitimate
@@ -911,11 +914,15 @@ function initGear(post) {
     var key = typeof m.gt === 'number' ? m.setting + ':' + m.gt : '';
     var live = key && staleOpen[key] && staleLive(staleOpen[key].t) ? staleOpen[key] : null;
     var where = staleHost(m);
+    // A write the kernel refused because it could not READ the setting's file (the frame carries `why`) is
+    // not an ordering race: re-issuing the gesture cannot succeed while the file is unreadable, so that
+    // toast offers no Apply anyway and says why instead (review find on #1018, 2026-09-08)
+    var why = staleWhy(m);
     if (live) {   // the same gesture, refused by one more kernel: add the host to the toast on screen
       if (live.hosts.indexOf(where) < 0) live.hosts.push(where);
-      live.t.querySelector('.rs-stale-toast-msg').textContent = staleText(label, live.refused || refused, kept, live.hosts);
+      live.t.querySelector('.rs-stale-toast-msg').textContent = staleText(label, live.refused || refused, kept, live.hosts) + why;
     } else {
-      var t = staleToast(staleText(label, refused, kept, [where]), staleAction(m, refused));
+      var t = staleToast(staleText(label, refused, kept, [where]) + why, why ? null : staleAction(m, refused));
       if (key) staleOpen[key] = { t: t, hosts: [where], refused: refused };
     }
     if (!p.hidden) fill();   // the open modal re-reads the kernel's values so it stops showing the refused pick
