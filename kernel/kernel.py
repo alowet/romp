@@ -7328,9 +7328,6 @@ def _parked_quiet_deploy(checkout, now=None):
     """The `t` of a QUIET deploy request still pending for the code the checkout holds, else 0
     (T240d): the newest restart-requesting audit row is a p2p-update (a peer's apply, which advanced
     the checkout and asked the manager for a quiet restart) or a main-converge with when=quiet, its
-    — since T269 a new peer's apply asks for an IMMEDIATE bounce and writes no when=quiet, so it
-    parks nothing here (its restart lands within the manager's ack, inside one drift cadence); the
-    quiet rows this reads now come from older peers, a quiet converge and `romp refresh --quiet` —
     sha is the checkout's, no cut row has consumed it (auditT), and it is inside the window a quiet
     request stays pending — the far manager's backstop bound, exactly what _recent_restart_audit
     already gives such a row for cut attribution. So a park lost with its manager self-heals at that
@@ -7338,7 +7335,10 @@ def _parked_quiet_deploy(checkout, now=None):
     function's own. The p2p row's sha rides its reason ("from <host> to <sha>"); the converge row
     carries `sha` outright, and so does the CLI's `romp refresh --quiet` row, which names no action
     (bin/romp's caller-attribution row, review find: that door parked a quiet restart the check
-    pre-empted just the same); a quiet row naming no sha matches nothing (never guess)."""
+    pre-empted just the same); a quiet row naming no sha matches nothing (never guess). Since T269 a
+    peer's apply asks for an IMMEDIATE bounce and writes no when=quiet, so it parks nothing here (its
+    restart lands within the manager's ack, inside one drift cadence); the quiet rows this reads come
+    from peers still on older code, a quiet converge and `romp refresh --quiet`."""
     rec = _recent_restart_audit(now=now)
     if not isinstance(rec, dict) or rec.get("when") != "quiet" or not checkout:
         return 0

@@ -141,7 +141,7 @@ class UpdateRemote(unittest.TestCase):
                         "pkill is the fallback AFTER the manager path, never the first move")
         exp = km._remotes["TESTHOST"].get("restartExpected")
         self.assertTrue(exp and exp.get("sha") == self.LFULL and exp.get("t") and exp.get("quiet") is False,
-                        "the dialing side expects the restart it just caused, on the immediate window")
+                        "the dialing side expects the restart it just caused; quiet is recorded, not read")
 
     def test_every_deploy_restart_is_immediate_and_only_refresh_quiet_defers(self):
         # T269, the three deploy callers: a peer's p2p update (the apply script above), a release
