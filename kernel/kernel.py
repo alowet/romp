@@ -43040,6 +43040,8 @@ _LANDING_MOBILE_JS = """
 // (the user 2026-08-19, in Firefox), so any scale arithmetic is a Chrome-ism there. The visual
 // viewport drives the fit only where its problems live — the coarse-pointer mobile world of soft
 // keyboards and collapsing toolbars — where height*scale keeps a mobile pinch from re-fitting too.
+// Every run recomputes from scratch — never adjusts a stored value — so a viewport that grows back
+// (keyboard gone, app back in front) can never leave a stale, shorter --app-h behind.
 function fit(){try{var vv=window.visualViewport;
 var coarse=window.matchMedia&&matchMedia('(pointer: coarse)').matches;
 var h=(!coarse||!vv)?window.innerHeight:Math.round(vv.height*(vv.scale||1));
@@ -43047,16 +43049,8 @@ if(h)document.documentElement.style.setProperty('--app-h',h+'px');
 // iOS ignores interactive-widget and reveals a focused input by SCROLLING this overflow:hidden page
 // (a UA scroll bypasses the clamp) — the shell then sits a keyboard-height up until dragged back
 // (the user 2026-09-02). The layout must never scroll: undo any stray offset on the same events.
-if(window.scrollY||document.documentElement.scrollTop)window.scrollTo(0,0);}catch(e){}}
-fit();window.addEventListener('resize',fit);window.addEventListener('orientationchange',fit);
-// iOS Safari collapses/expands its toolbars AS YOU SCROLL, and the visible height changes with them
-// without a window resize; the visual viewport's own scroll event is where that settles. pageshow covers
-// a restore from the back/forward cache, which hands back the height the page had when it was frozen.
-// (the user 2026-07-29, whose iPad clipped the bottom off with the toolbars showing.)
-window.addEventListener('pageshow',fit);
-if(window.visualViewport){window.visualViewport.addEventListener('resize',fit);
-window.visualViewport.addEventListener('scroll',fit);}
-var bar=document.getElementById('mtabs');if(!bar)return;
+if(window.scrollY||document.documentElement.scrollTop)window.scrollTo(0,0);
+barfit();}catch(e){}}
 // The bar is position:fixed (glued to the viewport bottom), so it's out of flow — reserve its real
 // rendered height (button text + padding) on .col as --mtabs-h so the iframes tile above it and the
 // fixed bar never covers the chat composer. Re-measure on resize/orientation (font metrics can shift).
@@ -43064,10 +43058,41 @@ var bar=document.getElementById('mtabs');if(!bar)return;
 // dead black band between the composer and the keyboard (the user 2026-07-22) — collapse the reservation
 // to 0 so the chat pane extends flush above the keyboard, and restore it when the keyboard closes. The
 // keyboard is open when the visual viewport is much shorter than the layout viewport (event: vv resize).
+// Measured by fit() itself since 2026-09-08: the two vars describe ONE geometry and went stale together.
 function kbOpen(){var vv=window.visualViewport;return vv?(window.innerHeight-vv.height*(vv.scale||1)>120):false;}
-function barfit(){try{document.documentElement.style.setProperty('--mtabs-h',(kbOpen()?0:(bar.offsetHeight||0))+'px');}catch(e){}}
-barfit();window.addEventListener('resize',barfit);window.addEventListener('orientationchange',barfit);
-if(window.visualViewport){window.visualViewport.addEventListener('resize',barfit);}
+function barfit(){try{var bar=document.getElementById('mtabs');if(!bar)return;
+document.documentElement.style.setProperty('--mtabs-h',(kbOpen()?0:(bar.offsetHeight||0))+'px');}catch(e){}}
+// ONE fit per animation frame, however many events a keyboard slide or a resume fires: rAF is the
+// frame the browser is about to paint, not a timer, so a burst coalesces and nothing is deferred past
+// the next paint. The boot fit below stays synchronous so the first paint is already right.
+var fitRaf=0;
+function refit(){if(fitRaf)return;if(!window.requestAnimationFrame){fit();return;}
+fitRaf=window.requestAnimationFrame(function(){fitRaf=0;fit();});}
+fit();window.addEventListener('resize',refit);window.addEventListener('orientationchange',refit);
+// iOS Safari collapses/expands its toolbars AS YOU SCROLL, and the visible height changes with them
+// without a window resize; the visual viewport's own scroll event is where that settles. pageshow covers
+// a restore from the back/forward cache, which hands back the height the page had when it was frozen.
+// (the user 2026-07-29, whose iPad clipped the bottom off with the toolbars showing.)
+window.addEventListener('pageshow',refit);
+// The installed iPhone app came back from the background keyboard-short (the user 2026-09-08): the
+// chat pane filled the top ~60% of the screen, the composer sat mid-screen, and a keyboard-tall blank
+// band ran down to the tab bar. --app-h had been measured with the keyboard up and nothing re-measured
+// it: iOS dropped the keyboard while the page was frozen, so the visual viewport's resize — the only
+// keyboard event the fit knew — never arrived, and iOS also skips that resize at times for a keyboard
+// the composer's blur dismissed. So bind every event that moves the real viewport: the return to the
+// foreground (visibilitychange → visible, window focus), and a blur out of any input (focusout) — the
+// composer's, heard through the same-origin chat pane's window below, since a focus event never
+// crosses the frame boundary. iOS reports the final geometry a beat after visibilitychange; the visual
+// viewport's resize is bound for good, so when that beat lands the fit runs again — no timer.
+window.addEventListener('focus',refit);
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible')refit();});
+document.addEventListener('focusout',refit);
+if(window.visualViewport){window.visualViewport.addEventListener('resize',refit);
+window.visualViewport.addEventListener('scroll',refit);}
+function hearBlur(f){try{if(!f.contentDocument)return;f.contentWindow.addEventListener('focusout',refit);}catch(e){}}   // cross-origin → nothing to hear
+['f-chat','f-fleet','f-feed','f-timeline'].forEach(function(id){var f=document.getElementById(id);if(!f)return;
+f.addEventListener('load',function(){hearBlur(f);});hearBlur(f);});   // now (already loaded) + on every (re)load, as the Alt+Arrow wiring does
+var bar=document.getElementById('mtabs');if(!bar)return;
 var F={chat:document.getElementById('f-chat'),fleet:document.getElementById('f-fleet'),feed:document.getElementById('f-feed'),timeline:document.getElementById('f-timeline')};
 var B=bar.querySelectorAll('button'),KT='romp-mobile-tab';
 function show(p){if(!F[p])return;document.body.setAttribute('data-tab',p);for(var k in F)F[k].classList.toggle('m-on',k===p);
