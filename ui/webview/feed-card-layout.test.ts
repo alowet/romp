@@ -23,7 +23,7 @@ test("COMPACTNESS (the user 2026-07-07; action corner 2026-08-08): time trails t
   assert.match(FEED, /row1\.append\(btns\);/, "the corner floats from the END of row1's flow (title+time keep first claim)");
   assert.match(FEED, /row2\.append\(idwrap, retryBadge, apiBadge, apiRetry, apiLogin, capLine, capBtn, jauthBadge, blkBadge, origin, fupBadge, dcBadge, nfBadge, intingBadge, intBadge, warnChip, waitOnBadge\)/, "ask card: the name row is identity + chips only");
   // its tooltip is plain-spoken (the user 2026-07-13): "clear this task", not the inbox-zero jargon
-  assert.match(FEED, /clr\.title = "clear this task";/);
+  assert.match(FEED, /const clr = clearButton\("clear this task"\);/, "the card's Clear comes from the one shared builder (2026-09-08)");
   assert.match(FEED, /btns\.append\(clr\);\s*\n\s*row1\.append\(btns\);\s*\n\s*row2\.append\(idwrap\);/, "group card: Clear in row1's action corner, name row is the name only");
   // the group card has no row3 anymore (its only content, the time, moved to row1)
   assert.match(FEED, /main\.append\(row1, row2, memberList\)/, "group card: no row3 (time moved to row1)");

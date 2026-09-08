@@ -689,6 +689,16 @@ let canUndoClear = false;   // host: cleared.jsonl has rows → the UndoClear bu
 // from there instead of appearing from nowhere. Rebuilt every render.
 let prevItemKey = new Map<string, string>();
 
+// ONE builder for every Clear on the feed (the user 2026-09-08): the card's, the turn-group's and the
+// session header's wear the same element, class set, label and hover, so they cannot drift apart. Callers
+// add behaviour (an onclick, a data-act) and, for the header, a layout-only positional class.
+function clearButton(title: string): HTMLElement {
+  const b = el("button", "fdismiss");
+  b.textContent = "Clear";
+  b.title = title;
+  return b;
+}
+
 function el(tag: string, cls?: string): HTMLElement {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
@@ -1080,7 +1090,7 @@ function makeAskCard(it: AskItem): HTMLElement {
   // The header "awaiting" chip was REMOVED (the user 2026-07-04): it duplicated the "Awaiting background
   // agents" box in the card body, which says the same thing with room for the full "why" — so the chip was
   // pure redundancy. The awaiting state now reads only from that body box (see the awaitSpin block below).
-  const clr = el("button", "fdismiss"); clr.textContent = "Clear"; clr.title = "clear this task";   // plain-spoken (the user 2026-07-13, over the inbox-zero jargon)
+  const clr = clearButton("clear this task");   // plain-spoken (the user 2026-07-13, over the inbox-zero jargon)
   // "Continue" (the user 2026-08-08): the needs-you card's one-click "nothing needed from me, keep
   // going" — a REPLY with a kernel-canned body (askFollowUp cont:true), never a bare column move (the
   // removed cardMove is the cautionary tale: a move with no message adds no information). The card
@@ -2472,7 +2482,7 @@ function makeGroupCard(g: AskGroup): HTMLElement {
   const idwrap = el("div", "fask-id");
   const name = el("a", "fname"); name.title = "open this session";
   idwrap.append(name);   // no "· N parts" label — the member checklist below already shows the count
-  const clr = el("button", "fdismiss"); clr.textContent = "Clear"; clr.title = "clear ALL sub-asks of this request (inbox-zero)";
+  const clr = clearButton("clear ALL sub-asks of this request (inbox-zero)");
   // Clear rides row1's action corner in every mode (the user 2026-08-08) — matches the ask card. Same
   // fask-btns wrapper so the float/wrap CSS is shared; no Continue here (a group is a multi-ask turn —
   // its members carry their own).
@@ -3439,8 +3449,10 @@ function makeSessHead(): HTMLElement {
   // the group clear uses instead of a confirm dialog. The action is DELEGATED on the stable columns root
   // (data-act, installed once where the root is built) — never bound to this header node, which grouped
   // mode re-homes and re-renders; the header only says which session it stands for (data-fsid).
-  const clr = el("button", "feed-sess-clear"); clr.textContent = "Clear";
-  clr.title = "clear every card for this session"; clr.dataset.act = "sess-clear"; clr.style.display = "none";
+  // THE card's Clear, built by the same builder (the user 2026-09-08: same size, the outline, blue on hover),
+  // plus one positional class that carries layout only (far right of the row) — never a lookalike
+  const clr = clearButton("clear every card for this session");
+  clr.classList.add("feed-sess-clear"); clr.dataset.act = "sess-clear"; clr.style.display = "none";
   h.append(nm, fold, cnt, svc, clr, svcList);
   (h as any)._name = nm; (h as any)._fold = fold; (h as any)._foldn = cnt;
   (h as any)._svc = svc; (h as any)._svcList = svcList; (h as any)._clear = clr;
