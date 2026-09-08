@@ -34477,7 +34477,7 @@ def _bind_message_execs(messages, turns):
 JUDGE_CAP_LIMIT = 80   # most-recent caption marks kept per session (the view merges adjacent marks anyway)
 
 
-def _derive_judging(sid, caps, goals, t0, out, seg_ends=None):
+def _derive_judging(sid, caps, goals, t0, out, seg_ends=None, stamp=False):
     """Append this session's JUDGE-activity marks to `out` — the second-timeline (data.judging) feed,
     read from the real artifacts the summarizer judges write (docs/judges.md):
       captioner ← captions/<sid>.jsonl   (one mark per segment/turn unit)
@@ -34495,11 +34495,19 @@ def _derive_judging(sid, caps, goals, t0, out, seg_ends=None):
     maps each segment's start t → its work-END t; a completion mark resolves through it to land just
     after the bar, where the work actually finished. CREATION marks (mint/sub) + captions stay at the
     start — a goal IS born when asked. Absent seg_ends (e.g. unit tests) → the old mt placement."""
+    # `stamp` (the dead-lane memo, 2026-09-08): every mark carries the value the horizon test compared
+    # under the private key "_h", so a lane cached once with t0 = 0 can be filtered later on exactly that
+    # value (the diary and distiller marks are COMPARED on their evidence time but EMITTED at the segment's
+    # work end, so a filter on the emitted `t` would not be the same set); _dead_lane_marks strips it.
+    def mark(h, m):
+        if stamp:
+            m["_h"] = h
+        out.append(m)
     endt = (lambda tt: seg_ends.get(tt, tt)) if seg_ends else (lambda tt: tt)   # completion → its segment's work-END
     caps_in = sorted((c for c in caps.values() if c.get("t") and c["t"] >= t0), key=lambda c: c["t"])
     for c in caps_in[-JUDGE_CAP_LIMIT:]:
-        out.append({"judge": "captioner", "sid": sid, "t": c["t"],
-                    "kind": c.get("grain", "segment"), "text": c.get("caption", "")})
+        mark(c["t"], {"judge": "captioner", "sid": sid, "t": c["t"],
+                      "kind": c.get("grain", "segment"), "text": c.get("caption", "")})
     for n in goals.get("nodes", {}).values():
         t = n.get("t")
         if not t:
@@ -34511,19 +34519,19 @@ def _derive_judging(sid, caps, goals, t0, out, seg_ends=None):
             # the grouper's surviving housekeeping (T103): merge/split/retitle append no diary
             # events by design, so the lane keys on the apply-time structure stamp — additive
             # beside the node's own mint/plant mark (a merged survivor is both)
-            out.append({"judge": "grouper", "sid": sid, "t": go["t"],
-                        "kind": go.get("kind") or "group", "text": text})
+            mark(go["t"], {"judge": "grouper", "sid": sid, "t": go["t"],
+                           "kind": go.get("kind") or "group", "text": text})
         if n.get("origin"):                                   # courier planted it from a peer's handoff
             if t >= t0:
-                out.append({"judge": "courier", "sid": sid, "t": t, "kind": "plant", "text": text})
+                mark(t, {"judge": "courier", "sid": sid, "t": t, "kind": "plant", "text": text})
         elif n.get("umbrella"):                               # ARCHIVED-history rendering only (T101
             # retired every umbrella mint; live containers dissolve each rollup) — an archived
             # pre-T101 container still shows the grouper mark it earned
             if mt >= t0:
-                out.append({"judge": "grouper", "sid": sid, "t": mt, "kind": "group", "text": text})
+                mark(mt, {"judge": "grouper", "sid": sid, "t": mt, "kind": "group", "text": text})
         elif t >= t0:                                         # planner placed it (top = mint, else a step)
-            out.append({"judge": "planner", "sid": sid, "t": t,
-                        "kind": ("mint" if not n.get("parentId") else "sub"), "text": text})
+            mark(t, {"judge": "planner", "sid": sid, "t": t,
+                     "kind": ("mint" if not n.get("parentId") else "sub"), "text": text})
         # done/block attribution reads the DIARY now (P3.4 2026-07-07): the event's src field IS the
         # provenance (negComplete/negBlock flags retired), each verdict gets its own mark at its own
         # evidence time, and reconstructed (synth) history never fakes a judging mark.
@@ -34531,33 +34539,75 @@ def _derive_judging(sid, caps, goals, t0, out, seg_ends=None):
             if _e.get("synth") or (_e.get("ev_t") or 0) < t0:
                 continue
             if _e.get("src") in ("planner", "closer") and _e.get("kind") in ("done", "block"):
-                out.append({"judge": _e["src"] if _e["src"] == "planner" else "closer", "sid": sid,
-                            "t": endt(_e["ev_t"]),
-                            "kind": ("done" if _e["src"] == "planner" else "close") if _e["kind"] == "done" else "block",
-                            "text": _e.get("why") or text})
+                mark(_e["ev_t"], {"judge": _e["src"] if _e["src"] == "planner" else "closer", "sid": sid,
+                                  "t": endt(_e["ev_t"]),
+                                  "kind": ("done" if _e["src"] == "planner" else "close") if _e["kind"] == "done" else "block",
+                                  "text": _e.get("why") or text})
         # distiller — key takeaway on a completed top goal. distilledMt == the goal's completion mt (the
         # completing segment's START); endt() lands the mark at that segment's work-END, just after the bar.
         # (The distiller LLM runs a pass later; the mark shows the work it summarizes, aligned to that work's
         # finish, not the judge's wall-clock run. A first sweep over the backlog still back-dates to old
         # completions, expected — the user 2026-06-17.)
         if n.get("distilledMt") and n["distilledMt"] >= t0:
-            out.append({"judge": "distiller", "sid": sid, "t": endt(n["distilledMt"]), "kind": "distill",
-                        "text": n.get("summary") or text})
+            mark(n["distilledMt"], {"judge": "distiller", "sid": sid, "t": endt(n["distilledMt"]), "kind": "distill",
+                                    "text": n.get("summary") or text})
         # block-distiller — the DECISION BRIEF on a BLOCKED top (briefedMt), the done-distiller's twin run
         # in the same pass. Same distiller row, a distinct kind ("brief"). Without this the brief popped up
         # on the card but left NO mark on the timeline, so the distiller row read as dead whenever the
         # recent work was blocks rather than completions (the user 2026-06-18). Lands at the block segment's
         # work-END via endt(), like the other completion marks.
         if n.get("briefedMt") and n["briefedMt"] >= t0:
-            out.append({"judge": "distiller", "sid": sid, "t": endt(n["briefedMt"]), "kind": "brief",
-                        "text": n.get("blockSummary") or text})
+            mark(n["briefedMt"], {"judge": "distiller", "sid": sid, "t": endt(n["briefedMt"]), "kind": "brief",
+                                  "text": n.get("blockSummary") or text})
     try:                                                      # archiver — the headline/abstract refresh
         arch = json.loads((jd.STATE / "archive" / (sid + ".json")).read_text(errors="replace"))
         if arch.get("t") and arch["t"] >= t0:
-            out.append({"judge": "archiver", "sid": sid, "t": arch["t"], "kind": "index",
-                        "text": arch.get("headline", "")})
+            mark(arch["t"], {"judge": "archiver", "sid": sid, "t": arch["t"], "kind": "index",
+                             "text": arch.get("headline", "")})
     except (OSError, ValueError):
         pass
+
+
+# ── the DEAD-LANE memo (2026-09-08): a timeline lane whose session is dead is re-derived only when an
+# input moves. The full build ran every cycle (the fleet signature's 5 s bucket turns over faster than a
+# 6 s cycle), and every rebuild parsed every lane's transcript and goals again — dead lanes included, the
+# majority within the 12 h window, none of which had changed. The memo holds the PARSE-DERIVED parts of a
+# dead lane (bars, compactions, the work end, and its judging marks stamped for the horizon filter) under a
+# key of every file they read; the clock-dependent parts (awaiting/compacting intervals, `since`) are
+# derived per build as before, so a cached lane's frame is byte-identical to a rebuilt one. Once a dead
+# lane is cached, its PARSE is dropped from _parse_cache: nothing else reads a dead session's parse per
+# cycle, and those parses were the bulk of a multi-GB resident set (a 166 MB transcript parses to ~220 MB).
+_dead_lane_memo = {}      # sid -> (key, {"bars", "compactions", "last_t", "marks"})
+_DEAD_LANE_MEMO_MAX = 512
+
+
+def _stat_key(p):
+    try:
+        st = os.stat(p)
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        return None
+
+
+def _dead_lane_key(sid, path, branch):
+    """Every input the parse-derived parts of a dead lane read: the transcript and its states file (the
+    parse), the goals store (seams, judging), the captions and the archive (judging), the session flags
+    (the blocked state), and the branch clip. None when the transcript cannot be stat'd (never cache)."""
+    tk = _stat_key(path)
+    if tk is None:
+        return None
+    return (tk, _stat_key(jd.STATE / "states" / (sid + ".jsonl")), _stat_key(jd.GOALDIR / (sid + ".json")),
+            _stat_key(jd.STATE / "overrides" / (sid + ".jsonl")),   # the store's user-override journal, replayed on load
+            _stat_key(jd.CAPDIR / (sid + ".jsonl")),                # the file _captions(sid) reads
+            _stat_key(jd.STATE / "archive" / (sid + ".json")),
+            _stat_key(jd.STATE / "session-flags.json"),
+            (branch or {}).get("fromId"), (branch or {}).get("t"), (branch or {}).get("cut"))
+
+
+def _dead_lane_marks(marks, t0):
+    """The cached marks a build at horizon `t0` would have derived: filtered on the stamped compare value
+    and handed out without it, as fresh dicts (the frame is serialized and the memo's are shared)."""
+    return [{k: v for k, v in m.items() if k != "_h"} for m in marks if m.get("_h", 0) >= t0]
 
 
 _session_tok_cache = {}   # transcript path -> ((mtime, size), [(t, in, out, cache_w, cache_r, model), ...]): one
@@ -35167,7 +35217,17 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
         goals, gfault = jd.load_goals_shared_or_fault(sid)   # read-only view (seams + judging marks); a FAULT (row
         if gfault is not None:                       # filed) → None: this lane renders without goal-derived data
             _bars_complain(sid, "goals", gfault)     # (blocked state, seams, marks) and the frame ships for every other lane
-        if with_bars:
+        # a DEAD lane's parse-derived parts are served from the memo while every input they read stands
+        # (see _dead_lane_memo); a goals fault is never cached (the lane's marks are missing, loudly)
+        lane_key = _dead_lane_key(sid, s["path"], branch_of.get(sid)) if (with_bars and not live and gfault is None) else None
+        lane_hit = _dead_lane_memo.get(sid) if lane_key is not None else None
+        if lane_hit is not None and lane_hit[0] != lane_key:
+            lane_hit = None
+        if lane_hit is not None:
+            cached = lane_hit[1]
+            session = None; caps = {}; st_turns = []; open_now = False
+            _VIEW_STATS["laneServe"] = _VIEW_STATS.get("laneServe", 0) + 1
+        elif with_bars:
             try:
                 session = _parse(s["path"], sid, now)
             except Exception as e:
@@ -35236,6 +35296,8 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
             state = "needsInput" if blocked else "idle"   # muted → no awaiting/background-task badge on the lane
             aw_open = open_now                          # unused (awaitingBg is None for a dead lane) — kept defined
         bars, last_t, seg_ends = [], None, {}            # seg_ends: seg-start t → work-END t (for completion marks)
+        if lane_hit is not None:
+            bars, last_t = cached["bars"], cached["last_t"]
         for ti, turn in enumerate(st_turns):
             turn_open = (live and ti == len(st_turns) - 1 and not turn["ended"]
                          and not any(x["type"] == "idle" for x in turn["atoms"])
@@ -35295,17 +35357,40 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
                 last_t = os.stat(s["path"]).st_mtime     # lane `since` ≈ the transcript's last write (last activity), no parse
             except OSError:
                 pass
-        if with_bars:
+        _bft = (branch_of.get(sid) or {}).get("t")
+        if lane_hit is not None:
             turns[sid] = bars
+            semantic.extend(_dead_lane_marks(cached["marks"], now - TL_HORIZON))
+            compactions = cached["compactions"]
+        elif with_bars:
+            turns[sid] = bars
+            marks = []
             try:
                 if goals is not None:
-                    _derive_judging(sid, caps, goals, now - TL_HORIZON, semantic, seg_ends)
+                    # a dead lane's marks are derived ONCE at horizon 0 and stamped, so the memo can filter
+                    # them per build on exactly the value this call would have compared (_dead_lane_marks)
+                    if lane_key is not None:
+                        _derive_judging(sid, caps, goals, 0, marks, seg_ends, stamp=True)
+                        semantic.extend(_dead_lane_marks(marks, now - TL_HORIZON))
+                    else:
+                        _derive_judging(sid, caps, goals, now - TL_HORIZON, semantic, seg_ends)
             except Exception as e:
                 _bars_complain(sid, "judging-marks", e)   # this lane loses its marks, the frame ships
-        _bft = (branch_of.get(sid) or {}).get("t")
-        compactions = [{"t": a["t"]} for turn in st_turns for a in turn["atoms"]
-                       if a.get("type") == "system" and a.get("subtype") == "compact_boundary" and a.get("t")
-                       and not (_bft and a["t"] <= _bft)]           # copied boundaries stay on the parent's lane
+                lane_key = None                            # never cache a lane whose marks failed
+            compactions = [{"t": a["t"]} for turn in st_turns for a in turn["atoms"]
+                           if a.get("type") == "system" and a.get("subtype") == "compact_boundary" and a.get("t")
+                           and not (_bft and a["t"] <= _bft)]       # copied boundaries stay on the parent's lane
+            if lane_key is not None:
+                if len(_dead_lane_memo) > _DEAD_LANE_MEMO_MAX:      # bounded by the lane window; evict oldest-inserted
+                    _dead_lane_memo.pop(next(iter(_dead_lane_memo)))
+                _dead_lane_memo[sid] = (lane_key, {"bars": bars, "compactions": compactions, "last_t": last_t, "marks": marks})
+                # the parse has done its work for this dead lane: drop it (the RSS lever); a lane that moves
+                # re-parses once, and a session that revives is parsed by its chat build as before
+                _parse_cache.pop(s["path"], None)
+        else:
+            compactions = [{"t": a["t"]} for turn in st_turns for a in turn["atoms"]
+                           if a.get("type") == "system" and a.get("subtype") == "compact_boundary" and a.get("t")
+                           and not (_bft and a["t"] <= _bft)]       # copied boundaries stay on the parent's lane
         # Idle fade: the SAME rule the chat tab uses (ready + idle > 1h — see the `faded` beside the chat
         # chip), keyed on the DERIVED chip `state` computed above, not the raw tmux state. The old form read
         # tmux's vocabulary and counted "waiting" as active — but "waiting" IS the post-turn idle state, so
@@ -36302,13 +36387,23 @@ def _delta_key(kind, it, prefix=""):
     return _delta_keyer(kind)(it, prefix)
 
 
-def _delta_split(kind, value):
+_delta_entry_memo = {}   # (frame type, collection) -> {id(entry): (entry, json)} from the LAST split: an entry
+#                          object the builder reused (a memoized dead lane's bar dicts) is not encoded again
+
+
+def _delta_split(kind, value, memo_key=None):
     """Entries of one collection as {key: (object, json)} plus the key order, per the kind table above. A
     list item that cannot be keyed, or a duplicate key, takes a positional key ('#n') — exact, since the
-    shim rebuilds in key order, just less delta-friendly."""
+    shim rebuilds in key order, just less delta-friendly. With `memo_key`, an entry that is the SAME OBJECT
+    as one the previous split of that collection encoded takes its string from that split (the identity is
+    checked, never an id alone); the memo is rebuilt from this split's entries, so it never outgrows one
+    build (2026-09-08: the bars frame re-encoded every bar of every lane on every build, ~15 MB a cycle,
+    when only the live lanes' bars were new objects)."""
     ents, order = {}, []
     enc = json.JSONEncoder(default=_wire_default_in("_delta_split")).encode   # one encoder for the thousand entries, not one each
     key = _delta_keyer(kind)                            # …and the kind parsed once, not per item
+    prev = _delta_entry_memo.get(memo_key) if memo_key is not None else None
+    cur = {} if memo_key is not None else None
     def put(kk, v, pre=""):
         if kk is None or kk in ents:
             n = len(order)
@@ -36317,7 +36412,11 @@ def _delta_split(kind, value):
                 if kk not in ents:
                     break
                 n += 1
-        ents[kk] = (v, enc(v)); order.append(kk)
+        hit = prev.get(id(v)) if prev else None
+        js = hit[1] if (hit is not None and hit[0] is v) else enc(v)
+        if cur is not None:
+            cur[id(v)] = (v, js)
+        ents[kk] = (v, js); order.append(kk)
     if kind == "dict" and isinstance(value, dict):
         for kk, v in value.items():
             put(str(kk), v)
@@ -36340,6 +36439,8 @@ def _delta_split(kind, value):
         # something else, with no resync ever asked (review find, 2026-09-04). Unkeyable → the whole frame goes.
         raise ValueError("%s collection is a %s, not a %s" % (
             kind, type(value).__name__, "dict" if kind == "dict" or kind.startswith("dictlist:") else "list"))
+    if cur is not None:
+        _delta_entry_memo[memo_key] = cur
     return ents, order
 
 
@@ -36362,7 +36463,7 @@ def _delta_parts(ftype, payload):
                 continue
             _wire_bump("split_miss")
             try:
-                colls[name] = _delta_split(kind, value)
+                colls[name] = _delta_split(kind, value, memo_key=(ftype, name))
             except ValueError as e:
                 raise ValueError("%s: %s" % (name, e)) from None     # name the collection for the log line
             _delta_split_memo[(ftype, name)] = (value, colls[name])
