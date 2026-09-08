@@ -319,9 +319,12 @@ const order: string[] = [];           // positional tab order (for cycling)
 const pendingSent = new Map<string, PendingSend[]>();
 const isOptimistic = (e: ChatEvent): boolean => isOptimisticUuid(e.uuid);
 
-// The kernel's own queued group, if one is at the tail. Ours merges INTO it when present: the session is
-// provably holding messages, so this send will queue behind them — no reason to show it as a separate lone
-// bubble (the user 2026-07-16). Tail-scanned; a queued group only ever sits at the bottom.
+// The kernel's own queued group, if one is at the tail. Since T252 ours is never merged into it: a copy of
+// OUR text in it is hidden (hideQueuedCopy — one bubble per message, ours at its send slot), and
+// a group holding OTHER texts is a floor — a send pressed while they were queued runs after them, so its
+// bubble is drawn below the group (send-pending.ts placementIndex, T252b; the user's 2026-07-16 rule that
+// a send queues behind what the session already holds, kept in placement rather than by merging).
+// Tail-scanned; a queued group only ever sits at the bottom.
 function tailQueuedIdx(evs: ChatEvent[]): number {
   for (let i = evs.length - 1, n = 0; i >= 0 && n < 10; i--, n++) if (evs[i].kind === "queued") return i;
   return -1;

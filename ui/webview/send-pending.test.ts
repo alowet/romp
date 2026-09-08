@@ -205,7 +205,7 @@ test("several pending sends: each after its own anchor, in send order; same anch
   const none = press([], "hello");
   assert.deepEqual(injectionGroups([], reconcilePending([], none).inject), [{ idx: 0, sends: [none[0]] }]);
   // an anchor that left the resident window: everything resident is later than the send, so the slot is the head
-  assert.equal(scanFrom([{ kind: "tool", uuid: "zz" }], { after: "gone", place: null, seen: [], queued: 0 }), 0);
+  assert.equal(scanFrom([{ kind: "tool", uuid: "zz" }], { after: "gone", place: null, queuedForeign: [], seen: [], queued: 0 }), 0);
 });
 
 test("a send pressed while an earlier send's echo is the newest event is placed BELOW that echo (review of the first cut)", () => {
@@ -300,6 +300,69 @@ test("the text fallback finds the floor by ORDINAL, so a later send of the same 
   assert.equal(d.at?.placeOrd, 0, "no same-text event after the anchor: the floor is not in play");
   const stepsAfterLater: TailEvent[] = [...stepsAfter, { kind: "tool", uuid: "t3" }, { kind: "user", md: "ok", uuid: "echo:D" }];
   assert.deepEqual(injectionGroups(stepsAfterLater, reconcilePending(stepsAfterLater, [d]).inject), [{ idx: 3, sends: [d] }], "right after the anchor");
+});
+
+test("an earlier pending send's landing or echo is a floor for every later send, whatever its text (T252b)", () => {
+  // X then Y pressed against [a1], both with no floor; the kernel ships X's absorbed atom: Y's bubble must sit
+  // BELOW it. Landings were recorded into `seen` for same-text entries only and placement never read them, so Y
+  // was spliced before uX and read above the first message until it landed — the very move this work ends.
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
+  const [x, y] = press(tail, "first", "second");
+  assert.equal(y.at?.place, null);
+  let frame: TailEvent[] = [...tail, { kind: "user", md: "first", uuid: "uX", absorbed: true }, { kind: "tool", uuid: "t1" }];
+  let r = reconcilePending(frame, [x, y]);
+  assert.deepEqual(r.landed.map((l) => l.p), [x]);
+  assert.deepEqual(r.keep, [y]);
+  assert.deepEqual(y.floors, ["uX"], "X's landing is recorded as Y's floor");
+  assert.deepEqual(injectionGroups(frame, r.inject), [{ idx: 2, sends: [y] }], "below uX, above t1");
+  // the echo variant: X's echo arrives while both are pending — Y sits below it, and X is covered
+  const [x2, y2] = press(tail, "first", "second");
+  frame = [...tail, { kind: "user", md: "first", uuid: "echo:X" }];
+  r = reconcilePending(frame, [x2, y2]);
+  assert.deepEqual(r.inject, [y2]);
+  assert.deepEqual(y2.floors, ["echo:X"]);
+  assert.deepEqual(injectionGroups(frame, r.inject), [{ idx: 2, sends: [y2] }]);
+  // …and when that echo becomes the landed atom, the landing takes over as the floor
+  frame = [...tail, { kind: "user", md: "first", uuid: "uX2", absorbed: true }, { kind: "tool", uuid: "t1" }];
+  r = reconcilePending(frame, [x2, y2]);
+  assert.deepEqual(y2.floors, ["echo:X", "uX2"]);
+  assert.deepEqual(injectionGroups(frame, r.inject), [{ idx: 2, sends: [y2] }]);
+  // a LATER send never becomes a floor for an earlier one: Z pressed after Y, lands first (a different route)
+  const [y3, z3] = press(tail, "second", "third");
+  frame = [...tail, { kind: "user", md: "third", uuid: "uZ" }];
+  r = reconcilePending(frame, [y3, z3]);
+  assert.deepEqual(r.landed.map((l) => l.p), [z3]);
+  assert.equal(y3.floors, undefined, "z3 was registered after y3: its landing is not y3's floor");
+  assert.deepEqual(injectionGroups(frame, r.inject), [{ idx: 1, sends: [y3] }], "y3 stays above the later send's atom");
+});
+
+test("a send pressed while the kernel's queue holds OTHER texts is drawn below that queue, and below their atoms once they land (T252b)", () => {
+  // the kernel's queued group has no uuid and is no user event, so it was never the anchor nor the floor: a send
+  // pressed while it held a romp nudge, another client's message, or a queue predating a page reload was spliced
+  // ABOVE the queue although it runs after those texts, and dropped down when one of them landed
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
+  const queued: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "a nudge from elsewhere" }, { md: "mine" }] }];
+  const mine = newPending("mine", undefined, T0);
+  let r = reconcilePending(queued, [mine]);
+  assert.deepEqual(mine.at?.queuedForeign, ["a nudge from elsewhere"], "the foreign texts at the press are recorded");
+  assert.equal(mine.at?.queued, 1, "…and our own copy is background as before");
+  assert.deepEqual(injectionGroups(queued, r.inject), [{ idx: 2, sends: [mine] }], "below the queue, not above it");
+  // our copy hidden (render.ts) leaves the foreign text visible: still below
+  const hidden: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "a nudge from elsewhere" }, { md: "mine", hiddenByPending: true }] }];
+  assert.deepEqual(injectionGroups(hidden, reconcilePending(hidden, [mine]).inject), [{ idx: 2, sends: [mine] }]);
+  // the foreign text lands and the queue drains: the bubble sits below its atom, above what streams after
+  const landed: TailEvent[] = [...tail, { kind: "user", md: "a nudge from elsewhere", uuid: "uN" }, { kind: "tool", uuid: "t1" }];
+  r = reconcilePending(landed, [mine]);
+  assert.deepEqual(injectionGroups(landed, r.inject), [{ idx: 2, sends: [mine] }]);
+  // a queue holding only OUR text keeps the in-place rule (right after the anchor)
+  const ours: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "mine" }] }];
+  const mine2 = newPending("mine", undefined, T0 + 1);
+  r = reconcilePending(ours, [mine2]);
+  assert.deepEqual(mine2.at?.queuedForeign, []);
+  assert.deepEqual(injectionGroups(ours, r.inject), [{ idx: 1, sends: [mine2] }]);
+  // render.ts: the stale merge-into-the-group comment is gone; the tail group is described as a floor
+  assert.doesNotMatch(RENDER, /Ours merges INTO it when present/);
+  assert.match(RENDER, /a group holding OTHER texts is a floor/);
 });
 
 test("a bubble that changes slot marks the view stale, so the incremental repaint never trusts a shifted prefix (second review)", () => {
@@ -607,7 +670,7 @@ test("a send pressed against no frame (a placeholder tab): the first frame's cop
   // a first frame that predates the send entirely stamps exactly as a press-time stamp would
   list = [late()];
   reconcilePending([frame[0], frame[1]], list);
-  assert.deepEqual(list[0].at, { after: "a1", place: "u-old", placeText: TEXT, placeOrd: 0, seen: ["u-old"], queued: 0 });
+  assert.deepEqual(list[0].at, { after: "a1", place: "u-old", placeText: TEXT, placeOrd: 0, queuedForeign: [], seen: ["u-old"], queued: 0 });
   // a press-time stamp reads no stamp: its frame predates the press by construction, so an identical
   // message that landed within the press's own second is still background
   const prompt = press([frame[1], { kind: "user", md: TEXT, uuid: "u-same-second", ts: isoAt(Math.floor(T0 / 1000)) }], TEXT);
@@ -657,7 +720,7 @@ test("a late stamp presumes the first frame's newest queued copy of the text is 
   // follows covers it, exactly as at a press-time stamp
   const early = [late()];
   let r = reconcilePending([step], early);
-  assert.deepEqual(early[0].at, { after: "a1", place: null, placeText: undefined, placeOrd: 0, seen: [], queued: 0 });
+  assert.deepEqual(early[0].at, { after: "a1", place: null, placeText: undefined, placeOrd: 0, queuedForeign: [], seen: [], queued: 0 });
   assert.equal(r.inject.length, 1);
   r = reconcilePending([step, { kind: "queued", texts: [{ md: TEXT }] }], early);
   assert.equal(r.inject.length, 1);

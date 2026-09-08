@@ -47,6 +47,11 @@ export type SendBase = {
                           //   landed in place, so the k-th match stays the floor while a LATER send of the same text
                           //   (its echo, its atom) lands beyond it and is never taken (third review). 0 → the floor sits
                           //   at or above the anchor, which already covers it: no fallback
+  queuedForeign: string[]; // texts the kernel's tail queue held at the press that are NOT this client's pending
+                          //   sends (a queued romp nudge, another client's message, a queue predating a page
+                          //   reload): the send runs after them, so its bubble is drawn below that group while it
+                          //   holds them and below their atoms once they land (T252b). The group carries no uuid
+                          //   and is no user event, so neither the anchor nor the floor ever saw it
   seen: string[];         // uuids of the user events carrying the text that are background for this send: what
                           //   the press found, and what an earlier same-text entry claimed since — ONE ENTRY PER
                           //   COPY (a record of several sends lists its uuid once per spoken-for block)
@@ -65,6 +70,9 @@ export type PendingSend = {
   imgPaths?: string[]; // dragged images → the bubble's thumbnails, and the image-aware landing match
   lost?: string;       // an event after the press that makes non-delivery LIKELY ("connection": the
                        //   socket dropped) — the bubble says "not confirmed" instead of "sending…"
+  floors?: string[];   // uuids of kernel user events that belong to EARLIER-registered pending sends — their
+                       //   covering echoes and their landed atoms, recorded as they are claimed (T252b): an earlier
+                       //   send's message sits above this one whatever its text, so its bubble is drawn below them
   received?: boolean;  // the kernel has shown a copy of the text attributed to THIS send (an echo atom or
                        //   a queued copy after the press that no earlier same-text send claimed): the send
                        //   reached it, so a connection drop before or after cannot have lost it — `lost` is
@@ -80,7 +88,7 @@ export type TailEvent = {
   absorbed?: boolean;
   undelivered?: boolean;
   images?: unknown[];
-  texts?: { md?: string }[];
+  texts?: { md?: string; hiddenByPending?: boolean }[];   // hiddenByPending: render.ts hid this copy for a send drawn in place
   blocks?: string[];    // a user record the CLI wrote from SEVERAL sends taken at one boundary: one text per
                         //   block (kernel.py build_session ships them when there are two or more); `md` is
                         //   the blocks joined, so each block is a copy of its own send
@@ -218,7 +226,7 @@ const eventSecond = (e: TailEvent): number | null => {
  *  is confined to the late stamp because that is the only stamp that can meet the send's own records,
  *  and because at a press-time stamp it could only misfire (an identical message that landed within
  *  the press's second would read as this send's). */
-export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.late ? 1 : 0): SendBase {
+export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.late ? 1 : 0, pendingTexts?: Set<string>): SendBase {
   const pressS = p.late ? Math.floor(p.ts / 1000) : Infinity;
   const beforeSend = (e: TailEvent): boolean => { const s = eventSecond(e); return s === null || s < pressS; };
   let after: string | null = null;
@@ -245,10 +253,22 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
     const n = copiesIn(e, p);
     for (let k = 0; k < n; k++) seen.push(e.uuid);   // once per COPY: a record of several sends is several
   }
+  // the texts the tail queue holds that are nobody's pending send here: the send runs after them (T252b)
+  const queuedForeign: string[] = [];
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.kind !== "queued") continue;
+    for (const t of e.texts || []) {
+      if (typeof t.md !== "string" || t.hiddenByPending) continue;
+      if (sameText(t.md, p.text) || (pendingTexts && [...pendingTexts].some((x) => sameText(t.md!, x)))) continue;
+      queuedForeign.push(t.md);
+    }
+    break;
+  }
   // the queued presumption (above): a late stamp's newest `own` copies are this press's, so the count of
   // background copies stops short of them — at zero when the frame lists fewer than presumed (the kernel
   // had not received every press yet; the copies still to come cover those entries in order)
-  return { after, place, placeText, placeOrd, seen, queued: Math.max(0, queued - (p.late ? own : 0)) };
+  return { after, place, placeText, placeOrd, queuedForeign, seen, queued: Math.max(0, queued - (p.late ? own : 0)) };
 }
 
 /** The first index AFTER the send's anchor — or 0 when there is no anchor, or when the anchor has left the
@@ -300,10 +320,17 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
   // identical sends pressed against the same placeholder frame own as many copies as there were presses.
   const lateOwn = new Map<string, number>();
   for (const p of list) if (!p.at && p.late) lateOwn.set(p.text, (lateOwn.get(p.text) || 0) + 1);
-  for (const p of list) if (!p.at) p.at = stampBase(events, p, p.late ? lateOwn.get(p.text) || 1 : 0);
+  const pendingTexts = new Set(list.map((q) => q.text));
+  for (const p of list) if (!p.at) p.at = stampBase(events, p, p.late ? lateOwn.get(p.text) || 1 : 0, pendingTexts);
   const r: Reconciled = { keep: [], inject: [], unqueue: [], landed: [], lost: [] };
   const claimed = new Map<string, number>();           // "index\0text" → copies of that text in that landing taken by earlier entries THIS push
   const takenCopies = new Map<string, Set<number>>();  // text → queued-copy positions taken by an earlier entry THIS push
+  // an earlier entry's covering echo / landed atom is a FLOOR for every entry registered after it (T252b)
+  const floorFor = (owner: PendingSend, u: string | undefined) => {
+    if (!u) return;
+    const i = list.indexOf(owner);
+    for (const q of list.slice(i + 1)) { if (!q.floors) q.floors = []; if (!q.floors.includes(u)) q.floors.push(u); }
+  };
   for (const p of list) {
     const at = p.at!;
     const from = scanFrom(events, at);
@@ -328,6 +355,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
       covered = true;
       const u = events[echoIdx].uuid;
       if (u) for (const q of list) if (q !== p && q.at && q.text === p.text && !q.at.seen.includes(u)) q.at.seen.push(u);
+      floorFor(p, u);
     } else if (copies > at.queued) {
       const taken = takenCopies.get(p.text) || new Set<number>();
       for (let k = at.queued; k < copies; k++) if (!taken.has(k)) { taken.add(k); covered = true; byQueued = true; break; }
@@ -339,6 +367,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
       const ck = landedIdx + "\0" + p.text;             // per text: a record of two DIFFERENT sends is one landing for each
       claimed.set(ck, (claimed.get(ck) || 0) + 1);
       r.landed.push({ p, idx: landedIdx });
+      floorFor(p, events[landedIdx].uuid);
       continue;
     }
     if (lostIdx >= 0) { r.lost.push(p); continue; }
@@ -404,22 +433,49 @@ export function injectionGroups(events: TailEvent[], inject: PendingSend[]): Inj
  *  covered by the anchor. Never by comparing the client's clock with the kernel's stamps: the frame
  *  resident at the press is older than the send by construction, and a clock comparison re-inverted the
  *  order whenever the kernel clock led the client by more than the gap between two presses (second
- *  review). A user event that arrives after the press is a later send and stays below the bubble. */
+ *  review). A user event that arrives after the press is a later send and stays below the bubble — with two
+ *  exceptions that are older than the send all the same (T252b): an EARLIER pending send's covering echo or
+ *  landed atom (`floors`, recorded as reconcilePending claims them, whatever their text), and the texts the
+ *  kernel's tail queue held at the press (`queuedForeign`: the bubble sits below that group while it holds
+ *  them, and below their atoms once they land — the group carries no uuid and is no user event, so the
+ *  anchor and the floor never saw it, and a send was drawn above texts it runs after). */
 export function placementIndex(events: TailEvent[], p: PendingSend): number {
   const at = p.at!;
-  let idx = scanFrom(events, at);
-  if (!at.place || !(at.placeOrd && at.placeOrd > 0)) return idx;   // no floor after the anchor: the anchor rules
-  for (let j = events.length - 1; j >= idx; j--) if (events[j].uuid === at.place) return j + 1;
-  if (at.placeText !== undefined) {
-    let n = 0, last = -1;
-    for (let j = idx; j < events.length; j++) {
+  const base = scanFrom(events, at);
+  let idx = base;
+  if (at.place && at.placeOrd && at.placeOrd > 0) {
+    let found = -1;
+    for (let j = events.length - 1; j >= base; j--) if (events[j].uuid === at.place) { found = j + 1; break; }
+    if (found < 0 && at.placeText !== undefined) {
+      let n = 0, last = -1;
+      for (let j = base; j < events.length; j++) {
+        const e = events[j];
+        if (e.kind === "user" && !isOptimisticUuid(e.uuid) && typeof e.md === "string" && sameText(e.md, at.placeText)) {
+          n++; last = j;
+          if (n === at.placeOrd) { found = j + 1; break; }   // the floor, under its landed uuid
+        }
+      }
+      if (found < 0 && last >= 0) found = last + 1;         // fewer matches than at the press (a pruned echo): the newest stands in
+    }
+    if (found > idx) idx = found;
+  }
+  // an earlier pending send's echo or landed atom: below it, whatever its text
+  for (const u of p.floors || []) {
+    for (let j = events.length - 1; j >= base; j--) if (events[j].uuid === u) { if (j + 1 > idx) idx = j + 1; break; }
+  }
+  // the texts the kernel's queue held at the press: below the group while it holds them, below their atoms after
+  if (at.queuedForeign && at.queuedForeign.length) {
+    for (let j = events.length - 1; j >= base; j--) {
       const e = events[j];
-      if (e.kind === "user" && !isOptimisticUuid(e.uuid) && typeof e.md === "string" && sameText(e.md, at.placeText)) {
-        n++; last = j;
-        if (n === at.placeOrd) return j + 1;              // the floor, under its landed uuid
+      if (e.kind === "queued") {
+        if ((e.texts || []).some((t) => typeof t.md === "string" && !t.hiddenByPending && at.queuedForeign.some((f) => sameText(t.md!, f)))) { if (j + 1 > idx) idx = j + 1; }
+        break;
       }
     }
-    if (last >= 0) return last + 1;                       // fewer matches than at the press (a pruned echo): the newest stands in
+    for (let j = events.length - 1; j >= base; j--) {
+      const e = events[j];
+      if (e.kind === "user" && !isOptimisticUuid(e.uuid) && typeof e.md === "string" && at.queuedForeign.some((f) => sameText(e.md!, f))) { if (j + 1 > idx) idx = j + 1; break; }
+    }
   }
   return idx;
 }
