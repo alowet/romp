@@ -2600,8 +2600,8 @@ class SdkSession:
         # resumes any session with a non-empty persisted queue and this seed delivers it.
         self._pending: list[str] = [t for t in (reg.get("queue") or []) if isinstance(t, str) and t]
         # Per-copy IDENTITY beside each queued text (T252c): {"qid", "qts"} — the echo key send() minted for
-        # it and its enqueue stamp (epoch ms) — or None for a copy nobody stamped (a restored queue after a
-        # kernel death, a notice this backend queued itself). Kept ALIGNED with _pending by the _q_* helpers;
+        # it and its enqueue stamp (epoch ms) — or None for a copy nobody stamped (a notice this backend queued
+        # itself; a copy restored from an older kernel's text-only mirror). Kept ALIGNED with _pending by the _q_* helpers;
         # pending_meta() refuses to answer when they disagree, so the chat falls back to text rather than
         # misattribute. The feed moves a copy's identity to _fed_meta, where qid_for_landing pairs it with
         # the record that lands the text (FIFO per text, at or after the feed) — the landed atom then carries

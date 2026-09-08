@@ -8,8 +8,10 @@ queue:
   SDK backend — send() mints the copy's id (the echo key it already minted for the optimistic echo) BEFORE the
   enqueue, so the queued copy, the echo atom and the landed atom share one id; the feed moves the id to a fed
   ledger, and the landed user record is paired with it FIFO per text, at or after the feed time (qid on the chat
-  event). A queue restored from the registry after a kernel death carries no ids (legacy: the chat falls back to
-  text), and so does a copy the backend itself queued (a death notice, the rename ping).
+  event). The registry mirrors carry the identity across a kernel death (second review): the queue mirror keeps
+  each identified copy's id and stamp, the echo mirror keeps the echo's uuid, and a fed copy the dead CLI was
+  holding goes back into the queue under its own id. An older kernel's mirror (texts only) restores id-less
+  copies, and a copy the backend itself queued (a death notice, the rename ping) carries none: text decides.
   Parked sends — a copy parked in the kernel's own FIFO (compaction, a usage-limit hold, a parked drive op) carries
   NO id until it reaches the backend: the park's op is the three-field record the on-disk mirror and a dozen
   readers pin, so the identity is minted where the copy enters the backend's queue. Stated as a gap.
