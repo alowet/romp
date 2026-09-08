@@ -20,28 +20,31 @@ test("the modelFallback kind is dispatched to its renderer", () => {
   assert.match(RENDER, /kind: "modelFallback"; from\?: string; to\?: string; md\?: string/);
 });
 
-test("the head line names both models via prettyModel, in the warning voice", () => {
-  const fn = RENDER.slice(RENDER.indexOf("function renderModelFallback"));
-  const body = fn.slice(0, fn.indexOf("\n}"));
-  assert.match(body, /prettyModel\(ev\.from\)/);
-  assert.match(body, /prettyModel\(ev\.to\)/);
-  assert.match(body, /safeguards flagged this message/);
-  assert.match(body, /"retried-text modelswap-text"/, "warning-voice class on the head text");
-  // never a red/blocked dress: a swap is a warning about provenance, not a failure of the turn
+test("the head names both models via prettyModel, in the WARN severity", () => {
+  // 2026-09-08 (the notice-vocabulary pass): a SESSION notice with the warn severity on its rail; the gist string
+  // lives in modelFallbackGist, shared with compact mode's group head
+  const body = RENDER.split("function renderModelFallback(")[1].split("\nfunction ")[0];
+  assert.match(body, /notice\(\{ src: "session", glyph: "power", sev: "warn", gist: modelFallbackGist\(ev\), body,/);
+  const gist = RENDER.split("function modelFallbackGist(")[1].split("\n}")[0];
+  assert.match(gist, /prettyModel\(ev\.from\)/);
+  assert.match(gist, /prettyModel\(ev\.to\)/);
+  assert.match(gist, /safeguards flagged this message/);
   assert.doesNotMatch(body, /apierror|gaveup/);
 });
 
 test("the full CLI notice is one click away and the fold survives re-renders", () => {
-  const fn = RENDER.slice(RENDER.indexOf("function renderModelFallback"));
-  const body = fn.slice(0, fn.indexOf("\n}"));
+  const body = RENDER.split("function renderModelFallback(")[1].split("\nfunction ")[0];
   assert.match(body, /body\.textContent = ev\.md;/, "verbatim notice — never paraphrased chrome");
-  assert.match(body, /applyFold\(body, "expanded", key\)/);
-  assert.match(body, /rememberFold\(body, "expanded", key\)/);
-  assert.match(body, /"mswap:" \+ ev\.uuid/, "fold keyed by the record's uuid");
+  // 2026-09-08: keyed through the builder (openFolds "notice:mswap:<uuid>"), toggled by the delegate
+  assert.match(body, /key: ev\.uuid \? "mswap:" \+ ev\.uuid : undefined/, "fold keyed by the record's uuid");
+  const nc = RENDER.split("function notice(spec: NoticeSpec)")[1].split("\nfunction ")[0];
+  assert.match(nc, /applyFold\(card, "notice-open", fkey\)/);
+  assert.match(RENDER, /noticetoggle: \(el\) => \{[\s\S]{0,400}?rememberFold\(card, "notice-open", el\.dataset\.nkey \|\| undefined\);/);
 });
 
-test("the body is hidden until expanded, styled in the note family", () => {
-  assert.match(CSS, /\.modelswap-body \{ display: none;/);
-  assert.match(CSS, /\.modelswap-body\.expanded \{ display: block; \}/);
-  assert.match(CSS, /\.modelswap-text \{ color: var\(--warn/);
+test("the body is hidden until expanded, in the one notice family; the warn is the rail's colour", () => {
+  assert.match(CSS, /\.notice-collapsible:not\(\.notice-open\) > \.notice-body \{ display: none; \}/);
+  assert.match(CSS, /\.notice-sev-warn\s+\{ --notice-rail: var\(--warn\);/);
+  assert.match(CSS, /\.notice-prose \{ white-space: pre-wrap;/);   // the CLI's text keeps its line breaks
+  assert.doesNotMatch(CSS, /\.modelswap-/);
 });
