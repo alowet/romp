@@ -16505,7 +16505,12 @@ def _poll_remote_version(r):
     `autoNudge` is that machine's own copy of a setting the gear presents as one switch for everything you
     are running, so the dashboard can say when the machines disagree instead of showing one kernel's answer
     for all of them (the user 2026-08-14). None — never False — when the remote didn't say, so an older
-    kernel that has no such field reads as unknown rather than as off."""
+    kernel that has no such field reads as unknown rather than as off.
+
+    `settingsGt` (T248b): every store's last-applied gesture stamp beside `settings`, so the supervisor
+    can adopt a peer's newer pick without a click (_adopt_peer_settings). None when the peer sends none
+    (an older kernel) — the first cut consumed the field here without carrying it across, so nothing
+    ever converged in production while the hand-built test dicts passed (its review, 2026-09-08)."""
     import urllib.parse
     try:
         c = http.client.HTTPConnection("127.0.0.1", int(r["local_port"]), timeout=4)
@@ -16520,9 +16525,11 @@ def _poll_remote_version(r):
         sha = j.get("kernel_sha") or None
         an = j.get("autoNudge")
         st = j.get("settings")
+        gts = j.get("settingsGt")
         return {"sha": sha, "ver": str(j.get("kernel_ver") or ""),
                 "autoNudge": an if isinstance(an, bool) else None,
-                "settings": st if isinstance(st, dict) else None} if sha else None
+                "settings": st if isinstance(st, dict) else None,
+                "settingsGt": gts if isinstance(gts, dict) else None} if sha else None
     except Exception:
         return None
 
@@ -33281,8 +33288,11 @@ def _setting_kept_value(name):
 # with a DIFFERENT value, is adopted through the setting's own gt-gated setter under the PEER's stamp:
 # the poll observing a newer stamp is the event, and gesture-time ordering gives latest-wins on both
 # sides with no ping-pong (the adopter's stamp then equals the peer's, and an equal stamp is never
-# adopted — the same rule the setters apply to a stale flush). Equal stamps or equal values write
-# nothing; a peer that sends no stamps (an older kernel) or junk teaches nothing. Scope: the three
+# adopted — the same rule the setters apply to a stale flush). A SAME value under a newer stamp is
+# adopted too, for its stamp: the dashboard mints its next gesture above the LOCAL kernel's stamps only
+# (gear.js learnAll on /version's settingsGt), so a lagging stamp let a later local click apply here,
+# stand down on the peer, and be adopted away again one pass later (the first cut's review). Equal
+# stamps write nothing; a peer that sends no stamps (an older kernel) or junk teaches nothing. Scope: the three
 # boolean settings that ride the browser broadcast and have no other propagation leg (the judge tiers
 # fan out over /judge-settings; update mode is a per-install boot policy by design).
 _MESH_ADOPTED_SETTINGS = (("compactSuggest", "compact-suggest", _set_compact_suggest),
@@ -33291,9 +33301,10 @@ _MESH_ADOPTED_SETTINGS = (("compactSuggest", "compact-suggest", _set_compact_sug
 
 
 def _adopt_peer_settings(host, rver):
-    """Adopt every kernel-side boolean in `rver` (a peer's /version dict) whose stamp is newer than the
-    local store's and whose value differs. Returns the store names adopted. Runs on the supervisor
-    thread: the setters' stand-down verdicts are consumed here (no delivering socket to answer)."""
+    """Adopt every kernel-side boolean in `rver` (_poll_remote_version's dict for a peer) whose stamp is
+    newer than the local store's — the value when it differs, the stamp alone when it agrees. Returns
+    the store names adopted. Runs on the supervisor thread: the setters' stand-down verdicts are
+    consumed here (no delivering socket to answer)."""
     st = (rver or {}).get("settings") if isinstance(rver, dict) else None
     gts = (rver or {}).get("settingsGt") if isinstance(rver, dict) else None
     if not isinstance(st, dict) or not isinstance(gts, dict):
@@ -33306,13 +33317,12 @@ def _adopt_peer_settings(host, rver):
         pgt = int(pgt)
         if pgt <= _setting_stored_gt(store):
             continue                                   # older or equal: nothing newer to learn
-        if bool(_setting_kept_value(store)) == val:
-            continue                                   # the values agree: nothing to converge
-        applied = setter(val, gt=pgt)
+        applied = setter(val, gt=pgt)                  # a same value lands too — the setter treats a newer
+        #                                                stamp as an apply (the echo rule needs an EQUAL one)
         _pop_stale_notice()                            # no WS gesture made this: never leave a verdict for one
         if applied is not None:
             adopted.append(store)
-            sys.stderr.write("setting %s: adopted %s's newer pick (%s, gesture %d) — one value across machines\n"
+            sys.stderr.write("setting %s: adopted %s's newer pick (%s, gesture %d) — one value, one stamp across machines\n"
                              % (store, host, val, pgt))
     return adopted
 

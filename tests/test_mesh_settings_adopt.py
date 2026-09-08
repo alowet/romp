@@ -13,15 +13,23 @@ boolean kernel settings that ride the browser broadcast and nothing else: compac
 fileEditing — the same three lines each, one table row apiece.
 
 Two hermetic "kernels" here are two state roots served by one loaded module (jd.STATE swapped per call),
-which is exactly what the seam sees: a peer is its /version dict, nothing more. Synthetic host names, no
-sockets, no live state.
+which is exactly what the seam sees: a peer is its /version dict, nothing more — and one class drives that
+dict through the REAL poll (_poll_remote_version against a loopback stand-in for the peer's /version), the
+gap the first cut's review caught: the poll copied four fixed keys and dropped settingsGt, so nothing ever
+converged in production while the hand-built dicts here passed. A same value under a NEWER peer stamp lifts
+the local stamp too (review, second finding): the dashboard mints its next gesture above the LOCAL kernel's
+stamps only, so a lagging stamp let a later local click apply locally, stand down on the peer, and then be
+adopted away again — the gear-says-off, kernel-holds-on state this exists to end. Synthetic host names,
+loopback only, no live state.
 """
 import contextlib
 import io
 import json
 import os
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -115,11 +123,20 @@ class AdoptPeerSettings(unittest.TestCase):
         self.assertEqual(self.a.adopt("TESTHOST", rver)[0], [])
         self.assertEqual(self.a.read("compact-suggest"), (True, 2_000))
 
-    def test_the_same_value_under_a_newer_stamp_writes_nothing(self):
-        self.a.set("compact-suggest", True, 2_000)
-        self.b.set("compact-suggest", True, 5_000)
-        self.assertEqual(self.a.adopt("TESTHOST", self.b.version())[0], [], "the values agree: nothing to converge")
-        self.assertEqual(self.a.read("compact-suggest"), (True, 2_000))
+    def test_the_same_value_under_a_newer_stamp_lifts_the_local_stamp(self):
+        # the value already agrees, but the STAMP is newer: adopt it, or the local dashboard — which mints its
+        # next gesture above the local kernel's stamps only — clicks below the peer's stamp, applies locally,
+        # stands down on the peer, and is adopted away again one pass later (review of the first cut)
+        self.a.set("compact-suggest", True, 5_000)
+        self.b.set("compact-suggest", True, 7_000)          # a device whose clock runs ahead clicked ON on b
+        self.assertEqual(self.a.adopt("TESTHOST", self.b.version())[0], ["compact-suggest"])
+        self.assertEqual(self.a.read("compact-suggest"), (True, 7_000), "same value, the peer's stamp")
+        # a's dashboard now learns 7_000 from a's own /version and mints the OFF click above it: it wins everywhere
+        self.a.set("compact-suggest", False, 7_001)
+        self.assertEqual(self.a.read("compact-suggest"), (False, 7_001))
+        self.assertEqual(self.a.adopt("TESTHOST", self.b.version())[0], [], "b's older pick teaches a nothing")
+        self.assertEqual(self.b.adopt("TESTHOST2", self.a.version())[0], ["compact-suggest"])
+        self.assertEqual(self.b.read("compact-suggest"), (False, 7_001), "the click held on both machines")
 
     def test_an_older_kernel_or_a_junk_dict_adopts_nothing(self):
         self.a.set("compact-suggest", False, 1_000)
@@ -159,6 +176,59 @@ class AdoptPeerSettings(unittest.TestCase):
             self.a.set(store, default, 3_000)
             self.assertEqual(self.b.adopt("TESTHOST2", self.a.version())[0], [store], store + ": the newer pick flows back")
             self.assertEqual(self.b.read(store), (default, 3_000), store)
+
+
+class _FakePeer(BaseHTTPRequestHandler):
+    """A stand-in peer kernel: /version answers with whatever PAYLOAD holds (the loopback shape
+    tests/test_auto_nudge_every_kernel.py uses)."""
+    PAYLOAD = {}
+
+    def do_GET(self):
+        body = json.dumps(self.PAYLOAD).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class ThroughTheRealPoll(unittest.TestCase):
+    """The dict the supervisor hands to _adopt_peer_settings is _poll_remote_version's return, not the
+    peer's /version JSON: the poll must carry the stamps across, or nothing ever converges."""
+
+    def setUp(self):
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), _FakePeer)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.a = _Kernel()
+
+    def tearDown(self):
+        self.srv.shutdown(); self.srv.server_close(); self.a.close()
+
+    def _poll(self, payload):
+        _FakePeer.PAYLOAD = payload
+        return km._poll_remote_version({"local_port": self.port, "token": "tok"})
+
+    def test_the_poll_carries_the_peers_stamps_beside_its_settings(self):
+        got = self._poll({"kernel_sha": "abc1234", "settings": {"compactSuggest": True},
+                          "settingsGt": {"compact-suggest": 2_000, "auto-nudge": 0}})
+        self.assertEqual(got["settings"], {"compactSuggest": True})
+        self.assertEqual(got["settingsGt"], {"compact-suggest": 2_000, "auto-nudge": 0})
+
+    def test_an_older_kernel_or_junk_stamps_poll_as_none(self):
+        self.assertIsNone(self._poll({"kernel_sha": "abc1234", "settings": {"compactSuggest": True}})["settingsGt"])
+        self.assertIsNone(self._poll({"kernel_sha": "abc1234", "settingsGt": "2000"})["settingsGt"])
+
+    def test_a_polled_peer_is_adopted_end_to_end(self):
+        rver = self._poll({"kernel_sha": "abc1234", "settings": {"compactSuggest": True, "autoNudge": True, "fileEditing": True},
+                           "settingsGt": {"compact-suggest": 2_000, "file-editing": 2_000}})
+        self.assertEqual(sorted(self.a.adopt("TESTHOST", rver)[0]), ["compact-suggest", "file-editing"])
+        self.assertEqual(self.a.read("compact-suggest"), (True, 2_000))
+        self.assertEqual(self.a.read("file-editing"), (True, 2_000))
+        self.assertEqual(self.a.read("auto-nudge")[1], 0, "no stamp for it in the peer's dict: untouched")
 
 
 class ThePollSeam(unittest.TestCase):
