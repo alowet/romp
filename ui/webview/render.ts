@@ -2135,17 +2135,21 @@ function contentOffsetFrame(content: HTMLElement, v: View, s: Session):
     const u = Number(node.dataset.unit);
     const h = node.offsetHeight;
     if (Number.isFinite(u) && h > 0) uh.set(u, h);
-    if (Number.isFinite(u)) {
+    if (Number.isFinite(u) && !exact.has(u)) {   // a unit's FIRST .turn node is its root (see the gate below)
       const r = node.getBoundingClientRect();
       exact.set(u, content.scrollTop + (r.top - cRect.top) + r.height / 2);
     }
   }
-  // EXACT when every unit is rendered (no spacers): the scrollbar the user reads the notches against spans
+  // EXACT when every unit is rendered (no spacer): the scrollbar the user reads the notches against spans
   // content.scrollHeight, and each unit's real middle in scroll space is known — the unit-height sum below
   // omits the gaps between turns and everything that is not a unit, so it sat a few dozen pixels off even
   // on a fully rendered conversation (T245). scrollTop + client-rect top is the position IN THE SCROLL
-  // CONTENT, invariant under scrolling: pure scrolling still moves nothing.
-  if (nodes.length > 0 && nodes.length === unitTotal && exact.size === unitTotal && content.scrollHeight > 0) {
+  // CONTENT, invariant under scrolling: pure scrolling still moves nothing. The gate counts UNITS, never
+  // nodes: one unit may own several .turn nodes — appendItem tags an expanded tool/retry group's child
+  // turns and every absorbed cue with their unit — so a node-count gate silently dropped the frame back
+  // to the sum whenever a group stood open (review of the first cut, 2026-09-08: 14px off, and the notch
+  // changed basis on every expand and collapse).
+  if (exact.size > 0 && exact.size === unitTotal && !v.el.querySelector(".tx-spacer") && content.scrollHeight > 0) {
     const shx = content.scrollHeight;
     return { sh: shx, offsetOf: (i: number): number | null => exact.get(i) ?? null };
   }
