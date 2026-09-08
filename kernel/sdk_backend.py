@@ -2115,13 +2115,18 @@ def _check_key_file_agrees(startup: str, live: str) -> None:
 _ENV_FILE_AUTH_CHECKED = False   # the env-file-vs-declaration check (one line, once per process)
 
 
-def _check_env_file_vs_declaration(log, state_dir, path: str | None = None) -> str:
-    """Say ONCE per process, as a problem-ring line, when the env file selects an API key source while
-    ROMP_EXPECTED_AUTH=login declares that the sessions bill the machine login. The two cannot both
-    hold: a source the file selects — an `ANTHROPIC_API_KEY=` line with a value, a `ROMP_API_KEY_REF=`
-    line, or a `ROMP_API_KEY_CMD=` line — is injected at launch for every session without an explicit
-    Billing pick (effective_auth and default_auth answer "key" whenever a source is configured), so
-    those sessions bill the key. Without this line the first sign is _note_auth_source's per-init
+def _check_env_file_vs_declaration(log, state_dir) -> str:
+    """Say ONCE per process, as a problem-ring line, when the API key source the LAUNCH would select
+    contradicts ROMP_EXPECTED_AUTH=login, which declares that the sessions bill the machine login. The two
+    cannot both hold: a selected source — an `ANTHROPIC_API_KEY=` line with a value, a `ROMP_API_KEY_REF=`
+    line, or a `ROMP_API_KEY_CMD=` line in the env file, and for a foreground manager the same names
+    exported in its environment — is injected at launch for every session without an explicit Billing
+    pick (effective_auth and default_auth answer "key" whenever a source is configured), so those
+    sessions bill the key. The selection is keysource.select_source, the launch's own (work_api_key_source),
+    so the check's silence is truthful: the file's lines alone missed the durable provider MARKER beside
+    the file (a removed provider the launch still tries, and fails on) and the foreground environment
+    (a review of the merged check, 2026-09-08). The startup key is PEEKED, never claimed: the claim and
+    its once-only semantics belong to the launch (startup_api_key). Without this line the first sign is _note_auth_source's per-init
     mismatch, after a launch has already billed the wrong account, and that line names the helper and
     the file without saying which line. A file whose source configuration is INVALID (both provider
     lines; a garbled line) is still a selection — `configured` is True, so nothing falls back to the
@@ -2144,22 +2149,26 @@ def _check_env_file_vs_declaration(log, state_dir, path: str | None = None) -> s
     exp, src = _declared_auth(state_dir)
     if exp != "login" or src != "env":
         return ""
-    p = path or _keysrc.service_env_path()
-    source = _keysrc.read_source(p)
+    p = _keysrc.service_env_path()
+    startup = _WORK_KEY if _WORK_KEY is not None else (os.environ.get("ANTHROPIC_API_KEY") or "")   # a peek
+    source = _keysrc.select_source(startup)
     if not source.configured:
-        return ""                    # no source selected (a missing file, an empty key line): the sessions fall
-    _ENV_FILE_AUTH_CHECKED = True    # to Claude Code's own credential, and there is nothing to weigh against the declaration
+        return ""                    # the launch selects nothing anywhere it looks (file, marker, environment):
+    _ENV_FILE_AUTH_CHECKED = True    # the sessions fall to Claude Code's own credential, nothing to weigh
+    from_env = source.kind == "environment" or "from the environment" in (source.error or "") \
+        or not _keysrc.read_source(p).configured and source.kind != "error"
+    where = "the manager's environment" if from_env else p
     if source.kind == "error":
         log("auth: %s selects an API key source that cannot be used (%s) while ROMP_EXPECTED_AUTH=login. Every "
             "session without an explicit Billing pick will try that source and fail to launch rather than bill "
-            "the machine login. Fix the file, or change the declaration to match what it should select."
-            % (p, source.error or "invalid API key source configuration"), problem=True)
+            "the machine login. Fix the source, or change the declaration to match what it should select."
+            % (where, source.error or "invalid API key source configuration"), problem=True)
         return "error"
     var = _keysrc.source_var(source.kind)
     log("auth: %s sets %s while ROMP_EXPECTED_AUTH=login. The declaration says the sessions bill the machine "
-        "login, but the key source this file selects is injected at launch for every session without an "
-        "explicit Billing pick, so they bill the key. Fix whichever side is wrong: remove the line, or change "
-        "the declaration to match what the file selects." % (p, var), problem=True)
+        "login, but the key source it selects is injected at launch for every session without an explicit "
+        "Billing pick, so they bill the key. Fix whichever side is wrong: remove the line (or the export), or "
+        "change the declaration to match what is selected." % (where, var), problem=True)
     return var
 
 
