@@ -204,8 +204,10 @@ class _PerfStats:
                                    sends). The push.* stages are measured inside _push for EVERY
                                    caller, connect pushes on handler threads included, so their sum
                                    can exceed `push`
-      builds                       chat / feed / timeline -> {cached, built, ms}: served from the
-                                   build cache vs rebuilt, and the rebuild time
+      builds                       chat / feed / timeline / feedJson -> {cached, built, ms}: served
+                                   from the build cache vs rebuilt, and the rebuild time. feedJson is
+                                   GET /feed.json's own reads (_pure_feed), kept apart from `feed`,
+                                   the pusher's (review find, 2026-09-08)
       sends                        full / delta / deduped -> {slot: {count, bytes}} per dedup-slot
                                    name (chat, feed, bars, taborder, ...; at most SLOTS names, the rest
                                    under "other"). A deduped frame was built and compared, not sent
@@ -234,7 +236,7 @@ class _PerfStats:
     HTTP_PATHS = 256
     SLOTS = 32
     STAGES = ("jobs", "push", "push.chat", "push.feed", "push.timeline", "push.send")
-    BUILDS = ("chat", "feed", "timeline")
+    BUILDS = ("chat", "feed", "timeline", "feedJson")
     SEND_KINDS = ("full", "delta", "deduped")
 
     def __init__(self):
@@ -35347,7 +35349,7 @@ def _push(targets, connect=False, tmux=None):
     # chat client is open — previously the fleet rode app=feed and got ledgers only as a side effect of a chat
     # build (want_chat), so opening the fleet alone showed an empty/loading screen until a chat push happened.
     want_fleet = any(c["app"] == "fleet" for c in targets)
-    want_feed = any(c["app"] in ("feed", "fleet", "chat") for c in targets)   # fleet rides the feed payload; chat needs feed["working"]
+    want_feed = _feed_audience(targets)          # the Sessions pane (app "fleet") rides the feed payload; chat needs feed["working"]
     want_tl = any(c["app"] == "timeline" for c in targets)
     chat_clients = [c for c in targets if c["app"] == "chat"]
     try:
@@ -35830,7 +35832,10 @@ _built_feed = [None, None, 0.0, 0.0]              # [fleet_sig, payload, built_a
 # "the timeline rebuilt 900 times in 30 min with 12 sessions idle" instead of inferred from top. A
 # rebuild is justified only by a changed input; a rising build count on a quiet board is a bug signature.
 _VIEW_STATS = {"feedBuild": 0, "feedServe": 0, "tlBuild": 0, "tlServe": 0,
-               "chatBuildActive": 0, "chatBuildBg": 0, "chatServeActive": 0, "chatServeBg": 0}
+               "chatBuildActive": 0, "chatBuildBg": 0, "chatServeActive": 0, "chatServeBg": 0,
+               # GET /feed.json's reads (_pure_feed), apart: a poller's builds under the pusher's numbers
+               # would forge the bug signature above, or bury a pusher regression (review find, 2026-09-08)
+               "feedJsonBuild": 0, "feedJsonServe": 0}
 _built_timeline = [None, None, 0.0, 0.0]          # [fleet_sig, payload, built_at, build_started_at]
 # Wire-form caches for the two heavy shared payloads (the 2026-08-10 CPU fix, round three): the last
 # (source-identity key, serialized bytes, dedup sig) for the feed and the timeline bars, so an unchanged
@@ -35968,27 +35973,50 @@ def _cached_feed(now, tmux, sig, connect=False):
 # never fills _built_feed — every GET took the cold branch, and a script's read pruned the bell's card
 # overrides on disk, advanced the notification baseline past changes nobody had been told about, pushed
 # a badge to the shells, and filled the pusher's cache. This slot holds the pure path's own build,
-# (payload, built_at, build_started_at) — a TUPLE rebound whole, so a concurrent reader never sees a
-# torn entry (the _feed_wire discipline). Never _built_feed: a pure build in that slot would satisfy the
+# (payload, built_at, build_started_at, view_sig), a TUPLE rebound whole, so a concurrent reader never
+# sees a torn entry (the _feed_wire discipline). Never _built_feed: a pure build in that slot would satisfy the
 # pusher's REBUILD_MIN_S reuse, so a 1 Hz poller would keep the pusher on its serve branch and MUTE
-# every bell and badge for as long as it polled (the build branch is where they fire). Its two gates
-# are the pusher's own — REBUILD_MIN_S (build cost) and _views_dirty (a mutation the sig cannot see);
-# no new clocks, no view sig (its 5s bucket buys nothing past the rebuild window a poller already pays).
-_PURE_FEED = None
+# every bell and badge for as long as it polled (the build branch is where they fire). Its reuse
+# question is the pusher's own (_cached_feed's, minus the connect arm): a _views_dirty mark (a mutation
+# the sig cannot see) rebuilds at once; inside REBUILD_MIN_S the copy is reused whatever the inputs did
+# (the floor caps build cost on an active board, as it does for the pusher); past the floor an UNCHANGED
+# view sig reuses, so an idle board rebuilds at the sig's own cadence (its 5 s bucket) and no faster,
+# the pusher's cost with a pane open. The first cut reused on the clock alone (review find, 2026-09-08):
+# a headless idle board then rebuilt every 2 s for as long as anything polled, where the pusher would
+# have reused; the sig is the event that clock was approximating.
+_PURE_FEED = None                                 # (payload, built_at, build_started_at, view_sig)
+# ONE build on the route's behalf at a time (review find, 2026-09-08). The pusher coalesces by being one
+# thread; the route runs on a handler thread per GET, so without this every GET arriving mid-build started
+# a build_feed of its own (the 2026-08-30 pile-up class: inline builds stacking on handler threads), and
+# the older build, finishing last, rebound the slot, so buildId went backwards inside the window. A GET
+# that queues here re-reads the slot under the lock and finds the build it waited for, fresh inside the
+# floor. Held across the sig sweep and the build: nothing under it takes _clients_lock or re-enters here.
+_pure_feed_lock = threading.Lock()
+
+
+def _feed_audience(clients):
+    """Whether any of `clients` rides the feed payload: the Sessions pane (app id "fleet") rides it, the
+    chat needs feed["working"]. The ONE question _push asks of its targets (want_feed) and the route asks
+    of the connected set (_pusher_has_feed_audience). The first cut kept two copies of the app tuple, held
+    together by a source-text pin (review find, 2026-09-08)."""
+    return any(c["app"] in ("feed", "fleet", "chat") for c in clients)
 
 
 def _pusher_has_feed_audience():
-    """Whether the pusher is MAINTAINING _built_feed right now: _push's own `want_feed` predicate — some
-    connected client rides the feed payload. Without one the pusher stops building the feed and the slot
-    freezes at the last disconnect, so a route that served it unconditionally would answer a poller with
-    an hours-old board that looks current. The audience is the event that decides whose copy is fresh."""
+    """Whether the pusher is MAINTAINING _built_feed right now: _feed_audience over the connected clients,
+    the question _push's want_feed asks of its targets. Without one the pusher stops building the feed
+    and the slot freezes at the last disconnect, so a route that served it unconditionally would answer a
+    poller with an hours-old board that looks current. The audience is the event that decides whose copy
+    is fresh."""
     with _clients_lock:
-        return any(c["app"] in ("feed", "fleet", "chat") for c in _clients)
+        return _feed_audience(_clients)
 
 
 def _pure_feed(now, tmux):
     """The feed payload for GET /feed.json: the pusher's warmed copy while the pusher has an audience
-    (byte-identical to what the panes see), else this path's own recent build, else a fresh build_feed
+    (the feed_src under the panes' payload: their frame is a per-push copy of it with _push's `ledgers`
+    attach on top, so this is the board's cards without that attach), else this path's own copy while
+    the pusher's reuse question says it is fresh, else a fresh build_feed shared by every GET in flight
     — served, never handed to the pusher. What this path never does is _cached_feed's cold-branch
     work: the bell diff, the notify-cards prune, the badge push, the pusher's cache fill. build_feed's
     OWN housekeeping is as it was on the old path and is not this path's to change: a session-order
@@ -35997,27 +36025,43 @@ def _pure_feed(now, tmux):
     runs only with a client connected and no chat/timeline client parsing; a goal store that cannot be
     read files its fault row (load_goals_or_fault: loud by design, and only on a fault).
     The build id IS claimed (a consumer reads buildId like any payload); the counter is monotonic and a
-    card-move ack only needs the pusher's next build to outrank whatever was claimed before it."""
+    card-move ack only needs the pusher's next build to outrank whatever was claimed before it.
+    Counted under the route's own numbers (feedJson*, never the pusher's feed*): those read as the
+    pusher's cost, and a poller's reads under them would forge or bury a pusher bug signature."""
     global _PURE_FEED
+
+    def _served(payload):
+        _VIEW_STATS["feedJsonServe"] += 1
+        _PERF_STATS.build("feedJson", True)
+        return payload
+
     e = _built_feed
     if e[1] is not None and _pusher_has_feed_audience():
-        _VIEW_STATS["feedServe"] += 1
-        _PERF_STATS.build("feed", True)
-        return e[1]
-    pf = _PURE_FEED
-    if pf is not None and (time.time() - pf[1]) < REBUILD_MIN_S and not _views_dirty[0] > pf[2]:
-        _VIEW_STATS["feedServe"] += 1
-        _PERF_STATS.build("feed", True)
-        return pf[0]
-    _VIEW_STATS["feedBuild"] += 1
-    bid = _next_feed_build_id()
-    started = time.time()                # the dirty floor for the next GET: a mutation after this may be missed below
-    _t0 = time.monotonic()
-    feed = build_feed(now, tmux)
-    _PERF_STATS.build("feed", False, time.monotonic() - _t0)
-    feed["buildId"] = bid
-    _PURE_FEED = (feed, time.time(), started)
-    return feed
+        return _served(e[1])
+    with _pure_feed_lock:
+        pf = _PURE_FEED                  # read UNDER the lock: a GET that queued behind a build finds that build
+        sig = None
+        # _cached_feed's question minus the connect arm. Never a copy a dirty mark postdates (start-keyed,
+        # as there: a mutation landing mid-build may have been missed by it). Inside the floor the clock
+        # answers and no sig is swept; past it, an unchanged sig answers (the idle board's case).
+        if pf is not None and not _views_dirty[0] > pf[2]:
+            if (time.time() - pf[1]) < REBUILD_MIN_S:
+                return _served(pf[0])
+            sig = _fleet_view_sig(now, tmux)
+            if pf[3] == sig:
+                return _served(pf[0])
+        _VIEW_STATS["feedJsonBuild"] += 1
+        bid = _next_feed_build_id()
+        if sig is None:
+            sig = _fleet_view_sig(now, tmux)     # sampled BEFORE the read, as the pusher's fsig is: an input
+            #                                      that moves during the build busts the next check
+        started = time.time()                # the dirty floor for the next GET: a mutation after this may be missed below
+        _t0 = time.monotonic()
+        feed = build_feed(now, tmux)
+        _PERF_STATS.build("feedJson", False, time.monotonic() - _t0)
+        feed["buildId"] = bid
+        _PURE_FEED = (feed, time.time(), started, sig)
+        return feed
 
 
 # ── system notifications: the bell toggles (the user 2026-07-28) ──────────────────────────────────
@@ -41567,8 +41611,8 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/feed.json":
                 # The feed's card payload as JSON, for scripts/agents diagnosing card state (both
                 # teams' surveys, 2026-08-24): EXACTLY what build_feed ships to the board — the
-                # pusher's warmed build while the pusher has an audience, else a build of its own
-                # (_pure_feed). NOT _cached_feed: that is the pusher's door, whose cold branch diffs
+                # pusher's warmed build while the pusher has an audience, else its own copy, one
+                # build at a time (_pure_feed). NOT _cached_feed: the pusher's door, whose cold branch diffs
                 # the bells, prunes notify-cards.json, pushes the badge and fills the pusher's cache
                 # — so on a headless kernel a script's GET did all four (2026-09-08). Token-gated
                 # like its stateful siblings; a read that moves none of those four (build_feed's own

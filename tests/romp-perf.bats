@@ -34,8 +34,8 @@ setup() {
     # A and B: the same kernel process ten seconds apart. Over the window: 20 cycles, 60 wakes, 6 s of
     # cycle time (4 s of it in push, 3 s of that in the chat block), 300 ms of pusher CPU and 50 ms of
     # judge CPU inside 500 ms of process CPU, 2 chat rebuilds against 18 cache hits, 1 MB sent as chat
-    # full frames, 100 goal loads, 2 judge passes totalling 2400 ms, 5 /tick requests and 3 WebSocket
-    # connects. B's lifetime figures (cycle_ms_max 900, ms_mean 1012.5) differ from the window's
+    # full frames, one GET /feed.json build (150 ms) against 4 of its cache hits, 100 goal loads, 2 judge
+    # passes totalling 2400 ms, 5 /tick requests and 3 WebSocket connects. B's lifetime figures (cycle_ms_max 900, ms_mean 1012.5) differ from the window's
     # (ring max 700, mean 1200) so a line printing the wrong one is caught.
     cat > "$SNAP_A" <<'JSON'
 {"now": 1000.0, "since": 900.0, "uptime_s": 100.0, "log": false,
@@ -44,7 +44,7 @@ setup() {
             "cycle_ms_max": 900.0, "cycle_ms_last": 200.0, "cycle_cpu_ms_sum": 10000.0,
             "cycle_ms_p50": 180.0, "cycle_ms_p90": 400.0, "cycle_ms_ring_max": 900.0, "ring_n": 100},
  "stages_ms": {"jobs": 5000.0, "push": 20000.0, "push.chat": 15000.0, "push.feed": 3000.0, "push.timeline": 1000.0, "push.send": 500.0},
- "builds": {"chat": {"cached": 80, "built": 20, "ms": 800.0}, "feed": {"cached": 90, "built": 10, "ms": 5000.0}, "timeline": {"cached": 95, "built": 5, "ms": 4000.0}},
+ "builds": {"chat": {"cached": 80, "built": 20, "ms": 800.0}, "feed": {"cached": 90, "built": 10, "ms": 5000.0}, "timeline": {"cached": 95, "built": 5, "ms": 4000.0}, "feedJson": {"cached": 5, "built": 1, "ms": 300.0}},
  "sends": {"full": {"chat": {"count": 10, "bytes": 1000000}}, "delta": {"chat": {"count": 100, "bytes": 50000}}, "deduped": {"feed": {"count": 90, "bytes": 9000000}}},
  "goals": {"loads": 1000, "saves": 200, "writes": 50},
  "judge": {"passes": 30, "ms_sum": 30000.0, "ms_last": 1000.0, "ms_mean": 1000.0, "cpu_ms_sum": 2000.0, "cpu_ms_workers": 1500.0},
@@ -57,7 +57,7 @@ JSON
             "cycle_ms_max": 900.0, "cycle_ms_last": 250.0, "cycle_cpu_ms_sum": 10300.0,
             "cycle_ms_p50": 190.0, "cycle_ms_p90": 420.0, "cycle_ms_ring_max": 700.0, "ring_n": 120},
  "stages_ms": {"jobs": 6000.0, "push": 24000.0, "push.chat": 18000.0, "push.feed": 3600.0, "push.timeline": 1200.0, "push.send": 600.0},
- "builds": {"chat": {"cached": 98, "built": 22, "ms": 880.0}, "feed": {"cached": 108, "built": 12, "ms": 6000.0}, "timeline": {"cached": 114, "built": 6, "ms": 4800.0}},
+ "builds": {"chat": {"cached": 98, "built": 22, "ms": 880.0}, "feed": {"cached": 108, "built": 12, "ms": 6000.0}, "timeline": {"cached": 114, "built": 6, "ms": 4800.0}, "feedJson": {"cached": 9, "built": 2, "ms": 450.0}},
  "sends": {"full": {"chat": {"count": 12, "bytes": 2048576}}, "delta": {"chat": {"count": 120, "bytes": 60000}}, "deduped": {"feed": {"count": 108, "bytes": 10800000}}},
  "goals": {"loads": 1100, "saves": 220, "writes": 55},
  "judge": {"passes": 32, "ms_sum": 32400.0, "ms_last": 1200.0, "ms_mean": 1012.5, "cpu_ms_sum": 2050.0, "cpu_ms_workers": 1540.0},
@@ -129,6 +129,8 @@ teardown() { rm -rf "$TEST_DIR"; }
     run "$ROMP_SCRIPT" perf --interval 0
     [ "$status" -eq 0 ]
     [[ "$output" == *"chat 2 built / 18 cached (40 ms avg)"* ]]
+    # GET /feed.json's own reads print beside the pusher's feed, never folded into it (review find, 2026-09-08)
+    [[ "$output" == *"feedJson 1 built / 4 cached (150 ms avg)"* ]]
     [[ "$output" == *"full 102 KB/s (chat 2 frames 102 KB/s)"* ]]        # 1048576 bytes over 10 s, bytes beside the count
     [[ "$output" == *"deduped 176 KB/s (feed 18 frames 176 KB/s)"* ]]
     [[ "$output" == *"10.0 loads/s   2.0 saves/s   0.5 writes/s"* ]]

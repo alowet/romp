@@ -1255,7 +1255,7 @@ st = {k: dl("stages_ms", k) for k in ("jobs", "push", "push.chat", "push.feed", 
 print("stages    jobs %s   push %s  (chat %s  feed %s  timeline %s  send %s)"
       % tuple(share(st[k]) for k in ("jobs", "push", "push.chat", "push.feed", "push.timeline", "push.send")))
 parts = []
-for k in ("chat", "feed", "timeline"):
+for k in ("chat", "feed", "timeline", "feedJson"):     # feedJson: GET /feed.json's own reads, apart from the pusher's feed
     built, cached, ms = dl("builds", k, "built"), dl("builds", k, "cached"), dl("builds", k, "ms")
     parts.append("%s %d built / %d cached%s" % (k, built, cached, (" (%.0f ms avg)" % (ms / built)) if built else ""))
 print("builds    " + "   ".join(parts))
