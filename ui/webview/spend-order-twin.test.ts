@@ -29,6 +29,7 @@ test("the landing's spApplyViewOrder is view-order.ts applyViewOrder, input for 
     [["h1:x", "y", "h2:z"], ["h2:z", "y"]],
     [[], ["a"]],
     [["a"], [1 as any, undefined as any]],
+    [["constructor", "toString", "__proto__", "a"], ["a", "__proto__"]],   // ids that collide with Object.prototype keys
   ];
   for (const [seed, view] of cases) {
     assert.deepEqual(f(seed as any, view as any), applyViewOrder(seed as any, view as any), JSON.stringify([seed, view]));

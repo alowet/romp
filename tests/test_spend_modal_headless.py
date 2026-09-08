@@ -178,6 +178,8 @@ class SpendModalServed(unittest.TestCase):
         self.assertTrue(yo["viewRows"][0].startswith("TESTHOST:web"), "the viewer's own arrangement wins over the seed: " + yo["viewRows"][0])
         self.assertEqual(yo["prefs"].get("order"), "yours")
         self.assertTrue(yo["pressed"])
+        self.assertTrue(o["mobile"]["persisted"]["pressed"], "the persisted choice is read back on a reload (review find: only the write was pinned)")
+        self.assertTrue(o["mobile"]["persisted"]["first"].strip().startswith("TESTHOST:api"), o["mobile"]["persisted"])
         self.assertTrue(any("tests" in r and "not running" in r for r in rows), "a dead session keeps its name, dimmed")
         self.assertTrue(any(r.strip().startswith("unattributed") for r in rows), "pre-attribution spend is a row of its own (its hatch mark leads)")
         self.assertGreaterEqual(o["out"]["deadRows"], 2)

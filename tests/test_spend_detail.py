@@ -501,9 +501,11 @@ class SpendDetail(unittest.TestCase):
         # T247f: "your order" is the tab strip's and the lanes' order — the kernel's shared seed
         # (session-order.json) per host, hosts local-first then the remotes listing's order; an older peer
         # that ships no order contributes nothing (its sessions trail, client-side)
-        (km.jd.STATE / "session-order.json").write_text(json.dumps([API, WEB]))
+        (km.jd.STATE / "session-order.json").write_text(json.dumps([API, TESTS, WEB]))
         d = km._spend_detail(now=NOW)
-        self.assertEqual(d["order"], [["TESTHOST", API], ["TESTHOST", WEB]], "one host: its seed, host-tagged")
+        self.assertEqual(d["order"], [["TESTHOST", API], ["TESTHOST", WEB]],
+                         "one host: its seed, host-tagged — restricted to what the tab strip renders (tests is dead: the "
+                         "file keeps its slot while its transcript is in the window, the strip shows no such tab, so it trails)")
         self._attach("PEERHOST", self._peer_server(self._peer_payload(0)))
         d = km._spend_detail(now=NOW)
         self.assertEqual(d["order"], [["TESTHOST", API], ["TESTHOST", WEB], ["PEERHOST", "22222222-3333-4444-5555-000000000001"]])

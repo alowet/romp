@@ -32596,10 +32596,14 @@ def _spend_detail_local(now=None):
             "tz": time.strftime("%Z", lt), "tzOffsetMin": int((getattr(lt, "tm_gmtoff", 0) or 0) // 60),
             "recordedAt": _spend_recorded_at(),
             "sessions": sessions,
-            # the shared session order (session-order.json — what a tab drag or a lane drag writes): the
-            # modal's "your order" seed (T247f); the viewer's own arrangement is applied client-side, the
-            # way the strip and the lanes apply it (view-order.ts)
-            "order": _session_order(),
+            # the shared session order (session-order.json — what a tab drag or a lane drag writes),
+            # restricted to the sessions the TAB STRIP renders (live, or kept open): the modal's "your
+            # order" seed (T247f). The file keeps a recently dead session at its slot while its transcript
+            # is in the discover window; the strip does not show it, and the modal follows the strip, so
+            # every session no longer running trails in spend order (review find: shipped verbatim, a
+            # session dead an hour interleaved with live rows). The viewer's own arrangement is applied
+            # client-side, the way the strip and the lanes apply it (view-order.ts).
+            "order": [s for s in _session_order() if s in live or s in set(_kept_open)],
             "unattributed": {"usd": round(un[0], 4), "tok": un[1], "turns": un[2]},
             "hours": hrs, "days": _series(days, day_keys)}
 
@@ -40947,12 +40951,12 @@ spLoadPrefs();
 // module's applyViewOrder, twinned here because the landing page loads no webview bundle; a node test
 // (ui/webview/spend-order-twin.test.ts) holds the two together. Sessions the order does not know (dead,
 // archived, an older peer's) trail in their spend order.
-function spApplyViewOrder(seed,view){var clean=function(xs){var out=[],seen={};(xs||[]).forEach(function(x){if(typeof x==='string'&&!seen[x]){seen[x]=1;out.push(x);}});return out;};var s=clean(seed);if(!view||!view.length)return s;var want={},placed={},out=[];s.forEach(function(x){want[x]=1;});clean(view).forEach(function(id){if(want[id]){placed[id]=1;out.push(id);}});s.forEach(function(id){if(!placed[id])out.push(id);});return out;}
+function spApplyViewOrder(seed,view){var clean=function(xs){var out=[],seen=Object.create(null);(xs||[]).forEach(function(x){if(typeof x==='string'&&!seen[x]){seen[x]=1;out.push(x);}});return out;};var s=clean(seed);if(!view||!view.length)return s;var want=Object.create(null),placed=Object.create(null),out=[];s.forEach(function(x){want[x]=1;});clean(view).forEach(function(id){if(want[id]){placed[id]=1;out.push(id);}});s.forEach(function(id){if(!placed[id])out.push(id);});return out;}
 function spViewOrder(){try{var o=JSON.parse(localStorage.getItem('romp:vieworder')||'[]');return Array.isArray(o)?o:[];}catch(e){return [];}}
 function spKey(d,s){return (s.host&&s.host!==d.host)?(s.host+':'+s.sid):s.sid;}
 function spOrdered(d){var ss=(d.sessions||[]).slice();if(SP.order!=='yours')return ss;
 var seed=(d.order||[]).map(function(p){return (p[0]&&p[0]!==d.host)?(p[0]+':'+p[1]):p[1];});
-var fin=spApplyViewOrder(seed,spViewOrder()),rank={};fin.forEach(function(id,i){rank[id]=i;});
+var fin=spApplyViewOrder(seed,spViewOrder()),rank=Object.create(null);fin.forEach(function(id,i){rank[id]=i;});
 var known=[],rest=[];ss.forEach(function(s){if(rank[spKey(d,s)]!==undefined)known.push(s);else rest.push(s);});
 known.sort(function(a,b){return rank[spKey(d,a)]-rank[spKey(d,b)];});return known.concat(rest);}
 // the chart's stacks follow the list, bottom to top = top row to bottom row
@@ -41007,7 +41011,7 @@ if(a==='close'){closeSpend();return;}
 if(a==='retry'){openSpend();return;}
 var m=/^(range|measure|order):(\\w+)$/.exec(a);if(!m)return;
 SP[m[1]]=m[2];spSavePrefs();
-if(m[1]==='order'){var tb=document.getElementById('rsp-table');if(tb)tb.innerHTML=sessionTable(SP.data);}
+if(m[1]==='order'){var tb=document.getElementById('rsp-table');if(tb){tb.innerHTML=sessionTable(SP.data);tb.scrollTop=0;}}   // the new order's head rows, not a mid-list slice (review find)
 var sib=b.parentNode.querySelectorAll('[data-act^="'+m[1]+':"]');
 for(var i=0;i<sib.length;i++){if(sib[i]===b)sib[i].classList.add('on');else sib[i].classList.remove('on');}
 renderChart();});
@@ -42986,9 +42990,9 @@ def _landing():
             # unattributed spend wears a TEXTURE, not a hue: it is not a session, and texture is the
             # dataviz fallback for a class that must never be confused with one
             ".rsp-hatch{background:repeating-linear-gradient(45deg,rgba(138,151,166,0.9) 0 1.5px,rgba(138,151,166,0.18) 1.5px 5px)}"
-            ".rsp-ctl{display:flex;align-items:center;gap:4px;margin:6px 0 8px}.rsp-gap{flex:0 0 12px}"
+            ".rsp-ctl{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin:6px 0 8px}.rsp-gap{flex:0 0 12px}"   # three chip pairs flow onto a second row on a phone, whole (review find)
             ".rsp-btn{background:none;border:1px solid rgba(255,255,255,0.14);border-radius:5px;color:#cfd6dd;font:inherit;"
-            "padding:2px 8px;cursor:pointer}"
+            "padding:2px 8px;cursor:pointer;white-space:nowrap}"
             ".rsp-btn.on{background:var(--accent,#9cd2ff);color:var(--accent-fg,#0c1a2e);border-color:transparent}"
             "#rsp-chart{position:relative}.rsp-svg{display:block;width:100%;background:rgba(255,255,255,0.04);border-radius:3px}"
             ".rsp-grid{stroke:rgba(255,255,255,0.10);stroke-width:1}"

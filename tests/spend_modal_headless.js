@@ -58,13 +58,12 @@ const { chromium } = require('playwright');
   });
   if (shots) await pg.screenshot({ path: shots + '-yourorder.png' });
   // a viewer arrangement (the strip's key) puts web first
-  const webSid = await pg.evaluate(() => { const r = window.__rompSpendData && window.__rompSpendData(); return r; });
   await pg.evaluate(() => { const rows = Array.from(document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr')); const web = rows.find((tr) => tr.textContent.includes('TESTHOST:web')); const sid = web && web.getAttribute('data-sid'); localStorage.setItem('romp:vieworder', JSON.stringify(sid ? [sid] : [])); });
   await pg.click('#rsp-panel [data-act="order:spend"]'); await pg.click('#rsp-panel [data-act="order:yours"]');
   await pg.waitForFunction(() => document.querySelector('#rsp-panel [data-act="order:yours"]').classList.contains('on'), null, { timeout: 5000 });
   yourOrder.viewRows = await pg.evaluate(() => Array.from(document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr')).map((tr) => tr.textContent.trim()));
   await pg.evaluate(() => { localStorage.removeItem('romp:vieworder'); });
-  await pg.click('#rsp-panel [data-act="order:spend"]');
+  // leave "your order" pressed: the phone reload below must read it back (the chip pressed on open, the rows ordered)
   await pg.click('#rsp-panel [data-act="measure:tok"]');
   await pg.click('#rsp-panel [data-act="range:days"]');
   await pg.waitForFunction(() => document.querySelector('#rsp-panel [data-act="range:days"]').classList.contains('on')
@@ -163,7 +162,10 @@ const { chromium } = require('playwright');
   await pg.waitForSelector('#rsp-panel .rsp-tbl', { timeout: 10000 });
   if (shots) await pg.screenshot({ path: shots + '-phone.png' });
   const panelHint = await pg.evaluate(() => document.getElementById('ru-tip').textContent.includes('Click for the full breakdown'));
-  const mobile = { railHidden, panelOpened: true, modalOpened: true, btn, panelHint };
+  const persisted = await pg.evaluate(() => ({ pressed: document.querySelector('#rsp-panel [data-act="order:yours"]').classList.contains('on'),
+    first: (document.querySelector('#rsp-panel .rsp-tbl tbody tr') || {}).textContent || '' }));
+  await pg.click('#rsp-panel [data-act="order:spend"]');   // restore the default for whoever runs next
+  const mobile = { railHidden, panelOpened: true, modalOpened: true, btn, panelHint , persisted };
   console.log(JSON.stringify({ yourOrder, hoverHint, hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, hiddenAfterDrag, lightErr, lightBtn, dim, timeout, mobile, errs }));
   await b.close();
 })().catch((e) => { console.error(e); process.exit(1); });
