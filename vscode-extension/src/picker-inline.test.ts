@@ -27,7 +27,7 @@ test("renderLiveAsk keeps the picker last and reveals it when the user is parked
   assert.match(SRC, /if \(content && host\.parentNode === content && host !== content\.lastChild\) content\.appendChild\(host\)/);
   // scroll the transcript to the bottom to reveal the picker — only when stuck to the bottom (never yank a
   // user scrolled up reading context)
-  assert.match(SRC, /const v = activeId \? views\.get\(activeId\) : undefined;\s*\n\s*if \(content && \(!v \|\| v\.stick\)\) content\.scrollTop = content\.scrollHeight;/);
+  assert.match(SRC, /const v = activeId \? views\.get\(activeId\) : undefined;\s*\n\s*if \(content && \(!v \|\| v\.stick\)\) writeScroll\(content, content\.scrollHeight, "liveask-reveal", true\);/);
 });
 
 test("#live-ask is no longer a fixed 42vh mini-region — it flows in the scroll", () => {

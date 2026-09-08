@@ -67,7 +67,7 @@ test("appendActive snaps only when the user is already near the bottom of OVERFL
   // the slack rule (the user 2026-08-25): while nothing overflows, nearBottom is trivially true —
   // ungated, the very append crossing the overflow boundary yanked the view; now streaming into
   // slack writes in place and grows the scrollbar, and the stick engages only once overflowing
-  assert.match(RENDER, /const stick = content\.scrollHeight > content\.clientHeight \+ 2 && nearBottom\(content\);[\s\S]*?if \(stick\) content\.scrollTop = content\.scrollHeight/,
+  assert.match(RENDER, /const stick = content\.scrollHeight > content\.clientHeight \+ 2 && nearBottom\(content\);[\s\S]*?if \(stick\) writeScroll\(content, content\.scrollHeight, "append-stick", true\)/,
     "tail-append follows the live edge only if content overflows AND the reader was at the bottom");
   // the popover's thread list speaks the same rule
   assert.match(RENDER, /const overflowed = list\.scrollHeight > list\.clientHeight \+ 2;/);
@@ -83,13 +83,13 @@ test("a scrolled-up append restores by turn ANCHOR (data-uuid), raw scrollTop on
   const fn = RENDER.slice(RENDER.indexOf("function appendActive"), RENDER.indexOf("window.addEventListener(\"resize\", scheduleRestamp)"));
   assert.match(fn, /const anchor = !stick && v \? captureScrollAnchor\(content, v\) : null;/,
     "the anchor is captured BEFORE the rebuild, only when scrolled up");
-  assert.match(fn, /else if \(!\(v && restoreScrollAnchor\(content, v, anchor\)\)\) content\.scrollTop = before;/,
+  assert.match(fn, /else if \(!\(v && restoreScrollAnchor\(content, v, anchor\)\)\) writeScroll\(content, before, "append-raw"\);/,
     "anchor-relative restore first; the raw pixel offset only when the anchor was evicted");
   assert.match(RENDER, /function captureScrollAnchor\(content: HTMLElement, v: View\)/);
   assert.match(RENDER, /r\.bottom > cTop \+ 1/, "the anchor is the first turn still visible at the viewport top");
   assert.match(RENDER, /querySelector\(`\[data-uuid="\$\{cssEscape\(a\.uuid\)\}"\]`\)/,
     "the anchor re-resolves by its stable uuid after the rebuild");
-  assert.match(RENDER, /content\.scrollTop = yNow - a\.y;/, "the anchor turn keeps its exact on-screen offset");
+  assert.match(RENDER, /writeScroll\(content, yNow - a\.y, "anchor-restore"\);/, "the anchor turn keeps its exact on-screen offset");
 });
 
 // BY-ID landing only — NO time-based fallback anywhere (the user 2026-06-20, who wanted to shrink the 29%, then remove
@@ -199,7 +199,7 @@ test("ResizeObservers on #tabbar AND #ledger compensate #content.scrollTop by th
   // shift scrollTop by (new - old) box height — only when not stuck to bottom and the pane is visible
   assert.match(RENDER, /content\.clientHeight > 0 && !nearBottom\(content\)/,
     "skipped when stuck to the bottom or the pane is hidden");
-  assert.match(RENDER, /content\.scrollTop \+= h - lastH/, "compensates by the exact height delta");
+  assert.match(RENDER, /writeScroll\(content, content\.scrollTop \+ \(h - lastH\), "box-resize"\)/, "compensates by the exact height delta");
   assert.match(RENDER, /if \(v\) v\.scrollTop = content\.scrollTop/, "keeps the per-view saved scroll in sync");
 });
 
@@ -209,5 +209,5 @@ test("a focus with `live` lands on the live tail — a blocked card's picker/per
   // cover the ALREADY-ACTIVE case, where setActive early-returns (activeId === id, no anchor) → jump to
   // bottom ONE FRAME later (the user 2026-08-13): when this focus is what un-hid a closed pane, the
   // synchronous scroll ran at display:none (scrollHeight 0) and the jump read as a no-op
-  assert.match(RENDER, /if \(m\.live && activeId === m\.id\) \{[\s\S]{0,700}?window\.requestAnimationFrame\(\(\) => \{\s*\n\s*const c = document\.getElementById\("content"\); if \(c\) c\.scrollTop = c\.scrollHeight;/);
+  assert.match(RENDER, /if \(m\.live && activeId === m\.id\) \{[\s\S]{0,700}?window\.requestAnimationFrame\(\(\) => \{\s*\n\s*const c = document\.getElementById\("content"\); if \(c\) writeScroll\(c, c\.scrollHeight, "focus-live", true\);/);
 });

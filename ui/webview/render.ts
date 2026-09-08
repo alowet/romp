@@ -57,6 +57,7 @@ import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDown
 import { followReader, keepPlaceAcrossShow } from "./scroll-keep";
 import { retainLiveOmitted } from "./tab-order";
 import { userTurnShows } from "./user-turn-content";
+import { ScrollDiagBudget, classifyScroll, scrollWriteRow } from "./scroll-write";
 import { keepResidentEvents } from "./frame-merge";
 import { activeTabToReannounce } from "./relay-active";
 import { dirStatusHint, nextDirActive, createDirPrompt, type DirStatus } from "./dir-complete";
@@ -462,7 +463,7 @@ function registerOptimistic(id: string, text: string, imgPaths?: string[]): void
     const content = document.getElementById("content");
     const wasAtBottom = !!content && nearBottom(content);
     appendActive();
-    if (content && wasAtBottom) content.scrollTop = content.scrollHeight;
+    if (content && wasAtBottom) writeScroll(content, content.scrollHeight, "optimistic-send", true);
   }
 }
 
@@ -9166,6 +9167,31 @@ function nearBottom(c: HTMLElement): boolean {
   return c.scrollHeight - c.scrollTop - c.clientHeight < 80;
 }
 
+// EVERY programmatic write to #content.scrollTop goes through here (T262, the user 2026-09-08, whose view "jumps
+// up slightly on my scroll" on a page whose bundle state nobody could see): a write that moved the view files one
+// client-diag row naming its writer (before, after, delta, whether it was a follow-to-bottom), and the scroll
+// listener below files a "scrollgesture" row for every scroll these writes do not explain, so a recording's
+// timestamps match the laptop's client-diag.jsonl and the next occurrence is convictable. Capped per session per
+// minute per kind (scroll-write.ts), one "capped" row at the cap; no stack traces; a write that did not move the
+// view files nothing. The value written is applied exactly as before: this changes nothing about WHERE the view
+// lands, only that the landing is on the record.
+let lastScrollWriteAfter: number | null = null;
+const scrollDiag = new ScrollDiagBudget();
+function scrollDiagRow(kind: "scrollwrite" | "scrollgesture", data: any): void {
+  const v = scrollDiag.take(activeId || "", kind, Date.now());
+  if (v === "drop") return;
+  vscodeApi?.postMessage(v === "cap"
+    ? { type: "clientDiag", surface: "chat", what: kind + "-capped", data: { sid: activeId || "", perMinute: 40 } }
+    : { type: "clientDiag", surface: "chat", what: kind, data });
+}
+function writeScroll(content: HTMLElement, top: number, writer: string, stick = false): void {
+  const before = content.scrollTop;
+  content.scrollTop = top;
+  const after = content.scrollTop;
+  lastScrollWriteAfter = after;
+  if (after !== before) scrollDiagRow("scrollwrite", scrollWriteRow(activeId || "", writer, before, after, stick));
+}
+
 function cssEscape(s: string): string {
   return typeof (window as any).CSS?.escape === "function" ? CSS.escape(s) : s.replace(/["\\]/g, "\\$&");
 }
@@ -9270,7 +9296,7 @@ function scrollToAnchor(uuid: string): boolean {
     const content = document.getElementById("content");
     if (content) {
       const yNow = target.getBoundingClientRect().top - content.getBoundingClientRect().top + content.scrollTop;
-      content.scrollTop = yNow - keepY;
+      writeScroll(content, yNow - keepY, "keep-offset");
     }
     return true;
   }
@@ -9841,7 +9867,7 @@ function toggleToolGroup(key: string): void {
   // the expand/collapse changes the DOM without changing the event set, so mark the view stale to force
   // the compact rebuild past the cache guard (a plain tab switch leaves stale false → reuses the cache).
   if (activeId) { const v = views.get(activeId); if (v) v.stale = true; syncView(activeId); }
-  if (content) content.scrollTop = top;
+  if (content) writeScroll(content, top, "toolgroup-toggle");
   refillOpenCommentPop();   // the popover renders the same units — its copy of this run must flip too
   scheduleRailSticky();
 }
@@ -10229,8 +10255,8 @@ function landActive(content: HTMLElement | null, v: View): void {
     }
   }
   if (!scrolled) {
-    if (!v.shown || v.stick) content.scrollTop = content.scrollHeight;
-    else content.scrollTop = v.scrollTop;
+    if (!v.shown || v.stick) writeScroll(content, content.scrollHeight, "land-bottom", true);
+    else writeScroll(content, v.scrollTop, "land-saved");
   }
   v.shown = true;
   scheduleRailSticky();
@@ -10264,7 +10290,7 @@ function restoreScrollAnchor(content: HTMLElement, v: View, a: { uuid: string; y
   const el = v.el.querySelector(`[data-uuid="${cssEscape(a.uuid)}"]`) as HTMLElement | null;
   if (!el) return false;
   const yNow = el.getBoundingClientRect().top - content.getBoundingClientRect().top + content.scrollTop;
-  content.scrollTop = yNow - a.y;              // the anchor turn keeps its exact on-screen offset
+  writeScroll(content, yNow - a.y, "anchor-restore");   // the anchor turn keeps its exact on-screen offset
   return true;
 }
 
@@ -10311,8 +10337,8 @@ function appendActive() {
   syncView(activeId, stick);
   syncHostOfflineFoot();                 // before the scroll maths: it changes scrollHeight
   updateStatusline();
-  if (stick) content.scrollTop = content.scrollHeight;
-  else if (!(v && restoreScrollAnchor(content, v, anchor))) content.scrollTop = before;
+  if (stick) writeScroll(content, content.scrollHeight, "append-stick", true);
+  else if (!(v && restoreScrollAnchor(content, v, anchor))) writeScroll(content, before, "append-raw");
   scheduleRailSticky();
   updateJumpBtn();   // appends can cross the overflow boundary either way — re-read the chip's truth
 }
@@ -10364,7 +10390,7 @@ function updateJumpBtn(): void {
 jumpBtn.onclick = () => {
   const c = document.getElementById("content");
   if (!c) return;
-  c.scrollTop = c.scrollHeight;                       // the snap IS the acknowledgment
+  writeScroll(c, c.scrollHeight, "jump-button", true);   // the snap IS the acknowledgment
   const v = activeId ? views.get(activeId) : undefined;
   if (v) { v.stick = true; v.scrollTop = c.scrollTop; }   // the explicit re-entry into follow mode
   updateJumpBtn();                                    // at the bottom now — the chip hides itself
@@ -10398,6 +10424,10 @@ window.addEventListener("resize", updateJumpBtn);
   if (c) c.addEventListener("scroll", () => {
     if (c.clientHeight <= 0) return;
     followReader(activeId ? views.get(activeId) : null, c.scrollTop, nearBottom(c), pendingBuildRaf != null);
+    // the scroll nobody's code asked for is the user's (T262): filed so a recording lines up with the journal;
+    // a write's own echo (within a pixel of the value written) is consumed here and never read as a gesture
+    if (classifyScroll(c.scrollTop, lastScrollWriteAfter) === "write-echo") lastScrollWriteAfter = null;
+    else scrollDiagRow("scrollgesture", { sid: activeId || "", top: c.scrollTop, gesture: true });
   }, { passive: true });
 }
 // Boxes ABOVE the transcript grow/shrink → keep the chat text visually anchored (the user 2026-06-30 for
@@ -10417,7 +10447,7 @@ if (typeof ResizeObserver === "function") {
       const h = entries[0]?.contentRect?.height ?? 0;
       const content = document.getElementById("content");
       if (content && lastH >= 0 && h !== lastH && content.clientHeight > 0 && !nearBottom(content)) {
-        content.scrollTop += h - lastH;
+        writeScroll(content, content.scrollTop + (h - lastH), "box-resize");
         const v = activeId ? views.get(activeId) : null;
         if (v) v.scrollTop = content.scrollTop;               // keep the per-view saved position in sync
       }
@@ -10461,7 +10491,7 @@ if (typeof ResizeObserver === "function") {
       // growing the bar shrinks #content, which would push a tail-following view off the tail one
       // sub-threshold step at a time — if it was at the tail when the drag began, keep it there
       const content = document.getElementById("content");
-      if (stick && content) content.scrollTop = content.scrollHeight;
+      if (stick && content) writeScroll(content, content.scrollHeight, "tabbar-drag", true);
     };
     const onUp = () => {
       if (!dragging) return;
@@ -10554,7 +10584,7 @@ function virtualizeToViewport(): void {
       const anchor = v.el.querySelector(`[data-unit="${c}"]`) as HTMLElement | null;
       if (anchor) {
         const yNow = anchor.getBoundingClientRect().top - content.getBoundingClientRect().top + content.scrollTop;
-        content.scrollTop = yNow - beforeY;
+        writeScroll(content, yNow - beforeY, "rewindow");
       }
       if (activeId) applyCommentMarks(activeId);   // the re-window rebuilt turns — re-anchor highlights
       scheduleRailSticky();
@@ -11246,7 +11276,7 @@ function renderLiveAsk() {
   // Reveal the picker if the user is parked at the bottom — it's part of the scroll flow now, so new/taller
   // pickers would otherwise land below the fold. Never yank a user who has scrolled UP to read context.
   const v = activeId ? views.get(activeId) : undefined;
-  if (content && (!v || v.stick)) content.scrollTop = content.scrollHeight;
+  if (content && (!v || v.stick)) writeScroll(content, content.scrollHeight, "liveask-reveal", true);
 }
 
 // The focused option's side-by-side preview box, reproduced VERBATIM in a monospace block (the user
@@ -13237,7 +13267,7 @@ const navHist = new NavHistory({
     if (v) { v.scrollTop = spot.top; v.stick = false; }   // land on the remembered spot, never the live bottom
     setActive(spot.sid);
     const c = document.getElementById("content");
-    if (c) whenChatVisible(() => { if (activeId === spot.sid) c.scrollTop = spot.top; });
+    if (c) whenChatVisible(() => { if (activeId === spot.sid) writeScroll(c, spot.top, "nav-history"); });
   },
 });
 
@@ -13972,7 +14002,7 @@ window.addEventListener("message", perfFrameHandler("chat", (m) => vscodeApi?.po
       // pane was already visible the deferral is invisible. Anchored jumps need nothing: landOn's
       // ResizeObserver realign already re-lands them when the pane sizes in.
       window.requestAnimationFrame(() => {
-        const c = document.getElementById("content"); if (c) c.scrollTop = c.scrollHeight;
+        const c = document.getElementById("content"); if (c) writeScroll(c, c.scrollHeight, "focus-live", true);
       });
     } else {
       pendingAnchorQuote = typeof (m as { anchorQuote?: string }).anchorQuote === "string" ? (m as { anchorQuote?: string }).anchorQuote! : null;   // the supporting span (T218) — consumed by the landing

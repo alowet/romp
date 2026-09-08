@@ -1,0 +1,56 @@
+// T262 (the user 2026-09-08): a view that "jumps up slightly on my scroll", on a page whose bundle state nobody can
+// see. Every programmatic write to #content.scrollTop rides ONE helper (render.ts writeScroll) that files a
+// client-diag breadcrumb naming its writer, and the scroll listener files a gesture marker for every scroll the
+// writes do not explain — so the next occurrence is convictable from the laptop's client-diag.jsonl. Executed
+// budget + classifier + row shape; render.ts pins: the helper, every writer name, and NO raw write left. Red on main.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { ScrollDiagBudget, classifyScroll, scrollWriteRow, SCROLL_DIAG_CAP_PER_MINUTE } from "./scroll-write";
+
+const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
+const SID = "TESTHOST:11111111-2222-4333-8444-000000000262";
+
+test("the budget sends up to the cap per session per minute, says 'cap' once, drops the rest, and rolls with the minute", () => {
+  const b = new ScrollDiagBudget(3);
+  const t0 = 1_700_000_000_000;
+  assert.deepEqual([b.take(SID, "scrollwrite", t0), b.take(SID, "scrollwrite", t0 + 10), b.take(SID, "scrollwrite", t0 + 20)], ["send", "send", "send"]);
+  assert.equal(b.take(SID, "scrollwrite", t0 + 30), "cap", "the (cap+1)th files one capped row");
+  assert.equal(b.take(SID, "scrollwrite", t0 + 40), "drop");
+  assert.equal(b.take(SID, "scrollgesture", t0 + 40), "send", "kinds are budgeted apart");
+  assert.equal(b.take("other", "scrollwrite", t0 + 40), "send", "sessions are budgeted apart");
+  assert.equal(b.take(SID, "scrollwrite", t0 + 60_000), "send", "the next minute starts fresh");
+  assert.equal(SCROLL_DIAG_CAP_PER_MINUTE, 40);
+});
+
+test("a scroll event within a pixel of the last programmatic write is its echo; anything else is a gesture", () => {
+  assert.equal(classifyScroll(1200, 1200), "write-echo");
+  assert.equal(classifyScroll(1200.5, 1200), "write-echo", "sub-pixel rounding");
+  assert.equal(classifyScroll(1230, 1200), "gesture");
+  assert.equal(classifyScroll(1200, null), "gesture", "no write pending: the user did it");
+});
+
+test("the row names the writer and carries before/after/delta/stick, gesture:false", () => {
+  assert.deepEqual(scrollWriteRow(SID, "append-stick", 100, 340, true),
+                   { sid: SID, writer: "append-stick", before: 100, after: 340, delta: 240, stick: true, gesture: false });
+});
+
+test("render.ts: one helper writes #content.scrollTop, files the row only when the view moved, and no raw write remains", () => {
+  assert.match(RENDER, /import \{ ScrollDiagBudget, classifyScroll, scrollWriteRow \} from "\.\/scroll-write";/);
+  assert.match(RENDER, /function writeScroll\(content: HTMLElement, top: number, writer: string, stick = false\): void \{\s*\n\s*const before = content\.scrollTop;\s*\n\s*content\.scrollTop = top;\s*\n\s*const after = content\.scrollTop;\s*\n\s*lastScrollWriteAfter = after;\s*\n\s*if \(after !== before\) scrollDiagRow\("scrollwrite", scrollWriteRow\(activeId \|\| "", writer, before, after, stick\)\);/);
+  // the breadcrumb rides the existing clientDiag path, capped, with one capped row at the cap
+  assert.match(RENDER, /\{ type: "clientDiag", surface: "chat", what: kind \+ "-capped", data: \{ sid: activeId \|\| "", perMinute: 40 \} \}/);
+  assert.match(RENDER, /\{ type: "clientDiag", surface: "chat", what: kind, data \}/);
+  // every writer is named
+  for (const w of ["optimistic-send", "keep-offset", "toolgroup-toggle", "land-bottom", "land-saved", "anchor-restore",
+                   "append-stick", "append-raw", "jump-button", "box-resize", "tabbar-drag", "rewindow", "liveask-reveal",
+                   "nav-history", "focus-live"]) {
+    assert.match(RENDER, new RegExp('writeScroll\\((?:content|c), [^;]*"' + w + '"'), "writer " + w + " goes through the helper");
+  }
+  // no raw #content write outside the helper (menus, the editor box and the per-view bookkeeping are not the transcript)
+  const raw = RENDER.split("\n").filter((l) => /\b(content|c)\.scrollTop (=|\+=|-=) /.test(l) && !/writeScroll|const |let /.test(l));
+  assert.deepEqual(raw.map((l) => l.trim()), ["content.scrollTop = top;"], "the only assignment is the helper's own");
+  // the gesture marker: a write's echo is consumed, anything else files a gesture row
+  assert.match(RENDER, /if \(classifyScroll\(c\.scrollTop, lastScrollWriteAfter\) === "write-echo"\) lastScrollWriteAfter = null;\s*\n\s*else scrollDiagRow\("scrollgesture", \{ sid: activeId \|\| "", top: c\.scrollTop, gesture: true \}\);/);
+});

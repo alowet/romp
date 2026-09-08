@@ -65,7 +65,7 @@ test("a send that first overflows the pane still reveals itself — nearBottom i
 // ── source pins: the replica models the real code ─────────────────────────────────────────────────
 
 test("registerOptimistic gates the snap on a pre-append nearBottom read", () => {
-  assert.match(RENDER, /const wasAtBottom = !!content && nearBottom\(content\);\s*\n\s*appendActive\(\);\s*\n\s*if \(content && wasAtBottom\) content\.scrollTop = content\.scrollHeight;/);
+  assert.match(RENDER, /const wasAtBottom = !!content && nearBottom\(content\);\s*\n\s*appendActive\(\);\s*\n\s*if \(content && wasAtBottom\) writeScroll\(content, content\.scrollHeight, "optimistic-send", true\);/);
   // nearBottom's 80px threshold — the replica's constant
   assert.match(RENDER, /function nearBottom\(c: HTMLElement\): boolean \{\s*\n\s*return c\.scrollHeight - c\.scrollTop - c\.clientHeight < 80;/);
   // appendActive's stick rule — overflow gate + nearBottom, restore otherwise

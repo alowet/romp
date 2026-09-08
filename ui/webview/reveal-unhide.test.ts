@@ -12,6 +12,6 @@ const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview"
 
 test("focus reveals the pane first, and the live-tail scroll waits one frame for real layout", () => {
   assert.match(RENDER, /revealSelfPane\(\);\s+\/\/ every focus is someone jumping HERE/);
-  assert.match(RENDER, /window\.requestAnimationFrame\(\(\) => \{\s*\n\s*const c = document\.getElementById\("content"\); if \(c\) c\.scrollTop = c\.scrollHeight;\s*\n\s*\}\);/,
+  assert.match(RENDER, /window\.requestAnimationFrame\(\(\) => \{\s*\n\s*const c = document\.getElementById\("content"\); if \(c\) writeScroll\(c, c\.scrollHeight, "focus-live", true\);\s*\n\s*\}\);/,
     "one frame later, not now — the un-hide lands a task after the postMessage");
 });
