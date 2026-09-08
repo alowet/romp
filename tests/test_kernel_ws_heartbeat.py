@@ -129,12 +129,15 @@ class BuildDriftBanner(unittest.TestCase):
         # that doesn't know its build can never false-positive
         self.assertIn("var LOADEDV=0;", km._shim("feed"))
 
-    def test_shim_raises_the_build_banner_once_shell_or_self(self):
+    def test_shim_raises_build_drift_once_to_the_reload_core_with_the_bar_as_fallback(self):
+        # T265 (the user 2026-09-08): the raise asks the reload core (the page reloads itself, never mid-gesture);
+        # the self-injected bar is only the fallback for a host that refuses location.reload
         js = km._shim("chat", 7)
-        self.assertIn('window.parent.postMessage({romp:"wsStale",build:1}', js,
-                      "embedded pane routes build drift to the shell banner, tagged so it words it as a BUILD")
+        self.assertIn('if(R){R.refused=function(){selfBar("A newer romp build is available.","build");};R.request("build","");}', js,
+                      "build drift is a reload request to the core; the bar only if the reload is refused")
+        self.assertNotIn('postMessage({romp:"wsStale",build:1}', js, "the hand-off to the shell banner is gone")
         self.assertIn('selfBar("A newer romp build is available.","build")', js,
-                      "standalone page self-injects the same reload bar")
+                      "standalone page self-injects the bar when the core is absent or refused")
         self.assertIn("var buildRaised=false,freshPending=false,restartAnnounced=0;", js)   # latched: one prompt per page life (T217 added the announced-restart latch to the line)
         #                                    (freshPending rides along: the CONN prompt's self-retire, 2026-08-01)
 

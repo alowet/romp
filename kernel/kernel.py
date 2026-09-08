@@ -34795,9 +34795,10 @@ WS_DEAD_S = float(os.environ.get("ROMP_WS_DEAD", "0")) or 3 * KEEPALIVE_S
 def _keepalive_all(now=None):
     # `dv` = the current dist build token (the same value baked into every page's ?v= urls). Riding the
     # keepalive makes build-drift detection EVENT-based on every surface with a live socket: a page whose
-    # LOADEDV is older raises the reload banner within one heartbeat of a rebuild — no per-page /version
-    # polling. The VS Code extension compares it against its bundled build stamp the same way (the user
-    # 2026-07-13: a stale tab sat silent through several rebuilds; drift must always show a banner).
+    # LOADEDV is older reloads itself within one heartbeat of a rebuild (T265, the user 2026-09-08; until then
+    # it raised the reload banner, the user 2026-07-13, whose stale tab sat silent through several rebuilds) —
+    # no per-page /version polling. The VS Code extension compares it against its bundled build stamp the same
+    # way and keeps its banner: a webview reload cannot fix bundled-code drift.
     s = json.dumps({"type": "ka", "dv": _dist_ver()})
     now = _ws_clock() if now is None else now
     with _clients_lock:
@@ -39345,12 +39346,99 @@ html,body{background:var(--vscode-editor-background);}
 body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-foreground);margin:0;padding:0;}"""
 
 # The WS bridge shim (ported verbatim from chat-view server.ts shimJs — same protocol).
+# ── the dashboard reloads ITSELF on a kernel restart and on a newer served bundle (T265) ──────────────────────
+# The user's ruling of 2026-09-08 (about 10:50 AM PT) supersedes their 2026-07-13 preference for a banner the
+# reader clicks: any restart of the kernel SERVING the page, and any bundle newer than the one the page loaded
+# with, reload the page by themselves. Two signals, both exact events, never a timer:
+#   (1) kernel restart — a socket REOPEN whose /version answers with a boot id other than the one baked into the
+#       page (checkBoot: the shell asks on its own socket's reopen; a standalone pane asks on its shim's
+#       reconnect); the 30 s /version poll the stale banner already ran is the backstop for a page whose socket
+#       never dropped (noteVersion, the same reading).
+#   (2) build drift — a `dv` on a keepalive, or /version's dist_ver, above the page's baked LOADEDV (noteDv).
+# Never mid-gesture: a pointer button held, a drag in flight, a text selection being made, or the composer
+# focused with text ARMS the reload, and the ending event (pointerup/pointercancel, dragend/drop,
+# selectionchange, input, focusout; a window blur releases every hold) fires it. The shell composes gesture state
+# across its same-origin panes, and a pane forwards its request to the shell when one is there, so ONE decision
+# reloads the top document; a standalone pane page decides for itself, and so does a pane under a foreign parent
+# (an iframe in another app can reload itself). Before reloading: every pane persists what a reload loses
+# (window.__rompPersistForReload — the chat pane's scroll position + follow mode; the draft and the active tab are
+# persisted already), the shell's lifted modals close (settings/picker), and a marker rides sessionStorage so the
+# fresh page leaves ONE notification-center line ("Reloaded onto build N — the kernel restarted / a newer romp
+# build was served"). If location.reload throws (a host that forbids it) the old banner is the fallback (the
+# `refused` hook). The VS Code webview never runs this: the extension loads its bundle from the installed VSIX
+# and a webview reload cannot fix bundled-code drift, so its own reload prompt stays (vscode-extension/src/
+# extension.ts). Federated relay: a REMOTE kernel's restart must not reload the page — and cannot: the core reads
+# only THIS page's own socket and /version (federation.ts drops remote `ka` frames, so they never reach the shim's
+# dv check, and the relay never forwards a remote kernel's boot id). tests/test_dashboard_auto_reload.py runs
+# this code in node with fakes and pins the wiring.
+_RELOAD_CORE_JS = r"""/*reload-core*/(function(){if(window.__rompReload)return;
+var LOADED=__LOADEDVER__,BOOT=__ROMP_BOOT__,ptr=0,drag=false,owed=null,fired=false;
+function shell(){try{var p=window.parent;if(p&&p!==window&&p.__rompReload)return p.__rompReload;}catch(e){}return null;}
+function busyHere(){if(ptr>0)return 'pointer';if(drag)return 'drag';
+try{var s=document.getSelection&&document.getSelection();if(s&&s.rangeCount&&!s.isCollapsed&&String(s).length)return 'selection';}catch(e){}
+try{var c=document.getElementById('composer-input');if(c&&document.activeElement===c&&(c.value||'').trim())return 'composer';}catch(e){}
+return '';}
+function panes(){var out=[],fs=document.querySelectorAll?document.querySelectorAll('iframe'):[];
+for(var i=0;i<fs.length;i++){try{var w=fs[i].contentWindow;if(w&&w.__rompReload)out.push(w);}catch(e){}}return out;}
+function busy(){var b=busyHere();if(b)return b;var ps=panes();for(var i=0;i<ps.length;i++){b=ps[i].__rompReload.busyHere();if(b)return b;}return '';}
+function persist(){try{if(window.__rompPersistForReload)window.__rompPersistForReload();}catch(e){}
+var ps=panes();for(var i=0;i<ps.length;i++){try{if(ps[i].__rompPersistForReload)ps[i].__rompPersistForReload();}catch(e){}}}
+function fire(){if(fired)return;fired=true;
+try{sessionStorage.setItem('romp:reloaded',JSON.stringify({reason:owed.reason,detail:owed.detail||'',from:LOADED,t:Date.now()}));}catch(e){}
+persist();
+try{document.body.classList.remove('settings-open','picker-open');}catch(e){}
+try{location.reload();}catch(e){fired=false;R.waiting='refused';if(R.refused)R.refused(owed);}}
+function tryFire(){if(!owed||fired)return;var b=busy();if(b){R.waiting=b;return;}R.waiting='';fire();}
+function request(reason,detail){var s=shell();if(s){s.request(reason,detail);return;}if(fired)return;
+if(!owed)owed={reason:reason,detail:detail||''};tryFire();}
+function noteDv(dv){if(LOADED&&dv&&dv>LOADED)request('build',String(dv));}
+function noteVersion(v){if(!v)return;if(v.boot&&BOOT&&v.boot!==BOOT)request('restart',String(v.boot));if(v.dist_ver)noteDv(v.dist_ver);}
+function checkBoot(){try{fetch('/version',{cache:'no-store'}).then(function(r){return r.json();}).then(noteVersion)['catch'](function(){});}catch(e){}}
+function announce(notify){var raw=null;try{raw=sessionStorage.getItem('romp:reloaded');if(raw)sessionStorage.removeItem('romp:reloaded');}catch(e){}
+if(!raw)return null;var d=null;try{d=JSON.parse(raw);}catch(e){return null;}if(!d)return null;
+var why=d.reason==='restart'?'the kernel restarted':'a newer romp build was served';
+var txt='Reloaded onto build '+LOADED+' — '+why+'.';try{if(notify)notify('reload',txt);}catch(e){}return txt;}
+document.addEventListener('pointerdown',function(){ptr++;},true);
+document.addEventListener('pointerup',function(){ptr=Math.max(0,ptr-1);},true);
+document.addEventListener('pointercancel',function(){ptr=Math.max(0,ptr-1);},true);
+document.addEventListener('dragstart',function(){drag=true;},true);
+document.addEventListener('dragend',function(){drag=false;},true);
+document.addEventListener('drop',function(){drag=false;},true);
+var END=['pointerup','pointercancel','dragend','drop','selectionchange','input','focusout'];
+function ended(){var s=shell();if(s)s.tryFire();else tryFire();}
+for(var k=0;k<END.length;k++)document.addEventListener(END[k],ended,true);
+window.addEventListener('blur',function(){ptr=0;drag=false;ended();});
+var R={request:request,tryFire:tryFire,busyHere:busyHere,busy:busy,noteDv:noteDv,noteVersion:noteVersion,checkBoot:checkBoot,announce:announce,
+inShell:function(){return !!shell();},owed:function(){return owed;},fired:function(){return fired;},refused:null,waiting:'',loaded:LOADED,boot:BOOT};
+window.__rompReload=R;})();/*end-reload-core*/"""
+
+
+def _reload_core(v=0):
+    """The reload core with this page's build token and this kernel's boot id baked in (see _RELOAD_CORE_JS).
+    Embedded by _shim (every pane page) and _stale_block (the dashboard landing)."""
+    return _RELOAD_CORE_JS.replace("__LOADEDVER__", str(int(v))).replace("__ROMP_BOOT__", json.dumps(_BOOT_ID))
+
+
+def _reload_core_js(v=0, boot=None):
+    """The reload core's IIFE alone — the code between its /*reload-core*/ anchors, baked for `v` and `boot` — so a
+    node test runs the REAL decision code with fakes for document, window, location, sessionStorage and fetch
+    (test_dashboard_auto_reload.py). Fails loudly if the anchors ever go missing."""
+    js = _RELOAD_CORE_JS.replace("__LOADEDVER__", str(int(v))).replace(
+        "__ROMP_BOOT__", json.dumps(_BOOT_ID if boot is None else boot))
+    a, b = "/*reload-core*/", "/*end-reload-core*/"
+    i, j = js.find(a), js.find(b)
+    if i < 0 or j < i:
+        raise RuntimeError("the reload-core anchors are missing from _RELOAD_CORE_JS")
+    return js[i + len(a):j]
+
+
 def _shim(app, v=0):
     # `v` = the dist build token this page was served with (its ?v= urls). The shim compares it against the
     # `dv` riding every keepalive and raises the build banner on drift — so EVERY kernel-served page gets the
     # "newer build" prompt, not just the dashboard landing's /version poll (the user 2026-07-13: a standalone
     # pane sat silent through rebuilds).
     return """
+%s
 (function(){/*shim-core*/var queue=[],ws=null,everConnected=false;
 var queuedDiag=0,DIAG_QUEUE_MAX=20;   // clientDiag rows waiting in `queue` for a reconnect, capped (an outage must not pile up breadcrumbs); other queued messages are untouched
 var failedConnects=0,firstFailT=0;   // handshakes that never OPENED since the last open: reported as ONE wsconnfail row on the next open, never one wsclose per redial
@@ -39376,7 +39464,10 @@ function netState(s){try{if(window.parent!==window)window.parent.postMessage({ro
 // "Re-judging" frame long after the kernel had moved on). PROMPT the user to reload rather than silently
 // auto-reloading (foisted, jarring) or leaving them staring at stale content. In the dashboard the pane rides
 // in an iframe, so hand it to the shell's ONE #rstale reload banner; a standalone page (feed/timeline opened
-// directly) has no shell, so self-inject a minimal top bar with the same Reload action.
+// directly) has no shell, so self-inject a minimal top bar with the same Reload action. Scope since T265 (the
+// user 2026-09-08): this prompt is for a reconnect to the SAME kernel process (a blip) — a reconnect against a
+// NEW process, and a newer bundle, reload the page by themselves (the reload core above); the "build" bar is
+// only the core's refused fallback.
 function selfBar(t,kind){try{if(document.getElementById("romp-stale-self"))return;
 var b=document.createElement("div");b.id="romp-stale-self";b.dataset.kind=kind||"conn";
 b.style.cssText="position:fixed;top:0;left:0;right:0;z-index:99999;display:flex;gap:12px;align-items:center;justify-content:center;background:#2b2d30;color:#e6e6e6;border-bottom:1px solid #4a4d51;padding:9px 14px;font:13px/1.4 'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif";
@@ -39468,13 +39559,16 @@ if(window.parent!==window){try{window.parent.postMessage({romp:"wsStale"},"*");}
 // path itself closes).
 var stalePending="",staleKa=0,pendingWhy="",openSock=null,openT=0;
 function armStale(why){stalePending=why;staleKa=0;}
-// BUILD drift (the user 2026-07-13): the keepalive carries the kernel's current dist token (dv); a page whose
-// baked LOADEDV is older is running outdated code against newer kernel state — prompt a reload (never auto).
-// In the dashboard the raise routes to the shell's #rstale banner (build:1 → its BUILDMSG); standalone pages
-// self-inject the same bar. Latched: one prompt per page life, cleared only by the reload it asks for.
+// BUILD drift: the keepalive carries the kernel's current dist token (dv); a page whose baked LOADEDV is older is
+// running outdated code against newer kernel state. The user 2026-07-13 wanted EVERY kernel-served page to notice
+// (a standalone pane sat silent through rebuilds); the user 2026-09-08 ruled the page RELOADS ITSELF, superseding
+// the 2026-07-13 "prompt, never auto" — the raise asks window.__rompReload (the reload core, embedded above this
+// shim on every kernel-served page), which forwards to the shell when this pane sits in one and otherwise reloads
+// this page in place, never mid-gesture. selfBar is only the refused fallback (a host that forbids location.reload).
+// Latched: one request per page life.
 var buildRaised=false,freshPending=false,restartAnnounced=0;   // freshPending: a reconnect is awaiting its resync frame; restartAnnounced: the kernel's dying frame (T217)
-function raiseBuild(){if(buildRaised)return;buildRaised=true;
-if(window.parent!==window){try{window.parent.postMessage({romp:"wsStale",build:1},"*");}catch(e){}}
+function raiseBuild(){if(buildRaised)return;buildRaised=true;var R=window.__rompReload;
+if(R){R.refused=function(){selfBar("A newer romp build is available.","build");};R.request("build","");}
 else selfBar("A newer romp build is available.","build");}
 function connect(){if(ws&&(ws.readyState===0||ws.readyState===1))return;   // one live attempt at a time — a lost timer + the watchdog can both call in
 if(returnAt)returnRedialed=true;   // a dial inside a return window (whatever path led here) → the return-fresh row says so
@@ -39483,7 +39577,11 @@ var active="";try{var st0=JSON.parse(localStorage.getItem(SK)||"null");active=(s
 ws=new WebSocket(proto+location.host+"/ws?app=%s&delta=1&iid="+encodeURIComponent(IID)+(wid?"&wid="+encodeURIComponent(wid):"")+(active?"&active="+encodeURIComponent(active):""));
 // onopen: flush the queue; a RECONNECT (after a drop) also PROMPTS a reload — the fresh socket resyncs live via
 // the kernel's next push, and the banner offers a full reload for anything a live push doesn't cover. This
-// replaces the old silent location.reload() (the user: don't foist a reload; let me click — [[prefer-reload-banner-not-auto]]).
+// replaced the old silent location.reload() (the user 2026-07-05: don't foist a reload; let me click). Narrowed by
+// T265 (the user 2026-09-08, superseding that for restarts): when the reconnect is against a NEW kernel process
+// (its /version boot id differs from this page's) the page reloads itself via the reload core — a standalone page
+// asks here (checkBoot), a pane inside the shell leaves it to the shell's own socket; the prompt stays for a
+// same-process blip.
 // A RECONNECT also fires `romp:wsup`, the counterpart to the `romp:wsdown` below: whatever went up when the
 // socket dropped (the pane's romp loader) needs the socket's RETURN as its event to come back down. The
 // first connect deliberately doesn't fire it — nothing is waiting on it, and the loader must stay up until
@@ -39491,6 +39589,7 @@ ws=new WebSocket(proto+location.host+"/ws?app=%s&delta=1&iid="+encodeURIComponen
 ws.onopen=function(){lastRecv=Date.now();openT=lastRecv;openSock=this;netState("up");resumeProvisional=0;var wasReconn=everConnected;everConnected=true;for(var i=0;i<queue.length;i++)ws.send(queue[i]);queue=[];queuedDiag=0;
 if(failedConnects){send({type:"clientDiag",surface:"pane-shim",what:"wsconnfail",data:{app:APP,attempts:failedConnects,firstFailMs:Date.now()-firstFailT}});failedConnects=0;firstFailT=0;}   // the redials that never opened since the last open, as ONE row: how many, and how long ago the first failed
 if(wasReconn){var ann=restartAnnounced&&Date.now()-restartAnnounced<30000;restartAnnounced=0;   // one-shot: spent here
+if(window.__rompReload&&!window.__rompReload.inShell())window.__rompReload.checkBoot();   // T265: a REOPEN is the restart signal — a standalone page asks /version whose kernel answered; inside the shell, the shell asks on its own socket
 if(!ann)armStale(pendingWhy||"reconnect");   // T217: an ANNOUNCED restart's reconnect skips the arm — the resync lands in a beat and the flash was pure noise; a restart that never comes back stays loud through the disconnected state itself, and a SECOND reconnect arms as always
 pendingWhy="";freshPending=true;try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}}};
 ws.onmessage=function(ev){lastRecv=Date.now();resumeProvisional=0;if(returnAt)returnBytes+=(ev.data&&ev.data.length)||0;var msg;try{msg=JSON.parse(ev.data);}catch(e){return;}
@@ -39642,7 +39741,7 @@ pendingWhy="foreground";freshPending=true;   // the reconnect's arm reads "foreg
 if(ws&&ws.readyState===1)abandon();else{try{if(ws&&ws.readyState===0)ws.close();}catch(e){}}   // OPEN-but-quiet → abandoned + redialed below, now; stuck-CONNECTING → aborted, onclose retries
 if(!ws||ws.readyState===3)connect();
 returnDiag("return",row);});/*end-shim-core*/})();   // filed AFTER the redial so it queues for the new socket instead of vanishing into the dead one
-""" % (app, int(v), app, app)
+""" % (_reload_core(v), app, int(v), app, app)
 
 
 def _shim_core_js(app="test", v=0):
@@ -41896,13 +41995,16 @@ Array.prototype.forEach.call(bar.querySelectorAll('button[data-act]'),function(b
 b.addEventListener('click',function(){var f=A[b.getAttribute('data-act')];if(f)f();});});
 window.addEventListener('message',function(e){var m=e.data;if(!m)return;if(m.romp==='reveal'&&m.pane)reveal(m.pane);// the chat header's Fleet pill / the fleet's back-to-chat post toggleFleet — on mobile that IS a tab switch
 if(m.romp==='toggleFleet')show(m.to==='chat'?'chat':'fleet');});
+var shellOpened=false;   // T265: this socket's REOPEN is the kernel-restart signal — the shell asks /version whose kernel answered
 function shellWS(){try{var proto=location.protocol==='https:'?'wss://':'ws://';
 var ws=new WebSocket(proto+location.host+'/ws?app=shell');
 // ready → the kernel sends the current needs-you count, so a relaunched installed app trues up
 // its icon badge immediately instead of waiting for the next change (plans/ios-app.md proposal 3)
-ws.onopen=function(){try{ws.send(JSON.stringify({type:'ready'}));}catch(e){}};
+ws.onopen=function(){try{ws.send(JSON.stringify({type:'ready'}));}catch(e){}
+if(shellOpened&&window.__rompReload)window.__rompReload.checkBoot();shellOpened=true;};
 ws.onmessage=function(ev){var m;try{m=JSON.parse(ev.data);}catch(e){return;}
-if(m&&m.type==='reveal'&&m.pane)reveal(m.pane);
+if(m&&m.type==='ka'){if(m.dv&&window.__rompReload)window.__rompReload.noteDv(m.dv);}   // build drift on the shell's own keepalive (T265)
+else if(m&&m.type==='reveal'&&m.pane)reveal(m.pane);
 // the app-icon badge: setAppBadge only exists where badging works (installed apps) — everyone
 // else falls through silently, so this needs no capability gymnastics
 else if(m&&m.type==='badge'&&'setAppBadge' in navigator){
@@ -42145,24 +42247,33 @@ _STALE_JS = (
     "var BUILDMSG='A newer romp build is available.',"
     "CONNMSG='romp lost the live connection to the dashboard, so what you see may be stale.';"
     "function show(m){msg.textContent=m;box.classList.add('show');}"
+    # T265 (the user 2026-09-08): the reload core (window.__rompReload, _RELOAD_CORE_JS) owns build drift and
+    # kernel restarts — the page reloads itself, never mid-gesture. The BUILD banner survives only as the
+    # core's `refused` fallback (a host that forbids location.reload); the poll below hands the core every
+    # /version reading (a restart the socket never showed, a bundle newer than this page's).
+    "var RL=window.__rompReload;"
+    "if(RL){RL.refused=function(){buildStale=true;show(BUILDMSG);};"
+    "RL.announce(function(k,t){if(window.__rompNotify)window.__rompNotify(k,t);});}"
     "function check(){fetch('/version',{cache:'no-store'}).then(function(r){return r.json();}).then(function(v){"
     "if(v&&v.boot&&window.__rompUpdBoot)window.__rompUpdBoot(v.boot);"   # retire cross-boot update offers (2026-08-15)
     "served=v.dist_ver||0;"
-    "if(loaded&&served>loaded&&served!==dismissed)show(BUILDMSG);"
+    "if(RL)RL.noteVersion(v);"
+    "if(loaded&&served>loaded&&served!==dismissed){if(!RL)show(BUILDMSG);}"
     "else if(served<=loaded&&!connStale&&!buildStale)box.classList.remove('show');}).catch(function(){});}"
     # A pane whose WebSocket dropped-and-reconnected (or a foregrounded tab that found its socket dead) posts
     # {romp:'wsStale'} — the same shell-coalesced channel as the disconnect banner, but a RELOAD PROMPT rather
     # than a silent auto-reload (the user 2026-07-05: a stale feed card showed 'Re-judging' while the kernel had
     # long since moved on, with no cue the view was frozen). connStale latches so the /version poll can't clear
-    # the prompt out from under it; Dismiss (or a reload) clears it. A pane's BUILD-drift raise (the shim's
-    # keepalive dv check, the user 2026-07-13) rides the same channel with build:1 → the BUILDMSG wording;
-    # buildStale latches it identically so the poll (whose own token may be current) can't clear it.
+    # the prompt out from under it; Dismiss (or a reload) clears it. A pane's BUILD-drift raise used to ride the
+    # same channel with build:1 → the BUILDMSG wording (the user 2026-07-13); since T265 (the user 2026-09-08,
+    # superseding that) the shim asks the reload core directly and a build:1 that still arrives is handed to
+    # the core too — the banner shows for it only where the core is absent.
     # {romp:'wsFresh'} — the reconnected pane's resync LANDED (its first non-keepalive frame), so the
     # connection prompt is moot and retires itself; the user saw it on nearly every dashboard open, offering
     # a reload for a staleness that had already healed in the background. A latched BUILD prompt survives
     # (and re-asserts its wording): a resync delivers state, never new code, so only a reload answers it.
     "window.addEventListener('message',function(e){var m=e&&e.data;"
-    "if(m&&m.romp==='wsStale'){if(m.build){buildStale=true;show(BUILDMSG);}else{connStale=true;show(CONNMSG);}}"
+    "if(m&&m.romp==='wsStale'){if(m.build){if(RL)RL.request('build','');else{buildStale=true;show(BUILDMSG);}}else{connStale=true;show(CONNMSG);}}"
     "else if(m&&m.romp==='wsFresh'){connStale=false;if(buildStale)show(BUILDMSG);else box.classList.remove('show');}});"
     # T132 (the user 2026-08-27): the banner is DRAGGABLE — movable out of the way so it can STAY up
     # (it was covering a tab they needed before accepting the build). Moving never dismisses, mutes, or
@@ -42231,7 +42342,9 @@ _LANDING_COLLAPSE_JS = """
 
 
 def _stale_block(v):
+    # the reload core first: the banner script below registers as its refused fallback and announces a reload
     return ("<style>" + _STALE_CSS + "</style>" + _STALE_HTML
+            + "<script>" + _reload_core(v) + "</script>"
             + "<script>" + _STALE_JS.replace("__LOADEDVER__", str(int(v))) + "</script>")
 
 
