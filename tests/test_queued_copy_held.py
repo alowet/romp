@@ -65,6 +65,12 @@ const page = await browser.newPage({ viewport: { width: 1000, height: 600 } });
 await page.addInitScript(() => {
   window.__rows = []; window.__frames = [];
   window.addEventListener("message", (e) => { const m = e.data; if (m && (m.type === "session" || m.type === "update" || m.type === "chatTail")) window.__frames.push(m); });
+  // while the synthetic sequence runs, the kernel's own frames for this session are held back (a status-only tail
+  // would truncate the injected events): the shim's socket handler is wrapped at the prototype
+  window.__quiet = false;
+  const desc = Object.getOwnPropertyDescriptor(WebSocket.prototype, "onmessage");
+  Object.defineProperty(WebSocket.prototype, "onmessage", { configurable: true, get() { return desc.get.call(this); },
+    set(fn) { desc.set.call(this, (ev) => { if (window.__quiet) { try { const m = JSON.parse(ev.data); if (m && (m.type === "chatTail" || m.type === "update" || m.type === "session" || m.type === "status")) return; } catch (e) {} } return fn.call(this, ev); }); } });
   const orig = WebSocket.prototype.send;
   WebSocket.prototype.send = function (d) {
     try { const m = JSON.parse(d); if (m && m.type === "clientDiag" && m.surface === "chat" && /^scroll/.test(m.what || "")) window.__rows.push({ what: m.what, writer: m.data && m.data.writer, before: m.data && m.data.before, after: m.data && m.data.after, sh: m.data && m.data.sh }); } catch (e) {}
@@ -106,8 +112,8 @@ const run = async (label, qid, uuid) => {
   await inject(landed(base, qid, uuid)); await page.waitForTimeout(400); out.landed = await measure();
   return out;
 };
-// a bottom reader
-await page.evaluate(() => { const c = document.getElementById("content"); c.scrollTop = c.scrollHeight; window.__rows = []; });
+// a bottom reader; from here on only the synthetic frames reach the page
+await page.evaluate(() => { const c = document.getElementById("content"); c.scrollTop = c.scrollHeight; window.__rows = []; window.__quiet = true; });
 await page.waitForTimeout(300);
 const start = await measure();
 const idPath = await run("id", "echo:m1", "am1");

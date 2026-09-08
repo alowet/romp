@@ -27,7 +27,7 @@ test("renderQueued draws a wireframe-hourglass header (singular/plural) + one ma
   // noun matches the content: all-commands → "command", all-prose → "message", mixed → "item" (the user 2026-07-01)
   assert.match(RENDER, /const noun = nCmd === n \? "command" : nSys === n \? "notice" : nNudge === n \? "nudge"\s*\n\s*: \(nCmd === 0 && nSys === 0 && nNudge === 0\) \? "message" : "item";/);   // romp's own entries: T243
   assert.match(RENDER, /return `\$\{n\} queued \$\{noun\}\$\{n === 1 \? "" : "s"\}`/);
-  assert.match(RENDER, /label\.textContent = queuedCountText\(n, nCmd, nSys, nNudge\) \+ why;/);
+  assert.match(RENDER, /label\.textContent = \(texts\.every\(\(t\) => t\.landing\) \? `\$\{n\} \$\{n === 1 \? "message" : "messages"\} landing…` : queuedCountText\(n, nCmd, nSys, nNudge\)\) \+ why;/);   // a held-only group says landing (T262i)
   assert.match(RENDER, /el\("div", "queued-head"\)/);
   // one faint "you" bubble per pending message, rendered as markdown (like a landed message — the
   // user-text renderer, newlines kept, so the queued→landed swap changes nothing on screen)
