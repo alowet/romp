@@ -108,7 +108,7 @@ class Collector(unittest.TestCase):
             self.assertEqual(p[k], 0.0, k)
         self.assertEqual(p["ring_n"], 0)
         self.assertEqual(set(snap["stages_ms"]), set(km._PerfStats.STAGES))
-        self.assertEqual(set(snap["builds"]), {"chat", "feed", "timeline"})
+        self.assertEqual(set(snap["builds"]), {"chat", "feed", "timeline", "feedJson"})
         self.assertEqual(set(snap["sends"]), {"full", "delta", "deduped"})
         self.assertEqual(snap["judge"]["ms_mean"], 0.0, "no passes: the mean is 0, not a division error")
         self.assertIn("cpu_ms_sum", snap["judge"])
