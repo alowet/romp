@@ -38,7 +38,7 @@ import { titleWithKey, chordOf, effectiveChord, loadOverrides } from "./keybindi
 import { DEFAULT_CHORDS } from "./commands";
 import { NavHistory } from "./nav-history";
 import { StagedStack } from "./staged-messages";
-import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, dropPending, cueAnchor, bareGroupLabel } from "./send-pending";
+import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, injectionGroups, queuedCopyToHide, dropPending, bareGroupLabel } from "./send-pending";
 import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional } from "./provisional";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
@@ -167,7 +167,7 @@ type ChatEvent = (
   // `held` DOES come from the kernel (_limit_hold): the queue is stuck on the ACCOUNT rather than on this
   // session — a usage limit or a monthly spend cap holds every send — so the head names what it is waiting
   // for, and how long is left when the API reported a reset (the user 2026-07-24).
-  | { kind: "queued"; texts: { md: string; followUp?: boolean; goal?: string; fuCtx?: string; idx?: number; park?: number; cancelable?: boolean; optimistic?: boolean; romp?: boolean; rompSystem?: boolean; rompAuto?: boolean; imgPaths?: string[]; lost?: string; qts?: number }[]; ts?: string; uuid?: string; bare?: boolean; held?: { reason: string; resetsAt?: number | null; what: string; detail?: string } }   // imgPaths: an optimistic echo's dragged-image attachments → thumbnails, the landed form's own renderer (the user 2026-08-25); lost: client-only, the connection dropped after this unconfirmed send; qts: client-only, the pending entry's identity (its press time) so the ✕ removes ITS entry (send-pending.ts)
+  | { kind: "queued"; texts: { md: string; followUp?: boolean; goal?: string; fuCtx?: string; idx?: number; park?: number; cancelable?: boolean; optimistic?: boolean; romp?: boolean; rompSystem?: boolean; rompAuto?: boolean; imgPaths?: string[]; lost?: string; qts?: number; hiddenByPending?: boolean }[]; ts?: string; uuid?: string; bare?: boolean; held?: { reason: string; resetsAt?: number | null; what: string; detail?: string } }   // imgPaths: an optimistic echo's dragged-image attachments → thumbnails, the landed form's own renderer (the user 2026-08-25); lost: client-only, the connection dropped after this unconfirmed send; qts: client-only, the pending entry's identity (its press time) so the ✕ removes ITS entry (send-pending.ts)
   // The turn stopped on an API error (event-based: transcript isApiErrorMessage). The session is BLOCKED
   // until retried — a red-dot card at the bottom with a Retry button (the user 2026-06-16).
   | { kind: "apiError"; text: string; status?: number; ts?: string; uuid?: string }
@@ -291,9 +291,12 @@ const order: string[] = [];           // positional tab order (for cycling)
 // ── client-side optimistic echo (the user 2026-07-15) ── a composer send clears the box instantly, but the
 // message only reappears in the chat once the kernel round-trips it back (its own provisional). Sending to a
 // busy/slow thread, the kernel's provisional could briefly VANISH in the echo→landed gap — so a just-sent
-// message looked lost for a beat. We drop a local optimistic bubble at the tail the moment you hit Enter and
-// keep RE-injecting it on every push until the kernel's payload demonstrably carries the message, then let it
-// go — the immediacy is client-owned, independent of every server-side timing subtlety.
+// message looked lost for a beat. We drop a local optimistic bubble the moment you hit Enter — AT ITS SEND
+// POSITION, right after the last kernel event at the press (T252, the user 2026-09-07), so the steps that
+// stream in while the CLI holds the send land below it and the absorbed atom the kernel places at the send
+// time replaces it in the same spot — and keep RE-injecting it on every push until the kernel's payload
+// demonstrably carries the message, then let it go — the immediacy is client-owned, independent of every
+// server-side timing subtlety.
 // It rides the QUEUED idiom (the user 2026-07-16): to the reader an unconfirmed send and a queued one are the
 // same state — sent, nothing's happened yet — so they wear the same dashed bubble. That also means the look
 // only ever moves provisional→settled: dashed→solid when it lands, dashed→dashed (invisible) when it really
@@ -314,13 +317,6 @@ const order: string[] = [];           // positional tab order (for cycling)
 // last 30 events, so an absorbed landing placed above them never ended the bubble (2026-09-06 review).
 const pendingSent = new Map<string, PendingSend[]>();
 const isOptimistic = (e: ChatEvent): boolean => isOptimisticUuid(e.uuid);
-// sid → MID-TURN CUES: where a pending bubble sat when its message landed ABOVE the tail. A send fed
-// into a running turn is taken by the CLI at a later tool boundary and placed at its SEND time (kernel
-// ev.absorbed), so the bubble the user was watching at the bottom vanishes and the message is somewhere
-// higher up. The cue stays under the event the bubble sat under — "delivered into the running turn at
-// HH:MM · jump" — until jump or ✕ (the user 2026-09-05). Keyed on the landing, never on a timer.
-type AbsorbedCue = { after: string; target: string; landedAt: number | null };
-const absorbedCues = new Map<string, AbsorbedCue[]>();
 
 // The kernel's own queued group, if one is at the tail. Ours merges INTO it when present: the session is
 // provably holding messages, so this send will queue behind them — no reason to show it as a separate lone
@@ -351,14 +347,7 @@ function reconcileOptimistic(s: Session): void {
       if (v) v.stale = true;
     }
   };
-  // undo our own injections. A standalone bare group is tail-appended (pop it); a kernel group we EXTENDED is
-  // restored by dropping the optimistic texts off our clone — so `landed` below only ever sees kernel truth.
-  while (s.events.length && isOptimistic(s.events[s.events.length - 1])) s.events.pop();
-  const qi = tailQueuedIdx(s.events);
-  if (qi >= 0) {
-    const q = s.events[qi] as Extract<ChatEvent, { kind: "queued" }>;
-    if (q.texts.some((t) => t.optimistic)) s.events[qi] = { ...q, texts: q.texts.filter((t) => !t.optimistic) };
-  }
+  stripOptimistic(s);   // kernel truth only below: our bubbles and our hide marks are re-derived from it
   const list = pendingSent.get(s.id);
   if (!list || !list.length) { settle([]); return; }
   // The decision reads KERNEL truth only (our injections are stripped above) — send-pending.ts: a
@@ -368,12 +357,18 @@ function reconcileOptimistic(s: Session): void {
   // the gap); the kernel's NEVER-DELIVERED verdict after the anchor retires it (that bubble now carries
   // the text and the resend); its PROVISIONAL — echo atom or queued bubble — suppresses ours for this
   // push and nothing more, so if it blinks, ours steps straight back in, and proves the kernel has the
-  // send (a "not confirmed" label is cleared). A landing that retired an ABSORBED atom's bubble may owe
-  // a mid-turn cue (noteAbsorbedLanding).
+  // send (a "not confirmed" label is cleared). The kernel's QUEUED copy of a send is different (T252): it
+  // sits in the kernel's group at the tail while the bubble the user watches is ours, at its send slot —
+  // so that copy is hidden and ours stays, one bubble per message; the group keeps its other texts.
   const r = reconcilePending(s.events as TailEvent[], list);
   if (r.keep.length) pendingSent.set(s.id, r.keep); else pendingSent.delete(s.id);
-  for (const { idx } of r.landed) noteAbsorbedLanding(s, idx);
-  const inject = r.inject;
+  const heldBy = new Map<PendingSend, NonNullable<Extract<ChatEvent, { kind: "queued" }>["held"]>>();
+  const covered = new Set<PendingSend>();   // a kernel copy that stays shown (non-cancelable: no recall exists) covers ours
+  for (const p of r.unqueue) {
+    const hid = hideQueuedCopy(s, p);
+    if (hid === null) covered.add(p); else if (hid.held) heldBy.set(p, hid.held);
+  }
+  const inject = r.inject.filter((p) => !covered.has(p));
   if (!inject.length) { settle([]); return; }
   // cancelable from the PRESS (the user 2026-08-30, who sent mid-compaction and sat in an unlabeled,
   // uncancellable beat until the kernel's park round-tripped): the ✕ on an optimistic bubble drops our
@@ -382,16 +377,46 @@ function reconcileOptimistic(s: Session): void {
   // `qts` is the entry's identity: the ✕ removes THAT entry, never the first with the same text (two
   // identical sends can sit in different states — one lost, one received).
   const mk = (p: PendingSend) => ({ md: p.text, optimistic: true, cancelable: true, imgPaths: p.imgPaths, lost: p.lost, qts: p.ts });
-  const qj = tailQueuedIdx(s.events);
-  if (qj >= 0) {
-    // something IS queued here → ours queues behind it: show it in that group, under its header, counted
-    const q = s.events[qj] as Extract<ChatEvent, { kind: "queued" }>;
-    s.events[qj] = { ...q, texts: [...q.texts, ...inject.map(mk)] };
-  } else {
-    // nothing known-queued → a BARE dashed bubble: no "N queued messages" header to claim what we can't back
-    s.events.push({ kind: "queued", bare: true, texts: inject.map(mk), uuid: OPT_PREFIX + inject[0].ts });
+  // A BARE dashed bubble at each send's slot — right after its anchor (send-pending.ts injectionGroups):
+  // no "N queued messages" header to claim what we can't back. Groups come highest slot first, so each
+  // splice leaves the lower slots valid. A copy hidden out of a HELD kernel group (a usage limit holds
+  // every send) hands its reason to our bubble, so the wait still says what it is waiting for.
+  const groups = injectionGroups(s.events as TailEvent[], inject);
+  for (const g of groups)
+    s.events.splice(g.idx, 0, { kind: "queued", bare: true, texts: g.sends.map(mk), uuid: OPT_PREFIX + g.sends[0].ts,
+                                held: g.sends.map((p) => heldBy.get(p)).find((h) => !!h) });
+  // the signature carries each group's SLOT beside its texts: chatTail repaints from the kernel index it was
+  // handed, trusting the DOM prefix — which also needs the bubble's slot unchanged. A slot that moves (a floor
+  // event arriving) marks the view stale, so the window is rebuilt (second review).
+  settle(groups.flatMap((g) => g.sends.map((p) => g.idx + ":" + p.text)));
+}
+
+// Undo our own injections wherever they sit — the bare groups we spliced in (T252: at their send slots, no
+// longer only at the tail), the optimistic texts we once merged into a kernel group, and the hide marks on
+// the kernel's queued copies — so every reader below sees KERNEL truth only. Every ingest path that applies
+// a kernel INDEX (chatTail's `from`) strips first: a bubble sitting mid-array would shift that index.
+function stripOptimistic(s: Session): void {
+  for (let i = s.events.length - 1; i >= 0; i--) {
+    const e = s.events[i];
+    if (isOptimistic(e)) { s.events.splice(i, 1); continue; }
+    if (e.kind === "queued" && e.texts.some((t) => t.optimistic || t.hiddenByPending))
+      s.events[i] = { ...e, texts: e.texts.filter((t) => !t.optimistic).map((t) => t.hiddenByPending ? { ...t, hiddenByPending: undefined } : t) };
   }
-  settle(inject.map((p) => p.text));
+}
+
+// Hide ONE copy of this send's text in the kernel's queued group (send-pending.ts queuedCopyToHide picks
+// it: the newest not-yet-hidden copy, never one the kernel marked non-cancelable): ours is drawn at its
+// slot, so the tail copy would be the same message twice. Returns the group's `held` so the bubble can
+// carry the reason — or null when no copy is hidden, in which case the kernel's copy keeps covering ours.
+function hideQueuedCopy(s: Session, p: PendingSend): { held?: Extract<ChatEvent, { kind: "queued" }>["held"] } | null {
+  const qi = tailQueuedIdx(s.events);
+  if (qi < 0) return { held: undefined };            // nothing queued at the tail: nothing to hide, ours shows
+  const q = s.events[qi] as Extract<ChatEvent, { kind: "queued" }>;
+  const k = queuedCopyToHide(q.texts, p.text);
+  if (k < 0) return null;                            // no copy to hide (or a non-cancelable one): the kernel's bubble stays
+  const texts = q.texts.slice(); texts[k] = { ...texts[k], hiddenByPending: true };
+  s.events[qi] = { ...q, texts };
+  return { held: q.held || undefined };
 }
 
 // Record a composer send as in-flight and show its optimistic bubble NOW (before any kernel push).
@@ -427,32 +452,6 @@ function registerOptimistic(id: string, text: string, imgPaths?: string[]): void
     appendActive();
     if (content && wasAtBottom) content.scrollTop = content.scrollHeight;
   }
-}
-
-// A landing just retired a pending bubble. When the landed atom is ABSORBED (kernel ev.absorbed: a
-// mid-turn splice, placed at its send time) and it landed ABOVE the tail, the bubble the user was
-// watching at the bottom is gone and the message is somewhere higher up — leave a cue under the event
-// the bubble sat under (cueAnchor). It landed AT the tail → the swap was in place, no cue owed. Keyed
-// on the landing itself; dismissed by the user's jump or ✕, never by a timer. The anchor is an event
-// the chat DRAWS in its current mode: compact mode (the default) hides thinking, and a cue hung on a
-// hidden event never rendered and could never be dismissed (2026-09-06 review).
-const cueRendered = (e: TailEvent): boolean => !(settings.compact && e.kind === "thinking");
-function noteAbsorbedLanding(s: Session, idx: number): void {
-  const ev = s.events[idx] as (ChatEvent & { absorbed?: boolean; landedAt?: number }) | undefined;
-  if (!ev || !ev.absorbed || !ev.uuid) return;
-  const after = cueAnchor(s.events as TailEvent[], idx, cueRendered);
-  if (!after) return;
-  const cues = absorbedCues.get(s.id) || [];
-  if (cues.some((c) => c.target === ev.uuid)) return;
-  cues.push({ after, target: ev.uuid, landedAt: typeof ev.landedAt === "number" ? ev.landedAt : null });
-  absorbedCues.set(s.id, cues);
-  const v = views.get(s.id);
-  if (v) v.stale = true;
-}
-
-function dismissAbsorbedCue(sid: string, target: string): void {
-  const cues = (absorbedCues.get(sid) || []).filter((c) => c.target !== target);
-  if (cues.length) absorbedCues.set(sid, cues); else absorbedCues.delete(sid);
 }
 
 // The socket (or the VS Code pipe) went DOWN: every send still unconfirmed may never have reached the
@@ -2379,7 +2378,7 @@ function contentOffsetFrame(content: HTMLElement, v: View, s: Session):
   // on a fully rendered conversation (T245). scrollTop + client-rect top is the position IN THE SCROLL
   // CONTENT, invariant under scrolling: pure scrolling still moves nothing. The gate counts UNITS, never
   // nodes: one unit may own several .turn nodes — appendItem tags an expanded tool/retry group's child
-  // turns and every absorbed cue with their unit — so a node-count gate silently dropped the frame back
+  // turns with their unit — so a node-count gate silently dropped the frame back
   // to the sum whenever a group stood open (review of the first cut, 2026-09-08: 14px off, and the notch
   // changed basis on every expand and collapse).
   if (exact.size > 0 && exact.size === unitTotal && !v.el.querySelector(".tx-spacer") && content.scrollHeight > 0) {
@@ -2653,11 +2652,6 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
     // a TYPED follow-up (resumed a goal) → a compact "↩ Follow-up · <goal>" header, the romp goal-context
     // quote + markers already stripped server-side. Same header the pending queued render uses (consistency).
     if (ev.followUp && !romp) turn.appendChild(followUpHeader(ev.goal, ev.fuCtx, ev.uuid ? "u:" + ev.uuid : undefined));
-    // "joined mid-turn" (kernel ev.absorbed): the CLI queued this send behind a running turn and took it
-    // at a later tool boundary; the transcript places it at its SEND time, so it reads above steps that
-    // were already running. The header says why; when the session took it (ev.landedAt) is one level
-    // deeper, on hover. Human bubbles only — a romp nudge's own tag row already says what it is.
-    if ((ev as any).absorbed && !romp && !injected && !tagged) turn.appendChild(absorbedHeader((ev as any).landedAt));
     const hasImgs = !!(ev.images && ev.images.length);
     if (ev.md || hasImgs) {
       if (romp) {
@@ -3687,46 +3681,6 @@ function compactTokens(n: number): string {
 // strip is display-only, and this is where the hidden part can be audited. Expansion survives the chat's
 // re-renders via fuExpanded (keyed by the turn's uuid / queue slot), NOT DOM state that a rebuild would lose.
 const fuExpanded = new Set<string>();
-const hhmm = (epoch: number): string => markerLabel(epoch, null, Date.now()).hm;
-
-function absorbedHeader(landedAt?: number | null): HTMLElement {
-  const h = el("div", "absorbed-tag");
-  h.textContent = "joined mid-turn";
-  h.title = "Sent while the session was working; it waited behind the steps in progress"
-    + (typeof landedAt === "number" ? ", and the session took it at " + hhmm(landedAt) : "") + ".";
-  return h;
-}
-
-// The mid-turn cue (absorbedCues): where a pending bubble sat when its message landed higher up. The
-// interrupt marker's chrome — a rail ring and one dim line — plus jump/✕ in the small-button rest.
-// Buttons ride the body delegate (data-act): the tail rebuilds every push.
-function renderAbsorbedCue(c: AbsorbedCue): HTMLElement {
-  const turn = el("div", "turn turn-absorbed-cue");
-  turn.dataset.cueTarget = c.target;
-  turn.appendChild(dot("ring"));
-  const line = el("div", "absorbed-cue-line");
-  line.title = "The session took your message at a tool boundary while it was working, so it appears above the steps that were already running.";
-  line.appendChild(document.createTextNode("delivered into the running turn"
-    + (c.landedAt != null ? " at " + hhmm(c.landedAt) : "")));
-  const jump = el("button", "absorbed-cue-act") as HTMLButtonElement;
-  jump.type = "button"; jump.textContent = "jump"; jump.title = "Scroll to the message";
-  jump.dataset.act = "abjump"; jump.dataset.target = c.target;
-  const x = el("button", "absorbed-cue-act") as HTMLButtonElement;
-  x.type = "button"; x.textContent = "✕"; x.title = "Dismiss this note";
-  x.dataset.act = "abdismiss"; x.dataset.target = c.target;
-  line.appendChild(jump); line.appendChild(x);
-  turn.appendChild(line);
-  return turn;
-}
-
-// The mid-turn cue(s) hung under this item's event(s) — rendered with the item, so the note keeps its
-// place as the tail grows past it.
-function appendAbsorbedCues(v: View, s: Session, uuids: (string | undefined)[], tag: (n: HTMLElement) => HTMLElement): void {
-  const cues = absorbedCues.get(s.id);
-  if (!cues || !cues.length) return;
-  for (const c of cues) if (uuids.includes(c.after)) v.el.appendChild(tag(renderAbsorbedCue(c)));
-}
-
 function followUpHeader(goal?: string, ctx?: string, key?: string): HTMLElement {
   const h = el("div", "followup-tag");
   const k = key || "";
@@ -3846,6 +3800,10 @@ function fillBareLabel(label: HTMLElement, nLost: number, nSending: number): voi
 }
 
 function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
+  // a copy hidden for a send drawn at its own slot (T252 hideQueuedCopy) is not rendered here; a group left
+  // with nothing visible renders as a zero-height unit (the unit still exists for the scroll↔unit map)
+  const texts = ev.texts.filter((t) => !t.hiddenByPending);
+  if (!texts.length) { const hid = el("div", "turn turn-queued turn-queued-hidden"); hid.style.display = "none"; return hid; }
   const turn = el("div", "turn turn-queued");
   // A BARE group is romp's own optimistic echo with nothing else known-queued: "N queued messages" is a
   // claim we can't back for a send the session hasn't confirmed (the user 2026-07-16) — so it wears its
@@ -3862,16 +3820,21 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
     // nothing confirming it since, reads "not confirmed" in warn amber — "sending…" would claim a
     // progress romp cannot see — and the ✕ is its way back to the composer; the others in the same
     // group still read "sending…". One label, both counts when both states are present.
-    const nLost = ev.texts.filter((t) => t.lost).length;
-    fillBareLabel(label, nLost, ev.texts.length - nLost);
+    const nLost = texts.filter((t) => t.lost).length;
+    fillBareLabel(label, nLost, texts.length - nLost);
+    if (ev.held) {   // the reason a hidden kernel copy carried (a usage limit holds every send): the wait says so
+      label.appendChild(document.createTextNode(" · " + ev.held.what
+        + (ev.held.resetsAt ? " · in " + fmtReset(ev.held.resetsAt, Math.floor(Date.now() / 1000)) : "")));
+      if (ev.held.detail) label.title = ev.held.detail;
+    }
     head.appendChild(label);
     turn.appendChild(head);
   }
   if (!ev.bare) {
-    const n = ev.texts.length;
-    const nCmd = ev.texts.filter((t) => SLASH_CMD_RE.test(t.md)).length;
-    const nSys = ev.texts.filter((t) => !!t.rompSystem).length;
-    const nNudge = ev.texts.filter((t) => !!t.romp && !t.rompSystem).length;
+    const n = texts.length;
+    const nCmd = texts.filter((t) => SLASH_CMD_RE.test(t.md)).length;
+    const nSys = texts.filter((t) => !!t.rompSystem).length;
+    const nNudge = texts.filter((t) => !!t.romp && !t.rompSystem).length;
     const head = el("div", "queued-head");
     head.appendChild(hourglassIcon());
     // While a question is pending, say WHAT it's waiting on: a message you'd already written when the picker
@@ -3901,9 +3864,9 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
   // identical texts FOLLOW it" — the queue drains from the FRONT, so a duplicate landing ahead leaves every
   // later duplicate's count untouched (counting the ones BEFORE renumbered them, review 2026-09-07)
   const totalSig = new Map<string, number>();
-  for (const t of ev.texts) { const k = strHash32(t.md); totalSig.set(k, (totalSig.get(k) || 0) + 1); }
+  for (const t of texts) { const k = strHash32(t.md); totalSig.set(k, (totalSig.get(k) || 0) + 1); }
   const seenSig = new Map<string, number>();
-  for (const t of ev.texts) {
+  for (const t of texts) {
     if (t.followUp && !t.romp) turn.appendChild(followUpHeader(t.goal, t.fuCtx, t.idx !== undefined ? "q:" + t.idx : undefined));
     const bubble = el("div", "queued-bubble md" + (t.cancelable ? " cancelable" : "")
                       + (t.romp ? " queued-romp" : "") + (t.rompSystem ? " queued-sys" : ""));
@@ -6468,7 +6431,6 @@ function dropProvisional(): { queued: string[]; draft: string } {
     const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
     draft = (activeId === id && ta) ? ta.value : (drafts.get(id) ?? "");
     pendingSent.delete(id);                // the optimistic bubbles belong to a tab that is going away
-    absorbedCues.delete(id);
     dismissSession(id, "close");           // drops it from sessions/order/views and reselects
   }
   return { queued, draft };
@@ -6528,7 +6490,6 @@ function failProvisional(why: string): void {
   const draft = (activeId === id && ta0) ? ta0.value : (drafts.get(id) ?? "");
   const held = [...queued, draft].filter(Boolean).join("\n\n");
   pendingSent.delete(id);            // the dashed "received" bubbles fold into the held text instead
-  absorbedCues.delete(id);
   failedProvisionals.add(id);
   const s = sessions.get(id);
   // "closed" gives the tab the dead treatment (struck label, plain ✕) — but the composer stays LIVE
@@ -9643,7 +9604,6 @@ function appendItem(v: View, s: Session, items: DisplayItem[], u: number, prevEp
         v.el.appendChild(tag(child)); adv(i);
       });
     }
-    appendAbsorbedCues(v, s, it.indices.map((i) => s.events[i]?.uuid), tag);
   } else if (it.kind === "retrygroup") {
     const notes = it.indices.map((i) => s.events[i]) as Extract<ChatEvent, { kind: "retried" }>[];
     const key = retryGroupKey(notes[0]);
@@ -9657,11 +9617,9 @@ function appendItem(v: View, s: Session, items: DisplayItem[], u: number, prevEp
         v.el.appendChild(tag(child)); adv(i);
       });
     }
-    appendAbsorbedCues(v, s, it.indices.map((i) => s.events[i]?.uuid), tag);
   } else {
     v.el.appendChild(tag(renderEvent(s.events[it.index], prevEpoch, turnWorkedSecs(s.events, it.index, working))));
     adv(it.index);
-    appendAbsorbedCues(v, s, [s.events[it.index]?.uuid], tag);
   }
   return prevEpoch;
 }
@@ -13463,13 +13421,15 @@ function chatTail(msg: any) {
   }
   // msg.from is a GLOBAL transcript index; the resident events are the tail [headFrom, …) → map to local.
   const from = (msg.from | 0) - (s.headFrom || 0);
-  // The kernel's coordinate space ends at ITS OWN events — our injected optimistic tail is not in it.
+  // The kernel's coordinate space ends at ITS OWN events — our injected optimistic bubbles are not in it.
   // Comparing `from` against the inflated length masked a genuine 1-event gap (the repair below never
   // fired, PR #107's desync class), and a delta starting exactly one past kernel truth landed BEYOND
   // the injected bubble, freezing it into the resident events as fake history the reconcile's strip
-  // loop could never pop (the user 2026-08-09).
-  let kernelLen = s.events.length;
-  while (kernelLen > 0 && isOptimistic(s.events[kernelLen - 1])) kernelLen--;
+  // loop could never pop (the user 2026-08-09). Since T252 a bubble sits at its send slot, mid-array,
+  // where it would also SHIFT every kernel index after it — so the gap check COUNTS kernel events here,
+  // and the strip itself waits until the delta is going to be applied: stripping ahead of the two early
+  // returns left s.events without the bubble while the DOM still showed it (review of the first cut).
+  const kernelLen = s.events.reduce((n, e) => n + (isOptimistic(e) ? 0 : 1), 0);
   if (from > kernelLen) {
     // GAP: the delta starts PAST what we hold, so the events in between never reached us. Applying it would
     // fabricate a transcript that silently skips them. This used to just `return` and "wait for the next
@@ -13485,6 +13445,7 @@ function chatTail(msg: any) {
     return;
   }
   if (from < 0) return;                            // below the loaded head → our resident tail is still valid
+  stripOptimistic(s);                              // kernel coordinates from here on (re-injected below)
   const wasLen = s.events.length;
   s.events.length = from;                          // drop the (now superseded) tail...
   for (const e of (msg.events || [])) s.events.push(e);   // ...and append the freshly-changed suffix
@@ -15391,21 +15352,6 @@ setupSettings();
     forkspot: (elx) => {
       const cut = (elx.closest(".fork-spot") as HTMLElement | null)?.dataset.cut || "";
       if (activeId && !isProvisionalId(activeId) && sessions.get(activeId)) showForkPrompt(activeId, cut);
-    },
-    // the mid-turn cue (absorbedCues): "jump" scrolls to the absorbed message and retires the note — its
-    // job, explaining the vanished bubble, is done; ✕ retires it in place. Delegated like qx: the tail
-    // rebuilds every push. The node goes NOW (the acknowledgement); the map keeps it gone.
-    abjump: (elx) => {
-      const target = elx.dataset.target || "";
-      const sidC = owningSidOf(elx) || activeId;
-      if (sidC) dismissAbsorbedCue(sidC, target);
-      (elx.closest(".turn-absorbed-cue") as HTMLElement | null)?.remove();
-      if (target) scrollToAnchor(target);
-    },
-    abdismiss: (elx) => {
-      const sidC = owningSidOf(elx) || activeId;
-      if (sidC) dismissAbsorbedCue(sidC, elx.dataset.target || "");
-      (elx.closest(".turn-absorbed-cue") as HTMLElement | null)?.remove();
     },
     // "copy to composer" on a never-delivered bubble: the echo is the only surviving copy of the text —
     // hand it back for review-and-resend (the same restore the queued ✕ uses). Delegated like qx: the
