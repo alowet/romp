@@ -579,6 +579,51 @@ class CrossHostDelegation(_Base):
         self.assertTrue(nd.get("nodeComplete"))
         self.assertIn("reported back by TESTHOST-B:web", nd.get("doneWhy") or "")
 
+    def test_a_delegate_that_came_back_plants_no_tracker(self):
+        # 2026-09-08: the far host refused the handoff (a terminal bounced row names it) before the
+        # courier's pass — a tracker planted from it would wait on a report-back nothing can bring
+        self._fleet_stub()
+        self._log([self._xrow(1, T0 + 10),
+                   json.dumps({"id": "px-1.mail.TESTHOST-A", "ev": "bounced", "t": T0 + 50,
+                               "to": self.RNAME, "host": self.RHOST, "why": "refused"}),
+                   self._xrow(2, T0 + 20, body="own the importer work")])
+        jd.run_courier(now=T0 + 100)
+        self.assertEqual([nd["handoff"]["msgId"] for nd in self._handoffs()], ["px-2.mail.TESTHOST-A"],
+                         "main: both planted — the returned delegate got a tracker no event could close")
+
+
+class ReturnedAskTwins(_Base):
+    """A send the bus RETURNED (a terminal `bounced` row naming its id) is a closed ask on both readers
+    (2026-09-08): the closer's admit gate sees no open question to stamp a peer wait over, and the wait
+    maps set no chip edge. Before, both twins skipped the row (no from_id/to_id) and the sender read as
+    waiting on a peer that never got the message — a card parked on a wait no event could end."""
+
+    @staticmethod
+    def _back(i, ts, host=""):
+        return json.dumps({"id": "m%d" % i, "ev": "bounced", "t": ts, "to": "web", "host": host,
+                           "why": "recipient exited; unread mail destroyed by the orphan sweep"})
+
+    def test_the_closer_does_not_stamp_a_peer_wait_over_a_returned_question(self):
+        s, gid = self._store()
+        self._log([_msg(1, SID, MGR, T0 + 10, "question"), self._back(1, T0 + 20)])
+        self._close_peer(s)
+        self.assertEqual((s["nodes"][gid].get("awaitingWhy"), s["nodes"][gid].get("awaitingKind")), (None, None),
+                         "main: the gate read the returned question as open and admitted the peer stamp")
+        self.assertEqual(jd._open_ask_peers(SID), [], "no open ask: the message never reached the manager")
+
+    def test_both_readers_agree_on_a_returned_ask(self):
+        def km_open(sid):
+            last_any, last_ask, _aw = km._postal_wait_maps()
+            return any(f == sid and last_any.get((p, sid), 0) < meta[0] for (f, p), meta in last_ask.items())
+        grid = [   # the single returned question is test_a_refused_question_is_no_open_ask_for_either_reader's
+            ([_msg(1, SID, MGR, T0, "question"), _msg(2, SID, MGR, T0 + 5, "question"), self._back(1, T0 + 9)], True),
+            ([_msg(1, SID, "peer:otherbox", T0, "question"), self._back(1, T0 + 5, host="otherbox")], False),
+        ]
+        for rows, open_ in grid:
+            self._log(rows)
+            self.assertEqual((jd._open_peer_asks(SID), km_open(SID)), (open_, open_),
+                             "gate and wait-maps on: %s" % rows)
+
 
 if __name__ == "__main__":
     unittest.main()

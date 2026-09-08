@@ -39,7 +39,8 @@ class _Recorder:
 class DebtBase(unittest.TestCase):
     def setUp(self):
         self._saved = (km._postal_wait_maps, km._name_of, km._auto_nudge_data,
-                       km._write_auto_nudge, km.Sessions.backend_for)
+                       km._write_auto_nudge, km.Sessions.backend_for,
+                       getattr(km, "_postal_returned", None))   # absent before 2026-09-08: the seam degrades
         self._d = {"nudged": {}}
         km._auto_nudge_data = lambda: self._d
         km._write_auto_nudge = lambda d: self._d.update(d) or True   # the writer's verdict: the reminder
@@ -49,17 +50,25 @@ class DebtBase(unittest.TestCase):
         km.Sessions.backend_for = lambda sid: self.rec
         self._maps = ({}, {}, {})   # (last_any, last_ask, last_await)
         km._postal_wait_maps = lambda: self._maps
+        self._returned = {}         # {(asker, debtor): {ask t: return t}} — the maps' returns, same seam
+        km._postal_returned = lambda: self._returned
 
     def tearDown(self):
         (km._postal_wait_maps, km._name_of, km._auto_nudge_data,
-         km._write_auto_nudge, km.Sessions.backend_for) = self._saved
+         km._write_auto_nudge, km.Sessions.backend_for, _ret) = self._saved
+        if _ret is None:
+            del km._postal_returned
+        else:
+            km._postal_returned = _ret
 
     def _ask(self, kind="question", head="Which port should the staging server use?",
-             ts=T_ASK, asker=ASKER, answered_at=None):
+             ts=T_ASK, asker=ASKER, answered_at=None, returned_at=None):
         last_any = {(asker, DEBTOR): ts}
         if answered_at is not None:
             last_any[(DEBTOR, asker)] = answered_at
-        last_ask = {(asker, DEBTOR): (ts, kind, head)}
+        # an ask the bus returned makes no last_ask entry and lands in the returns, as the real maps have it
+        last_ask = {} if returned_at is not None else {(asker, DEBTOR): (ts, kind, head)}
+        self._returned = {(asker, DEBTOR): {ts: returned_at}} if returned_at is not None else {}
         self._maps = (last_any, last_ask, {})
         km._postal_wait_maps = lambda: self._maps
 
@@ -200,6 +209,54 @@ class ReminderOutcomes(DebtBase):
         self._d["debtNudged"] = {"not-a-key": NOW - 600}
         km._debt_backstop_tick(NOW)
         self.assertEqual(self._d["debtNudged"], {}, "malformed records drop rather than loop forever")
+
+    def test_a_returned_ask_retires_the_reminder_without_escalating(self):
+        # 2026-09-08: the debtor exited before the reminder's turn read the ask; ORPHAN_GRACE later the
+        # sweep destroyed the mail and wrote the terminal bounced row, and the bus told the asker. The
+        # return IS the outcome. The guard — the same turn with no return escalates — is
+        # test_moving_on_without_replying_escalates_once above.
+        self._ask(returned_at=NOW - 400)
+        self._armed(fire_t=NOW - 600)
+        lt = {"t": NOW - 300, "end": NOW - 200}        # a turn ended after the fire, no reply
+        km._debt_reminder_outcomes(DEBTOR, lt, NOW)
+        self.assertEqual(self._esc, [], "main: escalated — a block on the asker's card for an ask that came back")
+        self.assertEqual(self._d["debtNudged"], {}, "the record retires, once-ever, like an answered one")
+
+    def test_the_backstop_retires_a_returned_ask_too(self):
+        # the debtor-never-returns path (its guard: test_the_backstop_escalates_a_debtor_that_never_returns)
+        self._ask(returned_at=NOW - 400)
+        self._armed(fire_t=NOW - km.NUDGE_DEFER_BACKSTOP_SECS - 60)
+        km._debt_backstop_tick(NOW)
+        self.assertEqual(self._esc, [], "main: the 6h backstop flipped the asker's card for a returned ask")
+        self.assertEqual(self._d["debtNudged"], {})
+
+    def test_a_return_of_a_different_ask_leaves_the_record_to_its_own_outcome(self):
+        # the join is the record's own ask time: a LATER ask on the same pair that came back says nothing
+        # about this one, which still escalates when the debtor moves on without replying
+        self._ask()
+        self._returned = {(ASKER, DEBTOR): {T_ASK + 300: NOW - 400}}
+        self._armed(fire_t=NOW - 600)
+        km._debt_reminder_outcomes(DEBTOR, {"t": NOW - 300, "end": NOW - 200}, NOW)
+        self.assertEqual(self._esc, [(ASKER, DEBTOR, T_ASK)])
+        self.assertEqual(self._d["debtNudged"], {})
+
+    def test_a_live_twin_in_the_same_second_keeps_the_record_open(self):
+        # the join is per send time: m1 and m2 both at T_ASK on the pair, m1 came back, m2 still waits —
+        # the record is m2's as much as m1's, so it stays and escalates on both paths exactly as before
+        # (main never retired on a return, so this guards the fold, not main)
+        for path in ("turn-end", "backstop"):
+            self._esc.clear()
+            self._ask()                                              # m2: live, last_ask at T_ASK
+            self._returned = {(ASKER, DEBTOR): {T_ASK: NOW - 400}}   # m1: the same second, returned
+            if path == "turn-end":
+                self._armed(fire_t=NOW - 600)
+                km._debt_reminder_outcomes(DEBTOR, {"t": NOW - 300, "end": NOW - 200}, NOW)
+            else:
+                self._armed(fire_t=NOW - km.NUDGE_DEFER_BACKSTOP_SECS - 60)
+                km._debt_backstop_tick(NOW)
+            self.assertEqual(self._esc, [(ASKER, DEBTOR, T_ASK)],
+                             "%s: the live twin's reminder still escalates (the first fold retired it)" % path)
+            self.assertEqual(self._d["debtNudged"], {})
 
 
 class DebtEscalate(DebtBase):

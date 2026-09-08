@@ -2672,7 +2672,11 @@ def _debt_reminder_outcomes(sid, lt, now):
     debtor's ENDED past the reminder's fire escalates to the asker's card and retires — the debtor had
     its chance and moved on without replying (the reminder's own response turn included: both honest
     exits it offered were postal replies, so a reply-less end IS the failure). A debtor that never turns
-    again is the backstop's case (_debt_backstop_tick)."""
+    again is the backstop's case (_debt_backstop_tick). An ask the bus RETURNED retires the record too and
+    never escalates (2026-09-08: the debtor exited before the reminder's turn read the ask; ORPHAN_GRACE
+    later the orphan sweep destroyed the mail and wrote the terminal bounced row; the asker got the bus
+    note; 6h on, the backstop flipped its card to blocked for an ask that had already come back) — the
+    debtor never had it, the return is the outcome, and the asker was told (_ask_returned)."""
     dn0 = _auto_nudge_data().get("debtNudged") or {}
     if not dn0:
         return
@@ -2686,6 +2690,9 @@ def _debt_reminder_outcomes(sid, lt, now):
         asker, _debtor, ts = parsed
         if last_any.get((sid, asker), 0) >= ts:        # answered → the reminder worked
             drop.append(key)
+            continue
+        if _ask_returned(asker, sid, ts):              # the ask came back: the debtor never had it, the
+            drop.append(key)                           # return is the outcome, the bus told the asker
             continue
         if isinstance(fire_t, (int, float)) and lt_end > fire_t:
             _debt_escalate(asker, sid, ts, now)        # moved on without replying → the user's turn
@@ -2717,6 +2724,9 @@ def _debt_backstop_tick(now):
             continue
         asker, debtor, ts = parsed
         if last_any.get((debtor, asker), 0) >= ts:
+            drop.append(key)
+            continue
+        if _ask_returned(asker, debtor, ts):           # came back → retired, never escalated (see above)
             drop.append(key)
             continue
         if isinstance(fire_t, (int, float)) and now - fire_t > NUDGE_DEFER_BACKSTOP_SECS:
@@ -30857,6 +30867,7 @@ def _blocked_placeholder(s, name, color, fsid, live, now, perm_state, since):
 _WAIT_Q_RE = re.compile(r"^\s*(?:QUESTION|ASK|Q)\b", re.I)
 _POSTAL_WAIT_CACHE = [None, None]   # (mtime_ns, size) , (last_any, last_ask, last_await) — one log scan per file change
 _POSTAL_PEER_NAMES = [None, {}]     # (mtime_ns, size) , {remote sid: "<host>:<name>"}: the same scan's display join
+_POSTAL_RETURNED = [None, {}]       # (mtime_ns, size) , {(from_id, peer key): {send t: return t}}: the same scan's returns — _postal_returned
 
 
 def _postal_wait_maps():
@@ -30890,17 +30901,35 @@ def _postal_wait_maps():
     host. The same scan therefore keeps the display join beside the maps, _POSTAL_PEER_NAMES, {remote
     sid: "<host>:<name>"} from every row that pairs the two (a relay row's to_sid + toName, a remote
     sender's from_id + from_host + from), newest sighting winning, and _peer_identity reads it
-    (_postal_peer_names) so the chip names the peer the row named."""
+    (_postal_peer_names) so the chip names the peer the row named.
+
+    A send that CAME BACK is neither an ask nor an answer (2026-09-08, two rules that agree). The bus
+    writes a terminal `bounced` row naming the message's id when a send is over with nothing ever coming
+    back — a peer refused it, the recipient exited and its unread mail was destroyed, an inbox file it
+    could not read, a write a crash cut short, an oversize push (every bounced row the bus writes is
+    terminal; a parked message awaiting relay has no row, its state is outbox residency). The scan used
+    to skip that row (it carries no from_id/to_id) and count the sent row, so the sender wore "Awaiting
+    <peer>" for a question the peer never received, its card parked as waiting on a peer while the
+    person may have needed to act, and a bounced reply read as answering the pair. A sent row whose id
+    a bounced row names now makes no entry at all — not last_any, not last_ask, not last_await (the
+    #1071 review's rule) — and a reply-requiring one records the return by pair and send time
+    (_POSTAL_RETURNED, read by _postal_returned) so the stamp readers' ending clock and the debt
+    reminder's outcome readers see it. The row is the closing EVENT: the card moves once, when it
+    lands. Keyed to the message it names, never the pair — a newer live ask keeps waiting whatever came
+    back for an older one."""
     try:
         st = jd.MESSAGES.stat()
         key = (st.st_mtime_ns, st.st_size)
     except OSError:
         _POSTAL_PEER_NAMES[:] = [None, {}]
+        _POSTAL_RETURNED[:] = [None, {}]
         return {}, {}, {}
     if _POSTAL_WAIT_CACHE[0] == key:
         return _POSTAL_WAIT_CACHE[1]
     last_any, last_ask, last_await = {}, {}, {}
     peer_names = {}   # remote sid -> (t, "<host>:<name>"): the display join, newest sighting wins
+    returned = {}     # mid -> t of its terminal `bounced` row: the sends that came back (jd._learn_return)
+    ended = {}        # (from_id, peer key) -> {send t: return t} for the pair's reply-requiring sends that came back
 
     def _saw(sid, at, hn):
         if sid and hn and at >= peer_names.get(sid, (-1, ""))[0]:
@@ -30908,14 +30937,12 @@ def _postal_wait_maps():
     try:
         rows = []
         alias = {}   # "host:name" -> [(t, sid), …], learned from every row a remote sender stamped
-        ended = set()   # ids a terminal `bounced` row closed: mail that never reached anyone
         for o in _messages_rows():                    # append-incremental rows (2026-09-03); the fold
             if not isinstance(o, dict):               # itself stays whole-log: aliases learned from LATER
                 continue                              # rows resolve EARLIER peer: rows
             rows.append(o)
             jd._learn_alias(alias, o)
-            if o.get("ev") == "bounced" and o.get("id"):
-                ended.add(str(o["id"]))
+            jd._learn_return(returned, o)
         jd._alias_settle(alias)
         for hn, hist in alias.items():                # the peer's own stamps, inverted: sid -> what it wore
             for at, sid in hist:
@@ -30923,16 +30950,6 @@ def _postal_wait_maps():
         for o in rows:
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
-                continue
-            if str(o.get("id") or "") in ended:
-                # A REFUSED or DESTROYED send is neither an ask nor an answer (review find,
-                # 2026-09-08): the bus closes a message it had to give up on — a peer's refusal, the
-                # orphan sweep's destroy, an inbox file it could not read, a write a crash cut short
-                # — with a terminal `bounced` row on the same id (a publish it refuses outright
-                # writes no row at all). The recipient never saw that message, so
-                # counting its row here made the asker wear an open ask (and the debt reminder
-                # count a debt) that no reply could ever close, and let a bounced reply read as
-                # answering the pair. The judge's _postal_ask_maps applies the same rule.
                 continue
             ts = int(ts)
             # a CROSS-HOST row is addressed to the RELAY ("peer:<host>"), not the recipient's sid —
@@ -30953,19 +30970,37 @@ def _postal_wait_maps():
                     # 29.6h-invisible ask eaten this way). The maps rebuild from the full log, so the
                     # moment the peer speaks the alias resolves and every row re-keys to the real sid.
                     t_ = jd._alias_at(alias, str(o["toName"]), ts) or "peer:" + str(o["toName"])
-            last_any[(f, t_)] = max(last_any.get((f, t_), 0), ts)
             k = o.get("kind")                            # the sender's DECLARED intent (schema field) wins
             is_ask = (k == "question") if k else bool(_WAIT_Q_RE.match(o.get("body") or ""))
+            is_await = (k in ("question", "delegate")) if k else is_ask   # reply-requiring; kindless rows by the ask prefix
+            mid = str(o.get("id") or "")
+            if mid and mid in returned:
+                # A REFUSED or DESTROYED send is neither an ask nor an answer (review find,
+                # 2026-09-08): the bus closes a message it had to give up on — a peer's refusal, the
+                # orphan sweep's destroy, an inbox file it could not read, a write a crash cut short
+                # — with a terminal `bounced` row on the same id (a publish it refuses outright
+                # writes no row at all). The recipient never saw that message, so counting its row
+                # here made the asker wear an open ask (and the debt reminder count a debt) that no
+                # reply could ever close, and let a bounced reply read as answering the pair. The
+                # judge's _postal_ask_maps applies the same rule. A reply-requiring one also records
+                # the RETURN on the pair, by send time: the stamp readers' other ending event beside
+                # the reply (_pair_wait_ended) and the debt outcome readers' join (_ask_returned). A
+                # coordinate opened no wait to end.
+                if is_await:
+                    pr = ended.setdefault((f, t_), {})
+                    pr[ts] = max(pr.get(ts, 0), returned[mid])
+                continue
+            last_any[(f, t_)] = max(last_any.get((f, t_), 0), ts)
             if is_ask and ts >= last_ask.get((f, t_), (0, ""))[0]:
                 # the ask's HEAD rides along (the user 2026-07-26): the debt reminder quotes the asker's
                 # own first words back at the debtor, so the reminder needs no second log scan
                 last_ask[(f, t_)] = (ts, k or "question", str(o.get("body") or "")[:300])
-            is_await = (k in ("question", "delegate")) if k else is_ask   # reply-requiring; kindless rows by the ask prefix
             if is_await:
                 last_await[(f, t_)] = max(last_await.get((f, t_), 0), ts)
     except OSError:
         pass
     _POSTAL_PEER_NAMES[:] = [key, {sid: hn for sid, (_at, hn) in peer_names.items()}]
+    _POSTAL_RETURNED[:] = [key, ended]
     _POSTAL_WAIT_CACHE[:] = [key, (last_any, last_ask, last_await)]
     return last_any, last_ask, last_await
 
@@ -30978,11 +31013,60 @@ def _postal_peer_names():
     return _POSTAL_PEER_NAMES[1]
 
 
+def _postal_returned():
+    """{(from_id, peer key): {send t: return t}}: per pair, each reply-requiring send of the sender's the
+    bus gave BACK — a terminal `bounced` row; the send is over and nothing will answer it (2026-09-08;
+    see _postal_wait_maps) — keyed by the send's own time. Kept by the same scan beside the maps, the
+    _postal_peer_names idiom, so the three-tuple every caller unpacks keeps its shape. The stamp readers'
+    ending clock reads the pair's newest return through _pair_wait_ended; the debt reminder's outcome
+    readers join a record's ask time to it through _ask_returned. Warms the scan when the log changed; a
+    stat per call otherwise."""
+    _postal_wait_maps()
+    return _POSTAL_RETURNED[1]
+
+
+def _pair_wait_ended(last_any, last_await, returned, f, t_):
+    """When the pair f → t_ stopped waiting, or 0 while it still does — THE ending clock both stamp
+    supersede readers (_peer_answered_at, _peer_answered) share. Two exact ending events, the newer
+    wins: the peer's reply at/after f's newest LIVE reply-requiring send (last_any[(t_, f)] at/after
+    last_await[(f, t_)]), and the bus returning such a send (returned[(f, t_)], the pair's returned sends
+    by send time: each a terminal `bounced` row — nothing will ever answer it, so the wait it opened is
+    over). A late reply after a return is not credited: with no live send there is nothing for it to
+    answer, so the pair's ending stays the return's t. A live send still unanswered
+    holds the pair open whatever came back for an older one: the return is keyed to the message it
+    names, never to the pair (2026-09-08)."""
+    sent = last_await.get((f, t_), 0)
+    reply = last_any.get((t_, f), 0)
+    if sent and reply < sent:
+        return 0                                     # a live reply-requiring send still waits
+    return max([reply if sent else 0] + list((returned.get((f, t_)) or {}).values()))
+
+
+def _ask_returned(asker, debtor, ask_ts):
+    """True when the ask `asker` sent `debtor` at `ask_ts` CAME BACK (a terminal bounced row named it) and
+    no live ask of theirs shares that second — the join the debt reminder's outcome readers
+    (_debt_reminder_outcomes, _debt_backstop_tick) make for a debtNudged record ("asker>debtor:ts", ts the
+    ask's own send time). The return is the outcome: the debtor never had the ask, so no reply is owed and
+    nothing escalates to the asker's card, and the bus's own note already told the asker the message came
+    back (2026-09-08). The reminder itself is injected through the session backend, never the bus, so only
+    the ask can be returned. The join is per SEND TIME, not per message: the record carries the ask's
+    second and the returns table keys a returned send by its second, so a live reply-expecting twin sent
+    in that same second keeps the record open — a returned m1 must not retire the reminder a live m2 still
+    owes. The twin check reads last_ask, the chip's own map and question-only like the record; a newer
+    live ask on the pair carries its own record, so the pair's newest live ask is the one that matters."""
+    ts = int(ask_ts)
+    if ts not in (_postal_returned().get((asker, debtor)) or {}):
+        return False
+    _any, last_ask, _aw = _postal_wait_maps()
+    return last_ask.get((asker, debtor), (0,))[0] != ts     # a live twin in the same second keeps the record
+
+
 def _wait_for_graph(now, alive_sids):
     """The fleet's WAIT-FOR graph from the postal log (the user 2026-06-22): a session X 'waits on' peer Y
     when X's latest REPLY-EXPECTING message to Y (a postal QUESTION, or a DELEGATE handoff whose result X
-    acts on — NOT a COORDINATE/FYI heads-up) has no answer back since (any later Y→X record answers it)
-    AND Y is ALIVE (a dead peer won't reply). Each X points to its single most-recent such Y (a functional
+    acts on — NOT a COORDINATE/FYI heads-up) has no answer back since (any later Y→X record answers it;
+    a send the bus RETURNED — a terminal bounced row — is neither an ask nor an answer, see
+    _postal_wait_maps) AND Y is ALIVE (a dead peer won't reply). Each X points to its single most-recent such Y (a functional
     graph), so following the edges detects CYCLES (X→Y→…→X = a mutual-wait deadlock). Returns
     {sid: {peerSid, name, color, inCycle, since, kind}} for every waiting session — the goal card's chip
     (kind picks its label: "Awaiting <peer>" vs "Handed off to <peer>") + the auto-nudge gate read it.
@@ -31014,8 +31098,9 @@ def _wait_for_graph(now, alive_sids):
 
 
 def _peer_answered_at(sid):
-    """The latest time a peer that `sid` had ASKED (question) or DELEGATED to REPLIED, over pairs with no
-    newer outstanding ask: max of last_any[(Y, sid)] where that reply is at/after sid's latest ask to Y.
+    """The latest time a peer that `sid` had ASKED (question) or DELEGATED to REPLIED — or the bus RETURNED
+    that send (a terminal bounced row, 2026-09-08) — over pairs with no newer outstanding ask: max of
+    last_any[(Y, sid)] where that reply is at/after sid's latest ask to Y, and of the pair's return.
     0 when nothing qualifies. The durable ⏳ awaiting-stamp readers treat a stamp OLDER than this as
     SUPERSEDED — the awaited answer arrived after the closer spoke, which is exactly the event the stamp
     was waiting for (the user 2026-07-25: a stamp filed at 13:12 kept a card on "Awaiting background
@@ -31024,6 +31109,7 @@ def _peer_answered_at(sid):
     stamp was really about non-peer work (subagents, a build), the LIVE sources that outrank it still
     carry the wait, and the closer's next pass can re-stamp with a fresh awaitingAt."""
     last_any, _ask, last_await = _postal_wait_maps()
+    returned = _postal_returned()
     best = 0
     # OUTBOUND rides last_await, not last_ask (2026-08-18 audit): the 2026-08-15 change that stopped
     # DELEGATES from making chip edges also emptied last_ask of them — which silently removed this
@@ -31033,17 +31119,19 @@ def _peer_answered_at(sid):
     # exact ending event for both; the chip edge stays question-only, exactly as #430 intended. Not
     # last_any (2026-09-08): a COORDINATE the asker sent after the answer landed ("thanks") counted as
     # a newer outbound awaiting a reply, so the answer read as stale and the stamp stood.
-    for (f, t_), sent in last_await.items():
+    # The bus RETURNING the send (2026-09-08, a terminal bounced row) is the pair's other ending event:
+    # the peer never got the ask and nothing will come back, so a stamp filed before the return is
+    # superseded by it exactly as by a reply (_pair_wait_ended, the clock _peer_answered shares).
+    for f, t_ in set(last_await) | set(returned):
         if f != sid:
             continue
-        r = last_any.get((t_, f), 0)
-        if r >= sent:                                    # the pair's newest reply-requiring send is answered
-            best = max(best, r)
+        best = max(best, _pair_wait_ended(last_any, last_await, returned, f, t_))
     return best
 
 
 def _peer_answered(sid):
-    """(answered_any, {peer_key: reply_t}) — _peer_answered_at with the PAIR kept (2026-08-24): the
+    """(answered_any, {peer_key: t the wait on that peer ENDED — its reply, or the bus returning the ask})
+    — _peer_answered_at with the PAIR kept (2026-08-24): the
     pair-blind scalar let ANY answered exchange supersede ANY peer stamp, so an unrelated coordinate
     from the same log hid a real wait (three stuck stamps, one ~14h). Stamps that record WHICH
     peer(s) they await (awaitingPeers, written by the closer's admit gate) are matched against their
@@ -31052,13 +31140,14 @@ def _peer_answered(sid):
     the admit gate derives them from, so the two sides can never disagree."""
     best = _peer_answered_at(sid)        # the scalar rides the existing name — the tests' stub seam
     last_any, _la, last_await = _postal_wait_maps()
+    returned = _postal_returned()
     per = {}
-    for (f, t_), sent in last_await.items():   # reply-requiring sends only — see _peer_answered_at
+    for f, t_ in set(last_await) | set(returned):   # reply-requiring sends only — see _peer_answered_at
         if f != sid:
             continue
-        r = last_any.get((t_, f), 0)
-        if r >= sent:
-            per[t_] = max(per.get(t_, 0), r)
+        ended = _pair_wait_ended(last_any, last_await, returned, f, t_)   # the reply, or the bus's return
+        if ended:
+            per[t_] = max(per.get(t_, 0), ended)
     return best, per
 
 

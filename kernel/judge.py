@@ -10304,6 +10304,24 @@ def _learn_alias(alias, o):
         alias.setdefault(str(o["from_host"]) + ":" + str(o["from"]), []).append((at, str(o["from_id"])))
 
 
+def _learn_return(returned, o):
+    """Record one TERMINAL return from a `bounced` row: returned[mid] is the latest t the bus gave the
+    message back — a peer refused it, the recipient exited and its unread mail was destroyed, an inbox
+    file it could not read, a write a crash cut short, an oversize push. Every bounced row the bus writes
+    is terminal (a parked message awaiting relay has no row; that state is outbox residency), and the row
+    names the ORIGINAL message's id, so a sent row whose id is here is neither an ask nor an answer:
+    nothing will ever answer it, and nobody ever read it. The ONE shape all three scans share — the
+    judge's ask maps, the kernel's wait maps (which also need the time, for the return clock) and the
+    courier's cross-host plant (2026-09-08)."""
+    if o.get("ev") == "bounced" and o.get("id"):
+        try:
+            at = int(o.get("t") or 0)
+        except (TypeError, ValueError):
+            at = 0
+        mid = str(o["id"])
+        returned[mid] = max(returned.get(mid, 0), at)
+
+
 def _alias_settle(alias):
     """Order each name's sightings by t and collapse CONSECUTIVE sightings of one sid into one entry, so
     the history is per WEARER CHANGE, not per row (a chatty peer name otherwise carries thousands of
@@ -10347,7 +10365,9 @@ def _postal_ask_maps():
     carries it (relay rows since 2026-09-08), else the name alias AT the row's send time (_alias_at),
     else the raw "peer:<host>:<name>". `alias` is the time-ordered name→sid history the re-key used;
     consumers resolve a name through _alias_at with the time of the message they hold, never by a
-    bare lookup."""
+    bare lookup. A sent row whose id a terminal `bounced` row names (the send came back: refused,
+    recipient gone, never left) makes no entry at all — neither an ask nor an answer — read exactly as
+    the kernel's wait maps read it (2026-09-08, _learn_return, the shape both scans share)."""
     try:
         st = MESSAGES.stat()
         key = (st.st_mtime_ns, st.st_size)
@@ -10355,8 +10375,7 @@ def _postal_ask_maps():
         return {}, {}, {}
     if _PEER_ASK_CACHE[0] == key:
         return _PEER_ASK_CACHE[1]
-    last_any, last_ask, rows, alias = {}, {}, [], {}
-    ended = set()   # ids a terminal `bounced` row closed: mail that never reached anyone
+    last_any, last_ask, rows, alias, returned = {}, {}, [], {}, {}   # returned: mid -> t of its terminal bounced row
     try:
         for line in MESSAGES.read_text(errors="replace").splitlines():
             try:
@@ -10367,16 +10386,16 @@ def _postal_ask_maps():
                 continue
             rows.append(o)
             _learn_alias(alias, o)
-            if o.get("ev") == "bounced" and o.get("id"):
-                ended.add(str(o["id"]))
+            _learn_return(returned, o)
         _alias_settle(alias)
         for o in rows:
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
                 continue
-            if str(o.get("id") or "") in ended:
+            if str(o.get("id") or "") in returned:
                 continue   # refused or destroyed: never reached the recipient, so neither an ask nor an
                 #            answer (review find, 2026-09-08): the kernel's _postal_wait_maps rule, mirrored
+                #            (the return's time rides in `returned` for the kernel's clock; membership is the rule here)
             ts = int(ts)
             if isinstance(t_, str) and t_.startswith("peer:"):
                 if o.get("to_sid"):
@@ -14910,6 +14929,7 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
     # backfilled; idempotent by msgId, so one plant per message ever.
     placed = 0
     fleet_ids = {f for f, p, a, nm in fleet}
+    xback = {}   # mid -> t: delegates the bus gave BACK (terminal bounced rows) — these plant nothing
     try:
         xrows = []
         for line in MESSAGES.read_text(errors="replace").splitlines():
@@ -14917,6 +14937,7 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
                 o = json.loads(line)
             except Exception:
                 continue
+            _learn_return(xback, o)
             if (o.get("ev") == "sent" and o.get("kind") == "delegate" and o.get("id")
                     and o.get("from_id") in fleet_ids and o.get("toName")
                     and str(o.get("to_id") or "").startswith("peer:")
@@ -14924,6 +14945,12 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
                 xrows.append(o)
     except OSError:
         xrows = []
+    # A delegate that came back never reached the peer (2026-09-08): a tracker planted from it would
+    # wait on a report-back no event can bring, since the remote arm's ending is the peer's own reply
+    # at/after the send. The bounced row is terminal, so the skip is final, not a retry. (A tracker
+    # planted BEFORE the return arrived is not closed here: ending it needs a verdict that says the
+    # handoff came back, not "reported back" — a writer, outside this reader's scope.)
+    xrows = [o for o in xrows if str(o["id"]) not in xback]
     for o in xrows:
         try:
             sstore = load_goals(o["from_id"])
