@@ -55,9 +55,11 @@ export type SendBase = {
                           //   (T252b). A LATE stamp leaves out the newest `own` copies of this send's text, the
                           //   ones the queued presumption reads as this press's. The group carries no uuid and is
                           //   no user event, so neither the anchor nor the floor ever saw it
-  queuedResident?: Record<string, number>; // per foreign key: user events after the anchor that already carried the
-                          //   text AT THE PRESS (a never-delivered verdict for an earlier copy) — not the queued
-                          //   copies' landings, so placement's ordinal counts them out (second review)
+  queuedResident?: Record<string, string[]>; // per foreign key: the uuids of user events after the anchor that
+                          //   already carried the text AT THE PRESS (a never-delivered verdict for an earlier copy) —
+                          //   not the queued copies' landings, so placement's ordinal counts them out while they are
+                          //   still present; the kernel retires a verdict once a same-text record lands, and a
+                          //   retired one must not keep the count unreachable (second and third reviews)
   seen: string[];         // uuids of the user events carrying the text that are background for this send: what
                           //   the press found, and what an earlier same-text entry claimed since — ONE ENTRY PER
                           //   COPY (a record of several sends lists its uuid once per spoken-for block)
@@ -127,14 +129,20 @@ export const foreignKey = (s: string): string => {
     while (i < lines.length && (/^\s*>/.test(lines[i]) || (i > 0 && !lines[i].trim()))) i++;
     if (i > 0 && lines.slice(0, i).some((l) => /^\s*>/.test(l))) t = lines.slice(i).join("\n");
   }
-  t = t.replace(/\[Image #\d+\]/g, " ").replace(/"?\S+\.(?:png|jpe?g|gif|webp)"?/gi, " ");
-  return collapse(t);
+  // the CLI's own extraction (kernel _IMG_PATH_RE): a leading delimiter, a path from `/` or `~/`, the extension
+  // at a word boundary — only the PATH is replaced, so whatever delimiter wrapped it stays on both sides
+  t = t.replace(/\[Image #\d+\]/g, "").replace(/(^|[\s'"`(])((?:~\/|\/)[^\s'"`()]+\.(?:png|jpe?g|gif|webp))\b/gi, "$1");
+  return collapse(t.replace(/"/g, ""));   // a quoted path may leave its quotes behind: set aside on both sides (noq)
 };
 /** Whether a user event carries `text` (on the foreignKey) in its md or any of its blocks — a record the CLI
  *  wrote from several queued messages taken at one boundary lists each as a block (T252b review). */
 const carriesText = (e: TailEvent, text: string): boolean => {
   if (e.kind !== "user" || isOptimisticUuid(e.uuid)) return false;
   const k = foreignKey(text);
+  // an image-only text keys to nothing: only an event that carries images can be its carrier — a reminders-only
+  // user record (a task notification landed mid-turn, md "") is not (the kernel's own by-text prune refuses an
+  // empty key the same way; third review)
+  if (!k) return Array.isArray(e.images) && e.images.length > 0 && (!e.md || !foreignKey(e.md));
   if (typeof e.md === "string" && foreignKey(e.md) === k) return true;
   return Array.isArray(e.blocks) && e.blocks.some((b) => typeof b === "string" && foreignKey(b) === k);
 };
@@ -299,7 +307,7 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
   // queued presumption). Beside them, the carriers of each text already resident after the anchor: those
   // are not the queued copies' landings, so placement counts them out (second review).
   const queuedForeign: string[] = [];
-  const queuedResident: Record<string, number> = {};
+  const queuedResident: Record<string, string[]> = {};
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
     if (e.kind !== "queued") continue;
@@ -317,9 +325,9 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
     for (const f of queuedForeign) {
       const k = foreignKey(f);
       if (k in queuedResident) continue;
-      let n = 0;
-      for (let i = anchorIdx + 1; i < events.length; i++) if (carriesText(events[i], f)) n++;
-      queuedResident[k] = n;
+      const us: string[] = [];
+      for (let i = anchorIdx + 1; i < events.length; i++) if (carriesText(events[i], f) && events[i].uuid) us.push(events[i].uuid!);
+      queuedResident[k] = us;
     }
   }
   // the queued presumption (above): a late stamp's newest `own` copies are this press's, so the count of
@@ -436,7 +444,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
       floorFor(p, landedIdx);
       continue;
     }
-    if (lostIdx >= 0) { r.lost.push(p); continue; }
+    if (lostIdx >= 0) { r.lost.push(p); floorFor(p, lostIdx); continue; }   // the verdict IS the earlier send's echo: a floor for later sends
     r.keep.push(p);
     // The kernel's ECHO atom covers ours: the kernel draws that atom itself, at the send time. A QUEUED copy
     // does not: it sits in the kernel's group at the tail, and the bubble the user watches is ours, at its
@@ -548,7 +556,8 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
     let groupIdx = -1;
     for (let j = events.length - 1; j >= base; j--) if (events[j].kind === "queued") { groupIdx = j; break; }
     for (const { text, n: copies } of counts.values()) {
-      const n = copies + ((at.queuedResident || {})[foreignKey(text)] || 0);   // the carriers resident at the press come first
+      const resident = ((at.queuedResident || {})[foreignKey(text)] || []).filter((u) => events.some((e) => e.uuid === u)).length;
+      const n = copies + resident;   // the carriers resident at the press, while still present, come first
       const k = kthCarrier(text, n);
       let floor = k.idx >= 0 ? k.idx + 1 : -1;
       if (k.count < n && groupIdx >= 0) {

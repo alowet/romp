@@ -446,6 +446,35 @@ test("the queue's copies count as they were at the press: a later press matching
   assert.deepEqual(injectionGroups(quoted, r.inject), [{ idx: 2, sends: [e] }]);
 });
 
+test("empty keys, retired verdicts, a verdict seen first, and the CLI's delimiters (T252b third review)", () => {
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }, { kind: "tool", uuid: "t1" }];
+  // (1) an image-only queued copy keys to nothing: a reminders-only user record (md "") that lands after the press
+  // is not its carrier — only an event that carries images can be
+  const imgQueued: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "/tmp/shot.png" }] }];
+  const b = newPending("typed after", undefined, T0); reconcilePending(imgQueued, [b]);
+  const notified: TailEvent[] = [...tail, { kind: "user", md: "", uuid: "uR" }, { kind: "tool", uuid: "t2" }, { kind: "queued", texts: [{ md: "/tmp/shot.png" }] }];
+  assert.deepEqual(injectionGroups(notified, reconcilePending(notified, [b]).inject), [{ idx: 5, sends: [b] }], "below the group, not after the notification");
+  const imgLanded: TailEvent[] = [...tail, { kind: "user", md: "", uuid: "uR" }, { kind: "tool", uuid: "t2" }, { kind: "user", md: "", uuid: "uImg", images: [{}] }, { kind: "tool", uuid: "t3" }];
+  assert.deepEqual(injectionGroups(imgLanded, reconcilePending(imgLanded, [b]).inject), [{ idx: 5, sends: [b] }], "below the image's atom once it lands");
+  // (2) a resident verdict counted at the press may be retired by the kernel: the group test must not then read a
+  // copy queued AFTER the press as a press-time one
+  const withVerdict: TailEvent[] = [tail[0], { kind: "user", md: "F", uuid: "echo:F0", undelivered: true }, { kind: "queued", texts: [{ md: "F" }] }];
+  const c = newPending("mine", undefined, T0 + 1); reconcilePending(withVerdict, [c]);
+  const verdictGone: TailEvent[] = [tail[0], { kind: "user", md: "F", uuid: "uF" }, { kind: "tool", uuid: "t1" }, { kind: "queued", texts: [{ md: "F" }] }];
+  assert.deepEqual(injectionGroups(verdictGone, reconcilePending(verdictGone, [c]).inject), [{ idx: 2, sends: [c] }], "right after the press-time copy's landing; the newer F is later");
+  // (3) an earlier send's never-delivered verdict, seen already flagged (a reconnect): a floor for the later send
+  const [p3, b3] = press([tail[0]], "first", "second");
+  const lostFirst: TailEvent[] = [tail[0], { kind: "user", md: "first", uuid: "echo:P", undelivered: true }];
+  const r = reconcilePending(lostFirst, [p3, b3]);
+  assert.deepEqual(r.lost, [p3]);
+  assert.deepEqual(b3.floors?.map((f) => f.uuid), ["echo:P"]);
+  assert.deepEqual(injectionGroups(lostFirst, r.inject), [{ idx: 2, sends: [b3] }], "below the verdict bubble, exactly as below the unflagged echo");
+  // (4) the CLI replaces only the path and leaves the delimiters: both sides keep them
+  for (const [q, l] of [["look (/tmp/a.png)", "look ()"], ["look `/tmp/a.png`", "look ``"], ["look '/tmp/a.png'", "look ''"], ["look \"/tmp/a.png\"", "look \"\""], ["look /tmp/a.png,", "look ,"]])
+    assert.equal(foreignKey(q), foreignKey(l), q);
+  assert.notEqual(foreignKey("design.png.bak notes"), foreignKey("notes"), "not a path: an ordinary token stays");
+});
+
 test("a bubble that changes slot marks the view stale, so the incremental repaint never trusts a shifted prefix (second review)", () => {
   // chatTail lowers v.rendered to the kernel index and the normal-mode append path re-renders from there, assuming
   // the DOM prefix still matches s.events — which also requires the bubble's SLOT to be unchanged. The settle
