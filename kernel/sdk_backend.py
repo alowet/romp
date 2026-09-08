@@ -2565,6 +2565,16 @@ class SdkSession:
         # so a kernel death can DELAY queued messages but never lose them; the boot reconcile
         # resumes any session with a non-empty persisted queue and this seed delivers it.
         self._pending: list[str] = [t for t in (reg.get("queue") or []) if isinstance(t, str) and t]
+        # Per-copy IDENTITY beside each queued text (T252c): {"qid", "qts"} — the echo key send() minted for
+        # it and its enqueue stamp (epoch ms) — or None for a copy nobody stamped (a restored queue after a
+        # kernel death, a notice this backend queued itself). Kept ALIGNED with _pending by the _q_* helpers;
+        # pending_meta() refuses to answer when they disagree, so the chat falls back to text rather than
+        # misattribute. The feed moves a copy's identity to _fed_meta, where qid_for_landing pairs it with
+        # the record that lands the text (FIFO per text, at or after the feed) — the landed atom then carries
+        # the same id the queued copy and the echo wore, and the chat places by identity, never by text.
+        self._pending_meta: list = [None] * len(self._pending)
+        self._fed_meta: list = []
+        self._landed_qid: dict = {}
         self._ping_feeding = False   # a rename ping was fed and its turn hasn't streamed yet: hold the
         #                              queue so no message can share its pre-turn window (the CLI batches
         #                              everything pre-start into ONE record — the 2026-08-25 fold); cleared
@@ -2611,12 +2621,71 @@ class SdkSession:
             except Exception as e:
                 self.backend._log("boot-settled callback (%s) failed: %s" % (self.name, e))
 
-    def enqueue(self, text: str):
+    def _q_append(self, text: str, meta=None):
+        self._pending.append(text)
+        self._pending_meta.append(meta if isinstance(meta, dict) and meta.get("qid") else None)
+
+    def _q_prepend(self, texts):
+        self._pending[0:0] = list(texts)
+        self._pending_meta[0:0] = [None] * len(texts)
+
+    def _q_pop(self, idx: int):
+        """(text, meta) at `idx`, both lists popped together — the one way a copy leaves the queue."""
+        text = self._pending.pop(idx)
+        meta = self._pending_meta.pop(idx) if idx < len(self._pending_meta) else None
+        return text, meta
+
+    def _pop_for_feed_locked(self):
+        """The head copy leaves for the CLI (the input generator, under self._lock): its identity moves to the
+        fed ledger, where the landing is paired with it. Returns (text, meta)."""
+        text, meta = self._q_pop(0)
+        if meta and meta.get("qid"):
+            self._fed_meta.append({"qid": meta["qid"], "text": text, "t": int(time.time())})
+            del self._fed_meta[:-64]                       # bounded: a landing is paired within a turn or two
+        return text, meta
+
+    def pending_meta(self):
+        """[{"md", "qid", "qts"}] aligned with pending(), or None when the identities cannot be trusted (the
+        two lists disagree) — the chat then falls back to text for this queue rather than misattribute."""
+        with self._lock:
+            if len(self._pending_meta) != len(self._pending):
+                return None
+            return [{"md": t, "qid": (m or {}).get("qid"), "qts": (m or {}).get("qts")}
+                    for t, m in zip(self._pending, self._pending_meta)]
+
+    def qid_for_landing(self, uuid_: str, text: str, t=None):
+        """The id of the fed copy a landed user record carries: the OLDEST fed entry with the same text
+        (echo_text_key), stamped at or before the record (a record stamped before the feed is an older
+        message's — 'ok', 'go ahead' repeat). Memoised per record uuid, so every rebuild answers the same and
+        each fed entry is spent once; None when nothing pairs (a record from before this kernel's life, a
+        copy the backend queued without an id)."""
+        if not uuid_:
+            return None
+        with self._lock:
+            if uuid_ in self._landed_qid:
+                return self._landed_qid[uuid_]
+            key = echo_text_key(text)
+            hit = None
+            for i, f in enumerate(self._fed_meta):
+                if echo_text_key(f["text"]) != key:
+                    continue
+                if t is not None and float(t) < f["t"] - 2:
+                    continue                               # stamped before the feed: not this copy's landing
+                hit = self._fed_meta.pop(i)["qid"]
+                break
+            self._landed_qid[uuid_] = hit
+            if len(self._landed_qid) > 512:
+                for k in list(self._landed_qid)[:-256]:
+                    del self._landed_qid[k]
+            return hit
+
+    def enqueue(self, text: str, qid: str | None = None, qts: int | None = None):
         """Deliver a user turn (called from the kernel thread). Held in self._pending —
         VISIBLE to pending_queued — until the input generator releases it at turn end. Works
-        before the loop is ready too (the generator drains _pending on its first pass)."""
+        before the loop is ready too (the generator drains _pending on its first pass). `qid`/`qts`:
+        the copy's identity (send() mints them; a caller without one queues an id-less copy)."""
         with self._lock:
-            self._pending.append(text)
+            self._q_append(text, {"qid": qid, "qts": qts} if qid else None)
             loop, wake = self.loop, self._input_wake
         self._persist_queue()
         if loop is not None and wake is not None:
@@ -2632,7 +2701,7 @@ class SdkSession:
         with self._lock:
             if self._pending:
                 return False
-            self._pending.append(text)
+            self._q_append(text)
             loop, wake = self.loop, self._input_wake
         self._persist_queue()
         if loop is not None and wake is not None:
@@ -2666,7 +2735,7 @@ class SdkSession:
         with self._lock:
             if expect is not None and not (0 <= idx < len(self._pending) and self._pending[idx] == expect):
                 idx = next((i for i, q in enumerate(self._pending) if q == expect), -1)
-            item = self._pending.pop(idx) if 0 <= idx < len(self._pending) else None
+            item = self._q_pop(idx)[0] if 0 <= idx < len(self._pending) else None
         if item is not None:
             self._persist_queue()
         return item
@@ -2868,7 +2937,7 @@ class SdkSession:
         self.backend.retire_live_work(self.sid)    # the abandoned turn's stream is gone with its client
         if stranded and not self.resume_sid:
             with self._lock:
-                self._pending[0:0] = stranded
+                self._q_prepend(stranded)
             self._persist_queue()                  # the fresh inputs() drains _pending on its first pass
         elif stranded:
             self.backend._mark_dropped_echoes(self.sid, self.pending(), refeed=False)
@@ -3362,7 +3431,7 @@ class SdkSession:
                     # turn-end events. Mid-turn forwards keep flowing (inflight > 0), so the
                     # in-flight turn can still finish; the wedged/rewind holds above are untouched.
                     blocked = blocked or (self.inflight == 0 and self.backend.drain_holding())
-                    item = self._pending.pop(0) if (self._pending and not blocked) else None
+                    item, _meta = self._pop_for_feed_locked() if (self._pending and not blocked) else (None, None)
                     fresh = item is not None and self.inflight == 0     # starting from idle, not mid-turn
                     if item is not None:
                         # under the SAME lock as the pop: busy() reads inflight>0 or _pending, and the kernel's
@@ -3532,7 +3601,7 @@ class SdkSession:
         dropped = None
         if not bare:
             with self._lock:
-                dropped = self._pending.pop(0) if self._pending else None
+                dropped = self._q_pop(0)[0] if self._pending else None
             self._persist_queue()
         self._rewind_wait = False
         try:
@@ -4848,7 +4917,7 @@ class SdkSession:
             note = task_death_notice(died, cause=self._RECONNECT_CAUSE)
             with self._lock:
                 if note not in self._pending:      # a flapping reconnect must not stack the same notice
-                    self._pending.append(note)
+                    self._q_append(note)
             self._persist_queue()
             try:
                 self.backend._update_reg(self.sid, bgTasks=[])   # reported — never re-notify these deaths
@@ -7354,6 +7423,21 @@ class SdkBackend:
         a no-op if already running."""
         return self._ensure(sid) is not None
 
+    def pending_queued_meta(self, sid: str):
+        """pending_queued's copies WITH their identities: [{"md", "qid", "qts"}] aligned with pending_queued,
+        or None when this session is not running (the persisted mirror carries texts only — a queue restored
+        after a kernel death has no ids, and the chat falls back to text for it) or the identities cannot be
+        trusted (T252c)."""
+        with self._lock:
+            s = self.sessions.get(sid)
+        return s.pending_meta() if s else None
+
+    def qid_for_landing(self, sid: str, uuid_: str, text: str, t=None):
+        """The id of the fed copy this landed user record carries, or None (see SdkSession.qid_for_landing)."""
+        with self._lock:
+            s = self.sessions.get(sid)
+        return s.qid_for_landing(uuid_, text, t) if s else None
+
     def pending_queued(self, sid: str) -> list[str]:
         """Queued-but-not-yet-started user turns for an SDK session (oldest first), or [] if the
         session isn't SDK-backed / not running. The kernel calls this to build the chat's
@@ -7426,7 +7510,7 @@ class SdkBackend:
                         or getattr(s, "_ping_feeding", False)   # getattr: test doubles skip __init__
                         or (s._rewind_to and not getattr(s, "_rewind_armed", False)))
 
-    def send(self, sid: str, text: str) -> bool:
+    def send(self, sid: str, text: str, qid: str | None = None) -> bool:
         s = self._ensure(sid)
         if not s:
             return False
@@ -7445,11 +7529,17 @@ class SdkBackend:
         # 2026-09-06, is where _text_landed starts the scan for this echo — see _transcript_mark).
         sent_t = int(time.time())
         sent_off, sent_fsid = self._transcript_mark(sid)
-        s.enqueue(text)
+        # The copy's IDENTITY (T252c): the echo key, minted BEFORE the enqueue so the queued copy, the
+        # optimistic echo and — through the fed ledger — the landed atom share one id; a parked send hands
+        # in the id it minted at park time. Synthetic uuid; the echo is pruned by text once the transcript
+        # writes the real user atom.
+        key = qid or "echo:" + uuid.uuid4().hex
+        try:
+            s.enqueue(text, qid=key, qts=int(time.time() * 1000))
+        except TypeError:                                    # a stand-in session that takes the text alone: an id-less copy
+            s.enqueue(text)
         # optimistic input echo: show the user's own message INSTANTLY (neither the transcript nor the
-        # stream has it yet at send time — only we know the text). Synthetic uuid; pruned by text once the
-        # transcript writes the real user atom.
-        key = "echo:" + uuid.uuid4().hex
+        # stream has it yet at send time — only we know the text).
         # AUTHOR the echo from the romp markers, exactly as the event model authors the REAL atom — else a
         # romp-injected nudge/auto-nudge sent through send() echoed as a BLUE HUMAN bubble (a "Follow-up"),
         # not the GRAY "from romp" auto-nudge it is, until the transcript atom replaced it (the user

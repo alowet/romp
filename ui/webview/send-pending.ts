@@ -55,6 +55,12 @@ export type SendBase = {
                           //   (T252b). A LATE stamp leaves out the newest `own` copies of this send's text, the
                           //   ones the queued presumption reads as this press's. The group carries no uuid and is
                           //   no user event, so neither the anchor nor the floor ever saw it
+  queuedForeignIds: string[]; // the IDS of the copies the tail queue held at the press, when the kernel gave them one
+                          //   (T252c: qid on each queued copy, the same id its echo and its landed atom carry): the
+                          //   exact reading — a copy is still queued while the group shows its id, and has landed
+                          //   when a user event carries it — with no text or ordinal involved. Copies without an id
+                          //   (an older kernel, a queue restored after a kernel death) stay in queuedForeign and take
+                          //   the text path
   queuedResident?: Record<string, string[]>; // per foreign key: the uuids of user events after the anchor that
                           //   already carried the text AT THE PRESS (a never-delivered verdict for an earlier copy) —
                           //   not the queued copies' landings, so placement's ordinal counts them out while they are
@@ -68,7 +74,7 @@ export type SendBase = {
 
 /** A placement floor recorded from an earlier send's kernel event: found by uuid, else by the `ord`-th user
  *  event after the anchor carrying `text` (the echo → landed swap keeps the position, changes the uuid). */
-export type Floor = { uuid: string; text?: string; ord: number };
+export type Floor = { uuid: string; text?: string; ord: number; qid?: string };   // qid: the earlier send's identity, followed exactly through the echo → landed swap
 
 export type PendingSend = {
   text: string;        // the sent body, byte for byte — what the kernel echoes and the transcript lands
@@ -82,6 +88,11 @@ export type PendingSend = {
   imgPaths?: string[]; // dragged images → the bubble's thumbnails, and the image-aware landing match
   lost?: string;       // an event after the press that makes non-delivery LIKELY ("connection": the
                        //   socket dropped) — the bubble says "not confirmed" instead of "sending…"
+  qid?: string;        // this send's IDENTITY once the kernel has shown it (T252c): the queued copy's id or the echo's
+                       //   uuid, latched from the first copy attributed to this send by text and position — from then
+                       //   on the landing, the cover and the hidden copy are decided by id (an event that carries an id
+                       //   is ours only if it carries THIS one); an event without an id (an older kernel, tmux) keeps
+                       //   deciding by text
   floors?: Floor[];    // kernel user events that belong to EARLIER-registered pending sends — their covering
                        //   echoes and their landed atoms, recorded as they are claimed (T252b): an earlier send's
                        //   message sits above this one whatever its text, so its bubble is drawn below them. Each
@@ -98,11 +109,12 @@ export type TailEvent = {
   kind: string;
   md?: string;
   uuid?: string;
+  qid?: string;         // a landed user atom: the id of the queued copy it lands (T252c; the kernel pairs them)
   ts?: string;          // the kernel's stamp for the event, ISO-8601 UTC (kernel.py `iso(t)`, whole seconds)
   absorbed?: boolean;
   undelivered?: boolean;
   images?: unknown[];
-  texts?: { md?: string; hiddenByPending?: boolean }[];   // hiddenByPending: render.ts hid this copy for a send drawn in place
+  texts?: { md?: string; hiddenByPending?: boolean; qid?: string; qts?: number; cancelable?: boolean }[];   // qid/qts: the copy's identity (T252c); hiddenByPending: render.ts hid this copy for a send drawn in place
   blocks?: string[];    // a user record the CLI wrote from SEVERAL sends taken at one boundary: one text per
                         //   block (kernel.py build_session ships them when there are two or more); `md` is
                         //   the blocks joined, so each block is a copy of its own send
@@ -189,6 +201,7 @@ function textCopies(e: TailEvent, p: PendingSend): number {
  *  its quotes behind, so those are set aside on both sides). */
 export function landedCopies(e: TailEvent, p: PendingSend): number {
   if (e.kind !== "user" || typeof e.md !== "string" || isKernelEchoUuid(e.uuid)) return 0;
+  if (p.qid && e.qid) return e.qid === p.qid ? 1 : 0;   // identity decides (T252c): ours only if it carries THIS send's id
   const n = textCopies(e, p);
   if (n) return n;
   if (p.imgPaths && p.imgPaths.length && Array.isArray(e.images) && e.images.length > 0) {
@@ -212,14 +225,18 @@ function queuedCopies(e: TailEvent, p: PendingSend): number {
  *  VERDICT, not a provisional (lostIn), and never suppresses a bubble. */
 function provisionalCopies(e: TailEvent, p: PendingSend): number {
   if (e.kind === "queued") return queuedCopies(e, p);
-  return e.kind === "user" && isKernelEchoUuid(e.uuid) && !e.undelivered ? textCopies(e, p) : 0;
+  if (!(e.kind === "user" && isKernelEchoUuid(e.uuid) && !e.undelivered)) return 0;
+  if (p.qid) return e.uuid === p.qid ? 1 : 0;         // the echo's uuid IS the copy's id (T252c)
+  return textCopies(e, p);
 }
 export const provisionalIn = (e: TailEvent, p: PendingSend): boolean => provisionalCopies(e, p) > 0;
 
 /** The kernel's verdict that the send was LOST: its echo, flagged never-delivered (the CLI died holding
  *  it, or the session moved past it). That bubble carries the text and the resend/dismiss actions. */
 function lostCopies(e: TailEvent, p: PendingSend): number {
-  return e.kind === "user" && !!e.undelivered ? textCopies(e, p) : 0;
+  if (!(e.kind === "user" && !!e.undelivered)) return 0;
+  if (p.qid && isKernelEchoUuid(e.uuid)) return e.uuid === p.qid ? 1 : 0;   // the verdict is the echo, by id (T252c)
+  return textCopies(e, p);
 }
 export const lostIn = (e: TailEvent, p: PendingSend): boolean => lostCopies(e, p) > 0;
 
@@ -313,15 +330,18 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
   // queued presumption). Beside them, the carriers of each text already resident after the anchor: those
   // are not the queued copies' landings, so placement counts them out (second review).
   const queuedForeign: string[] = [];
+  const queuedForeignIds: string[] = [];
   const queuedResident: Record<string, string[]> = {};
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
     if (e.kind !== "queued") continue;
     let skipOwn = p.late ? own : 0;
-    const copies = (e.texts || []).filter((t) => typeof t.md === "string" && !t.hiddenByPending).map((t) => t.md as string);
+    const copies = (e.texts || []).filter((t) => typeof t.md === "string" && !t.hiddenByPending);
     for (let k = copies.length - 1; k >= 0; k--) {
-      if (skipOwn > 0 && foreignKey(copies[k]) === foreignKey(p.text)) { skipOwn--; continue; }
-      queuedForeign.unshift(copies[k]);
+      const md = copies[k].md as string;
+      if (skipOwn > 0 && foreignKey(md) === foreignKey(p.text)) { skipOwn--; continue; }
+      if (copies[k].qid) queuedForeignIds.unshift(copies[k].qid!);   // an identified copy takes the id path (T252c)
+      else queuedForeign.unshift(md);                                //   an id-less one the text path
     }
     break;
   }
@@ -339,7 +359,7 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
   // the queued presumption (above): a late stamp's newest `own` copies are this press's, so the count of
   // background copies stops short of them — at zero when the frame lists fewer than presumed (the kernel
   // had not received every press yet; the copies still to come cover those entries in order)
-  return { after, place, placeText, placeOrd, queuedForeign, queuedResident, seen, queued: Math.max(0, queued - (p.late ? own : 0)) };
+  return { after, place, placeText, placeOrd, queuedForeign, queuedForeignIds, queuedResident, seen, queued: Math.max(0, queued - (p.late ? own : 0)) };
 }
 
 /** The first index AFTER the send's anchor — or 0 when there is no anchor, or when the anchor has left the
@@ -408,16 +428,21 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
       const text = owner.text;   // the earlier SEND's own text — a record of several sends carries it as a block, and its md is the blocks joined
       let ord = 0;
       if (q.at) for (let j = scanFrom(events, q.at); j <= at; j++) ord += carriedCopies(events[j], text);
-      q.floors.push({ uuid: u, text, ord });
+      q.floors.push({ uuid: u, text, ord, qid: owner.qid });
     }
   };
   for (const p of list) {
     const at = p.at!;
     const from = scanFrom(events, at);
-    let landedIdx = -1, lostIdx = -1, echoIdx = -1, copies = 0;
+    let landedIdx = -1, lostIdx = -1, echoIdx = -1, copies = 0, idCopy = -1;
     for (let i = from; i < events.length; i++) {
       const e = events[i];
-      if (e.kind === "queued") { copies += queuedCopies(e, p); continue; }
+      if (e.kind === "queued") {
+        copies += queuedCopies(e, p);
+        // the kernel's copy of THIS send, by id (T252c): the cover, wherever the copy sits in the group
+        if (p.qid && (e.texts || []).some((t) => t.qid === p.qid)) idCopy = i;
+        continue;
+      }
       // the copies of this event that are NOT this send's: background at the stamp, or claimed by an
       // entry retired since (`seen`); a landing an earlier entry took this push is counted in `claimed`
       const spoken = e.uuid ? spokenFor(at, e.uuid) : 0;
@@ -435,11 +460,26 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
       covered = true;
       const u = events[echoIdx].uuid;
       if (u) for (const q of list) if (q !== p && q.at && q.text === p.text && !q.at.seen.includes(u)) q.at.seen.push(u);
+      if (!p.qid && u) p.qid = u;                  // the echo's uuid is the copy's id: latched (T252c)
       floorFor(p, echoIdx);
-    } else if (copies > at.queued) {
+    } else if (p.qid && idCopy >= 0) {
+      covered = true; byQueued = true;              // our identified copy is in the queue: exact, whatever its position
+    } else if (!p.qid && copies > at.queued) {
       const taken = takenCopies.get(p.text) || new Set<number>();
       for (let k = at.queued; k < copies; k++) if (!taken.has(k)) { taken.add(k); covered = true; byQueued = true; break; }
       takenCopies.set(p.text, taken);
+      if (covered) {                                // latch the identity of the copy just attributed, when the kernel gave it one
+        let seen = 0;
+        outer: for (let i = from; i < events.length; i++) {
+          const e = events[i];
+          if (e.kind !== "queued") continue;
+          for (const t of e.texts || []) {
+            if (typeof t.md !== "string" || !sameText(t.md, p.text)) continue;
+            if (seen === [...taken].sort((a, b) => a - b).pop()) { if (t.qid) p.qid = t.qid; break outer; }
+            seen++;
+          }
+        }
+      }
     }
     if (covered) p.received = true;             // the kernel holds this send: proven once, latched
     if (p.received) p.lost = undefined;         // the drop is older news than the kernel's own copy
@@ -554,9 +594,22 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
   // an earlier pending send's echo or landed atom: below it, whatever its text — by uuid, else by its text's ordinal
   for (const f of p.floors || []) {
     let found = -1;
-    for (let j = events.length - 1; j >= base; j--) if (events[j].uuid === f.uuid) { found = j + 1; break; }
+    if (f.qid) for (let j = events.length - 1; j >= base; j--) if (events[j].qid === f.qid || events[j].uuid === f.qid) { found = j + 1; break; }   // by identity (T252c)
+    if (found < 0) for (let j = events.length - 1; j >= base; j--) if (events[j].uuid === f.uuid) { found = j + 1; break; }
     if (found < 0 && f.text !== undefined && f.ord > 0) { const k = kthCarrier(f.text, f.ord); if (k.idx >= 0) found = k.idx + 1; }
     if (found > idx) idx = found;
+  }
+  // the identified copies the kernel's queue held at the press (T252c): a copy is still queued while the group shows
+  // its id, and has landed when a user event carries it — exact, no text, no count
+  if (at.queuedForeignIds && at.queuedForeignIds.length) {
+    let groupIdx = -1;
+    for (let j = events.length - 1; j >= base; j--) if (events[j].kind === "queued") { groupIdx = j; break; }
+    for (const id of at.queuedForeignIds) {
+      let floor = -1;
+      for (let j = events.length - 1; j >= base; j--) if (events[j].qid === id) { floor = j + 1; break; }
+      if (floor < 0 && groupIdx >= 0 && (events[groupIdx].texts || []).some((t) => t.qid === id && !t.hiddenByPending)) floor = groupIdx + 1;
+      if (floor > idx) idx = floor;
+    }
   }
   // the texts the kernel's queue held at the press, COUNTED per text: the press-time copies are the first k
   // landings of that text, so the floor is the k-th carrier (never a later copy another client sent), and the
@@ -598,7 +651,11 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
  *  exists there: a tmux queue). That copy stays the one bubble shown, with its honest tooltip, and ours is
  *  suppressed as before: hidden behind our bubble's ✕ it offered a cancel the kernel would refuse (review of the
  *  first cut). */
-export function queuedCopyToHide(texts: { md?: string; cancelable?: boolean; hiddenByPending?: boolean; optimistic?: boolean }[], text: string): number {
+export function queuedCopyToHide(texts: { md?: string; cancelable?: boolean; hiddenByPending?: boolean; optimistic?: boolean; qid?: string }[], text: string, qid?: string): number {
+  if (qid) {   // OUR copy by identity (T252c): never the newest same-text one
+    const k = texts.findIndex((t) => t.qid === qid && !t.hiddenByPending && !t.optimistic);
+    if (k >= 0) return texts[k].cancelable === false ? -1 : k;
+  }
   for (let k = texts.length - 1; k >= 0; k--) {
     const t = texts[k];
     if (t.hiddenByPending || t.optimistic || typeof t.md !== "string" || !sameText(t.md, text)) continue;

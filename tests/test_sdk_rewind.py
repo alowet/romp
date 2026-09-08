@@ -189,7 +189,7 @@ class RollbackAndPendingCut(unittest.TestCase):
         # the head (a held postal delivery, say) must survive the failure
         self.assertIn("bare = self._rewind_bare", BACKEND_SRC)
         i_bare = BACKEND_SRC.index("bare = self._rewind_bare")
-        i_pop = BACKEND_SRC.index("dropped = self._pending.pop(0) if self._pending else None", i_bare)
+        i_pop = BACKEND_SRC.index("dropped = self._q_pop(0)[0] if self._pending else None", i_bare)   # T252c: the queue pops through its helper
         seg = BACKEND_SRC[i_bare:i_pop]
         self.assertIn("if not bare:", seg)
         self.assertIn("the rollback failed (the session's CLI refused it)", BACKEND_SRC)

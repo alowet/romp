@@ -416,7 +416,7 @@ function hideQueuedCopy(s: Session, p: PendingSend): { held?: Extract<ChatEvent,
   const qi = tailQueuedIdx(s.events);
   if (qi < 0) return { held: undefined };            // nothing queued at the tail: nothing to hide, ours shows
   const q = s.events[qi] as Extract<ChatEvent, { kind: "queued" }>;
-  const k = queuedCopyToHide(q.texts, p.text);
+  const k = queuedCopyToHide(q.texts, p.text, p.qid);   // ours by identity first (T252c)
   if (k < 0) return null;                            // no copy to hide (or a non-cancelable one): the kernel's bubble stays
   const texts = q.texts.slice(); texts[k] = { ...texts[k], hiddenByPending: true };
   s.events[qi] = { ...q, texts };
