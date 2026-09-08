@@ -244,7 +244,7 @@ class MovedAtomsDoNotReplay(unittest.TestCase):
             jd.plan_llm = jd.opener_llm = lambda text, *a, **k: (calls.append(text) or '{"ops":[{"why":"x","do":"skip"}]}')
             jd._group_store = lambda *a, **k: None
             try:
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 store = jd.load_goals(SID)
                 store["placementsV"] = jd.PLACEMENTS_V - 1        # recorded under the previous derivation…
                 store["placements"] = {SID + ":1780000000:ca8d36fd#p": {"goal": 1}}   # …with history
