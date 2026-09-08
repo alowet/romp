@@ -863,6 +863,16 @@ entry under the same kind says so. A file that cannot be read at all keeps
 showing its last-read values until it can. Nothing here needs a restart; the
 sidecars are yours to inspect or delete.
 
+Two small ledgers there, `auto-nudge.json` (the auto-nudge switch and its
+per-goal records) and `retry-suppressed.json` (the sessions whose auto-retry
+you stopped), are moved aside rather than overwritten when their bytes do not
+parse: the file is renamed `<name>.corrupt-<UTC stamp>` beside the original
+(`-1`, `-2`, ... when a second one lands in the same second), the dashboard's
+error center says so, and the ledger reads as a fresh install until you
+restore it from that file. Nothing is deleted. Any other read fault leaves the
+file untouched: the kernel serves the last copy it read, writes nothing to it,
+and says so once, until the file reads again.
+
 ## Switches
 
 Effective immediately, no restart.

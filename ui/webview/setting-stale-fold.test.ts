@@ -212,3 +212,23 @@ test("the open modal re-fills once per frame; a closed one never does", () => {
   g.frame({ ...REFUSED, gt: 5, host: "gpu1" });
   assert.equal(g.fills(), 2, "open: the frame IS the event — one re-read per frame, folded or not");
 });
+
+test("a write refused because the kernel could not read the setting's file offers no Apply anyway and says why", () => {
+  // the kernel answers a refused ledger write with the same frame plus `why` (kernel/kernel.py
+  // _tell_stale_gesture); re-issuing the gesture cannot succeed while the file is unreadable, so the
+  // toast drops the button (offered, it was a click that could only draw the same refusal) and names
+  // the reason beside the kept value (review find on #1018, 2026-09-08)
+  const g = lift();
+  g.frame({ type: "settingStale", setting: "auto-nudge", storedGt: 2000, gt: 1000, kept: false,
+            why: "read failed: [Errno 5] Input/output error", gesture: { type: "setAutoNudge", enabled: true } });
+  assert.equal(g.box().children.length, 1);
+  const t = g.box().children[0];
+  assert.equal(t.children.filter((c) => c.className === "rs-stale-toast-act").length, 0, "no Apply anyway: it could not succeed");
+  assert.match(g.texts()[0], /on was not applied on this machine\. Keeping off\./, "the stand-down copy is exactly true of it");
+  assert.match(g.texts()[0], /could not be read \(read failed: \[Errno 5\] Input\/output error\)/, "…and the reason is on the toast");
+  // an ordering stand-down (no why) keeps its button, the frozen-tab case the button exists for
+  g.frame({ ...REFUSED });
+  const t2 = g.box().children[1];
+  assert.equal(t2.children.filter((c) => c.className === "rs-stale-toast-act").length, 1);
+  assert.doesNotMatch(g.texts()[1], /could not be read/);
+});

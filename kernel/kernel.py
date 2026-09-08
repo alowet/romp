@@ -11,7 +11,7 @@ zero protocol change at switchover. WS is hand-rolled on the stdlib socket (no d
 
 Run:  bin/romp-kernel   → opens http://127.0.0.1:29855
 """
-import json, os, queue, random, re, signal, socket, sys, time, threading, traceback, base64, bisect, errno, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid, tempfile, stat, gzip, collections, functools
+import contextlib, json, os, queue, random, re, signal, socket, sys, time, threading, traceback, base64, bisect, errno, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid, tempfile, stat, gzip, collections, functools
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from importlib.machinery import SourceFileLoader
@@ -4208,11 +4208,13 @@ _ledger_fault_warned = {}              # what -> fault the reader already shoute
 _ledger_refusal_warned = {}            # what -> fault the writer already shouted; cleared by a proved write
 
 
-def _ledger_read(p, cache, default, what, normalize=None):
+def _ledger_read(p, cache, default, what, normalize=None, lock=None):
     """FOUR-STATE read of a small JSON ledger. Absent → default() (uncached: the fresh-install arm, byte for
     byte the old behavior); readable and a JSON object → the dict (normalize applied), cached under its
     stat key; bytes that do not parse → moved aside (_ledger_quarantine), then default(); any other stat
-    or read fault → a COPY of the last cached snapshot (else default()) tagged UNPROVED, nothing cached."""
+    or read fault → a COPY of the last cached snapshot (else default()) tagged UNPROVED, nothing cached.
+    `lock` is the ledger's WRITER lock, held across the quarantine only, never across the read (readers run
+    unlocked on several threads by design); see _ledger_quarantine for the window it closes."""
     try:
         st = p.stat()
     except FileNotFoundError:
@@ -4241,7 +4243,8 @@ def _ledger_read(p, cache, default, what, normalize=None):
             if not isinstance(d, dict):
                 reason = "top-level JSON value is %s, not an object" % type(d).__name__
     if reason is not None:                 # the bytes' fault, not the moment's: move them aside
-        why = _ledger_quarantine(p, st, what, reason)
+        with (lock if lock is not None else contextlib.nullcontext()):
+            why = _ledger_quarantine(p, st, what, reason)
         if why is None:
             return _ledger_proved(what, default())
         return _ledger_unproved(p, cache, default, what, "%s (%s)" % (reason, why))
@@ -4280,12 +4283,20 @@ def _ledger_unproved(p, cache, default, what, fault):
 def _ledger_quarantine(p, st, what, reason):
     """Move an unparseable ledger ASIDE (never delete it) so the evidence survives the fresh start that
     follows: the sidecar keeps the original name plus `.corrupt-<utc stamp>` (a `-n` suffix for a second in
-    the same second), the shape the judge's goal-store quarantine wears, so one convention reads across both.
+    the same second): the state dir's one sidecar convention for bytes moved aside (docs/reference.md,
+    "Where things live"; a goal-store quarantine proposed alongside in #1019 wears the same shape).
     Only while the file is still the one whose bytes failed (same inode and generation) — an atomic publish
-    since then already replaced them, and the new file gets its own read. Returns None once the bytes are out
-    of the way (moved, or already gone: a sibling reader moved them), with one stderr line for the move;
-    else the reason they are NOT, for the caller's fault text — which _ledger_unproved dedupes per episode,
-    so a corrupt file that cannot be moved (a read-only state dir) is said once, never once per read."""
+    since then already replaced them, and the new file gets its own read. That check and the rename are one
+    step ONLY under the ledger's writer lock, which _ledger_read holds around this call (review find,
+    2026-09-08): readers run unlocked on several threads, and two that read the same corrupt bytes both
+    arrive here with the same stat; between the first one's rename and a writer's fresh publish, the
+    second's check has already passed, so its rename moved the FRESH ledger aside and served the default.
+    Every writer publishes under that lock (the 2026-09-01 write discipline), so a reader holding it sees
+    either the file it read (and moves it) or a replacement (and yields). Returns None once the bytes are
+    out of the way (moved, or already gone: a sibling reader moved them), said once on stderr AND in the
+    error center; else the reason they are NOT, for the caller's fault text, which _ledger_unproved
+    dedupes per episode, so a corrupt file that cannot be moved (a read-only state dir) is said once, never
+    once per read."""
     try:
         cur = p.stat()
         if (cur.st_ino, cur.st_mtime_ns, cur.st_size) != (st.st_ino, st.st_mtime_ns, st.st_size):
@@ -4303,8 +4314,14 @@ def _ledger_quarantine(p, st, what, reason):
         # so a text with it changed every second and every once-per-fault-text dedupe fired once a second
         return "could not be moved aside: %s" % ("[Errno %d] %s" % (e.errno, e.strerror) if e.errno is not None
                                                  else type(e).__name__)
-    sys.stderr.write("%s: %s could not be parsed (%s); moved aside to %s, the ledger reads as absent\n"
-                     % (what, p.name, reason, aside.name))
+    # Both channels, one line (review find, 2026-09-08): stderr alone left the user with a ledger that read
+    # as a fresh install (an explicit auto-nudge OFF back ON, every session's stop-retrying gone) and
+    # nothing in the dashboard saying so. Once per corrupt file by construction: the next read finds it
+    # absent, and the unmovable arm above never reaches here (its text rides the deduped fault instead).
+    line = ("%s: %s could not be parsed (%s); moved aside to %s and reads as a fresh install (its settings "
+            "and records are gone) until you restore it from that file" % (what, p.name, reason, aside.name))
+    sys.stderr.write(line + "\n")
+    _sdk_problem(line)
     return None
 
 
@@ -4356,7 +4373,7 @@ def _auto_nudge_data():
     reads as the last proved snapshot tagged UNPROVED (which _write_auto_nudge refuses), bytes that do not
     parse are moved aside. Writers copy it first (`dict(_auto_nudge_data())`); the tag rides the copy."""
     return _ledger_read(jd.STATE / "auto-nudge.json", _autonudge_cache, _auto_nudge_default, "auto-nudge",
-                        _auto_nudge_normalize)
+                        _auto_nudge_normalize, lock=_NUDGE_LOCK)
 
 
 def _auto_nudge_on():
@@ -5801,10 +5818,13 @@ def _auto_resume_retry(now, tmux):
 # STATE/retry-suppressed.json {sid: stop_ts}. A sid present = suppressed; stop_ts is the re-arm floor (only a
 # successful turn AFTER it lifts the suppression). _auto_resume_session_retry clears re-armed sids each tick.
 _retry_suppress_cache = {}   # str(path) -> ((mtime_ns,size), dict)
-_RETRY_SUPPRESS_LOCK = threading.Lock()   # the arm/clear read-modify-write span: the interrupt handler (a WS
+_RETRY_SUPPRESS_LOCK = threading.RLock()  # the arm/clear read-modify-write span: the interrupt handler (a WS
 #                                           thread) and the pusher's re-arm sweep rewrite the same whole blob;
 #                                           unlocked, the loser's snapshot erased the winner's key. Held across
-#                                           the file read + write only — never across a backend call.
+#                                           the file read + write only, never across a backend call. Re-entrant
+#                                           because the reader takes it too, around a quarantine (_ledger_read's
+#                                           `lock`), and the arm and the clear call the reader while holding it
+#                                           (review find, 2026-09-08).
 _retry_floor_warned = set()               # (sid, type name) of a non-numeric floor already shouted
 
 
@@ -5812,7 +5832,8 @@ def _retry_suppress_data():
     """The per-session retry-suppression ledger's snapshot — the ledger block above _auto_nudge_data: absent
     reads as {} (nobody suppressed), a fault reads as the last proved snapshot tagged UNPROVED (which the
     writer refuses), bytes that do not parse are moved aside."""
-    return _ledger_read(jd.STATE / "retry-suppressed.json", _retry_suppress_cache, dict, "retry-suppress")
+    return _ledger_read(jd.STATE / "retry-suppressed.json", _retry_suppress_cache, dict, "retry-suppress",
+                        lock=_RETRY_SUPPRESS_LOCK)
 
 
 def _write_retry_suppress(d):
@@ -5826,6 +5847,36 @@ def _session_retry_suppressed(sid):
     storm and hasn't landed a successful turn since). Cheap membership read — the re-arm/clear lives in
     _auto_resume_session_retry; the apiRetry gate + the chat status flag both read this."""
     return str(sid) in _retry_suppress_data()
+
+
+_retry_gate_held = [None]   # the fault auto-retry is standing down on (see _retry_suppress_unknown); None = the ledger answers
+
+
+def _retry_suppress_unknown():
+    """True while the retry-suppression ledger reads UNPROVED and this process holds NO proved snapshot to
+    serve in its place: the tagged copy is then the fresh-install {} and EVERY stopped session reads as not
+    stopped, the one answer the auto-retry gate must not act on (review find, 2026-09-08: one EIO on a cold
+    kernel and auto-retry walked straight back into the session the user had interrupted to end its storm).
+    With a proved copy behind the fault the membership read is the best answer this process has (its own
+    arms refresh that copy), so the gate takes it. Unknown holds the AUTO path only (a manual Retry-now is
+    the user's explicit call and never reads this) and is said once per fault episode on stderr and in
+    the error center, the way the nudge pass's stand-down is; the first read that proves (or the first
+    proved copy) ends it: an event, not a clock."""
+    d = _retry_suppress_data()
+    fault = d.get(UNPROVED)
+    if fault and str(jd.STATE / "retry-suppressed.json") not in _retry_suppress_cache:
+        if _retry_gate_held[0] != fault:
+            _retry_gate_held[0] = fault
+            line = ("retry-suppress: retry-suppressed.json is unreadable (%s) and no proved copy is held; "
+                    "auto-retry stands down for every session, rather than resume into one you stopped, until "
+                    "it reads again" % fault)
+            sys.stderr.write(line + "\n")
+            _sdk_problem(line)
+        return True
+    if _retry_gate_held[0] is not None:
+        _retry_gate_held[0] = None
+        sys.stderr.write("retry-suppress: retry-suppressed.json answers again; auto-retry resumed\n")
+    return False
 
 
 def _suppress_session_retry(sid):
@@ -5930,6 +5981,9 @@ def _mark_auto_nudged(gid, turn_id, count, arm_atoms=None, at=None):
         _write_auto_nudge(d)
 
 
+_auto_nudge_drops_pending = set()   # gids whose spent-record drop was refused under a fault; replayed by the first proved pass
+
+
 def _drop_auto_nudge_rec(gid):
     """Erase `gid`'s SPENT ledger record — called when NEW INFORMATION voids the episode the record
     tracks (today: an awaiting-stamp LIFT in _lift_spent_awaiting — the wait the episode ended on has
@@ -5942,18 +5996,34 @@ def _drop_auto_nudge_rec(gid):
     counter on every stamp↔lift flap, so the same arm turn drew fresh first-nudges minutes apart and
     _mark_nudge_failed never engaged (the 2026-08-19 audit: three count-1 nudges in 21 minutes, each
     answered "the suite is still running"). A live record keeps itself honest without our help: a
-    genuine new turn re-arms it through the arm-key dedup, and answering marks it answered."""
+    genuine new turn re-arms it through the arm-key dedup, and answering marks it answered.
+
+    A drop that CANNOT land (the ledger read was unproved, or the writer refused the snapshot) is PARKED
+    (_auto_nudge_drops_pending) and replayed by the first pass whose read proves (review find, 2026-09-08):
+    every caller runs OUTSIDE the paused nudge pass (the awaiting lift, the follow-up reopen), off an event
+    that fires once, and its goal-store write had already landed, so a refused drop left the record
+    latched with nothing to retry it, and an idle session's card sat in Working with no reviver, the very
+    hole the drop exists to close. Under a fault the tagged copy cannot say what the file holds, so the gid
+    is parked whether or not the copy shows a record; the replay reads the proved file and drops only a
+    spent record, as ever. Returns True once nothing is owed (dropped, or no spent record to drop), False
+    when parked."""
     with _NUDGE_LOCK:
         d = dict(_auto_nudge_data())
+        if d.get(UNPROVED):
+            _auto_nudge_drops_pending.add(gid)
+            return False
         nudged = dict(d.get("nudged", {}))
         rec = nudged.get(gid)
         if not isinstance(rec, dict):
-            return
+            return True
         if not (rec.get("failed") or rec.get("moot") or rec.get("answeredAt")):
-            return                                        # live mid-episode → the ladder's memory, keep it
+            return True                                   # live mid-episode → the ladder's memory, keep it
         if nudged.pop(gid, None) is not None:
             d["nudged"] = nudged
-            _write_auto_nudge(d)
+            if _write_auto_nudge(d) is False:
+                _auto_nudge_drops_pending.add(gid)
+                return False
+        return True
 
 
 def _goal_awaiting_stamp(nodes, top, children=None, answered_at=0):
@@ -6141,13 +6211,15 @@ def _mark_nudge_failed(gid, ev_t=None, wake=False):
 
 def _interrupt_focus_top(store):
     """The top-level goal the interrupt actually stopped: the session's active-focus top, if it is
-    currently working. None when there's no working focus to block (nothing owed)."""
+    currently working, or blocked SOLELY by our own interrupt row (judge._intr_paused_only: the newest
+    block-family diary state is src 'interrupt' with no later unblock), which is the same stop still
+    standing; a card a judge has blocked since is theirs. None when there's no such focus (nothing owed)."""
     nodes = store.get("nodes", {})
     x = store.get("lastNode")
     seen = set()
     while x in nodes and nodes[x].get("parentId") is not None and x not in seen:
         seen.add(x); x = nodes[x]["parentId"]
-    if x in nodes and store.get("status", {}).get(x, "working") == "working":
+    if x in nodes and (store.get("status", {}).get(x, "working") == "working" or jd._intr_paused_only(nodes[x])):
         return x
     return None
 
@@ -6178,6 +6250,14 @@ def _record_interrupt_block(sid, ev):
     if not gid:
         return None
     nd = store["nodes"][gid]
+    if nd.get("blocked"):
+        # reachable only through _intr_paused_only: OUR block already holds the card, and only its marker
+        # is owed, so the tick re-mints it (review find, 2026-09-08). The marker write can be refused after
+        # the block landed (the ledger faulted between the tick's tag check and that write), and with the
+        # marker absent and the top no longer "working" every healed tick returned None here: no marker was
+        # ever minted, the re-engagement lift (gated on the marker) could never run, and the card sat in
+        # Needs-you until a judge happened to unblock it. Nothing is appended: the diary already says it.
+        return gid
     why = jd.INTERRUPT_BLOCK_WHY      # shared constant, PROCEDURAL (see judge.procedural_block_why)
     ev = int(ev or 0)
     ceil = max((e.get("ev_t") or 0 for e in (nd.get("log") or [])
@@ -6337,7 +6417,9 @@ def _interrupt_block_tick(now, tmux):
                 if g:
                     # the block IS filed — a proved goal-store write, a needs-you flip the feed must hear —
                     # so this pushes whatever the marker write's fate: a fault landing between the tag
-                    # check above and here refuses the marker, and the next tick stands down at the check
+                    # check above and here refuses the marker, the next tick stands down at the check, and
+                    # the first healed tick re-mints the marker (_record_interrupt_block hands back the gid
+                    # of a card our own block already holds, appending nothing)
                     _set_intr_blocked(sid, g); changed = True
         else:                                            # working / re-engaged / machine cut → lift OUR block if any
             ib = _intr_blocked(sid)
@@ -6957,6 +7039,16 @@ def _auto_nudge_pass(now, tmux, run_dead_wait):
         _auto_nudge_pause(snap[UNPROVED])
         return
     _auto_nudge_resume()
+    if _auto_nudge_drops_pending:
+        # the first proved read is the event the parked drops wait on (_drop_auto_nudge_rec): a replay that
+        # lands, or finds nothing spent, leaves the set; one refused again stays for the next proved pass
+        for gid in list(_auto_nudge_drops_pending):
+            if _drop_auto_nudge_rec(gid):
+                _auto_nudge_drops_pending.discard(gid)
+        snap = _auto_nudge_data()                         # the walk below reads the ledger the replay left
+        if snap.get(UNPROVED):
+            _auto_nudge_pause(snap[UNPROVED])
+            return
     on = _auto_nudge_on()
     nudged = dict(snap.get("nudged", {}))                 # {gid: {count, lastTurnId}}
     alive = list(_alive_sessions(now, tmux))
@@ -11681,11 +11773,15 @@ def _fire_api_retry(sid, be, manual=False):
     asking itself is the same decision on the same state.
 
     The GATE block is for the AUTO path only: a global pause or a thread the user interrupted must not
-    relapse into the storm. A MANUAL Retry-now is an explicit one-shot override — it ALWAYS fires so the
-    button is never a dead no-op on a suppressed/paused thread (the user 2026-07-06). It fires ONE retry
-    without clearing the suppression, so it doesn't re-arm the auto-loop the user turned off."""
+    relapse into the storm, nor may a thread whose stop the kernel cannot currently READ (the suppression
+    ledger unreadable with no proved copy behind it reads every stop as absent; _retry_suppress_unknown
+    holds the auto path until it reads again). A MANUAL Retry-now is an explicit one-shot override: it
+    ALWAYS fires so the button is never a dead no-op on a suppressed/paused thread (the user 2026-07-06).
+    It fires ONE retry without clearing the suppression, so it doesn't re-arm the auto-loop the user turned off."""
     if not manual and (_retry_paused_on() or _session_retry_suppressed(sid)):
         return
+    if not manual and _retry_suppress_unknown():
+        return                                            # unknown is not "not stopped": fail safe, said once
     # IDEMPOTENCY (the user 2026-07-08): don't stack a fresh auto-"retry" when the one romp already sent is
     # still QUEUED and unconsumed — the session is blocked, so the previous retry hasn't run yet and another
     # only piles up. Without this the auto-loop enqueued N bare "retry"s into the SDK queue during one

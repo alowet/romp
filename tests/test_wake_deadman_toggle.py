@@ -292,6 +292,36 @@ class UnreadableLedgerPausesThePass(_Base):
             self._tick()
         self.assertEqual(self.fb.sent, [], "OFF on disk, unreadable now: no fabricated ON fires a status check")
 
+    def test_a_drop_refused_during_a_fault_replays_on_the_first_proved_pass(self):
+        # the awaiting lift and the follow-up reopen drop a SPENT record from OUTSIDE the paused pass, off an
+        # event that fires once; their goal-store write lands, the ledger drop is refused under the fault,
+        # and nothing retried it: the record stayed latched and an idle session's card sat in Working with
+        # no reviver (review find, 2026-09-08). Now a refused drop is parked and the first proved pass
+        # replays it; a LIVE record parked alongside is kept, as the drop always keeps live records.
+        self._toggle(False)                              # wake-only, no store: the walk writes nothing itself
+        spent, live = self.gid, SID + ":g2"
+        d = json.loads(self.ledger.read_bytes())
+        d["nudged"] = {spent: {"count": 3, "lastTurnId": "t1", "failed": True, "failedAt": NOW - H},
+                       live: {"count": 1, "lastTurnId": "t1"}}
+        self.ledger.write_text(json.dumps(d))
+        km._autonudge_cache.clear()
+        before = self.ledger.read_bytes()
+        vars(km).get("_auto_nudge_drops_pending", set()).clear()          # absent before the fix (see setUp)
+        self.addCleanup(lambda: vars(km).get("_auto_nudge_drops_pending", set()).clear())
+        heal = self._fault()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            verdicts = [km._drop_auto_nudge_rec(spent), km._drop_auto_nudge_rec(live)]
+        self.assertEqual(self.ledger.read_bytes(), before, "under the fault the drops are refused: the file keeps its bytes")
+        heal()
+        with contextlib.redirect_stderr(err):
+            self._tick()
+        nudged = json.loads(self.ledger.read_text())["nudged"]
+        self.assertNotIn(spent, nudged, "the first proved pass replays the drop: the spent record is gone")
+        self.assertIn(live, nudged, "…and the live record (the ladder's memory) is kept, as ever")
+        self.assertEqual(verdicts, [False, False], "the callers were told the drop did not land")
+        self.assertEqual(self.fb.sent, [], "nothing injected: the replay is bookkeeping")
+
     # ── a fault that lands MID-pass: the head read proved, a leg's read did not ──────────────────
     # The pass gate covers a fault at the head. Two legs record what they fired only AFTER deciding to
     # send (the debt reminder) or send only after a durable claim (the compaction suggestion); each

@@ -12,6 +12,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -201,7 +202,9 @@ class LedgerFaultsNeverEraseSiblings(unittest.TestCase):
                 raise exc
             return real(p, *a, **k)
         Path.read_text = failing
-        self._undo.append(lambda: setattr(Path, "read_text", real))
+        heal = lambda: setattr(Path, "read_text", real)
+        self._undo.append(heal)
+        return heal
 
     def _aside(self):
         return sorted(n for n in os.listdir(self.dir) if n.startswith("retry-suppressed.json.corrupt-"))
@@ -309,6 +312,91 @@ class LedgerFaultsNeverEraseSiblings(unittest.TestCase):
         self.assertEqual(len(aside), 1, "evidence kept, never deleted")
         self.assertEqual((self.dir / aside[0]).read_text(), '{"s1": 100.0,')
         self.assertEqual(err.getvalue().count("moved aside"), 1)
+
+    # ── the auto-retry gate reads this ledger: unknown is not "not stopped" ─────────────────────
+    def _retry_rig(self):
+        """_fire_api_retry's collaborators, stubbed down to the gate under test: an api-errored live session,
+        no backoff due, no queued retry, and a backend that records what it was asked to send."""
+        sent = []
+        be = types.SimpleNamespace(pending_queued=lambda sid: [], send=lambda sid, body: sent.append(sid))
+        for n, v in (("_retry_paused_on", lambda: False), ("_api_error", lambda p: {"uuid": "e1"}),
+                     ("_path_of", lambda sid: "x"), ("_retry_gate_state", lambda sid: (0, 0)),
+                     ("_note_retry_sent", lambda *a, **k: None)):
+            orig = getattr(km, n)
+            setattr(km, n, v)
+            self._undo.append(lambda n=n, orig=orig: setattr(km, n, orig))
+        km._auto_retried.clear()
+        self.addCleanup(km._auto_retried.clear)
+        vars(km).get("_retry_gate_held", [None])[0] = None    # the gate's once-per-episode latch (absent before the fix)
+        return be, sent
+
+    def _fire(self, be, *sids, manual=False):
+        for sid in sids:
+            km._fire_api_retry(sid, be, manual=manual)
+            km._auto_retried.clear()                          # each ask is its own error episode here
+
+    def test_an_unreadable_ledger_with_no_proved_copy_retries_nobody_until_it_reads_again(self):
+        # the membership read answered `sid in {}` (every stopped session read as NOT stopped) and the
+        # auto-retry walked back into the session the user had interrupted to end its storm (review find,
+        # 2026-09-08). Unknown is not "not stopped": with no proved copy to fall back on, the auto path
+        # stands down for every session, said once, until the file reads again; a manual Retry-now still fires.
+        self._seed({"s1": 100.0})                             # s1 stopped; this process has proved nothing yet
+        be, sent = self._retry_rig()
+        heal = self._fail_read()
+        err, rows = io.StringIO(), len(km._SDK_BOOT_PROBLEMS)
+        with contextlib.redirect_stderr(err):
+            self._fire(be, "s1", "s2")
+            self._fire(be, "s1")
+        self.assertEqual(sent, [], "no auto-retry into s1 (stopped), nor s2: the ledger cannot say who is stopped")
+        self.assertEqual(err.getvalue().count("auto-retry stands down"), 1, "said once per fault episode, not per ask")
+        self.assertEqual(len(km._SDK_BOOT_PROBLEMS), rows + 1, "…and once in the error center")
+        with contextlib.redirect_stderr(err):
+            self._fire(be, "s1", manual=True)
+        self.assertEqual(sent, ["s1"], "a manual Retry-now is the user's explicit call: it fires")
+        heal()
+        del sent[:]
+        with contextlib.redirect_stderr(err):
+            self._fire(be, "s1", "s2")
+        self.assertEqual(sent, ["s2"], "healed: the real answer applies; s1 stays stopped, s2 retries")
+        self.assertIn("auto-retry resumed", err.getvalue())
+
+    def test_with_a_proved_copy_behind_the_fault_the_copy_answers(self):
+        self._seed({"s1": 100.0})
+        self.assertTrue(km._session_retry_suppressed("s1"))   # a proved read: the copy this process holds
+        self.p.write_text(json.dumps({"s1": 100.0}, indent=1))   # the file moves on…
+        be, sent = self._retry_rig()
+        self._fail_read()                                     # …and cannot be read
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._fire(be, "s1", "s2")
+        self.assertEqual(sent, ["s2"], "the last proved snapshot is the best answer this process has: s1 stays stopped, s2 retries")
+
+    def test_the_arm_and_the_sweep_s_clear_cannot_erase_each_other_s_key(self):
+        # the interrupt handler's arm (a WS thread) and the pusher's re-arm clear rewrite the same whole
+        # blob. Interleaved deterministically: the arm's read returns and then STALLS until the clear has
+        # run, a window that opens only if nothing holds the clear out (the wait has a timeout because,
+        # with the lock held, it is a deadlock by design: the clear cannot run until the arm is done).
+        self._seed({"s1": 100.0, "s2": 200.0})
+        real, main = km._retry_suppress_data, threading.current_thread()
+        arm_read, clear_done = threading.Event(), threading.Event()
+
+        def stalling():
+            d = real()
+            if threading.current_thread() is not main:        # the arm's thread only
+                arm_read.set()
+                clear_done.wait(0.5)
+            return d
+        km._retry_suppress_data = stalling
+        self._undo.append(lambda: setattr(km, "_retry_suppress_data", real))
+        arm = threading.Thread(target=km._suppress_session_retry, args=("s3",))
+        arm.start()
+        self.assertTrue(arm_read.wait(5), "the arm read the ledger")
+        cleared = km._clear_session_retry_suppress("s1")      # the sweep's clear, racing the arm's write
+        clear_done.set()
+        arm.join(5)
+        km._retry_suppress_cache.clear()
+        self.assertEqual(set(json.loads(self.p.read_text())), {"s2", "s3"},
+                         "both land, s1's clear and s3's stop: neither snapshot erased the other's key")
+        self.assertTrue(cleared)
 
 
 if __name__ == "__main__":

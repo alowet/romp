@@ -24,6 +24,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -56,6 +57,7 @@ def _reset_ledger_state():
     for reg in REGISTRIES:                       # absent on a kernel before the fix (see UNPROVED above)
         vars(km).get(reg, {}).clear()
     vars(km).get("_auto_nudge_paused", [None])[0] = None
+    vars(km).get("_auto_nudge_drops_pending", set()).clear()   # drops parked under a fault (review find, 2026-09-08)
 
 
 def _fail_path(target, method, exc):
@@ -336,16 +338,73 @@ class CorruptBytes(_Ledger):
         self.assertEqual((jd.STATE / self._aside()[0]).read_bytes(), b"\xff\xfe{")
         self.assertIn("not UTF-8", err.getvalue())
 
+    def test_the_move_is_said_in_the_error_center_once(self):
+        # stderr alone left the user with a ledger that read as a fresh install (an explicit OFF back ON,
+        # every session's stop-retrying gone) and nothing in the dashboard saying so (review find,
+        # 2026-09-08). One line, both channels; once per corrupt file, because the next read finds it absent
+        rows = len(km._SDK_BOOT_PROBLEMS)
+        d, err = self._corrupt('{"enabled": fals')
+        self.assertEqual(len(km._SDK_BOOT_PROBLEMS), rows + 1, "the dashboard's error center hears the move")
+        row = km._SDK_BOOT_PROBLEMS[-1]["text"]
+        self.assertIn("reads as a fresh install", row, "…worded as what it costs")
+        self.assertIn(self._aside()[0], row, "…and naming the file to restore from")
+        self.assertEqual(err.strip(), row, "the stderr line is the same line")
+        with contextlib.redirect_stderr(io.StringIO()):
+            km._auto_nudge_data()                          # absent now: a proved default, nothing more to say
+        self.assertEqual(len(km._SDK_BOOT_PROBLEMS), rows + 1, "once per corrupt file")
 
-class InterruptBlockTickUnderAFault(unittest.TestCase):
-    """_interrupt_block_tick runs every push OUTSIDE the paused nudge pass. Under an unproved snapshot its
-    block arm used to file the block in the goal store (a proved write) and then have the marker write
-    refused — and the lift on re-engagement is gated on that marker, so a block placed during a fault
-    episode stood until a judge happened to unblock it; and its lift arm, with the marker clear refused,
-    set `changed` every cycle and pushed every cycle. Now the block arm files nothing under a fault (the
-    stop is re-evaluated from the transcript every push, so the block lands on the first tick after the
-    file reads again), the lift still runs (it is the user's own re-engagement), and `changed` follows the
-    marker write. Control flow only: every collaborator is a recording stub."""
+    def test_a_second_reader_of_the_same_corrupt_bytes_cannot_move_a_fresh_ledger_aside(self):
+        # the inode guard alone is check-then-act: readers run unlocked on several threads, and two that
+        # read the same corrupt bytes both reach the quarantine with the same stat. Between the first one's
+        # rename and a writer's fresh publish, the second's check has already passed, so its rename moved
+        # the FRESH ledger aside and served the untagged default (review find, 2026-09-08). The check and
+        # the rename are one step under the ledger's writer lock, which every writer publishes under.
+        # Deterministic: at the moment of our rename a peer PROBES that lock without blocking: if it gets
+        # it, the window is open and the peer does exactly what the first reader and the writer would
+        # (moves the bytes, publishes a valid ledger) before our rename runs; if not, it waits like any
+        # writer, and acts once we are done. Either way, the fresh ledger must stand.
+        self.p.write_text("{")
+        km._autonudge_cache.clear()
+        real_replace, ledger, lock, probed, peer = os.replace, self.p, km._NUDGE_LOCK, threading.Event(), []
+
+        def peer_moves_and_publishes():
+            got = lock.acquire(blocking=False)
+            if not got:
+                probed.set()
+                lock.acquire()                             # a peer that respects the lock waits for us
+            try:
+                if ledger.exists():                        # the first reader's rename of the bytes that failed
+                    real_replace(ledger, ledger.with_name("auto-nudge.json.corrupt-peer"))
+                tmp = ledger.with_name("auto-nudge.json.tmp.peer")
+                tmp.write_text(json.dumps(SEEDED))         # the writer's publish
+                real_replace(tmp, ledger)
+            finally:
+                lock.release()
+                probed.set()
+
+        def replace_racing(src, dst, *a, **k):
+            if ".corrupt-" in str(dst) and not peer:
+                peer.append(threading.Thread(target=peer_moves_and_publishes))
+                peer[0].start()
+                self.assertTrue(probed.wait(5), "the peer probed the lock")
+            return real_replace(src, dst, *a, **k)
+        os.replace = replace_racing
+        self._undo.append(lambda: setattr(os, "replace", real_replace))
+        with contextlib.redirect_stderr(io.StringIO()):
+            km._auto_nudge_data()
+        peer[0].join(5)
+        self._heal()
+        self.assertTrue(self.p.exists(), "the fresh ledger was not moved aside")
+        self.assertEqual(json.loads(self.p.read_text()), SEEDED, "…and it stands, untouched")
+        for name in self._aside():
+            self.assertEqual((jd.STATE / name).read_text(), "{", "only the bytes that failed were moved aside: " + name)
+        km._autonudge_cache.clear()
+        self.assertEqual(km._auto_nudge_data()["nudged"], SEEDED["nudged"], "the next read serves the fresh ledger")
+
+
+class _InterruptTickRig(unittest.TestCase):
+    """The interrupt tick's collaborators as recording stubs, the rig the two classes below share
+    (unittest collects inherited test_ names, so the fixture lives apart from either's tests)."""
 
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
@@ -395,6 +454,17 @@ class InterruptBlockTickUnderAFault(unittest.TestCase):
     def _tick(self, n=1):
         for _ in range(n):
             km._interrupt_block_tick(2000, {SID: {"state": ""}})
+
+
+class InterruptBlockTickUnderAFault(_InterruptTickRig):
+    """_interrupt_block_tick runs every push OUTSIDE the paused nudge pass. Under an unproved snapshot its
+    block arm used to file the block in the goal store (a proved write) and then have the marker write
+    refused — and the lift on re-engagement is gated on that marker, so a block placed during a fault
+    episode stood until a judge happened to unblock it; and its lift arm, with the marker clear refused,
+    set `changed` every cycle and pushed every cycle. Now the block arm files nothing under a fault (the
+    stop is re-evaluated from the transcript every push, so the block lands on the first tick after the
+    file reads again), the lift still runs (it is the user's own re-engagement), and `changed` follows the
+    marker write. Control flow only: every collaborator is a recording stub."""
 
     def test_a_stop_during_a_fault_files_no_block_until_the_ledger_reads_again(self):
         self.p.write_text(json.dumps(DEFAULT))
@@ -455,6 +525,111 @@ class InterruptBlockTickUnderAFault(unittest.TestCase):
         self._tick()
         self.assertNotIn(SID, json.loads(self.p.read_text()).get("intrBlocked", {}), "the marker clears on the first tick after the file reads")
         self.assertEqual(len(self.pushes), 1, "…and that is the one push")
+
+
+B = 1_700_000_000   # an epoch base for the store class below: the diary is an evidence-time ledger
+
+
+class MidTickFaultThenHeal(_InterruptTickRig):
+    """The window the arm above cannot close: the tag check proved, the block was FILED in the goal store,
+    and the fault landed on the marker write's own read. The card is blocked, the marker is absent, and
+    every healed tick used to return None from _record_interrupt_block (its focus-top rule accepted only a
+    "working" top), so no marker was ever minted, the re-engagement lift (gated on the marker) could never
+    run, and the card sat in Needs-you until a judge happened to unblock it (review find, 2026-09-08). Now a
+    top blocked SOLELY by our own interrupt row (judge._intr_paused_only) is the same stop still standing:
+    the first healed tick re-mints the marker without appending, and the lift runs on re-engagement. A
+    judge's block filed since is theirs and is left alone. The real store and the real record/lift/stands
+    functions; only the transcript and the session list are stubs."""
+
+    def setUp(self):
+        super().setUp()
+        for n in ("_record_interrupt_block", "_lift_interrupt_block", "_intr_block_stands"):
+            setattr(km, n, self.saved[n])                  # the real ones: this class is about the store
+        self.saved_goaldir = jd.GOALDIR
+        jd.GOALDIR = jd.STATE / "goals"
+        jd.GOALDIR.mkdir(parents=True)                     # (the overrides journal follows GOALDIR: private too)
+        store = {"rompUuid": SID, "seq": 1, "placements": {}, "status": {}, "lastNode": GID,
+                 "nodes": {GID: {"id": GID, "text": "Ship the widget", "parentId": None, "nodeComplete": False,
+                                 "blocked": False, "cleared": False, "trail": [], "t": B + 500, "mt": B + 800}}}
+        jd.rollup_status(store, False)
+        jd.save_goals(SID, store)
+        self.marks = (B + 1200, B + 900)                   # a user stop, newer than the last human message
+        jd.parsed_session = lambda sid, paths, now: {"turns": [{"id": "t1", "t": B + 1000, "atoms": []}]}
+        self.p.write_text(json.dumps(DEFAULT))
+        km._autonudge_cache.clear()
+
+    def tearDown(self):
+        jd.GOALDIR = self.saved_goaldir
+        super().tearDown()
+
+    def _tick(self, n=1):
+        for _ in range(n):
+            km._interrupt_block_tick(B + 2000, {SID: {"state": ""}})
+
+    def _store(self):
+        return jd.load_goals(SID)
+
+    def _block_rows(self):
+        return [e.get("src") for e in self._store()["nodes"][GID].get("log") or [] if e.get("kind") == "block"]
+
+    def _fault_on_the_marker_write(self):
+        """Reads 1 (the tag check) and 2 (the marker lookup) prove; the block is filed; read 3, the marker
+        write's own, finds the file moved on and unreadable. Leaves the file healed."""
+        real, calls, ledger, test = km._auto_nudge_data, [0], self.p, self
+
+        def flaky():
+            calls[0] += 1
+            if calls[0] == 3:
+                ledger.write_text(json.dumps(DEFAULT, indent=1))
+                test._fail_read()
+            return real()
+        km._auto_nudge_data = flaky
+        self._undo.append(lambda: setattr(km, "_auto_nudge_data", real))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._tick()
+        self.assertEqual(self._store()["status"][GID], "blocked", "the block was filed in the goal store")
+        self.assertEqual(self._block_rows(), ["interrupt"])
+        self.assertNotIn("intrBlocked", json.loads(self.p.read_bytes()), "…and the marker write was refused")
+        self.assertEqual(self.pushes, [1], "the block's push")
+        self._heal()
+
+    def _re_engage(self):
+        self.marks = (B + 1200, B + 1300)                  # the user spoke after the stop…
+        jd.parsed_session = lambda sid, paths, now: {"turns": [{"id": "t1", "t": B + 1000, "atoms": []},
+                                                               {"id": "t2", "t": B + 1300, "atoms": []}]}   # …opening a turn
+
+    def test_the_first_healed_tick_mints_the_marker_and_the_re_engagement_lift_runs(self):
+        self._fault_on_the_marker_write()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._tick()
+        self.assertEqual(json.loads(self.p.read_text()).get("intrBlocked"), {SID: GID},
+                         "the marker our own block is owed is minted on the first tick after the file reads")
+        self.assertEqual(self._block_rows(), ["interrupt"], "…without a second block row: the diary already says it")
+        self.assertEqual(self.pushes, [1, 1], "the block's push, and the marker's")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._tick(3)
+        self.assertEqual(self.pushes, [1, 1], "settled: the marker stands and the block holds, nothing more to push")
+        self._re_engage()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._tick()
+        self.assertEqual(self._store()["status"][GID], "working", "the re-engagement lifts our block: the card leaves Needs-you")
+        self.assertNotIn(SID, json.loads(self.p.read_text()).get("intrBlocked", {}), "…and the marker clears")
+
+    def test_a_judge_block_filed_since_is_left_alone(self):
+        self._fault_on_the_marker_write()
+        st = self._store()
+        jd.record_verdict(st, st["nodes"][GID], "closer", "block", B + 1250, why="pick a name for the widget")
+        jd.rollup_status(st, False)
+        jd.save_goals(SID, st)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._tick(3)
+        self.assertNotIn("intrBlocked", json.loads(self.p.read_text()), "a card a judge has blocked is theirs: no marker")
+        self.assertEqual(self._block_rows(), ["interrupt", "closer"], "…and nothing appended")
+        self.assertEqual(self.pushes, [1], "…and nothing pushed")
+        self._re_engage()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._tick()
+        self.assertEqual(self._store()["status"][GID], "blocked", "the judge's block stands through the re-engagement")
 
 
 if __name__ == "__main__":
