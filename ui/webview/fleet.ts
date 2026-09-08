@@ -17,6 +17,7 @@ import { hostPrefix } from "./host-prefix";
 import { ageColorReadable } from "./age-color";
 import { liveNow } from "./feed-age";
 import { TIP_GRACE_MS } from "./tip";
+import { perfFrameHandler } from "./perf-telemetry";
 
 type Color = { bg: string; fg: string } | null;
 interface LedgerNode {
@@ -704,7 +705,9 @@ function mountControls() {
   foot.append(left, right);
 }
 
-window.addEventListener("message", (e: MessageEvent) => {
+// every frame's synchronous handling time is measured (perf-telemetry.ts: one clientDiag row a
+// minute, read by `romp perf client`); the handler itself is unchanged
+window.addEventListener("message", perfFrameHandler("fleet", (m) => vscodeApi?.postMessage(m), (e: MessageEvent) => {
   const m = e.data;
   if (!m) return;
   if (m.type === "delta") {
@@ -741,7 +744,7 @@ window.addEventListener("message", (e: MessageEvent) => {
     .filter((a: any) => a && a.itemId && !a.provisional)
     .map((a: any) => [a.itemId as string, a] as const));
   render();
-});
+}));
 window.addEventListener("storage", (e: StorageEvent) => { if (e.key === "romp:settings") { applyTheme(document, loadSettings()); render(); } });   // theme/colormap change → reskin + recolour
 applyTheme(document, loadSettings());   // the persisted theme applies at boot (2026-08-28)
 // VS Code webviews have per-origin storage and never see another pane's `storage` events — gear

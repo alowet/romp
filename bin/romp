@@ -660,6 +660,8 @@ For scripts / agents:
 EOF
     _romp_cmd "romp url"                   -            "Print ONLY the tokened dashboard URL (for scripts; humans just run \`romp\`)"
     _romp_cmd "romp sessions [--json]"     -            "List the fleet with each session's state, colours and backend"
+    _romp_cmd "romp perf [--interval <s>|--json|log on|off]" - "Kernel performance counters as rates over two snapshots (pusher cycles, stage times, build cache hits, bytes sent, goal loads, judge passes, rss, cpu); --json one raw snapshot; log on|off flips the romp-perf stderr log without a restart"
+    _romp_cmd "romp perf client [--minutes <n>|--json]" - "Browser-side performance of the open dashboards (client-diag.jsonl, surface perf): handler ms/min by frame type with window p50/p90/p99 and max, main-thread-free p90, long animation frames and their attributed callbacks, the worst minute, heap and DOM, the slowest frames — per dashboard and pane over the last <n> minutes (default 10)"
     _romp_cmd "romp fork <parent> <name>"  -            "Branch a session into a new parallel one (parent untouched; --at <uuid> picks the cut)"
     _romp_cmd "romp rename <session> <name>" -          "Rename a session (uuid-keyed: mailboxes, goals and history all follow)"
     _romp_cmd "romp move <session> <dir>"   -           "Move an SDK session's working directory (its conversation follows; mid-turn it waits for the turn to end)"
@@ -843,6 +845,436 @@ for r in rows:
                                      r.get("backend") or "", r.get("dir") or ""))
 '
     exit 0
+fi
+
+# `romp perf [--interval <s>] [--json]` / `romp perf log on|off` — the kernel's performance counters
+# (GET /perf), read as RATES from two snapshots taken <s> seconds apart (default 10): pusher cycles and
+# wakes per second, cycle time percentiles, the share of cycle time per stage, CPU split between the
+# pusher thread, the judge threads and the rest of the process, build cache hits vs rebuilds, bytes
+# sent per slot kind, goal-store loads per second, judge passes, rss. It exists so an optimization can
+# be checked against the LIVE kernel after each restart without attaching a profiler. --json prints one
+# raw snapshot (the shape is documented on the kernel's _PerfStats). `log on|off` flips the romp-perf
+# stderr log (POST /perf): before this the log needed ROMP_PERF in the kernel's environment at start,
+# so turning it on meant a restart. Same contract as `sessions`: the token on stdin, a dead kernel
+# fails loudly, an unknown flag is refused. Two snapshots from different kernel processes (a restart
+# inside the window resets the counters) are refused rather than subtracted into negative rates.
+if [[ "${1:-}" == "perf" ]]; then
+    shift
+    _kport="${ROMP_KERNEL_PORT:-29855}"
+    _usage="usage: romp perf [--interval <s>] [--json] | romp perf log on|off | romp perf client [--minutes <n>] [--json]"
+    # One kernel round trip: the body on stdout and 0 when the kernel answered 2xx. curl's -f folds a
+    # refused token (403) into the same exit as a dead kernel, and on a diagnostic verb that sends the
+    # user off to restart a kernel that is up and answering — so the status rides -w and is read here.
+    _perf_curl() {
+        local _out _code
+        _out="$(_romp_token_cfg | curl -s -m 10 --config - -w '\n%{http_code}' "$@")" \
+            || { echo "romp perf: kernel not reachable on :$_kport (is romp running?)" >&2; return 1; }
+        _code="${_out##*$'\n'}"
+        case "$_code" in
+            2??)     printf '%s' "${_out%$'\n'*}"; return 0 ;;
+            401|403) echo "romp perf: the kernel on :$_kport refused the serve token (HTTP $_code); is ROMP_KERNEL_PORT pointing at another kernel?" >&2; return 1 ;;
+            *)       echo "romp perf: the kernel on :$_kport answered HTTP $_code: ${_out%$'\n'*}" >&2; return 1 ;;
+        esac
+    }
+    if [[ "${1:-}" == "log" ]]; then
+        case "${2:-}" in
+            on)  _v=true ;;
+            off) _v=false ;;
+            *)   echo "$_usage" >&2; exit 2 ;;
+        esac
+        if [[ $# -gt 2 ]]; then echo "$_usage" >&2; exit 2; fi
+        _resp="$(_perf_curl -X POST "http://127.0.0.1:$_kport/perf" -H 'Content-Type: application/json' -d "{\"log\": $_v}")" || exit 1
+        if [[ "$_resp" == *'"ok": true'* || "$_resp" == *'"ok":true'* ]]; then
+            # where the lines land: the manager's stderr goes to the journal under systemd and to
+            # $STATE/manager.log under launchd (bin/romp-service writes StandardErrorPath there)
+            if [[ "$(uname -s)" == "Darwin" ]]; then
+                _hint="tail -f ${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}/manager.log | grep romp-perf"
+            else
+                _hint="journalctl --user -u romp-manager -f | grep romp-perf"
+            fi
+            echo "romp perf: log $2 (read it with: $_hint)"
+            exit 0
+        fi
+        echo "romp perf: refused — $_resp" >&2
+        exit 1
+    fi
+    # `romp perf client [--minutes <n>] [--json]` — the BROWSER side of the same question (2026-09-06): each
+    # pane that receives frames (feed, Outline, chat, timeline) posts one clientDiag row a
+    # minute (surface "perf", what "minute"; ui/webview/perf-telemetry.ts) with its frame counts and handler
+    # times by type (a log2 histogram per type, additive across minutes), the main-thread-free gap after a
+    # frame, the browser's long-animation-frame reports with the callbacks they name, heap and DOM size — plus
+    # a "slowframe" row the moment a frame's whole handling runs 100 ms or more, five a minute at most, the
+    # rest counted in the minute row. The kernel appends them to $STATE/client-diag.jsonl with the dashboard
+    # id (wid) and its clock, and rotates that file to .1 past 8 MB; this reads both, folds the last <n>
+    # minutes per dashboard and pane (window percentiles from the summed histograms, the worst minute, the
+    # slowest frames) and prints one screen. No kernel round trip: the files are read directly, so it works
+    # with the kernel down. An absent file or one with no perf rows is said plainly: the bundles predate the
+    # telemetry, or no dashboard has been open since.
+    if [[ "${1:-}" == "client" ]]; then
+        shift
+        _cusage="usage: romp perf client [--minutes <n>] [--json]"
+        _cjson=false; _cmin=10
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json) _cjson=true; shift ;;
+                --minutes)
+                    if [[ ! "${2:-}" =~ ^[0-9]+$ || "${2:-0}" -eq 0 ]]; then echo "$_cusage" >&2; exit 2; fi
+                    _cmin="$2"; shift 2 ;;
+                --minutes=*)
+                    _cmin="${1#--minutes=}"
+                    if [[ ! "$_cmin" =~ ^[0-9]+$ || "$_cmin" -eq 0 ]]; then echo "$_cusage" >&2; exit 2; fi
+                    shift ;;
+                *) echo "$_cusage" >&2; exit 2 ;;
+            esac
+        done
+        _cfile="${ROMP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/romp}/client-diag.jsonl"
+        python3 - "$_cfile" "$_cmin" "$_cjson" <<'PY'
+import json, math, os, sys, time
+path, minutes, as_json = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "true"
+RELOAD = "no browser telemetry yet: rebuild the bundles and reload the dashboard"
+EDGES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]   # perf-telemetry.ts HIST_EDGES: bucket i is [EDGES[i-1], EDGES[i])
+NBUCKETS = len(EDGES) + 1
+TYPES_SHOWN, SLOW_SHOWN = 8, 5
+older = path + ".1"                        # the kernel rotates the file past its size cap; the previous run is .1
+now = time.time()
+cutoff = now - minutes * 60
+rows, newest, files = [], 0, []
+for fp in (older, path):
+    try:
+        f = open(fp, encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        continue                            # never written, or the kernel is renaming it this instant: the next run sees it
+    files.append(fp)
+    with f:
+        for line in f:
+            if '"perf"' not in line:        # cheap prefilter: the file also holds the shim's and the panes' breadcrumbs
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(r, dict) or r.get("surface") != "perf" or not isinstance(r.get("data"), dict):
+                continue
+            t = r.get("t") or 0
+            newest = max(newest, t)
+            if t >= cutoff:
+                rows.append(r)
+if not files:
+    sys.stderr.write("romp perf client: %s (%s does not exist)\n" % (RELOAD, path))
+    sys.exit(1)
+shown = path + (" and .1" if older in files else "")
+if not newest:
+    sys.stderr.write("romp perf client: %s (%s has no surface \"perf\" rows)\n" % (RELOAD, shown))
+    sys.exit(1)
+if not rows:
+    sys.stderr.write("romp perf client: no browser telemetry in the last %d min (the newest perf row is %d min old); "
+                     "is a dashboard open? (--minutes to widen the window)\n" % (minutes, (now - newest) // 60))
+    sys.exit(1)
+
+groups = {}                                 # (dashboard id, pane app) -> its minute rows and slowframe rows
+for r in rows:
+    key = ((str(r.get("wid") or ""))[:8] or "-", str(r["data"].get("app") or "?"))
+    g = groups.setdefault(key, {"minute": [], "slow": []})
+    if r.get("what") == "minute":
+        g["minute"].append(r)
+    elif r.get("what") == "slowframe":
+        g["slow"].append(r)
+
+
+def num(d, k, default=0.0):
+    v = d.get(k) if isinstance(d, dict) else None
+    return float(v) if isinstance(v, (int, float)) else default
+
+
+def hist_of(st):
+    h = st.get("hist") if isinstance(st, dict) else None
+    if isinstance(h, list) and len(h) == NBUCKETS and all(isinstance(x, (int, float)) for x in h):
+        return [int(x) for x in h]
+    return [0] * NBUCKETS
+
+
+def hist_q(h, q):                           # nearest-rank quantile of a histogram -> its bucket index; -1 when empty
+    total = sum(h)
+    if not total:
+        return -1
+    rank = min(total, max(1, math.ceil(q * total)))
+    cum = 0
+    for i, c in enumerate(h):
+        cum += c
+        if cum >= rank:
+            return i
+    return NBUCKETS - 1
+
+
+def edge_label(i):                          # the bucket's upper bound, the figure a percentile is printed as
+    if i < 0:
+        return "-"
+    if i >= len(EDGES):
+        return ">=%d" % EDGES[-1]
+    return "<%d" % EDGES[i]
+
+
+def edge_num(i):                            # the same for --json: the exclusive upper edge, None for empty or the top bucket
+    return EDGES[i] if 0 <= i < len(EDGES) else None
+
+
+def clock(t):
+    return time.strftime("%H:%M:%S", time.localtime(t))
+
+
+def span(m):                                # a minute's span on the clock: its start (the browser's since) to the kernel's receipt of its row
+    s = m.get("since")
+    return (clock(s / 1000.0) + "-" if isinstance(s, (int, float)) and s > 0 else "ending ") + clock(m["t"])
+
+
+panes = []
+for (wid, app), g in sorted(groups.items()):
+    mins = sorted(g["minute"], key=lambda r: r.get("t") or 0)
+    span_min = sum(num(r["data"], "span_ms") for r in mins) / 60000.0
+    if span_min <= 0:
+        span_min = float(len(mins))
+    rate_min = max(span_min, 1.0 / 60)
+    frames, free_p90, loaf_n, blocking, worst, top, top_inv, srcs = {}, None, 0, 0.0, 0.0, {}, {}, set()
+    per_minute, slow_suppressed, slow_suppressed_worst = [], 0, 0.0
+    for r in mins:
+        d = r["data"]
+        total_ms = 0.0
+        for typ, st in (d.get("frames") or {}).items():
+            if not isinstance(st, dict):
+                continue
+            f = frames.setdefault(str(typ), {"n": 0, "ms_sum": 0.0, "max": 0.0, "n16": 0, "n100": 0, "hist": [0] * NBUCKETS})
+            f["n"] += int(num(st, "n"))
+            f["ms_sum"] += num(st, "ms_sum")
+            f["max"] = max(f["max"], num(st, "ms_max"))
+            f["n16"] += int(num(st, "n16"))
+            f["n100"] += int(num(st, "n100"))
+            for i, c in enumerate(hist_of(st)):
+                f["hist"][i] += c
+            total_ms += num(st, "ms_sum")
+        fr = d.get("free")
+        if isinstance(fr, dict) and num(fr, "n"):
+            free_p90 = max(free_p90 or 0.0, num(fr, "p90"))
+        lo = d.get("loaf") or {}
+        lo_n, lo_block = 0, 0.0
+        if isinstance(lo, dict):
+            lo_n, lo_block = int(num(lo, "n")), num(lo, "blocking_ms")
+            loaf_n += lo_n
+            blocking += lo_block
+            worst = max(worst, num(lo, "worst_ms"))
+            srcs.add(str(lo.get("src") or "none"))
+            for tp in lo.get("top") or []:
+                if isinstance(tp, dict) and tp.get("k"):
+                    top[str(tp["k"])] = top.get(str(tp["k"]), 0.0) + num(tp, "ms")
+                    if tp.get("inv"):
+                        top_inv[str(tp["k"])] = str(tp["inv"])
+        sl = d.get("slow")
+        if isinstance(sl, dict):
+            slow_suppressed += int(num(sl, "suppressed"))
+            slow_suppressed_worst = max(slow_suppressed_worst, num(sl, "suppressed_worst_ms"))
+        per_minute.append({"t": r.get("t") or 0, "since": d.get("since"), "total_ms": round(total_ms, 1),
+                           "loaf_n": lo_n, "blocking_ms": round(lo_block, 1), "frames": d.get("frames") or {}})
+    for f in frames.values():
+        f["per_min"] = f["n"] / rate_min
+        f["ms_per_min"] = f["ms_sum"] / rate_min
+        for q, k in ((0.5, "p50"), (0.9, "p90"), (0.99, "p99")):
+            f[k + "_bucket"] = hist_q(f["hist"], q)
+            f[k + "_lt"] = edge_num(f[k + "_bucket"])
+    total_ms_all = sum(f["ms_sum"] for f in frames.values())
+    worst_minute = max(per_minute, key=lambda m: m["total_ms"]) if per_minute else None
+    last = mins[-1]["data"] if mins else {}
+    slow = []
+    for r in g["slow"]:
+        d = r["data"]
+        lo = d.get("loaf") if isinstance(d.get("loaf"), dict) else None
+        slow.append({"t": r.get("t") or 0, "type": str(d.get("type") or "?"), "ms": num(d, "ms"), "dom": d.get("dom"),
+                     "loaf": [{"k": str(tp.get("k")), "ms": num(tp, "ms")} for tp in (lo or {}).get("top") or [] if isinstance(tp, dict)]})
+    slow.sort(key=lambda sl: -sl["ms"])
+    panes.append({
+        "wid": wid, "app": app, "ua": str(last.get("ua") or "?"), "minutes": round(span_min, 1), "rows": len(mins),
+        "total_ms_per_min": total_ms_all / rate_min, "frames": frames, "free_p90": free_p90,
+        "loaf": {"per_min": loaf_n / rate_min, "blocking_ms_per_min": blocking / rate_min, "worst_ms": worst,
+                 "src": "loaf" if "loaf" in srcs else ("longtask" if "longtask" in srcs else "none")},
+        "top": [{"k": k, "ms": ms, "inv": top_inv.get(k, "")} for k, ms in sorted(top.items(), key=lambda kv: -kv[1])[:5]],
+        "minutes_detail": [{k: m[k] for k in ("t", "since", "total_ms", "loaf_n", "blocking_ms")} for m in per_minute],
+        "worst_minute": worst_minute,
+        "heap_mb": last.get("heap_mb"), "dom": last.get("dom"),
+        "visible": last.get("visible"), "hidden_pane": last.get("hidden_pane"),
+        "slow": slow, "slow_suppressed": slow_suppressed, "slow_suppressed_worst_ms": slow_suppressed_worst,
+    })
+
+if as_json:
+    for p in panes:
+        p["minutes_detail"] = p.pop("minutes_detail")
+        if p["worst_minute"]:
+            p["worst_minute"] = {k: p["worst_minute"][k] for k in ("t", "since", "total_ms", "loaf_n", "blocking_ms")}
+    print(json.dumps({"window_min": minutes, "path": path, "files": files, "panes": panes}, indent=1, sort_keys=True))
+    sys.exit(0)
+
+n_slow = sum(len(p["slow"]) for p in panes)
+n_dash = len({p["wid"] for p in panes})
+print("romp perf client: browser telemetry from the last %d min (%s): %d dashboard%s, %d pane%s, %d minute row%s, %d slow frame row%s"
+      % (minutes, shown, n_dash, "" if n_dash == 1 else "s", len(panes), "" if len(panes) == 1 else "s",
+         len(rows) - n_slow, "" if len(rows) - n_slow == 1 else "s", n_slow, "" if n_slow == 1 else "s"))
+print("handler time is the pane's own, by frame type (fed:<type> is the federation layer's share, additive with the pane's);\n"
+      "percentiles are histogram bucket upper bounds over the window; attribution names the callback the browser ran;\n"
+      "heap and DOM are the last sample's")
+for p in panes:
+    if p["visible"] is False:
+        vis = "hidden"
+    elif p["hidden_pane"]:
+        vis = "hidden (no viewport)"
+    else:
+        vis = "visible"
+    heap = ("heap %.1f MB" % p["heap_mb"]) if isinstance(p["heap_mb"], (int, float)) else "heap n/a"
+    dom = ("dom %d" % p["dom"]) if isinstance(p["dom"], (int, float)) else "dom n/a"
+    print("dashboard %s · %s   %s   %g min reported   %s   %s   %s" % (p["wid"], p["app"], p["ua"], p["minutes"], heap, dom, vis))
+    fl = sorted(p["frames"].items(), key=lambda kv: -kv[1]["ms_sum"])
+    print("  handler      %.0f ms/min total" % p["total_ms_per_min"] if fl else "  handler      no frames")
+    for t, f in fl[:TYPES_SHOWN]:
+        print("    %-12s %6.1f/min %6.0f ms/min   p50 %s   p90 %s   p99 %s ms   max %.0f   >16.7 ms %.0f%%   >=100 ms %.0f%%"
+              % (t, f["per_min"], f["ms_per_min"], edge_label(f["p50_bucket"]), edge_label(f["p90_bucket"]), edge_label(f["p99_bucket"]),
+                 f["max"], 100.0 * f["n16"] / f["n"] if f["n"] else 0.0, 100.0 * f["n100"] / f["n"] if f["n"] else 0.0))
+    if len(fl) > TYPES_SHOWN:
+        print("    and %d more type%s" % (len(fl) - TYPES_SHOWN, "" if len(fl) - TYPES_SHOWN == 1 else "s"))
+    # each minute row's free p90 is over that minute's samples; the fold keeps the largest, so this is the worst
+    # minute's figure, not a window percentile like the handler columns
+    free = ("free after a frame, worst minute's p90 %.0f ms" % p["free_p90"]) if p["free_p90"] is not None else "free after a frame p90 n/a"
+    lo = p["loaf"]
+    if lo["src"] == "none":
+        longf = "long frames: not reported by this browser"
+    else:
+        longf = "long frames %.1f/min   blocking %.0f ms/min   worst %.0f ms" % (lo["per_min"], lo["blocking_ms_per_min"], lo["worst_ms"])
+        if lo["src"] == "longtask":
+            longf += " (longtask: no attribution)"
+    print("  main thread  %s   %s" % (free, longf))
+    print("  attribution  " + ("   ".join("%s %.0f ms%s" % (t["k"], t["ms"], (" (%s)" % t["inv"]) if t["inv"] else "") for t in p["top"]) or "none"))
+    wm = p["worst_minute"]
+    if wm:
+        wf = sorted(((typ, st) for typ, st in wm["frames"].items() if isinstance(st, dict)), key=lambda kv: -num(kv[1], "ms_sum"))[:3]
+        parts = ["%s %d (p90 %s ms, max %.0f)" % (typ, int(num(st, "n")), edge_label(hist_q(hist_of(st), 0.9)), num(st, "ms_max")) for typ, st in wf]
+        print("  worst minute %s   %.0f ms handler   %s   long frames %d, blocking %.0f ms"
+              % (span(wm), wm["total_ms"], "   ".join(parts) or "no frames", wm["loaf_n"], wm["blocking_ms"]))
+    if p["slow"] or p["slow_suppressed"]:
+        for sl in p["slow"][:SLOW_SHOWN]:
+            dom_s = (" (dom %d)" % sl["dom"]) if isinstance(sl["dom"], (int, float)) else ""
+            attr = ("  " + "  ".join("%s %.0f ms" % (a["k"], a["ms"]) for a in sl["loaf"])) if sl["loaf"] else ""
+            print("  slow frames  %s %s %.0f ms%s%s" % (clock(sl["t"]), sl["type"], sl["ms"], dom_s, attr))
+        more = max(0, len(p["slow"]) - SLOW_SHOWN) + p["slow_suppressed"]
+        if more:
+            print("               and %d more%s" % (more, (" (%d not sent by the pane past its per-minute cap; worst %.0f ms)"
+                                                          % (p["slow_suppressed"], p["slow_suppressed_worst_ms"])) if p["slow_suppressed"] else ""))
+    else:
+        print("  slow frames  none")
+PY
+        exit $?
+    fi
+    _json=false; _ival=10
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) _json=true; shift ;;
+            --interval)
+                if [[ ! "${2:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then echo "$_usage" >&2; exit 2; fi
+                _ival="$2"; shift 2 ;;
+            --interval=*)
+                _ival="${1#--interval=}"
+                if [[ ! "$_ival" =~ ^[0-9]+([.][0-9]+)?$ ]]; then echo "$_usage" >&2; exit 2; fi
+                shift ;;
+            *) echo "$_usage" >&2; exit 2 ;;
+        esac
+    done
+    _a="$(_perf_curl "http://127.0.0.1:$_kport/perf")" || exit 1
+    if $_json; then
+        printf '%s\n' "$_a"
+        exit 0
+    fi
+    sleep "$_ival"
+    _b="$(_perf_curl "http://127.0.0.1:$_kport/perf")" || exit 1
+    python3 - "$_a" "$_b" <<'PY'
+import json, sys
+a, b = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+
+
+def g(d, *ks):
+    for k in ks:
+        d = d.get(k, {}) if isinstance(d, dict) else {}
+    return d if isinstance(d, (int, float)) else 0
+
+
+def dl(*ks):                      # delta of a counter between the two snapshots
+    return g(b, *ks) - g(a, *ks)
+
+
+if a.get("since") != b.get("since") or g(a, "process", "pid") != g(b, "process", "pid"):
+    # the counters live in the kernel process and start over with it: a subtraction across a
+    # restart is a page of negative rates that look like measurements
+    sys.stderr.write("romp perf: the kernel restarted during the window (pid %d -> %d), so the counters "
+                     "reset and there are no rates to print; run it again\n"
+                     % (g(a, "process", "pid"), g(b, "process", "pid")))
+    sys.exit(1)
+
+dt = max(g(b, "now") - g(a, "now"), 1e-9)
+cyc = dl("pusher", "cycles")
+cyc_ms = dl("pusher", "cycle_ms_sum")
+wakes = dl("pusher", "wakes")
+ev, bs = dl("pusher", "wakes_event"), dl("pusher", "wakes_backstop")
+cpu_proc = 100.0 * dl("process", "cpu_s") / dt
+cpu_pusher = 100.0 * dl("pusher", "cycle_cpu_ms_sum") / (dt * 1000.0)
+cpu_judge = 100.0 * dl("judge", "cpu_ms_sum") / (dt * 1000.0)
+up = int(g(b, "uptime_s"))
+
+
+def hms(sec):
+    h, m = divmod(sec // 60, 60)
+    return "%dh%02dm" % (h, m) if h else "%dm%02ds" % (m, sec % 60)
+
+
+def kb(n):                        # bytes over the window as a rate
+    return "%.0f KB/s" % (n / 1024.0 / dt) if n < 1024 * 1024 * dt else "%.1f MB/s" % (n / 1048576.0 / dt)
+
+
+def share(ms):                    # a stage's share of the window's cycle time
+    return "%3.0f%%" % (100.0 * ms / cyc_ms) if cyc_ms else "  -"
+
+
+print("romp perf: %.1f s window, kernel up %s, pid %d, romp-perf log %s"
+      % (dt, hms(up), g(b, "process", "pid"), "on" if b.get("log") else "off"))
+print("process   rss %d MB   threads %d   cpu %.1f%% of one core (pusher %.1f%%, judge %.1f%%, other %.1f%%)"
+      % (g(b, "process", "rss_kb") // 1024, g(b, "process", "threads"), cpu_proc, cpu_pusher, cpu_judge,
+         cpu_proc - cpu_pusher - cpu_judge))
+print("pusher    %.2f cycles/s   %.2f wakes/s (event %d, backstop %d)   busy %.0f%% of wall"
+      % (cyc / dt, wakes / dt, ev, bs, 100.0 * cyc_ms / (dt * 1000.0)))
+print("cycle ms  p50 %.0f   p90 %.0f   max %.0f (over the last %d cycles)   last %.0f"
+      % (g(b, "pusher", "cycle_ms_p50"), g(b, "pusher", "cycle_ms_p90"), g(b, "pusher", "cycle_ms_ring_max"),
+         g(b, "pusher", "ring_n"), g(b, "pusher", "cycle_ms_last")))
+st = {k: dl("stages_ms", k) for k in ("jobs", "push", "push.chat", "push.feed", "push.timeline", "push.send")}
+print("stages    jobs %s   push %s  (chat %s  feed %s  timeline %s  send %s)"
+      % tuple(share(st[k]) for k in ("jobs", "push", "push.chat", "push.feed", "push.timeline", "push.send")))
+parts = []
+for k in ("chat", "feed", "timeline"):
+    built, cached, ms = dl("builds", k, "built"), dl("builds", k, "cached"), dl("builds", k, "ms")
+    parts.append("%s %d built / %d cached%s" % (k, built, cached, (" (%.0f ms avg)" % (ms / built)) if built else ""))
+print("builds    " + "   ".join(parts))
+parts = []
+for kind in ("full", "delta", "deduped"):
+    slots = set((b.get("sends") or {}).get(kind, {})) | set((a.get("sends") or {}).get(kind, {}))
+    tot = sum(dl("sends", kind, sl, "bytes") for sl in slots)
+    top = sorted(slots, key=lambda sl: -dl("sends", kind, sl, "bytes"))[:3]
+    detail = "; ".join("%s %d frames %s" % (sl, dl("sends", kind, sl, "count"), kb(dl("sends", kind, sl, "bytes")))
+                       for sl in top if dl("sends", kind, sl, "count"))
+    parts.append("%s %s%s" % (kind, kb(tot), (" (%s)" % detail) if detail else ""))
+print("sends     " + "   ".join(parts))
+print("goals     %.1f loads/s   %.1f saves/s   %.1f writes/s"
+      % (dl("goals", "loads") / dt, dl("goals", "saves") / dt, dl("goals", "writes") / dt))
+jp = dl("judge", "passes")
+print("judge     %d passes (%.2f/s)   last %.0f ms   mean %s ms"
+      % (jp, jp / dt, g(b, "judge", "ms_last"), ("%.0f" % (dl("judge", "ms_sum") / jp)) if jp else "-"))
+paths = set(b.get("http") or {}) | set(a.get("http") or {})
+rows = sorted(((dl("http", pth, "count"), dl("http", pth, "ms"), pth) for pth in paths), reverse=True)
+rows = [r for r in rows if r[0]][:6]
+print("http      " + ("   ".join(("%s %d" % (pth, n)) if pth.endswith("/ws") else ("%s %d (%.1f ms avg)" % (pth, n, ms / n))
+                                 for n, ms, pth in rows) or "no requests in the window"))
+PY
+    exit $?
 fi
 
 # Fork a session into a NEW parallel one (the user 2026-08-19, via the lab workflow: per-stage

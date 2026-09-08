@@ -712,10 +712,10 @@ class TwoThreadsOneClient(unittest.TestCase):
         gate, inside = threading.Event(), threading.Event()
         real = km._send_client
 
-        def parked(c, key, msg, pre=None, sig=None):    # the tail branch was chosen; park before the bytes go
-            inside.set()
+        def parked(c, key, msg, pre=None, sig=None, **kw):    # the tail branch was chosen; park before the bytes go
+            inside.set()                                    # (**kw: the tail send names its /perf kind, "delta")
             gate.wait(5)
-            return real(c, key, msg, pre=pre, sig=sig)
+            return real(c, key, msg, pre=pre, sig=sig, **kw)
         done = []
         with mock.patch.object(km, "_send_client", parked):
             ts = threading.Thread(target=lambda: km._send_chat(client, m, None, 1, False), daemon=True); ts.start()

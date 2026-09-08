@@ -30,11 +30,17 @@ def _read(p):
 
 class BundleBuildMode(unittest.TestCase):
     def test_esbuild_ties_minify_and_sourcemaps_to_the_production_flag(self):
-        """The flag has to actually mean something — this is what the other two rely on."""
+        """The flag has to actually mean something — this is what the other two rely on. The webview build
+        minifies whitespace and syntax only: identifiers are kept in every mode, because the browser's
+        long-frame attribution (ui/webview/perf-telemetry.ts) names a callback by its compile-time name, and
+        a mangled build reports a different letter after every rebuild. The extension host keeps `minify`."""
         src = _read(ESBUILD)
         self.assertIn('const production = process.argv.includes("--production")', src)
-        self.assertIn("minify: production", src)
+        self.assertIn("minify: production", src)              # the extension-host bundle
         self.assertIn("sourcemap: !production", src)
+        self.assertIn("minifyWhitespace: production", src)    # the webview bundles: whitespace and syntax…
+        self.assertIn("minifySyntax: production", src)
+        self.assertIn("minifyIdentifiers: false", src)        # …but never identifiers
 
     def test_the_installer_builds_production(self):
         src = _read(EXT_INSTALL)

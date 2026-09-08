@@ -44,7 +44,8 @@ test("BOTH release events run the same synchronous release: the observer's callb
 
 test("the payload is applied whatever the visibility — only the rebuild waits", () => {
   // the message handler swaps the model before render() decides whether to paint; no visibility check on the way
-  const handler = /window\.addEventListener\("message", \(e: MessageEvent\) => \{[\s\S]*?\n\}\);/.exec(SRC)![0];
+  // (the listener is installed through perf-telemetry's per-frame timing wrapper; the handler body is unchanged)
+  const handler = /window\.addEventListener\("message", perfFrameHandler\("fleet", \(m\) => vscodeApi\?\.postMessage\(m\), \(e: MessageEvent\) => \{[\s\S]*?\n\}\)\);/.exec(SRC)![0];
   assert.match(handler, /loaded = true;\n\s*sessions = m\.ledgers as FleetSession\[\];/);
   assert.doesNotMatch(handler, /document\.hidden|paneVisible|paneDirty|paintHeld/);
 });

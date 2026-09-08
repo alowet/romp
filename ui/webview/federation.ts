@@ -14,6 +14,7 @@
 import { adoptArrivals, applyViewOrder, applyViewOrderTo, churnSwaps, healOrder, pruneViewOrder,
          readViewOrder, writeViewOrder, VIEW_ORDER_KEY, VIEW_ORDER_EVENT } from "./view-order";
 import { hostOf, bareId } from "./host-prefix";
+import { installPerfTelemetry, classifyFrame, type RompPerf } from "./perf-telemetry";
 
 export const SEP = ":";
 export const LOCAL = ""; // the local kernel's host key — no prefix, so the single-kernel path is untouched
@@ -652,10 +653,18 @@ export class FederationManager {
   private hostSeq: string[] = [LOCAL]; // local first, then attach order — fixes the group order in the strip
   private downHosts = new Set<string>(); // attached, but its tunnel isn't up: what's on screen is a memory
   private lastSeen: Record<string, number> = {}; // host -> epoch secs of its last `up` poll
+  // the page's performance collector (ui/webview/perf-telemetry.ts), set by start(); inbound() times its own
+  // merge and dispatch through it as fed:<type>, nested outside the pane's handler. Public so a test can hand
+  // it a stand-in.
+  perf: RompPerf | null = null;
 
   start(): void {
     const w = window as any;
     this.app = w.__rompApp || "chat";
+    // the page's performance collector (perf-telemetry.ts), published as window.__rompPerf: the pane bundle
+    // installs its own on load, but the kernel-served timeline page has no bundle beyond this one, and its
+    // inline boot (kernel.py _TIMELINE_BOOT) wraps its message listener through the window slot
+    this.perf = installPerfTelemetry(this.app);
     w.__rompFed = {
       inbound: (h: string, m: any) => this.inbound(h, m),
       outbound: (m: any) => this.outbound(m),
@@ -770,6 +779,15 @@ export class FederationManager {
 
   // kernel → browser: prefix this host's ids, merge tab orders, hand the rest to the panes.
   inbound(host: string, msg: any): void {
+    // timed as fed:<wire type>: the prefixing, delta application and merge this layer does on a frame before
+    // the pane's own handler runs (that handler is timed under <type>, nested inside; the collector records
+    // each level's own time, so the two add up to the frame's cost). No collector: the plain path.
+    const p = this.perf;
+    if (!p) { this.inboundNow(host, msg); return; }
+    p.timed("fed:" + classifyFrame(msg), () => this.inboundNow(host, msg));
+  }
+
+  private inboundNow(host: string, msg: any): void {
     const m = prefixInbound(host, msg);
     if (m && m.type === "session" && typeof m.id === "string") {
       (this.perHostSids[host] ||= new Set()).add(m.id);
