@@ -119,6 +119,25 @@ half when that half qualifies, so a test or session name's head beside a digit-b
 (`'test_a_long_...1a2b3c4d5e6f7'`, `'romp-session...2026-09-08T1'`) and a Capitalised word before a
 hex tail (`'Connecting...1a2b3c4d5e6f7'`) are two markers where the qualifying half alone was one.
 
+pytest's diff of two compared strings skips what they share. At default verbosity, when the two agree
+on more than 42 leading characters it drops all but the last 10 of them and says so (`Skipping N
+identical leading characters in diff, use -v to show`), and the same for trailing characters when the
+two are of one length; the `- <a>` and `+ <a>` lines then show the rest of each operand. For two
+64-character secrets that agree on 51 or more that rest is 23 characters or fewer: too short for the
+generic rule, ending at the line's end rather than at a cut, so no rule above took it, and it stood in
+the clear under an assert line that showed both operands as markers (2026-09-08). A second pass over
+the scrubbed text closes that, keyed on the first pass's own verdict: a line under the `E` marker whose
+compared operand, the quoted string beside `==` or `!=`, came out of the first pass as markers and
+nothing else (`'<marker>'`, `'<marker>...<marker>'`) compared a credential, and the signed lines of the
+diff block under it are pieces of that operand, so each becomes its sign and the marker; the empty
+line, the `Skipping` lines and the `?` lines that point at the differing positions hold no character of
+either operand and stay. The pass cannot hide a plain string's diff: every rule takes runs of token
+characters, so a string with words and spaces keeps them beside any marker on its assert line
+(`'<marker>... string here'`), no verdict is reached, and its diff lines stay as they were. Its cost is
+the diff of a comparison in which either operand is a credential: after a skip every signed line begins
+with the 10 characters the two operands share, so the other operand's line goes too when it is a plain
+expected value (the assert line still shows that value, whole or cut).
+
 Nothing here is a credential: the file holds prefixes and character classes only.
 """
 import re
@@ -269,6 +288,55 @@ TOKEN_RE = re.compile(
     re.MULTILINE,
 )
 
+# The second pass (the module docstring measures the skip). pytest's diff of two compared strings drops
+# what they share past 42 leading (or trailing) characters but 10, so its `- <a>` and `+ <a>` lines can
+# show a rest of each operand too short for _DIFF_LINE's generic rule and ending at the line's end, which
+# is no cut: 22 characters of each of two 64-character secrets stood in the clear under an assert line
+# that showed both as markers (2026-09-08). Keyed on the first pass's own verdict, and on nothing else,
+# so that no plain string's diff is hidden: the trigger is a line under the E marker whose compared
+# operand, the quoted string beside `==` or `!=` with whitespace before its opening quote (a container's
+# element, `['<a>']`, is not one; pytest's diff of a container does not skip), came out of the first pass
+# as markers alone, and every rule of the first pass takes runs of token characters, so a string with
+# words and spaces keeps them beside any marker (`'<marker>... string here'`) and reaches no verdict. The
+# block under the trigger is the lines pytest's text diff emits and nothing else: the empty line, the
+# `Skipping N identical ... characters` lines and the `?` position lines (kept, since none holds a
+# character of either operand) and the signed lines, each of which becomes its sign and the marker; a
+# line of any other shape (`Full diff:`, `+  where '<a>' = f()`, a truncation notice, a location) ends
+# it. A signed line the first pass already took (a whole value under `-v`, unittest's whole-value diff)
+# is left as it is. The cost is the diff of a comparison in which either operand is a credential: after a
+# skip each signed line begins with the 10 shared characters, a piece of the credential whatever the
+# other operand is, so the other side's line goes too (the assert line still shows a plain expected
+# value, whole or cut). Either operand, not both: an operand sharing 43 or more characters with a
+# credential is one itself, and requiring both would leave the shared 10 in the clear.
+_MARKERS_ONLY = re.escape(REDACTED) + r"(?:" + _ELLIPSIS + re.escape(REDACTED) + r")*"
+_REDACTED_OPERAND_RE = re.compile(r"(?<=\s)['\"]" + _MARKERS_ONLY + r"['\"] [!=]= |[!=]= ['\"]" + _MARKERS_ONLY + r"['\"](?=\s|$)")
+_DIFF_BLOCK_LINE_RE = re.compile(
+    r"^(?P<signed>E[ \t]+[-+] )(?! (?:where|and) )(?P<piece>.*)$"
+    r"|^E(?:[ \t]*|[ \t]+\?.*|[ \t]+Skipping \d+ identical (?:leading|trailing) characters in diff, use -v to show)$")
+
+
+def _redact_skipped_diff(text):
+    """`text` with each signed line of a pytest text diff under a compared operand the first pass rendered
+    as markers alone replaced by its sign and the marker (the comment above says what and why)."""
+    lines = text.split("\n")
+    changed = False
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        i += 1
+        if not (line.startswith("E") and line[1:2] in (" ", "\t") and _REDACTED_OPERAND_RE.search(line)):
+            continue
+        while i < n:
+            m = _DIFF_BLOCK_LINE_RE.match(lines[i])
+            if not m:
+                break
+            if m.group("signed") and m.group("piece") != REDACTED:
+                lines[i] = m.group("signed") + REDACTED
+                changed = True
+            i += 1
+    return "\n".join(lines) if changed else text
+
+
 # A git sha (40 lowercase hex) is no credential when the text says what it is: named as a commit
 # (`commit=<sha>`, `commit: <sha>`, `{'commit': '<sha>'}`), or sitting in a path or after an `@`. Under
 # today's value positions only the commit form can precede a match (a token after `/` or `@` is in no
@@ -296,8 +364,9 @@ def _is_model_id(tok):
 
 def scrub(text):
     """`text` with every match replaced by REDACTED (a diff line keeps its marker and sign, a quoted
-    element line its marker and quotes, a pair of fragments the cut between two markers); anything that
-    is not a str comes back as is."""
+    element line its marker and quotes, a pair of fragments the cut between two markers), and then the
+    signed lines of a pytest text diff under a compared operand so rendered replaced too (the second
+    pass, _redact_skipped_diff); anything that is not a str comes back as is."""
     if not isinstance(text, str):
         return text
 
@@ -309,4 +378,5 @@ def scrub(text):
         if cut:                                                 # a paired fragment: a marker on each side of its cut
             return REDACTED + cut + REDACTED
         return pfx + REDACTED
-    return TOKEN_RE.sub(one, text)
+    out = TOKEN_RE.sub(one, text)
+    return _redact_skipped_diff(out) if REDACTED in out else out   # the second pass needs a verdict of the first

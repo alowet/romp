@@ -34,11 +34,16 @@ for the assertion nobody wrote that way. Pinned here:
     redacted, a Capitalised word or a single-case identifier is not); the two runs on the sides of one
     cut taken together when either qualifies, whatever the other's alphabet (a letters-only hex tail
     stood in the clear beside its redacted head on CI, 2026-09-08), with the floor on both sides and a
-    pair where neither qualifies left alone; and the two shapes the generic rule fires on but leaves
-    alone, a named git sha and a dated Anthropic model id.
+    pair where neither qualifies left alone; the signed lines of pytest's diff of two compared strings
+    after its identical-prefix (or -suffix) skip, which show a rest of each operand too short for any
+    rule (22 characters of each 64-character secret stood in the clear, 2026-09-08), redacted when the
+    assert line above rendered an operand as markers alone and left as they were under a plain string's
+    assert line; and the two shapes the generic rule fires on but leaves alone, a named git sha and a
+    dated Anthropic model id.
   ScrubCost: the scrub is linear: a 200 KB adversarial line (a run of repeated prefixes, of one case,
-    of digits, of dashes, of dots, a pair of runs around one cut) is scrubbed within a generous budget;
-    the first of them took 80 seconds before the cut-key rule's head was bounded.
+    of digits, of dashes, of dots, a pair of runs around one cut, a redacted compare over a 200 KB diff
+    line) is scrubbed within a generous budget; the first of them took 80 seconds before the cut-key
+    rule's head was bounded.
   ReportShapes: the hook's work on a report object of each outcome (a failure's longrepr, a skip's
     tuple, a passed test's sections); a changed failure keeps its crash location, its message scrubbed
     in pytest's E-marked rendering, through xdist's serialization round trip.
@@ -51,7 +56,11 @@ for the assertion nobody wrote that way. Pinned here:
     --showlocals (pytest's diff lines, its assert line and the locals all show the marker), and the
     where/and/in/not-found/Lists-differ/Tuples-differ renderings of two such tokens at default
     verbosity, and the ellipsized renderings of two keys and two 64-character tokens compared with
-    `==` (as strings, in a list, in a tuple, and through unittest's `[N chars]` shortening); a cut
+    `==` (as strings, in a list, in a tuple, and through unittest's `[N chars]` shortening); a
+    comparison of two 64-character values sharing 52 leading (or the first and 52 trailing) characters,
+    whose diff pytest skips down to 22 or 21 characters of each, shows the marker on both signed lines,
+    in the failure and in CI's repeat of the message; pytest's own cut onto a letters-only piece of a
+    hex value (a 13-letter tail, a 12-letter head) shows the marker on both pieces; a cut
     comparison of a 30-character environment value shows the marker for both of its pieces; and a
     comparison of a GitHub Actions variable, or of the conftest's own git identity, shows the value.
 
@@ -736,6 +745,80 @@ class CredentialPattern(_WithConftest):
                      "+ %s..." % a[:60]):
             self.assertEqual(red(text), text, text[:20])
 
+    def test_a_diff_after_pytests_identical_prefix_skip_shows_no_piece_of_a_redacted_operand(self):
+        # pytest's diff of two compared strings skips what they share: past 42 identical leading characters
+        # (or trailing, when the two are of one length) it keeps 10 and says so, and its `-` and `+` lines
+        # then show the rest of each operand, 22 characters of each 64-character value below: too short for
+        # the diff rule and ending at the line's end rather than a cut, so they stood in the clear under an
+        # assert line that showed both operands as markers (2026-09-08). Keyed on that verdict, the second
+        # pass makes each signed line its sign and the marker; the empty line, the Skipping line and the `?`
+        # lines stay. The shapes are pytest 9's, copied from a run; the `E   ` form is the crash message as
+        # the conftest scrubs it for CI's short summary
+        red, R = self.cf.redact_credential_tokens, self.cf.CREDENTIAL_REDACTED
+        a = _fixed_hex("prefix-skip")
+        b = a[:52] + _fixed_hex("prefix-skip-other")[52:]           # 52 shared: pytest keeps 10, shows 22 of each
+        c = _fixed_hex("suffix-skip")
+        d = c[0] + _fixed_hex("suffix-skip-other")[1:12] + c[12:]   # the first and the last 52 shared: shows 21
+        for piece in (a[:12], a[-13:], b[-13:], c[:12], c[-13:], d[:12]):
+            self.assertTrue(any(ch.isdigit() for ch in piece), piece)
+        skip_l = "Skipping 42 identical leading characters in diff, use -v to show"
+        skip_t = "Skipping 43 identical trailing characters in diff, use -v to show"
+
+        def no_piece(out, *values):
+            for v in values:
+                for i in range(0, len(v) - 8 + 1):
+                    self.assertFalse(v[i:i + 8] in out, "a piece of a compared value survived: " + out)
+        # the failure body: the assert line (the left operand is the `+` line, the right the `-` line)
+        body = ("E       AssertionError: assert '%s...%s' == '%s...%s'\nE         \nE         %s\nE         - %s\nE         + %s\n"
+                % (a[:12], a[-13:], b[:12], b[-13:], skip_l, b[42:], a[42:]))
+        out = red(body)
+        self.assertEqual(out, "E       AssertionError: assert '%s...%s' == '%s...%s'\nE         \nE         %s\nE         - %s\nE         + %s\n"
+                         % (R, R, R, R, skip_l, R, R))
+        no_piece(out, a, b)
+        # the trailing skip, with the `?` lines that point at the differing positions
+        body = ("E       AssertionError: assert '%s...%s' == '%s...%s'\nE         \nE         %s\nE         - %s\nE         ? ^^ ^  - ^^^^\n"
+                "E         + %s\nE         ? ^^^^ ^^   ^^\n" % (c[:12], c[-13:], d[:12], d[-13:], skip_t, d[:21], c[:21]))
+        out = red(body)
+        self.assertEqual(out, "E       AssertionError: assert '%s...%s' == '%s...%s'\nE         \nE         %s\nE         - %s\nE         ? ^^ ^  - ^^^^\n"
+                         "E         + %s\nE         ? ^^^^ ^^   ^^\n" % (R, R, R, R, skip_t, R, R))
+        no_piece(out, c, d)
+        # the crash message as _redact_crash_message marks it (every line under `E   `), and the same block
+        # after a location line and a second failure: the block ends where the E lines do
+        msg = "E   assert '%s...%s' == '%s...%s'\nE     \nE     %s\nE     - %s\nE     + %s" % (a[:12], a[-13:], b[:12], b[-13:], skip_l, b[42:], a[42:])
+        self.assertEqual(red(msg), "E   assert '%s...%s' == '%s...%s'\nE     \nE     %s\nE     - %s\nE     + %s" % (R, R, R, R, skip_l, R, R))
+        out = red(body + "\ntest_probe.py:7: AssertionError\n" + body)
+        no_piece(out, c, d)
+        self.assertEqual(out.count("- " + R), 2, out)
+        # a signed line the first pass took is left as it is: unittest's whole-value diff under its `!=` line,
+        # and pytest's under -v, where nothing is skipped
+        for line in ("E       AssertionError: '%s' != '%s'\nE       - %s\nE       ?    ^^\nE       + %s\n" % (a, b, b, a),
+                     "E       assert '%s' == '%s'\nE         \nE         - %s\nE         + %s\n" % (a, b, b, a)):
+            out = red(line)
+            self.assertEqual(out.count(R), 4, out)
+            self.assertFalse(R + R in out, "the second pass added nothing to a line already taken: " + out)
+        # the block is pytest's text diff and nothing else: a `where` line after the diff (where older pytests
+        # put it; pytest 9 renders none beside a diff) keeps its shape and ends the block, so a signed line
+        # past it is not the diff's; and `Full diff:` under a container's per-index line ends the block before
+        # the container's lines
+        out = red("E       assert '%s' == 'x'\nE         - x\nE         + %s\nE        +  where '%s' = f()\nE         - x\n" % (a, a, a))
+        self.assertEqual(out, "E       assert '%s' == 'x'\nE         - %s\nE         + %s\nE        +  where '%s' = f()\nE         - x\n" % (R, R, R, R))
+        out = red("E         At index 0 diff: '%s' != '%s'\nE         \nE         Full diff:\nE           [\nE         -     'x',\nE         +     'y',\nE           ]\n" % (a, b))
+        self.assertEqual(out, "E         At index 0 diff: '%s' != '%s'\nE         \nE         Full diff:\nE           [\nE         -     'x',\nE         +     'y',\nE           ]\n" % (R, R))
+        # what stays, exactly: a plain string's diff after the same skip (its assert line reaches no verdict);
+        # a string whose head is a token run but which is words beyond it; a container element beside the
+        # operator (pytest's diff of a container skips nothing); and the same block without the E marker
+        plain = ("E       AssertionError: assert 'the quick br...n running far' == 'the quick br...n running fat'\nE         \n"
+                 "E         Skipping 57 identical leading characters in diff, use -v to show\nE         - running fat\nE         ?           ^\n"
+                 "E         + running far\nE         ?           ^\n")
+        self.assertEqual(red(plain), plain)
+        words = "E       assert '%s...st of the text' == '%s...st of the test'\nE         \nE         Skipping 40 identical leading characters in diff, use -v to show\nE         - rest of the test\nE         + rest of the text\n" % (a[:12], a[:12])
+        self.assertEqual(red(words), words.replace(a[:12], R), "the heads go, the words and the diff stay")
+        listed = "E       assert ['%s'] == ['%s']\nE         \nE         - ['x']\nE         + ['y']\n" % (a, b)
+        self.assertEqual(red(listed), listed.replace(a, R).replace(b, R))
+        bare = "assert '%s...%s' == '%s...%s'\n  \n  %s\n  - %s\n  + %s\n" % (a[:12], a[-13:], b[:12], b[-13:], skip_l, b[42:], a[42:])
+        self.assertEqual(red(bare), "assert '%s...%s' == '%s...%s'\n  \n  %s\n  - %s\n  + %s\n" % (R, R, R, R, skip_l, b[42:], a[42:]),
+                         "without the E marker a signed line is a bullet in captured output, as the diff rule holds")
+
     def test_a_qualifying_token_takes_its_dotted_rest(self):
         # a dotted token in a value position was matched to its first dot; the `.<more>` segments ride along
         # once the first run qualifies. A dot with no token character after it (a sentence's, an ellipsis)
@@ -906,6 +989,9 @@ class ScrubCost(_WithConftest):
             # the two runs around one cut as a pair: a hex head and a one-case tail, closed by a quote and not
             "hex head, one-case tail": "'" + hexrun[:n // 2] + "..." + rep("a")[:n // 2] + "'",
             "hex head, one-case tail, unclosed": "'" + hexrun[:n // 2] + "..." + rep("a")[:n // 2] + " x",
+            # the second pass: a compared operand the first pass rendered as the marker, over a signed line the
+            # first pass leaves (the ` x` keeps it from the diff rule), so the pass itself does the replacing
+            "redacted compare over a 200 KB diff line": "E       assert '%s' == 'x'\nE         - %s x" % (self.cf.CREDENTIAL_REDACTED, hexrun),
         }
         for name, line in lines.items():
             t0 = time.perf_counter()
@@ -1255,6 +1341,79 @@ class HookEndToEnd(unittest.TestCase):
             # the keys' assert line (2) and diff (2); the tokens' four fragments and diff (6); the list's (6);
             # the tuple's (4); the three-element block (2 heads, 2 elements, 6 diff lines); the keys' block (8)
             self.assertGreaterEqual(out.count("[REDACTED-CREDENTIAL]"), 30, out[-2500:])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_comparison_of_two_values_sharing_a_long_prefix_prints_the_marker_on_the_skipped_diff(self):
+        # pytest's diff of two compared strings skips what they share (past 42 identical leading characters,
+        # or trailing ones when the two are of one length, it keeps 10 and says so), and its `-` and `+`
+        # lines then show the rest of each operand: 22 and 21 characters of each 64-character value here,
+        # under an assert line that shows both operands as markers; they stood in the clear (2026-09-08).
+        # Two runs, as the JWT test below: the default rendering, and CI set, where the short summary
+        # repeats each failure's whole message, the diff lines included. No 8-character piece of either
+        # value survives on any line of either run. The values are fixed digests, so the skip is the same
+        # every run, and the Skipping lines are asserted so a change in pytest's threshold is seen
+        d = tempfile.mkdtemp()
+        try:
+            _copy_hook(d)
+            a, c = _fixed_hex("skip-leading"), _fixed_hex("skip-trailing")
+            probes = {"a": a, "b": a[:52] + _fixed_hex("skip-leading-other")[52:],              # 52 shared: skips 42, shows 22
+                      "c": c, "d": c[0] + _fixed_hex("skip-trailing-other")[1:12] + c[12:]}    # the first and the last 52: skips 43, shows 21
+            for piece in (a[:12], a[-13:], probes["b"][-13:], c[:12], c[-13:], probes["d"][:12]):
+                self.assertTrue(any(ch.isdigit() for ch in piece), piece)
+            with open(os.path.join(d, "probes.json"), "w") as fh:
+                json.dump(probes, fh)
+            with open(os.path.join(d, "test_probe_skip.py"), "w") as fh:
+                fh.write("import json, os\n"
+                         "P = json.load(open(os.path.join(os.path.dirname(__file__), 'probes.json')))\n\n"
+                         "def test_leading():\n    assert P['a'] == P['b']\n\n"
+                         "def test_trailing():\n    assert P['c'] == P['d']\n")
+            for env in ({}, {"CI": "1"}):
+                rc, out = self._run(d, "test_probe_skip.py", env=env)
+                self.assertNotEqual(rc, 0)
+                self.assertTrue("2 failed" in out, out[-600:])
+                self.assertTrue("Skipping 42 identical leading characters in diff" in out, "pytest skipped the shared prefix: " + out[-1500:])
+                self.assertTrue("Skipping 43 identical trailing characters in diff" in out, "and the shared suffix: " + out[-1500:])
+                for name, v in probes.items():
+                    for i in range(0, len(v) - 8 + 1):
+                        self.assertFalse(v[i:i + 8] in out, "a piece of %s reached the report (CI=%s)" % (name, env.get("CI")))
+                # each failure: the assert line (4) and its two signed lines; under CI the summary repeats them
+                self.assertGreaterEqual(out.count("- [REDACTED-CREDENTIAL]"), 2 if not env else 4, out[-1500:])
+                self.assertGreaterEqual(out.count("+ [REDACTED-CREDENTIAL]"), 2 if not env else 4, out[-1500:])
+                self.assertGreaterEqual(out.count("[REDACTED-CREDENTIAL]"), 12 if not env else 24, out[-2500:])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_pytests_own_cut_onto_a_letters_only_piece_prints_the_marker_on_both_pieces(self):
+        # the CI shape at the reporter, not the scrub: pytest cuts each operand of a failed `==` to 12 and
+        # 13 characters around `...`, and one such piece of a 64-character hex value is letters alone (a-f)
+        # one draw in thousands, which the fragment rule's digit test cannot see; a tail so drawn stood in
+        # the clear beside its redacted head (2026-09-08). Forced here rather than drawn: a tail of 13 hex
+        # letters in one pair, a head of 12 in the other. The pair rule takes each with its qualifying
+        # other half, and the whole values on the diff lines are the diff rule's. No 8-character piece
+        # survives, and both assert lines show the four markers
+        d = tempfile.mkdtemp()
+        try:
+            _copy_hook(d)
+            probes = {"a": _fixed_hex("letters-tail")[:51] + _hex_letters(13), "b": _fixed_hex("letters-tail-other")[:51] + _hex_letters(13),
+                      "c": _hex_letters(12) + _fixed_hex("letters-head")[12:], "d": _hex_letters(12) + _fixed_hex("letters-head-other")[12:]}
+            for piece in (probes["a"][:12], probes["b"][:12], probes["c"][-13:], probes["d"][-13:]):
+                self.assertTrue(any(ch.isdigit() for ch in piece), piece)
+            with open(os.path.join(d, "probes.json"), "w") as fh:
+                json.dump(probes, fh)
+            with open(os.path.join(d, "test_probe_letters.py"), "w") as fh:
+                fh.write("import json, os\n"
+                         "P = json.load(open(os.path.join(os.path.dirname(__file__), 'probes.json')))\n\n"
+                         "def test_tail():\n    assert P['a'] == P['b']\n\n"
+                         "def test_head():\n    assert P['c'] == P['d']\n")
+            rc, out = self._run(d, "test_probe_letters.py")
+            self.assertNotEqual(rc, 0)
+            self.assertTrue("2 failed" in out, out[-600:])
+            for name, v in probes.items():
+                for i in range(0, len(v) - 8 + 1):
+                    self.assertFalse(v[i:i + 8] in out, "a piece of %s reached the report" % name)
+            R = "[REDACTED-CREDENTIAL]"
+            self.assertEqual(out.count("assert '%s...%s' == '%s...%s'" % (R, R, R, R)), 2, "both assert lines, both operands, both pieces: " + out[-1500:])
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
