@@ -178,6 +178,10 @@ def _rebind_state(path):
     #                         entries could never hit under the new one; cleared anyway so a rebind starts empty
     with _ABSENT_FLAGS_LOCK:
         _ABSENT_FLAGS.clear()   # the absent-store predicate memo: same full-path keys, same reasoning
+    with _VIEW_CLEARED_LOCK:
+        _VIEW_CLEARED_MEMO.clear()   # the cleared.jsonl replay memo and the states-log scan memo: full-path
+    with _LIVE_PROMPT_LOCK:          # keys, so an old root's entries could never hit under the new one;
+        _LIVE_PROMPT_MEMO.clear()    # cleared anyway so a rebind starts empty
     _shared_clear()             # the shared read-only store cache: same path keying, same reason; also lifts
     #                         a test's deliberate write-guard trip (the poison flag) so the next class starts clean
     with _STAGE_LOCK:
@@ -10301,20 +10305,56 @@ def _view_cleared():
     cleared.jsonl (a 'clear' row adds, an 'undo' removes, newest-wins). The grouper consults this so it
     NEVER re-organizes a card the user cleared: a relink mints a fresh umbrella whose new id is not in
     cleared.jsonl, so the card escapes the clear and reappears (the user 2026-06-18). Ids are globally
-    unique (<rompUuid>:gN), so no per-session scoping. Decoupled mirror of the kernel's _cleared_ids."""
-    cur = set()
+    unique (<rompUuid>:gN), so no per-session scoping. Decoupled mirror of the kernel's _cleared_ids.
+
+    Memoized on the file's (ino, mtime_ns, size) since 2026-09: seven call sites read it (open_menu,
+    _cleared_under, may_apply's reopen guard, the planner's follow-up pivot, _group_tops, _consolidate_tops,
+    the model-fallback mint), several once per session per pass, and each replayed the whole file. The key
+    is exact for this file's writers: every one APPENDS (the kernel's clear, undo, boundary-settle and
+    mute-seal paths and the judge's echo clears all open it "a"), so no two versions share a size; the one
+    write an identity memo cannot see, a rewrite in place of equal size within one mtime tick, is a pattern
+    nothing uses on this file. Stat before read, so a row landing between the two costs one extra replay,
+    never a stale answer; an unreadable file answers empty and is not memoized. Returns a frozenset: every
+    caller tests membership, and a mutation of the shared memo would be a silent corruption, so it raises
+    instead."""
+    path_s = str(STATE / "cleared.jsonl")
     try:
-        for line in (STATE / "cleared.jsonl").read_text().splitlines():
-            try:
-                o = json.loads(line)
-            except Exception:
-                continue
-            iid = o.get("id")
-            if not iid:
-                continue
-            cur.discard(iid) if o.get("op") == "undo" else cur.add(iid)
+        st = os.stat(path_s)
     except OSError:
-        pass
+        with _VIEW_CLEARED_LOCK:
+            _VIEW_CLEARED_MEMO.pop(path_s, None)
+        return frozenset()
+    key = (st.st_ino, st.st_mtime_ns, st.st_size)
+    with _VIEW_CLEARED_LOCK:
+        hit = _VIEW_CLEARED_MEMO.get(path_s)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    try:
+        cur = frozenset(_view_cleared_scan(path_s))
+    except OSError:
+        return frozenset()
+    with _VIEW_CLEARED_LOCK:
+        _VIEW_CLEARED_MEMO[path_s] = (key, cur)
+    return cur
+
+
+_VIEW_CLEARED_MEMO = {}    # cleared.jsonl path string -> ((ino, mtime_ns, size), frozenset of ids): see _view_cleared
+_VIEW_CLEARED_LOCK = threading.Lock()
+
+
+def _view_cleared_scan(path):
+    """The unmemoized replay behind _view_cleared over the log at `path`: a 'clear' row adds its id, an
+    'undo' row removes it, newest wins. Raises OSError when the file cannot be read."""
+    cur = set()
+    for line in Path(path).read_text().splitlines():
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        iid = o.get("id")
+        if not iid:
+            continue
+        cur.discard(iid) if o.get("op") == "undo" else cur.add(iid)
     return cur
 
 
@@ -13579,29 +13619,64 @@ def _live_prompt_since(fsid):
     EPISODES too (nothing lands in the store mid-turn), so a second prompt in the same open turn kept the
     first prompt's stale brief (the user 2026-07-24: a reply answered the parked question, the session
     asked a NEW one, and the card still briefed the answered one). Consecutive prompt states
-    (picker→permission) are ONE run — the episode starts where the run does."""
-    p = STATESDIR / (fsid + ".jsonl")
-    since, prev = None, ""
+    (picker→permission) are ONE run — the episode starts where the run does.
+
+    Memoized on the states file's (ino, mtime_ns, size) since 2026-09: the scan read every session's whole
+    states log on every distiller pass, 31 ms of the tier's 135 ms idle pass on a 31-session state copy
+    against under 1 ms of stats. The key is exact for this file's writers: every one APPENDS a row (the
+    tmux and SDK status hooks, the kernel's picker watcher and its interrupt idle row, the idle-dots CLI
+    all open it "a"), so no two versions share a size; the one write an identity memo cannot see, a
+    rewrite in place of equal size within one mtime tick, is a pattern nothing uses on this file (the
+    evidence gate's value inputs are read by value because their fixtures did). Stat before read: a row
+    landing between the two pairs an old identity with new content, which costs one extra scan next
+    time, never a stale answer. An unreadable file answers None and is not memoized."""
+    path_s = str(STATESDIR / (fsid + ".jsonl"))
     try:
-        with open(p, errors="replace") as f:
-            for line in f:
-                if '"state"' not in line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if not (isinstance(rec, dict) and isinstance(rec.get("state"), str)):
-                    continue
-                s = rec["state"]
-                if s in ("picker", "permission"):
-                    if prev not in ("picker", "permission"):
-                        since = rec.get("t") or 0      # entered a prompt run → the episode's own event
-                else:
-                    since = None                       # left the prompt → that episode is over
-                prev = s
+        st = os.stat(path_s)
+    except OSError:
+        with _LIVE_PROMPT_LOCK:
+            _LIVE_PROMPT_MEMO.pop(path_s, None)
+        return None
+    key = (st.st_ino, st.st_mtime_ns, st.st_size)
+    with _LIVE_PROMPT_LOCK:
+        hit = _LIVE_PROMPT_MEMO.get(path_s)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    try:
+        since = _live_prompt_since_scan(path_s)
     except OSError:
         return None
+    with _LIVE_PROMPT_LOCK:
+        _LIVE_PROMPT_MEMO[path_s] = (key, since)
+    return since
+
+
+_LIVE_PROMPT_MEMO = {}     # states path string -> ((ino, mtime_ns, size), since): see _live_prompt_since
+_LIVE_PROMPT_LOCK = threading.Lock()
+
+
+def _live_prompt_since_scan(path):
+    """The unmemoized scan behind _live_prompt_since over the states log at `path`: the `t` of the
+    transition into the trailing picker/permission run, else None. Raises OSError when the file cannot be
+    opened, so the memo never records an answer under an identity it did not read."""
+    since, prev = None, ""
+    with open(path, errors="replace") as f:
+        for line in f:
+            if '"state"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not (isinstance(rec, dict) and isinstance(rec.get("state"), str)):
+                continue
+            s = rec["state"]
+            if s in ("picker", "permission"):
+                if prev not in ("picker", "permission"):
+                    since = rec.get("t") or 0          # entered a prompt run → the episode's own event
+            else:
+                since = None                           # left the prompt → that episode is over
+            prev = s
     return since
 
 
@@ -13678,7 +13753,16 @@ def _deleg_frame(store, nid):
     return " | ".join(p for p in parts if p)[:360]
 
 
-def _distill_due_t(store, nid, blocked):
+def _kids_map(nodes):
+    """parentId -> [nid, ...] over every node (None keys the tops), in store order: the index every
+    subtree walk over a goal store uses (_distill_due_t, _distill_session's descendant gather)."""
+    kids = {}
+    for x, d in nodes.items():
+        kids.setdefault(d.get("parentId"), []).append(x)
+    return kids
+
+
+def _distill_due_t(store, nid, blocked, kids=None):
     """The authoritative "this goal (re)resolved" time the distiller/brief gate compares against —
     never `mt` (the user 2026-07-08, the Proton-card regression): since the diary flip an event-only
     reopen→settle cycle bumps no cache stamp, so an mt-keyed gate slept through re-completions and the
@@ -13702,12 +13786,17 @@ def _distill_due_t(store, nid, blocked):
     summary written at done is already right); only a reopen→re-done lands a NEWER done event and
     re-fires — the worst case the user accepted is one re-distill when work actually resumes. Subtree,
     not the top's own log: a bottom-up-completed umbrella carries no done verdict of its own — its
-    children's do. settledAt stays as the fallback for stores whose diary predates done events."""
+    children's do. settledAt stays as the fallback for stores whose diary predates done events.
+
+    `kids`: the store's parent -> children map (_kids_map over these nodes), built ONCE per store by
+    _distill_session and handed through _done_owed (2026-09): rebuilding it here on every call was 40 of
+    the distiller's 135 ms per idle pass on a 31-session state copy (690 calls). None builds it here, as
+    before; the answer is the same either way (pure over the nodes, pinned by
+    tests/test_judge_identity_memos.py), so the kernel's three callers pass nothing."""
     nodes = store["nodes"]
     nd = nodes.get(nid) or {}
-    kids = {}
-    for x, d in nodes.items():
-        kids.setdefault(d.get("parentId"), []).append(x)
+    if kids is None:
+        kids = _kids_map(nodes)
     best = None
     stack = [nid]
     while stack:
@@ -13724,14 +13813,15 @@ def _distill_due_t(store, nid, blocked):
     return best or nd.get("mt")
 
 
-def _done_owed(store, nid):
+def _done_owed(store, nid, kids=None):
     """True when a completed/confirming top owes a (re)distill: no summary yet, or the goal has
-    (re)resolved since the stamp (distilledMt != the newest done event, _distill_due_t)."""
+    (re)resolved since the stamp (distilledMt != the newest done event, _distill_due_t). `kids`: the
+    caller's per-store children map for _distill_due_t, or None to build one."""
     nd = store["nodes"][nid]
     if nd.get("summary") is None:
         return True
     _dmt = nd.get("distilledMt")
-    due = _distill_due_t(store, nid, False)
+    due = _distill_due_t(store, nid, False, kids)
     # A stamp equal to the goal's settle time is ALSO current: pre-07-24 stamps were the settle event,
     # and re-keying the due on the done event must not re-enter every already-distilled card in the
     # deployment at once (a re-distill storm). Match the settledAt cache OR any settle event in the
@@ -13801,9 +13891,12 @@ def _distill_session(fsid, path, now):
     # changes nothing; only a reopen→re-done moves the due and re-fires (the one-re-distill worst case the
     # user accepted).
     confirming = set(store.get("confirming") or ())
+    kids = _kids_map(nodes)                            # one parent -> children map per store, shared by every
+    #                                                    _distill_due_t below and the descendant gather (built
+    #                                                    AFTER the title save: a rebase there can add nodes)
     todo = [nid for nid, st in status.items() if nodes.get(nid) and (
-            ((st == "completed" or nid in confirming) and _done_owed(store, nid)) or
-            (st == "blocked" and (nodes[nid].get("briefedMt") != _distill_due_t(store, nid, True)
+            ((st == "completed" or nid in confirming) and _done_owed(store, nid, kids)) or
+            (st == "blocked" and (nodes[nid].get("briefedMt") != _distill_due_t(store, nid, True, kids)
                                   or nodes[nid].get("blockSummary") is None)))]
     # LIVE picker/permission floor (the user 2026-06-29): a session parked RIGHT NOW on a live prompt is
     # blocked-on-you, but the planner hasn't classified its focus goal — its stored status is still 'working',
@@ -13845,9 +13938,7 @@ def _distill_session(fsid, path, now):
         return 0
     session = parsed_session(fsid, [path], now)
     seg_by_id = {seg["id"]: seg for turn in session["turns"] for seg in _segs(turn, store)}
-    children = {}
-    for nid, nd in nodes.items():
-        children.setdefault(nd.get("parentId"), []).append(nid)
+    children = kids                                    # the same map: no node was added since it was built
     n, changed = 0, False
     for top in todo:
         blocked = status.get(top) == "blocked" or top in live_brief   # live-picker focus → brief it like a block
@@ -13856,7 +13947,7 @@ def _distill_session(fsid, path, now):
         # either — its verdict is in; it entered todo for the takeaway.
         stalled = (not blocked) and status.get(top) == "working" and top in stalls and top not in confirming
         due = (stalls[top]["since"] if stalled            # the stall's own start event, not a settle/block
-               else _distill_due_t(store, top, blocked))  # the event time this (re)resolution stamps back
+               else _distill_due_t(store, top, blocked, kids))  # the event time this (re)resolution stamps back
         stack, sub = [top], []                         # the top + all descendants (its whole subtree) — still
         while stack:                                   # needed below for blkd, so kept alongside _goal_work_text
             x = stack.pop(); sub.append(x); stack.extend(children.get(x, []))
