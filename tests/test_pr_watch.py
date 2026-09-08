@@ -282,5 +282,41 @@ class Route(unittest.TestCase):
                                     token=False)[0], 403)
 
 
+
+class VerdictJudgesEachCheckByItsNewestRun(unittest.TestCase):
+    """T256: gh's statusCheckRollup keeps SUPERSEDED runs beside their re-runs — the label workflow
+    left a failed run next to the passing one on every `gh pr create --label` PR, and any manual
+    re-run does the same. The first FAILURE in list order was treated as terminal, so a stale red run
+    mailed a false "FAILED check … will not land" (twice on 2026-09-07). The merge box's own rule:
+    group by check name, judge each name by its NEWEST run (completion time), decide only then."""
+
+    def _run(self, name, conclusion, completed, status="COMPLETED"):
+        return {"name": name, "conclusion": conclusion, "status": status,
+                "startedAt": completed.replace("Z", "") and "2026-09-07T05:00:00Z", "completedAt": completed}
+
+    def test_a_stale_failure_beside_a_newer_success_of_the_same_name_is_not_failed(self):
+        d = {"state": "OPEN", "statusCheckRollup": [
+            self._run("label check", "FAILURE", "2026-09-07T05:40:00Z"),     # the superseded run, listed first
+            self._run("Python 3.12", "SUCCESS", "2026-09-07T05:45:00Z"),
+            self._run("label check", "SUCCESS", "2026-09-07T05:50:00Z"),     # the re-run that actually counts
+        ]}
+        self.assertEqual(km._pr_watch_verdict(d), (None, ""),
+                         "every name's NEWEST run passed and the PR is open → keep watching, never 'failed'")
+
+    def test_a_newer_failure_after_an_older_success_is_failed(self):
+        d = {"state": "OPEN", "statusCheckRollup": [
+            self._run("Shell (bats)", "SUCCESS", "2026-09-07T05:40:00Z"),
+            self._run("Shell (bats)", "FAILURE", "2026-09-07T05:50:00Z"),
+        ]}
+        self.assertEqual(km._pr_watch_verdict(d), ("failed", "Shell (bats)"), "the newest run of that name is red")
+
+    def test_a_running_rerun_of_a_failed_name_keeps_watching(self):
+        d = {"state": "OPEN", "statusCheckRollup": [
+            self._run("Shell (bats)", "FAILURE", "2026-09-07T05:40:00Z"),
+            {"name": "Shell (bats)", "conclusion": "", "status": "IN_PROGRESS", "startedAt": "2026-09-07T05:55:00Z", "completedAt": None},
+        ]}
+        self.assertEqual(km._pr_watch_verdict(d), (None, "busy"), "its newest run is still in flight — the old red is superseded")
+
+
 if __name__ == "__main__":
     unittest.main()

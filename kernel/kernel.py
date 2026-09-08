@@ -16708,13 +16708,31 @@ def _pr_watch_verdict(d):
         return "merged", ""
     if state == "CLOSED":
         return "closed", ""
-    busy = False
+    # ONE verdict per check NAME, from its NEWEST run (T256, 2026-09-07): gh's rollup keeps superseded
+    # runs beside their re-runs — the label workflow left a failed run next to the passing one on every
+    # `gh pr create --label` PR, and any manual re-run does the same — and the first FAILURE in list
+    # order mailed a false "FAILED check … will not land" twice in one night. The merge box's own rule:
+    # group by name (plus the app/workflow when the API gives it — two workflows may share a job name),
+    # keep the run with the latest completion (a still-running re-run outranks any finished one: the
+    # name's story is not over), and only then decide across the survivors.
+    newest = {}
     for c in (d or {}).get("statusCheckRollup") or []:
         if not isinstance(c, dict):
             continue
+        app = c.get("app")
+        app_name = (app.get("name") if isinstance(app, dict) else None) or c.get("workflowName") or ""
+        key = (str(c.get("name") or c.get("context") or "a check"), str(app_name))
+        done = str(c.get("status") or "").upper() == "COMPLETED" or bool(c.get("conclusion"))
+        # sort key: an unfinished run is the newest by definition; among finished runs, completedAt,
+        # then startedAt; a run with no stamps at all sorts oldest
+        rank = (0 if done else 1, str(c.get("completedAt") or ""), str(c.get("startedAt") or ""))
+        if key not in newest or rank > newest[key][0]:
+            newest[key] = (rank, c)
+    busy = False
+    for (name, _app), (_rank, c) in newest.items():
         con = str(c.get("conclusion") or "").upper()
         if con in ("FAILURE", "TIMED_OUT"):
-            return "failed", str(c.get("name") or c.get("context") or "a check")
+            return "failed", name
         if str(c.get("status") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING") or con == "":
             busy = True
     return None, ("busy" if busy else "")
