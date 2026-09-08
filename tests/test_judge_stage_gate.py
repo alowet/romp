@@ -24,12 +24,13 @@ mid-pass (a turn ending after the pass's first touch), an unpoked background tas
 journal gesture, a nudge block, two concurrent writers, a restart (fresh process state), the death drain,
 the archive path.
 
-Accepted lag, recorded here as the design asks: under an open frame every parsed_session caller sees the
-pass-start world (a cache hit too), so the six pusher tick jobs that read the judge parse
-(_interrupt_block_tick, _closer_pending, _awaiting_wake_outcomes, _deferral_sweep_tick,
-_auto_nudge_session, _clear_done_working_notes) see a world up to one pass old for every session, and a
-turn that ends after a pass's first touch is judged next pass, whole. That is the frame's design
-(2026-07-21); the gate adds no lag beyond the producer's 3 s backstop for the clock input.
+Accepted lag, recorded here as the design asks: under an open frame every PASS-THREAD caller of
+parsed_session sees the pass-start world (a cache hit too), so a turn that ends after a pass's first touch is
+judged next pass, whole. That is the frame's design (2026-07-21). The kernel's six pusher tick jobs that read
+the judge parse (_interrupt_block_tick, _closer_pending, _awaiting_wake_outcomes, _deferral_sweep_tick,
+_auto_nudge_session, _clear_done_working_notes) are NOT pass threads (jd._pass_frame; review find,
+2026-09-08): they read the live world every cycle, so the frame costs them nothing, and the gate adds no lag
+beyond the producer's 3 s backstop for the clock input.
 
 PRIVATE synthetic sids (goal-minting fixtures never share the placeholder sid: its override journal is
 replayed on every load), invented text, a notes-api with web/api sessions; the journals are removed in
@@ -253,6 +254,10 @@ class _Gate(unittest.TestCase):
     def _stamp(self, tier, sid=SID):
         return jd._STAGE_STAMP.get((tier, sid))
 
+    def _rows(self, err):
+        """The judge-errors rows of kind `err` (the file exists once any row was logged)."""
+        return [r for r in (json.loads(l) for l in open(jd.ERRORS) if l.strip()) if r.get("err") == err]
+
     def _tops(self, sid=SID):
         store = jd.load_goals(sid)
         return sorted((nd for nd in store["nodes"].values() if nd["parentId"] is None), key=lambda nd: nd["t"])
@@ -313,8 +318,8 @@ class Convergence(_Gate):
 
 class ATurnEndingMidPass(_Gate):
     def test_a_turn_ending_after_the_first_touch_is_judged_next_pass_whole(self):
-        # the review's hazard: a tick job (or the index tier) touches the session while its last turn is
-        # OPEN; the turn's final record and the idle row land; the gated planner and closer check the gate.
+        # the review's hazard: a pass thread (the index tier's captioner, say) touches the session while its
+        # last turn is OPEN; the turn's final record and the idle row land; the gated planner and closer check the gate.
         # The transcript component is the pair the pass PINNED at that first touch, which equals the stamp
         # the converged run left, so the mid-pass check is a SKIP (no stat of the grown file, no run), the
         # stamps keep the pre-append pair, and the next pass runs both stages over the ended turn, whole.
@@ -326,7 +331,7 @@ class ATurnEndingMidPass(_Gate):
         self._converge()
         own = jd.begin_pass_frame()
         try:
-            jd.parsed_session(SID, [str(path)], NOW)                    # the tick job's first touch, turn open
+            jd.parsed_session(SID, [str(path)], NOW)                    # the index tier's first touch, turn open
             pre = jd._frame["keys"][("parse", SID)]
             self._append(path, aline(T0 + 140, "did B", "a3", "a2"))
             self._states_row(SID, T0 + 141, "idle")
@@ -868,6 +873,9 @@ class Completeness(_Gate):
         self.assertEqual((st["ran"], st["bypassed"], st["stamped"]), (1, 1, 0))
         rows = [json.loads(l) for l in open(jd.ERRORS) if l.strip()]
         self.assertEqual([r["err"] for r in rows if r.get("err") in ("gate-stamp", "pass-crash")], ["gate-stamp"])
+        self.assertEqual([r["judge"] for r in rows if r.get("err") == "gate-stamp"], ["planner"],
+                         "the row wears the judge's name like every other row (review find, 2026-09-08: it carried "
+                         "the tier key, which no reader of the log joins on)")
         self.assertIsNotNone(jd.pass_watermark("plan", SID), "the pass over the sid completed")
         self.assertIn("task C", " ".join(self.plan_calls), "and the stage's work landed")
 
@@ -1074,6 +1082,41 @@ class Bounds(_Gate):
         self._pass(tiers=("plan",))
         self.assertEqual(self._st("plan")["stamped"], 1, "under a frame the same work stamps")
 
+    def test_a_muted_sid_leaves_the_parse_tiers_and_an_unmute_costs_one_full_run(self):
+        # session-flags.json is in no signature on purpose (the inventory above GATED_TIERS): _hidden_from_feed
+        # filters run_plan's, run_close's and run_unblock's lists before any stage runs, so a muted sid is not
+        # listed and the post-pool eviction drops its stamps for those three tiers; the other three runners do
+        # not filter on it and keep skipping it. An unmute lists the sid again with no stamp to match: one
+        # full run (a load, the walk, a stamp), then the skips resume (review find, 2026-09-08: stated, untested)
+        self._session(SID)
+        self._session(SID2, name="api")
+        self._converge()
+        flags = jd.STATE / "session-flags.json"
+        flags.write_text(json.dumps({SID2: {"hideFromFeed": True}}))     # the timeline's mute checkbox
+        self._reset()
+        self._pass(tiers=ALL_TIERS)
+        self.assertEqual({k for k in jd._STAGE_STAMP if k[1] == SID2},
+                         {(t, SID2) for t in ("group", "consolidate", "distill")},
+                         "the muted sid's planner, closer and unblocker stamps are evicted; the store tiers keep theirs")
+        for t in ("plan", "close", "unblock"):
+            self.assertEqual((self._st(t)["ran"], self._st(t)["skipped"]), (0, 1), "%s: the muted sid is not listed" % t)
+        for t in ("group", "consolidate", "distill"):
+            self.assertEqual((self._st(t)["ran"], self._st(t)["skipped"]), (0, 2), "%s: both sids skip" % t)
+        flags.write_text(json.dumps({}))                                  # the unmute
+        self._reset()
+        io0 = dict(self.io)
+        self._pass(tiers=ALL_TIERS)
+        for t in ("plan", "close", "unblock"):
+            self.assertEqual((self._st(t)["ran"], self._st(t)["stamped"], self._st(t)["skipped"]), (1, 1, 1),
+                             "%s: the unmuted sid runs once, in full, and stamps; the other sid skips" % t)
+        for t in ("group", "consolidate", "distill"):
+            self.assertEqual((self._st(t)["ran"], self._st(t)["skipped"]), (0, 2), "%s: nothing changed for either sid" % t)
+        self.assertGreater(self.io["loads"] - io0["loads"], 0, "a full run loads the store")
+        self.assertEqual({k for k in jd._STAGE_STAMP if k[1] == SID2}, {(t, SID2) for t in ALL_TIERS})
+        self._reset()
+        self._pass(tiers=ALL_TIERS)
+        self.assertTrue(all(self._st(t)["ran"] == 0 for t in ALL_TIERS), "and the skips resume")
+
 
 class FsCompleteness(_Gate):
     """The loud guard for a missing input: wrap the filesystem for one idle run of each stage over a
@@ -1082,7 +1125,11 @@ class FsCompleteness(_Gate):
     the tier's signature file set plus a fixed allowlist. A stage that starts reading a file the signature
     does not carry fails here."""
 
-    ALLOW_NAMES = {"usage.json", "retry-paused.json", "judge-errors.jsonl", "session-flags.json"}
+    # what a stage may touch beyond its signature: the model-call gate's two files (a skip on either is a ""
+    # call, so the belt marks the run incomplete) and the errors log it writes to. session-flags.json is NOT
+    # here: no stage reads it (the runners filter their lists on it before any stage runs; Bounds has the
+    # muted-sid test), so a stage that started to would fail here (review find, 2026-09-08)
+    ALLOW_NAMES = {"usage.json", "retry-paused.json", "judge-errors.jsonl"}
 
     def _touched(self, fn):
         seen = set()
@@ -1687,9 +1734,6 @@ class StoreCompleteness(_Gate):
             f = store["nodes"][f]["parentId"]
         return store["nodes"][f]
 
-    def _rows(self, err):
-        return [r for r in (json.loads(l) for l in open(jd.ERRORS) if l.strip()) if r.get("err") == err]
-
     @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
     def test_an_unreadable_states_file_never_stamps(self):
         # the review's reproduction: the gate stats the states file into the distiller's signature, then the
@@ -2048,6 +2092,154 @@ class StoreCompleteness(_Gate):
         self.assertEqual(calls, [None, (1, 2)], "two owed decisions, one paragraph: the corrective retry ran")
         self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0))
         self.assertIsNone(jd.load_goals(SID)["nodes"][top["id"]].get("blockSummary"), "the brief is still owed")
+
+
+class SignatureFileReads(_Gate):
+    """The four signature files whose stage readers answered EMPTY on a read failure and let the run stamp
+    (review find, 2026-09-08): the captions (_prompt_gist), the episode log (_episode_read), the death marker
+    (_death_marker) and the archive (load_goal_archive). Each now goes through _read_failed like the states
+    file, cleared.jsonl and the stall records: the run is marked incomplete, one row per failure episode, and
+    the session stays due until the file reads. A stamp over an answer that never read the file would skip
+    the session until the file moved, which a permission bit, an EMFILE or an EIO never makes it do."""
+
+    def _coerced_top(self, sid, quote, seg, n=80):
+        """A coerce-floor node still wearing its verbatim head as its title: the shape _heal_floor_titles
+        retitles from the persisted prompt caption once one exists, reading captions/<sid>.jsonl every run
+        until it does."""
+        store = jd.load_goals(sid)
+        nid = "%s:g%d" % (sid, n)
+        store["nodes"][nid] = {"id": nid, "text": jd._seg_label(quote), "quote": quote, "parentId": None,
+                               "why": jd._COERCE_WHY, "t": T0 + 300, "mt": T0 + 300, "log": [], "trail": [seg],
+                               "nodeComplete": False, "cleared": False}
+        store["status"][nid] = "working"
+        jd.save_goals(sid, store)
+        return nid
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_an_unreadable_captions_file_never_stamps_the_planner(self):
+        # the caption the heal waits for lands (a new identity: the planner runs), and the read fails after
+        # the gate stat'd it. Before the fix the heal read '' and the run stamped, so the title healed only
+        # when the file moved again; now the run is incomplete and the heal lands as soon as the file reads
+        self._session(SID)
+        quote = "Ship the search endpoint for the notes api"
+        nid = self._coerced_top(SID, quote, "seg-x")
+        self._converge()                                                 # no captions file yet: the heal reads nothing
+        cp = jd.CAPDIR / (SID + ".jsonl")
+        jd.CAPDIR.mkdir(parents=True, exist_ok=True)
+        cp.write_text(json.dumps({"id": "seg-x#p", "caption": "Ship the search"}) + "\n")
+        os.chmod(cp, 0)
+        try:
+            self._reset()
+            self._pass(tiers=("plan",))
+            s = self._st("plan")
+            self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0),
+                             "the heal's read failed after a good stat: the run is incomplete, no stamp")
+            self.assertEqual(len(self._rows("captions-unreadable")), 1, "one loud row")
+            self.assertEqual(jd.load_goals(SID)["nodes"][nid]["text"], jd._seg_label(quote), "premise: not healed")
+            self._reset()
+            self._pass(tiers=("plan",))
+            self.assertEqual((self._st("plan")["ran"], self._st("plan")["incomplete"]), (1, 1), "still due")
+            self.assertEqual(len(self._rows("captions-unreadable")), 1, "one row per failure episode, not per pass")
+        finally:
+            os.chmod(cp, 0o644)
+        self._converge(tiers=("plan",))                                  # readable, nothing moved: the run happens
+        self.assertEqual(jd.load_goals(SID)["nodes"][nid]["text"], "Ship the search",
+                         "the heal landed once the file read (a stamp over the failed read would have skipped it)")
+        self.assertEqual(len(self._rows("captions-unreadable")), 1)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_an_unreadable_episode_log_never_stamps_the_planner_and_is_not_memoized(self):
+        # a /clear boundary at T0 + 50 makes task A pre-episode: the planner's retire reads the floor for
+        # every new unit. After a restart (empty stamps, empty mtime memo) the read fails: before the fix the
+        # run answered "no floor", stamped, AND memoized the empty read under the file's mtime, so the rows
+        # stayed invisible until the log grew; now the run is incomplete and the next read sees the rows
+        path = self._session(SID)
+        jd.EPIDIR.mkdir(parents=True, exist_ok=True)
+        ep = jd.EPIDIR / (SID + ".jsonl")
+        ep.write_text(json.dumps({"head": "u1", "fsid": SID, "t": T0}) + "\n"
+                      + json.dumps({"head": "u2", "fsid": SID, "t": T0 + 50}) + "\n")
+        self._converge()
+        self.assertEqual(len(self.plan_calls), 1, "premise: task A predates the boundary and was retired; task B placed")
+        self._append(path, uline(T0 + 200, "task C", "u3", "a2"), aline(T0 + 230, "did C", "a3", "u3"))
+        jd._STAGE_STAMP.clear(); jd._episode_memo.clear()                # what a restart does
+        os.chmod(ep, 0)
+        try:
+            self._reset()
+            self._pass(tiers=("plan",))
+            s = self._st("plan")
+            self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0),
+                             "the floor read failed after a good stat: the run is incomplete, no stamp")
+            self.assertEqual(len(self._rows("episodes-unreadable")), 1, "one loud row")
+            self.assertEqual(jd.episode_rows(SID), [], "while unreadable the log answers empty")
+        finally:
+            os.chmod(ep, 0o644)
+        self.assertEqual(len(jd.episode_rows(SID)), 2,
+                         "the failed read was not memoized under the file's mtime: the next read sees the rows")
+        self._converge(tiers=("plan",))
+        self.assertIsNotNone(self._stamp("plan"), "readable again: the planner completes and stamps")
+        self.assertEqual(len(self._rows("episodes-unreadable")), 1)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_an_unreadable_death_marker_never_stamps_the_closer(self):
+        # _death_finalize reads the marker at the end of every _close_session (a finalized one is read and
+        # left alone), so the marker is on the closer's idle path; another sid's cleared row re-arms the
+        # closer without giving it anything to write
+        self._session(SID)
+        jd._write_death_marker(SID, {"t": T0 + 1000, "by": "probe", "endedAt": T0 + 1000})
+        self._converge()
+        mp = jd.GONEDIR / (SID + ".json")
+        with open(jd.STATE / "cleared.jsonl", "a") as f:
+            f.write(json.dumps({"id": SID2 + ":g1", "op": "clear", "t": NOW}) + "\n")
+        os.chmod(mp, 0)
+        try:
+            self._reset()
+            self._pass(tiers=("close",))
+            s = self._st("close")
+            self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0),
+                             "the marker read failed after a good stat: the run is incomplete, no stamp")
+            self.assertEqual(len(self._rows("marker-unreadable")), 1, "one loud row")
+            self._reset()
+            self._pass(tiers=("close",))
+            self.assertEqual((self._st("close")["ran"], self._st("close")["incomplete"]), (1, 1), "still due")
+            self.assertEqual(len(self._rows("marker-unreadable")), 1, "one row per failure episode, not per pass")
+        finally:
+            os.chmod(mp, 0o644)
+        self._reset()
+        self._pass(tiers=("close",))
+        self.assertEqual((self._st("close")["ran"], self._st("close")["stamped"]), (1, 1),
+                         "readable again, nothing on disk moved: the run happens and stamps")
+        self.assertEqual(len(self._rows("marker-unreadable")), 1)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_an_unreadable_archive_never_stamps_any_tier(self):
+        # every tier's signature carries the archive; load_goals reads it for a journaled restore row, so a
+        # restore row puts the read on every tier's load. One failure episode, one row, six incomplete runs
+        self._session(SID)
+        self._converge()
+        top = self._tops()[0]
+        ap = jd.GOALARCHDIR / (SID + ".json")
+        jd.save_goal_archive(SID, {"rompUuid": SID, "nodes": {}, "status": {}})
+        jd.append_restore(SID, {top["id"]: dict(jd.load_goals(SID)["nodes"][top["id"]])}, {top["id"]: "working"}, NOW)
+        os.chmod(ap, 0)
+        try:
+            self._reset()
+            self._pass(tiers=ALL_TIERS)
+            for t in ALL_TIERS:
+                s = self._st(t)
+                self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0),
+                                 "%s: the archive read failed after a good stat: incomplete, no stamp" % t)
+            self.assertEqual(len(self._rows("archive-unreadable")), 1, "one row for the episode, not one per tier")
+            self._reset()
+            self._pass(tiers=ALL_TIERS)
+            for t in ALL_TIERS:
+                s = self._st(t)
+                self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0),
+                                 "%s: still due, and the shared archive memo did not serve the failed read" % t)
+            self.assertEqual(len(self._rows("archive-unreadable")), 1)
+        finally:
+            os.chmod(ap, 0o644)
+        self._converge()
+        self.assertEqual(len(self._rows("archive-unreadable")), 1, "readable again: every tier completed and stamped")
 
 
 class UnblockerHazard(_Gate):

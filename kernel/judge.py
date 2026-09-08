@@ -42,10 +42,15 @@ def judge_worker_cpu_ms():
 
 
 class _TimedPool(ThreadPoolExecutor):
-    """ThreadPoolExecutor whose submitted callables account their CPU to _JUDGE_CPU."""
+    """ThreadPoolExecutor whose submitted callables account their CPU to _JUDGE_CPU, and whose workers are
+    PASS THREADS (_pass_frame): a tier fans its per-session stages through these pools, and a worker must
+    see the frame the tier thread opened or joined, so every submitted run carries the mark (review find,
+    2026-09-08). Thread-locals do not cross into pool workers on their own, which is why the mark rides
+    the submit rather than the tier."""
 
     def submit(self, fn, /, *args, **kwargs):
         def run():
+            _judge_ctx.in_pass = True
             c0 = time.thread_time()
             try:
                 return fn(*args, **kwargs)
@@ -966,7 +971,13 @@ def _log_judge_error(judge, fsid, err, note=None, goal=None, seg=None):
              then failed under a user gesture, the save path's own strict read or the write itself; filed
              once per fault episode by save_goals_or_fault, and the gesture is answered on its socket),
              "unroll-heal" (a top left the rolled-up state with settle rows and no done in its diary; a romp
-             reopen row ended that settled episode so the node can be judged again — _heal_settle_without_done)
+             reopen row ended that settled episode so the node can be judged again — _heal_settle_without_done),
+             "gate-stamp" (the evidence gate could not write a tier's stamp after a complete run; the run
+             counts bypassed and the session stays due: _gated), "states-unreadable", "cleared-unreadable",
+             "stall-unreadable", "captions-unreadable", "episodes-unreadable", "marker-unreadable",
+             "archive-unreadable" (a side file the evidence gate stat'd into a tier's signature exists and
+             could not be read or parsed by the stage: the run is marked incomplete and stamps nothing, one
+             row per failure episode: _read_failed)
       note   the evidence — reply tail, error message, exception name, or the give-up scope + re-arm
              event. Callers must pass it; an empty note means the caller has nothing at all to show.
       goal   the node id (or list of node ids) the judge was ruling on, when one exists — the feed's
@@ -1076,12 +1087,13 @@ def pass_watermark(tier, fsid):
 # of this protects (CLAUDE.md, cards move on new information): the gate never withholds a verdict the
 # ungated pass would have filed from NEW evidence. In-memory only, empty at boot: the first pass after a
 # restart is a full walk, as before.
-# Accepted lag, stated once: under an open frame every parsed_session caller sees the pass-start world
-# (a cache hit too, since the warm-touch pin of 2026-09-06), so the six pusher tick jobs that read the
-# judge parse (_interrupt_block_tick, _closer_pending, _awaiting_wake_outcomes, _deferral_sweep_tick,
-# _auto_nudge_session, _clear_done_working_notes) see a world up to one pass old for every session, and
-# a turn that ends after a pass's first touch is judged next pass, whole. That is the frame's design
-# (2026-07-21); the gate adds no lag of its own beyond the producer's 3 s backstop for the clock input.
+# Accepted lag, stated once: under an open frame every PASS-THREAD caller of parsed_session sees the
+# pass-start world (a cache hit too, since the warm-touch pin of 2026-09-06), so a turn that ends after a
+# pass's first touch is judged next pass, whole. That is the frame's design (2026-07-21). The six pusher
+# tick jobs that read the judge parse (_interrupt_block_tick, _closer_pending, _awaiting_wake_outcomes,
+# _deferral_sweep_tick, _auto_nudge_session, _clear_done_working_notes) are NOT pass threads
+# (_pass_frame, review find 2026-09-08): they read the live world at every cycle, so the frame costs them
+# nothing, and the gate adds no lag of its own beyond the producer's 3 s backstop for the clock input.
 #
 # SIGNATURE INPUTS PER TIER (the planner and closer first; the four store-only tiers added 2026-09-07).
 # Each list is what the tier's DECISION path reads, enumerated by reading the stage end to end; a read on
@@ -1122,10 +1134,14 @@ def pass_watermark(tier, fsid):
 # that cannot be read raises at the stage's load (no stamp, a pass-crash row), and an unparseable one is
 # moved aside by load_goals, so the fresh store the stage judges is what the path holds. The same holds
 # for the side files a stage reads after the gate stat'd them (cleared.jsonl, the states file, the stall
-# records): a read that fails on a file that exists marks the run incomplete and logs a row (_read_failed).
+# records, and since the review of 2026-09-08 the captions, the episode log, the death marker and the
+# archive): a read that fails on a file that exists marks the run incomplete and logs a row (_read_failed).
 GATED_TIERS = ("plan", "close", "unblock", "group", "consolidate", "distill")
 PARSE_TIERS = ("plan", "close", "unblock")   # the tiers whose decision path reads the parse: their signature
 #                                              carries the pinned pair, and _gated checks the served pair
+_TIER_JUDGE = {"plan": "planner", "close": "closer", "unblock": "unblocker", "group": "grouper",
+               "consolidate": "consolidator", "distill": "distiller"}   # the judge name a tier's rows wear
+#                                              (_log_judge_error's contract: the judge, never a tier key)
 _STAGE_STAMP = {}        # (tier, fsid) -> (sig, not_before): the inputs the tier last judged to completion
 _STAGE_LOCK = threading.Lock()
 _STAGE_STAMP_MAX = 4096  # belt: a wholesale clear at the cap (one full walk next pass)
@@ -1337,7 +1353,7 @@ def _gated(tier, fn, fsid, path, now, sig, settle=True, parse=None):
         if parse is None:
             parse = tier in PARSE_TIERS
         if parse:
-            fr = _frame
+            fr = _pass_frame()
             if fr is None:
                 _tier_bump(tier, "bypassed")          # no frame: no served pair to make the stamp exact
                 return out
@@ -1358,7 +1374,7 @@ def _gated(tier, fn, fsid, path, now, sig, settle=True, parse=None):
         _tier_bump(tier, "stamped")
     except Exception as e:                            # a stamping failure is never a failed pass
         _tier_bump(tier, "bypassed")
-        _log_judge_error(tier, fsid, "gate-stamp", note=repr(e))
+        _log_judge_error(_TIER_JUDGE.get(tier, tier), fsid, "gate-stamp", note=repr(e))
     return out
 
 
@@ -2831,7 +2847,15 @@ def _sdk_owned(fsid):
 # end; the next pass sees the new world and runs every stage over it in order. Only EVIDENCE freezes:
 # goal/caption stores keep flowing through the pass — they are the pipeline's own dataflow (the closer
 # must see this pass's planner verdicts). Shared across tier threads AND their worker pools on
-# purpose: one frame, one world, first touch wins under the lock.
+# purpose: one frame, one world, first touch wins under the lock. Shared with those threads ONLY
+# (review find, 2026-09-08): the frame is a module global, and the kernel's pusher thread calls
+# parsed_session too (its six tick jobs), so before the scoping a tick job's first touch of a session,
+# cold or (since the warm-hit pin of 2026-09-06) warm, pinned that job to the pass-start world for as
+# long as the tiers ran, model calls included: a needs-you block, a working-note lift or a nudge
+# decision waited out the pass. The pin now applies to PASS THREADS (_pass_frame): the thread that
+# opened or joined the frame (the producer, run_index, run_triage, a test's own thread) and this
+# module's pool workers (_TimedPool). Any other thread reads the live world at every call and pins
+# nothing, as every thread did before the frame existed.
 _frame = None                    # {"parses": {fsid: session}, "keys": {tag: pinned value}, "served": {fsid: pair}}
 #                                  while a pass runs: "keys" holds the pass's ("parse", fsid) pairs
 #                                  (_frame_parse_key), "served" the pair each pinned parse was made under
@@ -2841,8 +2865,11 @@ _NO_PIN = object()               # "no entry" in a frame's keys: a pinned None (
 
 def begin_pass_frame():
     """Open a pass frame; True when this call CREATED it (the creator must end it), False when one is
-    already active (a tier running under the kernel producer's frame joins it instead)."""
+    already active (a tier running under the kernel producer's frame joins it instead). Either way the
+    calling thread is a PASS THREAD from here on (_pass_frame): the pins below are for it and for the
+    pool workers its runners submit."""
     global _frame
+    _judge_ctx.in_pass = True
     with _frame_lock:
         if _frame is not None:
             return False                             # a joiner shares the creator's pass — and its key gate
@@ -2851,12 +2878,24 @@ def begin_pass_frame():
 
 
 def end_pass_frame(owned=True):
-    """Drop the pass frame (creator only — a joiner passes its begin_pass_frame() result through)."""
+    """Drop the pass frame (creator only — a joiner passes its begin_pass_frame() result through, and its
+    end is a no-op: the thread is still inside the creator's pass). The creator's end also unmarks the
+    calling thread (_pass_frame): its pass work is over."""
     global _frame
     if not owned:
         return
+    _judge_ctx.in_pass = False
     with _frame_lock:
         _frame = None
+
+
+def _pass_frame():
+    """The open pass frame for a PASS THREAD, None for any other thread (and when no pass runs). A pass
+    thread is one that opened or joined the frame (begin_pass_frame) or runs in one of this module's pools
+    (_TimedPool marks every submitted run); the kernel's pusher thread, whose tick jobs read parsed_session
+    between and during passes, is neither, so it reads the live world and pins nothing (the frame's
+    comment above; review find, 2026-09-08). Every reader of the frame goes through here."""
+    return _frame if getattr(_judge_ctx, "in_pass", False) else None
 
 
 def _parse_key_files(fsid, files):
@@ -2895,7 +2934,7 @@ def _frame_parse_key(fsid, files):
     lives in (None without a frame), so a caller pinning its parse pins into the SAME frame the key went
     into rather than into whatever frame stands when its parse returns (a parse can span a pass
     boundary). An existing pin costs one dict read: no stat, no cut read."""
-    fr = _frame
+    fr = _pass_frame()
     if fr is not None:
         with _frame_lock:
             hit = fr["keys"].get(("parse", fsid), _NO_PIN)
@@ -2907,7 +2946,7 @@ def _frame_parse_key(fsid, files):
         key = (_fileset_key(key_files), cut)
     except OSError:
         key = None
-    fr = _frame
+    fr = _pass_frame()
     if fr is not None:
         with _frame_lock:
             return fr["keys"].setdefault(("parse", fsid), key), cut, fr
@@ -2931,9 +2970,11 @@ def parsed_session(fsid, files, now):
     kernel runs every judge in-process, so the cache lives across a producer pass. An unchanged transcript
     now costs 0 parses; a changed one costs 1. Falls through to a fresh parse if the files can't be stat'd.
 
-    Under an open PASS FRAME (begin_pass_frame) the FIRST parse of a session is pinned and every later
-    call in the pass returns it — even after the file grew — so all stages judge one frozen world
-    (the user 2026-07-21); first touch wins across the tier's worker threads. The parse's KEY is pinned
+    Under an open PASS FRAME (begin_pass_frame) the FIRST parse of a session by a PASS THREAD is pinned
+    and every later pass-thread call in the pass returns it — even after the file grew — so all stages
+    judge one frozen world (the user 2026-07-21); first touch wins across the tier's worker threads. A
+    thread outside the pass (the kernel's pusher tick jobs) sees no frame here: it reads live and pins
+    nothing (_pass_frame, review find 2026-09-08). The parse's KEY is pinned
     with it (_frame_parse_key): the fileset component is read before this function reads anything, the
     cache slot is (pinned fileset key, live cut), and the pair the pinned parse was served under is
     recorded in the frame. A gate that pinned the key earlier in the pass fixes the fileset component for
@@ -2946,7 +2987,7 @@ def parsed_session(fsid, files, now):
     is permanently False and a discharged focus goal never settles to completed (the settled gate, the
     user's bug 2026-06-17). The states file's (mtime,size) is folded into the cache key so an idle-only
     transition (which doesn't touch the transcript) still busts the cache and re-rolls status."""
-    fr = _frame
+    fr = _pass_frame()
     if fr is not None:
         with _frame_lock:
             hit = fr["parses"].get(fsid)
@@ -3051,9 +3092,11 @@ def tasks_for(fsid, leaf, files, now):
 # BEFORE the read (the chain-memo rule), so a row appended during the read moves the key the next call
 # takes and content read mid-write is served no further than that call; an absent file is never cached
 # (its key is None); a stat error (a fresh sentinel key) never matches. An existing file that cannot be
-# read is [] and never cached by the captions memo; the archive memo caches load_goal_archive's answer
-# for it, the empty shape, the same answer the fresh loader gives every archiver for that file. Bounded
-# at _FILE_MEMO_MAX entries, oldest-inserted out, the eviction and the insert under _FILE_MEMO_LOCK; a
+# read is [] and never cached by the captions memo; the archive memo answers the empty shape for it, the
+# same answer the fresh loader gives every archiver for that file, and does not cache it either: the read
+# marked the running stage incomplete (_read_failed, archive-unreadable), and a permission fix moves no
+# file key, so a cached failure would be served after the file reads again (2026-09-09, the evidence gate).
+# Bounded at _FILE_MEMO_MAX entries, oldest-inserted out, the eviction and the insert under _FILE_MEMO_LOCK; a
 # rebound state root clears both. The captions memo serves the three readers from one parse; the archive
 # memo serves READERS only (load_goal_archive_shared): every archiver keeps load_goal_archive, a fresh
 # private object it mutates and saves.
@@ -5045,9 +5088,12 @@ def save_goals(fsid, store):
     saves its store several times per pass, _distill_session saves after titling and again after distilling
     — took the unconditional branch, wrote over whatever a concurrent writer (the nudge tick, the unblocker,
     a peer tier) had published in between, and skipped the no-op check as well. The base is popped before
-    the CAS loop and re-stamped only after the rename, so a raise between the two leaves the object without
-    a base (its next save is unconditional, as every save was before this change); a refusal before the pop
-    (the frozen-store check, the no-op check) leaves it untouched.
+    the CAS loop and stamped again once the loop and the write are over: the written revision after the
+    rename, or the base it was loaded at when the publish did not happen (a revision read inside the loop,
+    the write or the rename raised), so the holder's retry is CAS-protected too (review find, 2026-09-08;
+    the first version of the re-stamp left that raise window documented instead, and a raise there made
+    the next save unconditional). A refusal before the pop (the frozen-store check, the no-op check)
+    leaves the object untouched.
 
     A publish that would write back EXACTLY what the file already holds is skipped (the user 2026-07-22).
     Callers save unconditionally on purpose — `_plan_session` ends every pass with a rollup + save whether or
@@ -5081,31 +5127,39 @@ def save_goals(fsid, store):
     if mine is not None and _matches_disk(fsid, store, mine):
         return                                       # nothing of ours to publish → leave the file (and its
     base = store.pop("_baseRev", None)               # mtime) alone.  transient: never serialized
-    store.pop("_unread", None)                       # likewise transient (_replay_overrides' unread-journal mark)
-    rebased = False
-    if base is not None:
-        disk = 0
-        for _ in range(4):                           # a busy store settles in a pass or two
-            disk = _disk_rev(fsid)
-            if disk == base:
-                break                                # nobody published since we loaded → ours is current
-            _rebase_onto_disk(fsid, store)           # fold their events in, then re-check
-            rebased = True
-            base = disk
-        store["rev"] = disk + 1                      # the revision the loop settled on; no second parse
-    else:
-        store["rev"] = int(store.get("rev") or 0) + 1
-    _goal_io_bump("writes")
-    tmp = _publish_tmp(GOALDIR, fsid)
-    tmp.write_text(json.dumps(store))
-    if mine is not None and not rebased:             # a rebase changed the content `mine` describes
-        _disk_seed(GOALDIR / (fsid + ".json"), tmp, mine)
-    tmp.rename(GOALDIR / (fsid + ".json"))            # atomic publish
-    _shared_forget(str(GOALDIR / (fsid + ".json")))   # the shared read-only view of the old version goes with
-    #                                                   it (its identity check would miss anyway; this frees the bytes)
-    if base is not None:
-        store["_baseRev"] = store["rev"]             # the file holds exactly this content at this revision:
-        #                                              the holder's NEXT save compares against it (docstring)
+    unread = store.pop("_unread", None)              # likewise transient (_replay_overrides' unread-journal mark)
+    rebased = published = False
+    try:
+        if base is not None:
+            disk = 0
+            for _ in range(4):                       # a busy store settles in a pass or two
+                disk = _disk_rev(fsid)
+                if disk == base:
+                    break                            # nobody published since we loaded → ours is current
+                _rebase_onto_disk(fsid, store)       # fold their events in, then re-check
+                rebased = True
+                base = disk
+            store["rev"] = disk + 1                  # the revision the loop settled on; no second parse
+        else:
+            store["rev"] = int(store.get("rev") or 0) + 1
+        _goal_io_bump("writes")
+        tmp = _publish_tmp(GOALDIR, fsid)
+        tmp.write_text(json.dumps(store))
+        if mine is not None and not rebased:         # a rebase changed the content `mine` describes
+            _disk_seed(GOALDIR / (fsid + ".json"), tmp, mine)
+        tmp.rename(GOALDIR / (fsid + ".json"))        # atomic publish
+        published = True
+        _shared_forget(str(GOALDIR / (fsid + ".json")))   # the shared read-only view of the old version goes
+        #                                               with it (its identity check would miss anyway; this frees the bytes)
+    finally:
+        if base is not None:
+            # published: the file holds exactly this content at this revision, so the holder's NEXT save
+            # compares against it. Not published (a raise above): the object is what it was when loaded, or
+            # that plus the disk events a rebase folded in, and `base` is the revision either state stands
+            # on, so the retry stays CAS-protected instead of stomping (review find, 2026-09-08)
+            store["_baseRev"] = store["rev"] if published else base
+        if not published and unread is not None:
+            store["_unread"] = unread                # the mark describes the object still held
 
 
 def load_goal_archive(fsid):
@@ -5116,31 +5170,61 @@ def load_goal_archive(fsid):
     _GOAL_ARCH_LOCK. The judge's readers (_cleared_context for the live re-plan's <recently-cleared> block,
     the override replay, the peer-node joins, the propagate pass) take load_goal_archive_shared, its twin,
     which serves one loaded object per file state; the re-plan's placements dedup and view-cleared sealing
-    keep it from ever re-minting an archived node. Any failure to read or decode an existing file answers the
-    empty shape, and the shared twin memoizes that answer for the file as it stands."""
+    keep it from ever re-minting an archived node.
+
+    An archive that exists and cannot be read or parsed answers the empty archive, as before, and marks the
+    running stage incomplete with one `archive-unreadable` row per failure episode (_read_failed, review
+    find 2026-09-08): every tier's signature carries the archive by identity (load_goals reads it for a
+    journaled restore row, the planner for its <recently-cleared> block), and a stamp over an answer that
+    never read it would skip the session until the archive moved. The shared twin does not memoize that
+    answer (a permission fix moves no file key, so a cached failure would be served after the file reads
+    again); it learns the outcome from _judge_ctx.archive_read_ok, set here for the calling thread, which
+    keeps its call to this function by name (tests count the archive reads through it). The empty answer
+    itself stays: the kernel's compaction sweep and undo-clear restore read through here too, and a raise
+    into their paths (#1019's shape for the goal stores) is the separate change the PR's body defers."""
+    path_s = str(GOALARCHDIR / (fsid + ".json"))
+    fresh = {"rompUuid": fsid, "nodes": {}, "status": {}}
+    _judge_ctx.archive_read_ok = True
     try:
-        return _guard_nodes(json.loads((GOALARCHDIR / (fsid + ".json")).read_text()))
-    except Exception:
-        return {"rompUuid": fsid, "nodes": {}, "status": {}}
+        text = Path(path_s).read_text()
+    except (FileNotFoundError, NotADirectoryError):
+        _read_ok(path_s)                               # absent is the common case and a real state
+        return fresh
+    except OSError as e:
+        _read_failed(path_s, "archive-unreadable", fsid, e)
+        _judge_ctx.archive_read_ok = False
+        return fresh
+    try:
+        arch = _guard_nodes(json.loads(text))
+    except Exception as e:                             # not a JSON document, or not a store shape
+        _read_failed(path_s, "archive-unreadable", fsid, e)
+        _judge_ctx.archive_read_ok = False
+        return fresh
+    _read_ok(path_s)
+    return arch
 
 
 def load_goal_archive_shared(fsid):
     """load_goal_archive for READERS: the guarded archive store, loaded once per file state and served while
     the file stands (2026-09-09), the key its stat taken before the read. The object is shared and read-only
     by contract; every archiver (a compaction, a rewind sweep, an undo restore) keeps load_goal_archive, a
-    fresh private object it mutates and saves under the archive lock."""
+    fresh private object it mutates and saves under the archive lock. A read that failed (a file that exists
+    and cannot be read or parsed: load_goal_archive leaves _judge_ctx.archive_read_ok False) is answered
+    empty and never memoized: the failure marked the running stage incomplete, and the next call must read
+    the file again to find out whether it still does."""
     p = GOALARCHDIR / (fsid + ".json")
     key = _file_key(str(p))
     ent = _GOALARCH_MEMO.get(fsid)
     if ent is not None and isinstance(key, tuple) and ent[0] == key:
         _GOALARCH_STATS["served"] += 1
         return ent[1]
+    _judge_ctx.archive_read_ok = True                  # a patched loader that never sets it reads as ok
     store = load_goal_archive(fsid)
+    ok = getattr(_judge_ctx, "archive_read_ok", True)
     _GOALARCH_STATS["loaded"] += 1
-    if isinstance(key, tuple):
+    if ok and isinstance(key, tuple):
         _memo_put(_GOALARCH_MEMO, fsid, key, store)
     return store
-
 
 def save_goal_archive(fsid, store):
     GOALARCHDIR.mkdir(parents=True, exist_ok=True)
@@ -7287,11 +7371,21 @@ def transcript_head(path):
 
 def _episode_read(sid):
     """One memoized read of the episodes log: (head rows oldest-first, settle annotations by head).
-    mtime-memoized like _sdk_last_sid — the log only grows at a /clear, so per-pass reads are a stat."""
+    mtime-memoized like _sdk_last_sid — the log only grows at a /clear, so per-pass reads are a stat.
+    A file that exists and does not read answers empty, is NOT memoized (the old code memoized the empty
+    read under the file's mtime, so the rows stayed invisible until the log grew), marks the running stage
+    incomplete and logs an `episodes-unreadable` row (_read_failed, review find 2026-09-08): the planner's
+    signature carries this file by identity, and a stamp over a floor that never read it would skip the
+    session until the file moved."""
     p = EPIDIR / (sid + ".jsonl")
     try:
         mt = p.stat().st_mtime
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
+        _read_ok(str(p))                               # absent is a real state, and ends a failure episode
+        _episode_memo.pop(sid, None)
+        return [], {}
+    except OSError as e:
+        _read_failed(str(p), "episodes-unreadable", sid, e)
         _episode_memo.pop(sid, None)
         return [], {}
     hit = _episode_memo.get(sid)
@@ -7299,20 +7393,28 @@ def _episode_read(sid):
         return hit[1], hit[2]
     rows, settles = [], {}
     try:
-        for line in p.read_text(errors="replace").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(r, dict) and r.get("head"):
-                rows.append(r)
-            elif isinstance(r, dict) and r.get("settleFor"):
-                settles[r["settleFor"]] = r           # newest annotation per boundary head wins
-    except OSError:
-        pass
+        text = p.read_text(errors="replace")
+    except (FileNotFoundError, NotADirectoryError):
+        _read_ok(str(p))                               # gone between the stat and the read: absent is a real state
+        _episode_memo.pop(sid, None)
+        return rows, settles
+    except OSError as e:
+        _read_failed(str(p), "episodes-unreadable", sid, e)
+        _episode_memo.pop(sid, None)
+        return rows, settles
+    _read_ok(str(p))
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("head"):
+            rows.append(r)
+        elif isinstance(r, dict) and r.get("settleFor"):
+            settles[r["settleFor"]] = r               # newest annotation per boundary head wins
     _episode_memo[sid] = (mt, rows, settles)
     return rows, settles
 
@@ -7852,13 +7954,23 @@ def _settle_not_before(fsid, path, now):
 
 def _death_marker(sid):
     """STATE/gone/<sid>.json — the recorded death event, or None. Reg-file read cost by design: this
-    sits on _cli_epoch's per-push path, so it must never scan the growing states stream."""
+    sits on _cli_epoch's per-push path, so it must never scan the growing states stream. A marker that
+    exists and cannot be read or parsed answers None too, and marks the running stage incomplete with one
+    `marker-unreadable` row per failure episode (_read_failed, review find 2026-09-08): the planner's and
+    closer's signatures carry the marker by identity, and a stamp over an epoch or a finalize that never
+    read it would skip the session until the marker moved, which a permission bit never makes it do."""
+    path_s = str(GONEDIR / (sid + ".json"))
     try:
-        with open(GONEDIR / (sid + ".json")) as f:
+        with open(path_s) as f:
             m = json.load(f)
-        return m if isinstance(m, dict) else None
-    except Exception:
+    except (FileNotFoundError, NotADirectoryError):
+        _read_ok(path_s)                               # absent is the common case and a real state
         return None
+    except Exception as e:                             # unreadable, or not a JSON document
+        _read_failed(path_s, "marker-unreadable", sid, e)
+        return None
+    _read_ok(path_s)
+    return m if isinstance(m, dict) else None
 
 
 def _cli_epoch(sid):
@@ -8311,18 +8423,28 @@ def _heal_floor_titles(fsid, store):
 def _prompt_gist(fsid, seg_id):
     """The persisted INDEX-tier gist of this segment's user message (captions/<fsid>.jsonl, id
     '<seg_id>#p', last-wins) — the same phrase the timeline dot and the Analyzing card show. '' when
-    the index pass hasn't captioned the message yet, or the file is unreadable."""
+    the index pass hasn't captioned the message yet, or the file is unreadable; a file that exists and
+    does not read also marks the running stage incomplete and logs a `captions-unreadable` row
+    (_read_failed, review find 2026-09-08): the planner's signature carries this file by identity, and a
+    stamp over a heal that never read it would skip the session until the file moved."""
     out = ""
+    path_s = str(CAPDIR / (fsid + ".jsonl"))
     try:
-        for line in (CAPDIR / (fsid + ".jsonl")).read_text(errors="replace").splitlines():
-            try:
-                o = json.loads(line)
-            except Exception:
-                continue
-            if o.get("id") == seg_id + "#p" and (o.get("caption") or "").strip():
-                out = o["caption"].strip()
-    except OSError:
-        pass
+        text = Path(path_s).read_text(errors="replace")
+    except (FileNotFoundError, NotADirectoryError):
+        _read_ok(path_s)                               # absent is a real state, and ends a failure episode
+        return out
+    except OSError as e:
+        _read_failed(path_s, "captions-unreadable", fsid, e)
+        return out
+    _read_ok(path_s)
+    for line in text.splitlines():
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if o.get("id") == seg_id + "#p" and (o.get("caption") or "").strip():
+            out = o["caption"].strip()
     return out
 
 

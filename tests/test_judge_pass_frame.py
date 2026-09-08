@@ -15,6 +15,7 @@ SYNTHETIC fixtures only."""
 import json
 import os
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
@@ -382,10 +383,11 @@ class PassFrame(unittest.TestCase):
         self.assertNotEqual(json.loads((jd.PCACHE / (SID + ".json")).read_text())["key"], o["key"],
                             "under the live key, which the memo now carries")
 
-    def test_a_warm_tick_job_first_touch_then_an_append_then_the_caption_memo(self):
-        # the tick-job variant: a pusher job's parsed_session is the pass's first toucher on a cache HIT (the
+    def test_a_warm_pass_thread_first_touch_then_an_append_then_the_caption_memo(self):
+        # the index-tier variant: a pass thread's parsed_session is the pass's first toucher on a cache HIT (the
         # turn open), the final record lands, then tasks_for. The frozen world (turn open) is what the memo
-        # holds, under the frozen key; the next pass sees the ended turn whole.
+        # holds, under the frozen key; the next pass sees the ended turn whole. (A pusher tick job's touch is
+        # not this case: it is not a pass thread and pins nothing, see the two tests below.)
         warm = jd.parsed_session(SID, [str(self.path)], T0 + 100)     # frameless: fills the cache, turn open
         self.assertTrue(jd.begin_pass_frame())
         self.assertIs(jd.parsed_session(SID, [str(self.path)], T0 + 100), warm, "premise: a cache hit pins")
@@ -399,6 +401,60 @@ class PassFrame(unittest.TestCase):
         jd.end_pass_frame(True)
         v2 = jd.tasks_for(SID, str(self.path), [str(self.path)], T0 + 300)
         self.assertTrue(self._ended_work_tasks(v2), "the next pass captions the ended turn: nothing dropped")
+
+    def _elsewhere(self, fn, *a):
+        """Run fn on a fresh plain thread (the kernel's pusher, say): no pass mark, whatever the frame's state."""
+        out, err = [], []
+
+        def run():
+            try:
+                out.append(fn(*a))
+            except BaseException as e:               # surfaced on the test thread, never swallowed by the worker
+                err.append(e)
+        t = threading.Thread(target=run, name="pusher")
+        t.start(); t.join(10)
+        self.assertFalse(t.is_alive(), "the thread finished")
+        if err:
+            raise err[0]
+        return out[0]
+
+    def test_a_thread_outside_the_pass_reads_live_and_pins_nothing(self):
+        # the pin is scoped to PASS THREADS (review find, 2026-09-08): the frame is a module global, so before
+        # this a pusher tick job's first touch, warm or cold, pinned that job to the pass-start world for as
+        # long as the tiers ran, model calls included. A thread that neither opened nor joined the frame nor
+        # runs in a judge pool sees no frame: it reads the live file at every call and leaves no pin behind.
+        warm = jd.parsed_session(SID, [str(self.path)], T0 + 100)     # frameless: fills the cache, turn open
+        self.assertTrue(jd.begin_pass_frame())
+        self.assertIs(jd._pass_frame(), jd._frame, "the opener is a pass thread")
+        self.assertIsNone(self._elsewhere(jd._pass_frame), "a plain thread is not")
+        self.assertIs(self._elsewhere(jd.parsed_session, SID, [str(self.path)], T0 + 100), warm,
+                      "a cache hit from outside the pass answers the cached parse...")
+        self.assertNotIn(SID, jd._frame["parses"], "...and pins nothing")
+        self._append(aline(T0 + 60, "All done: shipped and verified.", "a2", "a1", stop="end_turn"))
+        live = self._elsewhere(jd.parsed_session, SID, [str(self.path)], T0 + 100)
+        self.assertTrue(live["turns"][-1]["ended"], "outside the pass the mid-pass append shows through")
+        self.assertNotIn(SID, jd._frame["parses"], "still nothing pinned")
+        pinned = jd.parsed_session(SID, [str(self.path)], T0 + 100)   # the pass thread's own first touch
+        self.assertIs(jd._frame["parses"].get(SID), pinned, "the pass thread pins (the live parse the cache now holds)")
+        self.assertIs(pinned, live)
+        jd.end_pass_frame(True)
+        self.assertIsNone(jd._pass_frame(), "the end unmarks the caller")
+
+    def test_a_pool_worker_is_a_pass_thread_and_a_joiner_too(self):
+        # the tiers fan their per-session work through this module's pools; a worker pins into the frame like
+        # the tier thread that submitted it (the _TimedPool mark), and a thread that JOINS the frame
+        # (begin_pass_frame answering False: run_index and run_triage under the kernel producer) is a pass
+        # thread from then on
+        self.assertTrue(self._elsewhere(jd.begin_pass_frame), "the producer's thread opens the frame")
+        self.assertIsNone(jd._pass_frame(), "this thread has not joined: not a pass thread yet")
+        with jd.ThreadPoolExecutor(max_workers=1) as ex:
+            got = ex.submit(jd.parsed_session, SID, [str(self.path)], T0 + 100).result()
+            self.assertIs(jd._frame["parses"].get(SID), got, "a pool worker's touch pins")
+            self.assertIs(ex.submit(jd._pass_frame).result(), jd._frame)
+        self.assertFalse(jd.begin_pass_frame(), "this thread joins the open frame")
+        self.assertIs(jd._pass_frame(), jd._frame, "a joiner is a pass thread")
+        self.assertIs(jd.parsed_session(SID, [str(self.path)], T0 + 100), got, "and reads the pinned world")
+        jd.end_pass_frame(True)
 
     def test_tier_entries_and_producer_are_frame_wrapped(self):
         jsrc = open(jd.__file__).read()

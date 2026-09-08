@@ -358,15 +358,17 @@ class ReadFaultCas(unittest.TestCase):
         self.assertEqual(self._file().read_bytes(), before,
                          "the publish did not go ahead over bytes it failed to compare against")
 
-    def test_a_raise_inside_the_cas_loop_leaves_the_object_base_less(self):
-        # the documented window (save_goals' docstring, 2026-09-06): the base is popped before the CAS loop
-        # and re-stamped only after the rename, so a raise between the two leaves the object without a base
-        # and its next save unconditional, as every save was before the re-stamp. The read-fault cases
-        # above raise inside _matches_disk, BEFORE the pop, so they do not reach this window; here the
-        # revision read inside the loop is what fails
+    def test_a_raise_inside_the_cas_loop_keeps_the_object_cas_protected(self):
+        # the window save_goals' docstring left documented on 2026-09-06 (the base popped before the CAS loop,
+        # re-stamped only after the rename, so a raise between the two left the object base-less and its next
+        # save unconditional) is closed (review find, 2026-09-08): when the publish did not happen the object
+        # keeps the base it was loaded at, so the holder's retry is CAS-protected too. The read-fault cases
+        # above raise inside _matches_disk, BEFORE the pop; here the revision read inside the loop fails, then
+        # the rename itself, and then a retry meets a concurrent publish
         self._seed()
         before = self._file().read_bytes()
         s = jd.load_goals(self.FSID)
+        base = s["_baseRev"]
         jd.record_verdict(s, s["nodes"][self._gid()], "planner", "done", T0 + 30, why="shipped")
         real = jd._disk_rev
 
@@ -378,8 +380,26 @@ class ReadFaultCas(unittest.TestCase):
                 jd.save_goals(self.FSID, s)
         finally:
             jd._disk_rev = real
-        self.assertNotIn("_baseRev", s, "popped before the loop, and the raise came before the re-stamp")
+        self.assertEqual(s.get("_baseRev"), base, "a raise inside the loop: the object keeps the base it was loaded at")
         self.assertEqual(self._file().read_bytes(), before, "nothing was published")
+
+        def no_rename(path, target):
+            raise OSError(errno.EIO, "Input/output error", str(target))
+        with mock.patch.object(Path, "rename", no_rename):
+            with self.assertRaises(OSError):
+                jd.save_goals(self.FSID, s)
+        self.assertEqual(s.get("_baseRev"), base, "a raise at the rename: the base is restored too")
+        self.assertEqual(self._file().read_bytes(), before, "nothing was published")
+        other = jd.load_goals(self.FSID)             # a concurrent writer publishes between the failure and the retry
+        jd.apply_plan(other, "s2", T0 + 40, [{"do": "mint", "why": "x", "text": "Their new goal"}],
+                      jd.open_menu(other))
+        jd.save_goals(self.FSID, other)
+        jd.save_goals(self.FSID, s)                  # the retry: CAS-protected, so it rebases instead of stomping
+        after = jd.load_goals(self.FSID)
+        self.assertIn("%s:g2" % self.FSID, after["nodes"], "the other writer's node survives the retried save")
+        kinds = {(e.get("src"), e.get("kind")) for e in after["nodes"][self._gid()].get("log") or []}
+        self.assertIn(("planner", "done"), kinds, "and our verdict landed")
+        self.assertEqual(s.get("_baseRev"), after["rev"], "the retry re-stamped the written revision as the base")
 
     def test_a_file_corrupted_after_load_is_not_overwritten_by_the_save(self):
         """The save path never quarantines (that is load's job, after the evidence is preserved): a store

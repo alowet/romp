@@ -472,8 +472,17 @@ permission/API-error floors: one interrupt at a time, the present event first.
   store-unwritable: a goals file whose publish failed under a user gesture,
   store-quarantined: a goals file whose bytes did not parse, moved aside,
   frozen-store-write: a read-only site wrote to the shared store view, naming
-  the site, after which the shared cache is off for the process, and
-  frozen-store-save: a shared store view was handed to `save_goals`, refused).
+  the site, after which the shared cache is off for the process,
+  frozen-store-save: a shared store view was handed to `save_goals`, refused,
+  unroll-heal: a top left rolled up with settle rows and no done in its
+  diary, given one reopen row so it can be judged again, gate-stamp: the
+  evidence gate could not write a tier's stamp after a complete run, so the
+  session stays due, and the seven `*-unreadable` kinds of the gate's side
+  files, states-unreadable, cleared-unreadable, stall-unreadable,
+  captions-unreadable, episodes-unreadable, marker-unreadable and
+  archive-unreadable: a file the gate stat'd into a tier's signature exists
+  and could not be read or parsed by the stage, so the run is marked
+  incomplete and stamps nothing, one row per failure episode).
   A file that does not parse is never deleted: it is moved beside its path as
   `<file>.corrupt-<utc stamp>` (a `-n` suffix when two land in the same second)
   before a fresh one is written, so the bytes survive for inspection, and the
