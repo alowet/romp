@@ -8767,6 +8767,29 @@ class SdkBackend:
             return a
         return "key" if self.work_key_configured else "login"
 
+    def sid_for_name(self, name: str) -> str:
+        """The sid of the ONE alive session (not a comment thread) whose reg carries `name`, else "".
+        The regs are this backend's durable record of its sessions, so a name resolves here without
+        the live set; two alive regs with the same name resolve to nothing — a guess would mail the
+        wrong session."""
+        name = str(name or "")
+        if not name:
+            return ""
+        hits = [str(reg.get("sid")) for reg in list_regs(self.state_dir)
+                if reg.get("alive") and not reg.get("threadOf") and reg.get("name") == name and reg.get("sid")]
+        return hits[0] if len(hits) == 1 else ""
+
+    def end_marker(self, sid: str):
+        """What this backend's own DURABLE record says about `sid`, for a caller whose send it just
+        refused — never a liveness probe. True: the reg is present and says alive=false, the explicit
+        end marker written at session end. False: the reg says alive (the refusal was something else;
+        the caller retries). None: no readable reg — absent, or unreadable right now, which one read
+        cannot tell apart; the caller counts such reads, never decides from one."""
+        reg = read_reg(self.state_dir, sid)
+        if not reg:
+            return None
+        return not bool(reg.get("alive"))
+
     def owns(self, sid: str) -> bool:
         """Whether this backend has a registry entry for `sid`. Memoized on the reg file's (mtime, size):
         Sessions.backend_for asks this for every session in every pusher tick job — 130+ reg opens and

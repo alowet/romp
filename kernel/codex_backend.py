@@ -707,6 +707,17 @@ class CodexBackend:
         return (c or "").strip() if isinstance(c, str) else ""
 
     # ── liveness / identity ──────────────────────────────────────────────────────────────────────
+    def end_marker(self, sid):
+        """What this backend's own record says about `sid` after it refused a send — never a liveness
+        probe: True when the session is marked dead (the end marker set when its client dies or the
+        session is ended), None when it holds no session by that id, False when the session stands
+        (the refusal was something else; the caller retries)."""
+        s = self._session(sid)
+        if not s:
+            return None
+        with s.lock:
+            return bool(s.dead)
+
     def owns(self, sid):
         s = self._session(sid)
         if not s:
