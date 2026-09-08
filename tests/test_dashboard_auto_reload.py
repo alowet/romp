@@ -273,6 +273,31 @@ out({ held: held, after: state() });""")
         self.assertEqual(s["held"]["waiting"], "sends")
         self.assertEqual(s["after"]["reloads"], 1, "the flush is the ending event")
 
+    def test_a_held_reload_wears_a_face_once_per_hold_and_never_for_a_gesture(self):
+        # T272 follow-up (the manager's review): nothing displayed the core's `waiting`, so a reload held by a pane's
+        # reason (an upload in flight) sat invisible. The `held` hook fires once per owed request and reason — the shell
+        # files a notification-center line, a standalone pane raises its bar — and never for a momentary gesture hold.
+        s = run_core("""
+var R = window.__rompReload; var held = []; R.held = function (b, o) { held.push([b, o && o.reason]); };
+var busyReason = "upload";
+window.__rompPaneBusy = function () { return busyReason; };
+R.noteVersion({ boot: "2.2" });                       // owed, held on the pane's upload
+R.ended(); await tick(); R.ended(); await tick();     // re-asks while the same hold stands: no second line
+busyReason = "held-send"; R.ended(); await tick();    // the reason changed: one line for it
+busyReason = ""; R.ended(); await tick();             // idle: fires
+out({ held: held, reloads: RELOADS, waiting: R.waiting });""")
+        self.assertEqual(s["held"], [["upload", "restart"], ["held-send", "restart"]], "once per hold reason, with the owed request")
+        self.assertEqual(s["reloads"], 1)
+        s2 = run_core("""
+var R = window.__rompReload; var held = []; R.held = function (b) { held.push(b); };
+emit("pointerdown"); R.noteVersion({ boot: "2.2" });   // a held pointer: a gesture hold, no line
+var during = state();
+emit("pointerup"); await tick();
+out({ held: held, during: during, reloads: RELOADS });""")
+        self.assertEqual(s2["during"]["waiting"], "pointer")
+        self.assertEqual(s2["held"], ["pointer"], "the hook is told every hold; the shell's line filters gestures out (heldReloadText)")
+        self.assertEqual(s2["reloads"], 1)
+
     def test_a_touch_pan_holds_from_pointercancel_until_the_finger_lifts(self):
         s = run_core("""
 var R = window.__rompReload;
@@ -364,6 +389,17 @@ class ReloadWiringPinned(unittest.TestCase):
         self.assertIn("if(m.build){if(RL)RL.request('build','');else{buildStale=true;show(BUILDMSG);}}", js)
         self.assertIn("if(m&&m.romp==='wsFresh'){connStale=false;if(buildStale)show(BUILDMSG);else box.classList.remove('show');}", js,
                       "the CONNECTION prompt for a plain reconnect is untouched")
+
+    def test_a_held_reload_is_told_to_the_notification_center_and_to_a_standalone_panes_bar(self):
+        # the shell's stale script installs the `held` hook: the line names what the reload waits for (an upload, a held
+        # send, queued sends) and skips momentary gesture holds; a standalone pane (no shell) raises its own bar
+        js = km._STALE_JS
+        self.assertIn("RL.held=function(b){var t=(b==='upload'?'The dashboard will reload once the upload in progress finishes.'", js)
+        self.assertIn("if(t&&window.__rompNotify)window.__rompNotify('reload',t);", js)
+        shim = km._shim("chat", 7) if callable(getattr(km, "_shim", None)) else ""
+        self.assertIn("window.__rompReload.held=function(b){var t=(b==='upload'?", shim)
+        self.assertIn("if(t)selfBar(t,'held');", shim)
+        self.assertIn("!window.__rompReload.inShell()", shim, "only a standalone pane raises its own bar; in the shell the center speaks")
 
     def test_a_remote_kernels_restart_or_bundle_never_reaches_the_core(self):
         fed = open(os.path.join(ROOT, "ui", "webview", "federation.ts")).read()
