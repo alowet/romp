@@ -8,10 +8,12 @@ gitBranch derivation — into `_push`'s single outer try, which logged 'push bui
 sending ANY session to ANY client. Every cycle, for every session, until someone fixed that one file
 by hand. `_git_branch` and `_repo_file_index` closed their own reads with the same OSError-only clause.
 
-Now all three treat an undecodable file the way an unreadable one is treated (no branch, no file
-index), and the resolver names the bad file on stderr ONCE per fault episode: a registry keyed on the
-path, cleared when the file reads again, so the operator learns which file to fix instead of staring
-at a silent blank.
+Now the resolver reads the pointer the way git does, as BYTES decoded by the filesystem's own rule
+(review find, 2026-09-08: a gitdir path holding a non-UTF-8 byte is a valid worktree, not a torn file,
+and the text-mode read misreported it), and faults only when the gitdir it names has no HEAD. A fault
+is no branch and no file index, named ONCE per episode on stderr AND as a dashboard bell row: a
+locked registry keyed on the path, cleared when the pointer resolves again, so the operator learns
+which file to fix instead of staring at a silent blank.
 
 Synthetic only: throwaway git repos with fixture identities, placeholder sids, hostname TESTHOST."""
 import contextlib
@@ -19,7 +21,9 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
@@ -91,6 +95,12 @@ def _reset_caches():
     faults = getattr(km, "_git_file_faults", None)      # absent on the pre-fix kernel: the raise is the finding
     if faults is not None:
         faults.clear()
+    del km._SYNC_NOTICES[:]                             # the dashboard bell ring the fault also reaches
+
+
+def _bell():
+    """The dashboard bell rows filed so far (the sync-notice ring the feed payload carries)."""
+    return list(km._SYNC_NOTICES)
 
 
 @contextlib.contextmanager
@@ -116,17 +126,28 @@ class Resolver(unittest.TestCase):
             lines = err.getvalue().splitlines()
             self.assertEqual(len(lines), 1, "exactly one stderr line for the fault: %r" % lines)
             self.assertIn(dotgit, lines[0], "the line names the file the operator has to fix")
+            # the fault is what git itself trips on: the gitdir the pointer names has no HEAD. The bytes
+            # decode fine (git wrote and reads them raw); it is the TARGET that is not there.
+            self.assertIn("FileNotFoundError", lines[0], "the fault names the missing HEAD, not a decode: %r" % lines)
+            # ...and the dashboard hears it too (review find, 2026-09-08): one bell row per episode, so the
+            # user is not left reading the kernel log to learn why a session shows no branch
+            rows = _bell()
+            self.assertEqual(len(rows), 1, "one bell row for the fault: %r" % rows)
+            self.assertIn(dotgit, rows[0]["text"], "the row names the file, like the stderr line")
+            self.assertFalse(rows[0]["ok"], "a fault, not a sync that landed")
             # a second derivation adds nothing: the episode is already on record
             with _stderr() as err2:
                 self.assertEqual(km._git_branch(str(cwd)), "")
                 self.assertEqual(km._git_head_file(str(cwd)), "")
             self.assertEqual(err2.getvalue(), "", "one fault episode is reported once")
+            self.assertEqual(len(_bell()), 1, "one fault episode is one bell row")
             # the repair — a pointer file that reads — ends the episode without a kernel restart
             repo = _mk_repo(td)
             (cwd / ".git").write_text("gitdir: %s\n" % (repo / ".git"))
             with _stderr() as err3:
                 self.assertEqual(km._git_branch(str(cwd)), "main", "a repaired pointer file resolves again")
             self.assertEqual(err3.getvalue(), "", "a clean read is not news")
+            self.assertEqual(len(_bell()), 1, "...on the bell either")
             self.assertNotIn(dotgit, km._git_file_faults, "a clean read ends the fault episode")
             # ...so the same file going bad again is a NEW episode, reported anew. The resolved path is
             # cached on purpose (a live worktree's pointer never moves), so the re-read a restart would
@@ -138,13 +159,14 @@ class Resolver(unittest.TestCase):
                 self.assertEqual(km._git_branch(str(cwd)), "")
             self.assertEqual(len(err4.getvalue().splitlines()), 1, "a new episode → one new line")
             self.assertIn(dotgit, err4.getvalue())
+            self.assertEqual(len(_bell()), 2, "a new episode rings once more")
 
     @unittest.skipIf(os.geteuid() == 0, "root reads through chmod 0; the EACCES step needs a real permission fault")
     def test_a_different_fault_on_the_same_file_is_a_new_episode(self):
         # a presence-keyed registry would keep the FIRST fault on record: a pointer file that goes EACCES,
-        # then (chmod) readable but still undecodable, would log the PermissionError once and never the
-        # decode fault until a clean read. The episode is the fault TEXT, as the judge's store-fault
-        # boundary defines it — so the operator sees the fault that is CURRENTLY in the way.
+        # then (chmod) readable but naming a gitdir that has no HEAD, would log the PermissionError once and
+        # never the dangling-pointer fault until a clean read. The episode is the fault TEXT, as the judge's
+        # store-fault boundary defines it — so the operator sees the fault that is CURRENTLY in the way.
         with tempfile.TemporaryDirectory() as td:
             cwd = _torn_cwd(td)
             dotgit = cwd / ".git"
@@ -162,9 +184,75 @@ class Resolver(unittest.TestCase):
                 self.assertEqual(km._git_branch(str(cwd)), "")
                 self.assertEqual(km._git_branch(str(cwd)), "")
             lines2 = err2.getvalue().splitlines()
-            self.assertEqual(len(lines2), 1, "readable but undecodable is a NEW episode, once: %r" % lines2)
-            self.assertIn("UnicodeDecodeError", lines2[0])
+            self.assertEqual(len(lines2), 1, "readable but dangling is a NEW episode, once: %r" % lines2)
+            self.assertIn("FileNotFoundError", lines2[0])
             self.assertIn(str(dotgit), lines2[0])
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and os.fsencode(os.fsdecode(b"caf\xe9")) == b"caf\xe9",
+                         "a non-UTF-8 directory name needs Linux (APFS refuses one) and a surrogateescape filesystem codec")
+    def test_a_pointer_whose_gitdir_path_is_not_utf8_resolves_like_git_does(self):
+        # git writes the gitdir path RAW and follows it raw, so a worktree whose main repository sits under a
+        # directory named in Latin-1 is a valid, fully readable repository -- and a path component is the
+        # most plausible way a non-UTF-8 byte reaches a pointer file at all. The text-mode read faulted on
+        # it (review find, 2026-09-08): a false stderr line, no HEAD path cached (so every rebuild forked
+        # `git rev-parse`, the burn the cache exists to stop), and a file-index key with no git-index mtime.
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / os.fsdecode(b"caf\xe9")
+            parent.mkdir()
+            repo = _mk_repo(parent)
+            wt = Path(td) / "wt"                                    # a clean cwd, as the registry carries it
+            _git("worktree", "add", "-q", "-b", "feature", str(wt), cwd=repo)
+            self.assertIn(b"\xe9", (wt / ".git").read_bytes(), "premise: git wrote the byte into the pointer")
+            r = subprocess.run(["git", "-C", str(wt), "rev-parse", "--abbrev-ref", "HEAD"],
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, "feature"), "premise: git reads it fine")
+            with _stderr() as err, mock.patch.object(km.subprocess, "run", wraps=km.subprocess.run) as run:
+                hp = km._git_head_file(str(wt))
+                self.assertTrue(hp and os.path.exists(hp), "the HEAD git follows, not '': %r" % hp)
+                self.assertEqual(km._git_branch(str(wt)), "feature")
+                self.assertEqual(km._git_branch(str(wt)), "feature")
+                forks = [c for c in run.call_args_list if "--abbrev-ref" in c.args[0]]
+                self.assertEqual(len(forks), 1, "one fork derives it; the second call rides the HEAD-mtime cache: %r" % forks)
+                idx = km._repo_file_index(str(wt))
+            self.assertEqual(err.getvalue(), "", "nothing is wrong, so nothing is said")
+            self.assertIn("a.txt", idx)
+            self.assertIn(str(wt), km._head_path_cache, "the resolved HEAD path is cached like any worktree's")
+            self.assertIn(str(wt), km._branch_cache)
+            self.assertIsNotNone(km._repo_index_cache[str(wt)][0][0],
+                                 "the listing is keyed on the git index's mtime, so a commit or checkout refreshes it")
+            self.assertEqual(km._git_file_faults, {}, "no episode was opened")
+            self.assertEqual(_bell(), [])
+
+    def test_two_threads_faulting_the_same_file_say_it_once(self):
+        # the pusher and a connect push both run _push, so two threads can fault the same file at once. An
+        # unlocked get-then-set let both see "no episode" and both speak; the check-and-set is ONE step under
+        # a lock now (review find, 2026-09-08). The registry stands in for one whose reads answer, then PARK
+        # until the other thread has read too, so the interleaving the lock forbids (two reads, then two
+        # writes) is forced rather than hoped for: locked, the second thread cannot read until the first has
+        # written, so the rendezvous gives up and the first proceeds alone; unlocked, both read "no episode"
+        # together and both speak.
+        barrier = threading.Barrier(2)
+
+        class Parked(dict):
+            def get(self, key, default=None):
+                val = dict.get(self, key, default)      # read first...
+                try:
+                    barrier.wait(timeout=1.0)           # ...then hold that answer until the other thread has read
+                except threading.BrokenBarrierError:
+                    pass
+                return val
+        with tempfile.TemporaryDirectory() as td:
+            cwd = _torn_cwd(td)
+            dotgit = str(cwd / ".git")
+            with _stderr() as err, mock.patch.object(km, "_git_file_faults", Parked()):
+                threads = [threading.Thread(target=km._git_branch, args=(str(cwd),)) for _ in range(2)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(10)
+            lines = [l for l in err.getvalue().splitlines() if dotgit in l]
+            self.assertEqual(len(lines), 1, "one episode, one line, whichever thread got there first: %r" % lines)
+            self.assertEqual(len([r for r in _bell() if dotgit in r["text"]]), 1, "...and one bell row")
 
     def test_the_callers_backstop_a_raise_from_the_resolver(self):
         # _git_branch and _repo_file_index close their own reads with the same widened clause: even if the
@@ -239,19 +327,24 @@ class PushCycle(unittest.TestCase):
         return str(p)
 
     def _push_once(self, seen=None):
-        """One push to one chat client; `seen` (a list) collects every cwd the pointer-file resolver
-        was asked about, so a test can prove a branch was re-derived rather than served from a cache."""
+        """One push to one chat client; `seen` (a list) collects every OPEN of the torn session's pointer
+        file, so a test can prove the file was re-read rather than the fault served from a cache. A wrapper
+        on the resolver proved only that it was CALLED, which a cached fault satisfies too (review find,
+        2026-09-08); the open is the read."""
         sessions = [{"sid": A, "name": "web", "path": self.paths[A], "anchor": 0, "mtime": NOW},
                     {"sid": B, "name": "api", "path": self.paths[B], "anchor": 0, "mtime": NOW}]
         tmux = {A: _tm(), B: _tm()}
         sent = []
-        real_head = km._git_head_file
+        dotgit = str(self.torn / ".git")
+        real_open = open
 
-        def head(cwd):
-            if seen is not None:
-                seen.append(cwd)
-            return real_head(cwd)
-        with mock.patch.object(km, "_git_head_file", head), \
+        def opened(file, *a, **k):
+            if seen is not None and isinstance(file, str) and file == dotgit:
+                seen.append(file)
+            return real_open(file, *a, **k)
+        # a module-global `open` shadows the builtin for the kernel's functions ONLY (json, subprocess and the
+        # test's own reads keep the real one), and create=True removes it again on exit
+        with mock.patch.object(km, "open", opened, create=True), \
                 mock.patch.object(km, "_sessions", lambda now, window=None, forks=True: list(sessions)), \
                 mock.patch.object(km, "_tmux_sessions", lambda: dict(tmux)), \
                 mock.patch.object(km, "_chat_tab_sessions", lambda now, tm: list(sessions)), \
@@ -280,12 +373,14 @@ class PushCycle(unittest.TestCase):
         self.assertEqual(len(named), 1, "exactly one stderr line names the bad file: %r" % err.splitlines())
         # the next cycle has nothing new to say about a fault already on record. An UNCHANGED push serves
         # the chat from _built_chat / the parse cache and never re-derives the branch, which would keep
-        # this quiet with no registry at all — so those caches are cleared and the resolver is watched:
-        # what this pins is the DEDUPE (the branch IS re-derived, the file re-read, and still no new line).
+        # this quiet with no registry at all — so those caches are cleared and the pointer file's OPENS are
+        # counted: what this pins is the DEDUPE (the file IS re-read, and still no new line). Counting calls
+        # to the resolver was too weak a premise: a fault cached as "no HEAD" is served without a read and
+        # would also log nothing, registry or not (review find, 2026-09-08).
         self._clear_build_state()
         seen = []
         _, err2 = self._push_once(seen)
-        self.assertIn(str(self.torn), seen, "premise: the second push re-derived the torn session's branch")
+        self.assertTrue(seen, "premise: the second push re-READ the torn pointer file (a fault is never cached)")
         self.assertEqual([l for l in err2.splitlines() if str(self.torn / ".git") in l], [],
                          "a second push logs nothing new: %r" % err2.splitlines())
 
