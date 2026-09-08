@@ -781,3 +781,19 @@ test("our own send in the fed gap: the kernel's echo visible AND its held copy i
   const r2 = reconcilePending(frame2, [q]);
   assert.deepEqual([r2.inject, r2.unqueue, r2.echoHide], [[q], [q], [1]]);
 });
+
+test("two identical presses, then one push with the first's echo AND the second's queued copy: each send takes its own kernel copy (fed-gap fix review)", () => {
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
+  const [p1, p2] = press(tail, "x", "x");
+  const frame: TailEvent[] = [...tail, { kind: "user", md: "x", uuid: "echo:x1" }, { kind: "queued", texts: [{ md: "x", qid: "echo:x2", qts: 2 }] }];
+  let r = reconcilePending(frame, [p1, p2]);
+  assert.deepEqual([p1.qid, p2.qid], ["echo:x1", "echo:x2"], "the echo is the first's, the queued copy the second's — never the first's by text");
+  assert.deepEqual([p1.received, p2.received], [true, true]);
+  assert.deepEqual([r.inject, r.unqueue, r.echoHide], [[p1, p2], [p2], [1]], "both drawn by us; the copy hidden for the second, the echo for the first");
+  r = reconcilePending(frame, [p1, p2]);
+  assert.deepEqual([r.inject, r.unqueue, r.echoHide], [[p1, p2], [p2], [1]], "…and the same on the next push: no third bubble");
+  // the first's landing retires the first, and only the first
+  const landed: TailEvent[] = [...tail, { kind: "user", md: "x", uuid: "ux1", qid: "echo:x1" }, { kind: "queued", texts: [{ md: "x", qid: "echo:x2", qts: 2 }] }];
+  r = reconcilePending(landed, [p1, p2]);
+  assert.deepEqual([r.landed.map((l) => l.p), r.keep, r.unqueue], [[p1], [p2], [p2]]);
+});
