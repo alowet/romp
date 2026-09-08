@@ -463,7 +463,15 @@ permission/API-error floors: one interrupt at a time, the present event first.
   `STATE/judge-errors.jsonl` (the row contract above; kinds are parse,
   call, give-up, sweep-cut, cite-miss, rate-limited, task-store, history-unreadable,
   task-key-collision — a duplicated to-do mirror key, reconciled per node
-  and surfaced loudly),
+  and surfaced loudly, store-unreadable: a goals file that cannot be read,
+  filed once per fault episode and ended by the next successful read,
+  store-unwritable: a goals file whose publish failed under a user gesture,
+  and store-quarantined: a goals file whose bytes did not parse, moved aside).
+  A file that does not parse is never deleted: it is moved beside its path as
+  `<file>.corrupt-<utc stamp>` (a `-n` suffix when two land in the same second)
+  before a fresh one is written, so the bytes survive for inspection, and the
+  `*.json` globs that enumerate stores skip it; the same sidecar convention
+  applies to any other state file romp moves aside as unparseable.
   `STATE/judge-auth.json` (the per-session judge-auth-down latch — see
   "Billing" above).
 - Debugging: run the judge's own code against the live store

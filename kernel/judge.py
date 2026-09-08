@@ -844,7 +844,9 @@ def _log_judge_error(judge, fsid, err, note=None, goal=None, seg=None):
              could not be parsed was moved aside to <file>.corrupt-<stamp> and the session started fresh),
              "store-unreadable" (a goals store that cannot be READ — EACCES, EIO — filed once per fault
              episode by load_goals_or_fault; inside a judge pass the raise instead reaches the pass
-             wrapper's "pass-crash" row)
+             wrapper's "pass-crash" row), "store-unwritable" (a goals store that read but whose publish
+             then failed under a user gesture, the save path's own strict read or the write itself; filed
+             once per fault episode by save_goals_or_fault, and the gesture is answered on its socket)
       note   the evidence — reply tail, error message, exception name, or the give-up scope + re-arm
              event. Callers must pass it; an empty note means the caller has nothing at all to show.
       goal   the node id (or list of node ids) the judge was ruling on, when one exists — the feed's
@@ -2971,7 +2973,7 @@ def _guard_nodes(store):
     return store
 
 
-def _quarantine_store(path, reason):
+def _quarantine_store(path, reason, st):
     """Move an unparseable store file ASIDE (never delete it) so the evidence survives the fresh start
     that follows. The sidecar keeps the original name plus `.corrupt-<utc stamp>`, so the `*.json` globs
     that enumerate live stores (the kernel's compaction sweep and pre-pass feed snapshot, the propagate
@@ -2982,8 +2984,19 @@ def _quarantine_store(path, reason):
     file, never once per pass.
 
     No file lock (this codebase takes none), so the rename shares save_goals' vanishingly small window
-    with a concurrent writer that republishes the path between our read and our rename. A source that
-    vanished in that window was already handled by a peer: nothing left to move."""
+    with a concurrent writer that republishes the path between our read and our rename. `st` is the stat
+    the caller took BEFORE the read whose bytes failed: the file is re-stat'ed here and moved only while
+    it is still that very file (same inode, mtime and size). A different file at the path is a peer's
+    atomic publish since our read, and moving it would quarantine their VALID store and start the session
+    fresh over it; a path that vanished was already handled by a peer. Either way nothing of ours is left
+    to move: None, no row, and the caller reads what is there now (review find, 2026-09-08; the same
+    identity check the ledger quarantine wears)."""
+    try:
+        cur = path.stat()
+    except FileNotFoundError:
+        return None
+    if (cur.st_ino, cur.st_mtime_ns, cur.st_size) != (st.st_ino, st.st_mtime_ns, st.st_size):
+        return None
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     aside, n = path.with_name("%s.corrupt-%s" % (path.name, stamp)), 0
     while aside.exists():                            # a second corrupt file in the same second
@@ -3000,7 +3013,7 @@ def _quarantine_store(path, reason):
     return aside
 
 
-def _read_store_json(path, *, quarantine=False):
+def _read_store_json(path, *, quarantine=False, _tries=3):
     """The parsed JSON object at `path`, or None when the file is ABSENT (a session with no store yet).
 
     Every other failure is a fact about the file the caller must not paper over: a read FAULT (EIO,
@@ -3013,29 +3026,33 @@ def _read_store_json(path, *, quarantine=False):
 
     A raised fault is surfaced by whoever owns the pass: every judge pass wrapper files a `pass-crash`
     judge-errors row for that session and moves on to the next, so the fault is logged once per pass
-    rather than once here AND once there."""
+    rather than once here AND once there.
+
+    The stat comes BEFORE the read, so the quarantine can tell whether the file it is about to move is
+    still the one whose bytes failed (see _quarantine_store); when it is not, a peer published meanwhile
+    and THEIR bytes get their own read, bounded by `_tries` (review find, 2026-09-08)."""
     try:
+        st = path.stat()
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
     except UnicodeError as e:
-        if not quarantine:
-            raise
-        _quarantine_store(path, "not UTF-8: %s" % e)
-        return None
-    try:
-        value = json.loads(raw)
-    except ValueError as e:                          # json.JSONDecodeError is a ValueError
-        if not quarantine:
-            raise
-        _quarantine_store(path, "invalid JSON: %s" % e)
-        return None
-    if not isinstance(value, dict):
-        if not quarantine:
-            raise ValueError("%s: top-level JSON value is %s, not an object" % (path, type(value).__name__))
-        _quarantine_store(path, "top-level JSON value is %s, not an object" % type(value).__name__)
-        return None
-    return value
+        bad, reason = e, "not UTF-8: %s" % e
+    else:
+        try:
+            value = json.loads(raw)
+        except ValueError as e:                      # json.JSONDecodeError is a ValueError
+            bad, reason = e, "invalid JSON: %s" % e
+        else:
+            if isinstance(value, dict):
+                return value
+            reason = "top-level JSON value is %s, not an object" % type(value).__name__
+            bad = ValueError("%s: %s" % (path, reason))
+    if not quarantine:
+        raise bad
+    if _quarantine_store(path, reason, st) is not None or _tries <= 1:
+        return None                                  # the bad bytes are preserved aside: a fresh store is legitimate
+    return _read_store_json(path, quarantine=True, _tries=_tries - 1)   # declined: the file changed under us
 
 
 def load_goals(fsid):
@@ -3085,18 +3102,50 @@ def load_goals_or_fault(fsid):
     try:
         store = load_goals(fsid)
     except OSError as e:
-        text = "%s: %s" % (type(e).__name__, e)
-        with _STORE_FAULTS_LOCK:
-            repeat = _STORE_FAULTS.get(fsid) == text
-            _STORE_FAULTS[fsid] = text
-        if not repeat:
-            _log_judge_error("romp", fsid, "store-unreadable",
-                             note="goals store cannot be read; this session's goal-derived work is skipped "
-                                  "until it reads again: %s" % text)
+        _file_store_fault(fsid, e, "store-unreadable",
+                          "goals store cannot be read; this session's goal-derived work is skipped until it "
+                          "reads again")
         return None, e
-    with _STORE_FAULTS_LOCK:
-        _STORE_FAULTS.pop(fsid, None)                # a successful read ends the episode
+    _end_store_fault(fsid)                           # a successful read ends the episode
     return store, None
+
+
+def save_goals_or_fault(fsid, store):
+    """save_goals behind the same per-session boundary, for a USER GESTURE's write: None when the publish
+    landed (or was a no-op), the exception when it did not. The save path reads the file strictly
+    (_matches_disk, _disk_rev, _rebase_onto_disk: a fault or a corrupt file raises so nothing is published
+    over bytes we could not read), and the write itself can fail (a full disk, a directory gone read-only).
+    Either way the gesture's flag did not land and the caller answers the user; left to raise, an OSError
+    out of a WS gesture handler reached the receive loop's catch, which re-raises it to the outer handler,
+    where it is swallowed and the CLIENT DROPPED (`finally: client["alive"] = False`), so the dashboard
+    disconnected without a word (review find, 2026-09-08). Filed once per fault episode as
+    `store-unwritable`, on the same per-sid episode table as the load boundary (the same EACCES met at the
+    load and then at the save is one episode, not two rows); a successful publish ends the episode."""
+    try:
+        save_goals(fsid, store)
+    except (OSError, ValueError) as e:               # UnicodeError is a ValueError; a corrupt file at the save raises one
+        _file_store_fault(fsid, e, "store-unwritable",
+                          "goals store could not be published (the save's own read of the file, or the write "
+                          "itself, failed); the gesture that asked for it was refused and answered")
+        return e
+    _end_store_fault(fsid)
+    return None
+
+
+def _file_store_fault(fsid, e, kind, what):
+    """One judge-errors row per fault EPISODE for `fsid` (see load_goals_or_fault): the first fault with this
+    text files, an identical repeat files nothing, a different text is a new episode."""
+    text = "%s: %s" % (type(e).__name__, e)
+    with _STORE_FAULTS_LOCK:
+        repeat = _STORE_FAULTS.get(fsid) == text
+        _STORE_FAULTS[fsid] = text
+    if not repeat:
+        _log_judge_error("romp", fsid, kind, note="%s: %s" % (what, text))
+
+
+def _end_store_fault(fsid):
+    with _STORE_FAULTS_LOCK:
+        _STORE_FAULTS.pop(fsid, None)
 
 
 def _disk_rev(fsid):

@@ -24578,7 +24578,14 @@ def _mark_nodes_cleared(item_ids, value, src="user", why=None):
         except Exception:
             closed = False
         jd.rollup_status(store, closed)
-        jd.save_goals(sid, store)
+        fault = jd.save_goals_or_fault(sid, store)
+        if fault is not None:
+            skipped[sid] = str(fault)                  # the store read a moment ago and faults at its SAVE (the
+            continue                                   # save path's own strict reads, or the publish itself): the
+        #                                                flag did not land, and the caller answers the user exactly
+        #                                                as for a load fault. Left to raise, an OSError out of a WS
+        #                                                gesture reached the receive loop, which re-raises it and
+        #                                                DROPS the client (review find, 2026-09-08)
         if not value:
             # A restore is a USER GESTURE and must never wait out a judge pass (the same rule as a card
             # reply, the user 2026-07-21/23): punch it through the pre-pass snapshot and push now. The
@@ -24750,23 +24757,27 @@ def _gesture_store_refusal(client, gesture, skipped):
     next Undo retries it (_undo_clear keeps those ids the newest batch). `text` carries the whole
     account; there is no `copy` key, which by contract is the USER'S undelivered text (the feed renders
     it as a "Copy my text" button and folds it into the bell entry). The skip itself is already a
-    `store-unreadable` judge-errors row (jd.load_goals_or_fault); this is the user's copy."""
+    judge-errors row: `store-unreadable` when the load faulted (jd.load_goals_or_fault), `store-unwritable`
+    when the store read and its publish then faulted (jd.save_goals_or_fault: the save path's strict reads,
+    or the write itself), so the prose says "read or write" and lets the fault text name which; this is
+    the user's copy (the save shape added on a review find, 2026-09-08: left to raise, it dropped the
+    dashboard's socket without a word)."""
     for sid, fault in (skipped or {}).items():
         who = _name_of(sid) or sid[:8]
         if gesture == "undo":
             title = "That undo did not land for %s" % who
-            text = ("Its cards were not restored: romp could not read that session's goals file (%s). "
-                    "They are still held for you; press Undo again once the file reads. The other sessions "
+            text = ("Its cards were not restored: romp could not read or write that session's goals file (%s). "
+                    "They are still held for you; press Undo again once it can. The other sessions "
                     "were not affected." % fault)
         elif gesture == "drop":
             title = "That sub-goal was not cleared for %s" % who
-            text = ("romp could not read that session's goals file (%s), so nothing changed there and the "
-                    "row is as it was. Try it again once the file reads." % fault)
+            text = ("romp could not read or write that session's goals file (%s), so nothing changed there and "
+                    "the row is as it was. Try it again once it can." % fault)
         else:                                          # "clear": one card, or every card of one session
             title = "That clear did not fully land for %s" % who
             text = ("What you cleared there is off the board, but the clear was not written into that "
-                    "session's goals file, which romp could not read (%s); nothing else changed there, and "
-                    "the other sessions were not affected." % fault)
+                    "session's goals file, which romp could not read or write (%s); nothing else changed there, "
+                    "and the other sessions were not affected." % fault)
         try:
             client["send"](json.dumps({"type": "err", "sid": sid, "title": title, "text": text}))
         except Exception:
@@ -24830,13 +24841,18 @@ def _undo_clear():
     late = _mark_nodes_cleared(restored, False)       # so this finds the nodes → un-set the durable flag → real status
     if late:
         # The store read fine (or held nothing archived) a moment ago and faults NOW, after the undo row
-        # landed: the node is restored flag-cleared, which build_feed hides exactly like the clear did, and
-        # the modal has no op that could reach it (resolve and clear only). Re-journal the clear for those
-        # ids so the batch stays owed — the very next Undo restores them once the file reads again.
+        # landed (at the flag step's read, or at its publish): the node is restored flag-cleared, which
+        # build_feed hides exactly like the clear did, and the modal has no op that could reach it (resolve
+        # and clear only). Re-journal the clear for those ids so the batch stays owed: the very next Undo
+        # restores them once the file reads again. ONE stamp for the whole re-journal, as _clear_all takes
+        # one before its loop: a batch IS its exact timestamp (_cleared_ids keys on equality), so a stamp
+        # per row split a two-card batch into two one-card batches and each further Undo brought back one
+        # card, against the promise that the next Undo restores exactly them (review find, 2026-09-08).
+        t = time.time()
         with (jd.STATE / "cleared.jsonl").open("a") as f:
             for iid in restored:
                 if iid.rsplit(":", 1)[0] in late:
-                    f.write(json.dumps({"id": iid, "t": time.time(), "op": "clear"}) + "\n")
+                    f.write(json.dumps({"id": iid, "t": t, "op": "clear"}) + "\n")
         skipped.update(late)
     return skipped                                    # {sid: fault} for sessions whose store could not be read
 
@@ -24991,7 +25007,13 @@ def _restore_goal_archive(item_ids):
                     store.setdefault("rewindRestored", {})[nid] = max(rt, int(sv))
             # (Sticky completion restore lives in _mark_nodes_cleared now — 2026-07-07: the settle event must
             # land AFTER the undo reopen it records, or the fold consumes it and the card returns to Working.)
-            jd.save_goals(sid, store)
+            fault = jd.save_goals_or_fault(sid, store)
+            if fault is not None:
+                skipped[sid] = str(fault)              # the publish did not land (a save-path read fault, or the
+                continue                               # write itself), so the archive is NOT saved: it keeps these
+            #                                            nodes for the next Undo, whose restore journal row replays
+            #                                            idempotently; the caller answers the user (review find,
+            #                                            2026-09-08: left to raise, this dropped the WS client)
             jd.save_goal_archive(sid, arch)
             _compact_seen.pop(sid, None)               # force a re-stat next sweep (we just changed the live file)
     return skipped

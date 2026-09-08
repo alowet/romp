@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin")
 # Hermetic state BEFORE the loads — they resolve their state root at import time, and only
@@ -207,6 +208,34 @@ class UnparseableStore(unittest.TestCase):
                 self.assertEqual(len(held), 1, "the bytes survive verbatim in exactly one sidecar")
                 self.assertIn(reason, err.getvalue())
         self.assertEqual([r["err"] for r in self._error_rows()], ["store-quarantined"] * 3)
+
+    def test_a_store_republished_between_the_read_and_the_rename_is_left_alone(self):
+        """No lock guards the rename, so a peer can publish a VALID store to the path between the read that
+        failed to parse and the move aside; moving what is there now would quarantine the peer's good store
+        and start the session fresh over it. The quarantine re-checks the file's identity (inode, mtime,
+        size) against the stat taken before the read and declines when it changed; the reader then reads
+        what is there now (review find, 2026-09-08)."""
+        self._seed()
+        good = self._file().read_bytes()
+        self._file().write_text("{not json")
+        orig, fired, test = Path.read_text, [], self
+
+        def read_then_a_peer_publishes(p, *a, **kw):
+            raw = orig(p, *a, **kw)
+            if p == test._file() and not fired:          # the first read sees the bad bytes; a peer's atomic
+                fired.append(1)                          # publish then replaces the file before our rename
+                tmp = p.with_name(p.name + ".peer")
+                tmp.write_bytes(good)
+                os.replace(tmp, p)
+            return raw
+        err = io.StringIO()
+        with mock.patch.object(Path, "read_text", read_then_a_peer_publishes), contextlib.redirect_stderr(err):
+            s = jd.load_goals(self.QSID)
+        self.assertEqual(self._sidecars(), [], "the peer's valid store was not moved aside")
+        self.assertEqual(self._file().read_bytes(), good, "and sits untouched at the path")
+        self.assertEqual(self._error_rows(), [], "no row: nothing was quarantined")
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(len(s["nodes"]), 1, "the reader returns what is there now, not a fresh store")
 
     def test_an_absent_file_is_a_fresh_store_with_no_quarantine_and_no_error(self):
         self.assertFalse(self._file().exists())

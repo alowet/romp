@@ -15,6 +15,7 @@ made it.
 SYNTHETIC fixtures only: private synthetic sids, the notes-api demo world (`web` / `api` / `tests`),
 message ids stamped TESTHOST; the per-sid override journals are cleaned in tearDown."""
 import errno
+import itertools
 import json
 import os
 import tempfile
@@ -289,6 +290,23 @@ class InterruptLiftBoundary(_World):
         self.assertEqual(jd.load_goals(A)["status"][gid], "working", "the next healthy tick lifts the block")
         self.assertIsNone(km._intr_blocked(A), "and spends the marker")
 
+    def test_a_fault_at_the_stop_tick_records_no_block_and_the_next_healthy_tick_does(self):
+        """The BLOCK half of the tick meets the fault too: a genuine stop whose store cannot be read records
+        nothing, writes nothing and marks nothing (a marker with no block behind it would be a claim with no
+        evidence), files the session's one `store-unreadable` row, and the next healthy tick blocks the focus
+        goal as if the fault had never been. A bare load_goals here raised out of the whole tick, which has
+        no per-session catch around this write (review find, 2026-09-08)."""
+        gid = A + ":g1"
+        before = self.a_file.read_bytes()
+        with _fault_on(self.a_file):
+            km._interrupt_block_tick(NOW, self.tmux)
+        self.assertIsNone(km._intr_blocked(A), "no marker: nothing was blocked")
+        self.assertEqual(self.a_file.read_bytes(), before, "nothing was written to a store we could not read")
+        self.assertEqual([r["fsid"] for r in self._rows("store-unreadable")], [A], "and the fault is filed once")
+        km._interrupt_block_tick(NOW, self.tmux)          # the fault cleared
+        self.assertEqual(km._intr_blocked(A), gid, "the next healthy tick blocks the focus goal and marks it")
+        self.assertEqual(jd.load_goals(A)["status"][gid], "blocked")
+
     def _append(self, recs):
         with open(self.tpath, "a") as f:
             for r in recs:
@@ -323,6 +341,56 @@ class InterruptLiftBoundary(_World):
         km._interrupt_block_tick(NOW, self.tmux)              # re-engaged, readable: the lift lands
         self.assertEqual(jd.load_goals(A)["status"][gid], "working", "romp's own block is lifted")
         self.assertIsNone(km._intr_blocked(A), "and the marker is spent")
+
+
+class NudgeTickBoundary(_World):
+    """The auto-nudge tick's per-session slice reads the store once every session-level gate has passed:
+    a fault there fires nothing, stamps nothing and files the session's one row. A bare load_goals raised
+    out of the slice into the tick's per-session catch: one stderr line per tick, no row, and every nudge
+    module still passed (review find, 2026-09-08)."""
+
+    def setUp(self):
+        super().setUp()
+        uid = "11111111-2222-3333-4444-555555555555"
+        turns = [{"id": "t1", "t": NOW - 600, "end": NOW - 540, "ended": True, "trigger": {"uuid": uid},
+                  "atoms": [{"uuid": uid, "type": "user", "author": "human", "t": NOW - 600}]}]
+        self.sent = []
+        test = self
+
+        class FakeBackend:
+            def send(self, sid, body):
+                test.sent.append((sid, body))
+        for p in (mock.patch.object(km, "_session_flag", lambda sid, flag: False),
+                  mock.patch.object(km, "_compacting_now", lambda sid: False),
+                  mock.patch.object(km, "_api_error", lambda path: None),
+                  mock.patch.object(km, "_session_working", lambda turns: False),
+                  mock.patch.object(km, "_interrupt_suppresses_nudge", lambda turns, sid="": False),
+                  mock.patch.object(km, "_backend_queued", lambda sid: False),
+                  mock.patch.object(km, "_backend_rewind_pending", lambda sid: False),
+                  mock.patch.object(km, "_last_state", lambda sid: ("", 0)),
+                  mock.patch.object(km, "_session_awaiting", lambda *a, **k: False),
+                  # the first gate AFTER the read, held shut: a healthy slice stops right there, so the one
+                  # question here (does the read stay inside the boundary?) has one answer either way
+                  mock.patch.object(km, "_closer_settled", lambda *a: False),
+                  mock.patch.object(km, "_pending_ops", {}),
+                  mock.patch.object(jd, "parsed_session", lambda sid, paths, now: {"turns": turns}),
+                  mock.patch.object(km.Sessions, "backend_for", staticmethod(lambda sid: FakeBackend()))):
+            p.start()
+            self.addCleanup(p.stop)
+        km._autonudge_cache.clear()
+
+    def _slice(self):
+        return km._auto_nudge_session({"sid": A, "path": "/nonexistent/%s.jsonl" % A}, NOW, {}, {}, {})
+
+    def test_a_faulting_store_fires_nothing_and_files_one_row(self):
+        self.assertEqual(self._slice(), "closer-unsettled", "premise: every gate before the read passes; the read runs")
+        before = self.a_file.read_bytes()
+        with _fault_on(self.a_file):
+            self.assertIsNone(self._slice(), "the fault stands the slice down")
+        self.assertEqual(self.sent, [], "nothing was sent to the session")
+        self.assertEqual(self.a_file.read_bytes(), before, "nothing was written to a store we could not read")
+        self.assertEqual([r["fsid"] for r in self._rows("store-unreadable")], [A], "and the fault is filed once")
+        self.assertEqual(self._slice(), "closer-unsettled", "the next tick reads again")
 
 
 class TriagePassBoundary(_World):
@@ -692,6 +760,86 @@ class GestureRefusal(_World):
         self.assertFalse(jd.load_goals(A)["nodes"][A + ":g1"]["cleared"], "the next Undo un-clears it")
         self.assertEqual(km._cleared_ids(), {})
         self.assertIn(A + ":g1", self._feed_rows(A))
+
+    def test_a_re_journaled_batch_shares_one_timestamp_so_the_next_undo_restores_all_of_it(self):
+        """Two cards of one session cleared in ONE batch, undone while the store faults at the flag step: the
+        re-journaled clear rows must carry one shared `t`, because a batch IS its exact timestamp (_cleared_ids
+        and _undo_clear key on equality; _clear_all stamps one `t` before its loop for that reason). Stamped
+        per row, the two cards split into two one-card batches and each further Undo brought back one card,
+        against the promise that the next Undo restores exactly them (review find, 2026-09-08). time.time is
+        a counter for the faulting undo, so two stamps taken in one loop can never happen to coincide."""
+        gid, g3 = A + ":g1", A + ":g3"
+        st = _store(A, "the first card", cleared=True)
+        st["nodes"][g3] = dict(st["nodes"][gid], id=g3, text="the second card")
+        st["status"] = {gid: "cleared", g3: "cleared"}
+        self._write(A, st)
+        with (jd.STATE / "cleared.jsonl").open("a") as f:
+            for iid in (gid, g3):
+                f.write(json.dumps({"id": iid, "t": NOW - 10, "op": "clear"}) + "\n")
+        self.assertEqual(set(km._cleared_ids()), {gid, g3}, "premise: one two-card batch")
+        with _fault_on(self.a_file), mock.patch.object(km.time, "time", side_effect=itertools.count(NOW)):
+            sent = self._dispatch({"type": "undoClear"})
+        self.assertEqual([m.get("sid") for m in sent if m.get("type") == "err"], [A])
+        cur = km._cleared_ids()
+        self.assertEqual(set(cur), {gid, g3}, "both ids are re-journaled as cleared: owed")
+        self.assertEqual(len(set(cur.values())), 1, "and they share ONE timestamp: still one batch")
+        sent = self._dispatch({"type": "undoClear"})     # the fault cleared; Undo ONCE
+        self.assertEqual([m for m in sent if m.get("type") == "err"], [])
+        self.assertEqual(km._cleared_ids(), {}, "one Undo restores the whole batch")
+        a = jd.load_goals(A)
+        self.assertFalse(a["nodes"][gid]["cleared"])
+        self.assertFalse(a["nodes"][g3]["cleared"])
+        self.assertEqual(set(self._feed_rows(A)), {gid, g3}, "both cards are back on the board")
+
+    def test_a_fault_at_the_save_step_of_a_clear_answers_the_socket_instead_of_dropping_it(self):
+        """The store reads at the flag step and faults at its SAVE (save_goals' own strict reads: the file
+        went unreadable between the load and the publish). That raise left _clear_all and the dispatcher
+        unhandled, and the receive loop re-raises any OSError to the outer handler, which swallows it and
+        marks the client dead: the dashboard disconnected without a word. The save now sits behind the
+        same boundary as the load: the dispatch RETURNS (so the loop goes on reading this socket), the
+        socket hears the same account, and the fault is filed once (review find, 2026-09-08)."""
+        before, orig = self.a_file.read_bytes(), jd.save_goals
+
+        def save_under_fault(fsid, store):
+            with _fault_on(self.a_file):
+                return orig(fsid, store)
+        with mock.patch.object(jd, "save_goals", save_under_fault):
+            sent = self._dispatch({"type": "askClear", "itemId": A + ":g1"})   # raised OSError before
+        errs = [m for m in sent if m.get("type") == "err"]
+        self.assertEqual([m.get("sid") for m in errs], [A], "one refusal, for the card's session")
+        self.assertIn("clear", errs[0]["title"])
+        self._assert_clear_refusal(errs[0], before)
+        self.assertEqual([r["fsid"] for r in self._rows("store-unwritable")], [A], "filed once, like a load fault")
+
+    def test_a_publish_that_fails_at_the_undo_answers_and_leaves_the_ids_owed(self):
+        """The other save-step shape: the file reads fine and the PUBLISH itself fails (the temp cannot be
+        written: a full disk, a directory gone read-only). The undo's restore reached the store and could not
+        publish it, so nothing is journaled as undone, the archive keeps the card, the socket hears why, and
+        the next Undo, once the publish lands, restores it."""
+        for sid in (A, B):
+            self._compacted(sid, NOW - 10)
+        before, orig = self.a_file.read_bytes(), jd._publish_tmp
+
+        def unwritable_for_a(dirpath, fsid):
+            p = orig(dirpath, fsid)
+            return Path(self.td.name) / "gone" / p.name if fsid == A and dirpath == jd.GOALDIR else p
+        with mock.patch.object(jd, "_publish_tmp", unwritable_for_a):
+            sent = self._dispatch({"type": "undoClear"})   # raised FileNotFoundError before
+        errs = [m for m in sent if m.get("type") == "err"]
+        self.assertEqual([m.get("sid") for m in errs], [A])
+        self.assertIn("undo", errs[0]["title"])
+        self.assertIn("No such file or directory", errs[0]["text"], "it says why: the publish that failed")
+        self.assertIn("not restored", errs[0]["text"])
+        self.assertEqual(self._undo_rows(), [B + ":g1"], "only the id whose publish LANDED is journaled as undone")
+        self.assertEqual(km._cleared_ids(), {A + ":g1": NOW - 10}, "A's ids remain the newest cleared batch")
+        self.assertEqual(self.a_file.read_bytes(), before, "A's store was not written")
+        self.assertIn(A + ":g1", json.loads((jd.GOALARCHDIR / (A + ".json")).read_text())["nodes"],
+                      "A's archive still holds the card")
+        self.assertEqual([r["fsid"] for r in self._rows("store-unwritable")], [A])
+        sent = self._dispatch({"type": "undoClear"})     # the publish lands again; Undo
+        self.assertEqual([m for m in sent if m.get("type") == "err"], [])
+        self.assertIn(A + ":g1", jd.load_goals(A)["nodes"], "A's card is restored")
+        self.assertEqual(km._cleared_ids(), {})
 
     def test_a_gesture_that_reaches_every_session_says_nothing(self):
         (jd.STATE / "cleared.jsonl").write_text(json.dumps({"id": B + ":g1", "t": NOW - 10, "op": "clear"}) + "\n")
