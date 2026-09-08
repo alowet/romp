@@ -327,24 +327,25 @@ class PushCycle(unittest.TestCase):
         return str(p)
 
     def _push_once(self, seen=None):
-        """One push to one chat client; `seen` (a list) collects every OPEN of the torn session's pointer
-        file, so a test can prove the file was re-read rather than the fault served from a cache. A wrapper
-        on the resolver proved only that it was CALLED, which a cached fault satisfies too (review find,
-        2026-09-08); the open is the read."""
+        """One push to one chat client; `seen` (a list) collects every fault REPORT the torn session's pointer
+        file draws — each call of _git_file_fault naming it — so a test can prove the fault was re-derived
+        and handed to the registry rather than served from a cache. A wrapper on the resolver proved only
+        that it was CALLED, which a cached fault satisfies too (review find, 2026-09-08); counting the
+        pointer file's opens proved the re-derivation while the resolver read it per call, but the pointer's
+        CONTENT now rides a memo keyed on the file's identity (_pointer_gitdir) and the fault is re-derived
+        from its target's stat, so the report reaching the registry is what says it was re-derived."""
         sessions = [{"sid": A, "name": "web", "path": self.paths[A], "anchor": 0, "mtime": NOW},
                     {"sid": B, "name": "api", "path": self.paths[B], "anchor": 0, "mtime": NOW}]
         tmux = {A: _tm(), B: _tm()}
         sent = []
         dotgit = str(self.torn / ".git")
-        real_open = open
+        real_fault = km._git_file_fault
 
-        def opened(file, *a, **k):
-            if seen is not None and isinstance(file, str) and file == dotgit:
-                seen.append(file)
-            return real_open(file, *a, **k)
-        # a module-global `open` shadows the builtin for the kernel's functions ONLY (json, subprocess and the
-        # test's own reads keep the real one), and create=True removes it again on exit
-        with mock.patch.object(km, "open", opened, create=True), \
+        def reported(path, exc):
+            if seen is not None and path == dotgit:
+                seen.append(path)
+            return real_fault(path, exc)
+        with mock.patch.object(km, "_git_file_fault", reported), \
                 mock.patch.object(km, "_sessions", lambda now, window=None, forks=True: list(sessions)), \
                 mock.patch.object(km, "_tmux_sessions", lambda: dict(tmux)), \
                 mock.patch.object(km, "_chat_tab_sessions", lambda now, tm: list(sessions)), \
@@ -373,14 +374,15 @@ class PushCycle(unittest.TestCase):
         self.assertEqual(len(named), 1, "exactly one stderr line names the bad file: %r" % err.splitlines())
         # the next cycle has nothing new to say about a fault already on record. An UNCHANGED push serves
         # the chat from _built_chat / the parse cache and never re-derives the branch, which would keep
-        # this quiet with no registry at all — so those caches are cleared and the pointer file's OPENS are
-        # counted: what this pins is the DEDUPE (the file IS re-read, and still no new line). Counting calls
-        # to the resolver was too weak a premise: a fault cached as "no HEAD" is served without a read and
-        # would also log nothing, registry or not (review find, 2026-09-08).
+        # this quiet with no registry at all — so those caches are cleared and the fault REPORTS for the
+        # pointer file are counted: what this pins is the DEDUPE (the fault IS re-derived and handed to the
+        # registry, and still no new line). Counting calls to the resolver was too weak a premise: a fault
+        # cached as "no HEAD" is served without reaching the registry and would also log nothing, registry
+        # or not (review find, 2026-09-08).
         self._clear_build_state()
         seen = []
         _, err2 = self._push_once(seen)
-        self.assertTrue(seen, "premise: the second push re-READ the torn pointer file (a fault is never cached)")
+        self.assertTrue(seen, "premise: the second push re-derived the torn pointer file's fault (a fault is never cached)")
         self.assertEqual([l for l in err2.splitlines() if str(self.torn / ".git") in l], [],
                          "a second push logs nothing new: %r" % err2.splitlines())
 
