@@ -33,7 +33,7 @@ import { reconcileTabOrder } from "./tab-order";
 import { writeViewOrder } from "./view-order";
 import { planStrip, readTabGroups, writeTabGroups, setSectionCollapsed, sectionRef, isPinned, setPinned, prunePinned, reachableFrom, headWords,
          followAdoption, reorderTagOrder, TABGROUPS_KEY, TABGROUPS_EVENT, type TabSection } from "./tab-groups";
-import { tabStateClass, sectionPip, sectionPipMembers, sectionPipTitle } from "./tab-state";
+import { tabStateClass, tabDotClass, sectionPip, sectionPipMembers, sectionPipTitle } from "./tab-state";
 import { titleWithKey, chordOf, effectiveChord, loadOverrides } from "./keybindings";
 import { DEFAULT_CHORDS } from "./commands";
 import { NavHistory } from "./nav-history";
@@ -5486,17 +5486,13 @@ function renderTabs() {
     if (s.status.faded) tab.classList.add("at-rest");
     // WORKING shows a yellow dot; AWAITING-BG the same dot in await-green — matching the chip's color, so the
     // tab reads the split at a glance (the user 2026-07-13); BLOCKED (API error) gets NO dot — the dashed
-    // red tab highlight instead (the user 2026-06-16).
-    if (st === "working") tab.appendChild(el("span", "tab-dot"));
-    else if (st === "awaitingBg") tab.appendChild(el("span", "tab-dot await"));
-    // MISSING state — the kernel listed this session but could not read what it is doing. An
-    // explicit gray ring, so a bare tab can only mean a state with its own tab treatment (dashed
-    // blocked ring, compacting bar, struck-through closed) or a healthy idle one, never a hole.
-    else if (!st) tab.appendChild(el("span", "tab-dot unknown"));
-    // OPENING (a provisional tab, or the kernel's own opening chip): the accent loader dot — the session
-    // is starting, and a tab with no cue at all read as dead (the user 2026-08-10). Same pulse as the
-    // statusline's opening dots; never the solid working yellow, which claims work that isn't happening.
-    else if (st === "opening") tab.appendChild(el("span", "tab-dot opening"));
+    // red tab highlight instead (the user 2026-06-16). MISSING state: an explicit gray ring, so a bare tab
+    // can only mean a state with its own treatment or a healthy idle one, never a hole. OPENING: the accent
+    // loader dot (the user 2026-08-10). The slot itself is there in EVERY state (T262g, the user 2026-09-08):
+    // a dot that came and went with the state changed the tab's width, and with the strip at a wrap boundary
+    // that added or removed a row and slid the transcript under the reader by a row's height (tabDotClass).
+    const dotCls = tabDotClass(st);
+    if (dotCls) tab.appendChild(el("span", dotCls));
     // compacting → a tiny animated compaction bar before the name (the tab gets no outline for this state,
     // so the bar IS the cue). A teal fill whose right edge slides left and loops — the same "compression"
     // motion as the statusline ctx-scan bar (.ctx-compress), miniaturised. Replaces the static ⇲ glyph the
