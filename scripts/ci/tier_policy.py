@@ -15,11 +15,12 @@ Record shape (every key the rules read):
   first_check_at: epoch|None   (chain_start of THIS PR's hourly verdicts on this head, anchored at now)
   head_floor: epoch   now: epoch   body: str
   (the fetcher also records created_at; no rule reads it - head_floor already starts from it)
-  issues: {number: {exists, is_pr, user, comments: [login]}}   (bots already filtered out by the fetcher)
+  issues: {number: {exists, is_pr, comments: [login]}}   (commenters; bots already filtered out by the fetcher)
 
 Tiers: docs (documentation only) passes on green; fix passes on an approval OR seven days with the head
 unchanged and no changes requested; feature passes on an approval; major-feature passes on an approval AND
-a linked issue someone other than the author took part in. A PR touching .github/ or scripts/ci/ — the
+a linked issue someone other than the author has COMMENTED on (the opener alone is not a discussion: the
+maintainers' ruling of 2026-09-07 on the discussion issue). A PR touching .github/ or scripts/ci/ — the
 gate's own workflow and code — needs an approval whatever its tier; so does a PR whose file listing the
 API truncated (the unseen files are assumed guarded and not documentation). Zero or two tier labels fail.
 
@@ -118,8 +119,9 @@ def _changes_requested(pr):
 
 
 def _linked_issue_discussed(pr):
-    """(True, n) when the body references an issue in romp-on/romp that exists, is not a PR, and has a
-    participant (opener or commenter; bots filtered by the fetcher) other than the author."""
+    """(True, n) when the body references an issue in romp-on/romp that exists, is not a PR, and carries a
+    COMMENT by someone other than the author (bots filtered by the fetcher). The opener does not count on
+    their own: an issue filed and never answered is not a discussion (the maintainers, 2026-09-07)."""
     refs = [int(a or b) for a, b in _ISSUE_REF.findall(pr.get("body") or "")]
     if not refs:
         return False, "the body links no issue (#N or a romp-on/romp issue URL)"
@@ -128,12 +130,9 @@ def _linked_issue_discussed(pr):
         info = issues.get(n) or issues.get(str(n))
         if not info or not info.get("exists") or info.get("is_pr"):
             continue
-        participants = set(info.get("comments") or [])
-        if info.get("user"):
-            participants.add(info["user"])
-        if any(p != pr.get("author") for p in participants):
+        if any(c != pr.get("author") for c in info.get("comments") or []):
             return True, n
-    return False, "the linked issue(s) have no participant other than the author (or are PRs / missing)"
+    return False, "the linked issue(s) carry no comment by someone other than the author (or are PRs / missing)"
 
 
 def chain_start(stamps, now, gap):

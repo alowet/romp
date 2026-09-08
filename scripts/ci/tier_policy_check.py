@@ -152,12 +152,11 @@ def build_record(repo, number, token, now=None):
             it, _ = _req("GET", "/repos/%s/issues/%d" % (repo, n), token)
             comments = [c["user"]["login"] for c in _get_all("/repos/%s/issues/%d/comments" % (repo, n), token)
                         if not _is_bot(c.get("user"))]
-            opener = None if _is_bot(it.get("user")) else it["user"]["login"]
-            issues[n] = {"exists": True, "is_pr": "pull_request" in it, "user": opener, "comments": comments}
+            issues[n] = {"exists": True, "is_pr": "pull_request" in it, "comments": comments}
         except urllib.error.HTTPError as e:
             if e.code != 404:
                 raise
-            issues[n] = {"exists": False, "is_pr": False, "user": None, "comments": []}
+            issues[n] = {"exists": False, "is_pr": False, "comments": []}
     again, _ = _req("GET", "/repos/%s/pulls/%d" % (repo, number), token)
     if again["head"]["sha"] != head:
         raise RuntimeError("the PR's head moved during evaluation (%s -> %s); the push's own run grades the new head"

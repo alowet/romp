@@ -28,10 +28,12 @@ name: Tier policy
 #   API-posted verdict alone. Were the job named the same, every head would carry two same-named runs
 #   (the job's, frozen at push time, and the verdict the hourly sweep moves) and which one the ruleset
 #   honors is undocumented.
-# - RESIDUAL, stated: a PR that edits .github/ can add a pull_request-triggered job that posts a
-#   same-named success from the PR's own copy. The base-branch check cannot prevent that, so the
-#   policy requires an approval for ANY PR touching .github/ or scripts/ci/ - a human looks - and the
-#   maintainers' true backstop is a CODEOWNERS entry for those paths with code-owner review required.
+# - RESIDUAL, stated as open: a PR can add a pull_request-triggered workflow whose JOB is named
+#   "Tier policy"; GitHub Actions creates that run on the head with no token, under the same app and
+#   sha as the base verdict, and the merge box follows the newest same-named run - app selection
+#   cannot tell them apart. The policy requires an approval for ANY PR touching .github/ or
+#   scripts/ci/ (a human looks), but that rule rides the check the forged run competes with; what
+#   closes it is a CODEOWNERS entry for those paths with code-owner review required in the ruleset.
 
 on:
   pull_request_target:

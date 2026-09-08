@@ -5,7 +5,7 @@ pinned on fixtures so the gate's meaning lives in tests, not in a YAML step.
 
 Tiers: docs (documentation only) merges on green; fix needs an approval OR seven unchanged days with no
 changes requested; feature needs an approval; major-feature needs an approval AND a linked issue that
-someone other than the author took part in (opened, or commented on). Any PR touching .github/ or
+someone other than the author has commented on (the opener alone does not count). Any PR touching .github/ or
 scripts/ci/ - the gate's own workflow and code - needs an approval regardless (the base-branch check
 cannot stop a PR-branch job from posting a same-named success on pull_request events, and a fix-tier PR
 must not rewrite the policy through the seven-day path, so a human must look). Zero or two tier labels fail here too (belt and braces with the label
@@ -333,12 +333,15 @@ class MajorFeature(unittest.TestCase):
                                                    "comments": ["author-a"]}}))
         self.assertEqual(v["conclusion"], "failure")
 
-    def test_the_issue_opener_is_a_participant(self):
-        # the ordinary flow - a maintainer files the issue, the author replies and implements
+    def test_the_issue_opener_alone_is_not_a_discussion(self):
+        # the maintainers' ruling (2026-09-07, the discussion issue's third point): discussion means a
+        # COMMENT by someone other than the author; an issue a maintainer filed and the author answered
+        # alone is not one, and the fetcher no longer records the opener
         v = tp.evaluate(pr(labels=["major-feature"], reviews=[review("maint-b")], permissions=MAINTAINERS,
                            body="#7", issues={7: {"exists": True, "is_pr": False, "user": "maint-b",
                                                    "comments": ["author-a"]}}))
-        self.assertEqual(v["conclusion"], "success")
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("comment by someone other than the author", v["summary"])
 
     def test_a_linked_PR_number_is_not_an_issue(self):
         v = tp.evaluate(pr(labels=["major-feature"], reviews=[review("maint-b")], permissions=MAINTAINERS,
@@ -618,8 +621,8 @@ class FetcherShapes(unittest.TestCase):
                                     "permissions", "first_check_at", "head_floor", "created_at", "now", "body", "issues"},
                          "the record has exactly the documented keys - no commit date can reach the policy")
         self.assertEqual(rec["permissions"], {"maint-b": "write"})
-        self.assertEqual(rec["issues"], {7: {"exists": True, "is_pr": False, "user": "author-a",
-                                             "comments": ["maint-b"]}}, "the bot commenter is filtered")
+        self.assertEqual(rec["issues"], {7: {"exists": True, "is_pr": False, "comments": ["maint-b"]}},
+                         "the bot commenter is filtered; the opener is not recorded (they do not count)")
         self.assertEqual(rec["head_floor"], rec["created_at"], "no reset events → the floor is created_at")
         self.assertEqual(self.tc.evaluate(rec)["conclusion"], "success")
         self.assertFalse(any("/commits/%s\"" % HEAD in p or p.endswith("/commits/" + HEAD) for _, p in self.calls),

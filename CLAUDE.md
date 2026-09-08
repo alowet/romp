@@ -128,7 +128,8 @@ broad `git add` will sweep up your work). Conventions:
     design points in the body. Merges on the other maintainer's approval.
   - `major-feature` (tier 3): new functionality that changes what romp does or its
     contracts. Merges on the other maintainer's approval AND a discussion in a linked issue
-    (`#N` in the body, opened or commented on by someone other than the author). File it **without**
+    (`#N` in the body, with a comment by someone other than the author; the opener alone does
+    not count). File it **without**
     `--auto` and leave the merge to the maintainers.
   "Approval" is a standing APPROVED review by a maintainer other than the author on the
   CURRENT head (standing = their latest approval, change request or dismissal; comment-only
@@ -138,11 +139,11 @@ broad `git add` will sweep up your work). Conventions:
   GitHub forbids self-approval and the user's sessions act under
   the user's account, so it structurally means the other maintainer. A renamed file counts
   under both its paths. Any PR touching `.github/` or
-  `scripts/ci/` - the gate's own workflow and code - needs an approval regardless of tier: the
-  base-branch check cannot stop a PR's own copy from posting a same-named success on
-  `pull_request` events, and a fix-tier PR must not be able to rewrite the policy through the
-  seven-day path, so a human looks. (The ruleset must require the check with the GitHub
-  Actions app as its source; a bare name match would accept anyone's commit status.) Consequence for sessions:
+  `scripts/ci/` - the gate's own workflow and code - needs an approval regardless of tier: a
+  PR's own `pull_request` workflow can carry a JOB named like the check, whose run lands on
+  the head under the same app, and a fix-tier PR must not be able to rewrite the policy through
+  the seven-day path, so a human looks. That residual stays open until the maintainers add a
+  CODEOWNERS rule for those paths with code-owner review required (see `docs/pr-tiers.md`). Consequence for sessions:
   `--auto` still lands `docs` on green; a `fix` lands on approval or its seventh day; `feature`
   and `major-feature` wait for a human. The line that matters is 2 vs 3: adds a capability
   inside the existing model, `feature`; changes what romp is, `major-feature`, talk first.

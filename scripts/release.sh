@@ -170,12 +170,15 @@ if [ "$current" != "$target" ]; then
         # never fire and the release would stall one step after opening it. A version bump is
         # repo plumbing with no behavior change - but tier 0 (`docs`, renamed from tests-only on
         # 2026-09-07 with the tier POLICY, a required "Tier policy" check) is documentation ONLY,
-        # and this PR touches VERSION, so wearing `docs` it is held red by the file check itself -
+        # and this PR touches VERSION, so wearing tier 0 it is held red by the file check itself -
         # no approval or seven-day clock applies until it wears another tier. It stays held until
         # the maintainers decide (relabel it `fix`, or write an explicit allow-list into the policy).
-        # The label below is the mechanical rename, not a ruling on that question.
+        # The label below is the tier-0 label AS IT EXISTS upstream today: `gh pr create --label`
+        # resolves the name on the server and fails after the version branch is pushed if it does
+        # not exist, and the rename to `docs` is the maintainers' step. Both checks read `tests-only`
+        # as `docs` in the meantime; switch this line when the label is renamed.
         pr_url="$("$GH" pr create --repo "$UPSTREAM" --title "VERSION $target" \
-            --label docs \
+            --label tests-only \
             --body "Version bump for \`$tag\`, opened by scripts/release.sh.")" \
             || die "could not open the version PR."
         pr="${pr_url##*/}"
