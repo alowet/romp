@@ -15895,8 +15895,11 @@ def _safe_ssh_host(host):
     metacharacters. The ssh argvs also carry a `--` guard (belt-and-suspenders); validating here turns a
     crafted host into a clean rejection instead of a confusing ssh failure. Real hosts — aliases and
     user@host / IPv6-literal forms — pass."""
+    # fullmatch, not match: the pattern's `$` also matches before ONE trailing newline, and _remotes_load
+    # now holds an ssh row on disk to this rule without stripping it first (review find, 2026-09-08, the
+    # same hole _safe_id had).
     return bool(host) and isinstance(host, str) and len(host) <= 255 \
-        and not host.startswith("-") and bool(_SSH_HOST_RE.match(host))
+        and not host.startswith("-") and bool(_SSH_HOST_RE.fullmatch(host))
 
 
 # ── what a PEER kernel's answer may say, field by field ──────────────────────────────────────────────────
@@ -16340,15 +16343,60 @@ def _bus_quarantine_act(body):
 # SAME file the bus uses (its STATE.parent == jd.STATE) — so this machine can never check in under
 # one name while its bus declares another.
 
-_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 def _safe_id(s):
-    """True iff `s` is safe as a single path component (postal_service._safe_id, duplicated)."""
+    """True iff `s` is safe as a single path component (postal_service._safe_id, duplicated;
+    tests/test_postal_self_host.py pins the two copies identical). fullmatch, never match against
+    `^...$`: `$` also matches before ONE trailing newline, so "abc\\n" cleared the rule and the
+    override branches below returned it verbatim (review find, 2026-09-08)."""
     if not s or len(s) > 128:
         return False
     if "/" in s or "\\" in s or "\x00" in s or s.startswith("."):
         return False
-    return bool(_SAFE_ID_RE.match(s))
+    return bool(_SAFE_ID_RE.fullmatch(s))
+
+
+# What a door into the host registries says when it turns a declared name away. Two doors file a name
+# they have never seen (review find, 2026-09-08: the trust route took any string the serve token's holder
+# sent). The check-in handshake (checkin_apply) files what a mobile declares as its OWN name, so it holds
+# the machine-name rule, _safe_id. The trust route's origin-only branch (set_trust) files a name a hub
+# holds a peer under, and a hub keys an ATTACHED peer by its ssh alias (user@box, a bracketed address):
+# remote_trust carries that alias into a third machine's copy of this branch, and the relayed mail the
+# tier then judges is stamped with the same alias as its origin. So that door admits EITHER rule, the
+# union the remembered-hosts registry's two writers apply (attach: _safe_ssh_host; check-in and trust:
+# _safe_id), which is the union _known_load holds the registry's rows to. Neither sentence echoes the
+# refused string: it is the thing being refused.
+_HOST_RULE = ("host must be a machine name: letters, digits, dots, hyphens or underscores, starting with a "
+              "letter or digit, at most 128 characters")
+_HOST_OR_ALIAS_RULE = ("host must be a machine name or an ssh alias: letters, digits, dots, hyphens, underscores, "
+                       "at-signs, colons or square brackets, not starting with a hyphen, at most 255 characters")
+
+_host_refused_said = set()   # sha256 of each declared name already refused aloud: once per distinct value,
+#                              BOUNDED (cleared at 64, the _auto_push_tried idiom) because a peer chooses
+#                              these strings and could mint ten thousand distinct ones
+
+
+def _refuse_host_name(door, host, rule):
+    """A door turned a declared host away: say so ONCE per distinct value, on stderr and as a bell row of
+    kind refused (review find, 2026-09-08: the 400 with its reason went back to the peer, and no human on
+    this machine ever saw that a machine was being turned away). `rule` is the sentence the door answers
+    with, so the line names the rule that door holds. The value is shown as a CLIPPED repr, never raw: it
+    is the thing being refused, and it may carry a NUL, a newline or ten kilobytes. Never raises: the
+    refusal is answered whether or not it could be said."""
+    try:
+        key = hashlib.sha256(host.encode("utf-8", "surrogatepass")).hexdigest()
+        if key in _host_refused_said:
+            return
+        if len(_host_refused_said) >= 64:
+            _host_refused_said.clear()
+        _host_refused_said.add(key)
+        shown = repr(host[:40]) + (" (%d characters)" % len(host) if len(host) > 40 else "")
+        line = "%s refused the declared host %s: %s; nothing was recorded" % (door, shown, rule)
+        sys.stderr.write("romp-kernel: %s\n" % line)
+        _sync_notice(line, ok=False, kind="refused")
+    except Exception:
+        pass
 
 def _host_name_candidates():
     """Raw machine-name candidates for the self-host fallback, most meaningful first. macOS keeps
@@ -16402,28 +16450,43 @@ def _minted_host_id():
     return name
 
 _self_host_fb = None                         # resolved fallback identity, cached after the first (logged) resolve
+_host_name_env_warned = set()                # ROMP_HOST_NAME values already said to be unusable — once per value
 
 def _self_host():
     """This machine's name to peers (the check-in handshake, trust pushes, usage rows). Short
-    hostname; ROMP_HOST_NAME overrides (tests; unusual naming). The name MUST clear _safe_id — the
-    hub keys the mail it holds for us by it, as a path component — so an unsafe kernel hostname
-    falls back loudly, exactly like the bus's self_host(): the platform's user-set machine name,
-    else the minted id persisted in the SHARED file above (kernel and bus converge on one identity).
-    gethostname stays first and live — fixing the machine's hostname takes effect on the next call
-    with no restart."""
+    hostname; ROMP_HOST_NAME overrides (tests; unusual naming) WHEN it clears the same rule. The
+    name MUST clear _safe_id — the hub keys the mail it holds for us by it, as a path component,
+    and the hub's check-in door refuses anything else (checkin_apply) — so an unsafe kernel
+    hostname falls back loudly, exactly like the bus's self_host(): the platform's user-set machine
+    name, else the minted id persisted in the SHARED file above (kernel and bus converge on one
+    identity). An unsafe OVERRIDE is set aside the same way — said once on stderr, in plain words,
+    naming the name used instead — and the derived name goes out: the override used to come back
+    exactly as set, the one branch that dodged the rule (2026-09-08), so a mobile whose operator
+    set an odd ROMP_HOST_NAME landed on hubs while its own mail parked unreachable. gethostname
+    stays first and live — fixing the machine's hostname takes effect on the next call with no
+    restart."""
+    global _self_host_fb
     env = os.environ.get("ROMP_HOST_NAME")
-    if env:
+    if env and _safe_id(env):
         return env
     name = socket.gethostname().split(".")[0]
     if _safe_id(name):
-        return name
-    global _self_host_fb
-    if _self_host_fb is None:
-        _self_host_fb = next((s for s in map(_sanitize_host_name, _host_name_candidates()) if s),
-                             "") or _minted_host_id()
-        sys.stderr.write("self-host: kernel hostname %r fails path-safety; using %r for peering "
-                         "(fix the machine's hostname to control the name)\n" % (name, _self_host_fb))
-    return _self_host_fb
+        chosen = name
+    else:
+        if _self_host_fb is None:
+            _self_host_fb = next((s for s in map(_sanitize_host_name, _host_name_candidates()) if s),
+                                 "") or _minted_host_id()
+            sys.stderr.write("self-host: kernel hostname %r fails path-safety; using %r for peering "
+                             "(fix the machine's hostname to control the name)\n" % (name, _self_host_fb))
+        chosen = _self_host_fb
+    if env and env not in _host_name_env_warned:
+        _host_name_env_warned.add(env)
+        shown = env if len(env) <= 60 else env[:57] + "..."
+        sys.stderr.write("self-host: ROMP_HOST_NAME=%r is not usable as a machine name (letters, digits, dots, "
+                         "hyphens or underscores, starting with a letter or digit, at most 128 characters); "
+                         "using %r for peering instead. Fix or unset ROMP_HOST_NAME to control the name.\n"
+                         % (shown, chosen))
+    return chosen
 
 
 def checkin_set(host, on):
@@ -16440,6 +16503,7 @@ def checkin_set(host, on):
             r.setdefault("rk_port", _free_port())
             r.setdefault("rb_port", _free_port())
         r.pop("_handshook", None)
+        r.pop("_checkin_refused", None)    # a toggle is the user acting: a held refusal is re-tried
         proc = r.get("proc")
     if not on:
         _checkin_stop_hub(r)
@@ -16481,6 +16545,18 @@ def set_trust(host, level):
         if r is not None:
             r["trust"] = level
     if r is None:
+        # The ORIGIN-ONLY branch is the second door into the remembered-hosts registry (review find,
+        # 2026-09-08): a name with no tunnel here is filed and told to the bus on the word of any serve
+        # token holder (every checked-in mobile is one), and it took any string. The name is one a hub
+        # holds a peer under: the peer's own declared name (_safe_id), or the ssh alias the hub attached
+        # it by (user@box clears _safe_ssh_host, not _safe_id), which remote_trust carries here from the
+        # hub's popover and which stamps that peer's relayed mail as its origin. Either rule admits it, as
+        # at _known_load; a name clearing neither (a slash, whitespace, a NUL, a quote, ten kilobytes) is
+        # refused the way the check-in door refuses: nothing recorded, the string not echoed, said once
+        # with a clipped repr. The route maps this error to a 400.
+        if not (_safe_id(host) or _safe_ssh_host(host)):
+            _refuse_host_name("the trust route", host, _HOST_OR_ALIAS_RULE)
+            return None, _HOST_OR_ALIAS_RULE
         _known_note(host, level)           # the remembered entry IS the origin-trust store
         _notify_bus_origin_trust(host, level)   # best-effort now; the supervisor pass retries
         return {"host": host, "trust": level, "originOnly": True}, None
@@ -16739,18 +16815,54 @@ def _checkin_handshake(r):
     """Tell the hub (through our own -L to its kernel) where our reverse forwards landed and hand it
     our token — the PUSH that replaces the hub ever fetching credentials. Authorizes with the HUB's
     token (r["token"], fetched at attach — the hub requires it on every request, loopback included).
-    True on ack; the caller records success per tunnel incarnation and retries otherwise."""
+    True on ack; the caller records success per tunnel incarnation and retries otherwise.
+
+    A REFUSAL is read, said and held (review find, 2026-09-08: only the reply's status was read, so the
+    hub's reason reached nobody, and the same declared name went out again every supervisor pass,
+    forever). A non-200 is said once per distinct (status, reason): stderr, the dial log, a bell row of
+    kind refused. A 400, the hub's verdict on the very body we sent, is not re-sent while the
+    declared name and the hub's kernel incarnation are the ones it refused: the refusal is the event,
+    and a changed name (the operator fixed ROMP_HOST_NAME or the hostname), a hub restart (its /version
+    pid, the event _handshake_due keys on too), a check-in toggle, a port re-mint or a boot re-arms it.
+    A hub that answers nothing (mid-boot) is no refusal: no memo, no line, the next pass dials again."""
     import urllib.parse
+    payload = _checkin_payload(r)
+    memo = r.get("_checkin_refused") if isinstance(r.get("_checkin_refused"), dict) else {}
+    if memo.get("hold") and memo.get("host") == payload.get("host") and memo.get("hub") == r.get("hub_pid"):
+        return False                     # the hub already refused this very name, and nothing has changed
     try:
         conn = http.client.HTTPConnection("127.0.0.1", r["local_port"], timeout=4)
         p = "/checkin" + (("?token=" + urllib.parse.quote(r["token"])) if r.get("token") else "")
-        conn.request("POST", p, json.dumps(_checkin_payload(r)),
-                     {"Content-Type": "application/json"})
-        ok = conn.getresponse().status == 200
+        conn.request("POST", p, json.dumps(payload), {"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        status, raw = resp.status, resp.read()
         conn.close()
-        return ok
     except Exception:
         return False
+    if status == 200:
+        with _remotes_lock:
+            r.pop("_checkin_refused", None)
+        return True
+    try:
+        why = str((json.loads(raw.decode() or "{}") or {}).get("error") or "")
+    except Exception:
+        why = ""
+    why = re.sub(r"[\x00-\x1f\x7f]+", " ", why)[:200]      # the hub's sentence, one line of it, bounded
+    with _remotes_lock:
+        r["_checkin_refused"] = {"status": status, "error": why, "host": payload.get("host"),
+                                 "hub": r.get("hub_pid"), "hold": status == 400}
+    if (memo.get("status"), memo.get("error")) != (status, why):    # each DISTINCT refusal once, not per pass
+        hub = r.get("host") or "?"
+        line = "check-in refused by %s (HTTP %d): %s%s" % (
+            hub, status, why or "no reason given",
+            "; not re-sent until this machine's name or that kernel changes" if status == 400 else "")
+        sys.stderr.write("romp-kernel: %s\n" % line)
+        _tunnel_log(hub, "checkin-refused", status=status, error=why)
+        try:
+            _sync_notice(line, ok=False, kind="refused")
+        except Exception:
+            pass
+    return False
 
 
 def _checkin_stop_hub(r):
@@ -16773,13 +16885,30 @@ def checkin_apply(body):
     same federation row, same stage-1 bus notify — except we own NO ssh (proc None; the mobile
     supervises its tunnel; a dead forward reads down and the next handshake heals). An existing
     ssh-attached row by the same name is refused: the two ownership models must never mix silently."""
-    host = str((body or {}).get("host") or "").strip()
+    raw_host = (body or {}).get("host")
+    host = raw_host.strip() if isinstance(raw_host, str) else ""   # a number or list is no name: str() used
+    #                                                                 to coerce it into one ("1.5") and file it
     kp, bp = (body or {}).get("kernelPort"), (body or {}).get("busPort")
 
     def _bad(p):
         return not isinstance(p, int) or isinstance(p, bool) or not (0 < p < 65536)
     if not host or _bad(kp) or _bad(bp):
         return {"ok": False, "error": "host, kernelPort, busPort required"}, 400
+    if not _safe_id(host):
+        # The declared name used to be taken as it came, and it goes on to KEY everything: the registry
+        # and remotes.json, the remembered-hosts entry and remotes-known.json, the bus's peer table and
+        # the mail it holds for that peer (a path component there, gated by the bus's own _safe_id), the
+        # /remote/<host>/ routes, and every body/query lookup the row actions make. Every name a romp
+        # mobile can declare clears this rule: _self_host()'s derived names always did, for exactly that
+        # reason, and its ROMP_HOST_NAME override now does or is set aside aloud — so this door turns
+        # away only names no romp mobile produces, and a hostile or broken peer cannot file a slash, a
+        # NUL, whitespace or ten kilobytes into any of it (2026-09-08). Checked BEFORE the same-token sweep
+        # below, which would otherwise pop the mobile's good row on the way to refusing the junk one.
+        # The refused string is not echoed: it is the thing being refused. Said here too, once per
+        # distinct value, on stderr and the bell (review find, 2026-09-08: the reason went back to the
+        # peer and nobody on this machine saw a machine being turned away).
+        _refuse_host_name("the check-in handshake", host, _HOST_RULE)
+        return {"ok": False, "error": _HOST_RULE}, 400
     tok = str((body or {}).get("token") or "")
     with _remotes_lock:
         if tok:
@@ -16964,6 +17093,7 @@ def _remint_forward_ports(r):
     if r.get("checkin"):
         r["rk_port"], r["rb_port"] = fresh[2], fresh[3]
         r.pop("_handshook", None)        # the hub must be re-told the new ports
+        r.pop("_checkin_refused", None)  # …and a refusal of the old body no longer holds
     r["_peer_notified"] = None           # bus_port moved: the local bus is holding a stale endpoint
     new = {k: r.get(k) for k in ("local_port", "bus_port", "rk_port", "rb_port") if r.get(k)}
     _tunnel_log(r["host"], "ports-reminted", old=old, new=new)
@@ -17173,7 +17303,9 @@ _NOT_SAVED = ("proc",       # the live Popen
               #               _views_client serves every cached reading, status aside, so a down host's tags
               #               survive a kernel restart; the boot's first poll re-reads, the gate unstamped
               "misses",     # the poll run counters: they describe THIS connection, and a fresh boot
-              "ok_polls")   # dials from scratch, so carrying them across would judge a link that is gone
+              "ok_polls",   # dials from scratch, so carrying them across would judge a link that is gone
+              "_checkin_refused")   # the mobile's memo of a hub refusing the name it declared: a boot is
+#                                     an event that re-arms the send (review find, 2026-09-08)
 
 
 def _remotes_rows_for_save():
@@ -17218,6 +17350,39 @@ def _remotes_save_if_changed():
     return True
 
 
+def _registry_set_aside(path, rows, mode=None):
+    """Rows of a persisted host registry whose host is not a name this build would file (a check-in row
+    failing _safe_id, an ssh row failing _safe_ssh_host), moved ASIDE at load: never loaded, never written
+    back (review find, 2026-09-08: a row filed before the doors were guarded came back verbatim at every
+    boot, was told to the bus and rendered in the panel). The sidecar is `<name>.refused-<utc stamp>`
+    beside the file (a `-n` suffix within one second: the `.corrupt-` quarantines' shape, docs/reference.md
+    "Where things live"); `mode` 0o600 for remotes.json, whose rows carry that peer's serve token. Said once
+    on stderr with a CLIPPED repr of each host, never the raw string (it may carry a NUL or ten kilobytes),
+    and once as a bell row of kind refused. Returns the sidecar path, or None when it could not be written:
+    the rows are still not loaded, the caller's rewrite still drops them, and the line says so."""
+    shown = ", ".join(repr(str(r.get("host"))[:40]) for r in rows[:3])
+    if len(rows) > 3:
+        shown += " and %d more" % (len(rows) - 3)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    aside, n = path.with_name("%s.refused-%s" % (path.name, stamp)), 0
+    while aside.exists():                                # a second set-aside in the same second
+        n += 1
+        aside = path.with_name("%s.refused-%s-%d" % (path.name, stamp, n))
+    try:
+        _atomic_write(aside, json.dumps(rows), mode=mode)
+        where = "moved aside to %s" % aside.name
+    except Exception as e:
+        aside, where = None, "and could not be moved aside (%s), so dropped" % _errno_text(e)
+    line = "%s: %d row%s whose host is not a machine name refused at load and %s: %s" % (
+        path.name, len(rows), "" if len(rows) == 1 else "s", where, shown)
+    sys.stderr.write("romp-kernel: %s\n" % line)
+    try:
+        _sync_notice(line, ok=False, kind="refused")
+    except Exception:
+        pass
+    return aside
+
+
 def _remotes_load():
     try:
         rows = json.loads(REMOTES_FILE.read_text())
@@ -17229,9 +17394,18 @@ def _remotes_load():
         pass
     if not isinstance(rows, list):
         return
+    aside = []
     with _remotes_lock:
         for row in rows:
             if not isinstance(row, dict) or not row.get("host"):
+                continue
+            h = row["host"]
+            if not isinstance(h, str) or not (_safe_id(h) if row.get("checkin_peer") else _safe_ssh_host(h)):
+                # The rule the row's own door applies, a check-in row _safe_id (checkin_apply), an ssh row
+                # _safe_ssh_host (attach_remote), re-applied to what the file says (review find,
+                # 2026-09-08): a row filed before the doors were guarded came back verbatim at every boot.
+                # Set aside below: never loaded, never written back.
+                aside.append(row)
                 continue
             r = dict(row)
             for k in _NOT_SAVED:    # a file an older build wrote carries keys this one does not save; they
@@ -17250,6 +17424,9 @@ def _remotes_load():
             r.setdefault("bus_port", _free_port())   # peer-bus mode's -L to the remote's bus (allocated
             #                                          unconditionally so a later flag flip needs no migration)
             _remotes[r["host"]] = r
+    if aside:
+        _registry_set_aside(REMOTES_FILE, aside, mode=0o600)   # 0600: the rows carry that peer's serve token
+        _remotes_save()                                          # the file heals now: the kept rows only
 
 
 def attach_remote(host, kernel_port=None):
@@ -17377,15 +17554,28 @@ def _known_load():
         return
     if not isinstance(rows, list):
         return
+    aside = []
     with _known_lock:
         for row in rows:
-            if isinstance(row, dict) and row.get("host"):
-                _known[row["host"]] = {"host": row["host"],
-                                       "lastAttachedAt": row.get("lastAttachedAt") or 0,
-                                       "trust": row.get("trust") or "directed",
-                                       "share": bool(row.get("share"))}
-                if row.get("attached"):               # set only when proven (absent = trust-only row)
-                    _known[row["host"]]["attached"] = True
+            if not (isinstance(row, dict) and row.get("host")):
+                continue
+            h = row["host"]
+            if not isinstance(h, str) or not (_safe_ssh_host(h) or _safe_id(h)):
+                # A remembered row does not record which door filed it, attach (the ssh rule: user@box
+                # passes) or a check-in / trust setting (_safe_id), so a host clearing EITHER stays, and
+                # one clearing neither (a slash, whitespace, a NUL, ten kilobytes) is set aside below:
+                # never loaded, never written back (review find, 2026-09-08).
+                aside.append(row)
+                continue
+            _known[h] = {"host": h,
+                         "lastAttachedAt": row.get("lastAttachedAt") or 0,
+                         "trust": row.get("trust") or "directed",
+                         "share": bool(row.get("share"))}
+            if row.get("attached"):               # set only when proven (absent = trust-only row)
+                _known[h]["attached"] = True
+    if aside:
+        _registry_set_aside(KNOWN_FILE, aside)
+        _known_save()                             # the file heals now: the kept rows only
 
 
 def _known_save():
