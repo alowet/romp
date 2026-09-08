@@ -65,6 +65,7 @@ nav:
   - Install: install.md
   - Guide: guide.md
   - Reference: reference.md
+  - PR tiers: pr-tiers.md
   - Internals:
       - How Romp works: architecture.md
       - Judges: judges.md

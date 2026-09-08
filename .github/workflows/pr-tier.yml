@@ -1,7 +1,8 @@
 name: PR tier
 
-# Every PR carries exactly one tier label: tests-only, fix, feature or
-# major-feature. The tier says who merges it and after what review, so a PR
+# Every PR carries exactly one tier label: docs, fix, feature or
+# major-feature (tests-only is accepted as the pre-rename spelling of docs
+# until the label is renamed on the upstream - drop it then). The tier says who merges it and after what review, so a PR
 # with no label has not been sorted yet and a PR with two has been sorted two
 # ways; this check fails in both cases and passes otherwise.
 #
@@ -61,9 +62,9 @@ jobs:
             echo "::error::Could not read this PR's labels from the API."
             exit 1
           }
-          count=$(jq '[.[] | select(. == "tests-only" or . == "fix" or . == "feature" or . == "major-feature")] | length' <<<"$LABELS")
+          count=$(jq '[.[] | select(. == "docs" or . == "tests-only" or . == "fix" or . == "feature" or . == "major-feature")] | length' <<<"$LABELS")
           if [ "$count" -eq 1 ]; then
             exit 0
           fi
-          echo "::error::This PR carries $count tier labels; exactly one is required: tests-only, fix, feature or major-feature."
+          echo "::error::This PR carries $count tier labels; exactly one is required: docs, fix, feature or major-feature."
           exit 1

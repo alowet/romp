@@ -1,0 +1,73 @@
+name: Tier policy
+
+# The PR tier POLICY (the maintainers' decisions of 2026-09-07), enforced as a required status check:
+# docs merges on green; fix merges on the other maintainer's approval or after seven unchanged days
+# with no changes requested; feature needs an approval; major-feature needs an approval AND a
+# discussion in a linked issue; anything touching .github/ or scripts/ci/ needs an approval regardless. Rulesets
+# cannot vary by label, so the policy is this check. The RULES are a pure function
+# (scripts/ci/tier_policy.py, pinned by tests/test_tier_policy.py); this workflow only fetches PR data
+# through the API and posts the verdict as a check run named "Tier policy" on the PR's head sha.
+#
+# TRUST MODEL, verified against the GitHub docs:
+# - pull_request_target runs THIS file from the base repository's default branch, never the PR's copy,
+#   so a PR cannot rewrite its own gate; the job never checks out or executes PR code (API reads only).
+# - pull_request_review runs in the PR's merge-commit context, so it is deliberately NOT a trigger:
+#   approvals propagate through the hourly schedule (or a manual dispatch), never through a job whose
+#   file the PR controls.
+# - The token holds checks:write (to post the verdict), pull-requests:read, issues:read, contents:read
+#   and nothing else. GITHUB_TOKEN is the GitHub Actions app's installation token, which is what the
+#   Checks API's "GitHub Apps only" write rule admits; the ruleset requiring this check must select the
+#   run posted by the GitHub Actions app.
+# - The seven-day clock is the later of the head's arrival on the PR (created_at, raised by every
+#   server-stamped force-push / reopen / ready-for-review event) and the start of the UNBROKEN chain
+#   of hourly "Tier policy" verdicts THIS PR received on the head (each verdict carries the PR number
+#   as external_id; a sibling PR's verdicts on the same sha lend nothing, and a gap restarts it). A
+#   head with no verdict yet has not started its clock: the run that evaluates it posts the first.
+#   Commit dates are the author's to forge and are never read.
+# - The job below is named "Tier policy evaluation", NOT "Tier policy": the required check is the
+#   API-posted verdict alone. Were the job named the same, every head would carry two same-named runs
+#   (the job's, frozen at push time, and the verdict the hourly sweep moves) and which one the ruleset
+#   honors is undocumented.
+# - RESIDUAL, stated as open: a PR can add a pull_request-triggered workflow whose JOB is named
+#   "Tier policy"; GitHub Actions creates that run on the head with no token, under the same app and
+#   sha as the base verdict, and the merge box follows the newest same-named run - app selection
+#   cannot tell them apart. The policy requires an approval for ANY PR touching .github/ or
+#   scripts/ci/ (a human looks), but that rule rides the check the forged run competes with; what
+#   closes it is a CODEOWNERS entry for those paths with code-owner review required in the ruleset.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled, edited]
+  schedule:
+    - cron: "17 * * * *"          # hourly: the seven-day clock and approval propagation
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to re-evaluate (empty = every open PR)"
+        required: false
+        default: ""
+
+permissions:
+  checks: write
+  pull-requests: read
+  issues: read
+  contents: read
+
+jobs:
+  policy:
+    name: Tier policy evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4          # the BASE branch's tree (pull_request_target / schedule / dispatch)
+      - name: Evaluate and post the verdict
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+        run: |
+          if [ -n "$PR_NUMBER" ]; then
+            python3 scripts/ci/tier_policy_check.py --pr "$PR_NUMBER"
+          else
+            python3 scripts/ci/tier_policy_check.py --all-open
+          fi
