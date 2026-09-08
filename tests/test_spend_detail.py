@@ -123,7 +123,7 @@ class SpendDetail(unittest.TestCase):
         self.assertEqual(web["turns"], 48 * 40)
         self.assertEqual(api["tok"], 96000 * 40)
         self.assertEqual(d["topN"], km._DETAIL_TOP_N)
-        self.assertIn("windows", d)
+        self.assertNotIn("windows", d, "the modal's window rows are the hover's own (no second parse, no dead payload)")
         self.assertEqual(d["tzOffsetMin"], int((time.localtime(NOW).tm_gmtoff or 0) // 60))
 
     def test_unattributed_spend_is_shown_never_dropped(self):
@@ -179,7 +179,8 @@ class SpendDetail(unittest.TestCase):
         self.assertEqual(d["scope"], "keyed")
         by = {s["name"]: s for s in d["sessions"]}
         self.assertAlmostEqual(by["web"]["usd"], 2.0, places=3, msg="the key-billed dollars only")
-        self.assertEqual(by["api"]["usd"], 0.0, "a login-only session bills nothing to the key")
+        self.assertNotIn("api", by, "a login-only session bills nothing to the key: not a row, not a stack")
+        self.assertEqual([s["name"] for s in d["days"]["stacks"]], ["web"])
         self.assertEqual(d["unattributed"]["usd"], 0.0)
         # the TOTAL scope, same ledger: the split rides beside the totals where the hover would show it
         km._claude_account = lambda: ""
@@ -191,10 +192,58 @@ class SpendDetail(unittest.TestCase):
         self.assertNotIn("key", by2["api"])
 
     def test_other_machines_are_counted_so_the_modal_can_say_this_machine_only(self):
-        km._remotes["peer"] = {"host": "peer", "status": "up", "usage": {"apiKey": True}}
-        km._remotes["down"] = {"host": "down", "status": "down", "usage": {"apiKey": True}}
+        # the hover's predicate exactly: a remote counts when it reports SPEND windows (review find: a
+        # login-only remote contributes bars, not spend, and must not be named as a machine "in the totals")
+        km._remotes["peer"] = {"host": "peer", "status": "up", "usage": {"apiKey": True, "spend": {"day": {"usd": 1}}}}
+        km._remotes["bars"] = {"host": "bars", "status": "up", "usage": {"fiveHour": {"pct": 5}}}
+        km._remotes["down"] = {"host": "down", "status": "down", "usage": {"apiKey": True, "spend": {"day": {"usd": 1}}}}
         d = km._spend_detail(now=NOW)
-        self.assertEqual(d["hosts"], 2, "one live peer joins the fleet totals; its bySid does not reach us")
+        self.assertEqual(d["hosts"], 2, "one live peer with spend joins the totals; its bySid does not reach us")
+
+    def test_a_login_without_a_key_is_the_computed_scope(self):
+        # the rail's THIRD arm: windows present, no key → the rail shows no spend at all; the modal must
+        # not dress computed costs up as API spend (review find)
+        km._claude_account = lambda: "acct-digest"
+        km._auth_key_present = lambda: False
+        (km.jd.STATE / "usage.json").write_text(json.dumps({"five_hour": {"pct": 10}}))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual(d["scope"], "computed")
+        self.assertEqual(d["sessions"][0]["name"], "web", "the computed costs are still per session")
+        html = km._landing()
+        self.assertIn("computed cost, not billed", html)
+        self.assertIn("Spend (computed)", html)
+
+    def test_totals_cover_the_days_the_chart_draws_not_every_bucket_kept(self):
+        # the recorder keeps the 90 most RECENT spend days, which can reach past 90 calendar days; the
+        # header says "last 90 days", so a bucket older than the chart's window counts nowhere (review find)
+        d0 = km._spend_detail(now=NOW)
+        led = json.loads((km.jd.STATE / "spend.json").read_text())
+        led["days"][_day(120)] = _bucket(999.0, 9990000, 99, {TESTS: {"usd": 999.0, "turns": 99, "tok": 9990000}})
+        (km.jd.STATE / "spend.json").write_text(json.dumps(led))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual([s["name"] for s in d["sessions"]], [s["name"] for s in d0["sessions"]], "the ranking is unmoved")
+        self.assertEqual(d["sessions"][2]["usd"], d0["sessions"][2]["usd"], "tests' total is the chart's window, not the ledger's reach")
+        self.assertEqual(d["unattributed"], d0["unattributed"])
+
+    def test_a_fall_back_transition_writes_one_slot_per_local_hour(self):
+        # TZ-pinned: 192 epoch hours across a fall-back hold 191 distinct local keys; the recorder merges
+        # both 01:00s into one key, so the series holds one slot for it, not a labeled empty twin
+        import os as _os
+        saved = _os.environ.get("TZ")
+        _os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+        try:
+            fall = time.mktime((2026, 11, 1, 12, 0, 0, 0, 0, -1))
+            d = km._spend_detail(now=fall)
+            hk = d["hours"]["keys"]
+            self.assertEqual(len(hk), len(set(hk)), "no duplicate hour key")
+            self.assertEqual(len(hk), km._SERIES_HOURS - 1)
+        finally:
+            if saved is None:
+                _os.environ.pop("TZ", None)
+            else:
+                _os.environ["TZ"] = saved
+            time.tzset()
 
     def test_an_empty_or_missing_ledger_answers_with_zeros_not_an_error(self):
         (km.jd.STATE / "spend.json").unlink()
@@ -221,7 +270,8 @@ class SpendDetail(unittest.TestCase):
         self.assertIn("rl-word", html)
         self.assertIn("this machine only", html)
         self.assertIn("recorded before per-session tracking", html, "unattributed spend is named, never folded")
-        self.assertIn("fleetSpendHTML(LAST||[],true)", html, "the modal's window numbers are the hover's own renderer")
+        self.assertIn("var rows=spendRowsHTML(LAST||[]);", html, "the modal's window numbers are the hover's own renderer")
+        self.assertIn("function fleetSpendHTML(sets){", html, "…whose signature the other suites pin, untouched")
         self.assertIn("body.theme-light #rsp-panel{", html, "a light-theme step of its own")
 
 

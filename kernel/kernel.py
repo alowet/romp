@@ -29237,14 +29237,19 @@ def _spend_scope():
     """Which figure the rail shows for THIS host, mirrored for the usage modal so its numbers are the
     rail's: "total" on a no-login (key-only) machine — every turn there bills the key, and legacy files
     predate the split — or "keyed" when a login's windows sit beside the key's spend, where only the
-    turns whose session billed the key are dollars anyone pays (_usage's two arms, the user 2026-08-08)."""
+    turns whose session billed the key are dollars anyone pays (_usage's two arms, the user 2026-08-08) —
+    or "computed" for a login with no key at all, where the rail shows no spend and every recorded
+    figure is a computed cost, not a bill."""
     try:
         o = json.loads((jd.STATE / "usage.json").read_text())
     except Exception:
         o = {}
     if o.get("apiKey") or not _claude_account():
         return "total"
-    return "keyed" if _auth_key_present() else "total"
+    if _auth_key_present():
+        return "keyed"
+    return "computed"   # a login and no key: the rail shows NO spend for this host (its third arm), and the
+    #                     ledger's figures are computed costs nobody is billed — the modal says so (review find)
 
 
 def _spend_detail(now=None):
@@ -29257,8 +29262,11 @@ def _spend_detail(now=None):
     dense arrays over the top-N sessions by dollars plus ONE "other" stack and ONE "unattributed"
     stack — a bucket written before bySid existed, or the part of a bucket no sid accounts for, is
     shown as such, never dropped or folded into a session (fail loudly). Local ledger only: a remote's
-    row carries no bySid through the relay today, so the payload counts the other machines the fleet
-    totals include and the modal says "this machine only" rather than omitting them silently.
+    row carries no bySid through the relay today, so the payload counts the other machines whose spend
+    the hover's totals include and the modal says "this machine only" rather than omitting them silently.
+    The table's totals and the ranking cover exactly the day keys the daily chart draws — the last 90
+    local dates — not every bucket the recorder still holds (it keeps the 90 most RECENT spend days,
+    which can reach further back; review find).
     Bucket keys are the recorder's LOCAL time; tz/tzOffsetMin let a viewer elsewhere label that."""
     now = time.time() if now is None else now
     try:
@@ -29292,9 +29300,12 @@ def _spend_detail(now=None):
             out[str(sid)] = (float(s.get("usd") or 0), int(s.get("tok") or 0), int(s.get("turns") or 0))
         return out
 
+    today = datetime.fromtimestamp(now).date()
+    day_keys = [(today - timedelta(days=i)).isoformat() for i in range(_DETAIL_DAYS - 1, -1, -1)]
+    day_set = set(day_keys)
     totals, keyt, un = {}, {}, [0.0, 0, 0]
-    for e in days.values():
-        if not isinstance(e, dict):
+    for k, e in days.items():
+        if k not in day_set or not isinstance(e, dict):
             continue
         tu, tt, tn = _tot(e)
         bs = _by(e)
@@ -29315,6 +29326,9 @@ def _spend_detail(now=None):
                     r = keyt.setdefault(str(sid), [0.0, 0, 0])
                     r[0] += float(k.get("usd") or 0); r[1] += int(k.get("tok") or 0); r[2] += int(k.get("turns") or 0)
         un[0] += max(0.0, tu - au); un[1] += max(0, tt - at); un[2] += max(0, tn - an)
+    # a session that contributed nothing under this scope (a login-only session in the keyed scope) is
+    # not a row and not a stack: an all-zero stack with a legend chip says nothing (review find)
+    totals = {sid: v for sid, v in totals.items() if v[0] > 0 or v[1] > 0 or v[2] > 0}
     try:
         live = set(_live_names(_tmux_sessions()).values())
     except Exception:
@@ -29369,15 +29383,22 @@ def _spend_detail(now=None):
         return {"keys": keys, "stacks": stacks}
 
     h0 = int(now // 3600) - (_SERIES_HOURS - 1)
-    hour_keys = [time.strftime("%Y-%m-%dT%H", time.localtime((h0 + i) * 3600)) for i in range(_SERIES_HOURS)]
-    today = datetime.fromtimestamp(now).date()
-    day_keys = [(today - timedelta(days=i)).isoformat() for i in range(_DETAIL_DAYS - 1, -1, -1)]
+    hour_keys = []
+    for i in range(_SERIES_HOURS):
+        # the recorder keys by local hour, so a fall-back transition writes two epoch hours under ONE
+        # key: one slot for it here too, not a labeled empty twin (review find)
+        k = time.strftime("%Y-%m-%dT%H", time.localtime((h0 + i) * 3600))
+        if not hour_keys or hour_keys[-1] != k:
+            hour_keys.append(k)
     with _remotes_lock:
-        up = sum(1 for r in _remotes.values() if r.get("status") == "up" and r.get("usage"))
+        # the machines the hover's spend totals include: the same predicate as its rows — a remote
+        # that reports spend windows — never any remote with a usage payload (review find)
+        up = sum(1 for r in _remotes.values()
+                 if r.get("status") == "up" and isinstance((r.get("usage") or {}).get("spend"), dict))
     lt = time.localtime(now)
     return {"host": _self_host(), "hosts": 1 + up, "scope": scope,
             "tz": time.strftime("%Z", lt), "tzOffsetMin": int((getattr(lt, "tm_gmtoff", 0) or 0) // 60),
-            "windows": _spend_windows(keyed_only=keyed), "recordedAt": _spend_recorded_at(),
+            "recordedAt": _spend_recorded_at(),
             "topN": _DETAIL_TOP_N, "sessions": sessions,
             "unattributed": {"usd": round(un[0], 4), "tok": un[1], "turns": un[2]},
             "hours": _series(hours, hour_keys), "days": _series(days, day_keys)}
@@ -36638,7 +36659,9 @@ return h;}
 // The ONE API-spend section for the whole hover (the user 2026-08-13): every host's windows summed —
 // one shared key is one number — plus the summed $/hour over the last 7 days as an area graph. A host
 // that ships no series (an older kernel) still joins the window sums; the graph adds only contributors.
-function fleetSpendHTML(sets,rowsOnly){var sum={},series=null,hosts=0,per=[],legacyN=0;
+var _spendRowsOnly=false;   // set by spendRowsHTML for the modal's first section (T247); the signature below is pinned
+function spendRowsHTML(sets){_spendRowsOnly=true;try{return fleetSpendHTML(sets);}finally{_spendRowsOnly=false;}}
+function fleetSpendHTML(sets){var sum={},series=null,hosts=0,per=[],legacyN=0,rowsOnly=_spendRowsOnly;
 sets.forEach(function(e){var sp=e.det&&e.det._spend;if(!sp)return;hosts++;
 if(sp.week&&typeof sp.week.usd==='number')per.push({host:e.host,usd:sp.week.usd});
 SPEND_WINS.forEach(function(w){var v=sp[w[0]];if(!v)return;
@@ -36661,7 +36684,7 @@ if(!ks.length)return '';
 // above this section and read as the spend's age): the newest contributing host's last-record
 // moment — the recorder writes per turn result, so this is an event time, not a poll time
 var sAt=0;sets.forEach(function(e){var a=e.det&&e.det._spendAt;if(typeof a==='number'&&a>sAt)sAt=a;});
-var h='<div class="ru-tip-win ru-tip-fleetspend"><div class=ru-tip-name><span>'+(rowsOnly?'Totals':'API spend')+(hosts>1?' \u00b7 '+hosts+' machines':'')+'</span></div>'
+var h='<div class="ru-tip-win ru-tip-fleetspend"><div class=ru-tip-name><span>API spend'+(hosts>1?' \u00b7 '+hosts+' machines':'')+'</span></div>'
 +ks.map(function(k){var v=sum[k];
 // the rolling month's caveats ride its label: a ledger younger than 30 days ("since <date>"), and
 // the machines whose older build could contribute only a calendar month (left out, counted)
@@ -36674,10 +36697,10 @@ var row='<div class=ru-tip-row><span class=ru-tip-k>'+lab+'</span>'
 if(v.split&&(v.tokIn+v.tokOut+v.tokCacheR+v.tokCacheW)>0)row+='<div class="ru-tip-row ru-tip-sub"><span class=ru-tip-k></span>'
 +'<span class=ru-tip-v>'+fmtTok(v.tokCacheR)+' cache read \u00b7 '+fmtTok(v.tokCacheW)+' cache write \u00b7 '+fmtTok(v.tokIn)+' in \u00b7 '+fmtTok(v.tokOut)+' out</span></div>';
 return row;}).join('');
-// rowsOnly: the usage MODAL's first section is THESE SAME window numbers (T247) — the fleet sums the
-// hover shows, one renderer, so the two levels can never disagree; the graph and the machine line
-// stay the hover's (the modal draws its own stacked histogram instead)
-if(rowsOnly)return h+'</div>';
+// rowsOnly: the usage MODAL's first section is THESE SAME window numbers (T247) — the sums across
+// every machine the hover shows, one renderer, so the two levels can never disagree; the graph and
+// the machine line stay the hover's (the modal draws its own stacked histogram instead)
+if(rowsOnly)return h.replace('<span>API spend','<span>Totals')+'</div>';
 // every machine in the sum, BY NAME (the user 2026-08-13: a host with no login \u2014 the devbox \u2014 vanished
 // from the hover entirely when the per-host spend rows collapsed into this one section; '3 machines'
 // with two names visible reads as a bug). One line, largest first, week numbers like the graph.
@@ -36770,7 +36793,7 @@ var SP={data:null,err:'',range:'hours',measure:'usd',open:false,allRows:false};
 var SP_OTHER='#4a5361',SP_NONE='#6b7a8c';   // "other" and a session with no identity color: neutrals, never a hue
 function spName(s){return s.name||('session '+String(s.sid||'').slice(0,8));}
 function spColor(s){return (s.bg&&/^#[0-9a-fA-F]{3,8}$/.test(s.bg))?s.bg:SP_NONE;}
-function spHead(){return '<div class=rsp-top><span>API spend'+(SP.data&&SP.data.host?' \u00b7 '+esc(SP.data.host):'')+'</span>'
+function spHead(){return '<div class=rsp-top><span>'+(SP.data&&SP.data.scope==='computed'?'Spend (computed)':'API spend')+(SP.data&&SP.data.host?' \u00b7 '+esc(SP.data.host):'')+'</span>'
 +'<button class=rsp-x data-act=close aria-label=Close>\u00d7</button></div>';}
 function openSpend(){if(!spBack||!spPanel)return;SP.open=true;spBack.hidden=false;SP.data=null;SP.err='';SP.allRows=false;
 spPanel.innerHTML=spHead()+'<div class=rsp-load>'+__ROMP_LOADER__+'</div>';   // the loader FIRST (the loader rule)
@@ -36820,13 +36843,17 @@ return h+'</tbody></table>';}
 function renderSpend(){if(!spPanel)return;var d=SP.data,h=spHead();
 if(!d){h+='<div class=rsp-err>Couldn\u2019t load the spend detail'+(SP.err?': '+esc(SP.err):'')+'. '
 +'<button class=rsp-btn data-act=retry>Try again</button></div>';spPanel.innerHTML=h;return;}
-// 1. the SAME window numbers the hover shows — the fleet sums, rows only (one renderer, two levels)
-var rows=fleetSpendHTML(LAST||[],true);
-h+='<div class=rsp-sec>'+(rows||'<div class=ru-tip-name><span>API spend</span></div><div class=rsp-note>Nothing recorded yet.</div>')+'</div>';
+// 1. the SAME window numbers the hover shows — the sums across every machine, rows only (one renderer)
+var rows=spendRowsHTML(LAST||[]);
+// a login with no key (scope "computed"): the rail shows no API spend for this machine on purpose, and
+// what the ledger holds is a computed cost nobody is billed — said here, not dressed up as a bill
+var computed=d.scope==='computed';
+h+='<div class=rsp-sec>'+(rows||('<div class=ru-tip-name><span>Totals</span></div><div class=rsp-note>'
++(computed?'No API spend on this machine: its sessions run on a login. The figures below are computed costs, not a bill.':'Nothing recorded yet.')+'</div>'))+'</div>';
 // 2. per session — THIS machine's ledger; when other machines join the totals above, say so
 var many=(d.hosts||1)>1;
 h+='<div class=rsp-sec><div class=ru-tip-name><span>By session'+(many?' \u00b7 this machine only':'')+'</span>'
-+'<span class=ru-tip-reset>'+(d.scope==='keyed'?'key-billed turns':'all turns')+' \u00b7 last '+((d.days&&d.days.keys)?d.days.keys.length:90)+' days</span></div>';
++'<span class=ru-tip-reset>'+(d.scope==='keyed'?'key-billed turns':computed?'computed cost, not billed':'all turns')+' \u00b7 last '+((d.days&&d.days.keys)?d.days.keys.length:90)+' days</span></div>';
 if(many)h+='<div class=rsp-note>Per-session detail covers '+esc(d.host||'this machine')+' only; the other '+(d.hosts-1)+' machine'+(d.hosts>2?'s':'')+' in the totals above do not share theirs yet.</div>';
 h+='<div id=rsp-table>'+sessionTable(d)+'</div></div>';
 // 3. the histogram — the two ranges the ledger itself holds; dollars by default, tokens on a toggle
@@ -36864,9 +36891,10 @@ if(!(mx>0)){box.innerHTML='<div class=rsp-note>Nothing recorded in this range.</
 var top=niceTop(mx),slot=W/n,gap=Math.min(2,slot*0.3),bw=Math.max(1,slot-gap),PADT=6;
 var Y=function(v){return H-Math.max(0,Math.min(1,v/top))*(H-PADT);};
 var fmt=function(v){return meas==='usd'?fmtUsd(v):fmtTok(Math.round(v));};
-// axis labels: whole dollars from $10 up (the readouts' rule); below that a 1-2-5 ceiling's half is
-// a half-dollar, and rounding it away would label two lines with the same number
-var afmt=function(v){if(meas!=='usd')return fmtTok(Math.round(v));return v>=10||v===Math.round(v)?fmtUsd(v):'$'+v.toFixed(1);};
+// axis labels wear whole dollars like every spend surface (no cents anywhere, the user 2026-08-09);
+// a half-line whose value is not a whole dollar (a $5 ceiling's $2.50) stays an unlabeled hairline
+// rather than rounding into a twin of another label
+var afmt=function(v){if(meas!=='usd')return fmtTok(Math.round(v));return v===Math.round(v)?fmtUsd(v):'';};
 // EVERY attribute quoted (review of the first render): this markup goes through innerHTML, i.e. the HTML
 // parser, where an unquoted value swallows the closing slash (`class=rsp-grid/>` is a line with the value
 // "rsp-grid/" left OPEN) and every later element became that line's child — an empty chart
@@ -36876,7 +36904,7 @@ var svg='<svg class="rsp-svg" viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+
 // recessive hairline gridlines at thirds + the ceiling, labels overlaid in HTML (the hover graph's grammar)
 var ylab='';[top,top/2].forEach(function(g){var gy=Y(g);
 svg+='<line x1="0" y1="'+gy.toFixed(1)+'" x2="'+W+'" y2="'+gy.toFixed(1)+'" class="rsp-grid"></line>';
-ylab+='<span class=ru-tip-gy style="top:'+(gy+1).toFixed(0)+'px">'+afmt(g)+'</span>';});
+var al=afmt(g);if(al)ylab+='<span class=ru-tip-gy style="top:'+(gy+1).toFixed(0)+'px">'+al+'</span>';});
 // one column per bucket, stacked bottom-up in stack order (top-N by dollars, then other, then
 // unattributed); a 2px surface gap between touching segments; the topmost segment's top corners
 // rounded (4px data-end, square at the baseline) — the dataviz mark specs
@@ -36894,8 +36922,8 @@ svg+='</svg>';
 // daily range → the 1st and 15th. The keys are the KERNEL's local time — named when the viewer's differs.
 var xlab='';for(var i=0;i<n;i++){var k=ser.keys[i],m;
 if(SP.range==='hours'){m=/^(\\d{4})-(\\d\\d)-(\\d\\d)T00$/.exec(k);if(m){var dd=new Date(+m[1],+m[2]-1,+m[3]);
-xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(2)+'%">'+['S','M','T','W','T','F','S'][dd.getDay()]+'</span>';}}
-else{m=/^(\\d{4})-(\\d\\d)-(01|15)$/.exec(k);if(m)xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(2)+'%">'+Number(m[2])+'/'+Number(m[3])+'</span>';}}
+xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+['S','M','T','W','T','F','S'][dd.getDay()]+'</span>';}}
+else{m=/^(\\d{4})-(\\d\\d)-(01|15)$/.exec(k);if(m)xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+Number(m[2])+'/'+Number(m[3])+'</span>';}}
 var leg='<div class=rsp-leg>'+stacks.map(function(s){return '<span class="rsp-chip'+(s.kind==='sid'&&!s.live?' rsp-dead':'')+'"><i class="rsp-sw'+(s.kind==='unattributed'?' rsp-hatch':'')+'"'
 +(s.kind==='unattributed'?'':' style="background:'+(s.kind==='other'?SP_OTHER:spColor(s))+'"')+'></i>'+esc(spStackName(s))+'</span>';}).join('')+'</div>';
 var tzNote='';var mine=-(new Date().getTimezoneOffset());
