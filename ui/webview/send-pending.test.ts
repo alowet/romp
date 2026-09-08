@@ -21,7 +21,7 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { newPending, pendingBody, reconcilePending, dropPending, injectionGroups, scanFrom, queuedCopyToHide, landedIn, provisionalIn, bareGroupLabel, type TailEvent, type PendingSend } from "./send-pending";
+import { newPending, pendingBody, reconcilePending, dropPending, injectionGroups, scanFrom, queuedCopyToHide, foreignKey, landedIn, provisionalIn, bareGroupLabel, type TailEvent, type PendingSend } from "./send-pending";
 
 const read = (f: string) => fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", f), "utf8");
 const RENDER = read("render.ts");
@@ -205,7 +205,7 @@ test("several pending sends: each after its own anchor, in send order; same anch
   const none = press([], "hello");
   assert.deepEqual(injectionGroups([], reconcilePending([], none).inject), [{ idx: 0, sends: [none[0]] }]);
   // an anchor that left the resident window: everything resident is later than the send, so the slot is the head
-  assert.equal(scanFrom([{ kind: "tool", uuid: "zz" }], { after: "gone", place: null, queuedForeign: [], seen: [], queued: 0 }), 0);
+  assert.equal(scanFrom([{ kind: "tool", uuid: "zz" }], { after: "gone", place: null, queuedForeign: [], queuedResident: {}, seen: [], queued: 0 }), 0);
 });
 
 test("a send pressed while an earlier send's echo is the newest event is placed BELOW that echo (review of the first cut)", () => {
@@ -344,8 +344,8 @@ test("a send pressed while the kernel's queue holds OTHER texts is drawn below t
   const queued: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "a nudge from elsewhere" }, { md: "mine" }] }];
   const mine = newPending("mine", undefined, T0);
   let r = reconcilePending(queued, [mine]);
-  assert.deepEqual(mine.at?.queuedForeign, ["a nudge from elsewhere"], "the foreign texts at the press are recorded");
-  assert.equal(mine.at?.queued, 1, "…and our own copy is background as before");
+  assert.deepEqual(mine.at?.queuedForeign, ["a nudge from elsewhere", "mine"], "every copy the queue held at the press is ahead of the send — a same-text copy included: it predates the press, so it is an older send's (second review)");
+  assert.equal(mine.at?.queued, 1, "…and it is background for the landing scan as before");
   assert.deepEqual(injectionGroups(queued, r.inject), [{ idx: 2, sends: [mine] }], "below the queue, not above it");
   // our copy hidden (render.ts) leaves the foreign text visible: still below
   const hidden: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "a nudge from elsewhere" }, { md: "mine", hiddenByPending: true }] }];
@@ -354,12 +354,21 @@ test("a send pressed while the kernel's queue holds OTHER texts is drawn below t
   const landed: TailEvent[] = [...tail, { kind: "user", md: "a nudge from elsewhere", uuid: "uN" }, { kind: "tool", uuid: "t1" }];
   r = reconcilePending(landed, [mine]);
   assert.deepEqual(injectionGroups(landed, r.inject), [{ idx: 2, sends: [mine] }]);
-  // a queue holding only OUR text keeps the in-place rule (right after the anchor)
-  const ours: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "mine" }] }];
+  // OUR copy is the one the kernel lists AFTER the press: not in the frame at the press, hidden by render.ts
+  // when it appears — the in-place rule (right after the anchor) holds for it
   const mine2 = newPending("mine", undefined, T0 + 1);
-  r = reconcilePending(ours, [mine2]);
+  r = reconcilePending(tail, [mine2]);
   assert.deepEqual(mine2.at?.queuedForeign, []);
-  assert.deepEqual(injectionGroups(ours, r.inject), [{ idx: 1, sends: [mine2] }]);
+  const listed: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "mine" }] }];
+  r = reconcilePending(listed, [mine2]);
+  assert.deepEqual(r.unqueue, [mine2], "the copy that appears after the press is this send's: hidden, ours drawn");
+  assert.deepEqual(injectionGroups(listed, r.inject), [{ idx: 1, sends: [mine2] }]);
+  // a same-text copy PRESENT at the press is an older send's (another client, an earlier press): ahead, below the group
+  const older: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "mine" }] }];
+  const mine3 = newPending("mine", undefined, T0 + 2);
+  r = reconcilePending(older, [mine3]);
+  assert.deepEqual(mine3.at?.queuedForeign, ["mine"]);
+  assert.deepEqual(injectionGroups(older, r.inject), [{ idx: 2, sends: [mine3] }]);
   // render.ts: the stale merge-into-the-group comment is gone; the tail group is described as a floor
   assert.doesNotMatch(RENDER, /Ours merges INTO it when present/);
   assert.match(RENDER, /a group holding OTHER texts is a floor/);
@@ -372,7 +381,7 @@ test("foreign and floor texts match the kernel's landed shapes: a nudge's quote 
   const full = "> the goal's context line\n\n" + body + "\n\n<!-- romp-goal-id: g1 --><!-- romp-injected -->";
   const x = newPending("mine", undefined, T0);
   reconcilePending([...tail, { kind: "queued", texts: [{ md: body }, { md: "mine" }] }], [x]);
-  assert.deepEqual(x.at?.queuedForeign, [body]);
+  assert.deepEqual(x.at?.queuedForeign, [body, "mine"], "every copy present at the press is ahead (the same-text one is an older send's)");
   const nudgeLanded: TailEvent[] = [...tail, { kind: "user", md: full, uuid: "uN" }, { kind: "assistant", md: "…", uuid: "a2" }, { kind: "queued", texts: [{ md: "mine", hiddenByPending: true }] }];
   assert.deepEqual(injectionGroups(nudgeLanded, reconcilePending(nudgeLanded, [x]).inject), [{ idx: 2, sends: [x] }], "below the landed nudge, whatever wrapping the kernel kept");
   // (2) a multi-block record: two foreign texts taken at one boundary land as ONE user record
@@ -403,6 +412,38 @@ test("foreign and floor texts match the kernel's landed shapes: a nudge's quote 
   dropPending([x4, y4], "first", x4.ts);   // the ✕ the kernel could not honour: the CLI had taken it
   const afterX: TailEvent[] = [...tail, { kind: "user", md: "first", uuid: "uX", absorbed: true }, { kind: "tool", uuid: "t1" }];
   assert.deepEqual(injectionGroups(afterX, reconcilePending(afterX, [y4]).inject), [{ idx: 2, sends: [y4] }], "below X's atom, under its new uuid");
+});
+
+test("the queue's copies count as they were at the press: a later press matching a queued text, resident carriers, and the key's gates (T252b second review)", () => {
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
+  // (1) another client's "y" queued; A presses "x", then B presses "y": both run after that y, and A before B
+  const foreignY: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "y" }] }];
+  const a = newPending("x", undefined, T0); reconcilePending(foreignY, [a]);
+  const b = newPending("y", undefined, T0 + 1); let r = reconcilePending(foreignY, [a, b]);
+  assert.deepEqual(b.at?.queuedForeign, ["y"], "the copy predates B's press: ahead of B, whatever its text");
+  assert.deepEqual(injectionGroups(foreignY, r.inject), [{ idx: 2, sends: [a, b] }], "both below the group, in send order");
+  // (2) a carrier of the text already resident at the press (a never-delivered verdict for an earlier F) is not
+  // the press-time copy's landing: the group holding F stays the floor
+  const resident: TailEvent[] = [...tail, { kind: "user", md: "F", uuid: "echo:F0", undelivered: true }, { kind: "queued", texts: [{ md: "F" }] }];
+  const c = newPending("mine", undefined, T0 + 2); r = reconcilePending(resident, [c]);
+  assert.deepEqual(injectionGroups(resident, r.inject), [{ idx: 3, sends: [c] }], "below the group, not at the group's own index");
+  const residentLanded: TailEvent[] = [...tail, { kind: "user", md: "F", uuid: "echo:F0", undelivered: true }, { kind: "user", md: "F", uuid: "uF" }, { kind: "tool", uuid: "t1" }];
+  assert.deepEqual(injectionGroups(residentLanded, reconcilePending(residentLanded, [c]).inject), [{ idx: 3, sends: [c] }], "…and below the copy's landing once it lands");
+  // (3) the key: a leading quote block is set aside only for a romp-marked text (the kernel's own gate); a
+  // user's blockquote is part of the text; image chips and image paths are set aside like the kernel strips them
+  assert.equal(foreignKey("> the goal\n\nbody\n\n<!-- romp-goal-id: g1 -->"), "body");
+  assert.notEqual(foreignKey("> hi\nok"), foreignKey("ok"), "a typed blockquote is not wrapping");
+  assert.equal(foreignKey("look /tmp/shot.png"), foreignKey("look"));
+  assert.equal(foreignKey("look [Image #1]"), foreignKey("look"));
+  // an image-bearing foreign message (tmux route): queued with the path, landed with the chips stripped
+  const imgQueued: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "look /tmp/shot.png" }] }];
+  const d = newPending("mine", undefined, T0 + 3); reconcilePending(imgQueued, [d]);
+  const imgLanded: TailEvent[] = [...tail, { kind: "user", md: "look", uuid: "uI", images: [{}] }, { kind: "tool", uuid: "t1" }];
+  assert.deepEqual(injectionGroups(imgLanded, reconcilePending(imgLanded, [d]).inject), [{ idx: 2, sends: [d] }]);
+  // a copy whose text is a user's blockquote plus ours: still a copy present at the press, still ahead
+  const quoted: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "> hi\nok" }] }];
+  const e = newPending("ok", undefined, T0 + 4); r = reconcilePending(quoted, [e]);
+  assert.deepEqual(injectionGroups(quoted, r.inject), [{ idx: 2, sends: [e] }]);
 });
 
 test("a bubble that changes slot marks the view stale, so the incremental repaint never trusts a shifted prefix (second review)", () => {
@@ -710,7 +751,7 @@ test("a send pressed against no frame (a placeholder tab): the first frame's cop
   // a first frame that predates the send entirely stamps exactly as a press-time stamp would
   list = [late()];
   reconcilePending([frame[0], frame[1]], list);
-  assert.deepEqual(list[0].at, { after: "a1", place: "u-old", placeText: TEXT, placeOrd: 0, queuedForeign: [], seen: ["u-old"], queued: 0 });
+  assert.deepEqual(list[0].at, { after: "a1", place: "u-old", placeText: TEXT, placeOrd: 0, queuedForeign: [], queuedResident: {}, seen: ["u-old"], queued: 0 });
   // a press-time stamp reads no stamp: its frame predates the press by construction, so an identical
   // message that landed within the press's own second is still background
   const prompt = press([frame[1], { kind: "user", md: TEXT, uuid: "u-same-second", ts: isoAt(Math.floor(T0 / 1000)) }], TEXT);
@@ -760,7 +801,7 @@ test("a late stamp presumes the first frame's newest queued copy of the text is 
   // follows covers it, exactly as at a press-time stamp
   const early = [late()];
   let r = reconcilePending([step], early);
-  assert.deepEqual(early[0].at, { after: "a1", place: null, placeText: undefined, placeOrd: 0, queuedForeign: [], seen: [], queued: 0 });
+  assert.deepEqual(early[0].at, { after: "a1", place: null, placeText: undefined, placeOrd: 0, queuedForeign: [], queuedResident: {}, seen: [], queued: 0 });
   assert.equal(r.inject.length, 1);
   r = reconcilePending([step, { kind: "queued", texts: [{ md: TEXT }] }], early);
   assert.equal(r.inject.length, 1);

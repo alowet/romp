@@ -47,11 +47,17 @@ export type SendBase = {
                           //   landed in place, so the k-th match stays the floor while a LATER send of the same text
                           //   (its echo, its atom) lands beyond it and is never taken (third review). 0 → the floor sits
                           //   at or above the anchor, which already covers it: no fallback
-  queuedForeign: string[]; // texts the kernel's tail queue held at the press that are NOT this client's pending
-                          //   sends (a queued romp nudge, another client's message, a queue predating a page
-                          //   reload): the send runs after them, so its bubble is drawn below that group while it
-                          //   holds them and below their atoms once they land (T252b). The group carries no uuid
-                          //   and is no user event, so neither the anchor nor the floor ever saw it
+  queuedForeign: string[]; // the texts of every visible copy the kernel's tail queue held at the press, one entry
+                          //   per copy (a queued romp nudge, another client's message, an earlier press of this
+                          //   client, a queue predating a page reload): at a press-time stamp every one of them
+                          //   predates the press, so the send runs after them all — its bubble is drawn below that
+                          //   group while a press-time copy is still queued and below their atoms once they land
+                          //   (T252b). A LATE stamp leaves out the newest `own` copies of this send's text, the
+                          //   ones the queued presumption reads as this press's. The group carries no uuid and is
+                          //   no user event, so neither the anchor nor the floor ever saw it
+  queuedResident?: Record<string, number>; // per foreign key: user events after the anchor that already carried the
+                          //   text AT THE PRESS (a never-delivered verdict for an earlier copy) — not the queued
+                          //   copies' landings, so placement's ordinal counts them out (second review)
   seen: string[];         // uuids of the user events carrying the text that are background for this send: what
                           //   the press found, and what an earlier same-text entry claimed since — ONE ENTRY PER
                           //   COPY (a record of several sends lists its uuid once per spoken-for block)
@@ -104,12 +110,26 @@ export const OPT_PREFIX = "optimistic:";
 export const isOptimisticUuid = (u?: string): boolean => !!u && u.startsWith(OPT_PREFIX);
 export const isKernelEchoUuid = (u?: string): boolean => !!u && u.startsWith("echo:");
 const collapse = (s: string): string => s.replace(/\s+/g, " ").trim();
-/** The text a kernel event and a queued copy share once the kernel's wrapping is set aside: the queued group
- *  ships a romp nudge's split BODY, the landed atom keeps the full text — a leading `> ` goal quote, the body,
- *  and `<!-- … -->` marker comments (the kernel splits a landed record only for a human author). Compared on
- *  this key, the two are one text (T252b review). */
-const foreignKey = (s: string): string =>
-  collapse(s.replace(/<!--[\s\S]*?-->/g, " ").split("\n").filter((l) => !/^\s*>/.test(l)).join("\n"));
+/** The text a kernel event and a queued copy share once the kernel's wrapping is set aside (T252b review):
+ *  - a romp-marked text (a nudge, a follow-up: `<!-- romp-… -->` in its tail) is queued as its split BODY but
+ *    landed with the full text — a LEADING `> ` goal-quote block, the body, the marker comments (the kernel
+ *    splits a landed record only for a human author). The comments go, and the leading quote block goes only
+ *    when a romp marker is present — the kernel's own gate; a blockquote the user typed is part of their text;
+ *  - the CLI's image chips (`[Image #N]`) and image paths go: an image-bearing message is queued with the path
+ *    or the chip and landed with the chips stripped (kernel.py, images present), the same asymmetry
+ *    landedCopies sets aside for this client's own sends. */
+export const foreignKey = (s: string): string => {
+  const marked = /<!--\s*romp-/.test(s);
+  let t = s.replace(/<!--[\s\S]*?-->/g, " ");
+  if (marked) {
+    const lines = t.split("\n");
+    let i = 0;
+    while (i < lines.length && (/^\s*>/.test(lines[i]) || (i > 0 && !lines[i].trim()))) i++;
+    if (i > 0 && lines.slice(0, i).some((l) => /^\s*>/.test(l))) t = lines.slice(i).join("\n");
+  }
+  t = t.replace(/\[Image #\d+\]/g, " ").replace(/"?\S+\.(?:png|jpe?g|gif|webp)"?/gi, " ");
+  return collapse(t);
+};
 /** Whether a user event carries `text` (on the foreignKey) in its md or any of its blocks — a record the CLI
  *  wrote from several queued messages taken at one boundary lists each as a block (T252b review). */
 const carriesText = (e: TailEvent, text: string): boolean => {
@@ -246,7 +266,7 @@ const eventSecond = (e: TailEvent): number | null => {
  *  is confined to the late stamp because that is the only stamp that can meet the send's own records,
  *  and because at a press-time stamp it could only misfire (an identical message that landed within
  *  the press's second would read as this send's). */
-export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.late ? 1 : 0, pendingTexts?: Set<string>): SendBase {
+export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.late ? 1 : 0): SendBase {
   const pressS = p.late ? Math.floor(p.ts / 1000) : Infinity;
   const beforeSend = (e: TailEvent): boolean => { const s = eventSecond(e); return s === null || s < pressS; };
   let after: string | null = null;
@@ -273,22 +293,39 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
     const n = copiesIn(e, p);
     for (let k = 0; k < n; k++) seen.push(e.uuid);   // once per COPY: a record of several sends is several
   }
-  // the texts the tail queue holds that are nobody's pending send here: the send runs after them (T252b)
+  // every visible copy the tail queue held at the press is ahead of this send (T252b): a press-time frame
+  // predates the press by construction, so none of them is this send's — a same-text copy is an older send's
+  // (another client, an earlier press). A late stamp leaves out the newest `own` copies of this text (the
+  // queued presumption). Beside them, the carriers of each text already resident after the anchor: those
+  // are not the queued copies' landings, so placement counts them out (second review).
   const queuedForeign: string[] = [];
+  const queuedResident: Record<string, number> = {};
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
     if (e.kind !== "queued") continue;
-    for (const t of e.texts || []) {
-      if (typeof t.md !== "string" || t.hiddenByPending) continue;
-      if (foreignKey(t.md) === foreignKey(p.text) || (pendingTexts && [...pendingTexts].some((x) => foreignKey(t.md!) === foreignKey(x)))) continue;
-      queuedForeign.push(t.md);
+    let skipOwn = p.late ? own : 0;
+    const copies = (e.texts || []).filter((t) => typeof t.md === "string" && !t.hiddenByPending).map((t) => t.md as string);
+    for (let k = copies.length - 1; k >= 0; k--) {
+      if (skipOwn > 0 && foreignKey(copies[k]) === foreignKey(p.text)) { skipOwn--; continue; }
+      queuedForeign.unshift(copies[k]);
     }
     break;
+  }
+  if (queuedForeign.length) {
+    let anchorIdx = -1;
+    if (after !== null) for (let i = events.length - 1; i >= 0; i--) if (events[i].uuid === after) { anchorIdx = i; break; }
+    for (const f of queuedForeign) {
+      const k = foreignKey(f);
+      if (k in queuedResident) continue;
+      let n = 0;
+      for (let i = anchorIdx + 1; i < events.length; i++) if (carriesText(events[i], f)) n++;
+      queuedResident[k] = n;
+    }
   }
   // the queued presumption (above): a late stamp's newest `own` copies are this press's, so the count of
   // background copies stops short of them — at zero when the frame lists fewer than presumed (the kernel
   // had not received every press yet; the copies still to come cover those entries in order)
-  return { after, place, placeText, placeOrd, queuedForeign, seen, queued: Math.max(0, queued - (p.late ? own : 0)) };
+  return { after, place, placeText, placeOrd, queuedForeign, queuedResident, seen, queued: Math.max(0, queued - (p.late ? own : 0)) };
 }
 
 /** The first index AFTER the send's anchor — or 0 when there is no anchor, or when the anchor has left the
@@ -340,8 +377,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
   // identical sends pressed against the same placeholder frame own as many copies as there were presses.
   const lateOwn = new Map<string, number>();
   for (const p of list) if (!p.at && p.late) lateOwn.set(p.text, (lateOwn.get(p.text) || 0) + 1);
-  const pendingTexts = new Set(list.map((q) => q.text));
-  for (const p of list) if (!p.at) p.at = stampBase(events, p, p.late ? lateOwn.get(p.text) || 1 : 0, pendingTexts);
+  for (const p of list) if (!p.at) p.at = stampBase(events, p, p.late ? lateOwn.get(p.text) || 1 : 0);
   const r: Reconciled = { keep: [], inject: [], unqueue: [], landed: [], lost: [] };
   const claimed = new Map<string, number>();           // "index\0text" → copies of that text in that landing taken by earlier entries THIS push
   const takenCopies = new Map<string, Set<number>>();  // text → queued-copy positions taken by an earlier entry THIS push
@@ -511,7 +547,8 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
     for (const f of at.queuedForeign) { const k = foreignKey(f); const c = counts.get(k); if (c) c.n++; else counts.set(k, { text: f, n: 1 }); }
     let groupIdx = -1;
     for (let j = events.length - 1; j >= base; j--) if (events[j].kind === "queued") { groupIdx = j; break; }
-    for (const { text, n } of counts.values()) {
+    for (const { text, n: copies } of counts.values()) {
+      const n = copies + ((at.queuedResident || {})[foreignKey(text)] || 0);   // the carriers resident at the press come first
       const k = kthCarrier(text, n);
       let floor = k.idx >= 0 ? k.idx + 1 : -1;
       if (k.count < n && groupIdx >= 0) {
