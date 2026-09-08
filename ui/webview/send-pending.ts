@@ -41,7 +41,12 @@ export type SendBase = {
                           //   (not a stable place to bound the landing scan), but for placement an echo is exactly the
                           //   earlier send the bubble must follow. null → no user event at the press, the anchor rules
   placeText?: string;     // that event's text: when its uuid leaves (the echo → landed swap), the landed atom carrying
-                          //   the same text after the anchor is the floor
+                          //   the same text after the anchor is the floor…
+  placeOrd?: number;      //   …found by ORDINAL: how many same-text user events sit after the anchor through the floor
+                          //   at the press (the floor itself included). Events before the floor only ever swap echo →
+                          //   landed in place, so the k-th match stays the floor while a LATER send of the same text
+                          //   (its echo, its atom) lands beyond it and is never taken (third review). 0 → the floor sits
+                          //   at or above the anchor, which already covers it: no fallback
   seen: string[];         // uuids of the user events carrying the text that are background for this send: what
                           //   the press found, and what an earlier same-text entry claimed since — ONE ENTRY PER
                           //   COPY (a record of several sends lists its uuid once per spoken-for block)
@@ -218,10 +223,19 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
   const beforeSend = (e: TailEvent): boolean => { const s = eventSecond(e); return s === null || s < pressS; };
   let after: string | null = null;
   for (let i = events.length - 1; i >= 0; i--) if (stableUuid(events[i]) && beforeSend(events[i])) { after = events[i].uuid!; break; }
-  let place: string | null = null, placeText: string | undefined;
+  let place: string | null = null, placeText: string | undefined, placeOrd = 0;
+  let floorIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
-    if (e.kind === "user" && e.uuid && !isOptimisticUuid(e.uuid) && beforeSend(e)) { place = e.uuid; placeText = typeof e.md === "string" ? e.md : undefined; break; }
+    if (e.kind === "user" && e.uuid && !isOptimisticUuid(e.uuid) && beforeSend(e)) { place = e.uuid; placeText = typeof e.md === "string" ? e.md : undefined; floorIdx = i; break; }
+  }
+  if (floorIdx >= 0 && placeText !== undefined) {
+    let anchorIdx = -1;
+    if (after !== null) for (let i = events.length - 1; i >= 0; i--) if (events[i].uuid === after) { anchorIdx = i; break; }
+    for (let i = anchorIdx + 1; i <= floorIdx; i++) {
+      const e = events[i];
+      if (e.kind === "user" && !isOptimisticUuid(e.uuid) && typeof e.md === "string" && sameText(e.md, placeText)) placeOrd++;
+    }
   }
   const seen: string[] = [];
   let queued = 0;
@@ -234,7 +248,7 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
   // the queued presumption (above): a late stamp's newest `own` copies are this press's, so the count of
   // background copies stops short of them — at zero when the frame lists fewer than presumed (the kernel
   // had not received every press yet; the copies still to come cover those entries in order)
-  return { after, place, placeText, seen, queued: Math.max(0, queued - (p.late ? own : 0)) };
+  return { after, place, placeText, placeOrd, seen, queued: Math.max(0, queued - (p.late ? own : 0)) };
 }
 
 /** The first index AFTER the send's anchor — or 0 when there is no anchor, or when the anchor has left the
@@ -383,21 +397,29 @@ export function injectionGroups(events: TailEvent[], inject: PendingSend[]): Inj
  *  (an echo is not a stable place to bound the LANDING scan, since the landed atom replaces it under a new
  *  uuid) but which is older than this send all the same. Without it a second message pressed while the
  *  first's echo was the newest event sat ABOVE it until both landed (review of the first cut). The floor is
- *  found by identity: its uuid, or — once the echo has become the landed atom — the last user event after
- *  the anchor carrying its text. Never by comparing the client's clock with the kernel's stamps: the frame
+ *  found by identity: its uuid, or — once the echo has become the landed atom — the k-th user event after
+ *  the anchor carrying its text, k being how many such events sat through the floor at the press (a later
+ *  send of the same text lands beyond the k-th and is never taken; the last match used to be, and pulled
+ *  the bubble to the tail under a newer message — third review). A floor at or above the anchor is already
+ *  covered by the anchor. Never by comparing the client's clock with the kernel's stamps: the frame
  *  resident at the press is older than the send by construction, and a clock comparison re-inverted the
  *  order whenever the kernel clock led the client by more than the gap between two presses (second
  *  review). A user event that arrives after the press is a later send and stays below the bubble. */
 export function placementIndex(events: TailEvent[], p: PendingSend): number {
   const at = p.at!;
   let idx = scanFrom(events, at);
-  if (!at.place) return idx;
+  if (!at.place || !(at.placeOrd && at.placeOrd > 0)) return idx;   // no floor after the anchor: the anchor rules
   for (let j = events.length - 1; j >= idx; j--) if (events[j].uuid === at.place) return j + 1;
   if (at.placeText !== undefined) {
-    for (let j = events.length - 1; j >= idx; j--) {
+    let n = 0, last = -1;
+    for (let j = idx; j < events.length; j++) {
       const e = events[j];
-      if (e.kind === "user" && !isOptimisticUuid(e.uuid) && typeof e.md === "string" && sameText(e.md, at.placeText)) return j + 1;
+      if (e.kind === "user" && !isOptimisticUuid(e.uuid) && typeof e.md === "string" && sameText(e.md, at.placeText)) {
+        n++; last = j;
+        if (n === at.placeOrd) return j + 1;              // the floor, under its landed uuid
+      }
     }
+    if (last >= 0) return last + 1;                       // fewer matches than at the press (a pruned echo): the newest stands in
   }
   return idx;
 }

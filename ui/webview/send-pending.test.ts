@@ -272,6 +272,36 @@ test("the placement floor is the last user event AT THE PRESS, by identity, neve
   assert.doesNotMatch(read("send-pending.ts").split("export function placementIndex(")[1].split("\n}")[0], /eventSecond|pressS|p\.ts/, "placement reads no clock");
 });
 
+test("the text fallback finds the floor by ORDINAL, so a later send of the same text never pulls the bubble down (third review)", () => {
+  // A = "ok" pressed and echoed; B = "next" pressed with echo:A the newest user event; A lands, two steps stream,
+  // then the user sends "ok" again. The fallback used to take the LAST same-text user event — the new send's echo —
+  // and B's bubble dropped to the tail under a message pressed after it, until B landed.
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
+  const echoedA: TailEvent[] = [...tail, { kind: "user", md: "ok", uuid: "echo:A" }];
+  const b = newPending("next", undefined, T0);
+  reconcilePending(echoedA, [b]);
+  assert.equal(b.at?.place, "echo:A");
+  assert.equal(b.at?.placeOrd, 1, "one same-text user event from the anchor through the floor");
+  const later: TailEvent[] = [...tail, { kind: "user", md: "ok", uuid: "uA", absorbed: true }, { kind: "tool", uuid: "t1" }, { kind: "tool", uuid: "t2" }, { kind: "user", md: "ok", uuid: "echo:C" }];
+  assert.deepEqual(injectionGroups(later, reconcilePending(later, [b]).inject), [{ idx: 2, sends: [b] }], "below uA, above t1 — not under the newer echo");
+  const laterLanded: TailEvent[] = [...later.slice(0, 4), { kind: "user", md: "ok", uuid: "uC" }];
+  assert.deepEqual(injectionGroups(laterLanded, reconcilePending(laterLanded, [b]).inject), [{ idx: 2, sends: [b] }], "…nor under its landed atom");
+  // two identical echoes as the tail: the floor is the SECOND, so after both land the bubble sits below the second
+  const twin: TailEvent[] = [...tail, { kind: "user", md: "ok", uuid: "echo:A1" }, { kind: "user", md: "ok", uuid: "echo:A2" }];
+  const c = newPending("next", undefined, T0 + 1);
+  reconcilePending(twin, [c]);
+  assert.equal(c.at?.placeOrd, 2);
+  const twinLanded: TailEvent[] = [...tail, { kind: "user", md: "ok", uuid: "uA1" }, { kind: "user", md: "ok", uuid: "uA2" }, { kind: "tool", uuid: "t1" }];
+  assert.deepEqual(injectionGroups(twinLanded, reconcilePending(twinLanded, [c]).inject), [{ idx: 3, sends: [c] }]);
+  // the floor sits ABOVE the anchor (steps followed the last message before the press): the anchor already covers
+  // it, and a later same-text send must not become a floor
+  const stepsAfter: TailEvent[] = [{ kind: "user", md: "ok", uuid: "u0" }, { kind: "tool", uuid: "t0" }, { kind: "assistant", md: "…", uuid: "a1" }];
+  const d = press(stepsAfter, "next")[0];
+  assert.equal(d.at?.placeOrd, 0, "no same-text event after the anchor: the floor is not in play");
+  const stepsAfterLater: TailEvent[] = [...stepsAfter, { kind: "tool", uuid: "t3" }, { kind: "user", md: "ok", uuid: "echo:D" }];
+  assert.deepEqual(injectionGroups(stepsAfterLater, reconcilePending(stepsAfterLater, [d]).inject), [{ idx: 3, sends: [d] }], "right after the anchor");
+});
+
 test("a bubble that changes slot marks the view stale, so the incremental repaint never trusts a shifted prefix (second review)", () => {
   // chatTail lowers v.rendered to the kernel index and the normal-mode append path re-renders from there, assuming
   // the DOM prefix still matches s.events — which also requires the bubble's SLOT to be unchanged. The settle
@@ -577,7 +607,7 @@ test("a send pressed against no frame (a placeholder tab): the first frame's cop
   // a first frame that predates the send entirely stamps exactly as a press-time stamp would
   list = [late()];
   reconcilePending([frame[0], frame[1]], list);
-  assert.deepEqual(list[0].at, { after: "a1", place: "u-old", placeText: TEXT, seen: ["u-old"], queued: 0 });
+  assert.deepEqual(list[0].at, { after: "a1", place: "u-old", placeText: TEXT, placeOrd: 0, seen: ["u-old"], queued: 0 });
   // a press-time stamp reads no stamp: its frame predates the press by construction, so an identical
   // message that landed within the press's own second is still background
   const prompt = press([frame[1], { kind: "user", md: TEXT, uuid: "u-same-second", ts: isoAt(Math.floor(T0 / 1000)) }], TEXT);
@@ -627,7 +657,7 @@ test("a late stamp presumes the first frame's newest queued copy of the text is 
   // follows covers it, exactly as at a press-time stamp
   const early = [late()];
   let r = reconcilePending([step], early);
-  assert.deepEqual(early[0].at, { after: "a1", place: null, placeText: undefined, seen: [], queued: 0 });
+  assert.deepEqual(early[0].at, { after: "a1", place: null, placeText: undefined, placeOrd: 0, seen: [], queued: 0 });
   assert.equal(r.inject.length, 1);
   r = reconcilePending([step, { kind: "queued", texts: [{ md: TEXT }] }], early);
   assert.equal(r.inject.length, 1);
