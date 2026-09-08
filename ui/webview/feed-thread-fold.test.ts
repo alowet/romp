@@ -69,12 +69,18 @@ test("a jump into a folded thread unfolds it instead of landing on nothing", () 
   // revealCards scrolls to a DOM element; a folded card has none, so the navigation would silently no-op
   // the run the card RENDERS in (T263d): a turn-group member renders in the group's column (buildGroup's worst
   // member), not its own — keying the unfold by askColumn(a) opened an unrelated run and left the group's shut
-  assert.match(FEED, /const tkey = threadKey\(a\.sid, renderedCol\.get\(a\.itemId\) \?\? askColumn\(a\)\);\s*\n\s*if \(collapsedThreads\.has\(tkey\) && extHoverMatches\("a:" \+ a\.itemId, keys\)\) \{/,
-    "the run the card renders in — its rendered column's key — is what a jump unfolds");
-  assert.match(FEED, /const renderedCol = new Map<string, Column>\(\);/);
-  assert.match(FEED, /if \(feedPrefs\(\)\.grouped\) \{\s*\n\s*const rank = new Map\(sessionOrder\.map\(\(s, i\) => \[s, i\] as const\)\);\s*\n\s*renderedCol\.clear\(\);/, "rebuilt on every grouped render");
-  assert.match(FEED, /if \(e\.kind === "ask"\) renderedCol\.set\(e\.ask\.itemId, k\);\s*\n\s*else if \(e\.kind === "group"\) for \(const m of e\.group\.members\) renderedCol\.set\(m\.itemId, k\);/,
-    "every card and every group member is recorded under the bucket column it renders in");
+  // …read from the MODEL, never a memo of the last paint (T263e: a memo of the grouped render went stale in flat
+  // mode and under a held paint, so a reveal could unfold a run the card no longer renders in)
+  assert.match(FEED, /for \(const \[tid, ms\] of turnGroups\(viewFiltered\(asks\)\)\) \{ const c = buildGroup\(tid, ms\)\.column; for \(const m of ms\) colOf\.set\(m\.itemId, c\); \}/,
+    "the group rule the render applies, over the current filtered board");
+  assert.match(FEED, /const tkey = threadKey\(a\.sid, colOf\.get\(a\.itemId\) \?\? askColumn\(a\)\);\s*\n\s*if \(collapsedThreads\.has\(tkey\) && extHoverMatches\("a:" \+ a\.itemId, keys\)\) \{/,
+    "the run the card renders in — a group member's is the group's column — is what a jump unfolds");
+  assert.doesNotMatch(FEED, /renderedCol/, "no memo of the last paint");
+  // ONE rule for what forms a group: the render's bucket pass and the unfold both read turnGroups
+  assert.match(FEED, /function turnGroups\(list: AskItem\[\]\): Map<string, AskItem\[\]> \{/);
+  assert.match(FEED, /for \(const \[tid, ms\] of Array\.from\(byTurn\)\) if \(ms\.length < 2\) byTurn\.delete\(tid\);/, "a turn folds only with ≥2 current members");
+  assert.match(FEED, /const byTurn = turnGroups\(shown\);/, "the render reads the shared rule");
+  assert.equal((FEED.match(/turnGroups\(/g) || []).length, 3, "declared once, read by the render and by the unfold — nowhere else re-derives the rule");
   assert.match(FEED, /if \(opened\) render\(\);/);
 });
 

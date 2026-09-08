@@ -680,10 +680,6 @@ const openBgSvc = new Set<string>();   // sids with the chip's process list expa
 // arrive collapsed too, and a card's column is not knowable when you fold the thread. Persisted across
 // reloads with the rest of the disclosure state, and deliberately NOT pruned when the cards go away.
 const collapsedThreads = new Set<string>();
-// itemId → the column its card RENDERS in this grouped render (T263d, review of T263c): a turn-group's
-// members render in the GROUP's column (buildGroup: the worst member's), not their own, so a jump into a
-// folded member must unfold the run that actually holds it. Rebuilt on every grouped render.
-const renderedCol = new Map<string, Column>();
 // names of sessions idle-but-AWAITING background work (the user 2026-07-13): the same dot in await-green —
 // matching the chat chip's Awaiting color — so a held session reads differently from a working one.
 let awaitingSet = new Set<string>();
@@ -2553,6 +2549,18 @@ function memberMark(m: AskItem): string {
 // Fold N sibling asks (shared turnId) into one AskGroup. Column = WORST member
 // (any needs-input → needsInput; else any open → asks; else completed). Identity
 // (name/color/sid) is the shared asking session; age/tint follow the newest member.
+// The typed-turn GROUPS a card list forms — the render's rule, shared with the jump-unfold (T263e) so the two
+// can never disagree: host-flagged asks (groupTitle) gather by turnId, and a turn folds only with ≥2 current
+// members — a lone survivor (siblings cleared) renders as a single card.
+function turnGroups(list: AskItem[]): Map<string, AskItem[]> {
+  const byTurn = new Map<string, AskItem[]>();
+  for (const a of list) {
+    if (!a.groupTitle || !a.turnId) continue;
+    const arr = byTurn.get(a.turnId) || []; arr.push(a); byTurn.set(a.turnId, arr);
+  }
+  for (const [tid, ms] of Array.from(byTurn)) if (ms.length < 2) byTurn.delete(tid);
+  return byTurn;
+}
 function buildGroup(turnId: string, members: AskItem[]): AskGroup {
   const ms = members.slice().sort((a, b) => a.t - b.t);                       // chronological
   const repr = ms.reduce((x, y) => (y.t > x.t ? y : x), ms[0]);               // most-recent → freshest age/tint
@@ -4857,17 +4865,11 @@ function render() {
   // The display-side view filters (session filter + search), shared with the hover-freeze badge
   // painter so the deferred-churn hint counts exactly what the user would see move (viewFiltered).
   let shown = viewFiltered(asks);
-  // Derive sibling GROUPS at render time, keyed by the shared typed turn (turnId).
-  // Only host-flagged asks (groupTitle) participate, and a turn needs ≥2 current
-  // members to fold — a lone survivor (siblings cleared) renders as a single card.
-  const byTurn = new Map<string, AskItem[]>();
-  for (const a of shown) {
-    if (!a.groupTitle || !a.turnId) continue;
-    const arr = byTurn.get(a.turnId) || []; arr.push(a); byTurn.set(a.turnId, arr);
-  }
+  // Derive sibling GROUPS at render time, keyed by the shared typed turn (turnId) — turnGroups, the rule the
+  // jump-unfold reads too, so what renders as a group and what unfolds as one can never disagree (T263e).
+  const byTurn = turnGroups(shown);
   const grouped = new Set<string>();   // itemIds folded into a group → excluded from single ask cards
   for (const [tid, members] of byTurn) {
-    if (members.length < 2) continue;
     members.forEach((m) => grouped.add(m.itemId));
     const g = buildGroup(tid, members);
     buckets[g.column].push({ kind: "group", t: g.t, group: g });
@@ -4884,7 +4886,6 @@ function render() {
   // is stable, so per-session cards keep the column's newest/oldest order. Headers only where a run exists.
   if (feedPrefs().grouped) {
     const rank = new Map(sessionOrder.map((s, i) => [s, i] as const));
-    renderedCol.clear();   // rebuilt from this render's buckets (T263d)
     const eSid = (e: Entry) => e.kind === "ask" ? e.ask.sid : e.kind === "group" ? e.group.sid : e.sid;
     for (const k of Object.keys(buckets) as Column[]) {
       const extra = new Map<string, number>();   // sids the order list doesn't know → after it, first-seen order
@@ -4902,9 +4903,6 @@ function render() {
           head = { kind: "sess", t: e.t, sid: s, col: k, name: src.name, color: src.color || null, live: !!src.live, folded: 0 };
           withHeads.push(head);
         }
-        // where each card renders, for a jump into a folded run (unfoldThreadsFor): a group's members all sit in the group's column
-        if (e.kind === "ask") renderedCol.set(e.ask.itemId, k);
-        else if (e.kind === "group") for (const m of e.group.members) renderedCol.set(m.itemId, k);
         // A COLLAPSED thread contributes its header and nothing else — the run's cards are counted onto the
         // header instead of rendered, so the folded row still says how much is under it. CARDS, not rows
         // (entryCards): a turn-group folds as its member count, the same rule the section chip reads.
@@ -5863,10 +5861,14 @@ function applyExtHover() {
 function unfoldThreadsFor(keys: Set<string>): void {
   if (!collapsedThreads.size) return;
   let opened = false;
+  // the run each card RENDERS in — per (session, column), T263c — read from the MODEL, never a memo of the last
+  // paint (T263e, review of T263d: a memo went stale in flat mode and under a held paint): a member of a typed
+  // turn with ≥2 current members renders in the group's column (buildGroup: the worst member's), else in its
+  // own — the render's own rule, shared (turnGroups)
+  const colOf = new Map<string, Column>();
+  for (const [tid, ms] of turnGroups(viewFiltered(asks))) { const c = buildGroup(tid, ms).column; for (const m of ms) colOf.set(m.itemId, c); }
   for (const a of asks) {
-    // the run the card RENDERS in — per (session, column), T263c; a turn-group member renders in the group's
-    // column, not its own (T263d), so the last grouped render's map wins over the card's own column
-    const tkey = threadKey(a.sid, renderedCol.get(a.itemId) ?? askColumn(a));
+    const tkey = threadKey(a.sid, colOf.get(a.itemId) ?? askColumn(a));
     if (collapsedThreads.has(tkey) && extHoverMatches("a:" + a.itemId, keys)) {
       collapsedThreads.delete(tkey); opened = true;
     }
