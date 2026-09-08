@@ -12112,7 +12112,7 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
     _judge_ctx.fsid = fsid                            # usage logging: attribute this session's judge calls
     session = parsed_session(fsid, [path], now)
     store = load_goals(fsid)
-    seg_by_id = {seg["id"]: seg for turn in session["turns"] for seg in _segs(turn, store)}
+    seg_by_id = None                                  # built on the first turn the walk judges (below)
     swept = _closed_turns(store)
     sig = dict(store.get("closedSig") or {})
     turns = session["turns"]
@@ -12127,6 +12127,15 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
             break                                      # an explicit caller (a test) can still bound a backfill
         _judge_ctx.last_call_fail = None               # a stale stash must never charge THIS turn (below)
         _judge_ctx.close_menu = None                   # …nor a stale menu shape describe this turn's call
+        if seg_by_id is None:
+            # The seam-aware segment index over EVERY turn, built once, on the first turn the walk judges
+            # (2026-09-07): its only consumer is _close_turn's goal-history block, which a session whose
+            # every end-known turn is already swept never reaches, and that walk was one _segs call per
+            # turn per pass for every session. Built here it equals the dict the walk used to build before
+            # the loop: nothing between load_goals and the first judged turn writes seams (apply_close
+            # never touches them; rollup_status stamps them after the walk). A dict, never None:
+            # _close_turn skips the history block when handed None.
+            seg_by_id = {seg["id"]: seg for t in turns for seg in _segs(t, store)}
         res = _close_turn(store, turn, seg_by_id=seg_by_id)
         if res is None:
             # Every leg below is "retry next pass" for this turn (a failed call, a parse reject under
