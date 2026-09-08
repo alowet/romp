@@ -575,6 +575,36 @@ test("floors carry the earlier send's identity and follow it through the echo �
   assert.deepEqual(injectionGroups(frame, reconcilePending(frame, [y]).inject), [{ idx: 4, sends: [y] }], "below X's own atom, found by id, not the first same-text one");
 });
 
+test("identity edges: a copy without an id beside an echo, a landing carrying several ids, and an identified copy whose landing lost its id (T252c review)", () => {
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
+  // the tmux route: the queued copy carries a stamp but no id, the echo a random uuid, the landing nothing — text decides
+  // throughout, and our bubble never doubles beside the kernel's copies
+  const p = newPending("go on", undefined, T0);
+  reconcilePending(tail, [p]);
+  let r = reconcilePending([...tail, { kind: "queued", texts: [{ md: "go on", qts: 5 }] }], [p]);
+  assert.equal(p.qid, undefined, "no id to latch");
+  assert.deepEqual(r.unqueue, [p]);
+  r = reconcilePending([...tail, { kind: "user", md: "go on", uuid: "echo:random" }], [p]);
+  assert.equal(r.inject.length, 0, "the echo covers by text");
+  r = reconcilePending([...tail, { kind: "user", md: "go on", uuid: "uL" }], [p]);
+  assert.deepEqual(r.landed.map((l) => l.idx), [1]);
+  // a record the CLI wrote from two sends lands with one id per block: ours retires on its own block's id
+  const [x, y] = press(tail, "one", "two");
+  reconcilePending([...tail, { kind: "queued", texts: [{ md: "one", qid: "q1", qts: 1 }, { md: "two", qid: "q2", qts: 2 }] }], [x, y]);
+  assert.deepEqual([x.qid, y.qid], ["q1", "q2"]);
+  r = reconcilePending([...tail, { kind: "user", md: "one two", uuid: "uXY", blocks: ["one", "two"], qids: ["q1", "q2"] }], [x, y]);
+  assert.deepEqual(r.landed.map((l) => [l.p.text, l.idx]), [["one", 1], ["two", 1]]);
+  // an identified press-time copy whose landing carries no id (a kernel restart between feed and landing): the text
+  // floor still holds — the bubble stays below that message, never jumps above it
+  const z = newPending("mine", undefined, T0 + 5);
+  reconcilePending([...tail, { kind: "queued", texts: [{ md: "F", qid: "f1", qts: 1 }] }], [z]);
+  const lostId: TailEvent[] = [...tail, { kind: "user", md: "F", uuid: "uF" }, { kind: "tool", uuid: "t1" }];
+  assert.deepEqual(injectionGroups(lostId, reconcilePending(lostId, [z]).inject), [{ idx: 2, sends: [z] }]);
+  // …while an identified copy whose landing DOES carry the id ignores the text path (the newer-copy case stays exact)
+  const withId: TailEvent[] = [...tail, { kind: "user", md: "F", uuid: "uF", qid: "f1" }, { kind: "tool", uuid: "t1" }, { kind: "queued", texts: [{ md: "F", qid: "f2", qts: 9 }] }];
+  assert.deepEqual(injectionGroups(withId, reconcilePending(withId, [z]).inject), [{ idx: 2, sends: [z] }]);
+});
+
 test("a bubble that changes slot marks the view stale, so the incremental repaint never trusts a shifted prefix (second review)", () => {
   // chatTail lowers v.rendered to the kernel index and the normal-mode append path re-renders from there, assuming
   // the DOM prefix still matches s.events — which also requires the bubble's SLOT to be unchanged. The settle

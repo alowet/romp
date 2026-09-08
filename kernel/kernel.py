@@ -21157,9 +21157,11 @@ def _pending_queued(path):
 
 def _pending_queued_meta(path):
     """_pending_queued's copies with what the CLI's ledger knows about each (T252c): the enqueue record's
-    stamp (`qts`, epoch ms) and an id digested from (stamp, text) (`qid`, stable across folds). The ledger
-    carries no ids and the kernel never sees the CLI take a copy, so nothing pairs a tmux landing with its
-    copy — the landed atom carries no qid on this route; the chat falls back to text there."""
+    stamp (`qts`, epoch ms) and NO id. The ledger carries none, the kernel's tmux echo is minted before the
+    CLI writes the enqueue record, and the kernel never sees the CLI take a copy — so nothing else in the
+    chain could share an id the ledger copy wore, and an id the chat latched from it would make it reject
+    the echo and the landing as another send's (the review of the first cut). The chat reads this route
+    by text; `qid` is None on every copy."""
     def step(pending, o):
         if o.get("type") != "queue-operation":
             return pending
@@ -21181,8 +21183,7 @@ def _pending_queued_meta(path):
             continue
         t = em.parse_z(ts) if isinstance(ts, str) else None
         qts = int(t * 1000) if isinstance(t, (int, float)) and t else None
-        qid = "tq:" + hashlib.sha1(("%s\n%s" % (qts, text.strip())).encode()).hexdigest()[:16]
-        out.append({"md": text.strip(), "qid": qid, "qts": qts})
+        out.append({"md": text.strip(), "qid": None, "qts": qts})
     return out
 
 
@@ -27744,13 +27745,18 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                             # it FIFO per text, at or after the feed — so the chat retires and places its
                             # pending bubble by id, never by text. None on the tmux route or for a record
                             # from before this kernel's life; the chat falls back to text then.
-                            if hasattr(be, "qid_for_landing"):
+                            if hasattr(be, "qids_for_landing") and not a.get("_echo_text") and not str(a.get("uuid") or "").startswith("echo:"):
+                                # per text BLOCK: a record the CLI wrote from several queued sends is one landing per
+                                # block; the kernel's own echo atom is skipped — its uuid IS the copy's id
+                                _tblocks = [b.get("text", "") for b in (blocks or []) if b.get("type") == "text" and (b.get("text") or "").strip()] or [text]
                                 try:
-                                    _q = be.qid_for_landing(sid, a.get("uuid"), text, a.get("t"))
+                                    _qs = be.qids_for_landing(sid, a.get("uuid"), _tblocks, a.get("t"))
                                 except Exception:
-                                    _q = None
-                                if _q:
-                                    ev["qid"] = _q
+                                    _qs = []
+                                if len(_tblocks) > 1 and any(_qs):
+                                    ev["qids"] = list(_qs)
+                                elif len(_tblocks) == 1 and _qs and _qs[0]:
+                                    ev["qid"] = _qs[0]
                             if a.get("absorbed"):
                                 # A mid-turn splice (event_model._absorbed): the CLI queued this send
                                 # behind the running turn and took it at a later tool boundary, so the
@@ -28149,7 +28155,11 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
         if queued and hasattr(_cbe, "pending_queued_meta"):
             try:
                 _mm = _cbe.pending_queued_meta(sid)
-                if isinstance(_mm, list) and len(_mm) == len(queued):
+                # accepted only when each id sits beside ITS OWN text: the queue can move between the two reads
+                # this build makes (a pop and an append keep the length and shift every id by one), and a copy
+                # wearing another copy's id would be latched by the chat for good (review of the first cut)
+                if isinstance(_mm, list) and len(_mm) == len(queued) \
+                        and all(isinstance(x, dict) and (x.get("md") or "").strip() == (queued[i] or "").strip() for i, x in enumerate(_mm)):
                     _metas = _mm
             except Exception:
                 _metas = None

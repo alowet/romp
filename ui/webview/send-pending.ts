@@ -110,6 +110,7 @@ export type TailEvent = {
   md?: string;
   uuid?: string;
   qid?: string;         // a landed user atom: the id of the queued copy it lands (T252c; the kernel pairs them)
+  qids?: string[];      // a record of SEVERAL sends: one id (or null) per text block, in block order
   ts?: string;          // the kernel's stamp for the event, ISO-8601 UTC (kernel.py `iso(t)`, whole seconds)
   absorbed?: boolean;
   undelivered?: boolean;
@@ -201,7 +202,8 @@ function textCopies(e: TailEvent, p: PendingSend): number {
  *  its quotes behind, so those are set aside on both sides). */
 export function landedCopies(e: TailEvent, p: PendingSend): number {
   if (e.kind !== "user" || typeof e.md !== "string" || isKernelEchoUuid(e.uuid)) return 0;
-  if (p.qid && e.qid) return e.qid === p.qid ? 1 : 0;   // identity decides (T252c): ours only if it carries THIS send's id
+  if (p.qid && (e.qid || (Array.isArray(e.qids) && e.qids.length)))   // identity decides (T252c): ours only if it carries THIS send's id
+    return e.qid === p.qid || (Array.isArray(e.qids) && e.qids.includes(p.qid)) ? 1 : 0;
   const n = textCopies(e, p);
   if (n) return n;
   if (p.imgPaths && p.imgPaths.length && Array.isArray(e.images) && e.images.length > 0) {
@@ -340,8 +342,8 @@ export function stampBase(events: TailEvent[], p: PendingSend, own: number = p.l
     for (let k = copies.length - 1; k >= 0; k--) {
       const md = copies[k].md as string;
       if (skipOwn > 0 && foreignKey(md) === foreignKey(p.text)) { skipOwn--; continue; }
-      if (copies[k].qid) queuedForeignIds.unshift(copies[k].qid!);   // an identified copy takes the id path (T252c)
-      else queuedForeign.unshift(md);                                //   an id-less one the text path
+      if (copies[k].qid) queuedForeignIds.unshift(copies[k].qid!);   // an identified copy takes the id path first (T252c)…
+      queuedForeign.unshift(md);                                     //   …and every copy keeps the text path as its fallback
     }
     break;
   }
@@ -601,14 +603,24 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
   }
   // the identified copies the kernel's queue held at the press (T252c): a copy is still queued while the group shows
   // its id, and has landed when a user event carries it — exact, no text, no count
+  // the keys whose identified copies RESOLVED by id this frame skip the text path below: the text path is the
+  // fallback for a copy whose landing lost its id (a kernel restart between feed and landing) or an older kernel
+  const resolvedKeys = new Set<string>();
   if (at.queuedForeignIds && at.queuedForeignIds.length) {
     let groupIdx = -1;
     for (let j = events.length - 1; j >= base; j--) if (events[j].kind === "queued") { groupIdx = j; break; }
     for (const id of at.queuedForeignIds) {
-      let floor = -1;
-      for (let j = events.length - 1; j >= base; j--) if (events[j].qid === id) { floor = j + 1; break; }
-      if (floor < 0 && groupIdx >= 0 && (events[groupIdx].texts || []).some((t) => t.qid === id && !t.hiddenByPending)) floor = groupIdx + 1;
+      let floor = -1, text: string | undefined;
+      for (let j = events.length - 1; j >= base; j--) {
+        const e = events[j];
+        if (e.qid === id || (Array.isArray(e.qids) && e.qids.includes(id))) { floor = j + 1; text = typeof e.md === "string" ? e.md : undefined; break; }
+      }
+      if (floor < 0 && groupIdx >= 0) {
+        const c = (events[groupIdx].texts || []).find((t) => t.qid === id && !t.hiddenByPending);
+        if (c) { floor = groupIdx + 1; text = c.md; }
+      }
       if (floor > idx) idx = floor;
+      if (floor >= 0 && text !== undefined) resolvedKeys.add(foreignKey(text));
     }
   }
   // the texts the kernel's queue held at the press, COUNTED per text: the press-time copies are the first k
@@ -621,6 +633,7 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
     for (let j = events.length - 1; j >= base; j--) if (events[j].kind === "queued") { groupIdx = j; break; }
     for (const { text, n: copies } of counts.values()) {
       const key = foreignKey(text);
+      if (resolvedKeys.has(key)) continue;          // the identity path placed this key exactly
       const residents = (at.queuedResident ||= {})[key] ||= [];
       // The kernel's queued copies carry no identity, so which landing is the press-time copy's is read off the
       // GROUP (fourth review): while it still shows a copy of the key, the press-time copy has not landed, so every

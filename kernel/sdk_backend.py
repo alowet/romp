@@ -2653,31 +2653,48 @@ class SdkSession:
             return [{"md": t, "qid": (m or {}).get("qid"), "qts": (m or {}).get("qts")}
                     for t, m in zip(self._pending, self._pending_meta)]
 
-    def qid_for_landing(self, uuid_: str, text: str, t=None):
-        """The id of the fed copy a landed user record carries: the OLDEST fed entry with the same text
-        (echo_text_key), stamped at or before the record (a record stamped before the feed is an older
-        message's — 'ok', 'go ahead' repeat). Memoised per record uuid, so every rebuild answers the same and
-        each fed entry is spent once; None when nothing pairs (a record from before this kernel's life, a
-        copy the backend queued without an id)."""
-        if not uuid_:
-            return None
+    def qids_for_landing(self, uuid_: str, texts, t=None):
+        """The ids of the fed copies a landed user record carries, one per text block: for each block the
+        OLDEST fed entry with the same text (echo_text_key), stamped at or before the record (a record
+        stamped before the feed is an older message's — 'ok', 'go ahead' repeat), or None. A record the CLI
+        wrote from several back-to-back sends is as many landings as it has blocks, so each block spends its
+        own entry (asked with the blocks joined, no entry matched and the stale ones mis-paired a later
+        same-text landing — the review of the first cut). Memoised per record uuid, so every rebuild answers
+        the same. The kernel's own ECHO atom is refused outright (its uuid is the copy's id, minted at the
+        send): it is the visible copy between the feed and the CLI's record, and asked as a landing it took
+        the fed entry the real landing needed."""
+        if not uuid_ or str(uuid_).startswith("echo:"):
+            return [None] * len(texts)
         with self._lock:
             if uuid_ in self._landed_qid:
-                return self._landed_qid[uuid_]
-            key = echo_text_key(text)
-            hit = None
-            for i, f in enumerate(self._fed_meta):
-                if echo_text_key(f["text"]) != key:
-                    continue
-                if t is not None and float(t) < f["t"] - 2:
-                    continue                               # stamped before the feed: not this copy's landing
-                hit = self._fed_meta.pop(i)["qid"]
-                break
-            self._landed_qid[uuid_] = hit
+                return list(self._landed_qid[uuid_])
+            hits = []
+            for text in texts:
+                key = echo_text_key(text)
+                hit = None
+                for i, f in enumerate(self._fed_meta):
+                    if echo_text_key(f["text"]) != key:
+                        continue
+                    if t is not None and float(t) < f["t"] - 2:
+                        continue                           # stamped before the feed: not this copy's landing
+                    hit = self._fed_meta.pop(i)["qid"]
+                    break
+                hits.append(hit)
+            self._landed_qid[uuid_] = hits
             if len(self._landed_qid) > 512:
                 for k in list(self._landed_qid)[:-256]:
                     del self._landed_qid[k]
-            return hit
+            return list(hits)
+
+    def qid_for_landing(self, uuid_: str, text: str, t=None):
+        """qids_for_landing for a one-block record."""
+        return self.qids_for_landing(uuid_, [text], t)[0]
+
+    def forget_fed(self, qid: str):
+        """A fed copy the CLI dropped for good (its echo marked never delivered) leaves the fed ledger: its
+        landing will never come, and a later same-text landing must not be paired with it."""
+        with self._lock:
+            self._fed_meta = [f for f in self._fed_meta if f.get("qid") != qid]
 
     def enqueue(self, text: str, qid: str | None = None, qts: int | None = None):
         """Deliver a user turn (called from the kernel thread). Held in self._pending —
@@ -7433,10 +7450,23 @@ class SdkBackend:
         return s.pending_meta() if s else None
 
     def qid_for_landing(self, sid: str, uuid_: str, text: str, t=None):
-        """The id of the fed copy this landed user record carries, or None (see SdkSession.qid_for_landing)."""
+        """The id of the fed copy this landed user record carries, or None (see SdkSession.qids_for_landing)."""
         with self._lock:
             s = self.sessions.get(sid)
         return s.qid_for_landing(uuid_, text, t) if s else None
+
+    def qids_for_landing(self, sid: str, uuid_: str, texts, t=None):
+        """One id (or None) per text block of a landed record (see SdkSession.qids_for_landing)."""
+        with self._lock:
+            s = self.sessions.get(sid)
+        return s.qids_for_landing(uuid_, texts, t) if s else [None] * len(texts)
+
+    def forget_fed(self, sid: str, qid: str):
+        """A fed copy dropped for good leaves the session's fed ledger (see SdkSession.forget_fed)."""
+        with self._lock:
+            s = self.sessions.get(sid)
+        if s:
+            s.forget_fed(qid)
 
     def pending_queued(self, sid: str) -> list[str]:
         """Queued-but-not-yet-started user turns for an SDK session (oldest first), or [] if the
@@ -7637,6 +7667,7 @@ class SdkBackend:
                     atom["rompAuto"] = True
                 if e.get("dropped"):
                     atom["dropped"] = True
+                    self.forget_fed(reg["sid"], atom.get("uuid"))   # its landing will never come (T252c)
                 if isinstance(e.get("off"), int) and not isinstance(e.get("off"), bool):
                     atom["_echo_off"], atom["_echo_fsid"] = e["off"], str(e.get("fsid") or "")
                 if e.get("landed"):
@@ -7754,6 +7785,7 @@ class SdkBackend:
             if a["_echo_text"] in landed:
                 continue                                   # landed, un-pruned → the next build's prune_live
             a["dropped"] = True
+            self.forget_fed(sid, a.get("uuid"))   # its landing will never come (T252c)
             self._touch_live(sid)
             self._log("%s: a send never reached its CLI (the process died holding it) — kept in the chat "
                       "as never-delivered: %.80r" % (sid[:8], a["_echo_text"]), problem=True)

@@ -13,8 +13,9 @@ queue:
   Parked sends — a copy parked in the kernel's own FIFO (compaction, a usage-limit hold, a parked drive op) carries
   NO id until it reaches the backend: the park's op is the three-field record the on-disk mirror and a dozen
   readers pin, so the identity is minted where the copy enters the backend's queue. Stated as a gap.
-  tmux — the CLI's queue-operation records carry timestamps but no ids: each copy carries its enqueue stamp and a
-  digest of (stamp, text) as its id; nothing pairs the landed record (the kernel does not see the CLI take it).
+  tmux — the CLI's queue-operation records carry timestamps but no ids: each copy carries its enqueue stamp and NO
+  id (an id only the ledger copy wore would make the chat reject the tmux echo as another send's); nothing pairs the
+  landed record (the kernel does not see the CLI take it), so the chat reads this route by text.
 
 SYNTHETIC fixtures only: a private synthetic sid, the notes-api demo world, hostname-free.
 """
@@ -201,6 +202,34 @@ class TheSdkQueueCarriesIds(unittest.TestCase):
         self.assertIsNone(self.w.be.qid_for_landing(SID, "uOld", "other", now - 3600), "a record stamped long before the feed is not this copy's landing")
         self.assertEqual(self.w.be.qid_for_landing(SID, "uD", "other", now), ids[1])
 
+    def test_the_kernels_own_echo_never_consumes_a_fed_entry(self):
+        # the echo atom is a user atom too, stamped at the send; between the feed and the CLI's record it is the
+        # visible copy — asked as a landing it took the fed entry and the real landing then carried no id (review)
+        self.w.be.send(SID, "hello there")
+        [qid] = [m["qid"] for m in self.w.be.pending_queued_meta(SID)]
+        with self.w.s._lock:
+            self.w.s._pop_for_feed_locked()
+        now = int(time.time())
+        self.assertIsNone(self.w.be.qid_for_landing(SID, qid, "hello there", now), "an echo uuid is refused")
+        self.assertEqual(self.w.be.qid_for_landing(SID, "uReal", "hello there", now + 1), qid, "…so the record still pairs")
+
+    def test_a_batched_record_pairs_every_block_and_a_dropped_copy_leaves_the_ledger(self):
+        self.w.be.send(SID, "ok"); self.w.be.send(SID, "ok"); self.w.be.send(SID, "ok")
+        ids = [m["qid"] for m in self.w.be.pending_queued_meta(SID)]
+        with self.w.s._lock:
+            for _ in range(3): self.w.s._pop_for_feed_locked()
+        now = int(time.time())
+        self.assertEqual(self.w.be.qids_for_landing(SID, "uJ", ["ok", "ok"], now), [ids[0], ids[1]], "two blocks, two copies, in order")
+        self.assertEqual(self.w.be.qids_for_landing(SID, "uJ", ["ok", "ok"], now), [ids[0], ids[1]], "memoised per record")
+        self.assertEqual(self.w.be.qid_for_landing(SID, "u3", "ok", now + 1), ids[2], "the third landing is the third copy's, not a stale first")
+        # a copy fed and then dropped for good leaves the ledger, so a later same-text landing is not paired with it
+        self.w.be.send(SID, "again"); self.w.be.send(SID, "again")
+        [d1, d2] = [m["qid"] for m in self.w.be.pending_queued_meta(SID)]
+        with self.w.s._lock:
+            for _ in range(2): self.w.s._pop_for_feed_locked()
+        self.w.be.forget_fed(SID, d1)          # what the never-delivered marking calls
+        self.assertEqual(self.w.be.qid_for_landing(SID, "uAg", "again", now + 2), d2)
+
 
 class TheChatCarriesTheIds(unittest.TestCase):
     def setUp(self):
@@ -235,6 +264,53 @@ class TheChatCarriesTheIds(unittest.TestCase):
         q = [e for e in m["events"] if e.get("kind") == "queued"]
         self.assertEqual([t.get("qid") for t in q[0]["texts"]], [qid_later], "the queue now holds the other copy only")
 
+    def test_an_intermediate_build_between_the_feed_and_the_landing_keeps_the_pairing(self):
+        live = self.w.now - T0
+        self.w.write(RUNNING, shift=live)
+        fed_text = "and also update the docstring"
+        self.w.be.send(SID, fed_text)
+        [qid] = [m["qid"] for m in self.w.be.pending_queued_meta(SID)]
+        with self.w.s._lock:
+            self.w.s._pop_for_feed_locked()
+        mid = self.w.build()                    # the echo is the visible copy now: a build here must not pair it
+        echoes = [e for e in mid["events"] if e.get("kind") == "user" and str(e.get("uuid", "")).startswith("echo:")]
+        self.assertEqual([e.get("qid") for e in echoes], [None] * len(echoes), "an echo event carries no landing id (its uuid IS the copy's id)")
+        self.w.write(RUNNING + [attline(T0 + 55, fed_text, "att1", "tr1"), aline(T0 + 75, "Updated.", "a3", "att1", tools=("Bash",), stop="tool_use")], shift=live)
+        m = self.w.build()
+        landed = [e for e in m["events"] if e.get("kind") == "user" and e.get("md") == fed_text and not str(e.get("uuid", "")).startswith("echo:")]
+        self.assertEqual([e.get("qid") for e in landed], [qid])
+
+    def test_a_two_block_record_carries_both_copies_ids(self):
+        live = self.w.now - T0
+        self.w.write(RUNNING, shift=live)
+        self.w.be.send(SID, "first of two"); self.w.be.send(SID, "second of two")
+        [q1, q2] = [m["qid"] for m in self.w.be.pending_queued_meta(SID)]
+        with self.w.s._lock:
+            for _ in range(2): self.w.s._pop_for_feed_locked()
+        batched = {"type": "user", "timestamp": iso(T0 + 90), "uuid": "u9", "parentUuid": "tr1", "promptSource": "sdk", "sessionId": SID,
+                   "message": {"role": "user", "content": [{"type": "text", "text": "first of two"}, {"type": "text", "text": "second of two"}]}}
+        self.w.write(RUNNING + [batched], shift=live)
+        m = self.w.build()
+        rec = [e for e in m["events"] if e.get("kind") == "user" and e.get("uuid") == "u9"]
+        self.assertEqual(len(rec), 1)
+        self.assertEqual(rec[0].get("blocks"), ["first of two", "second of two"])
+        self.assertEqual(rec[0].get("qids"), [q1, q2], "one id per block, in block order")
+        self.assertIsNone(rec[0].get("qid"), "no single id claims the whole record")
+
+    def test_ids_ride_only_when_each_one_sits_beside_its_own_text(self):
+        # the queue can move between the two reads a build makes (a pop and an append keep the length): an id set
+        # that does not match the texts one for one is not shipped, so no copy wears another copy's id
+        self.w.write(RUNNING)
+        self.w.be.send(SID, "A"); self.w.be.send(SID, "B")
+        real = self.w.be.pending_queued_meta
+        self.w.be.pending_queued_meta = lambda sid: [{"md": "B", "qid": "echo:b", "qts": 1}, {"md": "C", "qid": "echo:c", "qts": 2}]
+        try:
+            m = self.w.build()
+        finally:
+            self.w.be.pending_queued_meta = real
+        q = [e for e in m["events"] if e.get("kind") == "queued"]
+        self.assertEqual([(x["md"], x.get("qid")) for x in q[0]["texts"]], [("A", None), ("B", None)])
+
     def test_a_parked_copy_carries_no_id_until_it_reaches_the_backend(self):
         # the park's op is the three-field record the on-disk mirror and its readers pin: no identity rides it; the
         # copy is identified where it enters the backend's queue (send()), and the chat reads a parked copy by text
@@ -250,7 +326,7 @@ class TheChatCarriesTheIds(unittest.TestCase):
 
 
 class TheTmuxQueueCarriesStamps(unittest.TestCase):
-    def test_each_copy_carries_its_enqueue_stamp_and_a_digest_id_and_nothing_pairs_the_landing(self):
+    def test_each_copy_carries_its_enqueue_stamp_and_no_id_since_nothing_on_this_route_could_share_one(self):
         td = tempfile.TemporaryDirectory()
         p = Path(td.name) / "t.jsonl"
         recs = [{"type": "queue-operation", "operation": "enqueue", "content": "one", "timestamp": iso(T0 + 5)},
@@ -262,8 +338,9 @@ class TheTmuxQueueCarriesStamps(unittest.TestCase):
         meta = km._pending_queued_meta(str(p))
         self.assertEqual([m["md"] for m in meta], ["two"])
         self.assertEqual(meta[0]["qts"], (T0 + 9) * 1000)
-        self.assertTrue(meta[0]["qid"].startswith("tq:") and len(meta[0]["qid"]) > 6)
-        self.assertEqual(meta[0]["qid"], km._pending_queued_meta(str(p))[0]["qid"], "stable across folds")
+        # no id: the tmux echo is minted before the CLI writes its enqueue record and the landing carries nothing,
+        # so an id only the ledger copy wore would make the chat reject the echo as another send's (review)
+        self.assertIsNone(meta[0]["qid"])
         td.cleanup()
 
 
