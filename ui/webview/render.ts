@@ -54,7 +54,7 @@ import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser
 import { pastedFilePath } from "./paste-path";
 import { insertAtCaret } from "./composer-insert";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
-import { followReader, keepPlaceAcrossShow, followTail, atBottomDist, followBoxBelow } from "./scroll-keep";
+import { followReader, keepPlaceAcrossShow, followTail, atBottomDist, followBoxBelow, followTailShrink } from "./scroll-keep";
 import { retainLiveOmitted } from "./tab-order";
 import { userTurnShows } from "./user-turn-content";
 import { ScrollDiagBudget, classifyScroll, scrollWriteRow } from "./scroll-write";
@@ -9624,8 +9624,26 @@ function ensureView(id: string): View {
     // turn and the native thumb moved to the new truth while the notches kept the stale frame, and a notch
     // for a message on screen read as "below". The view element's box grows with any child, so one observer
     // per view re-runs the shared rAF paint exactly when the geometry changes. No timer, no per-image hook.
+    // …and the same observer carries the tail-shrink rule (T262f, the user 2026-09-08: the pane unreadable near
+    // the bottom): the ACTIVE view's element losing height — a queued group emptying, the offline foot going, a
+    // tail unit re-rendering shorter outside the append path — moves the transcript's bottom UP, and the browser
+    // clamps scrollTop to the new maximum on its own: an unwritten move the follow-mode latch never saw. When the
+    // view's RECORDED follow mode held (`stick`, the pre-change truth), the reader is written to the new bottom
+    // through writeScroll — where the clamp left them, so nothing moves twice, but the move is the pane's own,
+    // attributed in the journal, and the latch re-reads from a real scroll event. A scrolled-up reader is untouched.
     if (typeof ResizeObserver === "function") {
-      v.ro = new ResizeObserver(() => scheduleRailSticky());
+      let lastH = -1;                                        // -1 = not yet measured (observe fires once on attach)
+      const view = v;                                        // the closure's own binding (the outer `v` is a let)
+      v.ro = new ResizeObserver((entries) => {
+        scheduleRailSticky();
+        const h = entries[0]?.contentRect?.height ?? 0;
+        const content = document.getElementById("content");
+        if (content && lastH >= 0 && activeId === id && view.shown && content.clientHeight > 0 && followTailShrink(view.stick, h - lastH)) {
+          writeScroll(content, content.scrollHeight, "tail-shrink", true);
+          view.scrollTop = content.scrollTop;
+        }
+        lastH = h;
+      });
       v.ro.observe(elv);
     }
     views.set(id, v);
@@ -10595,6 +10613,25 @@ window.addEventListener("resize", updateJumpBtn);
     if (classifyScroll(c.scrollTop, lastScrollWriteAfter) === "write-echo") lastScrollWriteAfter = null;
     else scrollDiagRow("scrollgesture", { sid: activeId || "", top: c.scrollTop, gesture: true, sh: c.scrollHeight, ch: c.clientHeight });   // sh/ch: a clamp reads top == sh - ch after sh dropped (T262e)
   }, { passive: true });
+}
+// The live-ask host (#live-ask) sits INSIDE #content after the threads: the picker card is the transcript's tail
+// while it is up, and its clearing is a tail shrink under the reader (T262f) — the same rule as the view's own
+// observer above, with the active view's recorded follow mode deciding.
+if (typeof ResizeObserver === "function") {
+  const tailHost = document.getElementById("live-ask");
+  if (tailHost) {
+    let tailLastH = -1;
+    new ResizeObserver((entries) => {
+      const h = entries[0]?.contentRect?.height ?? 0;
+      const content = document.getElementById("content");
+      const v = activeId ? views.get(activeId) : null;
+      if (content && tailLastH >= 0 && v && v.shown && content.clientHeight > 0 && followTailShrink(v.stick, h - tailLastH)) {
+        writeScroll(content, content.scrollHeight, "tail-shrink", true);
+        v.scrollTop = content.scrollTop;
+      }
+      tailLastH = h;
+    }).observe(tailHost);
+  }
 }
 // Boxes ABOVE the transcript grow/shrink → keep the chat text visually anchored (the user 2026-06-30 for
 // #tabbar; extended to #ledger 2026-07-05). Both are `flex: 0 0 auto` directly above the `flex: 1 1 auto`
