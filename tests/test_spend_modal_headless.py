@@ -82,7 +82,9 @@ class SpendModalServed(unittest.TestCase):
                 if p == "/":
                     return self._out(200, html, "text/html; charset=utf-8")
                 if p == "/spend/detail":
-                    return self._out(200, json.dumps(km._spend_detail()).encode(), "application/json")
+                    # the fixture's OWN clock (review find: served with the wall clock, the 192-hour window
+                    # slid off the anchored ledger within days and the hourly pins became a time bomb)
+                    return self._out(200, json.dumps(km._spend_detail(now=_sd.NOW)).encode(), "application/json")
                 if p == "/usage/fleet":
                     return self._out(200, json.dumps({"rows": [{"host": "", "acct": "", "usage": km._usage()}],
                                                       "host": "TESTHOST"}).encode(), "application/json")
@@ -136,9 +138,9 @@ class SpendModalServed(unittest.TestCase):
         self.assertEqual(o["foldAfter"], 15 + 1, "show all: every session, plus the unattributed row")
         self.assertTrue(any("5 more sessions" in r for r in rows), rows)
         leg = o["out"]["legend"]
-        self.assertEqual(leg[0], "web", "stack order is the table's: top by dollars")
-        self.assertEqual(leg[-1], "unattributed", "the pre-attribution hour is a stack of its own")
-        self.assertNotIn("other (5 sessions)", leg, "the small sessions have no hourly records: no empty 'other' stack")
+        self.assertEqual(leg, ["web", "api", "tests", "unattributed"],
+                         "the hourly legend names only the stacks the hourly chart draws — no chip for a "
+                         "top-N session with nothing in this range, no empty 'other' (review find)")
         self.assertIn("other (5 sessions)", o["days"]["legend"], "beyond the top-N the daily range folds them into one stack")
         self.assertEqual(o["days"]["legend"][-1], "unattributed")
         self.assertGreater(o["out"]["segs"], 60)
@@ -152,6 +154,10 @@ class SpendModalServed(unittest.TestCase):
         self.assertIn("·", o["tip"], "a segment hover names value · session · bucket")
         self.assertTrue(o["hiddenAfter"], "Escape closes it")
         self.assertTrue(o["hiddenAfterTap"], "a backdrop tap closes it")
+        self.assertFalse(o["hiddenAfterDrag"], "…but a drag-select that ends over the backdrop does not (review find)")
+        self.assertTrue(o["mobile"]["railHidden"] and o["mobile"]["panelOpened"] and o["mobile"]["modalOpened"],
+                        "on a phone the Usage panel's 'By session' button is the door (review find): " + json.dumps(o["mobile"]))
+        self.assertEqual(o["lightErr"], "rgb(154, 51, 36)", "the error line has a light-theme step")
         own = [e for e in o["errs"] if "rsp" in e or "Spend" in e or "spend" in e]
         self.assertEqual(own, [], "no page errors from the modal's own code")
 

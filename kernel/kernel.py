@@ -29371,6 +29371,8 @@ def _spend_detail(now=None):
             una[0][i] += max(0.0, tu - au); una[1][i] += max(0, tt - at)
         stacks = []
         for sid in top:
+            if not (any(per[sid][0]) or any(per[sid][1])):
+                continue          # a top-N session with nothing in THIS range: no empty stack, no legend chip (review find)
             s = meta[sid]
             stacks.append({"kind": "sid", "sid": sid, "name": s["name"], "bg": s["bg"], "live": s["live"],
                            "usd": [round(v, 4) for v in per[sid][0]], "tok": per[sid][1]})
@@ -36577,7 +36579,9 @@ el.innerHTML=aggBarsHTML(LAST)+apiCellHTML(LAST);
 // the rail. The mobile modal keeps its own pull-then-open path (openIt).
 if(tip.style.display==='block'&&!tip.classList.contains('ru-modal')){var th=tipHTML();
 if(th){tip.innerHTML=th;var rr=el.getBoundingClientRect();
-tip.style.top=Math.max(6,rr.top-tip.offsetHeight-8)+'px';}}}
+tip.style.top=Math.max(6,rr.top-tip.offsetHeight-8)+'px';}}
+// the spend modal's Totals section is these same rows: an open modal follows every landing too (T247)
+if(typeof SP!=='undefined'&&SP.open&&SP.data){var ts=document.getElementById('rsp-totals');if(ts)ts.innerHTML=totalsHTML(SP.data);}}
 // The single-payload path the timeline still posts (and the mobile panel's own fetch): treat it as this
 // machine's row, leaving any other account's bars alone.
 function render(u){notices(u);
@@ -36748,10 +36752,14 @@ tip.style.top=Math.max(6,r.top-tip.offsetHeight-8)+'px';}
 // Pulls fresh first so the numbers aren't a stale boot snapshot; any tap or Escape dismisses.
 window.__rompUsagePanel=function(){
 function openIt(){var h=tipHTML();if(!h)return;
-tip.innerHTML=h;tip.classList.add('ru-modal');tip.style.left='';tip.style.top='';tip.style.display='block';
+// the deeper level is one tap away here too (T247): the rail — and its click — do not exist on a
+// phone, and a compact view must never dead-end (progressive disclosure)
+tip.innerHTML=h+'<div class=ru-tip-age><button class=rsp-btn id=ru-bysession>By session \u2192</button></div>';
+tip.classList.add('ru-modal');tip.style.left='';tip.style.top='';tip.style.display='block';
 back.classList.add('on');
 var off=function(){tip.style.display='none';tip.classList.remove('ru-modal');back.classList.remove('on');
 window.__rompUsageClose=null;};
+var bs=document.getElementById('ru-bysession');if(bs)bs.onclick=function(e){e.stopPropagation();off();openSpend();};
 // Escape lands via _LANDING_ESC_JS (shell AND pane documents — the shell-only listener this modal
 // used to bind was deaf whenever focus sat inside a pane iframe); the backdrop tap stays.
 window.__rompUsageClose=off;
@@ -36802,7 +36810,12 @@ fetch('/spend/detail',{cache:'no-store'}).then(function(r){if(!r.ok)throw new Er
 function closeSpend(){SP.open=false;if(spBack)spBack.hidden=true;spTipHide();}
 window.__rompCloseSpend=closeSpend;
 window.__rompOpenSpend=openSpend;
-if(spBack)spBack.onclick=function(e){if(e.target===spBack)closeSpend();};
+// a click whose press and release land on different elements is dispatched at their common
+// ancestor — the backdrop — so a drag-select of table figures that ends outside the card read as a
+// tap and closed the modal (review find). The press must have begun on the backdrop too.
+var spDown=false;
+if(spBack){spBack.onpointerdown=function(e){spDown=(e.target===spBack);};
+spBack.onclick=function(e){var d=spDown;spDown=false;if(e.target===spBack&&d)closeSpend();};}
 // ONE listener on the STABLE panel (the click-safety rule): every control is a data-act, acknowledged
 // at once (the pressed state flips before the chart re-renders) — never a handler on a node a render
 // rebuilds. The close ✕ and the retry ride the same door.
@@ -36840,16 +36853,20 @@ if(un&&(un.usd>0||un.tok>0))h+='<tr class=rsp-dead><td><i class="rsp-sw rsp-hatc
 +'<td class=rsp-name>unattributed<span class=ru-tip-reset> \u00b7 recorded before per-session tracking</span></td>'
 +'<td class=n>'+fmtUsd(un.usd)+'</td>'+(keyCol?'<td class=n>\u2014</td>':'')+'<td class=n>'+(un.turns||0)+'</td><td class=n>'+fmtTok(un.tok||0)+'</td></tr>';
 return h+'</tbody></table>';}
-function renderSpend(){if(!spPanel)return;var d=SP.data,h=spHead();
-if(!d){h+='<div class=rsp-err>Couldn\u2019t load the spend detail'+(SP.err?': '+esc(SP.err):'')+'. '
-+'<button class=rsp-btn data-act=retry>Try again</button></div>';spPanel.innerHTML=h;return;}
-// 1. the SAME window numbers the hover shows — the sums across every machine, rows only (one renderer)
-var rows=spendRowsHTML(LAST||[]);
+// 1. the SAME window numbers the hover shows — the sums across every machine, rows only (one renderer).
+// Its own node: renderRows re-renders it whenever fresh rows land while the modal is open, so the
+// two levels agree at every moment, not only at the instant the modal opened (review find)
+function totalsHTML(d){var rows=spendRowsHTML(LAST||[]);
 // a login with no key (scope "computed"): the rail shows no API spend for this machine on purpose, and
 // what the ledger holds is a computed cost nobody is billed — said here, not dressed up as a bill
 var computed=d.scope==='computed';
-h+='<div class=rsp-sec>'+(rows||('<div class=ru-tip-name><span>Totals</span></div><div class=rsp-note>'
-+(computed?'No API spend on this machine: its sessions run on a login. The figures below are computed costs, not a bill.':'Nothing recorded yet.')+'</div>'))+'</div>';
+return rows||('<div class=ru-tip-name><span>Totals</span></div><div class=rsp-note>'
++(computed?'No API spend on this machine: its sessions run on a login. The figures below are computed costs, not a bill.':'Nothing recorded yet.')+'</div>');}
+function renderSpend(){if(!spPanel)return;var d=SP.data,h=spHead();
+if(!d){h+='<div class=rsp-err>Couldn\u2019t load the spend detail'+(SP.err?': '+esc(SP.err):'')+'. '
++'<button class=rsp-btn data-act=retry>Try again</button></div>';spPanel.innerHTML=h;return;}
+var computed=d.scope==='computed';
+h+='<div class=rsp-sec id=rsp-totals>'+totalsHTML(d)+'</div>';
 // 2. per session — THIS machine's ledger; when other machines join the totals above, say so
 var many=(d.hosts||1)>1;
 h+='<div class=rsp-sec><div class=ru-tip-name><span>By session'+(many?' \u00b7 this machine only':'')+'</span>'
@@ -39041,6 +39058,7 @@ def _landing():
             "body.theme-light .rsp-x{color:#5D574E}body.theme-light .rsp-x:hover{color:#1F1E1D}"
             "body.theme-light .rsp-tbl th{border-bottom-color:rgba(0,0,0,0.10)}body.theme-light .rsp-tbl td{border-bottom-color:rgba(0,0,0,0.06)}"
             "body.theme-light .rsp-btn{border-color:rgba(0,0,0,0.18);color:#1F1E1D}"
+            "body.theme-light .rsp-err{color:#9A3324}"   # the dark-only pink read 1.7:1 on the white card (review find)
             "body.theme-light .rsp-svg{background:rgba(0,0,0,0.04)}body.theme-light .rsp-grid{stroke:rgba(0,0,0,0.10)}"
             "body.theme-light #rsp-tip{background:#FFFFFF;border-color:rgba(0,0,0,0.12);color:#1F1E1D;"
             "box-shadow:0 5px 18px rgba(31,26,20,0.18)}body.theme-light #rsp-tip b{color:#1F1E1D}"

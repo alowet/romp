@@ -79,6 +79,33 @@ const { chromium } = require('playwright');
   await pg.waitForFunction(() => !document.getElementById('rsp-back').hidden, null, { timeout: 5000 });
   await pg.mouse.click(8, 8);
   const hiddenAfterTap = await pg.evaluate(() => document.getElementById('rsp-back').hidden);
-  console.log(JSON.stringify({ hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, foldBefore, foldAfter, errs }));
+  // a drag-select from a table cell that ends over the backdrop is not a tap
+  await pg.evaluate(() => document.getElementById('rail-usage').click());
+  await pg.waitForFunction(() => !document.getElementById('rsp-back').hidden && document.querySelector('#rsp-panel .rsp-tbl td.n'), null, { timeout: 5000 });
+  const cell = await (await pg.$('#rsp-panel .rsp-tbl td.n')).boundingBox();
+  await pg.mouse.move(cell.x + 2, cell.y + cell.height / 2); await pg.mouse.down(); await pg.mouse.move(5, 5, { steps: 4 }); await pg.mouse.up();
+  const hiddenAfterDrag = await pg.evaluate(() => document.getElementById('rsp-back').hidden);
+  // the light theme's error line, over a failed fetch
+  const lightErr = await pg.evaluate(async () => {
+    document.body.classList.add('theme-light');
+    const f = window.fetch; window.fetch = () => Promise.reject(new Error('boom'));
+    try { window.__rompOpenSpend(); await new Promise((r) => setTimeout(r, 200)); return getComputedStyle(document.querySelector('#rsp-panel .rsp-err')).color; }
+    finally { window.fetch = f; document.body.classList.remove('theme-light'); }
+  });
+  await pg.keyboard.press('Escape');
+  // the phone: no rail; the Usage panel's button is the door
+  await pg.setViewportSize({ width: 390, height: 844 });
+  await pg.reload(); await pg.waitForSelector('#mtabs [data-act="usage"]', { timeout: 20000 });
+  await pg.evaluate(() => { const bt = document.getElementById('romp-boot'); if (bt) bt.remove(); });
+  const mobile = await pg.evaluate(async () => {
+    const railHidden = getComputedStyle(document.querySelector('.pane-rail')).display === 'none';
+    window.__rompUsagePanel();
+    for (let i = 0; i < 50 && !document.getElementById('ru-bysession'); i++) await new Promise((r) => setTimeout(r, 100));
+    const panelOpened = !!document.getElementById('ru-bysession') && document.getElementById('ru-back').classList.contains('on');
+    if (panelOpened) document.getElementById('ru-bysession').click();
+    const modalOpened = !document.getElementById('rsp-back').hidden && !document.getElementById('ru-back').classList.contains('on');
+    return { railHidden, panelOpened, modalOpened };
+  });
+  console.log(JSON.stringify({ hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, hiddenAfterDrag, lightErr, mobile, foldBefore, foldAfter, errs }));
   await b.close();
 })().catch((e) => { console.error(e); process.exit(1); });
