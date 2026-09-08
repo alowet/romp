@@ -2819,7 +2819,7 @@ def _clear_state_fault(path):
     _state_fault_seen.pop(str(path), None)
 
 
-def _refuse_setting(client, exc, what, gesture, sid="", item_id="", flag="", value=None):
+def _refuse_setting(client, exc, what, gesture, sid="", item_id="", flag="", value=None, log=None):
     """A dashboard gesture (a lane/tab flag, a card bell, a drag, a view change) that this kernel
     REFUSED because the store it edits could not be read -- or, since the maintainer's fold on PR
     #1019, WRITTEN (_StateUnwritable: the publish itself failed): one stderr line, and the refusal answered
@@ -2833,9 +2833,11 @@ def _refuse_setting(client, exc, what, gesture, sid="", item_id="", flag="", val
     gesture with no single value (an order, a whole-blob view write). A `warn` frame did none of
     this: only the chat page renders `warn`, so a refused bell on the feed page and a refused lane
     flag on the timeline page stayed painted as if they had landed until a reload. A dead socket is
-    the client's problem: the refusal already stands."""
+    the client's problem: the refusal already stands. `log`, when given, is what stderr gets INSTEAD of
+    `text`: a flag refusal's text echoes the client's value for the client, and the log line names only
+    the field and its type (_flag_type_note; review find, 2026-09-08)."""
     text = "couldn't save %s \u2014 %s; try again" % (what, exc)
-    sys.stderr.write("romp-kernel: %s\n" % text)
+    sys.stderr.write("romp-kernel: %s\n" % (log or text))
     if not client or not callable(client.get("send")):
         return
     _reply(client, {"type": "settingRefused", "gesture": str(gesture), "sid": str(sid or ""),
@@ -13702,8 +13704,8 @@ def _drive(msg, client):
     elif t == "mcpAction" and msg.get("server"):
         # enable / disable / reconnect ONE MCP server (SDK control requests). The panel refetches after,
         # so the truth on screen is always the CLI's own status — never an optimistic guess.
-        err = be.mcp_action(sid, str(msg["server"]), str(msg.get("action") or "toggle"),
-                            bool(msg.get("enabled", True)))
+        enabled, ferr = _as_bool(msg.get("enabled"), "enabled", default=True)
+        err = ferr or be.mcp_action(sid, str(msg["server"]), str(msg.get("action") or "toggle"), enabled)
         client["send"](json.dumps({"type": "mcpResult", "id": sid, "server": str(msg["server"]),
                                    "error": err or ""}))
         _push_soon()
@@ -19964,6 +19966,147 @@ def _tmux_send(name, text, model_cmd=False, _async=True):
             time.sleep(0.85)
             _TMUX.send_keys(name, "Enter")                          # accept the hookless /model confirm
     threading.Thread(target=go, daemon=True).start() if _async else go()
+
+
+# The most a POST body may carry. Every POST this kernel serves is a JSON control request -- a /send
+# or /deliver message text, a tag edit, a push subscription, a settings flip -- tens of KB at the very
+# most; attachments never ride POST (they ride the WS, under _WS_MAX_MESSAGE). 1 MiB is an order of
+# magnitude of headroom over the largest legitimate body, and the bound on what one request can make a
+# handler thread buffer (the server is threaded: before the cap, each oversize POST pinned a thread
+# and allocated its declared length -- with no token, see _read_post_body).
+_POST_MAX_BYTES = 1024 * 1024
+
+# The longest the kernel waits for an announced, in-bounds body to ARRIVE. The cap above bounds what
+# one request can make a handler buffer; this bounds how long it can hold the handler's thread while
+# sending it (review find, 2026-09-08): an authorized client that announced 1 MiB and trickled it a
+# byte at a time pinned a thread for as long as it liked, since the socket had no timeout. Every
+# shipped client sends its body in one write, so 30 s is generous; a read that stalls past it answers
+# 408 and closes.
+_POST_BODY_TIMEOUT = 30.0
+
+
+def _clip_json(v, n=60):
+    """A BOUNDED, WELL-FORMED echo of an offending request value for an error message: a 1 MB body must
+    never come back as a 1 MB error. Every string is cut INSIDE its quotes and marked, at any depth, so a
+    long string still echoes as one complete quoted thing and the words after it survive; a container
+    is cut at the ELEMENT level, its first few members and a marker member, and nests no deeper than
+    four levels, so the echo is valid JSON whatever arrived (review find, 2026-09-08: a slice of the
+    serialized text cut a container mid-token, and ["xxx... came back with its quote and bracket open);
+    a number past n digits echoes as a marked string, since a cut decimal is a mid-token cut too.
+    Members are dropped until the whole echo fits about 4n characters; ensure_ascii is off, or the
+    marker itself comes back as \\u2026. The same shape as the /restart helper's clip."""
+    mark = "\u2026"
+
+    def cut(x, keep, depth):
+        if isinstance(x, str):
+            return x[:n] + mark if len(x) > n else x
+        if isinstance(x, dict):
+            if not x:
+                return {}
+            if depth >= 4 or keep == 0:
+                return {mark: mark}
+            items = list(x.items())
+            out = {cut(str(k), keep, depth + 1): cut(val, keep, depth + 1) for k, val in items[:keep]}
+            if len(items) > keep:
+                out[mark] = mark
+            return out
+        if isinstance(x, (list, tuple)):
+            if not x:
+                return []
+            if depth >= 4 or keep == 0:
+                return [mark]
+            out = [cut(val, keep, depth + 1) for val in x[:keep]]
+            if len(x) > keep:
+                out.append(mark)
+            return out
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            s = str(x)                                   # a number past n digits (json.loads takes an int of
+            return x if len(s) <= n else s[:n] + mark    # up to 4300) echoes as a marked STRING: a cut
+        return x                                         # decimal would be a mid-token cut
+
+    try:
+        for keep in (8, 4, 2, 1, 0):
+            s = json.dumps(cut(v, keep, 0), ensure_ascii=False)
+            if len(s) <= 4 * n or keep == 0:
+                return s
+    except (TypeError, ValueError):
+        pass
+    s = repr(v)
+    return s if len(s) <= n else s[:n] + mark
+
+
+def _json_object_body(raw):
+    """A POST body as the JSON object the session-management routes expect -> (body, error). Empty is
+    {} (the route then names its missing fields). Otherwise the body must decode AND be an object;
+    anything else comes back as `error` naming what arrived, and the route answers 400 without acting.
+    Before this the routes did `(b or {}).get(...)`: a JSON string, number or non-empty array is truthy,
+    so `.get` raised AttributeError into do_POST's catch-all -- a 500 whose body was a traceback
+    (absolute paths included) for what is a malformed request."""
+    if not raw:
+        return {}, None
+    try:
+        b = json.loads(raw)
+    except ValueError:                                # json.JSONDecodeError and a non-UTF-8 body alike
+        return None, "body is not JSON"
+    if not isinstance(b, dict):
+        return None, "body must be a JSON object, got %s" % _clip_json(b)
+    return b, None
+
+
+def _as_bool(v, field, default=False):
+    """A request flag as the boolean it claims to be -> (value, error). Absent is `default`, and so is an
+    EXPLICIT JSON null: the routes read their fields with .get(), under which the two are one value, and
+    null is how a client says "no value", the absent case spelled out, not a third kind of flag (review
+    find, 2026-09-08: the rule is stated here and in docs/reference.md, and pinned by the tests, so that
+    "a present non-boolean is refused" is read with null excepted). JSON true/false pass through;
+    anything else -- the string "false", 0/1, "no" -- is refused with `error` naming the field, and the
+    caller must NOT act. Never coerces: bool("false") is True, which is how a string used to enable
+    auto-nudge, file editing, the master bell and auto-update, pause retries across every session, make a
+    directory, and delete a tag."""
+    if v is None:
+        return default, None
+    if v is True or v is False:
+        return v, None
+    return None, "'%s' must be true or false, got %s" % (field, _clip_json(v))
+
+
+def _json_type_name(v):
+    """The JSON type of a decoded value, for a log line that must not carry the value itself."""
+    if v is None:
+        return "null"
+    if v is True or v is False:
+        return "a boolean"
+    if isinstance(v, str):
+        return "a string"
+    if isinstance(v, (int, float)):
+        return "a number"
+    if isinstance(v, list):
+        return "an array"
+    if isinstance(v, dict):
+        return "an object"
+    return type(v).__name__
+
+
+def _flag_type_note(field, v):
+    """What a refused flag was, for the kernel's OWN log: the field name and the value's JSON type, never
+    the value. The echo of the value belongs in the frame the sending client gets (it asked); the stderr
+    line used to carry up to 60 characters of whatever a client put in the field (review find,
+    2026-09-08), and a log is read by people who never sent it."""
+    return "'%s' is %s, not a boolean" % (field, _json_type_name(v))
+
+
+def _refuse_ws_flag(client, op, err, field="", value=None):
+    """A WS frame carried a flag that is not a boolean: one stderr line, and a `warn` frame -- the frame
+    the dispatcher answers a malformed request with (a bad session name, a failed login step) -- on the
+    delivering socket. The frame carries `err` with its bounded echo of the value (the sender sees what
+    it sent); the stderr line names only the op, the field and the value's type (_flag_type_note). The
+    shipped panes send real booleans, so nothing on screen needs repainting; this reaches the client
+    that sent the string, and the log. The two flags whose pages never render `warn` (setSessionFlag on
+    the timeline, cardNotify on the feed) refuse through _refuse_setting instead, on the settingRefused
+    frame those pages repaint from."""
+    sys.stderr.write("romp-kernel: refused %s: %s\n" % (op, _flag_type_note(field, value)))
+    if client and callable(client.get("send")):
+        _reply(client, {"type": "warn", "text": "%s: %s" % (op, err)})
 
 
 def _parse_send_body(raw):
@@ -41665,6 +41808,68 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _read_post_body(self):
+        """The POST body, read only AFTER _authorize passed and only within bounds -> (bytes, None), or
+        (None, (status, error)) with the connection marked to close (the unread body would otherwise be
+        parsed as the next request on this keep-alive socket). Bodies are delimited by Content-Length
+        alone: a Transfer-Encoding (chunked) request is refused with 411 rather than having its chunk
+        framing read as a body of length 0 and its bytes as a further request; the header must appear at
+        most once and be a plain decimal of at most 20 digits (a duplicate or a non-decimal value used to
+        be silently read as no body, inside a bare `except: pass`; the digit bound keeps int() from
+        raising on a run past the interpreter's conversion limit, which 500'd with a traceback); a
+        declared length past _POST_MAX_BYTES is refused with 413 before a byte of it is read; and a body
+        SHORTER than announced (a dead client, a short read) is refused with 400 naming the shortfall
+        rather than passing as the bytes that did arrive; a body that STALLS (an authorized client
+        trickling it) is refused with 408 once the read has waited _POST_BODY_TIMEOUT, so a slow sender
+        cannot pin a handler thread. An absent Content-Length is an empty body (the bodiless POSTs:
+        /tick, /restart). PR #1027 does the announced-vs-arrived check for /restart inside its own
+        parse; the two compose."""
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            return None, (411, "Transfer-Encoding is not accepted; send the body with a Content-Length")
+        get_all = getattr(self.headers, "get_all", None)   # an HTTPMessage in service; a plain dict in unit tests
+        if callable(get_all):
+            lengths = get_all("Content-Length") or []
+        else:
+            lengths = [] if self.headers.get("Content-Length") is None else [self.headers.get("Content-Length")]
+        if len(lengths) > 1:
+            self.close_connection = True
+            return None, (400, "body could not be read: more than one Content-Length header")
+        cl = str(lengths[0]).strip() if lengths else "0"
+        if not re.fullmatch(r"[0-9]{1,20}", cl):
+            self.close_connection = True
+            return None, (400, "body could not be read: Content-Length %s is an invalid literal for a byte count (decimal digits only)" % _clip_json(cl))
+        n = int(cl)
+        if n > _POST_MAX_BYTES:
+            self.close_connection = True
+            return None, (413, "request body of %d bytes exceeds the %d-byte limit" % (n, _POST_MAX_BYTES))
+        if not n:
+            return b"", None
+        # The read runs under a socket timeout (_POST_BODY_TIMEOUT), restored afterwards so a served
+        # keep-alive connection waits for its next request exactly as before. `connection` is the
+        # socket the stdlib handler set up; a unit-test handler over a BytesIO has none, and a fake
+        # rfile that stalls raises the same socket.timeout the real one would.
+        sock = getattr(self, "connection", None)
+        prior = sock.gettimeout() if sock is not None else None
+        try:
+            if sock is not None:
+                sock.settimeout(_POST_BODY_TIMEOUT)
+            raw = self.rfile.read(n)
+        except socket.timeout:
+            self.close_connection = True
+            return None, (408, "body could not be read: %d bytes announced, not all of it arrived within %g s"
+                          % (n, _POST_BODY_TIMEOUT))
+        finally:
+            if sock is not None:
+                try:
+                    sock.settimeout(prior)
+                except OSError:
+                    pass                                     # the socket is already gone; the close stands
+        if len(raw) < n:
+            self.close_connection = True
+            return None, (400, "body could not be read: read %d of the %d bytes Content-Length announced" % (len(raw), n))
+        return raw, None
+
     @_perf_http_timed
     def do_POST(self):
         u = urlparse(self.path)
@@ -41675,27 +41880,20 @@ class Handler(BaseHTTPRequestHandler):
         # runs; the _authorize call site then refines it (a valid token authorizes a
         # foreign origin — the federated dashboard — and a denial clears the echo).
         self._cors_origin = self.headers.get("Origin") if self._origin_ok() else None
-        raw_body = b""
-        # A body that was ANNOUNCED but did not arrive whole is remembered, not folded into "no body"
-        # (review find, 2026-09-08): this read used to swallow a short read, a dead client and an
-        # unparsable Content-Length into an EMPTY raw_body, and on /restart empty means the broad
-        # default, so a client that announced a peer-only body and died before sending it restarted
-        # every reachable kernel. Only /restart refuses on it today; the other routes keep reading
-        # raw_body as they did.
-        _body_err = None
-        try:
-            n = int(self.headers.get("Content-Length") or 0)   # read the body (keep-alive safety + POST payloads)
-            if n:
-                raw_body = self.rfile.read(n)
-                if len(raw_body) != n:
-                    _body_err = "read %d of the %d bytes Content-Length announced" % (len(raw_body), n)
-        except Exception as e:
-            _body_err = str(e)[:120] or e.__class__.__name__
         try:
             ok, self._set_cookie, why = self._authorize(q)
             self._cors_origin = self.headers.get("Origin") if ok else None   # echoed by _send (CORS delivery)
             if not ok:
-                return self._send(403, "forbidden: " + why, "text/plain")
+                # The body is still UNREAD: nothing an unauthenticated caller sends is buffered. It used
+                # to be read first, whatever its declared length, so a token-less loopback or tailnet
+                # client could make this kernel allocate and pin a handler thread per oversize POST.
+                # Unread bytes make the connection unusable for keep-alive, so it closes with the denial.
+                self.close_connection = True
+                return self._send(403, "forbidden: " + why, "text/plain", headers={"Connection": "close"})
+            raw_body, berr = self._read_post_body()
+            if berr is not None:
+                return self._send(berr[0], json.dumps({"ok": False, "error": berr[1]}), "application/json",
+                                  headers={"Connection": "close"})
             if u.path == "/restart":
                 # The web Restart button (↻ in the rail). Ack FIRST, then restart — the manager SIGTERMs
                 # this kernel and its exit handler spawns a fresh one, so new Python code loads (the
@@ -41711,7 +41909,9 @@ class Handler(BaseHTTPRequestHandler):
                 # The body is a JSON object with at most a boolean `fleet`, or empty (every ↻ button);
                 # anything else is a 400 that names the problem and restarts NOTHING. A malformed body
                 # must never widen the action — it used to fall through to the broad default.
-                _fleet, _bad = _restart_scope_from_body(raw_body, _body_err)
+                # A short or unparsable body never reaches this route: _read_post_body refused it with a 400
+                # naming the shortfall before any route ran, so the scope parser's own body-error is None here.
+                _fleet, _bad = _restart_scope_from_body(raw_body, None)
                 if _bad:
                     return self._send(400, json.dumps({"ok": False, "error": _bad}), "application/json")
                 # WHO ASKED, on the record (the user 2026-07-31): a restart blinks every dashboard, and
@@ -41747,10 +41947,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/update-dismiss":
                 # the banner's Not-now, PERSISTED (the user 2026-08-31): the dismissal outlives the
                 # page and the kernel — event-keyed, a NEW sha/tag offers again. Body: {"tag": id}.
-                try:
-                    b = json.loads(raw_body or b"{}")
-                except Exception:
-                    b = {}
+                b, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
                 _dismiss_update((b or {}).get("tag"))
                 return self._send(200, json.dumps({"ok": True}), "application/json")
             if u.path == "/update":
@@ -41794,10 +41993,11 @@ class Handler(BaseHTTPRequestHandler):
                 # posts here first, and only a 200 flips the bell — the device push subscription is
                 # a separate, best-effort leg on top. Every connected shell repaints at once, and
                 # the dirty mark rebuilds the feed so per-card bells show their new effective state.
-                try:
-                    _on = bool(json.loads(raw_body or b"{}").get("on"))
-                except (ValueError, AttributeError):
-                    return self._send(400, "bad json", "text/plain")
+                b, err = _json_object_body(raw_body)
+                if not err:
+                    _on, err = _as_bool(b.get("on"), "on")
+                if err:
+                    return self._send(400, json.dumps({"ok": False, "error": err}), "application/json")
                 try:
                     _set_notify_all(_on)
                 except (_StateUnreadable, _StateUnwritable) as e:
@@ -41817,10 +42017,11 @@ class Handler(BaseHTTPRequestHandler):
                 # the popover's turn-finished switch (2026-09-05): kernel-authoritative like the
                 # master, its own shell push so every open dashboard's row agrees. No dirty mark —
                 # the feed carries nothing that reads it.
-                try:
-                    _on = bool(json.loads(raw_body or b"{}").get("on"))
-                except (ValueError, AttributeError):
-                    return self._send(400, "bad json", "text/plain")
+                b, err = _json_object_body(raw_body)
+                if not err:
+                    _on, err = _as_bool(b.get("on"), "on")
+                if err:
+                    return self._send(400, json.dumps({"ok": False, "error": err}), "application/json")
                 try:
                     _set_notify_turns(_on)
                 except (_StateUnreadable, _StateUnwritable) as e:
@@ -42228,10 +42429,9 @@ class Handler(BaseHTTPRequestHandler):
                 # Same validation and the same no-silent-fallback rule as the WS op: when the SDK
                 # backend is unavailable, say so (ok:false + reason), never hand back a mystery tmux
                 # session. An already-live name is a success (idempotent open), not an error.
-                try:
-                    b = json.loads(raw_body or b"{}")
-                except Exception:
-                    b = {}
+                b, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
                 nm = str((b or {}).get("name") or "").strip()
                 if not nm or not NAME_RE.match(nm):
                     return self._send(400, json.dumps({"ok": False, "error":
@@ -42275,7 +42475,10 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(400, json.dumps({"ok": False, "error": terr}), "application/json")
                 tags_req = list(tags_req or [])
                 # mkdir:true makes a missing dir (the WS op's "create it" answer, available headlessly too)
-                cwd, derr = _resolve_create_dir(b.get("dir"), create=bool(b.get("mkdir")))
+                mk, ferr = _as_bool(b.get("mkdir"), "mkdir")
+                if ferr:
+                    return self._send(400, json.dumps({"ok": False, "error": ferr}), "application/json")
+                cwd, derr = _resolve_create_dir(b.get("dir"), create=mk)
                 if derr:
                     return self._send(200, json.dumps({"ok": False, "error": derr,
                                                        "dirStatus": _dir_status(b.get("dir"))}),
@@ -42387,10 +42590,9 @@ class Handler(BaseHTTPRequestHandler):
                 # ("at" empty = the whole conversation, the tip fork). Same contract as the op:
                 # parent untouched, explicit new name, and the fork discoverable the moment we ack
                 # (be.fork writes names/ synchronously inside _fork_session). Loud on refusal.
-                try:
-                    b = json.loads(raw_body or b"{}")
-                except Exception:
-                    b = {}
+                b, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
                 parent = str((b or {}).get("parent") or "").strip()
                 nm = str((b or {}).get("name") or "").strip()
                 if not parent or not nm:
@@ -42428,10 +42630,9 @@ class Handler(BaseHTTPRequestHandler):
                 # "name": <new-name>}. Sessions are uuid-keyed with the name as a label, so a rename
                 # never breaks mailboxes/goals/history; the by-name POISONING guard mirrors /fork's
                 # (a second session under one live name breaks every by-name surface). Loud errors.
-                try:
-                    b = json.loads(raw_body or b"{}")
-                except Exception:
-                    b = {}
+                b, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
                 target = str((b or {}).get("target") or "").strip()
                 nm = str((b or {}).get("name") or "").strip()
                 if not target or not nm:
@@ -42470,10 +42671,9 @@ class Handler(BaseHTTPRequestHandler):
                 # NOW and the reply carries the outcome; a busy one parks the move behind its turn and
                 # the reply says so (queued: true) — the CLI cannot tell whether that later fires, so it
                 # reports the park honestly rather than waiting on a turn of unknown length. Loud errors.
-                try:
-                    b = json.loads(raw_body or b"{}")
-                except Exception:
-                    b = {}
+                b, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
                 target = str((b or {}).get("target") or "").strip()
                 raw_dir = str((b or {}).get("dir") or "").strip()
                 if not target or not raw_dir:
@@ -42509,10 +42709,9 @@ class Handler(BaseHTTPRequestHandler):
                 # "bg": <swatch hex>}. Only a swatch from a known palette is accepted (its palette
                 # supplies the fg word) — GET /palette lists the choosable ones. A recolor is a
                 # names-registry write, so a dormant session works by sid, same as /rename. Loud errors.
-                try:
-                    b = json.loads(raw_body or b"{}")
-                except Exception:
-                    b = {}
+                b, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
                 target = str((b or {}).get("target") or "").strip()
                 bg = str((b or {}).get("bg") or "").strip()
                 if not target or not bg:
@@ -42544,10 +42743,9 @@ class Handler(BaseHTTPRequestHandler):
                 # restarts that killed every shell loop it replaces. Body: {"pr": <n>,
                 # "repo": "owner/name", "id"|"name": <session>}. Repo is explicit here (the CLI
                 # infers it from the caller's checkout); the session resolves like /send's.
-                try:
-                    b = json.loads(raw_body or b"{}")
-                except Exception:
-                    b = {}
+                b, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
                 try:
                     prn = int(b.get("pr"))
                 except Exception:
@@ -42586,10 +42784,9 @@ class Handler(BaseHTTPRequestHandler):
                 # watch retires; a timeout mails the giving-up notice (never a silent dead loop).
                 # Body: {"cmd": "...", "id"|"name": <session>, "every"?: s, "timeoutS"?: s,
                 # "note"?: "..."} — or {"cancel": <watch id>} to retire one early.
-                try:
-                    b = json.loads(raw_body or b"{}")
-                except Exception:
-                    b = {}
+                b, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
                 if b.get("cancel"):
                     ok = cancel_watch(str(b["cancel"]).strip())
                     return self._send(200, json.dumps({"ok": ok} if ok else
@@ -42626,14 +42823,16 @@ class Handler(BaseHTTPRequestHandler):
                 # — host:NAME included, since the blob stores ids and a stored name would be a
                 # member nothing ever matches — refuse loudly. /group is the pre-rename alias
                 # (same-day rename; an un-updated remote's bin/romp still posts there).
-                try:
-                    b = json.loads(raw_body or b"{}")
-                except Exception:
-                    b = {}
+                b, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
                 name = str((b or {}).get("name") or "").strip()
                 if not name:
                     return self._send(400, json.dumps({"ok": False, "error": "name required"}),
                                       "application/json")
+                dele, ferr = _as_bool(b.get("delete"), "delete")   # checked before the --host forward too
+                if ferr:
+                    return self._send(400, json.dumps({"ok": False, "error": ferr}), "application/json")
                 # --host (tag federation v0, the user 2026-08-24): the edit targets an ATTACHED
                 # kernel's store, through the tunnel it already holds — Model A home-kernel
                 # ownership, no sync engine. The body forwards minus `host`; the TARGET resolves
@@ -42689,7 +42888,7 @@ class Handler(BaseHTTPRequestHandler):
                 rn = b.get("rename")
                 t, err = _edit_tag(name, add=ids["add"], remove=ids["remove"],
                                    color=(str(color) if isinstance(color, str) else None),
-                                   delete=bool(b.get("delete")),
+                                   delete=dele,
                                    rename=(str(rn) if isinstance(rn, str) else None))
                 if err:
                     return self._send(200, json.dumps({"ok": False, "error": err}), "application/json")
@@ -42703,12 +42902,11 @@ class Handler(BaseHTTPRequestHandler):
                 # Publish/clear a session's working-note in the backend-agnostic store, so the postal bus's
                 # set_working goes through the kernel (no tmux @romp-working) and an SDK session can publish a
                 # note too. Body: {"id": <sid>, "text": <note|"">}. (the user 2026-06-26.)
-                try:
-                    body = json.loads(raw_body or b"{}")
-                except Exception:
-                    body = None
-                sid = str((body or {}).get("id") or "")
-                if not isinstance(body, dict) or not sid:
+                body, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
+                sid = str(body.get("id") or "")
+                if not sid:
                     return self._send(400, json.dumps({"ok": False, "error": "id required"}), "application/json")
                 r = _host_for_sid(sid)
                 if r is not None:                                   # remote session → forward over its -L tunnel
@@ -42722,12 +42920,11 @@ class Handler(BaseHTTPRequestHandler):
                 # enqueues it (SDK). {id, text} → {injected: bool}; the bus re-delivers to the maildir if false.
                 # Runs synchronously (the tmux inject polls the pane up to a few seconds) — fine on the
                 # threaded server. (the user 2026-06-26.)
-                try:
-                    body = json.loads(raw_body or b"{}")
-                except Exception:
-                    body = None
-                sid = str((body or {}).get("id") or "")
-                text = (body or {}).get("text") if isinstance(body, dict) else None
+                body, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
+                sid = str(body.get("id") or "")
+                text = body.get("text")
                 if not sid or not isinstance(text, str) or not text:
                     return self._send(400, json.dumps({"ok": False, "error": "id and text required"}), "application/json")
                 # POSTAL ISOLATION gate (the user 2026-07-10): /deliver is the agent-mail wake, so a
@@ -42748,11 +42945,10 @@ class Handler(BaseHTTPRequestHandler):
                 # Surface a revived tmux session stuck on Claude's resume picker (it blocks before any hook
                 # fires). The bus's `romp-postal picker-check` (run by romp on resume) calls this so it never
                 # shells tmux. {id}. Synchronous poll up to _PICKER_GRACE — fine on the threaded server.
-                try:
-                    body = json.loads(raw_body or b"{}")
-                except Exception:
-                    body = None
-                sid = str((body or {}).get("id") or "")
+                body, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
+                sid = str(body.get("id") or "")
                 if not sid:
                     return self._send(400, json.dumps({"ok": False, "error": "id required"}), "application/json")
                 _picker_check(sid)
@@ -42845,7 +43041,10 @@ class Handler(BaseHTTPRequestHandler):
                 host = str((body or {}).get("host") or "").strip() if isinstance(body, dict) else ""
                 if not host:
                     return self._send(400, json.dumps({"ok": False, "error": "host required"}), "application/json")
-                pub = checkin_set(host, bool((body or {}).get("on")))
+                on, ferr = _as_bool(body.get("on"), "on")
+                if ferr:
+                    return self._send(400, json.dumps({"ok": False, "error": ferr}), "application/json")
+                pub = checkin_set(host, on)
                 if pub is None:
                     return self._send(404, json.dumps({"ok": False, "error": "no attached host '%s' — attach it first" % host}), "application/json")
                 return self._send(200, json.dumps({"ok": True, "tunnel": pub}), "application/json")
@@ -42853,11 +43052,10 @@ class Handler(BaseHTTPRequestHandler):
                 # the postal bus asks for the sending session's walked root-ask record at relay
                 # time (T126) — best-effort: {} when the chain resolves nothing, and the bus
                 # degrades to an unenriched relay either way
-                try:
-                    body = json.loads(raw_body or b"{}")
-                except Exception:
-                    body = {}
-                rec = _walk_root_record(str((body or {}).get("sid") or ""))
+                body, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
+                rec = _walk_root_record(str(body.get("sid") or ""))
                 return self._send(200, json.dumps(rec or {}), "application/json")
             if u.path == "/redial":
                 # A CONSUMER just needed a host and found it unreachable (the postal bus parking mail,
@@ -42865,11 +43063,10 @@ class Handler(BaseHTTPRequestHandler):
                 # signal now instead of waiting out the backoff ladder (the user 2026-08-16, on flaky
                 # wifi). Best-effort by design — an unknown host is a quiet no-op, never an error the
                 # caller has to handle on top of the failure it is already reporting.
-                try:
-                    body = json.loads(raw_body or b"{}")
-                except Exception:
-                    body = {}
-                h = str((body or {}).get("host") or "")
+                body, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
+                h = str(body.get("host") or "")
                 if h:
                     _demand_redial(h, "timeout")
                 return self._send(200, json.dumps({"ok": True}), "application/json")
@@ -42885,7 +43082,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, json.dumps(fw), "application/json")
                 if not isinstance(body, dict) or "on" not in body:
                     return self._send(400, json.dumps({"ok": False, "error": "on required"}), "application/json")
-                _set_auto_update_remotes(bool(body.get("on")))
+                on, ferr = _as_bool(body.get("on"), "on")
+                if ferr:
+                    return self._send(400, json.dumps({"ok": False, "error": ferr}), "application/json")
+                _set_auto_update_remotes(on)
                 _tunnel_wake.set()   # apply on the NEXT pass, not up to 3s later — turning it on acts at once
                 return self._send(200, json.dumps({"ok": True, "on": _auto_update_remotes_on()}), "application/json")
             if u.path == "/tunnels/forget":
@@ -43168,7 +43368,11 @@ class Handler(BaseHTTPRequestHandler):
             _push_soon()
             return
         if msg and msg.get("type") == "setGlobalRetryPaused":
-            _set_retry_paused(msg.get("value"))
+            paused, ferr = _as_bool(msg.get("value"), "value")
+            if ferr:                                   # a string here paused retries across EVERY session
+                _refuse_ws_flag(client, msg["type"], ferr, "value", msg.get("value"))
+                return
+            _set_retry_paused(paused)
             _mark_views_dirty()
             return
         if msg and msg.get("type") == "ready":
@@ -43240,11 +43444,19 @@ class Handler(BaseHTTPRequestHandler):
             # timeline lane gear → toggle a per-session view flag (e.g. hideFromFeed). Persisted +
             # re-broadcast so the feed drops/restores that session's cards immediately. The notify
             # bell is tri-state (an override on the master default) → its own setter.
+            value, ferr = _as_bool(msg.get("value"), "value")
+            if ferr:
+                # the lane gear's own refusal frame (settingRefused, which the timeline page renders and
+                # repaints from; a `warn` never reaches it), addressed like the store-fault refusal below
+                _refuse_setting(client, ferr, "that setting", "flag", sid=msg["id"], flag=msg["flag"],
+                                value=_painted_flag_value(str(msg["id"]), str(msg["flag"])),
+                                log="refused %s: %s" % (msg["type"], _flag_type_note("value", msg.get("value"))))
+                return
             try:
                 if str(msg["flag"]) == "notify":
-                    _set_notify_session(str(msg["id"]), bool(msg.get("value")))
+                    _set_notify_session(str(msg["id"]), value)
                 else:
-                    _set_session_flag(str(msg["id"]), str(msg["flag"]), bool(msg.get("value")))
+                    _set_session_flag(str(msg["id"]), str(msg["flag"]), value)
             except (_StateUnreadable, _StateUnwritable) as e:
                 # the flags store could not be read, or its publish failed: refuse on the DELIVERING socket,
                 # addressed to the toggle (sid + flag) so the lane gear / tab menu ends its optimistic state
@@ -43335,7 +43547,15 @@ class Handler(BaseHTTPRequestHandler):
                     body["color"] = e["color"]
                 if isinstance(e.get("rename"), str):
                     body["rename"] = e["rename"]
-                if e.get("delete"):
+                dele, ferr = _as_bool(e.get("delete"), "delete")
+                if ferr:
+                    # a string here forwarded a DELETE; refused on the op's own failure frame, where a
+                    # refused edit lands, so the asking dashboard hears it
+                    _send_to_view("timeline", {"type": "tagEditFailed", "host": host, "name": nm,
+                                               "error": "editTag: " + ferr, "queued": False},
+                                  (client or {}).get("wid") or "")
+                    return
+                if dele:
                     body["delete"] = True
                 ans, err = _forward_tag_edit(host, body)
                 if err or not (ans or {}).get("ok", False):
@@ -43355,8 +43575,16 @@ class Handler(BaseHTTPRequestHandler):
             # completes). Persisted to notify-cards.json; build_feed echoes it back as ask.notify.
             # sid rides so the override can be resolved against the card's own default (session, else
             # the master) and deleted when it merely restates it.
+            value, ferr = _as_bool(msg.get("value"), "value")
+            if ferr:
+                # the bell's own refusal frame (settingRefused, which the feed page renders and repaints
+                # from; a `warn` never reaches it), addressed like the store-fault refusal below
+                _refuse_setting(client, ferr, "that bell", "bell", sid=msg.get("sid") or "", item_id=msg["itemId"],
+                                value=bool(_notify_card_effective(_notify_cards(), str(msg["itemId"]), str(msg.get("sid") or ""))),
+                                log="refused %s: %s" % (msg["type"], _flag_type_note("value", msg.get("value"))))
+                return
             try:
-                _set_notify_card(str(msg["itemId"]), bool(msg.get("value")), str(msg.get("sid") or ""))
+                _set_notify_card(str(msg["itemId"]), value, str(msg.get("sid") or ""))
             except (_StateUnreadable, _StateUnwritable) as e:
                 # the bells store could not be read, or its publish failed: refuse on the DELIVERING socket,
                 # addressed to the card (itemId) so the feed drops that bell's optimistic latch and says why
@@ -43385,19 +43613,27 @@ class Handler(BaseHTTPRequestHandler):
         elif msg and msg.get("type") == "setConserve" and msg.get("enabled") is not None:
             # the gear's conserve-memory toggle (T148) — kernel-side like autoNudge; the sweep
             # reads the flag fresh each pass, so flipping it needs no restart
-            _set_conserve(bool(msg.get("enabled")))
+            enabled, ferr = _as_bool(msg.get("enabled"), "enabled")
+            if ferr:
+                _refuse_ws_flag(client, msg["type"], ferr, "enabled", msg.get("enabled"))
+                return
+            _set_conserve(enabled)
             _push_soon()
         elif msg and msg.get("type") == "setAutoNudge" and msg.get("enabled") is not None:
             # feed gear → server-side Auto Nudge on/off; a stale gesture stamp stands down (no
             # apply — and no tick: a stood-down toggle is not new information), and the dashboard
             # that made the losing gesture hears it
-            if _set_auto_nudge(bool(msg["enabled"]), gt=_gesture_ms(msg)) is not None:
+            enabled, ferr = _as_bool(msg.get("enabled"), "enabled")
+            if ferr:
+                _refuse_ws_flag(client, msg["type"], ferr, "enabled", msg.get("enabled"))
+                return
+            if _set_auto_nudge(enabled, gt=_gesture_ms(msg)) is not None:
                 # turn-ON acts at once instead of waiting out the pusher's 0.5 s backstop; turning off
                 # has nothing to act on (the tick is a no-op when off, so this also spares the WS
                 # thread the listing fork). The single-flight rule, the dead-wait sweep skip and the
                 # try/except that keeps a failing tick from reading as a socket failure are all
                 # _ws_act_now_tick's; the stale reply below stays outside it (a real client write)
-                if msg["enabled"]:
+                if enabled:
                     _ws_act_now_tick()
             else:
                 _tell_stale_gesture(client, msg)
@@ -43408,7 +43644,11 @@ class Handler(BaseHTTPRequestHandler):
             # turn-on (instead of waiting out the pusher's 0.5 s backstop)
             # — a stood-down toggle is not new information — through the same wrap as setAutoNudge
             # (_ws_act_now_tick: single-flight, no dead-wait sweep, a failure logged not raised)
-            if _set_compact_suggest(bool(msg["enabled"]), gt=_gesture_ms(msg)) is not None:
+            enabled, ferr = _as_bool(msg.get("enabled"), "enabled")
+            if ferr:
+                _refuse_ws_flag(client, msg["type"], ferr, "enabled", msg.get("enabled"))
+                return
+            if _set_compact_suggest(enabled, gt=_gesture_ms(msg)) is not None:
                 _ws_act_now_tick()
             else:
                 _tell_stale_gesture(client, msg)
@@ -43420,13 +43660,21 @@ class Handler(BaseHTTPRequestHandler):
             # The viewer's Edit consent popup (the user 2026-08-22) — a kernel-side setting like
             # setAutoNudge, broadcast by federation.ts KERNEL_SETTING so one yes answers the mesh.
             # A stale gesture stamp stands down (a queued flush must not undo a newer choice).
-            if _set_file_editing(bool(msg["enabled"]), gt=_gesture_ms(msg)) is None:
+            enabled, ferr = _as_bool(msg.get("enabled"), "enabled")
+            if ferr:
+                _refuse_ws_flag(client, msg["type"], ferr, "enabled", msg.get("enabled"))
+                return
+            if _set_file_editing(enabled, gt=_gesture_ms(msg)) is None:
                 _tell_stale_gesture(client, msg)
         elif msg and msg.get("type") == "setThinkingSummaries" and msg.get("enabled") is not None:
             # The gear's Thinking summaries checkbox (2026-09-01) — kernel-side like setFileEditing but
             # PER-INSTALL (not a KERNEL_SETTING: nothing to propagate), gt-gated all the same; the SDK
             # backend reads the store at each session's next connect, so nothing else to do here.
-            if _set_thinking_summaries(bool(msg["enabled"]), gt=_gesture_ms(msg)) is None:
+            enabled, ferr = _as_bool(msg.get("enabled"), "enabled")
+            if ferr:
+                _refuse_ws_flag(client, msg["type"], ferr, "enabled", msg.get("enabled"))
+                return
+            if _set_thinking_summaries(enabled, gt=_gesture_ms(msg)) is None:
                 _tell_stale_gesture(client, msg)
         elif msg and msg.get("type") == "askClear" and msg.get("itemId"):
             # a cleared card drops any composer citation chip pointing INTO it (the user 2026-07-01) — the
@@ -43604,7 +43852,11 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 # the session dir is fixed at creation — validate now. mkdir: the user already saw the
                 # "that folder doesn't exist" dialog and chose to make it (see createDirMissing below).
-                cwd, derr = _resolve_create_dir(msg.get("dir"), create=bool(msg.get("mkdir")))
+                mk, ferr = _as_bool(msg.get("mkdir"), "mkdir")
+                if ferr:
+                    _refuse_ws_flag(client, msg["type"], ferr, "mkdir", msg.get("mkdir"))
+                    return
+                cwd, derr = _resolve_create_dir(msg.get("dir"), create=mk)
                 live = _live_names(_tmux_sessions())
                 # `parent` / `tags` (tab groups on tags, the user 2026-09-04): validated up front, like
                 # POST /new — an unknown parent or a malformed tags list refuses the create loudly,
@@ -43614,7 +43866,7 @@ class Handler(BaseHTTPRequestHandler):
                 terr = _tags_error(msg.get("tags")) if msg.get("tags") is not None else None
                 if derr:
                     st = _dir_status(msg.get("dir"))
-                    if st["canCreate"] and not msg.get("mkdir"):
+                    if st["canCreate"] and not mk:
                         # A missing directory is a QUESTION, not a failure: the client raises "create it or
                         # edit it" and comes back with mkdir set. Before this the create just warned and the
                         # "Opening…" cue span for 30s over a session that was never going to exist (the user

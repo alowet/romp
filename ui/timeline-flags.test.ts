@@ -91,3 +91,14 @@ test("every timeline dot's white border is thin (0.75px) — romp + user dots al
   assert.match(SRC, /el\('circle', \{ cx, cy, r: lit \? DOT_R \+ 2 : DOT_R, fill: color, stroke: PAL\(\)\.dotRing, 'stroke-width': 0\.75 \}\)/);
   assert.doesNotMatch(SRC, /stroke: '#e8eef5', 'stroke-width': 1\.5/, "the old 1.5px dot border is gone");
 });
+
+test("the lane toggle hands the kernel a JSON boolean", () => {
+  // the sender: the web host hook coerces to a real boolean before posting, never a string. The
+  // receiver's side (setSessionFlag refuses a non-boolean on the settingRefused frame this page renders,
+  // writes nothing, and no handler coerces with bool()) is pinned in the kernel's own lane,
+  // tests/test_kernel_session_flags.py WsFlagsMustBeBooleans, by driving the dispatcher rather than
+  // reading kernel.py as text from here (review find, 2026-09-08: a cross-lane source pin fails the
+  // extension build on a kernel edit that keeps the behaviour).
+  const BOOT = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "timeline-boot.ts"), "utf8");
+  assert.match(BOOT, /__rompTimelineSetFlag: \(id: string, flag: string, value: unknown\) => post\(\{ type: "setSessionFlag", id, flag, value: !!value \}\)/);
+});

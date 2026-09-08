@@ -3,9 +3,15 @@
 (the user 2026-06-26): drain the maildir, hand the banner to the kernel, and put the mail BACK if the kernel
 didn't inject — so the maildir-drain stays the backstop and the bus never shells tmux. Synthetic only.
 """
+import io
+import json
 import os
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -85,6 +91,235 @@ class PushThroughKernel(unittest.TestCase):
         self.assertIn('_kernel_post("/deliver"', src, "the live-push wakes via the kernel")
         self.assertNotIn("paste-buffer", src, "no tmux pane-inject remains in the bus")
         self.assertNotIn("capture-pane", src, "no tmux pane-capture remains in the bus")
+
+
+class PushIsChunkedUnderTheKernelsCap(unittest.TestCase):
+    """The kernel reads a POST body only up to _POST_MAX_BYTES (1 MiB). The bus used to hand it ONE
+    /deliver banner for a recipient's whole box: past the cap the kernel refused it with 413 before
+    reading a byte, _kernel_post folded the refusal into None, and _push filed it as the same "deferred"
+    every safe-pane deferral logs and re-posted the identical banner on every retry pass, forever (review
+    find, 2026-09-08). Now the box crosses in chunks measured against the exact wire size, a refusal is
+    logged by status and reads as one, and a single message no chunk can carry is bounced to its sender."""
+    SID = "11111111-2222-3333-4444-555555555555"
+    SENDER = "22222222-3333-4444-5555-666666666666"
+
+    def setUp(self):
+        self._seam = os.environ.pop("ROMP_SESSIONS_FILE", None)
+        self.saved = (pm._drain, pm._kernel_post, pm.deliver, pm.restore, pm._push_disabled, pm._log,
+                      pm._name_for_id, pm._tl_append)
+        self.posted, self.delivered, self.restored, self.logged = [], [], [], []
+        pm._push_disabled = lambda: False
+        pm.deliver = lambda sid, frm, frm_id, body, **k: self.delivered.append((sid, frm, frm_id, body, k)) or "n1"
+        pm.restore = lambda sid, mid: self.restored.append((sid, mid)) or True
+        pm._log = lambda msg: self.logged.append(msg)
+        pm._name_for_id = lambda sid: "api" if sid == self.SID else None
+        pm._tl_append = lambda fname, obj: None
+        pm._OVERSIZE_NAMED.clear()
+
+    def tearDown(self):
+        if self._seam is not None:
+            os.environ["ROMP_SESSIONS_FILE"] = self._seam
+        (pm._drain, pm._kernel_post, pm.deliver, pm.restore, pm._push_disabled, pm._log,
+         pm._name_for_id, pm._tl_append) = self.saved
+        pm._OVERSIZE_NAMED.clear()
+
+    def _msg(self, mid, size, **k):
+        m = {"from": "web", "from_id": self.SENDER, "body": "x" * size, "id": mid, "kind": "coordinate",
+             "park": False, "from_host": ""}
+        m.update(k)
+        return m
+
+    def _inject_all(self, path, body, timeout=2):
+        self.posted.append(body)
+        return {"ok": True, "injected": True}
+
+    def test_one_body_for_the_whole_box_would_cross_the_cap_so_it_is_split_oldest_first(self):
+        msgs = [self._msg("m1", 600_000), self._msg("m2", 600_000), self._msg("m3", 1000)]
+        self.assertGreater(pm._deliver_body_bytes(self.SID, msgs), pm._POST_MAX_BYTES,
+                           "the shape the chunking replaces: one banner for these three is over the cap")
+        chunks, oversize = pm._push_chunks(self.SID, msgs)
+        self.assertEqual(([[m["id"] for m in c] for c in chunks], oversize), ([["m1"], ["m2", "m3"]], []))
+
+    def test_a_box_past_the_cap_crosses_in_chunks_each_under_it(self):
+        msgs = [self._msg("m1", 600_000), self._msg("m2", 600_000), self._msg("m3", 1000)]
+        pm._drain = lambda sid: {"messages": msgs}
+        pm._kernel_post = self._inject_all
+        self.assertTrue(pm._push(self.SID, {"id": self.SID, "state": "idle"}))
+        self.assertEqual(len(self.posted), 2, "two bodies: m1 alone, then m2 with m3")
+        for body in self.posted:
+            self.assertEqual(body["id"], self.SID)
+            self.assertLessEqual(len(json.dumps(body).encode("utf-8")), pm._PUSH_MAX_BYTES,
+                                 "measured as _kernel_post serializes it")
+        self.assertIn("<!-- romp-msg-id: m1 -->", self.posted[0]["text"])
+        self.assertIn("<!-- romp-msg-id: m2 -->", self.posted[1]["text"])
+        self.assertIn("<!-- romp-msg-id: m3 -->", self.posted[1]["text"])
+        self.assertEqual((self.restored, self.delivered), ([], []), "everything landed: nothing put back")
+
+    def test_a_chunk_that_does_not_land_holds_it_and_the_rest_and_names_the_cause(self):
+        msgs = [self._msg("m1", 600_000), self._msg("m2", 600_000), self._msg("m3", 1000)]
+        pm._drain = lambda sid: {"messages": msgs}
+        answers = iter([{"ok": True, "injected": True}, None])
+        pm._kernel_post = lambda path, body, timeout=2: (self.posted.append(body), next(answers))[1]
+        self.assertFalse(pm._push(self.SID, {"id": self.SID, "state": "idle"}), "not everything landed")
+        self.assertEqual(len(self.posted), 2, "the run stops at the first chunk that does not land")
+        self.assertEqual(self.restored, [(self.SID, "m2"), (self.SID, "m3")],
+                         "the chunk that failed and everything after it go back under their own ids")
+        self.assertEqual(self.delivered, [])
+        line = self.logged[-1]
+        self.assertIn("deferred (kernel unreachable)", line)
+        self.assertIn("2 msg(s) restored", line)
+        self.assertIn("after 1 landed", line)
+
+    def test_a_pane_deferral_and_a_kernel_refusal_read_differently_in_the_log(self):
+        # both used to log the same "deferred" line, so a size refusal was indistinguishable from a pane
+        # that was not safe to paste into
+        pm._drain = lambda sid: {"messages": [self._msg("m1", 1000)]}
+        pm._kernel_post = lambda path, body, timeout=2: {"ok": True, "injected": False}
+        self.assertFalse(pm._push(self.SID, {"id": self.SID, "state": "idle"}))
+        self.assertIn("deferred (not injected)", self.logged[-1])
+        pm._kernel_post = lambda path, body, timeout=2: {"ok": False, "status": 413,
+                                                         "error": "request body of 2000000 bytes exceeds the 1048576-byte limit"}
+        self.assertFalse(pm._push(self.SID, {"id": self.SID, "state": "idle"}))
+        self.assertIn("deferred (kernel answered HTTP 413)", self.logged[-1])
+        self.assertEqual(self.restored, [(self.SID, "m1"), (self.SID, "m1")], "restored under its own id either way")
+
+    def test_kernel_post_logs_a_refusal_by_status_and_returns_it_as_one(self):
+        saved = urllib.request.urlopen
+
+        def refuse(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 413, "Payload Too Large", {}, io.BytesIO(
+                b'{"ok": false, "error": "request body of 2000000 bytes exceeds the 1048576-byte limit"}'))
+        urllib.request.urlopen = refuse
+        try:
+            r = pm._kernel_post("/deliver", {"id": self.SID, "text": "hello"})
+        finally:
+            urllib.request.urlopen = saved
+        self.assertEqual((r["ok"], r["status"]), (False, 413), "a refusal is not None (None is an unreachable kernel)")
+        self.assertIn("exceeds the 1048576-byte limit", r["error"])
+        self.assertEqual(len(self.logged), 1, self.logged)
+        self.assertIn("kernel refused POST /deliver: HTTP 413", self.logged[0])
+        self.assertIn("exceeds the 1048576-byte limit", self.logged[0], "the kernel's own reason reaches the log")
+
+        def refuse_long(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, io.BytesIO(b"y" * 100_000))
+        urllib.request.urlopen = refuse_long
+        try:
+            r = pm._kernel_post("/working", {"id": self.SID, "text": ""})
+        finally:
+            urllib.request.urlopen = saved
+        self.assertEqual(r["status"], 400)
+        self.assertLess(len(self.logged[-1]), 600, "a bounded slice of the refusal body, never the whole")
+
+        def unreachable(req, timeout=None):
+            raise urllib.error.URLError("connection refused")
+        urllib.request.urlopen = unreachable
+        try:
+            self.assertIsNone(pm._kernel_post("/working", {"id": self.SID, "text": ""}), "unreachable stays None")
+        finally:
+            urllib.request.urlopen = saved
+
+    def test_a_single_oversize_message_is_bounced_to_its_local_sender_not_reposted(self):
+        big = self._msg("m-big", 1_000_000)
+        pm._drain = lambda sid: {"messages": [big, self._msg("m-small", 1000)]}
+        pm._kernel_post = self._inject_all
+        self.assertTrue(pm._push(self.SID, {"id": self.SID, "state": "idle"}), "the rest of the box landed")
+        self.assertEqual(len(self.posted), 1)
+        self.assertNotIn("m-big", self.posted[0]["text"], "the oversize message is never posted")
+        self.assertEqual(self.restored, [], "and not put back: it left the recipient's box")
+        self.assertEqual(len(self.delivered), 1, "its sender hears it")
+        sid, frm, frm_id, note, k = self.delivered[0]
+        self.assertEqual((sid, frm, frm_id, k.get("kind")), (self.SENDER, "romp-postal", "", "coordinate"))
+        self.assertIn("undeliverable to 'api'", note)
+        self.assertIn("%d-byte limit" % pm._PUSH_MAX_BYTES, note)
+        self.assertNotIn("xxxxxxxx", note, "the note names the size instead of repeating the body")
+        self.assertLess(len(note), 600)
+        self.assertTrue(any("m-big" in l and "bounced to its sender" in l for l in self.logged), self.logged)
+
+    def test_an_oversize_message_with_no_local_sender_waits_for_the_drain_and_is_named_once(self):
+        relayed = self._msg("m-far", 1_000_000, from_host="TESTHOST")   # acked to its host at relay time
+        pm._drain = lambda sid: {"messages": [relayed]}
+        pm._kernel_post = lambda *a, **k: self.fail("an oversize body must never be posted")
+        for _ in range(3):                                   # the retry pass re-claims it every 5 s
+            self.assertFalse(pm._push(self.SID, {"id": self.SID, "state": "idle"}))
+        self.assertEqual(self.restored, [(self.SID, "m-far")] * 3, "put back under its own id each pass")
+        self.assertEqual(self.delivered, [], "a remote sender has no local box to bounce into")
+        named = [l for l in self.logged if "m-far" in l]
+        self.assertEqual(len(named), 1, named)
+        self.assertIn("waits in new/ for the turn-end drain", named[0])
+
+    def test_publish_working_reads_a_refusal_as_failure(self):
+        pm._kernel_post = lambda path, body, timeout=2: {"ok": False, "status": 400, "error": "id required"}
+        self.assertFalse(pm._publish_working(self.SID, "note"), "a refusal used to pass the `is not None` test")
+        pm._kernel_post = lambda path, body, timeout=2: {"ok": True}
+        self.assertTrue(pm._publish_working(self.SID, "note"))
+        pm._kernel_post = lambda path, body, timeout=2: None
+        self.assertFalse(pm._publish_working(self.SID, "note"))
+
+
+class _FakeKernel(BaseHTTPRequestHandler):
+    """The kernel's /deliver gate, in shape: 413 before reading a body announced past the cap; within it,
+    the body is read and injected."""
+    protocol_version = "HTTP/1.1"
+    seen = []
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > pm._POST_MAX_BYTES:
+            self.close_connection = True
+            self._answer(413, {"ok": False, "error": "request body of %d bytes exceeds the %d-byte limit"
+                               % (n, pm._POST_MAX_BYTES)})
+            return
+        raw = self.rfile.read(n)
+        _FakeKernel.seen.append((self.path, len(raw)))
+        self._answer(200, {"ok": True, "injected": True})
+
+    def _answer(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if code != 200:
+            self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class PushOverTheWire(unittest.TestCase):
+    """_push with the real _kernel_post, a real maildir and a fake kernel wearing the real gate's shape:
+    two 600 KB messages, which as one banner would be refused, cross as two POSTs and the box empties."""
+    SID = "33333333-4444-5555-6666-777777777777"
+
+    def setUp(self):
+        self._seam = os.environ.pop("ROMP_SESSIONS_FILE", None)
+        self.saved = (pm.KERNEL_BASE, pm._push_disabled, pm._log)
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), _FakeKernel)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        pm.KERNEL_BASE = "http://127.0.0.1:%d" % self.srv.server_address[1]
+        pm._push_disabled = lambda: False
+        self.logged = []
+        pm._log = lambda msg: self.logged.append(msg)
+        _FakeKernel.seen = []
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        if self._seam is not None:
+            os.environ["ROMP_SESSIONS_FILE"] = self._seam
+        pm.KERNEL_BASE, pm._push_disabled, pm._log = self.saved
+        pm.STREAKS.pop(self.SID, None)
+
+    def test_two_large_messages_cross_as_two_posts_and_the_box_empties(self):
+        pm.deliver(self.SID, "web", "22222222-3333-4444-5555-666666666666", "a" * 600_000, kind="coordinate")
+        pm.deliver(self.SID, "web", "22222222-3333-4444-5555-666666666666", "b" * 600_000, kind="coordinate")
+        self.assertTrue(pm._push(self.SID, {"id": self.SID, "state": "idle"}))
+        self.assertEqual([p for p, n in _FakeKernel.seen], ["/deliver", "/deliver"])
+        for path, n in _FakeKernel.seen:
+            self.assertLessEqual(n, pm._POST_MAX_BYTES)
+        self.assertEqual(pm.read_box(self.SID, consume=False), [], "both landed: nothing left in new/")
+        self.assertEqual([l for l in self.logged if "deferred" in l or "refused" in l], [])
 
 
 if __name__ == "__main__":

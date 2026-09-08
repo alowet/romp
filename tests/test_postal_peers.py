@@ -5,7 +5,9 @@ over POST /peer on tunnel transitions. Synthetic only."""
 import json
 import os
 import tempfile
+import threading
 import unittest
+from http.server import ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -53,6 +55,23 @@ class PeerMode(unittest.TestCase):
         self.assertEqual(pm.peers_snapshot()["peers"]["TESTHOST"]["up"], False,
                          "a down transition keeps the row for introspection, marked down")
         self.assertEqual(payload["up"], 0)
+
+    def test_peer_update_refuses_a_non_boolean_up_and_records_nothing(self):
+        # `up` used to be coerced with bool(), so a notify carrying the STRING "false" marked the peer UP
+        for bad in ("false", "true", 1, 0, "up"):
+            payload, status = pm.peer_update({"host": "TESTHOST", "port": 50002, "up": bad})
+            self.assertEqual(status, 400, (bad, payload))
+            self.assertEqual(payload["error"], "'up' must be true or false, got %s" % json.dumps(bad))
+        self.assertEqual(pm.PEERS, {}, "a refused notify records no row")
+        payload, status = pm.peer_update({"host": "TESTHOST", "port": 50002, "up": False})
+        self.assertEqual((status, pm.PEERS["TESTHOST"]["up"]), (200, False), "a real false rides through as itself")
+
+    def test_peer_update_reads_an_explicit_null_up_as_absent(self):
+        # the rule _as_bool states (review find, 2026-09-08): null is the absent case spelled out, so it
+        # takes the field's default (down), where a string or a number is refused
+        payload, status = pm.peer_update({"host": "TESTHOST", "port": 50002, "up": None})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(pm.PEERS["TESTHOST"]["up"], False)
 
     def test_peer_update_validates(self):
         for bad in ({}, {"host": "", "port": 1}, {"host": "h"}, {"host": "h", "port": "x"},
@@ -121,11 +140,10 @@ os.environ["XDG_STATE_HOME"] = _B_STATE
 pmb = SourceFileLoader("romp_postal_peers_b", os.path.join(BIN, "romp-postal-service")).load_module()
 
 
-class TwoBusExchange(unittest.TestCase):
+class _TwoBusHarness(unittest.TestCase):
     """The two-bus harness (plans/postal-peer-buses.md): A and B are two module instances with
     separate state dirs; the "tunnel" is a direct call — A builds a request, B handles it, A applies
-    the response. Covers mail both directions, end-to-end acks, dedupe on a resent relay, bounce to
-    the sender on a dead recipient, presence gossip, and the version handshake."""
+    the response. No tests of its own: TwoBusExchange and ExchangeRelaysAreBudgeted run on it."""
 
     def setUp(self):
         os.environ["ROMP_POSTAL_PEERS"] = "1"
@@ -172,6 +190,11 @@ class TwoBusExchange(unittest.TestCase):
         self.assertEqual(status, 200)
         pm.peer_exchange_apply("srv", req, resp)
         return resp
+
+
+class TwoBusExchange(_TwoBusHarness):
+    """Covers mail both directions, end-to-end acks, dedupe on a resent relay, bounce to the sender on a
+    dead recipient, presence gossip, and the version handshake."""
 
     def test_quarantine_holds_cross_the_exchange_both_ways(self):
         # Slice 4 of the federation UI (the user 2026-07-25): each side's exchange payload carries a
@@ -398,6 +421,106 @@ class ThreeBusRelay(unittest.TestCase):
         verdict, bounce = pmb._relay_in("hosta", m)
         self.assertEqual(verdict, "bounce", "one hop max: an already-hopped message bounces, never re-forwards")
         self.assertIn("no live session", bounce["why"])
+
+
+class ExchangeRelaysAreBudgeted(_TwoBusHarness):
+    """One exchange carries the outbox's oldest-first prefix under _RELAY_BUDGET_BYTES (half the dialed
+    bus's 1 MiB body cap); the rest ride the next round. The request used to carry the WHOLE outbox
+    (review find, 2026-09-08): a backlog past the cap was 413'd by the dialed bus's _body gate and the
+    dialer re-sent the identical request on every backoff, forever, so every message to that peer parked
+    on a healthy link. A single relay over the budget is bounced to its sender instead of retried."""
+
+    def _park(self, n, size, prefix="big"):
+        for i in range(n):
+            pm.outbox_put("srv", {"mid": "%s%02d" % (prefix, i), "to": "beta", "frm": "alpha", "frm_id": "sid-a",
+                                  "body": "R" * size, "kind": "coordinate", "t": i})
+
+    def test_a_backlog_past_the_cap_drains_over_successive_exchanges(self):
+        self._park(12, 100_000)
+        self.assertGreater(len(json.dumps({"relays": pm.outbox_list("srv")}).encode()), pm._POST_MAX_BYTES,
+                           "the whole outbox would not fit one request")
+        rounds = 0
+        while pm.outbox_list("srv") and rounds < 10:
+            req = pm.build_exchange_request("srv", wait=False)
+            self.assertLessEqual(len(json.dumps(req).encode("utf-8")), pm._POST_MAX_BYTES,
+                                 "every request fits the dialed bus's cap")
+            self.assertTrue(req["relays"], "progress every round")
+            resp, status = pmb.peer_exchange_handle(req)
+            self.assertEqual(status, 200)
+            pm.peer_exchange_apply("srv", req, resp)
+            rounds += 1
+        self.assertEqual(pm.outbox_list("srv"), [], "the backlog drained")
+        self.assertGreaterEqual(rounds, 2, "over more than one exchange")
+        box = pmb.read_box("sid-b", consume=True)
+        self.assertEqual(len(box), 12, "every message arrived exactly once")
+        self.assertEqual(sorted(len(m["body"]) for m in box), [100_000] * 12)
+
+    def test_the_budget_holds_through_the_dialed_bus_s_own_body_gate(self):
+        # the HTTP layer in the path: the dialed bus's _body reads a request only up to _POST_MAX_BYTES,
+        # and a 413 would raise out of _peer_http here
+        self._park(12, 100_000)
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), pmb.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            rounds = 0
+            while pm.outbox_list("srv") and rounds < 10:
+                req = pm.build_exchange_request("srv", wait=False)
+                resp = pm._peer_http(srv.server_address[1], req, token=pmb.SERVE_TOKEN)
+                pm.peer_exchange_apply("srv", req, resp)
+                rounds += 1
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(pm.outbox_list("srv"), [])
+        self.assertEqual(len(pmb.read_box("sid-b", consume=True)), 12)
+
+    def test_a_single_relay_over_the_budget_is_bounced_to_its_sender_naming_the_size(self):
+        logged, saved = [], pm._log
+        pm._log = lambda msg: logged.append(msg)
+        try:
+            pm.outbox_put("srv", {"mid": "huge", "to": "beta", "frm": "alpha", "frm_id": "sid-a",
+                                  "body": "Z" * (pm._RELAY_BUDGET_BYTES + 1000), "kind": "coordinate", "t": 1})
+            pm.outbox_put("srv", {"mid": "small", "to": "beta", "frm": "alpha", "frm_id": "sid-a",
+                                  "body": "hi", "kind": "", "t": 2})
+            req = pm.build_exchange_request("srv", wait=False)
+        finally:
+            pm._log = saved
+        self.assertEqual([m["mid"] for m in req["relays"]], ["small"], "the oversize relay never rides")
+        self.assertEqual([m["mid"] for m in pm.outbox_list("srv")], ["small"], "and left the outbox")
+        back = pm.read_box("sid-a", consume=True)
+        self.assertEqual(len(back), 1, "the sender got the bounce note")
+        self.assertIn("undeliverable to 'beta' on srv", back[0]["body"])
+        self.assertIn("exceeds the %d-byte relay limit" % pm._RELAY_BUDGET_BYTES, back[0]["body"])
+        self.assertNotIn("ZZZZ", back[0]["body"], "the note names the size instead of repeating the body")
+        self.assertEqual(back[0]["from"], "romp-postal")
+        self.assertTrue(any("relay huge is" in l and "bounced to its sender" in l for l in logged), logged)
+
+    def test_a_forwarded_relay_over_the_budget_bounces_backward_to_its_origin(self):
+        pm.outbox_put("srv", {"mid": "fwd", "to": "beta", "frm": "gamma", "frm_id": "sid-c", "origin": "hostc",
+                              "body": "Z" * (pm._RELAY_BUDGET_BYTES + 1000), "kind": "", "t": 1})
+        req = pm.build_exchange_request("srv", wait=False)
+        self.assertEqual(req["relays"], [])
+        self.assertEqual(pm.outbox_list("srv"), [])
+        b = pm._pending("hostc")["bounces"]
+        self.assertEqual(len(b), 1, "the bounce rides back to the origin on its next exchange")
+        self.assertEqual(b[0]["mid"], "fwd")
+        self.assertIn("relay limit", b[0]["why"])
+        self.assertTrue(b[0]["omitBody"])
+        self.assertEqual(pm.read_box("sid-c", consume=True), [], "nothing lands locally for mail we only forwarded")
+
+    def test_the_dialed_side_budgets_its_response_relays_too(self):
+        for i in range(12):
+            pmb.outbox_put("hosta", {"mid": "back%02d" % i, "to": "alpha", "frm": "beta", "frm_id": "sid-b",
+                                     "body": "Q" * 100_000, "kind": "", "t": i})
+        resp = self._exchange()
+        self.assertLess(len(resp["relays"]), 12)
+        self.assertLessEqual(len(json.dumps(resp["relays"]).encode()), pm._RELAY_BUDGET_BYTES)
+        rounds = 1
+        while pmb.outbox_list("hosta") and rounds < 10:   # each request acks the last response's relays
+            self._exchange()
+            rounds += 1
+        self.assertEqual(pmb.outbox_list("hosta"), [])
+        self.assertEqual(len(pm.read_box("sid-a", consume=True)), 12)
 
 
 class RecallAndReceipts(unittest.TestCase):

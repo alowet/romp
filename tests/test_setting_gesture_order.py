@@ -906,15 +906,15 @@ class WiringPins(unittest.TestCase):
         self.src = inspect.getsource(km.Handler._dispatch_ws)
 
     def test_auto_nudge_branch_gates_on_the_stamp_and_skips_the_tick_on_stand_down(self):
-        self.assertIn('_set_auto_nudge(bool(msg["enabled"]), gt=_gesture_ms(msg)) is not None', self.src,
+        self.assertIn('_set_auto_nudge(enabled, gt=_gesture_ms(msg)) is not None', self.src,
                       "a stood-down toggle must not fire the nudge tick either — no new information")
 
     def test_file_editing_branch_passes_the_stamp(self):
-        self.assertIn('_set_file_editing(bool(msg["enabled"]), gt=_gesture_ms(msg))', self.src)
+        self.assertIn('_set_file_editing(enabled, gt=_gesture_ms(msg))', self.src)
 
     def test_compact_suggest_branch_gates_on_the_stamp_and_skips_the_tick_on_stand_down(self):
         # T208's WS branch mirrors setAutoNudge's: gt-gated, immediate tick only on a real apply
-        self.assertIn('_set_compact_suggest(bool(msg["enabled"]), gt=_gesture_ms(msg)) is not None', self.src)
+        self.assertIn('_set_compact_suggest(enabled, gt=_gesture_ms(msg)) is not None', self.src)
 
     def test_update_mode_branch_passes_the_stamp(self):
         self.assertIn('_set_update_mode(str(msg["mode"]), gt=_gesture_ms(msg))', self.src)
@@ -1215,7 +1215,7 @@ class ThinkingSummariesSetting(_Base):
     def test_the_setting_is_reported_but_not_broadcast(self):
         import inspect
         src = inspect.getsource(km.Handler._dispatch_ws)
-        self.assertIn('_set_thinking_summaries(bool(msg["enabled"]), gt=_gesture_ms(msg))', src,
+        self.assertIn('_set_thinking_summaries(enabled, gt=_gesture_ms(msg))', src,
                       "the WS branch hands the gesture stamp to the store")
         fed = Path(BIN).parent / "ui" / "webview" / "federation.ts"
         self.assertNotIn("setThinkingSummaries", fed.read_text(),

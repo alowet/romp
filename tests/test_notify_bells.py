@@ -283,12 +283,16 @@ class NotifyWiring(unittest.TestCase):
     def test_the_ws_handler_persists_the_card_toggle(self):
         self.assertIn('msg.get("type") == "cardNotify"', self.src)
         # sid rides so delete-if-default resolves against the card's own default
-        self.assertIn('_set_notify_card(str(msg["itemId"]), bool(msg.get("value")), str(msg.get("sid") or ""))',
+        # the flag is a checked boolean, never bool()-coerced (a string "false" used to arm the bell)
+        self.assertIn('value, ferr = _as_bool(msg.get("value"), "value")', self.src)
+        # ...and refused on the frame the FEED page renders (settingRefused, addressed to the card), never a warn
+        self.assertIn('_refuse_setting(client, ferr, "that bell", "bell", sid=msg.get("sid") or "", item_id=msg["itemId"],',
                       self.src)
+        self.assertIn('_set_notify_card(str(msg["itemId"]), value, str(msg.get("sid") or ""))', self.src)
 
     def test_the_session_bell_routes_to_its_tristate_setter(self):
         # setSessionFlag's pop-on-false is right for the view flags but would eat a mute
-        self.assertIn('_set_notify_session(str(msg["id"]), bool(msg.get("value")))', self.src)
+        self.assertIn('_set_notify_session(str(msg["id"]), value)', self.src)
 
     def test_the_master_has_both_routes_and_broadcasts(self):
         # GET paints the bell at boot; POST flips it, rebuilds the feed (per-card bells repaint

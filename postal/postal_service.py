@@ -663,9 +663,14 @@ def _kernel_post(path, body, timeout=2):
     """POST a small JSON body to the kernel (loopback, X-Romp-Token from the shared 0600 file) — the bus's
     one-way control channel for the
     ops the kernel owns now that the bus never shells tmux: the working-note, mail delivery/wake, the
-    status-bar chrome, and the resume-picker check. Returns the parsed JSON response dict, or None
-    (unreachable kernel / non-2xx / parse error → the caller degrades). No-op (None) under the
-    ROMP_SESSIONS_FILE test seam, which signals a test running with no live kernel."""
+    status-bar chrome, and the resume-picker check. Returns the parsed JSON response dict; None when
+    the kernel could not be reached or its answer could not be parsed (the caller degrades); or, for a
+    kernel that REFUSED the request (a 4xx/5xx), {"ok": False, "status": <code>, "error": <its text>},
+    logged here by status with a bounded slice of the kernel's own reason, so a refusal never reads as
+    a dead kernel (review find, 2026-09-08: every non-2xx came back as None, and the kernel's 413 on an
+    oversize /deliver body was filed as "deferred" and re-posted forever). A caller that tests
+    `resp.get("ok")` or `resp.get("injected")` sees a refusal as the failure it is. No-op (None) under
+    the ROMP_SESSIONS_FILE test seam, which signals a test running with no live kernel."""
     if os.environ.get("ROMP_SESSIONS_FILE"):
         return None
     import urllib.request
@@ -677,6 +682,14 @@ def _kernel_post(path, body, timeout=2):
             if getattr(r, "status", 200) // 100 != 2:
                 return None
             return json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        text = ""
+        try:
+            text = " ".join((e.read(512) or b"").decode("utf-8", "replace").split())   # a bounded slice: the
+        except Exception:                                                                # kernel's reason, never
+            pass                                                                         # a whole error page
+        _log("kernel refused POST %s: HTTP %d %s" % (path, e.code, text))
+        return {"ok": False, "status": int(e.code), "error": text}
     except Exception:
         return None
 
@@ -703,7 +716,10 @@ def _publish_working(sid, text):
     """Publish/clear THIS session's working-note via the kernel's backend-agnostic store (POST /working) — no
     tmux. The kernel owns the store and both backends read it (it appears in GET /sessions' `working` field),
     so an SDK session can publish a note too."""
-    return _kernel_post("/working", {"id": str(sid), "text": text}) is not None if sid else False
+    if not sid:
+        return False
+    r = _kernel_post("/working", {"id": str(sid), "text": text})
+    return r is not None and r.get("ok") is not False        # None: unreachable; ok false: the kernel refused
 
 def all_agents(threads=False):
     agents = local_agents(threads=threads)
@@ -1263,13 +1279,89 @@ def format_push(msgs):
                % msgs[0].get("from", ""))
     return "\n".join(out)
 
+def _deliver_body_bytes(sid, msgs):
+    """The exact wire size of the /deliver POST carrying `msgs`: the banner in its JSON envelope,
+    serialized as _kernel_post serializes it (ensure_ascii on, so non-ASCII text and every newline
+    inflate past the banner's own length)."""
+    return len(json.dumps({"id": sid, "text": format_push(msgs)}).encode("utf-8"))
+
+
+def _push_chunks(sid, msgs):
+    """Split a recipient's pending mail into /deliver bodies that fit under _PUSH_MAX_BYTES, oldest
+    first -> (chunks, oversize). Each chunk is a non-empty run of consecutive messages whose whole body
+    fits; `oversize` are the messages whose body ALONE does not, which no chunk can carry. The banner
+    used to be one body for the whole box (review find, 2026-09-08): past the kernel's cap it was
+    refused, and the refusal re-posted on every retry pass."""
+    chunks, cur, oversize = [], [], []
+    for m in msgs:
+        if cur and _deliver_body_bytes(sid, cur + [m]) <= _PUSH_MAX_BYTES:
+            cur.append(m)
+            continue
+        if cur:
+            chunks.append(cur)
+            cur = []
+        if _deliver_body_bytes(sid, [m]) <= _PUSH_MAX_BYTES:
+            cur = [m]
+        else:
+            oversize.append(m)
+    if cur:
+        chunks.append(cur)
+    return chunks, oversize
+
+
+_OVERSIZE_NAMED = set()   # mids of oversize mail already named in the log: a message left for the drain
+#                           is re-claimed by every retry pass, and one line per message is the record
+
+
+def _bounce_oversize(sid, m):
+    """One message whose /deliver body alone exceeds _PUSH_MAX_BYTES: it can never ride the live wake
+    (the kernel refuses the body before reading it), so it is not posted, and never was going to land
+    however often the retry pass re-posted it. A LOCAL sender hears it, the way a peer's refusal reaches
+    a sender through _bounce_apply: the message leaves the recipient's box (the drain already claimed it)
+    and a bus-authored note names the size and the limit, without echoing the body, which would make
+    the note itself oversize. A message with no local sender to tell (a bus-authored note; relayed mail,
+    whose sender lives on another host and was acked at relay time) stays in new/ for the turn-end drain
+    and check_inbox, which have no size cap, and is named in the log once."""
+    n = _deliver_body_bytes(sid, [m])
+    mid, frm_id = m.get("id", ""), m.get("from_id", "")
+    if frm_id and not m.get("from_host") and frm_id != sid:
+        to = _name_for_id(sid) or sid
+        why = ("your message is %d bytes as delivered, over the %d-byte limit for delivery into a session"
+               % (n, _PUSH_MAX_BYTES))
+        deliver(frm_id, "romp-postal", "", "undeliverable to '%s': %s. Send a shorter message, or write "
+                "the text to a file and send its path. (The message is not echoed here because of its "
+                "size.)" % (to, why), kind="coordinate")
+        _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": mid, "to": to,
+                                      "host": "", "why": why})
+        _log("push to %s: message %s is %d bytes, over the %d-byte /deliver limit; bounced to its sender %s"
+             % (sid, mid, n, _PUSH_MAX_BYTES, frm_id))
+        return
+    if not restore(sid, mid):
+        deliver(sid, m.get("from", "?"), frm_id, m.get("body", ""), park=m.get("park", False),
+                kind=m.get("kind", ""), from_host=m.get("from_host", ""))
+    if mid not in _OVERSIZE_NAMED:
+        _OVERSIZE_NAMED.add(mid)
+        _log("push to %s: message %s is %d bytes, over the %d-byte /deliver limit, and has no local sender "
+             "to bounce to; it waits in new/ for the turn-end drain" % (sid, mid, n, _PUSH_MAX_BYTES))
+
+
 def _push(sid, agent):
     """Live-deliver pending mail to a session by WAKING it through the kernel (POST /deliver) — the kernel
     injects the banner into the pane (tmux, draft-preserving) or enqueues it (SDK); the bus never shells tmux.
     Coarse-skip a clearly not-ready session (remote / not idle-or-working) to avoid a needless drain; the
     kernel does the fine pane-safety (at a ❯ prompt, out of copy-mode, a draft it can safely stash) and tells
     us whether it injected. Not injected → put the mail back for the maildir-drain backstop. Returns True iff
-    injected (so a revive poll knows to stop). `agent` is the GET /sessions row (id, state, backend, remote)."""
+    every message that can ride the wake was injected (so a revive poll knows to stop). `agent` is the GET
+    /sessions row (id, state, backend, remote).
+
+    The box goes over in CHUNKS under _PUSH_MAX_BYTES (review find, 2026-09-08): the kernel reads a POST
+    body only up to _POST_MAX_BYTES, and one banner for the whole box crossed that once enough mail had
+    piled up for one recipient, refused with 413 before a byte was read, filed here as "deferred", and
+    re-posted identically on every retry pass, so the live wake for that recipient never came. Chunks
+    post oldest first; the first that does not land stops the run, and it and everything after it are
+    restored. A single message too large for any chunk is handled by _bounce_oversize. The log line
+    names the cause (a kernel that could not be reached, one that answered a status, or a pane that
+    was not safe) where every deferral used to read the same."""
     if _push_disabled() or not agent:
         return False
     if os.environ.get("ROMP_SESSIONS_FILE"):                  # test seam: no live kernel → leave it for the drain (don't churn the maildir)
@@ -1284,19 +1376,36 @@ def _push(sid, agent):
         msgs = res.get("messages", [])
         if not msgs:
             return False                                      # nothing, or loop-guard paused
-        resp = _kernel_post("/deliver", {"id": sid, "text": format_push(msgs)}, timeout=12)
-        if resp and resp.get("injected"):
-            return True
+        chunks, oversize = _push_chunks(sid, msgs)
+        for m in oversize:
+            _bounce_oversize(sid, m)
+        landed, held, cause = 0, [], ""
+        for i, chunk in enumerate(chunks):
+            resp = _kernel_post("/deliver", {"id": sid, "text": format_push(chunk)}, timeout=12)
+            if resp and resp.get("injected"):
+                landed += len(chunk)
+                continue
+            if resp is None:
+                cause = "kernel unreachable"
+            elif resp.get("status"):
+                cause = "kernel answered HTTP %s" % resp["status"]   # the reason is in _kernel_post's line
+            else:
+                cause = "not injected"                        # the pane was not safe to paste into
+            held = [m for c in chunks[i:] for m in c]
+            break
+        if not held:
+            return bool(landed)
         # Not injected → UNCLAIM: put each message back under its ORIGINAL id (restore), so a
         # deferred push doesn't mint a second identity for the same message. Only if the file is
         # gone (recalled/swept mid-push) do we fall back to a re-send, which costs a new id but
         # never loses the mail.
-        for m in msgs:
+        for m in held:
             if not restore(sid, m.get("id", "")):
                 deliver(sid, m.get("from", "?"), m.get("from_id", ""), m.get("body", ""),
                         park=m.get("park", False), kind=m.get("kind", ""),
                         from_host=m.get("from_host", ""))
-        _log("push to %s deferred; %d msg(s) restored for the drain backstop" % (sid, len(msgs)))
+        _log("push to %s deferred (%s); %d msg(s) restored for the drain backstop%s"
+             % (sid, cause, len(held), (" after %d landed" % landed) if landed else ""))
         return False
     except Exception as e:
         _log("push error for %s: %s" % (sid, e))
@@ -1330,21 +1439,166 @@ def _wake_when_ready(sid):
     except Exception as e:
         _log("wake wait failed for %s: %s" % (sid, e))
 
+# The most a POST body may carry -- the kernel's bound, mirrored: every bus route takes a JSON control
+# request (one mail, a peer table, an exchange of presence and acks), tens of KB at most.
+_POST_MAX_BYTES = 1024 * 1024
+
+# The longest the bus waits for an announced, in-bounds body to ARRIVE -- the kernel's _POST_BODY_TIMEOUT,
+# mirrored (review find, 2026-09-08): with no timeout on the socket, a handler thread was pinned for as
+# long as an authorized client cared to trickle its body. Every client sends its body in one write, so
+# 30 s is generous; a read that stalls past it answers 408 and closes.
+_POST_BODY_TIMEOUT = 30.0
+
+# The most one /deliver body the bus BUILDS may carry (review find, 2026-09-08): the kernel reads a POST
+# only up to _POST_MAX_BYTES, and this is what _push measures each chunk of a recipient's box against,
+# the exact wire size, envelope and escaping included, so no chunk is ever refused on size. The gap
+# under the cap is headroom, not a measurement allowance.
+_PUSH_MAX_BYTES = 900 * 1024
+
+
+def _clip_json(v, n=60):
+    """A BOUNDED, WELL-FORMED echo of an offending request value for an error message: a large body must
+    never come back as a large error. Every string is cut INSIDE its quotes and marked, at any depth, so
+    a long string still echoes as one complete quoted thing; a container is cut at the ELEMENT level,
+    its first few members and a marker member, and nests no deeper than four levels, so the echo is
+    valid JSON whatever arrived (review find, 2026-09-08: a slice of the serialized text cut a container
+    mid-token, and ["xxx... came back with its quote and bracket open); a number past n digits echoes as
+    a marked string, since a cut decimal is a mid-token cut too. Members are dropped until the whole
+    echo fits about 4n characters; ensure_ascii is off, or the marker itself comes back as \\u2026. The
+    kernel's shape."""
+    mark = "\u2026"
+
+    def cut(x, keep, depth):
+        if isinstance(x, str):
+            return x[:n] + mark if len(x) > n else x
+        if isinstance(x, dict):
+            if not x:
+                return {}
+            if depth >= 4 or keep == 0:
+                return {mark: mark}
+            items = list(x.items())
+            out = {cut(str(k), keep, depth + 1): cut(val, keep, depth + 1) for k, val in items[:keep]}
+            if len(items) > keep:
+                out[mark] = mark
+            return out
+        if isinstance(x, (list, tuple)):
+            if not x:
+                return []
+            if depth >= 4 or keep == 0:
+                return [mark]
+            out = [cut(val, keep, depth + 1) for val in x[:keep]]
+            if len(x) > keep:
+                out.append(mark)
+            return out
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            s = str(x)                                   # a number past n digits (json.loads takes an int of
+            return x if len(s) <= n else s[:n] + mark    # up to 4300) echoes as a marked STRING: a cut
+        return x                                         # decimal would be a mid-token cut
+
+    try:
+        for keep in (8, 4, 2, 1, 0):
+            s = json.dumps(cut(v, keep, 0), ensure_ascii=False)
+            if len(s) <= 4 * n or keep == 0:
+                return s
+    except (TypeError, ValueError):
+        pass
+    s = repr(v)
+    return s if len(s) <= n else s[:n] + mark
+
+
+def _as_bool(v, field, default=False):
+    """A request flag as the boolean it claims to be -> (value, error). Absent is `default`, and so is an
+    EXPLICIT JSON null: the routes read their fields with .get(), under which the two are one value, and
+    null is the absent case spelled out, not a third kind of flag (review find, 2026-09-08; the kernel's
+    _as_bool states the same rule). JSON true/false pass through; anything else -- the string "false",
+    0/1, "no" -- is refused with `error` naming the field, and the caller must NOT act. Never coerces:
+    bool("false") is True, which is how a string used to arm a tracked delegation and mark a down peer
+    bus up."""
+    if v is None:
+        return default, None
+    if v is True or v is False:
+        return v, None
+    return None, "'%s' must be true or false, got %s" % (field, _clip_json(v))
+
+
+class _RefusedBody(Exception):
+    """A request body Handler._body refused before or instead of parsing it: `status` and `error` are the
+    answer, and the connection closes with it (the body is unread or unusable, so the socket cannot
+    carry a next request)."""
+
+    def __init__(self, status, error):
+        super().__init__(error)
+        self.status, self.error = status, error
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass   # keep stdout/stderr clean; the bus log is for real events only
 
-    def _send(self, obj, code=200):
+    def _send(self, obj, code=200, close=False):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if close:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
     def _body(self):
-        n = int(self.headers.get("Content-Length", 0) or 0)
-        return json.loads(self.rfile.read(n)) if n else {}
+        """The request body as the JSON object every route expects, read only within bounds -- the
+        kernel's _read_post_body, mirrored. Refused as _RefusedBody(status, error), each before or
+        instead of parsing: a Transfer-Encoding request (411; bodies are delimited by Content-Length
+        alone), more than one Content-Length (400), a non-decimal one or a digit run past 20 (400), a
+        length past _POST_MAX_BYTES (413, before a byte is read), a body shorter than announced (400,
+        naming the shortfall), one that stalls past _POST_BODY_TIMEOUT (408; the read runs under a socket
+        timeout, so a trickling client cannot pin a handler thread), and a decodable body that is not an
+        object (400, naming what arrived). It
+        used to be `json.loads(rfile.read(int(Content-Length)))` unchecked: the first of two lengths was
+        trusted, nothing was capped, and a non-object came back parsed so the route's first `.get`
+        raised AttributeError out of the handler -- the connection dropped with a traceback on stderr
+        instead of the 400 do_POST answers for undecodable JSON."""
+        if self.headers.get("Transfer-Encoding"):
+            raise _RefusedBody(411, "Transfer-Encoding is not accepted; send the body with a Content-Length")
+        get_all = getattr(self.headers, "get_all", None)   # an HTTPMessage in service; a plain dict in unit tests
+        if callable(get_all):
+            lengths = get_all("Content-Length") or []
+        else:
+            lengths = [] if self.headers.get("Content-Length") is None else [self.headers.get("Content-Length")]
+        if len(lengths) > 1:
+            raise _RefusedBody(400, "body could not be read: more than one Content-Length header")
+        cl = str(lengths[0]).strip() if lengths else "0"
+        if not re.fullmatch(r"[0-9]{1,20}", cl):
+            raise _RefusedBody(400, "body could not be read: Content-Length %s is an invalid literal for a byte count (decimal digits only)" % _clip_json(cl))
+        n = int(cl)
+        if n > _POST_MAX_BYTES:
+            raise _RefusedBody(413, "request body of %d bytes exceeds the %d-byte limit" % (n, _POST_MAX_BYTES))
+        raw = b""
+        if n:
+            # The read runs under a socket timeout (_POST_BODY_TIMEOUT), put back afterwards; a unit-test
+            # handler over a BytesIO has no connection, and a fake rfile that stalls raises the same
+            # socket.timeout the real one would.
+            sock = getattr(self, "connection", None)
+            prior = sock.gettimeout() if sock is not None else None
+            try:
+                if sock is not None:
+                    sock.settimeout(_POST_BODY_TIMEOUT)
+                raw = self.rfile.read(n)
+            except socket.timeout:
+                raise _RefusedBody(408, "body could not be read: %d bytes announced, not all of it arrived within %g s"
+                                   % (n, _POST_BODY_TIMEOUT))
+            finally:
+                if sock is not None:
+                    try:
+                        sock.settimeout(prior)
+                    except OSError:
+                        pass                             # the socket is already gone; the refusal closes it anyway
+        if len(raw) < n:
+            raise _RefusedBody(400, "body could not be read: read %d of the %d bytes Content-Length announced" % (len(raw), n))
+        data = json.loads(raw) if raw else {}
+        if not isinstance(data, dict):
+            raise _RefusedBody(400, "body must be a JSON object, got %s" % _clip_json(data))
+        return data
 
     def _authorized(self):
         """Serve-token gate, every route but /ping (see the SERVE_TOKEN block). Local clients send
@@ -1421,6 +1675,9 @@ class Handler(BaseHTTPRequestHandler):
                                "~/.local/state/romp/serve-token)"}, 403)
         try:
             data = self._body()
+        except _RefusedBody as e:
+            self.close_connection = True
+            return self._send({"error": e.error}, e.status, close=True)
         except Exception:
             return self._send({"error": "bad json"}, 400)
         if u.path == "/peer":                      # the kernel's tunnel-transition notify (peer-bus mode)
@@ -1447,7 +1704,10 @@ class Handler(BaseHTTPRequestHandler):
             kind = str(data.get("kind", "")).strip().lower()
             if kind not in ("delegate", "coordinate", "question"):
                 kind = ""                              # legacy/CLI mail may be undeclared; never invent one
-            tracked = bool(data.get("tracked")) and kind == "delegate"   # report-back delegation
+            tracked, terr = _as_bool(data.get("tracked"), "tracked")   # report-back delegation
+            if terr:                                   # a string here armed tracking on a plain send
+                return self._send({"error": terr}, 400)
+            tracked = tracked and kind == "delegate"
             #   (the user 2026-08-24): only a delegate can be tracked; wire metadata only — nothing
             #   about the flag ever appears in message prose (the injected-voice rule)
             if _postal_off(frm_id):                # the sender is in isolation → sending is disabled
@@ -1791,7 +2051,10 @@ def peer_update(data):
     prev = PEERS.get(host) or {}
     tok = str(data.get("token") or "") or prev.get("token") or ""
     trust = str(data.get("trust") or "") or prev.get("trust") or "directed"
-    PEERS[host] = {"port": port, "up": bool(data.get("up")), "at": int(time.time()),
+    up, uerr = _as_bool(data.get("up"), "up")
+    if uerr:                                           # a string here marked a DOWN tunnel up
+        return {"error": uerr}, 400
+    PEERS[host] = {"port": port, "up": up, "at": int(time.time()),
                    "token": tok, "trust": trust}
     _peer_threads_reconcile(host)                    # an up peer gets its dialer; a down one is woken to exit
     return {"ok": True, "up": sum(1 for p in PEERS.values() if p["up"])}, 200
@@ -2200,8 +2463,9 @@ def _bounce_apply(host, b):
     outbox_del(host, mid)
     if not msg:
         return
-    note = ("undeliverable to '%s' on %s: %s\n\n(your message follows)\n%s"
-            % (msg.get("to") or "?", host, (b or {}).get("why") or "refused", msg.get("body") or ""))
+    note = "undeliverable to '%s' on %s: %s" % (msg.get("to") or "?", host, (b or {}).get("why") or "refused")
+    if not (b or {}).get("omitBody"):   # a SIZE bounce (_budget_relays) names the problem instead of repeating it
+        note += "\n\n(your message follows)\n%s" % (msg.get("body") or "")
     if msg.get("frm_id"):
         deliver(msg["frm_id"], "romp-postal", "", note, kind="coordinate")
     _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": mid,
@@ -2558,8 +2822,43 @@ def _drop_peer_name_dupes(host, bus_id):
         PEER_STATE.pop(k, None)
 
 
+# The most of one host's outbox a single exchange carries (review find, 2026-09-08). The dialed bus reads
+# the request only up to _POST_MAX_BYTES, and the request also carries presence, holds, reads and acks,
+# so the relays get half of it. build_exchange_request used to send the WHOLE outbox: a backlog past the
+# cap (a dozen 100 KB reports parked through one tunnel outage) was 413'd, and the dialer re-sent the
+# identical request on every backoff, forever: every message to that peer parked on a healthy link,
+# against the parking contract above (a link being DOWN is the only reason to park).
+_RELAY_BUDGET_BYTES = _POST_MAX_BYTES // 2
+
+
+def _budget_relays(host, msgs, budget=None):
+    """The oldest-first prefix of `msgs` that fits `budget` bytes serialized -> the relays for ONE
+    exchange; the rest ride the next round (the dialed side answers at once when it has acks to return,
+    so nothing waits out a long-poll). The first relay that fits always rides, so every round makes
+    progress. A relay that alone exceeds the budget can never cross, so it is bounced through the path a
+    peer's refusal takes (_bounce_arrived: to our local sender, or backward to the origin that forwarded
+    it) as a note naming the size, without the body, and leaves the outbox instead of being retried
+    forever."""
+    budget = _RELAY_BUDGET_BYTES if budget is None else budget
+    out, used = [], 0
+    for m in msgs:
+        n = len(json.dumps(m).encode("utf-8"))
+        if n > budget:
+            _log("peer %s: relay %s is %d bytes, over the %d-byte exchange limit; bounced to its sender"
+                 % (host, m.get("mid"), n, budget))
+            _bounce_arrived(host, {"mid": m.get("mid"), "omitBody": True,
+                                   "why": "message of %d bytes exceeds the %d-byte relay limit" % (n, budget)})
+            continue
+        if used + n > budget:
+            break
+        out.append(m)
+        used += n
+    return out
+
+
 def peer_exchange_handle(data):
-    """The DIALED side of one exchange. Returns (payload, status)."""
+    """The DIALED side of one exchange. Returns (payload, status). Relays ride under _RELAY_BUDGET_BYTES
+    (_budget_relays), the request side's bound mirrored, so the response is bounded the same way."""
     host = str((data or {}).get("host") or "").strip()
     if not host:
         return {"error": "host required"}, 400
@@ -2613,12 +2912,12 @@ def peer_exchange_handle(data):
 
     a2, b2 = _drain_backflow()
     acks, bounces = acks + a2, bounces + b2
-    rel, reads = outbox_list(host), readbox_list(host)
+    rel, reads = _budget_relays(host, outbox_list(host)), readbox_list(host)
     if not rel and not reads and data.get("wait") and not acks and not bounces:
         # nothing to hand back → park on the wake so anything we accept mid-wait crosses instantly
         _peer_wake(host).clear()
         _peer_wake(host).wait(EXCHANGE_WAIT)
-        rel, reads = outbox_list(host), readbox_list(host)
+        rel, reads = _budget_relays(host, outbox_list(host)), readbox_list(host)
         a2, b2 = _drain_backflow()
         acks, bounces = acks + a2, bounces + b2
     # `reads` stay parked until the dialer's NEXT request readAcks them — a response can vanish
@@ -2629,13 +2928,18 @@ def peer_exchange_handle(data):
             "relays": rel, "acks": acks, "bounces": bounces, "reads": reads}, 200
 
 def build_exchange_request(host, wait=True):
+    """The DIALER's request for one exchange. The relays are the outbox's oldest-first prefix under
+    _RELAY_BUDGET_BYTES (_budget_relays); the rest ride the next round, so a backlog drains over a few
+    exchanges instead of being refused whole."""
     p = _pending(host)
     with _peer_lock:
         acks, bounces, read_acks = list(p["acks"]), list(p["bounces"]), list(p.get("readAcks") or [])
+    relays = _budget_relays(host, outbox_list(host))          # may bounce (a backward bounce joins the
+    #                                                           origin's pending queue): after the snapshot
     return {"host": self_host(), "epoch": BUS_EPOCH, "proto": PEER_PROTO, "busId": BUS_ID,
             "presence": fleet_presence(host), "holds": holds_payload(host),
             "tier": my_tier_of(host),                # how WE hold the dialed host's mail
-            "relays": outbox_list(host),
+            "relays": relays,
             "acks": acks, "bounces": bounces,
             "reads": readbox_list(host), "readAcks": read_acks, "wait": bool(wait)}
 
@@ -2988,7 +3292,10 @@ def _mcp_call(name, args):
             return ("Cannot send: this session's own identity did not resolve (no session id), so "
                     "the mail would arrive anonymously and the recipient could not place or answer "
                     "it. This is a session-identity bug worth surfacing to the user.", True)
-        tracked = bool(args.get("tracked")) and kind == "delegate"
+        tracked, terr = _as_bool(args.get("tracked"), "tracked")
+        if terr:
+            return ("Cannot send: %s. Pass a JSON boolean (tracked: true), not a string." % terr, True)
+        tracked = tracked and kind == "delegate"
         try:
             payload = {"to": to, "from": me or "unknown", "from_id": mid, "body": body, "kind": kind}
             if tracked:

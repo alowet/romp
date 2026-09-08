@@ -769,3 +769,222 @@ def _gear_src():
 def _gear_css_src():
     import pathlib
     return (pathlib.Path(__file__).resolve().parent.parent / "ui" / "webview" / "gear.css").read_text()
+
+
+class WsFlagsMustBeBooleans(unittest.TestCase):
+    """Every WS flag the dashboards send takes JSON true/false and nothing else. Each handler used to
+    coerce with bool(), so the STRING "false" enabled auto-nudge, file editing, compact suggestions,
+    thinking summaries and conserve-memory, paused API retries across every session, set a lane flag,
+    armed a card bell, forwarded a tag DELETE to its home kernel, made a directory and enabled an MCP
+    server. Now a non-boolean is refused on the delivering socket -- a `warn` frame naming the field;
+    setSessionFlag and cardNotify on the settingRefused frame their pages (timeline, feed) render and
+    repaint from, a `warn` never reaching either; editTag on its own tagEditFailed frame; mcpAction in
+    its mcpResult error -- and the setting is untouched. The shipped panes send real booleans
+    (render.ts, feed.ts, timeline-boot.ts), so their frames are unchanged."""
+    SID = "11111111-2222-3333-4444-555555555555"
+    BAD = ("false", "true", "no", 1, 0)
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.saved = (jd.STATE, km._mark_views_dirty, km._push_soon, km._ws_act_now_tick)
+        jd.STATE = Path(self.td.name)
+        km._flags_cache.clear()
+        km._mark_views_dirty = lambda: None
+        km._push_soon = lambda: None
+        km._ws_act_now_tick = lambda: None           # turn-on acts at once in service; not under test here
+
+    def tearDown(self):
+        jd.STATE, km._mark_views_dirty, km._push_soon, km._ws_act_now_tick = self.saved
+        km._flags_cache.clear()
+        self.td.cleanup()
+
+    def _client(self):
+        sent = []
+        return {"app": "chat", "wid": "w1", "alive": True,
+                "send": lambda raw: sent.append(json.loads(raw))}, sent
+
+    def _refused(self, frame, op, field):
+        client, sent = self._client()
+        km.Handler._dispatch_ws(None, frame, client)
+        self.assertEqual(len(sent), 1, (op, frame, sent))
+        self.assertEqual(sent[0]["type"], "warn", (op, sent))
+        self.assertEqual(sent[0]["text"], "%s: '%s' must be true or false, got %s"
+                         % (op, field, json.dumps(frame[field])))
+
+    def _refused_setting(self, frame, gesture, field, sid, flag="", item_id=""):
+        """The two page-handled flags refuse on settingRefused, addressed to the toggle, carrying the
+        value the kernel still paints (nothing was written, so: the default, off)."""
+        client, sent = self._client()
+        km.Handler._dispatch_ws(None, frame, client)
+        self.assertEqual(len(sent), 1, (gesture, frame, sent))
+        fr = sent[0]
+        self.assertEqual((fr["type"], fr["gesture"], fr["sid"], fr["flag"], fr["itemId"]),
+                         ("settingRefused", gesture, sid, flag, item_id), fr)
+        self.assertIs(fr["value"], False, "the painted value rides along: nothing was written")
+        self.assertIn("'%s' must be true or false, got %s" % (field, json.dumps(frame[field])), fr["text"])
+        self.assertTrue(fr["text"].startswith("couldn't save"), fr["text"])
+
+    def test_kernel_settings_refuse_strings_and_apply_real_booleans(self):
+        warn = lambda frame, op, field: self._refused(frame, op, field)
+        lane = lambda frame, op, field: self._refused_setting(frame, "flag", field, self.SID, flag="hideFromFeed")
+        cases = (
+            ("setAutoNudge", "enabled", {}, km._auto_nudge_on, warn),
+            ("setCompactSuggest", "enabled", {}, km._compact_suggest_on, warn),
+            ("setFileEditing", "enabled", {}, km._file_editing_on, warn),
+            ("setThinkingSummaries", "enabled", {}, km._thinking_summaries_on, warn),
+            ("setConserve", "enabled", {}, km._conserve_on, warn),
+            ("setGlobalRetryPaused", "value", {}, km._retry_paused_on, warn),
+            ("setSessionFlag", "value", {"id": self.SID, "flag": "hideFromFeed"},
+             lambda: km._session_flag(self.SID, "hideFromFeed"), lane),
+        )
+        for op, field, extra, reader, refused in cases:
+            before = reader()                        # each setting's own default (auto-nudge ships ON)
+            for bad in self.BAD:
+                refused(dict({"type": op, field: bad}, **extra), op, field)
+                km._flags_cache.clear()
+                self.assertEqual(reader(), before, "%s: %r left the setting untouched" % (op, bad))
+            for want in (not before, before):        # a real boolean flips it, and flips it back
+                client, sent = self._client()
+                km.Handler._dispatch_ws(None, dict({"type": op, field: want}, **extra), client)
+                km._flags_cache.clear()
+                self.assertEqual(reader(), want, "%s: a real %r applies" % (op, want))
+                self.assertEqual(sent, [], "%s: no frame on success" % op)
+
+    def test_the_session_bell_and_the_card_bell_refuse_strings(self):
+        card = self.SID + ":g1"
+        for bad in self.BAD:
+            self._refused_setting({"type": "setSessionFlag", "id": self.SID, "flag": "notify", "value": bad},
+                                  "flag", "value", self.SID, flag="notify")
+            self._refused_setting({"type": "cardNotify", "itemId": card, "sid": self.SID, "value": bad},
+                                  "bell", "value", self.SID, item_id=card)
+        km._flags_cache.clear()
+        self.assertEqual(km._session_flags(), {}, "no bell override was written")
+        self.assertEqual(km._notify_cards(), {}, "no card override was written")
+        client, sent = self._client()
+        km.Handler._dispatch_ws(None, {"type": "cardNotify", "itemId": card, "sid": self.SID, "value": True}, client)
+        self.assertEqual(sent, [])
+        self.assertIs(km._notify_cards().get(card), True, "a real true arms the card (the master is off)")
+        km.Handler._dispatch_ws(None, {"type": "setSessionFlag", "id": self.SID, "flag": "notify", "value": True},
+                                self._client()[0])
+        km._flags_cache.clear()
+        self.assertEqual(km._session_flags().get(self.SID), {"notify": True})
+
+    def test_the_log_names_the_field_and_its_type_never_the_value(self):
+        # review find, 2026-09-08: the stderr line carried up to 60 characters of whatever a client put
+        # in the field; the echo belongs in the frame the sender gets, the log names the field and type
+        import io
+        leak = "SECRET-VALUE-TESTHOST"
+        frames = (
+            ({"type": "setAutoNudge", "enabled": leak}, "'enabled' is a string, not a boolean", "warn"),
+            ({"type": "setGlobalRetryPaused", "value": [leak]}, "'value' is an array, not a boolean", "warn"),
+            ({"type": "setSessionFlag", "id": self.SID, "flag": "hideFromFeed", "value": leak},
+             "'value' is a string, not a boolean", "settingRefused"),
+            ({"type": "cardNotify", "itemId": self.SID + ":g1", "sid": self.SID, "value": {"k": leak}},
+             "'value' is an object, not a boolean", "settingRefused"),
+            ({"type": "createSession", "name": "fresh", "dir": "/nonexistent/TESTHOST", "mkdir": 7},
+             "'mkdir' is a number, not a boolean", "warn"),
+        )
+        for frame, note, kind in frames:
+            client, sent = self._client()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                km.Handler._dispatch_ws(None, frame, client)
+            line = err.getvalue()
+            self.assertIn("romp-kernel: refused %s: %s" % (frame["type"], note), line, (frame, line))
+            self.assertNotIn(leak, line, "the client's value stays out of the kernel's log")
+            self.assertEqual(len(sent), 1, (frame, sent))
+            self.assertEqual(sent[0]["type"], kind)
+            field = [k for k in ("enabled", "value", "mkdir") if k in frame][0]
+            self.assertIn("'%s' must be true or false, got %s" % (field, json.dumps(frame[field])), sent[0]["text"],
+                          "the sender still sees what it sent")
+
+    def test_an_explicit_null_value_reads_as_absent(self):
+        # the rule _as_bool states (review find, 2026-09-08): null takes the field's default (off), where a
+        # string or a number is refused; no frame, since nothing was refused
+        km._set_session_flag(self.SID, "hideFromFeed", True)
+        km._flags_cache.clear()
+        self.assertTrue(km._session_flag(self.SID, "hideFromFeed"))
+        client, sent = self._client()
+        km.Handler._dispatch_ws(None, {"type": "setSessionFlag", "id": self.SID, "flag": "hideFromFeed", "value": None}, client)
+        km._flags_cache.clear()
+        self.assertFalse(km._session_flag(self.SID, "hideFromFeed"))
+        self.assertEqual(sent, [])
+
+    def test_no_ws_handler_coerces_a_gated_flag_with_bool(self):
+        # moved here from ui/timeline-flags.test.ts (review find, 2026-09-08): a kernel source pin
+        # belongs in the kernel's own lane, where a kernel change runs it. The behaviour itself is
+        # test_kernel_settings_refuse_strings_and_apply_real_booleans above; this catches a coercion
+        # slipped back in beside the gate
+        src = open(os.path.join(BIN, "romp-kernel"), encoding="utf-8").read()
+        for field in ('msg.get("value")', 'msg.get("enabled")', 'msg.get("mkdir")', 'e.get("delete")',
+                      'b.get("delete")', 'b.get("on")', 'b.get("mkdir")', 'body.get("on")', 'msg["enabled"]'):
+            self.assertNotIn("bool(%s)" % field, src, "%s is checked by _as_bool, never coerced" % field)
+
+    def test_create_session_refuses_a_string_mkdir_before_touching_the_disk(self):
+        calls = []
+        saved = km._resolve_create_dir
+        km._resolve_create_dir = (lambda raw, create=False:
+                                  calls.append((raw, create)) or ("", "stubbed: no directory here"))
+        try:
+            for bad in self.BAD:
+                self._refused({"type": "createSession", "name": "fresh", "dir": "/nonexistent/TESTHOST",
+                               "mkdir": bad}, "createSession", "mkdir")
+            self.assertEqual(calls, [], "no directory is resolved, let alone created, on a malformed flag")
+        finally:
+            km._resolve_create_dir = saved
+
+    def test_edit_tag_refuses_a_string_delete_on_its_own_failure_frame(self):
+        fwd, views = [], []
+        saved = (km._forward_tag_edit, km._send_to_view)
+        km._forward_tag_edit = lambda host, body: fwd.append((host, body)) or ({"ok": True, "tag": {}}, None)
+        km._send_to_view = lambda app, msg, wid: views.append((app, msg, wid))
+        try:
+            for bad in self.BAD:
+                client, sent = self._client()
+                km.Handler._dispatch_ws(None, {"type": "editTag",
+                                               "edit": {"host": "TESTHOST", "name": "pool", "delete": bad}}, client)
+                self.assertEqual(sent, [], "the refusal rides tagEditFailed, where a refused edit lands")
+                app, msg, wid = views.pop()
+                self.assertEqual((app, msg["type"], msg["host"], msg["name"], msg["queued"], wid),
+                                 ("timeline", "tagEditFailed", "TESTHOST", "pool", False, "w1"))
+                self.assertEqual(msg["error"], "editTag: 'delete' must be true or false, got %s" % json.dumps(bad))
+            self.assertEqual(fwd, [], "nothing crossed to the home kernel (a string used to forward a DELETE)")
+            km.Handler._dispatch_ws(None, {"type": "editTag", "edit": {"host": "TESTHOST", "name": "pool", "delete": True}},
+                                    self._client()[0])
+            self.assertEqual(fwd, [("TESTHOST", {"name": "pool", "delete": True})])
+            km.Handler._dispatch_ws(None, {"type": "editTag", "edit": {"host": "TESTHOST", "name": "pool", "delete": False}},
+                                    self._client()[0])
+            self.assertEqual(fwd[-1], ("TESTHOST", {"name": "pool"}), "a real false forwards no delete key, as before")
+            self.assertEqual(views, [], "no failure frame for a real boolean")
+        finally:
+            km._forward_tag_edit, km._send_to_view = saved
+
+    def test_mcp_action_refuses_a_string_enabled_in_its_result_frame(self):
+        calls = []
+
+        class BE:
+            def mcp_action(self, sid, name, action, enabled=True):
+                calls.append((sid, name, action, enabled))
+                return ""
+        saved = (km.Sessions.backend_for, km._name_of, km._sdk)
+        km.Sessions.backend_for = staticmethod(lambda sid: BE())
+        km._name_of = lambda sid: "web" if sid == self.SID else None    # _kernel_knows: ours
+        km._sdk = lambda: None
+        try:
+            for bad in self.BAD:
+                client, sent = self._client()
+                self.assertTrue(km._drive({"type": "mcpAction", "id": self.SID, "server": "postal",
+                                           "action": "enable", "enabled": bad}, client), "consumed: refused, not passed on")
+                self.assertEqual(len(sent), 1, sent)
+                self.assertEqual((sent[0]["type"], sent[0]["server"]), ("mcpResult", "postal"))
+                self.assertEqual(sent[0]["error"], "'enabled' must be true or false, got %s" % json.dumps(bad))
+            self.assertEqual(calls, [], "no control request reaches the session on a malformed flag")
+            client, sent = self._client()
+            km._drive({"type": "mcpAction", "id": self.SID, "server": "postal", "action": "enable", "enabled": False}, client)
+            self.assertEqual(calls, [(self.SID, "postal", "enable", False)], "a real false rides through as itself")
+            self.assertEqual(sent[0]["error"], "")
+            km._drive({"type": "mcpAction", "id": self.SID, "server": "postal", "action": "reconnect"}, client)
+            self.assertEqual(calls[-1], (self.SID, "postal", "reconnect", True), "absent keeps its old default")
+        finally:
+            km.Sessions.backend_for = staticmethod(saved[0])
+            km._name_of, km._sdk = saved[1], saved[2]

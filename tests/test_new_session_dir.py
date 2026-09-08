@@ -527,7 +527,9 @@ class HeadlessParity(unittest.TestCase):
     def test_the_new_route_can_create_the_directory_too(self):
         import inspect
         src = inspect.getsource(km.Handler)
-        self.assertIn('_resolve_create_dir(b.get("dir"), create=bool(b.get("mkdir")))', src,
+        self.assertIn('mk, ferr = _as_bool(b.get("mkdir"), "mkdir")', src,
+                      "mkdir is a checked boolean: a string \"false\" used to create the directory")
+        self.assertIn('_resolve_create_dir(b.get("dir"), create=mk)', src,
                       "`romp new` gets the same create-it answer the dashboard offers")
         self.assertIn('"dirStatus": _dir_status(b.get("dir"))', src,
                       "a headless caller is told WHY, in the same shape the picker reads")
