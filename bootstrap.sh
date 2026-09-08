@@ -42,12 +42,22 @@ else
     git clone --quiet "$REPO" "$DIR"
 fi
 
-# Pick the ref. Releases are `v`-prefixed, so match on that rather than taking
-# the newest tag of any kind: the repo also carries non-release tags, and
-# installing one of those would silently pin somebody to an old baseline.
+# Pick the ref. A release is exactly `vMAJOR.MINOR.PATCH`, so match on that
+# rather than taking the newest tag of any kind: the repo also carries
+# non-release tags, and installing one of those would silently pin somebody to
+# an old baseline. Nor does the `v*` glob alone suffice: git's version sort
+# (`--sort=v:refname`, git-tag(1)) compares the digit runs in a tag name as
+# numbers, so a prerelease cut for the next version (`v0.3.0-rc.1` after
+# `v0.2.0`) outranks the newest release on its number alone, and unless
+# `versionsort.suffix` is configured a suffixed tag also sorts above the plain
+# release of the same version (`v0.3.0-rc.1` above `v0.3.0`, git-config(1)).
+# The kernel's updater only compares plain release numbers, so a clone
+# installed onto such a tag would never see another update. (Reworded on a
+# review find, 2026-09-08: the sort does not single prereleases out; their
+# numbers do.)
 ref="${ROMP_REF:-}"
 if [ -z "$ref" ]; then
-    ref="$(git -C "$DIR" tag -l 'v*' --sort=-v:refname | head -n1 || true)"
+    ref="$(git -C "$DIR" tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
     if [ -z "$ref" ]; then
         ref=main
         echo "    No release tag published yet, so installing the latest code (main)."
