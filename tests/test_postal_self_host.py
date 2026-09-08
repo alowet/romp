@@ -11,9 +11,18 @@ under two names. peer_exchange_handle refuses an unkeyable declared name (guardi
 un-updated dialers) — but only AFTER _canon_peer_name, so the checked-in-alias fold keeps
 self-healing.
 
+The override tests (2026-09-08): the kernel's ROMP_HOST_NAME override and the bus's ROMP_POSTAL_HOST
+override were each the one branch that dodged the rule — returned exactly as set, directly under the
+docstring saying the name MUST clear _safe_id — so a mobile whose operator set one to an unusable name
+declared that name to every hub (which now refuses it at its check-in door, checkin_apply) while its
+own mail parked unreachable. An unusable override is now set aside aloud, once per process, and the
+derived name is used — on both daemons (KernelSelfHost and BusSelfHost).
+
 Synthetic only — invented hostnames (TESTHOST, a control-byte junk form), hermetic temp state dir,
 no real machine data.
 """
+import contextlib
+import io
 import os
 import socket as _socket
 import tempfile
@@ -48,6 +57,8 @@ class _HostnameSeams(unittest.TestCase):
         self._pc, self._kc = pm._host_name_candidates, km._host_name_candidates
         pm._host_name_candidates = km._host_name_candidates = lambda: []
         pm._self_host_fb = km._self_host_fb = None
+        getattr(km, "_host_name_env_warned", set()).clear()   # the once-per-process override warnings, re-armed
+        getattr(pm, "_postal_host_env_warned", set()).clear()
 
     def tearDown(self):
         for k, v in self._env.items():
@@ -58,6 +69,8 @@ class _HostnameSeams(unittest.TestCase):
         _socket.gethostname = self._gethostname
         pm._host_name_candidates, km._host_name_candidates = self._pc, self._kc
         pm._self_host_fb = km._self_host_fb = None
+        getattr(km, "_host_name_env_warned", set()).clear()
+        getattr(pm, "_postal_host_env_warned", set()).clear()
 
 
 class BusSelfHost(_HostnameSeams):
@@ -103,6 +116,42 @@ class BusSelfHost(_HostnameSeams):
         pm.outbox_put("TESTHOST", {"mid": mid, "body": "hi"})
         self.assertEqual((pm.outbox_get("TESTHOST", mid) or {}).get("body"), "hi")
         self.assertTrue(pm.outbox_del("TESTHOST", mid))
+
+    def test_a_valid_override_of_any_real_shape_is_returned_verbatim(self):
+        for name in ("TESTHOST", "build-box-01.example.com", "my_box", "host-1a2b3c4d"):
+            os.environ["ROMP_POSTAL_HOST"] = name
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(pm.self_host(), name)
+            self.assertEqual(err.getvalue(), "", "a usable override is taken quietly")
+
+    def test_a_junk_override_is_set_aside_aloud_once_and_the_derived_name_is_used(self):
+        # the bus's twin of the kernel gap: ROMP_POSTAL_HOST came back exactly as set, so a bus whose
+        # operator set it to an unusable name declared that name in every peer exchange (2026-09-08)
+        _socket.gethostname = lambda: "TESTHOST"
+        for junk in ("my box", "user@host", "a" * 129):
+            os.environ["ROMP_POSTAL_HOST"] = junk
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                first, second = pm.self_host(), pm.self_host()
+            self.assertEqual((first, second), ("TESTHOST", "TESTHOST"), repr(junk[:20]))
+            self.assertTrue(pm._safe_id(first))
+            lines = [l for l in err.getvalue().splitlines() if "ROMP_POSTAL_HOST" in l]
+            self.assertEqual(len(lines), 1, "said once per process, not per call: %r" % err.getvalue())
+            self.assertTrue(lines[0].startswith("[postal] self_host: "), "the bus's own log prefix")
+            self.assertIn("not usable as a machine name", lines[0])
+            self.assertIn("letters, digits, dots, hyphens or underscores", lines[0], "says what a name may look like")
+            self.assertIn("declaring 'TESTHOST' to peers instead", lines[0], "names the name used instead")
+            self.assertIn(repr(junk[:20])[:-1], lines[0], "and the name set aside (a long one is cut short)")
+
+    def test_a_junk_override_with_a_junk_hostname_still_converges_with_the_kernel(self):
+        os.environ["ROMP_POSTAL_HOST"] = "my box"
+        _socket.gethostname = lambda: JUNK
+        with contextlib.redirect_stderr(io.StringIO()):
+            b = pm.self_host()
+        self.assertTrue(pm._safe_id(b))
+        self.assertNotIn(" ", b)
+        self.assertEqual(b, km._self_host(), "bus and kernel still share the persisted identity")
 
 
 class ExchangeUnkeyableHostGate(_HostnameSeams):
@@ -158,6 +207,42 @@ class KernelSelfHost(_HostnameSeams):
         self.assertNotIn("\x04", k)
         self.assertEqual(k, pm.self_host(),
                          "kernel and bus share the persisted identity — one machine, one name")
+
+    def test_a_valid_override_of_any_real_shape_is_returned_verbatim(self):
+        # a dotted name with hyphens, an underscore, a minted-style id: what an operator might set
+        for name in ("TESTHOST", "build-box-01.example.com", "my_box", "host-1a2b3c4d"):
+            os.environ["ROMP_HOST_NAME"] = name
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(km._self_host(), name)
+            self.assertEqual(err.getvalue(), "", "a usable override is taken quietly")
+
+    def test_a_junk_override_is_set_aside_aloud_once_and_the_derived_name_is_used(self):
+        # the one branch that dodged the rule: the override came back exactly as set, so a mobile whose
+        # operator set ROMP_HOST_NAME to an unusable name declared it to every hub (2026-09-08)
+        _socket.gethostname = lambda: "TESTHOST"
+        for junk in ("my box", "user@host", "a" * 129):
+            os.environ["ROMP_HOST_NAME"] = junk
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                first, second = km._self_host(), km._self_host()
+            self.assertEqual((first, second), ("TESTHOST", "TESTHOST"), repr(junk[:20]))
+            self.assertTrue(km._safe_id(first))
+            lines = [l for l in err.getvalue().splitlines() if "ROMP_HOST_NAME" in l]
+            self.assertEqual(len(lines), 1, "said once per process, not per call: %r" % err.getvalue())
+            self.assertIn("not usable as a machine name", lines[0])
+            self.assertIn("letters, digits, dots, hyphens or underscores", lines[0], "says what a name may look like")
+            self.assertIn("using 'TESTHOST' for peering instead", lines[0], "names the name used instead")
+            self.assertIn(repr(junk[:20])[:-1], lines[0], "and the name set aside (a long one is cut short)")
+
+    def test_a_junk_override_with_a_junk_hostname_still_converges_with_the_bus(self):
+        os.environ["ROMP_HOST_NAME"] = "my box"
+        _socket.gethostname = lambda: JUNK
+        with contextlib.redirect_stderr(io.StringIO()):
+            k = km._self_host()
+        self.assertTrue(km._safe_id(k))
+        self.assertNotIn(" ", k)
+        self.assertEqual(k, pm.self_host(), "kernel and bus still share the persisted identity")
 
 
 if __name__ == "__main__":

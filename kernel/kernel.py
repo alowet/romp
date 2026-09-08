@@ -15633,28 +15633,43 @@ def _minted_host_id():
     return name
 
 _self_host_fb = None                         # resolved fallback identity, cached after the first (logged) resolve
+_host_name_env_warned = set()                # ROMP_HOST_NAME values already said to be unusable — once per value
 
 def _self_host():
     """This machine's name to peers (the check-in handshake, trust pushes, usage rows). Short
-    hostname; ROMP_HOST_NAME overrides (tests; unusual naming). The name MUST clear _safe_id — the
-    hub keys the mail it holds for us by it, as a path component — so an unsafe kernel hostname
-    falls back loudly, exactly like the bus's self_host(): the platform's user-set machine name,
-    else the minted id persisted in the SHARED file above (kernel and bus converge on one identity).
-    gethostname stays first and live — fixing the machine's hostname takes effect on the next call
-    with no restart."""
+    hostname; ROMP_HOST_NAME overrides (tests; unusual naming) WHEN it clears the same rule. The
+    name MUST clear _safe_id — the hub keys the mail it holds for us by it, as a path component,
+    and the hub's check-in door refuses anything else (checkin_apply) — so an unsafe kernel
+    hostname falls back loudly, exactly like the bus's self_host(): the platform's user-set machine
+    name, else the minted id persisted in the SHARED file above (kernel and bus converge on one
+    identity). An unsafe OVERRIDE is set aside the same way — said once on stderr, in plain words,
+    naming the name used instead — and the derived name goes out: the override used to come back
+    exactly as set, the one branch that dodged the rule (2026-09-08), so a mobile whose operator
+    set an odd ROMP_HOST_NAME landed on hubs while its own mail parked unreachable. gethostname
+    stays first and live — fixing the machine's hostname takes effect on the next call with no
+    restart."""
+    global _self_host_fb
     env = os.environ.get("ROMP_HOST_NAME")
-    if env:
+    if env and _safe_id(env):
         return env
     name = socket.gethostname().split(".")[0]
     if _safe_id(name):
-        return name
-    global _self_host_fb
-    if _self_host_fb is None:
-        _self_host_fb = next((s for s in map(_sanitize_host_name, _host_name_candidates()) if s),
-                             "") or _minted_host_id()
-        sys.stderr.write("self-host: kernel hostname %r fails path-safety; using %r for peering "
-                         "(fix the machine's hostname to control the name)\n" % (name, _self_host_fb))
-    return _self_host_fb
+        chosen = name
+    else:
+        if _self_host_fb is None:
+            _self_host_fb = next((s for s in map(_sanitize_host_name, _host_name_candidates()) if s),
+                                 "") or _minted_host_id()
+            sys.stderr.write("self-host: kernel hostname %r fails path-safety; using %r for peering "
+                             "(fix the machine's hostname to control the name)\n" % (name, _self_host_fb))
+        chosen = _self_host_fb
+    if env and env not in _host_name_env_warned:
+        _host_name_env_warned.add(env)
+        shown = env if len(env) <= 60 else env[:57] + "..."
+        sys.stderr.write("self-host: ROMP_HOST_NAME=%r is not usable as a machine name (letters, digits, dots, "
+                         "hyphens or underscores, starting with a letter or digit, at most 128 characters); "
+                         "using %r for peering instead. Fix or unset ROMP_HOST_NAME to control the name.\n"
+                         % (shown, chosen))
+    return chosen
 
 
 def checkin_set(host, on):
@@ -15999,13 +16014,29 @@ def checkin_apply(body):
     same federation row, same stage-1 bus notify — except we own NO ssh (proc None; the mobile
     supervises its tunnel; a dead forward reads down and the next handshake heals). An existing
     ssh-attached row by the same name is refused: the two ownership models must never mix silently."""
-    host = str((body or {}).get("host") or "").strip()
+    raw_host = (body or {}).get("host")
+    host = raw_host.strip() if isinstance(raw_host, str) else ""   # a number or list is no name: str() used
+    #                                                                 to coerce it into one ("1.5") and file it
     kp, bp = (body or {}).get("kernelPort"), (body or {}).get("busPort")
 
     def _bad(p):
         return not isinstance(p, int) or isinstance(p, bool) or not (0 < p < 65536)
     if not host or _bad(kp) or _bad(bp):
         return {"ok": False, "error": "host, kernelPort, busPort required"}, 400
+    if not _safe_id(host):
+        # The declared name used to be taken as it came, and it goes on to KEY everything: the registry
+        # and remotes.json, the remembered-hosts entry and remotes-known.json, the bus's peer table and
+        # the mail it holds for that peer (a path component there, gated by the bus's own _safe_id), the
+        # /remote/<host>/ routes, and every body/query lookup the row actions make. Every name a romp
+        # mobile can declare clears this rule: _self_host()'s derived names always did, for exactly that
+        # reason, and its ROMP_HOST_NAME override now does or is set aside aloud — so this door turns
+        # away only names no romp mobile produces, and a hostile or broken peer cannot file a slash, a
+        # NUL, whitespace or ten kilobytes into any of it (2026-09-08). Checked BEFORE the same-token sweep
+        # below, which would otherwise pop the mobile's good row on the way to refusing the junk one.
+        # The refused string is not echoed: it is the thing being refused.
+        return {"ok": False, "error": "host must be a machine name: letters, digits, dots, hyphens or "
+                                      "underscores, starting with a letter or digit, at most 128 "
+                                      "characters"}, 400
     tok = str((body or {}).get("token") or "")
     with _remotes_lock:
         if tok:

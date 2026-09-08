@@ -2298,30 +2298,42 @@ def _minted_host_id():
     return name
 
 _self_host_fb = None                         # resolved fallback identity, cached after the first (logged) resolve
+_postal_host_env_warned = set()              # ROMP_POSTAL_HOST values already said to be unusable — once per value
 
 def self_host():
     """This machine's postal identity: short hostname (each side keys the OTHER by its own name for
-    it, so exact agreement across machines is not required). ROMP_POSTAL_HOST overrides (tests).
-    The name MUST clear _safe_id: peers key the outbox that holds mail FOR us by it, as a path
-    component, so an unkeyable kernel hostname half-works — presence still crosses (PEER_STATE is a
-    dict), but outbox_put on the peer refuses every message back, parked "unreachable" forever with
-    the only trace a server-log line (2026-08-11, a kern.hostname stomped with control bytes). An
-    unsafe name falls back, loudly: the platform's user-set machine name, else a minted persisted
-    id. gethostname stays first and live, so fixing the machine's hostname takes effect on the next
-    call with no restart."""
+    it, so exact agreement across machines is not required). ROMP_POSTAL_HOST overrides (tests) WHEN
+    it clears the same rule. The name MUST clear _safe_id: peers key the outbox that holds mail FOR
+    us by it, as a path component, so an unkeyable kernel hostname half-works — presence still
+    crosses (PEER_STATE is a dict), but outbox_put on the peer refuses every message back, parked
+    "unreachable" forever with the only trace a server-log line (2026-08-11, a kern.hostname stomped
+    with control bytes). An unsafe name falls back, loudly: the platform's user-set machine name,
+    else a minted persisted id. An unsafe OVERRIDE is set aside the same way — said once, naming the
+    name used instead — and the derived name is declared: the override used to come back exactly as
+    set, the one branch that dodged the rule (2026-09-08; the kernel's _self_host had the same and
+    was fixed the same day). gethostname stays first and live, so fixing the machine's hostname
+    takes effect on the next call with no restart."""
+    global _self_host_fb
     env = os.environ.get("ROMP_POSTAL_HOST")
-    if env:
+    if env and _safe_id(env):
         return env
     name = socket.gethostname().split(".")[0]
     if _safe_id(name):
-        return name
-    global _self_host_fb
-    if _self_host_fb is None:
-        _self_host_fb = next((s for s in map(_sanitize_host_name, _host_name_candidates()) if s),
-                             "") or _minted_host_id()
-        _log("self_host: kernel hostname %r fails path-safety; declaring %r to peers instead "
-             "(fix the machine's hostname to control the name)" % (name, _self_host_fb))
-    return _self_host_fb
+        chosen = name
+    else:
+        if _self_host_fb is None:
+            _self_host_fb = next((s for s in map(_sanitize_host_name, _host_name_candidates()) if s),
+                                 "") or _minted_host_id()
+            _log("self_host: kernel hostname %r fails path-safety; declaring %r to peers instead "
+                 "(fix the machine's hostname to control the name)" % (name, _self_host_fb))
+        chosen = _self_host_fb
+    if env and env not in _postal_host_env_warned:
+        _postal_host_env_warned.add(env)
+        shown = env if len(env) <= 60 else env[:57] + "..."
+        _log("self_host: ROMP_POSTAL_HOST=%r is not usable as a machine name (letters, digits, dots, hyphens "
+             "or underscores, starting with a letter or digit, at most 128 characters); declaring %r to peers "
+             "instead. Fix or unset ROMP_POSTAL_HOST to control the name." % (shown, chosen))
+    return chosen
 
 def _peer_wake(host):
     with _peer_lock:
