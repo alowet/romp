@@ -25,12 +25,14 @@ Session control (how romp drives Claude Code) sits behind one seam:
 Shared lookup tables: `colormap.py` (recency tints, single source shared with
 the web bundles) and `palette.py` (session-identity colors).
 
-`keysource.py` selects the manager's live API key source: a
-`ROMP_API_KEY_REF=op://vault/item/field` reference or a legacy
-`ANTHROPIC_API_KEY`. Source inspection is separate from resolution so UI/status
-reads do not fetch secrets. A selected reference is resolved with `op read
---no-newline` for each Claude session launch/reconnect, key-billed judge call,
-and direct model-catalog refresh. Explicit cycle checks also resolve the key
+`keysource.py` selects the manager's live API key source: a key command
+(`ROMP_API_KEY_CMD=<command line>`, any secret manager's CLI printing the key,
+Claude Code's apiKeyHelper contract), the 1Password shorthand
+(`ROMP_API_KEY_REF=op://vault/item/field`, the same through `op read
+--no-newline`), or a legacy `ANTHROPIC_API_KEY`. Source inspection is separate
+from resolution so UI/status reads do not fetch secrets. A selected provider is
+run, in a minimal environment, for each Claude session launch/reconnect,
+key-billed judge call, and direct model-catalog refresh. Explicit cycle checks also resolve the key
 to detect rotations; a reconnect resolves it again at launch. Resolved provider
 keys are not cached or written to disk. Resolution failures fail closed.
 `cli/keyswap.py` (`romp keyswap`) shares the path and parser to switch references or legacy keys without

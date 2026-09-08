@@ -373,8 +373,9 @@ toward nothing.
 A judge call bills **the account of the session it judges** — the same pick the
 session's own Billing selector holds, read from the same registry, with the same
 selection (an explicit login pick → the login; otherwise the configured API
-key source when one exists, else the login). With `ROMP_API_KEY_REF` configured,
-each key-billed judge call resolves the reference through `op read --no-newline`; a
+key source when one exists, else the login). With a key provider configured
+(`ROMP_API_KEY_CMD`, or the 1Password shorthand `ROMP_API_KEY_REF`), each
+key-billed judge call runs the provider (the key command, or `op read --no-newline`); a
 retrieval that fails is not retried by later calls in the same judging pass, and the first
 call of a pass to reach the key gates the others until its retrieval returns. The next pass,
 or a changed source, retries.
