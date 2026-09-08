@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """The "Exactly one tier label" check (.github/workflows/pr-tier.yml) judges the PR's CURRENT labels, read
-from the API, and its runs for one PR are serialized, never cancelled.
+from the API, and runs one job at a time per PR without cancelling the one in progress.
 
 The race this pins closed (pull 1039, 2026-09-08): `gh pr create --label` fires `opened` with an empty
 label snapshot and `labeled` a second later; the opened run judged the snapshot and failed, and when its
-job finished two seconds AFTER the labeled run's, the newest same-named check run was that stale failure
-and the PR read blocked with auto-merge armed. Two things make ordering irrelevant now: every run reads
-the labels the PR carries at the moment it looks (the API, with the job's read-only token), and a
-concurrency group keyed on the PR number queues the runs so the newest check run is the last event's.
-Cancel-in-progress would be WRONG here: a cancelled run's check run concludes "cancelled", and when
-that run started later than the survivor it is the newest, and a cancelled required check blocks.
+job COMPLETED two seconds after the labeled run's, the merge box (which follows the newest same-named
+check run by time) took that stale failure and the PR read blocked with auto-merge armed. Two things make
+ordering irrelevant now: every run reads the labels the PR carries at the moment it looks (the API, with
+the job's read-only token), and a concurrency group keyed on the PR number runs one job at a time, which
+makes completion times monotonic in execution order, so the run that executes last is the newest. GitHub's
+default queue replaces a superseded PENDING run with the newer one (whose check run completes later
+still), so the last executed run has always read the world after the last event. Cancel-in-progress is
+deliberately off: cancelling the in-progress run risks its "cancelled" check run completing after the
+survivor's, and a cancelled required check blocks.
 
 The step's script is run for real, with `gh` replaced by a shim on PATH that prints a canned label list
 (or fails), so the zero / one / two / alias / unreadable cases are behaviour, not a grep. Source pins
-cover what the script cannot show: the trigger types, the token, the concurrency stanza and the check's
-name, which the ruleset requires by name and app and so must never change.
+cover what the script cannot show: the trigger types, the read-only token (the workflow's one
+permissions block, no job-level override), the concurrency stanza and the check's name, which the
+ruleset requires by name and app and so must never change. The accepted label SET is read back from the
+workflow, not pinned here: tests/test_tier_policy.py (the tier-policy change) pins it against the policy.
 
 Synthetic only: an invented repository name and PR number, no network."""
 import os
@@ -31,11 +36,16 @@ WF = os.path.join(os.path.dirname(HERE), ".github", "workflows", "pr-tier.yml")
 def _run_block(src):
     """The text of the step's `run: |` block, de-indented (no YAML library in the test deps; the
     workflow is small and its shape is pinned here)."""
-    m = re.search(r"^( +)run: \|\n((?:\1  .*\n|\n)+)", src, re.M)
+    m = re.search(r"^( +)run: \|\n((?:\1  .*(?:\n|\Z)|\n)+)", src, re.M)
     if not m:
         raise AssertionError("no `run: |` block found")
     indent = len(m.group(1)) + 2
-    return "".join(line[indent:] if line.strip() else line for line in m.group(2).splitlines(True))
+    script = "".join(line[indent:] if line.strip() else line for line in m.group(2).splitlines(True))
+    # a file saved without its final newline used to drop `exit 1` and fail two tests as `0 != 1`,
+    # pointing nowhere near the extractor (review find): the block's last line is pinned instead
+    if script.rstrip().splitlines()[-1].strip() != "exit 1":
+        raise AssertionError("the extracted script does not end in `exit 1`; the extractor lost a line")
+    return script
 
 
 def _accepted_labels(src):
@@ -110,13 +120,18 @@ class WorkflowPins(unittest.TestCase):
         types = {t.strip() for t in m.group(1).split(",")}
         self.assertTrue({"opened", "reopened", "labeled", "unlabeled", "synchronize"} <= types, types)
 
-    def test_runs_for_one_pr_are_serialized_never_cancelled(self):
+    def test_runs_for_one_pr_never_cancel_the_one_in_progress(self):
         self.assertIn("concurrency:\n  group: pr-tier-${{ github.event.pull_request.number }}\n"
                       "  cancel-in-progress: false\n", self.src)
 
     def test_the_token_is_read_only_and_passed_to_gh(self):
         self.assertIn("permissions:\n  pull-requests: read\n", self.src)
-        self.assertNotIn("write", self.src.split("jobs:")[0].split("permissions:")[1].split("\n\n")[0])
+        # ONE permissions block, the workflow's: a job-level `permissions:` replaces the workflow's grant
+        # for that job, so a write there would hand gh a write token past a pin that read only the top
+        # (review find); and no non-comment line grants a write anywhere
+        self.assertEqual(self.src.count("permissions:"), 1)
+        code = "\n".join(l for l in self.src.splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotIn("write", code)
         self.assertIn("GH_TOKEN: ${{ github.token }}", self.src)
         self.assertNotIn("actions/checkout", self.src, "no checkout: nothing from the PR's tree runs")
         self.assertNotIn("uses:", self.src, "no third-party action")
