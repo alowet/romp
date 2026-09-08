@@ -24,9 +24,11 @@ export interface FeedViewState {
   nodes: string[];               // "askId:nodeId" — COLLAPSED modal tree nodes (inverted sense, see feed.ts)
   logs: string[];                // "askId:nodeId" — expanded per-node log stories
   asks: string[];                // expanded ask itemIds
-  // COLLAPSED session sids (inverted sense, like `nodes`): in grouped mode the thread shows its header
-  // alone. Keyed by SESSION, not by card, because the point is that cards which do not exist yet inherit
-  // it — see the prune exemption below.
+  // COLLAPSED session runs (inverted sense, like `nodes`): in grouped mode the run shows its header alone.
+  // Keyed by (SESSION, COLUMN) — threadKey — never by card, because the point is that cards which do not
+  // exist yet inherit it (see the prune exemption below); per COLUMN (T263c, the user 2026-09-08) so a
+  // session's Blocked run folds while its Working run stays open. A bare sid is the pre-T263c spelling
+  // and reads as every column (threadKeys), so yesterday's folds survive the upgrade.
   threads: string[];
   // Stacked-layout COLUMN state (the user 2026-08-16): collapsed column keys ("asks"/"needsInput"/
   // "completed") and the user's dragged column order. Both describe the LAYOUT, not any card, so both
@@ -36,6 +38,19 @@ export interface FeedViewState {
 }
 
 export const VIEW_STATE_KEY = "romp:feedview";
+
+/** The feed's three columns, as the fold and layout state key them. */
+export const FEED_COLUMNS = ["asks", "needsInput", "completed"] as const;
+export type FeedColumn = typeof FEED_COLUMNS[number];
+const THREAD_SEP = "\u0000";   // a sid is a uuid (or host:uuid) and never carries a NUL
+/** The persisted key for one session's run in one column (T263c). */
+export function threadKey(sid: string, col: FeedColumn): string { return sid + THREAD_SEP + col; }
+/** The keys a STORED entry stands for: a (sid, column) key is itself; a bare sid — the pre-T263c spelling,
+ *  when a fold covered the session everywhere — is every column, so an old fold keeps folding until the
+ *  user opens a column. */
+export function threadKeys(stored: string): string[] {
+  return stored.includes(THREAD_SEP) ? [stored] : FEED_COLUMNS.map((c) => threadKey(stored, c));
+}
 // Backstop only. The live-set prune below bounds the real size to what is on screen; this exists so a bug in
 // that rule can never grow the entry unboundedly and wedge localStorage.
 export const VIEW_STATE_CAP = 4000;
@@ -100,8 +115,8 @@ export function keyIsLive(key: string, liveIds: Set<string>): boolean {
  *  everything the user just restored.
  *
  *  `threads` is EXEMPT, deliberately. Every other entry describes a card, so a card that is gone makes its
- *  entry meaningless; a collapsed thread describes a SESSION, and its whole purpose is to hold while that
- *  session has no cards on the board so the next one arrives collapsed too. Pruning it against the live set
+ *  entry meaningless; a collapsed thread describes a SESSION's run in a column, and its whole purpose is to
+ *  hold while that run has no cards on the board so the next one arrives collapsed too. Pruning it against the live set
  *  would silently re-expand a thread the moment its last card cleared — exactly the "collapse it and it
  *  stays collapsed" the feature is for. It is bounded by the cap instead. */
 export function pruneViewState(s: FeedViewState, liveIds: Set<string>): FeedViewState {
