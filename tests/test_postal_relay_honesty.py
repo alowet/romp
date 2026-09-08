@@ -230,7 +230,7 @@ class IdShapedAddressingRoutes(_RelayBase):
         pm.PEER_STATE["spokec"] = {"presence": [{"id": GHOST, "name": "web2"}], "epoch": 1, "seenAt": 0}
         parked = []
         saved_put, saved_get = pm.outbox_put, pm.outbox_get
-        pm.outbox_put = lambda h, m: parked.append((h, m))
+        pm.outbox_put = lambda h, m: parked.append((h, m)) or True   # the park reports success as a bool
         pm.outbox_get = lambda h, mid: None
         self.addCleanup(lambda: (setattr(pm, "outbox_put", saved_put), setattr(pm, "outbox_get", saved_get),
                                  pm.PEER_STATE.clear(), os.environ.pop("ROMP_POSTAL_PEERS", None)))
@@ -249,7 +249,7 @@ class IdShapedAddressingRoutes(_RelayBase):
         pm.PEER_STATE["spokec"] = {"presence": [{"id": ALPHA, "name": "web"}], "epoch": 1, "seenAt": 0}
         parked = []
         saved_put, saved_get = pm.outbox_put, pm.outbox_get
-        pm.outbox_put = lambda h, m: parked.append((h, m))
+        pm.outbox_put = lambda h, m: parked.append((h, m)) or True   # the park reports success as a bool
         pm.outbox_get = lambda h, mid: None
         self.addCleanup(lambda: (setattr(pm, "outbox_put", saved_put), setattr(pm, "outbox_get", saved_get),
                                  pm.PEER_STATE.clear(), os.environ.pop("ROMP_POSTAL_PEERS", None)))
@@ -396,7 +396,7 @@ class RelayRowCarriesTheStableId(_RelayBase):
         pm.PEER_STATE["TESTHOST"] = {"presence": [{"id": GHOST, "name": "api"}], "epoch": 1, "seenAt": 0}
         parked = []                                           # … the recipient on TESTHOST
         saved_put = pm.outbox_put
-        pm.outbox_put = lambda h, m: parked.append((h, m))
+        pm.outbox_put = lambda h, m: parked.append((h, m)) or True   # the park reports success as a bool
         self.addCleanup(lambda: (setattr(pm, "outbox_put", saved_put), pm.PEER_STATE.clear(),
                                  os.environ.pop("ROMP_POSTAL_PEERS", None)))
         obj, code = self._post_send({"to": "api", "from": "web", "from_id": ALPHA,

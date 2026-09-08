@@ -254,5 +254,47 @@ class MailKeyedByStableId(_AwaitBase):
         self.assertEqual(last_await.get((A, self.X)), 100)
 
 
+class RefusedSendsAreNoAsk(_AwaitBase):
+    """A sent row whose id a terminal `bounced` row closed never reached the recipient (review find,
+    2026-09-08): the bus closes a message it had to give up on — a peer's refusal, the orphan sweep's
+    destroy, an unreadable inbox file, a write a crash cut short — with a `bounced` row on the same id
+    (a publish it refuses outright writes no row at all). The readers ignored `ev`,
+    so a refused QUESTION read as an open ask (the asker's card wore it, the debt reminder counted it)
+    until the recipient happened to send anything, and a bounced reply read as answering the pair.
+    Mutant: the `ended` filter removed."""
+
+    BOUNCED = "not published: the mail service stopped before the message reached the inbox"
+
+    def test_a_bounced_question_is_no_open_ask(self):
+        self._write([
+            {"ev": "sent", "id": "m1", "from_id": A, "to_id": B, "t": 100, "kind": "question", "body": "which port?"},
+            {"ev": "bounced", "id": "m1", "t": 101, "to_id": B, "why": self.BOUNCED},
+        ])
+        last_any, last_ask, _aw = km._postal_wait_maps()
+        self.assertNotIn((A, B), last_ask, "a refused question is no ask: no reply can ever close it")
+        self.assertNotIn((A, B), last_any, "and no message, either")
+        self.assertEqual(km._wait_for_graph(1000, {A, B}), {}, "so the asker wears no open ask")
+
+    def test_a_standing_question_beside_a_bounced_one_still_asks(self):
+        self._write([
+            {"ev": "sent", "id": "m1", "from_id": A, "to_id": B, "t": 100, "kind": "question", "body": "which port?"},
+            {"ev": "bounced", "id": "m1", "t": 101, "to_id": B, "why": self.BOUNCED},
+            {"ev": "sent", "id": "m2", "from_id": A, "to_id": B, "t": 200, "kind": "question", "body": "which port? (retry)"},
+        ])
+        _any, last_ask, _aw = km._postal_wait_maps()
+        self.assertEqual(last_ask[(A, B)][0], 200, "the retry that did land is the open ask")
+        self.assertEqual(km._wait_for_graph(1000, {A, B})[A]["since"], 200)
+
+    def test_a_bounced_reply_answers_nothing(self):
+        self._write([
+            {"ev": "sent", "id": "m1", "from_id": B, "to_id": A, "t": 100, "kind": "question", "body": "status?"},
+            {"ev": "sent", "id": "m2", "from_id": A, "to_id": B, "t": 200, "kind": "coordinate", "body": "all green"},
+            {"ev": "bounced", "id": "m2", "t": 201, "to_id": B, "why": self.BOUNCED},
+        ])
+        graph = km._wait_for_graph(1000, {A, B})
+        self.assertEqual(graph[B]["peerSid"], A, "the asker still waits: the reply never reached it")
+        self.assertEqual(km._peer_answered_at(B), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -192,6 +192,26 @@ romp mail remote                 # legacy singleton scheme only (ROMP_POSTAL_PEE
 | `check_sent()` | Whether your sent messages were read yet |
 | `recall_message(to, id?)` | Unsend a message the recipient hasn't read |
 
+### When a send is refused
+
+A send whose record cannot be written, or that cannot be placed in the
+recipient's inbox, is refused: the bus answers `503` with `ok: false` and the
+reason, nothing is delivered and nothing is recorded, and the sender still
+holds the text to retry. Two outcomes are not refusals, because the message is
+already in the recipient's hands: the recipient read it in the instant before
+its record failed, or the bus could not take it back out of the inbox. The
+send then answers the id, and the bus says on stderr and on the dashboard that
+the message log has no record of that message. A bus stopped between placing a
+message and recording it writes the missing record from the message's own
+headers at its next start. `check_sent` and `romp mail sent`
+show a message the bus had to give up on later (a cross-host record it could
+not write, a file it could not read, a write a restart found unfinished) as
+`bounced`, marked `refused` with the reason; a peer's refusal that did come
+back as a note still reads `undeliverable, returned to you`. A message file the bus cannot read, in a
+recipient's inbox or in the cross-host outbox, is moved aside once (see the
+state files below), its sender's receipt reads refused, and the dashboard's
+error center says so under the `refused` kind.
+
 ### Claude Code 2.1.224 or newer
 
 Mail to a terminal (tmux) session delivers through Claude Code's per-session
@@ -1510,6 +1530,19 @@ lands in the same second; the `remotes.json` sidecar is 0600, since its rows
 carry tokens), the file is rewritten without them, and one stderr line plus one
 Log entry under the `refused` kind names each host as a clipped repr, never the
 raw string.
+
+The postal service's own files live under `postal/` there: `mail/<session>/`
+(a maildir per recipient), `outbox/<host>/` and `readbox/<host>/` (cross-host
+mail and read receipts awaiting their peer). A record or message file the bus
+cannot parse or read is moved aside once, never deleted, to
+`<name>.corrupt-<UTC stamp>` beside the original (an inbox file lands beside
+its `new/` directory, out of every listing; a `-1`, `-2` suffix when two land
+in the same second), the rest of the store is served, the sender's receipt for
+that message reads refused, and the error center says so under the `refused`
+kind. At start the bus removes the temporary files a crash left behind (a
+message written but never placed, a store record never finished), closes each
+one's receipt as refused, and says so once. The sidecars are yours to inspect
+or delete.
 
 ## Switches
 

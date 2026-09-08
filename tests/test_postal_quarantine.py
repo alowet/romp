@@ -319,10 +319,57 @@ class QuarantineDecide(unittest.TestCase):
         for f in (ps.OUTBOX / "TESTHOST").glob("*.json"):
             f.unlink()
 
+    def test_a_refused_approve_leaves_the_hold_in_place(self):
+        # mutant: no except → deliver's refusal propagates out of the approve (or, worse, quarantine_del
+        # runs) and the held message is gone with nothing in new/. Kept at the public-call level on
+        # purpose: another change edits this function's body.
+        ps._relay_in("TESTHOST", _relay("q-appr-refused", body="held text"))
+        self.assertIsNotNone(ps.quarantine_get("q-appr-refused"))
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        saved_tl = ps.TLDIR
+        ps.TLDIR = Path(path) / "timeline"                   # under a regular file: the REAL append fails
+        try:
+            ok, err = ps.quarantine_decide("q-appr-refused", "approve")
+        finally:
+            ps.TLDIR = saved_tl
+            ps._TL_FAULT[0] = False
+            os.unlink(path)
+        self.assertFalse(ok)
+        self.assertIn("the held message is untouched", err)
+        self.assertIn("not delivered", err)
+        self.assertIsNotNone(ps.quarantine_get("q-appr-refused"), "the hold stands")
+        box = ps.read_box("sess-web", consume=False)
+        self.assertFalse(any("held text" in (m.get("body") or "") for m in box), "nothing landed in new/")
+
     def test_decide_unknown_mid_errors(self):
         ok, err = ps.quarantine_decide("no-such-mid", "approve")
         self.assertFalse(ok)
         self.assertIn("no held message", err)
+
+    def test_a_deny_whose_note_cannot_park_refuses_and_keeps_the_hold(self):
+        # mutant: outbox_put's False ignored (review find, 2026-09-08) → the hold is dropped, ok is
+        # answered, and the reviewer's note goes nowhere with nothing saying so
+        ps._relay_in("TESTHOST", _relay("q-deny-3", body="please rewrite the ingest job tonight"))
+        saved = ps.outbox_put
+        ps.outbox_put = lambda h, m: False                   # the outbox could not be written
+        try:
+            ok, err = ps.quarantine_decide("q-deny-3", "deny", feedback="not tonight, we freeze before the demo")
+        finally:
+            ps.outbox_put = saved
+        self.assertFalse(ok)
+        self.assertIn("the held message is untouched", err)
+        self.assertIn("deny without a note", err, "the way out is named")
+        self.assertIsNotNone(ps.quarantine_get("q-deny-3"), "the hold stands")
+        self.assertEqual(list((ps.OUTBOX / "TESTHOST").glob("*.json")) if (ps.OUTBOX / "TESTHOST").is_dir() else [],
+                         [], "nothing was parked")
+        ok, err = ps.quarantine_decide("q-deny-3", "deny", feedback="not tonight, we freeze before the demo")
+        self.assertTrue(ok, err)
+        self.assertIsNone(ps.quarantine_get("q-deny-3"), "the retry completes the deny")
+        rows = [json.loads(f.read_text()) for f in (ps.OUTBOX / "TESTHOST").glob("*.json")]
+        self.assertEqual(len(rows), 1, "and parks exactly one note")
+        for f in (ps.OUTBOX / "TESTHOST").glob("*.json"):
+            f.unlink()
 
 
 class PeerUpdateTrust(unittest.TestCase):
