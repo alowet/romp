@@ -29964,6 +29964,10 @@ def _spend_recorded_at():
 
 _DETAIL_TOP_N = 10       # stacks the histogram names; every further session folds into ONE "other" stack
 _DETAIL_DAYS = 90        # the day ledger's own depth (the recorder prunes to 90 days)
+_SPEND_GRAIN = 5e-5      # a bucket's dollars minus its sids' dollars below this is rounding, not spend: the recorder
+#                          rounds the bucket sum and each sid's sum to 6 places INDEPENDENTLY, so a fully attributed
+#                          bucket carries +1e-6..+6e-6 residues (28 of 113 live hour buckets did, T247b review) — and
+#                          anything that rounds to 0 at the 4 places the payload carries is zero
 
 
 def _spend_scope():
@@ -30058,7 +30062,8 @@ def _spend_detail(now=None):
                 if k:
                     r = keyt.setdefault(str(sid), [0.0, 0, 0])
                     r[0] += float(k.get("usd") or 0); r[1] += int(k.get("tok") or 0); r[2] += int(k.get("turns") or 0)
-        un[0] += max(0.0, tu - au); un[1] += max(0, tt - at); un[2] += max(0, tn - an)
+        res = tu - au
+        un[0] += res if res >= _SPEND_GRAIN else 0.0; un[1] += max(0, tt - at); un[2] += max(0, tn - an)
     # a session that contributed nothing under this scope (a login-only session in the keyed scope) is
     # not a row and not a stack: an all-zero stack with a legend chip says nothing (review find)
     totals = {sid: v for sid, v in totals.items() if v[0] > 0 or v[1] > 0 or v[2] > 0}
@@ -30099,22 +30104,28 @@ def _spend_detail(now=None):
                 dst = per.get(sid)
                 if dst is None:
                     dst = other
-                    others.add(sid)
+                    if u > 0 or t > 0:
+                        others.add(sid)   # "other (N sessions)" counts contributors only — the table's own fold
+                        #                   (a login-only session in the keyed scope adds (0,0,0); T247b review)
                 dst[0][i] += u; dst[1][i] += t
-            una[0][i] += max(0.0, tu - au); una[1][i] += max(0, tt - at)
+            res = tu - au
+            una[0][i] += res if res >= _SPEND_GRAIN else 0.0; una[1][i] += max(0, tt - at)
+        # presence is tested on the ROUNDED values the payload carries: a residue that rounds to nothing
+        # must not hang a stack (a hatched "unattributed" chip with no bars, T247b review)
         stacks = []
         for sid in top:
-            if not (any(per[sid][0]) or any(per[sid][1])):
+            usd = [round(v, 4) for v in per[sid][0]]
+            if not (any(usd) or any(per[sid][1])):
                 continue          # a top-N session with nothing in THIS range: no empty stack, no legend chip (review find)
             s = meta[sid]
             stacks.append({"kind": "sid", "sid": sid, "name": s["name"], "bg": s["bg"], "live": s["live"],
-                           "usd": [round(v, 4) for v in per[sid][0]], "tok": per[sid][1]})
-        if any(other[0]) or any(other[1]):
-            stacks.append({"kind": "other", "name": "other", "count": len(others),
-                           "usd": [round(v, 4) for v in other[0]], "tok": other[1]})
-        if any(una[0]) or any(una[1]):
-            stacks.append({"kind": "unattributed", "name": "unattributed",
-                           "usd": [round(v, 4) for v in una[0]], "tok": una[1]})
+                           "usd": usd, "tok": per[sid][1]})
+        ousd = [round(v, 4) for v in other[0]]
+        if any(ousd) or any(other[1]):
+            stacks.append({"kind": "other", "name": "other", "count": len(others), "usd": ousd, "tok": other[1]})
+        uusd = [round(v, 4) for v in una[0]]
+        if any(uusd) or any(una[1]):
+            stacks.append({"kind": "unattributed", "name": "unattributed", "usd": uusd, "tok": una[1]})
         return {"keys": keys, "stacks": stacks}
 
     h0 = int(now // 3600) - (_SERIES_HOURS - 1)
@@ -37519,7 +37530,7 @@ window.__rompUsagePanel=function(){
 function openIt(){var h=tipHTML();if(!h)return;
 // the deeper level is one tap away here too (T247): the rail — and its click — do not exist on a
 // phone, and a compact view must never dead-end (progressive disclosure)
-tip.innerHTML=h+'<div class=ru-tip-age><button class=rsp-btn id=ru-bysession>By session \u2192</button></div>';
+tip.innerHTML=h+'<div class=ru-tip-more><button class=rsp-btn id=ru-bysession>By session \u2192</button></div>';   // its own row, the hover's button size (T247b review: inside .ru-tip-age it read as a 10px annotation at .55)
 tip.classList.add('ru-modal');tip.style.left='';tip.style.top='';tip.style.display='block';
 back.classList.add('on');
 var off=function(){tip.style.display='none';tip.classList.remove('ru-modal');back.classList.remove('on');
@@ -37568,11 +37579,22 @@ function spName(s){return s.name||('session '+String(s.sid||'').slice(0,8));}
 function spColor(s){return (s.bg&&/^#[0-9a-fA-F]{3,8}$/.test(s.bg))?s.bg:SP_NONE;}
 function spHead(){return '<div class=rsp-top><span>'+(SP.data&&SP.data.scope==='computed'?'Spend (computed)':'API spend')+(SP.data&&SP.data.host?' \u00b7 '+esc(SP.data.host):'')+'</span>'
 +'<button class=rsp-x data-act=close aria-label=Close>\u00d7</button></div>';}
+var spPending=null;   // the in-flight detail fetch's controller: a close or a re-open aborts it
 function openSpend(){if(!spBack||!spPanel)return;SP.open=true;spBack.hidden=false;SP.data=null;SP.err='';SP.allRows=false;
 spPanel.innerHTML=spHead()+'<div class=rsp-load>'+__ROMP_LOADER__+'</div>';   // the loader FIRST (the loader rule)
-fetch('/spend/detail',{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
-.then(function(d){SP.data=d;if(SP.open)renderSpend();},function(e){SP.err=String((e&&e.message)||e);if(SP.open)renderSpend();});}
-function closeSpend(){SP.open=false;if(spBack)spBack.hidden=true;spTipHide();}
+// the loader ends on the EVENT (the answer) — with a backstop that cannot trap (T247b review: a hung
+// socket spun the loader forever): a generous timer aborts the fetch onto the error + retry path
+if(spPending){try{spPending.abort();}catch(e){}}
+var spAbort=new AbortController(),ms=(window.__rompSpendTimeoutMs|0)||20000;spPending=spAbort;
+var spTimer=setTimeout(function(){spAbort.abort();},ms);
+fetch('/spend/detail',{cache:'no-store',signal:spAbort.signal}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
+.then(function(d){clearTimeout(spTimer);var mine=(spPending===spAbort);if(mine)spPending=null;if(!SP.open||!mine)return;SP.data=d;renderSpend();},
+// a SUPERSEDED fetch (a re-open aborted it) yields whatever it carries: its AbortError rejects on the
+// next tick, while the successor is still loading and SP.data is null — a guard that leaned on SP.data
+// painted a false "no answer after 20 s" over the loader (review find). Ownership decides, nothing else.
+function(e){clearTimeout(spTimer);var mine=(spPending===spAbort);if(mine)spPending=null;if(!SP.open||!mine)return;
+SP.err=(e&&e.name==='AbortError')?('no answer from the kernel after '+Math.round(ms/1000)+' s'):String((e&&e.message)||e);renderSpend();});}
+function closeSpend(){SP.open=false;if(spBack)spBack.hidden=true;spTipHide();if(spPending){try{spPending.abort();}catch(e){}spPending=null;}}
 window.__rompCloseSpend=closeSpend;
 window.__rompOpenSpend=openSpend;
 // a click whose press and release land on different elements is dispatched at their common
@@ -37610,8 +37632,8 @@ shown.forEach(function(s){h+='<tr'+(s.live?'':' class=rsp-dead')+'><td><i class=
 +'<td class=n>'+fmtUsd(s.usd)+'</td>'+(keyCol?'<td class=n>'+(s.key?fmtUsd(s.key.usd):'\u2014')+'</td>':'')
 +'<td class=n>'+(s.turns||0)+'</td><td class=n>'+fmtTok(s.tok||0)+'</td></tr>';});
 if(lim<ss.length){var rest=ss.slice(lim),ru=0,rt=0,rn=0;rest.forEach(function(s){ru+=s.usd||0;rt+=s.tok||0;rn+=s.turns||0;});
-h+='<tr class=rsp-dead><td><i class=rsp-sw style="background:'+SP_OTHER+'"></i></td><td class=rsp-name>'+rest.length+' more session'+(rest.length===1?'':'s')
-+' <button class=rsp-btn data-act=table:all>show all</button></td><td class=n>'+fmtUsd(ru)+'</td>'+(keyCol?'<td class=n></td>':'')+'<td class=n>'+rn+'</td><td class=n>'+fmtTok(rt)+'</td></tr>';}
+h+='<tr class=rsp-fold><td><i class=rsp-sw style="background:'+SP_OTHER+'"></i></td><td class=rsp-name><span class=rsp-muted>'+rest.length+' more session'+(rest.length===1?'':'s')
++'</span> <button class=rsp-btn data-act=table:all>show all</button></td><td class=n>'+fmtUsd(ru)+'</td>'+(keyCol?'<td class=n></td>':'')+'<td class=n>'+rn+'</td><td class=n>'+fmtTok(rt)+'</td></tr>';}
 // spend recorded before per-session attribution existed (T100, 2026-08-24), or the part of a bucket no
 // session accounts for: shown as its own row, never dropped or folded into a session (fail loudly)
 if(un&&(un.usd>0||un.tok>0))h+='<tr class=rsp-dead><td><i class="rsp-sw rsp-hatch"></i></td>'
@@ -37706,7 +37728,7 @@ var xlab='';for(var i=0;i<n;i++){var k=ser.keys[i],m;
 if(SP.range==='hours'){m=/^(\\d{4})-(\\d\\d)-(\\d\\d)T00$/.exec(k);if(m){var dd=new Date(+m[1],+m[2]-1,+m[3]);
 xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+['S','M','T','W','T','F','S'][dd.getDay()]+'</span>';}}
 else{m=/^(\\d{4})-(\\d\\d)-(01|15)$/.exec(k);if(m)xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+Number(m[2])+'/'+Number(m[3])+'</span>';}}
-var leg='<div class=rsp-leg>'+stacks.map(function(s){return '<span class="rsp-chip'+(s.kind==='sid'&&!s.live?' rsp-dead':'')+'"><i class="rsp-sw'+(s.kind==='unattributed'?' rsp-hatch':'')+'"'
+var leg='<div class=rsp-leg>'+stacks.map(function(s){return '<span class="rsp-chip'+((s.kind==='sid'&&!s.live)||s.kind==='unattributed'?' rsp-dead':'')+'"><i class="rsp-sw'+(s.kind==='unattributed'?' rsp-hatch':'')+'"'
 +(s.kind==='unattributed'?'':' style="background:'+(s.kind==='other'?SP_OTHER:spColor(s))+'"')+'></i>'+esc(spStackName(s))+'</span>';}).join('')+'</div>';
 var tzNote='';var mine=-(new Date().getTimezoneOffset());
 if(typeof d.tzOffsetMin==='number'&&d.tzOffsetMin!==mine)tzNote='<div class=rsp-note>Bucket times are '+esc(d.tz||'the kernel\u2019s clock')+' (the machine that recorded them), not your local time.</div>';
@@ -39510,7 +39532,12 @@ def _landing():
             ".rsp-tbl td{padding:3px 6px 3px 0;border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap}"
             ".rsp-tbl .n{text-align:right;font-variant-numeric:tabular-nums}"
             ".rsp-tbl td.rsp-name{width:100%;max-width:0;overflow:hidden;text-overflow:ellipsis}"
-            ".rsp-dead{opacity:.55}"   # a session no longer running keeps its last known name, dimmed
+            # a session no longer running keeps its last known name, dimmed ONCE (T247b review): the row's
+            # cells carry the dimming, the annotation inside stays at the row's level (it used to compound
+            # .55 × .6 to a 2.3:1 read), and a legend chip dims on its own; the fold row is a CONTROL row —
+            # its count is muted, its "show all" is never dimmed (it read as disabled)
+            ".rsp-dead td{opacity:.55}.rsp-dead .ru-tip-reset{opacity:1}.rsp-chip.rsp-dead{opacity:.55}"
+            ".rsp-fold .rsp-muted{opacity:.55}"
             ".rsp-sw{display:inline-block;width:10px;height:10px;border-radius:3px;vertical-align:-1px;background:#6b7a8c}"
             # unattributed spend wears a TEXTURE, not a hue: it is not a session, and texture is the
             # dataviz fallback for a class that must never be confused with one
@@ -39555,6 +39582,7 @@ def _landing():
             # margin-left:auto right-aligns every value to one edge, so the bar rows and the numbers-only
             # spend rows (no track span, the user 2026-08-08) read as one table.
             ".ru-tip-v{min-width:30px;text-align:right;font-variant-numeric:tabular-nums;margin-left:auto}"
+            ".ru-tip-more{margin-top:8px;text-align:center}"   # the phone panel's door into the spend modal (T247b)
             ".ru-tip-age{margin-top:7px;padding-top:5px;border-top:1px solid rgba(255,255,255,0.08);"
             "opacity:.55;font-size:10px}"
             # (The per-host .ru-set/.ru-host rail sets are gone, the user 2026-08-08: the collapsed rail
@@ -39823,6 +39851,11 @@ def _landing():
             "body.theme-light .rsp-x{color:#5D574E}body.theme-light .rsp-x:hover{color:#1F1E1D}"
             "body.theme-light .rsp-tbl th{border-bottom-color:rgba(0,0,0,0.10)}body.theme-light .rsp-tbl td{border-bottom-color:rgba(0,0,0,0.06)}"
             "body.theme-light .rsp-btn{border-color:rgba(0,0,0,0.18);color:#1F1E1D}"
+            # the PRESSED toggle's light step, written out (T247b review): `.rsp-btn.on` (0,2,0) lost to
+            # `body.theme-light .rsp-btn` (0,2,1 — two classes and the body type) and painted dark text
+            # and a hairline on the clay chip; this rule is (0,3,1) and wins outright.
+            # CSS state rules must win the cascade — pin the tiebreak, never rely on it.
+            "body.theme-light .rsp-btn.on{background:var(--accent,#C2410C);color:var(--accent-fg,#FFF8F2);border-color:transparent}"
             "body.theme-light .rsp-err{color:#9A3324}"   # the dark-only pink read 1.7:1 on the white card (review find)
             "body.theme-light .rsp-svg{background:rgba(0,0,0,0.04)}body.theme-light .rsp-grid{stroke:rgba(0,0,0,0.10)}"
             "body.theme-light #rsp-tip{background:#FFFFFF;border-color:rgba(0,0,0,0.12);color:#1F1E1D;"
