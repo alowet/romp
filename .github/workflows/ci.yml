@@ -24,13 +24,22 @@ on:
   pull_request:
   workflow_dispatch:   # the manual on-switch for the macOS cells (see above)
 
-# A newer push to the same ref cancels the older in-flight run OF THE SAME KIND.
-# The event is part of the key on purpose: a release dispatch (the macOS gate)
+# A newer push to a PULL REQUEST cancels the older in-flight run of the same
+# kind: the new head supersedes the old one, and the old verdict is moot. The
+# event is part of the key on purpose: a release dispatch (the macOS gate)
 # shares main's ref with every push, and a bare ref key let an auto-merged PR
 # cancel the in-flight release run mid-watch (2026-07-27).
+# Pushes to main are keyed on the commit sha and never cancelled: main's CI
+# must never cancel itself. With one group per ref, two merges in quick
+# succession cancelled the first merge's run, and a red main (2e9d4492,
+# 2026-09-08) went unseen until a later run happened to fail; a queue would
+# not do either, since a group holds at most one pending run and a third merge
+# would replace the second's. One group per merge commit, so every merge gets
+# its own completed run. A dispatch queues rather than cancels for the same
+# reason: a release gate mid-watch is not superseded by a second dispatch.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   python:
