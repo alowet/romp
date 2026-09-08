@@ -1689,13 +1689,61 @@ if [[ "${1:-}" == "tag" || "${1:-}" == "group" ]]; then
         echo "romp tag: the kernel isn't running (no serve token). Start romp (the login service, or \`romp up\`) first." >&2
         exit 1
     fi
-    if [[ -z "$_gr_name" ]]; then
-        _resp="$(_romp_token_cfg | curl -sf -m 10 --config - "http://127.0.0.1:$_kport/views")" \
-            || { echo "romp tag: kernel not reachable on :$_kport (is romp running?)" >&2; exit 1; }
-        if $_gr_json; then
-            printf '%s\n' "$_resp"
-            exit 0
+    # One GET of the kernel's tag store: the body on stdout and 0 when the kernel answered 2xx.
+    # Never `curl -sf` here: -f folds EVERY non-2xx into the exit a dead kernel gets and throws the
+    # body away, so a kernel that ANSWERED — a 503 with {ok:false, retryable, error} while the store
+    # cannot be read (a polling peer needs the non-200 to keep its last reading), a 403 for a token
+    # it does not hold — read as "not reachable", and the person was told to restart a kernel that
+    # was up and explaining itself. The status rides -w and is read here, the way `romp perf` reads
+    # its own: a connection failure (curl's own nonzero exit, no status) keeps the "not reachable"
+    # line; a non-2xx whose JSON body carries `error` prints the kernel's words (plus "retry" when
+    # the body says the fault is retryable and the text does not already say so); a refused token
+    # is named as such; anything else prints the status and whatever came with it, never a guess.
+    # Exit 1 on every refusal, as the POST refusal below exits. With `json`, a JSON refusal body
+    # is printed as is on stdout — the same answer a script reads on a 2xx, now saying ok:false and
+    # why, so it needs no second parser — and only a non-JSON answer is said as prose on stderr.
+    _tag_views() {   # _tag_views [json]: GET /views; the 2xx body on stdout, or the failure said and 1
+        local _out _code _body _line _rc
+        _out="$(_romp_token_cfg | curl -s -m 10 --config - -w '\n%{http_code}' "http://127.0.0.1:$_kport/views")" \
+            || { echo "romp tag: kernel not reachable on :$_kport (is romp running?)" >&2; return 1; }
+        _code="${_out##*$'\n'}"
+        _body="${_out%$'\n'*}"
+        case "$_code" in
+            2??) if [[ "${1:-}" == json ]]; then printf '%s\n' "$_body"; else printf '%s' "$_body"; fi; return 0 ;;
+        esac
+        # exits 0 with the line to say for a JSON object carrying `error`; 3 for JSON without one; 1 for a body that is not JSON
+        _line="$(python3 -c '
+import json, sys
+try:
+    v = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+e = v.get("error") if isinstance(v, dict) else None
+if not e:
+    sys.exit(3)
+e = str(e)
+if v.get("retryable") and "retry" not in e.lower():
+    e += " \u2014 retry"
+print(e)
+' "$_body" 2>/dev/null)" && _rc=0 || _rc=$?
+        if [[ "${1:-}" == json && ( $_rc -eq 0 || $_rc -eq 3 ) ]]; then
+            printf '%s\n' "$_body"; return 1
+        elif [[ $_rc -eq 0 ]]; then
+            echo "romp tag: $_line" >&2; return 1
         fi
+        case "$_code" in
+            401|403) echo "romp tag: the kernel on :$_kport refused the serve token (HTTP $_code); is ROMP_KERNEL_PORT pointing at another kernel?" >&2 ;;
+            *)       if [[ -n "$_body" ]]; then echo "romp tag: the kernel on :$_kport answered HTTP $_code: $_body" >&2
+                     else echo "romp tag: the kernel on :$_kport answered HTTP $_code with no explanation" >&2; fi ;;
+        esac
+        return 1
+    }
+    if [[ -z "$_gr_name" ]]; then
+        if $_gr_json; then
+            _tag_views json && exit 0
+            exit 1
+        fi
+        _resp="$(_tag_views)" || exit 1
         _rows="$(_romp_token_cfg | curl -sf -m 10 --config - "http://127.0.0.1:$_kport/sessions" 2>/dev/null)" || _rows='[]'
         python3 -c '
 import json, sys
@@ -1727,8 +1775,7 @@ for g in groups:
     if [[ $_gr_add_seen -eq 0 && $_gr_rm_seen -eq 0 && $_gr_cset -eq 0 && $_gr_del -eq 0 && -z "$_gr_rename" ]]; then
         # a bare name is a READ of that one group, never a write — POSTing here would CREATE a
         # missing group, so a typo'd "view" would mint a phantom and burn one of the 32 slots
-        _resp="$(_romp_token_cfg | curl -sf -m 10 --config - "http://127.0.0.1:$_kport/views")" \
-            || { echo "romp tag: kernel not reachable on :$_kport (is romp running?)" >&2; exit 1; }
+        _resp="$(_tag_views)" || exit 1
         _rows="$(_romp_token_cfg | curl -sf -m 10 --config - "http://127.0.0.1:$_kport/sessions" 2>/dev/null)" || _rows='[]'
         if ! python3 -c '
 import json, sys

@@ -119,6 +119,8 @@ teardown() {
     # Tests that launch a background romp-manager record its pid in MGR_PID so we
     # always reap it (and its child kernels), even if an assertion aborted the test.
     [[ -n "${MGR_PID:-}" ]] && kill "$MGR_PID" 2>/dev/null
+    # the stub kernel the `romp tag` read tests start (_stub_views_kernel) serves until reaped here
+    [[ -n "${VIEWS_KERNEL_PID:-}" ]] && kill "$VIEWS_KERNEL_PID" 2>/dev/null
     # The kill before the rm (a server the real tmux started must not outlive the test), and last, so
     # its failure is teardown's status: bats swallows a failing command mid-teardown.
     tmux_private_kill && rm -rf "$TEST_DIR"
@@ -171,7 +173,12 @@ if [[ -n "${MOCK_CURL_NEW_400:-}" && "$url" == */new ]]; then
   echo '{"ok": false, "error": "env: ROMP_SID is reserved — romp sets the session identity env itself"}'
   exit 0
 fi
-echo '{"ok": true}'
+# `romp tag`'s GET asks for the status as a trailer (-w '\n%{http_code}'), the way `romp perf`
+# does: append it as real curl would, so the read sees a 200 and not a body it must report as an
+# answer with no status
+_w=""; _prev=""
+for a in "$@"; do [[ "$_prev" == "-w" ]] && _w="$a"; _prev="$a"; done
+if [[ -n "$_w" ]]; then printf '{"ok": true}%b' "${_w//\%\{http_code\}/200}"; else echo '{"ok": true}'; fi
 MOCK
     chmod +x "$MOCK_DIR/curl"
 }
@@ -382,6 +389,7 @@ MOCK
     run run_romp tag workers
     grep -q '/views' "$MOCK_LOG"
     [ "$(grep -c '/tag' "$MOCK_LOG")" -eq 0 ]
+  [ "$status" -eq 1 ] && [[ "$output" == *"no tag named"* ]]   # the mock's -w trailer parsed: a good 200 body reaches the read (review pin)
 }
 
 @test "tag: --host rides the payload (an edit on an attached kernel's store)" {
@@ -450,6 +458,126 @@ MOCK
     run run_romp group workers --add exp-web
     [ "$status" -eq 0 ]
     grep '/tag' "$MOCK_LOG" | grep -q '"name": *"workers"'
+}
+
+# Helper — a stub kernel for `romp tag`'s READS, with REAL curl in front of it: answers GET /views
+# with the given HTTP status and body (GET /sessions with an empty list, so members print as ids) on
+# a free loopback port announced through a file written after the bind (the romp-headless.bats
+# pattern), and serves until teardown reaps it — a listing is two GETs. The curl mock above is the
+# wrong stand-in here: the subject is what the CLI makes of a status that `curl -sf` used to swallow,
+# and a mock that emulates -w would be testing its own emulation.
+_stub_views_kernel() {   # $1 = HTTP status for GET /views, $2 = its body
+    python3 - "$1" "$2" "$TEST_DIR/port" <<'PY' &
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+code, body, portfile = int(sys.argv[1]), sys.argv[2].encode(), sys.argv[3]
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        out, st = (body, code) if self.path.startswith("/views") else (b"[]", 200)
+        self.send_response(st); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out))); self.end_headers()
+        self.wfile.write(out)
+    def log_message(self, *a): pass
+srv = HTTPServer(("127.0.0.1", 0), H)
+with open(portfile, "w") as f:
+    f.write(str(srv.server_address[1]))
+srv.serve_forever()
+PY
+    VIEWS_KERNEL_PID=$!
+    until [ -s "$TEST_DIR/port" ]; do sleep 0.05; done
+    export ROMP_KERNEL_PORT="$(cat "$TEST_DIR/port")"
+}
+
+@test "tag: a kernel that answered 503 with its reason is repeated in its words, never called unreachable" {
+    # the tag store unreadable under a cold cache: the kernel answers GET /views with a 503 carrying
+    # {ok:false, retryable, error} (a polling peer needs the non-200 to keep its last reading).
+    # `curl -sf` threw that body away and told the person to restart a kernel that was up and
+    # explaining itself — and a restart cannot mend a disk fault
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_views_kernel 503 '{"ok": false, "retryable": true, "error": "the tag store could not be read (read failed: [Errno 5] Input/output error) — retry"}'
+    run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the tag store could not be read (read failed: [Errno 5] Input/output error) — retry"* ]]
+    [[ "$output" != *"retry — retry"* ]]      # a text that already says retry is not told twice
+    [[ "$output" != *"not reachable"* ]]
+    # the bare-name read is the same GET and says the same — not "no tag named"
+    run run_romp tag workers
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"the tag store could not be read"* ]]
+    [[ "$output" != *"not reachable"* ]]
+    [[ "$output" != *"no tag named"* ]]
+}
+
+@test "tag: a retryable refusal whose text does not say so gets 'retry' added" {
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_views_kernel 503 '{"ok": false, "retryable": true, "error": "the tag store is being rebuilt"}'
+    run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the tag store is being rebuilt — retry"* ]]
+}
+
+@test "tag: a 2xx answer still lists — the status-reading GET changes nothing on the good path" {
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_views_kernel 200 '{"active": "all", "tags": [{"id": "t1", "name": "workers", "color": "#54B204", "members": ["11111111-2222-3333-4444-555555555555"]}]}'
+    run run_romp tag
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"active view: All"* ]]
+    [[ "$output" == *"workers  #54B204  1 member: 11111111-2222-3333-4444-555555555555"* ]]
+    run run_romp tag workers
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"workers  #54B204  1 member"* ]]
+    run run_romp tag --json
+    [ "$status" -eq 0 ]
+    [ "$output" = '{"active": "all", "tags": [{"id": "t1", "name": "workers", "color": "#54B204", "members": ["11111111-2222-3333-4444-555555555555"]}]}' ]
+}
+
+@test "tag: nothing listening on the port is still 'kernel not reachable'" {
+    export ROMP_SERVE_TOKEN=testtok
+    local port; free_port port
+    ROMP_KERNEL_PORT="$port" run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: kernel not reachable on :$port (is romp running?)"* ]]
+    ROMP_KERNEL_PORT="$port" run run_romp tag --json
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"kernel not reachable"* ]]
+}
+
+@test "tag --json: a non-2xx JSON answer is printed as is — a script reads ok:false and the reason — and exits 1" {
+    # --json hands a script the kernel's answer; a refusal is still that answer, and it already says
+    # ok:false and why, so the script needs no second parser. Only a non-JSON answer is said as prose.
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_views_kernel 503 '{"ok": false, "retryable": true, "error": "the tag store could not be read (read failed: [Errno 5] Input/output error) — retry"}'
+    run run_romp tag --json
+    [ "$status" -eq 1 ]
+    [ "$output" = '{"ok": false, "retryable": true, "error": "the tag store could not be read (read failed: [Errno 5] Input/output error) — retry"}' ]
+}
+
+@test "tag: a 403 is a refused token, named as such (the kernel's plain-text answer is not JSON)" {
+    # what the kernel answers a GET /views carrying another kernel's token TODAY; -f read it as dead
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_views_kernel 403 'forbidden: token required'
+    run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the kernel on :$ROMP_KERNEL_PORT refused the serve token (HTTP 403)"* ]]
+    [[ "$output" != *"not reachable"* ]]
+    # --json has no JSON to print: the same prose line
+    run run_romp tag --json
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"refused the serve token (HTTP 403)"* ]]
+}
+
+@test "tag: a non-2xx with no JSON reason prints the status with what came with it, or says nothing came" {
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_views_kernel 500 '<h1>Internal Server Error</h1>'
+    run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the kernel on :$ROMP_KERNEL_PORT answered HTTP 500: <h1>Internal Server Error</h1>"* ]]
+    [[ "$output" != *"not reachable"* ]]
+    kill "$VIEWS_KERNEL_PID"; wait "$VIEWS_KERNEL_PID" 2>/dev/null || true; rm -f "$TEST_DIR/port"
+    _stub_views_kernel 502 ''
+    run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the kernel on :$ROMP_KERNEL_PORT answered HTTP 502 with no explanation"* ]]
 }
 
 @test "color/tag: usage errors exit 2" {
