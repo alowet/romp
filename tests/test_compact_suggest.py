@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""The kernel-level compaction SUGGESTION (the user 2026-08-30, via the nightly optimizer). The
-~300k recycle rule stays workers-only; every OTHER session is told — once idle at least an hour,
-first past 400k context tokens, again past 800k — that a /compact at a natural boundary would keep
-it snappy, its call. Event-keyed end to end: the CROSSING arms it; a per-threshold latch on the
-auto-nudge blob makes each fire once per episode; the idle gate reads the settle event's age AT
-FIRE TIME; and the latch re-arms only on the session's own context RESET (compact//clear/rewind),
-observed as the authoritative token counter falling back below the latched threshold — ignored =
-silent forever, acted+regrown+idle = one fresh suggestion per threshold (the manager's amendment).
-Workers (their roster tags), comment-thread forks, and mid-turn sessions are excluded at fire
-time. The voice render is pinned in test_injected_voice.py. SYNTHETIC fixtures only."""
+"""The kernel-level compaction SUGGESTION (the user 2026-08-30, via the nightly optimizer). Every
+session is told — once idle at least an hour, first past 400k context tokens, again past 800k —
+that a /compact at a natural boundary would keep it snappy, its call. Event-keyed end to end: the
+CROSSING arms it; a per-threshold latch on the auto-nudge blob makes each fire once per episode; the
+idle gate reads the settle event's age AT FIRE TIME; and the latch re-arms only on the session's own
+context RESET (compact//clear/rewind), observed as the authoritative token counter falling back
+below the latched threshold — ignored = silent forever, acted+regrown+idle = one fresh suggestion
+per threshold (the manager's amendment). Muted sessions, comment-thread forks, and mid-turn
+sessions are excluded at fire time. Session tags are NOT a gate (T248, the user 2026-09-07: a
+"workers" roster is a convention they run on top of romp, not something romp knows about; the
+first cut skipped every member of a *_workers tag). The voice render is pinned in
+test_injected_voice.py. SYNTHETIC fixtures only."""
 import contextlib
 import io
 import json
@@ -147,12 +149,16 @@ class CompactSuggest(_Fixture):
         self.assertEqual(self.sent, [])
 
     # ── the exclusions ──
-    def test_a_worker_tagged_session_is_never_suggested(self):
+    def test_a_session_inside_a_workers_tag_is_suggested_like_any_other(self):
+        # T248 (the user 2026-09-07): a session on an attached machine inside a "workers" roster tag is
+        # an ordinary session to romp — the tag is the user's own convention. Red before: the first
+        # cut's _worker_tag_member gate returned False for every member of a *_workers tag.
         (jd.STATE / "timeline-views.json").write_text(json.dumps(
             {"active": "all", "tags": [{"id": "t1", "name": "notes_workers",
                                         "members": [{"host": "", "sid": SID}]}]}))
-        self.assertFalse(self._tick(450_000), "the recycle rule owns workers")
-        self.assertEqual(self.sent, [])
+        self.assertTrue(self._tick(450_000), "a tag is not a gate")
+        self.assertEqual(len(self.sent), 1)
+        self.assertFalse(hasattr(km, "_worker_tag_member"), "the tag-roster gate is gone, not bypassed")
 
     def test_a_muted_session_is_never_suggested(self):
         # the user's explicit per-session opt-out (hideFromFeed) — every sibling injector honors
