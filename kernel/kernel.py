@@ -40351,7 +40351,10 @@ body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-for
 # already); once location.reload has been accepted the shell's lifted modals close (settings/picker) and a marker
 # rides sessionStorage, stamped with the page's path, so the fresh LANDING leaves ONE notification-center line
 # ("Reloaded onto build N — the kernel restarted / a newer romp build was served") and a standalone pane's marker
-# is consumed by nobody else. If location.reload throws (a host that forbids it) the old banner is the fallback
+# is consumed by nobody else. The marker is removed only by the page whose path it names (T272, 2026-09-08):
+# sessionStorage is shared across the shell and its same-origin panes, and a pane's shim, running before the
+# shell's own core existed (it reads as standalone then), consumed the shell's marker while checking the path
+# only afterwards — the notification-center line was lost on every reload the pane won that race. If location.reload throws (a host that forbids it) the old banner is the fallback
 # (the `refused` hook) and the refusal LATCHES for that build/boot: no re-attempt on every gesture end or poll,
 # only a strictly newer dv or boot re-arms. The VS Code webview never runs this: the extension loads its bundle from the installed VSIX
 # and a webview reload cannot fix bundled-code drift, so its own reload prompt stays (vscode-extension/src/
@@ -40388,9 +40391,10 @@ if(!owed)owed=next;tryFire();}
 function noteDv(dv){if(LOADED&&dv&&dv>LOADED)request('build',String(dv));}
 function noteVersion(v){if(!v)return;if(v.boot&&BOOT&&v.boot!==BOOT)request('restart',String(v.boot));if(v.dist_ver)noteDv(v.dist_ver);}
 function checkBoot(){try{fetch('/version',{cache:'no-store'}).then(function(r){return r.json();}).then(noteVersion)['catch'](function(){});}catch(e){}}
-function announce(notify){var raw=null;try{raw=sessionStorage.getItem('romp:reloaded');if(raw)sessionStorage.removeItem('romp:reloaded');}catch(e){}
-if(!raw)return null;var d=null;try{d=JSON.parse(raw);}catch(e){return null;}if(!d)return null;
+function announce(notify){var raw=null;try{raw=sessionStorage.getItem('romp:reloaded');}catch(e){}
+if(!raw)return null;var d=null;try{d=JSON.parse(raw);}catch(e){try{sessionStorage.removeItem('romp:reloaded');}catch(e2){}return null;}if(!d)return null;
 if(d.path&&d.path!==location.pathname)return null;
+try{sessionStorage.removeItem('romp:reloaded');}catch(e){}
 var why=d.reason==='restart'?'the kernel restarted':'a newer romp build was served';
 var txt='Reloaded onto build '+LOADED+' — '+why+'.';try{if(notify)notify('reload',txt);}catch(e){}return txt;}
 document.addEventListener('pointerdown',function(){ptr++;},true);
