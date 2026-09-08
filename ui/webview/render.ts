@@ -12950,6 +12950,7 @@ function retirePendingShip(key: string, shipId?: string): string | null {
     if (!list.length) pendingShips.delete(id);
     persistDrafts();
     if (id === activeId) renderComposerFiles(id);
+    endReloadHoldIfIdle();
     return id;
   }
   return null;
@@ -13031,6 +13032,14 @@ let fireHeldSend: () => void = () => {};
     if (shipGateSid) return "held-send";
     return "";
   };
+}
+// The ENDING event of those holds, told to the core the way the shim tells it its own (kernel.py ws.onopen →
+// __rompReload.ended()): the moment the last pending ship retires and no send is held, an owed reload may fire. The
+// core re-tries only on gesture ends, blur, a fresh request or the shell's poll, so without this a standalone page
+// stayed on the old build until the user's next unrelated click (the review of this change).
+function endReloadHoldIfIdle(): void {
+  if (pendingShips.size || shipGateSid) return;
+  try { (window as any).__rompReload?.ended?.(); } catch { /* a page without the core (the VS Code webview) */ }
 }
 
 // Persist drafts across a full RELOAD (the user 2026-06-25: a half-typed message must survive a refresh, not
@@ -13414,6 +13423,7 @@ function renderComposerFiles(id: string | null): void {
         if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }
         if (held || gateWasOpen) warnToast("The pending upload was dismissed — your held message was NOT sent.");
       }
+      endReloadHoldIfIdle();   // after the settle above cleared the gate: the dismissed last chip ends the hold (T272)
       renderComposerFiles(id);
     });
     box.appendChild(x);
@@ -14732,6 +14742,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       if (gateOpen) { shipGateSid = null; closeConfirm(null); }
       if (owner === activeId) fireHeldSend();
       else warnToast("attachments finished uploading on another tab — the held message was not sent; review it there.");
+      endReloadHoldIfIdle();   // the ending event follows the release: the held send has been posted
     }
   } else if (m.type === "dropSaveFailed" && typeof m.name === "string") {
     // the kernel could not SAVE the shipped bytes — clear the pending chip and say so loudly,
@@ -14743,6 +14754,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     const held = !!owner && sendOnShip.delete(owner);    // a held send must not fire without the file it waited for
     const gateWasOpen = shipGateSid === owner;
     if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }   // the question is moot — but a failed save never auto-sends
+    endReloadHoldIfIdle();
     warnToast(m.name + " couldn't be saved on the kernel, so it was not attached — try again."
               + (held || gateWasOpen ? " Your message was NOT sent." : ""));
     if (owner && owner === activeId) renderComposerFiles(owner);   // the held-send button state clears with the hold
@@ -14971,7 +14983,7 @@ function setupComposer() {
                   [{ label: "Wait for the upload", value: "wait" },
                    { label: "Send without " + them, value: "now", danger: true }],
                   (v) => {
-                    shipGateSid = null;
+                    shipGateSid = null; endReloadHoldIfIdle();
                     if (v === "now") sendComposer({ pastShipGate: true });
                     else if (v === "wait") { sendOnShip.add(sid); renderComposerFiles(sid); }
                   });
