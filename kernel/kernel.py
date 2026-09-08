@@ -18931,12 +18931,15 @@ def _tunnel_supervisor():
                     # row and may spawn a worker. Runs here, in the one supervisor, so an advance is pushed
                     # exactly once no matter how many dashboards are open.
                     _maybe_auto_push(r)
-                    # Kernel-side settings converge without a click (T248b): a peer whose stamp for a
-                    # setting is newer than ours, with a different value, is adopted through the setting's
-                    # own gt-gated setter. Outside the lock too: the setters take their own locks and write
-                    # their stores. Loud on a fault, never fatal to the supervisor.
+                    # Kernel-side settings converge without a click (T248b/T248c): a peer whose stamp for a
+                    # setting is newer than ours is adopted through the setting's own gt-gated setter; a peer
+                    # whose stamp is OLDER is handed ours through its gesture route (the default topology polls
+                    # one way — the hub polls the machine it attached, which has no row for the hub until
+                    # Share my sessions is on). Both legs gate on the peer's trust. Outside the lock too: the
+                    # setters take their own locks and write their stores. Loud on a fault, never fatal to
+                    # the supervisor.
                     try:
-                        _adopt_peer_settings(r.get("host") or "?", rver)
+                        _converge_peer_settings(r, rver)
                     except Exception:
                         _tunnel_log(r.get("host") or "?", "adopt-settings", error=traceback.format_exc()[-400:])
                     # tag federation v2, the reattach half (also outside the lock — it round-trips the
@@ -33529,6 +33532,99 @@ def _mesh_settings_snapshot():
     return values, stamps
 
 
+_MESH_SAID = set()   # (host, why) said once on stderr: an isolated peer, a peer that did not take a push
+
+
+def _mesh_say_once(host, why, line):
+    if (host, why) in _MESH_SAID:
+        return
+    _MESH_SAID.add((host, why))
+    sys.stderr.write(line + "\n")
+
+
+def _converge_peer_settings(r, rver, sync=False):
+    """One supervisor pass for one up peer (`r` its remotes row, `rver` its polled /version): adopt what the
+    peer holds under a NEWER stamp (_adopt_peer_settings), and PUSH what we hold under a newer stamp than the
+    peer's through the peer's gesture route (/mesh-settings, gt-gated by the peer's own setters), so
+    latest-wins holds in both directions of a one-way poll (T248c). Both legs gate on trust: an isolated
+    peer's stored state is neither read into this kernel's stores nor written over the tunnel — isolation is
+    a boundary both ways, and for fileEditing the inbound leg alone could open this kernel's save route
+    (the manager's review of the merged convergence, 2026-09-08). The push rides a daemon thread unless
+    `sync` (tests): the supervisor pass must not wait on a peer's HTTP round trip. Returns what moved."""
+    host = r.get("host") or "?"
+    if (r.get("trust") or "directed") == "isolated":
+        _mesh_say_once(host, "isolated", "settings: %s is isolated — its picks are neither adopted here nor pushed to it "
+                       "(isolation is a boundary both ways)" % host)
+        return {"adopted": [], "pushed": []}
+    adopted = _adopt_peer_settings(host, rver)
+    older = _older_peer_settings(rver)
+    if not older:
+        return {"adopted": adopted, "pushed": []}
+    if not sync:
+        threading.Thread(target=_push_settings_to_peer, args=(dict(r), older), daemon=True).start()
+        return {"adopted": adopted, "pushed": [store for store, _b in older]}
+    return {"adopted": adopted, "pushed": _push_settings_to_peer(r, older)}
+
+
+def _older_peer_settings(rver):
+    """[(store, body)] for every adopted store the peer reports under an OLDER stamp than ours: the body is
+    our (value, stamp) in the /mesh-settings shape. A peer that sends no stamps (an older kernel) or junk
+    teaches nothing and is told nothing — there is nothing to compare."""
+    st = (rver or {}).get("settings") if isinstance(rver, dict) else None
+    gts = (rver or {}).get("settingsGt") if isinstance(rver, dict) else None
+    if not isinstance(st, dict) or not isinstance(gts, dict):
+        return []
+    values, stamps = _mesh_settings_snapshot()
+    out = []
+    for key, store, _setter in _MESH_ADOPTED_SETTINGS:
+        pgt, mine = gts.get(store), stamps.get(store) or 0
+        if isinstance(pgt, bool) or not isinstance(pgt, (int, float)) or not math.isfinite(pgt) or pgt < 0:
+            continue
+        if mine > int(pgt):
+            out.append((store, {key: values[key], "gt": mine}))
+    return out
+
+
+def _push_settings_to_peer(r, older):
+    """Hand each (store, body) to the peer's /mesh-settings over its tunnel + its own token (mirror_trust's
+    transport). Counted as pushed only when the peer's ack shows our stamp holding: its setter stands down on
+    anything newer it has since applied (a click on that machine between our poll and this push), and the
+    next pass adopts that instead. A peer that refuses the route (an older kernel: 404, or a non-JSON answer)
+    is said once and skipped — its copy stays until it updates or the next click reaches it."""
+    host = r.get("host") or "?"
+    pushed = []
+    for store, body in older:
+        st, j, err = _remote_kernel_call(r, "POST", "/mesh-settings", body, timeout=8)
+        if err or st != 200 or not isinstance(j, dict) or not j.get("ok"):
+            # an older kernel answers the unknown route with a text 404, which the transport reports as a
+            # parse error, not a status — so the line names the shape it saw and both likely causes
+            _mesh_say_once(host, "push-failed", "settings: %s did not take the push (%s) — an older kernel without the "
+                           "route, or unreachable; its copy stays until it updates or the next click reaches it"
+                           % (host, err or ("HTTP %s" % st)))
+            return pushed
+        if (j.get("settingsGt") or {}).get(store) == body["gt"]:
+            pushed.append(store)
+            sys.stderr.write("setting %s: pushed our newer pick (%s, gesture %d) to %s — one value, one stamp across machines\n"
+                             % (store, body[[k for k in body if k != "gt"][0]], body["gt"], host))
+    return pushed
+
+
+def _apply_mesh_settings(body):
+    """The peer-side half of the push (POST /mesh-settings, behind the serve token like /judge-settings):
+    apply any of the three adopted booleans in `body` through their own gt-gated setters under the body's
+    `gt` — a stale stamp stands down per field, a non-bool is ignored — and answer with the CURRENT snapshot
+    (values and stamps), so the sender can see what actually holds. No socket delivered this, so the
+    stand-down verdict is consumed here."""
+    gt = _gesture_ms(body)
+    if isinstance(body, dict):
+        for key, _store, setter in _MESH_ADOPTED_SETTINGS:
+            if key in body and isinstance(body.get(key), bool):
+                setter(body[key], gt=gt)
+    _pop_stale_notice()
+    values, stamps = _mesh_settings_snapshot()
+    return {"ok": True, "settings": values, "settingsGt": stamps}
+
+
 def _adopt_peer_settings(host, rver):
     """Adopt every kernel-side boolean in `rver` (_poll_remote_version's dict for a peer) whose stamp is
     newer than the local store's — the value when it differs, the stamp alone when it agrees. Returns
@@ -42619,6 +42715,15 @@ class Handler(BaseHTTPRequestHandler):
                     fwd = {k: v for k, v in body.items() if k != "propagate"}
                     threading.Thread(target=_propagate_judge_settings, args=(fwd,), daemon=True).start()
                 return self._send(200, json.dumps(res), "application/json")
+            if u.path == "/mesh-settings":
+                # The gesture route a PEER's supervisor pushes its newer kernel-side booleans through (T248c:
+                # compactSuggest / autoNudge / fileEditing with the origin stamp), behind this kernel's serve
+                # token like /judge-settings. Our own gt-gated setters decide; the ack is the current snapshot.
+                try:
+                    body = json.loads(raw_body or b"{}")
+                except Exception:
+                    body = None
+                return self._send(200, json.dumps(_apply_mesh_settings(body if isinstance(body, dict) else {})), "application/json")
             return self._send(404, "not found", "text/plain")
         except (BrokenPipeError, ConnectionResetError):
             pass
