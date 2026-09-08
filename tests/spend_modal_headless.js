@@ -44,6 +44,27 @@ const { chromium } = require('playwright');
     railOpacity: getComputedStyle(document.getElementById('rail-usage')).opacity,
   }));
   if (shots) { await pg.screenshot({ path: shots + '-dark.png' }); const ch = await pg.$('#rsp-chart'); if (ch) await ch.screenshot({ path: shots + '-chart.png' }); }
+  // T247f: "your order"
+  await pg.click('#rsp-panel [data-act="order:yours"]');
+  await pg.waitForFunction(() => document.querySelector('#rsp-panel [data-act="order:yours"]').classList.contains('on'), null, { timeout: 5000 });
+  const yourOrder = await pg.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr')).map((tr) => tr.textContent.trim());
+    // the bottom stack of the first bucket that has one: the path whose top edge is lowest among those sharing the first x
+    const segs = Array.from(document.querySelectorAll('#rsp-chart .rsp-seg'));
+    const byX = new Map(); segs.forEach((p) => { const x = p.getAttribute('d').split(/[ ,]/)[0].slice(1); if (!byX.has(x)) byX.set(x, []); byX.get(x).push(p); });
+    let bottomFill = null; for (const [, ps] of byX) { const withY = ps.map((p) => ({ p, y1: parseFloat(p.getAttribute('d').split(/[ ,]/)[1]) })); withY.sort((a, b) => b.y1 - a.y1); if (withY.length > 1) { bottomFill = withY[0].p.getAttribute('fill'); break; } }
+    const prefs = JSON.parse(localStorage.getItem('romp:spendModal') || '{}');
+    return { rows, bottomFill, prefs, pressed: document.querySelector('#rsp-panel [data-act="order:yours"]').classList.contains('on') };
+  });
+  if (shots) await pg.screenshot({ path: shots + '-yourorder.png' });
+  // a viewer arrangement (the strip's key) puts web first
+  const webSid = await pg.evaluate(() => { const r = window.__rompSpendData && window.__rompSpendData(); return r; });
+  await pg.evaluate(() => { const rows = Array.from(document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr')); const web = rows.find((tr) => tr.textContent.includes('TESTHOST:web')); const sid = web && web.getAttribute('data-sid'); localStorage.setItem('romp:vieworder', JSON.stringify(sid ? [sid] : [])); });
+  await pg.click('#rsp-panel [data-act="order:spend"]'); await pg.click('#rsp-panel [data-act="order:yours"]');
+  await pg.waitForFunction(() => document.querySelector('#rsp-panel [data-act="order:yours"]').classList.contains('on'), null, { timeout: 5000 });
+  yourOrder.viewRows = await pg.evaluate(() => Array.from(document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr')).map((tr) => tr.textContent.trim()));
+  await pg.evaluate(() => { localStorage.removeItem('romp:vieworder'); });
+  await pg.click('#rsp-panel [data-act="order:spend"]');
   await pg.click('#rsp-panel [data-act="measure:tok"]');
   await pg.click('#rsp-panel [data-act="range:days"]');
   await pg.waitForFunction(() => document.querySelector('#rsp-panel [data-act="range:days"]').classList.contains('on')
@@ -143,6 +164,6 @@ const { chromium } = require('playwright');
   if (shots) await pg.screenshot({ path: shots + '-phone.png' });
   const panelHint = await pg.evaluate(() => document.getElementById('ru-tip').textContent.includes('Click for the full breakdown'));
   const mobile = { railHidden, panelOpened: true, modalOpened: true, btn, panelHint };
-  console.log(JSON.stringify({ hoverHint, hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, hiddenAfterDrag, lightErr, lightBtn, dim, timeout, mobile, errs }));
+  console.log(JSON.stringify({ yourOrder, hoverHint, hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, hiddenAfterDrag, lightErr, lightBtn, dim, timeout, mobile, errs }));
   await b.close();
 })().catch((e) => { console.error(e); process.exit(1); });

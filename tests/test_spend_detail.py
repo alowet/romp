@@ -364,7 +364,8 @@ class SpendDetail(unittest.TestCase):
         i5 = n - 1 - 5
         usd[i5] = 7.0; tok[i5] = 70000
         una = [0.0] * n; una[n - 1 - 9] = 2.0
-        pd = {"host": "PEERHOST", "scope": "total", "tz": "PEER", "tzOffsetMin": off_min, "topN": 10,
+        pd = {"host": "PEERHOST", "scope": "total", "tz": "PEER", "tzOffsetMin": off_min,
+              "order": ["22222222-3333-4444-5555-000000000001"],
               "sessions": [{"sid": "22222222-3333-4444-5555-000000000001", "name": "worker", "bg": "#C2410C", "fg": "#fff",
                             "live": True, "usd": 300.0, "tok": 3000000, "turns": 30}],
               "unattributed": {"usd": 2.0, "tok": 0, "turns": 1},
@@ -489,6 +490,24 @@ class SpendDetail(unittest.TestCase):
         self.assertEqual(small[0]["host"], "TESTHOST")
         self.assertEqual(len([s for s in d["days"]["stacks"] if s["kind"] == "sid"]), 16, "sixteen sessions across two hosts, sixteen stacks")
 
+    def test_the_payload_carries_the_shared_session_order_by_host(self):
+        # T247f: "your order" is the tab strip's and the lanes' order — the kernel's shared seed
+        # (session-order.json) per host, hosts local-first then the remotes listing's order; an older peer
+        # that ships no order contributes nothing (its sessions trail, client-side)
+        (km.jd.STATE / "session-order.json").write_text(json.dumps([API, WEB]))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual(d["order"], [["TESTHOST", API], ["TESTHOST", WEB]], "one host: its seed, host-tagged")
+        self._attach("PEERHOST", self._peer_server(self._peer_payload(0)))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual(d["order"], [["TESTHOST", API], ["TESTHOST", WEB], ["PEERHOST", "22222222-3333-4444-5555-000000000001"]])
+        km._remotes.clear()
+        pd = self._peer_payload(0)
+        del pd["order"]
+        self._attach("OLDPEER", self._peer_server(pd))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual(d["order"], [["TESTHOST", API], ["TESTHOST", WEB]], "no order from an older peer")
+        (km.jd.STATE / "session-order.json").unlink()
+
     def test_an_older_peer_without_epochs_still_aligns_through_its_offset(self):
         off = int((time.localtime(NOW).tm_gmtoff or 0) // 60) + 180
         self._attach("PEERHOST", self._peer_server(self._peer_payload(off, epochs=False)))
@@ -571,6 +590,11 @@ class SpendDetail(unittest.TestCase):
         self.assertIn(".rsp-tbl thead th{position:sticky;top:0;background:#252526;z-index:1}", js)
         self.assertIn("body.theme-light .rsp-tbl thead th{background:#FFFFFF}", js)
         self.assertIn('<span class="tab-label colored" style="--chip-bg:\'+spColor(s)+\'">', js, "a row's title wears the tab strip's classes")
+        # T247f: the order chips beside the measure chips; the choice persists with the other toggles
+        self.assertIn('data-act=order:spend>by spend</button>', js)
+        self.assertIn('data-act=order:yours>your order</button>', js)
+        self.assertIn("var SP_PREFS_KEY='romp:spendModal';", js)
+        self.assertIn("localStorage.getItem('romp:vieworder')", js, "the viewer's arrangement is the strip's own key")
         # the landing page loads no stylesheet, so the strip's two rules are inlined as a TWIN; this pins the
         # twin's declarations against the source so the two cannot drift
         import re as _re

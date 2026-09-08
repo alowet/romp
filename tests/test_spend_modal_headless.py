@@ -63,6 +63,7 @@ class SpendModalServed(unittest.TestCase):
         km._auth_key_present = lambda: True
         (state / "usage.json").write_text(json.dumps({"apiKey": True}))
         write_ledger(state, extra_sids=20)     # enough sessions to scroll the pane (T247e)
+        (state / "session-order.json").write_text(json.dumps([API, WEB]))   # the tab strip's order: api before web (T247f)
         # T247c: a two-host world — a peer kernel whose sessions merge in, and an older peer reported by name
         self._saved_remotes = dict(km._remotes)
         km._remotes.clear()
@@ -164,6 +165,17 @@ class SpendModalServed(unittest.TestCase):
         self.assertEqual(o["out"]["title"]["prefix"], "TESTHOST:")
         self.assertTrue(o["out"]["pane"]["scrolls"], o["out"]["pane"])
         self.assertEqual(o["out"]["pane"]["sticky"], "sticky")
+        # T247f: "your order" — the strip's order (api before web from session-order.json, then the peer's own
+        # order), unknown sessions trailing by spend; the chart's bottom stack follows; a viewer arrangement
+        # (the strip's localStorage key) reorders both; the choice persists with the other toggles
+        yo = o["yourOrder"]
+        self.assertTrue(yo["rows"][0].startswith("TESTHOST:api") and yo["rows"][1].startswith("TESTHOST:web"), yo["rows"][:3])
+        self.assertTrue(yo["rows"][2].startswith("PEERHOST:worker"), yo["rows"][:3])
+        self.assertTrue(yo["rows"][3].startswith("TESTHOST:tests"), "sessions the order does not know trail, by spend: " + yo["rows"][3])
+        self.assertEqual(yo["bottomFill"], "#54B204", "the chart's bottom stack is the first row (api)")
+        self.assertTrue(yo["viewRows"][0].startswith("TESTHOST:web"), "the viewer's own arrangement wins over the seed: " + yo["viewRows"][0])
+        self.assertEqual(yo["prefs"].get("order"), "yours")
+        self.assertTrue(yo["pressed"])
         self.assertTrue(any("tests" in r and "not running" in r for r in rows), "a dead session keeps its name, dimmed")
         self.assertTrue(any(r.strip().startswith("unattributed") for r in rows), "pre-attribution spend is a row of its own (its hatch mark leads)")
         self.assertGreaterEqual(o["out"]["deadRows"], 2)

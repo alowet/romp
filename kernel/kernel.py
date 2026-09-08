@@ -32588,6 +32588,10 @@ def _spend_detail_local(now=None):
             "tz": time.strftime("%Z", lt), "tzOffsetMin": int((getattr(lt, "tm_gmtoff", 0) or 0) // 60),
             "recordedAt": _spend_recorded_at(),
             "sessions": sessions,
+            # the shared session order (session-order.json — what a tab drag or a lane drag writes): the
+            # modal's "your order" seed (T247f); the viewer's own arrangement is applied client-side, the
+            # way the strip and the lanes apply it (view-order.ts)
+            "order": _session_order(),
             "unattributed": {"usd": round(un[0], 4), "tok": un[1], "turns": un[2]},
             "hours": hrs, "days": _series(days, day_keys)}
 
@@ -32685,6 +32689,7 @@ def _spend_detail(now=None):
     if len(payloads) == 1:
         out = dict(local)
         out["hosts"] = hosts
+        out["order"] = [[me, s] for s in (local.get("order") or []) if isinstance(s, str)]
         return out
     return _merge_spend_details(payloads, hosts, local)
 
@@ -32816,8 +32821,16 @@ def _merge_spend_details(payloads, hosts, local):
             out["epochs"] = epochs
         return out
 
+    # the seed for "your order" (T247f): each host's own shared order, hosts local-first then in the
+    # remotes listing's order — the dashboard's host sequence (federation's hostSeq: local, then attach
+    # order); an older peer that ships no order contributes nothing and its sessions trail
+    order = []
+    for host, p in payloads:
+        for sid in (p.get("order") or []):
+            if isinstance(sid, str):
+                order.append([host, sid])
     out = dict(local)
-    out.update({"hosts": hosts, "sessions": sessions, "unattributed": un,
+    out.update({"hosts": hosts, "sessions": sessions, "unattributed": un, "order": order,
                 "hours": _merge_range("hours"), "days": _merge_range("days")})
     return out
 
@@ -40913,7 +40926,31 @@ pullFleet().then(done,function(){if(ROWS.length)renderRows(ROWS,SELF);done();});
 // kernel-side, the ledger's bySid series — fetched on open behind the romp loader, never scraped from
 // the hover's HTML. The click still kicks the hover's own refresh (pull), so both levels are fresh.
 var spBack=document.getElementById('rsp-back'),spPanel=document.getElementById('rsp-panel'),spTip=null;
-var SP={data:null,err:'',range:'hours',measure:'usd',open:false};
+var SP={data:null,err:'',range:'hours',measure:'usd',order:'spend',open:false};
+// the toggles persist across opens and reloads (T247f): range, measure, and the list's order
+var SP_PREFS_KEY='romp:spendModal';
+function spLoadPrefs(){try{var p=JSON.parse(localStorage.getItem(SP_PREFS_KEY)||'{}')||{};if(p.range==='days')SP.range='days';if(p.measure==='tok')SP.measure='tok';if(p.order==='yours')SP.order='yours';}catch(e){}}
+function spSavePrefs(){try{localStorage.setItem(SP_PREFS_KEY,JSON.stringify({range:SP.range,measure:SP.measure,order:SP.order}));}catch(e){}}
+spLoadPrefs();
+// "your order" (T247f, the user 2026-09-08): the order the tab strip and the timeline lanes show — the
+// kernel's shared seed per host (session-order.json; hosts local-first then attach order, remote ids
+// host-prefixed the way federation prefixes them) arranged by THIS viewer's own drag order, read from
+// the same localStorage key the strip reads (view-order.ts VIEW_ORDER_KEY). spApplyViewOrder is that
+// module's applyViewOrder, twinned here because the landing page loads no webview bundle; a node test
+// (ui/webview/spend-order-twin.test.ts) holds the two together. Sessions the order does not know (dead,
+// archived, an older peer's) trail in their spend order.
+function spApplyViewOrder(seed,view){var clean=function(xs){var out=[],seen={};(xs||[]).forEach(function(x){if(typeof x==='string'&&!seen[x]){seen[x]=1;out.push(x);}});return out;};var s=clean(seed);if(!view||!view.length)return s;var want={},placed={},out=[];s.forEach(function(x){want[x]=1;});clean(view).forEach(function(id){if(want[id]){placed[id]=1;out.push(id);}});s.forEach(function(id){if(!placed[id])out.push(id);});return out;}
+function spViewOrder(){try{var o=JSON.parse(localStorage.getItem('romp:vieworder')||'[]');return Array.isArray(o)?o:[];}catch(e){return [];}}
+function spKey(d,s){return (s.host&&s.host!==d.host)?(s.host+':'+s.sid):s.sid;}
+function spOrdered(d){var ss=(d.sessions||[]).slice();if(SP.order!=='yours')return ss;
+var seed=(d.order||[]).map(function(p){return (p[0]&&p[0]!==d.host)?(p[0]+':'+p[1]):p[1];});
+var fin=spApplyViewOrder(seed,spViewOrder()),rank={};fin.forEach(function(id,i){rank[id]=i;});
+var known=[],rest=[];ss.forEach(function(s){if(rank[spKey(d,s)]!==undefined)known.push(s);else rest.push(s);});
+known.sort(function(a,b){return rank[spKey(d,a)]-rank[spKey(d,b)];});return known.concat(rest);}
+// the chart's stacks follow the list, bottom to top = top row to bottom row
+function spStackOrder(d,stacks){if(SP.order!=='yours')return stacks;var rank={};spOrdered(d).forEach(function(s,i){rank[String(s.host)+'\t'+s.sid]=i;});
+var sids=stacks.filter(function(s){return s.kind==='sid';}),rest=stacks.filter(function(s){return s.kind!=='sid';});
+sids.sort(function(a,b){return (rank[String(a.host)+'\t'+a.sid]||0)-(rank[String(b.host)+'\t'+b.sid]||0);});return sids.concat(rest);}
 var SP_OTHER='#4a5361',SP_NONE='#6b7a8c';   // "other" and a session with no identity color: neutrals, never a hue
 function spName(s){return s.name||('session '+String(s.sid||'').slice(0,8));}
 // T247c: when more than one machine contributes, a row or chip names its host the way a federated
@@ -40961,8 +40998,9 @@ while(t&&t!==spPanel){if(t.getAttribute&&t.getAttribute('data-act')){b=t;break;}
 if(!b)return;var a=b.getAttribute('data-act');
 if(a==='close'){closeSpend();return;}
 if(a==='retry'){openSpend();return;}
-var m=/^(range|measure):(\\w+)$/.exec(a);if(!m)return;
-SP[m[1]]=m[2];
+var m=/^(range|measure|order):(\\w+)$/.exec(a);if(!m)return;
+SP[m[1]]=m[2];spSavePrefs();
+if(m[1]==='order'){var tb=document.getElementById('rsp-table');if(tb)tb.innerHTML=sessionTable(SP.data);}
 var sib=b.parentNode.querySelectorAll('[data-act^="'+m[1]+':"]');
 for(var i=0;i<sib.length;i++){if(sib[i]===b)sib[i].classList.add('on');else sib[i].classList.remove('on');}
 renderChart();});
@@ -40976,7 +41014,7 @@ var keyCol=d.scope!=='keyed'&&ss.some(function(s){return s.key&&typeof s.key.usd
 var h='<table class=rsp-tbl><thead><tr><th>session</th><th class=n>dollars</th>'+(keyCol?'<th class=n>key-billed</th>':'')
 +'<th class=n>turns</th><th class=n>tokens</th></tr></thead><tbody>';
 var many=spMany(d);
-ss.forEach(function(s){h+='<tr'+(s.live?'':' class=rsp-dead')+'>'
+spOrdered(d).forEach(function(s){h+='<tr data-sid="'+esc(s.sid||'')+'"'+(s.live?' class=rsp-live':' class=rsp-dead')+'>'
 +'<td class=rsp-name>'+spTitle(s,many)+(s.live?'':'<span class=ru-tip-reset> \u00b7 not running</span>')+'</td>'
 +'<td class=n>'+fmtUsd(s.usd)+'</td>'+(keyCol?'<td class=n>'+(s.key?fmtUsd(s.key.usd):'\u2014')+'</td>':'')
 +'<td class=n>'+(s.turns||0)+'</td><td class=n>'+fmtTok(s.tok||0)+'</td></tr>';});
@@ -41010,6 +41048,9 @@ h+='<div class=rsp-sec><div class=ru-tip-name><span>Spend over time</span></div>
 +'<span class=rsp-gap></span>'
 +'<button class="rsp-btn'+(SP.measure==='usd'?' on':'')+'" data-act=measure:usd>dollars</button>'
 +'<button class="rsp-btn'+(SP.measure==='tok'?' on':'')+'" data-act=measure:tok>tokens</button>'
++'<span class=rsp-gap></span>'
++'<button class="rsp-btn'+(SP.order==='spend'?' on':'')+'" data-act=order:spend>by spend</button>'
++'<button class="rsp-btn'+(SP.order==='yours'?' on':'')+'" data-act=order:yours>your order</button>'
 +'</div><div id=rsp-chart></div></div>';
 // 3. per session — EVERY attached kernel's sessions (T247c), each machine's own story merged here;
 // the billing rule is named when every contributing machine shares one, else each keeps its own
@@ -41048,7 +41089,7 @@ var n=/^(\\d{4})-(\\d\\d)-(\\d\\d)$/.exec(k);return n?(Number(n[2])+'/'+Number(n
 function renderChart(){var box=document.getElementById('rsp-chart');if(!box||!SP.data)return;
 var d=SP.data,ser=d[SP.range],meas=SP.measure;
 if(!ser||!ser.keys||!ser.keys.length){box.innerHTML='<div class=rsp-note>No history yet.</div>';return;}
-var stacks=ser.stacks||[],n=ser.keys.length,W=Math.max(320,box.clientWidth||600),H=200;
+var stacks=spStackOrder(d,ser.stacks||[]),n=ser.keys.length,W=Math.max(320,box.clientWidth||600),H=200;
 var tots=[],mx=0;for(var i=0;i<n;i++){var t=0;for(var s=0;s<stacks.length;s++){t+=(stacks[s][meas]&&stacks[s][meas][i])||0;}tots.push(t);if(t>mx)mx=t;}
 if(!(mx>0)){box.innerHTML='<div class=rsp-note>Nothing recorded in this range.</div>';return;}
 var top=niceTop(mx),slot=W/n,gap=Math.min(2,slot*0.3),bw=Math.max(1,slot-gap),PADT=6;
