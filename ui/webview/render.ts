@@ -55,6 +55,7 @@ import { pastedFilePath } from "./paste-path";
 import { insertAtCaret } from "./composer-insert";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
 import { followReader, keepPlaceAcrossShow } from "./scroll-keep";
+import { keepResidentEvents } from "./frame-merge";
 import { activeTabToReannounce } from "./relay-active";
 import { dirStatusHint, nextDirActive, createDirPrompt, type DirStatus } from "./dir-complete";
 import { mediaSrc, kernelUrl } from "./media";
@@ -13284,11 +13285,22 @@ function upsert(msg: any) {
   const existed = sessions.has(msg.id);
   const prev = sessions.get(msg.id);
   awaitingFull.delete(msg.id);   // a full session landed → this session is re-based; a later gap may ask again
+  // A frame that would take a HELD transcript from content to nothing is status-shaped, never a wipe (T249b,
+  // the user 2026-09-07): the kernel sent `events: []` for a session with content when its read of the transcript
+  // failed for a cycle, the pane blanked to a placeholder, and the content frame that followed re-landed the
+  // reader as a first build (the recorded scroll snap). Decision in frame-merge.ts; said once per session in
+  // the client-diag journal so a kernel that sends such frames is seen, never silently absorbed.
+  const kept = keepResidentEvents(prev ? prev.events : null, msg.events);
+  if (kept && prev && !emptyFrameDiagSent.has(msg.id)) {
+    emptyFrameDiagSent.add(msg.id);
+    vscodeApi?.postMessage({ type: "clientDiag", surface: "chat", what: "empty-session-frame", data: { id: msg.id, held: prev.events.length } });
+  }
+  const events = kept && prev ? prev.events : (msg.events || (prev ? prev.events : []));
   const s: Session = {
     id: msg.id,
     name: msg.name,
     color: msg.color || null,
-    events: msg.events || (prev ? prev.events : []),
+    events,
     status: msg.status || (prev ? prev.status : { state: "idle", sinceEpoch: null }),
     firstSeen: msg.firstSeen ?? (prev ? prev.firstSeen : undefined),
     cwd: msg.cwd ?? (prev ? prev.cwd : ""),
@@ -13298,8 +13310,8 @@ function upsert(msg: any) {
     gitBranch: msg.gitBranch ?? (prev ? prev.gitBranch : ""),
     workTree: msg.workTree ?? (prev ? prev.workTree : null),
     // A trimmed full send carries headFrom/headTotal; a whole-transcript send omits them (headFrom 0).
-    headFrom: msg.headFrom ?? 0,
-    headTotal: msg.headTotal ?? ((msg.events || (prev ? prev.events : [])).length),
+    headFrom: kept && prev ? prev.headFrom : (msg.headFrom ?? 0),
+    headTotal: kept && prev ? prev.headTotal : (msg.headTotal ?? events.length),
     bgTasks: ("bgTasks" in msg) ? msg.bgTasks : (prev ? prev.bgTasks : undefined),
     hideFromFeed: ("hideFromFeed" in msg) ? !!msg.hideFromFeed : (prev ? prev.hideFromFeed : undefined),
     postalServiceOff: ("postalServiceOff" in msg) ? !!msg.postalServiceOff : (prev ? prev.postalServiceOff : undefined),
@@ -13424,6 +13436,7 @@ function notifyShell(kind: string, text: string, sid?: string): void {
 // every 0.5-3s and would otherwise re-ask on every rejected delta until the reply lands. Cleared in upsert(),
 // so the next gap can ask again.
 const awaitingFull = new Set<string>();
+const emptyFrameDiagSent = new Set<string>();   // sids whose empty session frame was filed once (see upsert / frame-merge.ts)
 function requestFullSession(id: string): void {
   if (!id || awaitingFull.has(id)) return;
   awaitingFull.add(id);
