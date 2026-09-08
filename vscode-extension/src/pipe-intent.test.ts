@@ -16,9 +16,16 @@ test("explicit state-changing picks are intent", () => {
   // 2026-09-05) — a tag renamed during a reconnect window must still land
   for (const t of ["setModel", "setEffort", "setMode", "setFast", "interrupt", "endSession",
     "nodeOverride", "askClear", "answerAsk", "submitAsk", "renameSession", "moveSession",
-    "setTimelineViews", "tagEdit"]) {
+    "setTimelineViews", "tagEdit", "editTag"]) {
     assert.ok(intentOp(t), `${t} must survive a reconnect`);
   }
+});
+
+test("a remote-tag edit is intent — its local half is already on screen when it is posted", () => {
+  // editTag is the federation op for a tag whose home is another kernel (render.ts's union add/remove,
+  // the timeline's __rompTimelineEditTag hook, 2026-08-24): the pane mirrors the edit locally right
+  // beside the post, so a post dropped on reconnect leaves a half-applied edit the user believes landed
+  assert.ok(intentOp("editTag"), "a queued editTag must be kept across the extension's reconnect");
 });
 
 test("view chatter is not intent — the reconnect reload resyncs it", () => {

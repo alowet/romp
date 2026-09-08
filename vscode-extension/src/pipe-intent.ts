@@ -15,6 +15,7 @@ export const INTENT_OPS: ReadonlySet<string> = new Set([
   "nodeOverride", "askClear", "undoClear", "cardMove", "cardNotify", "redistill",
   "answerAsk", "submitAsk", "toggleAsk", "navAsk", "cancelAsk",
   "setSessionFlag", "setSessionColor", "setGlobalRetryPaused", "setTimelineViews", "tagEdit", "openTagsDialog",
+  "editTag",  // the REMOTE-tag edit: its optimistic local half is already on screen, so a drop half-applies the gesture
   "reorderTabs", "closeTab",
 ]);
 
