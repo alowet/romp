@@ -2465,6 +2465,16 @@ function ensureScrollMarks(): HTMLElement {
       scrollToAnchor(uuid);
     },
   });
+  // The wheel over a notch scrolls the TRANSCRIPT (review of the first cut, 2026-09-08): the box hangs
+  // off body, not #content, so a notch that takes the pointer also took the wheel and its scroll chain
+  // ended at the page — the scrollbar under it stopped scrolling exactly where a notch sat. One passive
+  // listener on the stable box hands the delta to the scroller (lines and pages scaled to pixels).
+  scrollMarks.addEventListener("wheel", (e) => {
+    const c = document.getElementById("content");
+    if (!c) return;
+    const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? c.clientHeight : 1;
+    c.scrollBy({ top: e.deltaY * k, left: e.deltaX * k });
+  }, { passive: true });
   return scrollMarks;
 }
 
@@ -2476,7 +2486,7 @@ function scrollMarkTitle(ev: ChatEvent & { tag?: string }, kind: SenderKind): st
   const when = epoch != null ? markerLabel(epoch, null, Date.now()).text : "";
   const who = kind === "user" ? "" : kind === "romp" ? "from romp" : "from " + (ev.tag || "a machine sender");
   const head = [when, who].filter(Boolean).join(" · ");
-  return (head ? head + ": " : "") + (kind === "user" ? "click to jump to your message" : "click to jump to it");
+  return (head ? head + " · " : "") + (kind === "user" ? "click to jump to your message" : "click to jump to it");
 }
 
 function paintScrollMarks(): void {
@@ -2532,19 +2542,32 @@ function paintScrollMarks(): void {
     // Every notch that knows its message is a link: data-act routes the delegated click, data-uuid
     // says where, the title says when (and, for a machine notch, from whom). A notch without a uuid
     // (nothing to land on) stays a plain mark — no act, no pointer cursor, no false affordance.
-    const dress = (m: HTMLElement, o: typeof ys[number]) => {
+    // The HIT PAD above and below the 2px paint is clamped to half the gap to each neighbour (review
+    // of the first cut, 2026-09-08: a fixed pad reached over a neighbour's paint, and the later
+    // sibling won the hit test — hover, tip and click all answered for the message AFTER the one the
+    // user aimed at, wherever notches sat within about 5px). ys is in event order, hence ascending.
+    const PAD = 2;
+    const pad = (k: number): [number, number] => {
+      const up = k > 0 ? Math.floor((ys[k].y - ys[k - 1].y - 2) / 2) : PAD;
+      const down = k + 1 < ys.length ? Math.floor((ys[k + 1].y - ys[k].y - 2) / 2) : PAD;
+      return [Math.max(0, Math.min(PAD, up)), Math.max(0, Math.min(PAD, down))];
+    };
+    const dress = (m: HTMLElement, o: typeof ys[number], k: number) => {
       m.className = "scroll-mark" + (o.m ? " " + o.m : "");
+      const [up, down] = pad(k);
+      m.style.setProperty("--hit-t", up + "px");
+      m.style.setProperty("--hit-b", down + "px");
       if (o.uuid) { m.dataset.act = "markjump"; m.dataset.uuid = o.uuid; m.title = scrollMarkTitle(s.events[o.i] as ChatEvent & { tag?: string }, o.kind); }
       else { delete m.dataset.act; delete m.dataset.uuid; m.removeAttribute("title"); }
     };
     const kids = Array.from(box.children) as HTMLElement[];
     if (kids.length === ys.length) {
-      ys.forEach((o, i) => { kids[i].style.top = o.y + "px"; dress(kids[i], o); });
+      ys.forEach((o, i) => { kids[i].style.top = o.y + "px"; dress(kids[i], o, i); });
     } else {
-      box.replaceChildren(...ys.map((o) => {
+      box.replaceChildren(...ys.map((o, k) => {
         const m = el("div", "");
         m.style.top = o.y + "px";
-        dress(m, o);
+        dress(m, o, k);
         return m;
       }));
     }

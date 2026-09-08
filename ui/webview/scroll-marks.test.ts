@@ -50,9 +50,9 @@ test("a history load rescales the map smoothly — moved notches are carried, ne
   // the user 2026-08-17: scrolling back streams older history in; the scroller's world grows and
   // every proportional position compresses (the native thumb does the same). Rebuilt nodes can't
   // transition, so same-count updates move the EXISTING nodes and CSS carries them.
-  assert.match(RENDER, /if \(kids\.length === ys\.length\) \{\s*\n\s*ys\.forEach\(\(o, i\) => \{ kids\[i\]\.style\.top = o\.y \+ "px"; dress\(kids\[i\], o\); \}\);/,
-    "…and the dress (kind class, link target, tip) updates in place too — a machine notch stays gray through a rescale");
-  assert.match(RENDER, /const dress = \(m: HTMLElement, o: typeof ys\[number\]\) => \{\s*\n\s*m\.className = "scroll-mark" \+ \(o\.m \? " " \+ o\.m : ""\);/,
+  assert.match(RENDER, /if \(kids\.length === ys\.length\) \{\s*\n\s*ys\.forEach\(\(o, i\) => \{ kids\[i\]\.style\.top = o\.y \+ "px"; dress\(kids\[i\], o, i\); \}\);/,
+    "…and the dress (kind class, link target, tip, hit pads) updates in place too — a machine notch stays gray through a rescale");
+  assert.match(RENDER, /const dress = \(m: HTMLElement, o: typeof ys\[number\], k: number\) => \{\s*\n\s*m\.className = "scroll-mark" \+ \(o\.m \? " " \+ o\.m : ""\);/,
     "one dress for both DOM paths, so the moved notch and the rebuilt notch can never disagree");
   assert.match(CSS, /transition: top 180ms ease;/);
   assert.match(CSS, /prefers-reduced-motion: reduce\) \{ \.scroll-marks \.scroll-mark \{ transition: none; \} \}/);
@@ -119,7 +119,7 @@ test("every notch that knows its message carries the uuid and the action, on BOT
     "a notch with nothing to land on is a plain mark: no act, no pointer cursor, no false affordance");
   assert.match(PAINT, /offs\.push\(\{ top: off, m: kind === "user" \? "" : "machine", uuid: ev\.uuid \|\| "", i, kind \}\);/,
     "machine notches carry their uuid too — gray is clickable like blue");
-  assert.match(PAINT, /box\.replaceChildren\(\.\.\.ys\.map\(\(o\) => \{\s*\n\s*const m = el\("div", ""\);\s*\n\s*m\.style\.top = o\.y \+ "px";\s*\n\s*dress\(m, o\);/);
+  assert.match(PAINT, /box\.replaceChildren\(\.\.\.ys\.map\(\(o, k\) => \{\s*\n\s*const m = el\("div", ""\);\s*\n\s*m\.style\.top = o\.y \+ "px";\s*\n\s*dress\(m, o, k\);/);
   assert.match(PAINT, /ys\.map\(\(o\) => o\.y \+ \(o\.m \? "m" : ""\) \+ o\.uuid\)\.join\(","\)/,
     "the uuid rides the signature: a message changing identity under the same pixel re-points its notch");
 });
@@ -142,13 +142,35 @@ test("the tip is the rail's own time, and a machine notch names its sender (T260
   assert.match(TITLE, /kind === "romp" \? "from romp" : "from " \+ \(ev\.tag \|\| "a machine sender"\)/);
   assert.match(TITLE, /"click to jump to your message"/);
   assert.match(TITLE, /"click to jump to it"/);
+  assert.match(TITLE, /\(head \? head \+ " · " : ""\)/, "a middot before the verb phrase: a clock time followed by \": \" read as a doubled colon");
+});
+
+test("hit pads are clamped to half the gap to each neighbour, so a dense stretch never answers for the wrong message (T260 review)", () => {
+  // a fixed 3px pad reached over a neighbour's paint and the later sibling won the hit test: hover,
+  // tip and click all answered for the message AFTER the one under the pointer wherever notches sat
+  // within about 5px (verified in Chromium by two independent reviewers, 2026-09-08)
+  assert.match(PAINT, /const PAD = 2;/, "the pad is 2px each side — a 6px target for a 2px line, and less of the thumb's track than 3px took");
+  assert.match(PAINT, /const up = k > 0 \? Math\.floor\(\(ys\[k\]\.y - ys\[k - 1\]\.y - 2\) \/ 2\) : PAD;/);
+  assert.match(PAINT, /const down = k \+ 1 < ys\.length \? Math\.floor\(\(ys\[k \+ 1\]\.y - ys\[k\]\.y - 2\) \/ 2\) : PAD;/);
+  assert.match(PAINT, /return \[Math\.max\(0, Math\.min\(PAD, up\)\), Math\.max\(0, Math\.min\(PAD, down\)\)\];/, "half the gap, floored, never below 0 nor above the pad");
+  assert.match(PAINT, /m\.style\.setProperty\("--hit-t", up \+ "px"\);\s*\n\s*m\.style\.setProperty\("--hit-b", down \+ "px"\);/, "set in the one dress, so both DOM paths carry them");
+  assert.match(PAINT, /ys\.forEach\(\(o, i\) => \{ kids\[i\]\.style\.top = o\.y \+ "px"; dress\(kids\[i\], o, i\); \}\);/);
+  assert.match(PAINT, /box\.replaceChildren\(\.\.\.ys\.map\(\(o, k\) => \{/);
+});
+
+test("the wheel over a notch scrolls the transcript — the box forwards it (T260 review)", () => {
+  // the box hangs off body, not #content: a notch that takes the pointer took the wheel too, and its
+  // scroll chain ended at the page — the scrollbar stopped scrolling exactly where a notch sat
+  assert.match(ENSURE, /scrollMarks\.addEventListener\("wheel", \(e\) => \{/, "one listener on the stable box, never per notch");
+  assert.match(ENSURE, /const k = e\.deltaMode === 1 \? 16 : e\.deltaMode === 2 \? c\.clientHeight : 1;/, "lines and pages scaled to pixels");
+  assert.match(ENSURE, /c\.scrollBy\(\{ top: e\.deltaY \* k, left: e\.deltaX \* k \}\);\s*\n\s*\}, \{ passive: true \}\);/, "passive: the wheel is never blocked");
 });
 
 test("only the NOTCH takes the pointer — the box stays passive over the native scrollbar (T260)", () => {
   assert.match(CSS, /\.scroll-marks \{ position: fixed; z-index: 3; pointer-events: none; width: 12px; \}/, "the box: unchanged, passive");
   assert.match(CSS, /\.scroll-marks \.scroll-mark\[data-act\] \{ pointer-events: auto; cursor: pointer; \}/, "a linked notch: the link cursor");
-  assert.match(CSS, /\.scroll-marks \.scroll-mark\[data-act\]::before \{ content: ""; position: absolute; left: -2px; right: -2px; top: -3px; bottom: -3px; \}/,
-    "the hit box is padded past the 2px paint — the painted size never changes");
+  assert.match(CSS, /\.scroll-marks \.scroll-mark\[data-act\]::before \{ content: ""; position: absolute; left: -2px; right: -2px; top: calc\(-1 \* var\(--hit-t, 2px\)\); bottom: calc\(-1 \* var\(--hit-b, 2px\)\); \}/,
+    "the hit box is padded past the 2px paint by per-notch pads — the painted size never changes");
   const hover = (CSS.match(/\.scroll-marks \.scroll-mark\[data-act\]:hover \{[^}]*\}/) || [""])[0];
   assert.match(hover, /box-shadow: 0 0 0 1\.5px var\(--accent\)/, "the hover cue is the accent ring");
   assert.match(hover, /opacity: 1;/);
