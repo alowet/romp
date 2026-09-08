@@ -1600,6 +1600,15 @@ body.chat-theme-yatharth .meta-btn.mode-risky, body.chat-theme-yatharth .meta-it
   border-radius: 1px; background: var(--you); opacity: 0.65;
   transition: top 180ms ease; }   /* history streaming in rescales the map — carried, not teleported */
 @media (prefers-reduced-motion: reduce) { .scroll-marks .scroll-mark { transition: none; } }
+/* a notch is a LINK to its message (T260, the user 2026-09-08): the box above stays pointer-events:none —
+   the native scrollbar under it keeps working wherever a notch is not — and only a notch that knows its
+   message (data-act) takes the pointer, with the link cursor. The painted mark stays 8×2; the HIT box is
+   the ::before, padded to 12×8 so a 2px line is actually clickable. Hover: full opacity plus an accent
+   ring (the focus family's colour; never a status colour, never a size change). The machine notch's
+   dimmer opacity (its rule below) yields to :hover by specificity, so a gray notch lights up the same. */
+.scroll-marks .scroll-mark[data-act] { pointer-events: auto; cursor: pointer; }
+.scroll-marks .scroll-mark[data-act]::before { content: ""; position: absolute; left: -2px; right: -2px; top: -3px; bottom: -3px; }
+.scroll-marks .scroll-mark[data-act]:hover { opacity: 1; box-shadow: 0 0 0 1.5px var(--accent); }
 .rail-day {
   position: fixed; z-index: 3; pointer-events: none; white-space: nowrap; line-height: 1;
   font-size: 0.66em; letter-spacing: 0.03em; color: var(--dim); opacity: 0.85;

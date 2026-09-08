@@ -24,7 +24,7 @@ test("both consumers read the classifier — never a second hand-maintained pred
   assert.match(RENDER, /const kind = senderKind\(ev\);\s*\n\s*const romp = kind === "romp";\s*\n\s*const injected = kind === "injected";\s*\n\s*const tagged = kind === "tagged";/);
   // …and the notch painter reads the SAME function, coloring by it
   assert.match(RENDER, /const kind = senderKind\(ev\);\s*\n\s*if \(kind === "injected"\) continue;/);
-  assert.match(RENDER, /offs\.push\(\{ top: off, m: kind === "user" \? "" : "machine" \}\);/);
+  assert.match(RENDER, /offs\.push\(\{ top: off, m: kind === "user" \? "" : "machine", uuid: ev\.uuid \|\| "", i, kind \}\);/);
   // machine notches wear the light gray, never the blue that means "yours"
   assert.match(CSS, /\.scroll-marks \.scroll-mark\.machine \{ background: #8a8f98; opacity: 0\.55; \}/);
 });
