@@ -957,6 +957,18 @@ def msg_to_atom(msg, sid, fsid, t, skill_tool_ids=()):
             # same consumed-keys gate as the file adapter: a Read result's dict holds the whole
             # file — carrying shapes nothing reads only bloats the live tail
             atom["toolUseResult"] = tur
+        # The CLI's PROVENANCE stamp (UserMessage.origin — claude_agent_sdk MessageOrigin) rides the live
+        # atom exactly as the file adapter carries the record's `origin` (event_model._record_origin): it
+        # is how the chat knows a streamed user-role turn is a background task's notification, a peer's
+        # message or a scheduled firing and not the composer's words (the user 2026-09-07). The stream
+        # LEADS the disk write, so without it the live tail showed the CLI's preamble paragraph as a
+        # message until the transcript record superseded it.
+        origin = getattr(msg, "origin", None)
+        if isinstance(origin, dict) and isinstance(origin.get("kind"), str):
+            o = {k: origin[k] for k in ORIGIN_KEYS if isinstance(origin.get(k), str)}
+            if len(o.get("body") or "") > _ORIGIN_BODY_CAP:
+                o["body"] = o["body"][:_ORIGIN_BODY_CAP]
+            atom["origin"] = o
         return atom
     return None
 
@@ -966,6 +978,10 @@ def msg_to_atom(msg, sid, fsid, t, skill_tool_ids=()):
 # holds the two sets equal). Widen both together when a new consumer appears; never carry-all.
 TUR_CONSUMED_KEYS = frozenset(("answers", "structuredPatch", "agentId", "isAsync"))   # + the Agent tool's
 #   join/background flag (plans/subagent-transcripts.md, 2026-09-05) — widened in step with event_model
+# The origin keys the live atom carries — MIRRORS event_model._ORIGIN_KEYS / _RESULT_CAP (same standalone-
+# module reason as TUR_CONSUMED_KEYS above; a drift pin in tests/test_injected_origin.py holds them equal).
+ORIGIN_KEYS = ("kind", "subkind", "name", "from", "server", "senderTaskId", "body")
+_ORIGIN_BODY_CAP = 16000
 
 TYPE_SOMETHING = "Type something"   # meta-option label the webview turns into the inline "add your own" field
 

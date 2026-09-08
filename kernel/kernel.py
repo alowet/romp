@@ -12310,9 +12310,13 @@ def _thread_messages(tsid, cut_uuid, floor_t=0):
             break                                   # tip fork: copied history keeps its original (older) stamps
         if r.get("type") in ("user", "assistant"):
             txt = _comment_msg_text(r)
-            if r.get("type") == "user" and txt.lstrip().startswith("<task-notification>"):
+            if r.get("type") == "user" and (em.SYSTEM_WRAPPER_RE.match(txt) or
+                                            (em._record_origin(r) or {}).get("kind") not in (None, "human")):
                 txt = ""                            # harness bookkeeping for the AGENT (a parent bg task died
-                #                                     with the fork) — never the user's own words (2026-08-17)
+                #                                     with the fork) — never the user's own words (2026-08-17);
+                #                                     field-first since 2026-09-08: any origin-stamped injected
+                #                                     turn (a peer's message, a preamble-led notification) is
+                #                                     not "you" either
             if r.get("type") == "user" and em.CMD_WRAP_RE.match(txt):
                 txt = ""                            # a slash command's invocation/output wrapper (the record BEGINS
                                                     # with one — the event model's own anchored test; prose that merely
@@ -28586,12 +28590,26 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                         if author == "teammate":                 # Claude Code's native agent-to-agent delivery → its own
                             #   collapsed card (renderTeammate), never a blue "you typed this" bubble. blocks carry the
                             #   per-sender id/summary/body; the "permission laundering" boilerplate is stripped out.
+                            origin = a.get("origin") or {}
                             tblocks = em.parse_teammate_message(text)
-                            events.append({"kind": "teammate", "uuid": a.get("uuid"), "ts": ts,
-                                           "blocks": tblocks or [{"id": "", "summary": "",
-                                                                  "body": _split_reminders(text)[0]}]})
+                            if not tblocks:
+                                # the origin-stamped shape (CLI 2.1.263): the SDK hands the peer's body with the
+                                # envelope already stripped, "byte-exact with what the model saw" — render that
+                                # rather than re-parsing the text; the sender's display name rides `name`/`from`
+                                body = origin.get("body") or em.strip_harness_preamble(_split_reminders(text)[0])[0]
+                                tblocks = [{"id": origin.get("name") or origin.get("from") or "", "summary": "", "body": body}]
+                            tev = {"kind": "teammate", "uuid": a.get("uuid"), "ts": ts, "blocks": tblocks}
+                            src = em.injected_source(author, origin)
+                            if src:
+                                tev["source"] = src   # "From <session>" / a background subagent's message (render head)
+                            events.append(tev)
                             continue
                         prompt, reminders = _split_reminders(text)
+                        preamble = ""
+                        if author != "human":
+                            # the CLI's note-to-the-model paragraph ("[SYSTEM NOTIFICATION - NOT USER INPUT] …") is
+                            # not the message: lifted out of the shown text, kept one click away in the card's fold
+                            prompt, preamble = em.strip_harness_preamble(prompt)
                         imgs = _user_images(blocks, prompt, author == "human")
                         if imgs and prompt:
                             # drop the composer's "[Image #N]" placeholder chips + tidy the space each leaves.
@@ -28613,6 +28631,16 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                         if prompt or reminders or imgs:
                             ev = {"kind": "user", "md": prompt, "uuid": a.get("uuid"), "ts": ts,
                                   "human": author == "human" or bool(imgs), "reminders": reminders}
+                            # WHO injected a non-human user-role record (the user 2026-09-07: background-agent
+                            # reports and harness notices were wearing their own bubble): field-first from the
+                            # record's origin stamp, then the notification's own <summary>. The chat renders a
+                            # sourced event as a labelled notice card — "Background agent finished · <description>",
+                            # "System notice", "From <session>" — never the blue bubble (render.ts renderInjected).
+                            src = em.injected_source(author, a.get("origin"), reminders)
+                            if src:
+                                ev["source"] = src
+                            if preamble:
+                                ev["preamble"] = preamble
                             # the identity of the queued copy this record lands (T252c): the fed ledger pairs
                             # it FIFO per text, at or after the feed — so the chat retires and places its
                             # pending bubble by id, never by text. None on the tmux route or for a record

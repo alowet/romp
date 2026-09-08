@@ -2364,6 +2364,12 @@ body.chat-theme-yatharth .meta-btn.mode-risky, body.chat-theme-yatharth .meta-it
 .notice-card-compact { border-left-color: var(--st-compacting-bg, #14b8a6); }
 .notice-chip-compact { color: var(--st-compacting-bg, #14b8a6); border-color: var(--st-compacting-bg, #14b8a6); }
 .notice-dot-compact { border-color: var(--st-compacting-bg, #14b8a6); }
+/* a peer session's / channel's message surfaced as a notice (renderInjected, the user 2026-09-07) — the
+   teammate card's dashed, neutral language (NOT the per-peer color chrome of a romp postal card), on the
+   notice-card frame so every injected record wears one family */
+.notice-card-peer { border-left-color: var(--dim); border-style: dashed; }
+.notice-chip-peer { color: var(--fg); opacity: 0.85; border-color: var(--dim); }
+.notice-dot-peer { border-color: var(--dim); }
 /* the /clear boundary — QUIET, like the timeline's film-splice seam: a dim frame (this is a historical
    marker, not a live status), with the pre-clear conversation nested in the body once lazy-loaded. */
 .notice-card-clear { border-left-color: var(--dim); }
