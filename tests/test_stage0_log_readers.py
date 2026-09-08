@@ -51,14 +51,14 @@ class _StateSandbox(unittest.TestCase):
         for d in (jd.STATESDIR, jd.MESSAGES.parent, jd.GOALDIR, jd.CAPDIR, jd.ARCHDIR, root / "sdk"):
             d.mkdir(parents=True, exist_ok=True)
         km._postal_index_memo[0] = None
-        km._POSTAL_WAIT_CACHE[:] = [None, ({}, {})]
+        km._POSTAL_WAIT_CACHE[:] = [None, ({}, {}, {})]
         self.addCleanup(self._restore_paths)
 
     def _restore_paths(self):
         for k, v in self._saved_paths.items():
             setattr(jd, k, v)
         km._postal_index_memo[0] = None
-        km._POSTAL_WAIT_CACHE[:] = [None, ({}, {})]
+        km._POSTAL_WAIT_CACHE[:] = [None, ({}, {}, {})]
 
 
 def _write_rows(path, rows):

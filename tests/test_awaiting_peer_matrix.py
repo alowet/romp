@@ -168,7 +168,7 @@ class MatrixCloserGate(_Base):
         # alive-filtered _wait_for_graph: the gate deliberately keeps a dead/unknown peer's open ask
         # (the dead-wait sweep owns that ending, not the write gate).
         def km_open(sid):
-            last_any, last_ask = km._postal_wait_maps()
+            last_any, last_ask, _aw = km._postal_wait_maps()
             return any(f == sid and last_any.get((p, sid), 0) < meta[0]
                        for (f, p), meta in last_ask.items())
         grid = [
@@ -186,6 +186,69 @@ class MatrixCloserGate(_Base):
         # and where the peer IS alive, the user-facing graph agrees with the gate too
         self._log([_msg(1, SID, MGR, T0, "question")])
         self.assertTrue(jd._open_peer_asks(SID) and SID in km._wait_for_graph(NOW, {SID, MGR}))
+
+
+class TwinsKeyMailByStableId(_Base):
+    """Both readers of the postal log key a cross-host row on the recipient's STABLE id (2026-09-08):
+    the row's own `to_sid`, else the name alias AT the row's send time (jd._alias_at). The alias used
+    to be last-write-wins over the whole log, so a name a NEW session reused re-keyed every OLD
+    message to the new sid — the judge's admit gate then read an answered question as an open ask to
+    a stranger, and would have stamped awaitingPeers with the wrong sid."""
+
+    X = "11111111-2222-3333-4444-000000000003"   # wore "api" on TESTHOST when SID asked
+    Y = "11111111-2222-3333-4444-000000000004"   # reused the name later
+    C = "11111111-2222-3333-4444-000000000005"   # whoever Y mailed (how the alias learns Y)
+
+    def _row(self, **kw):
+        r = {"ev": "sent", "id": "m%d" % kw.pop("i"), "body": "x"}
+        r.update(kw)
+        return json.dumps(r)
+
+    def _reused_name(self):
+        return [
+            self._row(i=1, **{"from": "web"}, from_id=SID, to_id="peer:TESTHOST", toName="TESTHOST:api",
+                      t=T0, kind="question"),
+            self._row(i=2, **{"from": "api"}, from_id=self.X, to_id=SID, t=T0 + 50, kind="coordinate",
+                      from_host="TESTHOST"),
+            self._row(i=3, **{"from": "api"}, from_id=self.Y, to_id=self.C, t=T0 + 400, kind="coordinate",
+                      from_host="TESTHOST"),
+        ]
+
+    def test_the_judge_gate_keeps_an_answered_ask_answered_through_a_name_reuse(self):
+        self._log(self._reused_name())
+        self.assertEqual(jd._open_ask_peers(SID), [],
+                         "X answered; main: [Y] — the ask re-keyed to the new wearer, whom SID never asked")
+        _any, last_ask, alias = jd._postal_ask_maps()
+        self.assertIn((SID, self.X), last_ask)
+        self.assertEqual(jd._alias_at(alias, "TESTHOST:api", T0), self.X)
+        self.assertEqual(jd._alias_at(alias, "TESTHOST:api", T0 + 500), self.Y)
+
+    def test_the_judge_gate_reads_to_sid(self):
+        self._log([self._row(i=1, **{"from": "web"}, from_id=SID, to_id="peer:TESTHOST",
+                             toName="TESTHOST:api", to_sid=self.X, t=T0, kind="question")])
+        self.assertEqual(jd._open_ask_peers(SID), [self.X],
+                         "the open ask names the sid the send resolved (main: ['peer:TESTHOST:api'])")
+
+    def test_both_readers_agree_on_the_reused_name(self):
+        def km_open(sid):
+            last_any, last_ask, _aw = km._postal_wait_maps()
+            return sorted(p for (f, p), meta in last_ask.items()
+                          if f == sid and last_any.get((p, sid), 0) < meta[0])
+        for rows in (self._reused_name(),
+                     self._reused_name()[:1],                      # X never spoke: raw relay key on both
+                     [self._row(i=1, **{"from": "web"}, from_id=SID, to_id="peer:TESTHOST",
+                                toName="TESTHOST:api", to_sid=self.X, t=T0, kind="question")]):
+            self._log(rows)
+            self.assertEqual(jd._open_ask_peers(SID), km_open(SID), "gate and wait-maps disagree on: %s" % rows)
+
+    def test_alias_at_rule(self):
+        hist = {"TESTHOST:api": [(150, self.X), (400, self.Y)]}
+        self.assertEqual(jd._alias_at(hist, "TESTHOST:api", 100), self.X, "before any sighting: the earliest known")
+        self.assertEqual(jd._alias_at(hist, "TESTHOST:api", 150), self.X)
+        self.assertEqual(jd._alias_at(hist, "TESTHOST:api", 399), self.X)
+        self.assertEqual(jd._alias_at(hist, "TESTHOST:api", 400), self.Y, "at the sighting: the new wearer")
+        self.assertEqual(jd._alias_at(hist, "TESTHOST:api", 9_000), self.Y)
+        self.assertIsNone(jd._alias_at(hist, "TESTHOST:web", 100), "a name never seen resolves to nothing")
 
 
 class MatrixPlannerGate(_Base):
@@ -260,7 +323,9 @@ class MatrixSupersedeTwins(_Base):
 class PairAwareSupersede(_Base):
     """Hole (b), 2026-08-24: an identity-carrying stamp ends only on the AWAITED pair's answer; an
     unrelated exchange no longer hides a real wait. Legacy identity-less stamps keep the pair-blind
-    read — nothing strands. One predicate for every reader (pinned below)."""
+    read — nothing strands. One predicate for every reader (pinned below). Since 2026-09-08 the
+    answered clock walks reply-REQUIRING sends (question/delegate), so the "unrelated exchange" here
+    is a QUESTION the other peer answered; a coordinate-only exchange answers nothing (last test)."""
 
     OTHER = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"    # an unrelated peer on the same log
 
@@ -279,7 +344,7 @@ class PairAwareSupersede(_Base):
         future = int(time.time()) + 10_000
         # an answered exchange with a DIFFERENT peer, after the stamp's write time
         self._log([_msg(1, SID, MGR, T0 + 10, "question"),
-                   _msg(2, SID, self.OTHER, T0 + 20, "coordinate"),
+                   _msg(2, SID, self.OTHER, T0 + 20, "question"),      # PIN MOVED 2026-09-08: was a coordinate
                    _msg(3, self.OTHER, SID, future, "coordinate")])
         answered = km._peer_answered(SID)
         self.assertGreater(answered[0], 0, "the pair-blind scalar WOULD have superseded")
@@ -304,10 +369,24 @@ class PairAwareSupersede(_Base):
         del s["nodes"][gid]["awaitingPeers"]           # a pre-identity stamp, as stored stores hold
         future = int(time.time()) + 10_000
         self._log([_msg(1, SID, MGR, T0 + 10, "question"),
-                   _msg(2, SID, self.OTHER, T0 + 20, "coordinate"),
+                   _msg(2, SID, self.OTHER, T0 + 20, "question"),      # PIN MOVED 2026-09-08: was a coordinate
                    _msg(3, self.OTHER, SID, future, "coordinate")])
         self.assertIsNone(km._goal_awaiting_stamp_full(s["nodes"], gid, answered_at=km._peer_answered(SID)),
                           "no identity on the stamp -> today's behavior exactly (never strand legacy)")
+
+    def test_a_coordinate_only_exchange_answers_nothing_even_pair_blind(self):
+        # 2026-09-08 (the two fixtures above sent OTHER a coordinate before this): the answered clock
+        # walks reply-REQUIRING sends, so a heads-up OTHER happened to reply to is not an answer to
+        # anything and cannot end even a legacy identity-less stamp. main: superseded (walked last_any).
+        s, gid = self._stamped()
+        del s["nodes"][gid]["awaitingPeers"]
+        future = int(time.time()) + 10_000
+        self._log([_msg(1, SID, MGR, T0 + 10, "question"),
+                   _msg(2, SID, self.OTHER, T0 + 20, "coordinate"),
+                   _msg(3, self.OTHER, SID, future, "coordinate")])
+        self.assertEqual(km._peer_answered(SID), (0, {}), "nothing SID asked has been answered")
+        self.assertIsNotNone(km._goal_awaiting_stamp_full(s["nodes"], gid, answered_at=km._peer_answered(SID)),
+                             "the open question to MGR stands; a stranger's heads-up is not its answer")
 
     def test_every_reader_shares_the_one_predicate(self):
         # the twins rule, extended (the manager's ask): no reader may inline its own compare — the

@@ -156,6 +156,47 @@ class LinkBackLift(_Base):
         self.assertFalse(st["nodes"][X].get("nodeComplete"))
 
 
+class CrossHostReplyKeyedByWearerAtSendTime(_Base):
+    """The remote arm resolves the handoff's peer NAME to a sid AT the handoff's send time (2026-09-08,
+    jd._alias_at): the name→sid alias used to be last-write-wins over the whole log, so a name a NEW
+    session reused re-pointed every OLD handoff at the new wearer — the real recipient's report-back was
+    missed (its reply sits under the old sid), and the stranger's first mail read as the report-back."""
+
+    WX = "77777777-8888-9999-aaaa-000000000001"    # wore "worker_two" on boxa when the handoff was sent
+    WY = "77777777-8888-9999-aaaa-000000000002"    # reused the name later
+    ELSE = "88888888-9999-aaaa-bbbb-cccccccccccc"  # some other local session WY mailed
+
+    def _log(self, rows):
+        jd.MESSAGES.parent.mkdir(parents=True, exist_ok=True)
+        jd.MESSAGES.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        jd._PEER_ASK_CACHE[:] = [None, ({}, {}, {})]
+
+    def _row(self, i, sid, to, t):
+        return {"id": "m%d" % i, "ev": "sent", "from": "worker_two", "from_id": sid, "from_host": "boxa",
+                "to_id": to, "t": t, "kind": "coordinate", "body": "x"}
+
+    def test_the_wearer_at_send_time_reports_back_even_after_the_name_is_reused(self):
+        self._seed_sender(peer="boxa:worker_two")               # handoff sent at T
+        self._log([self._row(0, self.WX, SENDER, T - 100),      # WX wore the name before the handoff
+                   self._row(1, self.WX, SENDER, T + 60),       # …and is the one who reported back
+                   self._row(2, self.WY, self.ELSE, T + 500)])  # WY took the name later (never mailed SENDER)
+        self.assertEqual(jd.run_propagate(now=T + 1000), 1,
+                         "keyed to WX, the wearer at T: its reply completes the handoff (last-write-wins: "
+                         "keyed to WY, no reply, the handoff stays open)")
+        st = jd.load_goals(SENDER)
+        self.assertTrue(st["nodes"][H].get("nodeComplete"))
+        done = [e for e in st["nodes"][H]["log"] if e.get("kind") == "done" and e.get("src") == "courier"]
+        self.assertEqual([e.get("ev_t") for e in done], [T + 60], "the courier's verdict rides WX's reply")
+
+    def test_a_later_wearers_mail_is_not_the_report_back(self):
+        self._seed_sender(peer="boxa:worker_two")
+        self._log([self._row(0, self.WX, SENDER, T - 100),      # WX wore the name at T, never replied
+                   self._row(2, self.WY, SENDER, T + 500)])     # WY, wearing it later, mails SENDER
+        self.assertEqual(jd.run_propagate(now=T + 1000), 0,
+                         "a stranger's mail cannot complete WX's handoff (last-write-wins: done)")
+        self.assertFalse(jd.load_goals(SENDER)["nodes"][H].get("nodeComplete"))
+
+
 class MigrateGateKeyPresence(_Base):
     """The era marker is the diary KEY: eventless flags on a diary-era node never become history."""
 

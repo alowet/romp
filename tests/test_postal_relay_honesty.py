@@ -13,6 +13,7 @@ last ANSWERED rows when the local listing doesn't answer, so a local blink never
 
 SYNTHETIC fixtures only: placeholder UUIDs, invented names.
 """
+import io
 import json
 import os
 import tempfile
@@ -369,6 +370,116 @@ class QuarantineApproveHonesty(_RelayBase):
         src = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
         self.assertIn('HTTPConnection("127.0.0.1", BUS_PORT, timeout=20)', src,
                       "the client half of the approve budget pair — the halves move together")
+
+
+class RelayRowCarriesTheStableId(_RelayBase):
+    """The cross-host send's LOCAL record names the recipient by its stable id (2026-09-08). The wire
+    message has carried `toId` since 2026-09-01, but the sent row kept only "<host>:<name>", so every
+    wait reader joined it back to a sid through a name→sid alias learned from the peer's own rows —
+    a join a reused name could re-point at a stranger. The id was already in hand at the write."""
+
+    def _post_send(self, payload):
+        # the /send route lives inline in do_POST: drive the handler with a fake request
+        h = object.__new__(pm.Handler)
+        raw = json.dumps(payload).encode()
+        h.path = "/send"
+        h.headers = {"Content-Length": str(len(raw)), "X-Romp-Token": pm.SERVE_TOKEN}
+        h.rfile = io.BytesIO(raw)
+        out = []
+        h._send = lambda obj, code=200: out.append((obj, code))
+        h.do_POST()
+        return out[0]
+
+    def test_the_relay_sent_row_carries_to_sid_equal_to_the_wire_toid(self):
+        _set_live([{"id": ALPHA, "name": "web"}])            # the sender lives here …
+        os.environ["ROMP_POSTAL_PEERS"] = "1"
+        pm.PEER_STATE["TESTHOST"] = {"presence": [{"id": GHOST, "name": "api"}], "epoch": 1, "seenAt": 0}
+        parked = []                                           # … the recipient on TESTHOST
+        saved_put = pm.outbox_put
+        pm.outbox_put = lambda h, m: parked.append((h, m))
+        self.addCleanup(lambda: (setattr(pm, "outbox_put", saved_put), pm.PEER_STATE.clear(),
+                                 os.environ.pop("ROMP_POSTAL_PEERS", None)))
+        obj, code = self._post_send({"to": "api", "from": "web", "from_id": ALPHA,
+                                     "body": "which port does staging use?", "kind": "question"})
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(parked[0][1]["toId"], GHOST, "the wire carries the resolved sid (2026-09-01)")
+        rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines()]
+        row = next(r for r in rows if r.get("id") == obj["id"])
+        self.assertEqual(row["to_sid"], GHOST, "the local row carries the SAME sid")   # KeyError on main
+        self.assertEqual((row["to_id"], row["toName"], row["kind"]),
+                         ("peer:TESTHOST", "TESTHOST:api", "question"), "the old keys are untouched")
+
+
+class QuarantineApproveIsIdStrict(_RelayBase):
+    """Held mail that was ID-addressed on the wire may only ever reach that id (2026-09-08). The held
+    record kept only the RESOLVED local sid, and approve re-matched by NAME whenever that sid was no
+    longer live — so id-addressed mail whose recipient had ended went to whatever session now wore
+    the name, the exact swap intake refuses ("never a name fallback, which could hand the mail to a
+    same-named sibling"). The record now remembers the wire id (`toWireId`) and approve is id-strict
+    for it: nothing live by that id → a loud refusal that keeps the hold. Name-addressed mail (an
+    older sender) still re-matches by name."""
+
+    def setUp(self):
+        super().setUp()
+        pm.PEERS["TESTHOST"] = {"port": 1, "up": True, "trust": "directed"}
+        self.delivered = []
+        saved = pm.deliver
+        pm.deliver = lambda *a, **k: self.delivered.append((a, k)) or "m-q"
+        self.addCleanup(lambda: (setattr(pm, "deliver", saved), pm.PEERS.clear()))
+
+    def _hold(self, m):
+        verdict, _ = pm._relay_in("TESTHOST", m)
+        self.assertEqual(verdict, "ack", "directed → held, ack'd")
+        rec = pm.quarantine_get(m["mid"])
+        self.assertIsNotNone(rec, "the message is in the hold")
+        self.addCleanup(lambda: pm.quarantine_del(m["mid"]))
+        return rec
+
+    def test_id_addressed_mail_whose_recipient_ended_refuses_a_name_squatter(self):
+        _set_live([{"id": GHOST, "name": "web"}])
+        m = dict(self._msg("web"), toId=GHOST)
+        rec = self._hold(m)
+        self.assertEqual(rec["toWireId"], GHOST, "the hold remembers the wire chose a sid")   # KeyError on main
+        _set_live([{"id": ALPHA, "name": "web"}])            # GHOST ended; ALPHA wears the name now
+        ok, err = pm.quarantine_decide(m["mid"], "approve")
+        self.assertFalse(ok, "main delivers to the squatter here")
+        self.assertEqual(self.delivered, [], "nothing reached the same-named stranger")
+        self.assertIn("has ended", err)
+        self.assertIn("'web'", err, "the refusal names the session the mail was addressed to")
+        self.assertIn(GHOST[:8], err, "…and its id")
+        self.assertIsNotNone(pm.quarantine_get(m["mid"]), "the record stays held (deny carries a note back)")
+
+    def test_id_addressed_mail_whose_recipient_renamed_still_delivers_to_it(self):
+        _set_live([{"id": GHOST, "name": "web"}])
+        m = dict(self._msg("web"), toId=GHOST)
+        self._hold(m)
+        _set_live([{"id": ALPHA, "name": "web"}, {"id": GHOST, "name": "web2"}])   # renamed, still live
+        ok, err = pm.quarantine_decide(m["mid"], "approve")
+        self.assertTrue(ok, err)
+        self.assertEqual(self.delivered[0][0][0], GHOST, "the sid picks the session, not the name")
+
+    def test_name_addressed_mail_still_rematches_by_name(self):
+        # a GUARD (passes on main too): an older sender parks no toId, so the name is all there is
+        _set_live([{"id": GHOST, "name": "web"}])
+        m = self._msg("web")
+        rec = self._hold(m)
+        self.assertNotIn("toWireId", rec, "name-addressed: no wire id recorded")
+        _set_live([{"id": ALPHA, "name": "web"}])
+        ok, err = pm.quarantine_decide(m["mid"], "approve")
+        self.assertTrue(ok, err)
+        self.assertEqual(self.delivered[0][0][0], ALPHA, "the name re-match stands for name-addressed mail")
+
+    def test_the_hold_sanitizes_the_wire_id_itself(self):
+        # belt for callers that pass no wire_id: the record reads the wire toId and drops a malformed
+        # shape exactly as intake does — it is a match key, never a path
+        m = dict(self._msg("web"), toId=GHOST)
+        self.assertTrue(pm._quarantine_put("TESTHOST", m, ALPHA))
+        self.addCleanup(lambda: pm.quarantine_del(m["mid"]))
+        self.assertEqual(pm.quarantine_get(m["mid"])["toWireId"], GHOST)                # KeyError on main
+        m2 = dict(self._msg("web"), toId="../../etc/hostname")
+        self.assertTrue(pm._quarantine_put("TESTHOST", m2, ALPHA))
+        self.addCleanup(lambda: pm.quarantine_del(m2["mid"]))
+        self.assertNotIn("toWireId", pm.quarantine_get(m2["mid"]), "a malformed wire id is not a key")
 
 
 class SetWorkingMissingParamRefuses(unittest.TestCase):
