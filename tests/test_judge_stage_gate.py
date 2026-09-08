@@ -1680,6 +1680,375 @@ class StoreCompleteness(_Gate):
         self._pass(tiers=STORE_TIERS)
         self.assertEqual(self._st4("stamped"), (1, 1, 1, 1), "readable again: complete runs stamp")
 
+    def _focus(self):
+        store = jd.load_goals(SID)
+        f = store.get("lastNode")
+        while f and store["nodes"][f].get("parentId") is not None:
+            f = store["nodes"][f]["parentId"]
+        return store["nodes"][f]
+
+    def _rows(self, err):
+        return [r for r in (json.loads(l) for l in open(jd.ERRORS) if l.strip()) if r.get("err") == err]
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_an_unreadable_states_file_never_stamps(self):
+        # the review's reproduction: the gate stats the states file into the distiller's signature, then the
+        # stage's open fails. Before the fix the run answered "no live prompt", completed and stamped, and
+        # the brief owed to the parked session waited until the file moved for an unrelated reason
+        self._session(SID)
+        self._converge()
+        self._states_row(SID, T0 + 300, "picker")
+        sp = jd.STATESDIR / (SID + ".jsonl")
+        os.chmod(sp, 0)
+        try:
+            self._reset()
+            self._pass(tiers=("distill",))
+            s = self._st("distill")
+            self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0),
+                             "a states read that fails after a good stat marks the run incomplete")
+            self.assertEqual(len(self._rows("states-unreadable")), 1, "one loud row")
+            self._reset()
+            self._pass(tiers=("distill",))
+            self.assertEqual((self._st("distill")["ran"], self._st("distill")["incomplete"]), (1, 1), "still due")
+            self.assertEqual(len(self._rows("states-unreadable")), 1, "one row per failure episode, not per pass")
+        finally:
+            os.chmod(sp, 0o644)
+        self._reset()
+        self._pass(tiers=("distill",))
+        s = self._st("distill")
+        self.assertEqual((s["ran"], s["stamped"]), (1, 1), "readable again, nothing on disk moved: the run happens and stamps")
+        self.assertTrue(self._focus().get("blockSummary"), "the parked session's brief landed")
+        self._states_row(SID, T0 + 400, "picker")                        # a new picker run re-arms the distiller
+        os.chmod(sp, 0)
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual(len(self._rows("states-unreadable")), 2, "a second episode opens")
+        sp.unlink()                                                      # removed while the episode is open
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual(self._st("distill")["stamped"], 1, "no states file: absent is a real state, the run completes and stamps")
+        self._states_row(SID, T0 + 500, "picker")
+        os.chmod(sp, 0)
+        try:
+            self._reset()
+            self._pass(tiers=("distill",))
+            self.assertEqual(len(self._rows("states-unreadable")), 3, "recreated unreadable: absence ended the episode, a third row")
+        finally:
+            os.chmod(sp, 0o644)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_an_unreadable_cleared_file_never_stamps(self):
+        self._session(SID)
+        self._converge()
+        cp = jd.STATE / "cleared.jsonl"
+        with open(cp, "a") as f:                                         # a row: the grouper re-arms and reads it
+            f.write(json.dumps({"id": SID2 + ":g1", "op": "clear", "t": NOW}) + "\n")
+        os.chmod(cp, 0)
+        try:
+            self._reset()
+            self._pass(tiers=("group",))
+            s = self._st("group")
+            self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0),
+                             "a cleared.jsonl read that fails after a good stat marks the run incomplete")
+            self.assertEqual(len(self._rows("cleared-unreadable")), 1)
+        finally:
+            os.chmod(cp, 0o644)
+        self._reset()
+        self._pass(tiers=("group",))
+        self.assertEqual((self._st("group")["ran"], self._st("group")["stamped"]), (1, 1), "readable again: the run stamps")
+        with open(cp, "a") as f:                                         # another row re-arms the grouper
+            f.write(json.dumps({"id": SID2 + ":g2", "op": "clear", "t": NOW + 1}) + "\n")
+        os.chmod(cp, 0)
+        self._reset()
+        self._pass(tiers=("group",))
+        self.assertEqual(len(self._rows("cleared-unreadable")), 2, "a second episode opens")
+        cp.unlink()                                                      # removed while the episode is open
+        self._reset()
+        self._pass(tiers=("group",))
+        self.assertEqual(self._st("group")["stamped"], 1, "no cleared.jsonl: absent is a real state, the run completes and stamps")
+        with open(cp, "a") as f:
+            f.write(json.dumps({"id": SID2 + ":g3", "op": "clear", "t": NOW + 2}) + "\n")
+        os.chmod(cp, 0)
+        try:
+            self._reset()
+            self._pass(tiers=("group",))
+            self.assertEqual(len(self._rows("cleared-unreadable")), 3, "recreated unreadable: absence ended the episode, a third row")
+        finally:
+            os.chmod(cp, 0o644)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_an_unreadable_stall_file_never_stamps(self):
+        # the by-value input: the signature's own read fails too, and an empty slice would EQUAL the last
+        # good one whenever the records were empty, so the gate would skip a session over a file it cannot
+        # see. The signature read is strict (raises), so the gate runs the stage without a stamp (bypassed);
+        # the stage's own failed read marks the run; one row per failure episode either way
+        self._session(SID)
+        self._converge()
+        an = jd.STATE / "auto-nudge.json"
+        rec = {"enabled": False, "deferred": {SID + ":g999": {"why": "the build has not finished", "at": T0 + 10}}}
+        an.write_text(json.dumps(rec))                 # a record for this sid moves the slice: the distiller is due
+        os.chmod(an, 0)
+        try:
+            for _ in range(2):
+                self._reset()
+                self._pass(tiers=("distill",))
+                s = self._st("distill")
+                self.assertEqual((s["ran"], s["bypassed"], s["stamped"]), (1, 1, 0),
+                                 "the stage ran (no skip over an unreadable input) and did not stamp")
+                self.assertEqual(len(self._rows("stall-unreadable")), 1, "one row per failure episode, not per pass")
+        finally:
+            os.chmod(an, 0o644)
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual((self._st("distill")["ran"], self._st("distill")["stamped"]), (1, 1), "readable again: the run stamps")
+        an.write_text("{ not a document")              # exists, unparseable: the same shape, a new episode
+        self._reset()
+        self._pass(tiers=("distill",))
+        s = self._st("distill")
+        self.assertEqual((s["ran"], s["bypassed"], s["stamped"]), (1, 1, 0), "an unparseable file is not a real state")
+        self.assertEqual(len(self._rows("stall-unreadable")), 2, "a new failure episode: a second row")
+        an.write_text(json.dumps(rec))                 # the same records again: nothing the last complete run did not judge
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual((self._st("distill")["ran"], self._st("distill")["skipped"]), (0, 1), "the stamp survived the episode")
+        an.write_text("{ not a document")              # a third episode opens ...
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual(len(self._rows("stall-unreadable")), 3)
+        an.unlink()                                    # ... and the file is removed while it is open: absent is a real state
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual(self._st("distill")["stamped"], 1, "no stall file: an empty slice, the run completes and stamps")
+        an.write_text("{ not a document")              # recreated unparseable: absence ended the episode
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual(len(self._rows("stall-unreadable")), 4, "a fourth row")
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_a_stall_read_failing_after_a_good_signature_read_marks_the_run(self):
+        # the other half of the strict rule: the signature's read succeeded (the file was readable at gate
+        # time), so the run carries a signature; the stage's own, non-strict stalled_facts read then fails
+        # (the mode flips between the two reads, here under the mirror-top titling that precedes it). That
+        # read marks the run incomplete on its own, so no stamp; a _read_failed that fired only under
+        # strict would let the run stamp over a file it never saw
+        self._session(SID)
+        self._converge()
+        an = jd.STATE / "auto-nudge.json"
+        an.write_text(json.dumps({"enabled": False, "deferred": {}}))  # readable when the gate reads it
+        self._mirror_top(SID, "add tests+docs for the search endpoint")   # titled BEFORE the stage's stall read
+
+        def title_then_flip(subject, frame=None, user_ask=None):
+            os.chmod(an, 0)                                             # the mode flips between the two reads
+            return "Write the api tests"
+        jd.mirror_title_llm = title_then_flip
+        try:
+            self._reset()
+            self._pass(tiers=("distill",))
+            s = self._st("distill")
+            self.assertEqual((s["ran"], s["bypassed"], s["incomplete"], s["stamped"]), (1, 0, 1, 0),
+                             "a signature was computed, and the stage's own failed read voided the stamp")
+            self.assertEqual(len(self._rows("stall-unreadable")), 1, "one loud row")
+        finally:
+            os.chmod(an, 0o644)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_a_rebind_starts_the_failure_episodes_afresh(self):
+        # _rebind_state clears the per-path failure episodes with the rest of the per-root state: the same
+        # path string after a rebind is a new episode and logs again
+        self._session(SID)
+        self._converge()
+        self._states_row(SID, T0 + 300, "picker")
+        sp = jd.STATESDIR / (SID + ".jsonl")
+        os.chmod(sp, 0)
+        try:
+            self._reset()
+            self._pass(tiers=("distill",))
+            self.assertEqual(len(self._rows("states-unreadable")), 1)
+            jd._rebind_state(self.td)                                   # the SAME root: the path string is unchanged
+            self._reset()
+            self._pass(tiers=("distill",))
+            self.assertEqual(len(self._rows("states-unreadable")), 2, "the rebind ended the episode: a new row")
+        finally:
+            os.chmod(sp, 0o644)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_a_cleared_file_vanishing_between_the_stat_and_the_read_ends_the_episode(self):
+        # the race the stat-before-read order admits: the gate stat'd the file and the stage's read finds it
+        # gone. Absent is a real state, so an open episode ends there (as an absent stat ends it), and a file
+        # recreated unreadable logs a new row; a scan failure read as unreadable would keep the episode open
+        # and swallow that row. Fault-injected at the scan seam, since the window is a race
+        self._session(SID)
+        self._converge()
+        cp = jd.STATE / "cleared.jsonl"
+        with open(cp, "a") as f:
+            f.write(json.dumps({"id": SID2 + ":g1", "op": "clear", "t": NOW}) + "\n")
+        os.chmod(cp, 0)
+        self._reset()
+        self._pass(tiers=("group",))
+        self.assertEqual(len(self._rows("cleared-unreadable")), 1, "premise: an episode is open")
+        os.chmod(cp, 0o644)
+        real = jd._view_cleared_scan
+
+        def vanish_then_scan(path_s):
+            os.unlink(path_s)                                           # gone between the stat and the read
+            return real(path_s)                                         # FileNotFoundError, as the read of a vanished file
+        jd._view_cleared_scan = vanish_then_scan
+        try:
+            self._reset()
+            self._pass(tiers=("group",))
+        finally:
+            jd._view_cleared_scan = real
+        self.assertEqual(len(self._rows("cleared-unreadable")), 1, "a vanished file is not a failed read")
+        with open(cp, "a") as f:
+            f.write(json.dumps({"id": SID2 + ":g2", "op": "clear", "t": NOW + 1}) + "\n")
+        os.chmod(cp, 0)
+        try:
+            self._reset()
+            self._pass(tiers=("group",))
+            self.assertEqual(len(self._rows("cleared-unreadable")), 2, "recreated unreadable: the vanish ended the episode")
+        finally:
+            os.chmod(cp, 0o644)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_a_states_file_vanishing_between_the_stat_and_the_read_ends_the_episode(self):
+        # the states twin of the case above, at _live_prompt_since's scan seam
+        self._session(SID)
+        self._converge()
+        self._states_row(SID, T0 + 300, "picker")
+        sp = jd.STATESDIR / (SID + ".jsonl")
+        os.chmod(sp, 0)
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual(len(self._rows("states-unreadable")), 1, "premise: an episode is open")
+        os.chmod(sp, 0o644)
+        real = jd._live_prompt_since_scan
+
+        def vanish_then_scan(path_s):
+            os.unlink(path_s)
+            return real(path_s)
+        jd._live_prompt_since_scan = vanish_then_scan
+        try:
+            self._reset()
+            self._pass(tiers=("distill",))
+        finally:
+            jd._live_prompt_since_scan = real
+        self.assertEqual(len(self._rows("states-unreadable")), 1, "a vanished file is not a failed read")
+        self._states_row(SID, T0 + 400, "picker")
+        os.chmod(sp, 0)
+        try:
+            self._reset()
+            self._pass(tiers=("distill",))
+            self.assertEqual(len(self._rows("states-unreadable")), 2, "recreated unreadable: the vanish ended the episode")
+        finally:
+            os.chmod(sp, 0o644)
+
+    # ── the stage-site marks, one test per site, each forcing the early return past the _judge_run belt ──
+    def test_the_unblockers_failed_call_site_marks_the_run(self):
+        self._blocked_with_a_new_turn()
+        jd.unblock_llm = lambda blocks, since, completed="": ""        # the helper, not the belt: the site alone marks
+        self._reset()
+        io0 = dict(self.io)
+        self._pass(tiers=("unblock",))
+        s = self._st("unblock")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0))
+        self.assertEqual(self.io["saves"] - io0["saves"], 0)
+
+    def test_the_groupers_failed_call_site_marks_the_run(self):
+        self._session(SID)
+        self._pass(tiers=("plan", "close"))
+        store = jd.load_goals(SID)
+        store.pop("groupedSig", None)
+        jd.save_goals(SID, store)
+        jd.group_llm = lambda menu, judge="grouper": ""
+        self._reset()
+        io0 = dict(self.io)
+        self._pass(tiers=("group",))
+        s = self._st("group")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0))
+        self.assertEqual(self.io["saves"] - io0["saves"], 0)
+        self.assertFalse(jd.load_goals(SID).get("groupFails"))
+
+    def test_the_consolidators_failed_call_site_marks_the_run(self):
+        self._session(SID)
+        self._converge()
+        store = jd.load_goals(SID)
+        for top in self._tops():
+            store["status"][top["id"]] = "completed"
+        store["confirming"] = []
+        jd.save_goals(SID, store)
+        jd.group_llm = lambda menu, judge="grouper": ""
+        self._reset()
+        io0 = dict(self.io)
+        self._pass(tiers=("consolidate",))
+        s = self._st("consolidate")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0))
+        self.assertEqual(self.io["saves"] - io0["saves"], 0)
+        self.assertFalse(jd.load_goals(SID).get("consolidateFails"))
+
+    def test_the_titlers_paused_site_marks_the_run(self):
+        self._session(SID)
+        self._converge()
+        nid = self._mirror_top(SID, "add tests+docs for the search endpoint")
+
+        def paused_title(subject, frame=None, user_ask=None):
+            jd._judge_ctx.paused = True
+            return ""
+        jd.mirror_title_llm = paused_title
+        self._reset()
+        io0 = dict(self.io)
+        self._pass(tiers=("distill",))
+        s = self._st("distill")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0))
+        self.assertEqual(self.io["saves"] - io0["saves"], 0)
+        self.assertFalse(jd.load_goals(SID)["nodes"][nid].get("titledT"))
+
+    def test_the_stallers_paused_site_marks_the_run(self):
+        self._session(SID)
+        self._converge()
+        top = self._tops()[0]
+        (jd.STATE / "auto-nudge.json").write_text(json.dumps(
+            {"deferred": {top["id"]: {"why": "the build has not finished", "at": T0 + 100}}}))
+
+        def paused_stall(text, work, holding):
+            jd._judge_ctx.paused = True
+            return ""
+        jd.stall_llm = paused_stall
+        self._reset()
+        io0 = dict(self.io)
+        self._pass(tiers=("distill",))
+        s = self._st("distill")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0))
+        self.assertEqual(self.io["saves"] - io0["saves"], 0)
+        self.assertIsNone(jd.load_goals(SID)["nodes"][top["id"]].get("stallSummary"))
+
+    def test_the_briefers_paused_shortfall_retry_marks_the_run(self):
+        self._session(SID)
+        self._converge()
+        top = self._tops()[0]
+        store = jd.load_goals(SID)
+        kid = "%s:g%d" % (SID, 91)                                        # a sub-goal: two blocked nodes make owed a list
+        store["nodes"][kid] = {"id": kid, "text": "pick the test database", "parentId": top["id"], "t": T0 + 120,
+                               "mt": T0 + 120, "log": [], "trail": [], "nodeComplete": False, "cleared": False}
+        store["status"][kid] = "working"
+        jd.save_goals(SID, store)
+        self._block(SID, top["id"], T0 + 150, why="Which port should the api bind?")
+        self._block(SID, kid, T0 + 160, why="Which database should the tests use?")
+        calls = []
+
+        def brief(text, work, owed, frame=None, user_ask=None, shortfall=None):
+            calls.append(shortfall)
+            if shortfall:                                                # the retry is skipped under the pause
+                jd._judge_ctx.paused = True
+                return ""
+            return "One paragraph for two owed decisions."
+        jd.brief_llm = brief
+        self._reset()
+        self._pass(tiers=("distill",))
+        s = self._st("distill")
+        self.assertEqual(calls, [None, (1, 2)], "two owed decisions, one paragraph: the corrective retry ran")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0))
+        self.assertIsNone(jd.load_goals(SID)["nodes"][top["id"]].get("blockSummary"), "the brief is still owed")
+
 
 class UnblockerHazard(_Gate):
     def test_a_turn_ending_after_the_first_touch_is_judged_next_pass_by_the_unblocker(self):

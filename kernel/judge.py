@@ -182,6 +182,8 @@ def _rebind_state(path):
         _VIEW_CLEARED_MEMO.clear()   # the cleared.jsonl replay memo and the states-log scan memo: full-path
     with _LIVE_PROMPT_LOCK:          # keys, so an old root's entries could never hit under the new one;
         _LIVE_PROMPT_MEMO.clear()    # cleared anyway so a rebind starts empty
+    with _UNREADABLE_LOCK:
+        _UNREADABLE_LOGGED.clear()   # the read-failure episodes are per path too
     _shared_clear()             # the shared read-only store cache: same path keying, same reason; also lifts
     #                         a test's deliberate write-guard trip (the poison flag) so the next class starts clean
     with _STAGE_LOCK:
@@ -1118,7 +1120,9 @@ def pass_watermark(tier, fsid):
 # journal exists and did not read) marks the run incomplete wherever it happens (_mark_unread), so a run
 # judged from a fallback view never stamps under the identity of files it did not read; a store file
 # that cannot be read raises at the stage's load (no stamp, a pass-crash row), and an unparseable one is
-# moved aside by load_goals, so the fresh store the stage judges is what the path holds.
+# moved aside by load_goals, so the fresh store the stage judges is what the path holds. The same holds
+# for the side files a stage reads after the gate stat'd them (cleared.jsonl, the states file, the stall
+# records): a read that fails on a file that exists marks the run incomplete and logs a row (_read_failed).
 GATED_TIERS = ("plan", "close", "unblock", "group", "consolidate", "distill")
 PARSE_TIERS = ("plan", "close", "unblock")   # the tiers whose decision path reads the parse: their signature
 #                                              carries the pinned pair, and _gated checks the served pair
@@ -1158,6 +1162,37 @@ def _ident(p):
     return (st.st_ino, st.st_mtime_ns, st.st_size)
 
 
+_UNREADABLE_LOGGED = set()   # path strings whose last read failed and was logged: one row per failure episode
+_UNREADABLE_LOCK = threading.Lock()
+
+
+def _read_failed(path_s, err, fsid, exc):
+    """A file the signature stat'd (or reads by value) could not be READ by the stage: mark the running
+    stage incomplete and log one judge-errors row. An absent file is a real state (_ident's None, the
+    scans' FileNotFoundError) and is never this; every other failure (a permission bit, EMFILE, EIO, an
+    unparseable document) means the stage decided WITHOUT an input the signature says it saw, and a stamp
+    would skip the session until that file moved, which a permission or descriptor failure never does
+    (review finding, 2026-09-07; before the memos the same hole stood in the planner's and closer's
+    cleared.jsonl read). One row per failure episode, the first failed read after a good or an absent one
+    (_read_ok: absence is a real state, so a file removed and recreated unreadable is a new episode), not
+    one per call: the stall slice alone is read three times per session per pass, and a wedged shared file
+    would otherwise write a row for every one of them."""
+    _judge_ctx.stage_incomplete = True
+    with _UNREADABLE_LOCK:
+        first = path_s not in _UNREADABLE_LOGGED
+        _UNREADABLE_LOGGED.add(path_s)
+    if first:
+        _log_judge_error("romp", fsid or "", err,
+                         note="%s unreadable: %r — the pass judged without it and stays due until it reads"
+                              % (os.path.basename(path_s), exc))
+
+
+def _read_ok(path_s):
+    """A read of `path_s` succeeded, or found it absent: the next failure is a new episode and logs again."""
+    with _UNREADABLE_LOCK:
+        _UNREADABLE_LOGGED.discard(path_s)
+
+
 def _reg_spawned_at(fsid):
     """The spawnedAt VALUE of STATE/sdk/<fsid>.json, the only field _cli_epoch reads from it: model
     picks, task writes, push notes and subagent events rewrite the reg and leave spawnedAt alone (40
@@ -1179,8 +1214,9 @@ def _reg_spawned_at(fsid):
 def _stall_slice(fsid):
     """This session's stall records as a comparable tuple: what rollup_status's stall-warn retire reads
     (stalled_facts). A record appearing or ending for THIS sid moves it; another sid's does not. Read by
-    value from the file each time, for the reason _reg_spawned_at gives."""
-    return tuple(sorted((g, r.get("why"), r.get("since")) for g, r in stalled_facts(fsid).items()))
+    value from the file each time, for the reason _reg_spawned_at gives; strict, so a file that exists and
+    does not read raises and the gate runs the stage without a stamp instead of matching an empty slice."""
+    return tuple(sorted((g, r.get("why"), r.get("since")) for g, r in stalled_facts(fsid, strict=True).items()))
 
 
 def _pair_key(pair):
@@ -10402,13 +10438,16 @@ def _view_cleared():
     mute-seal paths and the judge's echo clears all open it "a"), so no two versions share a size; the one
     write an identity memo cannot see, a rewrite in place of equal size within one mtime tick, is a pattern
     nothing uses on this file. Stat before read, so a row landing between the two costs one extra replay,
-    never a stale answer; an unreadable file answers empty and is not memoized. Returns a frozenset: every
-    caller tests membership, and a mutation of the shared memo would be a silent corruption, so it raises
-    instead."""
+    never a stale answer. A file that exists and cannot be read answers empty, is not memoized, marks the
+    running stage incomplete and logs a `cleared-unreadable` row (_read_failed): the evidence gate stat'd
+    this file into the signature, and a stamp over an answer that never read it would skip the session
+    until the file moved. Returns a frozenset: every caller tests membership, and a mutation of the shared
+    memo would be a silent corruption, so it raises instead."""
     path_s = str(STATE / "cleared.jsonl")
     try:
         st = os.stat(path_s)
     except OSError:
+        _read_ok(path_s)                           # absent (as this branch reads any failed stat) ends an episode
         with _VIEW_CLEARED_LOCK:
             _VIEW_CLEARED_MEMO.pop(path_s, None)
         return frozenset()
@@ -10419,8 +10458,13 @@ def _view_cleared():
         return hit[1]
     try:
         cur = frozenset(_view_cleared_scan(path_s))
-    except OSError:
+    except FileNotFoundError:
+        _read_ok(path_s)
+        return frozenset()                         # gone between the stat and the read: absent is a real state
+    except OSError as e:
+        _read_failed(path_s, "cleared-unreadable", getattr(_judge_ctx, "fsid", ""), e)
         return frozenset()
+    _read_ok(path_s)
     with _VIEW_CLEARED_LOCK:
         _VIEW_CLEARED_MEMO[path_s] = (key, cur)
     return cur
@@ -13696,16 +13740,31 @@ def stall_llm(goal_text, work_text, holding):
 WHY_IN_FLIGHT = (WHY_JUDGING, _WHY_JUDGING_LEGACY, WHY_TURN_IN_FLIGHT, WHY_UNBLOCK_UNSETTLED)
 
 
-def stalled_facts(fsid):
+def stalled_facts(fsid, strict=False):
     """{gid: {"why", "since"}} for THIS session's goals the kernel's nudge gate is holding on a reviver that
     isn't retiring — the mechanical stall reasons it records in auto-nudge.json (kernel _stalled_goals is the
     twin read). Read from the FILE rather than imported: the kernel imports this module, never the reverse.
-    {} on an absent/unreadable file — a stall note is an extra surface, never a reason to fail a pass."""
+    {} on an absent file — a stall note is an extra surface, never a reason to fail a pass. A file that
+    exists and cannot be read or parsed marks the running stage incomplete and logs a `stall-unreadable`
+    row (_read_failed), then answers {} too, unless `strict`, when it raises OSError: the evidence gate
+    reads this file by value into the planner's, closer's and distiller's signatures (_stall_slice), and a
+    signature computed from a failed read would equal the last good one whenever the records were empty,
+    so the gate would skip a session over a file it could not see; raising makes the gate run the stage
+    and stamp nothing, as it does for any other unreadable component. The stage's own read then fails the
+    same way and marks the run, so a read that fails AFTER a good signature read cannot stamp either."""
     out = {}
+    path_s = str(STATE / "auto-nudge.json")
     try:
-        d = json.loads((STATE / "auto-nudge.json").read_text())
-    except Exception:
+        d = json.loads(Path(path_s).read_text())
+    except FileNotFoundError:
+        _read_ok(path_s)                               # absent is a real state, and ends a failure episode
         return out
+    except Exception as e:                             # unreadable, or not a JSON document
+        _read_failed(path_s, "stall-unreadable", fsid, e)
+        if strict:
+            raise OSError("auto-nudge.json unreadable: %r" % (e,))
+        return out
+    _read_ok(path_s)
     for gid, rec in ((d.get("deferred") if isinstance(d, dict) else None) or {}).items():
         if not isinstance(rec, dict) or not str(gid).startswith(fsid + ":"):
             continue                                   # a legacy bare-int record predates the why → nothing to say
@@ -13742,11 +13801,15 @@ def _live_prompt_since(fsid):
     rewrite in place of equal size within one mtime tick, is a pattern nothing uses on this file (the
     evidence gate's value inputs are read by value because their fixtures did). Stat before read: a row
     landing between the two pairs an old identity with new content, which costs one extra scan next
-    time, never a stale answer. An unreadable file answers None and is not memoized."""
+    time, never a stale answer. A file that exists and cannot be read answers None, is not memoized, marks
+    the running stage incomplete and logs a `states-unreadable` row (_read_failed): the distiller's
+    signature carries this file by identity, and a stamp over an answer that never read it would skip the
+    session until the file moved (a brief owed to a parked session would wait on an unrelated row)."""
     path_s = str(STATESDIR / (fsid + ".jsonl"))
     try:
         st = os.stat(path_s)
     except OSError:
+        _read_ok(path_s)                           # absent (as this branch reads any failed stat) ends an episode
         with _LIVE_PROMPT_LOCK:
             _LIVE_PROMPT_MEMO.pop(path_s, None)
         return None
@@ -13757,8 +13820,13 @@ def _live_prompt_since(fsid):
         return hit[1]
     try:
         since = _live_prompt_since_scan(path_s)
-    except OSError:
+    except FileNotFoundError:
+        _read_ok(path_s)
+        return None                                # gone between the stat and the read: absent is a real state
+    except OSError as e:
+        _read_failed(path_s, "states-unreadable", fsid, e)
         return None
+    _read_ok(path_s)
     with _LIVE_PROMPT_LOCK:
         _LIVE_PROMPT_MEMO[path_s] = (key, since)
     return since
