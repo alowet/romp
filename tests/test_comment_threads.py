@@ -349,6 +349,38 @@ class ThreadProjection(CommentBase):
              "exact": "exponential backoff", "status": "open",
              "createdT": self.now - 400, "lastSeenT": seen if seen is not None else self.now}]})
 
+    def test_the_thread_build_is_served_while_its_inputs_stand_and_rebuilt_when_they_move(self):
+        # 2026-09-08: the popover's build_session ran for every thread on every pusher cycle; it is now
+        # served on the thread's exact change key (the active tab's own) and rebuilt when an input moves
+        self._seed_thread()
+        km._built_thread.clear()
+        km._views_dirty[0] = 0.0
+        calls = []
+        real = km.build_session
+        km.build_session = lambda sid, now, tm=None, **kw: (calls.append(sid), real(sid, now, tm, **kw))[1]
+        try:
+            fr1 = km._comments_frame(PARENT)
+            n1 = len(calls)
+            self.assertGreaterEqual(n1, 1, "the first frame builds the thread")
+            fr2 = km._comments_frame(PARENT)
+            self.assertEqual(len(calls), n1, "unchanged inputs: served, not rebuilt")
+            self.assertEqual(fr1["threads"][0].get("unread"), fr2["threads"][0].get("unread"), "the same frame")
+            recs = self._thread_records()
+            recs.append(aline(self.now - 5, "one more thought on jitter", "a9", parent=recs[-1]["uuid"]))
+            self._write(THREAD, recs)                  # a moved input (the thread's transcript)
+            km._parse_cache.clear()
+            km._comments_frame(PARENT)
+            self.assertEqual(len(calls), n1 + 1, "a moved input rebuilds once")
+            km._comments_frame(PARENT)
+            self.assertEqual(len(calls), n1 + 1, "…and is served again afterwards")
+            km._views_dirty[0] = time.time() + 1       # a kernel-side optimistic mutation rebuilds too
+            km._comments_frame(PARENT)
+            self.assertEqual(len(calls), n1 + 2)
+        finally:
+            km.build_session = real
+            km._views_dirty[0] = 0.0
+            km._built_thread.clear()
+
     def test_projection_starts_after_the_cut_and_strips_the_frame(self):
         self._seed_thread()
         msgs = km._thread_messages(THREAD, "a1")
