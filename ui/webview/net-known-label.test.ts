@@ -26,7 +26,7 @@ test("web popover: a trust-only row is labeled, tooltipped, and buttoned as neve
   assert.match(KERNEL, /var kwas=!!k\.attached;/);
   // \uXXXX escapes in the inline JS are literally two backslashes in the file — hence \\\\
   assert.match(KERNEL, /trust remembered \\\\u00b7 never attached here/);
-  assert.match(KERNEL, /No tunnel to '\+k\.host\+' has ever been attached from this machine/);
+  assert.match(KERNEL, /No tunnel to '\+kh\+' has ever been attached from this machine/);
   assert.match(KERNEL, /\(kwas\?'Re-attach':'Attach'\)/);
   assert.match(KERNEL, /A row marked \\\\u201ctrust remembered\\\\u201d was never attached from this machine/,
     "the section header explains the mixed rows");

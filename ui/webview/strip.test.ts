@@ -6,7 +6,7 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { usageColor, fmtAgo, fmtReset, fmtUsd, fmtTok, usageWindows, apiCell, STRIP_PANES } from "./strip";
+import { usageColor, fmtAgo, fmtReset, fmtUsd, fmtTok, usageWindows, apiCell, STRIP_PANES, fillHostSelect, droppedRowsNote } from "./strip";
 
 test("fmtTok: 3 significant figures at every magnitude (the user 2026-08-13)", () => {
   assert.equal(fmtTok(1_318_619_909), "1.32B");
@@ -233,4 +233,84 @@ test("an unknown window is not drawn on the bar at all — its last-known lives 
   assert.doesNotMatch(src, /ru-qmark/, "the '?' slot is gone");
   assert.doesNotMatch(css, /ru-qmark/);
   assert.doesNotMatch(css, /\.ru-w\.ru-unk \.ru-fill \{ opacity: 0\.3; \}/, "the faded fill stays gone");
+});
+
+// ── the attach box's host list is built from ELEMENTS, never markup (2026-09-08) ─────────────────────
+// An ssh alias is whatever ~/.ssh/config says. loadHosts used to render `<option value="${h}">${h}</option>`
+// through innerHTML, so an alias that closed the attribute carried a handler into the popover. Executed
+// against a minimal element stand-in whose innerHTML setter THROWS, so the only way to pass is to set
+// value/textContent on option elements.
+class FakeEl {
+  tagName: string;
+  value = "";
+  children: FakeEl[] = [];
+  attrs: Record<string, string> = {};
+  private _text = "";
+  constructor(tag: string) { this.tagName = tag.toUpperCase(); }
+  get textContent(): string { return this._text; }
+  set textContent(v: string) { this._text = v; this.children = []; }   // the DOM's: assigning text drops children
+  set innerHTML(_v: string) { throw new Error("innerHTML is not how host options are built"); }
+  appendChild(c: FakeEl): FakeEl { this.children.push(c); return c; }
+  setAttribute(k: string, v: string): void { this.attrs[k] = v; }
+}
+function withDocument(fn: () => void): void {
+  const g: any = globalThis;
+  const had = "document" in g, prev = g.document;
+  g.document = { createElement: (t: string) => new FakeEl(t) };
+  try { fn(); } finally { if (had) g.document = prev; else delete g.document; }
+}
+
+test("fillHostSelect: a crafted alias is an option's VALUE and TEXT, never markup; non-strings are dropped", () => {
+  withDocument(() => {
+    const sel: any = new FakeEl("select");
+    const hostile = ['x"onmouseover="alert(1)', "<img src=x onerror=alert(1)>"];
+    fillHostSelect(sel, [...hostile, 42, "", null], "(none)");
+    assert.equal(sel.children.length, 2, "the two strings; the number, the empty string and the null are dropped");
+    assert.deepEqual(sel.children.map((o: any) => o.tagName), ["OPTION", "OPTION"]);
+    assert.deepEqual(sel.children.map((o: any) => o.value), hostile, "the value IS the string, character for character");
+    assert.deepEqual(sel.children.map((o: any) => o.textContent), hostile, "…and so is the label");
+    for (const o of sel.children) assert.deepEqual(o.attrs, {}, "nothing went through the attribute/markup path");
+  });
+});
+
+test("fillHostSelect: an empty or malformed list still says why, and the list is capped", () => {
+  withDocument(() => {
+    const sel: any = new FakeEl("select");
+    fillHostSelect(sel, [], "(kernel unreachable)");
+    assert.equal(sel.children.length, 1);
+    assert.equal(sel.children[0].value, "");
+    assert.equal(sel.children[0].textContent, "(kernel unreachable)", "loud, never silently empty");
+    fillHostSelect(sel, "not-a-list", "(no ~/.ssh/config hosts)");
+    assert.equal(sel.children.length, 1, "a previous fill is replaced, not appended to");
+    assert.equal(sel.children[0].textContent, "(no ~/.ssh/config hosts)");
+    fillHostSelect(sel, Array.from({ length: 600 }, (_, i) => "h" + i), "x");
+    assert.equal(sel.children.length, 513, "512 real options, then ONE marker for the rest");
+    assert.deepEqual(sel.children.slice(0, 512).map((o: any) => o.value), Array.from({ length: 512 }, (_, i) => "h" + i));
+    const marker = sel.children[512];
+    assert.equal(marker.textContent, "… 88 more not shown", "a cut list says how much it left out, never silently");
+    assert.equal(marker.disabled, true, "…and the marker is not a pickable host");
+    assert.ok(sel.children.slice(0, 512).every((o: any) => !o.disabled));
+    fillHostSelect(sel, Array.from({ length: 512 }, (_, i) => "h" + i), "x");
+    assert.equal(sel.children.length, 512, "exactly at the cap: no marker");
+  });
+});
+
+test("droppedRowsNote: the sub-panel names the peer rows the kernel left out, in one sentence both panels share", () => {
+  assert.equal(droppedRowsNote("TESTHOST", 2), "2 rows from TESTHOST had no usable host and were left out");
+  assert.equal(droppedRowsNote("TESTHOST", 1), "1 row from TESTHOST had no usable host and was left out");
+  for (const none of [0, -1, "2", undefined, null, NaN]) assert.equal(droppedRowsNote("TESTHOST", none), "", `${String(none)} is not a count`);
+  const ROOT = path.resolve(process.cwd(), "..");
+  const src = fs.readFileSync(path.join(ROOT, "ui", "webview", "strip.ts"), "utf8");
+  const sub = src.slice(src.indexOf("function renderSub(via: string)"), src.indexOf("function subRow(via: string"));
+  assert.match(sub, /const note = droppedRowsNote\(via, d\.dropped\);/, "renderSub reads the kernel's count");
+  assert.match(sub, /if \(!rows\.length && !note\)/, "a list emptied by the drop is not 'no hosts attached'");
+  assert.match(sub, /e\.textContent = note;/, "…and the note is rendered as text beneath the rows");
+});
+
+test("loadHosts routes both outcomes through fillHostSelect — no innerHTML host rendering remains in strip.ts", () => {
+  const ROOT = path.resolve(process.cwd(), "..");
+  const src = fs.readFileSync(path.join(ROOT, "ui", "webview", "strip.ts"), "utf8");
+  assert.match(src, /fillHostSelect\(sel, d && d\.hosts, "\(no ~\/\.ssh\/config hosts\)"\)/);
+  assert.match(src, /fillHostSelect\(sel, \[\], "\(kernel unreachable\)"\)/);
+  assert.doesNotMatch(src, /<option value="\$\{h\}">/, "the template that rendered an alias as markup");
 });

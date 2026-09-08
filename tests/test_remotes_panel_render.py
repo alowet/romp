@@ -32,7 +32,7 @@ km = SourceFileLoader("romp_kernel_rpanel", os.path.join(BIN, "romp-kernel")).lo
 TUNNELS = {
     "tunnels": [{
         "host": "TESTHOST", "kernelPort": 29855, "localPort": 51000, "busPort": 51001,
-        "checkin": False, "checkinPeer": False, "token": "tok", "status": "up", "detail": "",
+        "checkin": False, "checkinPeer": False, "hasToken": True, "status": "up", "detail": "",
         "sids": ["11111111-2222-3333-4444-555555555555"], "trust": "directed",
         "kernelSha": "abc1234", "localSha": "abc1234", "outOfDate": False,
         "behindBy": 0, "aheadBy": 0, "kernelDate": "",
@@ -45,13 +45,16 @@ TUNNELS = {
 # Minimal DOM/browser stub: enough for the panel IIFE to wire itself up and run one refresh.
 HARNESS = r"""
 'use strict';
+const HTML_SETS = [];           // every string any element was given as innerHTML, in order (the markup sinks)
 function mkEl(id){
-  return {id:id, hidden:true, textContent:'', title:'', style:{}, value:'', className:'',
+  return {id:id, hidden:true, _text:'', title:'', style:{}, value:'', className:'',
     children:[], _listeners:{}, _html:'',
     // Assigning innerHTML replaces an element's contents, so it must drop appended children too. Without
     // that, render()'s opening `list.innerHTML=''` left the previous pass's rows in place and every
     // refresh doubled the list.
-    get innerHTML(){return this._html;}, set innerHTML(v){this._html=v; this.children=[];},
+    get innerHTML(){return this._html;}, set innerHTML(v){this._html=v; this.children=[]; HTML_SETS.push(String(v));},
+    // …and so does assigning textContent (the DOM's rule) — the option lists clear themselves that way
+    get textContent(){return this._text;}, set textContent(v){this._text=v; this.children=[];},
     classList:{_s:new Set(), add(){}, remove(){}, toggle(){}, contains(){return false;}},
     appendChild(c){this.children.push(c); return c;},
     querySelector(){return null;}, querySelectorAll(){return [];},
@@ -70,6 +73,7 @@ const document = {
 const localStorage = { getItem(){return null;}, setItem(){} };
 const TUNNELS = __TUNNELS__;
 const PAIRS = __PAIRS__;        // /tunnels/pairs answer; null = the read never lands (loader-state test)
+const SUB = __SUB__;            // /tunnels/of answer (a PEER's own rows); null = answer with TUNNELS as before
 const POSTS = [];               // every write the panel makes, so a test can assert what Attach sent
 function fetch(url, opts){
   if (opts && opts.method === 'POST') {
@@ -79,6 +83,9 @@ function fetch(url, opts){
   if (url.indexOf('/tunnels/pairs') >= 0) {
     if (PAIRS === null) return new Promise(function(){});
     return Promise.resolve({ ok:true, json(){ return Promise.resolve(PAIRS); } });
+  }
+  if (url.indexOf('/tunnels/of') >= 0 && SUB !== null) {
+    return Promise.resolve({ ok:true, json(){ return Promise.resolve(SUB); } });
   }
   const body = url.indexOf('/ssh-hosts') >= 0 ? {hosts:['TESTHOST']} : TUNNELS;
   return Promise.resolve({ ok:true, json(){ return Promise.resolve(body); } });
@@ -109,26 +116,37 @@ setTimeout_(() => {
     const list = ELS['rnet-list'];
     const rows = list.children.length;
     const html = list.children.map(collect).join(' | ');
-    const add = ELS['rnet-add'], plus = ELS['rnet-plus'], dl = ELS['rnet-hosts'];
+    const add = ELS['rnet-add'], plus = ELS['rnet-plus'], dl = ELS['rnet-hosts'], fs = ELS['rnet-from'];
     process.stdout.write(JSON.stringify({rows:rows, html:html, errors:console_err,
-      addHidden:!!add.hidden, plusHidden:!!plus.hidden, hostsHtml:String(dl.innerHTML||''),
-      posts:POSTS, alerts:ALERTS}));
-    process.exit(0);   // the panel re-arms its own poll timer forever, so exit once measured
+      addHidden:!!add.hidden, plusHidden:!!plus.hidden,
+      hosts:dl.children.map(function(o){return o.value;}), hostsHtml:String(dl.innerHTML||''),
+      hostsLastDisabled:!!(dl.children.length&&dl.children[dl.children.length-1].disabled),
+      fromOpts:fs.children.map(function(o){return [o.value, o.textContent];}), fromHtml:String(fs.innerHTML||''),
+      htmlSets:HTML_SETS, posts:POSTS, alerts:ALERTS}), function(){process.exit(0);});
+    // exit once the measurement has FLUSHED: a pipe write is asynchronous, and exit() right after it cut a
+    // 600-row report mid-string (unterminated JSON); the panel re-arms its own poll timer forever otherwise
   }, 40);
 }, 60);
 """
 
 
-class RemotesPanelRender(unittest.TestCase):
-    def _run(self, drive="", tunnels=None, pairs=None):
+class _PanelHarness:
+    """Runs the real panel JS in node against the DOM stub above and returns what it measured. A MIXIN with
+    no tests of its own, so the classes below share the driver without inheriting each other's tests (a
+    subclass of a TestCase re-runs every inherited test — three copies of 26 node spawns, review find)."""
+
+    def _run(self, drive="", tunnels=None, pairs=None, sub=None):
         js = (HARNESS.replace("__PANEL_JS__", km._LANDING_REMOTES_JS)
                      .replace("__TUNNELS__", json.dumps(tunnels if tunnels is not None else TUNNELS))
                      .replace("__PAIRS__", json.dumps(pairs))
+                     .replace("__SUB__", json.dumps(sub))
                      .replace("__DRIVE__", drive))
         p = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=30)
         self.assertEqual(p.returncode, 0, "panel JS crashed:\n%s" % p.stderr[-2000:])
         return json.loads(p.stdout or "{}")
 
+
+class RemotesPanelRender(_PanelHarness, unittest.TestCase):
     def test_an_attached_host_renders_a_row(self):
         out = self._run()
         self.assertEqual(out.get("errors"), [], "the refresh must not report a failure")
@@ -289,8 +307,9 @@ class RemotesPanelRender(unittest.TestCase):
         tun = json.loads(json.dumps(TUNNELS))
         tun["known"] = [{"host": "otherbox", "trust": "trusted", "lastAttachedAt": 1}]
         out = self._run(tunnels=tun)
-        self.assertIn("TESTHOST", out.get("hostsHtml", ""))
-        self.assertIn("otherbox", out.get("hostsHtml", ""))
+        self.assertIn("TESTHOST", out.get("hosts", []))
+        self.assertIn("otherbox", out.get("hosts", []))
+        self.assertEqual(out.get("hostsHtml"), "", "the datalist is built from option elements, never markup (2026-09-08)")
 
     def test_a_down_host_says_it_is_still_being_dialed_and_when(self):
         # romp never stops dialing an attached host (the user 2026-07-29), so the row's job is to prove
@@ -359,7 +378,121 @@ class RemotesPanelRender(unittest.TestCase):
         self.assertIn("/tunnels/pairs", js)
 
 
-class PendingHostsRowCopy(RemotesPanelRender):
+# A hostile string in every place a peer gets to choose one. Markers are chosen so a raw one is unambiguous
+# in any innerHTML the panel assigned (`<img src=x` / `<script` / `" onmouseover=`) and its escaped form is
+# equally unambiguous (`&lt;img src=x`).
+IMG = "<img src=x onerror=alert(1)>"
+QUOTE = 'x" onmouseover="alert(1)'
+SCRIPT = "<script>alert(1)</script>"
+
+
+class PeerStringsRenderAsText(_PanelHarness, unittest.TestCase):
+    """Every string a PEER chooses reaches this panel through innerHTML — a host it named (a checked-in
+    peer names itself; the rows /tunnels/of relays are a peer's whole list), its status word, its build,
+    the bus gossip (tiers, relay hosts, holds). They were concatenated into markup as they came, so a
+    hostile or merely odd peer scripted the dashboard that displayed it (2026-09-08). Executed against the
+    real panel JS: every innerHTML the panel assigned is recorded, and none may carry a raw marker while
+    the escaped text must actually be shown (rendered as text, not dropped)."""
+
+    def _assert_inert(self, out, *markers):
+        sets = out.get("htmlSets", [])
+        self.assertTrue(sets, "the panel rendered something")
+        for h in sets:
+            for m in ("<img src=x", "<script", '" onmouseover='):
+                self.assertNotIn(m, h, "a peer string reached innerHTML as markup:\n%s" % h[:400])
+        html = out.get("html", "")
+        for m in markers:
+            self.assertIn(m, html, "the hostile string must still be SHOWN, as text")
+
+    def test_a_peer_named_host_build_status_and_gossip_render_as_text_on_the_main_rows(self):
+        tn = json.loads(json.dumps(TUNNELS))
+        tn["tunnels"][0].update({"host": "TEST" + IMG + "HOST", "status": "up", "outOfDate": True,
+                                 "behindBy": 2, "aheadBy": 0, "kernelSha": "abc" + QUOTE,
+                                 "kernelVer": "v1" + SCRIPT, "localSha": "def5678", "localVer": "v0.2.0",
+                                 "kernelDate": "<b>2026</b>", "stale": True, "lastOk": 1785272930})
+        tn["peerTiers"] = {"TEST" + IMG + "HOST": "<i>trusted</i>"}
+        tn["known"] = [{"host": "known" + IMG, "trust": "trusted", "lastAttachedAt": 1, "attached": True}]
+        tn["viaReach"] = [{"host": "relay" + IMG, "via": "hub" + QUOTE, "agents": "<u>3</u>", "trust": "directed"}]
+        tn["remoteHolds"] = [{"atHost": "holder" + IMG, "frm": "a", "to": "b", "gist": QUOTE, "origin": "a"}]
+        out = self._run(tunnels=tn)
+        self.assertEqual(out.get("errors"), [], "the render must not throw on any of it")
+        self._assert_inert(out, "TEST&lt;img src=x onerror=alert(1)&gt;HOST", "abc" + "x&quot; onmouseover=&quot;alert(1)",
+                           "v1&lt;script&gt;", "&lt;i&gt;trusted&lt;/i&gt;", "known&lt;img", "relay&lt;img",
+                           "hub" + "x&quot; onmouseover", "holder&lt;img")
+        # the completions list carries the raw NAME as an option value — a value, not markup
+        self.assertIn("TEST" + IMG + "HOST", out.get("hosts", []))
+        self.assertEqual(out.get("hostsHtml"), "")
+
+    def test_the_connect_from_select_is_option_elements_naming_the_up_hosts(self):
+        tn = json.loads(json.dumps(TUNNELS))
+        tn["tunnels"][0]["host"] = "up" + QUOTE
+        out = self._run(tunnels=tn)
+        self.assertEqual(out.get("fromHtml"), "", "no markup was assigned to the select (2026-09-08)")
+        self.assertEqual(out.get("fromOpts"), [["", "from: this machine"], ["up" + QUOTE, "from: up" + QUOTE]])
+
+    def test_a_peers_own_rows_in_the_connections_expand_render_as_text(self):
+        # The stub has no selector engine, so the expand toggle is stood in for: a button the panel finds
+        # under `button[data-x]`, whose data-x names the up host — the panel binds its onclick on render,
+        # the drive re-renders (a hostsPending post) and clicks it, and the /tunnels/of stub answers SUB.
+        sub = {"ok": True, "of": "TESTHOST", "tunnels": [{
+            "host": "peer" + IMG, "status": "up" + SCRIPT, "outOfDate": True, "behindBy": 1, "aheadBy": 0,
+            "kernelSha": "abc" + QUOTE, "kernelVer": "v9" + SCRIPT, "localSha": "def5678", "localVer": "v0.2.0",
+            "trust": "directed", "fastForward": True, "hasToken": True, "localPort": 5, "kernelPort": 6}]}
+        drive = ("var BTN=mkEl('button');BTN.getAttribute=function(){return 'TESTHOST';};"
+                 "ELS['rnet-list'].querySelectorAll=function(sel){return sel==='button[data-x]'?[BTN]:[];};"
+                 + PendingHostsRowCopy.DELIVER + "BTN.click();")
+        out = self._run(drive=drive, sub=sub)
+        self.assertEqual(out.get("errors"), [])
+        html = out.get("html", "")
+        self.assertIn("rnet-subrow", html, "the expand rendered the peer's rows")
+        self._assert_inert(out, "peer&lt;img src=x onerror=alert(1)&gt;", "up&lt;script&gt;", "v9&lt;script&gt;")
+
+    def test_rows_the_kernel_left_out_are_said_beneath_the_rows_that_passed(self):
+        # tunnels_of counts the peer rows it dropped (no host ssh would accept) as `dropped`; a list that is
+        # simply shorter would be a silent thinning, so the note names the count — as text — in BOTH panels
+        # (strip.ts droppedRowsNote wears the same sentence; net-remote-controls.test.ts pins the pair)
+        sub = {"ok": True, "of": "TESTHOST", "dropped": 2,
+               "tunnels": [{"host": "peerbox", "status": "up", "trust": "directed", "hasToken": True}]}
+        drive = ("var BTN=mkEl('button');BTN.getAttribute=function(){return 'TESTHOST';};"
+                 "ELS['rnet-list'].querySelectorAll=function(sel){return sel==='button[data-x]'?[BTN]:[];};"
+                 + PendingHostsRowCopy.DELIVER + "BTN.click();")
+        out = self._run(drive=drive, sub=sub)
+        self.assertEqual(out.get("errors"), [])
+        html = out.get("html", "")
+        self.assertIn("peerbox", html, "the rows that passed still render")
+        self.assertIn("2 rows from TESTHOST had no usable host and were left out", html)
+        one = json.loads(json.dumps(sub)); one["dropped"] = 1; one["tunnels"] = []
+        html1 = self._run(drive=drive, sub=one).get("html", "")
+        self.assertIn("1 row from TESTHOST had no usable host and was left out", html1)
+        self.assertNotIn("has no hosts attached", html1, "a list emptied by the drop is not 'no hosts attached'")
+
+    def test_a_cut_completions_list_says_how_many_it_left_out(self):
+        # 600 remembered hosts + the attached one: 512 option values, then ONE disabled marker naming the rest
+        # (strip.ts fillHostSelect and the connect-from select wear the same marker)
+        tun = json.loads(json.dumps(TUNNELS))
+        tun["known"] = [{"host": "h%d" % i, "trust": "directed", "lastAttachedAt": 1} for i in range(600)]
+        out = self._run(tunnels=tun)
+        hosts = out.get("hosts", [])
+        self.assertEqual(len(hosts), 513)
+        self.assertEqual(hosts[-1], "\u2026 89 more not shown")
+        self.assertTrue(out.get("hostsLastDisabled"), "the marker is not a pickable host")
+        self.assertFalse(any("\u2026" in h for h in hosts[:-1]), "the marker is the only non-host entry")
+
+    def test_the_markup_sinks_no_longer_interpolate_a_peers_strings_raw(self):
+        js = km._LANDING_REMOTES_JS
+        self.assertIn("function esc(s)", js, "one escape helper, beside the panel's other one-liners")
+        # the rail icon's hover summary keeps a raw `(LBL[t.status]||t.status)`: that is a title PROPERTY (text)
+        for gone in ("'<b>'+t.host+'</b>'", "'<b>'+s.host+'</b>'", "'<b>'+k.host+'</b>'", "'<b>'+v.host+'</b>'",
+                     "'<b>'+hn+'</b>'", "(LBL[t.status]||t.status)+((t.status", "(LBL[t.status]||t.status)+'.'",
+                     "(LBL[s.status]||s.status)+sver", "dl.innerHTML=", "fromSel.innerHTML=", "t.token"):
+            self.assertNotIn(gone, js, "a raw peer string in a markup sink came back: %s" % gone)
+        self.assertEqual(js.count("document.createElement('option')"), 4,
+                         "the completions datalist and the connect-from select build option ELEMENTS — each its "
+                         "hosts plus the one disabled cut marker")
+        self.assertIn("t.hasToken", js, "the row reads the fact of a token, never the token")
+
+
+class PendingHostsRowCopy(_PanelHarness, unittest.TestCase):
     """The panel must not contradict a blank board (the user 2026-09-02): after a kernel restart or a
     phone re-foreground the panes can show no trace of an attached host for a while (their relay
     sockets are still (re)dialing, the first payload has not landed) while this panel's row, read off

@@ -1177,9 +1177,13 @@ export class FederationManager {
     } catch (e) {
       return;
     }
-    const want = new Map<string, any>(tunnels.filter((t) => t.token && t.localPort).map((t) => [t.host, t]));
+    // `hasToken`, never the token: the kernel publishes whether a remote's credential EXISTS, and the
+    // relay it dials through (/remote/<host>/ws, _remote_ws) injects that credential itself — so the
+    // page never holds a remote's reusable secret (2026-09-08). A row without one has no admin path
+    // to that kernel and is not dialed.
+    const want = new Map<string, any>(tunnels.filter((t) => t.hasToken && t.localPort).map((t) => [t.host, t]));
     let opened = false;
-    for (const [host, t] of want) if (!this.conns.has(host)) { this.openRemote(host, t.token, t.status === "up"); opened = true; }
+    for (const [host, t] of want) if (!this.conns.has(host)) { this.openRemote(host, t.status === "up"); opened = true; }
     for (const host of [...this.conns.keys()]) if (!want.has(host)) this.closeRemote(host);
     // A host just ATTACHED is pending from this moment, not from the next push that happens to land:
     // re-emit the merged payloads so the placeholders appear at the attach event. Each emission holds
@@ -1221,20 +1225,20 @@ export class FederationManager {
     if (changed) window.dispatchEvent(new Event("romp-hosts"));   // panes repaint their disconnected marks
   }
 
-  private openRemote(host: string, token: string, live: boolean): void {
+  private openRemote(host: string, live: boolean): void {
     // Dial the remote through THIS kernel's /remote/<host>/ws relay, on the same origin that served
     // the page — never at 127.0.0.1:<forwarded port>, which only exists on the kernel's machine:
     // from a phone reading the dashboard over `tailscale serve`, that address is the phone itself,
     // and every remote host silently vanished with no disconnected mark (the user 2026-07-30).
-    // Same-origin also means the local auth cookie rides the upgrade; the ?token (the remote
-    // kernel's credential, from /tunnels) is re-checked and rewritten by the relay either way.
+    // Same-origin also means the local auth cookie rides the upgrade; the remote kernel's own
+    // credential is added by the relay (_remote_ws), so this URL carries no token at all.
     const proto = location.protocol === "https:" ? "wss://" : "ws://";
     // …carrying this dashboard's `wid`, exactly as the pane's own local socket does. Without it a remote
     // kernel sees every federated viewer as one anonymous client and BROADCASTS its per-viewer messages,
     // so one dashboard's jump to a remote session yanked every other open dashboard to that tab — the
     // very cross-window yank the local path fixed (the user 2026-07-29).
     const w = dashboardWid();
-    const url = `${proto}${location.host}/remote/${encodeURIComponent(host)}/ws?app=${encodeURIComponent(this.app)}&token=${encodeURIComponent(token)}`
+    const url = `${proto}${location.host}/remote/${encodeURIComponent(host)}/ws?app=${encodeURIComponent(this.app)}`
       + (w ? `&wid=${encodeURIComponent(w)}` : "");
     const conn: Conn = { host, ws: null, url, closed: false, live, lastRecv: 0, resumeProvisional: 0, connT: 0, pending: new Map() };
     this.conns.set(host, conn);

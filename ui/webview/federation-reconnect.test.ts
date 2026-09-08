@@ -90,10 +90,11 @@ const localFeed = { type: "feed", asks: [], items: [], working: [], ledgers: [],
 
 test("a relay socket that opens and then goes silent past the bound is abandoned with a breadcrumb, and a fresh one dialed at once", async () => {
   await withManager((fm, _emitted, diag) => {
-    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("TESTHOST", true);
     assert.equal(FakeWS.made.length, 1, "an up host is dialed at once");
     const ws = FakeWS.made[0];
-    assert.match(ws.url, /\/remote\/TESTHOST\/ws\?app=chat&token=tok/, "the dial goes through the local kernel's relay");
+    assert.match(ws.url, /\/remote\/TESTHOST\/ws\?app=chat/, "the dial goes through the local kernel's relay");
+    assert.doesNotMatch(ws.url, /token=/, "…which adds the remote's credential itself; the page never carries one (2026-09-08)");
     ws.open();
     clock += 10_000;
     fm.watchdog(clock);
@@ -127,7 +128,7 @@ test("a relay socket that opens and then goes silent past the bound is abandoned
 
 test("the foreground fast-path kills a socket still CONNECTING, whatever its age — the sleeping tab's unfinished handshake", async () => {
   await withManager((fm, _e, diag) => {
-    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("TESTHOST", true);
     const ws = FakeWS.made[0];              // never opens (readyState 0)
     clock += 1000;
     fm.watchdog(clock);
@@ -142,7 +143,7 @@ test("the foreground fast-path kills a socket still CONNECTING, whatever its age
 
 test("a CLOSED socket whose retry timer was lost is redialed directly (the throttled-tab case)", async () => {
   await withManager((fm) => {
-    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("TESTHOST", true);
     const conn = fm.conns.get("TESTHOST");
     conn.ws.readyState = 3;                 // closed under us with no onclose → no 2s timer armed
     clock += REMOTE_REDIAL_MS + 1000;
@@ -154,12 +155,12 @@ test("a CLOSED socket whose retry timer was lost is redialed directly (the throt
 
 test("a detached host is never touched by the watchdog, and a DOWN tunnel is never dialed by it", async () => {
   await withManager((fm) => {
-    fm.openRemote("TESTHOST", "tok", false);   // /tunnels says not up → no socket
+    fm.openRemote("TESTHOST", false);   // /tunnels says not up → no socket
     assert.equal(FakeWS.made.length, 0);
     clock += 999_999;
     fm.watchdog(clock);
     assert.equal(FakeWS.made.length, 0, "no dial against a tunnel the kernel calls down");
-    fm.openRemote("HOSTB", "tok", true);
+    fm.openRemote("HOSTB", true);
     fm.closeRemote("HOSTB");                  // detach → closed:true
     const n = FakeWS.made.length;
     clock += 999_999;
@@ -177,9 +178,9 @@ test("a detached host is never touched by the watchdog, and a DOWN tunnel is nev
 // foreground pass see fresh sockets and keep them. socketVerdict itself is unchanged.
 test("`resume` stamps every OPEN relay socket's lastRecv — and only the open ones", async () => {
   await withManager((fm) => {
-    fm.openRemote("TESTHOST", "tok", true);
-    fm.openRemote("HOSTB", "tok", true);
-    fm.openRemote("HOSTC", "tok", true);
+    fm.openRemote("TESTHOST", true);
+    fm.openRemote("HOSTB", true);
+    fm.openRemote("HOSTC", true);
     const [a, b, c] = FakeWS.made;
     a.open(); b.open();                                   // c never finishes its handshake (CONNECTING)
     clock += 45_000;                                      // frozen: no JS ran, so no frame was stamped
@@ -194,8 +195,8 @@ test("`resume` stamps every OPEN relay socket's lastRecv — and only the open o
 
 test("thaw: `resume` then the foreground watchdog pass closes NOTHING — and silence AFTER the resume still counts", async () => {
   await withManager((fm, _e, diag) => {
-    fm.openRemote("TESTHOST", "tok", true);
-    fm.openRemote("HOSTB", "tok", true);
+    fm.openRemote("TESTHOST", true);
+    fm.openRemote("HOSTB", true);
     const [a, b] = FakeWS.made;
     a.open(); b.open();
     clock += 45_000;                                      // well past REMOTE_STALE_MS with no frame
@@ -222,7 +223,7 @@ test("thaw: `resume` then the foreground watchdog pass closes NOTHING — and si
 
 test("no `resume` (a browser without Page Lifecycle, or a tab that was hidden but running): the stale verdict still closes on foreground", async () => {
   await withManager((fm, _e, diag) => {
-    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("TESTHOST", true);
     const ws = FakeWS.made[0];
     ws.open();
     clock += 45_000;                                      // 45s with no frame and no resume = real silence
@@ -238,7 +239,7 @@ test("no `resume` (a browser without Page Lifecycle, or a tab that was hidden bu
 
 test("a CONNECTING socket is still killed on foreground after a `resume` — the stamp never reaches an unfinished handshake", async () => {
   await withManager((fm, _e, diag) => {
-    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("TESTHOST", true);
     const ws = FakeWS.made[0];                            // never opens
     clock += 1000;
     fm.resumed(clock);
@@ -263,7 +264,7 @@ test("the document wiring: `resume` then `visibilitychange`→visible keeps an o
     fm.watchLifecycle(doc);
     assert.equal((listeners.resume || []).length, 1, "one resume listener");
     assert.equal((listeners.visibilitychange || []).length, 1, "one visibilitychange listener");
-    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("TESTHOST", true);
     const ws = FakeWS.made[0];
     ws.open();
     clock += 45_000;
@@ -298,8 +299,8 @@ test("a resumed keep is provisional: silence after the thaw is put down at REMOT
       fire(t: string) { for (const fn of listeners[t] || []) fn(); },
     };
     fm.watchLifecycle(doc);
-    fm.openRemote("TESTHOST", "tok", true);
-    fm.openRemote("HOSTB", "tok", true);
+    fm.openRemote("TESTHOST", true);
+    fm.openRemote("HOSTB", true);
     const [a, b] = FakeWS.made;
     a.open(); b.open();
     clock += 1000;
@@ -347,7 +348,7 @@ test("a socket already overdue before the freeze is not stamped by `resume`: the
       fire(t: string) { for (const fn of listeners[t] || []) fn(); },
     };
     fm.watchLifecycle(doc);
-    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("TESTHOST", true);
     const ws = FakeWS.made[0];
     ws.open();
     const opened = clock;
@@ -390,7 +391,7 @@ test("mergeHostTimelines names attached hosts that have no lanes payload yet, an
 test("the merged lanes emission carries the pending set, so the timeline can draw its placeholder rows", async () => {
   await withManager((fm, emitted) => {
     fm.app = "timeline";
-    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("TESTHOST", true);
     fm.inbound("", { type: "data", data: { sessions: [{ id: U, name: "web" }], turns: {}, messages: [], judging: [], now: 1000 } });
     const lanes = emitted.filter((m) => m.type === "data").pop();
     assert.deepEqual(lanes.data.pendingHosts, ["TESTHOST"]);
@@ -405,7 +406,7 @@ test("the merged lanes emission carries the pending set, so the timeline can dra
 test("each pane tells the shell which hosts IT still waits on — by its own channel, on change only", async () => {
   await withManager((fm, _e, _d, posted) => {
     fm.app = "feed";
-    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("TESTHOST", true);
     fm.inbound("", localFeed);
     assert.deepEqual(posted.pop(), { romp: "hostsPending", app: "feed", hosts: ["TESTHOST"] },
       "the feed pane pends TESTHOST until its feed payload lands");
@@ -417,7 +418,7 @@ test("each pane tells the shell which hosts IT still waits on — by its own cha
   });
   await withManager((fm, _e, _d, posted) => {
     fm.app = "timeline";
-    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("TESTHOST", true);
     fm.inbound("", { type: "data", data: { sessions: [], turns: {}, messages: [], judging: [], now: 1000 } });
     assert.deepEqual(posted.pop(), { romp: "hostsPending", app: "timeline", hosts: ["TESTHOST"] },
       "the timeline pends on the LANES channel, not the feed");
@@ -430,7 +431,7 @@ test("each pane tells the shell which hosts IT still waits on — by its own cha
 test("a host that ATTACHES is pending from that moment: the poll re-emits the merged payloads it can complete", async () => {
   const g: any = globalThis;
   const hadFetch = "fetch" in g, prevFetch = g.fetch;
-  g.fetch = async () => ({ json: async () => ({ tunnels: [{ host: "TESTHOST", token: "tok", localPort: 5, status: "up" }] }) });
+  g.fetch = async () => ({ json: async () => ({ tunnels: [{ host: "TESTHOST", hasToken: true, localPort: 5, status: "up" }] }) });
   try {
     await withManager(async (fm, emitted) => {
       fm.app = "feed";
@@ -450,7 +451,7 @@ test("a host that ATTACHES is pending from that moment: the poll re-emits the me
 test("…but never drops an EMPTY merged feed onto a page still waiting for its local kernel", async () => {
   const g: any = globalThis;
   const hadFetch = "fetch" in g, prevFetch = g.fetch;
-  g.fetch = async () => ({ json: async () => ({ tunnels: [{ host: "TESTHOST", token: "tok", localPort: 5, status: "up" }] }) });
+  g.fetch = async () => ({ json: async () => ({ tunnels: [{ host: "TESTHOST", hasToken: true, localPort: 5, status: "up" }] }) });
   try {
     await withManager(async (fm, emitted) => {
       fm.app = "feed";
@@ -466,7 +467,7 @@ test("…but never drops an EMPTY merged feed onto a page still waiting for its 
 test("the CHAT pane pends on the TAB LIST channel — the set its pin prune reads as __rompFed.pending (render.ts reachableHosts): an attached host pends from openRemote until its own tabOrder lands here, whatever else arrives; a detach retires it", async () => {
   await withManager((fm) => {
     fm.app = "chat";
-    fm.openRemote("TESTHOST", "tok", true);
+    fm.openRemote("TESTHOST", true);
     assert.deepEqual(fm.pendingFor(), ["TESTHOST"], "attached and dialed, no tab list from it yet");
     fm.inbound("", { type: "tabOrder", order: [U], tabs: [{ id: U, name: "web" }] });
     assert.deepEqual(fm.pendingFor(), ["TESTHOST"], "the LOCAL list is not the remote's");
@@ -477,4 +478,34 @@ test("the CHAT pane pends on the TAB LIST channel — the set its pin prune read
     fm.closeRemote("TESTHOST");
     assert.deepEqual(fm.pendingFor(), [], "detached: in no list at all");
   });
+});
+
+// ── the page never holds, nor sends, a remote's credential (2026-09-08) ──────────────────────────────
+// /tunnels used to ship each remote's serve token to the page, and the dial URL carried it back — even
+// though the relay (_remote_ws) injects that token itself. The row now says only whether one exists.
+test("the poll dials the hosts that HAVE a token, and no dial URL carries a token — not even one a row still ships", async () => {
+  const g: any = globalThis;
+  const hadFetch = "fetch" in g, prevFetch = g.fetch;
+  const LEAKED = "remote-secret-DO-NOT-USE";
+  g.fetch = async () => ({ json: async () => ({ tunnels: [
+    { host: "TESTHOST", hasToken: true, localPort: 5, status: "up" },
+    { host: "HOSTB", hasToken: false, localPort: 6, status: "up" },          // no admin path to it: not dialed
+    { host: "HOSTC", hasToken: true, token: LEAKED, localPort: 7, status: "up" },   // an older kernel's row shape
+  ] }) });
+  try {
+    await withManager(async (fm) => {
+      fm.app = "feed";
+      await fm.poll();
+      assert.deepEqual([...fm.conns.keys()].sort(), ["HOSTC", "TESTHOST"], "hasToken gates the dial; HOSTB is left alone");
+      assert.equal(FakeWS.made.length, 2, "one socket per dialed host");
+      for (const ws of FakeWS.made) {
+        assert.match(ws.url, /\/remote\/(TESTHOST|HOSTC)\/ws\?app=feed/, "through the local kernel's relay");
+        assert.doesNotMatch(ws.url, /token=/, "the relay adds the remote's credential; the page sends none");
+        assert.ok(!ws.url.includes(LEAKED), "a token a row still carries never leaves the page");
+      }
+      for (const c of fm.conns.values()) c.closed = true;
+    });
+  } finally {
+    if (hadFetch) g.fetch = prevFetch; else delete g.fetch;
+  }
 });
