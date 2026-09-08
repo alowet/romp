@@ -63,6 +63,18 @@ export function atBottomDist(dist: number): boolean {
   return dist <= AT_BOTTOM_PX;
 }
 
+/** A box BELOW the transcript changed height (T262e, the user 2026-09-08: the awaiting/background-task box appeared
+ *  over the last lines and the pane fell into scrolled-up mode by itself; the composer auto-growing does the same).
+ *  A box below the scroller changes only the scroller's clientHeight: the browser keeps scrollTop and fires no
+ *  scroll event, so a reader at the bottom is silently the box's height above it, and the next append reads
+ *  atBottom false and leaves them there. The rule is the OPPOSITE of the boxes-above compensation: the reader's
+ *  RECORDED follow mode (`stick`, still the pre-growth truth because nothing scrolled) decides — on, and any
+ *  height change, they are written to the new bottom (a shrink is a no-op write: the clamp is already there);
+ *  off, nothing moves — their top line never did. Pure, so node executes it. */
+export function followBoxBelow(stick: boolean, dh: number): boolean {
+  return stick && dh !== 0;
+}
+
 /** Follow-the-tail after an append, for a reader whose view is in follow mode (T262, the user 2026-09-08: "jumped
  *  up slightly on my scroll" in busy sessions). A tab within the old 80 px band used to be pinned to the bottom on
  *  EVERY frame the pane received — including a status-only tail that changed no content — so a reader wheeling

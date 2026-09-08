@@ -54,7 +54,7 @@ import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser
 import { pastedFilePath } from "./paste-path";
 import { insertAtCaret } from "./composer-insert";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
-import { followReader, keepPlaceAcrossShow, followTail, atBottomDist } from "./scroll-keep";
+import { followReader, keepPlaceAcrossShow, followTail, atBottomDist, followBoxBelow } from "./scroll-keep";
 import { retainLiveOmitted } from "./tab-order";
 import { userTurnShows } from "./user-turn-content";
 import { ScrollDiagBudget, classifyScroll, scrollWriteRow } from "./scroll-write";
@@ -9312,7 +9312,7 @@ function writeScroll(content: HTMLElement, top: number, writer: string, stick = 
   content.scrollTop = top;
   const after = content.scrollTop;
   lastScrollWriteAfter = after;
-  if (after !== before) scrollDiagRow("scrollwrite", scrollWriteRow(activeId || "", writer, before, after, stick));
+  if (after !== before) scrollDiagRow("scrollwrite", scrollWriteRow(activeId || "", writer, before, after, stick, content.scrollHeight, content.clientHeight));
 }
 
 function cssEscape(s: string): string {
@@ -10558,7 +10558,7 @@ window.addEventListener("resize", updateJumpBtn);
     // the scroll nobody's code asked for is the user's (T262): filed so a recording lines up with the journal;
     // a write's own echo (within a pixel of the value written) is consumed here and never read as a gesture
     if (classifyScroll(c.scrollTop, lastScrollWriteAfter) === "write-echo") lastScrollWriteAfter = null;
-    else scrollDiagRow("scrollgesture", { sid: activeId || "", top: c.scrollTop, gesture: true });
+    else scrollDiagRow("scrollgesture", { sid: activeId || "", top: c.scrollTop, gesture: true, sh: c.scrollHeight, ch: c.clientHeight });   // sh/ch: a clamp reads top == sh - ch after sh dropped (T262e)
   }, { passive: true });
 }
 // Boxes ABOVE the transcript grow/shrink → keep the chat text visually anchored (the user 2026-06-30 for
@@ -10586,6 +10586,33 @@ if (typeof ResizeObserver === "function") {
       lastH = h;
     });
     tro.observe(box);
+  }
+}
+// Boxes BELOW the transcript — #bg-tasks (the awaiting/background-task box) and #footer (statusline + the
+// composer, which auto-grows as a message is typed) — grow/shrink → an at-bottom reader STAYS at the bottom
+// (T262e, the user 2026-09-08: the box appeared over the last lines and the pane fell into scrolled-up mode by
+// itself). A box below changes only #content's clientHeight: the browser keeps scrollTop and fires no scroll
+// event, so the reader who was at the bottom is now the box's height above it with the text covered, and the
+// next append reads atBottom false and leaves them there. The rule is the OPPOSITE of the boxes-above one: the
+// view's RECORDED follow mode (`stick` — still the pre-growth truth, nothing scrolled) decides (followBoxBelow),
+// and a follow-mode reader is written to the new bottom; a scrolled-up reader is untouched (their top line never
+// moved). Event-based (the observer), no timer.
+if (typeof ResizeObserver === "function") {
+  for (const boxId of ["bg-tasks", "footer"]) {
+    const box = document.getElementById(boxId);
+    if (!box) continue;
+    let lastH = -1;                                           // -1 = not yet measured (observe fires once on attach)
+    const bro = new ResizeObserver((entries) => {
+      const h = entries[0]?.contentRect?.height ?? 0;
+      const content = document.getElementById("content");
+      const v = activeId ? views.get(activeId) : null;
+      if (content && lastH >= 0 && content.clientHeight > 0 && v && v.shown && followBoxBelow(v.stick, h - lastH)) {
+        writeScroll(content, content.scrollHeight, "box-below", true);
+        v.scrollTop = content.scrollTop;                      // keep the per-view saved position in sync
+      }
+      lastH = h;
+    });
+    bro.observe(box);
   }
 }
 

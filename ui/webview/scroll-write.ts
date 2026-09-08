@@ -35,7 +35,12 @@ export function classifyScroll(scrollTop: number, lastWriteAfter: number | null)
   return lastWriteAfter != null && Math.abs(scrollTop - lastWriteAfter) <= 1 ? "write-echo" : "gesture";
 }
 
-/** The breadcrumb for one write that moved the view. */
-export function scrollWriteRow(sid: string, writer: string, before: number, after: number, stick: boolean) {
-  return { sid, writer, before, after, delta: after - before, stick, gesture: false as const };
+/** The breadcrumb for one write that moved the view. `sh`/`ch` = #content's scrollHeight/clientHeight after the
+ *  write (T262e, the user 2026-09-08: their laptop's rows showed the view moving UP by the same 95 px on two
+ *  sessions with no write between the rows — an UNWRITTEN move, which the rows could not classify: a browser
+ *  CLAMP after the transcript's tail shrank (scrollHeight drops, the new top equals scrollHeight − clientHeight)
+ *  reads exactly like the browser's scroll anchoring absorbing a layout change above the viewport (scrollHeight
+ *  unchanged). With both numbers on every row the next log tells them apart in one pass.) */
+export function scrollWriteRow(sid: string, writer: string, before: number, after: number, stick: boolean, sh = 0, ch = 0) {
+  return { sid, writer, before, after, delta: after - before, stick, gesture: false as const, sh, ch };
 }
