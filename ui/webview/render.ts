@@ -9807,8 +9807,15 @@ function toggleToolGroup(key: string): void {
 // next syncView rebuilds it via the right path, then repaint the active one.
 function rerenderAll(): void {
   cancelPrebuild(); // the queued plan is now stale (every view reset below) — re-warm after showActive
+  // The reader's place, captured BEFORE the clear below empties the active view (T249 review find, 2026-09-08):
+  // a settings change re-renders the transcript under a reader who may be scrolled up, and once the DOM is
+  // gone there is no anchor to capture and the box no longer overflows. Near the bottom → nothing to keep
+  // (follow mode lands there); a hidden pane has nothing to keep either. showActive restores it after the land.
+  const content = document.getElementById("content");
+  const av = activeId ? views.get(activeId) : null;
+  const keep = av && av.shown && content && content.clientHeight > 0 && !nearBottom(content) ? captureScrollAnchor(content, av) : null;
   for (const v of views.values()) { while (v.el.firstChild) v.el.removeChild(v.el.firstChild); v.rendered = 0; v.stale = false; v.winStart = 0; v.winEnd = 0; v.avgTurnH = undefined; v.spacerCount = undefined; v.spacerCountBot = undefined; v.unitTotal = undefined; }
-  showActive();
+  showActive(keep);
   schedulePrebuild(); // rebuild every off-screen view in idle under the new setting, so switches stay instant
 }
 
@@ -9955,7 +9962,10 @@ function runPrebuild(deadline: IdleDeadline): void {
   renderingOwnerSid = savedOwnerSid;
 }
 
-function showActive() {
+// `keep` (review find, 2026-09-08): a caller that must EMPTY the view before showing it (rerenderAll on a
+// settings change) captures the reader's anchor first and hands it here — by the time this runs there is
+// no DOM left to capture from and the emptied box no longer overflows. undefined = capture here.
+function showActive(keep?: { uuid: string; y: number } | null) {
   const content = document.getElementById("content");
   if (!content) return;
   placeReviveLoader();   // session-local: shows over THIS pane only while the reviving tab is active
@@ -10025,8 +10035,11 @@ function showActive() {
   // rebuild the way appendActive does, restored after landActive; a tab switch is not a re-show (the
   // entering view is still display:none), so the leaving-tab save, the nav trail's spot and the jump
   // button keep their explicit semantics. The decision and the saved-spot rule live in scroll-keep.ts.
-  const reshow = keepPlaceAcrossShow(v, v.el.style.display !== "none", content.clientHeight > 0, !!pendingAnchor || pendingAnchorT != null);
-  const keepAnchor = reshow && !nearBottom(content) ? captureScrollAnchor(content, v) : null;
+  // a live durable seek for this tab is navigation too: landActive re-arms pendingAnchor from it after this
+  // decision, and a restore over its landing would undo the jump the reader asked for (review find, 2026-09-08)
+  const navigating = !!pendingAnchor || pendingAnchorT != null || (!!seek && seek.sid === activeId);
+  const reshow = keepPlaceAcrossShow(v, v.el.style.display !== "none", content.clientHeight > 0, navigating);
+  const keepAnchor = reshow ? (keep !== undefined ? keep : (!nearBottom(content) ? captureScrollAnchor(content, v) : null)) : null;
   // Bound the switch. A view the user scrolled to the top of has had its window expanded to the WHOLE
   // transcript (winStart crept to 0 via lazy-expand), and compact mode renders the whole folded stream —
   // either way, revealing thousands of nodes is the big-session switch lag (the user 2026-06-25: 4144 turns
@@ -10035,8 +10048,9 @@ function showActive() {
   // scrolling up lazily reloads. Both render paths honour winStart, so this works in either mode. Skip when
   // a deep-link is pending (its target may be in the collapsed head). A small view (≤ cap) is left untouched
   // → the no-op fast path reveals it instantly.
+  // …and a SWITCH rule only: a re-show of the view on screen never snaps it to the tail (T249)
   if (!reshow && !pendingAnchor && pendingAnchorT == null
-      && v.el.querySelectorAll(".turn").length > WINDOW_CAP) {   // a SWITCH rule: a re-show of the view on screen never snaps it to the tail (T249)
+      && v.el.querySelectorAll(".turn").length > WINDOW_CAP) {
     v.rendered = 0; v.winStart = 0; v.avgTurnH = undefined; v.stick = true;   // → firstBuild rebuilds the tail, lands at bottom
   }
   for (const [vid, vv] of views) vv.el.style.display = vid === activeId ? "" : "none";
@@ -10328,12 +10342,19 @@ window.addEventListener("resize", updateJumpBtn);
 // shown tab (a fork/first-build frame, a settings rerender, a revive failure, a dismissal's fallback)
 // snapped the reader back there. Every scroll of the active view now records its position and its
 // follow-mode (the same nearBottom threshold appendActive and the jump chip read), passive, no timer.
-// Programmatic scrolls (a land, an anchor restore) fire the same event, so the record is always the truth.
+// Programmatic scrolls (a land, an anchor restore) fire the same event, so the record is always the truth —
+// with ONE exception, the transient a DEFERRED build leaves (review find, 2026-09-08): showActive reveals
+// the entering view before its heavy build runs in the next frame, the browser clamps scrollTop to that
+// stale or empty DOM's bottom, and the clamp's scroll event is dispatched BEFORE the frame callback that
+// lands the view — recorded, it read as "the reader is at the bottom" and the land went there instead of
+// the saved spot (a compact-mode switch to a tab with an unbuilt update; a settings rerender). While a
+// build is pending the position is the clamp's, not the reader's, so nothing is recorded; the build's own
+// land fires the next scroll event, and that one is the truth. The pending build is the event, no timer.
 {
   const c = document.getElementById("content");
   if (c) c.addEventListener("scroll", () => {
     if (c.clientHeight <= 0) return;
-    followReader(activeId ? views.get(activeId) : null, c.scrollTop, nearBottom(c));
+    followReader(activeId ? views.get(activeId) : null, c.scrollTop, nearBottom(c), pendingBuildRaf != null);
   }, { passive: true });
 }
 // Boxes ABOVE the transcript grow/shrink → keep the chat text visually anchored (the user 2026-06-30 for
