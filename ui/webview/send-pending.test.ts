@@ -762,3 +762,22 @@ test("the landed bubble's hover says when the message was SENT, once the landing
   // render.ts applies it to the landed user bubble's title, from the kernel's two stamps (never the client's clock)
   assert.match(RENDER, /const sentTip = sentAtLabel\(ev\.ts, ev\.sentAt\);\s*\n\s*if \(sentTip\) bubble\.title = sentTip;/);
 });
+
+test("our own send in the fed gap: the kernel's echo visible AND its held copy in the group — ours is the one bubble, both kernel copies hidden (T262h review)", () => {
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
+  const p = newPending("hi there", undefined, T0);
+  reconcilePending(tail, [p]);
+  reconcilePending([...tail, { kind: "queued", texts: [{ md: "hi there", qid: "echo:q1", qts: 1 }] }], [p]);
+  assert.equal(p.qid, "echo:q1");
+  // the copy left the queue (fed) and is held by the caller, marked landing; the kernel's echo shows too
+  const frame: TailEvent[] = [...tail, { kind: "user", md: "hi there", uuid: "echo:q1" },
+                              { kind: "queued", texts: [{ md: "hi there", qid: "echo:q1", qts: 1, landing: true }], uuid: "held:s" }];
+  const r = reconcilePending(frame, [p]);
+  assert.deepEqual([r.inject, r.unqueue, r.echoHide], [[p], [p], [1]], "ours drawn; the held copy hidden; the echo hidden");
+  // an id-less send (an older kernel): the same by text
+  const q = newPending("go on", undefined, T0 + 1);
+  reconcilePending(tail, [q]);
+  const frame2: TailEvent[] = [...tail, { kind: "user", md: "go on", uuid: "echo:zz" }, { kind: "queued", texts: [{ md: "go on", landing: true }], uuid: "held:s" }];
+  const r2 = reconcilePending(frame2, [q]);
+  assert.deepEqual([r2.inject, r2.unqueue, r2.echoHide], [[q], [q], [1]]);
+});

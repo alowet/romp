@@ -88,7 +88,7 @@ export type TailEvent = {
   sentAt?: number;      // …with the send time beside it (epoch s), for the bubble's hover
   undelivered?: boolean;
   images?: unknown[];
-  texts?: { md?: string; hiddenByPending?: boolean; qid?: string; qts?: number; cancelable?: boolean }[];   // qid/qts: the copy's identity (T252c); hiddenByPending: render.ts hid this copy for a send drawn as our own bubble
+  texts?: { md?: string; hiddenByPending?: boolean; qid?: string; qts?: number; cancelable?: boolean; landing?: boolean }[];   // landing: a copy the caller holds after it left the kernel's queue (T262i)   // qid/qts: the copy's identity (T252c); hiddenByPending: render.ts hid this copy for a send drawn as our own bubble
   blocks?: string[];    // a user record the CLI wrote from SEVERAL sends taken at one boundary: one text per
                         //   block (kernel.py build_session ships them when there are two or more); `md` is
                         //   the blocks joined, so each block is a copy of its own send
@@ -391,12 +391,11 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
     // the whole of it) — else the first queued copy beyond this entry's press-time count that no
     // earlier entry took this push.
     let covered = false, byQueued = false, byEcho = false;
-    if (echoIdx >= 0) {
-      covered = true; byEcho = true;
-      const u = events[echoIdx].uuid;
-      if (u) for (const q of list) if (q !== p && q.at && q.text === p.text && !q.at.seen.includes(u)) q.at.seen.push(u);
-      if (!p.qid && u) p.qid = u;                  // the echo's uuid is the copy's id: latched (T252c)
-    } else if (p.qid && idCopy >= 0) {
+    // The kernel's QUEUED copy of this send is attributed whether or not an echo also covers it: in the fed gap the
+    // caller holds the copy that left the queue (marked landing) while the kernel's echo shows, and both are this
+    // send's — ours is the one bubble, so the copy is hidden (`unqueue`) beside the hidden echo (T262h review: the
+    // echo cover used to skip the queued attribution, and the held card drew a second bubble).
+    if (p.qid && idCopy >= 0) {
       covered = true; byQueued = true;              // our identified copy is in the queue: exact, whatever its position
       const k = copyIds.indexOf(p.qid);             // …and that position is spoken for on the text path this push: a later
       if (k >= 0) {                                 // same-text send never takes it, nor its id (third review)
@@ -415,6 +414,12 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
         taken.add(k); takenCopies.set(p.text, taken); covered = true; byQueued = true;
         if (copyIds[k] && !p.qid) p.qid = copyIds[k];   // latch the identity of the copy just attributed, when the kernel gave it one
       }
+    }
+    if (echoIdx >= 0) {
+      covered = true; byEcho = true;
+      const u = events[echoIdx].uuid;
+      if (u) for (const q of list) if (q !== p && q.at && q.text === p.text && !q.at.seen.includes(u)) q.at.seen.push(u);
+      if (!p.qid && u) p.qid = u;                  // the echo's uuid is the copy's id: latched (T252c)
     }
     if (covered) p.received = true;             // the kernel holds this send: proven once, latched
     if (p.received) p.lost = undefined;         // the drop is older news than the kernel's own copy
