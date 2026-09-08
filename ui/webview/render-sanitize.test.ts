@@ -15,7 +15,8 @@ const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview"
 
 test("md() sanitizes marked output with DOMPurify before returning HTML", () => {
   assert.match(RENDER, /import DOMPurify from "dompurify";/);
-  const mdFn = RENDER.match(/function md\(src: string\): string \{[\s\S]*?\n\}/)?.[0] || "";
+  // (the signature grew an optional repo parameter for PR links — pr-links.ts — so match it loosely)
+  const mdFn = RENDER.match(/function md\(src: string[^\n]*?\): string \{[\s\S]*?\n\}/)?.[0] || "";
   assert.ok(mdFn, "md() function not found");
   // marked is still used to parse, but its output must pass through DOMPurify.sanitize
   assert.match(mdFn, /marked\.parse\(/);

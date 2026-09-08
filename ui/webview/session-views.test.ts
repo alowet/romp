@@ -59,8 +59,9 @@ test("executed: the canonical key ignores list order AND which key the kernel us
 });
 
 test("the tabOrder frame carries the blob and the strip filters on it, composing with #only", () => {
-  // the frame's provenance rides along since T233 (captureViews still runs FIRST)
-  assert.match(RENDER, /else if \(m\.type === "tabOrder"\) \{\s*\n\s*captureViews\(m\.views \|\| null\);\s*\n\s*applyTabOrder\(m\.order, m\.tabs, \{ reemit: m\.reemit === true, freshHost: typeof m\.freshHost === "string" \? m\.freshHost : undefined \}, m\.live\);\s*\n\s*\}/,
+  // the frame's provenance rides along since T233 (captureViews still runs before the strip is applied; the
+  // kernel's own name, selfHost, is adopted first of all — pr-links.test.ts pins that line)
+  assert.match(RENDER, /else if \(m\.type === "tabOrder"\) \{\s*\n\s*if \(typeof m\.selfHost === "string" && m\.selfHost\) adoptSelfHost\(m\.selfHost\);[^\n]*\n\s*captureViews\(m\.views \|\| null\);\s*\n\s*applyTabOrder\(m\.order, m\.tabs, \{ reemit: m\.reemit === true, freshHost: typeof m\.freshHost === "string" \? m\.freshHost : undefined \}, m\.live\);\s*\n\s*\}/,
     "echo-less frames still reach captureViews — an older kernel must age out a pending edit");
   assert.match(RENDER, /const inViewIds = ids\.filter\(tabInView\);/);
   assert.match(RENDER, /const visibleIds = only \? inViewIds\.filter\(\(id\) => matchesOnly\(nameOf\(id\), only\)\) : inViewIds;/);
@@ -110,7 +111,8 @@ test("federation carries the LOCAL kernel's views blob through merged tabOrder r
   // re-derived from the stored blob before it moves — cleared only when the adoption changes it
   // (federation-views-seq.test.ts executes all four rules)
   assert.match(FED, /if \(host === LOCAL && m\.views && typeof m\.views === "object"\) \{\s*\n\s*if \(adoptViews\(this\.localViews, m\.views, this\.localViewsAnnounced\)\) \{ this\.localViewsAnnounced = announcedAfter\(this\.localViews, m\.views, this\.localViewsAnnounced\); this\.localViews = m\.views; this\.localViewsRejected = null; \}\s*\n\s*else this\.localViewsRejected = m\.views;\s*\n\s*\}/);
-  assert.match(FED, /\{ type: "tabOrder", order, tabs, live, views: this\.localViews \?\? undefined \}/,
+  // the merged frame also carries the LOCAL kernel's own name (selfHost), read from its tabOrder frame (pr-links)
+  assert.match(FED, /\{ type: "tabOrder", order, tabs, live, views: this\.localViews \?\? undefined, selfHost: this\.localSelfHost \|\| undefined \}/,
     "without this the browser dashboard's chat never receives the blob at all");
 });
 

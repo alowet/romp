@@ -393,8 +393,8 @@ test("rendered markdown never carries data-* attributes into the page, in the vi
   const sanitizes = (MD_FN.match(/DOMPurify\.sanitize\([^)]*\)/g) || []);
   assert.equal(sanitizes.length, 1);
   assert.match(sanitizes[0], /ALLOW_DATA_ATTR: false/);
-  const chatMd = (RENDER.split("function md(src: string): string {")[1] || "").split("\nfunction ")[0];
-  assert.match(chatMd, /DOMPurify\.sanitize\(dirty, MD_PURIFY\)/);
+  const chatMd = (RENDER.split("function md(src: string, repo: string | null = prRepoFor()): string {")[1] || "").split("\nfunction ")[0];   // the signature carries the PR-link repo (pr-links.ts)
+  assert.match(chatMd, /DOMPurify\.sanitize\(dirty, \{ \.\.\.MD_PURIFY, RETURN_DOM: true \}\)/);
   assert.match(RENDER, /const MD_PURIFY: Config = \{.*ALLOW_DATA_ATTR: false \};/, "the chat's shared sanitizer config forbids data-*");
   // the viewer's own stamps are set AFTER the sanitize, so they are unaffected
   assert.ok(MD_FN.indexOf("DOMPurify.sanitize(") < MD_FN.indexOf('a.dataset.act = "fv-open"'));

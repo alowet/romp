@@ -606,6 +606,23 @@ function withManager(fn: (fm: FederationManager, emitted: any[], store: Map<stri
 }
 const lastOrder = (emitted: any[]) => emitted.filter((m) => m && m.type === "tabOrder").pop()!.order;
 
+test("the merged tabOrder frame carries the LOCAL kernel's own name (selfHost), never a remote kernel's, and keeps it on a re-emit", () => {
+  // the chat reads a postal card's sender host against its kernel's own name, learned from the tabOrder
+  // frame every chat receives first; the manager re-emits a MERGED frame in place of each host's own, so the
+  // field has to be carried the way the views blob is — and a remote kernel's frame names ITSELF
+  const lastSelf = (emitted: any[]) => emitted.filter((m) => m && m.type === "tabOrder").pop()!.selfHost;
+  withManager((fm, emitted) => {
+    fm.inbound("TESTHOST", { type: "tabOrder", order: [V], tabs: [{ id: V, name: "tests" }], selfHost: "TESTHOST" });
+    assert.equal(lastSelf(emitted), undefined, "a remote kernel's own name is not this dashboard's");
+    fm.inbound("", { type: "tabOrder", order: ["a"], tabs: [{ id: "a", name: "web" }], selfHost: "SELFHOST" });
+    assert.equal(lastSelf(emitted), "SELFHOST");
+    fm.inbound("TESTHOST", { type: "tabOrder", order: [V], tabs: [{ id: V, name: "tests" }], selfHost: "TESTHOST" });
+    assert.equal(lastSelf(emitted), "SELFHOST", "a remote host's report re-emits the merge with the local name still on it");
+    fm.inbound("", { type: "tabOrder", order: ["a"], tabs: [{ id: "a", name: "web" }] });
+    assert.equal(lastSelf(emitted), "SELFHOST", "an older local frame without the field does not unlearn it");
+  });
+});
+
 test("a session created after a remote host attached lands at the END of the merged strip", () => {
   // The 2026-08-10 report: the new session's provisional tab rendered last, then the merged push
   // re-slotted it in front of the remote host's block (host-blocked seed, local first).

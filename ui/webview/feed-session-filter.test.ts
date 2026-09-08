@@ -20,7 +20,10 @@ const U = "11111111-2222-3333-4444-555555555555";
 const V = "99999999-8888-7777-6666-555555555555";
 
 test("the kernel's feed payload carries the chat tab strip's sessions, tab_meta-shaped", () => {
-  assert.ok(KERNEL.includes('"sessions": [{"sid": s["sid"], "name": s.get("name", ""), "color": _name_color(s["sid"])}'));
+  assert.ok(KERNEL.includes('"sessions": [{"sid": s["sid"], "name": s.get("name", ""), "color": _name_color(s["sid"]),'));
+  // …plus the session's GitHub repo (owner/repo or null), for the card text's PR links (pr-links.ts, 2026-09-06),
+  // derived from the SAME cwd the chat frame uses (_session_cwd: the registry's, else the transcript's stamp)
+  assert.ok(KERNEL.includes('"githubRepo": _github_repo_of(_session_cwd(s["sid"], s.get("path")))}'));
   assert.ok(KERNEL.includes("for s in _chat_tab_sessions(now, tmux)]"), "the SAME list the tabs render, in ITS order");
 });
 

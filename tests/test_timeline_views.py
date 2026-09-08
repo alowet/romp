@@ -263,6 +263,9 @@ class TimelineViews(unittest.TestCase):
         self.assertIn('"views": _views_client(),', src, "the timeline payload carries the RENDERED shape")
         self.assertIn('"palette": pal.colors(_palette_name()),', src, "and the palette, for tag colors in every host")
         self.assertIn('_tab_order_frame(tab_order, tab_meta, tmux)', src, "tabOrder pushes carry it (the one frame builder, T258)")
+        # every tabOrder frame is built by ONE helper (2026-09-06: the frame also carries selfHost)
+        self.assertIn('return {"type": "tabOrder", "order": list(order), "tabs": tabs, "selfHost": _self_host(),\n'
+                      '            "views": _views_client(), "live": sorted({str(x) for x in live})}', src, "tabOrder frames carry it")
         self.assertIn('"views": _views_client(), "live":', src, "…which carries the blob")
         self.assertIn('_frame = _tab_order_frame(_o, _tabs, _tm)', src, "the connect-time tabOrder carries it")
 

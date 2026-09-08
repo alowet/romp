@@ -67,6 +67,7 @@ import { setTip, pruneTip } from "./tip";
 import { agentCount, replyOwed, threadsByAnchor, threadBusy, threadStuck, findAnchorRange, sliceRanges, prunePending, type CommentThread } from "./comments";
 import { dragSlotIndex } from "./dragslot";
 import { perfFrameHandler } from "./perf-telemetry";
+import { linkifyPrRefs, senderPrRepo, postalSenderHost } from "./pr-links";
 
 for (const [name, lang] of Object.entries({
   bash, sh: bash, shell: bash, python, py: python, javascript, js: javascript,
@@ -140,6 +141,12 @@ type ChatEvent = (
       kind: "postal-service";
       direction: "in" | "out";
       peer: string;
+      // incoming: the sender's host as the CARD'S kernel's message log stamped it ("" = that kernel's own,
+      // a peer's name for mail from that host — relative to the kernel the card's session lives on) —
+      // with `peer`, names the ONE session whose repo the body's PR references link against
+      // (postalRepoFor); absent on cards from a kernel that predates the field, and on cards whose log
+      // row predates the stamp (the kernel omits it rather than read absence as its own)
+      peerHost?: string;
       color: { bg: string; fg: string } | null;
       body: string;
       summary?: string;  // incoming Haiku caption (≤9 words) — shown instead of the verbose body; body on hover
@@ -258,7 +265,7 @@ interface BgTasks { count: number; tasks: BgTask[]; }
 // kernel ships only the last WIRE_TAIL events (headFrom > 0) to keep startup light; older history streams in
 // on scroll-back (loadOlder → chatHead prepends, lowering headFrom). headFrom 0 = the whole transcript is
 // resident. chatTail's `from` is GLOBAL and mapped through headFrom.
-interface Session { id: string; name: string; color: Color | null; events: ChatEvent[]; status: Status; firstSeen?: number; cwd?: string; gitBranch?: string; workTree?: { dir: string; branch: string } | null; headFrom?: number; headTotal?: number; bgTasks?: BgTasks; hideFromFeed?: boolean; postalServiceOff?: boolean; notify?: boolean; branch?: { fromSid: string; fromName: string; cut: string; t: number } | null; branches?: { sid: string; name: string; cut: string; t: number }[] | null; sub?: SubInfo; }
+interface Session { id: string; name: string; color: Color | null; events: ChatEvent[]; status: Status; firstSeen?: number; cwd?: string; gitBranch?: string; workTree?: { dir: string; branch: string } | null; githubRepo?: string | null; headFrom?: number; headTotal?: number; bgTasks?: BgTasks; hideFromFeed?: boolean; postalServiceOff?: boolean; notify?: boolean; branch?: { fromSid: string; fromName: string; cut: string; t: number } | null; branches?: { sid: string; name: string; cut: string; t: number }[] | null; sub?: SubInfo; }
 // A SUBAGENT VIEWER pseudo-session (plans/subagent-transcripts.md): a read-only tab whose events are one
 // agent's own transcript, fed by {type:"subagent"} frames. Client-only — the kernel never lists it in
 // tabOrder (reconcileTabOrder keeps a known, never-kernel-seen id), so it lives exactly as long as the
@@ -1049,7 +1056,7 @@ function el(tag: string, cls?: string): HTMLElement {
 // message would post an interrupt on a click. Nothing the renderer needs rides data-* through md().
 const MD_PURIFY: Config = { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"], ALLOW_DATA_ATTR: false };
 
-function md(src: string): string {
+function md(src: string, repo: string | null = prRepoFor()): string {
   // Transcript text (user prompts, assistant output, subagent reports, postal
   // bodies) is UNTRUSTED and `marked` emits raw HTML verbatim, so its output
   // must be sanitized before it ever reaches .innerHTML — otherwise a payload
@@ -1058,7 +1065,14 @@ function md(src: string): string {
   // strips event-handler attributes and dangerous URL schemes (profile: MD_PURIFY).
   try {
     const dirty = marked.parse(src) as string;
-    return DOMPurify.sanitize(dirty, MD_PURIFY);
+    // RETURN_DOM hands back the sanitized <body> instead of its innerHTML — the same nodes, ours to
+    // walk once before the serialization DOMPurify would otherwise have done itself: PR references
+    // in the prose (`#123`, `PR #123`, `owner/repo#123`) become links to the session's repository
+    // (pr-links.ts; the user 2026-09-06). Text inside code, pre or an existing anchor is skipped, so
+    // the sanitizer's verdicts stand and a marked-autolinked GitHub URL is never wrapped twice.
+    const clean = DOMPurify.sanitize(dirty, { ...MD_PURIFY, RETURN_DOM: true }) as HTMLElement;   // the sanitized <body>
+    linkifyPrRefs(clean, repo);
+    return clean.innerHTML;
   } catch { const d = document.createElement("div"); d.textContent = src; return d.innerHTML; }
 }
 
@@ -1066,11 +1080,42 @@ function md(src: string): string {
 // but newlines KEPT — Shift+Enter in the composer means a new line, and the singleton's breaks:false
 // (right for assistant markdown, where a lone newline is a soft wrap) ran a multi-line message together
 // into one paragraph once it landed in the chat (the user 2026-09-06). userMarked is the breaks:true
-// instance in chat-md.ts; the singleton and every assistant surface are untouched.
-function userMd(src: string): string {
+// instance in chat-md.ts; the singleton and every assistant surface are untouched. The same PR-reference
+// walk as md(): a `#123` the user typed links to the session's repository too.
+function userMd(src: string, repo: string | null = prRepoFor()): string {
   try {
-    return DOMPurify.sanitize(userMdHtml(src), MD_PURIFY);
+    const clean = DOMPurify.sanitize(userMdHtml(src), { ...MD_PURIFY, RETURN_DOM: true }) as HTMLElement;
+    linkifyPrRefs(clean, repo);
+    return clean.innerHTML;
   } catch { const d = document.createElement("div"); d.textContent = src; return d.innerHTML; }
+}
+
+// The GitHub repository (owner/repo, or null) whose pull requests a `#123` in the text being rendered
+// refers to: the OWNING session's — the same rule relative paths follow (renderingOwnerSid), then the
+// session being built, then the active tab. A session the kernel gave no repo links nothing.
+function prRepoFor(sid?: string | null): string | null {
+  const id = sid ?? renderingOwnerSid ?? renderingSid ?? activeId;
+  return (id && sessions.get(id)?.githubRepo) || null;
+}
+
+// A postal body was written by its SENDER, so its `#123` means the sender's repository — and only a
+// repository the frame actually names for that sender is used; nothing is guessed (a wrong link is worse
+// than none). An OUTBOUND message was written by the reading session: its own repo, as the frame ships
+// it. An INBOUND message names its sender by host AND name (`peerHost` + `peer`, the host as the CARD'S
+// kernel's message log stamped it — relative to that kernel, so it is read against the host of the
+// session the card sits in, postalSenderHost), so the sender is exactly the session in the frame that
+// answers to that pair — a local row for this dashboard's own kernel, a host's federated row otherwise —
+// and the link uses ITS githubRepo. A sender on a host this dashboard has not attached, or one the kernel
+// gave no repo: the text stays plain (the name alone once resolved it, and a remote homonym borrowed a
+// local session's repo; then a remote session's card was read as if its kernel were this one, and its own
+// kernel's sender resolved against the LOCAL rows; review finds, 2026-09-06). Only a card from a kernel
+// that predates the field falls back to the name — the one session, local or federated by its bare name,
+// answering to it; a homonym leaves it plain. The reading session's repo is never substituted for the
+// sender's.
+function postalRepoFor(ev: { direction: "in" | "out"; peer: string; peerHost?: string }): string | null {
+  if (ev.direction === "out") return prRepoFor();
+  const cardHost = hostOf(renderingOwnerSid ?? renderingSid ?? activeId ?? "");   // the card's own kernel, as prRepoFor picks the session
+  return senderPrRepo(Array.from(sessions.values(), (s) => ({ sid: s.id, name: s.name, githubRepo: s.githubRepo })), ev.peer, postalSenderHost(ev.peerHost, localSelfHost, cardHost));
 }
 
 function highlight(container: HTMLElement, lineNos = true) {
@@ -4496,7 +4541,7 @@ function renderPostalService(ev: Extract<ChatEvent, { kind: "postal-service" }>)
     const sum = el("div", "postal-service-summary");
     const caret = el("span", "postal-service-expand-caret"); caret.textContent = "▸"; sum.appendChild(caret);
     const sumText = el("span", "postal-service-summary-text"); sumText.textContent = summaryText; sum.appendChild(sumText);
-    const full = el("div", "postal-service-full md"); full.innerHTML = md(ev.body); highlight(full);
+    const full = el("div", "postal-service-full md"); full.innerHTML = md(ev.body, postalRepoFor(ev)); highlight(full);
     // KEYED expand (the user 2026-07-25: "it expands for like a second and then collapses again") —
     // the old hand-rolled classList.toggle lived only on this DOM node, and the next kernel push
     // rebuilds the card, silently closing it. Same openFolds mechanism as every other keyed fold;
@@ -4514,7 +4559,7 @@ function renderPostalService(ev: Extract<ChatEvent, { kind: "postal-service" }>)
     body.appendChild(sum);
     body.appendChild(full);
   } else {
-    body.innerHTML = md(ev.body);
+    body.innerHTML = md(ev.body, postalRepoFor(ev));
     highlight(body);
   }
   card.appendChild(body);
@@ -8950,9 +8995,23 @@ function pickerKey(e: KeyboardEvent) {
 // prefilled into the dir field when there's no gear default, so "the default path is written in there".
 let kernelDefaultDir = "";
 // This machine's name as the kernel's peers know it (_self_host — short hostname, ROMP_HOST_NAME
-// override), from the same payload. The + picker's Host row labels its first option with it, so the
-// row reads as a list of machines by name rather than named hosts plus a "local" (the user 2026-08-12).
+// override). The + picker's Host row labels its first option with it, so the row reads as a list of
+// machines by name rather than named hosts plus a "local" (the user 2026-08-12); postalRepoFor reads a
+// postal card's sender host against it. Three sources, one adopter (adoptSelfHost): every tabOrder frame
+// — the one every chat receives, first of all on connect, and the only one a dashboard whose kernel runs
+// no local session gets — every LOCAL session frame (upsert), and the picker's sessionList reply.
 let localSelfHost = "";
+// Adopt the name. A postal card rendered BEFORE the name was known read its own kernel's name for this
+// host as a peer's — it matched no `host:` row and stayed plain — and was rebuilt only on its session's
+// next push (review find, 2026-09-06): so a name that CHANGES re-renders every built view, and each card's
+// body is read against the name once it is known. In practice nothing is built when the name arrives (the
+// tabOrder frame lands before any session frame); a late arrival — a remote kernel's frame ahead of the
+// local strip, or the name learned from the picker alone against an older kernel — is what this covers.
+function adoptSelfHost(name: string): void {
+  if (name === localSelfHost) return;
+  localSelfHost = name;
+  if (views.size) rerenderAll();
+}
 // Is this session already an open tab in THIS dashboard? (loaded session, or a not-yet-loaded placeholder tab
 // the kernel's order carries.) The + picker uses it to hide sessions you can already reach by a tab-click.
 function isOpenTab(id: string): boolean {
@@ -13254,6 +13313,12 @@ function sharesAnyUuid(a: ChatEvent[], b: ChatEvent[]): boolean {
 
 function upsert(msg: any) {
   retryCmtCreates(String(msg.id || ""));   // a session frame = the kernel re-parsed → retry a lag-refused create (T106)
+  // The LOCAL kernel's own machine name rides its session frames (the kernel's _self_host, as the tabOrder
+  // and feed frames carry it): the chat reads a postal card's sender host against it (postalSenderHost). It
+  // was learned only from the + picker's sessionList reply before, so that reading was inert in any chat
+  // whose picker had not been opened (review find, 2026-09-06). A remote kernel's frame names ITSELF — the
+  // id's host prefix says whose frame this is, and only the local kernel's is this dashboard's own name.
+  if (typeof msg.selfHost === "string" && msg.selfHost && !hostOf(msg.id)) adoptSelfHost(msg.selfHost);
   const existed = sessions.has(msg.id);
   const prev = sessions.get(msg.id);
   awaitingFull.delete(msg.id);   // a full session landed → this session is re-based; a later gap may ask again
@@ -13281,6 +13346,11 @@ function upsert(msg: any) {
     // so the branch used to vanish there. A chatTail delta omits it → keep the last-known via prev.
     gitBranch: msg.gitBranch ?? (prev ? prev.gitBranch : ""),
     workTree: msg.workTree ?? (prev ? prev.workTree : null),
+    // the GitHub repository the session works in (owner/repo, or null) — what its `#123` mentions link
+    // to (pr-links.ts). The "in msg" form, like bgTasks: a null from the kernel is a real value (the
+    // tree lost its origin, or never had one) and must not fall back to a stale prev; a chatTail delta
+    // omits the key and keeps the last-known.
+    githubRepo: ("githubRepo" in msg) ? (msg.githubRepo ?? null) : (prev ? prev.githubRepo : null),
     // A trimmed full send carries headFrom/headTotal; a whole-transcript send omits them (headFrom 0).
     headFrom: kept && prev ? prev.headFrom : (msg.headFrom ?? 0),
     headTotal: kept && prev ? prev.headTotal : (msg.headTotal ?? events.length),
@@ -14013,7 +14083,7 @@ window.addEventListener("message", perfFrameHandler("chat", (m) => vscodeApi?.po
     // this-machine button in place — the row's first-ever open is the only one that shows the
     // "local" placeholder.
     if (typeof m.selfHost === "string" && m.selfHost && !from) {
-      localSelfHost = m.selfHost;
+      adoptSelfHost(m.selfHost);
       const lb = document.querySelector('#picker .picker-host .picker-be-opt[data-host=""]') as HTMLElement | null;
       if (lb) lb.textContent = localSelfHost;
     }
@@ -14104,6 +14174,7 @@ window.addEventListener("message", perfFrameHandler("chat", (m) => vscodeApi?.po
   else if (m.type === "working") { workingSet = new Set(Array.isArray(m.names) ? m.names : []); refreshPostalDots(); }
   else if (m.type === "imgData" && typeof m.path === "string") onImgData(m.path, typeof m.url === "string" ? m.url : null, typeof m.sid === "string" ? m.sid : null);
   else if (m.type === "tabOrder") {
+    if (typeof m.selfHost === "string" && m.selfHost) adoptSelfHost(m.selfHost);   // the LOCAL kernel's own name: federation puts only its own on the merged frame
     captureViews(m.views || null);
     applyTabOrder(m.order, m.tabs, { reemit: m.reemit === true, freshHost: typeof m.freshHost === "string" ? m.freshHost : undefined }, m.live);
   }

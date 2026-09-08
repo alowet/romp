@@ -25,12 +25,12 @@ test("the this-machine option wears the machine's REAL name, not 'local' (the us
   assert.match(RENDER, /b\.textContent = h \|\| localSelfHost \|\| "local"/);
   // the Host row is built on open, BEFORE the reply lands — the handler relabels the button in
   // place, so only the first-ever open briefly shows the "local" placeholder
-  assert.match(RENDER, /if \(typeof m\.selfHost === "string" && m\.selfHost && !from\) \{\s*\n\s*localSelfHost = m\.selfHost;/);
+  assert.match(RENDER, /if \(typeof m\.selfHost === "string" && m\.selfHost && !from\) \{\s*\n\s*adoptSelfHost\(m\.selfHost\);/);
   assert.match(RENDER, /querySelector\('#picker \.picker-host \.picker-be-opt\[data-host=""\]'\)/);
   // …and the adoption sits BEFORE the stale-list drop guard: the name is this machine's identity,
   // not list data — switching the picker to a remote host before the local reply lands must not
   // throw the name away with the (rightly dropped) stale list
-  const adopt = RENDER.indexOf("localSelfHost = m.selfHost");
+  const adopt = RENDER.search(/&& !from\) \{\s*\n\s*adoptSelfHost\(m\.selfHost\);/);   // the picker's call of the one adopter (pr-links.test.ts pins the adopter itself)
   const drop = RENDER.indexOf("if (from !== pickerListHost) return;");
   assert.ok(adopt >= 0 && drop >= 0 && adopt < drop, "selfHost is adopted before the stale-list drop");
 });

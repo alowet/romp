@@ -29,6 +29,11 @@ const NONE: Routed = { revealChat: null, revealFeed: null, openLinkLocally: null
 export function routeViewMessage(app: App, m: any): Routed {
   if (!m || typeof m.type !== "string") return { ...NONE, forward: false };
 
+  // Any pane may hold a link the host must open (the timeline's, and since 2026-09-06 the PR links in
+  // feed cards and outline rows): the kernel has no openLink handler, so forwarding it is a dead click.
+  if (m.type === "openLink" && typeof m.href === "string")
+    return { ...NONE, openLinkLocally: m.href, forward: false };
+
   if (app === "chat") {
     // reveal side-effects ride along; the kernel does the real work
     if (m.type === "dotOpen") return { ...NONE, revealFeed: { preserveFocus: true } };
@@ -48,8 +53,6 @@ export function routeViewMessage(app: App, m: any): Routed {
 
   // timeline
   if (m.type === "deepLink") return { ...NONE, revealChat: { preserveFocus: true } }; // a lane click jumps the chat there
-  if (m.type === "openLink" && typeof m.href === "string")
-    return { ...NONE, openLinkLocally: m.href, forward: false };
   if (m.type === "usageData") return { ...NONE, forward: false }; // host-consumed (status-bar chrome), not a kernel op
   return NONE;
 }

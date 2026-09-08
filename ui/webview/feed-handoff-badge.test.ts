@@ -19,7 +19,9 @@ test("the badge is additive on the type — a payload without it renders exactly
 });
 
 test("the title is the kernel-shipped text verbatim — the de-arrowing lives kernel-side", () => {
-  assert.match(SRC, /a\._title\.textContent = it\.text;/,
+  // setLinkedText writes it.text as-is and only wraps its PR references in anchors (pr-links.ts);
+  // the visible text is still the kernel's, character for character
+  assert.match(SRC, /setLinkedText\(a\._title, it\.text, prRepoOf\(it\.sid\)\);/,
     "no client-side munging: one place (kernel _handoff_card_fields) owns the derivation");
 });
 
