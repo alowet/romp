@@ -50,13 +50,25 @@ fi
 # a login shell also reach the kernel. ROMP_API_KEY_REF remains a reference here;
 # the kernel resolves it through op when needed. Parsed line-by-line, never sourced: a
 # malformed line is skipped instead of executing code or (under set -eu)
-# taking the manager — and the whole kernel — down with it.
+# taking the manager, and the whole kernel, down with it. One layer of matching
+# quotes around the value is removed, so this launcher reads a line the same way
+# systemd's EnvironmentFile= and the kernel's own parser (kernel/keysource.py) do:
+# KEY="a b" reaches the manager as a b, not as "a b". Without this a quoted value in
+# service.env reached a macOS-launched manager with its quotes and a systemd-launched
+# one without, the same line meaning two different things by platform.
 ENV_FILE="${ROMP_SERVICE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/romp/service.env}"
 if [ -f "$ENV_FILE" ]; then
     while IFS= read -r _line || [ -n "$_line" ]; do
         case "$_line" in
             ''|'#'*) ;;
-            [A-Za-z_]*=*) export "$_line" 2>/dev/null || true ;;
+            [A-Za-z_]*=*)
+                _name="${_line%%=*}"
+                _val="${_line#*=}"
+                case "$_val" in
+                    \"*\") _val="${_val#\"}"; _val="${_val%\"}" ;;
+                    \'*\') _val="${_val#\'}"; _val="${_val%\'}" ;;
+                esac
+                export "$_name=$_val" 2>/dev/null || true ;;
         esac
     done < "$ENV_FILE"
 fi

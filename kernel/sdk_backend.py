@@ -2078,13 +2078,13 @@ def _check_key_file_agrees(startup: str, live: str) -> None:
     """Say ONCE, on stderr (the kernel's log wire), whether the file this process reads holds the
     same key its environment was started with. Both sides are fingerprints, never values.
 
-    Worth the six lines: this is the one way the live read can go quietly wrong. The launchers do
-    not parse identically to each other — systemd's EnvironmentFile strips one layer of quotes, the
-    macOS launcher's `export` does not — so a quoted value, a stray duplicate line, or a key that
-    reaches the manager some other way makes the file disagree with the environment, and every
-    session would then launch on a key nobody chose. Disagreement at startup is a configuration
-    fact the operator can fix in a minute, and silence about it would surface hours later as
-    inexplicable 401s."""
+    Worth the six lines: this is the one way the live read can go quietly wrong. Three readers each
+    parse the file themselves — systemd's EnvironmentFile, the macOS launcher (bin/romp-node-launch)
+    and keysource._assignments — and all strip one layer of matching quotes, but a stray duplicate
+    line, whitespace around a value, or a key that reaches the manager some other way makes the file
+    disagree with the environment, and every session would then launch on a key nobody chose.
+    Disagreement at startup is a configuration fact the operator can fix in a minute, and silence
+    about it would surface hours later as inexplicable 401s."""
     global _KEY_FILE_CHECKED
     if _KEY_FILE_CHECKED:
         return
@@ -2096,7 +2096,7 @@ def _check_key_file_agrees(startup: str, live: str) -> None:
     sys.stderr.write(
         "work key: the manager env file sets a DIFFERENT key than this process started with "
         "(file sha256:%s, startup sha256:%s) — sessions launch on the file's. If that is not what "
-        "you meant, check %s for a quoted or duplicated %s line.\n"
+        "you meant, check %s for a duplicated %s line or whitespace around its value.\n"
         % (_keysrc.fingerprint(live), _keysrc.fingerprint(startup),
            _keysrc.service_env_path(), _keysrc.KEY_VAR))
 

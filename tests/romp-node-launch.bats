@@ -80,3 +80,32 @@ teardown() { rm -rf "$TEST_DIR"; }
     [ "$status" -eq 0 ]
     [[ "$output" == *"SECRET=[hunter2] ran: $MANAGER up"* ]]
 }
+
+@test "service.env: one layer of matching quotes comes off the value, as systemd and the kernel read it" {
+    # systemd's EnvironmentFile= and kernel/keysource.py both strip one layer of
+    # matching quotes; this launcher must too, or a quoted value means one thing on
+    # Linux and another on macOS. An unbalanced quote is left as written; quotes
+    # inside a value are part of the value; an empty quoted value is empty. Exactly
+    # one layer comes off, so a nested pair keeps its inner quotes; the pair must
+    # match, so "abc' is left as written; a value holding the other quote character
+    # keeps it.
+    export XDG_CONFIG_HOME="$HOME/.config"
+    mkdir -p "$XDG_CONFIG_HOME/romp"
+    {
+        echo 'ROMP_TEST_DQ="two words"'
+        echo "ROMP_TEST_SQ='x y'"
+        echo 'ROMP_TEST_ONE="abc'
+        echo 'ROMP_TEST_EMPTY=""'
+        echo 'ROMP_TEST_INNER=a"b"c'
+        echo "ROMP_TEST_NESTED=\"'q'\""
+        echo 'ROMP_TEST_TWO=""a""'
+        echo "ROMP_TEST_MIX=\"abc'"
+        echo "ROMP_TEST_APOS=\"it's\""
+    } > "$XDG_CONFIG_HOME/romp/service.env"
+    printf '#!/bin/sh\necho "DQ=[$ROMP_TEST_DQ] SQ=[$ROMP_TEST_SQ] ONE=[$ROMP_TEST_ONE] EMPTY=[${ROMP_TEST_EMPTY-unset}] INNER=[$ROMP_TEST_INNER] NESTED=[$ROMP_TEST_NESTED] TWO=[$ROMP_TEST_TWO] MIX=[$ROMP_TEST_MIX] APOS=[$ROMP_TEST_APOS]"\n' > "$BIN/node"
+    chmod +x "$BIN/node"
+    run "$LAUNCH" "$MANAGER" up
+    [ "$status" -eq 0 ]
+    want="DQ=[two words] SQ=[x y] ONE=[\"abc] EMPTY=[] INNER=[a\"b\"c] NESTED=['q'] TWO=[\"a\"] MIX=[\"abc'] APOS=[it's]"
+    [[ "$output" == *"$want"* ]]
+}
