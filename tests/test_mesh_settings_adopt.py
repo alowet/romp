@@ -138,6 +138,16 @@ class AdoptPeerSettings(unittest.TestCase):
         self.assertEqual(self.b.adopt("TESTHOST2", self.a.version())[0], ["compact-suggest"])
         self.assertEqual(self.b.read("compact-suggest"), (False, 7_001), "the click held on both machines")
 
+    def test_a_non_finite_stamp_skips_only_its_own_setting(self):
+        # json can carry NaN/Infinity; int() of either raises, and an exception mid-loop would skip the peer's
+        # remaining settings every pass (second review, nit)
+        self.b.set("file-editing", True, 2_000)
+        rver = {"settings": {"compactSuggest": True, "fileEditing": True},
+                "settingsGt": {"compact-suggest": float("nan"), "file-editing": 2_000}}
+        self.assertEqual(self.a.adopt("TESTHOST", rver)[0], ["file-editing"])
+        rver["settingsGt"]["compact-suggest"] = float("inf")
+        self.assertEqual(self.a.adopt("TESTHOST", rver)[0], [], "…and inf is not a stamp either")
+
     def test_an_older_kernel_or_a_junk_dict_adopts_nothing(self):
         self.a.set("compact-suggest", False, 1_000)
         for rver in (None, {}, {"settings": {"compactSuggest": True}},                       # no settingsGt: older kernel
@@ -229,6 +239,52 @@ class ThroughTheRealPoll(unittest.TestCase):
         self.assertEqual(self.a.read("compact-suggest"), (True, 2_000))
         self.assertEqual(self.a.read("file-editing"), (True, 2_000))
         self.assertEqual(self.a.read("auto-nudge")[1], 0, "no stamp for it in the peer's dict: untouched")
+
+
+class TheEmitterIsOneSnapshotPerStore(unittest.TestCase):
+    """The consumer takes a peer's (value, stamp) as one snapshot, so the peer's /version must read each
+    store's value and stamp from ONE read: two reads with a click landing between them yield (old value,
+    new stamp), which the adopter persists and the equal-stamp rule then freezes on both machines (the
+    second review of this change)."""
+
+    def setUp(self):
+        self.k = _Kernel()
+
+    def tearDown(self):
+        self.k.close()
+
+    def test_version_reports_a_value_and_stamp_from_the_same_read(self):
+        # the blob reader is wrapped so that the settings sub-dict's VALUE readers see the pre-click blob while
+        # the stamp reader sees the post-click one — exactly a click landing between two separate reads
+        import inspect
+        with self.k:
+            km._set_compact_suggest(False, gt=5_000)
+            old = dict(km._auto_nudge_data())
+            km._set_compact_suggest(True, gt=9_000)
+            new = dict(km._auto_nudge_data())
+            real = km._auto_nudge_data
+            def torn():
+                caller = inspect.stack()[1].function
+                return dict(old) if caller in ("_compact_suggest_on", "_auto_nudge_on") else dict(new)
+            km._auto_nudge_data = torn
+            try:
+                v = km._version_info()
+            finally:
+                km._auto_nudge_data = real
+        pair = (v["settings"]["compactSuggest"], v["settingsGt"]["compact-suggest"])
+        self.assertIn(pair, [(False, 5_000), (True, 9_000)], "value and stamp come from one snapshot: %r" % (pair,))
+        self.assertEqual(v["compactSuggest"], v["settings"]["compactSuggest"], "the top-level field rides the same snapshot")
+
+    def test_version_builds_the_three_adopted_settings_from_the_snapshot_helper(self):
+        src = KERNEL_SRC.split("def _version_info():")[1].split("\ndef ")[0]
+        self.assertIn("_mesh_settings_snapshot()", src)
+        with self.k:
+            km._set_file_editing(True, gt=4_000)
+            values, stamps = km._mesh_settings_snapshot()
+        self.assertEqual(values["fileEditing"], True)
+        self.assertEqual(stamps["file-editing"], 4_000)
+        self.assertEqual(set(values), {"autoNudge", "compactSuggest", "fileEditing"})
+        self.assertEqual(set(stamps), {"auto-nudge", "compact-suggest", "file-editing"})
 
 
 class ThePollSeam(unittest.TestCase):
