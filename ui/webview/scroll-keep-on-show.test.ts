@@ -79,7 +79,7 @@ test("render.ts: the reshow decision counts a live durable seek for the tab as n
 test("render.ts: the #content scroll listener keeps the active view's saved spot current (passive, no timer)", () => {
   assert.match(RENDER, /import \{ followReader, keepPlaceAcrossShow, followTail, atBottomDist, followBoxBelow, followTailShrink \} from "\.\/scroll-keep";/);   // + followTail (T262: follow only on new content)
   // …and stands down while a deferred build is pending: the reveal's clamp fires a scroll event before the land
-  assert.match(RENDER, /c\.addEventListener\("scroll", \(\) => \{\n\s*if \(c\.clientHeight <= 0\) return;\n\s*followReader\(activeId \? views\.get\(activeId\) : null, c\.scrollTop, atBottom\(c\), pendingBuildRaf != null\);\n(?:.*\n){0,4}?\s*\}, \{ passive: true \}\);/);
+  assert.match(RENDER, /c\.addEventListener\("scroll", \(\) => \{\n\s*if \(c\.clientHeight <= 0\) return;\n\s*followReader\(activeId \? views\.get\(activeId\) : null, c\.scrollTop, atBottom\(c\), pendingBuildRaf != null\);\n(?:.*\n){0,5}?\s*\}, \{ passive: true \}\);/);
   // landActive's landing rule itself is unchanged — its INPUT is what the fix repairs
   assert.match(RENDER, /if \(!v\.shown \|\| v\.stick\) writeScroll\(content, content\.scrollHeight, "land-bottom", true\);\n\s*else writeScroll\(content, v\.scrollTop, "land-saved"\);/);   // (T262: every #content write rides writeScroll)
 });
