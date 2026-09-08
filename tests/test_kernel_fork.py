@@ -155,8 +155,18 @@ class ForkSessionOp(unittest.TestCase):
         km._push_session_now = lambda sid: None
         self._real_seed = km._seed_fork_stores
         km._seed_fork_stores = lambda *a: self.be.events.append(("seed",) + a[:2]) or None
+        # a PRIVATE views store (the goal-store fixture rule, for timeline-views.json): every kernel
+        # module in one pytest worker shares the one romp_judge module, hence one jd.STATE, and the
+        # store's stale-writer guard would keep another module's newer-stamped tags over this test's
+        self.vtd = tempfile.TemporaryDirectory()
+        self._saved_state = jd.STATE
+        jd.STATE = Path(self.vtd.name)
+        km._flags_cache.clear()
 
     def tearDown(self):
+        jd.STATE = self._saved_state
+        km._flags_cache.clear()
+        self.vtd.cleanup()
         (km.Sessions.backend_for, km._sdk_ready, km._sessions, km._pick_identity_color,
          km._reveal_chat_for, km._mark_views_dirty, km._push_session_now, km._seed_fork_stores) = self.saved
         for d in (jd.EPIDIR, jd.CAPDIR, jd.GOALDIR):
@@ -192,6 +202,37 @@ class ForkSessionOp(unittest.TestCase):
         self.assertIn("seeding", km._fork_session(PARENT, "", "api-fork") or "")
         self.assertEqual([e[0] for e in self.be.events], [],
                          "an unprotected fork must never be created (the replay storm)")
+
+    def test_the_fork_inherits_the_parents_tags_before_its_first_push(self):
+        # tab groups on tags (the user 2026-09-04): a fork joins every tag holding its parent, at the
+        # creation event — the parent keeps its tags — and BEFORE connect/push, so the first tabOrder
+        # frame (which carries the views blob) already sections the new tab under its group
+        km._flags_cache.clear()
+        km._set_timeline_views({"active": "all", "tags": [
+            {"id": "g1", "name": "pool", "members": [PARENT]},
+            {"id": "g2", "name": "other", "members": ["someone-else"]}]})
+        seen_at_connect = []
+        real_connect = self.be.connect
+        def connect(sid):
+            seen_at_connect.append([m["sid"] for m in km._timeline_views()["tags"][0]["members"]])
+            return real_connect(sid)
+        self.be.connect = connect
+        self.assertIsNone(km._fork_session(PARENT, "", "api-fork"))
+        fork_sid = next(e for e in self.be.events if e[0] == "fork")[4]
+        v = km._timeline_views()
+        pool = next(t for t in v["tags"] if t["name"] == "pool")
+        self.assertEqual(sorted(m["sid"] for m in pool["members"]), sorted([PARENT, fork_sid]),
+                         "the fork joined pool; the parent kept it")
+        self.assertEqual([m["sid"] for m in next(t for t in v["tags"] if t["name"] == "other")["members"]],
+                         ["someone-else"], "a tag the parent is not in is untouched")
+        self.assertIn(fork_sid, seen_at_connect[0], "membership landed BEFORE connect — ahead of the direct push")
+
+    def test_an_untagged_parents_fork_lands_untagged(self):
+        km._flags_cache.clear()
+        km._set_timeline_views({"active": "all", "tags": [{"id": "g1", "name": "pool", "members": ["someone-else"]}]})
+        self.assertIsNone(km._fork_session(PARENT, "", "api-fork"))
+        fork_sid = next(e for e in self.be.events if e[0] == "fork")[4]
+        self.assertNotIn(fork_sid, [m["sid"] for m in km._timeline_views()["tags"][0]["members"]])
 
 
 class CourierEpisodeFloor(unittest.TestCase):

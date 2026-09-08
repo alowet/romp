@@ -184,15 +184,17 @@ class CreateOpenReviveAreAimedToo(unittest.TestCase):
         src = inspect.getsource(km.Handler)
         self.assertIn('_open_or_revive(msg["id"], live=bool(msg.get("live")), client=client)', src,
                       "openSession — the click-op the 2026-07-29 fix missed")
-        self.assertIn('_create_sdk_session(nm, cwd, auth=(a if a in ("login", "key") else ""), client=client)',
-                      src, "the picker's createSession follows on the asking window")
-        flat = re.sub(r"\s+", "", src)   # the POST /new call wraps; pin it whitespace-blind
+        flat = re.sub(r"\s+", "", src)   # the create calls wrap; pin them whitespace-blind
+        # the picker's create wraps too since tab groups (parent/tags ride the same call); the PROPERTY
+        # is unchanged: the asker's client is named
+        self.assertIn('_sid,extra=_create_sdk_session(nm,cwd,auth=(aifain("login","key")else""),client=client,', flat,
+                      "the picker's createSession follows on the asking window")
         # POST /new threads env=env_req through the same call (its args carry inline comments, so the
         # pin walks the span rather than matching one literal); the PROPERTY is unchanged: no client
         self.assertIn('sid,extra=_create_sdk_session(nm,cwd,auth=(aifain("login","key")else""),prefs=b,', flat,
                       "POST /new (the CLI) has no dashboard in hand, and so names none")
-        start = flat.index('sid,extra=_create_sdk_session(')
-        call = flat[start:flat.index('env=env_req)', start) + len('env=env_req)')]
+        start = flat.index('sid,extra=_create_sdk_session(nm,cwd,auth=(aifain("login","key")else""),prefs=b,')
+        call = flat[start:flat.index('tags=tags_req)', start) + len('tags=tags_req)')]   # the call's last arg since tab groups
         self.assertNotIn('client', call, "POST /new (the CLI) has no dashboard in hand, and so names none")
         self.assertIn('threading.Thread(target=_revive_session, args=(msg["id"], client), daemon=True)', src,
                       "the revive thread carries its asker across to the focus that clears the loader")

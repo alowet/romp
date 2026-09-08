@@ -13,6 +13,7 @@
 
 import { adoptArrivals, applyViewOrder, applyViewOrderTo, churnSwaps, healOrder, pruneViewOrder,
          readViewOrder, writeViewOrder, VIEW_ORDER_KEY, VIEW_ORDER_EVENT } from "./view-order";
+import { adoptViews, capsAdopts, announcedSeq, announcedAfter } from "./views-writes";
 import { hostOf, bareId } from "./host-prefix";
 import { installPerfTelemetry, classifyFrame, type RompPerf } from "./perf-telemetry";
 
@@ -234,6 +235,13 @@ export function routeOutbound(msg: any, knownHosts?: ReadonlySet<string>): Route
     const { host, ...rest } = msg;
     return [{ host: host || LOCAL, msg: rest }];
   }
+
+  // The VIEWS store is per kernel and a dashboard edits only its LOCAL one: a tag edit or a whole-blob
+  // views write goes to the local socket whatever fields it carries (the 2026-09-05 review: the tag
+  // op's fields rode at the top level, so a tag `name` that happened to look like a remote lane's
+  // display name would have taken the name-addressed route below to that host — tag names and
+  // session names share a field name, not a meaning).
+  if (msg.type === "tagEdit" || msg.type === "setTimelineViews") return [{ host: LOCAL, msg }];
 
   // order[] (reorderTabs / the timeline's writeOrder): split across the hosts it touches.
   if (Array.isArray(msg.order) && msg.order.some((x: any) => typeof x === "string")) {
@@ -645,6 +653,10 @@ export class FederationManager {
   private perHostOrder: Record<string, string[]> = {};
   private perHostTabs: Record<string, any[]> = {};
   private localViews: any = null;   // the LOCAL kernel's session-views blob, carried on merged tabOrder re-emits
+  private localViewsRejected: any = null;   // the last LOCAL tabOrder blob the seq gate turned away since it last adopted one — the caps frame adopts it (inbound)
+  private tlViewsRejected: any = null;      // the same for the LOCAL lanes payload's blob (perHostTl[LOCAL].views)
+  private localViewsAnnounced: number | null = null;   // the seq the last LOCAL caps frame announced as the kernel's current store when the tabOrder store adopted no kept blob — a LATER blob at exactly that seq is adopted below the stored one (announcedSeq); cleared by the next adoption that changes the stored blob (announcedAfter)
+  private tlViewsAnnounced: number | null = null;      // the same for the lanes payload's store
   private perHostSids: Record<string, Set<string>> = {};
   private perHostFeed: Record<string, any> = {}; // last feed snapshot per host — merged so they don't clobber
   private perHostFeedAt: Record<string, number> = {}; // host -> local ms its snapshot ARRIVED: the merged frame's clock anchor (mergeHostFeeds `nowAt`), so a re-emit anchors exactly as the arrival did
@@ -792,6 +804,42 @@ export class FederationManager {
     if (m && m.type === "session" && typeof m.id === "string") {
       (this.perHostSids[host] ||= new Set()).add(m.id);
     }
+    // a kernel's `caps` frame describes THAT kernel; the panes hold only the LOCAL kernel's (its views
+    // store is the one they write). A remote's would read as the local kernel's — dropped here.
+    if (m && m.type === "caps" && host !== LOCAL) return;
+    // The local kernel's caps frame is the reconnect event: each replayed views store adopts the blob its
+    // gate last turned away when the frame names it (the 2026-09-05 review; capsAdopts),
+    // as the panes do — the kernel sends its connect push before this frame and `viewsSeq` is the seq of
+    // the views blob that push served, so a push a restarted kernel served under an OLDER seq (a store
+    // restored while it was down) was rejected a frame ago and is adopted here; a healthy reconnect's push
+    // was adopted, nothing is kept, and the stores stand; a pusher frame kept because it arrived between
+    // the push and this frame carries a seq the frame does not name and is discarded. A store that adopted
+    // RE-EMITS before the caps frame is handed on: the panes see the local blob only through these re-emits
+    // (a rejected push reached them wearing the stored blob), so the restored blob must meet their own gate
+    // — and be turned away there — before their caps door adopts it. Nothing is re-emitted otherwise. When a
+    // store kept nothing the frame names (the connect push carried no blob for it — a sentinel cycle sends no
+    // tabOrder), the frame's viewsSeq is remembered as the kernel's announced store for that store, and the
+    // later blob carrying exactly that seq is adopted below the stored one on arrival (the review;
+    // announcedSeq): one slot per store, overwritten by each local caps frame, cleared by the next adoption
+    // that CHANGES the stored blob and never by a re-arrival of the blob already stored (announcedAfter);
+    // null (no store at all) and a missing field announce nothing. The panes hold the same slot from the same
+    // frame, handed on below; the merged re-emits between that frame and the pusher's next one (a remote host's
+    // push, a `closed` frame, a storage event, a host drop) hand them the STORED blob at their own held seq,
+    // which leaves their slot standing by the same rule, so the re-emit of that later adoption meets an open
+    // door there too.
+    if (m && m.type === "caps") {
+      if (capsAdopts(this.localViewsRejected, m.viewsSeq)) {
+        this.localViews = this.localViewsRejected; this.localViewsAnnounced = null;
+        this.emitMergedOrder();
+      } else this.localViewsAnnounced = announcedSeq(m.viewsSeq);
+      this.localViewsRejected = null;
+      const tl = this.perHostTl[LOCAL];
+      if (tl && capsAdopts(this.tlViewsRejected, m.viewsSeq)) {
+        this.perHostTl[LOCAL] = { ...tl, views: this.tlViewsRejected }; this.tlViewsAnnounced = null;
+        this.emitMergedTimeline(false);
+      } else this.tlViewsAnnounced = announcedSeq(m.viewsSeq);
+      this.tlViewsRejected = null;
+    }
     // A kernel's `closed` frame is ITS OWN report that the session is gone — the one other writer allowed
     // to touch the per-host store (T233, the user 2026-09-03). The 2026-08-02 rule below forbids
     // ARRANGEMENT writes on a re-emit (a stale pane pruning another pane's drag); a `closed` frame is new
@@ -818,8 +866,15 @@ export class FederationManager {
       // session VIEWS (the user 2026-08-18): the blob is the LOCAL kernel's viewer pref (ids arrive
       // host-prefixed inside it already) — remote kernels' copies are their own dashboards' prefs.
       // Without this passthrough the merged re-emit silently dropped the field and the browser
-      // dashboard's chat never learned the views at all.
-      if (host === LOCAL && m.views && typeof m.views === "object") this.localViews = m.views;
+      // dashboard's chat never learned the views at all. Kept ONLY when its write sequence is at
+      // least the stored one (2026-09-05): the re-emit below replays this copy on every merged order,
+      // and a frame the kernel built before a write must not roll the replayed blob back behind an
+      // ack the pane already adopted. The last blob turned away is kept for the caps frame (above), and a
+      // blob at the seq the last caps frame announced is adopted below the stored one.
+      if (host === LOCAL && m.views && typeof m.views === "object") {
+        if (adoptViews(this.localViews, m.views, this.localViewsAnnounced)) { this.localViewsAnnounced = announcedAfter(this.localViews, m.views, this.localViewsAnnounced); this.localViews = m.views; this.localViewsRejected = null; }
+        else this.localViewsRejected = m.views;
+      }
       this.ensureHost(host);
       this.absorbHostReport(host, prevOrder, prevTabs);   // a host just reported its sessions → the one
       this.emitMergedOrder(true, host);                   //   moment the stored arrangement may be touched
@@ -834,7 +889,18 @@ export class FederationManager {
     }
     // timeline snapshots replace the panel's state wholesale (update/applyBars) — merge per host like the feed.
     if (m && m.type === "data" && m.data && typeof m.data === "object") {
-      this.perHostTl[host] = m.data;
+      // the LOCAL lanes payload carries the views blob the merged re-emit replays: a payload whose blob
+      // has a LOWER write sequence than the stored one keeps the stored blob (its lanes still land) —
+      // the same rule the tabOrder store applies above (2026-09-05), the same keep of the last blob
+      // turned away, for the caps frame, the same door for the blob at the announced seq, and the same
+      // slot rule on adoption (a re-arrival of the stored blob leaves the slot)
+      const held = host === LOCAL ? this.perHostTl[LOCAL] : null;
+      if (held && held.views && m.data.views && !adoptViews(held.views, m.data.views, this.tlViewsAnnounced)) {
+        this.perHostTl[host] = { ...m.data, views: held.views }; this.tlViewsRejected = m.data.views;
+      } else {
+        this.perHostTl[host] = m.data;
+        if (host === LOCAL && m.data.views) { this.tlViewsRejected = null; this.tlViewsAnnounced = announcedAfter(held && held.views, m.data.views, this.tlViewsAnnounced); }
+      }
       this.ensureHost(host);
       this.emitMergedTimeline(false);
       return;

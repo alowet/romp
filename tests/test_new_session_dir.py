@@ -198,7 +198,7 @@ class CreateSessionDirFork(_Wire):
         self.spawned = []
         self._real_sdk = km._create_sdk_session
         self._real_ready = km._sdk_ready
-        km._create_sdk_session = lambda nm, cwd, auth="", client=None: self.spawned.append((nm, cwd)) or "TESTSID"
+        km._create_sdk_session = lambda nm, cwd, auth="", client=None, **kw: self.spawned.append((nm, cwd)) or ("TESTSID", {})
         km._sdk_ready = lambda: True
         self.addCleanup(setattr, km, "_create_sdk_session", self._real_sdk)
         self.addCleanup(setattr, km, "_sdk_ready", self._real_ready)
@@ -231,6 +231,172 @@ class CreateSessionDirFork(_Wire):
         self.send({"type": "createSession", "name": "web", "dir": self.tmp, "backend": "sdk"})
         self.assertEqual(len(self.spawned), 1)
         self.assertNotIn("createDirMissing", [m.get("type") for m in self.sent])
+
+
+class CreateSessionTags(_Wire):
+    """createSession's `tags` + `parent` (tab groups on tags, the user 2026-09-04): the picker posts the
+    Tags row it prefilled from the active tab; the kernel hands both to _create_sdk_session so they
+    land BEFORE the first push. The same loud contract as POST /new: an unknown parent or a malformed
+    tags list refuses the create with a warn frame and nothing is spawned; a refused tag edit after a
+    successful spawn is warned, never swallowed. A Codex create takes both through the same seam
+    (_create_codex_session): the tag store keys on the registry sid, not the backend, so the op
+    used to refuse a Codex create asked into a group for no reason of its own. Synthetic sids only."""
+
+    PARENT = "11111111-2222-3333-4444-555555555555"
+
+    def setUp(self):
+        super().setUp()
+        self.spawned = []
+        self.extra = {}
+        saved = (km._create_sdk_session, km._sdk_ready, km._spawn_session,
+                 km._create_codex_session, km._codex_ready)
+        km._create_sdk_session = lambda nm, cwd, auth="", client=None, **kw: (
+            self.spawned.append((nm, dict(kw))), ("TESTSID", dict(self.extra)))[1]
+        km._sdk_ready = lambda: True
+        km._spawn_session = lambda nm, cwd=None: self.spawned.append((nm, "tmux"))
+        km._create_codex_session = lambda nm, cwd, client=None, **kw: (
+            self.spawned.append((nm, "codex", dict(kw))), ("TESTCODEX", dict(self.extra)))[1]
+        km._codex_ready = lambda: True
+        self.addCleanup(lambda: (setattr(km, "_create_sdk_session", saved[0]),
+                                 setattr(km, "_sdk_ready", saved[1]),
+                                 setattr(km, "_spawn_session", saved[2]),
+                                 setattr(km, "_create_codex_session", saved[3]),
+                                 setattr(km, "_codex_ready", saved[4])))
+        (km.jd.STATE / "names").mkdir(parents=True, exist_ok=True)
+        (km.jd.STATE / "names" / self.PARENT).write_text("web\t/tmp\t#123456\twhite\n")
+
+    def test_tags_and_a_known_parent_reach_the_create_as_keyword_args(self):
+        self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "sdk",
+                   "tags": ["pool", " infra "], "parent": self.PARENT})
+        self.assertEqual(len(self.spawned), 1)
+        nm, kw = self.spawned[0]
+        self.assertEqual(nm, "api")
+        self.assertEqual(kw.get("tags"), ["pool", "infra"], "names trimmed; applied inside the create, before its push")
+        self.assertEqual(kw.get("parent"), self.PARENT)
+
+    def test_no_tags_asked_none_threaded(self):
+        self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "sdk"})
+        nm, kw = self.spawned[0]
+        self.assertEqual(kw.get("tags"), [])
+        self.assertEqual(kw.get("parent"), "")
+
+    def test_an_unknown_parent_refuses_loudly_and_spawns_nothing(self):
+        r = self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "sdk",
+                       "parent": "99999999-0000-0000-0000-000000000000"})
+        self.assertEqual(r["type"], "warn")
+        self.assertIn("not a session this kernel knows", r["text"])
+        self.assertEqual(self.spawned, [], "a child must never spawn outside the group it was asked into")
+
+    def test_a_malformed_tags_list_refuses_loudly(self):
+        r = self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "sdk", "tags": ["", "x"]})
+        self.assertEqual(r["type"], "warn")
+        self.assertIn("tags must be", r["text"])
+        self.assertEqual(self.spawned, [])
+
+    def test_a_refused_tag_edit_after_the_spawn_is_warned_never_swallowed(self):
+        self.extra = {"tags": [], "tagError": 'two tags are named "pool"'}
+        r = self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "sdk", "tags": ["pool"]})
+        self.assertEqual(len(self.spawned), 1, "the session exists — the refusal rides beside it")
+        self.assertEqual(r["type"], "warn")
+        self.assertIn('two tags are named "pool"', r["text"])
+
+    def test_a_tmux_create_with_tags_refuses_instead_of_dropping_them(self):
+        r = self.send({"type": "createSession", "name": "term1", "dir": self.tmp, "backend": "tmux", "tags": ["pool"]})
+        self.assertEqual(r["type"], "warn")
+        self.assertIn("SDK or Codex", r["text"])
+        self.assertEqual(self.spawned, [], "no tmux spawn with the tags silently gone")
+
+    def test_a_codex_create_takes_tags_and_a_parent_like_an_sdk_one(self):
+        self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "codex",
+                   "tags": ["pool", " infra "], "parent": self.PARENT})
+        self.assertEqual(len(self.spawned), 1, "a Codex create asked into a group is spawned, not refused")
+        nm, be, kw = self.spawned[0]
+        self.assertEqual((nm, be), ("api", "codex"))
+        self.assertEqual(kw.get("tags"), ["pool", "infra"], "names trimmed; applied inside the create, before its push")
+        self.assertEqual(kw.get("parent"), self.PARENT)
+        self.assertEqual(self.sent, [], "nothing to warn about")
+
+    def test_a_codex_create_warns_a_refused_tag_edit_like_the_sdk_arm(self):
+        self.extra = {"tags": [], "tagError": 'two tags are named "pool"'}
+        r = self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "codex", "tags": ["pool"]})
+        self.assertEqual(len(self.spawned), 1, "the session exists — the refusal rides beside it")
+        self.assertEqual(r["type"], "warn")
+        self.assertIn('two tags are named "pool"', r["text"])
+
+    def test_a_codex_create_still_validates_parent_and_tags_up_front(self):
+        r = self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "codex",
+                       "parent": "99999999-0000-0000-0000-000000000000"})
+        self.assertEqual(r["type"], "warn")
+        self.assertIn("not a session this kernel knows", r["text"])
+        r = self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "codex", "tags": ["", "x"]})
+        self.assertIn("tags must be", r["text"])
+        self.assertEqual(self.spawned, [], "a child must never spawn outside the group it was asked into")
+
+    LIVE = "22222222-3333-4444-5555-666666666666"
+
+    def _live_api(self):
+        # a running session named "api", a private views store, and the focus reveal captured
+        saved = (km._live_names, km._reveal_chat_for, km._mark_views_dirty, km.jd.STATE)
+        focused = []
+        km._live_names = lambda *_: {"api": self.LIVE}
+        km._reveal_chat_for = lambda client, m: focused.append(m)
+        km._mark_views_dirty = lambda: None
+        km.jd.STATE = Path(tempfile.mkdtemp())
+        km._flags_cache.clear()
+        def restore():
+            km._live_names, km._reveal_chat_for, km._mark_views_dirty, km.jd.STATE = saved
+            km._flags_cache.clear()
+        self.addCleanup(restore)
+        km._set_timeline_views({"active": "all", "tags": [{"id": "g1", "name": "pool", "members": [self.PARENT]}]})
+        return focused
+
+    def test_a_live_name_with_tags_is_focused_and_warned_never_tagged_and_never_silently_dropped(self):
+        # the picker's Tags row is a PREFILL from the active tab, not an ask: applying it to a running
+        # session would move that session into the active tab's group unasked, and dropping it
+        # silently breaks the fail-loudly rule. So: focus as ever, then one loud warn naming the path.
+        focused = self._live_api()
+        self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "sdk", "tags": ["pool", "infra"]})
+        self.assertEqual(focused, [{"type": "focus", "id": self.LIVE}], "the running session is focused first")
+        self.assertEqual([m["type"] for m in self.sent], ["warn"])
+        self.assertIn('"api" is already running; its tags were not changed', self.sent[0]["text"])
+        self.assertIn("Tags menu", self.sent[0]["text"])
+        self.assertEqual(self.spawned, [])
+        tags = km._timeline_views()["tags"]
+        self.assertEqual([t["name"] for t in tags], ["pool"], "infra was never minted")
+        self.assertNotIn(self.LIVE, [m["sid"] for m in tags[0]["members"]], "the running session did not move")
+        # no tags → the idempotent open stays silent, as before
+        self.sent.clear()
+        self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "sdk"})
+        self.assertEqual(self.sent, [])
+        self.assertEqual(len(focused), 2)
+
+    def test_parent_and_tags_are_validated_before_the_live_name_check(self):
+        focused = self._live_api()
+        r = self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "sdk", "tags": ["", 3]})
+        self.assertEqual(r["type"], "warn")
+        self.assertIn("tags must be", r["text"])
+        r = self.send({"type": "createSession", "name": "api", "dir": self.tmp, "backend": "sdk",
+                       "parent": "99999999-0000-0000-0000-000000000000"})
+        self.assertIn("not a session this kernel knows", r["text"])
+        self.assertEqual(focused, [], "a malformed request is refused whether or not the name runs — nothing focused")
+        self.assertEqual(self.spawned, [])
+
+    def test_the_op_and_the_docs_say_how_the_live_name_case_differs_from_post_new(self):
+        # the two doors disagree on a running name ON PURPOSE — /new's `tags` is always an explicit
+        # --in (re-asserted like model/effort); the picker's is a prefill (warned, not applied). The
+        # op's comment and the docs both state the difference, not a match.
+        src = inspect.getsource(km.Handler._dispatch_ws)
+        op = src[src.index('msg.get("type") == "createSession"'):src.index('msg.get("type") == "cancelCreate"')]
+        live_arm = op[op.index("elif nm in live:"):op.index("elif _thread_name_refusal(nm, _thread_names())")]
+        self.assertIn("its tags were not changed", live_arm)
+        self.assertIn("existing:true arm differs on purpose", live_arm)
+        self.assertNotIn("the same contract as", op)
+        root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        side = " ".join(open(os.path.join(root, "docs", "read-side.md")).read().split())
+        self.assertIn("Opening a running session inherits nothing: `/new` re-asserts an explicit `--in` on it, "
+                      "while the picker's createSession op warns and leaves the running session's tags alone", side)
+        guide = open(os.path.join(root, "docs", "guide.md")).read()
+        self.assertIn("from\nthe picker, a name that already runs is focused and the Tags row is not applied", guide)
 
 
 class NativeDialogAvailability(unittest.TestCase):

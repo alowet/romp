@@ -49,6 +49,13 @@ export function dispatchFrame(panel: any, m: any): boolean {
   // ends its optimistic state on this event and shows the reason in the gear
   if (m.type === "settingRefused" && panel.settingRefused) { panel.settingRefused(m); return true; }
   if (m.type === "tagEditFailed" && panel.tagEditFailed) { panel.tagEditFailed(m); return true; }
+  // the kernel's answer to one of THIS page's views writes (a targeted tag edit, or a whole-blob lens/
+  // order write): the panel adopts the returned blob and settles or reverts its optimistic copy
+  if ((m.type === "tagEditAck" || m.type === "viewsAck") && panel.viewsAck) { panel.viewsAck(m); return true; }
+  // what the kernel can do for this page, sent on every `ready` (a reconnect re-sends it); and the
+  // kernel's answer to an op it does not know — a refusal of that write, and the cap is withdrawn
+  if (m.type === "caps" && panel.setCaps) { panel.setCaps(m); return true; }
+  if (m.type === "unknownOp" && panel.unknownOp) { panel.unknownOp(m); return true; }
   return false;
 }
 
@@ -91,7 +98,13 @@ export function bridgeFunctions(post: Post): Record<string, (...a: any[]) => voi
     // `{ floating: true }` so the kernel forgets the family's remembered pin
     __rompTimelineSendCommand: (name: string, cmd: string, extra?: Record<string, unknown>) => post({ type: "sendCommand", name, cmd, ...(extra || {}) }),
     __rompTimelineSetFlag: (id: string, flag: string, value: unknown) => post({ type: "setSessionFlag", id, flag, value: !!value }),
-    __rompTimelineSetViews: (views: unknown) => post({ type: "setTimelineViews", views }),
+    // a whole-blob write; `edited` names the tag ids the gesture changed (a lens or order write: none), so
+    // the kernel acks a refusal on an untouched tag as ok with the refusal listed
+    __rompTimelineSetViews: (views: unknown, writeId?: unknown, edited?: unknown) =>
+      post({ type: "setTimelineViews", views, writeId, edited: Array.isArray(edited) ? edited : [] }),
+    // one targeted tag edit: the op {op, tid, …} rides NESTED under `edit` (the kernel's tagEdit message),
+    // so no field of it sits at the top level where the federation router reads session addresses
+    __rompTimelineTagEdit: (writeId: unknown, edit: unknown) => post({ type: "tagEdit", writeId, edit }),
     __rompTimelineEditTag: (edit: unknown) => post({ type: "editTag", edit }),
     __rompTimelineDismiss: (id: string) => post({ type: "dismissLane", id }),
     __rompTimelineHover: (sid?: string, segIds?: unknown[], t0?: number, t1?: number) =>

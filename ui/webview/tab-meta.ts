@@ -12,7 +12,12 @@
 // labels): an OPTIMISTIC local edit (the color-swatch click; the kernel's one-shot renamed confirm)
 // records what it expects here, and a push built BEFORE the kernel applied that edit cannot revert
 // the strip while the expectation stands. Cleared by the echo (the push agreeing), or yielded after
-// three silent pushes — the sessionViews pendingViewsAge machinery's constants and reasoning.
+// three silent pushes: the rename and colour routes answer with no per-write ack the strip could
+// key on, so a push that still disagrees after three cycles is the best evidence available that the
+// kernel did not take the edit, and the kernel's view must win (it is the store of record). The
+// views blob's optimistic copy ran the same count until 2026-09-05 and now settles on the kernel's
+// ack and write sequence instead (views-writes.ts); this guard keeps the count until those routes
+// carry an ack of their own.
 
 export interface TabColor { bg: string; fg: string }
 export interface TabSessionMeta { name: string; color: TabColor | null }

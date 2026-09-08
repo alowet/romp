@@ -23,6 +23,9 @@ export interface TagMenuOpts {
   unions: () => TagUnion[];                  // the name-keyed union rows (re-read per repaint)
   onApply: (l: TagLens, done: boolean) => void;  // done=true → the pick closes the menu (All)
   onConfigure?: () => void;                  // the one management entry, when the surface has a route
+  /** a per-surface switch at the foot beside Configure tags… (the chat strip's "Group tabs by tag",
+   *  tab groups 2026-09-04): ✓-marked when on; flips and repaints in place like the tag rows */
+  groupToggle?: { label: string; on: () => boolean; toggle: () => void };
 }
 
 let echoInstalled = false;
@@ -116,12 +119,15 @@ export function openTagMenu(anchor: HTMLElement, opts: TagMenuOpts): void {
     for (const u of opts.unions())
       row(u.name, !lensAll(lens) && (lens.tags || []).includes(u.name), u.color || "#9aa0a6")
         .addEventListener("click", () => { opts.onApply(toggleLens(lens, { tag: u.name }), false); build(); });
-    if (opts.onConfigure) {
+    if (opts.groupToggle || opts.onConfigure) {
       const s = document.createElement("div");
       s.setAttribute("style", "height:1px;margin:4px 6px;background:var(--menu-border, rgba(255,255,255,0.12));");
       menu.appendChild(s);
-      row("Configure tags…", false, null, true).addEventListener("click", () => { closeTagMenu(); opts.onConfigure!(); });
     }
+    if (opts.groupToggle)
+      row(opts.groupToggle.label, opts.groupToggle.on(), null, true).addEventListener("click", () => { opts.groupToggle!.toggle(); build(); });
+    if (opts.onConfigure)
+      row("Configure tags…", false, null, true).addEventListener("click", () => { closeTagMenu(); opts.onConfigure!(); });
   };
   build();
   document.body.appendChild(menu);

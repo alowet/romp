@@ -68,7 +68,8 @@ test("the timeline's standalone helper splits the tag the same way", () => {
 test("chat tabs filter by the #only tag", () => {
   assert.match(RENDER, /import \{ onlyTag, matchesOnly \} from "\.\/only-filter";/);
   assert.match(RENDER, /const visibleIds = only \? inViewIds\.filter\(\(id\) => matchesOnly\(nameOf\(id\), only\)\) : inViewIds;/);
-  assert.match(RENDER, /for \(const id of visibleIds\)/);
+  // the filtered ids are what the strip plan renders (tab-groups.ts planStrip, since tab groups 2026-09-04)
+  assert.match(RENDER, /const plan = planStrip\(visibleIds,/);
 });
 
 test("a filtered view re-points the CHAT BODY, not just the tab bar", () => {

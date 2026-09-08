@@ -42,3 +42,18 @@ export function adoptsProvisional(
 ): boolean {
   return !existed && !!pendingName && arrivedName === pendingName;
 }
+
+/**
+ * Did a kernel `focus` RESOLVE the create in flight to a session that already runs? A create naming a
+ * running session is answered by focusing that session, never by minting one (and, when the request
+ * carried tags, by a warn that they were not applied — sent AFTER the focus). No session frame will
+ * ever adopt the tab then: adoptsProvisional wants a session this client has never seen, and the
+ * running one has been here all along. So the focus is the verdict — when it lands on a session we
+ * hold under exactly the name we asked for while a create is pending, the tab is done. The
+ * provisional id itself is excluded for form's sake (the kernel never learns it, so it cannot focus it).
+ */
+export function focusResolvesProvisional(
+  focusedId: string, focusedName: string | undefined, pendingName: string | null, provisionalId: string | null,
+): boolean {
+  return !!provisionalId && focusedId !== provisionalId && !!pendingName && focusedName === pendingName;
+}

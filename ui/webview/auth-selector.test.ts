@@ -26,10 +26,13 @@ test("the picker's Billing row shows for SDK whenever availability is known", ()
   // one known choice is enough to SHOW the row (the user 2026-08-09) — the both-test only decides
   // buttons vs written-out text; the backend toggle still re-decides the row (tmux CLIs live in the
   // tmux server's env, which the kernel doesn't control)
-  assert.match(RENDER, /const show = !pickMode && !!\(a && \(a\.login \|\| a\.key\)\) && \(beSel\?\.dataset\.be \|\| loadSettings\(\)\.backend\) === "sdk";/);
+  // (pickerBackendChoice reads the Backend row's chip alone since tab groups, 2026-09-04 — the Tags
+  // row wears the same chip grammar, and a selected tag must never read as the backend)
+  assert.match(RENDER, /const show = !pickMode && !!\(a && \(a\.login \|\| a\.key\)\) && pickerBackendChoice\(\) === "sdk";/);
+  assert.match(RENDER, /function pickerBackendChoice\(\): string \{\s*\n\s*const beSel = document\.querySelector\("#picker \.picker-backend:not\(\.picker-host\):not\(\.picker-auth\):not\(\.picker-tags\) \.picker-be-opt\.sel"\) as HTMLElement \| null;\s*\n\s*return beSel\?\.dataset\.be \|\| loadSettings\(\)\.backend;/);
   assert.match(RENDER, /const both = !!\(a!\.login && a!\.key\);/);
   assert.match(RENDER, /auWrap\.style\.display = "none";\s*\/\/ hidden until a sessionList reply carries authAvail/);
-  assert.match(RENDER, /beWrap\.addEventListener\("click", \(\) => syncPickerAuth\(\)\);/);
+  assert.match(RENDER, /beWrap\.addEventListener\("click", \(\) => \{ syncPickerAuth\(\); syncPickerTags\(\); \}\);/);   // the Tags row follows the backend pick too (tab groups)
   // a host switch clears the availability — the choices on screen belong to the OLD host
   assert.match(RENDER, /pickerAuthAvail = null;\s*\n\s*syncPickerAuth\(\);/);
   // …and the reply that re-arms it is dropped-if-stale by the same host check the list itself uses
@@ -49,8 +52,9 @@ test("one real choice renders WRITTEN OUT in the buttons' place, naming the logi
 
 test("the pick rides createSession, omitted when the row is hidden or written-out", () => {
   assert.match(RENDER, /function pickerAuthChoice\(\): string/);
-  assert.match(RENDER, /host: hostSel, \.\.\.\(auth \? \{ auth \} : \{\}\) \}\);/);
-  assert.match(RENDER, /interface CreateReq \{ name: string; backend: string; dir: string; host: string; auth\?: string \}/);
+  // (the picker's Tags row rides the same create since tab groups, 2026-09-04 — omitted the same way when nothing is picked)
+  assert.match(RENDER, /host: hostSel, \.\.\.\(auth \? \{ auth \} : \{\}\), \.\.\.\(tags\.length \? \{ tags \} : \{\}\) \}\);/);
+  assert.match(RENDER, /interface CreateReq \{ name: string; backend: string; dir: string; host: string; auth\?: string; tags\?: string\[\] \}/);
   // text mode sends nothing — the kernel default IS the single choice, and a stale .sel from a
   // previously-selected both-offering host must not ride along
   assert.match(RENDER, /if \(!sel \|\| sel\.style\.display === "none"\) return "";/);

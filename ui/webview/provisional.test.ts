@@ -9,7 +9,7 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional,
+import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional,
   PROVISIONAL_PREFIX } from "./provisional";
 
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
@@ -51,7 +51,42 @@ test("only an unseen session under exactly the requested name adopts the tab", (
   assert.ok(!adoptsProvisional(false, "web:api", "api"), "a remote arrival is not the local one we asked for");
 });
 
+test("executed: a focus on a RUNNING session under the requested name resolves the create in flight", () => {
+  // a create naming a running session is answered by focusing it, never by a new session — so no
+  // session frame will ever adopt the tab (adoptsProvisional wants an unseen one); the focus is the
+  // verdict. Before this the tab stayed pending: the warn that followed a tagged request became a
+  // "Couldn't start api" dialog over a running api, and an untagged one waited 90 s for the same.
+  const prov = mintProvisionalId("x1");
+  assert.ok(focusResolvesProvisional("LIVE", "api", "api", prov));
+  assert.ok(!focusResolvesProvisional("LIVE", "api", "api", null), "no create pending: an ordinary focus");
+  assert.ok(!focusResolvesProvisional("LIVE", "web", "api", prov), "some other session focused mid-create (a feed click): the create is still pending");
+  assert.ok(!focusResolvesProvisional("LIVE", undefined, "api", prov),
+    "a session this client does not hold yet: its frame arrives unseen and adopts the tab the usual way");
+  assert.ok(!focusResolvesProvisional(prov, "api", "api", prov), "the provisional id is never the kernel's to focus");
+  assert.ok(!focusResolvesProvisional("LIVE", "web:api", "api", prov), "a remote namesake is not the local one asked for");
+  assert.ok(focusResolvesProvisional("LIVE", "web:api", "web:api", prov), "…and a remote create resolves to its host-prefixed namesake");
+});
+
 // ── the wiring in render.ts ────────────────────────────────────────────────────────────────────────
+
+test("the focus handler retires the provisional QUIETLY when the kernel answered the create by focusing a running session; a warn after that toasts", () => {
+  const focus = RENDER.slice(RENDER.indexOf('else if (m.type === "focus") {'), RENDER.indexOf('else if (m.type === "dropCitation"'));
+  assert.match(focus, /if \(focusResolvesProvisional\(m\.id, sessions\.get\(m\.id\)\?\.name, pendingNewSession, provisionalId\)\) resolveProvisionalToExisting\(m\.id\);/);
+  assert.ok(focus.indexOf("resolveProvisionalToExisting(m.id)") < focus.indexOf("setActive(m.id"),
+    "retired BEFORE the switch, so dropProvisional's reselect cannot outrank the focus and the real tab is what stays active");
+  assert.ok(focus.indexOf("closingTabs.delete(m.id);") < focus.indexOf("resolveProvisionalToExisting(m.id)"),
+    "…and AFTER the branch's reveal + close-suppression retire, which stay first (the per-viewer focus contract, peek-tab / tab-close-optimistic pins)");
+  const res = RENDER.slice(RENDER.indexOf("function resolveProvisionalToExisting("), RENDER.indexOf("// A create that FAILED."));
+  assert.match(res, /const \{ queued, draft \} = dropProvisional\(\);/, "the tab goes, and the 90 s backstop with it");
+  assert.ok(!res.includes("showConfirm(") && !res.includes("failProvisional(") && !res.includes("warnToast("), "quietly: no dialog, no toast of its own");
+  assert.ok(!res.includes("sendMessage"), "held text is kept as the running session's draft, never sent into a thread the user has not read");
+  assert.match(res, /drafts\.set\(realId, \[drafts\.get\(realId\) \?\? "", held\]\.filter\(Boolean\)\.join\("\\n\\n"\)\);/,
+    "…and never dropped: it joins that session's draft (nothing typed is ever just lost)");
+  assert.match(res, /if \(activeId === realId && ta\) \{ ta\.value = drafts\.get\(realId\) \?\? ""; growComposer\(ta\); \}/,
+    "the reselect may already sit on the real tab (setActive then early-returns): the box is filled here too");
+  // the warn that follows a tagged request finds no create pending → the toast path, unchanged
+  assert.match(RENDER, /if \(provisionalId\) failProvisional\(m\.text\); else warnToast\(m\.text\);/);
+});
 
 test("creating a session opens the provisional tab instead of a modal", () => {
   assert.match(RENDER, /openProvisional\(req\);/);

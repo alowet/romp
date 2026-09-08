@@ -55,7 +55,7 @@ test("the phone gets the chat tag control too — the SHARED button mounted into
   const mnt = RENDER.slice(RENDER.indexOf('const mslot = document.getElementById("mtag-slot")'),
                            RENDER.indexOf("paintTabRowLines(bar);"));
   assert.match(mnt, /tagMenuButton\("filter sessions by tag"/, "the SHARED component, never a copy");
-  assert.match(mnt, /Object\.assign\(\{\}, mv\.actives, \{ chat: l \}\)/, "writes land on the chat lens — per-surface semantics");
+  assert.match(mnt, /postLens\(\{ actives: Object\.assign\(\{\}, \(effViews\(\) \|\| \{\}\)\.actives, \{ chat: l \}\) \}\)/, "writes land on the chat lens — per-surface semantics — as a lens write on the store's blob (the 2026-09-05 review)");
   assert.match(mnt, /syncTagFilter\(mslot\.children\[0\] as HTMLElement, mslot\.children\[1\] as HTMLElement,/,
     "the mobile pair re-syncs every render like the desktop one");
 });
@@ -66,13 +66,24 @@ test("the chat strip and the outline both mount the shared component (source pin
     "tabs + peeks decide through actives.chat");
   assert.match(RENDER, /tagMenuButton\("filter these tabs by tag"/,
     "the tooltip names the surface — the ONE scope carrier since the menu caption retired (2026-08-25)");
-  assert.match(RENDER, /Object\.assign\(\{\}, v\.actives, \{ chat: l \}\)/, "writes land on chat's lens only");
+  assert.match(RENDER, /postLens\(\{ actives: Object\.assign\(\{\}, \(v \|\| \{\}\)\.actives, \{ chat: l \}\) \}\)/, "writes land on chat's lens only");
   assert.match(FLEET, /tagMenuButton\("filter this outline by tag"/,
     "ditto — the outline tooltip names its surface");
   assert.match(FLEET, /Object\.assign\(\{\}, v\.actives, \{ outline: l \}\)/);
   assert.match(FLEET, /if \(!lensVisible\(outlineLens, outlineUnions, s\.sid\)\) continue;/);
   assert.match(FLEET, /fleetViews = m\.views as SessionViews/, "the outline reads views off the feed payload");
   assert.match(KERNEL, /"views": _views_client\(\),   # the rendered views blob — the outline \+ feed tag mounts read it/);
+});
+
+test("the chat's menu carries the 'Group tabs by tag' switch at its foot; the phone mount does not (its strip is hidden)", () => {
+  // tab groups (the user 2026-09-04): the per-browser sectioned-strip switch rides the SHARED menu
+  // as an optional foot row beside Configure tags… — the chat strip passes it, the outline does not
+  const desktop = RENDER.slice(RENDER.indexOf('tagMenuButton("filter these tabs by tag"'), RENDER.indexOf('tagBtn.classList.add("tab-tagfilter");'));
+  assert.match(desktop, /groupToggle: \{ label: "Group tabs by tag"/);
+  const mobile = RENDER.slice(RENDER.indexOf('const mslot = document.getElementById("mtag-slot")'), RENDER.indexOf("paintTabRowLines(bar);"));
+  assert.ok(!mobile.includes("groupToggle"), "the kernel's mobile page hides #tabs (_CHAT_MOBILE_CSS) — nothing to section there");
+  assert.ok(!FLEET.includes("groupToggle"), "the outline filters; it has no strip to section");
+  assert.match(MENU, /if \(opts\.groupToggle \|\| opts\.onConfigure\) \{/, "the foot divider appears for either entry");
 });
 
 test("every pane's Configure tags… routes to THE dialog on the timeline (source pins)", () => {

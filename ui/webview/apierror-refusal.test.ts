@@ -24,7 +24,11 @@ test("the auto-retry tick SKIPS a refused thread (a retry manufactures the same 
 });
 
 test("a refusal paints the tab alarm-red (on-you), not amber retrying", () => {
-  assert.match(R, /\(s\.status\.apiTooLong \|\| s\.status\.apiSpendLimit \|\| s\.status\.apiModelLimit \|\| s\.status\.apiAuthErr \|\| s\.status\.apiRefusal\) \? "tab-blocked" : "tab-retrying"/);
+  // the rule lives in tab-state.ts since tab groups (2026-09-04) — one function for the tab and the
+  // folded section header's pip (tab-state.test.ts executes it); render.ts wears its result
+  const S = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "tab-state.ts"), "utf8");
+  assert.match(S, /\(s!\.apiTooLong \|\| s!\.apiSpendLimit \|\| s!\.apiModelLimit \|\| s!\.apiAuthErr \|\| s!\.apiRefusal\) \? "tab-blocked" : "tab-retrying"/);
+  assert.match(R, /const stateCls = tabStateClass\(s\.status\);/);
 });
 
 test("the chat error card drops Retry on a refusal and names the real fix in plain terms", () => {
