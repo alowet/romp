@@ -236,8 +236,11 @@ never-delivered verdict, or the user's ✕), and a record the CLI wrote from sev
 back-to-back sends retires one bubble per text block (`blocks` on the user event).
 While the socket is down the bubble is labelled "not confirmed", until a kernel
 copy of the send clears the label. A send that landed mid-turn (`absorbed` and
-`landedAt` on the user chat event) wears a "joined mid-turn" header and, when its
-bubble sat at the tail, leaves a cue where the bubble was. The CLI extracts
+`landedAt` on the user chat event) is placed at its send time, and the chat's
+pending bubble is drawn at that same slot from the press — right after the last
+kernel event at the press, below an earlier send's echo or landing and below any
+texts the kernel already held queued — so the landing replaces it in place; there
+is no header and no cue (T252). The CLI extracts
 no image paths on the stream-json route (its only image-path test belongs to the
 interactive composer's paste handler), so an image path in an SDK send lands as
 typed and the echo's text matches. `_path_bearing` and the extension set it tests
