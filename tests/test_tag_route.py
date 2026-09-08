@@ -351,7 +351,10 @@ class ForwardHelper(TagRoute):
 
     def setUp(self):
         super().setUp()
-        self._saved = (dict(km._remotes), km._remote_forward, km._poll_remote_views)
+        # its own name, never the harness's `_saved`: rebinding that tuple here made _TagRouteHarness.tearDown
+        # restore km._mark_views_dirty to km._poll_remote_views for every test after this class (latent while
+        # each test stubbed the mark; the heal's real mark met it, 2026-09-08)
+        self._helper_saved = (dict(km._remotes), km._remote_forward, km._poll_remote_views)
         km._remotes.clear()
         km._remotes["alpha"] = {"host": "alpha", "status": "up", "_views_at": 12345.0,
                                 "views": {"tags": []}}
@@ -360,8 +363,8 @@ class ForwardHelper(TagRoute):
         km._poll_remote_views = lambda r: (self.polled.append(r["host"]) or {"tags": [{"id": "g1", "name": "team", "members": []}]})
 
     def tearDown(self):
-        km._remotes.clear(); km._remotes.update(self._saved[0])
-        km._remote_forward, km._poll_remote_views = self._saved[1], self._saved[2]
+        km._remotes.clear(); km._remotes.update(self._helper_saved[0])
+        km._remote_forward, km._poll_remote_views = self._helper_saved[1], self._helper_saved[2]
         super().tearDown()
 
     def test_a_landed_edit_echoes_fast(self):
@@ -1440,6 +1443,157 @@ class AFaultWithNothingGoodToShowSaysSo(_ViewsFaultMixin, _TagRouteHarness):
         self.assertTrue(clean["ok"], clean)
         self.assertNotIn("viewsFault", clean, "a proved read carries no marker")
         self.assertEqual(clean["seq"], clean["views"]["seq"])
+
+
+class GetViewsSaysSoToo(_ViewsFaultMixin, _TagRouteHarness):
+    """GET /views under a READ fault: the route is the read half of `romp tag` and the poll source of tag
+    federation, and it still served the display read's dict half -- under a cold-cache fault the seq-less empty
+    default, under a 200 -- after every frame and ack had learned to say so (the 2026-09-08 review). A polling
+    peer stores any 200 dict as this host's tags (_poll_remote_views) and keeps its last reading only on a
+    non-200, so for the fault's duration every peer erased this host's tags in its own view, with nothing said
+    there. Now the route answers like the frames: a last-good blob rides marked `viewsFault`, and nothing good
+    is a retryable 503 the peer keeps its last reading through. The peer here is the harness's own server,
+    dialled by the real poller, so the route is exercised as a peer sees it."""
+
+    def _get_views(self):
+        """GET /views as a script or a polling peer sees it: (status, body), a non-200 included."""
+        req = urllib.request.Request("http://127.0.0.1:%d/views" % self.port,
+                                     headers={"X-Romp-Token": os.environ["ROMP_SERVE_TOKEN"]})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode() or "{}")
+
+    def _peer_row(self, reading):
+        """A polling peer's row for THIS kernel, holding `reading` as its last one. No `_views_at`, so the
+        first poll dials; a case that polls again pops the stamp itself (the rate gate is not the subject)."""
+        return {"host": "TESTHOST", "local_port": self.port, "token": os.environ["ROMP_SERVE_TOKEN"], "views": reading}
+
+    def test_a_cold_cache_fault_is_a_retryable_503_and_a_polling_peer_keeps_its_last_reading(self):
+        self._seed("workers")
+        marks = len(self.dirty)                                            # the seed's own mark
+        st, good = self._get_views()
+        self.assertEqual((st, [t["name"] for t in good["tags"]]), (200, ["workers"]))
+        self.assertNotIn("viewsFault", good, "a clean read carries no marker: the route's body is what it was")
+        peer = self._peer_row(good)
+        km._flags_cache.clear()                                            # a kernel that never served the store
+        with _reads_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):
+            st, body = self._get_views()
+            self.assertEqual(st, 503, "nothing good to show is a refusal, never the empty default under a 200")
+            self.assertEqual((body["ok"], body["retryable"]), (False, True))
+            self.assertIn("the tag store could not be read (read failed: [Errno 5]", body["error"])
+            self.assertTrue(body["error"].endswith("retry"), body["error"])
+            self.assertNotIn("timeline-views.json", body["error"], "the person's words; the notice names the file")
+            self.assertNotIn("tags", body, "no tag list a reader could take for the store")
+            self.assertIs(km._poll_remote_views(peer), good, "the peer keeps its last reading on the non-200, as on any blip")
+            self.assertFalse(km._cache_remote_views(peer, km._poll_remote_views(peer)),
+                             "...and stores nothing new: this host's tags stand on every one of the peer's dashboards")
+            self.assertEqual(len(self.dirty), marks, "nothing to repaint anywhere: only the seed marked")
+            self.assertEqual(len(self._faults()), 1, "said once for the episode, however many GETs and polls")
+        with _stat_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):      # the stat arm on a cold cache: the same answer
+            st, body = self._get_views()
+            self.assertEqual(st, 503)
+            self.assertIn("the tag store could not be read (stat failed:", body["error"])
+        st, v = self._get_views()                                          # the disk heals: the file's own read
+        self.assertEqual((st, [t["name"] for t in v["tags"]], v["seq"]), (200, ["workers"], good["seq"]))
+        self.assertNotIn("viewsFault", v)
+        peer.pop("_views_at", None)
+        self.assertFalse(km._cache_remote_views(peer, km._poll_remote_views(peer)),
+                         "the healed reading is the one the peer kept: no change on the peer either side of the fault")
+
+    def test_a_primed_cache_fault_serves_the_last_good_blob_marked_and_a_peer_stores_the_marker_once(self):
+        self._seed("workers", "reviewers")                                  # the writes primed the cache
+        st, good = self._get_views()
+        peer = self._peer_row(good)
+        with _stat_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):   # a warm cache: the file's key cannot be checked
+            st, v = self._get_views()
+            self.assertEqual(st, 200, "a last-good blob is served: a peer with no reading yet gets this host's tags")
+            self.assertEqual((sorted(t["name"] for t in v["tags"]), v["seq"]), (["reviewers", "workers"], good["seq"]))
+            self.assertIn("the tag store could not be read (stat failed:", v["viewsFault"], "and it is said to be unproved")
+            self.assertEqual({k: x for k, x in v.items() if k != "viewsFault"}, good, "the marker is the only difference")
+            self.assertEqual(v.get("tags") or v.get("groups"), good["tags"], "the bare `romp tag` listing reads the tags and ignores the key")
+            marked = km._poll_remote_views(peer)
+            self.assertEqual(marked, v, "the peer takes the 200 as this host's reading, marker and all")
+            self.assertTrue(km._cache_remote_views(peer, marked), "the marker's arrival is one change on the peer")
+            peer.pop("_views_at", None)
+            self.assertFalse(km._cache_remote_views(peer, km._poll_remote_views(peer)),
+                             "...and a later poll of the same fault is none: nothing rebuilds per pass")
+            self.assertEqual(len(self._faults()), 1)
+        st, v2 = self._get_views()                                          # the disk heals
+        self.assertEqual((st, v2), (200, good), "unmarked again")
+        peer.pop("_views_at", None)
+        self.assertTrue(km._cache_remote_views(peer, km._poll_remote_views(peer)), "the marker's departure is the other change")
+        self.assertEqual(peer["views"], good)
+
+
+class TheHealRepaintsAtOnce(_ViewsFaultMixin, _TagRouteHarness):
+    """The pusher caches the feed and the timeline on a signature (_fleet_view_sig) the store's HEAL does not
+    move: the fault's start does (its once-per-episode notice bumps the sync-notice count, a signature input),
+    so the payloads were rebuilt under `viewsFault` -- and then stood, marker and all (on a cold cache with no
+    blob at all), until the clock bucket or an unrelated change rebuilt them. The read that ends an episode now
+    marks the views dirty (_views_read_clean), exactly once per episode end, so the rebuild rides the heal."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_alive = km._alive_sessions
+        km._alive_sessions = lambda now, tmux: []                          # build_feed with no sessions: the views half is the subject
+
+    def tearDown(self):
+        km._alive_sessions = self._saved_alive
+        super().tearDown()
+
+    def test_the_clean_read_that_ends_an_episode_marks_the_views_dirty_once(self):
+        self._seed("workers")
+        km._flags_cache.clear()
+        with _reads_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):
+            km._timeline_views()                                           # a cold-cache episode opens
+        self.assertIn(str(km._views_path()), km._state_fault_seen)
+        n = len(self.dirty)
+        km._timeline_views()                                               # the heal: the episode ends on this read
+        self.assertEqual(len(self.dirty), n + 1, "one mark for the heal")
+        self.assertNotIn(str(km._views_path()), km._state_fault_seen)
+        km._timeline_views()                                               # a hit: no episode to end
+        km._flags_cache.clear()
+        km._timeline_views()                                               # a clean miss: none either
+        self.assertEqual(len(self.dirty), n + 1, "a clean read with no episode open marks nothing")
+        with _stat_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):
+            km._timeline_views()                                           # a PRIMED-cache episode: the last blob served, marked
+        self.assertIn(str(km._views_path()), km._state_fault_seen)
+        km._timeline_views()
+        self.assertEqual(len(self.dirty), n + 2, "one mark per episode end, primed or cold")
+        km._flags_cache.clear()
+        with _reads_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):
+            km._timeline_views()
+        km._views_path().unlink()                                          # the store goes MISSING under the fault
+        self.assertEqual(km._timeline_views()["tags"], [], "empty is the truth now")
+        self.assertEqual(len(self.dirty), n + 3, "the missing-store read ends the episode too, and marks once")
+
+    def test_a_feed_cached_under_the_marker_is_rebuilt_on_the_heal_not_the_next_signature_change(self):
+        # the pusher's real cache on ONE unchanging signature: without the mark that signature serves the marked
+        # payload until something unrelated moves it (the clock bucket, a transcript, a notice)
+        self._seed("workers")
+        seq = km._timeline_views()["seq"]
+        km._mark_views_dirty = self._saved[2]                              # the real mark: the cache it moves is the subject
+        saved = (list(km._built_feed), km._views_dirty[0])
+        try:
+            km._flags_cache.clear()
+            now, sig = int(time.time()), ("one signature",)
+            with _reads_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):
+                feed = km._cached_feed(now, {}, sig)
+                self.assertNotIn("views", feed)
+                self.assertIn("the tag store could not be read", feed["viewsFault"])
+                self.assertIs(km._cached_feed(now, {}, sig), feed, "the same signature serves the cached payload, marker and all")
+            frame = km._tab_order_frame([SID], [{"id": SID}], {SID})        # the disk healed: the pusher's tabs-first read ends the episode
+            self.assertEqual((frame["views"]["seq"], "viewsFault" in frame), (seq, False))
+            healed = km._cached_feed(now, {}, sig)
+            self.assertIsNot(healed, feed, "the heal marked the views dirty: the same signature rebuilds")
+            self.assertNotIn("viewsFault", healed)
+            self.assertEqual(([t["name"] for t in healed["views"]["tags"]], healed["views"]["seq"]), (["workers"], seq))
+            self.assertIs(km._cached_feed(now, {}, sig), healed, "and one rebuild is all: the next serve is the cache")
+        finally:
+            km._built_feed[:] = saved[0]
+            km._views_dirty[0] = saved[1]
 
 
 if __name__ == "__main__":

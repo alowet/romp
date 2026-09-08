@@ -3836,7 +3836,9 @@ def _timeline_views_display():
     blob this kernel served or wrote when the cache holds one, else None -- UNPROVED either way, NEVER
     CACHED, loud once per episode (_note_state_fault), and NAMED: `fault` is the _StateUnreadable the
     blob is served under, None after a read that proved the file state it served (a cache hit at the
-    file's key, a clean read, a missing store). The empty default is not served here (review find,
+    file's key, a clean read, a missing store) -- and a proving read that ENDS an episode marks the views
+    dirty (_views_read_clean), so the payloads cached under the marker are rebuilt on the heal. The empty
+    default is not served here (review find,
     2026-09-08): carried on a frame it is a seq-less empty store that every dashboard adopts as the
     store's word; _timeline_views stands it in for the filtering callers, and _views_payload carries the
     fault instead. Until this change a fault was folded
@@ -3860,7 +3862,7 @@ def _timeline_views_display():
         # keeps a recreated store from being judged against a store that no longer exists. The seq
         # floor is kept (_VIEWS_SEQ_FLOOR): a recreated file is still ORDERED past what was served.
         _flags_cache.pop(str(p), None)
-        _clear_state_fault(p)
+        _views_read_clean(p)
         return _norm_timeline_views({}), None
     except OSError as e:
         # The store EXISTS but cannot be stat'ed (a state dir that cannot be searched): the last blob
@@ -3871,14 +3873,14 @@ def _timeline_views_display():
         _note_state_fault(exc)
         return (hit[1] if hit is not None else None), exc
     if hit is not None and hit[0] == key:
-        _clear_state_fault(p)
+        _views_read_clean(p)
         return hit[1], None
     try:
         d = _read_state_json(p, st, expect=dict)
     except _StateUnreadable as e:
         _note_state_fault(e)
         return (hit[1] if hit is not None else None), e
-    _clear_state_fault(p)
+    _views_read_clean(p)
     if d is None:
         # gone between the stat and the read, or quarantined aside just now: the store IS empty from
         # here, and the entry is forgotten as for a missing store (a file that then appears is not
@@ -4024,6 +4026,29 @@ def _timeline_views_display():
     d = _norm_timeline_views(d)
     _views_cache_put(p, key, d)
     return d, None
+
+
+def _views_read_clean(p):
+    """A read of the views store that proved its state (a hit at the file's key, the file read, a store found
+    missing): the fault episode ends (_clear_state_fault) -- and when one WAS open, the views are marked
+    dirty, so the pusher rebuilds the feed and timeline payloads it cached during the episode on THIS event,
+    the heal, not at the next unrelated change of their signature. The fault's start moves the signature by
+    itself (the once-per-episode notice bumps _sync_notice_count, a signature input); its end moved nothing
+    a READ fault touches (a stat fault also drops and restores the file's mtime key in the signature, so
+    there the heal already rebuilt and this mark is one idempotent build), so under a read fault the frames
+    built under `viewsFault` stood, marker and all, until the clock bucket or
+    some other change rebuilt them. ANY episode, not only a cold-cache one: _note_state_fault registers the
+    fault on the primed-cache arms too (the last-known blob served, marked), so the heal after one of those
+    costs one rebuild as well -- spurious when the file did not move under the fault (the payloads carry the
+    blob the file holds, with a marker to shed), and wanted when it did (the last-known blob served was
+    behind the file, and the read that ends the episode is the one that finds out). The tabOrder frame needs
+    no mark: it is built on every pusher cycle. Wrapping _clear_state_fault rather than changing it: the
+    flags, order and bell readers end their episodes there too and cache no payload of their own."""
+    if str(p) in _state_fault_seen:
+        _clear_state_fault(p)
+        _mark_views_dirty()
+    else:
+        _clear_state_fault(p)
 
 
 def _timeline_views_proved():
@@ -6214,6 +6239,10 @@ def _conserve_tick(now):
         _conserve_last_viewer[0] = now
     elif now - _conserve_last_viewer[0] < CONSERVE_VIEWER_LEASE_S:
         return   # the lease: a reloading page is not a closed dashboard
+    # Under a views read fault this is the last blob served, or -- with nothing served yet -- the empty
+    # default (_timeline_views), whose per-surface lens is ALL: every session then reads as tab-open, so a
+    # fault never closes a session, and at worst restarts the grace clocks the next readable pass counts
+    # from. A stand-down would keep the clocks; the fail-safe direction is already the outcome.
     vc = _views_client()
     running = be.running_sids()
     rows = be.live_sessions()
@@ -44739,7 +44768,24 @@ class Handler(BaseHTTPRequestHandler):
                 # tag federation v0. CANONICAL shape (member pairs), remoteTags absent on purpose:
                 # a polling kernel re-spells pairs for ITS viewer, and never re-imports another
                 # viewer's join (no transitive unions in v0). `romp tag` maps either spelling.
-                return self._send(200, json.dumps(_timeline_views()), "application/json", cache="no-cache")
+                # Under a READ FAULT the route says so, like every frame (_views_payload): with a last-good
+                # blob, the blob marked `viewsFault` under a 200 (a polling peer reads `tags` and `seq` and
+                # ignores the key -- its content compare stores the marked reading once, so the marker's
+                # arrival and departure each cost the peer one rebuild, nothing between; `romp tag --json`
+                # prints it, the bare listing reads `tags` and ignores it); with NOTHING good -- a cold cache
+                # -- a retryable 503 naming the fault, never the empty default under a 200: a polling peer
+                # keeps its last reading on any non-200 (_poll_remote_views), where a 200 `tags: []` replaced
+                # it and emptied this host's tags on every one of the peer's dashboards with nothing said
+                # there. `romp tag` reads the body's `error` once it stops treating a 5xx as an unreachable
+                # kernel (its own change); a curl -sf caller sees a failed fetch, which is the loud end.
+                views, fault = _timeline_views_display()
+                if views is None:
+                    return self._send(503, json.dumps({"ok": False, "retryable": True,
+                                                       "error": "%s \u2014 retry" % _views_fault_text(fault)}),
+                                      "application/json", cache="no-cache")
+                if fault is not None:
+                    views = dict(views, viewsFault=_views_fault_text(fault))
+                return self._send(200, json.dumps(views), "application/json", cache="no-cache")
             if p == "/models":                                # the ONE model + effort choice list — chat statusline, timeline lanes, AND judge settings all read it (the user 2026-07-02: no hardcoding in multiple places)
                 # each choice carries its colormap tint (the user 2026-08-17: the new-comment dialog's
                 # selectors wear the same colors the statusline badges do, for ANY pick — the badge
