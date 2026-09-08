@@ -10464,7 +10464,7 @@ function showActive(keep?: { uuid: string; y: number } | null) {
   const heavy = s.events.length > 0 && (v.el.childNodes.length === 0 || (settings.compact && (v.rendered !== s.events.length || v.stale)));
   if (!heavy) {
     syncView(activeId!); landActive(content, v);
-    if (keepAnchor) restoreScrollAnchor(content, v, keepAnchor);   // the line being read stays put across the rebuild (T249)
+    if (keepAnchor) keepPlaceAcrossWindow(content, v, keepAnchor);   // the line being read stays put across the rebuild (T249; T262l for a re-windowed view)
     return;
   }
   if (v.el.childNodes.length === 0) {   // truly empty → the ROMP LOADER holds the spot (the standing
@@ -10489,8 +10489,23 @@ function showActive(keep?: { uuid: string; y: number } | null) {
     const cc = document.getElementById("content");
     syncView(target);                   // the heavy build now (clears the loading hint)
     landActive(cc, vv);
-    if (keepAnchor && cc) restoreScrollAnchor(cc, vv, keepAnchor);   // same keep on the deferred path (T249)
+    if (keepAnchor && cc) keepPlaceAcrossWindow(cc, vv, keepAnchor);   // same keep on the deferred path (T249; T262l)
   });
+}
+
+// The reader's place across a rebuild that RE-WINDOWED the view (T262l, 2026-09-08, from a lab run: a settings
+// change re-renders every view from scratch; the fresh tail window of a long transcript rarely holds the anchor
+// turn of a reader scrolled up, so restoreScrollAnchor found nothing, the land put them on the raw saved scrollTop
+// in a layout whose spacer estimate had moved by thousands of pixels, and the anchor turn drifted ~200 px on
+// screen). When the direct restore misses, the deep-link land takes over with the kept offset: it renders a
+// window AROUND the anchor's unit (or fetches older history and re-lands on arrival) and writes "keep-offset",
+// the anchor's exact on-screen position — the same machinery a jump into folded history uses.
+function keepPlaceAcrossWindow(content: HTMLElement, v: View, keep: { uuid: string; y: number }): boolean {
+  if (restoreScrollAnchor(content, v, keep)) return true;
+  pendingAnchor = keep.uuid; pendingAnchorKeepY = keep.y;
+  const landed = scrollToAnchor(keep.uuid);
+  if (!anchorPendingOlder) { pendingAnchor = null; pendingAnchorKeepY = null; }   // an older-history fetch keeps them armed for chatHead's re-land
+  return landed;
 }
 
 // Scroll/anchor landing + deep-link diagnostics + restamp, AFTER the active view's DOM is up to date —

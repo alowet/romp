@@ -90,8 +90,8 @@ test("render.ts: showActive keeps the reader's place across a re-show of the vie
   const body = m![1];
   assert.match(body, /const reshow = keepPlaceAcrossShow\(v, v\.el\.style\.display !== "none", content\.clientHeight > 0, navigating\);/);
   assert.match(body, /const keepAnchor = reshow \? \(keep !== undefined \? keep : \(!atBottom\(content\) \? captureScrollAnchor\(content, v\) : null\)\) : null;[^\n]*/, "captured BEFORE the rebuild, like appendActive — or handed in by a caller that had to empty the DOM first");
-  const restores = body.match(/if \(keepAnchor(?: && cc)?\) restoreScrollAnchor\(/g) || [];
-  assert.equal(restores.length, 2, "restored after landActive on the light path AND inside the deferred heavy build");
+  const restores = body.match(/if \(keepAnchor(?: && cc)?\) keepPlaceAcrossWindow\(/g) || [];
+  assert.equal(restores.length, 2, "restored after landActive on the light path AND inside the deferred heavy build (through the window-aware keep, T262l)");
   // the big-view re-collapse to the tail is a SWITCH rule: a re-show of the view on screen must not snap it to the bottom
   assert.match(body, /if \(!reshow && !pendingAnchor && pendingAnchorT == null\n\s*&& v\.el\.querySelectorAll\("\.turn"\)\.length > WINDOW_CAP\)/);
 });
