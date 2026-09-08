@@ -57,6 +57,9 @@ class SkeletonDedup(unittest.TestCase):
         import inspect
         src = inspect.getsource(km._push)
         self.assertIn('_send_client(c, ("timeline",), {"type": "data", "data": skel})', src)
+        # the warm path (the frame projected from the cached build, serialized once per build and deduped on
+        # content) is driven, not pinned: tests/test_kernel_timeline_split.py SkeletonFromCache and
+        # SkeletonSerializedOncePerBuild
 
 
 if __name__ == "__main__":

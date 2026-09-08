@@ -453,10 +453,12 @@ const MAX_INTERP_AHEAD = 150;  // seconds the edge may glide past the last data.
                                // sooner, since 2026-09-04 the skeleton dedups too), so a healthy kernel never
                                // stalls the edge; a dead one is announced by the socket, not by this cap
 // The live edge advances in whole-pixel steps: the loop looks once the edge could have moved this far at the
-// current zoom (see _liveWaitMs, 100-2000 ms between looks) and rebuilds then. It used to be 0.15 px on every
-// animation frame — a full SVG rebuild about twice a second at a one-hour window, on the main thread every
-// pane shares, which is what a chat tab click waited behind (measured 2026-09-04). A sub-pixel glide would
-// need the now-line and open bars translated between rebuilds, not a lower threshold.
+// current zoom (see _liveWaitMs, 100-2000 ms between looks) and moves the plot then — one translate on the
+// plot group plus a width per live-edge rider (_tickTranslate), where a look used to rebuild the whole SVG.
+// Before the pacing it was 0.15 px on every animation frame: a full rebuild about twice a second at a one-hour
+// window, on the main thread every pane shares, which is what a chat tab click waited behind (measured
+// 2026-09-04). A smoother glide is now a pacing choice (a smaller step, a shorter sleep), not a rebuild cost;
+// the pacing stays at a whole pixel.
 const LIVE_MIN_PX = 1;
 function perfNow() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
 function interpNow(baseSec, baseMs, nowMs, live, maxAheadSec) {
@@ -1036,10 +1038,11 @@ class TimelinePanel {
     // time-baseline (epoch sec + the monotonic ms when it was observed); the edge FREE-RUNS off this fixed
     // pair and shouldReanchorEdge re-snaps it only on a genuine step, so per-poll arrival jitter no longer
     // hiccups the edge. _wasLive = were we live-following at the last poll (→ re-anchor on re-entry).
-    // _lastLiveNow = effective-now of the last live repaint (sub-pixel guard so we only repaint when the
-    // edge would actually move). Re-armed each poll; self-stops when not live.
+    // _lastLiveNow = effective-now of the last live move. _tickPlot = the last full build's handle for the
+    // tick (its plot group, live-edge riders and scale; draw()): the tick moves that group by a transform
+    // instead of rebuilding the svg (_tickTranslate). Re-armed each poll; self-stops when not live.
     this._nowBaseSec = null; this._nowBaseMs = null; this._wasLive = false;
-    this._liveRAF = null; this._liveTO = null; this._liveResume = false; this._lastLiveNow = null;
+    this._liveRAF = null; this._liveTO = null; this._liveResume = false; this._lastLiveNow = null; this._tickPlot = null;
     // Newest data.now sample ever seen this page-lifetime (see isFreshNowSample): a push carrying an
     // OLDER now is a RE-EMISSION — federation re-emits the STORED local payload whenever a remote host
     // pushes, and _cached_timeline re-serves its build-time now — never a fresh clock sample, so it must
@@ -1799,13 +1802,13 @@ class TimelinePanel {
   // Arm the rAF loop (no-op if already running or not currently live+visible). Re-armed each poll by
   // update(), so even after the loop self-stops it returns within one poll once we're live again. NOT
   // called from draw() — draw() runs inside the tick, and re-arming there would double the loop.
-  // The live-follow loop: a look (draw if the edge moved LIVE_MIN_PX; see _tickLive), then a sleep sized to
-  // the edge's speed, then the next look on an animation frame. Restarted by update()/applyBars() (each frame
-  // re-paces it: a pending sleep computed for the old zoom or data is dropped), by gestures, and by the
-  // pointer release when a look was skipped under a held pointer. Hidden pane: the loop STOPS (its old 2 s
-  // sleep re-entered _isVisible()'s forced offsetParent layout every wake, for a pane nobody could see —
-  // 2026-09-07) and the paint hold's release (_releasePaintHold) re-arms it; not live-following: it stops
-  // until a gesture pins the edge again.
+  // The live-follow loop: a look (a translate if the edge moved LIVE_MIN_PX, a draw where a translate cannot
+  // express the frame; see _tickLive), then a sleep sized to the edge's speed, then the next look on an
+  // animation frame. Restarted by update()/applyBars() (each frame re-paces it: a pending sleep computed for
+  // the old zoom or data is dropped), by gestures, and by the pointer release when a look was skipped under a
+  // held pointer. Hidden pane: the loop STOPS (its old 2 s sleep re-entered _isVisible()'s forced offsetParent
+  // layout every wake, for a pane nobody could see — 2026-09-07) and the paint hold's release
+  // (_releasePaintHold) re-arms it; not live-following: it stops until a gesture pins the edge again.
   _startLiveTick() {
     if (!this._liveFollowing() || !this._isVisible()) return;
     if (this._liveRAF != null) return;                                        // a look is already imminent
@@ -1816,10 +1819,11 @@ class TimelinePanel {
     this._liveTO = setTimeout(() => { this._liveTO = null; this._liveRAF = requestAnimationFrame(() => this._tickLive()); }, ms);
   }
   // How long until the live edge has moved LIVE_MIN_PX at the current zoom — the loop sleeps exactly that
-  // long between looks instead of waking every animation frame. A full redraw is what a look costs, so at a
-  // one-hour window over a few hundred px that is a redraw every several seconds, not two a second; and the
-  // sleeping loop touches no layout (the old per-frame _isVisible() read forced one — measured 2026-09-04:
-  // ~40% of the main thread on an idle four-pane dashboard, on the thread the chat pane's clicks share).
+  // long between looks instead of waking every animation frame. A look is a translate now (_tickTranslate; it
+  // was a full redraw) and the pacing is unchanged: at a one-hour window over a few hundred px that is a look
+  // every several seconds, not two a second; and the sleeping loop touches no layout (the old per-frame
+  // _isVisible() read forced one — measured 2026-09-04: ~40% of the main thread on an idle four-pane
+  // dashboard, on the thread the chat pane's clicks share).
   _liveWaitMs() {
     const g = this._geom;
     if (!g || !g.winSec || !g.plotW) return 1000;
@@ -1833,11 +1837,55 @@ class TimelinePanel {
     // Click-safe: don't rebuild the SVG under a pressed pointer (a click in progress). The release event
     // (_release) restarts the loop — no polling for it. See the constructor.
     if (this._pointerHeld) { this._liveResume = true; return; }
-    const g = this._geom;
-    if (!g || this._lastLiveNow == null || ((this._liveNow() - this._lastLiveNow) / g.winSec * g.plotW) >= LIVE_MIN_PX) {
-      this.draw();
-    }
+    const g = this._geom, nowS = this._liveNow();
+    // The look MOVES the view, it does not rebuild it: the last full build left a plot group and its live-edge
+    // riders (draw(), `_tickPlot`), and advancing the edge is one transform write on that group plus a width write
+    // per rider — _tickTranslate, which also owns the LIVE_MIN_PX guard, in COMPRESSED movement (inside a
+    // collapsed trailing gap the edge does not move on screen at all, where a real-seconds guard redrew for
+    // nothing). The full draw() stays for what a translate cannot express — no build yet, a glyph riding the live
+    // edge, the next gridline entering the window, a drift into the gutter, never for the clock's advance. A
+    // build that left NO handle (a glyph rode the live edge) has only the full draw for a look, and that look
+    // keeps the guard the loop always had (review find, 2026-09-08): the edge must have moved LIVE_MIN_PX since
+    // the build (_lastLiveNow, set by draw()). Without it such a board redrew the whole svg on every look, every
+    // 2 s at a wide window, where the edge moves a fraction of a pixel between looks and the redraw showed
+    // nothing new. The hand-backs from a handle (a gridline due, the drift cap) are events, not drift: they draw.
+    const tp = this._tickPlot;
+    if (!g || this._lastLiveNow == null) this.draw();
+    else if (!tp || !tp.g || !tp.g.parentNode) { if ((nowS - this._lastLiveNow) / g.winSec * g.plotW >= LIVE_MIN_PX) this.draw(); }
+    else if (!this._tickTranslate(nowS)) this.draw();
     this._sleep(this._liveWaitMs());
+  }
+  // Advance the live edge to `nowS` by moving the plot group (see draw()'s plot group and `_tickPlot`). Returns
+  // true when the frame is expressed — including the no-op of a sub-LIVE_MIN_PX move, or no movement in
+  // compressed time (a collapsed trailing gap) — and false when only a full draw() can: no handle (the loader, or
+  // a glyph riding the live edge was drawn); the clock has reached the next axis gridline (`nextTick`: nothing is
+  // pre-drawn outside the window, so an entering gridline and its clock ARE a rebuild, and the build dated the
+  // event rather than leaving it to the next kernel frame — the kernel dedups an unchanged skeleton and reposts
+  // it every 60 s, so a quiet board would otherwise show a stale axis for up to a minute); or the drift since the
+  // build has reached the gutter gap (no frame has rebuilt since — a quiet or disconnected kernel). The window
+  // geometry the handlers read (_geom's cT0/t0/t1, the held right edge) follows the move, so a pan or a focus
+  // jump begun between builds starts from what is on screen, and the hover re-arms as after a rebuild: the
+  // content moved under a pointer that did not.
+  _tickTranslate(nowS) {
+    const tp = this._tickPlot, g = this._geom;
+    if (!tp || !g || !tp.g || !tp.g.parentNode) return false;
+    if (!tp.trailing && nowS >= tp.nextTick) return false;    // a gridline enters at the right edge: the full draw draws it (inside a trailing gap the axis does not move, so none can)
+    const dc = tp.trailing ? 0 : (g.compress(nowS) - tp.cNow);   // compressed seconds the edge moved since the build
+    const px = dc * tp.k;
+    if (px < 0 || px >= tp.maxDrift) return false;
+    this._lastLiveNow = nowS;
+    if (Math.abs(px - tp.applied) < LIVE_MIN_PX) return true;   // the sub-pixel guard: nothing visible to write yet
+    tp.applied = px;
+    tp.g.setAttribute('transform', 'translate(' + (-px) + ' 0)');
+    for (const r of tp.riders) { if (r.fn) r.fn(px); else r.el.setAttribute(r.attr, Math.max(r.min || 0, r.base + px)); }   // the build's floor applies to the grown extent, so the frame matches a full draw
+    for (const e of tp.edge) {   // an anchored glyph whose anchor crossed the left edge: hidden, as a full draw culls it (inWin) — and hidden takes no pointer
+      const out = e.x - px < tp.left;
+      if (out !== !!e.out) { e.out = out; if (out) e.el.setAttribute('visibility', 'hidden'); else e.el.removeAttribute('visibility'); }
+    }
+    g.cT0 = tp.cT0 + dc; g.t0 = g.decompress(g.cT0); g.t1 = g.decompress(g.cT0 + g.winSec);
+    this._holdReal = g.t1;
+    this._rehover();
+    return true;
   }
   _stopLiveTick() {
     if (this._liveRAF != null) { cancelAnimationFrame(this._liveRAF); this._liveRAF = null; }
@@ -2516,7 +2564,15 @@ class TimelinePanel {
     const i = (this._vis || []).findIndex((s) => s.id === sid);
     if (i < 0) return;
     const y = g.top + i * LANE_GAP + LANE_GAP * 0.5;
-    const X = (tt) => g.ml + ((g.compress ? g.compress(tt) : tt) - g.cT0) / g.winSec * g.plotW;   // compressed-time x
+    // The outline goes INTO the live plot group when the last build left one (_tickPlot): the tick translates
+    // that group, so the outline rides along with its target instead of drifting off it. It is positioned in
+    // the group's own frame (the build's cT0), the translate carrying the rest; with no group (the loader, or
+    // a build with a glyph riding the live edge) it goes on the svg in the screen frame, as before.
+    const tp = this._tickPlot, grp = (tp && tp.g && tp.g.parentNode) ? tp : null;
+    const host = grp ? grp.g : this.svg;
+    const cT0 = grp ? grp.cT0 : g.cT0;
+    const X = (tt) => g.ml + ((g.compress ? g.compress(tt) : tt) - cT0) / g.winSec * g.plotW;   // compressed-time x, in the host's frame
+    const gone = (node) => !node.parentNode || (node.parentNode !== this.svg && !node.parentNode.parentNode);   // detached, or its group left the svg (a rebuild)
     const startMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : null;
     const DUR = 1400;
     if (workTurn) {
@@ -2524,10 +2580,10 @@ class TimelinePanel {
       const xs = X(workTurn.t), xe = X(workTurn.end != null && workTurn.end > workTurn.t ? workTurn.end : workTurn.t);
       const bw = Math.max(6, xe - xs), h = BAR_H + 6;
       const box = el('rect', { x: xs - 3, y: y - h / 2, width: bw + 6, height: h, rx: h / 2, fill: 'none', stroke: '#ffd166', 'stroke-width': 2.5, opacity: 0.95 });
-      this.svg.appendChild(box);
+      host.appendChild(box);
       try { box.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) {}
       const step = (nowMs) => {
-        if (!box.parentNode) return;
+        if (gone(box)) return;
         const p = startMs != null ? Math.min(1, (nowMs - startMs) / DUR) : 1;
         const ph = (p * 2) % 1;                        // two pulses
         box.setAttribute('stroke-width', String(2.5 + ph * 2.5));
@@ -2540,10 +2596,10 @@ class TimelinePanel {
     }
     const cx = X(t);
     const ring = el('circle', { cx, cy: y, r: 5, fill: 'none', stroke: '#ffd166', 'stroke-width': 2.5, opacity: 0.95 });
-    this.svg.appendChild(ring);
+    host.appendChild(ring);
     try { ring.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) {}
     const step = (nowMs) => {
-      if (!ring.parentNode) return;                  // a poll redraw cleared it → stop
+      if (gone(ring)) return;                        // a poll redraw cleared it → stop
       const p = startMs != null ? Math.min(1, (nowMs - startMs) / DUR) : 1;
       const ph = (p * 2) % 1;                         // two expanding pulses
       ring.setAttribute('r', String(5 + ph * 16));
@@ -2555,6 +2611,7 @@ class TimelinePanel {
   }
 
   drawMessage(msg) {
+    this._tickPlot = null;   // the plot group goes with the wipe; the tick has nothing to move until the next build
     while (this.svg.firstChild) this.svg.removeChild(this.svg.firstChild);
     this.svg.setAttribute('height', '60');
     const t = el('text', { x: 14, y: 34, fill: 'var(--text-muted)', 'font-size': 13 }); t.textContent = msg; this.svg.appendChild(t);
@@ -4529,6 +4586,7 @@ class TimelinePanel {
     applyPal();   // refresh the theme palette bindings — a body.theme-light flip lands on this repaint
     if (this.controls) this.controls.style.color = MODEL_FG;   // persistent controls row re-inks per theme (dark: the same #9aa0a6 it was built with)
     this._drawSeq = (this._drawSeq || 0) + 1;   // per-paint nonce: memoizes the overlay scale reflow (_ovScaleNow)
+    this._tickPlot = null;                       // the live tick's translate target — set at the end of a full build (below)
     // LOADING (the user 2026-06-26): until the heavy bars arrive, show ONLY the romp wordmark loader (R +
     // spinning swirl-o + m + p + dots) — NO lanes, NO gridlines. Partial data + empty gridlines read as
     // "broken", so suppress the SVG entirely and show the loader until applyBars sets _barsLoaded. (Data that
@@ -4553,6 +4611,31 @@ class TimelinePanel {
     // that breathes between two tones on a sine ease. That's a per-<text> SMIL `<animate fill>` (added
     // where the chip is drawn below), so no gradient def is needed here.
     svg.appendChild(defs);
+    // THE PLOT GROUP (the live tick as a transform write). Every element positioned by TIME through x() below
+    // goes into this one <g> — bars and their hits, the awaiting/compacting spans, clear seams, branch and
+    // message connectors, arrival and prompt dots, comment squares, the judging runs, the axis gridlines, clocks
+    // and gap squiggles — while the chrome that sits at the window's edges or in the gutter (row hits, lane
+    // lines, names, gear, chips, batteries, the judge rails, the now line, the lock) stays on the svg. Between
+    // builds the live edge advances with the clock, and moving the view by Δc compressed seconds is one attribute
+    // write on this group (translate(-Δc·plotW/winSec, 0)) plus a width write on each element whose right edge
+    // rides the live now (`riders`): the tick (_tickLive → _tickTranslate) does exactly that and nothing else,
+    // where every look of the live loop used to wipe and rebuild the whole svg. The group is APPENDED after the
+    // lane chrome so its paint order matches the old one: over the rows' hit rects and lane lines (a bar must
+    // take the hover), under the lock and the jump button. Clipping stays arithmetic (this file has no clipPath;
+    // see the stub comment): content the build clamped at the window's left edge pokes into the gutter gap by
+    // the drift since that build, which the next frame's rebuild resets, and _tickTranslate hands the tick back
+    // to a full draw() before the drift reaches the battery column. Glyphs are anchored rather than clamped and
+    // overhang their anchor, so the ones anchored within that cap of the edge are listed (`edge`) and the tick
+    // hides each once its anchor crosses the edge, where a full draw would have culled it. Nothing is painted
+    // over the gutter either way. The tick only moves what the build drew — nothing is pre-drawn outside the
+    // window — so what enters or changes between builds waits for a full draw: a gridline and its clock reaching
+    // the right edge get one the moment the clock reaches it (the build dates that, `nextTick`); a lane aging
+    // out or a time-latched visual waits for the next kernel frame — the next push on a changed board, the 60 s
+    // repost of an unchanged skeleton on a quiet one.
+    const plot = el('g', { 'data-tl-plot': '1' });
+    const riders = [];          // {el, attr, base, min} or {el, fn}: the live-edge riders — an open bar's/span's/run's width (or x2) is max(min, base + the drift), base the UN-clamped extent so the floor applies to the grown value; fn re-derives a placement the build centred
+    const edge = [];            // {el, x}: glyphs anchored within the drift cap of the plot's left edge — the tick hides one once its anchor crosses the edge (_tickTranslate), the event a full draw culls it on
+    let liveRiders = false;     // a message glyph or a pending prompt drawn AT the live edge — a path the translate cannot express; the tick then keeps its full draw
     // Pan: the window's RIGHT edge is `now` minus the offset slider; the actual live `now` (nowS)
     // is separate, so pending events still ride the true now (off-screen to the right when panned back).
     const nowS = this._liveNow(), winSec = this.winSec();   // effective now: glides between polls while live-following
@@ -4578,6 +4661,7 @@ class TimelinePanel {
     const cT1 = cNow - off, cT0 = cT1 - winSec;
     const t1 = decompress(cT1), t0 = decompress(cT0);         // real-time window edges (for clip filters)
     this._holdReal = t1;                                      // remember the absolute right edge for the next poll's hold
+    const edgeLive = off === 0;                               // the window's right edge IS the live now: open spans end there and their width rides the tick (riders)
 
     const inWin = (t) => t >= t0 && t <= t1;
     const overlaps = (a, b) => b >= t0 && a <= t1;
@@ -4706,6 +4790,7 @@ class TimelinePanel {
     const chipColX = modelColX + (maxModel > 0 ? Math.ceil(maxModel) + COLGAP : 0);
     const ctxColX = chipColX + (maxChip > 0 ? Math.ceil(maxChip) + COLGAP : 0);
     M.left = ctxColX + (maxCtx > 0 ? Math.ceil(maxCtx) + COLGAP : 4);
+    const maxDrift = Math.max(2, (maxCtx > 0 ? COLGAP : 4) - 1);   // how far the tick may translate the plot before a full draw (_tickPlot, below): the gutter gap left of it, less a pixel
     // (the compacting cue is now a solid teal "compression" rect drawn per-lane below — no shared gradient)
 
     // judging band height: a compact judge row per JUDGES entry, shown only when there's judging
@@ -4732,6 +4817,10 @@ class TimelinePanel {
     // x is LINEAR in compressed time → smooth pan (only zoom rescales). Identity compress = plain linear.
     const x = (t) => M.left + (compress(t) - cT0) / winSec * plotW;
     const laneY = (i) => M.top + i * LANE_GAP + LANE_GAP * 0.5;
+    // A glyph is ANCHORED at its x, not clamped at the edge — a dot overhangs by DOT_R, a comment square by half its
+    // side, a seam or a branch bar by its hit — so the drift cap alone does not keep one anchored just inside the
+    // edge off the battery column: the tick hides each listed glyph once its anchor crosses M.left (`edge`).
+    const nearEdge = (node, ax) => { if (ax - M.left < maxDrift) edge.push({ el: node, x: ax }); return node; };
     this._geom = { ml: M.left, plotW, W, H, top: M.top, t0, t1, cT0, winSec, compress, decompress };
 
     // axis — gridlines + time labels. Ticks at real nice intervals, drawn at their compressed x (evenly
@@ -4750,11 +4839,11 @@ class TimelinePanel {
     placedLabels.push([lockCx - lockHalf, lockCx + lockHalf]);
     for (let tk = Math.ceil(t0 / step) * step; tk <= t1; tk += step) {
       if (inGap(tk)) continue;
-      svg.appendChild(el('line', { x1: x(tk), y1: M.top, x2: x(tk), y2: axisY, stroke: PAL().grid, 'stroke-width': 1 }));
+      nearEdge(plot.appendChild(el('line', { x1: x(tk), y1: M.top, x2: x(tk), y2: axisY, stroke: PAL().grid, 'stroke-width': 1, 'pointer-events': 'none' })), x(tk));   // in the plot group it paints OVER the row hits it used to sit under: the row keeps the pointer
       this._mc.font = '10px ' + this._fontFace();
       const hw = this._mc.measureText(clock(tk)).width / 2;
       if (!placeLabel(x(tk) - hw, x(tk) + hw)) continue;
-      const tx = el('text', { x: x(tk), y: axisY + 14, 'text-anchor': 'middle', fill: 'var(--text-muted)', 'font-size': 10 }); tx.textContent = clock(tk); svg.appendChild(tx);
+      const tx = el('text', { x: x(tk), y: axisY + 14, 'text-anchor': 'middle', fill: 'var(--text-muted)', 'font-size': 10 }); tx.textContent = clock(tk); nearEdge(plot.appendChild(tx), x(tk));
     }
     svg.appendChild(el('line', { x1: x(t1), y1: M.top, x2: x(t1), y2: axisY, stroke: PAL().gridStrong, 'stroke-width': 1 }));
     // broken-axis squiggle(s): one per collapsed gap visible in the window (real edges → compressed x).
@@ -4765,7 +4854,7 @@ class TimelinePanel {
       for (const g of cmap.gaps) if (g.rb > t0 && g.ra < t1) {
         const rx0 = x(g.ra), rx1 = x(g.rb);
         const gx0 = Math.max(M.left, rx0), gx1 = Math.min(plotR, rx1);
-        if (gx1 > gx0 + 0.5) this._drawGapBreak(svg, gx0, gx1, g.ra, g.rb, M.top, axisY, rx0 >= M.left - 0.5, !g.trailing && rx1 <= plotR + 0.5, placeLabel);
+        if (gx1 > gx0 + 0.5) this._drawGapBreak(plot, gx0, gx1, g.ra, g.rb, M.top, axisY, rx0 >= M.left - 0.5, !g.trailing && rx1 <= plotR + 0.5, placeLabel);
       }
     }
     if (!vis.length) { const tx = el('text', { x: M.left, y: M.top + 16, fill: 'var(--text-muted)', 'font-size': 12 }); tx.textContent = 'no romp activity in this window'; svg.appendChild(tx); }
@@ -4839,14 +4928,15 @@ class TimelinePanel {
         // (same ask before & after), so it does NOT split the work — it's an overlay (candy-stripe
         // below). Only a new ASK (typed/queued/absorbed/drain) starts a new period. The bar's color
         // also backs the candy-stripe.
-        const bx = x(a), bw = Math.max(2, x(b) - x(a)), eh = BAR_H + 5;
+        const bx = x(a), bwRaw = x(b) - x(a), bw = Math.max(2, bwRaw), eh = BAR_H + 5;
         // Cross-hover focus on this work period — a DAG journey event (card hover) or the single event
         // hovered in the feed modal — draws EXACTLY like the native bar hover below: the bar itself
         // grown to eh and fully opaque, in its own color. No white outline (the user 2026-07-17).
         const lit = barLit(t, dagOrHover);
         const bh = lit ? eh : BAR_H;
         const bar = el('rect', { x: bx, y: y - bh / 2, width: bw, height: bh, rx: bh / 2, fill: s.color, opacity: lit ? 1 : 0.9 });
-        svg.appendChild(bar);
+        plot.appendChild(bar);
+        const liveEdge = barEndT(t, nowS, data.now) >= t1;   // an OPEN bar ends at the live edge → its width rides the tick (riders, below)
         const act = s.state === 'working' || s.state === 'permission' || s.state === 'needsInput' || s.state === 'awaiting' || s.state === 'awaitingBg' || s.state === 'compacting' || s.state === 'clearing';
         const ongoing = s.live && act && t.end > t.start && (data.now - t.end) <= 5;
         const hit = el('rect', { x: bx, y: y - 7, width: bw, height: 14, fill: 'transparent' }); hit.style.cursor = 'pointer';
@@ -4860,7 +4950,8 @@ class TimelinePanel {
         // work-bar click visibly did nothing while prompt-dot clicks worked (the user, 2026-06-12).
         // The prompt dot keeps the prompt-line uuid.
         hit.addEventListener('click', () => { this._select(s.id); this.openChat(t.tid || this._laneTid(s), workAnchorOf(t), false, false, t.start); });
-        svg.appendChild(hit);
+        plot.appendChild(hit);
+        if (liveEdge) riders.push({ el: bar, attr: 'width', base: bwRaw, min: 2 }, { el: hit, attr: 'width', base: bwRaw, min: 2 });   // the un-clamped extent with the 2 px floor: a just-opened bar grows as a full draw would draw it
       });
       // AWAITING a background task while the main thread is idle (the user 2026-07-13): a full-thickness
       // segment (BAR_H, the work-bar reference) in the lane color from the last work period's end to the
@@ -4876,7 +4967,7 @@ class TimelinePanel {
         if (lx2 - lx1 > 3) {
           const ln = el('line', { x1: lx1, y1: y, x2: lx2, y2: y, stroke: s.color, 'stroke-width': BAR_H,
             'stroke-linecap': 'round', opacity: 0.4, 'pointer-events': 'none' });
-          svg.appendChild(ln);
+          plot.appendChild(ln);
           const rows = ((s.awaitingTasks && s.awaitingTasks.length) ? s.awaitingTasks : [s.awaitingBg])
             .map((d) => '<div class="b" style="opacity:.85">' + esc(d) + '</div>').join('');
           const tip = '<div class="r"><span class="chip" style="background:' + s.color + '"></span><span class="who" style="color:' + s.color + '">' + esc(s.name)
@@ -4891,16 +4982,26 @@ class TimelinePanel {
             if (this._suppressClick) { this._suppressClick = false; return; }
             this._select(s.id); this.openChat(this._laneTid(s), null, true);
           });
-          svg.appendChild(wh);
+          plot.appendChild(wh);
+          if (edgeLive) riders.push({ el: ln, attr: 'x2', base: lx2 }, { el: wh, attr: 'width', base: lx2 - lx1 });
         }
       }
       // AWAITING (permission) → candy-stripe every span the session sat blocked on your
       // input (historical, from the state-transition log), plus the current open one. The
       // dashed white overlay reads as a distinct texture vs a solid "still working" bar.
       const aw = (s.awaiting && s.awaiting.length) ? s.awaiting
-                 : ((s.live && (s.state === 'permission' || s.state === 'needsInput' || s.state === 'awaiting') && s.since != null) ? [[s.since, t1]] : []);
+                 : ((s.live && (s.state === 'permission' || s.state === 'needsInput' || s.state === 'awaiting') && s.since != null) ? [[s.since, t1, true]] : []);
       for (const span of aw) {
-        const a0 = span[0], b0 = span[1];
+        // OPEN = the session is STILL in the state, which the kernel says outright: an interval with no later
+        // transition carries true as its third element ([start, end, true], _state_intervals) beside its
+        // numeric end at the build clock. Draw it to the live edge, the way barEndT draws an open work bar,
+        // so the stripe glides with the edge instead of sitting at the build clock until the next kernel
+        // rebuild. The mark, never the end's distance from data.now (review find, 2026-09-08): a connect
+        // frame carries the cycle's clock over the cached build's lanes, so that distance is the cache's age,
+        // and the 2 s tolerance this read used to be drew a lane blocked right now closed on every connect
+        // over a cache older than that. A null end reads open too (a span this renderer made itself, above).
+        const open = span[1] == null || span[2] === true;
+        const a0 = span[0], b0 = open ? Math.max(nowS, a0) : span[1];
         const sa = Math.max(a0, t0), sb = Math.min(b0, t1); if (sb <= sa) continue;
         // The awaiting interval (state log) and the work bars (transcript) come from different
         // sources, so a bar can end a few seconds BEFORE the permission prompt → a gap (made worse by
@@ -4919,36 +5020,38 @@ class TimelinePanel {
         const eh = BAR_H + 5;
         // colored backing bridges the gap (square caps so it merges with the rounded bars on either side)
         const back = el('rect', { x: bx0, y: y - BAR_H / 2, width: Math.max(2, bx1 - bx0), height: BAR_H, fill: s.color, opacity: 0.9 });
-        svg.appendChild(back);
+        plot.appendChild(back);
         // candy-cane stripes over the ACTUAL awaiting span (shows the session color THROUGH the stripes)
         const stripe = el('rect', { x: x(sa), y: y - BAR_H / 2, width: Math.max(2, x(sb) - x(sa)), height: BAR_H, fill: 'url(#vault-await-hatch)' });
-        svg.appendChild(stripe);
+        plot.appendChild(stripe);
         const sh = el('rect', { x: bx0, y: y - 7, width: Math.max(2, bx1 - bx0), height: 14, fill: 'transparent' }); sh.style.cursor = 'pointer';
-        const end = b0 >= data.now - 2 ? 'now' : clock(b0);
+        const end = open ? 'now' : clock(b0);
         const shtml = () => '<div class="r"><span class="chip" style="background:' + BADGE.attention.bg + '"></span><span class="who" style="color:' + s.color + '">' + esc(s.name) + '</span><span class="k">blocked</span></div><div class="b">blocked on your input · ' + clock(a0) + '–' + end + '</div>';
         const grow = (h) => { for (const r of [back, stripe]) { r.setAttribute('y', y - h / 2); r.setAttribute('height', h); } };
         sh.addEventListener('mouseenter', (e) => { grow(eh); this.showTip(shtml(), e); });
         sh.addEventListener('mousemove', (e) => this.moveTip(e));
         sh.addEventListener('mouseleave', () => { grow(BAR_H); this.hideTip(); });
         sh.addEventListener('click', () => { this._select(s.id); this.openChat(this._laneTid(s), null, true); });
-        svg.appendChild(sh);
+        plot.appendChild(sh);
+        if (open && edgeLive) riders.push({ el: back, attr: 'width', base: bx1 - bx0, min: 2 }, { el: stripe, attr: 'width', base: x(sb) - x(sa), min: 2 }, { el: sh, attr: 'width', base: bx1 - bx0, min: 2 });
       }
       // CONTEXT COMPACTING (LIVE) → cyan cross-hatch over the session color for every span the session
       // sat compacting (PreCompact→PostCompact from the state log), plus the current open one if it's
       // compacting RIGHT NOW. This is the in-progress indicator; the isCompactSummary marker below is the
       // after-the-fact one. Same figure-ground as the awaiting candy-cane.
       const comp = (s.compacting && s.compacting.length) ? s.compacting
-                   : ((s.live && s.state === 'compacting' && s.since != null) ? [[s.since, t1]] : []);
+                   : ((s.live && s.state === 'compacting' && s.since != null) ? [[s.since, t1, true]] : []);
       for (const span of comp) {
-        const a0 = span[0], b0 = span[1];
+        const open = span[1] == null || span[2] === true;   // still compacting (the kernel's open mark): to the live edge (see the awaiting loop)
+        const a0 = span[0], b0 = open ? Math.max(nowS, a0) : span[1];
         const sa = Math.max(a0, t0), sb = Math.min(b0, t1); if (sb <= sa) continue;
-        const eh = BAR_H + 5, cx = x(sa), cw = Math.max(2, x(sb) - x(sa));
+        const eh = BAR_H + 5, cx = x(sa), cwRaw = x(sb) - x(sa), cw = Math.max(2, cwRaw);
         const cback = el('rect', { x: cx, y: y - BAR_H / 2, width: cw, height: BAR_H, rx: 2, fill: s.color, opacity: 0.9 });
-        svg.appendChild(cback);
+        plot.appendChild(cback);
         const chx = el('rect', { x: cx, y: y - BAR_H / 2, width: cw, height: BAR_H, rx: 2, fill: 'url(#vault-compact-hatch)' });
-        svg.appendChild(chx);
+        plot.appendChild(chx);
         const ch = el('rect', { x: cx, y: y - 7, width: cw, height: 14, fill: 'transparent' }); ch.style.cursor = 'pointer';
-        const live = b0 >= data.now - 2;
+        const live = open;
         const cw2 = live ? 'compacting' : 'compacted';
         const chtml = () => '<div class="r"><span class="chip" style="background:#86e1ff"></span><span class="who" style="color:' + s.color + '">' + esc(s.name) + '</span><span class="k">' + cw2 + '</span></div><div class="b">context ' + cw2 + ' · ' + clock(a0) + '–' + (live ? 'now' : clock(b0)) + '</div>';
         const cgrow = (h) => { for (const r of [cback, chx]) { r.setAttribute('y', y - h / 2); r.setAttribute('height', h); } };
@@ -4956,7 +5059,8 @@ class TimelinePanel {
         ch.addEventListener('mousemove', (e) => this.moveTip(e));
         ch.addEventListener('mouseleave', () => { cgrow(BAR_H); this.hideTip(); });
         ch.addEventListener('click', () => { this._select(s.id); this.openChat(this._laneTid(s), null, true); });
-        svg.appendChild(ch);
+        plot.appendChild(ch);
+        if (open && edgeLive) riders.push({ el: cback, attr: 'width', base: cwRaw, min: 2 }, { el: chx, attr: 'width', base: cwRaw, min: 2 }, { el: ch, attr: 'width', base: cwRaw, min: 2 });
       }
       // CONTEXT COMPACTION → a cyan cross-hatch SPAN over the session color (same figure-ground as the
       // awaiting candy-cane: identity color behind, texture in front). The span runs from compaction
@@ -4969,9 +5073,9 @@ class TimelinePanel {
         const ce = Math.min(cp.t, t1);
         const cx = x(cs), cw = Math.max(6, x(ce) - cx), eh = BAR_H + 5;
         const cback = el('rect', { x: cx, y: y - BAR_H / 2, width: cw, height: BAR_H, rx: 2, fill: s.color, opacity: 0.9 });
-        svg.appendChild(cback);
+        plot.appendChild(cback);
         const chx = el('rect', { x: cx, y: y - BAR_H / 2, width: cw, height: BAR_H, rx: 2, fill: 'url(#vault-compact-hatch)' });
-        svg.appendChild(chx);
+        plot.appendChild(chx);
         const ch = el('rect', { x: cx, y: y - 7, width: cw, height: 14, fill: 'transparent' }); ch.style.cursor = 'pointer';
         const chtml = () => '<div class="r"><span class="chip" style="background:#86e1ff"></span><span class="who" style="color:' + s.color + '">' + esc(s.name) + '</span><span class="k">compacted</span></div><div class="b">context compacted · ' + clock(cp.t) + '</div>';
         const cgrow = (h) => { for (const r of [cback, chx]) { r.setAttribute('y', y - h / 2); r.setAttribute('height', h); } };
@@ -4979,7 +5083,7 @@ class TimelinePanel {
         ch.addEventListener('mousemove', (e) => this.moveTip(e));
         ch.addEventListener('mouseleave', () => { cgrow(BAR_H); this.hideTip(); });
         ch.addEventListener('click', () => { this._select(s.id); this.openChat(this._laneTid(s), null, true); });
-        svg.appendChild(ch);
+        plot.appendChild(ch);
       }
       // A /CLEAR SEAM — an episode boundary: the conversation ended here and a blank one began. Drawn
       // as a film-splice cut through the lane (two short slanted strokes), quiet by default with the
@@ -4989,15 +5093,15 @@ class TimelinePanel {
         if (cl.t < t0 || cl.t > t1) continue;
         const sx = x(cl.t), sh = BAR_H + 6;
         for (const dx of [-1.6, 1.6]) {
-          svg.appendChild(el('line', { x1: sx + dx - 2, y1: y + sh / 2, x2: sx + dx + 2, y2: y - sh / 2,
-                                       stroke: '#ffffff', 'stroke-width': 1.2, opacity: 0.55, 'pointer-events': 'none' }));
+          nearEdge(plot.appendChild(el('line', { x1: sx + dx - 2, y1: y + sh / 2, x2: sx + dx + 2, y2: y - sh / 2,
+                                                stroke: '#ffffff', 'stroke-width': 1.2, opacity: 0.55, 'pointer-events': 'none' })), sx);
         }
         const hh = el('rect', { x: sx - 6, y: y - 10, width: 12, height: 20, fill: 'transparent' });
         const html = () => '<div class="r"><span class="chip" style="background:#9cd2ff"></span><span class="who" style="color:' + s.color + '">' + esc(s.name) + '</span><span class="k">cleared</span></div><div class="b">conversation cleared · a fresh one starts here · ' + clock(cl.t) + '</div>';
         hh.addEventListener('mouseenter', (e) => this.showTip(html(), e));
         hh.addEventListener('mousemove', (e) => this.moveTip(e));
         hh.addEventListener('mouseleave', () => this.hideTip());
-        svg.appendChild(hh);
+        nearEdge(plot.appendChild(hh), sx);
       }
       // name left-aligned; status chip in the shared chip column to its right. ENDED or idle >1h
       // (s.faded) → name/chip/ctx blended toward the surface bg to a uniform low luminance (perceptual
@@ -5238,6 +5342,7 @@ class TimelinePanel {
     this._reapCompactBars(compactSeen);   // drop overlay scan-bars for lanes no longer compacting / off-screen
     this._reapWorkLabels(workSeen);        // drop overlay WORKING labels for lanes no longer working / off-screen
     this._reapMetaDots(metaSeen);          // drop switching-dots overlays for lanes whose /model pick has landed / off-screen
+    svg.appendChild(plot);   // the plot group takes its place now: over every row's hit rect and lane line, under the lock and the jump button (drawn last)
 
     // ── branch connectors (the user 2026-08-14): a fork drawn like a git graph — one thick
     // perpendicular bar, work-bar weight (BAR_H), from the parent's lane to the child's at the fork
@@ -5252,7 +5357,7 @@ class TimelinePanel {
       if (y1 === y2) return;
       const bTop = Math.min(y1, y2), bH = Math.abs(y2 - y1);
       const bbar = el('rect', { x: bx - BAR_H / 2, y: bTop, width: BAR_H, height: bH, rx: BAR_H / 2, fill: s.color, opacity: 0.85 });
-      svg.appendChild(bbar);
+      nearEdge(plot.appendChild(bbar), bx);
       const bhit = el('rect', { x: bx - 9, y: bTop - 4, width: 18, height: bH + 8, fill: 'transparent' });
       bhit.style.cursor = 'pointer';
       const pname = (data.sessions.find((p) => p.id === br.fromId) || {}).name || '';
@@ -5263,7 +5368,7 @@ class TimelinePanel {
       bhit.addEventListener('mousemove', (e) => this.moveTip(e));
       bhit.addEventListener('mouseleave', () => { bbar.setAttribute('opacity', '0.85'); this.hideTip(); });
       bhit.addEventListener('click', () => { this._select(s.id); this.openChat(s.id, br.cut ? 'branch:' + br.cut : '', false, false, br.t); });
-      svg.appendChild(bhit);
+      nearEdge(plot.appendChild(bhit), bx);
     });
 
     // obstacles for routing — at each event's process-start (a pending event rides `now` via execAt/startAt)
@@ -5416,14 +5521,15 @@ class TimelinePanel {
       const attrs = { d, fill: 'none', stroke: col, 'stroke-width': STUB_W, opacity: 0.45,
                       'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'pointer-events': 'none' };
       if (!arrived) attrs['stroke-dasharray'] = '1 4';   // in flight — the pending-connector dash (same key as the span)
-      svg.appendChild(el('path', attrs));
+      if (!arrived && !mm.toThreadT) liveRiders = true;   // an un-arrived stub spans to the live edge: the tick cannot translate that
+      plot.appendChild(el('path', attrs));
       // same affordances as a full connector: own-color highlight overlay + wide transparent hit —
       // the SAME path each, so highlight and hover cover the whole half-elbow as one unit —
       // co-lit with the arrival dot (PASS 2 links via msgUI), tooltip + click → where it landed
       const msgLit = dagOrHoverMsg(mm.id);
       const hl = el('path', { d, fill: 'none', stroke: col, 'stroke-width': STUB_W + 3, opacity: msgLit ? 0.95 : 0,
                               'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'pointer-events': 'none' });
-      svg.appendChild(hl);
+      plot.appendChild(hl);
       const u = (msgUI[i] = { hl, dot: null, lit: msgLit });
       const hit = el('path', { d, fill: 'none', stroke: 'transparent', 'stroke-width': MSG_HIT_W,
                                'stroke-linecap': 'round', 'stroke-linejoin': 'round' });
@@ -5465,13 +5571,14 @@ class TimelinePanel {
       const arrived = mm.hasExec || mm.exec !== mm.sent;
       const lineAttr = { d, fill: 'none', stroke: col, 'stroke-width': MSG_W0, opacity: arrived ? 0.5 : 0.4, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
       if (!arrived) lineAttr['stroke-dasharray'] = '1 4';
-      svg.appendChild(el('path', lineAttr));
+      if (mm.pending && !mm.toThreadT) liveRiders = true;   // a pending message lands AT the live edge (execAt): not a translate
+      plot.appendChild(el('path', lineAttr));
       // A connector in the focused journey (DAG card hover) or the hovered subtree's delegation messages
       // lights EXACTLY like its native hover: the own-color highlight overlay at full strength — no white
       // casing (the user 2026-07-17). msgLit remembers the drawn state so a local mouseleave restores it.
       const msgLit = dagOrHoverMsg(mm.id);
       const hl = el('path', { d, fill: 'none', stroke: col, 'stroke-width': MSG_W0 + 3, opacity: msgLit ? 0.95 : 0, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' });
-      svg.appendChild(hl);
+      plot.appendChild(hl);
       const u = (msgUI[i] = { hl, dot: null, lit: msgLit });
       // The hit target is BUILT here but APPENDED in a final pass below, after the arrival dots
       // (the user 2026-07-21, who found that hovering the vertical part didn't pop up the tooltip and they had to hit
@@ -5510,7 +5617,7 @@ class TimelinePanel {
         ? () => { const u0 = msgUI[msgI]; msgSetLight((u0 && u0.hoverSet) || [msgI], false); if (u0) u0.hoverSet = null; c.setAttribute('r', lit ? DOT_R + 2 : DOT_R); this.hideTip(); }
         : () => { c.setAttribute('r', lit ? DOT_R + 2 : DOT_R); if (linkedHl) linkedHl.setAttribute('opacity', lit ? '0.95' : '0'); this.hideTip(); });
       if (onClick) c.addEventListener('click', onClick);
-      svg.appendChild(c);
+      nearEdge(plot.appendChild(c), cx);
       return c;
     };
 
@@ -5521,6 +5628,7 @@ class TimelinePanel {
       if (vidx[mm.toId] == null || !inWin(landXT(mm))) return;
       const col = colorOf(mm.fromId), cy = laneY(vidx[mm.toId]);
       const u = msgUI[i];
+      if (mm.pending && !mm.toThreadT) liveRiders = true;   // its arrival dot rides the live edge (execAt)
       const c = dot(x(landXT(mm)), cy, col, msgHtml(mm), msgNav(mm), u && u.hl, dagOrHoverMsg(mm.id), i);
       if (u) u.dot = c;
     });
@@ -5530,7 +5638,7 @@ class TimelinePanel {
     // Nothing is lost by sitting over a message dot: the dot's tooltip, growth and click are the same
     // message's, and mEnter grows the linked dot too. Prompt dots are drawn after this pass, so they
     // keep their own hover.
-    Object.keys(msgUI).forEach((k) => { const u = msgUI[k]; if (u && u.hit) svg.appendChild(u.hit); });
+    Object.keys(msgUI).forEach((k) => { const u = msgUI[k]; if (u && u.hit) plot.appendChild(u.hit); });
 
     // turn process-start (prompt) dots — at startAt; CLICKABLE → jump to the prompt that started
     // the period. Skipped where a PROCESSED message dot coincides (the message dot stands in).
@@ -5545,6 +5653,7 @@ class TimelinePanel {
       turnsOf(s.id).forEach((t) => {
         if (t.cont) return;                  // a post-sleep continuation piece of one segment: its prompt dot belongs to the FIRST piece, not here
         if (!inWin(startAt(t))) return;
+        if (t.pending) liveRiders = true;    // a pending prompt's dot rides the live edge (startAt): not a translate
         if (execNear(s.id, startAt(t))) return;
         const dx = x(startAt(t));
         // cross-hover focus (dot GROWN in place, via dot()'s lit param): DAG journey node, a coarse card
@@ -5566,7 +5675,7 @@ class TimelinePanel {
         dot(dx, y, isRomp ? '#000' : s.color, tip, () => { this._select(s.id); this.openChat(t.tid || s.id, t.uuid, false, false, startAt(t), 'user'); }, null, dotLit(t, dagOrHover));   // romp message → a black dot (the swirl reads on it); prompt-intent → time fallback restricted to user turns
         if (isRomp) {                                    // the romp favicon swirl INSIDE the black dot; pointer-events:none → the dot keeps its hover/click
           const sz = DOT_R * 1.9;
-          svg.appendChild(el('image', { x: dx - sz / 2, y: y - sz / 2, width: sz, height: sz, href: mediaUrl('romp-swirl-glyph.svg'), 'pointer-events': 'none' }));
+          nearEdge(plot.appendChild(el('image', { x: dx - sz / 2, y: y - sz / 2, width: sz, height: sz, href: mediaUrl('romp-swirl-glyph.svg'), 'pointer-events': 'none' })), dx);
         }
       });
     });
@@ -5593,7 +5702,7 @@ class TimelinePanel {
         sq.addEventListener('mousemove', (e) => this.moveTip(e));
         sq.addEventListener('mouseleave', () => { qGrow(0); this.hideTip(); });
         sq.addEventListener('click', () => { this._select(s.id); this.openChat(s.id, c.uuid, false, false, c.t); });
-        svg.appendChild(sq);
+        nearEdge(plot.appendChild(sq), cx);
       });
     });
 
@@ -5605,16 +5714,16 @@ class TimelinePanel {
       const jY = (i) => jb0 + i * JROW + JROW * 0.5;
       const nameOf = (sid) => { const s = data.sessions.find((z) => z.id === sid); return s ? s.name : sid; };
       const sepY = jb0 - JB_TOPGAP * 0.5;
-      svg.appendChild(el('line', { x1: M.left, y1: sepY, x2: x(t1), y2: sepY, stroke: '#ffffff14', 'stroke-width': 1, 'pointer-events': 'none' }));
+      svg.insertBefore(el('line', { x1: M.left, y1: sepY, x2: x(t1), y2: sepY, stroke: '#ffffff14', 'stroke-width': 1, 'pointer-events': 'none' }), plot);   // the band's fixed chrome goes UNDER the plot group, where it painted before
       // vertical "judges" section label in the freed gutter space, just left of the right-justified judge names
       const jcx = Math.max(12, M.left - 72), jcy = (jY(0) + jY(shownJudges.length - 1)) / 2;
-      const hd = el('text', { x: jcx, y: jcy, fill: 'var(--text-faint)', 'font-size': 9, 'font-weight': 700, 'letter-spacing': '.08em', 'text-anchor': 'middle', transform: 'rotate(-90 ' + jcx + ' ' + jcy + ')' }); hd.textContent = 'judges'; svg.appendChild(hd);
+      const hd = el('text', { x: jcx, y: jcy, fill: 'var(--text-faint)', 'font-size': 9, 'font-weight': 700, 'letter-spacing': '.08em', 'text-anchor': 'middle', transform: 'rotate(-90 ' + jcx + ' ' + jcy + ')' }); hd.textContent = 'judges'; svg.insertBefore(hd, plot);
       shownJudges.forEach((J, ji) => {
         const y = jY(ji);
         // baseline rail through the row, faintly tinted in the judge's colour so each row is identifiable
-        svg.appendChild(el('line', { x1: M.left, y1: y, x2: x(t1), y2: y, stroke: J.color, 'stroke-opacity': 0.28, 'stroke-width': 2, 'stroke-linecap': 'round', 'pointer-events': 'none' }));
+        svg.insertBefore(el('line', { x1: M.left, y1: y, x2: x(t1), y2: y, stroke: J.color, 'stroke-opacity': 0.28, 'stroke-width': 2, 'stroke-linecap': 'round', 'pointer-events': 'none' }), plot);
         // judge name right-justified so it sits right beside the start of its rail
-        const lbl = el('text', { x: M.left - 6, y: y + 3, 'text-anchor': 'end', fill: J.color, 'font-size': 10, 'font-weight': 600 }); lbl.textContent = J.key; svg.appendChild(lbl);
+        const lbl = el('text', { x: M.left - 6, y: y + 3, 'text-anchor': 'end', fill: J.color, 'font-size': 10, 'font-weight': 600 }); lbl.textContent = J.key; svg.insertBefore(lbl, plot);
         // merge this judge's in-window marks into same-session blocks (a stretch of attention)
         // each mark is a RUN SPAN [t, t1] = [sent, recv] (g70): the real wall-clock the judge call ran, not
         // a point back-placed onto the work. Merge adjacent same-session spans into a stretch of attention.
@@ -5632,9 +5741,10 @@ class TimelinePanel {
         for (const b of blocks) {
           // an OPEN run (still in flight) has no recv yet — grow its bar to the live edge so it appears WHEN
           // it starts and advances with the axis, instead of popping in (back-dated) only once it ends.
-          let bx1 = x(b.start), bx2 = x(b.open ? Math.max(b.end, nowS) : b.end);
+          const rx1 = x(b.start), rx2 = x(b.open ? Math.max(b.end, nowS) : b.end);   // the run's own extent; a narrow one draws centred at JMARK_MINW
+          let bx1 = rx1, bx2 = rx2;
           if (bx2 - bx1 < JMARK_MINW) { const c = (bx1 + bx2) / 2; bx1 = c - JMARK_MINW / 2; bx2 = c + JMARK_MINW / 2; }
-          b._x1 = bx1; b._x2 = bx2;
+          b._x1 = bx1; b._x2 = bx2; b._rx1 = rx1; b._rw = rx2 - rx1;
           let lane = laneEnds.findIndex((endX) => bx1 >= endX);
           if (lane === -1) { lane = laneEnds.length; laneEnds.push(bx2); } else laneEnds[lane] = bx2;
           b._lane = lane;
@@ -5652,7 +5762,7 @@ class TimelinePanel {
           // opaque bar; a settled one is slightly dimmed — that's the only cue, no stroke.
           const r = el('rect', { x: x1, y: by - barH / 2, width: x2 - x1, height: barH, rx: Math.min(2.5, barH / 2),
             fill: col, 'fill-opacity': active ? 1 : 0.82, 'data-judge': J.key });
-          svg.appendChild(r);
+          plot.appendChild(r);
           const html = () => {
             const span = b.open ? clock(b.start) + '– running…' : (b.start === b.end ? clock(b.start) : clock(b.start) + '–' + clock(b.end));
             // elapsed (total judge compute) + tokens for this stretch, summed from each mark's matched run
@@ -5670,12 +5780,34 @@ class TimelinePanel {
           hit.addEventListener('mouseenter', (e) => this.showTip(html(), e));
           hit.addEventListener('mousemove', (e) => this.moveTip(e));
           hit.addEventListener('mouseleave', () => this.hideTip());
-          svg.appendChild(hit);
+          plot.appendChild(hit);
+          if (b.open && edgeLive) {   // an open run grows to the live edge: the rider re-derives the full draw's placement from the un-centred extent, so the centring goes once the run is wider than JMARK_MINW
+            const rx1 = b._rx1, rw = b._rw;
+            riders.push({ el: r, base: rw, x0: rx1, fn: (px) => {
+              const w = rw + px, narrow = w < JMARK_MINW, ax = narrow ? rx1 + (w - JMARK_MINW) / 2 : rx1, aw = narrow ? JMARK_MINW : w;
+              r.setAttribute('x', ax); r.setAttribute('width', aw); hit.setAttribute('x', ax - 2); hit.setAttribute('width', aw + 4);
+            } });
+          }
         }
       });
       // (auto-nudge ⚡ marks were removed from the judge band entirely — the user 2026-06-23. An auto-nudge
       // still surfaces as a romp-logo dot on its own lane; the band is now judge run-spans only.)
     }
+
+    // The live tick's handle on this build (see the plot group above and _tickTranslate): the group, its riders,
+    // the compressed now the build stood at and the px-per-compressed-second scale. A message glyph riding the
+    // live edge leaves it null — the tick then does the full draw it always did. The drift cap is the gutter gap
+    // left of the plot (COLGAP past the battery column, 4 px without one): content the build clamped at the
+    // window's left edge may poke that far into the gap before the tick hands back to a full draw; the glyphs
+    // anchored within the cap of the edge (`edge`, nearEdge) overhang their anchor, and the tick hides each once
+    // its anchor crosses the edge (`left`), so none reaches the battery column either. nextTick is the first axis
+    // tick past the window's right edge, in real seconds: the same interval the axis pass above draws at, so the
+    // tick hands back for a full draw exactly when a gridline and its clock would enter.
+    this._tickPlot = liveRiders ? null : {
+      g: plot, riders, edge, left: M.left, cNow, cT0, winSec, k: plotW / winSec, applied: 0,
+      trailing: !!(cmap && cmap.gaps.length && cmap.gaps[cmap.gaps.length - 1].trailing),
+      maxDrift, nextTick: (Math.floor(t1 / step) + 1) * step,
+    };
 
     // far-right ⟩⟩ jump-to-now button — only when held back off the live edge (unpinned)
     if (!this._pinned) this._drawNowButton(svg);

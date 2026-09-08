@@ -16,6 +16,7 @@ import unittest
 from http.server import ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
@@ -27,10 +28,12 @@ os.environ["ROMP_KERNEL_NO_OPEN"] = "1"
 os.environ.setdefault("ROMP_SERVE_TOKEN", "test-token-DO-NOT-USE")
 km = SourceFileLoader("romp_kernel_postpush", os.path.join(BIN, "romp-kernel")).load_module()
 
-# The ONLY functions allowed to build inline: the pusher's own cycle and the tick jobs that run ON
-# the pusher thread (see _pusher_cycle_jobs). Everything request-side pokes instead.
-PUSHER_THREAD_FNS = {"_push_all", "_pusher_cycle_jobs", "_auto_pause_on_limit",
-                     "_auto_pause_on_spend_limit", "_auto_resume_retry", "_interrupt_block_tick"}
+# The ONLY functions allowed to build inline: the pusher's own cycle. Everything request-side pokes
+# instead, and so do the tick jobs that run ON the pusher thread (_pusher_cycle_jobs): their writers
+# mark the views dirty and wake the pusher, whose next cycle carries the change (the interrupt tick's
+# inline push rebuilt nothing the next cycle would not, and the retry-pause flag is read by no view).
+# A tick job that builds inline is the regression this census catches.
+PUSHER_THREAD_FNS = {"_push_all", "_pusher_cycle_jobs"}
 
 
 class PushCallerCensus(unittest.TestCase):
@@ -56,6 +59,32 @@ class PokeCoalescing(unittest.TestCase):
         self.assertTrue(km._pusher_wake.is_set(), "the poke wakes the pusher immediately")
         km._pusher_wake.clear()                       # ONE cycle consumes the whole burst
         self.assertFalse(km._pusher_wake.is_set(), "50 pokes = 1 wakeup = 1 build — coalesced")
+
+
+class MidCycleWakeStartsTheNextCycle(unittest.TestCase):
+    """A tick job's writer sets the wake DURING the cycle (_mark_views_dirty, after that cycle's push): the loop
+    must take it as the NEXT cycle's event, not clear it on the way out. The tick jobs' inline pushes were
+    removed on the strength of this ordering (wait, then clear), which nothing pinned behaviourally."""
+
+    class _Stop(Exception):
+        pass
+
+    def test_a_wake_set_during_the_cycle_is_the_next_cycles_event(self):
+        kinds, n = [], [0]
+
+        def cycle():
+            n[0] += 1
+            if n[0] == 1:
+                km._pusher_wake.set()          # a tick job's writer, after this cycle's push
+            else:
+                raise self._Stop()             # the second cycle: end the while-True loop
+        km._pusher_wake.clear()
+        with mock.patch.object(km, "_pusher_cycle", cycle), \
+                mock.patch.object(km._PERF_STATS, "wake_kind", side_effect=kinds.append), \
+                self.assertRaises(self._Stop):
+            km._pusher()
+        self.assertEqual(kinds, [True], "the loop woke on the event, not on the 0.5 s backstop")
+        self.assertFalse(km._pusher_wake.is_set(), "…and consumed it")
 
 
 class ControlRouteLatency(unittest.TestCase):

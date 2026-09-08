@@ -225,8 +225,8 @@ class TimelineReaders(unittest.TestCase):
         now = 1_000_000
         p = jd.STATE / "states" / (SID + ".jsonl")
         _append(str(p), {"t": now - 300, "state": "working"}, {"t": now - 200, "state": "permission"})
-        self.assertEqual(km._state_intervals(SID, "permission", now), [[now - 200, now]],
-                         "an open awaiting interval runs to now")
+        self.assertEqual(km._state_intervals(SID, "permission", now), [[now - 200, now, True]],
+                         "an open awaiting interval runs to now (the build clock) and carries the open mark the renderer reads")
         _append(str(p), {"t": now - 100, "state": "working"}, {"awaiting": False})
         self.assertEqual(km._state_intervals(SID, "permission", now), [[now - 200, now - 100]])
         self.assertEqual(km._state_intervals(SID, "compacting", now), [])
@@ -239,7 +239,7 @@ class TimelineReaders(unittest.TestCase):
         with open(p, "a") as f:
             f.write(json.dumps({"t": now - 200, "state": "permission"}))
         _bump(str(p))
-        self.assertEqual(km._state_intervals(SID, "permission", now), [[now - 200, now]])
+        self.assertEqual(km._state_intervals(SID, "permission", now), [[now - 200, now, True]])
         self.assertEqual(km._state_ev_cache[str(p)][0], 1, "provisional: not folded into the cache")
 
     def test_postal_event_without_its_newline_still_counts(self):

@@ -485,6 +485,30 @@ class ViewBuilder(unittest.TestCase):
         s = {"turns": [{"atoms": created + pending}]}
         self.assertEqual(km._fold_tasks(s)[0]["status"], "completed", "no result yet is not a rejection")
 
+    def test_declared_plan_encodes_only_the_taskcreate_result_it_reads(self):
+        # event_model.declared_plan is this fold's twin (the #942 review asked that the two stay identical),
+        # so it takes the same read-side change: every result is stored as it came and only the TaskCreate
+        # result is encoded, at its one read. Before, both encoded every result up front, so a Bash result
+        # carrying a value json.dumps refuses aborted the fold; a list-shaped TaskCreate result yields the
+        # same Task #N in both, as it did when the whole result was encoded.
+        def _tu(name, inp, rid):
+            return {"type": "tool_use", "id": rid, "name": name, "input": inp}
+        def _tr(rid, content):
+            return {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": rid, "content": content}]}}
+        def _asst(*blocks):
+            return {"type": "assistant", "message": {"content": list(blocks)}}
+        s = {"turns": [{"atoms": [
+            _asst(_tu("Bash", {"command": "ls"}, "toolu_TEST0021")),
+            _tr("toolu_TEST0021", [{"type": "image", "source": {"data": object()}}]),
+            _asst(_tu("TaskCreate", {"subject": "vet the pairs", "activeForm": "Vetting the pairs"}, "toolu_TEST0022")),
+            _tr("toolu_TEST0022", [{"type": "text", "text": "Task #3 created successfully. Use TaskUpdate to update it."}]),
+            _asst(_tu("TaskUpdate", {"taskId": "3", "status": "in_progress"}, "toolu_TEST0023")),
+            _tr("toolu_TEST0023", "Task #3 updated.")]}]}
+        self.assertEqual([(t["key"], t["text"], t["activeForm"], t["status"]) for t in em.declared_plan(s)],
+                         [("3", "vet the pairs", "Vetting the pairs", "in_progress")])
+        self.assertEqual([(t["id"], t["subject"], t["activeForm"], t["status"]) for t in km._fold_tasks(s)],
+                         [("3", "vet the pairs", "Vetting the pairs", "in_progress")], "the kernel's fold reads the same")
+
     def test_fully_completed_store_drops_the_todo_card(self):
         # a done list is not a live to-do (the user 2026-06-10). At `track`'s screenshot time the store was
         # already all-completed, so the store-based card is correctly ABSENT — not a stale "3/5".
@@ -5810,8 +5834,8 @@ class ViewBuilder(unittest.TestCase):
             {"message": {"content": [{"type": "text", "text": "hi <!-- romp-msg-id: m1 -->"}]}},
             {"message": {"content": [{"type": "tool_result", "content": "inbox: <!-- romp-msg-id: m2 -->"}]}},
             {"message": {"content": "plain <!-- romp-msg-id: m3 -->"}}]}
-        self.assertEqual(set(km._seg_mids(seg)), {"m1", "m2", "m3"},
-                         "msg ids from text blocks, check_inbox tool_results, and string content")
+        self.assertEqual(km._seg_mids(seg), ["m1", "m2", "m3"],
+                         "msg ids from text blocks, check_inbox tool_results, and string content, in document order")
 
     def test_bind_message_exec_id_join(self):
         """A connector binds its exec to the recipient segment that carries its msg id (process-start),

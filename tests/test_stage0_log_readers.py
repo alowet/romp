@@ -168,7 +168,7 @@ class StatesReaders(_StateSandbox):
         with _OpenCounter(self.path) as c:
             _append_rows(self.path, [{"t": NOW - 10, "state": "working"}])
             self.assertEqual(km._last_state(SID), ("working", NOW - 10))
-            self.assertEqual(km._state_intervals(SID, "working", NOW)[-1], [NOW - 10, NOW])
+            self.assertEqual(km._state_intervals(SID, "working", NOW)[-1], [NOW - 10, NOW, True])   # open: the build clock, marked
         self.assertEqual(c.n, 1, "the grown file is opened once, for its tail")
 
     def test_e_a_missing_file_reads_as_before(self):
@@ -301,8 +301,8 @@ class BackendOwnsIsMemoized(unittest.TestCase):
 class ViewSignatureKeysOnExactInputs(_StateSandbox):
     """The feed/timeline signature used to bust every ≤3 s because the judge generation advanced after
     EVERY producer pass, changed store or not — and the per-session tuple missed the SDK snapshot facts the
-    views render (subagent counts, an interrupt, a switch resolving), so those surfaced only via the 5 s
-    time bucket. Now the generation moves only when a pass moved a store, a judge call starting or ending
+    views render (subagent rows, a switch resolving), so those surfaced only via the 5 s time bucket. Now the
+    generation moves only when a pass moved a store, a judge call starting or ending
     is its own signature input, and the snapshot facts are in the tuple."""
 
     SID = "11111111-2222-3333-4444-999999999931"
@@ -338,11 +338,13 @@ class ViewSignatureKeysOnExactInputs(_StateSandbox):
 
     def test_c_snapshot_facts_move_the_signature_without_a_file_or_the_clock(self):
         now = NOW - (NOW % 5)                                 # inside one time bucket throughout
-        base = {"state": "working", "model": "m", "ctx": 10, "effort": "", "mode": "", "fast": "", "since": NOW - 60,
-                "subagents": [], "bgTasks": [], "interrupting": False, "modelPending": False, "retryCount": 0}
+        base = {"state": "working", "model": "m", "context": 10, "effort": "", "mode": "", "fast": "", "since": NOW - 60,
+                "subagents": [], "bgTasks": [], "modelPending": False, "retryCount": 0}
         s1 = km._fleet_view_sig(now, {self.SID: dict(base)})
         self.assertEqual(s1, km._fleet_view_sig(now + 1, {self.SID: dict(base)}), "same inputs, same bucket → same sig")
-        for k, v in (("subagents", [{"id": "a1"}]), ("bgTasks", [{"toolUseId": "t1"}]), ("interrupting", True),
+        # `interrupting` is not in the tuple: no liveness row carries it, and the WS stop op marks the views
+        # dirty itself (tests/test_kernel_timeline_split.py::SkeletonFromCache pins the keyed set)
+        for k, v in (("subagents", [{"id": "a1"}]), ("bgTasks", [{"toolUseId": "t1"}]), ("context", 20),
                      ("modelPending", True), ("retryCount", 3)):
             changed = dict(base); changed[k] = v
             self.assertNotEqual(s1, km._fleet_view_sig(now, {self.SID: changed}), k)

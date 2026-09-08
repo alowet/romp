@@ -625,24 +625,101 @@ def _machine_cut_cause(users, i, cut_t=0.0, cut_cause=""):
     return None
 
 
-def _interrupt_marks(turns, sid=""):
+# The _interrupt_marks memo: (sid, family) -> (turns, (cut_t, cut_cause), (stop_t, human_t)). One entry
+# per key, so a sid pins at most two parses (one per family); the tick's sweep (_intr_marks_forget)
+# releases a sid's entries when it leaves the alive set, and the cap is the backstop for callers that
+# run outside the tick. The counters are bumped through _intr_marks_bump, under a lock: the interrupt
+# and nudge ticks bump them on the pusher thread and a connect-time build_feed bumps them on a WS
+# thread, so a bare `+= 1` here would be a read-modify-write across threads. The memo dict itself
+# needs no lock: its ops are single dict operations on immutable tuples keyed by the parse object, so
+# a lost insert or a double clear is one extra miss, never a wrong answer.
+_intr_marks_memo = {}
+_INTR_MARKS_MEMO_MAX = 512
+_intr_marks_memo_stats = {"hit": 0, "miss": 0, "evict": 0}
+_INTR_MARKS_STATS_LOCK = threading.Lock()
+
+
+def _intr_marks_bump(key, n=1):
+    with _INTR_MARKS_STATS_LOCK:
+        _intr_marks_memo_stats[key] = _intr_marks_memo_stats.get(key, 0) + n
+
+
+def _interrupt_marks(turns, sid="", family=None):
     """(newest genuine user STOP, newest genuine human PROMPT) on this thread, in transcript time —
     the one place the two are tallied, so the predicate below and the interrupt block's EVIDENCE stamp
     read the same events. A MACHINE cut (kernel restart / process death) mints the same stop record but
     is romp's own, so it never counts as a stop (_machine_cut_cause, via the resume notice that follows
     it, or — before that notice reaches disk — the backend's machineCut stamp). The interrupt record
     itself authors 'human', so it's classified FIRST. `sid` is optional only so the pure-atom callers in
-    the tests stay pure: pass it wherever it is known, or a cut still on its way to disk reads as a stop."""
+    the tests stay pure: pass it wherever it is known, or a cut still on its way to disk reads as a stop.
+
+    MEMOIZED per (sid, family) on the IDENTITY of `turns` and the value of the machineCut pair: the
+    result is a pure function of the user atoms and (cut_t, cut_cause) — no clock, no store, no global —
+    so while the caller hands in the same list object and the stamp has not moved, the answer cannot
+    have changed. A new parse object (a transcript or states append, a rewind cut armed or cleared, a
+    live atom merged) or a moved stamp is exactly the event that can change it, and either misses. A
+    held strong reference cannot have its id recycled, so `is` is exact. The inputs are never mutated
+    in place: event_model.parse_session allocates a fresh turns list per parse and _merge_live_atoms
+    copies rather than extends (a test pins the appended-transcript case); a list mutated in place is
+    not a supported input.
+
+    `family` names the parse the caller reads, "judge" (jd.parsed_session's object: the interrupt tick
+    and the nudge tick) or "display" (the kernel _parse cache's object: build_feed's badge). The split
+    is not a correctness requirement — identity keying would make one shared entry exact too — it stops
+    the two objects from evicting each other every cycle. Display-family hits are on the _parse_cache
+    object, which build_feed reads through _merge_live_atoms: that returns the cache object itself when
+    no unlanded live atom is pending and a fresh shallow copy otherwise, so a session mid-stream misses
+    each build until its tail lands (new information; the parse that follows hits again). While a judge
+    pass frame is open the tick alternates between the frame-pinned parse and the cache object, one
+    miss per swap. No family, or an empty sid, means no memo (the pure-atom test callers; a sid-less key
+    would be one slot thrashed by every caller)."""
+    cut = _last_machine_cut(sid) if sid else (0.0, "")
+    key = (sid, family) if (sid and family) else None
+    if key is not None:
+        e = _intr_marks_memo.get(key)
+        if e is not None and e[0] is turns and e[1] == cut:
+            _intr_marks_bump("hit")
+            return e[2]
+        _intr_marks_bump("miss")
     atoms = [a for turn in turns for a in (turn.get("atoms") or [])]
-    cut_t, cut_cause = _last_machine_cut(sid) if sid else (0.0, "")
-    return _interrupt_marks_atoms(atoms, cut_t, cut_cause)
+    res = _interrupt_marks_atoms(atoms, cut[0], cut[1])
+    if key is not None:
+        if len(_intr_marks_memo) >= _INTR_MARKS_MEMO_MAX and key not in _intr_marks_memo:
+            _intr_marks_bump("evict", len(_intr_marks_memo))   # the repo's overflow idiom: clear whole
+            _intr_marks_memo.clear()
+        _intr_marks_memo[key] = (turns, cut, res)
+    return res
+
+
+def _intr_marks_forget(alive):
+    """Drop every memo entry whose sid is not in `alive`. The interrupt tick calls this with the cycle's
+    alive set, so a session leaving it (death, the recorded event) releases the parses its entries pin
+    instead of holding them for the kernel's life. Iterates a key snapshot: a connect-push build on a
+    WS thread may insert concurrently."""
+    for k in list(_intr_marks_memo):
+        if k[0] not in alive and _intr_marks_memo.pop(k, None) is not None:
+            _intr_marks_bump("evict")
 
 
 def _interrupt_marks_atoms(atoms, cut_t=0.0, cut_cause=""):
     """The pure-atom core of _interrupt_marks — `atoms` plus the backend's machineCut stamp as
     plain arguments, so the classifier is testable without a states/ file (T219's repro rides
-    this surface)."""
-    users = [a for a in atoms if a.get("type") == "user"]
+    this surface).
+
+    A user atom whose `author` key is present and None is dropped before the text scan.
+    event_model.author_of returns None for exactly one shape, a record with no text block (every
+    branch on a non-empty text returns an author; the final `_is_real_prompt` gate is the only path
+    to None), so such an atom can be neither an interrupt record (is_interrupt_record needs text) nor
+    a human prompt (author != "human"), and the forward scan in _machine_cut_cause reads past it as
+    wedge either way: dropping it changes no tally. Its reach is narrow on purpose. The file adapter
+    OMITS the key for a None author rather than writing it (measured on a 31-session state copy: all
+    19,667 text-less user atoms lack the key; none carries None), so on disk-parsed sessions this gate
+    meets nothing, and a key-less atom must NOT be skipped: an SDK live-tail atom
+    (sdk_backend.msg_to_atom sets no author on stream user messages) may carry text, and a merged
+    live interrupt record would otherwise go uncounted until a parse of the disk record replaced it —
+    on a feed-only dashboard, whose cached parse nothing refreshes promptly, an arbitrary lag on the
+    "interrupted" badge. The per-cycle scan itself is what the memo in _interrupt_marks removes."""
+    users = [a for a in atoms if a.get("type") == "user" and a.get("author", "") is not None]
     last_intr = last_human = 0
     for i, a in enumerate(users):
         t = a.get("t", 0)
@@ -655,7 +732,7 @@ def _interrupt_marks_atoms(atoms, cut_t=0.0, cut_cause=""):
     return last_intr, last_human
 
 
-def _interrupt_suppresses_nudge(turns, sid=""):
+def _interrupt_suppresses_nudge(turns, sid="", family=None):
     """True while the session's most recent USER action is a GENUINE user INTERRUPT: the user stopped
     the agent and hasn't spoken since, so they're at the controls — auto-nudge stays suppressed until
     their NEXT message (the user 2026-07-05, refined via ui: re-engage on the user-message EVENT, never
@@ -670,8 +747,9 @@ def _interrupt_suppresses_nudge(turns, sid=""):
     user 2026-07-14: restart-cut SDK sessions sat inertly in Working wearing that false badge, and
     auto-nudge stayed off so a genuine RE-stall was never caught). Such a cut is identified by the romp
     resume notice that FOLLOWS its record (_interrupt_cause) and is EXCLUDED from the user-stop tally —
-    or, in the window before that notice reaches disk, by the backend's machineCut stamp (pass `sid`)."""
-    last_intr, last_human = _interrupt_marks(turns, sid)
+    or, in the window before that notice reaches disk, by the backend's machineCut stamp (pass `sid`).
+    `family` is _interrupt_marks' memo family, passed through by the per-cycle callers."""
+    last_intr, last_human = _interrupt_marks(turns, sid, family)
     return last_intr > last_human
 
 
@@ -2611,7 +2689,46 @@ def _rgb(color):
         return [112, 136, 170]
 
 
+_sessions_scope_stats = {"hit": 0, "miss": 0, "wide_hit": 0, "wide_miss": 0}   # the cycle memo's counters (the
+#                                 tests read them). Bumped only under an open scope, and the scope is opened by one
+#                                 thread at a time (the pusher's cycle), so plain increments: no lock, unlike
+#                                 _intr_marks_memo_stats, which connect-time builds bump from socket threads
+
+
 def _sessions(now, window=None, forks=True):
+    """The discover() rows the surfaces build from — [{sid, name, anchor, path, mtime}], newest
+    transcript first — for every romp session touched within `window` (discover's 48h default).
+
+    Inside a pusher cycle the rows are memoized on the cycle's scope (_live_scope.sessions, opened by
+    _pusher_cycle, thread-confined like its liveness snapshot): every _alive_sessions call in the tick
+    jobs, every _path_of miss under _compacting_now, _msg_summaries, build_session and the tab/lane
+    lists each ran a discover fingerprint (a stat per names entry, three times, plus one per
+    transcript) and a stat per row — 34-37 sweeps per cycle on a profiled 30-session kernel, 4.3% of
+    the pusher's GIL, all returning the same rows. One sweep per (window, forks) key per cycle now;
+    outside a cycle every read is fresh, exactly as _tmux_sessions and _path_of behave. The key is
+    normalized the way discover normalizes its own (jd.WINDOW for None, bool(forks)).
+
+    Every call hands out a COPY of the row list, hit or miss, so no caller can grow or reorder the
+    cycle's shared list (the headless _alive_sessions fallback returns this list as its own). The row
+    dicts themselves are shared by every in-cycle consumer and read-only by contract — each filters or
+    reorders into a list of its own, and build_session copies before its one write; a consumer that
+    wrote into a row would leak the write into every other consumer of the cycle.
+
+    Within one cycle the rows' membership and `mtime` are the cycle's snapshot: a transcript that grows
+    mid-cycle keeps its start-of-cycle mtime here, so _msg_summaries' per-sid cache and
+    _timeline_sessions' dead-lane cutoff lag one cycle at most, healed by the next sweep (never an
+    under-scan: the next cycle's fresh mtime forces the rescan), and a names/ rewrite delivered by a cwd
+    op after the memo fills is seen next cycle, as _live_scope.names already behaves. Direct
+    jd.discover callers (_walk_root_record, _token_analytics) are not served by this; the wide walk in
+    _alive_sessions has its own scope memo (_discover_wide)."""
+    memo = getattr(_live_scope, "sessions", None)
+    key = (jd.WINDOW if window is None else int(window), bool(forks))
+    if memo is not None:
+        hit = memo.get(key)
+        if hit is not None:
+            _sessions_scope_stats["hit"] += 1
+            return list(hit)
+        _sessions_scope_stats["miss"] += 1
     out = []
     for fsid, path, anchor, name in jd.discover(now, window, forks):
         try:
@@ -2620,7 +2737,30 @@ def _sessions(now, window=None, forks=True):
             mtime = 0
         out.append({"sid": fsid, "name": name or fsid[:8], "anchor": anchor, "path": str(path), "mtime": mtime})
     out.sort(key=lambda s: s["mtime"], reverse=True)
+    if memo is not None:
+        memo[key] = out
+        return list(out)
     return out
+
+
+def _discover_wide(now, window):
+    """{fsid: discover row} over `window` — the wide walk _alive_sessions resolves a live session idle
+    longer than the 48h caption window through. Memoized on the pusher cycle's scope beside _sessions
+    (key ("wide", window)): whenever one such session is live, every _alive_sessions call in the cycle
+    — the two builds, the chat tabs and about eight tick jobs — repeated the walk, a fingerprint each.
+    Read-only for every caller (a dict lookup per sid), so no copy. Outside a cycle it reads fresh."""
+    memo = getattr(_live_scope, "sessions", None)
+    key = ("wide", int(window))
+    if memo is not None:
+        hit = memo.get(key)
+        if hit is not None:
+            _sessions_scope_stats["wide_hit"] += 1
+            return hit
+        _sessions_scope_stats["wide_miss"] += 1
+    wide = {f[0]: f for f in jd.discover(now, window=window)}
+    if memo is not None:
+        memo[key] = wide
+    return wide
 
 
 def _path_of(sid, now=None):
@@ -2730,7 +2870,7 @@ def _alive_sessions(now, tmux):
     have = {s["sid"] for s in alive}
     stale_live = [sid for sid in tmux if sid not in have]
     if stale_live:
-        wide = {f[0]: f for f in jd.discover(now, window=jd.DEATH_BACKFILL_WINDOW)}
+        wide = _discover_wide(now, jd.DEATH_BACKFILL_WINDOW)   # one walk per cycle (the scope memo)
         for sid in stale_live:
             ent = wide.get(sid)
             if ent is not None:
@@ -7160,7 +7300,8 @@ def _auto_pause_on_limit():
         _set_retry_paused(True)
         sys.stderr.write("retry-pause: auto-engaged — usage limit reached (%s) → auto-retry + judges paused until reset\n"
                          % ",".join(account))
-        _push_all()
+        # no inline push: _set_retry_paused marked the views dirty and woke the pusher, whose next cycle
+        # carries the flip in its globalRetryPaused frame (see _auto_resume_retry)
 
 
 def _spend_capped_session(now, tmux):
@@ -7191,7 +7332,8 @@ def _auto_pause_on_spend_limit(now, tmux):
         _set_retry_paused(True, reason="spend")
         sys.stderr.write("retry-pause: auto-engaged — monthly spend limit reached → auto-retry + judges "
                          "paused until the cap is raised (claude.ai/settings/usage)\n")
-        _push_all()
+        # no inline push: _set_retry_paused marked the views dirty and woke the pusher, whose next cycle
+        # carries the flip in its globalRetryPaused frame (see _auto_resume_retry)
 
 
 def _auto_resume_retry(now, tmux):
@@ -7204,7 +7346,19 @@ def _auto_resume_retry(now, tmux):
 
     Event-based recovery signal: a live session that is NOT currently blocked on an API error AND has written
     fresh transcript output since the pause began (mtime past the pause floor) is proof the account can serve
-    requests again. Clearing re-enables both auto-retry and the judges together."""
+    requests again. Clearing re-enables both auto-retry and the judges together.
+
+    Delivery (the two auto-pause siblings above do the same): no inline push from this thread.
+    _set_retry_paused ends in _mark_views_dirty, which stamps the dirty mark and sets _pusher_wake, so
+    the pusher's next cycle rebuilds past the mark and its globalRetryPaused frame (sent to every chat
+    client on every push) carries the flip, one cycle start after the write, sub-second; the active
+    tab's key stats retry-paused.json as well (_ACTIVE_SIG_FILES), so the queued-hold reason follows on
+    that same push. The inline _push_all that used to end this branch spared no rebuild — the next
+    cycle's dirty-forced build is the same one — and cost a second push's fixed work per flip. A
+    BACKGROUND chat tab's queued-hold reason still waits for its own key to move (_chat_build_sig folds
+    neither the flag's file nor the dirty mark): pre-existing, unchanged. The re-arm below is a store
+    write the cards show (a given-up card's summary sentinel goes back to None), made after the flag's
+    own stamp, so it marks the views dirty itself: the write is the new information."""
     if not _retry_paused_on():
         return
     floor = _retry_pause_ts()
@@ -7224,9 +7378,11 @@ def _auto_resume_retry(now, tmux):
                 rearmed = jd.rearm_failed_summaries(now)  # while degraded, so their summaries/briefs retry now
                 if rearmed:
                     sys.stderr.write("distiller: re-armed %d given-up card(s) after recovery\n" % rearmed)
+                    _mark_views_dirty()                  # a store write the cards show, after the flag's stamp
             except Exception:
                 sys.stderr.write("rearm-failed-summaries: %s\n" % traceback.format_exc())
-            _push_all()                                  # globalRetryPaused=false reaches the UI immediately
+            # no inline push: _set_retry_paused marked the views dirty and woke the pusher; its next cycle
+            # carries globalRetryPaused=false (docstring)
             return
 
 
@@ -7801,14 +7957,27 @@ def _interrupt_block_tick(now, tmux):
     The once-per-episode marker is VERIFIED against the store each tick, never trusted (the user
     2026-08-08): judges complete/clear the goal it points at off newer turns (or compaction archives
     it), and trusting the bare marker skipped the re-block forever — the live focus goal sat in
-    Working wearing only the badge, auto-nudge suppressed: invisible-blocked."""
-    changed = False
-    for s in _alive_sessions(now, tmux):
+    Working wearing only the badge, auto-nudge suppressed: invisible-blocked.
+
+    No inline push: both writers end in _mark_views_dirty(), which stamps the dirty mark and sets
+    _pusher_wake, so the next cycle's own _push_all rebuilds past the mark. The inline call spared no
+    rebuild (the next cycle's dirty-forced build is the same one); it delivered the flip one cycle tail
+    earlier (the jobs after this tick plus the next cycle's liveness read: sub-second) at a second
+    push's fixed cost, and on the stand-down path below (a marker whose block a judge now owns) it
+    pushed with nothing new to show. The two fault paths push nothing either: an unproved ledger
+    stands the block down before any write, and a refused marker write leaves the store write's own
+    dirty mark to carry the flip."""
+    alive = _alive_sessions(now, tmux)
+    for s in alive:
         sid = s["sid"]
         if _session_flag(sid, "hideFromFeed"):           # muted from the feed → no interrupt-block bookkeeping either
             continue
         st = (tmux.get(sid) or {}).get("state", "")
-        if st in _NEEDS_INPUT_STATES or st == "compacting" or _compacting_now(sid):
+        # the row's own path and live meta go in: the default _path_of searched the 48h set, so a LIVE
+        # session idle longer than that — resolved into this row by _alive_sessions' wide walk — read as
+        # having no transcript here, and an optimistic compact click on it could not be disproved by its
+        # compact_boundary for the 180 s cap
+        if st in _NEEDS_INPUT_STATES or st == "compacting" or _compacting_now(sid, tm=tmux.get(sid), path=s["path"]):
             continue                                     # awaiting you / compacting → a different needs-you path owns it
         if _api_error(s["path"]):                        # stopped on an API error → not a user stop
             continue
@@ -7816,8 +7985,9 @@ def _interrupt_block_tick(now, tmux):
             turns = jd.parsed_session(sid, [s["path"]], now)["turns"]
         except Exception:
             continue
-        stop_t, human_t = _interrupt_marks(turns, sid)   # the two EVENTS this tick reasons about — and the
-        #                                                  evidence times both writes are stamped with
+        stop_t, human_t = _interrupt_marks(turns, sid, family="judge")   # the two EVENTS this tick reasons
+        #                                                  about — and the evidence times both writes are
+        #                                                  stamped with (memo family: the judge parse)
         block_it = bool(turns) and not _session_working(turns) and stop_t > human_t
         if block_it:                                     # a GENUINE user stop → block the focus goal on them,
             snap = _auto_nudge_data()
@@ -7845,27 +8015,28 @@ def _interrupt_block_tick(now, tmux):
                                      for a in (turn.get("atoms") or [])])
                 g = _record_interrupt_block(sid, ev)
                 if g:
-                    # the block IS filed — a proved goal-store write, a needs-you flip the feed must hear —
-                    # so this pushes whatever the marker write's fate: a fault landing between the tag
-                    # check above and here refuses the marker, the next tick stands down at the check, and
-                    # the first healed tick re-mints the marker (_record_interrupt_block hands back the gid
-                    # of a card our own block already holds, appending nothing)
-                    _set_intr_blocked(sid, g); changed = True
+                    # the block IS filed — a proved goal-store write that marked the views dirty, a needs-you
+                    # flip the next cycle carries — whatever the marker write's fate: a fault landing between
+                    # the tag check above and here refuses the marker, the next tick stands down at the check,
+                    # and the first healed tick re-mints the marker (_record_interrupt_block hands back the
+                    # gid of a card our own block already holds, appending nothing)
+                    _set_intr_blocked(sid, g)
         else:                                            # working / re-engaged / machine cut → lift OUR block if any
             ib = _intr_blocked(sid)
             if ib:
                 # the re-engagement IS the newest turn's trigger — the same stamp the judges will put on
                 # every verdict about that turn, so their ruling outranks this lift on arrival order.
-                # The lift runs whatever the ledger's state — it is the user's own re-engagement — but
-                # `changed` follows the MARKER write: refused under a fault, the marker stays in the last
-                # proved snapshot, the lift re-runs as a no-op next tick, and nothing pushes every cycle.
-                # A lift that could not READ the goals store (False: its row is filed) keeps the marker
-                # too, so the next tick retries the lift rather than erasing it (the #1019 boundary)
+                # The lift runs whatever the ledger's state — it is the user's own re-engagement. Nothing
+                # pushes from here (docstring): a lift that wrote the store marked the views dirty itself;
+                # a marker write refused under a fault leaves the marker in the last proved snapshot, the
+                # lift re-runs as a no-op next tick, and a no-op marks nothing, so nothing rebuilds every
+                # cycle either. A lift that could not READ the goals store (False: its row is filed) keeps
+                # the marker too, so the next tick retries the lift rather than erasing it (the #1019 boundary)
                 if _lift_interrupt_block(sid, ib, turns[-1].get("t") if turns else 0):
-                    if _set_intr_blocked(sid, None):     # spent → the marker goes; `changed` follows the write
-                        changed = True
-    if changed:                                          # a needs-you flip should reach the feed at once
-        _push_all()
+                    _set_intr_blocked(sid, None)     # spent → the marker goes; refused under a fault it stays
+                #                                      in the last proved snapshot and the next tick retries
+    _intr_marks_forget({s["sid"] for s in alive})       # a sid that left the alive set releases its memo entries
+    # a flip's writer marked the views dirty and woke the pusher: the next cycle carries it (docstring)
 
 
 def _walk_root_record(sid):
@@ -10104,7 +10275,7 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only
     lt = turns[-1]
     if _session_working(turns):                      # still actively working (event model) → not orphaned
         return "working"
-    if _interrupt_suppresses_nudge(turns, sid):      # the user's LAST action was a GENUINE interrupt → they're
+    if _interrupt_suppresses_nudge(turns, sid, family="judge"):   # the user's LAST action was a GENUINE interrupt → they're
         return "user-interrupt"                                # driving; suppressed until their NEXT message. The stopped
         #                                              focus goal's BLOCKED-on-you flip is owned by the always-on
         #                                              _interrupt_block_tick (a needs-you rule, not a nudge feature).
@@ -23954,7 +24125,7 @@ def _fold_tasks(session):
     _read_task_store). Returns the tasks in creation
     order, or None if there were none. The webview renders this as a todo card (kind:'todo') and hides the
     raw Task* calls (ACK_TOOLS) — so the kernel emits the folded card and skips the raw tool events."""
-    out = {}                                              # tool_use_id → result text (carries 'Task #N')
+    out = {}                                              # tool_use_id → result content (a TaskCreate's carries 'Task #N')
     rejected = set()                                      # tool_use_ids whose result came back is_error
     for turn in session["turns"]:
         for a in turn["atoms"]:
@@ -23962,8 +24133,7 @@ def _fold_tasks(session):
                 continue
             for b in (a.get("message") or {}).get("content", []) or []:
                 if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id"):
-                    c = b.get("content")
-                    out[b["tool_use_id"]] = c if isinstance(c, str) else json.dumps(c)
+                    out[b["tool_use_id"]] = b.get("content")
                     if b.get("is_error"):
                         rejected.add(b["tool_use_id"])
     tasks, order = {}, 0
@@ -23988,7 +24158,12 @@ def _fold_tasks(session):
                     # id, as before.
                     if b.get("id") in rejected:
                         continue
-                    m = re.search(r"Task #(\d+)", out.get(b.get("id"), "") or "")
+                    # Only a TaskCreate's result is ever read, so only it is encoded, here, to the same text
+                    # the regex saw when every result was encoded up front. Encoding every Bash and Read
+                    # output (list-shaped ones, image blocks) for a value nothing read was 0.3% of the pusher
+                    # (cProfile of the push thread on a loaded kernel, 2026-09-06).
+                    r = out.get(b.get("id"), "")
+                    m = re.search(r"Task #(\d+)", (r if isinstance(r, str) else json.dumps(r)) or "")
                     tid = m.group(1) if m else "c%d" % order
                     af = inp.get("activeForm")
                     tasks[tid] = {"_order": order, "id": tid, "subject": str(inp.get("subject") or ""),
@@ -24534,7 +24709,7 @@ def _chat_build_sig(sess, tm=None):
     """A cheap (transcript mtime,size, states mtime,size) signature for the chat-build cache — busts on any
     new content OR a state transition (idle/working), the two things that change a session's chat payload,
     plus the judge generation, the task store, the pending cut, and — when the caller hands the session's
-    snapshot row `tm` — the facts the build renders from it (state, model, ctx, effort, subagents, background
+    snapshot row `tm` — the facts the build renders from it (state, model, context, effort, subagents, background
     tasks, pending picks, retry count, connected, spawning). The judge generation used to advance every pass
     and so rebuilt every background tab within ~3 s whatever changed; it now advances only when a judge-
     written store moved, so the snapshot digest is what keeps a background tab's chips within one cycle of
@@ -24575,7 +24750,7 @@ def _chat_build_sig(sess, tm=None):
     sig.append(_be.pending_cut(sess.get("sid") or "") if _be else "")
     if tm is not None:
         t = tm
-        sig.append((t.get("state"), t.get("model"), t.get("ctx"), t.get("effort"), t.get("mode"), t.get("fast"), t.get("since"),
+        sig.append((t.get("state"), t.get("model"), t.get("context"), t.get("effort"), t.get("mode"), t.get("fast"), t.get("since"),
                     len(t.get("subagents") or ()), len(t.get("bgTasks") or ()), bool(t.get("interrupting")),
                     bool(t.get("modelPending")), bool(t.get("effortPending")), bool(t.get("authPending")),
                     int(t.get("retryCount") or 0), bool(t.get("connected")), bool(t.get("spawning")),
@@ -30024,9 +30199,12 @@ def build_feed(now, tmux=None):
         # The user's LAST action on this session was an INTERRUPT (no message from them since): its quiet
         # is user-chosen, not a stall — auto-nudge is suppressed (same predicate, _auto_nudge_tick) and
         # the working card wears an "interrupted" badge saying so (the user 2026-07-05). Cache-only,
-        # like the working dot: the badge snaps in once _warm_fleet_bg fills the parse.
+        # like the working dot: the badge snaps in once _warm_fleet_bg fills the parse. The read is memoized
+        # on that cache object's identity (_interrupt_marks, the "display" family), so an unchanged parse
+        # costs no scan per build.
         try:
-            sess_interrupted = bool(ps) and not who_working and _interrupt_suppresses_nudge(ps["turns"], fsid)
+            sess_interrupted = bool(ps) and not who_working and \
+                _interrupt_suppresses_nudge(ps["turns"], fsid, family="display")
         except Exception:
             sess_interrupted = False
         # A user interrupt still IN FLIGHT (dispatched, not yet settled): the card wears a steady
@@ -31041,10 +31219,22 @@ WIN_WEEK = 7 * 86400                           # The footer shows tokens per win
 
 def _state_intervals(sid, want, now):
     """Every [start,end] the session sat in `want` ('permission'/'picker' → awaiting candy-stripes,
-    'compacting' → cross-hatch), from states/<sid>.jsonl: an entry runs until the next transition
-    (or `now` if still in it). `want` is a single state or any collection of them (the awaiting band
-    passes both needs-input states). Forward-only — periods predating the log don't appear. File-based
-    port of the obsidian timeline's stateIntervals (the kernel reads states/, never tmux).
+    'compacting' → cross-hatch), from states/<sid>.jsonl: an entry runs until the next transition, or to
+    `now` (the build's clock) if the session is still in it, and that open interval carries True as a
+    third element, [start, end, True]: the open mark the renderer reads (romp-timeline-view.js) to draw the
+    stripe to the live edge. The mark is the lane's own state, never a clock compare (review find,
+    2026-09-08): the renderer used to read an end within 2 s of the payload's `now` as open, and a connect
+    push re-stamps the cycle's clock over the cached build's lanes (_push), so that distance was the
+    cache's age, and a lane blocked right now drew closed on every connect over a cache older than 2 s. The
+    end stays numeric on purpose: a null end would be a wire break, since every already-loaded renderer
+    (an open dashboard, an installed extension) takes Math.min(null, t1) = 0 and drops the stripe for a
+    lane blocked or compacting right now; a third element those renderers never read breaks nothing. The
+    clock-stamped end costs no per-cycle work: the lanes frame is
+    serialized once per build and deduped on content, so while the state lasts the frame goes once per
+    rebuild (the end moved), and an unchanged rebuild sends nothing. `want` is a single state or any
+    collection of them (the awaiting band passes both needs-input states). Forward-only — periods
+    predating the log don't appear. File-based port of the obsidian timeline's stateIntervals (the kernel
+    reads states/, never tmux).
     Folds the states log append-incrementally since 2026-09-03 (_fold_records): every timeline
     rebuild used to re-read and re-parse the whole file, twice per session (once per `want`); the
     intervals themselves are cheap."""
@@ -31054,10 +31244,11 @@ def _state_intervals(sid, want, now):
     for i, (t, st) in enumerate(ev):
         if st not in want:
             continue
-        end = ev[i + 1][0] if i + 1 < len(ev) else now
+        open_now = i + 1 >= len(ev)                       # no later transition: the session is still in it…
+        end = now if open_now else ev[i + 1][0]           # …so the interval runs to the build clock
         if end < cutoff:
             continue
-        out.append([max(t, cutoff), end])
+        out.append([max(t, cutoff), end, True] if open_now else [max(t, cutoff), end])   # …marked open for the renderer
     return out
 
 
@@ -32413,10 +32604,37 @@ def _seg_prompt(seg):
     return blocks if isinstance(blocks, str) else ""
 
 
+def _encoded_mids(content, ids=None):
+    """POSTAL_RE's matches over json.dumps(content) — the search a list-shaped tool_result gets — computed
+    without encoding the whole result, appended to `ids` in document order. Only the strings the encoding
+    would write (dict keys and string values; every other value encodes to digits, true/false/null or
+    brackets) can carry a marker, and a match cannot cross the encoder's `, ` and `: ` separators (the id
+    admits no space), so encoding just the strings that hold the marker's literal and matching each alone
+    yields the same ids in the same order. A value json.dumps would refuse (an unexpected type) contributes
+    nothing instead of raising. Encoding every list-shaped result was 2.3% of the pusher (cProfile of the
+    push thread on a loaded kernel, 2026-09-06): those lists are mostly image and tool_reference blocks that
+    never carry a marker, and a base64 image block is the expensive part."""
+    if ids is None:
+        ids = []
+    if isinstance(content, str):
+        if "romp-msg-id" in content:
+            ids += jd.em.POSTAL_RE.findall(json.dumps(content))
+    elif isinstance(content, dict):
+        for k, v in content.items():
+            if isinstance(k, str) and "romp-msg-id" in k:
+                ids += jd.em.POSTAL_RE.findall(json.dumps(k))
+            _encoded_mids(v, ids)
+    elif isinstance(content, (list, tuple)):
+        for v in content:
+            _encoded_mids(v, ids)
+    return ids
+
+
 def _seg_mids(seg):
     """Postal message ids referenced anywhere in a segment (its romp-msg-id markers, in text blocks or
     a check_inbox tool_result) — joins a recipient's WORK segment to the message that triggered it, so
-    the timeline connector can bind to the true process-start."""
+    the timeline connector can bind to the true process-start. Called per segment on every timeline
+    build, so it reads the blocks in place (_encoded_mids) rather than encoding them."""
     ids = []
     for a in seg.get("atoms", []):
         msg = a.get("message") or {}
@@ -32428,10 +32646,15 @@ def _seg_mids(seg):
                 if not isinstance(b, dict):
                     continue
                 if b.get("type") == "text":
-                    ids += jd.em.POSTAL_RE.findall(b.get("text", ""))
+                    t = b.get("text")
+                    if isinstance(t, str):                # a null text field is skipped, not a TypeError
+                        ids += jd.em.POSTAL_RE.findall(t)
                 elif b.get("type") == "tool_result":
-                    c = b.get("content")
-                    ids += jd.em.POSTAL_RE.findall(c if isinstance(c, str) else json.dumps(c))
+                    c = b.get("content")                  # str | list[dict] | None from the SDK, as passed through
+                    if isinstance(c, str):
+                        ids += jd.em.POSTAL_RE.findall(c)
+                    elif c is not None:
+                        _encoded_mids(c, ids)
     return ids
 
 
@@ -33117,11 +33340,13 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
     Message connectors (need the courier) and cross-pane focus/hover are later increments — emitted
     empty/null so the render's conditional paths hide them.
 
-    with_bars=False builds only the LANES SKELETON (sessions + tokens + status) — the heavy per-segment
-    bars, the judging band, the message connectors and the nudge marks are left empty. The push sends this
-    skeleton FIRST so the lanes paint instantly, then ships the bars as a separate {type:"bars"} message
-    (the user 2026-06-25, who wanted everything else loaded and the bars loaded after). build_timeline is ~95%
-    bars+judging by payload and the dominant startup cost, so the skeleton is cheap and lands immediately."""
+    with_bars=False builds only the LANES SKELETON (sessions + status) — the heavy per-segment bars, the
+    judging band and the message connectors are left empty. The push ships the lanes as a {type:"data"}
+    frame FIRST and the bars as a separate {type:"bars"} message (the user 2026-06-25, who wanted everything
+    else loaded and the bars loaded after); build_timeline is ~95% bars+judging by payload. The skeleton
+    BUILD runs only on the cold live-first connect (no cached full build yet): every warm push projects the
+    lanes frame from the cached full build instead (_timeline_skeleton; the WARM note in _push has the
+    contract and its lag), so the with_bars=False branches below are the cold-connect path."""
     if tmux is None:
         tmux = _tmux_sessions()
     alive = _timeline_sessions(now, tmux, live_only=live_only)   # living + window-dead (≤12h) lanes; per-session `live` below marks the dead ones (struck). live_only → live sessions only (cold-start first paint)
@@ -33187,16 +33412,14 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
             # ONE derivation with the chat chip (the user 2026-07-03: after an API error the chat read
             # API ERROR → READY while the lane sat on raw-snapshot 'working'): the lane state IS
             # _session_chip — same event-model working, api-error gate, compacting corroboration,
-            # interrupt stamp. The SKELETON build has no fresh parse, so it uses the CACHED one (no cold
-            # cost; the {type:"bars"} build refines a beat later); a COLD cache falls back to the raw
-            # snapshot state — the only moment the two surfaces may briefly differ, self-healing on the
-            # next build (the 2026-06-26 fast-first-paint contract).
-            # Same INPUT, not just the same formula (the user 2026-07-03): the chat chip computes over the
-            # LIVE-MERGED session, and the lane badge rides the SKELETON build (the {type:"bars"} message
-            # carries no states) — so the skeleton must merge the live tail onto the cached parse too, or
-            # a live atom that changes the answer splits the two surfaces on EVERY push (chat WORKING /
-            # lane READY, the phantom-working divergence). The merge is dict work on in-memory atoms — no
-            # parse, so the fast-first-paint contract holds.
+            # interrupt stamp. Same INPUT, not just the same formula (the user 2026-07-03): the chip
+            # computes over the LIVE-MERGED session, so the full build's lane does too (`session` above is
+            # merged). The SKELETON build — the cold live-first connect only — has no fresh parse: it uses
+            # the CACHED one with the live tail merged the same way, and a COLD cache falls back to the raw
+            # snapshot state, the one moment the two surfaces may briefly differ, self-healing on the next
+            # build (the 2026-06-26 fast-first-paint contract). Warm pushes project the lanes from the
+            # cached full build, so the lane's state trails the chat chip by at most REBUILD_MIN_S or the
+            # 5 s bucket (the WARM note in _push).
             comp_sess = session if with_bars else _parse_cached(s["path"])
             if not with_bars and comp_sess is not None:
                 try:
@@ -34028,6 +34251,101 @@ def _dedup_sig(msg, s):
     return s
 
 
+# The pusher's wire caches, counted: a collection's per-entry split served from _delta_split_memo (hit) or run
+# (miss, a raise included), whole frames serialized per slot (a _LazyWire made; at most once per build each),
+# builds whose payload could not be keyed and took the whole dump for their signature, and values a wire encoder
+# shipped as str() (_wire_default, one per encode). Bumped through _wire_bump, under a lock: the pusher and a
+# handler-thread connect push both split, and whichever sender thread first materializes a _LazyWire bumps its
+# counter, so a bare `+= 1` here would be a read-modify-write across threads (the tests assert exact counts).
+_wire_stats = {"split_hit": 0, "split_miss": 0, "feed_body": 0, "bars_body": 0, "feed_sig_fallback": 0,
+               "bars_sig_fallback": 0, "default_str": 0}
+_WIRE_STATS_LOCK = threading.Lock()
+_wire_default_said = set()   # type names _wire_default has written to stderr: a type is said once, not per value
+
+
+def _wire_bump(key, n=1):
+    with _WIRE_STATS_LOCK:
+        _wire_stats[key] = _wire_stats.get(key, 0) + n
+
+
+def _wire_default(o, enc="wire"):
+    """json.dumps's `default` for every wire encoder: the per-entry pass (_delta_split, _delta_parts' remainder),
+    the whole frames (_push) and the delta frames (_send_slot_delta). Returns str(o), the bytes the bare
+    `default=str` the delta paths carried produced, so the wire is unchanged. What changes is that the value is
+    no longer silent: _wire_stats["default_str"] counts every value shipped this way, one per encode (a value in
+    an entry is counted by the per-entry pass and again by the whole frame, if one goes), and the type is
+    written to stderr once, naming the encoder that met it first. A value json cannot encode (a set, a datetime,
+    a Path) is a builder's mistake, and str() of it is not what the pane expects; the whole-frame dumps used to
+    carry no `default` at all and raised on such a value, out of _push, on the pusher thread. The first
+    sighting of a type also files one bell row of kind "refused" (review find, 2026-09-08): a counter and a
+    stderr line reach nobody at the dashboard, and one refused row per distinct fault is how a fault the user
+    should see is surfaced (#1020, the state readers); the type name is the fault's identity, so a repeat
+    files nothing."""
+    _wire_bump("default_str")
+    tn = type(o).__name__
+    if tn not in _wire_default_said:
+        _wire_default_said.add(tn)
+        sys.stderr.write("wire: %s serialized via str() in %s\n" % (tn, enc))
+        _sync_notice("a %s value in the %s frame cannot be encoded as json; it reached the dashboard as text "
+                     "(str() of it), a builder's mistake to fix" % (tn, enc), ok=False, kind="refused")
+    return str(o)
+
+
+def _wire_default_in(enc):
+    """_wire_default bound to the encoder's name, for its `default=`."""
+    return lambda o: _wire_default(o, enc)
+
+
+class _LazyWire:
+    """A whole-frame serialization produced on the first send that needs it and kept for every later one: the
+    chat payload's `ms` (see _send_chat: None until a client takes the full-send branch, then materialized once
+    and reused) applied to the feed and the bars. Between rebuilds a frame's bytes are consumed only as a
+    LENGTH — the deduped byte counts, _send_slot_delta's size guard — and the whole frame itself goes a few
+    times an hour: a fresh socket, a re-base, a client without deltas, a delta past the guard. Serializing every
+    build for that was a second whole encode of each payload per rebuild.
+
+    text() materializes (once; two threads racing here compute the same bytes and one write wins) and size()
+    answers the length: exact once materialized, before that the caller's ESTIMATE — the per-entry strings'
+    byte total (_parts_est), which sits under the whole frame by what the entries do not carry, the frame's key
+    names and separators. The estimate only makes the size guard fall back to a whole frame slightly more
+    eagerly and the deduped byte counts read a little low; it never changes a frame's bytes.
+
+    The cell sits inside a wire tuple (_feed_wire, _bars_wire), which is rebound whole and never mutated:
+    materializing mutates the cell, not the tuple, so a handler-thread serve that materializes never clobbers
+    a refill the pusher made meanwhile. `stat` names the _wire_stats counter bumped on materialization; `text`
+    pre-fills the cell (an unkeyable build, whose whole dump the signature needed anyway)."""
+    __slots__ = ("_fn", "_s", "_est", "_stat")
+
+    def __init__(self, fn, est, stat=None, text=None):
+        self._fn, self._s, self._est, self._stat = fn, text, est, stat
+
+    def text(self):
+        s = self._s
+        if s is None:
+            s = self._fn()
+            self._s = s
+            if self._stat:
+                _wire_bump(self._stat)
+        return s
+
+    def size(self):
+        s = self._s
+        return len(s) if s is not None else self._est
+
+    def materialized(self):
+        return self._s is not None
+
+
+def _wire_text(pre):
+    """The bytes of a wire form that is either a str or a _LazyWire (materializing the latter)."""
+    return pre if isinstance(pre, str) else pre.text()
+
+
+def _wire_len(pre):
+    """The length of a wire form that is either a str or a _LazyWire — the latter's estimate until it is made."""
+    return len(pre) if isinstance(pre, str) else pre.size()
+
+
 # A dropped client is LOUD. _mk_ws_send raises when a client is WS_QUEUE_BYTES behind, and every caller
 # caught that with a bare `c["alive"] = False` — so a dashboard dropped every few minutes for a day (the
 # flashing "may be stale" prompt) left NO trace in the kernel log, the shim logged nothing on its side, and
@@ -34153,21 +34471,46 @@ _DELTA_SLOTS = {
 _DELTA_SEP = "\u001f"          # joins composite keys; never appears in an id or a sid
 _DELTA_MAX_FRACTION = 0.6      # a delta this large a fraction of the full payload is sent as the full instead
 _delta_parts_cache = {}        # frame type -> (payload object identity, parts) — one split per BUILD, shared by clients
+_delta_split_memo = {}         # (frame type, collection) -> (collection object identity, its split) — the same once-per-build
+#                                rule one level down. _push serves the feed as a COPY of the cached build with the cycle's
+#                                ledgers attached (feed = dict(feed_src)), so a cycle whose ledgers moved but whose build
+#                                did not is a new payload object around the same asks list: the payload cache misses and,
+#                                without this, every card was encoded again for a remainder-only change. Identity-keyed
+#                                on the premise the payload cache and _feed_wire already rest on — a built collection is
+#                                never mutated in place; a rebuild mints a new one. One entry per (frame type,
+#                                collection), replaced on a miss: it pins the entry graph _delta_parts_cache pins.
 _delta_unkeyable_said = set()  # (frame type, why) already written to stderr: an unkeyable shape is said once, not per cycle
 
 
-def _delta_key(kind, it, prefix=""):
-    """The key of one list item under `kind` ('byid' / 'bykeys:…'), or None when the item cannot be keyed
-    (then the caller falls back to a positional key, which is still exact)."""
-    if not isinstance(it, dict):
-        return None
+def _delta_keyer(kind):
+    """The key function of one collection kind — key(item, prefix="") gives the item's key under the table
+    above, or None when the item cannot be keyed (the caller then takes a positional key, still exact). The
+    kind string is parsed HERE, once per _delta_split call, not once per item: splitting "bykeys:sid,t,judge,t1"
+    and running its generator per entry was a visible share of the per-entry pass on a board of thousands of
+    bars. The keys are byte-identical to the per-item form's (_delta_key)."""
     if kind.startswith(("byid", "dictlist:")):
         field = "id" if kind == "byid" else kind.split(":", 1)[1]
-        v = it.get(field)
-        return None if v is None or v == "" else prefix + str(v)   # "" would spell a lane's bare-prefix marker
+
+        def key(it, prefix=""):
+            if not isinstance(it, dict):
+                return None
+            v = it.get(field)
+            return None if v is None or v == "" else prefix + str(v)   # "" would spell a lane's bare-prefix marker
+        return key
     if kind.startswith("bykeys:"):
-        return prefix + _DELTA_SEP.join(str(it.get(f)) for f in kind.split(":", 1)[1].split(","))
-    return None
+        fields = tuple(kind.split(":", 1)[1].split(","))
+
+        def key(it, prefix=""):
+            if not isinstance(it, dict):
+                return None
+            return prefix + _DELTA_SEP.join([str(it.get(f)) for f in fields])
+        return key
+    return lambda it, prefix="": None
+
+
+def _delta_key(kind, it, prefix=""):
+    """The key of one list item under `kind` ('byid' / 'bykeys:…'): _delta_keyer's per-item form."""
+    return _delta_keyer(kind)(it, prefix)
 
 
 def _delta_split(kind, value):
@@ -34175,7 +34518,8 @@ def _delta_split(kind, value):
     list item that cannot be keyed, or a duplicate key, takes a positional key ('#n') — exact, since the
     shim rebuilds in key order, just less delta-friendly."""
     ents, order = {}, []
-    enc = json.JSONEncoder(default=str).encode          # one encoder for the thousand entries, not one each
+    enc = json.JSONEncoder(default=_wire_default_in("_delta_split")).encode   # one encoder for the thousand entries, not one each
+    key = _delta_keyer(kind)                            # …and the kind parsed once, not per item
     def put(kk, v, pre=""):
         if kk is None or kk in ents:
             n = len(order)
@@ -34190,7 +34534,7 @@ def _delta_split(kind, value):
             put(str(kk), v)
     elif kind.startswith(("byid", "bykeys:")) and isinstance(value, list):
         for it in value:
-            put(_delta_key(kind, it), it)
+            put(key(it), it)
     elif kind.startswith("dictlist:") and isinstance(value, dict):
         for dk, lst in value.items():
             if _DELTA_SEP in str(dk):
@@ -34200,7 +34544,7 @@ def _delta_split(kind, value):
                 put(pre, lst)                      # an empty or non-list lane: one entry under its bare prefix
                 continue
             for it in lst:
-                put(_delta_key(kind, it, pre), it, pre)
+                put(key(it, pre), it, pre)
     else:
         # a value the kind cannot key (None where a list belongs, a list where a dict does): NOT zero entries —
         # that split carried the value nowhere, and the client kept its assembled [] / {} while the kernel held
@@ -34211,7 +34555,9 @@ def _delta_split(kind, value):
 
 
 def _delta_parts(ftype, payload):
-    """The payload split into its keyed collections and the remainder, computed once per payload object."""
+    """The payload split into its keyed collections and the remainder, computed once per payload object — and each
+    collection's split once per collection object (_delta_split_memo), so a payload that changed only its
+    remainder re-encodes no entry."""
     hit = _delta_parts_cache.get(ftype)
     if hit is not None and hit[0] is payload:
         return hit[1]
@@ -34219,10 +34565,18 @@ def _delta_parts(ftype, payload):
     try:
         colls = {}
         for name, kind in kinds.items():
+            value = payload.get(name)
+            m = _delta_split_memo.get((ftype, name))
+            if m is not None and m[0] is value:          # the same collection object: the same entries, the same strings
+                colls[name] = m[1]
+                _wire_bump("split_hit")
+                continue
+            _wire_bump("split_miss")
             try:
-                colls[name] = _delta_split(kind, payload.get(name))
+                colls[name] = _delta_split(kind, value)
             except ValueError as e:
                 raise ValueError("%s: %s" % (name, e)) from None     # name the collection for the log line
+            _delta_split_memo[(ftype, name)] = (value, colls[name])
     except ValueError as e:
         parts = None                                   # a payload the protocol cannot key: this build goes whole
         if (ftype, str(e)) not in _delta_unkeyable_said:   # …and says so once: a silent whole is a silent perf loss
@@ -34230,10 +34584,33 @@ def _delta_parts(ftype, payload):
             sys.stderr.write("view-delta %s: payload cannot be keyed (%s); sending whole frames\n" % (ftype, e))
     else:
         rest = {kk: v for kk, v in payload.items() if kk not in kinds}
-        rest_sig = json.dumps({kk: v for kk, v in rest.items() if kk not in _DEDUP_VOLATILE}, sort_keys=True, default=str)
+        rest_sig = json.dumps({kk: v for kk, v in rest.items() if kk not in _DEDUP_VOLATILE}, sort_keys=True,
+                              default=_wire_default_in("_delta_parts"))
         parts = (colls, rest, rest_sig)
     _delta_parts_cache[ftype] = (payload, parts)
     return parts
+
+
+def _parts_sig(parts):
+    """A slot payload's dedup signature from the split _delta_parts already made at the wire fill —
+    (rest_sig, ((collection, key order, entry strings), ...)) — in place of json.dumps(payload) plus _dedup_sig's
+    sort_keys re-dump of the payload minus its clock. The key order carries the lanes and ids, the entry strings
+    the entries themselves, rest_sig the remainder minus `now`/`buildId`: equal tuples mean equal bytes in every
+    entry and the remainder, so a suppressed change is impossible. Stricter than the sort_keys form in one way:
+    that dump was key-order-insensitive at every level (a turns lane dict included), so an equal-content reorder
+    deduped where it now re-sends once — an order-only delta for a delta client, one whole frame for a legacy
+    client, never a stale one — and then dedups. An unkeyable payload (parts None) keeps _dedup_sig over the
+    whole dump. A client's `sent` slot holds the tuple as it held the string; its strings are the split's own."""
+    colls, _rest, rest_sig = parts
+    return (rest_sig, tuple((name, tuple(order), tuple(e[1] for e in ents.values()))
+                            for name, (ents, order) in colls.items()))
+
+
+def _parts_est(parts):
+    """A whole frame's length before it is serialized (_LazyWire.size): the entry strings' byte total plus the
+    remainder's — the frame's key names and separators are not counted, so it reads a little under the frame."""
+    colls, _rest, rest_sig = parts
+    return sum(len(e[1]) for ents, _o in colls.values() for e in ents.values()) + len(rest_sig)
 
 
 def _js_key_order(keys):
@@ -34269,10 +34646,13 @@ def _order_shape(kind, order):
     return list(groups.items())
 
 
-def _send_slot(c, ftype, payload, pre, sig):
+def _send_slot(c, ftype, payload, pre, sig, parts=None):
     """Send a bars/feed payload to one client: whole for a client without delta support (exactly as before),
-    else as a delta against what that client holds. `pre`/`sig` are the shared full serialization and
-    dedup signature the pusher computed once per build.
+    else as a delta against what that client holds. `pre`/`sig` are the shared full serialization (a str, or a
+    _LazyWire serialized only if a whole frame goes) and dedup signature the pusher computed once per build;
+    `parts` is the payload's _delta_parts split when the caller made it at the wire fill (the pusher does), so
+    the delta path neither re-splits nor depends on _delta_parts_cache's single slot still holding it (a
+    handler-thread connect push can evict that between the fill and the send).
     One thread at a time per client (review find, 2026-09-04): the socket handler's connect push (`ready` →
     _push_one, on the handler thread) and the pusher's cycle both reach here for the same client, and both
     read and write its held delta state. Unserialized, one interleaving — both find nothing held, a rebuild
@@ -34281,16 +34661,16 @@ def _send_slot(c, ftype, payload, pre, sig):
     divergence until the next full. Before deltas the same race touched only the dedup dict, where a double
     full was harmless. Re-entrant: the size fallback in _send_slot_delta calls back in on the same thread."""
     with _client_lock(c):                             # one per client, made by _new_ws_client
-        _send_slot_locked(c, ftype, payload, pre, sig)
+        _send_slot_locked(c, ftype, payload, pre, sig, parts)
 
 
-def _send_slot_locked(c, ftype, payload, pre, sig):
+def _send_slot_locked(c, ftype, payload, pre, sig, parts=None):
     key = _DELTA_SLOTS[ftype][0]
     if not c.get("delta"):
         _send_client(c, key, payload, pre=pre, sig=sig)
         return
     try:
-        _send_slot_delta(c, key, ftype, payload, pre, sig)
+        _send_slot_delta(c, key, ftype, payload, pre, sig, parts)
     except Exception:
         # One client's frame must never take the pusher down with it (every dashboard would freeze until a
         # restart): say so, forget what that client holds, and send the whole payload — which carries no
@@ -34301,13 +34681,14 @@ def _send_slot_locked(c, ftype, payload, pre, sig):
         _send_client(c, key, payload, pre=pre, sig=sig)
 
 
-def _send_slot_delta(c, key, ftype, payload, pre, sig):
+def _send_slot_delta(c, key, ftype, payload, pre, sig, parts=None):
     rs = c.get("resync")
     if rs and ftype in rs:                             # the shim said it could not apply a delta (a base it does
         rs.discard(ftype)                              # not hold): forget what we believe it holds; whole, re-based
         c.get("dstate", {}).pop(ftype, None)
         c.get("sent", {}).pop(key, None)
-    parts = _delta_parts(ftype, payload)
+    if parts is None:
+        parts = _delta_parts(ftype, payload)
     states = c.setdefault("dstate", {})
     if parts is None:                                  # cannot be keyed: whole, and the client holds nothing
         states.pop(ftype, None)
@@ -34321,7 +34702,9 @@ def _send_slot_delta(c, key, ftype, payload, pre, sig):
         # bundle sees the message): every key is minted HERE, once — a shim deriving keys from field values
         # would spell null/None, true/True, 1/1.0 differently from Python and hold keys the kernel never sent.
         keys = json.dumps({n: o for n, (_e, o) in colls.items()})
-        pre_k = pre[:-1] + ',"_keys":' + keys + "}" if pre.endswith("}") else json.dumps(dict(payload, _keys=json.loads(keys)), default=str)
+        ps = _wire_text(pre)                           # a whole frame goes: the build's one whole encode, if not yet made
+        pre_k = (ps[:-1] + ',"_keys":' + keys + "}" if ps.endswith("}")
+                 else json.dumps(dict(payload, _keys=json.loads(keys)), default=_wire_default_in("_send_slot_delta")))
         # The keyed full must actually GO: a whole frame sent moments ago without keys (the failure path, or an
         # unkeyable build) filled the dedup slot with this same signature, and a deduped keyed full would leave
         # the kernel holding state for a client that holds nothing (review 2026-09-03).
@@ -34330,7 +34713,17 @@ def _send_slot_delta(c, key, ftype, payload, pre, sig):
         if c.get("sent", {}).get(key, (None,))[0] == sig:      # it went (or was already held) → rebase
             states[ftype] = {"rev": 0, "rest": rest_sig,
                              "coll": {n: {kk: e[1] for kk, e in ents.items()} for n, (ents, _o) in colls.items()},
-                             "order": {n: list(o) for n, (_e, o) in colls.items()}, "at": now}
+                             "order": {n: list(o) for n, (_e, o) in colls.items()}, "at": now, "parts": parts}
+        return
+    if parts is st.get("parts") and now - st.get("at", 0) < _DEDUP_REPOST_S:
+        # `parts` is the split of the payload OBJECT (_delta_parts is a one-entry identity cache per slot), and
+        # st["parts"] is the split the client's held state was last written from or last compared equal to: the
+        # keyed full, the last delta that went, or the unchanged branch below. The same object means the same entry
+        # strings, key sets, order shape and remainder, so the compare below would end at its unchanged branch; the
+        # pusher hands an unchanged payload object across cycles (_bars_wire holds the bars by the cached timeline's
+        # identity), and that compare is what this skips. Counted as the unchanged branch counts it: built, not
+        # sent. Past the repost window the compare runs and the repost goes.
+        _PERF_STATS.send(key, "deduped", _wire_len(pre))
         return
     frame = {"type": "delta", "slot": ftype, "base": st["rev"], "rev": st["rev"] + 1, "coll": {}}
     changed = False
@@ -34362,19 +34755,27 @@ def _send_slot_delta(c, key, ftype, payload, pre, sig):
             frame["coll"][name] = entry; changed = True
     if not changed:
         if now - st.get("at", 0) < _DEDUP_REPOST_S:    # unchanged: nothing to send (the repost keeps the fade alive)
-            _PERF_STATS.send(key, "deduped", len(pre))   # built and compared, not sent — the same fact
+            _PERF_STATS.send(key, "deduped", _wire_len(pre))   # built and compared, not sent — the same fact
+            # Adopt this split as the held one: the compare just showed the held entry strings, key sets, order
+            # shape and remainder equal it, so the same object next cycle is an identity hit above rather than
+            # another compare. A content-equal rebuild mints a new payload object (the view sig's 5 s bucket
+            # rebuilds the timeline on a quiet system; a feed differing only in `now`); without the adoption it
+            # would be re-compared every cycle until the repost, and the previous build's split, its whole
+            # entry-object graph, would stay referenced from here meanwhile. `at` stands: the repost timer counts
+            # from the last frame that went.
+            st["parts"] = parts
             return                                         # _send_client's dedup records for a whole-frame client
-    s = json.dumps(frame, default=str)
-    if len(s) >= _DELTA_MAX_FRACTION * len(pre):       # not worth a delta → the full frame, rebased
-        states.pop(ftype, None)
+    s = json.dumps(frame, default=_wire_default_in("_send_slot_delta"))   # the entry OBJECTS ride: re-encoded here
+    if len(s) >= _DELTA_MAX_FRACTION * _wire_len(pre):   # not worth a delta → the full frame, rebased (a lazy `pre`
+        states.pop(ftype, None)                          # answers its estimate here: a slightly eager fallback, never wrong)
         c.get("sent", {}).pop(key, None)
-        _send_slot(c, ftype, payload, pre, sig)
+        _send_slot(c, ftype, payload, pre, sig, parts)
         return
     _perf("send", slot=_perf_slot(key), bytes=len(s), deduped=0, delta=1)
     _PERF_STATS.send(key, "delta", len(s))
     if not _client_send(c, s, key):
         return
-    st["rev"] += 1; st["rest"] = rest_sig; st["at"] = now
+    st["rev"] += 1; st["rest"] = rest_sig; st["at"] = now; st["parts"] = parts
     for name, (ents, _order) in colls.items():
         st["coll"][name] = {kk: e[1] for kk, e in ents.items()}
         st["order"][name] = next_order[name]
@@ -34486,9 +34887,20 @@ def _send_client(c, key, msg, pre=None, sig=None, kind="full"):
     WebSocket client; the log makes the next one obvious.
 
     `kind` is the /perf sends class the frame is counted under when it goes: "full" (the default: a
-    whole frame) or "delta" for a caller whose frame is a suffix or a diff (_send_chat's chatTail)."""
-    s = pre if pre is not None else json.dumps(msg)
-    sig = sig if sig is not None else _dedup_sig(msg, s)
+    whole frame) or "delta" for a caller whose frame is a suffix or a diff (_send_chat's chatTail).
+
+    `pre` may also be a _LazyWire (the feed, the bars): its bytes are produced only if the frame GOES — a
+    deduped frame costs its size() and nothing else."""
+    if pre is None:
+        s = json.dumps(msg)
+    elif isinstance(pre, str):
+        s = pre
+    else:
+        s = None                                          # lazy: serialized below only if the frame goes
+    if sig is None:
+        if s is None:
+            s = pre.text()
+        sig = _dedup_sig(msg, s)
     seqs = getattr(_VIEWS_SERVED, "seqs", None)
     if seqs is not None:
         # the ready handler is capturing ITS connect push (the caps frame's viewsSeq, see KERNEL_WS_CAPS):
@@ -34501,13 +34913,18 @@ def _send_client(c, key, msg, pre=None, sig=None, kind="full"):
         prev = c.setdefault("sent", {}).get(key)      # reset (_client_reset_chat_base) — one writer at a time
         now = time.time()
         if prev is not None and prev[0] == sig and (now - prev[1]) < _DEDUP_REPOST_S:
-            _perf("send", slot=_perf_slot(key), bytes=len(s), deduped=1)
-            _PERF_STATS.send(key, "deduped", len(s))
+            n = len(s) if s is not None else pre.size()   # deduped: the length only; a lazy frame stays unserialized
+            _perf("send", slot=_perf_slot(key), bytes=n, deduped=1)
+            _PERF_STATS.send(key, "deduped", n)
             return
+        if s is None:
+            s = pre.text()                            # the frame goes: the build's one whole encode (the cell keeps it) —
+            #                                           BEFORE the slot is written, so a raise here leaves it for a retry
         c["sent"][key] = (sig, now)
         _perf("send", slot=_perf_slot(key), bytes=len(s), deduped=0)
         _PERF_STATS.send(key, kind, len(s))
-        _client_send(c, s, key)                       # enqueue only (never blocks): the lock is held for microseconds
+        _client_send(c, s, key)                       # enqueue only (never blocks): the lock is held for microseconds,
+        #                                               or for the one whole encode when a lazy frame goes
 
 
 def _send_chat(c, m, ms, change_from, led_changed):
@@ -36392,7 +36809,9 @@ def _push(targets, connect=False, tmux=None):
         feed = feed_src
         if feed is not None:
             feed = dict(feed_src)                        # copy so the per-push ledger attach never dirties the cache
-            #                                              (feed_src's identity keys the wire cache below)
+            #                                              (feed_src's identity keys the wire cache below; the asks list
+            #                                              rides through the copy, so a refill's cards are served from
+            #                                              _delta_split_memo rather than encoded again)
             # Attach `ledgers` whenever the session build RAN (want_chat or want_fleet) — even as an EMPTY list
             # for a fleet with no sessions — so the fleet can tell "the build ran, here's the data (maybe none)"
             # from "no data yet, still loading" and keep its loader up until real data lands (the user
@@ -36417,6 +36836,30 @@ def _push(targets, connect=False, tmux=None):
         # LIVE-FIRST (the user 2026-06-26): the very first paint after a kernel start reads NO dead session — it
         # builds live sessions only (lanes + bars) so the main UI is up at once; the producer warms the full
         # build (live + dead-within-12h) and the next pusher push folds the dead lanes in, in the background.
+        # WARM: once a full build is cached, the skeleton is PROJECTED from it (_timeline_skeleton) instead of
+        # built again. Every cycle used to run build_timeline(with_bars=False) — no transcript parse, but the
+        # same per-lane derivation the full build had just done (store loads, the chip over the cached parse
+        # plus the live merge, the awaiting overlay) — and then serialized the frame and re-dumped it once more
+        # per client for the dedup compare. A cache hit now serves lanes identical to the last rebuild, so no
+        # lane moves without a rebuild; rebuilds still come on every view-sig change, on _views_dirty and at
+        # the 5 s bucket, so the lanes lag a rebuild by at most REBUILD_MIN_S, the lag the bars always had.
+        # Two visible differences from the built skeleton: the lanes' `compactions` come from the full build's
+        # parse (the built skeleton parsed nothing and always shipped []), and a dead lane's `since` is its
+        # last work end rather than the transcript mtime. Accepted too: the first regular cycle after boot
+        # serves the full build before the lanes frame (the connect push took the cold path and cached
+        # nothing), so the DEAD lanes reach the client one build later than the per-cycle skeleton showed
+        # them; the live lanes painted on the connect.
+        # The frame is serialized once per BUILD (_skel_wire, keyed on the cached object's identity like
+        # _bars_wire) and deduped on CONTENT through _dedup_sig, which strips the nested clock as it does for
+        # every {type:"data"} frame: a rebuild whose lanes are unchanged sends nothing, exactly as the bars
+        # frame behaves, and the 60 s repost (_DEDUP_REPOST_S) is what refreshes the pane's clock sample. A
+        # lane sitting in an awaiting or compacting state is the one exception: its open interval ends at the
+        # build clock (_state_intervals), so its frame goes once per rebuild while the state lasts — where the
+        # per-cycle skeleton sent it every cycle. A CONNECT push is the other: it stamps the cached lanes with
+        # the cycle's clock (below), since the pane anchors its live edge on its first sample and the cache
+        # can be hours old when no timeline client kept it warm, when the cache is FRESH by the kernel's own
+        # rule (_timeline_cache_fresh); a stale one gets its lanes built fresh instead (below).
+        global _skel_wire
         _PERF_STATS.stage("push.feed", time.monotonic() - _t_stage)
         _t_stage = time.monotonic()
         timeline = None
@@ -36424,16 +36867,48 @@ def _push(targets, connect=False, tmux=None):
         if want_tl:
             tl_clients = [c for c in targets if c["app"] == "timeline"]
             live_first = connect and _built_timeline[1] is None     # cold start, nothing warmed yet → live only
-            skel = build_timeline(now, tmux, with_bars=False, live_only=live_first)
-            for c in tl_clients:
-                _send_client(c, ("timeline",), {"type": "data", "data": skel})
             if live_first:
+                skel = build_timeline(now, tmux, with_bars=False, live_only=True)
+                for c in tl_clients:
+                    _send_client(c, ("timeline",), {"type": "data", "data": skel})
                 timeline = build_timeline(now, tmux, with_bars=True, live_only=True)   # live bars now (no dead reads)
                 tl_warming = True                                   # this is the PARTIAL cold build — the client keeps its loader up
                 _producer_wake.set()                                # ...if it lands empty (SDK/federation not yet merged), rather than flashing
                 #                                                     "no activity"; a later warmed push (tl_warming False) settles it (the user 2026-07-03)
             else:
                 timeline = _cached_timeline(now, tmux, fsig, connect)
+                if connect:
+                    if _timeline_cache_fresh(fsig):
+                        # A CONNECT serves the cached lanes under the CYCLE's clock: the pane anchors its live
+                        # edge and its window fit on the first data.now it sees, and the cache is as old as the
+                        # last cycle that had a timeline client (a bucket on a reload), so the build clock
+                        # would sit the axis in the past until the next rebuild. One serialization per connect;
+                        # the new client's dedup slot is empty, so the frame always goes, and _send_client
+                        # derives its content-only sig, so the next cycle's build-clock frame dedups against it
+                        # unless the lanes changed.
+                        frame = {"type": "data", "data": {**_timeline_skeleton(timeline), "now": now}}
+                    else:
+                        # A STALE cache, built under a view signature the world has since left or marked dirty
+                        # since, is not what the pane should paint: the cache is as old as the last cycle that
+                        # had a timeline client (hours, when the pane was closed), and re-stamping the clock over
+                        # lanes that old painted a lane dead for hours as live (and the reverse) until the next
+                        # cycle's rebuild replaced them: a flap on every reload (review find, 2026-09-08). The
+                        # lanes are built fresh here, as every connect did before the projection (no transcript
+                        # parse: the skeleton), and the next cycle's rebuild dedups against them when unchanged;
+                        # the heavy bars still come from the cache, as they always did on a connect.
+                        frame = {"type": "data", "data": build_timeline(now, tmux, with_bars=False)}
+                    skel_pre, skel_sig = json.dumps(frame), None
+                else:
+                    w = _skel_wire                                  # tuple snapshot — rebound whole, never mutated
+                    if w is not None and w[0] is timeline:
+                        frame, skel_pre, skel_sig = w[1], w[2], w[3]
+                    else:
+                        frame = {"type": "data", "data": _timeline_skeleton(timeline)}
+                        skel_pre = json.dumps(frame)
+                        skel_sig = _dedup_sig(frame, skel_pre)
+                        _skel_wire = (timeline, frame, skel_pre, skel_sig)
+                for c in tl_clients:
+                    _send_client(c, ("timeline",), frame, pre=skel_pre, sig=skel_sig)
         _PERF_STATS.stage("push.timeline", time.monotonic() - _t_stage)
     except Exception:
         sys.stderr.write("push build: %s\n" % traceback.format_exc())
@@ -36441,39 +36916,87 @@ def _push(targets, connect=False, tmux=None):
     # Serialize the shared payloads once per BUILD, not per cycle (the 2026-08-10 CPU fix, round
     # three). Round two had brought feed/bars down to one dumps each per cycle — measured on a QUIET
     # fleet that was still ~357KB (feed) + ~1.65MB (bars) of json.dumps every cycle, ~4MB/s, nearly
-    # all of it discarded by the dedup because nothing had changed. The serialization is now keyed on
-    # the EVENT that can change the bytes: for bars, the cached timeline object's identity (a rebuild
+    # all of it discarded by the dedup because nothing had changed. The wire form is keyed on the
+    # EVENT that can change the bytes: for bars, the cached timeline object's identity (a rebuild
     # mints a new object; the cache slot holds the ref, so identity is stable and safe) + the warming
     # flag; for the feed, the cached pre-copy feed object's identity + a DEEP-EQUALITY check on the
     # per-cycle ledgers attach (rebuilt fresh each cycle around the always-rebuilt active tab, so its
     # OBJECT is always new but its content only changes when a session's ledger/status genuinely
     # moved — dict == is C-speed and allocation-free, far cheaper than re-serializing).
+    # And once per build means ONE encode. A rebuild used to serialize each payload three times over
+    # on this thread: the whole frame, _dedup_sig's sort_keys re-dump of the payload minus its clock
+    # (both frames carry `now`, so it always ran), and the per-entry split the delta path made on the
+    # first delta client's send. The per-entry split (_delta_parts) is now the one encode per build:
+    # the dedup signature is a tuple of its strings (_parts_sig), and the whole frame is a _LazyWire
+    # cell made on the first send that needs one — a fresh socket, a re-base, a client without deltas,
+    # a delta past the size guard — and kept in the wire tuple for the rest of the build. The split is
+    # handed down to _send_slot so the delta path neither re-splits nor depends on _delta_parts_cache's
+    # single slot still holding it: a connect push on a handler thread (_push([client], connect=True)
+    # from the ws handler) can evict that slot between this fill and the send. An unkeyable payload
+    # (said once by _delta_parts) keeps the whole dump and _dedup_sig, as before.
+    # This section runs AFTER the build try above, and nothing above it on the pusher thread catches:
+    # _push_all, _pusher_cycle_jobs, _pusher_cycle (a try/finally) and _pusher (a bare while-True) have
+    # no except, so a raise here used to end the pusher thread for the life of the process — every
+    # dashboard frozen until a restart. A whole-frame dump with no `default=` met a set in a card and
+    # raised; a build slot read as None by this loop raised too. Now a fill that raises stands its slot
+    # down for THIS cycle (one traceback; the slot's other clients are skipped without another), a send
+    # that raises skips that client, and the next cycle retries both. _pusher_cycle_jobs catches around
+    # _push_all for whatever escapes _push; _pusher itself stays unwrapped, since that belt and
+    # _pusher_cycle's finally cover the cycle.
     global _feed_wire, _bars_wire
-    feed_ms = feed_sig = bars = bars_ms = bars_sig = None
+    feed_ms = feed_sig = feed_parts = bars = bars_ms = bars_sig = bars_parts = None
+    feed_down = bars_down = False                        # this cycle's fill raised: the slot's clients are skipped
     _t_stage = time.monotonic()
     for c in targets:
-        if c["app"] in ("feed", "fleet"):   # the feed pane AND the Fleet view both ride the feed payload (Fleet reads feed.ledgers)
-            if feed_ms is None:
-                w = _feed_wire                           # tuple snapshot — rebound whole, never mutated (torn reads)
-                if w is not None and w[0] is feed_src and w[1] == feed.get("ledgers"):
-                    feed, feed_ms, feed_sig = w[2], w[3], w[4]
+        try:
+            if c["app"] in ("feed", "fleet"):   # the feed pane AND the Fleet view both ride the feed payload (Fleet reads feed.ledgers)
+                if feed_down:
+                    continue
+                if feed_ms is None:
+                    w = _feed_wire                           # tuple snapshot — rebound whole, never mutated (torn reads)
+                    if w is not None and w[0] is feed_src and w[1] == feed.get("ledgers"):
+                        feed, feed_ms, feed_sig, feed_parts = w[2], w[3], w[4], w[5]
+                    else:
+                        feed_parts = _delta_parts("feed", feed)   # the one per-entry encode, handed down to the delta path
+                        if feed_parts is not None:
+                            feed_sig = _parts_sig(feed_parts)
+                            feed_ms = _LazyWire(lambda f=feed: json.dumps(f, default=_wire_default_in("_push feed")),
+                                                _parts_est(feed_parts), "feed_body")
+                        else:                                # unkeyable: whole frames and the string signature, as before
+                            s = json.dumps(feed, default=_wire_default_in("_push feed"))
+                            feed_ms, feed_sig = _LazyWire(None, len(s), text=s), _dedup_sig(feed, s)
+                            _wire_bump("feed_sig_fallback")
+                        _feed_wire = (feed_src, feed.get("ledgers"), feed, feed_ms, feed_sig, feed_parts)
+                _send_slot(c, "feed", feed, feed_ms, feed_sig, feed_parts)
+            elif c["app"] == "timeline" and timeline is not None:
+                if bars_down:
+                    continue
+                if bars_ms is None:
+                    w = _bars_wire
+                    if w is not None and w[0] is timeline and w[1] == tl_warming:
+                        bars, bars_ms, bars_sig, bars_parts = w[2], w[3], w[4], w[5]
+                    else:
+                        bars = {"type": "bars", "turns": timeline["turns"], "judging": timeline["judging"],
+                                "messages": timeline["messages"], "now": timeline["now"], "warming": tl_warming}
+                        bars_parts = _delta_parts("bars", bars)   # the one per-entry encode, handed down to the delta path
+                        if bars_parts is not None:
+                            bars_sig = _parts_sig(bars_parts)
+                            bars_ms = _LazyWire(lambda b=bars: json.dumps(b, default=_wire_default_in("_push bars")),
+                                                _parts_est(bars_parts), "bars_body")
+                        else:                                # unkeyable: whole frames and the string signature, as before
+                            s = json.dumps(bars, default=_wire_default_in("_push bars"))
+                            bars_ms, bars_sig = _LazyWire(None, len(s), text=s), _dedup_sig(bars, s)
+                            _wire_bump("bars_sig_fallback")
+                        _bars_wire = (timeline, tl_warming, bars, bars_ms, bars_sig, bars_parts)
+                _send_slot(c, "bars", bars, bars_ms, bars_sig, bars_parts)
+        except Exception:
+            is_feed = c["app"] in ("feed", "fleet")
+            if (feed_ms if is_feed else bars_ms) is None:    # the FILL raised (nothing assigned): stand the slot down this cycle
+                if is_feed:
+                    feed_down = True
                 else:
-                    feed_ms = json.dumps(feed)
-                    feed_sig = _dedup_sig(feed, feed_ms)
-                    _feed_wire = (feed_src, feed.get("ledgers"), feed, feed_ms, feed_sig)
-            _send_slot(c, "feed", feed, feed_ms, feed_sig)
-        elif c["app"] == "timeline" and timeline is not None:
-            if bars_ms is None:
-                w = _bars_wire
-                if w is not None and w[0] is timeline and w[1] == tl_warming:
-                    bars, bars_ms, bars_sig = w[2], w[3], w[4]
-                else:
-                    bars = {"type": "bars", "turns": timeline["turns"], "judging": timeline["judging"],
-                            "messages": timeline["messages"], "now": timeline["now"], "warming": tl_warming}
-                    bars_ms = json.dumps(bars)
-                    bars_sig = _dedup_sig(bars, bars_ms)
-                    _bars_wire = (timeline, tl_warming, bars, bars_ms, bars_sig)
-            _send_slot(c, "bars", bars, bars_ms, bars_sig)
+                    bars_down = True
+            sys.stderr.write("push send %s (%s): %s\n" % ("feed" if is_feed else "bars", c.get("app"), traceback.format_exc()))
     _PERF_STATS.stage("push.send", time.monotonic() - _t_stage)
     with _clients_lock:
         _clients[:] = [c for c in _clients if c.get("alive", True)]
@@ -36724,12 +37247,14 @@ _VIEW_STATS = {"feedBuild": 0, "feedServe": 0, "tlBuild": 0, "tlServe": 0,
                "feedJsonBuild": 0, "feedJsonServe": 0}
 _built_timeline = [None, None, 0.0, 0.0]          # [fleet_sig, payload, built_at, build_started_at]
 # Wire-form caches for the two heavy shared payloads (the 2026-08-10 CPU fix, round three): the last
-# (source-identity key, serialized bytes, dedup sig) for the feed and the timeline bars, so an unchanged
-# build is never re-serialized cycle after cycle (~357KB + ~1.65MB per cycle measured on a quiet fleet).
+# (source-identity key, lazy serialization, dedup sig, per-entry split) for the feed and the timeline bars,
+# so an unchanged build is never re-serialized cycle after cycle (~357KB + ~1.65MB per cycle measured with
+# every session quiet), and a rebuild is serialized once (see _push's wire section).
 # TUPLES, rebound whole — a concurrent connect push on a WS thread snapshots the ref and can never see a
 # torn entry; the identity keys stay alive because these tuples (and the build caches above) hold them.
-_feed_wire = None   # (feed_src, ledgers, wire_feed, ms, sig)
-_bars_wire = None   # (timeline, warming, bars, ms, sig)
+_feed_wire = None   # (feed_src, ledgers, wire_feed, ms, sig, parts) — ms = a _LazyWire of json.dumps(wire_feed), made on the first whole-frame send; sig = _parts_sig(parts), or _dedup_sig over the whole dump when parts is None (unkeyable); parts = _delta_parts("feed", wire_feed), handed to _send_slot
+_bars_wire = None   # (timeline, warming, bars, ms, sig, parts) — the same shape for the bars
+_skel_wire = None   # (timeline, frame, pre, sig) — the lanes {type:"data"} frame projected from the same cached build
 # Each build is intrinsically ~1-1.6s (re-segments every session); the IDEAL is a per-session lane/card cache
 # (only the changed session rebuilds), but that's a big refactor of build_feed/build_timeline. Interim cap: a
 # minimum rebuild interval. With an ACTIVE fleet the fleet_sig busts on every push (the watched session keeps
@@ -36757,7 +37282,7 @@ def _next_feed_build_id():
 def _fleet_view_sig(now, tmux):
     """Cheap fingerprint of everything build_feed/build_timeline read. Busts on any transcript/names/states/
     postal change (_producer_sig), a judge pass (goal/caption via _judge_gen), a live tmux BADGE change
-    (state/model/ctx/effort — touches no file), a colormap or session-flags change, a SESSION-ORDER change
+    (state/model/context/effort — touches no file), a colormap or session-flags change, a SESSION-ORDER change
     (a tab/lane reorder writes session-order.json — the feed orders its grouped cards by it, so a reorder
     must bust the cache or the reordered cards lag behind the tabs by up to a bucket; the user 2026-07-15),
     or a 5s time bucket so 'X ago'/elapsed keeps advancing when nothing else changes."""
@@ -36775,22 +37300,57 @@ def _fleet_view_sig(now, tmux):
                  (jd.STATE / "auto-nudge.json", "__nudge__"),      # stalled section, nudge counts/failed stamps
                  (jd.STATE / "nudge-events.jsonl", "__nudgev__"),  # ⚡ marks
                  (jd.STATE / "judge-auth.json", "__jauth__"),      # judge billing refusal latch
-                 (jd.STATE / "judge-limit.json", "__jlimit__")):   # judge quota latch
+                 (jd.STATE / "judge-limit.json", "__jlimit__"),    # judge quota latch
+                 # the timeline's own file inputs: the lanes frame is projected from the cached build, so
+                 # what the lanes read must bust the cache — the usage bars (usage.json, via
+                 # _usage_for_client) and the views blob (timeline-views.json, via _views_client). The
+                 # per-cycle skeleton carried both fresh every cycle; projected from the cache, these
+                 # mtimes bring a change forward from the bucket, and the helpers' non-file inputs (remote
+                 # tags from the supervisor's /views poll, judge failures) still wait for it.
+                 (jd.STATE / "usage.json", "__usage__"),
+                 (_views_path(), "__views__"),
+                 # …the lanes' comment squares (STATE/comments/<sid>.json, _comment_markers: every write is
+                 # an _atomic_write into this directory, so its mtime moves on a create AND a rewrite) and
+                 # the kernel watches (WATCH_FILE, read by _watch_awaiting for the awaiting badge): a
+                 # resolve on a dormant thread or a watch firing changes only the store, and used to reach
+                 # the lane at the bucket
+                 (jd.STATE / "comments", "__comments__"),
+                 (WATCH_FILE, "__watches__")):
         try:
             sig[k] = os.stat(p).st_mtime
         except OSError:
             pass
     for s in sorted(tmux):
         t = tmux[s]
-        # the badge fields, plus the SDK snapshot facts the feed/timeline render that touch no file: live
-        # subagent and background-task counts (lane pill, awaiting box), an interrupt in flight, a model/
-        # effort/auth switch resolving, a retry storm. Without them a change here was visible only via
-        # the time bucket (the 2026-09-03 audit).
-        sig["t:" + s] = (t.get("state"), t.get("model"), t.get("ctx"), t.get("effort"), t.get("mode"), t.get("fast"), t.get("since"),
-                         len(t.get("subagents") or ()), len(t.get("bgTasks") or ()), bool(t.get("interrupting")),
+        # Every row field the lanes and the chat chip derive from, plus the SDK snapshot facts the feed/
+        # timeline render that touch no file (a model/effort/auth switch resolving, a retry storm, the
+        # connect and spawn bits; the 2026-09-03 audit). `context` is the row's key (the tmux vars and the
+        # SDK merge both write it); the sig read `ctx`, which no row carries, so a context-% change never
+        # busted the cache and the lane's battery waited on the bucket. Never keyed before: the fast-mode
+        # refusal reason (the chip's `fast` blanks on it), the subagent rows (the lane ships the whole
+        # list, so a count alone missed a change inside it) and the background-task ids behind the
+        # awaiting badge (a count alone missed a swap). Not keyed on purpose: `snapT` (the snapshot's
+        # clock, not a fact about the session) and `interrupting` (the merged row never carries it — the
+        # SDK merge copies an explicit key list — and the WS stop op marks the views dirty itself; the
+        # HTTP /interrupt route only wakes the pusher).
+        sig["t:" + s] = (t.get("state"), t.get("model"), t.get("context"), t.get("effort"), t.get("mode"),
+                         t.get("fast"), t.get("since"), t.get("fastReason"),
+                         _row_items_sig(t.get("subagents")), _row_ids_sig(t.get("bgTasks")),
                          bool(t.get("modelPending")), bool(t.get("effortPending")), bool(t.get("authPending")),
                          int(t.get("retryCount") or 0), bool(t.get("connected")), bool(t.get("spawning")))
     return tuple(sorted(sig.items()))
+
+
+def _row_items_sig(rows):
+    """A liveness row's list of dicts (the live subagents) as an immutable, comparable value for the view
+    signature: each dict's sorted items. The lane ships the whole list, so any field change counts."""
+    return tuple(tuple(sorted(r.items())) if isinstance(r, dict) else r for r in (rows or ()))
+
+
+def _row_ids_sig(tasks):
+    """The background-task ids off a liveness row, for the view signature: the awaiting badge and its task
+    list key on which tasks exist (toolUseId), not on a task's progress fields."""
+    return tuple(str(t.get("toolUseId") or "") for t in (tasks or ()) if isinstance(t, dict))
 
 
 def _cached_feed(now, tmux, sig, connect=False):
@@ -37622,8 +38182,7 @@ def _consume_pending_reveal(client):
 
 def _cached_timeline(now, tmux, sig, connect=False):
     e = _built_timeline
-    dirty = not connect and _views_dirty[0] > e[3]        # start-keyed, same as _cached_feed above
-    if e[1] is not None and not dirty and (connect or e[0] == sig or (time.time() - e[2]) < REBUILD_MIN_S):
+    if e[1] is not None and (connect or _timeline_cache_fresh(sig)):
         _VIEW_STATS["tlServe"] += 1
         _PERF_STATS.build("timeline", True)
         return e[1]
@@ -37634,6 +38193,28 @@ def _cached_timeline(now, tmux, sig, connect=False):
     _PERF_STATS.build("timeline", False, time.monotonic() - _t0)
     _built_timeline[:] = [sig, tl, time.time(), started]
     return tl
+
+
+def _timeline_cache_fresh(sig):
+    """The kernel's one rule for a cached full build a cycle may serve as it stands: built under the cycle's
+    view signature (nothing a lane reads has moved since) or within REBUILD_MIN_S of now, and no writer has
+    marked the views dirty since it started (start-keyed, same as _cached_feed). _cached_timeline rebuilds
+    when this is False; a connect push, which never rebuilds the full build on the handler thread, builds
+    its LANES fresh instead of projecting a stale cache (review find, 2026-09-08; see _push)."""
+    e = _built_timeline
+    if e[1] is None or _views_dirty[0] > e[3]:
+        return False
+    return e[0] == sig or (time.time() - e[2]) < REBUILD_MIN_S
+
+
+def _timeline_skeleton(tl):
+    """The {type:"data"} lanes frame's body, PROJECTED from a full timeline build: the same dict minus the
+    heavy time-plotted detail — turns, judging, messages, which ride the {type:"bars"} message. It keeps
+    the BUILD's clock (`now`): the pusher dedups the frame on content with that clock stripped, and the
+    bars frame carries the same clock. A shallow copy, never a mutation: `tl` is the cached build
+    (_built_timeline[1]), shared with every later cycle and the identity key of the bars and lanes wire
+    caches."""
+    return {**tl, "turns": {}, "judging": [], "messages": []}
 
 
 def _run_tier(fn):
@@ -37759,6 +38340,9 @@ def _pusher_cycle():
     try:
         _live_scope.paths = {}                  # …and the cycle's sid→path memo (_path_of): the parked-op drain
         #                                         otherwise resolves a held sid's path once per gate per cycle
+        _live_scope.sessions = {}               # …and the cycle's discover rows (_sessions, keyed (window,
+        #                                         forks); the wide walk under ("wide", window)): ~35 sweeps
+        #                                         per cycle became one
         _live_scope.names = _names_snapshot()   # …and the cycle's NAMES snapshot, same idiom: the name/
         #                                       cwd/color helpers otherwise re-read the registry per path
         #                                       token and per postal card (~38% of pusher wall, py-spy
@@ -37769,6 +38353,7 @@ def _pusher_cycle():
         _live_scope.snapshot = None
         _live_scope.names = None
         _live_scope.paths = None
+        _live_scope.sessions = None
         _PERF_STATS.cycle(time.monotonic() - _t_cycle, time.thread_time() - _c_cycle)
 
 
@@ -37785,6 +38370,10 @@ def _pusher_cycle_jobs(now, tmux, any_client):
         _t_push = time.monotonic()
         try:
             _push_all(tmux=tmux)
+        except Exception:                 # _push guards its build and its sends; anything escaping it rode
+            #                               _pusher_cycle's finally into _pusher's while-True and ended the
+            #                               pusher thread for the process's life (see _push's wire section)
+            sys.stderr.write("push: %s\n" % traceback.format_exc())
         finally:
             _t_push = time.monotonic() - _t_push
             _PERF_STATS.stage("push", _t_push)
