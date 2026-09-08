@@ -38,7 +38,10 @@ test("the frame is VIRTUAL: one cached-height prefix over ALL units, independent
   assert.match(RENDER, /\(i >= 0 && i < unitTotal\) \? pre\[i\] \+ \(pre\[i \+ 1\] - pre\[i\]\) \/ 2 : null/,
     "every unit slots at its virtual middle — uniform semantics, no per-basis seams");
   const frameBody = RENDER.slice(RENDER.indexOf("function contentOffsetFrame("), RENDER.indexOf("function ensureScrollMarks("));
-  assert.ok(!/scrollTop|tx-spacer|winStart|slotIn/.test(frameBody),
+  // the VIRTUAL branch never reads the scroll position or the window (T129); the fully-rendered EXACT branch
+  // above it converts client rects into scroll space, which is scroll-invariant (T245)
+  const virtualBody = frameBody.split("const avg = v.avgTurnH ?? 60;")[1] || frameBody;
+  assert.ok(!/scrollTop|tx-spacer|winStart|slotIn/.test(virtualBody),
     "nothing scroll-coupled inside the frame — no live offsets, no spacer reads, no window bounds");
 });
 
@@ -74,4 +77,23 @@ test("marks translate EVENT indices to DISPLAY UNITS before asking the frame", (
   assert.match(RENDER, /const u = evUnit\[i\];/);
   assert.match(RENDER, /const off = frame\.offsetOf\(u\);/, "notches ask the frame in unit space");
   assert.match(RENDER, /const off = frame\.offsetOf\(evUnit\[idx\]\);/, "comment ticks too — one translation, both overlays");
+});
+
+// ── T245 (the user 2026-09-07): a notch sat below the thumb while its message was on screen ───────────────
+test("a rendered unit changing height re-runs the shared paint — the event the frame was missing (T245)", () => {
+  const ev = RENDER.split("function ensureView(id: string): View {")[1].split("\n}")[0];
+  assert.match(ev, /v\.ro = new ResizeObserver\(\(\) => scheduleRailSticky\(\)\);\s*\n\s*v\.ro\.observe\(elv\);/,
+    "one observer per view element: a lazy figure sizing in or a fold toggling repaints notches AND rail ticks");
+  assert.match(RENDER, /ro\?: ResizeObserver; \}/, "the View carries its observer");
+  assert.equal((RENDER.match(/v\.ro\?\.disconnect\(\); v\.el\.remove\(\);/g) || []).length, 2, "both view-removal sites disconnect it");
+  assert.doesNotMatch(ev, /setTimeout|setInterval/, "no timer stands in for the event");
+});
+
+test("with every unit rendered the frame is the scrollbar's own truth: real middles over content.scrollHeight (T245)", () => {
+  const frameBody = RENDER.split("function contentOffsetFrame(")[1].split("\nfunction ")[0];
+  assert.match(frameBody, /const nodes = Array\.from\(v\.el\.querySelectorAll<HTMLElement>\("\.turn\[data-unit\]"\)\);/);
+  assert.match(frameBody, /exact\.set\(u, content\.scrollTop \+ \(r\.top - cRect\.top\) \+ r\.height \/ 2\);/, "scroll-space middle, invariant under scrolling");
+  assert.match(frameBody, /if \(nodes\.length > 0 && nodes\.length === unitTotal && exact\.size === unitTotal && content\.scrollHeight > 0\) \{\s*\n\s*const shx = content\.scrollHeight;\s*\n\s*return \{ sh: shx, offsetOf: \(i: number\): number \| null => exact\.get\(i\) \?\? null \};/);
+  // the virtual prefix-sum stays the fallback while spacers hide units
+  assert.match(frameBody, /for \(let u = 0; u < unitTotal; u\+\+\) \{ t \+= uh\.get\(u\) \?\? avg; pre\.push\(t\); \}/);
 });

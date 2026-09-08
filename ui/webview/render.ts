@@ -762,7 +762,7 @@ let landTrail: string[] = [];
 // count is NOT len − winStart + spacer: a unit may own more than one node (the day
 // divider that opens a new day precedes its turn), so anything mapping DOM back to
 // units reads data-unit off the node rather than counting children.
-interface View { el: HTMLElement; rendered: number; scrollTop: number; stick: boolean; shown: boolean; stale: boolean; winStart: number; winEnd?: number; avgTurnH?: number; spacerCount?: number; spacerCountBot?: number; unitTotal?: number; }
+interface View { el: HTMLElement; rendered: number; scrollTop: number; stick: boolean; shown: boolean; stale: boolean; winStart: number; winEnd?: number; avgTurnH?: number; spacerCount?: number; spacerCountBot?: number; unitTotal?: number; ro?: ResizeObserver; }
 const views = new Map<string, View>();
 
 // Pending pickers (AskUserQuestion / tool-permission) keyed by session id. These
@@ -2129,10 +2129,25 @@ function contentOffsetFrame(content: HTMLElement, v: View, s: Session):
   // remember every rendered unit's measured height — the virtual frame feeds on them
   let uh = unitHeights.get(activeId!);
   if (!uh) { uh = new Map(); unitHeights.set(activeId!, uh); }
-  for (const node of Array.from(v.el.querySelectorAll<HTMLElement>(".turn[data-unit]"))) {
+  const nodes = Array.from(v.el.querySelectorAll<HTMLElement>(".turn[data-unit]"));
+  const exact = new Map<number, number>();               // unit → its real middle in scroll space (fully rendered only)
+  for (const node of nodes) {
     const u = Number(node.dataset.unit);
     const h = node.offsetHeight;
     if (Number.isFinite(u) && h > 0) uh.set(u, h);
+    if (Number.isFinite(u)) {
+      const r = node.getBoundingClientRect();
+      exact.set(u, content.scrollTop + (r.top - cRect.top) + r.height / 2);
+    }
+  }
+  // EXACT when every unit is rendered (no spacers): the scrollbar the user reads the notches against spans
+  // content.scrollHeight, and each unit's real middle in scroll space is known — the unit-height sum below
+  // omits the gaps between turns and everything that is not a unit, so it sat a few dozen pixels off even
+  // on a fully rendered conversation (T245). scrollTop + client-rect top is the position IN THE SCROLL
+  // CONTENT, invariant under scrolling: pure scrolling still moves nothing.
+  if (nodes.length > 0 && nodes.length === unitTotal && exact.size === unitTotal && content.scrollHeight > 0) {
+    const shx = content.scrollHeight;
+    return { sh: shx, offsetOf: (i: number): number | null => exact.get(i) ?? null };
   }
   const avg = v.avgTurnH ?? 60;
   // one prefix-sum pass per paint (O(n)), then O(1) per mark
@@ -8827,6 +8842,17 @@ function ensureView(id: string): View {
     // with a null/absent ref node just appends, so this is safe whether or not the picker node exists yet.
     content?.insertBefore(elv, document.getElementById("live-ask"));
     v = { el: elv, rendered: 0, scrollTop: 0, stick: true, shown: false, stale: false, winStart: 0, winEnd: 0 };
+    // THE event the scrollbar overlays were missing (T245, the user 2026-09-07): a rendered unit CHANGED
+    // HEIGHT after the paint — a lazy figure sizing in, a fold toggling. The notch/rail frame feeds on the
+    // rendered units' measured heights, but it was refreshed only inside a paint, and the paint ran only
+    // on scroll, resize and a few render-side callers — so 54 figures loading after the paint grew the
+    // turn and the native thumb moved to the new truth while the notches kept the stale frame, and a notch
+    // for a message on screen read as "below". The view element's box grows with any child, so one observer
+    // per view re-runs the shared rAF paint exactly when the geometry changes. No timer, no per-image hook.
+    if (typeof ResizeObserver === "function") {
+      v.ro = new ResizeObserver(() => scheduleRailSticky());
+      v.ro.observe(elv);
+    }
     views.set(id, v);
   }
   return v;
@@ -12674,7 +12700,7 @@ function upsert(msg: any) {
   }
   if (forked) {
     const v = views.get(msg.id);
-    if (v) { v.el.remove(); views.delete(msg.id); }
+    if (v) { v.ro?.disconnect(); v.el.remove(); views.delete(msg.id); }
   }
   if ("ledger" in msg) ledgers.set(msg.id, msg.ledger ?? null);
   if (!existed) order.push(msg.id);
@@ -13108,7 +13134,7 @@ function dismissSession(id: string, why: DismissWhy, doomed?: ReadonlySet<string
     persistDrafts();   // a host drop / omission KEEPS it all (see DismissWhy) — the stash above may have updated the copy
   }
   const v = views.get(id);
-  if (v) { v.el.remove(); views.delete(id); }
+  if (v) { v.ro?.disconnect(); v.el.remove(); views.delete(id); }
   const oi = order.indexOf(id); if (oi >= 0) order.splice(oi, 1);
   const mi = mru.indexOf(id); if (mi >= 0) mru.splice(mi, 1);   // before the fallback read below — never the dead id
   renderTabs();                          // tab removed from `order` above → repaint without it
