@@ -275,6 +275,21 @@ class TheEmitterIsOneSnapshotPerStore(unittest.TestCase):
         self.assertIn(pair, [(False, 5_000), (True, 9_000)], "value and stamp come from one snapshot: %r" % (pair,))
         self.assertEqual(v["compactSuggest"], v["settings"]["compactSuggest"], "the top-level field rides the same snapshot")
 
+    def test_the_snapshot_reads_the_blob_exactly_once(self):
+        # the torn-read test above tears by CALLER, so a helper that read the blob twice (values, then stamps)
+        # would still pass it; this counts the reads inside one snapshot (third review, nit)
+        with self.k:
+            km._set_compact_suggest(True, gt=9_000)
+            real = km._auto_nudge_data
+            calls = []
+            km._auto_nudge_data = lambda: (calls.append(1), real())[1]
+            try:
+                values, stamps = km._mesh_settings_snapshot()
+            finally:
+                km._auto_nudge_data = real
+        self.assertEqual(len(calls), 1, "one read of the auto-nudge blob for its two values and two stamps")
+        self.assertEqual((values["compactSuggest"], stamps["compact-suggest"]), (True, 9_000))
+
     def test_version_builds_the_three_adopted_settings_from_the_snapshot_helper(self):
         src = KERNEL_SRC.split("def _version_info():")[1].split("\ndef ")[0]
         self.assertIn("_mesh_settings_snapshot()", src)
