@@ -291,7 +291,8 @@ class AnAskStaysOnThatPeer(unittest.TestCase):
                        ("_fleet_restart_plan", "_peer_call", "_peer_hub_name", "_local_head",
                         "_local_branch", "_restart_this_kernel")}
         self._remotes = dict(km._remotes)
-        km._fleet_restart_plan = lambda r: ("ask", "checked in here; asking it to fast-forward itself")
+        # the sweep hands the plan the head it read once (#1025); the stub takes it like the real function
+        km._fleet_restart_plan = lambda r, head=None: ("ask", "checked in here; asking it to fast-forward itself")
         km._peer_hub_name = lambda r: "hubname"
         km._local_head = lambda short=False: ("abc1234" if short else LOCAL_SHA)
         km._local_branch = lambda: "main"
