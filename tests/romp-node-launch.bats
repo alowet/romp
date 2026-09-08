@@ -10,6 +10,9 @@ setup() {
     LAUNCH="$(cd "$(dirname "$BATS_TEST_FILENAME")/../bin" && pwd)/romp-node-launch"
     export HOME="$TEST_DIR/home"
     export XDG_STATE_HOME="$HOME/.local/state"
+    # The launcher honors both; a developer shell exporting them would point every
+    # case here at a real service.env or state dir.
+    unset ROMP_SERVICE_ENV_FILE ROMP_STATE_DIR
     BIN="$TEST_DIR/bin"
     mkdir -p "$HOME" "$BIN"
     # Fake manager: just a marker file. It is never run directly — the fake node
@@ -81,14 +84,18 @@ teardown() { rm -rf "$TEST_DIR"; }
     [[ "$output" == *"SECRET=[hunter2] ran: $MANAGER up"* ]]
 }
 
-@test "service.env: one layer of matching quotes comes off the value, as systemd and the kernel read it" {
-    # systemd's EnvironmentFile= and kernel/keysource.py both strip one layer of
-    # matching quotes; this launcher must too, or a quoted value means one thing on
-    # Linux and another on macOS. An unbalanced quote is left as written; quotes
-    # inside a value are part of the value; an empty quoted value is empty. Exactly
-    # one layer comes off, so a nested pair keeps its inner quotes; the pair must
-    # match, so "abc' is left as written; a value holding the other quote character
-    # keeps it.
+@test "service.env: one layer of matching quotes comes off the value and whitespace around it is dropped; edge cases follow the kernel's reader" {
+    # Every reader of this file strips one layer of matching quotes and discards
+    # whitespace around the value (a trailing space after the closing quote, a CRLF
+    # line ending): systemd's EnvironmentFile=, the kernel's own reader
+    # (kernel/keysource.py _assignments) and this launcher. Without that a quoted
+    # value means one thing on Linux and another on macOS. The edge cases follow
+    # the kernel's reader, not systemd, which parses a value like a shell (pieces
+    # concatenate, an unbalanced quote runs on to the next line): an unbalanced
+    # quote is left as written; quotes inside a value are part of the value; an
+    # empty quoted value is empty; exactly one layer comes off, so a nested pair
+    # keeps its inner quotes; the pair must match, so "abc' is left as written; a
+    # value holding the other quote character keeps it.
     export XDG_CONFIG_HOME="$HOME/.config"
     mkdir -p "$XDG_CONFIG_HOME/romp"
     {
@@ -101,11 +108,14 @@ teardown() { rm -rf "$TEST_DIR"; }
         echo 'ROMP_TEST_TWO=""a""'
         echo "ROMP_TEST_MIX=\"abc'"
         echo "ROMP_TEST_APOS=\"it's\""
+        printf 'ROMP_TEST_TSP="a b" \n'          # trailing space after the closing quote
+        printf 'ROMP_TEST_CRLF="c d"\r\n'        # a CRLF line ending on a quoted value
+        printf 'ROMP_TEST_BARECR=plain\r\n'      # and on an unquoted one
     } > "$XDG_CONFIG_HOME/romp/service.env"
-    printf '#!/bin/sh\necho "DQ=[$ROMP_TEST_DQ] SQ=[$ROMP_TEST_SQ] ONE=[$ROMP_TEST_ONE] EMPTY=[${ROMP_TEST_EMPTY-unset}] INNER=[$ROMP_TEST_INNER] NESTED=[$ROMP_TEST_NESTED] TWO=[$ROMP_TEST_TWO] MIX=[$ROMP_TEST_MIX] APOS=[$ROMP_TEST_APOS]"\n' > "$BIN/node"
+    printf '#!/bin/sh\necho "DQ=[$ROMP_TEST_DQ] SQ=[$ROMP_TEST_SQ] ONE=[$ROMP_TEST_ONE] EMPTY=[${ROMP_TEST_EMPTY-unset}] INNER=[$ROMP_TEST_INNER] NESTED=[$ROMP_TEST_NESTED] TWO=[$ROMP_TEST_TWO] MIX=[$ROMP_TEST_MIX] APOS=[$ROMP_TEST_APOS] TSP=[$ROMP_TEST_TSP] CRLF=[$ROMP_TEST_CRLF] BARECR=[$ROMP_TEST_BARECR]"\n' > "$BIN/node"
     chmod +x "$BIN/node"
     run "$LAUNCH" "$MANAGER" up
     [ "$status" -eq 0 ]
-    want="DQ=[two words] SQ=[x y] ONE=[\"abc] EMPTY=[] INNER=[a\"b\"c] NESTED=['q'] TWO=[\"a\"] MIX=[\"abc'] APOS=[it's]"
+    want="DQ=[two words] SQ=[x y] ONE=[\"abc] EMPTY=[] INNER=[a\"b\"c] NESTED=['q'] TWO=[\"a\"] MIX=[\"abc'] APOS=[it's] TSP=[a b] CRLF=[c d] BARECR=[plain]"
     [[ "$output" == *"$want"* ]]
 }

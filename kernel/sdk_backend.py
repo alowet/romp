@@ -2080,9 +2080,10 @@ def _check_key_file_agrees(startup: str, live: str) -> None:
 
     Worth the six lines: this is the one way the live read can go quietly wrong. Three readers each
     parse the file themselves — systemd's EnvironmentFile, the macOS launcher (bin/romp-node-launch)
-    and keysource._assignments — and all strip one layer of matching quotes, but a stray duplicate
-    line, whitespace around a value, or a key that reaches the manager some other way makes the file
-    disagree with the environment, and every session would then launch on a key nobody chose.
+    and keysource._assignments — and all strip one layer of matching quotes and the whitespace around a
+    value, but a backslash escape inside quotes (systemd interprets some, the other two none), a stray
+    duplicate line, or a key that reaches the manager some other way makes the file disagree with the
+    environment, and every session would then launch on a key nobody chose.
     Disagreement at startup is a configuration fact the operator can fix in a minute, and silence
     about it would surface hours later as inexplicable 401s."""
     global _KEY_FILE_CHECKED
@@ -2096,7 +2097,7 @@ def _check_key_file_agrees(startup: str, live: str) -> None:
     sys.stderr.write(
         "work key: the manager env file sets a DIFFERENT key than this process started with "
         "(file sha256:%s, startup sha256:%s) — sessions launch on the file's. If that is not what "
-        "you meant, check %s for a duplicated %s line or whitespace around its value.\n"
+        "you meant, check %s for a duplicated %s line or a backslash escape inside its quotes.\n"
         % (_keysrc.fingerprint(live), _keysrc.fingerprint(startup),
            _keysrc.service_env_path(), _keysrc.KEY_VAR))
 
