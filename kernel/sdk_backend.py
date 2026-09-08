@@ -2370,7 +2370,14 @@ BOOT_RESUME_NUDGE = (
     "shows '[Request interrupted by user]', that record came from this cut, not from the user: nobody "
     "asked you to stop. Re-read the tail of the conversation and pick the work back up where it "
     "stopped, without asking whether to continue. Any messages queued before the restart follow "
-    "this one.")
+    "this one.<!-- romp-gist: resumed after a romp restart cut its turn -->")
+# Every [romp] mechanics notice carries a <!-- romp-gist --> marker (2026-09-08): the ONE-LINE, user-facing
+# head the chat shows for it. The prose is written to the AGENT ("Re-read the tail… pick the work back
+# up"), and its first sentence read wrong as a head in the transcript; the kernel lifts the gist beside
+# the rompSystem flag (build_session) and the chat folds the agent-facing text beneath it. Appended on these
+# constants (the rename ping is detected by its leading head, RENAME_PING_HEAD, and the interrupt causes by
+# their leading sentences, kernel INTR_RESTART_SIG / INTR_CRASH_SIG); task_death_notice carries its gist in
+# the leading marker run instead, where its voice test wants every marker. The lift reads either position.
 
 # T214: the restart also killed a QUESTION the session had up — the ask future lived only in the
 # old process, so the user's answer (often flushed by the reconnecting page) had nowhere to land,
@@ -2379,7 +2386,8 @@ BOOT_RESUME_NUDGE = (
 ASK_DIED_NOTICE = (
     "<!-- romp-injected --><!-- romp-system -->[romp] The restart also killed a question this "
     "session had up awaiting the user's answer — it was never delivered, and any answer they sent "
-    "could not land. Ask the question again so they can answer it.")
+    "could not land. Ask the question again so they can answer it."
+    "<!-- romp-gist: a question it had up was lost in the restart -->")
 
 # Staggered boot-resume (the user 2026-07-20): spawning every reconciled session's CLI at once
 # detonated a fleet-wide CPU storm — each resumed claude burns ~a full core catching up on its
@@ -2408,7 +2416,8 @@ CRASH_RESUME_NUDGE = (
     "(killed or crashed); the session has been resumed with its history intact. If the conversation "
     "tail shows '[Request interrupted by user]', that record came from this cut, not from the user: "
     "nobody asked you to stop. Re-read the tail of the conversation and pick the work back up where "
-    "it stopped, without asking whether to continue.")
+    "it stopped, without asking whether to continue."
+    "<!-- romp-gist: resumed after its process died mid-turn -->")
 
 
 # A CLI that cannot even START says so on the way out — and the ONE cause that reliably does this is the
@@ -2534,7 +2543,11 @@ def task_death_notice(tasks: list, cause: str = "a restart or crash") -> str:
     n = len(tasks)
     descs = "; ".join(d for d in ((t.get("desc") or "").strip() for t in tasks[:4]) if d)
     one = n == 1
-    return ("<!-- romp-injected --><!-- romp-system -->[romp] %d background task%s you had running %s "
+    # the gist marker rides in the LEADING marker run here (this notice's voice test wants every marker ahead of
+    # the prose, one line after it); the restart constants above append theirs — the lift reads either position
+    return ("<!-- romp-injected --><!-- romp-system --><!-- romp-gist: %d background task%s cut off when the process ended -->"
+            % (n, "" if one else "s")
+            + "[romp] %d background task%s you had running %s "
             "cut off when the claude process that started %s ended (%s)%s. "
             "%s completion notification%s will never arrive. Check whether %s still running before "
             "relaunching %s; if %s needed, carry on."
@@ -11098,7 +11111,8 @@ class SdkBackend:
         # its pre-turn record, the very fold this gate guards. The note is spent only AFTER the
         # ping is provably queued; a kernel death between the two re-pings at a later settle
         # (a repeat of a true fact) instead of losing the note.
-        if not s.enqueue_if_empty("<!-- romp-injected --><!-- romp-system -->" + RENAME_NUDGE % note):
+        if not s.enqueue_if_empty("<!-- romp-injected --><!-- romp-system -->" + RENAME_NUDGE % note
+                                  + "<!-- romp-gist: renamed to '%s' -->" % note):
             return False                   # a queued turn would share the pre-turn window — hold the note
         self._update_reg(s.sid, renameNote=None)
         return True
