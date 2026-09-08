@@ -5,8 +5,27 @@ name: PR tier
 # with no label has not been sorted yet and a PR with two has been sorted two
 # ways; this check fails in both cases and passes otherwise.
 #
-# It reads the labels from the event payload and nothing else: no checkout,
-# no token use, no third-party action, so a PR from a fork can run it safely.
+# It reads the PR's CURRENT labels from the API with the job's read-only token
+# (no checkout, no third-party action, so a PR from a fork can run it safely).
+# Not from the event payload: that is a snapshot taken when the event fired,
+# and `gh pr create --label` fires `opened` with no labels and `labeled` a
+# second later, so the opened run judged a label set that no longer existed.
+# When its job happened to finish AFTER the labeled run's, the newest
+# same-named check run was that stale failure and the PR read blocked with
+# auto-merge armed (pull 1039, 2026-09-08). Every run now judges what the PR
+# carries at the moment it looks, and the concurrency group below runs one
+# job at a time per PR. The merge box follows the newest same-named check run
+# BY TIME (on 1039 the failure that completed last won, though its run was
+# created first), and one-at-a-time makes completion times monotonic in
+# execution order, so the run that executes last is the newest. `queue: max`
+# keeps EVERY pending run (the default keeps one and replaces it, leaving a
+# check run concluding "cancelled"), so no run for a PR is ever cancelled or
+# replaced: each event's run executes, in the order they began waiting, and
+# the last one has read the world after the last event.
+# It is NOT cancel-in-progress: the in-progress run is never cut. Cancelling
+# it would risk its "cancelled" check run COMPLETING after the survivor's (the
+# runner's cancel grace is longer than this job), and a cancelled required
+# check blocks the merge. Queueing costs a few seconds; cancelling can wedge.
 # It re-runs when the labels change, and on every push to the PR, so the
 # status on the PR is always about the labels it carries now. Making it a
 # REQUIRED check on main is a branch-ruleset setting in the repository
@@ -17,7 +36,13 @@ on:
     types: [opened, reopened, labeled, unlabeled, synchronize, edited]
 
 permissions:
-  contents: read
+  pull-requests: read
+
+# One job at a time per PR, every run kept, none cancelled: see the header.
+concurrency:
+  group: pr-tier-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   tier:
@@ -27,8 +52,15 @@ jobs:
     steps:
       - name: Count the tier labels on this PR
         env:
-          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
+          # The API is the authority; the payload is a snapshot (see the header). A failed read is a
+          # failed check, never a guessed label set.
+          LABELS=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '[.labels[].name]') || {
+            echo "::error::Could not read this PR's labels from the API."
+            exit 1
+          }
           count=$(jq '[.[] | select(. == "tests-only" or . == "fix" or . == "feature" or . == "major-feature")] | length' <<<"$LABELS")
           if [ "$count" -eq 1 ]; then
             exit 0
