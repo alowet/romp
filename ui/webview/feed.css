@@ -482,7 +482,7 @@ body { display: flex; flex-direction: column; position: relative; }   /* column 
 .fitem.ask { cursor: pointer; }
 .fitem.ask, .fitem.fgroup { border-color: rgba(var(--card-r, 255), var(--card-g, 255), var(--card-b, 255), 0.5); }
 .fitem.ask.pinned  { border-color: rgba(var(--card-r, 255), var(--card-g, 255), var(--card-b, 255), 0.85); }   /* pinned: bolded, persistent */
-/* effective focus: full-opacity same colour, thickened a touch — plus the hover lift (the user 2026-07-15).
+/* effective focus: the same colour at full opacity plus the hover lift (the user 2026-07-15).
    The bolding is PAINT ONLY: the same 2px border at the identity colour's full alpha (rest is 0.5α), plus
    the lifted shadow. No width change and no ring. History, so neither comes back: the first cut drew a 1px
    box-shadow ring against the border, a second paint whose contact line is renderer- and zoom-dependent —

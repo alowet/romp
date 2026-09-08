@@ -3555,7 +3555,7 @@ function makeSessHead(): HTMLElement {
   // mode re-homes and re-renders; the header only says which session it stands for (data-fsid).
   // THE card's Clear, built by the same builder (the user 2026-09-08: same size, the outline, blue on hover),
   // plus one positional class that carries layout only (far right of the row) — never a lookalike
-  const clr = clearButton("clear every card for this session", "Clear all");   // "Clear all" (T271): it clears the whole session, the card's own says "Clear"
+  const clr = clearButton("clear every card for this session", "Clear all");
   clr.classList.add("feed-sess-clear"); clr.dataset.act = "sess-clear"; clr.style.display = "none";
   h.append(nm, fold, cnt, svc, clr, svcList);
   (h as any)._name = nm; (h as any)._fold = fold; (h as any)._foldn = cnt;
