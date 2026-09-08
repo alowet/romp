@@ -37536,8 +37536,11 @@ if(spPending){try{spPending.abort();}catch(e){}}
 var spAbort=new AbortController(),ms=(window.__rompSpendTimeoutMs|0)||20000;spPending=spAbort;
 var spTimer=setTimeout(function(){spAbort.abort();},ms);
 fetch('/spend/detail',{cache:'no-store',signal:spAbort.signal}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
-.then(function(d){clearTimeout(spTimer);if(spPending===spAbort)spPending=null;SP.data=d;if(SP.open)renderSpend();},
-function(e){clearTimeout(spTimer);if(spPending===spAbort)spPending=null;if(!SP.open||spAbort!==spPending&&SP.data)return;
+.then(function(d){clearTimeout(spTimer);var mine=(spPending===spAbort);if(mine)spPending=null;if(!SP.open||!mine)return;SP.data=d;renderSpend();},
+// a SUPERSEDED fetch (a re-open aborted it) yields whatever it carries: its AbortError rejects on the
+// next tick, while the successor is still loading and SP.data is null — a guard that leaned on SP.data
+// painted a false "no answer after 20 s" over the loader (review find). Ownership decides, nothing else.
+function(e){clearTimeout(spTimer);var mine=(spPending===spAbort);if(mine)spPending=null;if(!SP.open||!mine)return;
 SP.err=(e&&e.name==='AbortError')?('no answer from the kernel after '+Math.round(ms/1000)+' s'):String((e&&e.message)||e);renderSpend();});}
 function closeSpend(){SP.open=false;if(spBack)spBack.hidden=true;spTipHide();if(spPending){try{spPending.abort();}catch(e){}spPending=null;}}
 window.__rompCloseSpend=closeSpend;
@@ -37673,7 +37676,7 @@ var xlab='';for(var i=0;i<n;i++){var k=ser.keys[i],m;
 if(SP.range==='hours'){m=/^(\\d{4})-(\\d\\d)-(\\d\\d)T00$/.exec(k);if(m){var dd=new Date(+m[1],+m[2]-1,+m[3]);
 xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+['S','M','T','W','T','F','S'][dd.getDay()]+'</span>';}}
 else{m=/^(\\d{4})-(\\d\\d)-(01|15)$/.exec(k);if(m)xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+Number(m[2])+'/'+Number(m[3])+'</span>';}}
-var leg='<div class=rsp-leg>'+stacks.map(function(s){return '<span class="rsp-chip'+(s.kind==='sid'&&!s.live?' rsp-dead':'')+'"><i class="rsp-sw'+(s.kind==='unattributed'?' rsp-hatch':'')+'"'
+var leg='<div class=rsp-leg>'+stacks.map(function(s){return '<span class="rsp-chip'+((s.kind==='sid'&&!s.live)||s.kind==='unattributed'?' rsp-dead':'')+'"><i class="rsp-sw'+(s.kind==='unattributed'?' rsp-hatch':'')+'"'
 +(s.kind==='unattributed'?'':' style="background:'+(s.kind==='other'?SP_OTHER:spColor(s))+'"')+'></i>'+esc(spStackName(s))+'</span>';}).join('')+'</div>';
 var tzNote='';var mine=-(new Date().getTimezoneOffset());
 if(typeof d.tzOffsetMin==='number'&&d.tzOffsetMin!==mine)tzNote='<div class=rsp-note>Bucket times are '+esc(d.tz||'the kernel\u2019s clock')+' (the machine that recorded them), not your local time.</div>';
@@ -39797,7 +39800,8 @@ def _landing():
             "body.theme-light .rsp-tbl th{border-bottom-color:rgba(0,0,0,0.10)}body.theme-light .rsp-tbl td{border-bottom-color:rgba(0,0,0,0.06)}"
             "body.theme-light .rsp-btn{border-color:rgba(0,0,0,0.18);color:#1F1E1D}"
             # the PRESSED toggle's light step, written out (T247b review): `.rsp-btn.on` (0,2,0) lost to
-            # `body.theme-light .rsp-btn` (0,1,1,0) and painted dark text and a hairline on the clay chip.
+            # `body.theme-light .rsp-btn` (0,2,1 — two classes and the body type) and painted dark text
+            # and a hairline on the clay chip; this rule is (0,3,1) and wins outright.
             # CSS state rules must win the cascade — pin the tiebreak, never rely on it.
             "body.theme-light .rsp-btn.on{background:var(--accent,#C2410C);color:var(--accent-fg,#FFF8F2);border-color:transparent}"
             "body.theme-light .rsp-err{color:#9A3324}"   # the dark-only pink read 1.7:1 on the white card (review find)

@@ -22,6 +22,7 @@ const { chromium } = require('playwright');
   const out = await pg.evaluate(() => ({
     head: document.querySelector('#rsp-panel .rsp-top span').textContent,
     legend: Array.from(document.querySelectorAll('#rsp-chart .rsp-chip')).map((e) => e.textContent),
+    chipOpacity: Array.from(document.querySelectorAll('#rsp-chart .rsp-chip')).map((e) => e.textContent + ':' + getComputedStyle(e).opacity),
     rows: Array.from(document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr')).map((tr) => tr.textContent),
     deadRows: document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr.rsp-dead').length,
     segs: document.querySelectorAll('#rsp-chart .rsp-seg').length,
@@ -102,10 +103,14 @@ const { chromium } = require('playwright');
   });
   // the loader's backstop: a fetch that never answers ends on the error + retry path (T247b)
   const timeout = await pg.evaluate(async () => {
-    const f = window.fetch; window.__rompSpendTimeoutMs = 300;
+    const f = window.fetch; window.__rompSpendTimeoutMs = 1000;
     window.fetch = (u, o) => new Promise((res, rej) => { if (o && o.signal) o.signal.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError'))); });
-    try { window.__rompOpenSpend(); await new Promise((r) => setTimeout(r, 900));
-      const err = document.querySelector('#rsp-panel .rsp-err'); return { err: err ? err.textContent : null, retry: !!document.querySelector('#rsp-panel [data-act="retry"]') }; }
+    try {
+      // a re-open while the first fetch is pending: the superseded fetch's abort must NOT paint an error
+      window.__rompOpenSpend(); window.__rompOpenSpend(); await new Promise((r) => setTimeout(r, 150));
+      const early = { err: !!document.querySelector('#rsp-panel .rsp-err'), loader: !!document.querySelector('#rsp-panel .rsp-load') };
+      await new Promise((r) => setTimeout(r, 1400));
+      const err = document.querySelector('#rsp-panel .rsp-err'); return { early, err: err ? err.textContent : null, retry: !!document.querySelector('#rsp-panel [data-act="retry"]') }; }
     finally { window.fetch = f; delete window.__rompSpendTimeoutMs; }
   });
   await pg.keyboard.press('Escape');

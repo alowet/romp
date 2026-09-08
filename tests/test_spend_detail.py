@@ -289,13 +289,15 @@ class SpendDetail(unittest.TestCase):
         for i in range(5):    # five login-only sessions: no key sub-map
             by["11111111-2222-3333-4444-0000000003%02d" % i] = {"usd": 9.0, "turns": 9, "tok": 9000}
         days = {_day(0): _bucket(sum(v["usd"] for v in by.values()), 17000, 26, by,
-                                 key={"usd": sum(12.0 + i for i in range(12)) - 12 * 11.0 + 66.0, "turns": 12, "tok": 12000})}
+                                 key={"usd": sum(1.0 + i for i in range(12)), "turns": 12, "tok": 12000})}
         (km.jd.STATE / "spend.json").write_text(json.dumps({"days": days, "hours": {}}))
         d = km._spend_detail(now=NOW)
         self.assertEqual(d["scope"], "keyed")
         self.assertEqual(len(d["sessions"]), 12, "the table lists the key-billed sessions only")
         other = [s for s in d["days"]["stacks"] if s["kind"] == "other"][0]
         self.assertEqual(other["count"], 2, "the legend's count is the table's fold: sessions that contributed")
+        self.assertEqual(d["unattributed"]["usd"], 0.0, "every key dollar is a session's: nothing unattributed")
+        self.assertEqual([s["kind"] for s in d["days"]["stacks"]][-1], "other")
 
     def test_the_route_and_the_shell_are_wired(self):
         ksrc = inspect.getsource(km.Handler.do_GET) if hasattr(km.Handler, "do_GET") else open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
@@ -319,7 +321,7 @@ class SpendDetail(unittest.TestCase):
         self.assertIn("function fleetSpendHTML(sets){", html, "…whose signature the other suites pin, untouched")
         self.assertIn("body.theme-light #rsp-panel{", html, "a light-theme step of its own")
         # T247b: the pressed toggle's light rule is written explicitly — a state rule must win the cascade
-        # (body.theme-light .rsp-btn at 0,1,1,0 beat .rsp-btn.on at 0,2,0 and painted dark text on the clay)
+        # (body.theme-light .rsp-btn at (0,2,1) beat .rsp-btn.on at (0,2,0) and painted dark text on the clay)
         self.assertIn("body.theme-light .rsp-btn.on{background:var(--accent,#C2410C);color:var(--accent-fg,#FFF8F2);border-color:transparent}", html)
         # T247b: the loader has a backstop — an AbortController with a generous timeout lands on the
         # existing error + retry path, so a hung socket can never trap the modal

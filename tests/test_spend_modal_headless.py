@@ -165,9 +165,16 @@ class SpendModalServed(unittest.TestCase):
         self.assertEqual(o["dim"]["ann"], "1", "no second dimming inside a dimmed row")
         self.assertIs(o["dim"]["btnRowDead"], False, "the 'show all' row is not dimmed")
         self.assertEqual(o["dim"]["btnOpacity"], "1")
-        # T247b: the loader's backstop lands on the error + retry path
-        self.assertTrue(o["timeout"]["err"] and "load the spend detail" in o["timeout"]["err"], o["timeout"])
+        # T247b: the loader's backstop lands on the error + retry path, and names the timeout (the AbortError
+        # mapping is pinned, not just the shared prefix — review find); a re-open over a pending fetch keeps
+        # the loader up: the superseded fetch's abort paints nothing (review find)
+        self.assertTrue(o["timeout"]["err"] and "no answer from the kernel after 1 s" in o["timeout"]["err"], o["timeout"])
         self.assertTrue(o["timeout"]["retry"])
+        self.assertEqual(o["timeout"]["early"], {"err": False, "loader": True}, o["timeout"])
+        # the unattributed chip dims like its row (review find: same class, two weights)
+        self.assertIn("unattributed:0.55", o["out"]["chipOpacity"], o["out"]["chipOpacity"])
+        self.assertIn("web:1", o["out"]["chipOpacity"])
+        self.assertIn("tests:0.55", o["out"]["chipOpacity"])
         # T247b: the phone's door is a real button — the hover's size, full opacity, not an annotation
         self.assertEqual(o["mobile"]["btn"]["font"], "11px", o["mobile"]["btn"])
         self.assertEqual(o["mobile"]["btn"]["opacity"], "1", o["mobile"]["btn"])
