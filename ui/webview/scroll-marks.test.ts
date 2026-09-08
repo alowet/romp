@@ -1,8 +1,9 @@
 // A thin blue notch on the chat's right scroll edge for every USER message (the user 2026-08-17) —
 // the conversation's shape at a glance, overview-ruler style. Proportional positions (scroll-
 // invariant), painted by the rail-sticky scheduler with a signature skip so pure scrolls do no DOM
-// work; passive fixed chrome that never blocks the native scrollbar; gestures (command rows, the
-// Continue row) draw no notch — those are doings, not words. Source pins.
+// work; the BOX is passive fixed chrome that never blocks the native scrollbar, while each NOTCH is a
+// link to its message (T260); gestures (command rows, the Continue row) draw no notch — those are
+// doings, not words. Source pins.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -49,8 +50,10 @@ test("a history load rescales the map smoothly — moved notches are carried, ne
   // the user 2026-08-17: scrolling back streams older history in; the scroller's world grows and
   // every proportional position compresses (the native thumb does the same). Rebuilt nodes can't
   // transition, so same-count updates move the EXISTING nodes and CSS carries them.
-  assert.match(RENDER, /if \(kids\.length === ys\.length\) \{\s*\n\s*ys\.forEach\(\(o, i\) => \{ kids\[i\]\.style\.top = o\.y \+ "px"; kids\[i\]\.className = "scroll-mark" \+ \(o\.m \? " " \+ o\.m : ""\); \}\);/,
-    "…and the kind class updates in place too (a machine notch stays gray through a rescale)");
+  assert.match(RENDER, /if \(kids\.length === ys\.length\) \{\s*\n\s*ys\.forEach\(\(o, i\) => \{ kids\[i\]\.style\.top = o\.y \+ "px"; dress\(kids\[i\], o, i\); \}\);/,
+    "…and the dress (kind class, link target, tip, hit pads) updates in place too — a machine notch stays gray through a rescale");
+  assert.match(RENDER, /const dress = \(m: HTMLElement, o: typeof ys\[number\], k: number\) => \{\s*\n\s*m\.className = "scroll-mark" \+ \(o\.m \? " " \+ o\.m : ""\);/,
+    "one dress for both DOM paths, so the moved notch and the rebuilt notch can never disagree");
   assert.match(CSS, /transition: top 180ms ease;/);
   assert.match(CSS, /prefers-reduced-motion: reduce\) \{ \.scroll-marks \.scroll-mark \{ transition: none; \} \}/);
 });
@@ -101,4 +104,81 @@ test("with every unit rendered the frame is the scrollbar's own truth: real midd
   assert.match(frameBody, /if \(exact\.size > 0 && exact\.size === unitTotal && !v\.el\.querySelector\("\.tx-spacer"\) && content\.scrollHeight > 0\) \{\s*\n\s*const shx = content\.scrollHeight;\s*\n\s*return \{ sh: shx, offsetOf: \(i: number\): number \| null => exact\.get\(i\) \?\? null \};/);
   // the virtual prefix-sum stays the fallback while spacers hide units
   assert.match(frameBody, /for \(let u = 0; u < unitTotal; u\+\+\) \{ t \+= uh\.get\(u\) \?\? avg; pre\.push\(t\); \}/);
+});
+
+// ── T260 (the user 2026-09-08): the notches are links — click one and the chat lands on that message ─────
+const PAINT = RENDER.slice(RENDER.indexOf("function paintScrollMarks(): void {"), RENDER.indexOf("function paintRailSticky(): void {"));
+const ENSURE = RENDER.slice(RENDER.indexOf("function ensureScrollMarks(): HTMLElement {"), RENDER.indexOf("function scrollMarkTitle("));
+const TITLE = RENDER.slice(RENDER.indexOf("function scrollMarkTitle("), RENDER.indexOf("function paintScrollMarks(): void {"));
+
+test("every notch that knows its message carries the uuid and the action, on BOTH DOM paths (T260)", () => {
+  // the click resolves to a MESSAGE (a uuid), never to a pixel — and the same dress runs on the in-place
+  // move and the rebuild, so a rescale re-points a moved notch rather than leaving it aimed at a ghost
+  assert.match(PAINT, /if \(o\.uuid\) \{ m\.dataset\.act = "markjump"; m\.dataset\.uuid = o\.uuid; m\.title = scrollMarkTitle\(/);
+  assert.match(PAINT, /else \{ delete m\.dataset\.act; delete m\.dataset\.uuid; m\.removeAttribute\("title"\); \}/,
+    "a notch with nothing to land on is a plain mark: no act, no pointer cursor, no false affordance");
+  assert.match(PAINT, /offs\.push\(\{ top: off, m: kind === "user" \? "" : "machine", uuid: ev\.uuid \|\| "", i, kind \}\);/,
+    "machine notches carry their uuid too — gray is clickable like blue");
+  assert.match(PAINT, /box\.replaceChildren\(\.\.\.ys\.map\(\(o, k\) => \{\s*\n\s*const m = el\("div", ""\);\s*\n\s*m\.style\.top = o\.y \+ "px";\s*\n\s*dress\(m, o, k\);/);
+  assert.match(PAINT, /ys\.map\(\(o\) => o\.y \+ \(o\.m \? "m" : ""\) \+ o\.uuid\)\.join\(","\)/,
+    "the uuid rides the signature: a message changing identity under the same pixel re-points its notch");
+});
+
+test("the click is DELEGATED on the stable box and rides the deep-link route, like a comment tick (T260)", () => {
+  // click-safety: the notches are rebuilt on every paint, so the listener lives on the box (created once)
+  // and keys off data-act; actions.ts's delegate() also gives the press pulse. The jump is scrollToAnchor —
+  // pointer-exact on the uuid, the one-per-navigation flash re-armed — never scrollTop arithmetic.
+  assert.match(ENSURE, /delegate\(scrollMarks, \{\s*\n\s*markjump: \(elx\) => \{\s*\n\s*const uuid = elx\.dataset\.uuid;\s*\n\s*if \(!uuid \|\| !activeId\) return;\s*\n\s*flashedAnchor = null;\s*\n\s*scrollToAnchor\(uuid\);/);
+  assert.doesNotMatch(PAINT, /addEventListener|onclick|scrollTop =/, "no per-notch listener, no pixel jump in the painter");
+  assert.equal((ENSURE.match(/delegate\(/g) || []).length, 1, "installed once, inside the create-once branch");
+  assert.ok(ENSURE.indexOf("delegate(scrollMarks") > ENSURE.indexOf("document.body.appendChild(scrollMarks);"), "…after the box is made");
+});
+
+test("the tip is the rail's own time, and a machine notch names its sender (T260)", () => {
+  // the same HH:MM the rail stamps (markerLabel, with a past day named the way the day's first stamp does);
+  // a gray notch says who sent it — romp, or the ⚙ label — so it never poses as your words even on hover
+  assert.match(TITLE, /const epoch = eventEpoch\(ev\);/);
+  assert.match(TITLE, /markerLabel\(epoch, null, Date\.now\(\)\)\.text/);
+  assert.match(TITLE, /kind === "romp" \? "from romp" : "from " \+ \(ev\.tag \|\| "a machine sender"\)/);
+  assert.match(TITLE, /"click to jump to your message"/);
+  assert.match(TITLE, /"click to jump to it"/);
+  assert.match(TITLE, /\(head \? head \+ " · " : ""\)/, "a middot before the verb phrase: a clock time followed by \": \" read as a doubled colon");
+});
+
+test("hit pads are clamped to half the gap to each neighbour, so a dense stretch never answers for the wrong message (T260 review)", () => {
+  // a fixed 3px pad reached over a neighbour's paint and the later sibling won the hit test: hover,
+  // tip and click all answered for the message AFTER the one under the pointer wherever notches sat
+  // within about 5px (verified in Chromium by two independent reviewers, 2026-09-08)
+  assert.match(PAINT, /const PAD = 2;/, "the pad is 2px each side — a 6px target for a 2px line, and less of the thumb's track than 3px took");
+  assert.match(PAINT, /const up = k > 0 \? Math\.floor\(\(ys\[k\]\.y - ys\[k - 1\]\.y - 2\) \/ 2\) : PAD;/);
+  assert.match(PAINT, /const down = k \+ 1 < ys\.length \? Math\.floor\(\(ys\[k \+ 1\]\.y - ys\[k\]\.y - 2\) \/ 2\) : PAD;/);
+  assert.match(PAINT, /return \[Math\.max\(0, Math\.min\(PAD, up\)\), Math\.max\(0, Math\.min\(PAD, down\)\)\];/, "half the gap, floored, never below 0 nor above the pad");
+  assert.match(PAINT, /m\.style\.setProperty\("--hit-t", up \+ "px"\);\s*\n\s*m\.style\.setProperty\("--hit-b", down \+ "px"\);/, "set in the one dress, so both DOM paths carry them");
+  assert.match(PAINT, /ys\.forEach\(\(o, i\) => \{ kids\[i\]\.style\.top = o\.y \+ "px"; dress\(kids\[i\], o, i\); \}\);/);
+  assert.match(PAINT, /box\.replaceChildren\(\.\.\.ys\.map\(\(o, k\) => \{/);
+});
+
+test("the wheel over a notch scrolls the transcript — the box forwards it (T260 review)", () => {
+  // the box hangs off body, not #content: a notch that takes the pointer took the wheel too, and its
+  // scroll chain ended at the page — the scrollbar stopped scrolling exactly where a notch sat
+  assert.match(ENSURE, /scrollMarks\.addEventListener\("wheel", \(e\) => \{/, "one listener on the stable box, never per notch");
+  assert.match(ENSURE, /const k = e\.deltaMode === 1 \? 16 : e\.deltaMode === 2 \? c\.clientHeight : 1;/, "lines and pages scaled to pixels");
+  assert.match(ENSURE, /c\.scrollBy\(\{ top: e\.deltaY \* k, left: e\.deltaX \* k \}\);\s*\n\s*\}, \{ passive: true \}\);/, "passive: the wheel is never blocked");
+});
+
+test("only the NOTCH takes the pointer — the box stays passive over the native scrollbar (T260)", () => {
+  assert.match(CSS, /\.scroll-marks \{ position: fixed; z-index: 3; pointer-events: none; width: 12px; \}/, "the box: unchanged, passive");
+  assert.match(CSS, /\.scroll-marks \.scroll-mark\[data-act\] \{ pointer-events: auto; cursor: pointer; \}/, "a linked notch: the link cursor");
+  assert.match(CSS, /\.scroll-marks \.scroll-mark\[data-act\]::before \{ content: ""; position: absolute; left: -2px; right: -2px; top: calc\(-1 \* var\(--hit-t, 2px\)\); bottom: calc\(-1 \* var\(--hit-b, 2px\)\); \}/,
+    "the hit box is padded past the 2px paint by per-notch pads — the painted size never changes");
+  const hover = (CSS.match(/\.scroll-marks \.scroll-mark\[data-act\]:hover \{[^}]*\}/) || [""])[0];
+  assert.match(hover, /box-shadow: 0 0 0 1\.5px var\(--accent\)/, "the hover cue is the accent ring");
+  assert.match(hover, /opacity: 1;/);
+  assert.doesNotMatch(hover, /--st-|--you|width|height|#[0-9a-fA-F]{3,6}/, "never a status colour, never a size change, never a hardcoded hex");
+  // both themes resolve the ring: the token exists in the dark root and in the light block
+  const light = CSS.split("body.theme-light {")[1].split("\n}")[0];
+  assert.match(CSS.split("body.theme-light {")[0], /--accent: #9cd2ff;/);
+  assert.match(light, /--accent: #C2410C;/);
+  // the hover rule outranks the machine notch's dimmer opacity by specificity (state rules must win the cascade)
+  assert.match(CSS, /\.scroll-marks \.scroll-mark\.machine \{ background: #8a8f98; opacity: 0\.55; \}/);
 });

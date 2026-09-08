@@ -23,7 +23,7 @@ import { openTagMenu, tagMenuButton, syncTagFilter, tagChip } from "./tag-menu";
 import { syncSessionsFromTabMeta, applyMetaToSession, notePendingMeta, PendingTabMeta } from "./tab-meta";
 import { markerLabel, dayContext } from "./time-marker";
 import { compactDisplay, toolCounts, type DisplayItem } from "./compact";
-import { senderKind } from "./sender-identity";
+import { senderKind, SenderKind } from "./sender-identity";
 import { loadSettings, onExternalSettingsChange, installSettingsSync, type RompSettings } from "./settings";
 import { delegate } from "./actions";
 import { awaitWord, awaitBreakdown, groupRows, GROUP_TITLE, workingFor, type AwaitRow } from "./spin-caption";
@@ -2355,9 +2355,15 @@ function ensureRailDay(): HTMLElement {
 // USER message — the conversation's shape at a glance, VS Code overview-ruler style. Positions are
 // proportional (turn offset over scroll height), so they are scroll-INVARIANT: the paint rides the
 // rail-sticky scheduler for free, but a signature check skips the DOM work on pure scrolls and only
-// rebuilds when the geometry or the set of user turns actually changed. Passive fixed chrome, like
-// the sticky: it never intercepts the native scrollbar underneath. The blue is the outgoing-bubble
-// blue — the color that already means "yours" — never the romp accent.
+// rebuilds when the geometry or the set of user turns actually changed. The BOX is passive fixed
+// chrome, like the sticky: it never intercepts the native scrollbar underneath. Each NOTCH, though,
+// is a link to its message (T260, the user 2026-09-08, who wanted to click a notch and land there):
+// it alone takes the pointer, carries the message's uuid, and a click rides the deep-link route
+// (scrollToAnchor → landOn: pointer-exact on the uuid, the one-per-navigation flash) exactly as a
+// comment tick does — never scrollTop arithmetic, which lands on a pixel and not on a message. The
+// notches are rebuilt on every paint, so the click is DELEGATED on the box (installed once, in
+// ensureScrollMarks) and keyed off data-act, per the click-safety rule. The blue is the
+// outgoing-bubble blue — the color that already means "yours" — never the romp accent.
 let scrollMarks: HTMLElement | null = null;
 let scrollMarksSig = "";
 // Measured unit heights, remembered once rendered (the user 2026-08-17, whose video showed notches
@@ -2452,7 +2458,37 @@ function ensureScrollMarks(): HTMLElement {
   scrollMarks = el("div", "scroll-marks");
   scrollMarks.style.display = "none";
   document.body.appendChild(scrollMarks);
+  // a notch: jump the chat to its message (fresh navigation → one flash), the comment tick's route
+  delegate(scrollMarks, {
+    markjump: (elx) => {
+      const uuid = elx.dataset.uuid;
+      if (!uuid || !activeId) return;
+      flashedAnchor = null;
+      scrollToAnchor(uuid);
+    },
+  });
+  // The wheel over a notch scrolls the TRANSCRIPT (review of the first cut, 2026-09-08): the box hangs
+  // off body, not #content, so a notch that takes the pointer also took the wheel and its scroll chain
+  // ended at the page — the scrollbar under it stopped scrolling exactly where a notch sat. One passive
+  // listener on the stable box hands the delta to the scroller (lines and pages scaled to pixels).
+  scrollMarks.addEventListener("wheel", (e) => {
+    const c = document.getElementById("content");
+    if (!c) return;
+    const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? c.clientHeight : 1;
+    c.scrollBy({ top: e.deltaY * k, left: e.deltaX * k });
+  }, { passive: true });
   return scrollMarks;
+}
+
+// The notch's hover tip: the message's time in the rail's own HH:MM (a past day names the day too,
+// the way the rail's first stamp of that day does), and for a machine notch who sent it — romp, or
+// the ⚙ label the sender declared — so a gray notch never poses as your words even on hover.
+function scrollMarkTitle(ev: ChatEvent & { tag?: string }, kind: SenderKind): string {
+  const epoch = eventEpoch(ev);
+  const when = epoch != null ? markerLabel(epoch, null, Date.now()).text : "";
+  const who = kind === "user" ? "" : kind === "romp" ? "from romp" : "from " + (ev.tag || "a machine sender");
+  const head = [when, who].filter(Boolean).join(" · ");
+  return (head ? head + " · " : "") + (kind === "user" ? "click to jump to your message" : "click to jump to it");
 }
 
 function paintScrollMarks(): void {
@@ -2471,7 +2507,7 @@ function paintScrollMarks(): void {
   const frame = contentOffsetFrame(content, v, s);
   if (!frame) { box.style.display = "none"; scrollMarksSig = ""; return; }
   const sh = frame.sh;
-  const offs: Array<{ top: number; m: string }> = [];
+  const offs: Array<{ top: number; m: string; uuid: string; i: number; kind: SenderKind }> = [];
   const evUnit = eventUnitIndex(s);                       // marks anchor to EVENTS; the frame speaks UNITS
   for (let i = 0; i < s.events.length; i++) {
     const ev = s.events[i] as ChatEvent & { human?: boolean; romp?: boolean; rompAuto?: boolean; canned?: string; md?: string; tag?: string };
@@ -2490,11 +2526,13 @@ function paintScrollMarks(): void {
     if (u < 0) continue;                                  // not in the display stream (never for user events)
     const off = frame.offsetOf(u);
     if (off == null) continue;
-    offs.push({ top: off, m: kind === "user" ? "" : "machine" });
+    offs.push({ top: off, m: kind === "user" ? "" : "machine", uuid: ev.uuid || "", i, kind });
   }
-  const ys = offs.map((o) => ({ y: Math.round((o.top / sh) * (cRect.height - 4)), m: o.m }));
+  const ys = offs.map((o) => ({ y: Math.round((o.top / sh) * (cRect.height - 4)), m: o.m, uuid: o.uuid, i: o.i, kind: o.kind }));
+  // the uuid rides the signature too: a notch whose message changed identity under the same pixel
+  // (a provisional turn resolving to its real uuid) must re-point, not keep jumping to a ghost
   const sig = activeId + "|" + Math.round(cRect.top) + "," + Math.round(cRect.right) + ","
-    + Math.round(cRect.height) + "|" + ys.map((o) => o.y + (o.m ? "m" : "")).join(",");
+    + Math.round(cRect.height) + "|" + ys.map((o) => o.y + (o.m ? "m" : "") + o.uuid).join(",");
   if (sig !== scrollMarksSig) {
     scrollMarksSig = sig;
     // UPDATE IN PLACE when the notch count is unchanged (the user 2026-08-17: scrolling back streams
@@ -2503,13 +2541,35 @@ function paintScrollMarks(): void {
     // existing nodes lets the CSS transition carry them, so a history load reads as the map
     // rescaling rather than notches jumping to wrong places. Count changes (new messages, a fresh
     // tab) still rebuild outright — those are new marks, not moved ones.
+    // Every notch that knows its message is a link: data-act routes the delegated click, data-uuid
+    // says where, the title says when (and, for a machine notch, from whom). A notch without a uuid
+    // (nothing to land on) stays a plain mark — no act, no pointer cursor, no false affordance.
+    // The HIT PAD above and below the 2px paint is clamped to half the gap to each neighbour (review
+    // of the first cut, 2026-09-08: a fixed pad reached over a neighbour's paint, and the later
+    // sibling won the hit test — hover, tip and click all answered for the message AFTER the one the
+    // user aimed at, wherever notches sat within about 5px). ys is in event order, hence ascending.
+    const PAD = 2;
+    const pad = (k: number): [number, number] => {
+      const up = k > 0 ? Math.floor((ys[k].y - ys[k - 1].y - 2) / 2) : PAD;
+      const down = k + 1 < ys.length ? Math.floor((ys[k + 1].y - ys[k].y - 2) / 2) : PAD;
+      return [Math.max(0, Math.min(PAD, up)), Math.max(0, Math.min(PAD, down))];
+    };
+    const dress = (m: HTMLElement, o: typeof ys[number], k: number) => {
+      m.className = "scroll-mark" + (o.m ? " " + o.m : "");
+      const [up, down] = pad(k);
+      m.style.setProperty("--hit-t", up + "px");
+      m.style.setProperty("--hit-b", down + "px");
+      if (o.uuid) { m.dataset.act = "markjump"; m.dataset.uuid = o.uuid; m.title = scrollMarkTitle(s.events[o.i] as ChatEvent & { tag?: string }, o.kind); }
+      else { delete m.dataset.act; delete m.dataset.uuid; m.removeAttribute("title"); }
+    };
     const kids = Array.from(box.children) as HTMLElement[];
     if (kids.length === ys.length) {
-      ys.forEach((o, i) => { kids[i].style.top = o.y + "px"; kids[i].className = "scroll-mark" + (o.m ? " " + o.m : ""); });
+      ys.forEach((o, i) => { kids[i].style.top = o.y + "px"; dress(kids[i], o, i); });
     } else {
-      box.replaceChildren(...ys.map((o) => {
-        const m = el("div", "scroll-mark" + (o.m ? " " + o.m : ""));
+      box.replaceChildren(...ys.map((o, k) => {
+        const m = el("div", "");
         m.style.top = o.y + "px";
+        dress(m, o, k);
         return m;
       }));
     }
