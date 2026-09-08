@@ -1035,6 +1035,9 @@ async function diffSessionChanges() {
   try {
     // -z: NUL-separated records with raw paths (no C-quoting), a rename's source after its
     // destination — the one shape session-diff.ts parses.
+    // `=v1` names that format explicitly; bare `--porcelain` is the same v1 on every git, and
+    // the explicit spelling needs git 2.11 (2016), the oldest git this command runs against.
+    // (review find, 2026-09-08)
     files = parsePorcelain(await gitIn(s.dir, ["status", "--porcelain=v1", "-z"]));
   } catch {
     vscode.window.showWarningMessage(`romp: ${s.dir} is not a git repository (or git failed).`);

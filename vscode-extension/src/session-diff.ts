@@ -34,9 +34,15 @@ export function parsePorcelain(out: string): ChangedFile[] {
     const path = raw.slice(3);
     let renamedFrom: string | undefined;
     if (xy.includes("R") || xy.includes("C")) {
-      // Consume the source record. A cut-off tail (a rename with no source
-      // record behind it) leaves renamedFrom unset rather than guessed — the
-      // caller then diffs against the destination path's HEAD side.
+      // Consume the source record, whatever its shape: a source path may itself
+      // look like `XY path`, so the record filter above must not run on it.
+      // A rename with no record behind it cannot come from git (it always writes
+      // the source) or from gitIn (execFile rejects on a maxBuffer overflow
+      // instead of handing over a truncated stdout), so this arm is defensive
+      // and nothing downstream can tell it apart: renamedFrom stays unset, the
+      // caller asks HEAD for the DESTINATION path, which a pure rename does not
+      // have there, and the romp-git provider turns that miss into an empty
+      // left side, so the file reads as wholly added. (review find, 2026-09-08)
       const from = recs[++i];
       if (from) renamedFrom = from;
     }

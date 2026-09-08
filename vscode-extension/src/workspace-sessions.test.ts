@@ -109,6 +109,19 @@ test("parsePorcelain: a rename whose source record is cut off keeps the destinat
   }
 });
 
+// (review find, 2026-09-08) The record-shape filter (`XY<space>`) runs on entries only, never on
+// the record a rename consumes as its source: a source path that happens to start with two letters
+// and a space is still the source. A source shaped like a RENAME record is the sharp case: parsed as
+// an entry, it would swallow the entry behind it as its own source, and that file would vanish
+// from the pick list.
+test("parsePorcelain: a rename source shaped like a status record is still consumed as the source", () => {
+  const files = parsePorcelain("R  new.txt\0RM plan.txt\0 M plain.txt\0");
+  assert.deepEqual(files.map((f) => [f.path, f.status, f.renamedFrom]), [
+    ["new.txt", "R", "RM plan.txt"],
+    ["plain.txt", "M", undefined],
+  ]);
+});
+
 test("parsePorcelain tolerates junk", () => {
   assert.deepEqual(parsePorcelain(""), []);
   assert.deepEqual(parsePorcelain("\0\0xx"), []);     // empty records, and one too short to carry a path
