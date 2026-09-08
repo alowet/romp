@@ -127,7 +127,11 @@ class VersionTag(unittest.TestCase):
 
     def test_a_remote_poll_carries_the_tag_alongside_the_sha(self):
         src = inspect.getsource(km._poll_remote_version)
-        self.assertIn('"ver": str(j.get("kernel_ver") or "")', src)
+        # the tag is read off /version beside the sha and returned as `ver` — since 2026-09-08 only when it
+        # fits _kernel_ver's shape (a peer's word, judged before it is stored; test_peer_payloads_as_text)
+        self.assertIn('ver = j.get("kernel_ver") or ""', src)
+        self.assertIn("if ver and not _peer_ver(ver):", src)
+        self.assertIn('"ver": ver,', src)
         self.assertIn('"sha": sha', src)
 
     def test_the_row_publishes_both_sides(self):

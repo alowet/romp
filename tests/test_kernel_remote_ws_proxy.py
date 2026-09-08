@@ -174,6 +174,39 @@ class RemoteWsProxy(unittest.TestCase):
         finally:
             fake.close()
 
+    def _forwarded_query(self, host, browser_path):
+        """Dial the relay for `host` with `browser_path` and return the query the FAR side received, parsed."""
+        from urllib.parse import parse_qs, urlsplit
+        fake = _FakeRemoteKernel()
+        try:
+            self._register(host, fake.port, token=km._remotes[host]["token"] if host in km._remotes else REMOTE_TOKEN)
+            s, status, _, _, _ = self._upgrade(browser_path)
+            try:
+                self.assertEqual(status, 101, "the relay must splice before the query can be judged")
+                self.assertTrue(fake.done.wait(0.1) or fake.request, "the far side saw the request")
+            finally:
+                s.close()
+            req = fake.request.split(b"\r\n", 1)[0].decode("latin-1")
+            self.assertTrue(req.startswith("GET /ws?"), req)
+            return parse_qs(urlsplit(req.split(" ")[1]).query)
+        finally:
+            fake.close()
+
+    def test_a_row_without_a_stored_token_forwards_no_token_at_all(self):
+        # The pop is unconditional (2026-09-08): with no credential of its own to inject, the relay used to
+        # let whatever the browser sent ride through to the far kernel. Mutant this kills: delete the
+        # `q.pop("token", None)` and `token=evil` reaches the far side.
+        with km._remotes_lock:
+            km._remotes["gpu2"] = {"host": "gpu2", "kernel_port": 29855, "local_port": 0, "token": "", "status": "up"}
+        q = self._forwarded_query("gpu2", "/remote/gpu2/ws?app=chat&token=evil")
+        self.assertNotIn("token", q, "nothing the browser sent may stand in for a credential: %r" % q)
+        self.assertEqual(q.get("app"), ["chat"], "the rest of the query still travels")
+
+    def test_a_row_with_a_token_forwards_exactly_that_one(self):
+        q = self._forwarded_query("gpu1", "/remote/gpu1/ws?app=chat&token=evil&token=evil2")
+        self.assertEqual(q.get("token"), [REMOTE_TOKEN], "exactly the stored credential, once — never the browser's")
+        self.assertEqual(q.get("app"), ["chat"])
+
     def test_unknown_host_404s(self):
         s, status, _, _, _ = self._upgrade("/remote/nosuch/ws")
         s.close()

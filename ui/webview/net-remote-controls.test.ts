@@ -42,9 +42,18 @@ test("web popover: rows expand into that machine's connections, fetched on deman
     "the block renders under the host's own row");
   // loading and a failed read SAY so, with Retry — never a silent blank (the inline JS lives in a
   // Python string, so its \uXXXX escapes are literally TWO backslashes in the file — hence \\\\)
-  assert.match(KERNEL, /Reading '\+via\+'\\\\u2019s connections/);
-  assert.match(KERNEL, /Couldn\\\\u2019t read '\+via\+'\\\\u2019s connections/);
+  // `ev` is esc(via): the note names a host as TEXT (2026-09-08)
+  assert.match(KERNEL, /Reading '\+ev\+'\\\\u2019s connections/);
+  assert.match(KERNEL, /Couldn\\\\u2019t read '\+ev\+'\\\\u2019s connections/);
   assert.match(KERNEL, /data-xr=/);
+  // rows the kernel's whitelist left out of the peer's answer (`dropped`) are SAID beneath the rows that
+  // passed, in the same sentence in both copies (2026-09-08, review find: a silently shorter list)
+  assert.match(KERNEL, /var drop=\(typeof d\.dropped==='number'&&d\.dropped>0\)\?Math\.floor\(d\.dropped\):0;/);
+  assert.match(KERNEL, /if\(!rows\.length&&!drop\)/, "a list emptied by the drop is not 'no hosts attached'");
+  assert.match(KERNEL, / had no usable host and '\+\(drop===1\?'was':'were'\)\+' left out'/);
+  assert.match(STRIP, /export function droppedRowsNote\(via: string, dropped: unknown\): string/);
+  assert.match(STRIP, / had no usable host and \$\{n === 1 \? "was" : "were"\} left out/);
+  assert.match(STRIP, /const note = droppedRowsNote\(via, d\.dropped\);/);
 });
 
 test("web popover: sub-row actions ride the normal routes with {via}, refusals alert loudly", () => {

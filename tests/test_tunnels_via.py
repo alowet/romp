@@ -58,7 +58,8 @@ class TunnelsOf(_Stubbed):
         self.assertTrue(d["ok"])
         self.assertEqual(d["of"], "TESTHOST")
         self.assertEqual(d["tunnels"][0]["host"], "third")
-        self.assertEqual(d["tunnels"][0]["behindBy"], 2, "row fields pass through untouched")
+        self.assertEqual(d["tunnels"][0]["behindBy"], 2, "a well-formed row field passes through the whitelist")
+        self.assertNotIn("local", d, "only `tunnels` is relayed — the peer's other sections stay behind (2026-09-08)")
 
     def test_a_failed_read_carries_the_transport_error(self):
         km._remotes["TESTHOST"] = {"host": "TESTHOST", "status": "up", "local_port": 1, "token": "t"}

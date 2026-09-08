@@ -14924,6 +14924,121 @@ def _safe_ssh_host(host):
         and not host.startswith("-") and bool(_SSH_HOST_RE.match(host))
 
 
+# ── what a PEER kernel's answer may say, field by field ──────────────────────────────────────────────────
+# Two peer answers cross a tunnel into this kernel and on to the page: /version (polled into the row and
+# saved in remotes.json) and /tunnels (relayed whole by tunnels_of for the "its connections" expand). Both
+# used to pass through as they came, so a hostile or merely broken peer chose what the panel rendered and
+# what this kernel remembered about it. Every field now has to fit a shape; what doesn't is dropped, and
+# a dropped sha/version is said once on stderr rather than silently blanked (2026-09-08).
+_PEER_SHA_RE = re.compile(r"^[0-9a-f]{7,40}(-dirty)?$")   # a git short or full sha; '-dirty' is what _kernel_sha
+#                                                            appends on an uncommitted worktree, and _sha_base /
+#                                                            _shas_agree read through it — so must this (review find)
+_PEER_VER_RE = re.compile(r"^v\d+\.\d+\.\d+\+?$")          # _kernel_ver's shape: vN.N.N, '+' when past the bump
+_PEER_STATUSES = frozenset(("up", "authorizing", "connecting", "starting", "no-kernel", "restarting",
+                            "down", "error"))              # the words the panel's LBL/TIP maps know
+_PEER_PHASE_RE = re.compile(r"^[a-z][a-z-]{0,23}$")       # an auto-sync phase word (pushing, waiting, failed…)
+_PEER_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")     # a settings key, a session id
+_PEER_TUNNELS_MAX = 128                                    # rows one peer may contribute to the expand
+_PEER_TEXT_MAX = 200                                       # characters of free text per field
+
+
+def _peer_text(v, n=_PEER_TEXT_MAX):
+    """A peer's free text as INERT text: a str only, printable characters only, the four markup-significant
+    characters (< > " ') removed, at most `n` characters. Anything that is not a string is ''."""
+    if not isinstance(v, str):
+        return ""
+    return "".join(ch for ch in v if ch.isprintable() and ch not in '<>"\'')[:n]
+
+
+def _peer_int(v, lo=0, hi=2 ** 53):
+    """An int in [lo, hi] (a bool is not one), else 0."""
+    return v if isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi else 0
+
+
+def _peer_sha(v):
+    return v if isinstance(v, str) and _PEER_SHA_RE.match(v) else ""
+
+
+def _peer_ver(v):
+    return v if isinstance(v, str) and _PEER_VER_RE.match(v) else ""
+
+
+_peer_shape_said = set()          # (host, field) pairs already complained about — once per process
+
+
+def _peer_shape_complain(host, field, value, note=None):
+    """Say ONCE per (host, field), on stderr where the kernel's own log lands, that a peer reported a value
+    that does not fit the field's shape and was dropped. Loud, not silent (CLAUDE.md): the row then reads
+    as missing that field, and this line is what says why. `note` replaces the default sentence when the
+    finding is not "this value is not one" (tunnels_of's dropped rows)."""
+    key = (str(host), field)
+    if key in _peer_shape_said:
+        return
+    _peer_shape_said.add(key)
+    print(note or ("romp: %s reported a %s that is not one (%r) — ignoring it" % (host, field, str(value)[:60])),
+          file=sys.stderr, flush=True)
+
+
+def _remote_payload_public_row(raw):
+    """ONE row of a peer's /tunnels answer, re-read through the shape _remote_public publishes — the
+    whitelist tunnels_of applies before the page sees a peer's rows. Every key the panel's sub-row and
+    strip.ts's subRow read is here, so the expand loses nothing; nothing else passes. The host must be one
+    _safe_ssh_host would accept (it is posted back as the target of every forwarded action) or the row is
+    dropped (None). A peer's `token` (its OWN remote's credential) collapses to the fact of one, like every
+    row this kernel publishes; numbers must be ints; a boolean must be True itself; sha, version, status
+    and phase words must fit their shapes, else ''; free text is bounded and inert (_peer_text)."""
+    if not isinstance(raw, dict) or not _safe_ssh_host(raw.get("host")):
+        return None
+    ap = raw.get("autoPush")
+    if isinstance(ap, dict):
+        ph = ap.get("phase")
+        ap = {"phase": ph if isinstance(ph, str) and _PEER_PHASE_RE.match(ph) else "",
+              "detail": _peer_text(ap.get("detail")), "at": _peer_int(ap.get("at"))}
+    else:
+        ap = None
+    st = raw.get("settings")
+    if isinstance(st, dict):
+        def _scalar(v):
+            if isinstance(v, bool) or (isinstance(v, int) and abs(v) <= 2 ** 53):
+                return True
+            if isinstance(v, float):
+                return v == v and abs(v) != float("inf")
+            return isinstance(v, str) and v == _peer_text(v)
+        st = {k: v for k, v in list(st.items())[:64]
+              if isinstance(k, str) and _PEER_KEY_RE.match(k) and _scalar(v)}
+    else:
+        st = None
+    status, trust, an = raw.get("status"), raw.get("trust"), raw.get("autoNudge")
+    sids = raw.get("sids")
+    tok = raw.get("token")
+
+    def _drift(v):                # behindBy/aheadBy: an int, or None (the panel says "different build")
+        return v if isinstance(v, int) and not isinstance(v, bool) and abs(v) <= 2 ** 53 else None
+    return {"host": raw["host"],
+            "kernelPort": _peer_int(raw.get("kernelPort"), 0, 65535),
+            "localPort": _peer_int(raw.get("localPort"), 0, 65535),
+            "busPort": _peer_int(raw.get("busPort"), 0, 65535),
+            "checkin": raw.get("checkin") is True, "checkinPeer": raw.get("checkinPeer") is True,
+            "hasToken": raw.get("hasToken") is True or (isinstance(tok, str) and bool(tok)),
+            "status": status if isinstance(status, str) and status in _PEER_STATUSES else "",
+            "detail": _peer_text(raw.get("detail")),
+            "sids": [x for x in (sids if isinstance(sids, list) else [])[:512]
+                     if isinstance(x, str) and _PEER_KEY_RE.match(x)],
+            "trust": trust if isinstance(trust, str) and trust in TRUST_LEVELS else "",
+            "kernelSha": _peer_sha(raw.get("kernelSha")), "localSha": _peer_sha(raw.get("localSha")),
+            "kernelVer": _peer_ver(raw.get("kernelVer")), "localVer": _peer_ver(raw.get("localVer")),
+            "outOfDate": raw.get("outOfDate") is True,
+            "behindBy": _drift(raw.get("behindBy")), "aheadBy": _drift(raw.get("aheadBy")),
+            "kernelDate": _peer_text(raw.get("kernelDate"), 40),
+            "autoNudge": an if isinstance(an, bool) else None,
+            "settings": st,
+            "fastForward": raw.get("fastForward") is True, "fastPull": raw.get("fastPull") is True,
+            "askPull": raw.get("askPull") is True,
+            "autoPush": ap,
+            "fails": _peer_int(raw.get("fails")), "nextTry": _peer_int(raw.get("nextTry")),
+            "stale": raw.get("stale") is True, "lastOk": _peer_int(raw.get("lastOk"))}
+
+
 def _free_port():
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -15517,10 +15632,31 @@ def tunnels_of(host):
     st, j, err = _remote_kernel_call(r, "GET", "/tunnels", timeout=6)
     if err or not isinstance(j, dict):
         return {"ok": False, "error": err or ("HTTP %s from %s" % (st, host))}
-    j = dict(j)
-    j["ok"] = True
-    j["of"] = host
-    return j
+    rows = j.get("tunnels")
+    if not isinstance(rows, list):
+        return {"ok": False, "error": "%s answered /tunnels without a list of tunnels (got %s)"
+                                      % (host, type(rows).__name__)}
+    # The answer is a PEER's. Every row is re-read through _remote_payload_public_row — a host ssh would
+    # accept, an enumerated status, sha/version shapes, exact booleans, bounded inert text — rows without
+    # a usable host are dropped and counted, the row count is capped, and every other top-level key the
+    # peer sent (its known list, its gossip, its own build) stays behind: the expand reads only `tunnels`.
+    # Before this the peer's JSON went to the page verbatim (2026-09-08).
+    out, dropped = [], 0
+    for raw in rows[:4096]:
+        row = _remote_payload_public_row(raw)
+        if row is None:
+            dropped += 1
+        elif len(out) < _PEER_TUNNELS_MAX:
+            out.append(row)
+    ans = {"ok": True, "of": host, "tunnels": out}
+    if dropped:
+        # said twice, neither silently: once here (per host, per process) and in BOTH panels' sub-notes,
+        # which render `dropped` beneath the rows that did pass (review find)
+        ans["dropped"] = dropped
+        _peer_shape_complain(host, "tunnels", dropped,
+                             "romp: %s answered /tunnels with %d row%s without a usable host — left out of "
+                             "its connections list" % (host, dropped, "" if dropped == 1 else "s"))
+    return ans
 
 
 # Forwarded row actions block on the via machine's own ssh work; update/start push code and wait
@@ -15939,7 +16075,10 @@ def _expected_restart_status(r, st, rsha, now):
 
 
 def _remote_public(r):
-    """The API view of a remote row — everything the browser needs to open its own WS, minus the Popen.
+    """The API view of a remote row — everything the browser needs, minus the Popen and minus the remote's
+    credential. The browser reaches a remote through /remote/<host>/ws, where _remote_ws injects that
+    machine's token itself, so the page only ever needs to know one EXISTS: `hasToken`. The token string
+    itself used to ride here to every dashboard and every /tunnels reader (2026-09-08).
     kernelSha/localSha/outOfDate let the dashboard flag a remote running older code + offer to update it;
     behindBy/aheadBy/kernelDate say HOW it drifted (computed only when it actually did).
 
@@ -15966,7 +16105,7 @@ def _remote_public(r):
             "busPort": r.get("bus_port") or 0,   # peer-bus mode: a restarted bus reseeds its peer table from this
             "checkin": bool(r.get("checkin")),           # we publish ourselves to this hub (stage 3)
             "checkinPeer": bool(r.get("checkin_peer")),  # this host checked in to US (no ssh of ours)
-            "token": r.get("token") or "", "status": r.get("status") or "down",
+            "hasToken": bool(r.get("token")), "status": r.get("status") or "down",
             "detail": r.get("detail") or "", "sids": list(r.get("sids") or []),
             "trust": r.get("trust") or "directed",   # per-host federation trust: trusted|directed|isolated
             "kernelSha": r.get("kernel_sha") or "", "localSha": (_local_head(short=True) or _kernel_sha() or ""),
@@ -16528,11 +16667,24 @@ def _poll_remote_version(r):
         if resp.status != 200:
             return None
         j = json.loads(data.decode("utf-8")) or {}
+        if not isinstance(j, dict):
+            return None
+        # The sha and the release name are a PEER's words, and they get saved (remotes.json) and drawn
+        # (the panel row): each must fit its shape — 7-40 hex, vN.N.N(+) — or it is dropped and said once
+        # (_peer_shape_complain), never stored as it came (2026-09-08).
+        host = r.get("host") or "?"
         sha = j.get("kernel_sha") or None
+        if sha and not _peer_sha(sha):
+            _peer_shape_complain(host, "kernel_sha", sha)
+            sha = None                        # an unusable sha is no sha at all
+        ver = j.get("kernel_ver") or ""
+        if ver and not _peer_ver(ver):
+            _peer_shape_complain(host, "kernel_ver", ver)
+            ver = ""
         an = j.get("autoNudge")
         st = j.get("settings")
         gts = j.get("settingsGt")
-        return {"sha": sha, "ver": str(j.get("kernel_ver") or ""),
+        return {"sha": sha, "ver": ver,
                 "autoNudge": an if isinstance(an, bool) else None,
                 "settings": st if isinstance(st, dict) else None,
                 "settingsGt": gts if isinstance(gts, dict) else None} if sha else None
@@ -38051,10 +38203,18 @@ fetch('/tunnels/of?host='+encodeURIComponent(h),{cache:'no-store'}).then(functio
 if(_openSub[h])repaint();});}
 function pendLvl(map,host,current){var p=map[host];if(p&&current===p){delete map[host];p=null;}return p;}
 function fillHosts(){if(!dl)return;var hs=[];
-[[mruHost()],_seen,_cfg].forEach(function(g){(g||[]).forEach(function(h){if(h&&hs.indexOf(h)<0)hs.push(h);});});   // most-recently-connected first, not just ssh-config order
-dl.innerHTML=hs.map(function(h){return '<option value=\"'+h+'\"></option>';}).join('');}
+[[mruHost()],_seen,_cfg].forEach(function(g){(g||[]).forEach(function(h){if(typeof h==='string'&&h&&hs.indexOf(h)<0)hs.push(h);});});   // most-recently-connected first, not just ssh-config order
+// option ELEMENTS, never markup: an alias is whatever ~/.ssh/config says, and a datalist parses its
+// innerHTML like any element, so a crafted alias used to run there (2026-09-08)
+dl.textContent='';var cut=hs.length>512?hs.length-512:0;hs.slice(0,512).forEach(function(h){var o=document.createElement('option');o.value=h;dl.appendChild(o);});
+if(cut){var mo=document.createElement('option');mo.value=mo.textContent='\\u2026 '+cut+' more not shown';mo.disabled=true;dl.appendChild(mo);}}   // a cut list says so (strip.ts fillHostSelect wears the same marker)
 function loadHosts(){fetch('/ssh-hosts',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
 _cfg=(d&&d.hosts)||[];fillHosts();}).catch(function(){});}
+// Every string a PEER chose is rendered as TEXT: esc() before it meets innerHTML. That is a host it named
+// (a checked-in peer names itself), its status word, its build, the rows it reports for its own connections
+// (/tunnels/of — whitelisted by the kernel too), and the bus gossip below (tiers, relay hosts, holds).
+// Before this, those strings were concatenated into markup as they came (2026-09-08).
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return c==='&'?'&amp;':c==='<'?'&lt;':c==='>'?'&gt;':c==='"'?'&quot;':'&#39;';});}
 var LBL={up:'connected',authorizing:'authorizing\\u2026',connecting:'connecting\\u2026',starting:'connecting\\u2026','no-kernel':'kernel not answering',restarting:'restarting after update\\u2026',down:'reconnecting\\u2026',error:'error'};
 // Every status explains itself on hover (the user 2026-07-22: learn it from tooltips, not the CLI).
 var TIP={up:'Connected: the ssh tunnel is open and that machine\\u2019s romp kernel is answering through it. Its sessions appear in your tabs and timeline.',
@@ -38159,7 +38319,7 @@ var _head=!ts.length?'':(_bad?(_bad+' host'+(_bad===1?'':'s')+' need'+(_bad===1?
 icon.title=ts.length?('Remote kernels \\u00b7 '+_head+'\\n'+ts.map(function(t){var n=(t.sids&&t.sids.length)||0;
 var ap=t.autoPush?('\\n    auto-update: '+(t.autoPush.detail||t.autoPush.phase)):'';
 var dw=t.outOfDate?(' \\u00b7 '+(t.status==='up'?'':'last known ')+driftWord(t)):'';
-return '\\u2022 '+t.host+': '+(LBL[t.status]||t.status)+' ('+n+' session'+(n===1?'':'s')+')'+dw+(t.token?'':' \\u00b7 no token')+ap;}).join('\\n')):'Remote kernels \\u2014 none attached (click to connect)';
+return '\\u2022 '+t.host+': '+(LBL[t.status]||t.status)+' ('+n+' session'+(n===1?'':'s')+')'+dw+(t.hasToken?'':' \\u00b7 no token')+ap;}).join('\\n')):'Remote kernels \\u2014 none attached (click to connect)';
 _lastArgs=[ts,(d&&d.known)||[],pmode,(d&&d.viaReach)||[],(d&&d.remoteHolds)||[],(d&&d.peerTiers)||{}];
 _lastUp=ts.filter(function(t){return t.status==='up';}).length;
 if(!back.hidden){render.apply(null,_lastArgs);refreshPairs();}   // pmode is refresh-local — render must be GIVEN it (it rides _lastArgs)
@@ -38207,7 +38367,8 @@ var live={};ts.forEach(function(t){live[t.host]=1;});
 // owner; hidden while this machine is the only choice. Rebuilt per render, keeping the selection.
 if(fromSel){var ups=ts.filter(function(t){return t.status==='up';}).map(function(t){return t.host;});
 var fcur=fromSel.value;
-fromSel.innerHTML="<option value=''>from: this machine</option>"+ups.map(function(h){return '<option value="'+h+'"'+(fcur===h?' selected':'')+'>from: '+h+'</option>';}).join('');
+fromSel.textContent='';var fcut=ups.length>512?ups.length-512:0;[''].concat(ups.slice(0,512)).forEach(function(h){var o=document.createElement('option');o.value=h;o.textContent=h?'from: '+h:'from: this machine';o.selected=(fcur===h);fromSel.appendChild(o);});
+if(fcut){var fo=document.createElement('option');fo.value=fo.textContent='\\u2026 '+fcut+' more not shown';fo.disabled=true;fromSel.appendChild(fo);}
 fromSel.hidden=!ups.length;}
 via=via.filter(function(v){return !live[v.host];});
 var viaHosts={};via.forEach(function(v){viaHosts[v.host]=1;});
@@ -38217,36 +38378,39 @@ var TRUSTW={trusted:'trusted (auto-accept)',directed:'directed (held for you)',i
 // the controls its own popover would offer — drift there is measured between the via machine and
 // its remote (its own numbers), and every action rides the normal route + {via}. Loading and a
 // failed read say so (with Retry), never a silent blank.
-function subBlock(via){var box=document.createElement('div');box.className='rnet-subwrap';
+function subBlock(via){var box=document.createElement('div');box.className='rnet-subwrap';var ev=esc(via);
 var d=_subInfo[via];
-if(!d){box.innerHTML='<div class=\"rnet-empty rnet-subnote\">'+spin()+'Reading '+via+'\\u2019s connections\\u2026</div>';return box;}
-if(!d.ok){box.innerHTML='<div class=\"rnet-empty rnet-subnote\">Couldn\\u2019t read '+via+'\\u2019s connections: '+(d.error||'unknown error')+' <button data-xr=\"'+via+'\">Retry</button></div>';return box;}
-var rows=d.tunnels||[];
-if(!rows.length){box.innerHTML='<div class=\"rnet-empty rnet-subnote\">'+via+' has no hosts attached.</div>';return box;}
-rows.forEach(function(s){
+if(!d){box.innerHTML='<div class=\"rnet-empty rnet-subnote\">'+spin()+'Reading '+ev+'\\u2019s connections\\u2026</div>';return box;}
+if(!d.ok){box.innerHTML='<div class=\"rnet-empty rnet-subnote\">Couldn\\u2019t read '+ev+'\\u2019s connections: '+esc(d.error||'unknown error')+' <button data-xr=\"'+ev+'\">Retry</button></div>';return box;}
+var rows=d.tunnels||[];var drop=(typeof d.dropped==='number'&&d.dropped>0)?Math.floor(d.dropped):0;
+if(!rows.length&&!drop){box.innerHTML='<div class=\"rnet-empty rnet-subnote\">'+ev+' has no hosts attached.</div>';return box;}
+rows.forEach(function(s){var sh=esc(s.host),sst=esc(LBL[s.status]||s.status);
 var sr=document.createElement('div');sr.className='rnet-row rnet-subrow';
 var sdot=s.status==='up'?'background:var(--accent)':(s.status==='error'||s.status==='no-kernel')?'background:#E5534B':(s.status==='down')?'background:#8a8a8a':'background:transparent;box-shadow:inset 0 0 0 1.5px var(--accent)';
-var sver='',sbw=buildWord(s.kernelVer,s.kernelSha);
+var sver='',sbw=esc(buildWord(s.kernelVer,s.kernelSha));
 if(s.outOfDate){var sar=driftCounts(s);
-sver=' \\u00b7 <span class=rnet-old title=\"'+s.host+' runs '+(sbw||'?')+'; '+via+' is at '+(buildWord(s.localVer,s.localSha)||'?')+' \\u2014 drift here is between THOSE two machines, not this one.\">'+(sbw?sbw+' ':'')+(sar?'('+sar+')':driftWord(s))+'</span>';}
-else if(sbw){sver=' \\u00b7 <span class=rnet-sha title=\"same build as '+via+'\">'+sbw+'</span>';}
-var vk=via+'|'+s.host;
+sver=' \\u00b7 <span class=rnet-old title=\"'+sh+' runs '+(sbw||'?')+'; '+ev+' is at '+esc(buildWord(s.localVer,s.localSha)||'?')+' \\u2014 drift here is between THOSE two machines, not this one.\">'+(sbw?sbw+' ':'')+(sar?'('+sar+')':driftWord(s))+'</span>';}
+else if(sbw){sver=' \\u00b7 <span class=rnet-sha title=\"same build as '+ev+'\">'+sbw+'</span>';}
+var vk=via+'|'+s.host,evk=esc(vk);
 var spd=pendLvl(_pendSub,vk,s.trust||'directed');
 var scur=spd||s.trust||'directed';
-var strust='<select class=\"rnet-trust'+(spd?' rnet-applying':'')+'\"'+(spd?' disabled':'')+' data-vt=\"'+vk+'\" title=\"What '+via+' does with postal mail from '+s.host+'. Set on '+via+', over your tunnel + its own token \\u2014 the you-with-both-tokens boundary.\">'+
+var strust='<select class=\"rnet-trust'+(spd?' rnet-applying':'')+'\"'+(spd?' disabled':'')+' data-vt=\"'+evk+'\" title=\"What '+ev+' does with postal mail from '+sh+'. Set on '+ev+', over your tunnel + its own token \\u2014 the you-with-both-tokens boundary.\">'+
 ['trusted','directed','isolated'].map(function(v){return '<option value='+v+(scur===v?' selected':'')+'>'+TRUSTW[v]+'</option>';}).join('')+'</select>'+(spd?'<span class=rnet-pend>'+spin()+'applying\\u2026</span>':'');
 // the same provably-possible gating as the top rows, judged with the fields VIA computed about
 // ITS remote (fastForward/fastPull/askPull are relative to via's own build).
 var sapx=s.autoPush&&apBusy(s.autoPush.phase);
 var sb='';
-if(s.status==='up'&&s.fastForward&&!sapx&&!s.checkinPeer)sb+='<button class=rnet-upd data-vu=\"'+vk+'\" title=\"Push '+via+'\\u2019s committed romp to '+s.host+' and restart its kernel \\u2014 the work runs on '+via+'.\">Push</button>';
-if(s.status==='up'&&s.askPull&&!sapx)sb+='<button class=rnet-upd data-va=\"'+vk+'\" title=\"'+s.host+' checked in to '+via+' over its own tunnel, so '+via+' cannot push to it. This asks it to pull '+via+'\\u2019s commits over the link it already holds.\">Update</button>';
-if(s.status==='up'&&s.fastPull&&!sapx&&!s.checkinPeer)sb+='<button class=rnet-upd data-vp=\"'+vk+'\" title=\"Pull '+s.host+'\\u2019s newer commits into '+via+'\\u2019s romp (fast-forward only) \\u2014 the work runs on '+via+'.\">Pull</button>';
-if(s.status==='no-kernel')sb+='<button class=rnet-upd data-vs=\"'+vk+'\" title=\"No kernel answers '+via+'\\u2019s tunnel to '+s.host+'. This has '+via+' push its romp there and boot it.\">Start</button>';
+if(s.status==='up'&&s.fastForward&&!sapx&&!s.checkinPeer)sb+='<button class=rnet-upd data-vu=\"'+evk+'\" title=\"Push '+ev+'\\u2019s committed romp to '+sh+' and restart its kernel \\u2014 the work runs on '+ev+'.\">Push</button>';
+if(s.status==='up'&&s.askPull&&!sapx)sb+='<button class=rnet-upd data-va=\"'+evk+'\" title=\"'+sh+' checked in to '+ev+' over its own tunnel, so '+ev+' cannot push to it. This asks it to pull '+ev+'\\u2019s commits over the link it already holds.\">Update</button>';
+if(s.status==='up'&&s.fastPull&&!sapx&&!s.checkinPeer)sb+='<button class=rnet-upd data-vp=\"'+evk+'\" title=\"Pull '+sh+'\\u2019s newer commits into '+ev+'\\u2019s romp (fast-forward only) \\u2014 the work runs on '+ev+'.\">Pull</button>';
+if(s.status==='no-kernel')sb+='<button class=rnet-upd data-vs=\"'+evk+'\" title=\"No kernel answers '+ev+'\\u2019s tunnel to '+sh+'. This has '+ev+' push its romp there and boot it.\">Start</button>';
 sr.innerHTML='<span class=rnet-dot style=\"'+sdot+'\" title=\"'+(TIP[s.status]||'')+'\"></span>'+
-'<span class=nm><b>'+s.host+'</b> <span class=st title=\"'+via+'\\u2019s tunnel to '+s.host+'. '+(TIP[s.status]||'')+'\">'+(busyStatus(s.status)?spin():'')+(LBL[s.status]||s.status)+sver+'</span></span>'+
-strust+sb+'<button data-vh=\"'+vk+'\" title=\"Close '+via+'\\u2019s ssh tunnel to '+s.host+'. It stays in '+via+'\\u2019s previously-attached list.\">Detach</button>';
+'<span class=nm><b>'+sh+'</b> <span class=st title=\"'+ev+'\\u2019s tunnel to '+sh+'. '+(TIP[s.status]||'')+'\">'+(busyStatus(s.status)?spin():'')+sst+sver+'</span></span>'+
+strust+sb+'<button data-vh=\"'+evk+'\" title=\"Close '+ev+'\\u2019s ssh tunnel to '+sh+'. It stays in '+ev+'\\u2019s previously-attached list.\">Detach</button>';
 box.appendChild(sr);});
+// rows the kernel's whitelist left out (no host ssh would accept) are SAID beneath the rows that passed —
+// as text, the same sentence strip.ts renderSub wears (net-remote-controls.test.ts pins both)
+if(drop){var dn=document.createElement('div');dn.className='rnet-empty rnet-subnote';dn.textContent=drop+' row'+(drop===1?'':'s')+' from '+via+' had no usable host and '+(drop===1?'was':'were')+' left out';box.appendChild(dn);}
 return box;}
 // Every host romp knows about feeds the add box's completions, so a machine you typed in once is a
 // couple of keystrokes the next time even after you forget its exact spelling.
@@ -38257,7 +38421,7 @@ if(!ts.length&&!known.length){var e=document.createElement('div');e.className='r
 if(addBox&&addBox.hidden&&!_autoAdd){_autoAdd=true;showAdd(true);}
 return;}
 ts.forEach(function(t){var item=document.createElement('div');item.className='rnet-item';
-var row=document.createElement('div');row.className='rnet-row';
+var row=document.createElement('div');row.className='rnet-row';var th=esc(t.host);
 // connected -> solid accent dot (matches the lit rail icon); mid-attach -> hollow accent RING (glanceably
 // "in progress"); down -> grey; error -> red. Word beside it names the phase.
 var dot=t.status==='up'?'background:var(--accent)':(t.status==='error'||t.status==='no-kernel')?'background:#E5534B':(t.status==='down')?'background:#8a8a8a':'background:transparent;box-shadow:inset 0 0 0 1.5px var(--accent)';
@@ -38272,22 +38436,22 @@ var dot=t.status==='up'?'background:var(--accent)':(t.status==='error'||t.status
 // is remembered, and date it on hover: glanceable mark, mechanics one hover away.
 var stl=!!t.stale;
 var sw=stl?(t.lastOk?('last confirmed '+new Date(t.lastOk*1000).toLocaleTimeString()):'never confirmed since this kernel started'):'';
-var sq=stl?(' \\u2014 '+sw+'; not re-checked while '+(LBL[t.status]||t.status)+'.'):'';
+var sq=stl?(' \\u2014 '+sw+'; not re-checked while '+(LBL[t.status]||esc(t.status))+'.'):'';
 // The build reads as a NAME plus a distance: "v0.2.0+ 682d232 (behind 3)" — the release and commit it is
 // on, then how far that sits from here, said in words (the user 2026-07-30). A remote whose commit this
 // repo has never seen has no distance to report, so it says "different build" where the count would go.
-var ver='',bw=buildWord(t.kernelVer,t.kernelSha);
+var ver='',bw=esc(buildWord(t.kernelVer,t.kernelSha));
 if(t.outOfDate){var w=driftWord(t),ar=driftCounts(t);
 var tt='running '+(buildWord(t.kernelVer,t.kernelSha)||'?')+(t.kernelDate?' from '+t.kernelDate:'')+'; this machine is at '+(buildWord(t.localVer,t.localSha)||'?')+((t.aheadBy>0&&t.behindBy>0)?' (each has commits the other lacks)':'')
 +(t.checkinPeer?(t.askPull?' No ssh path from this machine (it checked in over its own tunnel), so Update asks it to fast-forward itself over the link it holds.':' No ssh path from this machine (it checked in over its own tunnel) \\u2014 sync from its own dashboard.'):'');
-ver=' \\u00b7 <span class=\"rnet-old'+(stl?' rnet-stale':'')+'\" title=\"'+tt+sq+'\">'+(stl?'last known: ':'')+(bw?bw+' ':'')+(ar?'('+ar+')':w)+'</span>';}
+ver=' \\u00b7 <span class=\"rnet-old'+(stl?' rnet-stale':'')+'\" title=\"'+esc(tt)+sq+'\">'+(stl?'last known: ':'')+(bw?bw+' ':'')+(ar?'('+ar+')':w)+'</span>';}
 else if(bw){ver=' \\u00b7 <span class=\"rnet-sha'+(stl?' rnet-stale':'')+'\" title=\"'+(stl?'same build as this machine when last reached.'+sq:'same build as this machine')+'\">'+(stl?'last known: ':'')+bw+'</span>';}
 // A connected host that reports NO build at all is running a plain file copy — no git checkout, so its
 // kernel cannot name a release or commit, and drift against this machine cannot be measured (it may be
 // months behind and never say so; the user 2026-08-11, whose devbox ran months-old code beside a bare
 // "connected"). Fail loudly where the build word would sit, never a silent blank that reads as fine.
 // strip.ts's popover row carries the same word (rnet parity pins).
-else if(t.status==='up'){ver=' \\u00b7 <span class=\"rnet-old\" title=\"'+t.host+' is running romp from a plain file copy \\u2014 not a git checkout \\u2014 so it cannot name its release or commit, and how far it is from this machine cannot be measured: it may be far behind and never say so. Reinstall it as a git clone to restore the build name and updates.\">unversioned copy</span>';}
+else if(t.status==='up'){ver=' \\u00b7 <span class=\"rnet-old\" title=\"'+th+' is running romp from a plain file copy \\u2014 not a git checkout \\u2014 so it cannot name its release or commit, and how far it is from this machine cannot be measured: it may be far behind and never say so. Reinstall it as a git clone to restore the build name and updates.\">unversioned copy</span>';}
 // A push romp is ALREADY doing needs no button — offering one would just invite a duplicate of the work in
 // flight. The row shows the live phase instead (below), and the manual Push returns if it fails.
 var apx=t.autoPush&&(t.autoPush.phase==='pushing'||t.autoPush.phase==='waiting'||t.autoPush.phase==='pulling'||t.autoPush.phase==='asking');
@@ -38298,18 +38462,18 @@ var apx=t.autoPush&&(t.autoPush.phase==='pushing'||t.autoPush.phase==='waiting'|
 // an ancestor of its HEAD). Those states get the action that CAN work instead: Pull when the remote is
 // strictly ahead, Update when a checked-in peer is behind, and otherwise the drift word plus its tooltip,
 // which say what happened without dead-ending on a button.
-var upd=(t.status==='up'&&t.fastForward&&!apx&&!t.checkinPeer)?'<button class=rnet-upd data-u=\"'+t.host+'\" title=\"Push this machine\\u2019s committed romp to '+t.host+' and restart its kernel, so it runs exactly this code. Uncommitted local edits are not sent, so commit first.\">Push</button>':'';
-var ask=(t.status==='up'&&t.askPull&&!apx)?'<button class=rnet-upd data-a=\"'+t.host+'\" title=\"'+t.host+' checked in over its own tunnel, so this machine cannot push to it. This asks its romp to pull these commits from here and restart, over the link it already holds.\">Update</button>':'';
-var pull=(t.status==='up'&&t.fastPull&&!apx&&!t.checkinPeer)?'<button class=rnet-upd data-p=\"'+t.host+'\" title=\"Pull '+t.host+'\\u2019s newer commits into this machine\\u2019s romp (fast-forward only; refuses if this tree has uncommitted changes). This kernel keeps running the old build until you restart romp.\">Pull</button>':'';
+var upd=(t.status==='up'&&t.fastForward&&!apx&&!t.checkinPeer)?'<button class=rnet-upd data-u=\"'+th+'\" title=\"Push this machine\\u2019s committed romp to '+th+' and restart its kernel, so it runs exactly this code. Uncommitted local edits are not sent, so commit first.\">Push</button>':'';
+var ask=(t.status==='up'&&t.askPull&&!apx)?'<button class=rnet-upd data-a=\"'+th+'\" title=\"'+th+' checked in over its own tunnel, so this machine cannot push to it. This asks its romp to pull these commits from here and restart, over the link it already holds.\">Update</button>':'';
+var pull=(t.status==='up'&&t.fastPull&&!apx&&!t.checkinPeer)?'<button class=rnet-upd data-p=\"'+th+'\" title=\"Pull '+th+'\\u2019s newer commits into this machine\\u2019s romp (fast-forward only; refuses if this tree has uncommitted changes). This kernel keeps running the old build until you restart romp.\">Pull</button>':'';
 // ssh alive but no kernel answering -> the explicit ASK (the user 2026-07-10): a Start button that
 // pushes this machine's committed romp to the host FIRST, then boots its kernel. Never auto-starts —
 // a stopped kernel may be stopped on purpose; the click is the consent.
-var strt=(t.status==='no-kernel')?'<button class=rnet-upd data-s=\"'+t.host+'\" title=\"No kernel is answering on '+t.host+'. This pushes this machine\\u2019s romp there and boots its kernel.\">Start</button>':'';
+var strt=(t.status==='no-kernel')?'<button class=rnet-upd data-s=\"'+th+'\" title=\"No kernel is answering on '+th+'. This pushes this machine\\u2019s romp there and boots its kernel.\">Start</button>':'';
 // A down row is BEING re-dialed on a widening backoff (the user 2026-07-29), so it says when the next
 // dial lands — a silent retry loop is indistinguishable from a dead row — and offers to skip the wait.
 var wait=(t.nextTry&&(t.status==='down'||t.status==='error'))?Math.max(0,t.nextTry-Math.floor(Date.now()/1000)):0;
 var when=wait>90?('next try in '+Math.round(wait/60)+'m'):(wait>0?('next try in '+wait+'s'):'retrying\\u2026');
-var again=(t.status==='down'||t.status==='error')?'<span class=rnet-retry title=\"romp keeps dialing '+t.host+' on its own, waiting longer between tries the longer it is down ('+(t.fails||0)+' so far).\">'+when+'</span>':'';
+var again=(t.status==='down'||t.status==='error')?'<span class=rnet-retry title=\"romp keeps dialing '+th+' on its own, waiting longer between tries the longer it is down ('+(t.fails||0)+' so far).\">'+when+'</span>':'';
 // Offered on EVERY row that is not up, not just down/error (the user 2026-07-29). A 'no-kernel' row used
 // to carry only Start — "this pushes this machine's romp there and boots its kernel" — so a link that had
 // quietly stopped carrying traffic read as a dead remote, and the only button on offer told you to go
@@ -38319,18 +38483,18 @@ var again=(t.status==='down'||t.status==='error')?'<span class=rnet-retry title=
 // is up — no backoff is running), where the same name beside Start read as a redundant second attempt
 // button, distinguished only by tooltips. There it is named for what it does: Re-dial.
 var wedged=(t.status==='no-kernel');
-var retry=(t.status!=='up'&&t.status!=='starting')?'<button data-ra=\"'+t.host+'\" title=\"'+(wedged?'Drop the ssh link to '+t.host+' and dial a fresh one. The link reports connected while nothing answers through it \u2014 a wedged tunnel can make a running kernel look absent, so re-dial before restarting anything.':'Dial '+t.host+' now: drop the current ssh and open a fresh one, instead of waiting out the automatic retry.')+'\">'+(wedged?'Re-dial':'Try now')+'</button>':'';
+var retry=(t.status!=='up'&&t.status!=='starting')?'<button data-ra=\"'+th+'\" title=\"'+(wedged?'Drop the ssh link to '+th+' and dial a fresh one. The link reports connected while nothing answers through it \u2014 a wedged tunnel can make a running kernel look absent, so re-dial before restarting anything.':'Dial '+th+' now: drop the current ssh and open a fresh one, instead of waiting out the automatic retry.')+'\">'+(wedged?'Re-dial':'Try now')+'</button>':'';
 // The check-in publishes THIS machine TO that host, which is the opposite direction from everything else
 // in the row. Its old label, "keep connected", read as the reconnect setting so plainly that the tooltip
 // had to spend a sentence saying what it was NOT. Name it for what it does instead.
-var keep=(pmode&&!t.checkinPeer)?'<label class=rnet-keep title=\"Publish this machine to '+t.host+' over your own outbound ssh, so its dashboard gains your sessions and its bus peers with yours. Uncheck to be forgotten there. Attach and Detach control the other direction.\"><input type=checkbox data-k=\"'+t.host+'\"'+(t.checkin?' checked':'')+'>Share my sessions there</label>':'';
+var keep=(pmode&&!t.checkinPeer)?'<label class=rnet-keep title=\"Publish this machine to '+th+' over your own outbound ssh, so its dashboard gains your sessions and its bus peers with yours. Uncheck to be forgotten there. Attach and Detach control the other direction.\"><input type=checkbox data-k=\"'+th+'\"'+(t.checkin?' checked':'')+'>Share my sessions there</label>':'';
 // Federation trust (per-host): trusted = full two-way postal; directed (default) = its mail is HELD for
 // your approval, never auto-injected; isolated = dashboard only, no postal. The gate lives in the bus.
 // Each option carries its own plain gloss: the bare words are romp's vocabulary, not English, and a
 // dropdown whose meaning only appears on hover makes you uncover every option before you can choose.
 var tpd=pendLvl(_pendTrust,t.host,t.trust||'directed');
 var tcur=tpd||t.trust||'directed';
-var trust='<span class=rnet-set><span class=rnet-lbl>Their mail</span><select class=\"rnet-trust'+(tpd?' rnet-applying':'')+'\"'+(tpd?' disabled':'')+' data-t=\"'+t.host+'\" title=\"What happens to postal mail from '+t.host+'. trusted: delivered straight to your sessions. directed: held for your approval. isolated: none, dashboard only.\">'+
+var trust='<span class=rnet-set><span class=rnet-lbl>Their mail</span><select class=\"rnet-trust'+(tpd?' rnet-applying':'')+'\"'+(tpd?' disabled':'')+' data-t=\"'+th+'\" title=\"What happens to postal mail from '+th+'. trusted: delivered straight to your sessions. directed: held for your approval. isolated: none, dashboard only.\">'+
 ['trusted','directed','isolated'].map(function(v){return '<option value='+v+(tcur===v?' selected':'')+'>'+TRUSTW[v]+'</option>';}).join('')+'</select>'+(tpd?'<span class=rnet-pend>'+spin()+'applying\\u2026</span>':'')+'</span>';
 // The OTHER direction of the pair (how that host holds mail FROM this machine, declared by its bus on
 // the last exchange). Trust is receiver-evaluated on purpose, so a half-open pair is legal — but it
@@ -38340,9 +38504,9 @@ var trust='<span class=rnet-set><span class=rnet-lbl>Their mail</span><select cl
 var theirs=tiers[t.host]||'';
 if(theirs){var mm=theirs!==tcur;
 var mpd=pendLvl(_pendMirror,t.host,theirs);   // confirmed by the peer's next tier gossip, not the POST
-trust+='<span class=\"rnet-back'+(mm&&!mpd?' rnet-mismatch':'')+(stl?' rnet-stale':'')+'\" title=\"How '+t.host+' holds mail from this machine, as its bus declared on the last exchange. Each side owns its own gate.'+sq+'\">'+t.host+' holds yours: '+(stl?'last known ':'')+theirs+'</span>';
-if(mpd){trust+='<button class=rnet-mirror disabled title=\"Set on '+t.host+'; waiting for its bus to confirm on the next exchange.\">'+spin()+'Matching\\u2026</button>';}
-else if(mm){trust+='<button class=rnet-mirror data-m=\"'+t.host+'\" data-lvl=\"'+tcur+'\" title=\"Set '+t.host+'\\u2019s level for this machine to '+tcur+' too. This is your admin access (the tunnel + that machine\\u2019s own token) acting on its kernel \\u2014 a peer can never set your trust, and this never lets one.\">Match ('+tcur+')</button>';}}
+trust+='<span class=\"rnet-back'+(mm&&!mpd?' rnet-mismatch':'')+(stl?' rnet-stale':'')+'\" title=\"How '+th+' holds mail from this machine, as its bus declared on the last exchange. Each side owns its own gate.'+sq+'\">'+th+' holds yours: '+(stl?'last known ':'')+esc(theirs)+'</span>';
+if(mpd){trust+='<button class=rnet-mirror disabled title=\"Set on '+th+'; waiting for its bus to confirm on the next exchange.\">'+spin()+'Matching\\u2026</button>';}
+else if(mm){trust+='<button class=rnet-mirror data-m=\"'+th+'\" data-lvl=\"'+tcur+'\" title=\"Set '+th+'\\u2019s level for this machine to '+tcur+' too. This is your admin access (the tunnel + that machine\\u2019s own token) acting on its kernel \\u2014 a peer can never set your trust, and this never lets one.\">Match ('+tcur+')</button>';}}
 // Line 1 is what this host is doing right now plus the acts you perform on it; line 2 is the pair of
 // settings you set once and leave. They shared a single flat row before, which gave Detach the same
 // weight as a dropdown, and on a phone pushed it off the edge entirely.
@@ -38350,11 +38514,11 @@ row.innerHTML='<span class=rnet-dot style=\"'+dot+'\" title=\"'+(TIP[t.status]||
 // A host mid-attach gets the romp loader inline (the user 2026-07-29): the swirl glyph spinning beside
 // the status word, so "connecting" reads as something HAPPENING rather than a label that might be stuck.
 // The repo's loading rule spelled small: same glyph, same reverse spin as the composer's slash spinner.
-'<span class=nm><b>'+t.host+'</b> <span class=st title=\"'+(TIP[t.status]||'')+'\">'+(busyStatus(t.status)?spin():'')+(LBL[t.status]||t.status)+((t.status==='up'&&pendingIn(t.host))?' \\u00b7 <span class=rnet-pend title=\"The tunnel is up; this dashboard is still loading '+t.host+'\\u2019s sessions. They appear the moment its first payload lands.\">'+spin()+'loading sessions\\u2026</span>':'')+(t.checkinPeer?' \\u00b7 checked in here':'')+(t.token?'':' \\u00b7 no token')+(again?' \\u00b7 '+again:'')+ver+'</span></span>'+
-retry+pull+ask+upd+strt+'<button data-h=\"'+t.host+'\" title=\"Close the ssh tunnel to '+t.host+'. It stays in this list as a previously-attached host, keeping its trust level, so you can re-attach in one click.\">Detach</button>'+
+'<span class=nm><b>'+th+'</b> <span class=st title=\"'+(TIP[t.status]||'')+'\">'+(busyStatus(t.status)?spin():'')+(LBL[t.status]||esc(t.status))+((t.status==='up'&&pendingIn(t.host))?' \\u00b7 <span class=rnet-pend title=\"The tunnel is up; this dashboard is still loading '+th+'\\u2019s sessions. They appear the moment its first payload lands.\">'+spin()+'loading sessions\\u2026</span>':'')+(t.checkinPeer?' \\u00b7 checked in here':'')+(t.hasToken?'':' \\u00b7 no token')+(again?' \\u00b7 '+again:'')+ver+'</span></span>'+
+retry+pull+ask+upd+strt+'<button data-h=\"'+th+'\" title=\"Close the ssh tunnel to '+th+'. It stays in this list as a previously-attached host, keeping its trust level, so you can re-attach in one click.\">Detach</button>'+
 // ITS CONNECTIONS toggle — the keyed expand (progressive disclosure): compact row by default,
 // that machine's own attached list one click deeper, fetched on the click, never the poll.
-(t.status==='up'?'<button class=rnet-subtoggle data-x=\"'+t.host+'\" title=\"'+t.host+'\\u2019s own attached hosts \\u2014 see and manage what IT is connected to, from here. Rows read live from its kernel over your tunnel + its own token; actions run there.\">'+(_openSub[t.host]?'\\u25be':'\\u25b8')+' connections</button>':'');
+(t.status==='up'?'<button class=rnet-subtoggle data-x=\"'+th+'\" title=\"'+th+'\\u2019s own attached hosts \\u2014 see and manage what IT is connected to, from here. Rows read live from its kernel over your tunnel + its own token; actions run there.\">'+(_openSub[t.host]?'\\u25be':'\\u25b8')+' connections</button>':'');
 item.appendChild(row);
 // Live automatic-update phase, on its own line under the row — this is the whole reason the modal could
 // go away: the work still announces itself, it just does it here instead of over your screen. A FAILURE
@@ -38379,13 +38543,13 @@ list.appendChild(item);});
 if(known.length){var hd=document.createElement('div');hd.className='rnet-khead';
 hd.textContent='Previously attached';hd.title='Hosts romp remembers. Most were attached before and keep the trust level you last chose, so re-attaching restores it. A row marked \\u201ctrust remembered\\u201d was never attached from this machine \\u2014 it only records how to hold that host\\u2019s mail. Forget removes a host from this list.';
 list.appendChild(hd);
-known.forEach(function(k){var kr=document.createElement('div');kr.className='rnet-row rnet-known';
+known.forEach(function(k){var kr=document.createElement('div');kr.className='rnet-row rnet-known';var kh=esc(k.host);
 var kpd=pendLvl(_pendTrust,k.host,k.trust||'directed');
 var kcur=kpd||k.trust||'directed';
 // The SAME trust select as an attached row (data-t → /tunnels/trust): trust is judged by ORIGIN at
 // delivery, so the level applies to this host's mail even when it arrives relayed through a hub —
 // no tunnel required to set it (the user 2026-07-25).
-var ktrust='<select class=\"rnet-trust'+(kpd?' rnet-applying':'')+'\"'+(kpd?' disabled':'')+' data-t=\"'+k.host+'\" title=\"What happens to postal mail from '+k.host+', however it arrives (a direct tunnel later, or relayed through a hub now): trusted = delivered straight to your sessions; directed = held for your approval; isolated = none.\">'+
+var ktrust='<select class=\"rnet-trust'+(kpd?' rnet-applying':'')+'\"'+(kpd?' disabled':'')+' data-t=\"'+kh+'\" title=\"What happens to postal mail from '+kh+', however it arrives (a direct tunnel later, or relayed through a hub now): trusted = delivered straight to your sessions; directed = held for your approval; isolated = none.\">'+
 ['trusted','directed','isolated'].map(function(v){return '<option value='+v+(kcur===v?' selected':'')+'>'+TRUSTW[v]+'</option>';}).join('')+'</select>'+(kpd?'<span class=rnet-pend>'+spin()+'applying\\u2026</span>':'');
 // A row that only remembers a mail-trust tier must SAY so (the user 2026-08-12, who read
 // "Previously attached: <host>" on a machine that never held that tunnel and went looking for an
@@ -38395,11 +38559,11 @@ var ktrust='<select class=\"rnet-trust'+(kpd?' rnet-applying':'')+'\"'+(kpd?' di
 var kwas=!!k.attached;
 var kst=kwas?'not attached':'trust remembered \\u00b7 never attached here';
 var kstt=kwas?'Not attached; the trust level applies to its mail by origin, and re-attaching keeps it.'
-:'No tunnel to '+k.host+' has ever been attached from this machine \\u2014 this row only records how its mail is held (trust is judged by origin, e.g. for a relayed peer). Attaching is still one click.';
+:'No tunnel to '+kh+' has ever been attached from this machine \\u2014 this row only records how its mail is held (trust is judged by origin, e.g. for a relayed peer). Attaching is still one click.';
 kr.innerHTML='<span class=rnet-dot style=\"background:transparent;box-shadow:inset 0 0 0 1.5px #5a5a5a\" title=\"Not attached right now.\"></span>'+
-'<span class=nm><b>'+k.host+'</b> <span class=st title=\"'+kstt+'\">'+kst+'</span></span>'+ktrust+
-'<button data-ra=\"'+k.host+'\" title=\"'+(kwas?'Open the ssh tunnel to '+k.host+' again, restoring its remembered trust level.':'Open an ssh tunnel to '+k.host+' (first attach from this machine); its remembered trust level rides along.')+'\">'+(kwas?'Re-attach':'Attach')+'</button>'+
-'<button data-fg=\"'+k.host+'\" title=\"Remove '+k.host+' from this list. It does not touch the host itself; attaching again will re-add it.\">Forget</button>';
+'<span class=nm><b>'+kh+'</b> <span class=st title=\"'+kstt+'\">'+kst+'</span></span>'+ktrust+
+'<button data-ra=\"'+kh+'\" title=\"'+(kwas?'Open the ssh tunnel to '+kh+' again, restoring its remembered trust level.':'Open an ssh tunnel to '+kh+' (first attach from this machine); its remembered trust level rides along.')+'\">'+(kwas?'Re-attach':'Attach')+'</button>'+
+'<button data-fg=\"'+kh+'\" title=\"Remove '+kh+' from this list. It does not touch the host itself; attaching again will re-add it.\">Forget</button>';
 list.appendChild(kr);});}
 // REACHABLE VIA RELAY (the user 2026-07-25): machines with no direct tunnel from here, one relay hop
 // away through an attached hub. Their mail is judged by ORIGIN, so the same trust select applies —
@@ -38407,13 +38571,13 @@ list.appendChild(kr);});}
 if(via.length){var vh=document.createElement('div');vh.className='rnet-khead';
 vh.textContent='Reachable via relay';vh.title='Machines you have no direct tunnel to; a hub you are attached to relays their mail one hop. Trust is judged by origin, so the level you set here applies to their mail even though it arrives through the hub.';
 list.appendChild(vh);
-via.forEach(function(v){var vr=document.createElement('div');vr.className='rnet-row rnet-known';
+via.forEach(function(v){var vr=document.createElement('div');vr.className='rnet-row rnet-known';var evh=esc(v.host),vv=esc(v.via);
 var vpd=pendLvl(_pendTrust,v.host,v.trust||'directed');
 var vcur=vpd||v.trust||'directed';
-var vtrust='<select class=\"rnet-trust'+(vpd?' rnet-applying':'')+'\"'+(vpd?' disabled':'')+' data-t=\"'+v.host+'\" title=\"What happens to postal mail from '+v.host+' (it arrives relayed through '+v.via+'; trust is judged by its true origin): trusted = delivered straight to your sessions; directed = held for your approval; isolated = none.\">'+
+var vtrust='<select class=\"rnet-trust'+(vpd?' rnet-applying':'')+'\"'+(vpd?' disabled':'')+' data-t=\"'+evh+'\" title=\"What happens to postal mail from '+evh+' (it arrives relayed through '+vv+'; trust is judged by its true origin): trusted = delivered straight to your sessions; directed = held for your approval; isolated = none.\">'+
 ['trusted','directed','isolated'].map(function(w){return '<option value='+w+(vcur===w?' selected':'')+'>'+TRUSTW[w]+'</option>';}).join('')+'</select>'+(vpd?'<span class=rnet-pend>'+spin()+'applying\\u2026</span>':'');
-vr.innerHTML='<span class=rnet-dot style=\"background:transparent;box-shadow:inset 0 0 0 1.5px #7a6a3a\" title=\"No direct tunnel; reachable one hop through '+v.via+'.\"></span>'+
-'<span class=nm><b>'+v.host+'</b> <span class=st title=\"Its sessions are gossiped one hop by '+v.via+'; attach it directly for full control.\">via '+v.via+' \\u00b7 '+(v.agents||0)+' session'+((v.agents||0)===1?'':'s')+'</span></span>'+vtrust;
+vr.innerHTML='<span class=rnet-dot style=\"background:transparent;box-shadow:inset 0 0 0 1.5px #7a6a3a\" title=\"No direct tunnel; reachable one hop through '+vv+'.\"></span>'+
+'<span class=nm><b>'+evh+'</b> <span class=st title=\"Its sessions are gossiped one hop by '+vv+'; attach it directly for full control.\">via '+vv+' \\u00b7 '+esc(v.agents||0)+' session'+((v.agents||0)===1?'':'s')+'</span></span>'+vtrust;
 list.appendChild(vr);});}
 // BETWEEN YOUR MACHINES (the user 2026-08-11): how attached machines hold EACH OTHER's mail. The
 // pair link a\\u2194b appears nowhere above — every list in this panel manages only THIS machine's own
@@ -38427,23 +38591,23 @@ var bh=document.createElement('div');bh.className='rnet-khead';bh.textContent='B
 bh.title='How your attached machines hold each other\\u2019s postal mail, one line per direction, read live from each machine\\u2019s own kernel. Changing a line writes to the holding machine through your tunnel and its own access token (like Match): you are acting on both ends; the machines never set each other\\u2019s trust.';
 list.appendChild(bh);
 if(_pairs&&_pairs.pairs){_pairs.pairs.forEach(function(pr){
-[[pr.a,pr.b,pr.ab],[pr.b,pr.a,pr.ba]].forEach(function(dd){var hold=dd[0],frm=dd[1],tier=dd[2];
+[[pr.a,pr.b,pr.ab],[pr.b,pr.a,pr.ba]].forEach(function(dd){var hold=dd[0],frm=dd[1],tier=dd[2],eh=esc(hold),ef=esc(frm);
 var br=document.createElement('div');br.className='rnet-row rnet-known';
 // null = that machine's table was unreadable this pass (named error, retried next kick); '' = no
 // explicit row there yet, which the receiving bus treats as directed for a relayed origin.
-if(tier===null){var he=(_pairs.hosts&&_pairs.hosts[hold]&&_pairs.hosts[hold].error)||'unreadable';
-br.innerHTML='<span class=nm><b>'+hold+'</b> holds <b>'+frm+'</b>\\u2019s mail: <span class=st title=\"Could not read '+hold+'\\u2019s trust table over the tunnel: '+he+'. It keeps gating mail by its own last-set levels; retried on the next refresh.\">unreadable \\u2014 '+he+'</span></span>';
+if(tier===null){var he=esc((_pairs.hosts&&_pairs.hosts[hold]&&_pairs.hosts[hold].error)||'unreadable');
+br.innerHTML='<span class=nm><b>'+eh+'</b> holds <b>'+ef+'</b>\\u2019s mail: <span class=st title=\"Could not read '+eh+'\\u2019s trust table over the tunnel: '+he+'. It keeps gating mail by its own last-set levels; retried on the next refresh.\">unreadable \\u2014 '+he+'</span></span>';
 list.appendChild(br);return;}
 var pk=hold+'|'+frm;
 var ppd=pendLvl(_pendPair,pk,tier||'');   // confirmed when the holder's own table shows the chosen level
 var pcur=ppd||tier||'directed';
 var imp=(!tier&&!ppd)?' Never set explicitly \\u2014 directed is its default.':'';
-br.innerHTML='<span class=nm><b>'+hold+'</b> holds <b>'+frm+'</b>\\u2019s mail</span>'+
-'<span class=rnet-set><select class=\"rnet-trust'+(ppd?' rnet-applying':'')+'\"'+(ppd?' disabled':'')+' data-pt-on=\"'+hold+'\" data-pt-of=\"'+frm+'\" title=\"What '+hold+' does with postal mail from '+frm+'.'+imp+' trusted: delivered straight to its sessions. directed: held on '+hold+' for your approval. isolated: none.\">'+
+br.innerHTML='<span class=nm><b>'+eh+'</b> holds <b>'+ef+'</b>\\u2019s mail</span>'+
+'<span class=rnet-set><select class=\"rnet-trust'+(ppd?' rnet-applying':'')+'\"'+(ppd?' disabled':'')+' data-pt-on=\"'+eh+'\" data-pt-of=\"'+ef+'\" title=\"What '+eh+' does with postal mail from '+ef+'.'+imp+' trusted: delivered straight to its sessions. directed: held on '+eh+' for your approval. isolated: none.\">'+
 ['trusted','directed','isolated'].map(function(v){return '<option value='+v+(pcur===v?' selected':'')+'>'+TRUSTW[v]+'</option>';}).join('')+'</select>'+(ppd?'<span class=rnet-pend>'+spin()+'applying\\u2026</span>':'')+'</span>';
 list.appendChild(br);});});}
 else if(_pairs&&_pairs.error){var be=document.createElement('div');be.className='rnet-row rnet-known';
-be.innerHTML='<span class=st>Could not read how your machines hold each other: '+_pairs.error+' \\u2014 retrying.</span>';list.appendChild(be);}
+be.innerHTML='<span class=st>Could not read how your machines hold each other: '+esc(_pairs.error)+' \\u2014 retrying.</span>';list.appendChild(be);}
 else{var bl=document.createElement('div');bl.className='rnet-row rnet-known';
 bl.innerHTML='<span class=st>'+spin()+'reading how your machines hold each other\\u2026</span>';list.appendChild(bl);}
 }
@@ -38455,11 +38619,11 @@ var hh=document.createElement('div');hh.className='rnet-khead';
 hh.textContent='Held for approval elsewhere';
 hh.title='Postal mail quarantined on another machine (its trust for the sender is directed). Open that machine\u2019s dashboard to approve or deny; the hold itself lives there.';
 list.appendChild(hh);
-Object.keys(byHost).sort().forEach(function(hn){var rows=byHost[hn];
+Object.keys(byHost).sort().forEach(function(hn){var rows=byHost[hn],ehn=esc(hn);
 var gl=rows.slice(0,6).map(function(r){return r.frm+' \\u2192 '+r.to+((r.origin&&r.origin!==hn)?' (from '+r.origin+')':'')+': '+(r.gist||'');}).join('\\n');
 var hr=document.createElement('div');hr.className='rnet-row rnet-known';
-hr.innerHTML='<span class=rnet-dot style=\"background:#b58900\" title=\"Mail is waiting for approval on '+hn+'.\"></span>'+
-'<span class=nm><b>'+hn+'</b> <span class=st title=\"'+gl.replace(/\"/g,'&quot;')+'\">'+rows.length+' message'+(rows.length===1?'':'s')+' held for your approval</span></span>';
+hr.innerHTML='<span class=rnet-dot style=\"background:#b58900\" title=\"Mail is waiting for approval on '+ehn+'.\"></span>'+
+'<span class=nm><b>'+ehn+'</b> <span class=st title=\"'+esc(gl)+'\">'+rows.length+' message'+(rows.length===1?'':'s')+' held for your approval</span></span>';
 list.appendChild(hr);});}
 // Pending is recorded ON THE CLICK (ack now — the buttons rule), so any re-render in the round-trip
 // window repaints the chosen level + applying cue instead of the stale snapshot's old value. A
@@ -43439,6 +43603,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.headers.get("Sec-WebSocket-Key"):
             return self._send(400, "expected websocket", "text/plain")
         q = parse_qs(query or "")
+        q.pop("token", None)         # whatever the browser sent never travels — with or without a row token
         if rtok:
             q["token"] = [rtok]      # the remote's own credential; whatever the browser sent means nothing there
         try:

@@ -71,7 +71,7 @@ function withFed(fn: (fm: any, winEvents: any[], localSends: any[]) => void): vo
 
 /** Dial a remote host through the real openRemote/connect path; returns its (CONNECTING) socket. */
 function attach(fm: any, host: string): FakeSocket {
-  fm.openRemote(host, "token-" + host, true);
+  fm.openRemote(host, true);
   return fm.conns.get(host).ws as FakeSocket;
 }
 

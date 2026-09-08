@@ -123,7 +123,9 @@ class TunnelConcierge(unittest.TestCase):
         self.assertTrue(body["ok"])
         t = body["tunnel"]
         self.assertEqual(t["host"], "testhost")
-        self.assertEqual(t["token"], FAKE_TOKEN, "the remote serve-token must be fetched over ssh")
+        self.assertNotIn("token", t, "the page is never handed the remote's credential (2026-09-08)")
+        self.assertIs(t["hasToken"], True, "…only the fact that one was fetched")
+        self.assertEqual(km._remotes["testhost"]["token"], FAKE_TOKEN, "the remote serve-token must be fetched over ssh")
         self.assertGreater(t["localPort"], 0, "a local -L port must be allocated for the browser")
         self.assertIn(t["status"], ("authorizing", "connecting", "starting", "up"))
         self.assertTrue(km._tunnel_proc_alive(km._remotes["testhost"]), "the ssh tunnel proc must be running")
@@ -134,7 +136,8 @@ class TunnelConcierge(unittest.TestCase):
         self.assertEqual(status, 200)
         hosts = {t["host"]: t for t in body["tunnels"]}
         self.assertIn("testhost", hosts)
-        self.assertEqual(hosts["testhost"]["token"], FAKE_TOKEN)
+        self.assertIs(hosts["testhost"]["hasToken"], True)
+        self.assertNotIn(FAKE_TOKEN, json.dumps(body), "the token string never rides /tunnels (2026-09-08)")
 
     def test_detach_kills_and_forgets(self):
         _req(self.port, "POST", "/tunnels", {"host": "testhost"})
@@ -281,14 +284,15 @@ class BootstrapRemoteKernel(unittest.TestCase):
         status, body = _req(self.port, "POST", "/tunnels", {"host": "testhost"})
         self.assertEqual(status, 200)
         self.assertTrue(os.path.exists(marker), "the bootstrap ran the remote start command")
-        self.assertEqual(body["tunnel"]["token"], FAKE_TOKEN,
-                         "the token is fetched AFTER the bootstrapped kernel comes up")
+        self.assertIs(body["tunnel"]["hasToken"], True,
+                      "the token is fetched AFTER the bootstrapped kernel comes up")
+        self.assertEqual(km._remotes["testhost"]["token"], FAKE_TOKEN)
 
     def test_attach_without_romp_reports_the_next_step(self):
         self._mock(MOCK_SSH_NOROMP)
         status, body = _req(self.port, "POST", "/tunnels", {"host": "barehost"})
         self.assertEqual(status, 200)
-        self.assertEqual(body["tunnel"]["token"], "", "no kernel to authorize against")
+        self.assertIs(body["tunnel"]["hasToken"], False, "no kernel to authorize against")
         self.assertIn("install.sh", body["tunnel"]["detail"],
                       "the popover tells the user the one command to run")
 

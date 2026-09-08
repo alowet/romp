@@ -352,6 +352,37 @@ export function initStrip(openSettings: () => void, post?: (m: Record<string, un
     .catch(() => { /* the live pushes fill it in */ });
 }
 
+// The attach box's host list, as <option> ELEMENTS: value and text set as properties, never as markup.
+// An alias is whatever ~/.ssh/config says, and the old innerHTML template (an option tag with the alias
+// interpolated into its value attribute) let a crafted one close the attribute and add a handler (2026-09-08). Non-strings are dropped, the list is capped, and an
+// empty list still names why (loud, never silently empty). Exported so the shape is testable on its own;
+// the web shell's datalist twin (_LANDING_REMOTES_JS fillHosts) builds its options the same way.
+export function fillHostSelect(sel: HTMLSelectElement, hosts: unknown, empty: string): void {
+  sel.textContent = "";
+  const all = (Array.isArray(hosts) ? hosts : []).filter((h): h is string => typeof h === "string" && h.length > 0);
+  const hs = all.slice(0, 512);
+  for (const h of hs.length ? hs : [""]) {
+    const o = document.createElement("option");
+    o.value = h;
+    o.textContent = h || empty;
+    sel.appendChild(o);
+  }
+  if (all.length > hs.length) {                    // a cut list says so, never silently (the kernel's fillHosts wears the same marker)
+    const o = document.createElement("option");
+    o.value = o.textContent = `… ${all.length - hs.length} more not shown`;
+    o.disabled = true;
+    sel.appendChild(o);
+  }
+}
+
+// The sub-panel's note for rows the kernel's whitelist left out of a peer's /tunnels/of answer (a row whose
+// host ssh would not accept): one sentence, worn by BOTH panels — the web shell's subBlock carries the same
+// words (net-remote-controls.test.ts pins both). "" when nothing was left out, or the count is not a count.
+export function droppedRowsNote(via: string, dropped: unknown): string {
+  const n = typeof dropped === "number" && dropped > 0 ? Math.floor(dropped) : 0;
+  return n ? `${n} row${n === 1 ? "" : "s"} from ${via} had no usable host and ${n === 1 ? "was" : "were"} left out` : "";
+}
+
 // The remote-kernels popover — the strip twin of the web shell's rail-net
 // popover (_LANDING_REMOTES_JS in bin/romp-kernel): same kernel endpoints
 // (/ssh-hosts, /tunnels, /tunnels/detach|update|start), leaner chrome. The two
@@ -430,12 +461,9 @@ function initNetPopover(button: HTMLButtonElement, post?: (m: Record<string, unk
   const busy = (s: string) => s !== "up" && s !== "down" && s !== "error" && s !== "no-kernel";
 
   function loadHosts() {
-    fetch(kernelUrl("/ssh-hosts"), { cache: "no-store" }).then((r) => r.json()).then((d) => {
-      const hs: string[] = (d && d.hosts) || [];
-      sel.innerHTML = hs.length
-        ? hs.map((h) => `<option value="${h}">${h}</option>`).join("")
-        : `<option value="">(no ~/.ssh/config hosts)</option>`;
-    }).catch(() => { sel.innerHTML = `<option value="">(kernel unreachable)</option>`; });   // loud, never silently empty
+    fetch(kernelUrl("/ssh-hosts"), { cache: "no-store" }).then((r) => r.json())
+      .then((d) => { fillHostSelect(sel, d && d.hosts, "(no ~/.ssh/config hosts)"); })
+      .catch(() => { fillHostSelect(sel, [], "(kernel unreachable)"); });   // loud, never silently empty
   }
 
   function act(path: string, host: string, b: HTMLButtonElement, busyText: string, via?: string) {
@@ -865,7 +893,8 @@ function initNetPopover(button: HTMLButtonElement, post?: (m: Record<string, unk
       return;
     }
     const rows = d.tunnels || [];
-    if (!rows.length) {
+    const note = droppedRowsNote(via, d.dropped);
+    if (!rows.length && !note) {
       const e = document.createElement("div");
       e.className = "sn-sub sn-empty";
       e.textContent = `${via} has no hosts attached.`;
@@ -873,6 +902,12 @@ function initNetPopover(button: HTMLButtonElement, post?: (m: Record<string, unk
       return;
     }
     for (const s of rows) subRow(via, s);
+    if (note) {                                    // said beneath the rows that passed, never a silently shorter list
+      const e = document.createElement("div");
+      e.className = "sn-sub sn-empty";
+      e.textContent = note;
+      list.appendChild(e);
+    }
   }
 
   function subRow(via: string, s: any) {
