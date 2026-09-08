@@ -10,10 +10,12 @@ save_goals now compares the revision it loaded at against the one on disk and RE
 logs) instead of clobbering. The store is an append-only event log, so two writers appending different
 events never really conflicted: the right answer is both sets. All fixtures SYNTHETIC.
 """
+import errno
 import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -185,6 +187,118 @@ class StoreCas(unittest.TestCase):
         jd.record_verdict(s, s["nodes"][gid], "planner", "done", T0 + 30, why="shipped")
         jd.save_goals(SID, s)                        # nobody else wrote → straight publish
         self.assertTrue(jd.load_goals(SID)["nodes"][gid].get("nodeComplete"))
+
+
+class ReadFaultCas(unittest.TestCase):
+    """The CAS can never publish over a file it could not READ.
+
+    Before this, every reader in the save path answered a read failure with the ABSENT-file value:
+    load_goals returned a fresh store at base 0, _disk_rev read 0, _matches_disk read "no match" and
+    _rebase_onto_disk had "nothing to rebase onto". So on an EIO, an EACCES or a corrupt file, save_goals
+    found base 0 == disk 0 and published the empty store over the user's goals. Now a read fault raises
+    from every one of those readers and the file on disk is left byte for byte as it was.
+
+    Mints goals, so it uses a PRIVATE synthetic sid (CLAUDE.md, 2026-08-24) and cleans that sid's override
+    journal in tearDown."""
+    FSID = "7b2c3d4e-5f60-4182-93a4-b5c6d7e8f901"
+
+    def setUp(self):
+        self._saved = jd.STATE
+        self.td = tempfile.TemporaryDirectory()
+        jd._rebind_state(Path(self.td.name))
+
+    def tearDown(self):
+        (jd._overrides_dir() / (self.FSID + ".jsonl")).unlink(missing_ok=True)
+        jd._rebind_state(self._saved)
+        (jd._overrides_dir() / (self.FSID + ".jsonl")).unlink(missing_ok=True)
+        self.td.cleanup()
+
+    def _file(self):
+        return jd.GOALDIR / (self.FSID + ".json")
+
+    def _gid(self):
+        return "%s:g1" % self.FSID
+
+    def _seed(self):
+        s = {"rompUuid": self.FSID, "seq": 0, "placementsV": jd.PLACEMENTS_V, "nodes": {},
+             "placements": {}, "status": {}}
+        jd.apply_plan(s, "s1", T0, [{"do": "mint", "why": "x", "text": "A goal"}], [])
+        jd.rollup_status(s, session_closed=False)
+        jd.save_goals(self.FSID, s)
+
+    def _eio_on_the_store(self):
+        """Path.read_text raises EIO for THIS store's path only; every other read is untouched."""
+        target, orig = self._file(), Path.read_text
+
+        def faulting(path, *a, **kw):
+            if path == target:
+                raise OSError(errno.EIO, "Input/output error", str(path))
+            return orig(path, *a, **kw)
+        return mock.patch.object(Path, "read_text", faulting)
+
+    def test_a_read_fault_raises_from_load_instead_of_reading_as_an_empty_store(self):
+        self._seed()
+        with self._eio_on_the_store():
+            with self.assertRaises(OSError) as cm:
+                jd.load_goals(self.FSID)
+        self.assertEqual(cm.exception.errno, errno.EIO, "the fault itself, not a fresh store")
+        self.assertEqual(len(self._sidecars()), 0, "a FAULT is not corruption: nothing is moved aside")
+
+    def test_a_read_fault_at_save_publishes_nothing_and_the_file_is_untouched(self):
+        self._seed()
+        before = self._file().read_bytes()
+        s = jd.load_goals(self.FSID)                 # a snapshot taken while the disk was healthy...
+        jd.record_verdict(s, s["nodes"][self._gid()], "planner", "done", T0 + 30, why="shipped")
+        with self._eio_on_the_store():               # ...then the store becomes unreadable
+            with self.assertRaises(OSError):
+                jd.save_goals(self.FSID, s)
+        self.assertEqual(self._file().read_bytes(), before,
+                         "the publish did not go ahead over bytes it failed to compare against")
+
+    def test_a_file_corrupted_after_load_is_not_overwritten_by_the_save(self):
+        """The save path never quarantines (that is load's job, after the evidence is preserved): a store
+        that turned unparseable underneath a held snapshot makes the save raise, and the bytes stay put for
+        the next load to move aside."""
+        self._seed()
+        s = jd.load_goals(self.FSID)
+        jd.record_verdict(s, s["nodes"][self._gid()], "planner", "done", T0 + 30, why="shipped")
+        self._file().write_text("{not json")
+        with self.assertRaises(ValueError):
+            jd.save_goals(self.FSID, s)
+        self.assertEqual(self._file().read_text(), "{not json", "the save wrote nothing")
+        self.assertEqual(len(self._sidecars()), 0, "and moved nothing: the save path only reads")
+        fresh = jd.load_goals(self.FSID)             # the next load is the one that quarantines
+        self.assertEqual(len(self._sidecars()), 1)
+        jd.save_goals(self.FSID, fresh)
+        self.assertEqual(json.loads(self._file().read_text())["rompUuid"], self.FSID)
+
+    def test_disk_rev_reads_zero_only_for_an_absent_file(self):
+        self.assertEqual(jd._disk_rev(self.FSID), 0, "absent → 0, a create")
+        self._seed()
+        self.assertGreater(jd._disk_rev(self.FSID), 0)
+        with self._eio_on_the_store():
+            with self.assertRaises(OSError):
+                jd._disk_rev(self.FSID)
+        self._file().write_text("{not json")
+        with self.assertRaises(ValueError):
+            jd._disk_rev(self.FSID)
+
+    def test_matches_disk_and_rebase_raise_on_a_fault_or_a_corrupt_file(self):
+        """Each reader in the save path on its own: a version of either that swallowed the read and answered
+        'no match' / 'nothing to rebase onto' would let save_goals go ahead and passed every other test."""
+        self._seed()
+        s = jd.load_goals(self.FSID)
+        self.assertTrue(jd._matches_disk(self.FSID, s), "premise: a healthy read matches")
+        with self._eio_on_the_store():
+            self.assertRaises(OSError, jd._matches_disk, self.FSID, s)
+            self.assertRaises(OSError, jd._rebase_onto_disk, self.FSID, s)
+        self._file().write_text("{not json")
+        self.assertRaises(ValueError, jd._matches_disk, self.FSID, s)
+        self.assertRaises(ValueError, jd._rebase_onto_disk, self.FSID, s)
+        self.assertEqual(self._file().read_text(), "{not json", "neither reader touched the file")
+
+    def _sidecars(self):
+        return sorted(jd.GOALDIR.glob(self.FSID + ".json.corrupt-*"))
 
 
 if __name__ == "__main__":

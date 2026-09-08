@@ -79,6 +79,7 @@ class FrameNeverSilentlyDies(unittest.TestCase):
         self.assertIn('_bars_complain(sid, "live-merge", e)', src)
         # seam refinement failing costs the seams, never the lane's bars
         self.assertIn('_bars_complain(sid, "seams", e)', src)
+        self.assertIn('_bars_complain(sid, "goals", gfault)', src)   # an unreadable goal store: lane without goal data
         self.assertIn('_bars_complain(sid, "judging-marks", e)', src)
         # the global stages are guarded ALONE — one malformed row costs that band, never the frame
         self.assertIn('_bars_complain("*", "messages", e)', src)
