@@ -8,8 +8,9 @@
 // Fix: a ResizeObserver on #bg-tasks and #footer with the rule OPPOSITE to the boxes-above compensation: a reader
 // whose recorded follow mode is on (the view's `stick`, untouched by the growth since no scroll event fired) is
 // written to the new bottom (writer "box-below"); a scrolled-up reader is untouched (their top line never moved).
-// Pure rule executed here; render.ts wiring pinned. Also pinned: #content opts out of the browser's own scroll
-// anchoring, which was double-compensating the pane's own writers (see the comment beside the rule in styles.css).
+// Pure rule executed here; render.ts wiring pinned. Also pinned: the browser's scroll anchoring stays ON for #content
+// (a measured result, see the comment beside the rule in styles.css — the opt-out let the visible line drift
+// 194-246 px after a window slide, where the anchoring held it at 0).
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -43,6 +44,7 @@ test("render.ts observes #bg-tasks and #footer and writes the new bottom through
   assert.match(RENDER, /writeScroll\(content, content\.scrollTop \+ \(h - lastH\), "box-resize"\);/);
 });
 
-test("#content opts out of the browser's scroll anchoring: the pane is the one compensator", () => {
-  assert.match(CSS, /#content \{[^}]*overflow-anchor: none;/);
+test("#content keeps the browser's scroll anchoring: measured, the opt-out made the line drift after a window slide", () => {
+  assert.doesNotMatch(CSS, /#content[^{]*\{[^}]*overflow-anchor/, "do not add overflow-anchor to #content");
+  assert.match(CSS, /The browser's scroll anchoring stays ON here \(measured 2026-09-08, T262e\)/);
 });

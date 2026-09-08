@@ -716,12 +716,12 @@ body.chat-theme-yatharth .tab.active.colored:not(.tab-blocked) {
    (overflow-y:auto alone makes overflow-x compute to auto, which allowed it) */
 /* overflow-y: scroll (not auto) so the chat scrollbar + its gutter are ALWAYS shown and never
    auto-hide on the side — and the content doesn't shift when it would appear (the user 2026-06-16). */
-/* overflow-anchor: none (T262e, the user 2026-09-08, still "jumped up" at times): the pane is the ONE compensator
-   for layout changes inside the transcript — rewindow, anchor-restore, keep-offset, the append's anchor keep all
-   write the scrollTop that keeps the line being read still. Chrome's own scroll anchoring did the same job on top
-   of them for the same change, and the breadcrumbs showed the pair: a rewindow write of -106 px followed by a
-   browser move of +190 px nobody's code asked for, every window slide. Two compensators for one change is a jump. */
-#content { flex: 1 1 auto; overflow-y: scroll; overflow-x: hidden; padding: 8px 0 12px; overflow-anchor: none; }
+/* The browser's scroll anchoring stays ON here (measured 2026-09-08, T262e): after a scroll that slides the
+   virtualization window, the pane's rewindow write keeps the focus unit still and Chrome's anchoring then absorbs
+   the LATER layout changes the pane does not compensate (spacer re-measures, late-sizing rows). With
+   overflow-anchor: none the visible line drifted 194-246 px after every such scroll on a headless run; with it on,
+   0 px on every row. Do not add overflow-anchor: none to #content. */
+#content { flex: 1 1 auto; overflow-y: scroll; overflow-x: hidden; padding: 8px 0 12px; }
 /* a clearly-visible always-on thumb for the chat pane (brighter than the faint global thumb) */
 #content::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.04); }
 #content::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.24); border-radius: 5px; min-height: 36px; }
