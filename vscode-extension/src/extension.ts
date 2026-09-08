@@ -23,7 +23,7 @@ import { execFile } from "child_process";
 import WebSocket from "ws";
 import { chatBody, FEED_BODY, FLEET_BODY, TIMELINE_BODY, ATTACH_TITLE_VSCODE } from "./page-skeleton";
 import { ensureThenAttach, parseHealthz, warnAfter } from "./kernel-attach";
-import { intentOp } from "./pipe-intent";
+import { intentOp, ReloadHold } from "./pipe-intent";
 import { routeViewMessage } from "./view-routing";
 import { deriveStatus, freshNeedsYou, renderStatusBar, statusTooltipLines, FleetStatus } from "./fleet-status";
 import { citeText, sessionsForWorkspace, SessionInfo } from "./workspace-sessions";
@@ -463,9 +463,10 @@ function askManagerEnsure(port: number): Promise<boolean> {
 class KernelPipe {
   private ws: WebSocket | null = null;
   private queue: { s: string; intent: boolean }[] = [];
+  private hold = new ReloadHold();   // refusals that arrived while the webview was reloading; see webviewReady
   private alive = true;
   private everConnected = false;
-  webviewReady = false;
+  private _webviewReady = false;
   constructor(
     private app: "chat" | "feed" | "timeline" | "fleet",
     private onDown: (m: any) => void,
@@ -480,6 +481,16 @@ class KernelPipe {
   }
   queuedIntents(): number {
     return this.queue.reduce((n, q) => n + (q.intent ? 1 : 0), 0);
+  }
+  // Set by the panel on its webview's "ready". The rising edge is the event a HELD frame waits for: a
+  // frame posted to a webview between its reload and its "ready" is gone, and the kernel's refusal of a
+  // replayed intent arrives in exactly that window: the reconnect below replays and then reloads in one
+  // tick. A remote-tag ADD replayed right after a kernel restart is refused (the home kernel's tunnel is
+  // not up yet, and an add never queues), and its tagEditFailed was never seen (review find, 2026-09-08).
+  get webviewReady(): boolean { return this._webviewReady; }
+  set webviewReady(v: boolean) {
+    this._webviewReady = v;
+    if (v) for (const m of this.hold.release()) this.onDown(m);
   }
   send(m: any) {
     const s = JSON.stringify(m);
@@ -529,6 +540,9 @@ class KernelPipe {
       // keepalive carries the kernel's dist build token — drift vs this bundle's stamp → one banner.
       // Panel pipes only: the passive status pipe observes and never toasts.
       if (m && m.type === "ka" && !this.passive) maybeBuildNotice(m.dv);
+      // a refusal for a webview that is mid-reload waits for its "ready" (webviewReady above); the passive
+      // status pipe has no webview and posts no intent, so nothing of its is ever held
+      if (!this.passive && !this.hold.offer(m, this._webviewReady)) return;
       this.onDown(m);
     });
     const reconnect = () => {
@@ -542,6 +556,7 @@ class KernelPipe {
   }
   dispose() {
     this.alive = false;
+    this.hold.release();   // the panel is gone; nothing is waiting for its ready any more
     try { this.ws?.close(); } catch { /* ignore */ }
     this.ws = null;
   }
