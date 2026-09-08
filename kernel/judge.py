@@ -4602,6 +4602,17 @@ def save_goals(fsid, store):
     the override journal still backstops the state. Stores built without load_goals carry no `_baseRev`
     and keep the old unconditional behavior (nothing to rebase onto).
 
+    A store that came through load_goals keeps a base across saves (the design review of 2026-09-06): after
+    a successful publish the object carries the revision just written as its base, which the file now holds
+    with exactly this content, so the holder's next save is CAS-protected too. Before the re-stamp, the first
+    publish popped the base and nothing restored it, so every later save of the same object — _plan_session
+    saves its store several times per pass, _distill_session saves after titling and again after distilling
+    — took the unconditional branch, wrote over whatever a concurrent writer (the nudge tick, the unblocker,
+    a peer tier) had published in between, and skipped the no-op check as well. The base is popped before
+    the CAS loop and re-stamped only after the rename, so a raise between the two leaves the object without
+    a base (its next save is unconditional, as every save was before this change); a refusal before the pop
+    (the frozen-store check, the no-op check) leaves it untouched.
+
     A publish that would write back EXACTLY what the file already holds is skipped (the user 2026-07-22).
     Callers save unconditionally on purpose — `_plan_session` ends every pass with a rollup + save whether or
     not the pass placed anything — so an idle fleet rewrote ~24 stores with byte-identical content about ten
@@ -4656,6 +4667,9 @@ def save_goals(fsid, store):
     tmp.rename(GOALDIR / (fsid + ".json"))            # atomic publish
     _shared_forget(str(GOALDIR / (fsid + ".json")))   # the shared read-only view of the old version goes with
     #                                                   it (its identity check would miss anyway; this frees the bytes)
+    if base is not None:
+        store["_baseRev"] = store["rev"]             # the file holds exactly this content at this revision:
+        #                                              the holder's NEXT save compares against it (docstring)
 
 
 def load_goal_archive(fsid):
@@ -15228,14 +15242,16 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbos
     exactly as several publishes did). A raise mid-loop publishes the senders reached before it and
     re-raises, the sender being applied dropped unpublished; a failed publish does not stop the others,
     and the first is raised once the rest are out (review find, 2026-09-08: the per-ref save this
-    replaced persisted each verdict as it was reached). A saved object leaves `loaded` in a finally: it
-    is dropped so the next touch reloads with a fresh CAS base (save_goals pops the base on publish), and
-    a failed publish drops it too, never leaving a base-less object for the sender loop. The absent-store
-    sweep answers from _absent_store_flags, memoized across passes on file identity. The per-session
-    catches stand around the shared read: a store that raises files its `pass-crash` row where it is
-    reached (the recipient scan, a ref's sender read, the sender loop) and is not kept, so the next touch
-    retries the read; _ref_goal's recipient read goes through the store-fault boundary (_or_fault) as
-    before."""
+    replaced persisted each verdict as it was reached). A saved object leaves `loaded` in a finally:
+    save_goals re-stamps `_baseRev` after a publish, so the object could serve a second save, but
+    `idents[sid]` (the pre-read identity _absent_store_flags evaluates `loaded[sid]` under, and memoizes
+    under) describes the pre-publish file, so the object is dropped and the next touch reads the published
+    file; a failed publish drops it too (a raise after save_goals' pop leaves the object without a base),
+    never leaving a base-less object for the sender loop. The absent-store sweep answers from
+    _absent_store_flags, memoized across passes on file identity. The per-session catches stand around the
+    shared read: a store that raises files its `pass-crash` row where it is reached (the recipient scan, a
+    ref's sender read, the sender loop) and is not kept, so the next touch retries the read; _ref_goal's
+    recipient read goes through the store-fault boundary (_or_fault) as before."""
     if now is None:
         now = int(time.time())
     n = 0
@@ -15259,8 +15275,10 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbos
         return a
 
     def _publish(sid):
-        """Save the shared object once and forget it: the next touch reloads with a fresh CAS base
-        (save_goals pops the base on publish)."""
+        """Save the shared object once and forget it: the next touch reads the published file. save_goals
+        re-stamps `_baseRev` after a publish, so the object could serve a second save; it is dropped anyway
+        because `idents[sid]` describes the pre-publish file (the absent-store memo would otherwise fill
+        from post-publish content under that identity), and a failed publish drops it too."""
         try:
             save_goals(sid, loaded[sid])
         finally:
