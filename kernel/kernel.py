@@ -4001,9 +4001,7 @@ def _forward_tag_edit(host, body):
     # owner's store, and try an inline refresh now (best-effort — the poll loop is the backstop)
     r.pop("_views_at", None)
     try:
-        rv = _poll_remote_views(r)
-        if rv is not None:
-            r["views"] = rv
+        _cache_remote_views(r, _poll_remote_views(r))   # the one store of a reading (a change marks dirty; None stores nothing)
     except Exception:
         pass
     return ans, None
@@ -4126,7 +4124,11 @@ def _apply_pending_tag_edits(r):
         _tunnel_log(host, "pending-tag-edits", note="views unreadable — retrying next pass",
                     pending=len(rows))
         return 0
-    r["views"] = rv
+    # the reading lands as the supervisor's does: a CHANGED one marks the views dirty and wakes the pusher
+    # whatever the rows below decide. Stored bare, a change seen only here went unmarked: with rows
+    # pending and every forward failing nothing retires, and this re-read stamps the poll gate, so the
+    # pass's own poll serves the cache and never sees it.
+    _cache_remote_views(r, rv)
     by_name = {}                                 # keyed on the name basis: the host's raw name may be padded
     for t in (rv.get("tags") or []):
         if isinstance(t, dict):
@@ -4203,6 +4205,12 @@ def _views_client():
         cand = [(r["host"], r.get("views")) for r in _remotes.values()
                 if isinstance(r.get("views"), dict)]
     for host, rv in sorted(cand):
+        # the host's OWN store's write seq, on every row of its tags: a remote rename rides this kernel's
+        # blob with no change to the local `seq`, so a client ordering what a blob says about a remote
+        # tag (tab-groups.ts followTagRenames — a pane stands down on evidence older than its memory's)
+        # needs the host's; an older host that stamps none puts none on the row
+        hseq = rv.get("seq")
+        hseq = int(hseq) if isinstance(hseq, int) and not isinstance(hseq, bool) and hseq > 0 else None
         for t in (rv.get("tags") or [])[:_VIEWS_MAX_TAGS]:
             if not isinstance(t, dict) or not t.get("id"):
                 continue
@@ -4210,10 +4218,13 @@ def _views_client():
             # the NAME BASIS (the 2026-09-05 review): an older remote build, or a padded
             # remote store, serves "web " raw; rendered raw, no lens entry (all on the basis) could
             # pick it and the union kept it apart from a local "web" — see _tag_name_basis
-            remote.append({"id": host + ":" + str(t["id"])[:64], "host": host,
-                           "name": _tag_name_basis(t.get("name")) or "tag",
-                           "color": str(t.get("color") or "")[:16],
-                           "members": [_remote_tag_member_str(host, m) for m in members]})
+            row = {"id": host + ":" + str(t["id"])[:64], "host": host,
+                   "name": _tag_name_basis(t.get("name")) or "tag",
+                   "color": str(t.get("color") or "")[:16],
+                   "members": [_remote_tag_member_str(host, m) for m in members]}
+            if hseq:
+                row["seq"] = hseq
+            remote.append(row)
     if remote:
         v["remoteTags"] = remote
     # tag federation v2: a queued edit is VISIBLE, never gone-but-not-gone — the matching cached
@@ -15543,6 +15554,11 @@ _remotes_saved_sig = None   # signature of the last blob written — lets the su
 _NOT_SAVED = ("proc",       # the live Popen
               "usage",      # a remote's rate-limit snapshot: re-polled a minute after any boot, and
               "_usage_at",  # persisting it would rewrite this 0600 credential file every minute forever
+              "_views_at",  # the /views poll's stamp, restamped once a minute per up host (REMOTE_VIEWS_EVERY):
+              #               saved, it was the same minute-forever rewrite, ~1440 a day per host. `views`
+              #               ITSELF stays: _remotes_load keeps it and
+              #               _views_client serves every cached reading, status aside, so a down host's tags
+              #               survive a kernel restart; the boot's first poll re-reads, the gate unstamped
               "misses",     # the poll run counters: they describe THIS connection, and a fresh boot
               "ok_polls")   # dials from scratch, so carrying them across would judge a link that is gone
 
@@ -15605,6 +15621,10 @@ def _remotes_load():
             if not isinstance(row, dict) or not row.get("host"):
                 continue
             r = dict(row)
+            for k in _NOT_SAVED:    # a file an older build wrote carries keys this one does not save; they
+                r.pop(k, None)      #   describe a process that is gone — a /views poll stamp restored here
+            #                         gated the boot's first read for up to REMOTE_VIEWS_EVERY and served
+            #                         the cached reading
             r["proc"], r["status"] = None, "down"
             r["booting"] = False       # transient in-flight Start flag — persisted mid-boot it would
             #                            freeze the row's status against the supervisor forever
@@ -16082,6 +16102,28 @@ def _poll_remote_views(r):
         return u if isinstance(u, dict) else r.get("views")
     except Exception:
         return r.get("views")
+
+
+def _cache_remote_views(r, rviews):
+    """The ONE store of a host's /views reading on its row — the supervisor's pass, the pending-edit
+    apply's fresh read, a landed edit's inline refresh (a test scans the module for any other) — and
+    the pusher's WAKE when the reading CHANGED. A remote host's tags reach a pane only on the local
+    views blob (_views_client, riding the pusher's tabOrder frame and the cached feed and timeline
+    builds), while its tabs reach the pane over the relay within a /tunnels poll of the row coming
+    up. Stored silently, a reattached
+    host's tags followed its tabs by whatever the pusher's cycle had left (20-40 s on a loaded box), and
+    on a quiet box the feed's and timeline's cached builds served the blob without them until some
+    signature moved — and a tab-strip pin written in that window judged the host's sessions as tabs no
+    tag holds and dropped their pins. The dirty mark
+    busts those caches and wakes the pusher, so the frame goes on its next cycle. Compared by CONTENT:
+    the poll's rate gate hands back the cached object itself, and a re-read of an unchanged store
+    parses equal — neither is news, and a mark per pass would rebuild the feed every 15 s per host for
+    nothing. None (no reading this pass) stores nothing. Returns whether the row changed."""
+    if rviews is None or rviews == r.get("views"):
+        return False
+    r["views"] = rviews
+    _mark_views_dirty()
+    return True
 
 
 # ── first-class PR-landing watches (the user 2026-08-24, both teams' surveys: every landing watch
@@ -17981,8 +18023,7 @@ def _tunnel_supervisor():
                             r["usage"] = ruse
                         else:
                             r.pop("usage", None)
-                    if rviews is not None:
-                        r["views"] = rviews
+                    _cache_remote_views(r, rviews)     # a CHANGED reading wakes the pusher: the tags reach the pane by its frame
                     auto_check = (st == "up")
                     peer_up = (st == "up")
                     peer_port, peer_tok = r.get("bus_port"), r.get("token") or ""

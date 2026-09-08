@@ -182,10 +182,10 @@ test("executed: announcedAfter — a re-arrival of the held blob (the same seq) 
 
 test("pins: render.ts keeps the last blob its gate turned away, lets it go on the next adoption, and on the caps frame adopts it only when viewsSeq names it — before anything else it does there", () => {
   const take = RENDER.slice(RENDER.indexOf("function takeViews("), RENDER.indexOf("\n}\n", RENDER.indexOf("function takeViews(")));
-  assert.match(take, /if \(adoptViews\(sessionViews, v, announcedViewsSeq\)\) \{ announcedViewsSeq = announcedAfter\(sessionViews, v, announcedViewsSeq\); sessionViews = v; rejectedViews = null; return true; \}\s*\n\s*rejectedViews = v;/,
-    "an adoption lets the kept blob go and re-derives the announced slot from the held blob BEFORE it moves (cleared only when the adoption changes it); a rejection keeps this one (the LAST turned away — the connect push is the last frame before caps on the handler's thread); the gate reads the announced seq");
+  assert.match(take, /if \(adoptViews\(sessionViews, v, announcedViewsSeq\)\) \{ announcedViewsSeq = announcedAfter\(sessionViews, v, announcedViewsSeq\); adoptBase\(v\); rejectedViews = null; return true; \}\s*\n\s*rejectedViews = v;/,
+    "an adoption lets the kept blob go and re-derives the announced slot from the held blob BEFORE it moves (cleared only when the adoption changes it; the move is adoptBase, which also carries the strip's pins across a renamed tag); a rejection keeps this one (the LAST turned away — the connect push is the last frame before caps on the handler's thread); the gate reads the announced seq");
   const caps = RENDER.slice(RENDER.indexOf("function onKernelCaps("), RENDER.indexOf("function onUnknownOp("));
-  assert.match(caps, /kernelCaps = new Set\([\s\S]*?\);\n\s*const adopted = capsAdopts\(rejectedViews, m\.viewsSeq\);\n\s*if \(adopted\) sessionViews = rejectedViews;\n\s*announcedViewsSeq = adopted \? null : announcedSeq\(m\.viewsSeq\);\n\s*rejectedViews = null;\n\s*if \(viewsWrites\.length\) \{/,
+  assert.match(caps, /kernelCaps = new Set\([\s\S]*?\);\n\s*const adopted = capsAdopts\(rejectedViews, m\.viewsSeq\);\n\s*if \(adopted && rejectedViews\) adoptBase\(rejectedViews\);\n\s*announcedViewsSeq = adopted \? null : announcedSeq\(m\.viewsSeq\);\n\s*rejectedViews = null;\n\s*if \(viewsWrites\.length\) \{/,
     "the verdict runs on EVERY caps frame, in-flight writes or not, on the frame's viewsSeq, and before the in-flight drop: the dropped copy reverts to the adopted base; the kept blob is let go either way; a frame that adopted nothing leaves the announced seq in the one slot");
   assert.equal((RENDER.match(/announcedViewsSeq = /g) || []).length, 2, "past its declaration the slot is written in exactly two places: the gate's re-derivation on adoption, and the caps frame");
   assert.match(caps, /\} else if \(!adopted\) return;/, "nothing in flight and nothing adopted: the caps frame changes nothing shown");
@@ -235,7 +235,7 @@ test("pins: render.ts posts a writeId on every views write and routes both acks 
 
 test("pins: every views arrival in render.ts goes through the ONE seq-gated adopter, and the exact-echo clear is legacy-only", () => {
   const take = RENDER.slice(RENDER.indexOf("function takeViews("), RENDER.indexOf("\n}\n", RENDER.indexOf("function takeViews(")));
-  assert.match(take, /if \(adoptViews\(sessionViews, v, announcedViewsSeq\)\) \{ announcedViewsSeq = announcedAfter\(sessionViews, v, announcedViewsSeq\); sessionViews = v; rejectedViews = null; return true; \}/, "adopt by write sequence, never by arrival order — or by the seq the caps frame announced; the slot is re-derived from the held blob before it moves");
+  assert.match(take, /if \(adoptViews\(sessionViews, v, announcedViewsSeq\)\) \{ announcedViewsSeq = announcedAfter\(sessionViews, v, announcedViewsSeq\); adoptBase\(v\); rejectedViews = null; return true; \}/, "adopt by write sequence, never by arrival order — or by the seq the caps frame announced; the slot is re-derived from the held blob before it moves, and the move is adoptBase");
   assert.match(take, /what: "views-stale-blob"/, "an ignored blob leaves one breadcrumb per page load — a visible fact, not a flicker");
   assert.doesNotMatch(RENDER, /pendingViewsAge/, "no frame counter anywhere in render.ts");
   const cap = RENDER.slice(RENDER.indexOf("function captureViews("), RENDER.indexOf("\n}\n", RENDER.indexOf("function captureViews(")));
@@ -243,9 +243,14 @@ test("pins: every views arrival in render.ts goes through the ONE seq-gated adop
   assert.match(cap, /if \(pendingSessionViews && v && seqOf\(v\) === null\s*\n\s*&& \(viewsKey\(v\) === viewsKey\(pendingSessionViews\) \|\| \+\+legacyViewsAge >= 3\)\) \{\s*\n\s*pendingSessionViews = null; viewsWrites = \[\]; legacyViewsAge = 0;/,
     "the exact-echo clear and the three-frame yield survive ONLY for a blob without a seq (a kernel that acks nothing); a stamped kernel's frames never clear a write they cannot name");
   assert.equal((cap.match(/>= 3/g) || []).length, 1, "one legacy yield, under the seq-less condition, nowhere else");
-  assert.equal((RENDER.match(/(?<!pending)(?<!\w)sessionViews = /g) || []).length, 2,
-    "the base is assigned in exactly two places: inside the gate, and the caps frame's adoption of the blob the gate last turned away");
-  assert.match(RENDER, /if \(adopted\) sessionViews = rejectedViews;/, "…that second one is the reconnect event's adoption and nothing else");
+  assert.equal((RENDER.match(/(?<!pending)(?<!\w)sessionViews = /g) || []).length, 1,
+    "the base is assigned in exactly one place — adoptBase, which also carries the tab strip's pins across a renamed tag (tab-groups.ts followAdoption)");
+  const adopt = RENDER.slice(RENDER.indexOf("function adoptBase("), RENDER.indexOf("function captureViews("));
+  assert.match(adopt, /const prev = sessionViews;\s*\n\s*sessionViews = v;\s*\n\s*const unions = viewTagUnion\(v\);[\s\S]*followAdoption\(st, prev, v, unions\);\s*\n\s*if \(next !== st\) writeTabGroups\(next\);/,
+    "the held blob is taken before the base moves and the follow reads the renames against it, and the base moves before any store write (its TABGROUPS_EVENT render reads the new blob)");
+  assert.equal((RENDER.match(/(?<!function )adoptBase\(/g) || []).length, 2,
+    "reached from exactly two places: inside the gate, and the caps frame's adoption of the blob the gate last turned away");
+  assert.match(RENDER, /if \(adopted && rejectedViews\) adoptBase\(rejectedViews\);/, "…that second one is the reconnect event's adoption and nothing else");
 });
 
 test("pins: the Tags flyout's local edits are targeted ops on ONE optimistic blob; a MOVE is two ops, one blob", () => {

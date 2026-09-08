@@ -68,8 +68,15 @@ surface (the tag button in the strip narrows the tabs to the tags you pick), and
 the tabs: as soon as any session carries a tag, the strip shows one section per tag, in your
 tag order, each with a header in the tag's color, and the untagged sessions after a divider
 at the end. A session with several tags sits under the first of them in your tag order; its
-other tags still filter. Click a header to fold that section down to a count, plus one pip
-when a member is working or waiting on you; the section of the tab you are reading never
+other tags still filter. Each header shows a chevron, the tag's color, its name, and a
+member count. Click a header, or press Enter on it, to fold its section down to the header
+alone; the count then says how many tabs are folded away, and a small dot after it says when
+one of them is working or waiting on you (hover it for their names). To keep one tab visible
+while its section is folded, right-click the tab and pick **Show when folded** under **Tags**;
+the header's count then leaves that tab out; when every tab in a section is set to
+show, the folded header shows the full count and its tooltip says nothing is hidden. Pick it
+again to fold the tab with the rest. A tab set to show when folded keeps that setting when its
+group is renamed. The section of the tab you are reading never
 folds (its header says so, and a click there changes nothing), and the `archived` section
 starts folded. Drag a header to reorder the groups, which
 reorders the tags on every surface (the timeline's tag table shows the same order). To move

@@ -192,6 +192,35 @@ class LateApply(unittest.TestCase):
         self.assertEqual(self.forwarded, [])
         self.assertEqual(len(km._pending_tag_rows()), 1)
 
+    def test_a_changed_reading_marks_the_views_dirty_with_nothing_retired(self):
+        """The apply's fresh read stored the reading BARE, and _mark_views_dirty fired only when a row
+        retired. With rows pending and every forward failing, the apply's re-read is the pass's only real
+        read (it stamps the poll gate, so the supervisor's own poll serves the cache), so a change seen
+        there reached the feed and timeline a cache bucket late and woke no one. The reading goes through
+        _cache_remote_views now: a change marks and wakes, an equal re-read does neither."""
+        self._rule({"delete": True})
+        dirty = km._views_dirty[0]
+        km._views_dirty[0] = 0.0
+        km._pusher_wake.clear()
+        try:
+            km._remote_forward = lambda r, path, body: None          # the transport fails, pass after pass
+            changed = [_remote_tag("g100", "web"), _remote_tag("g200", "api")]   # another tag appeared there
+            self._host_answers(changed)
+            self.assertEqual(km._apply_pending_tag_edits(self.r), 0)
+            self.assertEqual(len(km._pending_tag_rows()), 1, "nothing retired: the only path that used to mark")
+            self.assertEqual(self.r["views"], {"tags": changed}, "the fresh reading is cached")
+            self.assertGreater(km._views_dirty[0], 0.0, "…and marked dirty: the cached feed and timeline builds rebuild past it")
+            self.assertTrue(km._pusher_wake.is_set(), "…and the pusher is woken")
+            km._views_dirty[0] = 0.0
+            km._pusher_wake.clear()
+            self._host_answers(list(changed))                         # the next pass: equal content, a new object
+            self.assertEqual(km._apply_pending_tag_edits(self.r), 0)
+            self.assertEqual(km._views_dirty[0], 0.0, "an unchanged re-read is not news")
+            self.assertFalse(km._pusher_wake.is_set())
+        finally:
+            km._views_dirty[0] = dirty
+            km._pusher_wake.clear()
+
 
 class MtimeStamp(unittest.TestCase):
     """The v2 per-tag mtime: stamped at the store's ONE write door, only when the tag changed."""
@@ -245,6 +274,100 @@ class Visibility(unittest.TestCase):
                       "the immediate refusal stays AND says the intent persists (both WS and /tag)")
         self.assertEqual(src.count("queued: it applies when %s reattaches"), 2,
                          "both failure doors carry the wording (WS editTag + POST /tag --host)")
+
+
+class HostSeqRidesTheRows(unittest.TestCase):
+    """Every remoteTags row carries its host's OWN views store's write seq, read off the cached /views
+    reading (a kernel stamps `seq` on its blob since 2026-09-05). A remote rename rides this kernel's
+    blob with no change to the local `seq`, so a client ordering what a blob says about a remote tag —
+    the tab strip's rename follow, which stands down on a blob older than its memory's evidence — needs
+    the host's. A host that stamps none puts none on the row, and the local blob's own `seq` stays the
+    local store's."""
+
+    def tearDown(self):
+        km._remotes.clear()
+
+    def _rows(self):
+        return [t for t in km._views_client().get("remoteTags") or [] if t["host"] == HOST]
+
+    def test_a_stamped_reading_stamps_every_row_of_the_host(self):
+        _attach(views={"seq": 1757000000123, "tags": [_remote_tag("g100", "web"), _remote_tag("g200", "api")]})
+        rows = self._rows()
+        self.assertEqual([t["name"] for t in rows], ["web", "api"])
+        self.assertEqual([t["seq"] for t in rows], [1757000000123, 1757000000123], "the host's seq, not a per-tag one")
+        local_seq = km._views_client().get("seq")
+        self.assertNotEqual(local_seq, 1757000000123, "the local blob's seq is the local store's, untouched")
+
+    def test_an_unstamped_or_junk_seq_puts_none_on_the_row(self):
+        for bad in (None, 0, -4, True, "1757000000123", 1.5, {"n": 1}):
+            with self.subTest(seq=bad):
+                views = {"tags": [_remote_tag("g100", "web")]}
+                if bad is not None:
+                    views["seq"] = bad
+                _attach(views=views)
+                rows = self._rows()
+                self.assertEqual(len(rows), 1)
+                self.assertNotIn("seq", rows[0], "an older host stamps none; junk is not a seq")
+
+
+class SupervisorViewsCache(unittest.TestCase):
+    """_cache_remote_views: the supervisor's store of a host's /views reading marks the views dirty and
+    wakes the pusher when the reading CHANGED — a pane receives a remote host's tags only on the views
+    blob the pusher ships, and a silent store left a reattached host's tags trailing its tabs by a
+    pusher cycle. An unchanged reading is not news."""
+
+    def setUp(self):
+        self.r = _attach(views={"tags": [_remote_tag("g100", "web")]})
+        self._dirty = km._views_dirty[0]
+        km._views_dirty[0] = 0.0
+        km._pusher_wake.clear()
+
+    def tearDown(self):
+        km._views_dirty[0] = self._dirty
+        km._pusher_wake.clear()
+        km._remotes.clear()
+
+    def test_a_changed_reading_is_stored_and_marks_the_views_dirty(self):
+        new = {"tags": [_remote_tag("g100", "api")]}
+        self.assertTrue(km._cache_remote_views(self.r, new))
+        self.assertEqual(self.r["views"], new)
+        self.assertGreater(km._views_dirty[0], 0.0, "the dirty mark moved: the cached feed and timeline rebuild past it")
+        self.assertTrue(km._pusher_wake.is_set(),
+                        "...and the pusher is woken, so the tabOrder frame carrying the tags ships on its next cycle")
+
+    def test_the_first_reading_of_a_fresh_row_counts_as_a_change(self):
+        r = _attach()                                        # no cached views yet: the reattach's first pass
+        self.assertTrue(km._cache_remote_views(r, {"tags": []}))
+        self.assertEqual(r["views"], {"tags": []})
+        self.assertTrue(km._pusher_wake.is_set())
+
+    def test_an_unchanged_reading_stores_nothing_and_wakes_no_one(self):
+        same_object = self.r["views"]                        # what the poll's rate gate hands back
+        self.assertFalse(km._cache_remote_views(self.r, same_object))
+        self.assertFalse(km._cache_remote_views(self.r, {"tags": [_remote_tag("g100", "web")]}),
+                         "a re-read that parses equal is not news either")
+        self.assertFalse(km._cache_remote_views(self.r, None),
+                         "no reading this pass (the host down, or its first read failed): the cache stands")
+        self.assertEqual(self.r["views"], {"tags": [_remote_tag("g100", "web")]})
+        self.assertEqual(km._views_dirty[0], 0.0)
+        self.assertFalse(km._pusher_wake.is_set())
+
+    def test_every_store_of_a_reading_goes_through_the_cache(self):
+        """A first cut routed the supervisor's own store through the helper and this test read the
+        supervisor's source alone, while _apply_pending_tag_edits (called from the same pass) and
+        _forward_tag_edit still stored bare. The WHOLE module is scanned: the one `["views"] =` is the
+        helper's own, and every reader of a host's /views calls it."""
+        import inspect
+        import re
+        store = re.compile(r"""\[["']views["']\]\s*=(?!=)""")
+        src = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
+        helper = inspect.getsource(km._cache_remote_views)
+        self.assertEqual(len(store.findall(helper)), 1, "the helper stores once")
+        self.assertEqual(len(store.findall(src)), 1,
+                         "a bare r[\"views\"] = … outside _cache_remote_views: route it through the helper")
+        self.assertNotRegex(src, r"""(setdefault|update)\(\s*\{?\s*["']views["']""", "no store by another spelling")
+        for fn in (km._tunnel_supervisor, km._apply_pending_tag_edits, km._forward_tag_edit):
+            self.assertIn("_cache_remote_views(r, ", inspect.getsource(fn), fn.__name__)
 
 
 if __name__ == "__main__":

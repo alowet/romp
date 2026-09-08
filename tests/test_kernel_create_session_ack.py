@@ -85,3 +85,58 @@ class CreateSessionAckFast(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TagsLandBeforeTheDirectPush(unittest.TestCase):
+    """Tab groups on tags (#1007): a child created with a parent and named tags carries them BEFORE the
+    direct push, so the first tabOrder frame already sections the new tab. Both real create paths are
+    executed here — the SDK one and the Codex one — with the push stubbed to snapshot the child's tag
+    names AT push time; moving the tag step after the push (or dropping it) fails these. Synthetic
+    sids and tag names only."""
+    PARENT = "66666666-7777-4888-8999-000000000000"
+    CHILD_SDK = "11111111-2222-3333-4444-555555555555"
+    CHILD_CODEX = "22222222-3333-4444-5555-666666666666"
+
+    class _FakeCodex:
+        def __init__(self, sid):
+            self.sid = sid
+        def spawn(self, nm, cwd, bg="", fg="", *a, **kw):
+            return self.sid
+        def live_sessions(self):
+            return {}
+
+    def setUp(self):
+        self.at_push = {}
+        self._saved = {n: getattr(km, n) for n in
+                       ("_sdk", "_codex", "_reveal_chat_for", "_mark_views_dirty", "_push_all", "_push_session_now")}
+        km._sdk = lambda: _FakeSdk()
+        km._codex = lambda: self._FakeCodex(self.CHILD_CODEX)
+        km._reveal_chat_for = lambda c, m: None
+        km._mark_views_dirty = lambda: None
+        km._push_all = lambda: None
+        km._push_session_now = lambda sid: self.at_push.__setitem__(str(sid), self._tags_of(sid))
+        # a clean tag store holding one tag with the parent in it
+        km._set_timeline_views({"tags": [], "order": []} if "order" in km._timeline_views() else {"tags": []})
+        km._edit_tag("alpha", add=[self.PARENT])
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(km, n, v)
+
+    @staticmethod
+    def _tags_of(sid):
+        return sorted(t["name"] for t in km._timeline_views()["tags"]
+                      if any(m["host"] == "" and m["sid"] == str(sid) for m in t["members"]))
+
+    def test_an_sdk_child_is_in_its_parents_tag_and_the_named_one_when_its_tab_is_pushed(self):
+        sid, extra = km._create_sdk_session("child", "/tmp", parent=self.PARENT, tags=("beta",))
+        self.assertEqual(sid, self.CHILD_SDK)
+        self.assertEqual(self.at_push.get(sid), ["alpha", "beta"],
+                         "inherited + named tags are in the store BEFORE the direct push, not a cycle later")
+        self.assertEqual(sorted(extra["tags"]), ["alpha", "beta"], "and the ack echoes the same names")
+
+    def test_a_codex_child_is_in_its_parents_tag_and_the_named_one_when_its_tab_is_pushed(self):
+        sid, extra = km._create_codex_session_inner("child2", "/tmp", parent=self.PARENT, tags=("beta",))
+        self.assertEqual(sid, self.CHILD_CODEX)
+        self.assertEqual(self.at_push.get(sid), ["alpha", "beta"])
+        self.assertEqual(sorted(extra["tags"]), ["alpha", "beta"])
