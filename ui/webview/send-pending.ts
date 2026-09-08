@@ -136,15 +136,21 @@ export const foreignKey = (s: string): string => {
 };
 /** Whether a user event carries `text` (on the foreignKey) in its md or any of its blocks — a record the CLI
  *  wrote from several queued messages taken at one boundary lists each as a block (T252b review). */
-const carriesText = (e: TailEvent, text: string): boolean => {
-  if (e.kind !== "user" || isOptimisticUuid(e.uuid)) return false;
+const carriesText = (e: TailEvent, text: string): boolean => carriedCopies(e, text) > 0;
+/** How many copies of `text` (on the foreignKey) a user event carries: one when its md IS the text, else one per
+ *  matching block — a record the CLI wrote from several queued messages taken at one boundary is as many copies
+ *  as it has matching blocks, the shape textCopies reads for this client's own sends (fourth review). */
+const carriedCopies = (e: TailEvent, text: string): number => {
+  if (e.kind !== "user" || isOptimisticUuid(e.uuid)) return 0;
   const k = foreignKey(text);
   // an image-only text keys to nothing: only an event that carries images can be its carrier — a reminders-only
   // user record (a task notification landed mid-turn, md "") is not (the kernel's own by-text prune refuses an
   // empty key the same way; third review)
-  if (!k) return Array.isArray(e.images) && e.images.length > 0 && (!e.md || !foreignKey(e.md));
-  if (typeof e.md === "string" && foreignKey(e.md) === k) return true;
-  return Array.isArray(e.blocks) && e.blocks.some((b) => typeof b === "string" && foreignKey(b) === k);
+  if (!k) return Array.isArray(e.images) && e.images.length > 0 && (!e.md || !foreignKey(e.md)) ? 1 : 0;
+  if (typeof e.md === "string" && foreignKey(e.md) === k) return 1;
+  let n = 0;
+  if (Array.isArray(e.blocks)) for (const b of e.blocks) if (typeof b === "string" && foreignKey(b) === k) n++;
+  return n;
 };
 
 /** `text` with its shipped image paths removed (quoted or bare, however the composer joined them). */
@@ -399,9 +405,9 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
     for (const q of list.slice(i + 1)) {
       if (!q.floors) q.floors = [];
       if (q.floors.some((f) => f.uuid === u)) continue;
-      const text = typeof events[at].md === "string" ? events[at].md : undefined;
+      const text = owner.text;   // the earlier SEND's own text — a record of several sends carries it as a block, and its md is the blocks joined
       let ord = 0;
-      if (text !== undefined && q.at) for (let j = scanFrom(events, q.at); j <= at; j++) if (carriesText(events[j], text)) ord++;
+      if (q.at) for (let j = scanFrom(events, q.at); j <= at; j++) ord += carriedCopies(events[j], text);
       q.floors.push({ uuid: u, text, ord });
     }
   };
@@ -537,7 +543,12 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
   // LATER copy of the same words; -1 when fewer than k have landed
   const kthCarrier = (text: string, k: number): { idx: number; count: number } => {
     let n = 0, last = -1;
-    for (let j = base; j < events.length; j++) if (carriesText(events[j], text)) { n++; last = j; if (n === k) return { idx: j, count: n }; }
+    for (let j = base; j < events.length; j++) {
+      const c = carriedCopies(events[j], text);
+      if (!c) continue;
+      n += c; last = j;
+      if (n >= k) return { idx: j, count: n };
+    }
     return { idx: last, count: n };
   };
   // an earlier pending send's echo or landed atom: below it, whatever its text — by uuid, else by its text's ordinal
@@ -556,14 +567,22 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
     let groupIdx = -1;
     for (let j = events.length - 1; j >= base; j--) if (events[j].kind === "queued") { groupIdx = j; break; }
     for (const { text, n: copies } of counts.values()) {
-      const resident = ((at.queuedResident || {})[foreignKey(text)] || []).filter((u) => events.some((e) => e.uuid === u)).length;
-      const n = copies + resident;   // the carriers resident at the press, while still present, come first
+      const key = foreignKey(text);
+      const residents = (at.queuedResident ||= {})[key] ||= [];
+      // The kernel's queued copies carry no identity, so which landing is the press-time copy's is read off the
+      // GROUP (fourth review): while it still shows a copy of the key, the press-time copy has not landed, so every
+      // carrier landed so far was someone else's — an identical text the kernel had already forwarded (canned
+      // texts: the Continue button, a retry, a repeated nudge) — and is learned as a resident, so the count keeps
+      // looking past it. The cost, stated: a same-text copy another client queues after the press-time one landed
+      // reads as the press-time one and keeps this bubble below it until this send lands. A stamp on each queued
+      // copy would make the reading exact.
+      const groupShows = groupIdx >= 0 && (events[groupIdx].texts || []).some((t) => typeof t.md === "string" && !t.hiddenByPending && foreignKey(t.md) === key);
+      if (groupShows) for (let j = base; j < events.length; j++) { const e = events[j]; if (e.uuid && carriedCopies(e, text) && !residents.includes(e.uuid)) residents.push(e.uuid); }
+      const resident = residents.reduce((acc, u) => { const e = events.find((x) => x.uuid === u); return acc + (e ? carriedCopies(e, text) : 0); }, 0);
+      const n = copies + resident;   // the carriers resident at the press, and those learned since, come first
       const k = kthCarrier(text, n);
       let floor = k.idx >= 0 ? k.idx + 1 : -1;
-      if (k.count < n && groupIdx >= 0) {
-        const g = events[groupIdx];
-        if ((g.texts || []).some((t) => typeof t.md === "string" && !t.hiddenByPending && foreignKey(t.md) === foreignKey(text))) floor = Math.max(floor, groupIdx + 1);
-      }
+      if (groupShows) floor = Math.max(floor, groupIdx + 1);
       if (floor > idx) idx = floor;
     }
   }
