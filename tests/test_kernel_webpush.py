@@ -152,7 +152,8 @@ const LOG = [];          // every call the worker makes, in order
 global.self = {
   addEventListener: (k, f) => { H[k] = f; },
   skipWaiting: () => {},
-  registration: { showNotification: (title, opts) => { LOG.push(['show', title, opts]); return Promise.resolve(); } },
+  registration: { showNotification: (title, opts) => { LOG.push(['show', title, opts]); return Promise.resolve(); },
+                  update: () => { LOG.push(['update']); return Promise.resolve(); } },
   navigator: {},         // no setAppBadge here: the numeric-only badge rule has its own pin
 };
 global.clients = {
@@ -187,12 +188,16 @@ async function tap(data, windows) {
 (async () => {
   const out = {};
   const data = { sid: 'S1', host: '', kind: 'card', cardId: 'S1:g1', url: '/?push-reveal=S1&push-card=S1%3Ag1' };
+  let pushWait = null;
   H.push({ data: { json: () => ({ title: 'romp: web', body: 'Needs you: x', sid: 'S1', tag: 'romp:S1', badge: 2, data }) },
-           waitUntil: () => { out.pushWaited = true; } });
+           waitUntil: (p) => { out.pushWaited = true; pushWait = p; } });
+  out.pushSync = LOG.slice();          // before the handler yields: the show, and nothing racing it
+  await pushWait;                      // the whole push, as the browser waits for it
   out.push = LOG.slice();
   LOG.length = 0;
-  H.push({ data: { json: () => ({ title: 't', body: 'b', sid: 'S9' }) }, waitUntil: () => {} });   // an older kernel's flat payload
+  H.push({ data: { json: () => ({ title: 't', body: 'b', sid: 'S9' }) }, waitUntil: (p) => { pushWait = p; } });   // an older kernel's flat payload
   out.pushLegacy = LOG.slice();
+  await pushWait;                      // its update lands here, not inside the next tap's log
   out.live = await tap(data, [win(true)]);
   out.cold = await tap(data, []);
   out.refused = await tap(data, [win(false)]);
@@ -207,6 +212,15 @@ async function tap(data, windows) {
   out.nested = await tap(fed, [frame('chat', 'nested'), frame('feed', 'nested'), frame('shell', 'top-level')]);
   out.nestedOnly = await tap(fed, [frame('chat', 'nested')]);   // a pane with no shell above it: nothing to post to
   out.untyped = await tap(fed, [frame('old', undefined)]);       // a browser that reports no frameType is a window
+  // the cold start's second road (2026-09-08): the window openWindow hands back is given the routing block too
+  const opened = { postMessage: (m) => LOG.push(['post', 'opened', m]) };
+  const openWindow0 = global.clients.openWindow;
+  global.clients.openWindow = (u) => { LOG.push(['openWindow', u]); return Promise.resolve(opened); };
+  out.coldHanded = await tap(data, []);
+  out.testHanded = await tap({ sid: '', host: '', kind: 'test', cardId: '', url: '/' }, []);   // nothing to land on: nothing posted
+  global.clients.openWindow = (u) => { LOG.push(['openWindow', u]); return Promise.resolve(null); };
+  out.coldNull = await tap(data, []);                              // no client back: the link alone, no throw
+  global.clients.openWindow = openWindow0;
   console.log(JSON.stringify(out));
 })();
 """
@@ -242,6 +256,21 @@ class ServiceWorkerExecutes(unittest.TestCase):
         legacy = self.out["pushLegacy"][0][2]
         self.assertEqual(legacy["data"], {"sid": "S9"})
         self.assertNotIn("tag", legacy)
+
+    def test_the_push_refreshes_the_worker_once_the_notification_shows(self):
+        # the phone (2026-09-08): an installed app left in the background checks for a new worker only on
+        # a navigation, so every tap after a deploy ran the OLD handler. The push itself now asks for the
+        # update — after the show, so the notification a push must produce is never raced by the takeover
+        self.assertEqual([x[0] for x in self.out["pushSync"]], ["show"])
+        self.assertEqual([x[0] for x in self.out["push"]], ["show", "update"])
+        self.assertEqual([x[0] for x in self.out["pushLegacy"]], ["show"], "the legacy payload's push refreshes too, after its show")
+
+    def test_a_cold_start_also_hands_the_opened_window_the_routing_block(self):
+        # a message to a window whose page has no listener yet is held by the browser until the shell adds
+        # one — the second road for a browser that opens the app on its start URL instead of the link
+        self.assertEqual(self.out["coldHanded"]["log"], [["close"], self.MATCH, ["openWindow", self.URL], ["post", "opened", self.MSG]])
+        self.assertEqual(self.out["coldNull"]["log"], [["close"], self.MATCH, ["openWindow", self.URL]])
+        self.assertEqual(self.out["testHanded"]["log"], [["close"], self.MATCH, ["openWindow", "/"]])
 
     def test_a_live_window_is_focused_and_told_never_reopened(self):
         live = self.out["live"]
@@ -737,6 +766,21 @@ class RevealRoute(unittest.TestCase):
         self.assertEqual(twin_got, [])
         self.assertEqual(km._PENDING_REVEAL[0], {"sid": "SID-x", "wid": "W-x"})
 
+    def test_every_tap_leaves_a_line_in_the_kernel_log(self):
+        # 2026-09-08: a phone's tap "did nothing" and nothing recorded whether it had reached the kernel.
+        # The route logs the road the shell names, the flags and the outcome; the park's end logs too.
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            code, _ = self._post("/reveal", {"sid": "SID-x", "wid": "W-x", "via": "link", "boot": True})
+            pane, got = _fake_ws_client("chat", "W-x")
+            km._consume_pending_reveal(pane)
+        self.assertEqual(code, 200)
+        lines = [l for l in buf.getvalue().splitlines() if l.startswith("[reveal]")]
+        self.assertEqual(lines, ["[reveal] link sid=SID-x wid=W-x boot: parked",
+                                 "[reveal] sid=SID-x wid=W-x: consumed — the pane's ready"])
+        self.assertEqual(len(got), 1)
+
 
 class Badge(unittest.TestCase):
     """Proposal 3: the app icon wears the needs-you count."""
@@ -767,6 +811,7 @@ class LandingRevealPins(unittest.TestCase):
     def test_shell_carries_both_halves_of_the_tap(self):
         html = km._landing()
         self.assertIn("m.romp==='notificationClick'", html)   # live window: the SW's message
+        self.assertIn("m.romp==='pushReveal'", html)          # …or the shape a worker of an older build posts (2026-09-08)
         self.assertIn("searchParams.get('push-reveal')", html)  # cold start: the deep link's params…
         self.assertIn("searchParams.get('push-card')", html)
         self.assertIn("searchParams['delete']('push-reveal')", html)   # …stripped once read
@@ -830,6 +875,9 @@ const winMsg = (m) => WIN.forEach((f) => f({ data: m }));
   FETCHES.length = 0; POSTED.length = 0;
   swMsg({ romp: 'notificationClick', sid: 'S5', host: '', kind: 'test', cardId: '' });   // a test addressed to the session in front (2026-09-06)
   out.testSid = { fetches: FETCHES.slice(), posted: POSTED.slice() };
+  FETCHES.length = 0; POSTED.length = 0;
+  swMsg({ romp: 'pushReveal', sid: 'S6' });                                             // the worker of builds before 2026-09-06, still installed on a phone
+  out.legacy = { fetches: FETCHES.slice(), posted: POSTED.slice() };
   fetchOk = false; FETCHES.length = 0;
   swMsg({ romp: 'notificationClick', sid: 'S-bad', kind: 'turn' });
   await tick(); await tick();
@@ -857,7 +905,7 @@ class LandingRevealExecutes(unittest.TestCase):
         b = self.out["boot"]
         # boot:true — this page is booting, so its own chat pane is not connected yet; the kernel
         # parks for it rather than aiming at a same-wid socket the previous page left behind
-        self.assertEqual(b["fetches"], [["/reveal", {"sid": "S1", "wid": "W-test", "boot": True}]])
+        self.assertEqual(b["fetches"], [["/reveal", {"sid": "S1", "wid": "W-test", "via": "link", "boot": True}]])
         self.assertEqual(b["replaced"], ["/?keep=1#frag"], "only OUR params go; a reload must not replay the jump")
 
     def test_the_card_waits_for_the_feeds_own_ready(self):
@@ -868,7 +916,7 @@ class LandingRevealExecutes(unittest.TestCase):
 
     def test_a_live_tap_routes_the_same_way(self):
         live = self.out["live"]
-        self.assertEqual(live["fetches"], [["/reveal", {"sid": "S2", "wid": "W-test"}]])
+        self.assertEqual(live["fetches"], [["/reveal", {"sid": "S2", "wid": "W-test", "via": "sw"}]])
         self.assertEqual(live["posted"], [{"romp": "revealCard", "itemId": "S2:g4", "sid": "S2"}])
 
     def test_a_turn_focuses_without_a_card_and_a_sidless_test_lands_nowhere(self):
@@ -878,7 +926,12 @@ class LandingRevealExecutes(unittest.TestCase):
 
     def test_a_test_addressed_to_a_session_reveals_it_like_a_turn(self):
         # the user 2026-09-06: ANY sid lands, whatever the kind; only a card adds the card scroll
-        self.assertEqual(self.out["testSid"], {"fetches": [["/reveal", {"sid": "S5", "wid": "W-test"}]], "posted": []})
+        self.assertEqual(self.out["testSid"], {"fetches": [["/reveal", {"sid": "S5", "wid": "W-test", "via": "sw"}]], "posted": []})
+
+    def test_a_stale_workers_tap_still_lands(self):
+        # the worker of builds before 2026-09-06 posts {romp:'pushReveal', sid}; a phone keeps running it
+        # until a navigation refreshes it (2026-09-08) — the shell reads that shape too, never a silent miss
+        self.assertEqual(self.out["legacy"], {"fetches": [["/reveal", {"sid": "S6", "wid": "W-test", "via": "sw"}]], "posted": []})
 
     def test_a_refused_reveal_is_loud(self):
         self.assertEqual(self.out["refused"]["notes"],

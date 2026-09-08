@@ -39570,7 +39570,17 @@ var opts={body:d.body||'',icon:'/media/romp-app-192.png',badge:'/media/romp-app-
 data:(d.data&&typeof d.data==='object')?d.data:{sid:d.sid||''}};
 if(d.tag){opts.tag=d.tag;opts.renotify=!d.quiet;}   // a quiet push replaces without re-alerting
 if(d.quiet)opts.silent=true;
-var work=[self.registration.showNotification(d.title||'romp',opts)];
+var shown=self.registration.showNotification(d.title||'romp',opts);
+// Refresh THIS worker once the notification is up (2026-09-08, the phone again: a tap after a deploy
+// still did nothing). A Home Screen app left in the background checks for a new worker only on a
+// navigation — a relaunch or a reload — so until then every tap ran the worker the phone installed
+// LAST, whose handler could post a shape the current shell no longer reads. update() fetches /sw.js
+// now; the install above takes over at once, and the tap that follows runs the current handler.
+// After the show, never beside it: the notification is what a push must produce, and a takeover
+// while it is still pending would race it. A failure (offline, a browser without update() here) is
+// swallowed — the notification already shows. `shown` itself stays in the list, so a show that fails
+// still fails the push the way it always did.
+var work=[shown,shown.then(function(){return self.registration.update?self.registration.update():null;})['catch'](function(){})];
 // the app-icon count, kept current while the app is CLOSED (the open shell re-paints it live over
 // its own WS). setAppBadge exists in the SW only where badging works at all (iOS installed apps).
 // Numeric-only on purpose: a mirrored federated event omits badge (the ORIGIN kernel's count is
@@ -39598,7 +39608,13 @@ e.notification.close();
 var d=e.notification.data||{};var sid=d.sid||'';
 var url=d.url||(sid?'/?push-reveal='+encodeURIComponent(sid):'/');
 var msg={romp:'notificationClick',sid:sid,host:d.host||'',kind:d.kind||'',cardId:d.cardId||''};
-function open(){return clients.openWindow(url);}
+// The window openWindow hands back is ALSO given the routing block (2026-09-08): a message posted to a
+// window client before its page has a listener is held by the browser until the shell adds one, so it
+// lands exactly like a live tap's — a second road to the same focus for a browser that opens the app
+// on its start URL rather than the link (reported of installed iOS apps; unverified here). Where the
+// link arrives too, the kernel sees the same focus asked twice for the same window — idempotent. No
+// client back (null), or nothing to land on (no sid) → the link alone.
+function open(){return clients.openWindow(url).then(function(c){if(sid&&c&&typeof c.postMessage==='function'){try{c.postMessage(msg);}catch(err){}}return c;});}
 function shell(w){return !w.frameType||w.frameType==='top-level'||w.frameType==='auxiliary';}
 e.waitUntil(clients.matchAll({type:'window',includeUncontrolled:true}).then(function(ws){
 var tops=ws.filter(shell);
@@ -39639,7 +39655,7 @@ def _reveal_msg(sid):
     return {"type": "focus", "id": sid, "live": True}
 
 
-def _reveal_request(sid, wid, boot=False):
+def _reveal_request(sid, wid, boot=False, via=""):
     """POST /reveal: aim the focus at the dashboard whose wid asked. Its chat pane already
     connected → deliver now; not yet (the cold-start norm — the shell's fetch beats the iframe's
     WS) → park for _consume_pending_reveal. Returns whether it was delivered immediately.
@@ -39659,7 +39675,15 @@ def _reveal_request(sid, wid, boot=False):
               (_note_ws_inbound — the focus frame is ordered behind the ping it answers); a dead
               socket never pongs, the pane redials, and its ready consumes the copy instead of
               finding nothing. A socket with no ping outstanding is proven: nothing parked, so a
-              later ready never replays a landed tap."""
+              later ready never replays a landed tap.
+
+    One stderr line per tap, whatever became of it (2026-09-08: a phone's tap "did nothing" and
+    nothing anywhere recorded whether it had even reached the kernel). `via` is the road the shell
+    says the tap took ('sw': the worker's message to a live window; 'link': the deep link a cold start
+    opened); _consume_pending_reveal and _reveal_proven log a park's end the same way, so the journal
+    answers the next such report: no line — the worker never posted or opened; parked and never
+    consumed — the pane's ready never came for that wid; consumed — the pane got it. Ids clipped:
+    enough to match rows, not a transcript of anything."""
     with _clients_lock:
         targets = [] if boot else [c for c in _clients if c["app"] == "chat" and (c.get("wid") or "") == wid]
     delivered, sent = False, []
@@ -39675,6 +39699,9 @@ def _reveal_request(sid, wid, boot=False):
         _PENDING_REVEAL[0] = {"sid": str(sid), "wid": str(wid or "")}
     elif sent:
         _PENDING_REVEAL[0] = {"sid": str(sid), "wid": str(wid or ""), "sent": sent}
+    outcome = ("delivered, copy parked (target unproven)" if sent else "delivered") if delivered else "parked"
+    print("[reveal] %s sid=%s wid=%s%s: %s" % (via or "shell", str(sid)[:8], str(wid or "")[:8],
+                                             " boot" if boot else "", outcome), file=sys.stderr)
     return delivered
 
 
@@ -39684,6 +39711,7 @@ def _reveal_proven(client):
     p = _PENDING_REVEAL[0]
     if p and any(c is client for c in (p.get("sent") or ())):
         _PENDING_REVEAL[0] = None
+        print("[reveal] sid=%s: copy retired — its target answered" % str(p["sid"])[:8], file=sys.stderr)
 
 
 def _consume_pending_reveal(client):
@@ -39697,6 +39725,7 @@ def _consume_pending_reveal(client):
     if p["wid"] and (client.get("wid") or "") != p["wid"]:
         return
     _PENDING_REVEAL[0] = None
+    print("[reveal] sid=%s wid=%s: consumed — the pane's ready" % (str(p["sid"])[:8], str(p["wid"] or "")[:8]), file=sys.stderr)
     try:
         client["send"](json.dumps(_reveal_msg(p["sid"])))
     except Exception:
@@ -42930,7 +42959,11 @@ if(!isOn)testOut.textContent+=" Real notifications won't arrive until the main s
 # answers a live session with the focus (chat pane connected → delivered now; not yet → parked for
 # that wid and consumed on the pane's ready — the exact event, no delay heuristics) and a dead or
 # unknown one with the revive prompt (_reveal_msg), so no sid ever ends in a silent no-op.
-#  - live window: the SW focused us and posted {romp:'notificationClick', sid, host, kind, cardId}.
+#  - live window: the SW focused us and posted {romp:'notificationClick', sid, host, kind, cardId}
+#    — or {romp:'pushReveal', sid}, the shape the worker of builds before 2026-09-06 posts: a phone runs
+#    the worker it installed last until a navigation refreshes it, so that tap lands too (2026-09-08,
+#    when a tap after a deploy still did nothing). The worker now refreshes itself on every push, but
+#    only once a phone has THAT worker.
 #  - cold start: the SW opened the kernel's deep link '/?push-reveal=<sid>[&push-card=<id>]'. The
 #    params are stripped (history.replaceState) the moment they are read, so a manual reload later
 #    does not replay the jump. This arrival POSTs boot:true — the page is booting, so its chat pane
@@ -42946,7 +42979,9 @@ if(!isOn)testOut.textContent+=" Real notifications won't arrive until the main s
 # looking at when they pressed the button (2026-09-06) and comes back to it exactly like a turn's;
 # only a card kind adds the card scroll. A sid-less tap (a test pressed with no session in front)
 # has nowhere to land: the SW's focus/openWindow was the whole action. A /reveal the kernel refuses
-# lands in the Log rather than vanishing.
+# lands in the Log rather than vanishing. Each /reveal names the road the tap took (via: 'sw' — the
+# worker's message; 'link' — the deep link), and the kernel logs it with the outcome: the evidence a
+# "the tap did nothing" report needs, of which there was none (2026-09-08).
 # Its own <script>, like every shell behaviour (test_kernel_mobile's count pin): a throw in the
 # bell's script must not strand a tap, and a bell that bails where the Push API is missing must
 # not take the deep-link half with it.
@@ -42961,20 +42996,22 @@ try{f&&f.contentWindow&&f.contentWindow.postMessage({romp:'revealCard',itemId:it
 window.addEventListener('message',function(e){var m=e&&e.data;
 if(!(m&&m.romp==='ready'&&m.app==='feed'))return;
 feedReady=true;if(pendingCard){var c=pendingCard;pendingCard=null;revealCard(c.itemId,c.sid);}});
-function land(sid,kind,cardId,boot){
-var body={sid:sid,wid:wid()};if(boot)body.boot=true;   // booting: our chat pane is not connected yet — park for it
+function land(sid,kind,cardId,boot,via){
+var body={sid:sid,wid:wid(),via:via};if(boot)body.boot=true;   // booting: our chat pane is not connected yet — park for it; via: which road the tap took, for the kernel's log line
 if(sid)fetch('/reveal',{method:'POST',body:JSON.stringify(body)}).then(function(r){
 if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});})['catch'](fail);
 if(sid&&kind==='card'&&cardId)revealCard(cardId,sid);}
 if('serviceWorker' in navigator&&navigator.serviceWorker&&navigator.serviceWorker.addEventListener){
 navigator.serviceWorker.addEventListener('message',function(ev){var m=ev&&ev.data;
-if(m&&m.romp==='notificationClick')land(String(m.sid||''),String(m.kind||''),String(m.cardId||''),false);});}
+// notificationClick: this build's worker. pushReveal: the worker of builds before 2026-09-06, which a phone
+// keeps running until a navigation refreshes it — its tap must land too, not arrive in a shape nobody reads.
+if(m&&(m.romp==='notificationClick'||m.romp==='pushReveal'))land(String(m.sid||''),String(m.kind||''),String(m.cardId||''),false,'sw');});}
 var u=new URL(location.href),pr=u.searchParams.get('push-reveal'),pc=u.searchParams.get('push-card');
 // push-card is a goal id; a crafted link with a quote or bracket would reach the feed's
 // [data-key="a:..."] lookup as a selector and throw a SyntaxError that skips the openSession fallback
 // too (review find on #940, 2026-09-07). Drop a non-id value before it lands.
 if(pc&&!/^[A-Za-z0-9_.:-]{1,128}$/.test(pc))pc='';
-if(pr||pc){land(pr||'',pc?'card':'',pc||'',true);
+if(pr||pc){land(pr||'',pc?'card':'',pc||'',true,'link');
 u.searchParams['delete']('push-reveal');u.searchParams['delete']('push-card');
 try{history.replaceState(null,'',u.pathname+(u.searchParams.toString()?'?'+u.searchParams.toString():'')+u.hash);}catch(e){}}
 })();
@@ -45699,11 +45736,12 @@ class Handler(BaseHTTPRequestHandler):
                     sid = str(body.get("sid") or "")
                     wid = str(body.get("wid") or "")
                     boot = bool(body.get("boot"))
+                    via = str(body.get("via") or "")   # 'sw' | 'link': the road the tap took, for the log line
                 except (ValueError, AttributeError):
                     return self._send(400, "bad json", "text/plain")
                 if not sid:
                     return self._send(400, "missing sid", "text/plain")
-                now_ = _reveal_request(sid, wid, boot=boot)
+                now_ = _reveal_request(sid, wid, boot=boot, via=via)
                 return self._send(200, json.dumps({"ok": True, "delivered": now_}), "application/json")
             if u.path == "/tick":
                 # Event-driven wake: the Stop / UserPromptSubmit / PostCompact hooks (and the postal drain) poke
