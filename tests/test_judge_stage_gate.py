@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """The judge tiers' EVIDENCE GATE (2026-09-07): the planner and closer skip a
 session's per-pass run when nothing their decision path reads has changed since the run that last judged
-it to completion.
+it to completion. The four store-only tiers went on the same gate the same day: the unblocker (the parse
+pair and the store trio), the grouper and consolidator (the store trio and cleared.jsonl, no parse), the
+distiller (the store trio, the states file and this sid's stall records, no parse); the StoreTiers,
+StoreReArms, StoreOwnWrites, StoreCompleteness, UnblockerHazard and DrainStaysUngated classes and the four
+FsCompleteness checks below are its tests.
 
 Why: every pass ran every discovered session in full (a parse, a store load, the unit walk, the closed-turn
 walk, a rollup, an unconditional save), with about two of thirty-three sessions holding anything new per
@@ -59,6 +63,11 @@ T0 = 1781100000
 NOW = T0 + 5000
 MINT = '{"ops":[{"why":"x","do":"mint","text":"Goal"}]}'
 EMPTY_CLOSE = '{"done": [], "block": []}'
+HOLD_ALL = '{"verdicts":[]}'
+LIFT_ONE = '{"verdicts":[{"n":1,"do":"lift","why":"the port was named two messages later"}]}'
+MIRROR_WHY = "declared in the agent's own to-do list"          # the mirror top's mint reason (_title_mirror_tops)
+STORE_TIERS = ("unblock", "group", "consolidate", "distill")
+ALL_TIERS = ("plan", "close") + STORE_TIERS                     # run_triage's order
 
 
 def iso(t):
@@ -134,6 +143,20 @@ class _Gate(unittest.TestCase):
         jd.closer_llm = lambda tt, mt, *a, **k: (self.close_calls.append(tt) or EMPTY_CLOSE)
         jd.group_llm = lambda menu, judge="grouper": '{"ops":[]}'
         jd._PENDING_CUT_FN = None
+        # the store tiers' helpers: hold every block, land every distill, title every mirror top; and a belt
+        # under all of them, since no test here may reach the real model call
+        self._saved_store = (jd.unblock_llm, jd.distill_llm, jd.brief_llm, jd.stall_llm, jd.mirror_title_llm,
+                             jd.parsed_session)
+        self.unblock_calls, self.distill_calls, self.title_calls = [], [], []
+        jd.unblock_llm = lambda blocks, since, completed="": (self.unblock_calls.append(blocks) or HOLD_ALL)
+        jd.distill_llm = lambda text, work, why, **kw: (self.distill_calls.append(text) or "Shipped the search endpoint.")
+        jd.brief_llm = lambda text, work, owed, **kw: (self.distill_calls.append(text) or "Pick the port the api binds.")
+        jd.stall_llm = lambda text, work, holding: (self.distill_calls.append(text) or "The build has not finished.")
+        jd.mirror_title_llm = lambda subject, frame=None, user_ask=None: (self.title_calls.append(subject) or "Write the api tests")
+
+        def no_model(*a, **k):
+            raise AssertionError("a stage reached the real model call; patch the helper above the belt")
+        jd._judge_run_impl = no_model
         jd._judge_ctx.paused, jd._judge_ctx.last_call_fail, jd._judge_ctx.stage_incomplete = False, None, False
 
     def tearDown(self):
@@ -141,6 +164,8 @@ class _Gate(unittest.TestCase):
         (jd.PROJECTS, jd.plan_llm, jd.closer_llm, jd.group_llm, jd.opener_llm, jd._PENDING_CUT_FN,
          jd._judge_run_impl, jd._rewound_away, jd._judge_run, jd._fileset_key, jd._close_turn,
          jd._STAGE_STAMP_MAX, jd.load_goals, jd.save_goals) = self._saved
+        (jd.unblock_llm, jd.distill_llm, jd.brief_llm, jd.stall_llm, jd.mirror_title_llm,
+         jd.parsed_session) = self._saved_store
         if self._env is None:
             os.environ.pop("CLAUDE_CONFIG_DIR", None)
         else:
@@ -171,27 +196,51 @@ class _Gate(unittest.TestCase):
             f.write(json.dumps({"t": t, "state": state}) + "\n")
 
     def _pass(self, now=NOW, tiers=("plan", "close")):
-        """One gated pass over the fixture: the planner then the closer under one frame, as run_triage."""
+        """One gated pass over the fixture: the named tiers in run_triage's order under one frame."""
         jd._discover_cache.clear()                   # discover's list is cached behind a dir fingerprint, not `now`
+        runners = {"plan": jd.run_plan, "close": jd.run_close, "unblock": jd.run_unblock, "group": jd.run_group,
+                   "consolidate": jd.run_consolidate, "distill": jd.run_distill}
         own = jd.begin_pass_frame()
         try:
-            if "plan" in tiers:
-                jd.run_plan(now=now)
-            if "close" in tiers:
-                jd.run_close(now=now)
+            for t in ALL_TIERS:
+                if t in tiers:
+                    runners[t](now=now)
         finally:
             jd.end_pass_frame(own)
 
-    def _converge(self, now=NOW, limit=4):
-        """Passes until both tiers skip: the working pass, the follow-on run that finds nothing to write
-        (the tier's own publish re-armed it once), then the skip. Leaves the counters zeroed."""
+    def _converge(self, now=NOW, limit=6, tiers=ALL_TIERS):
+        """Passes over `tiers` until every one skips: the working pass, the follow-on run that finds nothing
+        to write (the tier's own publish re-armed it once), then the skip. Leaves the counters zeroed."""
         for _ in range(limit):
             self._reset()
-            self._pass(now)
-            if all(self._st(t)["ran"] == 0 for t in ("plan", "close")):
+            self._pass(now, tiers=tiers)
+            if all(self._st(t)["ran"] == 0 for t in tiers):
                 self._reset()
                 return
         self.fail("the fixture did not converge in %d passes" % limit)
+
+    def _st4(self, key="ran"):
+        """The four store tiers' `key` counters, in STORE_TIERS order."""
+        return tuple(self._st(t)[key] for t in STORE_TIERS)
+
+    def _block(self, sid, nid, t, why="Which port should the api bind?"):
+        """A kernel-side nudge block on `nid` at `t`: the journal row plus a publish through save_goals."""
+        store = jd.load_goals(sid)
+        jd.append_block(sid, nid, "nudge", why, t)
+        jd.record_verdict(store, store["nodes"][nid], "nudge", "block", t, why=why)
+        jd.rollup_status(store, False)
+        jd.save_goals(sid, store)
+
+    def _mirror_top(self, sid, text, n=90):
+        """An untitled to-do MIRROR top (the agent's own TaskCreate subject, verbatim): the one node shape
+        that makes _title_mirror_tops call the model before the distiller's todo is built."""
+        store = jd.load_goals(sid)
+        nid = "%s:g%d" % (sid, n)
+        store["nodes"][nid] = {"id": nid, "text": text, "parentId": None, "why": MIRROR_WHY, "t": T0 + 300,
+                               "mt": T0 + 300, "log": [], "trail": [], "nodeComplete": False, "cleared": False}
+        store["status"][nid] = "working"
+        jd.save_goals(sid, store)
+        return nid
 
     def _st(self, tier):
         return dict(jd._TIER_STATS[tier])
@@ -893,6 +942,21 @@ class TheClock(_Gate):
         self.assertEqual(jd.load_goals(SID)["status"].get(g1["id"]), "completed", "the released settle completes the top")
         self.assertIsNone(self._stamp("plan")[1])
 
+    def test_the_store_tiers_stamps_carry_no_clock_input(self):
+        # settle=False for the four store tiers: they consult the settle on write paths only, so their stamps
+        # hold no not-before and a background launch's expiry makes none of them due on the clock (the
+        # planner's stamp, on the same fixture, does carry it)
+        path, expiry = self._monitor_fixture()
+        self._converge(int(expiry) - 100)
+        self.assertEqual(self._stamp("plan")[1], expiry, "premise: the planner's stamp carries the expiry")
+        for t in STORE_TIERS:
+            self.assertIsNone(self._stamp(t)[1], "%s: no clock input in the stamp" % t)
+        self._reset()
+        self._pass(int(expiry) + 1, tiers=STORE_TIERS)                 # the planner NOT run: no publish re-arms them
+        self.assertEqual(self._st4("due_clock"), (0, 0, 0, 0), "past the expiry no store tier is due on the clock")
+        self.assertEqual(self._st4("ran"), (0, 0, 0, 0))
+        self.assertEqual(self._st4("skipped"), (1, 1, 1, 1))
+
     def test_the_expiry_helper_and_the_predicate_agree(self):
         self.assertEqual(em._bg_expiry_t({"deadline": 1000.0}), 1120.0)
         self.assertEqual(em._bg_expiry_t({"deadline": 1000.0, "deadlineSrc": "hook"}), 1005.0, "hook grace 5")
@@ -980,11 +1044,11 @@ class Bounds(_Gate):
         self._session(SID)
         self._session(SID2, name="api")
         self._converge()
-        self.assertEqual(len(jd._STAGE_STAMP), 4)
+        self.assertEqual(len(jd._STAGE_STAMP), len(ALL_TIERS) * 2, "one stamp per gated tier per sid")
         (jd.NAMES / SID2).unlink()                                      # the session leaves discover
         jd._namefp_memo.clear()
-        self._pass()
-        self.assertEqual({k for k in jd._STAGE_STAMP}, {("plan", SID), ("close", SID)}, "the gone sid's stamps evicted")
+        self._pass(tiers=ALL_TIERS)
+        self.assertEqual({k for k in jd._STAGE_STAMP}, {(t, SID) for t in ALL_TIERS}, "the gone sid's stamps evicted")
         jd._rebind_state(self.td)
         self.assertEqual(jd._STAGE_STAMP, {}, "a new root is a new world")
 
@@ -1062,13 +1126,20 @@ class FsCompleteness(_Gate):
 
     def _allowed(self, tier, sid, path):
         ident, value = jd._sig_inputs(tier, sid, str(path))
-        cands, states, key_files = jd._parse_key_files(sid, [str(path)])
-        allowed = {os.path.abspath(str(p)) for p in ident + value + key_files + [states, jd.MESSAGES]}
+        allowed = {os.path.abspath(str(p)) for p in ident + value}
+        if tier in jd.PARSE_TIERS:
+            cands, states, key_files = jd._parse_key_files(sid, [str(path)])
+            allowed |= {os.path.abspath(str(p)) for p in key_files + [states, jd.MESSAGES]}
+        # the grouper, consolidator and distiller carry NO parse pair, so a transcript read on their idle
+        # path is exactly what this test must catch: the transcript stays out of their allowed set
         allowed |= {os.path.abspath(str(jd.STATE / n)) for n in self.ALLOW_NAMES}
         return allowed
 
-    def _check(self, tier, stage):
+    def _check(self, tier, stage, prep=None):
         self._fixture()
+        if prep is not None:
+            prep()
+            self._converge()
         for sid in (SID, SID2):
             path = self.pdir / (sid + ".jsonl")
             own = jd.begin_pass_frame()                                 # a fresh frame: the parse hits the filesystem
@@ -1089,6 +1160,581 @@ class FsCompleteness(_Gate):
 
     def test_the_closers_idle_reads_are_all_in_its_signature(self):
         self._check("close", jd._close_session)
+
+    def test_the_unblockers_idle_reads_are_all_in_its_signature(self):
+        # with a blocked candidate whose examine is current (the block postdates every ended turn), so the
+        # run reaches the parse and stops at `due` empty: the parse and the store, nothing else
+        self._check("unblock", jd._unblock_session,
+                    prep=lambda: self._block(SID, self._tops()[0]["id"], T0 + 150))
+
+    def test_the_groupers_idle_reads_are_all_in_its_signature(self):
+        self._check("group", jd._group_session)
+
+    def test_the_consolidators_idle_reads_are_all_in_its_signature(self):
+        self._check("consolidate", jd._consolidate_session)
+
+    def test_the_distillers_idle_reads_are_all_in_its_signature(self):
+        # the distiller's idle run, as the design review defines it: no untitled mirror top and an empty
+        # todo; a transcript or peer-store read here would be a signature hole
+        self._check("distill", jd._distill_session)
+
+
+class StoreTiers(_Gate):
+    """The four store-only tiers on the gate: two idle passes run once, then skip with no store I/O."""
+
+    def test_two_idle_passes_run_once_then_skip_with_no_store_io(self):
+        self._session(SID)
+        self._pass(tiers=("plan", "close"))                            # the planner mints two tops, the closer sweeps
+        self._reset()
+        for t in STORE_TIERS:
+            jd._PASS_DONE.pop((t, SID), None)                           # so the run path's own pass_done shows
+        self._pass(tiers=STORE_TIERS)
+        self.assertEqual(self._st4("ran"), (1, 1, 1, 1), "first pass: every store tier runs")
+        self.assertEqual(self._st4("stamped"), (1, 1, 1, 1), "each ran to completion")
+        self.assertEqual(self._st4("skipped"), (0, 0, 0, 0))
+        for t in STORE_TIERS:
+            self.assertIsNotNone(jd.pass_watermark(t, SID), "%s: a completed run stamps pass_done" % t)
+        # the grouper and the consolidator each recorded their signature on first sight (groupedSig,
+        # consolidatedSig: a store-level write, no relink): those publishes moved the store identity after
+        # the unblocker's stamp and their own, and before the distiller's, which keyed on the final identity
+        self._reset()
+        self._pass(tiers=STORE_TIERS)
+        self.assertEqual(self._st4("ran"), (1, 1, 1, 0), "the publishes re-armed the tiers stamped before them, once")
+        self.assertEqual(self._st4("skipped"), (0, 0, 0, 1))
+        self._reset()
+        for t in STORE_TIERS:                                           # the earlier passes' watermarks go: the skip
+            self.assertIsNotNone(jd._PASS_DONE.pop((t, SID), None), t)  #  must write its own, not inherit one
+        io0 = dict(self.io)
+        self._pass(tiers=STORE_TIERS)
+        io1 = dict(self.io)
+        self.assertEqual(self._st4("ran"), (0, 0, 0, 0), "the third pass skips every store tier")
+        self.assertEqual(self._st4("skipped"), (1, 1, 1, 1))
+        self.assertEqual((io1["loads"] - io0["loads"], io1["saves"] - io0["saves"]), (0, 0),
+                         "a skipped session costs no store load and no save")
+        for t in STORE_TIERS:
+            self.assertIsNotNone(jd.pass_watermark(t, SID), "%s: a skip stamps pass_done" % t)
+        self.assertEqual(self.unblock_calls, [], "no blocked goal, no unblocker call")
+
+    def test_counters_add_up_over_the_store_tiers(self):
+        self._session(SID)
+        self._converge()
+        for t in STORE_TIERS:
+            self.assertIsNotNone(self._stamp(t), t)
+        stats = jd.tier_stats()
+        for t in STORE_TIERS:
+            s = stats[t]
+            self.assertEqual(s["ran"], s["stamped"] + s["bypassed"] + s["incomplete"], t)
+        self.assertGreaterEqual(stats["stamps"], 6, "one stamp per tier for the sid")
+
+    def test_an_unframed_pass_stamps_the_store_only_tiers_and_bypasses_the_parse_tiers(self):
+        # the rule split (_gated): a parse tier's stamp needs the frame's served pair, so without a frame it
+        # runs and bypasses; a store-only tier has no frame-pinned component (the gate stats every input
+        # itself), so it stamps with or without one, and its next unframed run skips
+        self._session(SID)
+        self._converge()
+        store = jd.load_goals(SID)
+        top = self._tops()[0]
+        store["nodes"][top["id"]]["text"] = "Renamed by a kernel-side writer"
+        jd.save_goals(SID, store)                                       # re-arms all six tiers by identity
+        runners = {"plan": jd.run_plan, "close": jd.run_close, "unblock": jd.run_unblock, "group": jd.run_group,
+                   "consolidate": jd.run_consolidate, "distill": jd.run_distill}
+        jd.end_pass_frame(True)
+        self._reset()
+        jd._discover_cache.clear()
+        for t in ALL_TIERS:
+            runners[t](now=NOW)                                         # no begin_pass_frame anywhere
+        for t in ("plan", "close", "unblock"):
+            st = self._st(t)
+            self.assertEqual((st["ran"], st["bypassed"], st["stamped"]), (1, 1, 0), "%s: no frame, no stamp" % t)
+        for t in ("group", "consolidate", "distill"):
+            st = self._st(t)
+            self.assertEqual((st["ran"], st["bypassed"], st["stamped"]), (1, 0, 1), "%s: stamps without a frame" % t)
+        for _ in range(3):                                              # the store tiers' own writes re-arm once or twice
+            self._reset()
+            jd._discover_cache.clear()
+            for t in ("group", "consolidate", "distill"):
+                runners[t](now=NOW)
+            if all(self._st(t)["ran"] == 0 for t in ("group", "consolidate", "distill")):
+                break
+            for t in ("group", "consolidate", "distill"):
+                self.assertEqual(self._st(t)["bypassed"], 0, "%s: an unframed run that completes stamps" % t)
+        for t in ("group", "consolidate", "distill"):
+            self.assertEqual((self._st(t)["ran"], self._st(t)["skipped"]), (0, 1), "%s: the unframed stamp is honoured" % t)
+
+
+class StoreReArms(_Gate):
+    """Each input re-arms exactly the store tiers that read it (the runs, in STORE_TIERS order)."""
+
+    def _rearms(self, expect, msg):
+        self._reset()
+        self._pass(tiers=STORE_TIERS)
+        self.assertEqual(self._st4("ran"), expect, msg)
+
+    def test_a_store_publish_a_journal_append_and_an_archive_write_re_arm_all_four(self):
+        self._session(SID)
+        self._converge()
+        store = jd.load_goals(SID)
+        top = self._tops()[0]
+        store["nodes"][top["id"]]["text"] = "Renamed by a kernel-side writer"
+        jd.save_goals(SID, store)
+        self._rearms((1, 1, 1, 1), "a save_goals publish (a rename: new identity)")
+        self._converge()
+        jd.append_override(SID, top["id"], "resolve", NOW + 1)           # the user's gesture: the journal only
+        self._rearms((1, 1, 1, 1), "a journal append with no store write")
+        self.assertEqual(jd.load_goals(SID)["status"].get(top["id"]), "completed", "the replayed resolve took")
+        self._converge()
+        jd.save_goal_archive(SID, {"rompUuid": SID, "nodes": {}, "status": {}})
+        self._rearms((1, 1, 1, 1), "an archive write: in the grouper's and consolidator's signatures too "
+                                   "(compaction rewrites it with no journal row)")
+
+    def test_a_cleared_row_re_arms_the_grouper_and_consolidator_only(self):
+        self._session(SID)
+        self._converge()
+        with open(jd.STATE / "cleared.jsonl", "a") as f:
+            f.write(json.dumps({"id": SID2 + ":g1", "op": "clear", "t": NOW}) + "\n")
+        self._rearms((0, 1, 1, 0), "a cleared.jsonl row (whole-file identity): the two tiers whose candidate "
+                                   "forests read the view-cleared set")
+
+    def test_a_transcript_append_re_arms_the_unblocker_only(self):
+        path = self._session(SID)
+        self._converge()
+        self._append(path, uline(T0 + 200, "task C", "u3", "a2"), aline(T0 + 230, "did C", "a3", "u3"))
+        self._rearms((1, 0, 0, 0), "a transcript append: the parse pair is the unblocker's key and no one else's")
+        self.assertEqual(self.unblock_calls, [], "no blocked goal: the re-armed run made no call")
+
+    def test_a_states_row_re_arms_the_distiller_and_the_unblocker_not_the_grouper_or_consolidator(self):
+        self._session(SID)
+        self._converge()
+        self._states_row(SID, T0 + 300, "picker")
+        self._rearms((1, 0, 0, 1), "a states row entering picker: the distiller reads the states file, and the "
+                                   "unblocker's parse key names it")
+
+    def test_a_stall_record_for_this_sid_re_arms_the_distiller_and_another_sids_does_not(self):
+        self._session(SID)
+        self._converge()
+        top = self._tops()[0]
+        an = jd.STATE / "auto-nudge.json"
+        an.write_text(json.dumps({"enabled": False, "deferred": {SID2 + ":g1": {"at": NOW, "why": "the closer has not settled the turn", "sid": SID2}}}))
+        self._rearms((0, 0, 0, 0), "another sid's stall record")
+        an.write_text(json.dumps({"enabled": False, "deferred": {top["id"]: {"at": NOW, "why": "the closer has not settled the turn", "sid": SID}}}))
+        self._rearms((0, 0, 0, 1), "this sid's stall record: the staller owes the card a note")
+        self.assertIsNotNone(jd.load_goals(SID)["nodes"][top["id"]].get("stallSummary"), "and wrote it")
+
+
+class StoreOwnWrites(_Gate):
+    """A tier's own publish re-arms it once (the stamp holds the pre-run identity); the follow-on run finds
+    nothing to write and stamps; the third pass skips."""
+
+    def test_the_unblockers_lift_re_arms_it_once_then_it_skips(self):
+        path = self._session(SID)
+        self._converge()
+        top = self._tops()[0]
+        self._block(SID, top["id"], T0 + 150)
+        self._append(path, uline(T0 + 200, "the api binds 8080", "u3", "a2"), aline(T0 + 230, "noted", "a3", "u3"))
+        jd.unblock_llm = lambda blocks, since, completed="": (self.unblock_calls.append(blocks) or LIFT_ONE)
+        self._reset()
+        self._pass(tiers=("unblock",))
+        self.assertEqual(len(self.unblock_calls), 1, "one examine over the new turn")
+        self.assertNotEqual(jd.load_goals(SID)["status"].get(top["id"]), "blocked", "the lift filed")
+        self.assertEqual((self._st("unblock")["ran"], self._st("unblock")["stamped"]), (1, 1))
+        self._reset()
+        self._pass(tiers=("unblock",))
+        self.assertEqual((self._st("unblock")["ran"], self._st("unblock")["stamped"]), (1, 1),
+                         "the own publish re-armed it once; the follow-on run found nothing due")
+        self.assertEqual(len(self.unblock_calls), 1, "and made no call")
+        self._reset()
+        self._pass(tiers=("unblock",))
+        self.assertEqual((self._st("unblock")["ran"], self._st("unblock")["skipped"]), (0, 1))
+
+    def test_a_titling_re_arms_the_distiller_once_and_the_third_pass_skips(self):
+        # the design review's cross-tier convergence probe: _title_mirror_tops titles a mirror top and the
+        # caller saves, so the distiller's own publish re-arms it once; the follow-on run reads no
+        # transcript, writes nothing and stamps; the third pass skips
+        self._session(SID)
+        self._converge()
+        nid = self._mirror_top(SID, "add tests+docs for the search endpoint")
+        parses = []
+        real = self._saved_store[5]
+        jd.parsed_session = lambda *a, **k: (parses.append(a[0]) or real(*a, **k))
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual(self.title_calls, ["add tests+docs for the search endpoint"])
+        nd = jd.load_goals(SID)["nodes"][nid]
+        self.assertEqual((nd.get("text"), nd.get("declaredSubject")), ("Write the api tests", "add tests+docs for the search endpoint"))
+        self.assertTrue(nd.get("titledT"))
+        self.assertEqual((self._st("distill")["ran"], self._st("distill")["stamped"]), (1, 1), "the titling run completed")
+        self._reset()
+        io0 = dict(self.io)
+        parses.clear()
+        self._pass(tiers=("distill",))
+        io1 = dict(self.io)
+        self.assertEqual((self._st("distill")["ran"], self._st("distill")["stamped"]), (1, 1),
+                         "the own publish re-armed it once; the follow-on run stamps")
+        self.assertEqual(parses, [], "no transcript read on the idle path")
+        self.assertEqual(io1["saves"] - io0["saves"], 0, "nothing written")
+        self.assertEqual(len(self.title_calls), 1, "titled once, never re-derived")
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual((self._st("distill")["ran"], self._st("distill")["skipped"]), (0, 1))
+
+
+class StoreCompleteness(_Gate):
+    """A store-tier run that did not finish leaves no stamp, so the sid stays due."""
+
+    def _blocked_with_a_new_turn(self):
+        path = self._session(SID)
+        self._converge()
+        top = self._tops()[0]
+        self._block(SID, top["id"], T0 + 150)
+        self._append(path, uline(T0 + 200, "the api binds 8080", "u3", "a2"), aline(T0 + 230, "noted", "a3", "u3"))
+        return top
+
+    def test_a_stripped_unblocker_reply_keeps_the_sid_due_without_a_strike(self):
+        # patches _judge_run_impl, not unblock_llm: the helper strips its reply, so "   " reaches the stage as
+        # "" and takes the no-write return (a truthy raw would take the parse-strike path instead)
+        top = self._blocked_with_a_new_turn()
+        jd.unblock_llm = self._saved_store[0]                            # the real helper, over the belt
+        for reply in ("", "   "):
+            jd._judge_run_impl = lambda *a, **k: reply
+            self._reset()
+            io0 = dict(self.io)
+            self._pass(tiers=("unblock",))
+            s = self._st("unblock")
+            self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0), "reply %r" % reply)
+            self.assertEqual(self.io["saves"] - io0["saves"], 0, "no save")
+            self.assertFalse(jd.load_goals(SID).get("unblockFails"), "no strike burned on a failed call")
+        jd.unblock_llm = lambda blocks, since, completed="": ""         # the helper itself returned nothing, above
+        self._reset()                                                    # the belt: the stage's own mark decides
+        io0 = dict(self.io)
+        self._pass(tiers=("unblock",))
+        s = self._st("unblock")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0), "an empty helper reply")
+        self.assertEqual(self.io["saves"] - io0["saves"], 0, "no save")
+        jd.unblock_llm = self._saved_store[0]
+        jd._judge_run_impl = lambda *a, **k: LIFT_ONE
+        self._reset()
+        self._pass(tiers=("unblock",))
+        self.assertEqual(self._st("unblock")["stamped"], 1, "a served reply completes the run")
+        self.assertNotEqual(jd.load_goals(SID)["status"].get(top["id"]), "blocked")
+
+    def test_a_stripped_grouper_or_consolidator_reply_keeps_the_sid_due_without_a_strike(self):
+        self._session(SID)
+        self._pass(tiers=("plan", "close"))                            # two open tops: the grouper has a menu
+        store = jd.load_goals(SID)
+        store.pop("groupedSig", None)                                    # the planner groups inline after each placement
+        jd.save_goals(SID, store)                                        # and recorded the set already: re-open the gate
+        jd.group_llm = self._saved[3]                                    # the real helper, over the belt
+        for reply in ("", "   "):
+            jd._judge_run_impl = lambda *a, **k: reply
+            self._reset()
+            io0 = dict(self.io)
+            self._pass(tiers=("group",))
+            s = self._st("group")
+            self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0), "grouper, reply %r" % reply)
+            self.assertEqual(self.io["saves"] - io0["saves"], 0, "no save")
+            self.assertFalse(jd.load_goals(SID).get("groupFails"), "no strike")
+        jd.group_llm = lambda menu, judge="grouper": ""                  # the helper itself returned nothing, above
+        self._reset()                                                    # the belt: the stage's own mark decides
+        io0 = dict(self.io)
+        self._pass(tiers=("group",))
+        s = self._st("group")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0), "grouper, an empty helper reply")
+        self.assertEqual(self.io["saves"] - io0["saves"], 0, "no save")
+        jd.group_llm = self._saved[3]
+        jd._judge_run_impl = lambda *a, **k: '{"ops":[]}'
+        self._reset()
+        self._pass(tiers=("group",))
+        self.assertEqual(self._st("group")["stamped"], 1, "a served reply completes the run (groupedSig written)")
+        # the consolidator: two COMPLETED tops (resolved, and the focus top's pending settle forced through:
+        # a done verdict on the last node exports as confirming until the session settles, and the
+        # consolidator's menu is the completed status alone), then the same probe over that menu
+        for top in self._tops():
+            jd.append_override(SID, top["id"], "resolve", NOW + 1)
+        store = jd.load_goals(SID)
+        for top in self._tops():
+            store["status"][top["id"]] = "completed"
+        store["confirming"] = []
+        jd.save_goals(SID, store)
+        self.assertEqual(len(jd._consolidate_tops(jd.load_goals(SID))), 2, "fixture: the consolidator has a menu")
+        for reply in ("", "   "):
+            jd._judge_run_impl = lambda *a, **k: reply
+            self._reset()
+            io0 = dict(self.io)
+            self._pass(tiers=("consolidate",))
+            s = self._st("consolidate")
+            self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0), "consolidator, reply %r" % reply)
+            self.assertEqual(self.io["saves"] - io0["saves"], 0, "no save")
+            self.assertFalse(jd.load_goals(SID).get("consolidateFails"), "no strike")
+        jd.group_llm = lambda menu, judge="grouper": ""
+        self._reset()
+        io0 = dict(self.io)
+        self._pass(tiers=("consolidate",))
+        s = self._st("consolidate")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0), "consolidator, an empty helper reply")
+        self.assertEqual(self.io["saves"] - io0["saves"], 0, "no save")
+        jd.group_llm = self._saved[3]
+        jd._judge_run_impl = lambda *a, **k: '{"ops":[]}'
+        self._reset()
+        self._pass(tiers=("consolidate",))
+        self.assertEqual(self._st("consolidate")["stamped"], 1)
+
+    def test_a_paused_title_call_keeps_the_distiller_due(self):
+        self._session(SID)
+        self._converge()
+        nid = self._mirror_top(SID, "add tests+docs for the search endpoint")
+        jd.mirror_title_llm = self._saved_store[4]                       # the real helper, over the belt
+
+        def paused(*a, **k):
+            jd._judge_ctx.paused = True                                  # what the real call does under retry-paused.json
+            return ""
+        jd._judge_run_impl = paused
+        self._reset()
+        io0 = dict(self.io)
+        self._pass(tiers=("distill",))
+        s = self._st("distill")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0), "a pause-skipped titling leaves the sid due")
+        self.assertEqual(self.io["saves"] - io0["saves"], 0)
+        self.assertFalse(jd.load_goals(SID)["nodes"][nid].get("titledT"), "not stamped: the next pass retries")
+        jd.mirror_title_llm = paused                                     # the helper itself pause-skipped, above the
+        self._reset()                                                    # belt: _title_mirror_tops' own mark decides
+        self._pass(tiers=("distill",))
+        s = self._st("distill")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0), "a pause-skip above the belt")
+        self.assertFalse(jd.load_goals(SID)["nodes"][nid].get("titledT"))
+        jd.mirror_title_llm = self._saved_store[4]
+
+        def served(*a, **k):
+            jd._judge_ctx.paused = False
+            return "Write the api tests"
+        jd._judge_run_impl = served
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual(self._st("distill")["stamped"], 1)
+        self.assertEqual(jd.load_goals(SID)["nodes"][nid].get("text"), "Write the api tests")
+
+    def test_a_paused_stall_brief_or_brief_retry_call_keeps_the_distiller_due(self):
+        # the distiller's three other paused continues, each reached with the helper patched ABOVE the belt so
+        # the stage's own mark is the one that decides: the staller (a stall record for this sid), the briefer
+        # (a blocked top owed one decision) and the briefer's shortfall retry (two blocked nodes under one top:
+        # the draft covers one, the corrective retry is pause-skipped)
+        self._session(SID)
+        self._converge()
+        top = self._tops()[0]["id"]
+
+        def paused(*a, **k):
+            jd._judge_ctx.paused = True
+            return ""
+        an = jd.STATE / "auto-nudge.json"
+        an.write_text(json.dumps({"enabled": False, "deferred": {top: {"at": NOW, "why": "the closer has not settled the turn", "sid": SID}}}))
+        jd.stall_llm = paused
+        self._reset()
+        self._pass(tiers=("distill",))
+        s = self._st("distill")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0), "the staller's paused continue marks the run")
+        nd = jd.load_goals(SID)["nodes"][top]
+        self.assertIsNone(nd.get("stallSummary"))
+        self.assertFalse(nd.get("stallFails"), "a pause-skip is not a strike")
+        jd._judge_ctx.paused = False
+        an.write_text(json.dumps({"enabled": False, "deferred": {}}))    # the stall ends; the top is blocked instead
+        self._block(SID, top, T0 + 150)
+        jd.brief_llm = paused
+        self._reset()
+        self._pass(tiers=("distill",))
+        s = self._st("distill")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0), "the briefer's paused continue marks the run")
+        nd = jd.load_goals(SID)["nodes"][top]
+        self.assertIsNone(nd.get("blockSummary"))
+        self.assertFalse(nd.get("briefFails"), "a pause-skip is not a strike")
+        jd._judge_ctx.paused = False
+        store = jd.load_goals(SID)                                       # a second owed decision under the same top
+        kid = SID + ":g91"
+        store["nodes"][kid] = {"id": kid, "text": "Choose the api's auth scheme", "parentId": top, "why": "x",
+                               "t": T0 + 300, "mt": T0 + 300, "log": [], "trail": [], "nodeComplete": False, "cleared": False}
+        jd.save_goals(SID, store)
+        self._block(SID, kid, T0 + 160, why="Which auth scheme should the api use?")
+        shortfalls = []
+
+        def draft_then_paused_retry(text, work, owed, **kw):
+            shortfalls.append(kw.get("shortfall"))
+            if kw.get("shortfall") is not None:                          # the corrective retry: pause-skipped
+                jd._judge_ctx.paused = True
+                return ""
+            return "Pick the port the api binds."                        # one paragraph for two owed decisions
+        jd.brief_llm = draft_then_paused_retry
+        self._reset()
+        self._pass(tiers=("distill",))
+        s = self._st("distill")
+        self.assertEqual(shortfalls, [None, (1, 2)], "the draft, then the retry naming the shortfall")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0), "the retry's paused continue marks the run")
+        self.assertIsNone(jd.load_goals(SID)["nodes"][top].get("blockSummary"), "the brief stays owed")
+        jd._judge_ctx.paused = False
+        jd.brief_llm = lambda text, work, owed, **kw: "Pick the port the api binds.\n\nUse bearer tokens."
+        self._converge(tiers=("distill",))
+        self.assertTrue(jd.load_goals(SID)["nodes"][top].get("blockSummary"), "unpaused, the brief lands and the tier settles")
+
+    def test_a_paused_distill_call_keeps_the_sid_due_and_a_failed_one_writes_the_strike(self):
+        self._session(SID)
+        self._converge()
+        top = self._tops()[0]
+        jd.append_override(SID, top["id"], "resolve", NOW + 1)           # completed: a summary is owed
+
+        def paused(*a, **k):
+            jd._judge_ctx.paused = True
+            return ""
+        jd.distill_llm = paused
+        self._reset()
+        self._pass(tiers=("distill",))
+        s = self._st("distill")
+        self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0), "the paused continue marks the run")
+        nd = jd.load_goals(SID)["nodes"][top["id"]]
+        self.assertIsNone(nd.get("summary"))
+        self.assertFalse(nd.get("distillFails"), "a pause-skip is not a strike")
+        jd._judge_ctx.paused = False
+        jd.distill_llm = lambda *a, **k: ""                              # a real failure, past the belt
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual(jd.load_goals(SID)["nodes"][top["id"]].get("distillFails"), 1, "the strike is written")
+        self.assertEqual(self._st("distill")["ran"], 1)
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual(self._st("distill")["ran"], 1, "the strike's publish re-armed the tier by identity")
+        self.assertEqual(jd.load_goals(SID)["nodes"][top["id"]].get("distillFails"), 2, "and it retried")
+        jd.distill_llm = lambda *a, **k: "Shipped the search endpoint."
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual(jd.load_goals(SID)["nodes"][top["id"]].get("summary"), "Shipped the search endpoint.")
+        self._converge(tiers=("distill",))
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_a_store_that_does_not_read_never_stamps(self):
+        # a goals file that exists and cannot be read RAISES out of load_goals (never an empty fallback): every
+        # tier dies at its load, _gated counts the run incomplete, the runner files its pass-crash row and
+        # nothing is written, so the sid stays due until the file reads. Nothing on disk moves when a
+        # permission bit or a descriptor failure clears, so a stamp here would skip the session for good
+        self._session(SID)
+        self._converge()
+        gp = jd.GOALDIR / (SID + ".json")
+        good = gp.read_bytes()
+        os.chmod(gp, 0)
+        try:
+            os.utime(gp, ns=(os.stat(gp).st_atime_ns, os.stat(gp).st_mtime_ns + 1_000_000_000))   # re-arm: chmod moves ctime only
+            for _ in range(2):
+                self._reset()
+                self._pass(tiers=ALL_TIERS)
+                for t in ALL_TIERS:
+                    s = self._st(t)
+                    self.assertEqual((s["ran"], s["incomplete"], s["stamped"]), (1, 1, 0),
+                                     "%s: a load that raises counts the run incomplete, so the sid stays due" % t)
+            rows = [json.loads(l) for l in open(jd.ERRORS) if l.strip()]
+            self.assertEqual(sum(r.get("err") == "pass-crash" for r in rows), 2 * len(ALL_TIERS),
+                             "one pass-crash row per tier per pass, as for any raised run")
+        finally:
+            os.chmod(gp, 0o644)
+        self.assertEqual(gp.read_bytes(), good, "no tier wrote")
+        self._reset()
+        self._pass(tiers=ALL_TIERS)
+        self.assertEqual(tuple(self._st(t)["stamped"] for t in ALL_TIERS), (1,) * len(ALL_TIERS),
+                         "readable again: every tier runs to completion and stamps")
+
+    def test_a_store_that_does_not_parse_is_moved_aside_and_the_fresh_store_is_judged(self):
+        # bytes that do not parse are quarantined aside by load_goals (<file>.corrupt-<stamp>, one
+        # store-quarantined row) and the fresh store is then what the path holds, so the tiers run to
+        # completion over it and stamp: no run is judged from a view the files contradict, and no tier crashes
+        self._session(SID)
+        self._converge()
+        gp = jd.GOALDIR / (SID + ".json")
+        gp.write_text("{ not the store")
+        self._reset()
+        self._pass(tiers=STORE_TIERS)
+        self.assertEqual(self._st4("ran"), (1, 1, 1, 1))
+        self.assertEqual(self._st4("incomplete"), (0, 0, 0, 0), "the fresh store is the files' content: no mark")
+        aside = sorted(jd.GOALDIR.glob(SID + ".json.corrupt-*"))
+        self.assertEqual(len(aside), 1, "the bad bytes were moved aside once")
+        self.assertEqual(aside[0].read_text(), "{ not the store")
+        rows = [json.loads(l) for l in open(jd.ERRORS) if l.strip()]
+        self.assertEqual(sum(r.get("err") == "store-quarantined" for r in rows), 1)
+        self.assertEqual(sum(r.get("err") == "pass-crash" for r in rows), 0, "no tier crashed")
+        self._converge(tiers=STORE_TIERS)                                # and the fresh store converges like any other
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_an_unreadable_journal_never_stamps(self):
+        self._session(SID)
+        self._converge()
+        top = self._tops()[0]
+        jd.append_override(SID, top["id"], "resolve", NOW + 1)
+        self._converge()
+        jp = jd._overrides_dir() / (SID + ".jsonl")
+        os.chmod(jp, 0)
+        try:
+            os.utime(jp, ns=(os.stat(jp).st_atime_ns, os.stat(jp).st_mtime_ns + 1_000_000_000))   # re-arm: chmod moves ctime only
+            self._reset()
+            self._pass(tiers=STORE_TIERS)
+            self.assertEqual(self._st4("ran"), (1, 1, 1, 1))
+            self.assertEqual(self._st4("incomplete"), (1, 1, 1, 1), "_replay_overrides' unreadable branch marks the run")
+            self.assertEqual(self._st4("stamped"), (0, 0, 0, 0))
+            rows = [json.loads(l) for l in open(jd.ERRORS) if l.strip()]
+            self.assertTrue(any(r.get("err") == "history-unreadable" for r in rows), "the loud row stays per pass")
+        finally:
+            os.chmod(jp, 0o644)
+        self._reset()
+        self._pass(tiers=STORE_TIERS)
+        self.assertEqual(self._st4("stamped"), (1, 1, 1, 1), "readable again: complete runs stamp")
+
+
+class UnblockerHazard(_Gate):
+    def test_a_turn_ending_after_the_first_touch_is_judged_next_pass_by_the_unblocker(self):
+        # the design review's hazard, on the unblocker: a tick job touches the session while its last turn is
+        # OPEN and a top is blocked; the turn's final record and the idle row land; the gated unblocker runs
+        # and finds nothing due under the pinned parse. Its stamp must hold the PRE-append pair, so the next
+        # pass runs it over the ended turn and the lift files. Without the frame's parse-key pin
+        # (_frame_parse_key) this test fails.
+        path = self._session(SID)
+        self._converge(tiers=("plan", "close"))
+        top = self._tops()[0]
+        self._block(SID, top["id"], T0 + 150)                            # after both ended turns
+        self._append(path, uline(T0 + 200, "use port 8080 for the api", "u3", "a2"),
+                     aline(T0 + 210, "starting on it", "a3", "u3", stop="tool_use"))
+        jd.unblock_llm = lambda blocks, since, completed="": (self.unblock_calls.append(since) or LIFT_ONE)
+        own = jd.begin_pass_frame()
+        try:
+            jd.parsed_session(SID, [str(path)], NOW)                     # the tick job's first touch, turn open
+            pre = jd._frame["keys"][("parse", SID)]
+            self._append(path, aline(T0 + 240, "bound to 8080", "a4", "a3"))
+            self._states_row(SID, T0 + 241, "idle")
+            jd.run_unblock(now=NOW)
+        finally:
+            jd.end_pass_frame(own)
+        self.assertEqual(self.unblock_calls, [], "under the pinned parse the turn is open: nothing due, no call")
+        st = self._stamp("unblock")
+        self.assertIsNotNone(st, "the run completed and stamped")
+        self.assertEqual(st[0][0][1], jd._pair_key(pre), "the stamp holds the PRE-append pair")
+        self._reset()
+        self._pass(tiers=("unblock",))
+        self.assertEqual(self._st("unblock")["ran"], 1, "the live pair differs from the stamped one: the tier runs")
+        self.assertEqual(len(self.unblock_calls), 1, "and examines the ended turn")
+        self.assertIn("bound to 8080", self.unblock_calls[0])
+        self.assertNotEqual(jd.load_goals(SID)["status"].get(top["id"]), "blocked", "the lift filed")
+
+
+class DrainStaysUngated(_Gate):
+    def test_the_drain_distills_an_absent_stuck_store_regardless_of_stamps(self):
+        # a store no discovered session owns (no transcript for SID2) holding a completed top with a null
+        # summary: _drain_undiscovered reaches it on every distill pass; it never holds a stamp to skip on
+        self._session(SID)
+        self._converge()
+        nid = SID2 + ":g1"
+        store = jd.load_goals(SID2)
+        store["nodes"][nid] = {"id": nid, "text": "Ship the search", "parentId": None, "nodeComplete": True,
+                               "cleared": False, "t": T0, "mt": T0 + 60, "trail": [],
+                               "log": [{"kind": "done", "ev_t": T0 + 60, "at": T0 + 60, "src": "closer", "why": "landed"}]}
+        store["status"][nid] = "completed"
+        jd.save_goals(SID2, store)
+        self._reset()
+        self._pass(tiers=("distill",))
+        self.assertEqual(jd.load_goals(SID2)["nodes"][nid].get("summary"), "",
+                         "no transcript, no work: the sentinel, written by the ungated drain")
+        self.assertIsNone(self._stamp("distill", SID2), "the drain leaves no stamp")
+        self.assertEqual(self._st("distill")["ran"], 0, "the discovered sid skipped; the drain is not a gated run")
 
 
 if __name__ == "__main__":

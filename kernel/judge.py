@@ -1080,7 +1080,48 @@ def pass_watermark(tier, fsid):
 # _auto_nudge_session, _clear_done_working_notes) see a world up to one pass old for every session, and
 # a turn that ends after a pass's first touch is judged next pass, whole. That is the frame's design
 # (2026-07-21); the gate adds no lag of its own beyond the producer's 3 s backstop for the clock input.
+#
+# SIGNATURE INPUTS PER TIER (the planner and closer first; the four store-only tiers added 2026-09-07).
+# Each list is what the tier's DECISION path reads, enumerated by reading the stage end to end; a read on
+# a path that ends in a write (or a completeness mark) is not listed, because the write moves the store
+# identity and re-arms the tier on its own. `_sig_inputs` carries the file lists, `_stage_sig` the
+# derived values.
+#  plan        parse pair + candidates; store, journal, archive; captions (_prompt_gist), episodes
+#              (episode_floor), gone marker + reg spawnedAt + _sdk_owned (_cli_epoch), cleared.jsonl
+#              (plan_units -> _live_anchor_gone -> _view_cleared), this sid's stall slice (rollup), the
+#              LEAF stem's task store (_sync_declared_plan). Clock: the bg-launch expiry.
+#  close       parse pair + candidates; store trio; gone marker, reg spawnedAt, _sdk_owned, cleared.jsonl,
+#              stall slice. Clock: the bg-launch expiry.
+#  unblock     parse pair + candidates (due = the parse's ended turns); store trio (load_goals,
+#              _blocked_sub_candidates, _newest_done_at, _completed_since). The candidate scan comes
+#              first, so about half the sessions never reach the parse, yet the pair re-arms them on
+#              every transcript append at one load each: accepted (about 10 ms per pass), stated here.
+#  group       store trio (_group_tops, _overgrown_tops, _group_sig read the store), cleared.jsonl
+#              (_group_tops -> _view_cleared). NO parse: it is read only after a relink, which follows a
+#              model call, which follows a store change. The archive stays in: compaction rewrites it
+#              without a journal row, and a store with a journaled restore row replays from it.
+#  consolidate store trio (_consolidate_tops), cleared.jsonl. NO parse, same reasoning as the grouper.
+#  distill     store trio (todo is a function of status, confirming, the nodes' stamps and diaries), the
+#              states file (_live_prompt_since), this sid's stall slice (stalled_facts, by value). NO
+#              parse and no peer store on the idle path: _title_mirror_tops reads the parse
+#              (_user_ask_text -> _session_user_prompt_record) and a peer's store and archive
+#              (_deleg_frame) only for an UNTITLED mirror top, and every such path ends in a write
+#              (titledT, the caller's save) or the paused incomplete mark; the todo loop reads the parse
+#              only after `if not todo`, and every branch of it writes or marks. `_drain_undiscovered`
+#              calls _distill_session directly for absent stores and is not gated (a straggler never
+#              holds a stamp to be skipped on).
+# Not in any signature, on purpose: MESSAGES (the parse cache key excludes it too: a delivery appends to
+# the transcript); retry-paused.json and usage.json (a skip on either is a "" call, so the belt marks the
+# run incomplete); session-flags.json (_hidden_from_feed filters run_plan's, run_close's and run_unblock's
+# session lists, and the post-pool eviction drops a hidden sid's stamps, so an unmute costs one full run;
+# the other three runners do not filter on it). A store loaded with the `_unread` mark (its override
+# journal exists and did not read) marks the run incomplete wherever it happens (_mark_unread), so a run
+# judged from a fallback view never stamps under the identity of files it did not read; a store file
+# that cannot be read raises at the stage's load (no stamp, a pass-crash row), and an unparseable one is
+# moved aside by load_goals, so the fresh store the stage judges is what the path holds.
 GATED_TIERS = ("plan", "close", "unblock", "group", "consolidate", "distill")
+PARSE_TIERS = ("plan", "close", "unblock")   # the tiers whose decision path reads the parse: their signature
+#                                              carries the pinned pair, and _gated checks the served pair
 _STAGE_STAMP = {}        # (tier, fsid) -> (sig, not_before): the inputs the tier last judged to completion
 _STAGE_LOCK = threading.Lock()
 _STAGE_STAMP_MAX = 4096  # belt: a wholesale clear at the cap (one full walk next pass)
@@ -1156,8 +1197,10 @@ def _sig_inputs(tier, fsid, path):
     (_prompt_gist), its pre-episode retire reads the episode log (episode_floor), _cli_epoch reads the
     gone marker and the reg, plan_units reads cleared.jsonl (_live_anchor_gone -> _view_cleared),
     rollup_status reads the stall slice, _sync_declared_plan reads the LEAF stem's task store; the
-    closer's idle path is the parse, the store, the marker, the reg, cleared.jsonl and the stall slice.
-    Kept apart from _stage_sig so the completeness test can hold a stage's reads against it."""
+    closer's idle path is the parse, the store, the marker, the reg, cleared.jsonl and the stall slice;
+    the unblocker's is the parse and the store; the grouper's and consolidator's the store and
+    cleared.jsonl; the distiller's the store, the states file and the stall slice (the inventory above
+    GATED_TIERS). Kept apart from _stage_sig so the completeness test can hold a stage's reads against it."""
     ident = [GOALDIR / (fsid + ".json"), _overrides_dir() / (fsid + ".jsonl"), GOALARCHDIR / (fsid + ".json")]
     value = []
     if tier in ("plan", "close"):
@@ -1166,19 +1209,29 @@ def _sig_inputs(tier, fsid, path):
     if tier == "plan":
         ident += [CAPDIR / (fsid + ".jsonl"), EPIDIR / (fsid + ".jsonl")]
         value += [em.task_store_dir(Path(path).stem)]
+    if tier in ("group", "consolidate"):
+        ident += [STATE / "cleared.jsonl"]
+    if tier == "distill":
+        ident += [STATESDIR / (fsid + ".jsonl")]
+        value += [STATE / "auto-nudge.json"]
     return ident, value
 
 
 def _stage_sig(tier, fsid, path):
     """The identity of every input `tier`'s decision path reads for `fsid`, taken BEFORE the stage runs:
-    the pass's pinned parse pair with the candidate files it names (a path swap with a coincidentally
-    equal fileset key cannot match), the store trio, and the tier's side files (_sig_inputs). Raises
-    OSError when a component cannot be computed (a vanished candidate, an unlistable task dir, a pinned
-    None pair): the caller runs the stage and stamps nothing, never a raise out of the submit loop."""
-    pair, _cut, _fr = _frame_parse_key(fsid, [path])
-    if pair is None:
-        raise OSError("no parse pair for %s this pass" % fsid)
-    parse = (tuple(_judge_candidates(fsid, [path])), _pair_key(pair))
+    for the parse tiers (PARSE_TIERS) the pass's pinned parse pair with the candidate files it names (a
+    path swap with a coincidentally equal fileset key cannot match), else None (the grouper, consolidator
+    and distiller read no parse on their decision paths, and pinning a key they never parse under would
+    cost four stats per session for nothing); the store trio; and the tier's side files (_sig_inputs)
+    and derived values. Raises OSError when a component cannot be computed (a vanished candidate, an
+    unlistable task dir, a pinned None pair): the caller runs the stage and stamps nothing, never a raise
+    out of the submit loop."""
+    parse = None
+    if tier in PARSE_TIERS:
+        pair, _cut, _fr = _frame_parse_key(fsid, [path])
+        if pair is None:
+            raise OSError("no parse pair for %s this pass" % fsid)
+        parse = (tuple(_judge_candidates(fsid, [path])), _pair_key(pair))
     ident, _value = _sig_inputs(tier, fsid, path)
     side = tuple(_ident(p) for p in ident)
     extra = ()
@@ -1186,6 +1239,8 @@ def _stage_sig(tier, fsid, path):
         extra = (_reg_spawned_at(fsid), _sdk_owned(fsid), _stall_slice(fsid))
     if tier == "plan":
         extra += (em.task_store_fp(Path(path).stem),)
+    if tier == "distill":
+        extra = (_stall_slice(fsid),)
     return (parse, side, extra)
 
 
@@ -1209,20 +1264,26 @@ def _gate_check(tier, fsid, path, now):
     return False, sig
 
 
-def _gated(tier, fn, fsid, path, now, sig, settle=True, parse=True):
+def _gated(tier, fn, fsid, path, now, sig, settle=True, parse=None):
     """Pool worker: run the stage, then stamp `sig` when the run was COMPLETE: it returned normally, set
-    no completeness bit, and (parse tiers) the frame served its parse under the very pair the signature
-    holds (a cut that moved between the pin and the parse means the judged world is not the stamped
-    one: no stamp). `settle`: the tier rolls up, so the stamp carries the clock input
-    (_settle_not_before). A stage that raises is counted `incomplete` (the run did not complete and
-    keyed nothing new) and the exception goes on to the runner's pass-crash row, so ran == stamped +
-    bypassed + incomplete holds through a crash.
+    no completeness bit, and (parse tiers) any parse the frame served for this sid was served under the
+    very pair the signature holds (a cut that moved between the pin and the parse means the judged world
+    is not the stamped one: no stamp; a stage that read no parse at all judged the store alone, and the
+    pinned pair stands for the transcript world it did not need). `settle`: the tier rolls up on its idle
+    path, so the stamp carries the clock input (_settle_not_before); the store tiers pass False (they
+    consult the settle on write paths only).
+    `parse`: whether to hold the served pair against the signature; None means `tier in PARSE_TIERS`.
+    A stage that raises is counted `incomplete` (the run did not complete and keyed nothing new) and the
+    exception goes on to the runner's pass-crash row, so ran == stamped + bypassed + incomplete holds
+    through a crash.
 
-    No frame, no stamp: the served pair the frame records is what makes a stamp exact. A runner
-    outside a pass frame (romp-judge's --plan, a test calling run_plan alone) therefore never writes a
-    stamp: every session runs and counts as bypassed, and the signature's stats are still paid. It DOES
-    honour a stamp a framed pass left: _gate_check reads the live signature either way, so an unframed
-    run after a framed one skips the sessions nothing has changed for, exactly as a framed run would."""
+    No frame, no stamp, for the parse tiers: the served pair the frame records is what makes their stamp
+    exact. A parse-tier runner outside a pass frame (romp-judge's --plan, a test calling run_plan alone)
+    therefore never writes a stamp: every session runs and counts as bypassed, and the signature's stats
+    are still paid. The store-only tiers have no frame-pinned component (every input is stat'd by the
+    gate itself), so they stamp with or without a frame. Either kind DOES honour a stamp a framed pass
+    left: _gate_check reads the live signature either way, so an unframed run after a framed one skips
+    the sessions nothing has changed for, exactly as a framed run would."""
     _judge_ctx.stage_incomplete = False
     _tier_bump(tier, "ran")
     try:
@@ -1237,13 +1298,20 @@ def _gated(tier, fn, fsid, path, now, sig, settle=True, parse=True):
         if getattr(_judge_ctx, "stage_incomplete", False):
             _tier_bump(tier, "incomplete")
             return out
+        if parse is None:
+            parse = tier in PARSE_TIERS
         if parse:
             fr = _frame
-            served = None
-            if fr is not None:
-                with _frame_lock:
-                    served = fr["served"].get(fsid)
-            if served is None or _pair_key(served) != sig[0][1]:
+            if fr is None:
+                _tier_bump(tier, "bypassed")          # no frame: no served pair to make the stamp exact
+                return out
+            with _frame_lock:
+                served = fr["served"].get(fsid, _NO_PIN)
+            # NO parse served for this sid in the pass means the stage never read one (its own read would
+            # have pinned it): the decision depended on the store alone, and the pinned pair the signature
+            # carries is exact for it (the unblocker with no blocked candidate, about half the sessions).
+            # A pair that WAS served must equal the pinned one; a pinned None (a failed stat) never matches.
+            if served is not _NO_PIN and (served is None or _pair_key(served) != sig[0][1]):
                 _tier_bump(tier, "bypassed")
                 return out
         nb = _settle_not_before(fsid, path, now) if settle else None
@@ -2153,6 +2221,7 @@ def _title_mirror_tops(store, fsid, path, now):
         out = mirror_title_llm(nd.get("text") or "", frame=_deleg_frame(store, nid),
                                user_ask=_user_ask_text(store, nid, fsid, path, now))
         if not out and getattr(_judge_ctx, "paused", False):
+            _judge_ctx.stage_incomplete = True         # nothing stamped, nothing written: the gate must not stamp
             continue                                   # skipped, not tried — retry next pass
         nd["titledT"] = int(now)
         titled += 1
@@ -3705,6 +3774,24 @@ def _fresh_store(fsid):
     return store
 
 
+def _mark_unread(store, reason):
+    """The store is NOT what its files say (see load_goals): carry `reason` as the transient `_unread` mark
+    and mark the running stage incomplete. The one load that answers with less than the files hold is a
+    parsed store whose override journal exists and did not read (`reason` "journal", set by
+    _replay_overrides: the user's gestures are missing from this view). A store FILE that cannot be read
+    RAISES out of load_goals instead (the stage dies at its load, _gated counts the run incomplete and the
+    runner files its pass-crash row), and unparseable bytes are moved aside with the fresh store as the
+    path's legitimate content, so neither is marked. Every reader tests the mark's truth; the string says
+    which file failed. The stage mark: the evidence gate stamps a complete run under the identity of the
+    files the stage read, and a run judged from a fallback view would stamp that identity without having
+    read those files; nothing on disk need change before the next read succeeds (an EMFILE, an EIO), so a
+    stamp over a fallback view would skip the session until the file moved, and the per-load judge-errors
+    row and the retry would become once per boot per tier. The mark keeps both per pass (2026-09-07).
+    Thread-local, so a load on the pusher thread marks nothing a stage reads."""
+    store["_unread"] = reason
+    _judge_ctx.stage_incomplete = True
+
+
 def _finish_load(fsid, store, lines=None):
     """The tail every loader runs on a freshly parsed, node-guarded store: replay the override journal
     (`lines` when the caller already read it, else from the file), re-derive the rollup when the replay
@@ -4112,8 +4199,9 @@ def _replay_overrides(fsid, store, lines=None):
                              note="override journal unreadable: %s — user actions may show undone until it reads" % e)
             # the store parsed but the journal exists and did not read: the user's gestures are missing from
             # this view until it does. The journal replays on every load, so a publish of this store loses
-            # nothing durable; the mark tells an identity-keyed reader not to cache it (see the docstring).
-            store["_unread"] = "journal"
+            # nothing durable; the mark tells an identity-keyed reader not to cache it (see the docstring)
+            # and the running stage not to stamp (_mark_unread)
+            _mark_unread(store, "journal")
             return False
     applied = False                                    # any write → load_goals re-runs rollup (one truth)
     arch_nodes = None                                  # the archive is read once, only if a restore entry needs it
@@ -10737,6 +10825,8 @@ def _group_store(store, fsid, now):
             if _sig_fail(store, "group", sig, "grouper", fsid,
                          "grouping this open-top set skipped until the set changes"):
                 store["groupedSig"] = sig              # give-up: adopt the set so the gate closes
+        else:
+            _judge_ctx.stage_incomplete = True         # a failed call writes nothing: the gate must not stamp
         return 0                                       # under the cap the sig stays stale → retry next call
     _sig_fail_clear(store, "group")
     relinks = apply_group(store, menu, ops, now)
@@ -10769,13 +10859,21 @@ def run_group(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=Fa
     fleet = discover(now)[:sessions_cap]
     n = 0
     with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
-        futs = {ex.submit(_group_session, fsid, str(path), now): fsid
-                for fsid, path, anchor, name in fleet}
+        futs = {}
+        for fsid, path, anchor, name in fleet:
+            # the evidence gate: the store trio and cleared.jsonl are the whole decision path (the parse
+            # is read only after a relink); identities taken at THIS tier's moment, so the courier's and
+            # propagate's publishes earlier in the pass are seen
+            skip, sig = _gate_check("group", fsid, str(path), now)
+            if not skip:
+                futs[ex.submit(_gated, "group", _group_session, fsid, str(path), now, sig, settle=False)] = fsid
         for fut in as_completed(futs):
             try:
                 n += fut.result()
+                pass_done("group", futs[fut])
             except Exception as e:                    # fail LOUDLY, never silently skip the store (T111)
                 _log_judge_error("grouper", futs[fut], "pass-crash", note=repr(e))
+    _gate_evict("group", {f[0] for f in fleet})
     if verbose:
         sys.stderr.write("romp-judge: grouper relinked %d top goals\n" % n)
     return n
@@ -10831,6 +10929,8 @@ def _consolidate_store(store, fsid, now):
             if _sig_fail(store, "consolidate", sig, "consolidator", fsid,
                          "consolidating this completed-top set skipped until the set changes"):
                 store["consolidatedSig"] = sig         # give-up: adopt the set so the gate closes
+        else:
+            _judge_ctx.stage_incomplete = True         # a failed call writes nothing: the gate must not stamp
         return changed                                 # under the cap the sig stays stale → retry next pass
     _sig_fail_clear(store, "consolidate")
     relinks = apply_group(store, cmenu, ops, now)
@@ -10863,13 +10963,18 @@ def run_consolidate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verb
     fleet = discover(now)[:sessions_cap]
     n = 0
     with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
-        futs = {ex.submit(_consolidate_session, fsid, str(path), now): fsid
-                for fsid, path, anchor, name in fleet}
+        futs = {}
+        for fsid, path, anchor, name in fleet:
+            skip, sig = _gate_check("consolidate", fsid, str(path), now)   # the evidence gate: store trio + cleared.jsonl
+            if not skip:
+                futs[ex.submit(_gated, "consolidate", _consolidate_session, fsid, str(path), now, sig, settle=False)] = fsid
         for fut in as_completed(futs):
             try:
                 n += fut.result()
+                pass_done("consolidate", futs[fut])
             except Exception as e:                    # fail LOUDLY, never silently skip the store (T111)
                 _log_judge_error("consolidator", futs[fut], "pass-crash", note=repr(e))
+    _gate_evict("consolidate", {f[0] for f in fleet})
     if verbose:
         sys.stderr.write("romp-judge: consolidator reorganized %d completed columns\n" % n)
     return n
@@ -12675,6 +12780,7 @@ def _unblock_session(fsid, path, now):
                             for i, (_nid, nd, _bt) in enumerate(due, 1))
     raw = unblock_llm(blocks_text, since, completed)   # ← seconds; no store copy held across this
     if not raw:
+        _judge_ctx.stage_incomplete = True             # nothing written: the evidence gate must not stamp
         return []                                      # call failed / paused (logged) → retry next pass
     lifts = _parse_unblock(raw, len(due))
     store = load_goals(fsid)                           # FRESH load: apply onto the current store, never the
@@ -12731,13 +12837,20 @@ def run_unblock(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=
     fleet = [s for s in discover(now) if not _hidden_from_feed(s[0])][:sessions_cap]
     n = 0
     with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
-        futs = {ex.submit(_unblock_session, fsid, str(path), now): fsid
-                for fsid, path, anchor, name in fleet}
+        futs = {}
+        for fsid, path, anchor, name in fleet:
+            # the evidence gate: the parse pair (due = the parse's ended turns) and the store trio are
+            # the whole decision path; no rollup on the idle path, so no clock input (settle=False)
+            skip, sig = _gate_check("unblock", fsid, str(path), now)
+            if not skip:
+                futs[ex.submit(_gated, "unblock", _unblock_session, fsid, str(path), now, sig, settle=False)] = fsid
         for fut in as_completed(futs):
             try:
                 n += len(fut.result())
+                pass_done("unblock", futs[fut])
             except Exception as e:                    # fail LOUDLY, never silently skip the store (T111)
                 _log_judge_error("unblocker", futs[fut], "pass-crash", note=repr(e))
+    _gate_evict("unblock", {f[0] for f in fleet})
     if verbose:
         sys.stderr.write("romp-judge: unblocker lifted %d stale blocks\n" % n)
     return n
@@ -13984,6 +14097,7 @@ def _distill_session(fsid, path, now):
             out = stall_llm(nodes[top].get("text", ""), work, holding)
             if not out:
                 if getattr(_judge_ctx, "paused", False):   # pause-skip, not a real failure (see the briefer)
+                    _judge_ctx.stage_incomplete = True     # deferred with no write: the gate must not stamp
                     continue
                 fails = nodes[top].get("stallFails", 0) + 1
                 _fail_log(nodes[top], "stall", now)    # the chip's attempt history: model + literal error
@@ -14108,6 +14222,7 @@ def _distill_session(fsid, path, now):
                                   user_ask=_user_ask_text(store, top, fsid, path, now)))
             if not out:
                 if getattr(_judge_ctx, "paused", False):   # the call was SKIPPED (global retry-pause on), not
+                    _judge_ctx.stage_incomplete = True     # deferred with no write: the gate must not stamp
                     continue                               # tried — never count a pause-skip toward give-up, else
                     # a retry-pause (esp. one that flaps on/off mid-pass) permanently blanks the card's brief to
                     # the "" sentinel though the API was never actually asked (the user 2026-07-03). Leave
@@ -14153,7 +14268,10 @@ def _distill_session(fsid, path, now):
                     if not _r2 and getattr(_judge_ctx, "paused", False):
                         # the retry was SKIPPED, not tried — the standing pause discipline: leave
                         # the brief null and re-enter next pass once the pause clears; a pause-skip
-                        # never counts as a verdict (the 2026-07-03 rule, met again here)
+                        # never counts as a verdict (the 2026-07-03 rule, met again here). The eager
+                        # promptBriefedT stamp above may already have set `changed`; either way the
+                        # brief is still owed, so the gate must not stamp this run
+                        _judge_ctx.stage_incomplete = True
                         changed = True
                         continue
                     _o2, _s2, _q2 = _split_source(_r2 or "")
@@ -14244,6 +14362,7 @@ def _distill_session(fsid, path, now):
                           user_ask=_user_ask_text(store, top, fsid, path, now))
         if not out:
             if getattr(_judge_ctx, "paused", False):   # pause-skip, not a real failure — don't count it toward
+                _judge_ctx.stage_incomplete = True     # deferred with no write: the gate must not stamp
                 continue                               # give-up (leave summary null → re-enters once unpaused)
             fails = nodes[top].get("distillFails", 0) + 1   # the failed call itself was logged by _judge_run
             _fail_log(nodes[top], "summary", now)      # the chip's attempt history: model + literal error
@@ -14651,12 +14770,20 @@ def run_distill(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=
     fleet = discover(now)[:sessions_cap]
     n = 0
     with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
-        futs = {ex.submit(_distill_session, fsid, str(path), now): fsid for fsid, path, anchor, name in fleet}
+        futs = {}
+        for fsid, path, anchor, name in fleet:
+            # the evidence gate: the store trio, the states file and this sid's stall records are the whole
+            # decision path (the inventory above GATED_TIERS); the drain below stays ungated
+            skip, sig = _gate_check("distill", fsid, str(path), now)
+            if not skip:
+                futs[ex.submit(_gated, "distill", _distill_session, fsid, str(path), now, sig, settle=False)] = fsid
         for fut in as_completed(futs):
             try:
                 n += fut.result()
+                pass_done("distill", futs[fut])
             except Exception as e:                     # fail LOUDLY, never silently skip the store
                 _log_judge_error("distiller", futs[fut], "pass-crash", note=repr(e))
+    _gate_evict("distill", {f[0] for f in fleet})
     n += _drain_undiscovered(now, {fsid for fsid, _p, _a, _n2 in fleet})
     if verbose:
         sys.stderr.write("romp-judge: distiller summarized %d completed goals\n" % n)
