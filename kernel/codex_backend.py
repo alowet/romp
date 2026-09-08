@@ -248,6 +248,9 @@ class _Session:
         self.norm = None              # ThreadNormalizer, built by the worker on first need
         self.worker = None
         self.kick = threading.Event() # wake the worker (new send / resume / shutdown)
+        self.parked = threading.Event()  # the worker is inside its backoff wait: a kick from now on wakes it
+                                         # (set just before the wait, cleared after; tests wait on this
+                                         # before releasing a backoff, instead of racing the worker to it)
         self.change_generation = 0    # explicit send/model/effort/resume changes that may fix a rejection
         self.turn_rejection = None    # rejected request generations; parked until either one changes
         self.note = ""                # postal working-note
@@ -1272,7 +1275,11 @@ class CodexBackend:
                     with s.lock:
                         if s.dead:
                             return
+                    # parked is set only once the clear above is behind us, so a kick that arrives
+                    # after a reader saw it can no longer be discarded before the wait sees it
+                    s.parked.set()
                     s.kick.wait(delay)
+                    s.parked.clear()
                     s.kick.clear()
         finally:
             with s.lock:

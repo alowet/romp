@@ -653,21 +653,27 @@ class Lifecycle(unittest.TestCase):
         # gate, twice on the same runner): the real 0.25s floor raced the main thread — a
         # descheduled runner let the LEGITIMATE 250ms retry fire before the assertion ran,
         # and the test read its own backoff expiring as a hot spin. With the floor pinned
-        # high, a second attempt inside the observation window can only be a real hot spin;
-        # the recovery phase then releases the backoff EXPLICITLY instead of racing a timer.
+        # high, a second attempt before the worker parks can only be a real hot spin.
         saved_floor = cb.CLIENT_RETRY_MIN
         cb.CLIENT_RETRY_MIN = 30.0
         self.addCleanup(setattr, cb, "CLIENT_RETRY_MIN", saved_floor)
         be, _, _ = build(factory=flaky_factory)
         sid = be.spawn("web", "/TESTDIR")
+        s = dict(be._session_items())[sid]
         self.assertTrue(be.send(sid, "retry me"))
         self.assertTrue(until(lambda: len(attempts) == 1), "the first attempt fires")
-        time.sleep(0.05)
-        self.assertEqual(len(attempts), 1, "unavailable client must not hot-spin")
+        # Release the backoff only once the worker is PARKED in it (s.parked, set right before its
+        # wait). The worker clears stale kicks just before parking, so a release kicked earlier —
+        # after a fixed sleep, as this test did — was discarded whenever the runner descheduled the
+        # worker between the failed attempt and that clear (its registry save and push sit there),
+        # and the worker slept the whole floor while the assertion below timed out (pulls 1026 and
+        # 991, 2026-09-08; reproduced by slowing that stretch). Waiting on the park makes the release
+        # an event the worker cannot miss, whatever the runner's speed.
+        self.assertTrue(until(lambda: s.parked.is_set(), timeout=20), "the worker parks in its backoff")
+        self.assertEqual(len(attempts), 1, "unavailable client must not hot-spin before parking")
         with be._client_lock:
             be._client_retry_at = 0.0                  # the explicit release, not a timer race
-        for _, s in be._session_items():
-            s.kick.set()
+        s.kick.set()
         # a GENEROUS bound: the recovery is event-shaped (the explicit release above is
         # the event), so only "eventually" matters — the 3s bound starved the worker
         # thread on a runner at load 20+ (the r63 release gate: a 55-minute full suite)
