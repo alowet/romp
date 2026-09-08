@@ -2562,7 +2562,11 @@ def parsed_session(fsid, files, now):
         key = None
     hit = _PARSE_CACHE.get(fsid)
     if key is not None and hit and hit[0] == key:
-        return hit[1]
+        fr = _frame
+        if fr is not None:                 # a WARM first touch pins too (review 2026-09-06): this path used to
+            with _frame_lock:              #  return unpinned, so a session already in the cache froze nothing
+                return fr["parses"].setdefault(fsid, hit[1])   # and a mid-pass append reached a later stage
+        return hit[1]                      #  only - the two-worlds shape the frame exists to prevent
     session = em.parse_session(files[0], rompuuid=fsid, candidate_files=list(files),
                                states=str(states), postal_log=str(MESSAGES), now=now,
                                sdk_human=_sdk_owned(fsid),   # SDK session → composer input is promptSource "sdk" = the human (mirrors the kernel)
