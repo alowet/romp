@@ -100,7 +100,9 @@ broad `git add` will sweep up your work). Conventions:
      `origin`, which is then romp-on itself). `remote.pushDefault` points at `origin`,
      so a bare `git push` does the same. Never push to `upstream`: the server rejects
      it, and naming it in scripts bakes in a failure.
-  2. `gh pr create --repo romp-on/romp --label <tier>` (gh detects the fork head), then
+  2. `gh pr create --repo romp-on/romp --label <tier>` (gh detects the fork head; a
+     contributor who cannot label writes `Tier: fix` on a line of the body instead, and the
+     tier workflow applies the label), then
      `gh pr merge --auto --merge`: it lands itself when the required checks pass, and
      the Tier policy check is one of them. Green CI alone lands `docs` and `fix` for
      every author, and `feature` too when the author is the repository owner (an
@@ -121,7 +123,9 @@ broad `git add` will sweep up your work). Conventions:
   fetches PR data and posts the verdict. See `docs/pr-tiers.md`. Roles are the author's
   collaborator permission: admin is the repository owner; write or maintain is a member;
   anyone else is a contributor (the check gates members and contributors alike). The author
-  picks the tier at filing time:
+  picks the tier at filing time, as the label or, for a contributor who cannot label, as a
+  `Tier: fix` line in the PR body that the tier workflow turns into the label (a label already
+  present wins; maintainers re-tier by relabeling):
   - `docs` (tier 0; renamed from `tests-only`): documentation. To the check it is the same
     tier as `fix`: merges on green for every author.
   - `fix` (tier 1): a bug fix with a test that fails before it. Merges on green for every

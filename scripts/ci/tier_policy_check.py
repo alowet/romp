@@ -4,8 +4,10 @@ workflow's GITHUB_TOKEN, builds the record scripts/ci/tier_policy.py evaluates, 
 check run named "Tier policy" on the PR's head sha. API reads only - it never checks out or runs PR code.
 
 Trust model, stated once: the workflow that runs this is the BASE branch's copy (pull_request_target), so
-a PR cannot rewrite its own gate; the token holds checks:write (to post the verdict), pull-requests:read,
-issues:read, contents:read and nothing else. Nothing in the policy is timed (the owner's rules of
+a PR cannot rewrite its own gate; the token holds checks:write (to post the verdict), pull-requests:write
+(to apply the tier the body declares as a label, T273), actions:write (to re-run the label counter on
+that head), issues:read, contents:read and nothing else. The PR body is DATA read through the API, never
+executed. Nothing in the policy is timed (the owner's rules of
 2026-09-08: the gate depends on the tier and on the author's role, and no tier has a time-based path), so
 this fetcher reads no check-run history, no timeline and no commit date; the record it builds carries no
 time field at all. The collaborator permission is fetched for the AUTHOR as well as for every reviewer: the
@@ -21,6 +23,15 @@ raises instead of grading a mixed record. Commit dates are never read.
 GITHUB_TOKEN is the GitHub Actions app's installation token, which is what the Checks API's "GitHub Apps
 only" write rule admits; the ruleset requiring this check must select the run posted by the GitHub Actions
 app (a bare context match would accept any write-holder's commit status of the same name).
+The body's tier line (T273, the owner 2026-09-08): outside contributors hold read permission and cannot
+label their own PRs, so `Tier: fix` in the body is how they sort one. When a PR carries NO tier label and
+its body declares one, the label is applied through the API before the verdict, and the same run grades
+the tier it applied; a label already on the PR always stands (maintainers re-tier by relabeling), and a
+body that disagrees is only mentioned in the summary. A label added with the workflow's own token starts
+no workflow run (GitHub: events the GITHUB_TOKEN causes create none, save dispatches), so the "Exactly one
+tier label" run on the head would keep the count it read before the label: its newest completed run is
+re-run through the Actions API. The hourly --all-open pass does the same for every open PR, so a PR whose
+author adds the line reaches both green checks without a further push.
 Usage: tier_policy_check.py --pr N | --all-open (env GITHUB_TOKEN, GITHUB_REPOSITORY)."""
 import json
 import os
@@ -34,10 +45,11 @@ from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
-from tier_policy import evaluate  # noqa: E402
+from tier_policy import evaluate, declared_tier, TIERS, TIER_ALIASES  # noqa: E402
 
 API = "https://api.github.com"
 CHECK_NAME = "Tier policy"
+LABEL_COUNTER_WORKFLOW = "pr-tier.yml"   # the read-only "Exactly one tier label" check, re-run after a label write
 MAX_ISSUE_REFS = 5                 # a body can be 64 KiB of "#1 " - bound the work (and the token budget)
 
 
@@ -158,16 +170,56 @@ def post_check(repo, head, verdict, token, number):
     _req("POST", "/repos/%s/check-runs" % repo, token, body)
 
 
+def apply_declared_tier(repo, number, rec, token):
+    """The body's declared tier becomes the label when the PR carries NO tier label (T273): one label write
+    through the API, the record learns it, and the note returned rides the verdict's summary. A tier label
+    already present stands whatever the body says (evaluate mentions the disagreement); a body declaring
+    nothing, or two tiers, applies nothing (evaluate says why). A refused write raises: grading the PR as
+    unlabeled with a normal-looking verdict would hide the missing permission (the T121 rule, fail loudly)."""
+    if any(TIER_ALIASES.get(l, l) in TIERS for l in rec.get("labels") or []):
+        return ""
+    tier, _ = declared_tier(rec.get("body"))
+    if not tier:
+        return ""
+    _req("POST", "/repos/%s/issues/%d/labels" % (repo, number), token, {"labels": [tier]})
+    rec["labels"] = list(rec.get("labels") or []) + [tier]
+    return "The `%s` label was applied from the body's tier line.%s" % (tier, _refresh_label_counter(repo, rec["head_sha"], token))
+
+
+def _refresh_label_counter(repo, head, token):
+    """A label added with the workflow's own token starts no workflow run, so the "Exactly one tier label"
+    run on this head still shows the count it read before the label. Re-run its newest run on the head when
+    that run is completed; a queued run has not counted yet and reads the label itself; one in progress may
+    have counted already and cannot be re-run, so the summary says so instead of guessing; no run on the
+    head (the counter never fired for it) is nothing to refresh. Returns the sentence for the summary."""
+    runs, _ = _req("GET", "/repos/%s/actions/workflows/%s/runs?head_sha=%s&per_page=5"
+                   % (repo, LABEL_COUNTER_WORKFLOW, urllib.parse.quote(head)), token)
+    runs = (runs or {}).get("workflow_runs") or []
+    if not runs:
+        return ""
+    run = runs[0]                       # the API lists runs newest first
+    if run.get("status") == "completed":
+        _req("POST", "/repos/%s/actions/runs/%d/rerun" % (repo, int(run["id"])), token)
+        return ' The "Exactly one tier label" run on this head was re-run to count it.'
+    if run.get("status") == "in_progress":
+        return ' The "Exactly one tier label" run on this head was mid-count; if it stays red, push or edit once more.'
+    return ""                           # queued: it reads the labels when it starts
+
+
 def run_one(repo, n, token):
-    """Evaluate one PR and post its verdict. A failure while BUILDING the record posts a failing verdict
-    naming the error when the head is known (never a silent gap on a required check), and re-raises so
-    the job reads red; in --all-open the caller isolates it so one PR cannot starve the others."""
+    """Evaluate one PR and post its verdict. A failure while BUILDING the record (or applying the body's
+    declared tier) posts a failing verdict naming the error when the head is known (never a silent gap on
+    a required check), and re-raises so the job reads red; in --all-open the caller isolates it so one PR
+    cannot starve the others."""
     head = None
     try:
         pr, _ = _req("GET", "/repos/%s/pulls/%d" % (repo, n), token)
         head = pr["head"]["sha"]
         rec = build_record(repo, n, token)
+        note = apply_declared_tier(repo, n, rec, token)
         v = evaluate(rec)
+        if note:
+            v["summary"] += " " + note
     except Exception as e:
         if head:
             post_check(repo, head, {"conclusion": "failure", "title": "Tier policy: evaluation failed",

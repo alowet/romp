@@ -631,20 +631,30 @@ class WorkflowPins(unittest.TestCase):
         self.assertIn("approval propagation", m.group(1))
         self.assertNotIn("seven", self.wf.lower(), "no clock rides the schedule")
 
-    def test_the_token_holds_only_what_the_verdict_needs(self):
-        self.assertIn("checks: write", self.wf)
-        for line in ("pull-requests: read", "issues: read", "contents: read"):
-            self.assertIn(line, self.wf)
+    def test_the_token_holds_what_the_verdict_and_the_label_need(self):
+        # checks:write posts the verdict; pull-requests:write applies the body's declared tier as a label
+        # (T273); actions:write re-runs the label counter on that head. Never contents:write: the job
+        # checks out the base tree read-only and executes nothing from the PR
+        for line in ("checks: write", "pull-requests: write", "actions: write", "issues: read", "contents: read"):
+            self.assertIn(line, self.wf, line)
         self.assertNotIn("contents: write", self.wf)
-        self.assertNotIn("pull-requests: write", self.wf)
+        self.assertNotIn("issues: write", self.wf)
+
+    def test_the_header_says_the_body_is_data_and_the_label_write_is_the_only_new_power(self):
+        head = self.wf[:self.wf.index("\non:")]
+        for phrase in ("body is data", "pull-requests: write", "Tier:"):
+            self.assertIn(phrase, head, phrase)
 
     def test_the_job_never_runs_pr_code(self):
         # the only checkout is the base tree; no ref: pointing at the PR head, and the fetcher is
         # API reads plus one check-run POST
         self.assertNotIn("ref:", self.wf)
         self.assertNotIn("head.sha", self.wf)
-        self.assertEqual(self.fetch.count('_req("POST"'), 1, "exactly one write: the verdict")
+        self.assertEqual(self.fetch.count('_req("POST"'), 3,
+                         "exactly three writes: the verdict, the declared tier's label, the label counter's re-run")
         self.assertIn('"/repos/%s/check-runs"', self.fetch)
+        self.assertIn('"/repos/%s/issues/%d/labels"', self.fetch)
+        self.assertIn('/actions/runs/%d/rerun', self.fetch)
 
     def test_the_fetcher_reads_no_clock_input(self):
         # nothing in the policy is timed, so the fetcher lists no check-run history, no timeline and
@@ -670,6 +680,15 @@ class WorkflowPins(unittest.TestCase):
         self.assertEqual(in_jq, expected, "the label check and the policy name the same tiers")
         for t in tp.TIERS:
             self.assertIn("`%s`" % t, tmpl, "the PR template lists every tier")
+
+    def test_the_docs_describe_the_body_line(self):
+        # docs/pr-tiers.md has the section; the repo CLAUDE.md's tier bullet names the line in a sentence
+        doc = open(os.path.join(os.path.dirname(HERE), "docs", "pr-tiers.md")).read()
+        self.assertIn("Declaring the tier", doc)
+        for phrase in ("Tier: fix", "label", "wins"):
+            self.assertIn(phrase, doc[doc.index("Declaring the tier"):], phrase)
+        claude = open(os.path.join(os.path.dirname(HERE), "CLAUDE.md")).read()
+        self.assertIn("`Tier: fix`", claude, "the CLAUDE.md tier bullet names the body line")
 
 
 class FetcherShapes(unittest.TestCase):
@@ -702,10 +721,22 @@ class FetcherShapes(unittest.TestCase):
         def fake_req(method, path, token, body=None):
             test.calls.append((method, path))
             path, _, query = path.partition("?")       # _get_all appends per_page; match the route
+            if method == "POST":
+                test.posted.append((path, body))
             if path.endswith("/pulls/42"):
                 return {"head": {"sha": HEAD}, "user": {"login": test.author}, "labels": [{"name": l} for l in test.labels],
-                        "created_at": "2026-08-30T00:00:00Z", "body": "fixes #7",
+                        "created_at": "2026-08-30T00:00:00Z", "body": test.body,
                         "changed_files": test.changed_files}, {}
+            if path.endswith("/issues/42/labels"):
+                test.labels = test.labels + list((body or {}).get("labels") or [])
+                return [{"name": l} for l in test.labels], {}
+            if "/actions/workflows/pr-tier.yml/runs" in path:
+                test.assertIn("head_sha=" + HEAD, query, "the counter's runs are asked for on THIS head")
+                return {"total_count": len(test.counter_runs), "workflow_runs": test.counter_runs}, {}
+            if "/actions/runs/" in path and path.endswith("/rerun"):
+                return None, {}
+            if path.endswith("/check-runs"):
+                return {"id": 1}, {}
             if "/files" in path:
                 if test.files_error:
                     raise urllib.error.HTTPError(path, test.files_error, "x", {}, None)
@@ -743,7 +774,103 @@ class FetcherShapes(unittest.TestCase):
                          "submitted_at": "2026-09-02T00:00:00Z"}]
         self.events = []
         self.issue_fetches = []
+        self.body = "fixes #7"
+        self.posted = []
+        self.counter_runs = [{"id": 9001, "status": "completed", "conclusion": "failure"}]
         self.tc._req = fake_req
+
+    def _labels_posted(self):
+        return [b for p, b in self.posted if p.endswith("/issues/42/labels")]
+
+    def _reruns_posted(self):
+        return [p for p, b in self.posted if p.endswith("/rerun")]
+
+    def test_a_declared_tier_on_an_unlabeled_pr_is_applied_before_the_verdict(self):
+        # T273: a read-only contributor cannot label their PR, so the body's `Tier: fix` line becomes the
+        # label through the workflow, and the same run grades the tier it just applied
+        self.labels = []
+        self.body = "fixes #7\n\nTier: fix\n"
+        self.reviews = []
+        v = self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._labels_posted(), [{"labels": ["fix"]}], "one label write, the declared tier")
+        self.assertEqual(v["conclusion"], "success", "graded as the fix it declared, in the same run")
+        self.assertIn("applied", v["summary"])
+        self.assertIn("fix", v["summary"])
+        # a label added with the workflow's own token fires no `labeled` run, so the "Exactly one tier
+        # label" run on this head still shows the count it read before: its newest completed run is re-run
+        self.assertEqual(self._reruns_posted(), ["/repos/romp-on/romp/actions/runs/9001/rerun"])
+
+    def test_an_existing_label_stands_and_a_disagreeing_body_is_only_mentioned(self):
+        self.labels = ["feature"]
+        self.body = "Tier: fix"
+        self.perms["author-a"] = "admin"
+        v = self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._labels_posted(), [], "the label stands; maintainers re-tier by relabeling")
+        self.assertEqual(self._reruns_posted(), [])
+        self.assertEqual(v["title"], "Tier policy: feature", "graded as the label says")
+        self.assertIn("fix", v["summary"])
+        self.assertIn("relabel", v["summary"])
+
+    def test_disagreeing_tier_lines_apply_nothing_and_the_verdict_says_so(self):
+        self.labels = []
+        self.body = "Tier: fix\n\nTier: feature\n"
+        v = self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._labels_posted(), [])
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("disagree", v["summary"])
+
+    def test_the_untouched_template_applies_nothing_and_the_verdict_points_at_the_placeholder(self):
+        self.labels = []
+        self.body = open(os.path.join(os.path.dirname(HERE), ".github", "PULL_REQUEST_TEMPLATE.md")).read()
+        v = self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._labels_posted(), [])
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("names no tier", v["summary"])
+
+    def test_a_counter_run_still_in_progress_is_not_rerun_and_the_verdict_says_so(self):
+        self.labels = []
+        self.body = "Tier: fix"
+        self.counter_runs = [{"id": 9002, "status": "in_progress", "conclusion": None}]
+        v = self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._labels_posted(), [{"labels": ["fix"]}])
+        self.assertEqual(self._reruns_posted(), [], "a run in progress cannot be re-run")
+        self.assertIn("mid-count", v["summary"])
+
+    def test_a_queued_counter_run_reads_the_label_itself(self):
+        self.labels = []
+        self.body = "Tier: fix"
+        self.counter_runs = [{"id": 9003, "status": "queued", "conclusion": None}]
+        v = self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._reruns_posted(), [], "a queued run has not counted yet: nothing to refresh")
+        self.assertEqual(v["conclusion"], "success")
+
+    def test_no_counter_run_on_the_head_is_nothing_to_refresh(self):
+        self.labels = []
+        self.body = "Tier: fix"
+        self.counter_runs = []
+        v = self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._labels_posted(), [{"labels": ["fix"]}])
+        self.assertEqual(self._reruns_posted(), [])
+        self.assertEqual(v["conclusion"], "success")
+
+    def test_a_failed_label_write_fails_the_run_loudly(self):
+        # a 403 (the token lacks pull-requests:write) must not grade the PR as unlabeled with a
+        # normal-looking verdict: the run raises, and run_one posts "evaluation failed" naming the error
+        real = self.tc._req
+
+        def refusing(method, path, token, body=None):
+            if method == "POST" and path.endswith("/issues/42/labels"):
+                raise urllib.error.HTTPError(path, 403, "Resource not accessible by integration", {}, None)
+            return real(method, path, token, body)
+        self.tc._req = refusing
+        self.labels = []
+        self.body = "Tier: fix"
+        with self.assertRaises(urllib.error.HTTPError):
+            self.tc.run_one("romp-on/romp", 42, "tok")
+        failed = [b for p, b in self.posted if p.endswith("/check-runs")]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["conclusion"], "failure")
+        self.assertIn("evaluation failed", failed[0]["output"]["title"])
 
     def test_build_record_survives_the_documented_shapes_and_has_no_time_field(self):
         rec = self.tc.build_record("romp-on/romp", 42, "tok")
@@ -843,3 +970,103 @@ class FetcherShapes(unittest.TestCase):
         self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure", "unapproved, the unseen files hold it")
         rec["labels"] = ["docs"]
         self.assertEqual(self.tc.evaluate(rec)["conclusion"], "failure", "docs cannot vouch for unseen files either")
+
+
+class DeclaredTier(unittest.TestCase):
+    """The body's tier line (T273, the owner 2026-09-08): outside contributors hold read permission and
+    cannot label their own PRs, so the author writes `Tier: fix` in the PR body and the tier workflow
+    applies the label. declared_tier(body) is the pure parser: one whole line, case-insensitive, one of
+    the four tiers (the tests-only alias reads as docs); HTML comments are not read, so the template's
+    explanation never parses; two lines naming different tiers declare nothing, and the reason says so.
+    A label already on the PR always wins: the body is then only remarked on."""
+
+    def test_each_tier_parses_from_its_own_line(self):
+        for t in tp.TIERS:
+            self.assertEqual(tp.declared_tier("one line about the change\n\nTier: %s\n\n## Tests\n" % t), (t, ""))
+
+    def test_case_bold_backticks_and_a_list_marker_are_tolerated(self):
+        for body in ("tier: FIX", "**Tier:** fix", "Tier: `fix`", "- Tier: fix", "  TIER :  Fix  ", "__Tier__: fix"):
+            self.assertEqual(tp.declared_tier(body)[0], "fix", body)
+
+    def test_the_alias_reads_as_docs(self):
+        self.assertEqual(tp.declared_tier("Tier: tests-only")[0], "docs")
+
+    def test_no_line_declares_nothing_and_says_nothing(self):
+        self.assertEqual(tp.declared_tier(""), (None, ""))
+        self.assertEqual(tp.declared_tier(None), (None, ""))
+        self.assertEqual(tp.declared_tier("fixes #7\n\nthe tier is fix, really\n## Tier\n"), (None, ""))
+
+    def test_the_value_must_be_the_whole_line(self):
+        tier, why = tp.declared_tier("Tier: fix and a bit more")
+        self.assertIsNone(tier)
+        self.assertIn("fix and a bit more", why)
+
+    def test_a_value_that_is_not_a_tier_declares_nothing_and_names_itself(self):
+        tier, why = tp.declared_tier("Tier: bugfix")
+        self.assertIsNone(tier)
+        self.assertIn("bugfix", why)
+        self.assertIn("names no tier", why)
+        tier, why = tp.declared_tier("Tier:")
+        self.assertIsNone(tier)
+        self.assertTrue(why, "an empty line is said, not skipped")
+
+    def test_html_comments_are_not_read(self):
+        self.assertEqual(tp.declared_tier("<!-- Tier: fix -->"), (None, ""))
+        self.assertEqual(tp.declared_tier("<!--\nTier: fix\n-->\nTier: docs")[0], "docs")
+
+    def test_two_lines_naming_different_tiers_declare_nothing_and_say_so(self):
+        tier, why = tp.declared_tier("Tier: fix\n\nTier: feature")
+        self.assertIsNone(tier)
+        self.assertIn("disagree", why)
+        for word in ("fix", "feature"):
+            self.assertIn(word, why)
+
+    def test_two_lines_naming_the_same_tier_agree(self):
+        self.assertEqual(tp.declared_tier("Tier: fix\nTier: FIX")[0], "fix")
+
+    def test_the_template_placeholder_never_parses(self):
+        tmpl = open(os.path.join(os.path.dirname(HERE), ".github", "PULL_REQUEST_TEMPLATE.md")).read()
+        self.assertRegex(tmpl, r"(?m)^Tier: ", "the template carries the fill-in line")
+        tier, why = tp.declared_tier(tmpl)
+        self.assertIsNone(tier, "the untouched template declares no tier")
+        self.assertIn("names no tier", why, "...and the reason points at the placeholder")
+        for t in tp.TIERS:
+            self.assertEqual(tp.declared_tier(tmpl.replace(re.search(r"(?m)^Tier: .*$", tmpl).group(0), "Tier: " + t))[0], t,
+                             "the placeholder replaced by a tier parses as that tier")
+
+    # evaluate reads the same line: with no label it names the label the workflow applies; with a label
+    # the label stands and a disagreeing body is only mentioned
+    def test_no_label_and_a_declared_tier_fails_naming_the_label_the_workflow_applies(self):
+        v = tp.evaluate(pr(labels=[], body="Tier: fix"))
+        self.assertEqual(v["conclusion"], "failure", "pure: the label is not on the PR yet")
+        self.assertIn("`fix`", v["summary"])
+        self.assertIn("applies", v["summary"])
+
+    def test_no_label_and_disagreeing_lines_say_so(self):
+        v = tp.evaluate(pr(labels=[], body="Tier: fix\nTier: feature"))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("disagree", v["summary"])
+
+    def test_no_label_and_no_line_points_at_the_body_line(self):
+        v = tp.evaluate(pr(labels=[]))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("Tier:", v["summary"])
+
+    def test_a_label_stands_over_a_disagreeing_body_and_the_verdict_mentions_it(self):
+        v = tp.evaluate(pr(labels=["fix"], body="Tier: feature"))
+        self.assertEqual(v["conclusion"], "success", "the fix label's own verdict")
+        self.assertIn("`feature`", v["summary"])
+        self.assertIn("relabel", v["summary"])
+        v = tp.evaluate(pr(labels=["feature"], body="Tier: fix"))
+        self.assertEqual(v["conclusion"], "failure", "a contributor's feature waits, whatever the body says")
+        self.assertIn("relabel", v["summary"])
+
+    def test_a_label_matching_the_body_is_not_remarked_on(self):
+        v = tp.evaluate(pr(labels=["fix"], body="Tier: fix"))
+        self.assertNotIn("body", v["summary"])
+        self.assertNotIn("relabel", v["summary"])
+
+    def test_two_labels_still_fail_whatever_the_body_says(self):
+        v = tp.evaluate(pr(labels=["fix", "feature"], body="Tier: fix"))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("2", v["title"])

@@ -75,6 +75,41 @@ TRUNCATED = "files beyond the API's 3000-entry listing"
 GUARDED_PREFIXES = (".github/", "scripts/ci/")
 import re
 _ISSUE_REF = re.compile(r"(?:^|[^\w/])#(\d+)\b|github\.com/romp-on/romp/issues/(\d+)\b")
+# the body's tier line (T273, the owner 2026-09-08): `Tier: fix` on a line of its own, read case-insensitively
+# with bold, backticks or a list marker tolerated; HTML comments are cut out first, so the PR template's
+# explanation of the tiers never parses. A read-only contributor cannot label their own PR (labeling needs
+# triage), so this line is how they sort it: the workflow applies the matching label from it.
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+_TIER_LINE = re.compile(r"^\s*(?:[-*]\s+)?[*_`]*tier[*_`]*\s*:[*_`]*\s*(.*?)\s*$", re.I)
+
+
+def declared_tier(body):
+    """The tier the PR body declares on a `Tier: <tier>` line, as (tier, why): (tier, "") when exactly one
+    tier is named (the same tier on two lines still agrees; the tests-only alias reads as docs); (None, "")
+    when no line declares anything; (None, why) when a line exists but declares nothing, and why says so
+    for the check's summary: lines naming different tiers disagree, a value that is no tier (the template's
+    untouched placeholder, a typo, an empty line) is quoted back. Pure over the body text; HTML comments are
+    not read."""
+    found, odd = [], []
+    for line in _HTML_COMMENT.sub("", body or "").splitlines():
+        m = _TIER_LINE.match(line)
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        val = raw.strip("`*_ ").lower()
+        tier = TIER_ALIASES.get(val, val)
+        if tier in TIERS:
+            found.append(tier)
+        else:
+            odd.append(raw or "(empty)")
+    distinct = list(dict.fromkeys(found))
+    if len(distinct) > 1:
+        return None, "the body's tier lines disagree (%s): one line, one tier" % ", ".join(distinct)
+    if distinct:
+        return distinct[0], ""
+    if odd:
+        return None, "the body's tier line names no tier (%s): one of %s" % ("; ".join(odd), ", ".join(TIERS))
+    return None, ""
 
 
 def _is_admin(pr, login=None):
@@ -163,11 +198,31 @@ def _linked_issue_discussed(pr):
 
 def evaluate(pr):
     labels = [TIER_ALIASES.get(l, l) for l in (pr.get("labels") or []) if TIER_ALIASES.get(l, l) in TIERS]
+    declared, why = declared_tier(pr.get("body"))
     if len(labels) != 1:
+        hint = ""
+        if not labels:
+            # no label yet: the body's line is how a read-only contributor sorts the PR (T273). The workflow
+            # applies that label and re-grades in the same run; here, purely, the PR is still unlabeled
+            if declared:
+                hint = " The body declares `%s`: the tier workflow applies that label and grades it." % declared
+            elif why:
+                hint = " " + why[0].upper() + why[1:] + "."
+            else:
+                hint = " Add the label, or declare the tier in the body on a line of its own: `Tier: fix`."
         return {"conclusion": "failure", "title": "Tier policy: %d tier labels" % len(labels),
-                "summary": "Exactly one tier label is required (docs, fix, feature, major-feature); this PR carries %d."
-                           % len(labels)}
+                "summary": "Exactly one tier label is required (docs, fix, feature, major-feature); this PR carries %d.%s"
+                           % (len(labels), hint)}
     tier = labels[0]
+    v = _verdict_for(pr, tier)
+    if declared and declared != tier:
+        # the LABEL stands (maintainers re-tier by relabeling); a body that disagrees is said, never applied
+        v["summary"] += " The body declares `%s`, but the `%s` label stands: maintainers re-tier by relabeling." % (declared, tier)
+    return v
+
+
+def _verdict_for(pr, tier):
+    """The verdict for a PR wearing exactly one tier label: the gate by tier and by the author's role."""
     admin_author = _is_admin(pr)
 
     # every tier, every author: a standing objection by a maintainer other than the author holds the PR

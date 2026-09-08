@@ -19,10 +19,19 @@ name: Tier policy
 # - pull_request_review runs in the PR's merge-commit context, so it is deliberately NOT a trigger:
 #   approvals propagate through the hourly schedule (or a manual dispatch), never through a job whose
 #   file the PR controls.
-# - The token holds checks:write (to post the verdict), pull-requests:read, issues:read, contents:read
-#   and nothing else. GITHUB_TOKEN is the GitHub Actions app's installation token, which is what the
-#   Checks API's "GitHub Apps only" write rule admits; the ruleset requiring this check must select the
-#   run posted by the GitHub Actions app.
+# - The token holds checks: write (to post the verdict), pull-requests: write (to apply the tier the PR
+#   body declares as a label), actions: write (to re-run the label counter on that head), issues: read,
+#   contents: read and nothing else. GITHUB_TOKEN is the GitHub Actions app's installation token, which
+#   is what the Checks API's "GitHub Apps only" write rule admits; the ruleset requiring this check must
+#   select the run posted by the GitHub Actions app.
+# - THE BODY'S TIER LINE (T273, the owner 2026-09-08): outside contributors hold read permission and
+#   cannot label their own PRs, so `Tier: fix` on a line of the PR body is how they sort one. When a PR
+#   carries no tier label and its body declares one, the fetcher applies that label through the API
+#   before grading; a label already present stands (maintainers re-tier by relabeling) and a body that
+#   disagrees is only mentioned. The body is data, read through the API like every other field: this
+#   job still checks out only the BASE branch and executes nothing from the PR head. A label added with
+#   GITHUB_TOKEN fires no `labeled` run (events the token causes create none, save dispatches), so the
+#   fetcher re-runs the "Exactly one tier label" run on that head through the Actions API instead.
 # - Nothing in the policy is timed: the fetcher reads no check-run history, no timeline and no commit
 #   date, so there is no clock for a forged date, a reopen or a sibling PR's head to feed.
 # - The job below is named "Tier policy evaluation", NOT "Tier policy": the required check is the
@@ -51,7 +60,8 @@ on:
 
 permissions:
   checks: write
-  pull-requests: read
+  pull-requests: write          # the body's declared tier becomes the label (T273)
+  actions: write                # re-run the label counter on the head after that write
   issues: read
   contents: read
 
