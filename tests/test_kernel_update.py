@@ -382,9 +382,11 @@ class RunUpdate(Fresh):
                       "experience — the quiet window cost minutes per push; explicit "
                       "`romp refresh --quiet` still drains)")
         self.assertNotIn("when=quiet", ok_branch, "no drain default on the deploy path")
-        self.assertIn("if curl -fsS -X POST 'http://127.0.0.1:", ok_branch,
+        self.assertIn("curl -fsS --max-time 60 -X POST 'http://127.0.0.1:", ok_branch,
                       "-f: a non-2xx answer from whatever holds the manager port is not a restart — the "
-                      "report's `restarted` is read from curl's exit, never assumed")
+                      "report's `restarted` is read from curl's exit, never assumed; --max-time: a manager "
+                      "that accepts and never answers ends the request instead of holding the latch with no "
+                      "report (review find, 2026-09-08)")
         self.assertIn('"action": "self-update"', ok_branch,
                       "the script stamps restart-audit.jsonl at curl time, so the dying kernel's "
                       "restart-cuts row joins to a named reason instead of reading anonymous")
@@ -426,8 +428,8 @@ class HonestLaunch(Fresh):
         with mock.patch.object(km.subprocess, "Popen"):
             self.assertTrue(km._run_update("v0.0.9"), "the next launch is not refused")
 
-    def _auto_pass(self):
-        with mock.patch.object(km, "_kernel_ver", return_value="v0.0.8"), \
+    def _auto_pass(self, cur="v0.0.8"):
+        with mock.patch.object(km, "_kernel_ver", return_value=cur), \
              mock.patch.object(km, "_latest_release_tag", return_value="v0.0.9"), \
              mock.patch.object(km, "_send_to_app"):
             km._set_update_mode("auto")
@@ -450,6 +452,23 @@ class HonestLaunch(Fresh):
         self.assertEqual(ran, ["v0.0.9"], "the retry the re-armed slot stands for")
         self.assertEqual(json.loads((jd.STATE / "update-attempted.json").read_text())["tag"], "v0.0.9",
                          "the marker records a launch that happened")
+
+    def test_a_refusal_for_an_update_already_in_flight_keeps_that_updates_tag(self):
+        # the pass found v0.0.9 while the update to v0.0.8 was still running: the launch is refused
+        # (one at a time), and the re-arm must give the slot BACK to the in-flight update's tag, not
+        # blank it: /update-check's `tag` names what is pending, and nothing about the running
+        # update changed (review find, 2026-09-08). Once it ends, the next pass tries v0.0.9.
+        km._UPDATE_STATE[0] = "running"
+        km._UPDATE_AVAIL[0] = "v0.0.8"
+        with mock.patch.object(km.subprocess, "Popen", side_effect=AssertionError("must not spawn")):
+            self._auto_pass(cur="v0.0.7")
+        self.assertEqual(km._UPDATE_AVAIL[0], "v0.0.8", "the in-flight update's tag stays pending")
+        self.assertFalse((jd.STATE / "update-attempted.json").exists())
+        km._UPDATE_STATE[0] = ""                                  # the in-flight update ended
+        ran = []
+        with mock.patch.object(km, "_run_update", side_effect=lambda tag: ran.append(tag) or True):
+            self._auto_pass(cur="v0.0.7")
+        self.assertEqual(ran, ["v0.0.9"], "the newer release is tried once the slot is free")
 
     def test_a_spawn_failure_in_auto_mode_leaves_no_marker_and_no_latch(self):
         with mock.patch.object(km.subprocess, "Popen", side_effect=OSError("no bash")):
@@ -521,23 +540,111 @@ class ReportConsumption(Fresh):
         self.assertEqual(kept, {"update-report.json.corrupt-20260101T000000Z": "[]",
                                 "update-report.json.corrupt-20260101T000000Z-1": "null"})
 
+    def test_the_quarantine_moves_only_the_file_whose_bytes_it_read(self):
+        # the ledger and state-reader quarantines stat BEFORE the read and decline when the file is
+        # no longer the one whose bytes failed (review find, 2026-09-08): here the child's real
+        # report lands between the read of the junk and the move, and the move must NOT carry the
+        # real report off as junk. The fresh bytes get their own (bounded) read instead.
+        p = jd.STATE / "update-report.json"
+        p.write_text("[]")
+        real_loads, fresh = json.loads, {"ok": True, "tag": "v0.0.9", "restarted": False,
+                                         "why": "the manager on port 7777 did not take the restart request"}
+        def loads_then_publish(raw, *a, **kw):
+            d = real_loads(raw, *a, **kw)
+            if not isinstance(d, dict):                           # the junk was read: a peer publishes now
+                p.write_text(json.dumps(fresh))
+            return d
+        with mock.patch.object(km.json, "loads", side_effect=loads_then_publish):
+            km._UPDATE_STATE[0] = "running"
+            rep = km._consume_update_report(running_only=True)
+        self.assertEqual(rep, fresh, "the replacement is what gets consumed")
+        self.assertEqual(list(jd.STATE.glob("update-report.json.corrupt-*")), [], "nothing was moved aside")
+        self.assertTrue((jd.STATE / "update-report-last.json").exists(), "the real report was archived as one")
+        self.assertEqual(km._UPDATE_STATE[0], "")
+        ns = self.notices()
+        self.assertEqual(len(ns), 1)
+        self.assertIn("v0.0.9", ns[0]["text"])
+        self.assertNotIn("could not be read", ns[0]["text"])
+
+    def test_a_junk_report_that_cannot_be_moved_aside_is_said_once_and_stays(self):
+        # a read-only state dir: the move fails. Silence here left the latch cleared with no word on
+        # why (review find, 2026-09-08); the convention is one loud notice per fault episode, the
+        # junk left in place as evidence, and the poll told the reason. A move that later succeeds
+        # ends the episode, so the next unmovable file speaks again.
+        p = jd.STATE / "update-report.json"
+        p.write_text("[]")
+        denied = PermissionError(13, "Permission denied")
+        with mock.patch.object(km.os, "replace", side_effect=denied):
+            km._UPDATE_STATE[0] = "running"
+            rep = km._consume_update_report(running_only=True)
+            self.assertEqual(km._UPDATE_STATE[0], "", "the child wrote SOMETHING: nothing is in flight")
+            self.assertFalse(rep["ok"])
+            self.assertIn("could not be moved aside", rep["why"])
+            self.assertIn("Permission denied", rep["why"])
+            self.assertTrue(p.exists(), "the evidence stays where it is")
+            ns = self.notices()
+            self.assertEqual(len(ns), 1)
+            self.assertEqual((ns[0]["ok"], ns[0].get("kind")), (False, "refused"))
+            self.assertIn("Permission denied", ns[0]["text"])
+            self.assertFalse(km._consume_update_report()["ok"], "the boot finds it again")
+            self.assertEqual(len(self.notices()), 1, "the same fault is said once per episode")
+        self.assertFalse(km._consume_update_report()["ok"])
+        self.assertEqual(len(list(jd.STATE.glob("update-report.json.corrupt-*"))), 1, "moved once it can be")
+        self.assertEqual(len(self.notices()), 2, "the move is its own word")
+        p.write_text("null")
+        with mock.patch.object(km.os, "replace", side_effect=denied):
+            km._consume_update_report()
+        self.assertEqual(len(self.notices()), 3, "a fault after a proved move is a new episode")
+
+    def test_the_restart_hint_names_the_step_that_works_for_the_case(self):
+        # `romp refresh` asks the manager; with no manager it exits 1 (review find, 2026-09-08). So
+        # the no-manager report's hint names `romp up`, the manager-refused report's names `romp
+        # refresh`, and a report from before the `why` field (main's no-manager shape: ok, not
+        # restarted, nothing else) reads as the no-manager case it was.
+        cases = ((dict(why="no manager is running this kernel"), "romp up"),
+                 (dict(why="the manager on port 7777 did not take the restart request"), "romp refresh"),
+                 (dict(why="the manager on port 7777 did not answer the restart request within 60 s"), "romp refresh"),
+                 (dict(), "romp up"))
+        for extra, cmd in cases:
+            with km._SYNC_LOCK:
+                del km._SYNC_NOTICES[:]
+            (jd.STATE / "update-report.json").write_text(json.dumps({"ok": True, "tag": "v0.0.9",
+                                                                     "restarted": False, **extra}))
+            km._consume_update_report(running_only=True)
+            ns = self.notices()
+            self.assertEqual(len(ns), 1, extra)
+            self.assertIn("`%s`" % cmd, ns[0]["text"], extra)
+            self.assertNotIn("romp on", ns[0]["text"], "a retired spelling: the manager runs as `romp up`")
+            # the no-manager hint may still NAME `romp refresh` (to say it needs the manager) but never
+            # as the step; the manager hint never sends the user to start a manager that is there
+            other = "(`romp refresh`) to run it" if cmd == "romp up" else "`romp up`"
+            self.assertNotIn(other, ns[0]["text"], extra)
+
     def test_a_boot_that_already_runs_the_landed_tag_does_not_ask_for_another_restart(self):
         # the report says "on disk, not restarted"; when nobody polled before the user restarted by
         # hand, the boot that RUNS the tag is the one consuming it — its notice says this start runs
         # it, instead of asking for the restart that just happened
+        # "v0.0.9+" FIRST: every release tag sits on the release PR's merge commit, not on the
+        # VERSION-bump commit, so a checkout exactly on the tag reads the + (per _kernel_ver's own
+        # docstring); a bare string compare made this arm dead on every real release (review
+        # find, 2026-09-08). The bare shape still counts (a tag placed on the bump commit itself).
         rep = {"ok": True, "tag": "v0.0.9", "restarted": False, "why": "no manager is running this kernel"}
-        (jd.STATE / "update-report.json").write_text(json.dumps(rep))
-        with mock.patch.object(km, "_kernel_ver", return_value="v0.0.9"):
-            km._consume_update_report()
-        ns = self.notices()
-        self.assertEqual(len(ns), 1)
-        self.assertTrue(ns[0]["ok"])
-        self.assertIn("this start is running it", ns[0]["text"])
-        self.assertIn("no manager is running this kernel", ns[0]["text"])
-        self.assertNotIn("restart romp yourself", ns[0]["text"])
+        for ver in ("v0.0.9+", "v0.0.9"):
+            with km._SYNC_LOCK:
+                del km._SYNC_NOTICES[:]
+            (jd.STATE / "update-report.json").write_text(json.dumps(rep))
+            with mock.patch.object(km, "_kernel_ver", return_value=ver):
+                km._consume_update_report()
+            ns = self.notices()
+            self.assertEqual(len(ns), 1, ver)
+            self.assertTrue(ns[0]["ok"], ver)
+            self.assertIn("this start is running it", ns[0]["text"], ver)
+            self.assertIn("no manager is running this kernel", ns[0]["text"], ver)
+            self.assertNotIn("restart romp yourself", ns[0]["text"], ver)
         # a kernel on any other version (or one whose version reader has nothing) still asks; and
         # the still-running kernel's poll (running_only) never claims to run it, whatever it reports
-        for ver, running_only in (("v0.0.8", False), (None, False), ("v0.0.9", True)):
+        for ver, running_only in (("v0.0.8", False), ("v0.0.8+", False), ("v0.0.10", False), (None, False),
+                                  ("v0.0.9", True), ("v0.0.9+", True)):
             with km._SYNC_LOCK:
                 del km._SYNC_NOTICES[:]
             (jd.STATE / "update-report.json").write_text(json.dumps(rep))
@@ -655,6 +762,53 @@ class Routes(Fresh):
             self.assertIn(s, ns[0]["text"])
         self.assertNotIn("no manager is running", ns[0]["text"], "a manager IS running — it did not take the request")
 
+    def test_update_check_carries_the_restart_hint_for_the_case(self):
+        # the banner shows the kernel's hint verbatim, so the no-manager case names the command
+        # that works there (`romp refresh` exits 1 with no manager; review find, 2026-09-08)
+        for why, cmd in (("no manager is running this kernel", "romp up"),
+                         ("the manager on port 7777 did not take the restart request", "romp refresh")):
+            km._UPDATE_STATE[0] = "running"
+            (jd.STATE / "update-report.json").write_text(json.dumps({"ok": True, "tag": "v0.0.9",
+                                                                     "restarted": False, "why": why}))
+            _, body = _serve_get("/update-check", headers={"X-Romp-Token": km.TOKEN})
+            d = json.loads(body)
+            self.assertEqual((d["updated"], d["why"]), ("v0.0.9", why))
+            self.assertIn(cmd, d["hint"], why)
+            self.assertNotIn("romp on", d["hint"])
+        km._UPDATE_STATE[0] = ""
+        _, body = _serve_get("/update-check", headers={"X-Romp-Token": km.TOKEN})
+        self.assertEqual(json.loads(body)["hint"], "", "no hint when nothing landed")
+
+    def test_two_clicks_launch_one_update_and_the_second_hears_running(self):
+        # two windows click Update: one child, and the second click is told `running` so its banner
+        # joins the wait instead of racing a second launch. The route's guard for a launch refused
+        # BECAUSE a concurrent click just took the latch (_run_update False AND the latch set) is the
+        # `running` answer too, never the 500 a failed spawn earns (review find, 2026-09-08).
+        km._UPDATE_AVAIL[0] = "v0.0.9"
+        km._MAIN_DRIFT[0] = km._MAIN_DRIFT[1] = ""
+        spawned, pushed = [], []
+        with mock.patch.object(km.subprocess, "Popen", side_effect=lambda *a, **kw: spawned.append(a)), \
+             mock.patch.object(km, "_send_to_app", side_effect=lambda app, m: pushed.append(m)):
+            first = self._post("/update")
+            second = self._post("/update")
+        self.assertEqual((first[0], json.loads(first[1])), (200, {"ok": True, "state": "running"}))
+        self.assertEqual((second[0], json.loads(second[1])), (200, {"ok": True, "state": "running"}))
+        launches = [a for a in spawned if a[0][:2] == ["bash", "-c"]]    # the seam also sees git helpers
+        self.assertEqual(len(launches), 1, ("one launch for two clicks", [a[0][:2] for a in spawned]))
+        self.assertEqual([m.get("state") for m in pushed], ["running"], "one running push")
+        self.assertEqual(self.notices(), [], "nothing failed, so nothing is filed")
+        # the race itself: the launch is refused because the latch was taken between the route's
+        # check and _run_update's own (a concurrent click won)
+        km._UPDATE_STATE[0] = ""
+        def won_the_race(tag):
+            km._UPDATE_STATE[0] = "running"
+            return False
+        with mock.patch.object(km, "_run_update", side_effect=won_the_race), \
+             mock.patch.object(km, "_send_to_app"):
+            code, body = self._post("/update")
+        self.assertEqual((code, json.loads(body)["state"]), (200, "running"))
+        km._UPDATE_STATE[0] = ""
+
     def test_a_report_that_is_not_an_object_is_set_aside_and_the_poll_still_answers(self):
         # null / [] / a number parse but carry nothing: `.get` on them 500'd every poll for the
         # kernel's life (never consumed, so every poll hit the same file again)
@@ -755,7 +909,9 @@ class Wiring(unittest.TestCase):
         # `updated` from /update-check means ON DISK, not running: the banner carries the reason
         # the restart did not happen and names the step that runs the new code
         self.assertIn("(d.why?', but '+d.why:'')", self.src)
-        self.assertIn("restart romp yourself (romp refresh) to run it.", self.src)
+        # the kernel words the step by case (`romp refresh` exits 1 with no manager; review find,
+        # 2026-09-08): the banner shows its hint, with the manager case as the fallback text
+        self.assertIn("(d.hint||'restart romp yourself (romp refresh) to run it')", self.src)
 
 
 class ReleaseChannelMigration(unittest.TestCase):
@@ -884,19 +1040,20 @@ class ReleaseChannelMigration(unittest.TestCase):
             km._UPDATE_STATE[0] = ""
             self.assertTrue(km._run_update(tag))
         km._UPDATE_STATE[0] = ""
-        fake, seen = os.path.join(inst, "fake-bin"), os.path.join(inst, "curl-saw")
+        fake, seen, args = os.path.join(inst, "fake-bin"), os.path.join(inst, "curl-saw"), os.path.join(inst, "curl-args")
         os.makedirs(fake)
         with open(os.path.join(fake, "curl"), "w") as f:
-            f.write("#!/bin/sh\nif [ -e \"$T_REPORT\" ]; then echo present > \"$T_SEEN\"; "
+            f.write("#!/bin/sh\nprintf '%s ' \"$@\" > \"$T_ARGS\"\n"
+                    "if [ -e \"$T_REPORT\" ]; then echo present > \"$T_SEEN\"; "
                     "else echo absent > \"$T_SEEN\"; fi\nexit \"$T_CURL_EXIT\"\n")
         os.chmod(os.path.join(fake, "curl"), 0o755)
         env = {**os.environ, "PATH": fake + os.pathsep + os.environ.get("PATH", ""),
-               "T_REPORT": str(km.jd.STATE / "update-report.json"), "T_SEEN": seen,
+               "T_REPORT": str(km.jd.STATE / "update-report.json"), "T_SEEN": seen, "T_ARGS": args,
                "T_CURL_EXIT": str(curl_exit)}
         subprocess.run(["bash", "-c", calls[0][0][2]], cwd=inst, env=env, capture_output=True, text=True)
         rep = json.loads((km.jd.STATE / "update-report.json").read_text())
-        with open(seen) as f:
-            return rep, f.read().strip()
+        with open(seen) as f, open(args) as a:
+            return rep, f.read().strip(), a.read().strip()
 
     def test_the_report_says_what_the_restart_request_actually_did(self):
         # The manager door can be shut (gone, or a stale port). The report used to be written
@@ -906,18 +1063,79 @@ class ReleaseChannelMigration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             g, inst = self._repos(tmp)
             g(inst, "checkout", "-q", "--detach", "v9.9.8")
-            rep, saw = self._run_with_manager("v9.9.9", inst, curl_exit=7)
+            rep, saw, args = self._run_with_manager("v9.9.9", inst, curl_exit=7)
         self.assertEqual(saw, "absent", "the report is written AFTER the restart request, never before")
+        self.assertIn("--max-time 60", args, "the request is bounded: a manager that never answers cannot "
+                                             "hold the latch with no report (review find, 2026-09-08)")
         self.assertEqual((rep["ok"], rep["restarted"]), (True, False))
         self.assertIn("port 7777", rep["why"])
         self.assertIn("did not take the restart request", rep["why"])
         with tempfile.TemporaryDirectory() as tmp:
             g, inst = self._repos(tmp)
             g(inst, "checkout", "-q", "--detach", "v9.9.8")
-            rep, saw = self._run_with_manager("v9.9.9", inst, curl_exit=0)
+            rep, saw, _ = self._run_with_manager("v9.9.9", inst, curl_exit=0)
         self.assertEqual(saw, "absent")
         self.assertEqual((rep["ok"], rep["restarted"], rep.get("why")), (True, True, None),
                          "a request the manager took is the one report the next boot files")
+
+    def test_a_restart_request_the_manager_never_answers_is_not_a_restart(self):
+        # curl's exit 28 is its own timeout: the manager accepted the connection and never answered.
+        # Without --max-time that curl hung for good, the report was never written, and the latch
+        # held with nothing to consume (review find, 2026-09-08). The timeout reads as not restarted,
+        # with a why of its own, and the running kernel's poll consumes it like the refused case.
+        with tempfile.TemporaryDirectory() as tmp:
+            g, inst = self._repos(tmp)
+            g(inst, "checkout", "-q", "--detach", "v9.9.8")
+            rep, saw, args = self._run_with_manager("v9.9.9", inst, curl_exit=28)
+        self.assertEqual(saw, "absent")
+        self.assertIn("--max-time 60", args)
+        self.assertEqual((rep["ok"], rep["restarted"]), (True, False))
+        self.assertIn("port 7777", rep["why"])
+        self.assertIn("did not answer the restart request within 60 s", rep["why"])
+        self.assertNotIn("did not take", rep["why"], "a timeout is its own reason, not a refusal")
+
+
+class BootOnTheTag(Fresh):
+    """The boot that already runs the landed tag, judged by the REAL version reader on a repo shaped
+    like every release: VERSION bumped in one commit, the tag on the commit after it (the release
+    PR's merge), so a checkout exactly on the tag reads `vX.Y.Z+`. The mocked arms above pin the
+    comparison; this pins the shape the comparison must survive (review find, 2026-09-08)."""
+
+    def test_a_release_checkout_reads_the_plus_and_the_boot_still_says_it_runs_it(self):
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+        def g(cwd, *args):
+            r = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, "git %s: %s%s" % (" ".join(args), r.stdout, r.stderr))
+            return r.stdout.strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.makedirs(src)
+            g(src, "init", "-q", "-b", "main")
+            with open(os.path.join(src, "VERSION"), "w") as f:
+                f.write("9.9.9\n")
+            g(src, "add", "VERSION")
+            g(src, "commit", "-qm", "VERSION 9.9.9")                       # the bump
+            g(src, "commit", "-qm", "merge the release PR", "--allow-empty")   # where the tag lands
+            g(src, "tag", "v9.9.9")
+            saved_ver, saved_head = km._VER, dict(km._HEAD_CACHE)
+            try:
+                with mock.patch.object(km, "ROOT", Path(src)):
+                    km._VER = None
+                    km._HEAD_CACHE.update(ts=0.0, full=None, short=None)
+                    self.assertEqual(km._kernel_ver(), "v9.9.9+", "the shape every release checkout reads")
+                    (jd.STATE / "update-report.json").write_text(json.dumps(
+                        {"ok": True, "tag": "v9.9.9", "restarted": False, "why": "no manager is running this kernel"}))
+                    rep = km._consume_update_report()
+            finally:
+                km._VER = saved_ver
+                km._HEAD_CACHE.clear()
+                km._HEAD_CACHE.update(saved_head)
+        self.assertTrue(rep["ok"])
+        ns = self.notices()
+        self.assertEqual(len(ns), 1)
+        self.assertIn("this start is running it", ns[0]["text"])
+        self.assertNotIn("restart romp yourself", ns[0]["text"])
 
 
 if __name__ == "__main__":

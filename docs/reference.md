@@ -850,6 +850,19 @@ State is written under `${XDG_STATE_HOME:-~/.local/state}/romp/`. Transcripts
 are read in place from where Claude Code writes them (`~/.claude/projects/`)
 and never copied.
 
+The self-updater's report, `update-report.json`, is read once, by the next
+kernel boot or by the running kernel's banner poll, and archived as
+`update-report-last.json`; `update.log` beside it has the updater's full
+output. An update that landed on disk but was not restarted into (no manager,
+or a manager that did not take the restart request or did not answer it within
+60 seconds) is filed in the Log with the step that runs it: `romp refresh` when
+a manager is there, `romp up` when none is. A boot that already runs the landed
+release says so instead of asking for another restart. A report that is not a
+JSON object is moved aside, never deleted, to
+`update-report.json.corrupt-<UTC stamp>` (the same `-1`, `-2` suffix rule) with
+one Log entry under the `refused` kind; one that cannot be moved stays where it
+is and is said once per fault.
+
 Three small files there hold settings you set by hand: `session-flags.json`
 (per-session flags, the postal isolation switch among them), `session-order.json`
 (the saved tab and lane order) and `notify-cards.json` (the bell overrides). A
