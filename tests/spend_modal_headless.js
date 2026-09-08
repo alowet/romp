@@ -139,6 +139,37 @@ const { chromium } = require('playwright');
   await pg.keyboard.press('Escape');
   await pg.evaluate(() => document.getElementById('rail-usage').click());
   await pg.waitForSelector('#rsp-panel .rsp-tbl', { timeout: 10000 });
+  // T247g: merge by tag, and the 1-day range — under "by spend", so the merged rows sort by dollars
+  await pg.click('#rsp-panel [data-act="order:spend"]');
+  await pg.click('#rsp-panel [data-act="merge:toggle"]');
+  await pg.waitForFunction(() => document.querySelector('#rsp-panel [data-act="merge:toggle"]').classList.contains('on'), null, { timeout: 5000 });
+  const merge = await pg.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr')).map((tr) => tr.textContent.trim());
+    const tagRow = document.querySelector('#rsp-panel .rsp-tbl tbody tr[data-tag] .tab-label');
+    return { rows, tagColor: tagRow ? getComputedStyle(tagRow).color : null,
+      notes: Array.from(document.querySelectorAll('#rsp-panel .rsp-note')).map((e) => e.textContent),
+      stackNames: (() => { const names = new Set(); document.querySelectorAll('#rsp-chart .rsp-seg').forEach((p) => { names.add(p.getAttribute('data-s')); }); return Array.from(names).map((i) => (window.__rompSpendStackNames || [])[+i] || ''); })(),
+      prefs: JSON.parse(localStorage.getItem('romp:spendModal') || '{}') };
+  });
+  // stack names ride the tooltip: hover the tallest segment of a tag stack is fiddly, so read them off the tooltip text per distinct stack index
+  merge.stackNames = await pg.evaluate(async () => {
+    const segs = Array.from(document.querAllSafe ? [] : document.querySelectorAll('#rsp-chart .rsp-seg'));
+    const byIdx = new Map(); segs.forEach((p) => { const i = p.getAttribute('data-s'); if (!byIdx.has(i)) byIdx.set(i, p); });
+    const names = [];
+    for (const [, p] of byIdx) { const r = p.getBoundingClientRect(); if (r.height < 1) continue;
+      p.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 }));
+      const t = document.getElementById('rsp-tip'); if (t && t.style.display === 'block') { const parts = t.textContent.split(' · '); names.push((parts[1] || '').trim()); } }
+    const t = document.getElementById('rsp-tip'); if (t) t.style.display = 'none';
+    return names;
+  });
+  if (shots) { await pg.screenshot({ path: shots + '-merged.png' }); await pg.evaluate(() => document.body.classList.add('theme-light')); await pg.waitForTimeout(120); await pg.screenshot({ path: shots + '-merged-light.png' }); await pg.evaluate(() => document.body.classList.remove('theme-light')); }
+  await pg.click('#rsp-panel [data-act="range:day"]');
+  await pg.waitForFunction(() => document.querySelector('#rsp-panel [data-act="range:day"]').classList.contains('on'), null, { timeout: 5000 });
+  const day = await pg.evaluate(() => { const xs = new Set(); document.querySelectorAll('#rsp-chart .rsp-seg').forEach((p) => xs.add(p.getAttribute('d').split(/[ ,]/)[0])); return { buckets: xs.size, labels: Array.from(document.querySelectorAll('#rsp-chart .ru-tip-gx span')).map((e) => e.textContent) }; });
+  merge.dayBuckets = day.buckets; merge.dayLabels = day.labels;
+  await pg.click('#rsp-panel [data-act="range:hours"]'); await pg.click('#rsp-panel [data-act="merge:toggle"]');
+  await pg.waitForFunction(() => !document.querySelector('#rsp-panel [data-act="merge:toggle"]').classList.contains('on'), null, { timeout: 5000 });
+  await pg.click('#rsp-panel [data-act="order:yours"]');   // back to the persisted "your order" the phone reload reads
   // the light theme's error line, over a failed fetch
   const lightErr = await pg.evaluate(async () => {
     document.body.classList.add('theme-light');
@@ -166,6 +197,6 @@ const { chromium } = require('playwright');
     first: (document.querySelector('#rsp-panel .rsp-tbl tbody tr') || {}).textContent || '' }));
   await pg.click('#rsp-panel [data-act="order:spend"]');   // restore the default for whoever runs next
   const mobile = { railHidden, panelOpened: true, modalOpened: true, btn, panelHint , persisted };
-  console.log(JSON.stringify({ yourOrder, hoverHint, hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, hiddenAfterDrag, lightErr, lightBtn, dim, timeout, mobile, errs }));
+  console.log(JSON.stringify({ merge, yourOrder, hoverHint, hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, hiddenAfterDrag, lightErr, lightBtn, dim, timeout, mobile, errs }));
   await b.close();
 })().catch((e) => { console.error(e); process.exit(1); });
