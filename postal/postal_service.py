@@ -80,7 +80,8 @@ SESSION_FLAGS = STATE.parent / "session-flags.json"   # the kernel's per-session
 # request except the /ping liveness probe. The 0600 file is the same-user trust boundary; kernel
 # and bus share it (whichever daemon starts first mints it, identical logic). A peer bus dialing
 # through an ssh forward authorizes with the DIALED machine's token (?token=), which rides the
-# kernel's /peer notifies and /tunnels rows.
+# kernel's /peer notifies only (never /tunnels rows, which a page reads too; since 2026-09-08 a
+# restarted bus gets every token re-notified, see peers_snapshot).
 def _load_serve_token():
     t = (os.environ.get("ROMP_SERVE_TOKEN") or "").strip()
     if t:
@@ -1932,6 +1933,12 @@ def _write_remote_sids():
 
 
 def peers_snapshot():
+    """GET /peers: the table, plus WHICH BUS PROCESS is answering (busId, minted per process; epoch, its
+    boot second). The kernel compares that pair across its supervisor passes: a change means this bus
+    restarted, so it re-tells every peer with its token (kernel _note_bus_incarnation). The /tunnels seed
+    below cannot learn tokens (that payload carries none since 2026-09-08), so without this a bus that
+    restarted under a running kernel dialed every peer credential-less until a tunnel bounced
+    (review find, 2026-09-08)."""
     peers = {}
     for h, p in PEERS.items():
         d = dict(p)
@@ -1939,7 +1946,8 @@ def peers_snapshot():
         if tt:
             d["theirTier"] = tt        # how that host holds US, from its last exchange declaration
         peers[h] = d
-    return {"peers": peers, "viaReach": via_reach(), "remoteHolds": remote_holds()}
+    return {"peers": peers, "viaReach": via_reach(), "remoteHolds": remote_holds(),
+            "busId": BUS_ID, "epoch": BUS_EPOCH}
 
 # ── peering protocol (peer-bus mode, stage 2) ───────────────────────────────────
 # One EXCHANGE carries both directions (plans/postal-peer-buses.md): the dialer POSTs
@@ -2804,7 +2812,10 @@ def _peer_threads_reconcile(host):
 
 def _seed_peers_from_kernel():
     """A restarted bus starts with an empty peer table (the kernel notifies on TRANSITIONS). Best-effort
-    seed from the kernel's /tunnels so peering resumes without waiting for the next transition."""
+    seed from the kernel's /tunnels so peering resumes without waiting for the next transition. The seed
+    learns each peer's port, up-state and trust; the peer's TOKEN is not in that payload (a page reads it
+    too, 2026-09-08), so a seeded row cannot dial yet. The kernel supplies it: its next supervisor pass
+    sees a new busId/epoch on GET /peers and re-notifies every peer (peer_update fills the token in)."""
     try:
         req = urllib.request.Request(KERNEL_BASE + "/tunnels", headers={"X-Romp-Token": SERVE_TOKEN})
         with urllib.request.urlopen(req, timeout=3) as r:
@@ -2814,8 +2825,8 @@ def _seed_peers_from_kernel():
             port = row.get("busPort")
             if row.get("host") and isinstance(port, int) and port:
                 peer_update({"host": row["host"], "port": port, "up": row.get("status") == "up",
-                             "token": row.get("token") or "",   # the peer's serve token — its bus is gated too
                              "trust": row.get("trust") or "directed"})   # per-host trust for the inbound gate
+                # no "token": /tunnels has not carried one since 2026-09-08; the kernel's re-notify brings it
         # Origin-only trust heals on restart too: the kernel's remembered-hosts list (`known` in the
         # same payload) carries the tier for every UNATTACHED host the user has set one on; without
         # this a bus bounce would silently drop a relayed origin back to `directed` (the user

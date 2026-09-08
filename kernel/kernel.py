@@ -15190,8 +15190,9 @@ def _tunnel_argv(r):
 def _notify_bus_peer(host, port, up, peer_token="", trust="directed"):
     """Tell the LOCAL bus about a peer bus endpoint (event: a tunnel transition, never a poll). True on
     ack. Guarded: postal being down must never break the tunnel supervisor — the caller records success
-    and retries an unacked notify on the next pass. Stage 2's HELLO re-learns the table after a bus
-    restart; until then a restarted bus heals on the next tunnel transition or retry. Authorizes to the
+    and retries an unacked notify on the next pass. A RESTARTED bus is re-told every peer by the next
+    supervisor pass, since its /tunnels seed learns ports and trust but no token: its /peers answer names
+    a new process (_note_bus_incarnation), which voids each row's notify memo. Authorizes to the
     local bus with OUR serve token; peer_token is the PEER machine's serve token (r["token"]), which the
     bus needs to dial that peer's /peer-exchange through the tunnel — both buses are token-gated now.
     trust rides too: the bus gates inbound mail from a 'directed' peer into quarantine and drops an
@@ -15251,17 +15252,45 @@ def _push_origin_trust_rows():
 
 
 _via_cache = {"t": 0.0, "snap": {}}
+_bus_seen = [None]   # (busId, epoch) of the bus PROCESS the kernel last heard from at GET /peers; None until one answers
 
 
-def _bus_peers_snap():
+def _note_bus_incarnation(snap):
+    """A /peers answer names the bus process that gave it (`busId`, minted per process; `epoch`, its boot
+    second). When that pair differs from the last one heard, the bus RESTARTED under a running kernel: a
+    crash revived by _revive_postal_bus, its own code-change re-exec, a manual restart. Its peer table is
+    then only what it seeded from /tunnels, and /tunnels carries no peer token any more (the page must
+    never see one, 2026-09-08), so every dialer it built would knock on its peer's bus with no credential
+    and be refused, and the kernel would never say the token again: the supervisor re-tells the bus a
+    peer only when (up, trust) changes. The restart is the event, so this voids every row's notify memo
+    (the supervisor's want != notified branch then re-runs _notify_bus_peer with the stored token and trust
+    on its next pass, and the bus's peer_update overwrites the seeded blank) and the origin-only trust
+    memo with it, since that table is new too. A first sighting counts as a change: harmless (a notify is
+    idempotent) and simpler than a special case. True when a new bus was noticed. (review find, 2026-09-08)"""
+    inc = (snap.get("busId"), snap.get("epoch")) if isinstance(snap, dict) else (None, None)
+    if inc == (None, None) or inc == _bus_seen[0]:
+        return False
+    was, _bus_seen[0] = _bus_seen[0], inc
+    with _remotes_lock:
+        for r in _remotes.values():
+            r.pop("_peer_notified", None)
+    _origin_trust_pushed.clear()
+    if was is not None:
+        _tunnel_log("-", "bus-restarted", busId=str(inc[0] or "")[:12], epoch=inc[1],
+                    note="the local bus is a new process; every peer is re-told, token included")
+    return True
+
+
+def _bus_peers_snap(fresh=False):
     """The bus's /peers snapshot (via-reach rows + remote hold summaries), cached ~3s — it rides
     every /tunnels poll. Empty when the bus is down or peering is off: the popover simply shows no
     relay/holds sections (display-only; the trust GATE itself lives in the bus and fails safe to
-    directed)."""
+    directed). `fresh` skips the cache: the supervisor asks once per pass so a bus restart is
+    noticed by the pass that can act on it (_note_bus_incarnation), dashboard or no dashboard."""
     if not _postal_peers_on():
         return {}
     now = time.time()
-    if now - _via_cache["t"] < 3.0:
+    if not fresh and now - _via_cache["t"] < 3.0:
         return _via_cache["snap"]
     snap = {}
     try:
@@ -15274,6 +15303,8 @@ def _bus_peers_snap():
     except Exception:
         snap = {}
     _via_cache["t"], _via_cache["snap"] = now, snap
+    if snap:
+        _note_bus_incarnation(snap)
     return snap
 
 
@@ -16103,6 +16134,8 @@ def _remote_public(r):
         ver = _kernel_ver() or ver
     return {"host": r["host"], "kernelPort": r["kernel_port"], "localPort": r["local_port"],
             "busPort": r.get("bus_port") or 0,   # peer-bus mode: a restarted bus reseeds its peer table from this
+            #                                       (port, up, trust; the token it needs to dial follows by the
+            #                                       supervisor's re-notify, _note_bus_incarnation)
             "checkin": bool(r.get("checkin")),           # we publish ourselves to this hub (stage 3)
             "checkinPeer": bool(r.get("checkin_peer")),  # this host checked in to US (no ssh of ours)
             "hasToken": bool(r.get("token")), "status": r.get("status") or "down",
@@ -16670,21 +16703,26 @@ def _poll_remote_version(r):
         if not isinstance(j, dict):
             return None
         # The sha and the release name are a PEER's words, and they get saved (remotes.json) and drawn
-        # (the panel row): each must fit its shape — 7-40 hex, vN.N.N(+) — or it is dropped and said once
-        # (_peer_shape_complain), never stored as it came (2026-09-08).
+        # (the panel row): each must fit its shape (7-40 hex; vN.N.N, optional +) or it is said once
+        # (_peer_shape_complain) and the row KEEPS THE LAST GOOD VALUE it held, never the bad one, while
+        # the other fields of the same answer still land (2026-09-08). The first cut returned None for a
+        # bad sha, which froze the whole answer (version, settings, Auto Nudge) and blanked a bad
+        # version outright; both contradicted "keeps the last good value" (review find, 2026-09-08).
+        # `shaConfirmed` says whether THIS poll vouched for the sha returned: a kept one was not
+        # confirmed now, so the supervisor must not re-date it (last_ok) as if it had been.
         host = r.get("host") or "?"
-        sha = j.get("kernel_sha") or None
+        sha, sha_ok = j.get("kernel_sha") or None, True
         if sha and not _peer_sha(sha):
             _peer_shape_complain(host, "kernel_sha", sha)
-            sha = None                        # an unusable sha is no sha at all
+            sha, sha_ok = r.get("kernel_sha") or None, False   # what the row last knew, undated; None if nothing
         ver = j.get("kernel_ver") or ""
         if ver and not _peer_ver(ver):
             _peer_shape_complain(host, "kernel_ver", ver)
-            ver = ""
+            ver = r.get("kernel_ver") or ""                    # the last good name, not a blank
         an = j.get("autoNudge")
         st = j.get("settings")
         gts = j.get("settingsGt")
-        return {"sha": sha, "ver": ver,
+        return {"sha": sha, "ver": ver, "shaConfirmed": sha_ok,
                 "autoNudge": an if isinstance(an, bool) else None,
                 "settings": st if isinstance(st, dict) else None,
                 "settingsGt": gts if isinstance(gts, dict) else None} if sha else None
@@ -18666,6 +18704,11 @@ def _tunnel_supervisor():
                             except Exception:
                                 pass
             last_addr[0] = addr
+            if _postal_peers_on():
+                # Who is the bus this pass? A NEW bus process holds a peer table with no tokens in it
+                # (see _note_bus_incarnation); noticing it HERE, before the rows below decide whether
+                # they owe the bus a notify, means the same pass re-tells it every peer.
+                _bus_peers_snap(fresh=True)
             now = time.time()               # bound per PASS, not per remote row: the pass tail below
             #                                 (_pr_watch_tick) reads it, and on a box with NO remotes the
             #                                 loop body never ran — every pass died on UnboundLocalError
@@ -18831,8 +18874,12 @@ def _tunnel_supervisor():
                         if _tunnel_established(r):
                             r["fails"], r["next_try"] = 0, 0   # healthy end-to-end → clear the backoff, so a
                             r.pop("gave_up", None)             #   later drop starts its ladder from 15s again
-                        r["last_ok"] = time.time()         # the moment the cached sha/tier below were TRUE,
-                        #                                    so a later down row can date what it remembers
+                        if (rver or {}).get("shaConfirmed", True):
+                            r["last_ok"] = time.time()     # the moment the cached sha/tier below were TRUE,
+                            #                                so a later down row can date what it remembers.
+                            #                                Not when the peer's sha did not fit its shape and
+                            #                                the row kept its old one: that one was not
+                            #                                confirmed now (review find, 2026-09-08)
                         if r.get("detail"):
                             r["detail"] = ""               # any parked error/hint is moot once it answers
                     elif st == "restarting":

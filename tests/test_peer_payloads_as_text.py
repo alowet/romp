@@ -10,13 +10,14 @@ itself, so the page never needed it.
 
 Now: tunnels_of returns only `tunnels`, each row re-read through _remote_payload_public_row (a host ssh
 would accept, an enumerated status, sha/version shapes, exact booleans, bounded inert text, unknown keys
-gone, the count capped); _remote_public publishes `hasToken`; _poll_remote_version drops a sha/version that
-does not fit and says so once on stderr; _remote_ws discards the browser's token whether or not the row
-has one. Synthetic only: hostname TESTHOST, invented tokens, a stubbed transport, a loopback fake /version.
+gone, the count capped); _remote_public publishes `hasToken`; _poll_remote_version says once on stderr when
+a sha/version does not fit and keeps the row's last good value in its place, marking a kept sha as not
+confirmed by this poll; _remote_ws discards the browser's token whether or not the row has one (driven end
+to end, both rows, in test_kernel_remote_ws_proxy.py). Synthetic only: hostname TESTHOST, invented tokens,
+a stubbed transport, a loopback fake /version.
 """
 import contextlib
 import io
-import inspect
 import json
 import os
 import tempfile
@@ -217,41 +218,56 @@ class TheVersionPollReadsShapes(unittest.TestCase):
         self.srv.server_close()
         km._peer_shape_said.clear()
 
-    def _poll(self, payload, host="TESTHOST"):
+    def _poll(self, payload, host="TESTHOST", row=None):
+        """Poll the fake /version for a row that may already remember a sha/version (`row`)."""
         _FakeVersion.PAYLOAD = payload
+        r = {"host": host, "local_port": self.port, "token": "tok"}
+        r.update(row or {})
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            got = km._poll_remote_version({"host": host, "local_port": self.port, "token": "tok"})
+            got = km._poll_remote_version(r)
         return got, err.getvalue()
 
     def test_good_values_pass_unchanged_and_quietly(self):
         got, said = self._poll({"kernel_sha": "abc1234", "kernel_ver": "v0.5.0+", "autoNudge": False})
         self.assertEqual((got["sha"], got["ver"], got["autoNudge"]), ("abc1234", "v0.5.0+", False))
+        self.assertIs(got["shaConfirmed"], True, "this poll vouched for the sha it returns")
         self.assertEqual(said, "")
         got, said = self._poll({"kernel_sha": "a" * 40, "kernel_ver": "v12.0.3"})
         self.assertEqual((got["sha"], got["ver"]), ("a" * 40, "v12.0.3"))
 
-    def test_a_sha_that_is_not_one_is_refused_and_said_once(self):
+    def test_a_sha_that_is_not_one_keeps_the_last_good_one_undated_and_is_said_once(self):
+        # The first cut returned None here, which froze the WHOLE answer (version, settings, Auto Nudge) on
+        # the row while the supervisor kept re-dating it as freshly confirmed (review find, 2026-09-08).
         for bad in ("abc" + QUOTE, IMG, "ABC1234", "abc12", "g" * 8, "a" * 41):
             with self.subTest(sha=bad):
                 km._peer_shape_said.clear()
                 got, said = self._poll({"kernel_sha": bad, "kernel_ver": "v0.5.0"})
-                self.assertIsNone(got, "an unusable sha is no sha — the row keeps what it last knew")
+                self.assertIsNone(got, "nothing remembered and nothing usable: no answer, as against a kernel that sent no sha")
                 self.assertIn("TESTHOST reported a kernel_sha that is not one", said)
                 self.assertIn(repr(bad[:60]), said, "the complaint quotes what came, so the offender is identifiable")
-                got, said2 = self._poll({"kernel_sha": bad, "kernel_ver": "v0.5.0"})
+                got, said2 = self._poll({"kernel_sha": bad, "kernel_ver": "v0.6.0", "autoNudge": True},
+                                        row={"kernel_sha": "0ld5ha0", "kernel_ver": "v0.5.0"})
                 self.assertEqual(said2, "", "said ONCE per host and field, not once per poll")
+                self.assertEqual(got["sha"], "0ld5ha0", "the row keeps the sha it last knew, never the bad one")
+                self.assertIs(got["shaConfirmed"], False,
+                              "...and this poll did not vouch for it, so the supervisor will not re-date the row")
+                self.assertEqual((got["ver"], got["autoNudge"]), ("v0.6.0", True),
+                                 "the rest of the answer still lands: the fields are judged apart")
 
-    def test_a_version_that_is_not_one_is_blanked_and_said_once(self):
+    def test_a_version_that_is_not_one_keeps_the_last_good_one_and_is_said_once(self):
+        # The first cut blanked it, against the PR's own account of itself (review find, 2026-09-08).
         for bad in ("v1" + IMG, "1.2.3", "v1.2", "v1.2.3-dirty", "v1.2.3++", QUOTE):
             with self.subTest(ver=bad):
                 km._peer_shape_said.clear()
-                got, said = self._poll({"kernel_sha": "abc1234", "kernel_ver": bad})
-                self.assertEqual(got["sha"], "abc1234", "the sha still lands — the fields are judged apart")
-                self.assertEqual(got["ver"], "", "the row falls back to the sha alone, as against an older kernel")
+                got, said = self._poll({"kernel_sha": "abc1234", "kernel_ver": bad}, row={"kernel_ver": "v0.4.0"})
+                self.assertEqual(got["sha"], "abc1234", "the sha still lands: the fields are judged apart")
+                self.assertIs(got["shaConfirmed"], True, "the sha was fine; only the version is in question")
+                self.assertEqual(got["ver"], "v0.4.0", "the row keeps the release name it last knew, never the bad one")
                 self.assertIn("TESTHOST reported a kernel_ver that is not one", said)
-                _, said2 = self._poll({"kernel_sha": "abc1234", "kernel_ver": bad})
+                got, said2 = self._poll({"kernel_sha": "abc1234", "kernel_ver": bad})
                 self.assertEqual(said2, "")
+                self.assertEqual(got["ver"], "", "with nothing remembered the row falls back to the sha alone, as against an older kernel")
 
     def test_a_missing_version_is_not_a_complaint(self):
         got, said = self._poll({"kernel_sha": "abc1234"})
@@ -261,7 +277,9 @@ class TheVersionPollReadsShapes(unittest.TestCase):
     def test_a_peer_on_a_dirty_worktree_keeps_its_sha(self):
         # The suffix _kernel_sha appends on uncommitted edits is a sha to every reader here (_sha_base strips
         # it, _shas_agree ignores it); a shape that refused it froze that peer's row on its last clean poll
-        # and the panel called it an unversioned copy (review find). Guard: passes on origin/main too.
+        # and the panel called it an unversioned copy (review find). This guards _PEER_SHA_RE's next edit,
+        # not the pre-shape code: the module cannot run on origin/main, where setUp fails on the missing
+        # _peer_shape_said (review find, 2026-09-08: the comment here used to claim it passed there).
         got, said = self._poll({"kernel_sha": "abc1234-dirty", "kernel_ver": "v0.5.0+"})
         self.assertEqual((got["sha"], got["ver"]), ("abc1234-dirty", "v0.5.0+"))
         self.assertEqual(said, "", "nothing to complain about")
@@ -271,22 +289,47 @@ class TheVersionPollReadsShapes(unittest.TestCase):
         self.assertIs(km._remote_out_of_date({"kernel_sha": got["sha"]}, head="def5678"), True)
 
 
-class TheRelayDiscardsTheBrowsersToken(unittest.TestCase):
-    def test_the_browser_query_token_is_dropped_before_the_remote_credential_is_set(self):
-        # test_kernel_remote_ws_proxy drives the splice end to end for a row WITH a token; this pins the
-        # order for the row without one: the browser's `token` is popped unconditionally, so nothing a page
-        # sends can ever travel to the far kernel — the relay speaks for itself or not at all.
-        src = inspect.getsource(km.Handler._remote_ws)
-        drop, inject = src.index('q.pop("token", None)'), src.index('q["token"] = [rtok]')
-        self.assertLess(drop, inject)
-        self.assertLess(src.index("q = parse_qs(query"), drop)
+class _Proc:
+    def poll(self):
+        return None
+
+    def terminate(self):
+        pass
 
 
 class TheAttachRouteSpeaksInHasToken(unittest.TestCase):
-    def test_no_kernel_source_publishes_the_token_key_on_a_public_row(self):
-        src = inspect.getsource(km._remote_public)
-        self.assertNotIn('"token": r.get("token")', src)
-        self.assertIn('"hasToken": bool(r.get("token"))', src)
+    """attach_remote answers the popover's Connect with the public row (POST /tunnels hands it back as
+    `tunnel`), and that row used to carry the very credential the attach had just fetched over ssh. Driven
+    through the real attach with ssh and the tunnel stubbed, as test_kernel_remote_identity does; a pin on
+    _remote_public's source text stood here first (review find, 2026-09-08)."""
+
+    def setUp(self):
+        self._saved = (km._fetch_remote_token, km._remote_kernel_up, km._spawn_tunnel, km._notify_bus_peer)
+        self._rem = dict(km._remotes)
+        km._remotes.clear()
+        with km._known_lock:
+            self._known = dict(km._known)
+            km._known.clear()
+        km._fetch_remote_token = lambda h: SECRET
+        km._remote_kernel_up = lambda h, p: True
+        km._spawn_tunnel = lambda r: r.update(proc=_Proc(), status="starting", detail="")
+        km._notify_bus_peer = lambda *a, **k: True
+
+    def tearDown(self):
+        km._fetch_remote_token, km._remote_kernel_up, km._spawn_tunnel, km._notify_bus_peer = self._saved
+        km._remotes.clear()
+        km._remotes.update(self._rem)
+        with km._known_lock:
+            km._known.clear()
+            km._known.update(self._known)
+
+    def test_the_row_the_attach_returns_says_only_that_a_token_was_fetched(self):
+        pub = km.attach_remote("TESTHOST")
+        self.assertIs(pub["hasToken"], True, "the fetch happened...")
+        self.assertNotIn("token", pub)
+        self.assertNotIn(SECRET, json.dumps(pub), "...and the page learns only that")
+        self.assertEqual(km._remotes["TESTHOST"]["token"], SECRET, "the kernel, not the page, holds what was fetched")
+        self.assertIs(km._remote_public(km._remotes["TESTHOST"])["hasToken"], True)
 
 
 if __name__ == "__main__":
