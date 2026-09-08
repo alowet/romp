@@ -26,12 +26,15 @@ app (a bare context match would accept any write-holder's commit status of the s
 The body's tier line (T273, the owner 2026-09-08): outside contributors hold read permission and cannot
 label their own PRs, so `Tier: fix` in the body is how they sort one. When a PR carries NO tier label and
 its body declares one, the label is applied through the API before the verdict, and the same run grades
-the tier it applied; a label already on the PR always stands (maintainers re-tier by relabeling), and a
-body that disagrees is only mentioned in the summary. A label added with the workflow's own token starts
-no workflow run (GitHub: events the GITHUB_TOKEN causes create none, save dispatches), so the "Exactly one
-tier label" run on the head would keep the count it read before the label: its newest completed run is
-re-run through the Actions API. The hourly --all-open pass does the same for every open PR, so a PR whose
-author adds the line reaches both green checks without a further push.
+the tier it applied; a label already on the PR always stands (maintainers re-tier by relabeling), a body
+that disagrees is only mentioned in the summary, and a tier label REMOVED by someone other than the author
+(read from the issue events) ends the body's say: the line is not re-applied, a maintainer sets the tier.
+A label added with the workflow's own token starts no workflow run (GitHub: events the GITHUB_TOKEN causes
+create none, save dispatches), so the "Exactly one tier label" run on the head would keep the count it
+read before the label: this PR's newest completed run is re-run through the Actions API, and every later
+pass re-runs a counter that concluded failure beside one correct label, so the in-progress race heals on
+the next event or hourly pass. A first-time contributor's counter run waits for a maintainer's approval of
+their workflows (completed, action_required): said in the summary, never re-run from here.
 Usage: tier_policy_check.py --pr N | --all-open (env GITHUB_TOKEN, GITHUB_REPOSITORY)."""
 import json
 import os
@@ -117,10 +120,17 @@ def build_record(repo, number, token):
     changed = pr.get("changed_files")
     files_truncated = changed is not None and changed != len(entries)
     dismissals = {}                    # review id -> (who dismissed it, the review's ORIGINAL state)
+    unlabeled = []                     # everyone other than the author who removed a TIER label (T273: a ruling)
     for e in _get_all("/repos/%s/issues/%d/events" % (repo, number), token):
         if e.get("event") == "review_dismissed":
             d = e.get("dismissed_review") or {}
             dismissals[d.get("review_id")] = ((e.get("actor") or {}).get("login"), str(d.get("state") or "").upper())
+        if e.get("event") == "unlabeled":
+            name = (e.get("label") or {}).get("name")
+            who = (e.get("actor") or {}).get("login")
+            if TIER_ALIASES.get(name, name) in TIERS and who and who != author and not _is_bot(e.get("actor")) \
+                    and who not in unlabeled:
+                unlabeled.append(who)
     reviews = []
     for r in _get_all("/repos/%s/pulls/%d/reviews" % (repo, number), token):
         if not r.get("user"):
@@ -159,7 +169,7 @@ def build_record(repo, number, token):
                            % (head[:8], again["head"]["sha"][:8]))
     return {"number": number, "author": author, "labels": [l["name"] for l in pr.get("labels") or []],
             "head_sha": head, "files": files, "files_truncated": files_truncated, "reviews": reviews,
-            "permissions": perms, "body": pr.get("body") or "", "issues": issues}
+            "permissions": perms, "body": pr.get("body") or "", "issues": issues, "tier_unlabeled_by": unlabeled}
 
 
 def post_check(repo, head, verdict, token, number):
@@ -170,40 +180,71 @@ def post_check(repo, head, verdict, token, number):
     _req("POST", "/repos/%s/check-runs" % repo, token, body)
 
 
-def apply_declared_tier(repo, number, rec, token):
+def _tier_labels(rec):
+    return [l for l in rec.get("labels") or [] if TIER_ALIASES.get(l, l) in TIERS]
+
+
+def apply_declared_tier(repo, number, rec, token, head_repo=None, head_branch=None):
     """The body's declared tier becomes the label when the PR carries NO tier label (T273): one label write
     through the API, the record learns it, and the note returned rides the verdict's summary. A tier label
     already present stands whatever the body says (evaluate mentions the disagreement); a body declaring
-    nothing, or two tiers, applies nothing (evaluate says why). A refused write raises: grading the PR as
-    unlabeled with a normal-looking verdict would hide the missing permission (the T121 rule, fail loudly)."""
-    if any(TIER_ALIASES.get(l, l) in TIERS for l in rec.get("labels") or []):
+    nothing, or two tiers, applies nothing (evaluate says why); a tier label REMOVED by someone other than
+    the author is a ruling, and the line is not re-applied over it (evaluate says so; re-applying on the
+    `unlabeled` event or the hourly pass would undo a maintainer's re-tier or leave two labels behind a
+    remove-then-add). A refused write raises: grading the PR as unlabeled with a normal-looking verdict
+    would hide the missing permission (the T121 rule, fail loudly)."""
+    if _tier_labels(rec) or rec.get("tier_unlabeled_by"):
         return ""
     tier, _ = declared_tier(rec.get("body"))
     if not tier:
         return ""
     _req("POST", "/repos/%s/issues/%d/labels" % (repo, number), token, {"labels": [tier]})
     rec["labels"] = list(rec.get("labels") or []) + [tier]
-    return "The `%s` label was applied from the body's tier line.%s" % (tier, _refresh_label_counter(repo, rec["head_sha"], token))
+    return "The `%s` label was applied from the body's tier line.%s" % (
+        tier, _refresh_label_counter(repo, rec["head_sha"], token, head_repo, head_branch))
 
 
-def _refresh_label_counter(repo, head, token):
+COUNTER = '"Exactly one tier label"'
+
+
+def _refresh_label_counter(repo, head, token, head_repo=None, head_branch=None, only_if_failed=False):
     """A label added with the workflow's own token starts no workflow run, so the "Exactly one tier label"
-    run on this head still shows the count it read before the label. Re-run its newest run on the head when
-    that run is completed; a queued run has not counted yet and reads the label itself; one in progress may
-    have counted already and cannot be re-run, so the summary says so instead of guessing; no run on the
-    head (the counter never fired for it) is nothing to refresh. Returns the sentence for the summary."""
-    runs, _ = _req("GET", "/repos/%s/actions/workflows/%s/runs?head_sha=%s&per_page=5"
-                   % (repo, LABEL_COUNTER_WORKFLOW, urllib.parse.quote(head)), token)
-    runs = (runs or {}).get("workflow_runs") or []
-    if not runs:
-        return ""
-    run = runs[0]                       # the API lists runs newest first
-    if run.get("status") == "completed":
+    run on this head still shows the count it read before the label. Re-run this PR's newest run on the head
+    (the query is by head sha and head branch, and a run from another repository's fork on the same sha is
+    skipped) when that run is completed; one that completed as action_required has never counted anything,
+    it awaits a maintainer's approval of a first-time contributor's workflows, and is said, never re-run
+    from here; a queued run has not counted yet and reads the label itself; one in progress may have
+    counted already and cannot be re-run, so the summary says so instead of guessing; no run on the head
+    is nothing to refresh. With only_if_failed (the reconcile every pass does for a PR wearing exactly one
+    tier label), only a run that concluded failure is re-run, so the in-progress race and a refused re-run
+    heal on the next event or hourly pass. A refused refresh is SAID in the summary, never raised: the label
+    is already on, and the verdict must be the real one. Returns the sentence for the summary."""
+    try:
+        q = "head_sha=%s&per_page=10" % urllib.parse.quote(head)
+        if head_branch:
+            q += "&branch=%s" % urllib.parse.quote(head_branch)
+        runs, _ = _req("GET", "/repos/%s/actions/workflows/%s/runs?%s" % (repo, LABEL_COUNTER_WORKFLOW, q), token)
+        runs = [r for r in (runs or {}).get("workflow_runs") or []
+                if not head_repo or not (r.get("head_repository") or {}).get("full_name")
+                or r["head_repository"]["full_name"] == head_repo]
+        if not runs:
+            return ""
+        run = runs[0]                       # the API lists runs newest first
+        if run.get("status") == "in_progress":
+            return "" if only_if_failed else " The %s run on this head was mid-count; if it stays red, push or edit once more." % COUNTER
+        if run.get("status") != "completed":
+            return ""                       # queued: it reads the labels when it starts
+        if run.get("conclusion") == "action_required":
+            return (" The %s run on this head awaits a maintainer's approval of this contributor's workflows (the "
+                    "Actions tab); it counts the label once approved." % COUNTER)
+        if only_if_failed and run.get("conclusion") != "failure":
+            return ""
         _req("POST", "/repos/%s/actions/runs/%d/rerun" % (repo, int(run["id"])), token)
-        return ' The "Exactly one tier label" run on this head was re-run to count it.'
-    if run.get("status") == "in_progress":
-        return ' The "Exactly one tier label" run on this head was mid-count; if it stays red, push or edit once more.'
-    return ""                           # queued: it reads the labels when it starts
+        return " The %s run on this head was re-run to count it." % COUNTER
+    except urllib.error.HTTPError as e:
+        sys.stderr.write("label counter refresh for %s: HTTP %s\n" % (head[:8], e.code))
+        return (" The %s run on this head could not be re-run (HTTP %s): re-run it from the Actions tab, or push or "
+                "edit once more." % (COUNTER, e.code))
 
 
 def run_one(repo, n, token):
@@ -216,7 +257,13 @@ def run_one(repo, n, token):
         pr, _ = _req("GET", "/repos/%s/pulls/%d" % (repo, n), token)
         head = pr["head"]["sha"]
         rec = build_record(repo, n, token)
-        note = apply_declared_tier(repo, n, rec, token)
+        head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
+        head_branch = (pr.get("head") or {}).get("ref")
+        note = apply_declared_tier(repo, n, rec, token, head_repo, head_branch)
+        if not note and len(_tier_labels(rec)) == 1:
+            # the reconcile: a red counter beside one correct label is re-run (the in-progress race, a
+            # refused re-run, a label a maintainer added by hand while the counter was mid-count)
+            note = _refresh_label_counter(repo, rec["head_sha"], token, head_repo, head_branch, only_if_failed=True).strip()
         v = evaluate(rec)
         if note:
             v["summary"] += " " + note

@@ -724,16 +724,19 @@ class FetcherShapes(unittest.TestCase):
             if method == "POST":
                 test.posted.append((path, body))
             if path.endswith("/pulls/42"):
-                return {"head": {"sha": HEAD}, "user": {"login": test.author}, "labels": [{"name": l} for l in test.labels],
-                        "created_at": "2026-08-30T00:00:00Z", "body": test.body,
+                return {"head": {"sha": HEAD, "ref": "topic", "repo": {"full_name": "fork-x/romp"}}, "user": {"login": test.author},
+                        "labels": [{"name": l} for l in test.labels], "created_at": "2026-08-30T00:00:00Z", "body": test.body,
                         "changed_files": test.changed_files}, {}
             if path.endswith("/issues/42/labels"):
                 test.labels = test.labels + list((body or {}).get("labels") or [])
                 return [{"name": l} for l in test.labels], {}
             if "/actions/workflows/pr-tier.yml/runs" in path:
                 test.assertIn("head_sha=" + HEAD, query, "the counter's runs are asked for on THIS head")
+                test.assertIn("branch=topic", query, "...and on this PR's head branch")
                 return {"total_count": len(test.counter_runs), "workflow_runs": test.counter_runs}, {}
             if "/actions/runs/" in path and path.endswith("/rerun"):
+                if test.rerun_error:
+                    raise urllib.error.HTTPError(path, test.rerun_error, "x", {}, None)
                 return None, {}
             if path.endswith("/check-runs"):
                 return {"id": 1}, {}
@@ -776,7 +779,9 @@ class FetcherShapes(unittest.TestCase):
         self.issue_fetches = []
         self.body = "fixes #7"
         self.posted = []
-        self.counter_runs = [{"id": 9001, "status": "completed", "conclusion": "failure"}]
+        self.rerun_error = None
+        self.counter_runs = [{"id": 9001, "status": "completed", "conclusion": "failure",
+                              "head_repository": {"full_name": "fork-x/romp"}}]
         self.tc._req = fake_req
 
     def _labels_posted(self):
@@ -804,6 +809,8 @@ class FetcherShapes(unittest.TestCase):
         self.labels = ["feature"]
         self.body = "Tier: fix"
         self.perms["author-a"] = "admin"
+        self.counter_runs = [{"id": 9006, "status": "completed", "conclusion": "success",
+                              "head_repository": {"full_name": "fork-x/romp"}}]     # a green counter: nothing to refresh
         v = self.tc.run_one("romp-on/romp", 42, "tok")
         self.assertEqual(self._labels_posted(), [], "the label stands; maintainers re-tier by relabeling")
         self.assertEqual(self._reruns_posted(), [])
@@ -853,6 +860,83 @@ class FetcherShapes(unittest.TestCase):
         self.assertEqual(self._reruns_posted(), [])
         self.assertEqual(v["conclusion"], "success")
 
+    def test_a_counter_run_awaiting_approval_is_not_rerun_and_the_verdict_says_so(self):
+        # a first-time contributor's workflow runs wait for a maintainer's approval: the API reports that
+        # run completed with conclusion action_required, though it has never counted anything. Re-running
+        # it would be either refused or a bypass of the approval; say what it waits for instead
+        self.labels = []
+        self.body = "Tier: fix"
+        self.counter_runs = [{"id": 9004, "status": "completed", "conclusion": "action_required",
+                              "head_repository": {"full_name": "fork-x/romp"}}]
+        v = self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._labels_posted(), [{"labels": ["fix"]}])
+        self.assertEqual(self._reruns_posted(), [], "an approval-gated run is never re-run from here")
+        self.assertEqual(v["conclusion"], "success")
+        self.assertIn("approval", v["summary"])
+
+    def test_a_refused_rerun_after_the_label_landed_is_said_not_graded_as_a_failed_evaluation(self):
+        # the label write succeeded, so the verdict is the real one; the counter's refresh is said to have
+        # failed (loudly, in the summary) instead of posting "evaluation failed" on a correctly labeled PR
+        self.labels = []
+        self.body = "Tier: fix"
+        self.rerun_error = 403
+        v = self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._labels_posted(), [{"labels": ["fix"]}])
+        self.assertEqual(v["conclusion"], "success")
+        self.assertIn("could not be re-run", v["summary"])
+        self.assertIn("403", v["summary"])
+
+    def test_a_red_counter_beside_one_correct_label_is_rerun_on_any_later_pass(self):
+        # the in-progress race (the counter read the labels a second before the write) and a refused
+        # re-run both leave the counter red with the label on; the next event or hourly pass repairs it
+        self.labels = ["fix"]
+        self.body = ""
+        v = self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._labels_posted(), [], "nothing to apply")
+        self.assertEqual(self._reruns_posted(), ["/repos/romp-on/romp/actions/runs/9001/rerun"])
+        self.assertEqual(v["conclusion"], "success")
+        self.assertIn("re-run", v["summary"])
+        # a green counter is left alone: no write for nothing
+        self.posted = []
+        self.served = set()
+        self.counter_runs = [{"id": 9005, "status": "completed", "conclusion": "success",
+                              "head_repository": {"full_name": "fork-x/romp"}}]
+        self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._reruns_posted(), [])
+
+    def test_another_repositorys_run_on_the_same_sha_is_not_the_one_rerun(self):
+        # two PRs can share a head sha (a fork and a branch); the run re-run is this PR's own
+        self.labels = []
+        self.body = "Tier: fix"
+        self.counter_runs = [{"id": 7, "status": "completed", "conclusion": "failure", "head_repository": {"full_name": "other-y/romp"}},
+                             {"id": 9001, "status": "completed", "conclusion": "failure", "head_repository": {"full_name": "fork-x/romp"}}]
+        self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._reruns_posted(), ["/repos/romp-on/romp/actions/runs/9001/rerun"])
+
+    def test_a_tier_label_removed_by_someone_other_than_the_author_ends_the_bodys_say(self):
+        # a maintainer who removes the label has ruled (to re-tier, or to leave it unsorted for a talk);
+        # re-applying the body's line on the `unlabeled` event or the hourly pass would undo that ruling,
+        # and a remove-then-add re-tier would end with two labels. The removal is read from the issue
+        # events the fetcher already fetches: an event, not a clock
+        self.labels = []
+        self.body = "Tier: fix"
+        self.events = [{"event": "unlabeled", "label": {"name": "fix"}, "actor": {"login": "maint-b"}},
+                       {"event": "unlabeled", "label": {"name": "wontfix"}, "actor": {"login": "maint-b"}},
+                       {"event": "unlabeled", "label": {"name": "feature"}, "actor": {"login": "github-actions[bot]", "type": "Bot"}}]
+        rec = self.tc.build_record("romp-on/romp", 42, "tok")
+        self.assertEqual(rec["tier_unlabeled_by"], ["maint-b"], "tier labels only, humans only, once per login")
+        self.served = set()
+        v = self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._labels_posted(), [], "the body's line is not re-applied after a maintainer's removal")
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("maint-b", v["summary"])
+        self.assertIn("not re-applied", v["summary"])
+        # the author's own removal is not a ruling: the line applies again
+        self.events = [{"event": "unlabeled", "label": {"name": "fix"}, "actor": {"login": "author-a"}}]
+        self.served = set()
+        self.tc.run_one("romp-on/romp", 42, "tok")
+        self.assertEqual(self._labels_posted(), [{"labels": ["fix"]}])
+
     def test_a_failed_label_write_fails_the_run_loudly(self):
         # a 403 (the token lacks pull-requests:write) must not grade the PR as unlabeled with a
         # normal-looking verdict: the run raises, and run_one posts "evaluation failed" naming the error
@@ -875,8 +959,9 @@ class FetcherShapes(unittest.TestCase):
     def test_build_record_survives_the_documented_shapes_and_has_no_time_field(self):
         rec = self.tc.build_record("romp-on/romp", 42, "tok")
         self.assertEqual(set(rec), {"number", "author", "labels", "head_sha", "files", "files_truncated", "reviews",
-                                    "permissions", "body", "issues"},
+                                    "permissions", "body", "issues", "tier_unlabeled_by"},
                          "the record has exactly the documented keys: no time field, no commit date")
+        self.assertEqual(rec["tier_unlabeled_by"], [], "no tier label was ever removed from this PR")
         self.assertEqual(rec["permissions"], {"admin-c": "admin", "author-a": "write"},
                          "every reviewer AND the author: the policy reads the author's role from this map")
         self.assertEqual(rec["issues"], {7: {"exists": True, "is_pr": False, "comments": ["maint-b"]}},
@@ -1013,6 +1098,31 @@ class DeclaredTier(unittest.TestCase):
     def test_html_comments_are_not_read(self):
         self.assertEqual(tp.declared_tier("<!-- Tier: fix -->"), (None, ""))
         self.assertEqual(tp.declared_tier("<!--\nTier: fix\n-->\nTier: docs")[0], "docs")
+        # an unclosed comment hides the rest of the body on GitHub too (a trimmed template that lost its
+        # closing marker): what the reader cannot see declares nothing
+        self.assertEqual(tp.declared_tier("Tier: docs\n<!-- explanation never closed\nTier: fix\n"), ("docs", ""))
+        self.assertEqual(tp.declared_tier("<!-- never closed\nTier: fix\n"), (None, ""))
+
+    def test_code_blocks_and_quotes_are_not_read(self):
+        # a docs PR quoting the template line in a fence, a pasted snippet, a quoted reply
+        self.assertEqual(tp.declared_tier("Tier: fix\n\n```\nTier: feature\n```\n")[0], "fix")
+        self.assertEqual(tp.declared_tier("~~~md\nTier: feature\n~~~\nTier: fix")[0], "fix")
+        self.assertEqual(tp.declared_tier("```\nTier: feature\n"), (None, ""), "an unclosed fence runs to the end")
+        self.assertEqual(tp.declared_tier("    Tier: feature\nTier: fix")[0], "fix", "four spaces indent a code block")
+        self.assertEqual(tp.declared_tier("> Tier: feature\nTier: fix")[0], "fix")
+
+    def test_trailing_punctuation_and_crlf_are_tolerated(self):
+        for body in ("Tier: fix.", "Tier: fix,\r\n", "Tier: `fix`.\r\nmore\r\n"):
+            self.assertEqual(tp.declared_tier(body)[0], "fix", repr(body))
+
+    def test_the_odd_value_echoed_back_is_bounded(self):
+        tier, why = tp.declared_tier("Tier: " + "x" * 65000)
+        self.assertIsNone(tier)
+        self.assertLess(len(why), 300, "the check summary quotes a bounded excerpt, never the whole line")
+        tier, why = tp.declared_tier("\n".join("Tier: odd%d" % i for i in range(50)))
+        self.assertIsNone(tier)
+        self.assertLess(len(why), 300)
+        self.assertIn("odd0", why)
 
     def test_two_lines_naming_different_tiers_declare_nothing_and_say_so(self):
         tier, why = tp.declared_tier("Tier: fix\n\nTier: feature")
@@ -1060,6 +1170,13 @@ class DeclaredTier(unittest.TestCase):
         v = tp.evaluate(pr(labels=["feature"], body="Tier: fix"))
         self.assertEqual(v["conclusion"], "failure", "a contributor's feature waits, whatever the body says")
         self.assertIn("relabel", v["summary"])
+
+    def test_no_label_after_a_maintainers_removal_says_the_line_is_not_re_applied(self):
+        v = tp.evaluate(pr(labels=[], body="Tier: fix", tier_unlabeled_by=["maint-b"]))
+        self.assertEqual(v["conclusion"], "failure")
+        self.assertIn("maint-b", v["summary"])
+        self.assertIn("not re-applied", v["summary"])
+        self.assertNotIn("applies that label", v["summary"])
 
     def test_a_label_matching_the_body_is_not_remarked_on(self):
         v = tp.evaluate(pr(labels=["fix"], body="Tier: fix"))

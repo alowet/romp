@@ -7,7 +7,8 @@ Tier: <one of docs, fix, feature, major-feature>
 <!-- Replace the placeholder above with ONE tier word and leave the line on its own. The "Tier policy"
 workflow turns it into the PR's label (labeling needs triage permission, which outside contributors do
 not hold); `gh pr create --label <tier>` still works for those who can. A label already on the PR wins:
-maintainers re-tier by relabeling. Two lines naming different tiers declare nothing. The tiers:
+maintainers re-tier by relabeling, and once a maintainer has removed a tier label the line is not applied
+again. Two lines naming different tiers declare nothing. The tiers:
   `docs`           documentation. To the check it is the same tier as `fix`: merges on green for every author.
   `fix`            a bug fix, with a test that fails before it. Merges on green for every author.
   `feature`        a self-contained new capability. By the repository owner (an admin): merges on green. By a

@@ -13,7 +13,9 @@ Record shape (every key the rules read):
   reviews: [{user, state, commit_id, submitted_at, dismissed, dismissed_by}]   (state = the ORIGINAL state;
             for a dismissed review the fetcher recovers it, and the dismisser, from the review_dismissed event)
   permissions: {login: permission}   (every reviewer AND the author; the author's role is read from here)
-  body: str
+  body: str              (the `Tier: <tier>` line is read here, T273; see declared_tier)
+  tier_unlabeled_by: [login]   (everyone other than the author who ever REMOVED a tier label, from the issue
+                          events; bots filtered. Non-empty: the body's line is not re-applied, a maintainer set the tier)
   issues: {number: {exists, is_pr, comments: [login]}}   (commenters; bots already filtered out by the fetcher)
   There is no time field: nothing in the policy is timed, so the fetcher records no clock, no check-run
   history and no commit date (submitted_at orders one reviewer's reviews and is never compared to now).
@@ -79,8 +81,13 @@ _ISSUE_REF = re.compile(r"(?:^|[^\w/])#(\d+)\b|github\.com/romp-on/romp/issues/(
 # with bold, backticks or a list marker tolerated; HTML comments are cut out first, so the PR template's
 # explanation of the tiers never parses. A read-only contributor cannot label their own PR (labeling needs
 # triage), so this line is how they sort it: the workflow applies the matching label from it.
-_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
-_TIER_LINE = re.compile(r"^\s*(?:[-*]\s+)?[*_`]*tier[*_`]*\s*:[*_`]*\s*(.*?)\s*$", re.I)
+# HTML comments and fenced code are cut out first, each running to its close or to the end of the body (an
+# unclosed comment or fence hides the rest on GitHub too, so what the reader cannot see declares nothing);
+# a line indented four spaces is a code block and a `>` line a quote, neither a declaration
+_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
+_CODE_FENCE = re.compile(r"^(```|~~~)[^\n]*\n.*?(?:^\1[ \t]*$|\Z)", re.S | re.M)
+_TIER_LINE = re.compile(r"^ {0,3}(?:[-*]\s+)?[*_`]*tier[*_`]*\s*:[*_`]*\s*(.*?)\s*$", re.I)
+_ODD_MAX, _ODD_LEN = 3, 40    # the check summary quotes a bounded excerpt of a line that names no tier
 
 
 def declared_tier(body):
@@ -91,17 +98,18 @@ def declared_tier(body):
     untouched placeholder, a typo, an empty line) is quoted back. Pure over the body text; HTML comments are
     not read."""
     found, odd = [], []
-    for line in _HTML_COMMENT.sub("", body or "").splitlines():
+    text = _CODE_FENCE.sub("", _HTML_COMMENT.sub("", body or ""))
+    for line in text.splitlines():
         m = _TIER_LINE.match(line)
         if not m:
             continue
         raw = m.group(1).strip()
-        val = raw.strip("`*_ ").lower()
+        val = raw.strip("`*_ .,;").lower()
         tier = TIER_ALIASES.get(val, val)
         if tier in TIERS:
             found.append(tier)
-        else:
-            odd.append(raw or "(empty)")
+        elif len(odd) < _ODD_MAX:
+            odd.append((raw[:_ODD_LEN] + "…") if len(raw) > _ODD_LEN else (raw or "(empty)"))
     distinct = list(dict.fromkeys(found))
     if len(distinct) > 1:
         return None, "the body's tier lines disagree (%s): one line, one tier" % ", ".join(distinct)
@@ -203,8 +211,14 @@ def evaluate(pr):
         hint = ""
         if not labels:
             # no label yet: the body's line is how a read-only contributor sorts the PR (T273). The workflow
-            # applies that label and re-grades in the same run; here, purely, the PR is still unlabeled
-            if declared:
+            # applies that label and re-grades in the same run; here, purely, the PR is still unlabeled.
+            # A tier label REMOVED by someone other than the author is a ruling (a maintainer re-tiering, or
+            # un-sorting it for a talk): the line is not re-applied over it, and a maintainer sets the tier
+            removed = list(pr.get("tier_unlabeled_by") or [])
+            if removed:
+                hint = (" %s removed a tier label, so the body's line is not re-applied: a maintainer sets the tier."
+                        % ", ".join(removed))
+            elif declared:
                 hint = " The body declares `%s`: the tier workflow applies that label and grades it." % declared
             elif why:
                 hint = " " + why[0].upper() + why[1:] + "."
