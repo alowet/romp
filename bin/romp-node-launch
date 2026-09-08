@@ -50,13 +50,34 @@ fi
 # a login shell also reach the kernel. ROMP_API_KEY_REF remains a reference here;
 # the kernel resolves it through op when needed. Parsed line-by-line, never sourced: a
 # malformed line is skipped instead of executing code or (under set -eu)
-# taking the manager — and the whole kernel — down with it.
+# taking the manager, and the whole kernel, down with it. Whitespace around the
+# value (a trailing space after a closing quote, a CRLF line ending) is discarded and
+# then one layer of matching quotes comes off, so the common line reads the same way
+# under systemd's EnvironmentFile= and the kernel's own reader (kernel/keysource.py
+# _assignments): KEY="a b" reaches the manager as a b, not as "a b". Without this a
+# quoted value in service.env reached a macOS-launched manager with its quotes and a
+# systemd-launched one without, the same line meaning two different things by
+# platform. Not full systemd parity: backslash escapes inside quotes are not
+# interpreted here (systemd interprets some), and the unusual shapes (an unbalanced
+# quote, quotes inside a value) follow the kernel's reader rather than systemd.
 ENV_FILE="${ROMP_SERVICE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/romp/service.env}"
 if [ -f "$ENV_FILE" ]; then
     while IFS= read -r _line || [ -n "$_line" ]; do
         case "$_line" in
             ''|'#'*) ;;
-            [A-Za-z_]*=*) export "$_line" 2>/dev/null || true ;;
+            [A-Za-z_]*=*)
+                _name="${_line%%=*}"
+                _val="${_line#*=}"
+                # Trim whitespace, a CR included, from both ends BEFORE looking for the
+                # quotes, or `KEY="a b" ` and a CRLF file keep their quotes here alone.
+                # POSIX parameter expansion only: this runs under /bin/sh.
+                _val="${_val#"${_val%%[![:space:]]*}"}"
+                _val="${_val%"${_val##*[![:space:]]}"}"
+                case "$_val" in
+                    \"*\") _val="${_val#\"}"; _val="${_val%\"}" ;;
+                    \'*\') _val="${_val#\'}"; _val="${_val%\'}" ;;
+                esac
+                export "$_name=$_val" 2>/dev/null || true ;;
         esac
     done < "$ENV_FILE"
 fi
