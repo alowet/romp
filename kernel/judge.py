@@ -1437,7 +1437,7 @@ def _resolve_work_key_gated():
         # would spawn `op` and wait out its own timeout. The first to arrive retrieves; the others wait for
         # its verdict — then raise the remembered failure, or retrieve for themselves (no value is shared).
         while _KEY_INFLIGHT[0] == key:
-            _KEY_GATE_CV.wait(timeout=_keysrc.OP_TIMEOUT + 1)
+            _KEY_GATE_CV.wait(timeout=_keysrc.KEY_CMD_TIMEOUT + 1)
         if _KEY_GATE["fp"] == fp and _KEY_GATE["gen"] == gen:
             raise _keysrc.KeySourceError(_KEY_GATE["note"] or "API credential retrieval failed earlier in this pass")
         first = _KEY_INFLIGHT[0] is None

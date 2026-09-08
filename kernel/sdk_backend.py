@@ -2028,19 +2028,20 @@ def work_api_key_source():
         if source.kind == "file":
             _check_key_file_agrees(startup, source.value)
             _note_key_file_gone(source.value)
-        if source.kind in ("file", "op"):
+        if source.kind == "file" or _keysrc.is_provider_kind(source.kind):
             # A real selection retires the startup key for good. Said ONCE when that key was non-empty:
             # an operator who delivers the key through a systemd drop-in or a launchd plist rather than
             # service.env would otherwise watch every session bill the login with nothing in the log
             # (review find, 2026-09-05) — the silent fallback this module exists to end.
             # (the standard install exports the file's own key line into the manager environment, so the
             # SAME key on both sides is nothing to say; a DIFFERENT file key is _check_key_file_agrees's line)
-            discarded = source.kind == "op" or (source.kind == "file" and not source.value)
+            discarded = _keysrc.is_provider_kind(source.kind) or (source.kind == "file" and not source.value)
             if startup and discarded and not _STARTUP_KEY_DISCARD_SAID:
                 _STARTUP_KEY_DISCARD_SAID = True
                 why = ("supervised managers read %s only" % _keysrc.service_env_path()
                        if source.kind == "file" and os.environ.get("ROMP_SUPERVISED") == "1"
                        else "%s selects the 1Password source" % _keysrc.REF_VAR if source.kind == "op"
+                       else "%s selects the key command source" % _keysrc.CMD_VAR if source.kind == "command"
                        else "the env file's key line is empty")
                 tail = ("Sessions launch with nothing of romp's injected, whatever their Billing pick (Claude "
                         "Code's own credential pays)." if not source.configured
@@ -5591,6 +5592,8 @@ class SdkBackend:
                        % (_keysrc.service_env_path(), _keysrc.KEY_VAR))
             elif source == "op":
                 src = "retrieved at runtime from 1Password"
+            elif source == "command":
+                src = "retrieved at runtime by the key command (%s)" % _keysrc.CMD_VAR
             else:
                 src = "read from %s" % _keysrc.service_env_path()
             self._log("work key: sessions now launch on the key sha256:%s (%s)" % (fp, src))
@@ -5604,8 +5607,9 @@ class SdkBackend:
             return
         self._unkeyed_pick_said = True
         self._log("sessions picked for API-key billing launch on Claude Code's own credential (its apiKeyHelper "
-                  "or login) because romp holds no key source — add ROMP_API_KEY_REF=op://vault/item/field or "
-                  "ANTHROPIC_API_KEY to %s if romp should manage the key" % _keysrc.service_env_path(),
+                  "or login) because romp holds no key source — add ROMP_API_KEY_CMD=<command>, "
+                  "ROMP_API_KEY_REF=op://vault/item/field or ANTHROPIC_API_KEY to %s if romp should manage the key"
+                  % _keysrc.service_env_path(),
                   problem=True)
 
     def _note_seed_skipped(self) -> None:
@@ -5618,7 +5622,8 @@ class SdkBackend:
         self._seed_skip_said = True
         self._log("the remembered Billing pick is the API key but romp holds no key source, so new sessions start "
                   "unpicked and launch on Claude Code's own credential (its apiKeyHelper or login) — add "
-                  "ROMP_API_KEY_REF=op://vault/item/field or ANTHROPIC_API_KEY to %s to apply the pick"
+                  "ROMP_API_KEY_CMD=<command>, ROMP_API_KEY_REF=op://vault/item/field or ANTHROPIC_API_KEY to %s "
+                  "to apply the pick"
                   % _keysrc.service_env_path(), problem=True)
 
     def cycle_key(self, sid: str, expected_source_fp: str | None = None, current_key_fp: str | None = None,

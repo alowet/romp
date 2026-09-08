@@ -3,9 +3,11 @@
 
 `romp keyswap` selects a credential source in the manager's env file
 (`~/.config/romp/service.env`), taken from a sibling profile (`service.env.highprio`,
-`service.env.lowprio`, …). A profile contains `ROMP_API_KEY_REF=op://…` for runtime 1Password
-retrieval, or `ANTHROPIC_API_KEY=…` for a conventional key. Switching removes competing credential
-assignments. This command never resolves a 1Password reference. The kernel reads the source live:
+`service.env.lowprio`, …). A profile contains `ROMP_API_KEY_CMD=…` (a key command: any secret
+manager's CLI printing the key, run by the kernel at use time), `ROMP_API_KEY_REF=op://…` (the
+1Password shorthand for the same), or `ANTHROPIC_API_KEY=…` for a conventional key. Switching
+removes competing credential assignments. This command never runs a provider. The kernel reads the
+source live:
 
   * a session started or revived from then on bills the new key with no further action;
   * a session already running keeps the key its CLI process started with, because the key rides
@@ -120,6 +122,8 @@ def _source_label(source):
         return "(invalid key source)"
     if source.kind == "op":
         return "1Password reference " + source.fingerprint()
+    if source.kind == "command":
+        return "key command " + source.fingerprint()
     return _fp(source.value)
 
 
@@ -149,7 +153,7 @@ def _candidates(path, out):
     if not names:
         out("candidates  none — keep one file per key beside it, e.g. %s.lowprio (chmod 600),"
             % os.path.basename(path))
-        out("            each a single ROMP_API_KEY_REF=op://… or %s=… line" % ks.KEY_VAR)
+        out("            each a single %s=…, ROMP_API_KEY_REF=op://… or %s=… line" % (ks.CMD_VAR, ks.KEY_VAR))
         return
     out("candidates")
     for n in names:
@@ -195,14 +199,15 @@ def _compare(body, path, out):
     except ks.KeySourceError as exc:
         out("MISMATCH    this file has an invalid key source — %s" % exc)
         return 1
-    if source.kind == "op":
+    if ks.is_provider_kind(source.kind):
         if "sourceFp" not in body:
             out("kernel      predates runtime key sources; update it with `romp refresh` before cycling")
             return 1
         source_fp = body.get("sourceFp") or ""
         out("kernel      source %s" % (source_fp or "(none)"))
         if source_fp == source.fingerprint():
-            out("            1Password reference matches; credentials are retrieved at runtime")
+            out("            %s matches; credentials are retrieved at runtime"
+                % ("1Password reference" if source.kind == "op" else "key command"))
             return 0
     else:
         kfp = body.get("keyFp") or ""
@@ -349,13 +354,13 @@ def main(argv, out=None):
     if not new.configured or not new.value:
         # Refuse rather than write an empty key: the CLI reads an empty ANTHROPIC_API_KEY as
         # "API-key mode, no key" and every session would then fail to authenticate.
-        sys.stderr.write("romp keyswap: %s has no usable ROMP_API_KEY_REF= or %s= line — "
-                         "nothing to swap to (file untouched)\n" % (src, ks.KEY_VAR))
+        sys.stderr.write("romp keyswap: %s has no usable %s=, ROMP_API_KEY_REF= or %s= line — "
+                         "nothing to swap to (file untouched)\n" % (src, ks.CMD_VAR, ks.KEY_VAR))
         return 2
     cur = ks.read_source(path)
     # A pre-existing reference may still sit beside a legacy plaintext key. Selecting that same
     # reference also migrates the file: remove the leftover secret instead of treating it as done.
-    if new == cur and not (new.kind == "op" and _legacy_key_present(path)):
+    if new == cur and not (ks.is_provider_kind(new.kind) and _legacy_key_present(path)):
         out("service.env %s" % path)
         out("live key    %s — already this key source, nothing rewritten" % _source_label(cur))
     else:
@@ -380,6 +385,8 @@ def main(argv, out=None):
     out("effect      new and revived sessions use this key source; no manager restart needed")
     if new.kind == "op":
         out("            the kernel retrieves the key through op at runtime; no key was copied to disk")
+    elif new.kind == "command":
+        out("            the kernel runs the key command at runtime; no key was copied to disk")
     if cycle or cycle_all:
         return _cycle(cycle, cycle_all, out, path)
     rc = _kernel_check(path, out)
