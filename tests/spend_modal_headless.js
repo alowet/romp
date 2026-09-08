@@ -31,7 +31,7 @@ const { chromium } = require('playwright');
     chartFirst: (() => { const secs = Array.from(document.querySelectorAll('#rsp-panel .rsp-sec')); const ci = secs.findIndex((s) => s.querySelector('#rsp-chart')); const ti = secs.findIndex((s) => s.querySelector('#rsp-table')); return ci >= 0 && ti > ci; })(),
     swatches: document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr .rsp-sw:not(.rsp-hatch)').length,
     title: (() => { const t = document.querySelector('#rsp-panel .rsp-tbl tbody tr .tab-label'); const cs = t ? getComputedStyle(t) : null; const hp = t ? t.querySelector('.host-prefix') : null; return { color: cs ? cs.color : null, weight: cs ? cs.fontWeight : null, prefix: hp ? hp.textContent : null }; })(),
-    pane: (() => { const p = document.getElementById('rsp-table'); const th = document.querySelector('#rsp-panel .rsp-tbl thead th'); return { scrolls: !!p && p.scrollHeight > p.clientHeight + 4, sticky: th ? getComputedStyle(th).position : null, h: p ? p.clientHeight : null }; })(),
+    pane: (() => { const p = document.getElementById('rsp-table'); const th = document.querySelector('#rsp-panel .rsp-tbl thead th'); const panel = document.getElementById('rsp-panel'); return { scrolls: !!p && p.scrollHeight > p.clientHeight + 4, sticky: th ? getComputedStyle(th).position : null, h: p ? p.clientHeight : null, thOpacity: th ? getComputedStyle(th).opacity : null, panelScrolls: panel.scrollHeight > panel.clientHeight + 2 }; })(),
     rows: Array.from(document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr')).map((tr) => tr.textContent),
     deadRows: document.querySelectorAll('#rsp-panel .rsp-tbl tbody tr.rsp-dead').length,
     segs: document.querySelectorAll('#rsp-chart .rsp-seg').length,

@@ -32503,27 +32503,35 @@ def _spend_detail_local(now=None):
     except Exception:
         live = set()
     sessions = []
-    swatches = pal.colors(pal.active_name(jd.STATE))
     for sid, (u, t, n) in totals.items():
         bg, fg = _identity_of(sid)
-        derived = False
-        if not bg:
-            # a session the registry never colored (a legacy or tmux one) still needs a color of its
-            # own for its stack and its row (T247e): a deterministic swatch of the active palette, by
-            # sid, so it reads the same on every open; flagged so a client can tell it from an identity
-            import zlib
-            bg = swatches[zlib.crc32(str(sid).encode()) % len(swatches)] if swatches else ""
-            fg = pal.fg_for(bg) if bg else ""
-            derived = True
         row = {"sid": sid, "name": _name_of(sid) or "", "bg": bg, "fg": fg, "live": sid in live,
                "usd": round(u, 4), "tok": t, "turns": n}
-        if derived:
-            row["bgDerived"] = True
         if sid in keyt:
             k = keyt[sid]
             row["key"] = {"usd": round(k[0], 4), "tok": k[1], "turns": k[2]}
         sessions.append(row)
     sessions.sort(key=lambda s: (-s["usd"], -s["tok"], s["name"]))
+    # a session the registry never colored (a legacy or tmux one) still needs a color of its own for its
+    # stack and its row (T247e): a swatch of the active palette — the LEAST-USED one across this payload,
+    # so it never wears a color an identity-colored session here already has while a free one remains
+    # (the kernel's own picker's rule; review find: a plain hash gave a dead session web's blue), ties
+    # broken by the sid's hash so the pick is the same on every open; flagged so a client can tell it
+    import zlib
+    swatches = pal.colors(pal.active_name(jd.STATE))
+    used = {}
+    for s in sessions:
+        if s["bg"]:
+            used[s["bg"]] = used.get(s["bg"], 0) + 1
+    for s in sessions:
+        if s["bg"] or not swatches:
+            continue
+        h = zlib.crc32(str(s["sid"]).encode()) % len(swatches)
+        ranked = sorted(range(len(swatches)), key=lambda i: (used.get(swatches[i], 0), (i - h) % len(swatches)))
+        s["bg"] = swatches[ranked[0]]
+        s["fg"] = pal.fg_for(s["bg"])
+        s["bgDerived"] = True
+        used[s["bg"]] = used.get(s["bg"], 0) + 1
     top = [s["sid"] for s in sessions]          # every session (T247e): the list IS the legend
     meta = {s["sid"]: s for s in sessions}
 
@@ -32807,7 +32815,7 @@ def _merge_spend_details(payloads, hosts, local):
                 continue
             m = meta[key]
             stacks.append({"kind": "sid", "host": key[0], "sid": key[1], "name": m.get("name") or "", "bg": m.get("bg") or "",
-                           "live": bool(m.get("live")), "bgDerived": bool(m.get("bgDerived")), "usd": u, "tok": arr[1]})
+                           "live": bool(m.get("live")), "usd": u, "tok": arr[1]})
         for oh, o in others.items():
             ou = [round(v, 4) for v in o[0]]
             if any(ou) or any(o[1]):
@@ -40957,7 +40965,6 @@ function spName(s){return s.name||('session '+String(s.sid||'').slice(0,8));}
 // session's tab does — the shared .host-prefix treatment (quiet, italic, a step smaller)
 function spHosts(d){return ((d&&d.hosts)||[]).filter(function(h){return h.status==='ok';});}
 function spMany(d){return spHosts(d).length>1;}
-function spLabel(s,many){return (many&&s.host?'<span class=host-prefix>'+esc(s.host)+':</span> ':'')+esc(spName(s));}
 // a session row reads like its TAB TITLE (T247e, the user 2026-09-08): the tab strip's own classes —
 // .tab-label with the identity color as --chip-bg (styles.css keys the color and weight on the SAME
 // rule the strip uses, so the two cannot drift) and the quiet .host-prefix — no swatch
@@ -41063,7 +41070,14 @@ h+='<div class=rsp-sec><div class=ru-tip-name><span>By session'+(many?' \u00b7 '
 ((d.hosts)||[]).forEach(function(x){if(x.status==='ok')return;
 h+='<div class=rsp-note>'+esc(x.host)+': '+(x.status==='older'?'older build, no per-session data':'not reachable')+(x.detail?' \u2014 '+esc(x.detail):'')+'</div>';});
 h+='<div id=rsp-table>'+sessionTable(d)+'</div></div>';
-spPanel.innerHTML=h;renderChart();}
+spPanel.innerHTML=h;renderChart();spSizePane();}
+// the list pane takes exactly the room left under the chart (review find: a fixed 38vh cap left the card
+// itself scrolling at common viewport heights, a scroll region inside a scroll region); a floor keeps a
+// few rows visible on a very short screen, where the card then scrolls as the last resort
+function spSizePane(){var pane=document.getElementById('rsp-table');if(!pane||!spPanel)return;
+var cap=Math.floor(window.innerHeight*0.92),cs=getComputedStyle(spPanel),pad=parseFloat(cs.paddingTop)+parseFloat(cs.paddingBottom)+2;
+var above=pane.offsetTop-spPanel.offsetTop-spPanel.clientTop;   // everything rendered above the pane, inside the card
+var room=cap-pad-above-8;pane.style.maxHeight=Math.max(120,room)+'px';}
 // 1-2-5 ceilings: the y-axis top is the nearest clean number above the tallest bucket
 function niceTop(mx){if(!(mx>0))return 1;var p=Math.pow(10,Math.floor(Math.log(mx)/Math.LN10)),f=mx/p;return (f<=1?1:f<=2?2:f<=5?5:10)*p;}
 function spFill(s){return s.kind==='unattributed'?'url(#rsp-hatch)':s.kind==='other'?SP_OTHER:spColor(s);}
@@ -41094,7 +41108,7 @@ var tots=[],mx=0;for(var i=0;i<n;i++){var t=0;for(var s=0;s<stacks.length;s++){t
 if(!(mx>0)){box.innerHTML='<div class=rsp-note>Nothing recorded in this range.</div>';return;}
 var top=niceTop(mx),slot=W/n,gap=Math.min(2,slot*0.3),bw=Math.max(1,slot-gap),PADT=6;
 var Y=function(v){return H-Math.max(0,Math.min(1,v/top))*(H-PADT);};
-var fmt=function(v){return meas==='usd'?fmtUsd(v):fmtTok(Math.round(v));};
+var fmt=function(v){return meas==='usd'?(v>0&&v<0.5?'under $1':fmtUsd(v)):fmtTok(Math.round(v));};   // whole dollars, and a sliver says so rather than "$0"
 // axis labels wear whole dollars like every spend surface (no cents anywhere, the user 2026-08-09);
 // a half-line whose value is not a whole dollar (a $5 ceiling's $2.50) stays an unlabeled hairline
 // rather than rounding into a twin of another label
@@ -41109,8 +41123,8 @@ var svg='<svg class="rsp-svg" viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+
 var ylab='';[top,top/2].forEach(function(g){var gy=Y(g);
 svg+='<line x1="0" y1="'+gy.toFixed(1)+'" x2="'+W+'" y2="'+gy.toFixed(1)+'" class="rsp-grid"></line>';
 var al=afmt(g);if(al)ylab+='<span class=ru-tip-gy style="top:'+(gy+1).toFixed(0)+'px">'+al+'</span>';});
-// one column per bucket, stacked bottom-up in stack order (top-N by dollars, then other, then
-// unattributed); a 2px surface gap between touching segments; the topmost segment's top corners
+// one column per bucket, stacked bottom-up in stack order (the session list's order — by dollars, or
+// the viewer's own — then unattributed); a 2px surface gap between touching segments; the topmost segment's top corners
 // rounded (4px data-end, square at the baseline) — the dataviz mark specs
 for(var i=0;i<n;i++){if(!(tots[i]>0))continue;var x=i*slot+gap/2,segs=[];
 for(var s=0;s<stacks.length;s++){var v=(stacks[s][meas]&&stacks[s][meas][i])||0;if(v>0)segs.push([s,v]);}
@@ -41143,7 +41157,9 @@ var i=+t.getAttribute('data-i'),si=+t.getAttribute('data-s'),s=stacks[si];if(!s)
 var v=(s[meas]&&s[meas][i])||0,o=(s[meas==='usd'?'tok':'usd']&&s[meas==='usd'?'tok':'usd'][i])||0;
 spTipShow(e.clientX,e.clientY,spStackText(s,many,meas,i),fmt(v),(meas==='usd'?fmtTok(Math.round(o))+' tok':fmtUsd(o))+' \u00b7 '+spBucketLabel(ser.keys[i],SP.range));};
 svgEl.onpointerleave=spTipHide;}
-window.addEventListener('resize',function(){if(SP.open&&SP.data)renderChart();});
+var spResizeRaf=0;
+window.addEventListener('resize',function(){if(!(SP.open&&SP.data)||spResizeRaf)return;
+spResizeRaf=requestAnimationFrame(function(){spResizeRaf=0;if(SP.open&&SP.data){renderChart();spSizePane();}});});
 el.addEventListener('click',function(){pull(true);openSpend();});
 setInterval(function(){pull(false);},60000);     // backup auto-refresh: re-read usage.json every 60s
 pull(false);                                     // fill on load, independent of the timeline-forward path
@@ -42947,7 +42963,7 @@ def _landing():
             ".rsp-load{display:flex;justify-content:center;padding:40px 0}"
             # the session list is a SCROLL PANE under a sticky header (T247e): every session, the modal a
             # centered card that keeps its size; the pane scrolls inside it
-            "#rsp-table{max-height:38vh;overflow-y:auto;margin-top:4px}"
+            "#rsp-table{max-height:38vh;overflow-y:auto;margin-top:4px}"   # the JS (spSizePane) refits it to the room under the chart
             ".rsp-tbl{width:100%;border-collapse:collapse}"
             ".rsp-tbl thead th{position:sticky;top:0;background:#252526;z-index:1}"
             # a row's title is its TAB TITLE, under the strip's own class names. The landing page loads no
@@ -42956,17 +42972,15 @@ def _landing():
             # their declarations — and tests/test_spend_detail.py pins the twin against the source, so the
             # two cannot drift (the timeline's MENU_STYLE twin is the precedent). --dim is the strip's
             # variable; a fallback carries the dark value where the landing defines none.
-            ".rsp-name .tab-label{font-size:inherit;line-height:inherit}"
             ".rsp-name .tab-label.colored{color:var(--chip-bg);font-weight:600}"
             ".rsp-name .host-prefix{color:var(--dim,#9aa0a6);font-weight:400;font-style:italic;font-size:0.86em}"
-            ".rsp-tbl th{text-align:left;font-weight:400;opacity:.55;padding:2px 6px 4px 0;border-bottom:1px solid rgba(255,255,255,0.08)}"
+            ".rsp-tbl th{text-align:left;font-weight:400;color:#8a97a6;padding:2px 6px 4px 0;border-bottom:1px solid rgba(255,255,255,0.08)}"   # muted by color, not opacity: the sticky header must occlude the rows scrolling under it (review find)
             ".rsp-tbl td{padding:3px 6px 3px 0;border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap}"
             ".rsp-tbl .n{text-align:right;font-variant-numeric:tabular-nums}"
             ".rsp-tbl td.rsp-name{width:100%;max-width:0;overflow:hidden;text-overflow:ellipsis}"
             # a session no longer running keeps its last known name, dimmed ONCE (T247b review): the row's
             # cells carry the dimming, the annotation inside stays at the row's level (it used to compound
-            # .55 × .6 to a 2.3:1 read), and a legend chip dims on its own; the fold row is a CONTROL row —
-            # its count is muted, its "show all" is never dimmed (it read as disabled)
+            # .55 × .6 to a 2.3:1 read)
             ".rsp-dead td{opacity:.55}.rsp-dead .ru-tip-reset{opacity:1}"
             ".rsp-sw{display:inline-block;width:10px;height:10px;border-radius:3px;vertical-align:-1px;background:#6b7a8c}"
             # unattributed spend wears a TEXTURE, not a hue: it is not a session, and texture is the
@@ -43280,7 +43294,7 @@ def _landing():
             "body.theme-light .rsp-top{color:#1F1E1D;border-bottom-color:rgba(0,0,0,0.10)}"
             "body.theme-light .rsp-x{color:#5D574E}body.theme-light .rsp-x:hover{color:#1F1E1D}"
             "body.theme-light .rsp-tbl th{border-bottom-color:rgba(0,0,0,0.10)}body.theme-light .rsp-tbl td{border-bottom-color:rgba(0,0,0,0.06)}"
-            "body.theme-light .rsp-tbl thead th{background:#FFFFFF}"
+            "body.theme-light .rsp-tbl thead th{background:#FFFFFF}body.theme-light .rsp-tbl th{color:#5D574E}"
             "body.theme-light .rsp-name .host-prefix{color:var(--dim,#5D574E)}"
             "body.theme-light .rsp-btn{border-color:rgba(0,0,0,0.18);color:#1F1E1D}"
             # the PRESSED toggle's light step, written out (T247b review): `.rsp-btn.on` (0,2,0) lost to

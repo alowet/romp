@@ -3,7 +3,7 @@
 spend breakdown and a stacked histogram of spend over time colored by session. The data is GET
 /spend/detail: the ledger's bySid maps (T100's per-session attribution) with names and identity colors
 resolved kernel-side, two ranges at the ledger's own granularity (192 hours, 90 days), the top-N sessions
-as stacks plus ONE "other" and ONE "unattributed" stack — spend recorded before attribution existed, or
+as stacks (every session its own, since T247e) plus ONE "unattributed" stack — spend recorded before attribution existed, or
 the part of a bucket no sid accounts for, is shown as such, never dropped (fail loudly). Hermetic state
 root, synthetic ledger, the notes-api demo sessions (web/api/tests), placeholder uuids, TESTHOST."""
 import inspect
@@ -168,6 +168,13 @@ class SpendDetail(unittest.TestCase):
         small = [s for s in d["days"]["stacks"] if s.get("sid", "").endswith("0111")][0]
         self.assertAlmostEqual(small["usd"][keys.index(_day(1))], 0.1, places=3, msg="a small session keeps its own series")
         self.assertTrue(all(s["bg"].startswith("#") for s in d["days"]["stacks"] if s["kind"] == "sid"), "every stack has a color")
+        # derived colors never take a swatch an identity-colored session here holds while a free one remains
+        # (review find: a plain hash gave a dead session web's blue)
+        ident = {s["bg"] for s in d["sessions"] if not s.get("bgDerived")}
+        derived = [s["bg"] for s in d["sessions"] if s.get("bgDerived")]
+        free = len(km.pal.colors(km.pal.active_name(km.jd.STATE))) - len(ident)
+        self.assertTrue(all(c not in ident for c in derived[:free]), "the free swatches go first")
+        self.assertEqual(len(set(derived[:free])), free, "…each once")
         self.assertEqual(d["hours"]["stacks"][0]["name"], "web", "stack order is the table's: top by dollars")
 
     def test_the_keyed_scope_reads_each_sids_key_split_like_the_rail(self):

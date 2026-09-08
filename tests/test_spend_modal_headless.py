@@ -165,6 +165,8 @@ class SpendModalServed(unittest.TestCase):
         self.assertEqual(o["out"]["title"]["prefix"], "TESTHOST:")
         self.assertTrue(o["out"]["pane"]["scrolls"], o["out"]["pane"])
         self.assertEqual(o["out"]["pane"]["sticky"], "sticky")
+        self.assertEqual(o["out"]["pane"]["thOpacity"], "1", "the sticky header occludes: muted by color, not opacity (review find)")
+        self.assertFalse(o["out"]["pane"]["panelScrolls"], "the card itself does not scroll at 820px: the pane takes the room under the chart (review find)")
         # T247f: "your order" — the strip's order (api before web from session-order.json, then the peer's own
         # order), unknown sessions trailing by spend; the chart's bottom stack follows; a viewer arrangement
         # (the strip's localStorage key) reorders both; the choice persists with the other toggles
