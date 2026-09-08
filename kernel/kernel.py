@@ -33464,7 +33464,7 @@ def _mesh_settings_snapshot():
     return values, stamps
 
 
-_MESH_SAID = set()   # (host, why) said once on stderr: an isolated peer, a peer without the route
+_MESH_SAID = set()   # (host, why) said once on stderr: an isolated peer, a peer that did not take a push
 
 
 def _mesh_say_once(host, why, line):
@@ -33528,8 +33528,11 @@ def _push_settings_to_peer(r, older):
     for store, body in older:
         st, j, err = _remote_kernel_call(r, "POST", "/mesh-settings", body, timeout=8)
         if err or st != 200 or not isinstance(j, dict) or not j.get("ok"):
-            _mesh_say_once(host, "no-route", "settings: %s did not take the push (%s) — an older kernel? its copy stays "
-                           "until it updates or the next click reaches it" % (host, err or ("HTTP %s" % st)))
+            # an older kernel answers the unknown route with a text 404, which the transport reports as a
+            # parse error, not a status — so the line names the shape it saw and both likely causes
+            _mesh_say_once(host, "push-failed", "settings: %s did not take the push (%s) — an older kernel without the "
+                           "route, or unreachable; its copy stays until it updates or the next click reaches it"
+                           % (host, err or ("HTTP %s" % st)))
             return pushed
         if (j.get("settingsGt") or {}).get(store) == body["gt"]:
             pushed.append(store)

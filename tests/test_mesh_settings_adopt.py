@@ -312,8 +312,8 @@ class _Mesh:
 
         def call(r, method, path, payload=None, timeout=8):
             self.calls.append((r.get("host"), method, path, payload))
-            if self.refuse:
-                return 404, {}, None
+            if self.refuse:   # the real shape: an older kernel's text 404 fails the transport's JSON parse
+                return None, None, "could not reach TESTHOST's kernel: Expecting value: line 1 column 1 (char 0)"
             with self.b:
                 return 200, km._apply_mesh_settings(payload if isinstance(payload, dict) else {}), None
         km._remote_kernel_call = call
@@ -393,6 +393,7 @@ class OneDirectionalAttach(unittest.TestCase):
         out2, err2 = self.m.converge()
         self.assertEqual((out1["pushed"], out2["pushed"]), ([], []))
         self.assertIn("TESTHOST", err1, "the refusal is said, naming the machine")
+        self.assertIn("older kernel without the route, or unreachable", err1, "…and both likely causes, since the transport cannot tell them apart")
         self.assertEqual(err2.count("did not take"), 0, "…once per peer, not every pass")
         self.assertEqual(self.b.read("compact-suggest"), (True, 5_000), "the peer keeps its copy until it updates or the next click")
 
