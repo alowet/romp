@@ -19,7 +19,8 @@ setup() {
     export ROMP_REPO="$TEST_DIR/origin"
 
     # A fake romp origin: enough structure for bootstrap's clone check, plus a
-    # non-release tag alongside two releases so tag selection is exercised.
+    # non-release tag and a prerelease tag alongside two releases so tag
+    # selection is exercised.
     mkdir -p "$ROMP_REPO/kernel"
     printf '#!/usr/bin/env bash\necho STUB_INSTALL_RAN\n' > "$ROMP_REPO/install.sh"
     chmod +x "$ROMP_REPO/install.sh"
@@ -33,6 +34,9 @@ setup() {
     git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m r2
     git -C "$ROMP_REPO" tag v0.2.0
     git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m post-release
+    # A prerelease cut after the newest release: `v*` matches it and version
+    # sort ranks it first, but it is not a release.
+    git -C "$ROMP_REPO" tag v9.9.9-rc.1
 }
 
 teardown() { rm -rf "$TEST_DIR"; }
@@ -44,6 +48,16 @@ teardown() { rm -rf "$TEST_DIR"; }
     # v0.2.0, not the newer untagged commit and not the non-release tag.
     [ "$(git -C "$HOME/romp" describe --tags)" = "v0.2.0" ]
     grep -qF "$HOME/romp/bin" "$HOME/.zshrc"
+}
+
+@test "bootstrap.sh: a prerelease tag is not a release, even when version sort ranks it first" {
+    # The kernel's updater compares plain vMAJOR.MINOR.PATCH numbers only, so a
+    # clone installed onto v9.9.9-rc.1 would sit there with no update ever offered.
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Checking out v0.2.0"* ]]
+    [[ "$output" != *"v9.9.9-rc.1"* ]]
+    [ "$(git -C "$HOME/romp" describe --tags)" = "v0.2.0" ]
 }
 
 @test "bootstrap.sh: re-running updates in place and does not duplicate the PATH line" {
