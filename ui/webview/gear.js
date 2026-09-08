@@ -887,6 +887,9 @@ function initGear(post) {
   // machine, the name the gear already uses for it.
   var staleOpen = {};   // 'setting:gt' → { t: the toast node, hosts: [...], refused: the value in words } while the toast is up
   function staleHost(m) { return (typeof m.host === 'string' && m.host) ? m.host : 'this machine'; }
+  // The kernel's reason a write was refused OUTRIGHT as a clause for the copy: its file could not be READ, or
+  // (a `why` starting "write failed:", the fold on PR #1019) WRITTEN — one clause per cause; absent on a stand-down
+  function staleWhy(m) { return (typeof m.why === 'string' && m.why) ? ' Its settings file could not be ' + (m.why.indexOf('write failed:') === 0 ? 'written' : 'read') + ' (' + m.why + ').' : ''; }
   function staleLive(t) { return !!t.parentNode && !(t.classList && t.classList.contains('fade')); }
   // Apply anyway re-issues the frame's echoed gesture as a NEW one, stamped above everything this
   // page has seen (the frame's storedGt included, learned just before): a fresh click is legitimate
@@ -911,11 +914,15 @@ function initGear(post) {
     var key = typeof m.gt === 'number' ? m.setting + ':' + m.gt : '';
     var live = key && staleOpen[key] && staleLive(staleOpen[key].t) ? staleOpen[key] : null;
     var where = staleHost(m);
+    // A write the kernel refused because it could not READ the setting's file (the frame carries `why`) is
+    // not an ordering race: re-issuing the gesture cannot succeed while the file is unreadable, so that
+    // toast offers no Apply anyway and says why instead (review find on #1018, 2026-09-08)
+    var why = staleWhy(m);
     if (live) {   // the same gesture, refused by one more kernel: add the host to the toast on screen
       if (live.hosts.indexOf(where) < 0) live.hosts.push(where);
-      live.t.querySelector('.rs-stale-toast-msg').textContent = staleText(label, live.refused || refused, kept, live.hosts);
+      live.t.querySelector('.rs-stale-toast-msg').textContent = staleText(label, live.refused || refused, kept, live.hosts) + why;
     } else {
-      var t = staleToast(staleText(label, refused, kept, [where]), staleAction(m, refused));
+      var t = staleToast(staleText(label, refused, kept, [where]) + why, why ? null : staleAction(m, refused));
       if (key) staleOpen[key] = { t: t, hosts: [where], refused: refused };
     }
     if (!p.hidden) fill();   // the open modal re-reads the kernel's values so it stops showing the refused pick

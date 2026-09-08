@@ -42,7 +42,8 @@ class DebtBase(unittest.TestCase):
                        km._write_auto_nudge, km.Sessions.backend_for)
         self._d = {"nudged": {}}
         km._auto_nudge_data = lambda: self._d
-        km._write_auto_nudge = lambda d: self._d.update(d)
+        km._write_auto_nudge = lambda d: self._d.update(d) or True   # the writer's verdict: the reminder
+        #                                            sends only when its record landed (a None here reads as refused)
         km._name_of = lambda sid: {ASKER: "web", ASKER2: "api", DEBTOR: "tests"}.get(sid)
         self.rec = _Recorder()
         km.Sessions.backend_for = lambda sid: self.rec
