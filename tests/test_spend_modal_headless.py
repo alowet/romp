@@ -9,7 +9,6 @@ not; this is the maintainer's screenshot harness too — pass ROMP_SHOTS=<path-p
 import json
 import os
 import subprocess
-import time
 import tempfile
 import threading
 import time
@@ -141,7 +140,7 @@ class SpendModalServed(unittest.TestCase):
         self.assertTrue(o["hiddenBefore"], "closed until the click")
         self.assertTrue(o["loaderSeen"], "the loader (or the content) is up the instant the modal opens")
         self.assertEqual(o["out"]["backdrop"], "rgba(0, 0, 0, 0.55)", "the panel rule's backdrop")
-        self.assertEqual(o["out"]["head"], "API spend · TESTHOST")
+        self.assertEqual(o["out"]["head"], "API spend · 2 machines", "the header names the machines when several contribute (review find)")
         rows = o["out"]["rows"]
         # T247c: two hosts contribute, so every row names its host in the tab strip's host-prefix voice
         self.assertTrue(rows[0].startswith("TESTHOST:web") or rows[0].startswith("TESTHOST: web"), rows[0])

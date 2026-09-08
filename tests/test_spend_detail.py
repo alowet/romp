@@ -308,9 +308,10 @@ class SpendDetail(unittest.TestCase):
         self.assertEqual([s["kind"] for s in d["days"]["stacks"]][-1], "other")
 
     # ── T247c: every attached kernel's sessions, merged kernel-side ──────────────────────────────
-    def _peer_server(self, payload=None, status=200, token="peer-tok", hang=False):
+    def _peer_server(self, payload=None, status=200, token="peer-tok", hang=False, seen=None):
         """A stand-in peer kernel: /spend/detail behind the peer's own serve token (the transport
-        mirror_trust uses), answering `payload` — or 404 for an older build, or never (hang)."""
+        mirror_trust uses), answering `payload` — or, for an older build, the real kernel's unknown-route
+        answer (a plain-text 404 "not found"), or never (hang). `seen` collects the paths it was asked."""
         import threading
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         body = json.dumps(payload or {}).encode()
@@ -320,12 +321,20 @@ class SpendDetail(unittest.TestCase):
                 pass
 
             def do_GET(self):
+                if seen is not None:
+                    seen.append(self.path)
                 if self.headers.get("X-Romp-Token") != token:
                     self.send_response(401); self.end_headers(); return
                 if hang:
                     time.sleep(5); return
-                if self.path.split("?")[0] != "/spend/detail":
-                    self.send_response(404); self.end_headers(); return
+                if status == 404 or self.path.split("?")[0] != "/spend/detail":
+                    nf = b"not found"
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(nf)))
+                    self.end_headers()
+                    self.wfile.write(nf)
+                    return
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -390,6 +399,80 @@ class SpendDetail(unittest.TestCase):
         dk = d["days"]["keys"]
         wd = [s for s in d["days"]["stacks"] if s.get("name") == "worker"][0]
         self.assertAlmostEqual(wd["usd"][len(dk) - 1], 300.0, places=3, msg="daily buckets align by each machine's own date")
+
+    def test_a_peer_is_asked_for_its_local_half_only_and_the_route_serves_it(self):
+        # review find: the route served the MERGED payload to a peer too, so two kernels attached to each
+        # other asked each other back until the socket timeouts unwound hundreds of nested requests, and
+        # the healthy peer read as timed out. The ask carries ?local=1 and the route never fans out for it.
+        seen = []
+        self._attach("PEERHOST", self._peer_server(self._peer_payload(0), seen=seen))
+        km._spend_detail(now=NOW)
+        self.assertEqual(seen, ["/spend/detail?local=1"], "the peer is asked for its own half, nothing more")
+        ksrc = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
+        self.assertIn('if (q.get("local") or [""])[0]:\n                    return self._send(200, json.dumps(_spend_detail_local())', ksrc,
+                      "a peer's ask is served the local reader — the fan-out never runs on a peer's behalf")
+
+    def test_a_merged_shaped_answer_from_a_peer_counts_only_its_own_rows(self):
+        # review find: a peer answering with a MERGED payload (a third host it reaches, or us) had every
+        # row re-tagged as the peer's, doubling a host reachable both ways and our own sessions
+        pd = self._peer_payload(0)
+        pd["hosts"] = [{"host": "PEERHOST", "status": "ok"}, {"host": "TESTHOST", "status": "ok"}, {"host": "THIRDHOST", "status": "ok"}]
+        pd["sessions"][0]["host"] = "PEERHOST"
+        pd["sessions"] += [{"sid": WEB, "name": "web", "host": "TESTHOST", "bg": "#1EA1EB", "fg": "#fff", "live": True, "usd": 960.0, "tok": 1, "turns": 1},
+                           {"sid": "22222222-3333-4444-5555-000000000009", "name": "builder", "host": "THIRDHOST", "bg": "", "fg": "", "live": True, "usd": 50.0, "tok": 1, "turns": 1}]
+        for st in pd["hours"]["stacks"] + pd["days"]["stacks"]:
+            if st["kind"] == "sid":
+                st["host"] = "PEERHOST"
+        pd["days"]["stacks"].append({"kind": "sid", "sid": WEB, "name": "web", "host": "TESTHOST", "bg": "#1EA1EB", "live": True,
+                                     "usd": [0.0] * 89 + [960.0], "tok": [0] * 90})
+        self._attach("PEERHOST", self._peer_server(pd))
+        d = km._spend_detail(now=NOW)
+        rows = [(s["host"], s["name"]) for s in d["sessions"]]
+        self.assertEqual(rows.count(("TESTHOST", "web")), 1, "our own session arrives once, as ours")
+        self.assertNotIn(("PEERHOST", "web"), rows)
+        self.assertNotIn(("PEERHOST", "builder"), rows, "a third host's row is not the peer's")
+        self.assertEqual([s for s in d["days"]["stacks"] if s.get("name") == "web"][0]["host"], "TESTHOST")
+
+    def test_a_peers_bucket_beyond_our_axis_extends_it_instead_of_vanishing(self):
+        # review find: a peer east of us has a "today" our 90-day axis lacks, and a peer whose hour ticked
+        # over after ours ships an epoch beyond our newest — both were dropped without a trace
+        pd = self._peer_payload(0)
+        import datetime as _dt
+        tomorrow = (_dt.date.fromisoformat(pd["days"]["keys"][-1]) + _dt.timedelta(days=1)).isoformat()
+        pd["days"]["keys"] = pd["days"]["keys"][1:] + [tomorrow]
+        pd["days"]["stacks"][0]["usd"] = [0.0] * 89 + [300.0]
+        last_e = pd["hours"]["epochs"][-1]
+        pd["hours"]["epochs"] = pd["hours"]["epochs"][1:] + [last_e + 1]
+        pd["hours"]["keys"] = pd["hours"]["keys"][1:] + [time.strftime("%Y-%m-%dT%H", time.gmtime((last_e + 1) * 3600))]
+        n = len(pd["hours"]["keys"])
+        pd["hours"]["stacks"][0]["usd"] = [0.0] * (n - 1) + [7.0]
+        self._attach("PEERHOST", self._peer_server(pd))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual(d["days"]["keys"][-1], tomorrow, "the peer's day joins the axis")
+        wd = [s for s in d["days"]["stacks"] if s.get("name") == "worker"][0]
+        self.assertAlmostEqual(wd["usd"][-1], 300.0, places=3)
+        self.assertEqual(d["hours"]["epochs"][-1], last_e + 1, "the peer's newest hour joins the axis")
+        wh = [s for s in d["hours"]["stacks"] if s.get("name") == "worker"][0]
+        self.assertAlmostEqual(wh["usd"][-1], 7.0, places=3)
+        self.assertEqual(len(d["hours"]["keys"]), len(d["hours"]["epochs"]))
+
+    def test_the_merged_other_count_names_contributors_in_that_range_only(self):
+        # review find: the merged "other (N sessions)" counted every non-top session from the roster,
+        # whatever it spent in the range — the single-host reader counts contributors only
+        write_ledger(km.jd.STATE, extra_sids=12)
+        led = json.loads((km.jd.STATE / "spend.json").read_text())
+        sid = "11111111-2222-3333-4444-000000000111"   # the last extra: outside the merged top ten
+        led["hours"][_hour(3)]["bySid"][sid] = {"usd": 0.2, "turns": 1, "tok": 200}
+        led["hours"][_hour(3)]["usd"] += 0.2
+        led["hours"][_hour(3)]["tokIn"] += 200
+        (km.jd.STATE / "spend.json").write_text(json.dumps(led))
+        self._attach("PEERHOST", self._peer_server(self._peer_payload(0)))
+        d = km._spend_detail(now=NOW)
+        other_h = [s for s in d["hours"]["stacks"] if s["kind"] == "other"]
+        self.assertEqual(len(other_h), 1)
+        self.assertEqual(other_h[0]["count"], 1, "one non-top session spent in the hourly range")
+        other_d = [s for s in d["days"]["stacks"] if s["kind"] == "other"][0]
+        self.assertEqual(other_d["count"], 16 - 10, "every non-top session spent in the daily range")
 
     def test_an_older_peer_without_epochs_still_aligns_through_its_offset(self):
         off = int((time.localtime(NOW).tm_gmtoff or 0) // 60) + 180

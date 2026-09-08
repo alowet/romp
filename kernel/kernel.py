@@ -31771,14 +31771,42 @@ def _epoch_of_local_hour(key, off_min):
         return None
 
 
+def _peer_spend_call(row, timeout):
+    """GET /spend/detail?local=1 on an attached kernel — mirror_trust's transport (the tunnel's local
+    forward, THAT machine's serve token), asking for the peer's LOCAL half only: the route never fans out
+    when serving a peer, so a mutual attachment (the ordinary pairing: an ssh attach one way and the
+    check-in row the other) cannot recurse (review find: one modal open ping-ponged between two kernels
+    until the socket timeouts unwound it, hundreds of nested requests deep, and the healthy peer read as
+    timed out). Tolerant of a NON-JSON body: an older kernel's unknown-route answer is a plain-text 404,
+    which the shared transport reports as a parse error — here it is (404, None, None), so the caller can
+    say "older build" rather than "not reachable" (review find). Returns (status, json_or_None, err)."""
+    host = row.get("host") or "?"
+    port, tok = row.get("local_port") or 0, row.get("token") or ""
+    if not port or not tok:
+        return None, None, "no admin path to '%s' (missing forward or token)" % host
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=timeout)
+        conn.request("GET", "/spend/detail?local=1", None, {"X-Romp-Token": tok})
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        try:
+            j = json.loads(data.decode() or "null")
+        except Exception:
+            j = None
+        return resp.status, j, None
+    except Exception as e:
+        return None, None, "could not reach %s's kernel: %s" % (host, e)
+
+
 def _spend_detail(now=None):
     """GET /spend/detail — EVERY attached kernel's sessions, merged here (T247c, the user 2026-09-08:
     the per-session breakdown covered this machine only, and the federated kernels' sessions matter).
     Each kernel owns its spend.json and resolves its own names and colors, so a host's story comes
     from THAT host's kernel: for every attached host the hover's spend totals include (the same
     predicate as its rows — a remote reporting spend windows) this kernel calls its /spend/detail over
-    the tunnel with that machine's serve token (mirror_trust's transport), all in parallel under one
-    bounded timeout, and merges by host. A host that is down, that times out, that refuses the token,
+    the tunnel with that machine's serve token (mirror_trust's transport, asking for that kernel's LOCAL
+    half so nothing recurses), all in parallel under one bounded timeout, and merges by host. A host that is down, that times out, that refuses the token,
     or whose older build lacks the route is REPORTED in `hosts` by name and status — never omitted
     (fail loudly) — and the rest renders. Hours align by ABSOLUTE time (each host's epochs, or its
     offset for an older peer), never by the spelling of local-hour keys; days align by each machine's
@@ -31798,7 +31826,7 @@ def _spend_detail(now=None):
             continue
 
         def _ask(row=r):
-            results[row["host"]] = _remote_kernel_call(row, "GET", "/spend/detail", timeout=_PEER_SPEND_TIMEOUT_S)
+            results[row["host"]] = _peer_spend_call(row, _PEER_SPEND_TIMEOUT_S)
         t = threading.Thread(target=_ask, daemon=True)
         t.start()
         threads.append(t)
@@ -31832,10 +31860,17 @@ def _spend_detail(now=None):
 
 def _merge_spend_details(payloads, hosts, local):
     """Fold every host's /spend/detail into one payload on the LOCAL kernel's axes (see _spend_detail)."""
+    def _own(host, p, item):
+        """A peer's payload is its LOCAL half by request; should a build ever answer with a MERGED
+        payload anyway, only the rows it tagged as its own count here — a third host reachable both
+        ways would otherwise arrive twice under two names (review find)."""
+        tag = item.get("host") if isinstance(item, dict) else None
+        return not tag or tag == host or tag == p.get("host")
+
     sessions = []
     for host, p in payloads:
         for s in p.get("sessions") or []:
-            if isinstance(s, dict):
+            if isinstance(s, dict) and _own(host, p, s):
                 row = dict(s)
                 row["host"] = host
                 sessions.append(row)
@@ -31855,16 +31890,10 @@ def _merge_spend_details(payloads, hosts, local):
     def _merge_range(name):
         axis = local.get(name) or {}
         keys = list(axis.get("keys") or [])
-        n = len(keys)
-        if name == "hours":
-            pos = {e: i for i, e in enumerate(axis.get("epochs") or [])}
-        else:
-            pos = {k: i for i, k in enumerate(keys)}
-        per = {}           # (host, sid) -> [usd[], tok[]]
-        other = ([0.0] * n, [0] * n)
-        others = set()
-        una = ([0.0] * n, [0] * n)
-        una_hosts = {}
+        epochs = list(axis.get("epochs") or []) if name == "hours" else []
+        # each peer's axis in OUR terms: epochs for hours (its own, or through its offset for an older
+        # build that ships none), the date string for days
+        peer_axes = []
         for host, p in payloads:
             rng = p.get(name) if isinstance(p.get(name), dict) else {}
             pkeys = list(rng.get("keys") or [])
@@ -31873,25 +31902,59 @@ def _merge_spend_details(payloads, hosts, local):
                 if not (isinstance(peps, list) and len(peps) == len(pkeys)):
                     off = next((h.get("tzOffsetMin") for h in hosts if h["host"] == host), None) or 0
                     peps = [_epoch_of_local_hour(k, off) for k in pkeys]
-                idx = [pos.get(e) for e in peps]
+                peer_axes.append((host, p, rng, peps))
             else:
-                idx = [pos.get(k) for k in pkeys]
+                peer_axes.append((host, p, rng, pkeys))
+        # a peer's bucket BEYOND our newest — its current hour after ours ticked over, or its "today"
+        # east of our date line — extends the axis rather than vanishing (review find: the peer's
+        # freshest spend, the one most likely to hold money, was dropped without a trace); bounded
+        # so a wild clock cannot stretch the chart
+        last = (epochs[-1] if epochs else None) if name == "hours" else (keys[-1] if keys else None)
+        beyond = set()
+        for _h, _p, _r, ax in peer_axes:
+            for a in ax:
+                if a is not None and last is not None and a > last:
+                    beyond.add(a)
+        cap = 24 if name == "hours" else 7
+        for a in sorted(beyond)[:cap]:
+            if name == "hours":
+                epochs.append(a)
+                keys.append(time.strftime("%Y-%m-%dT%H", time.localtime(a * 3600)))
+            else:
+                keys.append(a)
+        n = len(keys)
+        pos = {e: i for i, e in enumerate(epochs)} if name == "hours" else {k: i for i, k in enumerate(keys)}
+        per = {}           # (host, sid) -> [usd[], tok[]]
+        other = ([0.0] * n, [0] * n)
+        other_count = 0    # "other (N sessions)" counts CONTRIBUTORS in this range only, like the local reader:
+        #                    each payload's own fold plus the top-N sessions of its own the merge folded
+        una = ([0.0] * n, [0] * n)
+        una_hosts = {}
+        for host, p, rng, ax in peer_axes:
+            idx = [pos.get(a) for a in ax]
             for s in rng.get("stacks") or []:
-                if not isinstance(s, dict):
+                if not isinstance(s, dict) or not _own(host, p, s):
                     continue
                 usd, tok = s.get("usd") or [], s.get("tok") or []
                 kind = s.get("kind")
                 if kind == "sid":
                     key = (host, str(s.get("sid") or ""))
-                    dst = per.setdefault(key, ([0.0] * n, [0] * n)) if key in top_set else other
-                    if key not in top_set and (any(usd) or any(tok)):
-                        others.add(key)
+                    if key in top_set:
+                        dst = per.setdefault(key, ([0.0] * n, [0] * n))
+                    else:
+                        dst = other
+                        if any(usd) or any(tok):
+                            other_count += 1
                 elif kind == "other":
                     dst = other
-                    # the peer's own fold already holds its non-top sessions: count them from the roster
+                    other_count += int(s.get("count") or 0)
                 elif kind == "unattributed":
                     dst = una
                     hu = una_hosts.setdefault(host, ([0.0] * n, [0] * n))
+                    # a merged-shaped answer breaks its unattributed stack down by host: take the peer's own share
+                    if isinstance(s.get("hosts"), dict) and isinstance(s["hosts"].get(p.get("host") or host), dict):
+                        own = s["hosts"][p.get("host") or host]
+                        usd, tok = own.get("usd") or [], own.get("tok") or []
                 else:
                     continue
                 for j, i in enumerate(idx):
@@ -31901,8 +31964,6 @@ def _merge_spend_details(payloads, hosts, local):
                     dst[0][i] += v; dst[1][i] += t
                     if kind == "unattributed":
                         hu[0][i] += v; hu[1][i] += t
-        # every non-top session across hosts is in "other", whichever fold it came through
-        others |= {(s["host"], s["sid"]) for s in sessions[top_n:]}
         stacks = []
         for key in top:
             arr = per.get(key)
@@ -31916,14 +31977,14 @@ def _merge_spend_details(payloads, hosts, local):
                            "live": bool(m.get("live")), "usd": u, "tok": arr[1]})
         ou = [round(v, 4) for v in other[0]]
         if any(ou) or any(other[1]):
-            stacks.append({"kind": "other", "name": "other", "count": len(others), "usd": ou, "tok": other[1]})
+            stacks.append({"kind": "other", "name": "other", "count": other_count, "usd": ou, "tok": other[1]})
         uu = [round(v, 4) for v in una[0]]
         if any(uu) or any(una[1]):
             stacks.append({"kind": "unattributed", "name": "unattributed", "usd": uu, "tok": una[1],
                            "hosts": {h: {"usd": [round(v, 4) for v in a[0]], "tok": a[1]} for h, a in una_hosts.items()}})
         out = {"keys": keys, "stacks": stacks}
         if name == "hours":
-            out["epochs"] = list(axis.get("epochs") or [])
+            out["epochs"] = epochs
         return out
 
     out = dict(local)
@@ -39630,7 +39691,8 @@ function spHosts(d){return ((d&&d.hosts)||[]).filter(function(h){return h.status
 function spMany(d){return spHosts(d).length>1;}
 function spLabel(s,many){return (many&&s.host?'<span class=host-prefix>'+esc(s.host)+':</span> ':'')+esc(spName(s));}
 function spColor(s){return (s.bg&&/^#[0-9a-fA-F]{3,8}$/.test(s.bg))?s.bg:SP_NONE;}
-function spHead(){return '<div class=rsp-top><span>'+(SP.data&&SP.data.scope==='computed'?'Spend (computed)':'API spend')+(SP.data&&SP.data.host?' \u00b7 '+esc(SP.data.host):'')+'</span>'
+function spHead(){var d=SP.data,ok=d?spHosts(d):[];return '<div class=rsp-top><span>'+(d&&d.scope==='computed'?'Spend (computed)':'API spend')
++(ok.length>1?' \u00b7 '+ok.length+' machines':(d&&d.host?' \u00b7 '+esc(d.host):''))+'</span>'
 +'<button class=rsp-x data-act=close aria-label=Close>\u00d7</button></div>';}
 var spPending=null;   // the in-flight detail fetch's controller: a close or a re-open aborts it
 function openSpend(){if(!spBack||!spPanel)return;SP.open=true;spBack.hidden=false;SP.data=null;SP.err='';SP.allRows=false;
@@ -42849,7 +42911,11 @@ class Handler(BaseHTTPRequestHandler):
                 # who spent what and spend over time stacked by session, read from the ledger's bySid
                 # maps with names + colors resolved kernel-side — the same read class as /usage, and
                 # the shell fetches it on open rather than scraping the hover's HTML. Every attached
-                # kernel's sessions ride along, asked over the tunnel and merged here (T247c).
+                # kernel's sessions ride along, asked over the tunnel and merged here (T247c) — and a
+                # PEER's ask (?local=1) gets this kernel's own half, never a fan-out: two kernels attached
+                # to each other would otherwise ask each other forever (review find).
+                if (q.get("local") or [""])[0]:
+                    return self._send(200, json.dumps(_spend_detail_local()), "application/json", cache="no-cache")
                 return self._send(200, json.dumps(_spend_detail()), "application/json", cache="no-cache")
             if p == "/mcp":                                   # the MCP panel's data (the user 2026-08-05): `/mcp`
                 # in a romp session hits the CLI's INTERACTIVE panel, which an SDK session can't render — it
