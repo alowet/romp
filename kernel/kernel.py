@@ -916,7 +916,7 @@ def _version_info():
             # The top-level fields above stay: this tab's own gear and older kernels read those.
             "settings": {"autoNudge": _auto_nudge_on(), "updateMode": _update_mode(),
                          "conserveMemory": _conserve_on(),
-                         "compactSuggest": _compact_suggest_on(),   # T208: per-install, default OFF
+                         "compactSuggest": _compact_suggest_on(),   # default OFF; one value across machines (T248)
                          "fileEditing": _file_editing_on(),
                          "judgeModel": jd._triage_model(), "judgeEffort": jd._triage_effort(),
                          "indexModel": jd._index_model(), "indexEffort": jd._index_effort(),
@@ -5556,10 +5556,13 @@ def _set_auto_nudge(enabled, gt=None):
 
 
 def _compact_suggest_on():
-    """The compaction-suggestion regime's own per-install toggle (T208, the user 2026-09-01: the
-    regime must NOT ship default-on to every install — it stays behind this install's config).
-    OFF by default: the key is absent from a fresh install's blob and absent reads False — no
-    setdefault, deliberately, so shipping the feature never turns it on anywhere."""
+    """The compaction-suggestion regime's toggle. OFF by default (T208, the user 2026-09-01: the
+    regime must NOT ship default-on): the key is absent from a fresh install's blob and absent
+    reads False — no setdefault, deliberately, so shipping the feature never turns it on anywhere.
+    Each kernel stores its own copy, and the gear's click reaches every attached kernel (federation.ts
+    KERNEL_SETTING, like setFileEditing) so the mesh holds ONE value (T248, the user 2026-09-07: it
+    shipped per-install, and a session on an attached machine whose copy was on got the suggestion
+    while the gear they were looking at showed the box off with the mixed mark)."""
     return bool(_auto_nudge_data().get("compactSuggestEnabled"))
 
 
@@ -7847,19 +7850,22 @@ def _closer_pending(sid, path, now, store):
 
 
 # ── the compaction SUGGESTION (the user 2026-08-30, via the nightly optimizer) ──────────────────
-# The ~300k RECYCLE rule stays workers-only; every OTHER session gets a suggestion it decides on
-# itself: once its context crosses each threshold below AND it has been idle at least an hour, it
-# is told — in the person's voice, marker-free (the rename-ping precedent) — that a /compact at a
-# natural boundary would keep it snappy. Event-keyed end to end: the CROSSING arms it, a per-
-# threshold latch on the auto-nudge blob makes each fire once per episode, the idle gate reads the
-# settle event's age at fire time (_settle_event_key — the hook-ledger seam), and the latch re-arms
-# only on the session's own CONTEXT RESET (compact//clear/rewind), observed as the authoritative
-# token counter falling back below the latched threshold — a session that ignores the suggestion
-# is never re-asked (its counter never falls, the latch stands), one that acts hears nothing until
-# it has genuinely filled up again (the manager's amendment, 2026-08-30). Workers are excluded by
-# their roster tags (*_workers in the session-tag store), comment-thread forks by their registry
-# marker, and anything mid-turn by the progressing-state gate. Rides the auto-nudge tick's
-# alive-session walk — no new poll, no timer.
+# Every session gets a suggestion it decides on itself: once its context crosses each threshold
+# below AND it has been idle at least an hour, it is told — in the person's voice, marker-free (the
+# rename-ping precedent) — that a /compact at a natural boundary would keep it snappy. Event-keyed
+# end to end: the CROSSING arms it, a per-threshold latch on the auto-nudge blob makes each fire
+# once per episode, the idle gate reads the settle event's age at fire time (_settle_event_key —
+# the hook-ledger seam), and the latch re-arms only on the session's own CONTEXT RESET
+# (compact//clear/rewind), observed as the authoritative token counter falling back below the
+# latched threshold — a session that ignores the suggestion is never re-asked (its counter never
+# falls, the latch stands), one that acts hears nothing until it has genuinely filled up again (the
+# manager's amendment, 2026-08-30). Excluded at fire time: muted sessions (the per-session
+# opt-out), comment-thread forks (their registry marker) and anything mid-turn (the
+# progressing-state gate). Session TAGS are not a gate (T248, the user 2026-09-07): the first cut
+# skipped every member of a *_workers tag on the theory that a manager layer owned those sessions,
+# but that roster is a convention the user runs on top of romp, not something romp knows about —
+# to romp every session is a session. Rides the auto-nudge tick's alive-session walk — no new
+# poll, no timer.
 COMPACT_SUGGEST_TOKENS = (400_000, 800_000)
 COMPACT_SUGGEST_IDLE_S = 3600
 def _compact_suggest_body(name):
@@ -7875,23 +7881,6 @@ def _compact_suggest_body(name):
     return ("It's been quiet here for a while and this conversation has built up a lot of context. "
             "When you next reach a natural stopping point, run `romp compact %s` in your shell to "
             "compact it and keep things snappy; your call, nothing is waiting on it." % name)
-
-
-def _worker_tag_member(sid):
-    """True when any *_workers tag in the session-tag store holds this sid — the worker rosters ARE
-    session tags (the `romp tag` headless-edit workflow), and the recycle rule owns those sessions."""
-    try:
-        d = json.loads(_views_path().read_text())
-    except (OSError, ValueError):
-        return False
-    for t in (d.get("tags") or []):
-        if not str(t.get("name") or "").lower().endswith("workers"):
-            continue
-        for m in (t.get("members") or []):
-            ms = m.get("sid") if isinstance(m, dict) else str(m or "")
-            if ms == sid or (isinstance(ms, str) and ms.split(":", 1)[-1] == sid):
-                return True
-    return False
 
 
 def _compact_suggest_tick(sid, tm, now):
@@ -7938,8 +7927,6 @@ def _compact_suggest_tick(sid, tm, now):
     #                                                    (the nudge gate, the interrupt-block tick;
     #                                                    a routed review caught this one missing,
     #                                                    2026-09-01)
-    if _worker_tag_member(sid):
-        return False                                   # the recycle rule owns workers
     if _thread_reg(sid).get("threadOf"):
         return False                                   # a comment-thread fork is not first-class
     if (tm or {}).get("state", "") in _PROGRESSING_STATES:
@@ -42069,8 +42056,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 _tell_stale_gesture(client, msg)
         elif msg and msg.get("type") == "setCompactSuggest" and msg.get("enabled") is not None:
-            # T208 opt-in — kernel-side like autoNudge, gt-gated like every queued setting. Only a
-            # real apply acts at once on turn-on (instead of waiting out the pusher's 0.5 s backstop)
+            # T208 opt-in — kernel-side like autoNudge, broadcast by federation.ts KERNEL_SETTING so
+            # one click answers for every attached kernel (T248), gt-gated like every queued setting
+            # (a queued flush must not undo a newer choice). Only a real apply acts at once on
+            # turn-on (instead of waiting out the pusher's 0.5 s backstop)
             # — a stood-down toggle is not new information — through the same wrap as setAutoNudge
             # (_ws_act_now_tick: single-flight, no dead-wait sweep, a failure logged not raised)
             if _set_compact_suggest(bool(msg["enabled"]), gt=_gesture_ms(msg)) is not None:

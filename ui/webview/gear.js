@@ -80,7 +80,7 @@ var GEAR_HTML =
   '</span></label>' +
   "<label class='rs-row'><input type=checkbox id=rs-suggestcompact>" +
   '<span><b>Suggest /compact</b><span class=rs-mixed hidden></span>' +
-  '<span class=rs-sub>When a session has been idle over an hour with a lot of context built up (first past 400k tokens, again past 800k), send it ONE suggestion to /compact at a natural boundary — its call, once per fill-up. Never sent to workers, muted sessions, or anything mid-turn. Off by default for a fresh install; this kernel keeps its own copy.</span>' +
+  '<span class=rs-sub>When a session has been idle over an hour with a lot of context built up (first past 400k tokens, again past 800k), send it ONE suggestion to /compact at a natural boundary — its call, once per fill-up. Never sent to muted sessions or anything mid-turn. Off by default for a fresh install. Applies on every connected machine’s kernel.</span>' +
   '</span></label>' +
   "<label class='rs-row'><input type=checkbox id=rs-conserve>" +
   '<span><b>Conserve memory</b><span class=rs-mixed hidden></span>' +
@@ -447,9 +447,9 @@ function initGear(post) {
   // applies by it and stands a stale flush down instead of walking the mesh back to an hours-old
   // pick (a frozen tab's flush did exactly that). Stamp in the message literal, never at send/flush
   // time.
-  // Thinking summaries and Suggest /compact are kernel-side but PER-INSTALL: each post goes to the
-  // LOCAL kernel only — deliberately not in federation's KERNEL_SETTING set (gear.test.ts pins the
-  // membership), so neither queues for or reaches another machine. Stamped all the same: two
+  // Thinking summaries is kernel-side but PER-INSTALL: the post goes to the LOCAL kernel only —
+  // deliberately not in federation's KERNEL_SETTING set (thinking-summaries.test.ts pins the
+  // membership), so it neither queues for nor reaches another machine. Stamped all the same: two
   // dashboards on one kernel still race, and the kernel orders every setting by `gt`.
   if (ths) ths.addEventListener('change', function () { post({ type: 'setThinkingSummaries', enabled: ths.checked, gt: gclock.stamp('thinking-summaries') }); });
   // Auto Nudge / judge tiers are SERVER-SIDE (the kernel runs them): post the
