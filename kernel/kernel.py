@@ -10644,13 +10644,40 @@ def _live_names(tmux):
     return {n: sid for sid in (tmux or {}) for n in [_name_of(sid)] if n}
 
 
+def _live_names_now():
+    """_live_names(_tmux_sessions()) read NOW, past any pusher-cycle scope on this thread. On the pusher
+    thread _tmux_sessions() serves the cycle-start liveness map (_live_scope.snapshot) and _name_of the
+    cycle-start registry (_live_scope.names), and the comment-create door runs there through
+    _retry_parked_creates: its claim read a cycle-old world, so a same-name session created, registered
+    and released earlier in the same cycle was in neither the snapshot nor the claims dict, and the parked
+    thread was minted beside it (review find, 2026-09-08). A claim's snapshot must postdate every released
+    registration, so both scopes are suspended for exactly this read and restored after: the rest of the
+    cycle keeps its one honest snapshot. Off the pusher thread the scopes are unset and this is the plain
+    read. Cost: one tmux fork plus one registry read per claim on that thread, only while a create is
+    parked there."""
+    saved = getattr(_live_scope, "snapshot", None), getattr(_live_scope, "names", None)
+    _live_scope.snapshot = _live_scope.names = None
+    try:
+        return _live_names(_tmux_sessions())
+    finally:
+        _live_scope.snapshot, _live_scope.names = saved
+
+
 # ─── name reservation: one holder per session name while its registration is in flight (2026-09-08) ───
-# Every door that gives a session a name — POST /new, /fork, /rename, the WS createSession / forkSession /
-# renameSession ops, a comment thread's create and break-out, a revive — used to read the live snapshot
-# and then act, with nothing between the two: two same-name creates both passed the check and both
-# spawned, a rename landed on a name whose session was still being created, and the WS fork and rename
-# ops had no live check at all. _claim_name is the one atomic step every door now takes before it acts;
-# _release_name frees the name once the registration is durable or the attempt has failed.
+# Every kernel door that gives a session a name — POST /new, /fork, /rename, the WS createSession /
+# forkSession / renameSession ops, a comment thread's create and break-out, a revive — used to read the
+# live snapshot and then act, with nothing between the two: two same-name creates both passed the check
+# and both spawned, a rename landed on a name whose session was still being created, and the WS fork and
+# rename ops had no live check at all. _claim_name is the one atomic step every door now takes before it
+# acts; _release_name frees the name once the registration is durable or the attempt has failed.
+# COVERAGE (review find, 2026-09-08): the KERNEL's doors, every path that reaches _claim_session_name. The
+# CLI's terminal launcher run from a shell (`romp new -t <name>`, `romp resume`, in bin/romp) checks tmux
+# alone (`tmux has-session`) and writes the names/ registry with no claim, and a tmux-native rename
+# (prefix-$, choose-tree, :rename-session) publishes through the `romp _renamed` hook the same way; a
+# namesake made by either is refused by the kernel's doors only once a later snapshot lists it as
+# "already running". The kernel's OWN tmux spawn is covered: _spawn_session_start holds the claim across
+# the `romp new -t --detach` it runs, which is also why bin/romp cannot take a claim of its own without a
+# bypass for that launch and a lease for a launcher that dies mid-way, so the CLI stays outside by design.
 _NAME_CLAIMS = {}                       # name -> {"kind": create|fork|rename|promote|revive|thread, "sid": the claimant's sid, "" when unknown}
 _name_claims_lock = threading.Lock()    # guards _NAME_CLAIMS ONLY: never held across a tmux fork, a store read or a backend call
 _CLAIM_HELD_TEXT = {                    # the refusal for a name another door holds right now, by what that door is doing
@@ -10660,34 +10687,49 @@ _CLAIM_HELD_TEXT = {                    # the refusal for a name another door ho
 _CLAIM_HELD_DEFAULT = 'a session named "%s" is being created right now'   # create / fork / promote / thread
 
 
+def _taken_refusal(nm, kind, held=None):
+    """The refusal for a name that is not free: `held` is the claims row of the door holding it (the text
+    names what that door is doing), None means a live session already wears it. Shared by _claim_name
+    (the dict check) and _claim_session_name (the post-claim snapshot check), so the refusal reads the
+    same whichever check fires."""
+    if held is not None:
+        text = _CLAIM_HELD_TEXT.get(held.get("kind"), _CLAIM_HELD_DEFAULT) % nm
+    else:
+        text = 'a session named "%s" is already running' % nm
+    # a revive cannot pick another name — the dead session's own is the one being asked for
+    return text if kind == "revive" else text + " — pick another name"
+
+
 def _claim_name(nm, live_names, kind="create", sid=""):
     """Reserve `nm` for ONE in-flight registration. Returns "" when the caller now holds the name (and
     must _release_name it in a `finally`), else the refusal text: the name is held by a registration in
-    flight, or the caller's own live snapshot already lists it. `kind` records what the holder is doing
+    flight, or the snapshot the caller passed already lists it. `kind` records what the holder is doing
     (the refusal a second claimant reads names it); `sid` is the claimant's session when known.
 
-    DESIGN POINT: the EXPENSIVE snapshot is taken by the caller, OUTSIDE this lock, and passed in —
-    _live_names(_tmux_sessions()) forks tmux and _thread_names() walks every comments store, and a fork
-    under a lock every create door takes would serialize all of them behind it. The lock guards only
-    the claims dict, and that is sufficient: create-vs-create is serialized by the claim, not the
-    snapshot; a session that becomes live BETWEEN a caller's snapshot and its claim can only have come
-    from a creator that held the claim — and holds it still, since a holder releases only once its
-    registration is durable, i.e. visible to the NEXT snapshot — so the second claimant is refused by
-    the dict, never let through by the stale snapshot. The one thing a stale snapshot can change is
-    the wording ("being created" where "already running" is by now the truth), never the outcome.
-    Every session-side door claims through _claim_session_name, whose snapshot is the live set AND the
-    thread names: a thread is never in the live set, so the live set alone was not the whole namespace."""
+    DESIGN POINT: the lock guards only the claims dict. The EXPENSIVE snapshot (_live_names(_tmux_sessions())
+    forks tmux, _thread_names() walks every comments store) is never taken under it, or every create door
+    would serialize behind one fork. What makes that sound is the ORDER the doors take: claim FIRST, then
+    snapshot while holding the claim, then verify (_claim_session_name). Any registration of `nm` happens
+    only under a claim that is released once the registration is durable, so a snapshot taken while we
+    hold the claim necessarily lists every earlier registration: an earlier creator either still holds
+    the claim (we are refused by the dict) or released after a durable registration (our post-claim
+    snapshot lists it). The first cut took the snapshot BEFORE the claim and argued that a session going
+    live in between could only come from a claimant that "holds it still": false, since a creator that
+    claimed, registered and released entirely inside that gap left the dict empty and the rival's
+    snapshot stale, and two sessions named "web" were minted (review find, 2026-09-08, reproduced by a
+    deterministic probe). `live_names` is therefore a PRE-CHECK only, for a caller that happens to hold
+    a snapshot: an "already running" it lists is refused under the lock without inserting; it is not
+    what makes the claim safe, and every door passes () and verifies under the claim instead.
+    Every door claims through _claim_session_name, whose snapshot is the live set AND the thread names:
+    a thread is never in the live set, so the live set alone was not the whole namespace."""
     with _name_claims_lock:
         held = _NAME_CLAIMS.get(nm)
         if held is not None:
-            text = _CLAIM_HELD_TEXT.get(held.get("kind"), _CLAIM_HELD_DEFAULT) % nm
-        elif nm in (live_names or ()):
-            text = 'a session named "%s" is already running' % nm
-        else:
-            _NAME_CLAIMS[nm] = {"kind": kind, "sid": str(sid or "")}
-            return ""
-    # a revive cannot pick another name — the dead session's own is the one being asked for
-    return text if kind == "revive" else text + " — pick another name"
+            return _taken_refusal(nm, kind, held)
+        if nm in (live_names or ()):
+            return _taken_refusal(nm, kind)
+        _NAME_CLAIMS[nm] = {"kind": kind, "sid": str(sid or "")}
+        return ""
 
 
 def _release_name(nm):
@@ -10701,24 +10743,42 @@ def _release_name(nm):
 
 
 def _claim_session_name(nm, kind, sid="", own=""):
-    """Claim `nm` for a SESSION-side door (create / fork / rename / promote / revive) against BOTH
-    snapshots, taken here and OUTSIDE the claims lock: the live sessions (_live_names(_tmux_sessions()),
-    a tmux fork) and the comment threads (_thread_names(), a walk of every comments store). A thread is
-    never in the live set — live_sessions skips threadOf regs — so a claim against the live set alone
-    let a session land on a thread's name between a door's own thread check and its claim, or on a
-    thread whose claim had already been released (review find, 2026-09-08); with both sets in the claim
-    the _claim_name argument holds for threads too. `own` is the claimant's sid: its own live row (a
-    revive of a session already up) and its own thread rows (a thread promoting under the name it
-    wears) are not rivals. Returns "" (held) or the refusal — a thread's name says so in the T223
-    words; an unreadable thread store refuses (never mint blind)."""
-    live = _live_names(_tmux_sessions())
-    names = _thread_names()
-    if names is None:
-        return _thread_name_refusal(nm, None)
-    if own:
-        live = {n: s for n, s in live.items() if s != own}
-        names = {n: v for n, v in names.items() if v[0] != own}
-    return _thread_name_refusal(nm, names) or _claim_name(nm, set(live) | set(names), kind, sid)
+    """Claim `nm` in the session namespace for a door (create / fork / rename / promote / revive, and the
+    comment thread's create, whose names share the namespace), in the ORDER that makes the claim sound:
+    the dict FIRST (_claim_name against no snapshot: a rival holder refuses), then, holding the claim and
+    OUTSIDE the claims lock, BOTH snapshots: the live sessions (_live_names_now(), a tmux fork read past
+    any pusher-cycle scope) and the comment threads (_thread_names(), a walk of every comments store);
+    then verify. Any registration of `nm` happens only under a claim released once it is durable, so a
+    snapshot taken while we hold the claim lists every earlier one; taking it BEFORE the claim let a
+    creator register and release inside the gap unseen, and both minted (review find, 2026-09-08). A
+    thread is never in the live set — live_sessions skips threadOf regs — so a claim against the live set
+    alone let a session land on a thread's name (review find, 2026-09-08); with both sets verified under
+    the claim the argument holds for threads too. `own` is the claimant's sid: its own live row (a revive
+    of a session already up) and its own thread rows (a thread promoting under the name it wears) are not
+    rivals. Returns "" (held: the caller must _release_name in a `finally`) or the refusal, the claim
+    already released: a thread's name says so in the T223 words, worded for what `kind` can do; an
+    unreadable thread store refuses (never mint blind). A snapshot that raises releases and re-raises."""
+    refusal = _claim_name(nm, (), kind, sid)
+    if refusal:
+        return refusal
+    try:
+        live = _live_names_now()
+        names = _thread_names()
+        if names is None:
+            refusal = _thread_name_refusal(nm, None, kind)
+        else:
+            if own:
+                live = {n: s for n, s in live.items() if s != own}
+                names = {n: v for n, v in names.items() if v[0] != own}
+            refusal = _thread_name_refusal(nm, names, kind)
+            if not refusal and nm in live:
+                refusal = _taken_refusal(nm, kind)
+    except BaseException:
+        _release_name(nm)
+        raise
+    if refusal:
+        _release_name(nm)
+    return refusal
 
 
 def _rename_claimed(be, sid, nm):
@@ -10726,11 +10786,11 @@ def _rename_claimed(be, sid, nm):
     that name is the tmux backend's own rename helper further down) — `nm` already
     NAME_RE-valid and not a comment thread's. The session's OWN name is a no-op ack: (True, "") with
     nothing written and never a refusal (the pre-claim route refused it as "already running"). Any
-    other name is claimed (kind rename) against a live snapshot taken here, outside the claims lock;
-    be.rename runs under the claim — it rewrites the reg and the names/ entry, so the next snapshot
-    answers the new name — and the claim is released either way. Returns (ok, refusal): a non-empty
-    refusal names a taken or in-flight name; ok False with no refusal is the backend declining (a sid
-    it does not know), which the doors already report."""
+    other name is claimed (kind rename) and verified against a live snapshot taken under the claim,
+    outside the claims lock; be.rename runs under the claim — it rewrites the reg and the names/ entry,
+    so the next snapshot answers the new name — and the claim is released either way. Returns
+    (ok, refusal): a non-empty refusal names a taken or in-flight name; ok False with no refusal is the
+    backend declining (a sid it does not know), which the doors already report."""
     if _name_of(sid) == nm:
         return True, ""
     refusal = _claim_session_name(nm, "rename", sid)
@@ -11066,11 +11126,11 @@ def _reap_if_cancelled(name):
 
 def _spawn_session_start(nm, cwd):
     """The tmux create door's front half, on the ASKING thread (POST /new and the WS createSession op
-    both come through here, so neither can skip the claim): claim `nm` (kind create) against a live
-    snapshot taken here, outside the claims lock, then run _spawn_session on its own thread — the
-    seconds-long `romp new` launch must not block a WS recv loop or an HTTP handler — which releases
-    the name once the launch has settled either way (the tmux session is up and in the next snapshot,
-    or the launch failed and the name is free again). Returns "" or the refusal text, so the door
+    both come through here, so neither can skip the claim): claim `nm` (kind create), verified against a
+    live snapshot taken under the claim and outside the claims lock, then run _spawn_session on its own
+    thread — the seconds-long `romp new` launch must not block a WS recv loop or an HTTP handler — which
+    releases the name once the launch has settled either way (the tmux session is up and in the next
+    snapshot, or the launch failed and the name is free again). Returns "" or the refusal text, so the door
     answers the request that asked; a claim taken on the launch thread could only refuse into a log
     line after the door had already acked "pending". A Thread.start that fails releases the name first
     and then raises — loud, and never a held name with no launch behind it."""
@@ -11235,12 +11295,12 @@ def _apply_new_session_prefs(sid, body):
 
 def _create_sdk_session(nm, cwd, auth="", prefs=None, client=None, env=None, parent="", tags=()):
     """The SDK create door — POST /new and the WS createSession op both land here, so neither can skip
-    the claim. `nm` is claimed (kind create) against a live snapshot taken here, outside the claims
-    lock; the create runs under the claim and the name is released once the registration is durable
-    (spawn wrote the reg and the names/ entry, so the next snapshot lists it) or the create failed (a
-    raise, a refusal), leaving the name free for the retry. A refused name answers ("", {"error": text,
-    "nameTaken": True}) — the (sid, echo) shape the doors already read as a failed create, the flag
-    letting POST /new answer it as a 409 rather than a generic failure."""
+    the claim. `nm` is claimed (kind create) and verified against a live snapshot taken under the claim,
+    outside the claims lock; the create runs under the claim and the name is released once the
+    registration is durable (spawn wrote the reg and the names/ entry, so the next snapshot lists it) or
+    the create failed (a raise, a refusal), leaving the name free for the retry. A refused name answers
+    ("", {"error": text, "nameTaken": True}) — the (sid, echo) shape the doors already read as a failed
+    create, the flag letting POST /new answer it as a 409 rather than a generic failure."""
     refusal = _claim_session_name(nm, "create")
     if refusal:
         return "", {"error": refusal, "nameTaken": True}
@@ -11304,9 +11364,10 @@ def _create_sdk_session_inner(nm, cwd, auth="", prefs=None, client=None, env=Non
 
 def _create_codex_session(nm, cwd, client=None, parent="", tags=()):
     """The Codex create door — the same claim contract as _create_sdk_session (both doors land here):
-    `nm` claimed (kind create) against a live snapshot taken outside the lock, released once spawn has
-    the row in the Codex registry and the shared names/ entry (the next snapshot lists it) or the
-    create failed; a refused name answers ("", {"error": text, "nameTaken": True})."""
+    `nm` claimed (kind create) and verified against a live snapshot taken under the claim, outside the
+    lock, released once spawn has the row in the Codex registry and the shared names/ entry (the next
+    snapshot lists it) or the create failed; a refused name answers ("", {"error": text, "nameTaken":
+    True})."""
     refusal = _claim_session_name(nm, "create")
     if refusal:
         return "", {"error": refusal, "nameTaken": True}
@@ -11349,10 +11410,10 @@ def _create_codex_session_inner(nm, cwd, client=None, parent="", tags=()):
 def _fork_session(parent_sid, cut_msg_uuid, new_name, now=None, client=None):
     """The fork door — POST /fork and the WS forkSession op both land here (the op had no live-name
     check of its own before this). A bad name is refused before anything is claimed; a good one is
-    claimed (kind fork) against a live snapshot taken here, outside the claims lock, and held through
-    _fork_session_inner — be.fork writes the names/ entry, so the next snapshot lists the fork before
-    the release — then released on every exit, the inner's own refusals included. Returns the refusal
-    text for the caller to warn-toast, None on success (the inner's contract)."""
+    claimed (kind fork), verified against a live snapshot taken under the claim and outside the claims
+    lock, and held through _fork_session_inner — be.fork writes the names/ entry, so the next snapshot
+    lists the fork before the release — then released on every exit, the inner's own refusals included.
+    Returns the refusal text for the caller to warn-toast, None on success (the inner's contract)."""
     nm = (new_name or "").strip()
     if not NAME_RE.match(nm):
         return "session names use letters, digits, . _ - only."
@@ -12331,13 +12392,13 @@ def _comment_create(parent_sid, anchor_uuid, exact, text, name="", model="", eff
     # a thread's name shares the SESSION namespace: the create and relabel doors consult _thread_names
     # (T223's namesakes ran that way), so the reverse holds too — a thread takes neither a live
     # session's name nor another thread's nor one being registered right now, and the claim (kind
-    # thread) is what serializes it against every other door. Both snapshots are taken HERE, outside
-    # the claims lock AND the comments lock (a tmux fork and a walk of every comments store).
-    live = _live_names(_tmux_sessions())
-    names = _thread_names()
-    if names is None:                              # unverifiable → refuse, the standing rule (never mint blind)
-        return (_thread_name_refusal(nm, None) if nm else
-                "couldn't verify the thread's name against the comment threads — try again in a moment"), None
+    # thread) is what serializes it against every other door. It goes through _claim_session_name like
+    # every session door: the dict first, then both snapshots taken UNDER the claim, outside the claims
+    # lock AND the comments lock (a tmux fork and a walk of every comments store). The first cut took
+    # the snapshots up here, before the claim, so a same-name session that was created, registered and
+    # released while this create built its row and waited on the comments lock was in neither the
+    # snapshot nor the dict; and on the pusher thread (_retry_parked_creates) the live snapshot was the
+    # cycle-start one, a gap as wide as everything the cycle had done so far (review find, 2026-09-08).
     tsid = str(uuid.uuid4())
     row = {"tid": tsid, "sid": tsid, "anchorUuid": str(anchor_uuid or ""), "cutUuid": cut,
            "anchorT": cut_t,   # the commented message's own time — the timeline square's x
@@ -12345,25 +12406,32 @@ def _comment_create(parent_sid, anchor_uuid, exact, text, name="", model="", eff
            "createdT": int(now), "lastSeenT": int(now)}
     if isinstance(meta, dict) and (meta.get("thread") or meta.get("note")):
         row["meta"] = {k: str(meta.get(k) or "")[:500] for k in ("thread", "note") if meta.get(k)}
-    taken = set(live) | set(names)                 # the one claim set for both branches below
-    claimed = ""                                   # the name this create holds, once it holds one
+    if nm:
+        refusal = _claim_session_name(nm, "thread", tsid)
+        if refusal:
+            return refusal, None
+    else:
+        # the default name counts the threads this session has had, then skips every taken or
+        # in-flight name — a deleted thread's number must not hand a namesake to the next. The count is
+        # read outside the comments lock: it only says where the candidates START, and each candidate
+        # is claimed and verified in turn. An unreadable thread store refuses the first candidate as
+        # unverifiable and would refuse every next one the same way, so that refusal is returned, not
+        # bumped past.
+        data = _load_comments(parent_sid)
+        n = len(data.get("threads") or []) + 1
+        while True:
+            nm = "%s-comment-%d" % (sess["name"], n)
+            refusal = _claim_session_name(nm, "thread", tsid)
+            if not refusal:
+                break
+            if refusal == _thread_name_refusal(nm, None, "thread"):
+                return refusal, None
+            n += 1
     # the try begins AT the claim: a _save_comments that raises (an atomic write re-raises) must
     # release the name too, or every later create of it is refused as in flight for the kernel's life
     try:
         with _comments_lock:
             data = _load_comments(parent_sid)
-            if not nm:
-                # the default name counts the threads this session has had, then skips every taken
-                # or in-flight name — a deleted thread's number must not hand a namesake to the next
-                n = len(data.get("threads") or []) + 1
-                while _claim_name("%s-comment-%d" % (sess["name"], n), taken, "thread", tsid):
-                    n += 1
-                nm = "%s-comment-%d" % (sess["name"], n)
-            else:
-                refusal = _thread_name_refusal(nm, names) or _claim_name(nm, taken, "thread", tsid)
-                if refusal:
-                    return refusal, None
-            claimed = nm
             row["name"] = nm
             if col:
                 row["color"] = col                 # the comment's identity color (the dialog's name tint)
@@ -12388,8 +12456,7 @@ def _comment_create(parent_sid, anchor_uuid, exact, text, name="", model="", eff
         _push_soon()
         return None, tsid
     finally:
-        if claimed:
-            _release_name(claimed)   # saved (its registration), removed again, or never written — settled either way
+        _release_name(nm)   # saved (its registration), removed again, or never written — settled either way
 
 
 def _comment_reply(parent_sid, tid, text):
@@ -12584,10 +12651,11 @@ def _comment_promote(parent_sid, tid, new_name, now=None, client=None):
     """The promote door — the WS commentPromote op and POST /fork-promote both land here. NAME_RE first;
     then the name is checked against the OTHER comment threads (a break-out onto another thread's name
     makes the T223 namesake; the thread's own names — its row's and its reg's — are left out, since a
-    thread most often promotes under the name it already wears) and claimed (kind promote) against a
-    live snapshot taken here, outside the claims lock. The claim holds through _comment_promote_inner —
-    be.promote_thread writes the names/ entry, so the next snapshot lists the new session before the
-    release — and is released on every exit. Returns an error string or None (the inner's contract)."""
+    thread most often promotes under the name it already wears) and claimed (kind promote), verified
+    against a live snapshot taken under the claim and outside the claims lock. The claim holds through
+    _comment_promote_inner — be.promote_thread writes the names/ entry, so the next snapshot lists the
+    new session before the release — and is released on every exit. Returns an error string or None
+    (the inner's contract)."""
     nm = (new_name or "").strip()
     if not NAME_RE.match(nm):
         return "session names use letters, digits, . _ - only."
@@ -14234,13 +14302,13 @@ def _open_or_revive(sid, live=False, client=None):
 
 def _revive_session(sid, client=None):
     """The revive door (the WS reviveSession op, on its own thread). The dead session's name is claimed
-    (kind revive) against a live snapshot taken here, outside the claims lock, with the session's OWN
-    row left out of it (a revive of a session that is already up is not a collision with itself). A
-    name another live session has taken since this one died, or one being registered right now,
-    refuses with a reviveFailed to the asker — the failure shape every other revive refusal takes —
-    instead of bringing up a second session under a name every by-name surface resolves to one of
-    them. The claim holds through _revive_session_inner (resume writes the reg alive, or the tmux
-    session comes up, so the next snapshot lists it) and is released either way."""
+    (kind revive) and verified against a live snapshot taken under the claim, outside the claims lock,
+    with the session's OWN row left out of it (a revive of a session that is already up is not a
+    collision with itself). A name another live session has taken since this one died, or one being
+    registered right now, refuses with a reviveFailed to the asker — the failure shape every other revive
+    refusal takes — instead of bringing up a second session under a name every by-name surface resolves
+    to one of them. The claim holds through _revive_session_inner (resume writes the reg alive, or the
+    tmux session comes up, so the next snapshot lists it) and is released either way."""
     name = _name_of(sid) or sid
     refusal = _claim_session_name(name, "revive", sid, own=sid)
     if refusal:
@@ -19365,15 +19433,19 @@ def _thread_names():
     return out
 
 
-def _thread_name_refusal(nm, names):
-    """The refusal text for a create/relabel door hitting a thread's name (None names = unverifiable)."""
+def _thread_name_refusal(nm, names, kind="create"):
+    """The refusal text for a create/relabel door hitting a thread's name (None names = unverifiable).
+    `kind` is the claiming door's (see _claim_name): a revive asks for the dead session's OWN name and
+    cannot pick another, so its tail says what a revive can do, rename the dead tab first (review find,
+    2026-09-08)."""
     if names is None:
         return "couldn't verify \"%s\" against the comment threads — try again in a moment" % nm
     hit = names.get(nm)
     if not hit:
         return ""
-    return ("\"%s\" is a comment thread of %s — open it from that session's comments, or pick another "
-            "name" % (nm, _name_of(hit[1]) or hit[1][:8]))
+    text = "\"%s\" is a comment thread of %s — open it from that session's comments" % (
+        nm, _name_of(hit[1]) or hit[1][:8])
+    return text + (", or rename this session first" if kind == "revive" else ", or pick another name")
 
 
 # ── inbox-socket delivery (Claude Code ≥ 2.1.224) ──

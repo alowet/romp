@@ -12,6 +12,13 @@ against the pending set, every door claims before it acts — inside the creator
 _spawn_session_start, _rename_claimed, and _comment_create for threads), so no door can skip it — and
 _release_name frees the name once the registration is durable or the attempt has failed.
 
+The ORDER inside every door is claim FIRST, snapshot SECOND (review find, 2026-09-08): a door that took
+its live snapshot and then claimed left a gap in which a rival could claim, register and release
+entirely unseen, so both minted. With the claim taken first, the snapshot is taken while the claim is
+held and necessarily lists every earlier registration; and the liveness read bypasses the pusher
+cycle's scoped snapshot, so a comment create retried on the pusher thread reads the world NOW, not
+at cycle start. ClaimBeforeSnapshot and ClaimReadsPastTheCycleScope pin both.
+
 The concurrency here is EVENT-keyed: the first creator parks on a threading.Event between its claim and
 its durable registration while the second door tries the same name; nothing sleeps. Synthetic fixtures
 only — placeholder sids and the demo names (web / api).
@@ -40,7 +47,9 @@ SourceFileLoader("romp_judge", os.path.join(BIN, "romp-judge")).load_module()
 os.environ["ROMP_KERNEL_NO_OPEN"] = "1"
 os.environ.setdefault("ROMP_SERVE_TOKEN", "test-token-DO-NOT-USE")
 km = SourceFileLoader("romp_kernel_names", os.path.join(BIN, "romp-kernel")).load_module()
-_REAL_LIVE_NAMES = km._live_names   # the real registry reader, for the one class that exercises it
+_REAL_LIVE_NAMES = km._live_names   # the real registry reader, for the classes that exercise it
+_REAL_TMUX_SESSIONS = km._tmux_sessions   # the real liveness read, for the class that exercises the cycle scope
+_REAL_THREAD_NAMES = km._thread_names     # the real store walk, for the class that parks a door inside it
 
 SID = "11111111-2222-3333-4444-555555555555"      # a running session named web
 SID2 = "66666666-7777-8888-9999-000000000000"     # what the first create mints
@@ -108,6 +117,33 @@ class _ParkingSdk:
         return True
 
 
+class _ThreadBE:
+    """The SDK backend as the comment-thread door touches it: fork / connect / send / kill recorded,
+    the claims dict sampled at the fork. fork_fails=True raises there, as a CLI that would not start."""
+
+    def __init__(self, outer, fork_fails=False):
+        self.calls, self.outer, self.fork_fails = [], outer, fork_fails
+
+    def fork(self, name, parent_sid, cut_uuid="", bg="", fg="", sid=None, thread_of="",
+             model="", effort="", fast=""):
+        self.calls.append(("fork", name, self.outer.claims()))
+        if self.fork_fails:
+            raise RuntimeError("the CLI would not start")
+        return sid
+
+    def connect(self, sid):
+        self.calls.append(("connect", sid))
+        return True
+
+    def send(self, sid, text):
+        self.calls.append(("send", sid))
+        return True
+
+    def kill(self, sid):
+        self.calls.append(("kill", sid))
+        return True
+
+
 class _Base(unittest.TestCase):
     def patch(self, name, value):
         saved = getattr(km, name)
@@ -149,6 +185,18 @@ class _Base(unittest.TestCase):
         self.assertEqual(km._claim_name(nm, {}, kind, sid), "")
         self.addCleanup(km._release_name, nm)
 
+    def thread_door(self):
+        """The comment-thread door's harness: a commented-on session `api` (PARENT) whose tip fork never
+        reads the transcript, and a fork-recording backend (self.tbe) behind Sessions.backend_for."""
+        self.tbe = _ThreadBE(self)
+        self.patch_backend_for(lambda sid: self.tbe)
+        self.patch("_sdk_ready", lambda: True)
+        path = os.path.join(self.dir, PARENT + ".jsonl")
+        open(path, "w").close()
+        self.patch("_sessions", lambda now, window=None, forks=True: [
+            {"sid": PARENT, "name": "api", "path": path, "mtime": now}])
+        self.addCleanup(_rm_threads)
+
 
 class _Routes(_Base):
     @classmethod
@@ -162,9 +210,14 @@ class _Routes(_Base):
         cls.srv.shutdown()
 
     def post(self, path, body):
+        # km.TOKEN, not os.environ: pytest imports every collected module before any test runs, and
+        # another module may assign ROMP_SERVE_TOKEN at import after this module's kernel captured the
+        # value it checks, so the env at request time depends on collection order (the fix
+        # test_color_route.py carries; review find, 2026-09-08). The kernel's own token is the one the
+        # handler compares against.
         req = urllib.request.Request("http://127.0.0.1:%d%s" % (self.port, path), method="POST",
                                      data=json.dumps(body).encode(),
-                                     headers={"X-Romp-Token": os.environ["ROMP_SERVE_TOKEN"],
+                                     headers={"X-Romp-Token": km.TOKEN,
                                               "Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
@@ -301,6 +354,25 @@ class WsCreate(_Base):
         self.assertIn("being created", fb[0]["text"])
         self.assertFalse(launched.is_set())
 
+    def test_a_codex_create_of_a_reserved_name_warns_and_spawns_nothing(self):
+        # the Codex arm's refusal, unpinned until now: a mutant that drops its `if not _sid` warn passed
+        # every test (review find, 2026-09-08). On that mutant: Lists differ: [] != ['warn']
+        self.hold("cx1")
+        spawns = []
+
+        class _Codex:
+            def spawn(self, nm, cwd, bg="", fg="", sid=None, auth=""):
+                spawns.append(nm)
+                return SID2
+        self.patch("_codex_ready", lambda: True)
+        self.patch("_codex", lambda: _Codex())
+        b, fb = self.client("win-B")
+        self.dispatch({"type": "createSession", "name": "cx1", "dir": self.dir, "backend": "codex"}, b)
+        self.assertEqual([f["type"] for f in fb], ["warn"], fb)
+        self.assertIn("being created", fb[0]["text"])
+        self.assertEqual(spawns, [], "nothing spawned behind a refusal")
+        self.assertEqual(self.reveals, [], "nothing to focus")
+
 
 class FailurePathsFreeTheName(_Base):
     def test_a_create_that_raises_leaves_the_name_free_for_the_retry(self):
@@ -355,10 +427,12 @@ class RenameDoors(_Routes):
         outer = self
 
         class _BE:
+            accept = True                       # False: the backend declines (a sid it does not know)
+
             def rename(self, sid, name):
                 outer.claims_at_rename.append(outer.claims())
                 outer.renames.append((sid, name))
-                return True
+                return self.accept
         self.be = _BE()
         self.patch_backend_for(lambda sid: self.be)
         self.patch("_kernel_knows", lambda sid: True)
@@ -417,6 +491,18 @@ class RenameDoors(_Routes):
         self.assertEqual(self.renames, [(SID, "web3")])
         self.assertEqual(self.claims(), {"web2": {"kind": "create", "sid": ""}},
                          "the rename's claim is released; the planted in-flight create still stands")
+
+    def test_ws_rename_declined_by_the_backend_is_said_and_releases_the_claim(self):
+        # the op used to answer NOTHING on a decline; the PR's warn was unpinned until now (review find,
+        # 2026-09-08). With the warn replaced by `pass`: Lists differ: [] != ['warn']
+        frames = []
+        client = {"send": lambda s: frames.append(json.loads(s))}
+        self.be.accept = False
+        self.assertTrue(km._drive({"type": "renameSession", "id": SID, "name": "web2"}, client))
+        self.assertEqual([f["type"] for f in frames], ["warn"], frames)
+        self.assertIn("the rename did not take", frames[0]["text"])
+        self.assertEqual(self.renames, [(SID, "web2")], "the backend was asked, and declined")
+        self.assertEqual(self.claims(), {}, "the declined rename's claim is released")
 
 
 class ForkDoor(_Base):
@@ -544,6 +630,19 @@ class ReviveDoor(_Base):
         self.assertEqual(self.sent, [])
         self.assertEqual(self.reveals, [("win-A", {"type": "focus", "id": SID})])
 
+    def test_revive_refused_on_a_threads_name_is_worded_for_what_a_revive_can_do(self):
+        # a revive asks for the dead session's OWN name and cannot pick another; the T223 refusal told it
+        # to (review find, 2026-09-08). On the PR head: 'pick another name' unexpectedly found in the text
+        _write_threads(PARENT, [(TSID, "web")])
+        self.addCleanup(_rm_threads)
+        km._revive_session(SID, self.client)
+        self.assertEqual(self.sdk.calls, [], "the dead session came up beside a thread wearing its name")
+        text = self.sent[0][1]["text"]
+        self.assertIn("is a comment thread of", text)
+        self.assertNotIn("pick another name", text)
+        self.assertIn("rename this session first", text, "what a revive CAN do: rename the dead tab, then revive")
+        self.assertEqual(self.claims(), {})
+
     def test_a_session_that_is_already_up_is_not_a_collision_with_itself(self):
         # green on origin/main too (no claim to collide with); the guard for the own-row exclusion
         self.live = {"web": SID}
@@ -555,40 +654,11 @@ class ReviveDoor(_Base):
 class ThreadNames(_Base):
     """A comment thread's name shares the session namespace, both ways."""
 
-    class _BE:
-        def __init__(self, outer, fork_fails=False):
-            self.calls, self.outer, self.fork_fails = [], outer, fork_fails
-
-        def fork(self, name, parent_sid, cut_uuid="", bg="", fg="", sid=None, thread_of="",
-                 model="", effort="", fast=""):
-            self.calls.append(("fork", name, self.outer.claims()))
-            if self.fork_fails:
-                raise RuntimeError("the CLI would not start")
-            return sid
-
-        def connect(self, sid):
-            self.calls.append(("connect", sid))
-            return True
-
-        def send(self, sid, text):
-            self.calls.append(("send", sid))
-            return True
-
-        def kill(self, sid):
-            self.calls.append(("kill", sid))
-            return True
-
     def setUp(self):
         super().setUp()
         self.live = {"web": SID}
-        self.be = self._BE(self)
-        self.patch_backend_for(lambda sid: self.be)
-        self.patch("_sdk_ready", lambda: True)
-        path = os.path.join(self.dir, PARENT + ".jsonl")   # a tip fork never reads the transcript
-        open(path, "w").close()
-        self.patch("_sessions", lambda now, window=None, forks=True: [
-            {"sid": PARENT, "name": "api", "path": path, "mtime": now}])
-        self.addCleanup(_rm_threads)
+        self.thread_door()
+        self.be = self.tbe
 
     def create(self, name=""):
         return km._comment_create(PARENT, "", "a passage", "a note", name=name)
@@ -721,8 +791,17 @@ class LiveTmuxRenamePublishesTheName(_Base):
 
     def test_a_rename_tmux_declined_publishes_nothing_and_is_reported(self):
         # on origin/main: AttributeError: '_rename_claimed'
-        with mock.patch.object(km._TMUX, "rename_by_name", lambda old, new, t=5: False):
+        # The REAL rename_by_name over a tmux whose rename exits 1: its nonzero-exit mapping is what the
+        # doors' "declined" reading rests on, and the first cut mocked it away (review find, 2026-09-08);
+        # on a rename_by_name that answers True regardless of the exit: (True, '') != (False, '')
+        argv = []
+
+        class _Declined:
+            returncode = 1
+        with mock.patch.dict(os.environ, {"ROMP_TMUX_AVAILABLE": "1"}), \
+                mock.patch.object(km.subprocess, "run", lambda cmd, *a, **k: argv.append(cmd) or _Declined()):
             ok, refusal = km._rename_claimed(km._TMUX, SID, "web2")
+        self.assertEqual(argv, [["tmux", "rename-session", "-t", "web", "web2"]], "tmux was asked, once")
         self.assertEqual((ok, refusal), (False, ""), "the backend declined — the doors say so")
         self.assertEqual(km._live_names(km._tmux_sessions()), {"web": SID}, "a name tmux refused is never published")
         self.assertEqual(self.claims(), {})
@@ -752,6 +831,17 @@ class LockDiscipline(_Base):
             def rename(self, sid, nm):
                 return True
         self.assertEqual(km._rename_claimed(_BE(), SID, "web3"), (True, ""))
+
+        class _Codex:
+            def spawn(self, nm, cwd, bg="", fg="", sid=None, auth=""):
+                return SID3
+        self.patch("_codex_ready", lambda: True)
+        self.patch("_codex", lambda: _Codex())
+        self.assertEqual(km._create_codex_session("cx1", self.dir)[0], SID3)
+        # the thread door too (the seventh the body counts; the first cut sampled six, review find 2026-09-08)
+        self.thread_door()
+        err, tid = km._comment_create(PARENT, "", "a passage", "a note", name="side")
+        self.assertIsNone(err, "the thread door minted")
         # the tmux starter LAST: its launch thread releases the name (taking the lock) after the call
         # returns, so every sample above is taken before it, and the final look at the dict waits for
         # that thread — gated on its release, never on time
@@ -760,7 +850,7 @@ class LockDiscipline(_Base):
         self.patch("_spawn_session", lambda nm, cwd=None: None)
         self.assertEqual(km._spawn_session_start("term1", self.dir), "")
         self.assertTrue(released.wait(timeout=10), "the launch thread settled")
-        self.assertGreaterEqual(len(held), 12, "every door took both snapshots (live + threads)")
+        self.assertGreaterEqual(len(held), 16, "every door took both snapshots (live + threads): eight doors")
         self.assertEqual(set(held), {False}, "a snapshot was taken while the claims lock was held")
         self.assertEqual(self.claims(), {})
 
@@ -798,6 +888,219 @@ class LockDiscipline(_Base):
         # a revive cannot pick another name, so its refusal does not tell it to
         self.assertNotIn("pick another name", km._claim_name("web4", {}, "revive", SID3))
         self.assertIn("pick another name", km._claim_name("web4", {}, "create"))
+
+
+class ClaimBeforeSnapshot(_Base):
+    """The claim PRECEDES the snapshot. A door that took its live snapshot first and claimed after left a
+    gap in which a rival could claim, register and release entirely unseen: the dict was empty again
+    and the snapshot predated the registration, so BOTH minted (review find, 2026-09-08, reproduced by a
+    deterministic probe on the first cut). Here one caller is parked inside its comments-store walk (an
+    Event keyed on its thread id), a rival runs the same create to completion, then the parked caller
+    resumes. On the old order the park sits AFTER the live snapshot and BEFORE the claim, the rival's
+    whole life fits in it, and both mint; with the claim taken first the parked caller holds the name
+    through its snapshot, the rival is refused by the dict, and exactly one mints. The third case parks
+    a caller at the claim's door itself: on the old order after both snapshots, on the new before any."""
+
+    def setUp(self):
+        super().setUp()
+        self.parked_ident, self.park_at = [None], "_thread_names"
+        self.entered, self.gate = threading.Event(), threading.Event()
+        real_claim = km._claim_name
+
+        def parked_here(where):
+            if where == self.park_at and threading.get_ident() == self.parked_ident[0]:
+                self.entered.set()
+                self.gate.wait(timeout=10)
+
+        def thread_names():
+            # the parked caller waits HERE, after its live snapshot on the old order and after its claim
+            # on the new one; every other caller walks the store at once
+            parked_here("_thread_names")
+            return _REAL_THREAD_NAMES()
+
+        def claim_name(nm, live_names, kind="create", sid=""):
+            # or HERE, at the claim's door: after BOTH snapshots on the old order, before any on the new
+            parked_here("_claim_name")
+            return real_claim(nm, live_names, kind, sid)
+        self.patch("_thread_names", thread_names)
+        self.patch("_claim_name", claim_name)
+        self.be = _ParkingSdk(self.live, park=False)
+        self.patch("_sdk", lambda: self.be)
+        self.thread_door()
+
+    def park(self, fn, at="_thread_names"):
+        """Run fn on its own thread and hold it at `at` (its store walk, or the claim's door); returns
+        (thread, out)."""
+        out = {}
+        self.park_at = at
+
+        def run():
+            self.parked_ident[0] = threading.get_ident()
+            out["v"] = fn()
+        t = threading.Thread(target=run)
+        t.start()
+        self.assertTrue(self.entered.wait(timeout=10), "the parked caller reached %s" % at)
+        return t, out
+
+    def resume(self, t):
+        self.gate.set()
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive(), "the parked caller finished")
+
+    def test_two_creates_one_parked_in_its_snapshot_mint_exactly_one(self):
+        # on the PR head: AssertionError: 2 != 1 : both creates minted a "web" (the rival claimed,
+        # registered and released inside the parked caller's snapshot-to-claim gap, unseen by either check)
+        t, out = self.park(lambda: km._create_sdk_session("web", self.dir))
+        rival = km._create_sdk_session("web", self.dir)      # runs to completion while the other is parked
+        self.resume(t)
+        self.assertEqual(len(self.be.spawns), 1, 'both creates minted a "web"')
+        self.assertEqual(rival[0], "", rival)
+        self.assertTrue(rival[1].get("nameTaken"))
+        self.assertIn("being created", rival[1].get("error") or "",
+                      "the rival is refused by the claim the parked caller took before its snapshot")
+        self.assertEqual(out["v"][0], SID2, "the parked caller, the claim's holder, is the one that mints")
+        self.assertEqual(self.claims(), {})
+
+    def test_a_thread_create_parked_in_its_store_walk_and_a_session_create_mint_exactly_one(self):
+        # the thread door's gap was wider still on the old order (a row build and a wait on the comments
+        # lock between its snapshots and its claim); on the PR head: AssertionError: 2 != 1 : both the
+        # thread and the session minted a "web"
+        t, out = self.park(lambda: km._comment_create(PARENT, "", "a passage", "a note", name="web"))
+        rival = km._create_sdk_session("web", self.dir)
+        self.resume(t)
+        forks = [c[1] for c in self.tbe.calls if c[0] == "fork"]
+        self.assertEqual(len(self.be.spawns) + len(forks), 1, 'both the thread and the session minted a "web"')
+        self.assertEqual((rival[0], self.be.spawns), ("", []), "the session create is refused by the claim the thread holds")
+        self.assertIn("being created", rival[1].get("error") or "")
+        err, tid = out["v"]
+        self.assertIsNone(err, "the thread, the claim's holder, is the one that mints")
+        self.assertEqual([row.get("name") for row in km._load_comments(PARENT).get("threads", [])], ["web"])
+        self.assertEqual(self.claims(), {})
+
+    def test_a_session_create_parked_at_its_claim_sees_a_thread_that_finished_meanwhile(self):
+        # the reverse: the thread's row is saved and its claim released while the session create is parked
+        # at the claim's door (after both of its snapshots on the old order, so neither lists the thread);
+        # on the PR head: AssertionError: ['review'] != [] : the session landed on a thread's name
+        t, out = self.park(lambda: km._create_sdk_session("review", self.dir), at="_claim_name")
+        err, tid = km._comment_create(PARENT, "", "a passage", "a note", name="review")
+        self.assertIsNone(err)
+        self.assertEqual(self.claims(), {}, "the thread has registered and released")
+        self.resume(t)
+        self.assertEqual(self.be.spawns, [], "the session landed on a thread's name")
+        sid, extra = out["v"]
+        self.assertEqual(sid, "")
+        self.assertIn("is a comment thread of", extra.get("error") or "")
+        self.assertEqual(self.claims(), {})
+
+
+class ClaimReadsPastTheCycleScope(_Base):
+    """A claim's liveness read bypasses the pusher cycle's scoped snapshots. On the pusher thread
+    _tmux_sessions() serves the cycle-start liveness map (_live_scope.snapshot) and _name_of the
+    cycle-start registry (_live_scope.names), and the comment-create door runs THERE through
+    _retry_parked_creates: a same-name session created, registered and released earlier in the same
+    cycle was in neither snapshot nor the dict, and a parked thread create minted the namesake (review
+    find, 2026-09-08). The real _tmux_sessions and _live_names run here over a private registry, and
+    the scope is set on the test thread exactly as the cycle sets it, aged to before `web2` existed."""
+
+    def setUp(self):
+        super().setUp()
+        names = Path(tempfile.mkdtemp())
+        (names / SID2).write_text("web2\t/work/web2\t#112233\t#ffffff\n")
+        self.patch("NAMES", names)
+        self.patch("_tmux_sessions", _REAL_TMUX_SESSIONS)
+        self.patch("_live_names", _REAL_LIVE_NAMES)
+        saved = km.Sessions.__dict__["live"]
+        km.Sessions.live = staticmethod(lambda: {SID2: {"state": "ready"}})   # web2 is live NOW
+        self.addCleanup(setattr, km.Sessions, "live", saved)
+        km._live_scope.snapshot, km._live_scope.names = {}, {}   # the cycle's snapshots: taken before web2 was made
+        self.addCleanup(self._drop_scope)
+        self.thread_door()
+
+    @staticmethod
+    def _drop_scope():
+        km._live_scope.snapshot = km._live_scope.names = None
+
+    def test_a_session_door_on_a_scoped_thread_sees_a_session_the_cycle_snapshot_predates(self):
+        # on the PR head: AssertionError: Tuples differ: (SID2, ['web2']) != ('', []) : minted against the cycle-start snapshot
+        be = _ParkingSdk(self.live, park=False)
+        self.patch("_sdk", lambda: be)
+        sid, extra = km._create_sdk_session("web2", self.dir)
+        self.assertEqual((sid, be.spawns), ("", []), "the create minted a second web2 against the cycle-start snapshot")
+        self.assertIn("already running", extra.get("error") or "")
+        self.assertEqual((km._live_scope.snapshot, km._live_scope.names), ({}, {}),
+                         "the cycle's scope is restored for the rest of the cycle")
+        self.assertEqual(self.claims(), {})
+
+    def test_a_parked_comment_create_retried_by_the_pusher_sees_it_too(self):
+        # the real call chain: _retry_parked_creates on the scoped thread; on the PR head:
+        # AssertionError: ['web2'] != [] : the retry minted a thread beside the live web2
+        km._parked_creates.append({"sid": PARENT, "uuid": "", "exact": "a passage", "text": "a note",
+                                   "name": "web2", "model": "", "effort": "", "fast": "", "color": "", "tries": 0})
+        self.addCleanup(km._parked_creates.clear)
+        km._retry_parked_creates()
+        self.assertEqual([c[1] for c in self.tbe.calls if c[0] == "fork"], [], "the retry minted a thread beside the live web2")
+        self.assertEqual([t.get("name") for t in km._load_comments(PARENT).get("threads", [])], [])
+        self.assertEqual(km._parked_creates, [], "a refused create is dropped, never re-parked")
+        self.assertEqual((km._live_scope.snapshot, km._live_scope.names), ({}, {}))
+        self.assertEqual(self.claims(), {})
+
+
+class UnverifiableThreadStore(_Base):
+    """An unreadable comments store (_thread_names None) refuses every door: an unverifiable name never
+    mints (the standing rule; _thread_names' docstring records the first cut that returned {} and
+    silently reopened the door). Each refusal here survived replacement by minting blind until it was
+    pinned (review find, 2026-09-08): on a mutant that falls through with names = {} the create spawns
+    and the thread's row is written."""
+
+    def setUp(self):
+        super().setUp()
+        self.live = {"web": SID}
+        self.patch("_thread_names", lambda: None)
+        self.thread_door()
+
+    def test_every_session_door_refuses_and_leaves_the_name_free(self):
+        be = _ParkingSdk(self.live, park=False)
+        self.patch("_sdk", lambda: be)
+        sid, extra = km._create_sdk_session("web2", self.dir)
+        self.assertEqual((sid, be.spawns), ("", []), "the create minted with the thread store unreadable")
+        self.assertTrue(extra.get("nameTaken"))
+        self.assertIn("couldn't verify", extra.get("error") or "")
+        forks = []
+        self.patch("_fork_session_inner", lambda psid, at, nm, now=None, client=None: forks.append(nm) or None)
+        self.assertIn("couldn't verify", km._fork_session(SID, "", "web-fork") or "")
+        promotes = []
+        self.patch("_comment_promote_inner", lambda p, t, nm, now=None, client=None: promotes.append(nm) or None)
+        self.assertIn("couldn't verify", km._comment_promote(PARENT, TSID, "sidework") or "")
+        launched = threading.Event()
+        self.patch("_spawn_session", lambda nm, cwd=None: launched.set())
+        self.assertIn("couldn't verify", km._spawn_session_start("term1", self.dir))
+        renames = []
+
+        class _BE:
+            def rename(self, sid, nm):
+                renames.append(nm)
+                return True
+        ok, refusal = km._rename_claimed(_BE(), SID, "web3")
+        self.assertFalse(ok)
+        self.assertIn("couldn't verify", refusal)
+        revived, sent = [], []
+        self.patch("_revive_session_inner", lambda sid, client=None: revived.append(sid))
+        self.patch("_name_of", lambda sid: "dead")
+        self.patch("_send_to_view", lambda app, msg, wid: sent.append(msg))
+        km._revive_session(SID3)
+        self.assertIn("couldn't verify", sent[0]["text"])
+        self.assertEqual((forks, promotes, launched.is_set(), renames, revived), ([], [], False, [], []),
+                         "no door acted on an unverifiable name")
+        self.assertEqual(self.claims(), {}, "every refusal released its claim")
+
+    def test_the_thread_door_refuses_an_explicit_and_a_default_name(self):
+        for name in ("side", ""):
+            err, tid = km._comment_create(PARENT, "", "a passage", "a note", name=name)
+            self.assertIsNone(tid, name)
+            self.assertIn("couldn't verify", err or "", name)
+        self.assertEqual(self.tbe.calls, [], "nothing forked")
+        self.assertEqual(km._load_comments(PARENT).get("threads", []), [], "no row written")
+        self.assertEqual(self.claims(), {})
 
 
 if __name__ == "__main__":
