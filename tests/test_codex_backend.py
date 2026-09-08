@@ -7,6 +7,7 @@ surfaces as launch_error text instead of a silent non-start. All data synthetic 
 
 Run:    python3 tests/test_codex_backend.py
 """
+import contextlib
 import json
 import os
 import queue
@@ -28,6 +29,28 @@ os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
 os.environ.pop("ROMP_STATE_DIR", None)
 cb = SourceFileLoader("romp_codex_backend", os.path.join(ROOT, "kernel", "codex_backend.py")).load_module()
 sb = SourceFileLoader("romp_session_backend", os.path.join(ROOT, "kernel", "session_backend.py")).load_module()
+
+
+@contextlib.contextmanager
+def _disk_full(nf):
+    """ENOSPC beneath the REAL names writer: the publish (os.replace onto names/<sid>) fails, and an
+    in-place write to that file does what ENOSPC does to one — truncates, then fails. Every other path
+    proceeds, so only the writer under test, and any restore aimed at its file, feel the full disk."""
+    want = os.path.realpath(str(nf))
+    real_replace, real_wb = os.replace, Path.write_bytes
+
+    def replace(src, dst, *a, **k):
+        if os.path.realpath(str(dst)) == want:
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst, *a, **k)
+
+    def write_bytes(self, data, *a, **k):
+        if os.path.realpath(str(self)) == want:
+            open(self, "w").close()
+            raise OSError(28, "No space left on device")
+        return real_wb(self, data, *a, **k)
+    with mock.patch.object(os, "replace", replace), mock.patch.object(Path, "write_bytes", write_bytes):
+        yield
 
 
 def until(fn, timeout=5.0, step=0.01):
@@ -1250,47 +1273,45 @@ class RaisingRegistryTransactions(unittest.TestCase):
                              "without it the registry alone holds the new name and applies the "
                              "'failed' rename at the next restart")
 
-    def test_a_truncating_names_write_in_rename_is_restored(self):
-        # the r30 mutant hunt: the chmod-0444 fixture fails AT OPEN without truncating, so
-        # deleting the bytes-restore stayed green — this drives the ENOSPC shape the fix names
-        # (write_text truncates, THEN fails)
+    def test_a_failed_publish_in_rename_leaves_the_names_file_untouched(self):
+        # rewritten to the truth (review, 2026-09-08): the old form mocked _write_name with a fake that
+        # truncated the file IN PLACE — something the real tmp+os.replace writer cannot do — and pinned
+        # an in-place RESTORE that, under the very ENOSPC it existed for, truncated a good file to
+        # nothing and then blamed "a failed write". _disk_full drives the REAL writer with the fault
+        # beneath it and models ENOSPC for any in-place write aimed at the file; on origin/main the
+        # restore itself empties the file
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             be = cb.CodexBackend(td, client_factory=lambda: None)
             sid = be.spawn("webby", "/tmp")
-            nf = os.path.join(td, "names", sid)
-            old_line = open(nf).read()
-
-            def truncating_write(s2, bg="", fg=""):
-                open(nf, "w").close()              # the open('w') truncation
-                raise OSError(28, "No space left on device")
-            with mock.patch.object(be, "_write_name", side_effect=truncating_write):
+            nf = Path(td) / "names" / sid
+            old_line = nf.read_text()
+            with _disk_full(nf):
                 with self.assertRaises(OSError):
                     be.rename(sid, "newname")
-            self.assertEqual(open(nf).read(), old_line,
-                             "the compensation restores the truncated identity line")
-            self.assertEqual(be._session(sid).name, "webby")
+            self.assertEqual(nf.read_text(), old_line,
+                             "byte-identical: the atomic writer left it, and nothing rewrote it in place")
+            self.assertEqual(sorted(p.name for p in nf.parent.iterdir()), [sid], "no staging file left behind")
+            self.assertEqual(be._session(sid).name, "webby", "memory kept the old name")
+            rows = json.loads((Path(td) / "codex" / "registry.json").read_text())
+            self.assertEqual(rows[sid]["name"], "webby", "the registry write was re-run with the old name")
 
-    def test_a_failed_rename_of_an_absent_names_file_stays_unpublished(self):
-        # the r30 verification: with no file to snapshot, _write_name CREATED a partial file
-        # holding the NEW name — the failed rename stayed published, silently
+    def test_a_failed_first_publish_in_rename_creates_nothing(self):
+        # rewritten to the truth (review, 2026-09-08): the old fake CREATED a partial file, which the
+        # real writer never can (it publishes whole or not at all). Green on origin/main as well — its
+        # unlink branch was a no-op there — kept as the pin for the absent-entry shape
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             be = cb.CodexBackend(td, client_factory=lambda: None)
             sid = be.spawn("webby", "/tmp")
-            nf = os.path.join(td, "names", sid)
+            nf = Path(td) / "names" / sid
             os.unlink(nf)                          # a legacy row predating the names write
-
-            def partial_write(s2, bg="", fg=""):
-                with open(nf, "w") as f:
-                    f.write("newname\t")           # partial line lands, then the write dies
-                raise OSError(28, "No space left on device")
-            with mock.patch.object(be, "_write_name", side_effect=partial_write):
+            with _disk_full(nf):
                 with self.assertRaises(OSError):
                     be.rename(sid, "newname")
-            self.assertFalse(os.path.exists(nf),
-                             "the partial NEW-name file is removed — a failed rename must not "
-                             "stay published")
+            self.assertEqual(sorted(p.name for p in nf.parent.iterdir()), [],
+                             "neither the file nor its temp exists: a failed rename publishes nothing")
+            self.assertEqual(be._session(sid).name, "webby")
 
     def test_a_names_write_failure_after_thread_start_is_restored_not_fatal(self):
         # the r30 verification: _prepare_thread's unguarded names write truncated the identity
