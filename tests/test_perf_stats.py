@@ -47,7 +47,7 @@ SID = "11111111-2222-3333-4444-555555555555"
 # and node ids collide across test modules under the shared placeholder (CLAUDE.md, goal-store fixtures).
 GOAL_SID = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
 TOP_KEYS = {"now", "since", "uptime_s", "log", "process", "pusher", "stages_ms", "builds", "sends",
-            "goals", "judge", "http"}
+            "goals", "memos", "judge", "http"}
 
 
 def _burn_cpu(seconds):
@@ -114,6 +114,11 @@ class Collector(unittest.TestCase):
         self.assertIn("cpu_ms_sum", snap["judge"])
         self.assertIn("cpu_ms_workers", snap["judge"])
         self.assertEqual(set(snap["goals"]), {"loads", "saves", "writes"}, "read through jd.goal_io_stats")
+        # the three identity memos' readers land here (review find, 2026-09-08: they had no consumer)
+        self.assertEqual(set(snap["memos"]), {"pass", "shared", "chain"})
+        self.assertEqual(snap["memos"]["pass"], km._goals_memo_report())
+        self.assertEqual(snap["memos"]["shared"], km.jd.shared_store_stats())
+        self.assertEqual(snap["memos"]["chain"], km.jd.chain_memo_stats())
         for k in ("rss_kb", "threads", "cpu_s", "pid"):
             self.assertIn(k, snap["process"])
         self.assertGreater(snap["process"]["threads"], 0)
@@ -388,6 +393,28 @@ class GoalIoCounters(unittest.TestCase):
         d = self.jd.goal_io_stats()
         d["loads"] = -1
         self.assertNotEqual(self.jd.goal_io_stats()["loads"], -1)
+
+    def test_the_reference_doc_describes_memos_and_routes_the_pushers_loads_there(self):
+        # docs/reference.md read `goals.loads` as every store read; the pusher's loads moved to the shared cache
+        # with this PR, so the doc names the memos section and sends the reader there (review find, 2026-09-08)
+        doc = Path(HERE).parent.joinpath("docs", "reference.md").read_text()
+        self.assertIn("- `memos`:", doc)
+        for k in ("`pass`", "`shared`", "`chain`"):
+            self.assertIn(k, doc)
+        self.assertIn("`memos.shared`", doc)
+
+    def test_the_pushers_shared_loads_count_under_memos_shared_not_under_goals_loads(self):
+        # `goals.loads` is the writer's loader alone; the pusher's read-only loads ride load_goals_shared and
+        # show under memos.shared (review find, 2026-09-08: nine pusher sites left `loads` with the move to the
+        # shared cache, and the doc still read it as every store read). A fill is a miss, a re-read a hit.
+        self.jd.save_goals(GOAL_SID, self.jd.load_goals(GOAL_SID))
+        before, snap0 = self.jd.goal_io_stats(), km._PERF_STATS.snapshot()["memos"]["shared"]
+        self.jd.load_goals_shared(GOAL_SID)
+        self.jd.load_goals_shared(GOAL_SID)
+        after, snap = self.jd.goal_io_stats(), km._PERF_STATS.snapshot()["memos"]["shared"]
+        self.assertEqual(after["loads"], before["loads"], "two shared loads: no writer-side load counted")
+        self.assertEqual((snap["miss"] - snap0["miss"], snap["hit"] - snap0["hit"]), (1, 1),
+                         "...the fill and the hit are the shared cache's, on the snapshot")
 
 
 class JudgeCpu(unittest.TestCase):

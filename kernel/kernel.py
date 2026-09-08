@@ -211,9 +211,15 @@ class _PerfStats:
       sends                        full / delta / deduped -> {slot: {count, bytes}} per dedup-slot
                                    name (chat, feed, bars, taborder, ...; at most SLOTS names, the rest
                                    under "other"). A deduped frame was built and compared, not sent
-      goals                        loads, saves, writes: judge.load_goals calls, save_goals calls,
-                                   and the saves that reached the disk (a byte-identical republish
-                                   is a save without a write)
+      goals                        loads, saves, writes: judge.load_goals calls (the writer's loader;
+                                   the pusher's read-only loads ride load_goals_shared and show under
+                                   memos.shared), save_goals calls, and the saves that reached the
+                                   disk (a byte-identical republish is a save without a write)
+      memos                        pass / shared / chain: the judge pass's stat-keyed store memo
+                                   (_goals_memo_report: hit, miss, fail, evict, punch, entries,
+                                   bytes), the pusher's shared read-only store cache
+                                   (judge.shared_store_stats) and the write-moment chain memo
+                                   (judge.chain_memo_stats)
       judge                        passes (one per _producer pass), ms_sum / ms_last / ms_mean (wall:
                                    a pass is a join over the tier threads, so this is mostly model
                                    latency), cpu_ms_sum (CPU: the two tier threads' own time, from
@@ -364,10 +370,20 @@ class _PerfStats:
             goals = jd.goal_io_stats()
         except Exception:
             goals = {}
+        # The three identity memos' readers land here (review find, 2026-09-08: they had no consumer): the
+        # judge pass's stat-keyed store memo, the pusher's shared read-only store cache and the write-moment
+        # chain memo. `goals.loads` is the writer's loader alone; the pusher's loads show under memos.shared.
+        memos = {}
+        for key, read in (("pass", _goals_memo_report), ("shared", jd.shared_store_stats),
+                          ("chain", jd.chain_memo_stats)):
+            try:
+                memos[key] = read()
+            except Exception:
+                memos[key] = {}
         now = time.time()
         return {"now": now, "since": since, "uptime_s": now - _STARTED, "log": _PERF,
                 "process": _process_stats(), "pusher": pusher, "stages_ms": stages,
-                "builds": builds, "sends": sends, "goals": goals, "judge": judge, "http": http}
+                "builds": builds, "sends": sends, "goals": goals, "memos": memos, "judge": judge, "http": http}
 
 
 _PERF_STATS = _PerfStats()
@@ -19060,8 +19076,9 @@ SYNC_RING = 40
 def _sync_notice(text, ok=True, kind="sync"):
     """One row on the ring the shell's bell mirrors. `kind` is the bell kind the row is filed under:
     "sync" (the default, the ring's original tenant: a machine sync) or "refused" (a state file that
-    could not be read or written, or was moved aside), so a mute on one never hides the other (review
-    find, 2026-09-08). The shell allowlists the value; anything it does not know reads as sync."""
+    could not be read or written, or was moved aside, or a session's chat frame that could not be
+    built), so a mute on one never hides the other (review find, 2026-09-08). The shell allowlists the
+    value; anything it does not know reads as sync."""
     global _SYNC_SEQ
     with _SYNC_LOCK:
         _SYNC_SEQ += 1
@@ -24559,7 +24576,9 @@ _goals_snap_lock = threading.Lock()
 # reported) once per file version rather than once per pass; its sid stays out of the snapshot and the
 # feed reads it live. A read that fails (EMFILE under descriptor pressure, EIO) is not remembered: that
 # is the pass's failure, not the version's, so the next pass reads the file again, as every pass did
-# before the memo. Entries for paths gone from the directory are evicted at the next pass.
+# before the memo. Entries for paths gone from the directory are evicted at the next pass, and the
+# compaction sweep after each pass evicts the entries of stores no discovered session owns
+# (_goals_memo_evict_unowned), so the resident set is bounded by the live board.
 # WHAT THE KEY RESTS ON: st_mtime_ns moving between publishes, not the inode. Inode numbers recycle
 # (on ext4, consecutive tmp+rename publishes of one path alternate between two numbers, so the third
 # version can sit on the first's inode), and equal sizes are common (a digit bump, a same-length
@@ -24573,7 +24592,7 @@ _goals_memo = [{}]                               # path → ((st_ino, st_mtime_n
 _GOALS_MEMO_BAD = object()                       # a file version that did not decode: no snapshot entry, no retry until it changes
 # Bare `+= 1` increments with one writer per key: hit/miss/fail/evict are written only by the producer thread
 # (_begin_goals_pass runs only from _producer) and punch only under _goals_snap_lock, so no key has two writers.
-_goals_memo_stats = {"hit": 0, "miss": 0, "fail": 0, "evict": 0, "punch": 0}   # read by tests; surfaced on GET /perf once that route exists
+_goals_memo_stats = {"hit": 0, "miss": 0, "fail": 0, "evict": 0, "punch": 0}   # read by tests and GET /perf (memos.pass)
 
 
 def _goals_memo_decode(data):
@@ -24585,12 +24604,30 @@ def _goals_memo_decode(data):
 
 def _goals_memo_report():
     """The memo's counters plus its current occupancy: `entries` memoized paths and `bytes` their summed
-    on-disk size (a proxy for the parsed objects' footprint). GET /perf reports it once that route exists."""
+    on-disk size (a proxy for the parsed objects' footprint). GET /perf reports it as memos.pass."""
     memo = _goals_memo[0]
     out = dict(_goals_memo_stats)
     out["entries"] = len(memo)
     out["bytes"] = sum(k[2] for k, v in memo.values() if v is not _GOALS_MEMO_BAD)
     return out
+
+
+def _goals_memo_evict_unowned(owned):
+    """Drop the entries of stores no session in `owned` (the discover set's sids) holds. The memo had no
+    cap: every store the directory held stayed decoded in memory between passes, tens of MB on a large
+    board (review find, 2026-09-08). The compaction sweep calls this after the tiers, on the producer
+    thread, the memo's one writer. The price is one decode at the next pass for such a store the pass
+    still lists (what every pass paid before the memo); the stores a discovered session owns keep their
+    entries. A swap, never an in-place mutation: a /perf reader may be iterating the old dict."""
+    memo = _goals_memo[0]
+    kept = {path: ent for path, ent in memo.items() if os.path.basename(path)[:-5] in owned}
+    gone = len(memo) - len(kept)
+    if gone:
+        _goals_memo[0] = kept
+        _goals_memo_stats["evict"] += gone
+    return gone
+
+
 # A USER gesture (card reply, Move to Working, resolve) must NEVER wait out a pass (the user 2026-07-21).
 # The snapshot above exists to hide half-applied JUDGE writes; it was also hiding the user's own, because
 # optimistic_followup writes the LIVE store while the feed reads the frozen copy. A reply landing
@@ -30136,7 +30173,9 @@ _compact_seen = {}                                     # fsid → live-store mti
 
 def _compact_goal_stores():
     """Sweep every session's goal store, archiving newly-cleared tops. Cheap: skips a store whose live file
-    hasn't changed since the last sweep (no new clears, no judge write), so the steady state is just stats."""
+    hasn't changed since the last sweep (no new clears, no judge write), so the steady state is just stats.
+    Runs on the producer thread after the tiers join (its caller's single-writer slot): the pass memo it
+    evicts from has that thread as its one writer."""
     import glob
     moved = 0
     try:
@@ -30144,6 +30183,16 @@ def _compact_goal_stores():
         jd._shared_evict_absent()                      # ...and the shared read-only views of removed stores
     except Exception:
         pass
+    try:
+        # ...and, for the two memos that hold PARSED stores, the entries of stores no discovered session
+        # owns: neither had a cap (review find, 2026-09-08). discover is cached behind the transcript
+        # directory's fingerprint, so this is the tiers' own list, not a second walk. A discover that
+        # raises evicts nothing: with no owner list there is no unowned.
+        owned = {f for f, _p, _a, _n in jd.discover(int(time.time()))}
+        jd._shared_evict_unowned(owned)
+        _goals_memo_evict_unowned(owned)
+    except Exception:
+        sys.stderr.write("compact: memo eviction: %s\n" % traceback.format_exc())
     try:
         paths = glob.glob(str(jd.GOALDIR / "*.json"))
     except Exception:
@@ -37612,6 +37661,38 @@ def _note_chat_divergence(sid, name, chat_state, row_state, now):
         pass
 
 
+_chat_build_faults = {}   # sid -> the fault text of its CURRENT chat-build episode; ONE stderr traceback + bell row per episode
+_chat_build_faults_lock = threading.Lock()   # the pusher and a connect push both run _push, on their own threads
+
+
+def _chat_build_fault(s, exc):
+    """Name a session whose chat build raised, on stderr (with the traceback) AND as a dashboard bell row,
+    ONCE per fault episode. _push skips the session's frame for the cycle (see its catch), so without this
+    the user's only sign was a pane that stopped updating, and a build that fails the same way every cycle
+    (its input stands) wrote a full traceback every 0.5-3 s (review find, 2026-09-08). The episode is the
+    fault TEXT, the _git_file_fault rule: an identical repeat says nothing, a different fault on the same
+    session is a new episode, and a build that succeeds ends it (_chat_build_ok). The bell row wears the
+    kind a state file that cannot be read wears. Never raises: the bell is a courtesy inside the push."""
+    sid = str(s.get("sid") or "")
+    text = "%s: %s" % (type(exc).__name__, exc)
+    with _chat_build_faults_lock:                     # check-and-set as ONE step: two _push threads faulting
+        if _chat_build_faults.get(sid) == text:       # the same session must not both speak
+            return
+        _chat_build_faults[sid] = text
+    sys.stderr.write("push build: chat %s: %s\n" % (sid[:8], traceback.format_exc()))
+    try:
+        _sync_notice("chat: the pane for %s cannot be built (%s); it keeps its last frame until a build succeeds"
+                     % (s.get("name") or sid[:8], text), ok=False, kind="refused")
+    except Exception:
+        pass
+
+
+def _chat_build_ok(sid):
+    """A chat build that succeeded ends the session's fault episode, so the same fault later is said anew."""
+    if _chat_build_faults:                            # the common case (no episode open) pays no lock
+        with _chat_build_faults_lock:
+            _chat_build_faults.pop(str(sid), None)
+
 
 def _push(targets, connect=False, tmux=None):
     """Build the payloads once (cached parses) and send each target only the pieces that CHANGED for it.
@@ -37693,13 +37774,16 @@ def _push(targets, connect=False, tmux=None):
                     _t0 = time.monotonic()
                     try:
                         m = build_session(s["sid"], now, tmux)
-                    except Exception:
+                    except Exception as e:
                         # One session's failed chat build costs that session's frame this cycle, not every
                         # client's whole push: the cycle-level catch below ("push build:") would return
                         # before the feed and the timeline were built, and a build that fails the same way
                         # every cycle would freeze the board for as long as its input stands (2026-09-06).
-                        sys.stderr.write("push build: chat %s: %s\n" % (str(s["sid"])[:8], traceback.format_exc()))
+                        # Said ONCE per fault episode, on stderr and as a dashboard bell row, so the pane
+                        # that stopped updating is not a silent degrade (review find, 2026-09-08).
+                        _chat_build_fault(s, e)
                         continue
+                    _chat_build_ok(s["sid"])             # a build that succeeds ends its fault episode
                     # The full serialization is LAZY (the 2026-08-10 CPU fix, round two): steady state
                     # sends only chatTail suffixes, so an eager json.dumps of the WHOLE payload — multi-MB
                     # for a busy active tab, re-dumped every cycle just to be discarded — was the largest

@@ -5396,6 +5396,39 @@ class ViewBuilder(unittest.TestCase):
         finally:
             km._end_goals_pass()
 
+    def test_the_compaction_sweep_evicts_the_entries_of_stores_no_discovered_session_owns(self):
+        # The memo had no cap: every store the directory held stayed decoded in memory between passes (tens
+        # of MB on a large board; the PR that added it asked whether that was welcome). The compaction sweep,
+        # run after the tiers on the same producer thread, drops the entries of stores no session in the
+        # discover set owns; the price is one decode at the next pass for such a store the pass still lists
+        # (review find, 2026-09-08).
+        other = self._publish_store(self.OTHER_SID, {"rompUuid": self.OTHER_SID, "seq": 0, "nodes": {},
+                                                     "placements": {}, "status": {}})
+        mine = str(jd.GOALDIR / (SID + ".json"))
+        km._begin_goals_pass()
+        km._end_goals_pass()
+        self.assertEqual(set(km._goals_memo[0]), {mine, str(other)})
+        before = km._goals_memo_stats["evict"]
+        disc = [(SID, str(self.tpath), None, "testsess"), (self.OTHER_SID, "/dev/null", None, "api")]
+        with mock.patch.object(jd, "discover", lambda now, window=None, forks=True: list(disc)):
+            km._compact_goal_stores()
+            self.assertEqual(set(km._goals_memo[0]), {mine, str(other)}, "both owned: nothing evicted")
+            del disc[1:]                                             # the other session left the discover window
+            km._compact_goal_stores()
+        self.assertEqual(set(km._goals_memo[0]), {mine}, "the unowned store's entry is gone")
+        self.assertEqual(km._goals_memo_stats["evict"] - before, 1)
+        real, calls = self._count_decodes()
+        try:
+            km._begin_goals_pass()
+            try:
+                self.assertEqual(len(calls), 1, "the price: the evicted store is decoded again next pass")
+                self.assertEqual(km._feed_goals(self.OTHER_SID)["seq"], 0, "…and served as before")
+            finally:
+                km._end_goals_pass()
+        finally:
+            km._goals_memo_decode = real
+        self.assertEqual(set(km._goals_memo[0]), {mine, str(other)})
+
     # Each component of the memo key is load-bearing on its own, and none of the tests above pins one:
     # they publish by rename AND change the content's length, so every version differs in two components
     # at once, and a key missing any one component still passes them. The three tests below isolate one
@@ -5474,6 +5507,38 @@ class ViewBuilder(unittest.TestCase):
         self.assertEqual(decodes, 1, "the inode moved → decoded again")
         self.assertEqual(served["seq"], 1, "…and the new version is what the pass serves")
         self.assertNotEqual(old_key, new_key)
+
+    def test_a_same_size_in_place_rewrite_with_the_mtime_put_back_is_the_documented_blind_spot(self):
+        # All three components held: same inode (in place), same length (seq 0 → 1), mtime pinned back. The
+        # key cannot tell, so the pass serves the EARLIER parse. Pinned as the named exception the memo note
+        # documents, as its two sibling memos pin theirs (the absent-store memo in test_judge_propagate_loads,
+        # the shared cache's byte compare in test_judge_store_cache; review find, 2026-09-08). No romp writer
+        # does this (every publish is a tmp+rename); it stands in for two equal-size publishes onto a
+        # recycled inode inside one clock tick on a coarse-timestamp kernel. A publish of another size is seen.
+        def mutate(path, st, store):
+            store["seq"] = 1
+            data = json.dumps(store)
+            self.assertEqual(len(data.encode()), st.st_size, "same length by construction")
+            path.write_text(data)                                        # same inode, same size
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))        # same mtime_ns
+            now = path.stat()
+            self.assertEqual((now.st_ino, now.st_mtime_ns, now.st_size), (st.st_ino, st.st_mtime_ns, st.st_size))
+        decodes, served, old_key, new_key = self._memo_key_probe(mutate)
+        self.assertEqual(decodes, 0, "the key did not move → no decode")
+        self.assertEqual(served["seq"], 0, "…so the pass serves the earlier parse: the documented blind spot")
+        self.assertEqual(old_key, new_key)
+        path = self._publish_store(self.OTHER_SID, {"rompUuid": self.OTHER_SID, "seq": 2, "nodes": {},
+                                                    "placements": {}, "status": {}, "note": "another size"})
+        real, calls = self._count_decodes()
+        try:
+            km._begin_goals_pass()
+            try:
+                self.assertEqual(len(calls), 1, "a publish of another size is seen")
+                self.assertEqual(km._feed_goals(self.OTHER_SID)["seq"], 2)
+            finally:
+                km._end_goals_pass()
+        finally:
+            km._goals_memo_decode = real
 
     def test_a_publish_between_the_listing_stat_and_the_open_is_keyed_as_the_version_read(self):
         # The key is taken by fstat on the fd the bytes come from, so a rename landing between the

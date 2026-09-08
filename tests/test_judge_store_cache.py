@@ -173,14 +173,14 @@ class SharedStoreCache(unittest.TestCase):
         # onto a recycled inode inside one clock tick. The byte compare catches it.
         p = self._seed()
         a = jd.load_goals_shared(SID)
-        key0 = jd.store_key(SID)
+        key0 = jd._file_key(str(p))
         st = os.stat(p)
         raw = p.read_bytes()
         self.assertIn(b'"text": "A goal"', raw)
         with open(p, "r+b") as f:                         # in place: the inode stays
             f.write(raw.replace(b'"text": "A goal"', b'"text": "B goal"'))
         os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))  # pin the stamp: the identity is unchanged
-        self.assertEqual(jd.store_key(SID), key0, "the stat key did not move")
+        self.assertEqual(jd._file_key(str(p)), key0, "the stat key did not move")
         b = jd.load_goals_shared(SID)
         self.assertIsNot(a, b)
         self.assertEqual(b["nodes"][self._nid(1)]["text"], "B goal")
@@ -287,11 +287,18 @@ class SharedStoreCache(unittest.TestCase):
         self.assertEqual(self._delta("absent"), 1)
         self.assertEqual(jd.shared_store_stats()["entries"], 0, "the removed store's entry went with it")
 
-    def test_store_key(self):
-        self.assertIsNone(jd.store_key(SID), "no file, no key")
-        p = self._seed()
-        st = os.stat(p)
-        self.assertEqual(jd.store_key(SID), (st.st_ino, st.st_mtime_ns, st.st_size))
+    def test_the_cache_exports_no_uncalled_key_reader(self):
+        # store_key (a fresh stat of the store's identity) shipped with no caller: the two kernel view signatures
+        # that stat the store carry (mtime, size) inside larger multi-file keys and are not its consumer, so it
+        # is gone rather than kept ahead of a use (review find, 2026-09-08). _file_key stays: the cache's own.
+        self.assertFalse(hasattr(jd, "store_key"))
+
+    def test_the_two_kinds_this_cache_files_are_documented(self):
+        # docs/judges.md lists the judge-errors kinds; the two the frozen guard files were missing from it
+        # (review find, 2026-09-08)
+        doc = (Path(BIN).parent / "docs" / "judges.md").read_text()
+        for kind in ("frozen-store-write", "frozen-store-save"):
+            self.assertIn(kind, doc, "%s is documented" % kind)
 
     # ── the degraded inputs ──────────────────────────────────────────────────────────────────────────
 

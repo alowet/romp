@@ -50,6 +50,7 @@ jd = SourceFileLoader("romp_judge", os.path.join(BIN, "romp-judge")).load_module
 
 SENDER = "a4a4a4a4-0001-4000-8000-000000000001"   # discovered, name "web"
 RECIP = "a4a4a4a4-0002-4000-8000-000000000002"    # discovered, name "api"
+SENDER2 = "a4a4a4a4-0006-4000-8000-000000000006"  # a second sender, discovered on demand (name "tests")
 DEAD = "a4a4a4a4-0003-4000-8000-000000000003"     # absent: no discover entry
 DEAD2 = "a4a4a4a4-0004-4000-8000-000000000004"
 DEAD3 = "a4a4a4a4-0005-4000-8000-000000000005"
@@ -256,6 +257,62 @@ class LoadOncePerPass(World):
         self.assertEqual(_rev(SENDER), r0 + 1)
         log = jd.load_goals(SENDER)["nodes"][SENDER + ":t1"]["log"]
         self.assertEqual([e["kind"] for e in log if e.get("src") == "courier"], ["done"])
+
+    def _two_senders_one_recipient(self):
+        """SENDER and SENDER2 each delegated one step to RECIP, which completed both; RECIP's g5 (SENDER's ref)
+        is reached before g6 (SENDER2's) in the recipient loop. Returns the two senders' revisions."""
+        self.sessions.append((SENDER2, "/dev/null", None, "tests"))
+        self._publish(SENDER, {t["id"]: t for t in [_tracker(SENDER, 1, RECIP, MID)]})
+        self._publish(SENDER2, {t["id"]: t for t in [_tracker(SENDER2, 1, RECIP, MID2)]})
+        g5 = _complete(RECIP, 5, origin={"peer": SENDER, "goalId": SENDER + ":t1", "msgId": MID})
+        g6 = _complete(RECIP, 6, origin={"peer": SENDER2, "goalId": SENDER2 + ":t1", "msgId": MID2})
+        self._publish(RECIP, {g5["id"]: g5, g6["id"]: g6})
+        return _rev(SENDER), _rev(SENDER2)
+
+    def test_a_raise_mid_loop_publishes_the_verdicts_already_reached_and_re_raises(self):
+        # The deferred single publish must not turn one ref's trip into the loss of every verdict the pass
+        # recorded before it (review find, 2026-09-08; the per-ref save it replaced had persisted each as it
+        # was reached): the senders reached before the raise are published, the error is re-raised, and the
+        # sender whose ref raised (its object half-applied) is left for the next pass to re-derive.
+        r1, r2 = self._two_senders_one_recipient()
+        orig = jd._presumed_closed
+
+        def tripping(sid, now):
+            if sid == SENDER2:
+                raise RuntimeError("synthetic: the second sender's rollup input trips")
+            return orig(sid, now)
+        jd._presumed_closed = tripping
+        try:
+            with self.assertRaises(RuntimeError):
+                jd.run_propagate(now=T + 900)
+        finally:
+            jd._presumed_closed = orig
+        self.assertEqual(_rev(SENDER), r1 + 1, "the verdict reached before the raise is on disk")
+        self.assertTrue(jd.load_goals(SENDER)["nodes"][SENDER + ":t1"]["nodeComplete"])
+        self.assertEqual(_rev(SENDER2), r2, "the sender whose ref raised is not published: half-applied is no verdict")
+        self.assertFalse(jd.load_goals(SENDER2)["nodes"][SENDER2 + ":t1"]["nodeComplete"])
+        self.assertEqual(jd.run_propagate(now=T + 901), 1, "the next pass re-derives the one left, and only it")
+        self.assertEqual((_rev(SENDER), _rev(SENDER2)), (r1 + 1, r2 + 1))
+
+    def test_one_senders_failed_publish_does_not_stop_the_other_senders(self):
+        # Every dirty sender is published whatever happened to the one before it; the first failed publish is
+        # the pass's error, raised once the rest are out (review find, 2026-09-08).
+        r1, r2 = self._two_senders_one_recipient()
+        orig_save = jd.save_goals
+
+        def failing(fsid, store):
+            if fsid == SENDER:
+                raise RuntimeError("disk full")
+            return orig_save(fsid, store)
+        jd.save_goals = failing
+        try:
+            with self.assertRaises(RuntimeError):
+                jd.run_propagate(now=T + 900)
+        finally:
+            jd.save_goals = orig_save
+        self.assertEqual(_rev(SENDER), r1, "the failed publish left its file untouched")
+        self.assertEqual(_rev(SENDER2), r2 + 1, "the other sender's publish still landed")
+        self.assertTrue(jd.load_goals(SENDER2)["nodes"][SENDER2 + ":t1"]["nodeComplete"])
 
     def test_a_kernel_side_write_between_two_refs_survives_the_single_publish(self):
         # The CAS discipline under the deferred publish: the nudge tick blocks a third node and

@@ -95,6 +95,10 @@ class WiringPins(unittest.TestCase):
         src = inspect.getsource(km._compact_goal_stores)
         self.assertIn("jd._disk_memo_evict_absent()", src)
         self.assertIn("jd._shared_evict_absent()", src)
+        # ...and, for the two memos holding PARSED stores, the entries of stores no discovered session owns
+        # (review find, 2026-09-08: neither had a cap)
+        self.assertIn("jd._shared_evict_unowned(", src)
+        self.assertIn("_goals_memo_evict_unowned(", src)
 
 
 class SharedViewInBuilds(unittest.TestCase):
@@ -112,11 +116,18 @@ class SharedViewInBuilds(unittest.TestCase):
         km._timeline_sessions = lambda now, tmux, live_only=False: [
             {"sid": sid, "name": "s%d" % i, "path": os.path.join(self.td.name, "no-such-transcript-%d" % i)}
             for i, sid in enumerate(SIDS)]
+        # the compaction sweep evicts the entries of stores no DISCOVERED session owns, so the three synthetic
+        # stores must be discovered for their entries to survive a sweep (review find, 2026-09-08)
+        self.saved_discover = jd.discover
+        self.discovered = list(SIDS)
+        jd.discover = lambda now, window=None, forks=True: [(sid, "/dev/null", None, "s%d" % i)
+                                                            for i, sid in enumerate(SIDS) if sid in self.discovered]
         self.stats0 = jd.shared_store_stats()
 
     def tearDown(self):
         for nm, v in self.saved.items():
             setattr(km, nm, v)
+        jd.discover = self.saved_discover
         jd._rebind_state(self.saved_state)
         self.td.cleanup()
 
@@ -272,11 +283,34 @@ class SharedViewInBuilds(unittest.TestCase):
         self.assertEqual(jd.shared_store_stats()["entries"], len(SIDS) - 1)
         self.assertEqual(self._delta("evict"), 1)
 
+    def test_the_compaction_sweep_evicts_the_entries_of_stores_no_discovered_session_owns(self):
+        # The cache had no cap: a store's view stayed resident for the process once read, so a board's whole
+        # history of stores sat in memory (review find, 2026-09-08). The sweep drops the entries of stores no
+        # session in the discover set owns; a later read of one is a miss that refills it.
+        for sid in SIDS:
+            jd.load_goals_shared(sid)
+        self.assertEqual(jd.shared_store_stats()["entries"], len(SIDS))
+        km._compact_goal_stores()
+        self.assertEqual(jd.shared_store_stats()["entries"], len(SIDS), "every store is owned: nothing evicted")
+        self.assertEqual(self._delta("evict"), 0)
+        self.discovered[:] = [SIDS[0]]                     # the other two sessions left the discover window
+        km._compact_goal_stores()
+        self.assertEqual(jd.shared_store_stats()["entries"], 1, "the unowned stores' entries are gone")
+        self.assertEqual(self._delta("evict"), 2)
+        miss0 = self._delta("miss")
+        jd.load_goals_shared(SIDS[1])                      # read again: one miss refills it
+        self.assertEqual(self._delta("miss"), miss0 + 1)
+        self.assertEqual(jd.shared_store_stats()["entries"], 2)
+
 
 class PushSurvivesOneFailedChatBuild(unittest.TestCase):
     """A chat build that raises used to abort the whole push (the cycle-level "push build:" catch returns
     before the feed and the timeline are built). One session's build now fails alone: its frame is skipped
-    this cycle, the other sessions' frames and the timeline still go out, and stderr names it."""
+    this cycle, the other sessions' frames and the timeline still go out, and stderr names it, ONCE per
+    fault episode, with a dashboard bell row beside the stderr line, so the pane that stopped updating is
+    not a silent degrade and a build that fails every cycle is not a traceback every cycle (review find,
+    2026-09-08). The episode is the fault text: a repeat says nothing, a different fault is a new episode,
+    and a build that succeeds ends it."""
     STUBS = ("NAMES", "_tmux_sessions", "_live_names", "_chat_tab_sessions", "build_session",
              "_cached_feed", "_cached_timeline", "build_timeline", "_fleet_view_sig", "_comments_frame",
              "_retry_parked_creates")
@@ -312,6 +346,10 @@ class PushSurvivesOneFailedChatBuild(unittest.TestCase):
         km._comments_frame = lambda sid, tmux: None
         km._retry_parked_creates = lambda: None
         km._built_chat.clear(); km._prev_chat_events.clear(); km._prev_chat_ledger.clear()
+        self.saved_bell = list(km._SYNC_NOTICES)          # the dashboard bell ring the fault reaches
+        del km._SYNC_NOTICES[:]
+        km._chat_build_faults.clear()                     # no fault episode carried in from another test
+        self.fail_with = "synthetic: this session's chat build fails"
         self.built = []
         self.chat_frames, self.tl_frames = [], []
         self.chat = {"app": "chat", "alive": True, "sent": {}, "send": lambda s: self.chat_frames.append(json.loads(s))}
@@ -326,11 +364,12 @@ class PushSurvivesOneFailedChatBuild(unittest.TestCase):
         km._prev_chat_events.clear(); km._prev_chat_events.update(pe)
         km._prev_chat_ledger.clear(); km._prev_chat_ledger.update(pl)
         km._last_tab_order[:] = lo
+        km._SYNC_NOTICES[:] = self.saved_bell
 
     def _build_session(self, sid, now, tmux):
         self.built.append(sid)
-        if sid == self.A:
-            raise RuntimeError("synthetic: this session's chat build fails")
+        if sid == self.A and self.fail_with:
+            raise RuntimeError(self.fail_with)
         return {"type": "session", "id": sid, "name": "api", "events": [{"uuid": "e1", "type": "user"}],
                 "ledger": None, "status": {"state": "waiting"}, "color": None}
 
@@ -346,6 +385,38 @@ class PushSurvivesOneFailedChatBuild(unittest.TestCase):
         self.assertIn("synthetic: this session's chat build fails", err.getvalue())
         self.assertNotIn(self.A, km._built_chat, "no cache entry for the failed build")
         self.assertIn(self.B, km._built_chat)
+        # ...and the dashboard hears it (review find, 2026-09-08): one bell row of the kind a state file that
+        # cannot be read wears, naming the session and the fault, so the user is not left reading the kernel
+        # log to learn why one pane stopped updating
+        rows = list(km._SYNC_NOTICES)
+        self.assertEqual(len(rows), 1, "one bell row for the fault: %r" % rows)
+        self.assertEqual(rows[0]["kind"], "refused")
+        self.assertFalse(rows[0]["ok"], "a fault, not a sync that landed")
+        self.assertIn("web", rows[0]["text"], "the row names the session")
+        self.assertIn("RuntimeError: " + self.fail_with, rows[0]["text"], "...and the fault")
+
+    def test_a_build_that_keeps_failing_the_same_way_is_said_once_until_it_changes_or_succeeds(self):
+        def push():
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                km._push([self.chat, self.tl])
+            return err.getvalue().count("push build: chat %s" % self.A[:8])
+        self.assertEqual(push(), 1, "the first cycle says it")
+        self.assertEqual(push(), 0, "the second cycle, same fault: not again")
+        self.assertEqual(push(), 0)
+        self.assertEqual(len(km._SYNC_NOTICES), 1, "one episode, one bell row")
+        self.fail_with = "synthetic: a different fault on the same session"
+        self.assertEqual(push(), 1, "a different fault is a new episode")
+        self.assertEqual(len(km._SYNC_NOTICES), 2)
+        self.assertIn("a different fault", km._SYNC_NOTICES[-1]["text"])
+        self.fail_with = ""                                   # the build succeeds: the episode is over
+        self.assertEqual(push(), 0)
+        self.assertNotIn(self.A, km._chat_build_faults, "a build that succeeds ends the fault episode")
+        self.assertIn(self.A, km._built_chat, "…and its frame is cached like any other")
+        self.fail_with = "synthetic: this session's chat build fails"
+        km._built_chat.pop(self.A, None)                      # the input moved: the build runs again and fails again
+        self.assertEqual(push(), 1, "the same fault after a success is a new episode, said anew")
+        self.assertEqual(len(km._SYNC_NOTICES), 3)
 
 
 if __name__ == "__main__":

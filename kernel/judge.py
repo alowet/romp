@@ -2226,7 +2226,8 @@ _CHAIN_STATS = {"hit": 0, "miss": 0, "populate": 0, "bypass": 0}   # read throug
 def chain_memo_stats():
     """The write-moment chain memo's counters, snapshotted under the lock: hit (served from the
     memo), miss (key computed, no usable entry, built and memoized), populate (entries written),
-    bypass (the key itself hit OSError: built fresh, not memoized)."""
+    bypass (the key itself hit OSError: built fresh, not memoized). The kernel's GET /perf reports
+    the dict as memos.chain."""
     with _CHAIN_LOCK:
         return dict(_CHAIN_STATS)
 
@@ -3152,8 +3153,11 @@ def _guard_nodes(store):
 
 # ── goal-store I/O counters (the kernel's GET /perf reads them through goal_io_stats) ─────────────
 # How often the stores are read and written is the first question when the kernel is busy: every
-# judge stage, the feed build and the nudge tick load stores, so the load rate says whether a change
-# added a pass over every session. Plain counters, one lock, no formatting on the path.
+# judge stage and the nudge tick load stores through load_goals, so the load rate says whether a change
+# added a writer-side pass over every session. The pusher's read-only sites (the feed, chat and timeline
+# builds) read through load_goals_shared, whose hits and misses shared_store_stats reports (GET /perf
+# memos.shared), so a pass added THERE shows as shared misses, not here (review find, 2026-09-08).
+# Plain counters, one lock, no formatting on the path.
 _GOAL_IO = {"loads": 0, "saves": 0, "writes": 0}
 _GOAL_IO_LOCK = threading.Lock()
 
@@ -4031,9 +4035,10 @@ def _matches_disk(fsid, store, mine=None):
 # Invalidation is exact by construction: a store publish is a rename to a new inode (save_goals), a
 # journal write an append, an archive publish a rename. save_goals also pops its path after the rename
 # (the writer's object is never the shared one), _rebind_state and migrate_all_stores clear, and the
-# kernel's compaction sweep evicts absent paths (_shared_evict_absent). Two fills of one path race
-# harmlessly: the second checks under the lock for an entry with its exact keys and bytes and returns
-# that object, so concurrent readers of one file version receive one object.
+# kernel's compaction sweep evicts absent paths (_shared_evict_absent) and the entries of stores no
+# discovered session owns (_shared_evict_unowned), so the cache is bounded by the live board. Two fills
+# of one path race harmlessly: the second checks under the lock for an entry with its exact keys and
+# bytes and returns that object, so concurrent readers of one file version receive one object.
 _SHARED = {}                                     # store path → (keys, store bytes, frozen store)
 _SHARED_LOCK = threading.Lock()
 _SHARED_OFF = [False]                            # a write attempt on a shared object switches the cache off (see _shared_poison)
@@ -4302,27 +4307,35 @@ def _shared_evict_absent():
     return len(gone)
 
 
+def _shared_evict_unowned(owned):
+    """Drop the entries of stores no session in `owned` (the discover set's sids) holds. The cache had no
+    cap: a store's view stayed resident for the process once read (review find, 2026-09-08). The kernel's
+    compaction sweep calls this beside _shared_evict_absent; a later read of an evicted store is a miss
+    that refills it."""
+    with _SHARED_LOCK:
+        gone = [k for k in _SHARED if os.path.basename(k)[:-5] not in owned]
+        for k in gone:
+            del _SHARED[k]
+        _SHARED_STATS["evict"] += len(gone)
+    return len(gone)
+
+
 def shared_store_stats():
     """The cache's counters plus its occupancy. hit: identity and bytes matched. miss: no entry, or its keys
     moved. compare_miss: identity matched and the bytes did not. refuse: a fill not published because the
     archive moved under it. dup: a fill discarded for a concurrent fill's identical entry. absent: no store
     file. corrupt: bytes that did not parse, handed to load_goals (which moves them aside); nothing cached.
-    unreadable_journal: served uncached from load_goals. evict:
-    entries dropped for gone files. fallback: calls served by load_goals because the cache is off. poisoned:
-    write attempts on a shared object (the first switched the cache off). Gauges: entries, bytes (the raw
-    store bytes held for the compare), off."""
+    unreadable_journal: served uncached from load_goals. evict: entries dropped for gone files and for
+    stores no discovered session owns (the compaction sweep). fallback: calls served by load_goals because
+    the cache is off. poisoned: write attempts on a shared object (the first switched the cache off).
+    Gauges: entries, bytes (the raw store bytes held for the compare), off. The kernel's GET /perf reports
+    the dict as memos.shared."""
     with _SHARED_LOCK:
         out = dict(_SHARED_STATS)
         out["entries"] = len(_SHARED)
         out["bytes"] = sum(len(e[1]) for e in _SHARED.values())
         out["off"] = int(_SHARED_OFF[0])
     return out
-
-
-def store_key(fsid):
-    """The store file's identity (inode, mtime_ns, size) from a fresh stat, None when absent — the per-session
-    key a view signature can carry. Independent of the cache: one stat, no entry consulted."""
-    return _file_key(str(GOALDIR / (fsid + ".json")))
 
 
 def load_goals_shared(fsid):
@@ -14565,13 +14578,17 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
     sender is read only when nothing this pass has read it yet. A ref's verdict lands on the shared object
     with today's per-ref rollup, and each dirty sender is PUBLISHED ONCE, after the recipient loop (the
     rebase unions per-node logs by (ev_t, src, kind), so one publish carrying several courier rows merges
-    exactly as several publishes did). A saved object leaves `loaded` in a finally: it is dropped so the
-    next touch reloads with a fresh CAS base (save_goals pops the base on publish), and a failed publish
-    drops it too, never leaving a base-less object for the sender loop. The absent-store sweep answers from
-    _absent_store_flags, memoized across passes on file identity. The per-session catches stand around the
-    shared read: a store that raises files its `pass-crash` row where it is reached (the recipient scan, a
-    ref's sender read, the sender loop) and is not kept, so the next touch retries the read; _ref_goal's
-    recipient read goes through the store-fault boundary (_or_fault) as before."""
+    exactly as several publishes did). A raise mid-loop publishes the senders reached before it and
+    re-raises, the sender being applied dropped unpublished; a failed publish does not stop the others,
+    and the first is raised once the rest are out (review find, 2026-09-08: the per-ref save this
+    replaced persisted each verdict as it was reached). A saved object leaves `loaded` in a finally: it
+    is dropped so the next touch reloads with a fresh CAS base (save_goals pops the base on publish), and
+    a failed publish drops it too, never leaving a base-less object for the sender loop. The absent-store
+    sweep answers from _absent_store_flags, memoized across passes on file identity. The per-session
+    catches stand around the shared read: a store that raises files its `pass-crash` row where it is
+    reached (the recipient scan, a ref's sender read, the sender loop) and is not kept, so the next touch
+    retries the read; _ref_goal's recipient read goes through the store-fault boundary (_or_fault) as
+    before."""
     if now is None:
         now = int(time.time())
     n = 0
@@ -14603,65 +14620,93 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
             loaded.pop(sid, None)
             idents.pop(sid, None)
 
+    def _publish_dirty():
+        """One publish per dirty sender, every one of them whatever happened to the one before: the first
+        failed publish is the pass's error, raised once the rest are out (review find, 2026-09-08)."""
+        first = None
+        for a_sid in list(dirty):
+            try:
+                _publish(a_sid)
+            except Exception as e:
+                if first is None:
+                    first = e
+        if first is not None:
+            raise first
+
     closed = {}                                         # sender sid -> _presumed_closed, once per pass
     dirty = {}                                          # sender sids with verdicts to publish, in order
-    for fsid, path, anchor, name in sessions:
-        # live + ARCHIVE merged for the RECIPIENT-side scan (2026-08-26, the working-column audit):
-        # a recipient goal that completed and was then ARCHIVED (the user cleared the done card)
-        # vanished from the live-only scan, so the sender's tracker never checked off — a live
-        # specimen sat open seven hours with its completion event already fired and recorded.
-        # Read-only on this side: propagate writes SENDER stores only.
-        rnodes = dict(_arch(fsid).get("nodes") or {})
-        try:
-            rnodes.update(_get(fsid).get("nodes") or {})
-        except Exception as e:                         # an unreadable store: this session's row, the next session's turn
-            _log_judge_error("propagate", fsid, "pass-crash", note="store: %r" % e)
-            continue
-        for nid, nd in list(rnodes.items()):
-            if not nd.get("nodeComplete"):
-                continue                                # B hasn't finished it yet
-            o = nd.get("origin")
-            refs = ([o] if (isinstance(o, dict) and o.get("peer") and o.get("goalId")) else [])
-            refs += [l for l in (nd.get("links") or [])
-                     if isinstance(l, dict) and l.get("peer") and l.get("goalId")]
-            for ref in refs:
-                a_sid, a_gid = ref["peer"], ref["goalId"]
-                try:
-                    a_store = _get(a_sid)               # the shared read: no load when this pass has it
-                except Exception as e:                 # the sender's store faulted: its tracker waits for the next pass
-                    _log_judge_error("propagate", fsid, "pass-crash", note="sender %s store: %r" % (a_sid[:8], e))
-                    continue
-                a_node = a_store.get("nodes", {}).get(a_gid)
-                if not a_node or a_node.get("nodeComplete"):
-                    continue                            # sender's tracking node gone or already done → idempotent
-                # Carry the RECIPIENT'S OWN RESOLUTION across (the user 2026-08-25, the re-asking
-                # umbrella): the bare "completed by <peer>" why gave the sender-side closer nothing
-                # to rule a delegated ask done WITH — the steps-finished nomination saw an ask whose
-                # only visible history was the dispatch, omitted, and the look-stamp sealed it while
-                # the auto-nudge re-asked a finished question seven times in 75 minutes. The
-                # recipient's doneWhy (else its summary head) IS the report-back's substance; capped
-                # like every quoted why.
-                why = "completed by %s (delegated)" % (name or fsid[:8])
-                sub = str(nd.get("doneWhy") or "").strip() \
-                    or (str(nd.get("summary") or "").strip().splitlines() or [""])[0]
-                if sub:
-                    why += ": " + sub[:220]
-                record_verdict(a_store, a_store["nodes"][a_gid], "courier", "done", now, why=why)
-                _mark_node_done(a_store, a_gid, why, now, src="courier")
-                if a_sid not in closed:
-                    closed[a_sid] = _presumed_closed(a_sid, now)
-                rollup_status(a_store, closed[a_sid])   # sender just had work close →
-                #                                        recompute its columns, SETTLING them when the
-                #                                        sender is determined dead (2026-08-28: a live
-                #                                        sender's own pass settles as before; a dead one
-                #                                        has no pass, so this write is its only settler).
-                #                                        Per ref, as before: a later recipient in this
-                #                                        loop reads the shared object, and this keeps it
-                #                                        exactly what the per-ref publish used to leave.
-                dirty[a_sid] = True
-                n += 1
-    for a_sid in list(dirty):
-        _publish(a_sid)                                 # one publish per dirty sender
+    applying = None                                     # the sender whose object a ref's verdict is landing on
+    try:
+        for fsid, path, anchor, name in sessions:
+            # live + ARCHIVE merged for the RECIPIENT-side scan (2026-08-26, the working-column audit):
+            # a recipient goal that completed and was then ARCHIVED (the user cleared the done card)
+            # vanished from the live-only scan, so the sender's tracker never checked off — a live
+            # specimen sat open seven hours with its completion event already fired and recorded.
+            # Read-only on this side: propagate writes SENDER stores only.
+            rnodes = dict(_arch(fsid).get("nodes") or {})
+            try:
+                rnodes.update(_get(fsid).get("nodes") or {})
+            except Exception as e:                         # an unreadable store: this session's row, the next session's turn
+                _log_judge_error("propagate", fsid, "pass-crash", note="store: %r" % e)
+                continue
+            for nid, nd in list(rnodes.items()):
+                if not nd.get("nodeComplete"):
+                    continue                                # B hasn't finished it yet
+                o = nd.get("origin")
+                refs = ([o] if (isinstance(o, dict) and o.get("peer") and o.get("goalId")) else [])
+                refs += [l for l in (nd.get("links") or [])
+                         if isinstance(l, dict) and l.get("peer") and l.get("goalId")]
+                for ref in refs:
+                    a_sid, a_gid = ref["peer"], ref["goalId"]
+                    try:
+                        a_store = _get(a_sid)               # the shared read: no load when this pass has it
+                    except Exception as e:                 # the sender's store faulted: its tracker waits for the next pass
+                        _log_judge_error("propagate", fsid, "pass-crash", note="sender %s store: %r" % (a_sid[:8], e))
+                        continue
+                    a_node = a_store.get("nodes", {}).get(a_gid)
+                    if not a_node or a_node.get("nodeComplete"):
+                        continue                            # sender's tracking node gone or already done → idempotent
+                    # Carry the RECIPIENT'S OWN RESOLUTION across (the user 2026-08-25, the re-asking
+                    # umbrella): the bare "completed by <peer>" why gave the sender-side closer nothing
+                    # to rule a delegated ask done WITH — the steps-finished nomination saw an ask whose
+                    # only visible history was the dispatch, omitted, and the look-stamp sealed it while
+                    # the auto-nudge re-asked a finished question seven times in 75 minutes. The
+                    # recipient's doneWhy (else its summary head) IS the report-back's substance; capped
+                    # like every quoted why.
+                    why = "completed by %s (delegated)" % (name or fsid[:8])
+                    sub = str(nd.get("doneWhy") or "").strip() \
+                        or (str(nd.get("summary") or "").strip().splitlines() or [""])[0]
+                    if sub:
+                        why += ": " + sub[:220]
+                    applying = a_sid                    # half-applied from here until dirty: see the except
+                    record_verdict(a_store, a_store["nodes"][a_gid], "courier", "done", now, why=why)
+                    _mark_node_done(a_store, a_gid, why, now, src="courier")
+                    if a_sid not in closed:
+                        closed[a_sid] = _presumed_closed(a_sid, now)
+                    rollup_status(a_store, closed[a_sid])   # sender just had work close →
+                    #                                        recompute its columns, SETTLING them when the
+                    #                                        sender is determined dead (2026-08-28: a live
+                    #                                        sender's own pass settles as before; a dead one
+                    #                                        has no pass, so this write is its only settler).
+                    #                                        Per ref, as before: a later recipient in this
+                    #                                        loop reads the shared object, and this keeps it
+                    #                                        exactly what the per-ref publish used to leave.
+                    dirty[a_sid] = True
+                    applying = None
+                    n += 1
+    except Exception:
+        # A raise mid-loop must not turn one ref's trip into the loss of every verdict the pass reached
+        # before it (review find, 2026-09-08; the per-ref save this single publish replaced persisted each
+        # as it was reached): the senders reached are published, then the error goes up. The sender whose
+        # ref raised is dropped unpublished, its object half-applied (a verdict recorded without its rollup
+        # is no verdict); the next pass re-derives it from the recipient's completion, forward-only.
+        if applying is not None:
+            dirty.pop(applying, None)
+            loaded.pop(applying, None)
+            idents.pop(applying, None)
+        _publish_dirty()                                # a publish that fails here raises with the loop's error chained
+        raise
+    _publish_dirty()                                    # one publish per dirty sender
     # REMOTE recipients (the user 2026-08-24): their goal stores live on another kernel, so the
     # origin back-link above can never fire for them. The local log still records the exact
     # report-back event: the recipient's REPLY mail — any kind — at/after the delegate's send, the
