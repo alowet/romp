@@ -57,7 +57,7 @@ import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDown
 import { followReader, keepPlaceAcrossShow, followTail, atBottomDist, followBoxBelow, followTailShrink } from "./scroll-keep";
 import { retainLiveOmitted } from "./tab-order";
 import { userTurnShows } from "./user-turn-content";
-import { ScrollDiagBudget, classifyScroll, scrollWriteRow } from "./scroll-write";
+import { ScrollDiagBudget, classifyScroll, scrollWriteRow, tailChangeRow, tailLabel } from "./scroll-write";
 import { reloadScrollRecord, takeReloadScroll, type ReloadScroll } from "./reload-restore";
 import { keepResidentEvents } from "./frame-merge";
 import { activeTabToReannounce } from "./relay-active";
@@ -9303,7 +9303,7 @@ function nearBottomForSend(c: HTMLElement): boolean {
 // lands, only that the landing is on the record.
 let lastScrollWriteAfter: number | null = null;
 const scrollDiag = new ScrollDiagBudget();
-function scrollDiagRow(kind: "scrollwrite" | "scrollgesture", data: any): void {
+function scrollDiagRow(kind: "scrollwrite" | "scrollgesture" | "tailchange", data: any): void {
   const v = scrollDiag.take(activeId || "", kind, Date.now());
   if (v === "drop") return;
   vscodeApi?.postMessage(v === "cap"
@@ -9640,6 +9640,10 @@ function ensureView(id: string): View {
         scheduleRailSticky();
         const h = entries[0]?.contentRect?.height ?? 0;
         const content = document.getElementById("content");
+        // the tail's height change, named (T262f): which element grew or shrank under the reader — Chrome moves a
+        // bottom reader for both without a pane write, so the scroll rows alone cannot say which element flapped
+        if (content && lastH >= 0 && activeId === id && view.shown && h !== lastH)
+          scrollDiagRow("tailchange", tailChangeRow(id, h - lastH, tailLabel(view.el.children), view.stick, content.scrollHeight, content.clientHeight));
         if (content && lastH >= 0 && activeId === id && view.shown && content.clientHeight > 0 && followTailShrink(view.stick, h - lastH)) {
           writeScroll(content, content.scrollHeight, "tail-shrink", true);
           view.scrollTop = content.scrollTop;
@@ -10627,6 +10631,8 @@ if (typeof ResizeObserver === "function") {
       const h = entries[0]?.contentRect?.height ?? 0;
       const content = document.getElementById("content");
       const v = activeId ? views.get(activeId) : null;
+      if (content && tailLastH >= 0 && v && v.shown && h !== tailLastH)
+        scrollDiagRow("tailchange", tailChangeRow(activeId || "", h - tailLastH, "live-ask", v.stick, content.scrollHeight, content.clientHeight));
       if (content && tailLastH >= 0 && v && v.shown && content.clientHeight > 0 && followTailShrink(v.stick, h - tailLastH)) {
         writeScroll(content, content.scrollHeight, "tail-shrink", true);
         v.scrollTop = content.scrollTop;

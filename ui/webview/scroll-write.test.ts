@@ -40,7 +40,7 @@ test("the row names the writer and carries before/after/delta/stick, gesture:fal
 });
 
 test("render.ts: one helper writes #content.scrollTop, files the row only when the view moved, and no raw write remains", () => {
-  assert.match(RENDER, /import \{ ScrollDiagBudget, classifyScroll, scrollWriteRow \} from "\.\/scroll-write";/);
+  assert.match(RENDER, /import \{ ScrollDiagBudget, classifyScroll, scrollWriteRow, tailChangeRow, tailLabel \} from "\.\/scroll-write";/);
   assert.match(RENDER, /function writeScroll\(content: HTMLElement, top: number, writer: string, stick = false\): void \{\s*\n\s*const before = content\.scrollTop;\s*\n\s*content\.scrollTop = top;\s*\n\s*const after = content\.scrollTop;\s*\n\s*lastScrollWriteAfter = after;\s*\n\s*if \(after !== before\) scrollDiagRow\("scrollwrite", scrollWriteRow\(activeId \|\| "", writer, before, after, stick, content\.scrollHeight, content\.clientHeight\)\);/);
   // the breadcrumb rides the existing clientDiag path, capped, with one capped row at the cap
   assert.match(RENDER, /\{ type: "clientDiag", surface: "chat", what: kind \+ "-capped", data: \{ sid: activeId \|\| "", perMinute: 40 \} \}/);
