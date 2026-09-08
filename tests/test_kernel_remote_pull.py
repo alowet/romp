@@ -37,8 +37,8 @@ class FastPullGate(unittest.TestCase):
 
     def _fp(self, behind, ahead, ood=True):
         saved = (km._remote_out_of_date, km._behind_info)
-        km._remote_out_of_date = lambda r: ood
-        km._behind_info = lambda sha: {"behind": behind, "ahead": ahead, "date": ""}
+        km._remote_out_of_date = lambda r, head=None: ood
+        km._behind_info = lambda sha, head=None: {"behind": behind, "ahead": ahead, "date": ""}
         try:
             return km._is_fast_pull({"host": "TESTHOST", "kernel_sha": REMOTE})
         finally:
@@ -212,8 +212,8 @@ class AutoPullFiring(unittest.TestCase):
         km._auto_push.clear()
         km._auto_push_tried.clear()
         self._saved = (km._remote_out_of_date, km._behind_info, km._local_head, km._local_branch)
-        km._remote_out_of_date = lambda r: True
-        km._behind_info = lambda sha: {"behind": 0, "ahead": 2, "date": ""}   # strictly ahead → pull side
+        km._remote_out_of_date = lambda r, head=None: True
+        km._behind_info = lambda sha, head=None: {"behind": 0, "ahead": 2, "date": ""}   # strictly ahead → pull side
         km._local_head = lambda short=False: (LOCAL[:8] if short else LOCAL)
         km._local_branch = lambda: "main"
         self.calls = []
@@ -267,7 +267,7 @@ class AutoPullFiring(unittest.TestCase):
     def test_a_checked_in_peer_that_is_BEHIND_is_asked_to_update_itself(self):
         # the third direction (the user 2026-07-28): the peer owns the only ssh between the machines, so
         # the fast-forward is driven through the tunnel IT holds instead of offered as an impossible push
-        km._behind_info = lambda sha: {"behind": 2, "ahead": 0, "date": ""}
+        km._behind_info = lambda sha, head=None: {"behind": 2, "ahead": 0, "date": ""}
         self._run({"host": "TESTHOST", "kernel_sha": REMOTE, "trust": "trusted", "checkin_peer": True})
         self.assertEqual(self.calls, [("_auto_ask_peer", "TESTHOST")])
 
@@ -275,7 +275,7 @@ class AutoPullFiring(unittest.TestCase):
         # same bar as the push gate: diverged, or a build this repo has never seen, is not driven at all
         for drift in ({"behind": 2, "ahead": 1, "date": ""}, {"behind": None, "ahead": None, "date": ""}):
             km._auto_push_tried.clear()
-            km._behind_info = lambda sha, d=drift: d
+            km._behind_info = lambda sha, head=None, d=drift: d
             self._run({"host": "TESTHOST", "kernel_sha": REMOTE, "trust": "trusted", "checkin_peer": True})
         self.assertEqual(self.calls, [])
 
@@ -289,7 +289,7 @@ class AutoPullFiring(unittest.TestCase):
         # after a pull the drift clears at once (HEAD moved) but the RUNNING kernel is the old build —
         # the 'pulled … restart romp' trace must outlive the clearing event, until the restart itself
         km._set_auto_push("TESTHOST", "pulled", "pulled 2 commits from TESTHOST — restart romp to run it")
-        km._remote_out_of_date = lambda r: False
+        km._remote_out_of_date = lambda r, head=None: False
         self._run({"host": "TESTHOST", "kernel_sha": REMOTE, "trust": "trusted"})
         st = km._auto_push_state("TESTHOST")
         self.assertEqual((st or {}).get("phase"), "pulled")
