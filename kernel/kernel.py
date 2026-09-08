@@ -30412,9 +30412,10 @@ def _postal_wait_maps():
                 continue
             if str(o.get("id") or "") in ended:
                 # A REFUSED or DESTROYED send is neither an ask nor an answer (review find,
-                # 2026-09-08): the bus writes the sent row BEFORE it publishes and closes a publish
-                # that then failed, or a peer's refusal, or the orphan sweep's destroy, with a
-                # terminal `bounced` row on the same id. The recipient never saw that message, so
+                # 2026-09-08): the bus closes a message it had to give up on — a peer's refusal, the
+                # orphan sweep's destroy, an inbox file it could not read, a write a crash cut short
+                # — with a terminal `bounced` row on the same id (a publish it refuses outright
+                # writes no row at all). The recipient never saw that message, so
                 # counting its row here made the asker wear an open ask (and the debt reminder
                 # count a debt) that no reply could ever close, and let a bounced reply read as
                 # answering the pair. The judge's _postal_ask_maps applies the same rule.

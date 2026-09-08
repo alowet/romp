@@ -357,9 +357,8 @@ class MessageIdsNeverCollide(unittest.TestCase):
                              "the standing message is untouched; the collision was refused, not tiebroken")
             self.assertIn("refusing to replace", str(cm.exception))
             rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines() if l]
-            self.assertEqual([r["ev"] for r in rows], ["sent", "sent", "bounced"],
-                             "the ledger closes on the refused id — no 'sent' left pending forever")
-            self.assertIn("refusing to replace", rows[-1]["why"])
+            self.assertEqual([(r["ev"], r["id"]) for r in rows], [("sent", first)],
+                             "the refusal wrote no row: the id is the standing message's, never the impostor's")
             self.assertEqual([p.name for p in (pm.MAILROOT / self.RCP / "tmp").iterdir()], [],
                              "the temp is removed")
         finally:
@@ -414,21 +413,22 @@ class MessageIdsNeverCollide(unittest.TestCase):
                 self.assertIn("[Errno %d]" % code, fallback[0], "errno %d: the line names the errno" % code)
             for code in (errno.EIO, errno.ENOSPC):
                 os.link, os.rename = raising(code), raising(code)     # a REAL fault: the rename meets it too
-                before = box()
+                before, before_rows = box(), rows()
                 with self.assertRaises(pm.DeliveryNotRecorded):
                     pm.deliver(self.RCP, "web", self.SND, "never lands (%d)" % code)
                 self.assertEqual(box(), before, "errno %d: nothing new in the inbox" % code)
                 self.assertEqual(tmpd(), [], "errno %d: the temp is removed" % code)
-                self.assertEqual([r["ev"] for r in rows()[-2:]], ["sent", "bounced"],
-                                 "errno %d: the ledger closes on the refused id" % code)
-                self.assertTrue(rows()[-1]["why"].startswith(pm.WHY_NOT_PUBLISHED))
+                self.assertEqual(rows(), before_rows, "errno %d: a refused publish records nothing" % code)
+            self.assertEqual(len([m for m in logged if "refused, nothing recorded" in m]), 2,
+                             "each refusal is said on stderr, since no row says it")
             os.rename = saved_rename
             os.link = raising(errno.EEXIST)                          # EEXIST IS the collision: never a fallback
-            before = box()
+            before, before_rows = box(), rows()
             with self.assertRaises(pm.DeliveryNotRecorded) as cm:
                 pm.deliver(self.RCP, "web", self.SND, "a collision at the link")
             self.assertIn("refusing to replace", str(cm.exception))
-            self.assertEqual(box(), before)
+            self.assertEqual((box(), rows()), (before, before_rows), "a collision at the link writes no row either")
+            self.assertEqual(len([m for m in logged if "refused, nothing recorded" in m]), 3)
             # a forced collision under the fallback is refused too, and the first message stands
             os.link = raising(errno.EPERM)
             saved_unique = pm._unique

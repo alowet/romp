@@ -434,10 +434,12 @@ def _tl_append(fname, obj):
         return False
 
 class DeliveryNotRecorded(Exception):
-    """deliver() refused: nothing reached the recipient. Either the sent row could not land (so the
-    mail was never published — the sender still holds the text and retries), or the publish itself
-    failed after the row (a terminal 'bounced' row then closes the ledger on that id). The message
-    text is written for the SENDER's eyes: the /send route answers it as the refusal body."""
+    """deliver() refused: nothing reached the recipient, and NO row names the attempt. Either the
+    publish was refused — the name already stands in the inbox (a collision), or the filesystem said
+    no — so the name was never this message's and nothing is written under it; or the publish landed
+    and the sent row could not, and the mail was taken back out of new/ before anyone read it. The
+    sender still holds the text and retries. The message text is written for the SENDER's eyes: the
+    /send route answers it as the refusal body."""
 
 NOT_RECORDED_TEXT = ("the send was not recorded (the message log could not be written), so it was not "
                      "delivered — nothing is lost; retry")
@@ -445,6 +447,9 @@ NOT_RECORDED_TEXT = ("the send was not recorded (the message log could not be wr
 # The `why` of a terminal `bounced` row that records a REFUSAL — nothing left this machine and no
 # return note exists — as opposed to a peer's refusal, which _bounce_apply returns to the sender as
 # a note. format_receipts phrases the two apart (2026-09-08): a refusal must not promise a note.
+# deliver() itself writes no WHY_NOT_PUBLISHED row: a publish it refuses records nothing (the name
+# was never its own — see deliver). The prefix remains for the start sweep's close of a temp whose
+# sent row stood open (WHY_STOPPED_BEFORE_PUBLISH).
 WHY_NOT_PUBLISHED = "not published: "
 WHY_NOT_PARKED = "not parked: the outbox record could not be written"
 WHY_OUTBOX_UNREADABLE = "outbox record unreadable, moved aside"
@@ -497,8 +502,8 @@ def _publish_new(tmp, dst):
     visible under exactly one name at every instant. A filesystem that refuses hard links falls
     back to an exists-check + rename, said once: that check is not atomic, but a collision there
     needs two writers minting the same 128-bit name in the same instant, so the protection is the
-    same in practice. Raises OSError (FileExistsError on a collision); the caller accounts and
-    refuses.
+    same in practice. Raises OSError (FileExistsError on a collision); the caller refuses and
+    records nothing — the name was never this delivery's (see deliver).
 
     EVERY link() refusal but a collision takes the fallback (review find, 2026-09-08). The first
     cut named six errnos as "no hard links here" (EPERM, EOPNOTSUPP, ENOTSUP, ENOSYS, EMLINK,
@@ -615,34 +620,56 @@ def deliver(to_id, from_name, from_id, body, park=False, kind="", from_host="",
         # receiving courier reads it off this row (_postal_row) as walk-proved provenance
         ev["userAsk"] = {"text": str(user_ask["text"])[:1200], "sid": str(user_ask.get("sid") or ""),
                          "host": str(user_ask.get("host") or "")}
-    # The row lands BEFORE the mail is published (2026-09-08). The row is the ONE record the
-    # sender's receipts, the timeline and the kernel's courier read; before this the publish came
-    # first and the row was best-effort after it, so a failed append left mail in the recipient's
-    # inbox that nothing else knew about. When the row can't land the mail does not go out: the
-    # temp is removed and the caller answers a retryable refusal — the sender still holds the text.
-    if not _tl_append("messages.jsonl", ev):
+    # The PUBLISH is the claim on the name, and the row follows it (2026-09-08). The row is the ONE
+    # record the sender's receipts, the timeline and the kernel's courier read — and a row is a
+    # statement about a NAME. Until link() has granted this delivery the name, the name may be
+    # somebody else's: a row-first order under a collision filed the refused message's `sent` row
+    # and then the refusal's `bounced` row under the STANDING message's id, and every reader of the
+    # ledger saw a delivered message as bounced. link() refuses an existing target atomically, so
+    # the publish is the one act that proves the name is ours; a refused publish therefore records
+    # nothing (the retry lands under a fresh name with its own row). The sender-side rule "row
+    # before park" is not contradicted: that row is the sender's receipt under the sender's OWN mid;
+    # this one is the recipient's record of a message that landed. What keeps new/ honest — before
+    # 2026-09-08 a best-effort append after the publish left mail in the inbox that nothing else
+    # knew about — is the take-back below: a row that cannot land pulls the mail back out before
+    # it is read, and the caller answers a retryable refusal while the sender still holds the text.
+    dst = mb / "new" / name
+    try:
+        _publish_new(tmp, dst)
+    except Exception as e:
         try:
             tmp.unlink()
         except OSError:
             pass
-        raise DeliveryNotRecorded(NOT_RECORDED_TEXT)
-    try:
-        _publish_new(tmp, mb / "new" / name)
-    except Exception as e:
-        # The ledger says "sent" and the mail never landed: close the ledger on this id (the
-        # terminal-row rule _sweep_orphans follows), remove the temp, and refuse loudly. A collision
-        # — a standing new/<name> — is the one case named apart: impossible in practice with 128-bit
-        # ids, so if it ever shows up it is evidence of something badly wrong, not a tiebreak.
+        # A collision — a standing new/<name> — is the one case named apart: impossible in practice
+        # with 128-bit ids, so if it ever shows up it is evidence of something badly wrong, not a
+        # tiebreak. Either way the name was never this message's, so nothing is written under it.
         why = ("a message with this id already stands in the recipient's inbox; refusing to replace it"
                if isinstance(e, FileExistsError) else str(e))
-        _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "bounced", "id": name,
-                                      "to_id": to_id, "why": WHY_NOT_PUBLISHED + why})
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+        _log("deliver to %s: %s was not published (%s) — refused, nothing recorded" % (to_id, name, why))
         raise DeliveryNotRecorded("the message could not be placed in the recipient's inbox (%s) — "
                                   "nothing was delivered; retry" % why)
+    if not _tl_append("messages.jsonl", ev):
+        # The mail is out but its row is not: take it back, so nothing stands in new/ that the
+        # ledger does not know, and refuse — the sender still holds the text. The one interleaving
+        # the take-back cannot undo is a reader claiming the file in the instant between the publish
+        # and the row (read_box renames it into cur/): the message IS in the recipient's hands then,
+        # so the truthful answer is the id — said loudly, by name, because the ledger will never
+        # carry this message (the log fault itself was already said by _tl_append).
+        try:
+            dst.unlink()
+        except FileNotFoundError:
+            _log("deliver to %s: %s was read before its row could be written — delivered, and the "
+                 "ledger has no record of it" % (to_id, name))
+            _mark_pending(to_id)
+            return name
+        except OSError as e:
+            _log("deliver to %s: %s stands in the inbox without its row and could not be taken back "
+                 "(%s) — the ledger has no record of it" % (to_id, name, e))
+            _mark_pending(to_id)
+            return name
+        _mark_pending(to_id)        # new/ may be empty again -> reconcile the marker
+        raise DeliveryNotRecorded(NOT_RECORDED_TEXT)
     _mark_pending(to_id)            # new/ is now non-empty -> raise the marker (covers park + live)
     return name   # the message id (maildir filename); joins to the log + status-bar prefix
 
@@ -2466,10 +2493,12 @@ WHY_STOPPED_BEFORE_PARK = "not parked: the mail service stopped before the outbo
 
 def _sweep_unfinished_writes():
     """Bus start: the one event at which no writer of ours is running, so every temp on disk is a
-    write that never finished (review find, 2026-09-08). deliver() writes the sent row and THEN
-    publishes: a crash between the two left the row saying "sent" and the message in <mailbox>/tmp/,
-    where nothing lists it, a phantom the sender's receipt read as pending forever. The relay leg
-    (row, then outbox_put) had the same window, leaving a `<mid>.json.tmp-*` temp and no record;
+    write that never finished (review find, 2026-09-08). A maildir temp is a message that stopped
+    before its publish; deliver() publishes first and writes its row second (the collision fold),
+    so such a temp normally has no row and is simply removed — a row saying "sent" beside one (a
+    bus that wrote row-first) is closed the same way, so no receipt reads pending forever for a
+    message nothing lists. The relay leg (row, then outbox_put) has that window still, leaving a
+    `<mid>.json.tmp-*` temp and no record;
     _atomic_json_put's own failure path removes its temp, so only a crash leaves one. Each temp is
     removed (never published: it may be half-written), its id's ledger is closed with a terminal
     `bounced` row when a sent row stands with no terminal row yet, each is said on stderr, and one

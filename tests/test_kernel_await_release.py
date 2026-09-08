@@ -256,8 +256,9 @@ class MailKeyedByStableId(_AwaitBase):
 
 class RefusedSendsAreNoAsk(_AwaitBase):
     """A sent row whose id a terminal `bounced` row closed never reached the recipient (review find,
-    2026-09-08): the bus writes the sent row BEFORE it publishes and closes a failed publish, a peer's
-    refusal or the orphan sweep's destroy with a `bounced` row on the same id. The readers ignored `ev`,
+    2026-09-08): the bus closes a message it had to give up on — a peer's refusal, the orphan sweep's
+    destroy, an unreadable inbox file, a write a crash cut short — with a `bounced` row on the same id
+    (a publish it refuses outright writes no row at all). The readers ignored `ev`,
     so a refused QUESTION read as an open ask (the asker's card wore it, the debt reminder counted it)
     until the recipient happened to send anything, and a bounced reply read as answering the pair.
     Mutant: the `ended` filter removed."""

@@ -455,6 +455,100 @@ class ExchangeRelaysAreBudgeted(_TwoBusHarness):
         self.assertEqual(len(box), 12, "every message arrived exactly once")
         self.assertEqual(sorted(len(m["body"]) for m in box), [100_000] * 12)
 
+    def test_a_name_collision_on_the_dialed_side_loses_no_message(self):
+        """The drain test above failed once on CI with 11 of 12 (2026-09-08, on a PR that touched no postal
+        code) and passed on either side of it. The dialed side names every message it lands by
+        _unique() — the second, the pid and five random digits, 100k names per second per process — and
+        deliver() published with rename(), which silently REPLACES a standing new/<name>. Two relays
+        landing in one second with the same draw became one file: the first sender's message gone, both
+        relays acked, both ledgers reading delivered (a drain of twelve loses one about once in 1500).
+        Drives that collision exactly, through the mint the drain reads: the second mint returns the
+        first's name. The standing message stays, the collided relay is refused rather than acked
+        (silence on the wire, so the sender's outbox keeps it), and it rides the next exchange under a
+        fresh name."""
+        for i in range(12):
+            pm.outbox_put("srv", {"mid": "big%02d" % i, "to": "beta", "frm": "alpha", "frm_id": "sid-a",
+                                  "body": ("%02d" % i).ljust(100_000, "R"), "kind": "coordinate", "t": i})
+        real, minted = pmb._unique, []
+
+        def collide_once():
+            name = real()
+            minted.append(name)
+            return minted[0] if len(minted) == 2 else name    # the drain's second mint repeats its first
+
+        pmb._unique = collide_once
+        acked = []
+        try:
+            rounds = 0
+            while pm.outbox_list("srv") and rounds < 10:
+                req = pm.build_exchange_request("srv", wait=False)
+                resp, status = pmb.peer_exchange_handle(req)
+                self.assertEqual(status, 200)
+                acked.append(resp["acks"])
+                pm.peer_exchange_apply("srv", req, resp)
+                rounds += 1
+        finally:
+            pmb._unique = real
+        self.assertEqual(pm.outbox_list("srv"), [], "the backlog drained")
+        box = pmb.read_box("sid-b", consume=True)
+        self.assertEqual(len(box), 12, "every message arrived exactly once")
+        self.assertEqual(sorted(m["body"][:2] for m in box), ["%02d" % i for i in range(12)],
+                         "the collided message included, under its own name")
+        self.assertEqual(len({m["id"] for m in box}), 12, "under twelve distinct names")
+        self.assertNotIn("big01", acked[0], "the relay that hit the collision was not acked")
+        self.assertIn("big01", acked[1], "it rode the next exchange and landed")
+        self.assertEqual(len(minted), 13, "one extra mint: the refused relay was named afresh on its next ride")
+
+    def test_a_refused_collision_leaves_the_standing_message_s_ledger_alone(self):
+        """The first cut of the collision refusal wrote the row before the publish, and under this same
+        forced collision it filed the refused message's `sent` row and then the refusal's `bounced` row
+        under the colliding name — the STANDING message's id — so the dialed side's ledger (its timeline,
+        its receipts, every reader that takes a bounced row on a sent id as terminal) showed a delivered
+        message as bounced. The publish is the claim on the name now and the row follows it: the refusal
+        writes nothing, the standing message keeps its one `sent` row, and the retry lands under a fresh
+        id with a row of its own."""
+        for i in range(3):
+            pm.outbox_put("srv", {"mid": "m%d" % i, "to": "beta", "frm": "alpha", "frm_id": "sid-a",
+                                  "body": "note %d" % i, "kind": "coordinate", "t": i})
+        ledger = pmb.TLDIR / "messages.jsonl"
+
+        def rows():
+            return [json.loads(l) for l in ledger.read_text().splitlines() if l] if ledger.exists() else []
+
+        before = len(rows())
+        real, minted = pmb._unique, []
+
+        def collide_once():
+            name = real()
+            minted.append(name)
+            return minted[0] if len(minted) == 2 else name    # the drain's second mint repeats its first
+
+        pmb._unique = collide_once
+        try:
+            rounds = 0
+            while pm.outbox_list("srv") and rounds < 10:
+                self._exchange()
+                rounds += 1
+        finally:
+            pmb._unique = real
+        self.assertEqual(pm.outbox_list("srv"), [], "the backlog drained")
+        self.assertEqual(len(minted), 4, "three lands, plus the refused relay's fresh name on its next ride")
+        standing, fresh = minted[0], minted[-1]
+        self.assertNotEqual(fresh, standing)
+        added = rows()[before:]
+        self.assertEqual([r["ev"] for r in added if r["id"] == standing], ["sent"],
+                         "the standing message has exactly one sent row and no bounced row")
+        self.assertEqual([r["ev"] for r in added], ["sent"] * 3, "three messages, three sent rows, nothing bounced")
+        by_id = {r["id"]: r for r in added}
+        self.assertEqual(len(by_id), 3, "three distinct ids: the refusal wrote no row under the standing id")
+        self.assertEqual(by_id[standing]["originMid"], "m0", "the standing message's one row is its own")
+        self.assertEqual(by_id[fresh]["originMid"], "m1", "the refused relay landed under a fresh id with its own row")
+        # the receipts reader on the dialed side: nothing about the standing message reads bounced
+        recs = {r["id"]: r for r in pmb._sent_receipts("sid-a")}
+        self.assertIsNone(recs[standing]["bounced"], "the standing message's receipt is not bounced")
+        self.assertIsNone(recs[fresh]["bounced"])
+        self.assertEqual(recs[standing]["to"], "beta")
+
     def test_the_budget_holds_through_the_dialed_bus_s_own_body_gate(self):
         # the HTTP layer in the path: the dialed bus's _body reads a request only up to _POST_MAX_BYTES,
         # and a 413 would raise out of _peer_http here
@@ -645,20 +739,45 @@ class LedgerBeforeTheDelete(unittest.TestCase):
         self.assertEqual([p.name for p in tmpd.iterdir()] if tmpd.is_dir() else [], [], "the temp is removed")
         self.assertFalse((pm.MAILPENDING / _RCP).exists(), "no pending marker for mail that never landed")
 
-    def test_the_sent_row_precedes_the_publish(self):
-        # the order pin, executed: a recording _tl_append sees new/ still EMPTY at the moment the
-        # sent row is written
+    def test_the_sent_row_follows_the_publish_it_names(self):
+        # the order pin, executed: a recording _tl_append sees the mail ALREADY in new/ under the very
+        # name the row carries. The publish is the claim on the name (link() refuses a standing one),
+        # so a row is never written for a name that is not this message's — the first cut wrote the
+        # row first and, under a collision, filed it under the standing message's id (the ledger pin
+        # is in ExchangeRelaysAreBudgeted). A row that then fails takes the mail back (pinned above).
         seen = []
         saved = pm._tl_append
         newd = pm.MAILROOT / _RCP / "new"
         pm._tl_append = lambda f, o: seen.append(
-            (o["ev"], sorted(p.name for p in newd.iterdir()) if newd.is_dir() else [])) or True
+            (o["ev"], o["id"], sorted(p.name for p in newd.iterdir()) if newd.is_dir() else [])) or True
         try:
             mid = pm.deliver(_RCP, "web", _SND, "hello")
         finally:
             pm._tl_append = saved
-        self.assertEqual(seen, [("sent", [])], "the row is written before the mail is visible in new/")
-        self.assertTrue((newd / mid).exists(), "…and the mail is published once the row landed")
+        self.assertEqual(seen, [("sent", mid, [mid])],
+                         "the row is written once the mail stands in new/, under the name the row carries")
+
+    def test_a_row_that_fails_after_a_reader_claimed_the_mail_answers_the_id(self):
+        # the one interleaving the take-back cannot undo: read_box moved the file into cur/ in the
+        # instant between the publish and the row. The message is in the recipient's hands, so the
+        # answer is the id, not a refusal that would have the sender deliver it twice — and the gap
+        # in the ledger is said out loud, by name.
+        claimed = []
+        saved = pm._tl_append
+
+        def claim_then_fail(f, o):
+            if o["ev"] == "sent":
+                claimed.extend(m["id"] for m in pm.read_box(_RCP, consume=True))   # the reader beat the row
+            return False
+
+        pm._tl_append = claim_then_fail
+        try:
+            mid = pm.deliver(_RCP, "web", _SND, "hello")
+        finally:
+            pm._tl_append = saved
+        self.assertEqual(claimed, [mid], "the reader took the message")
+        self.assertTrue((pm.MAILROOT / _RCP / "cur" / mid).is_file(), "…and holds it")
+        self.assertTrue(any(mid in m and "no record" in m for m in self.logged), "the missing row is said, by id")
 
     def test_bounce_apply_writes_the_terminal_row_and_the_note_before_the_delete(self):
         pm.outbox_put("srv", {"mid": "b1", "to": "beta", "frm": "alpha", "frm_id": _SND,

@@ -281,8 +281,7 @@ class RefusalReceipts(_Base):
         return r
 
     def test_a_refusal_bounce_promises_no_return_note(self):
-        for why in (ps.WHY_NOT_PUBLISHED + "a message with this id already stands in the recipient's inbox",
-                    ps.WHY_NOT_PARKED, ps.WHY_OUTBOX_UNREADABLE):
+        for why in (ps.WHY_STOPPED_BEFORE_PUBLISH, ps.WHY_NOT_PARKED, ps.WHY_OUTBOX_UNREADABLE):
             txt = ps.format_receipts([self._row(bounced=7, bouncedWhy=why)])
             self.assertIn("refused — " + why, txt)
             self.assertNotIn("returned to you", txt, why)

@@ -196,7 +196,8 @@ class MatrixCloserGate(_Base):
 
     def test_a_refused_question_is_no_open_ask_for_either_reader(self):
         # A sent row a terminal `bounced` row closed never reached the recipient (review find,
-        # 2026-09-08): the bus refused it (its publish failed after the row) or destroyed it unread, so
+        # 2026-09-08): the bus gave up on it (a write a crash cut short, a file it could not read) or
+        # destroyed it unread, so
         # neither reader counts it as an ask, nor as an answer. Mutant: either reader's `ended` filter
         # removed (the agreement test above would still pass with both wrong).
         def km_open(sid):

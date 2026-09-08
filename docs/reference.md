@@ -194,12 +194,14 @@ romp mail remote                 # legacy singleton scheme only (ROMP_POSTAL_PEE
 
 ### When a send is refused
 
-A send whose record cannot be written is refused, never half-done: the bus
-answers `503` with `ok: false` and the reason, nothing is delivered, and the
-sender still holds the text to retry. `check_sent` and `romp mail sent` show
-a message the bus refused, or could not place, as `bounced`, marked `refused`
-with the reason; a peer's refusal that did come back as a note still reads
-`undeliverable, returned to you`. A message file the bus cannot read, in a
+A send whose record cannot be written, or that cannot be placed in the
+recipient's inbox, is refused, never half-done: the bus answers `503` with
+`ok: false` and the reason, nothing is delivered and nothing is recorded, and
+the sender still holds the text to retry. `check_sent` and `romp mail sent`
+show a message the bus had to give up on later (a cross-host record it could
+not write, a file it could not read, a write a restart found unfinished) as
+`bounced`, marked `refused` with the reason; a peer's refusal that did come
+back as a note still reads `undeliverable, returned to you`. A message file the bus cannot read, in a
 recipient's inbox or in the cross-host outbox, is moved aside once (see the
 state files below), its sender's receipt reads refused, and the dashboard's
 error center says so under the `refused` kind.
