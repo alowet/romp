@@ -164,8 +164,9 @@ class RenderHandlesTheTail(unittest.TestCase):
 
     def test_render_handles_a_partial_session_and_streams_older_in(self):
         r = self._render()
-        # upsert records the wire offset → s.events is the tail [headFrom, headTotal)
-        self.assertIn("headFrom: msg.headFrom ?? 0,", r)
+        # upsert records the wire offset → s.events is the tail [headFrom, headTotal); an empty frame for a held
+        # transcript keeps the resident window instead (T249b, frame-merge.ts)
+        self.assertIn("headFrom: kept && prev ? prev.headFrom : (msg.headFrom ?? 0),", r)
         # scroll to the top of the resident tail with older on the server → request the previous chunk
         self.assertIn('vscodeApi?.postMessage({ type: "loadOlder", id: sid, before: s.headFrom });', r)
         self.assertIn("if (moreOnServer && (v.winStart ?? 0) === 0 && st < topH + edgePx) { requestOlder(", r)
