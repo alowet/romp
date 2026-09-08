@@ -162,7 +162,11 @@ test("EVERY ✕ stops our re-injection first; the optimistic one cancels by body
   // cancelResult, and the composer restore reverts (pendingCancelRestores).
   assert.match(RENDER, /if \(qmd\) \{/);
   // …by the bubble's OWN identity when it has one (data-qts) — send-pending.test.ts runs the lookup
-  assert.match(RENDER, /const qts = el\.dataset\.qts !== undefined \? Number\(el\.dataset\.qts\) : undefined;\s*\n\s*if \(dropPending\(list, qmd, qts\)\)/);
+  assert.match(RENDER, /const qts = el\.dataset\.qts !== undefined \? Number\(el\.dataset\.qts\) : undefined;\s*\n\s*const qid = el\.dataset\.qid \|\| undefined;\s*\n\s*if \(dropPending\(list, qmd, qts, qid\)\)/);
+  // …and the kernel's copies carry their own enqueue stamp under `qts` now (T252c): only OUR bubble's stamp is its identity
+  // for the ✕, while a kernel copy's ✕ names the copy's id, so it drops the send that owns it (third review)
+  assert.match(RENDER, /if \(t\.optimistic && t\.qts !== undefined\) x\.dataset\.qts = String\(t\.qts\);/);
+  assert.match(RENDER, /if \(t\.qid\) x\.dataset\.qid = t\.qid;/);
   assert.doesNotMatch(RENDER, /list\.findIndex\(\(p\) => p\.text === qmd\)/, "never 'the first entry with this text' for a bubble that names its entry");
   assert.match(RENDER, /echoShownSig\.delete\(sidQ\);/);
   assert.match(RENDER, /const msg: Record<string, unknown> = \{ type: "cancelQueued", id: sidQ, md: qmd \};/);

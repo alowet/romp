@@ -28175,9 +28175,10 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                 continue
             goal, body, fu, ctx = _split_followup(t)
             m = {"md": body, "idx": i, "cancelable": cancelable, **_queued_romp_flags(t)}   # idx ↔ the backend's _pending position (cancelQueued)
-            if _metas and isinstance(_metas[i], dict) and _metas[i].get("qid"):
-                m["qid"] = _metas[i]["qid"]
-                if isinstance(_metas[i].get("qts"), int):
+            if _metas and isinstance(_metas[i], dict):          # the copy's identity and stamp: each rides on its own
+                if _metas[i].get("qid"):                          # (a tmux copy has a stamp and no id — third review)
+                    m["qid"] = _metas[i]["qid"]
+                if isinstance(_metas[i].get("qts"), int) and not isinstance(_metas[i].get("qts"), bool):
                     m["qts"] = _metas[i]["qts"]
             if fu:
                 m["followUp"] = True

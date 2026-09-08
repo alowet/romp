@@ -2306,6 +2306,24 @@ def _model_downgrade(frm, to):
     return a is not None and b is not None and b < a
 
 
+def _echo_queued_in(a: dict, queued) -> bool:
+    """Whether echo atom `a` is in the surviving queue `queued` — its copies as {"md", "qid"} (a plain text is an
+    id-less copy) — by identity where it has one (T252c, third review): an echo whose uuid a queued copy wears is
+    queued; an echo whose text is queued only under OTHER ids is not (by text alone, the second of two identical
+    sends hid the loss of the first). A copy without an id (an older kernel's mirror, a notice the backend queued)
+    and an echo the reseed re-minted (an older mirror carried no uuid) keep the text reading, so an upgrade
+    mid-flight never re-delivers a copy that is in fact queued."""
+    metas = [m if isinstance(m, dict) else {"md": m, "qid": None} for m in (queued or [])]
+    qs = {m.get("md") for m in metas if isinstance(m.get("md"), str)}
+    ids = {m.get("qid") for m in metas if isinstance(m.get("qid"), str) and m.get("qid")}
+    idless = {m.get("md") for m in metas if isinstance(m.get("md"), str) and not m.get("qid")}
+    if a.get("uuid") in ids:
+        return True
+    if a.get("_echo_reminted") or not ids:
+        return a.get("_echo_text") in qs
+    return a.get("_echo_text") in idless
+
+
 def _enqueue_with_id(s, text: str, uuid_, t):
     """Re-queue `text` on session `s` under the echo's uuid as its id (T252c) — a stand-in session in tests takes
     the text alone."""
@@ -2319,22 +2337,38 @@ def _enqueue_with_id(s, text: str, uuid_, t):
 def queue_meta_from_reg(reg: dict) -> list:
     """The per-copy identities the registry mirror carries for reg['queue'], ALIGNED with it (one entry per text,
     None for a copy without one). reg['queueMeta'] lists {"text", "qid", "qts"} for each identified copy in queue
-    order (_persist_queue); each queue text takes the first unused entry with its text, FIFO. Matching by text
-    rather than by position keeps the alignment through the reg-level edits that know texts only (a boot notice
-    prepended, a re-delivered send appended, the crash-resume nudge), and an older kernel's mirror, which has no
-    queueMeta, restores id-less copies the chat reads by text (second review: a chat that latched a copy's id
+    order (_persist_queue), text alone for an id-less one. The run is aligned as one BLOCK of the queue, wherever
+    the reg-level edits that know texts only (a boot notice prepended, a re-delivered send appended, the
+    crash-resume nudge) have shifted it; only a run no block of the queue matches falls to first-in-first-out by
+    text over the identified entries. An older kernel's mirror, which has no queueMeta, restores id-less copies
+    the chat reads by text (second review: a chat that latched a copy's id
     before the kernel died must find the same id on the restored copy, or fall back to text — never neither)."""
     texts = [t for t in (reg.get("queue") or []) if isinstance(t, str) and t]
-    metas = [m for m in (reg.get("queueMeta") or [])
-             if isinstance(m, dict) and isinstance(m.get("qid"), str) and m["qid"] and isinstance(m.get("text"), str)]
-    used = [False] * len(metas)
+    raw = reg.get("queueMeta")
+    entries = [m for m in raw if isinstance(m, dict) and isinstance(m.get("text"), str)] if isinstance(raw, list) else []
+
+    def ident(m):
+        return {"qid": m["qid"], "qts": m.get("qts")} if isinstance(m.get("qid"), str) and m["qid"] else None
+
+    # the mirror lists EVERY position (text alone for an id-less copy): align the mirrored run as one block of the
+    # queue — the boot paths that edit reg['queue'] by text (a notice prepended, a re-delivered send appended)
+    # shift it whole — so a same-text pair keeps its ids where they were (third review)
+    n = len(entries)
+    if n and len(entries) == len(raw):
+        run = [m["text"] for m in entries]
+        for k in range(0, len(texts) - n + 1):
+            if texts[k:k + n] == run:
+                return [None] * k + [ident(m) for m in entries] + [None] * (len(texts) - k - n)
+    # no block matches (a copy removed by text): first in first out by text over the identified entries
+    idents = [m for m in entries if ident(m)]
+    used = [False] * len(idents)
     out = []
     for t in texts:
         hit = None
-        for i, m in enumerate(metas):
+        for i, m in enumerate(idents):
             if not used[i] and m["text"] == t:
                 used[i] = True
-                hit = {"qid": m["qid"], "qts": m.get("qts")}
+                hit = ident(m)
                 break
         out.append(hit)
     return out
@@ -2820,8 +2854,8 @@ class SdkSession:
         with self._lock:
             snap = list(self._pending)
             metas = list(self._pending_meta)
-        qmeta = [{"text": t, "qid": m["qid"], "qts": m.get("qts")}
-                 for t, m in zip(snap, metas) if isinstance(m, dict) and m.get("qid")]   # identified copies only, in order
+        qmeta = [{"text": t, "qid": m["qid"], "qts": m.get("qts")} if isinstance(m, dict) and m.get("qid") else {"text": t}
+                 for t, m in zip(snap, metas)]        # every position, so the restore aligns the run as a block
         try:
             self.backend._update_reg(self.sid, queue=snap, queueMeta=qmeta)
         except Exception:
@@ -3013,7 +3047,7 @@ class SdkSession:
                 self._q_prepend(stranded, self._unfeed_locked(stranded))   # back at the head under their own ids
             self._persist_queue()                  # the fresh inputs() drains _pending on its first pass
         elif stranded:
-            self.backend._mark_dropped_echoes(self.sid, self.pending(), refeed=False)
+            self.backend._mark_dropped_echoes(self.sid, self.pending_meta() or self.pending(), refeed=False)
         self.backend._poke()
 
     # ---- async internals (run inside the quarantined loop) ----
@@ -3437,7 +3471,7 @@ class SdkSession:
             # The SPAWN half of the dropped-echo marking (boot half: _reseed_echoes): a fresh CLI means
             # whatever held any earlier send is gone. An echo neither in self._pending (delivered to the
             # new CLI) nor landed has no holder left — flag it so the chat says "never delivered".
-            self.backend._mark_dropped_echoes(self.sid, self.pending())
+            self.backend._mark_dropped_echoes(self.sid, self.pending_meta() or self.pending())
             asyncio.run(self._amain())
         except Exception as e:                       # surfaced for debugging; never crash kernel
             # The TRACEBACK too, not just the type and message: a bare "KeyError: <uuid>" names no line,
@@ -7722,11 +7756,14 @@ class SdkBackend:
                 text = e.get("text")
                 if not isinstance(text, str) or not text:
                     continue
-                key = e["uuid"] if isinstance(e.get("uuid"), str) and e["uuid"].startswith("echo:") else "echo:" + uuid.uuid4().hex
+                kept = isinstance(e.get("uuid"), str) and e["uuid"].startswith("echo:")
+                key = e["uuid"] if kept else "echo:" + uuid.uuid4().hex
                 atom = {"type": "user", "uuid": key, "session_id": reg["sid"],
                         "t": int(e.get("t") or 0) or int(time.time()), "parentUuid": None,
                         "author": e.get("author") or "human", "_echo_text": text,
                         "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
+                if not kept:
+                    atom["_echo_reminted"] = True    # an older mirror carried no uuid: this echo is judged by text
                 if e.get("rompAuto"):
                     atom["rompAuto"] = True
                 if e.get("dropped"):
@@ -7739,7 +7776,9 @@ class SdkBackend:
                     atom["_landed"] = True           # already adjudicated landed: never re-scanned, never flagged
                 self._stash_live(reg["sid"], key, atom)
             if self._live.get(reg["sid"]):
-                self._mark_dropped_echoes(reg["sid"], reg.get("queue") or [])
+                _texts = [t for t in (reg.get("queue") or []) if isinstance(t, str) and t]
+                self._mark_dropped_echoes(reg["sid"], [{"md": t, "qid": (m or {}).get("qid")}
+                                                       for t, m in zip(_texts, queue_meta_from_reg(reg))])
 
     def _mark_dropped_echoes(self, sid: str, queued_texts, refeed: bool = True) -> None:
         """A fresh CLI is spawning for this sid, or the kernel just booted: whatever process held any
@@ -7761,7 +7800,14 @@ class SdkBackend:
         exactly the duplicate that branch refuses by design. The loss still surfaces in full (the dropped
         flag); only the queue re-add is withheld. Boot and dead-spawn callers keep the default: no client
         survived there to be writing anything."""
-        qs = {q for q in queued_texts if isinstance(q, str)}
+        # The surviving queue, by identity where it has one (T252c, third review): `queued_texts` is the queue's
+        # copies as {"md", "qid"} (a caller with texts alone gives id-less copies). An echo whose uuid a queued
+        # copy wears is queued; an echo whose text is queued only under OTHER ids is not — by text alone, the
+        # second of two identical sends hid the loss of the first, which was neither re-delivered nor flagged.
+        # A copy without an id (an older kernel's mirror, a notice the backend queued) and an echo the reseed
+        # re-minted (an older mirror carried no uuid) keep the text reading, so an upgrade mid-flight never
+        # re-delivers a copy that is in fact queued.
+        _queued = lambda a: _echo_queued_in(a, queued_texts)
         # The selection is under the live-tail lock; everything after it (the transcript scan, the
         # queue re-add, the reg write) is not. This runs on the SESSION thread at spawn and at every
         # reconnect, outside the connect's try — while the kernel thread's send() stashes an echo into
@@ -7773,7 +7819,7 @@ class SdkBackend:
                 return
             newly = [a for a in list(d.values())
                      if a.get("_echo_text") and not a.get("command") and not a.get("dropped")
-                     and not a.get("_landed") and a["_echo_text"] not in qs]
+                     and not a.get("_landed") and not _queued(a)]
         if not newly:
             return
         # RE-DELIVER, don't just flag (the user 2026-08-23, their strongest point in the restart
@@ -7836,7 +7882,10 @@ class SdkBackend:
                     reg = read_reg(self.state_dir, sid)
                     if reg is not None:
                         have = [t for t in (reg.get("queue") or []) if isinstance(t, str) and t]
-                        adds = [a for a in redeliver if a["_echo_text"] not in have]
+                        # already queued, by the same identity reading as the selection above (by text alone, the
+                        # lost first of two identical sends was never re-added behind its queued twin)
+                        _have = [{"md": t, "qid": (m or {}).get("qid")} for t, m in zip(have, queue_meta_from_reg(reg))]
+                        adds = [a for a in redeliver if not _echo_queued_in(a, _have)]
                         add = [a["_echo_text"] for a in adds]
                         if add:
                             reg["queue"] = have + add      # behind the surviving queue: original send order

@@ -873,8 +873,8 @@ test("✕ on one of two identical bubbles removes that bubble's entry, never the
   assert.deepEqual(list2, []);
   // render.ts: the identity rides the bubble's ✕, and the handler removes by it
   assert.match(RENDER, /const mk = \(p: PendingSend\) => \(\{ md: p\.text, optimistic: true, cancelable: true, imgPaths: p\.imgPaths, lost: p\.lost, qts: p\.ts \}\);/);
-  assert.match(RENDER, /if \(t\.qts !== undefined\) x\.dataset\.qts = String\(t\.qts\);/);
-  assert.match(RENDER, /const qts = el\.dataset\.qts !== undefined \? Number\(el\.dataset\.qts\) : undefined;\s*\n\s*if \(dropPending\(list, qmd, qts\)\) \{ if \(list\.length\) pendingSent\.set\(sidQ, list\); else pendingSent\.delete\(sidQ\); \}/);
+  assert.match(RENDER, /if \(t\.optimistic && t\.qts !== undefined\) x\.dataset\.qts = String\(t\.qts\);/);
+  assert.match(RENDER, /const qts = el\.dataset\.qts !== undefined \? Number\(el\.dataset\.qts\) : undefined;\s*\n\s*const qid = el\.dataset\.qid \|\| undefined;\s*\n\s*if \(dropPending\(list, qmd, qts, qid\)\) \{ if \(list\.length\) pendingSent\.set\(sidQ, list\); else pendingSent\.delete\(sidQ\); \}/);
   assert.doesNotMatch(RENDER, /list\.findIndex\(\(p\) => p\.text === qmd\)/);
 });
 
@@ -1101,4 +1101,58 @@ test("an id the frame still shows queued or echoed refuses a same-text landing t
   assert.deepEqual([c.qid, d.qid], ["echo:c1", "echo:d1"]);
   r = reconcilePending([...tail, { kind: "user", md: "go", uuid: "echo:d1" }], [c, d]);
   assert.deepEqual([r.keep, r.inject], [[c, d], [c]], "the echo is the second send's cover; the first, unshown, is drawn by us");
+});
+
+test("a send covered by its identified copy holds that copy's position: a later same-text send never latches the same id, nor takes the copy (T252c third review)", () => {
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
+  const [p1, p2] = press(tail, "ok", "ok");
+  // the kernel shows the first copy alone: p1 takes it and latches its id; p2 has nothing yet
+  let r = reconcilePending([...tail, { kind: "queued", texts: [{ md: "ok", qid: "echo:q1", qts: 1 }] }], [p1, p2]);
+  assert.deepEqual([p1.qid, p2.qid, r.unqueue, r.inject], ["echo:q1", undefined, [p1], [p1, p2]]);
+  // both copies show: p1 is covered by id, and p2 takes the OTHER copy and its id
+  r = reconcilePending([...tail, { kind: "queued", texts: [{ md: "ok", qid: "echo:q1", qts: 1 }, { md: "ok", qid: "echo:q2", qts: 2 }] }], [p1, p2]);
+  assert.deepEqual([p1.qid, p2.qid], ["echo:q1", "echo:q2"], "two sends, two identities");
+  assert.deepEqual(r.unqueue, [p1, p2]);
+  // the first copy's landing retires p1 alone; p2 is still the queued second copy
+  r = reconcilePending([...tail, { kind: "user", md: "ok", uuid: "u1", qid: "echo:q1" }, { kind: "queued", texts: [{ md: "ok", qid: "echo:q2", qts: 2 }] }], [p1, p2]);
+  assert.deepEqual([r.landed.map((l) => l.p), r.keep, r.unqueue], [[p1], [p2], [p2]]);
+  // a send read by text never takes a queued copy another send owns by id, nor a landing wearing another send's id
+  const [c, d] = press(tail, "go", "go");
+  reconcilePending([...tail, { kind: "queued", texts: [{ md: "go", qid: "echo:d1", qts: 1 }] }], [d]);   // d alone saw its copy first
+  assert.equal(d.qid, "echo:d1");
+  r = reconcilePending([...tail, { kind: "queued", texts: [{ md: "go", qid: "echo:d1", qts: 1 }] }], [c, d]);
+  assert.deepEqual([c.qid, r.unqueue, r.inject], [undefined, [d], [c, d]], "the one copy is d's: c is drawn uncovered");
+  r = reconcilePending([...tail, { kind: "user", md: "go", uuid: "uD", qid: "echo:d1" }], [c, d]);
+  assert.deepEqual([r.landed.map((l) => l.p), r.keep], [[d], [c]], "the landing wearing d's id is d's, whatever the list order");
+});
+
+test("floors follow an earlier send's identity into a record of several sends, and an id-less press-time copy keeps its text floor beside an identified one (T252c third review)", () => {
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
+  const [x, y] = press(tail, "first", "second");
+  reconcilePending([...tail, { kind: "user", md: "first", uuid: "echo:x1" }], [x, y]);
+  assert.deepEqual(y.floors?.map((f) => f.qid), ["echo:x1"]);
+  dropPending([x, y], "first", x.ts);
+  // X's block lands inside a two-send record, behind an unrelated same-text message
+  const frame: TailEvent[] = [...tail, { kind: "user", md: "first", uuid: "uOther" }, { kind: "tool", uuid: "t1" },
+                              { kind: "user", md: "first and more", uuid: "uXZ", blocks: ["first", "and more"], qids: ["echo:x1", "echo:z1"] }, { kind: "tool", uuid: "t2" }];
+  assert.deepEqual(injectionGroups(frame, reconcilePending(frame, [y]).inject), [{ idx: 4, sends: [y] }], "below the record carrying X's id");
+  // a press against a group holding an identified F and an id-less F: the identified one lands by id while the other
+  // is still queued — the bubble stays below the group (the id-less copy's text floor), never above it
+  const queued: TailEvent[] = [...tail, { kind: "queued", texts: [{ md: "F", qid: "f1", qts: 1 }, { md: "F" }] }];
+  const mine = newPending("mine", undefined, T0 + 9);
+  reconcilePending(queued, [mine]);
+  const after: TailEvent[] = [...tail, { kind: "user", md: "F", uuid: "uF1", qid: "f1" }, { kind: "tool", uuid: "t1" }, { kind: "queued", texts: [{ md: "F" }] }];
+  assert.deepEqual(injectionGroups(after, reconcilePending(after, [mine]).inject), [{ idx: 4, sends: [mine] }], "below the group while the id-less press-time copy is still queued");
+});
+
+test("the ✕ on the kernel's copy of an identified send drops THAT send's entry, by id (T252c third review)", () => {
+  const tail: TailEvent[] = [{ kind: "assistant", md: "…", uuid: "a1" }];
+  const [p1, p2, p3] = press(tail, "ok", "ok", "ok");
+  reconcilePending([...tail, { kind: "queued", texts: [{ md: "ok", qid: "echo:q1", qts: 1 }, { md: "ok", qid: "echo:q2", qts: 2 }] }], [p1, p2, p3]);
+  assert.deepEqual([p1.qid, p2.qid, p3.qid], ["echo:q1", "echo:q2", undefined]);
+  const list = [p1, p2, p3];
+  assert.equal(dropPending(list, "ok", undefined, "echo:q2"), p2, "the second copy's ✕ removes the second send, not the first with the text");
+  assert.equal(dropPending(list, "ok", undefined, "echo:zz"), p3, "an id no entry latched falls to the first entry still WITHOUT an id — never one that owns another");
+  assert.equal(dropPending(list, "ok", undefined, "echo:zz"), undefined, "…and to nothing once every entry owns its id");
+  assert.deepEqual(list, [p1]);
 });

@@ -395,13 +395,17 @@ export type Reconciled = {
  *   - the k-th kernel copy of the text after the anchor — an echo atom no earlier entry claimed, or a
  *     queued copy beyond the entry's press-time count — covers the k-th pending send with that text: it
  *     hides that send's bubble for this push and proves the kernel received THAT send (`received`). A
- *     claimed echo joins later same-text entries' `seen` for good; queued copies carry no identity, so
- *     they are handed out by position within a push (the copies an entry's press listed are its
- *     background). One echo used to mark every same-text entry received and clear every "not confirmed"
- *     (2026-09-06 review, round 3): with two identical sends in flight and one of them lost, the lost
- *     one read "sending…" for good, and nothing could ever mark it.
- *  Identical texts carry no identity of their own, so WHICH send a copy belongs to is attributed by
- *  order, exactly as landings are; the COUNT of confirmed sends is what the kernel's records support.
+ *     claimed echo joins later same-text entries' `seen` for good; a queued copy without an id is handed
+ *     out by position within a push (the copies an entry's press listed are its background). One echo
+ *     used to mark every same-text entry received and clear every "not confirmed" (2026-09-06 review,
+ *     round 3): with two identical sends in flight and one of them lost, the lost one read "sending…"
+ *     for good, and nothing could ever mark it.
+ *  Identity first (T252c): the kernel gives each copy an id — the queued copy's `qid`, the echo's uuid, the
+ *  landed atom's `qid`/`qids` — and a send latches the id of the first copy attributed to it; from then on
+ *  landing, cover and loss are decided by that id wherever the frame shows it. Text and order remain the
+ *  reading for copies the kernel gave no id (an older kernel, the tmux route, a notice it queued itself)
+ *  and for a push in which the frame carries a latched id nowhere; the COUNT of confirmed sends is then
+ *  what the kernel's records support.
  *  When the kernel hides a fed send's echo behind a same-text queued copy (its chat dedups by text), a
  *  received send can read "not confirmed" after a drop until a copy of its own shows; that clears on the
  *  next kernel copy, and the error is toward "not confirmed", never toward a false "sending…". */
@@ -435,8 +439,20 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
   for (const p of list) if (!p.at) p.at = stampBase(events, p, p.late ? lateOwn.get(p.text) || 1 : 0);
   const r: Reconciled = { keep: [], inject: [], unqueue: [], landed: [], lost: [] };
   const claimed = new Map<string, number>();           // "index\0text" → copies of that text in that landing taken by earlier entries THIS push
-  const owned = new Set<string>();                     // the identities pending sends have latched: an echo wearing one is that send's, never a text match
+  const owned = new Set<string>();                     // the identities pending sends have latched: an echo, a queued copy or a landing wearing one is that send's, never a text match
   for (const p of list) if (p.qid) owned.add(p.qid);
+  // a landing read by text (this send's id is nowhere in the frame): a record wearing another pending send's id is that
+  // send's, and in a record of several sends the same-text blocks wearing another send's id are not this one's (third review)
+  const landedForText = (e: TailEvent, pv: PendingSend, self?: string): number => {
+    if (e.qid && owned.has(e.qid) && e.qid !== self) return 0;
+    let n = landedCopies(e, pv);
+    if (n && Array.isArray(e.qids) && Array.isArray(e.blocks))
+      for (let k = 0; k < e.qids.length; k++) {
+        const q = e.qids[k], b = e.blocks[k];
+        if (q && owned.has(q) && q !== self && typeof b === "string" && sameText(b, pv.text)) n--;
+      }
+    return Math.max(0, n);
+  };
   const takenCopies = new Map<string, Set<number>>();  // text → queued-copy positions taken by an earlier entry THIS push
   // an earlier entry's covering echo / landed atom is a FLOOR for every entry registered after it (T252b),
   // recorded with its text and its ordinal among same-text user events after THAT entry's anchor, so the
@@ -457,7 +473,8 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
   for (const p of list) {
     const at = p.at!;
     const from = scanFrom(events, at);
-    let landedIdx = -1, lostIdx = -1, echoIdx = -1, copies = 0, idCopy = -1;
+    let landedIdx = -1, lostIdx = -1, echoIdx = -1, idCopy = -1;
+    const copyIds: (string | undefined)[] = [];   // the group's same-text copies in order, each with its id when the kernel gave one
     // identity decides where the frame shows it (T252c): the atom carrying our id is our landing, whatever the
     // text arithmetic says (an identical send retired on the same record this push claimed the text once);
     // while a queued copy or an echo wears it, no landing is ours; and an id the frame carries NOWHERE leaves
@@ -468,7 +485,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
     else for (let i = from; i < events.length; i++) {
       const e = events[i];
       if (e.kind === "queued") {
-        copies += queuedCopies(e, p);
+        for (const t of e.texts || []) if (typeof t.md === "string" && sameText(t.md, p.text)) copyIds.push(t.qid);
         // the kernel's copy of THIS send, by id (T252c): the cover, wherever the copy sits in the group
         if (p.qid && (e.texts || []).some((t) => t.qid === p.qid)) idCopy = i;
         continue;
@@ -480,7 +497,7 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
       const spoken = e.uuid ? spokenFor(at, e.uuid) : 0;
       // a send that landed needs no cover and no verdict: scanning on would claim a later echo (another send's
       // cover) as its own, and mark it spoken for that send (second review)
-      if (loc.where === "none" && landedIdx < 0 && landedCopies(e, pv) > spoken + (claimed.get(i + "\0" + p.text) || 0)) { landedIdx = i; break; }
+      if (loc.where === "none" && landedIdx < 0 && landedForText(e, pv, p.qid) > spoken + (claimed.get(i + "\0" + p.text) || 0)) { landedIdx = i; break; }
       if (lostIdx < 0 && lostCopies(e, pv) > spoken) { lostIdx = i; continue; }
       if (echoIdx < 0 && provisionalCopies(e, pv) > spoken) echoIdx = i;   // the first echo no earlier entry claimed (`seen`)
     }
@@ -498,21 +515,22 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
       floorFor(p, echoIdx);
     } else if (p.qid && idCopy >= 0) {
       covered = true; byQueued = true;              // our identified copy is in the queue: exact, whatever its position
-    } else if (!pv.qid && copies > at.queued) {
+      const k = copyIds.indexOf(p.qid);             // …and that position is spoken for on the text path this push: a later
+      if (k >= 0) {                                 // same-text send never takes it, nor its id (third review)
+        const taken = takenCopies.get(p.text) || new Set<number>();
+        taken.add(k); takenCopies.set(p.text, taken);
+      }
+    } else if (!pv.qid && copyIds.length > at.queued) {
       const taken = takenCopies.get(p.text) || new Set<number>();
-      for (let k = at.queued; k < copies; k++) if (!taken.has(k)) { taken.add(k); covered = true; byQueued = true; break; }
-      takenCopies.set(p.text, taken);
-      if (covered) {                                // latch the identity of the copy just attributed, when the kernel gave it one
-        let seen = 0;
-        outer: for (let i = from; i < events.length; i++) {
-          const e = events[i];
-          if (e.kind !== "queued") continue;
-          for (const t of e.texts || []) {
-            if (typeof t.md !== "string" || !sameText(t.md, p.text)) continue;
-            if (seen === [...taken].sort((a, b) => a - b).pop()) { if (t.qid && !p.qid) p.qid = t.qid; break outer; }
-            seen++;
-          }
-        }
+      let k = -1;
+      for (let j = at.queued; j < copyIds.length; j++) {
+        const id = copyIds[j];
+        if (taken.has(j) || (id && owned.has(id) && id !== p.qid)) continue;   // taken this push, or another send's by id
+        k = j; break;
+      }
+      if (k >= 0) {
+        taken.add(k); takenCopies.set(p.text, taken); covered = true; byQueued = true;
+        if (copyIds[k] && !p.qid) p.qid = copyIds[k];   // latch the identity of the copy just attributed, when the kernel gave it one
       }
     }
     if (covered) p.received = true;             // the kernel holds this send: proven once, latched
@@ -551,8 +569,13 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
  *  bubble back and the other was gone without a gesture (2026-09-06 review, round 3). Returns the removed
  *  entry; undefined when none matched — a bubble whose entry a push already retired removes nothing,
  *  never a neighbour with the same text. */
-export function dropPending(list: PendingSend[], text: string, ts?: number): PendingSend | undefined {
-  const i = ts !== undefined ? list.findIndex((p) => p.ts === ts && p.text === text) : list.findIndex((p) => p.text === text);
+export function dropPending(list: PendingSend[], text: string, ts?: number, qid?: string): PendingSend | undefined {
+  let i = -1;
+  if (ts !== undefined) i = list.findIndex((p) => p.ts === ts && p.text === text);
+  else if (qid) {   // the kernel's copy names its id (T252c): the send that owns it, else the first with the text that owns NO id yet
+    i = list.findIndex((p) => p.qid === qid);
+    if (i < 0) i = list.findIndex((p) => p.text === text && !p.qid);
+  } else i = list.findIndex((p) => p.text === text);
   return i >= 0 ? list.splice(i, 1)[0] : undefined;
 }
 
@@ -628,16 +651,19 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
   // an earlier pending send's echo or landed atom: below it, whatever its text — by uuid, else by its text's ordinal
   for (const f of p.floors || []) {
     let found = -1;
-    if (f.qid) for (let j = events.length - 1; j >= base; j--) if (events[j].qid === f.qid || events[j].uuid === f.qid) { found = j + 1; break; }   // by identity (T252c)
+    if (f.qid) for (let j = events.length - 1; j >= base; j--) {   // by identity (T252c): the atom carrying it, alone or as one block of several
+      const e = events[j];
+      if (e.qid === f.qid || e.uuid === f.qid || (Array.isArray(e.qids) && e.qids.includes(f.qid))) { found = j + 1; break; }
+    }
     if (found < 0) for (let j = events.length - 1; j >= base; j--) if (events[j].uuid === f.uuid) { found = j + 1; break; }
     if (found < 0 && f.text !== undefined && f.ord > 0) { const k = kthCarrier(f.text, f.ord); if (k.idx >= 0) found = k.idx + 1; }
     if (found > idx) idx = found;
   }
   // the identified copies the kernel's queue held at the press (T252c): a copy is still queued while the group shows
   // its id, and has landed when a user event carries it — exact, no text, no count
-  // the keys whose identified copies RESOLVED by id this frame skip the text path below: the text path is the
-  // fallback for a copy whose landing lost its id (a kernel restart between feed and landing) or an older kernel
-  const resolvedKeys = new Set<string>();
+  // the copies that RESOLVED by id this frame leave the text path below to the rest: the text path is the fallback
+  // for an id-less copy beside them (a mixed group) or one whose landing lost its id (an older kernel's restart)
+  const resolvedCopies = new Map<string, number>();   // key → press-time copies of it the identity path placed
   if (at.queuedForeignIds && at.queuedForeignIds.length) {
     let groupIdx = -1;
     for (let j = events.length - 1; j >= base; j--) if (events[j].kind === "queued") { groupIdx = j; break; }
@@ -652,7 +678,7 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
         if (c) { floor = groupIdx + 1; text = c.md; }
       }
       if (floor > idx) idx = floor;
-      if (floor >= 0 && text !== undefined) resolvedKeys.add(foreignKey(text));
+      if (floor >= 0 && text !== undefined) { const k = foreignKey(text); resolvedCopies.set(k, (resolvedCopies.get(k) || 0) + 1); }
     }
   }
   // the texts the kernel's queue held at the press, COUNTED per text: the press-time copies are the first k
@@ -663,9 +689,10 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
     for (const f of at.queuedForeign) { const k = foreignKey(f); const c = counts.get(k); if (c) c.n++; else counts.set(k, { text: f, n: 1 }); }
     let groupIdx = -1;
     for (let j = events.length - 1; j >= base; j--) if (events[j].kind === "queued") { groupIdx = j; break; }
-    for (const { text, n: copies } of counts.values()) {
+    for (const { text, n: all } of counts.values()) {
       const key = foreignKey(text);
-      if (resolvedKeys.has(key)) continue;          // the identity path placed this key exactly
+      const copies = all - (resolvedCopies.get(key) || 0);   // the copies the identity path did not place: id-less ones, or one whose landing lost its id
+      if (copies <= 0) continue;
       const residents = (at.queuedResident ||= {})[key] ||= [];
       // The kernel's queued copies carry no identity, so which landing is the press-time copy's is read off the
       // GROUP (fourth review): while it still shows a copy of the key, the press-time copy has not landed, so every

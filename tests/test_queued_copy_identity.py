@@ -318,6 +318,16 @@ class TheChatCarriesTheIds(unittest.TestCase):
         q = [e for e in m["events"] if e.get("kind") == "queued"]
         self.assertEqual([(x["md"], x.get("qid")) for x in q[0]["texts"]], [("A", None), ("B", None)])
 
+    def test_a_stamp_without_an_id_rides_the_queued_copy_too(self):
+        # the tmux route's copies carry an enqueue stamp and no id (TheTmuxQueueCarriesStamps): the group ships the
+        # stamp on its own — it rode only beside an id (third review)
+        self.w.write(RUNNING)
+        self.w.s.enqueue("stamped only")
+        self.w.be.pending_queued_meta = lambda sid: [{"md": "stamped only", "qid": None, "qts": 1_700_000_000_000}]
+        m = self.w.build()
+        q = [e for e in m["events"] if e.get("kind") == "queued"]
+        self.assertEqual([(t["md"], t.get("qid"), t.get("qts")) for t in q[0]["texts"]], [("stamped only", None, 1_700_000_000_000)])
+
     def test_a_parked_copy_carries_no_id_until_it_reaches_the_backend(self):
         # the park's op is the three-field record the on-disk mirror and its readers pin: no identity rides it; the
         # copy is identified where it enters the backend's queue (send()), and the chat reads a parked copy by text
@@ -409,6 +419,30 @@ class IdentitySurvivesTheKernelsDeath(unittest.TestCase):
                          "back in the queue under the echo's own uuid")
         self.assertEqual([(a["uuid"], bool(a.get("dropped"))) for a in be2.live_atoms(SID) if a.get("_echo_text")], [(qid, False)])
 
+    def test_a_re_delivered_copy_joins_a_surviving_identified_queue_with_both_ids_intact(self):
+        self.assertTrue(self.w.be.send(SID, "go on"))
+        self.assertTrue(self.w.be.send(SID, "keep this"))
+        [qid_go, qid_keep] = [m["qid"] for m in self.w.be.pending_queued_meta(SID)]
+        with self.w.s._lock:
+            self.w.s._pop_for_feed_locked()           # the CLI took the first…
+        self.w.s._persist_queue()                     # …so the mirror holds the second, and the first's unlanded echo
+        be2, s2 = self._restart()
+        self.assertEqual([(m["md"], m["qid"]) for m in be2.pending_queued_meta(SID)], [("keep this", qid_keep), ("go on", qid_go)],
+                         "the survivor first, the re-delivered copy behind it, each under its own id (third review)")
+
+    def test_the_lost_first_of_two_identical_sends_is_seen_lost_beside_the_queued_second(self):
+        self.assertTrue(self.w.be.send(SID, "ok"))
+        self.assertTrue(self.w.be.send(SID, "ok"))
+        [qa, qb] = [m["qid"] for m in self.w.be.pending_queued_meta(SID)]
+        with self.w.s._lock:
+            self.w.s._pop_for_feed_locked()           # the CLI took the first copy…
+        self.w.s._persist_queue()                     # …the mirror holds the second, and both echoes
+        be2, s2 = self._restart()                     # the first died with the CLI; by TEXT it looked queued (third review)
+        self.assertEqual([(m["md"], m["qid"]) for m in be2.pending_queued_meta(SID)], [("ok", qb), ("ok", qa)],
+                         "the survivor, then the lost copy re-delivered under its own id")
+        self.assertEqual(sorted((a["uuid"], bool(a.get("dropped"))) for a in be2.live_atoms(SID) if a.get("_echo_text")),
+                         sorted([(qa, False), (qb, False)]))
+
     def test_a_dead_spawns_re_delivery_into_a_live_session_carries_the_id_and_clears_the_stale_ledger_entry(self):
         self.assertTrue(self.w.be.send(SID, "go on"))
         [qid] = [m["qid"] for m in self.w.be.pending_queued_meta(SID)]
@@ -431,6 +465,25 @@ class IdentitySurvivesTheKernelsDeath(unittest.TestCase):
         self.assertEqual([(m["md"], m["qid"]) for m in s.pending_meta()], [("go on", qid), ("then this", later)],
                          "the fed copy is back at the head under its own id")
         self.assertEqual(s._fed_meta, [], "…and out of the fed ledger")
+
+
+class TheQueueMirrorAlignsByPosition(unittest.TestCase):
+    """The mirror lists every position (text alone for an id-less copy), so a restore aligns the mirrored run as one
+    block of the queue: the boot paths that edit reg['queue'] by text — a notice prepended, a re-delivered send
+    appended — shift it whole. Only when no block matches (a copy removed by text) does it fall to first-in-first-out
+    by text over the identified entries, and an older mirror restores nothing (third review)."""
+
+    def test_the_mirrored_run_aligns_as_a_block_after_text_only_edits_else_by_text(self):
+        meta = [{"text": "go"}, {"text": "go", "qid": "echo:b", "qts": 5}]
+        self.assertEqual(sb.queue_meta_from_reg({"queue": ["go", "go"], "queueMeta": meta}), [None, {"qid": "echo:b", "qts": 5}])
+        self.assertEqual(sb.queue_meta_from_reg({"queue": ["a notice", "go", "go", "later"],
+                                                 "queueMeta": meta + [{"text": "later", "qid": "echo:c", "qts": None}]}),
+                         [None, None, {"qid": "echo:b", "qts": 5}, {"qid": "echo:c", "qts": None}],
+                         "prepended and appended around the block: the id stays on the SECOND go")
+        self.assertEqual(sb.queue_meta_from_reg({"queue": ["go"], "queueMeta": meta}), [{"qid": "echo:b", "qts": 5}],
+                         "no block matches: the identified entry goes to the first copy of its text")
+        self.assertEqual(sb.queue_meta_from_reg({"queue": ["go"]}), [None], "an older mirror")
+        self.assertEqual(sb.queue_meta_from_reg({"queue": ["go"], "queueMeta": "junk"}), [None])
 
 
 if __name__ == "__main__":
