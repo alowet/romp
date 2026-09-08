@@ -229,6 +229,43 @@ class ReturnedSendClosesTheWait(unittest.TestCase):
         self.assertEqual(km._wait_for_graph(0, {X, Y}), {})
         self.assertEqual(km._postal_returned(), {}, "no reply-requiring send came back → no return clock")
 
+    def test_a_bounced_reply_moves_neither_the_answer_nor_the_watermark(self):
+        # The reconciliation with #1071 (review, 2026-09-08): the skip sits ABOVE the last_any update in
+        # both readers, so a reply that came back is not only no answer (#1071's
+        # test_a_bounced_reply_answers_nothing) but leaves the pair's last-activity watermark exactly
+        # where it was. This PR's earlier placement updated last_any first and skipped after, so the
+        # bounced reply still moved the clock every reader keys on. The pin: the log WITH the returned
+        # reply and its bounce reads, on every map and every reader, exactly as the log WITHOUT them.
+        def reading():
+            last_any, last_ask, last_await = km._postal_wait_maps()
+            jd._PEER_ASK_CACHE[:] = [None, ({}, {}, {})]
+            j_any, j_ask, _alias = jd._postal_ask_maps()
+            return (dict(last_any), dict(last_ask), dict(last_await), km._wait_for_graph(0, {X, Y}),
+                    km._peer_answered(X), dict(j_any), dict(j_ask), jd._open_ask_peers(X))
+        self.addCleanup(lambda: jd._PEER_ASK_CACHE.__setitem__(slice(None), [None, ({}, {}, {})]))
+        fyi = {"ev": "sent", "id": "f0", "from_id": Y, "to_id": X, "t": 50, "kind": "coordinate", "body": "api is up"}
+        reply = {"ev": "sent", "id": "r1", "from_id": Y, "to_id": X, "t": 200, "kind": "coordinate", "body": "8080"}
+        back = {"ev": "bounced", "id": "r1", "t": 201, "to_id": X,
+                "why": "not published: the mail service stopped before the message reached the inbox"}
+        # still waiting: the ask stands and the reply never arrived, so the watermark is still the fyi
+        self._log([fyi, self._ask(1, 100)])
+        before = reading()
+        self.assertEqual(before[0].get((Y, X)), 50, "the watermark before the bounce is the fyi")
+        self.assertEqual(before[3].get(X, {}).get("peerSid"), Y, "X waits on Y")
+        self.assertEqual(before[7], [Y], "the judge's gate sees the open ask")
+        self._log([fyi, self._ask(1, 100), reply, back])
+        self.assertEqual(reading(), before, "a bounced reply moves nothing: not the answer, not last_any")
+        # not waiting: a reply that landed, then a later one that came back; the clock stays at the landed one
+        landed = {"ev": "sent", "id": "r0", "from_id": Y, "to_id": X, "t": 150, "kind": "coordinate", "body": "8080"}
+        self._log([self._ask(1, 100), landed])
+        before = reading()
+        self.assertEqual(before[0].get((Y, X)), 150)
+        self.assertEqual(before[3], {}, "answered: X waits on nobody")
+        self.assertEqual(before[4], (150, {Y: 150}), "the answered clock is the landed reply")
+        self._log([self._ask(1, 100), landed, reply, back])
+        self.assertEqual(reading(), before,
+                         "the earlier placement: last_any[(Y, X)] read 200 and the answered clock moved to it")
+
 
 if __name__ == "__main__":
     unittest.main()
