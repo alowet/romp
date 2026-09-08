@@ -573,9 +573,12 @@ export function placementIndex(events: TailEvent[], p: PendingSend): number {
       // GROUP (fourth review): while it still shows a copy of the key, the press-time copy has not landed, so every
       // carrier landed so far was someone else's — an identical text the kernel had already forwarded (canned
       // texts: the Continue button, a retry, a repeated nudge) — and is learned as a resident, so the count keeps
-      // looking past it. The cost, stated: a same-text copy another client queues after the press-time one landed
-      // reads as the press-time one and keeps this bubble below it until this send lands. A stamp on each queued
-      // copy would make the reading exact.
+      // looking past it. Two costs, stated: a same-text copy another client queues after the press-time one landed
+      // reads as the press-time one and keeps this bubble below it until this send lands; and the learning needs the
+      // frame in which the group still shows the key — a socket down from before the fed copy landed until after the
+      // press-time copy was taken (a laptop asleep for a whole turn) delivers both landings at once, nothing is
+      // learned, and the bubble sits between them until this send lands (fifth review). A stamp on each queued copy
+      // would make both readings exact.
       const groupShows = groupIdx >= 0 && (events[groupIdx].texts || []).some((t) => typeof t.md === "string" && !t.hiddenByPending && foreignKey(t.md) === key);
       if (groupShows) for (let j = base; j < events.length; j++) { const e = events[j]; if (e.uuid && carriedCopies(e, text) && !residents.includes(e.uuid)) residents.push(e.uuid); }
       const resident = residents.reduce((acc, u) => { const e = events.find((x) => x.uuid === u); return acc + (e ? carriedCopies(e, text) : 0); }, 0);
