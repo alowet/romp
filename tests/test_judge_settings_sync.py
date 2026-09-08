@@ -123,7 +123,7 @@ class ApplySettings(unittest.TestCase):
         # kernel lifts onto its /tunnels row, and the row serializer forwards it (None = older kernel)
         import inspect
         src = inspect.getsource(km)
-        self.assertIn('"settings": {"autoNudge": _auto_nudge_on(), "updateMode": _update_mode()', src)
+        self.assertIn('"settings": {"autoNudge": _mv["autoNudge"], "updateMode": _update_mode()', src)   # T248b: one snapshot per adopted store
         self.assertIn('"settings": r.get("settings") if isinstance(r.get("settings"), dict) else None', src)
         self.assertIn('r["settings"] = (rver or {}).get("settings")', src)
 

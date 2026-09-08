@@ -43,7 +43,7 @@ test("/version reports every gt-gated store's last-applied stamp, and the gear s
   // already read /version on every open; now it learns each store's stamp there and mints every
   // gesture at max(Date.now(), seen + 1) (ui/webview/gesture-clock.js; gesture-clock.test.ts drives
   // the module). The kernel side is behavior-tested in test_setting_gesture_order.py.
-  assert.match(KERNEL, /"settingsGt": _settings_gt\(\),/, "/version carries the stamps (ints only — the route is auth-exempt)");
+  assert.match(KERNEL, /"settingsGt": \{\*\*_settings_gt\(\), \*\*_mgt\},/, "/version carries the stamps (ints only — the route is auth-exempt); the three mesh-adopted stores' stamps ride the same snapshot as their values (T248b)");
   assert.match(KERNEL, /def _settings_gt\(\):/);
   assert.match(KERNEL, /def _setting_stored_gt\(name\):/, "one switch mirrors _setting_kept_value's");
   assert.match(GEAR, /var gclock = require\('\.\/gesture-clock\.js'\);/, "the gear loads the clock");

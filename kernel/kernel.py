@@ -11,6 +11,7 @@ zero protocol change at switchover. WS is hand-rolled on the stdlib socket (no d
 
 Run:  bin/romp-kernel   → opens http://127.0.0.1:29855
 """
+import math
 import contextlib, json, os, queue, random, re, signal, socket, sys, time, threading, traceback, base64, bisect, errno, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid, tempfile, stat, gzip, collections, functools
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -864,6 +865,7 @@ def _version_info():
                 pass
     except OSError:
         pass
+    _mv, _mgt = _mesh_settings_snapshot()   # value AND stamp of each mesh-adopted store from ONE read (T248b)
     return {"kernel_sha": _kernel_sha(), "kernel_ver": _kernel_ver(), "pid": os.getpid(), "started": int(_STARTED),
             "boot": _BOOT_ID,   # lets a page retire update offers from a previous kernel life (2026-08-15)
             "uptime_s": int(time.time() - _STARTED), "dist_ver": _dist_ver(), "bundles": bundles,
@@ -891,12 +893,12 @@ def _version_info():
             # the API added beyond the shipped seed, and the last refresh failure — so a stale list
             # is a visible fact in `romp version`, never a guess
             "modelCatalog": _catalog_public_status(),
-            "autoNudge": _auto_nudge_on(),   # server-side toggle state → the gear checkbox reflects the kernel
-            "compactSuggest": _compact_suggest_on(),   # T208+: its gear checkbox rides the same read
+            "autoNudge": _mv["autoNudge"],   # server-side toggle state → the gear checkbox reflects the kernel
+            "compactSuggest": _mv["compactSuggest"],   # T208+: its gear checkbox rides the same read
             "conserveMemory": _conserve_on(),   # the T148 toggle: close idle tab-less claude processes
             "login": _login_state(),         # the in-dashboard login flow's state/url/err (T157) — never a secret
             "acctLabel": _claude_account_label(),   # which login this box holds ("" = none) — the gear's Billing row
-            "fileEditing": _file_editing_on(),   # dashboard raw-mode editing opt-in → gates the viewer's Edit
+            "fileEditing": _mv["fileEditing"],   # dashboard raw-mode editing opt-in → gates the viewer's Edit
             # per-install: SDK sessions ask for reasoning summaries (gear checkbox). Top-level only — not
             # in the "settings" sub-dict below, whose mixed marks promise a cross-machine write this never makes
             "thinkingSummaries": _thinking_summaries_on(),
@@ -914,10 +916,14 @@ def _version_info():
             # One dict with every kernel-side setting, lifted by a PEER kernel's /version poll onto its
             # /tunnels row so its gear can mark controls where machines disagree (the user 2026-08-14).
             # The top-level fields above stay: this tab's own gear and older kernels read those.
-            "settings": {"autoNudge": _auto_nudge_on(), "updateMode": _update_mode(),
+            # The three a PEER adopts (T248b, _adopt_peer_settings) ride one snapshot per store with their
+            # stamps below: read separately, a click landing between the value read and the stamp read
+            # handed the peer (old value, new stamp), which it persisted and the equal-stamp rule then
+            # froze on both machines (the change's second review).
+            "settings": {"autoNudge": _mv["autoNudge"], "updateMode": _update_mode(),
                          "conserveMemory": _conserve_on(),
-                         "compactSuggest": _compact_suggest_on(),   # default OFF; one value across machines (T248)
-                         "fileEditing": _file_editing_on(),
+                         "compactSuggest": _mv["compactSuggest"],   # default OFF; one value across machines (T248)
+                         "fileEditing": _mv["fileEditing"],
                          "judgeModel": jd._triage_model(), "judgeEffort": jd._triage_effort(),
                          "indexModel": jd._index_model(), "indexEffort": jd._index_effort(),
                          "distillModel": jd._state_str("distill-model", "triage"),
@@ -929,7 +935,7 @@ def _version_info():
             # the gear stamps its next gesture above these instead of trusting the device clock.
             # Top-level, not lifted into /tunnels rows — a remote's newer stamp reaches the dashboard
             # through its settingStale frame, and Apply anyway is the designed path from there.
-            "settingsGt": _settings_gt(),
+            "settingsGt": {**_settings_gt(), **_mgt},   # the adopted stores' stamps from the SAME snapshot as their values
             "defaultDir": _tilde(_default_create_dir()),   # the resolved default new-session dir → the gear "Default directory" field
             "nativeDialogs": _native_dialogs()}   # whether Browse… can draw a dialog HERE → the gear drops the button when it can't
 
@@ -16505,7 +16511,12 @@ def _poll_remote_version(r):
     `autoNudge` is that machine's own copy of a setting the gear presents as one switch for everything you
     are running, so the dashboard can say when the machines disagree instead of showing one kernel's answer
     for all of them (the user 2026-08-14). None — never False — when the remote didn't say, so an older
-    kernel that has no such field reads as unknown rather than as off."""
+    kernel that has no such field reads as unknown rather than as off.
+
+    `settingsGt` (T248b): every store's last-applied gesture stamp beside `settings`, so the supervisor
+    can adopt a peer's newer pick without a click (_adopt_peer_settings). None when the peer sends none
+    (an older kernel) — the first cut consumed the field here without carrying it across, so nothing
+    ever converged in production while the hand-built test dicts passed (its review, 2026-09-08)."""
     import urllib.parse
     try:
         c = http.client.HTTPConnection("127.0.0.1", int(r["local_port"]), timeout=4)
@@ -16520,9 +16531,11 @@ def _poll_remote_version(r):
         sha = j.get("kernel_sha") or None
         an = j.get("autoNudge")
         st = j.get("settings")
+        gts = j.get("settingsGt")
         return {"sha": sha, "ver": str(j.get("kernel_ver") or ""),
                 "autoNudge": an if isinstance(an, bool) else None,
-                "settings": st if isinstance(st, dict) else None} if sha else None
+                "settings": st if isinstance(st, dict) else None,
+                "settingsGt": gts if isinstance(gts, dict) else None} if sha else None
     except Exception:
         return None
 
@@ -18691,6 +18704,7 @@ def _tunnel_supervisor():
                         r["kernel_ver"] = (rver or {}).get("ver") or ""
                         r["auto_nudge"] = (rver or {}).get("autoNudge")   # None = that kernel didn't say
                         r["settings"] = (rver or {}).get("settings")      # its whole kernel-side dict (None = older kernel)
+                        r["settingsGt"] = (rver or {}).get("settingsGt")  # each store's last-applied stamp (T248b: the adopt seam)
                     if ruse is not None:
                         # {} = the host ANSWERED with nothing to show → clear; None = no answer (blip/
                         # rate-gate) → keep the last reading (see _poll_remote_usage)
@@ -18713,6 +18727,14 @@ def _tunnel_supervisor():
                     # row and may spawn a worker. Runs here, in the one supervisor, so an advance is pushed
                     # exactly once no matter how many dashboards are open.
                     _maybe_auto_push(r)
+                    # Kernel-side settings converge without a click (T248b): a peer whose stamp for a
+                    # setting is newer than ours, with a different value, is adopted through the setting's
+                    # own gt-gated setter. Outside the lock too: the setters take their own locks and write
+                    # their stores. Loud on a fault, never fatal to the supervisor.
+                    try:
+                        _adopt_peer_settings(r.get("host") or "?", rver)
+                    except Exception:
+                        _tunnel_log(r.get("host") or "?", "adopt-settings", error=traceback.format_exc()[-400:])
                     # tag federation v2, the reattach half (also outside the lock — it round-trips the
                     # tunnel): a host that answers this pass applies any journaled tag edits that
                     # failed while it was unreachable. Steady state costs one cached-list scan.
@@ -33260,6 +33282,75 @@ def _setting_kept_value(name):
     if name == "thinking-summaries":
         return _thinking_summaries_on()
     return jd._state_str(name, "")   # the judge-tier stores are bare value files
+
+
+# ── kernel-side settings converge across attached machines WITHOUT a click (T248b) ──────────────
+# The gear's click is broadcast to every attached kernel (federation.ts KERNEL_SETTING), but a machine
+# attached AFTER the click kept its own copy until the next one, with a mixed mark to show it — and the
+# user's standard for these settings is consistent ALWAYS (2026-09-08, after Suggest /compact fired
+# from an attached kernel whose copy was on while the gear showed the box off). The tunnel supervisor
+# already lifts each up peer's /version "settings" dict onto its /tunnels row every poll; it now lifts
+# "settingsGt" beside it and hands both here. A peer's stamp NEWER than our store's last-applied stamp,
+# with a DIFFERENT value, is adopted through the setting's own gt-gated setter under the PEER's stamp:
+# the poll observing a newer stamp is the event, and gesture-time ordering gives latest-wins on both
+# sides with no ping-pong (the adopter's stamp then equals the peer's, and an equal stamp is never
+# adopted — the same rule the setters apply to a stale flush). A SAME value under a newer stamp is
+# adopted too, for its stamp: the dashboard mints its next gesture above the LOCAL kernel's stamps only
+# (gear.js learnAll on /version's settingsGt), so a lagging stamp let a later local click apply here,
+# stand down on the peer, and be adopted away again one pass later (the first cut's review). Equal
+# stamps write nothing; a peer that sends no stamps (an older kernel) or junk teaches nothing. Scope: the three
+# boolean settings that ride the browser broadcast and have no other propagation leg (the judge tiers
+# fan out over /judge-settings; update mode is a per-install boot policy by design).
+_MESH_ADOPTED_SETTINGS = (("compactSuggest", "compact-suggest", _set_compact_suggest),
+                          ("autoNudge", "auto-nudge", _set_auto_nudge),
+                          ("fileEditing", "file-editing", _set_file_editing))
+
+
+def _mesh_settings_snapshot():
+    """(values, stamps) for the three mesh-adopted stores, each store read ONCE so a value and its stamp
+    are one snapshot: the auto-nudge blob carries autoNudge/compactSuggest and both stamps, file-editing.json
+    carries fileEditing and its stamp. /version serves these for a polling peer's _adopt_peer_settings, which
+    takes the pair as one fact — two reads let a click landing between them hand the peer (old value, new
+    stamp), a pair it persisted and the equal-stamp rule then froze on both machines."""
+    d = _auto_nudge_data()
+    try:
+        fe = json.loads((jd.STATE / "file-editing.json").read_text())
+    except Exception:
+        fe = None
+    fe = fe if isinstance(fe, dict) else {}
+    values = {"autoNudge": bool(d.get("enabled")), "compactSuggest": bool(d.get("compactSuggestEnabled")),
+              "fileEditing": bool(fe.get("enabled"))}
+    stamps = {"auto-nudge": _gt_int(d.get("gt")), "compact-suggest": _gt_int(d.get("compactSuggestGt")),
+              "file-editing": _gt_int(fe.get("gt"))}
+    return values, stamps
+
+
+def _adopt_peer_settings(host, rver):
+    """Adopt every kernel-side boolean in `rver` (_poll_remote_version's dict for a peer) whose stamp is
+    newer than the local store's — the value when it differs, the stamp alone when it agrees. Returns
+    the store names adopted. Runs on the supervisor thread: the setters' stand-down verdicts are
+    consumed here (no delivering socket to answer)."""
+    st = (rver or {}).get("settings") if isinstance(rver, dict) else None
+    gts = (rver or {}).get("settingsGt") if isinstance(rver, dict) else None
+    if not isinstance(st, dict) or not isinstance(gts, dict):
+        return []
+    adopted = []
+    for key, store, setter in _MESH_ADOPTED_SETTINGS:
+        val, pgt = st.get(key), gts.get(store)
+        if not isinstance(val, bool) or isinstance(pgt, bool) or not isinstance(pgt, (int, float)) \
+                or not math.isfinite(pgt) or pgt <= 0:
+            continue                                   # json can carry NaN/Infinity: not a stamp, and int() of it raises
+        pgt = int(pgt)
+        if pgt <= _setting_stored_gt(store):
+            continue                                   # older or equal: nothing newer to learn
+        applied = setter(val, gt=pgt)                  # a same value lands too — the setter treats a newer
+        #                                                stamp as an apply (the echo rule needs an EQUAL one)
+        _pop_stale_notice()                            # no WS gesture made this: never leave a verdict for one
+        if applied is not None:
+            adopted.append(store)
+            sys.stderr.write("setting %s: adopted %s's newer pick (%s, gesture %d) — one value, one stamp across machines\n"
+                             % (store, host, val, pgt))
+    return adopted
 
 
 # Every gt-gated store, by the name _setting_stale is called with — the vocabulary the settingStale
