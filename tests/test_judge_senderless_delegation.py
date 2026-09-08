@@ -81,7 +81,7 @@ class SenderlessDelegation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tpath = Path(td) / (SID + ".jsonl")
             tpath.write_text("\n".join(json.dumps(r) for r in RECORDS) + "\n")
-            jd._PARSE_CACHE.clear()
+            jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
             phases = [ph for _sg, ph in self._units(str(tpath))]
             self.assertNotIn("delegation", phases,
                              "no sender resolved → the courier can never place a '#d'; none may be yielded")
@@ -96,13 +96,13 @@ class SenderlessDelegation(unittest.TestCase):
             jd.MESSAGES.write_text(json.dumps(
                 {"t": T0 - 1, "ev": "sent", "id": MID, "from_id": SENDER, "to_id": SID}) + "\n")
             try:
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 phases = [ph for _sg, ph in self._units(str(tpath))]
                 self.assertIn("delegation", phases, "a resolvable sender keeps the courier's '#d' work-run")
                 self.assertNotIn("work", phases, "and the planner does not double-place it")
             finally:
                 jd.MESSAGES = saved
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def test_one_planner_pass_opens_the_nudge_gate(self):
         """The systemic claim: with the sender-less segment owned by the planner, one ordinary pass
@@ -116,7 +116,7 @@ class SenderlessDelegation(unittest.TestCase):
             jd.plan_llm = jd.opener_llm = lambda *a, **k: MINT
             jd._group_store = lambda *a, **k: None
             try:
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 store = jd.load_goals(SID)
                 self.assertFalse(self._gate_is_open(store, str(tpath)),
                                  "precondition: the fresh unit starts unplaced (gate closed)")

@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """A send fed into a RUNNING turn is held by the CLI until its next tool boundary, then spliced in as a
-queued_command attachment stamped with the ENQUEUE time — so its atom lands ABOVE the tool calls that
-streamed while it waited. Until that splice the kernel's input echo is the message's only visible
-record, and two things must hold end to end:
+queued_command attachment stamped with the ENQUEUE time. Its atom is placed at the LANDING time — the
+boundary's own record, the attachment's file-order predecessor — so it lands BELOW the tool calls that
+streamed while it waited, where the model read it (T252d, the user 2026-09-08); the send time rides
+along as `sentAt`. Until that splice the kernel's input echo is the message's only visible record, and
+two things must hold end to end:
 
   1. the echo of a FED, unlanded text outlives its sibling's landing — no floor retires an SDK echo at
      all (sdk_backend.prune_live, 2026-09-06: the CLI's image-path extraction is a composer paste-hook
      behaviour that stream-json input never reaches) — and retires exactly when the absorbed atom's text
      lands: the kernel's _atom_user_texts reads the queued_command text off the parsed absorbed atom, so
      the by-text prune fires on it and the message never renders twice;
-  2. the chat event for that atom says so (`absorbed`, plus `landedAt`: when the CLI took it — the
-     file-order predecessor of the attachment record, since the attachment's own stamp is the send
-     time), so the client can mark it and leave a cue where the pending bubble was.
+  2. the chat event for that atom says so (`absorbed`, its `ts` the landing, plus `sentAt`: when the
+     user sent it), so the client's tail bubble is replaced in place and its hover can say when the
+     message was sent.
 
 The sdk_backend twin of the image-path predicate is pinned against the kernel's, and both against the
 CLI paste hook's extension set (ImagePathPredicateTwins names the source). The TEXT KEY the kernel's
@@ -207,8 +209,9 @@ class AbsorbedAtomCarriesItsLandingTime(unittest.TestCase):
         self.w.write(running_turn() + spliced_tail())
         a = self._absorbed(self.w.parse())
         self.assertEqual(len(a), 1)
-        self.assertEqual(a[0]["t"], T0 + 38, "placed at the SEND time, above the steps that ran meanwhile")
-        self.assertEqual(a[0]["landedT"], T0 + 50, "taken at the boundary before it in file order")
+        self.assertEqual(a[0]["t"], T0 + 50, "placed at the LANDING time — the boundary before it in file order — below the steps that ran meanwhile (T252d)")
+        self.assertEqual(a[0]["sentAt"], T0 + 38, "the send time rides along for the bubble's hover")
+        self.assertNotIn("landedT", a[0], "one time is the placement; the other is sentAt")
         self.assertNotIn("_seq", a[0], "the parse still strips its private ordering key")
 
     def test_the_fold_stamps_it_too(self):
@@ -226,7 +229,7 @@ class AbsorbedAtomCarriesItsLandingTime(unittest.TestCase):
                                postal_log=[], now=NOW, sdk_human=True, asm_mode_out=mode)
         self.assertEqual(mode, ["fold"], "the appended splice folds onto the cached parse")
         a = self._absorbed(out)
-        self.assertEqual([(x["t"], x["landedT"]) for x in a], [(T0 + 38, T0 + 50)])
+        self.assertEqual([(x["t"], x["sentAt"]) for x in a], [(T0 + 50, T0 + 38)])
 
     def test_two_splices_at_one_boundary_read_that_boundary(self):
         # the CLI drains its queue at a boundary: the second attachment's file-order neighbour is the
@@ -238,7 +241,8 @@ class AbsorbedAtomCarriesItsLandingTime(unittest.TestCase):
                                  aline(T0 + 75, "Both done.", "a3", "att2")]
         self.w.write(recs)
         a = self._absorbed(self.w.parse())
-        self.assertEqual([(x["uuid"], x["landedT"]) for x in a], [("att1", T0 + 50), ("att2", T0 + 50)])
+        self.assertEqual([(x["uuid"], x["t"], x["sentAt"]) for x in a], [("att1", T0 + 50, T0 + 38), ("att2", T0 + 50, T0 + 44)],
+                         "both placed at the boundary they waited for, in send order (the attachment's file order breaks the tie)")
 
     def test_a_witness_stamped_before_the_send_clamps_to_the_send(self):
         # whole-second stamps can invert a sub-second gap between the tool_result and the enqueue (the
@@ -249,19 +253,20 @@ class AbsorbedAtomCarriesItsLandingTime(unittest.TestCase):
                                       aline(T0 + 75, "Renamed.", "a3", "att1")]
         self.w.write(recs)
         a = self._absorbed(self.w.parse())
-        self.assertEqual([(x["t"], x["landedT"]) for x in a], [(T0 + 38, T0 + 38)])
+        self.assertEqual([(x["t"], x["sentAt"]) for x in a], [(T0 + 38, T0 + 38)])
 
     def test_an_attachment_with_no_predecessor_carries_no_stamp(self):
         # nothing before it in the read → nothing truthful to stamp; the field is simply absent
         self.w.write([attline(T0 + 38, FED, "att1", None), aline(T0 + 75, "ok", "a1", "att1")])
         a = self._absorbed(self.w.parse())
         self.assertEqual(len(a), 1)
-        self.assertNotIn("landedT", a[0])
+        self.assertEqual((a[0]["t"], a[0]["sentAt"]), (T0 + 38, T0 + 38), "no landing witness: the send time is the only truthful place")
 
 
 class ChatEventSaysAbsorbed(unittest.TestCase):
-    """build_session's kind:"user" event for the absorbed atom carries `absorbed` and `landedAt`, so
-    the client can mark the bubble and place the mid-turn cue. A synthetic session discovery can see
+    """build_session's kind:"user" event for the absorbed atom carries `absorbed`, its landing as `ts`
+    and the send as `sentAt`, so the client's tail bubble is replaced in place and its hover can say
+    when the message was sent. A synthetic session discovery can see
     (names/ + projects/<cdir>/<SID>.jsonl under a hermetic state root), the test_chat_fold shape."""
 
     def setUp(self):
@@ -315,8 +320,9 @@ class ChatEventSaysAbsorbed(unittest.TestCase):
         ab = [e for e in users if e.get("absorbed")]
         self.assertEqual([e["uuid"] for e in ab], ["att1"])
         self.assertEqual(ab[0]["md"], FED)
-        self.assertEqual(ab[0]["landedAt"], T0 + 50 + shift, "when the CLI took it, not when it was sent")
-        self.assertEqual(ab[0]["ts"][:19], iso(T0 + 38 + shift)[:19], "ts stays the send time — placement unchanged")
+        self.assertEqual(ab[0]["ts"][:19], iso(T0 + 50 + shift)[:19], "ts is the LANDING: the event sits below the steps that ran while the send waited (T252d)")
+        self.assertEqual(ab[0]["sentAt"], T0 + 38 + shift, "the send time rides along for the hover")
+        self.assertNotIn("landedAt", ab[0])
         self.assertTrue(all("absorbed" not in e for e in users if e["uuid"] != "att1"),
                         "a native user record never wears the flag")
 

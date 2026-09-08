@@ -7,6 +7,7 @@ Also covers auto-retry IDEMPOTENCY (the user 2026-07-08): the 10s auto-loop must
 when the one romp already sent is still queued and unconsumed — that piled N bare "retry"s into the SDK
 queue during one API-error storm (the "retry retry retry retry…" card). A MANUAL "Retry now" still fires.
 """
+import json
 import os
 import types
 import unittest
@@ -134,6 +135,65 @@ class ApiRetryIdempotency(unittest.TestCase):
         be = FakeBackend(pending=[RETRY])
         self._drive_retry(be, manual=True)
         self.assertEqual(be.sent, [RETRY], "a manual retry is not deduped by the pending-queue guard")
+
+
+class RefusingBackend(FakeBackend):
+    """A backend whose send is refused: SdkBackend.send returns False for a session with no live registry
+    row (a dead client the retry cannot reach), CodexBackend.send likewise."""
+    def send(self, sid, text):
+        self.sent.append(text)
+        return False
+
+
+class ManualRetryRefusal(unittest.TestCase):
+    """A MANUAL Retry the backend cannot deliver answers the pane that asked (review find, 2026-09-08). The
+    feed's Retry latches "Retrying…" on the click and re-arms on the kernel's reply for that request; a send
+    the backend refused used to answer nothing at all, so the button stayed latched until the card happened
+    to be re-sent. The auto path stays silent: no pane asked, and the kernel's own tick asks again."""
+    def setUp(self):
+        self._saved = (km.Sessions, km._name_of, km._retry_paused_on, km._session_retry_suppressed,
+                       km._api_error, km._path_of)
+        km._name_of = lambda sid: "web"          # a session this kernel HAS; _drive refuses a foreign one earlier
+        km._retry_paused_on = lambda: False
+        km._session_retry_suppressed = lambda sid: False
+        km._api_error = lambda path: {"text": "500", "status": 500, "category": "server_error", "uuid": "ep-r",
+                                      "tooLong": False, "spendLimit": False}
+        km._path_of = lambda sid, now=None: "/TESTDIR/x.jsonl"
+        km._auto_retried.clear()
+        km._auto_retry_state.clear()
+        self.sent = []
+        self.client = {"app": "feed", "wid": "w1", "alive": True, "send": lambda raw: self.sent.append(json.loads(raw))}
+
+    def tearDown(self):
+        (km.Sessions, km._name_of, km._retry_paused_on, km._session_retry_suppressed,
+         km._api_error, km._path_of) = self._saved
+        km._auto_retried.clear()
+        km._auto_retry_state.clear()
+
+    def _drive(self, be, **msg):
+        km.Sessions = types.SimpleNamespace(backend_for=lambda sid: be)
+        m = {"type": "apiRetry", "id": "s1"}
+        m.update(msg)
+        km._drive(m, self.client)
+
+    def test_a_refused_manual_retry_answers_the_asker_by_session(self):
+        be = RefusingBackend(pending=[])
+        self._drive(be, manual=True)
+        self.assertEqual(be.sent, [RETRY], "the manual retry was attempted")
+        self.assertEqual([(m["type"], m["sid"]) for m in self.sent], [("retryRefused", "s1")],
+                         "the refusal names the session whose Retry was clicked, so that latch alone re-arms")
+        self.assertTrue(self.sent[0]["text"], "…and says why")
+
+    def test_a_delivered_manual_retry_answers_nothing(self):
+        # the retry is in the session's queue: the card's next frame (the turn opening, or a new error record)
+        # is the reply, as before
+        self._drive(FakeBackend(pending=[]), manual=True)
+        self.assertEqual(self.sent, [])
+
+    def test_a_refused_auto_retry_stays_silent(self):
+        # nobody clicked: the dashboard tick and the kernel's own driver ask again on their next cycle
+        self._drive(RefusingBackend(pending=[]))
+        self.assertEqual(self.sent, [])
 
 
 class KernelAutoRetryTick(unittest.TestCase):

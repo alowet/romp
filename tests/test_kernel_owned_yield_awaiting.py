@@ -86,6 +86,22 @@ class OwnedYieldAwaiting(unittest.TestCase):
         self.assertEqual(why, "waiting on a background command: " + DESC,
                          "the same why the card shows — one story, both surfaces")
 
+    def test_owned_yield_why_takes_the_shared_view(self):
+        # the rule's one store read takes the shared read-only view (kernel/judge.py load_goals_shared):
+        # it reads nodes and status and writes nothing
+        self._store()
+        km.jd._shared_clear()
+        private, o_load = [], km.jd.load_goals
+        km.jd.load_goals = lambda fsid: (private.append(fsid), o_load(fsid))[1]
+        stats0 = km.jd.shared_store_stats()
+        try:
+            why = km._owned_yield_why(SID, self.path)
+        finally:
+            km.jd.load_goals = o_load
+        self.assertEqual(why, "waiting on a background command: " + DESC)
+        self.assertEqual(private, [], "the writer's loader is never asked")
+        self.assertEqual(km.jd.shared_store_stats()["miss"] - stats0["miss"], 1)
+
     def test_a_dispatch_that_predates_the_block_proves_nothing(self):
         # the block is the NEWER event: the thread has not moved past it, so this is a genuine needs-you
         self._store(blk_t=DISPATCH + 50)

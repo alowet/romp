@@ -89,7 +89,7 @@ class CourierDeferAbandon(unittest.TestCase):
         jd.CAPDIR, jd.ARCHDIR, jd.PCACHE = td / "captions", td / "archive", td / "pcache"
         jd.MESSAGES = tl / "messages.jsonl"
         jd.ERRORS = td / "judge-errors.jsonl"
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._discover_cache["fp"] = None
         jd._discover_cache["result"] = None
 

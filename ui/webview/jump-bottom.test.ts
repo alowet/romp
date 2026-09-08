@@ -1,7 +1,9 @@
 // The jump-to-newest chip (the user 2026-08-31): scrolled-up reading leaves follow mode — and the
 // send gate keeps it that way — so a floating ↓ at the transcript's bottom-center is the deliberate
 // way back: click = snap to the bottom + re-engage follow (today's at-bottom behavior). Visibility
-// reads the SAME nearBottom threshold the stick rule and the send gate use — one definition.
+// reads the SAME atBottom read the stick rule uses — one definition, the TRUE bottom (T262c: the send
+// gate keeps its own wider 80 px band, nearBottomForSend, so the chevron appears the moment the reader
+// leaves the bottom rather than 80 px later).
 // render.ts has import-time DOM side effects → source pins + an executed replica of the decisions
 // (send-scroll-preserve.test.ts precedent).
 import { test } from "node:test";
@@ -19,8 +21,8 @@ test("the chip lives on BODY, never inside the re-rendered #content — click-sa
   assert.match(RENDER, /jumpBtn\.id = "jump-bottom";/);
 });
 
-test("visibility reads the one nearBottom definition, off a passive scroll listener — no polling", () => {
-  assert.match(RENDER, /const off = c\.scrollHeight > c\.clientHeight \+ 2 && !nearBottom\(c\);/);
+test("visibility reads the one atBottom definition, off a passive scroll listener — no polling", () => {
+  assert.match(RENDER, /const off = c\.scrollHeight > c\.clientHeight \+ 2 && !atBottom\(c\);/);
   assert.match(RENDER, /c\.addEventListener\("scroll", updateJumpBtn, \{ passive: true \}\);/);
   // a hidden pane measures 0 — the chip must not float over nothing
   assert.match(RENDER, /if \(!c \|\| c\.clientHeight <= 0\) \{ jumpBtn\.hidden = true; return; \}/);
@@ -36,7 +38,7 @@ test("click snaps to the bottom AND sets the view's stick — the explicit re-en
 
 test("the send gate stays byte-intact — the chip is the sanctioned mover, sends are not", () => {
   // T187's contract, cross-pinned from this feature so a regression here names both
-  assert.match(RENDER, /const wasAtBottom = !!content && nearBottom\(content\);\s*\n\s*appendActive\(\);\s*\n\s*if \(content && wasAtBottom\) writeScroll\(content, content\.scrollHeight, "optimistic-send", true\);/);
+  assert.match(RENDER, /const wasAtBottom = !!content && nearBottomForSend\(content\);[^\n]*\n\s*appendActive\(\);\s*\n\s*if \(content && wasAtBottom\) writeScroll\(content, content\.scrollHeight, "optimistic-send", true\);/);
 });
 
 test("the chip wears the menu-card vocabulary and survives [hidden] against its own display:flex", () => {
@@ -62,12 +64,12 @@ test("a short PILL with a stemless chevron — the circle + full arrow were the 
 
 // ── executed replica: visibility + click + follow ─────────────────────────────────────────────────
 type Box = { scrollHeight: number; clientHeight: number; scrollTop: number };
-const nearBottom = (c: Box) => c.scrollHeight - c.scrollTop - c.clientHeight < 80;   // render.ts nearBottom
+const atBottom = (c: Box) => c.scrollHeight - c.scrollTop - c.clientHeight <= 2;   // render.ts atBottom (T262c: the true bottom)
 const maxScroll = (c: Box) => Math.max(0, c.scrollHeight - c.clientHeight);
-const visible = (c: Box) => c.clientHeight > 0 && c.scrollHeight > c.clientHeight + 2 && !nearBottom(c);
+const visible = (c: Box) => c.clientHeight > 0 && c.scrollHeight > c.clientHeight + 2 && !atBottom(c);
 const clickJump = (c: Box, v: { stick: boolean }) => { c.scrollTop = maxScroll(c); v.stick = true; };
 const append = (c: Box, growth: number) => {          // appendActive's stick rule
-  const stick = c.scrollHeight > c.clientHeight + 2 && nearBottom(c);
+  const stick = c.scrollHeight > c.clientHeight + 2 && atBottom(c);
   const before = c.scrollTop;
   c.scrollHeight += growth;
   c.scrollTop = stick ? maxScroll(c) : before;
@@ -75,7 +77,8 @@ const append = (c: Box, growth: number) => {          // appendActive's stick ru
 
 test("replica: shown only when overflowing AND off the bottom", () => {
   assert.equal(visible({ scrollHeight: 5000, clientHeight: 600, scrollTop: 4400 }), false, "at bottom");
-  assert.equal(visible({ scrollHeight: 5000, clientHeight: 600, scrollTop: 4360 }), false, "inside the 80px band");
+  assert.equal(visible({ scrollHeight: 5000, clientHeight: 600, scrollTop: 4398 }), false, "2 px of sub-pixel slack is the bottom");
+  assert.equal(visible({ scrollHeight: 5000, clientHeight: 600, scrollTop: 4360 }), true, "40 px up: the old band hid the chip here (T262c), now it shows at once");
   assert.equal(visible({ scrollHeight: 5000, clientHeight: 600, scrollTop: 1000 }), true, "mid-history");
   assert.equal(visible({ scrollHeight: 500, clientHeight: 600, scrollTop: 0 }), false, "no overflow, no chip");
   assert.equal(visible({ scrollHeight: 5000, clientHeight: 0, scrollTop: 0 }), false, "hidden pane");

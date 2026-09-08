@@ -1,5 +1,5 @@
 // Expand/collapse state must SURVIVE the incremental re-render a send/turn triggers (the user 2026-06-19):
-// a short transcript rebuilds from index 0, a long one re-renders the trailing TAIL_RECHECK turns, so a
+// a short transcript rebuilds from index 0, a long one re-renders from the first changed event, so a
 // DOM-only `.open`/`.expanded` silently snaps shut whatever the user had opened (the reported bug: expand
 // the system-context card, type, hit ⏎ → it collapses). We persist open-state in a module Set keyed by a
 // stable id and reapply on rebuild. No jsdom harness for the renderer, so pin the wiring at the source.

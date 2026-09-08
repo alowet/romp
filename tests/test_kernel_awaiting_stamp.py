@@ -161,6 +161,23 @@ class SessionLevelStamp(unittest.TestCase):
         self.assertEqual(km._session_stamp_full(SID),
                          ("g1", 200, "slurm 4821 regenerating the parts", "job", ()))
 
+    def test_the_stamp_reader_takes_the_shared_view(self):
+        # _session_stamp_read's one store read per key takes the shared read-only view (kernel/judge.py
+        # load_goals_shared): it reads nodes and status and writes nothing
+        self._seed(("g1", "waiting on the nightly batch", 200))
+        km.jd._shared_clear()
+        km._SESSION_STAMP_CACHE.clear()
+        private, o_load = [], km.jd.load_goals
+        km.jd.load_goals = lambda fsid: (private.append(fsid), o_load(fsid))[1]
+        stats0 = km.jd.shared_store_stats()
+        try:
+            full, _tops, _deleg = km._session_stamp_read(SID)
+        finally:
+            km.jd.load_goals = o_load
+        self.assertEqual(full[0], "g1", "the stamp names the goal")
+        self.assertEqual(private, [], "the writer's loader is never asked")
+        self.assertEqual(km.jd.shared_store_stats()["miss"] - stats0["miss"], 1)
+
     def test_session_stamp_takes_the_freshest_across_ALL_tops(self):
         # session-level, so it scans every goal (not one subtree like _goal_awaiting_stamp) for the newest
         self._seed(("g1", "the older wait, padded", 100), ("g2", "the newer wait", 300))

@@ -11,11 +11,16 @@ import * as path from "node:path";
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
 const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "styles.css"), "utf8");
 
+const HL = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "highlight-cache.ts"), "utf8");
+
 test("highlight() captures the raw source then adds a Copy button to each <pre>", () => {
-  // raw is captured BEFORE innerHTML is rewritten, and hljs highlights that same captured string
+  // raw is captured BEFORE innerHTML is rewritten, and hljs highlights that same captured string — through
+  // the (language, source) cache (highlight-cache.ts), which still names a grammar for a labeled fence and
+  // auto-detects an unlabeled one
   assert.match(RENDER, /const raw = code\.textContent \|\| "";/);
-  assert.match(RENDER, /hljs\.highlight\(raw, \{ language: lang \}\)/);
-  assert.match(RENDER, /hljs\.highlightAuto\(raw\)/);
+  assert.match(RENDER, /code\.innerHTML = highlightHtml\(hljs, lang, raw\);/);
+  assert.match(HL, /hl\.highlight\(raw, \{ language: lang as string \}\)/);
+  assert.match(HL, /hl\.highlightAuto\(raw\)/);
   // the button is added per code block, to its parent <pre>, with the captured raw
   assert.match(RENDER, /if \(pre && pre\.tagName === "PRE"\) addCopyBtn\(pre as HTMLElement, raw\)/);
 });

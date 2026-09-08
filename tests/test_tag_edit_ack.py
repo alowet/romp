@@ -283,7 +283,9 @@ class TargetedTagEdits(_Wire):
         self.seed()                                                        # web = gA holding SID1
         api = self.edit("w1", {"op": "create", "name": "api", "color": "#54B204"})["tid"]
         writes, real = [], km._set_timeline_views
-        km._set_timeline_views = lambda blob: (writes.append(1), real(blob))[1]
+        # the RMW doors hand the setter their proved snapshot as `base=` (one read per write), so the
+        # counting stub forwards the setter's keywords
+        km._set_timeline_views = lambda blob, **kw: (writes.append(1), real(blob, **kw))[1]
         try:
             a = self.edit("w2", {"op": "move", "tid_from": "gA", "tid_to": api, "sid": SID1})
         finally:
@@ -789,9 +791,10 @@ class WriteSequence(_Wire):
         self.assertEqual(km._norm_timeline_views(json.loads(json.dumps(served)))["seq"], served["seq"],
                          "clients echo the blob wholesale — the stamp survives the round trip")
         src = open(os.path.join(BIN, "romp-kernel")).read()
-        self.assertGreaterEqual(src.count('"views": _views_client()'), 3,
+        self.assertGreaterEqual(src.count('**_views_payload()'), 3,
                                 "the timeline skeleton, the feed frame and the tabOrder frames all embed the "
-                                "rendered blob — one carrier, so the seq rides every one of them")
+                                "rendered blob — one carrier (_views_payload since 2026-09-08: the blob, marked "
+                                "under a read fault, or the marker alone), so the seq rides every one of them")
 
     def test_a_store_recreated_from_nothing_starts_past_what_a_connected_client_holds(self):
         """The seq is seeded from the clock, then +1 per write: a deleted views file (or a new
@@ -1122,16 +1125,27 @@ class LegacyStoreStampedOnce(_Wire):
         finally:
             restore()
 
-    def test_an_unreadable_file_is_served_empty_and_never_overwritten(self):
+    def test_a_torn_file_is_moved_aside_never_overwritten_and_the_store_reads_empty(self):
+        # MOVED PIN (the views store's proved read): this test asserted the torn file was left IN PLACE ("a corrupt
+        # file is left for a human"). The reader goes through _read_state_json now, which QUARANTINES torn bytes
+        # aside (<name>.corrupt-<stamp>: a move, never a delete -- the flags, order and bell stores' convention)
+        # so the evidence survives AND the store reads as empty only after it is preserved; left in place, the
+        # next writer's atomic replace overwrote it. The stamp still never replaces it with an empty store.
         p = km._views_path()
         p.write_text("{not json")
         n, restore = self._writes()
         try:
-            self.assertEqual(km._timeline_views()["tags"], [])
-            self.assertEqual(n[0], 0, "a corrupt file is left for a human — the stamp never replaces it with an empty store")
-            self.assertEqual(p.read_text(), "{not json")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(km._timeline_views()["tags"], [])
+            self.assertEqual(n[0], 0, "a corrupt file is never replaced with an empty store by the stamp")
+            self.assertFalse(p.exists(), "the torn bytes were moved aside, not left for the next writer to overwrite")
+            aside = sorted(p.parent.glob("timeline-views.json.corrupt-*"))
+            self.assertEqual(len(aside), 1, "one quarantine file")
+            self.assertEqual(aside[0].read_text(), "{not json", "…holding the ORIGINAL bytes for forensics")
         finally:
             restore()
+            for q in p.parent.glob("timeline-views.json.corrupt-*"):
+                q.unlink()
 
 
 class LegacyTagsStampedOnFirstRead(_Wire):

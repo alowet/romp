@@ -14,6 +14,8 @@ run_courier additionally grew its own episode-floor guard: a fork's copied histo
 that leaves OLD peer segments visible to it (a /clear's null-rooted head drops them from the parse).
 
 SYNTHETIC fixtures only (placeholder UUIDs, invented text)."""
+import contextlib
+import errno
 import json
 import os
 import re
@@ -122,6 +124,29 @@ class ForkStoreSeeding(unittest.TestCase):
         empty = os.path.join(self.td.name, "empty.jsonl")
         Path(empty).write_text("")
         self.assertIn("nothing to fork", km._seed_fork_stores(PARENT, NEWSID, empty, "") or "")
+
+
+@contextlib.contextmanager
+def _reads_fault(target):
+    """Fail every byte read of ONE path with an EIO for the duration of the block (the views store's proved
+    reader reads bytes); everything else reads normally."""
+    real_rb, real_rt = Path.read_bytes, Path.read_text
+    tgt = str(target)
+
+    def rb(self, *a, **k):
+        if str(self) == tgt:
+            raise OSError(errno.EIO, "injected EIO")
+        return real_rb(self, *a, **k)
+
+    def rt(self, *a, **k):
+        if str(self) == tgt:
+            raise OSError(errno.EIO, "injected EIO")
+        return real_rt(self, *a, **k)
+    Path.read_bytes, Path.read_text = rb, rt
+    try:
+        yield
+    finally:
+        Path.read_bytes, Path.read_text = real_rb, real_rt
 
 
 class _FakeForkBackend:
@@ -237,6 +262,35 @@ class ForkSessionOp(unittest.TestCase):
         fork_sid = next(e for e in self.be.events if e[0] == "fork")[4]
         self.assertNotIn(fork_sid, [m["sid"] for m in km._timeline_views()["tags"][0]["members"]])
 
+    def test_a_faulting_views_store_leaves_the_fork_standing_and_says_it_did_not_inherit(self):
+        # the views store's proved read: a fault under the inherit RAISES (never an empty parent read off a
+        # fabricated store), and the fork site's boundary keeps the spawn -- the session already exists -- and
+        # says what did not happen: one refused-kind notice naming the child, nothing written to the store
+        km._flags_cache.clear()
+        km._set_timeline_views({"active": "all", "tags": [{"id": "g1", "name": "pool", "members": [PARENT]}]})
+        km._flags_cache.clear()                      # a cold display cache: the fault must be met by the READ, not bypassed by a hit
+        p = jd.STATE / "timeline-views.json"
+        before = p.read_bytes()
+        notices, saved = [], km._sync_notice
+        km._sync_notice = lambda text, ok=True, kind="sync": notices.append((text, ok, kind))
+        try:
+            with _reads_fault(p):
+                self.assertIsNone(km._fork_session(PARENT, "", "api-fork"), "the fork stands")
+        finally:
+            km._sync_notice = saved
+        self.assertEqual([e[0] for e in self.be.events], ["seed", "fork", "connect"], "seeded, forked, connected as ever")
+        self.assertEqual(p.read_bytes(), before, "nothing was written to the store")
+        rows = [(t, k) for t, ok, k in notices if not ok]
+        self.assertEqual(len(rows), 1, "one notice for the one thing that did not happen")
+        self.assertIn('"api-fork" did not inherit the tags of', rows[0][0])
+        self.assertIn("the tag store could not be read (read failed: [Errno 5]", rows[0][0])
+        self.assertEqual(rows[0][1], "refused")
+        km._flags_cache.clear()
+        fork_sid = next(e for e in self.be.events if e[0] == "fork")[4]
+        self.assertEqual([m["sid"] for m in km._timeline_views()["tags"][0]["members"]], [PARENT],
+                         "the parent keeps its tag; the fork is not in it (tag it again once the store reads)")
+        self.assertNotEqual(fork_sid, PARENT)
+
 
 class CourierEpisodeFloor(unittest.TestCase):
     """run_courier skips segments below the episode floor — a fork's copied history is the first
@@ -270,7 +324,7 @@ class CourierEpisodeFloor(unittest.TestCase):
              "to_id": self.RECIP, "body": "what subnet is the new box on?"}) + "\n")
         self.calls = []
         jd.courier_llm = lambda *a, **k: self.calls.append(1) or '{"verdict": "delegating", "goal": 0, "text": "x"}'
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._discover_cache.clear()
         jd._postal_from_memo["key"] = None
         # the marker rides the comment-wrapped wire form (see test_courier_origin_host)
@@ -283,7 +337,7 @@ class CourierEpisodeFloor(unittest.TestCase):
         (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.CAPDIR, jd.ARCHDIR, jd.PCACHE,
          jd.MESSAGES, jd.ERRORS, jd.EPIDIR, jd.courier_llm) = self.saved
         jd._postal_from_memo["key"] = None
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         jd._discover_cache.clear()
         self.td.cleanup()
 

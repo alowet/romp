@@ -1,8 +1,9 @@
 // The optimistic follow-up move must never WRITE into the payload it renders (the user 2026-08-02, who
 // replied to a blocked card and watched it bounce working → blocked → working). On the federated page the
 // ask objects in a `feed` payload ARE the FederationManager's cached per-host frames: mergeHostFeeds
-// concatenates the cached arrays element-by-reference, and the merged frame reaches the pane through a
-// same-realm MessageEvent (window.dispatchEvent — no structured clone). So applyFollowMove's old in-place
+// concatenates the cached arrays element-by-reference, and the merged frame reaches the pane by direct call
+// from federation's emit (a same-realm window dispatch only when no handler is registered), so no structured
+// clone severs the references. So applyFollowMove's old in-place
 // `a.column = "working"` edited the manager's cache; the next merged re-emit — fired by ANY host's frame,
 // seconds later — served the pane its own edit back as kernel truth, reconcileFollowMove read it as the
 // kernel confirming the move ("confirmed") and dropped the prediction, and the next local build already in
@@ -38,8 +39,9 @@ test("applyFollowMove replaces the list slot with a copy — it never mutates th
 test("the shared-reference premise holds: the merge reuses cached frame elements, delivered same-realm", () => {
   // mergeHostFeeds concatenates the cached asks arrays by reference (no per-element copy)…
   assert.match(FED, /if \(Array\.isArray\(f\.asks\)\) merged\.asks\.push\(\.\.\.f\.asks\);/);
-  // …and the merged frame is dispatched in-realm, so no structured clone severs the references
-  assert.match(FED, /window\.dispatchEvent\(new MessageEvent\("message", \{ data: mergeHostFeeds\(/);
+  // …and the merged frame is handed to the pane by direct call (emit: the registered handler, else a same-realm
+  // window dispatch), so no structured clone severs the references
+  assert.match(FED, /this\.emit\(mergeHostFeeds\(/);
 });
 
 // Executed replica: the exact scenario off the diagnosed trail. A cached host frame holds the blocked

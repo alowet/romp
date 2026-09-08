@@ -28,9 +28,11 @@ function shimJs(app: string): string {
   const def = KERNEL.indexOf("def _shim(app, v=0):");
   assert.ok(def > 0, "the shim renderer exists");
   const start = KERNEL.indexOf('return """', def) + 'return """'.length;
-  const end = KERNEL.indexOf('""" % (app, int(v), app, app)', start);
+  // the tuple's first slot is the reload core (T265, its own executed test in tests/test_dashboard_auto_reload.py);
+  // an empty core here leaves window.__rompReload undefined, so the shim's raise takes its fallback path
+  const end = KERNEL.indexOf('""" % (_reload_core(v), app, int(v), app, app)', start);
   assert.ok(end > start, "the template's format tuple is the one the test substitutes");
-  const args = [app, "5", app, app];
+  const args = ["", app, "5", app, app];
   let i = 0;
   return KERNEL.slice(start, end).replace(/%[sd]/g, () => args[i++]).replace(/%%/g, "%");
 }

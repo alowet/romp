@@ -88,8 +88,9 @@ bound) is the JWT rule's, which takes the cut and its dotted tail the same way. 
 a cut token with more than JWT_HEADER_MAX characters between `eyJ` and the first dot or the cut,
 whichever comes first — a header past the bound with the cut anywhere after its first JWT_HEADER_MAX
 characters (a cut inside such a header within them is the cut rule's match: the bound is on the head,
-not the header): in a quoted repr the fragment rule takes its head and its tail as two matches, in a
-value position the generic rule takes the head and the tail shows, and in bare text the header shows
+not the header): in a quoted repr the fragment rule takes its head and its tail in one paired match (a
+marker on each side of the cut), in a value position the generic rule takes the head and the tail
+shows, and in bare text the header shows
 — whole, with the cut and the tail, when the cut is inside it; up to its dot when the cut is in the
 payload, where the payload's own `eyJ` (a JSON payload begins with one too) is the cut rule's match
 with the cut and the tail. No enumerated tool leaves a head of that width (pytest's widest default
@@ -105,7 +106,37 @@ camelCase or PascalCase name (`'SessionStart...'`, `'HookEndToEnd...'`), a cut I
 (`'python38...'`) are redacted. That is a readability cost in a cut repr, taken on purpose: a
 PascalCase name's letters are a shape a base64 tail without a digit takes for one 8-character
 fragment in 25 (one in 200 at 13), and a digit-bearing run is the shape of a hex tail, so an
-exclusion for either would pass fragments of a key.
+exclusion for either would pass fragments of a key. The two runs on the sides of one cut are pieces of
+ONE value (pytest cuts one operand's repr, unittest one element's), so when either qualifies the other
+is a piece of the same value whatever its alphabet, and the pair is taken in one match with the cut
+kept between two markers, as the two single matches rendered it: a hex tail of 13 characters is
+letters alone one time in 345,000 (an 8-character piece one in 2,560), and such a tail stood in the
+clear beside its redacted head on CI (2026-09-08). The floor is 8 on both sides, so a shorter piece
+beside a cut (unittest's 3 after `[88 chars]`) is what it always was, and a pair where neither run
+qualifies (`'test_a_long_...ithout_digits'`) stays, as one such run does. The pair has a readability
+cost of its own, taken for the same reason: the legible half of a cut identifier goes with its other
+half when that half qualifies, so a test or session name's head beside a digit-bearing tail
+(`'test_a_long_...1a2b3c4d5e6f7'`, `'romp-session...2026-09-08T1'`) and a Capitalised word before a
+hex tail (`'Connecting...1a2b3c4d5e6f7'`) are two markers where the qualifying half alone was one.
+
+pytest's diff of two compared strings skips what they share. At default verbosity, when the two agree
+on more than 42 leading characters it drops all but the last 10 of them and says so (`Skipping N
+identical leading characters in diff, use -v to show`), and the same for trailing characters when the
+two are of one length; the `- <a>` and `+ <a>` lines then show the rest of each operand. For two
+64-character secrets that agree on 51 or more that rest is 23 characters or fewer: too short for the
+generic rule, ending at the line's end rather than at a cut, so no rule above took it, and it stood in
+the clear under an assert line that showed both operands as markers (2026-09-08). A second pass over
+the scrubbed text closes that, keyed on the first pass's own verdict: a line under the `E` marker whose
+compared operand, the quoted string beside `==` or `!=`, came out of the first pass as markers and
+nothing else (`'<marker>'`, `'<marker>...<marker>'`) compared a credential, and the signed lines of the
+diff block under it are pieces of that operand, so each becomes its sign and the marker; the empty
+line, the `Skipping` lines and the `?` lines that point at the differing positions hold no character of
+either operand and stay. The pass cannot hide a plain string's diff: every rule takes runs of token
+characters, so a string with words and spaces keeps them beside any marker on its assert line
+(`'<marker>... string here'`), no verdict is reached, and its diff lines stay as they were. Its cost is
+the diff of a comparison in which either operand is a credential: after a skip every signed line begins
+with the 10 characters the two operands share, so the other operand's line goes too when it is a plain
+expected value (the assert line still shows that value, whole or cut).
 
 Nothing here is a credential: the file holds prefixes and character classes only.
 """
@@ -170,7 +201,8 @@ _QUOTED_LINE = r"^(?P<pfxq>E[ \t]+['\"])" + _GENERIC + r"(?=['\"]$)"
 # of the cut; a known prefix against one, whatever follows; a JWT against one, its head and tail dotted;
 # and a fragment of an unknown-format value: a run of 8 or more token characters against an ellipsis, a
 # quote or another ellipsis on its far side, with a digit, or with a lower-case letter and an upper-case
-# one after its first, and the dotted rest of it.
+# one after its first, and the dotted rest of it; and the two runs on the sides of one cut as one match
+# when either is such a fragment (_PAIRED, below).
 #
 # CUT_HEAD_MAX bounds the head between a prefix and the cut. The widest head a tool leaves is pytest's
 # saferepr at its default 240: 118 characters of the repr, 117 of a quoted string; unittest's `[N chars]`
@@ -214,7 +246,22 @@ _JWT_ELLIPSIZED = (r"eyJ(?:" + _atomic_run("hj", r"{1,%d}" % JWT_HEADER_MAX) + r
                    + r"|" + _ELLIPSIS + _TOKEN_CHARS + r"+" + _DOTTED + r")")
 _FRAGMENT = (r"(?:(?=" + _TOKEN_CHARS + r"*\d)" + _TOKEN_CHARS + r"{8,}"
              r"|(?=" + _TOKEN_CHARS + r"*[a-z])(?=" + _TOKEN_CHARS + r"+[A-Z])" + _TOKEN_CHARS + r"{8,})" + _DOTTED)
-_ELLIPSIZED = (r"(?:(?<=['\"])" + _FRAGMENT + r"(?=" + _ELLIPSIS + r")"
+# The two runs on the sides of one cut are pieces of one value (pytest cuts one operand's repr, unittest
+# one element's): when either qualifies as a fragment, the other is a piece of the same value whatever
+# its alphabet. A hex tail of 13 characters is letters alone one time in 345,000, an 8-character piece
+# one in 2,560, and such a tail stood in the clear beside its redacted head (CI, 2026-09-08); a
+# letters-only head beside a qualifying tail showed the same way. Tried before the single-fragment forms;
+# the cut is captured (pcut, pcut2: a group name cannot repeat, so one per alternative) and scrub() keeps
+# it between two markers, the rendering the two single matches gave. The floor stays 8 on both sides. The
+# runs are greedy and disjoint from what follows them (a cut, a quote), so the pair costs one bounded scan
+# at each quote or cut, as the single forms do (ScrubCost times a hex head against a one-case tail).
+_RUN8 = _TOKEN_CHARS + r"{8,}" + _DOTTED
+_PAIRED = (r"(?:(?<=['\"])|(?<=\.\.\.)|(?<=chars\]))"
+           r"(?:" + _FRAGMENT + r"(?P<pcut>" + _ELLIPSIS + r")" + _RUN8
+           + r"|" + _RUN8 + r"(?P<pcut2>" + _ELLIPSIS + r")" + _FRAGMENT + r")"
+           r"(?=" + _ELLIPSIS + r"|['\"])")
+_ELLIPSIZED = (r"(?:" + _PAIRED
+               + r"|(?<=['\"])" + _FRAGMENT + r"(?=" + _ELLIPSIS + r")"
                r"|(?:(?<=\.\.\.)|(?<=chars\]))" + _FRAGMENT + r"(?=" + _ELLIPSIS + r"|['\"]))")
 # The last line of an explanation pytest truncated (over 8 lines or 640 characters: `...` is appended to
 # it, then `use '-vv' to show`). A diff line so cut ends in `...` instead of the token's end, which
@@ -240,6 +287,55 @@ TOKEN_RE = re.compile(
     r"|" + _ELLIPSIZED,                             # ...or a fragment of a value pytest or unittest cut
     re.MULTILINE,
 )
+
+# The second pass (the module docstring measures the skip). pytest's diff of two compared strings drops
+# what they share past 42 leading (or trailing) characters but 10, so its `- <a>` and `+ <a>` lines can
+# show a rest of each operand too short for _DIFF_LINE's generic rule and ending at the line's end, which
+# is no cut: 22 characters of each of two 64-character secrets stood in the clear under an assert line
+# that showed both as markers (2026-09-08). Keyed on the first pass's own verdict, and on nothing else,
+# so that no plain string's diff is hidden: the trigger is a line under the E marker whose compared
+# operand, the quoted string beside `==` or `!=` with whitespace before its opening quote (a container's
+# element, `['<a>']`, is not one; pytest's diff of a container does not skip), came out of the first pass
+# as markers alone, and every rule of the first pass takes runs of token characters, so a string with
+# words and spaces keeps them beside any marker (`'<marker>... string here'`) and reaches no verdict. The
+# block under the trigger is the lines pytest's text diff emits and nothing else: the empty line, the
+# `Skipping N identical ... characters` lines and the `?` position lines (kept, since none holds a
+# character of either operand) and the signed lines, each of which becomes its sign and the marker; a
+# line of any other shape (`Full diff:`, `+  where '<a>' = f()`, a truncation notice, a location) ends
+# it. A signed line the first pass already took (a whole value under `-v`, unittest's whole-value diff)
+# is left as it is. The cost is the diff of a comparison in which either operand is a credential: after a
+# skip each signed line begins with the 10 shared characters, a piece of the credential whatever the
+# other operand is, so the other side's line goes too (the assert line still shows a plain expected
+# value, whole or cut). Either operand, not both: an operand sharing 43 or more characters with a
+# credential is one itself, and requiring both would leave the shared 10 in the clear.
+_MARKERS_ONLY = re.escape(REDACTED) + r"(?:" + _ELLIPSIS + re.escape(REDACTED) + r")*"
+_REDACTED_OPERAND_RE = re.compile(r"(?<=\s)['\"]" + _MARKERS_ONLY + r"['\"] [!=]= |[!=]= ['\"]" + _MARKERS_ONLY + r"['\"](?=\s|$)")
+_DIFF_BLOCK_LINE_RE = re.compile(
+    r"^(?P<signed>E[ \t]+[-+] )(?! (?:where|and) )(?P<piece>.*)$"
+    r"|^E(?:[ \t]*|[ \t]+\?.*|[ \t]+Skipping \d+ identical (?:leading|trailing) characters in diff, use -v to show)$")
+
+
+def _redact_skipped_diff(text):
+    """`text` with each signed line of a pytest text diff under a compared operand the first pass rendered
+    as markers alone replaced by its sign and the marker (the comment above says what and why)."""
+    lines = text.split("\n")
+    changed = False
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        i += 1
+        if not (line.startswith("E") and line[1:2] in (" ", "\t") and _REDACTED_OPERAND_RE.search(line)):
+            continue
+        while i < n:
+            m = _DIFF_BLOCK_LINE_RE.match(lines[i])
+            if not m:
+                break
+            if m.group("signed") and m.group("piece") != REDACTED:
+                lines[i] = m.group("signed") + REDACTED
+                changed = True
+            i += 1
+    return "\n".join(lines) if changed else text
+
 
 # A git sha (40 lowercase hex) is no credential when the text says what it is: named as a commit
 # (`commit=<sha>`, `commit: <sha>`, `{'commit': '<sha>'}`), or sitting in a path or after an `@`. Under
@@ -268,7 +364,9 @@ def _is_model_id(tok):
 
 def scrub(text):
     """`text` with every match replaced by REDACTED (a diff line keeps its marker and sign, a quoted
-    element line its marker and quotes); anything that is not a str comes back as is."""
+    element line its marker and quotes, a pair of fragments the cut between two markers), and then the
+    signed lines of a pytest text diff under a compared operand so rendered replaced too (the second
+    pass, _redact_skipped_diff); anything that is not a str comes back as is."""
     if not isinstance(text, str):
         return text
 
@@ -276,5 +374,9 @@ def scrub(text):
         pfx = m.group("pfx") or m.group("pfxq") or m.group("pfxc") or ""
         if _is_git_sha_in_context(text, m) or _is_model_id(m.group(0)[len(pfx):]):
             return m.group(0)
+        cut = m.group("pcut") or m.group("pcut2")
+        if cut:                                                 # a paired fragment: a marker on each side of its cut
+            return REDACTED + cut + REDACTED
         return pfx + REDACTED
-    return TOKEN_RE.sub(one, text)
+    out = TOKEN_RE.sub(one, text)
+    return _redact_skipped_diff(out) if REDACTED in out else out   # the second pass needs a verdict of the first

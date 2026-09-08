@@ -550,6 +550,162 @@ process.stdout.write(JSON.stringify(out));"""
             self.assertEqual(out[i], payloads[i], "frame %d reassembled differently in the shim than the kernel built" % i)
         self.assertTrue(any("dictlist" in f.get("coll", {}).get("turns", {}).__class__.__name__ or True for f in frames))
 
+    def test_c_untouched_lanes_keep_their_array_identity_across_a_delta(self):
+        """A delta renews only the lane arrays it touched: the lane prefix of every set/del key, plus — when the
+        frame carries an `order` — every lane whose key subsequence changed. Every other lane's array is the very
+        object the previous message held (===), so a pane can read `turns[sid]` identity as "unchanged". The
+        assembled VALUE is unchanged either way (test_a pins that)."""
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        km._delta_parts_cache.clear()
+        frac = km._DELTA_MAX_FRACTION; km._DELTA_MAX_FRACTION = 10.0
+        self.addCleanup(setattr, km, "_DELTA_MAX_FRACTION", frac)
+        S4 = "11111111-2222-3333-4444-aaaaaaaaaaa4"
+        st = _Stream("bars")
+        t0 = 1000
+        def turn(sid, n): return [{"id": "s%s-%d" % (sid[-1], i), "t": t0 - 60 * i, "end": t0 - 60 * i + 30} for i in range(n)]
+        s3rev = list(reversed(turn(S3, 3)))                       # the same three bars, the other way round
+        payloads = [
+            _bars({S1: turn(S1, 2), S2: turn(S2, 1), S3: turn(S3, 3)}, [], []),
+            _bars({S1: turn(S1, 3), S2: turn(S2, 1), S3: turn(S3, 3)}, [], [], now=1005),                   # S1 grows
+            _bars({S1: turn(S1, 3), S2: [{"id": "s2-0", "t": t0, "end": t0 + 45}], S3: turn(S3, 3)}, [], [], now=1010),   # S2's bar changes
+            _bars({S1: [], S2: [{"id": "s2-0", "t": t0, "end": t0 + 45}], S3: turn(S3, 3)}, [], [], now=1015),           # S1 empties
+            _bars({S1: [], S2: [{"id": "s2-0", "t": t0, "end": t0 + 45}], S3: s3rev}, [], [], now=1020),                 # S3 reorders
+            _bars({S1: [], S2: [{"id": "s2-0", "t": t0, "end": t0 + 45}], S3: s3rev, S4: turn(S4, 1)}, [], [], now=1025),   # S4 appears
+        ]
+        frames = []
+        for p in payloads:
+            frames += st.push(p)
+        deltas = [f for f in frames if f["type"] == "delta"]
+        self.assertEqual(len(deltas), len(payloads) - 1, "every step after the first must have shipped as a delta")
+        self.assertIn("order", deltas[3].get("coll", {}).get("turns", {}), "a within-lane reorder must ship an order")
+        fx = tempfile.mkdtemp()
+        with open(os.path.join(fx, "frames.json"), "w") as f:
+            json.dump(frames, f)
+        script = self._shim_functions() + r"""
+var frames=JSON.parse(require("fs").readFileSync(process.argv[2],"utf8"));var out=[];var prev=null;
+for(var i=0;i<frames.length;i++){var msg=frames[i];
+if(msg.type==="delta"){var full=applyDelta(msg);if(!full){out.push({error:"rejected",at:i});break;}
+var same=[],renewed=[];for(var ln in full.turns){if(prev&&Object.prototype.hasOwnProperty.call(prev.turns,ln)&&prev.turns[ln]===full.turns[ln])same.push(ln);else renewed.push(ln);}
+same.sort();renewed.sort();out.push({same:same,renewed:renewed,turns:full.turns});prev=full;}
+else if(DELTA_KINDS[msg.type]){var keys=msg._keys;delete msg._keys;LAST[msg.type]={rev:0,msg:msg,maps:buildMaps(msg,keys)};prev=msg;out.push({full:true});}}
+process.stdout.write(JSON.stringify(out));"""
+        with open(os.path.join(fx, "run.js"), "w") as f:
+            f.write(script)
+        r = subprocess.run([node, os.path.join(fx, "run.js"), os.path.join(fx, "frames.json")], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out[0], {"full": True})
+        steps = out[1:]
+        self.assertEqual(len(steps), 5)
+        for k, step in enumerate(steps):
+            self.assertEqual(step["turns"], payloads[k + 1]["turns"], "step %d assembled a different value" % (k + 1))
+        self.assertEqual((steps[0]["same"], steps[0]["renewed"]), (sorted([S2, S3]), [S1]))       # S1 grew
+        self.assertEqual((steps[1]["same"], steps[1]["renewed"]), (sorted([S1, S3]), [S2]))       # S2's bar changed
+        self.assertEqual((steps[2]["same"], steps[2]["renewed"]), (sorted([S2, S3]), [S1]))       # S1 emptied to the bare marker
+        self.assertEqual(steps[2]["turns"][S1], [], "an emptied lane carries the kernel's [] value")
+        self.assertEqual((steps[3]["same"], steps[3]["renewed"]), (sorted([S1, S2]), [S3]))       # S3's keys reordered: same set, new array
+        self.assertEqual((steps[4]["same"], steps[4]["renewed"]), (sorted([S1, S2, S3]), [S4]))   # S4 appeared; nothing else moved
+
+    def test_e_untouched_feed_cards_keep_their_object_identity_across_a_delta(self):
+        """The feed's per-card update gate (ui/webview/feed-card-gate.ts) repaints a card when its OBJECT changed,
+        so the shim's reassembly must hand every untouched card through as the very object the previous message
+        held (===) and mint a new one only for a card the delta set. Held here, in the lane that owns the shim
+        (review find, 2026-09-08: the TypeScript lane had lifted kernel.py's shim by source text to check this,
+        and a kernel edit must not break that lane). The assembled VALUE is the kernel's payload either way."""
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        km._delta_parts_cache.clear()
+        frac = km._DELTA_MAX_FRACTION; km._DELTA_MAX_FRACTION = 10.0
+        self.addCleanup(setattr, km, "_DELTA_MAX_FRACTION", frac)
+        def ask(i, column="working"):
+            return {"itemId": "awaiting:g%d" % i, "sid": S1, "column": column, "text": "do the thing", "color": None, "trail": [1, 2, 3]}
+        st = _Stream("feed")
+        payloads = [_feed([ask(1), ask(2), ask(3)]),
+                    _feed([ask(1), ask(2, column="done"), ask(3)], now=1005)]   # one card moves; the other two are untouched
+        frames = []
+        for p in payloads:
+            frames += st.push(p)
+        self.assertEqual([f["type"] for f in frames], ["feed", "delta"])
+        self.assertEqual(set(frames[1]["coll"]["asks"]["set"]), {"awaiting:g2"}, "only the moved card crosses")
+        fx = tempfile.mkdtemp()
+        with open(os.path.join(fx, "frames.json"), "w") as f:
+            json.dump(frames, f)
+        script = self._shim_functions() + r"""
+var frames=JSON.parse(require("fs").readFileSync(process.argv[2],"utf8"));
+var full=frames[0],keys=full._keys;delete full._keys;LAST[full.type]={rev:0,msg:full,maps:buildMaps(full,keys)};
+var next=applyDelta(frames[1]);if(!next){process.stdout.write(JSON.stringify({error:"rejected"}));process.exit(0);}
+var same=[];for(var i=0;i<next.asks.length;i++)same.push(next.asks[i]===full.asks[i]);
+process.stdout.write(JSON.stringify({newMessage:next!==full,same:same,asks:next.asks}));"""
+        with open(os.path.join(fx, "run.js"), "w") as f:
+            f.write(script)
+        r = subprocess.run([node, os.path.join(fx, "run.js"), os.path.join(fx, "frames.json")], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertNotIn("error", out, "the delta applies over the keyed full frame")
+        self.assertTrue(out["newMessage"], "a delta builds a NEW message object (the bundle may still hold the previous one)")
+        self.assertEqual(out["same"], [True, False, True],
+                         "the untouched cards are the same objects (the gate skips them); the moved card is a new one (the gate repaints it)")
+        self.assertEqual(out["asks"], payloads[1]["asks"], "…and the value is the kernel's")
+
+    def test_d_a_lane_that_only_loses_a_bar_is_renewed_and_carries_the_shorter_array(self):
+        """A lane whose delta is `del` alone (no `set`, no `order`: a bar retired with nothing replacing it and
+        no key crossing another) is a TOUCHED lane: it is renewed and carries the shorter array. Without the
+        `del` clause in touchedLanes the shim would hand the pane the held array, so the timeline kept showing
+        a bar the kernel removed, a value bug the identity test above never reaches because every shrinking
+        lane there also gets a `set` or an `order`."""
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        km._delta_parts_cache.clear()
+        frac = km._DELTA_MAX_FRACTION; km._DELTA_MAX_FRACTION = 10.0
+        self.addCleanup(setattr, km, "_DELTA_MAX_FRACTION", frac)
+        st = _Stream("bars")
+        t0 = 1000
+        def turn(sid, n): return [{"id": "s%s-%d" % (sid[-1], i), "t": t0 - 60 * i, "end": t0 - 60 * i + 30} for i in range(n)]
+        payloads = [
+            _bars({S1: turn(S1, 2), S2: turn(S2, 1), S3: turn(S3, 3)}, [], []),
+            _bars({S1: turn(S1, 2), S2: turn(S2, 1), S3: turn(S3, 3)[:2]}, [], [], now=1005),      # S3 loses its last bar
+            _bars({S1: turn(S1, 2), S2: turn(S2, 1), S3: [turn(S3, 3)[1]]}, [], [], now=1010),     # S3 loses its first bar
+            _bars({S1: [turn(S1, 2)[1]], S2: turn(S2, 1), S3: [turn(S3, 3)[1]]}, [], [], now=1015),   # S1 loses its first bar
+        ]
+        frames = []
+        for p in payloads:
+            frames += st.push(p)
+        deltas = [f for f in frames if f["type"] == "delta"]
+        self.assertEqual(len(deltas), len(payloads) - 1, "every step after the first must have shipped as a delta")
+        for k, d in enumerate(deltas):
+            turns = d.get("coll", {}).get("turns", {})
+            self.assertIn("del", turns, "step %d must retire a key" % (k + 1))
+            self.assertNotIn("set", turns, "step %d is del-only by construction: no value changed" % (k + 1))
+            self.assertNotIn("order", turns, "step %d is del-only by construction: no key crossed another" % (k + 1))
+        fx = tempfile.mkdtemp()
+        with open(os.path.join(fx, "frames.json"), "w") as f:
+            json.dump(frames, f)
+        script = self._shim_functions() + r"""
+var frames=JSON.parse(require("fs").readFileSync(process.argv[2],"utf8"));var out=[];var prev=null;
+for(var i=0;i<frames.length;i++){var msg=frames[i];
+if(msg.type==="delta"){var full=applyDelta(msg);if(!full){out.push({error:"rejected",at:i});break;}
+var same=[],renewed=[];for(var ln in full.turns){if(prev&&Object.prototype.hasOwnProperty.call(prev.turns,ln)&&prev.turns[ln]===full.turns[ln])same.push(ln);else renewed.push(ln);}
+same.sort();renewed.sort();out.push({same:same,renewed:renewed,turns:full.turns});prev=full;}
+else if(DELTA_KINDS[msg.type]){var keys=msg._keys;delete msg._keys;LAST[msg.type]={rev:0,msg:msg,maps:buildMaps(msg,keys)};prev=msg;out.push({full:true});}}
+process.stdout.write(JSON.stringify(out));"""
+        with open(os.path.join(fx, "run.js"), "w") as f:
+            f.write(script)
+        r = subprocess.run([node, os.path.join(fx, "run.js"), os.path.join(fx, "frames.json")], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out[0], {"full": True})
+        steps = out[1:]
+        self.assertEqual(len(steps), 3)
+        for k, step in enumerate(steps):
+            self.assertEqual(step["turns"], payloads[k + 1]["turns"], "step %d assembled a different value (a retired bar still shown?)" % (k + 1))
+        self.assertEqual((steps[0]["same"], steps[0]["renewed"]), (sorted([S1, S2]), [S3]))       # S3 shrank from the end
+        self.assertEqual((steps[1]["same"], steps[1]["renewed"]), (sorted([S1, S2]), [S3]))       # S3 shrank from the front
+        self.assertEqual((steps[2]["same"], steps[2]["renewed"]), (sorted([S2, S3]), [S1]))       # S1 shrank; S3 kept its new array
+
     def test_b_a_delta_whose_base_is_not_held_is_refused(self):
         node = shutil.which("node")
         if not node:

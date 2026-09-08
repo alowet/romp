@@ -294,7 +294,7 @@ class OpenerExtend(unittest.TestCase):
         shutil.rmtree(self._state_td, ignore_errors=True)
         if hasattr(self, "_saved"):
             (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.plan_llm, jd.opener_llm, jd.group_llm) = self._saved
-            jd._PARSE_CACHE.clear()
+            jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     # ── parse gating ──
     def test_extend_parses_only_when_offered(self):
@@ -394,7 +394,7 @@ class OpenerExtend(unittest.TestCase):
         (names / SID).write_text("testsess\t%s\t#abcdef\n" % str(cdir))
         self._saved = (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.plan_llm, jd.opener_llm, jd.group_llm)
         jd.NAMES, jd.PROJECTS, jd.GOALDIR = names, proj, td / "goals"
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
         offered = []
         jd.plan_llm = (lambda text, menu, **kw:
                        '{"ops":[{"why":"x","do":"mint","text":"Fix mobile chat width"}]}')

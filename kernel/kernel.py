@@ -211,9 +211,15 @@ class _PerfStats:
       sends                        full / delta / deduped -> {slot: {count, bytes}} per dedup-slot
                                    name (chat, feed, bars, taborder, ...; at most SLOTS names, the rest
                                    under "other"). A deduped frame was built and compared, not sent
-      goals                        loads, saves, writes: judge.load_goals calls, save_goals calls,
-                                   and the saves that reached the disk (a byte-identical republish
-                                   is a save without a write)
+      goals                        loads, saves, writes: judge.load_goals calls (the writer's loader;
+                                   the pusher's read-only loads ride load_goals_shared and show under
+                                   memos.shared), save_goals calls, and the saves that reached the
+                                   disk (a byte-identical republish is a save without a write)
+      memos                        pass / shared / chain: the judge pass's stat-keyed store memo
+                                   (_goals_memo_report: hit, miss, fail, evict, punch, entries,
+                                   bytes), the pusher's shared read-only store cache
+                                   (judge.shared_store_stats) and the write-moment chain memo
+                                   (judge.chain_memo_stats)
       judge                        passes (one per _producer pass), ms_sum / ms_last / ms_mean (wall:
                                    a pass is a join over the tier threads, so this is mostly model
                                    latency), cpu_ms_sum (CPU: the two tier threads' own time, from
@@ -364,10 +370,20 @@ class _PerfStats:
             goals = jd.goal_io_stats()
         except Exception:
             goals = {}
+        # The three identity memos' readers land here (review find, 2026-09-08: they had no consumer): the
+        # judge pass's stat-keyed store memo, the pusher's shared read-only store cache and the write-moment
+        # chain memo. `goals.loads` is the writer's loader alone; the pusher's loads show under memos.shared.
+        memos = {}
+        for key, read in (("pass", _goals_memo_report), ("shared", jd.shared_store_stats),
+                          ("chain", jd.chain_memo_stats)):
+            try:
+                memos[key] = read()
+            except Exception:
+                memos[key] = {}
         now = time.time()
         return {"now": now, "since": since, "uptime_s": now - _STARTED, "log": _PERF,
                 "process": _process_stats(), "pusher": pusher, "stages_ms": stages,
-                "builds": builds, "sends": sends, "goals": goals, "judge": judge, "http": http}
+                "builds": builds, "sends": sends, "goals": goals, "memos": memos, "judge": judge, "http": http}
 
 
 _PERF_STATS = _PerfStats()
@@ -1276,11 +1292,16 @@ def _persist_serve_port(port):
     once the socket is BOUND (main): the AUTHORITATIVE answer for a same-user client that has the
     state dir but no shell environment to read ROMP_KERNEL_PORT from -- the Obsidian timeline panel,
     an Electron app launched from the dock, which posts its flag, views and order edits to the
-    routes below (_state_write_route) rather than writing the state files itself. A client that
-    finds no record, or a record nothing answers on, treats the kernel as not running and refuses the
-    gesture visibly, never guessing a port or falling back to a write the kernel cannot check. An
-    atomic publish (a reader never sees a torn number); best-effort, like the serve-token mint and
-    the repo-root record above."""
+    routes below (_state_write_route) rather than writing the state files itself. With a record that
+    nothing answers on, the panel treats the kernel as not running and refuses the gesture visibly,
+    never falling back to a write the kernel cannot check. With NO record (a kernel older than this
+    one wrote the token and no port) the panel tries the port the CLI resolves -- ROMP_KERNEL_PORT,
+    then ROMP_SERVE_PORT, else 29855 -- and says so in its refusal when nothing answers there. Record
+    or fallback, the panel first asks the port to prove itself over GET /healthz (a 200 "ok" carrying
+    X-Romp-Boot, on 127.0.0.1 only) with no token, and sends its token only to a port that did; a
+    port that answers as anything else is refused by name and never sees the token (review find,
+    2026-09-08, on #1078). An atomic publish (a reader never sees a torn number); best-effort, like
+    the serve-token mint and the repo-root record above."""
     try:
         _atomic_write(jd.STATE / "serve-port", "%d\n" % int(port))
     except OSError:
@@ -2887,9 +2908,10 @@ def _tab_order_frame(order, tabs, live):
     sessions of its own — every session attached from elsewhere — never learned it until the + picker was
     opened, and a remote card stamped with this kernel's name stayed plain text (review find, 2026-09-06).
     Every chat client receives a tabOrder frame, first of all on connect (tabs-first), so the name is known
-    before any card renders. Older clients ignore the extra fields."""
+    before any card renders. Older clients ignore the extra fields. Under a views read fault the blob is the last
+    one served, marked `viewsFault`, or absent with the marker alone (_views_payload)."""
     return {"type": "tabOrder", "order": list(order), "tabs": tabs, "selfHost": _self_host(),
-            "views": _views_client(), "live": sorted({str(x) for x in live})}
+            **_views_payload(), "live": sorted({str(x) for x in live})}
 
 
 def _alive_sessions(now, tmux):
@@ -3003,6 +3025,13 @@ _STATE_REPLACED = "replaced meanwhile; the new bytes get their own read"   # _st
 #                                        file is no longer the one whose bytes failed: the reader re-reads (bounded)
 
 
+# What a state file holds, for the quarantine notice: a quarantine resets the file to EMPTY, and the
+# notice says what starts over in the person's words. The views store holds the user's tags and lenses,
+# which are not settings (review find, 2026-09-08: its notice called them that); the flags, order and
+# bell stores are settings, the default.
+_STATE_FILE_HOLDS = {"timeline-views.json": "the tags and lenses"}
+
+
 def _state_quarantine(p, st, reason):
     """Move an unparseable state file ASIDE (never delete it) so the evidence survives the fresh
     start that follows: the sidecar keeps the original name plus `.corrupt-<utc stamp>` (a `-n`
@@ -3038,16 +3067,17 @@ def _state_quarantine(p, st, reason):
     # speaks exactly once. Guarded like _note_state_fault: a notice never turns a successful move
     # into a raise.
     try:
-        _sync_notice("%s could not be parsed and was moved aside to %s; the settings it held start over "
-                     "empty until you set them again" % (p.name, aside.name), ok=False, kind="refused")
+        _sync_notice("%s could not be parsed and was moved aside to %s; %s it held start over "
+                     "empty until you set them again"
+                     % (p.name, aside.name, _STATE_FILE_HOLDS.get(p.name, "the settings")), ok=False, kind="refused")
     except Exception:
         pass
     return None
 
 
 def _read_state_json(path, st=None, expect=None, _tries=3):
-    """The ONE strict reader for a small JSON state file (session-flags, session-order, notify-cards;
-    timeline-views follows in its own change). Distinguishes the outcomes the old `except Exception: {}` conflated:
+    """The ONE strict reader for a small JSON state file (session-flags, session-order, notify-cards,
+    timeline-views). Distinguishes the outcomes the old `except Exception: {}` conflated:
       - a MISSING file is legitimately empty            -> returns None (a fresh install has no files)
       - an UNREADABLE existing file (EIO/EACCES/...)     -> raises _StateUnreadable (never reads empty)
       - TORN or non-JSON bytes                           -> QUARANTINED aside (_state_quarantine: a move,
@@ -3104,6 +3134,15 @@ def _read_state_json(path, st=None, expect=None, _tries=3):
 # Last-known-good session order (session-order.json has no mtime cache): served over a transient
 # fault instead of a fabricated [], and the order to render when the store cannot be re-read.
 _session_order_lkg = [None]
+# One writer of session-order.json at a time. Every writer of the order is a read-modify-write
+# (_merge_session_order + _write_session_order for a drag, _ordered's newcomer splice,
+# _gc_session_order's prune), and the kernel serves them from many threads: the WS receive loops,
+# the POST /order route's handler threads, the pusher. Two unlocked writers that read the same
+# store both publish, and the second publish silently drops the first one's change while both were
+# acked ok (review find, 2026-09-08, on #1078: 8 to 13 of 40 concurrent route writes survived).
+# Taken around the read AND the write, as one step; _views_lock nests INSIDE it (_ordered's
+# newcomer heal takes it), never the other way round -- nothing under _views_lock touches the order.
+_order_lock = threading.Lock()
 
 # One VISIBLE error per fault EPISODE, per state file (never a raise into the push/build path -- one
 # unreadable state file must not abort the whole push and wedge the board). str(path) -> the fault
@@ -3166,7 +3205,8 @@ def _refuse_setting(client, exc, what, gesture, sid="", item_id="", flag="", val
     #1019, WRITTEN (_StateUnwritable: the publish itself failed): one stderr line, and the refusal answered
     on the DELIVERING socket as a `settingRefused` frame -- the same targeted _reply idiom the
     settingStale stand-down and the saveFile acks use, never a broadcast. The frame names the
-    `gesture` ("flag" / "bell" / "order"; "views" follows with its store, so a pane never infers it from which fields are
+    `gesture` ("flag" / "bell" / "order" -- the views store's doors answer on their own acks, _ack_views_write, and
+    never draw this frame -- so a pane never infers it from which fields are
     empty), the gesture's own address (sid / itemId / flag), and `value`: what the kernel's display
     path still paints for that flag or bell -- the value the next push carries -- so the pane
     repaints the refused toggle to it on THIS event rather than to a value it recorded at the click
@@ -3234,21 +3274,26 @@ _atomic_lock = threading.Lock()
 _atomic_seq = [0]
 
 
-def _write_state_json(path, text):
+def _write_state_json(path, text, note=True):
     """The ONE write door for the small JSON state files (session-flags, session-order, notify-cards,
-    and the views store once its path folds in): _atomic_write, with the publish's OSError turned into
+    timeline-views): _atomic_write, with the publish's OSError turned into
     _StateUnwritable and the fault filed ONCE per episode on the path's registry (_note_state_fault, the
     write faults' own table beside the read faults'); a landed write ends the episode. Left as an OSError, a publish that
     failed under a WS gesture escaped the arm's `except _StateUnreadable` to the receive loop, which
     re-raised it as a socket failure and dropped the client, and under an HTTP route reached do_POST's
     catch-all as a 500 traceback (the maintainer's fold on PR #1019: the write step is a fault boundary
-    too). Defined here, beside _atomic_write, because _write_session_order below is its first caller."""
+    too). Defined here, beside _atomic_write, because _write_session_order below is its first caller.
+    `note=False` raises the same _StateUnwritable but files NO notice and opens no write-fault episode:
+    for a write that is housekeeping rather than a gesture (the views reader's re-stamp on read), where
+    a failure is a log line the caller writes itself and the first GESTURE that fails is what the user
+    hears about (the views store's 2026-09-05 rule; the flags, order and bell stores never pass it)."""
     path = Path(path)
     try:
         _atomic_write(path, text)
     except OSError as e:
         exc = _StateUnwritable(path, "write failed: %s" % _errno_text(e))
-        _note_state_fault(exc)
+        if note:
+            _note_state_fault(exc)
         raise exc from e
     _state_write_fault_seen.pop(str(path), None)     # a landed write ends the write-fault episode
 
@@ -3355,17 +3400,18 @@ def _gc_session_order(known):
     it so a closed / aged-out session falls out on its own). Everything still around keeps its EXACT slot —
     only truly-absent sids are removed, and since the discover window only slides FORWARD a pruned sid never
     flickers back to reclaim a slot. Writes only when something actually changed (no churn on the hot path)."""
-    try:
-        order = _session_order_proved()
-    except _StateUnreadable as e:
-        _note_state_fault(e)                         # loud once per episode, not per pass
-        return
-    kept = [sid for sid in order if sid in known]
-    if kept != order:
+    with _order_lock:                                # read and write as one step (the store's rule, above)
         try:
-            _write_session_order(kept)
-        except _StateUnwritable:
-            pass                                     # filed once per episode by the write door; the next pass retries
+            order = _session_order_proved()
+        except _StateUnreadable as e:
+            _note_state_fault(e)                     # loud once per episode, not per pass
+            return
+        kept = [sid for sid in order if sid in known]
+        if kept != order:
+            try:
+                _write_session_order(kept)
+            except _StateUnwritable:
+                pass                                 # filed once per episode by the write door; the next pass retries
 
 
 def _merge_session_order(incoming):
@@ -3396,6 +3442,30 @@ def _merge_session_order(incoming):
     return [s for s in merged if not (s in seen or seen.add(s))]
 
 
+def _reorder_session_order(incoming):
+    """A drag's write of the order, as the reorderTabs/writeOrder socket arm and POST /order both land
+    it: _merge_session_order then _write_session_order, under _order_lock so the read and the publish
+    are ONE step. Before the lock the two calls sat unlocked at each call site, and two writers -- the
+    Obsidian panel and a dashboard, or two dashboards -- that read the same store both published, the
+    later publish dropping the earlier one's drag while both were acked ok (review find, 2026-09-08,
+    on #1078). Raises _StateUnreadable / _StateUnwritable exactly as the two steps do; the callers'
+    refusals are unchanged. Returns the merged order that was published."""
+    with _order_lock:
+        merged = _merge_session_order(incoming)
+        _write_session_order(merged)
+    return merged
+
+
+# Forks whose views heal (_heal_timeline_views: a /clear or revive inherits its session's tag memberships)
+# could not run because the views store faulted -- new sid -> the sid whose memberships it inherits.
+# _ordered retries them on every later pass until the heal lands: the order publish that follows the
+# splice marks the fork KNOWN, so without this map a heal skipped over a transient EIO was never run
+# again and the /clear'd session fell out of its tag for good, with one stderr line as the whole record.
+# In-memory: a fork that is in the saved order when the kernel restarts is no longer new, so a heal
+# still pending across a restart is lost -- the stderr line the skip files says so.
+_views_heal_pending = {}
+
+
 def _ordered(sessions):
     """Order session dicts STRICTLY by the shared, persisted session order (session-order.json) — and by
     NOTHING else. A session already in the order keeps its saved slot; a session NEW to the order is
@@ -3410,51 +3480,80 @@ def _ordered(sessions):
     sibling already in the order. A genuinely-new session still appends at the end. Keyed off the anchor the
     sessions carry (default: the sid itself), so session-order.json + the client stay fsid-based — no
     migration (the user 2026-06-24: keep ONE slot across /clear / revive)."""
-    try:
-        order = _session_order_proved()   # a PROVED read: a transient fault must not fold to [] and then
-        #                                   mark every session "new", persisting discovery order over the
-        #                                   user's saved order under no gesture (the state-readers audit).
-    except _StateUnreadable as e:
-        # render the last-known order (or plain input order if we never read one) and persist NOTHING
-        # this pass; the next clean read re-appends any true newcomers. Loud once per episode.
-        _note_state_fault(e)
-        lkg = _session_order_lkg[0] or []
-        idx0 = {sid: i for i, sid in enumerate(lkg)}
-        return sorted(sessions, key=lambda s: idx0.get(s["sid"], len(idx0)))
-    _session_order_lkg[0] = list(order)   # a COPY of the clean read: `order` is spliced below and only
-    #                                       _write_session_order latches the spliced list, AFTER it lands
-    #                                       (review find, 2026-09-08: latched by reference, a publish that
-    #                                       failed left an unpersisted order as the known-good)
-    known = set(order)
-    # Slot inheritance keys on the STABLE session NAME (customTitle), NOT the fsid or discover's anchor: a
-    # /clear, relaunch, or revive mints a NEW transcript fsid for the SAME logical session, and it must
-    # inherit that session's existing slot rather than jump to the END. Keying on the name — resolved from
-    # the names registry, so even a DEAD order entry's name is known — is robust to fsid churn AND to
-    # discover occasionally SELF-anchoring a fork (a fork that has its own names entry, processed first in
-    # the lexical scan, anchors to itself instead of grouping under its session): that lexical-order accident
-    # was the silent, intermittent tab reorder the user kept hitting (2026-06-29). A genuinely-new session has
-    # a unique name → no sibling → appends at the end, then is frozen.
-    sess_name = {s["sid"]: (s.get("name") or "") for s in sessions}
-    def _nm(sid):
-        return sess_name.get(sid) or _name_of(sid) or ""
-    new = [s["sid"] for s in sessions if s["sid"] not in known]
-    if new:
-        name_at = [_nm(o) for o in order]                # each existing slot's stable name (resolved once)
-        for sid in new:
-            a = _nm(sid)
-            sib = [i for i, n in enumerate(name_at) if a and n == a]   # same-name entries already placed
-            if sib:
-                _heal_timeline_views(order[sib[-1]], sid)   # the fork inherits hidden/tag state too
-                order.insert(sib[-1] + 1, sid)           # a fork inherits its session's slot, not the END
-                name_at.insert(sib[-1] + 1, a)           # keep name_at aligned with order as we splice
-            else:
-                order.append(sid)                        # a genuinely new session appends, then is frozen
-                name_at.append(a)
+    # the read, the splice and the publish are ONE step under _order_lock: a drag landing between the
+    # read and the publish (POST /order, the socket arm) was overwritten by this splice, or overwrote it,
+    # with no gesture and no notice (review find, 2026-09-08, on #1078)
+    with _order_lock:
         try:
-            _write_session_order(order)
-        except _StateUnwritable:
-            pass                                         # this build still sorts by the in-memory order; the publish
-            #                                              is filed once per episode and the next pass retries it
+            order = _session_order_proved()   # a PROVED read: a transient fault must not fold to [] and then
+            #                                   mark every session "new", persisting discovery order over the
+            #                                   user's saved order under no gesture (the state-readers audit).
+        except _StateUnreadable as e:
+            # render the last-known order (or plain input order if we never read one) and persist NOTHING
+            # this pass; the next clean read re-appends any true newcomers. Loud once per episode.
+            _note_state_fault(e)
+            lkg = _session_order_lkg[0] or []
+            idx0 = {sid: i for i, sid in enumerate(lkg)}
+            return sorted(sessions, key=lambda s: idx0.get(s["sid"], len(idx0)))
+        _session_order_lkg[0] = list(order)   # a COPY of the clean read: `order` is spliced below and only
+        #                                       _write_session_order latches the spliced list, AFTER it lands
+        #                                       (review find, 2026-09-08: latched by reference, a publish that
+        #                                       failed left an unpersisted order as the known-good)
+        known = set(order)
+        # Slot inheritance keys on the STABLE session NAME (customTitle), NOT the fsid or discover's anchor: a
+        # /clear, relaunch, or revive mints a NEW transcript fsid for the SAME logical session, and it must
+        # inherit that session's existing slot rather than jump to the END. Keying on the name — resolved from
+        # the names registry, so even a DEAD order entry's name is known — is robust to fsid churn AND to
+        # discover occasionally SELF-anchoring a fork (a fork that has its own names entry, processed first in
+        # the lexical scan, anchors to itself instead of grouping under its session): that lexical-order accident
+        # was the silent, intermittent tab reorder the user kept hitting (2026-06-29). A genuinely-new session has
+        # a unique name → no sibling → appends at the end, then is frozen.
+        sess_name = {s["sid"]: (s.get("name") or "") for s in sessions}
+        def _nm(sid):
+            return sess_name.get(sid) or _name_of(sid) or ""
+        for fsid, osid in list(_views_heal_pending.items()):
+            # a heal deferred on an earlier pass (the views store faulted): retried until it lands. Quiet while
+            # the store still faults -- the skip said it once -- and one line when it lands.
+            try:
+                carried = _heal_timeline_views(osid, fsid)
+            except (_StateUnreadable, _StateUnwritable):
+                continue
+            _views_heal_pending.pop(fsid, None)
+            sys.stderr.write("romp-kernel: views heal for %s %s\n"
+                             % (fsid, "landed on retry" if carried else "retried: nothing to carry"))
+        new = [s["sid"] for s in sessions if s["sid"] not in known]
+        if new:
+            name_at = [_nm(o) for o in order]                # each existing slot's stable name (resolved once)
+            for sid in new:
+                a = _nm(sid)
+                sib = [i for i, n in enumerate(name_at) if a and n == a]   # same-name entries already placed
+                if sib:
+                    try:
+                        _heal_timeline_views(order[sib[-1]], sid)   # the fork inherits its tag state too
+                    except (_StateUnreadable, _StateUnwritable) as e:
+                        # the views store faulted inside the heal (its PROVED read, or its publish): the slot
+                        # inheritance below still lands and the heal is deferred (_views_heal_pending), retried on
+                        # the next pass. Never a raise out of _ordered -- it runs inside every build (the push,
+                        # GET /feed.json, the WS clearAll arm) -- and never a fold: the heal read the display
+                        # reader before this change, which folded the fault to an empty store, so the heal
+                        # carried nothing and said nothing. Said once per fork, like the order publish below:
+                        # the stderr line, and the bell row the fork and promotion sites file for the same
+                        # non-event (_note_views_heal_deferred; review find, 2026-09-08).
+                        if sid not in _views_heal_pending:
+                            sys.stderr.write("romp-kernel: views heal for %s skipped (%s) \u2014 deferred; the next pass "
+                                             "retries it (lost if the kernel restarts first)\n" % (sid, e))
+                            _note_views_heal_deferred(a or sid, e)
+                        _views_heal_pending[sid] = order[sib[-1]]
+                    order.insert(sib[-1] + 1, sid)           # a fork inherits its session's slot, not the END
+                    name_at.insert(sib[-1] + 1, a)           # keep name_at aligned with order as we splice
+                else:
+                    order.append(sid)                        # a genuinely new session appends, then is frozen
+                    name_at.append(a)
+            try:
+                _write_session_order(order)
+            except _StateUnwritable:
+                pass                                         # this build still sorts by the in-memory order; the publish
+                #                                              is filed once per episode and the next pass retries it
     idx = {sid: i for i, sid in enumerate(order)}
     return sorted(sessions, key=lambda s: idx.get(s["sid"], len(idx)))   # stable sort: ties keep input order
 
@@ -3752,28 +3851,74 @@ def _views_lost_notice(note, members):
 
 
 def _timeline_views():
+    """The DISPLAY read of the views store as a blob every display caller can filter on: what
+    _timeline_views_display serves, with the empty default standing in when a fault left it nothing to
+    serve (a cold cache: a kernel that has never served the store). The display callers -- view
+    visibility, the tab sections, the union -- read here; a FRAME or an ACK reads _views_payload, which
+    carries the fault instead of that default (review find, 2026-09-08). Writers never read here: they
+    read _timeline_views_proved, which raises, and refuse."""
+    v, _fault = _timeline_views_display()
+    return v if v is not None else _norm_timeline_views({})
+
+
+def _timeline_views_display():
+    """The DISPLAY read of the views store, cached under the file's (mtime_ns, size) key, as (blob,
+    fault). Never raises into a build (build_feed / build_timeline / build_session run under _push's one
+    outer try, so a reader that raised would abort every client's push): a MISSING store is legitimately
+    empty; a store that EXISTS but cannot be read (a stat or read fault: EIO, EACCES) serves the last
+    blob this kernel served or wrote when the cache holds one, else None -- UNPROVED either way, NEVER
+    CACHED, loud once per episode (_note_state_fault), and NAMED: `fault` is the _StateUnreadable the
+    blob is served under, None after a read that proved the file state it served (a cache hit at the
+    file's key, a clean read, a missing store). The empty default is not served here (review find,
+    2026-09-08): carried on a frame it is a seq-less empty store that every dashboard adopts as the
+    store's word; _timeline_views stands it in for the filtering callers, and _views_payload carries the
+    fault instead. Until this change a fault was folded
+    to an empty store and CACHED under the file's real key, so after one EIO the store read as {} on
+    every call until the file's stat moved, and every read-modify-write door (which read here) then
+    persisted that emptiness plus its one edit over the user's whole tag set under an ok:true ack --
+    while every dashboard adopted the seq-less {} and its tag bar emptied with nothing said. Torn or
+    non-JSON bytes, or JSON of the wrong shape, are QUARANTINED aside by _read_state_json (a move,
+    never a delete; its own stderr line and dashboard notice) and the store then reads as empty: that
+    is the disk's state after a stated event, not a fold, and the cache entry is forgotten with it as
+    for a store read as missing. Writers never read here: they read _timeline_views_proved, which
+    raises, and refuse."""
     p = _views_path()
+    hit = _flags_cache.get(str(p))
     try:
         st = p.stat(); key = (st.st_mtime_ns, st.st_size)
-    except OSError:
+    except FileNotFoundError:
         # No store: nothing served before it describes this one. The cache entry is the last blob
         # this kernel served or wrote, and a file written outside the kernel after a delete or a
         # restore is judged against it (_views_restamp's third case) — forgetting it here is what
         # keeps a recreated store from being judged against a store that no longer exists. The seq
         # floor is kept (_VIEWS_SEQ_FLOOR): a recreated file is still ORDERED past what was served.
         _flags_cache.pop(str(p), None)
-        return _norm_timeline_views({})
-    hit = _flags_cache.get(str(p))
+        _clear_state_fault(p)
+        return _norm_timeline_views({}), None
+    except OSError as e:
+        # The store EXISTS but cannot be stat'ed (a state dir that cannot be searched): the last blob
+        # served, else nothing -- unproved, uncached, the entry KEPT (the store is not gone); loud once
+        # per episode, and the fault returned beside the blob. Until this change this was the
+        # missing-store arm, so an EACCES forgot the entry and served {}.
+        exc = _StateUnreadable(p, "stat failed: %s" % _errno_text(e))
+        _note_state_fault(exc)
+        return (hit[1] if hit is not None else None), exc
     if hit is not None and hit[0] == key:
-        return hit[1]
+        _clear_state_fault(p)
+        return hit[1], None
     try:
-        d = json.loads(p.read_text())
-        parsed = isinstance(d, dict)
-    except Exception:
-        d, parsed = {}, False
-    if not parsed:
-        d = {}
-    fix = _views_restamp(d, hit) if parsed else None
+        d = _read_state_json(p, st, expect=dict)
+    except _StateUnreadable as e:
+        _note_state_fault(e)
+        return (hit[1] if hit is not None else None), e
+    _clear_state_fault(p)
+    if d is None:
+        # gone between the stat and the read, or quarantined aside just now: the store IS empty from
+        # here, and the entry is forgotten as for a missing store (a file that then appears is not
+        # judged against one that no longer exists)
+        _flags_cache.pop(str(p), None)
+        return _norm_timeline_views({}), None
+    fix = _views_restamp(d, hit)
     if fix is not None:
         # The file goes back through the write door BEFORE it is served (the cases in
         # _views_restamp), as ONE write: the setter is handed its diff base explicitly, because
@@ -3797,9 +3942,9 @@ def _timeline_views():
             try:
                 st2 = p.stat()
             except OSError:
-                return _norm_timeline_views({})
+                return _timeline_views_display()      # gone, or faulting, under the lock: the arms above say which
             if (st2.st_mtime_ns, st2.st_size) != key:
-                return _timeline_views()
+                return _timeline_views_display()
             hit2 = _flags_cache.get(str(p))
             if hit2 is not None and hit2[0] == key:
                 # The same file state, served and cached by a reader that held the lock while this one
@@ -3809,7 +3954,7 @@ def _timeline_views():
                 # and two cold readers racing on a full disk each judged the file, each failed the
                 # write, and each filed the file-fact notice. The check the function opens with, run
                 # again under the lock; it serves nothing that check would not.
-                return hit2[1]
+                return hit2[1], None
             try:
                 floor = int(hit[1].get("seq") or 0) if hit is not None else 0
             except (TypeError, ValueError):
@@ -3859,14 +4004,15 @@ def _timeline_views():
                                                              if m) or "no members")
                                     for g in raw)
             try:
-                _write_timeline_views(judged)
+                _write_timeline_views(judged, note=False)   # housekeeping: a failure is the log line below,
+                #                                              never a notice (the first GESTURE that fails is)
                 sys.stderr.write("romp-kernel: views store re-stamped on read: %s\n" % why)
                 if lost:
                     # the drop is permanent once the stamp is written
                     _views_lost_notice(_notice_list(
                         "%s %d tag%s dropped when it was re-stamped on read (%s)"
                         % (fact, len(lost), " was" if len(lost) == 1 else "s were", why), ": ", names), members)
-            except OSError as e:
+            except (_StateUnwritable, OSError) as e:
                 # The state dir is unwritable or full: a READ must still answer (every frame builds
                 # on it), so a blob is served and cached under the file's key — the next read is a
                 # hit, not another failing write — and the failure is logged once per distinct
@@ -3880,15 +4026,18 @@ def _timeline_views():
                 # past the floor that the file does not, which is the point: dashboards adopt it,
                 # and the next write that lands (a RMW built from this cache) persists it.
                 # the key is the error's kind, not its text: the atomic write's temp name differs
-                # per call, so the text would read as a new error every time
-                kind = "%s errno=%s" % (type(e).__name__, getattr(e, "errno", None))
+                # per call, so the text would read as a new error every time. The door raises
+                # _StateUnwritable around the publish's OSError now; the OSError underneath is what
+                # the kind and the line name, as before
+                oe = e.__cause__ if isinstance(e, _StateUnwritable) and isinstance(e.__cause__, OSError) else e
+                kind = "%s errno=%s" % (type(oe).__name__, getattr(oe, "errno", None))
                 if _VIEWS_RESTAMP_ERR[0] != kind:
                     _VIEWS_RESTAMP_ERR[0] = kind
                     sys.stderr.write("romp-kernel: views store could not be re-stamped on read (%s) — "
                                      "serving %s: %s: %s\n"
                                      % (why, "the judged blob, unwritten" if judge
                                         else "the file as read, under the cap, unstamped",
-                                        type(e).__name__, e))
+                                        type(oe).__name__, oe))
                 if lost:
                     # The file still holds the excess and the served blob does not, and the next
                     # write that lands (a RMW built from this cache) persists the served blob: the
@@ -3903,11 +4052,72 @@ def _timeline_views():
                            "is" if len(lost) == 1 else "are"), ": ", names), members)
                 d = _norm_timeline_views(json.loads(json.dumps(judged)) if judge else d2)
                 _views_cache_put(p, key, d)
-                return d
-        return _timeline_views()          # the write refreshed the cache under the file's new key
+                return d, None
+        return _timeline_views_display()  # the write refreshed the cache under the file's new key
     d = _norm_timeline_views(d)
     _views_cache_put(p, key, d)
-    return d
+    return d, None
+
+
+def _timeline_views_proved():
+    """The MUTATION snapshot of the views store: a read fault RAISES (_StateUnreadable) instead of
+    folding to an empty store, so a read-modify-write writer (_edit_tag, _move_tag_member,
+    _heal_timeline_views, _inherit_tag_membership, and the judge's diff base) refuses rather than
+    publishing the emptiness back over the user's whole tag set, lenses and order under a success
+    ack. Only a missing store, or one just quarantined aside (_read_state_json moves torn bytes aside
+    BEFORE the store reads as empty), reads as empty; no last-known-good -- a writer acts on the real
+    store or not at all. Always a FRESH dict the caller may mutate.
+    The snapshot is what this kernel SERVES for the file state the read just proved: the display
+    cache's entry when its key is the file's current (mtime_ns, size) -- the file's own content, or
+    the JUDGED blob the reader served over an unwritable store, whose next write is meant to persist
+    it (the 2026-09-05 review) -- which is exactly what every RMW writer built on when it read the
+    display reader, now proved by a read rather than assumed from a key. Otherwise the file, with
+    what the reader's re-stamp would do to it replayed and not persisted -- the SAME snapshot the
+    display reader would serve for that file (_views_restamp, handed the same cache entry):
+    - the unjudged cases (the hidden->archived migration, the legacy per-tag mtimes) change the
+      CONTENT: the normalizer DROPS `hidden`, so a snapshot that skipped the migration would hand a
+      writer a blob without the legacy entries, and its write -- before the display reader's first
+      read after boot -- would lose every one of them;
+    - the JUDGED case -- a file written OUTSIDE the kernel (the timeline's Electron and Obsidian
+      branches write timeline-views.json themselves) whose seq fell behind the last served blob -- is
+      judged here against that blob exactly as the display reader judges it (the stale-writer guard,
+      `foreign`): a deleted tag the foreign copy still carries is not re-created, a member or a tag
+      added since is not lost, its refusals said by the judge. Replayed raw instead, in the window
+      before the pusher's next display read, every RMW door diffed its one edit against the foreign
+      copy (no refusal anywhere) and the judge stamped the result past everything served -- the stale
+      copy blessed on every dashboard (review find, 2026-09-08).
+    The writer's own write persists what the replay produced (the migrated tag, the judgment) through
+    the judge; a RMW that writes nothing leaves the file for the display reader's own re-stamp, whose
+    judge says the refusals once more. So the refusals can be said more than once for one outside
+    write: once per gesture that reads and then writes nothing while the stale copy stands, and once
+    more if the pusher's re-stamp lands between a gesture's read and its write -- notices only; the
+    content converges either way, and the persisted seq still orders past everything served."""
+    p = _views_path()
+    hit = _flags_cache.get(str(p))
+    try:
+        st = p.stat()
+    except FileNotFoundError:
+        return _norm_timeline_views({})
+    except OSError as e:
+        raise _StateUnreadable(p, "stat failed: %s" % _errno_text(e))
+    d = _read_state_json(p, st, expect=dict)
+    if d is None:
+        return _norm_timeline_views({})
+    if hit is not None and hit[0] == (st.st_mtime_ns, st.st_size):
+        return json.loads(json.dumps(hit[1]))
+    fix = _views_restamp(d, hit)
+    if fix is None:
+        return _norm_timeline_views(d)
+    why, d2, judge = fix
+    if not judge:
+        return _norm_timeline_views(d2)
+    try:
+        floor = int(hit[1].get("seq") or 0)
+    except (TypeError, ValueError):
+        floor = 0
+    judged, _rows = _judge_timeline_views(d2, base=hit[1], seq_floor=max(floor, _views_seq_floor(p)),
+                                          foreign="a stale write to the views file from outside the kernel")
+    return _norm_timeline_views(json.loads(json.dumps(judged)))
 
 
 def _views_stamp_legacy_tags(tags, d):
@@ -3963,6 +4173,8 @@ def _views_restamp(d, hit):
       file restored from an older copy would be served under its old seq and ignored by every
       dashboard holding a higher one. The seq floor outlives the entry (_VIEWS_SEQ_FLOOR), and the
       file is re-stamped past it, as written — ordered, not judged.
+    The proved reader (_timeline_views_proved) replays the unjudged cases on its snapshot without
+    persisting them, so a writer's blob carries what the file's re-stamp would have.
     Returns (why, dict-to-write, judge). The dict is a COPY: `d` is also the diff base the migration
     is stamped against, and mutating its tag dicts in place (an earlier aliasing bug) left the
     base already migrated — an existing "archived" tag gained its members with no fresh mtime, and
@@ -4025,19 +4237,29 @@ def _set_timeline_views(blob, base=None, seq_floor=0, edited=None, foreign=None)
     was written over by a blob judged against the pre-re-stamp store — the foreign write's lens
     change and its creates gone, under a seq no higher than the re-stamp's (both computed from the
     same base), with no refusal filed. The lock is re-entrant, and every caller holding _views_lock
-    takes it first, so the documented order stands."""
+    takes it first, so the documented order stands.
+    `base`: the store as the caller read it PROVED (_timeline_views_proved) -- every read-modify-write
+    door hands its own snapshot over, so the judge diffs against the very blob the caller edited and no
+    second read opens a fault window between the read and the write; with none (the WS whole-blob
+    door), the judge reads the store proved itself. A read fault RAISES _StateUnreadable and a failed
+    publish _StateUnwritable to the caller, which refuses the gesture; nothing is written either way."""
     with _views_file_lock:
         v, rows = _judge_timeline_views(blob, base=base, seq_floor=seq_floor, edited=edited, foreign=foreign)
         _write_timeline_views(v)
     return rows
 
 
-def _write_timeline_views(v):
+def _write_timeline_views(v, note=True):
     """Write a judged, stamped blob (from _judge_timeline_views) to the store and refresh the read
-    cache with it. Raises the OSError of an unwritable or full state dir to the caller."""
+    cache with it. Publishes through _write_state_json, the state files' one write door: an unwritable
+    or full state dir (ENOSPC, EROFS, EACCES) raises _StateUnwritable -- a plain Exception, filed once
+    per episode -- never the OSError, which do_POST answered as a 500 traceback (`romp tag` posts with
+    `curl -sf` and read that as an unreachable kernel) and the WS receive loop re-raises as a socket
+    failure should an arm let it through. `note=False` is the reader's re-stamp: housekeeping whose
+    failure is its own log line, not a notice."""
     text = json.dumps(v, sort_keys=True)
     with _views_file_lock:
-        _atomic_write(_views_path(), text)
+        _write_state_json(_views_path(), text, note=note)
         _views_cache_refresh(text)
     _VIEWS_RESTAMP_ERR[0] = None      # the store is writable again: a later failure logs afresh
 
@@ -4089,10 +4311,11 @@ def _judge_timeline_views(blob, base=None, seq_floor=0, edited=None, foreign=Non
     unread = _views_unread(blob, v["tags"])
     ed = set(x for x in edited if isinstance(x, str)) if isinstance(edited, list) else None
     if base is None:
-        try:
-            base = _timeline_views()
-        except Exception:
-            base = {}
+        # the PROVED store, never the display reader and never a fold: the guard's "previous truth"
+        # computed from a reader that folded a fault to {} refused nothing, and the write then landed
+        # the blob's tags -- or, on a lens write's empty `edited`, NO tags -- over the user's whole set
+        # under an ok:true ack. A fault here RAISES to the door, which refuses the write.
+        base = _timeline_views_proved()
     prev_blob = base
     prev = {t["id"]: t for t in (prev_blob.get("tags") or [])}
     now = int(time.time())
@@ -4612,15 +4835,39 @@ def _row_op(row):
     return "delete" if row.get("delete") else ("rename" if row.get("rename") else "remove")
 
 
-def _views_client():
+def _views_payload():
+    """The views fields of a frame (the tabOrder frame, the feed, the timeline skeleton) and of a write's
+    ack (_ack_views_write), from ONE display read (_timeline_views_display): `views`, the rendered blob
+    (_views_client), and under a read fault `viewsFault`, the fault in the person's words
+    (_views_fault_text), which a pane can render as "tags unavailable: <reason>". With a last good blob
+    the frame carries it AND the marker: the blob is what this kernel last served or wrote, unproved by
+    this read and said so. With NONE (a cold cache: a kernel that has never served the store) the frame
+    carries no `views` at all -- every pane keeps what it holds on a frame without the blob (render.ts
+    captureViews, feed.ts, fleet.ts, the timeline's _takeViews) -- where the seq-less empty default it
+    carried until this change was adopted by every dashboard as the store's word: the tag bar emptied
+    with the fault said only on the bell, and the next lens click made it permanent (review find,
+    2026-09-08). A clean read adds no key, so a clean frame is byte-identical to before."""
+    v, fault = _timeline_views_display()
+    # a dict literal, not a subscript store of the views key: test_tag_federation_v2 counts that spelling across
+    # the module as a store of a REMOTE reading, which must go through _cache_remote_views; this is the local
+    # frame's own field
+    out = {"views": _views_client(v)} if v is not None else {}
+    if fault is not None:
+        out["viewsFault"] = _views_fault_text(fault)
+    return out
+
+
+def _views_client(v=None):
     """The views blob every client renders and matches against — the RENDERING of the canonical
     store (federation v0, the user 2026-08-24): local tags with members as viewer-relative strings
     (the pre-pairs contract, so no client re-learns anything), plus `remoteTags` — each ATTACHED
     kernel's own tags, read-only, host-stamped, members respelled for this viewer. Per-host maps
     joined at the viewer, never merged (the federation counter rule); same-name tags on two kernels
     stay two entries — the host disambiguates, nothing silently merges. Remote reads ride the
-    supervisor's cached /views poll; a kernel that is down simply contributes nothing this push."""
-    v = json.loads(json.dumps(_timeline_views()))
+    supervisor's cached /views poll; a kernel that is down simply contributes nothing this push.
+    `v`: the display blob to render, else the display read's own (_timeline_views); _views_payload hands
+    its read over, so a frame is built from ONE read and the fault it carries names that read."""
+    v = json.loads(json.dumps(_timeline_views() if v is None else v))
     for t in v["tags"]:
         t["members"] = [_member_str(m) for m in t["members"]]
     remote = []
@@ -4727,14 +4974,19 @@ def _heal_timeline_views(old_sid, new_sid):
     """fsid churn (a /clear, relaunch or revive mints a new transcript fsid for the same logical
     session): carry the old sid's tag memberships to the new one, exactly like the order-slot
     inheritance that detects the churn. Without this a tagged session would silently fall out of
-    its tag on every /clear. (The hidden half retired with the set, 2026-08-24.)"""
+    its tag on every /clear. (The hidden half retired with the set, 2026-08-24.)
+    Reads the store PROVED, once: a fault RAISES (_StateUnreadable; a failed publish, _StateUnwritable)
+    to _ordered's boundary, which defers the heal and retries it, rather than carrying memberships off
+    a fabricated empty store; the snapshot is handed to the setter as its diff base, so no second read
+    opens a fault window inside a build. Returns True when memberships were carried, False when the old
+    sid held no tag (so _ordered's retry of a deferred heal can say which it was)."""
     def _has(t):
         return any(m["host"] == "" and m["sid"] == old_sid for m in t["members"])
     with _views_lock:   # RMW like _edit_tag: a write landing inside the read-to-write window is lost
-        v = _timeline_views()
-        if not any(_has(t) for t in v["tags"]):
-            return
-        v = json.loads(json.dumps(v))                    # deep copy: never mutate the cached blob
+        v0 = _timeline_views_proved()
+        if not any(_has(t) for t in v0["tags"]):
+            return False
+        v = json.loads(json.dumps(v0))                   # the working copy; v0 stays the pristine base
         # COPY, never move: stripping the old sid un-hid its DEAD lane, which lingers on the timeline for
         # hours — and when the old sid is still alive (a fork beside a living parent, or an unrelated new
         # session reusing a name), moving would steal the living session's state. A dead sid left in the
@@ -4742,7 +4994,8 @@ def _heal_timeline_views(old_sid, new_sid):
         for t in v["tags"]:
             if _has(t):
                 t["members"] = t["members"] + [{"host": "", "sid": new_sid}]   # normalizer dedups + re-sorts
-        _set_timeline_views(v)
+        _set_timeline_views(v, base=v0)
+    return True
 
 
 def _inherit_tag_membership(parent_sid, child_sid):
@@ -4754,22 +5007,26 @@ def _inherit_tag_membership(parent_sid, child_sid):
     where the parent is known instead of being detected later. COPY, never move — the parent keeps
     its tags. No-op when the parent holds none; idempotent (the normalizer dedups pairs). Local tags
     only in v1: a parent held only by a REMOTE-homed tag is not inherited here (its home kernel
-    would have to be asked — the accepted gap). Returns the inherited tag names."""
+    would have to be asked — the accepted gap). Returns the inherited tag names.
+    Reads the store PROVED: a fault RAISES (_StateUnreadable; a failed publish, _StateUnwritable) to
+    the caller -- the creation ack folds it into `tagError` (_tag_ack), the fork and thread-promotion
+    sites say what did not happen (_note_tags_not_inherited) -- rather than reading an empty parent
+    off a fabricated store and returning [] as if the parent held no tag."""
     parent_sid, child_sid = str(parent_sid or ""), str(child_sid or "")
     if not parent_sid or not child_sid or parent_sid == child_sid:
         return []
     with _views_lock:   # RMW like _edit_tag: two unlocked copies would both write the same pre-state
-        v = _timeline_views()
+        v0 = _timeline_views_proved()
         def _has(t):
             return any(m["host"] == "" and m["sid"] == parent_sid for m in t["members"])
-        names = [t["name"] for t in v["tags"] if _has(t)]
+        names = [t["name"] for t in v0["tags"] if _has(t)]
         if not names:
             return []
-        v = json.loads(json.dumps(v))                # deep copy: never mutate the cached blob
+        v = json.loads(json.dumps(v0))               # the working copy; v0 stays the pristine base
         for t in v["tags"]:
             if _has(t):
                 t["members"] = t["members"] + [{"host": "", "sid": child_sid}]
-        _set_timeline_views(v)
+        _set_timeline_views(v, base=v0)
     _mark_views_dirty()
     return names
 
@@ -4786,6 +5043,55 @@ def _b36(n):
 
 
 _TAG_GONE = "that tag no longer exists — it may have been deleted from another dashboard"
+
+
+def _views_fault_text(e):
+    """The views store's fault in the person's words: the store (never the file -- the once-per-episode
+    notice names it), the step that failed, and the errno and strerror. The head of every refusal
+    (_views_fault_refusal), the frame's marker of a blob it could not prove (_views_payload), and the
+    reason on the spawn sites' and the heal's bell rows."""
+    return "the tag store could not be %s (%s)" % ("written" if isinstance(e, _StateUnwritable) else "read", e.fault)
+
+
+def _views_fault_refusal(e):
+    """The refusal a gesture on the views store gets when the STORE itself faulted (_StateUnreadable /
+    _StateUnwritable out of a proved read or a publish) -- the tags dialog's tagEditAck, a lens write's
+    viewsAck, POST /tag's reply, the creation ack's `tagError`: the fault (_views_fault_text) and what
+    stands -- nothing changed, since a read that fails edits nothing and a publish that fails never
+    reached its replace."""
+    return "%s; nothing was changed \u2014 retry" % _views_fault_text(e)
+
+
+def _note_tags_not_inherited(parent_sid, child_name, e):
+    """A spawn (a fork, a promoted thread) whose parent's tag memberships could not be copied because the
+    views store faulted (_inherit_tag_membership raised): the session already exists, so the spawn stands
+    and what did NOT happen is said -- one stderr line, and one dashboard notice under the bell's `refused`
+    kind naming the child, since the store's own once-per-episode notice cannot say which session landed
+    outside its group. Tagging it again once the store reads puts it there."""
+    text = ('"%s" did not inherit the tags of "%s": %s \u2014 tag it again once it can be'
+            % (child_name, _name_of(parent_sid) or parent_sid, _views_fault_text(e)))
+    sys.stderr.write("romp-kernel: %s\n" % text)
+    try:
+        _sync_notice(text, ok=False, kind="refused")
+    except Exception:
+        pass
+
+
+def _note_views_heal_deferred(name, e):
+    """A /clear or revive whose new session id could not inherit its session's tag memberships because
+    the views store faulted under the heal (_ordered's boundary deferred it, _views_heal_pending): the
+    dashboard hears it like the fork and promotion sites (_note_tags_not_inherited) -- one bell row under
+    the `refused` kind, once per deferral, beside the stderr line the boundary writes. Until this change
+    that line was the whole record, and it dies with the process while the session sits outside its tag
+    (review find, 2026-09-08). The row says what happens next: the heal is retried until it lands, and a
+    restart loses it, so tagging the session again is the remedy then. Guarded like the rest: a notice
+    never turns a placed fork into a raise out of a build."""
+    text = ('"%s" did not carry its tags across a /clear or revive: %s. Retried until it lands; '
+            'tag it again if the kernel restarts first' % (name, _views_fault_text(e)))
+    try:
+        _sync_notice(text, ok=False, kind="refused")
+    except Exception:
+        pass
 
 
 def _default_tag_name(tags):
@@ -4824,7 +5130,12 @@ def _edit_tag(name=None, add=(), remove=(), color=None, delete=False, rename=Non
     # subsequent edit. A name that is empty after the strip is no name: a create takes the default.
     name = (str(name)[:_VIEWS_MAX_NAME].strip() or None) if name is not None else None
     with _views_lock:   # the server is threaded; two unlocked merges would both copy the same pre-state
-        v = json.loads(json.dumps(_timeline_views()))     # deep copy: never mutate the cached blob
+        v0 = _timeline_views_proved()   # PROVED: a read fault RAISES (_StateUnreadable; a failed publish
+        #                                below, _StateUnwritable) to the door, which refuses -- never an
+        #                                edit applied to a fabricated empty store and published over the
+        #                                user's real tags (a create landed a one-tag store; an edit by tid
+        #                                was refused as a deleted tag). v0 is the setter's diff base too.
+        v = json.loads(json.dumps(v0))                    # the working copy; v0 stays the pristine base
         if tid is not None:
             hits = [t for t in v["tags"] if t["id"] == tid]
             if not hits:
@@ -4841,7 +5152,7 @@ def _edit_tag(name=None, add=(), remove=(), color=None, delete=False, rename=Non
             if not hits:
                 return None, 'no tag named "%s"' % name
             v["tags"] = [t for t in v["tags"] if t["id"] != hits[0]["id"]]
-            _set_timeline_views(v)      # an active pointing at it falls back to "all" (the All view) in the normalizer
+            _set_timeline_views(v, base=v0)   # an active pointing at it falls back to "all" (the All view) in the normalizer
             return None, None
         if hits:
             t = hits[0]
@@ -4870,7 +5181,7 @@ def _edit_tag(name=None, add=(), remove=(), color=None, delete=False, rename=Non
         if color is not None:
             t["color"] = color
         v = _norm_timeline_views(v)
-        _set_timeline_views(v)
+        _set_timeline_views(v, base=v0)
         out = json.loads(json.dumps(next(t2 for t2 in v["tags"] if t2["id"] == t["id"])))
         out["members"] = [_member_str(m) for m in out["members"]]   # the route's reply speaks strings
         return out, None
@@ -4884,7 +5195,8 @@ def _move_tag_member(tid_from, tid_to, sids):
     viewer-relative id strings every client posts (_member_pair canonicalizes). Returns
     (tag-or-None, error-or-None) like _edit_tag; the tag is the destination's post-write row."""
     with _views_lock:
-        v = json.loads(json.dumps(_timeline_views()))     # deep copy: never mutate the cached blob
+        v0 = _timeline_views_proved()                     # PROVED, like _edit_tag: a fault raises to the door
+        v = json.loads(json.dumps(v0))                    # the working copy; v0 stays the pristine base
         by_id = {t["id"]: t for t in v["tags"]}
         src, dst = by_id.get(tid_from), by_id.get(tid_to)
         if src is None:
@@ -4897,7 +5209,7 @@ def _move_tag_member(tid_from, tid_to, sids):
         have = {(m["host"], m["sid"]) for m in dst["members"]}
         dst["members"] = list(dst["members"]) + [m for m in pairs if (m["host"], m["sid"]) not in have]
         v = _norm_timeline_views(v)
-        _set_timeline_views(v)
+        _set_timeline_views(v, base=v0)
         out = json.loads(json.dumps(next(t for t in v["tags"] if t["id"] == tid_to)))
         out["members"] = [_member_str(m) for m in out["members"]]
         return out, None
@@ -4982,7 +5294,11 @@ def _ack_views_write(client, kind, write_id, ok, error=None, refused=None, info=
     kernel-minted `tid` and `name` here and opens its rename input on that id. `edited` is the
     write's own list (the whole-blob path): it orders the not-ok `error`, the poster's own refusals
     first. A dead socket is the client's problem, never the write's: the edit landed before this
-    runs."""
+    runs. Under a READ fault the store cannot be proved for the ack either (review find, 2026-09-08):
+    `views` is then the last blob this kernel served, marked by `viewsFault` (the fault in the person's
+    words), or absent with the marker alone when nothing was served yet -- so a poster reverting on the
+    refusal keeps what it holds instead of adopting a seq-less empty store as the base, and `seq` is
+    None. A publish fault's refusal read the store proved, so its ack carries the blob unmarked."""
     if not client or not callable(client.get("send")):
         return
     try:
@@ -4995,13 +5311,14 @@ def _views_write_ack(kind, write_id, ok, error=None, refused=None, info=None, ed
     """The ack document _ack_views_write sends, built without a socket: POST /views (the Obsidian
     panel's whole-blob write, _state_write_route) answers with this same document, so the panel feeds
     it to the viewsAck handler it already has and a refusal reads the same in every host."""
-    views = _views_client()
+    vp = _views_payload()
+    views = vp.get("views")
     ack = {"type": kind, "writeId": write_id if isinstance(write_id, str) else None,
-           "ok": bool(ok), "views": views,
+           "ok": bool(ok), **vp,
            # the store's write sequence after this write (the blob carries it too): the poster
            # orders this against the frames it receives — a frame with a lower seq predates the
-           # write and is ignored, whatever order the socket delivered them in
-           "seq": views.get("seq")}
+           # write and is ignored, whatever order the socket delivered them in; None with no blob
+           "seq": views.get("seq") if views is not None else None}
     for k in ("tid", "name"):
         if isinstance(info, dict) and info.get(k):
             ack[k] = info[k]
@@ -5115,15 +5432,30 @@ def _tag_ack(sid, parent_sid="", tags=()):
                       matches by position and says "applied as <name>" instead
       tagError      — the first refused tag edit's reason, when any
     The session exists by the time a tag edit can refuse (a same-named twin, the tag cap), so the
-    refusal rides beside the ack rather than undoing the spawn; the caller surfaces it."""
+    refusal rides beside the ack rather than undoing the spawn; the caller surfaces it. A views STORE
+    fault (the proved read raised; the publish failed) is a refusal of the same standing: nothing was
+    inherited or joined, every requested tag reads as not applied, and `tagError` carries the fault in
+    the person's words (_views_fault_refusal) -- before this change the inherit read an empty parent
+    off a fabricated store and the join created the tag anew, erasing the rest, under a clean ack."""
     sid = str(sid)
     tags = [str(t) for t in (tags or ())]
     err = None
     applied = []
     if parent_sid:
-        _inherit_tag_membership(parent_sid, sid)
+        try:
+            _inherit_tag_membership(parent_sid, sid)
+        except (_StateUnreadable, _StateUnwritable) as e:
+            sys.stderr.write("romp-kernel: %s did not inherit the tags of %s: %s\n" % (sid, parent_sid, e))
+            err = _views_fault_refusal(e)
     for name in tags:
-        row, e = _edit_tag(name.strip(), add=[sid])
+        try:
+            row, e = _edit_tag(name.strip(), add=[sid])
+        except (_StateUnreadable, _StateUnwritable) as ex:
+            # the same store for every name left: none joined, said once, positionally
+            sys.stderr.write("romp-kernel: %s joined no tag: %s\n" % (sid, ex))
+            applied.extend([None] * (len(tags) - len(applied)))
+            err = err or _views_fault_refusal(ex)
+            break
         applied.append(row["name"] if row else None)
         if e and not err:
             err = e
@@ -5151,6 +5483,14 @@ def _tag_new_session(sid, parent_sid="", tags=()):
 # set from the timeline's lane controls; the session stays on the timeline. mtime-cached since
 # build_feed/build_timeline read it on every push.
 _flags_cache = {}   # str(path) -> ((mtime,size), dict)
+# One writer of session-flags.json at a time: _set_session_flag and _set_notify_session both
+# read-modify-write the whole file, and the kernel runs them from many threads (the WS receive loops
+# of every dashboard, the POST /flag route's handler threads). Two unlocked writers that read the same
+# store both publish, and the second publish drops the first one's toggle while both were acked ok
+# (review find, 2026-09-08, on #1078: 8 to 13 of 40 concurrent route writes survived). Taken around
+# the proved read and the publish as one step; the setters' side work (goal clearing, the planner
+# fast-forward) runs outside it, as it touches other stores.
+_flags_lock = threading.Lock()
 
 
 def _session_flags_proved():
@@ -5205,18 +5545,19 @@ def _session_flag_raw(sid, flag):
 
 
 def _set_session_flag(sid, flag, value):
-    cur = dict(_session_flags_proved())              # PROVED: a read fault refuses (raises) rather than
-    #                                                  overwriting every session's flags with a fabricated {}
-    f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
-    if value:
-        f[flag] = True
-    else:
-        f.pop(flag, None)
-    if f:
-        cur[sid] = f
-    else:
-        cur.pop(sid, None)
-    _write_state_json(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
+    with _flags_lock:                                # read and publish as ONE step (the store's rule, above)
+        cur = dict(_session_flags_proved())          # PROVED: a read fault refuses (raises) rather than
+        #                                              overwriting every session's flags with a fabricated {}
+        f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
+        if value:
+            f[flag] = True
+        else:
+            f.pop(flag, None)
+        if f:
+            cur[sid] = f
+        else:
+            cur.pop(sid, None)
+        _write_state_json(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
     if flag == "hideFromFeed" and value:
         # Muting takes the session OUT of task tracking → VIEW-CLEAR its current goals: seal them exactly like
         # crossing each card off the feed (cleared.jsonl + the durable node flag), NOT delete — they stay on
@@ -5386,22 +5727,23 @@ def _set_notify_session(sid, value):
     discipline as _set_notify_card, against the master. Not _set_session_flag: that setter's
     pop-on-false is right for the on/off view flags, but here False is a real value (muted while
     the master is on)."""
-    cur = dict(_session_flags_proved())              # PROVED: a read fault refuses rather than erasing flags
-    f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
-    # the master this click is judged against lives in the OTHER store and must be PROVED too: read
-    # through the display reader, a fault on notify-cards.json folded it to off, so a click matching
-    # that fabricated master popped the session's stored override -- a mute erased under the success
-    # path. A fault there refuses this write exactly like a fault on the flags file.
-    master = bool(_notify_cards_proved().get(NOTIFY_ALL_KEY))
-    if bool(value) == master:
-        f.pop("notify", None)
-    else:
-        f["notify"] = bool(value)
-    if f:
-        cur[sid] = f
-    else:
-        cur.pop(sid, None)
-    _write_state_json(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
+    with _flags_lock:                                # read and publish as ONE step (the store's rule, above)
+        cur = dict(_session_flags_proved())          # PROVED: a read fault refuses rather than erasing flags
+        f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
+        # the master this click is judged against lives in the OTHER store and must be PROVED too: read
+        # through the display reader, a fault on notify-cards.json folded it to off, so a click matching
+        # that fabricated master popped the session's stored override -- a mute erased under the success
+        # path. A fault there refuses this write exactly like a fault on the flags file.
+        master = bool(_notify_cards_proved().get(NOTIFY_ALL_KEY))
+        if bool(value) == master:
+            f.pop("notify", None)
+        else:
+            f["notify"] = bool(value)
+        if f:
+            cur[sid] = f
+        else:
+            cur.pop(sid, None)
+        _write_state_json(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
 
 
 def _prune_notify_cards(live_ids):
@@ -8156,7 +8498,7 @@ def _open_top_goal(sid):
     their notes lifted while they still held exactly those). Was _working_top_goal ('working' only), whose
     sole caller was that expiry."""
     try:
-        store = jd.load_goals(sid)
+        store = jd.load_goals_shared(sid)           # read-only: a top's status
     except Exception:
         return None
     nodes = store.get("nodes", {}); status = store.get("status", {})
@@ -8986,6 +9328,12 @@ def _lift_spent_awaiting(now, tmux):
             # reply), the SDK reg (the CLI epoch) and the backend's live task set. Unchanged since the
             # last cycle → the ruling is unchanged → skip the load (2026-09-03: this ran a full store
             # load + journal replay per live session per 0.5 s cycle on a quiet board).
+            # A recorded fingerprint stands for a ruling made from the files' CONTENT. A load that raises
+            # forgets its entry (the except below), a load that FAULTS forgets it (the boundary's (None,
+            # fault) answer below), and so does one whose store parsed but whose override JOURNAL did not
+            # read: _replay_overrides logs history-unreadable, returns the store without the user's rows
+            # and marks it `_unread`. A ruling on that store is not a ruling on the files (a stamp the
+            # journal restored is missing from it), so the entry is forgotten and the next cycle retries.
             snap = tmux.get(sid) or {}
             # …plus the two facts the ruling reads that no file records: the live subagent count, and
             # for every dispatch the transcript pairs, WHETHER its recorded deadline has passed (a
@@ -9005,6 +9353,8 @@ def _lift_spent_awaiting(now, tmux):
             if fault is not None:                     # its row is filed; forget the gate so the next cycle
                 _lift_seen.pop(sid, None)             # retries this session, and go on to the others
                 continue
+            if store.get("_unread"):                  # the store read but its journal did not (the mark):
+                _lift_seen.pop(sid, None)             # not a ruling on the files; the next cycle retries
             nodes = store.get("nodes") or {}
             stamped = [nd for nd in nodes.values()
                        if nd.get("awaitingWhy") and nd.get("awaitingAt") and not nd.get("rolledUp")]
@@ -10113,7 +10463,7 @@ def _deferral_sweep_tick(now):
     drop = []
     for sid, recs in by_sid.items():
         try:
-            store = jd.load_goals(sid)
+            store = jd.load_goals_shared(sid)           # read-only: nodes, status, confirming, log rows
         except Exception:
             continue                                   # unreadable store → records stand; nothing silent
         nodes, status = store.get("nodes", {}) or {}, store.get("status", {}) or {}
@@ -11907,7 +12257,10 @@ def _fork_session_inner(parent_sid, cut_msg_uuid, new_name, now=None, client=Non
     # the fork inherits the parent's TAGS too (tab groups on tags, the user 2026-09-04) — the same
     # "that conversation, continued elsewhere" contract be.fork applies to mode/effort/model/env —
     # before the direct push below, so the first frame already sections the new tab under its group
-    _inherit_tag_membership(parent_sid, sid)
+    try:
+        _inherit_tag_membership(parent_sid, sid)
+    except (_StateUnreadable, _StateUnwritable) as e:
+        _note_tags_not_inherited(parent_sid, nm, e)   # the fork stands; its group membership did not follow
     be.connect(sid)          # eager-connect: the CLI copies the conversation and the tab fills in
     if client is not None:   # the asker's window follows its fork; nobody else's chat moves
         _reveal_chat_for(client, {"type": "focus", "id": sid})
@@ -13171,7 +13524,10 @@ def _comment_promote_inner(parent_sid, tid, new_name, now=None, client=None):
     # the thread becomes a TAB now, so it inherits the parent's tags here (tab groups on tags, the
     # user 2026-09-04) — never at _comment_create, where it has no tab and a tagged hidden sid would
     # only inflate the member lists
-    _inherit_tag_membership(parent_sid, tsid)
+    try:
+        _inherit_tag_membership(parent_sid, tsid)
+    except (_StateUnreadable, _StateUnwritable) as e:
+        _note_tags_not_inherited(parent_sid, nm, e)   # the promotion stands; its group membership did not follow
     started = be.connect(tsid)
     if client is not None:   # the promoter's window follows the new session; nobody else's chat moves
         _reveal_chat_for(client, {"type": "focus", "id": tsid})
@@ -13907,8 +14263,12 @@ def _fire_api_retry(sid, be, manual=False):
     # message, force-pinning a junk goal per retry via the never-skip hard guard ("retry — kept on the
     # board…", 71 of them in one API-error storm). The marker makes author_of return 'romp' (ROMP_INJECT_RE)
     # so the echo + transcript render gray and the planner skips a work-less retry instead of minting a goal.
-    be.send(sid, RETRY_MSG)
+    delivered = be.send(sid, RETRY_MSG)
     _note_retry_sent(sid, manual=manual)
+    # the send's own verdict, for the manual route's reply (review find, 2026-09-08): SdkBackend.send and
+    # CodexBackend.send return False for a session they cannot reach (no live registry row, no client);
+    # TmuxBackend.send always True. Only an explicit False is a refusal; a backend answering None sent.
+    return delivered is not False
 
 
 def _auto_retry_tick(now, tmux):
@@ -14133,8 +14493,12 @@ def _refuse_drive(client, op, sid, msg):
         # `sid` rides along so the shell's error-center entry carries the session it was meant for, the way
         # every card-badge entry does — the bell is a log you read later, and "which one?" is the first thing
         # you ask of it.
+        # `op` and `itemId` name the REQUEST (review find, 2026-09-08): the feed latches a button on the click
+        # (Retry → "Retrying…", Continue → "Sent") and re-arms it on the kernel's reply for that post alone,
+        # not every latch the session holds, and never on a clock, so the reply says which post it answers.
         client["send"](json.dumps({"type": "err", "title": "That %s was not delivered" % what,
-                                   "text": detail, "copy": text, "sid": sid}))
+                                   "text": detail, "copy": text, "sid": sid,
+                                   "op": op, "itemId": msg.get("itemId") or ""}))
     except Exception:
         pass
 
@@ -14389,7 +14753,14 @@ def _drive(msg, client):
         # ONE retry decision, all of it kernel state — see _fire_api_retry (shared with the kernel's own
         # _auto_retry_tick, which drives recovery unattended since 2026-08-11; this route remains for the
         # manual Retry-now button and the dashboard tick's redundant asks, both idempotent against it).
-        _fire_api_retry(sid, be, manual=bool(msg.get("manual")))
+        if not _fire_api_retry(sid, be, manual=bool(msg.get("manual"))) and msg.get("manual"):
+            # the backend refused the send (review find, 2026-09-08): the feed's Retry latched "Retrying…" on
+            # the click and re-arms on the kernel's reply for that request, matched by sid. Nothing answered a
+            # refused send before, so the button stayed latched until the card happened to be re-sent. A SOFT
+            # refusal (nothing typed was lost), so a typed reply the feed toasts, not the must-dismiss `err`.
+            # The auto path stays silent: no pane asked, and the kernel's own tick asks again.
+            client["send"](json.dumps({"type": "retryRefused", "sid": sid,
+                                       "text": "Couldn't retry: the session isn't connected right now."}))
     elif t == "setModel" and msg.get("value"):
         # mid-compaction → parked as a queued command; `floating` is the version submenu's Latest row —
         # forget the family's remembered pin and send the alias
@@ -14760,8 +15131,12 @@ def _revive_session(sid, client=None):
     refusal = _claim_session_name(name, "revive", sid, own=sid)
     if refusal:
         sys.stderr.write("revive '%s' (%s): refused — %s\n" % (name, sid, refusal))
-        _send_to_view("chat", {"type": "reviveFailed", "id": sid, "name": name, "text": refusal},
-                      (client or {}).get("wid") or "")
+        # the asking dashboard's chat AND feed, like every other revive refusal (_revive_session_inner): the
+        # feed's parked card latched "Reviving…" on the click and re-arms only on the reply for its own sid.
+        failed = {"type": "reviveFailed", "id": sid, "name": name, "text": refusal}
+        wid = (client or {}).get("wid") or ""
+        _send_to_view("chat", failed, wid)
+        _send_to_view("feed", failed, wid)
         return
     try:
         _revive_session_inner(sid, client)
@@ -14814,8 +15189,15 @@ def _revive_session_inner(sid, client=None):
         ok, detail = False, str(e)[:200]
     if not ok:
         sys.stderr.write("revive '%s' (%s): %s\n" % (name, sid, detail))
-        _send_to_view("chat", {"type": "reviveFailed", "id": sid, "name": name,
-                               "text": detail or "unknown error"}, (client or {}).get("wid") or "")
+        failed = {"type": "reviveFailed", "id": sid, "name": name, "text": detail or "unknown error"}
+        wid = (client or {}).get("wid") or ""
+        _send_to_view("chat", failed, wid)
+        # …and the same dashboard's FEED (review find, 2026-09-08): its parked-handoff card latched "Reviving…"
+        # on the click and re-arms on this reply, the reply for ITS request, matched by the revived sid, which
+        # is the card's own. With the notice aimed at the chat alone the feed heard nothing, and since the feed
+        # repaints a card only when the kernel re-sends it, a refusal that changes no card left that button
+        # latched until the parked card's colour ticked: never, past the colour ramp's ceiling.
+        _send_to_view("feed", failed, wid)
         return
     _kept_open.discard(sid)       # it's live again → no longer a read-only kept tab
     _push_soon()                  # surface it promptly — the woken pusher builds it off this thread
@@ -19056,8 +19438,9 @@ SYNC_RING = 40
 def _sync_notice(text, ok=True, kind="sync"):
     """One row on the ring the shell's bell mirrors. `kind` is the bell kind the row is filed under:
     "sync" (the default, the ring's original tenant: a machine sync) or "refused" (a state file that
-    could not be read or written, or was moved aside), so a mute on one never hides the other (review
-    find, 2026-09-08). The shell allowlists the value; anything it does not know reads as sync."""
+    could not be read or written, or was moved aside, or a session's chat frame that could not be
+    built), so a mute on one never hides the other (review find, 2026-09-08). The shell allowlists the
+    value; anything it does not know reads as sync."""
     global _SYNC_SEQ
     with _SYNC_LOCK:
         _SYNC_SEQ += 1
@@ -21868,7 +22251,7 @@ def _session_stamp_read(sid):
         return hit[1]
     full, tops, deleg = (None, None, None, None, ()), set(), ()
     try:                                               # load_goals (not a raw read) so overrides replay —
-        store = jd.load_goals(sid)                     # the same view _goal_awaiting_stamp sees on the card
+        store = jd.load_goals_shared(sid)              # the same view _goal_awaiting_stamp sees on the card
         nodes = store.get("nodes", {})
         status = store.get("status", {}) or {}
         best = None
@@ -22777,7 +23160,7 @@ def _owned_yield_why(sid, path):
     if not owned:
         return None
     try:
-        store = jd.load_goals(sid)
+        store = jd.load_goals_shared(sid)           # read-only: nodes + status
         nodes = store.get("nodes", {})
         status = store.get("status", {}) or {}
     except Exception:
@@ -24541,7 +24924,72 @@ _judge_gen = [0]                                 # bumped when a producer pass C
 _goals_snap = [None]                             # {sid: store} while a judge pass is mid-flight, else None
 _goals_snap_at = [0.0]                           # when that snapshot's file reads STARTED (see _feed_goals)
 _goals_snap_done = {}                            # sid → the user-write mark already punched onto THIS snapshot
+_goals_snap_owned = set()                        # sids whose snapshot entry is THIS pass's private copy (copy-on-punch)
 _goals_snap_lock = threading.Lock()
+# STAT-KEYED STORE MEMO (2026-09-06). The snapshot used to json.loads EVERY goals/<fsid>.json at the
+# start of every pass — on one busy kernel 72 files of up to 1.3 MB, about 3% of its interpreter time
+# and most of the producer thread's cost — although a pass changes only a few of them. Every writer
+# publishes by rename (save_goals), so the bytes under an inode never change once it is at its path. The
+# memo keeps the parsed object per path under (st_ino, st_mtime_ns, st_size); a pass stats every file,
+# decodes only the ones whose key moved, and builds the snapshot from memo REFERENCES. Consequence: a
+# snapshot entry is shared with later passes, so nothing may mutate it — _feed_goals copies an entry
+# before punching a user gesture onto it (the _apply_rewind_hold idiom), and build_feed only reads. A
+# version that fails to decode is remembered under its key too, so a corrupt store is decoded (and
+# reported) once per file version rather than once per pass; its sid stays out of the snapshot and the
+# feed reads it live. A read that fails (EMFILE under descriptor pressure, EIO) is not remembered: that
+# is the pass's failure, not the version's, so the next pass reads the file again, as every pass did
+# before the memo. Entries for paths gone from the directory are evicted at the next pass, and the
+# compaction sweep after each pass evicts the entries of stores no discovered session owns
+# (_goals_memo_evict_unowned), so the resident set is bounded by the live board.
+# WHAT THE KEY RESTS ON: st_mtime_ns moving between publishes, not the inode. Inode numbers recycle
+# (on ext4, consecutive tmp+rename publishes of one path alternate between two numbers, so the third
+# version can sit on the first's inode), and equal sizes are common (a digit bump, a same-length
+# status word). On Linux 6.13+ (multigrain timestamps) the move is guaranteed: the pass's own stat
+# marks the inode as queried, so the next publish gets a fine-grained stamp. On a coarse-timestamp
+# kernel, two equal-size publishes of one store inside one clock tick after the pass's stat reproduce
+# the memoized key and pin the earlier parse until the store's next publish — a known blind spot. A byte
+# compare on a stat hit closes it; this memo does not carry one, so the cost is one pass serving the
+# earlier parse (a stale card until the store's next publish, never a wrong write).
+_goals_memo = [{}]                               # path → ((st_ino, st_mtime_ns, st_size), parsed store | _GOALS_MEMO_BAD)
+_GOALS_MEMO_BAD = object()                       # a file version that did not decode: no snapshot entry, no retry until it changes
+# Bare `+= 1` increments with one writer per key: hit/miss/fail/evict are written only by the producer thread
+# (_begin_goals_pass runs only from _producer) and punch only under _goals_snap_lock, so no key has two writers.
+_goals_memo_stats = {"hit": 0, "miss": 0, "fail": 0, "evict": 0, "punch": 0}   # read by tests and GET /perf (memos.pass)
+
+
+def _goals_memo_decode(data):
+    """The memo's one decode: a raw parse of the file's bytes, exactly what the snapshot always held
+    (no _guard_nodes, no replay — those are load_goals' business). A module function so tests count
+    decodes here rather than by patching json.loads."""
+    return json.loads(data)
+
+
+def _goals_memo_report():
+    """The memo's counters plus its current occupancy: `entries` memoized paths and `bytes` their summed
+    on-disk size (a proxy for the parsed objects' footprint). GET /perf reports it as memos.pass."""
+    memo = _goals_memo[0]
+    out = dict(_goals_memo_stats)
+    out["entries"] = len(memo)
+    out["bytes"] = sum(k[2] for k, v in memo.values() if v is not _GOALS_MEMO_BAD)
+    return out
+
+
+def _goals_memo_evict_unowned(owned):
+    """Drop the entries of stores no session in `owned` (the discover set's sids) holds. The memo had no
+    cap: every store the directory held stayed decoded in memory between passes, tens of MB on a large
+    board (review find, 2026-09-08). The compaction sweep calls this after the tiers, on the producer
+    thread, the memo's one writer. The price is one decode at the next pass for such a store the pass
+    still lists (what every pass paid before the memo); the stores a discovered session owns keep their
+    entries. A swap, never an in-place mutation: a /perf reader may be iterating the old dict."""
+    memo = _goals_memo[0]
+    kept = {path: ent for path, ent in memo.items() if os.path.basename(path)[:-5] in owned}
+    gone = len(memo) - len(kept)
+    if gone:
+        _goals_memo[0] = kept
+        _goals_memo_stats["evict"] += gone
+    return gone
+
+
 # A USER gesture (card reply, Move to Working, resolve) must NEVER wait out a pass (the user 2026-07-21).
 # The snapshot above exists to hide half-applied JUDGE writes; it was also hiding the user's own, because
 # optimistic_followup writes the LIVE store while the feed reads the frozen copy. A reply landing
@@ -24556,27 +25004,77 @@ def _note_user_goal_write(sid):
     _user_goal_write[str(sid)] = time.time()
 
 def _begin_goals_pass():
-    """Capture the PRE-pass goal stores so build_feed serves a pass-boundary-consistent view for the pass."""
-    at = time.time()          # stamped BEFORE the reads: a write racing this loop must count as AFTER them,
-    snap = {}                 # so it gets replayed onto the snapshot rather than lost to the read order
+    """Capture the PRE-pass goal stores so build_feed serves a pass-boundary-consistent view for the pass.
+
+    Stat-keyed (see the memo note above): each store is decoded only when its (ino, mtime_ns, size)
+    moved since the last pass; an unchanged one is served as the memoized object. The key is taken by
+    fstat on the fd the bytes are read from, so key and content are the same file version: a rename
+    landing between the listing's stat and the open is read whole from the new inode and keyed as
+    such. Any race the other way (content newer than its key) only costs one extra decode next pass;
+    it can never pin a stale parse, because the next stat sees a moved key. The one way a stale parse
+    CAN pin is the coarse-timestamp blind spot in the memo note above (equal size, recycled inode, same
+    clock tick); on a multigrain-timestamp kernel it does not occur."""
+    # ui/webview/feed-move-ack.test.ts pins the next line's comment text ("stamped BEFORE the reads").
+    at = time.time()          # stamped BEFORE the reads and the stats that gate them: a write racing this loop
+    snap = {}                 # must count as AFTER them, so it is replayed onto the snapshot, not lost to the read order
+    prev = _goals_memo[0]
+    memo = {}
+    hit = miss = fail = 0
     try:
-        for p in jd.GOALDIR.glob("*.json"):
-            try:
-                snap[p.stem] = json.loads(p.read_text())
-            except Exception:
-                pass
-    except Exception:
-        pass
+        entries = [e for e in os.scandir(jd.GOALDIR) if e.name.endswith(".json") and e.is_file()]
+    except OSError:
+        entries = []
+    for ent in entries:
+        path, sid = ent.path, ent.name[:-5]
+        try:
+            st = ent.stat()
+            key = (st.st_ino, st.st_mtime_ns, st.st_size)
+            old = prev.get(path)
+            if old is not None and old[0] == key:
+                hit += 1                                   # same file version → the memoized parse (or its
+                memo[path] = old                           # remembered decode failure) stands
+                if old[1] is not _GOALS_MEMO_BAD:
+                    snap[sid] = old[1]
+                continue
+            with open(path, "rb") as fh:
+                st = os.fstat(fh.fileno())
+                key = (st.st_ino, st.st_mtime_ns, st.st_size)
+                data = fh.read()
+            store = _goals_memo_decode(data)
+        except FileNotFoundError:
+            continue                                       # gone between the listing and the read: no store
+        except OSError as e:                               # unreadable (EMFILE, EIO): out of the snapshot for THIS
+            fail += 1                                      # pass and not remembered, so the next pass reads it again
+            sys.stderr.write("goals-pass: %s: %s: %s (not in the pass snapshot; served live, read again next pass)\n"
+                             % (ent.name, type(e).__name__, e))
+            continue
+        except Exception as e:                             # undecodable: out of the snapshot (the feed reads it
+            fail += 1                                      # live, as before), said once per version
+            memo[path] = (key, _GOALS_MEMO_BAD)
+            sys.stderr.write("goals-pass: %s: %s: %s (not in the pass snapshot; served live until the file changes)\n"
+                             % (ent.name, type(e).__name__, e))
+            continue
+        miss += 1
+        memo[path] = (key, store)
+        snap[sid] = store
+    _goals_memo[0] = memo
+    _goals_memo_stats["hit"] += hit
+    _goals_memo_stats["miss"] += miss
+    _goals_memo_stats["fail"] += fail
+    _goals_memo_stats["evict"] += len(prev.keys() - memo.keys())
     with _goals_snap_lock:
         _goals_snap[0] = snap
         _goals_snap_at[0] = at
         _goals_snap_done.clear()
+        _goals_snap_owned.clear()
 
 def _end_goals_pass():
-    """Pass over — drop the snapshot so reads go live again (post-pass results + any user writes show now)."""
+    """Pass over — drop the snapshot so reads go live again (post-pass results + any user writes show now).
+    The memo keeps its parsed stores: they are the next pass's cache hits."""
     with _goals_snap_lock:
         _goals_snap[0] = None
         _goals_snap_done.clear()
+        _goals_snap_owned.clear()
 
 def _feed_goals(sid):
     """Goal store for the FEED, frozen at the pre-pass snapshot while a judge pass is mid-flight (so a card
@@ -24595,6 +25093,14 @@ def _feed_goals(sid):
         if snap is not None and sid in snap:
             store, mark = snap[sid], _user_goal_write.get(str(sid), 0.0)
             if mark >= _goals_snap_at[0] and _goals_snap_done.get(sid) != mark:
+                if sid not in _goals_snap_owned:
+                    # COPY-ON-PUNCH: the entry is the memo's object, shared with every later pass that
+                    # finds the file unchanged, so the replay and rollup below must land on a copy of it
+                    # (the _apply_rewind_hold idiom). Once per pass per sid: a second gesture in the
+                    # same pass punches the copy this one made.
+                    store = snap[sid] = json.loads(json.dumps(store))
+                    _goals_snap_owned.add(sid)
+                    _goals_memo_stats["punch"] += 1
                 try:
                     jd._replay_overrides(sid, store)   # the reopen/move/resolve/unclear event, applied by the judge's own code
                     jd.rollup_status(store, False)     # …and the card's column follows it (the user just acted → working)
@@ -28290,8 +28796,9 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
     events, by_tool = [], {}                  # by_tool: tool_use_id → its tool event (fill output later)
     uuid2seg, seg_anchors = {}, {}            # atom uuid → seg id; seg id → (promptId, workId) for the dot/bar split
     seg_trig, seg_work = {}, {}               # goal-node DEEP-LINK anchors: prompt = the segment's trigger
-    _bs_store, _bs_fault = jd.load_goals_or_fault(sid)   # seam-aware seg ids (mirror the judge's split); a
-    #                                                      FAULT (row filed) → None → seams off, the tab still builds
+    _bs_store, _bs_fault = jd.load_goals_shared_or_fault(sid)   # seam-aware seg ids (mirror the judge's split):
+    #                                                             the shared read-only view; a FAULT (row filed) →
+    #                                                             None → seams off, the tab still builds
     #                                          (the per-turn seg loop runs below, after the fold decision)
     last_t = None
     last_model = ""                           # the model on the most recent assistant message (system-card meta)
@@ -28659,16 +29166,15 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                                     ev["qid"] = _qs[0]
                             if a.get("absorbed"):
                                 # A mid-turn splice (event_model._absorbed): the CLI queued this send
-                                # behind the running turn and took it at a later tool boundary, so the
-                                # atom sits at its SEND time, above the steps that ran while it waited.
-                                # The client marks it ("joined mid-turn") and, when the landing retires
-                                # a pending bubble that sat at the tail, leaves a cue where the bubble
-                                # was — the user 2026-09-05 watched a message vanish from the bottom
-                                # and reappear higher up with no explanation. `landedAt`: when the CLI
-                                # took it (the attachment's file-order predecessor; `ts` is the send).
+                                # behind the running turn and took it at a later tool boundary. The
+                                # atom sits at its LANDING time (`ts`), below the steps that ran while
+                                # it waited — where the model read it (T252d, the user 2026-09-08), and
+                                # where the chat's pending bubble already was (the tail), so nothing
+                                # moves when it lands. `sentAt`: when the user sent it, for the
+                                # bubble's hover when the two differ by more than a minute.
                                 ev["absorbed"] = True
-                                if a.get("landedT"):
-                                    ev["landedAt"] = int(a["landedT"])
+                                if a.get("sentAt"):
+                                    ev["sentAt"] = int(a["sentAt"])
                             # Several back-to-back sends the CLI took together land as ONE user record
                             # with a text block each — the shape _atom_user_texts prunes the kernel's
                             # echoes against. The chat's own pending bubbles end on an EXACT text match
@@ -29199,9 +29705,9 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
     # LEAF: its descendants are hidden even if open. Skip cleared nodes. `current` marks the focus node
     # being worked on (the graph's lastNode) so render can point a line at it; done nodes carry their
     # time for a recency-coloured "(Xm ago)" on the right.
-    gstore, gfault = jd.load_goals_or_fault(sid)   # a FAULT (row filed) → None: this tab's ledger tree
-    if gfault is None:                             # renders EMPTY instead of every tab's build failing
-        gstore = _apply_rewind_hold(sid, gstore)   # a pending rewind's cards hide on EVERY
+    gstore, gfault = jd.load_goals_shared_or_fault(sid)   # the shared read-only view; a FAULT (row filed) →
+    if gfault is None:                                    # None: this tab's ledger tree renders EMPTY instead
+        gstore = _apply_rewind_hold(sid, gstore)          # of every tab's build failing. A pending rewind's cards hide on EVERY
     #                                            surface — this ledger tree (and the tab-hover
     #                                            recents derived from it) used to keep showing the
     #                                            doomed asks for the whole armed window while the
@@ -30052,9 +30558,26 @@ _compact_seen = {}                                     # fsid → live-store mti
 
 def _compact_goal_stores():
     """Sweep every session's goal store, archiving newly-cleared tops. Cheap: skips a store whose live file
-    hasn't changed since the last sweep (no new clears, no judge write), so the steady state is just stats."""
+    hasn't changed since the last sweep (no new clears, no judge write), so the steady state is just stats.
+    Runs on the producer thread after the tiers join (its caller's single-writer slot): the pass memo it
+    evicts from has that thread as its one writer."""
     import glob
     moved = 0
+    try:
+        jd._disk_memo_evict_absent()                   # save_goals' disk-side memo: drop removed stores' entries
+        jd._shared_evict_absent()                      # ...and the shared read-only views of removed stores
+    except Exception:
+        pass
+    try:
+        # ...and, for the two memos that hold PARSED stores, the entries of stores no discovered session
+        # owns: neither had a cap (review find, 2026-09-08). discover is cached behind the transcript
+        # directory's fingerprint, so this is the tiers' own list, not a second walk. A discover that
+        # raises evicts nothing: with no owner list there is no unowned.
+        owned = {f for f, _p, _a, _n in jd.discover(int(time.time()))}
+        jd._shared_evict_unowned(owned)
+        _goals_memo_evict_unowned(owned)
+    except Exception:
+        sys.stderr.write("compact: memo eviction: %s\n" % traceback.format_exc())
     try:
         paths = glob.glob(str(jd.GOALDIR / "*.json"))
     except Exception:
@@ -30481,11 +31004,14 @@ def _postal_wait_maps():
     try:
         rows = []
         alias = {}   # "host:name" -> [(t, sid), …], learned from every row a remote sender stamped
+        ended = set()   # ids a terminal `bounced` row closed: mail that never reached anyone
         for o in _messages_rows():                    # append-incremental rows (2026-09-03); the fold
             if not isinstance(o, dict):               # itself stays whole-log: aliases learned from LATER
                 continue                              # rows resolve EARLIER peer: rows
             rows.append(o)
             jd._learn_alias(alias, o)
+            if o.get("ev") == "bounced" and o.get("id"):
+                ended.add(str(o["id"]))
         jd._alias_settle(alias)
         for hn, hist in alias.items():                # the peer's own stamps, inverted: sid -> what it wore
             for at, sid in hist:
@@ -30493,6 +31019,16 @@ def _postal_wait_maps():
         for o in rows:
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
+                continue
+            if str(o.get("id") or "") in ended:
+                # A REFUSED or DESTROYED send is neither an ask nor an answer (review find,
+                # 2026-09-08): the bus closes a message it had to give up on — a peer's refusal, the
+                # orphan sweep's destroy, an inbox file it could not read, a write a crash cut short
+                # — with a terminal `bounced` row on the same id (a publish it refuses outright
+                # writes no row at all). The recipient never saw that message, so
+                # counting its row here made the asker wear an open ask (and the debt reminder
+                # count a debt) that no reply could ever close, and let a bounced reply read as
+                # answering the pair. The judge's _postal_ask_maps applies the same rule.
                 continue
             ts = int(ts)
             # a CROSS-HOST row is addressed to the RELAY ("peer:<host>"), not the recipient's sid —
@@ -31291,7 +31827,7 @@ def build_feed(now, tmux=None):
                 # offered Continue. Badges persist for the card's life, so one absorbed badge
                 # poisoned the session's whole card tail.
                 psid, gid = o["peer"], o.get("goalId")
-                pstore, pfault = jd.load_goals_or_fault(psid) if gid else (None, None)
+                pstore, pfault = jd.load_goals_shared_or_fault(psid) if gid else (None, None)   # read-only peer view
                 sgoal = pstore.get("nodes", {}).get(gid) if pstore is not None else None
                 origin_live = bool(sgoal and not sgoal.get("nodeComplete") and not sgoal.get("cleared")
                                    and gid not in cleared)   # a sender whose store faults reads absorbed (dimmed,
@@ -31820,7 +32356,7 @@ def build_feed(now, tmux=None):
     for _a in asks:
         _a["notify"] = True if _notify_card_effective(_ncards, _a["itemId"], str(_a.get("sid") or "")) else None
     return {"type": "feed", "asks": asks, "now": now,
-            "views": _views_client(),   # the rendered views blob — the outline + feed tag mounts read it (2026-08-25)
+            **_views_payload(),   # the rendered views blob — the outline + feed tag mounts read it (2026-08-25); under a read fault its marker rides too, or alone (2026-09-08)
             # usage-limit-down latch (judge-limit.json): analysis is paused because the account
             # cannot bill judge calls — the dashboard must SAY so, never fail quietly into retries
             # (the user 2026-08-18); self-expires at the window reset, cleared by the next success
@@ -32417,7 +32953,8 @@ def _spend_recorded_at():
         return None
 
 
-_DETAIL_TOP_N = 10       # stacks the histogram names; every further session folds into ONE "other" stack
+# (T247e, the user 2026-09-08: EVERY session is its own stack in its own color and its own row in a
+# scrolling list — no top-N, no "other" fold, no legend; the list below the chart is the legend)
 _DETAIL_DAYS = 90        # the day ledger's own depth (the recorder prunes to 90 days)
 _SPEND_GRAIN = 5e-5      # a bucket's dollars minus its sids' dollars below this is rounding, not spend: the recorder
 #                          rounds the bucket sum and each sid's sum to 6 places INDEPENDENTLY, so a fully attributed
@@ -32539,7 +33076,27 @@ def _spend_detail_local(now=None):
             row["key"] = {"usd": round(k[0], 4), "tok": k[1], "turns": k[2]}
         sessions.append(row)
     sessions.sort(key=lambda s: (-s["usd"], -s["tok"], s["name"]))
-    top = [s["sid"] for s in sessions[:_DETAIL_TOP_N]]
+    # a session the registry never colored (a legacy or tmux one) still needs a color of its own for its
+    # stack and its row (T247e): a swatch of the active palette — the LEAST-USED one across this payload,
+    # so it never wears a color an identity-colored session here already has while a free one remains
+    # (the kernel's own picker's rule; review find: a plain hash gave a dead session web's blue), ties
+    # broken by the sid's hash so the pick is the same on every open; flagged so a client can tell it
+    import zlib
+    swatches = pal.colors(pal.active_name(jd.STATE))
+    used = {}
+    for s in sessions:
+        if s["bg"]:
+            used[s["bg"]] = used.get(s["bg"], 0) + 1
+    for s in sessions:
+        if s["bg"] or not swatches:
+            continue
+        h = zlib.crc32(str(s["sid"]).encode()) % len(swatches)
+        ranked = sorted(range(len(swatches)), key=lambda i: (used.get(swatches[i], 0), (i - h) % len(swatches)))
+        s["bg"] = swatches[ranked[0]]
+        s["fg"] = pal.fg_for(s["bg"])
+        s["bgDerived"] = True
+        used[s["bg"]] = used.get(s["bg"], 0) + 1
+    top = [s["sid"] for s in sessions]          # every session (T247e): the list IS the legend
     meta = {s["sid"]: s for s in sessions}
 
     def _series(buckets, keys):
@@ -32602,7 +33159,15 @@ def _spend_detail_local(now=None):
     return {"host": _self_host(), "scope": scope,
             "tz": time.strftime("%Z", lt), "tzOffsetMin": int((getattr(lt, "tm_gmtoff", 0) or 0) // 60),
             "recordedAt": _spend_recorded_at(),
-            "topN": _DETAIL_TOP_N, "sessions": sessions,
+            "sessions": sessions,
+            # the shared session order (session-order.json — what a tab drag or a lane drag writes),
+            # restricted to the sessions the TAB STRIP renders (live, or kept open): the modal's "your
+            # order" seed (T247f). The file keeps a recently dead session at its slot while its transcript
+            # is in the discover window; the strip does not show it, and the modal follows the strip, so
+            # every session no longer running trails in spend order (review find: shipped verbatim, a
+            # session dead an hour interleaved with live rows). The viewer's own arrangement is applied
+            # client-side, the way the strip and the lanes apply it (view-order.ts).
+            "order": [s for s in _session_order() if s in live or s in set(_kept_open)],
             "unattributed": {"usd": round(un[0], 4), "tok": un[1], "turns": un[2]},
             "hours": hrs, "days": _series(days, day_keys)}
 
@@ -32643,6 +33208,50 @@ def _peer_spend_call(row, timeout):
         return resp.status, j, None
     except Exception as e:
         return None, None, "could not reach %s's kernel: %s" % (host, e)
+
+
+def _spend_tags():
+    """The tags the usage modal's "merge by tag" groups by (T247g, the user 2026-09-08): this viewer's
+    own tags and every attached host's cached ones, as _views_client renders them, unioned by NAME —
+    the user ruled tags equivalent, no home tag, so a same-named tag on two kernels is one here (the
+    strip's sections union the same way) — members as the viewer sees them (a bare local sid, host:sid
+    for a remote session: the modal's own keys), the first color a same-named tag carries. A tag with
+    no color of its own gets the least-used swatch of the active palette among the tags, ties by the
+    name's hash, so it reads the same on every open; flagged colorDerived."""
+    try:
+        v = _views_client()
+    except Exception:
+        return []
+    out = {}
+    for t in (v.get("tags") or []) + (v.get("remoteTags") or []):
+        if not isinstance(t, dict):
+            continue
+        name = str(t.get("name") or "").strip()
+        if not name:
+            continue
+        e = out.setdefault(name, {"name": name, "color": "", "members": []})
+        if not e["color"] and t.get("color"):
+            e["color"] = str(t["color"])[:16]
+        for m in t.get("members") or []:
+            if isinstance(m, str) and m not in e["members"]:
+                e["members"].append(m)
+    tags = sorted(out.values(), key=lambda t: t["name"].lower())
+    swatches = pal.colors(pal.active_name(jd.STATE))
+    if swatches:
+        import zlib
+        used = {}
+        for t in tags:
+            if t["color"]:
+                used[t["color"]] = used.get(t["color"], 0) + 1
+        for t in tags:
+            if t["color"]:
+                continue
+            h = zlib.crc32(t["name"].encode()) % len(swatches)
+            ranked = sorted(range(len(swatches)), key=lambda i: (used.get(swatches[i], 0), (i - h) % len(swatches)))
+            t["color"] = swatches[ranked[0]]
+            t["colorDerived"] = True
+            used[t["color"]] = used.get(t["color"], 0) + 1
+    return tags
 
 
 def _spend_detail(now=None):
@@ -32700,6 +33309,8 @@ def _spend_detail(now=None):
     if len(payloads) == 1:
         out = dict(local)
         out["hosts"] = hosts
+        out["order"] = [[me, s] for s in (local.get("order") or []) if isinstance(s, str)]
+        out["tags"] = _spend_tags()
         return out
     return _merge_spend_details(payloads, hosts, local)
 
@@ -32721,8 +33332,7 @@ def _merge_spend_details(payloads, hosts, local):
                 row["host"] = host
                 sessions.append(row)
     sessions.sort(key=lambda s: (-float(s.get("usd") or 0), -int(s.get("tok") or 0), str(s.get("name") or "")))
-    top_n = int(local.get("topN") or _DETAIL_TOP_N)
-    top = [(s["host"], s["sid"]) for s in sessions[:top_n]]
+    top = [(s["host"], s["sid"]) for s in sessions]   # every session is a stack (T247e)
     top_set = set(top)
     meta = {(s["host"], s["sid"]): s for s in sessions}
     un = {"usd": 0.0, "tok": 0, "turns": 0, "byHost": {}}
@@ -32771,9 +33381,9 @@ def _merge_spend_details(payloads, hosts, local):
         n = len(keys)
         pos = {e: i for i, e in enumerate(epochs)} if name == "hours" else {k: i for i, k in enumerate(keys)}
         per = {}           # (host, sid) -> [usd[], tok[]]
-        other = ([0.0] * n, [0] * n)
-        other_count = 0    # "other (N sessions)" counts CONTRIBUTORS in this range only, like the local reader:
-        #                    each payload's own fold plus the top-N sessions of its own the merge folded
+        others = {}        # host -> ([usd], [tok], count): an OLDER peer's own "other" fold (its build still
+        #                    folds beyond a top-N); kept as that host's stack so its dollars are not lost, and
+        #                    named with the host — a current build folds nothing (T247e)
         una = ([0.0] * n, [0] * n)
         una_hosts = {}
         for host, p, rng, ax in peer_axes:
@@ -32785,15 +33395,13 @@ def _merge_spend_details(payloads, hosts, local):
                 kind = s.get("kind")
                 if kind == "sid":
                     key = (host, str(s.get("sid") or ""))
-                    if key in top_set:
-                        dst = per.setdefault(key, ([0.0] * n, [0] * n))
-                    else:
-                        dst = other
-                        if any(usd) or any(tok):
-                            other_count += 1
+                    if key not in top_set:
+                        continue          # a stack for a session the roster does not know: nothing to draw it as
+                    dst = per.setdefault(key, ([0.0] * n, [0] * n))
                 elif kind == "other":
-                    dst = other
-                    other_count += int(s.get("count") or 0)
+                    o = others.setdefault(host, ([0.0] * n, [0] * n, [0]))
+                    o[2][0] += int(s.get("count") or 0)
+                    dst = o
                 elif kind == "unattributed":
                     dst = una
                     hu = una_hosts.setdefault(host, ([0.0] * n, [0] * n))
@@ -32821,9 +33429,10 @@ def _merge_spend_details(payloads, hosts, local):
             m = meta[key]
             stacks.append({"kind": "sid", "host": key[0], "sid": key[1], "name": m.get("name") or "", "bg": m.get("bg") or "",
                            "live": bool(m.get("live")), "usd": u, "tok": arr[1]})
-        ou = [round(v, 4) for v in other[0]]
-        if any(ou) or any(other[1]):
-            stacks.append({"kind": "other", "name": "other", "count": other_count, "usd": ou, "tok": other[1]})
+        for oh, o in others.items():
+            ou = [round(v, 4) for v in o[0]]
+            if any(ou) or any(o[1]):
+                stacks.append({"kind": "other", "host": oh, "name": "other", "count": o[2][0], "usd": ou, "tok": o[1]})
         uu = [round(v, 4) for v in una[0]]
         if any(uu) or any(una[1]):
             stacks.append({"kind": "unattributed", "name": "unattributed", "usd": uu, "tok": una[1],
@@ -32833,8 +33442,16 @@ def _merge_spend_details(payloads, hosts, local):
             out["epochs"] = epochs
         return out
 
+    # the seed for "your order" (T247f): each host's own shared order, hosts local-first then in the
+    # remotes listing's order — the dashboard's host sequence (federation's hostSeq: local, then attach
+    # order); an older peer that ships no order contributes nothing and its sessions trail
+    order = []
+    for host, p in payloads:
+        for sid in (p.get("order") or []):
+            if isinstance(sid, str):
+                order.append([host, sid])
     out = dict(local)
-    out.update({"hosts": hosts, "sessions": sessions, "unattributed": un,
+    out.update({"hosts": hosts, "sessions": sessions, "unattributed": un, "order": order, "tags": _spend_tags(),
                 "hours": _merge_range("hours"), "days": _merge_range("days")})
     return out
 
@@ -32955,7 +33572,7 @@ def _msg_sum_scan_session(sid, path, now):
         return {}
     sub = {}
     session = _parse(path, sid, now)
-    mstore = jd.load_goals(sid)
+    mstore = jd.load_goals_shared(sid)               # read-only: the seams for the seg ids
     for turn in session["turns"]:
         for seg in _segs_seam(turn, mstore):
             cap = _seg_work_caption(caps, seg["id"])     # drift-safe: the store id came from the judge's parse
@@ -34265,9 +34882,9 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
         tm = tmux.get(sid)
         live = tm is not None
         hexcol = (tm and tm["color"]) or (_name_color(sid) or {}).get("bg", "#888888")
-        goals, gfault = jd.load_goals_or_fault(sid)  # a FAULT (row filed) → None: this lane renders without
-        if gfault is not None:                       # goal-derived data (blocked state, seams, judging marks)
-            _bars_complain(sid, "goals", gfault)     # and the frame ships for every other lane
+        goals, gfault = jd.load_goals_shared_or_fault(sid)   # read-only view (seams + judging marks); a FAULT (row
+        if gfault is not None:                       # filed) → None: this lane renders without goal-derived data
+            _bars_complain(sid, "goals", gfault)     # (blocked state, seams, marks) and the frame ships for every other lane
         if with_bars:
             try:
                 session = _parse(s["path"], sid, now)
@@ -34500,7 +35117,7 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
     # letting the bar slide through the map's hues as it compresses — mirroring the context battery fill.
     cmap_grad = [list(cm.ramp(v, ctx_stops)) for v in (0.12, 0.34, 0.56, 0.78, 1.0)]
     return {"type": "timeline", "now": now, "sessions": sessions, "turns": turns,
-            "views": _views_client(),
+            **_views_payload(),
             "palette": pal.colors(_palette_name()),   # tag color choices — the same set sessions draw identity colors from
             "messages": messages, "judging": judging,
             "cmapGrad": cmap_grad,
@@ -34823,9 +35440,10 @@ WS_DEAD_S = float(os.environ.get("ROMP_WS_DEAD", "0")) or 3 * KEEPALIVE_S
 def _keepalive_all(now=None):
     # `dv` = the current dist build token (the same value baked into every page's ?v= urls). Riding the
     # keepalive makes build-drift detection EVENT-based on every surface with a live socket: a page whose
-    # LOADEDV is older raises the reload banner within one heartbeat of a rebuild — no per-page /version
-    # polling. The VS Code extension compares it against its bundled build stamp the same way (the user
-    # 2026-07-13: a stale tab sat silent through several rebuilds; drift must always show a banner).
+    # LOADEDV is older reloads itself within one heartbeat of a rebuild (T265, the user 2026-09-08; until then
+    # it raised the reload banner, the user 2026-07-13, whose stale tab sat silent through several rebuilds) —
+    # no per-page /version polling. The VS Code extension compares it against its bundled build stamp the same
+    # way and keeps its banner: a webview reload cannot fix bundled-code drift.
     s = json.dumps({"type": "ka", "dv": _dist_ver()})
     now = _ws_clock() if now is None else now
     with _clients_lock:
@@ -37523,6 +38141,38 @@ def _note_chat_divergence(sid, name, chat_state, row_state, now):
         pass
 
 
+_chat_build_faults = {}   # sid -> the fault text of its CURRENT chat-build episode; ONE stderr traceback + bell row per episode
+_chat_build_faults_lock = threading.Lock()   # the pusher and a connect push both run _push, on their own threads
+
+
+def _chat_build_fault(s, exc):
+    """Name a session whose chat build raised, on stderr (with the traceback) AND as a dashboard bell row,
+    ONCE per fault episode. _push skips the session's frame for the cycle (see its catch), so without this
+    the user's only sign was a pane that stopped updating, and a build that fails the same way every cycle
+    (its input stands) wrote a full traceback every 0.5-3 s (review find, 2026-09-08). The episode is the
+    fault TEXT, the _git_file_fault rule: an identical repeat says nothing, a different fault on the same
+    session is a new episode, and a build that succeeds ends it (_chat_build_ok). The bell row wears the
+    kind a state file that cannot be read wears. Never raises: the bell is a courtesy inside the push."""
+    sid = str(s.get("sid") or "")
+    text = "%s: %s" % (type(exc).__name__, exc)
+    with _chat_build_faults_lock:                     # check-and-set as ONE step: two _push threads faulting
+        if _chat_build_faults.get(sid) == text:       # the same session must not both speak
+            return
+        _chat_build_faults[sid] = text
+    sys.stderr.write("push build: chat %s: %s\n" % (sid[:8], traceback.format_exc()))
+    try:
+        _sync_notice("chat: the pane for %s cannot be built (%s); it keeps its last frame until a build succeeds"
+                     % (s.get("name") or sid[:8], text), ok=False, kind="refused")
+    except Exception:
+        pass
+
+
+def _chat_build_ok(sid):
+    """A chat build that succeeded ends the session's fault episode, so the same fault later is said anew."""
+    if _chat_build_faults:                            # the common case (no episode open) pays no lock
+        with _chat_build_faults_lock:
+            _chat_build_faults.pop(str(sid), None)
+
 
 def _push(targets, connect=False, tmux=None):
     """Build the payloads once (cached parses) and send each target only the pieces that CHANGED for it.
@@ -37602,7 +38252,18 @@ def _push(targets, connect=False, tmux=None):
                     _VIEW_STATS["chatBuildActive" if is_active else "chatBuildBg"] += 1
                     started = time.time()                # the _views_dirty floor for this build (start-keyed)
                     _t0 = time.monotonic()
-                    m = build_session(s["sid"], now, tmux)
+                    try:
+                        m = build_session(s["sid"], now, tmux)
+                    except Exception as e:
+                        # One session's failed chat build costs that session's frame this cycle, not every
+                        # client's whole push: the cycle-level catch below ("push build:") would return
+                        # before the feed and the timeline were built, and a build that fails the same way
+                        # every cycle would freeze the board for as long as its input stands (2026-09-06).
+                        # Said ONCE per fault episode, on stderr and as a dashboard bell row, so the pane
+                        # that stopped updating is not a silent degrade (review find, 2026-09-08).
+                        _chat_build_fault(s, e)
+                        continue
+                    _chat_build_ok(s["sid"])             # a build that succeeds ends its fault episode
                     # The full serialization is LAZY (the 2026-08-10 CPU fix, round two): steady state
                     # sends only chatTail suffixes, so an eager json.dumps of the WHOLE payload — multi-MB
                     # for a busy active tab, re-dumped every cycle just to be discarded — was the largest
@@ -39373,12 +40034,119 @@ html,body{background:var(--vscode-editor-background);}
 body{font-family:var(--vscode-font-family);font-size:13px;color:var(--vscode-foreground);margin:0;padding:0;}"""
 
 # The WS bridge shim (ported verbatim from chat-view server.ts shimJs — same protocol).
+# ── the dashboard reloads ITSELF on a kernel restart and on a newer served bundle (T265) ──────────────────────
+# The user's ruling of 2026-09-08 supersedes their 2026-07-13 preference for a banner the
+# reader clicks: any restart of the kernel SERVING the page, and any bundle newer than the one the page loaded
+# with, reload the page by themselves. Two signals, both exact events, never a timer:
+#   (1) kernel restart — a socket REOPEN whose /version answers with a boot id other than the one baked into the
+#       page (checkBoot: the shell asks on its own socket's reopen; a standalone pane asks on its shim's
+#       reconnect); the 30 s /version poll the stale banner already ran is the backstop for a page whose socket
+#       never dropped (noteVersion, the same reading).
+#   (2) build drift — a `dv` on a keepalive, or /version's dist_ver, above the page's baked LOADEDV (noteDv).
+# Never mid-gesture: a pointer button held, a touch pan (pointercancel converts a held pointer into a pan hold
+# that touchend/touchcancel/scrollend release — the finger is still on the glass), a drag in flight, a text
+# selection being made in the FOCUSED document (a highlight left in another pane is not a gesture), any focused
+# editable with text (the composer, the picker's inputs, the feed modal's follow-up box — a generic "typing"
+# hold), or a pane's sends still queued for its socket's reopen (the shim's window.__rompPaneBusy: a prompt typed
+# while the kernel was down must flush before the page goes) ARMS the reload, and the ending event fires it —
+# pointerup, touchend/touchcancel/scrollend, dragend/drop, selectionchange, input, focusout, the pane's own flush;
+# a window blur releases every hold. The fire is deferred one tick past the ending event so the click the same
+# press produces lands on its control first. The shell composes gesture state across its same-origin panes, and a
+# pane forwards its request to the shell when one is there, so ONE decision reloads the top document; a standalone
+# pane page decides for itself, and so does a pane under a foreign parent (an iframe in another app can reload
+# itself). Before reloading: every pane persists what a reload loses (window.__rompPersistForReload — the chat
+# pane's scroll position + follow mode, per tab in sessionStorage; the draft and the active tab are persisted
+# already); once location.reload has been accepted the shell's lifted modals close (settings/picker) and a marker
+# rides sessionStorage, stamped with the page's path, so the fresh LANDING leaves ONE notification-center line
+# ("Reloaded onto build N — the kernel restarted / a newer romp build was served") and a standalone pane's marker
+# is consumed by nobody else. If location.reload throws (a host that forbids it) the old banner is the fallback
+# (the `refused` hook) and the refusal LATCHES for that build/boot: no re-attempt on every gesture end or poll,
+# only a strictly newer dv or boot re-arms. The VS Code webview never runs this: the extension loads its bundle from the installed VSIX
+# and a webview reload cannot fix bundled-code drift, so its own reload prompt stays (vscode-extension/src/
+# extension.ts). Federated relay: a REMOTE kernel's restart must not reload the page — and cannot: the core reads
+# only THIS page's own socket and /version (federation.ts drops remote `ka` frames, so they never reach the shim's
+# dv check, and the relay never forwards a remote kernel's boot id). tests/test_dashboard_auto_reload.py runs
+# this code in node with fakes and pins the wiring.
+_RELOAD_CORE_JS = r"""/*reload-core*/(function(){if(window.__rompReload)return;
+var LOADED=__LOADEDVER__,BOOT=__ROMP_BOOT__,ptr=0,pan=false,drag=false,owed=null,fired=false,refusedFor=null;
+function shell(){try{var p=window.parent;if(p&&p!==window&&p.__rompReload)return p.__rompReload;}catch(e){}return null;}
+function editing(){try{var a=document.activeElement;if(!a)return false;var tag=(a.tagName||'').toUpperCase();
+var textual=tag==='TEXTAREA'||(tag==='INPUT'&&/^(text|search|url|email|number|password|tel)$/i.test(a.type||'text'))||!!a.isContentEditable;
+if(!textual)return false;var val=(a.value!=null?a.value:(a.textContent||''));return !!String(val).trim();}catch(e){return false;}}
+function busyHere(){if(ptr>0)return 'pointer';if(pan)return 'pan';if(drag)return 'drag';
+try{var s=document.getSelection&&document.getSelection();var focused=!document.hasFocus||document.hasFocus();
+if(focused&&s&&s.rangeCount&&!s.isCollapsed&&String(s).length)return 'selection';}catch(e){}
+if(editing())return 'typing';
+try{if(window.__rompPaneBusy){var b=window.__rompPaneBusy();if(b)return String(b);}}catch(e){}
+return '';}
+function panes(){var out=[],fs=document.querySelectorAll?document.querySelectorAll('iframe'):[];
+for(var i=0;i<fs.length;i++){try{var w=fs[i].contentWindow;if(w&&w.__rompReload)out.push(w);}catch(e){}}return out;}
+function busy(){var b=busyHere();if(b)return b;var ps=panes();for(var i=0;i<ps.length;i++){b=ps[i].__rompReload.busyHere();if(b)return b;}return '';}
+function persist(){try{if(window.__rompPersistForReload)window.__rompPersistForReload();}catch(e){}
+var ps=panes();for(var i=0;i<ps.length;i++){try{if(ps[i].__rompPersistForReload)ps[i].__rompPersistForReload();}catch(e){}}}
+function key(o){return o?o.reason+':'+(o.detail||''):'';}
+function fire(){if(fired)return;fired=true;persist();
+try{location.reload();}catch(e){fired=false;refusedFor=key(owed);R.waiting='refused';if(R.refused)R.refused(owed);return;}
+try{sessionStorage.setItem('romp:reloaded',JSON.stringify({reason:owed.reason,detail:owed.detail||'',from:LOADED,path:location.pathname,t:Date.now()}));}catch(e){}
+try{document.body.classList.remove('settings-open','picker-open');}catch(e){}}
+function tryFire(){if(!owed||fired)return;if(refusedFor!==null&&refusedFor===key(owed))return;var b=busy();if(b){R.waiting=b;return;}R.waiting='';fire();}
+function request(reason,detail){var s=shell();if(s){s.request(reason,detail);return;}if(fired)return;
+var next={reason:reason,detail:detail||''};if(refusedFor!==null&&key(next)!==refusedFor){refusedFor=null;owed=next;}
+if(!owed)owed=next;tryFire();}
+function noteDv(dv){if(LOADED&&dv&&dv>LOADED)request('build',String(dv));}
+function noteVersion(v){if(!v)return;if(v.boot&&BOOT&&v.boot!==BOOT)request('restart',String(v.boot));if(v.dist_ver)noteDv(v.dist_ver);}
+function checkBoot(){try{fetch('/version',{cache:'no-store'}).then(function(r){return r.json();}).then(noteVersion)['catch'](function(){});}catch(e){}}
+function announce(notify){var raw=null;try{raw=sessionStorage.getItem('romp:reloaded');if(raw)sessionStorage.removeItem('romp:reloaded');}catch(e){}
+if(!raw)return null;var d=null;try{d=JSON.parse(raw);}catch(e){return null;}if(!d)return null;
+if(d.path&&d.path!==location.pathname)return null;
+var why=d.reason==='restart'?'the kernel restarted':'a newer romp build was served';
+var txt='Reloaded onto build '+LOADED+' — '+why+'.';try{if(notify)notify('reload',txt);}catch(e){}return txt;}
+document.addEventListener('pointerdown',function(){ptr++;},true);
+document.addEventListener('pointerup',function(){ptr=Math.max(0,ptr-1);},true);
+document.addEventListener('pointercancel',function(){if(ptr>0){ptr=0;pan=true;}},true);
+document.addEventListener('touchend',function(){pan=false;},true);
+document.addEventListener('touchcancel',function(){pan=false;},true);
+document.addEventListener('scrollend',function(){pan=false;},true);
+document.addEventListener('dragstart',function(){drag=true;},true);
+document.addEventListener('dragend',function(){drag=false;},true);
+document.addEventListener('drop',function(){drag=false;},true);
+var END=['pointerup','touchend','touchcancel','scrollend','dragend','drop','selectionchange','input','focusout'];
+function ended(){setTimeout(function(){var s=shell();if(s)s.tryFire();else tryFire();},0);}
+for(var k=0;k<END.length;k++)document.addEventListener(END[k],ended,true);
+window.addEventListener('blur',function(){ptr=0;pan=false;drag=false;ended();});
+var R={request:request,tryFire:tryFire,ended:ended,busyHere:busyHere,busy:busy,noteDv:noteDv,noteVersion:noteVersion,checkBoot:checkBoot,announce:announce,
+inShell:function(){return !!shell();},owed:function(){return owed;},fired:function(){return fired;},refusedFor:function(){return refusedFor;},refused:null,waiting:'',loaded:LOADED,boot:BOOT};
+window.__rompReload=R;})();/*end-reload-core*/"""
+
+
+def _reload_core(v=0):
+    """The reload core with this page's build token and this kernel's boot id baked in (see _RELOAD_CORE_JS).
+    Embedded by _shim (every pane page) and _stale_block (the dashboard landing)."""
+    return _RELOAD_CORE_JS.replace("__LOADEDVER__", str(int(v))).replace("__ROMP_BOOT__", json.dumps(_BOOT_ID))
+
+
+def _reload_core_js(v=0, boot=None):
+    """The reload core's IIFE alone — the code between its /*reload-core*/ anchors, baked for `v` and `boot` — so a
+    node test runs the REAL decision code with fakes for document, window, location, sessionStorage and fetch
+    (test_dashboard_auto_reload.py). Fails loudly if the anchors ever go missing."""
+    js = _RELOAD_CORE_JS.replace("__LOADEDVER__", str(int(v))).replace(
+        "__ROMP_BOOT__", json.dumps(_BOOT_ID if boot is None else boot))
+    a, b = "/*reload-core*/", "/*end-reload-core*/"
+    i, j = js.find(a), js.find(b)
+    if i < 0 or j < i:
+        raise RuntimeError("the reload-core anchors are missing from _RELOAD_CORE_JS")
+    return js[i + len(a):j]
+
+
 def _shim(app, v=0):
     # `v` = the dist build token this page was served with (its ?v= urls). The shim compares it against the
-    # `dv` riding every keepalive and raises the build banner on drift — so EVERY kernel-served page gets the
-    # "newer build" prompt, not just the dashboard landing's /version poll (the user 2026-07-13: a standalone
-    # pane sat silent through rebuilds).
+    # `dv` riding every keepalive and, on drift, asks the reload core it embeds as the template's first slot
+    # (window.__rompReload, _RELOAD_CORE_JS) to reload the page — never mid-gesture (the user 2026-09-08,
+    # superseding the 2026-07-13 banner; the build bar is only the refused fallback). EVERY kernel-served page
+    # notices, not just the dashboard landing's /version poll (the user 2026-07-13: a standalone pane sat
+    # silent through rebuilds).
     return """
+%s
 (function(){/*shim-core*/var queue=[],ws=null,everConnected=false;
 var queuedDiag=0,DIAG_QUEUE_MAX=20;   // clientDiag rows waiting in `queue` for a reconnect, capped (an outage must not pile up breadcrumbs); other queued messages are untouched
 var failedConnects=0,firstFailT=0;   // handshakes that never OPENED since the last open: reported as ONE wsconnfail row on the next open, never one wsclose per redial
@@ -39404,7 +40172,10 @@ function netState(s){try{if(window.parent!==window)window.parent.postMessage({ro
 // "Re-judging" frame long after the kernel had moved on). PROMPT the user to reload rather than silently
 // auto-reloading (foisted, jarring) or leaving them staring at stale content. In the dashboard the pane rides
 // in an iframe, so hand it to the shell's ONE #rstale reload banner; a standalone page (feed/timeline opened
-// directly) has no shell, so self-inject a minimal top bar with the same Reload action.
+// directly) has no shell, so self-inject a minimal top bar with the same Reload action. Scope since T265 (the
+// user 2026-09-08): this prompt is for a reconnect to the SAME kernel process (a blip) — a reconnect against a
+// NEW process, and a newer bundle, reload the page by themselves (the reload core above); the "build" bar is
+// only the core's refused fallback.
 function selfBar(t,kind){try{if(document.getElementById("romp-stale-self"))return;
 var b=document.createElement("div");b.id="romp-stale-self";b.dataset.kind=kind||"conn";
 b.style.cssText="position:fixed;top:0;left:0;right:0;z-index:99999;display:flex;gap:12px;align-items:center;justify-content:center;background:#2b2d30;color:#e6e6e6;border-bottom:1px solid #4a4d51;padding:9px 14px;font:13px/1.4 'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif";
@@ -39496,13 +40267,22 @@ if(window.parent!==window){try{window.parent.postMessage({romp:"wsStale"},"*");}
 // path itself closes).
 var stalePending="",staleKa=0,pendingWhy="",openSock=null,openT=0;
 function armStale(why){stalePending=why;staleKa=0;}
-// BUILD drift (the user 2026-07-13): the keepalive carries the kernel's current dist token (dv); a page whose
-// baked LOADEDV is older is running outdated code against newer kernel state — prompt a reload (never auto).
-// In the dashboard the raise routes to the shell's #rstale banner (build:1 → its BUILDMSG); standalone pages
-// self-inject the same bar. Latched: one prompt per page life, cleared only by the reload it asks for.
+// BUILD drift: the keepalive carries the kernel's current dist token (dv); a page whose baked LOADEDV is older is
+// running outdated code against newer kernel state. The user 2026-07-13 wanted EVERY kernel-served page to notice
+// (a standalone pane sat silent through rebuilds); the user 2026-09-08 ruled the page RELOADS ITSELF, superseding
+// the 2026-07-13 "prompt, never auto" — the raise asks window.__rompReload (the reload core, embedded above this
+// shim on every kernel-served page), which forwards to the shell when this pane sits in one and otherwise reloads
+// this page in place, never mid-gesture. selfBar is only the refused fallback (a host that forbids location.reload).
+// Latched: one request per page life.
 var buildRaised=false,freshPending=false,restartAnnounced=0;   // freshPending: a reconnect is awaiting its resync frame; restartAnnounced: the kernel's dying frame (T217)
-function raiseBuild(){if(buildRaised)return;buildRaised=true;
-if(window.parent!==window){try{window.parent.postMessage({romp:"wsStale",build:1},"*");}catch(e){}}
+// T265: the reload core asks every pane before firing; a pane whose socket is down with sends queued for its
+// reopen (a prompt typed during a kernel restart) holds the reload — the shell's socket may reopen first, and a
+// reload then would take the queue with it. Diag rows never hold. The flush in ws.onopen is the ending event.
+window.__rompPaneBusy=function(){return (everConnected&&queue.length>queuedDiag)?"sends":"";};
+// …and a standalone page (no same-origin shell) consumes its own reload marker: nobody else would
+try{if(window.__rompReload&&!window.__rompReload.inShell())window.__rompReload.announce(null);}catch(e){}
+function raiseBuild(){if(buildRaised)return;buildRaised=true;var R=window.__rompReload;
+if(R){R.refused=function(){selfBar("A newer romp build is available.","build");};R.request("build","");}
 else selfBar("A newer romp build is available.","build");}
 function connect(){if(ws&&(ws.readyState===0||ws.readyState===1))return;   // one live attempt at a time — a lost timer + the watchdog can both call in
 if(returnAt)returnRedialed=true;   // a dial inside a return window (whatever path led here) → the return-fresh row says so
@@ -39511,14 +40291,20 @@ var active="";try{var st0=JSON.parse(localStorage.getItem(SK)||"null");active=(s
 ws=new WebSocket(proto+location.host+"/ws?app=%s&delta=1&iid="+encodeURIComponent(IID)+(wid?"&wid="+encodeURIComponent(wid):"")+(active?"&active="+encodeURIComponent(active):""));
 // onopen: flush the queue; a RECONNECT (after a drop) also PROMPTS a reload — the fresh socket resyncs live via
 // the kernel's next push, and the banner offers a full reload for anything a live push doesn't cover. This
-// replaces the old silent location.reload() (the user: don't foist a reload; let me click — [[prefer-reload-banner-not-auto]]).
+// replaced the old silent location.reload() (the user 2026-07-05: don't foist a reload; let me click). Narrowed by
+// T265 (the user 2026-09-08, superseding that for restarts): when the reconnect is against a NEW kernel process
+// (its /version boot id differs from this page's) the page reloads itself via the reload core — a standalone page
+// asks here (checkBoot), a pane inside the shell leaves it to the shell's own socket; the prompt stays for a
+// same-process blip.
 // A RECONNECT also fires `romp:wsup`, the counterpart to the `romp:wsdown` below: whatever went up when the
 // socket dropped (the pane's romp loader) needs the socket's RETURN as its event to come back down. The
 // first connect deliberately doesn't fire it — nothing is waiting on it, and the loader must stay up until
 // real content lands.
 ws.onopen=function(){lastRecv=Date.now();openT=lastRecv;openSock=this;netState("up");resumeProvisional=0;var wasReconn=everConnected;everConnected=true;for(var i=0;i<queue.length;i++)ws.send(queue[i]);queue=[];queuedDiag=0;
+try{if(window.__rompReload)window.__rompReload.ended();}catch(e){}   // T265: the flush is the ending event for the "sends" hold — a reload owed while a prompt sat in the queue goes now
 if(failedConnects){send({type:"clientDiag",surface:"pane-shim",what:"wsconnfail",data:{app:APP,attempts:failedConnects,firstFailMs:Date.now()-firstFailT}});failedConnects=0;firstFailT=0;}   // the redials that never opened since the last open, as ONE row: how many, and how long ago the first failed
 if(wasReconn){var ann=restartAnnounced&&Date.now()-restartAnnounced<30000;restartAnnounced=0;   // one-shot: spent here
+if(window.__rompReload&&!window.__rompReload.inShell())window.__rompReload.checkBoot();   // T265: a REOPEN is the restart signal — a standalone page asks /version whose kernel answered; inside the shell, the shell asks on its own socket
 if(!ann)armStale(pendingWhy||"reconnect");   // T217: an ANNOUNCED restart's reconnect skips the arm — the resync lands in a beat and the flash was pure noise; a restart that never comes back stays loud through the disconnected state itself, and a SECOND reconnect arms as always
 pendingWhy="";freshPending=true;try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}}};
 ws.onmessage=function(ev){lastRecv=Date.now();resumeProvisional=0;if(returnAt)returnBytes+=(ev.data&&ev.data.length)||0;var msg;try{msg=JSON.parse(ev.data);}catch(e){return;}
@@ -39612,8 +40398,19 @@ if(kind==="dict"){items[kk]=v[kk];}
 else if(kind.indexOf("dictlist:")===0){var cut=kk.indexOf(SEP),dk=cut<0?kk:kk.slice(0,cut),rest=cut<0?"":kk.slice(cut+1),lane=v[dk];if(rest===""){items[kk]=lane;}else{var j=pos[dk]||0;pos[dk]=j+1;items[kk]=lane[j];}}
 else{items[kk]=v[i];}}
 maps[name]={order:order,items:items};}return maps;}
-function assemble(kind,map){var i,kk;if(kind==="dict"){var o={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))o[kk]=map.items[kk];}return o;}
+// dictlist lanes keep their ARRAY IDENTITY across a delta that did not touch them: the lane prefix of
+// every set/del key names a touched lane, and an order that crosses touches every lane whose key
+// subsequence differs from the held order. An untouched lane assembles elementwise-identical to the
+// array the pane already holds, so assemble hands back that same array — turns[sid] identity then means
+// "unchanged", and a per-lane cache in the pane can key on it. The assembled VALUE is what it always
+// was; only object identity differs.
+function laneOf(kk){var cut=kk.indexOf(SEP);return cut<0?kk:kk.slice(0,cut);}
+function laneSeqs(order){var s={};for(var i=0;i<order.length;i++){var kk=order[i],ln=laneOf(kk);(s[ln]||(s[ln]=[])).push(kk);}return s;}
+function touchedLanes(c,oldOrder,newOrder){var t={},k;if(c.del)for(k=0;k<c.del.length;k++)t[laneOf(c.del[k])]=1;if(c.set)for(k in c.set)t[laneOf(k)]=1;
+if(c.order){var a=laneSeqs(oldOrder),b=laneSeqs(newOrder),ln;for(ln in a)if(!(ln in b)||JSON.stringify(a[ln])!==JSON.stringify(b[ln]))t[ln]=1;for(ln in b)if(!(ln in a))t[ln]=1;}return t;}
+function assemble(kind,map,prev,touched){var i,kk;if(kind==="dict"){var o={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))o[kk]=map.items[kk];}return o;}
 if(kind.indexOf("dictlist:")===0){var d={};for(i=0;i<map.order.length;i++){kk=map.order[i];if(!map.items.hasOwnProperty(kk))continue;var cut=kk.indexOf(SEP);var dk=cut<0?kk:kk.slice(0,cut),rest=cut<0?"":kk.slice(cut+1);
+if(prev&&touched&&!touched[dk]&&Object.prototype.hasOwnProperty.call(prev,dk)){if(!d.hasOwnProperty(dk))d[dk]=prev[dk];continue;}   // an untouched lane: the held array itself, not a copy
 if(rest===""){d[dk]=map.items[kk];continue;}   // a bare-prefix entry: the lane's own (empty or non-list) value
 if(!d.hasOwnProperty(dk))d[dk]=[];d[dk].push(map.items[kk]);}return d;}
 var out=[];for(i=0;i<map.order.length;i++){kk=map.order[i];if(map.items.hasOwnProperty(kk))out.push(map.items[kk]);}return out;}
@@ -39623,7 +40420,8 @@ var coll=d.coll||{};for(var name in coll){var kind=kinds[name];if(!kind)continue
 if(c.del){for(var x=0;x<c.del.length;x++){delete items[c.del[x]];}}
 if(c.set){for(var sk in c.set){if(!items.hasOwnProperty(sk))order.push(sk);items[sk]=c.set[sk];}}
 if(c.order){order=c.order.slice();}else{order=order.filter(function(kk){return items.hasOwnProperty(kk);});}
-last.maps[name]={order:order,items:items};m[name]=assemble(kind,last.maps[name]);}
+var touched=kind.indexOf("dictlist:")===0?touchedLanes(c,map.order,order):null;
+last.maps[name]={order:order,items:items};m[name]=assemble(kind,last.maps[name],last.msg[name],touched);}
 last.rev=d.rev;last.msg=m;return m;}
 window.__rompLocalSend=send;window.__rompApp=APP;   // federation.ts (the multi-kernel manager) routes local sends + knows the app through these
 var SK="romp-vscode-state-%s";   // persist webview state to localStorage so UI prefs survive a refresh
@@ -39670,7 +40468,7 @@ pendingWhy="foreground";freshPending=true;   // the reconnect's arm reads "foreg
 if(ws&&ws.readyState===1)abandon();else{try{if(ws&&ws.readyState===0)ws.close();}catch(e){}}   // OPEN-but-quiet → abandoned + redialed below, now; stuck-CONNECTING → aborted, onclose retries
 if(!ws||ws.readyState===3)connect();
 returnDiag("return",row);});/*end-shim-core*/})();   // filed AFTER the redial so it queues for the new socket instead of vanishing into the dead one
-""" % (app, int(v), app, app)
+""" % (_reload_core(v), app, int(v), app, app)
 
 
 def _shim_core_js(app="test", v=0):
@@ -40095,7 +40893,11 @@ else if(m.type==="caps"&&panel.setCaps)panel.setCaps(m);
 else if(m.type==="unknownOp"&&panel.unknownOp)panel.unknownOp(m);
 else if(m.type==="tagEditFailed"&&panel.tagEditFailed)panel.tagEditFailed(m);
 else if(m.type==="openViewsDialog"&&panel._openViewsDialog)panel._openViewsDialog(null);};
-window.addEventListener("message",(window.__rompPerf&&window.__rompPerf.wrapFrameHandler)?window.__rompPerf.wrapFrameHandler(onFrame):onFrame);
+var frameListener=(window.__rompPerf&&window.__rompPerf.wrapFrameHandler)?window.__rompPerf.wrapFrameHandler(onFrame):onFrame;
+window.addEventListener("message",frameListener);
+// the merged data/bars frames come by direct call from federation.js once the listener is registered with it (federation.ts
+// onFrame/emit; the pane bundles register through frame-listener.ts) — without the registry the window dispatch carries them
+if(window.__rompFed&&window.__rompFed.onFrame)window.__rompFed.onFrame(frameListener);
 window.__rompTimelineOpenExternal=function(url){try{var u=new URL(url);if(u.protocol==="vscode:"){var q=u.searchParams;
 post({type:"deepLink",session:q.get("session"),anchor:q.get("anchor")||undefined,anchorT:Number(q.get("anchorT"))||undefined,anchorKind:q.get("anchorKind")||undefined,compose:q.get("compose")==="1"});
 if(window.parent!==window)window.parent.postMessage({romp:"reveal",pane:"chat"},"*");return;}}catch(e){}window.open(url,"_blank");};
@@ -40930,20 +41732,75 @@ pullFleet().then(done,function(){if(ROWS.length)renderRows(ROWS,SELF);done();});
 // kernel-side, the ledger's bySid series — fetched on open behind the romp loader, never scraped from
 // the hover's HTML. The click still kicks the hover's own refresh (pull), so both levels are fresh.
 var spBack=document.getElementById('rsp-back'),spPanel=document.getElementById('rsp-panel'),spTip=null;
-var SP={data:null,err:'',range:'hours',measure:'usd',open:false,allRows:false};
+var SP={data:null,err:'',range:'hours',measure:'usd',order:'spend',merge:false,open:false};
+// the toggles persist across opens and reloads (T247f): range, measure, and the list's order
+var SP_PREFS_KEY='romp:spendModal';
+function spLoadPrefs(){try{var p=JSON.parse(localStorage.getItem(SP_PREFS_KEY)||'{}')||{};if(p.range==='days'||p.range==='day')SP.range=p.range;if(p.measure==='tok')SP.measure='tok';if(p.order==='yours')SP.order='yours';if(p.merge===true)SP.merge=true;}catch(e){}}
+function spSavePrefs(){try{localStorage.setItem(SP_PREFS_KEY,JSON.stringify({range:SP.range,measure:SP.measure,order:SP.order,merge:SP.merge}));}catch(e){}}
+spLoadPrefs();
+// "your order" (T247f, the user 2026-09-08): the order the tab strip and the timeline lanes show — the
+// kernel's shared seed per host (session-order.json; hosts local-first then attach order, remote ids
+// host-prefixed the way federation prefixes them) arranged by THIS viewer's own drag order, read from
+// the same localStorage key the strip reads (view-order.ts VIEW_ORDER_KEY). spApplyViewOrder is that
+// module's applyViewOrder, twinned here because the landing page loads no webview bundle; a node test
+// (ui/webview/spend-order-twin.test.ts) holds the two together. Sessions the order does not know (dead,
+// archived, an older peer's) trail in their spend order.
+function spApplyViewOrder(seed,view){var clean=function(xs){var out=[],seen=Object.create(null);(xs||[]).forEach(function(x){if(typeof x==='string'&&!seen[x]){seen[x]=1;out.push(x);}});return out;};var s=clean(seed);if(!view||!view.length)return s;var want=Object.create(null),placed=Object.create(null),out=[];s.forEach(function(x){want[x]=1;});clean(view).forEach(function(id){if(want[id]){placed[id]=1;out.push(id);}});s.forEach(function(id){if(!placed[id])out.push(id);});return out;}
+function spViewOrder(){try{var o=JSON.parse(localStorage.getItem('romp:vieworder')||'[]');return Array.isArray(o)?o:[];}catch(e){return [];}}
+function spKey(d,s){return (s.host&&s.host!==d.host)?(s.host+':'+s.sid):s.sid;}
+function spOrdered(d){var ss=(d.sessions||[]).slice();if(SP.order!=='yours')return ss;
+var seed=(d.order||[]).map(function(p){return (p[0]&&p[0]!==d.host)?(p[0]+':'+p[1]):p[1];});
+var fin=spApplyViewOrder(seed,spViewOrder()),rank=Object.create(null);fin.forEach(function(id,i){rank[id]=i;});
+var known=[],rest=[];ss.forEach(function(s){if(rank[spKey(d,s)]!==undefined)known.push(s);else rest.push(s);});
+known.sort(function(a,b){return rank[spKey(d,a)]-rank[spKey(d,b)];});return known.concat(rest);}
+// the chart's stacks follow the list, bottom to top = top row to bottom row
+function spStackOrder(d,stacks){if(SP.order!=='yours')return stacks;var rank={};spOrdered(d).forEach(function(s,i){rank[String(s.host)+'\t'+s.sid]=i;});
+var sids=stacks.filter(function(s){return s.kind==='sid';}),rest=stacks.filter(function(s){return s.kind!=='sid';});
+sids.sort(function(a,b){return (rank[String(a.host)+'\t'+a.sid]||0)-(rank[String(b.host)+'\t'+b.sid]||0);});return sids.concat(rest);}
 var SP_OTHER='#4a5361',SP_NONE='#6b7a8c';   // "other" and a session with no identity color: neutrals, never a hue
 function spName(s){return s.name||('session '+String(s.sid||'').slice(0,8));}
 // T247c: when more than one machine contributes, a row or chip names its host the way a federated
 // session's tab does — the shared .host-prefix treatment (quiet, italic, a step smaller)
 function spHosts(d){return ((d&&d.hosts)||[]).filter(function(h){return h.status==='ok';});}
 function spMany(d){return spHosts(d).length>1;}
-function spLabel(s,many){return (many&&s.host?'<span class=host-prefix>'+esc(s.host)+':</span> ':'')+esc(spName(s));}
+// a session row reads like its TAB TITLE (T247e, the user 2026-09-08): the tab strip's own classes —
+// .tab-label with the identity color as --chip-bg (styles.css keys the color and weight on the SAME
+// rule the strip uses, so the two cannot drift) and the quiet .host-prefix — no swatch
+function spTitle(s,many){return '<span class="tab-label colored" style="--chip-bg:'+spColor(s)+'">'+(many&&s.host?'<span class=host-prefix>'+esc(s.host)+':</span>':'')+esc(spName(s))+'</span>';}
+// ── T247g (the user 2026-09-08): three ranges, and "merge by tag"
+// the series for the range: "1 day" is the hourly series' last 24 buckets (the ledger holds hours and
+// days; a day is a slice of the hours, never a third ledger)
+function spSeries(d){var ser=d[SP.range==='day'?'hours':SP.range];if(!ser)return null;if(SP.range!=='day')return ser;
+var n=(ser.keys||[]).length,cut=Math.max(0,n-24);
+return {keys:(ser.keys||[]).slice(cut),epochs:(ser.epochs||[]).slice(cut),stacks:(ser.stacks||[]).map(function(s){var o={};for(var k in s)o[k]=s[k];o.usd=(s.usd||[]).slice(cut);o.tok=(s.tok||[]).slice(cut);
+if(s.hosts){o.hosts={};Object.keys(s.hosts).forEach(function(h){o.hosts[h]={usd:(s.hosts[h].usd||[]).slice(cut),tok:(s.hosts[h].tok||[]).slice(cut)};});}return o;})};}
+// the rows: the ordered sessions, or — merged by tag — one row per tag holding sessions here (named
+// by the tag, colored by the tag store's color, the strip's chip color) and the untagged sessions as
+// themselves. A session under several tags counts under EACH (the user's ruling: tags are equivalent,
+// no home tag); the footer says how many do, because the rows then sum past the totals.
+function spRows(d){var ss=spOrdered(d);if(!SP.merge||!(d.tags&&d.tags.length))return {rows:ss.map(function(s,i){return {kind:'sid',s:s,sid:s.sid,name:s.name,bg:s.bg,live:s.live,usd:s.usd,tok:s.tok,turns:s.turns,host:s.host,key:s.key,rank:i};}),multi:0};
+var byKey={},counts={},tagged={},rows=[];ss.forEach(function(s,i){byKey[spKey(d,s)]={s:s,i:i};});
+d.tags.forEach(function(t){var mem=[];(t.members||[]).forEach(function(m){var e=byKey[m];if(e){mem.push(e);counts[m]=(counts[m]||0)+1;}});if(!mem.length)return;
+var usd=0,tok=0,turns=0,live=false,hosts={},minI=1e9;mem.forEach(function(e){usd+=e.s.usd||0;tok+=e.s.tok||0;turns+=e.s.turns||0;live=live||!!e.s.live;hosts[String(e.s.host)]=1;if(e.i<minI)minI=e.i;tagged[spKey(d,e.s)]=1;});
+var hk=Object.keys(hosts);rows.push({kind:'tag',sid:'tag:'+t.name,name:t.name,bg:t.color||'',live:live,usd:usd,tok:tok,turns:turns,members:mem.map(function(e){return e.s;}),host:(hk.length===1?hk[0]:''),rank:minI});});
+ss.forEach(function(s,i){if(!tagged[spKey(d,s)])rows.push({kind:'sid',s:s,sid:s.sid,name:s.name,bg:s.bg,live:s.live,usd:s.usd,tok:s.tok,turns:s.turns,host:s.host,key:s.key,rank:i});});
+if(SP.order==='yours')rows.sort(function(a,b){return a.rank-b.rank;});else rows.sort(function(a,b){return ((b.usd||0)-(a.usd||0))||((b.tok||0)-(a.tok||0));});
+var multi=0;Object.keys(counts).forEach(function(k){if(counts[k]>1)multi++;});return {rows:rows,multi:multi};}
+// the stacks follow the rows: a tag row's stack is its members' stacks summed; untagged sessions keep
+// their own; unattributed (and an older peer's fold) stay last
+function spStacks(d,ser,model){var stacks=ser.stacks||[];if(!SP.merge||!(d.tags&&d.tags.length))return spStackOrder(d,stacks);
+var byKey={};stacks.forEach(function(s){if(s.kind==='sid')byKey[spKey(d,s)]=s;});var out=[];
+model.rows.forEach(function(r){if(r.kind==='tag'){var usd=null,tok=null;r.members.forEach(function(m){var st=byKey[spKey(d,m)];if(!st)return;
+if(!usd){usd=st.usd.slice();tok=st.tok.slice();}else{for(var i=0;i<usd.length;i++){usd[i]+=st.usd[i]||0;tok[i]+=st.tok[i]||0;}}});
+if(usd&&(usd.some(function(v){return v>0;})||tok.some(function(v){return v>0;})))out.push({kind:'tag',name:r.name,bg:r.bg,live:r.live,usd:usd,tok:tok});}
+else{var st=byKey[spKey(d,r)];if(st)out.push(st);}});
+stacks.forEach(function(s){if(s.kind!=='sid')out.push(s);});return out;}
 function spColor(s){return (s.bg&&/^#[0-9a-fA-F]{3,8}$/.test(s.bg))?s.bg:SP_NONE;}
 function spHead(){var d=SP.data,ok=d?spHosts(d):[];return '<div class=rsp-top><span>'+(d&&d.scope==='computed'?'Spend (computed)':'API spend')
 +(ok.length>1?' \u00b7 '+ok.length+' machines':(d&&d.host?' \u00b7 '+esc(d.host):''))+'</span>'
 +'<button class=rsp-x data-act=close aria-label=Close>\u00d7</button></div>';}
 var spPending=null;   // the in-flight detail fetch's controller: a close or a re-open aborts it
-function openSpend(){if(!spBack||!spPanel)return;SP.open=true;spBack.hidden=false;SP.data=null;SP.err='';SP.allRows=false;
+function openSpend(){if(!spBack||!spPanel)return;SP.open=true;spBack.hidden=false;SP.data=null;SP.err='';
 spPanel.innerHTML=spHead()+'<div class=rsp-load>'+__ROMP_LOADER__+'</div>';   // the loader FIRST (the loader rule)
 // the loader ends on the EVENT (the answer) — with a backstop that cannot trap (T247b review: a hung
 // socket spun the loader forever): a generous timer aborts the fetch onto the error + retry path
@@ -40974,9 +41831,11 @@ while(t&&t!==spPanel){if(t.getAttribute&&t.getAttribute('data-act')){b=t;break;}
 if(!b)return;var a=b.getAttribute('data-act');
 if(a==='close'){closeSpend();return;}
 if(a==='retry'){openSpend();return;}
-if(a==='table:all'){SP.allRows=true;var tb=document.getElementById('rsp-table');if(tb)tb.innerHTML=sessionTable(SP.data);return;}
-var m=/^(range|measure):(\\w+)$/.exec(a);if(!m)return;
-SP[m[1]]=m[2];
+if(a==='merge:toggle'){SP.merge=!SP.merge;spSavePrefs();if(SP.merge)b.classList.add('on');else b.classList.remove('on');
+var tb2=document.getElementById('rsp-table');if(tb2){tb2.innerHTML=sessionTable(SP.data);tb2.scrollTop=0;}renderChart();return;}
+var m=/^(range|measure|order):(\\w+)$/.exec(a);if(!m)return;
+SP[m[1]]=m[2];spSavePrefs();
+if(m[1]==='order'){var tb=document.getElementById('rsp-table');if(tb){tb.innerHTML=sessionTable(SP.data);tb.scrollTop=0;}}   // the new order's head rows, not a mid-list slice (review find)
 var sib=b.parentNode.querySelectorAll('[data-act^="'+m[1]+':"]');
 for(var i=0;i<sib.length;i++){if(sib[i]===b)sib[i].classList.add('on');else sib[i].classList.remove('on');}
 renderChart();});
@@ -40985,24 +41844,25 @@ if(!ss.length&&!(un&&(un.usd>0||un.tok>0)))return '<div class=rsp-note>No per-se
 // the key-billed split shows where the hover would show it: the TOTAL scope on a mixed host, where a
 // session's key dollars differ from its computed total
 var keyCol=d.scope!=='keyed'&&ss.some(function(s){return s.key&&typeof s.key.usd==='number'&&Math.round(s.key.usd)!==Math.round(s.usd);});
-var h='<table class=rsp-tbl><thead><tr><th></th><th>session</th><th class=n>dollars</th>'+(keyCol?'<th class=n>key-billed</th>':'')
+// EVERY session, in a pane that scrolls under a sticky header (T247e): the list is the chart's legend,
+// each row its tab title in its identity color; no fold, no swatch
+var h='<table class=rsp-tbl><thead><tr><th>session</th><th class=n>dollars</th>'+(keyCol?'<th class=n>key-billed</th>':'')
 +'<th class=n>turns</th><th class=n>tokens</th></tr></thead><tbody>';
-// the table folds to the histogram's own top-N (progressive disclosure: the chart stays in view under
-// a long roster); one click shows every session
-var lim=(SP.allRows||ss.length<=(d.topN||10)+2)?ss.length:(d.topN||10),shown=ss.slice(0,lim),many=spMany(d);
-shown.forEach(function(s){h+='<tr'+(s.live?'':' class=rsp-dead')+'><td><i class=rsp-sw style="background:'+spColor(s)+'"></i></td>'
-+'<td class=rsp-name>'+spLabel(s,many)+(s.live?'':'<span class=ru-tip-reset> \u00b7 not running</span>')+'</td>'
+var many=spMany(d);
+var model=spRows(d);
+model.rows.forEach(function(s){h+='<tr data-sid="'+esc(s.sid||'')+'"'+(s.live?' class=rsp-live':' class=rsp-dead')+(s.kind==='tag'?' data-tag="'+esc(s.name)+'"':'')+'>'
++'<td class=rsp-name>'+(s.kind==='tag'?('<span class="tab-label colored" style="--chip-bg:'+spColor(s)+'">'+esc(s.name)+'</span><span class=ru-tip-reset> \u00b7 '+s.members.length+' session'+(s.members.length===1?'':'s')+'</span>'):spTitle(s.s,many))+(s.live?'':'<span class=ru-tip-reset> \u00b7 not running</span>')+'</td>'
 +'<td class=n>'+fmtUsd(s.usd)+'</td>'+(keyCol?'<td class=n>'+(s.key?fmtUsd(s.key.usd):'\u2014')+'</td>':'')
 +'<td class=n>'+(s.turns||0)+'</td><td class=n>'+fmtTok(s.tok||0)+'</td></tr>';});
-if(lim<ss.length){var rest=ss.slice(lim),ru=0,rt=0,rn=0;rest.forEach(function(s){ru+=s.usd||0;rt+=s.tok||0;rn+=s.turns||0;});
-h+='<tr class=rsp-fold><td><i class=rsp-sw style="background:'+SP_OTHER+'"></i></td><td class=rsp-name><span class=rsp-muted>'+rest.length+' more session'+(rest.length===1?'':'s')
-+'</span> <button class=rsp-btn data-act=table:all>show all</button></td><td class=n>'+fmtUsd(ru)+'</td>'+(keyCol?'<td class=n></td>':'')+'<td class=n>'+rn+'</td><td class=n>'+fmtTok(rt)+'</td></tr>';}
 // spend recorded before per-session attribution existed (T100, 2026-08-24), or the part of a bucket no
-// session accounts for: shown as its own row, never dropped or folded into a session (fail loudly)
-if(un&&(un.usd>0||un.tok>0))h+='<tr class=rsp-dead><td><i class="rsp-sw rsp-hatch"></i></td>'
-+'<td class=rsp-name>unattributed<span class=ru-tip-reset> \u00b7 recorded before per-session tracking</span></td>'
+// session accounts for: shown as its own row, never dropped or folded into a session (fail loudly);
+// its hatch mark is the chart's hatched stack, not a session swatch
+if(un&&(un.usd>0||un.tok>0))h+='<tr class=rsp-dead>'
++'<td class=rsp-name><i class="rsp-sw rsp-hatch"></i> unattributed<span class=ru-tip-reset> \u00b7 recorded before per-session tracking</span></td>'
 +'<td class=n>'+fmtUsd(un.usd)+'</td>'+(keyCol?'<td class=n>\u2014</td>':'')+'<td class=n>'+(un.turns||0)+'</td><td class=n>'+fmtTok(un.tok||0)+'</td></tr>';
-return h+'</tbody></table>';}
+h+='</tbody></table>';
+if(model.multi)h+='<div class=rsp-note>'+model.multi+(model.multi===1?' session carries':' sessions carry')+' several tags and count'+(model.multi===1?'s':'')+' under each of them, so the rows add up past the totals.</div>';
+return h;}
 // 1. the SAME window numbers the hover shows — the sums across every machine, rows only (one renderer).
 // Its own node: renderRows re-renders it whenever fresh rows land while the modal is open, so the
 // two levels agree at every moment, not only at the instant the modal opened (review find)
@@ -41017,7 +41877,23 @@ if(!d){h+='<div class=rsp-err>Couldn\u2019t load the spend detail'+(SP.err?': '+
 +'<button class=rsp-btn data-act=retry>Try again</button></div>';spPanel.innerHTML=h;return;}
 var computed=d.scope==='computed';
 h+='<div class=rsp-sec id=rsp-totals>'+totalsHTML(d)+'</div>';
-// 2. per session — EVERY attached kernel's sessions (T247c), each machine's own story merged here;
+// 2. the histogram FIRST (T247e, the user 2026-09-08): the two ranges the ledger itself holds; dollars
+// by default, tokens on a toggle; the session list below is its legend
+h+='<div class=rsp-sec><div class=ru-tip-name><span>Spend over time</span></div>'
++'<div class=rsp-ctl>'
++'<button class="rsp-btn'+(SP.range==='day'?' on':'')+'" data-act=range:day>1 day \u00b7 by hour</button>'
++'<button class="rsp-btn'+(SP.range==='hours'?' on':'')+'" data-act=range:hours>8 days \u00b7 by hour</button>'
++'<button class="rsp-btn'+(SP.range==='days'?' on':'')+'" data-act=range:days>90 days \u00b7 by day</button>'
++'<span class=rsp-gap></span>'
++'<button class="rsp-btn'+(SP.measure==='usd'?' on':'')+'" data-act=measure:usd>dollars</button>'
++'<button class="rsp-btn'+(SP.measure==='tok'?' on':'')+'" data-act=measure:tok>tokens</button>'
++'<span class=rsp-gap></span>'
++'<button class="rsp-btn'+(SP.order==='spend'?' on':'')+'" data-act=order:spend>by spend</button>'
++'<button class="rsp-btn'+(SP.order==='yours'?' on':'')+'" data-act=order:yours>your order</button>'
++'<span class=rsp-gap></span>'
++'<button class="rsp-btn'+(SP.merge?' on':'')+'" data-act=merge:toggle>merge by tag</button>'
++'</div><div id=rsp-chart></div></div>';
+// 3. per session — EVERY attached kernel's sessions (T247c), each machine's own story merged here;
 // the billing rule is named when every contributing machine shares one, else each keeps its own
 var ok=spHosts(d),many=ok.length>1;
 var scopes={};ok.forEach(function(x){scopes[x.scope||d.scope]=1;});var sk=Object.keys(scopes);
@@ -41028,23 +41904,21 @@ h+='<div class=rsp-sec><div class=ru-tip-name><span>By session'+(many?' \u00b7 '
 ((d.hosts)||[]).forEach(function(x){if(x.status==='ok')return;
 h+='<div class=rsp-note>'+esc(x.host)+': '+(x.status==='older'?'older build, no per-session data':'not reachable')+(x.detail?' \u2014 '+esc(x.detail):'')+'</div>';});
 h+='<div id=rsp-table>'+sessionTable(d)+'</div></div>';
-// 3. the histogram — the two ranges the ledger itself holds; dollars by default, tokens on a toggle
-h+='<div class=rsp-sec><div class=ru-tip-name><span>Spend over time</span></div>'
-+'<div class=rsp-ctl>'
-+'<button class="rsp-btn'+(SP.range==='hours'?' on':'')+'" data-act=range:hours>8 days \u00b7 by hour</button>'
-+'<button class="rsp-btn'+(SP.range==='days'?' on':'')+'" data-act=range:days>90 days \u00b7 by day</button>'
-+'<span class=rsp-gap></span>'
-+'<button class="rsp-btn'+(SP.measure==='usd'?' on':'')+'" data-act=measure:usd>dollars</button>'
-+'<button class="rsp-btn'+(SP.measure==='tok'?' on':'')+'" data-act=measure:tok>tokens</button>'
-+'</div><div id=rsp-chart></div></div>';
-spPanel.innerHTML=h;renderChart();}
+spPanel.innerHTML=h;renderChart();spSizePane();}
+// the list pane takes exactly the room left under the chart (review find: a fixed 38vh cap left the card
+// itself scrolling at common viewport heights, a scroll region inside a scroll region); a floor keeps a
+// few rows visible on a very short screen, where the card then scrolls as the last resort
+function spSizePane(){var pane=document.getElementById('rsp-table');if(!pane||!spPanel)return;
+var cap=Math.floor(window.innerHeight*0.92),cs=getComputedStyle(spPanel),pad=parseFloat(cs.paddingTop)+parseFloat(cs.paddingBottom)+2;
+var above=pane.offsetTop-spPanel.offsetTop-spPanel.clientTop;   // everything rendered above the pane, inside the card
+var room=cap-pad-above-8;pane.style.maxHeight=Math.max(120,room)+'px';}
 // 1-2-5 ceilings: the y-axis top is the nearest clean number above the tallest bucket
 function niceTop(mx){if(!(mx>0))return 1;var p=Math.pow(10,Math.floor(Math.log(mx)/Math.LN10)),f=mx/p;return (f<=1?1:f<=2?2:f<=5?5:10)*p;}
 function spFill(s){return s.kind==='unattributed'?'url(#rsp-hatch)':s.kind==='other'?SP_OTHER:spColor(s);}
-function spStackName(s){return s.kind==='other'?('other ('+(s.count||0)+' session'+(s.count===1?'':'s')+')'):s.kind==='unattributed'?'unattributed':spName(s);}
+function spStackName(s){return s.kind==='other'?('other ('+(s.count||0)+' session'+(s.count===1?'':'s')+(s.host?' on '+s.host:'')+')'):s.kind==='unattributed'?'unattributed':spName(s);}
 // the plain-text form for the tooltip: host · name when more than one machine contributes; the
 // unattributed stack names each machine's share of the hovered bucket
-function spStackText(s,many,meas,i){if(s.kind==='sid')return (many&&s.host?s.host+' \u00b7 ':'')+spName(s);
+function spStackText(s,many,meas,i){if(s.kind==='tag')return s.name;if(s.kind==='sid')return (many&&s.host?s.host+' \u00b7 ':'')+spName(s);
 if(s.kind==='unattributed'&&many&&s.hosts){var parts=[];Object.keys(s.hosts).forEach(function(hn){var v=(s.hosts[hn][meas]||[])[i]||0;if(v>0)parts.push(hn+' '+(meas==='usd'?fmtUsd(v):fmtTok(Math.round(v))));});
 return 'unattributed'+(parts.length?' ('+parts.join(', ')+')':'');}
 return spStackName(s);}
@@ -41061,14 +41935,14 @@ function spBucketLabel(k,range){if(range==='hours'){var m=/^(\\d{4})-(\\d\\d)-(\
 return m?(Number(m[2])+'/'+Number(m[3])+' '+m[4]+':00\u2013'+(('0'+((Number(m[4])+1)%24)).slice(-2))+':00'):k;}
 var n=/^(\\d{4})-(\\d\\d)-(\\d\\d)$/.exec(k);return n?(Number(n[2])+'/'+Number(n[3])):k;}
 function renderChart(){var box=document.getElementById('rsp-chart');if(!box||!SP.data)return;
-var d=SP.data,ser=d[SP.range],meas=SP.measure;
+var d=SP.data,ser=spSeries(d),meas=SP.measure;
 if(!ser||!ser.keys||!ser.keys.length){box.innerHTML='<div class=rsp-note>No history yet.</div>';return;}
-var stacks=ser.stacks||[],n=ser.keys.length,W=Math.max(320,box.clientWidth||600),H=200;
+var stacks=spStacks(d,ser,spRows(d)),n=ser.keys.length,W=Math.max(320,box.clientWidth||600),H=200;
 var tots=[],mx=0;for(var i=0;i<n;i++){var t=0;for(var s=0;s<stacks.length;s++){t+=(stacks[s][meas]&&stacks[s][meas][i])||0;}tots.push(t);if(t>mx)mx=t;}
 if(!(mx>0)){box.innerHTML='<div class=rsp-note>Nothing recorded in this range.</div>';return;}
 var top=niceTop(mx),slot=W/n,gap=Math.min(2,slot*0.3),bw=Math.max(1,slot-gap),PADT=6;
 var Y=function(v){return H-Math.max(0,Math.min(1,v/top))*(H-PADT);};
-var fmt=function(v){return meas==='usd'?fmtUsd(v):fmtTok(Math.round(v));};
+var fmt=function(v){return meas==='usd'?(v>0&&v<0.5?'under $1':fmtUsd(v)):fmtTok(Math.round(v));};   // whole dollars, and a sliver says so rather than "$0"
 // axis labels wear whole dollars like every spend surface (no cents anywhere, the user 2026-08-09);
 // a half-line whose value is not a whole dollar (a $5 ceiling's $2.50) stays an unlabeled hairline
 // rather than rounding into a twin of another label
@@ -41083,8 +41957,8 @@ var svg='<svg class="rsp-svg" viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+
 var ylab='';[top,top/2].forEach(function(g){var gy=Y(g);
 svg+='<line x1="0" y1="'+gy.toFixed(1)+'" x2="'+W+'" y2="'+gy.toFixed(1)+'" class="rsp-grid"></line>';
 var al=afmt(g);if(al)ylab+='<span class=ru-tip-gy style="top:'+(gy+1).toFixed(0)+'px">'+al+'</span>';});
-// one column per bucket, stacked bottom-up in stack order (top-N by dollars, then other, then
-// unattributed); a 2px surface gap between touching segments; the topmost segment's top corners
+// one column per bucket, stacked bottom-up in stack order (the session list's order — by dollars, or
+// the viewer's own — then unattributed); a 2px surface gap between touching segments; the topmost segment's top corners
 // rounded (4px data-end, square at the baseline) — the dataviz mark specs
 for(var i=0;i<n;i++){if(!(tots[i]>0))continue;var x=i*slot+gap/2,segs=[];
 for(var s=0;s<stacks.length;s++){var v=(stacks[s][meas]&&stacks[s][meas][i])||0;if(v>0)segs.push([s,v]);}
@@ -41099,26 +41973,28 @@ svg+='</svg>';
 // x labels: hourly range → weekday initials at the ledger's local midnights (the hover graph's rule);
 // daily range → the 1st and 15th. The keys are the KERNEL's local time — named when the viewer's differs.
 var xlab='';for(var i=0;i<n;i++){var k=ser.keys[i],m;
-if(SP.range==='hours'){m=/^(\\d{4})-(\\d\\d)-(\\d\\d)T00$/.exec(k);if(m){var dd=new Date(+m[1],+m[2]-1,+m[3]);
+if(SP.range==='day'){m=/T(\\d\\d)$/.exec(k);if(m&&(+m[1])%6===0)xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+m[1]+':00</span>';}
+else if(SP.range==='hours'){m=/^(\\d{4})-(\\d\\d)-(\\d\\d)T00$/.exec(k);if(m){var dd=new Date(+m[1],+m[2]-1,+m[3]);
 xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+['S','M','T','W','T','F','S'][dd.getDay()]+'</span>';}}
 else{m=/^(\\d{4})-(\\d\\d)-(01|15)$/.exec(k);if(m)xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+Number(m[2])+'/'+Number(m[3])+'</span>';}}
 var many=spMany(d);
-var leg='<div class=rsp-leg>'+stacks.map(function(s){return '<span class="rsp-chip'+((s.kind==='sid'&&!s.live)||s.kind==='unattributed'?' rsp-dead':'')+'"><i class="rsp-sw'+(s.kind==='unattributed'?' rsp-hatch':'')+'"'
-+(s.kind==='unattributed'?'':' style="background:'+(s.kind==='other'?SP_OTHER:spColor(s))+'"')+'></i>'+(s.kind==='sid'?spLabel(s,many):esc(spStackName(s)))+'</span>';}).join('')+'</div>';
+// no legend (T247e): the session list under the chart is the legend, each row in its stack's color
 var tzNote='';var mine=-(new Date().getTimezoneOffset());
 if(typeof d.tzOffsetMin==='number'&&d.tzOffsetMin!==mine)tzNote+='<div class=rsp-note>Bucket times are '+esc(d.tz||'the kernel\u2019s clock')+' (the machine that recorded them), not your local time.</div>';
 // machines in different zones (T247c): the rule is stated, not left to be guessed
 var offs={};spHosts(d).forEach(function(x){offs[String(x.tzOffsetMin)]=1;});
 if(Object.keys(offs).length>1)tzNote+='<div class=rsp-note>Hourly buckets are aligned by clock time across machines; daily buckets follow each machine\u2019s own calendar day.</div>';
-box.innerHTML=svg+ylab+'<div class=ru-tip-gx>'+xlab+'</div>'+leg+tzNote;
+box.innerHTML=svg+ylab+'<div class=ru-tip-gx>'+xlab+'</div>'+tzNote;
 // the per-segment hover: session · value · bucket, the mark itself the hit target
 var svgEl=box.querySelector('svg');if(!svgEl)return;
 svgEl.onpointermove=function(e){var t=e.target;if(!t||!t.classList||!t.classList.contains('rsp-seg')){spTipHide();return;}
 var i=+t.getAttribute('data-i'),si=+t.getAttribute('data-s'),s=stacks[si];if(!s)return;
 var v=(s[meas]&&s[meas][i])||0,o=(s[meas==='usd'?'tok':'usd']&&s[meas==='usd'?'tok':'usd'][i])||0;
-spTipShow(e.clientX,e.clientY,spStackText(s,many,meas,i),fmt(v),(meas==='usd'?fmtTok(Math.round(o))+' tok':fmtUsd(o))+' \u00b7 '+spBucketLabel(ser.keys[i],SP.range));};
+spTipShow(e.clientX,e.clientY,spStackText(s,many,meas,i),fmt(v),(meas==='usd'?fmtTok(Math.round(o))+' tok':fmtUsd(o))+' \u00b7 '+spBucketLabel(ser.keys[i],SP.range==='day'?'hours':SP.range));};
 svgEl.onpointerleave=spTipHide;}
-window.addEventListener('resize',function(){if(SP.open&&SP.data)renderChart();});
+var spResizeRaf=0;
+window.addEventListener('resize',function(){if(!(SP.open&&SP.data)||spResizeRaf)return;
+spResizeRaf=requestAnimationFrame(function(){spResizeRaf=0;if(SP.open&&SP.data){renderChart();spSizePane();}});});
 el.addEventListener('click',function(){pull(true);openSpend();});
 setInterval(function(){pull(false);},60000);     // backup auto-refresh: re-read usage.json every 60s
 pull(false);                                     // fill on load, independent of the timeline-forward path
@@ -41924,13 +42800,16 @@ Array.prototype.forEach.call(bar.querySelectorAll('button[data-act]'),function(b
 b.addEventListener('click',function(){var f=A[b.getAttribute('data-act')];if(f)f();});});
 window.addEventListener('message',function(e){var m=e.data;if(!m)return;if(m.romp==='reveal'&&m.pane)reveal(m.pane);// the chat header's Fleet pill / the fleet's back-to-chat post toggleFleet — on mobile that IS a tab switch
 if(m.romp==='toggleFleet')show(m.to==='chat'?'chat':'fleet');});
+var shellOpened=false;   // T265: this socket's REOPEN is the kernel-restart signal — the shell asks /version whose kernel answered
 function shellWS(){try{var proto=location.protocol==='https:'?'wss://':'ws://';
 var ws=new WebSocket(proto+location.host+'/ws?app=shell');
 // ready → the kernel sends the current needs-you count, so a relaunched installed app trues up
 // its icon badge immediately instead of waiting for the next change (plans/ios-app.md proposal 3)
-ws.onopen=function(){try{ws.send(JSON.stringify({type:'ready'}));}catch(e){}};
+ws.onopen=function(){try{ws.send(JSON.stringify({type:'ready'}));}catch(e){}
+if(shellOpened&&window.__rompReload)window.__rompReload.checkBoot();shellOpened=true;};
 ws.onmessage=function(ev){var m;try{m=JSON.parse(ev.data);}catch(e){return;}
-if(m&&m.type==='reveal'&&m.pane)reveal(m.pane);
+if(m&&m.type==='ka'){if(m.dv&&window.__rompReload)window.__rompReload.noteDv(m.dv);}   // build drift on the shell's own keepalive (T265)
+else if(m&&m.type==='reveal'&&m.pane)reveal(m.pane);
 // the app-icon badge: setAppBadge only exists where badging works (installed apps) — everyone
 // else falls through silently, so this needs no capability gymnastics
 else if(m&&m.type==='badge'&&'setAppBadge' in navigator){
@@ -42173,24 +43052,33 @@ _STALE_JS = (
     "var BUILDMSG='A newer romp build is available.',"
     "CONNMSG='romp lost the live connection to the dashboard, so what you see may be stale.';"
     "function show(m){msg.textContent=m;box.classList.add('show');}"
+    # T265 (the user 2026-09-08): the reload core (window.__rompReload, _RELOAD_CORE_JS) owns build drift and
+    # kernel restarts — the page reloads itself, never mid-gesture. The BUILD banner survives only as the
+    # core's `refused` fallback (a host that forbids location.reload); the poll below hands the core every
+    # /version reading (a restart the socket never showed, a bundle newer than this page's).
+    "var RL=window.__rompReload;"
+    "if(RL){RL.refused=function(){buildStale=true;show(BUILDMSG);};"
+    "RL.announce(function(k,t){if(window.__rompNotify)window.__rompNotify(k,t);});}"
     "function check(){fetch('/version',{cache:'no-store'}).then(function(r){return r.json();}).then(function(v){"
     "if(v&&v.boot&&window.__rompUpdBoot)window.__rompUpdBoot(v.boot);"   # retire cross-boot update offers (2026-08-15)
     "served=v.dist_ver||0;"
-    "if(loaded&&served>loaded&&served!==dismissed)show(BUILDMSG);"
+    "if(RL)RL.noteVersion(v);"
+    "if(loaded&&served>loaded&&served!==dismissed){if(!RL)show(BUILDMSG);}"
     "else if(served<=loaded&&!connStale&&!buildStale)box.classList.remove('show');}).catch(function(){});}"
     # A pane whose WebSocket dropped-and-reconnected (or a foregrounded tab that found its socket dead) posts
     # {romp:'wsStale'} — the same shell-coalesced channel as the disconnect banner, but a RELOAD PROMPT rather
     # than a silent auto-reload (the user 2026-07-05: a stale feed card showed 'Re-judging' while the kernel had
     # long since moved on, with no cue the view was frozen). connStale latches so the /version poll can't clear
-    # the prompt out from under it; Dismiss (or a reload) clears it. A pane's BUILD-drift raise (the shim's
-    # keepalive dv check, the user 2026-07-13) rides the same channel with build:1 → the BUILDMSG wording;
-    # buildStale latches it identically so the poll (whose own token may be current) can't clear it.
+    # the prompt out from under it; Dismiss (or a reload) clears it. A pane's BUILD-drift raise used to ride the
+    # same channel with build:1 → the BUILDMSG wording (the user 2026-07-13); since T265 (the user 2026-09-08,
+    # superseding that) the shim asks the reload core directly and a build:1 that still arrives is handed to
+    # the core too — the banner shows for it only where the core is absent.
     # {romp:'wsFresh'} — the reconnected pane's resync LANDED (its first non-keepalive frame), so the
     # connection prompt is moot and retires itself; the user saw it on nearly every dashboard open, offering
     # a reload for a staleness that had already healed in the background. A latched BUILD prompt survives
     # (and re-asserts its wording): a resync delivers state, never new code, so only a reload answers it.
     "window.addEventListener('message',function(e){var m=e&&e.data;"
-    "if(m&&m.romp==='wsStale'){if(m.build){buildStale=true;show(BUILDMSG);}else{connStale=true;show(CONNMSG);}}"
+    "if(m&&m.romp==='wsStale'){if(m.build){if(RL)RL.request('build','');else{buildStale=true;show(BUILDMSG);}}else{connStale=true;show(CONNMSG);}}"
     "else if(m&&m.romp==='wsFresh'){connStale=false;if(buildStale)show(BUILDMSG);else box.classList.remove('show');}});"
     # T132 (the user 2026-08-27): the banner is DRAGGABLE — movable out of the way so it can STAY up
     # (it was covering a tab they needed before accepting the build). Moving never dismisses, mutes, or
@@ -42259,7 +43147,9 @@ _LANDING_COLLAPSE_JS = """
 
 
 def _stale_block(v):
+    # the reload core first: the banner script below registers as its refused fallback and announces a reload
     return ("<style>" + _STALE_CSS + "</style>" + _STALE_HTML
+            + "<script>" + _reload_core(v) + "</script>"
             + "<script>" + _STALE_JS.replace("__LOADEDVER__", str(int(v))) + "</script>")
 
 
@@ -42920,29 +43810,38 @@ def _landing():
             ".rsp-note{opacity:.6;font-size:10px;margin:4px 0 6px}"
             ".rsp-err{color:#f2b8b5;margin:10px 0}"
             ".rsp-load{display:flex;justify-content:center;padding:40px 0}"
-            ".rsp-tbl{width:100%;border-collapse:collapse;margin-top:4px}"
-            ".rsp-tbl th{text-align:left;font-weight:400;opacity:.55;padding:2px 6px 4px 0;border-bottom:1px solid rgba(255,255,255,0.08)}"
+            # the session list is a SCROLL PANE under a sticky header (T247e): every session, the modal a
+            # centered card that keeps its size; the pane scrolls inside it
+            "#rsp-table{max-height:38vh;overflow-y:auto;margin-top:4px}"   # the JS (spSizePane) refits it to the room under the chart
+            ".rsp-tbl{width:100%;border-collapse:collapse}"
+            ".rsp-tbl thead th{position:sticky;top:0;background:#252526;z-index:1}"
+            # a row's title is its TAB TITLE, under the strip's own class names. The landing page loads no
+            # stylesheet (the panes do), so the two declarations are INLINED here as the strip's twin —
+            # `.tab.colored .tab-label` and `.host-prefix` from ui/webview/styles.css, byte for byte in
+            # their declarations — and tests/test_spend_detail.py pins the twin against the source, so the
+            # two cannot drift (the timeline's MENU_STYLE twin is the precedent). --dim is the strip's
+            # variable; a fallback carries the dark value where the landing defines none.
+            ".rsp-name .tab-label.colored{color:var(--chip-bg);font-weight:600}"
+            ".rsp-name .host-prefix{color:var(--dim,#9aa0a6);font-weight:400;font-style:italic;font-size:0.86em}"
+            ".rsp-tbl th{text-align:left;font-weight:400;color:#8a97a6;padding:2px 6px 4px 0;border-bottom:1px solid rgba(255,255,255,0.08)}"   # muted by color, not opacity: the sticky header must occlude the rows scrolling under it (review find)
             ".rsp-tbl td{padding:3px 6px 3px 0;border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap}"
             ".rsp-tbl .n{text-align:right;font-variant-numeric:tabular-nums}"
             ".rsp-tbl td.rsp-name{width:100%;max-width:0;overflow:hidden;text-overflow:ellipsis}"
             # a session no longer running keeps its last known name, dimmed ONCE (T247b review): the row's
             # cells carry the dimming, the annotation inside stays at the row's level (it used to compound
-            # .55 × .6 to a 2.3:1 read), and a legend chip dims on its own; the fold row is a CONTROL row —
-            # its count is muted, its "show all" is never dimmed (it read as disabled)
-            ".rsp-dead td{opacity:.55}.rsp-dead .ru-tip-reset{opacity:1}.rsp-chip.rsp-dead{opacity:.55}"
-            ".rsp-fold .rsp-muted{opacity:.55}"
+            # .55 × .6 to a 2.3:1 read)
+            ".rsp-dead td{opacity:.55}.rsp-dead .ru-tip-reset{opacity:1}"
             ".rsp-sw{display:inline-block;width:10px;height:10px;border-radius:3px;vertical-align:-1px;background:#6b7a8c}"
             # unattributed spend wears a TEXTURE, not a hue: it is not a session, and texture is the
             # dataviz fallback for a class that must never be confused with one
             ".rsp-hatch{background:repeating-linear-gradient(45deg,rgba(138,151,166,0.9) 0 1.5px,rgba(138,151,166,0.18) 1.5px 5px)}"
-            ".rsp-ctl{display:flex;align-items:center;gap:4px;margin:6px 0 8px}.rsp-gap{flex:0 0 12px}"
+            ".rsp-ctl{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin:6px 0 8px}.rsp-gap{flex:0 0 12px}"   # three chip pairs flow onto a second row on a phone, whole (review find)
             ".rsp-btn{background:none;border:1px solid rgba(255,255,255,0.14);border-radius:5px;color:#cfd6dd;font:inherit;"
-            "padding:2px 8px;cursor:pointer}"
+            "padding:2px 8px;cursor:pointer;white-space:nowrap}"
             ".rsp-btn.on{background:var(--accent,#9cd2ff);color:var(--accent-fg,#0c1a2e);border-color:transparent}"
             "#rsp-chart{position:relative}.rsp-svg{display:block;width:100%;background:rgba(255,255,255,0.04);border-radius:3px}"
             ".rsp-grid{stroke:rgba(255,255,255,0.10);stroke-width:1}"
             ".rsp-seg{cursor:pointer}.rsp-seg:hover{filter:brightness(1.18)}"
-            ".rsp-leg{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:6px}.rsp-chip{display:inline-flex;align-items:center;gap:5px}"
             "#rsp-tip{position:fixed;z-index:310;pointer-events:none;display:none;background:#1e1e1e;border:1px solid #3a3a3a;"
             "border-radius:6px;padding:5px 8px;color:#cfd6dd;font:500 11px 'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;"
             "box-shadow:0 5px 18px rgba(0,0,0,0.45)}#rsp-tip b{color:#e8eef5;font-weight:700}"
@@ -43244,6 +44143,8 @@ def _landing():
             "body.theme-light .rsp-top{color:#1F1E1D;border-bottom-color:rgba(0,0,0,0.10)}"
             "body.theme-light .rsp-x{color:#5D574E}body.theme-light .rsp-x:hover{color:#1F1E1D}"
             "body.theme-light .rsp-tbl th{border-bottom-color:rgba(0,0,0,0.10)}body.theme-light .rsp-tbl td{border-bottom-color:rgba(0,0,0,0.06)}"
+            "body.theme-light .rsp-tbl thead th{background:#FFFFFF}body.theme-light .rsp-tbl th{color:#5D574E}"
+            "body.theme-light .rsp-name .host-prefix{color:var(--dim,#5D574E)}"
             "body.theme-light .rsp-btn{border-color:rgba(0,0,0,0.18);color:#1F1E1D}"
             # the PRESSED toggle's light step, written out (T247b review): `.rsp-btn.on` (0,2,0) lost to
             # `body.theme-light .rsp-btn` (0,2,1 — two classes and the body type) and painted dark text
@@ -43624,8 +44525,7 @@ def _state_write_route(path, b):
         if not isinstance(order, list) or not all(isinstance(x, str) for x in order):
             return 400, {"ok": False, "error": "order (a list of session ids) required, got %s" % _clip_json(order)}
         try:
-            merged = _merge_session_order(order)
-            _write_session_order(merged)
+            merged = _reorder_session_order(order)   # merge + publish as one step under _order_lock (the arm's step too)
         except (_StateUnreadable, _StateUnwritable) as e:
             # the order file could not be read, or its publish failed: the drag must not splice against a
             # fabricated [] and persist discovery order over the saved one (the reorderTabs arm's rule)
@@ -45570,10 +46470,22 @@ class Handler(BaseHTTPRequestHandler):
                         ", ".join('"%s"' % x for x in unknown)}), "application/json")
                 color = b.get("color")
                 rn = b.get("rename")
-                t, err = _edit_tag(name, add=ids["add"], remove=ids["remove"],
-                                   color=(str(color) if isinstance(color, str) else None),
-                                   delete=dele,
-                                   rename=(str(rn) if isinstance(rn, str) else None))
+                try:
+                    t, err = _edit_tag(name, add=ids["add"], remove=ids["remove"],
+                                       color=(str(color) if isinstance(color, str) else None),
+                                       delete=dele,
+                                       rename=(str(rn) if isinstance(rn, str) else None))
+                except (_StateUnreadable, _StateUnwritable) as e:
+                    # the views store could not be read, or its publish failed: the route's OWN refusal
+                    # shape -- 200, ok:false, retryable -- never a 5xx. `romp tag` posts with `curl -sf`,
+                    # which turns any 5xx into "kernel not reachable" (the wrong reason; until this change
+                    # a full disk drew exactly that, the OSError reaching do_POST's catch-all as a 500
+                    # traceback), and a federation forward treats every non-200 as a tunnel hiccup; both
+                    # read this body as the refusal it is. Nothing was written: a read that fails edits
+                    # nothing, a publish that fails never reached its replace.
+                    sys.stderr.write("romp-kernel: POST /tag refused: %s\n" % e)
+                    return self._send(200, json.dumps({"ok": False, "retryable": True,
+                                                       "error": _views_fault_refusal(e)}), "application/json")
                 if err:
                     return self._send(200, json.dumps({"ok": False, "error": err}), "application/json")
                 _mark_views_dirty()
@@ -45753,6 +46665,22 @@ class Handler(BaseHTTPRequestHandler):
                 h = str(body.get("host") or "")
                 if h:
                     _demand_redial(h, "timeout")
+                return self._send(200, json.dumps({"ok": True}), "application/json")
+            if u.path == "/postal-notice":
+                # The postal bus files a fault the USER should see (review find, 2026-09-08): a mail
+                # file it had to move aside, a return note it could not deliver, temps a crash left.
+                # The bus has no dashboard surface of its own, so the text lands here as one row on
+                # the ring the bell mirrors, under its `refused` kind, the kind a state file that
+                # could not be read or written wears, so a mute on machine-sync notices never hides
+                # it. The kernel adds nothing to the text: the bus wrote it for the user. Bounded to
+                # what the ring serves whole; a body with no text is a 400 that files nothing.
+                body, berr = _json_object_body(raw_body)
+                if berr:
+                    return self._send(400, json.dumps({"ok": False, "error": berr}), "application/json")
+                text = " ".join(str(body.get("text") or "").split())
+                if not text:
+                    return self._send(400, json.dumps({"ok": False, "error": "text required"}), "application/json")
+                _sync_notice(text[:300], ok=False, kind="refused")
                 return self._send(200, json.dumps({"ok": True}), "application/json")
             if u.path == "/tunnels/autoupdate":
                 # The popover's "Automatically update" checkbox. Body: {"on": bool}. Fleet-wide, not per-host
@@ -46180,6 +47108,13 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     ok = not refused
                 err = None
+            except (_StateUnreadable, _StateUnwritable) as e:
+                # the views store could not be read (the judge's PROVED base raised -- until this change it
+                # folded the fault to {} and a lens write's empty `edited` then wrote `tags: []` over the
+                # user's whole set, acked ok) or its publish failed: refused on the poster's socket in the
+                # person's words, no traceback; the store is as it was
+                sys.stderr.write("romp-kernel: setTimelineViews refused: %s\n" % e)
+                refused, ok, err = [], False, _views_fault_refusal(e)
             except Exception as e:
                 sys.stderr.write("setTimelineViews: %s\n" % traceback.format_exc())
                 refused, ok, err = [], False, "the write failed on the kernel: %s" % (str(e) or type(e).__name__)
@@ -46198,6 +47133,12 @@ class Handler(BaseHTTPRequestHandler):
             # the recv loop's log: an unanswered write would pin the poster's optimistic copy.
             try:
                 ok, err, info = _apply_tag_edit(msg.get("edit"))
+            except (_StateUnreadable, _StateUnwritable) as e:
+                # the store faulted under the edit (a create until this change landed a one-tag store over
+                # the user's whole set, acked ok; an edit by tid was refused as a deleted tag): the fault,
+                # in the person's words, on the poster's socket; nothing was written
+                sys.stderr.write("romp-kernel: tagEdit refused: %s\n" % e)
+                ok, err, info = False, _views_fault_refusal(e), None
             except Exception as e:
                 sys.stderr.write("tagEdit: %s\n" % traceback.format_exc())
                 ok, err, info = False, "the edit failed on the kernel: %s" % (str(e) or type(e).__name__), None
@@ -46387,7 +47328,7 @@ class Handler(BaseHTTPRequestHandler):
             # Human verdict on a DIRECTED peer's held message (per-host trust): approve delivers it
             # (optionally with human-edited text), deny drops it. The bus owns delivery + the held-message
             # store, so proxy there; on success the bus removes the held file, so _quarantine_cards drops
-            # the card on the next build (event-based — no cleared.jsonl needed). Failure warn-toasts.
+            # the card on the next build (event-based — no cleared.jsonl needed). Failure answers the asker by mid.
             _qmid = str(msg["mid"])
             _qbody = {"mid": _qmid, "action": str(msg.get("action") or "").strip().lower()}
             if msg.get("text") is not None:
@@ -46398,7 +47339,12 @@ class Handler(BaseHTTPRequestHandler):
             if _qok:
                 _mark_views_dirty()
             else:
-                client["send"](json.dumps({"type": "warn", "text": "quarantine: " + _qerr}))
+                # the refusal answers the asking pane BY THE MESSAGE it was about (review find, 2026-09-08): the
+                # feed latched Approve/Deny ("Delivering…") on the click and re-arms them on this reply, matched
+                # by mid. It was a bare `warn` before, which the feed never handled, so a refused verdict left
+                # both buttons disabled until the card was re-sent, and a card the bus refused to act on is
+                # exactly the one that is never re-sent. The feed is the only poster of this op.
+                client["send"](json.dumps({"type": "quarantineRefused", "mid": _qmid, "text": "quarantine: " + _qerr}))
         elif msg and msg.get("type") == "nodeOverride" and msg.get("sid") and msg.get("nodeId"):
             # modal surgical override: cross a node off (op:resolve → nodeComplete) or drop it
             # (op:clear → the user-authority clear verdict, same seam as a card Clear, scoped to the
@@ -46528,8 +47474,8 @@ class Handler(BaseHTTPRequestHandler):
             # tab-drag or lane-drag → reorder BOTH surfaces. MERGE the dragged surface's order into the
             # persisted one (don't overwrite): a chat-tab drag must not drop/reshuffle timeline-only lanes.
             try:
-                _merged = _merge_session_order(msg["order"])
-                _write_session_order(_merged)            # the publish too: a failed one is refused, never a
+                _reorder_session_order(msg["order"])     # merge + publish as ONE step under _order_lock (the
+                #                                          POST /order route's step too); a failed publish is refused, never a
             except (_StateUnreadable, _StateUnwritable) as e:   # dropped socket (the fold on PR #1019)
                 # the order file could not be read, or its publish failed; the drag must not splice against
                 # a fabricated [] and persist discovery order over the user's saved order. Refused on the

@@ -35,9 +35,9 @@ test("the coupling's artifacts are fully retired: cue, N-outside line, promoted 
 });
 
 test("the kernel's views blob serves the tabs/timeline; the feed payload carries it again for the tag mounts", () => {
-  assert.ok(KERNEL.includes('"views": _views_client(), "live": sorted({str(x) for x in live})}'), "tabOrder pushes keep the blob (tabs + timeline consume it; the one frame builder, T258)");
+  assert.ok(KERNEL.includes('**_views_payload(), "live": sorted({str(x) for x in live})}'), "tabOrder pushes keep the blob (tabs + timeline consume it; the one frame builder, T258; since 2026-09-08 through _views_payload, which marks a blob a read fault left unproved or sends the marker alone)");
   const fp = KERNEL.slice(KERNEL.indexOf('return {"type": "feed", "asks": asks'), KERNEL.indexOf('"clearNotices"'));
   // retired 2026-08-25 morning as unread; REVIVED the same day for the per-surface tag lenses —
   // the outline pane and the feed's own tag filter read the rendered blob off this payload
-  assert.ok(fp.includes('"views": _views_client()'), "the tag mounts' read");
+  assert.ok(fp.includes('**_views_payload()'), "the tag mounts' read");
 });

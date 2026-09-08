@@ -467,7 +467,10 @@ permission/API-error floors: one interrupt at a time, the present event first.
   and surfaced loudly, store-unreadable: a goals file that cannot be read,
   filed once per fault episode and ended by the next successful read,
   store-unwritable: a goals file whose publish failed under a user gesture,
-  and store-quarantined: a goals file whose bytes did not parse, moved aside).
+  store-quarantined: a goals file whose bytes did not parse, moved aside,
+  frozen-store-write: a read-only site wrote to the shared store view, naming
+  the site, after which the shared cache is off for the process, and
+  frozen-store-save: a shared store view was handed to `save_goals`, refused).
   A file that does not parse is never deleted: it is moved beside its path as
   `<file>.corrupt-<utc stamp>` (a `-n` suffix when two land in the same second)
   before a fresh one is written, so the bytes survive for inspection, and the

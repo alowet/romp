@@ -40,7 +40,7 @@ class SdkHumanPromptRun(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.mkdtemp()
         jd._rebind_state(Path(self.td))
-        jd._PARSE_CACHE.clear()
+        jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
 
     def _open_human_turn(self, sid):
         """A transcript with ONE in-progress human prompt over the SDK channel (promptSource 'sdk'), no

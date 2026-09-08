@@ -15,10 +15,16 @@ const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "
 const FED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "federation.ts"), "utf8");
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
 
-test("the header carries a plain-worded Clear on the far right, hidden when the session has no clearable cards", () => {
-  assert.match(FEED, /const clr = el\("button", "feed-sess-clear"\); clr\.textContent = "Clear";/);
-  // lowercase like every sibling tooltip on the header row (the caret's, the service chip's)
-  assert.match(FEED, /clr\.title = "clear every card for this session"; clr\.dataset\.act = "sess-clear";/);
+test("the header's Clear IS the card's Clear: one builder, one class set, a layout-only position class", () => {
+  // the user 2026-09-08 (twice): same size, the outline, blue on hover — so the card, the turn-group and the
+  // header all build their Clear with clearButton(), which mints the .fdismiss button; the header adds only
+  // a positional class and its behaviour
+  assert.match(FEED, /function clearButton\(title: string\): HTMLElement \{\s*\n\s*const b = el\("button", "fdismiss"\);\s*\n\s*b\.textContent = "Clear";\s*\n\s*b\.title = title;/);
+  assert.match(FEED, /const clr = clearButton\("clear this task"\);/, "the card");
+  assert.match(FEED, /const clr = clearButton\("clear ALL sub-asks of this request \(inbox-zero\)"\);/, "the turn-group");
+  assert.match(FEED, /const clr = clearButton\("clear every card for this session"\);\s*\n\s*clr\.classList\.add\("feed-sess-clear"\); clr\.dataset\.act = "sess-clear";/, "the header");
+  assert.doesNotMatch(FEED, /el\("button", "feed-sess-clear"\)/, "no lookalike element");
+  // the tooltip keeps the sibling grammar: a lowercase verb phrase, like the card's "clear this task"
   assert.match(FEED, /sclr\.setAttribute\("aria-label", "clear every card for " \+ e\.name\);/);
   // after the caret, count and service chip; before the full-width process list that wraps below
   assert.match(FEED, /h\.append\(nm, fold, cnt, svc, clr, svcList\);/);
@@ -83,10 +89,14 @@ test("the router sends the batch to the session's kernel with bare ids, and Undo
     "undoClear follows the LAST clear, batched or single, to the kernel that took it");
 });
 
-test("the control wears the header's size and the caret's quiet monochrome treatment, pushed to the far right", () => {
-  assert.match(CSS, /\.feed-sess-clear \{ flex: none; margin-left: auto; padding: 0 5px; color: var\(--dim\); background: transparent;\s*\n\s*border: 0; font: inherit; font-weight: 400; line-height: 1; cursor: pointer;/);
-  assert.match(CSS, /\.feed-sess-clear:hover, \.feed-sess-clear:focus-visible \{ color: var\(--fg\); \}/);
-  // negatives scoped to the RULE BLOCK, not the selector's line (a second-line font-size or accent must fail)
-  assert.doesNotMatch(CSS, /\.feed-sess-clear \{[^}]*font-size/, "no new font size on this surface");
-  assert.doesNotMatch(CSS, /\.feed-sess-clear[^{]*\{[^}]*(red|--st-|--accent)/, "monochrome: no status colour, no accent");
+test("the header Clear's own class carries layout only; size, outline and the accent hover come from .fdismiss", () => {
+  assert.match(CSS, /\.feed-sess-clear \{ flex: none; margin-left: auto; \}/, "position only: far right of the row");
+  // nothing of the button's look may live on the positional class (block-scoped negatives)
+  assert.doesNotMatch(CSS, /\.feed-sess-clear[^{]*\{[^}]*(font|color|border|background|padding|line-height|opacity)/,
+    "a header-only size or colour would be a second button that drifts");
+  assert.doesNotMatch(CSS, /\.feed-sess-clear:hover|\.feed-sess-clear:focus/, "the hover is .fdismiss's accent hover, shared");
+  // the shared button: outlined, 0.72em, accent on hover — and its weight pinned, since the header renders at 600
+  assert.match(CSS, /\.fdismiss \{\s*\n\s*font: inherit; font-size: 0\.72em; font-weight: 400; cursor: pointer; white-space: nowrap;/);
+  assert.match(CSS, /border: 1px solid var\(--card-border\); border-radius: 6px;/);
+  assert.match(CSS, /\.fdismiss:hover \{ border-color: var\(--accent\); color: var\(--accent\); background: var\(--accent-wash\); \}/);
 });

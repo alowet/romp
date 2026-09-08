@@ -25,7 +25,8 @@ test("applyTabOrder REBUILDS tabMeta from the authoritative payload (closed tabs
 
 test("renderTabs renders the union of arrived sessions and tabMeta, placeholders for the rest", () => {
   assert.match(RENDER, /for \(const id of tabMeta\.keys\(\)\)/);
-  assert.match(RENDER, /if \(!s\) \{ bar\.appendChild\(makePlaceholderTab\(id\)\); continue; \}/);
+  assert.match(RENDER, /if \(!s\) \{\s*\n\s*const ph = makePlaceholderTab\(id\);\s*\n\s*if \(copyGroup !== undefined\) ph\.dataset\.copy = copyGroup \?\? "";[^\n]*\n\s*bar\.appendChild\(ph\); continue;\s*\n\s*\}/,
+    "a placeholder per plan item — one per group the session sits in (T264b), each keyed by its copy");
 });
 
 test("makePlaceholderTab draws name + identity color, and is CLICKABLE while loading", () => {

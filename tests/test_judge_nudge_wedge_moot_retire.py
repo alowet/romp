@@ -81,7 +81,7 @@ class MootPromptRetire(unittest.TestCase):
             jd.plan_llm = jd.opener_llm = lambda *a, **k: MINT
             jd._group_store = lambda *a, **k: None
             try:
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
 
@@ -100,7 +100,7 @@ class MootPromptRetire(unittest.TestCase):
                 self.assertFalse(self._gate_is_open(store, str(tpath)),
                                  "precondition: the legacy store leaves the moot #p unit unplaced")
 
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW + 100)
                 store = jd.load_goals(SID)
 
@@ -125,7 +125,7 @@ class MootPromptRetire(unittest.TestCase):
             jd.plan_llm = jd.opener_llm = lambda *a, **k: MINT
             jd._group_store = lambda *a, **k: None
             try:
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
                 before = len(store["nodes"])
@@ -135,7 +135,7 @@ class MootPromptRetire(unittest.TestCase):
 
                 calls = []
                 jd.plan_llm = jd.opener_llm = lambda *a, **k: (calls.append(1), MINT)[1]
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW + 100)
                 store = jd.load_goals(SID)
                 self.assertEqual(calls, [], "a moot phase is retired with NO planner call")

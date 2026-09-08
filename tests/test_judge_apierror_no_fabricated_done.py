@@ -72,7 +72,7 @@ class NoFabricatedDone(unittest.TestCase):
             jd.plan_llm = jd.opener_llm = fake
             jd._group_store = lambda *a, **k: None
             try:
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
             finally:

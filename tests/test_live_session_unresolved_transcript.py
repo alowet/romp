@@ -127,7 +127,7 @@ class _World(unittest.TestCase):
 
 class FrameCarriesLive(unittest.TestCase):
     def test_the_tab_order_frame_names_the_live_sids(self):
-        with mock.patch.object(km, "_views_client", lambda: {}):
+        with mock.patch.object(km, "_views_payload", lambda: {"views": {}}):   # the frame's one views carrier (2026-09-08)
             f = km._tab_order_frame(["a", "b"], [{"id": "a"}], {"a", "b", "c"})
         self.assertEqual(f["type"], "tabOrder")
         self.assertEqual(f["order"], ["a", "b"])

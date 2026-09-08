@@ -638,6 +638,19 @@ export function socketVerdict(readyState: number, lastRecv: number, connT: numbe
 // and window.__rompFed.outbound(m) for sends (both no-ops when this module isn't loaded, e.g. the timeline
 // pane), and exposes window.__rompLocalSend + window.__rompApp.
 
+/** A pane's frame handler: the window "message" listener's signature, so one function serves both paths. */
+export type FrameHandler = (e: MessageEvent) => void;
+
+/** Report a subscriber's exception the way the DOM reports a listener's: through reportError where the page has
+ *  it (window.onerror / the console, as an uncaught exception), else console.error. Never throws. */
+export function reportListenerError(e: unknown): void {
+  const g: any = globalThis;
+  try {
+    if (typeof g.reportError === "function") { g.reportError(e); return; }
+  } catch (_) { /* fall through to the console */ }
+  try { console.error(e); } catch (_) { /* nothing left to report to */ }
+}
+
 interface Conn {
   host: string;
   ws: WebSocket | null;
@@ -679,6 +692,49 @@ export class FederationManager {
   // merge and dispatch through it as fed:<type>, nested outside the pane's handler. Public so a test can hand
   // it a stand-in.
   perf: RompPerf | null = null;
+  // The pane's frame handlers, registered through onFrame (window.__rompFed.onFrame): the merged frames this
+  // layer emits reach them by direct call, never as a window "message" event. See emit() for why.
+  private frameSubs: FrameHandler[] = [];
+
+  /** Register a handler for the merged frames this manager emits (`feed`, `tabOrder`, `data`, `bars`); returns
+   *  the unsubscribe. The pane registers the SAME wrapped handler it installs on window (frame-listener.ts), so
+   *  the perf brackets nest as before and every frame reaches it exactly once: federation picks one path per
+   *  frame (emit). Every other frame — the passthrough, `closed`, `hostUp`, `warn`, the shell's `romp:` posts —
+   *  still arrives through the window listener. */
+  onFrame(handler: FrameHandler): () => void {
+    this.frameSubs.push(handler);
+    return () => {
+      const i = this.frameSubs.indexOf(handler);
+      if (i >= 0) this.frameSubs.splice(i, 1);
+    };
+  }
+
+  /** Hand one merged frame to the pane. With a subscriber registered: ONE MessageEvent, called into each handler
+   *  directly, in registration order, over a snapshot of the list. Here the direct path deliberately differs from
+   *  dispatchEvent on removal: the DOM skips a listener removed during dispatch, while a handler unsubscribed by
+   *  an earlier handler in the same frame still runs once here (the snapshot is simpler, and nobody unsubscribes
+   *  mid-delivery today). With none: window.dispatchEvent, exactly as before, so a pane bundle that predates the
+   *  registry keeps working.
+   *
+   *  Why not always dispatch on window: Blink hands a same-world listener the event's data object itself, but a
+   *  "message" listener in ANOTHER JavaScript world — a browser extension's content script on the pane's page —
+   *  that reads event.data receives a STRUCTURED CLONE of it, made synchronously inside dispatchEvent. For a
+   *  merged feed of several megabytes that is tens of milliseconds and as many megabytes of garbage per frame, in
+   *  every feed-consuming pane, counted under this layer's fed:<type> bracket (its own work is under a
+   *  millisecond); a probe measured 35-46 ms per dispatch of a 7 MB frame and 0 ms for a direct call. Nothing
+   *  outside romp's bundles receives a merged frame now, so nothing can clone it.
+   *
+   *  A throwing handler is reported and the rest still run — the DOM's report-and-continue for event listeners.
+   *  Without this a throw would propagate through inbound into the shim's socket callback and skip this layer's
+   *  remaining work (the bars emission after a detach's lanes emission). */
+  private emit(data: any): void {
+    const ev = new MessageEvent("message", { data });
+    const subs = this.frameSubs;
+    if (!subs.length) { window.dispatchEvent(ev); return; }
+    for (const h of subs.slice()) {
+      try { h(ev); } catch (e) { reportListenerError(e); }
+    }
+  }
 
   start(): void {
     const w = window as any;
@@ -690,6 +746,7 @@ export class FederationManager {
     w.__rompFed = {
       inbound: (h: string, m: any) => this.inbound(h, m),
       outbound: (m: any) => this.outbound(m),
+      onFrame: (h: FrameHandler) => this.onFrame(h),   // the pane's direct-delivery registration (emit)
       hosts: () => this.hostSeq.filter((h) => h !== LOCAL), // attached hosts (the + modal's host picker)
       // Hosts that are attached but NOT reachable right now. Their sessions stay on screen — dropping
       // them would lose the thread — but every surface that shows one has to say the link is down, or
@@ -959,7 +1016,7 @@ export class FederationManager {
     }
     this.publishPending();
     const dead = this.deadHosts();
-    window.dispatchEvent(new MessageEvent("message", { data: mergeHostFeeds(this.perHostFeed, this.hostSeq, this.view(), dead, this.perHostFeedAt) }));
+    this.emit(mergeHostFeeds(this.perHostFeed, this.hostSeq, this.view(), dead, this.perHostFeedAt));
   }
 
   // the hosts whose link is DOWN right now (this manager knows its sockets) — the merges' pendingDead input
@@ -1014,7 +1071,7 @@ export class FederationManager {
       // the bars message carries no lanes — hand the merged lane list in for the connector stitch
       ? mergeHostBars(this.perHostTlBars, this.hostSeq, mergeHostTimelines(this.perHostTl, this.hostSeq, this.view()).sessions)
       : { type: "data", data: mergeHostTimelines(this.perHostTl, this.hostSeq, this.view(), this.deadHosts()) };
-    window.dispatchEvent(new MessageEvent("message", { data }));
+    this.emit(data);
   }
 
   // Every caller re-emits WITHOUT touching the stored arrangement — a drag landing here through the
@@ -1035,7 +1092,7 @@ export class FederationManager {
     // confirms a close by absence like any order, but is never evidence that a kernel still has a tab.
     if (fresh) data.freshHost = freshHost;
     else data.reemit = true;
-    window.dispatchEvent(new MessageEvent("message", { data }));
+    this.emit(data);
   }
 
   // Fold a host's OWN report — the one moment with fresh evidence about what exists — into the stored

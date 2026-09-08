@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""A prompt QUEUED into a running turn must never complete off that turn's unrelated work (the user 2026-07-29).
+"""A prompt QUEUED into a running turn completes off the work that FOLLOWS it, and never off nothing.
 
-The incident: the user queued a question while the session was mid-turn on other work; the CLI
-spliced it in (a queued_command attachment, stamped with its ENQUEUE time), and the process died
-before any reply. The splice's segment absorbed the running turn's CONTINUING atoms — real assistant
-work, none of it a reply to the spliced ask — so the no-work guard from the API-error fix
-(_has_asst_work, the user 2026-07-25) passed, plan_units emitted a full work unit framed
-"USER ASKED: … ASSISTANT SAID: [other work]", and a capable planner answered the question from its
-own knowledge and filed done with a confabulated summary — 30 seconds after the ask was typed,
-before the assistant's first post-splice token. Now the event model marks the synthesized splice
-atom `absorbed`, and planner DONE ops filed off a spliced-trigger segment are stripped
-(_strip_unevidenced_dones, spliced leg): work in such a segment is never proof the spliced ask — or any listed goal —
-was answered. Mint/sub still apply (the ask gets its card, the tail work files), the goal stays
-open — the truth — and the turn-level closer keeps done authority. SYNTHETIC fixtures only."""
+The 2026-07-29 incident: the user queued a question while the session was mid-turn on other work; the
+CLI spliced it in (a queued_command attachment, stamped with its ENQUEUE time), and the process died
+before any reply. With the atom placed at its SEND time (the rule until T252d) the splice's segment
+absorbed the running turn's CONTINUING atoms — real assistant work, none of it a reply — and a
+done-happy planner completed the question from its own knowledge. A spliced leg of
+_strip_unevidenced_dones refused every done off such a segment.
+
+T252d (the user 2026-09-08) places the absorbed atom where the model READ it — at its landing time,
+below the steps that ran while it waited — so the atoms after it are the model's work after reading
+it: its reply, as for any ask. The spliced leg is gone with the placement, and the incident's shape
+(a turn that dies before its first post-splice token) is a WORKLESS segment, which the remaining leg
+still refuses. Mint/sub still apply, and the turn-level closer keeps done authority. SYNTHETIC
+fixtures only."""
 import json
 import tempfile
 import unittest
@@ -52,7 +53,8 @@ def aline(t, text, uuid, parent=None, stop="end_turn"):
 
 def qline(t, text, uuid, parent):
     """The CLI's mid-turn splice witness: a queued_command attachment, uuid-bearing, parent-chained,
-    stamped with the ENQUEUE time (earlier than its neighbours in file order — the real shape)."""
+    stamped with the ENQUEUE time (earlier than its neighbours in file order — the real shape). The
+    event model places its atom at the file-order predecessor's stamp, clamped never before the send."""
     return {"type": "attachment", "timestamp": iso(t), "uuid": uuid, "parentUuid": parent,
             "attachment": {"type": "queued_command", "prompt": text}}
 
@@ -63,15 +65,26 @@ SKIP = '{"ops":[{"why":"nothing to file","do":"skip"}]}'
 
 
 def spliced_records():
-    """An in-flight labeling turn; the ask spliced into it at enqueue time; the turn's work
-    CONTINUES (chained through the attachment, as the CLI writes it) and never answers the ask;
-    a later unrelated turn ends things."""
+    """An in-flight labeling turn; the ask spliced into it; the model's work after reading it
+    (chained through the attachment, as the CLI writes it); a later unrelated turn ends things."""
     return [
         uline(T0, "Label the notes-api fixture batch", "u1"),
         aline(T0 + 10, "Working through the batch now.", "a1", "u1"),
         qline(T0 + 30, ASK, "q1", "a1"),
         aline(T0 + 60, "Sheet seven labeled; two to go.", "a2", "q1"),
         uline(T0 + 400, "unrelated: also bump the version", "u2", "a2"),
+        aline(T0 + 410, "Bumped.", "a3", "u2"),
+    ]
+
+
+def dead_splice_records():
+    """The 2026-07-29 shape: the ask spliced in, and the process dies before its first post-splice
+    token; a later unrelated turn ends things. The splice's segment holds no assistant work."""
+    return [
+        uline(T0, "Label the notes-api fixture batch", "u1"),
+        aline(T0 + 10, "Working through the batch now.", "a1", "u1"),
+        qline(T0 + 30, ASK, "q1", "a1"),
+        uline(T0 + 400, "unrelated: also bump the version", "u2", "q1"),
         aline(T0 + 410, "Bumped.", "a3", "u2"),
     ]
 
@@ -91,37 +104,32 @@ class SplicedDone(unittest.TestCase):
             jd.plan_llm = jd.opener_llm = fake
             jd._group_store = lambda *a, **k: None
             try:
-                jd._PARSE_CACHE.clear()
+                jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
                 jd._plan_session(SID, str(tpath), NOW)
                 store = jd.load_goals(SID)
             finally:
                 (jd.GOALDIR, jd.PCACHE, jd.plan_llm, jd.opener_llm, jd._group_store) = saved
             return calls, store
 
-    def test_spliced_ask_places_but_cannot_complete(self):
+    def test_spliced_ask_completes_off_the_work_that_follows_it(self):
         calls, store = self._run(spliced_records(), DONE_HAPPY)
-        # the planner DID see the ambiguous frame (the unit still runs — the guard is at op level)
-        self.assertTrue(any(ASK[:40] in c for c in calls),
-                        "the spliced segment still gets its work unit — the tail work must still file")
+        self.assertTrue(any(ASK[:40] in c for c in calls), "the spliced segment gets its work unit")
+        asked = [nd for nd in store["nodes"].values()
+                 if "search endpoint" in (nd.get("text") or "").lower()]
+        self.assertTrue(asked, "the spliced ask gets a card — it is real")
+        self.assertTrue(asked[0].get("nodeComplete"),
+                        "the atoms after the splice are the model's work after reading it: a done-happy "
+                        "reply completes the ask, as for any ask (T252d)")
+
+    def test_a_splice_the_turn_never_answered_cannot_complete(self):
+        # the 2026-07-29 shape: the turn died before its first post-splice token — the splice's segment
+        # holds no assistant work, and the workless leg refuses the done; the ask still gets its card
+        calls, store = self._run(dead_splice_records(), DONE_HAPPY)
         asked = [nd for nd in store["nodes"].values()
                  if "search endpoint" in (nd.get("text") or "").lower()]
         self.assertTrue(asked, "the spliced ask still gets a card — it is real")
         self.assertFalse(asked[0].get("nodeComplete"),
-                         "a done-happy planner reply must not complete a goal off a spliced segment "
-                         "whose work belongs to the interrupted turn's own ask")
-
-    def test_spliced_done_cannot_complete_other_cards_either(self):
-        # a done aimed at a PRE-EXISTING card (the in-flight work's own card, coerce-placed by the
-        # earlier segment) is confabulation off the same unreliable frame — stripped too, and the
-        # ask itself still lands via the never-vanish floor
-        done_only = '{"ops":[{"why":"the batch is finished","do":"done","goal":1}]}'
-        calls, store = self._run(spliced_records(), done_only)
-        self.assertTrue(store["nodes"], "the earlier segment's ask was placed")
-        self.assertFalse(any(nd.get("nodeComplete") for nd in store["nodes"].values()),
-                         "no goal may complete off a spliced-trigger segment")
-        placed_texts = " | ".join((nd.get("quote") or nd.get("text") or "") for nd in store["nodes"].values())
-        self.assertIn(ASK[:30], placed_texts,
-                      "a stripped-to-empty reply still hard-places the spliced ask (never vanish)")
+                         "no work followed the splice: nothing evidences an answer")
 
     def test_typed_ask_with_real_answer_still_completes(self):
         # guard precision: an ordinary typed ask whose turn really answers it still dones
@@ -137,12 +145,12 @@ class SplicedDone(unittest.TestCase):
         self.assertTrue(asked and asked[0].get("nodeComplete"),
                         "a genuinely delivered answer still completes")
 
-    def test_absorbed_trigger_is_marked_and_detected(self):
+    def test_absorbed_trigger_is_marked_and_the_following_work_is_its_reply(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             tpath = td / (SID + ".jsonl")
             tpath.write_text("\n".join(json.dumps(r) for r in spliced_records()) + "\n")
-            jd._PARSE_CACHE.clear()
+            jd._PARSE_CACHE.clear(); jd._CHAIN_MEMO.clear()
             session = jd.parsed_session(SID, [str(tpath)], NOW)
         segs = [seg for turn in session["turns"] for seg in jd.em.segments(turn)]
         by_trig = {seg.get("trigger"): seg for seg in segs}
@@ -150,11 +158,8 @@ class SplicedDone(unittest.TestCase):
         spliced = by_trig["q1"]
         self.assertTrue(any(a.get("uuid") == "q1" and a.get("absorbed") for a in spliced["atoms"]),
                         "the synthesized splice atom carries the absorbed marker")
-        self.assertTrue(jd._seg_spliced(spliced))
-        self.assertFalse(jd._seg_spliced(by_trig["u1"]),
-                         "an ordinary typed trigger is not spliced")
-        # and the running turn's continuation really does land inside the splice's segment —
-        # the ambiguity this whole guard exists for
+        self.assertFalse(hasattr(jd, "_seg_spliced"), "the spliced leg is gone with the send-time placement (T252d)")
+        # the work after the splice lands inside the splice's segment — its reply
         self.assertIn("a2", [a.get("uuid") for a in spliced["atoms"]])
 
 

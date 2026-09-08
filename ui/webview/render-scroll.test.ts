@@ -41,9 +41,9 @@ test("a placeholder's first content-bearing build LANDS (bottom), it does not ap
 
 test("a rebuild NEVER snaps a scrolled-up reader to the bottom — it captures + restores their anchor", () => {
   // even a genuine rebuild (new tab / fork / slid tail-window) preserves position for a scrolled-up reader:
-  // capture nearBottom + the anchor BEFORE dropping the DOM, restore after (the user 2026-07-06). A true
+  // capture atBottom + the anchor BEFORE dropping the DOM, restore after (the user 2026-07-06). A true
   // fork's anchor uuid isn't in the new transcript, so restoreScrollAnchor no-ops → it stays at the bottom.
-  assert.match(RENDER, /_wasNear = !_scrollContent \|\| !_v0 \|\| !_v0\.shown \|\| nearBottom\(_scrollContent\);/);
+  assert.match(RENDER, /_wasNear = !_scrollContent \|\| !_v0 \|\| !_v0\.shown \|\| atBottom\(_scrollContent\);/);
   assert.match(RENDER, /_scrollAnchor = \(!_wasNear && _scrollContent && _v0\) \? captureScrollAnchor\(_scrollContent, _v0\) : null;/);
   assert.match(RENDER, /if \(!_wasNear && _scrollAnchor && _scrollContent\) \{[\s\S]*?restoreScrollAnchor\(_scrollContent, v1, _scrollAnchor\)/);
 });
@@ -64,10 +64,10 @@ test("sharesAnyUuid: a continuation shares a uuid, a wholesale fork shares none"
 });
 
 test("appendActive snaps only when the user is already near the bottom of OVERFLOWING content", () => {
-  // the slack rule (the user 2026-08-25): while nothing overflows, nearBottom is trivially true —
+  // the slack rule (the user 2026-08-25): while nothing overflows, atBottom is trivially true —
   // ungated, the very append crossing the overflow boundary yanked the view; now streaming into
   // slack writes in place and grows the scrollbar, and the stick engages only once overflowing
-  assert.match(RENDER, /const stick = content\.scrollHeight > content\.clientHeight \+ 2 && nearBottom\(content\);[\s\S]*?if \(stick && followTail\(distBefore, heightBefore, content\.scrollHeight\)\) writeScroll\(content, content\.scrollHeight, "append-stick", true\)/,   // …and only when there is new content to follow (T262 followTail)
+  assert.match(RENDER, /const stick = content\.scrollHeight > content\.clientHeight \+ 2 && atBottom\(content\);[\s\S]*?if \(stick && followTail\(distBefore, heightBefore, content\.scrollHeight\)\) writeScroll\(content, content\.scrollHeight, "append-stick", true\)/,   // …and only when there is new content to follow (T262 followTail)
     "tail-append follows the live edge only if content overflows AND the reader was at the bottom");
   // the popover's thread list speaks the same rule
   assert.match(RENDER, /const overflowed = list\.scrollHeight > list\.clientHeight \+ 2;/);
@@ -197,7 +197,7 @@ test("ResizeObservers on #tabbar AND #ledger compensate #content.scrollTop by th
   assert.match(RENDER, /for \(const boxId of \["tabbar", "ledger"\]\)/, "both boxes above the transcript are observed");
   assert.match(RENDER, /const tro = new ResizeObserver/, "via a dedicated per-box ResizeObserver");
   // shift scrollTop by (new - old) box height — only when not stuck to bottom and the pane is visible
-  assert.match(RENDER, /content\.clientHeight > 0 && !nearBottom\(content\)/,
+  assert.match(RENDER, /content\.clientHeight > 0 && !atBottom\(content\)/,
     "skipped when stuck to the bottom or the pane is hidden");
   assert.match(RENDER, /writeScroll\(content, content\.scrollTop \+ \(h - lastH\), "box-resize"\)/, "compensates by the exact height delta");
   assert.match(RENDER, /if \(v\) v\.scrollTop = content\.scrollTop/, "keeps the per-view saved scroll in sync");
