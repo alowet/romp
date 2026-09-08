@@ -57,7 +57,10 @@ test("renderTabs draws a skeleton tab BEFORE the placeholder branch; both draw t
   // dot's class is tab-state.ts's tabDotClass, one slot in every state, so the file has ONE call and no ring literal)
   assert.equal(RENDER.split("const dotCls = tabDotClass(st);").length - 1, 1, "one dot-slot site: applyTabStatus");
   assert.equal(RENDER.split('el("span", "tab-dot unknown")').length - 1, 0, "no hand-rolled unknown ring anywhere");
-  assert.equal(RENDER.split('tab.classList.add("tab-working")').length - 1, 1, "one working-class site");
+  // …and the state → class step inside it is tab-state.ts's shared rule (tab groups, 2026-09-04: the folded
+  // section header's pip reads the same function), so the file has ONE such call and no hand-rolled class literal
+  assert.equal(RENDER.split("const stateCls = tabStateClass(s.status);").length - 1, 1, "one state-class site: applyTabStatus wears the shared rule");
+  assert.equal(RENDER.split('tab.classList.add("tab-working")').length - 1, 0, "no hand-rolled state class anywhere");
   const chip = fn("applyTabStatus");
   assert.match(chip, /^function applyTabStatus\(tab: HTMLElement, s: \{ status: Partial<Status> \}\): ChipState \| undefined \{\s*\n\s*const st = s\.status\.state;/);
   assert.match(chip, /const dotCls = tabDotClass\(st\);\s*\n\s*if \(dotCls\) tab\.appendChild\(el\("span", dotCls\)\);/, "no state → the honest unknown ring (tabDotClass: a missing state is the gray ring)");
