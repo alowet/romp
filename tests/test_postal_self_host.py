@@ -18,14 +18,23 @@ declared that name to every hub (which now refuses it at its check-in door, chec
 own mail parked unreachable. An unusable override is now set aside aloud, once per process, and the
 derived name is used — on both daemons (KernelSelfHost and BusSelfHost).
 
+SafeIdTwins (review find, 2026-09-08): the rule itself is duplicated in the two daemons, and its regex
+ended in `$`, which in Python also matches before ONE trailing newline, so "TESTHOST\n" cleared it, and
+the override branches on both daemons returned that name verbatim while every hub stripped it, leaving
+the machine believing in a name no peer keyed. Both copies now fullmatch, both must stay the same
+function, and a trailing newline is the one whitespace shape the junk-override cases now include.
+
 Synthetic only — invented hostnames (TESTHOST, a control-byte junk form), hermetic temp state dir,
 no real machine data.
 """
+import ast
 import contextlib
+import inspect
 import io
 import os
 import socket as _socket
 import tempfile
+import textwrap
 import unittest
 from importlib.machinery import SourceFileLoader
 
@@ -129,7 +138,7 @@ class BusSelfHost(_HostnameSeams):
         # the bus's twin of the kernel gap: ROMP_POSTAL_HOST came back exactly as set, so a bus whose
         # operator set it to an unusable name declared that name in every peer exchange (2026-09-08)
         _socket.gethostname = lambda: "TESTHOST"
-        for junk in ("my box", "user@host", "a" * 129):
+        for junk in ("my box", "user@host", "a" * 129, "TESTHOST2\n"):   # the trailing newline: review find, 2026-09-08
             os.environ["ROMP_POSTAL_HOST"] = junk
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
@@ -221,7 +230,7 @@ class KernelSelfHost(_HostnameSeams):
         # the one branch that dodged the rule: the override came back exactly as set, so a mobile whose
         # operator set ROMP_HOST_NAME to an unusable name declared it to every hub (2026-09-08)
         _socket.gethostname = lambda: "TESTHOST"
-        for junk in ("my box", "user@host", "a" * 129):
+        for junk in ("my box", "user@host", "a" * 129, "TESTHOST2\n"):   # the trailing newline: review find, 2026-09-08
             os.environ["ROMP_HOST_NAME"] = junk
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
@@ -243,6 +252,66 @@ class KernelSelfHost(_HostnameSeams):
         self.assertTrue(km._safe_id(k))
         self.assertNotIn(" ", k)
         self.assertEqual(k, pm.self_host(), "kernel and bus still share the persisted identity")
+
+
+class SafeIdTwins(unittest.TestCase):
+    """_safe_id lives in both daemons on purpose (each loads alone), so the two copies must stay ONE
+    function; and a trailing newline is not a name on either (review find, 2026-09-08: `$` matched
+    before it, and the override branches returned "TESTHOST\n" verbatim)."""
+
+    @staticmethod
+    def _body(fn):
+        # the function minus its docstring: the two copies explain themselves differently, and may
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        f = tree.body[0]
+        f.body = [n for n in f.body if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                                            and isinstance(n.value.value, str))]
+        return ast.dump(f)
+
+    def test_the_two_copies_are_the_same_function(self):
+        self.assertEqual(km._SAFE_ID_RE.pattern, pm._SAFE_ID_RE.pattern, "one regex on both daemons")
+        self.assertEqual(self._body(km._safe_id), self._body(pm._safe_id), "one rule on both daemons")
+
+    def test_a_trailing_newline_is_not_a_name_on_either_daemon(self):
+        for s in ("TESTHOST\n", "abc\n", "a\n", "TESTHOST\r\n", "TESTHOST\n\n"):
+            self.assertFalse(km._safe_id(s), repr(s))
+            self.assertFalse(pm._safe_id(s), repr(s))
+        for s in ("TESTHOST", "a", "A.B-c_2", "11111111-2222-3333-4444-555555555555", "a" * 128):
+            self.assertTrue(km._safe_id(s), repr(s))
+            self.assertTrue(pm._safe_id(s), repr(s))
+
+    def test_an_override_with_a_trailing_newline_is_set_aside_on_both_daemons(self):
+        # the ONE whitespace shape the rule admitted: returned verbatim by both override branches, then
+        # stripped by every hub, so the machine's own name and the name peers keyed it by differed by a
+        # newline, and the bus baked it into every message id
+        saved = {k: os.environ.pop(k, None) for k in ("ROMP_POSTAL_HOST", "ROMP_HOST_NAME")}
+        seams = (_socket.gethostname, pm._host_name_candidates, km._host_name_candidates,
+                 pm._self_host_fb, km._self_host_fb)
+        _socket.gethostname = lambda: "TESTHOST"
+        pm._host_name_candidates = km._host_name_candidates = lambda: []
+        pm._self_host_fb = km._self_host_fb = None
+        getattr(km, "_host_name_env_warned", set()).clear()
+        getattr(pm, "_postal_host_env_warned", set()).clear()
+        try:
+            os.environ["ROMP_HOST_NAME"] = os.environ["ROMP_POSTAL_HOST"] = "TESTHOST2\n"
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                k, b, mid = km._self_host(), pm.self_host(), pm._unique()
+            self.assertEqual((k, b), ("TESTHOST", "TESTHOST"), "the derived name, never the newline one")
+            self.assertNotIn("\n", mid, "no message id carries a newline")
+            self.assertTrue(pm._safe_id(mid))
+            self.assertEqual(len([l for l in err.getvalue().splitlines() if "ROMP_HOST_NAME" in l]), 1)
+            self.assertEqual(len([l for l in err.getvalue().splitlines() if "ROMP_POSTAL_HOST" in l]), 1)
+        finally:
+            for k_, v in saved.items():
+                if v is None:
+                    os.environ.pop(k_, None)
+                else:
+                    os.environ[k_] = v
+            (_socket.gethostname, pm._host_name_candidates, km._host_name_candidates,
+             pm._self_host_fb, km._self_host_fb) = seams
+            getattr(km, "_host_name_env_warned", set()).clear()
+            getattr(pm, "_postal_host_env_warned", set()).clear()
 
 
 if __name__ == "__main__":

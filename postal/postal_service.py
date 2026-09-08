@@ -179,19 +179,23 @@ def my_name():
 def _iso_now():
     return datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
 
-_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 def _safe_id(s):
     """True iff `s` is safe as a single path component under the mail/names roots.
     Blocks path traversal (`..`, `/`, `\\`, NUL, leading dot, absolute paths) in
     any id/name that arrives over the (unauthenticated) bus. Session ids are
     UUIDs and names are sanitized to [A-Za-z0-9_-] at creation, so both match;
-    anything else is a crafted reference (e.g. `../../../etc`) and is rejected."""
+    anything else is a crafted reference (e.g. `../../../etc`) and is rejected.
+    Duplicated in the kernel (its _safe_id; tests/test_postal_self_host.py pins
+    the two copies identical). fullmatch, never match against `^...$`: `$` also
+    matches before ONE trailing newline, so "abc\\n" cleared the rule and
+    self_host's override branch declared it verbatim (review find, 2026-09-08)."""
     if not s or len(s) > 128:
         return False
     if "/" in s or "\\" in s or "\x00" in s or s.startswith("."):
         return False
-    return bool(_SAFE_ID_RE.match(s))
+    return bool(_SAFE_ID_RE.fullmatch(s))
 
 # Every character str.splitlines() treats as a line break — \n \r \v \f \x1c \x1d \x1e
 # \x85 U+2028 U+2029 — plus the rest of the C0/C1 control range and NUL with them. Nothing

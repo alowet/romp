@@ -46,7 +46,7 @@ These are for scripting and for agents rather than daily use:
 | `romp compact <session> [--wait] [--timeout <s>]` | Compact a session's context in place (Claude's `/compact`: summarize the history, keep the session's name, id, mailbox, and watches) — the alternative to ending and recreating a long-lived session, and the external hand a session needs since it cannot `/compact` itself mid-turn. Quiet session → compacts now; open turn → queued, fires alone the moment the turn ends (the same safe path the chat's compact button uses). `--wait` blocks until the compaction has started and cleared, polling the kernel's own `compacting` signal on the `/sessions` rows (also the field to point a `romp watch` predicate at for scripted recycling); exits 1 honestly on timeout. A remote session's compaction is requested on its own kernel — `--wait` can't follow it from here and says so |
 | `romp end <session>` | End a session |
 | `romp move <session> <dir>` | Move an SDK session's working directory to `<dir>` (the folder must already exist); the conversation, name, mail and history stay with the session. Quiet session → moves now; open turn → queued, fires when the turn ends. See [Moving a session to another folder](#moving-a-session-to-another-folder) |
-| `romp checkin <host>` / `romp checkout <host>` | Publish this machine to an attached hub, or withdraw it |
+| `romp checkin <host>` / `romp checkout <host>` | Publish this machine to an attached hub, or withdraw it. The hub files this machine under the name it declares only when that name is a machine name (letters, digits, dots, hyphens or underscores, starting with a letter or digit, at most 128 characters). Any other declared name is refused with a 400 that states the rule and echoes nothing, is recorded nowhere, and is said once on both machines: on the hub, one stderr line and one Log entry under the `refused` kind, naming the value as a clipped repr; on this machine, one stderr line, one dial-log record and one Log entry carrying the hub's reason, after which the same name is not re-sent until it, or the hub's kernel, changes. A hub's `POST /tunnels/trust` for a host it has never seen (the remembered-hosts entry that tiers relayed mail by origin) holds the wider rule that registry's writers share, a machine name or an ssh alias (letters, digits, dots, hyphens, underscores, at-signs, colons or square brackets, not starting with a hyphen, at most 255 characters), because a hub keys an attached peer by its ssh alias and carries that alias when you set trust between two of your machines; anything else is refused the same way, on the hub, with nothing recorded. `ROMP_HOST_NAME` (the kernel) and `ROMP_POSTAL_HOST` (the postal bus) override the declared name only when they clear the same rule; an unusable value (a space, an at-sign, a trailing newline) is set aside once, on stderr or in the bus log, and the derived name (the short hostname, else the platform's machine name, else a minted id) is used |
 | `romp default-dir [PATH]` | The default working directory for new sessions; no argument prints it, `""` clears it |
 | `romp debug [on\|off\|status]` | Judge debug mode, where rejection rows carry the full input and reply |
 | `romp resume <id> [--name <n>] [--detach]` | Resume one exact conversation by UUID |
@@ -1042,6 +1042,19 @@ read-only disk) is told to the gesture that asked, the gear's toast or the
 stop button's warning, and said once per fault episode in the error center;
 the automatic pass sends nothing whose record could not land, and the file
 keeps what it holds.
+
+The two host registries there, `remotes.json` (attached and checked-in
+machines, each row with that machine's serve token) and `remotes-known.json`
+(machines remembered for re-attach, with the mail tier you set for each), are
+read at boot under the rule their doors apply: a checked-in row's host must be
+a machine name, an attached row's an ssh alias, a remembered row's either. A
+row that fails (one filed before the doors applied the rule) is set aside,
+never loaded and never written back: the rows are moved to
+`<file>.refused-<UTC stamp>` beside the original (`-1`, `-2` when a second one
+lands in the same second; the `remotes.json` sidecar is 0600, since its rows
+carry tokens), the file is rewritten without them, and one stderr line plus one
+Log entry under the `refused` kind names each host as a clipped repr, never the
+raw string.
 
 ## Switches
 
