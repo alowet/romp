@@ -162,6 +162,22 @@ class DeadmanIgnoresTheToggle(_Base):
                          "no block — every procedural block copy would misstate what happened")
         self.assertNotIn(self.gid, km._auto_nudge_data()["nudged"], "no injection → no wake record")
 
+    def test_the_lift_journals_the_wake_moment_as_its_horizon(self):
+        # the dead-man's ruling is "no ending event arrived through NOW", so the clock is the horizon
+        # it journals (record_verdict end_ev). A closer auditing a segment triggered anywhere inside
+        # (anchor, wake) then stands down — with no horizon the fallback read the row's ev_t, the
+        # stamp's anchor, and that re-assert stood across the whole 6h window (pre-fold: it files)
+        self._toggle(False)
+        self._seed(kind="job", age=7 * H)
+        self._tick()
+        self.assertEqual(self._lifts()[-1].get("endEv"), NOW, "the wake moment is what the lift ruled through")
+        s = jd.load_goals(SID)
+        jd.apply_close(s, jd.open_menu(s), {"done": {}, "block": {},
+                                            "awaiting": {1: {"why": "still watching the rebuild", "kind": "job"}}},
+                       t=NOW - 3 * H)
+        self.assertIsNone(s["nodes"][self.gid].get("awaitingWhy"),
+                          "a segment inside (anchor, wake) predates the dead-man's ruling — the writer yields")
+
     def test_a_second_cycle_does_not_file_again(self):
         self._toggle(False)
         self._seed(kind="job", age=7 * H)

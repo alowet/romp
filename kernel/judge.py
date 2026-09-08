@@ -7287,13 +7287,18 @@ LOG_CAP = 64                             # per-node verdict-log bound (a node ra
 
 
 def record_verdict(store, nd, src, kind, ev_t=None, why=None, seg=None, msg=False, undo=False, lift=False,
-                   await_kind=None, await_peers=None):
+                   await_kind=None, await_peers=None, end_ev=None):
     """P3.1 DUAL-WRITE (the user 2026-07-06): the gate AND the recorder, fused into the one seam every
     verdict write goes through. Asks may_apply; when allowed, appends the event to the node's
     append-only verdict LOG and returns True — the caller then writes the flags exactly as before
     (flags stay AUTHORITATIVE until the P3.3 flip; the log is the shadow history the fold reads).
     Fusing gate+record means a future writer cannot pass the gate yet skip the history — one call does
     both. `ev_t` = EVIDENCE time (segment/turn/user-action moment); `at` = arrival, forensics only.
+    `end_ev` (2026-09-07) = the EVIDENCE HORIZON a lift ruled on — the newest evidence time it cites (the
+    return that came back, the peer's reply, the last in-harness ending) — journaled as `endEv`, so the
+    gates that ask "did a lift end this wait AFTER the evidence I hold?" compare evidence to evidence
+    (_wait_end_ev), never to the lift's arrival: read as arrival, a lift filed late for old evidence
+    suppressed a fresh assert on evidence it never ruled on, and the card stayed down on new information.
 
     The migration window is CLOSED (2026-07-07): every store was swept by migrate_all_stores at kernel
     boot, so an unmigrated node here means the sweep missed one — surface it loudly (judge-errors.jsonl)
@@ -7313,6 +7318,7 @@ def record_verdict(store, nd, src, kind, ev_t=None, why=None, seg=None, msg=Fals
                     **({"msg": True} if msg else {}),  # a user message rides this reopen (chip derivation)
                     **({"undo": True} if undo else {}),   # an undo-restore reopen: not a "not done" assertion
                     **({"lift": True} if lift else {}),   # an `awaiting` row that ENDS the wait, not asserts it
+                    **({"endEv": int(end_ev)} if end_ev else {}),   # …and the newest evidence that lift ruled on
                     # what an `awaiting` assert waits ON (AWAIT_KINDS; "kind" is taken by the verdict kind).
                     # Absent = a kindless legacy stamp, which every rule treats exactly as before the enum.
                     **({"awaitKind": await_kind} if await_kind else {}),
@@ -7329,6 +7335,21 @@ def record_verdict(store, nd, src, kind, ev_t=None, why=None, seg=None, msg=Fals
     return True                                        # updated here, so callers keep NO mirror writes
     #                                                    (a FROZEN unmigrated node keeps its flags — deriving
     #                                                     from its partial log would wipe real legacy state)
+
+
+def _wait_end_ev(e):
+    """The EVIDENCE HORIZON of a diary row — the newest evidence time the writer of `e` ruled on, for the
+    gates that ask whether a row ended a wait AFTER the evidence they hold (apply_close's awaiting-assert
+    stand-down; the sweep's re-lift stand-down in kernel._lift_spent_awaiting). Fallback order, on purpose:
+      `endEv` — a lift naming the return / reply / last ending it cited (record_verdict end_ev, 2026-09-07);
+      `ev_t`  — the row's own evidence time. For a lift that is the ANCHOR of the wait it retracts
+                (_lift_ev_t): a horizon that can never disown evidence newer than that wait's own start;
+      `at`    — arrival, for a legacy row carrying no evidence time at all.
+    Arrival comes LAST because it is forensics (record_verdict's own rule), and reading it first was the
+    2026-09-07 defect: a lift filed late for evidence up to T_ev read as having ruled on everything before
+    its arrival, so a fresh assert whose evidence lay between T_ev and that arrival was suppressed — the
+    card stayed down on new information."""
+    return e.get("endEv") or e.get("ev_t") or e.get("at") or 0
 
 
 def _block_since(nd):
@@ -10007,7 +10028,7 @@ def _menu_history_text(store, seg_by_id, menu, char_cap):
     return "\n\n".join(parts)
 
 
-def apply_close(store, menu, verdicts, t=None, touched=None, t_overrides=None):
+def apply_close(store, menu, verdicts, t=None, touched=None, t_overrides=None, t_end=None):
     """Apply the closer's turn-end verdicts over the touched open tops: COMPLETE each in verdicts["done"]
     (recording doneWhy, clearing any soft block), BLOCK each in verdicts["block"] (recording blockWhy =
     the question owed to the user), and STAMP each in verdicts["awaiting"] (the ⏳ annotation: waiting on
@@ -10026,7 +10047,12 @@ def apply_close(store, menu, verdicts, t=None, touched=None, t_overrides=None):
     since-time and a long poll loop never chews through LOG_CAP. ONE exception rides that rule without
     breaking it: a same-why re-assert whose kind fills a KINDLESS stamp lands once, AT the original
     anchor (ev_t = the standing awaitingAt), so the classification catches up while the since-time, the
-    wake's patience, and the supersede ordering stay keyed to the first assertion."""
+    wake's patience, and the supersede ordering stay keyed to the first assertion.
+
+    `t_end` (2026-09-08) = the audited turn's END, when the caller has it (_close_turn: turn["end"]): the
+    closer's lift ruled on the WHOLE segment, so that is the evidence horizon it journals (record_verdict
+    end_ev) — its ev_t is the turn's trigger, the segment's START, and left as the horizon it understated
+    what the lift saw. Absent (a caller without the turn) the fallback reads ev_t, as before."""
     done, block = verdicts.get("done", {}), verdicts.get("block", {})
     awaiting = verdicts.get("awaiting", {})
     newly = []
@@ -10087,12 +10113,16 @@ def apply_close(store, menu, verdicts, t=None, touched=None, t_overrides=None):
                 # (a stand-down is not new information in either direction).
                 continue
             if any(e.get("kind") in ("awaiting", "done") and (e.get("lift") or e.get("kind") == "done")
-                   and (e.get("at") or e.get("ev_t") or 0) > (ev or 0) for e in nd.get("log") or []):
+                   and _wait_end_ev(e) > (ev or 0) for e in nd.get("log") or []):
                 # the wait this assert describes already ENDED in the diary AFTER this turn's evidence
                 # (2026-08-25 audit: a closer auditing the pre-merge segment re-asserted a watch whose
                 # lift AND whose goal's done were both already filed — the stamp then stood for hours
                 # with the job kind exempt from every mail retire). The writer's world is older than
                 # the diary: stand down; a REAL new wait re-asserts from the next pass's fresh evidence.
+                # "After" is evidence against evidence — the horizon the ending RULED ON (_wait_end_ev),
+                # never the row's arrival: a lift filed late for older evidence must not silence an
+                # assert on evidence it never saw (2026-09-07). Strict: an assert whose evidence EQUALS
+                # the horizon does not predate it, and stands.
                 continue
             if nd.get("awaitingWhy") != aw_why:
                 # a changed why is a real event → new row, new anchor (as ever)
@@ -10107,7 +10137,7 @@ def apply_close(store, menu, verdicts, t=None, touched=None, t_overrides=None):
                 record_verdict(store, nd, "closer", "awaiting", nd.get("awaitingAt"),
                                why=aw_why, await_kind=aw_kind, await_peers=aw_peers)
         elif nd.get("awaitingWhy") and (touched is None or i <= touched):
-            record_verdict(store, nd, "closer", "awaiting", t, lift=True)
+            record_verdict(store, nd, "closer", "awaiting", t, lift=True, end_ev=t_end)
     return newly
 
 
@@ -10321,7 +10351,8 @@ def _close_turn(store, turn, samples=None, seg_by_id=None):
                                  note="a %s anchored to ev_t %s is shadowed by newer diary rows on "
                                       "%s — the writer stands down; the newer evidence's own turn "
                                       "carries the ruling" % (kind, ev, nd.get("id")))
-    newly = apply_close(store, menu, out, t=turn.get("t"), touched=n_touched, t_overrides=t_overrides)
+    newly = apply_close(store, menu, out, t=turn.get("t"), touched=n_touched, t_overrides=t_overrides,
+                        t_end=turn.get("end"))
     # The reply LANDED → the closer considered every menu node (a verdict or a considered omission).
     # ONE look-stamp replaces the retired umbSig/starvedSig signatures (2026-08-13): the newest row
     # FILED in each node's top subtree as of this look, stamped BELOW apply_close so the reply's own
