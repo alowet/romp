@@ -143,6 +143,18 @@ class GoalCompactionTest(unittest.TestCase):
         self.assertIn(other, km._compact_seen, "...so the next sweep retries it")
         self.assertIn(g("g1"), json.loads((jd.GOALARCHDIR / (other + ".json")).read_text())["nodes"],
                       "and archives its cleared top")
+    def test_g_the_sweep_evicts_the_disk_memo_entries_of_removed_stores(self):
+        """save_goals' no-op check memoizes each store file's identity; the sweep's start is where entries
+        for stores that no longer exist are dropped (2026-09-06)."""
+        jd.save_goals(SID, jd.load_goals(SID))        # a no-op save fills the entry for this store
+        gone = "11111111-2222-3333-4444-666666666666"
+        jd.save_goals(gone, {"rompUuid": gone, "seq": 0, "nodes": {}, "placements": {}, "status": {}})
+        jd.save_goals(gone, jd.load_goals(gone))
+        self.assertIn(str(jd.GOALDIR / (gone + ".json")), jd._DISK_CONTENT)
+        (jd.GOALDIR / (gone + ".json")).unlink()
+        km._compact_goal_stores()
+        self.assertNotIn(str(jd.GOALDIR / (gone + ".json")), jd._DISK_CONTENT, "the removed store's entry is gone")
+        self.assertIn(str(jd.GOALDIR / (SID + ".json")), jd._DISK_CONTENT, "the live store's entry stays")
 
     def test_f_undo_clear_wires_in_the_archive_restore_before_unsetting_the_flag(self):
         import inspect

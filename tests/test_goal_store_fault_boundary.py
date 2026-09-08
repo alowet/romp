@@ -14,6 +14,7 @@ made it.
 
 SYNTHETIC fixtures only: private synthetic sids, the notes-api demo world (`web` / `api` / `tests`),
 message ids stamped TESTHOST; the per-sid override journals are cleaned in tearDown."""
+import contextlib
 import errno
 import itertools
 import json
@@ -81,15 +82,24 @@ def _store(sid, text, **node):
             "lastNode": gid}
 
 
+@contextlib.contextmanager
 def _fault_on(path):
-    """Path.read_text raises EIO for `path` alone; every other read is untouched."""
-    orig = Path.read_text
+    """Every reader of `path` raises EIO; every other read is untouched. Path.read_text is the load path's
+    reader; the save path's memoized readers (_disk_entry, _disk_rev) open a descriptor of their own and
+    read from it (_disk_read), so os.open faults for the path as well."""
+    orig_read_text, orig_open = Path.read_text, os.open
 
     def faulting(p, *a, **kw):
         if p == path:
             raise OSError(errno.EIO, "Input/output error", str(p))
-        return orig(p, *a, **kw)
-    return mock.patch.object(Path, "read_text", faulting)
+        return orig_read_text(p, *a, **kw)
+
+    def faulting_open(p, *a, **kw):
+        if os.fspath(p) == str(path):
+            raise OSError(errno.EIO, "Input/output error", str(path))
+        return orig_open(p, *a, **kw)
+    with mock.patch.object(Path, "read_text", faulting), mock.patch.object(os, "open", faulting_open):
+        yield
 
 
 class _World(unittest.TestCase):

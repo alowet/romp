@@ -30131,6 +30131,10 @@ def _compact_goal_stores():
     import glob
     moved = 0
     try:
+        jd._disk_memo_evict_absent()                   # save_goals' disk-side memo: drop removed stores' entries
+    except Exception:
+        pass
+    try:
         paths = glob.glob(str(jd.GOALDIR / "*.json"))
     except Exception:
         return 0

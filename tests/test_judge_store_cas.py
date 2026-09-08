@@ -10,6 +10,7 @@ save_goals now compares the revision it loaded at against the one on disk and RE
 logs) instead of clobbering. The store is an append-only event log, so two writers appending different
 events never really conflicted: the right answer is both sets. All fixtures SYNTHETIC.
 """
+import contextlib
 import errno
 import json
 import os
@@ -226,15 +227,24 @@ class ReadFaultCas(unittest.TestCase):
         jd.rollup_status(s, session_closed=False)
         jd.save_goals(self.FSID, s)
 
+    @contextlib.contextmanager
     def _eio_on_the_store(self):
-        """Path.read_text raises EIO for THIS store's path only; every other read is untouched."""
-        target, orig = self._file(), Path.read_text
+        """Every reader of THIS store's path raises EIO; every other read is untouched. Path.read_text is the
+        load path's reader; the save path's memoized readers (_disk_entry, _disk_rev) open a descriptor of
+        their own and read from it (_disk_read), so os.open faults for the path as well."""
+        target, orig_read_text, orig_open = self._file(), Path.read_text, os.open
 
         def faulting(path, *a, **kw):
             if path == target:
                 raise OSError(errno.EIO, "Input/output error", str(path))
-            return orig(path, *a, **kw)
-        return mock.patch.object(Path, "read_text", faulting)
+            return orig_read_text(path, *a, **kw)
+
+        def faulting_open(path, *a, **kw):
+            if os.fspath(path) == str(target):
+                raise OSError(errno.EIO, "Input/output error", str(target))
+            return orig_open(path, *a, **kw)
+        with mock.patch.object(Path, "read_text", faulting), mock.patch.object(os, "open", faulting_open):
+            yield
 
     def test_a_read_fault_raises_from_load_instead_of_reading_as_an_empty_store(self):
         self._seed()
@@ -282,6 +292,21 @@ class ReadFaultCas(unittest.TestCase):
         self._file().write_text("{not json")
         with self.assertRaises(ValueError):
             jd._disk_rev(self.FSID)
+
+    def test_a_fresh_store_is_not_published_over_a_non_object_file(self):
+        """A top-level JSON value that is not an object is neither a store nor an absent file: a fresh store
+        (base 0, minted while the path was empty) is not published over it, and a gesture's boundary answers
+        the fault instead of None."""
+        s = jd.load_goals(self.FSID)                 # absent: a fresh store at base 0
+        jd.apply_plan(s, "s1", T0, [{"do": "mint", "why": "x", "text": "A goal"}], [])
+        jd.GOALDIR.mkdir(parents=True, exist_ok=True)
+        self._file().write_bytes(b"[]")              # meanwhile the path holds a JSON array
+        with self.assertRaises(ValueError):
+            jd.save_goals(self.FSID, s)
+        self.assertEqual(self._file().read_bytes(), b"[]", "nothing was published over bytes that are not a store")
+        self.assertIsInstance(jd.save_goals_or_fault(self.FSID, s), ValueError,
+                              "the gesture boundary answers the fault, not None")
+        self.assertEqual(self._file().read_bytes(), b"[]")
 
     def test_matches_disk_and_rebase_raise_on_a_fault_or_a_corrupt_file(self):
         """Each reader in the save path on its own: a version of either that swallowed the read and answered
