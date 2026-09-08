@@ -7,11 +7,25 @@ the 0600 file) and ?token= (a peer bus dialing through the ssh forward with the 
 machine's token). Also pins the peer-token plumbing: /peer notifies carry the peer's
 token, a token-less down notify keeps the last known one, and the dialer sends ?token=.
 
+The Postal* classes pin the bus's COPY of the serve-token read-or-mint (`_serve_token_read_or_mint`,
+the same shape as the kernel's; the bus imports nothing from kernel/) to the same contract the
+kernel's tests pin in tests/test_kernel_serve_token_mode.py, whose docstring carries the reasoning:
+born 0600 by rename of a finished temp with the live path never opened for writing, one mint among
+racing starters under serve-token.lock, an unreadable existing token is a refusal, never a rotation
+(the old bus loader minted its OWN token on any read fault, and every request it then made was a
+silent 403), a loose token is tightened and kept, an empty file is minted over aloud, and without the
+lock only a good 0600 token is returned. The last three each kill a postal-only mutant that the
+kernel tests' invariant pins let through in review; the kernel tests' AST-identity pin now catches
+any such drift as well, and these say what it broke.
+
 Synthetic only — hermetic temp state dir, placeholder names, no real session data.
 """
+import contextlib
+import io
 import json
 import os
 import socket
+import stat
 import tempfile
 import threading
 import time
@@ -288,6 +302,202 @@ class TrackedIsABoolean(_BusServer):
             self.assertIs(dialed[0][2]["tracked"], True, "a real true rides the wire as itself")
         finally:
             ps._http, ps.my_name, ps.my_id, ps._heartbeat = saved
+def _mode(p):
+    return stat.S_IMODE(os.stat(p).st_mode)
+
+
+class _PostalTokenFile(unittest.TestCase):
+    """Drives _load_serve_token against the file the kernel mints (STATE.parent / "serve-token").
+    SERVE_TOKEN, the module constant the gate compares against, was minted at import and is not
+    touched; each case ends by putting TOK back so the file and the constant agree again. The umask
+    is 0 so only the loader's own modes protect what it writes."""
+
+    def setUp(self):
+        self.f = ps.STATE.parent / "serve-token"
+        self.lock = self.f.with_name("serve-token.lock")
+        self._env = self._umask = None
+        self.addCleanup(self._restore)      # registered FIRST: a failing _clear() must not leak a zeroed umask
+        self._env = os.environ.pop("ROMP_SERVE_TOKEN", None)
+        self._umask = os.umask(0)
+        self._clear()
+
+    def _clear(self):
+        for p in [self.f, self.lock] + list(self.f.parent.glob("serve-token.*.tmp")):
+            if p.is_dir():
+                p.rmdir()                    # PostalLockFailureIsFailClosed plants a directory at the lock path
+            elif p.exists():
+                p.unlink()
+
+    def _restore(self):
+        self._clear()
+        self.f.write_text(TOK)
+        os.chmod(self.f, 0o600)
+        if self._umask is not None:
+            os.umask(self._umask)
+        if self._env is not None:
+            os.environ["ROMP_SERVE_TOKEN"] = self._env
+
+    def _temps(self):
+        return sorted(p.name for p in self.f.parent.glob("serve-token.*.tmp"))
+
+
+class PostalTokenBirth(_PostalTokenFile):
+    def test_token_is_0600_from_its_first_byte_and_the_live_path_is_never_opened_for_writing(self):
+        """Expected first error on the old loader: the rename count is 0 (it wrote the live file with
+        write_text, at the umask's mode, and chmod'd it a line later)."""
+        os.umask(0o022)
+        swaps, opens = [], []
+        real_replace, real_open = os.replace, os.open
+
+        def _replace(src, dst, *a, **k):
+            swaps.append((str(src), str(dst), _mode(src), Path(src).read_text()))
+            return real_replace(src, dst, *a, **k)
+
+        def _open(path, flags, *a, **k):
+            opens.append((str(path), flags))
+            return real_open(path, flags, *a, **k)
+
+        os.replace, os.open = _replace, _open
+        try:
+            tok = ps._load_serve_token()
+        finally:
+            os.replace, os.open = real_replace, real_open
+
+        self.assertEqual(len(swaps), 1, "the mint must land by one rename of a finished temp file")
+        src, dst, mode, body = swaps[0]
+        self.assertEqual(dst, str(self.f))
+        self.assertEqual(mode, 0o600, "the temp is born 0600 under a 022 umask")
+        self.assertEqual(body, tok, "the temp already holds the whole token when it is swapped in")
+        self.assertEqual(Path(src).parent, self.f.parent, "same directory, so the rename is atomic")
+        self.assertFalse(Path(src).exists(), "the temp is gone after the swap")
+        self.assertEqual([fl for path, fl in opens if path == str(self.f)], [],
+                         "the live token path is never opened for writing at all")
+        self.assertEqual(_mode(self.f), 0o600)
+        self.assertEqual(self.f.read_text(), tok)
+
+
+class PostalTokenFlock(_PostalTokenFile):
+    def test_racing_starters_read_one_token_and_the_lock_file_is_0600(self):
+        """The barrier inside os.urandom holds every unlocked racer at the mint until all have read
+        'absent'; under the lock only the first racer gets there and waits it out alone. Expected
+        first error on the old loader: 6 != 1 at the one-token check."""
+        n = 6
+        gate = threading.Barrier(n)
+        real_urandom = os.urandom
+        mints = []
+
+        def _urandom(k):
+            mints.append(threading.get_ident())
+            try:
+                gate.wait(timeout=1.0)
+            except threading.BrokenBarrierError:
+                pass
+            return real_urandom(k)
+
+        out, errs = [], []
+
+        def run():
+            try:
+                out.append(ps._load_serve_token())
+            except BaseException as e:        # surfaced by the assertion below, never swallowed
+                errs.append(repr(e))
+
+        os.urandom = _urandom
+        try:
+            ts = [threading.Thread(target=run) for _ in range(n)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(15)
+        finally:
+            os.urandom = real_urandom
+
+        self.assertEqual(errs, [])
+        self.assertEqual(len(out), n)
+        self.assertEqual(len(set(out)), 1, "every starter must come away holding the SAME token")
+        self.assertEqual(self.f.read_text().strip(), out[0])
+        self.assertEqual(len(mints), 1, "exactly one starter minted; the rest read its token under the lock")
+        self.assertTrue(self.lock.exists())
+        self.assertEqual(_mode(self.lock), 0o600)
+        self.assertEqual(self._temps(), [])
+
+
+class PostalUnreadableIsNotRotated(_PostalTokenFile):
+    @unittest.skipIf(os.geteuid() == 0, "root reads through mode 0, so the fault cannot be staged")
+    def test_an_unreadable_existing_token_is_a_fault_not_a_rotation(self):
+        """Expected first error on the old loader: RuntimeError not raised (it returned a fresh
+        random token the kernel would refuse, while the file kept the real one)."""
+        self.f.write_text("old-token-DO-NOT-USE\n")
+        os.chmod(self.f, 0)
+        with self.assertRaises(RuntimeError) as cm:
+            ps._load_serve_token()
+        msg = str(cm.exception)
+        self.assertIn(str(self.f), msg, "the refusal names the file to fix")
+        self.assertIn("EACCES", msg, "and the errno, by name")
+        self.assertIn("NOT replace", msg)
+        os.chmod(self.f, 0o600)
+        self.assertEqual(self.f.read_text(), "old-token-DO-NOT-USE\n", "the file is untouched, byte for byte")
+        self.assertEqual(self._temps(), [])
+
+
+class PostalTightenMode(_PostalTokenFile):
+    def test_a_loose_existing_token_is_tightened_and_returned_unchanged(self):
+        """Kills the postal-only mutant that drops the tighten. Old loader: 0o644 != 0o600 (a
+        readable file never reached its chmod)."""
+        self.f.write_text("keep-me-DO-NOT-USE\n")
+        os.chmod(self.f, 0o644)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            tok = ps._load_serve_token()
+        self.assertEqual(tok, "keep-me-DO-NOT-USE")
+        self.assertEqual(_mode(self.f), 0o600)
+        self.assertEqual(self.f.read_text(), "keep-me-DO-NOT-USE\n", "tightening the mode rewrites nothing")
+        self.assertIn("644", err.getvalue())
+        self.assertIn("0600", err.getvalue())
+        self.assertEqual(self._temps(), [])
+
+
+class PostalEmptyFileMints(_PostalTokenFile):
+    def test_an_empty_or_whitespace_file_is_a_torn_mint_and_is_minted_over_aloud(self):
+        """Kills the postal-only mutant that raises on an empty file instead of minting over it.
+        Old loader: 'empty' not found in '' (it minted, but silently)."""
+        for body in ("", "  \n"):
+            self._clear()
+            self.f.write_text(body)
+            os.chmod(self.f, 0o644)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                tok = ps._load_serve_token()
+            self.assertTrue(tok, "a token was minted")
+            self.assertEqual(self.f.read_text(), tok)
+            self.assertEqual(_mode(self.f), 0o600)
+            self.assertIn("empty", err.getvalue(), "the torn earlier mint is said on stderr")
+            self.assertEqual(self._temps(), [])
+
+
+class PostalLockFailureIsFailClosed(_PostalTokenFile):
+    def test_no_lock_tolerates_only_a_good_0600_token(self):
+        """Kills the postal-only mutant whose lock-failure arm returns any non-empty token
+        regardless of mode (case b). Old loader: the lock path is not said on stderr at (a), and
+        the refusals at (b) and (c) are not raised either."""
+        self.lock.mkdir()
+        self.f.write_text("good-DO-NOT-USE")
+        os.chmod(self.f, 0o600)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(ps._load_serve_token(), "good-DO-NOT-USE")
+        self.assertIn(str(self.lock), err.getvalue())
+        os.chmod(self.f, 0o644)
+        with self.assertRaises(RuntimeError) as cm:
+            ps._load_serve_token()
+        self.assertIn(str(self.lock), str(cm.exception), "the refusal names the lock path")
+        self.assertIn("EISDIR", str(cm.exception))
+        self.assertEqual(_mode(self.f), 0o644, "no unlocked write of any kind, not even a chmod")
+        self.f.unlink()
+        with self.assertRaises(RuntimeError):
+            ps._load_serve_token()
+        self.assertFalse(self.f.exists(), "nothing minted unlocked")
+        self.assertEqual(self._temps(), [])
 
 
 if __name__ == "__main__":

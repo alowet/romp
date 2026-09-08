@@ -12,7 +12,7 @@ zero protocol change at switchover. WS is hand-rolled on the stdlib socket (no d
 Run:  bin/romp-kernel   → opens http://127.0.0.1:29855
 """
 import math
-import contextlib, json, os, queue, random, re, signal, socket, sys, time, threading, traceback, base64, bisect, errno, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid, tempfile, stat, gzip, collections, functools
+import contextlib, json, os, queue, random, re, signal, socket, sys, time, threading, traceback, base64, bisect, errno, hashlib, hmac, struct, subprocess, shutil, shlex, http.client, uuid, tempfile, stat, gzip, collections, functools, fcntl
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from importlib.machinery import SourceFileLoader
@@ -993,37 +993,142 @@ def _dist_ver():
         return 0
 
 
+def _serve_token_read_or_mint(f, who):
+    """Read the serve token at `f`, or mint one: under a lock, born 0600, never rotated by a fault.
+
+    Every client holds a COPY of this token (bin/romp and the hooks read the file, the bus and each
+    session's MCP process load it at their own start, peers fetch it at attach), so the one thing
+    this must never do is quietly replace it: a rotated token strands all of them with a credential
+    the daemon no longer accepts, and nothing says why. The old loader did exactly that on ANY read
+    fault (an EACCES or EIO fell through to the mint), minted by truncating the live file in place (a
+    concurrent reader saw an empty file and minted its own), and took no lock (two starters each
+    wrote their own). The contract now — KEEP IN SYNC with postal_service.py's copy; the bus imports nothing
+    from kernel/ by design, so it carries the same shape rather than this function:
+      - FileNotFoundError is the ONLY mint trigger. Any other read fault (a file that is not UTF-8
+        text included) raises RuntimeError naming the path and the errno. At import that refuses to
+        start the daemon, which is visible and repairable; the token every client holds stays valid.
+      - An EMPTY or whitespace-only file is a torn earlier mint (no client can hold a token that was
+        never written), so it is minted over, and said on stderr.
+      - The mint sweeps any `serve-token.*.tmp` a crashed attempt left (safe under the lock), writes
+        its own with O_EXCL at 0600, checks the write length, fsyncs, and os.replace()s it onto the
+        path: the live file appears with the token already inside, at 0600 from its first byte, and
+        the live path is never opened for writing at all.
+      - A non-empty token that is not 0600 is tightened in place, and said on stderr.
+      - `serve-token.lock` (0600) is flock'd around all of that, so the kernel and the bus booting
+        together mint once between them. When the lock itself cannot be taken, an existing non-empty
+        0600 token is returned as is (nothing to mint, nothing to tighten) and every other case is a
+        fault: minting or tightening without the lock is the race this exists to close."""
+    lock = f.with_name(f.name + ".lock")
+
+    def fault(path, what, e):
+        code = getattr(e, "errno", None)
+        why = ("%s, errno %s" % (errno.errorcode.get(code, type(e).__name__), code) if code is not None
+               else type(e).__name__)
+        raise RuntimeError(
+            "%s: cannot %s (%s). romp did NOT replace the serve token, so every client holding it "
+            "stays valid. Make the file yours and mode 0600 (or set ROMP_SERVE_TOKEN), then start "
+            "again." % (path, what, why)) from e
+
+    def read():
+        try:
+            return f.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError) as e:   # a token that is not text is a fault too, never a mint
+            fault(f, "read it", e)
+
+    def mode():
+        try:
+            return stat.S_IMODE(os.stat(f).st_mode)
+        except OSError as e:
+            fault(f, "stat it", e)
+
+    def mint(why):
+        if why:
+            print("[%s] serve token %s: %s; minting a fresh one" % (who, f, why), file=sys.stderr)
+        v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+        tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
+        fd = None
+        try:
+            for stale in f.parent.glob(f.name + ".*.tmp"):
+                try:
+                    os.unlink(stale)         # under the lock, so any temp here is a crashed earlier attempt, any pid's
+                except FileNotFoundError:
+                    pass
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            data = v.encode()
+            n = os.write(fd, data)
+            if n != len(data):
+                raise OSError(errno.EIO, "short write, %d of %d bytes" % (n, len(data)))
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            os.replace(str(tmp), str(f))
+        except OSError as e:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            fault(f, "mint it (via %s)" % tmp.name, e)
+        return v
+
+    lfd = None
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        lfd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lfd, fcntl.LOCK_EX)
+    except OSError as e:
+        if lfd is not None:
+            try:
+                os.close(lfd)
+            except OSError:
+                pass
+        v = read()                           # a read fault is its own RuntimeError
+        if v and mode() == 0o600:
+            print("[%s] serve token: could not lock %s (%s); using the existing 0600 token as is"
+                  % (who, lock, e), file=sys.stderr)
+            return v
+        fault(lock, "take the lock, which minting or tightening the token needs", e)
+    try:
+        v = read()
+        if v is None:
+            return mint(None)
+        if not v:
+            return mint("the file is empty, a torn earlier mint that no client can be holding")
+        m = mode()
+        if m != 0o600:
+            try:
+                os.chmod(f, 0o600)
+            except OSError as e:
+                fault(f, "tighten its mode from %o to 0600" % m, e)
+            print("[%s] serve token %s was mode %o; tightened to 0600" % (who, f, m), file=sys.stderr)
+        return v
+    finally:
+        try:
+            fcntl.flock(lfd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lfd)
+
+
 def _load_token():
     """The serve token, baked into launch so the human never passes --token: ROMP_SERVE_TOKEN if
     set, else a stable random token persisted under the state dir at 0600 — file perms are the
     same-user gate (Jupyter's model). Required on EVERY request, loopback included: loopback is
     reachable by any local user, so a token-free loopback would let a same-host co-tenant drive
     sessions. Local clients read the file (same user) and send X-Romp-Token; browsers carry
-    ?token= once and ride the auto-set cookie."""
+    ?token= once and ride the auto-set cookie. The file is read or minted by
+    _serve_token_read_or_mint (locked, born 0600, never rotated by a read fault); a fault there at
+    import refuses to start the kernel rather than hand out a token no client holds."""
     t = (os.environ.get("ROMP_SERVE_TOKEN") or "").strip()
     if t:
         return t
-    f = jd.STATE / "serve-token"
-    try:
-        v = f.read_text().strip()
-        if v:
-            return v
-    except OSError:
-        pass
-    v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
-    try:
-        jd.STATE.mkdir(parents=True, exist_ok=True)
-        # 0600 from birth, not written-then-chmod'd: between those two calls the file carried the
-        # token at the umask's mercy, and the whole same-user gate is this file's mode.
-        fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, v.encode())
-        finally:
-            os.close(fd)
-        os.chmod(f, 0o600)                       # a PRE-EXISTING file keeps its old mode through O_CREAT
-    except OSError:
-        pass
-    return v
+    return _serve_token_read_or_mint(jd.STATE / "serve-token", "kernel")
 
 TOKEN = _load_token()
 
@@ -1033,7 +1138,8 @@ def _persist_repo_root():
     _discover_remote_clone): the running kernel knows exactly where it lives, so probes read this
     file over ssh FIRST instead of guessing conventional dirs — the guess list missed a clone at
     ~/projects/romp while that machine's kernel was literally up, reporting "romp not installed"
-    (the user 2026-08-11). Best-effort, like the serve-token mint above."""
+    (the user 2026-08-11). Best-effort, unlike the serve-token mint above, which refuses rather
+    than degrade: a wrong repo-root misleads a probe, a wrong token strands every client."""
     try:
         jd.STATE.mkdir(parents=True, exist_ok=True)
         (jd.STATE / "repo-root").write_text(str(ROOT) + "\n")

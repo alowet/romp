@@ -36,6 +36,8 @@
 # ~/.claude/romp-postal-nopush; disable everything with ~/.claude/romp-postal-off.
 
 import base64
+import errno
+import fcntl
 import hashlib
 import hmac
 import json
@@ -45,6 +47,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -82,25 +85,119 @@ SESSION_FLAGS = STATE.parent / "session-flags.json"   # the kernel's per-session
 # through an ssh forward authorizes with the DIALED machine's token (?token=), which rides the
 # kernel's /peer notifies only (never /tunnels rows, which a page reads too; since 2026-09-08 a
 # restarted bus gets every token re-notified, see peers_snapshot).
+#
+# _serve_token_read_or_mint is a COPY of the kernel's (kernel.py, same name; KEEP IN SYNC): the bus
+# imports nothing from kernel/ by design, and the two daemons boot together, so they must agree on
+# the whole contract, not just the path. Why it is shaped this way is in the kernel's docstring; in
+# one line: FileNotFoundError is the only mint trigger, the mint lands by rename of a 0600 temp,
+# and it all happens under serve-token.lock. A fault raises RuntimeError, which at import refuses to
+# start the bus (or a session's MCP process): the old loader minted its OWN token on any read fault
+# and every request it then made was a silent 403.
+def _serve_token_read_or_mint(f, who):
+    lock = f.with_name(f.name + ".lock")
+
+    def fault(path, what, e):
+        code = getattr(e, "errno", None)
+        why = ("%s, errno %s" % (errno.errorcode.get(code, type(e).__name__), code) if code is not None
+               else type(e).__name__)
+        raise RuntimeError(
+            "%s: cannot %s (%s). romp did NOT replace the serve token, so every client holding it "
+            "stays valid. Make the file yours and mode 0600 (or set ROMP_SERVE_TOKEN), then start "
+            "again." % (path, what, why)) from e
+
+    def read():
+        try:
+            return f.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError) as e:   # a token that is not text is a fault too, never a mint
+            fault(f, "read it", e)
+
+    def mode():
+        try:
+            return stat.S_IMODE(os.stat(f).st_mode)
+        except OSError as e:
+            fault(f, "stat it", e)
+
+    def mint(why):
+        if why:
+            print("[%s] serve token %s: %s; minting a fresh one" % (who, f, why), file=sys.stderr)
+        v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+        tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
+        fd = None
+        try:
+            for stale in f.parent.glob(f.name + ".*.tmp"):
+                try:
+                    os.unlink(stale)         # under the lock, so any temp here is a crashed earlier attempt, any pid's
+                except FileNotFoundError:
+                    pass
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            data = v.encode()
+            n = os.write(fd, data)
+            if n != len(data):
+                raise OSError(errno.EIO, "short write, %d of %d bytes" % (n, len(data)))
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            os.replace(str(tmp), str(f))
+        except OSError as e:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            fault(f, "mint it (via %s)" % tmp.name, e)
+        return v
+
+    lfd = None
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        lfd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lfd, fcntl.LOCK_EX)
+    except OSError as e:
+        if lfd is not None:
+            try:
+                os.close(lfd)
+            except OSError:
+                pass
+        v = read()                           # a read fault is its own RuntimeError
+        if v and mode() == 0o600:
+            print("[%s] serve token: could not lock %s (%s); using the existing 0600 token as is"
+                  % (who, lock, e), file=sys.stderr)
+            return v
+        fault(lock, "take the lock, which minting or tightening the token needs", e)
+    try:
+        v = read()
+        if v is None:
+            return mint(None)
+        if not v:
+            return mint("the file is empty, a torn earlier mint that no client can be holding")
+        m = mode()
+        if m != 0o600:
+            try:
+                os.chmod(f, 0o600)
+            except OSError as e:
+                fault(f, "tighten its mode from %o to 0600" % m, e)
+            print("[%s] serve token %s was mode %o; tightened to 0600" % (who, f, m), file=sys.stderr)
+        return v
+    finally:
+        try:
+            fcntl.flock(lfd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lfd)
+
+
 def _load_serve_token():
     t = (os.environ.get("ROMP_SERVE_TOKEN") or "").strip()
     if t:
         return t
-    f = STATE.parent / "serve-token"              # ~/.local/state/romp/serve-token (STATE is romp/postal)
-    try:
-        v = f.read_text().strip()
-        if v:
-            return v
-    except OSError:
-        pass
-    v = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
-    try:
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(v)
-        os.chmod(f, 0o600)
-    except OSError:
-        pass
-    return v
+    # ~/.local/state/romp/serve-token (STATE is romp/postal): the kernel's file, shared.
+    return _serve_token_read_or_mint(STATE.parent / "serve-token", "postal")
 
 
 SERVE_TOKEN = _load_serve_token()
