@@ -18691,6 +18691,7 @@ def _tunnel_supervisor():
                         r["kernel_ver"] = (rver or {}).get("ver") or ""
                         r["auto_nudge"] = (rver or {}).get("autoNudge")   # None = that kernel didn't say
                         r["settings"] = (rver or {}).get("settings")      # its whole kernel-side dict (None = older kernel)
+                        r["settingsGt"] = (rver or {}).get("settingsGt")  # each store's last-applied stamp (T248b: the adopt seam)
                     if ruse is not None:
                         # {} = the host ANSWERED with nothing to show → clear; None = no answer (blip/
                         # rate-gate) → keep the last reading (see _poll_remote_usage)
@@ -18713,6 +18714,14 @@ def _tunnel_supervisor():
                     # row and may spawn a worker. Runs here, in the one supervisor, so an advance is pushed
                     # exactly once no matter how many dashboards are open.
                     _maybe_auto_push(r)
+                    # Kernel-side settings converge without a click (T248b): a peer whose stamp for a
+                    # setting is newer than ours, with a different value, is adopted through the setting's
+                    # own gt-gated setter. Outside the lock too: the setters take their own locks and write
+                    # their stores. Loud on a fault, never fatal to the supervisor.
+                    try:
+                        _adopt_peer_settings(r.get("host") or "?", rver)
+                    except Exception:
+                        _tunnel_log(r.get("host") or "?", "adopt-settings", error=traceback.format_exc()[-400:])
                     # tag federation v2, the reattach half (also outside the lock — it round-trips the
                     # tunnel): a host that answers this pass applies any journaled tag edits that
                     # failed while it was unreachable. Steady state costs one cached-list scan.
@@ -33260,6 +33269,52 @@ def _setting_kept_value(name):
     if name == "thinking-summaries":
         return _thinking_summaries_on()
     return jd._state_str(name, "")   # the judge-tier stores are bare value files
+
+
+# ── kernel-side settings converge across attached machines WITHOUT a click (T248b) ──────────────
+# The gear's click is broadcast to every attached kernel (federation.ts KERNEL_SETTING), but a machine
+# attached AFTER the click kept its own copy until the next one, with a mixed mark to show it — and the
+# user's standard for these settings is consistent ALWAYS (2026-09-08, after Suggest /compact fired
+# from an attached kernel whose copy was on while the gear showed the box off). The tunnel supervisor
+# already lifts each up peer's /version "settings" dict onto its /tunnels row every poll; it now lifts
+# "settingsGt" beside it and hands both here. A peer's stamp NEWER than our store's last-applied stamp,
+# with a DIFFERENT value, is adopted through the setting's own gt-gated setter under the PEER's stamp:
+# the poll observing a newer stamp is the event, and gesture-time ordering gives latest-wins on both
+# sides with no ping-pong (the adopter's stamp then equals the peer's, and an equal stamp is never
+# adopted — the same rule the setters apply to a stale flush). Equal stamps or equal values write
+# nothing; a peer that sends no stamps (an older kernel) or junk teaches nothing. Scope: the three
+# boolean settings that ride the browser broadcast and have no other propagation leg (the judge tiers
+# fan out over /judge-settings; update mode is a per-install boot policy by design).
+_MESH_ADOPTED_SETTINGS = (("compactSuggest", "compact-suggest", _set_compact_suggest),
+                          ("autoNudge", "auto-nudge", _set_auto_nudge),
+                          ("fileEditing", "file-editing", _set_file_editing))
+
+
+def _adopt_peer_settings(host, rver):
+    """Adopt every kernel-side boolean in `rver` (a peer's /version dict) whose stamp is newer than the
+    local store's and whose value differs. Returns the store names adopted. Runs on the supervisor
+    thread: the setters' stand-down verdicts are consumed here (no delivering socket to answer)."""
+    st = (rver or {}).get("settings") if isinstance(rver, dict) else None
+    gts = (rver or {}).get("settingsGt") if isinstance(rver, dict) else None
+    if not isinstance(st, dict) or not isinstance(gts, dict):
+        return []
+    adopted = []
+    for key, store, setter in _MESH_ADOPTED_SETTINGS:
+        val, pgt = st.get(key), gts.get(store)
+        if not isinstance(val, bool) or isinstance(pgt, bool) or not isinstance(pgt, (int, float)) or pgt <= 0:
+            continue
+        pgt = int(pgt)
+        if pgt <= _setting_stored_gt(store):
+            continue                                   # older or equal: nothing newer to learn
+        if bool(_setting_kept_value(store)) == val:
+            continue                                   # the values agree: nothing to converge
+        applied = setter(val, gt=pgt)
+        _pop_stale_notice()                            # no WS gesture made this: never leave a verdict for one
+        if applied is not None:
+            adopted.append(store)
+            sys.stderr.write("setting %s: adopted %s's newer pick (%s, gesture %d) — one value across machines\n"
+                             % (store, host, val, pgt))
+    return adopted
 
 
 # Every gt-gated store, by the name _setting_stale is called with — the vocabulary the settingStale
