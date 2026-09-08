@@ -168,6 +168,22 @@ export const TAG_BTN_ACCENT = "#9cd2ff";   // the romp accent (--accent) — pin
 export const TAG_BTN_BORDER = "rgba(255,255,255,0.10)";   // the feed's --card-border, stated by value
 export const TAG_BTN_WASH = "rgba(156,210,255,0.12)";     // the feed .on's faint accent wash, ditto
 
+/** THE TAG CHIP (one vocabulary, T251 — the user 2026-09-07: a group header must show its tag the way
+ *  the tag is shown everywhere else): the outline pill in the tag's own colour, the shape the strip's
+ *  tags bar and the feed's tag chips wear. `inheritSize` drops the pill's own 0.82em for a host that
+ *  already sits at the surface's sub-line size (the group header), so no em nests inside an em (the
+ *  fonts rule). The uncoloured fallback is the theme's --dim (a token, so the light theme is never
+ *  handed a dark gray), with the constant as the file:// fallback. */
+export function tagChip(label: string, color?: string | null, opts?: { inheritSize?: boolean }): HTMLElement {
+  const col = color || ("var(--dim, " + TAG_BTN_GRAY + ")");
+  const chip = document.createElement("span");
+  chip.setAttribute("style", "display:inline-flex;align-items:center;gap:5px;padding:2px 7px;"
+    + "border-radius:9px;" + (opts && opts.inheritSize ? "" : "font-size:0.82em;")
+    + "border:1px solid " + col + ";color:" + col + ";background:transparent;white-space:nowrap;");
+  chip.appendChild(document.createTextNode(label));
+  return chip;
+}
+
 export function syncTagFilter(btn: HTMLElement, chipsHost: HTMLElement,
                               lens: TagLens, unions: { name: string; color?: string | null; members: string[]; }[],
                               onApply: (l: TagLens) => void,
@@ -183,12 +199,7 @@ export function syncTagFilter(btn: HTMLElement, chipsHost: HTMLElement,
   btn.setAttribute("aria-pressed", narrowed ? "true" : "false");
   chipsHost.textContent = "";
   for (const c of lensChips(lens, unions as never)) {
-    const col = c.color || TAG_BTN_GRAY;
-    const chip = document.createElement("span");
-    chip.setAttribute("style", "display:inline-flex;align-items:center;gap:5px;padding:2px 7px;"
-      + "border-radius:9px;font-size:0.82em;border:1px solid " + col + ";color:" + col + ";"
-      + "background:transparent;white-space:nowrap;");
-    chip.appendChild(document.createTextNode(c.label));
+    const chip = tagChip(c.label, c.color);
     const x = document.createElement("span");
     x.textContent = "✕";
     x.setAttribute("style", "cursor:pointer;opacity:0.75;color:" + TAG_BTN_GRAY + ";font-size:0.9em;");

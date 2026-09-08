@@ -384,8 +384,9 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 .tab-group-caret { display: inline-block; flex: 0 0 auto; width: 0.9em; text-align: center; transition: transform 0.12s ease; }
 .tab-group-head:not(.collapsed) .tab-group-caret { transform: rotate(90deg); }
 /* the tag's color as a short bar, not a dot: a dot beside a name is a session pip */
-.tab-group-swatch { flex: 0 0 auto; width: 3px; height: 12px; border-radius: 1px; background: var(--dim); }
-.tab-group-name { font-weight: 600; }
+/* the tag's CHIP (T251) — the shared tag-menu builder's pill, sized by the header (no nested em); flex-none
+   so a wrapping strip never squeezes it, and a tab's own vertical rhythm stays the ceiling */
+.tab-group-chip { flex: 0 0 auto; font-weight: 600; line-height: 1.2; }
 .tab-group-count { opacity: 0.7; }
 /* the folded header's member-state pip (after the count, small — subordinate to the label): the tab's
    status colors by the tab's own rule (tab-state.ts) — working gold, blocked/waiting red, retrying the
