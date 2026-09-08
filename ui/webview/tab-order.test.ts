@@ -5,7 +5,7 @@
 // own order tests never reached, which is why the jumping survived every "fix".
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
-import { reconcileTabOrder } from "./tab-order";
+import { reconcileTabOrder, retainLiveOmitted } from "./tab-order";
 
 // A tiny stand-in for the client's tab state: the order array + the set of ids whose session is known. The
 // real render.ts drives the SAME three ops (append on a session push, remove on close, reconcile on a kernel
@@ -143,4 +143,33 @@ test("a revived session (same sid re-listed after a drop) is adopted back cleanl
   assert.deepEqual(m.list(), ["A"]);
   m.onKernelOrder(["A", "B"]);            // B revived (dead sessions revive with their history)
   assert.deepEqual(m.list(), ["A", "B"]);
+});
+
+// T258 (the user 2026-09-08): a live session the kernel STILL affirms live but whose tabOrder push omits it
+// (its transcript file was briefly unreadable) is kept at its slot, never dropped or moved. The kernel-side
+// fix keeps it in `order`; this is the pane's second line of defense.
+test("retainLiveOmitted keeps a live-but-omitted local id at its slot; drops nothing else; a no-op without a marker", () => {
+  // B is live per the marker but missing from the kernel order → spliced back after A (its local predecessor)
+  assert.deepEqual(retainLiveOmitted(["A", "C"], ["A", "B", "C"], new Set(["B"])), ["A", "B", "C"]);
+  // a genuinely gone id (NOT in live) is not retained — the omission stands
+  assert.deepEqual(retainLiveOmitted(["A", "C"], ["A", "B", "C"], new Set()), ["A", "C"]);
+  // the kernel order otherwise wins verbatim (a drag/reorder is honored); a retained id sits at its local slot
+  assert.deepEqual(retainLiveOmitted(["C", "A"], ["A", "B", "C"], new Set(["B"])), ["C", "A", "B"]);
+  // first-position live-omitted id lands at the front (no surviving predecessor)
+  assert.deepEqual(retainLiveOmitted(["C"], ["B", "C"], new Set(["B"])), ["B", "C"]);
+  // an id already in the kernel order is never duplicated even if the marker also names it
+  assert.deepEqual(retainLiveOmitted(["A", "B"], ["A", "B"], new Set(["A", "B"])), ["A", "B"]);
+});
+
+// End to end through reconcileTabOrder: a push that omits a live id must not tear the tab down (the property
+// render.ts's applyTabOrder relies on — omitted excludes live, and the retained order feeds reconcile).
+test("a kernel push omitting a LIVE id keeps its tab; omitting a non-live id removes it", () => {
+  const kernelSeen = new Set(["A", "B"]);
+  const seen = (id: string) => kernelSeen.has(id);
+  // B live but omitted → retained order lists it → reconcile keeps it (kernel-owned, so it would otherwise drop)
+  const keptOrder = retainLiveOmitted(["A"], ["A", "B"], new Set(["B"]));
+  assert.deepEqual(reconcileTabOrder(keptOrder, ["A", "B"], (id) => id === "A" || id === "B", seen), ["A", "B"]);
+  // B NOT live and omitted → not retained → reconcile drops it (the genuine close)
+  const goneOrder = retainLiveOmitted(["A"], ["A", "B"], new Set());
+  assert.deepEqual(reconcileTabOrder(goneOrder, ["A", "B"], (id) => id === "A" || id === "B", seen), ["A"]);
 });

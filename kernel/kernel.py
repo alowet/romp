@@ -2501,6 +2501,63 @@ def _has_tmux():
     return shutil.which("tmux") is not None
 
 
+# ── a LIVE session survives a transient transcript-read failure on the tab list (T258) ─────────────────────
+# _alive_sessions resolves each live sid to a transcript through discover(), which scans project dirs for
+# <sid>.jsonl. A file moved aside (a torn write, a hand `mv`, a resume that renames the leaf before the CLI
+# recreates it) leaves discover with NO entry, so the live session dropped off _alive_sessions → the chat tab
+# list → the tabOrder push, and the pane tore its tab down through the T236 omission path. A read that failed
+# for a cycle is NOT a state change (the same rule as T249b's empty-build guard). A session whose tmux lane /
+# SDK reg is live stays listed with a names/-derived stub — the EXPECTED path under its cwd, which discover
+# re-resolves the instant the file returns — and build_session parses the missing file to empty while the
+# T249b guard holds its last content. Said once per episode + a romp-perf line.
+_UNRESOLVED_LIVE_NOTED = set()      # live sids inside an unresolved-transcript episode (one stderr line each)
+
+
+def _live_stub_session(sid, now):
+    """A _sessions()-shaped entry for a LIVE sid discover cannot resolve this cycle. The path is the expected
+    transcript under the session's cwd (from names/), which may not exist right now — build_session re-resolves
+    it and the empty-read guard covers the gap. None when there is nothing to stub from: no names/ entry and no
+    SDK owner, a genuinely unknown live sid, which stays out (never invented)."""
+    name = _name_of(sid)
+    cwd = _cwd_of(sid)
+    if not name and not cwd:
+        return None
+    path = (jd._proj_dir(cwd) / (sid + ".jsonl")) if cwd else (jd.STATE / "boot-stub" / (sid + ".jsonl"))
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0        # the file is the thing that is missing; never the clock (a ticking mtime re-sorts the
+        #                  feed's order every push and defeats its dedup) — the wide-walk fallback's idiom
+    return {"sid": sid, "name": name or sid[:8], "anchor": sid, "path": str(path), "mtime": mtime}
+
+
+def _note_unresolved_live(sid, path):
+    """One stderr line per episode naming the live sid whose transcript could not be resolved, plus a
+    romp-perf `liveunresolved` line every cycle it holds (for the perf log / the harness)."""
+    sid = str(sid or "")
+    _perf("liveunresolved", sid=sid[:8])
+    if sid in _UNRESOLVED_LIVE_NOTED:
+        return
+    _UNRESOLVED_LIVE_NOTED.add(sid)
+    sys.stderr.write("romp-kernel: %s is LIVE but its transcript could not be resolved (expected %s) — keeping "
+                     "it in the tab list with its last-known meta; a read failure is not a close\n"
+                     % (sid[:8], path))
+
+
+def _clear_unresolved_live_note(sid):
+    _UNRESOLVED_LIVE_NOTED.discard(str(sid or ""))
+
+
+def _tab_order_frame(order, tabs, live):
+    """The ONE tabOrder frame shape (T258): the shared order, the tabs meta, the viewer's views blob, and
+    `live` — the sids the kernel affirms are LIVE this build (raw tmux/SDK liveness, independent of whether
+    discover could resolve each one's transcript). The pane keeps a live sid on the strip even if this frame's
+    `order` omits it: a transient read failure that drops a session from the order is not a close (render.ts
+    applyTabOrder). Older clients ignore the extra field."""
+    return {"type": "tabOrder", "order": list(order), "tabs": tabs,
+            "views": _views_client(), "live": sorted({str(x) for x in live})}
+
+
 def _alive_sessions(now, tmux):
     """The sessions shown on EVERY surface (feed / timeline / chat tabs): only those alive in tmux
     right now. The hard liveness filter (the user 2026-06-15) — ignore everything that isn't a living
@@ -2542,7 +2599,18 @@ def _alive_sessions(now, tmux):
     if be:
         for sid in tmux:
             if sid not in have and be.owns(sid):
-                alive.append(_sdk_sess(sid, now))
+                alive.append(_sdk_sess(sid, now)); have.add(sid)
+    # a LIVE sid discover STILL cannot resolve (its transcript file is momentarily unreadable) stays listed
+    # with a stub rather than dropping off the strip (T258, see _live_stub_session above)
+    still = [sid for sid in tmux if sid not in have]
+    for sid in still:
+        stub = _live_stub_session(sid, now)
+        if stub is not None:
+            alive.append(stub); have.add(sid)
+            _note_unresolved_live(sid, stub["path"])
+    for sid in list(_UNRESOLVED_LIVE_NOTED):     # resolved again OR died → the episode is over, re-arm the note
+        if sid not in still:
+            _clear_unresolved_live_note(sid)
     if tmux or _has_tmux():
         return alive
     return _sessions(now)
@@ -34738,7 +34806,7 @@ def _push(targets, connect=False, tmux=None):
                 _send_client(c, ("globalRetryPaused",), {"type": "globalRetryPaused", "value": _retry_paused_on(),
                                                          "resumeAt": _retry_resume_at(),   # limit reset epoch → the card counts down to the real retry
                                                          "reason": _retry_pause_reason()})   # "spend" → the card says 'raise your cap', no countdown
-                _send_client(c, ("taborder",), {"type": "tabOrder", "order": tab_order, "tabs": tab_meta, "views": _views_client()})
+                _send_client(c, ("taborder",), _tab_order_frame(tab_order, tab_meta, tmux))
             active = {c.get("active") for c in chat_clients if c.get("active")}
             # Stable: active tabs first — and TRANSCRIPT-LESS sessions with them. A just-created session
             # has no transcript, so its build is near-free, and its creator is guaranteed to be staring
@@ -35064,7 +35132,7 @@ def _push_session_now(sid):
             return                                   # the periodic pusher owns the sid until content returns
         ms = None                                    # lazy: the first full send materializes it, the rest reuse
         for c in targets:
-            _send_client(c, ("taborder",), {"type": "tabOrder", "order": tab_order, "tabs": tab_meta, "views": _views_client()})
+            _send_client(c, ("taborder",), _tab_order_frame(tab_order, tab_meta, tmux))
             ms = _send_chat(c, m, ms, 0, True)       # change_from 0 → always the full-session form
     except Exception:
         sys.stderr.write("push-session-now (%s): %s\n" % (sid, traceback.format_exc()))
@@ -35101,10 +35169,11 @@ def _confirm_close_now(sid):
     Off-cycle by design: `_tmux_sessions()` outside a pusher cycle is a live Sessions.live() read."""
     try:
         now = int(time.time())
-        chat_list = _chat_tab_sessions(now, _tmux_sessions())
+        tmux = _tmux_sessions()
+        chat_list = _chat_tab_sessions(now, tmux)
         tab_order = [s["sid"] for s in chat_list]
         tab_meta = [{"id": s["sid"], "name": s.get("name", ""), "color": _name_color(s["sid"])} for s in chat_list]
-        frame = {"type": "tabOrder", "order": tab_order, "tabs": tab_meta, "views": _views_client()}
+        frame = _tab_order_frame(tab_order, tab_meta, tmux)
         with _clients_lock:
             targets = [c for c in _clients if c["app"] == "chat"]
         for c in targets:
@@ -42673,11 +42742,12 @@ class Handler(BaseHTTPRequestHandler):
                 # back to ordering tabs by session STATE — so they drift on their own (worse now that the
                 # heartbeat auto-reloads). _ordered_alive is the same order chat tabs + timeline lanes use.
                 try:
-                    _alive = _ordered_alive(int(time.time()), _tmux_sessions())
+                    _tm = _tmux_sessions()
+                    _alive = _ordered_alive(int(time.time()), _tm)
                     _o = [s["sid"] for s in _alive]
                     # name+color per tab → the client paints the whole strip as placeholders up front (tabs-first)
                     _tabs = [{"id": s["sid"], "name": s.get("name", ""), "color": _name_color(s["sid"])} for s in _alive]
-                    _frame = {"type": "tabOrder", "order": _o, "tabs": _tabs, "views": _views_client()}
+                    _frame = _tab_order_frame(_o, _tabs, _tm)
                     client["send"](json.dumps(_frame))
                     # sent on the raw socket, not through _send_client — so its views seq is captured here
                     _sq = _views_seq_of(_frame)

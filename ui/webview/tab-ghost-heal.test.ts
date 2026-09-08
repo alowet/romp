@@ -126,11 +126,11 @@ test("a create placeholder the kernel has never listed still survives unrelated 
 test("applyTabOrder dismisses kernel-owned omissions BEFORE reconciling, then records add-only", () => {
   // the drop loop sits between ackClosingTabs and the reconcile, and dismissSession is the shared teardown
   assert.match(RENDER,
-    /ackClosingTabs\(kernelOrder, report\);[\s\S]{0,900}?const omitted = new Set\(order\.filter\(\(id\) => kernelListed\.has\(id\) && !inKernel\.has\(id\)\)\);[^\n]*\n\s*for \(const id of order\.slice\(\)\) \{\s*\n\s*if \(omitted\.has\(id\)\) dismissSession\(id, "omitted", omitted\);\s*\n\s*\}/,
+    /ackClosingTabs\(kernelOrder, report\);[\s\S]{0,1600}?const omitted = new Set\(order\.filter\(\(id\) => kernelListed\.has\(id\) && !inKernel\.has\(id\) && !liveSet\.has\(id\)\)\);[^\n]*\n(?:.*\n){0,3}?\s*for \(const id of order\.slice\(\)\) \{\s*\n\s*if \(omitted\.has\(id\)\) dismissSession\(id, "omitted", omitted\);\s*\n\s*\}/,
     "kernel-owned tabs the push stopped carrying get the closed-event teardown");
   // the reconcile passes the kernelListed predicate, so the pure model enforces the same rule
   assert.match(RENDER,
-    /reconcileTabOrder\(kernelOrder, order, \(id\) => sessions\.has\(id\) \|\| tabMeta\.has\(id\),\s*\n\s*\(id\) => kernelListed\.has\(id\)\)/);
+    /reconcileTabOrder\(retainLiveOmitted\(kernelOrder, order, liveSet\), order,\s*\n\s*\(id\) => sessions\.has\(id\) \|\| tabMeta\.has\(id\),\s*\n\s*\(id\) => kernelListed\.has\(id\)\)/);   // the retained order (T258) feeds the reconcile
   // add-only, recorded AFTER the reconcile: dropping entries would hand a late stale `session` frame the
   // never-listed keep and re-mint the ghost
   assert.match(RENDER, /for \(const id of next\) order\.push\(id\);\s*\n\s*for \(const id of kernelOrder\) kernelListed\.add\(id\);/);
