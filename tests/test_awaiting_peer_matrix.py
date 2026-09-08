@@ -304,6 +304,24 @@ class TwinsKeyMailByStableId(_Base):
             jd._learn_alias(alias, o)
         self.assertEqual(alias, {"TESTHOST:api": [(0, self.X), (40, self.Y)]})
 
+    def test_a_row_that_came_back_still_teaches_the_alias(self):
+        # 2026-09-08: identity is not word — a remote sender's row names who wore the name even when the
+        # message itself came back or was recalled unread. The alias half is a guard on the exclusion's
+        # reach (green on the base by design); the last_any half is the fix (base: the row counted as
+        # X's word toward SID)
+        for terminal in ({"id": "m2", "ev": "bounced", "t": T0 + 60, "to": "web",
+                          "why": "recipient exited; unread mail destroyed by the orphan sweep"},
+                         {"id": "m2", "ev": "recall", "t": T0 + 60}):
+            self._log([self._row(i=2, **{"from": "api"}, from_id=self.X, to_id=SID, t=T0 + 50,
+                                 kind="coordinate", from_host="TESTHOST"),
+                       json.dumps(terminal)])
+            last_any, _ask, alias = jd._postal_ask_maps()
+            self.assertEqual(jd._alias_at(alias, "TESTHOST:api", T0 + 50), self.X, "the judge still learned the wearer")
+            self.assertNotIn((self.X, SID), last_any, "…while the row is not X's word: %s" % terminal["ev"])
+            k_any, _k_ask, _k_aw = km._postal_wait_maps()
+            self.assertEqual(km._postal_peer_names().get(self.X), "TESTHOST:api", "the kernel's display join too")
+            self.assertNotIn((self.X, SID), k_any)
+
 
 class MatrixPlannerGate(_Base):
     """The nudge planner's awaiting op: kind=peer demotes to kindless without an open ask (the op's
@@ -591,17 +609,44 @@ class CrossHostDelegation(_Base):
         self.assertEqual([nd["handoff"]["msgId"] for nd in self._handoffs()], ["px-2.mail.TESTHOST-A"],
                          "main: both planted — the returned delegate got a tracker no event could close")
 
+    def test_a_recalled_outbox_delegate_still_plants_the_tracker(self):
+        # review find, 2026-09-08: an OUTBOX recall names the relay mid ("px-…"), and the outbox item
+        # outlives the carry (the exchange relays it without removing it; only the end-to-end ack does),
+        # so the far host may already have delivered it and the peer may report back — NOT terminal,
+        # and the tracker is planted as before (green on the base by design, where no recall was read).
+        # The bus owns the follow-up: refuse to recall a carried item, or stamp the row with its box.
+        self._fleet_stub()
+        self._log([self._xrow(1, T0 + 10),
+                   json.dumps({"id": "px-1.mail.TESTHOST-A", "ev": "recall", "t": T0 + 50}),
+                   self._xrow(2, T0 + 20, body="own the importer work")])
+        jd.run_courier(now=T0 + 100)
+        self.assertEqual(sorted(nd["handoff"]["msgId"] for nd in self._handoffs()),
+                         ["px-1.mail.TESTHOST-A", "px-2.mail.TESTHOST-A"],
+                         "a recalled outbox delegate keeps its tracker: the recall is not read as terminal")
+
 
 class ReturnedAskTwins(_Base):
     """A send the bus RETURNED (a terminal `bounced` row naming its id) is a closed ask on both readers
     (2026-09-08): the closer's admit gate sees no open question to stamp a peer wait over, and the wait
     maps set no chip edge. Before, both twins skipped the row (no from_id/to_id) and the sender read as
-    waiting on a peer that never got the message — a card parked on a wait no event could end."""
+    waiting on a peer that never got the message — a card parked on a wait no event could end. The same
+    day's second fold: a maildir `recall` row (the sender withdrew the message unread) is the other
+    terminal kind, riding #1071's one skip before last_any — so a recalled reply, like a bounced one
+    (#1071's own test), leaves the asker's question open on both readers."""
 
     @staticmethod
     def _back(i, ts, host=""):
         return json.dumps({"id": "m%d" % i, "ev": "bounced", "t": ts, "to": "web", "host": host,
                            "why": "recipient exited; unread mail destroyed by the orphan sweep"})
+
+    @staticmethod
+    def _recall(i, ts):
+        return json.dumps({"id": "m%d" % i, "ev": "recall", "t": ts})    # the sender unsent it unread
+
+    @staticmethod
+    def _km_open(sid):
+        last_any, last_ask, _aw = km._postal_wait_maps()
+        return any(f == sid and last_any.get((p, sid), 0) < meta[0] for (f, p), meta in last_ask.items())
 
     def test_the_closer_does_not_stamp_a_peer_wait_over_a_returned_question(self):
         s, gid = self._store()
@@ -623,6 +668,53 @@ class ReturnedAskTwins(_Base):
             self._log(rows)
             self.assertEqual((jd._open_peer_asks(SID), km_open(SID)), (open_, open_),
                              "gate and wait-maps on: %s" % rows)
+
+    def test_the_closer_does_not_stamp_a_peer_wait_over_a_recalled_question(self):
+        # 2026-09-08: the worker withdrew its question before the manager read it — as over as a bounce
+        s, gid = self._store()
+        self._log([_msg(1, SID, MGR, T0 + 10, "question"), self._recall(1, T0 + 20)])
+        self._close_peer(s)
+        self.assertEqual((s["nodes"][gid].get("awaitingWhy"), s["nodes"][gid].get("awaitingKind")), (None, None),
+                         "base: the gate read the withdrawn question as open and admitted the peer stamp")
+        self.assertEqual(jd._open_ask_peers(SID), [], "no open ask: the worker unsent it")
+
+    def test_both_readers_agree_on_a_recalled_ask(self):
+        grid = [
+            ([_msg(1, SID, MGR, T0, "question"), self._recall(1, T0 + 5)], False),
+            ([_msg(1, SID, MGR, T0, "question"), _msg(2, SID, MGR, T0 + 5, "question"), self._recall(1, T0 + 9)], True),
+            # an OUTBOX recall (the row names the relay mid, "px-…") is not terminal: the item may already
+            # have been carried, so the cross-host ask stays open on both readers (review find, 2026-09-08)
+            ([json.dumps({"id": "px-1.mail.TESTHOST", "ev": "sent", "from": "web", "from_id": SID,
+                          "to_id": "peer:otherbox", "toName": "otherbox:web", "t": T0, "body": "x", "kind": "question"}),
+              json.dumps({"id": "px-1.mail.TESTHOST", "ev": "recall", "t": T0 + 5})], True),
+        ]
+        for rows, open_ in grid:
+            self._log(rows)
+            self.assertEqual((jd._open_peer_asks(SID), self._km_open(SID)), (open_, open_),
+                             "gate and wait-maps on: %s" % rows)
+
+    def test_both_readers_agree_a_recalled_reply_answers_nothing(self):
+        # the manager recalled its reply before the worker read it: the worker never received it, so its
+        # question is as open as before on both readers; the first row is the guard. (The BOUNCED reply
+        # is #1071's rule and test: test_a_refused_question_is_no_open_ask_for_either_reader's second half.)
+        grid = [
+            ([_msg(1, SID, MGR, T0, "question"), _msg(2, MGR, SID, T0 + 5, "coordinate")], False),
+            ([_msg(1, SID, MGR, T0, "question"), _msg(2, MGR, SID, T0 + 5, "coordinate"), self._recall(2, T0 + 9)], True),
+        ]
+        for rows, open_ in grid:
+            self._log(rows)
+            self.assertEqual((jd._open_peer_asks(SID), self._km_open(SID)), (open_, open_),
+                             "gate and wait-maps on: %s" % rows)
+
+    def test_the_closer_still_stamps_when_the_reply_was_recalled(self):
+        # the admit gate's other direction, at the closer's WRITE: the wait IS on when the only answer was
+        # withdrawn before it arrived (the bounced reply's gate predicate is #1071's test)
+        s, gid = self._store()
+        self._log([_msg(1, SID, MGR, T0 + 10, "question"), _msg(2, MGR, SID, T0 + 20, "coordinate"),
+                   self._recall(2, T0 + 30)])
+        self._close_peer(s)
+        self.assertEqual(s["nodes"][gid].get("awaitingKind"), "peer",
+                         "base: the recalled reply read as the answer and the gate dropped the stamp")
 
 
 if __name__ == "__main__":
