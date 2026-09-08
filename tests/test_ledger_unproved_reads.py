@@ -49,7 +49,7 @@ EIO = OSError(errno.EIO, "Input/output error")
 # Spelled out, not km.UNPROVED: a kernel without the fix has no such name, and these tests must fail
 # there on the DEFECT (a rewritten file, a fired message), never on an AttributeError in the fixture.
 UNPROVED = "_unproved"
-REGISTRIES = ("_ledger_fault_warned", "_ledger_refusal_warned")   # the once-per-episode registries
+REGISTRIES = ("_ledger_fault_warned", "_ledger_refusal_warned", "_ledger_write_failed")   # the once-per-episode registries
 
 
 def _reset_ledger_state():
@@ -260,7 +260,9 @@ class CorruptBytes(_Ledger):
 
     def test_a_file_replaced_under_a_corrupt_read_is_not_moved_aside(self):
         # the inode guard: the bytes that failed are the ones to move; a concurrent atomic publish between
-        # our read and our rename has already replaced them, and the NEW file must not be quarantined
+        # our read and our rename has already replaced them, and the NEW file must not be quarantined —
+        # and (the maintainer's fold on PR #1019) the peer's bytes get their own read IN THIS CALL, so the
+        # reader returns what is there now, proved, rather than an unproved copy of the old snapshot
         self.p.write_text("{")
         km._autonudge_cache.clear()
         real, target = Path.read_text, str(self.p)
@@ -280,9 +282,37 @@ class CorruptBytes(_Ledger):
         self._heal()
         self.assertEqual(self._aside(), [], "the replacement is not the file whose bytes failed")
         self.assertEqual(json.loads(self.p.read_text()), SEEDED, "…and it stands, untouched")
-        self.assertIn("replaced meanwhile", str(d.get(UNPROVED, "")), "this read is unproved; the next one reads the new bytes")
+        self.assertNotIn(UNPROVED, d, "the peer's bytes were read in this call: a PROVED snapshot, not the old one tagged")
+        self.assertEqual(d["nudged"], SEEDED["nudged"], "…and it is what the peer published")
+        self.assertEqual(err.getvalue(), "", "a peer's publish is not an incident: no line")
         km._autonudge_cache.clear()
         self.assertEqual(km._auto_nudge_data()["nudged"], SEEDED["nudged"])
+
+    def test_a_file_that_keeps_changing_under_the_read_ends_unproved_after_the_bound(self):
+        # the re-read is BOUNDED: a peer that republishes corrupt bytes under every read is chased three
+        # times, then the reader stops and reports the last try unproved (never a spin, never a move aside)
+        self.p.write_text("{")
+        km._autonudge_cache.clear()
+        real, target, reads = Path.read_text, str(self.p), []
+
+        def read_then_republish_corrupt(p, *a, **k):
+            raw = real(p, *a, **k)
+            if str(p) == target:                           # a peer publishes again — corrupt again, a new size
+                reads.append(1)
+                tmp = p.with_name("auto-nudge.json.tmp.peer")
+                tmp.write_text("{" * (len(reads) + 1))
+                os.replace(tmp, p)
+            return raw
+        Path.read_text = read_then_republish_corrupt
+        self._undo.append(lambda: setattr(Path, "read_text", real))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            d = km._auto_nudge_data()
+        self._heal()
+        self.assertEqual(len(reads), 3, "three tries, then the reader stops chasing the file")
+        self.assertIn("replaced meanwhile", str(d.get(UNPROVED, "")), "…and reports the last try unproved")
+        self.assertEqual(self._aside(), [], "nothing of a peer's was moved aside")
+        self.assertEqual(err.getvalue().count("unreadable"), 1, "said once")
 
     def test_a_corrupt_file_that_cannot_be_moved_aside_is_said_once_not_once_per_read(self):
         # a read-only state dir: every read re-fails the parse and the move; build_feed reads this ledger

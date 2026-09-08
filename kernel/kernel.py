@@ -4106,8 +4106,10 @@ def _setting_stale(name, gt, applied_gt):
     alone left the refusing kernel's verdict invisible to the dashboard that made the gesture
     (the open gear kept showing the refused pick, and with the mesh AGREEING on the kept value
     the mixed marks showed nothing). Every check clears the previous verdict first, so a popped
-    notice is always the CURRENT call's."""
+    notice is always the CURRENT call's — the refused-write verdict (_note_refused_gesture) included,
+    so a setter called outside a WS arm (nothing pops there) never leaves one for an unrelated gesture."""
     _stale_seen.last = None
+    _stale_seen.refused = None
     if gt is None or gt > applied_gt:
         return False
     _stale_seen.last = {"setting": name, "storedGt": applied_gt, "gt": gt}
@@ -4138,7 +4140,7 @@ def _pop_stale_notice():
     return d
 
 
-def _note_refused_gesture(name, gt, enabled, snap):
+def _note_refused_gesture(name, gt, enabled, snap, why=None):
     """A gt-gated toggle's write was REFUSED because its ledger read was unproved (the snapshot carries
     UNPROVED — the file could not be read, so the writer would not persist a copy of it). Recorded on this
     thread the way _setting_stale records a stand-down, so the WS branch that delivered the gesture can tell
@@ -4147,9 +4149,13 @@ def _note_refused_gesture(name, gt, enabled, snap):
     the file healed, ON is what ran. A different notice from the stale one on purpose: nothing about
     ordering is claimed, and the frame names the fault. `known` says whether a kept value can be NAMED at
     all: the tagged copy is the last snapshot this process proved (its last read or its own last write)
-    only when one is cached; otherwise it is the default, and the frame must not present that as kept."""
+    only when one is cached; otherwise it is the default, and the frame must not present that as kept.
+    `why` given: the WRITE itself failed (the snapshot was proved; the publish raised) — the same frame, the
+    fault named, and `write` set so the reply files no second error-center row: the writer already filed the
+    episode's one (the maintainer's fold on PR #1019: a refused write is told, once per episode)."""
     _stale_seen.refused = {"setting": name, "gt": gt, "refused": "on" if enabled else "off",
-                           "why": str(snap.get(UNPROVED) or "the ledger could not be read"),
+                           "why": str(why or snap.get(UNPROVED) or "the ledger could not be read"),
+                           "write": why is not None,
                            "known": str(jd.STATE / "auto-nudge.json") in _autonudge_cache}   # kept: None → the
     #                                                                                gear drops "Keeping …"
 
@@ -4204,17 +4210,25 @@ _NUDGE_LOCK = threading.RLock()
 # the cache would not survive the copy, and a per-path "last read failed" bit races a sibling thread's
 # proved read.
 UNPROVED = "_unproved"                 # snapshot tag → the fault text; never a key a ledger stores
+_LEDGER_REPLACED = "replaced meanwhile; the new bytes get their own read"   # _ledger_quarantine's decline when
+#                                        the file is no longer the one whose bytes failed: the reader re-reads
 _ledger_fault_warned = {}              # what -> fault the reader already shouted; cleared by a proved read
 _ledger_refusal_warned = {}            # what -> fault the writer already shouted; cleared by a proved write
+_ledger_write_failed = {}              # what -> the WRITE fault the writer already shouted; cleared only by a
+#                                        landed write (a proved read ends a read episode, not a write one)
 
 
-def _ledger_read(p, cache, default, what, normalize=None, lock=None):
+def _ledger_read(p, cache, default, what, normalize=None, lock=None, _tries=3):
     """FOUR-STATE read of a small JSON ledger. Absent → default() (uncached: the fresh-install arm, byte for
     byte the old behavior); readable and a JSON object → the dict (normalize applied), cached under its
     stat key; bytes that do not parse → moved aside (_ledger_quarantine), then default(); any other stat
     or read fault → a COPY of the last cached snapshot (else default()) tagged UNPROVED, nothing cached.
     `lock` is the ledger's WRITER lock, held across the quarantine only, never across the read (readers run
-    unlocked on several threads by design); see _ledger_quarantine for the window it closes."""
+    unlocked on several threads by design); see _ledger_quarantine for the window it closes.
+    The stat comes BEFORE the read so the quarantine can tell whether the file it is about to move is still
+    the one whose bytes failed; when a peer's atomic publish replaced it meanwhile, the quarantine declines
+    and THEIR bytes get their own read here, bounded by `_tries` — the shape the goal store's reader wears
+    (the maintainer's fold on PR #1019). Only a file that keeps changing under every read ends unproved."""
     try:
         st = p.stat()
     except FileNotFoundError:
@@ -4247,6 +4261,8 @@ def _ledger_read(p, cache, default, what, normalize=None, lock=None):
             why = _ledger_quarantine(p, st, what, reason)
         if why is None:
             return _ledger_proved(what, default())
+        if why == _LEDGER_REPLACED and _tries > 1:   # a peer published since our stat: read what is there now
+            return _ledger_read(p, cache, default, what, normalize, lock=lock, _tries=_tries - 1)
         return _ledger_unproved(p, cache, default, what, "%s (%s)" % (reason, why))
     if normalize is not None:
         normalize(d)
@@ -4285,8 +4301,9 @@ def _ledger_quarantine(p, st, what, reason):
     follows: the sidecar keeps the original name plus `.corrupt-<utc stamp>` (a `-n` suffix for a second in
     the same second): the state dir's one sidecar convention for bytes moved aside (docs/reference.md,
     "Where things live"; a goal-store quarantine proposed alongside in #1019 wears the same shape).
-    Only while the file is still the one whose bytes failed (same inode and generation) — an atomic publish
-    since then already replaced them, and the new file gets its own read. That check and the rename are one
+    Only while the file is still the one whose bytes failed (same inode, mtime and size as `st`, the stat the
+    reader took BEFORE its read) — an atomic publish since then already replaced them, and the new file gets
+    its own read (_LEDGER_REPLACED: _ledger_read re-reads, bounded). That check and the rename are one
     step ONLY under the ledger's writer lock, which _ledger_read holds around this call (review find,
     2026-09-08): readers run unlocked on several threads, and two that read the same corrupt bytes both
     arrive here with the same stat; between the first one's rename and a writer's fresh publish, the
@@ -4300,7 +4317,7 @@ def _ledger_quarantine(p, st, what, reason):
     try:
         cur = p.stat()
         if (cur.st_ino, cur.st_mtime_ns, cur.st_size) != (st.st_ino, st.st_mtime_ns, st.st_size):
-            return "replaced meanwhile; the new bytes get their own read"
+            return _LEDGER_REPLACED
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         aside, n = p.with_name("%s.corrupt-%s" % (p.name, stamp)), 0
         while aside.exists():                            # a second corrupt file in the same second
@@ -4310,10 +4327,7 @@ def _ledger_quarantine(p, st, what, reason):
     except FileNotFoundError:
         return None
     except OSError as e:
-        # errno + strerror ONLY: str(e) names both paths, and the destination carries the per-second stamp,
-        # so a text with it changed every second and every once-per-fault-text dedupe fired once a second
-        return "could not be moved aside: %s" % ("[Errno %d] %s" % (e.errno, e.strerror) if e.errno is not None
-                                                 else type(e).__name__)
+        return "could not be moved aside: %s" % _errno_text(e)   # stamp-free: _errno_text (#1020's helper, the same shape)
     # Both channels, one line (review find, 2026-09-08): stderr alone left the user with a ledger that read
     # as a fresh install (an explicit auto-nudge OFF back ON, every session's stop-retrying gone) and
     # nothing in the dashboard saying so. Once per corrupt file by construction: the next read finds it
@@ -4334,7 +4348,14 @@ def _ledger_write_proved(p, what, d, cache, normalize=None):
     A write that lands is a PROVED state: it ends the fault episode and refreshes the cache with what the
     file now holds (read back under its stat key), so "the last snapshot this process proved" — what a
     later fault serves, what a refused gesture names as kept — includes this kernel's own last write, not
-    just its last read. Best-effort: a read-back that fails leaves the cache as it was."""
+    just its last read. Best-effort: a read-back that fails leaves the cache as it was.
+    The WRITE step is a fault boundary too (the maintainer's fold on PR #1019, for the goal store's saves):
+    an OSError from the publish itself (ENOSPC, EROFS, EACCES) is said here ONCE per fault episode — one
+    stderr line and one error-center row, keyed on the stamp-free errno text in the writer's OWN registry
+    (_ledger_write_failed: a proved read clears the read registries, but only a landed write proves the disk
+    takes writes again) — and then re-raised, so the caller that owns a gesture answers its socket (the
+    setting toggles through _note_refused_gesture, the interrupt through its warn toast) and a tick's caller
+    is covered by its own wrap. Left silent at the caller, a refused write looked like one that landed."""
     fault = d.get(UNPROVED) if isinstance(d, dict) else None
     if fault:
         if _ledger_refusal_warned.get(what) != fault:
@@ -4342,7 +4363,18 @@ def _ledger_write_proved(p, what, d, cache, normalize=None):
             sys.stderr.write("%s: refusing to write %s from an unproved snapshot (%s) — the file keeps what "
                              "it holds\n" % (what, p.name, fault))
         return False
-    _atomic_write(p, json.dumps(d))
+    try:
+        _atomic_write(p, json.dumps(d))
+    except OSError as e:
+        fault = "write failed: %s" % _errno_text(e)
+        if _ledger_write_failed.get(what) != fault:
+            _ledger_write_failed[what] = fault
+            line = ("%s: write failed for %s (%s) — the change did not land; the file keeps what it holds"
+                    % (what, p.name, _errno_text(e)))
+            sys.stderr.write(line + "\n")
+            _sdk_problem(line)                # the error center: on record once, however many gestures repeat it
+        raise
+    _ledger_write_failed.pop(what, None)     # a landed write ends the write-fault episode
     _ledger_proved(what, None)               # a proved write ends the episode too
     try:
         st = p.stat()
@@ -4476,11 +4508,14 @@ def _write_auto_nudge(d):
 def _set_auto_nudge(enabled, gt=None):
     """Returns the applied gesture stamp (epoch ms), or None when a stale `gt` stood down —
     see the gesture-time ordering block above _NUDGE_LOCK — or the store write failed (OSError:
-    loud on stderr, nothing applied), or the ledger read was unproved (the writer refuses the
-    snapshot, loud once per fault episode; nothing applied). The catch lives HERE, like _set_update_mode's and
-    _set_judge_state's: a raised OSError reaches the WS reader loop, which classifies it as a
-    socket failure and re-raises into a silent pass — a full-disk gear toggle tearing the whole
-    dashboard WebSocket down with zero log output."""
+    said once per fault episode by the writer, nothing applied, and the delivering socket hears
+    the refusal through _note_refused_gesture, exactly as for an unproved read), or the ledger read
+    was unproved (the writer refuses the snapshot, loud once per fault episode; nothing applied). The
+    catch lives HERE, like _set_update_mode's and _set_judge_state's: a raised OSError reaches the WS
+    reader loop, which classifies it as a socket failure and re-raises into a silent pass — a
+    full-disk gear toggle tearing the whole dashboard WebSocket down with zero log output. Catching it
+    and saying nothing was the defect's quieter face (the maintainer's fold on PR #1019: a refused
+    write must be told): the gear kept the flipped box while the kernel held the old value."""
     with _NUDGE_LOCK:
         d = dict(_auto_nudge_data())
         if _gesture_echo(gt, _gt_int(d.get("gt")), bool(d.get("enabled")) == bool(enabled)):
@@ -4493,9 +4528,9 @@ def _set_auto_nudge(enabled, gt=None):
             if _write_auto_nudge(d) is False:           # unproved snapshot: refused at the writer, nothing
                 _note_refused_gesture("auto-nudge", gt, enabled, d)   # applied — and the socket hears it
                 return None
-        except OSError as e:
-            sys.stderr.write("setting auto-nudge: write failed (%s) — nothing applied\n" % e)
-            return None
+        except OSError as e:                          # said once per episode by the writer; THIS gesture's
+            _note_refused_gesture("auto-nudge", gt, enabled, d, why="write failed: %s" % _errno_text(e))
+            return None                                 # refusal is answered on its socket (_tell_stale_gesture)
         return d["gt"]
 
 
@@ -4509,7 +4544,8 @@ def _compact_suggest_on():
 
 def _set_compact_suggest(enabled, gt=None):
     """Returns the applied gesture stamp (epoch ms), or None when a stale `gt` stood down or the
-    store write failed (OSError: loud on stderr, nothing applied, nothing ticked) —
+    store write failed (OSError: said once per fault episode by the writer, nothing applied, nothing
+    ticked, and the delivering socket hears the refusal) —
     _set_auto_nudge's contract exactly (same blob, same _NUDGE_LOCK), but the
     stamp is PER SETTING (`compactSuggestGt`): the two checkboxes share a file, not a clock, so a
     queued compact-suggest flush can never stand down against a newer auto-nudge gesture or steal
@@ -4526,9 +4562,9 @@ def _set_compact_suggest(enabled, gt=None):
             if _write_auto_nudge(d) is False:           # unproved snapshot: refused at the writer, nothing
                 _note_refused_gesture("compact-suggest", gt, enabled, d)   # applied — and the socket hears it
                 return None
-        except OSError as e:
-            sys.stderr.write("setting compact-suggest: write failed (%s) — nothing applied\n" % e)
-            return None
+        except OSError as e:                          # as _set_auto_nudge: the writer said it once; the
+            _note_refused_gesture("compact-suggest", gt, enabled, d, why="write failed: %s" % _errno_text(e))
+            return None                                 # socket hears this gesture's refusal
         return d["compactSuggestGt"]
 
 
@@ -5887,14 +5923,14 @@ def _suppress_session_retry(sid):
     the ledger read was unproved (the writer refuses the snapshot — persisting it erased every sibling
     session's stop), or the write itself failed (ENOSPC — before this the OSError escaped into the WS reader
     loop, which reads any OSError as a socket failure and tore the dashboard's connection down, with the
-    suppression neither on disk nor anywhere)."""
+    suppression neither on disk nor anywhere; the writer says a failed write once per fault episode, this
+    arm only answers the click)."""
     with _RETRY_SUPPRESS_LOCK:
         d = dict(_retry_suppress_data())
         d[str(sid)] = time.time()
         try:
             written = _write_retry_suppress(d)
-        except OSError as e:
-            sys.stderr.write("retry-suppress: write failed (%s) — the stop for %s is not recorded\n" % (e, sid))
+        except OSError as e:                          # said once per episode by the writer (_ledger_write_proved)
             why = getattr(e, "strerror", None) or str(e)
         else:
             if written:
@@ -5906,13 +5942,18 @@ def _suppress_session_retry(sid):
 
 def _clear_session_retry_suppress(sid):
     """Drop `sid`'s suppression; True when the ledger on disk changed. A refused write (an unproved snapshot)
-    leaves the suppression standing and returns False — suppressed is the safe direction while the ledger
-    cannot be read; the sweep retries on its next tick, and the file's next proved read is the event."""
+    or a FAILED one (an OSError from the publish, said once per fault episode by the writer) leaves the
+    suppression standing and returns False — suppressed is the safe direction while the ledger cannot be
+    read or written; the sweep retries on its next tick, and the file's next proved read or landed write is
+    the event. Left to raise, the OSError reached the pusher's wrap as a traceback every tick."""
     with _RETRY_SUPPRESS_LOCK:
         d = dict(_retry_suppress_data())
         if d.pop(str(sid), None) is None:
             return False
-        return _write_retry_suppress(d)
+        try:
+            return _write_retry_suppress(d)
+        except OSError:
+            return False
 
 
 def _auto_resume_session_retry(now, tmux):
@@ -31550,8 +31591,8 @@ def _tell_stale_gesture(client, msg):
     was one kernel stderr line: the dashboard that made the gesture kept displaying the refused
     pick as applied (the gear fills only on open), and with the mesh AGREEING on the kept value
     the mixed marks showed nothing. The gear toasts the frame and re-fills if open — event-keyed,
-    the frame IS the deciding event; no polling. A refusal for any other cause (invalid value,
-    OSError) records no notice and sends nothing.
+    the frame IS the deciding event; no polling. A refusal for an invalid value records no notice
+    and sends nothing; a refused WRITE (OSError) records one like the unproved-read refusal below.
     The frame echoes `gesture`: the refused message itself, WITHOUT its stamp, so the toast can
     offer to re-issue it as a new gesture (a fresh click is legitimate new information) stamped
     above the stored one. The stamp is dropped on purpose — a re-issue can never reuse the stale
@@ -31563,7 +31604,9 @@ def _tell_stale_gesture(client, msg):
     the same frame plus `why` (the fault): the gear's copy — not applied, keeping the stored value —
     is exactly true of it, and the frame's re-fill snaps the checkbox back to the last snapshot this
     kernel proved (`kept`, named only when there is one); the fault itself, which the copy does not
-    carry, goes to the error center so it is on record."""
+    carry, goes to the error center so it is on record. A write that FAILED (the snapshot proved, the
+    publish raised) rides the same frame with its fault as `why`; its error-center row is the writer's,
+    filed once per fault episode, so this reply files none (the maintainer's fold on PR #1019)."""
     st = _pop_stale_notice()
     if st:
         _reply(client, {"type": "settingStale", "setting": st["setting"],
@@ -31574,9 +31617,10 @@ def _tell_stale_gesture(client, msg):
     if not rf:
         return
     kept = _setting_kept_value(rf["setting"]) if rf.get("known") else None
-    _sdk_problem("setting %s: %s was not applied — %s; the stored value%s stands until the ledger reads again"
-                 % (rf["setting"], rf["refused"], rf["why"],
-                    "" if kept is None else " (%s)" % ("on" if kept else "off")))
+    if not rf.get("write"):                            # a write fault's row is the writer's, once per episode
+        _sdk_problem("setting %s: %s was not applied — %s; the stored value%s stands until the ledger reads again"
+                     % (rf["setting"], rf["refused"], rf["why"],
+                        "" if kept is None else " (%s)" % ("on" if kept else "off")))
     _reply(client, {"type": "settingStale", "setting": rf["setting"],
                     "storedGt": _setting_stored_gt(rf["setting"]), "gt": rf["gt"], "kept": kept,
                     "why": rf["why"], "gesture": {k: v for k, v in msg.items() if k != "gt"}})

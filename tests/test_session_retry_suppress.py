@@ -185,7 +185,7 @@ class LedgerFaultsNeverEraseSiblings(unittest.TestCase):
     @staticmethod
     def _reset():
         km._retry_suppress_cache.clear()
-        for reg in ("_ledger_fault_warned", "_ledger_refusal_warned", "_retry_floor_warned"):
+        for reg in ("_ledger_fault_warned", "_ledger_refusal_warned", "_ledger_write_failed", "_retry_floor_warned"):
             vars(km).get(reg, set()).clear()       # the once-only registries — absent on a kernel before the
             #                                        fix, so these tests fail there on the DEFECT, not in setUp
 
@@ -260,10 +260,65 @@ class LedgerFaultsNeverEraseSiblings(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             told = km._suppress_session_retry("s3")               # raised straight into the WS reader loop before
+            told2 = km._suppress_session_retry("s3")              # the user presses stop again on the same full disk
         self.assertIsInstance(told, str)
         self.assertIn("No space left on device", told)
-        self.assertIn("write failed", err.getvalue())
+        self.assertEqual(told2, told, "every click is answered")
+        self.assertEqual(err.getvalue().count("write failed"), 1,
+                         "…but the fault is said ONCE per episode, at the writer (the maintainer's fold on PR #1019)")
         self.assertEqual(self.p.read_bytes(), before)
+
+    def test_a_full_disk_stop_toasts_every_click_and_the_client_survives_said_once_per_episode(self):
+        # the incident shape through the real dispatcher, with the publish itself failing: the interrupt
+        # happens, each click hears its own warn toast, the client is never dropped, and the fault is on
+        # record once per episode; a landed write ends the episode and a fresh fault speaks again
+        before = self._seed()
+        cuts = []
+        km._kernel_knows = lambda sid: True
+        km.Sessions.backend_for = lambda sid: types.SimpleNamespace(interrupt=lambda sid: cuts.append(sid))
+        real_write = km._atomic_write
+
+        def full(*a, **k):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        km._atomic_write = full
+        sent, err = [], io.StringIO()
+        client = {"app": "chat", "alive": True, "send": lambda s: sent.append(json.loads(s))}
+        with contextlib.redirect_stderr(err):
+            for _ in range(2):
+                km.Handler._dispatch_ws(types.SimpleNamespace(), {"type": "interrupt", "id": SID}, client)
+        self.assertEqual(cuts, [SID, SID], "both interrupts happened")
+        self.assertTrue(client["alive"])
+        self.assertEqual([m["type"] for m in sent], ["warn", "warn"], "each stop that did not land is said to the click")
+        self.assertIn("No space left on device", sent[1]["text"])
+        self.assertEqual(err.getvalue().count("write failed"), 1, "the fault is said once per episode")
+        self.assertEqual(self.p.read_bytes(), before, "the ledger is untouched")
+        km._atomic_write = real_write
+        sent.clear()
+        km.Handler._dispatch_ws(types.SimpleNamespace(), {"type": "interrupt", "id": SID}, client)
+        self.assertEqual(sent, [], "the disk heals: the stop lands and nothing is said")
+        self.assertIn(SID, json.loads(self.p.read_text()))
+        km._atomic_write = full
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsInstance(km._suppress_session_retry("s4"), str)
+        self.assertEqual(err.getvalue().count("write failed"), 1, "a landed write ended the episode: said again")
+
+    def test_the_sweep_s_clear_under_a_full_disk_returns_false_and_does_not_raise(self):
+        # the clear-suppress path is the pusher's, not a gesture: a failed publish leaves the suppression
+        # standing (the safe direction) and returns False instead of a traceback into the pusher's wrap
+        # every tick; the writer says it once per episode
+        before = self._seed()
+        self.assertTrue(km._session_retry_suppressed("s1"))
+
+        def full(*a, **k):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        km._atomic_write = full
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(km._clear_session_retry_suppress("s1"))       # raised OSError before
+            self.assertFalse(km._clear_session_retry_suppress("s1"))
+        self.assertEqual(self.p.read_bytes(), before, "s1 stays suppressed on disk")
+        self.assertEqual(err.getvalue().count("write failed"), 1)
 
     def test_the_interrupt_handler_toasts_a_stop_that_did_not_land(self):
         # through the real dispatcher (_drive → the interrupt branch): the interrupt itself happens, the

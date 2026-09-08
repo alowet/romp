@@ -887,9 +887,9 @@ function initGear(post) {
   // machine, the name the gear already uses for it.
   var staleOpen = {};   // 'setting:gt' → { t: the toast node, hosts: [...], refused: the value in words } while the toast is up
   function staleHost(m) { return (typeof m.host === 'string' && m.host) ? m.host : 'this machine'; }
-  // The kernel's reason a write was refused OUTRIGHT (it could not read the setting's file) as a clause
-  // for the copy; absent on an ordering stand-down, and from an older kernel (review find on #1018, 2026-09-08)
-  function staleWhy(m) { return (typeof m.why === 'string' && m.why) ? ' Its settings file could not be read (' + m.why + ').' : ''; }
+  // The kernel's reason a write was refused OUTRIGHT as a clause for the copy: its file could not be READ, or
+  // (a `why` starting "write failed:", the fold on PR #1019) WRITTEN — one clause per cause; absent on a stand-down
+  function staleWhy(m) { return (typeof m.why === 'string' && m.why) ? ' Its settings file could not be ' + (m.why.indexOf('write failed:') === 0 ? 'written' : 'read') + ' (' + m.why + ').' : ''; }
   function staleLive(t) { return !!t.parentNode && !(t.classList && t.classList.contains('fade')); }
   // Apply anyway re-issues the frame's echoed gesture as a NEW one, stamped above everything this
   // page has seen (the frame's storedGt included, learned just before): a fresh click is legitimate

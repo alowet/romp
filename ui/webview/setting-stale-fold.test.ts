@@ -232,3 +232,25 @@ test("a write refused because the kernel could not read the setting's file offer
   assert.equal(t2.children.filter((c) => c.className === "rs-stale-toast-act").length, 1);
   assert.doesNotMatch(g.texts()[1], /could not be read/);
 });
+
+test("a write refused because the publish itself failed names THAT cause: could not be written, not read", () => {
+  // the kernel answers a ledger write that FAILED (ENOSPC, EROFS, EACCES out of the publish) with the same
+  // frame, its `why` starting "write failed:" (kernel/kernel.py _set_auto_nudge / _set_compact_suggest,
+  // the maintainer's fold on PR #1019: the write step is a fault boundary too). The clause hardcoded
+  // "could not be read", so a full disk read as an unreadable file; the toast names the cause it carries
+  // (review find, 2026-09-08). No Apply anyway either: a re-issue cannot land while the disk refuses.
+  const g = lift();
+  g.frame({ type: "settingStale", setting: "auto-nudge", storedGt: 2000, gt: 1000, kept: true,
+            why: "write failed: [Errno 28] No space left on device", gesture: { type: "setAutoNudge", enabled: false } });
+  assert.equal(g.box().children.length, 1);
+  const t = g.box().children[0];
+  assert.equal(t.children.filter((c) => c.className === "rs-stale-toast-act").length, 0, "no Apply anyway: it could not succeed");
+  assert.match(g.texts()[0], /off was not applied on this machine\. Keeping on\./);
+  assert.match(g.texts()[0], /could not be written \(write failed: \[Errno 28\] No space left on device\)/, "the cause the frame carries");
+  assert.doesNotMatch(g.texts()[0], /could not be read/, "a full disk is not an unreadable file");
+  // the read-fault clause is unchanged beside it
+  g.frame({ type: "settingStale", setting: "compact-suggest", storedGt: 2000, gt: 1001, kept: false,
+            why: "read failed: [Errno 5] Input/output error", gesture: { type: "setCompactSuggest", enabled: true } });
+  assert.match(g.texts()[1], /could not be read \(read failed: \[Errno 5\] Input\/output error\)/);
+  assert.doesNotMatch(g.texts()[1], /could not be written/);
+});

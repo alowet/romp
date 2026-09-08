@@ -83,6 +83,8 @@ class _Base(unittest.TestCase):
         km.jd.STATE = Path(self._td)
         km.jd._state_cache.clear()
         km._autonudge_cache.clear()
+        vars(km).get("_ledger_write_failed", {}).clear()   # the writer's per-episode registry: no episode leaks in
+        km._stale_seen.refused = None                      # a direct setter call's verdict never rides a later dispatch
         self._saved = {n: getattr(km, n) for n in
                        ("_propagate_judge_settings", "_auto_nudge_tick", "_tmux_sessions", "threading")}
         self.propagated = []
@@ -537,14 +539,14 @@ class StoreWriteFailureIsLoudAndContained(_Base):
     _set_judge_state and _set_update_mode already hold this contract; these tests pin
     _set_auto_nudge and _set_file_editing onto the same one."""
 
-    def _fail_writes(self):
+    def _fail_writes(self, exc=None):
         """Patch Path.write_text to raise OSError on every call from now (both stores publish
         via _atomic_write, whose temp-file write funnels through it)."""
         import pathlib
         orig = pathlib.Path.write_text
 
         def failing(p, *a, **k):
-            raise OSError("simulated full disk")
+            raise exc or OSError("simulated full disk")
 
         pathlib.Path.write_text = failing
         return lambda: setattr(pathlib.Path, "write_text", orig)
@@ -602,8 +604,62 @@ class StoreWriteFailureIsLoudAndContained(_Base):
             restore()
         self.assertTrue(client["alive"], "the delivering client survives the failed write")
         self.assertEqual(ticks, [], "a stood-down toggle fires no nudge tick — no new information")
-        self.assertEqual([m for m in sent if m.get("type") == "settingStale"], [],
-                         "a write failure is not a stale gesture — no settingStale frame")
+        # This used to pin "no settingStale frame" for both toggles: a write failure sent nothing. The
+        # maintainer's fold on PR #1019 draws the line the other way — a user gesture's WRITE step is a
+        # fault boundary too, and a refused write must be TOLD — so the ledger toggle now answers its socket
+        # with the same settingStale+why frame an unproved-read refusal sends (the gear snaps the box back to
+        # the stored value and says why). setFileEditing's store is not one of this PR's two ledgers and keeps
+        # its silent arm for now: nothing escapes there, and nothing is told.
+        frames = [m for m in sent if m.get("type") == "settingStale"]
+        self.assertEqual([(f["setting"], f["why"].split(":")[0]) for f in frames], [("auto-nudge", "write failed")],
+                         "the ledger toggle's refused write is answered on the delivering socket, once")
+        self.assertIsNone(frames[0]["kept"], "no write ever landed here: the frame does not present the default as kept")
+
+    def test_a_refused_ledger_write_is_told_per_gesture_and_said_once_per_episode(self):
+        """The maintainer's fold on PR #1019 (a user gesture's WRITE step is a fault boundary too), on the two
+        ledger toggles through the REAL dispatch: every gesture whose publish raises is answered on the
+        delivering socket — the settingStale+why frame, `kept` naming the value the gear re-fills to — while
+        the fault itself is said ONCE per episode (one stderr line, one error-center row) however many gestures
+        repeat it; a landed write ends the episode, and a fresh fault speaks again. Before: the OSError arm
+        logged per call and sent nothing, so the gear kept the flipped box while the kernel held the old value."""
+        self.assertEqual(km._set_auto_nudge(True, gt=T_OLD), T_OLD)
+        del km._SDK_BOOT_PROBLEMS[:]
+        sent = []
+        client = {"send": lambda s: sent.append(json.loads(s)), "alive": True}
+        full = OSError(errno.ENOSPC, "No space left on device")
+        restore, err = self._fail_writes(full), io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                for msg in ({"type": "setAutoNudge", "enabled": False, "gt": T_NEW},
+                            {"type": "setAutoNudge", "enabled": False, "gt": T_NEW + 1},
+                            {"type": "setCompactSuggest", "enabled": True, "gt": T_NEW}):
+                    km.Handler._dispatch_ws(types.SimpleNamespace(), msg, client)
+        finally:
+            restore()
+        self.assertTrue(client["alive"], "nothing escaped to the reader loop")
+        frames = [m for m in sent if m.get("type") == "settingStale"]
+        self.assertEqual([(f["setting"], f["gt"]) for f in frames],
+                         [("auto-nudge", T_NEW), ("auto-nudge", T_NEW + 1), ("compact-suggest", T_NEW)],
+                         "every refused gesture is answered on its own socket")
+        for f in frames:
+            self.assertIn("No space left on device", f["why"], "the frame names the fault")
+            self.assertNotIn(".tmp.", f["why"], "errno + strerror only: never the temp path")
+        self.assertIs(frames[0]["kept"], True, "the stored value stands: the gear snaps the box back to it")
+        self.assertEqual(err.getvalue().count("write failed"), 1, "said once per fault episode, not per gesture")
+        self.assertEqual(len(km._SDK_BOOT_PROBLEMS), 1, "one error-center row per episode")
+        self.assertIn("auto-nudge.json", km._SDK_BOOT_PROBLEMS[0]["text"])
+        km._autonudge_cache.clear()
+        self.assertTrue(km._auto_nudge_on(), "nothing applied — the store keeps the old value")
+        self.assertFalse(km._compact_suggest_on())
+        self.assertEqual(km._set_auto_nudge(False, gt=T_NEW + 2), T_NEW + 2, "the disk heals: the next gesture lands")
+        restore, err = self._fail_writes(full), io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                self.assertIsNone(km._set_auto_nudge(True, gt=T_NEW + 3))
+        finally:
+            restore()
+        self.assertEqual(err.getvalue().count("write failed"), 1, "a landed write ended the episode: a new fault speaks again")
+        self.assertEqual(len(km._SDK_BOOT_PROBLEMS), 2)
 
 
 class StaleGestureAnswersTheDeliveringSocket(_Base):
@@ -1143,7 +1199,7 @@ class RefusedToggleTellsTheDeliveringSocket(_Base):
 
     def setUp(self):
         super().setUp()
-        for reg in ("_ledger_fault_warned", "_ledger_refusal_warned"):
+        for reg in ("_ledger_fault_warned", "_ledger_refusal_warned", "_ledger_write_failed"):
             vars(km).get(reg, {}).clear()                  # absent on a kernel before the fix: fail on the defect
         self.ledger = km.jd.STATE / "auto-nudge.json"
         self.problems = len(km._SDK_BOOT_PROBLEMS)

@@ -248,7 +248,7 @@ class UnreadableLedgerPausesThePass(_Base):
         # the pause latch + the once-per-episode registries (absent on a kernel before the fix, so these
         # tests fail there on the DEFECT — a fired wake — not in setUp)
         vars(km).get("_auto_nudge_paused", [None])[0] = None
-        for reg in ("_ledger_fault_warned", "_ledger_refusal_warned"):
+        for reg in ("_ledger_fault_warned", "_ledger_refusal_warned", "_ledger_write_failed"):
             vars(km).get(reg, {}).clear()
         self.problems = len(km._SDK_BOOT_PROBLEMS)
         self.ledger = jd.STATE / "auto-nudge.json"
