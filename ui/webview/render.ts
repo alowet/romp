@@ -54,7 +54,7 @@ import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser
 import { pastedFilePath } from "./paste-path";
 import { insertAtCaret } from "./composer-insert";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
-import { followReader, keepPlaceAcrossShow, followTail } from "./scroll-keep";
+import { followReader, keepPlaceAcrossShow, followTail, atBottomDist } from "./scroll-keep";
 import { retainLiveOmitted } from "./tab-order";
 import { userTurnShows } from "./user-turn-content";
 import { ScrollDiagBudget, classifyScroll, scrollWriteRow } from "./scroll-write";
@@ -455,13 +455,14 @@ function registerOptimistic(id: string, text: string, imgPaths?: string[]): void
   if (v) v.stale = true;
   if (id === activeId) {
     // Your own send reveals itself only from the TAIL, measured BEFORE the bubble lands (the append
-    // grows scrollHeight, which would misread a tail-sitter as scrolled-up). At — or within the
-    // stick rule's 80px of — the bottom, hitting Enter scrolls to the new bubble, exactly once, at
-    // send time (the user 2026-08-09, whose send painted below the fold and looked lost). Scrolled
-    // UP reading history, the viewport stays exactly where it is and the bubble waits below (the
+    // grows scrollHeight, which would misread a tail-sitter as scrolled-up). At — or within
+    // nearBottomForSend's 80 px of — the bottom, hitting Enter scrolls to the new bubble, exactly once,
+    // at send time (the user 2026-08-09, whose send painted below the fold and looked lost). That band is
+    // deliberately wider than follow mode's true-bottom read (T262c): the send is the reader's own act.
+    // Scrolled UP reading history, the viewport stays exactly where it is and the bubble waits below (the
     // user 2026-08-30, yanked mid-read by the unconditional snap that used to live here).
     const content = document.getElementById("content");
-    const wasAtBottom = !!content && nearBottom(content);
+    const wasAtBottom = !!content && nearBottomForSend(content);   // the send band: the user's own send reveals itself
     appendActive();
     if (content && wasAtBottom) writeScroll(content, content.scrollHeight, "optimistic-send", true);
   }
@@ -9238,7 +9239,24 @@ function filterPicker(q: string) {
   setActiveRow(creating && q.trim() ? null : pickerRows()[0] ?? null);
 }
 
-function nearBottom(c: HTMLElement): boolean {
+// Two readings of "at the bottom", never one (T262c, the user 2026-09-08, who wheeled up from the tail of a
+// working session, saw no go-to-bottom chevron for a stretch, and within that stretch had the view snap back;
+// they expected the chevron the moment they left the bottom). One 80 px band used to drive BOTH follow mode
+// (appendActive's stick, followReader's record, the leaving-tab save, the rebuild's _wasNear, the resize
+// compensations) AND the jump chip, so for the first 80 px of a deliberate scroll-up the pane still counted the
+// reader as at the bottom: no chip, and every content-height change of a working session — streaming text, a
+// landed card — re-pinned them to the bottom through followTail's height-changed branch. That is the snapback
+// with no predictable interval: it fired whenever the session appended while they were inside the band.
+// Follow mode and the chip now read the TRUE bottom (atBottom: within the 2 px sub-pixel tolerance followTail
+// already used), so leaving the bottom by more than 2 px leaves follow mode and shows the chip at once, and the
+// only ways back are a scroll to the true bottom or the chip. The 80 px band survives ONLY as nearBottomForSend,
+// for the user's own send revealing itself (registerOptimistic; the user 2026-08-09, whose send painted below
+// the fold and looked lost): the question there is whether they meant to be at the tail, and a reader a few
+// lines up who hits Enter still gets to see their bubble. Two names so the two intents cannot be confused again.
+function atBottom(c: HTMLElement): boolean {
+  return atBottomDist(c.scrollHeight - c.scrollTop - c.clientHeight);
+}
+function nearBottomForSend(c: HTMLElement): boolean {
   return c.scrollHeight - c.scrollTop - c.clientHeight < 80;
 }
 
@@ -9953,11 +9971,11 @@ function rerenderAll(): void {
   cancelPrebuild(); // the queued plan is now stale (every view reset below) — re-warm after showActive
   // The reader's place, captured BEFORE the clear below empties the active view (T249 review find, 2026-09-08):
   // a settings change re-renders the transcript under a reader who may be scrolled up, and once the DOM is
-  // gone there is no anchor to capture and the box no longer overflows. Near the bottom → nothing to keep
+  // gone there is no anchor to capture and the box no longer overflows. At the bottom → nothing to keep
   // (follow mode lands there); a hidden pane has nothing to keep either. showActive restores it after the land.
   const content = document.getElementById("content");
   const av = activeId ? views.get(activeId) : null;
-  const keep = av && av.shown && content && content.clientHeight > 0 && !nearBottom(content) ? captureScrollAnchor(content, av) : null;
+  const keep = av && av.shown && content && content.clientHeight > 0 && !atBottom(content) ? captureScrollAnchor(content, av) : null;   // follow mode: only a true tail-sitter lands at the bottom
   for (const v of views.values()) { while (v.el.firstChild) v.el.removeChild(v.el.firstChild); v.rendered = 0; v.stale = false; v.winStart = 0; v.winEnd = 0; v.avgTurnH = undefined; v.spacerCount = undefined; v.spacerCountBot = undefined; v.unitTotal = undefined; }
   showActive(keep);
   schedulePrebuild(); // rebuild every off-screen view in idle under the new setting, so switches stay instant
@@ -10183,7 +10201,7 @@ function showActive(keep?: { uuid: string; y: number } | null) {
   // decision, and a restore over its landing would undo the jump the reader asked for (review find, 2026-09-08)
   const navigating = !!pendingAnchor || pendingAnchorT != null || (!!seek && seek.sid === activeId);
   const reshow = keepPlaceAcrossShow(v, v.el.style.display !== "none", content.clientHeight > 0, navigating);
-  const keepAnchor = reshow ? (keep !== undefined ? keep : (!nearBottom(content) ? captureScrollAnchor(content, v) : null)) : null;
+  const keepAnchor = reshow ? (keep !== undefined ? keep : (!atBottom(content) ? captureScrollAnchor(content, v) : null)) : null;   // follow mode: off the true bottom keeps its place
   // Bound the switch. A view the user scrolled to the top of has had its window expanded to the WHOLE
   // transcript (winStart crept to 0 via lazy-expand), and compact mode renders the whole folded stream —
   // either way, revealing thousands of nodes is the big-session switch lag (the user 2026-06-25: 4144 turns
@@ -10403,10 +10421,11 @@ function appendActive() {
   const v = views.get(activeId);
   // Follow-the-tail engages ONLY once content actually overflows (the user 2026-08-25: with slack
   // below, a streaming reply should write IN PLACE and grow a scrollbar, not jump the view to the
-  // bottom). nearBottom is trivially true while nothing overflows, so without this gate the very
+  // bottom). atBottom is trivially true while nothing overflows, so without this gate the very
   // append that crosses the overflow boundary yanked the view. Overflowing + genuinely at the
   // bottom keeps the existing stick; scrolled-up keeps its never-yank rule.
-  const stick = content.scrollHeight > content.clientHeight + 2 && nearBottom(content);
+  // follow mode: the TRUE bottom (T262c), never the send band
+  const stick = content.scrollHeight > content.clientHeight + 2 && atBottom(content);
   const before = content.scrollTop;
   const heightBefore = content.scrollHeight;
   const distBefore = heightBefore - before - content.clientHeight;
@@ -10445,8 +10464,9 @@ if (typeof ResizeObserver === "function") {
 // ── jump to newest (the user 2026-08-31) ─────────────────────────────────────────────────────────
 // Scrolled-up reading leaves follow mode, and the send gate keeps it that way — this chip is the
 // deliberate way BACK. Visible only while the transcript overflows AND the view is off the bottom,
-// read through the SAME nearBottom threshold appendActive's stick and the send gate use (one
-// definition, never a second). Click = snap to the bottom + set the view's stick: follow mode
+// read through the SAME atBottom read appendActive's stick uses (one definition, never a second; the
+// send gate keeps its own wider band, nearBottomForSend, on purpose — T262c). So the chevron appears
+// the moment the reader is more than 2 px off the bottom. Click = snap to the bottom + set the view's stick: follow mode
 // re-engaged exactly as today's at-bottom behavior — every subsequent append recomputes stick from
 // the at-bottom position and keeps descending until the user scrolls up, which re-shows the chip
 // from the same listener. It lives on BODY, never inside #content, so window re-renders cannot
@@ -10464,7 +10484,7 @@ jumpBtn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none"
 function updateJumpBtn(): void {
   const c = document.getElementById("content");
   if (!c || c.clientHeight <= 0) { jumpBtn.hidden = true; return; }   // hidden pane measures 0 — no chip
-  const off = c.scrollHeight > c.clientHeight + 2 && !nearBottom(c);
+  const off = c.scrollHeight > c.clientHeight + 2 && !atBottom(c);   // the chip: shown the moment the reader leaves the true bottom
   jumpBtn.hidden = !off;
   if (off) jumpBtn.style.bottom = (Math.max(0, window.innerHeight - c.getBoundingClientRect().bottom) + 8) + "px";
 }
@@ -10491,7 +10511,7 @@ window.addEventListener("resize", updateJumpBtn);
 // the reader's own scrolling. So the spot named where the tab was when last left, and a full show of a
 // shown tab (a fork/first-build frame, a settings rerender, a revive failure, a dismissal's fallback)
 // snapped the reader back there. Every scroll of the active view now records its position and its
-// follow-mode (the same nearBottom threshold appendActive and the jump chip read), passive, no timer.
+// follow-mode (the same atBottom read appendActive and the jump chip use), passive, no timer.
 // Programmatic scrolls (a land, an anchor restore) fire the same event, so the record is always the truth —
 // with ONE exception, the transient a DEFERRED build leaves (review find, 2026-09-08): showActive reveals
 // the entering view before its heavy build runs in the next frame, the browser clamps scrollTop to that
@@ -10504,7 +10524,7 @@ window.addEventListener("resize", updateJumpBtn);
   const c = document.getElementById("content");
   if (c) c.addEventListener("scroll", () => {
     if (c.clientHeight <= 0) return;
-    followReader(activeId ? views.get(activeId) : null, c.scrollTop, nearBottom(c), pendingBuildRaf != null);
+    followReader(activeId ? views.get(activeId) : null, c.scrollTop, atBottom(c), pendingBuildRaf != null);
     // the scroll nobody's code asked for is the user's (T262): filed so a recording lines up with the journal;
     // a write's own echo (within a pixel of the value written) is consumed here and never read as a gesture
     if (classifyScroll(c.scrollTop, lastScrollWriteAfter) === "write-echo") lastScrollWriteAfter = null;
@@ -10527,7 +10547,8 @@ if (typeof ResizeObserver === "function") {
     const tro = new ResizeObserver((entries) => {
       const h = entries[0]?.contentRect?.height ?? 0;
       const content = document.getElementById("content");
-      if (content && lastH >= 0 && h !== lastH && content.clientHeight > 0 && !nearBottom(content)) {
+      // follow mode: an off-bottom reader's line stays still
+      if (content && lastH >= 0 && h !== lastH && content.clientHeight > 0 && !atBottom(content)) {
         writeScroll(content, content.scrollTop + (h - lastH), "box-resize");
         const v = activeId ? views.get(activeId) : null;
         if (v) v.scrollTop = content.scrollTop;               // keep the per-view saved position in sync
@@ -10596,7 +10617,7 @@ if (typeof ResizeObserver === "function") {
       // weeks later with no visible cause.
       startH = cap != null ? clampTabbarH(cap, window.innerHeight) : TABBAR_H_DEFAULT;
       const content = document.getElementById("content");
-      stick = !!content && nearBottom(content);
+      stick = !!content && atBottom(content);   // follow mode at drag start: the true bottom
       pid = e.pointerId;
       // capture so the drag survives leaving the pane; a pointer already gone throws — the window
       // listeners below carry the drag either way, so a failed capture must not abort the setup
@@ -13378,7 +13399,7 @@ function setActive(id: string, anchor?: string, anchorT?: number, anchorKind?: s
   const content = document.getElementById("content");
   if (content && activeId && activeId !== id) {
     const cur = views.get(activeId);
-    if (cur) { cur.scrollTop = content.scrollTop; cur.stick = nearBottom(content); }
+    if (cur) { cur.scrollTop = content.scrollTop; cur.stick = atBottom(content); }   // the leaving tab's follow mode: the true bottom
   }
   // Stash the leaving tab's draft; show the entering tab's own (usually empty).
   const ta = document.getElementById("composer-input") as HTMLTextAreaElement | null;
@@ -13516,7 +13537,7 @@ function upsert(msg: any) {
   if (msg.id === activeId && !(existed && !forked && !firstBuild)) {   // only the rebuild branch (appendActive preserves on its own)
     _scrollContent = document.getElementById("content");
     const _v0 = views.get(msg.id);
-    _wasNear = !_scrollContent || !_v0 || !_v0.shown || nearBottom(_scrollContent);
+    _wasNear = !_scrollContent || !_v0 || !_v0.shown || atBottom(_scrollContent);   // only a true tail-sitter follows a rebuild
     _scrollAnchor = (!_wasNear && _scrollContent && _v0) ? captureScrollAnchor(_scrollContent, _v0) : null;
   }
   if (forked) {

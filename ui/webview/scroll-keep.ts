@@ -52,15 +52,30 @@ export function keepPlaceAcrossShow(v: KeepView, displayed: boolean, visible: bo
   return v.shown && displayed && visible && !navigating;
 }
 
-/** Follow-the-tail after an append, for a reader who was near the bottom (T262, the user 2026-09-08: "jumped up
- *  slightly on my scroll" in busy sessions). A tab within the 80 px follow threshold used to be pinned to the
- *  bottom on EVERY frame the pane received — including a status-only tail that changed no content — so a reader
- *  wheeling up from the tail of a working session was snapped back within the first 80 px, again and again (the
- *  harness reproduced it: a 60 px stop moved 60 px to the bottom in a quiet window with the content height
- *  unchanged). The bottom is followed only when there is something new to follow: the content's height
- *  changed, or the reader was already at the very bottom (where the pin is a no-op). Pure, so node executes it.
- *  `distBefore` = scrollHeight − scrollTop − clientHeight before the rebuild. */
+/** The follow-mode tolerance (T262c, the user 2026-09-08): a reader within this many pixels of the bottom IS at
+ *  the bottom — fractional scroll positions on a scaled display leave up to a pixel of slack at the true end —
+ *  and one pixel further they have LEFT it: follow mode is off and the go-to-bottom chip shows. render.ts's
+ *  atBottom reads this for appendActive's stick, followReader's record, the leaving-tab save, the rebuild's
+ *  at-bottom capture, the resize compensations and the chip. The 80 px band that used to drive all of those
+ *  survives only for the user's own send revealing itself (render.ts nearBottomForSend). */
+export const AT_BOTTOM_PX = 2;
+export function atBottomDist(dist: number): boolean {
+  return dist <= AT_BOTTOM_PX;
+}
+
+/** Follow-the-tail after an append, for a reader whose view is in follow mode (T262, the user 2026-09-08: "jumped
+ *  up slightly on my scroll" in busy sessions). A tab within the old 80 px band used to be pinned to the bottom on
+ *  EVERY frame the pane received — including a status-only tail that changed no content — so a reader wheeling
+ *  up from the tail of a working session was snapped back within the first 80 px, again and again (the harness
+ *  reproduced it: a 60 px stop moved 60 px to the bottom in a quiet window with the content height unchanged).
+ *  The bottom is followed only when there is something new to follow: the content's height changed, or the
+ *  reader was already at the very bottom (where the pin is a no-op). T262c then found the height-changed branch
+ *  was the remaining snapback — a reader 30 px up in a streaming session was re-pinned by every append — and
+ *  moved follow mode itself onto the true bottom (atBottomDist), so a stick now implies `distBefore` within the
+ *  tolerance and this answers true for it; the height branch stays as the executable statement of the rule
+ *  should a wider stick ever return. Pure, so node executes it. `distBefore` = scrollHeight − scrollTop −
+ *  clientHeight before the rebuild. */
 export function followTail(distBefore: number, heightBefore: number, heightAfter: number): boolean {
-  if (distBefore <= 2) return true;
+  if (atBottomDist(distBefore)) return true;
   return heightAfter !== heightBefore;
 }
