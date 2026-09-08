@@ -89,5 +89,114 @@ class StuckMailWarning(unittest.TestCase):
                          "the marker is pruned once the message left new/ so WARNED stays bounded")
 
 
+class RefusedNotesKeepTheMail(unittest.TestCase):
+    """deliver() can REFUSE now (2026-09-08: its sent row could not land). The orphan sweep and the
+    stuck-mail warning used to catch every deliver error and carry on — destroy the orphan, touch the
+    one-time marker — so a refused note lost the mail with no notice and no row, and the warning was
+    never retried. A refusal keeps the file and the marker untouched, is said once per episode, and
+    the next pass retries once the log writes again. Mutants killed: the generic `except Exception`
+    arm swallowing the refusal (the orphan is destroyed / the marker touched); the sweep's destroy
+    row written best-effort AFTER the unlink (the file goes with no row)."""
+
+    def setUp(self):
+        self._seamfile = os.path.join(tempfile.mkdtemp(), "sessions.json")
+        os.environ["ROMP_SESSIONS_FILE"] = self._seamfile
+        for d in (pm.MAILROOT, pm.WARNED, pm.MAILPENDING):
+            shutil.rmtree(d, ignore_errors=True)
+        self._tl, self._log = pm.TLDIR, pm._log
+        self.logged = []
+        pm._log = lambda m: self.logged.append(m)
+        try:
+            (pm.TLDIR / "messages.jsonl").unlink()
+        except OSError:
+            pass
+        pm._TL_FAULT[0] = False
+        pm._REFUSAL_SAID.clear()
+
+    def tearDown(self):
+        pm.TLDIR, pm._log = self._tl, self._log
+        pm._TL_FAULT[0] = False
+        pm._REFUSAL_SAID.clear()
+        os.environ.pop("ROMP_SESSIONS_FILE", None)
+
+    def _live(self, rows):
+        Path(self._seamfile).write_text(json.dumps(rows))
+
+    def _break_the_log(self):
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(lambda: os.unlink(path))
+        pm.TLDIR = Path(path) / "timeline"          # under a regular file: the REAL append fails (ENOTDIR)
+
+    def _age(self, secs):
+        old = time.time() - secs
+        for f in (pm.MAILROOT / RECIP / "new").iterdir():
+            os.utime(f, (old, old))
+
+    def _rows(self):
+        p = self._tl / "messages.jsonl"
+        return [json.loads(l) for l in p.read_text().splitlines() if l] if p.exists() else []
+
+    def _said(self):
+        return len([m for m in self.logged if "kept for the next pass" in m])
+
+    def test_the_sweep_keeps_an_orphan_whose_bounce_note_was_refused(self):
+        self._live([{"id": SENDER, "name": "alice", "state": "idle"}])          # bob is dead → an orphan
+        mid = pm.deliver(RECIP, "alice", SENDER, "please review my PR")
+        self._age(pm.ORPHAN_GRACE + 60)
+        self._break_the_log()
+        pm._sweep_orphans()
+        self.assertTrue((pm.MAILROOT / RECIP / "new" / mid).exists(),
+                        "a refused bounce note destroys nothing: the orphan waits for the next sweep")
+        self.assertEqual(pm.read_box(SENDER, consume=False), [], "no note was published without its row")
+        pm._sweep_orphans()
+        self.assertTrue((pm.MAILROOT / RECIP / "new" / mid).exists())
+        self.assertEqual(self._said(), 1, "said once per episode, not per pass")
+        pm.TLDIR = self._tl                                                    # the log writes again
+        pm._sweep_orphans()
+        self.assertFalse((pm.MAILROOT / RECIP / "new" / mid).exists(), "the next pass completes the bounce")
+        notes = pm.read_box(SENDER, consume=False)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("UNDELIVERED", notes[0]["body"])
+        self.assertEqual([r["ev"] for r in self._rows() if r.get("id") == mid], ["sent", "bounced"],
+                         "the destroy landed on the ledger")
+
+    def test_the_sweep_records_the_destroy_before_it_destroys(self):
+        # no live sender to bounce to (the sweep still runs: someone is live) → straight to the destroy
+        self._live([{"id": "33333333-4444-5555-6666-777777777777", "name": "carol", "state": "idle"}])
+        mid = pm.deliver(RECIP, "alice", SENDER, "please review my PR")
+        self._age(pm.ORPHAN_GRACE + 60)
+        self._break_the_log()
+        pm._sweep_orphans()
+        self.assertTrue((pm.MAILROOT / RECIP / "new" / mid).exists(),
+                        "a destroy that cannot be recorded does not happen")
+        pm.TLDIR = self._tl
+        pm._sweep_orphans()
+        self.assertFalse((pm.MAILROOT / RECIP / "new" / mid).exists())
+        self.assertEqual([r["ev"] for r in self._rows() if r.get("id") == mid], ["sent", "bounced"])
+
+    def test_the_stuck_warning_is_retried_once_its_note_lands(self):
+        self._live([{"id": SENDER, "name": "alice", "state": "idle"},
+                    {"id": RECIP, "name": "bob", "state": "idle"}])
+        mid = pm.deliver(RECIP, "alice", SENDER, "please review my PR")
+        self._age(pm.STUCK_GRACE + 60)
+        self._break_the_log()
+        pm._warn_stuck_mail()
+        self.assertFalse((pm.WARNED / mid).exists(), "a refused warning leaves the one-time marker untouched")
+        self.assertEqual(pm.read_box(SENDER, consume=False), [])
+        pm._warn_stuck_mail()
+        self.assertFalse((pm.WARNED / mid).exists())
+        self.assertEqual(self._said(), 1, "said once per episode")
+        pm.TLDIR = self._tl
+        pm._warn_stuck_mail()
+        warns = pm.read_box(SENDER, consume=False)
+        self.assertEqual(len(warns), 1, "the warning fires on the first pass whose note lands")
+        self.assertIn("STILL UNDELIVERED", warns[0]["body"])
+        self.assertTrue((pm.WARNED / mid).exists(), "…and only then is it marked one-time")
+        pm._warn_stuck_mail()
+        self.assertEqual(len(pm.read_box(SENDER, consume=False)), 1, "one-time still holds")
+        self.assertTrue((pm.MAILROOT / RECIP / "new" / mid).exists(), "the stuck message itself is left for delivery")
+
+
 if __name__ == "__main__":
     unittest.main()

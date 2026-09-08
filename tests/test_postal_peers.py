@@ -581,3 +581,371 @@ class RecallAndReceipts(unittest.TestCase):
                          "no tunnel record at all reads down, matching the send path's branch")
         row = pm._sent_receipts("sid-a")[-1]
         self.assertEqual(row["parked"], "srv", "the parked key keeps its host-string shape")
+
+
+_SND = "11111111-2222-3333-4444-555555555555"
+_RCP = "22222222-3333-4444-5555-666666666666"
+
+
+class LedgerBeforeTheDelete(unittest.TestCase):
+    """The accounting rows are the ONE record anyone reads (the sender's receipts, the timeline, the
+    kernel's courier), so they land before the irreversible step, never after it (2026-09-08):
+    deliver() writes the sent row and only then publishes — a row that cannot land refuses the send
+    with nothing in new/ — and _bounce_apply / _ack_arrived write the terminal row and only then
+    delete the outbox record. On origin/main the publish and the delete came first and the row was
+    best-effort after them: mail with no row anywhere, and records gone before their receipt existed."""
+
+    def setUp(self):
+        os.environ["ROMP_POSTAL_PEERS"] = "1"
+        import shutil
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)
+        shutil.rmtree(pm.MAILROOT, ignore_errors=True)
+        shutil.rmtree(pm.MAILPENDING, ignore_errors=True)
+        self._tl, self._log = pm.TLDIR, pm._log
+        self.logged = []
+        pm._log = lambda m: self.logged.append(m)
+        try:
+            (pm.TLDIR / "messages.jsonl").unlink()
+        except OSError:
+            pass
+        if hasattr(pm, "_TL_FAULT"):
+            pm._TL_FAULT[0] = False
+
+    def tearDown(self):
+        pm.TLDIR, pm._log = self._tl, self._log
+        if hasattr(pm, "_TL_FAULT"):
+            pm._TL_FAULT[0] = False
+        os.environ.pop("ROMP_POSTAL_PEERS", None)
+
+    def _break_the_log(self):
+        # TLDIR under a regular FILE: mkdir raises (ENOTDIR), so the REAL _tl_append fails the way a
+        # full or read-only disk fails it — no stub stands in for the function under test
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(lambda: os.unlink(path))
+        pm.TLDIR = type(pm.TLDIR)(path) / "timeline"
+
+    def test_tl_append_reports_whether_the_row_landed(self):
+        self.assertTrue(pm._tl_append("messages.jsonl", {"t": 1, "ev": "sent", "id": "r1"}))
+        self._break_the_log()
+        self.assertFalse(pm._tl_append("messages.jsonl", {"t": 1, "ev": "sent", "id": "r2"}))
+        self.assertFalse(pm._tl_append("messages.jsonl", {"t": 1, "ev": "sent", "id": "r3"}))
+        self.assertEqual(len([m for m in self.logged if "append failed" in m]), 1,
+                         "one line per fault episode, not per call")
+
+    def test_a_send_whose_row_cannot_land_is_refused_with_nothing_in_new(self):
+        self._break_the_log()
+        with self.assertRaises(pm.DeliveryNotRecorded) as cm:
+            pm.deliver(_RCP, "web", _SND, "please review the schema", kind="question")
+        self.assertIn("not delivered", str(cm.exception))
+        self.assertIn("retry", str(cm.exception))
+        newd, tmpd = pm.MAILROOT / _RCP / "new", pm.MAILROOT / _RCP / "tmp"
+        self.assertEqual([p.name for p in newd.iterdir()] if newd.is_dir() else [], [],
+                         "no mail is published without its row")
+        self.assertEqual([p.name for p in tmpd.iterdir()] if tmpd.is_dir() else [], [], "the temp is removed")
+        self.assertFalse((pm.MAILPENDING / _RCP).exists(), "no pending marker for mail that never landed")
+
+    def test_the_sent_row_precedes_the_publish(self):
+        # the order pin, executed: a recording _tl_append sees new/ still EMPTY at the moment the
+        # sent row is written
+        seen = []
+        saved = pm._tl_append
+        newd = pm.MAILROOT / _RCP / "new"
+        pm._tl_append = lambda f, o: seen.append(
+            (o["ev"], sorted(p.name for p in newd.iterdir()) if newd.is_dir() else [])) or True
+        try:
+            mid = pm.deliver(_RCP, "web", _SND, "hello")
+        finally:
+            pm._tl_append = saved
+        self.assertEqual(seen, [("sent", [])], "the row is written before the mail is visible in new/")
+        self.assertTrue((newd / mid).exists(), "…and the mail is published once the row landed")
+
+    def test_bounce_apply_writes_the_terminal_row_and_the_note_before_the_delete(self):
+        pm.outbox_put("srv", {"mid": "b1", "to": "beta", "frm": "alpha", "frm_id": _SND,
+                              "body": "ship it", "kind": "", "t": 1})
+        calls = []
+        saved = (pm._tl_append, pm.outbox_del, pm.deliver)
+        pm._tl_append = lambda f, o: calls.append("row:" + o["ev"]) or True
+        pm.outbox_del = lambda h, m: calls.append("del:" + m) or saved[1](h, m)
+        pm.deliver = lambda *a, **k: calls.append("note") or "m-note"
+        try:
+            pm._bounce_apply("srv", {"mid": "b1", "why": "no live session named 'beta'"})
+        finally:
+            pm._tl_append, pm.outbox_del, pm.deliver = saved
+        self.assertEqual(calls, ["row:bounced", "note", "del:b1"],
+                         "terminal row, then the return note, then — only then — the delete")
+        self.assertIsNone(pm.outbox_get("srv", "b1"), "the record does leave the outbox once accounted")
+
+    def test_bounce_apply_keeps_the_record_when_the_row_cannot_land(self):
+        pm.outbox_put("srv", {"mid": "b2", "to": "beta", "frm": "alpha", "frm_id": _SND,
+                              "body": "ship it", "kind": "", "t": 1})
+        self._break_the_log()
+        pm._bounce_apply("srv", {"mid": "b2", "why": "no live session named 'beta'"})
+        self.assertIsNotNone(pm.outbox_get("srv", "b2"),
+                             "an unaccounted refusal keeps the record — the next exchange re-relays it")
+        self.assertTrue(any("stays parked" in m for m in self.logged), "…and says so")
+        newd = pm.MAILROOT / _SND / "new"
+        self.assertFalse(newd.is_dir() and any(newd.iterdir()),
+                         "no return note either: nothing is published without its row")
+
+    def test_ack_arrived_writes_the_receipt_before_the_delete(self):
+        pm.outbox_put("srv", {"mid": "a1", "to": "beta", "frm": "alpha", "frm_id": _SND,
+                              "body": "hi", "kind": "", "t": 1})
+        calls = []
+        saved = (pm._tl_append, pm.outbox_del)
+        pm._tl_append = lambda f, o: calls.append("row:" + o["ev"]) or True
+        pm.outbox_del = lambda h, m: calls.append("del:" + m) or saved[1](h, m)
+        try:
+            pm._ack_arrived("srv", "a1")
+        finally:
+            pm._tl_append, pm.outbox_del = saved
+        self.assertEqual(calls, ["row:relayed", "del:a1"], "the delivered receipt, then the delete")
+        self._break_the_log()
+        pm.outbox_put("srv", {"mid": "a2", "to": "beta", "frm": "alpha", "frm_id": _SND,
+                              "body": "hi", "kind": "", "t": 1})
+        pm._ack_arrived("srv", "a2")
+        self.assertIsNotNone(pm.outbox_get("srv", "a2"), "a receipt that did not land keeps the record")
+
+
+class StoresPublishAtomicallyAndQuarantineTornRecords(unittest.TestCase):
+    """outbox_put / readbox_put publish through a same-directory temp + os.replace, so a reader never
+    sees a half-written record; a record that still cannot be parsed is moved aside ONCE to
+    `<name>.corrupt-<utc stamp>` with one log line, and the rest of the store is listed. On
+    origin/main the put was a plain write_text and the list skipped an unparseable file silently on
+    every pass, forever."""
+
+    def setUp(self):
+        import shutil
+        shutil.rmtree(pm.OUTBOX, ignore_errors=True)
+        shutil.rmtree(pm.READBOX, ignore_errors=True)
+        self._log = pm._log
+        self.logged = []
+        pm._log = lambda m: self.logged.append(m)
+
+    def tearDown(self):
+        pm._log = self._log
+
+    def test_puts_go_through_os_replace_and_leave_no_temp(self):
+        replaced = []
+        saved = os.replace
+        os.replace = lambda a, b, *r, **k: replaced.append((str(a), str(b))) or saved(a, b, *r, **k)
+        try:
+            self.assertTrue(pm.outbox_put("srv", {"mid": "p1", "to": "beta", "body": "hi"}))
+            self.assertTrue(pm.readbox_put("srv", {"mid": "p2", "t": 1}))
+        finally:
+            os.replace = saved
+        self.assertEqual([os.path.basename(b) for _a, b in replaced], ["p1.json", "p2.json"],
+                         "each record is published by an atomic replace of a finished temp")
+        for a, b in replaced:
+            self.assertEqual(os.path.dirname(a), os.path.dirname(b), "the temp lives in the store's own directory")
+            self.assertFalse(a.endswith(".json"), "…under a name the *.json listing can never see")
+        self.assertEqual([p.name for p in (pm.OUTBOX / "srv").iterdir()], ["p1.json"], "no temp left behind")
+        self.assertEqual([p.name for p in (pm.READBOX / "srv").iterdir()], ["p2.json"])
+        self.assertEqual([r["mid"] for r in pm.outbox_list("srv")], ["p1"])
+        self.assertEqual([r["mid"] for r in pm.readbox_list("srv")], ["p2"])
+
+    def test_a_torn_record_is_moved_aside_once_and_the_rest_is_listed(self):
+        pm.outbox_put("srv", {"mid": "good", "to": "beta", "body": "hi"})
+        (pm.OUTBOX / "srv" / "torn.json").write_text('{"mid": "torn", "to": "be')     # a half-written record
+        self.assertEqual([r["mid"] for r in pm.outbox_list("srv")], ["good"], "the rest of the store is served")
+        aside = sorted(p.name for p in (pm.OUTBOX / "srv").iterdir() if p.name.startswith("torn.json.corrupt-"))
+        self.assertEqual(len(aside), 1, "the torn record is moved aside, kept as evidence")
+        self.assertFalse((pm.OUTBOX / "srv" / "torn.json").exists())
+        said = [m for m in self.logged if "torn.json" in m]
+        self.assertEqual(len(said), 1, "one log line names it")
+        self.assertIn(aside[0], said[0], "…and where it went")
+        self.assertEqual([r["mid"] for r in pm.outbox_list("srv")], ["good"])
+        self.assertEqual(sorted(p.name for p in (pm.OUTBOX / "srv").iterdir() if "corrupt" in p.name), aside,
+                         "the second pass moves nothing again")
+        self.assertEqual(len([m for m in self.logged if "torn.json" in m]), 1, "…and says nothing again")
+
+    def test_readbox_shares_the_quarantine(self):
+        pm.readbox_put("srv", {"mid": "good", "t": 1})
+        (pm.READBOX / "srv" / "torn.json").write_text("[1, 2")
+        self.assertEqual([r["mid"] for r in pm.readbox_list("srv")], ["good"])
+        self.assertTrue(any(p.name.startswith("torn.json.corrupt-") for p in (pm.READBOX / "srv").iterdir()))
+
+    def test_a_record_rewritten_under_the_read_is_left_for_the_next_pass(self):
+        # the fingerprint guard: the parse fails because a writer REPLACED the file between the stat
+        # and the read — a torn READ of a healthy record, never a torn record — and it must not be
+        # moved aside. Pins the new mechanism against moving a live record; main had no move to guard.
+        pm.outbox_put("srv", {"mid": "live", "to": "beta", "body": "v1"})
+        target = pm.OUTBOX / "srv" / "live.json"
+        real_json = pm.json
+
+        class _Shim:
+            dumps = staticmethod(real_json.dumps)
+            fired = [False]
+
+            @staticmethod
+            def loads(text, *a, **k):
+                if not _Shim.fired[0]:
+                    _Shim.fired[0] = True
+                    pm._atomic_json_put(target, {"mid": "live", "to": "beta", "body": "v2"})   # a concurrent rewrite
+                    raise ValueError("torn read")
+                return real_json.loads(text, *a, **k)
+
+        pm.json = _Shim
+        try:
+            first = pm.outbox_list("srv")
+        finally:
+            pm.json = real_json
+        self.assertEqual(first, [], "this pass skips the record it could not read whole")
+        self.assertTrue(target.exists(), "…and leaves it in place")
+        self.assertEqual([p.name for p in (pm.OUTBOX / "srv").iterdir() if "corrupt" in p.name], [],
+                         "a rewritten record is never moved aside")
+        self.assertEqual([r["body"] for r in pm.outbox_list("srv")], ["v2"], "the next pass lists the new bytes")
+        self.assertEqual(self.logged, [], "nothing to say: no fault happened")
+
+
+class RefusalArms(unittest.TestCase):
+    """The arms the review found claimed but untested (2026-09-08), each named with the mutant it kills."""
+
+    def setUp(self):
+        os.environ["ROMP_POSTAL_PEERS"] = "1"
+        import shutil
+        for d in (pm.OUTBOX, pm.READBOX, pm.MAILROOT):
+            shutil.rmtree(d, ignore_errors=True)
+        self._tl, self._log = pm.TLDIR, pm._log
+        self.logged = []
+        pm._log = lambda m: self.logged.append(m)
+        try:
+            (pm.TLDIR / "messages.jsonl").unlink()
+        except OSError:
+            pass
+        pm._TL_FAULT[0] = False
+        pm._peer_pending.clear()
+
+    def tearDown(self):
+        pm.TLDIR, pm._log = self._tl, self._log
+        pm._TL_FAULT[0] = False
+        pm._peer_pending.clear()
+        os.environ.pop("ROMP_POSTAL_PEERS", None)
+
+    def _break_the_log(self):
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(lambda: os.unlink(path))
+        pm.TLDIR = type(pm.TLDIR)(path) / "timeline"
+
+    def _rows(self):
+        p = self._tl / "messages.jsonl"
+        return [json.loads(l) for l in p.read_text().splitlines() if l] if p.exists() else []
+
+    def test_tl_append_says_once_when_the_log_writes_again(self):
+        # mutant: the three recovery lines deleted → no "writes again" line and _TL_FAULT stays set
+        self._break_the_log()
+        self.assertFalse(pm._tl_append("messages.jsonl", {"t": 1, "ev": "sent", "id": "r1"}))
+        self.assertTrue(pm._TL_FAULT[0])
+        pm.TLDIR = self._tl
+        self.assertTrue(pm._tl_append("messages.jsonl", {"t": 1, "ev": "sent", "id": "r2"}))
+        self.assertTrue(pm._tl_append("messages.jsonl", {"t": 1, "ev": "sent", "id": "r3"}))
+        self.assertEqual(len([m for m in self.logged if m == "timeline log messages.jsonl writes again"]), 1,
+                         "exactly one recovery line (the fault line also ends in the phrase; pin the whole line)")
+        self.assertFalse(pm._TL_FAULT[0], "the fault flag clears with it")
+
+    def test_relay_in_answers_retry_when_the_local_delivery_is_refused(self):
+        # mutant: no except → falls through to peer_seen_add + "ack": the mail is acked, marked seen, gone
+        saved = (pm.local_agents_checked, pm._postal_off, dict(pm.PEERS), pm._seen_ids)
+        pm.local_agents_checked = lambda threads=False: ([{"id": _RCP, "name": "api", "remote": False}], True)
+        pm._postal_off = lambda sid: False
+        pm.PEERS["TESTHOST"] = {"trust": "trusted", "up": True}
+        pm._seen_ids = set()
+        self._break_the_log()
+        mid = "px-1700000000.1_" + "ab" * 16 + ".TESTHOST"
+        try:
+            verdict, bounce = pm._relay_in("TESTHOST", {"mid": mid, "to": "api", "frm": "web", "frm_id": _SND,
+                                                        "body": "ship it", "kind": "coordinate"})
+            seen = pm.peer_seen_check(mid)
+        finally:
+            pm.local_agents_checked, pm._postal_off, peers, pm._seen_ids = saved
+            pm.PEERS.clear()
+            pm.PEERS.update(peers)
+        self.assertEqual((verdict, bounce), ("retry", None), "silence on the wire: the sender re-relays")
+        self.assertFalse(seen, "not marked seen, so the re-relay is processed in full")
+        newd = pm.MAILROOT / _RCP / "new"
+        self.assertEqual([p.name for p in newd.iterdir()] if newd.is_dir() else [], [], "nothing landed")
+
+    def test_bounce_arrived_queues_the_backward_bounce_before_the_delete(self):
+        # mutant: delete first (main's order) → at the delete the backward queue is still empty
+        pm.outbox_put("hub", {"mid": "f1", "to": "carol", "frm": "alpha", "frm_id": _SND,
+                              "body": "hi", "kind": "", "t": 1, "origin": "originhost"})
+        at_delete = []
+        saved = pm.outbox_del
+        pm.outbox_del = lambda h, m: at_delete.append(list(pm._pending("originhost")["bounces"])) or saved(h, m)
+        b = {"mid": "f1", "why": "no live session named 'carol'"}
+        try:
+            pm._bounce_arrived("hub", b)
+        finally:
+            pm.outbox_del = saved
+        self.assertEqual(at_delete, [[b]], "the backward bounce is already queued at the moment of the delete")
+        self.assertIsNone(pm.outbox_get("hub", "f1"), "…and the forward does leave the outbox")
+
+    def test_no_readable_record_means_no_delete(self):
+        # mutant: main's get → del → check: the unparseable record is destroyed, evidence gone
+        d = pm.OUTBOX / "srv"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "torn.json").write_text('{"mid": "torn", "to": "be')
+        pm._bounce_apply("srv", {"mid": "torn", "why": "refused"})
+        self.assertTrue((d / "torn.json").exists(), "a bounce for a record we cannot read deletes nothing")
+        pm._ack_arrived("srv", "torn")
+        self.assertTrue((d / "torn.json").exists(), "…nor does an ack")
+        pm.outbox_list("srv")                                # the listing is what moves it aside
+        self.assertTrue(any(p.name.startswith("torn.json.corrupt-") for p in d.iterdir()), "evidence kept")
+
+    def test_a_torn_outbox_record_closes_its_ledger_and_the_receipt_says_refused(self):
+        # mutant: no terminal row → check_sent reads "pending (not read yet)" forever
+        pm._tl_append("messages.jsonl", {"t": 10, "ev": "sent", "id": "px-torn", "from": "alpha",
+                                         "from_id": "sid-a", "to_id": "peer:srv",
+                                         "toName": "srv:beta", "body": "hi", "kind": ""})
+        d = pm.OUTBOX / "srv"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "px-torn.json").write_text("{torn")
+        self.assertEqual(pm.outbox_list("srv"), [])
+        term = [r for r in self._rows() if r.get("ev") == "bounced" and r.get("id") == "px-torn"]
+        self.assertEqual(len(term), 1, "one terminal row for the mid the filename names")
+        self.assertEqual((term[0]["host"], term[0]["why"]), ("srv", pm.WHY_OUTBOX_UNREADABLE))
+        row = pm._sent_receipts("sid-a")[-1]
+        self.assertTrue(row["bounced"])
+        self.assertEqual(row["bouncedWhy"], pm.WHY_OUTBOX_UNREADABLE)
+        txt = pm.format_receipts([row])
+        self.assertIn("refused — " + pm.WHY_OUTBOX_UNREADABLE, txt)
+        self.assertNotIn("returned to you", txt, "no return note exists for a refusal")
+        pm.outbox_list("srv")
+        self.assertEqual(len([r for r in self._rows() if r.get("ev") == "bounced"]), 1, "the second pass adds nothing")
+
+    def test_a_torn_readbox_record_closes_no_ledger(self):
+        pm.readbox_put("srv", {"mid": "good", "t": 1})
+        (pm.READBOX / "srv" / "torn.json").write_text("[1, 2")
+        self.assertEqual([r["mid"] for r in pm.readbox_list("srv")], ["good"])
+        self.assertEqual([r for r in self._rows() if r.get("ev") == "bounced"], [], "a receipt is not a message")
+
+    def test_a_refused_oversize_bounce_puts_the_claimed_message_back(self):
+        # the rebase onto the oversize-bounce change (PR #1038) created this arm: _bounce_oversize drops a
+        # claimed message and mails its local sender a note; with the note REFUSED the message must not
+        # sit in cur/ with no note and no row. Mutant: no except → the refusal escapes into _push's
+        # catch-all and the message is stranded.
+        saved_name = pm._name_for_id
+        pm._name_for_id = lambda sid: "api"
+        try:
+            mid = pm.deliver(_RCP, "web", _SND, "x" * 64, kind="coordinate")
+            m = pm.read_box(_RCP, consume=True)[0]                # the drain claims it (new/ → cur/)
+            self.assertEqual(m["id"], mid)
+            self._break_the_log()
+            pm._bounce_oversize(_RCP, m)                          # must not raise
+            self.assertTrue((pm.MAILROOT / _RCP / "new" / mid).exists(), "put back for the next pass")
+            self.assertEqual(pm.read_box(_SND, consume=False), [], "no note was published without its row")
+            self.assertEqual(len([x for x in self.logged if "kept for the next pass" in x]), 1)
+            pm.TLDIR = self._tl                                    # the log writes again: the next pass
+            m = pm.read_box(_RCP, consume=True)[0]
+            pm._bounce_oversize(_RCP, m)
+            self.assertFalse((pm.MAILROOT / _RCP / "new" / mid).exists(), "…and the bounce completes")
+            notes = pm.read_box(_SND, consume=False)
+            self.assertEqual(len(notes), 1)
+            self.assertIn("undeliverable to 'api'", notes[0]["body"])
+            evs = [r["ev"] for r in self._rows() if r.get("id") == mid]
+            self.assertEqual((evs[-1], evs.count("bounced")), ("bounced", 1),
+                             "one terminal row, written only once the note had landed (the roll-back's unexec "
+                             "could not land while the log was down — that window is what restore() is for)")
+        finally:
+            pm._name_for_id = saved_name

@@ -314,5 +314,126 @@ class SafeIdTwins(unittest.TestCase):
             getattr(pm, "_postal_host_env_warned", set()).clear()
 
 
+class MessageIdsNeverCollide(unittest.TestCase):
+    """_unique() carries 128 bits of randomness (2026-09-08) — random.randint(0, 99999) gave 100k
+    names per second per process — and deliver() refuses to publish over a standing new/<name>: a
+    collision, however unlikely, is detected loudly, never a silent replace of somebody's unread
+    mail (rename() overwrote; the publish is a link() now, which refuses an existing target)."""
+
+    RCP = "22222222-3333-4444-5555-666666666666"
+    SND = "11111111-2222-3333-4444-555555555555"
+
+    def setUp(self):
+        # set, never popped: other modules set ROMP_POSTAL_HOST at import time (see the module head)
+        self._prev = os.environ.get("ROMP_POSTAL_HOST")
+        os.environ["ROMP_POSTAL_HOST"] = "TESTHOST"
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("ROMP_POSTAL_HOST", None)
+        else:
+            os.environ["ROMP_POSTAL_HOST"] = self._prev
+
+    def test_the_id_carries_128_bits_of_randomness(self):
+        mid = pm._unique()
+        self.assertTrue(pm._safe_id(mid), "still a path component the outbox accepts")
+        self.assertRegex(mid, r"^\d+\.\d+_[0-9a-f]{32}\.TESTHOST$")
+        self.assertEqual(len({pm._unique() for _ in range(10000)}), 10000, "ten thousand mints, zero collisions")
+
+    def test_a_standing_message_is_never_replaced(self):
+        import json
+        import shutil
+        shutil.rmtree(pm.MAILROOT, ignore_errors=True)
+        td = tempfile.mkdtemp()
+        saved_tl, saved_unique = pm.TLDIR, pm._unique
+        pm.TLDIR = type(pm.TLDIR)(td)
+        pm._unique = lambda: "1700000000.4242_deadbeef.TESTHOST"       # a forced collision
+        try:
+            first = pm.deliver(self.RCP, "web", self.SND, "the first message")
+            with self.assertRaises(pm.DeliveryNotRecorded) as cm:
+                pm.deliver(self.RCP, "web", self.SND, "an impostor with the same id")
+            box = pm.read_box(self.RCP, consume=False)
+            self.assertEqual([(m["id"], m["body"]) for m in box], [(first, "the first message")],
+                             "the standing message is untouched; the collision was refused, not tiebroken")
+            self.assertIn("refusing to replace", str(cm.exception))
+            rows = [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines() if l]
+            self.assertEqual([r["ev"] for r in rows], ["sent", "sent", "bounced"],
+                             "the ledger closes on the refused id — no 'sent' left pending forever")
+            self.assertIn("refusing to replace", rows[-1]["why"])
+            self.assertEqual([p.name for p in (pm.MAILROOT / self.RCP / "tmp").iterdir()], [],
+                             "the temp is removed")
+        finally:
+            pm.TLDIR, pm._unique = saved_tl, saved_unique
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_publish_without_hard_links_falls_back_once_and_real_faults_refuse(self):
+        # mutants: the fallback errno set widened to every OSError → EIO/ENOSPC would publish by rename
+        # over a real fault; narrowed to none → a link-less filesystem could never deliver at all
+        import errno
+        import json
+        import shutil
+        shutil.rmtree(pm.MAILROOT, ignore_errors=True)
+        td = tempfile.mkdtemp()
+        saved_tl, saved_link, saved_log = pm.TLDIR, os.link, pm._log
+        pm.TLDIR = type(pm.TLDIR)(td)
+        logged = []
+        pm._log = lambda m: logged.append(m)
+
+        def rows():
+            return [json.loads(l) for l in (pm.TLDIR / "messages.jsonl").read_text().splitlines() if l]
+
+        def box():
+            newd = pm.MAILROOT / self.RCP / "new"
+            return sorted(p.name for p in newd.iterdir()) if newd.is_dir() else []
+
+        def tmpd():
+            t = pm.MAILROOT / self.RCP / "tmp"
+            return [p.name for p in t.iterdir()] if t.is_dir() else []
+
+        def link_raising(code):
+            def _link(src, dst, *a, **k):
+                raise OSError(code, "staged by the test")
+            return _link
+
+        try:
+            for code in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK, errno.EXDEV):
+                os.link = link_raising(code)
+                pm._LINK_FALLBACK_SAID[0] = False
+                logged.clear()
+                mid = pm.deliver(self.RCP, "web", self.SND, "via rename (%d)" % code)
+                self.assertIn(mid, box(), "errno %d: delivered by the checked rename" % code)
+                self.assertEqual(tmpd(), [], "errno %d: no temp left" % code)
+                pm.deliver(self.RCP, "web", self.SND, "again (%d)" % code)
+                self.assertEqual(len([m for m in logged if "hard links unavailable" in m]), 1,
+                                 "errno %d: said once per bus run, not per send" % code)
+            for code in (errno.EACCES, errno.EIO, errno.ENOSPC, errno.EEXIST):
+                os.link = link_raising(code)
+                before = box()
+                with self.assertRaises(pm.DeliveryNotRecorded):
+                    pm.deliver(self.RCP, "web", self.SND, "never lands (%d)" % code)
+                self.assertEqual(box(), before, "errno %d: nothing new in the inbox" % code)
+                self.assertEqual(tmpd(), [], "errno %d: the temp is removed" % code)
+                self.assertEqual([r["ev"] for r in rows()[-2:]], ["sent", "bounced"],
+                                 "errno %d: the ledger closes on the refused id" % code)
+                self.assertTrue(rows()[-1]["why"].startswith(pm.WHY_NOT_PUBLISHED))
+            # a forced collision under the fallback is refused too, and the first message stands
+            os.link = link_raising(errno.EPERM)
+            saved_unique = pm._unique
+            pm._unique = lambda: "1700000000.4242_c0ffee.TESTHOST"
+            try:
+                first = pm.deliver(self.RCP, "web", self.SND, "first under the fallback")
+                with self.assertRaises(pm.DeliveryNotRecorded) as cm:
+                    pm.deliver(self.RCP, "web", self.SND, "an impostor under the fallback")
+            finally:
+                pm._unique = saved_unique
+            self.assertIn("refusing to replace", str(cm.exception))
+            standing = [m["body"] for m in pm.read_box(self.RCP, consume=False) if m["id"] == first]
+            self.assertEqual(standing, ["first under the fallback"])
+        finally:
+            os.link, pm.TLDIR, pm._log = saved_link, saved_tl, saved_log
+            pm._LINK_FALLBACK_SAID[0] = False
+            shutil.rmtree(td, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

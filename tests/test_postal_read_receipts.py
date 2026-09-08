@@ -269,5 +269,39 @@ class FormatHonesty(_Base):
         self.assertIn("parked for boxalias (unreachable) — delivers on reconnect", txt)
 
 
+class RefusalReceipts(_Base):
+    """A terminal bounced row that records a REFUSAL (nothing left this machine; no return note) must
+    not read as "undeliverable, returned to you" — no note is coming (2026-09-08). Mutant: the
+    refusal branch dropped → every bounce promises a note."""
+
+    def _row(self, **kw):
+        r = {"to": "boxalias:api", "id": "px-1.mail.peerbox", "sent": 1, "exec": None,
+             "recalled": None, "relayed": None, "bounced": None, "parked": None}
+        r.update(kw)
+        return r
+
+    def test_a_refusal_bounce_promises_no_return_note(self):
+        for why in (ps.WHY_NOT_PUBLISHED + "a message with this id already stands in the recipient's inbox",
+                    ps.WHY_NOT_PARKED, ps.WHY_OUTBOX_UNREADABLE):
+            txt = ps.format_receipts([self._row(bounced=7, bouncedWhy=why)])
+            self.assertIn("refused — " + why, txt)
+            self.assertNotIn("returned to you", txt, why)
+
+    def test_a_peers_refusal_still_reads_as_returned(self):
+        txt = ps.format_receipts([self._row(bounced=7, bouncedWhy="no live session named 'api' on boxalias")])
+        self.assertIn("undeliverable, returned to you", txt, "a peer's bounce did come back as a note")
+        txt = ps.format_receipts([self._row(bounced=7)])
+        self.assertIn("undeliverable, returned to you", txt, "an older row with no why keeps the old line")
+
+    def test_sent_receipts_carries_the_why(self):
+        ps._tl_append("messages.jsonl", {"t": 1, "ev": "sent", "id": "px-r", "from": "web", "from_id": "sid-w",
+                                         "to_id": "peer:boxalias", "toName": "boxalias:api", "body": "hi",
+                                         "kind": ""})
+        ps._tl_append("messages.jsonl", {"t": 2, "ev": "bounced", "id": "px-r", "host": "boxalias",
+                                         "why": ps.WHY_NOT_PARKED})
+        row = ps._sent_receipts("sid-w")[-1]
+        self.assertEqual((row["bounced"], row["bouncedWhy"]), (2, ps.WHY_NOT_PARKED))
+
+
 if __name__ == "__main__":
     unittest.main()

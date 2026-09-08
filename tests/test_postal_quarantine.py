@@ -319,6 +319,29 @@ class QuarantineDecide(unittest.TestCase):
         for f in (ps.OUTBOX / "TESTHOST").glob("*.json"):
             f.unlink()
 
+    def test_a_refused_approve_leaves_the_hold_in_place(self):
+        # mutant: no except → deliver's refusal propagates out of the approve (or, worse, quarantine_del
+        # runs) and the held message is gone with nothing in new/. Kept at the public-call level on
+        # purpose: another change edits this function's body.
+        ps._relay_in("TESTHOST", _relay("q-appr-refused", body="held text"))
+        self.assertIsNotNone(ps.quarantine_get("q-appr-refused"))
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        saved_tl = ps.TLDIR
+        ps.TLDIR = Path(path) / "timeline"                   # under a regular file: the REAL append fails
+        try:
+            ok, err = ps.quarantine_decide("q-appr-refused", "approve")
+        finally:
+            ps.TLDIR = saved_tl
+            ps._TL_FAULT[0] = False
+            os.unlink(path)
+        self.assertFalse(ok)
+        self.assertIn("the held message is untouched", err)
+        self.assertIn("not delivered", err)
+        self.assertIsNotNone(ps.quarantine_get("q-appr-refused"), "the hold stands")
+        box = ps.read_box("sess-web", consume=False)
+        self.assertFalse(any("held text" in (m.get("body") or "") for m in box), "nothing landed in new/")
+
     def test_decide_unknown_mid_errors(self):
         ok, err = ps.quarantine_decide("no-such-mid", "approve")
         self.assertFalse(ok)
