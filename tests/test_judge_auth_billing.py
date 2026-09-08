@@ -191,10 +191,16 @@ class JudgeEnvBilling(_JudgeAuthBase):
         reference configured kept them in its judge children."""
         self._helper()
         ambient = {name: AMBIENT for name in CREDENTIAL_NAMES + _op_names()}
+        login_tokens = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
         for auth in ("key", "login", "codex"):
             with patch.dict(os.environ, ambient):
                 env = jd._judge_env("triage", auth)
             for name in ambient:
+                if auth == "login" and name in login_tokens:
+                    # a login-billed child gets the LOGIN tokens back (standalone, the stash is the environment
+                    # itself): they are the login, not key material, and the design keeps them
+                    self.assertEqual(env.get(name), AMBIENT, "%s is the login-billed child's credential" % name)
+                    continue
                 self.assertNotIn(name, env, "%s rode a %s-billed child" % (name, auth))
             self.assertEqual(env.get("ROMP_SUMMARIZING"), "1", "the rest of the env contract is untouched")
 
