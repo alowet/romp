@@ -89,7 +89,7 @@ test("a rendered unit changing height re-runs the shared paint — the event the
   assert.match(ev, /v\.ro = new ResizeObserver\(\(entries\) => \{\s*\n\s*scheduleRailSticky\(\);[\s\S]*?\n\s*\}\);\s*\n\s*v\.ro\.observe\(elv\);/,
     "one observer per view element: a lazy figure sizing in or a fold toggling repaints notches AND rail ticks");
   assert.match(RENDER, /ro\?: ResizeObserver; mo\?: MutationObserver; \}/, "the View carries its observers (the tail mutation one joined it, T262j)");
-  assert.equal((RENDER.match(/v\.ro\?\.disconnect\(\); v\.el\.remove\(\);/g) || []).length, 2, "both view-removal sites disconnect it");
+  assert.equal((RENDER.match(/v\.ro\?\.disconnect\(\); v\.mo\?\.disconnect\(\); v\.el\.remove\(\);/g) || []).length, 2, "both view-removal sites disconnect it (and the tail mutation observer beside it, T262j)");
   assert.doesNotMatch(ev, /setTimeout|setInterval/, "no timer stands in for the event");
 });
 
