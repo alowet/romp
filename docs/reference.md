@@ -508,6 +508,16 @@ server, when its own environment carries one of the names (it is what receives
 globals carry `ANTHROPIC_API_KEY`. A key romp holds is a key a session can
 print, so there is no quiet fallback anywhere.
 
+At boot the kernel also names, once and as information rather than a problem,
+the variables in its own environment shaped like credentials (names ending
+`_API_KEY` or `_TOKEN`, and 1Password's own `OP_*` names) that reach every
+session's Claude process and the shells it spawns: the SDK hands each session
+the kernel's environment, and romp takes only the login tokens it claims at
+boot (see [The login](#the-login)) out of it. The line carries names only,
+never values, and a second provider's key placed there on purpose is nothing
+to act on. To keep a variable away from sessions, remove it from `service.env`
+or from the service unit's environment and restart the manager.
+
 #### A key from a secret manager
 
 Claude Code's own credential resolution is the only key path. Point Claude

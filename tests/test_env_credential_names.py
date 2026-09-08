@@ -25,6 +25,16 @@ os.environ["ROMP_SERVICE_ENV"] = os.environ["ROMP_SERVICE_ENV_FILE"]
 sb = SourceFileLoader("romp_sdk_envnames", str(ROOT / "kernel/sdk_backend.py")).load_module()
 
 
+def _op_name(n):
+    """The 1Password CLI's own names as credentials.py classifies them (is_op_env_name): the boot line's op
+    shape is that classifier, the one the boot check refuses and the test floor pops."""
+    return sb._cred.is_op_env_name(n)
+
+
+def _shaped(n):
+    return n.endswith("_API_KEY") or n.endswith("_TOKEN") or _op_name(n)
+
+
 class PureNames(unittest.TestCase):
     def names(self, env):
         return sb.env_credential_names(env)
@@ -51,6 +61,19 @@ class PureNames(unittest.TestCase):
 
     def test_non_credential_names_are_ignored(self):
         self.assertEqual(self.names({"ROMP_PERF": "1", "PATH": "/bin", "EDITOR_TOKENIZER": "x"}), [])
+
+    def test_op_names_are_named_as_credentials_classifies_them(self):
+        """OP_SESSION_<account> (what `op signin` exports) ends in neither suffix, yet credentials.py classifies
+        it (is_op_env_name, beside the service-account and Connect names in OP_ENV_NAMES) as the 1Password
+        CLI's own and refuses it at boot; the helper names exactly what that classifier accepts, so the boot
+        line and the boot check agree on what an op name is."""
+        env = {"OP_SESSION_TESTACCT": "s", "OP_CONNECT_HOST": "h", "OP_ACCOUNT": "a",
+               "OP_SERVICE_ACCOUNT_TOKEN": "t", "OPTIONS_FOR_X": "not an op name"}
+        self.assertEqual(self.names(env), ["OP_ACCOUNT", "OP_CONNECT_HOST", "OP_SERVICE_ACCOUNT_TOKEN",
+                                           "OP_SESSION_TESTACCT"])
+        for n in self.names(env):
+            self.assertTrue(_op_name(n), n)
+        self.assertEqual(self.names({"OP_SESSION_TESTACCT": ""}), [], "an empty value is not a leak")
 
     def test_the_return_is_names_never_values(self):
         env = {"OPENAI_API_KEY": "plain-oai-must-not-appear"}
@@ -79,12 +102,12 @@ class BootNoticeMethod(unittest.TestCase):
         self.assertIn("HF_TOKEN", rows[0])
         self.assertNotIn("value-oai-synth", rows[0])
         self.assertNotIn("value-hf-synth", rows[0])
-        self.assertIsNone(self.logs[0][1], "informational, not a problem-ring entry")
+        self.assertIs(self.logs[0][1], False, "filed as information explicitly, never left to _log's default")
 
     def test_quiet_when_no_credential_names(self):
         with patch.dict(os.environ, {}, clear=False):       # restores every popped name on exit
             for n in list(os.environ):
-                if n.endswith("_API_KEY") or n.endswith("_TOKEN"):
+                if _shaped(n):
                     os.environ.pop(n, None)
             self.be._note_env_credential_names()
         self.assertEqual([m for m, _ in self.logs if "reach every session" in m], [])
@@ -122,6 +145,41 @@ class BootWiring(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("OPENAI_API_KEY", rows[0])
         self.assertNotIn("value-oai-init", rows[0])
+
+    def test_boot_line_is_never_a_problem_row(self):
+        """Informational on the wired path: the row reaches the log and NOT the problem ring the dashboard's
+        error center reads. Built inside an except block on purpose: _log's default classification files
+        any line logged while an exception is being handled, so an implicit problem=None would file this
+        one whenever a boot happens on a handler's retry path. The explicit problem=False is what this
+        pins; the synthetic exception below is never raised past the handler."""
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "value-oai-ring"}, clear=False):
+            try:
+                raise RuntimeError("synthetic: a boot inside an exception handler")
+            except RuntimeError:
+                be, logs = self.build()
+        rows = [m for m in logs if "reach every session" in m]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual([p["text"] for p in be.problems(50) if "reach every session" in p["text"]], [],
+                         "the boot line is information, never a problem row")
+
+    def test_op_names_are_named_on_the_wired_path(self):
+        """The op shape on the wired path: a backend built with 1Password's names in the environment names
+        them, the service-account token and the `op signin` session token both, beside a second provider's
+        key, and the values never appear. romp runs no `op` of its own and claims none of these names
+        (credentials.py); in production the boot check refuses them before kernel.main() builds a backend,
+        so a backend that sees them was built outside it, and the line says what such a backend's sessions
+        inherit."""
+        env = {"OP_SERVICE_ACCOUNT_TOKEN": "synthetic-op-helper", "OP_SESSION_TESTACCT": "synthetic-op-session",
+               "OPENAI_API_KEY": "value-oai-helper"}
+        with patch.dict(os.environ, env, clear=False):
+            _, logs = self.build()
+            self.assertIn("OP_SERVICE_ACCOUNT_TOKEN", os.environ, "nothing of romp's claims op's names")
+        rows = [m for m in logs if "reach every session" in m]
+        self.assertEqual(len(rows), 1)
+        for name in env:
+            self.assertIn(name, rows[0])
+        for value in env.values():
+            self.assertNotIn(value, rows[0])
 
     def test_login_tokens_claimed_at_boot_are_not_named(self):
         """startup_auth_env pops the login tokens out of os.environ at the top of __init__, before the notice
