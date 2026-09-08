@@ -102,6 +102,18 @@ os.environ["GIT_AUTHOR_EMAIL"] = os.environ["GIT_COMMITTER_EMAIL"] = "tests@exam
 os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="romp-tests-state-")   # inside the root; the hook records it
 os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel exports this to its sessions; it outranks the XDG floor
 
+# No test may resolve the REAL ~/.claude (2026-09-08): the judge module and the event model compute
+# their projects root at IMPORT from CLAUDE_CONFIG_DIR (default ~/.claude), the kernel and the SDK
+# backend read the same variable at call time for the task store and transcripts, and a test that
+# touched a per-session project dir without patching jd.PROJECTS wrote thirty synthetic-sid
+# directories under a developer's real ~/.claude/projects. Floored like the state root: a fresh
+# directory inside the run's private temp root, set (not defaulted: a developer's own export must
+# not reach a test either) before any test module loads, and re-asserted per test below so a
+# module-level pop or write in one test file cannot erase it for the run. A test that needs its own
+# Claude root sets the variable in setUp, after the fixture, exactly as the ones that do already do.
+_CLAUDE_CONFIG = tempfile.mkdtemp(prefix="romp-tests-claude-")
+os.environ["CLAUDE_CONFIG_DIR"] = _CLAUDE_CONFIG
+
 
 # No test may reach a REAL manager control port (2026-08-27): on a machine running a live romp,
 # every shell the manager tree spawns inherits ROMP_MANAGER_PORT, and any test kernel that dials
@@ -186,6 +198,12 @@ def _no_real_service_env():
     _scrub_key_source_env()
     os.environ.pop("ROMP_SUPERVISED", None)
     _reset_keysource_state()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_claude_config():
+    os.environ["CLAUDE_CONFIG_DIR"] = _CLAUDE_CONFIG
     yield
 
 
