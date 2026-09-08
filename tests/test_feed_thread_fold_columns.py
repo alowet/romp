@@ -118,6 +118,63 @@ process.exit(0);
 """
 
 
+GROUP_DRIVER = r"""
+import { createRequire } from "node:module";
+import fs from "node:fs";
+const require = createRequire(process.env.EXT_PKG);
+const { chromium } = require("playwright");
+const cfg = JSON.parse(fs.readFileSync(process.env.CFG, "utf8"));
+let browser;
+try { browser = await chromium.launch(); }
+catch (e) { console.error("browser-launch-failed: " + e); process.exit(3); }
+const page = await browser.newPage({ viewport: { width: 1100, height: 520 } });
+const errors = [];
+page.on("pageerror", (e) => errors.push(String(e && e.stack || e).slice(0, 400)));
+await page.goto(cfg.feed);
+await page.waitForFunction(() => document.readyState === "complete" && typeof window.acquireVsCodeApi === "function", null, { timeout: 20000 });
+await page.waitForTimeout(600);
+const now = Math.floor(Date.now() / 1000);
+const ask = (itemId, column, text, t, extra) => Object.assign({ itemId, sid: cfg.sid, name: "web", color: { bg: "#1EA1EB", fg: "#ffffff" },
+  text, t, live: true, turnId: "turn-solo-" + itemId.slice(-1), trgb: [30, 161, 235], column, tree: [] }, extra || {});
+// m1 + m2 share a typed turn (turnId + groupTitle) → one turn-group card, in Blocked (its worst member)
+const grp = { turnId: "turn-group-1", groupTitle: "notes-api: ship the search index" };
+const payload = { type: "feed", asks: [ask(cfg.m1, "needs_input", "notes-api: pick the index backend", now - 300, grp),
+                                        ask(cfg.m2, "completed", "notes-api: write the index schema", now - 240, grp),
+                                        ask(cfg.c3, "completed", "notes-api: tune the retry curve", now - 60)],
+                  sessions: [{ sid: cfg.sid, name: "web" }], order: [cfg.sid] };
+const deliver = (m) => page.evaluate((m) => { window.dispatchEvent(new MessageEvent("message", { data: m })); }, m);
+await deliver(payload);
+await page.waitForSelector(`[data-key="g:turn-group-1"]`, { timeout: 10000 });
+await page.waitForSelector(`[data-key="a:${cfg.c3}"]`, { timeout: 10000 });
+await page.waitForTimeout(300);
+const survey = () => page.evaluate((cfg) => {
+  const listOf = (el) => el ? el.closest(".feed-col")?.querySelector(".feed-col-list")?.id || null : null;
+  const heads = Array.from(document.querySelectorAll(".feed-sess-head")).map((h) => ({
+    col: h.closest(".feed-col")?.querySelector(".feed-col-list")?.id || null, folded: h.classList.contains("folded"),
+    count: h.querySelector(".feed-sess-foldn")?.style.display === "none" ? null : h.querySelector(".feed-sess-foldn")?.textContent }));
+  return { groupCol: listOf(document.querySelector('[data-key="g:turn-group-1"]')), soloCol: listOf(document.querySelector(`[data-key="a:${cfg.c3}"]`)),
+           groupShown: !!document.querySelector('[data-key="g:turn-group-1"]'), soloShown: !!document.querySelector(`[data-key="a:${cfg.c3}"]`),
+           heads, stored: localStorage.getItem("romp:feedview") };
+}, cfg);
+const before = await survey();
+if (!before.groupCol || !before.soloCol) { console.error("cards did not land: " + JSON.stringify(before)); process.exit(1); }
+// FOLD both runs (the group's Blocked run, the solo card's Completed run)
+for (const col of [before.groupCol, before.soloCol]) {
+  await page.click(`#${col} .feed-sess-head[data-fsid="${cfg.sid}"] .feed-sess-fold`);
+  await page.waitForTimeout(250);
+}
+const folded = await survey();
+// JUMP to the completed MEMBER of the group (a bell-entry click / notification tap): the run it RENDERS in — Blocked,
+// the group's column — must open; the Completed run, an unrelated fold, must stay folded
+await deliver({ romp: "revealCard", itemId: cfg.m2, sid: cfg.sid });
+await page.waitForTimeout(500);
+const jumped = await survey();
+fs.writeSync(1, "RESULT:" + JSON.stringify({ before, folded, jumped, groupCol: before.groupCol, soloCol: before.soloCol, errors }) + "\n");
+await browser.close();
+process.exit(0);
+"""
+
+
 class ServedFoldIsPerColumn(unittest.TestCase):
     maxDiff = None
 
@@ -158,6 +215,40 @@ class ServedFoldIsPerColumn(unittest.TestCase):
             cls.kernel.kill()
             cls.kernel.wait()
         shutil.rmtree(getattr(cls, "lab", ""), ignore_errors=True)
+
+    def test_a_jump_into_a_folded_turn_group_member_opens_the_run_the_group_renders_in(self):
+        # T263d (review of T263c): a turn-group's members render in the GROUP's column (its worst member), so the
+        # jump must unfold that run — keying by the member's own column opened the unrelated Completed run and
+        # left the group's Blocked run shut (red on the first cut)
+        cfg = os.path.join(self.lab, "cfg-group.json")
+        with open(cfg, "w") as f:
+            json.dump({"feed": "http://127.0.0.1:%d/feed?token=%s" % (self.port, self.token), "sid": SID,
+                       "m1": "eeeeeeee-1111-2222-3333-000000000001", "m2": "eeeeeeee-1111-2222-3333-000000000002",
+                       "c3": "eeeeeeee-1111-2222-3333-000000000003"}, f)
+        driver = os.path.join(self.lab, "driver-group.mjs")
+        with open(driver, "w") as f:
+            f.write(GROUP_DRIVER)
+        p = subprocess.run(["node", driver], capture_output=True, text=True, timeout=300,
+                           env=dict(os.environ, EXT_PKG=os.path.join(EXT, "package.json"), CFG=cfg))
+        if p.returncode == 3:
+            raise unittest.SkipTest("no playwright browser on this box — the served guard needs one (CI installs none)")
+        self.assertEqual(p.returncode, 0, "driver failed:\n" + p.stdout[-3000:] + p.stderr[-3000:])
+        line = next((ln for ln in p.stdout.splitlines() if ln.startswith("RESULT:")), None)
+        self.assertIsNotNone(line, "driver printed no result:\n" + p.stdout[-3000:])
+        r = json.loads(line[len("RESULT:"):])
+        self.assertEqual(r.get("errors"), [], "the page threw nothing: %r" % r.get("errors"))
+        gcol, scol = r["groupCol"], r["soloCol"]
+        self.assertEqual(gcol, "col-needsInput-list", "the mixed-state group renders in Blocked, its worst member's column: %r" % r["before"])
+        self.assertEqual(scol, "col-completed-list", "the solo completed card renders in Completed: %r" % r["before"])
+        f_ = r["folded"]
+        self.assertFalse(f_["groupShown"] or f_["soloShown"], "both runs folded: nothing rendered: %r" % f_)
+        self.assertEqual(sorted(h["folded"] for h in f_["heads"]), [True, True], "both headers folded: %r" % f_["heads"])
+        j = r["jumped"]
+        heads = {h["col"]: h for h in j["heads"]}
+        self.assertTrue(j["groupShown"], "the jump opened the run the member RENDERS in — the group is back on screen: %r" % j)
+        self.assertFalse(heads[gcol]["folded"], "the Blocked header (the group's run) is open: %r" % heads)
+        self.assertTrue(heads[scol]["folded"], "the Completed run — an unrelated fold — stays folded: %r" % heads)
+        self.assertFalse(j["soloShown"], "…its solo card still hidden: %r" % j)
 
     def test_folding_a_session_in_one_column_leaves_its_other_column_open_and_persists(self):
         cfg = os.path.join(self.lab, "cfg.json")

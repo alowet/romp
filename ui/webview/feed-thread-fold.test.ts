@@ -67,8 +67,14 @@ test("the click acknowledges immediately and cannot be lost to a re-render", () 
 
 test("a jump into a folded thread unfolds it instead of landing on nothing", () => {
   // revealCards scrolls to a DOM element; a folded card has none, so the navigation would silently no-op
-  assert.match(FEED, /const tkey = threadKey\(a\.sid, askColumn\(a\)\);[^\n]*\n\s*if \(collapsedThreads\.has\(tkey\) && extHoverMatches\("a:" \+ a\.itemId, keys\)\) \{/,
-    "the run the card sits in — its column's key — is what a jump unfolds");
+  // the run the card RENDERS in (T263d): a turn-group member renders in the group's column (buildGroup's worst
+  // member), not its own — keying the unfold by askColumn(a) opened an unrelated run and left the group's shut
+  assert.match(FEED, /const tkey = threadKey\(a\.sid, renderedCol\.get\(a\.itemId\) \?\? askColumn\(a\)\);\s*\n\s*if \(collapsedThreads\.has\(tkey\) && extHoverMatches\("a:" \+ a\.itemId, keys\)\) \{/,
+    "the run the card renders in — its rendered column's key — is what a jump unfolds");
+  assert.match(FEED, /const renderedCol = new Map<string, Column>\(\);/);
+  assert.match(FEED, /if \(feedPrefs\(\)\.grouped\) \{\s*\n\s*const rank = new Map\(sessionOrder\.map\(\(s, i\) => \[s, i\] as const\)\);\s*\n\s*renderedCol\.clear\(\);/, "rebuilt on every grouped render");
+  assert.match(FEED, /if \(e\.kind === "ask"\) renderedCol\.set\(e\.ask\.itemId, k\);\s*\n\s*else if \(e\.kind === "group"\) for \(const m of e\.group\.members\) renderedCol\.set\(m\.itemId, k\);/,
+    "every card and every group member is recorded under the bucket column it renders in");
   assert.match(FEED, /if \(opened\) render\(\);/);
 });
 
