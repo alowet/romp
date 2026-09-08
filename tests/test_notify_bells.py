@@ -423,6 +423,25 @@ def _reads_fault(target):
         Path.read_bytes, Path.read_text = real_rb, real_rt
 
 
+@contextlib.contextmanager
+def _writes_fault(target):
+    """Fail the PUBLISH of ONE state file with an ENOSPC for the duration of the block: _atomic_write
+    writes `<name>.tmp.<pid>.<tid>.<n>` beside the file and renames it over, so failing every write_text
+    of that shape is the disk refusing this file's publish while every other path, and every read, behaves."""
+    real = Path.write_text
+    prefix = Path(target).name + ".tmp."
+
+    def wt(self, *a, **k):
+        if self.name.startswith(prefix):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(self, *a, **k)
+    Path.write_text = wt
+    try:
+        yield
+    finally:
+        Path.write_text = real
+
+
 class NotifyDisplayReaderServesUnproved(unittest.TestCase):
     """The DISPLAY reader of the bells under a fault: the last value this kernel read if it holds
     one, else {} -- neither cached under the file's stat key, so the recovered disk is read again."""
@@ -579,6 +598,30 @@ class NotifyRoutesRefuseInTheirOwnShape(unittest.TestCase):
     def test_notify_turns_refuses_in_the_route_shape(self):
         self._refused("/notify-turns")
 
+    def _refused_publish(self, path):
+        # the store READS but its PUBLISH fails: the maintainer's fold on PR #1019 (the write step is a fault
+        # boundary too). Before, the OSError out of _atomic_write reached do_POST's catch-all as a 500
+        # traceback -- which `romp tag`-style callers and a federation forward read as an unreachable kernel
+        km._set_notify_card("11111111-2222-3333-4444-555555555555:g1", True)
+        km._notify_cards_cache.clear()
+        p = jd.STATE / "notify-cards.json"
+        before = p.read_bytes()
+        with _writes_fault(p):
+            status, body = self._post(path, {"on": True})
+        self.assertEqual(status, 200, "%s: a failed publish rides the route's own 200 shape, never a 500" % path)
+        self.assertEqual((body["ok"], body["retryable"]), (False, True))
+        self.assertIn("notify-cards.json could not be written", body["error"])
+        self.assertIn("No space left on device", body["error"])
+        self.assertIn("try again", body["error"])
+        self.assertEqual(p.read_bytes(), before, "%s: the bells file is untouched" % path)
+        self.assertEqual(self.sent, [], "%s: no dashboard is told the switch flipped -- it did not" % path)
+
+    def test_notify_all_refuses_a_failed_publish_in_the_route_shape(self):
+        self._refused_publish("/notify-all")
+
+    def test_notify_turns_refuses_a_failed_publish_in_the_route_shape(self):
+        self._refused_publish("/notify-turns")
+
     def test_a_clean_post_still_answers_ok_and_broadcasts(self):
         status, body = self._post("/notify-turns", {"on": True})
         self.assertEqual((status, body), (200, {"ok": True, "on": True}))
@@ -663,6 +706,60 @@ class CardBellJudgedAgainstAProvedDefault(unittest.TestCase):
         self.assertEqual((sent[0]["type"], sent[0]["gesture"], sent[0]["itemId"]), ("settingRefused", "bell", self.SID + ":g1"))
         self.assertIn("session-flags.json could not be read", sent[0]["text"])
         self.assertEqual(self.dirty, [])
+
+
+class NotifyWsWriteFailure(unittest.TestCase):
+    """The cardNotify WS arm when the bells store READS but its PUBLISH fails: the maintainer's fold on PR
+    #1019. Before, the arm caught only _StateUnreadable and the OSError out of _atomic_write escaped
+    _dispatch_ws to the receive loop, which dropped the client. Now the poster gets the same settingRefused
+    frame, addressed to the card, saying the file could not be written; the store is untouched; the fault
+    is filed once per episode."""
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.saved = (jd.STATE, km._mark_views_dirty, km._sync_notice)
+        jd.STATE = Path(self.td.name)
+        km._notify_cards_cache.clear(); km._flags_cache.clear(); km._state_fault_seen.clear()
+        vars(km).get("_state_write_fault_seen", {}).clear()
+        self.dirty, self.notices = [], []
+        km._mark_views_dirty = lambda: self.dirty.append(1)
+        km._sync_notice = lambda text, ok=True: self.notices.append((text, ok))
+
+    def tearDown(self):
+        jd.STATE, km._mark_views_dirty, km._sync_notice = self.saved
+        km._notify_cards_cache.clear(); km._flags_cache.clear(); km._state_fault_seen.clear()
+        vars(km).get("_state_write_fault_seen", {}).clear()
+        self.td.cleanup()
+
+    def test_a_failed_publish_answers_the_poster_instead_of_dropping_the_socket(self):
+        km._set_notify_card(self.SID + ":g1", True, self.SID)
+        km._notify_cards_cache.clear()
+        p = jd.STATE / "notify-cards.json"
+        before = p.read_bytes()
+        sent = []
+        client = {"app": "feed", "wid": "w1", "alive": True, "send": lambda raw: sent.append(json.loads(raw))}
+        with _writes_fault(p):
+            for _ in range(2):                                             # two clicks on the same full disk
+                try:
+                    km.Handler._dispatch_ws(None, {"type": "cardNotify", "itemId": self.SID + ":g2", "sid": self.SID, "value": True}, client)
+                except OSError:
+                    self.fail("the OSError escaped _dispatch_ws -- the receive loop re-raises it and drops the client")
+        self.assertTrue(client["alive"])
+        self.assertEqual(p.read_bytes(), before, "the bells file is byte-for-byte unchanged")
+        self.assertEqual(len(sent), 2, "every click is answered on the delivering socket")
+        fr = sent[0]
+        self.assertEqual((fr["type"], fr["gesture"], fr["itemId"], fr["sid"]), ("settingRefused", "bell", self.SID + ":g2", self.SID))
+        self.assertIn("couldn't save that bell", fr["text"])
+        self.assertIn("notify-cards.json could not be written", fr["text"])
+        self.assertIs(fr["value"], False, "what the kernel still paints for this card (no override, master off)")
+        self.assertEqual(self.dirty, [])
+        self.assertEqual(len([t for t, ok in self.notices if not ok]), 1, "filed once per episode, not per click")
+        km.Handler._dispatch_ws(None, {"type": "cardNotify", "itemId": self.SID + ":g2", "sid": self.SID, "value": True}, client)
+        self.assertEqual(len(sent), 2, "the disk heals: the click lands and nothing more is said")
+        self.assertEqual(self.dirty, [1])
+        km._notify_cards_cache.clear()
+        self.assertIs(km._notify_cards().get(self.SID + ":g2"), True)
 
 
 if __name__ == "__main__":

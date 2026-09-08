@@ -1,5 +1,6 @@
 // The kernel's `settingRefused` frame: a dashboard gesture that edits a small state store (a lane/tab flag,
-// a card bell, a drag) was REFUSED because the store could not be read, and the refusal is answered on the
+// a card bell, a drag) was REFUSED because the store could not be read -- or, since the maintainer's fold on
+// PR #1019, because its publish failed (_StateUnwritable) -- and the refusal is answered on the
 // posting socket, addressed to the gesture (sid / itemId / flag). The rule it exists for: a refused gesture
 // must reach the eye that made it AND end the optimistic state on that event. Before it, the kernel sent a
 // `warn`, which only the chat page renders -- a refused bell on the feed page and a refused lane flag on the
@@ -33,7 +34,10 @@ test("the kernel answers a refused store write on the DELIVERING socket, address
   for (const what of ['"that setting", "flag"', '"that bell", "bell"', '"the new order", "order"']) {
     const call = KERNEL.indexOf("_refuse_setting(client, e, " + what);
     assert.ok(call > 0, what);
-    const block = KERNEL.slice(KERNEL.lastIndexOf("except _StateUnreadable as e:", call), call);
+    // the arm catches the read fault AND the write fault (the write step is a fault boundary too); anchoring on
+    // the read-only literal fell back to a catch thousands of lines above and sliced in unrelated warn frames
+    const block = KERNEL.slice(KERNEL.lastIndexOf("except (_StateUnreadable, _StateUnwritable) as e:", call), call);
+    assert.ok(block.length < 2000, "the arm's own except sits just above its refusal: " + what);
     assert.doesNotMatch(block, /"type": "warn"/, "no store-fault arm answers with a warn frame: " + what);
   }
 });
@@ -106,7 +110,7 @@ test("the shell's bell knows the `refused` kind: listed, labelled, explained, an
   // anomaly stamp) never mutes a change of yours that did not land
   assert.match(KERNEL, /var KINDS=\[[^\]]*'refused','undelivered'\]/);
   assert.match(KERNEL, /refused:'not saved'/);
-  assert.match(KERNEL, /refused:"a change you made \\u2014 a lane or tab setting, a card bell, a tag or view, a lane order \\u2014 was not saved because romp could not read the file that holds it/);
+  assert.match(KERNEL, /refused:"a change you made \\u2014 a lane or tab setting, a card bell, a tag or view, a lane order \\u2014 was not saved because the file that holds it could not be read or written/);
   assert.match(KERNEL, /\.rerr-chip\.k-refused\{color:#ffd166;border-color:rgba\(255,209,102,0\.6\)\}/);
   // and every pane files under it -- none under `warn`
   for (const src of [FEED, RENDER, VIEW]) assert.doesNotMatch(src.slice(src.indexOf("settingRefused")), /kind: ['"]warn['"]/);

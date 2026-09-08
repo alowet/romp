@@ -210,6 +210,25 @@ def _reads_fault(target):
         Path.read_bytes, Path.read_text = real_rb, real_rt
 
 
+@contextlib.contextmanager
+def _writes_fault(target):
+    """Fail the PUBLISH of ONE state file with an ENOSPC for the duration of the block: _atomic_write
+    writes `<name>.tmp.<pid>.<tid>.<n>` beside the file and renames it over, so failing every write_text
+    of that shape is the disk refusing this file's publish while every other path, and every read, behaves."""
+    real = Path.write_text
+    prefix = Path(target).name + ".tmp."
+
+    def wt(self, *a, **k):
+        if self.name.startswith(prefix):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(self, *a, **k)
+    Path.write_text = wt
+    try:
+        yield
+    finally:
+        Path.write_text = real
+
+
 class StateUnreadableIsAPlainException(unittest.TestCase):
     """The WS receive loop re-raises (BrokenPipeError, ConnectionResetError, OSError) as a genuine
     socket failure and tears the connection down; every other exception falls to its logging arm
@@ -410,6 +429,87 @@ class SessionBellJudgedAgainstAProvedMaster(unittest.TestCase):
         self.assertEqual((sent[0]["type"], sent[0]["gesture"], sent[0]["flag"]), ("settingRefused", "flag", "notify"))
         self.assertIn("notify-cards.json could not be read", sent[0]["text"])
         self.assertEqual(self.dirty, [])
+
+
+class FlagsWsWriteFailure(unittest.TestCase):
+    """The setSessionFlag WS arm when the store READS but its PUBLISH fails (ENOSPC, EROFS, EACCES): the
+    maintainer's fold on PR #1019 -- a user gesture's WRITE step is a fault boundary too. Before, the arm
+    caught only _StateUnreadable, so the OSError out of _atomic_write escaped _dispatch_ws to the receive
+    loop, which re-raises any OSError as a socket failure: the dashboard was DROPPED without a word. Now
+    the publish raises _StateUnwritable, the arm answers the same settingRefused frame ("could not be
+    written"), the file is untouched, the fault is filed once per episode on the path's registry, and a
+    landed write ends the episode."""
+    SID = "11111111-2222-3333-4444-555555555555"
+    OTHER = "99999999-8888-7777-6666-555555555555"
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.saved = (jd.STATE, km._mark_views_dirty, km._sync_notice)
+        jd.STATE = Path(self.td.name)
+        km._flags_cache.clear(); km._notify_cards_cache.clear(); km._state_fault_seen.clear()
+        vars(km).get("_state_write_fault_seen", {}).clear()
+        self.dirty, self.notices = [], []
+        km._mark_views_dirty = lambda: self.dirty.append(1)
+        km._sync_notice = lambda text, ok=True: self.notices.append((text, ok))
+
+    def tearDown(self):
+        jd.STATE, km._mark_views_dirty, km._sync_notice = self.saved
+        km._flags_cache.clear(); km._notify_cards_cache.clear(); km._state_fault_seen.clear()
+        vars(km).get("_state_write_fault_seen", {}).clear()
+        self.td.cleanup()
+
+    def _client(self):
+        sent = []
+        return {"app": "timeline", "wid": "w1", "alive": True, "send": lambda raw: sent.append(json.loads(raw))}, sent
+
+    def test_a_failed_publish_answers_the_poster_instead_of_dropping_the_socket(self):
+        km._set_session_flag(self.OTHER, "postalServiceOff", True)
+        km._flags_cache.clear()
+        p = jd.STATE / "session-flags.json"
+        before = p.read_bytes()
+        with _writes_fault(p):
+            for flag in ("hideFromFeed", "notify"):                   # the plain setter and the tri-state bell
+                client, sent = self._client()
+                try:
+                    km.Handler._dispatch_ws(None, {"type": "setSessionFlag", "id": self.SID, "flag": flag, "value": True}, client)
+                except OSError:
+                    self.fail("%s: the OSError escaped _dispatch_ws -- the receive loop re-raises it and drops the client" % flag)
+                self.assertTrue(client["alive"])
+                self.assertEqual(p.read_bytes(), before, "%s: the flags file is byte-for-byte unchanged" % flag)
+                self.assertEqual(len(sent), 1, "%s: exactly one frame, on the delivering socket" % flag)
+                fr = sent[0]
+                self.assertEqual((fr["type"], fr["gesture"], fr["sid"], fr["flag"]), ("settingRefused", "flag", self.SID, flag))
+                self.assertIn("couldn't save that setting", fr["text"])
+                self.assertIn("session-flags.json could not be written", fr["text"])
+                self.assertIn("No space left on device", fr["text"])
+                self.assertNotIn(".tmp.", fr["text"], "errno + strerror only, never the temp path")
+                self.assertIs(fr["value"], False, "the value the kernel still paints rides along")
+        self.assertEqual(self.dirty, [], "a refused write marks nothing dirty")
+        self.assertEqual(len([t for t, ok in self.notices if not ok]), 1, "the fault is filed ONCE per episode, not per click")
+        self.assertIn("could not be written", self.notices[0][0])
+        self.assertIn("not saved", self.notices[0][0])
+        # the disk heals: the next click lands, ends the episode, and a fresh fault speaks again
+        client, sent = self._client()
+        km.Handler._dispatch_ws(None, {"type": "setSessionFlag", "id": self.SID, "flag": "hideFromFeed", "value": True}, client)
+        self.assertEqual(sent, [])
+        self.assertTrue(km._session_flag(self.SID, "hideFromFeed"))
+        self.assertNotIn(str(p), km._state_write_fault_seen, "a landed write ends the episode")
+        with _writes_fault(p):
+            client, sent = self._client()
+            km.Handler._dispatch_ws(None, {"type": "setSessionFlag", "id": self.SID, "flag": "hideFromFeed", "value": False}, client)
+        self.assertEqual([m["type"] for m in sent], ["settingRefused"])
+        self.assertEqual(len([t for t, ok in self.notices if not ok]), 2, "a new episode is filed again")
+        self.assertTrue(km._session_flag(self.SID, "hideFromFeed"), "nothing applied: the store keeps the value")
+
+    def test_the_setter_raises_the_plain_exception_never_the_os_error(self):
+        p = jd.STATE / "session-flags.json"
+        with _writes_fault(p):
+            with self.assertRaises(km._StateUnwritable) as cm:
+                km._set_session_flag(self.SID, "hideFromFeed", True)
+        self.assertNotIsInstance(cm.exception, OSError, "an OSError is what the receive loop reads as a dead socket")
+        self.assertEqual(str(cm.exception), "session-flags.json could not be written (write failed: [Errno 28] No space left on device)")
+        self.assertEqual((cm.exception.path.name, cm.exception.fault), ("session-flags.json", "write failed: [Errno 28] No space left on device"))
+        self.assertFalse(p.exists(), "nothing was published")
 
 
 if __name__ == "__main__":

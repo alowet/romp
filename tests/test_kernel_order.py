@@ -315,6 +315,25 @@ def _reads_fault(target):
         Path.read_bytes, Path.read_text = real_rb, real_rt
 
 
+@contextlib.contextmanager
+def _writes_fault(target):
+    """Fail the PUBLISH of ONE state file with an ENOSPC for the duration of the block: _atomic_write
+    writes `<name>.tmp.<pid>.<tid>.<n>` beside the file and renames it over, so failing every write_text
+    of that shape is the disk refusing this file's publish while every other path, and every read, behaves."""
+    real = Path.write_text
+    prefix = Path(target).name + ".tmp."
+
+    def wt(self, *a, **k):
+        if self.name.startswith(prefix):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(self, *a, **k)
+    Path.write_text = wt
+    try:
+        yield
+    finally:
+        Path.write_text = real
+
+
 class OrderDisplayReaderServesUnproved(unittest.TestCase):
     """The DISPLAY reader of the lane order under a fault serves the last order this kernel read or
     wrote -- and never latches what the fault produced as the new known-good. A reader that latched
@@ -399,6 +418,35 @@ class OrderWsRefusal(unittest.TestCase):
         self.assertEqual(km._session_order_proved(), [A, C, B], "the drag merged: the untouched lane keeps its slot, the dragged pair reorders in place")
         self.assertEqual(self.dirty, [1])
 
+    def test_a_drag_whose_publish_fails_is_refused_not_a_dropped_socket(self):
+        # the order READS and the merge is right, but the PUBLISH fails (ENOSPC): the maintainer's fold on PR
+        # #1019 -- the write step is a fault boundary too. Before, the write sat in the arm's `else:` outside
+        # its catch, and the OSError escaped _dispatch_ws to the receive loop, which dropped the client.
+        km._write_session_order([A, B, C])
+        km._state_fault_seen.clear()
+        p = km.jd.STATE / "session-order.json"
+        before = p.read_bytes()
+        sent = []
+        client = {"app": "chat", "wid": "w1", "alive": True, "send": lambda raw: sent.append(json.loads(raw))}
+        with _writes_fault(p):
+            try:
+                km.Handler._dispatch_ws(None, {"type": "reorderTabs", "order": [C, B]}, client)
+            except OSError:
+                self.fail("the OSError escaped _dispatch_ws -- the receive loop re-raises it and drops the client")
+        self.assertTrue(client["alive"])
+        self.assertEqual(p.read_bytes(), before, "the order file is byte-for-byte unchanged")
+        self.assertEqual(km._session_order_lkg[0], [A, B, C], "nothing is latched as known-good off a publish that failed")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual((sent[0]["type"], sent[0]["gesture"], sent[0]["value"]), ("settingRefused", "order", None))
+        self.assertIn("couldn't save the new order", sent[0]["text"])
+        self.assertIn("session-order.json could not be written", sent[0]["text"])
+        self.assertEqual(self.dirty, [])
+        self.assertIn(str(p), km._state_write_fault_seen, "the fault is on the path's write registry")
+        km.Handler._dispatch_ws(None, {"type": "reorderTabs", "order": [C, B]}, client)
+        self.assertEqual(len(sent), 1, "the disk heals: the drag lands and nothing more is said")
+        self.assertEqual(km._session_order_proved(), [A, C, B])
+        self.assertNotIn(str(p), km._state_write_fault_seen, "a landed write ends the episode")
+
 
 class StateQuarantineShape(unittest.TestCase):
     """The quarantine wears the shape the goal-store and ledger quarantines wear: `<file>.corrupt-<utc
@@ -436,8 +484,9 @@ class StateQuarantineShape(unittest.TestCase):
     def test_a_file_republished_between_the_read_and_the_rename_is_not_moved_aside(self):
         # the torn bytes are read, and BEFORE the quarantine's rename an atomic publish replaces the
         # file with a good one (a writer on another thread): the re-check sees a different inode /
-        # mtime / size and leaves the new file exactly where it is -- the caller gets a transient
-        # UNREADABLE (its next read is a fresh one), never a good file quarantined
+        # mtime / size and leaves the new file exactly where it is -- and the peer's bytes get their own
+        # read IN THIS CALL (the maintainer's fold on PR #1019, bounded), so the caller gets what is there
+        # now rather than a transient UNREADABLE; never a good file quarantined
         good = json.dumps([A, B]).encode()
         p = self._path()
         p.write_bytes(b'["aaaa", NOT JSON')
@@ -449,14 +498,35 @@ class StateQuarantineShape(unittest.TestCase):
             return raw
         Path.read_bytes = rb
         try:
+            got = km._read_state_json(p)                           # raised a transient _StateUnreadable before the fold
+        finally:
+            Path.read_bytes = real_rb
+        self.assertEqual(got, [A, B], "the reader returns what is there now: the peer's valid store")
+        self.assertEqual(p.read_bytes(), good, "the republished good file is untouched")
+        self.assertEqual(list(km.jd.STATE.glob("session-order.json.corrupt-*")), [], "nothing was moved aside")
+
+    def test_a_file_that_keeps_changing_under_the_read_is_unreadable_after_the_bound(self):
+        # the re-read is BOUNDED: a peer republishing torn bytes under every read is chased three times,
+        # then the reader stops and raises the transient _StateUnreadable (never a spin, never a move aside)
+        p = self._path()
+        p.write_bytes(b'["aaaa", NOT JSON')
+        real_rb, reads = Path.read_bytes, []
+
+        def rb(self_, *a, **k):
+            raw = real_rb(self_, *a, **k)
+            if str(self_) == str(p):
+                reads.append(1)
+                km._atomic_write(p, '["bbbb", NOT JSON' + " " * len(reads))   # torn again, a new size each time
+            return raw
+        Path.read_bytes = rb
+        try:
             with self.assertRaises(km._StateUnreadable) as cm:
                 km._read_state_json(p)
         finally:
             Path.read_bytes = real_rb
+        self.assertEqual(len(reads), 3, "three tries, then the reader stops chasing the file")
         self.assertIn("replaced meanwhile", str(cm.exception))
-        self.assertEqual(p.read_bytes(), good, "the republished good file is untouched")
-        self.assertEqual(list(km.jd.STATE.glob("session-order.json.corrupt-*")), [], "nothing was moved aside")
-        self.assertEqual(km._read_state_json(p), [A, B], "the next read is a fresh, clean one")
+        self.assertEqual(list(km.jd.STATE.glob("session-order.json.corrupt-*")), [], "nothing of a peer's was moved aside")
 
     def test_bytes_that_cannot_be_moved_aside_leave_the_store_unreadable_not_empty(self):
         p = self._path()

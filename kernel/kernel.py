@@ -2222,11 +2222,33 @@ class _StateUnreadable(Exception):
         super().__init__("%s could not be read (%s)" % (self.path.name, self.fault))
 
 
+class _StateUnwritable(Exception):
+    """A small JSON state file could not be WRITTEN -- ENOSPC, EROFS, EACCES out of the publish itself,
+    after the store read proved. The sibling of _StateUnreadable for the gesture's other step (the
+    maintainer's fold on PR #1019: a user gesture's WRITE step is a fault boundary too). Raised by
+    _write_state_json in place of the OSError, which the WS receive loop re-raised as a socket failure
+    and turned into a DROPPED client (`finally: client["alive"] = False`): the dashboard disconnected
+    without a word, and the HTTP routes answered a 500 traceback where their callers read only their
+    own ok:false shape. As a plain Exception the same escape costs one logged line, and the gesture
+    arms catch it beside _StateUnreadable and answer the socket. `path` and `fault` as its sibling's:
+    errno + strerror only, never the temp path (which carries a per-call sequence), so the per-path
+    fault registry dedupes a disk that stays full."""
+
+    def __init__(self, path, fault):
+        self.path = Path(path)
+        self.fault = str(fault)
+        super().__init__("%s could not be written (%s)" % (self.path.name, self.fault))
+
+
 def _errno_text(e):
     """errno + strerror ONLY: str(e) names the path(s), and a quarantine destination carries a
     per-second stamp, so a text built from it changed every second and every once-per-fault-text
     dedupe fired once a second (the ledgers' lesson)."""
     return ("[Errno %d] %s" % (e.errno, e.strerror)) if getattr(e, "errno", None) is not None else type(e).__name__
+
+
+_STATE_REPLACED = "replaced meanwhile; the new bytes get their own read"   # _state_quarantine's decline when the
+#                                        file is no longer the one whose bytes failed: the reader re-reads (bounded)
 
 
 def _state_quarantine(p, st, reason):
@@ -2235,14 +2257,15 @@ def _state_quarantine(p, st, reason):
     suffix for a second in the same second) -- the shape the goal-store and ledger quarantines wear,
     so one convention reads across all three. Only while the file is still the one whose bytes
     failed (same inode, mtime and size as `st`, the stat taken before the read): an atomic publish
-    that landed before the re-check already replaced them, and the new file gets its own read (the
-    window left is between the re-check and the os.replace). Returns None once the
-    bytes are out of the way (moved, or already gone: a sibling reader moved them), with one stderr
-    line for the move; else the reason they are NOT, for the caller's fault text."""
+    that landed before the re-check already replaced them, and the new file gets its own read
+    (_STATE_REPLACED: _read_state_json re-reads, bounded -- the maintainer's fold on PR #1019; the
+    window left is between the re-check and the os.replace). Returns None once the bytes are out of
+    the way (moved, or already gone: a sibling reader moved them), with one stderr line for the move;
+    else the reason they are NOT, for the caller's fault text."""
     try:
         cur = p.stat()
         if (cur.st_ino, cur.st_mtime_ns, cur.st_size) != (st.st_ino, st.st_mtime_ns, st.st_size):
-            return "replaced meanwhile; the new bytes get their own read"
+            return _STATE_REPLACED
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         aside, n = p.with_name("%s.corrupt-%s" % (p.name, stamp)), 0
         while aside.exists():                            # a second corrupt file in the same second
@@ -2258,16 +2281,18 @@ def _state_quarantine(p, st, reason):
     return None
 
 
-def _read_state_json(path, st=None):
+def _read_state_json(path, st=None, _tries=3):
     """The ONE strict reader for a small JSON state file (session-flags, session-order, notify-cards;
     timeline-views follows in its own change). Distinguishes the outcomes the old `except Exception: {}` conflated:
       - a MISSING file is legitimately empty            -> returns None (a fresh install has no files)
       - an UNREADABLE existing file (EIO/EACCES/...)     -> raises _StateUnreadable (never reads empty)
       - TORN or non-JSON bytes                           -> QUARANTINED aside (_state_quarantine: a move,
         never a delete -- the evidence survives for forensics), then None, so the store starts empty
-        ONLY after the bad bytes are preserved; bytes that could not be moved aside, or a file
-        replaced between the stat and the rename, raise _StateUnreadable instead (the next read is
-        a fresh one).
+        ONLY after the bad bytes are preserved; bytes that could not be moved aside raise
+        _StateUnreadable instead; a file a peer's atomic publish REPLACED between the stat and the
+        rename is left alone and read afresh here, bounded by `_tries` (the maintainer's fold on
+        PR #1019), so the caller gets what is there now -- only a file that keeps changing under
+        every read ends _StateUnreadable.
     `st` is the stat the caller already took (the display readers key their cache on it); without
     one the reader stats first, so the quarantine can tell the file it read from one published
     since. Reads bytes (json.loads accepts them and auto-detects the encoding), so a non-UTF-8 torn
@@ -2293,6 +2318,8 @@ def _read_state_json(path, st=None):
         why = _state_quarantine(path, st, "invalid JSON: %s" % e)
         if why is None:
             return None                              # the bytes are preserved; the store starts empty
+        if why == _STATE_REPLACED and _tries > 1:    # a peer published since our stat: read what is there now
+            return _read_state_json(path, None, _tries=_tries - 1)
         raise _StateUnreadable(path, "invalid JSON; %s" % why)
 
 
@@ -2306,6 +2333,11 @@ _session_order_lkg = [None]
 # stderr line + one dashboard notice; a repeat of the SAME text files nothing; a clean read clears
 # the entry (the event, no timer) so a recovered-then-refaulted file speaks again.
 _state_fault_seen = {}
+# The WRITE faults' own table, same key (str(path)): a clean READ ends a read episode, not a write one --
+# the display readers clear _state_fault_seen on every clean read, and a gesture's refusal reads the store
+# to name the value it still paints, so a write fault filed there was cleared before the next click and
+# said again per click. Only a landed write (_write_state_json) clears an entry here.
+_state_write_fault_seen = {}
 
 
 def _note_state_fault(exc):
@@ -2315,13 +2347,21 @@ def _note_state_fault(exc):
     empty default) and no writer will persist it -- the mutation path reads the proved snapshot,
     which raises and refuses. Never raises itself. The sync-notice ring is the surface the views
     store's stale-writer guard already uses (the shell's bell files it under its sync label); a
-    dedicated kernel-fault surface is a follow-up."""
+    dedicated kernel-fault surface is a follow-up. A WRITE fault (_StateUnwritable, from
+    _write_state_json) files once per episode too, keyed on the same path but in its own table
+    (_state_write_fault_seen): only a landed write ends a write episode, where a clean read ends a
+    read one."""
     key = str(exc.path)
-    text = ("%s — showing the last-known value; changes to it are refused until the file can be "
-            "read again" % exc)
-    if _state_fault_seen.get(key) == text:
+    if isinstance(exc, _StateUnwritable):
+        table = _state_write_fault_seen
+        text = "%s — the change was not saved; changes to it are refused until the file can be written again" % exc
+    else:
+        table = _state_fault_seen
+        text = ("%s — showing the last-known value; changes to it are refused until the file can be "
+                "read again" % exc)
+    if table.get(key) == text:
         return
-    _state_fault_seen[key] = text
+    table[key] = text
     sys.stderr.write("romp-kernel: %s\n" % text)
     try:
         _sync_notice(text, ok=False)                 # the shell bell / feed sync-notice row (resolved at call time)
@@ -2336,7 +2376,8 @@ def _clear_state_fault(path):
 
 def _refuse_setting(client, exc, what, gesture, sid="", item_id="", flag="", value=None):
     """A dashboard gesture (a lane/tab flag, a card bell, a drag, a view change) that this kernel
-    REFUSED because the store it edits could not be read: one stderr line, and the refusal answered
+    REFUSED because the store it edits could not be read -- or, since the maintainer's fold on PR
+    #1019, WRITTEN (_StateUnwritable: the publish itself failed): one stderr line, and the refusal answered
     on the DELIVERING socket as a `settingRefused` frame -- the same targeted _reply idiom the
     settingStale stand-down and the saveFile acks use, never a broadcast. The frame names the
     `gesture` ("flag" / "bell" / "order"; "views" follows with its store, so a pane never infers it from which fields are
@@ -2403,6 +2444,25 @@ def _session_order_proved():
 
 _atomic_lock = threading.Lock()
 _atomic_seq = [0]
+
+
+def _write_state_json(path, text):
+    """The ONE write door for the small JSON state files (session-flags, session-order, notify-cards,
+    and the views store once its path folds in): _atomic_write, with the publish's OSError turned into
+    _StateUnwritable and the fault filed ONCE per episode on the path's registry (_note_state_fault, the
+    write faults' own table beside the read faults'); a landed write ends the episode. Left as an OSError, a publish that
+    failed under a WS gesture escaped the arm's `except _StateUnreadable` to the receive loop, which
+    re-raised it as a socket failure and dropped the client, and under an HTTP route reached do_POST's
+    catch-all as a 500 traceback (the maintainer's fold on PR #1019: the write step is a fault boundary
+    too). Defined here, beside _atomic_write, because _write_session_order below is its first caller."""
+    path = Path(path)
+    try:
+        _atomic_write(path, text)
+    except OSError as e:
+        exc = _StateUnwritable(path, "write failed: %s" % _errno_text(e))
+        _note_state_fault(exc)
+        raise exc from e
+    _state_write_fault_seen.pop(str(path), None)     # a landed write ends the write-fault episode
 
 
 def _atomic_write(path, text, mode=None):
@@ -2496,8 +2556,8 @@ def _write_session_order(order):
     # for the audit only: the DISPLAY read never raises (a fault serves the last-known order), so a
     # fault here cannot block the write -- the caller already read the store PROVED to build `order`
     _order_audit("persist", _session_order(), new)   # every mutation of the authoritative order, with its stack
-    _atomic_write(jd.STATE / "session-order.json", json.dumps(new))
-    _session_order_lkg[0] = new                      # what we just published IS the new known-good
+    _write_state_json(jd.STATE / "session-order.json", json.dumps(new))   # a failed publish raises _StateUnwritable:
+    _session_order_lkg[0] = new                      # what we just published IS the new known-good; nothing latched otherwise
 
 
 def _gc_session_order(known):
@@ -2514,7 +2574,10 @@ def _gc_session_order(known):
         return
     kept = [sid for sid in order if sid in known]
     if kept != order:
-        _write_session_order(kept)
+        try:
+            _write_session_order(kept)
+        except _StateUnwritable:
+            pass                                     # filed once per episode by the write door; the next pass retries
 
 
 def _merge_session_order(incoming):
@@ -2596,7 +2659,11 @@ def _ordered(sessions):
             else:
                 order.append(sid)                        # a genuinely new session appends, then is frozen
                 name_at.append(a)
-        _write_session_order(order)
+        try:
+            _write_session_order(order)
+        except _StateUnwritable:
+            pass                                         # this build still sorts by the in-memory order; the publish
+            #                                              is filed once per episode and the next pass retries it
     idx = {sid: i for i, sid in enumerate(order)}
     return sorted(sessions, key=lambda s: idx.get(s["sid"], len(idx)))   # stable sort: ties keep input order
 
@@ -3353,7 +3420,7 @@ def _set_session_flag(sid, flag, value):
         cur[sid] = f
     else:
         cur.pop(sid, None)
-    _atomic_write(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
+    _write_state_json(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
     if flag == "hideFromFeed" and value:
         # Muting takes the session OUT of task tracking → VIEW-CLEAR its current goals: seal them exactly like
         # crossing each card off the feed (cleared.jsonl + the durable node flag), NOT delete — they stay on
@@ -3461,7 +3528,7 @@ def _set_notify_all(value):
         cur[NOTIFY_ALL_KEY] = True
     else:
         cur.pop(NOTIFY_ALL_KEY, None)
-    _atomic_write(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
+    _write_state_json(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
 
 
 def _notify_turns_on():
@@ -3477,7 +3544,7 @@ def _set_notify_turns(value):
         cur[NOTIFY_TURNS_KEY] = True
     else:
         cur.pop(NOTIFY_TURNS_KEY, None)
-    _atomic_write(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
+    _write_state_json(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
 
 
 def _notify_session_effective(sid):
@@ -3515,7 +3582,7 @@ def _set_notify_card(item_id, value, sid=""):
         cur.pop(item_id, None)
     else:
         cur[item_id] = bool(value)
-    _atomic_write(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
+    _write_state_json(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
 
 
 def _set_notify_session(sid, value):
@@ -3538,7 +3605,7 @@ def _set_notify_session(sid, value):
         cur[sid] = f
     else:
         cur.pop(sid, None)
-    _atomic_write(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
+    _write_state_json(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
 
 
 def _prune_notify_cards(live_ids):
@@ -3555,7 +3622,10 @@ def _prune_notify_cards(live_ids):
     gone = [i for i in cur if i not in live_ids and i not in _NOTIFY_RESERVED]
     if gone:
         kept = {i: cur[i] for i in cur if i in live_ids or i in _NOTIFY_RESERVED}
-        _atomic_write(jd.STATE / "notify-cards.json", json.dumps(kept, sort_keys=True))
+        try:
+            _write_state_json(jd.STATE / "notify-cards.json", json.dumps(kept, sort_keys=True))
+        except _StateUnwritable:
+            pass                                     # filed once per episode by the write door; the next leaving card retries
 
 
 # ── Auto Nudge (the user 2026-06-19) ──────────────────────────────────────────────────────────────
@@ -33912,7 +33982,7 @@ sdk:"romp's SDK backend, the machinery that actually runs your sessions, hit an 
 sync:"romp moved commits between your machines by itself \u2014 a push to a remote, a pull from one, or an ask that a peer fast-forward itself. Successes are logged as well as failures, so this is the record of what romp did to your machines; the network panel shows a sync while it is still running",
 locate:"a click that should have jumped to a message in the chat couldn't find it. Usually the chat is missing part of its history; reload the pane if it keeps happening",
 cleared:"a /clear in a session dropped still-open cards at the boundary; Undo on the feed restores them",
-refused:"a change you made \u2014 a lane or tab setting, a card bell, a tag or view, a lane order \u2014 was not saved because romp could not read the file that holds it; nothing changed, the entry carries the reason, and the same change can be tried again",
+refused:"a change you made \u2014 a lane or tab setting, a card bell, a tag or view, a lane order \u2014 was not saved because the file that holds it could not be read or written; nothing changed, the entry carries the reason, and the same change can be tried again",
 undelivered:"something you sent never reached a session — the kernel it was addressed to has no session by that id, which on a board showing more than one machine means the pane addressed the wrong one. Nothing was delivered. Your text is kept verbatim in undelivered.jsonl under ~/.local/state/romp"};
 // the toggles ARE the chips (same pill, same colours) — lit = shown, dimmed = muted. Built once on a
 // STABLE container; only classes flip on click, so the buttons stay click-safe.
@@ -37649,9 +37719,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, "bad json", "text/plain")
                 try:
                     _set_notify_all(_on)
-                except _StateUnreadable as e:
-                    # the bells store could not be read: refuse in the route's OWN shape -- 200 with
-                    # ok:false -- never a 5xx. The shell's post() reads ok:false as the refusal it is
+                except (_StateUnreadable, _StateUnwritable) as e:
+                    # the bells store could not be read, or its publish failed: refuse in the route's OWN
+                    # shape -- 200 with ok:false -- never a 5xx (a failed publish used to reach do_POST's
+                    # catch-all as a 500 traceback). The shell's post() reads ok:false as the refusal it is
                     # (a non-2xx would reach it as raw JSON in an HTTP error), and the same body
                     # crosses a federation forward, which treats any non-200 as a tunnel hiccup.
                     return self._send(200, json.dumps({"ok": False, "retryable": True,
@@ -37669,9 +37740,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, "bad json", "text/plain")
                 try:
                     _set_notify_turns(_on)
-                except _StateUnreadable as e:
-                    # the bells store could not be read: refuse in the route's OWN shape -- 200 with
-                    # ok:false -- never a 5xx. The shell's post() reads ok:false as the refusal it is
+                except (_StateUnreadable, _StateUnwritable) as e:
+                    # the bells store could not be read, or its publish failed: refuse in the route's OWN
+                    # shape -- 200 with ok:false -- never a 5xx (a failed publish used to reach do_POST's
+                    # catch-all as a 500 traceback). The shell's post() reads ok:false as the refusal it is
                     # (a non-2xx would reach it as raw JSON in an HTTP error), and the same body
                     # crosses a federation forward, which treats any non-200 as a tunnel hiccup.
                     return self._send(200, json.dumps({"ok": False, "retryable": True,
@@ -38963,9 +39035,11 @@ class Handler(BaseHTTPRequestHandler):
                     _set_notify_session(str(msg["id"]), bool(msg.get("value")))
                 else:
                     _set_session_flag(str(msg["id"]), str(msg["flag"]), bool(msg.get("value")))
-            except _StateUnreadable as e:
-                # the flags store could not be read: refuse on the DELIVERING socket, addressed to the
-                # toggle (sid + flag) so the lane gear / tab menu ends its optimistic state and says why
+            except (_StateUnreadable, _StateUnwritable) as e:
+                # the flags store could not be read, or its publish failed: refuse on the DELIVERING socket,
+                # addressed to the toggle (sid + flag) so the lane gear / tab menu ends its optimistic state
+                # and says why. Left as an OSError, the failed publish reached the receive loop and DROPPED
+                # this client (the maintainer's fold on PR #1019)
                 _refuse_setting(client, e, "that setting", "flag", sid=msg["id"], flag=msg["flag"],
                                 value=_painted_flag_value(str(msg["id"]), str(msg["flag"])))
             else:
@@ -39024,9 +39098,9 @@ class Handler(BaseHTTPRequestHandler):
             # the master) and deleted when it merely restates it.
             try:
                 _set_notify_card(str(msg["itemId"]), bool(msg.get("value")), str(msg.get("sid") or ""))
-            except _StateUnreadable as e:
-                # the bells store could not be read: refuse on the DELIVERING socket, addressed to the
-                # card (itemId) so the feed drops that bell's optimistic latch and says why
+            except (_StateUnreadable, _StateUnwritable) as e:
+                # the bells store could not be read, or its publish failed: refuse on the DELIVERING socket,
+                # addressed to the card (itemId) so the feed drops that bell's optimistic latch and says why
                 _refuse_setting(client, e, "that bell", "bell", sid=msg.get("sid") or "", item_id=msg["itemId"],
                                 value=bool(_notify_card_effective(_notify_cards(), str(msg["itemId"]), str(msg.get("sid") or ""))))
             else:
@@ -39243,15 +39317,15 @@ class Handler(BaseHTTPRequestHandler):
             # persisted one (don't overwrite): a chat-tab drag must not drop/reshuffle timeline-only lanes.
             try:
                 _merged = _merge_session_order(msg["order"])
-            except _StateUnreadable as e:
-                # the order file could not be read; the drag must not splice against a fabricated []
-                # and persist discovery order over the user's saved order. Refused on the delivering
-                # socket. (No shipped pane posts this op today -- the strip and the lanes write the
-                # viewer's own arrangement -- so the frame has no latch to release; the contract holds
+                _write_session_order(_merged)            # the publish too: a failed one is refused, never a
+            except (_StateUnreadable, _StateUnwritable) as e:   # dropped socket (the fold on PR #1019)
+                # the order file could not be read, or its publish failed; the drag must not splice against
+                # a fabricated [] and persist discovery order over the user's saved order. Refused on the
+                # delivering socket. (No shipped pane posts this op today -- the strip and the lanes write
+                # the viewer's own arrangement -- so the frame has no latch to release; the contract holds
                 # for the op all the same.)
                 _refuse_setting(client, e, "the new order", "order")
             else:
-                _write_session_order(_merged)
                 # _mark_views_dirty, NOT _push_all: the feed/timeline order the grouped cards CLIENT-side by this
                 # list, but a plain push serves the CACHED feed — reused for REBUILD_MIN_S (2s) even though the sig
                 # changed — so the reordered cards lagged up to ~2s before the dirty mark. The dirty mark bypasses
