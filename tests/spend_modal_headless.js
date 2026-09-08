@@ -29,6 +29,7 @@ const { chromium } = require('playwright');
     hatched: document.querySelectorAll('#rsp-chart .rsp-seg[fill="url(#rsp-hatch)"]').length,
     backdrop: getComputedStyle(document.getElementById('rsp-back')).backgroundColor,
     windows: Array.from(document.querySelectorAll('#rsp-panel .ru-tip-fleetspend .ru-tip-row .ru-tip-k')).map((e) => e.textContent),
+    notes: Array.from(document.querySelectorAll('#rsp-panel .rsp-note')).map((e) => e.textContent),
     xlabels: Array.from(document.querySelectorAll('#rsp-chart .ru-tip-gx span')).map((e) => e.textContent).join(''),
     ylabels: Array.from(document.querySelectorAll('#rsp-chart .ru-tip-gy')).map((e) => e.textContent),
     railOpacity: getComputedStyle(document.getElementById('rail-usage')).opacity,
