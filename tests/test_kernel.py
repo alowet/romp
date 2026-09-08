@@ -5490,13 +5490,14 @@ class ViewBuilder(unittest.TestCase):
         # commands with output DEVNULL'd, so the picker's Revive silently did nothing (the user
         # 2026-07-05). Full coverage: tests/test_kernel_revive.py.
         import subprocess as _sp
-        calls, saved = [], km.subprocess.run
+        calls, saved, saved_tmux = [], km.subprocess.run, km._tmux_sessions
         km.subprocess.run = (lambda *a, **k:
                              calls.append(list(a[0])) or _sp.CompletedProcess(a[0], 0, "", ""))
+        km._tmux_sessions = lambda: {}   # the door's live snapshot (names reserved atomically) — not the tmux probe
         try:
             km._revive_session("deadsid000")
         finally:
-            km.subprocess.run = saved
+            km.subprocess.run, km._tmux_sessions = saved, saved_tmux
         self.assertTrue(calls, "revive must shell out to the resume path")
         argv = calls[0]
         self.assertTrue(str(argv[0]).endswith("/romp"),

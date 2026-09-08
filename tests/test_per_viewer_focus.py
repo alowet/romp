@@ -167,17 +167,18 @@ class CreateOpenReviveAreAimedToo(unittest.TestCase):
 
             def connect(self, sid):
                 pass
-        saved = (km._sdk, km._pick_identity_color, km._mark_views_dirty, km._push_session_now)
+        saved = (km._sdk, km._pick_identity_color, km._mark_views_dirty, km._push_session_now, km._tmux_sessions)
         km._sdk = lambda: _BE()
         km._pick_identity_color = lambda: ("#123456", "#ffffff")
         km._mark_views_dirty = lambda: None
         km._push_session_now = lambda sid: None
+        km._tmux_sessions = lambda: {}   # the create door's live snapshot (names reserved atomically) — never the box's tmux
         try:
             km._create_sdk_session("web", "/tmp")                     # the CLI's POST /new: no dashboard in hand
             self.assertEqual(self.sink, [], "a terminal/script create yanks no window's chat")
             km._create_sdk_session("api", "/tmp", client=self.win_a)  # the picker's create: the asker follows it
         finally:
-            (km._sdk, km._pick_identity_color, km._mark_views_dirty, km._push_session_now) = saved
+            (km._sdk, km._pick_identity_color, km._mark_views_dirty, km._push_session_now, km._tmux_sessions) = saved
         self.assertEqual([w for w, _ in self.sink], ["win-A"], "…and only the asker")
 
     def test_the_ops_that_make_or_wake_sessions_name_their_asker(self):

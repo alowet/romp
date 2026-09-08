@@ -145,7 +145,9 @@ class ForkSessionOp(unittest.TestCase):
         write_transcript(self.path)
         self.be = _FakeForkBackend()
         self.saved = (km.Sessions.backend_for, km._sdk_ready, km._sessions, km._pick_identity_color,
-                      km._reveal_chat_for, km._mark_views_dirty, km._push_session_now, km._seed_fork_stores)
+                      km._reveal_chat_for, km._mark_views_dirty, km._push_session_now, km._seed_fork_stores,
+                      km._tmux_sessions)
+        km._tmux_sessions = lambda: {}   # the fork door's live snapshot (names reserved atomically) — never the box's tmux
         km.Sessions.backend_for = lambda sid: self.be
         km._sdk_ready = lambda: True
         km._sessions = lambda now: [{"sid": PARENT, "path": self.path}]
@@ -168,7 +170,8 @@ class ForkSessionOp(unittest.TestCase):
         km._flags_cache.clear()
         self.vtd.cleanup()
         (km.Sessions.backend_for, km._sdk_ready, km._sessions, km._pick_identity_color,
-         km._reveal_chat_for, km._mark_views_dirty, km._push_session_now, km._seed_fork_stores) = self.saved
+         km._reveal_chat_for, km._mark_views_dirty, km._push_session_now, km._seed_fork_stores,
+         km._tmux_sessions) = self.saved
         for d in (jd.EPIDIR, jd.CAPDIR, jd.GOALDIR):
             for f in Path(d).glob("*"):
                 f.unlink()
