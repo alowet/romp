@@ -12807,7 +12807,10 @@ def _thread_events(tsid, cut_uuid, now, tmux):
     if cut_uuid:
         at = next((i for i, e in enumerate(evs)
                    if e.get("uuid") == cut_uuid or e.get("resultUuid") == cut_uuid), None)
-        evs = [] if at is None else evs[at + 1:]   # the cut isn't in this transcript — never the copy
+        if at is None:
+            evs = []                                 # the cut isn't in this transcript: never the copy
+        else:
+            evs = evs[at + 1:]                       # sliced to AFTER the branch point (the extension's source pin)
     else:
         floor = int((_comment_thread_row_created(tsid) or 0))
         evs = [e for e in evs if not e.get("ts") or int(em.parse_z(e.get("ts")) or 0) >= floor]
