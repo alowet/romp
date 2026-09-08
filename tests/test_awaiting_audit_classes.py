@@ -210,22 +210,46 @@ class LiftHorizon(_Base):
         self._reassert(s, t=self.T_EV)
         self.assertIsNotNone(s["nodes"][gid].get("awaitingWhy"), "equal evidence does not predate — stands")
 
-    def test_c_a_row_without_a_horizon_falls_back_to_its_evidence_time_never_its_filing(self):
-        # a pre-horizon lift row: ev_t (the anchor it retracted) is its horizon; the filing time is not
+    def test_c_a_row_without_a_horizon_keeps_the_arrival_compare_it_always_had(self):
+        # a lift row filed before horizons were journaled (no endEv): its arrival is its horizon, the
+        # compare this gate made before 2026-09-07, so the upgrade changes nothing for it (review find,
+        # 2026-09-08). Reading its ev_t instead (the anchor of the wait it retracted) disowned nothing:
+        # a stale re-assert inside (anchor, filing) was admitted, and the sweep re-lifted it next pass
         s, gid = self._stamped_then_lifted()                       # ev_t = T0+500, at = T_ARR, no endEv
         self._reassert(s, t=T0 + 700)                              # between the row's ev_t and its filing
-        self.assertIsNotNone(s["nodes"][gid].get("awaitingWhy"),
-                             "ev_t is the horizon of a row with no endEv — not its arrival")
-        # the accessor itself, in order: endEv, then ev_t, then at, then nothing
+        self.assertIsNone(s["nodes"][gid].get("awaitingWhy"),
+                          "no horizon → arrival is the horizon, as before: the re-assert yields")
+        self._reassert(s, t=self.T_ARR + 1)                        # evidence past the filing: new information
+        self.assertIsNotNone(s["nodes"][gid].get("awaitingWhy"), "…and one past the filing stands, as before")
+        # the accessor itself, in order: endEv, then at, then ev_t, then nothing
         self.assertEqual(jd._wait_end_ev({"endEv": 5, "ev_t": 7, "at": 9}), 5)
-        self.assertEqual(jd._wait_end_ev({"ev_t": 7, "at": 9}), 7)
-        self.assertEqual(jd._wait_end_ev({"at": 9}), 9)
+        self.assertEqual(jd._wait_end_ev({"ev_t": 7, "at": 9}), 9)
+        self.assertEqual(jd._wait_end_ev({"ev_t": 7}), 7)
         self.assertEqual(jd._wait_end_ev({}), 0)
 
+    def test_c2_the_horizon_keeps_its_fraction(self):
+        # a Monitor's recorded ceiling is t + timeout_ms/1000, fractional when timeout_ms is not a whole
+        # second. int()-truncated at the journal, the ceiling the lift cited was disowned: the sweep's
+        # inclusive stand-down measured 600.5 against 600 and re-lifted every pass (pinned through the
+        # sweep in test_kernel_awaiting_lift), and this gate admitted an assert from the ceiling's own
+        # second (review find, 2026-09-08; pre-fix: endEv 600 and the T_EV assert stands)
+        self._log([_msg(1, SID, PEER, T0 + 10, "question")])
+        s, gid = self._store()
+        self._close_peer(s)
+        nd = s["nodes"][gid]
+        nd["log"][-1]["at"] = T0 + 550                             # the closer's write, pinned (synthetic diary)
+        self.assertTrue(jd.record_verdict(s, nd, "romp", "awaiting", T0 + 500, lift=True, end_ev=self.T_EV + 0.5))
+        self.assertEqual(nd["log"][-1].get("endEv"), self.T_EV + 0.5, "journaled as given, never truncated")
+        self.assertIsNone(nd.get("awaitingWhy"), "fixture: the lift ended the wait")
+        self._reassert(s, t=self.T_EV)                             # the ceiling's own second: predates it
+        self.assertIsNone(nd.get("awaitingWhy"), "evidence at int(horizon) still predates a fractional horizon")
+        self._reassert(s, t=self.T_EV + 1)
+        self.assertIsNotNone(nd.get("awaitingWhy"), "the next second is past it: stands")
+
     def test_e_the_closers_own_lift_journals_the_audited_turns_end(self):
-        # the closer's lift ruled on the WHOLE turn, so its horizon is the turn's END (t_end, threaded
-        # from turn["end"] by _close_turn), not its trigger: a re-assert ruled from an anchor inside
-        # the audited span then yields (pre-fold: the fallback read ev_t = the trigger, so it stood)
+        # the closer's lift ruled on the WHOLE turn, so its horizon is the turn's last event (t_end,
+        # threaded by _close_turn, exercised in test_judge_close_standdown's CloserLiftHorizon), not its
+        # trigger: a re-assert ruled from an anchor inside the audited span then yields
         self._log([_msg(1, SID, PEER, T0 + 10, "question")])
         s, gid = self._store()
         self._close_peer(s)                                        # stamped at T0+500
@@ -236,8 +260,58 @@ class LiftHorizon(_Base):
                          "the closer's lift: anchored at the trigger, horizon at the turn's end")
         self._reassert(s, t=T0 + 800)                              # evidence inside the audited span
         self.assertIsNone(s["nodes"][gid].get("awaitingWhy"), "the lift ruled past this evidence — yields")
-        src = open(os.path.join(BIN, "romp-judge")).read()
-        self.assertIn('t_end=turn.get("end")', src, "_close_turn hands the turn's end to apply_close")
+
+    def test_e2_the_closers_done_journals_the_turns_end_and_the_gate_reads_it(self):
+        # done rows are endings for this gate too. The closer's done ruled on the whole audited turn, so
+        # it journals the horizon its lift does (t_end); with none, a row reads its arrival, later than
+        # the turn by the closer's own latency, and silenced an assert from a turn triggered in that gap
+        # (review find, 2026-09-08; pre-fix: no endEv on the done, and the T0+550 assert stood)
+        s, gid = self._store()
+        nd = s["nodes"][gid]
+        jd.apply_close(s, jd.open_menu(s), {"done": {1: "shipped the exporter"}, "block": {}, "awaiting": {}},
+                       t=T0 + 500, t_end=T0 + 600)
+        row = nd["log"][-1]
+        self.assertEqual((row.get("kind"), row.get("ev_t"), row.get("endEv")), ("done", T0 + 500, T0 + 600),
+                         "the closer's done: anchored at the trigger, horizon at the turn's end")
+        row["at"] = T0 + 900                                       # a late filing, pinned (synthetic diary)
+        jd.record_verdict(s, nd, "agent", "reopen", T0 + 650, why="the agent re-opened its own to-do")
+        self.assertFalse(nd.get("nodeComplete"), "fixture: reopened, so the closer may stamp it again")
+        self._reassert(s, t=T0 + 550)                              # inside the done's audited span
+        self.assertIsNone(nd.get("awaitingWhy"), "the done ruled past this evidence: yields")
+        self._reassert(s, t=T0 + 700)                              # past the turn, before the filing
+        self.assertEqual(nd.get("awaitingWhy"), "the rebuild is running again; holding",
+                         "evidence the done never ruled on stands: its arrival is not its horizon")
+
+    def test_e3_a_done_with_no_horizon_keeps_the_arrival_compare_it_always_had(self):
+        # a done from a writer that journals no horizon (the planner's, the user's, the link-back): its
+        # arrival is its horizon, exactly the compare the gate made before 2026-09-07, so the upgrade
+        # changes nothing for it (review find, 2026-09-08; pre-fix: ev_t was read, and the assert stood)
+        s, gid = self._store()
+        nd = s["nodes"][gid]
+        self.assertTrue(jd.record_verdict(s, nd, "planner", "done", T0 + 500, why="shipped"))
+        nd["log"][-1]["at"] = T0 + 900                             # filed late, pinned (synthetic diary)
+        jd.record_verdict(s, nd, "agent", "reopen", T0 + 650, why="the agent re-opened its own to-do")
+        self.assertFalse(nd.get("nodeComplete"), "fixture: reopened")
+        self._reassert(s, t=T0 + 700)                              # between the done's evidence and its filing
+        self.assertIsNone(nd.get("awaitingWhy"), "no horizon → arrival, as before: the re-assert yields")
+        self._reassert(s, t=T0 + 901)
+        self.assertIsNotNone(nd.get("awaitingWhy"), "…and one past the filing stands, as before")
+
+    def test_f_a_peer_stamps_write_is_the_moment_its_own_gate_read_the_log(self):
+        # why the peer supersede (kernel._peer_stamp_superseded) compares the reply to the stamp's WRITE
+        # time and not to the assert's evidence time (review 2026-09-08): the peer-kind write gate reads
+        # the postal log AT the write, so a reply that landed after the audited turn's trigger but before
+        # the write already stands the assert down: a standing peer stamp certifies no reply existed when
+        # it was written, and a reply is new information exactly when it postdates that read
+        self._log([_msg(1, SID, PEER, T0 + 10, "question"), _msg(2, PEER, SID, T0 + 700, "coordinate")])
+        s, gid = self._store()
+        self._close_peer(s)                                        # the audited turn's trigger, T0+500 < the reply
+        self.assertIsNone(s["nodes"][gid].get("awaitingWhy"),
+                          "the reply predates the write: the gate saw it, nothing is filed")
+        self._log([_msg(1, SID, PEER, T0 + 10, "question")])      # no reply yet when the closer writes
+        s, gid = self._store()
+        self._close_peer(s)
+        self.assertEqual(s["nodes"][gid].get("awaitingKind"), "peer", "an open ask at the write admits the stamp")
 
     def test_d_record_verdict_journals_the_horizon_exactly_when_given(self):
         s, gid = self._store()

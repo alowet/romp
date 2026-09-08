@@ -8913,14 +8913,23 @@ def _lift_spent_awaiting(now, tmux):
                     _kind, _anchor0 = nd.get("awaitingKind"), nd.get("awaitingAt") or 0
                     _empty = reg_ids is not None and not reg_ids and not snap.get("subagents") and not running
                     # `_ended` = the newest in-harness ending this lift cites — its EVIDENCE HORIZON
-                    # (record_verdict end_ev, 2026-09-07). 0 when the lift rests on no recorded ending
-                    # at all (an agents stamp over a transcript where nothing ever ran and no respawn
-                    # past the anchor): then NO horizon is journaled and the gates fall back to the
-                    # row's own anchor — a horizon nothing on record supports is worse than none.
+                    # (record_verdict end_ev, 2026-09-07). An agents lift resting on no recorded ending
+                    # at all (a stamp over a transcript where nothing ever ran, no respawn past the
+                    # anchor: the misread-peers-as-agents shape) rules "the authoritative registry shows
+                    # nothing running NOW and nothing ever ended", so the registry read's moment is what
+                    # it ruled through, the dead-man lift's own choice for the same shape of ruling
+                    # (_wake_goal), and journaled as read, never floored to the second: the gates compare
+                    # a horizon against raw evidence times, and int(now) disowned an assert triggered in
+                    # the read's own second. Journaling none instead (review find, 2026-09-08) left the gates
+                    # reading the row's anchor, which disowns nothing: a lagging closer's re-assert from a
+                    # segment triggered inside (anchor, lift) stood, the next pass re-lifted on the same
+                    # empty world, and every re-lift re-armed the nudge ladder: a permanent flap on no
+                    # new information, where main's arrival compare had suppressed the re-assert.
                     _ended, _lift = 0, False
                     if _empty and _kind == "agents" \
                             and (sp > _anchor0 or not any(t.get("status") == "running" for t in every)):
-                        _ended, _lift = _bg_ended_after(every, tombs, sp, _anchor0, now, kind=_kind), True
+                        _ended = _bg_ended_after(every, tombs, sp, _anchor0, now, kind=_kind) or now
+                        _lift = True
                     elif _empty and _kind in ("task", "job") and not _kernel_watch_armed(sid):
                         # endings are measured from the stamp's WRITE time (_stamp_written_at), not
                         # the audited turn's trigger: an item that returned mid-turn, before the
@@ -8929,7 +8938,7 @@ def _lift_spent_awaiting(now, tmux):
                         _ended = _bg_ended_after(every, tombs, sp, _stamp_written_at(nd), now, kind=_kind)
                         _lift = bool(_ended)
                     if _lift and jd.record_verdict(store, nd, "romp", "awaiting", _lift_ev_t(nd, now),
-                                                   lift=True, end_ev=_ended or None):
+                                                   lift=True, end_ev=_ended):
                         changed = True
                         _drop_auto_nudge_rec(top)
                     continue
@@ -8950,10 +8959,29 @@ def _lift_spent_awaiting(now, tmux):
                 # parking the card in Working with no reviver left (an idle experiment session,
                 # 2026-08-16).
                 _anchor = nd.get("awaitingAt") or 0
+
+                def _return_ev(t):
+                    # the evidence time of this dispatch's RETURN, the ONE conditioning both the "did
+                    # anything return after the anchor" test and the horizon this lift journals read
+                    # (review find, 2026-09-08: two hand-kept copies had drifted, and the older one still
+                    # counted an UNSPENT ceiling, so a dead watcher whose ceiling lay ahead lifted off a
+                    # horizon older than the anchor it retracted). A terminal record's endT; for a task
+                    # the pairing still shows running, the respawn that killed it (dead) or its recorded
+                    # ceiling once that has PASSED (expired); the launch as the floor (a launch past the
+                    # anchor returned past it). A ceiling that has not passed is never evidence: the
+                    # completion path leaves `deadline` in place, so a watcher that fired early carries a
+                    # FUTURE ceiling, and folding it unconditionally pushed the horizon past the clock;
+                    # a min() floor then journaled the tick time, arrival by another name.
+                    ev = max(t.get("endT") or 0, t.get("t") or 0)
+                    if t.get("status") == "running":
+                        if t.get("id") in dead:
+                            ev = max(ev, sp)
+                        if em._bg_expired(t, now):
+                            ev = max(ev, t.get("deadline") or 0)
+                    return ev
+
                 def _returned_after(t):
-                    return ((t.get("endT") or 0) > _anchor or (t.get("t") or 0) > _anchor
-                            or (t.get("status") == "running" and (t.get("deadline") or 0) > _anchor)
-                            or (t.get("id") in dead and sp > _anchor))
+                    return _return_ev(t) > _anchor
                 if not any(_returned_after(t) for t in own):
                     continue
                 # THE STAND-DOWN RULE, joined (the 2026-08-19 audit): a writer whose evidence
@@ -8977,24 +9005,7 @@ def _lift_spent_awaiting(now, tmux):
                 # T_ev and the filing was never citable and the stamp stayed on new information
                 # (2026-09-07). `<=`: a return AT the horizon is the very return that lift cited.
                 _horizon = max((jd._wait_end_ev(e) for e in _aw if e.get("lift")), default=0)
-
-                def _return_ev(t):
-                    # the evidence time of this dispatch's RETURN, conditioned exactly as _returned_after
-                    # conditions its evidence: a terminal record's endT; for a task the pairing still
-                    # shows running, the respawn that killed it (dead) or its recorded ceiling once that
-                    # has PASSED (expired); the launch as the floor (a launch past the anchor returned
-                    # past it). A ceiling that has not passed is never evidence: the completion path
-                    # leaves `deadline` in place, so a watcher that fired early carries a FUTURE ceiling,
-                    # and folding it unconditionally pushed the horizon past the clock — a min() floor
-                    # then journaled the tick time, arrival by another name (review find, 2026-09-08).
-                    ev = max(t.get("endT") or 0, t.get("t") or 0)
-                    if t.get("status") == "running":
-                        if t.get("id") in dead:
-                            ev = max(ev, sp)
-                        if em._bg_expired(t, now):
-                            ev = max(ev, t.get("deadline") or 0)
-                    return ev
-                _evidence = max((_return_ev(t) for t in own), default=0)
+                _evidence = max((_return_ev(t) for t in own), default=0)   # conditioned as _returned_after
                 if _last_lift and _last_assert > _last_lift and _evidence <= _horizon:
                     continue                          # every citable return was already ruled on by that
                     #                                   lift — re-lifting off it is the flap. A return
@@ -9472,9 +9483,11 @@ def _wake_goal(sid, gid, stamp, nudged, turns, store, now, lt, tmux, wake_only=F
         # this lift's ruling is "no ending event arrived through NOW", so the clock IS its evidence
         # horizon (record_verdict end_ev; review 2026-09-08): with none journaled the fallback read the
         # row's ev_t — the stamp's anchor — and a closer auditing a segment triggered anywhere inside
-        # (anchor, wake) re-asserted the wait across the whole dead-man window
+        # (anchor, wake) re-asserted the wait across the whole dead-man window. Journaled as read, never
+        # floored to the second (review find, 2026-09-08): a horizon compares against raw evidence times,
+        # and int(now) disowned an assert triggered in the wake's own second, which stood and was re-lifted
         if _sn is None or not jd.record_verdict(_fresh, _sn, "romp", "awaiting", at, lift=True,
-                                                end_ev=int(now)):
+                                                end_ev=now):
             return False
         jd.rollup_status(_fresh, False)
         jd.save_goals(sid, _fresh)
@@ -29790,7 +29803,18 @@ def _peer_stamp_superseded(nd, answered):
     stamps stand through mail; write-time keyed (the 2026-08-19 audit): a stamp filed after the
     reply survives — the closer's verdict is fresher than the answer it already saw. Returns the
     superseding reply's TIME (truthy) or 0 (2026-09-07): every reader keeps the predicate it had, and
-    the sweep's lift journals that time as the evidence horizon it ruled on (record_verdict end_ev)."""
+    the sweep's lift journals that time as the evidence horizon it ruled on (record_verdict end_ev).
+
+    The WRITE time, not the assert's evidence time (the audited turn's trigger), is the right side of
+    this compare, and deliberately so (review 2026-09-08, asked whether the lift-horizon rule reaches
+    here): a peer-kind stamp's own write gate (judge.apply_close → _open_ask_peers) reads the live
+    postal log AT the write, and files nothing when any named peer has already replied, so a peer
+    stamp standing certifies that no reply existed when it was written, and a reply is new information
+    exactly when it postdates that read. Keyed on the trigger instead, a reply the gate had already
+    weighed (it landed mid-turn, before the write) would read as superseding a stamp written in full
+    knowledge of it: the 2026-08-19 defect, back. The one residue is a KINDLESS stamp, which has no
+    peer gate and may be superseded by a reply from anyone: the known, tested legacy trade
+    (_goal_awaiting_stamp_full's kindless note), untouched here."""
     if nd.get("awaitingKind") not in (None, "peer"):
         return 0
     if isinstance(answered, tuple):
@@ -29802,7 +29826,7 @@ def _peer_stamp_superseded(nd, answered):
     ans = (max((per.get(pk, 0) for pk in peers), default=0) if (peers and per is not None) else any_t)
     if not ((nd.get("awaitingAt") or 0) and ans and _stamp_written_at(nd) < ans):
         return 0
-    return int(ans)
+    return ans                               # as recorded: a horizon is never truncated (record_verdict end_ev)
 
 
 # ───────────────────────── view-builder: goals → feed (parity: feed = ADAPT; minimal here) ─────────────────────────

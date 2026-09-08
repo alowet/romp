@@ -166,11 +166,14 @@ class DeadmanIgnoresTheToggle(_Base):
         # the dead-man's ruling is "no ending event arrived through NOW", so the clock is the horizon
         # it journals (record_verdict end_ev). A closer auditing a segment triggered anywhere inside
         # (anchor, wake) then stands down — with no horizon the fallback read the row's ev_t, the
-        # stamp's anchor, and that re-assert stood across the whole 6h window (pre-fold: it files)
+        # stamp's anchor, and that re-assert stood across the whole 6h window (pre-fold: it files).
+        # Journaled as read, fraction and all (review find, 2026-09-08): floored to the second, the
+        # horizon disowned an assert triggered in the wake's own second, which stood and was re-lifted
         self._toggle(False)
         self._seed(kind="job", age=7 * H)
-        self._tick()
-        self.assertEqual(self._lifts()[-1].get("endEv"), NOW, "the wake moment is what the lift ruled through")
+        self._tick(now=NOW + 0.5)
+        self.assertEqual(self._lifts()[-1].get("endEv"), NOW + 0.5,
+                         "the wake moment, as read, is what the lift ruled through")
         s = jd.load_goals(SID)
         jd.apply_close(s, jd.open_menu(s), {"done": {}, "block": {},
                                             "awaiting": {1: {"why": "still watching the rebuild", "kind": "job"}}},
