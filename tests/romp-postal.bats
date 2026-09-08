@@ -408,6 +408,7 @@ PY
 }
 
 @test "remote: on the host (no SSH) refuses and creates no marker" {
+    export ROMP_POSTAL_PEERS=0    # the command belongs to the LEGACY singleton scheme (peer mode refuses it outright, below)
     run "$POSTAL" remote
     [ "$status" -eq 0 ]
     [[ "$output" == *"looks like your Romp Postal Service host"* ]]
@@ -416,6 +417,7 @@ PY
 }
 
 @test "remote --force with the bus reachable configures the client and connects" {
+    export ROMP_POSTAL_PEERS=0    # legacy singleton scheme: the one place `romp mail remote` applies
     rm -f "$XDG_STATE_HOME/romp/postal/server.pid"   # model a tunnel: reachable port, no local bus
     export SSH_CONNECTION="1 2 3 4"
     run "$POSTAL" remote --force
@@ -423,6 +425,21 @@ PY
     [ -e "$HOME/.config/romp-postal/client-only" ]
     [[ "$output" == *"Already connected"* ]]
     [[ "$output" == *"alpha"* ]]
+}
+
+@test "remote: peer mode refuses, --force included, and leaves the bus and marker alone" {
+    # peer mode (the default) has no laptop bus to point at, and a local session's heartbeats end for good
+    # once its own bus confirms it local, so a hub's bus swapped in behind the port would never see this
+    # box's sessions: the command refuses before any side effect and says why (review find, 2026-09-08)
+    export SSH_CONNECTION="1 2 3 4"
+    run "$POSTAL" remote --force
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"peer mode"* ]]
+    [[ "$output" == *"Nothing was changed"* ]]
+    [[ "$output" != *"Stopped the local-only bus"* ]]
+    [ ! -e "$HOME/.config/romp-postal/client-only" ]
+    [ -e "$XDG_STATE_HOME/romp/postal/server.pid" ]
+    curl -sf "127.0.0.1:$ROMP_POSTAL_PORT/ping" >/dev/null   # the local bus is still up
 }
 
 @test "remote: nudge fires for an unconfigured remote, gone once configured" {

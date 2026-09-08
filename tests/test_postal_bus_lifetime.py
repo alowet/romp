@@ -173,6 +173,29 @@ class IdleGate(unittest.TestCase):
             idle, stop = pm._idle_tick(0, idle, answered=False)
         self.assertTrue(stop, "the last answered listing was empty: nothing to protect")
 
+    def test_the_hold_releases_only_through_an_answered_listing(self):
+        # the hold's one release is the next answered listing, which rewrites the twin: a kernel gone for
+        # good after listing sessions leaves the bus up for as long as nothing answers, a code-staleness
+        # re-exec re-primes the hold from the twin (a fresh process: empty memory, the twin still on disk),
+        # and the first answered listing (here: nobody left) is what lets the autostop resume
+        # (review find, 2026-09-08: the re-exec was described as ending the hold; it does not)
+        pm._kernel_up = lambda: False
+        pm._remember_presence([{"id": ALPHA, "name": "web"}])
+        idle = 0
+        for _ in range(pm.IDLE_GRACE * 3):
+            idle, stop = pm._idle_tick(0, idle, answered=False)
+            self.assertEqual((idle, stop), (0, False), "no number of unanswered polls ends the hold")
+        pm._LOCAL_PRESENCE_GOOD[0], pm._LOCAL_PRESENCE_GOOD[1] = [], False   # the re-exec: fresh memory, same twin
+        for _ in range(pm.IDLE_GRACE * 3):
+            idle, stop = pm._idle_tick(0, idle, answered=False)
+            self.assertEqual((idle, stop), (0, False), "the re-exec'd bus primes the hold back from the twin")
+        pm._remember_presence([])                    # the kernel returns, lists nobody, and is gone again
+        for _ in range(pm.IDLE_GRACE - 1):
+            idle, stop = pm._idle_tick(0, idle, answered=False)
+            self.assertFalse(stop)
+        idle, stop = pm._idle_tick(0, idle, answered=False)
+        self.assertTrue(stop, "with the twin rewritten empty the autostop resumes")
+
     def test_an_answered_empty_listing_advances_the_count(self):
         # reachable only through the ROMP_SESSIONS_FILE seam in practice (an answered listing implies
         # a live kernel, which resets the count first); pinned so the seam-driven bats autostop holds

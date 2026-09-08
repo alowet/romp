@@ -2063,9 +2063,15 @@ def _idle_tick(n, idle, answered=True):
     outage as presence; with those loops ended in peer mode the gate reads the bit itself. A bus
     that never saw an answered non-empty listing — a kernel-less `romp mail` bus, a box whose kernel
     stopped after its sessions had all gone — keeps the autostop: the count advances every poll and
-    stops at IDLE_GRACE. In production an answered listing implies a live kernel (both are the same
-    process), so `answered and n == 0` with the kernel down is reached only through the
-    ROMP_SESSIONS_FILE seam; the stop that matters is the unanswered one without evidence."""
+    stops at IDLE_GRACE. The kernel-less case holds only on a box whose twin holds no rows: a twin left
+    by an earlier kernel primes the hold in a bus spawned later the same way. The hold has ONE release,
+    the next answered listing (which rewrites the twin): a kernel gone for good after listing sessions
+    leaves the bus up until a manual stop or the returning kernel's first answer, and a code-staleness
+    re-exec does not end it (the fresh process re-primes the hold from the twin, which outlives the
+    re-exec by design) (review find, 2026-09-08; pinned by tests/test_postal_bus_lifetime.py). In
+    production an answered listing implies a live kernel (both are the same process), so `answered and
+    n == 0` with the kernel down is reached only through the ROMP_SESSIONS_FILE seam; the stop that
+    matters is the unanswered one without evidence."""
     if n > 0 or _kernel_up():
         return 0, False
     if not answered and _sessions_were_listed():
@@ -3390,7 +3396,9 @@ def looks_remote():
     return bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"))
 
 def _unreachable_hint():
-    if is_client_only() or looks_remote():
+    # the tunnel hint belongs to the legacy singleton scheme: in peer mode (the default) an SSH'd box runs
+    # its own bus and `romp mail remote` refuses, so pointing at it would be a dead end (review find, 2026-09-08)
+    if not peers_on() and (is_client_only() or looks_remote()):
         return "can't reach your laptop's Romp Postal Service bus — is the SSH tunnel up? run: romp mail remote"
     return "can't reach the Romp Postal Service bus (see ~/.local/state/romp/postal/server.log)"
 
@@ -3470,8 +3478,9 @@ def _heartbeat_once():
     verdict cannot go stale. It is never latched from an unanswered or false answer, and never in
     legacy singleton mode (ROMP_POSTAL_PEERS=0), where `romp mail remote` can replace the local bus
     with the hub's over an -R tunnel under a running session — the beats are then its only presence.
-    The peer-mode premise assumes `romp mail remote` is not run there: nothing in setup_remote refuses
-    it, but peer mode runs a bus per machine and _remote_nudge already treats the command as moot."""
+    The peer-mode premise, that `romp mail remote` never swaps the bus behind BASE there, is enforced:
+    setup_remote refuses in peer mode, --force included (review find, 2026-09-08: run after the latch
+    it silenced the session on the hub), as _remote_nudge already treated the command as moot."""
     sid, name = _self_identity()
     if not sid:
         return False
@@ -3496,7 +3505,16 @@ def _heartbeat_loop(interval=None, stop=None):
     replaces the local bus with the hub's over an -R tunnel while sessions run, and from then on these
     beats are the only presence the hub sees. A remote (client-only box) session never hears "local"
     from the hub's bus in either mode. `interval` and `stop` (a threading.Event) are test seams; the
-    defaults are the production cadence and no external stop."""
+    defaults are the production cadence and no external stop.
+
+    What the ended loop changes for a peer's send during a KERNEL BLINK (review find, 2026-09-08): a
+    local session's beat that landed while the listing was unanswered used to be filed as remote
+    presence (the bus could not call it local), so a send to its name during the blink resolved to that
+    row and delivered into its mailbox with no wake, and the mail sat there unannounced until the
+    kernel returned. With the loop ended and the per-call beat skipped no such row appears, and
+    resolve_recipient's standing blink refusal (503, retry shortly, never a death ruling) covers every
+    local peer alike: the mail stays with the sender, who is told so. Pinned by
+    tests/test_postal_heartbeat_fetches.py."""
     if interval is None:
         interval = max(15, HEARTBEAT_TTL // 3)
     while not (stop is not None and stop.is_set()):
@@ -3896,7 +3914,25 @@ def cli_drain(argv):
 def setup_remote(force=False):
     """Point THIS machine at the laptop's Romp Postal Service over an SSH reverse
     tunnel: configure the client side automatically, then guide + verify the one
-    manual step (the tunnel, which can only be opened from the laptop)."""
+    manual step (the tunnel, which can only be opened from the laptop). Legacy
+    singleton scheme only: peer mode refuses, --force included (see below)."""
+    if peers_on():
+        # Peer mode (the default since 2026-07-20) has no laptop bus to point at, and since the
+        # heartbeat latch (2026-09-06) the command would do harm here: a local session's MCP stops
+        # beating for good once its own bus confirms it local, so a hub's bus swapped in behind the
+        # port would never hear of this box's sessions, and the local bus this command stops is the
+        # one carrying their mail. Refuse before any side effect, --force included, and say why
+        # (review find, 2026-09-08: `romp mail remote --force` after the latch silenced the session
+        # on the hub). _remote_nudge already treats the command as moot in peer mode.
+        print("romp mail remote is off in peer mode (the default): every machine runs its own Romp")
+        print("Postal Service bus and cross-host mail rides the kernel's peer tunnels, so there is no")
+        print("laptop bus to point this machine at. Nothing was changed.")
+        print("")
+        print("--force does not override this: a session's heartbeats end for good once its own bus")
+        print("confirms it local, so a hub's bus swapped in behind the port would never see this box's")
+        print("sessions, and the local bus this command would stop is what carries their mail.")
+        print("This command belongs to the legacy singleton scheme (ROMP_POSTAL_PEERS=0).")
+        return 2
     if not force and not looks_remote():
         print("This looks like your Romp Postal Service host (no SSH session detected);")
         print("the bus runs here automatically, so there's nothing to set up.")
@@ -3950,7 +3986,7 @@ USAGE = """romp-postal-service — the Romp Postal Service
   romp mail working <text>          publish what you're working on (empty to clear)
   romp mail sent                    show your sent messages + whether each was read
   romp mail recall <to> [id]        unsend an unread message you sent to <to>
-  romp mail remote                  connect this (remote) machine to your laptop's bus
+  romp mail remote                  connect this (remote) machine to your laptop's bus (legacy scheme, ROMP_POSTAL_PEERS=0)
 (internal: serve | ensure | restart | mcp | drain --id <id> | wake --id <id> | picker-check --name <n> --id <id>)"""
 
 def main(argv):

@@ -159,7 +159,7 @@ romp mail agents                 # who is live, their branch and working-note
 romp mail working "<note>"       # publish what this session is working on
 romp mail sent                   # your sent messages, and whether each was read
 romp mail recall <to> [id]       # unsend a message the recipient has not read
-romp mail remote                 # connect this remote machine to your laptop's bus
+romp mail remote                 # legacy singleton scheme only (ROMP_POSTAL_PEERS=0): connect this remote machine to your laptop's bus; peer mode refuses
 ```
 
 ### Mail inside a session (MCP tools)
