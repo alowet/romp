@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """The env file's API key source against ROMP_EXPECTED_AUTH, checked once at kernel start.
 
-A `service.env` that selects a key source — an `ANTHROPIC_API_KEY=` line with a value, or a
-`ROMP_API_KEY_REF=` line — while `ROMP_EXPECTED_AUTH=login` is in force sends every session without
+A `service.env` that selects a key source — an `ANTHROPIC_API_KEY=` line with a value, a
+`ROMP_API_KEY_REF=` line, or a `ROMP_API_KEY_CMD=` line — while `ROMP_EXPECTED_AUTH=login` is in force sends every session without
 an explicit Billing pick to the key (effective_auth and default_auth answer "key" whenever a source is
 configured). Before this check the first sign was _note_auth_source's per-init line, after a launch had
 billed the wrong account. What these tests pin (sdk_backend._check_env_file_vs_declaration):
 
-  * =login over a key line, or over a reference line, is one problem-ring line naming the file and the
-    variable — never a value — said once per process (a re-constructed backend says nothing new);
+  * =login over a key line, a reference line, or a key-command line is one problem-ring line naming the
+    file and the variable (keysource.source_var) — never a value — said once per process (a
+    re-constructed backend says nothing new); over an INVALID source configuration (both provider
+    lines) the line says the file is invalid instead of naming a variable it does not select;
   * =key is never a contradiction: a key source in the file lands the sessions keyed, as declared;
   * undeclared is quiet, as is a declaration over a file that selects no source, whatever else the
     file carries (another service's token beside a reference is the documented shape);
@@ -41,6 +43,7 @@ ks = sb._keysrc
 
 KEY = "sk-ant-TEST-0000"
 REF = "op://test-vault/test-item/api-key"
+CMD = "/opt/test/fetch-api-key --profile test"
 
 
 class _Env(unittest.TestCase):
@@ -51,10 +54,12 @@ class _Env(unittest.TestCase):
         self.path = os.path.join(self.d, "service.env")
         self._before = {v: os.environ.get(v) for v in ("ROMP_SERVICE_ENV_FILE", "ROMP_SERVICE_ENV",
                                                        "ROMP_EXPECTED_AUTH", "ANTHROPIC_API_KEY",
-                                                       "ROMP_API_KEY_REF")}
+                                                       "ROMP_API_KEY_REF", "ROMP_API_KEY_CMD")}
         os.environ["ROMP_SERVICE_ENV_FILE"] = self.path
         os.environ["ROMP_SERVICE_ENV"] = self.path
-        for v in ("ROMP_EXPECTED_AUTH", "ANTHROPIC_API_KEY", "ROMP_API_KEY_REF"):
+        # every source variable, the key command included: a box that runs its manager on
+        # ROMP_API_KEY_CMD exports it to every shell, and the environment fallback would read it
+        for v in ("ROMP_EXPECTED_AUTH", "ANTHROPIC_API_KEY", "ROMP_API_KEY_REF", "ROMP_API_KEY_CMD"):
             os.environ.pop(v, None)
         self._checked = sb._ENV_FILE_AUTH_CHECKED
         sb._ENV_FILE_AUTH_CHECKED = False
@@ -142,6 +147,40 @@ class EnvFileVsDeclaration(_Backend):
         self.assertIn(ks.REF_VAR, lines[0])
         self.assertNotIn(ks.KEY_VAR, lines[0])
         self.assertFalse(any(REF in m for m in self.logged), "names, never values: the reference included")
+
+    def test_login_declared_over_a_key_command_line_names_the_command_variable(self):
+        # the recommended route (ROMP_API_KEY_CMD, the apiKeyHelper contract) is a source like any other:
+        # configured, so default_auth answers key, so it contradicts =login the same way
+        self.write_env("ROMP_PERF=1\n%s=%s\n" % (ks.CMD_VAR, CMD))
+        os.environ["ROMP_EXPECTED_AUTH"] = "login"
+        be = self.construct()
+        lines = self.flagged(be)
+        self.assertEqual(len(lines), 1, be.problems())
+        self.assertIn(ks.CMD_VAR, lines[0])
+        self.assertNotIn(ks.KEY_VAR, lines[0])
+        self.assertNotIn(ks.REF_VAR, lines[0])
+        self.assertFalse(any(CMD in m for m in self.logged), "names, never values: the command line included")
+        self.assertEqual(be.default_auth({}), "key")
+
+    def test_login_declared_over_an_invalid_source_says_the_file_is_invalid(self):
+        # both provider lines is kind "error": still configured (nothing falls back to the login), so
+        # the sessions will try the source and fail to launch. The line says that, and names no variable
+        # the file does not select.
+        self.write_env("%s=%s\n%s=%s\n" % (ks.CMD_VAR, CMD, ks.REF_VAR, REF))
+        os.environ["ROMP_EXPECTED_AUTH"] = "login"
+        said = []
+        log = lambda m, problem=None: said.append((str(m), problem))
+        self.assertEqual(sb._check_env_file_vs_declaration(log, self.state), "error")
+        self.assertEqual(len(said), 1)
+        text, problem = said[0]
+        self.assertTrue(problem)
+        self.assertIn("cannot be used", text)
+        self.assertIn(ks.BOTH_PROVIDERS_ERROR, text)
+        self.assertNotIn(" sets ", text, "an invalid file selects no variable to name")
+        self.assertNotIn(REF, text)
+        self.assertNotIn(CMD, text)
+        self.assertTrue(sb._ENV_FILE_AUTH_CHECKED, "said once: the one shot is spent")
+        self.assertEqual(sb._check_env_file_vs_declaration(log, self.state), "")
 
     def test_the_direct_call_returns_the_variable_it_named_and_files_a_problem(self):
         self.write_env("%s=%s\n" % (ks.REF_VAR, REF))

@@ -279,14 +279,20 @@ against your pick, never against stale doctrine.
 
 The declaration is also checked against `service.env` once, when the kernel
 starts. Under `ROMP_EXPECTED_AUTH=login`, a file that selects an API key
-source (an `ANTHROPIC_API_KEY=` line with a value, or a `ROMP_API_KEY_REF=`
-line) is a contradiction: that source is injected at launch for every session
-without an explicit Billing pick, so those sessions bill the key. One problem
-line in the Log panel says so before anything launches, naming the file and
-the variable but never a value; fix whichever side is wrong. Under `key`, a
-key source in the file agrees with the declaration and nothing is said. With
-no declaration, or once a Billing pick has made it inert, nothing is said
-either. The per-init check above still confirms each landing.
+source (a `ROMP_API_KEY_CMD=` line, a `ROMP_API_KEY_REF=` line, or an
+`ANTHROPIC_API_KEY=` line with a value) is a contradiction: that source is
+injected at launch for every session without an explicit Billing pick, so
+those sessions bill the key. One problem line in the Log panel says so before
+anything launches, naming the file and the variable but never a value; fix
+whichever side is wrong. A file whose source configuration is invalid (both
+provider lines, say) is still a selection, and the line says so instead: those
+sessions will try the source and fail to launch rather than bill the login.
+Under `key`, a key source in the file agrees with the declaration and nothing
+is said. With no key source selected, Romp injects nothing and Claude Code's
+own credential applies (see [API keys from a secret manager at
+runtime](#api-keys-from-a-secret-manager-at-runtime)), so nothing is said;
+nor with no declaration, nor once a Billing pick has made it inert. The
+per-init check above still confirms each landing.
 
 The usage rail reflects a mixed machine: the window bars (5 hours / 7 days /
 Fable 5) are drawn once, aggregated across every connected host's login as the

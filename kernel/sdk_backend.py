@@ -2118,21 +2118,26 @@ _ENV_FILE_AUTH_CHECKED = False   # the env-file-vs-declaration check (one line, 
 def _check_env_file_vs_declaration(log, state_dir, path: str | None = None) -> str:
     """Say ONCE per process, as a problem-ring line, when the env file selects an API key source while
     ROMP_EXPECTED_AUTH=login declares that the sessions bill the machine login. The two cannot both
-    hold: a source the file selects — an `ANTHROPIC_API_KEY=` line with a value, or a `ROMP_API_KEY_REF=`
-    line — is injected at launch for every session without an explicit Billing pick (effective_auth and
-    default_auth answer "key" whenever a source is configured), so those sessions bill the key. Without
-    this line the first sign is _note_auth_source's per-init mismatch, after a launch has already
-    billed the wrong account, and that line names the helper and the file without saying which line.
+    hold: a source the file selects — an `ANTHROPIC_API_KEY=` line with a value, a `ROMP_API_KEY_REF=`
+    line, or a `ROMP_API_KEY_CMD=` line — is injected at launch for every session without an explicit
+    Billing pick (effective_auth and default_auth answer "key" whenever a source is configured), so
+    those sessions bill the key. Without this line the first sign is _note_auth_source's per-init
+    mismatch, after a launch has already billed the wrong account, and that line names the helper and
+    the file without saying which line. A file whose source configuration is INVALID (both provider
+    lines; a garbled line) is still a selection — `configured` is True, so nothing falls back to the
+    login — and gets its own sentence: those sessions will try the source and fail to launch, not bill
+    the login. keysource's error strings are static by design, so quoting one names no value.
 
     Gated on _declared_auth, not _expected_auth: one explicit gear Billing pick makes the declaration
     inert everywhere else, and under a remembered login pick every spawn is seeded auth=login (spawn),
     so the sentence above would be false there. =key is never a contradiction: a key source in the
     file lands the sessions keyed, as declared (the reference shape docs/reference.md recommends
     included), so nothing is said. Undeclared, nothing is said either: a key line in service.env
-    with no declaration is the ordinary shape. The file is read through keysource, so the only names
-    this can ever say are its two (a token another service keeps in the file is never one of them),
-    and the line names the file and the variable, never a value. Returns the variable named ("" when
-    quiet) so the caller and the tests can see what it decided."""
+    with no declaration is the ordinary shape. The file is read through keysource and the variable is
+    named through keysource.source_var, so the only names this can ever say are its three (a token
+    another service keeps in the file is never one of them), and the line names the file and the
+    variable, never a value. Returns the variable named ("error" for an invalid file, "" when quiet)
+    so the caller and the tests can see what it decided."""
     global _ENV_FILE_AUTH_CHECKED
     if _ENV_FILE_AUTH_CHECKED:
         return ""
@@ -2141,10 +2146,16 @@ def _check_env_file_vs_declaration(log, state_dir, path: str | None = None) -> s
         return ""
     p = path or _keysrc.service_env_path()
     source = _keysrc.read_source(p)
-    if source.kind not in ("file", "op") or not source.configured:
-        return ""                    # no source selected (a missing file, an empty key line) or a file the
-    _ENV_FILE_AUTH_CHECKED = True    # launch itself will report as unreadable: nothing to weigh against the declaration
-    var = _keysrc.REF_VAR if source.kind == "op" else _keysrc.KEY_VAR
+    if not source.configured:
+        return ""                    # no source selected (a missing file, an empty key line): the sessions fall
+    _ENV_FILE_AUTH_CHECKED = True    # to Claude Code's own credential, and there is nothing to weigh against the declaration
+    if source.kind == "error":
+        log("auth: %s selects an API key source that cannot be used (%s) while ROMP_EXPECTED_AUTH=login. Every "
+            "session without an explicit Billing pick will try that source and fail to launch rather than bill "
+            "the machine login. Fix the file, or change the declaration to match what it should select."
+            % (p, source.error or "invalid API key source configuration"), problem=True)
+        return "error"
+    var = _keysrc.source_var(source.kind)
     log("auth: %s sets %s while ROMP_EXPECTED_AUTH=login. The declaration says the sessions bill the machine "
         "login, but the key source this file selects is injected at launch for every session without an "
         "explicit Billing pick, so they bill the key. Fix whichever side is wrong: remove the line, or change "
