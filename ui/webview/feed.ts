@@ -8,6 +8,7 @@
 // when the fleet streams new deliverables in.
 import { distillText, distillInputs, applyDistillLine, distillPending, distillStaleNote } from "./distiller-line";
 import { flipNeeded } from "./feed-flip";
+import { delegate } from "./actions";
 import { paintHeld, paintReleased } from "./paint-gate";
 import { linkifyPrRefs, setLinkedText, senderPrRepo, installPrLinkOpener } from "./pr-links";
 import { spinFor, waitedSuffix, awaitWord, groupRows, GROUP_TITLE, ROW_KIND_OF_LEGACY, type AwaitRow } from "./spin-caption";
@@ -3429,9 +3430,17 @@ function makeSessHead(): HTMLElement {
   // most. The count beside it is what keeps the folded row from dead-ending — you can see what is under it.
   const fold = el("button", "feed-sess-fold");
   const cnt = el("span", "feed-sess-foldn"); cnt.style.display = "none";
-  h.append(nm, fold, cnt, svc, svcList);
+  // CLEAR for the whole session (the user 2026-09-08): far right of the header row, the header's own size,
+  // as quiet as the caret — one word, the same "Clear" every card wears. One click clears every card this
+  // session has in the current view (every column, folded ones included), with the same optimistic Undo
+  // the group clear uses instead of a confirm dialog. The action is DELEGATED on the stable columns root
+  // (data-act, installed once where the root is built) — never bound to this header node, which grouped
+  // mode re-homes and re-renders; the header only says which session it stands for (data-fsid).
+  const clr = el("button", "feed-sess-clear"); clr.textContent = "Clear";
+  clr.title = "Clear every card for this session"; clr.dataset.act = "sess-clear"; clr.style.display = "none";
+  h.append(nm, fold, cnt, svc, clr, svcList);
   (h as any)._name = nm; (h as any)._fold = fold; (h as any)._foldn = cnt;
-  (h as any)._svc = svc; (h as any)._svcList = svcList;
+  (h as any)._svc = svc; (h as any)._svcList = svcList; (h as any)._clear = clr;
   return h;
 }
 function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
@@ -3459,6 +3468,13 @@ function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
     if (collapsedThreads.has(e.sid)) collapsedThreads.delete(e.sid); else collapsedThreads.add(e.sid);
     render();
   };
+  // the session-wide Clear: which session, and only while it has cards in the current view (a header
+  // exists only for a run, so this is a guard against a stale header, not a common state)
+  const sclr = (h as any)._clear as HTMLElement;
+  sclr.dataset.fsid = e.sid;
+  const ncards = sessionCards(e.sid).length;
+  sclr.style.display = ncards ? "" : "none";
+  sclr.setAttribute("aria-label", "clear every card for " + e.name);
   const svc = (h as any)._svc as HTMLElement, svcList = (h as any)._svcList as HTMLElement;
   const procs = e.live ? bgServicesMap[e.name] || [] : [];
   const open = procs.length > 0 && openBgSvc.has(e.sid);
@@ -4091,6 +4107,12 @@ function ensureCols(list: HTMLElement) {
   if (!document.getElementById("feed-cols")) {
     list.innerHTML = "";
     const cols = el("div", "feed-cols"); cols.id = "feed-cols";
+    // Header actions ride the STABLE columns root (the click-safety rule): the header nodes under it are
+    // re-homed and re-rendered on every push, and a native click needs mousedown and mouseup on one element.
+    // delegate() also flashes the pressed control (.romp-acted), the instant acknowledgement.
+    delegate(cols, {
+      "sess-clear": (b, ev) => { ev.stopPropagation(); const sid = b.dataset.fsid; if (sid) clearSessionCards(sid); },
+    });
     // "Working" (the user's rename, 2026-06-11): every card is an ASK; the left
     // column holds the ones being worked — internal keys keep the old names
     // each header is a filled state chip reproducing the chat status chips
@@ -4173,6 +4195,42 @@ function dressHeaderIfLast(card: HTMLElement, sid: string): void {
   }
   const key = head.dataset.key || "";
   startSessHeadExit(key, head);
+}
+
+// Every card a session has in the CURRENT view (the same filters render reads: scope, lens, `#only=`),
+// across every column, folded-under-the-header ones included — the set the header's Clear removes.
+function sessionCards(sid: string): AskItem[] {
+  return viewFiltered(asks).filter((a) => a.sid === sid);
+}
+// The session header's Clear (the user 2026-09-08): one click, every card of that session in the current
+// view, as ONE motion and ONE Undo batch. The same optimistic path the ask-group clear takes, applied to
+// every card and turn-group of the session in every column: flush each card's cross-surface hover
+// highlight, mark it .dismissing, start every column's header for this session on its exit at the same
+// moment (the one-motion rule), cache the whole batch on clearedStack so Undo restores the session in one
+// click, suppress the ids from incoming pushes (pendingCleared) and post askClear per card. Finalize after
+// the 180ms exit only what is STILL ours and still dismissing — a render inside the window that revived a
+// card (re-render resets its class) or replaced its element must not be yanked by a stale timeout.
+function clearSessionCards(sid: string): void {
+  const members = sessionCards(sid);
+  if (!members.length) return;
+  const ids = members.map((m) => m.itemId);
+  const turns = new Set(members.map((m) => m.turnId).filter(Boolean));
+  const leaving: [HTMLElement, () => boolean, () => void][] = [];
+  for (const m of members) {
+    const c = askEls.get(m.itemId);
+    if (c) leaving.push([c, () => askEls.get(m.itemId) === c, () => askEls.delete(m.itemId)]);
+  }
+  for (const [tid, g] of Array.from(groupEls)) {
+    if (turns.has(tid) && ((g as any)._g as AskGroup | undefined)?.sid === sid) leaving.push([g, () => groupEls.get(tid) === g, () => groupEls.delete(tid)]);
+  }
+  for (const [c] of leaving) { c.dispatchEvent(new MouseEvent("mouseleave")); c.classList.add("dismissing"); }
+  for (const [key, head] of Array.from(sessHeadEls)) if (head.getAttribute("data-fsid") === sid) startSessHeadExit(key, head);
+  clearedStack.push(members.slice());   // one batch: one Undo brings the whole session back
+  for (const m of members) { pendingCleared.add(m.itemId); vscodeApi?.postMessage({ type: "askClear", itemId: m.itemId, sid: m.sid }); }
+  setTimeout(() => {
+    for (const [c, stillOurs, forget] of leaving) if (stillOurs() && c.classList.contains("dismissing")) { c.remove(); forget(); }
+    dropDismissed(ids);
+  }, 180);
 }
 
 function reconcileCol(listEl: HTMLElement, entries: Entry[], globalDesired: Set<string>) {

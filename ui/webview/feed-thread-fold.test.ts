@@ -17,7 +17,7 @@ const CSS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "
 
 test("the caret sits to the RIGHT of the session name, where it was asked for", () => {
   assert.match(FEED, /const fold = el\("button", "feed-sess-fold"\);/);
-  assert.match(FEED, /h\.append\(nm, fold, cnt, svc, svcList\);/, "name, then caret — not a leading tree triangle");
+  assert.match(FEED, /h\.append\(nm, fold, cnt, svc, clr, svcList\);/, "name, then caret — not a leading tree triangle (the session-wide Clear sits after, at the far right; the user 2026-09-08)");
 });
 
 test("it is a caret, and it says which way it will go", () => {
