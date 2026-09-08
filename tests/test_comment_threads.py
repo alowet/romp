@@ -8,6 +8,8 @@ names/, skipped by live_sessions, skipped by discover), the opening message's fr
 the transcript→popover projection, the create/reply/resolve/promote ops, and promotion's seeding
 order. All fixtures SYNTHETIC: invented text, placeholder UUIDs.
 """
+import contextlib
+import errno
 import json
 import os
 import shutil
@@ -1107,6 +1109,29 @@ class FakeBackend:
         return True
 
 
+@contextlib.contextmanager
+def _views_reads_fault():
+    """Fail every byte read of the views store with an EIO for the duration of the block (its proved reader
+    reads bytes); everything else reads normally."""
+    real_rb, real_rt = Path.read_bytes, Path.read_text
+    tgt = str(jd.STATE / "timeline-views.json")
+
+    def rb(self, *a, **k):
+        if str(self) == tgt:
+            raise OSError(errno.EIO, "injected EIO")
+        return real_rb(self, *a, **k)
+
+    def rt(self, *a, **k):
+        if str(self) == tgt:
+            raise OSError(errno.EIO, "injected EIO")
+        return real_rt(self, *a, **k)
+    Path.read_bytes, Path.read_text = rb, rt
+    try:
+        yield
+    finally:
+        Path.read_bytes, Path.read_text = real_rb, real_rt
+
+
 class CommentOps(CommentBase):
     def setUp(self):
         super().setUp()
@@ -1398,6 +1423,36 @@ class CommentOps(CommentBase):
         self.assertEqual(self._tag_members("pool"), sorted([PARENT, tid]), "promoted = a tab now, in the parent's group")
         self.assertEqual(self._tag_members("other"), ["x"], "a tag the parent is not in is untouched")
         self.assertIn(tid, seen_at_connect[0], "membership landed before connect, ahead of the direct push")
+
+    def test_a_faulting_views_store_leaves_the_promotion_standing_and_says_it_did_not_inherit(self):
+        # the views store's proved read: a fault under the inherit RAISES (never an empty parent read off a
+        # fabricated store), and the promotion site's boundary keeps the spawn -- the thread is a session by
+        # then -- and says what did not happen: one refused-kind notice naming the child, nothing written
+        km._flags_cache.clear()
+        km._set_timeline_views({"active": "all", "tags": [{"id": "g1", "name": "pool", "members": [PARENT]}]})
+        km._flags_cache.clear()                      # a cold display cache: the fault must be met by the READ, not bypassed by a hit
+        _, tid = km._comment_create(PARENT, "a1", "exponential backoff", "Why?")
+        self._promotable(tid)
+        p = jd.STATE / "timeline-views.json"
+        before = p.read_bytes()
+        connected = []
+        real_connect = self.be.connect
+        self.be.connect = lambda sid: (connected.append(sid), real_connect(sid))[1]
+        notices, saved = [], km._sync_notice
+        km._sync_notice = lambda text, ok=True, kind="sync": notices.append((text, ok, kind))
+        try:
+            with _views_reads_fault():
+                self.assertIsNone(km._comment_promote(PARENT, tid, "sidework"), "the promotion stands")
+        finally:
+            km._sync_notice = saved
+        self.assertEqual(connected, [tid], "the promoted session was connected as ever")
+        self.assertEqual(p.read_bytes(), before, "nothing was written to the store")
+        rows = [(t, k) for t, ok, k in notices if not ok and "did not inherit" in t]
+        self.assertEqual(len(rows), 1, "one notice for the one thing that did not happen")
+        self.assertIn('"sidework" did not inherit the tags of', rows[0][0])
+        self.assertIn("the tag store could not be read (read failed: [Errno 5]", rows[0][0])
+        self.assertEqual(rows[0][1], "refused")
+        self.assertEqual(self._tag_members("pool"), [PARENT], "the parent keeps its tag; the thread is not in it")
 
     def test_a_session_spawned_from_inside_a_thread_inherits_the_threads_parents_tags(self):
         # a thread's CLI carries the THREAD's sid as ROMP_SID, so `romp new` run from its shell names

@@ -3046,8 +3046,8 @@ def _state_quarantine(p, st, reason):
 
 
 def _read_state_json(path, st=None, expect=None, _tries=3):
-    """The ONE strict reader for a small JSON state file (session-flags, session-order, notify-cards;
-    timeline-views follows in its own change). Distinguishes the outcomes the old `except Exception: {}` conflated:
+    """The ONE strict reader for a small JSON state file (session-flags, session-order, notify-cards,
+    timeline-views). Distinguishes the outcomes the old `except Exception: {}` conflated:
       - a MISSING file is legitimately empty            -> returns None (a fresh install has no files)
       - an UNREADABLE existing file (EIO/EACCES/...)     -> raises _StateUnreadable (never reads empty)
       - TORN or non-JSON bytes                           -> QUARANTINED aside (_state_quarantine: a move,
@@ -3166,7 +3166,8 @@ def _refuse_setting(client, exc, what, gesture, sid="", item_id="", flag="", val
     #1019, WRITTEN (_StateUnwritable: the publish itself failed): one stderr line, and the refusal answered
     on the DELIVERING socket as a `settingRefused` frame -- the same targeted _reply idiom the
     settingStale stand-down and the saveFile acks use, never a broadcast. The frame names the
-    `gesture` ("flag" / "bell" / "order"; "views" follows with its store, so a pane never infers it from which fields are
+    `gesture` ("flag" / "bell" / "order" -- the views store's doors answer on their own acks, _ack_views_write, and
+    never draw this frame -- so a pane never infers it from which fields are
     empty), the gesture's own address (sid / itemId / flag), and `value`: what the kernel's display
     path still paints for that flag or bell -- the value the next push carries -- so the pane
     repaints the refused toggle to it on THIS event rather than to a value it recorded at the click
@@ -3234,21 +3235,26 @@ _atomic_lock = threading.Lock()
 _atomic_seq = [0]
 
 
-def _write_state_json(path, text):
+def _write_state_json(path, text, note=True):
     """The ONE write door for the small JSON state files (session-flags, session-order, notify-cards,
-    and the views store once its path folds in): _atomic_write, with the publish's OSError turned into
+    timeline-views): _atomic_write, with the publish's OSError turned into
     _StateUnwritable and the fault filed ONCE per episode on the path's registry (_note_state_fault, the
     write faults' own table beside the read faults'); a landed write ends the episode. Left as an OSError, a publish that
     failed under a WS gesture escaped the arm's `except _StateUnreadable` to the receive loop, which
     re-raised it as a socket failure and dropped the client, and under an HTTP route reached do_POST's
     catch-all as a 500 traceback (the maintainer's fold on PR #1019: the write step is a fault boundary
-    too). Defined here, beside _atomic_write, because _write_session_order below is its first caller."""
+    too). Defined here, beside _atomic_write, because _write_session_order below is its first caller.
+    `note=False` raises the same _StateUnwritable but files NO notice and opens no write-fault episode:
+    for a write that is housekeeping rather than a gesture (the views reader's re-stamp on read), where
+    a failure is a log line the caller writes itself and the first GESTURE that fails is what the user
+    hears about (the views store's 2026-09-05 rule; the flags, order and bell stores never pass it)."""
     path = Path(path)
     try:
         _atomic_write(path, text)
     except OSError as e:
         exc = _StateUnwritable(path, "write failed: %s" % _errno_text(e))
-        _note_state_fault(exc)
+        if note:
+            _note_state_fault(exc)
         raise exc from e
     _state_write_fault_seen.pop(str(path), None)     # a landed write ends the write-fault episode
 
@@ -3396,6 +3402,16 @@ def _merge_session_order(incoming):
     return [s for s in merged if not (s in seen or seen.add(s))]
 
 
+# Forks whose views heal (_heal_timeline_views: a /clear or revive inherits its session's tag memberships)
+# could not run because the views store faulted -- new sid -> the sid whose memberships it inherits.
+# _ordered retries them on every later pass until the heal lands: the order publish that follows the
+# splice marks the fork KNOWN, so without this map a heal skipped over a transient EIO was never run
+# again and the /clear'd session fell out of its tag for good, with one stderr line as the whole record.
+# In-memory: a fork that is in the saved order when the kernel restarts is no longer new, so a heal
+# still pending across a restart is lost -- the stderr line the skip files says so.
+_views_heal_pending = {}
+
+
 def _ordered(sessions):
     """Order session dicts STRICTLY by the shared, persisted session order (session-order.json) — and by
     NOTHING else. A session already in the order keeps its saved slot; a session NEW to the order is
@@ -3437,6 +3453,16 @@ def _ordered(sessions):
     sess_name = {s["sid"]: (s.get("name") or "") for s in sessions}
     def _nm(sid):
         return sess_name.get(sid) or _name_of(sid) or ""
+    for fsid, osid in list(_views_heal_pending.items()):
+        # a heal deferred on an earlier pass (the views store faulted): retried until it lands. Quiet while
+        # the store still faults -- the skip said it once -- and one line when it lands.
+        try:
+            carried = _heal_timeline_views(osid, fsid)
+        except (_StateUnreadable, _StateUnwritable):
+            continue
+        _views_heal_pending.pop(fsid, None)
+        sys.stderr.write("romp-kernel: views heal for %s %s\n"
+                         % (fsid, "landed on retry" if carried else "retried: nothing to carry"))
     new = [s["sid"] for s in sessions if s["sid"] not in known]
     if new:
         name_at = [_nm(o) for o in order]                # each existing slot's stable name (resolved once)
@@ -3444,7 +3470,19 @@ def _ordered(sessions):
             a = _nm(sid)
             sib = [i for i, n in enumerate(name_at) if a and n == a]   # same-name entries already placed
             if sib:
-                _heal_timeline_views(order[sib[-1]], sid)   # the fork inherits hidden/tag state too
+                try:
+                    _heal_timeline_views(order[sib[-1]], sid)   # the fork inherits its tag state too
+                except (_StateUnreadable, _StateUnwritable) as e:
+                    # the views store faulted inside the heal (its PROVED read, or its publish): the slot
+                    # inheritance below still lands and the heal is deferred (_views_heal_pending), retried on
+                    # the next pass. Never a raise out of _ordered -- it runs inside every build (the push,
+                    # GET /feed.json, the WS clearAll arm) -- and never a fold: the heal read the display
+                    # reader before this change, which folded the fault to an empty store, so the heal
+                    # carried nothing and said nothing. Said once per fork, like the order publish below.
+                    if sid not in _views_heal_pending:
+                        sys.stderr.write("romp-kernel: views heal for %s skipped (%s) \u2014 deferred; the next pass "
+                                         "retries it (lost if the kernel restarts first)\n" % (sid, e))
+                    _views_heal_pending[sid] = order[sib[-1]]
                 order.insert(sib[-1] + 1, sid)           # a fork inherits its session's slot, not the END
                 name_at.insert(sib[-1] + 1, a)           # keep name_at aligned with order as we splice
             else:
@@ -3752,28 +3790,57 @@ def _views_lost_notice(note, members):
 
 
 def _timeline_views():
+    """The DISPLAY read of the views store, cached under the file's (mtime_ns, size) key. Never raises
+    into a build (build_feed / build_timeline / build_session run under _push's one outer try, so a
+    reader that raised would abort every client's push): a MISSING store is legitimately empty; a
+    store that EXISTS but cannot be read (a stat or read fault: EIO, EACCES) serves the last blob this
+    kernel served or wrote when the cache holds one, else the empty default -- UNPROVED either way,
+    NEVER CACHED, and loud once per episode (_note_state_fault). Until this change a fault was folded
+    to an empty store and CACHED under the file's real key, so after one EIO the store read as {} on
+    every call until the file's stat moved, and every read-modify-write door (which read here) then
+    persisted that emptiness plus its one edit over the user's whole tag set under an ok:true ack --
+    while every dashboard adopted the seq-less {} and its tag bar emptied with nothing said. Torn or
+    non-JSON bytes, or JSON of the wrong shape, are QUARANTINED aside by _read_state_json (a move,
+    never a delete; its own stderr line and dashboard notice) and the store then reads as empty: that
+    is the disk's state after a stated event, not a fold, and the cache entry is forgotten with it as
+    for a store read as missing. Writers never read here: they read _timeline_views_proved, which
+    raises, and refuse."""
     p = _views_path()
+    hit = _flags_cache.get(str(p))
     try:
         st = p.stat(); key = (st.st_mtime_ns, st.st_size)
-    except OSError:
+    except FileNotFoundError:
         # No store: nothing served before it describes this one. The cache entry is the last blob
         # this kernel served or wrote, and a file written outside the kernel after a delete or a
         # restore is judged against it (_views_restamp's third case) — forgetting it here is what
         # keeps a recreated store from being judged against a store that no longer exists. The seq
         # floor is kept (_VIEWS_SEQ_FLOOR): a recreated file is still ORDERED past what was served.
         _flags_cache.pop(str(p), None)
+        _clear_state_fault(p)
         return _norm_timeline_views({})
-    hit = _flags_cache.get(str(p))
+    except OSError as e:
+        # The store EXISTS but cannot be stat'ed (a state dir that cannot be searched): the last blob
+        # served, else the empty default -- unproved, uncached, the entry KEPT (the store is not gone);
+        # loud once per episode. Until this change this was the missing-store arm, so an EACCES forgot
+        # the entry and served {}.
+        _note_state_fault(_StateUnreadable(p, "stat failed: %s" % _errno_text(e)))
+        return hit[1] if hit is not None else _norm_timeline_views({})
     if hit is not None and hit[0] == key:
+        _clear_state_fault(p)
         return hit[1]
     try:
-        d = json.loads(p.read_text())
-        parsed = isinstance(d, dict)
-    except Exception:
-        d, parsed = {}, False
-    if not parsed:
-        d = {}
-    fix = _views_restamp(d, hit) if parsed else None
+        d = _read_state_json(p, st, expect=dict)
+    except _StateUnreadable as e:
+        _note_state_fault(e)
+        return hit[1] if hit is not None else _norm_timeline_views({})
+    _clear_state_fault(p)
+    if d is None:
+        # gone between the stat and the read, or quarantined aside just now: the store IS empty from
+        # here, and the entry is forgotten as for a missing store (a file that then appears is not
+        # judged against one that no longer exists)
+        _flags_cache.pop(str(p), None)
+        return _norm_timeline_views({})
+    fix = _views_restamp(d, hit)
     if fix is not None:
         # The file goes back through the write door BEFORE it is served (the cases in
         # _views_restamp), as ONE write: the setter is handed its diff base explicitly, because
@@ -3797,7 +3864,7 @@ def _timeline_views():
             try:
                 st2 = p.stat()
             except OSError:
-                return _norm_timeline_views({})
+                return _timeline_views()      # gone, or faulting, under the lock: the arms above say which
             if (st2.st_mtime_ns, st2.st_size) != key:
                 return _timeline_views()
             hit2 = _flags_cache.get(str(p))
@@ -3859,14 +3926,15 @@ def _timeline_views():
                                                              if m) or "no members")
                                     for g in raw)
             try:
-                _write_timeline_views(judged)
+                _write_timeline_views(judged, note=False)   # housekeeping: a failure is the log line below,
+                #                                              never a notice (the first GESTURE that fails is)
                 sys.stderr.write("romp-kernel: views store re-stamped on read: %s\n" % why)
                 if lost:
                     # the drop is permanent once the stamp is written
                     _views_lost_notice(_notice_list(
                         "%s %d tag%s dropped when it was re-stamped on read (%s)"
                         % (fact, len(lost), " was" if len(lost) == 1 else "s were", why), ": ", names), members)
-            except OSError as e:
+            except (_StateUnwritable, OSError) as e:
                 # The state dir is unwritable or full: a READ must still answer (every frame builds
                 # on it), so a blob is served and cached under the file's key — the next read is a
                 # hit, not another failing write — and the failure is logged once per distinct
@@ -3880,15 +3948,18 @@ def _timeline_views():
                 # past the floor that the file does not, which is the point: dashboards adopt it,
                 # and the next write that lands (a RMW built from this cache) persists it.
                 # the key is the error's kind, not its text: the atomic write's temp name differs
-                # per call, so the text would read as a new error every time
-                kind = "%s errno=%s" % (type(e).__name__, getattr(e, "errno", None))
+                # per call, so the text would read as a new error every time. The door raises
+                # _StateUnwritable around the publish's OSError now; the OSError underneath is what
+                # the kind and the line name, as before
+                oe = e.__cause__ if isinstance(e, _StateUnwritable) and isinstance(e.__cause__, OSError) else e
+                kind = "%s errno=%s" % (type(oe).__name__, getattr(oe, "errno", None))
                 if _VIEWS_RESTAMP_ERR[0] != kind:
                     _VIEWS_RESTAMP_ERR[0] = kind
                     sys.stderr.write("romp-kernel: views store could not be re-stamped on read (%s) — "
                                      "serving %s: %s: %s\n"
                                      % (why, "the judged blob, unwritten" if judge
                                         else "the file as read, under the cap, unstamped",
-                                        type(e).__name__, e))
+                                        type(oe).__name__, oe))
                 if lost:
                     # The file still holds the excess and the served blob does not, and the next
                     # write that lands (a RMW built from this cache) persists the served blob: the
@@ -3908,6 +3979,67 @@ def _timeline_views():
     d = _norm_timeline_views(d)
     _views_cache_put(p, key, d)
     return d
+
+
+def _timeline_views_proved():
+    """The MUTATION snapshot of the views store: a read fault RAISES (_StateUnreadable) instead of
+    folding to an empty store, so a read-modify-write writer (_edit_tag, _move_tag_member,
+    _heal_timeline_views, _inherit_tag_membership, and the judge's diff base) refuses rather than
+    publishing the emptiness back over the user's whole tag set, lenses and order under a success
+    ack. Only a missing store, or one just quarantined aside (_read_state_json moves torn bytes aside
+    BEFORE the store reads as empty), reads as empty; no last-known-good -- a writer acts on the real
+    store or not at all. Always a FRESH dict the caller may mutate.
+    The snapshot is what this kernel SERVES for the file state the read just proved: the display
+    cache's entry when its key is the file's current (mtime_ns, size) -- the file's own content, or
+    the JUDGED blob the reader served over an unwritable store, whose next write is meant to persist
+    it (the 2026-09-05 review) -- which is exactly what every RMW writer built on when it read the
+    display reader, now proved by a read rather than assumed from a key. Otherwise the file, with
+    what the reader's re-stamp would do to it replayed and not persisted -- the SAME snapshot the
+    display reader would serve for that file (_views_restamp, handed the same cache entry):
+    - the unjudged cases (the hidden->archived migration, the legacy per-tag mtimes) change the
+      CONTENT: the normalizer DROPS `hidden`, so a snapshot that skipped the migration would hand a
+      writer a blob without the legacy entries, and its write -- before the display reader's first
+      read after boot -- would lose every one of them;
+    - the JUDGED case -- a file written OUTSIDE the kernel (the timeline's Electron and Obsidian
+      branches write timeline-views.json themselves) whose seq fell behind the last served blob -- is
+      judged here against that blob exactly as the display reader judges it (the stale-writer guard,
+      `foreign`): a deleted tag the foreign copy still carries is not re-created, a member or a tag
+      added since is not lost, its refusals said by the judge. Replayed raw instead, in the window
+      before the pusher's next display read, every RMW door diffed its one edit against the foreign
+      copy (no refusal anywhere) and the judge stamped the result past everything served -- the stale
+      copy blessed on every dashboard (review find, 2026-09-08).
+    The writer's own write persists what the replay produced (the migrated tag, the judgment) through
+    the judge; a RMW that writes nothing leaves the file for the display reader's own re-stamp, whose
+    judge says the refusals once more. So the refusals can be said more than once for one outside
+    write: once per gesture that reads and then writes nothing while the stale copy stands, and once
+    more if the pusher's re-stamp lands between a gesture's read and its write -- notices only; the
+    content converges either way, and the persisted seq still orders past everything served."""
+    p = _views_path()
+    hit = _flags_cache.get(str(p))
+    try:
+        st = p.stat()
+    except FileNotFoundError:
+        return _norm_timeline_views({})
+    except OSError as e:
+        raise _StateUnreadable(p, "stat failed: %s" % _errno_text(e))
+    d = _read_state_json(p, st, expect=dict)
+    if d is None:
+        return _norm_timeline_views({})
+    if hit is not None and hit[0] == (st.st_mtime_ns, st.st_size):
+        return json.loads(json.dumps(hit[1]))
+    fix = _views_restamp(d, hit)
+    if fix is None:
+        return _norm_timeline_views(d)
+    why, d2, judge = fix
+    if not judge:
+        return _norm_timeline_views(d2)
+    try:
+        floor = int(hit[1].get("seq") or 0)
+    except (TypeError, ValueError):
+        floor = 0
+    judged, _rows = _judge_timeline_views(d2, base=hit[1], seq_floor=max(floor, _views_seq_floor(p)),
+                                          foreign="a stale write to the views file from outside the kernel")
+    return _norm_timeline_views(json.loads(json.dumps(judged)))
 
 
 def _views_stamp_legacy_tags(tags, d):
@@ -3963,6 +4095,8 @@ def _views_restamp(d, hit):
       file restored from an older copy would be served under its old seq and ignored by every
       dashboard holding a higher one. The seq floor outlives the entry (_VIEWS_SEQ_FLOOR), and the
       file is re-stamped past it, as written — ordered, not judged.
+    The proved reader (_timeline_views_proved) replays the unjudged cases on its snapshot without
+    persisting them, so a writer's blob carries what the file's re-stamp would have.
     Returns (why, dict-to-write, judge). The dict is a COPY: `d` is also the diff base the migration
     is stamped against, and mutating its tag dicts in place (an earlier aliasing bug) left the
     base already migrated — an existing "archived" tag gained its members with no fresh mtime, and
@@ -4025,19 +4159,29 @@ def _set_timeline_views(blob, base=None, seq_floor=0, edited=None, foreign=None)
     was written over by a blob judged against the pre-re-stamp store — the foreign write's lens
     change and its creates gone, under a seq no higher than the re-stamp's (both computed from the
     same base), with no refusal filed. The lock is re-entrant, and every caller holding _views_lock
-    takes it first, so the documented order stands."""
+    takes it first, so the documented order stands.
+    `base`: the store as the caller read it PROVED (_timeline_views_proved) -- every read-modify-write
+    door hands its own snapshot over, so the judge diffs against the very blob the caller edited and no
+    second read opens a fault window between the read and the write; with none (the WS whole-blob
+    door), the judge reads the store proved itself. A read fault RAISES _StateUnreadable and a failed
+    publish _StateUnwritable to the caller, which refuses the gesture; nothing is written either way."""
     with _views_file_lock:
         v, rows = _judge_timeline_views(blob, base=base, seq_floor=seq_floor, edited=edited, foreign=foreign)
         _write_timeline_views(v)
     return rows
 
 
-def _write_timeline_views(v):
+def _write_timeline_views(v, note=True):
     """Write a judged, stamped blob (from _judge_timeline_views) to the store and refresh the read
-    cache with it. Raises the OSError of an unwritable or full state dir to the caller."""
+    cache with it. Publishes through _write_state_json, the state files' one write door: an unwritable
+    or full state dir (ENOSPC, EROFS, EACCES) raises _StateUnwritable -- a plain Exception, filed once
+    per episode -- never the OSError, which do_POST answered as a 500 traceback (`romp tag` posts with
+    `curl -sf` and read that as an unreachable kernel) and the WS receive loop re-raises as a socket
+    failure should an arm let it through. `note=False` is the reader's re-stamp: housekeeping whose
+    failure is its own log line, not a notice."""
     text = json.dumps(v, sort_keys=True)
     with _views_file_lock:
-        _atomic_write(_views_path(), text)
+        _write_state_json(_views_path(), text, note=note)
         _views_cache_refresh(text)
     _VIEWS_RESTAMP_ERR[0] = None      # the store is writable again: a later failure logs afresh
 
@@ -4089,10 +4233,11 @@ def _judge_timeline_views(blob, base=None, seq_floor=0, edited=None, foreign=Non
     unread = _views_unread(blob, v["tags"])
     ed = set(x for x in edited if isinstance(x, str)) if isinstance(edited, list) else None
     if base is None:
-        try:
-            base = _timeline_views()
-        except Exception:
-            base = {}
+        # the PROVED store, never the display reader and never a fold: the guard's "previous truth"
+        # computed from a reader that folded a fault to {} refused nothing, and the write then landed
+        # the blob's tags -- or, on a lens write's empty `edited`, NO tags -- over the user's whole set
+        # under an ok:true ack. A fault here RAISES to the door, which refuses the write.
+        base = _timeline_views_proved()
     prev_blob = base
     prev = {t["id"]: t for t in (prev_blob.get("tags") or [])}
     now = int(time.time())
@@ -4727,14 +4872,19 @@ def _heal_timeline_views(old_sid, new_sid):
     """fsid churn (a /clear, relaunch or revive mints a new transcript fsid for the same logical
     session): carry the old sid's tag memberships to the new one, exactly like the order-slot
     inheritance that detects the churn. Without this a tagged session would silently fall out of
-    its tag on every /clear. (The hidden half retired with the set, 2026-08-24.)"""
+    its tag on every /clear. (The hidden half retired with the set, 2026-08-24.)
+    Reads the store PROVED, once: a fault RAISES (_StateUnreadable; a failed publish, _StateUnwritable)
+    to _ordered's boundary, which defers the heal and retries it, rather than carrying memberships off
+    a fabricated empty store; the snapshot is handed to the setter as its diff base, so no second read
+    opens a fault window inside a build. Returns True when memberships were carried, False when the old
+    sid held no tag (so _ordered's retry of a deferred heal can say which it was)."""
     def _has(t):
         return any(m["host"] == "" and m["sid"] == old_sid for m in t["members"])
     with _views_lock:   # RMW like _edit_tag: a write landing inside the read-to-write window is lost
-        v = _timeline_views()
-        if not any(_has(t) for t in v["tags"]):
-            return
-        v = json.loads(json.dumps(v))                    # deep copy: never mutate the cached blob
+        v0 = _timeline_views_proved()
+        if not any(_has(t) for t in v0["tags"]):
+            return False
+        v = json.loads(json.dumps(v0))                   # the working copy; v0 stays the pristine base
         # COPY, never move: stripping the old sid un-hid its DEAD lane, which lingers on the timeline for
         # hours — and when the old sid is still alive (a fork beside a living parent, or an unrelated new
         # session reusing a name), moving would steal the living session's state. A dead sid left in the
@@ -4742,7 +4892,8 @@ def _heal_timeline_views(old_sid, new_sid):
         for t in v["tags"]:
             if _has(t):
                 t["members"] = t["members"] + [{"host": "", "sid": new_sid}]   # normalizer dedups + re-sorts
-        _set_timeline_views(v)
+        _set_timeline_views(v, base=v0)
+    return True
 
 
 def _inherit_tag_membership(parent_sid, child_sid):
@@ -4754,22 +4905,26 @@ def _inherit_tag_membership(parent_sid, child_sid):
     where the parent is known instead of being detected later. COPY, never move — the parent keeps
     its tags. No-op when the parent holds none; idempotent (the normalizer dedups pairs). Local tags
     only in v1: a parent held only by a REMOTE-homed tag is not inherited here (its home kernel
-    would have to be asked — the accepted gap). Returns the inherited tag names."""
+    would have to be asked — the accepted gap). Returns the inherited tag names.
+    Reads the store PROVED: a fault RAISES (_StateUnreadable; a failed publish, _StateUnwritable) to
+    the caller -- the creation ack folds it into `tagError` (_tag_ack), the fork and thread-promotion
+    sites say what did not happen (_note_tags_not_inherited) -- rather than reading an empty parent
+    off a fabricated store and returning [] as if the parent held no tag."""
     parent_sid, child_sid = str(parent_sid or ""), str(child_sid or "")
     if not parent_sid or not child_sid or parent_sid == child_sid:
         return []
     with _views_lock:   # RMW like _edit_tag: two unlocked copies would both write the same pre-state
-        v = _timeline_views()
+        v0 = _timeline_views_proved()
         def _has(t):
             return any(m["host"] == "" and m["sid"] == parent_sid for m in t["members"])
-        names = [t["name"] for t in v["tags"] if _has(t)]
+        names = [t["name"] for t in v0["tags"] if _has(t)]
         if not names:
             return []
-        v = json.loads(json.dumps(v))                # deep copy: never mutate the cached blob
+        v = json.loads(json.dumps(v0))               # the working copy; v0 stays the pristine base
         for t in v["tags"]:
             if _has(t):
                 t["members"] = t["members"] + [{"host": "", "sid": child_sid}]
-        _set_timeline_views(v)
+        _set_timeline_views(v, base=v0)
     _mark_views_dirty()
     return names
 
@@ -4786,6 +4941,32 @@ def _b36(n):
 
 
 _TAG_GONE = "that tag no longer exists — it may have been deleted from another dashboard"
+
+
+def _views_fault_refusal(e):
+    """The refusal a gesture on the views store gets when the STORE itself faulted (_StateUnreadable /
+    _StateUnwritable out of a proved read or a publish) -- the tags dialog's tagEditAck, a lens write's
+    viewsAck, POST /tag's reply, the creation ack's `tagError`: the person's words, the fault's errno and
+    strerror, and what stands -- nothing changed, since a read that fails edits nothing and a publish
+    that fails never reached its replace. No file name: the once-per-episode notice names the file."""
+    return "the tag store could not be %s (%s); nothing was changed \u2014 retry" % (
+        "written" if isinstance(e, _StateUnwritable) else "read", e.fault)
+
+
+def _note_tags_not_inherited(parent_sid, child_name, e):
+    """A spawn (a fork, a promoted thread) whose parent's tag memberships could not be copied because the
+    views store faulted (_inherit_tag_membership raised): the session already exists, so the spawn stands
+    and what did NOT happen is said -- one stderr line, and one dashboard notice under the bell's `refused`
+    kind naming the child, since the store's own once-per-episode notice cannot say which session landed
+    outside its group. Tagging it again once the store reads puts it there."""
+    text = ('"%s" did not inherit the tags of "%s": the tag store could not be %s (%s) \u2014 tag it again once it can be'
+            % (child_name, _name_of(parent_sid) or parent_sid,
+               "written" if isinstance(e, _StateUnwritable) else "read", e.fault))
+    sys.stderr.write("romp-kernel: %s\n" % text)
+    try:
+        _sync_notice(text, ok=False, kind="refused")
+    except Exception:
+        pass
 
 
 def _default_tag_name(tags):
@@ -4824,7 +5005,12 @@ def _edit_tag(name=None, add=(), remove=(), color=None, delete=False, rename=Non
     # subsequent edit. A name that is empty after the strip is no name: a create takes the default.
     name = (str(name)[:_VIEWS_MAX_NAME].strip() or None) if name is not None else None
     with _views_lock:   # the server is threaded; two unlocked merges would both copy the same pre-state
-        v = json.loads(json.dumps(_timeline_views()))     # deep copy: never mutate the cached blob
+        v0 = _timeline_views_proved()   # PROVED: a read fault RAISES (_StateUnreadable; a failed publish
+        #                                below, _StateUnwritable) to the door, which refuses -- never an
+        #                                edit applied to a fabricated empty store and published over the
+        #                                user's real tags (a create landed a one-tag store; an edit by tid
+        #                                was refused as a deleted tag). v0 is the setter's diff base too.
+        v = json.loads(json.dumps(v0))                    # the working copy; v0 stays the pristine base
         if tid is not None:
             hits = [t for t in v["tags"] if t["id"] == tid]
             if not hits:
@@ -4841,7 +5027,7 @@ def _edit_tag(name=None, add=(), remove=(), color=None, delete=False, rename=Non
             if not hits:
                 return None, 'no tag named "%s"' % name
             v["tags"] = [t for t in v["tags"] if t["id"] != hits[0]["id"]]
-            _set_timeline_views(v)      # an active pointing at it falls back to "all" (the All view) in the normalizer
+            _set_timeline_views(v, base=v0)   # an active pointing at it falls back to "all" (the All view) in the normalizer
             return None, None
         if hits:
             t = hits[0]
@@ -4870,7 +5056,7 @@ def _edit_tag(name=None, add=(), remove=(), color=None, delete=False, rename=Non
         if color is not None:
             t["color"] = color
         v = _norm_timeline_views(v)
-        _set_timeline_views(v)
+        _set_timeline_views(v, base=v0)
         out = json.loads(json.dumps(next(t2 for t2 in v["tags"] if t2["id"] == t["id"])))
         out["members"] = [_member_str(m) for m in out["members"]]   # the route's reply speaks strings
         return out, None
@@ -4884,7 +5070,8 @@ def _move_tag_member(tid_from, tid_to, sids):
     viewer-relative id strings every client posts (_member_pair canonicalizes). Returns
     (tag-or-None, error-or-None) like _edit_tag; the tag is the destination's post-write row."""
     with _views_lock:
-        v = json.loads(json.dumps(_timeline_views()))     # deep copy: never mutate the cached blob
+        v0 = _timeline_views_proved()                     # PROVED, like _edit_tag: a fault raises to the door
+        v = json.loads(json.dumps(v0))                    # the working copy; v0 stays the pristine base
         by_id = {t["id"]: t for t in v["tags"]}
         src, dst = by_id.get(tid_from), by_id.get(tid_to)
         if src is None:
@@ -4897,7 +5084,7 @@ def _move_tag_member(tid_from, tid_to, sids):
         have = {(m["host"], m["sid"]) for m in dst["members"]}
         dst["members"] = list(dst["members"]) + [m for m in pairs if (m["host"], m["sid"]) not in have]
         v = _norm_timeline_views(v)
-        _set_timeline_views(v)
+        _set_timeline_views(v, base=v0)
         out = json.loads(json.dumps(next(t for t in v["tags"] if t["id"] == tid_to)))
         out["members"] = [_member_str(m) for m in out["members"]]
         return out, None
@@ -5115,15 +5302,30 @@ def _tag_ack(sid, parent_sid="", tags=()):
                       matches by position and says "applied as <name>" instead
       tagError      — the first refused tag edit's reason, when any
     The session exists by the time a tag edit can refuse (a same-named twin, the tag cap), so the
-    refusal rides beside the ack rather than undoing the spawn; the caller surfaces it."""
+    refusal rides beside the ack rather than undoing the spawn; the caller surfaces it. A views STORE
+    fault (the proved read raised; the publish failed) is a refusal of the same standing: nothing was
+    inherited or joined, every requested tag reads as not applied, and `tagError` carries the fault in
+    the person's words (_views_fault_refusal) -- before this change the inherit read an empty parent
+    off a fabricated store and the join created the tag anew, erasing the rest, under a clean ack."""
     sid = str(sid)
     tags = [str(t) for t in (tags or ())]
     err = None
     applied = []
     if parent_sid:
-        _inherit_tag_membership(parent_sid, sid)
+        try:
+            _inherit_tag_membership(parent_sid, sid)
+        except (_StateUnreadable, _StateUnwritable) as e:
+            sys.stderr.write("romp-kernel: %s did not inherit the tags of %s: %s\n" % (sid, parent_sid, e))
+            err = _views_fault_refusal(e)
     for name in tags:
-        row, e = _edit_tag(name.strip(), add=[sid])
+        try:
+            row, e = _edit_tag(name.strip(), add=[sid])
+        except (_StateUnreadable, _StateUnwritable) as ex:
+            # the same store for every name left: none joined, said once, positionally
+            sys.stderr.write("romp-kernel: %s joined no tag: %s\n" % (sid, ex))
+            applied.extend([None] * (len(tags) - len(applied)))
+            err = err or _views_fault_refusal(ex)
+            break
         applied.append(row["name"] if row else None)
         if e and not err:
             err = e
@@ -11907,7 +12109,10 @@ def _fork_session_inner(parent_sid, cut_msg_uuid, new_name, now=None, client=Non
     # the fork inherits the parent's TAGS too (tab groups on tags, the user 2026-09-04) — the same
     # "that conversation, continued elsewhere" contract be.fork applies to mode/effort/model/env —
     # before the direct push below, so the first frame already sections the new tab under its group
-    _inherit_tag_membership(parent_sid, sid)
+    try:
+        _inherit_tag_membership(parent_sid, sid)
+    except (_StateUnreadable, _StateUnwritable) as e:
+        _note_tags_not_inherited(parent_sid, nm, e)   # the fork stands; its group membership did not follow
     be.connect(sid)          # eager-connect: the CLI copies the conversation and the tab fills in
     if client is not None:   # the asker's window follows its fork; nobody else's chat moves
         _reveal_chat_for(client, {"type": "focus", "id": sid})
@@ -13167,7 +13372,10 @@ def _comment_promote_inner(parent_sid, tid, new_name, now=None, client=None):
     # the thread becomes a TAB now, so it inherits the parent's tags here (tab groups on tags, the
     # user 2026-09-04) — never at _comment_create, where it has no tab and a tagged hidden sid would
     # only inflate the member lists
-    _inherit_tag_membership(parent_sid, tsid)
+    try:
+        _inherit_tag_membership(parent_sid, tsid)
+    except (_StateUnreadable, _StateUnwritable) as e:
+        _note_tags_not_inherited(parent_sid, nm, e)   # the promotion stands; its group membership did not follow
     started = be.connect(tsid)
     if client is not None:   # the promoter's window follows the new session; nobody else's chat moves
         _reveal_chat_for(client, {"type": "focus", "id": tsid})
@@ -45029,10 +45237,22 @@ class Handler(BaseHTTPRequestHandler):
                         ", ".join('"%s"' % x for x in unknown)}), "application/json")
                 color = b.get("color")
                 rn = b.get("rename")
-                t, err = _edit_tag(name, add=ids["add"], remove=ids["remove"],
-                                   color=(str(color) if isinstance(color, str) else None),
-                                   delete=dele,
-                                   rename=(str(rn) if isinstance(rn, str) else None))
+                try:
+                    t, err = _edit_tag(name, add=ids["add"], remove=ids["remove"],
+                                       color=(str(color) if isinstance(color, str) else None),
+                                       delete=dele,
+                                       rename=(str(rn) if isinstance(rn, str) else None))
+                except (_StateUnreadable, _StateUnwritable) as e:
+                    # the views store could not be read, or its publish failed: the route's OWN refusal
+                    # shape -- 200, ok:false, retryable -- never a 5xx. `romp tag` posts with `curl -sf`,
+                    # which turns any 5xx into "kernel not reachable" (the wrong reason; until this change
+                    # a full disk drew exactly that, the OSError reaching do_POST's catch-all as a 500
+                    # traceback), and a federation forward treats every non-200 as a tunnel hiccup; both
+                    # read this body as the refusal it is. Nothing was written: a read that fails edits
+                    # nothing, a publish that fails never reached its replace.
+                    sys.stderr.write("romp-kernel: POST /tag refused: %s\n" % e)
+                    return self._send(200, json.dumps({"ok": False, "retryable": True,
+                                                       "error": _views_fault_refusal(e)}), "application/json")
                 if err:
                     return self._send(200, json.dumps({"ok": False, "error": err}), "application/json")
                 _mark_views_dirty()
@@ -45639,6 +45859,13 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     ok = not refused
                 err = None
+            except (_StateUnreadable, _StateUnwritable) as e:
+                # the views store could not be read (the judge's PROVED base raised -- until this change it
+                # folded the fault to {} and a lens write's empty `edited` then wrote `tags: []` over the
+                # user's whole set, acked ok) or its publish failed: refused on the poster's socket in the
+                # person's words, no traceback; the store is as it was
+                sys.stderr.write("romp-kernel: setTimelineViews refused: %s\n" % e)
+                refused, ok, err = [], False, _views_fault_refusal(e)
             except Exception as e:
                 sys.stderr.write("setTimelineViews: %s\n" % traceback.format_exc())
                 refused, ok, err = [], False, "the write failed on the kernel: %s" % (str(e) or type(e).__name__)
@@ -45657,6 +45884,12 @@ class Handler(BaseHTTPRequestHandler):
             # the recv loop's log: an unanswered write would pin the poster's optimistic copy.
             try:
                 ok, err, info = _apply_tag_edit(msg.get("edit"))
+            except (_StateUnreadable, _StateUnwritable) as e:
+                # the store faulted under the edit (a create until this change landed a one-tag store over
+                # the user's whole set, acked ok; an edit by tid was refused as a deleted tag): the fault,
+                # in the person's words, on the poster's socket; nothing was written
+                sys.stderr.write("romp-kernel: tagEdit refused: %s\n" % e)
+                ok, err, info = False, _views_fault_refusal(e), None
             except Exception as e:
                 sys.stderr.write("tagEdit: %s\n" % traceback.format_exc())
                 ok, err, info = False, "the edit failed on the kernel: %s" % (str(e) or type(e).__name__), None

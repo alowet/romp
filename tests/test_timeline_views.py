@@ -786,7 +786,7 @@ class TagInheritance(unittest.TestCase):
         km._atomic_write(km._views_path(), json.dumps(served))
         km._flags_cache.clear()
         entered, release = threading.Event(), threading.Event()
-        real_read = km._timeline_views
+        real_read = km._timeline_views_proved   # the RMW doors' seam (a proved read)
         inheriting = []
         def stalled_read():
             v = real_read()
@@ -794,7 +794,7 @@ class TagInheritance(unittest.TestCase):
                 entered.set()             # parked INSIDE the locked window: after the read, before the write
                 release.wait(5)
             return v
-        km._timeline_views = stalled_read
+        km._timeline_views_proved = stalled_read
         got = []
         def inherit():
             inheriting.append(threading.current_thread())
@@ -816,7 +816,7 @@ class TagInheritance(unittest.TestCase):
             release.set()
             t1.join(5)
             t2.join(5)
-            km._timeline_views = real_read
+            km._timeline_views_proved = real_read
         self.assertEqual(got, [["pool"]])
         self.assertIn(self.C, self._members("pool"), "the inherit's write landed; the dashboard's stale copy could not strip it")
 
@@ -835,7 +835,7 @@ class TagInheritance(unittest.TestCase):
         km._atomic_write(km._views_path(), json.dumps(served))
         km._flags_cache.clear()
         entered, release = threading.Event(), threading.Event()
-        real_read = km._timeline_views
+        real_read = km._timeline_views_proved   # the RMW doors' seam (a proved read)
         healing = []
         def stalled_read():
             v = real_read()
@@ -843,7 +843,7 @@ class TagInheritance(unittest.TestCase):
                 entered.set()             # parked INSIDE the heal's window: after its read, before its write
                 release.wait(5)
             return v
-        km._timeline_views = stalled_read
+        km._timeline_views_proved = stalled_read
         def heal():
             healing.append(threading.current_thread())
             km._heal_timeline_views("old", "new")
@@ -861,7 +861,7 @@ class TagInheritance(unittest.TestCase):
             release.set()
             t1.join(5)
             t2.join(5)
-            km._timeline_views = real_read
+            km._timeline_views_proved = real_read
         self.assertEqual(sorted(self._members("pool")), ["new", "old", "other"], "both writers landed whole, in turn")
         self.assertEqual(len(edited), 1)
         self.assertIsNone(edited[0][1], "the edit was not refused")
