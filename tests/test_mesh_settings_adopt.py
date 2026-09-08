@@ -302,15 +302,159 @@ class TheEmitterIsOneSnapshotPerStore(unittest.TestCase):
         self.assertEqual(set(stamps), {"auto-nudge", "compact-suggest", "file-editing"})
 
 
+class _Mesh:
+    """Two kernels and a stubbed tunnel: A's pushes to B land in B's /mesh-settings applier under B's state root
+    (the peer's gesture route, gt-gated like every setting). `refuse` makes B an older kernel with no such route."""
+
+    def __init__(self, a, b, refuse=False):
+        self.a, self.b, self.refuse, self.calls = a, b, refuse, []
+        self._saved = km._remote_kernel_call
+
+        def call(r, method, path, payload=None, timeout=8):
+            self.calls.append((r.get("host"), method, path, payload))
+            if self.refuse:
+                return 404, {}, None
+            with self.b:
+                return 200, km._apply_mesh_settings(payload if isinstance(payload, dict) else {}), None
+        km._remote_kernel_call = call
+
+    def close(self):
+        km._remote_kernel_call = self._saved
+
+    def row(self, trust="directed"):
+        return {"host": "TESTHOST", "local_port": 51000, "token": "tok", "trust": trust, "status": "up"}
+
+    def converge(self, trust="directed"):
+        """A's supervisor step against B's /version — synchronously, so the test reads the outcome."""
+        with self.a:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                out = km._converge_peer_settings(self.row(trust), self.b.version(), sync=True)
+            return out, err.getvalue()
+
+
+class OneDirectionalAttach(unittest.TestCase):
+    """The default topology polls ONE way: the hub polls the machine it attached; that machine has no row for
+    the hub until Share my sessions is on. Convergence therefore also PUSHES: a peer whose stamp is OLDER than
+    ours receives our (value, stamp) through its gesture route, so latest-wins holds in both directions (the
+    manager's review of the merged convergence, 2026-09-08)."""
+
+    def setUp(self):
+        self.a, self.b = _Kernel(), _Kernel()
+        self.m = _Mesh(self.a, self.b)
+
+    def tearDown(self):
+        self.m.close(); self.a.close(); self.b.close()
+
+    def test_the_hubs_newer_pick_reaches_a_peer_that_never_polls_it_within_one_pass(self):
+        # the user's incident: the hub clicked compactSuggest OFF, then attached a machine whose copy was ON
+        # under an older stamp; the hub polled, saw an older stamp, adopted nothing; the machine never polled back
+        self.a.set("compact-suggest", False, 9_000)
+        self.b.set("compact-suggest", True, 5_000)
+        out, err = self.m.converge()
+        self.assertEqual(out["pushed"], ["compact-suggest"])
+        self.assertEqual(out["adopted"], [])
+        self.assertEqual(self.b.read("compact-suggest"), (False, 9_000), "b holds the hub's pick under the hub's stamp")
+        self.assertIn("TESTHOST", err)
+        self.assertEqual([c[2] for c in self.m.calls], ["/mesh-settings"])
+        # the next pass: equal stamps, nothing moves in either direction — no ping-pong
+        out, _ = self.m.converge()
+        self.assertEqual((out["pushed"], out["adopted"]), ([], []))
+        self.assertEqual(len(self.m.calls), 1, "one push, once")
+
+    def test_a_newer_peer_is_still_adopted_and_nothing_is_pushed_to_it(self):
+        self.a.set("compact-suggest", False, 5_000)
+        self.b.set("compact-suggest", True, 9_000)
+        out, _ = self.m.converge()
+        self.assertEqual((out["adopted"], out["pushed"]), (["compact-suggest"], []))
+        self.assertEqual(self.a.read("compact-suggest"), (True, 9_000))
+        self.assertEqual(self.m.calls, [])
+
+    def test_a_push_stands_down_on_the_peer_when_the_peer_clicked_in_between(self):
+        # the peer's own gt-gated setter decides: a click on b newer than a's stamp, landing between a's poll and
+        # a's push, keeps — and a adopts it on the next pass
+        self.a.set("compact-suggest", False, 9_000)
+        self.b.set("compact-suggest", True, 5_000)
+        rver = self.b.version()
+        self.b.set("compact-suggest", True, 9_500)
+        with self.a:
+            out = km._converge_peer_settings(self.m.row(), rver, sync=True)
+        self.assertEqual(out["pushed"], [], "the peer refused the older stamp: not counted as pushed")
+        self.assertEqual(self.b.read("compact-suggest"), (True, 9_500))
+        out, _ = self.m.converge()
+        self.assertEqual(out["adopted"], ["compact-suggest"])
+        self.assertEqual(self.a.read("compact-suggest"), (True, 9_500))
+
+    def test_an_older_kernel_that_has_no_route_is_said_once_and_skipped(self):
+        self.m.refuse = True
+        self.a.set("compact-suggest", False, 9_000)
+        self.b.set("compact-suggest", True, 5_000)
+        out1, err1 = self.m.converge()
+        out2, err2 = self.m.converge()
+        self.assertEqual((out1["pushed"], out2["pushed"]), ([], []))
+        self.assertIn("TESTHOST", err1, "the refusal is said, naming the machine")
+        self.assertEqual(err2.count("did not take"), 0, "…once per peer, not every pass")
+        self.assertEqual(self.b.read("compact-suggest"), (True, 5_000), "the peer keeps its copy until it updates or the next click")
+
+    def test_all_three_settings_push_the_same_way(self):
+        for store in ("compact-suggest", "auto-nudge", "file-editing"):
+            default = self.b.read(store)[0]
+            self.a.set(store, not default, 9_000)
+            self.b.set(store, default, 5_000)
+            out, _ = self.m.converge()
+            self.assertIn(store, out["pushed"], store)
+            self.assertEqual(self.b.read(store), (not default, 9_000), store)
+
+
+class TrustGate(unittest.TestCase):
+    """Adoption is an INBOUND leg — a peer's stored state, read off its auth-exempt /version, applied to this
+    kernel's stores with no gesture — and the push is a new outbound one. Both gate on the peer's trust not being
+    "isolated": for fileEditing an isolated peer could otherwise open this kernel's write-any-file save route."""
+
+    def setUp(self):
+        self.a, self.b = _Kernel(), _Kernel()
+        self.m = _Mesh(self.a, self.b)
+
+    def tearDown(self):
+        self.m.close(); self.a.close(); self.b.close()
+
+    def test_an_isolated_peers_newer_pick_is_neither_adopted_nor_pushed_to_and_that_is_said_once(self):
+        self.b.set("file-editing", True, 9_000)
+        self.a.set("compact-suggest", True, 9_000)
+        self.b.set("compact-suggest", False, 5_000)
+        out1, err1 = self.m.converge(trust="isolated")
+        out2, err2 = self.m.converge(trust="isolated")
+        self.assertEqual(out1, {"adopted": [], "pushed": []})
+        self.assertEqual(out2, {"adopted": [], "pushed": []})
+        self.assertEqual(self.a.read("file-editing"), (False, 0), "the gate on this kernel's save route stays shut")
+        self.assertEqual(self.b.read("compact-suggest"), (False, 5_000), "nothing pushed either")
+        self.assertEqual(self.m.calls, [])
+        self.assertIn("isolated", err1); self.assertIn("TESTHOST", err1)
+        self.assertEqual(err2.strip(), "", "said once per peer")
+
+    def test_the_route_applies_with_the_stamp_and_answers_the_current_snapshot(self):
+        with self.b:
+            self.b.set("compact-suggest", True, 5_000)
+            ack = km._apply_mesh_settings({"compactSuggest": False, "gt": 9_000})
+            self.assertEqual(ack["ok"], True)
+            self.assertEqual((ack["settings"]["compactSuggest"], ack["settingsGt"]["compact-suggest"]), (False, 9_000))
+            stale = km._apply_mesh_settings({"compactSuggest": True, "gt": 8_000})
+            self.assertEqual((stale["settings"]["compactSuggest"], stale["settingsGt"]["compact-suggest"]), (False, 9_000), "a stale stamp stands down; the ack shows what holds")
+            self.assertIsNone(km._pop_stale_notice(), "no socket delivered this: no verdict left for the next gesture")
+            junk = km._apply_mesh_settings({"compactSuggest": "yes", "gt": 9_500})
+            self.assertEqual(junk["settings"]["compactSuggest"], False, "a non-bool is ignored")
+
+
 class ThePollSeam(unittest.TestCase):
     def test_the_supervisor_lifts_the_stamps_and_adopts_outside_the_lock(self):
         sup = KERNEL_SRC.split("def _tunnel_supervisor():")[1].split("\ndef ")[0]
         self.assertIn('r["settings"] = (rver or {}).get("settings")', sup)
         self.assertIn('r["settingsGt"] = (rver or {}).get("settingsGt")', sup, "the stamps ride the row beside the values")
-        self.assertIn("_adopt_peer_settings(r.get(\"host\") or \"?\", rver)", sup)
+        self.assertIn("_converge_peer_settings(r, rver)", sup, "the supervisor hands the ROW over, so trust is read at the seam")
         # the setters take their own locks and write files: they run in the OUTSIDE-the-lock block, like the auto update
         before_lock_exit = sup.split("if auto_check:")[0]
-        self.assertNotIn("_adopt_peer_settings(", before_lock_exit, "never under _remotes_lock")
+        self.assertNotIn("_converge_peer_settings(", before_lock_exit, "never under _remotes_lock")
+        self.assertIn('if u.path == "/mesh-settings":', KERNEL_SRC, "the peer-side gesture route the push lands on")
 
     def test_the_table_names_exactly_the_three_broadcast_booleans(self):
         self.assertEqual([row[0] for row in km._MESH_ADOPTED_SETTINGS], ["compactSuggest", "autoNudge", "fileEditing"])
