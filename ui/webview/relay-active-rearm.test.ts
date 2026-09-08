@@ -5,30 +5,45 @@
 // hint or an `activeTab` message) on the live change key (_active_chat_sig: the backend's live tail, its
 // queue, the snapshot row, every side file); every OTHER session is served from the file-stat cache
 // (_chat_build_sig), which no in-memory stream ever busts. The pane shim's local socket carries `?active=`
-// on every dial, so a LOCAL kernel restart re-arms it for free. The federation relay (federation.ts
-// connect) carries no such hint, and nothing re-sent `activeTab` on the relay's reopen — so the restarted
-// remote kernel minted a client with no active tab, served the watched session as a background one, and
-// its reply streamed nowhere until the user's next send moved a file-stat input. The fix re-announces
-// the active tab on romp:hostRelayUp — the relay's own open event, the exact moment the fresh kernel-side
-// client exists — when, and only when, that host owns the tab. Executed helper + render.ts wiring pins.
-// Synthetic ids only.
+// on every dial, so a LOCAL kernel restart re-arms it. The federation relay (federation.ts connect) carries
+// no such hint, and nothing re-sent `activeTab` on the relay's reopen — so the restarted remote kernel
+// minted a client with no active tab, served the watched session as a background one, and its reply
+// streamed nowhere until the user's next send moved a file-stat input. Reproduced on two real hermetic
+// kernels (one attached to the other through the relay, a browser on the first): after the remote's restart
+// the in-memory probe never arrived in 12 s while that kernel logged the session as active=0 on every cycle;
+// a transcript append still flowed; a tab click flipped it back to active=1. The fix re-announces the active
+// tab on romp:hostRelayUp — the relay's own open event, the exact moment the fresh kernel-side client
+// exists — when, and only when, that host owns the tab; the local socket's open (romp:wsup) re-announces a
+// local tab the same way, because the shim's persisted hint can lag a dismissal or an adoption (review fold).
+// Executed helper + routing contract + render.ts wiring pins. Synthetic ids only.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { activeTabToReannounce } from "./relay-active";
+import { routeOutbound } from "./federation";
 
 const SID = "11111111-2222-4333-8444-000000000246";
 // the sources are read from the tree, not the bundled test's own dir (node --test runs from vscode-extension/)
 const RENDER = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "render.ts"), "utf8");
 const FED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "federation.ts"), "utf8");
 
-test("the active tab is re-announced on the relay's open only when THAT host owns it", () => {
-  assert.equal(activeTabToReannounce("TESTHOST:" + SID, "TESTHOST"), true, "the watched tab is that host's");
+test("the active tab is re-announced on a socket's open only when THAT kernel owns it", () => {
+  assert.equal(activeTabToReannounce("TESTHOST:" + SID, "TESTHOST"), true, "the watched tab is that host's: its relay reopened");
   assert.equal(activeTabToReannounce("TESTHOST:" + SID, "hostB"), false, "another host's relay reopened — its kernel never had this tab");
-  assert.equal(activeTabToReannounce(SID, "TESTHOST"), false, "a LOCAL tab: the pane shim's ?active= already covers the local socket");
+  assert.equal(activeTabToReannounce("TESTHOST:" + SID, ""), false, "the LOCAL socket reopened while a remote tab is active — the local kernel does not know it");
+  assert.equal(activeTabToReannounce(SID, ""), true, "a local tab on the local socket's open (the shim's persisted hint can lag)");
+  assert.equal(activeTabToReannounce(SID, "TESTHOST"), false, "a local tab is never announced at a remote host");
   assert.equal(activeTabToReannounce(null, "TESTHOST"), false, "no tab open");
-  assert.equal(activeTabToReannounce("TESTHOST:" + SID, ""), false, "an event with no host names no relay");
+  assert.equal(activeTabToReannounce(null, ""), false, "no tab open, local socket");
+});
+
+test("the re-announced activeTab reaches exactly the owning host, its id bared (the contract notifyActive relies on)", () => {
+  // notifyActive posts {type:"activeTab", id: activeId} with the HOST-PREFIXED id; federation's outbound
+  // router must land it on that host's relay with the bare id the remote kernel knows, and a local id local
+  assert.deepEqual(routeOutbound({ type: "activeTab", id: "TESTHOST:" + SID }),
+                   [{ host: "TESTHOST", msg: { type: "activeTab", id: SID } }]);
+  assert.deepEqual(routeOutbound({ type: "activeTab", id: SID }), [{ host: "", msg: { type: "activeTab", id: SID } }]);
 });
 
 test("render.ts re-sends activeTab on romp:hostRelayUp for that host's active tab, beside the upload re-ship", () => {
@@ -42,15 +57,19 @@ test("render.ts re-sends activeTab on romp:hostRelayUp for that host's active ta
   assert.match(m![1], /if \(activeTabToReannounce\(activeId, h\)\) notifyActive\(\);/, "the active tab is re-announced through the one activeTab sender (notifyActive → routeOutbound strips the host prefix)");
 });
 
-test("the relay dial carries no connect-time active hint — the reopen event is where the tab is re-armed", () => {
-  // Documenting the shape the fix composes with: federation's URL names app/token/wid only (the shim's
-  // local socket adds ?active= from its persisted state; the relay reads the pane's LIVE activeId on the
-  // open event instead — a persisted copy can lag a dismissal/adoption, which never call setActive)
-  const url = FED.match(/const url = `\$\{proto\}\$\{location\.host\}\/remote\/[\s\S]*?;\n/);
-  assert.ok(url, "the relay URL builder");
-  assert.doesNotMatch(url![0], /active=/);
-  // and the open event is dispatched AFTER flushPending, so a queued setting still precedes the activeTab
+test("render.ts re-sends a LOCAL active tab on romp:wsup, the shim's reconnect event, beside the local re-ship", () => {
+  // anchored on the re-ship call: render.ts has other romp:wsup listeners (preview heals, awaitingFull), this is the one
+  const m = RENDER.match(/window\.addEventListener\("romp:wsup", \(\) => \{\n  reshipPendingUploads\(\);([\s\S]*?)\n\}\);/);
+  assert.ok(m, "the romp:wsup re-ship listener, now with a body");
+  assert.match(m![1], /if \(activeTabToReannounce\(activeId, ""\)\) notifyActive\(\);/, "the local tab is re-announced with the LOCAL host marker");
+});
+
+test("the relay's open dispatches romp:hostRelayUp AFTER flushing queued settings, so a queued setting still precedes the re-announced activeTab", () => {
   const onopen = FED.match(/ws\.onopen = \(\) => \{([\s\S]*?)\n    \};/);
-  assert.ok(onopen);
-  assert.ok(onopen![1].indexOf("this.flushPending(conn)") < onopen![1].indexOf('"romp:hostRelayUp"'));
+  assert.ok(onopen, "the relay socket's onopen");
+  const flush = onopen![1].indexOf("this.flushPending(conn)");
+  const up = onopen![1].indexOf('"romp:hostRelayUp"');
+  assert.ok(flush >= 0, "the flush is in onopen");
+  assert.ok(up >= 0, "the relay-up dispatch is in onopen");
+  assert.ok(flush < up, "flush first, then the event the re-arm rides");
 });

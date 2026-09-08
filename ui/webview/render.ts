@@ -11832,7 +11832,14 @@ function reshipPendingUploads(hosts?: readonly string[]): void {
     }
   }
 }
-window.addEventListener("romp:wsup", () => reshipPendingUploads());
+window.addEventListener("romp:wsup", () => {
+  reshipPendingUploads();
+  // …and the LOCAL kernel's active tab (the twin of the relay re-arm below; review fold, T246): the shim's
+  // redial carries ?active= from the PERSISTED activeId, which a dismissal's fallback and a sole-tab adoption
+  // change without setActive — so a restarted local kernel could key a tab the user had left and serve the
+  // one they are looking at as a background tab. The live activeId is re-announced on the socket's open.
+  if (activeTabToReannounce(activeId, "")) notifyActive();
+});
 // federation dispatches this on a host relay socket (re)connect — the exact event that makes that
 // host's owed acks reachable again; the detail names the host, so only its entries re-ship
 window.addEventListener("romp:hostRelayUp", (e) => {
