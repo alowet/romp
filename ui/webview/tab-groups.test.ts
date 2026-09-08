@@ -350,9 +350,10 @@ test("the section chrome is a LABEL's (the user 2026-09-06): the surface's sub-l
   assert.match(head, /letter-spacing: 0\.04em;/);
   assert.match(head, /color: var\(--dim\);/);
   assert.match(CSS, /\.tab-group-count \{ opacity: 0\.7; \}/, "the count inherits the header's size — no em nested inside an em");
-  assert.match(CSS, /\.tab-group-name \{ font-weight: 600; \}/);
-  assert.match(CSS, /\.tab-group-swatch \{ flex: 0 0 auto; width: 3px; height: 12px; border-radius: 1px; background: var\(--dim\); \}/,
-    "the tag's color as a short bar — a 7px dot beside a name is a session pip");
+  // T251 (the user 2026-09-07): the swatch+name pair retired for THE CHIP the tag wears everywhere —
+  // the shared tag-menu builder's pill, bold like the name it replaces, sized by the header
+  assert.match(CSS, /\.tab-group-chip \{ flex: 0 0 auto; font-weight: 600; line-height: 1\.2; \}/);
+  assert.doesNotMatch(CSS, /\.tab-group-swatch|\.tab-group-name \{/, "the bar and the plain name are gone");
   assert.doesNotMatch(CSS, /\.tab-group-dot/, "the dot is gone");
   const sizes = new Set(Array.from(CSS.matchAll(/\n\.tab-group-[^{\n]*\{[^}]*font-size: ([^;]+);/g)).map((m) => m[1]));
   assert.deepEqual([...sizes], ["0.82em"], "one font-size across every section rule");
@@ -362,14 +363,13 @@ test("the section chrome is a LABEL's (the user 2026-09-06): the surface's sub-l
 test("the header's structure and gestures read as a label: chevron (flips with the fold) → color bar → name → count; a keyboard button; hover/focus say fold, never open; tokens only (the user 2026-09-06)", () => {
   const head = RENDER.slice(RENDER.indexOf("function makeGroupHead("), RENDER.indexOf("function sectionHeadOf("));
   const at = (t: string) => { const i = head.indexOf(t); assert.ok(i >= 0, "present: " + t); return i; };
-  assert.ok(at('el("span", "tab-group-caret")') < at('el("span", "tab-group-swatch")')
-    && at('el("span", "tab-group-swatch")') < at('el("span", "tab-group-name")')
-    && at('el("span", "tab-group-name")') < at('el("span", "tab-group-count")'), "chevron, bar, name, count");
+  assert.ok(at('el("span", "tab-group-caret")') < at('tagChip(name, sec.color, { inheritSize: true })')
+    && at('tagChip(name, sec.color, { inheritSize: true })') < at('el("span", "tab-group-count")'), "chevron, the tag's CHIP, count");
   assert.match(head, /caret\.textContent = "▸";/);
   assert.match(CSS, /\.tab-group-head:not\(\.collapsed\) \.tab-group-caret \{ transform: rotate\(90deg\); \}/,
     "the fold state flips it — the sheet's fold-caret idiom, a CSS transition, no timer");
   assert.match(CSS, /\.tab-group-caret \{[^}]*transition: transform 0\.12s ease;/);
-  assert.match(head, /if \(sec\.color\) swatch\.style\.background = sec\.color;/, "the tag's color from the views store");
+  assert.match(head, /tagChip\(name, sec\.color, \{ inheritSize: true \}\)/, "the tag's color from the views store, on the SHARED chip (T251)");
   // none of a tab's affordances
   assert.ok(!head.includes("tab-close") && !head.includes("tabStateClass(") && !head.includes("tab-dot") && !head.includes("tabCtxGauge("),
     "no close, no state class of its own, no tab pip, no gauge");
@@ -1523,7 +1523,10 @@ test("assistive tech hears a label: decoration is aria-hidden, the header's name
   // folded into the name — and the active section's header as "button, expanded" with no focus and a
   // no-op click
   assert.match(MAKE_HEAD, /caret\.setAttribute\("aria-hidden", "true"\);/, "the chevron is decoration");
-  assert.match(MAKE_HEAD, /swatch\.setAttribute\("aria-hidden", "true"\);/, "so is the color bar");
+  // T251: the color bar retired for the tag's CHIP, which carries the NAME — words, not decoration, so it is
+  // never aria-hidden (the header's explicit aria-label still outranks name-from-content)
+  assert.match(MAKE_HEAD, /const chip = tagChip\(name, sec\.color, \{ inheritSize: true \}\);/, "the chip carries the name");
+  assert.ok(!/chip\.setAttribute\("aria-hidden"/.test(MAKE_HEAD), "…and is words, never hidden decoration");
   assert.match(MAKE_HEAD, /pip\.setAttribute\("aria-hidden", "true"\);[^\n]*\n\s*spoken \+= "; " \+ pip\.title;/, "the pip too — its phrase rides the label instead");
   assert.match(MAKE_HEAD, /let spoken = words\.label;/, "the label starts as headWords' (name and count, in words — executed above)");
   assert.match(MAKE_HEAD, /head\.setAttribute\("aria-label", spoken\);\s*\n\s*head\.draggable = true;/, "set once, after the pip; an aria-label outranks name-from-content, so the header says what was appended and nothing that leaked in");
@@ -1536,4 +1539,16 @@ test("assistive tech hears a label: decoration is aria-hidden, the header's name
   assert.equal(MAKE_HEAD.split('"role", "button"').length - 1, 1);
   assert.ok(MAKE_HEAD.indexOf('"role", "group"') < MAKE_HEAD.indexOf('"role", "button"'), "the active branch first, as the source reads");
   assert.equal(headWords("archived", 2, 2, true, false).label, "archived, 2 sessions folded");
+});
+
+
+test("the group header wears the SHARED tag chip — one vocabulary with the tags bar and the feed (T251)", () => {
+  const MENU = ui("webview", "tag-menu.ts");
+  assert.match(MENU, /export function tagChip\(label: string, color\?: string \| null, opts\?: \{ inheritSize\?: boolean \}\): HTMLElement \{/,
+    "the chip is a named builder, not a lookalike");
+  assert.match(MENU, /const chip = tagChip\(c\.label, c\.color\);/, "the tags bar builds its chips through it");
+  assert.match(MENU, /\("var\(--dim, " \+ TAG_BTN_GRAY \+ "\)"\)/, "the uncoloured fallback is a THEME TOKEN — the light theme is never handed a dark gray");
+  const head = RENDER.slice(RENDER.indexOf("function makeGroupHead("), RENDER.indexOf("function sectionHeadOf("));
+  assert.match(head, /chip\.classList\.add\("tab-group-chip"\);/);
+  assert.ok(!/font-size/.test(head), "the header sets no size of its own — the chip inherits the header's 0.82em (no nested em)");
 });

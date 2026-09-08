@@ -19,7 +19,7 @@ import { applyTheme } from "./theme";
 import { SessionViews, viewVisible, viewsKey, revealIn, viewTagUnion, viewTags, type TagUnion, type SessionTag } from "./session-views";
 import { mintWriteId, ackOutcome, adoptViews, seqOf, capsAdopts, announcedSeq, announcedAfter, createInFlight, rederivePending, lensBlob, applyLensFields, type InflightWrite, type LensFields, type TagEditOp, type ViewsAck } from "./views-writes";
 import { lensVisible, surfaceLens } from "./tag-lens";
-import { openTagMenu, tagMenuButton, syncTagFilter } from "./tag-menu";
+import { openTagMenu, tagMenuButton, syncTagFilter, tagChip } from "./tag-menu";
 import { syncSessionsFromTabMeta, applyMetaToSession, notePendingMeta, PendingTabMeta } from "./tab-meta";
 import { markerLabel, dayContext } from "./time-marker";
 import { compactDisplay, toolCounts, type DisplayItem } from "./compact";
@@ -5031,13 +5031,14 @@ function makeGroupHead(sec: TabSection, collapsed: boolean, holdsActive: boolean
   caret.textContent = "▸";                       // turned down by CSS while open (.tab-group-head:not(.collapsed))
   caret.setAttribute("aria-hidden", "true");
   head.appendChild(caret);
-  const swatch = el("span", "tab-group-swatch");  // the tag's color as a short bar — a dot beside a name is a session pip
-  if (sec.color) swatch.style.background = sec.color;
-  swatch.setAttribute("aria-hidden", "true");
-  head.appendChild(swatch);
-  const label = el("span", "tab-group-name");
-  label.textContent = name;
-  head.appendChild(label);
+  // the tag as THE CHIP it wears everywhere (T251, the user 2026-09-07: the swatch+name pair read as a
+  // plain label; the chip says "this is the tag" the way the tags bar and the feed say it, so which
+  // tabs belong to which group reads at a glance). The shared builder from tag-menu.ts — one
+  // vocabulary, never a lookalike — inheriting the header's own sub-line size (no nested em). The
+  // count rides right after it in the same row.
+  const chip = tagChip(name, sec.color, { inheritSize: true });
+  chip.classList.add("tab-group-chip");
+  head.appendChild(chip);
   const n = el("span", "tab-group-count");
   n.textContent = words.count;   // folded: the hidden members — a pinned one shows itself; all pinned: the total (headWords)
   head.appendChild(n);
