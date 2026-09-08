@@ -102,51 +102,57 @@ broad `git add` will sweep up your work). Conventions:
      it, and naming it in scripts bakes in a failure.
   2. `gh pr create --repo romp-on/romp --label <tier>` (gh detects the fork head), then
      `gh pr merge --auto --merge`: it lands itself when the required checks pass, and
-     the Tier policy check is one of them, so green CI alone lands only `docs`; a `fix`
-     waits for an approval or its seventh day, and the rest wait for a human (the tier
-     list below). There is no way to move `main` except a green PR.
+     the Tier policy check is one of them. Green CI alone lands `docs` and `fix` for
+     every author, and `feature` too when the author is the repository owner (an
+     admin); anyone else's `feature` waits for the owner's approval, and every
+     `major-feature` for a discussed issue (the tier list below). There is no way to
+     move `main` except a green PR.
   Anything that reads the canonical repo (the release script's post-merge
   fast-forward and tag push, the kernel's update and drift probes) resolves the remote
   as `upstream` when the clone has one, else `origin` (`_release_remote` in
   `kernel/kernel.py`, `canonical_remote` in `scripts/release.sh`); never a literal
   `origin`, which in a fork layout is a stale mirror nobody advances.
 - **Every PR carries exactly one tier label, and the tier is ENFORCED** (maintainers' rule
-  2026-09-06; the policy decided 2026-09-07). Two required checks: "Exactly one tier label"
-  holds a PR with no tier label, or two, red; "Tier policy" then holds it until the tier's
-  gate is met. The rules are a pure function (`scripts/ci/tier_policy.py`, pinned by
-  `tests/test_tier_policy.py`); the workflow only fetches PR data and posts the verdict. See
-  `docs/pr-tiers.md`. The author picks the tier at filing time:
-  - `docs` (tier 0; renamed from `tests-only`): documentation ONLY - files under `docs/` or
-    `*.md` anywhere, never `.github/` or `scripts/`. Merges on green.
-  - `fix` (tier 1): a bug fix with a test that fails before it. Merges on the other
-    maintainer's approval, or after seven days with the head unchanged and no changes
-    requested (the clock is the unbroken chain of hourly Tier policy verdicts THIS PR received
-    on the current head, or the head's arrival on the PR if later, never a commit date; a
-    head with no verdict yet has not started its clock, and a sibling PR's verdicts on the
-    same sha lend nothing).
+  2026-09-06; the policy decided 2026-09-07 and reset by the repository owner 2026-09-08: the
+  gate depends on the tier and on the AUTHOR's role, and no tier has a time-based path). Two
+  required checks: "Exactly one tier label" holds a PR with no tier label, or two, red; "Tier
+  policy" then holds it until the tier's gate is met. The rules are a pure function
+  (`scripts/ci/tier_policy.py`, pinned by `tests/test_tier_policy.py`); the workflow only
+  fetches PR data and posts the verdict. See `docs/pr-tiers.md`. Roles are the author's
+  collaborator permission: admin is the repository owner; write or maintain is a member;
+  anyone else is a contributor (the check gates members and contributors alike). The author
+  picks the tier at filing time:
+  - `docs` (tier 0; renamed from `tests-only`): documentation. To the check it is the same
+    tier as `fix`: merges on green for every author.
+  - `fix` (tier 1): a bug fix with a test that fails before it. Merges on green for every
+    author: the check requires no approval, and whichever maintainer merges it is the whole
+    requirement.
   - `feature` (tier 2): a self-contained new capability inside romp's existing model; put the
-    design points in the body. Merges on the other maintainer's approval.
+    design points in the body. By the repository owner (an admin): merges on green. By a
+    member (write access) or a contributor: merges on the owner's approval on the current
+    head. No issue, no waiting period.
   - `major-feature` (tier 3): new functionality that changes what romp does or its
-    contracts. Merges on the other maintainer's approval AND a discussion in a linked issue
-    (`#N` in the body, with a comment by someone other than the author; the opener alone does
-    not count). File it **without**
-    `--auto` and leave the merge to the maintainers.
-  "Approval" is a standing APPROVED review by a maintainer other than the author on the
-  CURRENT head (standing = their latest approval, change request or dismissal; comment-only
-  reviews never change it; a dismissed approval never counts, whoever dismissed it, and a
-  dismissed change request clears only when the reviewer dismissed it themselves, so the
-  author cannot dismiss the peer's objection away to reopen the seven-day path) -
-  GitHub forbids self-approval and the user's sessions act under
-  the user's account, so it structurally means the other maintainer. A renamed file counts
-  under both its paths. Any PR touching `.github/` or
-  `scripts/ci/` - the gate's own workflow and code - needs an approval regardless of tier: a
-  PR's own `pull_request` workflow can carry a JOB named like the check, whose run lands on
-  the head under the same app, and a fix-tier PR must not be able to rewrite the policy through
-  the seven-day path, so a human looks. That residual stays open until the maintainers add a
-  CODEOWNERS rule for those paths with code-owner review required (see `docs/pr-tiers.md`). Consequence for sessions:
-  `--auto` still lands `docs` on green; a `fix` lands on approval or its seventh day; `feature`
-  and `major-feature` wait for a human. The line that matters is 2 vs 3: adds a capability
-  inside the existing model, `feature`; changes what romp is, `major-feature`, talk first.
+    contracts. For every author, a discussion in a linked issue (`#N` in the body, with a
+    comment by someone other than the author; the opener alone does not count); a member's or
+    a contributor's additionally needs the owner's approval on the current head. File it
+    **without** `--auto` and leave the merge to the maintainers.
+  A standing change request by a maintainer (write, maintain or admin) other than the author
+  holds a PR of ANY tier until that reviewer lifts it; an approval by someone else does not.
+  "Approval" is a standing APPROVED review by an admin other than the author on the CURRENT
+  head (standing = their latest approval, change request or dismissal; comment-only reviews
+  never change it; a dismissed approval never counts, whoever dismissed it, and a dismissed
+  change request clears only when the reviewer dismissed it themselves, so the author cannot
+  dismiss the peer's objection away to merge on green). A renamed file counts under both its
+  paths. Any PR touching `.github/` or `scripts/ci/`, the gate's own workflow and code, needs
+  the owner's approval regardless of tier when the author is not an admin: a PR's own
+  `pull_request` workflow can carry a JOB named like the check, whose run lands on the head
+  under the same app, and nobody but the owner may rewrite the policy through a PR the check
+  cannot see, so a human looks; the owner's own PRs are exempt. That residual stays open until
+  the maintainers add a CODEOWNERS rule for those paths with code-owner review required (see
+  `docs/pr-tiers.md`). Consequence for sessions, which act under the user's account (an
+  admin): `--auto` lands `docs`, `fix` and `feature` on green; `major-feature` waits for the
+  discussed issue and a human. The line that matters is 2 vs 3: adds a capability inside the
+  existing model, `feature`; changes what romp is, `major-feature`, talk first.
 - **Clean up when finished.** After publishing, remove the worktree
   (`git worktree remove ../romp-<session>`) and delete its branch — don't leave stale
   worktrees lying around.

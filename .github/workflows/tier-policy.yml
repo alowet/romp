@@ -1,10 +1,15 @@
 name: Tier policy
 
-# The PR tier POLICY (the maintainers' decisions of 2026-09-07), enforced as a required status check:
-# docs merges on green; fix merges on the other maintainer's approval or after seven unchanged days
-# with no changes requested; feature needs an approval; major-feature needs an approval AND a
-# discussion in a linked issue; anything touching .github/ or scripts/ci/ needs an approval regardless. Rulesets
-# cannot vary by label, so the policy is this check. The RULES are a pure function
+# The PR tier POLICY (the repository owner's rules of 2026-09-08, by tier and by the author's role),
+# enforced as a required status check. Roles are the author's collaborator permission: admin is the
+# repository owner, write or maintain a member, anyone else a contributor. docs and fix are one tier and
+# merge on green for every author (the check requires no approval). feature merges on green when the
+# author is an admin; by anyone else it needs an approval by an admin other than the author on the
+# current head. major-feature needs a discussion in a linked issue for every author, plus that admin
+# approval when the author is not an admin. Anything touching .github/ or scripts/ci/ needs an admin's
+# approval regardless of tier unless the author is an admin. A standing change request by a maintainer
+# other than the author holds a PR of any tier until that reviewer lifts it. No tier has a time-based
+# path. Rulesets cannot vary by label, so the policy is this check. The RULES are a pure function
 # (scripts/ci/tier_policy.py, pinned by tests/test_tier_policy.py); this workflow only fetches PR data
 # through the API and posts the verdict as a check run named "Tier policy" on the PR's head sha.
 #
@@ -18,12 +23,8 @@ name: Tier policy
 #   and nothing else. GITHUB_TOKEN is the GitHub Actions app's installation token, which is what the
 #   Checks API's "GitHub Apps only" write rule admits; the ruleset requiring this check must select the
 #   run posted by the GitHub Actions app.
-# - The seven-day clock is the later of the head's arrival on the PR (created_at, raised by every
-#   server-stamped force-push / reopen / ready-for-review event) and the start of the UNBROKEN chain
-#   of hourly "Tier policy" verdicts THIS PR received on the head (each verdict carries the PR number
-#   as external_id; a sibling PR's verdicts on the same sha lend nothing, and a gap restarts it). A
-#   head with no verdict yet has not started its clock: the run that evaluates it posts the first.
-#   Commit dates are the author's to forge and are never read.
+# - Nothing in the policy is timed: the fetcher reads no check-run history, no timeline and no commit
+#   date, so there is no clock for a forged date, a reopen or a sibling PR's head to feed.
 # - The job below is named "Tier policy evaluation", NOT "Tier policy": the required check is the
 #   API-posted verdict alone. Were the job named the same, every head would carry two same-named runs
 #   (the job's, frozen at push time, and the verdict the hourly sweep moves) and which one the ruleset
@@ -31,15 +32,16 @@ name: Tier policy
 # - RESIDUAL, stated as open: a PR can add a pull_request-triggered workflow whose JOB is named
 #   "Tier policy"; GitHub Actions creates that run on the head with no token, under the same app and
 #   sha as the base verdict, and the merge box follows the newest same-named run - app selection
-#   cannot tell them apart. The policy requires an approval for ANY PR touching .github/ or
-#   scripts/ci/ (a human looks), but that rule rides the check the forged run competes with; what
-#   closes it is a CODEOWNERS entry for those paths with code-owner review required in the ruleset.
+#   cannot tell them apart. The policy requires an admin's approval for ANY PR touching .github/ or
+#   scripts/ci/ whose author is not an admin (a human looks), but that rule rides the check the forged
+#   run competes with; what closes it is a CODEOWNERS entry for those paths with code-owner review
+#   required in the ruleset.
 
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, labeled, unlabeled, edited]
   schedule:
-    - cron: "17 * * * *"          # hourly: the seven-day clock and approval propagation
+    - cron: "17 * * * *"          # hourly: approval propagation
   workflow_dispatch:
     inputs:
       pr:
