@@ -51,3 +51,16 @@ export function landSpot(v: KeepView): number | "bottom" {
 export function keepPlaceAcrossShow(v: KeepView, displayed: boolean, visible: boolean, navigating: boolean): boolean {
   return v.shown && displayed && visible && !navigating;
 }
+
+/** Follow-the-tail after an append, for a reader who was near the bottom (T262, the user 2026-09-08: "jumped up
+ *  slightly on my scroll" in busy sessions). A tab within the 80 px follow threshold used to be pinned to the
+ *  bottom on EVERY frame the pane received — including a status-only tail that changed no content — so a reader
+ *  wheeling up from the tail of a working session was snapped back within the first 80 px, again and again (the
+ *  harness reproduced it: a 60 px stop moved 60 px to the bottom in a quiet window with the content height
+ *  unchanged). The bottom is followed only when there is something new to follow: the content's height
+ *  changed, or the reader was already at the very bottom (where the pin is a no-op). Pure, so node executes it.
+ *  `distBefore` = scrollHeight − scrollTop − clientHeight before the rebuild. */
+export function followTail(distBefore: number, heightBefore: number, heightAfter: number): boolean {
+  if (distBefore <= 2) return true;
+  return heightAfter !== heightBefore;
+}
