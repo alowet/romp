@@ -7328,6 +7328,9 @@ def _parked_quiet_deploy(checkout, now=None):
     """The `t` of a QUIET deploy request still pending for the code the checkout holds, else 0
     (T240d): the newest restart-requesting audit row is a p2p-update (a peer's apply, which advanced
     the checkout and asked the manager for a quiet restart) or a main-converge with when=quiet, its
+    — since T269 a new peer's apply asks for an IMMEDIATE bounce and writes no when=quiet, so it
+    parks nothing here (its restart lands within the manager's ack, inside one drift cadence); the
+    quiet rows this reads now come from older peers, a quiet converge and `romp refresh --quiet` —
     sha is the checkout's, no cut row has consumed it (auditT), and it is inside the window a quiet
     request stays pending — the far manager's backstop bound, exactly what _recent_restart_audit
     already gives such a row for cut attribution. So a park lost with its manager self-heals at that
@@ -7396,7 +7399,10 @@ def _main_drift_check():
         # restart from a peer resets it the same way (T240). Module memory still covers the seconds
         # before the ledger row exists.
         #
-        # A QUIET deploy already parked for the code on disk STANDS THIS CHECK DOWN (T240d): a peer's
+        # A QUIET deploy already parked for the code on disk STANDS THIS CHECK DOWN (T240d, when the
+        # p2p apply still asked for the quiet window; since T269 it asks for an immediate bounce and
+        # writes no quiet row, so a new peer's apply never parks — the park below now comes from older
+        # peers, a quiet converge, or `romp refresh --quiet`). The 2026-09 shape: a peer's
         # p2p apply advanced the checkout and asked the manager for a quiet restart, then this check
         # saw the checkout ahead of the kernel and posted an IMMEDIATE restart-all — 16:23Z quiet
         # park, 16:27Z converge/now, ten sessions cut, the quiet window the peer asked for never ran
@@ -19836,7 +19842,11 @@ def _update_remote(host, head=None):
         if tag == "SYNCED":
             short, _, mode = rest.partition(":")
             mode = mode.strip()
-            _expect(False)                    # every deploy restart is immediate (T269): the short expectation window
+            # every deploy restart is immediate (T269). `quiet` is RECORDED on the expectation, not read:
+            # the tunnel's reinterpretation keys on sha and t (RESTART_EXPECT_MAX_S caps a restart that
+            # never comes). The far kernel's own cut attribution takes the short window from the ROW,
+            # which no longer carries when=quiet (_recent_restart_audit).
+            _expect(False)
             short = short.strip() or lfull[:8]
             if mode == "MANAGED":
                 return True, "synced to %s + restarting now (through its manager)" % short
