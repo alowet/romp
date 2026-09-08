@@ -123,6 +123,47 @@ class DeadLaneMemo(unittest.TestCase):
         self.assertEqual([(m["judge"], m["_h"]) for m in marks], [("captioner", cap_t)], "derived once, stamped")
         self.assertFalse(any("_h" in m for m in tl["judging"]), "the stamp never reaches the wire")
 
+    def test_every_keyed_input_re_derives_the_lane_when_it_moves(self):
+        """The key is every file the parse-derived parts read, not the transcript alone (the review of the
+        first batch found a key pinned on one component): touching each one changes the memo's key and the
+        lane is derived again."""
+        td = Path(self.td.name)
+        self._build()
+        key0 = km._dead_lane_memo[SID][0]
+        inputs = [td / "states" / (SID + ".jsonl"), td / "goals" / (SID + ".json"),
+                  td / "overrides" / (SID + ".jsonl"), td / "captions" / (SID + ".jsonl"),
+                  td / "archive" / (SID + ".json"), td / "session-flags.json"]
+        seen = {key0}
+        for i, p in enumerate(inputs):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.name == SID + ".json" and p.parent.name == "goals":
+                p.write_text(json.dumps({"nodes": {}, "status": {}, "touched": i}))
+            elif p.suffix == ".json":
+                p.write_text(json.dumps({"touched": i}))
+            else:
+                p.write_text("")
+            os.utime(p, (NOW - 10 + i, NOW - 10 + i))
+            self._build()
+            key = km._dead_lane_memo[SID][0]
+            self.assertNotIn(key, seen, "%s moved but the key did not" % p.name)
+            seen.add(key)
+        self._build()
+        self.assertEqual(km._dead_lane_memo[SID][0], key, "nothing moved: the key stands")
+
+    def test_a_lane_whose_goals_store_cannot_be_read_is_never_cached(self):
+        """A goals FAULT is a store that cannot be read (an OSError; malformed bytes are healed by the loader):
+        the lane renders without goal-derived data, complains, and is derived again on every build rather
+        than served from a memo that would silence the fault."""
+        store = Path(self.td.name) / "goals" / (SID + ".json")
+        store.chmod(0)
+        try:
+            self._build()
+            self.assertNotIn(SID, km._dead_lane_memo, "a faulted store stays loud on every build, never served stale")
+        finally:
+            store.chmod(0o600)
+        self._build()
+        self.assertIn(SID, km._dead_lane_memo, "readable again: cached like any other dead lane")
+
     def test_a_live_lane_is_not_memoized(self):
         km._tmux_sessions = lambda: {SID: {"state": "waiting", "since": NOW - 100, "model": "", "effort": "",
                                            "context": None, "compactPct": None, "color": None, "mode": ""}}
