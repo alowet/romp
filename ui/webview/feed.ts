@@ -35,7 +35,7 @@ import { applyTheme } from "./theme";
 import { canPreview } from "./preview";
 import { initFileView, setFileViewIdentity, hostStub } from "./file-view";
 import { initFileBrowse, openFileBrowse } from "./file-browse";
-import { VIEW_STATE_KEY, parseViewState, serializeViewState, pruneViewState, capViewState, type FeedViewState } from "./feed-view-state";
+import { VIEW_STATE_KEY, parseViewState, serializeViewState, pruneViewState, capViewState, type FeedViewState, threadKey, threadKeys } from "./feed-view-state";
 import { wireTip, setTip, pruneTip } from "./tip";
 import { perfFrameHandler } from "./perf-telemetry";
 import { listenForFrames } from "./frame-listener";
@@ -1526,7 +1526,7 @@ let colOrder: string[] = [];                         // [] = each layout's own C
   for (const k of st.nodes) collapsedNodes.add(k);
   for (const k of st.logs) nodeLogOpen.add(k);
   for (const k of st.asks) expandedAsks.add(k);
-  for (const k of st.threads) collapsedThreads.add(k);
+  for (const k of st.threads) for (const key of threadKeys(k)) collapsedThreads.add(key);   // a pre-T263c bare sid = every column
   for (const k of st.cols) collapsedCols.add(k);
   colOrder = st.order.slice();
 })();
@@ -3512,7 +3512,8 @@ type Entry =
   // a SESSION HEADER row in grouped mode (the user 2026-07-13): the session's name + working dot on the
   // column backdrop, heading that session's run of cards. Only emitted for runs that exist.
   // `folded` = how many of this run's cards the header is standing in for (0 when the thread is expanded)
-  | { kind: "sess"; t: number; sid: string; name: string; color: { bg: string; fg: string } | null; live: boolean; folded: number };
+  // `col` = the column this header heads: the fold is per (session, column) — T263c, the user 2026-09-08
+  | { kind: "sess"; t: number; sid: string; col: Column; name: string; color: { bg: string; fg: string } | null; live: boolean; folded: number };
 
 // ONE counting rule (the user 2026-08-26): every number on the board counts CARDS, never rows — a
 // turn-group entry is worth its members, a folded session header is worth the cards it stands in for.
@@ -3572,10 +3573,13 @@ function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
   setWorkDot(nm, dotFor(e.name));   // the working/awaiting dot rides the header, not the cards
   // the fold caret + the "n cards" stand-in for what it hides
   const fold = (h as any)._fold as HTMLElement, foldn = (h as any)._foldn as HTMLElement;
-  const shut = collapsedThreads.has(e.sid);
+  // per (session, COLUMN) — T263c, the user 2026-09-08: the same session folds in Blocked and stays open in
+  // Working; a card that lands in this column later inherits this column's fold
+  const tkey = threadKey(e.sid, e.col);
+  const shut = collapsedThreads.has(tkey);
   h.classList.toggle("folded", shut);
   setText(fold, shut ? "▸" : "▾");               // ▸ folded / ▾ open
-  fold.title = shut ? "show this session's cards" : "collapse this session to its name — new cards stay folded too";
+  fold.title = shut ? "show this session's cards in this column" : "collapse this session's cards in this column to its name — new cards here stay folded too";
   fold.setAttribute("aria-expanded", shut ? "false" : "true");
   fold.setAttribute("aria-label", (shut ? "expand " : "collapse ") + e.name);
   foldn.style.display = shut && e.folded ? "" : "none";
@@ -3584,7 +3588,7 @@ function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
   foldn.title = e.folded === 1 ? "1 card folded under this session" : e.folded + " cards folded under this session";
   fold.onclick = (ev) => {
     ev.stopPropagation();   // the fold IS the acknowledgement: local state + an immediate re-render
-    if (collapsedThreads.has(e.sid)) collapsedThreads.delete(e.sid); else collapsedThreads.add(e.sid);
+    if (collapsedThreads.has(tkey)) collapsedThreads.delete(tkey); else collapsedThreads.add(tkey);
     render();
   };
   // the session-wide Clear: which session, and only while it has cards in the current view (a header
@@ -4889,13 +4893,13 @@ function render() {
         if (s !== cur) {
           cur = s;
           const src: any = e.kind === "ask" ? e.ask : e.kind === "group" ? e.group : e;
-          head = { kind: "sess", t: e.t, sid: s, name: src.name, color: src.color || null, live: !!src.live, folded: 0 };
+          head = { kind: "sess", t: e.t, sid: s, col: k, name: src.name, color: src.color || null, live: !!src.live, folded: 0 };
           withHeads.push(head);
         }
         // A COLLAPSED thread contributes its header and nothing else — the run's cards are counted onto the
         // header instead of rendered, so the folded row still says how much is under it. CARDS, not rows
         // (entryCards): a turn-group folds as its member count, the same rule the section chip reads.
-        if (collapsedThreads.has(s)) { if (head) head.folded += entryCards(e); continue; }
+        if (collapsedThreads.has(threadKey(s, k))) { if (head) head.folded += entryCards(e); continue; }
         withHeads.push(e);
       }
       buckets[k] = withHeads;
@@ -5851,8 +5855,9 @@ function unfoldThreadsFor(keys: Set<string>): void {
   if (!collapsedThreads.size) return;
   let opened = false;
   for (const a of asks) {
-    if (collapsedThreads.has(a.sid) && extHoverMatches("a:" + a.itemId, keys)) {
-      collapsedThreads.delete(a.sid); opened = true;
+    const tkey = threadKey(a.sid, askColumn(a));   // the run the card sits in — per (session, column), T263c
+    if (collapsedThreads.has(tkey) && extHoverMatches("a:" + a.itemId, keys)) {
+      collapsedThreads.delete(tkey); opened = true;
     }
   }
   if (opened) render();
