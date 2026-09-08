@@ -52,8 +52,12 @@ class ReviveSession(unittest.TestCase):
 
     def setUp(self):
         self.saved = (km._sdk, km._name_of, km._cwd_of, km._push_all, km._reveal_chat_for,
-                      km._send_to_view, subprocess.run)
+                      km._send_to_view, subprocess.run, km._tmux_sessions, km._live_names)
         self.sent, self.focused, self.runs = [], [], []
+        # the revive door claims the name against a live snapshot first (names reserved atomically,
+        # 2026-09-08): an empty one here, so the tmux probe never lands in the subprocess.run stub below
+        km._tmux_sessions = lambda: {}
+        km._live_names = lambda tm: {}
         km._name_of = lambda sid: "testsess"
         km._cwd_of = lambda sid: "/nonexistent-dir-for-test"
         km._push_all = lambda: None
@@ -62,7 +66,7 @@ class ReviveSession(unittest.TestCase):
 
     def tearDown(self):
         (km._sdk, km._name_of, km._cwd_of, km._push_all, km._reveal_chat_for,
-         km._send_to_view, subprocess.run) = self.saved
+         km._send_to_view, subprocess.run, km._tmux_sessions, km._live_names) = self.saved
 
     def _stub_run(self, returncode=0, stderr=""):
         def run(cmd, **kw):
@@ -117,6 +121,7 @@ class ReviveSession(unittest.TestCase):
         # docstring may NAME the old path as history — the pin is on the invocation form.
         import inspect
         self.assertNotIn('HERE / "romp-postal-service"', inspect.getsource(km._revive_session))
+        self.assertNotIn('HERE / "romp-postal-service"', inspect.getsource(km._revive_session_inner))
 
 
 class SdkResumePreservesLastSid(unittest.TestCase):

@@ -357,7 +357,9 @@ test("the create dialog names the thread right there: prefilled <session>-commen
   assert.match(UI, /const metaRow = el\("div", "statusline cmt-meta-row"\);/);   // the chat statusline dress (2026-08-25 parity)
   assert.match(UI, /META_CHOICES\[kind\]/);
   assert.match(KERNEL, /model=str\(msg\.get\("model"\) or ""\), effort=str\(msg\.get\("effort"\) or ""\)/);
-  assert.match(KERNEL, /"%s-comment-%d" % \(sess\["name"\], len\(data\.get\("threads"\) or \[\]\) \+ 1\)/);
+  // the kernel's default starts from the same count, then bumps past every taken or in-flight name
+  // (session names are reserved atomically, 2026-09-08) — the prefill and the default agree on the count
+  assert.match(KERNEL, /n = len\(data\.get\("threads"\) or \[\]\) \+ 1[\s\S]{0,400}"%s-comment-%d" % \(sess\["name"\], n\)/);
   assert.match(UI, /const base = thName \|\|/, "break-out prefills the thread's own name");
 });
 

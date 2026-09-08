@@ -1116,8 +1116,10 @@ class CommentOps(CommentBase):
         self._saved_sessions = km._sessions
         self._saved_reveal = km._reveal_chat_for
         self._saved_push_now = km._push_session_now
+        self._saved_tmux = km._tmux_sessions
         km.Sessions.backend_for = staticmethod(lambda sid: self.be)
         km._sdk_ready = lambda: True
+        km._tmux_sessions = lambda: {}   # the create/promote doors' live snapshot (names reserved atomically) — never the box's tmux
         p = self._write(PARENT, self._parent_records())
         km._sessions = lambda now, window=None, forks=True: [
             {"sid": PARENT, "name": "parent", "path": str(p), "mtime": self.now}]
@@ -1130,6 +1132,7 @@ class CommentOps(CommentBase):
         km._sessions = self._saved_sessions
         km._reveal_chat_for = self._saved_reveal
         km._push_session_now = self._saved_push_now
+        km._tmux_sessions = self._saved_tmux
         self._clear_defaults()   # the module shares one hermetic STATE — never leak across tests
         super().tearDown()
 
