@@ -7667,7 +7667,8 @@ class SdkBackend:
                     atom["rompAuto"] = True
                 if e.get("dropped"):
                     atom["dropped"] = True
-                    self.forget_fed(reg["sid"], atom.get("uuid"))   # its landing will never come (T252c)
+                    if hasattr(self, "forget_fed"):      # a stand-in backend in tests borrows this method without the ledger
+                        self.forget_fed(reg["sid"], atom.get("uuid"))   # its landing will never come (T252c)
                 if isinstance(e.get("off"), int) and not isinstance(e.get("off"), bool):
                     atom["_echo_off"], atom["_echo_fsid"] = e["off"], str(e.get("fsid") or "")
                 if e.get("landed"):
@@ -7785,7 +7786,8 @@ class SdkBackend:
             if a["_echo_text"] in landed:
                 continue                                   # landed, un-pruned → the next build's prune_live
             a["dropped"] = True
-            self.forget_fed(sid, a.get("uuid"))   # its landing will never come (T252c)
+            if hasattr(self, "forget_fed"):
+                self.forget_fed(sid, a.get("uuid"))   # its landing will never come (T252c)
             self._touch_live(sid)
             self._log("%s: a send never reached its CLI (the process died holding it) — kept in the chat "
                       "as never-delivered: %.80r" % (sid[:8], a["_echo_text"]), problem=True)
