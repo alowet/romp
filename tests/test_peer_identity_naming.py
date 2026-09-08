@@ -7,8 +7,12 @@ arm hardcoded peers=None even when the stamp recorded its awaitPeers, and build_
 filtered on raw nodeComplete while its gate pierced done-markers for agent-open nodes (an empty scan
 minted a nameless, durationless wait the gate saw as real). One identity ladder (_peer_identity) now
 resolves every recorded shape: the names REGISTRY first — identity persists for DORMANT sessions,
-liveness is never a prerequisite for naming — else the composite's own parts (display-join on the
-canonical pair, per the federation rule), else the sid stub. All fixtures SYNTHETIC."""
+liveness is never a prerequisite for naming, else, for a bare sid another kernel owns, what its host
+calls it in the tunnel supervisor's snapshot, else the "<host>:<name>" the postal log itself paired
+with the sid (review find, 2026-09-08: the wait maps key a cross-host ask on the row's to_sid, and
+the registry knows no remote sid, so the awaiting chip named the peer by an eight-hex stub with no
+host), else the composite's own parts (display-join on the canonical pair, per the federation rule),
+else the sid stub. All fixtures SYNTHETIC."""
 import json
 import os
 import tempfile
@@ -68,6 +72,27 @@ class _Base(unittest.TestCase):
         (km.jd.GOALDIR / (SID + ".json")).write_text(json.dumps({
             "rompUuid": SID, "seq": 9, "placements": {}, "status": status or {}, "nodes": nodes}))
 
+    def _attach(self, host, sid, name=None):
+        # the tunnel supervisor's polled copy of a remote host's registry (the shape _host_for_sid and
+        # _remote_name_of read); a host polled before names were filed has the sid and no name
+        with km._remotes_lock:
+            km._remotes[host] = {"host": host, "sids": [sid], "names": ({sid: name} if name else {})}
+        self.addCleanup(lambda: km._remotes.pop(host, None))
+
+    def _postal(self, rows):
+        # a postal log of SYNTHETIC rows under the temp root; both kernel caches reset around it
+        path = Path(self.td.name) / "timeline" / "messages.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        saved = km.jd.MESSAGES
+        km.jd.MESSAGES = path
+
+        def _reset():
+            km._POSTAL_WAIT_CACHE[:] = [None, None]
+            km._POSTAL_PEER_NAMES[:] = [None, {}]
+        _reset()
+        self.addCleanup(lambda: (setattr(km.jd, "MESSAGES", saved), _reset()))
+
 
 class PeerIdentityLadder(_Base):
     """_peer_identity — the ONE resolve for every recorded peer shape."""
@@ -96,6 +121,41 @@ class PeerIdentityLadder(_Base):
     def test_bare_unknown_sid_stubs(self):
         got = km._peer_identity(FARSID)
         self.assertEqual((got["name"], got["host"], got["color"]), (FARSID[:8], "", None))
+
+    def test_a_remote_sid_names_from_its_hosts_polled_registry(self):
+        # review find, 2026-09-08: the wait maps key a cross-host ask on the row's to_sid: a bare sid
+        # this kernel's registry cannot name. What its host calls it is one read away (the supervisor's
+        # snapshot, the ladder the user ruled on 2026-09-06 for a federated session); the ladder skipped it.
+        self._attach("TESTHOST", FARSID, "api")
+        self.assertEqual(km._peer_identity(FARSID),
+                         {"name": "api", "host": "TESTHOST", "sid": FARSID, "color": None})   # stub on the PR head
+
+    def test_a_remote_sid_names_from_the_postal_logs_own_join_when_no_host_is_attached(self):
+        # a host reached through gossip is never polled, so no snapshot names its sessions, but the
+        # relay row that keyed the wait paired the sid with "<host>:<name>" itself, and the peer's own
+        # stamps do too; the newest sighting wins, so a rename reads through
+        self._postal([{"ev": "sent", "id": "m1", "from": "web", "from_id": SID, "to_id": "peer:TESTHOST",
+                       "toName": "TESTHOST:api", "to_sid": FARSID, "t": 100, "kind": "question", "body": "x"}])
+        self.assertEqual(km._peer_identity(FARSID),
+                         {"name": "api", "host": "TESTHOST", "sid": FARSID, "color": None})
+        self._postal([{"ev": "sent", "id": "m1", "from": "web", "from_id": SID, "to_id": "peer:TESTHOST",
+                       "toName": "TESTHOST:api", "to_sid": FARSID, "t": 100, "kind": "question", "body": "x"},
+                      {"ev": "sent", "id": "m2", "from": "api2", "from_id": FARSID, "from_host": "TESTHOST",
+                       "to_id": SID, "t": 200, "kind": "coordinate", "body": "renamed myself"}])
+        self.assertEqual(km._peer_identity(FARSID)["name"], "api2", "the peer's own later stamp wins")
+        self.assertEqual(km._peer_identity(FARSID)["host"], "TESTHOST")
+
+    def test_the_polled_registry_outranks_the_postal_join_and_the_owner_alone_keeps_the_host(self):
+        self._postal([{"ev": "sent", "id": "m1", "from": "web", "from_id": SID, "to_id": "peer:TESTHOST",
+                       "toName": "TESTHOST:old", "to_sid": FARSID, "t": 100, "kind": "question", "body": "x"}])
+        self._attach("TESTHOST", FARSID, "api")
+        self.assertEqual(km._peer_identity(FARSID)["name"], "api", "the host's live registry is authoritative")
+        km._remotes["TESTHOST"]["names"] = {}                  # polled before names were filed, no log join
+        km.jd.MESSAGES = Path(self.td.name) / "timeline" / "absent.jsonl"
+        km._POSTAL_WAIT_CACHE[:] = [None, None]
+        got = km._peer_identity(FARSID)
+        self.assertEqual((got["name"], got["host"], got["color"]), (FARSID[:8], "TESTHOST", None),
+                         "the stub keeps the host the supervisor knows (was: host '')")
 
 
 class DelegatedWaitNames(_Base):
@@ -147,6 +207,17 @@ class StampArmNamesPeers(_Base):
         aw = km._session_awaiting(SID, "/p", True, stamp=True)
         self.assertEqual(aw["kind"], "peer")
         self.assertEqual(aw["peers"][0]["name"], "web")
+
+    def test_session_arm_names_a_to_sid_keyed_remote_peer_with_its_host(self):
+        # the rendered chip (review find, 2026-09-08): a stamp whose awaitPeers is the bare remote sid
+        # the wait maps now key on carried name FARSID[:8] and host '' to every surface, the feed
+        # joins host+name for the label, so it read an eight-hex stub with no host for the whole wait
+        self._attach("TESTHOST", FARSID, "api")
+        self._stamped(peers=(FARSID,))
+        aw = km._session_awaiting(SID, "/p", True, stamp=True)
+        self.assertEqual(aw["peers"], [{"name": "api", "host": "TESTHOST", "sid": FARSID, "color": None}])
+        self.assertEqual([it["label"] for it in aw["items"]], ["api"], "the item label is the name, not the stub")
+        self.assertEqual(aw["count"], 1)
 
     def test_non_peer_and_recordless_stamps_keep_the_legacy_shape(self):
         # byte-identical dicts for every arm that has nothing to name — no key, not a null

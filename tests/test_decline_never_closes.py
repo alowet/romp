@@ -62,11 +62,11 @@ class _Base(unittest.TestCase):
         if jd.MESSAGES.exists():
             jd.MESSAGES.unlink()
 
-    def _seed_sender(self, peer=RECIP):
+    def _seed_sender(self, peer=RECIP, **handoff):
         st = jd.load_goals(SENDER)
         st["nodes"][U] = _node(U, "Improve the notes app across surfaces", None)
         st["nodes"][H] = _node(H, "↪ delegated to api: rework the gear menu", U,
-                               handoff={"peer": peer, "msgId": MID})
+                               handoff=dict({"peer": peer, "msgId": MID}, **handoff))
         # the adjacent ask the report will DECLINE — open, nothing ever filed under it
         st["nodes"][X] = _node(X, "Add tag editing to the tab dropdown", H, t=T + 10)
         # a step that earned its own verdict — it belongs to the delegation's history and stays
@@ -154,6 +154,75 @@ class LinkBackLift(_Base):
         self.assertTrue(st["nodes"][H].get("nodeComplete"))
         self.assertEqual(st["nodes"][X].get("parentId"), U)
         self.assertFalse(st["nodes"][X].get("nodeComplete"))
+
+
+class CrossHostReplyKeyedByWearerAtSendTime(_Base):
+    """The remote arm resolves the handoff's peer NAME to a sid AT the handoff's send time (2026-09-08,
+    jd._alias_at): the name→sid alias used to be last-write-wins over the whole log, so a name a NEW
+    session reused re-pointed every OLD handoff at the new wearer — the real recipient's report-back was
+    missed (its reply sits under the old sid), and the stranger's first mail read as the report-back.
+    That alias read is the LEGACY path (a tracker planted from a row without to_sid, the first two
+    tests). A tracker planted from a row that carries to_sid keys on that sid alone (handoff.toSid,
+    review find 2026-09-08, the last two): the same key the kernel's wait maps use for the row, so the
+    two readers of one log cannot disagree about one handoff."""
+
+    WX = "77777777-8888-9999-aaaa-000000000001"    # wore "worker_two" on boxa when the handoff was sent
+    WY = "77777777-8888-9999-aaaa-000000000002"    # reused the name later
+    ELSE = "88888888-9999-aaaa-bbbb-cccccccccccc"  # some other local session WY mailed
+
+    def _log(self, rows):
+        jd.MESSAGES.parent.mkdir(parents=True, exist_ok=True)
+        jd.MESSAGES.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        jd._PEER_ASK_CACHE[:] = [None, ({}, {}, {})]
+
+    def _row(self, i, sid, to, t):
+        return {"id": "m%d" % i, "ev": "sent", "from": "worker_two", "from_id": sid, "from_host": "boxa",
+                "to_id": to, "t": t, "kind": "coordinate", "body": "x"}
+
+    def test_the_wearer_at_send_time_reports_back_even_after_the_name_is_reused(self):
+        self._seed_sender(peer="boxa:worker_two")               # handoff sent at T
+        self._log([self._row(0, self.WX, SENDER, T - 100),      # WX wore the name before the handoff
+                   self._row(1, self.WX, SENDER, T + 60),       # …and is the one who reported back
+                   self._row(2, self.WY, self.ELSE, T + 500)])  # WY took the name later (never mailed SENDER)
+        self.assertEqual(jd.run_propagate(now=T + 1000), 1,
+                         "keyed to WX, the wearer at T: its reply completes the handoff (last-write-wins: "
+                         "keyed to WY, no reply, the handoff stays open)")
+        st = jd.load_goals(SENDER)
+        self.assertTrue(st["nodes"][H].get("nodeComplete"))
+        done = [e for e in st["nodes"][H]["log"] if e.get("kind") == "done" and e.get("src") == "courier"]
+        self.assertEqual([e.get("ev_t") for e in done], [T + 60], "the courier's verdict rides WX's reply")
+
+    def test_a_later_wearers_mail_is_not_the_report_back(self):
+        self._seed_sender(peer="boxa:worker_two")
+        self._log([self._row(0, self.WX, SENDER, T - 100),      # WX wore the name at T, never replied
+                   self._row(2, self.WY, SENDER, T + 500)])     # WY, wearing it later, mails SENDER
+        self.assertEqual(jd.run_propagate(now=T + 1000), 0,
+                         "a stranger's mail cannot complete WX's handoff (last-write-wins: done)")
+        self.assertFalse(jd.load_goals(SENDER)["nodes"][H].get("nodeComplete"))
+
+    def test_a_tracker_carrying_the_rows_to_sid_completes_on_that_sid_alone(self):
+        # review find, 2026-09-08: WY was recreated under WX's name and its FIRST mail to this host is
+        # its report-back, the shape no name alias can read (at T the name meant WX). The row named WY
+        # by id; the kernel's wait maps read that and called the row answered, while the arm, anchoring
+        # the name, keyed to WX and left the tracker open forever (main's last-write-wins completed it).
+        self._seed_sender(peer="boxa:worker_two", toSid=self.WY)
+        self._log([self._row(0, self.WX, SENDER, T - 100),      # WX wore the name before the handoff
+                   self._row(1, self.WY, SENDER, T + 60)])      # WY's first sighting IS the report-back
+        self.assertEqual(jd.run_propagate(now=T + 1000), 1,
+                         "keyed to the row's own sid: WY's reply completes it (anchored alias: WX, open)")
+        st = jd.load_goals(SENDER)
+        self.assertTrue(st["nodes"][H].get("nodeComplete"))
+        done = [e for e in st["nodes"][H]["log"] if e.get("kind") == "done" and e.get("src") == "courier"]
+        self.assertEqual([e.get("ev_t") for e in done], [T + 60], "the courier's verdict rides WY's reply")
+
+    def test_with_to_sid_the_names_earlier_wearer_is_a_stranger(self):
+        # the converse: the sid rules. WX, whom the send-time alias would pick, mails the sender; the
+        # row named WY, so that is not the report-back (anchored alias: done, on the wrong evidence)
+        self._seed_sender(peer="boxa:worker_two", toSid=self.WY)
+        self._log([self._row(0, self.WX, SENDER, T - 100),
+                   self._row(1, self.WX, SENDER, T + 60)])
+        self.assertEqual(jd.run_propagate(now=T + 1000), 0)
+        self.assertFalse(jd.load_goals(SENDER)["nodes"][H].get("nodeComplete"))
 
 
 class MigrateGateKeyPresence(_Base):

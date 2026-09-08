@@ -9457,7 +9457,61 @@ _PEER_ASK_RE = re.compile(r"^\s*(?:QUESTION|ASK|Q)\b", re.I)   # legacy pre-`kin
 _PEER_ASK_CACHE = [None, ({}, {}, {})]   # (mtime_ns, size) , (last_any, last_ask, alias) — one scan per log change
 
 
+def _learn_alias(alias, o):
+    """Record one name→sid sighting from a row a REMOTE sender stamped: alias["<host>:<name>"] is the
+    time-ordered history [(t, sid), …] of who wore that name on that host (see _alias_at)."""
+    if o.get("from_host") and o.get("from") and o.get("from_id"):
+        try:
+            at = int(o.get("t") or 0)
+        except (TypeError, ValueError):
+            at = 0
+        alias.setdefault(str(o["from_host"]) + ":" + str(o["from"]), []).append((at, str(o["from_id"])))
+
+
+def _alias_settle(alias):
+    """Order each name's sightings by t and collapse CONSECUTIVE sightings of one sid into one entry, so
+    the history is per WEARER CHANGE, not per row (a chatty peer name otherwise carries thousands of
+    identical sightings that _alias_at walks for every legacy row). Result-identical: the sid in force
+    at any t is unchanged. Call once after the scan, before any _alias_at."""
+    for key, hist in alias.items():
+        hist.sort(key=lambda e: e[0])
+        kept = []
+        for e in hist:
+            if not kept or kept[-1][1] != e[1]:
+                kept.append(e)
+        alias[key] = kept
+
+
+def _alias_at(alias, key, t):
+    """The sid the cross-host name `key` ("<host>:<name>") resolved to AT time t: the most recent
+    sighting at or before t, else the earliest known (a message sent before the peer first spoke
+    still went to the session that then answered). None when the name was never seen. The map used
+    to be last-write-wins over the whole log (2026-09-08), so a name a NEW session reused re-keyed
+    every OLD message to the new sid: an answered question read unanswered (its reply sits under the
+    old sid), a stamp awaiting the old sid could never see its answer, and a stranger's coordinate
+    counted as the reply. Anchoring each row at its own send time keeps it keyed to the session it
+    really went to. `alias` must have been through _alias_settle (sorted, one entry per wearer change)."""
+    hist = alias.get(key)
+    if not hist:
+        return None
+    sid = hist[0][1]
+    for at, s in hist:
+        if at <= t:
+            sid = s
+        else:
+            break
+    return sid
+
+
 def _postal_ask_maps():
+    """(last_any, last_ask, alias) from the postal log, cached on (mtime, size). Per ordered pair
+    (from_id, to_id): last_any the latest t of ANY message, last_ask the latest t of a reply-expecting
+    ask (kind=question; a kindless legacy row by its QUESTION/ASK lead word).
+    A cross-host row (to_id "peer:<host>") keys on the recipient's STABLE id: `to_sid` when the row
+    carries it (relay rows since 2026-09-08), else the name alias AT the row's send time (_alias_at),
+    else the raw "peer:<host>:<name>". `alias` is the time-ordered name→sid history the re-key used;
+    consumers resolve a name through _alias_at with the time of the message they hold, never by a
+    bare lookup."""
     try:
         st = MESSAGES.stat()
         key = (st.st_mtime_ns, st.st_size)
@@ -9473,15 +9527,18 @@ def _postal_ask_maps():
             except Exception:
                 continue
             rows.append(o)
-            if o.get("from_host") and o.get("from") and o.get("from_id"):
-                alias[str(o["from_host"]) + ":" + str(o["from"])] = str(o["from_id"])
+            _learn_alias(alias, o)
+        _alias_settle(alias)
         for o in rows:
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
                 continue
-            if isinstance(t_, str) and t_.startswith("peer:") and o.get("toName"):
-                t_ = alias.get(str(o["toName"]), "peer:" + str(o["toName"]))
             ts = int(ts)
+            if isinstance(t_, str) and t_.startswith("peer:"):
+                if o.get("to_sid"):
+                    t_ = str(o["to_sid"])                # the id the send resolved — exact, rename-proof
+                elif o.get("toName"):
+                    t_ = _alias_at(alias, str(o["toName"]), ts) or "peer:" + str(o["toName"])
             last_any[(f, t_)] = max(last_any.get((f, t_), 0), ts)
             k = o.get("kind")
             is_ask = (k == "question") if k else bool(_PEER_ASK_RE.match(o.get("body") or ""))
@@ -13117,13 +13174,17 @@ def _handoff_backref(mid):
     return "", ""
 
 
-def _plant_handoff_track(store, parent_id, text, peer_sid, peer_name, t, mid, tracked=False):
+def _plant_handoff_track(store, parent_id, text, peer_sid, peer_name, t, mid, tracked=False, to_sid=None):
     """Mint a precise '↪ delegated to <peer>' TRACKING node in the SENDER's own tree (the user 2026-06-22):
     the exact item B's completion checks off, so a PARTIAL handoff doesn't over-complete the sender's broader
     goal. Filed under the courier's linked goal (parent_id) if any, else top-level. Carries handoff:{peer,
     msgId} both as the run_propagate target and so the feed can badge it; a TRACKED report-back delegation
     (the user 2026-08-24) adds handoff.tracked — this node's card is the pair's PRIMARY, and the recipient's
-    planted goal is marked its satellite. Idempotent by msgId. Returns its id."""
+    planted goal is marked its satellite. `to_sid` (review find, 2026-09-08) is the recipient's STABLE id
+    when the sent row carried one (a cross-host relay row's `to_sid`): it rides as handoff.toSid beside the
+    display identity in handoff.peer ("<host>:<name>"), so run_propagate's remote arm keys the report-back
+    on the exact sid the send resolved, the same key the kernel's wait maps use for that row, instead of
+    re-deriving it from the name. Idempotent by msgId. Returns its id."""
     nodes = store["nodes"]
     for nid, nd in nodes.items():
         h = nd.get("handoff")
@@ -13131,6 +13192,9 @@ def _plant_handoff_track(store, parent_id, text, peer_sid, peer_name, t, mid, tr
             if tracked and not h.get("tracked"):
                 h["tracked"] = True                     # a replant that learned the flag (a crash between
                 #                                         the two store saves) upgrades in place; never down
+            if to_sid and not h.get("toSid"):
+                h["toSid"] = str(to_sid)                # same in-place upgrade for the exact key: a tracker
+                #                                         planted before the row's to_sid was read learns it
             return nid                                  # already planted for this message → idempotent
     if parent_id is not None and parent_id not in nodes:
         parent_id = None                                # linked goal vanished → file as a top, never orphan
@@ -13157,6 +13221,8 @@ def _plant_handoff_track(store, parent_id, text, peer_sid, peer_name, t, mid, tr
             #                                            fan-out contract, test_chain_rooted_minting)
     if tracked:
         handoff["tracked"] = True
+    if to_sid:
+        handoff["toSid"] = str(to_sid)
     nodes[nid] = GuardedNode({"id": nid, "text": label[:120], "parentId": parent_id,
                   "nodeComplete": False, "blocked": False, "cleared": False,
                   "trail": [], "t": t, "mt": t, "handoff": handoff, "log": []})
@@ -13544,8 +13610,14 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
     # Granularity is per-PEER, not per-message — the log carries no reply→delegate join, so one
     # reply completes every outstanding cross-host handoff to that peer sent at/before it; coarse,
     # but forward-only and honest, where the alternative was a wait no event could ever end. Keys
-    # re-derive from the stored toName exactly as the wait maps do: the alias when the peer has
-    # spoken (it must have, to reply), else the raw relay key.
+    # derive exactly as the wait maps derive them for the same row (review find, 2026-09-08: the
+    # arm re-derived by name alone while the kernel's maps read the row's to_sid, so a handoff to a
+    # recreated same-named peer whose first mail here was its report-back lifted the stamp and
+    # left the tracker open forever): the row's own stable id when the plant carried it
+    # (handoff.toSid), else, a legacy row, the alias the stored toName resolved to AT the
+    # handoff's send time when the peer has spoken (it must have, to reply), else the raw relay
+    # key. Anchored so a name a later session reused cannot make that stranger's mail the
+    # report-back (2026-09-08).
     last_any, _la, alias = _postal_ask_maps()
     _rmemo = {}                                        # recipient sid -> merged nodes (per-pass, read-only)
 
@@ -13622,8 +13694,12 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
                 reply = last_any.get((pk, fsid), 0)
             else:
                 keys = {"peer:" + pk}
-                if alias.get(pk):
-                    keys.add(alias[pk])
+                if h.get("toSid"):
+                    keys.add(str(h["toSid"]))          # the sid the send resolved: exact, rename-proof
+                else:
+                    asid = _alias_at(alias, pk, nd.get("t") or 0)   # legacy plant: the wearer at send time
+                    if asid:
+                        keys.add(asid)
                 reply = max((last_any.get((k, fsid), 0) for k in keys), default=0)
             if reply and reply >= (nd.get("t") or 0):
                 why = (("reported back by %s (delegated; the recipient's card was dismissed)" % pk[:8])
@@ -13712,7 +13788,9 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
     # judge, and the send ack already told the sender "they own it now". Declared-only on purpose:
     # a kindless legacy row is indistinguishable from a coordinate, and planting from a guess mints
     # noise. handoff.peer stores toName ("<host>:<name>") — the identity every display resolves
-    # (the quiet host: prefix) and the key run_propagate's remote arm re-derives pair keys from.
+    # (the quiet host: prefix) and the key run_propagate's remote arm re-derives pair keys from
+    # for a row without to_sid; a row that carries to_sid (relay rows since 2026-09-08) also
+    # plants it as handoff.toSid, the exact key that arm reads first (review find, 2026-09-08).
     # `tracked` never rides here: the relay drops the flag by design (a primary/satellite pair
     # cannot span kernels yet). Horizon-bounded like every courier retry, so old history is never
     # backfilled; idempotent by msgId, so one plant per message ever.
@@ -13742,7 +13820,8 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
                for nd in sstore["nodes"].values()):
             continue
         head = " ".join(str(o.get("body") or "").split())[:120]
-        _plant_handoff_track(sstore, None, head, str(o["toName"]), str(o["toName"]), int(o["t"]), o["id"])
+        _plant_handoff_track(sstore, None, head, str(o["toName"]), str(o["toName"]), int(o["t"]), o["id"],
+                             to_sid=(str(o["to_sid"]) if o.get("to_sid") else None))   # the row's exact key rides along (review find, 2026-09-08)
         rollup_status(sstore, False)
         save_goals(o["from_id"], sstore)
         placed += 1

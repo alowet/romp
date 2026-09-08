@@ -589,7 +589,9 @@ def _queue_read_receipt(meta, unread=False, dmid=""):
 #      {ev:"sent", id, from, from_id, to_id, body, t, park?, kind?, from_host?, tracked?}
 #      (park/kind/from_host/tracked are all additive; `tracked` marks a report-back delegation —
 #      kind stays "delegate" — whose sender-side view is primary: the kernel courier reads it off
-#      this row, never off the message prose).
+#      this row, never off the message prose). A CROSS-HOST relay row has to_id "peer:<host>" and
+#      adds toName ("<host>:<name>") + to_sid (the recipient's stable id — the wait readers key on
+#      it; rows from before 2026-09-08 lack it and fall back to the name alias).
 # The HUMAN-FACING prose (banner text, headers, the "⏸ parked" tag, REPLY_HINT) is
 # NOT a contract — consumers must not parse it, so it stays free to change.
 
@@ -1882,10 +1884,17 @@ class Handler(BaseHTTPRequestHandler):
                     if ua:
                         relay_msg["userAsk"] = ua
                 outbox_put(phost, relay_msg)
+                # `to_sid` (2026-09-08): the recipient's STABLE id, the same value the wire's toId
+                # carries. The row used to name the recipient only ("<host>:<name>"), so every
+                # reader of the wait (the kernel's wait maps, the judge's ask maps) had to join it
+                # back to a sid through a name→sid alias learned from the peer's own rows — and a
+                # name reused by a NEW session re-keyed every OLD message to the new sid. With the
+                # sid on the row the join is exact; the alias stays the fallback for older rows.
                 _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "sent", "id": mid,
                                               "from": frm, "from_id": frm_id,
                                               "to_id": "peer:%s" % phost,
                                               "toName": "%s:%s" % (phost, hit.get("name") or to),
+                                              "to_sid": str(hit.get("id") or ""),
                                               "body": body, "kind": kind})
                 if PEERS.get(phost, {}).get("up"):
                     return self._send({"ok": True, "id": mid,
@@ -2684,17 +2693,28 @@ def fleet_presence(exclude_host):
 # cards (fast, bus-down-resilient); mutations go through the bus routes below (delivery is postal's).
 QUARANTINE = STATE / "quarantine"
 
-def _quarantine_put(origin, m, to_id, via=""):
+def _quarantine_put(origin, m, to_id, via="", wire_id=None):
     """Hold one inbound relay from a directed host: quarantine/<mid>.json with everything approve needs
     to replay deliver(). Idempotent by mid (a resend overwrites the same file, never double-holds).
     `via` is the DIRECT peer it arrived from — kept so an approved delivery still carries the
-    read-receipt route (older held records lack it; approve falls back to the origin)."""
+    read-receipt route (older held records lack it; approve falls back to the origin).
+    `wire_id` (2026-09-08) is the sid the WIRE message was addressed to (intake's sanitized toId),
+    stored as `toWireId` so approve knows whether the sender chose a sid or a name: the record used
+    to keep only the RESOLVED local sid, and once that session ended approve re-matched by NAME —
+    handing id-addressed mail to whatever session wore the name, the very swap intake refuses. None
+    reads the wire toId off `m`; either way a malformed shape is dropped (never a path, never a
+    match key), exactly as intake blanks it."""
     mid = m.get("mid") or ""
     if not _safe_id(mid):
         return False
+    wire = str((m.get("toId") if wire_id is None else wire_id) or "")
+    if wire and _ID_FORM_RE.fullmatch(wire) is None:
+        wire = ""
     rec = {"mid": mid, "to": m.get("to") or "", "toId": to_id, "frm": m.get("frm") or "?",
            "frmId": m.get("frm_id") or "", "body": m.get("body") or "", "kind": m.get("kind") or "",
            "origin": origin, "via": via or origin, "at": int(time.time())}
+    if wire:
+        rec["toWireId"] = wire
     if isinstance(m.get("userAsk"), dict):
         rec["userAsk"] = m["userAsk"]                # held with its provenance; approve replays it (T126)
     try:
@@ -2777,7 +2797,30 @@ def quarantine_decide(mid, action, text=None, feedback=None):
             return False, ("the liveness source (the romp kernel) didn't answer — likely "
                            "mid-restart. The held message is untouched; retry the approve shortly.")
         live = {a["id"] for a in agents}
-        if to_id not in live:                         # session renamed/revived since it was held → re-match by name
+        if to_id not in live:                         # the held sid is gone: renamed/revived, or ended
+            wire = str(rec.get("toWireId") or "")
+            if wire:
+                # ID-ADDRESSED mail (2026-09-08): the sender chose a sid, so only that sid may take
+                # it — the same id-strict rule intake applies (_relay_in: "never a name fallback,
+                # which could hand the mail to a same-named sibling"). Before this, approve
+                # re-matched by NAME unconditionally, and id-addressed mail whose recipient had
+                # ended went to whatever session now wore the name. The held sid IS the wire id
+                # (intake matched the wire's toId exactly and held that match), so a held sid the
+                # listing no longer carries means nothing live answers to the id the sender chose:
+                # there is no second candidate to look for (review find, 2026-09-08: a re-match on
+                # the wire id here could never succeed). Refuse loudly; the record stays held (deny
+                # carries a note back to the sender). Worded on what the listing proved, no live
+                # session by that id, never "ended": a dormant session is absent from it too.
+                return False, ("no live session carries the id this message was addressed to ('%s', "
+                               "id %s), and a session that now wears the name is not the one the "
+                               "sender chose, so it was not delivered. It stays held: deny it (with a "
+                               "note, so the sender hears) or leave it."
+                               % (rec.get("to") or "?", wire[:8]))
+            # NAME-addressed (an older sender): the name still rules. A record held BEFORE
+            # 2026-09-08 lands here too even when its wire chose a sid, the hold kept only the
+            # resolved sid then, so nothing on the record can tell the two apart; that name
+            # re-match is a known residual for holds from before the upgrade, and it drains with
+            # their next approve/deny (review find, 2026-09-08).
             match = [a for a in agents if a["name"] == rec.get("to") and not _postal_off(a["id"])]
             if not match:
                 return False, "recipient '%s' is no longer a live local session" % (rec.get("to") or "?")
@@ -2858,7 +2901,9 @@ def _relay_in(host, m, token_proven=False):
                     relay_mid=mid, relay_via=host,       # read-receipt route: back through the direct peer
                     user_ask=m.get("userAsk"))           # origin-kernel walked record rides through (T126)
         elif trust == "directed":
-            _quarantine_put(origin, m, match[0]["id"], via=host)   # HELD for human approve/deny/edit; never injects
+            _quarantine_put(origin, m, match[0]["id"], via=host, wire_id=to_id)   # HELD for human approve/deny/edit;
+            #                                                                        never injects; remembers whether
+            #                                                                        the wire chose a sid (approve is id-strict then)
         # else isolated → drop: ack so the sender stops resending, but deliver nothing (no communication).
         # An isolated host normally never peers at all (the kernel forces its notify down), so this is a
         # defensive backstop for the checkin-peer path where the mobile dials our /peer-exchange.

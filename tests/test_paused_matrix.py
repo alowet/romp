@@ -128,8 +128,10 @@ class MatrixMint(_Base):
         # the pair-blind trade (documented in _peer_answered_at): the answered exchange is with a
         # DIFFERENT topic/peer than the stamp's subject, and the stamp still goes dark. The sweep's
         # durable lift is what turns this cell from paused-forever into a fresh closer ruling.
+        # PIN MOVED 2026-09-08: the outbound is a QUESTION (was a coordinate) — the answered clock walks
+        # reply-REQUIRING sends, and a coordinate-only exchange answers nothing (test_awaiting_peer_matrix).
         other = "99999999-aaaa-bbbb-cccc-dddddddddddd"
-        self._log([_msg(1, SID, other, STAMP_EV - 50, "coordinate"),
+        self._log([_msg(1, SID, other, STAMP_EV - 50, "question"),
                    _msg(2, other, SID, REPLY, "coordinate")])
         self.assertTrue(self._dark(self._node(kind="peer")),
                         "any answered outbound pair supersedes a peer stamp (the known trade)")

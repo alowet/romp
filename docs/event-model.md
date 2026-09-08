@@ -280,7 +280,17 @@ triggers).
 **Postal detection.** A user atom is postal when it carries the
 `<!-- romp-msg-id: <id> -->` marker. Fill the peer ROMP UUID by joining that id to
 `timeline/messages.jsonl`: the `sent` row's `from_id` is the sender's anchor sid,
-`to_id` the recipient. peer = null only when the id isn't in the log (legacy/rare).
+`to_id` the recipient. A cross-host relay row's `to_id` is `peer:<host>` (the relay,
+not a session); the recipient's stable id rides the additive `to_sid` key (rows since
+2026-09-08), with `toName` = `<host>:<name>` for display. peer = null only when the id
+isn't in the log (legacy/rare).
+Two rules the wait readers apply to these rows: only a `question` or a `delegate` opens
+a wait, so the answered clock walks reply-requiring sends and a coordinate-only exchange
+neither opens nor reopens one (a reply of any kind still answers). A row without
+`to_sid` keys by whoever wore the name AT the row's send time, so a pre-2026-09-08 ask
+to a recreated same-named peer whose first sighting here is its own reply stays keyed
+to the prior wearer and reads open until the 6h wake: a known residual, legacy rows
+only, since new rows carry the id.
 The postal log is the authoritative sender-identity source (the same contract
 postal-spec.ts relies on), so identity needs no inline `from=` marker. Never key on
 the `"Stop hook feedback"` prefix: it is Claude Code's generic wrapper around any
