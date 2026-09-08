@@ -19747,28 +19747,27 @@ def _update_remote(host, head=None):
         'if [ ! -x "$R/bin/romp-serve" ]; then echo "NOLAUNCH:$NEW$K"; exit 0; fi; '
         # NEVER AN ANONYMOUS SIGTERM (T238, the T121 rule): a restart-audit row lands BEFORE whichever
         # restart happens, so the far kernel's cut row carries WHO and WHY (the p2p update, from this
-        # machine, to this sha) — nine restarts in three hours had no reason on record. The QUIET row
-        # lands HERE, right after the reset and before the owner check (T240d): the far kernel's drift
-        # check stands down for a quiet deploy of the code its checkout holds by reading this row, and
-        # the owner check's manager status call was a window in which the checkout was already ahead
-        # with no row on disk. When no owning manager answers, the fallback below writes its own
-        # IMMEDIATE row, which is then the newest and supersedes this one for every reader. The
-        # restart goes THROUGH THE FAR MANAGER'S QUIET WINDOW (restart-all --quiet: no in-flight turn is cut,
-        # the 15-minute backstop still lands the deploy, a second apply arriving while one is pending
-        # coalesces into the same bounce) — but ONLY when that manager actually OWNS the kernel on the
-        # polled port (its /status lists it): a manager owning nothing, or a bare kernel beside a
-        # crash-looping managed one, answers 202 and restarts nothing, which would have turned this
-        # into a silent never-restart (review find). SYNCED:<sha>:QUIET = deferred; SYNCED:<sha>:FALLBACK
-        # = the immediate path below ran (no owning manager reachable — node absent, no manager, or
-        # the polled kernel is bare). The quiet audit row says when=quiet; the fallback writes its own
-        # row without it, so the cut row joins the right request with the right window.
+        # machine, to this sha) — nine restarts in three hours had no reason on record. The row lands
+        # HERE, right after the reset and before the owner check (T240d), so the far kernel's drift check
+        # reads the request the moment its checkout is ahead. When no owning manager answers, the
+        # fallback below writes its own row, which is then the newest and supersedes this one for every
+        # reader. The restart goes THROUGH THE FAR MANAGER and lands AT ONCE (T269, the user 2026-09-08:
+        # every deploy restart bounces immediately — the parked quiet window held the devbox unusable
+        # for the full 15-minute backstop on 26 of 32 restarts in a morning, and boot reconcile resumes
+        # the cut turns with their history either way, so an immediate bounce costs seconds; the quiet
+        # window survives only as the explicit `romp refresh --quiet`) — but ONLY when that manager
+        # actually OWNS the kernel on the polled port (its /status lists it): a manager owning nothing,
+        # or a bare kernel beside a crash-looping managed one, answers 202 and restarts nothing, which
+        # would have turned this into a silent never-restart (review find). SYNCED:<sha>:MANAGED = the
+        # manager bounced it; SYNCED:<sha>:FALLBACK = the kill path below ran (no owning manager
+        # reachable — node absent, no manager, or the polled kernel is bare).
         'python3 -c "import json,time;print(json.dumps({\'t\':int(time.time()),\'action\':\'p2p-update\','
-        '\'reason\':\'from %s to %s\',\'when\':\'quiet\'}))" >>"$LOGDIR/restart-audit.jsonl" 2>/dev/null || true; '
+        '\'reason\':\'from %s to %s\'}))" >>"$LOGDIR/restart-audit.jsonl" 2>/dev/null || true; '
         'OWNED=0; if command -v node >/dev/null 2>&1 && [ -x "$R/bin/romp-manager" ]; then '
         'OWNED="$("$R/bin/romp-manager" status 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); '
         'print(1 if any(int(k.get(\'port\') or 0)==%d for k in (d.get(\'kernels\') or [])) else 0)" 2>/dev/null || echo 0)"; fi; '
         'if [ "$OWNED" = 1 ]; then '
-        'if "$R/bin/romp-manager" restart-all --quiet >>"$LOGDIR/update.log" 2>&1; then echo "SYNCED:$NEW:QUIET$K"; exit 0; fi; fi; '
+        'if "$R/bin/romp-manager" restart-all >>"$LOGDIR/update.log" 2>&1; then echo "SYNCED:$NEW:MANAGED$K"; exit 0; fi; fi; '
         # LAST RESORT (no owning manager answering on this host): the immediate path below — audit row,
         # kill, then `ensure` upgrades the host to a supervised kernel.
         'python3 -c "import json,time;print(json.dumps({\'t\':int(time.time()),\'action\':\'p2p-update\','
@@ -19837,10 +19836,10 @@ def _update_remote(host, head=None):
         if tag == "SYNCED":
             short, _, mode = rest.partition(":")
             mode = mode.strip()
-            _expect(mode == "QUIET")
+            _expect(False)                    # every deploy restart is immediate (T269): the short expectation window
             short = short.strip() or lfull[:8]
-            if mode == "QUIET":
-                return True, "synced to %s — restarting at its next quiet window" % short
+            if mode == "MANAGED":
+                return True, "synced to %s + restarting now (through its manager)" % short
             if mode == "FALLBACK":
                 return True, ("synced to %s + restarting now (no manager owns that kernel there — an "
                               "immediate restart)" % short)

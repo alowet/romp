@@ -116,27 +116,49 @@ class UpdateRemote(unittest.TestCase):
         self.assertIn(self.LFULL + ":refs/heads/" + km._P2P_REF, push,
                       "pushes the exact advertised sha to the scratch ref, not a HEAD that may move under it")
 
-    def test_the_apply_restarts_through_the_manager_quiet_window_with_an_audit_row(self):
+    def test_the_apply_restarts_through_the_manager_at_once_with_an_audit_row(self):
         # T238: the remote apply used to `pkill` the far kernel outright — an anonymous, immediate
-        # SIGTERM (no restart-audit row, no quiet window: nine in-flight-turn cuts in three hours on a
-        # merge day, each read by the dialing side as "unreachable"). The apply now writes the audit
-        # row first and asks the far MANAGER for a quiet-window restart; pkill survives only as the
-        # last-resort branch for a host with no manager.
-        calls = self._wire(apply_out="SYNCED:abcdef0:QUIET")
+        # SIGTERM (no restart-audit row: nine in-flight-turn cuts in three hours on a merge day, each
+        # read by the dialing side as "unreachable"). The apply writes the audit row first and asks the
+        # far MANAGER for the restart; pkill survives only as the last-resort branch for a host with no
+        # manager. T269 (the user 2026-09-08): the manager bounces AT ONCE — the parked quiet window
+        # held a box unusable for the full 15-minute backstop on 26 of 32 restarts in a morning, and
+        # boot reconcile resumes the cut turns either way; the quiet window is `romp refresh --quiet` only.
+        calls = self._wire(apply_out="SYNCED:abcdef0:MANAGED")
         km._remotes["TESTHOST"] = {"host": "TESTHOST"}
         self.addCleanup(km._remotes.pop, "TESTHOST", None)
         ok, detail = km._update_remote("TESTHOST")
         self.assertTrue(ok, detail)
-        self.assertIn("quiet window", detail)
+        self.assertIn("restarting now", detail)
+        self.assertNotIn("quiet", detail)
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "reset --hard" in a[-1])
         self.assertIn("restart-audit.jsonl", apply, "the restart is never anonymous")
         self.assertIn("p2p-update", apply)
-        self.assertIn("restart-all --quiet", apply, "the manager's quiet-window gate, not a kill")
-        self.assertLess(apply.index("restart-all --quiet"), apply.index('pkill -f "bin/romp-kern[e]l"'),
+        self.assertIn('romp-manager" restart-all >>', apply, "the manager's IMMEDIATE restart, not a kill")
+        self.assertNotIn("restart-all --quiet", apply, "no deploy path asks for the quiet window (T269)")
+        self.assertNotIn("'when':'quiet'", apply, "the p2p row is an immediate request: no quiet marker")
+        self.assertLess(apply.index('restart-all >>'), apply.index('pkill -f "bin/romp-kern[e]l"'),
                         "pkill is the fallback AFTER the manager path, never the first move")
         exp = km._remotes["TESTHOST"].get("restartExpected")
-        self.assertTrue(exp and exp.get("sha") == self.LFULL and exp.get("t") and exp.get("quiet") is True,
-                        "the dialing side is told to expect the restart it just caused")
+        self.assertTrue(exp and exp.get("sha") == self.LFULL and exp.get("t") and exp.get("quiet") is False,
+                        "the dialing side expects the restart it just caused, on the immediate window")
+
+    def test_every_deploy_restart_is_immediate_and_only_refresh_quiet_defers(self):
+        # T269, the three deploy callers: a peer's p2p update (the apply script above), a release
+        # self-update (_run_update, immediate since T160) and the automatic converge (_run_main_update's
+        # default). The quiet window's one door is `romp refresh --quiet`: bin/romp forwards the flag,
+        # bin/romp-manager maps it to when=quiet, and nothing else sends it.
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ksrc = open(os.path.join(root, "kernel", "kernel.py")).read()
+        i = ksrc.index("def _run_update(tag):"); j = ksrc.index("\ndef ", i + 10)
+        self.assertNotIn("when=quiet", ksrc[i:j], "the release self-update restarts at once")
+        self.assertIn("def _run_main_update(kind, immediate=True", ksrc, "the converge's default is immediate")
+        self.assertNotIn("restart-all --quiet", ksrc, "no kernel-generated script asks the manager for the quiet window")
+        cli = open(os.path.join(root, "bin", "romp")).read()
+        self.assertIn('restart-all "${2:-}"', cli, "romp refresh forwards --quiet, the one door")
+        mgr = open(os.path.join(root, "bin", "romp-manager")).read()
+        self.assertIn("process.argv[3] === '--quiet' ? { when: 'quiet' } : {}", mgr, "…which the manager maps to when=quiet")
 
     def test_a_host_with_no_owning_manager_restarts_the_old_way_and_says_so(self):
         calls = self._wire(apply_out="SYNCED:abcdef0:FALLBACK")
@@ -148,28 +170,28 @@ class UpdateRemote(unittest.TestCase):
         self.assertNotIn("quiet window", detail)
         self.assertIs(km._remotes["TESTHOST"]["restartExpected"]["quiet"], False)
 
-    def test_the_quiet_path_requires_the_manager_to_own_the_polled_kernel(self):
+    def test_the_managed_path_requires_the_manager_to_own_the_polled_kernel(self):
         # a manager owning nothing (or a bare kernel beside a crash-looping managed one) answers 202
         # and restarts nothing — trusting it turned the update into a silent never-restart (review)
-        calls = self._wire(apply_out="SYNCED:abcdef0:QUIET")
+        calls = self._wire(apply_out="SYNCED:abcdef0:MANAGED")
         km._update_remote("TESTHOST")
         apply = next(a[-1] for a in calls if isinstance(a[-1], str) and "reset --hard" in a[-1])
         self.assertIn('romp-manager" status', apply, "ownership is read from the manager's own registry")
-        self.assertLess(apply.index('romp-manager" status'), apply.index("restart-all --quiet"))
+        self.assertLess(apply.index('romp-manager" status'), apply.index('restart-all >>'))
         self.assertIn('if [ "$OWNED" = 1 ]', apply)
-        # per-branch audit rows: the quiet row precedes the quiet call; the fallback writes its own
-        # row (no when=quiet) right before pkill, so the cut row joins the request that happened
+        # per-branch audit rows: the request row precedes the manager call; the fallback writes its own
+        # row right before pkill, so the cut row joins the request that happened
         self.assertEqual(apply.count("restart-audit.jsonl"), 2)
-        self.assertLess(apply.index("p2p-update"), apply.index("restart-all --quiet"),
-                        "the quiet row lands before the quiet request")
-        self.assertLess(apply.index("restart-all --quiet"), apply.index("immediate: no owning manager"),
-                        "the fallback writes its own row after the quiet branch was skipped")
+        self.assertLess(apply.index("p2p-update"), apply.index('restart-all >>'),
+                        "the request row lands before the manager request")
+        self.assertLess(apply.index('restart-all >>'), apply.index("immediate: no owning manager"),
+                        "the fallback writes its own row after the managed branch was skipped")
         self.assertLess(apply.index("immediate: no owning manager"), apply.index('pkill -f "bin/romp-kern[e]l"'))
         self.assertIn('SYNCED:$NEW:FALLBACK', apply)
 
     def test_both_generated_apply_scripts_parse_as_bash(self):
         import shlex, subprocess as sp
-        calls = self._wire(apply_out="SYNCED:abcdef0:QUIET")
+        calls = self._wire(apply_out="SYNCED:abcdef0:MANAGED")
         km._update_remote("TESTHOST")
         wrapper = next(a[-1] for a in calls if isinstance(a[-1], str) and "reset --hard" in a[-1])
         inner = shlex.split(wrapper.split("; if command -v setsid")[0][len("APPLY="):])[0]
@@ -266,7 +288,7 @@ class UpdateRemote(unittest.TestCase):
         # having pushed nothing (and when it did push, the restart it told itself to expect named the old
         # sha). The transport reads the head the user actually has.
         stale, fresh = "3" * 40, "4" * 40
-        calls = self._wire(rhead=stale, apply_out="SYNCED:4444444:QUIET")   # the peer is on the OLD commit
+        calls = self._wire(rhead=stale, apply_out="SYNCED:4444444:MANAGED")   # the peer is on the OLD commit
         km._HEAD_CACHE.update(ts=9e18, full=stale, short=stale[:8])          # the cache still says so too
         km._remotes["TESTHOST"] = {"host": "TESTHOST"}
         self.addCleanup(km._remotes.pop, "TESTHOST", None)
@@ -337,7 +359,7 @@ class UpdateRemote(unittest.TestCase):
             if "for d in" in cmd:
                 return _R(out="DIR:/home/u/romp\nHEAD:%s\nDIRTY:" % remote)         # the peer never restarts
             if "merge-base" in cmd or "reset --hard" in cmd:
-                return _R(out="SYNCED:4444444:QUIET")
+                return _R(out="SYNCED:4444444:MANAGED")
             return _R()
         km.subprocess.run = fake
         km._behind_info = lambda sha, head=None: {"behind": 1, "ahead": 0, "date": ""}   # a straight fast-forward
