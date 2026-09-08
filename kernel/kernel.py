@@ -35959,6 +35959,67 @@ def _cached_feed(now, tmux, sig, connect=False):
     return feed
 
 
+# GET /feed.json's copy of the feed: a READ that changes nothing (2026-09-08). _cached_feed is the PUSHER's
+# door, and its build branch is where the bells diff (_feed_notifications advances _NOTIFY_PREV and prunes
+# notify-cards.json on disk), the app badge moves (_badge_push sends a frame) and the pusher's own cache
+# fills — a fresh build IS the transition event there, by design. A monitoring script's GET is not that
+# event, yet the route used to answer through that door with connect=True: fine on a warmed kernel (the
+# connect arm serves the pusher's copy), but on a HEADLESS one — no client rides the feed payload, so the pusher
+# never fills _built_feed — every GET took the cold branch, and a script's read pruned the bell's card
+# overrides on disk, advanced the notification baseline past changes nobody had been told about, pushed
+# a badge to the shells, and filled the pusher's cache. This slot holds the pure path's own build,
+# (payload, built_at, build_started_at) — a TUPLE rebound whole, so a concurrent reader never sees a
+# torn entry (the _feed_wire discipline). Never _built_feed: a pure build in that slot would satisfy the
+# pusher's REBUILD_MIN_S reuse, so a 1 Hz poller would keep the pusher on its serve branch and MUTE
+# every bell and badge for as long as it polled (the build branch is where they fire). Its two gates
+# are the pusher's own — REBUILD_MIN_S (build cost) and _views_dirty (a mutation the sig cannot see);
+# no new clocks, no view sig (its 5s bucket buys nothing past the rebuild window a poller already pays).
+_PURE_FEED = None
+
+
+def _pusher_has_feed_audience():
+    """Whether the pusher is MAINTAINING _built_feed right now: _push's own `want_feed` predicate — some
+    connected client rides the feed payload. Without one the pusher stops building the feed and the slot
+    freezes at the last disconnect, so a route that served it unconditionally would answer a poller with
+    an hours-old board that looks current. The audience is the event that decides whose copy is fresh."""
+    with _clients_lock:
+        return any(c["app"] in ("feed", "fleet", "chat") for c in _clients)
+
+
+def _pure_feed(now, tmux):
+    """The feed payload for GET /feed.json: the pusher's warmed copy while the pusher has an audience
+    (byte-identical to what the panes see), else this path's own recent build, else a fresh build_feed
+    — served, never handed to the pusher. What this path never does is _cached_feed's cold-branch
+    work: the bell diff, the notify-cards prune, the badge push, the pusher's cache fill. build_feed's
+    OWN housekeeping is as it was on the old path and is not this path's to change: a session-order
+    persist when the living set moved, the views store's re-stamp, a fork's tag inheritance heal, and
+    _warm_fleet_bg (a background parse warm that then drops the pusher's cache and wakes it), which
+    runs only with a client connected and no chat/timeline client parsing; a goal store that cannot be
+    read files its fault row (load_goals_or_fault: loud by design, and only on a fault).
+    The build id IS claimed (a consumer reads buildId like any payload); the counter is monotonic and a
+    card-move ack only needs the pusher's next build to outrank whatever was claimed before it."""
+    global _PURE_FEED
+    e = _built_feed
+    if e[1] is not None and _pusher_has_feed_audience():
+        _VIEW_STATS["feedServe"] += 1
+        _PERF_STATS.build("feed", True)
+        return e[1]
+    pf = _PURE_FEED
+    if pf is not None and (time.time() - pf[1]) < REBUILD_MIN_S and not _views_dirty[0] > pf[2]:
+        _VIEW_STATS["feedServe"] += 1
+        _PERF_STATS.build("feed", True)
+        return pf[0]
+    _VIEW_STATS["feedBuild"] += 1
+    bid = _next_feed_build_id()
+    started = time.time()                # the dirty floor for the next GET: a mutation after this may be missed below
+    _t0 = time.monotonic()
+    feed = build_feed(now, tmux)
+    _PERF_STATS.build("feed", False, time.monotonic() - _t0)
+    feed["buildId"] = bid
+    _PURE_FEED = (feed, time.time(), started)
+    return feed
+
+
 # ── system notifications: the bell toggles (the user 2026-07-28) ──────────────────────────────────
 # The master bell (bottom-right → notify-cards.json "*"), a session's bell (timeline lane / tab menu →
 # session-flags "notify") or a card's bell (right-click → notify-cards.json) arm OS-level notifications
@@ -41505,12 +41566,14 @@ class Handler(BaseHTTPRequestHandler):
                                  for k, v in pal.PALETTES.items()]}), "application/json", cache="no-cache")
             if p == "/feed.json":
                 # The feed's card payload as JSON, for scripts/agents diagnosing card state (both
-                # teams' surveys, 2026-08-24): EXACTLY what build_feed ships to the board — served
-                # from the pusher's warmed build (the connect semantics: never triggers a rebuild;
-                # a cold kernel builds once, a read like any client connect). Token-gated like its
-                # stateful siblings; read-only, no side effects.
-                return self._send(200, json.dumps(_cached_feed(time.time(), _tmux_sessions(), None,
-                                                               connect=True)),
+                # teams' surveys, 2026-08-24): EXACTLY what build_feed ships to the board — the
+                # pusher's warmed build while the pusher has an audience, else a build of its own
+                # (_pure_feed). NOT _cached_feed: that is the pusher's door, whose cold branch diffs
+                # the bells, prunes notify-cards.json, pushes the badge and fills the pusher's cache
+                # — so on a headless kernel a script's GET did all four (2026-09-08). Token-gated
+                # like its stateful siblings; a read that moves none of those four (build_feed's own
+                # housekeeping — an order persist, a views re-stamp — is as on the old path).
+                return self._send(200, json.dumps(_pure_feed(time.time(), _tmux_sessions())),
                                   "application/json", cache="no-cache")
             if p == "/classify":
                 # One session's LIVE classification as the kernel derives it right now (both teams'
