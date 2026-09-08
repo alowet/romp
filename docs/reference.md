@@ -347,8 +347,9 @@ For the one-line installer (`bootstrap.sh`), which passes all of the above
 through to `install.sh`:
 
 - `ROMP_DIR=<path>` where to clone; default `~/romp`.
-- `ROMP_REF=<tag|branch>` install a specific ref; default is the newest `v*`
-  release tag, falling back to `main` when none is published.
+- `ROMP_REF=<tag|branch>` install a specific ref; default is the newest
+  `vMAJOR.MINOR.PATCH` release tag (prerelease-suffixed tags are skipped),
+  falling back to `main` when none is published.
 - `ROMP_NO_PATH=1` leaves your shell rc alone.
 
 ### Ports

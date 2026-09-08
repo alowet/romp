@@ -27,9 +27,10 @@
 # to get wrong in public:
 #
 #   * The tag MUST be v-prefixed. bootstrap.sh picks the release with
-#     `git tag -l 'v*' --sort=-v:refname | head -n1`. A tag like "0.1.0" matches NOTHING, so
-#     the one-line installer silently falls back to main instead of installing the release —
-#     no error, just the wrong thing. Deriving the tag guarantees the prefix.
+#     `git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1`.
+#     A tag like "0.1.0" matches NOTHING, so the one-line installer silently falls back to
+#     main instead of installing the release — no error, just the wrong thing. Deriving the
+#     tag guarantees the prefix.
 #   * macOS CI does not run on pushes (it is billed even on public repos, ~10x, so it is
 #     workflow_dispatch-only). A macOS-only breakage can therefore sit undetected until a
 #     user hits it. Releasing is exactly when that matters, so this triggers the macOS run

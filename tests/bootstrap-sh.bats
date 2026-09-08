@@ -19,7 +19,7 @@ setup() {
     export ROMP_REPO="$TEST_DIR/origin"
 
     # A fake romp origin: enough structure for bootstrap's clone check, plus a
-    # non-release tag and a prerelease tag alongside two releases so tag
+    # non-release tag and a prerelease tag alongside four releases so tag
     # selection is exercised.
     mkdir -p "$ROMP_REPO/kernel"
     printf '#!/usr/bin/env bash\necho STUB_INSTALL_RAN\n' > "$ROMP_REPO/install.sh"
@@ -33,6 +33,14 @@ setup() {
     git -C "$ROMP_REPO" tag v0.1.0
     git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m r2
     git -C "$ROMP_REPO" tag v0.2.0
+    # v0.9.0 then v0.10.0: a lexical sort ranks v0.9.0 first and a version sort
+    # v0.10.0, so the newest release proves which order the selector uses. With
+    # only v0.1.0 and v0.2.0 the two sorts agreed and the fixture could not
+    # tell them apart (review find, 2026-09-08).
+    git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m r3
+    git -C "$ROMP_REPO" tag v0.9.0
+    git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m r4
+    git -C "$ROMP_REPO" tag v0.10.0
     git -C "$ROMP_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m post-release
     # A prerelease cut after the newest release: `v*` matches it and version
     # sort ranks it first, but it is not a release.
@@ -45,8 +53,8 @@ teardown() { rm -rf "$TEST_DIR"; }
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
     [[ "$output" == *STUB_INSTALL_RAN* ]]
-    # v0.2.0, not the newer untagged commit and not the non-release tag.
-    [ "$(git -C "$HOME/romp" describe --tags)" = "v0.2.0" ]
+    # v0.10.0, not the newer untagged commit and not the non-release tag.
+    [ "$(git -C "$HOME/romp" describe --tags)" = "v0.10.0" ]
     grep -qF "$HOME/romp/bin" "$HOME/.zshrc"
 }
 
@@ -55,9 +63,35 @@ teardown() { rm -rf "$TEST_DIR"; }
     # clone installed onto v9.9.9-rc.1 would sit there with no update ever offered.
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Checking out v0.2.0"* ]]
+    [[ "$output" == *"Checking out v0.10.0"* ]]
     [[ "$output" != *"v9.9.9-rc.1"* ]]
-    [ "$(git -C "$HOME/romp" describe --tags)" = "v0.2.0" ]
+    [ "$(git -C "$HOME/romp" describe --tags)" = "v0.10.0" ]
+}
+
+@test "bootstrap.sh: orders releases by version, not by name: v0.10.0 outranks v0.9.0" {
+    # A lexical sort (`--sort=-refname`) would check out v0.9.0 here. The fixture's
+    # other releases sort the same either way, so this pair is what proves the
+    # order (review find, 2026-09-08).
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Checking out v0.10.0"* ]]
+    [ "$(git -C "$HOME/romp" describe --tags)" = "v0.10.0" ]
+}
+
+@test "docs/install.md: the manual install uses bootstrap.sh's selector and picks the same release" {
+    # The manual install spells the selector out by hand, so a change to
+    # bootstrap.sh's line can pass it by: the docs kept the unfiltered `v*` pick
+    # after bootstrap.sh started skipping prerelease tags, and would have checked
+    # out the decoy (review find, 2026-09-08). Pin the two to the same text, and
+    # run the documented line against the fixture so it is proven, not just matched.
+    local want got
+    want="$(grep -o "tag -l .*| head -n1" "$REPO_ROOT/bootstrap.sh")"
+    got="$(grep -o "tag -l .*| head -n1" "$REPO_ROOT/docs/install.md")"
+    [ -n "$want" ]
+    [ "$got" = "$want" ]
+    ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
+    [ "$status" -eq 0 ]
+    [ "$(cd "$HOME/romp" && eval "git $got")" = "v0.10.0" ]
 }
 
 @test "bootstrap.sh: re-running updates in place and does not duplicate the PATH line" {
@@ -75,7 +109,7 @@ teardown() { rm -rf "$TEST_DIR"; }
 }
 
 @test "bootstrap.sh: falls back to main when no release is tagged yet" {
-    git -C "$ROMP_REPO" tag -d v0.1.0 v0.2.0
+    git -C "$ROMP_REPO" tag -d v0.1.0 v0.2.0 v0.9.0 v0.10.0
     ROMP_DIR="$HOME/romp" run bash "$REPO_ROOT/bootstrap.sh"
     [ "$status" -eq 0 ]
     [[ "$output" == *"No release tag published yet"* ]]

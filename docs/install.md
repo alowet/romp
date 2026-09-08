@@ -34,7 +34,7 @@ latest commit rather than the newest release:
 ```bash
 git clone https://github.com/romp-on/romp.git ~/romp
 cd ~/romp
-git checkout "$(git tag -l 'v*' --sort=-v:refname | head -n1)"   # newest release
+git checkout "$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)"   # newest release
 # or:   git checkout main                                        # the latest commit
 ./install.sh
 ```
