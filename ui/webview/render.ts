@@ -175,7 +175,7 @@ type ChatEvent = (
   // `held` DOES come from the kernel (_limit_hold): the queue is stuck on the ACCOUNT rather than on this
   // session — a usage limit or a monthly spend cap holds every send — so the head names what it is waiting
   // for, and how long is left when the API reported a reset (the user 2026-07-24).
-  | { kind: "queued"; texts: { md: string; followUp?: boolean; goal?: string; fuCtx?: string; idx?: number; park?: number; cancelable?: boolean; optimistic?: boolean; romp?: boolean; rompSystem?: boolean; rompAuto?: boolean; imgPaths?: string[]; lost?: string; qts?: number; hiddenByPending?: boolean }[]; ts?: string; uuid?: string; bare?: boolean; held?: { reason: string; resetsAt?: number | null; what: string; detail?: string } }   // imgPaths: an optimistic echo's dragged-image attachments → thumbnails, the landed form's own renderer (the user 2026-08-25); lost: client-only, the connection dropped after this unconfirmed send; qts: client-only, the pending entry's identity (its press time) so the ✕ removes ITS entry (send-pending.ts)
+  | { kind: "queued"; texts: { md: string; followUp?: boolean; goal?: string; fuCtx?: string; idx?: number; park?: number; cancelable?: boolean; optimistic?: boolean; romp?: boolean; rompSystem?: boolean; rompAuto?: boolean; imgPaths?: string[]; lost?: string; qts?: number; qid?: string; hiddenByPending?: boolean }[]; ts?: string; uuid?: string; bare?: boolean; held?: { reason: string; resetsAt?: number | null; what: string; detail?: string } }   // imgPaths: an optimistic echo's dragged-image attachments → thumbnails, the landed form's own renderer (the user 2026-08-25); lost: client-only, the connection dropped after this unconfirmed send; qts: on OUR optimistic copy the pending entry's identity (its press time) so the ✕ removes ITS entry, on a kernel copy its enqueue stamp (T252c); qid: a kernel copy's identity, the ✕ drops the send that owns it (send-pending.ts)
   // The turn stopped on an API error (event-based: transcript isApiErrorMessage). The session is BLOCKED
   // until retried — a red-dot card at the bottom with a Retry button (the user 2026-06-16).
   | { kind: "apiError"; text: string; status?: number; ts?: string; uuid?: string }
@@ -423,7 +423,7 @@ function hideQueuedCopy(s: Session, p: PendingSend): { held?: Extract<ChatEvent,
   const qi = tailQueuedIdx(s.events);
   if (qi < 0) return { held: undefined };            // nothing queued at the tail: nothing to hide, ours shows
   const q = s.events[qi] as Extract<ChatEvent, { kind: "queued" }>;
-  const k = queuedCopyToHide(q.texts, p.text);
+  const k = queuedCopyToHide(q.texts, p.text, p.qid);   // ours by identity first (T252c)
   if (k < 0) return null;                            // no copy to hide (or a non-cancelable one): the kernel's bubble stays
   const texts = q.texts.slice(); texts[k] = { ...texts[k], hiddenByPending: true };
   s.events[qi] = { ...q, texts };
@@ -4010,7 +4010,8 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
       if (t.idx !== undefined) x.dataset.qidx = String(t.idx);
       if (t.park !== undefined) x.dataset.qpark = String(t.park);
       if (t.optimistic) x.dataset.qopt = "1";   // ✕ before confirmation → cancel-by-body (no park/idx yet)
-      if (t.qts !== undefined) x.dataset.qts = String(t.qts);   // OUR entry's identity: the ✕ removes this bubble's entry, not the first with its text
+      if (t.optimistic && t.qts !== undefined) x.dataset.qts = String(t.qts);   // OUR entry's identity: the ✕ removes this bubble's entry, not the first with its text
+      if (t.qid) x.dataset.qid = t.qid;   // the kernel's copy names its id (T252c): the ✕ drops the send that owns it (a kernel copy's own qts is its enqueue stamp, not an entry)
       if (isCmd) x.dataset.qcmd = "1";
       (x as any)._qmd = t.md;   // the bubble's body — the kernel's drift guard + the composer restore read it
       xHost.appendChild(x);
@@ -15316,7 +15317,8 @@ setupSettings();
         // drops the first pending send with the text — the one the kernel's first copy covers.
         const list = pendingSent.get(sidQ) || [];
         const qts = el.dataset.qts !== undefined ? Number(el.dataset.qts) : undefined;
-        if (dropPending(list, qmd, qts)) { if (list.length) pendingSent.set(sidQ, list); else pendingSent.delete(sidQ); }
+        const qid = el.dataset.qid || undefined;
+        if (dropPending(list, qmd, qts, qid)) { if (list.length) pendingSent.set(sidQ, list); else pendingSent.delete(sidQ); }
         echoShownSig.delete(sidQ);
       }
       // a PROVISIONAL tab's send has never left the client (T244): forget it from the queue adoption would

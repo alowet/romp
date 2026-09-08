@@ -15185,6 +15185,10 @@ class TmuxBackend(sb.SessionBackend):
         p = _path_of(str(sid))
         return _pending_queued(p) if p else []
 
+    def pending_queued_meta(self, sid):
+        p = _path_of(str(sid))
+        return _pending_queued_meta(p) if p else []
+
     def live_atoms(self, sid):
         return _tmux_echo_atoms(str(sid))
 
@@ -21631,22 +21635,39 @@ def _pending_queued(path):
     (live corpus: one such remove in 305, and it is where a credited dequeue had already taken the entry)."""
     # A queue LEDGER: a dequeue resolves the OLDEST entry, which can predate any window, so this folds
     # append-incrementally over the whole record list (_fold_records) with the pending list carried.
+    return [m["md"] for m in _pending_queued_meta(path)]
+
+
+def _pending_queued_meta(path):
+    """_pending_queued's copies with what the CLI's ledger knows about each (T252c): the enqueue record's
+    stamp (`qts`, epoch ms) and NO id. The ledger carries none, the kernel's tmux echo is minted before the
+    CLI writes the enqueue record, and the kernel never sees the CLI take a copy — so nothing else in the
+    chain could share an id the ledger copy wore, and an id the chat latched from it would make it reject
+    the echo and the landing as another send's (the review of the first cut). The chat reads this route
+    by text; `qid` is None on every copy."""
     def step(pending, o):
         if o.get("type") != "queue-operation":
             return pending
         op = o.get("operation")
         content = o.get("content") if isinstance(o.get("content"), str) else None
         if op == "enqueue":
-            pending.append(content or "")
+            pending.append((content or "", o.get("timestamp")))
         elif op == "popAll":                                 # the whole queue recalled — nothing is left owed
             pending.clear()
-        elif op == "remove" and content is not None and content in pending:
-            pending.remove(content)                          # that entry only; the rest keep their places
+        elif op == "remove" and content is not None and any(c == content for c, _ts in pending):
+            pending.pop(next(i for i, (c, _ts) in enumerate(pending) if c == content))   # that entry only; the rest keep their places
         elif op in ("dequeue", "remove") and pending:
             del pending[0]                                   # anonymous resolution: the oldest is the one taken
         return pending
     pending = _fold_records(_queued_parse_cache, path, list, step)
-    return [t.strip() for t in pending if _genuine_queued(t)]
+    out = []
+    for text, ts in pending:
+        if not _genuine_queued(text):
+            continue
+        t = em.parse_z(ts) if isinstance(ts, str) else None
+        qts = int(t * 1000) if isinstance(t, (int, float)) and t else None
+        out.append({"md": text.strip(), "qid": None, "qts": qts})
+    return out
 
 
 # ── Idle-queue drive: wake signals stuck in an idle SDK CLI's queue (the user 2026-08-18) ──
@@ -28592,6 +28613,22 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                         if prompt or reminders or imgs:
                             ev = {"kind": "user", "md": prompt, "uuid": a.get("uuid"), "ts": ts,
                                   "human": author == "human" or bool(imgs), "reminders": reminders}
+                            # the identity of the queued copy this record lands (T252c): the fed ledger pairs
+                            # it FIFO per text, at or after the feed — so the chat retires and places its
+                            # pending bubble by id, never by text. None on the tmux route or for a record
+                            # from before this kernel's life; the chat falls back to text then.
+                            if hasattr(be, "qids_for_landing") and not a.get("_echo_text") and not str(a.get("uuid") or "").startswith("echo:"):
+                                # per text BLOCK: a record the CLI wrote from several queued sends is one landing per
+                                # block; the kernel's own echo atom is skipped — its uuid IS the copy's id
+                                _tblocks = [b.get("text", "") for b in (blocks or []) if b.get("type") == "text" and (b.get("text") or "").strip()] or [text]
+                                try:
+                                    _qs = be.qids_for_landing(sid, a.get("uuid"), _tblocks, a.get("t"))
+                                except Exception:
+                                    _qs = []
+                                if len(_tblocks) > 1 and any(_qs):
+                                    ev["qids"] = list(_qs)
+                                elif len(_tblocks) == 1 and _qs and _qs[0]:
+                                    ev["qid"] = _qs[0]
                             if a.get("absorbed"):
                                 # A mid-turn splice (event_model._absorbed): the CLI queued this send
                                 # behind the running turn and took it at a later tool boundary, so the
@@ -28984,6 +29021,20 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
         # bubble stays (dashed, with a why-no-✕ tooltip client-side); only the false affordance goes.
         _cbe = Sessions.backend_for(sid)
         cancelable = hasattr(_cbe, "unqueue") and _queue_recallable(_cbe, sid)
+        # each copy's IDENTITY beside its text (T252c): the backend's per-copy id + enqueue stamp, when it
+        # keeps them (an SDK session that is running; a tmux ledger's stamps) — None for a restored queue
+        _metas = None
+        if queued and hasattr(_cbe, "pending_queued_meta"):
+            try:
+                _mm = _cbe.pending_queued_meta(sid)
+                # accepted only when each id sits beside ITS OWN text: the queue can move between the two reads
+                # this build makes (a pop and an append keep the length and shift every id by one), and a copy
+                # wearing another copy's id would be latched by the chat for good (review of the first cut)
+                if isinstance(_mm, list) and len(_mm) == len(queued) \
+                        and all(isinstance(x, dict) and (x.get("md") or "").strip() == (queued[i] or "").strip() for i, x in enumerate(_mm)):
+                    _metas = _mm
+            except Exception:
+                _metas = None
         qmsgs = []
         for i, t in enumerate(queued):
             if not _genuine_queued(t):
@@ -28996,6 +29047,11 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                 continue
             goal, body, fu, ctx = _split_followup(t)
             m = {"md": body, "idx": i, "cancelable": cancelable, **_queued_romp_flags(t)}   # idx ↔ the backend's _pending position (cancelQueued)
+            if _metas and isinstance(_metas[i], dict):          # the copy's identity and stamp: each rides on its own
+                if _metas[i].get("qid"):                          # (a tmux copy has a stamp and no id — third review)
+                    m["qid"] = _metas[i]["qid"]
+                if isinstance(_metas[i].get("qts"), int) and not isinstance(_metas[i].get("qts"), bool):
+                    m["qts"] = _metas[i]["qts"]
             if fu:
                 m["followUp"] = True
                 if goal:
@@ -29013,6 +29069,9 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
         # the ✕ handshake (_parked_md/_cancel_parked verify it so a shifted queue never drops the wrong op).
         for j, op in enumerate(pending_ops):
             m = {"md": _parked_md(op), "park": j, "cancelable": True, **(_queued_romp_flags(op[1]) if op[0] == "send" else {})}
+            # a PARKED copy carries no identity until it reaches the backend (T252c): the park's op is the
+            # three-field record the on-disk mirror and its readers pin, and the identity is minted where the
+            # copy enters the backend's queue (SdkBackend.send) — until then the chat reads this copy by text
             if op[0] == "send":
                 goal, _, fu, ctx = _split_followup(op[1])
                 if fu:
