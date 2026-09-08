@@ -1292,11 +1292,16 @@ def _persist_serve_port(port):
     once the socket is BOUND (main): the AUTHORITATIVE answer for a same-user client that has the
     state dir but no shell environment to read ROMP_KERNEL_PORT from -- the Obsidian timeline panel,
     an Electron app launched from the dock, which posts its flag, views and order edits to the
-    routes below (_state_write_route) rather than writing the state files itself. A client that
-    finds no record, or a record nothing answers on, treats the kernel as not running and refuses the
-    gesture visibly, never guessing a port or falling back to a write the kernel cannot check. An
-    atomic publish (a reader never sees a torn number); best-effort, like the serve-token mint and
-    the repo-root record above."""
+    routes below (_state_write_route) rather than writing the state files itself. With a record that
+    nothing answers on, the panel treats the kernel as not running and refuses the gesture visibly,
+    never falling back to a write the kernel cannot check. With NO record (a kernel older than this
+    one wrote the token and no port) the panel tries the port the CLI resolves -- ROMP_KERNEL_PORT,
+    then ROMP_SERVE_PORT, else 29855 -- and says so in its refusal when nothing answers there. Record
+    or fallback, the panel first asks the port to prove itself over GET /healthz (a 200 "ok" carrying
+    X-Romp-Boot, on 127.0.0.1 only) with no token, and sends its token only to a port that did; a
+    port that answers as anything else is refused by name and never sees the token (review find,
+    2026-09-08, on #1078). An atomic publish (a reader never sees a torn number); best-effort, like
+    the serve-token mint and the repo-root record above."""
     try:
         _atomic_write(jd.STATE / "serve-port", "%d\n" % int(port))
     except OSError:
@@ -3129,6 +3134,15 @@ def _read_state_json(path, st=None, expect=None, _tries=3):
 # Last-known-good session order (session-order.json has no mtime cache): served over a transient
 # fault instead of a fabricated [], and the order to render when the store cannot be re-read.
 _session_order_lkg = [None]
+# One writer of session-order.json at a time. Every writer of the order is a read-modify-write
+# (_merge_session_order + _write_session_order for a drag, _ordered's newcomer splice,
+# _gc_session_order's prune), and the kernel serves them from many threads: the WS receive loops,
+# the POST /order route's handler threads, the pusher. Two unlocked writers that read the same
+# store both publish, and the second publish silently drops the first one's change while both were
+# acked ok (review find, 2026-09-08, on #1078: 8 to 13 of 40 concurrent route writes survived).
+# Taken around the read AND the write, as one step; _views_lock nests INSIDE it (_ordered's
+# newcomer heal takes it), never the other way round -- nothing under _views_lock touches the order.
+_order_lock = threading.Lock()
 
 # One VISIBLE error per fault EPISODE, per state file (never a raise into the push/build path -- one
 # unreadable state file must not abort the whole push and wedge the board). str(path) -> the fault
@@ -3386,17 +3400,18 @@ def _gc_session_order(known):
     it so a closed / aged-out session falls out on its own). Everything still around keeps its EXACT slot —
     only truly-absent sids are removed, and since the discover window only slides FORWARD a pruned sid never
     flickers back to reclaim a slot. Writes only when something actually changed (no churn on the hot path)."""
-    try:
-        order = _session_order_proved()
-    except _StateUnreadable as e:
-        _note_state_fault(e)                         # loud once per episode, not per pass
-        return
-    kept = [sid for sid in order if sid in known]
-    if kept != order:
+    with _order_lock:                                # read and write as one step (the store's rule, above)
         try:
-            _write_session_order(kept)
-        except _StateUnwritable:
-            pass                                     # filed once per episode by the write door; the next pass retries
+            order = _session_order_proved()
+        except _StateUnreadable as e:
+            _note_state_fault(e)                     # loud once per episode, not per pass
+            return
+        kept = [sid for sid in order if sid in known]
+        if kept != order:
+            try:
+                _write_session_order(kept)
+            except _StateUnwritable:
+                pass                                 # filed once per episode by the write door; the next pass retries
 
 
 def _merge_session_order(incoming):
@@ -3427,6 +3442,20 @@ def _merge_session_order(incoming):
     return [s for s in merged if not (s in seen or seen.add(s))]
 
 
+def _reorder_session_order(incoming):
+    """A drag's write of the order, as the reorderTabs/writeOrder socket arm and POST /order both land
+    it: _merge_session_order then _write_session_order, under _order_lock so the read and the publish
+    are ONE step. Before the lock the two calls sat unlocked at each call site, and two writers -- the
+    Obsidian panel and a dashboard, or two dashboards -- that read the same store both published, the
+    later publish dropping the earlier one's drag while both were acked ok (review find, 2026-09-08,
+    on #1078). Raises _StateUnreadable / _StateUnwritable exactly as the two steps do; the callers'
+    refusals are unchanged. Returns the merged order that was published."""
+    with _order_lock:
+        merged = _merge_session_order(incoming)
+        _write_session_order(merged)
+    return merged
+
+
 # Forks whose views heal (_heal_timeline_views: a /clear or revive inherits its session's tag memberships)
 # could not run because the views store faulted -- new sid -> the sid whose memberships it inherits.
 # _ordered retries them on every later pass until the heal lands: the order publish that follows the
@@ -3451,76 +3480,80 @@ def _ordered(sessions):
     sibling already in the order. A genuinely-new session still appends at the end. Keyed off the anchor the
     sessions carry (default: the sid itself), so session-order.json + the client stay fsid-based — no
     migration (the user 2026-06-24: keep ONE slot across /clear / revive)."""
-    try:
-        order = _session_order_proved()   # a PROVED read: a transient fault must not fold to [] and then
-        #                                   mark every session "new", persisting discovery order over the
-        #                                   user's saved order under no gesture (the state-readers audit).
-    except _StateUnreadable as e:
-        # render the last-known order (or plain input order if we never read one) and persist NOTHING
-        # this pass; the next clean read re-appends any true newcomers. Loud once per episode.
-        _note_state_fault(e)
-        lkg = _session_order_lkg[0] or []
-        idx0 = {sid: i for i, sid in enumerate(lkg)}
-        return sorted(sessions, key=lambda s: idx0.get(s["sid"], len(idx0)))
-    _session_order_lkg[0] = list(order)   # a COPY of the clean read: `order` is spliced below and only
-    #                                       _write_session_order latches the spliced list, AFTER it lands
-    #                                       (review find, 2026-09-08: latched by reference, a publish that
-    #                                       failed left an unpersisted order as the known-good)
-    known = set(order)
-    # Slot inheritance keys on the STABLE session NAME (customTitle), NOT the fsid or discover's anchor: a
-    # /clear, relaunch, or revive mints a NEW transcript fsid for the SAME logical session, and it must
-    # inherit that session's existing slot rather than jump to the END. Keying on the name — resolved from
-    # the names registry, so even a DEAD order entry's name is known — is robust to fsid churn AND to
-    # discover occasionally SELF-anchoring a fork (a fork that has its own names entry, processed first in
-    # the lexical scan, anchors to itself instead of grouping under its session): that lexical-order accident
-    # was the silent, intermittent tab reorder the user kept hitting (2026-06-29). A genuinely-new session has
-    # a unique name → no sibling → appends at the end, then is frozen.
-    sess_name = {s["sid"]: (s.get("name") or "") for s in sessions}
-    def _nm(sid):
-        return sess_name.get(sid) or _name_of(sid) or ""
-    for fsid, osid in list(_views_heal_pending.items()):
-        # a heal deferred on an earlier pass (the views store faulted): retried until it lands. Quiet while
-        # the store still faults -- the skip said it once -- and one line when it lands.
+    # the read, the splice and the publish are ONE step under _order_lock: a drag landing between the
+    # read and the publish (POST /order, the socket arm) was overwritten by this splice, or overwrote it,
+    # with no gesture and no notice (review find, 2026-09-08, on #1078)
+    with _order_lock:
         try:
-            carried = _heal_timeline_views(osid, fsid)
-        except (_StateUnreadable, _StateUnwritable):
-            continue
-        _views_heal_pending.pop(fsid, None)
-        sys.stderr.write("romp-kernel: views heal for %s %s\n"
-                         % (fsid, "landed on retry" if carried else "retried: nothing to carry"))
-    new = [s["sid"] for s in sessions if s["sid"] not in known]
-    if new:
-        name_at = [_nm(o) for o in order]                # each existing slot's stable name (resolved once)
-        for sid in new:
-            a = _nm(sid)
-            sib = [i for i, n in enumerate(name_at) if a and n == a]   # same-name entries already placed
-            if sib:
-                try:
-                    _heal_timeline_views(order[sib[-1]], sid)   # the fork inherits its tag state too
-                except (_StateUnreadable, _StateUnwritable) as e:
-                    # the views store faulted inside the heal (its PROVED read, or its publish): the slot
-                    # inheritance below still lands and the heal is deferred (_views_heal_pending), retried on
-                    # the next pass. Never a raise out of _ordered -- it runs inside every build (the push,
-                    # GET /feed.json, the WS clearAll arm) -- and never a fold: the heal read the display
-                    # reader before this change, which folded the fault to an empty store, so the heal
-                    # carried nothing and said nothing. Said once per fork, like the order publish below:
-                    # the stderr line, and the bell row the fork and promotion sites file for the same
-                    # non-event (_note_views_heal_deferred; review find, 2026-09-08).
-                    if sid not in _views_heal_pending:
-                        sys.stderr.write("romp-kernel: views heal for %s skipped (%s) \u2014 deferred; the next pass "
-                                         "retries it (lost if the kernel restarts first)\n" % (sid, e))
-                        _note_views_heal_deferred(a or sid, e)
-                    _views_heal_pending[sid] = order[sib[-1]]
-                order.insert(sib[-1] + 1, sid)           # a fork inherits its session's slot, not the END
-                name_at.insert(sib[-1] + 1, a)           # keep name_at aligned with order as we splice
-            else:
-                order.append(sid)                        # a genuinely new session appends, then is frozen
-                name_at.append(a)
-        try:
-            _write_session_order(order)
-        except _StateUnwritable:
-            pass                                         # this build still sorts by the in-memory order; the publish
-            #                                              is filed once per episode and the next pass retries it
+            order = _session_order_proved()   # a PROVED read: a transient fault must not fold to [] and then
+            #                                   mark every session "new", persisting discovery order over the
+            #                                   user's saved order under no gesture (the state-readers audit).
+        except _StateUnreadable as e:
+            # render the last-known order (or plain input order if we never read one) and persist NOTHING
+            # this pass; the next clean read re-appends any true newcomers. Loud once per episode.
+            _note_state_fault(e)
+            lkg = _session_order_lkg[0] or []
+            idx0 = {sid: i for i, sid in enumerate(lkg)}
+            return sorted(sessions, key=lambda s: idx0.get(s["sid"], len(idx0)))
+        _session_order_lkg[0] = list(order)   # a COPY of the clean read: `order` is spliced below and only
+        #                                       _write_session_order latches the spliced list, AFTER it lands
+        #                                       (review find, 2026-09-08: latched by reference, a publish that
+        #                                       failed left an unpersisted order as the known-good)
+        known = set(order)
+        # Slot inheritance keys on the STABLE session NAME (customTitle), NOT the fsid or discover's anchor: a
+        # /clear, relaunch, or revive mints a NEW transcript fsid for the SAME logical session, and it must
+        # inherit that session's existing slot rather than jump to the END. Keying on the name — resolved from
+        # the names registry, so even a DEAD order entry's name is known — is robust to fsid churn AND to
+        # discover occasionally SELF-anchoring a fork (a fork that has its own names entry, processed first in
+        # the lexical scan, anchors to itself instead of grouping under its session): that lexical-order accident
+        # was the silent, intermittent tab reorder the user kept hitting (2026-06-29). A genuinely-new session has
+        # a unique name → no sibling → appends at the end, then is frozen.
+        sess_name = {s["sid"]: (s.get("name") or "") for s in sessions}
+        def _nm(sid):
+            return sess_name.get(sid) or _name_of(sid) or ""
+        for fsid, osid in list(_views_heal_pending.items()):
+            # a heal deferred on an earlier pass (the views store faulted): retried until it lands. Quiet while
+            # the store still faults -- the skip said it once -- and one line when it lands.
+            try:
+                carried = _heal_timeline_views(osid, fsid)
+            except (_StateUnreadable, _StateUnwritable):
+                continue
+            _views_heal_pending.pop(fsid, None)
+            sys.stderr.write("romp-kernel: views heal for %s %s\n"
+                             % (fsid, "landed on retry" if carried else "retried: nothing to carry"))
+        new = [s["sid"] for s in sessions if s["sid"] not in known]
+        if new:
+            name_at = [_nm(o) for o in order]                # each existing slot's stable name (resolved once)
+            for sid in new:
+                a = _nm(sid)
+                sib = [i for i, n in enumerate(name_at) if a and n == a]   # same-name entries already placed
+                if sib:
+                    try:
+                        _heal_timeline_views(order[sib[-1]], sid)   # the fork inherits its tag state too
+                    except (_StateUnreadable, _StateUnwritable) as e:
+                        # the views store faulted inside the heal (its PROVED read, or its publish): the slot
+                        # inheritance below still lands and the heal is deferred (_views_heal_pending), retried on
+                        # the next pass. Never a raise out of _ordered -- it runs inside every build (the push,
+                        # GET /feed.json, the WS clearAll arm) -- and never a fold: the heal read the display
+                        # reader before this change, which folded the fault to an empty store, so the heal
+                        # carried nothing and said nothing. Said once per fork, like the order publish below:
+                        # the stderr line, and the bell row the fork and promotion sites file for the same
+                        # non-event (_note_views_heal_deferred; review find, 2026-09-08).
+                        if sid not in _views_heal_pending:
+                            sys.stderr.write("romp-kernel: views heal for %s skipped (%s) \u2014 deferred; the next pass "
+                                             "retries it (lost if the kernel restarts first)\n" % (sid, e))
+                            _note_views_heal_deferred(a or sid, e)
+                        _views_heal_pending[sid] = order[sib[-1]]
+                    order.insert(sib[-1] + 1, sid)           # a fork inherits its session's slot, not the END
+                    name_at.insert(sib[-1] + 1, a)           # keep name_at aligned with order as we splice
+                else:
+                    order.append(sid)                        # a genuinely new session appends, then is frozen
+                    name_at.append(a)
+            try:
+                _write_session_order(order)
+            except _StateUnwritable:
+                pass                                         # this build still sorts by the in-memory order; the publish
+                #                                              is filed once per episode and the next pass retries it
     idx = {sid: i for i, sid in enumerate(order)}
     return sorted(sessions, key=lambda s: idx.get(s["sid"], len(idx)))   # stable sort: ties keep input order
 
@@ -5450,6 +5483,14 @@ def _tag_new_session(sid, parent_sid="", tags=()):
 # set from the timeline's lane controls; the session stays on the timeline. mtime-cached since
 # build_feed/build_timeline read it on every push.
 _flags_cache = {}   # str(path) -> ((mtime,size), dict)
+# One writer of session-flags.json at a time: _set_session_flag and _set_notify_session both
+# read-modify-write the whole file, and the kernel runs them from many threads (the WS receive loops
+# of every dashboard, the POST /flag route's handler threads). Two unlocked writers that read the same
+# store both publish, and the second publish drops the first one's toggle while both were acked ok
+# (review find, 2026-09-08, on #1078: 8 to 13 of 40 concurrent route writes survived). Taken around
+# the proved read and the publish as one step; the setters' side work (goal clearing, the planner
+# fast-forward) runs outside it, as it touches other stores.
+_flags_lock = threading.Lock()
 
 
 def _session_flags_proved():
@@ -5504,18 +5545,19 @@ def _session_flag_raw(sid, flag):
 
 
 def _set_session_flag(sid, flag, value):
-    cur = dict(_session_flags_proved())              # PROVED: a read fault refuses (raises) rather than
-    #                                                  overwriting every session's flags with a fabricated {}
-    f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
-    if value:
-        f[flag] = True
-    else:
-        f.pop(flag, None)
-    if f:
-        cur[sid] = f
-    else:
-        cur.pop(sid, None)
-    _write_state_json(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
+    with _flags_lock:                                # read and publish as ONE step (the store's rule, above)
+        cur = dict(_session_flags_proved())          # PROVED: a read fault refuses (raises) rather than
+        #                                              overwriting every session's flags with a fabricated {}
+        f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
+        if value:
+            f[flag] = True
+        else:
+            f.pop(flag, None)
+        if f:
+            cur[sid] = f
+        else:
+            cur.pop(sid, None)
+        _write_state_json(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
     if flag == "hideFromFeed" and value:
         # Muting takes the session OUT of task tracking → VIEW-CLEAR its current goals: seal them exactly like
         # crossing each card off the feed (cleared.jsonl + the durable node flag), NOT delete — they stay on
@@ -5685,22 +5727,23 @@ def _set_notify_session(sid, value):
     discipline as _set_notify_card, against the master. Not _set_session_flag: that setter's
     pop-on-false is right for the on/off view flags, but here False is a real value (muted while
     the master is on)."""
-    cur = dict(_session_flags_proved())              # PROVED: a read fault refuses rather than erasing flags
-    f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
-    # the master this click is judged against lives in the OTHER store and must be PROVED too: read
-    # through the display reader, a fault on notify-cards.json folded it to off, so a click matching
-    # that fabricated master popped the session's stored override -- a mute erased under the success
-    # path. A fault there refuses this write exactly like a fault on the flags file.
-    master = bool(_notify_cards_proved().get(NOTIFY_ALL_KEY))
-    if bool(value) == master:
-        f.pop("notify", None)
-    else:
-        f["notify"] = bool(value)
-    if f:
-        cur[sid] = f
-    else:
-        cur.pop(sid, None)
-    _write_state_json(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
+    with _flags_lock:                                # read and publish as ONE step (the store's rule, above)
+        cur = dict(_session_flags_proved())          # PROVED: a read fault refuses rather than erasing flags
+        f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
+        # the master this click is judged against lives in the OTHER store and must be PROVED too: read
+        # through the display reader, a fault on notify-cards.json folded it to off, so a click matching
+        # that fabricated master popped the session's stored override -- a mute erased under the success
+        # path. A fault there refuses this write exactly like a fault on the flags file.
+        master = bool(_notify_cards_proved().get(NOTIFY_ALL_KEY))
+        if bool(value) == master:
+            f.pop("notify", None)
+        else:
+            f["notify"] = bool(value)
+        if f:
+            cur[sid] = f
+        else:
+            cur.pop(sid, None)
+        _write_state_json(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
 
 
 def _prune_notify_cards(live_ids):
@@ -44303,8 +44346,7 @@ def _state_write_route(path, b):
         if not isinstance(order, list) or not all(isinstance(x, str) for x in order):
             return 400, {"ok": False, "error": "order (a list of session ids) required, got %s" % _clip_json(order)}
         try:
-            merged = _merge_session_order(order)
-            _write_session_order(merged)
+            merged = _reorder_session_order(order)   # merge + publish as one step under _order_lock (the arm's step too)
         except (_StateUnreadable, _StateUnwritable) as e:
             # the order file could not be read, or its publish failed: the drag must not splice against a
             # fabricated [] and persist discovery order over the saved one (the reorderTabs arm's rule)
@@ -47248,8 +47290,8 @@ class Handler(BaseHTTPRequestHandler):
             # tab-drag or lane-drag → reorder BOTH surfaces. MERGE the dragged surface's order into the
             # persisted one (don't overwrite): a chat-tab drag must not drop/reshuffle timeline-only lanes.
             try:
-                _merged = _merge_session_order(msg["order"])
-                _write_session_order(_merged)            # the publish too: a failed one is refused, never a
+                _reorder_session_order(msg["order"])     # merge + publish as ONE step under _order_lock (the
+                #                                          POST /order route's step too); a failed publish is refused, never a
             except (_StateUnreadable, _StateUnwritable) as e:   # dropped socket (the fold on PR #1019)
                 # the order file could not be read, or its publish failed; the drag must not splice against
                 # a fabricated [] and persist discovery order over the user's saved order. Refused on the
