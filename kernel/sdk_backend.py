@@ -90,8 +90,41 @@ def _bin_on_path_env(environ) -> dict:
 # ppid 1.
 CLI_SCOPE_PROBE = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", "true"]
 CLI_SCOPE_PROBE_TIMEOUT = 10.0
-# What every line bin/romp-cli-scope writes to stderr starts with. The wrapper writes only when the
-# CLI did NOT get its scope, and the line's second word says which of its two messages it is:
+# The two commands the boot probe of the per-session limits runs besides `true` (cli_scope_limits):
+#   * inside a probe scope carrying the memory properties, whether the scope's cgroup has the memory
+#     interface files. systemd takes MemoryMax= and the others from a user manager WITHOUT the memory
+#     controller (not delegated: an admin drop-in on user@.service, the legacy cgroup hierarchy, a kernel
+#     booted with the controller off, a container whose subtree lacks it), records them, reports them
+#     from `systemctl --user show`, and applies nothing; the only sign is that memory.max is absent from
+#     the cgroup. `cut -d: -f3` is the cgroup v2 path (one `0::` line); on the legacy hierarchy the path
+#     is garbage and the test fails, which is the right verdict there (an unprivileged manager gets no
+#     controllers on it). The command prints one of two markers (CLI_SCOPE_MEMORY_PROBE_MARKS) and exits
+#     0 either way, so the verdict rides stdout and systemd-run's exit status says one thing only: whether
+#     the scope ran (it exits with the command's status when it did, and non-zero on its own when it did
+#     not). Keyed on the exit status alone, a scope that failed to start — a bus fault moments after the
+#     property probe's scope had started — read as "no controller" for the kernel's whole life (a review
+#     finding, 2026-09-06);
+#   * a throwaway child writing the adjustment to ITS OWN oom_score_adj, in two steps, so the exit status
+#     says which failed: opening the file for writing (`true >`; exit CLI_SCOPE_ADJ_PROBE_UNOPENABLE — a
+#     read-only or masked /proc, a child that is not dumpable; the shell's text names the file and the
+#     reason), then the write (`echo`'s own failure; exit 1). A value below the floor this process inherited
+#     (the user manager's own oom_score_adj; 100 on a typical machine) opens the file and fails on the write,
+#     with EACCES, for the wrapper too, which is spawned from here with the same floor — and that is the one
+#     way an in-range value's write fails, so exit 1 is the floor and no other status is called that. The
+#     shells differ on what they print for it (dash: `echo: I/O error`; bash and busybox: `write error:
+#     Permission denied`), and an open failure can say `Permission denied` too, which is why the status
+#     carries the verdict and the text is only quoted. A redirection that fails on a regular builtin is not
+#     fatal to a POSIX shell, so `|| exit 3` runs (verified on dash, bash and busybox). The kernel's own
+#     value is untouched.
+CLI_SCOPE_MEMORY_PROBE_CMD = ["sh", "-c", 'test -e "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.max" '
+                                          '&& echo has-memory-max || echo no-memory-max']
+CLI_SCOPE_MEMORY_PROBE_MARKS = {"has-memory-max": True, "no-memory-max": False}   # what it prints → delegated
+CLI_SCOPE_ADJ_PROBE_CMD = ["sh", "-c", 'true > /proc/self/oom_score_adj || exit 3; '
+                                       'echo "$1" > /proc/self/oom_score_adj', "sh"]   # + the value
+CLI_SCOPE_ADJ_PROBE_UNOPENABLE = 3   # its exit when /proc/self/oom_score_adj could not be opened for writing
+# What every line bin/romp-cli-scope writes to stderr starts with. The wrapper writes only when something
+# it was asked for did not happen — the scope itself, or one of the limits on it — and the line's second
+# word says which of its three messages it is:
 #   CLI_SCOPE_FALLBACK_PREFIX — the pre-flight scope failed and it ran the CLI directly. The CLI starts,
 #     so no launch failure ever drains the stderr tail; SdkSession._on_cli_stderr logs the line the
 #     moment it arrives, as a problem (_note_cli_scope_fallback). launch_failure_text drops these lines
@@ -99,9 +132,335 @@ CLI_SCOPE_PROBE_TIMEOUT = 10.0
 #   CLI_SCOPE_REFUSAL_PREFIX — ROMP_CLI_REAL was unset and it refused (exit 127). No CLI started, so this
 #     is a launch failure on its own, reported by _record_launch_error like any other; it is not a
 #     fallback and is not logged as one.
+#   CLI_SCOPE_IGNORED_PREFIX — a per-session limit (CLI_SCOPE_LIMITS) was not applied: a value that did
+#     not parse, a property this systemd rejected, or an adjustment that parsed but Linux would not let
+#     the wrapper write. The CLI starts, in its scope, so as with the fallback nothing would ever drain
+#     the line from the tail; _on_cli_stderr logs it at once (_note_cli_scope_ignored) and
+#     launch_failure_text drops it. Not a fallback: the scope is there. One launch can write more than one.
 CLI_SCOPE_NOTICE_PREFIX = "romp-cli-scope:"
 CLI_SCOPE_FALLBACK_PREFIX = CLI_SCOPE_NOTICE_PREFIX + " fallback:"
 CLI_SCOPE_REFUSAL_PREFIX = CLI_SCOPE_NOTICE_PREFIX + " refused:"
+CLI_SCOPE_IGNORED_PREFIX = CLI_SCOPE_NOTICE_PREFIX + " ignored:"
+
+# Per-session limits on the scopes (2026-09-06): every one opt-in, none set by default. A session's
+# shell that globbed a bloated /tmp grew past 30 GB and the box's userspace OOM killer took the largest
+# process it found at that instant — the kernel — cutting every session. A memory limit on the scope
+# makes the runaway die inside its own session instead (the cgroup's OOM killer SIGKILLs the largest
+# process in the scope, that process alone; the session sees a failed tool call), and a raised
+# oom_score_adj on the session tree makes the box-wide killers prefer a session over the kernel. Read
+# from the manager's environment ONCE per backend (cli_scope_limits), like the scope verdict, and
+# handed to bin/romp-cli-scope through options.env; the wrapper turns the sizes into systemd-run
+# properties (MemoryMax=, MemoryHigh=, MemorySwapMax=, with OOMPolicy=continue whenever one is set —
+# a scope's default `stop` would end the whole scope on one OOM kill) and writes the adjustment to its
+# own /proc/self/oom_score_adj before the exec. The same syntax rules live in the wrapper (size_ok,
+# adj_ok): the kernel's check is what the boot log reports from, and what keeps a bad value from
+# reaching the wrapper at all (it goes down empty); the wrapper's is its own guard. The syntax is not
+# the whole check: a value this systemd or this Linux refuses (OOMPolicy= on scopes before systemd 253;
+# an adjustment below the inherited floor) would pass it and be refused on every launch, one `ignored:`
+# line each, while the boot log called it in force. So with the scopes on, the kernel also runs the
+# wrapper's own steps once, at its start, against this box (_cli_scope_settle): the property probe
+# scope, the memory-controller check inside it, and the adjustment write in a throwaway child. What
+# that refuses lands in `rejected` and goes down empty, so a per-launch `ignored:` line marks a change
+# since boot, not a standing condition.
+# Rows: (environment variable, report key — the word the boot line prints, as in `memoryMax=16G` —,
+# validator, the rule in words, the type a report of the value carries: sizes as the strings systemd
+# reads, the adjustment as an integer. Nothing here converts: the wrapper receives every value as the
+# string it was read as, and only a reader that surfaces the values types them).
+# ASCII digits only ([0-9], never \d, which in a str pattern also matches other scripts' digits that
+# the wrapper's [!0-9] and systemd reject). A leading zero is refused for the adjustment: Linux parses
+# oom_score_adj with base 0, so `0400` would land as octal 256 while this reported 400. Sizes may
+# carry one (systemd reads them in base 10; verified: MemoryMax=016M gave memory.max 16777216).
+CLI_SCOPE_SIZE_RE = re.compile(r"([0-9]+[KMGT]?|infinity)\Z")
+CLI_SCOPE_ADJ_RE = re.compile(r"-?(0|[1-9][0-9]{0,3})\Z")
+CLI_SCOPE_SIZE_RULE = "a size (digits with an optional K, M, G or T suffix, or infinity)"
+CLI_SCOPE_ADJ_RULE = "an integer in -1000..1000 with no leading zero"
+
+
+def _cli_scope_size_ok(v: str) -> bool:
+    return bool(CLI_SCOPE_SIZE_RE.match(v))
+
+
+def _cli_scope_adj_ok(v: str) -> bool:
+    return bool(CLI_SCOPE_ADJ_RE.match(v)) and abs(int(v)) <= 1000
+
+
+CLI_SCOPE_LIMITS = (
+    ("ROMP_CLI_SCOPE_MEMORY_MAX", "memoryMax", _cli_scope_size_ok, CLI_SCOPE_SIZE_RULE, str),
+    ("ROMP_CLI_SCOPE_MEMORY_HIGH", "memoryHigh", _cli_scope_size_ok, CLI_SCOPE_SIZE_RULE, str),
+    ("ROMP_CLI_SCOPE_MEMORY_SWAP_MAX", "memorySwapMax", _cli_scope_size_ok, CLI_SCOPE_SIZE_RULE, str),
+    ("ROMP_CLI_SCOPE_OOM_SCORE_ADJ", "oomScoreAdj", _cli_scope_adj_ok, CLI_SCOPE_ADJ_RULE, int),
+)
+# The systemd property each memory key becomes on the scope (the wrapper's own mapping; the adjustment
+# is a /proc write, not a property).
+CLI_SCOPE_MEMORY_PROPS = {"memoryMax": "MemoryMax", "memoryHigh": "MemoryHigh", "memorySwapMax": "MemorySwapMax"}
+# The boot probe's checks (_cli_scope_settle), as `unsettled` names the ones that settled nothing and as
+# the boot line words them: the memory properties on a probe scope, the memory controller inside one,
+# the adjustment write in a throwaway child.
+CLI_SCOPE_CHECKS = ("memoryLimits", "memoryController", "oomScoreAdj")
+CLI_SCOPE_CHECK_NAMES = {"memoryLimits": "memory-limits probe", "memoryController": "memory-controller check",
+                         "oomScoreAdj": "oom_score_adj check"}
+
+
+def _cli_scope_props(in_force: dict) -> list[str]:
+    """The `-p Name=value` words the wrapper adds to systemd-run for the memory limits in `in_force`
+    (report keys → values): CLI_SCOPE_LIMITS order, then `-p OOMPolicy=continue` when any is set — the
+    words bin/romp-cli-scope builds, so the boot probe starts the scope a session would get."""
+    words = []
+    for _var, key, _ok, _rule, _typ in CLI_SCOPE_LIMITS:
+        if key in CLI_SCOPE_MEMORY_PROPS and key in in_force:
+            words += ["-p", "%s=%s" % (CLI_SCOPE_MEMORY_PROPS[key], in_force[key])]
+    if words:
+        words += ["-p", "OOMPolicy=continue"]
+    return words
+
+
+def _cli_scope_probe(run, argv, stdout=False) -> tuple:
+    """One boot probe: (returncode or None when `run` raised, the first line of stderr or the
+    exception's text, the first line of stdout — read only with `stdout`, which the controller check
+    sets for its marker; "" otherwise). Bounded like the scope verdict's probe; never raises."""
+    try:
+        r = run(argv, stdout=subprocess.PIPE if stdout else subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=CLI_SCOPE_PROBE_TIMEOUT)
+    except Exception as e:      # timeout, a missing binary, anything else
+        return None, str(e), ""
+
+    def first(raw) -> str:
+        raw = raw or b""
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        text = text.strip()
+        return text.split("\n", 1)[0].strip() if text else ""
+    return r.returncode, first(r.stderr), first(r.stdout) if stdout else ""
+
+
+def _cli_scope_attempt(rc, err: str) -> tuple[str, str]:
+    """One controller-probe attempt that gave no verdict, as (kind, what happened) for the problem line.
+    Kinds: "no-answer" — `run` raised (the 10 s bound, an OSError); "no-start" — a non-zero exit with
+    systemd-run's stderr text, which is how it reports a scope it could not start; "no-marker" — the
+    scope started and its command did not print a marker: killed by a signal (subprocess reports it as
+    a negative status; a memory limit too small for `sh` does this), or a non-zero exit with nothing on
+    stderr (systemd-run always says when it cannot start a scope, so silence means it did). The text
+    quotes the status and any stderr, so the line names what happened, not a guess at it."""
+    if rc is None:
+        return "no-answer", "did not answer (%s)" % (err or "no detail")
+    if rc < 0:
+        return "no-marker", ("was killed by signal %d in its scope before it printed a marker%s"
+                             % (-rc, (" (stderr: %s)" % err) if err else ""))
+    if err:
+        return "no-start", "failed to start its scope (%s)" % err
+    return "no-marker", ("exited %d with no marker and nothing on stderr — the scope started (systemd-run says "
+                         "when one cannot) and its command did not finish the check" % rc)
+
+
+def _cli_scope_settle(in_force: dict, run, log=None) -> tuple[dict, bool | None, list]:
+    """The boot probe behind cli_scope_limits: does THIS box take the values the syntax passed? Each
+    of the wrapper's own steps, run once here so a refusal that would otherwise repeat on every launch
+    (one `ignored:` line and one problem each, while the boot log called the value in force) is settled
+    once, lands in `rejected`, and goes down to the wrapper empty:
+      * the memory properties, on a probe scope (`systemd-run … -p … -- true`), with the wrapper's own
+        retry chain: a failure is retried bare, a bare pass is followed by one more try with the
+        properties, and only that second failure rejects them, quoting the deciding failure. Two
+        outcomes settle nothing: a bare failure too (the bus is away; the scope verdict is moments old),
+        and a second try that does not answer (a raise: the 10 s bound, an OSError). One plain line each
+        says so, the values stand as read, and the wrapper reports per launch — its fallback line, or
+        its `ignored:` line if the properties turn out to be refused;
+      * the memory controller, inside a probe scope carrying the properties (CLI_SCOPE_MEMORY_PROBE_CMD),
+        since systemd accepts the properties from a user manager without the controller and applies
+        nothing. The verdict is the marker the command prints (CLI_SCOPE_MEMORY_PROBE_MARKS): no
+        memory.max is a problem line, the values stay in `in_force` (they are set, and systemd holds
+        them) and the verdict is kept on the backend as cli_scope_memory_delegated. An attempt that gives
+        no verdict without exiting 0 — the scope did not start, the probe did not answer, the command was
+        killed or exited non-zero without a marker — gets one retry; an exit 0 without a marker gets
+        none (the command ran, and what it printed is the broken contract). When no attempt gives a
+        verdict the check is UNSETTLED, as a problem line that says what each attempt did, one or two
+        (_cli_scope_attempt: a start refusal quoting systemd, a non-answer, a scope that ran without
+        printing a marker; an odd print is quoted): the wrapper does not make this check, so nothing
+        reports it per launch, and an unknown here would otherwise stay silent for the kernel's life;
+      * the adjustment, written by a throwaway child (CLI_SCOPE_ADJ_PROBE_CMD) in two steps, so its exit
+        status says what failed: the file could not be opened for writing (CLI_SCOPE_ADJ_PROBE_UNOPENABLE:
+        a read-only or masked /proc), or the write was refused (exit 1: the floor, a value below the user
+        manager's own oom_score_adj — the one way an in-range value's write fails). Either rejects the
+        value, with a line that quotes the shell's stderr and names the floor only for the refused write;
+        any other status is quoted as it is. No answer, or a child killed by a signal, settles nothing (a
+        plain line; the wrapper reports per launch).
+    Returns (rejected: variable → value, memory_delegated: True/False, None when not settled, unsettled:
+    the checks that were due and settled nothing, named as CLI_SCOPE_CHECKS — empty when every due check
+    answered; the caller words its boot line from it, so no value whose check did not answer is ever
+    called in force). `run` is subprocess.run or a stand-in; `log`, when given, takes (message,
+    problem=bool)."""
+    rejected, delegated, unsettled = {}, None, []
+    props = _cli_scope_props(in_force)
+    if props:
+        base = CLI_SCOPE_PROBE[:-2]
+        rc, err, _out = _cli_scope_probe(run, base + props + ["--", "true"])
+        if rc != 0:
+            bare_rc, bare_err, _out = _cli_scope_probe(run, CLI_SCOPE_PROBE)
+            if bare_rc != 0:
+                rc = None
+                if log:
+                    log("cli scope: the per-session memory limits could not be settled at start — a probe scope "
+                        "with them failed (%s) and so did one without (%s); the values stand as read, and the "
+                        "wrapper reports on each launch" % (err or "no detail", bare_err or "no detail"))
+            else:
+                first_err = err
+                rc, err, _out = _cli_scope_probe(run, base + props + ["--", "true"])
+                if rc is None and log:
+                    log("cli scope: the per-session memory limits could not be settled at start — a probe scope "
+                        "with them failed (%s), one without passed, and the retry with them did not answer (%s); "
+                        "the values stand as read, and the wrapper reports on each launch"
+                        % (first_err or "no detail", err or "no detail"))
+        if rc is None:
+            unsettled.append("memoryLimits")
+        elif rc != 0:
+            for var, key, _ok, _rule, _typ in CLI_SCOPE_LIMITS:
+                if key in CLI_SCOPE_MEMORY_PROPS and key in in_force:
+                    rejected[var] = in_force[key]
+            if log:
+                hint = " (OOMPolicy= on scopes needs systemd 253)" if "OOMPolicy" in err else ""
+                log("cli scope: systemd-run rejected the per-session memory limits (%s: %s) — not applied; "
+                    "sessions run in their scopes without them%s" % (" ".join(props), err or "no detail", hint),
+                    problem=True)
+        else:
+            d_argv = base + props + ["--"] + CLI_SCOPE_MEMORY_PROBE_CMD
+            d_rc, d_err, d_out = _cli_scope_probe(run, d_argv, stdout=True)
+            first = None    # the first attempt, kept when it gave no verdict, so the line can say what it did
+            if d_rc != 0:   # None too: a scope that did not run, or a probe that did not answer, gets one retry
+                first = _cli_scope_attempt(d_rc, d_err)
+                d_rc, d_err, d_out = _cli_scope_probe(run, d_argv, stdout=True)
+            if d_rc == 0 and d_out in CLI_SCOPE_MEMORY_PROBE_MARKS:
+                delegated = CLI_SCOPE_MEMORY_PROBE_MARKS[d_out]
+                if not delegated and log:
+                    log("cli scope: the memory controller is not delegated to the systemd user manager — systemd "
+                        "accepts the memory limits (%s) and applies nothing; a probe scope had no memory.max in "
+                        "its cgroup. `systemctl show user@$(id -u).service -p DelegateControllers` should list "
+                        "memory" % " ".join(props), problem=True)
+            else:
+                unsettled.append("memoryController")
+                if log:
+                    # a start refusal carries the remark that a scope with these properties started moments
+                    # earlier (the property probe passed): on the attempt it is about, once, never at the
+                    # sentence's end, where it read as a remark about the retry
+                    def said(attempt, remark=True):
+                        return attempt[1] + (", moments after one with the same properties started"
+                                             if remark and attempt[0] == "no-start" else "")
+                    if d_rc == 0:
+                        why = "its probe printed %r where has-memory-max or no-memory-max was expected" % d_out
+                        if first:
+                            why += ", after a first try that %s" % said(first)
+                    else:   # a retry happened (the first attempt gave no verdict), and it gave none either
+                        second = _cli_scope_attempt(d_rc, d_err)
+                        why = ("its probe %s, and again on the retry" % said(first) if second[1] == first[1] else
+                               "its probe %s, and the retry %s" % (said(first), said(second, first[0] != "no-start")))
+                    log("cli scope: the memory-controller check could not be settled — %s; whether the memory "
+                        "limits (%s) apply is unknown until the next kernel start, and the values stand as read"
+                        % (why, " ".join(props)), problem=True)
+    adj = in_force.get("oomScoreAdj")
+    if adj is not None:
+        a_rc, a_err, _out = _cli_scope_probe(run, CLI_SCOPE_ADJ_PROBE_CMD + [adj])
+        if a_rc is None or a_rc < 0:   # no verdict: the child did not answer, or was killed before it wrote
+            unsettled.append("oomScoreAdj")
+            if log:
+                what = ("could not run (%s)" % (a_err or "no detail") if a_rc is None else
+                        "was killed by signal %d before it wrote%s"
+                        % (-a_rc, (" (stderr: %s)" % a_err) if a_err else ""))
+                log("cli scope: the oom_score_adj check %s; ROMP_CLI_SCOPE_OOM_SCORE_ADJ=%s stands as read, and the "
+                    "wrapper reports on each launch" % (what, adj))
+        elif a_rc != 0:
+            rejected["ROMP_CLI_SCOPE_OOM_SCORE_ADJ"] = adj
+            if log:
+                quoted = a_err or "nothing on stderr"
+                if a_rc == CLI_SCOPE_ADJ_PROBE_UNOPENABLE:
+                    why = "/proc/self/oom_score_adj could not be opened for writing (%s)" % quoted
+                elif a_rc == 1:   # the file opened and the write was refused: EACCES, an in-range value's one failure
+                    why = ("the write was refused (%s): a value below the systemd user manager's own oom_score_adj "
+                           "(the floor every process under it inherits; 100 on a typical machine) needs a privilege it "
+                           "does not have" % quoted)
+                else:
+                    why = "its probe exited %d (%s)" % (a_rc, quoted)
+                log("cli scope: ROMP_CLI_SCOPE_OOM_SCORE_ADJ=%s cannot be written by this process — %s — not applied; "
+                    "sessions run in their scopes without it" % (adj, why), problem=True)
+    return rejected, delegated, unsettled
+
+
+def _cli_scope_boot_line(in_force: dict, delegated, unsettled: list) -> str:
+    """The one boot line's body: every value in force under its own verdict, so the line is true of
+    each value — `in force`; set but applied to nothing until the memory controller is delegated (the
+    memory limits, on a user manager without it); set but not settled, naming the check that settled
+    nothing (its own line, above, says why). The memory limits share one verdict (the property probe
+    and the controller check take them together) and the adjustment has its own check, so the line has
+    at most two clauses; values with the same verdict share one, memory limits first, and a box that
+    takes everything reads `memoryMax=16G memorySwapMax=0 oomScoreAdj=500 in force`."""
+    def verdict(checks, not_delegated):
+        for check in checks:
+            if check in unsettled:
+                return ("set but not settled (the %s settled nothing at start, as logged above)"
+                        % CLI_SCOPE_CHECK_NAMES[check])
+        if not_delegated:
+            return "set but applied to nothing until the memory controller is delegated to the user manager"
+        return "in force"
+    clauses = []    # [verdict, [key=value, …]] in CLI_SCOPE_LIMITS order
+    for _var, key, _ok, _rule, _typ in CLI_SCOPE_LIMITS:
+        if key not in in_force:
+            continue
+        if key in CLI_SCOPE_MEMORY_PROPS:
+            v = verdict(("memoryLimits", "memoryController"), delegated is False)
+        else:
+            v = verdict(("oomScoreAdj",), False)
+        word = "%s=%s" % (key, in_force[key])
+        if clauses and clauses[-1][0] == v:
+            clauses[-1][1].append(word)
+        else:
+            clauses.append([v, [word]])
+    return "; ".join("%s %s" % (" ".join(words), v) for v, words in clauses)
+
+
+def cli_scope_limits(environ=None, log=None, scope_on=True, run=None) -> tuple[dict, dict, bool | None, list]:
+    """The per-session limits (CLI_SCOPE_LIMITS) from `environ` (the manager's environment): a 4-tuple
+    (in_force, rejected, memory_delegated, unsettled). `in_force` maps each set variable's report key
+    (CLI_SCOPE_LIMITS) to its value, as the string the wrapper receives; `rejected` maps each variable
+    whose value is refused to that value — such a variable is handed to the wrapper EMPTY (so a bad
+    value in the manager's environment never reaches it) and is logged once, as a problem naming the
+    variable and the reason. An unset or empty variable is neither. Two kinds of refusal: a value that
+    fails its rule (the syntax; pure, checked on every OS), and — with `run` given (subprocess.run or a
+    stand-in) and the scopes on — a value this box refuses (_cli_scope_settle): memory properties systemd
+    rejects, an adjustment the process cannot write (below the inherited floor, or a
+    /proc/self/oom_score_adj it cannot open for writing). `memory_delegated` is that probe's verdict on
+    the memory controller (True/False), None when it did not run or could not be settled; `unsettled`
+    names the probe's checks that were due and settled nothing (CLI_SCOPE_CHECKS; empty when every due
+    check answered, and when none was due). `log`, when given, takes (message, problem=bool); the boot
+    line comes last, after every refusal: with `scope_on` false it says the limits apply to nothing,
+    since no scope is started for them to apply to; otherwise it lists each value in force under its own
+    verdict (_cli_scope_boot_line) — in force, applied to nothing until the controller is delegated, or
+    set but not settled by a named check — so a value whose check did not answer is never called in
+    force, and a value whose check did answer is never called unknown. Without `run` the check is the
+    syntax alone, so the rules are testable on any OS."""
+    env = os.environ if environ is None else environ
+    in_force, rejected = {}, {}
+    for var, key, ok, rule, _typ in CLI_SCOPE_LIMITS:
+        v = env.get(var, "")
+        if not v:
+            continue
+        if ok(v):
+            in_force[key] = v
+        else:
+            rejected[var] = v
+            if log:
+                # with the scopes off there is no scope for the line to place the sessions in
+                meanwhile = "; sessions run in their scopes without that limit" if scope_on else ""
+                log("cli scope: %s=%r is not %s — not applied%s" % (var, v, rule, meanwhile), problem=True)
+    delegated, unsettled = None, []
+    if in_force and scope_on and run is not None:
+        refused, delegated, unsettled = _cli_scope_settle(in_force, run, log)
+        for var, key, _ok, _rule, _typ in CLI_SCOPE_LIMITS:
+            if var in refused:
+                rejected[var] = in_force.pop(key)
+    if in_force and log:
+        if not scope_on:
+            listed = " ".join("%s=%s" % (k, v) for k, v in in_force.items())
+            log("cli scope: per-session limits are set (%s) but the scopes are off, so they apply to nothing"
+                % listed)
+        else:
+            log("cli scope: per-session limits — %s" % _cli_scope_boot_line(in_force, delegated, unsettled))
+    return in_force, rejected, delegated, unsettled
 
 
 def cli_scope_wrapper() -> str:
@@ -1131,6 +1490,815 @@ def acct_digest() -> str:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# API health — the GET /api-health signal (docs/reference.md, "The API-health signal").
+#
+# One aggregate view of how the API is treating the sessions this kernel runs, computed from frames the
+# backend already parses (SdkSession._on_message): the per-attempt `api_retry` SystemMessage, the
+# per-response AssistantMessage (one `ok` per distinct message_id) and the ResultMessage that settles a
+# turn the CLI gave up on (api_error_status). Events land in ONE in-memory ring keyed by
+# (auth-source label, model family); every window count and the thrash/degraded/recovering state are
+# computed from that ring when the route is read — no background tick, no derived-at stamp to go stale
+# (the kernel has had a pusher thread die quietly before). The state is derived from the ring AND the
+# last persisted (state, stateSince) — the hysteresis needs a memory the ring alone does not hold once a
+# storm has slid past the windows — and from nothing else. Only STATE TRANSITIONS a read observes are
+# written to disk (STATE/api-health.json: the per-bucket state plus a bounded transition tail, rewritten
+# whole and atomically on each), so the history survives a restart while the per-request events do not:
+# persisting every attempt would add a write per API call for a window that empties itself in 17
+# minutes, and a restart already announces itself through bootId/complete — every bucket comes back
+# `unknown` (an empty ring is no evidence) with its transitions continuous across the boot.
+#
+# What is deliberately NOT here: probes, actions, hooks, error text, paths, key material. The kernel
+# publishes what it observed; a consumer reads the signal and applies its own policy.
+#
+# Scope (v1): the MAIN THREAD of each session only, symmetrically. A subagent's retries never reach the
+# SDK as api_retry frames (the CLI folds them into a tool_progress frame the SDK discards), while its
+# tool-calling responses DO arrive as AssistantMessages tagged parent_tool_use_id — counting those `ok`s
+# without their retries would dilute every rate during exactly the storm this exists to see. So `ok`
+# requires parent_tool_use_id is None and api_retry is main-thread by construction; the payload says so
+# (coverage.sidechainExcluded). tmux-backed sessions and judge subprocesses have no SDK stream and are
+# outside the signal.
+#
+# `rate429` is an ATTEMPT share, not a request share: one stuck turn contributes up to max_retries
+# attempts. The payload names the basis (rate429Basis) and reports distinct sessions/turns retrying
+# beside the attempt counts so a reader can tell one stuck session from a saturated key.
+#
+# Note for anyone reading a storm on a machine with CLAUDE_CODE_RETRY_WATCHDOG's persistent-retry mode set:
+# that mode re-emits one api_retry frame per ~30 s for the SAME attempt, so `retries` would overcount
+# attempts there. Unset on the machine this was built on; a reader on such a machine should lean on
+# sessionsRetrying/turnsRetrying.
+# ---------------------------------------------------------------------------
+
+API_HEALTH_SCHEMA = 1
+API_HEALTH_STATE_FILE = "api-health.json"   # STATE/… — per-bucket (state, stateSince, …) + the transition tail; rewritten whole on each transition
+API_HEALTH_SALT_FILE = "api-health-salt"    # STATE/… — the per-install label salt (0600); EMPTY file = unsalted
+API_HEALTH_TRANSITIONS_KEEP = 50            # transitions kept, newest last
+
+# The constants, in one place, with defaults backtested against one rate-limit incident on one machine
+# (re-check them against the next). Each is overridable for tests through ROMP_API_HEALTH_<NAME>; the
+# payload echoes the values in force under `config` so a reader can recompute the state from the windows.
+_API_HEALTH_DEFAULTS = {
+    "windows": (60, 300, 900),   # fast / mid / slow, seconds; slow + holdS is the ring's retention
+    "minRequests": 10,           # a window with fewer attempts decides nothing
+    "fastMinRequests": 20,       # the 60 s path needs more: near a cap one request's outcome is random
+    "enter429": 0.20, "enter429Slow": 0.15, "enter429Fast": 0.50, "exit429": 0.10,
+    "enter5xx": 0.20, "enter5xxSlow": 0.15, "enter5xxFast": 0.50, "exit5xx": 0.10,
+    "holdS": 120,                # exit must hold this long → recovering, and this long again → healthy
+}
+_API_HEALTH_ENV = {
+    "windows": "WINDOWS", "minRequests": "MIN_REQUESTS", "fastMinRequests": "FAST_MIN_REQUESTS",
+    "enter429": "ENTER_429", "enter429Slow": "ENTER_429_SLOW", "enter429Fast": "ENTER_429_FAST",
+    "exit429": "EXIT_429", "enter5xx": "ENTER_5XX", "enter5xxSlow": "ENTER_5XX_SLOW",
+    "enter5xxFast": "ENTER_5XX_FAST", "exit5xx": "EXIT_5XX", "holdS": "HOLD_S",
+}
+
+
+def api_health_config() -> dict:
+    """The constants in force: the defaults above, each replaced by ROMP_API_HEALTH_<NAME> when set
+    (tests). Read fresh per call — a cached read would outlive a test's env change. A malformed
+    override is ignored, never a crash in a message handler."""
+    cfg = dict(_API_HEALTH_DEFAULTS)
+    for key, env in _API_HEALTH_ENV.items():
+        raw = os.environ.get("ROMP_API_HEALTH_" + env)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            if key == "windows":
+                ws = tuple(sorted({int(x) for x in raw.split(",") if x.strip()}))
+                if ws and all(w > 0 for w in ws):
+                    cfg[key] = ws
+            elif key in ("minRequests", "fastMinRequests", "holdS"):
+                cfg[key] = int(raw)
+            else:
+                cfg[key] = float(raw)
+        except ValueError:
+            pass
+    # the slow window at (asOf - holdS) reaches back holdS + slow seconds: exactly what the exit hold
+    # needs and nothing more (1020 s at the defaults; the ring is memory only)
+    cfg["retentionS"] = max(cfg["windows"]) + cfg["holdS"]
+    return cfg
+
+
+def model_family(raw) -> str:
+    """The model FAMILY a rate limit is scoped to: 'claude-fable-5-1', 'claude-fable-5' and
+    'us.anthropic.claude-fable-5-…' are all `fable`. re.search, not pretty_model's anchored re.match,
+    so a Bedrock/Vertex id lands in its family rather than one 'other' bucket. The generation-first ids
+    ('claude-3-5-sonnet-20241022', 'claude-3-opus-…') name the family AFTER the generation and file
+    under it too: a rate limit on one of those is still that family's, and `other` would pool it with
+    everything unrecognised. The pretty badge form ('Fable 5', the session's display model) is accepted
+    too for the retry-attribution fallback. '' → 'unknown' (nothing learned yet); a non-empty id
+    matching nothing → 'other'."""
+    s = str(raw or "").strip()
+    if not s:
+        return "unknown"
+    low = s.lower()
+    m = re.search(r"claude-([a-z]+)-\d", low) or re.search(r"claude-\d+(?:-\d+)*-([a-z]+)", low)
+    if m:
+        return m.group(1)
+    m = re.match(r"([A-Za-z]+) \d", s)
+    return m.group(1).lower() if m else "other"
+
+
+def _api_health_digest(salt: str, material: str) -> str:
+    """The label's 12 hex from a credential's identity (`material`: a key's fingerprint, or the account
+    digest) and this install's salt. With a salt, sha256(salt + material)[:12]: a name that means nothing
+    outside this install. With an EMPTY salt, the material's own first 12 hex — the identity the rest
+    of romp already prints for that credential (the key's fingerprint in the kernel log and `romp
+    keyswap`; the account digest the usage bars stamp), so an operator can match a bucket to them."""
+    if not salt:
+        return material[:12]
+    return hashlib.sha256((salt + material).encode("utf-8")).hexdigest()[:12]
+
+
+def api_health_auth_label(source, *, salt: str, key_fp: str = "", launched_keyed: bool = False,
+                          acct: str = "") -> str:
+    """The bucket's auth-source label from an init's apiKeySource, resolved ONCE per init and cached on
+    the session (never per event: a per-event resolution would run on every session's own thread).
+
+    The label is a SALTED digest — sha256(install salt + material)[:12] — so two sessions on the same
+    key or login share a bucket within this install, while the label is not a cross-machine equality
+    oracle for a key (the account digest the /usage bars use is unsalted by design; this one need not
+    be). An EMPTY salt makes the label the material itself — the fingerprint or account digest the
+    kernel prints elsewhere (_api_health_digest): the salt file is the one switch. No fragment of the
+    key itself is ever in the label — that is the standing rule for every surface. The key's material
+    here is its FINGERPRINT (keysource.fingerprint, recorded at launch as _launched_key_fp), never the
+    key: resolving the key at init time would run a 1Password retrieval per init on a reference-sourced
+    machine, and the fingerprint is the identity the launch already computed.
+
+      login:<12 hex>   apiKeySource absent or 'none' (a subscription login); the material is the
+                       account digest the usage bars already stamp (acct_digest)
+      login:unknown    …with no readable account
+      key:<12 hex>     'ANTHROPIC_API_KEY' where the kernel itself injected the key (_options):
+                       the material is the launched key's fingerprint
+      key:env          'ANTHROPIC_API_KEY' the CLI found some other way (the kernel holds no material)
+      key:helper       'apiKeyHelper' — two accounts behind one helper are one bucket
+      key:managed      '/login managed key'
+      key:<source>     any other source word the CLI enumerates (user, project, temporary, oauth, …),
+                       lowercased and stripped to alphanumerics"""
+    s = str(source or "").strip()
+    low = s.lower()
+    if not s or low == "none":
+        return ("login:" + _api_health_digest(salt, acct)) if acct else "login:unknown"
+    if s == "ANTHROPIC_API_KEY":
+        return ("key:" + _api_health_digest(salt, key_fp)) if (key_fp and launched_keyed) else "key:env"
+    if s == "apiKeyHelper":
+        return "key:helper"
+    if s == "/login managed key":
+        return "key:managed"
+    return "key:" + (re.sub(r"[^a-z0-9]+", "", low)[:16] or "other")
+
+
+def api_health_status_class(status, category="") -> str:
+    """One attempt's outcome class from the wire's error_status (int|None), falling back to its error
+    category string ('overloaded' | 'rate_limit' | 'authentication_failed' | 'server_error' | 'unknown';
+    the AssistantMessage error stamp adds 'billing_error' / 'invalid_request'). Classes: '429' (rate
+    limited), '529' (overloaded), '5xx' (other server error), 'other' (any other status — a 4xx like
+    400/401/404), 'none' (no status at all: the machine's own connectivity, typically)."""
+    st = None
+    if isinstance(status, bool):
+        status = None
+    if isinstance(status, (int, float)):
+        st = int(status)
+    elif isinstance(status, str) and status.strip().isdigit():
+        st = int(status.strip())
+    if st is not None and st > 0:
+        if st == 429:
+            return "429"
+        if st == 529:
+            return "529"
+        if 500 <= st <= 599:
+            return "5xx"
+        return "other"
+    cat = str(category or "").strip().lower()
+    if cat == "rate_limit":
+        return "429"
+    if cat == "overloaded":
+        return "529"
+    if cat == "server_error":
+        return "5xx"
+    if cat in ("authentication_failed", "billing_error", "invalid_request"):
+        return "other"
+    return "none"
+
+
+class AhEvent(tuple):
+    """One API event in the ring: (t, auth, family, kind, cls, status, sid, turn, category).
+    kind: 'ok' (a response), 'retry' (one api_retry attempt), 'gaveup' (the turn's final failed
+    attempt, from the settle). cls: api_health_status_class for the failures, 'ok' for a response.
+    category: the wire's error category string ('rate_limit', 'overloaded', …; '' when none) — it
+    rides lastError, never the counters (cls is the counter)."""
+    __slots__ = ()
+
+    def __new__(cls, t, auth, family, kind, klass, status=None, sid="", turn=0, category=""):
+        return tuple.__new__(cls, (float(t), str(auth), str(family), str(kind), str(klass),
+                                   status, str(sid), int(turn), str(category or "")))
+
+    t = property(lambda s: s[0])
+    auth = property(lambda s: s[1])
+    family = property(lambda s: s[2])
+    kind = property(lambda s: s[3])
+    cls = property(lambda s: s[4])
+    status = property(lambda s: s[5])
+    sid = property(lambda s: s[6])
+    turn = property(lambda s: s[7])
+    category = property(lambda s: s[8])
+
+
+_AH_COUNTED = ("ok", "429", "529", "5xx", "other")   # the `requests` denominator; 'none' is outside it
+
+
+def _ah_rates(c: dict) -> tuple:
+    """(requests, rate429, rate5xx) from a class-count dict; rates are None at zero requests."""
+    n = sum(c.get(k, 0) for k in _AH_COUNTED)
+    if not n:
+        return 0, None, None
+    return n, c.get("429", 0) / n, (c.get("529", 0) + c.get("5xx", 0)) / n
+
+
+def api_health_counts(events, now: float, window: int, uptime_s=None) -> dict:
+    """One window's counters over `events` (AhEvent), for (now - window, now]. `requests` is the
+    attempt count with a status (ok + the four failure classes); noStatus and gaveUp sit outside that
+    sum — a give-up IS already one of the status counters (the exhausting attempt emits no api_retry
+    frame, so the settle is the only place it can be counted). sessionsRetrying / turnsRetrying are
+    distinct sids / (sid, turn) pairs with at least one api_retry attempt in the window — the
+    request-level companions to the attempt-level rate. `complete` is false while the window is longer
+    than this kernel has been up: the counts are right for what was observed, the window is shorter
+    than its name."""
+    lo = now - window
+    c = {}
+    retries = gave_up = 0
+    sids, turns = set(), set()
+    for e in events:
+        if not (lo < e.t <= now):
+            continue
+        if e.kind == "ok":
+            c["ok"] = c.get("ok", 0) + 1
+            continue
+        c[e.cls] = c.get(e.cls, 0) + 1
+        if e.kind == "retry":
+            retries += 1
+            sids.add(e.sid)
+            turns.add((e.sid, e.turn))
+        elif e.kind == "gaveup":
+            gave_up += 1
+    n, r429, r5xx = _ah_rates(c)
+    return {"complete": True if uptime_s is None else bool(uptime_s >= window),
+            "requests": n, "ok": c.get("ok", 0),
+            "rateLimited": c.get("429", 0), "overloaded": c.get("529", 0),
+            "serverErrors": c.get("5xx", 0), "otherErrors": c.get("other", 0),
+            "noStatus": c.get("none", 0), "gaveUp": gave_up,
+            "retries": retries, "sessionsRetrying": len(sids), "turnsRetrying": len(turns),
+            "rate429": None if r429 is None else round(r429, 4),
+            "rate5xx": None if r5xx is None else round(r5xx, 4)}
+
+
+API_HEALTH_SEVERITY = {"unknown": 0, "healthy": 1, "recovering": 2, "degraded": 3, "thrashing": 4}
+API_HEALTH_RESTART_WHY = "kernel restarted: the event ring is empty"
+
+
+def api_health_state(events, now: float, prev=None, cfg: dict | None = None) -> dict:
+    """The bucket's state at `now`, as a PURE function of three inputs: its events, the previous
+    persisted `(state, stateSince)` and `now`. Nothing else is consulted — not the transitions list —
+    so a consumer holding the same three computes the same answer and a test drives it with a list.
+    `prev` None means a bucket never classified: ("unknown", now).
+
+    Returns {"state", "since", "why", "evidence", "transitions"}. `since` is the read that entered the
+    state: `now` when this read did, else the previous stateSince. `transitions` is what THIS read
+    found — zero, one or two rows of {"from", "to", "why", "evidence"} — and `why` / `evidence` are the
+    newest of those, or None when nothing moved (the caller keeps the ones it recorded). For
+    `unknown`, `evidence` is always fresh: null window and rates, `n` = requests over the slow window.
+    `evidence` is the DECIDING window's numbers — {"window", "rate429", "rate5xx", "n"} — the same
+    numbers the row's `why` carries.
+
+    The machine (docs/reference.md, "Derived state"), evaluated at `now`:
+      unknown:           no window reaches minRequests — from ANY state. The first qualifying read after
+                         it classifies afresh (an enter condition, else healthy): unknown keeps no memory
+      enter thrashing:   rate429(mid) >= enter429, or rate429(slow) >= enter429Slow, or rate429(fast) >=
+                         enter429Fast with fast >= fastMinRequests; a window counts only when it
+                         qualifies. From healthy / recovering / unknown — AND from degraded, at once:
+                         thrashing wins whenever its enter condition holds
+      enter degraded:    the same on rate5xx while the 429 condition does not hold, from healthy /
+                         recovering / unknown. There is NO thrashing -> degraded: leaving thrashing goes
+                         through recovering, and recovering -> degraded fires IN THE SAME READ when the
+                         5xx condition holds (two rows, one `at`)
+      thrashing -> recovering:  rate429 <= exit429 on BOTH mid and slow, both qualifying, at every
+                         instant of the last holdS. degraded -> recovering: the same on rate5xx / exit5xx
+      recovering -> healthy:    BOTH exit conditions (429 and 5xx) held throughout the last holdS, and
+                         now - stateSince >= holdS. Both, because the input is (state, stateSince) alone:
+                         nothing says which state recovering came from. A bucket with one rate between
+                         its exit and enter thresholds stays recovering, which is the accurate label
+      recovering -> thrashing | degraded:  the enter condition again, immediately
+
+    "Held throughout the last holdS" is exact, not sampled: a window's counts change only at
+    BREAKPOINTS (an event arriving; an event leaving a window), so the exit test is evaluated at
+    now - holdS, at now, and at every breakpoint between — the piece containing now - holdS began
+    before it, so its start is an evaluation point of its own. The slow window at now - holdS reaches
+    back holdS + slow seconds, which is exactly what the ring retains (retentionS).
+
+    A sparse reader observes the state at its read times and the transitions those reads find: a
+    state entered and left between two reads is not recorded, a transition a sparse read finds is
+    stamped with that read's time, and recovering -> healthy needs a read at least holdS after the
+    read that entered recovering. Nothing derives while nobody reads."""
+    cfg = cfg or api_health_config()
+    windows = tuple(sorted(cfg["windows"]))
+    fast, slow = windows[0], windows[-1]
+    mid = windows[1] if len(windows) >= 3 else slow
+    min_r, fast_min, hold = cfg["minRequests"], cfg["fastMinRequests"], float(cfg["holdS"])
+    p_state, p_since = prev if prev else ("unknown", None)
+    p_state = p_state if p_state in API_HEALTH_SEVERITY else "unknown"
+    p_since = now if p_since is None else float(p_since)
+    lo = now - hold - slow                      # the oldest event any evaluation below needs
+    evs = sorted(((e.t, "ok" if e.kind == "ok" else e.cls) for e in events if lo < e.t <= now),
+                 key=lambda x: x[0])
+
+    def _counts_at(points, wins):
+        """{point: {w: (n, rate429, rate5xx)}} for ascending `points`, one sliding pass per window."""
+        out = {b: {} for b in points}
+        for w in wins:
+            c, i_in, i_out = {}, 0, 0
+            for b in points:
+                while i_in < len(evs) and evs[i_in][0] <= b:
+                    k = evs[i_in][1]
+                    c[k] = c.get(k, 0) + 1
+                    i_in += 1
+                while i_out < len(evs) and evs[i_out][0] <= b - w:
+                    c[evs[i_out][1]] -= 1
+                    i_out += 1
+                out[b][w] = _ah_rates(c)
+        return out
+
+    r = _counts_at([now], windows)[now]
+    sufficient = any(r[w][0] >= min_r for w in windows)
+
+    def _enter(key):
+        """(fired, window, n, rate) for the 429 (key=1) or 5xx (key=2) enter rule, in the reference's order:
+        the mid window, the slow one, then the fast path with its own larger minimum."""
+        e_mid, e_slow, e_fast = ((cfg["enter429"], cfg["enter429Slow"], cfg["enter429Fast"]) if key == 1
+                                 else (cfg["enter5xx"], cfg["enter5xxSlow"], cfg["enter5xxFast"]))
+        for w, thr, need in ((mid, e_mid, min_r), (slow, e_slow, min_r), (fast, e_fast, fast_min)):
+            n, rate = r[w][0], r[w][key]
+            if n >= need and rate is not None and rate >= thr:
+                return True, w, n, rate
+        return False, None, 0, None
+
+    thr, deg = _enter(1), _enter(2)
+    run = {}
+
+    def _exit_held(key, thr_exit):
+        """Exit true at every instant of the last holdS: rate <= threshold on both mid and slow, both
+        qualifying, at now - holdS, at now and at each breakpoint between (computed once, on demand)."""
+        if not run:
+            pts = {now - hold, now}
+            for t, _ in evs:
+                if now - hold <= t <= now:
+                    pts.add(t)
+                for w in (mid, slow):
+                    if now - hold <= t + w <= now:
+                        pts.add(t + w)
+            run["pts"] = sorted(pts)
+            run["at"] = _counts_at(run["pts"], (mid, slow))
+        for b in run["pts"]:
+            for w in (mid, slow):
+                n, rate = run["at"][b][w][0], run["at"][b][w][key]
+                if n < min_r or rate is None or rate > thr_exit:
+                    return False
+        return True
+
+    def _rd(x):
+        return None if x is None else round(x, 4)
+
+    def _ev(w):
+        return {"window": w, "rate429": _rd(r[w][1]), "rate5xx": _rd(r[w][2]), "n": r[w][0]}
+
+    def _ev_unknown():
+        return {"window": None, "rate429": None, "rate5xx": None, "n": r[slow][0]}
+
+    def _binding(key):
+        """Of the two windows an exit needs, the one whose rate was closer to the threshold."""
+        a, b = r[mid][key] or 0.0, r[slow][key] or 0.0
+        return mid if a >= b else slow
+
+    why_unknown = "fewer than %d attempts in every window" % min_r
+
+    def _why_enter(fired, key):
+        return "%s over %d s = %.2f, n = %d (attempts)" % ("rate429" if key == 1 else "rate5xx",
+                                                          fired[1], fired[3], fired[2])
+
+    def _why_exit(key, thr_exit):
+        rk = "rate429" if key == 1 else "rate5xx"
+        return ("%s over %d s and %d s <= %.2f throughout the last %d s (%d s: %.2f, n = %d; %d s: %.2f, n = %d)"
+                % (rk, mid, slow, thr_exit, int(hold), mid, r[mid][key], r[mid][0], slow, r[slow][key], r[slow][0]))
+
+    def _step(state, since):
+        """One transition from `state`, or None. Chained by the caller until nothing moves."""
+        if not sufficient:
+            return None if state == "unknown" else ("unknown", why_unknown, _ev_unknown())
+        if thr[0]:
+            return None if state == "thrashing" else ("thrashing", _why_enter(thr, 1), _ev(thr[1]))
+        if deg[0] and state != "thrashing":
+            return None if state == "degraded" else ("degraded", _why_enter(deg, 2), _ev(deg[1]))
+        if state == "unknown":
+            w = mid if r[mid][0] >= min_r else (slow if r[slow][0] >= min_r else fast)
+            return ("healthy", "no enter condition: rate429 over %d s = %.2f, rate5xx = %.2f, n = %d (attempts)"
+                    % (w, r[w][1], r[w][2], r[w][0]), _ev(w))
+        if state == "healthy":
+            return None
+        if state == "thrashing":
+            return ("recovering", _why_exit(1, cfg["exit429"]), _ev(_binding(1))) if _exit_held(1, cfg["exit429"]) else None
+        if state == "degraded":
+            return ("recovering", _why_exit(2, cfg["exit5xx"]), _ev(_binding(2))) if _exit_held(2, cfg["exit5xx"]) else None
+        # recovering
+        if now - since >= hold and _exit_held(1, cfg["exit429"]) and _exit_held(2, cfg["exit5xx"]):
+            w = mid if max(r[mid][1] or 0, r[mid][2] or 0) >= max(r[slow][1] or 0, r[slow][2] or 0) else slow
+            why = ("rate429 and rate5xx over %d s and %d s within exit throughout the last %d s; recovering for %d s "
+                   "(%d s: 429 %.2f, 5xx %.2f, n = %d; %d s: 429 %.2f, 5xx %.2f, n = %d)"
+                   % (mid, slow, int(hold), int(now - since), mid, r[mid][1], r[mid][2], r[mid][0],
+                      slow, r[slow][1], r[slow][2], r[slow][0]))
+            return ("healthy", why, _ev(w))
+        return None
+
+    state, since, trans = p_state, p_since, []
+    for _ in range(3):
+        nxt = _step(state, since)
+        if nxt is None:
+            break
+        to, why, ev = nxt
+        trans.append({"from": state, "to": to, "why": why, "evidence": ev})
+        state, since = to, now
+    if trans:
+        why, ev = trans[-1]["why"], trans[-1]["evidence"]
+    elif state == "unknown":
+        why, ev = why_unknown, _ev_unknown()
+    else:
+        why, ev = None, None
+    return {"state": state, "since": since, "why": why, "evidence": ev, "transitions": trans}
+
+
+def _pid_alive(pid: int) -> bool:
+    """Signal 0: True for a live process (ours or another user's), False for no such pid."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True                                     # exists; not ours to signal
+    return True
+
+
+class ApiHealth:
+    """The aggregator: one ring of AhEvent tuples, one seen-message-id map, one lock, the per-bucket
+    (state, stateSince, evidence) and the transition ledger. Owned by SdkBackend; fed from
+    SdkSession._on_message on each session's own thread; read by the kernel's /api-health handler on
+    the HTTP thread — hence the lock. Holds at most a few thousand tuples over the retention (the slow
+    window plus the hold); a snapshot is one pass per bucket, run with the lock RELEASED."""
+
+    def __init__(self, state_dir, log=None, boot_at=None):
+        self.state_dir = Path(state_dir)
+        self._log = log
+        self._lock = threading.Lock()
+        self._salt_lock = threading.Lock()
+        self._ring: deque = deque()
+        self._seen: dict = {}            # (sid, message_id) -> t; dedupes the CLI's one-frame-per-block replies
+        self._seq = 0
+        self._last_event_at = None
+        self._salt = None                # lazily read/minted: nothing is written until a label is needed
+        # bucket key -> {"state", "since", "why", "evidence", "auth", "family"}: the persisted half of
+        # the derivation's input is (state, since); the rest is what the newest transition recorded
+        self._last_state: dict = {}
+        self._transitions: deque = deque(maxlen=API_HEALTH_TRANSITIONS_KEEP)   # the global tail, newest last
+        self._by_bucket: dict = {}       # bucket key -> deque(maxlen=API_HEALTH_TRANSITIONS_KEEP): that bucket's own tail
+        self._seed(time.time() if boot_at is None else float(boot_at))
+
+    # ---- labels ----
+    def salt(self) -> str:
+        """The per-install label salt. Minted once into STATE/api-health-salt at 0600 (from birth: the
+        mode is the whole point of the file). An EMPTY file is the documented switch to unsalted labels;
+        an unreadable one falls back to unsalted for this process and says so.
+
+        The mint is serialised (one lock for the whole read-or-mint) AND published atomically: the
+        bytes go to a temp file first and the name is taken with a hard link, so no reader — a sibling
+        thread, or a second process on the same state dir — can ever observe the salt file EMPTY. The
+        first cut created the file and then wrote it, and a thread reading in between cached '' (the
+        unsalted switch) and labelled the same key differently from its siblings."""
+        with self._salt_lock:
+            if self._salt is not None:
+                return self._salt
+            p = self.state_dir / API_HEALTH_SALT_FILE
+            try:
+                self._salt = p.read_text().strip()
+                return self._salt
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                if self._log:
+                    self._log("api-health: salt file unreadable (%s) — labels unsalted this kernel life" % e)
+                self._salt = ""
+                return self._salt
+            v = uuid.uuid4().hex + uuid.uuid4().hex
+            tmp = p.with_name("%s.%d.%s.tmp" % (p.name, os.getpid(), uuid.uuid4().hex[:8]))
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                self._sweep_dead_salt_temps(p)
+                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    os.write(fd, v.encode())
+                finally:
+                    os.close(fd)
+                try:
+                    try:
+                        os.link(str(tmp), str(p))       # publish whole, or lose to a sibling that did
+                    except FileExistsError:
+                        try:
+                            self._salt = p.read_text().strip()   # one salt per install: theirs
+                        except OSError:
+                            self._salt = ""
+                    else:
+                        self._salt = v
+                finally:
+                    try:
+                        os.unlink(str(tmp))
+                    except OSError:
+                        pass
+            except OSError as e:
+                if self._log:
+                    self._log("api-health: could not mint the label salt (%s) — labels unsalted this kernel life" % e)
+                self._salt = ""
+            return self._salt
+
+    def _sweep_dead_salt_temps(self, p: Path):
+        """Remove `api-health-salt.<pid>.<hex>.tmp` leftovers whose writer is DEAD: a kernel that died
+        between creating its temp and linking it. Harmless clutter otherwise, but it accumulates in a
+        state dir that is never otherwise cleaned. A temp whose writer pid is alive — or our own pid: a
+        sibling instance in this process — is a mint in progress and stays; unlinking it would turn
+        that writer's link into FileNotFoundError and leave it unsalted for its life. Never raises."""
+        try:
+            for t in p.parent.glob(p.name + ".*.tmp"):
+                try:
+                    pid = int(t.name[len(p.name) + 1:].split(".", 1)[0])
+                except ValueError:
+                    continue                            # not a name we minted: not ours to remove
+                if pid == os.getpid() or _pid_alive(pid):
+                    continue
+                try:
+                    t.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def auth_label(self, source, *, key_fp: str = "", launched_keyed: bool = False) -> str:
+        """api_health_auth_label with this install's salt and the account digest the usage bars use."""
+        acct = ""
+        if not source or str(source).strip().lower() == "none":
+            acct = acct_digest()
+        return api_health_auth_label(source, salt=self.salt(), key_fp=key_fp,
+                                     launched_keyed=launched_keyed, acct=acct)
+
+    # ---- ingestion (each on the session's own thread) ----
+    def _push(self, ev: AhEvent):
+        with self._lock:
+            self._ring.append(ev)
+            self._seq += 1
+            self._last_event_at = ev.t if self._last_event_at is None else max(self._last_event_at, ev.t)
+            if self._seq % 256 == 0:
+                self._evict_locked(ev.t)
+
+    def _evict_locked(self, now: float):
+        keep = api_health_config()["retentionS"]
+        lo = now - keep
+        while self._ring and self._ring[0].t < lo:
+            self._ring.popleft()
+        if len(self._seen) > 512:
+            for k in [k for k, t in self._seen.items() if t < lo]:
+                del self._seen[k]
+
+    def note_retry(self, t, *, auth, family, status, category="", sid, turn):
+        """One api_retry ATTEMPT (main thread — the caller checked parent_tool_use_id)."""
+        self._push(AhEvent(t, auth, family, "retry", api_health_status_class(status, category),
+                           status if isinstance(status, int) and not isinstance(status, bool) else None,
+                           sid, turn, category))
+
+    def note_ok(self, t, *, auth, family, sid, message_id) -> bool:
+        """One successful RESPONSE, deduped on (sid, message_id): the CLI emits one AssistantMessage per
+        content block and every frame of one response carries the same id. Returns whether it counted."""
+        key = (sid, message_id) if message_id else None
+        with self._lock:
+            if key is not None:
+                if key in self._seen:
+                    return False
+                self._seen[key] = float(t)
+        self._push(AhEvent(t, auth, family, "ok", "ok", None, sid, 0))
+        return True
+
+    def note_gaveup(self, t, *, auth, family, status, category="", sid, turn):
+        """The turn's FINAL failed attempt — the CLI settled it with an error (AssistantMessage.error,
+        then ResultMessage.api_error_status). Ungated on any storm flag: most give-ups observed had no
+        retry frame before them, which is why the retriesGaveUp chat marker never fired for them."""
+        self._push(AhEvent(t, auth, family, "gaveup", api_health_status_class(status, category),
+                           status if isinstance(status, int) and not isinstance(status, bool) else None,
+                           sid, turn, category))
+
+    # ---- the state file ----
+    def _state_path(self) -> Path:
+        return self.state_dir / API_HEALTH_STATE_FILE
+
+    @staticmethod
+    def _row_ok(r) -> bool:
+        """A persisted transition row: a dict with a non-empty string `bucket` and `to` and a numeric `t`."""
+        if not isinstance(r, dict):
+            return False
+        b, to = r.get("bucket"), r.get("to")
+        if not (isinstance(b, str) and b and isinstance(to, str) and to):
+            return False
+        try:
+            float(r.get("t") or 0)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _seed(self, boot_at: float):
+        """Restore the per-bucket (state, stateSince, why, evidence) and the transition tail from
+        STATE/api-health.json and set EVERY persisted bucket to `unknown` as of `boot_at`: the ring
+        is empty, so there is no evidence for any other state and no held pre-restart state.
+        `<state> -> unknown` is filed for each bucket that was not already unknown, so the transitions
+        list is continuous across the restart and the first read with enough evidence records
+        `unknown -> <state>` after it. What the boot filed is written.
+
+        Never raises: this runs inside SdkBackend.__init__, and an exception here pinned the SDK backend
+        unavailable for the kernel's whole life. A row that is not JSON, lacks its fields, or carries a
+        non-numeric `t` or a non-string `bucket` is skipped; the skips are logged once."""
+        try:
+            rows, per, recs, bad = [], {}, {}, 0
+            try:
+                doc = json.loads(self._state_path().read_text())
+            except FileNotFoundError:
+                return
+            if not isinstance(doc, dict):
+                raise ValueError("not a JSON object")
+            for r in doc.get("transitions") or []:
+                if self._row_ok(r):
+                    rows.append(r)
+                else:
+                    bad += 1
+            for key, rec in (doc.get("buckets") or {}).items():
+                st = rec.get("state") if isinstance(rec, dict) else None
+                if not (isinstance(key, str) and key and isinstance(st, str) and st):
+                    bad += 1
+                    continue
+                try:
+                    since = float(rec.get("stateSince") or 0)
+                except (TypeError, ValueError):
+                    bad += 1
+                    continue
+                recs[key] = {"state": st, "since": since, "why": rec.get("why") or "", "evidence": rec.get("evidence"),
+                             "auth": rec.get("auth"), "family": rec.get("family")}
+                per[key] = []
+                for r in rec.get("transitions") or []:
+                    if self._row_ok(r):
+                        per[key].append(r)
+                    else:
+                        bad += 1
+            if bad and self._log:
+                self._log("api-health: %d malformed row(s) skipped at boot (%s)" % (bad, API_HEALTH_STATE_FILE))
+            filed = False
+            with self._lock:
+                self._transitions.extend(rows)
+                for key, rs in per.items():
+                    self._by_bucket[key] = deque(rs, maxlen=API_HEALTH_TRANSITIONS_KEEP)
+                for key, rec in recs.items():
+                    a, f = key.split("|", 1) if "|" in key else (key, "unknown")
+                    auth = rec["auth"] if isinstance(rec["auth"], str) and rec["auth"] else a
+                    fam = rec["family"] if isinstance(rec["family"], str) and rec["family"] else f
+                    ev = {"window": None, "rate429": None, "rate5xx": None, "n": 0}
+                    if rec["state"] != "unknown":
+                        self._file_locked({"t": round(boot_at, 3), "bucket": key, "auth": auth, "family": fam,
+                                           "from": rec["state"], "to": "unknown", "why": API_HEALTH_RESTART_WHY,
+                                           "evidence": ev})
+                        filed = True
+                    self._last_state[key] = {"state": "unknown", "since": boot_at, "why": API_HEALTH_RESTART_WHY,
+                                             "evidence": ev, "auth": auth, "family": fam}
+                if filed:
+                    self._write_state_locked()
+        except Exception as e:   # loud, and the backend still comes up
+            if self._log:
+                self._log("api-health: state file unreadable (%s) — starting with no history" % e)
+            self._last_state, self._transitions, self._by_bucket = {}, deque(maxlen=API_HEALTH_TRANSITIONS_KEEP), {}
+
+    def _file_locked(self, row: dict):
+        """Record one transition in both tails: the global one and its bucket's own. The bucket's tail is
+        NOT a filter of the global one — that shape let a neighbour churning through fifty transitions
+        erase a quiet bucket's history from its own payload. The caller holds the lock and writes the
+        state file once it has filed everything this read found. One kernel-log line per transition, in
+        the `retry-pause:` lines' style, so the log reconstructs an incident as a polling reader observed
+        it: bucket, move, why. A transition is derived, filed and logged only by a read (GET /api-health),
+        so a state entered and left between two reads leaves no line; nothing derives while nobody reads."""
+        self._transitions.append(row)
+        self._by_bucket.setdefault(row["bucket"], deque(maxlen=API_HEALTH_TRANSITIONS_KEEP)).append(row)
+        if self._log:
+            self._log("api-health: %s %s -> %s — %s" % (row["bucket"], row.get("from"), row["to"], row.get("why") or ""))
+
+    def _write_state_locked(self):
+        """Publish the persisted half of the signal — the per-bucket (state, stateSince, why, evidence)
+        and the transition tail — to STATE/api-health.json whole: a writer-unique temp in the same dir,
+        then os.replace (the kernel's _atomic_write idiom), so a reader or a crash never sees a partial
+        document. Called under the lock, at most once per read that filed something; the document is
+        bounded (one record per bucket, API_HEALTH_TRANSITIONS_KEEP rows in the global tail and in each
+        bucket's own), so rewriting it whole is a few KB. Never raises into a request handler."""
+        p = self._state_path()
+        doc = {"schema": API_HEALTH_SCHEMA,
+               "transitions": list(self._transitions),
+               "buckets": {k: {"state": v["state"], "stateSince": v["since"], "why": v["why"], "evidence": v["evidence"],
+                               "auth": v["auth"], "family": v["family"],
+                               "transitions": list(self._by_bucket.get(k, ()))} for k, v in self._last_state.items()}}
+        tmp = p.with_name("%s.%d.%s.tmp" % (p.name, os.getpid(), uuid.uuid4().hex[:8]))
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(doc))
+            os.replace(tmp, p)
+        except OSError as e:
+            if self._log:
+                self._log("api-health: state file write failed: %s" % e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    # ---- the read ----
+    def snapshot(self, now: float | None = None, uptime_s=None) -> dict:
+        """The /api-health payload minus boot identity (the kernel stamps bootId/bootAt from /version's
+        globals). Windows and states are computed here, from the ring and the last persisted
+        (state, stateSince), at read time; the transitions a read finds are the events that rewrite
+        the state file. Every KNOWN bucket is derived — one in the ring, or one the state file remembers
+        whose events have all aged out: absent from the ring is `unknown`, filed at the read that found
+        it so, which is how an episode closes when traffic stops between two reads.
+
+        Three phases around the lock: copy the ring under it; derive with it RELEASED (every session
+        thread's _push takes the same lock, and a derivation over tens of thousands of ring events
+        measured 70-376 ms); re-take it only to file. A concurrent read that filed the same bucket in
+        between wins — its record is adopted rather than a second row written."""
+        now = time.time() if now is None else float(now)
+        cfg = api_health_config()
+        with self._lock:
+            self._evict_locked(now)
+            events = list(self._ring)
+            seq, last_at = self._seq, self._last_event_at
+            known = {k: dict(v) for k, v in self._last_state.items()}
+        by_bucket: dict = {}
+        for e in events:
+            by_bucket.setdefault("%s|%s" % (e.auth, e.family), []).append(e)
+        derived = []
+        for key in sorted(set(by_bucket) | set(known)):
+            evs = by_bucket.get(key, [])
+            prev = known.get(key)
+            auth, fam = (evs[0].auth, evs[0].family) if evs else (prev["auth"], prev["family"])
+            st = api_health_state(evs, now, (prev["state"], prev["since"]) if prev else None, cfg)
+            wins = {str(w): api_health_counts(evs, now, w, uptime_s) for w in cfg["windows"]}
+            last_err = None
+            for e in reversed(evs):
+                if e.kind != "ok":
+                    last_err = {"at": round(e.t, 3), "status": e.status, "category": e.category or None,
+                                "class": e.cls, "kind": e.kind}
+                    break
+            derived.append((key, auth, fam, prev, st, wins, last_err))
+        buckets = {}
+        worst, worst_key = "unknown", None
+        filed = False
+        with self._lock:
+            for key, auth, fam, prev, st, wins, last_err in derived:
+                cur = self._last_state.get(key)
+                if cur != prev:
+                    rec = cur                    # a concurrent read filed this bucket first: its record stands
+                else:
+                    for tr in st["transitions"]:
+                        self._file_locked({"t": round(now, 3), "bucket": key, "auth": auth, "family": fam,
+                                           "from": tr["from"], "to": tr["to"], "why": tr["why"],
+                                           "evidence": tr["evidence"]})
+                        filed = True
+                    rec = {"state": st["state"], "since": st["since"], "auth": auth, "family": fam,
+                           "why": st["why"] if st["why"] is not None else ((prev or {}).get("why") or ""),
+                           "evidence": st["evidence"] if st["evidence"] is not None else (prev or {}).get("evidence")}
+                    self._last_state[key] = rec
+                buckets[key] = {"auth": auth, "family": fam, "windows": wins,
+                                "state": rec["state"], "stateSince": round(rec["since"], 3),
+                                "evidence": rec["evidence"], "why": rec["why"],
+                                "transitions": list(self._by_bucket.get(key, ())),
+                                "lastError": last_err}
+                if API_HEALTH_SEVERITY[rec["state"]] > API_HEALTH_SEVERITY[worst] or worst_key is None:
+                    worst, worst_key = rec["state"], key
+            if filed:
+                self._write_state_locked()       # once per read, after every bucket's record is current
+            transitions = list(self._transitions)
+        return {"schema": API_HEALTH_SCHEMA, "asOf": round(now, 3), "uptimeS": None if uptime_s is None else round(uptime_s, 1),
+                "complete": None if uptime_s is None else bool(uptime_s >= max(cfg["windows"])),
+                "seq": seq, "lastEventAt": None if last_at is None else round(last_at, 3),
+                "rate429Basis": "attempts",
+                "coverage": {"sidechainExcluded": True},
+                "config": {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.items()},
+                "overall": {"state": worst, "worstBucket": worst_key},
+                "buckets": buckets,
+                "transitions": transitions}
+
+
 def read_reg(state_dir: Path, sid: str) -> dict | None:
     try:
         return json.loads(_reg_path(state_dir, sid).read_text())
@@ -1283,13 +2451,15 @@ STDERR_TAIL_LINES = 40
 
 
 def _without_scope_fallback_notices(text: str) -> str:
-    """`text` less every line of the scope wrapper's fallback notice (CLI_SCOPE_FALLBACK_PREFIX). On a
-    fallback launch that notice is the FIRST line of the CLI's stderr, about 230 characters of it, and
+    """`text` less every line of the scope wrapper's fallback notice (CLI_SCOPE_FALLBACK_PREFIX) and of
+    its `ignored:` line (CLI_SCOPE_IGNORED_PREFIX, a per-session limit not applied). On a fallback
+    launch that notice is the FIRST line of the CLI's stderr, about 230 characters of it, and
     _note_cli_scope_fallback logged it the moment it arrived; left in, it led the launch-error card of a
     CLI that then failed at start and pushed the CLI's own reason past the card's 600-character cut. The
-    wrapper's exit-127 refusal (CLI_SCOPE_REFUSAL_PREFIX) is kept: it IS that launch's reason, and
-    nothing else reports it."""
-    return "\n".join(ln for ln in text.splitlines() if not ln.startswith(CLI_SCOPE_FALLBACK_PREFIX))
+    `ignored:` line is logged at arrival the same way (_note_cli_scope_ignored). The wrapper's exit-127
+    refusal (CLI_SCOPE_REFUSAL_PREFIX) is kept: it IS that launch's reason, and nothing else reports it."""
+    return "\n".join(ln for ln in text.splitlines()
+                     if not ln.startswith((CLI_SCOPE_FALLBACK_PREFIX, CLI_SCOPE_IGNORED_PREFIX)))
 
 
 def launch_failure_text(exc: BaseException, tail: str = "") -> str:
@@ -2318,6 +3488,13 @@ class SdkSession:
     # full line again once the ring has evicted it — so a handler failing on each message stays visible.
     _stream_fail_seen: dict = {}
     _stream_fail_lock = threading.Lock()
+    # Same idiom, the CONFIRMING side: the FIRST api_retry frame each kernel life logs its sorted keys,
+    # so the next storm settles which fields the installed CLI actually forwards (the /api-health hook
+    # reads two of them) — read from the emitter's source until now, never captured live.
+    _retry_shape_logged = False
+    # …and one line per SystemMessage subtype the handler has no branch for (per kernel life), so a
+    # CLI that starts forwarding a new frame kind is noticed in the log instead of silently dropped.
+    _sys_subtypes_seen: set = set()
 
     def __init__(self, backend: "SdkBackend", reg: dict):
         self.backend = backend
@@ -2410,6 +3587,14 @@ class SdkSession:
         self.retrying = False                        # an api_retry storm (API rate-limit/overload) is stalling the turn → 'retrying', not 'working'
         self.retry_count = 0                          # api_retry backoff attempts in the CURRENT storm; → the live 'attempt N' + the 'Recovered after N retries' note, reset each turn
         self.retry_info = None                        # the CURRENT storm's latest api_retry detail (attempt/max, error status+message, next-attempt epoch) → the chat retrying element's extra context (the user 2026-07-10); lives and dies with `retrying`
+        # /api-health attribution (see ApiHealth): the bucket label this session's API events file under —
+        # resolved ONCE per init by _note_auth_source (api_health_auth_label), 'unknown' until one lands;
+        # a main-thread turn counter for turnsRetrying (bumped at every settle, so a storm's attempts
+        # share one turn); and the pending give-up marker — the error-stamped AssistantMessage arrives
+        # BEFORE the ResultMessage that carries api_error_status, so the settle pairs the two.
+        self.auth_label = "unknown"
+        self._ah_turn = 0
+        self._ah_gaveup = None
         self._interrupted = False                    # user interrupted the in-flight turn → snapshot reads 'waiting' (display only; inflight stays event-driven)
         self._intr_level = 0                         # interrupt escalation rung this episode (interrupt_action); reset on settle / fresh turn
         self._launched_key_fp = None                 # fingerprint of the work key this session's CURRENT client launched on
@@ -3649,7 +4834,9 @@ class SdkSession:
         line, the exit-127 refusal (CLI_SCOPE_REFUSAL_PREFIX, ROMP_CLI_REAL unset), is only buffered: no
         CLI started, so the launch fails and _record_launch_error reports the line from the tail.
         Logging it here as well reported the one event twice, and the first time as a CLI "started
-        outside a scope" when none had started.
+        outside a scope" when none had started. Its third line, `ignored:` (CLI_SCOPE_IGNORED_PREFIX, a
+        per-session limit not applied), is logged at once like the fallback — the CLI starts, in its
+        scope (_note_cli_scope_ignored).
 
         Called from the SDK's stderr reader task; it isolates exceptions per line, but keep it total
         anyway (a raise here would lose the very diagnostics this exists to keep)."""
@@ -3659,6 +4846,8 @@ class SdkSession:
                 self._stderr_tail.append(text)
                 if text.startswith(CLI_SCOPE_FALLBACK_PREFIX):
                     self.backend._note_cli_scope_fallback(self, text)
+                elif text.startswith(CLI_SCOPE_IGNORED_PREFIX):
+                    self.backend._note_cli_scope_ignored(self, text)
         except Exception:
             pass
 
@@ -3808,6 +4997,85 @@ class SdkSession:
                           % (self.name, type(e).__name__, _failing_site(e), kind, again,
                              _failure_consequence(msg, settled=settled),
                              type(e).__name__, _mask_ids(e), _compact_tb(e)), problem=True, key=key)
+    def _ah_family(self) -> str:
+        """The family a RETRY or GIVE-UP is filed under: the model this session last learned (the raw
+        id the CLI reported, else the display name). api_retry frames carry no model, so an attempt is
+        attributed to the session's CURRENT model — a capacity fallback mid-storm (the CLI moving the
+        session to another model) is learned only from the next successful reply, so the attempts
+        between the switch and that reply are filed under the previous family. Detection-grade;
+        an `ok` uses the response's own model and is exact."""
+        return model_family(getattr(self, "_model_id", "") or getattr(self, "model", "") or "")
+
+    def _ah_note_retry(self, d: dict, msg) -> None:
+        """One attempt from the api_retry frame. Reads exactly TWO of its fields, straight from the wire:
+        `error_status` (the CLI's `error.status ?? null`) and `error` (a category string). Not the chat
+        card's retry_info with its alternate spellings, and nothing else the frame carries — no field
+        of the signal uses them, and the one-shot sorted(msg.data) line shows they are present."""
+        ah = getattr(self.backend, "api_health", None)
+        if ah is None:
+            return
+        if getattr(msg, "parent_tool_use_id", None) or d.get("parent_tool_use_id"):
+            return   # a sidechain frame (should not exist for api_retry; symmetric with `ok` if one does)
+        status = d.get("error_status")
+        cat = d.get("error") if isinstance(d.get("error"), str) else ""
+        try:
+            ah.note_retry(time.time(), auth=getattr(self, "auth_label", "unknown") or "unknown",
+                          family=self._ah_family(), status=status, category=cat,
+                          sid=self.sid, turn=getattr(self, "_ah_turn", 0))
+        except Exception as e:   # the signal must never cost the session its turn
+            _lg = getattr(self.backend, "_log", None)
+            if _lg:
+                _lg("api-health: retry ingest failed: %s" % e)
+
+    def _ah_note_assistant(self, msg) -> None:
+        ah = getattr(self.backend, "api_health", None)
+        if ah is None:
+            return
+        if getattr(msg, "parent_tool_use_id", None):
+            return   # a subagent's response: its retries never reach us, so its `ok`s are not counted either
+        if getattr(msg, "error", None):
+            # the give-up's own frame: model is '<synthetic>', the status arrives with the ResultMessage
+            self._ah_gaveup = {"category": str(msg.error), "family": self._ah_family(), "t": time.time()}
+            return
+        m = str(getattr(msg, "model", None) or "")
+        if "claude" not in m.lower():
+            return   # injected / synthetic assistant records are not API responses
+        try:
+            ah.note_ok(time.time(), auth=getattr(self, "auth_label", "unknown") or "unknown",
+                       family=model_family(m), sid=self.sid,
+                       message_id=getattr(msg, "message_id", None) or getattr(msg, "uuid", None))
+        except Exception as e:
+            _lg = getattr(self.backend, "_log", None)
+            if _lg:
+                _lg("api-health: ok ingest failed: %s" % e)
+
+    def _ah_note_result(self, msg) -> None:
+        """The settle ends the turn (the counter behind turns/turnsRetrying) and completes a pending
+        give-up marker. `api_error_status` is defined only when `is_error` is true (the SDK's own comment,
+        types.py:1247-1249), so is_error GATES the read. is_error + a status + no marker files a give-up
+        in that status counter (the error AssistantMessage was not seen); is_error + a null status + no
+        marker files nothing — the CLI's other error results (max turns, budget, execution) are not API
+        failures; a pending marker with a null status is completed by its own category string."""
+        pend = getattr(self, "_ah_gaveup", None)
+        self._ah_gaveup = None
+        turn = getattr(self, "_ah_turn", 0)
+        self._ah_turn = turn + 1
+        ah = getattr(self.backend, "api_health", None)
+        if ah is None or getattr(msg, "parent_tool_use_id", None):
+            return
+        is_error = bool(getattr(msg, "is_error", False))
+        status = getattr(msg, "api_error_status", None) if is_error else None
+        status = status if isinstance(status, int) and not isinstance(status, bool) else None
+        if pend is None and status is None:
+            return
+        try:
+            ah.note_gaveup(time.time(), auth=getattr(self, "auth_label", "unknown") or "unknown",
+                           family=(pend or {}).get("family") or self._ah_family(), status=status,
+                           category=(pend or {}).get("category") or "", sid=self.sid, turn=turn)
+        except Exception as e:
+            _lg = getattr(self.backend, "_log", None)
+            if _lg:
+                _lg("api-health: give-up ingest failed: %s" % e)
 
     def _on_message(self, msg, AssistantMessage, ResultMessage, SystemMessage):
         if getattr(self, "_ping_feeding", False):   # getattr: __new__-built test doubles skip __init__
@@ -3965,6 +5233,16 @@ class SdkSession:
                     "romp: api_retry payload has no field this build understands — keys=%r. The retry "
                     "detail (attempt/max, status, countdown) will be blank until these are mapped.\n"
                     % (sorted(d)[:20],))
+            # The confirming diagnostic (one per kernel life): which keys the installed CLI's api_retry
+            # frame actually carries. Keys only — the values would include the error text.
+            if d and not SdkSession._retry_shape_logged:
+                SdkSession._retry_shape_logged = True
+                _lg = getattr(self.backend, "_log", None)
+                if _lg:
+                    _lg("api-health: first api_retry frame this kernel life — keys=%r" % (sorted(d)[:20],))
+            # ONE parse, TWO consumers: the same frame feeds the /api-health ring (ApiHealth) — never a
+            # second subscription, never the settle-time retriesRecovered ledger (no per-attempt status).
+            self._ah_note_retry(d, msg)
             self._mark("retrying")
             self.backend._poke()
         elif isinstance(msg, SystemMessage) and msg.subtype in (
@@ -3975,7 +5253,23 @@ class SdkSession:
             # off subtype+data (the typed subclasses need a newer SDK; the raw payload is identical).
             # Terminal statuses clear from EITHER message kind — a TaskStop can suppress the notification.
             self._on_task_event(msg.subtype, msg.data if isinstance(msg.data, dict) else {})
+        elif isinstance(msg, SystemMessage):
+            # A subtype no branch above handles. Logged ONCE per subtype per kernel life (keys only, no
+            # values): the CLI's stream-json allowlist decides what reaches us, and a frame kind it
+            # starts forwarding should be a line in the log, not a silent drop. Still forwarded below.
+            _st = str(getattr(msg, "subtype", "") or "")
+            if _st and _st not in SdkSession._sys_subtypes_seen:
+                SdkSession._sys_subtypes_seen.add(_st)
+                _lg = getattr(self.backend, "_log", None)
+                if _lg:
+                    _d = msg.data if isinstance(getattr(msg, "data", None), dict) else {}
+                    _lg("sdk: unhandled SystemMessage subtype %r (first seen this kernel life) — keys=%r"
+                        % (_st, sorted(_d)[:20]))
         elif isinstance(msg, AssistantMessage):
+            # /api-health: a response (one `ok` per message_id) or a give-up marker — main thread only;
+            # this hook checks parent_tool_use_id itself rather than inheriting the sidechain guard
+            # below, which sits AFTER the recovery-marker writes and so never protected them.
+            self._ah_note_assistant(msg)
             # The CLI's FAILURE settle wears an AssistantMessage too: when a storm exhausts its retries it
             # writes the error itself as the reply text ("API Error: 529 Overloaded…") and stamps the
             # message with `error` (the SDK's designed flag — "server_error", "rate_limit", …; the same
@@ -4033,6 +5327,8 @@ class SdkSession:
                 # body: it is the step most likely to raise on data (a NaN usage field, a failing spend
                 # write), and ahead of the others it skipped the rewind consumption and the live-tail
                 # sweep — 2026-09-07 review.)
+                # /api-health: the settle names a give-up's status (api_error_status) and ends the turn
+                self._ah_note_result(msg)
                 if self._rewind_to and getattr(self, "_rewind_wait", False):
                     # delete-while-busy: THIS settle is the interrupted turn ending — the flag is being
                     # ARMED here, not consumed. Second observer of the turn-end fact (the Stop hook is
@@ -5543,6 +6839,9 @@ class SdkBackend:
         # once, here, where the problem ring exists to carry it, before the boot reconcile below can
         # launch a session on the account the declaration says it does not bill.
         _check_env_file_vs_declaration(self._log, self.state_dir)
+        # The /api-health aggregator (one ring, one lock; see ApiHealth). Fed from _on_message on each
+        # session's thread, read by the kernel's route; the salt is minted lazily at the first label.
+        self.api_health = ApiHealth(self.state_dir, log=self._log)
         # The dependency check, done ONCE here: absent → every session this backend owns reports the same
         # launch error (launch_error), instead of each one silently dying at its own lazy import.
         self._sdk_missing = not sdk_importable()
@@ -5562,6 +6861,22 @@ class SdkBackend:
             # directly, unscoped.
             os.environ["ROMP_CLI_REAL"] = self.claude_bin
         self._cli_scope_wrapper_logged = False    # the missing-wrapper fallback is reported once per backend
+        # CLI launches since boot that the wrapper reported running WITHOUT a scope (its stderr notice,
+        # see _on_cli_stderr), and when the last one was. The boot verdict above is taken once; these say
+        # whether it stopped holding afterwards. Read by api_health_snapshot (cliScope.fallbacks).
+        self.cli_scope_fallbacks = 0
+        self.cli_scope_fallback_at: float | None = None
+        # The per-session limits (cli_scope_limits): the values the wrapper applies, keyed as the boot
+        # line and /api-health report them; the variables refused (each logged once, as a problem, in
+        # there) — by their rule, or by this box, which the boot probe settles once here (subprocess.run,
+        # with the scopes on) so the wrapper does not report the same refusal on every launch; the probe's
+        # verdict on the memory controller (None when it did not run); and the probe's checks that settled
+        # nothing (CLI_SCOPE_CHECKS; /api-health's `unsettled`). Read once per backend, like the verdict;
+        # _options hands them down at every connect. `cli_scope_ignored` counts the wrapper's `ignored:`
+        # lines since boot (_note_cli_scope_ignored; /api-health's `limitsIgnored`).
+        (self.cli_scope_limits, self.cli_scope_rejected, self.cli_scope_memory_delegated,
+         self.cli_scope_unsettled) = cli_scope_limits(log=self._log, scope_on=self.cli_scope, run=subprocess.run)
+        self.cli_scope_ignored = 0
         self._heal_attempts: dict[str, int] = {}  # sid -> crash-resume attempts since its last COMPLETED turn
         #                                           (bounds _heal_cut_session to one resume per cut; a completed
         #                                           turn resets it, so a crash LOOP can't respawn forever)
@@ -6507,6 +7822,17 @@ class SdkBackend:
         (_expected_auth) and the session carries no explicit per-session pick — a pick outranks
         the declaration — else against _launched_keyed as before; see the comment at the check."""
         keyed = bool(source) and str(source).strip().lower() != "none"
+        # The /api-health bucket label, resolved here — once per init, from the init's own source word
+        # and what THIS session was launched with — and cached on the session (api_health_auth_label).
+        # The key's identity is the fingerprint _options recorded at launch (_launched_key_fp), not a
+        # fresh work_key read: that read resolves the source, and on a reference-sourced machine it
+        # would run one 1Password retrieval per init.
+        try:
+            sess.auth_label = self.api_health.auth_label(
+                source, key_fp=getattr(sess, "_launched_key_fp", "") or "",
+                launched_keyed=bool(getattr(sess, "_launched_keyed", False)))
+        except Exception as e:
+            self._log("api-health: auth label failed (%s): %s" % (sess.name, e))
         # The CLI landed on a DIFFERENT auth than EXPECTED — the expected side is the box-wide
         # ROMP_EXPECTED_AUTH declaration when one is set (an apiKeyHelper box injects no key at
         # launch, so _launched_keyed said "login" while key auth was the design and every init rang
@@ -6820,12 +8146,63 @@ class SdkBackend:
         """The scope wrapper wrote its fallback notice on `sess`'s stderr (SdkSession._on_cli_stderr,
         CLI_SCOPE_FALLBACK_PREFIX): this CLI is running directly, inside the service cgroup, after the
         pre-flight scope failed. Logged at once as a problem (the error center shows it; a launch that
-        succeeds never drains the stderr tail, so nothing else would), so a reader of the log can tell
-        that the boot verdict "cli scope: on" stopped holding. The wrapper's exit-127 refusal
-        (CLI_SCOPE_REFUSAL_PREFIX) never reaches here: no CLI started, and the launch-error path
-        reports it."""
+        succeeds never drains the stderr tail, so nothing else would) and counted, so a reader of the
+        log or of /api-health can tell that the boot verdict "cli scope: on" stopped holding. The
+        wrapper's exit-127 refusal (CLI_SCOPE_REFUSAL_PREFIX) never reaches here: no CLI started, and
+        the launch-error path reports it."""
+        with self._lock:
+            self.cli_scope_fallbacks += 1
+            self.cli_scope_fallback_at = time.time()
         self._log("cli scope: session %s (%s) started its CLI outside a scope — %s"
                   % (sess.name, str(sess.sid)[:8], text), problem=True)
+
+    def _note_cli_scope_ignored(self, sess, text: str) -> None:
+        """The scope wrapper wrote its `ignored:` line on `sess`'s stderr (SdkSession._on_cli_stderr,
+        CLI_SCOPE_IGNORED_PREFIX): a per-session limit (CLI_SCOPE_LIMITS) was not applied, and the CLI
+        runs in its scope without it. Logged at once as a problem, for the fallback's reason (the CLI
+        starts, so nothing drains the tail), and counted for /api-health (cliScope.limitsIgnored) —
+        apart from the fallbacks, since the scope itself is there."""
+        with self._lock:
+            self.cli_scope_ignored += 1
+        self._log("cli scope: session %s (%s) started its CLI without a per-session limit — %s"
+                  % (sess.name, str(sess.sid)[:8], text), problem=True)
+
+    def api_health_snapshot(self, now: float | None = None, uptime_s=None) -> dict:
+        """The /api-health payload (ApiHealth.snapshot) plus what only the backend knows: how many SDK
+        sessions it holds and how many are in a retry storm right now — the cheapest direct thrash
+        indicator, independent of the ratio thresholds. Boot identity is the kernel's to stamp."""
+        out = self.api_health.snapshot(now, uptime_s=uptime_s)
+        with self._lock:
+            sess = list(self.sessions.values())
+        live = [s for s in sess if not getattr(s, "ended", False)]
+        out["coverage"]["sdkSessionsLive"] = len(live)
+        # inTurn: a turn in flight (working or retrying); retrying: inside an api_retry storm right now
+        out["coverage"]["inTurn"] = sum(1 for s in live if (getattr(s, "inflight", 0) or 0) > 0
+                                        or getattr(s, "retrying", False))
+        out["coverage"]["retrying"] = sum(1 for s in live if getattr(s, "retrying", False))
+        # The per-session scopes (cli_scope_supported): the boot verdict, and whether it stopped holding
+        # afterwards — CLI launches the wrapper reported running without a scope (_note_cli_scope_fallback).
+        # Plus the per-session limits (cli_scope_limits): each /api-health key carries the value in force
+        # — null when unset, refused, or when the scopes are off (nothing is started for a limit to apply
+        # to); `rejected` names the variables whose values were refused, by their rule or by this box at
+        # the boot probe; `memoryControllerDelegated` is the boot probe's verdict on the memory controller
+        # (null when no memory limit is set, the scopes are off, or it could not be settled); `unsettled`
+        # names the boot probe's checks that settled nothing (CLI_SCOPE_CHECKS: memoryLimits,
+        # memoryController, oomScoreAdj), so a value shown here whose check did not answer is marked as
+        # such — without it an unsettled adjustment reads exactly like a settled one; empty when every due
+        # check answered, or none was due; `limitsIgnored` counts the wrapper's `ignored:` lines since boot
+        # (_note_cli_scope_ignored) — lines, not launches.
+        with self._lock:
+            n, at, ign = self.cli_scope_fallbacks, self.cli_scope_fallback_at, self.cli_scope_ignored
+        out["cliScope"] = {"on": bool(self.cli_scope), "fallbacks": n,
+                           "lastFallbackAt": int(at) if at else None,
+                           "limitsIgnored": ign, "rejected": sorted(self.cli_scope_rejected),
+                           "memoryControllerDelegated": self.cli_scope_memory_delegated if self.cli_scope else None,
+                           "unsettled": list(self.cli_scope_unsettled) if self.cli_scope else []}
+        for _var, key, _ok, _rule, typ in CLI_SCOPE_LIMITS:
+            v = self.cli_scope_limits.get(key) if self.cli_scope else None
+            out["cliScope"][key] = typ(v) if v is not None else None
+        return out
 
     def _poke(self):
         if self._poke_cb:
@@ -6900,6 +8277,17 @@ class SdkBackend:
             if os.access(wrapper, os.X_OK):
                 kw["cli_path"] = wrapper
                 kw["env"]["ROMP_CLI_REAL"] = self.claude_bin
+                # The per-session limits (cli_scope_limits): a vetted value goes down as itself; a refused
+                # one goes down EMPTY — options.env merges over the manager's environment, which is where
+                # the refused value came from, and empty reads as unset to the wrapper, which then reports
+                # nothing a second time (the boot log has it). An unset variable is not sent at all: there
+                # is nothing to mask, and a session's environment is then what it was before the limits
+                # existed (a review found all four names set-empty in every tool shell, 2026-09-06).
+                for var, key, _ok, _rule, _typ in CLI_SCOPE_LIMITS:
+                    if key in self.cli_scope_limits:
+                        kw["env"][var] = self.cli_scope_limits[key]
+                    elif var in self.cli_scope_rejected:
+                        kw["env"][var] = ""
             elif not self._cli_scope_wrapper_logged:
                 self._cli_scope_wrapper_logged = True
                 self._log("cli scope: the wrapper %s is missing or not executable (a packaging bug) — "
