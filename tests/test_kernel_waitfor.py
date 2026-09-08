@@ -139,15 +139,9 @@ class DeclaredKindWins(unittest.TestCase):
         self.assertEqual(km._wait_for_graph(0, {X, Y}), {})
 
 
-class ReturnedSendClosesTheWait(unittest.TestCase):
-    """A send that came back is not an open ask (2026-09-08). The bus writes a terminal `bounced` row
-    naming the message's id when a send is over with nothing ever coming back — the peer refused it, the
-    recipient exited and its unread mail was destroyed, the send was refused before it left. The wait
-    reader skipped that row (no from_id/to_id), so the sender wore "Awaiting <peer>" for a question the
-    peer never received, and its card parked as waiting on a peer while the person may have needed to
-    act. The row is the closing EVENT, keyed to the message it names. The two guards this class leans on
-    live above: a sent question alone waits (test_unanswered_outbound_to_live_peer_is_a_wait) and a
-    reply of any kind answers it (test_a_reply_of_any_kind_answers_the_question)."""
+class _TerminalRowLog(unittest.TestCase):
+    """A synthetic postal log with the bus's terminal rows: `bounced` (the bus returned the message) and
+    `recall` (the sender withdrew it before anyone read it). Shared by the two classes below."""
 
     RSID = "dddddddd-0000-0000-0000-000000000004"   # a remote recipient, keyed by the relay row's to_sid
 
@@ -174,11 +168,37 @@ class ReturnedSendClosesTheWait(unittest.TestCase):
         return r
 
     @staticmethod
+    def _reply(i, t, kind="coordinate"):
+        return {"ev": "sent", "id": "m%d" % i, "from_id": Y, "to_id": X, "t": t, "kind": kind, "body": "8080"}
+
+    @staticmethod
     def _back(i, t, why="recipient exited; unread mail destroyed by the orphan sweep", **extra):
         # the bus's terminal return as the orphan sweep shapes it: the ORIGINAL id, a `to` name, a `why`
         r = {"ev": "bounced", "id": "m%d" % i, "t": t, "to": "api", "host": "", "why": why}
         r.update(extra)
         return r
+
+    @staticmethod
+    def _recall(i, t):
+        # the sender unsent it before anyone read it: {t, ev, id} is the row's whole shape, and the id is
+        # the sent row's own maildir name. (An OUTBOX recall names the relay mid, "px-…", and is not read
+        # as terminal — test_a_recall_naming_a_relay_mid_is_not_terminal.)
+        return {"ev": "recall", "id": "m%d" % i, "t": t}
+
+
+class ReturnedSendClosesTheWait(_TerminalRowLog):
+    """A send that came back is not an open ask (2026-09-08). The bus writes a terminal `bounced` row
+    naming the message's id when a send is over with nothing ever coming back — the peer refused it, the
+    recipient exited and its unread mail was destroyed, the send was refused before it left. The wait
+    reader skipped that row (no from_id/to_id), so the sender wore "Awaiting <peer>" for a question the
+    peer never received, and its card parked as waiting on a peer while the person may have needed to
+    act. The row is the closing EVENT, keyed to the message it names. The two guards this class leans on
+    live above: a sent question alone waits (test_unanswered_outbound_to_live_peer_is_a_wait) and a
+    reply of any kind answers it (test_a_reply_of_any_kind_answers_the_question). Since the same day a
+    maildir `recall` row (the sender withdrew the message before anyone read it) is read as the other
+    terminal kind through the same skip — #1071's rule, one skip before last_any, so neither row is its
+    sender's word toward the peer either — and ReturnedReplyIsNotTheAnswer below holds the recalled
+    reply's half (the bounced reply's is #1071's RefusedSendsAreNoAsk)."""
 
     def test_a_returned_question_is_no_longer_a_wait(self):
         self._log([self._ask(1, 100), self._back(1, 150)])
@@ -188,6 +208,34 @@ class ReturnedSendClosesTheWait(unittest.TestCase):
         self.assertNotIn((X, Y), last_ask, "the ask is closed on the chip's map…")
         self.assertNotIn((X, Y), last_await, "…and on the stamp clock's")
         self.assertNotIn((X, Y), last_any, "…and it is no message either: neither an ask nor an answer (#1071's rule)")
+
+    def test_a_recalled_question_is_no_longer_a_wait(self):
+        # the sender withdrew the question before the peer read it (unlinked unread from new/): as over
+        # as a bounce — the row went unread before, and X wore Awaiting Y for its own withdrawal
+        self._log([self._ask(1, 100), self._recall(1, 150)])
+        self.assertEqual(km._wait_for_graph(0, {X, Y}), {},
+                         "base: X wears Awaiting Y for a question X itself withdrew")
+        last_any, last_ask, last_await = km._postal_wait_maps()
+        self.assertNotIn((X, Y), last_ask, "the ask is closed on the chip's map…")
+        self.assertNotIn((X, Y), last_await, "…and on the stamp clock's")
+        self.assertNotIn((X, Y), last_any, "…and a withdrawn send is not X's word toward Y")
+
+    def test_a_recall_naming_a_relay_mid_is_not_terminal(self):
+        # the OUTBOX recall (review find, 2026-09-08): the row names the relay send's mid ("px-" +
+        # _unique()), and an outbox item outlives the carry — the exchange relays it without removing it;
+        # only the end-to-end ack does — so the far recipient may already hold the message and answer.
+        # Not terminal: the ask stays open, the send stays X's word, the debt stays owed, no return clock
+        # (as before — green on the base by design, where no recall was read). The maildir recall above
+        # still ends it.
+        self._log([self._ask(1, 100, id="px-1.mail.TESTHOST-A", to="peer:TESTHOST-B",
+                             toName="TESTHOST-B:api", to_sid=self.RSID),
+                   {"ev": "recall", "id": "px-1.mail.TESTHOST-A", "t": 160}])
+        self.assertEqual(km._wait_for_graph(0, {X, self.RSID}).get(X, {}).get("peerSid"), self.RSID)
+        last_any, last_ask, _aw = km._postal_wait_maps()
+        self.assertEqual(last_any.get((X, self.RSID)), 100)
+        self.assertIn((X, self.RSID), last_ask)
+        self.assertEqual([a[0] for a in km._debt_asks(self.RSID, {X})], [X])
+        self.assertEqual(km._postal_returned(), {})
 
     def test_every_return_shape_the_bus_writes_closes_by_id_alone(self):
         # the writers differ in their side fields (the orphan sweep: to/why; a peer's refusal: to/host/why;
@@ -265,6 +313,49 @@ class ReturnedSendClosesTheWait(unittest.TestCase):
         self._log([self._ask(1, 100), landed, reply, back])
         self.assertEqual(reading(), before,
                          "the earlier placement: last_any[(Y, X)] read 200 and the answered clock moved to it")
+
+
+class ReturnedReplyIsNotTheAnswer(_TerminalRowLog):
+    """A reply the replier recalled before the asker read it answers nothing (2026-09-08). last_any — any
+    later Y→X row answers X's ask — counted Y's sent row to X even after a terminal row named it: a recall
+    unlinks it from X's new/ unread (the bounced reply — the oversize push bounces it to Y WITHOUT putting
+    it back in X's box — is #1071's rule; its skip carries the recall through _learn_return). So X's chip
+    cleared, Y's debt read settled, and X's card left the wait on an answer nobody had received. The
+    exclusion is per MESSAGE (the id the row names), never per pair or per second: a live reply of Y's
+    answers as ever. Guards: the reply answers when nothing names it
+    (test_a_reply_of_any_kind_answers_the_question, and test_without_the_return_the_reply_answers)."""
+
+    def test_a_recalled_reply_leaves_the_ask_open(self):
+        self._log([self._ask(1, 100), self._reply(2, 200), self._recall(2, 250)])
+        self.assertEqual(km._wait_for_graph(0, {X, Y}).get(X, {}).get("peerSid"), Y,
+                         "base: X's edge cleared on a reply X never received")
+        last_any, _ask, _aw = km._postal_wait_maps()
+        self.assertNotIn((Y, X), last_any, "the withdrawn row is not Y's word toward X")
+        self.assertEqual([a[0] for a in km._debt_asks(Y, {X})], [X], "Y still owes X the answer (base: owed nothing)")
+
+    def test_a_bounced_reply_leaves_the_debt_owed(self):
+        # the bounced reply's edge and maps are #1071's rule and tests (RefusedSendsAreNoAsk, the twins'
+        # refused-question test); the debtor's own reader is what this pins (a guard on that rule)
+        self._log([self._ask(1, 100), self._reply(2, 200),
+                   self._back(2, 250, why="your message is 90000 bytes as delivered, over the limit")])
+        self.assertEqual([a[0] for a in km._debt_asks(Y, {X})], [X])
+
+    def test_without_the_return_the_reply_answers(self):
+        self._log([self._ask(1, 100), self._reply(2, 200)])
+        self.assertEqual(km._wait_for_graph(0, {X, Y}), {})
+        self.assertEqual(km._debt_asks(Y, {X}), [])
+
+    def test_a_live_reply_in_the_same_second_still_answers(self):
+        # per message, not per second: Y's second reply, sent the same second as the one that came back
+        # and read by X, answers — last_any keys the pair by its newest LIVE row exactly as before
+        self._log([self._ask(1, 100), self._reply(2, 200), self._reply(3, 200), self._recall(2, 250)])
+        self.assertEqual(km._wait_for_graph(0, {X, Y}), {})
+        self.assertEqual(km._postal_wait_maps()[0].get((Y, X)), 200)
+
+    def test_a_later_live_reply_still_answers(self):
+        self._log([self._ask(1, 100), self._reply(2, 200), self._recall(2, 250), self._reply(3, 300)])
+        self.assertEqual(km._wait_for_graph(0, {X, Y}), {})
+        self.assertEqual(km._postal_wait_maps()[0].get((Y, X)), 300)
 
 
 if __name__ == "__main__":

@@ -845,7 +845,7 @@ function startManager() {
       // SIGTERM respawns blinked every dashboard for an hour, and this handler — the one door every
       // programmatic restart walks through — recorded nothing. The immediate path used to be silent.
       log(`restart-all requested (${url.searchParams.get('when') === 'quiet' ? 'deferred to quiet window' : 'IMMEDIATE'}) from ${req.socket.remoteAddress || '?'}`);
-      if (url.searchParams.get('when') === 'quiet') {            // deploy path: land at the next quiet window
+      if (url.searchParams.get('when') === 'quiet') {            // `romp refresh --quiet`, the one quiet door (T269): land at the next quiet window
         return json(202, { ok: true, deferred: true, coalesced: queueQuietRestart('all') });
       }
       clearPendingQuiet();                                       // this bounce delivers any pending deploy too

@@ -1398,17 +1398,38 @@ def _lines_from_end(p: Path, block: int = 65536):
         yield rest.decode("utf-8", "replace")
 
 
+_LAST_STATE_MEMO: dict = {}     # states path -> ((mtime_ns, size, ino), record): the tail decoded once per file version
+
+
 def last_state(state_dir: Path, sid: str) -> dict:
     """The literal last line of states/<sid>.jsonl as a record ({} when absent, blank, or unparseable).
     Reads the file's tail only (2026-09-03): every caller wanted the newest record and paid a full
     forward walk of a log that only ever grows — megabytes per call for a long-lived session, on the
-    kernel's push path."""
+    kernel's push path. And only when the file MOVED (2026-09-08): live_sessions asks for every dormant
+    reg's state on every liveness read — every pusher cycle and every GET /sessions — so an unchanged
+    log now costs one stat, not a tail read and a decode. The key is the file's (mtime_ns, size, ino);
+    a missing file drops the memo and reads as {} exactly as before. Callers get their own copy."""
     p = Path(state_dir) / "states" / (sid + ".jsonl")
     try:
+        st = os.stat(p)
+    except OSError:
+        _LAST_STATE_MEMO.pop(str(p), None)
+        return {}
+    key = (st.st_mtime_ns, st.st_size, st.st_ino)
+    hit = _LAST_STATE_MEMO.get(str(p))
+    if hit is not None and hit[0] == key:
+        return dict(hit[1])
+    try:
         line = next(_lines_from_end(p), "")
-        return json.loads(line) if line.strip() else {}
+        rec = json.loads(line) if line.strip() else {}
     except (OSError, ValueError):
         return {}
+    if not isinstance(rec, dict):
+        rec = {}
+    if len(_LAST_STATE_MEMO) > 2048:
+        _LAST_STATE_MEMO.clear()
+    _LAST_STATE_MEMO[str(p)] = (key, rec)
+    return dict(rec)
 
 
 def last_state_value(state_dir: Path, sid: str) -> str:
