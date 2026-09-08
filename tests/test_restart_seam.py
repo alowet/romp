@@ -168,7 +168,7 @@ class ShimSeam(unittest.TestCase):
     def test_an_announced_death_redials_tight_and_a_blind_drop_keeps_the_cadence(self):
         # 2026-09-07 added a second tight-redial event (a close within STALE_MS of a foreground) beside T217's
         self.assertIn("var inWin=Date.now()-foregroundedAt<STALE_MS,d=1500;", self.js)
-        self.assertIn("if(inWin){d=eagerDial?0:250;eagerDial=false;}", self.js)   # the FIRST close after a foreground redials now; a second waits 250 ms
+        self.assertIn("if(inWin){d=eagerDial?0:250;eagerDial=false;}", self.js)   # the FIRST close after a foreground redials now; every further one in the window waits 250 ms
         self.assertIn("if(restartAnnounced&&Date.now()-restartAnnounced<30000)d=Math.min(d,250);", self.js)
         self.assertIn("setTimeout(connect,d);", self.js)
 

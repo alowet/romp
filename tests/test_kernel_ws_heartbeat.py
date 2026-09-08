@@ -78,12 +78,17 @@ class ShimWatchdogSourcePins(unittest.TestCase):
         # said "JS did not run", so a healthy OPEN socket read as dead and was redialed on every return
         self.assertGreaterEqual(KSRC.count("lastRecv=Date.now()"), 3)
         self.assertIn('document.addEventListener("resume",function(){resumedAt=Date.now();', KSRC)
-        self.assertIn("if(ws&&ws.readyState===1)lastRecv=Date.now();});", KSRC, "only an OPEN socket earns the stamp")
+        self.assertIn("if(ws&&ws.readyState===1&&!(frozeAt&&frozeAt-lastRecv>STALE_MS)){lastRecv=Date.now();resumeProvisional=lastRecv;}});", KSRC,
+                      "only an OPEN socket that was in time at the freeze earns the stamp, and only provisionally (review find, 2026-09-08)")
         # the staleness threshold is used TWICE within the one shim: the 5s interval watchdog AND the
         # visibilitychange fast-path (a foregrounded tab checks freshness at once — since 2026-09-07 it
         # names that verdict `stale` and files it as the return row's decision, still one test). Both live
-        # in _shim, so the single-shim guard above still holds.
-        self.assertEqual(KSRC.count("Date.now()-lastRecv>STALE_MS"), 2)
+        # in _shim, so the single-shim guard above still holds. Since 2026-09-08 the watchdog reads its bound
+        # through `bound`: PROVISIONAL_MS (1.5 keepalive periods) while a resumed keep awaits a confirming frame,
+        # STALE_MS otherwise, so the literal appears once and the watchdog's line once.
+        self.assertEqual(KSRC.count("Date.now()-lastRecv>STALE_MS"), 1)
+        self.assertEqual(KSRC.count("var bound=resumeProvisional?PROVISIONAL_MS:STALE_MS;if(everConnected&&Date.now()-lastRecv>bound)"), 1)
+        self.assertEqual(KSRC.count("var PROVISIONAL_MS=15000,resumeProvisional=0;"), 1)
         self.assertNotIn("new WebSocket", km._TIMELINE_BOOT, "the timeline boot owns no socket of its own")
 
     def test_shim_ignores_the_keepalive_frame(self):

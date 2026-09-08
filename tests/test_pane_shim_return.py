@@ -160,6 +160,65 @@ out({ret:rows(sock(),"return")});""")
         self.assertEqual(r["ret"][0]["data"]["decision"], "redial-closed")
         self.assertEqual(r["ret"][0]["data"]["ready"], 3)
 
+    # A resumed keep is PROVISIONAL (review find, 2026-09-08): the stamp re-bases the watchdog, it does not vouch
+    # for the far end. A peer that died without a FIN reaching the browser (a laptop sleep across a network change,
+    # a tunnel whose local end stays open) leaves the socket OPEN at the thaw, so the stamp made the return say
+    # `keep` and the old content sat with no badge until the 5 s watchdog crossed STALE_MS, 30 to 35 s later,
+    # where the pre-stamp shim redialed at once. Now the kernel's next frame confirms the keep, and until one
+    # lands the watchdog runs at PROVISIONAL_MS (1.5 keepalive periods) instead of STALE_MS.
+    def test_a_resumed_keep_that_no_frame_confirms_is_put_down_at_the_provisional_bound_and_the_row_re_filed(self):
+        r = _run(r"""
+open();recv({type:"ka"});hide();NOW+=1000;fire("freeze");NOW+=45000;fire("resume");show();
+var kept=sockets.length;NOW+=10000;tick();var at10=sockets.length;   // 10 s of silence since the stamp: inside the bound
+NOW+=5001;tick();   // past PROVISIONAL_MS with no beat from the kernel: the kept socket was dead all along
+var at15={sockets:sockets.length,oldReady:sockets[0].readyState,wsdown:count(winEvents,"romp:wsdown")};
+open();NOW+=200;recv({type:"feed",asks:[]});
+out({kept:kept,at10:at10,at15:at15,bound:PROVISIONAL_MS,wdOld:rows(sockets[0],"watchdog-close").length,wdNew:rows(sock(),"watchdog-close").length,
+retOld:rows(sockets[0],"return").map(function(x){return x.data;}),retNew:rows(sock(),"return").map(function(x){return x.data;}),
+rf:rows(sock(),"return-fresh").map(function(x){return x.data;}),held:returnRow,prov:resumeProvisional});""")
+        self.assertEqual(r["kept"], 1, "the thaw itself still keeps the socket: the healthy case pays nothing")
+        self.assertEqual(r["at10"], 1, "inside the provisional bound the socket stands")
+        self.assertEqual(r["bound"], 15000, "1.5 kernel keepalive periods (KEEPALIVE_S is 10 s): one beat may be in flight, two missing is silence")
+        self.assertEqual(r["at15"]["sockets"], 2, "past the bound the watchdog puts it down and redials, not at 30 to 35 s")
+        self.assertEqual(r["at15"]["oldReady"], 3)
+        self.assertEqual(r["at15"]["wsdown"], 1)
+        self.assertEqual((r["wdOld"], r["wdNew"]), (1, 0), "one watchdog-close row, sent down the quiet socket before the abandon")
+        self.assertEqual(len(r["retOld"]), 1)
+        self.assertEqual(r["retOld"][0]["decision"], "keep")
+        self.assertEqual(len(r["retNew"]), 1, "the keep row is re-filed onto the redial: the kept socket proved dead")
+        self.assertEqual((r["retNew"][0]["decision"], r["retNew"][0]["resent"]), ("keep", True))
+        self.assertIsNone(r["held"], "the held row is spent")
+        self.assertEqual(len(r["rf"]), 1)
+        self.assertTrue(r["rf"][0]["redialed"], "the return-fresh row on the redial says a dial got in the way")
+        self.assertEqual(r["rf"][0]["ms"], 15201, "measured from the foreground, as on any return")
+        self.assertEqual(r["prov"], 0, "the redial's frame confirmed the new socket")
+
+    def test_a_resumed_keep_that_a_frame_confirms_lives_to_stale_ms(self):
+        r = _run(r"""
+open();recv({type:"ka"});hide();NOW+=1000;fire("freeze");NOW+=45000;fire("resume");show();var provAtKeep=resumeProvisional;
+NOW+=2000;recv({type:"ka"});var provAfterKa=resumeProvisional;   // the kernel's beat confirms the keep: a keepalive is enough
+NOW+=20000;tick();var at22=sockets.length;   // 20 s since that frame: past the provisional bound, inside STALE_MS
+NOW+=10001;tick();var at32=sockets.length;   // 30 s since the frame: the ordinary watchdog, as before
+out({provAtKeep:provAtKeep,provAfterKa:provAfterKa,at22:at22,at32:at32,wd:rows(sockets[0],"watchdog-close").length});""")
+        self.assertEqual(r["provAtKeep"], 1000000 + 46000, "the keep records the stamp it rests on")
+        self.assertEqual(r["provAfterKa"], 0, "any frame confirms, the keepalive included")
+        self.assertEqual(r["at22"], 1, "confirmed: the shorter bound no longer applies")
+        self.assertEqual(r["at32"], 2, "real silence after the confirmation is still put down at STALE_MS")
+        self.assertEqual(r["wd"], 1)
+
+    def test_a_socket_already_overdue_before_the_freeze_is_not_stamped_and_redials_at_the_return(self):
+        r = _run(r"""
+open();recv({type:"ka"});var stamped=lastRecv;hide();NOW+=31000;fire("freeze");NOW+=45000;fire("resume");show();
+var afterShow={sockets:sockets.length,lastRecvUnchanged:lastRecv===stamped,prov:resumeProvisional};NOW+=300;open();
+out({afterShow:afterShow,ret:rows(sock(),"return").map(function(x){return x.data;})});""")
+        a = r["afterShow"]
+        self.assertTrue(a["lastRecvUnchanged"], "31 s of silence before the freeze: the far end was gone while JS still ran, the resume vouches for nothing")
+        self.assertEqual(a["prov"], 0)
+        self.assertEqual(a["sockets"], 2, "the return redials at once, as before the stamp existed")
+        self.assertEqual(len(r["ret"]), 1)
+        self.assertEqual((r["ret"][0]["decision"], r["ret"][0]["resumed"]), ("redial-stale", True))
+        self.assertEqual(r["ret"][0]["quietAtResumeMs"], 76000)
+
 
 class EagerRedialAfterForeground(unittest.TestCase):
     """§1.1: a close landing within STALE_MS of a foreground is the FIN a frozen tab thawed into — redial now."""
@@ -333,6 +392,51 @@ out({fresh:rows(sock(),"return").length,delay:liveTimers()});""")
         self.assertNotIn("romp:wsfresh',function(){badge(false);", km._timeline_page(), "the timeline owns no _pane_spin")
 
 
+class HeldReturnRow(unittest.TestCase):
+    """The keep-decision row is held for ONE reason: a FIN queued in the same thaw burst proves the kept socket was
+    already dead, and the close re-files the row onto the redial. Held past that it is a liability (review find,
+    2026-09-08): a fresh frame filed return-fresh and zeroed returnAt but left the row, so an ordinary close within
+    STALE_MS of the foreground (a kernel restart 5 s after a healthy return) re-filed it `resent` and a second,
+    contradictory return-fresh followed. Every return now starts with no held row, and the flush retires a row
+    whose return-fresh has filed, once the burst that carried the frame has drained."""
+
+    def test_keep_then_frame_then_an_ordinary_close_files_no_resent_row_and_no_second_return_fresh(self):
+        r = _run(r"""
+open();recv({type:"ka"});hide();NOW+=1000;fire("freeze");NOW+=45000;fire("resume");show();NOW+=40;recv({type:"feed",asks:[]});runFlushes();
+var afterFresh={held:returnRow,rf:rows(sock(),"return-fresh").length,returnAt:returnAt};
+NOW+=5000;sock().readyState=3;sock().onclose();var d=liveTimers().slice(-1);timers[timers.length-1].fn();open();NOW+=100;recv({type:"feed",asks:[]});
+out({afterFresh:afterFresh,d:d,retNew:rows(sock(),"return").length,rfOld:rows(sockets[0],"return-fresh").length,rfNew:rows(sock(),"return-fresh").length});""")
+        self.assertEqual(r["afterFresh"]["rf"], 1)
+        self.assertEqual(r["afterFresh"]["returnAt"], 0)
+        self.assertIsNone(r["afterFresh"]["held"], "the frame answered the return; once its burst drained, nothing is held")
+        self.assertEqual(r["d"], [{"ms": 0, "fn": "connect"}], "the close still redials at once: that rule is the foreground's, not the row's")
+        self.assertEqual(r["retNew"], 0, "no resent copy: the kept socket delivered, it did not prove dead")
+        self.assertEqual((r["rfOld"], r["rfNew"]), (1, 0), "one return-fresh per return")
+
+    def test_a_row_is_retired_only_once_its_burst_drained_so_a_same_burst_fin_still_re_files(self):
+        # the frames-then-FIN thaw (FreshCue above) needs the row to survive the frame that files return-fresh: the
+        # hop to the flush runs AFTER every task the thaw queued, a FIN included, so the close still finds the row
+        # and it is gone right after
+        r = _run(r"""
+open();recv({type:"ka"});hide();NOW+=45000;fire("resume");show();recv({type:"feed",asks:[]});
+var heldAfterFrame=!!returnRow;runFlushes();var heldAfterFlush=returnRow;
+out({heldAfterFrame:heldAfterFrame,heldAfterFlush:heldAfterFlush,fifo:FIFO.length});""")
+        self.assertTrue(r["heldAfterFrame"], "the frame alone does not retire the row (a FIN may still be queued behind it)")
+        self.assertIsNone(r["heldAfterFlush"])
+        self.assertEqual(r["fifo"], 0)
+
+    def test_a_later_return_that_decides_stale_holds_nothing(self):
+        r = _run(r"""
+open();recv({type:"ka"});hide();NOW+=2000;show();var firstHeld=!!returnRow;   // a keep no frame ever answered
+hide();NOW+=46000;show();var held=returnRow;NOW+=300;open();
+out({firstHeld:firstHeld,held:held,ret:rows(sock(),"return").map(function(x){return x.data;})});""")
+        self.assertTrue(r["firstHeld"])
+        self.assertIsNone(r["held"], "every return starts with no held row")
+        self.assertEqual(len(r["ret"]), 1, "the stale return files its own row, and nothing older rides the redial")
+        self.assertEqual(r["ret"][0]["decision"], "redial-stale")
+        self.assertNotIn("resent", r["ret"][0])
+
+
 class ReturnBreadcrumbs(unittest.TestCase):
     """§1.0: the rows that name the regime on the user's own machine."""
 
@@ -429,6 +533,21 @@ for(var i=1;i<=5;i++)recv({type:"chatTail",id:"s"+i,from:0,events:[]});
 var armed=flushes.length;runFlushes();
 out({armed:armed,n:delivered.length,armedAfter:flushes.length});""")
         self.assertEqual((r["armed"], r["n"], r["armedAfter"]), (1, 5, 0), "no clock spent → one slice, no re-arm")
+
+    def test_a_frame_whose_handler_throws_does_not_eat_the_rest_of_the_burst_and_its_error_still_surfaces(self):
+        # the isolation branch, run (review find, 2026-09-08: it had no test): the bundle throws on the second of
+        # three frames; the first and third still land in order, the queue is drained, the port is not left armed,
+        # and the error reaches the task's caller (the console, in a browser) instead of vanishing
+        r = _run(r"""
+open();var n=0;window.__rompFed={inbound:function(h,m){n++;if(n===2)throw new Error("bad frame");delivered.push(m);}};
+recv({type:"chatTail",id:"a",from:0,events:[]});recv({type:"chatTail",id:"b",from:0,events:[]});recv({type:"chatTail",id:"c",from:0,events:[]});
+var err="";try{runFlushes();}catch(e){err=String(e&&e.message);}
+out({got:delivered.map(function(m){return m.id;}),fifo:FIFO.length,armed:flushArmed,rearmed:flushes.length,err:err});""")
+        self.assertEqual(r["got"], ["a", "c"], "the bad frame alone is lost; its neighbours are delivered in order")
+        self.assertEqual(r["fifo"], 0)
+        self.assertFalse(r["armed"])
+        self.assertEqual(r["rearmed"], 0, "nothing left to flush, so no re-arm")
+        self.assertEqual(r["err"], "bad frame", "the first error is rethrown after the drain")
 
     def test_source_pin_the_budget_and_the_re_arm(self):
         js = km._shim_core_js()

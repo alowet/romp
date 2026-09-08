@@ -32697,6 +32697,7 @@ try{if(!wid)wid=window.sessionStorage.getItem("romp:wid")||"";}catch(e){}
 // sessionStorage, and with it wid; it must not copy this).
 var IID="";try{IID=(window.crypto&&crypto.randomUUID)?crypto.randomUUID():"";}catch(e){}if(!IID)IID=String(Math.random()).slice(2)+"-"+Date.now();
 var APP="%s";var LOADEDV=%d;var lastRecv=0;var STALE_MS=30000;   // watchdog: no frame (incl. keepalive) for this long → the socket is dead → reconnect
+var PROVISIONAL_MS=15000,resumeProvisional=0;   // a resumed keep is PROVISIONAL (review find, 2026-09-08): the `resume` stamp below re-bases the watchdog on a socket the browser still holds OPEN, but the far end can have died without a FIN reaching the browser, and only the kernel's next frame can tell. Until one lands the watchdog runs at 1.5 keepalive periods (KEEPALIVE_S is 10 s, so 15 s: one beat may be in flight, two missing is silence) instead of STALE_MS. resumeProvisional holds the stamp a kept socket rests on; 0 once a frame confirmed it (or the socket is a fresh one)
 var connT=0;   // when the current socket's connect() attempt started — the progress watchdog's reference point
 // Tell the shell this pane's WS state so it can show ONE "disconnected" banner (the user 2026-06-27): a real
 // network drop used to blind-reload into a dead page, leaving the pane silently frozen with no explanation.
@@ -32747,7 +32748,7 @@ data:{app:APP,why:why||"",ready:ws?ws.readyState:-1,quietMs:lastRecv?Date.now()-
 // resume seen; how long frozen/hidden/quiet; the socket state; what the fast-path below DECIDED), and how long
 // the first fresh frame then took (and whether a redial got in the way). Same clientDiag path as staleDiag:
 // send() queues while the socket is down, so a row survives the very redial it describes.
-var frozeAt=0,resumedAt=0,resumeQuiet=-1,hiddenAt=0,foregroundedAt=0,returnAt=0,returnBytes=0,returnRedialed=false,returnRow=null,eagerDial=false;   // eagerDial: the one immediate redial each return window gets   // returnRow: a keep-decision row held until a close inside the return window proves its socket was already dead
+var frozeAt=0,resumedAt=0,resumeQuiet=-1,hiddenAt=0,foregroundedAt=0,returnAt=0,returnBytes=0,returnRedialed=false,returnRow=null,eagerDial=false;   // eagerDial: the one immediate redial each return window gets   // returnRow: a keep-decision row held until a close inside the return window (or the watchdog, at the provisional bound) proves its socket was already dead; retired by the flush once its return-fresh has filed
 function returnDiag(what,data){try{data.app=APP;send({type:"clientDiag",surface:"pane-shim",what:what,data:data});}catch(e){}}
 var nav="";try{var ne=performance.getEntriesByType("navigation");nav=(ne&&ne[0]&&ne[0].type)||"";}catch(e){}
 // the page-load row exists to catch a tab the browser DISCARDED and reloaded on return (Memory Saver: the return is a
@@ -32762,7 +32763,15 @@ document.addEventListener("freeze",function(){frozeAt=Date.now();});
 // pane on every return. Stamping here makes the clock honest; the foreground test and the watchdog tick the
 // freeze queued then KEEP the socket. No `resume` (Firefox, Safari, hidden-but-running, a genuinely silent
 // socket) reads stale exactly as before and redials at once. The pre-stamp gap is kept for the return row.
-document.addEventListener("resume",function(){resumedAt=Date.now();resumeQuiet=lastRecv?resumedAt-lastRecv:-1;if(ws&&ws.readyState===1)lastRecv=Date.now();});
+// The stamp RE-BASES the watchdog, it does not disarm it (review find, 2026-09-08): an OPEN readyState says only
+// that the browser has seen no FIN, and a peer that died while the tab was frozen (a laptop sleep across a network
+// change, a tunnel whose local end stays open) leaves the socket looking exactly like a healthy one. So the stamp
+// is PROVISIONAL (resumeProvisional: the watchdog runs at PROVISIONAL_MS until a frame confirms it, and abandon()
+// re-files the held keep row onto the redial when none does), and a socket already overdue BEFORE the freeze is
+// not stamped at all: its silence began while JS was running, so that gap is real and the return redials it at
+// once, as it did before the stamp existed.
+document.addEventListener("resume",function(){resumedAt=Date.now();resumeQuiet=lastRecv?resumedAt-lastRecv:-1;
+if(ws&&ws.readyState===1&&!(frozeAt&&frozeAt-lastRecv>STALE_MS)){lastRecv=Date.now();resumeProvisional=lastRecv;}});   // only an OPEN socket that was in time at the freeze earns the stamp, and only provisionally
 function raiseStale(why){if(paneHidden()){staleDiag("stale-suppressed-hidden",why);return;}
 staleDiag("stale-raise",why);
 if(window.parent!==window){try{window.parent.postMessage({romp:"wsStale"},"*");}catch(e){}}else{selfStale();}}
@@ -32810,15 +32819,15 @@ ws=new WebSocket(proto+location.host+"/ws?app=%s&delta=1&iid="+encodeURIComponen
 // socket dropped (the pane's romp loader) needs the socket's RETURN as its event to come back down. The
 // first connect deliberately doesn't fire it — nothing is waiting on it, and the loader must stay up until
 // real content lands.
-ws.onopen=function(){lastRecv=Date.now();openT=lastRecv;openSock=this;netState("up");var wasReconn=everConnected;everConnected=true;for(var i=0;i<queue.length;i++)ws.send(queue[i]);queue=[];queuedDiag=0;
+ws.onopen=function(){lastRecv=Date.now();openT=lastRecv;openSock=this;netState("up");resumeProvisional=0;var wasReconn=everConnected;everConnected=true;for(var i=0;i<queue.length;i++)ws.send(queue[i]);queue=[];queuedDiag=0;
 if(failedConnects){send({type:"clientDiag",surface:"pane-shim",what:"wsconnfail",data:{app:APP,attempts:failedConnects,firstFailMs:Date.now()-firstFailT}});failedConnects=0;firstFailT=0;}   // the redials that never opened since the last open, as ONE row: how many, and how long ago the first failed
 if(wasReconn){var ann=restartAnnounced&&Date.now()-restartAnnounced<30000;restartAnnounced=0;   // one-shot: spent here
 if(!ann)armStale(pendingWhy||"reconnect");   // T217: an ANNOUNCED restart's reconnect skips the arm — the resync lands in a beat and the flash was pure noise; a restart that never comes back stays loud through the disconnected state itself, and a SECOND reconnect arms as always
 pendingWhy="";freshPending=true;try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}}};
-ws.onmessage=function(ev){lastRecv=Date.now();if(returnAt)returnBytes+=(ev.data&&ev.data.length)||0;var msg;try{msg=JSON.parse(ev.data);}catch(e){return;}
+ws.onmessage=function(ev){lastRecv=Date.now();resumeProvisional=0;if(returnAt)returnBytes+=(ev.data&&ev.data.length)||0;var msg;try{msg=JSON.parse(ev.data);}catch(e){return;}
 if(msg&&msg.type==="ka"){if(LOADEDV&&msg.dv&&msg.dv>LOADEDV)raiseBuild();
 if(stalePending&&++staleKa>=2){var sw=stalePending;stalePending="";raiseStale(sw);}   // the SECOND keepalive since the arm, no resync between: a full heartbeat period on THIS socket with the kernel alive, talking to it, and not resyncing it — the view IS stale. (One keepalive alone can be a beat queued at accept, ahead of the resync frame.)
-return;}   // keepalive: stamped lastRecv above; carries the build token (drift → reload banner); nothing for the bundle to render
+return;}   // keepalive: stamped lastRecv above and confirmed a resumed keep (resumeProvisional=0: any frame does); carries the build token (drift → reload banner); nothing for the bundle to render
 // T217: the kernel announces its own death (one final frame from the dying process). Latch it: the
 // imminent close is EXPECTED — onclose redials eagerly instead of on the blind cadence, and the
 // reconnect skips the stale-banner arm once (the resync is seconds away; a restart that never
@@ -32858,7 +32867,7 @@ try{window.dispatchEvent(new Event("romp:wsdown"));}catch(e){}
 // both ride the redial (review find 2026-09-07: the frozen-then-dropped regime otherwise left no trace)
 if(returnRow&&Date.now()-foregroundedAt<STALE_MS){var rr=returnRow;returnRow=null;rr.resent=true;returnDiag("return",rr);returnAt=returnAt||foregroundedAt;returnBytes=0;}
 var inWin=Date.now()-foregroundedAt<STALE_MS,d=1500;   // a close landing within STALE_MS of a foreground (the FIN a frozen tab thawed into; an iOS return): the close IS the event
-if(inWin){d=eagerDial?0:250;eagerDial=false;}   // …so the FIRST such close redials NOW; a second one in the same window waits 250 ms (a kernel that is down must not be hammered) (2026-09-07)
+if(inWin){d=eagerDial?0:250;eagerDial=false;}   // …so the FIRST such close redials NOW; every further close in the same window waits 250 ms (a kernel that is down must not be hammered) (2026-09-07)
 if(restartAnnounced&&Date.now()-restartAnnounced<30000)d=Math.min(d,250);   // an announced death keeps its tight redial
 setTimeout(connect,d);};   // the blind 1.5 s stays for unannounced drops outside any return window
 ws.onerror=function(){try{ws.close();}catch(e){}};}
@@ -32888,6 +32897,7 @@ FIFO.push(m);if(!flushArmed){flushArmed=true;ch.port2.postMessage(0);}}
 // from its head, and a newer whole-state frame arriving mid-burst still replaces its older still-queued twin.
 var FLUSH_MS=8;
 function flush(){flushArmed=false;var t0=Date.now(),err=null;
+if(returnRow&&!returnAt)returnRow=null;   // the held keep row is spent once its return-fresh has filed AND the burst that carried the frame has drained: this hop runs after every task the thaw queued, a same-burst FIN included, so that FIN still finds the row (onclose re-files it) and an ordinary close later does not (review find, 2026-09-08: a kernel restart 5 s after a healthy return re-filed the row `resent` and a second return-fresh followed)
 while(FIFO.length){var m=FIFO.shift();try{deliver(m);}catch(e){if(!err)err=e;}   // one bad frame never eats the rest of the burst; its error still surfaces
 if(FIFO.length&&Date.now()-t0>=FLUSH_MS){flushArmed=true;ch.port2.postMessage(0);break;}}   // budget spent → the rest rides the next task
 if(err)throw err;}
@@ -32934,6 +32944,7 @@ setState:function(s){try{localStorage.setItem(SK,JSON.stringify(s));}catch(e){}}
 // socket still carries writes; the raise's row does not depend on that.)
 function abandon(){var d=ws;if(!d)return;d.onopen=d.onmessage=d.onclose=d.onerror=null;try{d.close();}catch(e){}ws=null;
 if(stalePending&&openSock===d){var qw=stalePending;stalePending="";raiseStale(qw+"-quiet");}   // the reconnected socket armed and then said nothing before its resync: nothing is coming on it, and the view IS stale — the disowned onclose cannot rule on it, and the redial's open would otherwise re-arm from zero
+if(returnRow&&returnAt){var rr=returnRow;returnRow=null;rr.resent=true;returnDiag("return",rr);returnBytes=0;}   // a KEPT socket put down before any fresh frame reached this return (the watchdog at the provisional bound): the keep row went into a socket that proved dead, so re-file it onto the redial as onclose does for a same-burst FIN, keyed on the return still being open, never on the clock (review find, 2026-09-08)
 netState("down");try{window.dispatchEvent(new Event("romp:wsdown"));}catch(e){}}
 // progress watchdog (state-keyed, one per socket state): OPEN but silent past STALE_MS = half-open, no
 // onclose will ever fire — force-close (the user 2026-06-29). CONNECTING past its deadline = the browser is
@@ -32942,7 +32953,7 @@ netState("down");try{window.dispatchEvent(new Event("romp:wsdown"));}catch(e){}}
 // "Disconnected — reconnecting…" banner sat until a manual refresh). CLOSED with no fresh attempt = the 1.5s
 // retry timer was lost (throttled/killed) — re-dial directly; connect()'s own guard makes this idempotent.
 setInterval(function(){if(!ws)return;
-if(ws.readyState===1){if(everConnected&&Date.now()-lastRecv>STALE_MS){staleDiag("watchdog-close","quiet");abandon();connect();}return;}
+if(ws.readyState===1){var bound=resumeProvisional?PROVISIONAL_MS:STALE_MS;if(everConnected&&Date.now()-lastRecv>bound){staleDiag("watchdog-close","quiet");abandon();connect();}return;}   // a resumed keep no frame has confirmed runs at the shorter bound (PROVISIONAL_MS, above)
 if(ws.readyState===0&&Date.now()-connT>15000){try{ws.close();}catch(e){}return;}
 if(ws.readyState===3&&Date.now()-connT>8000){connect();}},5000);
 // visibility fast-path (the user 2026-07-05): a BACKGROUNDED tab has its timers throttled, so the 5s watchdog
@@ -32956,7 +32967,7 @@ foregroundedAt=Date.now();eagerDial=true;if(!everConnected)return;
 var stale=!ws||ws.readyState!==1||Date.now()-lastRecv>STALE_MS;var res=resumedAt>hiddenAt;
 var row={decision:stale?((!ws||ws.readyState!==1)?"redial-closed":"redial-stale"):"keep",resumed:res,hiddenMs:hiddenAt?Date.now()-hiddenAt:-1,
 frozenMs:(res&&frozeAt>=hiddenAt&&resumedAt>frozeAt)?resumedAt-frozeAt:0,quietMs:lastRecv?Date.now()-lastRecv:-1,quietAtResumeMs:res?resumeQuiet:-1,ready:ws?ws.readyState:-1};
-returnAt=Date.now();returnBytes=0;returnRedialed=false;
+returnAt=Date.now();returnBytes=0;returnRedialed=false;returnRow=null;   // every return starts with no held row (review find, 2026-09-08): a keep row left over from an earlier return must not ride this one's close or abandon
 if(!stale){returnRow=row;returnDiag("return",row);return;}   // the socket stands: the row rides it now — and is HELD, because a FIN queued in the same thaw burst would swallow it (review find 2026-09-07; onclose re-files)
 pendingWhy="foreground";freshPending=true;   // the reconnect's arm reads "foreground" (upstream's two-event prompt)
 if(ws&&ws.readyState===1)abandon();else{try{if(ws&&ws.readyState===0)ws.close();}catch(e){}}   // OPEN-but-quiet → abandoned + redialed below, now; stuck-CONNECTING → aborted, onclose retries

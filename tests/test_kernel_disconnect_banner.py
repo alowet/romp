@@ -34,7 +34,7 @@ class DisconnectBanner(unittest.TestCase):
         # T217: an ANNOUNCED death redials tight; since 2026-09-07 so does a close landing within STALE_MS
         # of a foreground (the FIN a frozen tab thawed into); the blind 1.5s stays for unannounced drops
         self.assertIn("var inWin=Date.now()-foregroundedAt<STALE_MS,d=1500;", js)
-        self.assertIn("if(inWin){d=eagerDial?0:250;eagerDial=false;}", js)   # the FIRST close after a foreground redials now; a second waits 250 ms
+        self.assertIn("if(inWin){d=eagerDial?0:250;eagerDial=false;}", js)   # the FIRST close after a foreground redials now; every further one in the window waits 250 ms
         self.assertIn("if(restartAnnounced&&Date.now()-restartAnnounced<30000)d=Math.min(d,250);", js)
         self.assertIn("setTimeout(connect,d);", js)
         self.assertIn("ws.onerror=function(){try{ws.close();}catch(e){}};", js)
@@ -122,8 +122,9 @@ class DisconnectBanner(unittest.TestCase):
         # the watchdog handles EVERY socket state: half-open OPEN, stuck CONNECTING, and lost-timer CLOSED.
         # A quiet OPEN socket is ABANDONED and redialed in the same tick (2026-09-02): close() alone
         # starts a closing handshake a dead far side never answers, and the browser holds CLOSING ~60s
-        # before onclose — the audited phone panes came back 64s after their own watchdog-close.
-        self.assertIn('if(ws.readyState===1){if(everConnected&&Date.now()-lastRecv>STALE_MS){staleDiag("watchdog-close","quiet");abandon();connect();}return;}', js)
+        # before onclose — the audited phone panes came back 64s after their own watchdog-close. The bound is
+        # PROVISIONAL_MS while a resumed keep awaits its confirming frame, STALE_MS otherwise (review find, 2026-09-08).
+        self.assertIn('if(ws.readyState===1){var bound=resumeProvisional?PROVISIONAL_MS:STALE_MS;if(everConnected&&Date.now()-lastRecv>bound){staleDiag("watchdog-close","quiet");abandon();connect();}return;}', js)
         self.assertIn("function abandon(){var d=ws;if(!d)return;d.onopen=d.onmessage=d.onclose=d.onerror=null;try{d.close();}catch(e){}ws=null;", js)
         self.assertIn('netState("down");try{window.dispatchEvent(new Event("romp:wsdown"));}catch(e){}}', js,
                       "the abandoned socket's onclose is disowned, so abandon() itself does what onclose did (banner + close rule + loader)")
