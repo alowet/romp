@@ -13,12 +13,19 @@ name: PR tier
 # When its job happened to finish AFTER the labeled run's, the newest
 # same-named check run was that stale failure and the PR read blocked with
 # auto-merge armed (pull 1039, 2026-09-08). Every run now judges what the PR
-# carries at the moment it looks, and the concurrency group below serializes
-# the runs for one PR so the newest check run is always the last event's.
-# It is NOT cancel-in-progress: a cancelled run leaves a check run whose
-# conclusion is "cancelled", and when that run started later than the one
-# that survived, IT is the newest, and a required check that is cancelled
-# blocks the merge. Queueing costs a few seconds; cancelling can wedge.
+# carries at the moment it looks, and the concurrency group below runs one
+# job at a time per PR. The merge box follows the newest same-named check run
+# BY TIME (on 1039 the failure that completed last won, though its run was
+# created first), and one-at-a-time makes completion times monotonic in
+# execution order, so the run that executes last is the newest. `queue: max`
+# keeps EVERY pending run (the default keeps one and replaces it, leaving a
+# check run concluding "cancelled"), so no run for a PR is ever cancelled or
+# replaced: each event's run executes, in the order they began waiting, and
+# the last one has read the world after the last event.
+# It is NOT cancel-in-progress: the in-progress run is never cut. Cancelling
+# it would risk its "cancelled" check run COMPLETING after the survivor's (the
+# runner's cancel grace is longer than this job), and a cancelled required
+# check blocks the merge. Queueing costs a few seconds; cancelling can wedge.
 # It re-runs when the labels change, and on every push to the PR, so the
 # status on the PR is always about the labels it carries now. Making it a
 # REQUIRED check on main is a branch-ruleset setting in the repository
@@ -31,10 +38,11 @@ on:
 permissions:
   pull-requests: read
 
-# One run at a time per PR, in event order, never cancelling: see the header.
+# One job at a time per PR, every run kept, none cancelled: see the header.
 concurrency:
   group: pr-tier-${{ github.event.pull_request.number }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   tier:

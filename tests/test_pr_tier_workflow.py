@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The "Exactly one tier label" check (.github/workflows/pr-tier.yml) judges the PR's CURRENT labels, read
-from the API, and runs one job at a time per PR without cancelling the one in progress.
+from the API, and runs one job at a time per PR, keeping every run: none cancelled, none replaced.
 
 The race this pins closed (pull 1039, 2026-09-08): `gh pr create --label` fires `opened` with an empty
 label snapshot and `labeled` a second later; the opened run judged the snapshot and failed, and when its
@@ -8,11 +8,12 @@ job COMPLETED two seconds after the labeled run's, the merge box (which follows 
 check run by time) took that stale failure and the PR read blocked with auto-merge armed. Two things make
 ordering irrelevant now: every run reads the labels the PR carries at the moment it looks (the API, with
 the job's read-only token), and a concurrency group keyed on the PR number runs one job at a time, which
-makes completion times monotonic in execution order, so the run that executes last is the newest. GitHub's
-default queue replaces a superseded PENDING run with the newer one (whose check run completes later
-still), so the last executed run has always read the world after the last event. Cancel-in-progress is
-deliberately off: cancelling the in-progress run risks its "cancelled" check run completing after the
-survivor's, and a cancelled required check blocks.
+makes completion times monotonic in execution order, so the run that executes last is the newest.
+`queue: max` keeps every pending run (GitHub's default keeps one and replaces it, leaving a "cancelled"
+check run), so each event's run executes and the last has read the world after the last event.
+Cancel-in-progress is deliberately off: cancelling the in-progress run risks its "cancelled" check run
+completing after the survivor's, and a cancelled required check blocks; GitHub also refuses
+`queue: max` beside `cancel-in-progress: true`.
 
 The step's script is run for real, with `gh` replaced by a shim on PATH that prints a canned label list
 (or fails), so the zero / one / two / alias / unreadable cases are behaviour, not a grep. Source pins
@@ -120,9 +121,9 @@ class WorkflowPins(unittest.TestCase):
         types = {t.strip() for t in m.group(1).split(",")}
         self.assertTrue({"opened", "reopened", "labeled", "unlabeled", "synchronize"} <= types, types)
 
-    def test_runs_for_one_pr_never_cancel_the_one_in_progress(self):
+    def test_runs_for_one_pr_are_kept_and_never_cancelled(self):
         self.assertIn("concurrency:\n  group: pr-tier-${{ github.event.pull_request.number }}\n"
-                      "  cancel-in-progress: false\n", self.src)
+                      "  cancel-in-progress: false\n  queue: max\n", self.src)
 
     def test_the_token_is_read_only_and_passed_to_gh(self):
         self.assertIn("permissions:\n  pull-requests: read\n", self.src)
