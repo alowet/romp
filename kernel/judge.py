@@ -2479,8 +2479,11 @@ def _sdk_owned(fsid):
 # goal/caption stores keep flowing through the pass — they are the pipeline's own dataflow (the closer
 # must see this pass's planner verdicts). Shared across tier threads AND their worker pools on
 # purpose: one frame, one world, first touch wins under the lock.
-_frame = None                    # {"parses": {fsid: session}, "keys": {tag: fileset-key}} while a pass runs
+_frame = None                    # {"parses": {fsid: session}, "keys": {tag: pinned value}, "served": {fsid: pair}}
+#                                  while a pass runs: "keys" holds the pass's ("parse", fsid) pairs
+#                                  (_frame_parse_key), "served" the pair each pinned parse was made under
 _frame_lock = threading.Lock()
+_NO_PIN = object()               # "no entry" in a frame's keys: a pinned None (a failed stat) IS an entry
 
 
 def begin_pass_frame():
@@ -2490,7 +2493,7 @@ def begin_pass_frame():
     with _frame_lock:
         if _frame is not None:
             return False                             # a joiner shares the creator's pass — and its key gate
-        _frame = {"parses": {}, "keys": {}}
+        _frame = {"parses": {}, "keys": {}, "served": {}}
         return True
 
 
@@ -2503,22 +2506,69 @@ def end_pass_frame(owned=True):
         _frame = None
 
 
-def _pinned_fileset_key(tag, files):
-    """The fileset key as of this pass's FIRST look (frame-pinned), else the live key. Keeps a
-    memo written mid-pass consistent with the frame's content: a live key over a file that grew
-    mid-pass would stamp stale derived data under the NEW key, and the next pass would trust it."""
+def _parse_key_files(fsid, files):
+    """The files the judge parse of `fsid` reads, as the filesystem shows them now: the candidate
+    transcripts (_judge_candidates over the RAW leaf list every caller hands in) plus states/<fsid>.jsonl
+    when it exists. Takes the raw list on purpose: _judge_candidates over an already-expanded list would
+    append a fork lane's anchor a second time, and a key computed that way would never equal the one the
+    parse cache holds (one spurious parse per fork lane per pass)."""
+    cands = _judge_candidates(fsid, files)
+    states = STATESDIR / (fsid + ".jsonl")
+    return cands, states, list(cands) + ([str(states)] if states.exists() else [])
+
+
+def _frame_parse_key(fsid, files):
+    """The (fileset key, pending cut) pair this pass judges `fsid` under, pinned in the pass frame
+    (2026-09-07).
+
+    Under a frame the FIRST caller pins it (tag ("parse", fsid)) and every later caller in the pass gets
+    the pinned pair back, whatever the files look like now. The pin is taken BEFORE anything is read, so a
+    reader holding the pair sees content at least as new as the pair describes, never older; that
+    ordering is what lets a stamp keyed on the pair stand for the content a stage judged (the evidence
+    gate, _stage_sig): the judged content can be newer than the stamped key, which costs one redundant
+    run next pass, never older, which would be a missed run. The fileset component is what the frame
+    fixes; the CUT the parse runs under stays LIVE (parsed_session reads it at parse time, as before the
+    frame existed), and the pair the parse was actually served under is recorded beside it
+    (fr["served"]) so the gate can withhold its stamp when the two disagree.
+
+    A stat that fails pins None: the tag is PRESENT with value None, the pass parses uncached, and the
+    gate reads a pinned None as run-and-do-not-stamp. Pinning None rather than leaving the tag absent
+    closes the hole where a later caller in the same pass would pin a fresh key over a parse read
+    earlier (a candidate _judge_candidates just saw can be renamed or removed before its stat, so the
+    exists() and the stat can disagree). No frame: the live pair, no pin.
+
+    Returns (pair, cut, fr): the pinned (or live) pair, or None; the LIVE cut this call read, or None when
+    an existing pin answered and nothing was read (the caller reads its own); and the frame dict the pin
+    lives in (None without a frame), so a caller pinning its parse pins into the SAME frame the key went
+    into rather than into whatever frame stands when its parse returns (a parse can span a pass
+    boundary). An existing pin costs one dict read: no stat, no cut read."""
     fr = _frame
     if fr is not None:
         with _frame_lock:
-            hit = fr["keys"].get(tag)
-        if hit is not None:
-            return hit
-    k = _fileset_key(files)
+            hit = fr["keys"].get(("parse", fsid), _NO_PIN)
+        if hit is not _NO_PIN:
+            return hit, None, fr
+    _cands, _states, key_files = _parse_key_files(fsid, files)
+    cut = _pending_cut(fsid)
+    try:
+        key = (_fileset_key(key_files), cut)
+    except OSError:
+        key = None
     fr = _frame
     if fr is not None:
         with _frame_lock:
-            return fr["keys"].setdefault(tag, k)
-    return k
+            return fr["keys"].setdefault(("parse", fsid), key), cut, fr
+    return key, cut, None
+
+
+def _frame_pin_parse(fr, fsid, session, key):
+    """Under _frame_lock: pin `session` as the frame's parse of fsid unless a concurrent first toucher
+    already did (first touch wins), and record the pair the WINNING parse was made under for the gate's
+    served-pair check. Returns the pinned parse."""
+    won = fr["parses"].setdefault(fsid, session)
+    if won is session:
+        fr["served"][fsid] = key
+    return won
 
 
 def parsed_session(fsid, files, now):
@@ -2530,7 +2580,14 @@ def parsed_session(fsid, files, now):
 
     Under an open PASS FRAME (begin_pass_frame) the FIRST parse of a session is pinned and every later
     call in the pass returns it — even after the file grew — so all stages judge one frozen world
-    (the user 2026-07-21); first touch wins across the tier's worker threads.
+    (the user 2026-07-21); first touch wins across the tier's worker threads. The parse's KEY is pinned
+    with it (_frame_parse_key): the fileset component is read before this function reads anything, the
+    cache slot is (pinned fileset key, live cut), and the pair the pinned parse was served under is
+    recorded in the frame. A gate that pinned the key earlier in the pass fixes the fileset component for
+    every parse of the pass; the content read here can then be newer than the key, never older, which is
+    the property the gate's stamp needs. The cache slot stays exact for the cache's own contract: a later
+    lookup hits it only when the live key equals the pinned one, which means the file has not moved since
+    the pin, so the cached content is that key's content.
 
     Passes states/<fsid>.jsonl so REAL idle transitions become idle atoms — without them _session_closed()
     is permanently False and a discharged focus goal never settles to completed (the settled gate, the
@@ -2542,6 +2599,10 @@ def parsed_session(fsid, files, now):
             hit = fr["parses"].get(fsid)
         if hit is not None:
             return hit
+    # The pass's (fileset key, cut) pair, pinned BEFORE this read: a gate that pinned first fixes the
+    # fileset component for the pass; a first toucher pins the live one here. `fr` is the frame the pin
+    # went into, and the parse below is pinned into that same frame.
+    pair, cut, fr = _frame_parse_key(fsid, files)
     states = STATESDIR / (fsid + ".jsonl")
     # A FORKED leaf (SDK /clear: discover hands the lastSid file under the stable romp sid) parses with
     # the session's anchor transcript among the candidates, so a fork whose chain back-links across files
@@ -2555,19 +2616,17 @@ def parsed_session(fsid, files, now):
     # and clearing both change the parse with NO file change. No PLACEMENTS_V bump: the override only
     # SHRINKS the atom set, transiently, while a cut is armed — segment identity for everything kept is
     # unchanged, and no previously-invisible atom ever becomes a fresh plannable segment (the two drift
-    # shapes the version exists for).
-    cut = _pending_cut(fsid)
-    key_files = list(files) + ([str(states)] if states.exists() else [])
-    try:
-        key = (_fileset_key(key_files), cut)
-    except OSError:
-        key = None
+    # shapes the version exists for). The cut is read LIVE here (the user's call, 2026-09-07): the
+    # judged world is the one the cut wire was built for, and a cut that moved since the gate's pin
+    # shows up as a served pair that differs from the pinned one, which withholds the gate's stamp.
+    if cut is None:                        # a pin answered and read nothing: the live cut is ours to read
+        cut = _pending_cut(fsid)
+    key = (pair[0], cut) if pair is not None else None
     hit = _PARSE_CACHE.get(fsid)
     if key is not None and hit and hit[0] == key:
-        fr = _frame
         if fr is not None:                 # a WARM first touch pins too (review 2026-09-06): this path used to
             with _frame_lock:              #  return unpinned, so a session already in the cache froze nothing
-                return fr["parses"].setdefault(fsid, hit[1])   # and a mid-pass append reached a later stage
+                return _frame_pin_parse(fr, fsid, hit[1], key)   # and a mid-pass append reached a later stage
         return hit[1]                      #  only - the two-worlds shape the frame exists to prevent
     session = em.parse_session(files[0], rompuuid=fsid, candidate_files=list(files),
                                states=str(states), postal_log=str(MESSAGES), now=now,
@@ -2577,24 +2636,29 @@ def parsed_session(fsid, files, now):
         if len(_PARSE_CACHE) > 256:        # bounded by fleet size; a wholesale clear on overflow is fine
             _PARSE_CACHE.clear()
         _PARSE_CACHE[fsid] = (key, session)
-    fr = _frame
-    if fr is not None:                     # pin under the frame; a concurrent first toucher already
-        with _frame_lock:                  #  there wins, so every stage shares ONE canonical parse
-            return fr["parses"].setdefault(fsid, session)
+    if fr is not None:                     # pin under the frame the KEY went into (never a re-read _frame: a
+        with _frame_lock:                  #  parse spanning a pass boundary must not land keyless in the next
+            return _frame_pin_parse(fr, fsid, session, key)   # frame); a concurrent first toucher wins
     return session
 
 
 def tasks_for(fsid, leaf, files, now):
     """The transcript's ready caption tasks [{text, writes:[{id,grain,t}]}], memoized on disk
-    by the file set's (mtime, size) — repeated passes don't re-parse an unchanged transcript
-    (ports the romp-events cache; the per-second-polling / 14MB-transcript guard). The key rides
-    the PASS FRAME (_pinned_fileset_key): under a frame the memo is checked and written with the
-    key of the content the pass actually judged, so a file growing mid-pass can't stamp stale
-    tasks under its new key (which the next pass would then trust)."""
-    try:
-        key = _pinned_fileset_key(("tasks", fsid) + tuple(str(f) for f in files), files)
-    except OSError:
+    by the pass's parse pair — repeated passes don't re-parse an unchanged transcript
+    (ports the romp-events cache; the per-second-polling / 14MB-transcript guard). The memo key IS
+    the pair the parse it derives from was pinned under (_frame_parse_key: the fileset key of the
+    candidates plus the states file, and the cut), so it can never be newer than that parse: under a
+    frame the pair is pinned at the pass's first touch, before any read, and a file growing mid-pass
+    can't stamp stale tasks under its new key (which the next pass would then trust). Keying the memo
+    on its own separate stat (the pre-2026-09-07 shape) let a gate pin the parse at K0, the turn's
+    final record land, and this memo stat K1: the entry then held K0's tasks under K1's key, and the
+    turn's final caption was never queued until the transcript moved again. A pair that could not be
+    computed (a stat failed) memoizes nothing. The key's shape changed with the pinning (a list of
+    [mtime, size] rows plus the cut, JSON-shaped), so older entries miss once and regenerate."""
+    pair, _cut, _fr = _frame_parse_key(fsid, files)
+    if pair is None:
         return []
+    key = list(pair)                                   # as JSON reads it back: [[[mtime, size], ...], cut]
     cf = PCACHE / (fsid + ".json")
     try:
         o = json.loads(cf.read_text())
