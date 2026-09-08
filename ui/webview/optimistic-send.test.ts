@@ -45,9 +45,9 @@ test("your OWN send reveals itself from the TAIL only — scrolled up, the viewp
   // is gated on a nearBottom read taken BEFORE appendActive lands the bubble (the append grows
   // scrollHeight, which would misread a tail-sitter as scrolled-up). Behavioral scenarios live in
   // send-scroll-preserve.test.ts.
-  assert.match(RENDER, /const wasAtBottom = !!content && nearBottom\(content\);\s*\n\s*appendActive\(\);\s*\n\s*if \(content && wasAtBottom\) content\.scrollTop = content\.scrollHeight;/);
+  assert.match(RENDER, /const wasAtBottom = !!content && nearBottom\(content\);\s*\n\s*appendActive\(\);\s*\n\s*if \(content && wasAtBottom\) writeScroll\(content, content\.scrollHeight, "optimistic-send", true\);/);
   // the unconditional form is retired everywhere — nothing snaps a scrolled-up reader on send
-  assert.doesNotMatch(RENDER, /if \(content\) content\.scrollTop = content\.scrollHeight;/);
+  assert.doesNotMatch(RENDER, /if \(content\) (?:content\.scrollTop = content\.scrollHeight|writeScroll\(content, content\.scrollHeight)/);
 });
 
 // The reconcile's two IN-PLACE tail mutations — merging into an existing queued group (a busy session

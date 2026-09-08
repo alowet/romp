@@ -30,13 +30,13 @@ test("visibility reads the one nearBottom definition, off a passive scroll liste
 });
 
 test("click snaps to the bottom AND sets the view's stick — the explicit re-entry into follow mode", () => {
-  assert.match(RENDER, /c\.scrollTop = c\.scrollHeight;\s*\/\/ the snap IS the acknowledgment/);
+  assert.match(RENDER, /writeScroll\(c, c\.scrollHeight, "jump-button", true\);\s*\/\/ the snap IS the acknowledgment/);   // (T262: every #content write rides writeScroll)
   assert.match(RENDER, /if \(v\) \{ v\.stick = true; v\.scrollTop = c\.scrollTop; \}/);
 });
 
 test("the send gate stays byte-intact — the chip is the sanctioned mover, sends are not", () => {
   // T187's contract, cross-pinned from this feature so a regression here names both
-  assert.match(RENDER, /const wasAtBottom = !!content && nearBottom\(content\);\s*\n\s*appendActive\(\);\s*\n\s*if \(content && wasAtBottom\) content\.scrollTop = content\.scrollHeight;/);
+  assert.match(RENDER, /const wasAtBottom = !!content && nearBottom\(content\);\s*\n\s*appendActive\(\);\s*\n\s*if \(content && wasAtBottom\) writeScroll\(content, content\.scrollHeight, "optimistic-send", true\);/);
 });
 
 test("the chip wears the menu-card vocabulary and survives [hidden] against its own display:flex", () => {

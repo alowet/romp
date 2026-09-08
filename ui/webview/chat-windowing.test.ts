@@ -65,7 +65,7 @@ test("scroll re-windows around the viewport (steady scroll OR jump) when near a 
   assert.match(RENDER, /const idx = unitAtScroll\(v, content\);/);
   assert.match(RENDER, /renderWindowItems\(v, s, items, Math\.max\(0, c - WINDOW_RADIUS\), Math\.min\(items\.length, c \+ WINDOW_RADIUS\), working\);/);
   // it re-anchors the focus unit so it doesn't jump, and shows a loading cue, coalesced to one frame
-  assert.match(RENDER, /content\.scrollTop = yNow - beforeY;/);
+  assert.match(RENDER, /writeScroll\(content, yNow - beforeY, "rewindow"\);/);   // (T262: every #content write rides writeScroll)
   assert.match(RENDER, /showLoadingPill\(\);/);
   assert.match(RENDER, /c\.addEventListener\("scroll", virtualizeToViewport, \{ passive: true \}\);/);
 });
@@ -102,7 +102,7 @@ test("a new message while scrolled UP keeps the viewport put (no backwards jump)
   // the view "backwards" when messages arrived (the user 2026-06-25).
   assert.match(RENDER, /const before = content\.scrollTop;/);
   assert.match(RENDER, /syncView\(activeId, stick\);/);
-  assert.match(RENDER, /else if \(!\(v && restoreScrollAnchor\(content, v, anchor\)\)\) content\.scrollTop = before;/);
+  assert.match(RENDER, /else if \(!\(v && restoreScrollAnchor\(content, v, anchor\)\)\) writeScroll\(content, before, "append-raw"\);/);
   // the compact branch keeps winStart on a scrolled-up append
   assert.match(RENDER, /const keepTop = wasAtTail && atBottom === false;/);
   assert.match(RENDER, /const ws = keepTop \? \(v\.winStart \?\? 0\)/);

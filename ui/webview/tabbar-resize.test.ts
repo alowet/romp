@@ -81,7 +81,7 @@ test("dragging moves the EFFECTIVE cap, guarded and captured, persists on releas
   assert.match(fn, /cap = clampTabbarH\(startH \+ \(e\.clientY - startY\), window\.innerHeight\);/,
     "drag DOWN grows — the cap follows the pointer");
   assert.match(fn, /stick = !!content && nearBottom\(content\);/, "a tail-following transcript is noted at drag start…");
-  assert.match(fn, /if \(stick && content\) content\.scrollTop = content\.scrollHeight;/,
+  assert.match(fn, /if \(stick && content\) writeScroll\(content, content\.scrollHeight, "tabbar-drag", true\);/,
     "…and held on the tail while the bar grows over it");
   assert.match(fn, /if \(cap != null\) localStorage\.setItem\(TABBAR_H_KEY, String\(cap\)\);/,
     "persisted on release, not per-move");
