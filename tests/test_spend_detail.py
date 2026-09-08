@@ -517,6 +517,32 @@ class SpendDetail(unittest.TestCase):
         self.assertEqual(d["order"], [["TESTHOST", API], ["TESTHOST", WEB]], "no order from an older peer")
         (km.jd.STATE / "session-order.json").unlink()
 
+    def test_the_payload_carries_the_tag_union_by_name_with_a_color_for_every_tag(self):
+        # T247g: "merge by tag" groups by this viewer's tags and every attached host's cached ones, unioned
+        # by NAME (the user's ruling: tags are equivalent, no home tag); members as the viewer sees them
+        # (bare local sid, host:sid remote); a colorless tag gets a stable swatch
+        peer_sid = "22222222-3333-4444-5555-000000000001"
+        (km.jd.STATE / "timeline-views.json").write_text(json.dumps({"active": "all", "tags": [
+            {"id": "g1", "name": "team", "color": "#C2410C", "members": [WEB, API]},
+            {"id": "g2", "name": "ops", "color": "", "members": [API, "PEERHOST:" + peer_sid]}]}))
+        km._remotes["PEERHOST"] = {"host": "PEERHOST", "status": "up", "local_port": 1, "token": "t",
+                                   "usage": {"apiKey": True, "spend": {"day": {"usd": 1}}},
+                                   "views": {"seq": 3, "tags": [{"id": "g7", "name": "team", "color": "#123456", "members": [peer_sid]}]}}
+        saved = km._PEER_SPEND_TIMEOUT_S
+        km._PEER_SPEND_TIMEOUT_S = 0.4
+        try:
+            d = km._spend_detail(now=NOW)
+        finally:
+            km._PEER_SPEND_TIMEOUT_S = saved
+        tags = {t["name"]: t for t in d["tags"]}
+        self.assertEqual(sorted(tags), ["ops", "team"])
+        self.assertEqual(tags["team"]["color"], "#C2410C", "the first color a same-named tag carries: the local one")
+        self.assertEqual(tags["team"]["members"], [WEB, API, "PEERHOST:" + peer_sid], "the peer's same-named tag joins by name, its member host-prefixed")
+        self.assertEqual(tags["ops"]["members"], [API, "PEERHOST:" + peer_sid])
+        self.assertTrue(tags["ops"].get("colorDerived") and tags["ops"]["color"] in km.pal.colors(km.pal.active_name(km.jd.STATE)))
+        self.assertNotEqual(tags["ops"]["color"], "#C2410C", "…never the swatch another tag already wears while a free one remains")
+        (km.jd.STATE / "timeline-views.json").unlink()
+
     def test_an_older_peer_without_epochs_still_aligns_through_its_offset(self):
         off = int((time.localtime(NOW).tm_gmtoff or 0) // 60) + 180
         self._attach("PEERHOST", self._peer_server(self._peer_payload(off, epochs=False)))
@@ -603,6 +629,12 @@ class SpendDetail(unittest.TestCase):
         self.assertIn('data-act=order:spend>by spend</button>', js)
         self.assertIn('data-act=order:yours>your order</button>', js)
         self.assertIn("var SP_PREFS_KEY='romp:spendModal';", js)
+        # T247g: three ranges and the merge toggle, persisted with the rest
+        self.assertIn('data-act=range:day>1 day ', js)
+        self.assertIn('data-act=range:hours>8 days ', js)
+        self.assertIn('data-act=range:days>90 days ', js)
+        self.assertIn('data-act=merge:toggle>merge by tag</button>', js)
+        self.assertIn("JSON.stringify({range:SP.range,measure:SP.measure,order:SP.order,merge:SP.merge})", js)
         self.assertIn("localStorage.getItem('romp:vieworder')", js, "the viewer's arrangement is the strip's own key")
         # the landing page loads no stylesheet, so the strip's two rules are inlined as a TWIN; this pins the
         # twin's declarations against the source so the two cannot drift

@@ -33156,6 +33156,50 @@ def _peer_spend_call(row, timeout):
         return None, None, "could not reach %s's kernel: %s" % (host, e)
 
 
+def _spend_tags():
+    """The tags the usage modal's "merge by tag" groups by (T247g, the user 2026-09-08): this viewer's
+    own tags and every attached host's cached ones, as _views_client renders them, unioned by NAME —
+    the user ruled tags equivalent, no home tag, so a same-named tag on two kernels is one here (the
+    strip's sections union the same way) — members as the viewer sees them (a bare local sid, host:sid
+    for a remote session: the modal's own keys), the first color a same-named tag carries. A tag with
+    no color of its own gets the least-used swatch of the active palette among the tags, ties by the
+    name's hash, so it reads the same on every open; flagged colorDerived."""
+    try:
+        v = _views_client()
+    except Exception:
+        return []
+    out = {}
+    for t in (v.get("tags") or []) + (v.get("remoteTags") or []):
+        if not isinstance(t, dict):
+            continue
+        name = str(t.get("name") or "").strip()
+        if not name:
+            continue
+        e = out.setdefault(name, {"name": name, "color": "", "members": []})
+        if not e["color"] and t.get("color"):
+            e["color"] = str(t["color"])[:16]
+        for m in t.get("members") or []:
+            if isinstance(m, str) and m not in e["members"]:
+                e["members"].append(m)
+    tags = sorted(out.values(), key=lambda t: t["name"].lower())
+    swatches = pal.colors(pal.active_name(jd.STATE))
+    if swatches:
+        import zlib
+        used = {}
+        for t in tags:
+            if t["color"]:
+                used[t["color"]] = used.get(t["color"], 0) + 1
+        for t in tags:
+            if t["color"]:
+                continue
+            h = zlib.crc32(t["name"].encode()) % len(swatches)
+            ranked = sorted(range(len(swatches)), key=lambda i: (used.get(swatches[i], 0), (i - h) % len(swatches)))
+            t["color"] = swatches[ranked[0]]
+            t["colorDerived"] = True
+            used[t["color"]] = used.get(t["color"], 0) + 1
+    return tags
+
+
 def _spend_detail(now=None):
     """GET /spend/detail — EVERY attached kernel's sessions, merged here (T247c, the user 2026-09-08:
     the per-session breakdown covered this machine only, and the federated kernels' sessions matter).
@@ -33212,6 +33256,7 @@ def _spend_detail(now=None):
         out = dict(local)
         out["hosts"] = hosts
         out["order"] = [[me, s] for s in (local.get("order") or []) if isinstance(s, str)]
+        out["tags"] = _spend_tags()
         return out
     return _merge_spend_details(payloads, hosts, local)
 
@@ -33352,7 +33397,7 @@ def _merge_spend_details(payloads, hosts, local):
             if isinstance(sid, str):
                 order.append([host, sid])
     out = dict(local)
-    out.update({"hosts": hosts, "sessions": sessions, "unattributed": un, "order": order,
+    out.update({"hosts": hosts, "sessions": sessions, "unattributed": un, "order": order, "tags": _spend_tags(),
                 "hours": _merge_range("hours"), "days": _merge_range("days")})
     return out
 
@@ -41617,11 +41662,11 @@ pullFleet().then(done,function(){if(ROWS.length)renderRows(ROWS,SELF);done();});
 // kernel-side, the ledger's bySid series — fetched on open behind the romp loader, never scraped from
 // the hover's HTML. The click still kicks the hover's own refresh (pull), so both levels are fresh.
 var spBack=document.getElementById('rsp-back'),spPanel=document.getElementById('rsp-panel'),spTip=null;
-var SP={data:null,err:'',range:'hours',measure:'usd',order:'spend',open:false};
+var SP={data:null,err:'',range:'hours',measure:'usd',order:'spend',merge:false,open:false};
 // the toggles persist across opens and reloads (T247f): range, measure, and the list's order
 var SP_PREFS_KEY='romp:spendModal';
-function spLoadPrefs(){try{var p=JSON.parse(localStorage.getItem(SP_PREFS_KEY)||'{}')||{};if(p.range==='days')SP.range='days';if(p.measure==='tok')SP.measure='tok';if(p.order==='yours')SP.order='yours';}catch(e){}}
-function spSavePrefs(){try{localStorage.setItem(SP_PREFS_KEY,JSON.stringify({range:SP.range,measure:SP.measure,order:SP.order}));}catch(e){}}
+function spLoadPrefs(){try{var p=JSON.parse(localStorage.getItem(SP_PREFS_KEY)||'{}')||{};if(p.range==='days'||p.range==='day')SP.range=p.range;if(p.measure==='tok')SP.measure='tok';if(p.order==='yours')SP.order='yours';if(p.merge===true)SP.merge=true;}catch(e){}}
+function spSavePrefs(){try{localStorage.setItem(SP_PREFS_KEY,JSON.stringify({range:SP.range,measure:SP.measure,order:SP.order,merge:SP.merge}));}catch(e){}}
 spLoadPrefs();
 // "your order" (T247f, the user 2026-09-08): the order the tab strip and the timeline lanes show — the
 // kernel's shared seed per host (session-order.json; hosts local-first then attach order, remote ids
@@ -41652,6 +41697,34 @@ function spMany(d){return spHosts(d).length>1;}
 // .tab-label with the identity color as --chip-bg (styles.css keys the color and weight on the SAME
 // rule the strip uses, so the two cannot drift) and the quiet .host-prefix — no swatch
 function spTitle(s,many){return '<span class="tab-label colored" style="--chip-bg:'+spColor(s)+'">'+(many&&s.host?'<span class=host-prefix>'+esc(s.host)+':</span>':'')+esc(spName(s))+'</span>';}
+// ── T247g (the user 2026-09-08): three ranges, and "merge by tag"
+// the series for the range: "1 day" is the hourly series' last 24 buckets (the ledger holds hours and
+// days; a day is a slice of the hours, never a third ledger)
+function spSeries(d){var ser=d[SP.range==='day'?'hours':SP.range];if(!ser)return null;if(SP.range!=='day')return ser;
+var n=(ser.keys||[]).length,cut=Math.max(0,n-24);
+return {keys:(ser.keys||[]).slice(cut),epochs:(ser.epochs||[]).slice(cut),stacks:(ser.stacks||[]).map(function(s){var o={};for(var k in s)o[k]=s[k];o.usd=(s.usd||[]).slice(cut);o.tok=(s.tok||[]).slice(cut);
+if(s.hosts){o.hosts={};Object.keys(s.hosts).forEach(function(h){o.hosts[h]={usd:(s.hosts[h].usd||[]).slice(cut),tok:(s.hosts[h].tok||[]).slice(cut)};});}return o;})};}
+// the rows: the ordered sessions, or — merged by tag — one row per tag holding sessions here (named
+// by the tag, colored by the tag store's color, the strip's chip color) and the untagged sessions as
+// themselves. A session under several tags counts under EACH (the user's ruling: tags are equivalent,
+// no home tag); the footer says how many do, because the rows then sum past the totals.
+function spRows(d){var ss=spOrdered(d);if(!SP.merge||!(d.tags&&d.tags.length))return {rows:ss.map(function(s,i){return {kind:'sid',s:s,sid:s.sid,name:s.name,bg:s.bg,live:s.live,usd:s.usd,tok:s.tok,turns:s.turns,host:s.host,key:s.key,rank:i};}),multi:0};
+var byKey={},counts={},tagged={},rows=[];ss.forEach(function(s,i){byKey[spKey(d,s)]={s:s,i:i};});
+d.tags.forEach(function(t){var mem=[];(t.members||[]).forEach(function(m){var e=byKey[m];if(e){mem.push(e);counts[m]=(counts[m]||0)+1;}});if(!mem.length)return;
+var usd=0,tok=0,turns=0,live=false,hosts={},minI=1e9;mem.forEach(function(e){usd+=e.s.usd||0;tok+=e.s.tok||0;turns+=e.s.turns||0;live=live||!!e.s.live;hosts[String(e.s.host)]=1;if(e.i<minI)minI=e.i;tagged[spKey(d,e.s)]=1;});
+var hk=Object.keys(hosts);rows.push({kind:'tag',sid:'tag:'+t.name,name:t.name,bg:t.color||'',live:live,usd:usd,tok:tok,turns:turns,members:mem.map(function(e){return e.s;}),host:(hk.length===1?hk[0]:''),rank:minI});});
+ss.forEach(function(s,i){if(!tagged[spKey(d,s)])rows.push({kind:'sid',s:s,sid:s.sid,name:s.name,bg:s.bg,live:s.live,usd:s.usd,tok:s.tok,turns:s.turns,host:s.host,key:s.key,rank:i});});
+if(SP.order==='yours')rows.sort(function(a,b){return a.rank-b.rank;});else rows.sort(function(a,b){return ((b.usd||0)-(a.usd||0))||((b.tok||0)-(a.tok||0));});
+var multi=0;Object.keys(counts).forEach(function(k){if(counts[k]>1)multi++;});return {rows:rows,multi:multi};}
+// the stacks follow the rows: a tag row's stack is its members' stacks summed; untagged sessions keep
+// their own; unattributed (and an older peer's fold) stay last
+function spStacks(d,ser,model){var stacks=ser.stacks||[];if(!SP.merge||!(d.tags&&d.tags.length))return spStackOrder(d,stacks);
+var byKey={};stacks.forEach(function(s){if(s.kind==='sid')byKey[spKey(d,s)]=s;});var out=[];
+model.rows.forEach(function(r){if(r.kind==='tag'){var usd=null,tok=null;r.members.forEach(function(m){var st=byKey[spKey(d,m)];if(!st)return;
+if(!usd){usd=st.usd.slice();tok=st.tok.slice();}else{for(var i=0;i<usd.length;i++){usd[i]+=st.usd[i]||0;tok[i]+=st.tok[i]||0;}}});
+if(usd&&(usd.some(function(v){return v>0;})||tok.some(function(v){return v>0;})))out.push({kind:'tag',name:r.name,bg:r.bg,live:r.live,usd:usd,tok:tok});}
+else{var st=byKey[spKey(d,r)];if(st)out.push(st);}});
+stacks.forEach(function(s){if(s.kind!=='sid')out.push(s);});return out;}
 function spColor(s){return (s.bg&&/^#[0-9a-fA-F]{3,8}$/.test(s.bg))?s.bg:SP_NONE;}
 function spHead(){var d=SP.data,ok=d?spHosts(d):[];return '<div class=rsp-top><span>'+(d&&d.scope==='computed'?'Spend (computed)':'API spend')
 +(ok.length>1?' \u00b7 '+ok.length+' machines':(d&&d.host?' \u00b7 '+esc(d.host):''))+'</span>'
@@ -41688,6 +41761,8 @@ while(t&&t!==spPanel){if(t.getAttribute&&t.getAttribute('data-act')){b=t;break;}
 if(!b)return;var a=b.getAttribute('data-act');
 if(a==='close'){closeSpend();return;}
 if(a==='retry'){openSpend();return;}
+if(a==='merge:toggle'){SP.merge=!SP.merge;spSavePrefs();if(SP.merge)b.classList.add('on');else b.classList.remove('on');
+var tb2=document.getElementById('rsp-table');if(tb2){tb2.innerHTML=sessionTable(SP.data);tb2.scrollTop=0;}renderChart();return;}
 var m=/^(range|measure|order):(\\w+)$/.exec(a);if(!m)return;
 SP[m[1]]=m[2];spSavePrefs();
 if(m[1]==='order'){var tb=document.getElementById('rsp-table');if(tb){tb.innerHTML=sessionTable(SP.data);tb.scrollTop=0;}}   // the new order's head rows, not a mid-list slice (review find)
@@ -41704,8 +41779,9 @@ var keyCol=d.scope!=='keyed'&&ss.some(function(s){return s.key&&typeof s.key.usd
 var h='<table class=rsp-tbl><thead><tr><th>session</th><th class=n>dollars</th>'+(keyCol?'<th class=n>key-billed</th>':'')
 +'<th class=n>turns</th><th class=n>tokens</th></tr></thead><tbody>';
 var many=spMany(d);
-spOrdered(d).forEach(function(s){h+='<tr data-sid="'+esc(s.sid||'')+'"'+(s.live?' class=rsp-live':' class=rsp-dead')+'>'
-+'<td class=rsp-name>'+spTitle(s,many)+(s.live?'':'<span class=ru-tip-reset> \u00b7 not running</span>')+'</td>'
+var model=spRows(d);
+model.rows.forEach(function(s){h+='<tr data-sid="'+esc(s.sid||'')+'"'+(s.live?' class=rsp-live':' class=rsp-dead')+(s.kind==='tag'?' data-tag="'+esc(s.name)+'"':'')+'>'
++'<td class=rsp-name>'+(s.kind==='tag'?('<span class="tab-label colored" style="--chip-bg:'+spColor(s)+'">'+esc(s.name)+'</span><span class=ru-tip-reset> \u00b7 '+s.members.length+' session'+(s.members.length===1?'':'s')+'</span>'):spTitle(s.s,many))+(s.live?'':'<span class=ru-tip-reset> \u00b7 not running</span>')+'</td>'
 +'<td class=n>'+fmtUsd(s.usd)+'</td>'+(keyCol?'<td class=n>'+(s.key?fmtUsd(s.key.usd):'\u2014')+'</td>':'')
 +'<td class=n>'+(s.turns||0)+'</td><td class=n>'+fmtTok(s.tok||0)+'</td></tr>';});
 // spend recorded before per-session attribution existed (T100, 2026-08-24), or the part of a bucket no
@@ -41714,7 +41790,9 @@ spOrdered(d).forEach(function(s){h+='<tr data-sid="'+esc(s.sid||'')+'"'+(s.live?
 if(un&&(un.usd>0||un.tok>0))h+='<tr class=rsp-dead>'
 +'<td class=rsp-name><i class="rsp-sw rsp-hatch"></i> unattributed<span class=ru-tip-reset> \u00b7 recorded before per-session tracking</span></td>'
 +'<td class=n>'+fmtUsd(un.usd)+'</td>'+(keyCol?'<td class=n>\u2014</td>':'')+'<td class=n>'+(un.turns||0)+'</td><td class=n>'+fmtTok(un.tok||0)+'</td></tr>';
-return h+'</tbody></table>';}
+h+='</tbody></table>';
+if(model.multi)h+='<div class=rsp-note>'+model.multi+(model.multi===1?' session carries':' sessions carry')+' several tags and count'+(model.multi===1?'s':'')+' under each of them, so the rows add up past the totals.</div>';
+return h;}
 // 1. the SAME window numbers the hover shows — the sums across every machine, rows only (one renderer).
 // Its own node: renderRows re-renders it whenever fresh rows land while the modal is open, so the
 // two levels agree at every moment, not only at the instant the modal opened (review find)
@@ -41733,6 +41811,7 @@ h+='<div class=rsp-sec id=rsp-totals>'+totalsHTML(d)+'</div>';
 // by default, tokens on a toggle; the session list below is its legend
 h+='<div class=rsp-sec><div class=ru-tip-name><span>Spend over time</span></div>'
 +'<div class=rsp-ctl>'
++'<button class="rsp-btn'+(SP.range==='day'?' on':'')+'" data-act=range:day>1 day \u00b7 by hour</button>'
 +'<button class="rsp-btn'+(SP.range==='hours'?' on':'')+'" data-act=range:hours>8 days \u00b7 by hour</button>'
 +'<button class="rsp-btn'+(SP.range==='days'?' on':'')+'" data-act=range:days>90 days \u00b7 by day</button>'
 +'<span class=rsp-gap></span>'
@@ -41741,6 +41820,8 @@ h+='<div class=rsp-sec><div class=ru-tip-name><span>Spend over time</span></div>
 +'<span class=rsp-gap></span>'
 +'<button class="rsp-btn'+(SP.order==='spend'?' on':'')+'" data-act=order:spend>by spend</button>'
 +'<button class="rsp-btn'+(SP.order==='yours'?' on':'')+'" data-act=order:yours>your order</button>'
++'<span class=rsp-gap></span>'
++'<button class="rsp-btn'+(SP.merge?' on':'')+'" data-act=merge:toggle>merge by tag</button>'
 +'</div><div id=rsp-chart></div></div>';
 // 3. per session — EVERY attached kernel's sessions (T247c), each machine's own story merged here;
 // the billing rule is named when every contributing machine shares one, else each keeps its own
@@ -41767,7 +41848,7 @@ function spFill(s){return s.kind==='unattributed'?'url(#rsp-hatch)':s.kind==='ot
 function spStackName(s){return s.kind==='other'?('other ('+(s.count||0)+' session'+(s.count===1?'':'s')+(s.host?' on '+s.host:'')+')'):s.kind==='unattributed'?'unattributed':spName(s);}
 // the plain-text form for the tooltip: host · name when more than one machine contributes; the
 // unattributed stack names each machine's share of the hovered bucket
-function spStackText(s,many,meas,i){if(s.kind==='sid')return (many&&s.host?s.host+' \u00b7 ':'')+spName(s);
+function spStackText(s,many,meas,i){if(s.kind==='tag')return s.name;if(s.kind==='sid')return (many&&s.host?s.host+' \u00b7 ':'')+spName(s);
 if(s.kind==='unattributed'&&many&&s.hosts){var parts=[];Object.keys(s.hosts).forEach(function(hn){var v=(s.hosts[hn][meas]||[])[i]||0;if(v>0)parts.push(hn+' '+(meas==='usd'?fmtUsd(v):fmtTok(Math.round(v))));});
 return 'unattributed'+(parts.length?' ('+parts.join(', ')+')':'');}
 return spStackName(s);}
@@ -41784,9 +41865,9 @@ function spBucketLabel(k,range){if(range==='hours'){var m=/^(\\d{4})-(\\d\\d)-(\
 return m?(Number(m[2])+'/'+Number(m[3])+' '+m[4]+':00\u2013'+(('0'+((Number(m[4])+1)%24)).slice(-2))+':00'):k;}
 var n=/^(\\d{4})-(\\d\\d)-(\\d\\d)$/.exec(k);return n?(Number(n[2])+'/'+Number(n[3])):k;}
 function renderChart(){var box=document.getElementById('rsp-chart');if(!box||!SP.data)return;
-var d=SP.data,ser=d[SP.range],meas=SP.measure;
+var d=SP.data,ser=spSeries(d),meas=SP.measure;
 if(!ser||!ser.keys||!ser.keys.length){box.innerHTML='<div class=rsp-note>No history yet.</div>';return;}
-var stacks=spStackOrder(d,ser.stacks||[]),n=ser.keys.length,W=Math.max(320,box.clientWidth||600),H=200;
+var stacks=spStacks(d,ser,spRows(d)),n=ser.keys.length,W=Math.max(320,box.clientWidth||600),H=200;
 var tots=[],mx=0;for(var i=0;i<n;i++){var t=0;for(var s=0;s<stacks.length;s++){t+=(stacks[s][meas]&&stacks[s][meas][i])||0;}tots.push(t);if(t>mx)mx=t;}
 if(!(mx>0)){box.innerHTML='<div class=rsp-note>Nothing recorded in this range.</div>';return;}
 var top=niceTop(mx),slot=W/n,gap=Math.min(2,slot*0.3),bw=Math.max(1,slot-gap),PADT=6;
@@ -41822,7 +41903,8 @@ svg+='</svg>';
 // x labels: hourly range → weekday initials at the ledger's local midnights (the hover graph's rule);
 // daily range → the 1st and 15th. The keys are the KERNEL's local time — named when the viewer's differs.
 var xlab='';for(var i=0;i<n;i++){var k=ser.keys[i],m;
-if(SP.range==='hours'){m=/^(\\d{4})-(\\d\\d)-(\\d\\d)T00$/.exec(k);if(m){var dd=new Date(+m[1],+m[2]-1,+m[3]);
+if(SP.range==='day'){m=/T(\\d\\d)$/.exec(k);if(m&&(+m[1])%6===0)xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+m[1]+':00</span>';}
+else if(SP.range==='hours'){m=/^(\\d{4})-(\\d\\d)-(\\d\\d)T00$/.exec(k);if(m){var dd=new Date(+m[1],+m[2]-1,+m[3]);
 xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+['S','M','T','W','T','F','S'][dd.getDay()]+'</span>';}}
 else{m=/^(\\d{4})-(\\d\\d)-(01|15)$/.exec(k);if(m)xlab+='<span style="left:'+(((i+0.5)*slot)/W*100).toFixed(1)+'%">'+Number(m[2])+'/'+Number(m[3])+'</span>';}}
 var many=spMany(d);
@@ -41838,7 +41920,7 @@ var svgEl=box.querySelector('svg');if(!svgEl)return;
 svgEl.onpointermove=function(e){var t=e.target;if(!t||!t.classList||!t.classList.contains('rsp-seg')){spTipHide();return;}
 var i=+t.getAttribute('data-i'),si=+t.getAttribute('data-s'),s=stacks[si];if(!s)return;
 var v=(s[meas]&&s[meas][i])||0,o=(s[meas==='usd'?'tok':'usd']&&s[meas==='usd'?'tok':'usd'][i])||0;
-spTipShow(e.clientX,e.clientY,spStackText(s,many,meas,i),fmt(v),(meas==='usd'?fmtTok(Math.round(o))+' tok':fmtUsd(o))+' \u00b7 '+spBucketLabel(ser.keys[i],SP.range));};
+spTipShow(e.clientX,e.clientY,spStackText(s,many,meas,i),fmt(v),(meas==='usd'?fmtTok(Math.round(o))+' tok':fmtUsd(o))+' \u00b7 '+spBucketLabel(ser.keys[i],SP.range==='day'?'hours':SP.range));};
 svgEl.onpointerleave=spTipHide;}
 var spResizeRaf=0;
 window.addEventListener('resize',function(){if(!(SP.open&&SP.data)||spResizeRaf)return;
