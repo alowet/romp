@@ -149,6 +149,10 @@ _SW_HARNESS = r"""
 'use strict';
 const H = {};            // event name -> the worker's handler
 const LOG = [];          // every call the worker makes, in order
+const META = [];         // per posted message: the tap id and the worker's diag block (2026-09-08), kept apart
+                         // from LOG so the routing block still compares whole — the id is minted per tap
+function strip(m) { if (!m || typeof m !== 'object') return m; const c = Object.assign({}, m);
+  META.push({ id: c.id, diag: c.diag }); delete c.id; delete c.diag; return c; }
 global.self = {
   addEventListener: (k, f) => { H[k] = f; },
   skipWaiting: () => {},
@@ -166,7 +170,7 @@ _SW_DRIVER = r"""
 function win(focusOk) {
   const w = { frameType: 'top-level',
               focus: () => { LOG.push(['focus']); return focusOk ? Promise.resolve(w) : Promise.reject(new Error('refused')); },
-              postMessage: (m) => LOG.push(['post', m]) };
+              postMessage: (m) => LOG.push(['post', strip(m)]) };
   return w;
 }
 // a TAGGED client, for the dashboard's shape: the shell (top-level) plus its same-origin pane iframes,
@@ -174,7 +178,16 @@ function win(focusOk) {
 function frame(tag, frameType) {
   const w = { frameType,
               focus: () => { LOG.push(['focus', tag]); return Promise.resolve(w); },
-              postMessage: (m) => LOG.push(['post', tag, m]) };
+              postMessage: (m) => LOG.push(['post', tag, m && strip(m)]) };
+  return w;
+}
+// a top-level client with the state a real WindowClient reports (2026-09-08): how visible it is after
+// focus(), its creation URL, and navigate() — the last-resort road for a stale entry
+function stateful(o) {
+  const w = { frameType: 'top-level', visibilityState: o.vis, url: o.url,
+              focus: () => { LOG.push(['focus']); return Promise.resolve(w); },
+              postMessage: (m) => LOG.push(['post', strip(m)]) };
+  if (o.nav !== false) w.navigate = (u) => { LOG.push(['navigate', u]); return o.nav === 'refuse' ? Promise.reject(new TypeError('not controlled')) : Promise.resolve(w); };
   return w;
 }
 async function tap(data, windows) {
@@ -213,14 +226,48 @@ async function tap(data, windows) {
   out.nestedOnly = await tap(fed, [frame('chat', 'nested')]);   // a pane with no shell above it: nothing to post to
   out.untyped = await tap(fed, [frame('old', undefined)]);       // a browser that reports no frameType is a window
   // the cold start's second road (2026-09-08): the window openWindow hands back is given the routing block too
-  const opened = { postMessage: (m) => LOG.push(['post', 'opened', m]) };
+  const opened = { postMessage: (m) => LOG.push(['post', 'opened', strip(m)]) };
   const openWindow0 = global.clients.openWindow;
   global.clients.openWindow = (u) => { LOG.push(['openWindow', u]); return Promise.resolve(opened); };
   out.coldHanded = await tap(data, []);
+  out.coldHandedMeta = META[META.length - 1];
   out.testHanded = await tap({ sid: '', host: '', kind: 'test', cardId: '', url: '/' }, []);   // nothing to land on: nothing posted
+  out.refusedHanded = await tap(data, [win(false)]);               // focus refused, then the opened window is told
+  out.refusedHandedMeta = META[META.length - 1];
   global.clients.openWindow = (u) => { LOG.push(['openWindow', u]); return Promise.resolve(null); };
   out.coldNull = await tap(data, []);                              // no client back: the link alone, no throw
   global.clients.openWindow = openWindow0;
+  // the worker's own trail rides each message (2026-09-08): what it saw and which road it took
+  META.length = 0;
+  out.live2 = await tap(data, [win(true)]);
+  out.liveMeta = META[0];
+  META.length = 0;
+  out.nested2 = await tap(fed, [frame('chat', 'nested'), frame('feed', 'nested'), frame('shell', 'top-level')]);
+  out.nestedMeta = META[0];
+  // the last resort (2026-09-08): a top-level client focus() brought forward that STILL reports hidden is a
+  // stale entry for a page the browser no longer runs — set its URL to the deep link. Never a visible one
+  // (a live window that came forward), never one whose creation URL already carries the link, never for a
+  // sid-less tap; a refused navigate ends that road without a throw
+  out.stale = await tap(data, [stateful({ vis: 'hidden', url: 'https://romp.test/' })]);
+  out.staleLinked = await tap(data, [stateful({ vis: 'hidden', url: 'https://romp.test/?push-reveal=S1' })]);
+  out.visible = await tap(data, [stateful({ vis: 'visible', url: 'https://romp.test/' })]);
+  out.staleRefused = await tap(data, [stateful({ vis: 'hidden', url: 'https://romp.test/', nav: 'refuse' })]);
+  out.staleNoNav = await tap(data, [stateful({ vis: 'hidden', url: 'https://romp.test/', nav: false })]);
+  out.staleNoSid = await tap({ sid: '', host: '', kind: 'test', cardId: '', url: '/' }, [stateful({ vis: 'hidden', url: 'https://romp.test/' })]);
+  // the kept tap (2026-09-08): a shell that boots or comes back asks for it; the tap stays until a shell
+  // says THAT tap landed; a sid-less tap keeps nothing
+  META.length = 0;
+  await tap(testSid, [win(true)]);
+  const keptId = META[0].id;
+  const src = { postMessage: (m) => LOG.push(['replay', strip(m)]) };
+  function ask(m) { LOG.length = 0; H.message({ data: m, source: src }); return LOG.slice(); }
+  out.replay = ask({ romp: 'tapReplay' });
+  out.replayWrongAck = (ask({ romp: 'tapLanded', id: 'someone-else' }), ask({ romp: 'tapReplay' }));
+  out.replayAfterAck = (ask({ romp: 'tapLanded', id: keptId }), ask({ romp: 'tapReplay' }));
+  await tap({ sid: '', host: '', kind: 'test', cardId: '', url: '/' }, [win(true)]);
+  out.replaySidless = ask({ romp: 'tapReplay' });
+  out.replayNoSource = (LOG.length = 0, H.message({ data: { romp: 'tapReplay' }, source: null }), LOG.slice());   // a message with no sender: nothing to answer, no throw
+  out.keptId = keptId;
   console.log(JSON.stringify(out));
 })();
 """
@@ -311,6 +358,46 @@ class ServiceWorkerExecutes(unittest.TestCase):
         self.assertEqual(self.out["nestedOnly"]["log"], [["close"], self.MATCH, ["openWindow", "/?push-reveal=boxa%3AS8"]])
         # a client that reports no frameType is treated as a window, never dropped
         self.assertEqual(self.out["untyped"]["log"][-1], ["post", "old", msg])
+
+    def test_every_tap_carries_an_id_and_the_workers_own_trail(self):
+        # 2026-09-08: the app came forward, no /reveal left the phone, and nothing said what the worker had
+        # seen. Each message now wears a per-tap id (the shell lands a tap once whichever roads deliver it)
+        # and a diag block the shell files beside its own rows: clients seen, top-level among them, the road
+        # taken, the target's visibility (the stubs report none)
+        live, nested = self.out["liveMeta"], self.out["nestedMeta"]
+        self.assertTrue(live["id"] and isinstance(live["id"], str))
+        self.assertEqual(live["diag"], {"clients": 1, "tops": 1, "road": "focus", "vis": ""})
+        self.assertEqual(nested["diag"], {"clients": 3, "tops": 1, "road": "focus", "vis": ""})
+        self.assertNotEqual(live["id"], nested["id"], "minted per tap")
+        self.assertEqual(self.out["coldHandedMeta"]["diag"], {"clients": 0, "tops": 0, "road": "open", "vis": ""})
+        self.assertEqual(self.out["refusedHanded"]["log"], [["close"], self.MATCH, ["focus"], ["openWindow", self.URL], ["post", "opened", self.MSG]])
+        self.assertEqual(self.out["refusedHandedMeta"]["diag"]["road"], "open-after-refused")
+
+    def test_a_stale_top_level_client_is_sent_to_the_deep_link_and_a_live_one_never_reloaded(self):
+        # the last resort: a client focus() brought forward that STILL reports hidden is a stale entry for a
+        # page the browser no longer runs — its URL is set to the deep link, after the message (a live page
+        # would have read it). A visible client is a live window and is never navigated (a full page load);
+        # one whose creation URL already carries the link has the boot road; a sid-less tap has nowhere to go
+        self.assertEqual(self.out["stale"]["log"], [["close"], self.MATCH, ["focus"], ["post", self.MSG], ["navigate", self.URL]])
+        self.assertEqual(self.out["visible"]["log"], [["close"], self.MATCH, ["focus"], ["post", self.MSG]])
+        self.assertEqual(self.out["staleLinked"]["log"], [["close"], self.MATCH, ["focus"], ["post", self.MSG]])
+        self.assertEqual(self.out["staleNoNav"]["log"], [["close"], self.MATCH, ["focus"], ["post", self.MSG]], "a browser without navigate(): the message alone")
+        self.assertEqual(self.out["staleRefused"]["log"][-1], ["navigate", self.URL], "a refused navigate ends that road quietly")
+        self.assertEqual(self.out["staleRefused"]["waited"], 1)
+        self.assertNotIn(["navigate", "/"], self.out["staleNoSid"]["log"])
+        self.assertEqual([x[0] for x in self.out["staleNoSid"]["log"]], ["close", "matchAll", "focus", "post"])
+
+    def test_the_kept_tap_replays_until_a_shell_says_it_landed(self):
+        # a page suspended in the background can miss a message posted before it resumed; a page the browser
+        # evicted and relaunched never saw one. The worker keeps the last session-addressed tap; a shell that
+        # asks (at boot, on becoming visible) gets it; only an ack naming THAT tap retires it
+        msg = {"romp": "notificationClick", "sid": "S5", "host": "", "kind": "test", "cardId": ""}
+        self.assertEqual(self.out["replay"], [["replay", msg]])
+        self.assertEqual(self.out["replayWrongAck"], [["replay", msg]], "an ack for another tap changes nothing")
+        self.assertEqual(self.out["replayAfterAck"], [], "acked → nothing left to replay")
+        self.assertEqual(self.out["replaySidless"], [], "a sid-less tap keeps nothing: nowhere to land")
+        self.assertEqual(self.out["replayNoSource"], [])
+        self.assertTrue(self.out["keptId"])
 
 
 @unittest.skipUnless(HAVE_CRYPTO, "python 'cryptography' not installed")
@@ -829,6 +916,31 @@ class LandingRevealPins(unittest.TestCase):
         self.assertIn("setAppBadge", html)
         self.assertIn("clearAppBadge", html)       # zero clears, never leaves a stale number
 
+    def test_the_shell_files_its_own_diag_rows_over_a_socket_that_carries_its_wid(self):
+        # 2026-09-08: the shell's scripts record what they saw as the clientDiag rows the panes already file
+        # (surface 'shell'), through ONE poster the mobile script defines before the bell's and the landing
+        # script parse; rows queue (capped) until the shell socket opens. The socket now carries the shell's
+        # wid, so its rows match this dashboard's pane rows — and _reveal_chat_for's shell line has a target
+        js = km._LANDING_MOBILE_JS
+        self.assertIn("var m={type:'clientDiag',surface:'shell',what:what,data:data};", js)
+        self.assertIn("window.__rompShellDiag=shellDiag;", js)
+        self.assertLess(js.index("window.__rompShellDiag=shellDiag;"), js.index("var bar=document.getElementById('mtabs');if(!bar)return;"),
+                        "defined before the script's first early return")
+        self.assertIn("else if(diagQ.length<DIAGQ_MAX)diagQ.push(m);", js)
+        self.assertIn("'/ws?app=shell&wid='+encodeURIComponent(wid())", js)
+        self.assertIn("shellSock=ws;var q=diagQ;diagQ=[];q.forEach(", js, "queued rows go out on open")
+        self.assertIn("if(shellSock===ws)shellSock=null;", js)
+        html = km._landing()
+        self.assertLess(html.index("window.__rompShellDiag=shellDiag;"), html.index("function activeSession(){"))
+        self.assertLess(html.index("window.__rompShellDiag=shellDiag;"), html.index("diag('deeplink'"))
+        # the callers: the bell's press and the landing script's three steps, each through the poster, and the
+        # kernel already persists the type they post (the clientDiag branch of _dispatch_ws)
+        self.assertIn("diag('push-test',{sidAttached:!!at.sid,host:at.host,why:at.why,tabs:at.tabs});", km._LANDING_PUSH_JS)
+        for row in ("diag('deeplink',{hasSid:!!pr,hasCard:!!pc,controlled:", "diag('sw-message',{shape:m.romp,hasSid:!!m.sid,", "diag('reveal-post',{status:r.status,via:via,boot:!!boot});"):
+            self.assertIn(row, km._LANDING_REVEAL_JS)
+        import inspect
+        self.assertIn('msg.get("type") == "clientDiag"', inspect.getsource(km.Handler._dispatch_ws))
+
 
 # The shell's reveal script, EXECUTED (the test_error_center.py pattern): node runs
 # _LANDING_REVEAL_JS against stubs of the few browser globals it touches, booting on a deep link
@@ -838,50 +950,74 @@ class LandingRevealPins(unittest.TestCase):
 # a sid-less tap does nothing, a refused /reveal is loud.
 _REVEAL_HARNESS = r"""
 'use strict';
-const FETCHES = [], POSTED = [], NOTES = [], REPLACED = [], WIN = [], SW = [];
+const FETCHES = [], POSTED = [], NOTES = [], REPLACED = [], WIN = [], SW = [], DOC = [], PAGESHOW = [], CTRL = [], ACK = [], DIAG = [];
 let fetchOk = true;
 const feedWin = { postMessage: (m) => POSTED.push(m) };
 global.window = global;
-global.document = { getElementById: (id) => (id === 'f-feed' ? { contentWindow: feedWin } : null) };
+global.document = { getElementById: (id) => (id === 'f-feed' ? { contentWindow: feedWin } : null),
+  addEventListener: (k, f) => { if (k === 'visibilitychange') DOC.push(f); }, visibilityState: 'visible' };
 global.sessionStorage = { getItem: (k) => (k === 'romp:wid' ? 'W-test' : null) };
-global.addEventListener = (k, f) => { if (k === 'message') WIN.push(f); };
+global.addEventListener = (k, f) => { if (k === 'message') WIN.push(f); if (k === 'pageshow') PAGESHOW.push(f); };
 Object.defineProperty(global, 'navigator', { configurable: true,   // a getter-only global in node 22
-  value: { serviceWorker: { addEventListener: (k, f) => { if (k === 'message') SW.push(f); } } } });
+  value: { serviceWorker: { addEventListener: (k, f) => { if (k === 'message') SW.push(f); },
+                            controller: { postMessage: (m) => CTRL.push(m) } } } });   // the worker that controls this page
 global.history = { replaceState: (s, t, u) => REPLACED.push(u) };
 global.location = { href: 'http://localhost:7777/?push-reveal=S1&push-card=S1%3Ag1&keep=1#frag' };
 global.fetch = (path, init) => { FETCHES.push([path, JSON.parse(init.body)]);
-  return Promise.resolve(fetchOk ? { ok: true } : { ok: false, status: 400, text: () => Promise.resolve('missing sid') }); };
+  return Promise.resolve(fetchOk ? { ok: true, status: 200 } : { ok: false, status: 400, text: () => Promise.resolve('missing sid') }); };
 global.__rompNotify = (kind, text) => NOTES.push([kind, text]);
+global.__rompShellDiag = (what, data) => DIAG.push([what, data]);   // _LANDING_MOBILE_JS's poster, stubbed: the rows this script files
 """
 _REVEAL_DRIVER = r"""
 const tick = () => new Promise((r) => setTimeout(r, 0));
-const swMsg = (m) => SW.forEach((f) => f({ data: m }));
+const swSrc = { postMessage: (m) => ACK.push(m) };            // ev.source: the worker that posted
+const swMsg = (m) => SW.forEach((f) => f({ data: m, source: swSrc }));
 const winMsg = (m) => WIN.forEach((f) => f({ data: m }));
 (async () => {
-  const out = { boot: { fetches: FETCHES.slice(), replaced: REPLACED.slice(), postedBeforeReady: POSTED.length } };
+  const out = { boot: { fetches: FETCHES.slice(), replaced: REPLACED.slice(), postedBeforeReady: POSTED.length,
+                        diag: DIAG.slice(), ctrl: CTRL.slice(), swListeners: SW.length } };
+  await tick();
+  out.boot.diagAfter = DIAG.slice();                      // …plus /reveal's answer, once it lands
   winMsg({ romp: 'ready' });                              // the timeline's ready: not the feed's
   out.boot.postedAfterTimelineReady = POSTED.length;
   winMsg({ romp: 'ready', app: 'feed' });
   out.boot.postedAfterFeedReady = POSTED.slice();
-  FETCHES.length = 0; POSTED.length = 0;
-  swMsg({ romp: 'notificationClick', sid: 'S2', host: '', kind: 'card', cardId: 'S2:g4' });
-  out.live = { fetches: FETCHES.slice(), posted: POSTED.slice() };
-  FETCHES.length = 0; POSTED.length = 0;
+  FETCHES.length = 0; POSTED.length = 0; DIAG.length = 0; ACK.length = 0;
+  swMsg({ romp: 'notificationClick', sid: 'S2', host: '', kind: 'card', cardId: 'S2:g4', id: 'T-1', diag: { clients: 3, tops: 1, road: 'focus', vis: 'hidden' } });
+  await tick();
+  out.live = { fetches: FETCHES.slice(), posted: POSTED.slice(), diag: DIAG.slice(), ack: ACK.slice() };
+  FETCHES.length = 0; POSTED.length = 0; DIAG.length = 0; ACK.length = 0;
+  swMsg({ romp: 'notificationClick', sid: 'S2', host: '', kind: 'card', cardId: 'S2:g4', id: 'T-1', diag: { clients: 3, tops: 1, road: 'focus', vis: 'hidden' } });   // the same tap again, by another road
+  await tick();
+  out.dup = { fetches: FETCHES.slice(), posted: POSTED.slice(), diag: DIAG.slice(), ack: ACK.slice() };
+  FETCHES.length = 0; POSTED.length = 0; DIAG.length = 0; ACK.length = 0;
   swMsg({ romp: 'notificationClick', sid: 'S3', host: '', kind: 'turn', cardId: '' });
   out.turn = { fetches: FETCHES.slice(), posted: POSTED.slice() };
-  FETCHES.length = 0; POSTED.length = 0;
-  swMsg({ romp: 'notificationClick', sid: '', host: '', kind: 'test', cardId: '' });
-  out.test = { fetches: FETCHES.slice(), posted: POSTED.slice() };
+  await tick();                                                                          // its /reveal answers before the next scenario's snapshot
+  FETCHES.length = 0; POSTED.length = 0; DIAG.length = 0;
+  swMsg({ romp: 'notificationClick', sid: '', host: '', kind: 'test', cardId: '', id: 'T-2', diag: { clients: 1, tops: 1, road: 'focus', vis: '' } });
+  await tick();
+  out.test = { fetches: FETCHES.slice(), posted: POSTED.slice(), diag: DIAG.slice() };
   FETCHES.length = 0; POSTED.length = 0;
   swMsg({ romp: 'notificationClick', sid: 'S5', host: '', kind: 'test', cardId: '' });   // a test addressed to the session in front (2026-09-06)
   out.testSid = { fetches: FETCHES.slice(), posted: POSTED.slice() };
-  FETCHES.length = 0; POSTED.length = 0;
+  await tick();
+  FETCHES.length = 0; POSTED.length = 0; DIAG.length = 0; ACK.length = 0;
   swMsg({ romp: 'pushReveal', sid: 'S6' });                                             // the worker of builds before 2026-09-06, still installed on a phone
-  out.legacy = { fetches: FETCHES.slice(), posted: POSTED.slice() };
-  fetchOk = false; FETCHES.length = 0;
+  await tick();
+  out.legacy = { fetches: FETCHES.slice(), posted: POSTED.slice(), diag: DIAG.slice(), ack: ACK.slice() };
+  fetchOk = false; FETCHES.length = 0; DIAG.length = 0;
   swMsg({ romp: 'notificationClick', sid: 'S-bad', kind: 'turn' });
   await tick(); await tick();
-  out.refused = { notes: NOTES.slice() };
+  out.refused = { notes: NOTES.slice(), diag: DIAG.slice() };
+  // the replay asks (2026-09-08): at boot (above), and every time the page becomes visible again
+  CTRL.length = 0;
+  global.document.visibilityState = 'hidden'; DOC.forEach((f) => f());
+  out.hiddenAsks = CTRL.slice();
+  global.document.visibilityState = 'visible'; DOC.forEach((f) => f());
+  out.visibleAsks = CTRL.slice();
+  CTRL.length = 0; PAGESHOW.forEach((f) => f());
+  out.pageshowAsks = CTRL.slice();
   console.log(JSON.stringify(out));
 })();
 """
@@ -922,7 +1058,7 @@ class LandingRevealExecutes(unittest.TestCase):
     def test_a_turn_focuses_without_a_card_and_a_sidless_test_lands_nowhere(self):
         self.assertEqual(len(self.out["turn"]["fetches"]), 1)
         self.assertEqual(self.out["turn"]["posted"], [])
-        self.assertEqual(self.out["test"], {"fetches": [], "posted": []})
+        self.assertEqual((self.out["test"]["fetches"], self.out["test"]["posted"]), ([], []))
 
     def test_a_test_addressed_to_a_session_reveals_it_like_a_turn(self):
         # the user 2026-09-06: ANY sid lands, whatever the kind; only a card adds the card scroll
@@ -931,11 +1067,56 @@ class LandingRevealExecutes(unittest.TestCase):
     def test_a_stale_workers_tap_still_lands(self):
         # the worker of builds before 2026-09-06 posts {romp:'pushReveal', sid}; a phone keeps running it
         # until a navigation refreshes it (2026-09-08) — the shell reads that shape too, never a silent miss
-        self.assertEqual(self.out["legacy"], {"fetches": [["/reveal", {"sid": "S6", "wid": "W-test", "via": "sw"}]], "posted": []})
+        self.assertEqual((self.out["legacy"]["fetches"], self.out["legacy"]["posted"]),
+                         ([["/reveal", {"sid": "S6", "wid": "W-test", "via": "sw"}]], []))
 
     def test_a_refused_reveal_is_loud(self):
         self.assertEqual(self.out["refused"]["notes"],
                          [["error", "Could not open the session this notification was about: missing sid"]])
+        self.assertEqual(self.out["refused"]["diag"][-1], ["reveal-post", {"status": 400, "via": "sw", "boot": False}],
+                         "the refusal's status is on record beside the toast")
+
+    def test_every_step_files_a_shell_diag_row(self):
+        # 2026-09-08: the app came forward, the session did not change, the journal held no /reveal line —
+        # so the request never left the phone, and nothing said where it had stopped. Each step now files a
+        # client-diag row through the shell socket's poster: the boot (link or not; a worker in control),
+        # the worker's message (its shape, whether it carries a session, the worker's own trail), /reveal's
+        # status. Structure only — no id, no name, no text
+        b = self.out["boot"]
+        self.assertEqual(b["diag"], [["deeplink", {"hasSid": True, "hasCard": True, "controlled": True}]])
+        self.assertEqual(b["diagAfter"][1:], [["reveal-post", {"status": 200, "via": "link", "boot": True}]])
+        self.assertEqual(self.out["live"]["diag"],
+                         [["sw-message", {"shape": "notificationClick", "hasSid": True, "kind": "card", "dup": False,
+                                          "sw": {"clients": 3, "tops": 1, "road": "focus", "vis": "hidden"}}],
+                          ["reveal-post", {"status": 200, "via": "sw", "boot": False}]])
+        self.assertEqual(self.out["test"]["diag"],
+                         [["sw-message", {"shape": "notificationClick", "hasSid": False, "kind": "test", "dup": False,
+                                          "sw": {"clients": 1, "tops": 1, "road": "focus", "vis": ""}}]],
+                         "a sid-less tap: the row says so, and no /reveal follows")
+        self.assertEqual(self.out["legacy"]["diag"][0],
+                         ["sw-message", {"shape": "pushReveal", "hasSid": True, "kind": "", "dup": False, "sw": None}])
+        for what, data in b["diag"] + self.out["live"]["diag"]:
+            self.assertNotIn("sid", data, "structure only: the row never carries the session id")
+
+    def test_a_tap_lands_once_however_many_roads_deliver_it_and_is_acked(self):
+        # the worker posts the tap, replays it to a shell that asks, and the deep link can carry it too; the
+        # id dedupes: one /reveal, one card scroll — and the shell tells the worker that tap landed so the
+        # worker retires it. A worker of an older build sends no id: nothing to dedupe on, nothing to ack
+        self.assertEqual(self.out["live"]["ack"], [{"romp": "tapLanded", "id": "T-1"}])
+        d = self.out["dup"]
+        self.assertEqual((d["fetches"], d["posted"], d["ack"]), ([], [], []))
+        self.assertEqual(d["diag"][0][1]["dup"], True, "the second arrival is filed as such, not landed again")
+        self.assertEqual(self.out["legacy"]["ack"], [])
+
+    def test_the_shell_asks_the_worker_for_a_kept_tap_at_boot_and_on_coming_back(self):
+        # the events a tap that brought the app forward produces: this page booting (a relaunched app), or
+        # becoming visible again (a resumed one). Each asks the controlling worker; hidden asks nothing
+        b = self.out["boot"]
+        self.assertEqual(b["swListeners"], 1)
+        self.assertEqual(b["ctrl"], [{"romp": "tapReplay"}], "asked at parse time, after the listener is in place")
+        self.assertEqual(self.out["hiddenAsks"], [])
+        self.assertEqual(self.out["visibleAsks"], [{"romp": "tapReplay"}])
+        self.assertEqual(self.out["pageshowAsks"], [{"romp": "tapReplay"}])
 
 
 

@@ -39315,11 +39315,17 @@ def _push_test(endpoint, sid="", host="", label=""):
     `label` stands in: the active tab's own text, the user's UI text and nothing more, so it is
     clipped and flattened here and never consulted ahead of the kernel's own copy. Neither → the
     short id, as before."""
+    sid, host, name = str(sid or ""), str(host or ""), ""
+    # One stderr line per test push (2026-09-08: a phone's test tap brought romp forward and nothing more,
+    # and the journal could not say whether the test had carried a session at all — this route logged nothing).
+    # The session's id clipped, the endpoint's host only: enough to match the shell's client-diag row.
+    _tag = (("%s:%s" % (sid.split(":", 1)[0], sid.split(":", 1)[1][:8])) if ":" in sid else sid[:8]) or "none"
+    _ep_host = urlparse(str(endpoint or "")).netloc or "?"
     sub = _push_subs().get(str(endpoint or ""))
     if not sub:
+        print("[push] test sid=%s endpoint=%s: not subscribed" % (_tag, _ep_host), file=sys.stderr)
         return {"ok": False, "status": 0, "detail": "this device isn't subscribed yet"}
     _vapid_keys()                                          # RuntimeError without cryptography → the route's 500
-    sid, host, name = str(sid or ""), str(host or ""), ""
     label = " ".join(str(label or "").split())[:PUSH_LABEL_MAX]
     if sid:
         if ":" in sid:
@@ -39335,6 +39341,7 @@ def _push_test(endpoint, sid="", host="", label=""):
         body = "Test notification — this device is set up."
     payload = json.dumps(_push_payload("romp", body, sid=sid, kind="test", host=host)).encode()
     status, detail = _push_post(sub, payload)
+    print("[push] test sid=%s endpoint=%s: %s" % (_tag, _ep_host, status), file=sys.stderr)
     ok = 200 <= status < 300
     if status in _PUSH_DEAD_STATUSES:
         _del_push_sub(sub["endpoint"])
@@ -39603,25 +39610,51 @@ e.waitUntil(Promise.all(work));
 // chat pane's session picker is the chat iframe. Only the shell (the top-level document) carries
 // the reveal listener; posting into a pane dropped the tap on the floor. A client that reports no
 // frameType is treated as a window rather than dropped.
+// EVERY TAP WEARS AN ID AND A `diag` BLOCK (2026-09-08, the phone again: the app came forward and no
+// /reveal ever left it, and nothing recorded where between the tap and the shell it had stopped). The
+// shell files the block in client-diag.jsonl beside its own rows, so one file says what the worker saw:
+// how many window clients, how many top-level, which road it took, the target's visibility. The id lets
+// the shell land a tap ONCE however many roads deliver it (the message, the replay, the link).
+// THE TAP IS KEPT (`pending`) until a shell says it landed. A page the browser SUSPENDED while the app
+// sat in the background can miss a message posted before it resumed, and a page the browser EVICTED and
+// relaunches on the start URL never saw one. The shell asks {romp:'tapReplay'} at boot and whenever it
+// becomes visible again — the very events a tap that brought the app forward produces — the worker
+// answers with the kept tap, and the shell's {romp:'tapLanded', id} retires it, so a reload minutes
+// later cannot replay a tap that already landed. Events, no timers.
+// LAST RESORT: a top-level client focus() brought forward that STILL reports hidden is not a page that
+// came forward but a stale entry for one the browser no longer runs, so its URL is set to the deep link
+// (WindowClient.navigate — iOS has it) and the page that loads boots on the link. Only for a sid (a
+// sid-less tap has nowhere to land) and only when the client's creation URL carries no push-reveal yet
+// (one opened on the link has the boot road already). Never a live window: one that came forward is
+// visible by then, and navigate() is a full page load. A refused navigate is the end of that road; the
+// message and the replay above are the roads for a live page, the link the road for a fresh one.
+var pending=null;   // the last tap addressed to a session, until a shell says it landed
+self.addEventListener('message',function(e){var m=(e&&e.data)||{},src=e&&e.source;
+if(m.romp==='tapReplay'){if(pending&&src){try{src.postMessage(pending);}catch(err){}}}
+else if(m.romp==='tapLanded'){if(pending&&m.id===pending.id)pending=null;}});
 self.addEventListener('notificationclick',function(e){
 e.notification.close();
 var d=e.notification.data||{};var sid=d.sid||'';
 var url=d.url||(sid?'/?push-reveal='+encodeURIComponent(sid):'/');
-var msg={romp:'notificationClick',sid:sid,host:d.host||'',kind:d.kind||'',cardId:d.cardId||''};
+var msg={romp:'notificationClick',sid:sid,host:d.host||'',kind:d.kind||'',cardId:d.cardId||'',
+id:String(Date.now())+'-'+Math.random().toString(36).slice(2,8),diag:{}};
+if(sid)pending=msg;
+function tell(c,road){msg.diag.road=road;msg.diag.vis=String((c&&c.visibilityState)||'');try{c.postMessage(msg);}catch(err){}}
 // The window openWindow hands back is ALSO given the routing block (2026-09-08): a message posted to a
 // window client before its page has a listener is held by the browser until the shell adds one, so it
 // lands exactly like a live tap's — a second road to the same focus for a browser that opens the app
 // on its start URL rather than the link (reported of installed iOS apps; unverified here). Where the
 // link arrives too, the kernel sees the same focus asked twice for the same window — idempotent. No
 // client back (null), or nothing to land on (no sid) → the link alone.
-function open(){return clients.openWindow(url).then(function(c){if(sid&&c&&typeof c.postMessage==='function'){try{c.postMessage(msg);}catch(err){}}return c;});}
+function open(road){return clients.openWindow(url).then(function(c){if(sid&&c&&typeof c.postMessage==='function')tell(c,road);return c;});}
 function shell(w){return !w.frameType||w.frameType==='top-level'||w.frameType==='auxiliary';}
+function stale(c){return !!sid&&!!c&&c.visibilityState==='hidden'&&typeof c.navigate==='function'&&String(c.url||'').indexOf('push-reveal=')<0;}
 e.waitUntil(clients.matchAll({type:'window',includeUncontrolled:true}).then(function(ws){
-var tops=ws.filter(shell);
-if(!tops.length)return open();
+var tops=ws.filter(shell);msg.diag.clients=ws.length;msg.diag.tops=tops.length;
+if(!tops.length)return open('open');
 var w=tops[0];
-return Promise.resolve().then(function(){return w.focus();}).then(function(fw){
-try{(fw||w).postMessage(msg);}catch(err){}},open);
+return Promise.resolve().then(function(){return w.focus();}).then(function(fw){var c=fw||w;tell(c,'focus');
+if(stale(c))return c.navigate(url).then(null,function(){});},function(){return open('open-after-refused');});
 }));
 });
 """
@@ -42736,6 +42769,18 @@ refresh();   // self-schedules (fast while attaching, slow keep-alive otherwise)
 # Entirely inert on desktop, where #mtabs is hidden and all three panes are shown at once.
 _LANDING_MOBILE_JS = """
 (function(){
+// The shell's own client-diag rows (2026-09-08): the bell's and the tap-landing scripts record what they saw
+// (a test's session attached or not, and why; a worker's message; a deep link; /reveal's status) as
+// {type:'clientDiag', surface:'shell'} over the shell socket below — the rows the panes already file in
+// client-diag.jsonl, so one file holds a tap's whole trail. Queued (capped) until the socket is open. The
+// socket carries the shell's wid, so its rows and this dashboard's pane rows match on it — and so a reveal
+// the kernel aims at a dashboard's shell by wid (_reveal_chat_for's second line) has a target at last.
+var diagQ=[],DIAGQ_MAX=20,shellSock=null;
+function shellDiag(what,data){var m={type:'clientDiag',surface:'shell',what:what,data:data};
+if(shellSock&&shellSock.readyState===1){try{shellSock.send(JSON.stringify(m));}catch(e){}}
+else if(diagQ.length<DIAGQ_MAX)diagQ.push(m);}
+window.__rompShellDiag=shellDiag;
+function wid(){try{return sessionStorage.getItem('romp:wid')||'';}catch(e){return '';}}
 // Pin the shell to the TRUE visible viewport. body{height:100dvh} alone left a dead slab below the
 // Chat/Feed/Timeline bar on real Android Chrome — dvh didn't track the painted area (the user 2026-06-19).
 // visualViewport.height IS the live visible height (address-bar- AND keyboard-aware), so drive --app-h
@@ -42803,10 +42848,11 @@ window.addEventListener('message',function(e){var m=e.data;if(!m)return;if(m.rom
 if(m.romp==='toggleFleet')show(m.to==='chat'?'chat':'fleet');});
 var shellOpened=false;   // T265: this socket's REOPEN is the kernel-restart signal — the shell asks /version whose kernel answered
 function shellWS(){try{var proto=location.protocol==='https:'?'wss://':'ws://';
-var ws=new WebSocket(proto+location.host+'/ws?app=shell');
+var ws=new WebSocket(proto+location.host+'/ws?app=shell&wid='+encodeURIComponent(wid()));
 // ready → the kernel sends the current needs-you count, so a relaunched installed app trues up
 // its icon badge immediately instead of waiting for the next change (plans/ios-app.md proposal 3)
 ws.onopen=function(){try{ws.send(JSON.stringify({type:'ready'}));}catch(e){}
+shellSock=ws;var q=diagQ;diagQ=[];q.forEach(function(m){try{ws.send(JSON.stringify(m));}catch(e){}});   // the rows that waited for this socket
 if(shellOpened&&window.__rompReload)window.__rompReload.checkBoot();shellOpened=true;};
 ws.onmessage=function(ev){var m;try{m=JSON.parse(ev.data);}catch(e){return;}
 if(m&&m.type==='ka'){if(m.dv&&window.__rompReload)window.__rompReload.noteDv(m.dv);}   // build drift on the shell's own keepalive (T265)
@@ -42820,7 +42866,7 @@ else if(m&&m.type==='notifyAll'&&window.__rompNotifyAllPaint)window.__rompNotify
 else if(m&&m.type==='notifyTurns'&&window.__rompNotifyTurnsPaint)window.__rompNotifyTurnsPaint(!!m.on);
 // the boot check found a newer romp release — raise the update banner on every open dashboard
 else if(m&&m.type==='updateAvail'&&window.__rompUpdateOffer)window.__rompUpdateOffer(m.cur||'',m.tag||'',m.drift||'',m.boot||'',m.state||'');};
-ws.onclose=function(){setTimeout(shellWS,2000);};}catch(e){}}
+ws.onclose=function(){if(shellSock===ws)shellSock=null;setTimeout(shellWS,2000);};}catch(e){}}
 shellWS();
 var last='chat';try{var s=localStorage.getItem(KT);if(s&&F[s])last=s;}catch(e){}show(last);
 })();
@@ -42912,10 +42958,19 @@ return (s?s.unsubscribe():Promise.resolve()).then(function(){return ep?post('/pu
 // courtesy copy. No tab in front → no sid, and the test is the plain probe it always was. The tab's LABEL rides
 // along too (2026-09-06): the kernel names the session from its own registry or its snapshot of the owning host and
 // falls back to this — the user's own UI text, display-only, clipped here as well as there.
-function activeSession(){var t=null;try{var f=document.getElementById('f-chat'),d=f&&f.contentDocument;t=d&&d.querySelector('#tabs .tab.active[data-id]');}catch(e){}
+// WHY an empty read is empty rides the answer (2026-09-08, the phone: a test whose tap only brought romp forward,
+// and no way to tell whether it had carried a session at all): no chat frame; no document in it; no #tabs; or
+// tabs with none active — the boot window before the first session payload names one, when the mobile chip
+// shows the FIRST tab (its own fallback) while the test attaches none rather than guess that one. The press
+// files it as a client-diag row and the result line says no session was attached, never a silent probe.
+function diag(what,data){try{window.__rompShellDiag&&window.__rompShellDiag(what,data);}catch(e){}}
+function activeSession(){var t=null,why='',n=0;
+try{var f=document.getElementById('f-chat'),d=f&&f.contentDocument,tb=d&&d.querySelector('#tabs');
+if(!f)why='no-frame';else if(!d)why='no-doc';else if(!tb)why='no-tabs';
+else{n=tb.querySelectorAll('.tab[data-id]').length;t=tb.querySelector('.tab.active[data-id]');if(!t)why='none-active';}}catch(e){why='threw';}
 var id=t?String(t.getAttribute('data-id')||''):'';var i=id.indexOf(':');
 var lab=t&&t.querySelector('.tab-label');
-return {sid:id,host:i>0?id.slice(0,i):'',label:String((lab&&lab.textContent)||'').replace(/\\s+/g,' ').trim().slice(0,80)};}
+return {sid:id,host:i>0?id.slice(0,i):'',label:String((lab&&lab.textContent)||'').replace(/\\s+/g,' ').trim().slice(0,80),why:why,tabs:n};}
 function place(anchor){var r=anchor.getBoundingClientRect();   // beside the rail bell / above the tab bar: both sit at the bottom edge
 pop.style.bottom=Math.max(8,window.innerHeight-r.top+6)+'px';pop.style.right=Math.max(8,window.innerWidth-r.right)+'px';}
 function open(anchor){place(anchor);back.hidden=false;}
@@ -42938,11 +42993,13 @@ post('/notify-turns',{on:wantT}).then(function(){turnsOn=wantT;paint();},fail).t
 else if(act==='test'){if(!testBtn||testBtn.disabled)return;testBtn.disabled=true;var label=testBtn.textContent;testBtn.textContent='Sending…';
 testOut.className='rbp-sub';testOut.textContent='';
 var at=activeSession();   // read AT the press, before any await: the session you were looking at, not the one you switch to while it sends
+diag('push-test',{sidAttached:!!at.sid,host:at.host,why:at.why,tabs:at.tabs});   // the trail's first row: did the test carry a session, and if not, why the read came back empty
 sub().then(function(s){if(!s)return {ok:false,status:0,detail:'',nosub:true};return post('/push/test',{endpoint:s.endpoint,sid:at.sid,host:at.host,label:at.label});}).then(function(d){
 var ok=!!(d&&d.ok);testOut.classList.toggle('bad',!ok);
 testOut.textContent=ok?'The push service accepted it.':(d&&d.nosub?"This device isn't subscribed yet.":
 (d&&d.status?('The push service refused it: '+d.status+' '+(d.detail||'')+'.'):('Could not reach the push service: '+((d&&d.detail)||'no answer')+'.')));
 if(ok&&d.name)testOut.textContent+=' Tapping it brings you back to '+d.name+'.';   // addressed to a session: say where the tap goes, in the kernel's words (the body names it the same way)
+else if(ok)testOut.textContent+=' No session was attached — the tap will only bring romp forward.';   // the kernel names one for every sid, so no name is no sid: say so rather than let a plain probe pass for a landing test
 if(!isOn)testOut.textContent+=" Real notifications won't arrive until the main switch is on.";   // the test ignores the switches on purpose; say so
 },function(e){testOut.classList.add('bad');testOut.textContent='Test failed: '+((e&&e.message)||e)+'.';})
 .then(function(){testBtn.disabled=false;testBtn.textContent=label;});}
@@ -42982,6 +43039,18 @@ if(!isOn)testOut.textContent+=" Real notifications won't arrive until the main s
 # lands in the Log rather than vanishing. Each /reveal names the road the tap took (via: 'sw' — the
 # worker's message; 'link' — the deep link), and the kernel logs it with the outcome: the evidence a
 # "the tap did nothing" report needs, of which there was none (2026-09-08).
+# THE SHELL'S OWN TRAIL (2026-09-08, the phone once more: the app came forward, the session did not
+# change, and the journal held no /reveal line — so the request never left the phone, and nothing said
+# where between the tap and the fetch it had stopped). Every step here files a client-diag row (surface
+# 'shell', over the shell socket _LANDING_MOBILE_JS owns): 'deeplink' at every boot (did the page open on
+# the link; does a worker control it), 'sw-message' when a worker's message arrives (its shape, whether
+# it carries a session, the worker's own diag block: clients seen, road taken, target visibility, and
+# whether this tap already landed), 'reveal-post' with /reveal's status. Structure only, never text.
+# THE REPLAY: the worker keeps the last tap until a shell says it landed; this page asks for it at
+# boot and every time it becomes visible again (the events a tap that brought the app forward
+# produces), so a message posted while the page was suspended, or to a page the browser had already
+# evicted, still lands — and acks each tap it lands so the worker retires it. A tap's id dedupes the
+# roads: message, replay and link can all deliver the same tap, and it lands once.
 # Its own <script>, like every shell behaviour (test_kernel_mobile's count pin): a throw in the
 # bell's script must not strand a tap, and a bell that bails where the Push API is missing must
 # not take the deep-link half with it.
@@ -42989,6 +43058,7 @@ _LANDING_REVEAL_JS = """
 (function(){
 function wid(){try{return sessionStorage.getItem('romp:wid')||'';}catch(e){return '';}}
 function fail(e){try{window.__rompNotify&&window.__rompNotify('error','Could not open the session this notification was about: '+((e&&e.message)||e));}catch(err){}}
+function diag(what,data){try{window.__rompShellDiag&&window.__rompShellDiag(what,data);}catch(e){}}
 var feedReady=false,pendingCard=null;
 function revealCard(itemId,sid){if(!feedReady){pendingCard={itemId:itemId,sid:sid};return;}
 var f=document.getElementById('f-feed');
@@ -42999,18 +43069,32 @@ feedReady=true;if(pendingCard){var c=pendingCard;pendingCard=null;revealCard(c.i
 function land(sid,kind,cardId,boot,via){
 var body={sid:sid,wid:wid(),via:via};if(boot)body.boot=true;   // booting: our chat pane is not connected yet — park for it; via: which road the tap took, for the kernel's log line
 if(sid)fetch('/reveal',{method:'POST',body:JSON.stringify(body)}).then(function(r){
-if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});})['catch'](fail);
+diag('reveal-post',{status:r.status,via:via,boot:!!boot});
+if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});},
+function(e){diag('reveal-post',{status:0,via:via,boot:!!boot});throw e;})['catch'](fail);
 if(sid&&kind==='card'&&cardId)revealCard(cardId,sid);}
-if('serviceWorker' in navigator&&navigator.serviceWorker&&navigator.serviceWorker.addEventListener){
-navigator.serviceWorker.addEventListener('message',function(ev){var m=ev&&ev.data;
+var swc=('serviceWorker' in navigator)&&navigator.serviceWorker||null,seen={};
+function toWorker(m,src){try{var t=src||(swc&&swc.controller);if(t)t.postMessage(m);}catch(e){}}
+function askReplay(){toWorker({romp:'tapReplay'});}
+if(swc&&swc.addEventListener){
+swc.addEventListener('message',function(ev){var m=ev&&ev.data;
 // notificationClick: this build's worker. pushReveal: the worker of builds before 2026-09-06, which a phone
 // keeps running until a navigation refreshes it — its tap must land too, not arrive in a shape nobody reads.
-if(m&&(m.romp==='notificationClick'||m.romp==='pushReveal'))land(String(m.sid||''),String(m.kind||''),String(m.cardId||''),false,'sw');});}
+if(!(m&&(m.romp==='notificationClick'||m.romp==='pushReveal')))return;
+var id=String(m.id||''),dup=!!(id&&seen[id]);
+diag('sw-message',{shape:m.romp,hasSid:!!m.sid,kind:String(m.kind||''),dup:dup,sw:m.diag||null});
+if(dup)return;if(id)seen[id]=1;
+land(String(m.sid||''),String(m.kind||''),String(m.cardId||''),false,'sw');
+if(id)toWorker({romp:'tapLanded',id:id},ev.source);});
+askReplay();   // after the listener, so the answer has somewhere to land
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible')askReplay();});
+window.addEventListener('pageshow',askReplay);}
 var u=new URL(location.href),pr=u.searchParams.get('push-reveal'),pc=u.searchParams.get('push-card');
 // push-card is a goal id; a crafted link with a quote or bracket would reach the feed's
 // [data-key="a:..."] lookup as a selector and throw a SyntaxError that skips the openSession fallback
 // too (review find on #940, 2026-09-07). Drop a non-id value before it lands.
 if(pc&&!/^[A-Za-z0-9_.:-]{1,128}$/.test(pc))pc='';
+diag('deeplink',{hasSid:!!pr,hasCard:!!pc,controlled:!!(swc&&swc.controller)});
 if(pr||pc){land(pr||'',pc?'card':'',pc||'',true,'link');
 u.searchParams['delete']('push-reveal');u.searchParams['delete']('push-card');
 try{history.replaceState(null,'',u.pathname+(u.searchParams.toString()?'?'+u.searchParams.toString():'')+u.hash);}catch(e){}}
