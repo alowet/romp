@@ -82,9 +82,15 @@ op uses; a store that cannot be read or written answers 200 with `ok:false` and
 the reason the dashboards see, and an unknown key or a wrong type is a 400
 naming it. The panel finds the kernel through the `serve-port` record the
 kernel writes beside `serve-token` in the state directory once its socket is
-bound; with no record, or nothing answering on it, the panel refuses the
-gesture and says the kernel is not running rather than writing a file the
-kernel cannot check.
+bound; with a record nothing answers on, the panel refuses the gesture and says
+the kernel is not running rather than writing a file the kernel cannot check.
+With no record at all (a kernel older than the panel wrote the token and no
+port) it tries the port the command line resolves, `ROMP_KERNEL_PORT`, then
+`ROMP_SERVE_PORT`, else `29855`, and its refusal says so when nothing answers
+there. Record or fallback, the panel first asks the port to prove itself: a
+`GET /healthz` with no token, on `127.0.0.1` only, must answer `200 ok` with
+the kernel's `X-Romp-Boot` identity before the token is sent, and a port that
+answers as anything else is refused by name and never sees the token.
 
 `--env` gives one session its own environment, so two sessions in the same
 directory can run with different toggles (a `FEATURE_FLAG=1`, a `CLAUDE_CODE_*`
