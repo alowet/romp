@@ -10338,7 +10338,14 @@ function landActive(content: HTMLElement | null, v: View): void {
       pendingReloadScroll = null;
       v.stick = rs.stick;
       if (rs.stick) writeScroll(content, content.scrollHeight, "reload-restore", true);
-      else if (!(rs.anchor && restoreScrollAnchor(content, v, rs.anchor))) writeScroll(content, rs.top, "reload-restore");
+      else if (!(rs.anchor && restoreScrollAnchor(content, v, rs.anchor))) {
+        // the anchor turn is not in the fresh page's window (the reader was above the tail window): the raw
+        // scrollTop was measured in a differently windowed DOM, so land it now as the first guess and arm the
+        // deep-link land, whose window-around-unit and fetch-older paths bring the anchor turn back to its exact
+        // offset (review find, 2026-09-08)
+        writeScroll(content, rs.top, "reload-restore");
+        if (rs.anchor) { pendingAnchor = rs.anchor.uuid; pendingAnchorKeepY = rs.anchor.y; }
+      }
     }
     else if (!v.shown || v.stick) writeScroll(content, content.scrollHeight, "land-bottom", true);
     else writeScroll(content, v.scrollTop, "land-saved");
@@ -10360,14 +10367,16 @@ function landActive(content: HTMLElement | null, v: View): void {
 // The dashboard now reloads itself on a kernel restart and on a newer served bundle (the shell's reload core,
 // kernel.py _RELOAD_CORE_JS). The core calls window.__rompPersistForReload on every pane SYNCHRONOUSLY before
 // location.reload (a posted message could miss the unload); `pagehide` is the belt for any other navigation.
-// The record rides the persisted webview state beside the drafts and the active tab, is taken out of the state
-// the moment the page loads (one reload, one restore) and is consumed by landActive's first show of that tab.
+// The record rides sessionStorage — THIS tab's alone and it survives a reload (the persisted webview state is
+// localStorage on the served page, shared by every dashboard tab of the origin, so a record there could land
+// one tab on another's position; review find, 2026-09-08) — is taken out the moment the page loads (one reload,
+// one restore) and is consumed by landActive's first show of that tab.
+const RELOAD_SCROLL_KEY = "romp:reloadScroll";
 let pendingReloadScroll: ReloadScroll | null = (() => {
   try {
-    const st = (vscodeApi?.getState?.() || {}) as any;
-    const r = st.reloadScroll || null;
-    if (r && vscodeApi?.setState) vscodeApi.setState({ ...st, reloadScroll: undefined });
-    return r;
+    const raw = sessionStorage.getItem(RELOAD_SCROLL_KEY);
+    if (raw) sessionStorage.removeItem(RELOAD_SCROLL_KEY);
+    return raw ? (JSON.parse(raw) as ReloadScroll) : null;
   } catch { return null; }
 })();
 function persistScrollForReload(): void {
@@ -10376,7 +10385,7 @@ function persistScrollForReload(): void {
   if (!content || !v || !v.shown || content.clientHeight <= 0) return;
   const stick = content.scrollHeight - content.scrollTop - content.clientHeight <= 2;   // the true bottom
   const rec = reloadScrollRecord(activeId, content.scrollTop, stick, stick ? null : captureScrollAnchor(content, v));
-  try { if (vscodeApi?.setState) vscodeApi.setState({ ...(vscodeApi.getState() || {}), reloadScroll: rec }); } catch { /* ignore */ }
+  try { if (rec) sessionStorage.setItem(RELOAD_SCROLL_KEY, JSON.stringify(rec)); } catch { /* ignore */ }
 }
 (window as any).__rompPersistForReload = persistScrollForReload;
 window.addEventListener("pagehide", persistScrollForReload);

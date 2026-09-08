@@ -36,7 +36,7 @@ test("where the restored land goes: bottom for follow mode, the anchor when hono
   assert.equal(reloadLandTarget({ id: SID, top: 999, stick: false, anchor: null }, false), 999);
 });
 
-test("render.ts persists SYNCHRONOUSLY for the reload core and on pagehide, into the persisted webview state", () => {
+test("render.ts persists SYNCHRONOUSLY for the reload core and on pagehide, into THIS tab's sessionStorage", () => {
   assert.match(RENDER, /import \{ reloadScrollRecord, takeReloadScroll, type ReloadScroll \} from "\.\/reload-restore";/);
   assert.match(RENDER, /\(window as any\)\.__rompPersistForReload = persistScrollForReload;/);
   assert.match(RENDER, /window\.addEventListener\("pagehide", persistScrollForReload\);/);
@@ -45,18 +45,22 @@ test("render.ts persists SYNCHRONOUSLY for the reload core and on pagehide, into
   const body = m![1];
   assert.match(body, /const stick = content\.scrollHeight - content\.scrollTop - content\.clientHeight <= 2;/, "follow mode is the true bottom");
   assert.match(body, /reloadScrollRecord\(activeId, content\.scrollTop, stick, stick \? null : captureScrollAnchor\(content, v\)\)/);
-  assert.match(body, /vscodeApi\.setState\(\{ \.\.\.\(vscodeApi\.getState\(\) \|\| \{\}\), reloadScroll: rec \}\)/);
+  assert.match(body, /sessionStorage\.setItem\(RELOAD_SCROLL_KEY, JSON\.stringify\(rec\)\)/, "per tab: the persisted webview state is localStorage on the served page, shared by every dashboard tab");
+  assert.match(RENDER, /const RELOAD_SCROLL_KEY = "romp:reloadScroll";/);
   // nothing to keep for a hidden pane or a tab never shown
   assert.match(body, /if \(!content \|\| !v \|\| !v\.shown \|\| content\.clientHeight <= 0\) return;/);
 });
 
-test("render.ts takes the record out of the state at load (one reload, one restore)", () => {
-  assert.match(RENDER, /let pendingReloadScroll: ReloadScroll \| null = \(\(\) => \{[\s\S]*?const r = st\.reloadScroll \|\| null;\s*\n\s*if \(r && vscodeApi\?\.setState\) vscodeApi\.setState\(\{ \.\.\.st, reloadScroll: undefined \}\);\s*\n\s*return r;/);
+test("render.ts takes the record out of sessionStorage at load (one reload, one restore)", () => {
+  assert.match(RENDER, /let pendingReloadScroll: ReloadScroll \| null = \(\(\) => \{[\s\S]*?const raw = sessionStorage\.getItem\(RELOAD_SCROLL_KEY\);\s*\n\s*if \(raw\) sessionStorage\.removeItem\(RELOAD_SCROLL_KEY\);/);
 });
 
 test("landActive's landing consumes the record for the active tab first, then falls to the ordinary rule", () => {
   const m = RENDER.match(/^function landActive\(content: HTMLElement \| null, v: View\): void \{([\s\S]*?)\n\}/m);
   assert.ok(m, "landActive");
   const body = m![1];
-  assert.match(body, /const rs = takeReloadScroll\(pendingReloadScroll, activeId\);\s*\n\s*if \(rs\) \{\s*\n\s*pendingReloadScroll = null;\s*\n\s*v\.stick = rs\.stick;\s*\n\s*if \(rs\.stick\) writeScroll\(content, content\.scrollHeight, "reload-restore", true\);\s*\n\s*else if \(!\(rs\.anchor && restoreScrollAnchor\(content, v, rs\.anchor\)\)\) writeScroll\(content, rs\.top, "reload-restore"\);\s*\n\s*\}\s*\n\s*else if \(!v\.shown \|\| v\.stick\) writeScroll\(content, content\.scrollHeight, "land-bottom", true\);\s*\n\s*else writeScroll\(content, v\.scrollTop, "land-saved"\);/);
+  assert.match(body, /const rs = takeReloadScroll\(pendingReloadScroll, activeId\);\s*\n\s*if \(rs\) \{\s*\n\s*pendingReloadScroll = null;\s*\n\s*v\.stick = rs\.stick;\s*\n\s*if \(rs\.stick\) writeScroll\(content, content\.scrollHeight, "reload-restore", true\);\s*\n\s*else if \(!\(rs\.anchor && restoreScrollAnchor\(content, v, rs\.anchor\)\)\) \{/);
+  // the anchor turn outside the fresh window: the raw top is the first guess and the deep-link land finishes it
+  assert.match(body, /writeScroll\(content, rs\.top, "reload-restore"\);\s*\n\s*if \(rs\.anchor\) \{ pendingAnchor = rs\.anchor\.uuid; pendingAnchorKeepY = rs\.anchor\.y; \}/);
+  assert.match(body, /else if \(!v\.shown \|\| v\.stick\) writeScroll\(content, content\.scrollHeight, "land-bottom", true\);\s*\n\s*else writeScroll\(content, v\.scrollTop, "land-saved"\);/);
 });

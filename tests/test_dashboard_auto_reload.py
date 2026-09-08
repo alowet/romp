@@ -29,11 +29,13 @@ km = SourceFileLoader("romp_kernel_autoreload", os.path.join(BIN, "romp-kernel")
 HARNESS = r"""
 var LISTENERS = {}, STORE = {}, REMOVED = [], FETCHES = [], RELOADS = 0, REFUSE = false, PERSISTED = 0, WLISTENERS = {};
 var SEL = { rangeCount: 0, isCollapsed: true, toString: function () { return ""; } };
-var COMPOSER = { value: "" };
+var COMPOSER = { tagName: "TEXTAREA", value: "" };              // the chat composer, one editable among any
+var FOCUSED = true;                                             // document.hasFocus()
 var IFRAMES = [];
 var document = {
   addEventListener: function (t, f) { (LISTENERS[t] = LISTENERS[t] || []).push(f); },
   getSelection: function () { return SEL; },
+  hasFocus: function () { return FOCUSED; },
   getElementById: function (id) { return id === "composer-input" ? COMPOSER : null; },
   activeElement: null,
   body: { classList: { remove: function () { REMOVED.push(Array.prototype.slice.call(arguments)); } } },
@@ -42,7 +44,7 @@ var document = {
 var window = { addEventListener: function (t, f) { (WLISTENERS[t] = WLISTENERS[t] || []).push(f); } };
 window.parent = window;
 window.__rompPersistForReload = function () { PERSISTED++; };
-var location = { reload: function () { RELOADS++; if (REFUSE) throw new Error("host forbids reload"); } };
+var location = { pathname: "/", reload: function () { RELOADS++; if (REFUSE) throw new Error("host forbids reload"); } };
 var sessionStorage = {
   setItem: function (k, v) { STORE[k] = v; }, getItem: function (k) { return k in STORE ? STORE[k] : null; },
   removeItem: function (k) { delete STORE[k]; }
@@ -54,7 +56,7 @@ function wemit(t) { (WLISTENERS[t] || []).forEach(function (f) { f({}); }); }
 function tick() { return new Promise(function (r) { setTimeout(r, 0); }); }
 function state() {
   var R = window.__rompReload;
-  return { reloads: RELOADS, fired: R.fired(), owed: R.owed(), waiting: R.waiting, persisted: PERSISTED, removed: REMOVED,
+  return { reloads: RELOADS, fired: R.fired(), owed: R.owed(), waiting: R.waiting, persisted: PERSISTED, removed: REMOVED, refusedFor: R.refusedFor(),
            stored: STORE["romp:reloaded"] ? JSON.parse(STORE["romp:reloaded"]) : null, fetches: FETCHES.length };
 }
 function out(o) { process.stdout.write("RESULT:" + JSON.stringify(o) + "\n"); }
@@ -94,6 +96,7 @@ out({ same: same, older: older, after: state() });""")
         self.assertEqual(a["stored"]["reason"], "build")
         self.assertEqual(a["stored"]["detail"], "8")
         self.assertEqual(a["stored"]["from"], 7)
+        self.assertEqual(a["stored"]["path"], "/", "the marker names the page that reloaded")
         self.assertEqual(a["persisted"], 1, "the pane's persist hook ran before the reload")
         self.assertIn(["settings-open", "picker-open"], a["removed"], "the lifted modals close")
 
@@ -123,17 +126,18 @@ out({ quiet: quiet, after: state() });""")
 var R = window.__rompReload;
 emit("pointerdown");
 R.noteDv(8); var held = state();
-emit("pointerup");
-out({ held: held, after: state() });""")
+emit("pointerup"); var atOnce = state(); await tick();
+out({ held: held, atOnce: atOnce, after: state() });""")
         self.assertEqual(s["held"]["reloads"], 0)
         self.assertEqual(s["held"]["waiting"], "pointer")
         self.assertEqual(s["held"]["owed"]["reason"], "build", "armed, not dropped")
+        self.assertEqual(s["atOnce"]["reloads"], 0, "the fire waits one tick so the click the same press produces lands on its control first")
         self.assertEqual(s["after"]["reloads"], 1)
 
     def test_a_drag_in_flight_arms_and_dragend_fires(self):
         s = run_core("""
 var R = window.__rompReload;
-emit("dragstart"); R.noteDv(8); var held = state(); emit("dragend");
+emit("dragstart"); R.noteDv(8); var held = state(); emit("dragend"); await tick();
 out({ held: held, after: state() });""")
         self.assertEqual(s["held"]["waiting"], "drag")
         self.assertEqual(s["held"]["reloads"], 0)
@@ -144,7 +148,7 @@ out({ held: held, after: state() });""")
 var R = window.__rompReload;
 SEL = { rangeCount: 1, isCollapsed: false, toString: function () { return "some words"; } };
 R.noteDv(8); var held = state();
-SEL = { rangeCount: 1, isCollapsed: true, toString: function () { return ""; } }; emit("selectionchange");
+SEL = { rangeCount: 1, isCollapsed: true, toString: function () { return ""; } }; emit("selectionchange"); await tick();
 out({ held: held, after: state() });""")
         self.assertEqual(s["held"]["waiting"], "selection")
         self.assertEqual(s["held"]["reloads"], 0)
@@ -155,23 +159,23 @@ out({ held: held, after: state() });""")
 var R = window.__rompReload;
 document.activeElement = COMPOSER; COMPOSER.value = "half a thought";
 R.noteDv(8); var held = state();
-COMPOSER.value = "half a thought, more"; emit("input"); var typing = state();
-COMPOSER.value = ""; emit("input");
+COMPOSER.value = "half a thought, more"; emit("input"); await tick(); var typing = state();
+COMPOSER.value = ""; emit("input"); await tick();
 out({ held: held, typing: typing, after: state() });""")
-        self.assertEqual(s["held"]["waiting"], "composer")
+        self.assertEqual(s["held"]["waiting"], "typing")
         self.assertEqual(s["typing"]["reloads"], 0, "typing keeps the hold")
         self.assertEqual(s["after"]["reloads"], 1, "an emptied composer releases it")
         s2 = run_core("""
 var R = window.__rompReload;
 document.activeElement = COMPOSER; COMPOSER.value = "draft"; R.noteDv(8);
-document.activeElement = null; emit("focusout");
+document.activeElement = null; emit("focusout"); await tick();
 out({ after: state() });""")
         self.assertEqual(s2["after"]["reloads"], 1, "a blurred composer releases it (the draft is persisted already)")
 
     def test_a_window_blur_releases_every_hold(self):
         s = run_core("""
 var R = window.__rompReload;
-emit("pointerdown"); emit("dragstart"); R.noteDv(8); var held = state(); wemit("blur");
+emit("pointerdown"); emit("dragstart"); R.noteDv(8); var held = state(); wemit("blur"); await tick();
 out({ held: held, after: state() });""")
         self.assertEqual(s["held"]["reloads"], 0)
         self.assertEqual(s["after"]["reloads"], 1)
@@ -180,12 +184,22 @@ out({ held: held, after: state() });""")
         s = run_core("""
 var R = window.__rompReload; var refused = [];
 R.refused = function (o) { refused.push(o); }; REFUSE = true;
-R.noteDv(8);
-out({ refused: refused, after: state() });""")
-        self.assertEqual(s["after"]["reloads"], 1, "the reload was attempted")
-        self.assertFalse(s["after"]["fired"], "…and stood down when the host threw")
-        self.assertEqual(s["after"]["waiting"], "refused")
-        self.assertEqual(s["refused"], [{"reason": "build", "detail": "8"}])
+R.noteDv(8); var first = state();
+emit("pointerup"); await tick(); emit("selectionchange"); await tick(); R.noteVersion({ boot: "1.1", dist_ver: 8 }); var again = state(); var shownAfterAgain = refused.length;
+R.noteDv(9); var newer = state();
+out({ refused: refused, first: first, again: again, shownAfterAgain: shownAfterAgain, newer: newer });""")
+        f = s["first"]
+        self.assertEqual(f["reloads"], 1, "the reload was attempted")
+        self.assertFalse(f["fired"], "…and stood down when the host threw")
+        self.assertEqual(f["waiting"], "refused")
+        self.assertEqual(f["refusedFor"], "build:8", "the refusal latches for this build")
+        self.assertEqual(f["stored"], None, "no marker and no un-lifted modal for a reload that never happened")
+        self.assertEqual(f["removed"], [])
+        self.assertEqual(s["refused"][0], {"reason": "build", "detail": "8"})
+        self.assertEqual(s["again"]["reloads"], 1, "gesture ends and the poll do not re-attempt the refused build")
+        self.assertEqual(s["shownAfterAgain"], 1, "the banner is shown once for that build")
+        self.assertEqual(s["newer"]["reloads"], 2, "a strictly newer build re-arms and tries again (and is refused again on this host)")
+        self.assertEqual(len(s["refused"]), 2)
 
     def test_the_fresh_page_announces_once_from_the_marker(self):
         s = run_core("""
@@ -203,6 +217,12 @@ var R = window.__rompReload;
 STORE["romp:reloaded"] = JSON.stringify({ reason: "build", detail: "9", from: 6, t: 1 });
 out({ first: R.announce(null) });""")
         self.assertEqual(s2["first"], "Reloaded onto build 7 — a newer romp build was served.")
+        s3 = run_core("""
+var R = window.__rompReload;
+STORE["romp:reloaded"] = JSON.stringify({ reason: "build", detail: "9", from: 6, path: "/feed", t: 1 });
+out({ first: R.announce(null), left: STORE["romp:reloaded"] || null });""")
+        self.assertIsNone(s3["first"], "a marker another page wrote (a standalone /feed reload) is not this page's to announce")
+        self.assertIsNone(s3["left"], "…but it is consumed, so it cannot be misattributed later")
 
     def test_the_shell_composes_gesture_state_across_its_panes_and_a_pane_forwards_its_request(self):
         s = run_core("""
@@ -222,11 +242,54 @@ out({ held: held, after: state() });""")
 var shellReqs = [];
 window.parent = { __rompReload: { request: function (r, d) { shellReqs.push([r, d]); }, tryFire: function () { shellReqs.push(["tryFire"]); } } };
 var R = window.__rompReload;
-R.noteDv(8); emit("pointerup");
+R.noteDv(8); emit("pointerup"); await tick();
 out({ shellReqs: shellReqs, inShell: R.inShell(), after: state() });""")
         self.assertTrue(s2["inShell"])
         self.assertEqual(s2["shellReqs"], [["build", "8"], ["tryFire"]])
         self.assertEqual(s2["after"]["reloads"], 0, "the top document reloads, never the pane alone")
+
+    def test_a_panes_queued_sends_hold_the_reload_until_its_flush(self):
+        s = run_core("""
+var R = window.__rompReload; var queued = 1;
+window.__rompPaneBusy = function () { return queued ? "sends" : ""; };   // the shim: everConnected && queue.length > queuedDiag
+R.noteVersion({ boot: "2.2" }); var held = state();
+queued = 0; R.ended(); await tick();                                    // the shim's ws.onopen flush
+out({ held: held, after: state() });""")
+        self.assertEqual(s["held"]["reloads"], 0, "a prompt typed during the outage sits in the pane's queue: the shell's earlier reopen must not take the page down")
+        self.assertEqual(s["held"]["waiting"], "sends")
+        self.assertEqual(s["after"]["reloads"], 1, "the flush is the ending event")
+
+    def test_a_touch_pan_holds_from_pointercancel_until_the_finger_lifts(self):
+        s = run_core("""
+var R = window.__rompReload;
+emit("pointerdown"); emit("pointercancel");       // the touch became a scroll: the browser cancels the pointer, the finger is still down
+R.noteDv(8); var panning = state();
+emit("pointerup"); await tick(); var stillPanning = state();   // no pointerup comes for a cancelled pointer, but even one must not release the pan
+emit("touchend"); await tick();
+out({ panning: panning, stillPanning: stillPanning, after: state() });""")
+        self.assertEqual(s["panning"]["reloads"], 0)
+        self.assertEqual(s["panning"]["waiting"], "pan")
+        self.assertEqual(s["stillPanning"]["reloads"], 0)
+        self.assertEqual(s["after"]["reloads"], 1, "touchend releases the pan")
+
+    def test_a_selection_counts_only_in_the_focused_document(self):
+        s = run_core("""
+var R = window.__rompReload;
+SEL = { rangeCount: 1, isCollapsed: false, toString: function () { return "an old highlight"; } };
+FOCUSED = false; R.noteDv(8);
+out({ after: state() });""")
+        self.assertEqual(s["after"]["reloads"], 1, "a highlight left in a pane the user is not in is not a gesture being made")
+
+    def test_typing_in_any_editable_holds_not_only_the_composer(self):
+        s = run_core("""
+var R = window.__rompReload;
+var pickerInput = { tagName: "INPUT", type: "text", value: "new-sess" };
+document.activeElement = pickerInput; R.noteDv(8); var held = state();
+var sel = { tagName: "SELECT", value: "x" }; document.activeElement = sel; emit("focusout"); await tick();
+out({ held: held, after: state() });""")
+        self.assertEqual(s["held"]["waiting"], "typing", "the new-session picker's name box holds like the composer")
+        self.assertEqual(s["held"]["reloads"], 0)
+        self.assertEqual(s["after"]["reloads"], 1, "a focused <select> is not text entry")
 
     def test_a_foreign_parent_leaves_the_pane_to_reload_itself(self):
         s = run_core("""
@@ -262,6 +325,11 @@ class ReloadWiringPinned(unittest.TestCase):
         self.assertNotIn('postMessage({romp:"wsStale",build:1}', js, "the build:1 hand-off to the banner is gone")
         self.assertIn('if(msg&&msg.type==="ka"){if(LOADEDV&&msg.dv&&msg.dv>LOADEDV)raiseBuild();', js, "the keepalive's dv is still the event")
         self.assertIn("if(window.__rompReload&&!window.__rompReload.inShell())window.__rompReload.checkBoot();", js)
+        # the pane's queued sends hold the reload, and the flush is the ending event (review find, 2026-09-08)
+        self.assertIn('window.__rompPaneBusy=function(){return (everConnected&&queue.length>queuedDiag)?"sends":"";};', js)
+        self.assertIn("queue=[];queuedDiag=0;\ntry{if(window.__rompReload)window.__rompReload.ended();}catch(e){}", js)
+        # a standalone page consumes its own marker; nobody else would
+        self.assertIn("try{if(window.__rompReload&&!window.__rompReload.inShell())window.__rompReload.announce(null);}catch(e){}", js)
         # …on the RECONNECT branch only: the first open is not a restart
         i = js.find("if(wasReconn){")
         self.assertGreater(i, 0)
@@ -293,8 +361,8 @@ class ReloadWiringPinned(unittest.TestCase):
 
     def test_the_superseded_rule_is_recorded_with_both_dates(self):
         src = open(os.path.join(ROOT, "kernel", "kernel.py")).read()
-        self.assertIn("The user's ruling of 2026-09-08 (about 10:50 AM PT) supersedes their 2026-07-13 preference", src)
-        self.assertIn('the user 2026-09-08 ruled the page RELOADS ITSELF, superseding\n// the 2026-07-13 "prompt, never auto"', src)
+        block = src[src.index("# ── the dashboard reloads ITSELF"):src.index("_RELOAD_CORE_JS = r")]
+        self.assertIn("2026-09-08", block); self.assertIn("2026-07-13", block); self.assertIn("supersedes", block)
         ext = open(os.path.join(ROOT, "vscode-extension", "src", "extension.ts")).read()
         self.assertIn("2026-09-08", ext, "the VS Code exception names the ruling it stands beside")
 

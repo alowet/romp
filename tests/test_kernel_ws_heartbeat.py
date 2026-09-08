@@ -108,11 +108,12 @@ class ShimWatchdogSourcePins(unittest.TestCase):
 
 
 class BuildDriftBanner(unittest.TestCase):
-    """Build drift always shows a banner (the user 2026-07-13): the keepalive carries the kernel's current
-    dist token (dv); every kernel-served page bakes its own load-time token (LOADEDV) into the shim and
-    raises the reload prompt when dv passes it — so a standalone pane (no dashboard shell, previously NO
-    check at all) prompts too, and within one heartbeat instead of a 30s poll. Reload stays the user's
-    click, never automatic ([[prefer-reload-banner-not-auto]])."""
+    """Build drift is noticed on every page (the user 2026-07-13): the keepalive carries the kernel's current
+    dist token (dv); every kernel-served page bakes its own load-time token (LOADEDV) into the shim and acts
+    when dv passes it — so a standalone pane (no dashboard shell, previously NO check at all) notices too,
+    and within one heartbeat instead of a 30s poll. What the raise DOES changed on 2026-09-08 (T265): it asks
+    the reload core to reload the page itself, never mid-gesture, superseding the 2026-07-13 "prompt, never
+    automatic" rule; the self-injected bar remains only as the fallback when the host refuses the reload."""
 
     def test_keepalive_frame_carries_the_dist_token(self):
         got = []
