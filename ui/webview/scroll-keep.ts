@@ -91,3 +91,16 @@ export function followTail(distBefore: number, heightBefore: number, heightAfter
   if (atBottomDist(distBefore)) return true;
   return heightAfter !== heightBefore;
 }
+
+/** The transcript's bottom moved UP under a follow-mode reader (T262f, the user 2026-09-08: the pane unreadable near
+ *  the bottom; their laptop's breadcrumbs showed the view moving up by one fixed amount with no pane write between
+ *  the rows). An element at the END of #content losing height — the live-ask card cleared, a queued group emptying,
+ *  the offline foot going — makes the browser clamp scrollTop to the new maximum: an unwritten move the follow-mode
+ *  latch never saw. The rule mirrors followBoxBelow: the view's RECORDED follow mode (`stick`, still the pre-change
+ *  truth) decides, and only a SHRINK qualifies — growth at the tail is the append path's (append-stick) or the
+ *  live-ask reveal's. On: the reader is written to the new bottom (where the clamp left them, so nothing moves
+ *  twice, but the move is the pane's own, attributed in the journal, and the latch re-reads from a real scroll
+ *  event). Off: nothing — the clamp cannot reach a reader more than the shrink above the bottom. Pure. */
+export function followTailShrink(stick: boolean, dh: number): boolean {
+  return stick && dh < 0;
+}
