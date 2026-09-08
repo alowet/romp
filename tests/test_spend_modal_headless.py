@@ -158,6 +158,20 @@ class SpendModalServed(unittest.TestCase):
         self.assertTrue(o["mobile"]["railHidden"] and o["mobile"]["panelOpened"] and o["mobile"]["modalOpened"],
                         "on a phone the Usage panel's 'By session' button is the door (review find): " + json.dumps(o["mobile"]))
         self.assertEqual(o["lightErr"], "rgb(154, 51, 36)", "the error line has a light-theme step")
+        # T247b: the pressed toggle in the light theme wears the accent chip with --accent-fg text and no hairline
+        self.assertEqual(o["lightBtn"], {"color": "rgb(255, 248, 242)", "border": "rgba(0, 0, 0, 0)", "bg": "rgb(194, 65, 12)"}, o["lightBtn"])
+        # T247b: dim once — the annotation inside a dead row is at the row's level; the fold row is a control row
+        self.assertEqual(o["dim"]["row"], "0.55", o["dim"])
+        self.assertEqual(o["dim"]["ann"], "1", "no second dimming inside a dimmed row")
+        self.assertIs(o["dim"]["btnRowDead"], False, "the 'show all' row is not dimmed")
+        self.assertEqual(o["dim"]["btnOpacity"], "1")
+        # T247b: the loader's backstop lands on the error + retry path
+        self.assertTrue(o["timeout"]["err"] and "load the spend detail" in o["timeout"]["err"], o["timeout"])
+        self.assertTrue(o["timeout"]["retry"])
+        # T247b: the phone's door is a real button — the hover's size, full opacity, not an annotation
+        self.assertEqual(o["mobile"]["btn"]["font"], "11px", o["mobile"]["btn"])
+        self.assertEqual(o["mobile"]["btn"]["opacity"], "1", o["mobile"]["btn"])
+        self.assertIs(o["mobile"]["btn"]["inAge"], False)
         own = [e for e in o["errs"] if "rsp" in e or "Spend" in e or "spend" in e]
         self.assertEqual(own, [], "no page errors from the modal's own code")
 

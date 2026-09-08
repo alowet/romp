@@ -85,6 +85,32 @@ const { chromium } = require('playwright');
   const cell = await (await pg.$('#rsp-panel .rsp-tbl td.n')).boundingBox();
   await pg.mouse.move(cell.x + 2, cell.y + cell.height / 2); await pg.mouse.down(); await pg.mouse.move(5, 5, { steps: 4 }); await pg.mouse.up();
   const hiddenAfterDrag = await pg.evaluate(() => document.getElementById('rsp-back').hidden);
+  // the light theme's PRESSED toggle: accent chip, --accent-fg text, no hairline (T247b)
+  const lightBtn = await pg.evaluate(() => {
+    document.body.classList.add('theme-light');
+    const b = document.querySelector('#rsp-panel .rsp-btn.on'); const cs = getComputedStyle(b);
+    const out = { color: cs.color, border: cs.borderTopColor, bg: cs.backgroundColor };
+    document.body.classList.remove('theme-light'); return out;
+  });
+  // dim once: a dead row's annotation sits at the row's level, and the fold row's button is a control
+  const dim = await pg.evaluate(() => {
+    const dead = document.querySelector('#rsp-panel tr.rsp-dead td.rsp-name');
+    const ann = dead && dead.querySelector('.ru-tip-reset');
+    const btn = document.querySelector('#rsp-panel [data-act="table:all"]');
+    return { row: dead ? getComputedStyle(dead).opacity : null, ann: ann ? getComputedStyle(ann).opacity : null,
+             btnRowDead: btn ? btn.closest('tr').classList.contains('rsp-dead') : null, btnOpacity: btn ? getComputedStyle(btn).opacity : null };
+  });
+  // the loader's backstop: a fetch that never answers ends on the error + retry path (T247b)
+  const timeout = await pg.evaluate(async () => {
+    const f = window.fetch; window.__rompSpendTimeoutMs = 300;
+    window.fetch = (u, o) => new Promise((res, rej) => { if (o && o.signal) o.signal.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError'))); });
+    try { window.__rompOpenSpend(); await new Promise((r) => setTimeout(r, 900));
+      const err = document.querySelector('#rsp-panel .rsp-err'); return { err: err ? err.textContent : null, retry: !!document.querySelector('#rsp-panel [data-act="retry"]') }; }
+    finally { window.fetch = f; delete window.__rompSpendTimeoutMs; }
+  });
+  await pg.keyboard.press('Escape');
+  await pg.evaluate(() => document.getElementById('rail-usage').click());
+  await pg.waitForSelector('#rsp-panel .rsp-tbl', { timeout: 10000 });
   // the light theme's error line, over a failed fetch
   const lightErr = await pg.evaluate(async () => {
     document.body.classList.add('theme-light');
@@ -97,15 +123,17 @@ const { chromium } = require('playwright');
   await pg.setViewportSize({ width: 390, height: 844 });
   await pg.reload(); await pg.waitForSelector('#mtabs [data-act="usage"]', { timeout: 20000 });
   await pg.evaluate(() => { const bt = document.getElementById('romp-boot'); if (bt) bt.remove(); });
-  const mobile = await pg.evaluate(async () => {
-    const railHidden = getComputedStyle(document.querySelector('.pane-rail')).display === 'none';
-    window.__rompUsagePanel();
-    for (let i = 0; i < 50 && !document.getElementById('ru-bysession'); i++) await new Promise((r) => setTimeout(r, 100));
-    const panelOpened = !!document.getElementById('ru-bysession') && document.getElementById('ru-back').classList.contains('on');
-    if (panelOpened) document.getElementById('ru-bysession').click();
-    const modalOpened = !document.getElementById('rsp-back').hidden && !document.getElementById('ru-back').classList.contains('on');
-    return { railHidden, panelOpened, modalOpened };
-  });
-  console.log(JSON.stringify({ hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, hiddenAfterDrag, lightErr, mobile, foldBefore, foldAfter, errs }));
+  const railHidden = await pg.evaluate(() => getComputedStyle(document.querySelector('.pane-rail')).display === 'none');
+  await pg.evaluate(() => window.__rompUsagePanel());
+  await pg.waitForFunction(() => !!document.getElementById('ru-bysession') && document.getElementById('ru-back').classList.contains('on'), null, { timeout: 10000 });
+  const btn = await pg.evaluate(() => { const bs = document.getElementById('ru-bysession');
+    return { font: getComputedStyle(bs).fontSize, opacity: getComputedStyle(bs.parentNode).opacity, inAge: !!bs.closest('.ru-tip-age') }; });
+  if (shots) await pg.screenshot({ path: shots + '-phone-panel.png' });
+  await pg.click('#ru-bysession');
+  await pg.waitForFunction(() => !document.getElementById('rsp-back').hidden && !document.getElementById('ru-back').classList.contains('on'), null, { timeout: 5000 });
+  await pg.waitForSelector('#rsp-panel .rsp-tbl', { timeout: 10000 });
+  if (shots) await pg.screenshot({ path: shots + '-phone.png' });
+  const mobile = { railHidden, panelOpened: true, modalOpened: true, btn };
+  console.log(JSON.stringify({ hiddenBefore, loaderSeen, out, days, tip, hiddenAfter, hiddenAfterTap, hiddenAfterDrag, lightErr, lightBtn, dim, timeout, mobile, foldBefore, foldAfter, errs }));
   await b.close();
 })().catch((e) => { console.error(e); process.exit(1); });

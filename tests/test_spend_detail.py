@@ -252,6 +252,51 @@ class SpendDetail(unittest.TestCase):
         self.assertEqual(d["days"]["stacks"], [])
         self.assertEqual(len(d["days"]["keys"]), 90)
 
+    def test_float_residue_never_conjures_an_unattributed_stack_or_row(self):
+        # T247b review find: the recorder rounds the bucket sum and each sid's sum independently (6
+        # places), so a fully attributed bucket can carry a +1e-6..+6e-6 dollar residue with zero token
+        # residue — 28 of 113 live hour buckets did — and the presence test on the unrounded residues
+        # hung a hatched "unattributed" chip with no bars on the 8-day view. Below the rounding grain
+        # a residue is zero: no stack, no row.
+        hours, days = {}, {}
+        for n in range(0, 40):
+            by = {WEB: {"usd": 0.333333, "turns": 1, "tok": 1000}, API: {"usd": 0.666667, "turns": 1, "tok": 2000}}
+            hours[_hour(n)] = _bucket(1.000001, 3000, 2, by)          # sum of sids: 1.000000 → +1e-6 residue
+        for n in range(0, 30):
+            by = {WEB: {"usd": 2.1, "turns": 3, "tok": 5000}, API: {"usd": 3.9, "turns": 4, "tok": 7000}}
+            days[_day(n)] = _bucket(6.000004, 12000, 7, by)           # +4e-6 residue, every day
+        (km.jd.STATE / "spend.json").write_text(json.dumps({"days": days, "hours": hours}))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual([s["kind"] for s in d["hours"]["stacks"]], ["sid", "sid"], "no unattributed stack from residue")
+        self.assertEqual([s["kind"] for s in d["days"]["stacks"]], ["sid", "sid"])
+        self.assertEqual(d["unattributed"], {"usd": 0.0, "tok": 0, "turns": 0}, "30 days of residue sum to nothing, not $0.0001")
+        # …and a REAL remainder still shows: a sid-less turn's cost is far above the grain
+        days[_day(1)]["usd"] += 0.05
+        (km.jd.STATE / "spend.json").write_text(json.dumps({"days": days, "hours": hours}))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual(d["days"]["stacks"][-1]["kind"], "unattributed")
+        self.assertAlmostEqual(d["unattributed"]["usd"], 0.05, places=4)
+
+    def test_the_keyed_scopes_other_stack_counts_only_sessions_that_billed_the_key(self):
+        # T247b review find: in the keyed scope a login-only session contributed (0,0,0) yet was counted
+        # into "other (N sessions)", while the table dropped it — the legend said 17, the fold said 2
+        km._claude_account = lambda: "acct-digest"
+        (km.jd.STATE / "usage.json").write_text(json.dumps({"five_hour": {"pct": 10}}))
+        by = {}
+        for i in range(12):   # twelve key-billed sessions, two beyond the top ten
+            by["11111111-2222-3333-4444-0000000002%02d" % i] = {"usd": 1.0 + i, "turns": 1, "tok": 1000,
+                                                                "key": {"usd": 1.0 + i, "turns": 1, "tok": 1000}}
+        for i in range(5):    # five login-only sessions: no key sub-map
+            by["11111111-2222-3333-4444-0000000003%02d" % i] = {"usd": 9.0, "turns": 9, "tok": 9000}
+        days = {_day(0): _bucket(sum(v["usd"] for v in by.values()), 17000, 26, by,
+                                 key={"usd": sum(12.0 + i for i in range(12)) - 12 * 11.0 + 66.0, "turns": 12, "tok": 12000})}
+        (km.jd.STATE / "spend.json").write_text(json.dumps({"days": days, "hours": {}}))
+        d = km._spend_detail(now=NOW)
+        self.assertEqual(d["scope"], "keyed")
+        self.assertEqual(len(d["sessions"]), 12, "the table lists the key-billed sessions only")
+        other = [s for s in d["days"]["stacks"] if s["kind"] == "other"][0]
+        self.assertEqual(other["count"], 2, "the legend's count is the table's fold: sessions that contributed")
+
     def test_the_route_and_the_shell_are_wired(self):
         ksrc = inspect.getsource(km.Handler.do_GET) if hasattr(km.Handler, "do_GET") else open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
         self.assertIn('if p == "/spend/detail":', ksrc, "the kernel route exists")
@@ -273,6 +318,26 @@ class SpendDetail(unittest.TestCase):
         self.assertIn("var rows=spendRowsHTML(LAST||[]);", html, "the modal's window numbers are the hover's own renderer")
         self.assertIn("function fleetSpendHTML(sets){", html, "…whose signature the other suites pin, untouched")
         self.assertIn("body.theme-light #rsp-panel{", html, "a light-theme step of its own")
+        # T247b: the pressed toggle's light rule is written explicitly — a state rule must win the cascade
+        # (body.theme-light .rsp-btn at 0,1,1,0 beat .rsp-btn.on at 0,2,0 and painted dark text on the clay)
+        self.assertIn("body.theme-light .rsp-btn.on{background:var(--accent,#C2410C);color:var(--accent-fg,#FFF8F2);border-color:transparent}", html)
+        # T247b: the loader has a backstop — an AbortController with a generous timeout lands on the
+        # existing error + retry path, so a hung socket can never trap the modal
+        self.assertIn("var spAbort=new AbortController()", html)
+        self.assertIn("setTimeout(function(){spAbort.abort();}", html)
+        self.assertIn("signal:spAbort.signal", html)
+        # T247b: dimmed rows dim ONCE — the annotation inside a dimmed row stays at the row's level, and
+        # the fold row's "show all" is a control, never dimmed
+        self.assertIn(".rsp-dead td{opacity:.55}", html)
+        self.assertIn(".rsp-dead .ru-tip-reset{opacity:1}", html)
+        self.assertNotIn("<tr class=rsp-dead><td><i class=rsp-sw style=\"background:'+SP_OTHER+'\"></i></td><td class=rsp-name>'+rest.length+' more session", html,
+                         "the fold row is not a dead row")
+        self.assertIn("<tr class=rsp-fold>", html)
+        # T247b: the phone's door is its own row at the hover's button size, full opacity — not an
+        # annotation inside .ru-tip-age (10px, .55)
+        self.assertIn("<div class=ru-tip-more><button class=rsp-btn id=ru-bysession>", html)
+        self.assertNotIn("<div class=ru-tip-age><button class=rsp-btn id=ru-bysession>", html)
+        self.assertIn(".ru-tip-more{", html)
 
 
 if __name__ == "__main__":
