@@ -13,6 +13,18 @@
 
 export const SCROLL_DIAG_CAP_PER_MINUTE = 40;
 
+/** The cap a page actually runs with: the default, or the positive integer in localStorage under
+ *  "romp:scrollDiagCap" (T262j, the user 2026-09-08: a capture on their laptop hit the 40/min gesture cap within
+ *  seconds of trackpad scrolling, and every unwritten move for the rest of the minute went unrecorded; a laptop
+ *  capturing sets the key, everyone else keeps the default). Anything that is not a positive integer → the default. */
+export const SCROLL_DIAG_CAP_KEY = "romp:scrollDiagCap";
+export function readScrollDiagCap(getItem: (key: string) => string | null): number {
+  let raw: string | null = null;
+  try { raw = getItem(SCROLL_DIAG_CAP_KEY); } catch { raw = null; }
+  const n = raw == null ? NaN : Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : SCROLL_DIAG_CAP_PER_MINUTE;
+}
+
 /** One kind of row's budget for one session within the current minute: "send" while under the cap, "cap"
  *  exactly once at the cap (the caller files a capped row), "drop" past it until the minute rolls. */
 export class ScrollDiagBudget {
@@ -33,6 +45,13 @@ export class ScrollDiagBudget {
  *  pixel of the value written), or a gesture nobody's code asked for? */
 export function classifyScroll(scrollTop: number, lastWriteAfter: number | null): "write-echo" | "gesture" {
   return lastWriteAfter != null && Math.abs(scrollTop - lastWriteAfter) <= 1 ? "write-echo" : "gesture";
+}
+
+/** The breadcrumb for one re-size of a view's virtualization spacers (T262j): a top spacer re-estimate paired with
+ *  a bottom one leaves scrollHeight unchanged yet moves everything under the top spacer, and Chrome's scroll
+ *  anchoring then moves the reader by the same amount with no pane write. `top`/`bot` = [before, after] heights. */
+export function spacerRow(sid: string, topBefore: number, topAfter: number, botBefore: number, botAfter: number, sh = 0, ch = 0) {
+  return { sid, top: [topBefore, topAfter], bot: [botBefore, botAfter], dTop: topAfter - topBefore, dBot: botAfter - botBefore, sh, ch };
 }
 
 /** The breadcrumb for one height change of the transcript's TAIL outside the append path (T262f, the user

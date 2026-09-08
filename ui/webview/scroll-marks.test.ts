@@ -164,7 +164,7 @@ test("the wheel over a notch scrolls the transcript — the box forwards it (T26
   // scroll chain ended at the page — the scrollbar stopped scrolling exactly where a notch sat
   assert.match(ENSURE, /scrollMarks\.addEventListener\("wheel", \(e\) => \{/, "one listener on the stable box, never per notch");
   assert.match(ENSURE, /const k = e\.deltaMode === 1 \? 16 : e\.deltaMode === 2 \? c\.clientHeight : 1;/, "lines and pages scaled to pixels");
-  assert.match(ENSURE, /c\.scrollBy\(\{ top: e\.deltaY \* k, left: e\.deltaX \* k \}\);\s*\n\s*\}, \{ passive: true \}\);/, "passive: the wheel is never blocked");
+  assert.match(ENSURE, /scrollContentBy\(c, e\.deltaY \* k, "wheel-scale"\);\s*\n\s*\}, \{ passive: true \}\);/, "passive: the wheel is never blocked; the move rides the write helper as wheel-scale (T262j)");
 });
 
 test("only the NOTCH takes the pointer — the box stays passive over the native scrollbar (T260)", () => {

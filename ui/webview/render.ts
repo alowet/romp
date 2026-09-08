@@ -57,7 +57,7 @@ import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDown
 import { followReader, keepPlaceAcrossShow, followTail, atBottomDist, followBoxBelow, followTailShrink } from "./scroll-keep";
 import { retainLiveOmitted } from "./tab-order";
 import { userTurnShows } from "./user-turn-content";
-import { ScrollDiagBudget, classifyScroll, scrollWriteRow, tailChangeRow, tailLabel } from "./scroll-write";
+import { ScrollDiagBudget, classifyScroll, scrollWriteRow, tailChangeRow, tailLabel, spacerRow, readScrollDiagCap } from "./scroll-write";
 import { reloadScrollRecord, takeReloadScroll, type ReloadScroll } from "./reload-restore";
 import { keepResidentEvents } from "./frame-merge";
 import { activeTabToReannounce } from "./relay-active";
@@ -2471,11 +2471,14 @@ function ensureScrollMarks(): HTMLElement {
   // off body, not #content, so a notch that takes the pointer also took the wheel and its scroll chain
   // ended at the page — the scrollbar under it stopped scrolling exactly where a notch sat. One passive
   // listener on the stable box hands the delta to the scroller (lines and pages scaled to pixels).
+  // …through the one write helper, as "wheel-scale" (T262j): a trackpad's momentum keeps delivering wheel
+  // events for a second or two after the fingers lift, and each one this box receives is a move of the
+  // transcript the journal must be able to name. #content never scrolls sideways (overflow-x hidden).
   scrollMarks.addEventListener("wheel", (e) => {
     const c = document.getElementById("content");
     if (!c) return;
     const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? c.clientHeight : 1;
-    c.scrollBy({ top: e.deltaY * k, left: e.deltaX * k });
+    scrollContentBy(c, e.deltaY * k, "wheel-scale");
   }, { passive: true });
   return scrollMarks;
 }
@@ -6375,7 +6378,7 @@ window.addEventListener("keydown", (e) => {
     const content = document.getElementById("content");
     if (!content) return;
     e.preventDefault();
-    content.scrollBy({ top: e.key === "ArrowDown" ? NAV_SCROLL_STEP : -NAV_SCROLL_STEP });
+    scrollContentBy(content, e.key === "ArrowDown" ? NAV_SCROLL_STEP : -NAV_SCROLL_STEP, "key-nav");   // attributed (T262j)
   } else if (e.key === "Enter") {
     // A live transcript selection outranks everything below (the user 2026-08-04): the selection already
     // seeded the reply chip (selectionchange), and Enter is the natural "now type the reply" — so drop
@@ -9302,12 +9305,14 @@ function nearBottomForSend(c: HTMLElement): boolean {
 // view files nothing. The value written is applied exactly as before: this changes nothing about WHERE the view
 // lands, only that the landing is on the record.
 let lastScrollWriteAfter: number | null = null;
-const scrollDiag = new ScrollDiagBudget();
-function scrollDiagRow(kind: "scrollwrite" | "scrollgesture" | "tailchange", data: any): void {
+// the cap is the default unless the page's localStorage says otherwise (a laptop capturing raises it; T262j)
+const scrollDiagCap = readScrollDiagCap((k) => { try { return localStorage.getItem(k); } catch { return null; } });
+const scrollDiag = new ScrollDiagBudget(scrollDiagCap);
+function scrollDiagRow(kind: "scrollwrite" | "scrollgesture" | "tailchange" | "spacer", data: any): void {
   const v = scrollDiag.take(activeId || "", kind, Date.now());
   if (v === "drop") return;
   vscodeApi?.postMessage(v === "cap"
-    ? { type: "clientDiag", surface: "chat", what: kind + "-capped", data: { sid: activeId || "", perMinute: 40 } }
+    ? { type: "clientDiag", surface: "chat", what: kind + "-capped", data: { sid: activeId || "", perMinute: scrollDiagCap } }
     : { type: "clientDiag", surface: "chat", what: kind, data });
 }
 function writeScroll(content: HTMLElement, top: number, writer: string, stick = false): void {
@@ -9316,6 +9321,23 @@ function writeScroll(content: HTMLElement, top: number, writer: string, stick = 
   const after = content.scrollTop;
   lastScrollWriteAfter = after;
   if (after !== before) scrollDiagRow("scrollwrite", scrollWriteRow(activeId || "", writer, before, after, stick, content.scrollHeight, content.clientHeight));
+}
+// EVERY mover of #content goes through writeScroll (T262j, the user 2026-09-08: an unwritten move the journal could
+// not name). scrollBy and scrollIntoView are scrollTop writes expressed differently, so they are expressed as such:
+/** scrollBy on #content, attributed. */
+function scrollContentBy(content: HTMLElement, dy: number, writer: string): void {
+  writeScroll(content, content.scrollTop + dy, writer);
+}
+/** scrollIntoView for a node inside #content, attributed: "start" puts its top at the viewport top, "center" centres
+ *  it, "nearest" writes only when it is off screen (the browser's own rule), else nothing. */
+function scrollElInto(content: HTMLElement, el: Element, block: "start" | "center" | "nearest", writer: string): void {
+  const cr = content.getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  const y = r.top - cr.top + content.scrollTop;                     // the node's top in scroll space
+  if (block === "start") writeScroll(content, y, writer);
+  else if (block === "center") writeScroll(content, y - (content.clientHeight - r.height) / 2, writer);
+  else if (r.top < cr.top) writeScroll(content, y, writer);
+  else if (r.bottom > cr.bottom) writeScroll(content, y - (content.clientHeight - r.height), writer);
 }
 
 function cssEscape(s: string): string {
@@ -9509,13 +9531,17 @@ function highlightCiteSpan(target: HTMLElement, quote: string): void {
     H.set("cite-span", new (Highlight as unknown as { new(...r: Range[]): unknown })(range));
     window.setTimeout(() => { try { H.delete("cite-span"); } catch { /* gone with a nav */ } }, 6000);
     const el0 = range.startContainer.parentElement;
-    if (el0) el0.scrollIntoView({ block: "center", behavior: "auto" });   // land ON the sentence, not the message top
+    const content0 = document.getElementById("content");
+    if (el0 && content0) scrollElInto(content0, el0, "center", "land-on");   // land ON the sentence, not the message top (attributed, T262j)
   } catch { /* highlight is chrome, never load-bearing */ }
 }
 
 function landOn(target: HTMLElement, flashKey?: string) {
-  const realign = () => target.scrollIntoView({ block: "start", behavior: "auto" });
-  realign();
+  // the land and its re-alignments are writes of #content like any other, attributed (T262j): "land-on" for the
+  // landing itself, "land-realign" for each re-land while the boxes above size in
+  const land = (writer: string) => { const c = document.getElementById("content"); if (c) scrollElInto(c, target, "start", writer); };
+  const realign = () => land("land-realign");
+  land("land-on");
   if (flashKey == null || flashKey !== flashedAnchor) {   // one flash per navigation (see flashedAnchor)
     if (flashKey != null) flashedAnchor = flashKey;
     target.classList.add("anchor-flash");
@@ -9916,8 +9942,16 @@ function sizeSpacers(v: View): void {
     if (h > 0 && n > 0) v.avgTurnH = h / n;
   }
   const avg = v.avgTurnH ?? 60;
-  if (top) top.style.height = Math.max(0, Math.round((v.spacerCount ?? 0) * avg)) + "px";
-  if (bot) bot.style.height = Math.max(0, Math.round((v.spacerCountBot ?? 0) * avg)) + "px";
+  const topBefore = top ? (parseFloat(top.style.height) || 0) : 0, botBefore = bot ? (parseFloat(bot.style.height) || 0) : 0;
+  const topAfter = top ? Math.max(0, Math.round((v.spacerCount ?? 0) * avg)) : 0, botAfter = bot ? Math.max(0, Math.round((v.spacerCountBot ?? 0) * avg)) : 0;
+  if (top) top.style.height = topAfter + "px";
+  if (bot) bot.style.height = botAfter + "px";
+  // a spacer re-size is a layout change above or below the reader that no pane write accompanies; the browser's
+  // anchoring answers it on its own, so the journal names it (T262j) — for the ACTIVE view only
+  if ((topAfter !== topBefore || botAfter !== botBefore) && activeId && views.get(activeId) === v) {
+    const content = document.getElementById("content");
+    scrollDiagRow("spacer", spacerRow(activeId, topBefore, topAfter, botBefore, botAfter, content ? content.scrollHeight : 0, content ? content.clientHeight : 0));
+  }
 }
 
 // Estimate the UNIT index at the viewport top: a spacer maps by avg height; a rendered row by its data-unit.
