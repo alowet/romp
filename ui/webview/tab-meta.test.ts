@@ -116,6 +116,6 @@ test("the tabOrder frame's views land before the strip repaints — a CLI tag ed
   // captureViews (adopt the pushed views/tags blob) must run BEFORE applyTabOrder (whose renderTabs
   // re-filters via tabInView) in the tabOrder handler — the (c) leg of the live-update fix
   // the frame's provenance rides along since T233 (captureViews still runs FIRST)
-  assert.match(RENDER, /else if \(m\.type === "tabOrder"\) \{\s*\n\s*captureViews\(m\.views \|\| null\);\s*\n\s*applyTabOrder\(m\.order, m\.tabs, \{ reemit: m\.reemit === true, freshHost: typeof m\.freshHost === "string" \? m\.freshHost : undefined \}\);\s*\n\s*\}/);
+  assert.match(RENDER, /else if \(m\.type === "tabOrder"\) \{\s*\n\s*captureViews\(m\.views \|\| null\);\s*\n\s*applyTabOrder\(m\.order, m\.tabs, \{ reemit: m\.reemit === true, freshHost: typeof m\.freshHost === "string" \? m\.freshHost : undefined \}, m\.live\);\s*\n\s*\}/);
   assert.match(RENDER, /const inViewIds = ids\.filter\(tabInView\);/);
 });

@@ -53,7 +53,7 @@ test("the feed dot matches too: dotFor picks work/await per name, the dot retint
   // headers, and the session-filter button (2026-08-08; its menu rows route via setWorkDot(label,…))
   assert.equal((FEED.match(/setWorkDot\((?:a\._name|agent|nm), dotFor\(/g) || []).length, 6);
   assert.match(FEEDCSS, /\.fwork-dot\.await \{ background: #54B204; \}/);
-  assert.match(FED, /const ARRAY_ID = \["order", "names", "working", "awaiting", "stateUnknown"\];/);
+  assert.match(FED, /const ARRAY_ID = \["order", "names", "working", "awaiting", "stateUnknown", "live"\];/);   // + the tabOrder frame\'s live set (T258)
   assert.match(FED, /if \(Array\.isArray\(f\.awaiting\)\) merged\.awaiting\.push\(\.\.\.f\.awaiting\);/);
 });
 

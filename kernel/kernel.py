@@ -2526,7 +2526,8 @@ def _live_stub_session(sid, now):
     try:
         mtime = path.stat().st_mtime
     except OSError:
-        mtime = now
+        mtime = 0        # the file is the thing that is missing; never the clock (a ticking mtime re-sorts the
+        #                  feed's order every push and defeats its dedup) — the wide-walk fallback's idiom
     return {"sid": sid, "name": name or sid[:8], "anchor": sid, "path": str(path), "mtime": mtime}
 
 

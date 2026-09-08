@@ -262,8 +262,9 @@ class TimelineViews(unittest.TestCase):
         src = open(os.path.join(BIN, "romp-kernel")).read()
         self.assertIn('"views": _views_client(),', src, "the timeline payload carries the RENDERED shape")
         self.assertIn('"palette": pal.colors(_palette_name()),', src, "and the palette, for tag colors in every host")
-        self.assertIn('"tabs": tab_meta, "views": _views_client()', src, "tabOrder pushes carry it")
-        self.assertIn('"tabs": _tabs, "views": _views_client()', src, "the connect-time tabOrder carries it")
+        self.assertIn('_tab_order_frame(tab_order, tab_meta, tmux)', src, "tabOrder pushes carry it (the one frame builder, T258)")
+        self.assertIn('"views": _views_client(), "live":', src, "…which carries the blob")
+        self.assertIn('_frame = _tab_order_frame(_o, _tabs, _tm)', src, "the connect-time tabOrder carries it")
 
     def test_web_boot_exposes_the_set_views_hook(self):
         src = open(os.path.join(BIN, "romp-kernel")).read()

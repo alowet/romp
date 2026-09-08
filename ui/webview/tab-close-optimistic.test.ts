@@ -156,7 +156,7 @@ test("the wiring: applyTabOrder hands the frame's provenance to the backstop, wh
   assert.match(RENDER, /type OrderReport = \{ reemit\?: boolean; freshHost\?: string \} \| undefined;/);
   assert.match(RENDER, /function ackClosingTabs\(kernelOrder: readonly string\[\], report\?: OrderReport\): void/);
   assert.match(RENDER, /if \(report && \(report\.reemit \|\| \(typeof report\.freshHost === "string" && hostOf\(id\) !== report\.freshHost\)\)\) continue;/);
-  assert.match(RENDER, /applyTabOrder\(m\.order, m\.tabs, \{ reemit: m\.reemit === true, freshHost: typeof m\.freshHost === "string" \? m\.freshHost : undefined \}\);/);
+  assert.match(RENDER, /applyTabOrder\(m\.order, m\.tabs, \{ reemit: m\.reemit === true, freshHost: typeof m\.freshHost === "string" \? m\.freshHost : undefined \}, m\.live\);/);   // + the frame\'s live set (T258)
   // confirm-on-absence is untouched: it acts BEFORE the provenance gate, on any order
   assert.match(RENDER, /if \(!live\.has\(id\)\) \{ closingTabs\.delete\(id\); continue; \}[\s\S]{0,120}?if \(now - ts < CLOSE_ACK_MS\) continue;[\s\S]{0,900}?if \(report && /);
 });

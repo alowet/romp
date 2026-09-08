@@ -134,19 +134,29 @@ class BuiltFeedIsClockInvariantApartFromTheClockItself(unittest.TestCase):
         (names / SID).write_text("web\t%s\t#abcdef\n" % str(cdir))
 
         self.saved = (jd.NAMES, jd.PROJECTS, jd.CAPDIR, jd.ARCHDIR, jd.GOALDIR, jd.STATE,
-                      km.NAMES, km._GLOBAL_CLAUDE_MD)
+                      km.NAMES, km._GLOBAL_CLAUDE_MD, km.jd.NAMES, km.jd.PROJECTS)
         jd.NAMES, jd.PROJECTS = names, proj
         jd.CAPDIR, jd.ARCHDIR, jd.GOALDIR = td / "captions", td / "archive", td / "goals"
         jd.STATE = td
         km.NAMES = names
+        # The KERNEL's judge module is a separate object from this module's `jd` (each is its own
+        # SourceFileLoader load), so discover() — which the kernel runs through km.jd — never saw this
+        # fixture's names/ or transcript: the session was invisible and the invariant held hollowly. Reach
+        # the kernel's copy too, so the fixture's transcript is the one the feed builds from (T258).
+        km.jd.NAMES, km.jd.PROJECTS = names, proj
         km._GLOBAL_CLAUDE_MD = td / "no-global-claude.md"
         # Fixed so the stub itself contributes nothing clock-derived (mirrors the chat invariant test).
         self.tmux = {SID: {"state": "idle", "since": NOW - 100, "model": "", "effort": "",
                            "context": None, "compactPct": None, "color": None}}
+        # The invariant is over an UNCHANGING fleet. A session's FIRST build adopts it into the persisted
+        # session order (feed `order` reads that file before _ordered appends the newcomer), so the first
+        # sight is a genuine change; warm once so the two compared builds are both post-adoption (T258).
+        km.jd._discover_cache.clear()
+        km.build_feed(NOW - 1, self.tmux)
 
     def tearDown(self):
         (jd.NAMES, jd.PROJECTS, jd.CAPDIR, jd.ARCHDIR, jd.GOALDIR, jd.STATE,
-         km.NAMES, km._GLOBAL_CLAUDE_MD) = self.saved
+         km.NAMES, km._GLOBAL_CLAUDE_MD, km.jd.NAMES, km.jd.PROJECTS) = self.saved
         self.td.cleanup()
 
     def test_only_the_declared_volatile_fields_move_with_the_clock(self):

@@ -31,7 +31,13 @@ class _World(unittest.TestCase):
         self.td = tempfile.TemporaryDirectory()
         root = Path(self.td.name)
         self.cwd = root / "work"; self.cwd.mkdir()
-        # names registry entry: name \t cwd \t #bg  (written at launch for both backends)
+        # names registry entry: name \t cwd \t #bg  (written at launch for both backends). The kernel binds
+        # NAMES at import while the ONE romp_judge module is re-executed by every later kernel load in the
+        # suite, so km.NAMES and jd.NAMES can name different roots under the full run — align them.
+        self._names_patch = mock.patch.object(km, "NAMES", jd.NAMES); self._names_patch.start()
+        # …and the transcript root: jd.PROJECTS defaults to the REAL ~/.claude/projects when CLAUDE_CONFIG_DIR is
+        # unset, so every project dir this test makes lives under its own temp root (never live state)
+        self._proj_patch = mock.patch.object(jd, "PROJECTS", root / "projects"); self._proj_patch.start()
         jd.NAMES.mkdir(parents=True, exist_ok=True)
         (jd.NAMES / SID).write_text("web\t%s\t#3fa7c9\n" % self.cwd)
         # the real transcript, where discover expects it
@@ -48,6 +54,8 @@ class _World(unittest.TestCase):
         jd._discover_cache.clear(); jd._namefp_memo.clear()
 
     def tearDown(self):
+        self._proj_patch.stop()
+        self._names_patch.stop()
         if hasattr(km, "_UNRESOLVED_LIVE_NOTED"):
             km._UNRESOLVED_LIVE_NOTED.discard(SID)
         for f in (jd.NAMES / SID,):
