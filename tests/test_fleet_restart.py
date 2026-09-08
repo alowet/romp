@@ -219,6 +219,27 @@ class AnAskStaysOnThatPeer(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(self.calls[-1], ("POST", "/restart", {"fleet": False}))
 
+    def test_a_restart_the_peer_refuses_lands_in_the_report_with_its_reason(self):
+        """The peer's /restart can refuse (a 400 naming why, since it stopped taking a malformed body
+        as the broad default), and the sweep's report row is that answer's only reader. It used to
+        drop the text and say just "did not ack": the row keeps the peer's own words, next to what is
+        left to do by hand (review find, 2026-09-08)."""
+        def _peer_call(r, method, path, body=None, timeout=8):
+            self.calls.append((method, path, body))
+            if path == "/tunnels/pull":
+                return 200, {"ok": True, "detail": "pulled 3 commits from hubname"}
+            return 400, {"ok": False, "error": "body could not be read: read 0 of the 16 bytes announced"}
+        km._peer_call = _peer_call
+        km._fleet_restart_run()
+        report = json.loads(km.FLEET_REPORT.read_text())
+        [x] = report["rows"]
+        self.assertEqual((x["host"], x["ok"], x["action"]), ("TESTHOST", True, "ask"),
+                         "the commits DID land; that is not a failed row")
+        self.assertIn("pulled 3 commits", x["detail"])
+        self.assertIn("did not ack the restart", x["detail"])
+        self.assertIn("body could not be read", x["detail"], "the peer's reason, not a bare 'did not ack'")
+        self.assertIn("restart romp on TESTHOST", x["detail"], "and what is left to do")
+
 
 class GlyphSaysTheFleetState(unittest.TestCase):
     """The rail's network glyph carries the whole verdict, so drift/disconnection reads without opening

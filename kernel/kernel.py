@@ -15596,9 +15596,15 @@ def _ask_peer_to_pull(host):
     # made the peer we had just updated fan out: it restarted the hub back (mid-sweep, before the
     # report was written) and cut in-flight turns on machines nobody asked to restart. This step
     # exists so THAT peer runs what it just pulled; the hub walks its own rows (_fleet_restart_run).
-    rst, _rj = _peer_call(r, "POST", "/restart", {"fleet": False}, timeout=10)
+    rst, rj = _peer_call(r, "POST", "/restart", {"fleet": False}, timeout=10)
     if rst != 200:
-        return True, detail + "; it took the commits but did not ack the restart — restart romp on %s" % host
+        # The peer's own words ride along (review find, 2026-09-08): its /restart refuses a body it
+        # cannot take with a JSON error, and a kernel that never answered comes back as {"error"} from
+        # _peer_call. This answer's readers, the sweep's report row and the sync notice, could only
+        # say "did not ack" before, with no why.
+        why = str((rj or {}).get("error") or (rj or {}).get("detail") or ("HTTP %s" % rst))
+        return True, detail + ("; it took the commits but did not ack the restart (%s) — restart romp on %s"
+                               % (why, host))
     return True, detail + "; restarting it"
 
 
@@ -15606,7 +15612,9 @@ def _ask_peer_to_pull(host):
 # Restart used to mean "this machine's kernel", which is a half-truth on a fleet: the remotes kept running
 # their old processes on their old code, and nothing said so. Restart now covers every REACHABLE kernel,
 # syncing on the way where a clean fast-forward can be proven in either direction, and reports per host
-# what it did and what it skipped.
+# what it did and what it skipped. A checked-in peer, which this machine has no ssh route to, is ASKED
+# to fast-forward and restart ITSELF only (_ask_peer_to_pull): machines attached to that peer alone are
+# not restarted by this sweep, they are restarted from the peer's own dashboard (review find, 2026-09-08).
 #
 # What it will NOT do is the whole point of the report. A diverged remote, a dirty tree either side, a
 # relationship this repo cannot even evaluate: those are skipped with the reason named, never guessed at.
@@ -15739,13 +15747,18 @@ def _fleet_restart_run(manager_port=_PORT_FROM_ENV):
     _restart_this_kernel("fleet-restart: the local half of the fleet Restart", manager_port=manager_port)
 
 
-def _restart_scope_from_body(raw_body):
+def _restart_scope_from_body(raw_body, read_error=None):
     """What a POST /restart body asks for → (broad, error). Empty body: the default, every reachable
     kernel — each dashboard's ↻ sends a bodiless POST. Otherwise the body must be a JSON object holding
     at most a boolean `fleet` (false = this kernel only); anything else comes back as `error`, naming
     what was wrong, and the caller restarts NOTHING. The refusal is the point: this used to be a bare
     `except Exception: pass` around `.get("fleet", True)`, so junk, a JSON array, null, a non-boolean
-    value or a typo key ({"fleat": false}) all silently took the BROADEST action with a 200."""
+    value or a typo key ({"fleat": false}) all silently took the BROADEST action with a 200.
+    `read_error` is do_POST's own complaint about the read (a short read, a Content-Length int() cannot
+    parse): a body that was announced but never arrived whole is refused the same way, since letting
+    it pass as "no body" would hand it the broad default (review find, 2026-09-08)."""
+    if read_error:
+        return None, "body could not be read: %s" % read_error
     if not raw_body:
         return True, None
     try:
@@ -15753,16 +15766,21 @@ def _restart_scope_from_body(raw_body):
     except Exception:
         return None, "body is not JSON"
 
-    def clip(v):   # a BOUNDED echo of the offending value: a 1 MB body must not come back as a 1 MB error
-        if isinstance(v, (str, list)):
-            v = v[:80]                                # slice before serializing where the value allows it
-        return json.dumps(v)[:80]
+    def clip(v, n=60):
+        # A BOUNDED echo of the offending key or value: a 1 MB body must not come back as a 1 MB error.
+        # The cut lands INSIDE the quotes and is marked, so a long string still echoes as one complete
+        # quoted thing and the words after it survive; the first cut sliced the serialized text and
+        # took the closing quote with it (review find, 2026-09-08). Keys echo with repr, values as JSON.
+        if isinstance(v, str):          # ensure_ascii off, or the marker itself comes back as \u2026
+            return json.dumps(v[:n] + "…" if len(v) > n else v, ensure_ascii=False)
+        s = json.dumps(v, ensure_ascii=False)
+        return s if len(s) <= n else s[:n] + "…"
     if not isinstance(b, dict):
         return None, "body must be a JSON object, got %s" % clip(b)
     extra = sorted(set(b) - {"fleet"})
     if extra:
         return None, ("unknown key(s) %s — only 'fleet' is understood"
-                      % ", ".join(repr(k[:80]) for k in extra[:8])[:80])
+                      % ", ".join(repr(k[:60] + "…" if len(k) > 60 else k) for k in extra[:8]))
     if "fleet" in b and not isinstance(b["fleet"], bool):
         return None, "'fleet' must be true or false, got %s" % clip(b["fleet"])
     return bool(b.get("fleet", True)), None
@@ -37818,12 +37836,21 @@ class Handler(BaseHTTPRequestHandler):
         # foreign origin — the federated dashboard — and a denial clears the echo).
         self._cors_origin = self.headers.get("Origin") if self._origin_ok() else None
         raw_body = b""
+        # A body that was ANNOUNCED but did not arrive whole is remembered, not folded into "no body"
+        # (review find, 2026-09-08): this read used to swallow a short read, a dead client and an
+        # unparsable Content-Length into an EMPTY raw_body, and on /restart empty means the broad
+        # default, so a client that announced a peer-only body and died before sending it restarted
+        # every reachable kernel. Only /restart refuses on it today; the other routes keep reading
+        # raw_body as they did.
+        _body_err = None
         try:
             n = int(self.headers.get("Content-Length") or 0)   # read the body (keep-alive safety + POST payloads)
             if n:
                 raw_body = self.rfile.read(n)
-        except Exception:
-            pass
+                if len(raw_body) != n:
+                    _body_err = "read %d of the %d bytes Content-Length announced" % (len(raw_body), n)
+        except Exception as e:
+            _body_err = str(e)[:120] or e.__class__.__name__
         try:
             ok, self._set_cookie, why = self._authorize(q)
             self._cors_origin = self.headers.get("Origin") if ok else None   # echoed by _send (CORS delivery)
@@ -37844,7 +37871,7 @@ class Handler(BaseHTTPRequestHandler):
                 # The body is a JSON object with at most a boolean `fleet`, or empty (every ↻ button);
                 # anything else is a 400 that names the problem and restarts NOTHING. A malformed body
                 # must never widen the action — it used to fall through to the broad default.
-                _fleet, _bad = _restart_scope_from_body(raw_body)
+                _fleet, _bad = _restart_scope_from_body(raw_body, _body_err)
                 if _bad:
                     return self._send(400, json.dumps({"ok": False, "error": _bad}), "application/json")
                 # WHO ASKED, on the record (the user 2026-07-31): a restart blinks every dashboard, and

@@ -314,7 +314,10 @@ Your sessions now show up in its interface from whatever network you are on.
 Because the laptop is the end that connects, the always-on machine never holds a
 way in to it; untick the box and it forgets you. Romp calls this checking in,
 and the always-on machine the hub, which is where `romp checkin` and
-`romp checkout` get their names.
+`romp checkout` get their names. Restarting Romp from the hub's interface
+restarts the machines linked to it as well, and a checked-in machine is asked to
+restart itself only: anything attached to that machine alone is restarted from
+its own interface.
 
 #### Hand the connection to a different machine
 
