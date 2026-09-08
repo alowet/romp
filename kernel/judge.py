@@ -422,7 +422,12 @@ JUDGE_FAIL_CAP = 3                       # the same rule for every other retryin
 #                                          consolidator / courier; the
 #                                          planner (PLAN_PARSE_RETRIES) and distiller/briefer (DISTILL_FAIL_CAP)
 #                                          already had their own.
-PLACEMENTS_V = 11                        # placements-identity schema version (plan P2, the user 2026-07-06).
+PLACEMENTS_V = 12                        # placements-identity schema version (plan P2, the user 2026-07-06).
+#                                          v12 (2026-09-08, T252d): an ABSORBED atom (a mid-turn send the CLI
+#                                          spliced in) is placed at its LANDING time, not its send time, so
+#                                          every absorbed segment whose landing differs from its send changes
+#                                          its id's t. Same seal: dormant sessions must not replay the moved
+#                                          atoms as new goals.
 #                                          v2 (2026-07-09): a 07-07/07-08 change to segment-text derivation
 #                                          stepped the text hash without this bump — dormant segments' old-hash
 #                                          placements stopped matching, and every restart/touch replayed them as
@@ -2530,7 +2535,8 @@ def tasks_for(fsid, leaf, files, now):
     cf = PCACHE / (fsid + ".json")
     try:
         o = json.loads(cf.read_text())
-        if o.get("key") == key and o.get("v") == 5:    # v5 = absorbed SDK-injection atoms carry real text (2026-07-06); older caches regenerate
+        if o.get("key") == key and o.get("v") == 6:    # v6 = absorbed atoms placed at their landing time, so their seg ids moved (T252d, 2026-09-08);
+            #                                             v5 = absorbed SDK-injection atoms carry real text (2026-07-06); older caches regenerate
             return o["tasks"]
     except Exception:
         pass
@@ -2549,7 +2555,7 @@ def tasks_for(fsid, leaf, files, now):
     try:
         PCACHE.mkdir(parents=True, exist_ok=True)
         tmp = cf.with_suffix(".tmp.%d" % os.getpid())
-        tmp.write_text(json.dumps({"key": key, "v": 5, "tasks": tasks}))
+        tmp.write_text(json.dumps({"key": key, "v": 6, "tasks": tasks}))
         tmp.rename(cf)
     except Exception:
         pass
@@ -5442,47 +5448,32 @@ def _strip_top_mints(ops):
     return out
 
 
-def _seg_spliced(seg):
-    """True when this segment's TRIGGER is an ABSORBED atom — a prompt the CLI spliced into a
-    RUNNING turn (a queued_command attachment; em._absorbed_atom marks the synthesized atom
-    `absorbed`). The atoms after such a trigger are the interrupted turn's CONTINUING work: by
-    wall-clock they follow the enqueue, but they answer the turn's ORIGINAL ask — deterministically
-    indistinguishable from a reply to the splice. So work in this segment is never proof that the
-    spliced ask, or any listed goal, was answered (see _strip_unevidenced_dones)."""
-    trig = (seg or {}).get("trigger")
-    if not trig:
-        return False
-    return any(a.get("uuid") == trig and a.get("absorbed") for a in seg.get("atoms") or [])
-
-
 def _strip_unevidenced_dones(ops, seg, fsid, seg_id):
-    """Drop planner DONE ops a segment cannot EVIDENCE — two shapes of one rule (a done needs the
-    reply's own post-ask work as proof):
-      - SPLICED trigger (_seg_spliced): a capable planner, handed 'USER ASKED: …' plus the
-        interrupted turn's unrelated tail work, answers the question from its OWN knowledge and
-        files done with a confabulated summary — a queued question completed as a card 30 seconds
-        after it was typed, before the assistant's first post-splice token, off a turn that then
-        crashed without ever replying (the user 2026-07-29).
-      - WORKLESS segment (no assistant work at all): the workless FOLLOW-UP unit (the user
-        2026-08-08, the beacon g10 card) judges the user's reply so the msg-reopen latch gets its
-        verdict — the reply is real evidence of the user's INTENT (pivot / continuation / block),
-        never of completion. Same failure family as the API-error confabulation (the user
-        2026-07-25), whose mint-only prompt-run op filter already enforces this for plain asks.
-    Mint/sub/block still apply — placing the ask and filing the work are right — and the goal stays
-    OPEN, which is the truth; the turn-level closer keeps done authority once the turn actually
-    ends. Logged (judge-errors, kinds 'spliced-done' / 'workless-done'), never silent."""
+    """Drop planner DONE ops a segment cannot EVIDENCE (a done needs the reply's own post-ask work as
+    proof): a WORKLESS segment (no assistant work at all). The workless FOLLOW-UP unit (the user
+    2026-08-08, the beacon g10 card) judges the user's reply so the msg-reopen latch gets its verdict —
+    the reply is real evidence of the user's INTENT (pivot / continuation / block), never of
+    completion. Same failure family as the API-error confabulation (the user 2026-07-25), whose
+    mint-only prompt-run op filter already enforces this for plain asks.
+
+    Until T252d (2026-09-08) a second leg refused dones off a SPLICED trigger — an absorbed mid-turn
+    send sat at its SEND time, so its segment held the interrupted turn's continuing work, never
+    provably a reply (the user 2026-07-29: a queued question completed as a card 30 seconds after it
+    was typed, off a turn that crashed without ever replying). The absorbed atom now sits where the
+    model READ it, so the atoms after it ARE its reply, like any ask's; and the 2026-07-29 shape — the
+    turn dying before its first post-splice token — is exactly a workless segment, which this leg
+    still refuses. Mint/sub/block still apply — placing the ask and filing the work are right — and
+    the goal stays OPEN, which is the truth; the turn-level closer keeps done authority once the
+    turn actually ends. Logged (judge-errors, kind 'workless-done'), never silent."""
     if not ops:
         return ops
-    spliced = _seg_spliced(seg)
-    workless = not _has_asst_work((seg or {}).get("atoms") or [])
-    if not (spliced or workless):
+    if _has_asst_work((seg or {}).get("atoms") or []):
         return ops
     kept = [o for o in ops if o.get("do") != "done"]
     if len(kept) != len(ops):
-        kind, shape = (("spliced-done", "spliced-trigger") if spliced else ("workless-done", "workless"))
-        _log_judge_error("planner", fsid, kind, seg=seg_id,
-                         note="dropped %d done op(s): a %s segment cannot evidence an answer"
-                              % (len(ops) - len(kept), shape))
+        _log_judge_error("planner", fsid, "workless-done", seg=seg_id,
+                         note="dropped %d done op(s): a workless segment cannot evidence an answer"
+                              % (len(ops) - len(kept)))
     return kept
 
 
@@ -9034,9 +9025,9 @@ def _plan_session(fsid, path, now):
             hist = _goal_work_text(store, seg_by_id, target, GOAL_HISTORY_CHARS)
             ops = _parse_plan(plan_llm(text, _menu_text(store, sub), human=False,
                                        goal_history=hist, goal_num=1), len(sub)) or []
-            ops = _strip_unevidenced_dones(ops, seg_by_id.get(seg_id), fsid, seg_id)   # a peer message spliced
-            #                                           mid-turn can't evidence an answer any more than a
-            #                                           spliced human ask can — the fallback sub still files
+            ops = _strip_unevidenced_dones(ops, seg_by_id.get(seg_id), fsid, seg_id)   # a peer message whose
+            #                                           segment holds no assistant work can't evidence an
+            #                                           answer — the fallback sub still files
             # Full expressivity, ROOTED under G: a delegation gets the same sub/done/block a human-minted top
             # does (over G's subtree), and a top-level MINT is re-rooted as a sub under G (#1) so a handoff is
             # never a competing top. Skips drop; an empty/skip-only reply falls back to one sub under G.
@@ -9124,9 +9115,9 @@ def _plan_session(fsid, path, now):
                 ops = [{"do": "sub", "under": 1, "text": o.get("text"), "why": o.get("why")}
                        if o["do"] == "mint" else o for o in ops if o["do"] != "skip"]
                 ops = _restrict_retitle(ops, 1)          # goal_num=1 above → retitle is only valid on #1
-                ops = _strip_unevidenced_dones(ops, _tseg, fsid, seg_id)   # a nudge spliced mid-turn reads the
-                #                                           interrupted turn's work as its reply — resolve
-                #                                           nothing; the goal stays open and re-nudgeable
+                ops = _strip_unevidenced_dones(ops, _tseg, fsid, seg_id)   # a nudge no work followed can't be
+                #                                           resolved off nothing — the goal stays open
+                #                                           and re-nudgeable
                 if apply_plan_guarded(fsid, path, store, seg_id, seg_t, ops, sub,
                                       place_key=_pkey, prompt_uuid=trig, quote=vq):
                     placed += 1
@@ -9161,8 +9152,8 @@ def _plan_session(fsid, path, now):
                                            goal_history=hist, goal_num=gi, followup=True,
                                            lifted_blocks=[(i, a) for i, (_n, a) in sorted(lifted_by_num.items())] or None),
                                   len(menu)) or []
-                ops = _strip_unevidenced_dones(ops, seg_by_id.get(seg_id), fsid, seg_id)   # a card reply spliced
-                #                                           mid-turn: strip BEFORE the pivot apply and before
+                ops = _strip_unevidenced_dones(ops, seg_by_id.get(seg_id), fsid, seg_id)   # a card reply no work
+                #                                           followed: strip BEFORE the pivot apply and before
                 #                                           the continuation lifts `res`, so a confabulated
                 #                                           done never re-completes the reopened target
                 if any(o["do"] == "mint" for o in ops):
