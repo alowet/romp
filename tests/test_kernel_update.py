@@ -382,6 +382,9 @@ class RunUpdate(Fresh):
                       "experience — the quiet window cost minutes per push; explicit "
                       "`romp refresh --quiet` still drains)")
         self.assertNotIn("when=quiet", ok_branch, "no drain default on the deploy path")
+        self.assertIn("if curl -fsS -X POST 'http://127.0.0.1:", ok_branch,
+                      "-f: a non-2xx answer from whatever holds the manager port is not a restart — the "
+                      "report's `restarted` is read from curl's exit, never assumed")
         self.assertIn('"action": "self-update"', ok_branch,
                       "the script stamps restart-audit.jsonl at curl time, so the dying kernel's "
                       "restart-cuts row joins to a named reason instead of reading anonymous")
@@ -494,12 +497,56 @@ class ReportConsumption(Fresh):
         self.assertFalse(rep["ok"])
         self.assertFalse(p.exists())
         self.assertFalse((jd.STATE / "update-report-last.json").exists(), "not an outcome — not archived as one")
-        self.assertEqual((jd.STATE / "update-report.json.bad").read_text(), "[]", "set aside as evidence, never deleted")
+        aside = sorted(jd.STATE.glob("update-report.json.corrupt-*"))
+        self.assertEqual(len(aside), 1, aside)
+        self.assertEqual(aside[0].read_text(), "[]", "set aside as evidence, never deleted")
         ns = self.notices()
         self.assertEqual(len(ns), 1)
         self.assertFalse(ns[0]["ok"])
-        self.assertIn("update-report.json.bad", ns[0]["text"])
+        self.assertEqual(ns[0].get("kind"), "refused", "a state file moved aside rings the refused bell, like every quarantine")
+        self.assertIn(aside[0].name, ns[0]["text"])
         self.assertIsNone(km._consume_update_report(), "the next boot finds nothing to file")
+
+    def test_a_second_unreadable_report_in_the_same_second_keeps_the_first(self):
+        # the sidecar wears the quarantine convention (`.corrupt-<stamp>`, `-n` for a same-second
+        # repeat): a plain `.bad` was one fixed name, so a second junk report overwrote the first's bytes
+        p = jd.STATE / "update-report.json"
+        real = km.time.strftime
+        fixed = lambda fmt, *a: "20260101T000000Z" if fmt == "%Y%m%dT%H%M%SZ" else real(fmt, *a)
+        with mock.patch.object(km.time, "strftime", side_effect=fixed):
+            for junk in ("[]", "null"):
+                p.write_text(junk)
+                self.assertFalse(km._consume_update_report()["ok"])
+        kept = {x.name: x.read_text() for x in jd.STATE.glob("update-report.json.corrupt-*")}
+        self.assertEqual(kept, {"update-report.json.corrupt-20260101T000000Z": "[]",
+                                "update-report.json.corrupt-20260101T000000Z-1": "null"})
+
+    def test_a_boot_that_already_runs_the_landed_tag_does_not_ask_for_another_restart(self):
+        # the report says "on disk, not restarted"; when nobody polled before the user restarted by
+        # hand, the boot that RUNS the tag is the one consuming it — its notice says this start runs
+        # it, instead of asking for the restart that just happened
+        rep = {"ok": True, "tag": "v0.0.9", "restarted": False, "why": "no manager is running this kernel"}
+        (jd.STATE / "update-report.json").write_text(json.dumps(rep))
+        with mock.patch.object(km, "_kernel_ver", return_value="v0.0.9"):
+            km._consume_update_report()
+        ns = self.notices()
+        self.assertEqual(len(ns), 1)
+        self.assertTrue(ns[0]["ok"])
+        self.assertIn("this start is running it", ns[0]["text"])
+        self.assertIn("no manager is running this kernel", ns[0]["text"])
+        self.assertNotIn("restart romp yourself", ns[0]["text"])
+        # a kernel on any other version (or one whose version reader has nothing) still asks; and
+        # the still-running kernel's poll (running_only) never claims to run it, whatever it reports
+        for ver, running_only in (("v0.0.8", False), (None, False), ("v0.0.9", True)):
+            with km._SYNC_LOCK:
+                del km._SYNC_NOTICES[:]
+            (jd.STATE / "update-report.json").write_text(json.dumps(rep))
+            with mock.patch.object(km, "_kernel_ver", return_value=ver):
+                km._consume_update_report(running_only=running_only)
+            ns = self.notices()
+            self.assertEqual(len(ns), 1, (ver, running_only))
+            self.assertIn("restart romp yourself", ns[0]["text"], (ver, running_only))
+            self.assertNotIn("this start is running it", ns[0]["text"], (ver, running_only))
 
 
 class Routes(Fresh):
@@ -611,7 +658,7 @@ class Routes(Fresh):
     def test_a_report_that_is_not_an_object_is_set_aside_and_the_poll_still_answers(self):
         # null / [] / a number parse but carry nothing: `.get` on them 500'd every poll for the
         # kernel's life (never consumed, so every poll hit the same file again)
-        p, bad = jd.STATE / "update-report.json", jd.STATE / "update-report.json.bad"
+        p = jd.STATE / "update-report.json"
         for junk in ("null", "[]", "3"):
             km._UPDATE_STATE[0] = "running"
             with km._SYNC_LOCK:
@@ -621,10 +668,12 @@ class Routes(Fresh):
             self.assertEqual(status, 200, junk)
             d = json.loads(body)
             self.assertEqual(d["state"], "", "nothing is in flight — the child wrote SOMETHING")
-            self.assertIn("update-report.json.bad", d["failed"])
+            self.assertIn("update-report.json.corrupt-", d["failed"])
             self.assertFalse(p.exists())
-            self.assertEqual(bad.read_text(), junk, "evidence kept, never deleted")
-            bad.unlink()
+            aside = list(jd.STATE.glob("update-report.json.corrupt-*"))
+            self.assertEqual(len(aside), 1, aside)
+            self.assertEqual(aside[0].read_text(), junk, "evidence kept, never deleted")
+            aside[0].unlink()
             ns = self.notices()
             self.assertEqual((len(ns), ns[0]["ok"]), (1, False))
             status, body = _serve_get("/update-check", headers={"X-Romp-Token": km.TOKEN})
@@ -776,6 +825,8 @@ class ReleaseChannelMigration(unittest.TestCase):
                              "HEAD landed exactly on the tag — back on the release channel")
             rep = json.loads((km.jd.STATE / "update-report.json").read_text())
             self.assertTrue(rep.get("ok"), rep)
+            self.assertEqual((rep.get("restarted"), rep.get("why")), (False, "no manager is running this kernel"),
+                             "the no-manager leg says what did not happen, and why")
             log = (km.jd.STATE / "update.log").read_text()
             self.assertIn("return to the release channel", log,
                           "the move is LOUD in the update log, never a silent history jump")

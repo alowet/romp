@@ -4649,15 +4649,24 @@ def _consume_update_report(running_only=False):
         # 500'd every /update-check poll and crashed the boot that found it. The child wrote
         # SOMETHING, so nothing is in flight any more: set the file aside as evidence (never
         # deleted), say so once, and answer like any other ended update.
+        # The sidecar wears the quarantine convention the goal store, the ledgers and the state
+        # readers wear (`.corrupt-<utc stamp>`, `-n` for a second one in the same second), so a
+        # second unreadable report never overwrites the first's bytes -- a plain `.bad` did. Its
+        # notice rings the bell's `refused` kind, the class every moved-aside state file rings.
         try:
-            p.rename(p.with_name(p.name + ".bad"))
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            aside, n = p.with_name("%s.corrupt-%s" % (p.name, stamp)), 0
+            while aside.exists():
+                n += 1
+                aside = p.with_name("%s.corrupt-%s-%d" % (p.name, stamp, n))
+            os.replace(p, aside)
         except OSError:
             return None
         if running_only:
             _UPDATE_STATE[0] = ""
-        why = ("the updater's report could not be read — it is kept as update-report.json.bad under "
-               "~/.local/state/romp, next to update.log, which says what actually happened")
-        _sync_notice("romp's self-update ended without a readable outcome: %s" % why, ok=False)
+        why = ("the updater's report could not be read — it is kept as %s under ~/.local/state/romp, next "
+               "to update.log, which says what actually happened" % aside.name)
+        _sync_notice("romp's self-update ended without a readable outcome: %s" % why, ok=False, kind="refused")
         return {"ok": False, "tag": "", "why": why}
     try:
         p.rename(jd.STATE / "update-report-last.json")   # consumed — never re-filed on later boots
@@ -4670,10 +4679,21 @@ def _consume_update_report(running_only=False):
         _sync_notice("romp updated itself to %s and restarted into it" % tag)
     elif rep.get("ok"):
         # landed on disk, not running: the script says why (no manager, or a manager that did not
-        # take the restart request). Only a restart the user runs gets the new code running.
-        _sync_notice("romp updated itself to %s on disk, but %s — restart romp yourself (`romp refresh`, "
-                     "or `romp on` if no manager answers) to run it"
-                     % (tag, rep.get("why") or "it was not restarted"))
+        # take the restart request). Only a restart the user runs gets the new code running -- and
+        # when this consume is the BOOT's (nothing polled before the user restarted by hand), that
+        # restart has already happened: a kernel whose own version IS the tag says this start runs
+        # it, instead of asking for one more restart.
+        why = rep.get("why") or "it was not restarted"
+        try:
+            runs_it = (not running_only) and _kernel_ver() == tag
+        except Exception:
+            runs_it = False
+        if runs_it:
+            _sync_notice("romp updated itself to %s on disk and this start is running it (%s, so the restart "
+                         "that brought it up was yours)" % (tag, why))
+        else:
+            _sync_notice("romp updated itself to %s on disk, but %s — restart romp yourself (`romp refresh`, "
+                         "or `romp on` if no manager answers) to run it" % (tag, why))
     else:
         _sync_notice("romp could not update itself to %s: %s — nothing was restarted; update.log under "
                      "~/.local/state/romp has the full output" % (tag, rep.get("why") or "the update failed"),
