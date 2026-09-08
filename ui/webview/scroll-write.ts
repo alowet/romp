@@ -35,6 +35,24 @@ export function classifyScroll(scrollTop: number, lastWriteAfter: number | null)
   return lastWriteAfter != null && Math.abs(scrollTop - lastWriteAfter) <= 1 ? "write-echo" : "gesture";
 }
 
+/** The breadcrumb for one height change of the transcript's TAIL outside the append path (T262f, the user
+ *  2026-09-08): the active view's element or the live-ask host grew or shrank, by `dh` px, with `last` naming the
+ *  tail element (its class list, or "live-ask"). Chrome moves a bottom reader down itself when the tail grows and
+ *  clamps them back when it shrinks — both unwritten, so the scroll rows alone cannot say WHICH element flapped;
+ *  this row, filed beside them, names it. `stick` = the view's recorded follow mode at the change. */
+export function tailChangeRow(sid: string, dh: number, last: string, stick: boolean, sh = 0, ch = 0) {
+  return { sid, dh, last: String(last || "").slice(0, 60), stick, sh, ch };
+}
+
+/** The class list of the tail element of a view: its last child that is not a virtualization spacer. */
+export function tailLabel(children: ArrayLike<{ className?: string }>): string {
+  for (let i = children.length - 1; i >= 0; i--) {
+    const c = String(children[i]?.className || "");
+    if (c.indexOf("tx-spacer") < 0) return c;
+  }
+  return "";
+}
+
 /** The breadcrumb for one write that moved the view. `sh`/`ch` = #content's scrollHeight/clientHeight after the
  *  write (T262e, the user 2026-09-08: their laptop's rows showed the view moving UP by the same 95 px on two
  *  sessions with no write between the rows — an UNWRITTEN move, which the rows could not classify: a browser
