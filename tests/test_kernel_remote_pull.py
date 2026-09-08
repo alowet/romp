@@ -68,13 +68,13 @@ class PullRemote(unittest.TestCase):
         km._HEAD_CACHE.clear(); km._HEAD_CACHE.update(self._hc)
         km._remotes.clear()
 
-    def _wire(self, dirty="", rhead=REMOTE, ancestor_rc=0, merge_rc=0, count="3"):
+    def _wire(self, dirty="", rhead=REMOTE, ancestor_rc=0, merge_rc=0, count="3", status_rc=0):
         calls = []
 
         def fake(argv, **kw):
             calls.append(argv)
             if argv[0] == "git" and "status" in argv:
-                return _R(out=dirty)
+                return _R(out=dirty, rc=status_rc, err="fatal: not a git repository" if status_rc else "")
             if argv[0] == "git" and "fetch" in argv:
                 return _R()
             if argv[0] == "git" and "merge-base" in argv:
@@ -116,6 +116,17 @@ class PullRemote(unittest.TestCase):
         ok, detail = km._pull_remote("TESTHOST")
         self.assertFalse(ok)
         self.assertIn("uncommitted", detail)
+
+    def test_a_failed_status_is_unknown_never_clean(self):
+        # rc 128 with nothing on stdout read as a CLEAN tree before: the fetch and the fast-forward
+        # then ran over a tree whose state nobody had read. Unknown refuses, and names the failure.
+        calls = self._wire(status_rc=128)
+        ok, detail = km._pull_remote("TESTHOST")
+        self.assertFalse(ok)
+        self.assertIn("tree state failed", detail)
+        self.assertIn("not a git repository", detail, "the refusal carries git's own words")
+        self.assertFalse(any(a[0] == "git" and ("fetch" in a or "merge" in a) for a in calls),
+                         "nothing fetched or moved past the refusal")
 
     def test_a_clean_fast_forward_pulls_and_says_what_to_do_next(self):
         calls = self._wire()

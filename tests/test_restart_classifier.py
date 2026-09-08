@@ -321,13 +321,28 @@ class PreDeathRebuild(unittest.TestCase):
         from unittest.mock import patch
         km._rebuild_dist = lambda: (self.order.append("rebuild"), (rebuild_ok, "boom"))[1]
 
-        def fake_urlopen(req, timeout=0):
-            self.order.append("post")
-            class R:
-                def read(self):
-                    return b""
-            return R()
-        with patch("urllib.request.urlopen", fake_urlopen):
+        order = self.order
+
+        class FakeConn:
+            # the restart POST dials http.client the way _restart_this_kernel does — never urllib,
+            # whose default opener honours HTTP_PROXY and diverted the loopback POST under a proxy
+            def __init__(self, host, port, timeout=0):
+                pass
+
+            def request(self, method, path, *a, **k):
+                order.append("post")
+
+            def getresponse(self):
+                class R:
+                    status = 200
+
+                    def read(self):
+                        return b""
+                return R()
+
+            def close(self):
+                pass
+        with patch.object(km.http.client, "HTTPConnection", FakeConn):
             km._run_main_update("restart", immediate=True, manager_port="1")
 
     def test_the_rebuild_lands_before_the_restart_post(self):
