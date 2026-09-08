@@ -868,6 +868,8 @@ class TimelinePanel {
     this._lockNow = false;
     this._compactClicked = {};   // sid → click ts: show the compacting cue OPTIMISTICALLY until the real state catches up
     this._pendingFlags = {};     // sid → {flag: value}: an optimistic eye-toggle held STICKY across pushes until the kernel's data confirms it (no flicker-back)
+    this._laneRefusal = null;    // {sid, flag, text}: the kernel's refusal of the last lane-gear toggle, shown in the gear until dismissed or retried
+    this._laneMenuBuild = null;  // the last-opened lane gear's rebuild-in-place, so a refusal arriving while it is open repaints it (like _viewsDialogBuild; every use is gated on _laneMenu being open)
     this._dismissed = new Set(); // sids cleared via the dead-lane Clear pill, held STICKY the same way (see _reconcileDismissed)
     this._views = null;          // the kernel-echoed views blob (data.views); null until the first push
     this._pendingViews = null;   // an optimistic edit held sticky until a push echoes it (see _reconcileViews)
@@ -2958,6 +2960,38 @@ class TimelinePanel {
     this.draw();
   }
 
+  // the kernel's refusal of a gesture this page posted (the store it edits could not be read), answered on
+  // THIS page's socket and naming the gesture. A lane-gear flag (gesture 'flag', sid + flag): end the
+  // optimistic state ON THIS EVENT — the flag's sticky latch drops and the lane repaints to the value the
+  // kernel still paints (the frame carries it: what the next push shows; not a value recorded at the click,
+  // which a second click before the first refusal made wrong) — and the reason shows in the gear (rebuilt in
+  // place if it is open, on its next open otherwise) until dismissed or until the toggle is tried again.
+  // Filed in the shell's bell under its own `refused` kind, so it is findable after the fact and muting judge
+  // warnings never mutes it. Before this the kernel sent a `warn`, which this page never rendered, so the
+  // gear kept showing the refused state until a reload. The feed's bell and the chat's tab menu handle the
+  // same frame for their gestures.
+  settingRefused(m) {
+    const sid = String((m && m.sid) || ''), flag = String((m && m.flag) || '');
+    const text = String((m && m.text) || "couldn't save that setting");
+    if (m && m.gesture === 'flag' && sid && flag) {
+      const pend = this._pendingFlags[sid];
+      if (pend) { delete pend[flag]; if (!Object.keys(pend).length) delete this._pendingFlags[sid]; }
+      if (typeof m.value === 'boolean') {
+        // both copies a click may have written: the current frame's session, and the one the open gear built from
+        const targets = [((this.data && this.data.sessions) || []).find((x) => x.id === sid),
+                         this._laneMenu && this._laneMenu._sid === sid ? this._laneMenu._session : null];
+        for (const s of targets) if (s) s[flag] = m.value;
+      }
+      this._laneRefusal = { sid, flag, text };
+      if (this._laneMenu && this._laneMenu._sid === sid && this._laneMenuBuild) this._laneMenuBuild();
+    }
+    try {
+      if (typeof window !== 'undefined' && window.parent && window.parent !== window)
+        window.parent.postMessage({ romp: 'notify', kind: 'refused', text, sid }, '*');
+    } catch (e) { /* no parent frame (Obsidian, headless) */ }
+    this.draw();
+  }
+
   // ── the NAME-KEYED tag editor (user ruling 2026-08-24), shared by the dialog and the lane gear ──
   // One union group = one tag identity. Edits stay routed under the hood: an ADD lands on the LOCAL
   // store when the name exists locally, else the tag's single home; a REMOVE removes the
@@ -3789,6 +3823,7 @@ class TimelinePanel {
     menu.setAttribute('style', 'position:fixed;z-index:1001;width:280px;' + MENU_STYLE);
     menu.dataset.rompMenu = '1';   // the echo writers skip in-menu presses (T213)
     menu._sid = s.id;
+    menu._session = s;             // the copy build() reads; a refusal restores it alongside the frame's
     menu.addEventListener('click', (e) => e.stopPropagation());   // inside clicks must not reach the doc closer
     const build = () => {
       menu.textContent = '';
@@ -3811,6 +3846,7 @@ class TimelinePanel {
         row.addEventListener('click', (e) => {
           e.stopPropagation();
           const next = t.value(!on);                 // the flag value that flips this toggle
+          if (this._laneRefusal && this._laneRefusal.sid === s.id && this._laneRefusal.flag === t.flag) this._laneRefusal = null;   // a retry retires the last refusal
           s[t.flag] = next;                          // optimistic …
           (this._pendingFlags[s.id] = this._pendingFlags[s.id] || {})[t.flag] = next;   // … sticky until the kernel confirms
           this._setSessionFlag(s, t.flag, next);
@@ -3818,6 +3854,17 @@ class TimelinePanel {
           this.draw();
           build();                                   // repaint states in place; the panel stays open
         });
+      }
+      // the kernel's refusal of this lane's last toggle (settingRefused): the same dismissible row the
+      // views dialog wears for a refused tag edit, here because the gear is where the click was made
+      if (this._laneRefusal && this._laneRefusal.sid === s.id) {
+        const er = menu.createDiv();
+        er.setAttribute('style', 'display:flex;align-items:center;gap:6px;margin:4px 8px;padding:4px 8px;'
+          + 'border:1px solid #F85B5A;border-radius:5px;color:#F85B5A;font-size:0.82em;line-height:1.3;');
+        er.createSpan({ text: '⚠ ' + this._laneRefusal.text });
+        const ex = er.createSpan({ text: '✕' });
+        ex.setAttribute('style', 'margin-left:auto;cursor:pointer;opacity:0.7;flex:0 0 auto;');
+        ex.addEventListener('click', (e) => { e.stopPropagation(); this._laneRefusal = null; build(); });
       }
       // ── Tags (the user 2026-08-24: taggable from the gear too, not only the filter dialog) ──
       // The SAME name-keyed editor the dialog rows carry — the shared builders, never a fork:
@@ -3847,6 +3894,7 @@ class TimelinePanel {
       }
     };
     build();
+    this._laneMenuBuild = build;    // a settingRefused arriving while the gear is open repaints it in place
     const h = this._menuHost(anchorEl.getBoundingClientRect());
     h.doc.body.appendChild(menu);   // a cross-document append ADOPTS the node; its listeners are kept
     const left = Math.min(Math.round(h.rect.left), (h.win.innerWidth || 9999) - 300);   // clamp on-screen
@@ -3893,22 +3941,35 @@ class TimelinePanel {
   }
 
   // Persist a per-session flag. Web dashboard: the host WS hook (→ kernel setSessionFlag → rebuild feed).
-  // Obsidian/headless fallback: write the same session-flags.json the kernel's build_feed reads.
+  // Obsidian desktop fallback: write the same session-flags.json the kernel's build_feed reads, with the
+  // discipline the kernel's own writer has (review find, 2026-09-08). Before this it was the exact shape
+  // the kernel dropped: any read fault or torn bytes became {} and was written over EVERY session's flags
+  // (postal isolation included), and the write truncated the live file in place, so the kernel's strict
+  // reader could observe 0 bytes mid-write and quarantine the very file being written. Now it mirrors
+  // _persistOrder / _setViews: Electron-or-nothing (a bare-node test run must never touch the real file),
+  // the kernel's state root, a refusal on any read fault or non-object parse (only a MISSING file reads as
+  // empty; the kernel quarantines torn bytes on its own next read), and an atomic tmp + rename publish.
   _setSessionFlag(s, flag, value) {
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetFlag === 'function') {
         window.__rompTimelineSetFlag(s.id, flag, value); return;
       }
+      if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
       const fs = require('fs'), os = require('os'), path = require('path');
-      const dir = path.join(os.homedir(), '.local', 'state', 'romp');
+      const dir = process.env.ROMP_STATE_DIR
+        || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'romp');
       const fp = path.join(dir, 'session-flags.json');
       let cur = {};
-      try { cur = JSON.parse(fs.readFileSync(fp, 'utf8')) || {}; } catch (e) {}
+      try { cur = JSON.parse(fs.readFileSync(fp, 'utf8')); }
+      catch (e) { if (!e || e.code !== 'ENOENT') return; }   // unreadable or torn: never write over a store we could not read
+      if (!cur || typeof cur !== 'object' || Array.isArray(cur)) return;   // valid JSON of the wrong shape: not ours to overwrite
       const f = (cur[s.id] && typeof cur[s.id] === 'object') ? cur[s.id] : {};
       if (value) f[flag] = true; else delete f[flag];
       if (Object.keys(f).length) cur[s.id] = f; else delete cur[s.id];
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(fp, JSON.stringify(cur));
+      const tmp = fp + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(cur));
+      fs.renameSync(tmp, fp);
     } catch (e) { /* no host hook + no Node fs → can't persist */ }
   }
 

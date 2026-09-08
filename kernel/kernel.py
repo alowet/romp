@@ -2528,19 +2528,298 @@ def _alive_sessions(now, tmux):
     return _sessions(now)
 
 
+class _StateUnreadable(Exception):
+    """A small JSON state file EXISTS but could not be read -- a transient EIO, an EACCES, torn bytes
+    that could not be moved aside -- as opposed to a missing file. Raised by _read_state_json so a
+    read-modify-write writer REFUSES the write rather than folding the fault to an empty store and
+    publishing that emptiness back over the user's real state under a success ack (one such fold
+    erased a whole tag set, every session flag, the saved lane order, or every bell override,
+    silently). Callers on the MUTATION path let it propagate to a loud refusal; DISPLAY readers
+    serve their last-known-good cache if they hold one, else the empty default, UNPROVED and
+    uncached, so no writer persists it.
+
+    A plain Exception, deliberately NOT an OSError: the WS receive loop re-raises
+    `(BrokenPipeError, ConnectionResetError, OSError)` as a genuine socket failure and tears the
+    connection down, while any other exception falls to its logging arm and the next message still
+    processes. Were this an OSError, one handler branch that forgot to catch it would drop the
+    dashboard's socket on a read fault; as an Exception the same escape costs one logged line.
+    `path` is the file, `fault` the errno-and-strerror text (never the per-second quarantine stamp,
+    never a second path), so the once-per-fault-text registries dedupe a disk that stays broken."""
+
+    def __init__(self, path, fault):
+        self.path = Path(path)
+        self.fault = str(fault)
+        super().__init__("%s could not be read (%s)" % (self.path.name, self.fault))
+
+
+class _StateUnwritable(Exception):
+    """A small JSON state file could not be WRITTEN -- ENOSPC, EROFS, EACCES out of the publish itself,
+    after the store read proved. The sibling of _StateUnreadable for the gesture's other step (the
+    maintainer's fold on PR #1019: a user gesture's WRITE step is a fault boundary too). Raised by
+    _write_state_json in place of the OSError, which the WS receive loop re-raised as a socket failure
+    and turned into a DROPPED client (`finally: client["alive"] = False`): the dashboard disconnected
+    without a word, and the HTTP routes answered a 500 traceback where their callers read only their
+    own ok:false shape. As a plain Exception the same escape costs one logged line, and the gesture
+    arms catch it beside _StateUnreadable and answer the socket. `path` and `fault` as its sibling's:
+    errno + strerror only, never the temp path (which carries a per-call sequence), so the per-path
+    fault registry dedupes a disk that stays full."""
+
+    def __init__(self, path, fault):
+        self.path = Path(path)
+        self.fault = str(fault)
+        super().__init__("%s could not be written (%s)" % (self.path.name, self.fault))
+
+
+def _errno_text(e):
+    """errno + strerror ONLY: str(e) names the path(s), and a quarantine destination carries a
+    per-second stamp, so a text built from it changed every second and every once-per-fault-text
+    dedupe fired once a second (the ledgers' lesson)."""
+    return ("[Errno %d] %s" % (e.errno, e.strerror)) if getattr(e, "errno", None) is not None else type(e).__name__
+
+
+_STATE_REPLACED = "replaced meanwhile; the new bytes get their own read"   # _state_quarantine's decline when the
+#                                        file is no longer the one whose bytes failed: the reader re-reads (bounded)
+
+
+def _state_quarantine(p, st, reason):
+    """Move an unparseable state file ASIDE (never delete it) so the evidence survives the fresh
+    start that follows: the sidecar keeps the original name plus `.corrupt-<utc stamp>` (a `-n`
+    suffix for a second in the same second) -- the shape the goal-store and ledger quarantines wear,
+    so one convention reads across all three. Only while the file is still the one whose bytes
+    failed (same inode, mtime and size as `st`, the stat taken before the read): an atomic publish
+    that landed before the re-check already replaced them, and the new file gets its own read
+    (_STATE_REPLACED: _read_state_json re-reads, bounded -- the maintainer's fold on PR #1019; the
+    window left is between the re-check and the os.replace). Returns None once the bytes are out of
+    the way (moved, or already gone: a sibling reader moved them), with one stderr line for the move;
+    else the reason they are NOT, for the caller's fault text."""
+    try:
+        cur = p.stat()
+        if (cur.st_ino, cur.st_mtime_ns, cur.st_size) != (st.st_ino, st.st_mtime_ns, st.st_size):
+            return _STATE_REPLACED
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        aside, n = p.with_name("%s.corrupt-%s" % (p.name, stamp)), 0
+        while aside.exists():                            # a second corrupt file in the same second
+            n += 1
+            aside = p.with_name("%s.corrupt-%s-%d" % (p.name, stamp, n))
+        os.replace(p, aside)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return "could not be moved aside: %s" % _errno_text(e)
+    sys.stderr.write("romp-kernel: %s could not be parsed (%s); moved aside to %s, the store reads as empty\n"
+                     % (p.name, reason, aside.name))
+    # The dashboard hears it too (review find, 2026-09-08): a quarantine resets the store to EMPTY, so
+    # every bell override, lane flag (postal isolation included) or saved lane order it held reads as
+    # a default from here on, and the stderr line alone left that looking like settings resetting
+    # themselves. One notice, under the bell's `refused` kind (a setting that did not hold, not a
+    # machine sync); no dedupe registry: the next read of this path is an ENOENT, so a corrupt file
+    # speaks exactly once. Guarded like _note_state_fault: a notice never turns a successful move
+    # into a raise.
+    try:
+        _sync_notice("%s could not be parsed and was moved aside to %s; the settings it held start over "
+                     "empty until you set them again" % (p.name, aside.name), ok=False, kind="refused")
+    except Exception:
+        pass
+    return None
+
+
+def _read_state_json(path, st=None, expect=None, _tries=3):
+    """The ONE strict reader for a small JSON state file (session-flags, session-order, notify-cards;
+    timeline-views follows in its own change). Distinguishes the outcomes the old `except Exception: {}` conflated:
+      - a MISSING file is legitimately empty            -> returns None (a fresh install has no files)
+      - an UNREADABLE existing file (EIO/EACCES/...)     -> raises _StateUnreadable (never reads empty)
+      - TORN or non-JSON bytes                           -> QUARANTINED aside (_state_quarantine: a move,
+        never a delete -- the evidence survives for forensics), then None, so the store starts empty
+        ONLY after the bad bytes are preserved; bytes that could not be moved aside raise
+        _StateUnreadable instead; a file a peer's atomic publish REPLACED between the stat and the
+        rename is left alone and read afresh here, bounded by `_tries` (the maintainer's fold on
+        PR #1019), so the caller gets what is there now -- only a file that keeps changing under
+        every read ends _StateUnreadable.
+      - valid JSON of the WRONG top-level type           -> quarantined the same way, when the caller
+        names the store's shape in `expect` (dict for the flags and bells, list for the order). Read
+        as empty instead, a list where a dict belongs was overwritten by the next writer, and a file
+        none of our writers produce is exactly the evidence worth keeping (review find, 2026-09-08).
+        None skips the check.
+    `st` is the stat the caller already took (the display readers key their cache on it); without
+    one the reader stats first, so the quarantine can tell the file it read from one published
+    since. Reads bytes (json.loads accepts them and auto-detects the encoding), so a non-UTF-8 torn
+    file lands in the quarantine arm rather than escaping as an uncaught UnicodeDecodeError. Never
+    caches: the caller stores only a value that came from a clean read."""
+    path = Path(path)
+    if st is None:
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            raise _StateUnreadable(path, "stat failed: %s" % _errno_text(e))
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise _StateUnreadable(path, "read failed: %s" % _errno_text(e))
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeDecodeError) as e:
+        why = _state_quarantine(path, st, "invalid JSON: %s" % e)
+        if why is None:
+            return None                              # the bytes are preserved; the store starts empty
+        if why == _STATE_REPLACED and _tries > 1:    # a peer published since our stat: read what is there now
+            return _read_state_json(path, None, expect=expect, _tries=_tries - 1)
+        raise _StateUnreadable(path, "invalid JSON; %s" % why)
+    if expect is not None and not isinstance(data, expect):
+        why = _state_quarantine(path, st, "wrong shape: %s where %s was expected"
+                                % (type(data).__name__, expect.__name__))
+        if why is None:
+            return None
+        if why == _STATE_REPLACED and _tries > 1:
+            return _read_state_json(path, None, expect=expect, _tries=_tries - 1)
+        raise _StateUnreadable(path, "wrong shape; %s" % why)
+    return data
+
+
+# Last-known-good session order (session-order.json has no mtime cache): served over a transient
+# fault instead of a fabricated [], and the order to render when the store cannot be re-read.
+_session_order_lkg = [None]
+
+# One VISIBLE error per fault EPISODE, per state file (never a raise into the push/build path -- one
+# unreadable state file must not abort the whole push and wedge the board). str(path) -> the fault
+# text last filed. The first time a given fault text is seen for a path, _note_state_fault files one
+# stderr line + one dashboard notice; a repeat of the SAME text files nothing; a clean read clears
+# the entry (the event, no timer) so a recovered-then-refaulted file speaks again.
+_state_fault_seen = {}
+# The WRITE faults' own table, same key (str(path)): a clean READ ends a read episode, not a write one --
+# the display readers clear _state_fault_seen on every clean read, and a gesture's refusal reads the store
+# to name the value it still paints, so a write fault filed there was cleared before the next click and
+# said again per click. Only a landed write (_write_state_json) clears an entry here.
+_state_write_fault_seen = {}
+
+
+def _note_state_fault(exc):
+    """A DISPLAY-time state read fault is loud ONCE per episode, not on every build: file one stderr
+    line + one dashboard sync-notice the first time this fault text is seen for this path, then stay
+    quiet until a clean read clears it. The value the reader returns is UNPROVED (last-known or the
+    empty default) and no writer will persist it -- the mutation path reads the proved snapshot,
+    which raises and refuses. Never raises itself. The sync-notice ring is the surface the views
+    store's stale-writer guard already uses; the row carries the bell's `refused` kind (review find,
+    2026-09-08: filed under the ring's default sync kind, a user who muted the machine-sync log muted
+    every disk-fault notice with it, and the chip named a sync that moved no commits). A WRITE fault (_StateUnwritable, from
+    _write_state_json) files once per episode too, keyed on the same path but in its own table
+    (_state_write_fault_seen): only a landed write ends a write episode, where a clean read ends a
+    read one."""
+    key = str(exc.path)
+    if isinstance(exc, _StateUnwritable):
+        table = _state_write_fault_seen
+        text = "%s — the change was not saved; changes to it are refused until the file can be written again" % exc
+    else:
+        table = _state_fault_seen
+        text = ("%s — showing the last-known value; changes to it are refused until the file can be "
+                "read again" % exc)
+    if table.get(key) == text:
+        return
+    table[key] = text
+    sys.stderr.write("romp-kernel: %s\n" % text)
+    try:
+        _sync_notice(text, ok=False, kind="refused")   # the shell bell / feed sync-notice row (resolved at call time)
+    except Exception:
+        pass
+
+
+def _clear_state_fault(path):
+    """A clean read of `path` ends its fault episode, so the next fault on it files a fresh notice."""
+    _state_fault_seen.pop(str(path), None)
+
+
+def _refuse_setting(client, exc, what, gesture, sid="", item_id="", flag="", value=None):
+    """A dashboard gesture (a lane/tab flag, a card bell, a drag, a view change) that this kernel
+    REFUSED because the store it edits could not be read -- or, since the maintainer's fold on PR
+    #1019, WRITTEN (_StateUnwritable: the publish itself failed): one stderr line, and the refusal answered
+    on the DELIVERING socket as a `settingRefused` frame -- the same targeted _reply idiom the
+    settingStale stand-down and the saveFile acks use, never a broadcast. The frame names the
+    `gesture` ("flag" / "bell" / "order"; "views" follows with its store, so a pane never infers it from which fields are
+    empty), the gesture's own address (sid / itemId / flag), and `value`: what the kernel's display
+    path still paints for that flag or bell -- the value the next push carries -- so the pane
+    repaints the refused toggle to it on THIS event rather than to a value it recorded at the click
+    (two clicks before the first refusal made such a record wrong until the next push). None for a
+    gesture with no single value (an order, a whole-blob view write). A `warn` frame did none of
+    this: only the chat page renders `warn`, so a refused bell on the feed page and a refused lane
+    flag on the timeline page stayed painted as if they had landed until a reload. A dead socket is
+    the client's problem: the refusal already stands."""
+    text = "couldn't save %s \u2014 %s; try again" % (what, exc)
+    sys.stderr.write("romp-kernel: %s\n" % text)
+    if not client or not callable(client.get("send")):
+        return
+    _reply(client, {"type": "settingRefused", "gesture": str(gesture), "sid": str(sid or ""),
+                    "itemId": str(item_id or ""), "flag": str(flag or ""),
+                    "value": value if isinstance(value, bool) else None, "text": text})
+
+
+def _painted_flag_value(sid, flag):
+    """What the DISPLAY path paints for one lane/tab flag right now -- the derivation build_timeline
+    and build_session use for the lane and the tab (the bell EFFECTIVE: override, else the master).
+    Rides a settingRefused frame as `value`, so the pane repaints a refused toggle to exactly what
+    the next push will show. Never raises: the display readers serve their last read (or the empty
+    default) over a fault."""
+    if flag == "notify":
+        return bool(_notify_session_effective(sid))
+    if flag == "postalServiceOff":
+        return bool(_session_flag(sid, "postalServiceOff") or _session_flag(sid, "postalOff"))
+    return bool(_session_flag(sid, flag))
+
+
 def _session_order():
     """The shared session order (SID list), persisted by a tab-drag (reorderTabs) or a lane-drag
     (writeOrder). Chat tabs AND timeline lanes both order by it, so dragging either reorders both
-    (parity with the old UI's session-order.json). [] when unset."""
+    (parity with the old UI's session-order.json). [] when unset. This is the DISPLAY read: a
+    transient fault serves the last-known-good order this kernel read or wrote, else the empty
+    default (a cold start with no known-good yet) -- UNPROVED either way, never latched as the new
+    known-good, and no writer persists it (the mutation path reads _session_order_proved, which
+    refuses); the fault is loud once per episode (a sync-notice), never a raise into the build path."""
+    p = jd.STATE / "session-order.json"
     try:
-        a = json.loads((jd.STATE / "session-order.json").read_text())
-        return [x for x in a if isinstance(x, str)] if isinstance(a, list) else []
-    except Exception:
-        return []
+        raw = _read_state_json(p, expect=list)
+    except _StateUnreadable as e:
+        # DISPLAY path: never raise into the push (one outer try would abort every client's build).
+        _note_state_fault(e)
+        return list(_session_order_lkg[0]) if _session_order_lkg[0] is not None else []
+    _clear_state_fault(p)
+    order = [x for x in raw if isinstance(x, str)] if isinstance(raw, list) else []
+    _session_order_lkg[0] = list(order)              # a COPY: callers reorder the list they get
+    return order
+
+
+def _session_order_proved():
+    """The MUTATION snapshot of the lane order: a read fault RAISES (_StateUnreadable) so a writer
+    refuses rather than persisting a fabricated [] over the user's saved order (the drag that would
+    reorder every tab/lane on a transient EIO, under no gesture). Only a missing (or
+    freshly-quarantined) file reads as empty; no last-known-good -- a writer acts on the real store
+    or not at all."""
+    raw = _read_state_json(jd.STATE / "session-order.json", expect=list)
+    return [x for x in raw if isinstance(x, str)] if isinstance(raw, list) else []
 
 
 _atomic_lock = threading.Lock()
 _atomic_seq = [0]
+
+
+def _write_state_json(path, text):
+    """The ONE write door for the small JSON state files (session-flags, session-order, notify-cards,
+    and the views store once its path folds in): _atomic_write, with the publish's OSError turned into
+    _StateUnwritable and the fault filed ONCE per episode on the path's registry (_note_state_fault, the
+    write faults' own table beside the read faults'); a landed write ends the episode. Left as an OSError, a publish that
+    failed under a WS gesture escaped the arm's `except _StateUnreadable` to the receive loop, which
+    re-raised it as a socket failure and dropped the client, and under an HTTP route reached do_POST's
+    catch-all as a 500 traceback (the maintainer's fold on PR #1019: the write step is a fault boundary
+    too). Defined here, beside _atomic_write, because _write_session_order below is its first caller."""
+    path = Path(path)
+    try:
+        _atomic_write(path, text)
+    except OSError as e:
+        exc = _StateUnwritable(path, "write failed: %s" % _errno_text(e))
+        _note_state_fault(exc)
+        raise exc from e
+    _state_write_fault_seen.pop(str(path), None)     # a landed write ends the write-fault episode
 
 
 def _atomic_write(path, text, mode=None):
@@ -2631,8 +2910,11 @@ def _write_session_order(order):
     if not isinstance(order, list):
         return
     new = [x for x in order if isinstance(x, str)]
+    # for the audit only: the DISPLAY read never raises (a fault serves the last-known order), so a
+    # fault here cannot block the write -- the caller already read the store PROVED to build `order`
     _order_audit("persist", _session_order(), new)   # every mutation of the authoritative order, with its stack
-    _atomic_write(jd.STATE / "session-order.json", json.dumps(new))
+    _write_state_json(jd.STATE / "session-order.json", json.dumps(new))   # a failed publish raises _StateUnwritable:
+    _session_order_lkg[0] = new                      # what we just published IS the new known-good; nothing latched otherwise
 
 
 def _gc_session_order(known):
@@ -2642,10 +2924,17 @@ def _gc_session_order(known):
     it so a closed / aged-out session falls out on its own). Everything still around keeps its EXACT slot —
     only truly-absent sids are removed, and since the discover window only slides FORWARD a pruned sid never
     flickers back to reclaim a slot. Writes only when something actually changed (no churn on the hot path)."""
-    order = _session_order()
+    try:
+        order = _session_order_proved()
+    except _StateUnreadable as e:
+        _note_state_fault(e)                         # loud once per episode, not per pass
+        return
     kept = [sid for sid in order if sid in known]
     if kept != order:
-        _write_session_order(kept)
+        try:
+            _write_session_order(kept)
+        except _StateUnwritable:
+            pass                                     # filed once per episode by the write door; the next pass retries
 
 
 def _merge_session_order(incoming):
@@ -2658,7 +2947,9 @@ def _merge_session_order(incoming):
     sid's slot, so those lanes jumped — a drag that auto-reordered untouched lanes.) Returns the merged full
     SID order (deduped, strings only)."""
     incoming = [x for x in incoming if isinstance(x, str)]
-    existing = _session_order()
+    existing = _session_order_proved()   # a read fault RAISES -> the drag is refused loudly by the caller,
+    #                                      never spliced into a fabricated [] and persisted (the WS branch
+    #                                      catches _StateUnreadable and warns; it does not overwrite the order)
     inset = set(incoming)
     queue = list(incoming)
     merged = []
@@ -2688,7 +2979,21 @@ def _ordered(sessions):
     sibling already in the order. A genuinely-new session still appends at the end. Keyed off the anchor the
     sessions carry (default: the sid itself), so session-order.json + the client stay fsid-based — no
     migration (the user 2026-06-24: keep ONE slot across /clear / revive)."""
-    order = _session_order()
+    try:
+        order = _session_order_proved()   # a PROVED read: a transient fault must not fold to [] and then
+        #                                   mark every session "new", persisting discovery order over the
+        #                                   user's saved order under no gesture (the state-readers audit).
+    except _StateUnreadable as e:
+        # render the last-known order (or plain input order if we never read one) and persist NOTHING
+        # this pass; the next clean read re-appends any true newcomers. Loud once per episode.
+        _note_state_fault(e)
+        lkg = _session_order_lkg[0] or []
+        idx0 = {sid: i for i, sid in enumerate(lkg)}
+        return sorted(sessions, key=lambda s: idx0.get(s["sid"], len(idx0)))
+    _session_order_lkg[0] = list(order)   # a COPY of the clean read: `order` is spliced below and only
+    #                                       _write_session_order latches the spliced list, AFTER it lands
+    #                                       (review find, 2026-09-08: latched by reference, a publish that
+    #                                       failed left an unpersisted order as the known-good)
     known = set(order)
     # Slot inheritance keys on the STABLE session NAME (customTitle), NOT the fsid or discover's anchor: a
     # /clear, relaunch, or revive mints a NEW transcript fsid for the SAME logical session, and it must
@@ -2714,7 +3019,11 @@ def _ordered(sessions):
             else:
                 order.append(sid)                        # a genuinely new session appends, then is frozen
                 name_at.append(a)
-        _write_session_order(order)
+        try:
+            _write_session_order(order)
+        except _StateUnwritable:
+            pass                                         # this build still sorts by the in-memory order; the publish
+            #                                              is filed once per episode and the next pass retries it
     idx = {sid: i for i, sid in enumerate(order)}
     return sorted(sessions, key=lambda s: idx.get(s["sid"], len(idx)))   # stable sort: ties keep input order
 
@@ -3408,21 +3717,39 @@ def _edit_tag(name, add=(), remove=(), color=None, delete=False, rename=None):
 _flags_cache = {}   # str(path) -> ((mtime,size), dict)
 
 
+def _session_flags_proved():
+    """The MUTATION snapshot of the per-session flags: a read fault RAISES (_StateUnreadable) so
+    _set_session_flag / _set_notify_session refuse rather than writing a fabricated {} back over
+    every session's flags -- including the postalServiceOff isolation boundaries -- under a success
+    ack (the state-readers audit). Only a missing (or freshly-quarantined) file reads as empty."""
+    raw = _read_state_json(jd.STATE / "session-flags.json", expect=dict)
+    return raw if isinstance(raw, dict) else {}
+
+
 def _session_flags():
     p = jd.STATE / "session-flags.json"
+    hit = _flags_cache.get(str(p))
     try:
         st = p.stat(); key = (st.st_mtime_ns, st.st_size)   # ns + size → no stale hit on rapid toggles
-    except OSError:
+    except FileNotFoundError:
+        _clear_state_fault(p)
         return {}
-    hit = _flags_cache.get(str(p))
+    except OSError as e:
+        # DISPLAY path: never raise into the push. The last cached value if there is one, else {} (a
+        # cold start) -- UNPROVED either way, not cached; one loud notice per episode. Writers refuse
+        # via _session_flags_proved.
+        _note_state_fault(_StateUnreadable(p, "stat failed: %s" % _errno_text(e)))
+        return hit[1] if hit is not None else {}
     if hit is not None and hit[0] == key:
+        _clear_state_fault(p)
         return hit[1]
     try:
-        d = json.loads(p.read_text())
-        if not isinstance(d, dict):
-            d = {}
-    except Exception:
-        d = {}
+        raw = _read_state_json(p, st, expect=dict)
+    except _StateUnreadable as e:
+        _note_state_fault(e)
+        return hit[1] if hit is not None else {}
+    _clear_state_fault(p)
+    d = raw if isinstance(raw, dict) else {}
     _flags_cache[str(p)] = (key, d)
     return d
 
@@ -3442,7 +3769,8 @@ def _session_flag_raw(sid, flag):
 
 
 def _set_session_flag(sid, flag, value):
-    cur = dict(_session_flags())                     # copy: never mutate the cached dict in place
+    cur = dict(_session_flags_proved())              # PROVED: a read fault refuses (raises) rather than
+    #                                                  overwriting every session's flags with a fabricated {}
     f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
     if value:
         f[flag] = True
@@ -3452,7 +3780,7 @@ def _set_session_flag(sid, flag, value):
         cur[sid] = f
     else:
         cur.pop(sid, None)
-    _atomic_write(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
+    _write_state_json(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
     if flag == "hideFromFeed" and value:
         # Muting takes the session OUT of task tracking → VIEW-CLEAR its current goals: seal them exactly like
         # crossing each card off the feed (cleared.jsonl + the durable node flag), NOT delete — they stay on
@@ -3511,21 +3839,40 @@ _NOTIFY_RESERVED = frozenset((NOTIFY_ALL_KEY, NOTIFY_TURNS_KEY))
 _notify_cards_cache = {}   # str(path) -> ((mtime_ns,size), dict)
 
 
+def _notify_cards_proved():
+    """The MUTATION snapshot of the notification subscriptions: a read fault RAISES
+    (_StateUnreadable) so the bell setters (_set_notify_all/_turns/_card) and _prune_notify_cards
+    refuse rather than writing a fabricated {} back over every per-card, session and master bell
+    override under a success ack (the state-readers audit). Only a missing (or freshly-quarantined)
+    file reads as empty."""
+    raw = _read_state_json(jd.STATE / "notify-cards.json", expect=dict)
+    return raw if isinstance(raw, dict) else {}
+
+
 def _notify_cards():
     p = jd.STATE / "notify-cards.json"
+    hit = _notify_cards_cache.get(str(p))
     try:
         st = p.stat(); key = (st.st_mtime_ns, st.st_size)
-    except OSError:
+    except FileNotFoundError:
+        _clear_state_fault(p)
         return {}
-    hit = _notify_cards_cache.get(str(p))
+    except OSError as e:
+        # DISPLAY path: never raise into the push. The last cached value if there is one, else {} (a
+        # cold start) -- UNPROVED either way, not cached; one loud notice per episode. Writers refuse
+        # via _notify_cards_proved.
+        _note_state_fault(_StateUnreadable(p, "stat failed: %s" % _errno_text(e)))
+        return hit[1] if hit is not None else {}
     if hit is not None and hit[0] == key:
+        _clear_state_fault(p)
         return hit[1]
     try:
-        d = json.loads(p.read_text())
-        if not isinstance(d, dict):
-            d = {}
-    except Exception:
-        d = {}
+        raw = _read_state_json(p, st, expect=dict)
+    except _StateUnreadable as e:
+        _note_state_fault(e)
+        return hit[1] if hit is not None else {}
+    _clear_state_fault(p)
+    d = raw if isinstance(raw, dict) else {}
     _notify_cards_cache[str(p)] = (key, d)
     return d
 
@@ -3536,12 +3883,12 @@ def _notify_all_on():
 
 
 def _set_notify_all(value):
-    cur = dict(_notify_cards())                      # copy: never mutate the cached dict in place
+    cur = dict(_notify_cards_proved())               # PROVED: a read fault refuses rather than erasing bells
     if value:
         cur[NOTIFY_ALL_KEY] = True
     else:
         cur.pop(NOTIFY_ALL_KEY, None)
-    _atomic_write(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
+    _write_state_json(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
 
 
 def _notify_turns_on():
@@ -3552,12 +3899,12 @@ def _notify_turns_on():
 
 
 def _set_notify_turns(value):
-    cur = dict(_notify_cards())                      # copy: never mutate the cached dict in place
+    cur = dict(_notify_cards_proved())               # PROVED: a read fault refuses rather than erasing bells
     if value:
         cur[NOTIFY_TURNS_KEY] = True
     else:
         cur.pop(NOTIFY_TURNS_KEY, None)
-    _atomic_write(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
+    _write_state_json(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
 
 
 def _notify_session_effective(sid):
@@ -3581,15 +3928,21 @@ def _set_notify_card(item_id, value, sid=""):
     matches what the card would inherit anyway (session override, else master), in which case the
     override is deleted: clicking a bell back to its default returns it to FOLLOWING the default,
     rather than pinning today's default against tomorrow's master flip."""
-    cur = dict(_notify_cards())                      # copy: never mutate the cached dict in place
-    default = _session_flag_raw(sid, "notify")
+    cur = dict(_notify_cards_proved())               # PROVED: a read fault refuses rather than erasing bells
+    # the default this click is judged against comes from the OTHER store, and it must be PROVED too:
+    # read through the display reader, a fault on session-flags.json folded the session's bell to
+    # "unset" and the click was judged against the master instead -- a mute that matched the
+    # fabricated default was DELETED under the success path (the user's override, erased). A fault
+    # there refuses this write exactly like a fault on the bells file.
+    f = _session_flags_proved().get(sid)
+    default = None if not isinstance(f, dict) or f.get("notify") is None else bool(f.get("notify"))
     if default is None:
         default = bool(cur.get(NOTIFY_ALL_KEY))
     if bool(value) == default:
         cur.pop(item_id, None)
     else:
         cur[item_id] = bool(value)
-    _atomic_write(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
+    _write_state_json(jd.STATE / "notify-cards.json", json.dumps(cur, sort_keys=True))
 
 
 def _set_notify_session(sid, value):
@@ -3597,9 +3950,14 @@ def _set_notify_session(sid, value):
     discipline as _set_notify_card, against the master. Not _set_session_flag: that setter's
     pop-on-false is right for the on/off view flags, but here False is a real value (muted while
     the master is on)."""
-    cur = dict(_session_flags())                     # copy: never mutate the cached dict in place
+    cur = dict(_session_flags_proved())              # PROVED: a read fault refuses rather than erasing flags
     f = dict(cur.get(sid)) if isinstance(cur.get(sid), dict) else {}
-    if bool(value) == _notify_all_on():
+    # the master this click is judged against lives in the OTHER store and must be PROVED too: read
+    # through the display reader, a fault on notify-cards.json folded it to off, so a click matching
+    # that fabricated master popped the session's stored override -- a mute erased under the success
+    # path. A fault there refuses this write exactly like a fault on the flags file.
+    master = bool(_notify_cards_proved().get(NOTIFY_ALL_KEY))
+    if bool(value) == master:
         f.pop("notify", None)
     else:
         f["notify"] = bool(value)
@@ -3607,7 +3965,7 @@ def _set_notify_session(sid, value):
         cur[sid] = f
     else:
         cur.pop(sid, None)
-    _atomic_write(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
+    _write_state_json(jd.STATE / "session-flags.json", json.dumps(cur, sort_keys=True))
 
 
 def _prune_notify_cards(live_ids):
@@ -3615,11 +3973,19 @@ def _prune_notify_cards(live_ids):
     Called from the feed-diff detector, so the write happens only on the event of a card leaving.
     The reserved keys (the master, the turn-finished switch) are not cards and never prune; values
     are kept as stored (False = a mute)."""
-    cur = _notify_cards()
+    try:
+        cur = _notify_cards_proved()   # PROVED: a fault must not prune against a fabricated {} and then
+        #                                write the truncation over the user's real bell overrides
+    except _StateUnreadable as e:
+        _note_state_fault(e)                         # loud once per episode, not per pass
+        return
     gone = [i for i in cur if i not in live_ids and i not in _NOTIFY_RESERVED]
     if gone:
         kept = {i: cur[i] for i in cur if i in live_ids or i in _NOTIFY_RESERVED}
-        _atomic_write(jd.STATE / "notify-cards.json", json.dumps(kept, sort_keys=True))
+        try:
+            _write_state_json(jd.STATE / "notify-cards.json", json.dumps(kept, sort_keys=True))
+        except _StateUnwritable:
+            pass                                     # filed once per episode by the write door; the next leaving card retries
 
 
 # ── Auto Nudge (the user 2026-06-19) ──────────────────────────────────────────────────────────────
@@ -15391,11 +15757,16 @@ _SYNC_SEQ = 0
 SYNC_RING = 40
 
 
-def _sync_notice(text, ok=True):
+def _sync_notice(text, ok=True, kind="sync"):
+    """One row on the ring the shell's bell mirrors. `kind` is the bell kind the row is filed under:
+    "sync" (the default, the ring's original tenant: a machine sync) or "refused" (a state file that
+    could not be read or written, or was moved aside), so a mute on one never hides the other (review
+    find, 2026-09-08). The shell allowlists the value; anything it does not know reads as sync."""
     global _SYNC_SEQ
     with _SYNC_LOCK:
         _SYNC_SEQ += 1
-        _SYNC_NOTICES.append({"seq": _SYNC_SEQ, "t": time.time(), "text": str(text), "ok": bool(ok)})
+        _SYNC_NOTICES.append({"seq": _SYNC_SEQ, "t": time.time(), "text": str(text), "ok": bool(ok),
+                              "kind": str(kind or "sync")})
         del _SYNC_NOTICES[:-SYNC_RING]
 
 
@@ -15410,7 +15781,7 @@ def _sync_notice_rows(limit=20, cap=300):
     with _SYNC_LOCK:
         rows = list(_SYNC_NOTICES[-limit:])
     return [{"sig": "sync|%d|%d" % (int(_STARTED), r["seq"]), "t": float(r["t"]),
-             "text": r["text"][:cap], "ok": bool(r["ok"])} for r in rows]
+             "text": r["text"][:cap], "ok": bool(r["ok"]), "kind": str(r.get("kind") or "sync")} for r in rows]
 
 
 def _auto_push_remote(host):
@@ -34233,6 +34604,7 @@ else if(m.type==="hover"&&panel.setHover)panel.setHover(m);
 // timeline-boot.test.ts pins the pair.
 else if(m.type==="revealEvent"&&panel.revealEvent)panel.revealEvent(m.sid,m.t,m.id);
 else if(m.type==="models"&&panel.refreshModels)panel.refreshModels();
+else if(m.type==="settingRefused"&&panel.settingRefused)panel.settingRefused(m);
 else if(m.type==="tagEditFailed"&&panel.tagEditFailed)panel.tagEditFailed(m);
 else if(m.type==="openViewsDialog"&&panel._openViewsDialog)panel._openViewsDialog(null);};
 window.addEventListener("message",(window.__rompPerf&&window.__rompPerf.wrapFrameHandler)?window.__rompPerf.wrapFrameHandler(onFrame):onFrame);
@@ -34510,10 +34882,10 @@ el.classList.toggle('has',n>0||(kindOn('conn')&&liveDown()));
 var t=el.querySelector('.rerr-n');if(t)t.textContent=n<=0?'!':(n>9?'+':String(n));});
 if(!back.hidden)renderList();}
 // each entry leads with the chip its card wears in the feed, so the vocabulary matches across surfaces
-var KINDS=['conn','limit','judge','warn','stalled','nudge','retry','apierror','sdk','sync','locate','cleared','undelivered'];
+var KINDS=['conn','limit','judge','warn','stalled','nudge','retry','apierror','sdk','sync','locate','cleared','refused','undelivered'];
 var KINDLBL={conn:'offline',limit:'limit',judge:'judge',warn:'warning',stalled:'stalled',
 nudge:'follow-up failed',retry:'retrying',apierror:'api error',sdk:'sdk',sync:'fleet sync',
-locate:'jump failed',cleared:'cleared',undelivered:'not sent'};
+locate:'jump failed',cleared:'cleared',refused:'not saved',undelivered:'not sent'};
 // what each kind MEANS (the user 2026-07-28: the tooltip should explain the badge, not just say
 // show/hide) — worn by the filter toggles AND every entry's chip
 var DESC={conn:"the dashboard lost its live connection to the kernel for a visible pane; it reconnects on its own",
@@ -34528,6 +34900,7 @@ sdk:"romp's SDK backend, the machinery that actually runs your sessions, hit an 
 sync:"romp moved commits between your machines by itself \u2014 a push to a remote, a pull from one, or an ask that a peer fast-forward itself. Successes are logged as well as failures, so this is the record of what romp did to your machines; the network panel shows a sync while it is still running",
 locate:"a click that should have jumped to a message in the chat couldn't find it. Usually the chat is missing part of its history; reload the pane if it keeps happening",
 cleared:"a /clear in a session dropped still-open cards at the boundary; Undo on the feed restores them",
+refused:"a setting that could not be saved, or a state file that could not be read. A change you made \u2014 a lane or tab setting, a card bell, a lane order \u2014 was not saved because romp could not read or write the file that holds it; nothing changed, the entry carries the reason, and the same change can be tried again. Or one of those files could not be read (the last values are shown until it can), or held bytes romp could not parse and was moved aside, so what it held starts over as defaults",
 undelivered:"something you sent never reached a session — the kernel it was addressed to has no session by that id, which on a board showing more than one machine means the pane addressed the wrong one. Nothing was delivered. Your text is kept verbatim in undelivered.jsonl under ~/.local/state/romp"};
 // the toggles ARE the chips (same pill, same colours) — lit = shown, dimmed = muted. Built once on a
 // STABLE container; only classes flip on click, so the buttons stay click-safe.
@@ -35923,7 +36296,9 @@ sub().then(function(s){devOn=!!s;paint();});
 function fail(e){try{window.__rompNotify&&window.__rompNotify('error','Notifications: '+((e&&e.message)||e));}catch(err){}}
 function post(path,obj){return fetch(path,{method:'POST',body:JSON.stringify(obj)}).then(function(r){
 if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});
-return r.json().catch(function(){return {};});});}
+return r.json().catch(function(){return {};});}).then(function(d){
+if(d&&d.ok===false&&d.error)throw new Error(d.error);   // a refusal in the route's own shape ({ok:false, error}): the switch stays put and the reason toasts. Only bodies carrying `error`: /push/test answers 200 {ok:false, status, detail} for a refused or unsubscribed test push, and its caller reads those itself (review find, 2026-09-08)
+return d;});}
 function b64u(s){var raw=atob((s+'==='.slice((s.length+3)%4)).replace(/-/g,'+').replace(/_/g,'/'));
 var a=new Uint8Array(raw.length);for(var i=0;i<raw.length;i++)a[i]=raw.charCodeAt(i);return a;}
 function devSubscribe(permP){return permP.then(function(p){
@@ -37031,6 +37406,7 @@ def _landing():
             ".rerr-chip{flex:0 0 auto;font-size:9px;font-weight:700;letter-spacing:.04em;padding:1px 6px;"
             "border-radius:999px;line-height:1.4;white-space:nowrap;border:1px solid transparent}"
             ".rerr-chip.k-stalled,.rerr-chip.k-warn{color:#ffd166;border-color:rgba(255,209,102,0.6)}"
+            ".rerr-chip.k-refused{color:#ffd166;border-color:rgba(255,209,102,0.6)}"   # a change that did not land: the warning yellow, its own kind
             # "not sent" rides with the follow-up-failed red: both mean a message of yours didn't land, and
             # this one is the harder loss of the two — nothing was delivered at all (the user 2026-07-29)
             ".rerr-chip.k-nudge,.rerr-chip.k-undelivered{color:#ff6a6a;border-color:rgba(255,106,106,0.6)}"
@@ -38270,7 +38646,18 @@ class Handler(BaseHTTPRequestHandler):
                     _on = bool(json.loads(raw_body or b"{}").get("on"))
                 except (ValueError, AttributeError):
                     return self._send(400, "bad json", "text/plain")
-                _set_notify_all(_on)
+                try:
+                    _set_notify_all(_on)
+                except (_StateUnreadable, _StateUnwritable) as e:
+                    # the bells store could not be read, or its publish failed: refuse in the shape every
+                    # kernel refusal wears -- 200 with {ok:false, error}, as /send and /new answer theirs --
+                    # never a 5xx (a failed publish used to reach do_POST's catch-all as a 500 traceback).
+                    # The shell's post() consumes that shape; a non-2xx would reach it as raw JSON inside
+                    # an HTTP error, the toast showing a body instead of the reason. (An earlier comment
+                    # here credited `romp tag`'s curl -sf and the federation forward; neither calls this
+                    # route -- review find, 2026-09-08. No `retryable` key: nothing reads one.)
+                    return self._send(200, json.dumps({"ok": False,
+                        "error": "%s \u2014 the change did not land; try again" % e}), "application/json")
                 _mark_views_dirty()
                 _send_to_app("shell", {"type": "notifyAll", "on": _on})
                 return self._send(200, json.dumps({"ok": True, "on": _on}), "application/json")
@@ -38282,7 +38669,18 @@ class Handler(BaseHTTPRequestHandler):
                     _on = bool(json.loads(raw_body or b"{}").get("on"))
                 except (ValueError, AttributeError):
                     return self._send(400, "bad json", "text/plain")
-                _set_notify_turns(_on)
+                try:
+                    _set_notify_turns(_on)
+                except (_StateUnreadable, _StateUnwritable) as e:
+                    # the bells store could not be read, or its publish failed: refuse in the shape every
+                    # kernel refusal wears -- 200 with {ok:false, error}, as /send and /new answer theirs --
+                    # never a 5xx (a failed publish used to reach do_POST's catch-all as a 500 traceback).
+                    # The shell's post() consumes that shape; a non-2xx would reach it as raw JSON inside
+                    # an HTTP error, the toast showing a body instead of the reason. (An earlier comment
+                    # here credited `romp tag`'s curl -sf and the federation forward; neither calls this
+                    # route -- review find, 2026-09-08. No `retryable` key: nothing reads one.)
+                    return self._send(200, json.dumps({"ok": False,
+                        "error": "%s \u2014 the change did not land; try again" % e}), "application/json")
                 _send_to_app("shell", {"type": "notifyTurns", "on": _on})
                 return self._send(200, json.dumps({"ok": True, "on": _on}), "application/json")
             if u.path == "/push/test":
@@ -39580,11 +39978,20 @@ class Handler(BaseHTTPRequestHandler):
             # timeline lane gear → toggle a per-session view flag (e.g. hideFromFeed). Persisted +
             # re-broadcast so the feed drops/restores that session's cards immediately. The notify
             # bell is tri-state (an override on the master default) → its own setter.
-            if str(msg["flag"]) == "notify":
-                _set_notify_session(str(msg["id"]), bool(msg.get("value")))
+            try:
+                if str(msg["flag"]) == "notify":
+                    _set_notify_session(str(msg["id"]), bool(msg.get("value")))
+                else:
+                    _set_session_flag(str(msg["id"]), str(msg["flag"]), bool(msg.get("value")))
+            except (_StateUnreadable, _StateUnwritable) as e:
+                # the flags store could not be read, or its publish failed: refuse on the DELIVERING socket,
+                # addressed to the toggle (sid + flag) so the lane gear / tab menu ends its optimistic state
+                # and says why. Left as an OSError, the failed publish reached the receive loop and DROPPED
+                # this client (the maintainer's fold on PR #1019)
+                _refuse_setting(client, e, "that setting", "flag", sid=msg["id"], flag=msg["flag"],
+                                value=_painted_flag_value(str(msg["id"]), str(msg["flag"])))
             else:
-                _set_session_flag(str(msg["id"]), str(msg["flag"]), bool(msg.get("value")))
-            _mark_views_dirty()
+                _mark_views_dirty()
         elif msg and msg.get("type") == "setTimelineViews" and isinstance(msg.get("views"), dict):
             # timeline corner panel → replace the whole views blob (tiny; last-write-wins across
             # dashboards, like colormap). Validation/normalization happens in the setter.
@@ -39637,8 +40044,15 @@ class Handler(BaseHTTPRequestHandler):
             # completes). Persisted to notify-cards.json; build_feed echoes it back as ask.notify.
             # sid rides so the override can be resolved against the card's own default (session, else
             # the master) and deleted when it merely restates it.
-            _set_notify_card(str(msg["itemId"]), bool(msg.get("value")), str(msg.get("sid") or ""))
-            _mark_views_dirty()
+            try:
+                _set_notify_card(str(msg["itemId"]), bool(msg.get("value")), str(msg.get("sid") or ""))
+            except (_StateUnreadable, _StateUnwritable) as e:
+                # the bells store could not be read, or its publish failed: refuse on the DELIVERING socket,
+                # addressed to the card (itemId) so the feed drops that bell's optimistic latch and says why
+                _refuse_setting(client, e, "that bell", "bell", sid=msg.get("sid") or "", item_id=msg["itemId"],
+                                value=bool(_notify_card_effective(_notify_cards(), str(msg["itemId"]), str(msg.get("sid") or ""))))
+            else:
+                _mark_views_dirty()
         elif msg and msg.get("type") == "setSessionColor" and msg.get("id") and msg.get("bg"):
             # tab right-click color picker → override the session's identity color (persisted to the names
             # registry); re-broadcast so every tab/lane/card repaints in the new color at once.
@@ -39854,12 +40268,22 @@ class Handler(BaseHTTPRequestHandler):
         elif msg and msg.get("type") in ("reorderTabs", "writeOrder") and isinstance(msg.get("order"), list):
             # tab-drag or lane-drag → reorder BOTH surfaces. MERGE the dragged surface's order into the
             # persisted one (don't overwrite): a chat-tab drag must not drop/reshuffle timeline-only lanes.
-            _write_session_order(_merge_session_order(msg["order"]))
-            # _mark_views_dirty, NOT _push_all: the feed/timeline order the grouped cards CLIENT-side by this
-            # list, but a plain push serves the CACHED feed — reused for REBUILD_MIN_S (2s) even though the sig
-            # changed — so the reordered cards lagged up to ~2s (the user 2026-07-15). The dirty mark bypasses
-            # the throttle AND wakes the pusher, so the rebuilt payload (fresh order) ships right away.
-            _mark_views_dirty()
+            try:
+                _merged = _merge_session_order(msg["order"])
+                _write_session_order(_merged)            # the publish too: a failed one is refused, never a
+            except (_StateUnreadable, _StateUnwritable) as e:   # dropped socket (the fold on PR #1019)
+                # the order file could not be read, or its publish failed; the drag must not splice against
+                # a fabricated [] and persist discovery order over the user's saved order. Refused on the
+                # delivering socket. (No shipped pane posts this op today -- the strip and the lanes write
+                # the viewer's own arrangement -- so the frame has no latch to release; the contract holds
+                # for the op all the same.)
+                _refuse_setting(client, e, "the new order", "order")
+            else:
+                # _mark_views_dirty, NOT _push_all: the feed/timeline order the grouped cards CLIENT-side by this
+                # list, but a plain push serves the CACHED feed — reused for REBUILD_MIN_S (2s) even though the sig
+                # changed — so the reordered cards lagged up to ~2s before the dirty mark. The dirty mark bypasses
+                # the throttle AND wakes the pusher, so the rebuilt payload (fresh order) ships right away.
+                _mark_views_dirty()
         elif msg and msg.get("type") == "createSession" and msg.get("name"):
             nm = str(msg["name"]).strip()
             if not NAME_RE.match(nm):

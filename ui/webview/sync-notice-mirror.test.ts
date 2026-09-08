@@ -23,6 +23,19 @@ test("a finished sync logs once, under its own kind", () => {
   assert.deepEqual([...active].sort(), ["sync|100|1", "sync|100|2"]);
 });
 
+test("a row's kind is honoured through an allowlist: refused stays refused, everything else is sync", () => {
+  // review find, 2026-09-08: the kernel's state-file faults (a store it could not read, or moved aside)
+  // ride the same ring; filed under sync they wore the machine-sync label, and muting that log muted
+  // them. The kernel names the kind; a value the bell does not know (a newer remote kernel) reads as sync
+  const { notices } = syncNotices(
+    [{ ...row("sync|100|1", "session-flags.json could not be read (read failed: [Errno 5] Input/output error)", false), kind: "refused" },
+      { ...row("sync|100|2", "pushed this machine's build to api"), kind: "sync" },
+      row("sync|100|3", "a row from a kernel that predates the field"),
+      { ...row("sync|100|4", "a kind this bell does not know", false), kind: "bogus" }], new Set());
+  assert.deepEqual(notices.map((n) => n.kind), ["refused", "sync", "sync", "sync"]);
+  assert.match(notices[0].text, /could not be read/);
+});
+
 test("a SUCCESS is an entry, not only a failure", () => {
   // the whole point: an unwatched push that worked used to leave no record either
   const { notices } = syncNotices([row("sync|100|1", "pushed this machine's build to api")], new Set());

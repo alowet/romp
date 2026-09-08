@@ -128,7 +128,13 @@ export function sdkProblemNotices(rows: SdkNoticeRow[], seen: Set<string>): { no
 // The Log is a browser-side store the kernel cannot write to, which is why this rides the payload and
 // mirrors here rather than being appended server-side. Same episode-identity contract as the SDK ring:
 // the kernel signs each occurrence (its start + the ring's sequence).
-export interface SyncNoticeRow { sig: string; t: number; text: string; ok?: boolean }
+//
+// `kind` (review find, 2026-09-08): the ring also carries the kernel's state-file faults (a store that
+// could not be read, or held bytes it could not parse and moved aside). Filed under "sync" they wore
+// the machine-sync label, and muting that log (the one kind that records successes, so a plausible
+// mute) silenced every disk-fault notice with it. The kernel names the row's kind; this side ALLOWLISTS
+// it, so a remote kernel's payload can only ever land in one of the two kinds the bell knows here.
+export interface SyncNoticeRow { sig: string; t: number; text: string; ok?: boolean; kind?: string }
 
 export function syncNotices(rows: SyncNoticeRow[], seen: Set<string>): { notices: BadgeNotice[]; active: Set<string> } {
   const notices: BadgeNotice[] = [];
@@ -137,7 +143,7 @@ export function syncNotices(rows: SyncNoticeRow[], seen: Set<string>): { notices
     if (!r || !r.sig || !r.text) continue;
     active.add(r.sig);
     if (seen.has(r.sig)) continue;
-    notices.push({ kind: "sync", text: cap(r.text, 240), sig: r.sig, sid: "", itemId: "" });
+    notices.push({ kind: r.kind === "refused" ? "refused" : "sync", text: cap(r.text, 240), sig: r.sig, sid: "", itemId: "" });
   }
   return { notices, active };
 }

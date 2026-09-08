@@ -850,6 +850,19 @@ State is written under `${XDG_STATE_HOME:-~/.local/state}/romp/`. Transcripts
 are read in place from where Claude Code writes them (`~/.claude/projects/`)
 and never copied.
 
+Three small files there hold settings you set by hand: `session-flags.json`
+(per-session flags, the postal isolation switch among them), `session-order.json`
+(the saved tab and lane order) and `notify-cards.json` (the bell overrides). A
+change to one of them is refused, never written over an empty, when the file
+exists but cannot be read; the refusal reaches the dashboard's error center
+under the `not saved` kind, with the reason, and the same change can be tried
+again. A file whose bytes cannot be parsed (a torn write) is moved aside, never
+deleted, to `<file>.corrupt-<UTC stamp>` in the same directory (a `-1`, `-2`
+suffix when two land in the same second), the store starts over empty, and an
+entry under the same kind says so. A file that cannot be read at all keeps
+showing its last-read values until it can. Nothing here needs a restart; the
+sidecars are yours to inspect or delete.
+
 ## Switches
 
 Effective immediately, no restart.
