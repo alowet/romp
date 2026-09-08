@@ -8,10 +8,14 @@ The design, in four rules:
   identity checks — reads the source. Only resolve() ever runs ``op read``, at the moment a Claude
   session launches, an API-key-billed judge call is made, or the model catalog refreshes; the value
   is handed to that one operation and never written to disk or cached for a later one.
-* A selected source is AUTHORITATIVE. A file that once carried a key line or a reference keeps
-  governing this process: emptying it, removing the line, or making it unreadable is an error the
-  operation reports, never permission to fall back to the key the manager started with or to a
-  login. That is what makes ``romp keyswap`` a swap — nothing an operator removed can come back.
+* A selected source is AUTHORITATIVE over the key the manager started with. A file that once
+  carried a key line or a reference keeps governing this process: nothing an operator removed can
+  come back, which is what makes ``romp keyswap`` a swap. An unreadable file, or a removed
+  1Password reference (remembered by the marker), is an error the operation reports. A file whose
+  static key line was emptied or removed is an UNCONFIGURED source: romp injects nothing and Claude
+  Code's own credential resolution (its apiKeyHelper or its login) decides for every session,
+  whatever its Billing pick, said once as a problem row (2026-09-07; until then an explicit API-key
+  pick was refused at launch, which took every session of an apiKeyHelper box down).
 * Supervised managers (``ROMP_SUPERVISED=1``: the systemd/launchd service) read the FILE only. The
   manager process keeps the environment it started with across every kernel restart, so a key it
   inherited would otherwise resurrect after the operator removed it from the file. A startup key

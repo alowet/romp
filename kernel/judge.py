@@ -1046,6 +1046,21 @@ def _work_key_configured():
     return _keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "").configured
 
 
+def _key_source_unconfigured():
+    """True only when the selected key source is KNOWN to be unconfigured without retrieving anything: the
+    kernel's configured wire when it is up; a standalone caller wiring the key callback alone leaves the
+    verdict to the retrieval (as before); no wire at all reads the source descriptor. Never _work_key():
+    a resolve here would run outside the per-pass gate."""
+    if _WORK_KEY_CONFIGURED_FN is not None:
+        return not _WORK_KEY_CONFIGURED_FN()
+    if _WORK_KEY_FN is not None:
+        return False
+    return not _keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "").configured
+
+
+_UNKEYED_SAID = set()   # the key-billed-calls-run-on-the-CLI's-own-credential line: said once per process
+
+
 def _login_auth_env():
     if _LOGIN_AUTH_ENV_FN is not None:
         return _LOGIN_AUTH_ENV_FN()
@@ -1327,6 +1342,22 @@ def _judge_env(tier, auth="login", model=None):
         # _judge_run is the lever that lands. Both ride together; neither can hurt the other.
         env["MAX_THINKING_TOKENS"] = "0"
     if auth == "key":
+        # No source configured at all (a supervised box whose env file carries no key line: the session's
+        # `key` pick outlived the line) is decided BEFORE any retrieval, so a retrieval FAILURE keeps its own
+        # gated path below. The child then runs on Claude Code's own credential — its apiKeyHelper or its
+        # login — the shape every judge had before #932's hard error, which logged err=auth on every pass
+        # and took a board down (the maintainer's direction, 2026-09-07: given no key, romp defers to
+        # Claude Code's default); said once per process. The login tokens ride along exactly as for a
+        # login call (the session half restores them the same way): before #932 the child simply
+        # inherited the manager's, and a box whose login lives in those tokens would otherwise hand the
+        # judge no credential at all and floor its cards with an auth-down mark.
+        if _key_source_unconfigured():
+            env.update(_login_auth_env())
+            if not _UNKEYED_SAID:
+                _UNKEYED_SAID.add(True)
+                sys.stderr.write("romp-judge: key-billed judge calls run on Claude Code's own credential — "
+                                 "romp holds no key source\n")
+            return env
         wk = _resolve_work_key_gated()               # resolve only at the call boundary — once per pass on failure
         if not wk:
             raise _keysrc.KeySourceError("No API key source is configured for this judge call")
