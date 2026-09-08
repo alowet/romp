@@ -24962,6 +24962,23 @@ def _tree_of(d):
 
 _branch_cache = {}   # cwd -> (branch, head_mtime) — git branch derived straight from the FOLDER
 _head_path_cache = {}   # cwd -> the resolved HEAD file path (worktrees indirect through a .git FILE)
+_git_file_faults = {}   # .git pointer-file path -> the fault text of its CURRENT episode; ONE stderr line per episode
+
+
+def _git_file_fault(path, exc):
+    """Name a .git pointer file that cannot be read — undecodable bytes or an OS error — on stderr ONCE
+    per fault episode. One non-UTF-8 byte in one session cwd's .git file used to raise UnicodeDecodeError
+    through _git_branch and build_session into _push's single try, and every pane of every session went
+    stale until that file was fixed by hand. A blank branch alone would hide WHICH file. The episode is
+    the fault TEXT (the judge's _file_store_fault rule): an identical repeat says nothing, a DIFFERENT
+    fault on the same file is a new episode — a pointer that goes EACCES, then readable but still
+    undecodable, reports both — and a clean read ends it (_git_head_file drops the entry)."""
+    text = "%s: %s" % (type(exc).__name__, exc)
+    if _git_file_faults.get(path) == text:
+        return
+    _git_file_faults[path] = text
+    sys.stderr.write("git: %s cannot be read (%s) — sessions there show no branch until it is fixed\n"
+                     % (path, text))
 
 
 def _git_head_file(cwd):
@@ -24987,8 +25004,10 @@ def _git_head_file(cwd):
                 if not os.path.isabs(gd):
                     gd = os.path.normpath(os.path.join(cwd, gd))
                 hp = os.path.join(gd, "HEAD")
-    except OSError:
-        hp = ""
+    except (OSError, UnicodeDecodeError) as e:       # undecodable bytes are as fatal to a path as an unreadable file
+        _git_file_fault(dotgit, e)                    # ...but never silent: the operator learns WHICH file is bad
+        return ""                                     # uncached: the next read retries, so a repair ends the episode
+    _git_file_faults.pop(dotgit, None)                # a clean read ends the episode
     if len(_head_path_cache) > 512:                  # bounded, like _tree_cache
         _head_path_cache.clear()
     _head_path_cache[cwd] = hp
@@ -25009,7 +25028,7 @@ def _git_branch(cwd):
         hp = _git_head_file(cwd)
         if hp:
             mt = os.path.getmtime(hp)
-    except OSError:
+    except (OSError, UnicodeDecodeError):   # the resolver reports and yields ''; this is the backstop should it raise
         pass
     hit = _branch_cache.get(cwd)
     if hit is not None and mt is not None and hit[1] == mt:
@@ -33609,7 +33628,7 @@ def _repo_file_index(cwd):
                     subs.append((e.name, e.stat().st_mtime))
         key = ((os.path.getmtime(os.path.join(os.path.dirname(gi), "index")) if gi else None),
                os.path.getmtime(tree), tuple(sorted(subs)))
-    except OSError:
+    except (OSError, UnicodeDecodeError):   # the same backstop as _git_branch: no key → an uncached listing, never a raise
         key = None
     hit = _repo_index_cache.get(cwd)
     if hit is not None and key is not None and hit[0] == key:
