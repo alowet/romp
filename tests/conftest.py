@@ -125,10 +125,36 @@ os.environ["ROMP_MANAGER_PORT"] = "1"
 _NO_SERVICE_ENV = os.path.join(os.environ["XDG_STATE_HOME"], "no-such-service.env")
 os.environ["ROMP_SERVICE_ENV_FILE"] = _NO_SERVICE_ENV
 os.environ["ROMP_SERVICE_ENV"] = _NO_SERVICE_ENV
-# A runtime provider can also be selected directly from the manager's environment. Remove its
-# inherited reference before module loading, so an auth test cannot resolve a developer's vault
-# merely because the isolated service.env is absent. Tests set synthetic references explicitly.
-os.environ.pop("ROMP_API_KEY_REF", None)
+# No test starts with a KEY SOURCE the developer's shell configured (2026-09-08). Every session shell
+# under a romp-managed manager inherits the manager's credentials: ANTHROPIC_API_KEY (the startup key
+# sdk_backend.startup_api_key claims), ROMP_API_KEY_CMD and ROMP_API_KEY_REF (the runtime providers
+# keysource._env_provider selects straight from the environment when the isolated env file above is
+# absent), ROMP_EXPECTED_AUTH (the box-wide auth declaration), the competing token credentials
+# sdk_backend.startup_auth_env claims, and 1Password's own names keysource.claim_op_env takes. A
+# test that constructs a backend, resolves a key or asks default_auth then reads the DEVELOPER'S
+# configuration: 73 tests across eight modules went red on a box running the command key source
+# while CI, which exports none of these, stayed green (the manager's full run, 2026-09-08). Popped at
+# import so module-level loads see the clean baseline, and re-asserted per test below; a test that
+# wants a source sets a synthetic one itself in setUp, which runs after the fixture. The list is the
+# code's own constants (tests/test_key_source_floor.py pins it against keysource.SOURCE_VARS,
+# keysource.OP_ENV_NAMES / OP_ENV_PREFIX and sdk_backend.AUTH_ENV_NAMES).
+KEY_SOURCE_ENV_NAMES = (
+    "ANTHROPIC_API_KEY", "ROMP_API_KEY_REF", "ROMP_API_KEY_CMD",          # keysource.SOURCE_VARS
+    "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",                     # sdk_backend.AUTH_ENV_NAMES (the rest)
+    "ROMP_EXPECTED_AUTH",                                                  # the auth declaration
+    "OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN", "OP_ACCOUNT",   # keysource.OP_ENV_NAMES
+)
+KEY_SOURCE_ENV_PREFIXES = ("OP_SESSION_",)                                # keysource.OP_ENV_PREFIX
+
+
+def _scrub_key_source_env():
+    for name in KEY_SOURCE_ENV_NAMES:
+        os.environ.pop(name, None)
+    for name in [k for k in os.environ if k.startswith(KEY_SOURCE_ENV_PREFIXES)]:
+        os.environ.pop(name, None)
+
+
+_scrub_key_source_env()
 # Every shell under a romp-managed session inherits ROMP_SUPERVISED=1 from the kernel (the service
 # unit exports it), and keysource gives that variable authority: a supervised manager reads the env
 # file only and ignores a startup key. Twenty-five tests that stage a startup key went red when the
@@ -157,7 +183,7 @@ def _no_real_service_env():
     phase, before TestCase.run calls setUp) — so per-test intent still wins."""
     for var in ("ROMP_SERVICE_ENV_FILE", "ROMP_SERVICE_ENV"):
         os.environ[var] = _NO_SERVICE_ENV
-    os.environ.pop("ROMP_API_KEY_REF", None)
+    _scrub_key_source_env()
     os.environ.pop("ROMP_SUPERVISED", None)
     _reset_keysource_state()
     yield
