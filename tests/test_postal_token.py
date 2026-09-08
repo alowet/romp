@@ -14,6 +14,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -183,6 +184,22 @@ class BusBodiesAreObjects(_BusServer):
         self.assertEqual(r["error"], 'body must be a JSON object, got "' + "x" * 60 + '\u2026"')
         self.assertLess(len(r["error"]), 100)
 
+    def test_a_container_holding_a_long_string_echoes_well_formed(self):
+        # review find, 2026-09-08: a slice of the serialized container cut mid-token, so the echo came
+        # back with its quote and bracket open; the cut now lands inside the string, at any depth
+        st, r = self._post("/send", json.dumps(["x" * 100_000]).encode())
+        self.assertEqual(st, 400, r)
+        self.assertEqual(r["error"], 'body must be a JSON object, got ["' + "x" * 60 + '\u2026"]')
+        st, r = self._post("/send", json.dumps(list(range(1000))).encode())
+        self.assertEqual(st, 400, r)
+        echo = r["error"].split("got ", 1)[1]
+        self.assertEqual(json.loads(echo), [0, 1, 2, 3, 4, 5, 6, 7, "\u2026"], "cut at the element level")
+        self.assertLess(len(r["error"]), 300)
+        st, r = self._post("/send", json.dumps(int("7" * 4000)).encode())
+        self.assertEqual(st, 400, r)
+        self.assertEqual(r["error"], 'body must be a JSON object, got "' + "7" * 60 + '\u2026"',
+                         "a number past the bound echoes as a marked string: a cut decimal would be a mid-token cut")
+
 
 class BusBodyGate(_BusServer):
     """The bus reads a body only within bounds -- the kernel's gate, mirrored. _body() used to trust the
@@ -215,6 +232,27 @@ class BusBodyGate(_BusServer):
         st, r, head = self._raw("/send", [("Transfer-Encoding", "chunked")], body=b"2\r\n{}\r\n0\r\n\r\n")
         self.assertEqual(st, 411, r)
         self.assertIn("Transfer-Encoding", r.get("error", ""))
+
+    def test_a_trickling_body_is_408_and_closes(self):
+        # review find, 2026-09-08: the in-bounds read had no socket timeout, so an AUTHORIZED client that
+        # announced a body and trickled it pinned a handler thread for as long as it liked. 100 bytes
+        # announced, 10 sent, the sending side left OPEN (no half-close, so no EOF to end the read)
+        saved = ps._POST_BODY_TIMEOUT
+        ps._POST_BODY_TIMEOUT = 0.5
+        try:
+            t0 = time.monotonic()
+            st, r, head = self._raw("/send", [("Content-Length", "100")], body=b'{"to": "ap', half_close=False)
+            took = time.monotonic() - t0
+        finally:
+            ps._POST_BODY_TIMEOUT = saved
+        self.assertEqual((st, r.get("error")),
+                         (408, "body could not be read: 100 bytes announced, not all of it arrived within 0.5 s"))
+        self.assertIn("Connection: close", head)
+        self.assertLess(took, 5, "answered on the body timeout, not on the client giving up")
+        # the server is still serving, and a body that arrives whole is read as before
+        st, r, head = self._raw("/send", [("Content-Length", "2")], body=b"{}")
+        self.assertEqual(st, 400, r)
+        self.assertIn("sender identity required", r.get("error", ""))
 
 
 class TrackedIsABoolean(_BusServer):

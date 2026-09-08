@@ -262,6 +262,19 @@ class HostForward(TagRoute):
         st, r = self._post({"name": "team", "host": "alpha", "add": ["web"]})
         self.assertFalse(r["ok"]); self.assertIn("never landed", r["error"])
 
+    def test_a_string_delete_is_refused_before_the_host_forward(self):
+        # the flag is checked ahead of the --host arm (review find, 2026-09-08: pinned by no test until
+        # now), so a malformed delete never crosses to the home kernel, where an un-updated kernel
+        # would still coerce it with bool()
+        for bad in ("true", "false", 1):
+            st, r = self._post({"name": "team", "host": "alpha", "delete": bad})
+            self.assertEqual(st, 400, (bad, r))
+            self.assertEqual(r.get("error"), "'delete' must be true or false, got %s" % json.dumps(bad))
+        self.assertEqual(self.forwarded, [], "nothing reaches the tunnel while the flag is malformed")
+        st, r = self._post({"name": "team", "host": "alpha", "delete": True})
+        self.assertEqual(self.forwarded, [("alpha", "/tag", {"name": "team", "delete": True})],
+                         "a real boolean forwards as itself")
+
 
 class RenameAndHomeFrame(TagRoute):
     """Federation v1: /tag gains rename (collision-refusing), and a bare sid routed here from a
@@ -426,6 +439,29 @@ class HttpFlagsMustBeBooleans(TagRoute):
                          "the cut lands inside the quotes, marked -- never an unclosed quote or 5000 chars")
         self.assertLess(len(r["error"]), 100)
         self.assertFalse(km._notify_all_on())
+
+    def test_a_container_flag_value_echoes_well_formed_too(self):
+        # review find, 2026-09-08: a long string INSIDE a container used to clip to an unclosed quote
+        st, r = self._post_to("/notify-all", {"on": {"nested": ["a" * 5000]}})
+        self.assertEqual(st, 400, r)
+        self.assertEqual(r.get("error"), "'on' must be true or false, got " + '{"nested": ["' + "a" * 60 + '\u2026"]}')
+        self.assertFalse(km._notify_all_on())
+
+    def test_an_explicit_null_flag_reads_as_absent(self):
+        # the rule _as_bool states (review find, 2026-09-08): null is the absent case spelled out, so it
+        # takes the route's default -- an edit, not a delete; the bell off -- where a string or a number
+        # is refused
+        self._post({"name": "pool", "add": ["web"]})
+        st, r = self._post({"name": "pool", "delete": None})
+        self.assertEqual((st, r.get("ok")), (200, True), r)
+        self.assertEqual([g["name"] for g in self._views()[1]["tags"]], ["pool"], "null is not a delete")
+        self._post_to("/notify-all", {"on": True})
+        self.assertTrue(km._notify_all_on())
+        st, r = self._post_to("/notify-all", {"on": None})
+        self.assertEqual((st, r.get("ok"), r.get("on")), (200, True, False), r)
+        self._post_to("/notify-all", {"on": True})
+        st, r = self._post_to("/notify-all", {})
+        self.assertEqual((st, r.get("on")), (200, False), "the same answer an absent field gets")
 
     def test_auto_update_takes_only_a_boolean(self):
         self.assertFalse(km._auto_update_remotes_on())

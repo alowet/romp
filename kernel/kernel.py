@@ -2745,7 +2745,7 @@ def _clear_state_fault(path):
     _state_fault_seen.pop(str(path), None)
 
 
-def _refuse_setting(client, exc, what, gesture, sid="", item_id="", flag="", value=None):
+def _refuse_setting(client, exc, what, gesture, sid="", item_id="", flag="", value=None, log=None):
     """A dashboard gesture (a lane/tab flag, a card bell, a drag, a view change) that this kernel
     REFUSED because the store it edits could not be read -- or, since the maintainer's fold on PR
     #1019, WRITTEN (_StateUnwritable: the publish itself failed): one stderr line, and the refusal answered
@@ -2759,9 +2759,11 @@ def _refuse_setting(client, exc, what, gesture, sid="", item_id="", flag="", val
     gesture with no single value (an order, a whole-blob view write). A `warn` frame did none of
     this: only the chat page renders `warn`, so a refused bell on the feed page and a refused lane
     flag on the timeline page stayed painted as if they had landed until a reload. A dead socket is
-    the client's problem: the refusal already stands."""
+    the client's problem: the refusal already stands. `log`, when given, is what stderr gets INSTEAD of
+    `text`: a flag refusal's text echoes the client's value for the client, and the log line names only
+    the field and its type (_flag_type_note; review find, 2026-09-08)."""
     text = "couldn't save %s \u2014 %s; try again" % (what, exc)
-    sys.stderr.write("romp-kernel: %s\n" % text)
+    sys.stderr.write("romp-kernel: %s\n" % (log or text))
     if not client or not callable(client.get("send")):
         return
     _reply(client, {"type": "settingRefused", "gesture": str(gesture), "sid": str(sid or ""),
@@ -19400,20 +19402,63 @@ def _tmux_send(name, text, model_cmd=False, _async=True):
 # and allocated its declared length -- with no token, see _read_post_body).
 _POST_MAX_BYTES = 1024 * 1024
 
+# The longest the kernel waits for an announced, in-bounds body to ARRIVE. The cap above bounds what
+# one request can make a handler buffer; this bounds how long it can hold the handler's thread while
+# sending it (review find, 2026-09-08): an authorized client that announced 1 MiB and trickled it a
+# byte at a time pinned a thread for as long as it liked, since the socket had no timeout. Every
+# shipped client sends its body in one write, so 30 s is generous; a read that stalls past it answers
+# 408 and closes.
+_POST_BODY_TIMEOUT = 30.0
+
 
 def _clip_json(v, n=60):
     """A BOUNDED, WELL-FORMED echo of an offending request value for an error message: a 1 MB body must
-    never come back as a 1 MB error. The cut lands INSIDE a string's quotes and is marked, so a long
-    string still echoes as one complete quoted thing and the words after it survive (a slice of the
-    serialized text took the closing quote with it); ensure_ascii is off, or the marker itself comes
-    back as \\u2026. The same shape as the /restart helper's clip."""
-    if isinstance(v, str):
-        return json.dumps(v[:n] + "\u2026" if len(v) > n else v, ensure_ascii=False)
+    never come back as a 1 MB error. Every string is cut INSIDE its quotes and marked, at any depth, so a
+    long string still echoes as one complete quoted thing and the words after it survive; a container
+    is cut at the ELEMENT level, its first few members and a marker member, and nests no deeper than
+    four levels, so the echo is valid JSON whatever arrived (review find, 2026-09-08: a slice of the
+    serialized text cut a container mid-token, and ["xxx... came back with its quote and bracket open);
+    a number past n digits echoes as a marked string, since a cut decimal is a mid-token cut too.
+    Members are dropped until the whole echo fits about 4n characters; ensure_ascii is off, or the
+    marker itself comes back as \\u2026. The same shape as the /restart helper's clip."""
+    mark = "\u2026"
+
+    def cut(x, keep, depth):
+        if isinstance(x, str):
+            return x[:n] + mark if len(x) > n else x
+        if isinstance(x, dict):
+            if not x:
+                return {}
+            if depth >= 4 or keep == 0:
+                return {mark: mark}
+            items = list(x.items())
+            out = {cut(str(k), keep, depth + 1): cut(val, keep, depth + 1) for k, val in items[:keep]}
+            if len(items) > keep:
+                out[mark] = mark
+            return out
+        if isinstance(x, (list, tuple)):
+            if not x:
+                return []
+            if depth >= 4 or keep == 0:
+                return [mark]
+            out = [cut(val, keep, depth + 1) for val in x[:keep]]
+            if len(x) > keep:
+                out.append(mark)
+            return out
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            s = str(x)                                   # a number past n digits (json.loads takes an int of
+            return x if len(s) <= n else s[:n] + mark    # up to 4300) echoes as a marked STRING: a cut
+        return x                                         # decimal would be a mid-token cut
+
     try:
-        s = json.dumps(v, ensure_ascii=False)
+        for keep in (8, 4, 2, 1, 0):
+            s = json.dumps(cut(v, keep, 0), ensure_ascii=False)
+            if len(s) <= 4 * n or keep == 0:
+                return s
     except (TypeError, ValueError):
-        s = repr(v)
-    return s if len(s) <= n else s[:n] + "\u2026"
+        pass
+    s = repr(v)
+    return s if len(s) <= n else s[:n] + mark
 
 
 def _json_object_body(raw):
@@ -19435,11 +19480,15 @@ def _json_object_body(raw):
 
 
 def _as_bool(v, field, default=False):
-    """A request flag as the boolean it claims to be -> (value, error). Absent (None) is `default`; JSON
-    true/false pass through; anything else -- the string "false", 0/1, "no" -- is refused with `error`
-    naming the field, and the caller must NOT act. Never coerces: bool("false") is True, which is how a
-    string used to enable auto-nudge, file editing, the master bell and auto-update, pause retries
-    across every session, make a directory, and delete a tag."""
+    """A request flag as the boolean it claims to be -> (value, error). Absent is `default`, and so is an
+    EXPLICIT JSON null: the routes read their fields with .get(), under which the two are one value, and
+    null is how a client says "no value", the absent case spelled out, not a third kind of flag (review
+    find, 2026-09-08: the rule is stated here and in docs/reference.md, and pinned by the tests, so that
+    "a present non-boolean is refused" is read with null excepted). JSON true/false pass through;
+    anything else -- the string "false", 0/1, "no" -- is refused with `error` naming the field, and the
+    caller must NOT act. Never coerces: bool("false") is True, which is how a string used to enable
+    auto-nudge, file editing, the master bell and auto-update, pause retries across every session, make a
+    directory, and delete a tag."""
     if v is None:
         return default, None
     if v is True or v is False:
@@ -19447,17 +19496,43 @@ def _as_bool(v, field, default=False):
     return None, "'%s' must be true or false, got %s" % (field, _clip_json(v))
 
 
-def _refuse_ws_flag(client, op, err):
+def _json_type_name(v):
+    """The JSON type of a decoded value, for a log line that must not carry the value itself."""
+    if v is None:
+        return "null"
+    if v is True or v is False:
+        return "a boolean"
+    if isinstance(v, str):
+        return "a string"
+    if isinstance(v, (int, float)):
+        return "a number"
+    if isinstance(v, list):
+        return "an array"
+    if isinstance(v, dict):
+        return "an object"
+    return type(v).__name__
+
+
+def _flag_type_note(field, v):
+    """What a refused flag was, for the kernel's OWN log: the field name and the value's JSON type, never
+    the value. The echo of the value belongs in the frame the sending client gets (it asked); the stderr
+    line used to carry up to 60 characters of whatever a client put in the field (review find,
+    2026-09-08), and a log is read by people who never sent it."""
+    return "'%s' is %s, not a boolean" % (field, _json_type_name(v))
+
+
+def _refuse_ws_flag(client, op, err, field="", value=None):
     """A WS frame carried a flag that is not a boolean: one stderr line, and a `warn` frame -- the frame
     the dispatcher answers a malformed request with (a bad session name, a failed login step) -- on the
-    delivering socket. The shipped panes send real booleans, so nothing on screen needs repainting; this
-    reaches the client that sent the string, and the log. The two flags whose pages never render `warn`
-    (setSessionFlag on the timeline, cardNotify on the feed) refuse through _refuse_setting instead, on
-    the settingRefused frame those pages repaint from."""
-    text = "%s: %s" % (op, err)
-    sys.stderr.write("romp-kernel: refused %s\n" % text)
+    delivering socket. The frame carries `err` with its bounded echo of the value (the sender sees what
+    it sent); the stderr line names only the op, the field and the value's type (_flag_type_note). The
+    shipped panes send real booleans, so nothing on screen needs repainting; this reaches the client
+    that sent the string, and the log. The two flags whose pages never render `warn` (setSessionFlag on
+    the timeline, cardNotify on the feed) refuse through _refuse_setting instead, on the settingRefused
+    frame those pages repaint from."""
+    sys.stderr.write("romp-kernel: refused %s: %s\n" % (op, _flag_type_note(field, value)))
     if client and callable(client.get("send")):
-        _reply(client, {"type": "warn", "text": text})
+        _reply(client, {"type": "warn", "text": "%s: %s" % (op, err)})
 
 
 def _parse_send_body(raw):
@@ -40909,9 +40984,11 @@ class Handler(BaseHTTPRequestHandler):
         raising on a run past the interpreter's conversion limit, which 500'd with a traceback); a
         declared length past _POST_MAX_BYTES is refused with 413 before a byte of it is read; and a body
         SHORTER than announced (a dead client, a short read) is refused with 400 naming the shortfall
-        rather than passing as the bytes that did arrive. An absent Content-Length is an empty body (the
-        bodiless POSTs: /tick, /restart). PR #1027 does the announced-vs-arrived check for /restart inside
-        its own parse; the two compose."""
+        rather than passing as the bytes that did arrive; a body that STALLS (an authorized client
+        trickling it) is refused with 408 once the read has waited _POST_BODY_TIMEOUT, so a slow sender
+        cannot pin a handler thread. An absent Content-Length is an empty body (the bodiless POSTs:
+        /tick, /restart). PR #1027 does the announced-vs-arrived check for /restart inside its own
+        parse; the two compose."""
         if self.headers.get("Transfer-Encoding"):
             self.close_connection = True
             return None, (411, "Transfer-Encoding is not accepted; send the body with a Content-Length")
@@ -40931,7 +41008,28 @@ class Handler(BaseHTTPRequestHandler):
         if n > _POST_MAX_BYTES:
             self.close_connection = True
             return None, (413, "request body of %d bytes exceeds the %d-byte limit" % (n, _POST_MAX_BYTES))
-        raw = self.rfile.read(n) if n else b""
+        if not n:
+            return b"", None
+        # The read runs under a socket timeout (_POST_BODY_TIMEOUT), restored afterwards so a served
+        # keep-alive connection waits for its next request exactly as before. `connection` is the
+        # socket the stdlib handler set up; a unit-test handler over a BytesIO has none, and a fake
+        # rfile that stalls raises the same socket.timeout the real one would.
+        sock = getattr(self, "connection", None)
+        prior = sock.gettimeout() if sock is not None else None
+        try:
+            if sock is not None:
+                sock.settimeout(_POST_BODY_TIMEOUT)
+            raw = self.rfile.read(n)
+        except socket.timeout:
+            self.close_connection = True
+            return None, (408, "body could not be read: %d bytes announced, not all of it arrived within %g s"
+                          % (n, _POST_BODY_TIMEOUT))
+        finally:
+            if sock is not None:
+                try:
+                    sock.settimeout(prior)
+                except OSError:
+                    pass                                     # the socket is already gone; the close stands
         if len(raw) < n:
             self.close_connection = True
             return None, (400, "body could not be read: read %d of the %d bytes Content-Length announced" % (len(raw), n))
@@ -42406,7 +42504,7 @@ class Handler(BaseHTTPRequestHandler):
         if msg and msg.get("type") == "setGlobalRetryPaused":
             paused, ferr = _as_bool(msg.get("value"), "value")
             if ferr:                                   # a string here paused retries across EVERY session
-                _refuse_ws_flag(client, msg["type"], ferr)
+                _refuse_ws_flag(client, msg["type"], ferr, "value", msg.get("value"))
                 return
             _set_retry_paused(paused)
             _mark_views_dirty()
@@ -42484,7 +42582,8 @@ class Handler(BaseHTTPRequestHandler):
                 # the lane gear's own refusal frame (settingRefused, which the timeline page renders and
                 # repaints from; a `warn` never reaches it), addressed like the store-fault refusal below
                 _refuse_setting(client, ferr, "that setting", "flag", sid=msg["id"], flag=msg["flag"],
-                                value=_painted_flag_value(str(msg["id"]), str(msg["flag"])))
+                                value=_painted_flag_value(str(msg["id"]), str(msg["flag"])),
+                                log="refused %s: %s" % (msg["type"], _flag_type_note("value", msg.get("value"))))
                 return
             try:
                 if str(msg["flag"]) == "notify":
@@ -42614,7 +42713,8 @@ class Handler(BaseHTTPRequestHandler):
                 # the bell's own refusal frame (settingRefused, which the feed page renders and repaints
                 # from; a `warn` never reaches it), addressed like the store-fault refusal below
                 _refuse_setting(client, ferr, "that bell", "bell", sid=msg.get("sid") or "", item_id=msg["itemId"],
-                                value=bool(_notify_card_effective(_notify_cards(), str(msg["itemId"]), str(msg.get("sid") or ""))))
+                                value=bool(_notify_card_effective(_notify_cards(), str(msg["itemId"]), str(msg.get("sid") or ""))),
+                                log="refused %s: %s" % (msg["type"], _flag_type_note("value", msg.get("value"))))
                 return
             try:
                 _set_notify_card(str(msg["itemId"]), value, str(msg.get("sid") or ""))
@@ -42648,7 +42748,7 @@ class Handler(BaseHTTPRequestHandler):
             # reads the flag fresh each pass, so flipping it needs no restart
             enabled, ferr = _as_bool(msg.get("enabled"), "enabled")
             if ferr:
-                _refuse_ws_flag(client, msg["type"], ferr)
+                _refuse_ws_flag(client, msg["type"], ferr, "enabled", msg.get("enabled"))
                 return
             _set_conserve(enabled)
             _push_soon()
@@ -42658,7 +42758,7 @@ class Handler(BaseHTTPRequestHandler):
             # that made the losing gesture hears it
             enabled, ferr = _as_bool(msg.get("enabled"), "enabled")
             if ferr:
-                _refuse_ws_flag(client, msg["type"], ferr)
+                _refuse_ws_flag(client, msg["type"], ferr, "enabled", msg.get("enabled"))
                 return
             if _set_auto_nudge(enabled, gt=_gesture_ms(msg)) is not None:
                 # turn-ON acts at once instead of waiting out the pusher's 0.5 s backstop; turning off
@@ -42679,7 +42779,7 @@ class Handler(BaseHTTPRequestHandler):
             # (_ws_act_now_tick: single-flight, no dead-wait sweep, a failure logged not raised)
             enabled, ferr = _as_bool(msg.get("enabled"), "enabled")
             if ferr:
-                _refuse_ws_flag(client, msg["type"], ferr)
+                _refuse_ws_flag(client, msg["type"], ferr, "enabled", msg.get("enabled"))
                 return
             if _set_compact_suggest(enabled, gt=_gesture_ms(msg)) is not None:
                 _ws_act_now_tick()
@@ -42695,7 +42795,7 @@ class Handler(BaseHTTPRequestHandler):
             # A stale gesture stamp stands down (a queued flush must not undo a newer choice).
             enabled, ferr = _as_bool(msg.get("enabled"), "enabled")
             if ferr:
-                _refuse_ws_flag(client, msg["type"], ferr)
+                _refuse_ws_flag(client, msg["type"], ferr, "enabled", msg.get("enabled"))
                 return
             if _set_file_editing(enabled, gt=_gesture_ms(msg)) is None:
                 _tell_stale_gesture(client, msg)
@@ -42705,7 +42805,7 @@ class Handler(BaseHTTPRequestHandler):
             # backend reads the store at each session's next connect, so nothing else to do here.
             enabled, ferr = _as_bool(msg.get("enabled"), "enabled")
             if ferr:
-                _refuse_ws_flag(client, msg["type"], ferr)
+                _refuse_ws_flag(client, msg["type"], ferr, "enabled", msg.get("enabled"))
                 return
             if _set_thinking_summaries(enabled, gt=_gesture_ms(msg)) is None:
                 _tell_stale_gesture(client, msg)
@@ -42887,7 +42987,7 @@ class Handler(BaseHTTPRequestHandler):
                 # "that folder doesn't exist" dialog and chose to make it (see createDirMissing below).
                 mk, ferr = _as_bool(msg.get("mkdir"), "mkdir")
                 if ferr:
-                    _refuse_ws_flag(client, msg["type"], ferr)
+                    _refuse_ws_flag(client, msg["type"], ferr, "mkdir", msg.get("mkdir"))
                     return
                 cwd, derr = _resolve_create_dir(msg.get("dir"), create=mk)
                 live = _live_names(_tmux_sessions())

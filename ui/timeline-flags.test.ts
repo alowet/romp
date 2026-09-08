@@ -92,18 +92,13 @@ test("every timeline dot's white border is thin (0.75px) — romp + user dots al
   assert.doesNotMatch(SRC, /stroke: '#e8eef5', 'stroke-width': 1\.5/, "the old 1.5px dot border is gone");
 });
 
-test("the lane toggle hands the kernel a JSON boolean, and the kernel refuses anything else", () => {
-  // the sender: the web host hook coerces to a real boolean before posting — never a string
+test("the lane toggle hands the kernel a JSON boolean", () => {
+  // the sender: the web host hook coerces to a real boolean before posting, never a string. The
+  // receiver's side (setSessionFlag refuses a non-boolean on the settingRefused frame this page renders,
+  // writes nothing, and no handler coerces with bool()) is pinned in the kernel's own lane,
+  // tests/test_kernel_session_flags.py WsFlagsMustBeBooleans, by driving the dispatcher rather than
+  // reading kernel.py as text from here (review find, 2026-09-08: a cross-lane source pin fails the
+  // extension build on a kernel edit that keeps the behaviour).
   const BOOT = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "timeline-boot.ts"), "utf8");
   assert.match(BOOT, /__rompTimelineSetFlag: \(id: string, flag: string, value: unknown\) => post\(\{ type: "setSessionFlag", id, flag, value: !!value \}\)/);
-  // the receiver: setSessionFlag takes only true/false. bool("false") is True, which is how a string
-  // used to set a lane flag; a non-boolean is now refused on the delivering socket and nothing is written
-  const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
-  assert.ok(KERNEL.includes('value, ferr = _as_bool(msg.get("value"), "value")\n            if ferr:'),
-    "setSessionFlag checks the flag before either setter runs");
-  // ...and refuses on the frame THIS page renders (settingRefused, addressed to sid + flag), never a warn
-  assert.ok(KERNEL.includes('_refuse_setting(client, ferr, "that setting", "flag", sid=msg["id"], flag=msg["flag"],'),
-    "the refusal reaches the lane gear, which repaints from settingRefused");
-  assert.ok(KERNEL.includes('_set_session_flag(str(msg["id"]), str(msg["flag"]), value)'), "the checked value reaches the setter");
-  assert.ok(!KERNEL.includes('bool(msg.get("value"))'), "no WS handler coerces a value flag with bool()");
 });

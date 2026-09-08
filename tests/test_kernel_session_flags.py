@@ -869,6 +869,57 @@ class WsFlagsMustBeBooleans(unittest.TestCase):
         km._flags_cache.clear()
         self.assertEqual(km._session_flags().get(self.SID), {"notify": True})
 
+    def test_the_log_names_the_field_and_its_type_never_the_value(self):
+        # review find, 2026-09-08: the stderr line carried up to 60 characters of whatever a client put
+        # in the field; the echo belongs in the frame the sender gets, the log names the field and type
+        import io
+        leak = "SECRET-VALUE-TESTHOST"
+        frames = (
+            ({"type": "setAutoNudge", "enabled": leak}, "'enabled' is a string, not a boolean", "warn"),
+            ({"type": "setGlobalRetryPaused", "value": [leak]}, "'value' is an array, not a boolean", "warn"),
+            ({"type": "setSessionFlag", "id": self.SID, "flag": "hideFromFeed", "value": leak},
+             "'value' is a string, not a boolean", "settingRefused"),
+            ({"type": "cardNotify", "itemId": self.SID + ":g1", "sid": self.SID, "value": {"k": leak}},
+             "'value' is an object, not a boolean", "settingRefused"),
+            ({"type": "createSession", "name": "fresh", "dir": "/nonexistent/TESTHOST", "mkdir": 7},
+             "'mkdir' is a number, not a boolean", "warn"),
+        )
+        for frame, note, kind in frames:
+            client, sent = self._client()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                km.Handler._dispatch_ws(None, frame, client)
+            line = err.getvalue()
+            self.assertIn("romp-kernel: refused %s: %s" % (frame["type"], note), line, (frame, line))
+            self.assertNotIn(leak, line, "the client's value stays out of the kernel's log")
+            self.assertEqual(len(sent), 1, (frame, sent))
+            self.assertEqual(sent[0]["type"], kind)
+            field = [k for k in ("enabled", "value", "mkdir") if k in frame][0]
+            self.assertIn("'%s' must be true or false, got %s" % (field, json.dumps(frame[field])), sent[0]["text"],
+                          "the sender still sees what it sent")
+
+    def test_an_explicit_null_value_reads_as_absent(self):
+        # the rule _as_bool states (review find, 2026-09-08): null takes the field's default (off), where a
+        # string or a number is refused; no frame, since nothing was refused
+        km._set_session_flag(self.SID, "hideFromFeed", True)
+        km._flags_cache.clear()
+        self.assertTrue(km._session_flag(self.SID, "hideFromFeed"))
+        client, sent = self._client()
+        km.Handler._dispatch_ws(None, {"type": "setSessionFlag", "id": self.SID, "flag": "hideFromFeed", "value": None}, client)
+        km._flags_cache.clear()
+        self.assertFalse(km._session_flag(self.SID, "hideFromFeed"))
+        self.assertEqual(sent, [])
+
+    def test_no_ws_handler_coerces_a_gated_flag_with_bool(self):
+        # moved here from ui/timeline-flags.test.ts (review find, 2026-09-08): a kernel source pin
+        # belongs in the kernel's own lane, where a kernel change runs it. The behaviour itself is
+        # test_kernel_settings_refuse_strings_and_apply_real_booleans above; this catches a coercion
+        # slipped back in beside the gate
+        src = open(os.path.join(BIN, "romp-kernel"), encoding="utf-8").read()
+        for field in ('msg.get("value")', 'msg.get("enabled")', 'msg.get("mkdir")', 'e.get("delete")',
+                      'b.get("delete")', 'b.get("on")', 'b.get("mkdir")', 'body.get("on")', 'msg["enabled"]'):
+            self.assertNotIn("bool(%s)" % field, src, "%s is checked by _as_bool, never coerced" % field)
+
     def test_create_session_refuses_a_string_mkdir_before_touching_the_disk(self):
         calls = []
         saved = km._resolve_create_dir

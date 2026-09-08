@@ -151,6 +151,32 @@ class NonObjectBodies(unittest.TestCase):
         self.assertEqual(err, 'body must be a JSON object, got "' + "x" * 60 + '\u2026"')
         self.assertLess(len(err), 100)
 
+    def test_a_container_holding_a_long_string_echoes_well_formed_at_any_depth(self):
+        # review find, 2026-09-08: the echo was well formed only for a top-level string; a container
+        # holding a long one was sliced as serialized text and came back with its quote and bracket
+        # open. Every string is now cut inside its quotes, a container at the element level, and the
+        # nesting is bounded, so the echo parses whatever arrived
+        cases = (
+            (["x" * 100_000], ["x" * 60 + "\u2026"]),
+            ([{"a": ["y" * 5000]}], [{"a": ["y" * 60 + "\u2026"]}]),
+            (list(range(1000)), [0, 1, 2, 3, 4, 5, 6, 7, "\u2026"]),
+            ([[[[[[1]]]]]], [[[[["\u2026"]]]]]),
+            ([{"k%d" % i: "v" * 200 for i in range(50)}], None),
+            (int("7" * 4000), "7" * 60 + "\u2026"),          # a number past the bound: a marked string,
+        )                                                    # since a cut decimal is a mid-token cut
+        for raw, want in cases:
+            st, body = self._post_raw("/rename", json.dumps(raw).encode())
+            self.assertEqual(st, 400, (str(raw)[:80], body[:160]))
+            err = json.loads(body)["error"]
+            self.assertTrue(err.startswith("body must be a JSON object, got "), err)
+            echo = err[len("body must be a JSON object, got "):]
+            self.assertLess(len(echo), 300, "bounded whatever the size of what arrived")
+            parsed = json.loads(echo)                        # well formed: the whole point
+            if want is not None:
+                self.assertEqual(parsed, want, (str(raw)[:80], echo))
+        st, body = self._post_raw("/rename", json.dumps([{"a": ["y" * 5000]}]).encode())
+        self.assertEqual(json.loads(body)["error"], 'body must be a JSON object, got [{"a": ["' + "y" * 60 + '\u2026"]}]')
+
 
 if __name__ == "__main__":
     unittest.main()

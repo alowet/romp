@@ -20,6 +20,7 @@ import json
 import os
 import socket
 import threading
+import time
 import unittest
 from http.client import HTTPMessage
 from http.server import ThreadingHTTPServer
@@ -395,12 +396,15 @@ class _RfileSpy:
         return out
 
 
-def _serve_post(path, headers=None, body=b"", rfile=None):
+def _serve_post(path, headers=None, body=b"", rfile=None, connection=None):
     """Drive the REAL do_POST dispatcher over a fake socket -> (status, response headers, body text,
     handler). `headers` is a dict or an http.client.HTTPMessage -- the type the live server parses
-    into, and the one that can carry a header TWICE (a dict cannot)."""
+    into, and the one that can carry a header TWICE (a dict cannot). `connection`, when given, stands
+    in for the socket the body read puts its timeout on."""
     h = km.Handler.__new__(km.Handler)
     h.client_address = ("127.0.0.1", 0)
+    if connection is not None:
+        h.connection = connection
     h.headers = headers if headers is not None else {}
     h.path = path
     h.command = "POST"
@@ -500,6 +504,48 @@ class PostBodyGate(unittest.TestCase):
         self.assertEqual(spy.reads, [])
         self.assertTrue(h.close_connection)
 
+    def test_a_body_that_stalls_is_408_and_closes_and_the_socket_timeout_is_restored(self):
+        # review find, 2026-09-08: the in-bounds read had no socket timeout, so an AUTHORIZED client
+        # that announced a body and trickled it pinned a handler thread for as long as it liked
+        class Stall:
+            reads = []
+
+            def read(self, n=-1):
+                self.reads.append(n)
+                raise socket.timeout("timed out")           # what the real rfile raises past the deadline
+
+        class Sock:
+            def __init__(self):
+                self.timeouts, self._t = [], None
+
+            def gettimeout(self):
+                return self._t
+
+            def settimeout(self, t):
+                self.timeouts.append(t)
+                self._t = t
+        sock = Sock()
+        st, hdrs, body, h = _serve_post("/perf", {"X-Romp-Token": TOK, "Content-Length": "100"},
+                                        rfile=Stall(), connection=sock)
+        self.assertEqual(st, 408)
+        r = json.loads(body)
+        self.assertIs(r["ok"], False)
+        self.assertEqual(r["error"], "body could not be read: 100 bytes announced, not all of it arrived within %g s"
+                         % km._POST_BODY_TIMEOUT)
+        self.assertTrue(h.close_connection, "a half-arrived body cannot stay on a keep-alive socket")
+        self.assertEqual(hdrs.get("Connection"), "close")
+        self.assertEqual(sock.timeouts, [km._POST_BODY_TIMEOUT, None],
+                         "the read ran under the body timeout, and the socket's own (none) came back")
+        self.assertEqual(Stall.reads, [100], "the read was attempted once, for the announced length")
+        # a body that ARRIVES under the same timeout is served, and the timeout is restored just the same
+        sock = Sock()
+        raw = b'{"log": false}'
+        st, hdrs, body, h = _serve_post("/perf", {"X-Romp-Token": TOK, "Content-Length": str(len(raw))},
+                                        body=raw, connection=sock)
+        self.assertEqual((st, json.loads(body)), (200, {"ok": True, "log": False}))
+        self.assertEqual(sock.timeouts, [km._POST_BODY_TIMEOUT, None])
+        self.assertFalse(h.close_connection)
+
     def test_an_absent_content_length_is_an_empty_body_never_a_read(self):
         # the hook's bodiless POST /tick, and any bodiless POST: served on an empty body without a read
         spy = _RfileSpy(b"")
@@ -572,6 +618,27 @@ class PostBodyGateOverTheWire(unittest.TestCase):
         self.assertEqual(st, 400, r)
         self.assertEqual(r["error"], "body could not be read: more than one Content-Length header")
         self.assertIn("Connection: close", head)
+
+    def test_a_trickling_body_is_408_over_the_wire_and_the_connection_closes(self):
+        # 100 bytes announced, 10 sent, the sending side left OPEN (no half-close, so no EOF): before the
+        # body timeout this read blocked for as long as the client cared to hold the socket
+        saved = km._POST_BODY_TIMEOUT
+        km._POST_BODY_TIMEOUT = 0.5
+        try:
+            t0 = time.monotonic()
+            st, r, head = _raw_post(self.port, "/rename", [("X-Romp-Token", TOK), ("Content-Length", "100")],
+                                    body=b'{"target":', half_close=False)
+            took = time.monotonic() - t0
+        finally:
+            km._POST_BODY_TIMEOUT = saved
+        self.assertEqual(st, 408, r)
+        self.assertEqual(r, {"ok": False, "error": "body could not be read: 100 bytes announced, not all of it arrived within 0.5 s"})
+        self.assertIn("Connection: close", head)
+        self.assertLess(took, 5, "answered on the body timeout, not on the client giving up")
+        # the server is still serving: the next request lands
+        st, r, head = _raw_post(self.port, "/rename", [("X-Romp-Token", TOK), ("Content-Length", "2")], body=b"{}")
+        self.assertEqual(st, 400, r)
+        self.assertNotIn("announced", r.get("error", ""))
 
 
 if __name__ == "__main__":

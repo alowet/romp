@@ -52,6 +52,21 @@ These are for scripting and for agents rather than daily use:
 | `romp resume <id> [--name <n>] [--detach]` | Resume one exact conversation by UUID |
 | `romp refresh --quiet` | Refresh at the next quiet window instead — waits for sessions to finish their turns (15-min backstop) |
 
+Raw `POST` callers, anything that talks to the kernel's routes directly rather
+than through `romp`, follow one body contract, and the postal bus's own routes
+share it. The request carries the serve token (`X-Romp-Token`, or `?token=`)
+and is authorized before its body is read. The body is delimited by
+`Content-Length` alone: no `Transfer-Encoding` (411), the header once and a
+plain decimal (400 otherwise), and at most 1 MiB (413 beyond that, refused
+before a byte is read). A body that arrives short of its announced length is
+400, one that stalls for 30 seconds is 408, and every refusal closes the
+connection. The body is a JSON object; an array, string, number or `null` is a
+400 naming what arrived, echoed bounded and well formed. A flag field
+(`delete`, `on`, `mkdir`, `tracked`, and the like) is a JSON boolean: `true`
+and `false` apply, an absent field or an explicit `null` reads as the route's
+default, and anything else (the string `"false"`, `0`, `1`) is a 400 naming the
+field, with nothing acted on.
+
 `--env` gives one session its own environment, so two sessions in the same
 directory can run with different toggles (a `FEATURE_FLAG=1`, a `CLAUDE_CODE_*`
 switch) without editing the directory's `.claude/settings*.json`, which reaches
