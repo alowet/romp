@@ -32,13 +32,16 @@ test("a scroll event within a pixel of the last programmatic write is its echo; 
 });
 
 test("the row names the writer and carries before/after/delta/stick, gesture:false", () => {
-  assert.deepEqual(scrollWriteRow(SID, "append-stick", 100, 340, true),
-                   { sid: SID, writer: "append-stick", before: 100, after: 340, delta: 240, stick: true, gesture: false });
+  assert.deepEqual(scrollWriteRow(SID, "append-stick", 100, 340, true, 5000, 600),
+                   { sid: SID, writer: "append-stick", before: 100, after: 340, delta: 240, stick: true, gesture: false, sh: 5000, ch: 600 });
+  // T262e: every row carries #content's scrollHeight/clientHeight, so an UNWRITTEN move in the journal can be told
+  // apart: a clamp after the tail shrank (sh dropped, top == sh - ch) vs the browser's anchoring (sh unchanged)
+  assert.deepEqual(scrollWriteRow(SID, "land-saved", 0, 10, false), { sid: SID, writer: "land-saved", before: 0, after: 10, delta: 10, stick: false, gesture: false, sh: 0, ch: 0 });
 });
 
 test("render.ts: one helper writes #content.scrollTop, files the row only when the view moved, and no raw write remains", () => {
   assert.match(RENDER, /import \{ ScrollDiagBudget, classifyScroll, scrollWriteRow \} from "\.\/scroll-write";/);
-  assert.match(RENDER, /function writeScroll\(content: HTMLElement, top: number, writer: string, stick = false\): void \{\s*\n\s*const before = content\.scrollTop;\s*\n\s*content\.scrollTop = top;\s*\n\s*const after = content\.scrollTop;\s*\n\s*lastScrollWriteAfter = after;\s*\n\s*if \(after !== before\) scrollDiagRow\("scrollwrite", scrollWriteRow\(activeId \|\| "", writer, before, after, stick\)\);/);
+  assert.match(RENDER, /function writeScroll\(content: HTMLElement, top: number, writer: string, stick = false\): void \{\s*\n\s*const before = content\.scrollTop;\s*\n\s*content\.scrollTop = top;\s*\n\s*const after = content\.scrollTop;\s*\n\s*lastScrollWriteAfter = after;\s*\n\s*if \(after !== before\) scrollDiagRow\("scrollwrite", scrollWriteRow\(activeId \|\| "", writer, before, after, stick, content\.scrollHeight, content\.clientHeight\)\);/);
   // the breadcrumb rides the existing clientDiag path, capped, with one capped row at the cap
   assert.match(RENDER, /\{ type: "clientDiag", surface: "chat", what: kind \+ "-capped", data: \{ sid: activeId \|\| "", perMinute: 40 \} \}/);
   assert.match(RENDER, /\{ type: "clientDiag", surface: "chat", what: kind, data \}/);
@@ -52,5 +55,5 @@ test("render.ts: one helper writes #content.scrollTop, files the row only when t
   const raw = RENDER.split("\n").filter((l) => /\b(content|c)\.scrollTop (=|\+=|-=) /.test(l) && !/writeScroll|const |let /.test(l));
   assert.deepEqual(raw.map((l) => l.trim()), ["content.scrollTop = top;"], "the only assignment is the helper's own");
   // the gesture marker: a write's echo is consumed, anything else files a gesture row
-  assert.match(RENDER, /if \(classifyScroll\(c\.scrollTop, lastScrollWriteAfter\) === "write-echo"\) lastScrollWriteAfter = null;\s*\n\s*else scrollDiagRow\("scrollgesture", \{ sid: activeId \|\| "", top: c\.scrollTop, gesture: true \}\);/);
+  assert.match(RENDER, /if \(classifyScroll\(c\.scrollTop, lastScrollWriteAfter\) === "write-echo"\) lastScrollWriteAfter = null;\s*\n\s*else scrollDiagRow\("scrollgesture", \{ sid: activeId \|\| "", top: c\.scrollTop, gesture: true, sh: c\.scrollHeight, ch: c\.clientHeight \}\);/);
 });

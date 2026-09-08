@@ -9282,7 +9282,7 @@ function writeScroll(content: HTMLElement, top: number, writer: string, stick = 
   content.scrollTop = top;
   const after = content.scrollTop;
   lastScrollWriteAfter = after;
-  if (after !== before) scrollDiagRow("scrollwrite", scrollWriteRow(activeId || "", writer, before, after, stick));
+  if (after !== before) scrollDiagRow("scrollwrite", scrollWriteRow(activeId || "", writer, before, after, stick, content.scrollHeight, content.clientHeight));
 }
 
 function cssEscape(s: string): string {
@@ -10528,7 +10528,7 @@ window.addEventListener("resize", updateJumpBtn);
     // the scroll nobody's code asked for is the user's (T262): filed so a recording lines up with the journal;
     // a write's own echo (within a pixel of the value written) is consumed here and never read as a gesture
     if (classifyScroll(c.scrollTop, lastScrollWriteAfter) === "write-echo") lastScrollWriteAfter = null;
-    else scrollDiagRow("scrollgesture", { sid: activeId || "", top: c.scrollTop, gesture: true });
+    else scrollDiagRow("scrollgesture", { sid: activeId || "", top: c.scrollTop, gesture: true, sh: c.scrollHeight, ch: c.clientHeight });   // sh/ch: a clamp reads top == sh - ch after sh dropped (T262e)
   }, { passive: true });
 }
 // Boxes ABOVE the transcript grow/shrink → keep the chat text visually anchored (the user 2026-06-30 for
