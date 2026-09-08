@@ -13017,6 +13017,21 @@ let shipGateSid: string | null = null;
 // Assigned by setupComposer (sendComposer lives in its closure); the WS ack handler fires a held
 // send through it when the last pending ship lands.
 let fireHeldSend: () => void = () => {};
+// The reload core (kernel.py _RELOAD_CORE_JS) asks every pane before it reloads the page (T265). A page reload
+// costs an upload in flight its bytes (persistDrafts keeps only the names, for the loss toast) and a send held on
+// the upload gate its release — the T215 wedge the reconnect re-ship heals in the same page. So while a ship
+// awaits its ack, or a send is held on one, this pane reports itself busy and the core waits for the ending event
+// (the ack retires the chip, the held send fires) before it fires; the shim's own reasons come first (T272).
+{
+  const shimBusy = (window as any).__rompPaneBusy as (() => string) | undefined;
+  (window as any).__rompPaneBusy = (): string => {
+    const b = shimBusy ? shimBusy() : "";
+    if (b) return b;
+    if (pendingShips.size) return "upload";
+    if (shipGateSid) return "held-send";
+    return "";
+  };
+}
 
 // Persist drafts across a full RELOAD (the user 2026-06-25: a half-typed message must survive a refresh, not
 // only a tab switch). The Map is in-memory, so mirror it into the webview's persisted state — the same store
