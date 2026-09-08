@@ -5,8 +5,11 @@
 // must reach the eye that made it AND end the optimistic state on that event. Before it, the kernel sent a
 // `warn`, which only the chat page renders -- a refused bell on the feed page and a refused lane flag on the
 // timeline page stayed painted as if they had landed until a reload, their sticky latches never released.
-// No jsdom for the renderers, so the pane handlers are pinned at source (the card-notify / undelivered-err
-// pattern); the boot dispatch is exercised for real.
+// The feed and chat handlers are pinned at source (the card-notify / undelivered-err pattern: their pages
+// need a DOM); the timeline's runs for real -- romp-timeline-view.js loads under plain node, and
+// Object.create(TimelinePanel.prototype) drives the method the way tests/test_timeline_touch.py does (review
+// find, 2026-09-08: the regex pins could not tell a released latch from a wiped one). The boot dispatch is
+// exercised for real too.
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -40,6 +43,52 @@ test("the kernel answers a refused store write on the DELIVERING socket, address
     assert.ok(block.length < 2000, "the arm's own except sits just above its refusal: " + what);
     assert.doesNotMatch(block, /"type": "warn"/, "no store-fault arm answers with a warn frame: " + what);
   }
+});
+
+test("timeline (executed): only the refused sid+flag leaves the latch; both copies repaint to the frame's value; the gear rebuilds only when open for that sid", () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { TimelinePanel } = require(path.join(ROOT, "ui", "romp-timeline-view.js"));
+  const mk = (over: Record<string, unknown> = {}) => {
+    const v: any = Object.create(TimelinePanel.prototype);
+    v._pendingFlags = { s1: { notify: true, hideFromFeed: true }, s2: { notify: true } };
+    v.data = { sessions: [{ id: "s1", notify: true, hideFromFeed: true }, { id: "s2", notify: true }] };
+    v._laneMenu = { _sid: "s1", _session: { id: "s1", notify: true } };
+    v.builds = 0; v._laneMenuBuild = function () { this.builds++; };
+    v.draws = 0; v.draw = function () { this.draws++; };
+    Object.assign(v, over);
+    return v;
+  };
+  const posted: any[] = [];
+  (globalThis as any).window = { parent: { postMessage: (m: any) => posted.push(m) } };
+  try {
+    const v = mk();
+    v.settingRefused({ type: "settingRefused", gesture: "flag", sid: "s1", flag: "notify", value: false, text: "couldn't save that setting" });
+    assert.deepEqual(v._pendingFlags, { s1: { hideFromFeed: true }, s2: { notify: true } }, "only s1's notify latch is released");
+    assert.equal(v.data.sessions[0].notify, false, "the frame's session repaints to the kernel's painted value");
+    assert.equal(v._laneMenu._session.notify, false, "so does the copy the open gear built from");
+    assert.equal(v.data.sessions[1].notify, true, "another session is untouched");
+    assert.deepEqual(v._laneRefusal, { sid: "s1", flag: "notify", text: "couldn't save that setting" });
+    assert.equal(v.builds, 1, "the gear is open for s1: rebuilt in place");
+    assert.equal(v.draws, 1);
+    assert.deepEqual(posted, [{ romp: "notify", kind: "refused", text: "couldn't save that setting", sid: "s1" }], "filed in the shell's bell under its own kind");
+    // the gear open for ANOTHER lane is neither rebuilt nor repainted
+    const w = mk({ _laneMenu: { _sid: "s2", _session: { id: "s2", notify: true } } });
+    w.settingRefused({ type: "settingRefused", gesture: "flag", sid: "s1", flag: "notify", value: false, text: "x" });
+    assert.equal(w.builds, 0);
+    assert.equal(w._laneMenu._session.notify, true);
+    assert.equal(w.data.sessions[0].notify, false, "the frame's session still repaints");
+    // the last latch on a sid releases the whole entry; a frame without a boolean value repaints nothing
+    const u = mk({ _pendingFlags: { s1: { hideFromFeed: true } } });
+    u.settingRefused({ type: "settingRefused", gesture: "flag", sid: "s1", flag: "hideFromFeed", text: "x" });
+    assert.deepEqual(u._pendingFlags, {});
+    assert.equal(u.data.sessions[0].hideFromFeed, true);
+    // a bell gesture (the feed's) touches no lane state and rebuilds no gear
+    const b = mk();
+    b.settingRefused({ type: "settingRefused", gesture: "bell", sid: "s1", itemId: "s1:g1", value: true, text: "x" });
+    assert.deepEqual(b._pendingFlags, { s1: { notify: true, hideFromFeed: true }, s2: { notify: true } });
+    assert.equal(b.builds, 0);
+    assert.equal(b.draws, 1, "…but still repaints, and files the text");
+  } finally { delete (globalThis as any).window; }
 });
 
 test("both timeline boots (VS Code and the kernel's inline browser twin) hand the frame to the panel", () => {
@@ -110,7 +159,10 @@ test("the shell's bell knows the `refused` kind: listed, labelled, explained, an
   // anomaly stamp) never mutes a change of yours that did not land
   assert.match(KERNEL, /var KINDS=\[[^\]]*'refused','undelivered'\]/);
   assert.match(KERNEL, /refused:'not saved'/);
-  assert.match(KERNEL, /refused:"a change you made \\u2014 a lane or tab setting, a card bell, a tag or view, a lane order \\u2014 was not saved because the file that holds it could not be read or written/);
+  // the tooltip covers BOTH things filed under the kind (review find, 2026-09-08): a change that did not
+  // save (a read OR a write fault), and a state file that could not be read or was moved aside
+  assert.match(KERNEL, /refused:"a setting that could not be saved, or a state file that could not be read\. A change you made \\u2014 a lane or tab setting, a card bell, a lane order \\u2014 was not saved because romp could not read or write the file that holds it/);
+  assert.match(KERNEL, /refused:"[^"]*could not be read \(the last values are shown until it can\), or held bytes romp could not parse and was moved aside/);
   assert.match(KERNEL, /\.rerr-chip\.k-refused\{color:#ffd166;border-color:rgba\(255,209,102,0\.6\)\}/);
   // and every pane files under it -- none under `warn`
   for (const src of [FEED, RENDER, VIEW]) assert.doesNotMatch(src.slice(src.indexOf("settingRefused")), /kind: ['"]warn['"]/);

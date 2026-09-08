@@ -396,11 +396,32 @@ class NotifyStoreUnreadableRefuses(unittest.TestCase):
 
 import contextlib
 import errno
+import shutil
+import subprocess
 import threading
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from unittest import mock
+
+
+@contextlib.contextmanager
+def _stat_fault(target):
+    """Fail every stat of ONE path with an EACCES for the duration of the block -- the arm the read-fault
+    injector never reaches (review find, 2026-09-08): every reader stats BEFORE it reads (the display
+    readers key their cache on it), and a state dir that cannot be searched faults exactly there.
+    Everything else stats normally."""
+    real_stat = Path.stat
+    tgt = str(target)
+    def st(self, *a, **k):
+        if str(self) == tgt:
+            raise OSError(errno.EACCES, "injected EACCES")
+        return real_stat(self, *a, **k)
+    Path.stat = st
+    try:
+        yield
+    finally:
+        Path.stat = real_stat
 
 
 @contextlib.contextmanager
@@ -454,8 +475,12 @@ class NotifyDisplayReaderServesUnproved(unittest.TestCase):
         km._notify_cards_cache.clear()
         km._flags_cache.clear()
         km._state_fault_seen.clear()
+        self.notices = []
+        self._notice = km._sync_notice
+        km._sync_notice = lambda text, ok=True, kind="sync": self.notices.append((text, ok, kind))
 
     def tearDown(self):
+        km._sync_notice = self._notice
         jd.STATE = self.saved
         km._notify_cards_cache.clear()
         km._flags_cache.clear()
@@ -464,6 +489,72 @@ class NotifyDisplayReaderServesUnproved(unittest.TestCase):
 
     def _path(self):
         return jd.STATE / "notify-cards.json"
+
+    def test_a_stat_fault_serves_the_last_read_value_and_refuses_the_writers(self):
+        km._set_notify_card(self.SID + ":g1", True)
+        km._notify_cards_cache.clear()
+        self.assertEqual(km._notify_cards(), {self.SID + ":g1": True})   # primes the cache
+        key1 = km._notify_cards_cache[str(self._path())][0]
+        before = self._path().read_bytes()
+        with _stat_fault(self._path()):
+            self.assertEqual(km._notify_cards(), {self.SID + ":g1": True}, "the stat arm serves the LAST value read")
+            self.assertEqual(km._notify_cards_cache[str(self._path())], (key1, {self.SID + ":g1": True}), "and caches nothing new")
+            with self.assertRaises(km._StateUnreadable) as cm:
+                km._notify_cards_proved()
+            self.assertIn("stat failed: [Errno 13]", str(cm.exception))
+            with self.assertRaises(km._StateUnreadable):
+                km._set_notify_all(True)                                 # a writer refuses on the stat fault too
+        self.assertEqual(self._path().read_bytes(), before)
+        bad = [t for t, ok, _k in self.notices if not ok]
+        self.assertEqual(len(bad), 1, "one notice for the episode, from the display reader's stat arm")
+        self.assertIn("notify-cards.json could not be read (stat failed: [Errno 13]", bad[0])
+        km._notify_cards_cache.clear()
+        with _stat_fault(self._path()):
+            self.assertEqual(km._notify_cards(), {}, "a cold cache serves the empty default under a stat fault")
+            self.assertNotIn(str(self._path()), km._notify_cards_cache, "…uncached")
+
+    def test_the_prune_on_a_card_leaving_skips_the_pass_on_a_fault_loud_once(self):
+        # the body's claim, unpinned until now (review find, 2026-09-08: deleting the prune's try/except
+        # passed the suite): the prune that runs when a card leaves the feed skips its pass on a fault
+        # instead of pruning against a fabricated {} and writing the truncation over every override
+        km._set_notify_card(self.SID + ":g1", True)
+        km._set_notify_card(self.SID + ":g2", True)
+        km._notify_cards_cache.clear()
+        before = self._path().read_bytes()
+        with _reads_fault(self._path()):
+            km._prune_notify_cards({self.SID + ":g1"})                  # g2 left the feed: a clean pass drops it
+            km._prune_notify_cards({self.SID + ":g1"})
+        self.assertEqual(self._path().read_bytes(), before, "a fault must not prune against a fabricated {} and write it")
+        bad = [t for t, ok, _k in self.notices if not ok]
+        self.assertEqual(len(bad), 1, "loud once per episode, not once per pass")
+        self.assertIn("notify-cards.json could not be read", bad[0])
+        km._prune_notify_cards({self.SID + ":g1"})                      # the disk recovers: the pass prunes as before
+        self.assertEqual(km._notify_cards_proved(), {self.SID + ":g1": True})
+
+    def test_a_quarantine_tells_the_dashboard_once_under_the_refused_kind(self):
+        # review find, 2026-09-08: a quarantine reset every bell override with only a stderr line
+        torn = b'{"*": true, "' + self.SID.encode() + b':g1":'
+        self._path().write_bytes(torn)
+        self.assertEqual(km._notify_cards_proved(), {})
+        self.assertEqual(len(self.notices), 1)
+        text, ok, kind = self.notices[0]
+        self.assertEqual((ok, kind), (False, "refused"))
+        self.assertIn("notify-cards.json could not be parsed and was moved aside to notify-cards.json.corrupt-", text)
+        self.assertIn("start over empty", text)
+        self.assertEqual(km._notify_cards_proved(), {})                  # the next read is an ENOENT …
+        self.assertEqual(len(self.notices), 1, "… and files nothing more")
+
+    def test_valid_json_of_the_wrong_shape_is_quarantined_not_read_as_empty(self):
+        # review find, 2026-09-08: a LIST where the bells dict belongs read as a proved empty store and
+        # was overwritten by the next bell click -- a file none of our writers produce, gone
+        wrong = b'["' + self.SID.encode() + b':g1"]'
+        self._path().write_bytes(wrong)
+        self.assertEqual(km._notify_cards_proved(), {}, "empty only AFTER the bytes are moved aside")
+        aside = list(jd.STATE.glob("notify-cards.json.corrupt-*"))
+        self.assertEqual(len(aside), 1, "quarantined like torn bytes")
+        self.assertEqual(aside[0].read_bytes(), wrong)
+        self.assertFalse(self._path().exists())
+        self.assertEqual([k for _t, _ok, k in self.notices], ["refused"])
 
     def test_a_fault_serves_the_last_read_value_and_caches_nothing_new(self):
         km._set_notify_card(self.SID + ":g1", True)
@@ -536,13 +627,33 @@ class NotifyWsRefusal(unittest.TestCase):
         self.assertEqual(km._notify_cards().get(self.SID + ":g2"), True)
         self.assertEqual(self.dirty, [1])
 
+    def test_a_refusal_carries_the_painted_value_when_the_bell_is_on(self):
+        # `value` is what the display path still PAINTS for the card. Every other case here paints off
+        # (review find, 2026-09-08: a constant False survived), so this one paints ON: the master is on and
+        # the card has no override. The file then moves on (a new stat key) so the faulted read is a real
+        # miss served from the primed cache, not a cache hit
+        km._set_notify_all(True)
+        km._notify_cards_cache.clear()
+        km._notify_cards()                                              # prime the display cache
+        km._set_notify_card(self.SID + ":g9", False, self.SID)          # a stored mute elsewhere: bumps the stat key
+        p = jd.STATE / "notify-cards.json"
+        before = p.read_bytes()
+        sent = []
+        client = {"app": "feed", "wid": "w1", "alive": True, "send": lambda raw: sent.append(json.loads(raw))}
+        with _reads_fault(p):
+            km.Handler._dispatch_ws(None, {"type": "cardNotify", "itemId": self.SID + ":g2", "sid": self.SID, "value": False}, client)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["gesture"], "bell")
+        self.assertIs(sent[0]["value"], True, "no override, master on: the card paints ON, and the frame says so")
+        self.assertEqual(p.read_bytes(), before)
+
 
 class NotifyRoutesRefuseInTheirOwnShape(unittest.TestCase):
-    """POST /notify-all and /notify-turns under a store fault answer 200 with the route's own
-    refusal body -- {ok:false, retryable:true, error} -- never a 5xx: the shell's post() reads
-    ok:false as the refusal it is, whereas a non-2xx reached it as raw JSON inside an HTTP error;
-    and a federation forward treats any non-200 as a tunnel hiccup. Live server: the POST needs a
-    real Content-Length read."""
+    """POST /notify-all and /notify-turns under a store fault -- a read fault, or a publish that
+    fails -- answer 200 with the shape every kernel refusal wears, {ok:false, error} (as /send and
+    /new answer theirs), never a 5xx: the shell's post() consumes that shape, whereas a non-2xx
+    reached it as raw JSON inside an HTTP error. No `retryable` key: nothing reads one (review find,
+    2026-09-08). Live server: the POST needs a real Content-Length read."""
 
     @classmethod
     def setUpClass(cls):
@@ -586,7 +697,8 @@ class NotifyRoutesRefuseInTheirOwnShape(unittest.TestCase):
         with _reads_fault(p):
             status, body = self._post(path, {"on": True})
         self.assertEqual(status, 200, "%s: the refusal rides the route's own 200 shape, never a 5xx" % path)
-        self.assertEqual((body["ok"], body["retryable"]), (False, True))
+        self.assertIs(body["ok"], False)
+        self.assertNotIn("retryable", body, "%s: no key the shell's post() never reads" % path)
         self.assertIn("notify-cards.json could not be read", body["error"])
         self.assertIn("try again", body["error"])
         self.assertEqual(p.read_bytes(), before, "%s: the bells file is untouched" % path)
@@ -609,7 +721,8 @@ class NotifyRoutesRefuseInTheirOwnShape(unittest.TestCase):
         with _writes_fault(p):
             status, body = self._post(path, {"on": True})
         self.assertEqual(status, 200, "%s: a failed publish rides the route's own 200 shape, never a 500" % path)
-        self.assertEqual((body["ok"], body["retryable"]), (False, True))
+        self.assertIs(body["ok"], False)
+        self.assertNotIn("retryable", body, "%s: no key the shell's post() never reads" % path)
         self.assertIn("notify-cards.json could not be written", body["error"])
         self.assertIn("No space left on device", body["error"])
         self.assertIn("try again", body["error"])
@@ -628,22 +741,76 @@ class NotifyRoutesRefuseInTheirOwnShape(unittest.TestCase):
         self.assertIn(("shell", {"type": "notifyTurns", "on": True}), self.sent)
 
 
+_POST_HARNESS = r"""
+const src = process.argv[1], answers = JSON.parse(process.argv[2]);
+let i = 0;
+global.fetch = function (path) {
+  const a = answers[i++];
+  return Promise.resolve({ ok: a.status < 400, status: a.status,
+    json: () => (a.body === undefined ? Promise.reject(new Error('no json')) : Promise.resolve(a.body)),
+    text: () => Promise.resolve(a.text || '') });
+};
+eval(src + '\nglobal.post = post;');                     // the popover's post(), verbatim from the shell
+const out = [];
+(async () => {
+  for (const a of answers) {
+    try { out.push({ resolved: await post(a.path, {}) }); }
+    catch (e) { out.push({ rejected: String(e && e.message) }); }
+  }
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+
+
 class ShellSwitchesReadTheRefusal(unittest.TestCase):
     """The bell popover's switches post through one post() helper. With the routes refusing as 200
     ok:false, a helper that resolved on any 2xx would run the SUCCESS arm -- flipping the switch to
-    the state the kernel just refused. It must reject on ok:false with the route's `error`, so the
-    switch stays where it was and the reason toasts through the same fail() the transport errors use."""
+    the state the kernel just refused. It must reject on the refusal shape ({ok:false, error}) with
+    the route's `error`, so the switch stays where it was and the reason toasts through the same
+    fail() the transport errors use. And ONLY on that shape (review find, 2026-09-08): the same
+    helper serves the test button, and /push/test answers 200 {ok:false, status, detail} by design
+    for a refused or unsubscribed test push -- rejecting every ok:false made the button's own result
+    line ('The push service refused it: <status> <detail>') unreachable behind a generic failure."""
 
     def test_post_rejects_an_ok_false_body_with_its_error_text(self):
         js = km._LANDING_PUSH_JS
         post = js[js.index("function post(path,obj){"):js.index("function b64u(")]
-        self.assertIn("if(d&&d.ok===false)throw new Error(d.error||'the kernel refused it');", post)
+        self.assertIn("if(d&&d.ok===false&&d.error)throw new Error(d.error);", post)
         # the throw sits AFTER the JSON parse and BEFORE the value is handed to the callers
         self.assertLess(post.index("return r.json()"), post.index("d.ok===false"))
         self.assertIn("return d;", post)
         # both switches take the fail arm, which toasts and leaves isOn / turnsOn untouched
         self.assertIn("post('/notify-all',{on:want}).then(function(){isOn=want;paint();},fail)", js)
         self.assertIn("post('/notify-turns',{on:wantT}).then(function(){turnsOn=wantT;paint();},fail)", js)
+        # …and the test button reads the push service's verdict off the RESOLVED body, so a refusal
+        # there must reach it as a value, not as a rejection
+        handler = js[js.index("if(act==='test')"):]
+        self.assertIn("(d&&d.status?('The push service refused it: '+d.status+' '+(d.detail||'')+'.')", handler)
+
+    @unittest.skipUnless(shutil.which("node"), "node not available")
+    def test_post_executed_passes_a_push_test_verdict_through_and_rejects_only_a_refusal(self):
+        js = km._LANDING_PUSH_JS
+        post = js[js.index("function post(path,obj){"):js.index("function b64u(")]
+        answers = [
+            # /push/test's designed answers: a refused push and an unsubscribed device, both 200 ok:false
+            # WITHOUT `error` -- they must resolve, so the result arm can say what the service said
+            {"path": "/push/test", "status": 200, "body": {"ok": False, "status": 410, "detail": "Gone; the dead subscription was removed"}},
+            {"path": "/push/test", "status": 200, "body": {"ok": False, "status": 0, "detail": "this device isn't subscribed yet"}},
+            # a switch route's refusal: 200 ok:false WITH the reason -- rejects with exactly that text
+            {"path": "/notify-all", "status": 200, "body": {"ok": False, "error": "notify-cards.json could not be read (read failed: [Errno 5] Input/output error) \u2014 the change did not land; try again"}},
+            # a success, and a transport error, behave as they always did
+            {"path": "/notify-turns", "status": 200, "body": {"ok": True, "on": True}},
+            {"path": "/notify-turns", "status": 503, "text": "kernel busy"},
+        ]
+        out = subprocess.run([shutil.which("node"), "-e", _POST_HARNESS, post, json.dumps(answers)],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got[0], {"resolved": answers[0]["body"]}, "a refused test push reaches the result arm")
+        self.assertEqual(got[1], {"resolved": answers[1]["body"]}, "an unsubscribed device reaches the result arm")
+        self.assertEqual(got[2], {"rejected": answers[2]["body"]["error"]}, "a switch refusal rejects with the route's reason")
+        self.assertEqual(got[3], {"resolved": {"ok": True, "on": True}})
+        self.assertEqual(got[4], {"rejected": "kernel busy"})
 
 
 class CardBellJudgedAgainstAProvedDefault(unittest.TestCase):
@@ -724,7 +891,7 @@ class NotifyWsWriteFailure(unittest.TestCase):
         vars(km).get("_state_write_fault_seen", {}).clear()
         self.dirty, self.notices = [], []
         km._mark_views_dirty = lambda: self.dirty.append(1)
-        km._sync_notice = lambda text, ok=True: self.notices.append((text, ok))
+        km._sync_notice = lambda text, ok=True, kind="sync": self.notices.append((text, ok))
 
     def tearDown(self):
         jd.STATE, km._mark_views_dirty, km._sync_notice = self.saved

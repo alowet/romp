@@ -3872,22 +3872,35 @@ class TimelinePanel {
   }
 
   // Persist a per-session flag. Web dashboard: the host WS hook (→ kernel setSessionFlag → rebuild feed).
-  // Obsidian/headless fallback: write the same session-flags.json the kernel's build_feed reads.
+  // Obsidian desktop fallback: write the same session-flags.json the kernel's build_feed reads, with the
+  // discipline the kernel's own writer has (review find, 2026-09-08). Before this it was the exact shape
+  // the kernel dropped: any read fault or torn bytes became {} and was written over EVERY session's flags
+  // (postal isolation included), and the write truncated the live file in place, so the kernel's strict
+  // reader could observe 0 bytes mid-write and quarantine the very file being written. Now it mirrors
+  // _persistOrder / _setViews: Electron-or-nothing (a bare-node test run must never touch the real file),
+  // the kernel's state root, a refusal on any read fault or non-object parse (only a MISSING file reads as
+  // empty; the kernel quarantines torn bytes on its own next read), and an atomic tmp + rename publish.
   _setSessionFlag(s, flag, value) {
     try {
       if (typeof window !== 'undefined' && typeof window.__rompTimelineSetFlag === 'function') {
         window.__rompTimelineSetFlag(s.id, flag, value); return;
       }
+      if (typeof process === 'undefined' || !process.versions || !process.versions.electron) return;
       const fs = require('fs'), os = require('os'), path = require('path');
-      const dir = path.join(os.homedir(), '.local', 'state', 'romp');
+      const dir = process.env.ROMP_STATE_DIR
+        || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'romp');
       const fp = path.join(dir, 'session-flags.json');
       let cur = {};
-      try { cur = JSON.parse(fs.readFileSync(fp, 'utf8')) || {}; } catch (e) {}
+      try { cur = JSON.parse(fs.readFileSync(fp, 'utf8')); }
+      catch (e) { if (!e || e.code !== 'ENOENT') return; }   // unreadable or torn: never write over a store we could not read
+      if (!cur || typeof cur !== 'object' || Array.isArray(cur)) return;   // valid JSON of the wrong shape: not ours to overwrite
       const f = (cur[s.id] && typeof cur[s.id] === 'object') ? cur[s.id] : {};
       if (value) f[flag] = true; else delete f[flag];
       if (Object.keys(f).length) cur[s.id] = f; else delete cur[s.id];
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(fp, JSON.stringify(cur));
+      const tmp = fp + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(cur));
+      fs.renameSync(tmp, fp);
     } catch (e) { /* no host hook + no Node fs → can't persist */ }
   }
 

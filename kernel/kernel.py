@@ -2278,10 +2278,22 @@ def _state_quarantine(p, st, reason):
         return "could not be moved aside: %s" % _errno_text(e)
     sys.stderr.write("romp-kernel: %s could not be parsed (%s); moved aside to %s, the store reads as empty\n"
                      % (p.name, reason, aside.name))
+    # The dashboard hears it too (review find, 2026-09-08): a quarantine resets the store to EMPTY, so
+    # every bell override, lane flag (postal isolation included) or saved lane order it held reads as
+    # a default from here on, and the stderr line alone left that looking like settings resetting
+    # themselves. One notice, under the bell's `refused` kind (a setting that did not hold, not a
+    # machine sync); no dedupe registry: the next read of this path is an ENOENT, so a corrupt file
+    # speaks exactly once. Guarded like _note_state_fault: a notice never turns a successful move
+    # into a raise.
+    try:
+        _sync_notice("%s could not be parsed and was moved aside to %s; the settings it held start over "
+                     "empty until you set them again" % (p.name, aside.name), ok=False, kind="refused")
+    except Exception:
+        pass
     return None
 
 
-def _read_state_json(path, st=None, _tries=3):
+def _read_state_json(path, st=None, expect=None, _tries=3):
     """The ONE strict reader for a small JSON state file (session-flags, session-order, notify-cards;
     timeline-views follows in its own change). Distinguishes the outcomes the old `except Exception: {}` conflated:
       - a MISSING file is legitimately empty            -> returns None (a fresh install has no files)
@@ -2293,6 +2305,11 @@ def _read_state_json(path, st=None, _tries=3):
         rename is left alone and read afresh here, bounded by `_tries` (the maintainer's fold on
         PR #1019), so the caller gets what is there now -- only a file that keeps changing under
         every read ends _StateUnreadable.
+      - valid JSON of the WRONG top-level type           -> quarantined the same way, when the caller
+        names the store's shape in `expect` (dict for the flags and bells, list for the order). Read
+        as empty instead, a list where a dict belongs was overwritten by the next writer, and a file
+        none of our writers produce is exactly the evidence worth keeping (review find, 2026-09-08).
+        None skips the check.
     `st` is the stat the caller already took (the display readers key their cache on it); without
     one the reader stats first, so the quarantine can tell the file it read from one published
     since. Reads bytes (json.loads accepts them and auto-detects the encoding), so a non-UTF-8 torn
@@ -2313,14 +2330,23 @@ def _read_state_json(path, st=None, _tries=3):
     except OSError as e:
         raise _StateUnreadable(path, "read failed: %s" % _errno_text(e))
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
     except (ValueError, UnicodeDecodeError) as e:
         why = _state_quarantine(path, st, "invalid JSON: %s" % e)
         if why is None:
             return None                              # the bytes are preserved; the store starts empty
         if why == _STATE_REPLACED and _tries > 1:    # a peer published since our stat: read what is there now
-            return _read_state_json(path, None, _tries=_tries - 1)
+            return _read_state_json(path, None, expect=expect, _tries=_tries - 1)
         raise _StateUnreadable(path, "invalid JSON; %s" % why)
+    if expect is not None and not isinstance(data, expect):
+        why = _state_quarantine(path, st, "wrong shape: %s where %s was expected"
+                                % (type(data).__name__, expect.__name__))
+        if why is None:
+            return None
+        if why == _STATE_REPLACED and _tries > 1:
+            return _read_state_json(path, None, expect=expect, _tries=_tries - 1)
+        raise _StateUnreadable(path, "wrong shape; %s" % why)
+    return data
 
 
 # Last-known-good session order (session-order.json has no mtime cache): served over a transient
@@ -2346,8 +2372,9 @@ def _note_state_fault(exc):
     quiet until a clean read clears it. The value the reader returns is UNPROVED (last-known or the
     empty default) and no writer will persist it -- the mutation path reads the proved snapshot,
     which raises and refuses. Never raises itself. The sync-notice ring is the surface the views
-    store's stale-writer guard already uses (the shell's bell files it under its sync label); a
-    dedicated kernel-fault surface is a follow-up. A WRITE fault (_StateUnwritable, from
+    store's stale-writer guard already uses; the row carries the bell's `refused` kind (review find,
+    2026-09-08: filed under the ring's default sync kind, a user who muted the machine-sync log muted
+    every disk-fault notice with it, and the chip named a sync that moved no commits). A WRITE fault (_StateUnwritable, from
     _write_state_json) files once per episode too, keyed on the same path but in its own table
     (_state_write_fault_seen): only a landed write ends a write episode, where a clean read ends a
     read one."""
@@ -2364,7 +2391,7 @@ def _note_state_fault(exc):
     table[key] = text
     sys.stderr.write("romp-kernel: %s\n" % text)
     try:
-        _sync_notice(text, ok=False)                 # the shell bell / feed sync-notice row (resolved at call time)
+        _sync_notice(text, ok=False, kind="refused")   # the shell bell / feed sync-notice row (resolved at call time)
     except Exception:
         pass
 
@@ -2421,7 +2448,7 @@ def _session_order():
     refuses); the fault is loud once per episode (a sync-notice), never a raise into the build path."""
     p = jd.STATE / "session-order.json"
     try:
-        raw = _read_state_json(p)
+        raw = _read_state_json(p, expect=list)
     except _StateUnreadable as e:
         # DISPLAY path: never raise into the push (one outer try would abort every client's build).
         _note_state_fault(e)
@@ -2438,7 +2465,7 @@ def _session_order_proved():
     reorder every tab/lane on a transient EIO, under no gesture). Only a missing (or
     freshly-quarantined) file reads as empty; no last-known-good -- a writer acts on the real store
     or not at all."""
-    raw = _read_state_json(jd.STATE / "session-order.json")
+    raw = _read_state_json(jd.STATE / "session-order.json", expect=list)
     return [x for x in raw if isinstance(x, str)] if isinstance(raw, list) else []
 
 
@@ -2633,7 +2660,10 @@ def _ordered(sessions):
         lkg = _session_order_lkg[0] or []
         idx0 = {sid: i for i, sid in enumerate(lkg)}
         return sorted(sessions, key=lambda s: idx0.get(s["sid"], len(idx0)))
-    _session_order_lkg[0] = order
+    _session_order_lkg[0] = list(order)   # a COPY of the clean read: `order` is spliced below and only
+    #                                       _write_session_order latches the spliced list, AFTER it lands
+    #                                       (review find, 2026-09-08: latched by reference, a publish that
+    #                                       failed left an unpersisted order as the known-good)
     known = set(order)
     # Slot inheritance keys on the STABLE session NAME (customTitle), NOT the fsid or discover's anchor: a
     # /clear, relaunch, or revive mints a NEW transcript fsid for the SAME logical session, and it must
@@ -3362,7 +3392,7 @@ def _session_flags_proved():
     _set_session_flag / _set_notify_session refuse rather than writing a fabricated {} back over
     every session's flags -- including the postalServiceOff isolation boundaries -- under a success
     ack (the state-readers audit). Only a missing (or freshly-quarantined) file reads as empty."""
-    raw = _read_state_json(jd.STATE / "session-flags.json")
+    raw = _read_state_json(jd.STATE / "session-flags.json", expect=dict)
     return raw if isinstance(raw, dict) else {}
 
 
@@ -3384,7 +3414,7 @@ def _session_flags():
         _clear_state_fault(p)
         return hit[1]
     try:
-        raw = _read_state_json(p, st)
+        raw = _read_state_json(p, st, expect=dict)
     except _StateUnreadable as e:
         _note_state_fault(e)
         return hit[1] if hit is not None else {}
@@ -3485,7 +3515,7 @@ def _notify_cards_proved():
     refuse rather than writing a fabricated {} back over every per-card, session and master bell
     override under a success ack (the state-readers audit). Only a missing (or freshly-quarantined)
     file reads as empty."""
-    raw = _read_state_json(jd.STATE / "notify-cards.json")
+    raw = _read_state_json(jd.STATE / "notify-cards.json", expect=dict)
     return raw if isinstance(raw, dict) else {}
 
 
@@ -3507,7 +3537,7 @@ def _notify_cards():
         _clear_state_fault(p)
         return hit[1]
     try:
-        raw = _read_state_json(p, st)
+        raw = _read_state_json(p, st, expect=dict)
     except _StateUnreadable as e:
         _note_state_fault(e)
         return hit[1] if hit is not None else {}
@@ -15238,11 +15268,16 @@ _SYNC_SEQ = 0
 SYNC_RING = 40
 
 
-def _sync_notice(text, ok=True):
+def _sync_notice(text, ok=True, kind="sync"):
+    """One row on the ring the shell's bell mirrors. `kind` is the bell kind the row is filed under:
+    "sync" (the default, the ring's original tenant: a machine sync) or "refused" (a state file that
+    could not be read or written, or was moved aside), so a mute on one never hides the other (review
+    find, 2026-09-08). The shell allowlists the value; anything it does not know reads as sync."""
     global _SYNC_SEQ
     with _SYNC_LOCK:
         _SYNC_SEQ += 1
-        _SYNC_NOTICES.append({"seq": _SYNC_SEQ, "t": time.time(), "text": str(text), "ok": bool(ok)})
+        _SYNC_NOTICES.append({"seq": _SYNC_SEQ, "t": time.time(), "text": str(text), "ok": bool(ok),
+                              "kind": str(kind or "sync")})
         del _SYNC_NOTICES[:-SYNC_RING]
 
 
@@ -15257,7 +15292,7 @@ def _sync_notice_rows(limit=20, cap=300):
     with _SYNC_LOCK:
         rows = list(_SYNC_NOTICES[-limit:])
     return [{"sig": "sync|%d|%d" % (int(_STARTED), r["seq"]), "t": float(r["t"]),
-             "text": r["text"][:cap], "ok": bool(r["ok"])} for r in rows]
+             "text": r["text"][:cap], "ok": bool(r["ok"]), "kind": str(r.get("kind") or "sync")} for r in rows]
 
 
 def _auto_push_remote(host):
@@ -33982,7 +34017,7 @@ sdk:"romp's SDK backend, the machinery that actually runs your sessions, hit an 
 sync:"romp moved commits between your machines by itself \u2014 a push to a remote, a pull from one, or an ask that a peer fast-forward itself. Successes are logged as well as failures, so this is the record of what romp did to your machines; the network panel shows a sync while it is still running",
 locate:"a click that should have jumped to a message in the chat couldn't find it. Usually the chat is missing part of its history; reload the pane if it keeps happening",
 cleared:"a /clear in a session dropped still-open cards at the boundary; Undo on the feed restores them",
-refused:"a change you made \u2014 a lane or tab setting, a card bell, a tag or view, a lane order \u2014 was not saved because the file that holds it could not be read or written; nothing changed, the entry carries the reason, and the same change can be tried again",
+refused:"a setting that could not be saved, or a state file that could not be read. A change you made \u2014 a lane or tab setting, a card bell, a lane order \u2014 was not saved because romp could not read or write the file that holds it; nothing changed, the entry carries the reason, and the same change can be tried again. Or one of those files could not be read (the last values are shown until it can), or held bytes romp could not parse and was moved aside, so what it held starts over as defaults",
 undelivered:"something you sent never reached a session — the kernel it was addressed to has no session by that id, which on a board showing more than one machine means the pane addressed the wrong one. Nothing was delivered. Your text is kept verbatim in undelivered.jsonl under ~/.local/state/romp"};
 // the toggles ARE the chips (same pill, same colours) — lit = shown, dimmed = muted. Built once on a
 // STABLE container; only classes flip on click, so the buttons stay click-safe.
@@ -35379,7 +35414,7 @@ function fail(e){try{window.__rompNotify&&window.__rompNotify('error','Notificat
 function post(path,obj){return fetch(path,{method:'POST',body:JSON.stringify(obj)}).then(function(r){
 if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});
 return r.json().catch(function(){return {};});}).then(function(d){
-if(d&&d.ok===false)throw new Error(d.error||'the kernel refused it');   // a refusal in the route's own shape: the switch stays put and the reason toasts
+if(d&&d.ok===false&&d.error)throw new Error(d.error);   // a refusal in the route's own shape ({ok:false, error}): the switch stays put and the reason toasts. Only bodies carrying `error`: /push/test answers 200 {ok:false, status, detail} for a refused or unsubscribed test push, and its caller reads those itself (review find, 2026-09-08)
 return d;});}
 function b64u(s){var raw=atob((s+'==='.slice((s.length+3)%4)).replace(/-/g,'+').replace(/_/g,'/'));
 var a=new Uint8Array(raw.length);for(var i=0;i<raw.length;i++)a[i]=raw.charCodeAt(i);return a;}
@@ -37720,12 +37755,14 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     _set_notify_all(_on)
                 except (_StateUnreadable, _StateUnwritable) as e:
-                    # the bells store could not be read, or its publish failed: refuse in the route's OWN
-                    # shape -- 200 with ok:false -- never a 5xx (a failed publish used to reach do_POST's
-                    # catch-all as a 500 traceback). The shell's post() reads ok:false as the refusal it is
-                    # (a non-2xx would reach it as raw JSON in an HTTP error), and the same body
-                    # crosses a federation forward, which treats any non-200 as a tunnel hiccup.
-                    return self._send(200, json.dumps({"ok": False, "retryable": True,
+                    # the bells store could not be read, or its publish failed: refuse in the shape every
+                    # kernel refusal wears -- 200 with {ok:false, error}, as /send and /new answer theirs --
+                    # never a 5xx (a failed publish used to reach do_POST's catch-all as a 500 traceback).
+                    # The shell's post() consumes that shape; a non-2xx would reach it as raw JSON inside
+                    # an HTTP error, the toast showing a body instead of the reason. (An earlier comment
+                    # here credited `romp tag`'s curl -sf and the federation forward; neither calls this
+                    # route -- review find, 2026-09-08. No `retryable` key: nothing reads one.)
+                    return self._send(200, json.dumps({"ok": False,
                         "error": "%s \u2014 the change did not land; try again" % e}), "application/json")
                 _mark_views_dirty()
                 _send_to_app("shell", {"type": "notifyAll", "on": _on})
@@ -37741,12 +37778,14 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     _set_notify_turns(_on)
                 except (_StateUnreadable, _StateUnwritable) as e:
-                    # the bells store could not be read, or its publish failed: refuse in the route's OWN
-                    # shape -- 200 with ok:false -- never a 5xx (a failed publish used to reach do_POST's
-                    # catch-all as a 500 traceback). The shell's post() reads ok:false as the refusal it is
-                    # (a non-2xx would reach it as raw JSON in an HTTP error), and the same body
-                    # crosses a federation forward, which treats any non-200 as a tunnel hiccup.
-                    return self._send(200, json.dumps({"ok": False, "retryable": True,
+                    # the bells store could not be read, or its publish failed: refuse in the shape every
+                    # kernel refusal wears -- 200 with {ok:false, error}, as /send and /new answer theirs --
+                    # never a 5xx (a failed publish used to reach do_POST's catch-all as a 500 traceback).
+                    # The shell's post() consumes that shape; a non-2xx would reach it as raw JSON inside
+                    # an HTTP error, the toast showing a body instead of the reason. (An earlier comment
+                    # here credited `romp tag`'s curl -sf and the federation forward; neither calls this
+                    # route -- review find, 2026-09-08. No `retryable` key: nothing reads one.)
+                    return self._send(200, json.dumps({"ok": False,
                         "error": "%s \u2014 the change did not land; try again" % e}), "application/json")
                 _send_to_app("shell", {"type": "notifyTurns", "on": _on})
                 return self._send(200, json.dumps({"ok": True, "on": _on}), "application/json")
