@@ -15,6 +15,8 @@ import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+from tests.conftest import restore_env
+
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
 
@@ -53,6 +55,10 @@ def _resp(host, **kw):
 
 class _Base(unittest.TestCase):
     def setUp(self):
+        # the sessions-file seam is read per call, so the import-time assignment above holds only until
+        # another module's test changes it: bind this module's file for the duration of each test
+        self._prior_seam = os.environ.get("ROMP_SESSIONS_FILE")
+        os.environ["ROMP_SESSIONS_FILE"] = _SESS
         os.environ["ROMP_POSTAL_PEERS"] = "1"
         ps.PEERS.clear()
         ps.PEER_STATE.clear()
@@ -66,6 +72,7 @@ class _Base(unittest.TestCase):
 
     def tearDown(self):
         os.environ.pop("ROMP_POSTAL_PEERS", None)
+        restore_env("ROMP_SESSIONS_FILE", self._prior_seam)
 
     def _trusted_peer(self, host="boxalias"):
         ps.peer_update({"host": host, "port": 19999, "up": True, "trust": "trusted"})

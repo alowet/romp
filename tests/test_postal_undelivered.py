@@ -15,6 +15,8 @@ import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+from tests.conftest import restore_env
+
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
 
@@ -29,12 +31,13 @@ RECIP = "22222222-2222-2222-2222-222222222222"
 class StuckMailWarning(unittest.TestCase):
     def setUp(self):
         self._seamfile = os.path.join(tempfile.mkdtemp(), "sessions.json")
+        self._prior_seam = os.environ.get("ROMP_SESSIONS_FILE")
         os.environ["ROMP_SESSIONS_FILE"] = self._seamfile      # local_agents() reads this instead of a live kernel
         for d in (pm.MAILROOT, pm.WARNED, pm.MAILPENDING):     # isolate each test
             shutil.rmtree(d, ignore_errors=True)
 
     def tearDown(self):
-        os.environ.pop("ROMP_SESSIONS_FILE", None)
+        restore_env("ROMP_SESSIONS_FILE", self._prior_seam)
 
     def _set_recip_state(self, state):
         Path(self._seamfile).write_text(json.dumps(
@@ -100,6 +103,7 @@ class RefusedNotesKeepTheMail(unittest.TestCase):
 
     def setUp(self):
         self._seamfile = os.path.join(tempfile.mkdtemp(), "sessions.json")
+        self._prior_seam = os.environ.get("ROMP_SESSIONS_FILE")
         os.environ["ROMP_SESSIONS_FILE"] = self._seamfile
         for d in (pm.MAILROOT, pm.WARNED, pm.MAILPENDING):
             shutil.rmtree(d, ignore_errors=True)
@@ -117,7 +121,7 @@ class RefusedNotesKeepTheMail(unittest.TestCase):
         pm.TLDIR, pm._log = self._tl, self._log
         pm._TL_FAULT[0] = False
         pm._REFUSAL_SAID.clear()
-        os.environ.pop("ROMP_SESSIONS_FILE", None)
+        restore_env("ROMP_SESSIONS_FILE", self._prior_seam)
 
     def _live(self, rows):
         Path(self._seamfile).write_text(json.dumps(rows))
@@ -208,6 +212,7 @@ class TheSweepMovesAnUnreadableFileAside(unittest.TestCase):
 
     def setUp(self):
         self._seamfile = os.path.join(tempfile.mkdtemp(), "sessions.json")
+        self._prior_seam = os.environ.get("ROMP_SESSIONS_FILE")
         os.environ["ROMP_SESSIONS_FILE"] = self._seamfile
         for d in (pm.MAILROOT, pm.WARNED, pm.MAILPENDING):
             shutil.rmtree(d, ignore_errors=True)
@@ -224,7 +229,7 @@ class TheSweepMovesAnUnreadableFileAside(unittest.TestCase):
     def tearDown(self):
         pm.TLDIR, pm._log, pm._kernel_post = self._saved
         pm._DASHBOARD_MISSED[0] = False
-        os.environ.pop("ROMP_SESSIONS_FILE", None)
+        restore_env("ROMP_SESSIONS_FILE", self._prior_seam)
 
     @unittest.skipIf(os.geteuid() == 0, "root reads a mode-0 file; the fault cannot be staged")
     def test_the_file_is_moved_aside_the_marker_drops_and_the_box_keeps_its_evidence(self):
