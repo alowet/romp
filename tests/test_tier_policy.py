@@ -1092,9 +1092,10 @@ class FetcherShapes(unittest.TestCase):
 class DeclaredTier(unittest.TestCase):
     """The body's tier line (T273, the owner 2026-09-08): outside contributors hold read permission and
     cannot label their own PRs, so the author writes `Tier: fix` in the PR body and the tier workflow
-    applies the label. declared_tier(body) is the pure parser: one whole line, case-insensitive, one of
-    the four tiers (the tests-only alias reads as docs); HTML comments are not read, so the template's
-    explanation never parses; two lines naming different tiers declare nothing, and the reason says so.
+    applies the label. declared_tier(body) is the pure parser: the first word after "Tier:" is the tier,
+    case-insensitive, one of the four (the tests-only alias reads as docs), prose after it allowed unless it
+    names another tier (T273b); HTML comments and code are not read, so the template's explanation never
+    parses; two lines naming different tiers declare nothing, and the reason says so.
     A label already on the PR always wins: the body is then only remarked on."""
 
     def test_each_tier_parses_from_its_own_line(self):
@@ -1117,7 +1118,7 @@ class DeclaredTier(unittest.TestCase):
         # T273b (the manager, 2026-09-08): a contributor wrote the tier word and then a sentence on the same
         # line, and the line declared nothing until a maintainer labeled by hand. The FIRST word after
         # "Tier:" (markup stripped) is the declaration; prose after it is ignored unless it names another tier
-        for body in ("Tier: `fix` — a maintainer needs to add the label, I cannot",
+        for body in ("Tier: `fix` — please label this one, I have no triage",
                      "Tier: fix (see the test below)",
                      "Tier: fix. This closes the parser gap.",
                      "Tier: **fix** since it comes with a failing test",
@@ -1126,6 +1127,26 @@ class DeclaredTier(unittest.TestCase):
             self.assertEqual(tp.declared_tier(body), ("fix", ""), body)
         self.assertEqual(tp.declared_tier("Tier: major-feature: it changes the contract")[0], "major-feature")
         self.assertEqual(tp.declared_tier("Tier: tests-only, docs only")[0], "docs", "the alias as first word")
+
+    def test_punctuation_glued_to_the_tier_word_still_reads_the_word(self):
+        # an em dash or a parenthesis set without spaces, smart quotes from a phone keyboard, an ellipsis:
+        # words split on punctuation as well as on whitespace, so the first WORD is still the tier
+        for body in ("Tier: fix—closes the parser gap", "Tier: `fix`—please label", "Tier: fix(see below)",
+                     "Tier: \u2018fix\u2019", "Tier: \u201cfix\u201d", "Tier: fix\u2026", "Tier:\u00a0fix", "Tier: <b>fix</b> please"):
+            self.assertEqual(tp.declared_tier(body), ("fix", ""), repr(body))
+        self.assertEqual(tp.declared_tier("Tier: major-feature—see #7")[0], "major-feature", "the inner hyphen survives")
+        for body in ("Tier: fix/feature", "Tier: fix,feature", "Tier: fix—feature"):
+            self.assertIsNone(tp.declared_tier(body)[0], body)
+            self.assertIn("more than one tier", tp.declared_tier(body)[1], body)
+
+    def test_an_ambiguous_line_counts_like_a_line_naming_no_tier(self):
+        # consistent with the placeholder: a line that declares nothing never vetoes a clean line elsewhere;
+        # alone, it is what the summary quotes
+        self.assertEqual(tp.declared_tier("Tier: fix or feature\n\nTier: fix"), ("fix", ""))
+        self.assertEqual(tp.declared_tier("Tier: <one of docs, fix, feature, major-feature>\n\nTier: fix"), ("fix", ""))
+        tier, why = tp.declared_tier("Tier: fix or feature\n\nTier: bogus")
+        self.assertIsNone(tier)
+        self.assertIn("more than one tier", why)
 
     def test_a_line_naming_two_tiers_declares_nothing_and_says_so(self):
         for body in ("Tier: fix or feature", "Tier: fix (maybe feature?)", "Tier: docs — not a fix"):
