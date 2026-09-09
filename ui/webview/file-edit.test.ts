@@ -49,7 +49,12 @@ test("no exit path can silently eat an edited buffer", () => {
 });
 
 test("a conflict keeps the buffer, says why, and Reload asks before discarding", () => {
-  assert.match(VIEW, /body\.prepend\(bar2\);/, "the error bar sits ABOVE the textarea — the buffer survives");
+  // a child of the CARD between the title bar and the body (noteBar), never the body's first child: inside
+  // the body it sat above an editor that is 100% of that same body, so the editor's bottom was cut off by
+  // the bar's height and the body's scroll carried the bar away (file-view-notice.test.ts runs the mount)
+  assert.match(VIEW, /box\.insertBefore\(bar2, body\);/, "the error bar sits ABOVE the body that holds the textarea, so the buffer survives");
+  assert.doesNotMatch(VIEW, /body\.prepend\(bar2\);/, "never inside the body, where the editor's 100% height leaves it no room");
+  assert.match(VIEW, /const bar2 = noteBar\(err\);/, "the refused-save notice goes through the one helper that mounts there");
   assert.match(VIEW, /if \(\/changed on disk\/\.test\(err\)\) \{/);
   assert.match(VIEW, /dirty = false;\s*\/\/ confirmed once — the replace guard must not ask twice/);
 });

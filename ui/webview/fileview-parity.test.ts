@@ -19,7 +19,7 @@ const RULES = [
   "a.fileview-btn {", ".fileview-gh {", ".fileview-gh-why {", ".fileview-gh-dots {",
   ".fileview-gh .fileview-btn:disabled {", ".fileview-gh .fileview-btn:disabled:hover {",
   ".fileview-gh .fileview-btn:disabled:active {", "a.fileview-gh-note {", ".fileview-body {",
-  ".fileview-cm {", ".fileview-cm .cm-editor {", ".fileview-editor {",
+  ".fileview-cm {", ".fileview-cm .cm-editor {", ".fileview-editor {", ".fileview > .fileview-err {",
   ".fileview-dir-link {", ".fileview-dir-link:hover {",
   ".fileview-imgbox {", ".fileview-img {", ".fileview-frame {",
 ];
