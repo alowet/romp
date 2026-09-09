@@ -30714,6 +30714,23 @@ _CLEARED_STATS = {"served": 0, "derived": 0}   # bumped from the pusher AND sock
 #                                                no lock: a lost count under a race is tolerated, these are diagnostics only
 
 
+def _cleared_foreign(cleared):
+    """The ledger's ids that belong to no local session: no goal store and no archive here for the id's sid. A
+    merged board routes a card's gestures to the owning kernel by id, but a viewer's ledger can still hold a
+    remote card's clear (a gesture taken while the owner was unreachable, a ledger copied between machines,
+    an older client), and the owning kernel's archive projection reads only its own ledger; so the viewer's
+    feed payload carries these for the client to apply over remote rows (federation.ts mergeHostFeeds).
+    Small in practice (a viewer clears few foreign cards); capped so a stray ledger cannot swell the frame.
+    One directory listing per build for the local sid set, the same cost class as the ledger read."""
+    local = set()
+    for d in (jd.GOALDIR, jd.GOALARCHDIR):
+        try:
+            local.update(n[:-5] for n in os.listdir(d) if n.endswith(".json"))
+        except OSError:
+            pass
+    return sorted(i for i in cleared if i.rsplit(":", 1)[0] not in local)[:500]
+
+
 def _cleared_ids():
     """The set of currently-cleared feed itemIds (asks + stream), replayed from the append-only
     cleared.jsonl: a 'clear' row adds an id, an 'undo' row removes it (newest-wins). Mirrors the old
@@ -33099,6 +33116,10 @@ def build_feed(now, tmux=None):
             # _bg_split) → the grouped-mode session header's neutral chip, never a waiting state (2026-07-24)
             "bgServices": bg_services,
             "dismissedCount": len(cleared), "showDismissed": False,
+            # the ledger's ids that belong to no session of THIS kernel (review find, 2026-09-09): clears this
+            # kernel took for cards another kernel owns; the merged board applies them over that host's rows
+            # (federation.ts mergeHostFeeds), since a remote kernel's projection reads only its own ledger
+            "clearedForeign": _cleared_foreign(cleared),
             # the shared session order (session-order.json — the tab/lane order): grouped mode sorts each
             # column's session runs by it (the user 2026-07-13); federation prefixes + concatenates per host
             "order": _session_order(),

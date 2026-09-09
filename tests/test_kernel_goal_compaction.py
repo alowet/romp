@@ -264,6 +264,45 @@ class ClearedLedgerIsAuthoritativeAcrossTheCompaction(unittest.TestCase):
         jd._shared_clear()
         self.assertFalse(jd.load_goals(SID)["nodes"][self.g("g6")].get("cleared"), "...and it stays undone on a reload")
 
+    def test_clear_undo_clear_inside_one_second_replays_to_the_last_row(self):
+        # the review find (2026-09-09): the arms compared integer seconds, so three gestures in one second
+        # left the LAST clear skipped on replay; the journal's row order decides now
+        self._completed_top("g7")
+        snapshot = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+        km._clear_all([self.g("g7")])
+        km._undo_clear()
+        km._clear_all([self.g("g7")])
+        rows = [json.loads(l)["op"] for l in (jd._overrides_dir() / (SID + ".jsonl")).read_text().splitlines()]
+        self.assertEqual([r for r in rows if r in ("clear", "unclear")], ["clear", "unclear", "clear"])
+        self._clobber_with(snapshot)
+        self.assertTrue(jd.load_goals(SID)["nodes"][self.g("g7")].get("cleared"), "the last row, a clear, wins")
+        # and the mirror: clear then undo in the same second ends unsealed
+        self._completed_top("g8")
+        snapshot = json.loads((jd.GOALDIR / (SID + ".json")).read_text())
+        km._clear_all([self.g("g8")])
+        km._undo_clear()
+        self._clobber_with(snapshot)
+        self.assertFalse(jd.load_goals(SID)["nodes"][self.g("g8")].get("cleared"), "the last row, an undo, wins")
+
+    def test_the_feed_payload_carries_the_ledgers_foreign_ids_for_the_merged_board(self):
+        # the viewer's ledger over remote rows (review find, 2026-09-09): ids the local ledger clears whose
+        # session has no store and no archive here ride the payload, bare, for the client merge to apply
+        # over that host's rows; local ids stay off it (the local kernel applied them itself); capped
+        self._completed_top("g4")
+        foreign_sid = "11111111-2222-3333-4444-999999999909"
+        with (jd.STATE / "cleared.jsonl").open("a") as f:
+            f.write(json.dumps({"id": self.g("g4"), "t": 200, "op": "clear"}) + "\n")
+            f.write(json.dumps({"id": foreign_sid + ":g1", "t": 201, "op": "clear"}) + "\n")
+            f.write(json.dumps({"id": foreign_sid + ":g2", "t": 202, "op": "clear"}) + "\n")
+            f.write(json.dumps({"id": foreign_sid + ":g2", "t": 203, "op": "undo"}) + "\n")
+        km._CLEARED_MEMO["slot"] = None
+        self.assertEqual(km._cleared_foreign(km._cleared_ids()), [foreign_sid + ":g1"],
+                         "the foreign clear rides; the local one and the undone one do not")
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        self.assertIn('"clearedForeign": _cleared_foreign(cleared),', src, "on the feed payload beside dismissedCount")
+        many = {"%s:g%d" % (foreign_sid, i): i for i in range(700)}
+        self.assertEqual(len(km._cleared_foreign(many)), 500, "capped")
+
     def test_the_compaction_stamps_a_root_only_the_ledger_clears(self):
         self._completed_top("g4")
         with (jd.STATE / "cleared.jsonl").open("a") as f:                  # the ledger alone: no flag, no journal
