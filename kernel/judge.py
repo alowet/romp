@@ -2175,7 +2175,8 @@ _PARSE_CACHE = {}          # fsid -> (fileset_key, parsed_session)
 # file's key and its journal's and archive's (the shared view's inputs), the episode log's key (the
 # floor) and the transcript path. A session is recorded only when its scan added nothing pending; one
 # with rows to place is scanned again next pass however its inputs stand (its placements move the store
-# anyway). A parse the cache does not hold (a stubbed one) is never keyed, so never skipped. Pruned to
+# anyway), and so is one whose scan raised (its pass-crash row is filed, the rows it queued are dropped).
+# A parse the cache does not hold (a stubbed one) is never keyed, so never skipped. Pruned to
 # the pass's fleet, so bounded by it; a rebound state root clears it.
 _COURIER_SEEN = {}         # fsid -> the scan key of its last pass that found nothing to place
 
@@ -15317,57 +15318,71 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=
         except Exception as e:                         # an unreadable store: this session's row, the next session's turn
             _log_judge_error("courier", fsid, "pass-crash", note="store: %r" % e)
             continue
-        closed[fsid] = _session_settled(fsid, str(path), session, cstore)
-        placed_ids = cstore["placements"]
-        floor = episode_floor(fsid)
-        n_pending0, repair_open = len(pending), False
-        for turn in session["turns"]:
-            for seg in _segs(turn, cstore):
-                if seg["id"] in placed_ids:
-                    # LINK-ONLY repair (the user 2026-08-23): the planner placed this peer segment
-                    # before the courier saw it, so no courier goal was minted and the SENDER's
-                    # handoff waits on a completion event that can never fire (12 live handoffs, up
-                    # to 240h old). A placed DELEGATE with no courier link gets the link attached to
-                    # the placement's TOP — run_propagate completes the sender's tracking node when
-                    # that goal lands. No model call; idempotent by msgId.
-                    try:
-                        pm0 = _seg_peer(seg)
-                        if (pm0 and pm0[0] and pm0[1] and _seg_peer_kind(seg) == "delegate"
-                                and _courier_link_target(cstore, seg["id"], pm0[1]) is not None):
-                            repair_open = True     # a missing link with a live node to attach to: whether it CAN
-                            #                        attach depends on the SENDER's store (_handoff_backref), outside
-                            #                        this session's key, so the session is scanned again next pass, as
-                            #                        before. A placement with no node (filed fyi, retired) has no
-                            #                        repair to wait for and records like any settled session.
-                            if _courier_link_wanted(cstore, seg["id"], pm0[1]) is not None:
-                                _attach_courier_link(load_goals(fsid), seg["id"], pm0[1])   # a writer: its own load
-                    except Exception as e:             # bookkeeping, but its failure is not nothing (T111)
-                        _log_judge_error("courier", fsid, "pass-crash", note="link-attach: %r" % e)
-                    continue
-                if floor and seg["t"] < floor:
-                    # pre-episode: conversation the agent can no longer see. The planner retires these
-                    # before any model call; the courier needs its own guard because a FORK's copied
-                    # history is the first shape that leaves OLD peer segments visible here (a /clear's
-                    # null-rooted head drops pre-clear history from the parse for free, so this never
-                    # fired before). Defense in depth beside the fork's sealed-placements seed.
-                    continue
-                pm = _seg_peer(seg)
-                if pm and pm[0] and _placed_key(placed_ids, seg["id"]):
-                    continue                           # placed under a DRIFTED key (the parse's t shifted after the
-                    #                                    placement was recorded): the placement loop's own _placed_key
-                    #                                    check dropped the row unwritten every pass, at a writer load per
-                    #                                    row per pass, and the row kept its session from ever recording
-                    #                                    in the change gate (2026-09-09). The same rule, applied here.
-                if not pm or not pm[0]:                # peer-triggered with a KNOWN sender only. This filter
-                    #                                    is one half of a partition contract with plan_units:
-                    #                                    the courier places exactly the peer segments it can
-                    #                                    file under a sender's goal, and plan_units yields a
-                    #                                    '#d' unit for exactly those (a sender-less one gets a
-                    #                                    plain work unit there instead — a '#d' nothing places
-                    #                                    wedges auto-nudge's placement gate, 2026-08-16).
-                    continue
-                pending.append((seg["t"], fsid, seg["id"], _unit_text(seg["atoms"]), pm[1], pm[0],
-                                _seg_peer_kind(seg), _seg_anchor(seg), str(path)))
+        n_pending0 = len(pending)                      # before the walk: the boundary below drops what it queued
+        try:
+            closed[fsid] = _session_settled(fsid, str(path), session, cstore)
+            placed_ids = cstore["placements"]
+            floor = episode_floor(fsid)
+            repair_open = False
+            for turn in session["turns"]:
+                for seg in _segs(turn, cstore):
+                    if seg["id"] in placed_ids:
+                        # LINK-ONLY repair (the user 2026-08-23): the planner placed this peer segment
+                        # before the courier saw it, so no courier goal was minted and the SENDER's
+                        # handoff waits on a completion event that can never fire (12 live handoffs, up
+                        # to 240h old). A placed DELEGATE with no courier link gets the link attached to
+                        # the placement's TOP — run_propagate completes the sender's tracking node when
+                        # that goal lands. No model call; idempotent by msgId.
+                        try:
+                            pm0 = _seg_peer(seg)
+                            if (pm0 and pm0[0] and pm0[1] and _seg_peer_kind(seg) == "delegate"
+                                    and _courier_link_target(cstore, seg["id"], pm0[1]) is not None):
+                                repair_open = True     # a missing link with a live node to attach to: whether it CAN
+                                #                        attach depends on the SENDER's store (_handoff_backref), outside
+                                #                        this session's key, so the session is scanned again next pass, as
+                                #                        before. A placement with no node (filed fyi, retired) has no
+                                #                        repair to wait for and records like any settled session.
+                                if _courier_link_wanted(cstore, seg["id"], pm0[1]) is not None:
+                                    _attach_courier_link(load_goals(fsid), seg["id"], pm0[1])   # a writer: its own load
+                        except Exception as e:             # bookkeeping, but its failure is not nothing (T111)
+                            _log_judge_error("courier", fsid, "pass-crash", note="link-attach: %r" % e)
+                        continue
+                    if floor and seg["t"] < floor:
+                        # pre-episode: conversation the agent can no longer see. The planner retires these
+                        # before any model call; the courier needs its own guard because a FORK's copied
+                        # history is the first shape that leaves OLD peer segments visible here (a /clear's
+                        # null-rooted head drops pre-clear history from the parse for free, so this never
+                        # fired before). Defense in depth beside the fork's sealed-placements seed.
+                        continue
+                    pm = _seg_peer(seg)
+                    if pm and pm[0] and _placed_key(placed_ids, seg["id"]):
+                        continue                           # placed under a DRIFTED key (the parse's t shifted after the
+                        #                                    placement was recorded): the placement loop's own _placed_key
+                        #                                    check dropped the row unwritten every pass, at a writer load per
+                        #                                    row per pass, and the row kept its session from ever recording
+                        #                                    in the change gate (2026-09-09). The same rule, applied here.
+                    if not pm or not pm[0]:                # peer-triggered with a KNOWN sender only. This filter
+                        #                                    is one half of a partition contract with plan_units:
+                        #                                    the courier places exactly the peer segments it can
+                        #                                    file under a sender's goal, and plan_units yields a
+                        #                                    '#d' unit for exactly those (a sender-less one gets a
+                        #                                    plain work unit there instead — a '#d' nothing places
+                        #                                    wedges auto-nudge's placement gate, 2026-08-16).
+                        continue
+                    pending.append((seg["t"], fsid, seg["id"], _unit_text(seg["atoms"]), pm[1], pm[0],
+                                    _seg_peer_kind(seg), _seg_anchor(seg), str(path)))
+        except Exception as e:                         # the settle, the floor or the walk raised: this session's row,
+            #                                            never the tier's. Outside this boundary one session's raise
+            #                                            left run_courier before its write loop (no session placed)
+            #                                            and run_triage before the propagate, group, consolidate and
+            #                                            distill passes, with a stderr traceback for the whole tier.
+            _log_judge_error("courier", fsid, "pass-crash", note="scan: %r" % e)
+            del pending[n_pending0:]                   # the rows an unfinished walk queued place nothing
+            _COURIER_SEEN.pop(fsid, None)              # a record from an earlier scan is dropped, as the rows-to-place
+            #                                            arm below drops it: the memo holds only a completed scan that
+            #                                            found nothing. The continue skips the record step, so the
+            #                                            session is scanned again next pass.
+            continue
         if skey is not None:
             if len(pending) == n_pending0 and not repair_open:
                 _COURIER_SEEN[fsid] = skey             # nothing to place, no link to repair: skipped until an input moves
