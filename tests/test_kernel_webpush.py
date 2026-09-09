@@ -133,6 +133,25 @@ class ServiceWorkerRoute(unittest.TestCase):
         self.assertIn("skipWaiting()", js)
         self.assertIn("clients.claim()", js)
 
+    def test_sw_carries_this_builds_fingerprint_string(self):
+        # 2026-09-09, the warm-app round: the served worker bakes the kernel's build string into SWV — the SAME
+        # string the shell page carries as PAGEV — so a page can say whether the worker on this device is its own
+        # build (the trail could not: a tap that ran an older worker and a tap that never reached the worker
+        # looked identical). The raw source keeps a placeholder inside a string literal, so the node harness runs
+        # it unbaked; the string is sha + dist token, so a deploy and a bundle rebuild both move it
+        _, body = _serve_get("/sw.js", headers={"X-Romp-Token": km.TOKEN})
+        js = body.decode()
+        v = km._sw_version()
+        self.assertTrue(v)
+        self.assertRegex(v, r"^[A-Za-z0-9._+-]+$", "safe inside a JS string literal")
+        self.assertIn(km._kernel_sha() or "nogit", v)
+        self.assertIn(str(km._dist_ver()), v)
+        self.assertIn("SWV='%s'" % v, js)
+        self.assertNotIn("__ROMP_SWV__", js)
+        self.assertIn("SWV='__ROMP_SWV__'", km._SW_JS, "the raw source is valid JS with the placeholder in a literal")
+        self.assertIn("PAGEV='%s'" % v, km._landing(), "the page bakes the same string")
+        self.assertIn("PAGEV='__ROMP_SWV__'", km._LANDING_REVEAL_JS)
+
     def test_sw_click_lands_on_the_session_that_fired(self):
         # the user 2026-08-08: the first real push opened the app on a DIFFERENT session. The
         # kernel's routing block rides the notification's data; a live window gets it over
@@ -322,6 +341,60 @@ async function tap(data, windows) {
   STORE.clear(); cacheFail = true;
   out.storeFail = await tap(data, []);
   cacheFail = false;
+  // THE FINGERPRINT AND THE SHOWN RECORD (2026-09-09, the warm-app round): install writes a fresh record for this
+  // build over the previous build's, activate its takeover; every push stamps its arrival and writes the notification
+  // it shows to '/__romp/shown' BEFORE the show is attempted; every click stamps itself FIRST, counts, and a
+  // session-addressed one retires the shown record (the tap wins); the ack naming the shown id retires it too
+  const fpRec = async () => (STORE.has('/__romp/sw') ? STORE.get('/__romp/sw').clone().json() : null);
+  const shownRec = async () => (STORE.has('/__romp/shown') ? STORE.get('/__romp/shown').clone().json() : null);
+  const life = async (k) => { const w = []; H[k]({ waitUntil: (p) => w.push(p) }); await Promise.all(w); return w.length; };
+  STORE.clear(); SLOG.length = 0; LOG.length = 0;
+  STORE.set('/__romp/sw', new Response(JSON.stringify({ version: 'older', installedAt: 1, activatedAt: 2, lastPushAt: 3, lastPushSid: 'S0', lastClickAt: 4, lastClickSid: 'S0', clicks: 7 })));
+  out.installWaited = await life('install');
+  out.fpInstalled = await fpRec();
+  out.activateWaited = await life('activate');
+  out.fpActivated = await fpRec();
+  SLOG.length = 0; LOG.length = 0;
+  const named = Object.assign({ name: 'web' }, data);
+  H.push({ data: { json: () => ({ title: 'romp: web', body: 'Needs you: x', sid: 'S1', tag: 'romp:S1', badge: 2, data: named }) }, waitUntil: (p) => { pushWait = p; } });
+  out.pushOpsBeforeShow = SLOG.filter((x) => x[2] === 0).map((x) => x.slice(0, 2));   // LOG.length 0: started before the show was logged
+  out.pushSync2 = LOG.map((x) => x[0]);
+  await pushWait;
+  out.fpPushed = await fpRec();
+  out.shownAfterPush = await shownRec();
+  // a show that FAILS still leaves the record and the stamp (headless browsers refuse showNotification)
+  const showOk = global.self.registration.showNotification;
+  global.self.registration.showNotification = (t, o) => { LOG.push(['show', t, o]); return Promise.reject(new Error('denied')); };
+  SLOG.length = 0; LOG.length = 0;
+  H.push({ data: { json: () => ({ title: 'api', body: 'finished', sid: 'S2', tag: 'romp:S2', data: { sid: 'S2', host: '', kind: 'turn', cardId: '', url: '/?push-reveal=S2', name: 'api' } }) }, waitUntil: (p) => { pushWait = p; } });
+  out.pushRefused = await pushWait.then(() => 'resolved', (e) => 'rejected: ' + e.message);
+  for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+  out.shownAfterRefused = await shownRec();
+  out.fpAfterRefused = await fpRec();
+  global.self.registration.showNotification = showOk;
+  // a sid-less push (a test with no session in front) stamps the arrival but has nothing to offer
+  SLOG.length = 0; LOG.length = 0;
+  H.push({ data: { json: () => ({ title: 'romp', body: 'Test notification', tag: 'romp:test', data: { sid: '', host: '', kind: 'test', cardId: '', url: '/', name: '' } }) }, waitUntil: (p) => { pushWait = p; } });
+  await pushWait;
+  out.shownAfterSidless = await shownRec();
+  out.fpAfterSidless = await fpRec();
+  STORE.set('/__romp/shown', new Response(JSON.stringify({ id: 'N-1', sid: 'S1', host: '', kind: 'card', cardId: 'S1:g1', url: data.url, name: 'web', t: 1 })));
+  SLOG.length = 0;
+  out.clickSidless = await tap({ sid: '', host: '', kind: 'test', cardId: '', url: '/' }, []);
+  out.clickSidlessOps = SLOG.map((x) => x.slice(0, 3));
+  out.shownAfterSidlessClick = await shownRec();
+  out.fpAfterSidlessClick = await fpRec();
+  SLOG.length = 0;
+  out.clickStamp = await tap(data, [win(true)]);
+  out.clickStampOps = SLOG.map((x) => x.slice(0, 3));
+  out.shownAfterClick = await shownRec();
+  out.fpAfterClick = await fpRec();
+  STORE.set('/__romp/shown', new Response(JSON.stringify({ id: 'N-2', sid: 'S3', host: '', kind: 'turn', cardId: '', url: '/?push-reveal=S3', name: 'tests', t: 1 })));
+  await ackMsg({ romp: 'tapLanded', id: 'someone-else' });
+  out.shownAckOther = await shownRec();
+  await ackMsg({ romp: 'tapLanded', id: 'N-2' });
+  out.shownAckOwn = await shownRec();
+  out.ackShownWaited = ackWaits.length;
   console.log(JSON.stringify(out));
 })();
 """
@@ -463,8 +536,12 @@ class ServiceWorkerExecutes(unittest.TestCase):
         o = self.out
         self.assertEqual(o["storeCold"]["log"], [["close"], self.MATCH, ["openWindow", self.URL]], "the tap still opens as before")
         self.assertEqual(o["storeCold"]["waited"], 1, "one waitUntil carries write and tap")
-        self.assertEqual([x[:2] for x in o["storeColdOps"]], [["open", "romp-tap"], ["put", "/__romp/tap"]])
-        self.assertTrue(all(x[2] == 1 for x in o["storeColdOps"]), "written while LOG held only the close: before the matchAll — " + repr(o["storeColdOps"]))
+        # the fingerprint's stamp and the shown record's retirement share the cache since 2026-09-09 (their own
+        # test below); the TAP entry's ops are what this pin is about
+        tap_ops = [x for x in o["storeColdOps"] if x[1] == "/__romp/tap"]
+        self.assertEqual([x[:2] for x in tap_ops], [["put", "/__romp/tap"]])
+        self.assertEqual(o["storeColdOps"][0][:2], ["open", "romp-tap"])
+        self.assertTrue(all(x[2] == 1 for x in tap_ops), "written while LOG held only the close: before the matchAll — " + repr(o["storeColdOps"]))
         r = o["storeColdRec"]
         self.assertEqual({k: r[k] for k in ("sid", "host", "kind", "cardId", "url")},
                          {"sid": "S1", "host": "", "kind": "card", "cardId": "S1:g1", "url": self.URL})
@@ -473,18 +550,83 @@ class ServiceWorkerExecutes(unittest.TestCase):
         # a live window is told AND the entry is written: a page the browser suspended can miss the message
         self.assertEqual(o["storeLive"]["log"], [["close"], self.MATCH, ["focus"], ["post", self.MSG]])
         self.assertEqual(o["storeLiveRec"]["id"], o["storeLiveId"])
-        self.assertTrue(all(x[2] == 1 for x in o["storeLiveOps"]), "before the matchAll here too")
-        # a sid-less tap has nowhere to land: nothing written, no cache touched
-        self.assertEqual((o["storeSidlessKeys"], o["storeSidlessOps"]), ([], []))
+        self.assertTrue(all(x[2] == 1 for x in o["storeLiveOps"] if x[1] == "/__romp/tap"), "before the matchAll here too")
+        # a sid-less tap has nowhere to land: no tap written, the tap entry untouched (the click's own fingerprint
+        # stamp is the one op it makes — every click leaves that trace, by design)
+        self.assertEqual([k for k in o["storeSidlessKeys"] if k != "/__romp/sw"], [])
+        self.assertEqual([x for x in o["storeSidlessOps"] if x[1] in ("/__romp/tap", "/__romp/shown")], [])
         self.assertEqual(o["storeSidless"]["log"], [["close"], self.MATCH, ["openWindow", "/"]])
 
     def test_the_ack_retires_the_entry_only_for_the_tap_it_names_and_a_refusing_store_never_blocks_the_tap(self):
         o = self.out
-        self.assertEqual(o["ackOtherKeeps"], ["/__romp/tap"], "an ack for another tap leaves the entry")
-        self.assertEqual(o["ackOwnDeletes"], [], "the ack naming the stored tap deletes it")
+        self.assertEqual([k for k in o["ackOtherKeeps"] if k != "/__romp/sw"], ["/__romp/tap"], "an ack for another tap leaves the entry")
+        self.assertEqual([k for k in o["ackOwnDeletes"] if k != "/__romp/sw"], [], "the ack naming the stored tap deletes it")
         self.assertEqual(o["ackWaited"], 1, "the delete rides the message event's waitUntil")
         self.assertEqual(o["storeFail"]["log"], [["close"], self.MATCH, ["openWindow", self.URL]], "storage refused: the tap lands by the other roads")
         self.assertEqual(o["storeFail"]["waited"], 1)
+
+    def test_the_worker_leaves_a_fingerprint_the_page_can_read(self):
+        # 2026-09-09, the warm-app round: three taps, no [reveal], no worker message, an empty store on every
+        # resume — and no way to tell an older worker that never wrote the store from a tap iOS delivered past
+        # the worker altogether. So the worker writes WHICH worker ran and WHAT it saw: '/__romp/sw' beside the
+        # tap, {version (baked at serve time), installedAt, activatedAt, lastPushAt, lastPushSid, lastClickAt,
+        # lastClickSid, clicks}. install starts a fresh record for the new build over the old one's
+        o = self.out
+        self.assertEqual(o["installWaited"], 1, "the install's write rides its waitUntil")
+        fi = o["fpInstalled"]
+        self.assertEqual(fi["version"], "__ROMP_SWV__", "the harness runs the unbaked source: the placeholder IS the version here")
+        self.assertGreater(fi["installedAt"], 1)
+        self.assertEqual((fi["activatedAt"], fi["lastPushAt"], fi["lastClickAt"], fi["clicks"], fi["lastPushSid"], fi["lastClickSid"]),
+                         (0, 0, 0, 0, "", ""), "a fresh record: the previous build's counters do not carry over")
+        self.assertEqual(o["activateWaited"], 1)
+        fa = o["fpActivated"]
+        self.assertGreater(fa["activatedAt"], 1)
+        self.assertEqual(fa["installedAt"], fi["installedAt"], "merged, not replaced")
+        # every push stamps its arrival — and the show is still the synchronous first act of the handler
+        fp = o["fpPushed"]
+        self.assertGreater(fp["lastPushAt"], 1)
+        self.assertEqual(fp["lastPushSid"], "S1")
+        self.assertEqual((fp["installedAt"], fp["activatedAt"], fp["clicks"]), (fi["installedAt"], fa["activatedAt"], 0))
+        self.assertEqual(o["pushSync2"], ["show"])
+        # every click stamps itself FIRST — the cache is opened before even the notification's close — and counts
+        ops = o["clickStampOps"]
+        self.assertEqual(ops[0], ["open", "romp-tap", 0], "the first thing the click handler does, before the close is logged: " + repr(ops[:3]))
+        self.assertIn(["put", "/__romp/sw"], [x[:2] for x in ops])
+        fc = o["fpAfterClick"]
+        self.assertGreater(fc["lastClickAt"], 1)
+        self.assertEqual(fc["lastClickSid"], "S1")
+        self.assertEqual(fc["clicks"], 2, "the sid-less test tap before it counted too: every click is a click")
+        self.assertEqual(o["fpAfterSidlessClick"]["clicks"], 1)
+        self.assertEqual(o["fpAfterSidlessClick"]["lastClickSid"], "")
+        self.assertEqual(o["clickStamp"]["log"], [["close"], self.MATCH, ["focus"], ["post", self.MSG]], "the tap lands exactly as before")
+        self.assertEqual(o["clickStamp"]["waited"], 1, "the stamp rides the tap's one waitUntil")
+
+    def test_the_push_writes_the_notification_it_shows_before_attempting_the_show(self):
+        # the offer's source (2026-09-09): a page that comes forward with no tap stored — the click handler is a
+        # road it cannot count on any more — but a shown record can OFFER the session the notification named. So
+        # every session-addressed push writes '/__romp/shown' {id, sid, host, kind, cardId, url, name, t} BEFORE
+        # the show is attempted: a show that fails (headless browsers refuse it) still leaves the record
+        o = self.out
+        self.assertEqual(o["pushOpsBeforeShow"], [["open", "romp-tap"], ["open", "romp-tap"]], "both writes are started before the show is logged")
+        s = o["shownAfterPush"]
+        self.assertEqual({k: s[k] for k in ("sid", "host", "kind", "cardId", "url", "name")},
+                         {"sid": "S1", "host": "", "kind": "card", "cardId": "S1:g1", "url": self.URL, "name": "web"})
+        self.assertRegex(s["id"], r"^\d+-[a-z0-9]+$")
+        self.assertIsInstance(s["t"], (int, float))
+        self.assertEqual(o["pushRefused"], "rejected: denied", "the push still fails the way it always did when the show is refused")
+        r = o["shownAfterRefused"]
+        self.assertEqual((r["sid"], r["kind"], r["name"]), ("S2", "turn", "api"), "…but the record is there: one slot, latest wins")
+        self.assertEqual(o["fpAfterRefused"]["lastPushSid"], "S2", "and the push was stamped")
+        # a sid-less push has nothing to offer: the slot keeps what it held; the arrival is still stamped
+        self.assertEqual(o["shownAfterSidless"]["sid"], "S2")
+        self.assertEqual(o["fpAfterSidless"]["lastPushSid"], "")
+        # a session-addressed click retires the record (the tap wins); a sid-less one leaves it
+        self.assertEqual(o["shownAfterSidlessClick"]["id"], "N-1")
+        self.assertIsNone(o["shownAfterClick"], "the tap on a session's notification spends the offer")
+        # the shell's ack, naming the shown id (an offer taken or dismissed), retires it; another id leaves it
+        self.assertEqual(o["shownAckOther"]["id"], "N-2")
+        self.assertIsNone(o["shownAckOwn"])
+        self.assertEqual(o["ackShownWaited"], 1, "one waitUntil carries both retirements")
 
 
 @unittest.skipUnless(HAVE_CRYPTO, "python 'cryptography' not installed")
@@ -708,7 +850,7 @@ class PushSink(unittest.TestCase):
         # E2E-encrypted. Every routing value is an id or a fixed word, never text.
         self.assertEqual(set(body), {"title", "body", "sid", "badge", "tag", "data"})
         self.assertEqual((body["title"], body["sid"], body["badge"]), ("romp: web", "SID-web", 3))
-        self.assertEqual(set(body["data"]), {"sid", "host", "kind", "cardId", "url"})
+        self.assertEqual(set(body["data"]), {"sid", "host", "kind", "cardId", "url", "name"})   # name (2026-09-09): the session's display name, for the offer chip
 
 
 class PushPayloadShape(unittest.TestCase):
@@ -719,7 +861,8 @@ class PushPayloadShape(unittest.TestCase):
         d = km._push_payload("romp: web", "Needs you: pick one", "SID-web", 2, kind="card",
                              card_id="SID-web:g3")
         self.assertEqual(d["data"], {"sid": "SID-web", "host": "", "kind": "card", "cardId": "SID-web:g3",
-                                     "url": "/?push-reveal=SID-web&push-card=SID-web%3Ag3"})
+                                     "url": "/?push-reveal=SID-web&push-card=SID-web%3Ag3",
+                                     "name": "SID-web"})   # no registry entry here: the short id, as _push_test always fell back
         self.assertEqual(d["tag"], "romp:SID-web", "one notification per session")
         self.assertEqual(d["sid"], "SID-web", "…and flat, for a worker of the previous build")
         self.assertEqual(d["badge"], 2)
@@ -735,8 +878,23 @@ class PushPayloadShape(unittest.TestCase):
         # "test", no sid, so the tap can only ever focus or open romp — and every test collapses
         # into one notification rather than stacking on the lock screen
         d = km._push_payload("romp", "Test notification", kind="test")
-        self.assertEqual(d["data"], {"sid": "", "host": "", "kind": "test", "cardId": "", "url": "/"})
+        self.assertEqual(d["data"], {"sid": "", "host": "", "kind": "test", "cardId": "", "url": "/", "name": ""})
         self.assertEqual(d["tag"], "romp:test")
+
+    def test_the_payload_names_the_session_the_way_the_test_push_does(self):
+        # 2026-09-09: the shell's "from the notification" offer names the session from the payload alone, so every
+        # push carries `name`, resolved by ONE helper in _push_test's order of authority — the names registry for
+        # a local session, the tunnel supervisor's snapshot for a federated one (host-prefixed), then the caller's
+        # label, then the short id — unless the leg passes its own (the turn leg's title IS the name)
+        with mock.patch.object(km, "_name_of", side_effect=lambda s: {"SID-web": "web"}.get(s)), \
+             mock.patch.object(km, "_remote_name_of", side_effect=lambda h, s: {("boxa", "SID-api"): "api"}.get((h, s))):
+            self.assertEqual(km._push_payload("romp: web", "b", "SID-web")["data"]["name"], "web")
+            self.assertEqual(km._push_payload("romp: boxa:api", "b", "boxa:SID-api", host="boxa")["data"]["name"], "boxa:api")
+            self.assertEqual(km._push_payload("romp: boxb:?", "b", "boxb:SID-unknown")["data"]["name"], "SID-unkn", "no snapshot: the short id")
+            self.assertEqual(km._push_payload("web", "finished", "SID-web", kind="turn", name="web (renamed)")["data"]["name"], "web (renamed)", "a leg's own name wins")
+            self.assertEqual(km._push_session_name("SID-other", label="  the   tab  text  "), "the tab text", "the label, flattened, when the kernel has no name")
+            self.assertEqual(km._push_session_name(""), "")
+            self.assertEqual(km._push_session_name("SID-other", label="x" * 200), "x" * km.PUSH_LABEL_MAX, "clipped")
 
     def test_a_relayed_push_keeps_the_origin_in_sid_and_host(self):
         # a federated event's sid already wears its host prefix (the merged dashboard's own tab
@@ -1008,7 +1166,7 @@ class LandingRevealPins(unittest.TestCase):
                         "written before the worker looks for a window")
         js = km._LANDING_REVEAL_JS
         self.assertIn("resume('boot',pr||'')", js)
-        self.assertIn("if(document.visibilityState==='visible'){askReplay();resume('visible');}", js)
+        self.assertIn("if(document.visibilityState==='visible'){askReplay();refreshWorker();resume('visible');}", js)   # + the worker re-check (2026-09-09)
         self.assertIn("window.addEventListener('pageshow',function(){askReplay();resume('pageshow');});", js)
         self.assertIn("window.addEventListener('focus',function(){askReplay();resume('focus');});", js)
         self.assertIn("diag('tap-resume',", js)
@@ -1054,16 +1212,33 @@ class LandingRevealPins(unittest.TestCase):
 # a sid-less tap does nothing, a refused /reveal is loud.
 _REVEAL_HARNESS = r"""
 'use strict';
-const FETCHES = [], POSTED = [], NOTES = [], REPLACED = [], WIN = [], SW = [], DOC = [], PAGESHOW = [], FOCUS = [], CTRL = [], ACK = [], DIAG = [];
+const FETCHES = [], POSTED = [], NOTES = [], REPLACED = [], WIN = [], SW = [], DOC = [], PAGESHOW = [], FOCUS = [], CTRL = [], ACK = [], DIAG = [], UPD = [];
 let fetchOk = true;
 const feedWin = { postMessage: (m) => POSTED.push(m) };
 global.window = global;
-global.document = { getElementById: (id) => (id === 'f-feed' ? { contentWindow: feedWin } : null),
+// the offer chip's three stable shell elements (2026-09-09), as minimal nodes: hidden/disabled/textContent (a set
+// clears appended children, as the DOM's does), a classList, listeners fired by click()
+function el(id) { const L = {}; let text = ''; const kids = [];
+  const e = { id, hidden: true, disabled: false,
+    classList: { _s: new Set(), add(c) { this._s.add(c); }, remove(c) { this._s.delete(c); }, contains(c) { return this._s.has(c); } },
+    appendChild(k) { kids.push(k); }, addEventListener(k, f) { (L[k] = L[k] || []).push(f); }, click() { (L.click || []).forEach((f) => f()); },
+    get textContent() { return text + kids.map((k) => k.textContent).join(''); }, set textContent(v) { text = String(v); kids.length = 0; } };
+  return e; }
+const CHIP = { 'tap-offer': el('tap-offer'), 'tap-offer-go': el('tap-offer-go'), 'tap-offer-x': el('tap-offer-x') };
+const chipState = () => ({ hidden: CHIP['tap-offer'].hidden, text: CHIP['tap-offer-go'].textContent, acted: CHIP['tap-offer'].classList.contains('acted'), disabled: CHIP['tap-offer-go'].disabled });
+// the chat pane's active tab, as the same-origin iframe DOM the script reads: ROMP_TEST_ACTIVE at boot, reassignable
+let activeSid = process.env.ROMP_TEST_ACTIVE || '';
+const chatFrame = { contentDocument: { querySelector: () => (activeSid ? { getAttribute: () => activeSid } : null) } };
+global.document = { getElementById: (id) => (id === 'f-feed' ? { contentWindow: feedWin } : id === 'f-chat' ? chatFrame : (CHIP[id] || null)),
+  createElement: (tag) => ({ tag, className: '', textContent: '' }),
   addEventListener: (k, f) => { if (k === 'visibilitychange') DOC.push(f); }, visibilityState: 'visible' };
 global.sessionStorage = { getItem: (k) => (k === 'romp:wid' ? 'W-test' : null) };
 global.addEventListener = (k, f) => { if (k === 'message') WIN.push(f); if (k === 'pageshow') PAGESHOW.push(f); if (k === 'focus') FOCUS.push(f); };
+// the registration the page asks to update() at boot and on every visible (2026-09-09); ROMP_TEST_NO_REG: none registered
+const REG = { update: () => { UPD.push(1); return Promise.resolve(); } };
 Object.defineProperty(global, 'navigator', { configurable: true,   // a getter-only global in node 22
   value: { serviceWorker: { addEventListener: (k, f) => { if (k === 'message') SW.push(f); },
+                            getRegistration: () => Promise.resolve(process.env.ROMP_TEST_NO_REG ? undefined : REG),
                             controller: { postMessage: (m) => CTRL.push(m) } } } });   // the worker that controls this page
 global.history = { replaceState: (s, t, u) => REPLACED.push(u) };
 // the boot is env-driven (2026-09-09) so one harness plays every arrival: ROMP_TEST_HREF is the URL the page
@@ -1080,7 +1255,9 @@ const cacheObj = {
 };
 if (!process.env.ROMP_TEST_NO_CACHES) global.caches = { open: () => Promise.resolve(cacheObj), match: (k) => cacheObj.match(k) };
 function seed(tap) { STORE.set('/__romp/tap', new Response(JSON.stringify(tap))); }
+function seedK(k, v) { STORE.set(k, new Response(JSON.stringify(v))); }   // any entry: the fingerprint, the shown record
 if (process.env.ROMP_TEST_TAP) seed(JSON.parse(process.env.ROMP_TEST_TAP));
+if (process.env.ROMP_TEST_SEED) { const s = JSON.parse(process.env.ROMP_TEST_SEED); for (const k in s) seedK(k, s[k]); }
 global.fetch = (path, init) => { FETCHES.push([path, JSON.parse(init.body)]);
   return Promise.resolve(fetchOk ? { ok: true, status: 200 } : { ok: false, status: 400, text: () => Promise.resolve('missing sid') }); };
 global.__rompNotify = (kind, text) => NOTES.push([kind, text]);
@@ -1141,9 +1318,24 @@ const winMsg = (m) => WIN.forEach((f) => f({ data: m }));
 """
 
 
-def _run_reveal(driver, href=None, tap=None, no_caches=False):
+# the fingerprint keys every tap-resume row carries since 2026-09-09, as a page reads them with NO '/__romp/sw'
+# entry in the store (no worker ever wrote one): nothing known, said plainly
+NO_FP = {"swVersion": None, "swMatchesPage": None, "lastPushAgeS": -1, "lastClickAgeS": -1, "clicks": 0}
+
+
+def _fp(row, **fp):
+    """a tap-resume row as filed: `row` plus the fingerprint keys (NO_FP unless overridden)"""
+    d = dict(row)
+    d.update(NO_FP)
+    d.update(fp)
+    return d
+
+
+def _run_reveal(driver, href=None, tap=None, no_caches=False, seed=None, active=None, no_reg=False):
     """node runs the harness + the shell's reveal script + `driver`, booting on `href` (default: the deep
-    link) with `tap` already in the store (the worker wrote it before this page) — see the harness's env."""
+    link) with `tap` already in the store (the worker wrote it before this page) — see the harness's env.
+    `seed`: other entries already in the store ({key: record} — the fingerprint, the shown record); `active`:
+    the chat pane's active tab at boot; `no_reg`: no service worker registration to update."""
     import subprocess, tempfile as _tf
     env = dict(os.environ)
     if href:
@@ -1152,6 +1344,12 @@ def _run_reveal(driver, href=None, tap=None, no_caches=False):
         env["ROMP_TEST_TAP"] = json.dumps(tap)
     if no_caches:
         env["ROMP_TEST_NO_CACHES"] = "1"
+    if seed:
+        env["ROMP_TEST_SEED"] = json.dumps(seed)
+    if active:
+        env["ROMP_TEST_ACTIVE"] = active
+    if no_reg:
+        env["ROMP_TEST_NO_REG"] = "1"
     with _tf.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
         f.write(_REVEAL_HARNESS + km._LANDING_REVEAL_JS + driver)
         path = f.name
@@ -1215,11 +1413,12 @@ class LandingRevealExecutes(unittest.TestCase):
         # status. Structure only — no id, no name, no text
         b = self.out["boot"]
         self.assertEqual(b["diag"], [["deeplink", {"hasSid": True, "hasCard": True, "controlled": True}]])
-        # …then /reveal's answer and the stored-tap check (2026-09-09: an empty store, said so), in whatever
-        # order the two promises settle
+        # …then /reveal's answer, the stored-tap check (2026-09-09: an empty store, said so — with the worker's
+        # fingerprint, none written here) and the worker re-check, in whatever order the promises settle
         self.assertEqual(sorted(json.dumps(x, sort_keys=True) for x in b["diagAfter"][1:]),
                          sorted(json.dumps(x, sort_keys=True) for x in [["reveal-post", {"status": 200, "via": "link", "boot": True}],
-                                                                        ["tap-resume", {"found": False, "via": "boot", "store": True}]]))
+                                                                        ["tap-resume", _fp({"found": False, "via": "boot", "store": True})],
+                                                                        ["sw-update", {"ok": True, "reg": True}]]))
         self.assertEqual(self.out["live"]["diag"],
                          [["sw-message", {"shape": "notificationClick", "hasSid": True, "kind": "card", "dup": False,
                                           "sw": {"clients": 3, "tops": 1, "road": "focus", "vis": "hidden"}}],
@@ -1264,7 +1463,7 @@ const swSrc = { postMessage: (m) => ACK.push(m) };
 const swMsg = (m) => SW.forEach((f) => f({ data: m, source: swSrc }));
 const winMsg = (m) => WIN.forEach((f) => f({ data: m }));
 const flip = async (state) => { global.document.visibilityState = state; DOC.forEach((f) => f()); await settle(); };
-const snap = () => ({ fetches: FETCHES.slice(), posted: POSTED.slice(), diag: DIAG.slice(), ack: ACK.slice(), ctrl: CTRL.slice(), keys: [...STORE.keys()], notes: NOTES.slice() });
+const snap = () => ({ fetches: FETCHES.slice(), posted: POSTED.slice(), diag: DIAG.slice(), ack: ACK.slice(), ctrl: CTRL.slice(), keys: [...STORE.keys()], notes: NOTES.slice(), chip: chipState(), upd: UPD.length });
 const reset = () => { FETCHES.length = 0; POSTED.length = 0; DIAG.length = 0; ACK.length = 0; CTRL.length = 0; NOTES.length = 0; };
 """
 # a page that booted on the plain start URL with nothing stored, then came back with a tap in the store
@@ -1355,6 +1554,179 @@ _RESUME_LINK_DRIVER = _RESUME_LIB + r"""
 })();
 """
 
+# the offer (2026-09-09): a page booting on the plain start URL with a shown record and the worker's fingerprint in the
+# store — no tap — then every turn the chip can take
+_OFFER_DRIVER = _RESUME_LIB + r"""
+(async () => {
+  const out = {};
+  await settle();
+  out.boot = snap();                                   // the chip is up: a shown record, no tap, no session in front yet
+  winMsg({ romp: 'ready', app: 'feed' });
+  reset();
+  CHIP['tap-offer-go'].click();                        // the user takes the offer
+  out.clickedSync = chipState();                       // acknowledged before anything settles
+  await settle();
+  out.taken = snap();
+  reset();
+  await flip('visible');                               // nothing left to offer
+  out.after = snap();
+  reset();
+  seedK('/__romp/shown', { id: 'N-2', sid: 'S10', host: '', kind: 'card', cardId: 'S10:g1', url: '/?push-reveal=S10&push-card=S10%3Ag1', name: 'tests', t: Date.now() - 60000 });
+  await flip('visible');
+  out.second = snap();
+  reset();
+  CHIP['tap-offer-x'].click();                         // …and this one dismissed
+  await settle();
+  out.dismissed = snap();
+  reset();
+  // a shown record AND a stored tap: the tap wins, the offer never shows and its record is spent
+  seedK('/__romp/shown', { id: 'N-3', sid: 'S11', host: '', kind: 'turn', cardId: '', url: '/?push-reveal=S11', name: 'web', t: Date.now() });
+  seed({ id: 'T-30', sid: 'S12', host: '', kind: 'turn', cardId: '', url: '/?push-reveal=S12', t: Date.now() });
+  await flip('visible');
+  out.tapWins = snap();
+  reset();
+  // the session in front already IS the one named: nothing to offer, the record is spent
+  seedK('/__romp/shown', { id: 'N-4', sid: 'S13', host: '', kind: 'turn', cardId: '', url: '/?push-reveal=S13', name: 'api', t: Date.now() - 2000 });
+  activeSid = 'S13';
+  await flip('visible');
+  out.already = snap();
+  activeSid = '';
+  reset();
+  // a record with no session is not an offer: cleared, nothing filed
+  seedK('/__romp/shown', { id: 'N-5', sid: '', host: '', kind: 'test', cardId: '', url: '/', name: '', t: Date.now() });
+  await flip('visible');
+  out.sidless = snap();
+  reset();
+  // the fingerprint of ANOTHER build: the row says so, and sw-stale is filed beside it
+  seedK('/__romp/sw', { version: 'other-build', installedAt: Date.now() - 900000, activatedAt: Date.now() - 900000, lastPushAt: Date.now() - 30000, lastPushSid: 'S9', lastClickAt: Date.now() - 20000, lastClickSid: 'S9', clicks: 3 });
+  await flip('visible');
+  out.stale = snap();
+  console.log(JSON.stringify(out));
+})();
+"""
+# a boot and nothing else: the rows the boot alone files
+_BOOT_DRIVER = _RESUME_LIB + r"""
+(async () => { await settle(); console.log(JSON.stringify({ boot: snap() })); })();
+"""
+
+
+class LandingRevealOffers(unittest.TestCase):
+    """2026-09-09, the phone with the app WARM: three taps, three 201s from the push service, and then nothing
+    — no [reveal] line, no worker message, tap-resume found:false on every resume, each tap booting a fresh
+    page on the start URL. Whether iOS handed the tap to the live app past the worker or an older worker took
+    it, the click handler is a road the page cannot count on. Two answers, both read here: the worker's
+    FINGERPRINT (which build wrote the store, how long since its last push and click) folded into every
+    tap-resume row, with sw-stale on a mismatch and a registration.update() at boot and on every visible; and
+    the OFFER — a chip, not a jump, for the notification the worker showed but nobody tapped through."""
+    SHOWN = {"id": "N-1", "sid": "S9", "host": "", "kind": "card", "cardId": "S9:g2", "url": "/?push-reveal=S9&push-card=S9%3Ag2", "name": "api"}
+    FP = {"version": "__ROMP_SWV__", "installedAt": 1, "activatedAt": 1, "lastPushSid": "S9", "lastClickAt": 0, "lastClickSid": "", "clicks": 0}
+
+    @classmethod
+    def setUpClass(cls):
+        import time as _t
+        now = int(_t.time() * 1000)
+        cls.out = _run_reveal(_OFFER_DRIVER, href="http://localhost:7777/",
+                              seed={"/__romp/shown": dict(cls.SHOWN, t=now - 5000), "/__romp/sw": dict(cls.FP, lastPushAt=now - 5000)})
+        cls.link = _run_reveal(_BOOT_DRIVER, href="http://localhost:7777/?push-reveal=S1",
+                               seed={"/__romp/shown": dict(cls.SHOWN, t=now - 5000)})
+        cls.no_reg = _run_reveal(_BOOT_DRIVER, href="http://localhost:7777/", no_reg=True)
+        cls.active_at_boot = _run_reveal(_BOOT_DRIVER, href="http://localhost:7777/", active="S9",
+                                         seed={"/__romp/shown": dict(cls.SHOWN, t=now - 5000)})
+
+    @staticmethod
+    def _rows(snap, what):
+        return [d for w, d in snap["diag"] if w == what]
+
+    def test_a_shown_but_untapped_notification_is_offered_not_jumped_to(self):
+        b = self.out["boot"]
+        self.assertEqual(b["fetches"], [], "no jump: the user may have opened the app for another reason")
+        self.assertEqual(b["chip"], {"hidden": False, "text": "Open api · from the notification", "acted": False, "disabled": False})
+        self.assertEqual(self._rows(b, "tap-offer"), [{"shown": True, "via": "boot", "ageS": 5, "why": ""}])
+        # the fingerprint rides the tap-resume row: this page's own build wrote the store, its last push seconds ago,
+        # never a click — the reading that separates a worker that never ran from one that ran and lost the tap
+        self.assertEqual(self._rows(b, "tap-resume"),
+                         [_fp({"found": False, "via": "boot", "store": True}, swVersion="__ROMP_SWV__", swMatchesPage=True, lastPushAgeS=5, lastClickAgeS=-1, clicks=0)])
+        self.assertEqual(self._rows(b, "sw-stale"), [], "the same build: nothing stale")
+        for d in self._rows(b, "tap-offer") + self._rows(b, "tap-resume"):
+            for k in d:
+                self.assertNotIn("sid", k.lower(), "ages and booleans only, never a session id: %r" % d)
+
+    def test_taking_the_offer_lands_by_the_same_path_and_retires_the_record(self):
+        self.assertEqual(self.out["clickedSync"], {"hidden": True, "text": "Open api · from the notification", "acted": True, "disabled": True},
+                         "acknowledged in the click's own stack: pressed look, disabled, gone")
+        t = self.out["taken"]
+        self.assertEqual(t["fetches"], [["/reveal", {"sid": "S9", "wid": "W-test", "via": "offer"}]], "the same land() path, the road named")
+        self.assertEqual(t["posted"], [{"romp": "revealCard", "itemId": "S9:g2", "sid": "S9"}], "a card kind scrolls the feed too")
+        self.assertIn(["tap-offer-click", {"ageS": 5}], t["diag"])
+        self.assertIn(["reveal-post", {"status": 200, "via": "offer", "boot": False}], t["diag"])
+        self.assertIn({"romp": "tapLanded", "id": "N-1"}, t["ctrl"], "the worker is told, so its copy goes too")
+        self.assertNotIn("/__romp/shown", t["keys"], "the record is retired here as well")
+        self.assertTrue(t["chip"]["hidden"])
+        a = self.out["after"]
+        self.assertEqual((a["fetches"], self._rows(a, "tap-offer"), a["chip"]["hidden"]), ([], [], True), "nothing left to offer on the next coming-back")
+
+    def test_dismissing_retires_the_record_without_landing(self):
+        s = self.out["second"]
+        self.assertEqual(s["chip"], {"hidden": False, "text": "Open tests · from the notification", "acted": False, "disabled": False})
+        self.assertEqual(self._rows(s, "tap-offer"), [{"shown": True, "via": "visible", "ageS": 60, "why": ""}])
+        d = self.out["dismissed"]
+        self.assertEqual(d["fetches"], [], "dismissed: nothing lands")
+        self.assertEqual(d["posted"], [])
+        self.assertIn(["tap-offer-dismiss", {"ageS": 60}], d["diag"])
+        self.assertIn({"romp": "tapLanded", "id": "N-2"}, d["ctrl"])
+        self.assertNotIn("/__romp/shown", d["keys"])
+        self.assertTrue(d["chip"]["hidden"])
+
+    def test_a_stored_tap_outranks_the_offer(self):
+        w = self.out["tapWins"]
+        self.assertEqual(w["fetches"], [["/reveal", {"sid": "S12", "wid": "W-test", "via": "store"}]], "the tap lands")
+        self.assertEqual(self._rows(w, "tap-offer"), [], "the offer never shows")
+        self.assertTrue(w["chip"]["hidden"])
+        self.assertNotIn("/__romp/tap", w["keys"])
+        self.assertNotIn("/__romp/shown", w["keys"], "…and its record is spent: the user tapped")
+
+    def test_no_offer_for_the_session_already_in_front(self):
+        a = self.out["already"]
+        self.assertEqual(a["fetches"], [])
+        self.assertTrue(a["chip"]["hidden"])
+        self.assertEqual(self._rows(a, "tap-offer"), [{"shown": False, "via": "visible", "ageS": 2, "why": "active"}])
+        self.assertIn({"romp": "tapLanded", "id": "N-4"}, a["ctrl"], "the notification's purpose is met: retired")
+        self.assertNotIn("/__romp/shown", a["keys"])
+        # …and at boot too, when the pane already shows that session
+        b = self.active_at_boot["boot"]
+        self.assertEqual(self._rows(b, "tap-offer"), [{"shown": False, "via": "boot", "ageS": 5, "why": "active"}])
+        self.assertTrue(b["chip"]["hidden"])
+        z = self.out["sidless"]
+        self.assertEqual((z["fetches"], self._rows(z, "tap-offer"), z["chip"]["hidden"]), ([], [], True), "a record without a session is not an offer")
+        self.assertNotIn("/__romp/shown", z["keys"])
+
+    def test_a_deep_link_boot_outranks_the_offer(self):
+        b = self.link["boot"]
+        self.assertEqual(b["fetches"], [["/reveal", {"sid": "S1", "wid": "W-test", "via": "link", "boot": True}]], "the link alone lands")
+        self.assertEqual(self._rows(b, "tap-offer"), [{"shown": False, "via": "boot", "ageS": 5, "why": "link"}])
+        self.assertTrue(b["chip"]["hidden"])
+        self.assertIn({"romp": "tapLanded", "id": "N-1"}, b["ctrl"])
+        self.assertNotIn("/__romp/shown", b["keys"])
+
+    def test_a_foreign_builds_fingerprint_files_sw_stale(self):
+        s = self.out["stale"]
+        self.assertEqual(self._rows(s, "tap-resume"),
+                         [_fp({"found": False, "via": "visible", "store": True}, swVersion="other-build", swMatchesPage=False, lastPushAgeS=30, lastClickAgeS=20, clicks=3)])
+        self.assertEqual(self._rows(s, "sw-stale"), [{"swVersion": "other-build", "pageVersion": "__ROMP_SWV__"}])
+
+    def test_the_worker_is_asked_to_update_at_boot_and_on_every_visible(self):
+        # a Home Screen app may not re-check its worker on relaunch — so the page asks, on the events such an app
+        # produces, and files whether there was a registration to ask
+        b = self.out["boot"]
+        self.assertEqual(b["upd"], 1)
+        self.assertEqual(self._rows(b, "sw-update"), [{"ok": True, "reg": True}])
+        self.assertEqual(self.out["after"]["upd"], 2, "one more per visible: " + repr(self.out["after"]["upd"]))
+        self.assertEqual(self._rows(self.out["after"], "sw-update"), [{"ok": True, "reg": True}])
+        self.assertEqual(self.out["second"]["upd"], 3, "…and again on the next")
+        n = self.no_reg["boot"]
+        self.assertEqual(n["upd"], 0)
+        self.assertEqual(self._rows(n, "sw-update"), [{"ok": False, "reg": False}], "no registration: said so, never a throw")
+
 
 class LandingRevealResumesFromStore(unittest.TestCase):
     """2026-09-09, the phone with the app alive in the background: the tap brought the app forward and
@@ -1388,7 +1760,7 @@ class LandingRevealResumesFromStore(unittest.TestCase):
     def test_a_page_that_comes_back_lands_the_stored_tap_once_and_retires_it(self):
         w = self.warm
         self.assertEqual(w["boot"]["fetches"], [], "a plain start with nothing stored lands nothing")
-        self.assertEqual(self._rows(w["boot"]), [{"found": False, "via": "boot", "store": True}], "…and says the check ran")
+        self.assertEqual(self._rows(w["boot"]), [_fp({"found": False, "via": "boot", "store": True})], "…and says the check ran")
         self.assertEqual(w["hidden"]["fetches"], [], "going hidden reads nothing")
         self.assertEqual(self._rows(w["hidden"]), [])
         v = w["visible"]
@@ -1397,24 +1769,24 @@ class LandingRevealResumesFromStore(unittest.TestCase):
         self.assertEqual(v["ctrl"], [{"romp": "tapReplay"}, {"romp": "tapLanded", "id": "T-9"}],
                          "the replay ask still goes out first; then the controlling worker is told the tap landed, so its kept copy and the entry go")
         self.assertEqual(v["keys"], [], "the page deletes the entry itself as well")
-        self.assertEqual(self._rows(v), [{"found": True, "via": "visible", "ageS": 5, "dup": False, "dropped": False, "sameSid": None}])
-        self.assertEqual(v["diag"][-1], ["reveal-post", {"status": 200, "via": "store", "boot": False}])
+        self.assertEqual(self._rows(v), [_fp({"found": True, "via": "visible", "ageS": 5, "dup": False, "dropped": False, "sameSid": None})])
+        self.assertIn(["reveal-post", {"status": 200, "via": "store", "boot": False}], v["diag"])
         for d in self._rows(v):
             self.assertNotIn("sid", d, "structure only")
         a = w["again"]
         self.assertEqual((a["fetches"], self._acks(a), a["posted"]), ([], [], []), "a second coming-back finds nothing")
-        self.assertEqual(self._rows(a), [{"found": False, "via": "visible", "store": True}])
+        self.assertEqual(self._rows(a), [_fp({"found": False, "via": "visible", "store": True})])
 
     def test_pageshow_and_focus_are_roads_too_and_age_is_clipped_never_a_reason_to_drop(self):
         w = self.warm
         p = w["pageshow"]
         self.assertEqual(p["fetches"], [["/reveal", {"sid": "S11", "wid": "W-test", "via": "store"}]])
         self.assertEqual(p["posted"], [], "a turn: no card")
-        self.assertEqual(self._rows(p), [{"found": True, "via": "pageshow", "ageS": 400, "dup": False, "dropped": False, "sameSid": None}], "minutes old is still the user's tap")
+        self.assertEqual(self._rows(p), [_fp({"found": True, "via": "pageshow", "ageS": 400, "dup": False, "dropped": False, "sameSid": None})], "minutes old is still the user's tap")
         self.assertEqual(self._acks(p), [{"romp": "tapLanded", "id": "T-11"}])
         f = w["focus"]
         self.assertEqual(f["fetches"], [["/reveal", {"sid": "boxa:S12", "wid": "W-test", "via": "store"}]], "a federated sid lands as-is")
-        self.assertEqual(self._rows(f), [{"found": True, "via": "focus", "ageS": -1, "dup": False, "dropped": False, "sameSid": None}], "no timestamp: -1, never a throw")
+        self.assertEqual(self._rows(f), [_fp({"found": True, "via": "focus", "ageS": -1, "dup": False, "dropped": False, "sameSid": None})], "no timestamp: -1, never a throw")
         self.assertEqual(f["ctrl"][0], {"romp": "tapReplay"}, "focus asks the worker for its kept copy as well")
         self.assertEqual(f["keys"], [])
 
@@ -1424,7 +1796,7 @@ class LandingRevealResumesFromStore(unittest.TestCase):
         self.assertEqual(s1["fetches"], [["/reveal", {"sid": "S13", "wid": "W-test", "via": "sw"}]])
         self.assertEqual(s1["keys"], [], "landing by the message retires the stored copy of the same tap too")
         self.assertEqual(s1["ack"], [{"romp": "tapLanded", "id": "T-13"}], "acked to the worker that posted")
-        self.assertEqual((w["swThenStore"]["fetches"], self._rows(w["swThenStore"])), ([], [{"found": False, "via": "visible", "store": True}]))
+        self.assertEqual((w["swThenStore"]["fetches"], self._rows(w["swThenStore"])), ([], [_fp({"found": False, "via": "visible", "store": True})]))
         s2 = w["storeFirst"]
         self.assertEqual(s2["fetches"], [["/reveal", {"sid": "S14", "wid": "W-test", "via": "store"}]])
         self.assertEqual(s2["posted"], [{"romp": "revealCard", "itemId": "S14:g1", "sid": "S14"}])
@@ -1440,7 +1812,7 @@ class LandingRevealResumesFromStore(unittest.TestCase):
         # a record with no session is not a tap: nothing lands, the entry is cleared, the row says nothing was found
         z = w["sidless"]
         self.assertEqual((z["fetches"], self._acks(z), z["keys"]), ([], [], []))
-        self.assertEqual(self._rows(z), [{"found": False, "via": "visible", "store": True}])
+        self.assertEqual(self._rows(z), [_fp({"found": False, "via": "visible", "store": True})])
 
     def test_a_relaunch_on_the_start_url_lands_the_stored_tap_as_a_boot(self):
         # iOS reopens the installed app on its start URL, not the link: the page boots with the tap in the store.
@@ -1481,8 +1853,8 @@ class LandingRevealResumesFromStore(unittest.TestCase):
 
     def test_a_window_without_a_cache_api_says_so_and_never_throws(self):
         n = self.no_store
-        self.assertEqual(self._rows(n["boot"]), [{"found": False, "via": "boot", "store": False}])
-        self.assertEqual(self._rows(n["visible"]), [{"found": False, "via": "visible", "store": False}])
+        self.assertEqual(self._rows(n["boot"]), [_fp({"found": False, "via": "boot", "store": False})])
+        self.assertEqual(self._rows(n["visible"]), [_fp({"found": False, "via": "visible", "store": False})])
         self.assertEqual(n["visible"]["fetches"], [])
         self.assertEqual(n["visible"]["ctrl"], [{"romp": "tapReplay"}], "the worker is still asked")
 
