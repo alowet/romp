@@ -285,7 +285,9 @@ class CodexBackend:
         self._client_retry_at = 0.0
         self._client_failures = 0
         self._client_generation = 0   # successful app-server client installations
-        self._catalog = None          # model_catalog() cache — fetched once per process
+        self._catalog = None          # model_catalog() cache: a NON-EMPTY list, fetched once per process
+        self._catalog_err = None      # why the last model_catalog() answered [] (str), or None
+        self._catalog_lock = threading.Lock()   # one model_catalog() read at a time (see its docstring)
         self._client_lock = threading.Lock()
         self._sessions = {}           # sid → _Session
         self._sessions_lock = threading.RLock()
@@ -880,24 +882,59 @@ class CodexBackend:
 
     def model_catalog(self):
         """[{value,label}] for the UI's model picker — the app-server's own model list (the ONE
-        authoritative source), fetched once per process and cached. [] when the client is
-        unavailable (the picker then shows nothing rather than another vendor's list). A plan
-        account may still refuse some listed models per turn — that failure surfaces loudly as
-        the turn's error card, and switching back is one click."""
-        if self._catalog is not None:
-            return self._catalog
-        c = self._get_client()
-        if c is None:
-            return []
-        try:
-            ms = c.model_list()
-            self._catalog = [{"value": m.id, "label": getattr(m, "display_name", None) or m.id}
-                             for m in (getattr(ms, "data", None) or [])
-                             if not getattr(m, "hidden", False)]
-        except Exception as e:
-            self.log("model_list failed: %s" % e)
-            return []
-        return self._catalog
+        authoritative source), fetched once per process and cached. [] when the list cannot be had,
+        and then model_catalog_error() says WHY (the picker shows nothing rather than another vendor's
+        list, and the kernel's /models hands the reason on). Three ways to [], each recorded: the
+        client is unavailable (_get_client() None: the factory failed, or the client sits in its retry
+        backoff), model_list raised, or the app-server answered an EMPTY page. Only a NON-EMPTY list is
+        cached: an empty page `is not None`, and caching it would hold the empty catalog for the life of
+        the process, a blank menu on every later picker open after the app-server has models to list.
+        Each failure is logged once per DISTINCT reason, not once per call: the kernel
+        re-reads the catalog on every picker open and every models frame, and a per-call line repeats
+        for as long as the fault lasts. The read runs under _catalog_lock: /models is served from handler
+        threads, and two readers racing the same first read would otherwise both log the same reason, or
+        one that found no client would record its reason after the other had stored the list and cleared
+        it, a stale reason beside a held catalog. A plan account may still refuse some listed models per
+        turn — that failure surfaces loudly as the turn's error card, and switching back is one click."""
+        with self._catalog_lock:
+            if self._catalog:
+                return self._catalog
+            c = self._get_client()
+            if c is None:
+                self._note_catalog_error("the Codex app-server client is unavailable: %s"
+                                         % (self._client_err or "not started yet"))
+                return []
+            try:
+                ms = c.model_list()
+                rows = [{"value": m.id, "label": getattr(m, "display_name", None) or m.id}
+                        for m in (getattr(ms, "data", None) or [])
+                        if not getattr(m, "hidden", False)]
+            except Exception as e:
+                self._note_catalog_error("model_list failed: %s" % (str(e) or e.__class__.__name__))
+                return []
+            if not rows:
+                self._note_catalog_error("the Codex app-server listed no models")
+                return []
+            self._catalog = rows
+            self._catalog_err = None
+            return rows
+
+    def _note_catalog_error(self, why):
+        """Record why model_catalog() answered [] and log it once per distinct reason (see model_catalog).
+        Caller owns _catalog_lock."""
+        if why != self._catalog_err:
+            self.log(why)
+        self._catalog_err = why
+
+    def model_catalog_error(self):
+        """Why the last model_catalog() answered [] (one sentence for a picker to show), or None when
+        a catalog is held or none has been asked for yet. The kernel's /models reads it after an empty
+        answer; the failure is the app-server's or the client's, so the sentence names that side.
+        Read under _catalog_lock like every writer of the reason, so a concurrent read that is mid-way
+        through storing a list or recording its own reason cannot hand this caller a half-updated value
+        (review find, 2026-09-09)."""
+        with self._catalog_lock:
+            return self._catalog_err
 
     def set_mode(self, sid, mode):
         s = self._session(sid)
