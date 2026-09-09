@@ -4452,7 +4452,9 @@ class ViewBuilder(unittest.TestCase):
         km._tmux_name_of = lambda s: "testsess"
         km.subprocess.run = lambda cmd, *a, **k: (calls.append(cmd), _R())[1]
         try:
-            out = km._rename_session(SID, "newname")
+            with mock.patch.dict(os.environ):
+                os.environ.pop("ROMP_TMUX_SOCKET", None)   # the bare argv this pins is the no-socket one:
+                out = km._rename_session(SID, "newname")   # a per-kernel socket prepends -L (test_tmux_optional)
             self.assertEqual(out, "newname")
             self.assertTrue(any(c[:2] == ["tmux", "rename-session"] and "newname" in c for c in calls),
                             "live rename must call `tmux rename-session ... newname`")
@@ -6590,7 +6592,9 @@ class ViewBuilder(unittest.TestCase):
         self.assertEqual(bar["prompt"], "fix the feed flicker")
         self.assertEqual(bar["summary"], "Fixed the feed flicker", "caption binds to the segment id")
         self.assertEqual(bar["src"], "typed")
-        self.assertEqual(bar["workUuid"], "a1", "first assistant atom = work anchor")
+        self.assertEqual(bar["workId"], "a1", "first assistant atom = work anchor")
+        for gone in ("tid", "uuid", "workUuid"):
+            self.assertNotIn(gone, bar, "T278b: %s left the wire (the lane key, promptId and workId carry it)" % gone)
         self.assertEqual(bar["replyUuid"], "a2", "last assistant-with-text = reply anchor")
         self.assertFalse(bar["open"], "the turn ended -> bar not open")
 

@@ -12,6 +12,8 @@ Only applies inside a romp session (a tmux session tagged `@romp`, or an SDK-bac
 
 Message sibling sessions with the postal MCP tools (each tool's own description carries the specifics): `send_message(to, body, kind)`, `check_inbox()`, `list_agents()`, `set_working(text)`, `check_sent()`, `recall_message(to, id?)`. Inbox is also delivered automatically at each turn's end, so you rarely call `check_inbox` yourself.
 
+Not the same tools: romp peers are discovered only through the postal service's `list_agents`. Claude Code also ships its own `ListAgents` and `SendMessage` tools, which list the account's Anthropic cloud sessions and this session's own subagents: a different system, and a cloud session in that list is easy to mistake for a romp peer (the user 2026-09-08, who found one there that read like a session of theirs). The recommended setting is `"permissions": { "deny": ["ListAgents"] }` in the Claude Code settings, so the only list of agents a session sees is romp's; `SendMessage` must stay allowed, because continuing a subagent uses it.
+
 Addressing is live-only: you can message only currently-live sessions (see `list_agents`). Dead names error, with no parked mail or reviving. A session's stable id (the uuid `list_agents` shows) also works as the recipient — rename-proof, unique by construction, so it never hits the shared-name ambiguity refusal.
 
 Role-named recipients go stale: a role handed to a new session keeps the OLD name in your memory of it, and the retired name just bounces. Before sending to a role-style name (a router, a watcher, a manager), confirm it against `list_agents` and address whoever holds the role now.

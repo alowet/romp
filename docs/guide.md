@@ -171,6 +171,8 @@ session by name, check the inbox, and see who is live. Each session also
 publishes a working note saying what it currently holds, so agents can see who
 to talk to instead of messaging each other to find out.
 
+Not the same tools: romp peers are discovered only through the postal service's `list_agents`. Claude Code also ships its own `ListAgents` and `SendMessage` tools, which list the account's Anthropic cloud sessions and this session's own subagents: a different system, and a cloud session in that list is easy to mistake for a romp peer (the user 2026-09-08, who found one there that read like a session of theirs). The recommended setting is `"permissions": { "deny": ["ListAgents"] }` in the Claude Code settings, so the only list of agents a session sees is romp's; `SendMessage` must stay allowed, because continuing a subagent uses it.
+
 The timeline draws an arc for each message. Hover one for its gist:
 
 <video src="../assets/guide/coordination.mp4" controls loop muted playsinline preload="none" data-romp-autoplay width="100%"></video>
@@ -535,6 +537,11 @@ switches indented under it, and a button:
   tab, tap the notification, and check that it brings you back. With the main
   switch off, the answer adds that real notifications will not arrive until it
   is on.
+
+The handler that answers a tap lives on the phone, and the phone refreshes it
+whenever you open the app and whenever a notification arrives. If a tap ever
+opens Romp on the wrong session, close the app from the app switcher and open
+it again once.
 
 The bell itself shows the state of the device you are looking at: lit when the
 main switch is on and this device is set up, and crossed out otherwise. Its

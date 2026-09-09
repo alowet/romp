@@ -7,8 +7,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   emptyViewState, parseViewState, serializeViewState, pruneViewState, capViewState,
-  keyIsLive, viewStateSize, VIEW_STATE_KEY, VIEW_STATE_CAP, type FeedViewState,
-} from "./feed-view-state";
+  keyIsLive, viewStateSize, VIEW_STATE_KEY, VIEW_STATE_CAP, type FeedViewState, threadKey, threadKeys, FEED_COLUMNS } from "./feed-view-state";
 
 const FEED = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "feed.ts"), "utf8");
 
@@ -191,4 +190,22 @@ test("stacked-column state persists, tolerates old blobs, and gates on the three
   const pruned = pruneViewState(sample(), new Set<string>([]));
   assert.deepEqual(pruned.cols, ["completed"], "layout state survives a full card prune");
   assert.deepEqual(pruned.order, ["asks", "completed", "needsInput"]);
+});
+
+// ── T263c (the user 2026-09-08): the fold key is (session, column) ─────────────────────────────────────────
+test("executed: threadKey names one session's run in one column; a stored bare sid reads as every column", () => {
+  const k = threadKey("sid-1", "needsInput");
+  assert.notEqual(k, "sid-1", "a (session, column) key is not the bare sid");
+  assert.ok(k.startsWith("sid-1"), "…but it carries the sid");
+  assert.notEqual(threadKey("sid-1", "asks"), threadKey("sid-1", "completed"), "one key per column");
+  assert.deepEqual(threadKeys(k), [k], "a keyed entry stands for itself");
+  // a fold saved before T263c covered the session everywhere: it keeps doing so until a column is opened
+  assert.deepEqual(threadKeys("sid-1"), FEED_COLUMNS.map((c) => threadKey("sid-1", c)));
+  assert.deepEqual(FEED_COLUMNS, ["asks", "needsInput", "completed"]);
+  // a remote sid spelled host:uuid is still one segment
+  assert.deepEqual(threadKeys("TESTHOST:sid-2"), FEED_COLUMNS.map((c) => threadKey("TESTHOST:sid-2", c)));
+  // the composite key round-trips through the persisted blob untouched
+  const st = { ...sample(), threads: [k, threadKey("sid-3", "asks")] };
+  assert.deepEqual(parseViewState(serializeViewState(st)).threads, [k, threadKey("sid-3", "asks")]);
+  assert.deepEqual(pruneViewState(st, new Set()).threads, [k, threadKey("sid-3", "asks")], "prune-exempt like before");
 });

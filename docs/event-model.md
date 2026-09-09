@@ -140,11 +140,16 @@ interface Trigger {
 interface Atom {
   // Parity with the streaming API:
   type: "assistant" | "user" | "system" | "result" | "idle";   // "idle" is ours
-  subtype?: "compact_boundary" | "status" | "task_notification"; // when type==="system"
+  subtype?: "compact_boundary" | "status" | "task_notification"
+          | "model_refusal_fallback";                          // when type==="system"
   uuid: string;             // message id (same value in stream and transcript)
   session_id: string;       // = rompUuid
   message?: ApiMessage;     // assistant/user: the Anthropic message object (below)
   compact_metadata?: { trigger: "auto" | "manual"; pre_tokens: number }; // system:compact_boundary
+  content?: string; fallback_from?: string; fallback_to?: string;   // system:model_refusal_fallback — the CLI's
+  refusal_category?: string; refusal_explanation?: string;          //   line, the swap, the refusal's category and
+  scope?: "session" | "local";                                      //   the API's explanation ("" when the record
+                                                                    //   carried none), the scope (absent = session)
   result?: {                // type==="result"
     subtype: "success" | "error_during_execution" | "error_max_turns" | string;
     num_turns: number; stop_reason: string | null;
@@ -286,7 +291,7 @@ from rather than re-scanning the text and landing on a different one.
 
 | value | author | shown as |
 |---|---|---|
-| `"task-notification"` | `system` (`sdk` when `subkind` is `scheduled-trigger`: a fired prompt opens a turn) | the background agent's / command's notice card, named from the notification's own `<summary>` |
+| `"task-notification"` | `system` (`sdk` when `subkind` is `scheduled-trigger`: a fired prompt opens a turn; `teammate` when `subkind` is `peer-send-message`: a message from another of the user's sessions on the task channel, never a finished task) | the background agent's / command's notice card, named from the notification's own `<summary>`; a scheduled firing is the "Scheduled task" system notice, which an UNSTAMPED firing keeps too by its lifted preamble; a `peer-send-message` is the peer notice ("From another session": that subkind carries no sender fields) |
 | `"peer"` | `teammate` | the teammate card, "from" the sender's `name` / `from`; a `senderTaskId` marks one of this session's background agents |
 | `"coordinator"`, `"channel"`, `"auto-continuation"`, `"observer"`, `"unclassified"`, anything newer | `sdk` | a system/peer notice card with the kind as its label |
 | `"human"` / *(absent)* | by `promptSource` and text, as before | the user's bubble |
@@ -307,7 +312,27 @@ not a session); the recipient's stable id rides the additive `to_sid` key (rows 
 isn't in the log (legacy/rare).
 Two rules the wait readers apply to these rows: only a `question` or a `delegate` opens
 a wait, so the answered clock walks reply-requiring sends and a coordinate-only exchange
-neither opens nor reopens one (a reply of any kind still answers). A row without
+neither opens nor reopens one (a reply of any kind still answers). Two rows are
+terminal for the sent row whose id they name: `bounced` (the send came back: the peer
+refused it, the recipient exited, it never left) and a maildir `recall` (the sender
+withdrew it before anyone read it: that arm unlinks the message unread from the
+recipient's new/). An outbox recall — its row names a relay mid, `px-…` — is NOT read
+as terminal: the outbox item outlives the carry until the end-to-end ack, so the far
+recipient may already hold the message; a recalled cross-host send stays an open ask
+(a bus follow-up: refuse to recall a carried item, or stamp the row with its box).
+Either terminal row closes that ask for every reader that opens a wait from a sent
+row — the chip, the stamp clock, the closer's admit gate, the debt reminder's outcome,
+the courier's plant: the row is neither an ask nor an answer, so the sender is not
+waiting on a peer that never got it, a reply that came back or was withdrawn unread
+answers nothing (the edge stands, the replier still owes, no tracker reads "reported
+back" on a report the asker never received), and a stamp filed before the return is
+superseded by it as by a reply. Cross-host that bites on the replier's own host for a
+refused relay, and on the asker's host when its own orphan sweep destroys the
+delivered copy unread — the two hosts then disagree, honestly, and the remote replier
+is not told (the sweep's note reaches local senders only). A handoff tracker planted
+before the return arrived is not closed this way. The row is the event, keyed to the
+message it names, so a newer live ask keeps waiting whatever came back for an older
+one. A row without
 `to_sid` keys by whoever wore the name AT the row's send time, so a pre-2026-09-08 ask
 to a recreated same-named peer whose first sighting here is its own reply stays keyed
 to the prior wearer and reads open until the 6h wake: a known residual, legacy rows

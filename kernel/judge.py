@@ -58,8 +58,8 @@ ThreadPoolExecutor = _TimedPool      # every pool below is a timed one (see abov
 
 HERE = Path(__file__).resolve().parent
 em = SourceFileLoader("romp_event_model", str(HERE / "event_model.py")).load_module()
-_keysrc = sys.modules.get("romp_keysource") or SourceFileLoader(
-    "romp_keysource", str(HERE / "keysource.py")).load_module()
+_cred = sys.modules.get("romp_credentials") or SourceFileLoader(
+    "romp_credentials", str(HERE / "credentials.py")).load_module()
 
 HOME     = Path.home()
 STATE    = Path(os.environ.get("ROMP_STATE_DIR")   # per-kernel state root override (plans/multi-kernel.md)
@@ -206,8 +206,8 @@ def _state_str(name, default=""):
     if not c or c["mt"] != mt:
         try:
             v = f.read_text().strip()
-        except OSError:
-            v = ""
+        except (OSError, ValueError):   # ValueError: an undecodable file (UnicodeDecodeError) reads as the
+            v = ""                      # default too, like a missing one — a hand edit must never fail a pass
         _state_cache[name] = c = {"val": v or default, "mt": mt}
     return c["val"]
 
@@ -550,7 +550,50 @@ CLOSE_RIDER_CAP = 6                      # RIDERS per closer call — the steps-
                                          # reply stamps them, so what is cut rides a later landed call. STATUS
                                          # riders are never cut — one-shot per status turn, they would be lost,
                                          # not deferred — and take their room off the cap first (why: _close_turn).
-CONCURRENCY = 6                          # concurrent claude -p calls
+CONCURRENCY_DEFAULT = 6                  # concurrent claude -p calls, unless configured (below)
+CONCURRENCY_MIN, CONCURRENCY_MAX = 1, 16   # the knob's range; the kernel's select offers exactly this
+
+
+def _concurrency_from_env(raw, default=CONCURRENCY_DEFAULT):
+    """ROMP_JUDGE_CONCURRENCY as read ONCE at module load (T277): an integer, clamped to
+    CONCURRENCY_MIN..CONCURRENCY_MAX (a value at either bound is applied at the bound, silently — it is a
+    value); unset or blank → `default`; anything that is not an integer is IGNORED with one stderr line,
+    never a crash — a typo in a service.env must not take the judges down with it."""
+    if raw is None or not raw.strip():
+        return default
+    try:
+        n = int(raw.strip())
+    except ValueError:
+        sys.stderr.write("romp-judge: ROMP_JUDGE_CONCURRENCY=%r is not an integer; using %d\n" % (raw, default))
+        return default
+    return max(CONCURRENCY_MIN, min(CONCURRENCY_MAX, n))
+
+
+CONCURRENCY = _concurrency_from_env(os.environ.get("ROMP_JUDGE_CONCURRENCY"))   # the variable's value, else 6
+
+
+def _judge_concurrency():
+    """The EFFECTIVE judge concurrency at this moment: the kernel setting `judge-concurrency` (the gear's
+    "Judge concurrency" select, validated to 1..16 by the kernel before it is written, read fresh each call
+    through the same mtime-cached STATE reader as the tier picks — so a change lands on the judges' NEXT
+    pass, no restart), else CONCURRENCY (the variable at module load, else 6). The setting wins over the
+    variable. An unparseable file (a hand edit) falls back rather than crashing a pass; the clamp here is
+    belt-and-braces — the kernel refuses anything outside the range."""
+    v = _state_str("judge-concurrency", "")
+    if v:
+        try:
+            return max(CONCURRENCY_MIN, min(CONCURRENCY_MAX, int(v)))
+        except ValueError:
+            pass
+    return CONCURRENCY
+
+
+def _conc(concurrency):
+    """A run_* function's `concurrency` argument, resolved: an explicit value stands (tests, the A/B tools);
+    None — every entry point's default — reads the setting at CALL time. A def-time default (the old
+    `=CONCURRENCY` in every signature) would have frozen the setting out of the long-lived kernel, which imports
+    this module once."""
+    return concurrency if concurrency is not None else _judge_concurrency()
 # The CLOSER: the turn-end completion backstop (judge.md HYBRID; named the "closer" 2026-06-16 — it
 # closes out goals whose outcome is delivered). SHIPPED as the default 2026-06-15 after the fleet A/B
 # (25→30 completed top-goals, zero false-positives — `romp-judge --ab-close` re-measures). Kept
@@ -772,7 +815,7 @@ UNTRUSTED_SYS = (
     "prompt and from text outside the marked sections.")
 
 
-def _judge_cmd(model, sys_prompt, effort=None):
+def _judge_cmd(model, sys_prompt, effort=None, auth=None):
     """The `claude -p` argv for ONE judge call, isolated so the model sees ONLY its own prompt. Three
     flags do it (verified by token count: a probe call drops 8334 -> ~165 input tokens):
       --system-prompt (REPLACE, not --append) — drops Claude Code's static base prompt (~6k tokens);
@@ -787,6 +830,12 @@ def _judge_cmd(model, sys_prompt, effort=None):
            "--output-format", "json"]                 # stdout = {"result", "usage", "duration_ms", "total_cost_usd"}
     if effort:
         cmd += ["--effort", effort]
+    if auth == "login":
+        # A login-billed call must not bill the key (2026-09-08): in the CLI's precedence apiKeyHelper outranks
+        # every login form, so the per-call settings layer disables the helper. The empty string is the value
+        # the CLI takes as unset (null falls through to the settings files; verified on 2.1.257), the same
+        # lever a login-picked session's launch uses (sdk_backend.flag_settings_path).
+        cmd += ["--settings", '{"apiKeyHelper": ""}']
     return cmd
 
 
@@ -1073,61 +1122,36 @@ def _log_judge_usage(judge, tier, model, fsid, wrap, sent=None, recv=None):
         pass
 
 
-_WORK_KEY_FN = None   # the kernel wires this to sdk_backend.work_api_key when it loads that module
-                      # (_sdk_locked), so judges read the SAME once-per-process stash sessions bill from
-_WORK_KEY_CONFIGURED_FN = None  # metadata only; never retrieve a secret to decide billing
-_LOGIN_AUTH_ENV_FN = None      # login tokens claimed out of the manager's ambient environment
+_LOGIN_AUTH_ENV_FN = None      # login tokens claimed out of the manager's ambient environment: the kernel
+                               # wires sdk_backend.startup_auth_env; standalone reads the environment
 
 
-def _work_key():
-    """The manager-environment API key available for key-mode judge billing — READ, never claimed.
-    In the kernel process the SDK backend is the one claimer (work_api_key pops os.environ so its
-    transport can't hand session CLIs an ambient key), and the kernel wires _WORK_KEY_FN to that
-    stash; until that wire lands — or standalone (romp-judge --once/--test, tests) — the key is
-    still sitting in os.environ and the plain read returns the same value. Neither path mutates the
-    environment: _judge_env strips the ambient var from every child env itself, and a second claimer
-    would only race the backend's pop (whoever popped second would stash "" — sessions or judges
-    losing the key on thread timing). This is what broke on 2026-08-12: judges inherited the
-    post-claim environment on a host with no login, and every call refused "Not logged in" for
-    13 hours (~53k errors) while the cards sat parked in Working."""
-    if _WORK_KEY_FN is not None:
-        return _WORK_KEY_FN() or ""
-    return _keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "").resolve()
-
-
-def _work_key_configured():
-    if _WORK_KEY_CONFIGURED_FN is not None:
-        return bool(_WORK_KEY_CONFIGURED_FN())
-    # Compatibility for standalone callers wiring only the original callback.
-    if _WORK_KEY_FN is not None:
-        return bool(_work_key())
-    return _keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "").configured
-
-
-def _key_source_unconfigured():
-    """True only when the selected key source is KNOWN to be unconfigured without retrieving anything: the
-    kernel's configured wire when it is up; a standalone caller wiring the key callback alone leaves the
-    verdict to the retrieval (as before); no wire at all reads the source descriptor. Never _work_key():
-    a resolve here would run outside the per-pass gate."""
-    if _WORK_KEY_CONFIGURED_FN is not None:
-        return not _WORK_KEY_CONFIGURED_FN()
-    if _WORK_KEY_FN is not None:
+def _key_available():
+    """Whether an unpicked judge call bills the key: an apiKeyHelper is configured in Claude Code's settings
+    in the operator's settings, managed or user (credentials.key_available: read, never run). romp holds no key of
+    its own since 2026-09-08 (the user, after a contributor PR's test printed a key from a session's
+    environment); the child resolves the helper itself. An unreadable settings file reads as no helper here;
+    said once per process on stderr (the SDK backend says the same once in its problem ring)."""
+    try:
+        return _cred.key_available()
+    except _cred.CredentialError as e:
+        if not _SETTINGS_UNREADABLE_SAID:
+            _SETTINGS_UNREADABLE_SAID.add(True)
+            sys.stderr.write("romp-judge: %s; judge calls without an explicit pick bill the login until it reads\n" % e)
         return False
-    return not _keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "").configured
 
 
-_UNKEYED_SAID = set()   # the key-billed-calls-run-on-the-CLI's-own-credential line: said once per process
+_SETTINGS_UNREADABLE_SAID = set()   # the unreadable-settings line: once per process, never silent
 
 
 def _login_auth_env():
     if _LOGIN_AUTH_ENV_FN is not None:
         return _LOGIN_AUTH_ENV_FN()
-    return {k: os.environ[k] for k in ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
-            if os.environ.get(k)}
+    return {k: os.environ[k] for k in _cred.LOGIN_TOKEN_VARS if os.environ.get(k)}
 
 
 def _credential_error_note(exc):
-    return str(exc) if isinstance(exc, _keysrc.KeySourceError) else "API credential source failed"
+    return str(exc) if isinstance(exc, _cred.CredentialError) else "API credential source failed"
 
 
 def _judge_auth(fsid):
@@ -1136,8 +1160,8 @@ def _judge_auth(fsid):
     never a silent fall to the other one — a judge quietly billing the login on a session the user
     put on the key is the same wrong-account failure the per-session picker exists to prevent).
     Same resolution as the picker (sdk_backend default_auth / effective_auth), read from the same
-    registry file: an explicit 'login' pick → login; anything else → the key when the environment
-    carries one, else login. A call with no session (fleet-level rows) takes the same default a
+    registry file: an explicit 'login' pick → login; anything else → the key when Claude Code's
+    settings carry an apiKeyHelper, else login. A call with no session (rows with no session) takes the same default a
     fresh session would."""
     a = ""
     if fsid:
@@ -1147,7 +1171,7 @@ def _judge_auth(fsid):
             a = ""
     if a in ("login", "key"):
         return a
-    return "key" if _work_key_configured() else "login"
+    return "key" if _key_available() else "login"
 
 
 def _is_auth_error(text):
@@ -1366,16 +1390,18 @@ def _judge_env(tier, auth="login", model=None):
     serial), so this is the captioner's biggest single lever — and it's what makes any future batching
     latency-safe.
 
-    `auth` is the call's resolved billing (_judge_auth). The ambient ANTHROPIC_API_KEY is stripped
-    unconditionally — in the kernel process the SDK backend already claimed it out of os.environ, and
-    standalone the var is still there, where a login-mode child would otherwise bill the key by mere
-    inheritance — and injected back EXPLICITLY for a key-mode call only. Removal, not blanking, same
-    rule as sdk_backend._options: the CLI treats even an empty var as key-mode-without-a-key and
-    refuses with "Not logged in"."""
+    `auth` is the call's resolved billing (_judge_auth). The three credential names are stripped
+    unconditionally, and a KEY-billed call injects nothing back (2026-09-08: romp holds no key; the child
+    resolves Claude Code's apiKeyHelper itself, and the first pass after boot runs exactly like every later
+    one). A LOGIN-billed call gets the claimed login tokens back and, in _judge_cmd, the helper suppression.
+    Removal, not blanking: the CLI treats even an empty var as key-mode-without-a-key and refuses with
+    "Not logged in"."""
     env = dict(os.environ)
     for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
         env.pop(k, None)                             # billing is an explicit choice per call
-    _keysrc.strip_op_env(env)                        # op's own credential never rides a judge child (2026-09-05)
+    for k in list(env):                              # the 1Password CLI's own names never ride a judge child
+        if k in _cred.OP_ENV_NAMES or k.startswith(_cred.OP_ENV_PREFIX):
+            env.pop(k, None)
     if auth == "login":
         env.update(_login_auth_env())
     for k in ("TMUX", "TMUX_PANE"):
@@ -1399,74 +1425,7 @@ def _judge_env(tier, auth="login", model=None):
         # where the CLI drops it (Fable, Mythos, strangers) it is a harmless no-op and `--effort` in
         # _judge_run is the lever that lands. Both ride together; neither can hurt the other.
         env["MAX_THINKING_TOKENS"] = "0"
-    if auth == "key":
-        # No source configured at all (a supervised box whose env file carries no key line: the session's
-        # `key` pick outlived the line) is decided BEFORE any retrieval, so a retrieval FAILURE keeps its own
-        # gated path below. The child then runs on Claude Code's own credential — its apiKeyHelper or its
-        # login — the shape every judge had before #932's hard error, which logged err=auth on every pass
-        # and took a board down (the maintainer's direction, 2026-09-07: given no key, romp defers to
-        # Claude Code's default); said once per process. The login tokens ride along exactly as for a
-        # login call (the session half restores them the same way): before #932 the child simply
-        # inherited the manager's, and a box whose login lives in those tokens would otherwise hand the
-        # judge no credential at all and floor its cards with an auth-down mark.
-        if _key_source_unconfigured():
-            env.update(_login_auth_env())
-            if not _UNKEYED_SAID:
-                _UNKEYED_SAID.add(True)
-                sys.stderr.write("romp-judge: key-billed judge calls run on Claude Code's own credential — "
-                                 "romp holds no key source\n")
-            return env
-        wk = _resolve_work_key_gated()               # resolve only at the call boundary — once per pass on failure
-        if not wk:
-            raise _keysrc.KeySourceError("No API key source is configured for this judge call")
-        env["ANTHROPIC_API_KEY"] = wk
     return env
-
-
-# A failed retrieval is remembered for the rest of the PASS it happened in, keyed on the source's
-# identity: the next key-billed call in that pass fails at once with the same note instead of spawning
-# `op` and waiting out its 15 s timeout again (six judge threads, hundreds of calls a pass — review
-# find, 2026-09-05). The deciding events that retry are exact, not timed: the source changes (another
-# fingerprint), or a new pass begins (begin_pass_frame). Standalone callers with no pass frame retry
-# every call, as before.
-_KEY_GATE = {"fp": None, "gen": None, "note": ""}
-_PASS_GEN = [0]
-_KEY_GATE_CV = threading.Condition()                 # guards _KEY_GATE and the in-flight first retrieval of a pass
-_KEY_INFLIGHT = [None]                               # (fp, gen) being retrieved right now, or None
-
-
-def _resolve_work_key_gated():
-    try:
-        src = _keysrc.select_source(os.environ.get("ANTHROPIC_API_KEY", "") or "")
-        fp = src.fingerprint() if src.kind != "error" else "error"
-    except Exception:
-        fp = None
-    gen = _PASS_GEN[0]
-    key = (fp, gen) if (fp is not None and gen) else None
-    if key is None:
-        return _work_key()                           # no pass frame (standalone) or no source identity: as before
-    with _KEY_GATE_CV:
-        # The first wave: six judge threads reach a pass's first key call together, and every one of them
-        # would spawn `op` and wait out its own timeout. The first to arrive retrieves; the others wait for
-        # its verdict — then raise the remembered failure, or retrieve for themselves (no value is shared).
-        while _KEY_INFLIGHT[0] == key:
-            _KEY_GATE_CV.wait(timeout=_keysrc.KEY_CMD_TIMEOUT + 1)
-        if _KEY_GATE["fp"] == fp and _KEY_GATE["gen"] == gen:
-            raise _keysrc.KeySourceError(_KEY_GATE["note"] or "API credential retrieval failed earlier in this pass")
-        first = _KEY_INFLIGHT[0] is None
-        if first:
-            _KEY_INFLIGHT[0] = key
-    try:
-        return _work_key()
-    except _keysrc.KeySourceError as e:
-        with _KEY_GATE_CV:
-            _KEY_GATE.update(fp=fp, gen=gen, note=str(e))
-        raise
-    finally:
-        if first:
-            with _KEY_GATE_CV:
-                _KEY_INFLIGHT[0] = None
-                _KEY_GATE_CV.notify_all()
 
 
 _RATE_GATE_LOGGED = {}                   # bucket -> resets_at already announced (one line per window)
@@ -1715,7 +1674,7 @@ def _judge_run(model, sys_prompt, user, effort=None, judge=None, tier="triage", 
             _judge_ctx.paused = True
             return ""
         try:
-            p = subprocess.run(_judge_cmd(model, sys_prompt, effort), input=user,
+            p = subprocess.run(_judge_cmd(model, sys_prompt, effort, auth=auth), input=user,
                                capture_output=True, text=True, cwd=JUDGE_SCRATCH, env=env,
                                timeout=CALL_ALARM_S + 5)
         except Exception as e:
@@ -2431,7 +2390,6 @@ def begin_pass_frame():
         if _frame is not None:
             return False                             # a joiner shares the creator's pass — and its key gate
         _frame = {"parses": {}, "keys": {}}
-        _PASS_GEN[0] += 1                            # a CREATED pass is the event that lets a failed key retrieval retry
         return True
 
 
@@ -6993,7 +6951,7 @@ def _archive_call(fsid, caps):
     return archive_llm("\n".join("- " + c for c in caps))
 
 
-def run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=CONCURRENCY, verbose=False):
+def run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=None, verbose=False):
     """One INDEX-TIER pass over the fleet: caption ready units, then refresh per-session archives whose
     turn set grew. Returns {"captions": n, "archives": m}. Frame-wrapped like run_triage: under the
     kernel producer it joins the producer's pass frame; standalone it owns one."""
@@ -7004,7 +6962,7 @@ def run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=CONCURRENC
         end_pass_frame(own)
 
 
-def _run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=CONCURRENCY, verbose=False):
+def _run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=None, verbose=False):
     if now is None:
         now = int(time.time())
     fleet = discover(now)
@@ -7036,7 +6994,7 @@ def _run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=CONCURREN
     captions = 0
     struck = set()                                        # one strike per unit per PASS (grains share ids)
     gave = {}                                             # fsid → units tombstoned this pass (one log row each)
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_caption_call, t): t for t in selected}
         for fut in as_completed(futs):
             task = futs[fut]
@@ -7087,7 +7045,7 @@ def _run_index(now=None, budget=BUDGET, fairness=FAIRNESS, concurrency=CONCURREN
     if verbose:
         sys.stderr.write("romp-judge: %d sessions need (re)archiving\n" % len(arch_tasks))
     archives = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_archive_call, fsid, caps): (fsid, len(caps))
                 for fsid, caps in arch_tasks}
         for fut in as_completed(futs):
@@ -9357,7 +9315,7 @@ def _hidden_from_feed(fsid):
         return False
 
 
-def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One TRIAGE-TIER planner pass: advance each session's goal tree. Per-session sequential
     (the tree accretes); sessions concurrent. Returns total placements made. (Global cross-session
     time-order is the courier's need; the planner's tree is per-session.)"""
@@ -9365,7 +9323,7 @@ def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verb
         now = int(time.time())
     fleet = [s for s in discover(now) if not _hidden_from_feed(s[0])][:sessions_cap]   # muted sessions are out of task tracking
     placed = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_plan_session, fsid, str(path), now): fsid for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
             try:
@@ -10000,7 +9958,7 @@ def _group_session(fsid, path, now):
     return relinks
 
 
-def run_group(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_group(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One GROUPER pass (triage tier), run after run_plan: nest each session's related open top goals into
     coherent trees. Event-gated per session (see _group_session) so it only calls the model when a
     session's open-top set changed. Per-session sequential, sessions concurrent. Returns total relinks."""
@@ -10008,7 +9966,7 @@ def run_group(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, ver
         now = int(time.time())
     fleet = discover(now)[:sessions_cap]
     n = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_group_session, fsid, str(path), now): fsid
                 for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
@@ -10094,7 +10052,7 @@ def _consolidate_session(fsid, path, now):
     return 1 if changed else 0
 
 
-def run_consolidate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_consolidate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One CONSOLIDATOR pass (triage tier), run after run_group / before run_distill so a card the
     housekeeping touched re-distills this same cycle. Event-gated per session. Returns the number
     of sessions whose completed column changed."""
@@ -10102,7 +10060,7 @@ def run_consolidate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENC
         now = int(time.time())
     fleet = discover(now)[:sessions_cap]
     n = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_consolidate_session, fsid, str(path), now): fsid
                 for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
@@ -10295,6 +10253,49 @@ def _learn_alias(alias, o):
         alias.setdefault(str(o["from_host"]) + ":" + str(o["from"]), []).append((at, str(o["from_id"])))
 
 
+def _learn_return(returned, o):
+    """Record one TERMINAL row naming a sent message: returned[mid] is the latest t the message was over
+    with nobody ever receiving it — so a sent row whose id is here is neither an ask nor an answer:
+    nothing will ever answer it, and nobody ever read it. Two kinds, joined by the id alone. `bounced`:
+    the bus gave it back — a peer refused it, the recipient exited and its unread mail was destroyed, an
+    inbox file it could not read, a write a crash cut short, an oversize push (every bounced row the bus
+    writes is terminal; a parked message awaiting relay has no row, that state is outbox residency). A
+    MAILDIR `recall`: the sender withdrew it before anyone read it — that arm's unlink from the
+    recipient's new/ is the atomic claim against read_box's rename to cur/, so the row is written only
+    for mail nobody read, and it names the maildir name deliver() logged as the sent id; exactly as
+    terminal as a bounce (2026-09-08; before, a recall was not read, and the sender wore "Awaiting
+    <peer>" for a question it had withdrawn).
+
+    NOT an OUTBOX recall (review find, 2026-09-08). That arm unlinks any outbox file of the sender's and
+    writes the same row, but an outbox item OUTLIVES THE CARRY: the exchange relays outbox_list on both
+    sides without removing anything; a SUCCESSFUL carry leaves the file until _ack_arrived removes it
+    on the END-TO-END ack (a bounce removes it too, but writes a bounced row the readers honour) —
+    one round trip normally, the whole outage when a response was lost and _peer_loop re-relays under
+    its 30 s-capped backoff. A recall inside that window names a message the far recipient already
+    holds (_relay_in delivered and pushed it) and may answer; reading it as terminal would close a LIVE
+    ask. The two arms are told apart by the id the row names: the relay send mints
+    `mid = "px-" + _unique()` and the outbox recall logs that stem, while a maildir name is a bare
+    _unique() — `<epoch>.<pid>_<rand>.<host>` — and never carries the prefix. So a recall naming a relay
+    mid is read as nothing here, and a recalled cross-host send stays an open ask (and a recalled
+    cross-host delegate still plants its tracker), exactly as before. The bus owns the fix: refuse to
+    recall a carried item, or stamp the recall row with the box it came from — a writer change for
+    another PR.
+
+    The ONE shape all three scans share — the judge's ask maps, the kernel's wait maps (which also need
+    the time, for the return clock) and the courier's cross-host plant: both map builders skip a sent
+    row whose id is here before last_any, so it is not its sender's WORD toward the recipient either,
+    and a reply that came back or was withdrawn unread answers nothing."""
+    if o.get("ev") == "recall" and str(o.get("id") or "").startswith("px-"):
+        return                                   # the outbox arm (a relay mid): not terminal, see above
+    if o.get("ev") in ("bounced", "recall") and o.get("id"):
+        try:
+            at = int(o.get("t") or 0)
+        except (TypeError, ValueError):
+            at = 0
+        mid = str(o["id"])
+        returned[mid] = max(returned.get(mid, 0), at)
+
+
 def _alias_settle(alias):
     """Order each name's sightings by t and collapse CONSECUTIVE sightings of one sid into one entry, so
     the history is per WEARER CHANGE, not per row (a chatty peer name otherwise carries thousands of
@@ -10338,7 +10339,12 @@ def _postal_ask_maps():
     carries it (relay rows since 2026-09-08), else the name alias AT the row's send time (_alias_at),
     else the raw "peer:<host>:<name>". `alias` is the time-ordered name→sid history the re-key used;
     consumers resolve a name through _alias_at with the time of the message they hold, never by a
-    bare lookup."""
+    bare lookup. A sent row whose id a terminal row names (`bounced`: the send came back — refused,
+    recipient gone, never left; a maildir `recall`: the sender withdrew it unread — an outbox recall is
+    not terminal, see _learn_return) makes no entry at all — neither an ask nor an answer, so a returned
+    or withdrawn reply leaves the asker's question open — read exactly as the kernel's wait maps read it
+    (2026-09-08, _learn_return, the shape both scans share). The alias history still learns from it:
+    identity is not word."""
     try:
         st = MESSAGES.stat()
         key = (st.st_mtime_ns, st.st_size)
@@ -10346,8 +10352,7 @@ def _postal_ask_maps():
         return {}, {}, {}
     if _PEER_ASK_CACHE[0] == key:
         return _PEER_ASK_CACHE[1]
-    last_any, last_ask, rows, alias = {}, {}, [], {}
-    ended = set()   # ids a terminal `bounced` row closed: mail that never reached anyone
+    last_any, last_ask, rows, alias, returned = {}, {}, [], {}, {}   # returned: mid -> t of its terminal bounced row
     try:
         for line in MESSAGES.read_text(errors="replace").splitlines():
             try:
@@ -10358,16 +10363,16 @@ def _postal_ask_maps():
                 continue
             rows.append(o)
             _learn_alias(alias, o)
-            if o.get("ev") == "bounced" and o.get("id"):
-                ended.add(str(o["id"]))
+            _learn_return(returned, o)
         _alias_settle(alias)
         for o in rows:
             f, t_, ts = o.get("from_id"), o.get("to_id"), o.get("t")
             if not (f and t_ and ts):
                 continue
-            if str(o.get("id") or "") in ended:
-                continue   # refused or destroyed: never reached the recipient, so neither an ask nor an
-                #            answer (review find, 2026-09-08): the kernel's _postal_wait_maps rule, mirrored
+            if str(o.get("id") or "") in returned:
+                continue   # refused, destroyed or withdrawn unread: never reached the recipient, so neither an
+                #            ask nor an answer (review find, 2026-09-08): the kernel's _postal_wait_maps rule, mirrored
+                #            (the return's time rides in `returned` for the kernel's clock; membership is the rule here)
             ts = int(ts)
             if isinstance(t_, str) and t_.startswith("peer:"):
                 if o.get("to_sid"):
@@ -11469,6 +11474,9 @@ def _close_session(fsid, path, now, cap=CLOSE_FAIRNESS):
 
 
 DEATH_DRAIN_PER_PASS = CONCURRENCY   # a QUEUE-DRAIN bound on death-pending finalizes per closer pass —
+#   sized to the module-load concurrency (the variable, else 6), deliberately not the live setting: it
+#   spreads a one-time backfill, it is not a parallelism lever, and a bound that moved between passes
+#   would make the drain's progress unreadable. The pool that runs the finalizes follows the setting.
 #   NOT a fairness cap on live sessions (those were removed 2026-06-30 and stay removed): the pending
 #   set is a finite backlog that strictly shrinks (every drained marker gains endedAt, superseded ones
 #   retire), so the bound only spreads the one-time upgrade backfill over successive passes instead of
@@ -11594,7 +11602,7 @@ def _death_finalize(fsid, store, settled):
         append_episode_settle(fsid, "ended:%d" % mt, int(time.time()), open_tops)
 
 
-def run_close(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_close(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One CLOSER pass (the turn-end completion backstop), triage tier, run after run_plan.
     Per-session sequential (the tree accretes), sessions concurrent. Returns nodes completed.
     The fleet is the discover set PLUS a bounded drain of death-pending sids (markers without
@@ -11621,7 +11629,7 @@ def run_close(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, ver
                     m["noTranscript"] = True
                     _write_death_marker(sid, m)
     n = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_close_session, fsid, str(path), now): fsid
                 for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
@@ -11891,14 +11899,14 @@ def _unblock_session(fsid, path, now):
     return lifted
 
 
-def run_unblock(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_unblock(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One UNBLOCKER pass (stale sub-block re-examination), triage tier, run after run_close.
     Per-session sequential (one call covers all its due blocks), sessions concurrent."""
     if now is None:
         now = int(time.time())
     fleet = [s for s in discover(now) if not _hidden_from_feed(s[0])][:sessions_cap]
     n = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_unblock_session, fsid, str(path), now): fsid
                 for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
@@ -11946,7 +11954,7 @@ def _ab_close(sessions_cap=PLAN_SESSIONS):
     tot_a = tot_b = 0
     all_new, all_samples = [], []
     # Parallel ACROSS sessions (each session sweeps its own turns sequentially for clean attribution).
-    with ThreadPoolExecutor(max_workers=min(len(fleet) or 1, 2 * CONCURRENCY)) as ex:
+    with ThreadPoolExecutor(max_workers=min(len(fleet) or 1, 2 * _judge_concurrency())) as ex:
         futs = {ex.submit(_ab_close_session, fsid, str(path), now): (name or fsid[:8])
                 for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
@@ -11997,7 +12005,7 @@ def _latest_subtree_segment(nid, nodes, children, seg_by_id):
     return max(segs, key=lambda s: s["t"]) if segs else None
 
 
-def _ab_classify(sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY):
+def _ab_classify(sessions_cap=PLAN_SESSIONS, concurrency=None):
     """Measure-only: re-run the planner's BLOCKED/WORKING verdict on the current uncleared top-goals
     (working + blocked) under 3 arms — sonnet / sonnet+effort medium / opus+effort medium — and diff vs
     the live status, WITHOUT mutating goal state. The question: do the soft blocks hold under
@@ -12035,7 +12043,7 @@ def _ab_classify(sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY):
             ops = _parse_plan(plan_llm(job["text"], job["menu_text"], model=model, effort=effort), job["menu_len"])
             v[arm] = ("blocked" if any(o["do"] == "block" for o in ops) else "working") if ops else "?"
         return dict(job, v=v)
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         rows = list(ex.map(classify, jobs))
 
     armnames = [a[0] for a in CLASSIFY_ARMS]
@@ -12293,6 +12301,13 @@ def mint_fallback_card(sid, from_model, to_model, ev_t=None):
                     and prev.get("text") == text and not prev.get("cleared") \
                     and prev.get("id") not in vc:
                 return None
+            # T279: the same swap is already on the board WITH its cause — a safeguards refusal the CLI
+            # retried on the fallback (a CLI that streams that notice ahead of the reply); the capacity
+            # reading of the down-tier transition stands down rather than filing a second card.
+            if prev.get("why") == REFUSAL_FALLBACK_WHY and not prev.get("cleared") \
+                    and prev.get("id") not in vc \
+                    and prev.get("swap") == {"from": from_model or "?", "to": to_model or "?"}:
+                return None
         n = store.get("seq", 0) + 1
         store["seq"] = n
         gid = "%s:g%d" % (sid, n)
@@ -12301,7 +12316,7 @@ def mint_fallback_card(sid, from_model, to_model, ev_t=None):
                "capacity fallback, not a pick. Work continued on the fallback; switch back from the "
                "statusline if that isn't what you want."
                % (from_model or "the pinned model", to_model))
-        nd = GuardedNode({"id": gid, "text": text,
+        nd = GuardedNode({"id": gid, "text": text, "swap": {"from": from_model or "?", "to": to_model or "?"},
                           "parentId": None, "nodeComplete": False, "blocked": False, "cleared": False,
                           "trail": [], "promptUuid": "", "quote": "", "t": t, "mt": t,
                           "why": "kernel-observed API model fallback", "log": []})
@@ -12314,6 +12329,151 @@ def mint_fallback_card(sid, from_model, to_model, ev_t=None):
         sys.stderr.write("fallback-card mint (%s): %r\n" % (sid[:8], e))
         return None
 
+
+REFUSAL_FALLBACK_WHY = "kernel-observed safeguards refusal fallback"     # the refusal card's why key (T279)
+CAPACITY_FALLBACK_WHY = "kernel-observed API model fallback"            # mint_fallback_card's, as it spells it
+
+
+def _refusal_fallback_texts(from_model, to_model, category, explanation, scope):
+    """The refusal card's title and done-why. The title carries the swap and the category (the head the
+    chat notice shows); the why carries the cause, the API's explanation when it sent one (the notice's
+    fold), and what to do about it. 'local' scope: only that reply came from the fallback model."""
+    to = to_model or "a fallback model"
+    cat = (category or "").strip()
+    expl = (explanation or "").strip()
+    local = (scope or "session") == "local"
+    cat_part = (" (%s)" % cat) if cat else ""
+    if local:
+        text = "A reply came from %s after a safeguards refusal%s" % (to, cat_part)
+    else:                                    # the swap LAST: mint_fallback_card's stand-down matches on it
+        text = "Model changed after a safeguards refusal%s: %s → %s" % (cat_part, from_model or "?", to)
+    why = ("The model's safeguards flagged a message%s and the request was retried on %s: a refusal "
+           "fallback, not a pick." % ((" (category: %s)" % cat) if cat else "", to))
+    if expl:
+        why += " The API's explanation: %s%s" % (expl, "" if expl.endswith((".", "!", "?")) else ".")
+    if local:
+        why += (" Only that reply (a subagent's or a side question's) came from %s; the session's model "
+                "is unchanged." % to)
+    else:
+        why += " Work continued on %s; switch back from the statusline if that isn't what you want." % to
+    return text, why
+
+
+def _swap_of(nd):
+    """(from, to) of a fallback card: the `swap` field, or, for a capacity card minted before the field
+    existed, the two names its title spells ("Model changed automatically: A → B")."""
+    sw = nd.get("swap")
+    if isinstance(sw, dict) and sw.get("from") and sw.get("to"):
+        return str(sw["from"]), str(sw["to"])
+    text = str(nd.get("text") or "")
+    if ": " in text and " → " in text:
+        a, _, b = text.split(": ", 1)[1].partition(" → ")
+        if a and b:
+            return a.strip(), b.strip()
+    return None
+
+
+def _chain_cards(cards, origin, target):
+    """The fallback cards that lie on a path origin → … → target through `cards` (each a (from, to)
+    pair keyed by id): a card is on the chain when its `from` is reachable from the origin and the
+    target is reachable from its `to`. A multi-hop refusal (the first fallback refused too) learned a
+    card per hop; a card off the path (another swap this turn) is never claimed."""
+    fwd = {origin}
+    changed = True
+    while changed:
+        changed = False
+        for a, b in cards.values():
+            if a in fwd and b not in fwd:
+                fwd.add(b); changed = True
+    bwd = {target}
+    changed = True
+    while changed:
+        changed = False
+        for a, b in cards.values():
+            if b in bwd and a not in bwd:
+                bwd.add(a); changed = True
+    return [cid for cid, (a, b) in cards.items() if a in fwd and b in bwd]
+
+
+def _claimable(store, nd, vc):
+    """A fallback card the bookkeeping may fold: uncleared, and untouched by the user (no follow-up in
+    flight, no user stamp) — the user's gesture outranks the bookkeeping."""
+    return not nd.get("cleared") and nd.get("id") not in vc \
+        and not _floor_of(store, nd) and not nd.get("followupPending")
+
+
+def mint_refusal_fallback_card(sid, from_model, to_model, category=None, explanation=None,
+                               scope="session", ev_t=None, capacity_gids=None, episode=None):
+    """A COMPLETED card recording a SAFEGUARDS refusal the CLI retried on a fallback model (T279): the
+    model's classifier declined the request (the API's stop_reason "refusal") and the CLI re-ran the
+    call on the configured fallback, so the reply that followed came from a different model, for a
+    reason the user should see: the refusal category, and the API's explanation when it sent one.
+    Same shape as mint_fallback_card (kernel-authored bookkeeping, minted done, never a question;
+    existence-keyed dedupe while an identical uncleared card is on the board), with its own why key,
+    the swap as data (`swap`, for both mints' dedupes), the episode key (`episode`: the refused prompt's
+    uuid) and prose that names the refusal, never "capacity".
+
+    ONE card per swap. The fallback model's own reply streams BEFORE the CLI's end-of-turn refusal
+    notice, and its model learn has already filed the swap as a capacity fallback (a down-tier
+    transition nobody asked for is all _learn_model can see). The backend names the cards its own
+    learn minted THIS turn (`capacity_gids`; never an older card that reads the same), and those that
+    lie on the chain from the refused model to the answering one (_chain_cards: a multi-hop refusal
+    learned a card per hop) are FOLDED into the fresh refusal card with the store's merge
+    (_merge_nodes): the refusal node is new, so a concurrent writer's save adopts it wholesale, and
+    each folded card's deletion is a durable tombstone (mergedFrom) the rebase honors from either
+    side — no field of an existing node is rewritten, so no stale snapshot can half-revert it. The
+    same fold retires an earlier refusal card of the SAME episode (a CLI that files an intermediate
+    hop unmarked): the final frame's card is the record. The user's gesture outranks the bookkeeping:
+    a card the user cleared, followed up on, or otherwise stamped (_claimable) is left exactly as they
+    left it and the refusal files fresh beside it. `scope` per the CLI's schema: 'session' (the
+    session's model is swapped) or 'local' (a subagent's or a side question's reply only; the
+    session's model is unchanged; absent on older CLIs = session); a 'local' refusal claims no
+    capacity card. The rollup runs with session_closed=False: the card completes on its own (it is
+    never the session's focus), and a swap's information must not force the settle of the focus
+    card."""
+    try:
+        store = load_goals(sid)
+        nodes = store.setdefault("nodes", {})
+        text, why = _refusal_fallback_texts(from_model, to_model, category, explanation, scope)
+        swap = {"from": from_model or "?", "to": to_model or "?"}
+        local = (scope or "session") == "local"
+        vc = _view_cleared()
+        for prev in nodes.values():
+            if prev.get("why") == REFUSAL_FALLBACK_WHY and prev.get("text") == text \
+                    and not prev.get("cleared") and prev.get("id") not in vc:
+                return None                          # the board already says exactly this
+        t = int(ev_t or time.time())
+        n = store.get("seq", 0) + 1
+        store["seq"] = n
+        gid = "%s:g%d" % (sid, n)
+        nd = GuardedNode({"id": gid, "text": text, "swap": swap, "episode": episode or "",
+                          "parentId": None, "nodeComplete": False, "blocked": False, "cleared": False,
+                          "trail": [], "promptUuid": "", "quote": "", "t": t, "mt": t,
+                          "why": REFUSAL_FALLBACK_WHY, "log": []})
+        nodes[gid] = nd
+        record_verdict(store, nd, "romp", "done", t, why=why)
+        fold = []
+        if not local:
+            cands = {}
+            for cid in (capacity_gids or []):
+                cap = nodes.get(cid)
+                sw = _swap_of(cap) if cap is not None else None
+                if sw and cap.get("why") == CAPACITY_FALLBACK_WHY and _claimable(store, cap, vc):
+                    cands[cid] = sw
+            fold += _chain_cards(cands, swap["from"], swap["to"])
+        if episode:
+            fold += [pid for pid, prev in list(nodes.items())
+                     if pid != gid and prev.get("why") == REFUSAL_FALLBACK_WHY
+                     and prev.get("episode") == episode and _claimable(store, prev, vc)]
+        for did in fold:
+            _merge_nodes(store, did, gid, t, "the same swap, filed with its cause: a safeguards refusal "
+                                             "the CLI retried on the fallback model")
+        rollup_status(store, False)                # the fold materializes nodeComplete/doneWhy from the diary
+        save_goals(sid, store)
+        return gid
+    except Exception as e:
+        sys.stderr.write("refusal-fallback card mint (%s): %r\n" % (sid[:8], e))
+        return None
 
 NUDGE_REDUNDANT_SYS = (
     "You answer one question about a working session, from its own latest message. The user message "
@@ -13605,7 +13765,7 @@ def _drain_undiscovered(now, fleet_sids):
     return n
 
 
-def run_distill(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_distill(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One DISTILLER pass (triage tier), run after the closer/grouper: store a key-takeaway summary on each
     newly-(re)completed top goal's card. Event-gated per goal. Also drains stores the fleet walk
     can't reach (_drain_undiscovered) and logs a session pass that dies instead of swallowing it —
@@ -13615,7 +13775,7 @@ def run_distill(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
         now = int(time.time())
     fleet = discover(now)[:sessions_cap]
     n = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+    with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_distill_session, fsid, str(path), now): fsid for fsid, path, anchor, name in fleet}
         for fut in as_completed(futs):
             try:
@@ -13628,7 +13788,7 @@ def run_distill(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
     return n
 
 
-def run_triage(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_triage(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """The TRIAGE-tier sequence as ONE unit, so the kernel can run it in PARALLEL with the always-on INDEX
     tier (run_index) — they share no store and triage never reads the captioner's output, so the only cost
     of overlap is each tier parsing a transcript instead of sharing one parse. Order matters: the planner
@@ -14561,7 +14721,7 @@ def _presumed_closed(sid, now):
     return sid not in remote
 
 
-def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """DETERMINISTIC delegation completion link-back (the user 2026-06-22). When a courier-planted goal G
     (origin.peer + origin.goalId) is COMPLETE on the recipient B's tree, mark the SENDER's tracking node
     origin.goalId DONE too — so a '↪ delegated to B' item checks off the instant B finishes and reports. NO
@@ -14723,6 +14883,11 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
     # handoff's send time when the peer has spoken (it must have, to reply), else the raw relay
     # key. Anchored so a name a later session reused cannot make that stranger's mail the
     # report-back (2026-09-08).
+    # last_any carries no row that came back or was withdrawn unread (2026-09-08, _postal_ask_maps): a
+    # reply the asker never received is not a report-back, so neither arm below marks a tracker done
+    # on it. Cross-host it bites on the asker's host when its own orphan sweep destroys the delivered
+    # copy unread (a relayed reply is a local sent row here, and the sweep's bounce names its id); a
+    # relay the far host refused writes no sent row here at all.
     last_any, _la, alias = _postal_ask_maps()
     _rmemo = {}                                        # recipient sid -> merged nodes (per-pass, read-only)
 
@@ -14823,7 +14988,7 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY,
     return n
 
 
-def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, verbose=False):
+def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=False):
     """One TRIAGE-TIER courier pass: place peer-message (postal) segments as delegations, GLOBAL
     oldest-first across sessions. Idempotent (msgId + seg_id). COORDINATING segments are marked processed
     without a goal-edit; a declared coordinate/question files that way outright, no model call (demote-
@@ -14901,6 +15066,7 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
     # backfilled; idempotent by msgId, so one plant per message ever.
     placed = 0
     fleet_ids = {f for f, p, a, nm in fleet}
+    xback = {}   # mid -> t: delegates the bus gave BACK (terminal bounced rows, _learn_return) — these plant nothing
     try:
         xrows = []
         for line in MESSAGES.read_text(errors="replace").splitlines():
@@ -14908,6 +15074,7 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
                 o = json.loads(line)
             except Exception:
                 continue
+            _learn_return(xback, o)
             if (o.get("ev") == "sent" and o.get("kind") == "delegate" and o.get("id")
                     and o.get("from_id") in fleet_ids and o.get("toName")
                     and str(o.get("to_id") or "").startswith("peer:")
@@ -14915,6 +15082,14 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=CONCURRENCY, v
                 xrows.append(o)
     except OSError:
         xrows = []
+    # A delegate that came back never reached the peer (2026-09-08): a tracker planted from it would
+    # wait on a report-back no event can bring, since the remote arm's ending is the peer's own reply
+    # at/after the send. The bounced row is terminal, so the skip is final, not a retry. An OUTBOX
+    # recall of a cross-host delegate is NOT read as terminal (_learn_return: the item may already have
+    # been carried and delivered), so a recalled delegate still plants, as before. (A tracker
+    # planted BEFORE the return arrived is not closed here: ending it needs a verdict that says the
+    # handoff came back, not "reported back" — a writer, outside this reader's scope.)
+    xrows = [o for o in xrows if str(o["id"]) not in xback]
     for o in xrows:
         try:
             sstore = load_goals(o["from_id"])
@@ -15166,7 +15341,7 @@ def _test(path):
     tasks.sort(key=lambda t: max(w["t"] for w in t["writes"]), reverse=True)
     tasks = tasks[:TEST_UNITS]
     print("transcript %s — %d recent caption tasks (newest first)\n" % (fsid[:8], len(tasks)))
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
+    with ThreadPoolExecutor(max_workers=_judge_concurrency()) as ex:   # the live setting, like every pass pool
         caps = list(ex.map(lambda t: caption_llm(t["text"]), tasks))
     from datetime import datetime
     for t, cap in zip(tasks, caps):

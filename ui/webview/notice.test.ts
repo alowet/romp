@@ -73,6 +73,17 @@ test("nested notices (inside the carrying user turn) are bare cards on the turn'
   assert.doesNotMatch(CSS, /\.turn-notice\.notice-romp/, "no right-aligned 72% romp card — direction belongs to the bubbles");
 });
 
+test("the agent report nests by DEFAULT (the carrying human turn passes no opts) and stands on its own rail only when renderInjected asks", () => {
+  // carried from notice-card.test.ts (retired with noticeCard) when main's review of #1099 re-pinned it on
+  // renderAgentNotif's OWN body: a lazy whole-file span onto any later `nested: true` had made the old line
+  // vacuous (review find, 2026-09-09, on #1099); here the same shape, on the builder's spec
+  const AGENT = RENDER.split("function renderAgentNotif(")[1].split("\nfunction ")[0];
+  assert.match(AGENT, /opts: \{ nested\?: boolean; preamble\?: string \} = \{\}/, "nested unless told otherwise");
+  assert.match(AGENT, /sev: failed \? "err" : "info", body: hasBody \? body : null, key, nested: opts\.nested !== false \}\);/);
+  const INJ = RENDER.split("function renderInjected(")[1].split("\nfunction ")[0];
+  assert.match(INJ, /renderAgentNotif\([^)]*nested: false/, "the notification-only record stands on its own rail");
+});
+
 test("one glyph per SOURCE, in the ctxIcon line-icon style; the romp swirl is the one non-stroke glyph", () => {
   for (const k of ["agent", "command", "system", "peer", "teammate", "api", "compaction", "clear", "branch", "session", "power", "question", "todo", "retry"]) {
     assert.match(RENDER, new RegExp("\\n  " + k + ": '<"), "NOTICE_GLYPHS." + k);

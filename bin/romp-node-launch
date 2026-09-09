@@ -47,14 +47,14 @@ fi
 
 # Extra service environment (parity with the systemd unit's EnvironmentFile=-):
 # plain KEY=VALUE lines exported to the manager, so variables available only in
-# a login shell also reach the kernel. ROMP_API_KEY_CMD / ROMP_API_KEY_REF remain a command
-# line / a reference here; the kernel runs them when a key is needed. Parsed line-by-line, never sourced: a
+# a login shell also reach the kernel (ROMP_EXPECTED_AUTH and service knobs; never an API key,
+# which the kernel refuses at boot). Parsed line-by-line, never sourced: a
 # malformed line is skipped instead of executing code or (under set -eu)
 # taking the manager, and the whole kernel, down with it. Whitespace around the
 # value (a trailing space after a closing quote, a CRLF line ending) is discarded and
 # then one layer of matching quotes comes off, so the common line reads the same way
-# under systemd's EnvironmentFile= and the kernel's own reader (kernel/keysource.py
-# _assignments): KEY="a b" reaches the manager as a b, not as "a b". Without this a
+# under systemd's EnvironmentFile= and the kernel's own reader (kernel/credentials.py
+# env_file_assignments): KEY="a b" reaches the manager as a b, not as "a b". Without this a
 # quoted value in service.env reached a macOS-launched manager with its quotes and a
 # systemd-launched one without, the same line meaning two different things by
 # platform. Not full systemd parity: backslash escapes inside quotes are not

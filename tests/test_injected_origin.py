@@ -102,6 +102,22 @@ class AuthorFieldFirst(unittest.TestCase):
         self.assertEqual(em.author_of(tb("<turn>\nUSER ASKED: Another Claude session sent a message: x"), "sdk", {},
                                       sdk_human=True), "human")
 
+    def test_peer_send_message_subkind_is_a_teammate_not_a_finished_task(self):
+        # the SDK's OTHER task-notification subkind (TaskNotificationOriginSubkind "peer-send-message"): a message
+        # from another of the user's sessions, delivered on the task channel. Another session's words → the
+        # teammate card, never 'system' (a finished background task that folds into the running turn) and never
+        # an opener (review find, 2026-09-09, on #1099)
+        origin = {"kind": "task-notification", "subkind": "peer-send-message"}
+        self.assertEqual(em.author_of(tb("The routes are ready for review."), "sdk", {}, sdk_human=True, origin=origin),
+                         "teammate")
+        self.assertEqual(em.author_of(tb(PREAMBLE + "\n\nThe routes are ready for review."), "sdk", {}, sdk_human=True,
+                                      origin=origin), "teammate",
+                         "the stamp outranks the task channel's own preamble on the text")
+        self.assertFalse(em._is_opener({"type": "user", "author": "teammate"}))
+        # the subkind-less stamp is still the finished background task
+        self.assertEqual(em.author_of(tb("The routes are ready for review."), "sdk", {}, sdk_human=True,
+                                      origin={"kind": "task-notification"}), "system")
+
     def test_other_injected_kinds_are_never_the_human(self):
         for kind in ("coordinator", "channel", "auto-continuation", "observer", "unclassified", "brand-new-kind"):
             self.assertEqual(em.author_of(tb(CONTINUATION), "sdk", {}, sdk_human=True, origin={"kind": kind}), "sdk", kind)
@@ -174,6 +190,28 @@ class InjectedSourceUnit(unittest.TestCase):
                          {"kind": "peer", "name": "the coordinating session", "subagent": False})
         self.assertEqual(em.injected_source("sdk", {"kind": "auto-continuation"}),
                          {"kind": "system", "label": "Automatic continuation"})
+
+    def test_peer_send_message_subkind_is_the_peer_notice(self):
+        # the task channel's other subkind carries none of kind "peer"'s sender fields → "another session"; a
+        # name, when the CLI gives one, is used (review find, 2026-09-09, on #1099)
+        self.assertEqual(em.injected_source("teammate", {"kind": "task-notification", "subkind": "peer-send-message"}),
+                         {"kind": "peer", "name": "another session", "subagent": False})
+        self.assertEqual(em.injected_source("teammate", {"kind": "task-notification", "subkind": "peer-send-message",
+                                                         "name": "web"}),
+                         {"kind": "peer", "name": "web", "subagent": False})
+        # never named from a notification that happens to ride along as a reminder
+        self.assertEqual(em.injected_source("teammate", {"kind": "task-notification", "subkind": "peer-send-message"},
+                                            [NOTIF_INNER])["kind"], "peer")
+
+    def test_an_unstamped_scheduled_prompt_keeps_its_label_by_its_lifted_preamble(self):
+        # no stamp (an older CLI, the live echo): the paragraph strip_harness_preamble lifted names what fired the
+        # prompt, so the record keeps the "Scheduled task" label the stamped path gives it (review find, 2026-09-09,
+        # on #1099); with nothing lifted, the unstamped 'sdk' prompt keeps its neutral note as before
+        _rest, pre = em.strip_harness_preamble(SCHEDULED)
+        self.assertEqual(em.injected_source("sdk", None, (), pre), {"kind": "system", "label": "Scheduled task"})
+        self.assertIsNone(em.injected_source("sdk", None, (), ""))
+        self.assertIsNone(em.injected_source("sdk", None, (), em.strip_harness_preamble(PREAMBLE)[1]),
+                          "a notification's preamble on a programmatic prompt names no scheduled task")
 
     def test_the_human_and_romp_and_unstamped_sdk_have_no_source(self):
         self.assertIsNone(em.injected_source("human", None, [NOTIF_INNER]),
@@ -352,6 +390,27 @@ class BuildSessionSourcedEvents(unittest.TestCase):
         self.assertEqual(ev["source"], {"kind": "system", "label": "Scheduled task"})
         self.assertEqual(ev["md"], "Sweep the notes-api routes for slow spots and report.")
         self.assertTrue(ev["preamble"].startswith("[SCHEDULED TASK"))
+
+    def test_an_unstamped_scheduled_prompt_keeps_its_label_and_preamble(self):
+        # the same record without the stamp (the text fallback): still the labelled notice, the stored prompt as
+        # its text and the preamble kept for its fold, never an unlabelled neutral note (review find,
+        # 2026-09-09, on #1099)
+        ev = self._events((SCHEDULED, None))["u1"]
+        self.assertEqual(ev["kind"], "user")
+        self.assertFalse(ev["human"])
+        self.assertEqual(ev["source"], {"kind": "system", "label": "Scheduled task"})
+        self.assertEqual(ev["md"], "Sweep the notes-api routes for slow spots and report.")
+        self.assertTrue(ev["preamble"].startswith("[SCHEDULED TASK"))
+
+    def test_a_peer_send_message_delivery_is_a_teammate_card_not_a_task(self):
+        # the task channel's "peer-send-message" subkind: the teammate card from "another session" (that subkind
+        # names no sender), its body the message, never a "background task" notice folded into the running
+        # turn (review find, 2026-09-09, on #1099)
+        ev = self._events(("The routes are ready for review on the api branch.",
+                           {"kind": "task-notification", "subkind": "peer-send-message"}))["u1"]
+        self.assertEqual(ev["kind"], "teammate")
+        self.assertEqual(ev["source"], {"kind": "peer", "name": "another session", "subagent": False})
+        self.assertEqual(ev["blocks"][0]["body"], "The routes are ready for review on the api branch.")
 
     def test_auto_continuation_is_a_system_notice(self):
         ev = self._events((CONTINUATION, {"kind": "auto-continuation"}))["u1"]

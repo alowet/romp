@@ -88,7 +88,7 @@ export type TailEvent = {
   sentAt?: number;      // …with the send time beside it (epoch s), for the bubble's hover
   undelivered?: boolean;
   images?: unknown[];
-  texts?: { md?: string; hiddenByPending?: boolean; qid?: string; qts?: number; cancelable?: boolean }[];   // qid/qts: the copy's identity (T252c); hiddenByPending: render.ts hid this copy for a send drawn as our own bubble
+  texts?: { md?: string; hiddenByPending?: boolean; qid?: string; qts?: number; cancelable?: boolean; landing?: boolean }[];   // landing: a copy the caller holds after it left the kernel's queue (T262i)   // qid/qts: the copy's identity (T252c); hiddenByPending: render.ts hid this copy for a send drawn as our own bubble
   blocks?: string[];    // a user record the CLI wrote from SEVERAL sends taken at one boundary: one text per
                         //   block (kernel.py build_session ships them when there are two or more); `md` is
                         //   the blocks joined, so each block is a copy of its own send
@@ -396,26 +396,32 @@ export function reconcilePending(events: TailEvent[], list: PendingSend[]): Reco
       const u = events[echoIdx].uuid;
       if (u) for (const q of list) if (q !== p && q.at && q.text === p.text && !q.at.seen.includes(u)) q.at.seen.push(u);
       if (!p.qid && u) p.qid = u;                  // the echo's uuid is the copy's id: latched (T252c)
-    } else if (p.qid && idCopy >= 0) {
-      covered = true; byQueued = true;              // our identified copy is in the queue: exact, whatever its position
-      const k = copyIds.indexOf(p.qid);             // …and that position is spoken for on the text path this push: a later
-      if (k >= 0) {                                 // same-text send never takes it, nor its id (third review)
-        const taken = takenCopies.get(p.text) || new Set<number>();
-        taken.add(k); takenCopies.set(p.text, taken);
-      }
-    } else if (!pv.qid && copyIds.length > at.queued) {
-      const taken = takenCopies.get(p.text) || new Set<number>();
+    }
+    // The kernel's QUEUED copy of this send, beside the echo or alone. By id first: our copy wherever it sits (an
+    // identified copy the caller HOLDS after it left the queue is ours by the same id — the fed gap, where the echo
+    // shows too and the held copy must hide with it, or the message draws twice). Else by text, for a copy the kernel
+    // gave no id: before any echo, the legacy reading (positions past the press-time count, untaken, not another
+    // send's by id); after an echo cover, ONLY an id-less copy — a copy wearing ANOTHER id is another send's, and
+    // taking it by text handed the second of two identical presses' copy to the first (the review of the fed-gap
+    // fix: three bubbles for two messages, the wrong entry retired on the landing).
+    const taken = takenCopies.get(p.text) || new Set<number>();
+    const idHit = p.qid ? copyIds.indexOf(p.qid) : -1;
+    if (idHit >= 0 && !taken.has(idHit)) {
+      taken.add(idHit); covered = true; byQueued = true;   // exact, whatever its position; spoken for on the text path this push
+    } else if (byEcho || (!pv.qid && copyIds.length > at.queued)) {
       let k = -1;
       for (let j = at.queued; j < copyIds.length; j++) {
         const id = copyIds[j];
         if (taken.has(j) || (id && owned.has(id) && id !== p.qid)) continue;   // taken this push, or another send's by id
+        if (byEcho && id) continue;                                            // after an echo: an id-less copy only
         k = j; break;
       }
       if (k >= 0) {
-        taken.add(k); takenCopies.set(p.text, taken); covered = true; byQueued = true;
+        taken.add(k); covered = true; byQueued = true;
         if (copyIds[k] && !p.qid) p.qid = copyIds[k];   // latch the identity of the copy just attributed, when the kernel gave it one
       }
     }
+    takenCopies.set(p.text, taken);
     if (covered) p.received = true;             // the kernel holds this send: proven once, latched
     if (p.received) p.lost = undefined;         // the drop is older news than the kernel's own copy
     if (landedIdx >= 0) {

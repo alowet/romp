@@ -401,7 +401,9 @@ class BootReconcile(unittest.TestCase):
         sid = "11111111-aaaa-0000-0000-00000000000b"
         _reg(d, sid)
         sb.append_state(Path(d), sid, "working")
-        ps = ("  555 1 /x/claude --output-format stream-json --resume %s --input-format stream-json\n"
+        # the orphan's fake pid sits above pid_max (T276): the tree kill polls procfs after its SIGTERM, and a live
+        # process wearing a small fake pid on the box would earn a SIGKILL the pin below does not expect
+        ps = ("  9999555 1 /x/claude --output-format stream-json --resume %s --input-format stream-json\n"
               "  556 1 claude --resume %s --name termsess\n"
               "  90210 1 /usr/bin/python3 /x/romp/bin/romp-kernel\n"
               "  557 90210 /x/claude --output-format stream-json --resume %s --input-format stream-json\n"
@@ -410,7 +412,7 @@ class BootReconcile(unittest.TestCase):
         with mock.patch.object(sb.subprocess, "run", return_value=mock.Mock(stdout=ps)) as run, \
              mock.patch.object(sb.os, "kill", side_effect=lambda p, s: killed.append((p, s))):
             be._boot_reconcile([sb.read_reg(Path(d), sid)])
-        self.assertEqual(killed, [(555, sb.signal.SIGTERM)],
+        self.assertEqual(killed, [(9999555, sb.signal.SIGTERM)],
                          "the SDK orphan is reaped; the tmux CLI and the live (parented) CLI "
                          "on the same sid are untouched")
         self.assertEqual(run.call_args_list[0][0][0], sb.PS_ARGV, "the listing is read with PS_ARGV")

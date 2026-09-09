@@ -33,10 +33,10 @@ function sel(): Sel {
 }
 // the one document call the block makes: setShow's injected <option>
 const DOC = { createElement: (tag: string): Opt => { assert.equal(tag, "option"); return { value: "", textContent: "" }; } };
-const SELECTS = ["jm", "im", "je", "ie", "dm", "de", "cmm", "cme"] as const;
+const SELECTS = ["jm", "im", "je", "ie", "jc", "dm", "de", "cmm", "cme"] as const;   // jc: the judge concurrency select (T277)
 
 // The block, evaluated with the closure variables it reads passed in: `window` (the listener's target),
-// `document` (the injected option), `fetch`/`ku` (the read), and the eight <select>s — real stand-ins by
+// `document` (the injected option), `fetch`/`ku` (the read), and the nine <select>s — real stand-ins by
 // default, or null (the guards).
 function lift(withSelects = true) {
   const start = GEAR.indexOf("  var choices = null");
@@ -137,6 +137,7 @@ test("executed: when the frame's re-read overtakes the page-load fill, every pic
   for (const k of SELECTS) assert.ok(S[k]!.innerHTML.length > 0, `${k} is painted`);
   assert.deepEqual(S.jm!.values, ["fable", "claude-fable-5"], "family + version options, from the list that won");
   assert.deepEqual(S.je!.values, ["", "high"]);
+  assert.deepEqual(S.jc!.values, ["", ...Array.from({ length: 16 }, (_, i) => String(i + 1))], "Default, then the kernel's whole 1..16 range (T277)");
   assert.deepEqual(S.dm!.values, ["triage", "fable", "claude-fable-5"], "the distilling sentinel leads");
   assert.deepEqual(S.de!.values, ["triage", "none", "high"]);
   assert.deepEqual(S.cmm!.values, ["session", "default", "fable", "claude-fable-5"], "the comment sentinels lead");

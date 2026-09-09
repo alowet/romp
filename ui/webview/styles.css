@@ -2266,6 +2266,13 @@ body.chat-theme-yatharth .meta-btn.mode-risky, body.chat-theme-yatharth .meta-it
 .notice-body .fold-pre + .fold-pre { margin-top: 6px; }
 /* a live row (compacting / clearing / reloading / retrying): the head is the whole notice; nothing to fold */
 .notice-live .notice-gist { color: var(--fg); }
+/* a safeguards refusal's fold (renderModelFallback, T279): the first line restates the swap (a truncated
+   head is recoverable), then the API's explanation, then the CLI's own line, dimmed — no dress of its own:
+   the warn severity is the rail + dot */
+.refusal-swap { font-weight: 600; }
+.refusal-cli-line { color: var(--dim); }
+.refusal-swap + .refusal-explanation, .refusal-swap + .refusal-cli-line,
+.refusal-explanation + .refusal-cli-line { margin-top: 6px; }
 /* the clear boundary's lazy body (loader dots while the cleared conversation is fetched, then the episode) */
 .clear-loading { display: inline-flex; align-items: center; gap: 8px; }
 .clear-truncated { color: var(--dim); padding: 4px 0 6px; }

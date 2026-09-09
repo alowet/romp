@@ -58,7 +58,7 @@ class MemoDeadlock(unittest.TestCase):
             "_interrupt_suppresses_nudge", "_backend_queued", "_backend_rewind_pending",
             "_last_state", "_session_awaiting", "_closer_settled", "_revivers_pending",
             "_pending_ops", "_last_assistant_report", "_all_outstanding_delegated")}
-        self._orig_jd = {n: getattr(jd, n) for n in ("parsed_session", "load_goals", "_segs",
+        self._orig_jd = {n: getattr(jd, n) for n in ("parsed_session", "load_goals", "load_goals_shared_or_fault", "_segs",
                                                      "plan_units", "nudge_redundant")}
         self._orig_backend = km.Sessions.backend_for
         km._session_flag = lambda sid, flag: False
@@ -83,6 +83,7 @@ class MemoDeadlock(unittest.TestCase):
         jd.parsed_session = lambda sid, paths, now: {"turns": self.turns}
         self.store = _store()
         jd.load_goals = lambda sid: self.store
+        jd.load_goals_shared_or_fault = lambda sid: (self.store, None)   # the walk reads the shared view; the fresh re-read stays on load_goals
         self.sent = []
         self.reports = [("working through the queue", ARM_T + 50),
                         ("working through the queue", ARM_T + 50)]

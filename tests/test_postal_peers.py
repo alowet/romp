@@ -162,6 +162,9 @@ class _TwoBusHarness(unittest.TestCase):
             m.PEER_STATE.clear()
             m.PEERS.clear()
             m._peer_pending.clear()
+            getattr(m, "_inflight", {}).clear()      # no exchange is carrying anything at the start of a test
+            #                                          (getattr: the module also runs against a bus without the
+            #                                          flight table, to show each new test red for its own reason)
             m._seen_ids = None
         import shutil
         for m in (pm, pmb):
@@ -1566,3 +1569,698 @@ class BusStartSweepsUnfinishedWrites(_LoudBus):
         self.assertIn("_sweep_unfinished_writes()", src)
         self.assertLess(src.index("_sweep_unfinished_writes()"), src.index("ThreadingHTTPServer("),
                         "the sweep runs at start, before any writer of ours can run")
+
+
+class RecallAfterTheCarry(_TwoBusHarness):
+    """A recall reaches a parked cross-host record only until an exchange CARRIES it (2026-09-08). The
+    record stays in the outbox until the END-TO-END ack — one round trip normally, a whole outage when
+    a response was lost and the dialer re-relays under its backoff — and the far bus delivers on
+    arrival, so on origin/main a recall in that window unlinked a message the recipient already held
+    and filed a terminal recall row for it: the sender's receipts read withdrawn for a message that
+    was read, and any reader that treats a recall as final would close a live ask on it.
+
+    The carry is an exact mark on the record (`carried`, `carriedVia`), keyed on the exchange's
+    OUTCOME, never on the request being built (a first cut marked at build and so refused a recall
+    through every failed dial): the dialer marks on a response, or on a failure raised after the
+    request went out; a refused status or a failed connect marks nothing; the dialed side marks once
+    its response write returned. From the listing to that outcome the record is in flight, and a
+    recall is told it is on its way. A carried record is refused with the reason (`kept`), stays, and
+    writes no row; every recall row names its box (`new` / `outbox`); check_sent shows a carried
+    record as left, awaiting confirmation, the same fact the recall refuses on. Two exchanges for one
+    host run at once by design (our dialer, their dial of us): each listing is its own flight, and ending
+    one releases nothing another still holds."""
+
+    def setUp(self):
+        super().setUp()
+        for m in (pm, pmb):
+            try:
+                (m.TLDIR / "messages.jsonl").unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _open(m, host):
+        """The mids every open flight for `host` holds on bus `m`."""
+        return set().union(*((m._inflight.get(host) or {}).values()))
+
+    def _rows(self, m=None):
+        log = (m or pm).TLDIR / "messages.jsonl"
+        return [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+
+    def _recall_rows(self, m=None):
+        return [r for r in self._rows(m) if r.get("ev") == "recall"]
+
+    def _park(self, mid="c1", body="please review the notes-api branch"):
+        pm.outbox_put("srv", {"mid": mid, "to": "beta", "frm": "alpha", "frm_id": "sid-a",
+                              "body": body, "kind": "question", "t": 1})
+
+    def _dial(self, fn):
+        """One exchange from A's dialer with the HTTP leg replaced by fn(req) — return a response, or
+        raise what urllib would. Returns (outcome, the request that went out)."""
+        seen, saved = [], pm._peer_http
+
+        def http(port, req, token=""):
+            seen.append(req)
+            return fn(req)
+        pm._peer_http = http
+        try:
+            return pm._peer_exchange_once("srv", 1, ""), seen[0]
+        finally:
+            pm._peer_http = saved
+
+    def _via_b(self, req):
+        resp, status = pmb.peer_exchange_handle(req)
+        self.assertEqual(status, 200)
+        return resp
+
+    @staticmethod
+    def _lost(req):
+        import socket
+        raise socket.timeout("timed out")             # raised by getresponse: AFTER the request went out
+
+    # ── the rows and the uncarried case ─────────────────────────────────────────────────────────
+
+    def test_an_uncarried_item_is_recalled_and_the_row_names_the_outbox(self):
+        self._park()
+        kept = []
+        removed = pm._recall("sid-a", "", "c1", kept=kept)
+        self.assertEqual([r["id"] for r in removed], ["c1"], "still parked here: the recall wins")
+        self.assertEqual(kept, [])
+        self.assertEqual(pm.outbox_list("srv"), [])
+        self.assertEqual([(r["id"], r["box"], r["host"]) for r in self._recall_rows()], [("c1", "outbox", "srv")],
+                         "the row says which box it left, by field")
+
+    def test_a_maildir_recall_row_names_the_new_box(self):
+        mid = pm.deliver(_RCP, "alpha", "sid-a", "a local ask", kind="question")
+        removed = pm._recall("sid-a", "", mid)
+        self.assertEqual([r["id"] for r in removed], [mid])
+        self.assertEqual([(r["id"], r["box"]) for r in self._recall_rows()], [(mid, "new")])
+
+    # ── the defect, end to end ──────────────────────────────────────────────────────────────────
+
+    def test_a_message_the_far_side_already_holds_is_not_withdrawn(self):
+        # the request carried it and B delivered on arrival; the end-to-end ack is not yet folded in on
+        # A. Main unlinked the record and filed a recall row here — the recipient reading a message its
+        # sender's receipts called withdrawn
+        self._park()
+        flight = []                                  # the dialer's shape: the build registers a flight it will end
+        req = pm.build_exchange_request("srv", wait=False, flight=flight)
+        resp, status = pmb.peer_exchange_handle(req)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(pmb.read_box("sid-b", consume=False)), 1, "B holds it")
+        self.assertEqual(pm._recall("sid-a", "", "c1"), [], "a message the far side already holds is not withdrawn")
+        self.assertEqual(self._recall_rows(), [], "and no recall row says otherwise")
+        pm.peer_exchange_apply("srv", req, resp, flight=flight)
+        self.assertIsNone(pm.outbox_get("srv", "c1"), "the ack folds in: the record is gone")
+        self.assertEqual([r["ev"] for r in self._rows() if r.get("id") == "c1"], ["relayed"], "the ledger says delivered")
+        self.assertEqual(len(pmb.read_box("sid-b", consume=True)), 1)
+
+    def test_the_dialed_sides_copy_of_a_message_the_far_side_already_holds_cannot_be_withdrawn(self):
+        # The core defect through the real wire, in names main has: B's parked reply rides B's RESPONSE
+        # (a real server over B's Handler, A dialing it with the plain request shape), A delivers it to
+        # alpha, and the end-to-end ack is not back yet — B's copy is still in its outbox. On main B's
+        # recall then unlinked that copy and filed a recall row: withdrawn on the ledger, read on A.
+        pmb.outbox_put("hosta", {"mid": "r9", "to": "alpha", "frm": "beta", "frm_id": "sid-b",
+                                 "body": "the schema is frozen, ship it", "kind": "coordinate", "t": 1})
+        port = self._serve(pmb)
+        req = pm.build_exchange_request("srv", wait=False)
+        resp = pm._peer_http(port, req, token=pmb.SERVE_TOKEN)
+        self.assertEqual([m["mid"] for m in resp["relays"]], ["r9"], "B's response carried it")
+        pm.peer_exchange_apply("srv", req, resp)
+        held = pm.read_box("sid-a", consume=False)
+        self.assertEqual(len(held), 1, "alpha holds it on A")
+        self.assertEqual(pmb._recall("sid-b", "", "r9"), [], "the far side already holds it: B's copy is not withdrawn")
+        self.assertEqual(self._recall_rows(pmb), [], "and no recall row says otherwise")
+        self.assertIsNotNone(pmb.outbox_get("hosta", "r9"), "B's copy stays for A's ack")
+        self.assertIn("ship it", pm.read_box("sid-a", consume=True)[0]["body"], "alpha still has the message")
+
+    # ── the dialer: the dial's outcome is the event ─────────────────────────────────────────────
+
+    def test_building_the_request_marks_nothing_but_puts_the_record_in_flight(self):
+        # the mark keys on the outcome, never on the build: a request built is not a request delivered.
+        # Between the two the record is in flight, and a recall is told so instead of being granted —
+        # main granted it, for bytes the dial was about to put on the wire
+        self._park()
+        flight = []
+        req = pm.build_exchange_request("srv", wait=False, flight=flight)
+        self.assertEqual([m["mid"] for m in req["relays"]], ["c1"])
+        self.assertNotIn("carried", req["relays"][0], "the mark is this bus's bookkeeping, never on the wire")
+        self.assertIsNone(json.loads((pm.OUTBOX / "srv" / "c1.json").read_text()).get("carried"),
+                          "nothing durable is written at build")
+        self.assertEqual(len(flight), 1, "the build registered one flight and handed its id back")
+        self.assertEqual(self._open(pm, "srv"), {"c1"})
+        kept = []
+        self.assertEqual(pm._recall("sid-a", "", "c1", kept=kept), [], "in flight: not granted")
+        self.assertEqual([(k["id"], k["why"], k["carried"]) for k in kept], [("c1", pm.WHY_IN_FLIGHT % "srv", None)])
+        self.assertEqual(self._recall_rows(), [])
+        pm._flight_done("srv", flight[0], carried=False)   # the test stands in for a dial that never connected
+        self.assertEqual([r["id"] for r in pm._recall("sid-a", "", "c1")], ["c1"], "freed: the recall wins")
+
+    def test_a_protocol_drift_refusal_marks_nothing_and_the_recall_still_wins(self):
+        # the 409 arm waits 60 s between dials; a mark at build would have refused the recall throughout,
+        # for bytes the far bus refused before it read a relay
+        import io
+        import urllib.error
+        self._park()
+
+        def drift(req):
+            raise urllib.error.HTTPError("http://127.0.0.1:1/peer-exchange", 409, "drift", {},
+                                         io.BytesIO(b'{"error": "peer protocol drift"}'))
+        outcome, req = self._dial(drift)
+        self.assertEqual(outcome, "drift")
+        self.assertEqual([m["mid"] for m in req["relays"]], ["c1"], "the request carried it…")
+        self.assertIsNone(pm.outbox_get("srv", "c1").get("carried"), "…but nothing reached the far bus: no mark")
+        kept = []
+        self.assertEqual([r["id"] for r in pm._recall("sid-a", "", "c1", kept=kept)], ["c1"], "recalled, as on main")
+        self.assertEqual(kept, [])
+        self.assertEqual(len(self._recall_rows()), 1)
+
+    def test_a_refused_connection_marks_nothing(self):
+        # urllib wraps every connect/send failure in URLError: the request never arrived
+        import urllib.error
+        self._park()
+
+        def refused(req):
+            raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        outcome, _ = self._dial(refused)
+        self.assertEqual(outcome, "unsent")
+        self.assertIsNone(pm.outbox_get("srv", "c1").get("carried"))
+        self.assertEqual([r["id"] for r in pm._recall("sid-a", "", "c1")], ["c1"], "still here, still the sender's")
+
+    def test_a_connection_closed_before_any_status_line_marks_nothing(self):
+        # through the kernel's ssh -L forward a far bus that is not listening (its restart window, a
+        # crash) looks like this: the local ssh listener accepts, the request goes out to it, ssh fails
+        # the channel and closes the socket, and getresponse raises RAW (urllib wraps only the connect
+        # and the send in URLError). The generic arm took it for a lost answer and marked the flight
+        # carried, so through every far-bus restart the sender was refused a recall for a message still
+        # in its own outbox (review find, 2026-09-09)
+        import http.client
+        self._park()
+
+        def closed(req):
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+        outcome, req = self._dial(closed)
+        self.assertEqual(outcome, "unsent")
+        self.assertEqual([m["mid"] for m in req["relays"]], ["c1"], "the request listed it…")
+        self.assertIsNone(pm.outbox_get("srv", "c1").get("carried"), "…but no bus read it: no mark")
+        self.assertEqual(self._open(pm, "srv"), set(), "the flight is closed, not left open")
+        kept = []
+        self.assertEqual([r["id"] for r in pm._recall("sid-a", "", "c1", kept=kept)], ["c1"], "still here, still the sender's")
+        self.assertEqual(kept, [])
+        self.assertEqual(len(self._recall_rows()), 1)
+        self.assertEqual(pm.outbox_list("srv"), [])
+
+    def test_a_reset_connection_marks_nothing(self):
+        # the same shape when the tunnel's close arrives as a reset rather than a clean EOF
+        self._park()
+
+        def reset(req):
+            raise ConnectionResetError(104, "Connection reset by peer")
+        outcome, _ = self._dial(reset)
+        self.assertEqual(outcome, "unsent")
+        self.assertIsNone(pm.outbox_get("srv", "c1").get("carried"))
+        self.assertEqual(self._open(pm, "srv"), set())
+        self.assertEqual([r["id"] for r in pm._recall("sid-a", "", "c1")], ["c1"], "still here, still the sender's")
+
+    def test_a_lost_response_marks_the_relays_carried(self):
+        # a read timeout is raised after the request went out: the far bus may hold the message
+        self._park()
+        outcome, req = self._dial(self._lost)
+        self.assertEqual(outcome, "lost")
+        self.assertNotIn("carried", req["relays"][0])
+        on_disk = json.loads((pm.OUTBOX / "srv" / "c1.json").read_text())   # from disk, not from memory
+        self.assertTrue(on_disk.get("carried"), "the departure is recorded on the record itself")
+        self.assertEqual(on_disk.get("carriedVia"), "srv")
+        kept = []
+        self.assertEqual(pm._recall("sid-a", "", "c1", kept=kept), [], "a carried item is not withdrawn")
+        self.assertEqual([(k["id"], k["to"], k["host"]) for k in kept], [("c1", "srv:beta", "srv")])
+        self.assertEqual(kept[0]["why"], "already left for srv and can no longer be withdrawn")
+        self.assertEqual(kept[0]["carried"], on_disk["carried"])
+        self.assertIn("notes-api", kept[0]["body"], "the sender can tell which message this was")
+        self.assertEqual([m["mid"] for m in pm.outbox_list("srv")], ["c1"], "it stays parked for its ack")
+        self.assertEqual(self._recall_rows(), [], "no recall row: nothing about the message changed")
+
+    def test_a_recall_by_recipient_name_meets_the_same_refusal(self):
+        # the `to` form the tool and `romp mail recall <to>` send; a caller passing no list still gets
+        # nothing removed, only without the reason
+        self._park()
+        self._dial(self._lost)
+        kept = []
+        self.assertEqual(pm._recall("sid-a", "srv:beta", "", kept=kept), [])
+        self.assertEqual([k["id"] for k in kept], ["c1"])
+        self.assertEqual(pm._recall("sid-a", "srv:beta", ""), [])
+        self.assertEqual(len(pm.outbox_list("srv")), 1)
+
+    def test_a_response_whose_ack_covers_the_relay_clears_the_record_with_no_stray_temp(self):
+        self._park()
+        outcome, req = self._dial(self._via_b)
+        self.assertEqual(outcome, "ok")
+        self.assertIsNone(pm.outbox_get("srv", "c1"), "acked end to end: the record is gone")
+        self.assertEqual([p.name for p in (pm.OUTBOX / "srv").iterdir()], [],
+                         "no temp beside it: the mark is written after the acks, so a closed record is never rewritten")
+        self.assertEqual([r["id"] for r in self._rows() if r.get("ev") == "relayed"], ["c1"])
+        self.assertEqual(len(pmb.read_box("sid-b", consume=True)), 1)
+        self.assertEqual(self._open(pm, "srv"), set(), "nothing left in flight")
+
+    def test_a_response_that_does_not_ack_the_relay_marks_it_carried(self):
+        # B's listing did not answer (its kernel mid-restart): _relay_in rules 'retry', silence on the
+        # wire — yet the relay reached B, and B re-processes the re-relay in full next round
+        self._park()
+        pmb.local_agents_checked = lambda threads=False: ([], False)
+        outcome, req = self._dial(self._via_b)
+        self.assertEqual(outcome, "ok")
+        rec = pm.outbox_get("srv", "c1")
+        self.assertTrue(rec.get("carried"), "no ack, no bounce: the record stays, marked as left")
+        self.assertEqual(rec.get("carriedVia"), "srv")
+        kept = []
+        self.assertEqual(pm._recall("sid-a", "", "c1", kept=kept), [])
+        self.assertEqual(kept[0]["why"], pm.WHY_CARRIED % "srv")
+        self.assertEqual(len(pm.outbox_list("srv")), 1)
+        self.assertEqual(self._recall_rows(), [])
+
+    def test_a_recall_during_the_dial_is_told_on_its_way_and_the_outcome_decides(self):
+        # between the listing and the outcome the bytes are on the wire or about to be: a recall then is
+        # neither granted (the recipient may already hold them) nor told they left (a refused dial means
+        # they never will) — it is told to try again in a moment, and the outcome decides
+        import urllib.error
+        during = []
+
+        def recall_now(mid):
+            kept = []
+            during.append((pm._recall("sid-a", "", mid, kept=kept), kept))
+
+        def refused_after_a_recall(req):
+            recall_now("c1")
+            raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+        def lost_after_a_recall(req):
+            recall_now("c2")
+            self._lost(req)
+        self._park("c1")
+        self._dial(refused_after_a_recall)
+        removed, kept = during[0]
+        self.assertEqual(removed, [])
+        self.assertEqual([(k["id"], k["why"], k["carried"]) for k in kept],
+                         [("c1", pm.WHY_IN_FLIGHT % "srv", None)], "in flight: on its way, not left")
+        self.assertEqual(self._recall_rows(), [], "no row was written for a refused recall")
+        self.assertEqual([r["id"] for r in pm._recall("sid-a", "", "c1")], ["c1"],
+                         "the dial failed to connect: the recall wins after all")
+        self._park("c2")
+        self._dial(lost_after_a_recall)
+        self.assertEqual(during[1][0], [])
+        self.assertEqual(during[1][1][0]["why"], pm.WHY_IN_FLIGHT % "srv")
+        kept = []
+        self.assertEqual(pm._recall("sid-a", "", "c2", kept=kept), [])
+        self.assertEqual(kept[0]["why"], pm.WHY_CARRIED % "srv", "the response was lost: it left for good")
+        self.assertEqual(self._open(pm, "srv"), set(), "every outcome empties the flight")
+
+    def test_a_recall_that_lands_between_the_listing_and_the_flight_keeps_the_message_off_the_wire(self):
+        # the exchange carries only what it put in flight: a record the recall removed after the listing
+        # read it never rides, so the recall it granted was honest
+        self._park()
+        saved = pm.outbox_list
+
+        def listed_then_recalled(host):
+            recs = saved(host)
+            self.assertEqual([r["id"] for r in pm._recall("sid-a", "", "c1")], ["c1"])
+            return recs
+        pm.outbox_list = listed_then_recalled
+        try:
+            req = pm.build_exchange_request("srv", wait=False)
+        finally:
+            pm.outbox_list = saved
+        self.assertEqual(req["relays"], [], "nothing rides that the ledger has closed")
+        self.assertEqual(len(self._recall_rows()), 1)
+        self.assertEqual(self._open(pm, "srv"), set(), "an empty listing registers no flight")
+
+    def test_a_re_relay_keeps_the_first_departure_and_the_ack_still_deletes(self):
+        self._park()
+        outcome, req1 = self._dial(self._lost)
+        first = pm.outbox_get("srv", "c1")["carried"]
+        writes, saved = [], pm._atomic_json_put
+        pm._atomic_json_put = lambda p, o: writes.append(p) or saved(p, o)
+        try:
+            outcome, req2 = self._dial(self._lost)   # the link is bad; it rides again and is lost again
+        finally:
+            pm._atomic_json_put = saved
+        self.assertEqual([m["mid"] for m in req2["relays"]], ["c1"], "it rides again")
+        self.assertEqual(writes, [], "already marked: nothing is rewritten")
+        self.assertEqual(pm.outbox_get("srv", "c1")["carried"], first, "the FIRST departure is the fact")
+        self.assertEqual(json.dumps(req1["relays"]), json.dumps(req2["relays"]),
+                         "the wire form is the same before and after the mark")
+        outcome, req3 = self._dial(self._via_b)      # the link heals: B takes it and acks
+        self.assertEqual(outcome, "ok")
+        self.assertIsNone(pm.outbox_get("srv", "c1"), "the end-to-end ack still clears the record")
+        self.assertEqual([r["id"] for r in self._rows() if r.get("ev") == "relayed"], ["c1"])
+        self.assertEqual(len(pmb.read_box("sid-b", consume=True)), 1, "delivered exactly once")
+        kept = []                                    # a recall that races the ack: the ack removed it first
+        self.assertEqual(pm._recall("sid-a", "", "c1", kept=kept), [])
+        self.assertEqual(kept, [])
+        self.assertEqual(self._recall_rows(), [], "nothing to recall and no row: it was delivered, not withdrawn")
+
+    def test_the_mark_survives_a_reload_of_the_bus(self):
+        # the mark lives on the record: a bus restarted between the carry and the ack (a fresh module
+        # instance over the same store) still refuses the recall
+        self._park()
+        self._dial(self._lost)
+        env = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(pm.OUTBOX.parents[2])   # outbox → postal → romp → the XDG root
+        try:
+            fresh = SourceFileLoader("romp_postal_peers_fresh", os.path.join(BIN, "romp-postal-service")).load_module()
+        finally:
+            os.environ["XDG_STATE_HOME"] = env
+        self.assertEqual(fresh.OUTBOX, pm.OUTBOX, "the fresh bus reads the same store")
+        kept = []
+        self.assertEqual(fresh._recall("sid-a", "", "c1", kept=kept), [])
+        self.assertEqual([(k["id"], k["host"]) for k in kept], [("c1", "srv")])
+        self.assertEqual(len(pm.outbox_list("srv")), 1)
+
+    def test_a_mark_that_cannot_be_written_is_said_and_leaves_the_record_recallable(self):
+        # the record RODE; its departure could not be recorded, so a recall can still withdraw it — the
+        # behaviour before the mark — and the log says so by id
+        self._park()
+        logged, saved = [], (pm._atomic_json_put, pm._log)
+
+        def boom(p, o):
+            raise OSError(28, "No space left on device")
+        pm._atomic_json_put, pm._log = boom, lambda m: logged.append(m)
+        try:
+            outcome, _ = self._dial(self._lost)
+        finally:
+            pm._atomic_json_put, pm._log = saved
+        self.assertEqual(outcome, "lost")
+        self.assertIsNone(pm.outbox_get("srv", "c1").get("carried"))
+        said = [m for m in logged if "c1" in m and "departure could not be recorded" in m]
+        self.assertEqual(len(said), 1, logged)
+        self.assertIn("a recall can still withdraw it", said[0])
+        self.assertEqual(self._open(pm, "srv"), set(), "freed: no refusal outlives the outcome")
+        self.assertEqual([r["id"] for r in pm._recall("sid-a", "", "c1")], ["c1"])
+
+    # ── the dialed side: the response write is the event ───────────────────────────────────────
+
+    def _serve(self, m):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+        srv.handle_error = lambda *a: None           # a handler that raises is the point of one test below
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def _outcome_event(self, m, want=None):
+        """m._flight_done wrapped to set an Event (on any outcome, or only on one whose `carried` is `want`):
+        the route records the outcome after the response is on the wire, so the client can hold the
+        response before the handler thread has recorded it. The wrapper keeps _flight_done's parameter
+        names: the route passes `carried=` by keyword."""
+        done, saved = threading.Event(), m._flight_done
+
+        def flight_done(host, flight_id, carried):
+            saved(host, flight_id, carried)
+            if want is None or carried == want:
+                done.set()
+        m._flight_done = flight_done
+        self.addCleanup(setattr, m, "_flight_done", saved)
+        return done
+
+    def _inbound_from_srv(self):
+        """A request as srv would dial A with: nothing to relay, so A's response carries A's outbox."""
+        return {"host": "srv", "proto": pm.PEER_PROTO, "busId": "bus-srv", "epoch": 1, "presence": [], "holds": [],
+                "relays": [], "acks": [], "bounces": [], "reads": [], "readAcks": [], "wait": False}
+
+    def test_the_dialed_side_marks_its_relays_after_the_response_is_written_not_before(self):
+        pmb.outbox_put("hosta", {"mid": "r1", "to": "alpha", "frm": "beta", "frm_id": "sid-b",
+                                 "body": "the port is 8080", "kind": "coordinate", "t": 1})
+        at_write, saved = [], pmb.Handler._send
+
+        def send_then_note(handler, obj, code=200, close=False):
+            if isinstance(obj, dict) and obj.get("relays"):
+                at_write.append((pmb.outbox_get("hosta", "r1") or {}).get("carried"))
+            return saved(handler, obj, code, close)
+        pmb.Handler._send = send_then_note
+        self.addCleanup(setattr, pmb.Handler, "_send", saved)
+        done = self._outcome_event(pmb)
+        port = self._serve(pmb)
+        req = pm.build_exchange_request("srv", wait=False)     # A's outbox is empty: no flight on A's side
+        resp = pm._peer_http(port, req, token=pmb.SERVE_TOKEN)
+        self.assertEqual([m["mid"] for m in resp["relays"]], ["r1"], "the dialed side handed it out")
+        self.assertNotIn("carried", resp["relays"][0])
+        self.assertEqual(at_write, [None], "unmarked while the response was being written")
+        self.assertTrue(done.wait(5), "the route recorded the outcome")
+        rec = pmb.outbox_get("hosta", "r1")
+        self.assertTrue(rec.get("carried"), "marked once the write returned")
+        self.assertEqual(rec.get("carriedVia"), "hosta")
+        kept = []
+        self.assertEqual(pmb._recall("sid-b", "", "r1", kept=kept), [])
+        self.assertEqual([(k["id"], k["host"], k["why"]) for k in kept], [("r1", "hosta", pmb.WHY_CARRIED % "hosta")])
+        self.assertEqual(len(pmb.outbox_list("hosta")), 1)
+        pm.peer_exchange_apply("srv", req, resp)
+        self.assertEqual(len(pm.read_box("sid-a", consume=True)), 1, "A folded it in: delivered")
+        self.assertEqual(self._open(pmb, "hosta"), set(), "the flight ended with the write")
+
+    def test_a_response_that_cannot_be_written_leaves_the_relays_unmarked_to_ride_again(self):
+        pmb.outbox_put("hosta", {"mid": "r2", "to": "alpha", "frm": "beta", "frm_id": "sid-b",
+                                 "body": "the port is 8080", "kind": "coordinate", "t": 1})
+        saved = pmb.Handler._send
+
+        def dead_socket(handler, obj, code=200, close=False):
+            if isinstance(obj, dict) and obj.get("relays"):
+                raise BrokenPipeError(32, "Broken pipe")
+            return saved(handler, obj, code, close)
+        pmb.Handler._send = dead_socket
+        self.addCleanup(setattr, pmb.Handler, "_send", saved)
+        done = self._outcome_event(pmb)
+        port = self._serve(pmb)
+        req = pm.build_exchange_request("srv", wait=False)
+        with self.assertRaises(Exception):           # the connection drops with no response
+            pm._peer_http(port, req, token=pmb.SERVE_TOKEN)
+        self.assertTrue(done.wait(5), "the route recorded the outcome")
+        self.assertIsNone(pmb.outbox_get("hosta", "r2").get("carried"), "nothing left: no mark")
+        self.assertEqual(self._open(pmb, "hosta"), set(), "freed to ride the next exchange")
+        self.assertEqual([r["id"] for r in pmb._recall("sid-b", "", "r2")], ["r2"], "and still the sender's to recall")
+
+    # ── two exchanges for one host at once ─────────────────────────────────────────────────────
+
+    def test_a_flight_that_ends_unsent_releases_nothing_another_open_flight_holds(self):
+        # srv dials A while A's own dialer is out: both list c1. The dialer's exchange never connects and
+        # ends first; srv's response is still being written. With one set per host the first outcome
+        # released c1 and a recall was granted for bytes on the wire (review find, 2026-09-08)
+        import urllib.error
+        self._park()
+        gate, listed = threading.Event(), threading.Event()
+        saved = pm.Handler._send
+
+        def hold_then_send(handler, obj, code=200, close=False):
+            if isinstance(obj, dict) and obj.get("relays"):
+                listed.set()
+                gate.wait(5)                         # the response to srv is mid-write while A's dialer runs
+            return saved(handler, obj, code, close)
+        pm.Handler._send = hold_then_send
+        self.addCleanup(setattr, pm.Handler, "_send", saved)
+        done = self._outcome_event(pm, want=True)
+        port = self._serve(pm)
+        got = []
+        t = threading.Thread(target=lambda: got.append(pmb._peer_http(port, self._inbound_from_srv(), token=pm.SERVE_TOKEN)),
+                             daemon=True)
+        t.start()
+        self.assertTrue(listed.wait(5), "srv's dial listed A's outbox into its flight")
+
+        def refused(req):
+            raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        outcome, req = self._dial(refused)
+        self.assertEqual(outcome, "unsent")
+        self.assertEqual([m["mid"] for m in req["relays"]], ["c1"], "the second listing skips nothing another flight holds")
+        kept = []
+        self.assertEqual(pm._recall("sid-a", "", "c1", kept=kept), [], "srv's exchange still carries it: not granted")
+        self.assertEqual([(k["id"], k["why"]) for k in kept], [("c1", pm.WHY_IN_FLIGHT % "srv")])
+        gate.set()
+        t.join(5)
+        self.assertEqual([m["mid"] for m in got[0]["relays"]], ["c1"], "srv got it in the response")
+        self.assertTrue(done.wait(5), "the route recorded srv's outcome")
+        self.assertTrue(pm.outbox_get("srv", "c1").get("carried"), "the write returned: it left")
+        kept = []
+        self.assertEqual(pm._recall("sid-a", "", "c1", kept=kept), [])
+        self.assertEqual(kept[0]["why"], pm.WHY_CARRIED % "srv")
+        self.assertEqual(self._open(pm, "srv"), set())
+
+    def test_a_flight_that_ends_carried_leaves_the_mark_when_the_other_ends_unsent(self):
+        # the reverse order: srv's dial completes (carried) while A's dialer is out; A's dial then fails
+        # to connect and ends unsent — releasing nothing, since the record is marked
+        import urllib.error
+        self._park()
+        done = self._outcome_event(pm, want=True)
+        port = self._serve(pm)
+
+        def refused_after_srv_carried_it(req):
+            resp = pmb._peer_http(port, self._inbound_from_srv(), token=pm.SERVE_TOKEN)
+            self.assertEqual([m["mid"] for m in resp["relays"]], ["c1"])
+            self.assertTrue(done.wait(5))
+            raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        outcome, req = self._dial(refused_after_srv_carried_it)
+        self.assertEqual(outcome, "unsent")
+        self.assertEqual([m["mid"] for m in req["relays"]], ["c1"])
+        self.assertTrue(pm.outbox_get("srv", "c1").get("carried"), "srv's write returned: it left")
+        kept = []
+        self.assertEqual(pm._recall("sid-a", "", "c1", kept=kept), [])
+        self.assertEqual(kept[0]["why"], pm.WHY_CARRIED % "srv", "the unsent outcome released no mark")
+        self.assertEqual(self._open(pm, "srv"), set())
+
+    def test_ending_a_flight_twice_is_a_no_op_and_a_failed_fold_still_ends_it_carried(self):
+        self._park()
+        pmb.local_agents_checked = lambda threads=False: ([], False)   # B rules 'retry': no ack, the record stays
+        flight = []
+        req = pm.build_exchange_request("srv", wait=False, flight=flight)
+        resp = self._via_b(req)
+        pm.peer_exchange_apply("srv", req, resp, flight=flight)
+        first = pm.outbox_get("srv", "c1")["carried"]
+        self.assertTrue(first)
+        self.assertEqual(self._open(pm, "srv"), set())
+        pm._flight_done("srv", flight[0], carried=True)          # the fold-then-exception path's second call
+        pm._flight_done("srv", flight[0], carried=False)
+        pm._flight_done("srv", 10 ** 9, carried=False)           # an id nobody registered
+        self.assertEqual(pm.outbox_get("srv", "c1")["carried"], first, "no-ops: the mark stands as written")
+        self.assertEqual(self._open(pm, "srv"), set())
+        # a fold that fails before it ends the flight: the dial answered, so the relays reached B
+        self._park("c2")
+        logged, saved = [], (pm._ack_arrived, pm._log)
+        pmb.local_agents_checked = lambda threads=False: (pmb.local_agents(), True)   # B acks c2 this time
+
+        def boom(host, mid):
+            raise RuntimeError("the fold broke")
+        pm._ack_arrived, pm._log = boom, lambda m: logged.append(m)
+        try:
+            outcome, req = self._dial(self._via_b)
+        finally:
+            pm._ack_arrived, pm._log = saved
+        self.assertEqual(outcome, "ok")
+        self.assertTrue(any("apply failed" in m and "the fold broke" in m for m in logged), logged)
+        self.assertTrue(pm.outbox_get("srv", "c2").get("carried"), "ended carried by the once-function")
+        self.assertEqual(self._open(pm, "srv"), set())
+
+    # ── the surfaces ───────────────────────────────────────────────────────────────────────────
+
+    def test_check_sent_shows_a_carried_record_as_left_awaiting_confirmation(self):
+        # the receipt and the recall read the same record: before this the receipt said "queued for
+        # relay" for the very id the recall refused as already left
+        self._park()
+        pm._tl_append("messages.jsonl", {"t": 10, "ev": "sent", "id": "c1", "from": "alpha", "from_id": "sid-a",
+                                         "to_id": "peer:srv", "toName": "srv:beta", "body": "hi", "kind": "question"})
+        row = pm._sent_receipts("sid-a")[-1]
+        self.assertNotIn("carried", row)
+        self.assertIn("queued for relay to srv", pm.format_receipts([row]), "parked, not yet left")
+        self._dial(self._lost)
+        row = pm._sent_receipts("sid-a")[-1]
+        self.assertEqual(row["carried"], pm.outbox_get("srv", "c1")["carried"])
+        line = pm.format_receipts([row])
+        self.assertIn("left for srv %s — awaiting delivery confirmation · id c1" % pm._hhmm_epoch(row["carried"]), line)
+        self.assertNotIn("queued for relay", line)
+        kept = []
+        pm._recall("sid-a", "", "c1", kept=kept)
+        self.assertEqual(kept[0]["why"], pm.WHY_CARRIED % "srv", "the two surfaces agree on the same id")
+
+    def test_the_route_answers_kept_beside_removed(self):
+        self._park("c3")
+        self._dial(self._lost)
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), pm.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            import urllib.request
+            req = urllib.request.Request("http://127.0.0.1:%d/recall" % srv.server_address[1],
+                                         data=json.dumps({"from_id": "sid-a", "id": "c3"}).encode(),
+                                         headers={"Content-Type": "application/json",
+                                                  "X-Romp-Token": pm.SERVE_TOKEN}, method="POST")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                res = json.loads(r.read())
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(res["removed"], [])
+        self.assertEqual([(k["id"], k["host"]) for k in res["kept"]], [("c3", "srv")])
+        self.assertEqual(res["kept"][0]["why"], pm.WHY_CARRIED % "srv")
+
+    def test_the_tool_and_the_cli_say_it_in_plain_words(self):
+        import contextlib
+        import io
+        kept = [{"to": "srv:beta", "id": "c1", "host": "srv", "carried": 5, "why": pm.WHY_CARRIED % "srv",
+                 "body": "please review the notes-api branch"}]
+        saved = (pm._http, pm._self_identity, pm._heartbeat, pm.ensure, pm.my_id)
+        pm._http = lambda method, path, payload=None: {"ok": True, "removed": [], "kept": kept}
+        pm._self_identity = lambda: ("sid-a", "alpha")
+        pm._heartbeat = lambda *a, **k: None
+        pm.ensure, pm.my_id = (lambda: True), (lambda: "sid-a")
+        try:
+            out, err = pm._mcp_call("recall_message", {"id": "c1"})
+            self.assertFalse(err)
+            self.assertIn('NOT recalled — to srv:beta (id c1): it already left for srv and can no longer be '
+                          'withdrawn; they may already have read it. "please review the notes-api branch"', out,
+                          "the gist is quoted: the sender's own imperative is not addressed to the reader")
+            self.assertNotIn("Nothing to recall", out, "a refusal is not 'nothing matched'")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = pm.cli_recall(["srv:beta", "c1"])
+            self.assertEqual(rc, 0)
+            self.assertIn("[romp mail] not recalled: the message to 'srv:beta' (id c1) already left for srv and "
+                          "can no longer be withdrawn; they may already have read it", buf.getvalue())
+            self.assertNotIn("nothing to recall", buf.getvalue())
+            pm._http = lambda method, path, payload=None: {"ok": True, "kept": kept,
+                                                           "removed": [{"to": "srv:beta", "id": "c2", "body": "second"}]}
+            out, err = pm._mcp_call("recall_message", {"to": "srv:beta"})
+            self.assertIn("Recalled 1 message(s) before they were read:", out)
+            self.assertIn("✕ to srv:beta: second", out)
+            self.assertIn("NOT recalled — to srv:beta (id c1)", out, "one withdrawn, one refused: both are said")
+            riding = [{"to": "srv:beta", "id": "c4", "host": "srv", "carried": None, "why": pm.WHY_IN_FLIGHT % "srv",
+                       "body": "one more thing"}]
+            pm._http = lambda method, path, payload=None: {"ok": True, "removed": [], "kept": riding}
+            out, err = pm._mcp_call("recall_message", {"id": "c4"})
+            self.assertIn('NOT recalled — to srv:beta (id c4): it is on its way to srv right now (try again in a '
+                          'moment). "one more thing"', out, "in flight: try again — never 'too late' in the same breath")
+            self.assertNotIn("may already have read it", out)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                pm.cli_recall(["srv:beta", "c4"])
+            self.assertIn("[romp mail] not recalled: the message to 'srv:beta' (id c4) is on its way to srv right now "
+                          "(try again in a moment)\n", buf.getvalue())
+            self.assertNotIn("may already have read it", buf.getvalue())
+            pm._http = lambda method, path, payload=None: {"ok": True, "removed": []}   # an older bus: no `kept`
+            out, err = pm._mcp_call("recall_message", {"to": "srv:beta"})
+            self.assertIn("Nothing to recall", out)
+            self.assertIn("already read or delivered", out, "delivered-and-unread on the far side is not 'read'")
+        finally:
+            (pm._http, pm._self_identity, pm._heartbeat, pm.ensure, pm.my_id) = saved
+        desc = [t for t in pm.MCP_TOOLS if t["name"] == "recall_message"][0]["description"]
+        self.assertIn("has not left for it yet", desc, "the tool says it withdraws mail still here")
+        self.assertIn("check_sent shows which", desc)
+
+
+class TheStartSweepLeavesAStandingOutboxRecordAlone(_LoudBus):
+    """_mark_carried rewrites a STANDING record through _atomic_json_put, whose temp is
+    <mid>.json.tmp-<pid>-<hex> beside it. A stop between the temp's open and its os.replace leaves that
+    temp beside a valid <mid>.json. The start sweep's outbox arm used to remove every temp and close its
+    id's ledger as never parked (WHY_STOPPED_BEFORE_PARK) — sound when outbox_put was the only temp
+    writer, and a parked message read as refused to its sender once a rewrite could leave one
+    (review find, 2026-09-08). The maildir arm's rule applies: a temp beside a record that stands is
+    removed, said, and its ledger is left alone."""
+
+    def test_a_temp_beside_a_standing_outbox_record_is_removed_and_its_ledger_left_alone(self):
+        pm._tl_append("messages.jsonl", {"t": 10, "ev": "sent", "id": "px-mark", "from": "alpha", "from_id": _SND,
+                                         "to_id": "peer:srv", "toName": "srv:beta", "body": "hi", "kind": "question"})
+        pm.outbox_put("srv", {"mid": "px-mark", "to": "beta", "frm": "alpha", "frm_id": _SND,
+                              "body": "hi", "kind": "question", "t": 1})
+        (pm.OUTBOX / "srv" / "px-mark.json.tmp-1-abcd").write_text('{"mid": "px-mark", "carried": 5')
+        pm._sweep_unfinished_writes()
+        self.assertEqual(sorted(p.name for p in (pm.OUTBOX / "srv").iterdir()), ["px-mark.json"],
+                         "the temp is gone, the record stands")
+        self.assertEqual([r["ev"] for r in self._rows() if r.get("id") == "px-mark"], ["sent"],
+                         "no bounced row: the message is parked and its ledger stays open")
+        said = [m for m in self.logged if "px-mark.json.tmp-1-abcd" in m]
+        self.assertEqual(len(said), 1, self.logged)
+        self.assertIn("the record itself stands", said[0])
+        self.assertIn("its ledger left alone", said[0])
+        self.assertEqual(len(self._notices()), 1)
+        self.assertIn("1 unfinished mail write(s)", self._notices()[0])
+        self.assertIn("0 sender receipt(s) now read refused", self._notices()[0])
+        self.assertIn("1 of them the temp of a record that stands", self._notices()[0],
+                      "both stores run the standing check (readbox_put rewrites too), so the row names neither")
+        rec = pm._sent_receipts(_SND)[0]
+        self.assertEqual((rec["parked"], rec["bounced"]), ("srv", None))
+        line = pm.format_receipts([rec])
+        self.assertIn("id px-mark", line)
+        self.assertNotIn("refused", line, "the receipt still reads parked, never refused")
