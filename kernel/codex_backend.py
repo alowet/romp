@@ -929,8 +929,12 @@ class CodexBackend:
     def model_catalog_error(self):
         """Why the last model_catalog() answered [] (one sentence for a picker to show), or None when
         a catalog is held or none has been asked for yet. The kernel's /models reads it after an empty
-        answer; the failure is the app-server's or the client's, so the sentence names that side."""
-        return self._catalog_err
+        answer; the failure is the app-server's or the client's, so the sentence names that side.
+        Read under _catalog_lock like every writer of the reason, so a concurrent read that is mid-way
+        through storing a list or recording its own reason cannot hand this caller a half-updated value
+        (review find, 2026-09-09)."""
+        with self._catalog_lock:
+            return self._catalog_err
 
     def set_mode(self, sid, mode):
         s = self._session(sid)
