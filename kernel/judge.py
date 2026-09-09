@@ -166,6 +166,7 @@ def _rebind_state(path):
     _CHAIN_MEMO.clear()     # the write-moment chain memo keys on paths under STATESDIR; a new root is a new world
     _COURIER_SEEN.clear()   # the courier gate keys on the old root's files
     _BACKREF_MEMO["slot"] = None   # ...and so does the sender-board walk's map
+    _CAPTIONS_MEMO.clear(); _GOALARCH_MEMO.clear()   # ...and the per-file read memos
     _episode_memo.clear()   # ...and so are the episode-log reads
     _head_memo.clear()      # transcript heads are immutable per path, but a rebind swaps the whole world of paths
     _namefp_memo.clear()    # names-entry content is memoized per SID against same-second mtimes — across a
@@ -2554,23 +2555,74 @@ def tasks_for(fsid, leaf, files, now):
 
 
 # ───────────────────────── the caption store ─────────────────────────
-def captioned_ids(fsid):
-    """The set of unit ids already captioned for this transcript (id-keyed dedup, no window). LIVE
-    in-progress captions (the open segment's provisional work caption, the user 2026-06-21 via link_audit)
-    are SKIPPED: they're not 'done', so run_index keeps re-captioning the open segment until it closes and
-    writes the final non-live record — which then dedups normally and supersedes (the reader is last-wins)."""
-    done = set()
+# ── per-file read memos for the index tier and the re-plan's context (2026-09-09) ──
+# Measured on the maintainer's box (py-spy, the judge tier thread): captioned_ids, _live_natoms and
+# session_turn_captions each read and JSON-decoded the whole captions/<sid>.jsonl for every session on
+# every index pass (19% of the thread), and load_goal_archive decoded goals-archive/<sid>.json per call
+# (11%). Each file is now parsed once per file state: the key is _file_key (inode, mtime_ns, size) taken
+# BEFORE the read (the chain-memo rule), so a row appended during the read moves the key the next call
+# takes and content read mid-write is served no further than that call; an absent or unreadable file is
+# never cached; a stat error (a fresh sentinel key) never matches. Bounded at _FILE_MEMO_MAX entries,
+# oldest-inserted out; a rebound state root clears both. The captions memo serves the three readers from
+# one parse; the archive memo serves READERS only (load_goal_archive_shared): every archiver keeps
+# load_goal_archive, a fresh private object it mutates and saves.
+_CAPTIONS_MEMO = {}        # fsid -> (file key taken before the read, the parsed rows)
+_CAPTIONS_STATS = {"served": 0, "parsed": 0}
+_GOALARCH_MEMO = {}        # fsid -> (file key taken before the read, the guarded archive store: read-only)
+_GOALARCH_STATS = {"served": 0, "loaded": 0}
+_FILE_MEMO_MAX = 256
+
+
+def captions_memo_stats():
+    return dict(_CAPTIONS_STATS)
+
+
+def goal_archive_memo_stats():
+    return dict(_GOALARCH_STATS)
+
+
+def _memo_put(memo, fsid, key, val):
+    if fsid not in memo and len(memo) >= _FILE_MEMO_MAX:
+        memo.pop(next(iter(memo)))                        # oldest-inserted out: bounded by construction
+    memo[fsid] = (key, val)
+
+
+def _captions_rows(fsid):
+    """The parsed rows of captions/<fsid>.jsonl (dict rows only; a malformed or non-object line is skipped, as
+    the readers skipped it), once per file state and served while the file stands. The key is the file's stat
+    taken before the read; an absent or unreadable file is [] and never cached."""
+    p = CAPDIR / (fsid + ".jsonl")
+    key = _file_key(str(p))
+    if key is None:
+        return []
+    ent = _CAPTIONS_MEMO.get(fsid)
+    if ent is not None and isinstance(key, tuple) and ent[0] == key:
+        _CAPTIONS_STATS["served"] += 1
+        return ent[1]
+    rows = []
     try:
-        for line in (CAPDIR / (fsid + ".jsonl")).read_text(errors="replace").splitlines():
+        for line in p.read_text(errors="replace").splitlines():
             try:
                 o = json.loads(line)
             except Exception:
                 continue
-            if o.get("id") and not o.get("live"):
-                done.add(o["id"])
+            if isinstance(o, dict):
+                rows.append(o)
     except OSError:
-        pass
-    return done
+        return []
+    _CAPTIONS_STATS["parsed"] += 1
+    if isinstance(key, tuple):
+        _memo_put(_CAPTIONS_MEMO, fsid, key, rows)
+    return rows
+
+
+def captioned_ids(fsid):
+    """The set of unit ids already captioned for this transcript (id-keyed dedup, no window). LIVE
+    in-progress captions (the open segment's provisional work caption, the user 2026-06-21 via link_audit)
+    are SKIPPED: they're not 'done', so run_index keeps re-captioning the open segment until it closes and
+    writes the final non-live record — which then dedups normally and supersedes (the reader is last-wins).
+    Derived from the one parse _captions_rows holds per file state (2026-09-09)."""
+    return {o["id"] for o in _captions_rows(fsid) if o.get("id") and not o.get("live")}
 
 
 LIVE_CAPTION_ATOM_CHUNK = 8   # re-caption an OPEN segment's live work caption only every ~8 NEW atoms (a
@@ -2581,18 +2633,12 @@ LIVE_CAPTION_ATOM_CHUNK = 8   # re-caption an OPEN segment's live work caption o
 def _live_natoms(fsid):
     """{id: natoms} for the LIVE in-progress captions — the atom count each was built from. run_index
     re-captions an open segment only once its atoms grow by a full LIVE_CAPTION_ATOM_CHUNK past this (event-
-    based cadence, no timer), so a busy segment re-captions once per chunk of work, not per atom."""
+    based cadence, no timer), so a busy segment re-captions once per chunk of work, not per atom. Derived
+    from the one parse _captions_rows holds per file state (2026-09-09)."""
     out = {}
-    try:
-        for line in (CAPDIR / (fsid + ".jsonl")).read_text(errors="replace").splitlines():
-            try:
-                o = json.loads(line)
-            except Exception:
-                continue
-            if o.get("live") and o.get("id"):
-                out[o["id"]] = o.get("natoms", 0)         # last-wins: the latest live caption's size
-    except OSError:
-        pass
+    for o in _captions_rows(fsid):
+        if o.get("live") and o.get("id"):
+            out[o["id"]] = o.get("natoms", 0)             # last-wins: the latest live caption's size
     return out
 
 
@@ -2729,18 +2775,9 @@ def archive_llm(session_log):
 
 
 def session_turn_captions(fsid):
-    """The session's TURN captions, oldest first — the archiver's input."""
-    caps = []
-    try:
-        for line in (CAPDIR / (fsid + ".jsonl")).read_text(errors="replace").splitlines():
-            try:
-                o = json.loads(line)
-            except Exception:
-                continue
-            if o.get("grain") == "turn" and o.get("caption"):
-                caps.append((o.get("t", 0), o["caption"]))
-    except OSError:
-        pass
+    """The session's TURN captions, oldest first — the archiver's input. Derived from the one parse
+    _captions_rows holds per file state (2026-09-09)."""
+    caps = [(o.get("t", 0), o["caption"]) for o in _captions_rows(fsid) if o.get("grain") == "turn" and o.get("caption")]
     caps.sort()
     return [c for _, c in caps]
 
@@ -3670,7 +3707,7 @@ def _replay_overrides(fsid, store, lines=None):
         op, t = ev.get("op"), int(ev.get("t") or 0)
         if op == "restore":
             if arch_nodes is None:
-                arch_nodes = (load_goal_archive(fsid) or {}).get("nodes", {})
+                arch_nodes = (load_goal_archive_shared(fsid) or {}).get("nodes", {})   # read-only: membership
             for nid, nddata in (ev.get("nodes") or {}).items():
                 if nid in store.get("nodes", {}) or nid in arch_nodes:
                     continue                           # alive, or re-cleared into the archive → nothing lost
@@ -4504,6 +4541,24 @@ def load_goal_archive(fsid):
         return _guard_nodes(json.loads((GOALARCHDIR / (fsid + ".json")).read_text()))
     except Exception:
         return {"rompUuid": fsid, "nodes": {}, "status": {}}
+
+
+def load_goal_archive_shared(fsid):
+    """load_goal_archive for READERS: the guarded archive store, loaded once per file state and served while
+    the file stands (2026-09-09), the key its stat taken before the read. The object is shared and read-only
+    by contract; every archiver (a compaction, a rewind sweep, an undo restore) keeps load_goal_archive, a
+    fresh private object it mutates and saves under the archive lock."""
+    p = GOALARCHDIR / (fsid + ".json")
+    key = _file_key(str(p))
+    ent = _GOALARCH_MEMO.get(fsid)
+    if ent is not None and isinstance(key, tuple) and ent[0] == key:
+        _GOALARCH_STATS["served"] += 1
+        return ent[1]
+    store = load_goal_archive(fsid)
+    _GOALARCH_STATS["loaded"] += 1
+    if isinstance(key, tuple):
+        _memo_put(_GOALARCH_MEMO, fsid, key, store)
+    return store
 
 
 def save_goal_archive(fsid, store):
@@ -7776,7 +7831,7 @@ def _cleared_context(fsid, store, cap=6):
     mine = [iid for iid in times if iid.startswith(fsid + ":")]
     if not mine:
         return ""
-    arch = load_goal_archive(fsid).get("nodes", {})
+    arch = load_goal_archive_shared(fsid).get("nodes", {})   # read-only context: the re-plan's <recently-cleared> block
     nodes = store.get("nodes", {})
     out = []
     for iid in sorted(mine, key=lambda i: times[i], reverse=True)[:cap]:
@@ -10849,7 +10904,7 @@ def _deleg_report_lines(store, nid):
             sub = ""                                   # the bare pre-fix form carries none
         if not sub and ":" not in str(h.get("peer") or ""):
             try:                                       # read-only recipient join (local peers only)
-                r_nodes = dict(load_goal_archive(h["peer"]).get("nodes") or {})
+                r_nodes = dict(load_goal_archive_shared(h["peer"]).get("nodes") or {})   # a copy of the map; the nodes are read
                 r_nodes.update(load_goals(h["peer"]).get("nodes") or {})
                 for rn in r_nodes.values():
                     o = rn.get("origin")
@@ -12916,7 +12971,7 @@ def _deleg_frame(store, nid):
     parts = [str(nd["frame"])]
     if o.get("goalId") and not o.get("peerHost"):
         try:
-            snodes = dict(load_goal_archive(o["peer"]).get("nodes") or {})
+            snodes = dict(load_goal_archive_shared(o["peer"]).get("nodes") or {})   # a copy of the map; the nodes are read
             snodes.update(load_goals(o["peer"]).get("nodes") or {})
             tr = snodes.get(o["goalId"]) or {}
             ask = (snodes.get(tr.get("parentId") or "") or {}).get("text") or ""
@@ -14868,7 +14923,7 @@ def run_propagate(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbos
     def _arch(sid):
         a = archives.get(sid)
         if a is None:
-            a = archives[sid] = load_goal_archive(sid)
+            a = archives[sid] = load_goal_archive_shared(sid)   # read-only: the pass never saves an archive
         return a
 
     def _publish(sid):
