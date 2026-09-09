@@ -30820,7 +30820,7 @@ def _mark_nodes_cleared(item_ids, value, src="user", why=None):
     for sid, ids in by_sid.items():
         store, fault = jd.load_goals_or_fault(sid)
         if fault is not None:
-            skipped[sid] = str(fault)                  # its row is filed; the flag cannot be written on a store we
+            skipped[sid] = _store_fault_copy(fault)    # its row is filed; the flag cannot be written on a store we
             continue                                   # cannot read (the view-level clear still holds), the other
         nodes = store.get("nodes", {})                 # sessions' clears proceed, and the CALLER answers the user
         touched = False                                # (a WS gesture reports the refusal to its own socket)
@@ -30869,7 +30869,7 @@ def _mark_nodes_cleared(item_ids, value, src="user", why=None):
         jd.rollup_status(store, closed)
         fault = jd.save_goals_or_fault(sid, store)
         if fault is not None:
-            skipped[sid] = str(fault)                  # the store read a moment ago and faults at its SAVE (the
+            skipped[sid] = _store_fault_copy(fault)    # the store read a moment ago and faults at its SAVE (the
             continue                                   # save path's own strict reads, or the publish itself): the
         #                                                flag did not land, and the caller answers the user exactly
         #                                                as for a load fault. Left to raise, an OSError out of a WS
@@ -31031,6 +31031,22 @@ def _delegation_linked_ids(item_ids):
             if isinstance(o, dict) and o.get("peer") and o.get("goalId") in _nodes(o.get("peer")):
                 out.add(o["goalId"])                                          # recipient → sender (the tracking node)
     return out
+
+
+def _store_fault_copy(fault):
+    """The USER'S copy of a goal-store fault: str(fault) with the state root taken out of every path it
+    names, so the feed's err dialog says goals/<sid>.json rather than the absolute path under the home
+    directory. The same rule _oserror_text applies to the frames it serves: an absolute state path has no
+    business in a pane, and a federated dashboard shows the pane on another machine's screen. The errno
+    text and the file name stay, so the user still learns what refused and which file (one with several
+    sessions knows which store refused; _oserror_text drops the path whole, which is right for a frame that
+    dedupes on its text and wrong for a dialog about one session's file). The judge-errors row the boundary
+    files (_file_store_fault) keeps the whole str(e): the path is diagnostic there. The strip is textual,
+    on the root as jd.STATE spells it; every loader builds its path from jd.GOALDIR, so that is the prefix
+    a fault carries, and a failed publish's rename names two (the temp file and its destination): both lose
+    it."""
+    text = str(fault) or type(fault).__name__
+    return text.replace(str(jd.STATE) + os.sep, "")
 
 
 def _gesture_store_refusal(client, gesture, skipped):
@@ -31298,9 +31314,9 @@ def _restore_goal_archive(item_ids):
                 continue
             store, fault = jd.load_goals_or_fault(sid)
             if fault is not None:
-                skipped[sid] = str(fault)              # its row is filed; the archive keeps these nodes (nothing is
-                continue                               # restored INTO a store we cannot read), the other sessions'
-            nodes = store.setdefault("nodes", {})      # restores proceed, and the caller answers the user
+                skipped[sid] = _store_fault_copy(fault) # its row is filed; the archive keeps these nodes (nothing is
+                continue                                # restored INTO a store we cannot read), the other sessions'
+            nodes = store.setdefault("nodes", {})       # restores proceed, and the caller answers the user
             status = store.setdefault("status", {})
             # Journal the payload FIRST (the user 2026-07-10): once the archive save below lands, these nodes
             # exist only in the live store's save — a stale triage-pass save racing it would drop them from
@@ -31331,11 +31347,11 @@ def _restore_goal_archive(item_ids):
             # land AFTER the undo reopen it records, or the fold consumes it and the card returns to Working.)
             fault = jd.save_goals_or_fault(sid, store)
             if fault is not None:
-                skipped[sid] = str(fault)              # the publish did not land (a save-path read fault, or the
-                continue                               # write itself), so the archive is NOT saved: it keeps these
-            #                                            nodes for the next Undo, whose restore journal row replays
-            #                                            idempotently; the caller answers the user (review find,
-            #                                            2026-09-08: left to raise, this dropped the WS client)
+                skipped[sid] = _store_fault_copy(fault) # the publish did not land (a save-path read fault, or the
+                continue                                # write itself), so the archive is NOT saved: it keeps these
+            #                                             nodes for the next Undo, whose restore journal row replays
+            #                                             idempotently; the caller answers the user (review find,
+            #                                             2026-09-08: left to raise, this dropped the WS client)
             jd.save_goal_archive(sid, arch)
             _compact_seen.pop(sid, None)               # force a re-stat next sweep (we just changed the live file)
     return skipped
