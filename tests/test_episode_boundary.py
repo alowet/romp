@@ -53,6 +53,7 @@ def _node(nid, parent, **kw):
 
 class EpisodeBoundaryTest(unittest.TestCase):
     def setUp(self):
+        self._saved_state = jd.STATE
         self._td = tempfile.mkdtemp()
         jd._rebind_state(Path(self._td))
         self.proj = Path(self._td) / "proj"
@@ -60,6 +61,7 @@ class EpisodeBoundaryTest(unittest.TestCase):
         self.g = lambda n: "%s:%s" % (SID, n)
 
     def tearDown(self):
+        jd._rebind_state(self._saved_state)   # the judge module is shared process-wide: never leave it on a removed dir
         shutil.rmtree(self._td, ignore_errors=True)
 
     def _store(self):

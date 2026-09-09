@@ -8,13 +8,15 @@ append-only log (two thousand rows) for every session on every cycle. Pins: pars
 append re-derives, including one the file clock cannot see (same mtime, larger size); an undo row removes;
 a set read before a write is served no further than that call (the key is the stat taken before the read);
 an absent file is empty and never cached; the key carries the path, so a rebound state root is a new key;
-the pass hoists one set and the walk takes it; the counters ride /perf.
+a chmod of the log re-derives once (the shared stat key carries ctime_ns); the pass hoists one set and the
+walk takes it; the counters ride /perf.
 
 Synthetic ids under a private synthetic sid; a temp state root; nothing real is read."""
 import inspect
 import json
 import os
 import tempfile
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -32,6 +34,21 @@ jd = km.jd
 SID = "11111111-2222-3333-4444-888888888802"
 G1, G2, G3 = SID + ":g1", SID + ":g2", SID + ":g3"
 NOW = 1_800_000_000
+
+
+def _move_ctime(path):
+    """Move a file's ctime and nothing else: flip its mode between 0o600 and 0o644, checking the stat after
+    each chmod, until the ctime differs (a coarse filesystem clock can hand two chmods one timestamp). mtime,
+    size and inode stand. Bounded at 5 s: a filesystem that never ticks ctime under chmod fails the test
+    loudly rather than passing it."""
+    before = cur = os.stat(path)
+    deadline = time.monotonic() + 5
+    while cur.st_ctime_ns == before.st_ctime_ns:
+        if time.monotonic() > deadline:
+            raise AssertionError("ctime did not move under chmod within 5 s")
+        os.chmod(path, 0o644 if (cur.st_mode & 0o777) == 0o600 else 0o600)
+        cur = os.stat(path)
+    return cur
 
 
 class _Memo(unittest.TestCase):
@@ -139,7 +156,7 @@ class ClearSetMemo(_Memo):
         km._cleared_ids()
         key = km._CLEARED_MEMO["slot"][0]
         self.assertEqual(key[0], str(self.path))
-        self.assertEqual(len(key), 4, "path, then the stat's mtime_ns, size and inode")
+        self.assertEqual(len(key), 5, "path, then the stat's mtime_ns, size, inode and ctime_ns")
         other = tempfile.TemporaryDirectory()
         try:
             jd._rebind_state(Path(other.name))
@@ -148,6 +165,31 @@ class ClearSetMemo(_Memo):
         finally:
             jd._rebind_state(Path(self.td.name))
             other.cleanup()
+
+    def test_a_chmod_of_the_log_re_derives_the_set_once(self):
+        """_stat_key is shared with the dead-lane memo and carries ctime_ns, which a chmod or chown moves while
+        mtime, size and inode stand: the set is derived again once and then served as before. No kernel path
+        changes this log's metadata without appending, so that one read is the whole cost of the member."""
+        self._append(self._clear(G1, NOW - 100))
+        real, reads = Path.read_text, []
+
+        def counting(p, *a, **k):
+            if p == self.path:
+                reads.append(p)
+            return real(p, *a, **k)
+        with patch.object(Path, "read_text", counting):
+            a = km._cleared_ids()
+            self.assertIs(km._cleared_ids(), a)
+            key0 = km._CLEARED_MEMO["slot"][0]
+            _move_ctime(self.path)
+            b = km._cleared_ids()
+            self.assertIs(km._cleared_ids(), b, "served again once re-derived")
+        self.assertEqual(b, a, "the same rows")
+        self.assertEqual(len(reads), 2, "one extra read: the chmod moved the ctime")
+        key1 = km._CLEARED_MEMO["slot"][0]
+        self.assertEqual(key1[:4], key0[:4], "path, mtime_ns, size and inode stood")
+        self.assertNotEqual(key1[4], key0[4], "ctime_ns moved")
+        self.assertEqual(km._CLEARED_STATS, {"served": 2, "derived": 2})
 
     def test_a_malformed_row_is_skipped_as_before(self):
         self._append(self._clear(G1, NOW - 100))
