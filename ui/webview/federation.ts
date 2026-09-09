@@ -300,6 +300,15 @@ export function routeOutbound(msg: any, knownHosts?: ReadonlySet<string>): Route
   // with nothing on screen to say so). Broadcast, like the hover clear above.
   if (KERNEL_SETTING.has(msg.type)) return [LOCAL, ...(knownHosts || [])].map((h) => ({ host: h, msg }));
 
+  // The BOARD-WIDE Clear all (the feed footer's, T286; the session header's Clear all is askClearMany, routed
+  // by its session id below) carries no session id, so it fell through to the local kernel alone and a merged
+  // board's Clear all left every remote card standing. Broadcast, local first: each kernel clears its own
+  // feed's cards and appends its own ledger rows, so each side's Undo stays whole (FederationManager.outbound
+  // remembers the hosts and sends undoClear to the same ones). Deliberately NOT a KERNEL_SETTING: a setting
+  // queues on a down socket and replays on reconnect, and a Clear all replayed minutes later would clear
+  // cards the user never saw; a kernel that is down at the click misses it and its cards stay.
+  if (msg.type === "clearAll") return [LOCAL, ...(knownHosts || [])].map((h) => ({ host: h, msg }));
+
   // openFolder ALWAYS stays LOCAL, `id` UNSTRIPPED (the user 2026-07-03): unlike every other id-bearing
   // message, this one means "open a window on the machine the BROWSER is running on" — routing it to a
   // remote kernel would open a folder/terminal on that headless machine's own (unwatched) screen. The
@@ -1165,26 +1174,35 @@ export class FederationManager {
     if (next.length !== cur.length || next.some((id, i) => id !== cur[i])) writeViewOrder(next);
   }
 
-  private lastClearHost = LOCAL; // where the most recent askClear routed — undoClear follows it
+  private lastClearHosts: string[] = [LOCAL]; // where the most recent clear routed (one kernel for a card or a
+  //                                             session's batch, every attached kernel for the board-wide Clear
+  //                                             all, T286) — undoClear follows it to each of them
 
   // browser → kernel: route each message to the owning kernel, prefix stripped.
   outbound(m: any): void {
-    // undoClear undoes the LAST clear, which may have gone to a remote kernel — follow it there.
-    // (The kernel keeps its own cleared.jsonl; only the kernel that took the clear can undo it.)
-    if (m && m.type === "undoClear" && this.lastClearHost !== LOCAL) {
-      this.sendRemote(this.lastClearHost, m);
-      this.lastClearHost = LOCAL;
+    // undoClear undoes the LAST clear on every kernel that took it: a remote card's clear went to that kernel
+    // alone, the board-wide Clear all went to all of them. (Each kernel keeps its own cleared.jsonl; only the
+    // kernel that took a clear can undo it, and it undoes its own newest batch.)
+    if (m && m.type === "undoClear") {
+      const hosts = this.lastClearHosts.length ? this.lastClearHosts : [LOCAL];
+      this.lastClearHosts = [LOCAL];
+      for (const h of hosts) this.sendTo(h, m);
       return;
     }
     const routes = routeOutbound(m, new Set(this.hostSeq.filter((h) => h !== LOCAL)));
-    if (m && (m.type === "askClear" || m.type === "askClearMany")) this.lastClearHost = routes[0] ? routes[0].host : LOCAL;
-    for (const r of routes) {
-      if (r.host === LOCAL) {
-        const s = (window as any).__rompLocalSend;
-        if (typeof s === "function") s(r.msg);
-      } else {
-        this.sendRemote(r.host, r.msg);
-      }
+    if (m && (m.type === "askClear" || m.type === "askClearMany" || m.type === "clearAll")) {
+      this.lastClearHosts = routes.length ? routes.map((r) => r.host) : [LOCAL];
+    }
+    for (const r of routes) this.sendTo(r.host, r.msg);
+  }
+
+  /** One send to one kernel: the local one through the page's own socket, a remote one through its conn. */
+  private sendTo(host: string, msg: any): void {
+    if (host === LOCAL) {
+      const s = (window as any).__rompLocalSend;
+      if (typeof s === "function") s(msg);
+    } else {
+      this.sendRemote(host, msg);
     }
   }
 
