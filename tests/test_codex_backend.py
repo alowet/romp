@@ -19,6 +19,8 @@ import time
 import unittest
 from unittest import mock
 from importlib.machinery import SourceFileLoader
+
+from tests.conftest import thread_census, wait_for_census
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -84,6 +86,41 @@ def note(method, params):
     return SimpleNamespace(method=method, payload=_Payload(params))
 
 
+_CLIENTS = []                    # every FakeClient made by this module
+_BACKENDS = []                   # every CodexBackend made by this module
+_CENSUS0 = []
+_ORIG_INIT = []
+
+
+def setUpModule():
+    # Residue hygiene (T282): each backend this module builds starts a global pump per client and a worker per
+    # session, daemon threads that parked on the fake client forever and outlived the module (64 of them under
+    # the full suite). Every backend and client is recorded here and ended in tearDownModule, which then pins
+    # the thread census back to what it was when the module started.
+    _CENSUS0[:] = [thread_census()]
+    orig = cb.CodexBackend.__init__
+
+    def recording_init(self, *a, **k):
+        orig(self, *a, **k)
+        _BACKENDS.append(self)
+    _ORIG_INIT[:] = [orig]
+    cb.CodexBackend.__init__ = recording_init
+
+
+def tearDownModule():
+    cb.CodexBackend.__init__ = _ORIG_INIT[0]
+    for be in _BACKENDS:
+        for _, sess in be._session_items():          # a worker returns when it wakes to a dead session
+            with sess.lock:
+                sess.dead = True
+            sess.kick.set()
+    for c in _CLIENTS:
+        c.close()                                    # a pump returns when its client reads as closed
+    _BACKENDS.clear(); _CLIENTS.clear()
+    left = wait_for_census(_CENSUS0[0], timeout=10)
+    assert left == [], "threads outlived this module: %r" % left
+
+
 class FakeClient:
     """Scripted app-server: turn_start opens a queue and streams either the injected script or a
     default echo turn (userMessage + agentMessage + tokenUsage + completed)."""
@@ -95,6 +132,8 @@ class FakeClient:
         self.hold_open = False      # script the turn to stay open (steer/interrupt tests)
         self._n = 0
         self._global = queue.Queue()
+        self._closed = False
+        _CLIENTS.append(self)       # every client ever made is closed when the module ends (T282)
 
     # bookkeeping helpers ------------------------------------------------------------------
     def _rec(self, name, *a):
@@ -113,6 +152,8 @@ class FakeClient:
 
     def close(self):
         self._rec("close")
+        self._closed = True
+        self._global.put(None)      # wakes the backend's global pump, which reads the close and stops (T282)
 
     def thread_start(self, params=None):
         self._rec("thread_start", params)
@@ -186,7 +227,10 @@ class FakeClient:
                                                      "status": "interrupted"}}))
 
     def next_notification(self):
-        return self._global.get()   # blocks forever — the global pump just parks in tests
+        n = self._global.get()      # parks the backend's global pump until a notification or the close
+        if n is None or self._closed:
+            raise RuntimeError("client closed")   # the pump logs "global pump stopped" and returns
+        return n
 
 
 def build(tmp=None, factory=None):

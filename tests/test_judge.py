@@ -1306,11 +1306,24 @@ class ClearedSeal(unittest.TestCase):
     def setUp(self):
         self._saved_state = jd.STATE
         self._td = tempfile.mkdtemp()
-        jd.STATE = Path(self._td)
+        jd._rebind_state(Path(self._td))
 
     def tearDown(self):
-        jd.STATE = self._saved_state
+        jd._rebind_state(self._saved_state)
         shutil.rmtree(self._td, ignore_errors=True)
+
+    def test_the_stores_this_class_saves_do_not_outlive_it(self):
+        # The residue pin (T282): a store saved through this module's judge (the object every kernel shares) lands
+        # under the sandbox root, and the run-wide root is exactly as it was.
+        shared = Path(self._saved_state) / "goals" / (SID + ".json")
+        before = (shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None)
+        st = jd.load_goals(SID)
+        st["nodes"][SID + ":t282"] = jd.GuardedNode({"id": SID + ":t282", "text": "a note", "parentId": None, "nodeComplete": False,
+                                                    "blocked": False, "cleared": False, "trail": [], "t": 1, "mt": 1, "log": []})
+        jd.save_goals(SID, st)
+        self.assertTrue((Path(self._td) / "goals" / (SID + ".json")).exists(), "the store lives under the sandbox root")
+        self.assertEqual((shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None), before,
+                         "the run-wide goals directory is untouched by this class")
 
     def _view_clear(self, *ids):
         with (jd.STATE / "cleared.jsonl").open("a") as f:
@@ -1438,7 +1451,7 @@ class Grouper(unittest.TestCase):
         # empty dir so every grouper test is hermetic (no real cleared.jsonl bleeds in).
         self._saved_state = jd.STATE
         self._state_td = tempfile.mkdtemp()
-        jd.STATE = Path(self._state_td)
+        jd._rebind_state(Path(self._state_td))
 
     def _two_tops(self):
         s = _store()
@@ -1589,10 +1602,10 @@ class Grouper(unittest.TestCase):
         return str(pdir / (SID + ".jsonl"))
 
     def tearDown(self):
-        jd.STATE = self._saved_state
-        shutil.rmtree(self._state_td, ignore_errors=True)
         if hasattr(self, "_saved"):
-            (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.group_llm) = self._saved
+            (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.group_llm) = self._saved   # _setup's own dirs, off first
+        jd._rebind_state(self._saved_state)   # ...then the import-time root and every derived dir
+        shutil.rmtree(self._state_td, ignore_errors=True)
 
     def test_view_cleared_top_is_excluded_from_grouping(self):
         # The reappearance bug (the user 2026-06-18): the user CLEARS a top from the feed (a row in
@@ -1713,13 +1726,13 @@ class Consolidator(unittest.TestCase):
     def setUp(self):
         self._saved_state = jd.STATE
         self._state_td = tempfile.mkdtemp()
-        jd.STATE = Path(self._state_td)
+        jd._rebind_state(Path(self._state_td))
 
     def tearDown(self):
-        jd.STATE = self._saved_state
-        shutil.rmtree(self._state_td, ignore_errors=True)
         if hasattr(self, "_saved"):
-            (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.group_llm) = self._saved
+            (jd.NAMES, jd.PROJECTS, jd.GOALDIR, jd.group_llm) = self._saved   # _setup's own dirs, off first
+        jd._rebind_state(self._saved_state)   # ...then the import-time root and every derived dir
+        shutil.rmtree(self._state_td, ignore_errors=True)
 
     def _completed_store(self, specs):
         # specs: [(gid_suffix, text, [trail segs])] → a store of completed top goals (rolled up to "completed")
@@ -4295,11 +4308,11 @@ class ModelTiers(unittest.TestCase):
         # read nor deleted). The tier split must hold on the DEFAULT aliases.
         self._saved_state = jd.STATE
         self._td = tempfile.mkdtemp()
-        jd.STATE = Path(self._td)
+        jd._rebind_state(Path(self._td))
         jd._state_cache.clear()
 
     def tearDown(self):
-        jd.STATE = self._saved_state
+        jd._rebind_state(self._saved_state)
         jd._state_cache.clear()
         shutil.rmtree(self._td, ignore_errors=True)
 
@@ -4776,10 +4789,10 @@ class DeltaScopedDistill(unittest.TestCase):
         self._saved_state = jd.STATE
         self._saved_distill = jd.distill_llm
         self._td = tempfile.mkdtemp()
-        jd.STATE = Path(self._td)
+        jd._rebind_state(Path(self._td))
 
     def tearDown(self):
-        jd.STATE = self._saved_state
+        jd._rebind_state(self._saved_state)
         jd.distill_llm = self._saved_distill
         shutil.rmtree(self._td, ignore_errors=True)
 
@@ -4986,11 +4999,12 @@ class DistillAtDone(unittest.TestCase):
     def setUp(self):
         self._saved = (jd.STATE, jd.STATESDIR, jd.distill_llm)
         self._td = tempfile.mkdtemp()
-        jd.STATE = Path(self._td)
+        jd._rebind_state(Path(self._td))
         jd.STATESDIR = Path(self._td) / "states"
 
     def tearDown(self):
         jd.STATE, jd.STATESDIR, jd.distill_llm = self._saved
+        jd._rebind_state(jd.STATE)   # the tuple restores STATE; every derived dir follows it (T282)
         shutil.rmtree(self._td, ignore_errors=True)
 
     def _write(self, status="working", confirming=True, log=None, **nd_extra):
@@ -5168,10 +5182,10 @@ class ProceduralBlockStillSpeaks(unittest.TestCase):
         self._saved_stall = jd.stall_llm
         self._saved_brief = jd.brief_llm
         self._td = tempfile.mkdtemp()
-        jd.STATE = Path(self._td)
+        jd._rebind_state(Path(self._td))
 
     def tearDown(self):
-        jd.STATE = self._saved_state
+        jd._rebind_state(self._saved_state)
         jd.stall_llm = self._saved_stall
         jd.brief_llm = self._saved_brief
         shutil.rmtree(self._td, ignore_errors=True)
@@ -7107,10 +7121,10 @@ class OrphanRollup(unittest.TestCase):
     def setUp(self):
         self._saved_state = jd.STATE
         self._td = tempfile.mkdtemp()
-        jd.STATE = Path(self._td)                        # hermetic: _reopen's _view_cleared reads STATE
+        jd._rebind_state(Path(self._td))                        # hermetic: _reopen's _view_cleared reads STATE
 
     def tearDown(self):
-        jd.STATE = self._saved_state
+        jd._rebind_state(self._saved_state)
         shutil.rmtree(self._td, ignore_errors=True)
 
     def test_completed_top_rolls_its_open_children_done(self):
@@ -7174,12 +7188,13 @@ class LivePickerBrief(unittest.TestCase):
         self._saved = (jd.GOALDIR, jd.STATESDIR, jd.STATE, jd.brief_llm, jd.distill_llm)
         self._td = Path(tempfile.mkdtemp())
         jd.GOALDIR = self._td / "goals"
-        jd.STATE = self._td
+        jd._rebind_state(Path(self._td))
         jd.STATESDIR = self._td / "states"
         jd.STATESDIR.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):
         (jd.GOALDIR, jd.STATESDIR, jd.STATE, jd.brief_llm, jd.distill_llm) = self._saved
+        jd._rebind_state(jd.STATE)   # the tuple restores STATE; every derived dir follows it (T282)
         shutil.rmtree(self._td, ignore_errors=True)
 
     _RECORDS = [uline(T0, "wire the picker", "u1", ps="typed"),
@@ -7579,6 +7594,7 @@ class LiveReplan(unittest.TestCase):
         self.saved = (jd.GOALDIR, jd.GOALARCHDIR, jd.PCACHE, jd.STATE,
                       jd.plan_llm, jd.opener_llm, jd._group_store)
         jd.GOALDIR, jd.GOALARCHDIR = td / "goals", td / "goals-archive"
+        jd._rebind_state(Path(td))   # every derived dir moves too; the explicit ones below still win (T282)
         jd.PCACHE, jd.STATE = td / "pcache", td
         jd.GOALDIR.mkdir()
         jd._group_store = lambda *a, **k: None           # never fire the real grouper model
@@ -7588,6 +7604,7 @@ class LiveReplan(unittest.TestCase):
     def tearDown(self):
         (jd.GOALDIR, jd.GOALARCHDIR, jd.PCACHE, jd.STATE,
          jd.plan_llm, jd.opener_llm, jd._group_store) = self.saved
+        jd._rebind_state(jd.STATE)   # the tuple restores STATE; every derived dir follows it (T282)
         self.td.cleanup()
 
     @staticmethod
@@ -7877,8 +7894,9 @@ class FailureContract(unittest.TestCase):
     event (the turn gaining atoms / the top set changing)."""
 
     def setUp(self):
+        self._saved_state = jd.STATE
         self._td = tempfile.mkdtemp()
-        jd._rebind_state(Path(self._td))
+        jd._rebind_state(Path(self._td))   # GOALDIR and every derived dir move too (T282)
         # the model-health latch is process-global, keyed by model: the failing calls below push "model-x"
         # and "gpt-5-test" past the degraded cap, so snapshot it here and restore it after — a later test
         # must not inherit a degraded model (review nit, 2026-09-03)
@@ -7887,6 +7905,7 @@ class FailureContract(unittest.TestCase):
                             {m: dict(st) for m, st in jd._CALL_HEALTH["stats"].items()})
 
     def tearDown(self):
+        jd._rebind_state(self._saved_state)   # the shared judge goes back to the run-wide root (T282)
         shutil.rmtree(self._td, ignore_errors=True)
         with jd._health_lock:
             jd._CALL_HEALTH["degraded"].clear()
@@ -8387,11 +8406,12 @@ class OrphanedHistory(unittest.TestCase):
         self._saved_state, self._saved_errors = jd.STATE, jd.ERRORS
         self._saved_distill = jd.distill_llm
         self._td = tempfile.mkdtemp()
-        jd.STATE = Path(self._td)
+        jd._rebind_state(Path(self._td))
         jd.ERRORS = jd.STATE / "judge-errors.jsonl"   # module-level twin of STATE — captured at import
 
     def tearDown(self):
         jd.STATE, jd.ERRORS = self._saved_state, self._saved_errors
+        jd._rebind_state(jd.STATE)   # the tuple restores STATE; every derived dir follows it (T282)
         jd.distill_llm = self._saved_distill
         shutil.rmtree(self._td, ignore_errors=True)
 
