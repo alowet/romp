@@ -37,7 +37,7 @@ import { tabStateClass, tabDotClass, sectionPip, sectionPipMembers, sectionPipTi
 import { titleWithKey, chordOf, effectiveChord, loadOverrides } from "./keybindings";
 import { DEFAULT_CHORDS } from "./commands";
 import { NavHistory } from "./nav-history";
-import { StagedStack } from "./staged-messages";
+import { StagedStack, quoteReplyBody, stagedPosts } from "./staged-messages";
 import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, queuedCopyToHide, dropPending, bareGroupLabel, sentAtLabel } from "./send-pending";
 import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued, type HeldMemory } from "./queued-held";
 import { reloadHoldReason } from "./reload-hold";
@@ -13319,21 +13319,33 @@ try {
 // strip shows an "Editing message" pill whose ✕ (or Esc in the box) cancels back to normal sending.
 const composerEdits = new Map<string, { uuid: string; orig: string }>();
 
-// STAGED messages (the user 2026-08-15): compose against a highlight, ⌘/Ctrl+⏎ to HOLD it — citation
-// chips and all — clear the box and keep reading; repeat. Nothing sends until the next plain send
-// (the stack flushes first, in stage order, the typed message last) or the strip's Send now.
-// Deliberately NOT the queue and never called "queued": queued is romp's injection-side wait (sent,
-// pending injection); staged is user-side — unsent by choice, each message keeping the context it was
-// written against so the batch reads as quote → comment, quote → comment. Per-tab, persisted with the
-// drafts (a reload or tab switch never drops a stack). The pure stack rules live in staged-messages.ts,
-// executed by its test; this file owns the strip DOM and the send routing.
+// STAGED messages (the user 2026-08-15): compose against a highlight, ⌘/Ctrl+⏎ to HOLD it, citation
+// chips and all, clear the composer and keep reading; repeat. Nothing sends until the next plain send
+// or the strip's Send now, and the release is ONE message: the staged items in stage order, each as the
+// quote it was written against and then its comment, the typed message last, so the run reads
+// quote, comment, quote, comment, wrap-up, and the agent takes it in one turn (stagedPosts in
+// staged-messages.ts says which items still go on their own). Deliberately NOT the queue and never
+// called "queued": queued is romp's injection-side wait (sent, pending injection); staged is user-side,
+// unsent by choice. Per-tab, persisted with the drafts (a reload or tab switch never drops a stack).
+// The pure stack rules and the body live in staged-messages.ts, executed by its test; this file owns
+// the strip DOM and the send routing.
 const stagedMsgs = new StagedStack();
 const stagedOpen = new Set<string>();   // sid:index of staged chips expanded to their full text
+// The strip collapsed to its head line: a page-lifetime Set of session ids, empty (list shown) at load,
+// written by the head's caret or label click and cleared when the stack empties, so a collapse is the
+// user's and belongs to the stack they collapsed (the next stack starts shown, its first item in view),
+// and a reload shows the list again. The head keeps the count and Send now either way.
+const stagedCollapsed = new Set<string>();
+// The list's kept scroll offset, PER TAB: the strip holds one tab's list at a time, so the offset is
+// stored under the sid that built the list the strip holds (strip.dataset.sid) and reused only for
+// that sid. Read off whatever list was in the strip, it would carry the leaving tab's offset onto the
+// entering tab's list on a switch and hide that tab's first items.
+const stagedScroll = new Map<string, number>();
 try { stagedMsgs.restore(((vscodeApi?.getState?.() || {}) as any).staged); } catch { /* ignore */ }
 
-// One routing owner for a user message (the deliver path and the staged flush both speak it): a goal
-// chip rides askFollowUp, quote chips wrap client-side, a bare message is a plain send with the
-// optimistic bubble (chip sends have their own kernel-side echo).
+// One routing owner for a user message (deliver speaks it through flushStaged, once per post of the
+// release): a goal chip rides askFollowUp, quote chips wrap client-side, a bare message is a plain send
+// with the optimistic bubble (chip sends have their own kernel-side echo).
 function routeUserMessage(sid: string, text: string, cites: Citation[] | undefined, imgPaths?: string[]): void {
   if (!vscodeApi) return;
   const goalCite = cites?.find((c) => c.itemId);
@@ -13354,27 +13366,63 @@ function routeUserMessage(sid: string, text: string, cites: Citation[] | undefin
     data: { sid, ts: Date.now(), len: text.length, route: goalCite?.itemId ? "followup" : quoteCites.length ? "quote" : "plain" } });
 }
 
-/** Release the tab's staged stack (deliver's guards — host down, provisional — run before this in the
- *  send path; Send now re-checks reachability itself). Returns how many went. */
-function flushStaged(sid: string): number {
-  const batch = stagedMsgs.takeAll(sid);
-  for (const s of batch) routeUserMessage(sid, s.text, s.cites as Citation[]);
-  if (batch.length) { persistDrafts(); renderStagedStrip(sid); }
-  return batch.length;
+/** Release the tab's staged stack as ONE message: stagedPosts (staged-messages.ts, executed by its test)
+ *  composes the staged items in stage order and then the typed message, when the send carries one, into
+ *  a single body, so one post makes one bubble and one turn. Two kinds of item still go on their own, at
+ *  their place in stage order: an item citing a GOAL (the kernel wraps one goal per message, askFollowUp;
+ *  a typed goal follow-up carries the run inside its text and the goal wraps the lot) and a SLASH
+ *  COMMAND, staged or typed (the kernel fires a command only at the head of its own text: after another
+ *  section a typed /clear would be prose the agent read, and ahead of one a staged /compact would take
+ *  the comments after it as its argument). With nothing staged the typed message routes exactly as
+ *  before. Deliver's guards (host down, provisional) run before this in the send path; Send now
+ *  re-checks reachability itself. Returns how many staged items went. */
+function flushStaged(sid: string, typed?: { text: string; cites?: Citation[]; imgPaths?: string[] }): number {
+  const run = stagedMsgs.takeAll(sid);
+  for (const p of stagedPosts(run, typed)) routeUserMessage(sid, p.text, p.cites as Citation[] | undefined, p.imgPaths);
+  if (run.length) { persistDrafts(); renderStagedStrip(sid); }
+  return run.length;
 }
 
-function renderStagedStrip(id: string | null): void {
+function renderStagedStrip(id: string | null, opts?: { reveal?: "last" }): void {
   const strip = document.getElementById("composer-staged");
   if (!strip) return;
+  // the list's scroll position survives the rebuild: expanding or discarding an item re-renders the
+  // strip, and a fresh list would start at the top, away from the item just clicked. The offset is kept
+  // under the tab that built the list it is read from (stagedScroll), so a switch never carries one tab's
+  // place onto another's list and a tab comes back to its own; an emptied list forgets it. The STAGE path
+  // passes reveal: "last" instead and the new item scrolls into view: with only the kept offset, every
+  // item staged past the fourth would land below the list's edge, out of sight.
+  const prev = strip.querySelector(".staged-list");
+  if (prev && strip.dataset.sid) stagedScroll.set(strip.dataset.sid, prev.scrollTop);
   strip.replaceChildren();
-  const list = id ? stagedMsgs.list(id) : [];
-  if (!id || !list.length) { strip.style.display = "none"; return; }
+  const items = id ? stagedMsgs.list(id) : [];
+  if (!id || !items.length) { if (id) { stagedScroll.delete(id); stagedCollapsed.delete(id); } delete strip.dataset.sid; strip.style.display = "none"; return; }
+  strip.dataset.sid = id;
   strip.style.display = "flex";
+  const collapsed = stagedCollapsed.has(id);
   const head = el("div", "staged-head");
-  const lbl = el("span");
-  lbl.textContent = list.length + " staged — sends with your next message";
+  // the caret: the head line alone when collapsed, the count still on it; a real button so the keyboard
+  // reaches it, and its state is spoken (aria-expanded) as well as drawn
+  const caret = el("button", "staged-caret") as HTMLButtonElement;
+  caret.textContent = collapsed ? "▸" : "▾";
+  caret.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  caret.setAttribute("aria-label", collapsed ? "Show the staged messages" : "Hide the staged messages");
+  const lbl = el("span", "staged-lbl");
+  lbl.textContent = items.length + " staged — sends with your next message";
   lbl.title = "⌘⏎ (or Ctrl+⏎) stages what you've typed, quote chips and all, without sending. "
-    + "A plain send releases them in order with your new message last — or Send now releases them alone.";
+    + "A plain send releases them as one message, in order, with your new message last; a card follow-up or a slash command goes on its own, in its place. "
+    + "Send now releases them alone.";
+  const toggleCollapse = (ev: Event) => {
+    ev.stopPropagation();
+    if (stagedCollapsed.has(id)) stagedCollapsed.delete(id); else stagedCollapsed.add(id);
+    // the rebuild destroys the caret that had focus, so the keyboard user stays on the new one (dropped
+    // to body, the next Enter would be the bare-area Enter that focuses the composer)
+    const had = document.activeElement === caret;
+    renderStagedStrip(id);
+    if (had) (strip.querySelector(".staged-caret") as HTMLElement | null)?.focus();
+  };
+  caret.addEventListener("click", toggleCollapse);
+  lbl.addEventListener("click", toggleCollapse);
   const go = el("button", "staged-go");
   go.textContent = "Send now";
   go.addEventListener("click", () => {
@@ -13385,9 +13433,14 @@ function renderStagedStrip(id: string | null): void {
     }
     flushStaged(id);
   });
-  head.append(lbl, go);
+  head.append(caret, lbl, go);
   strip.appendChild(head);
-  list.forEach((s, i) => {
+  if (collapsed) return;
+  // the items sit in their own scrolling list UNDER the head: about four items show and the rest scroll
+  // (.staged-list in styles.css), the head with its count and Send now stays outside the scroll, and the
+  // composer below keeps its place. An expanded item grows inside the scroll.
+  const list = el("div", "staged-list");
+  items.forEach((s, i) => {
     const chip = el("div", "staged-chip");
     // each staged reply keeps the CONTEXT it was written against visible inside its own dotted box
     // (the user 2026-08-15): one small context chip per quote, independently expandable — clicking
@@ -13435,8 +13488,10 @@ function renderStagedStrip(id: string | null): void {
     x.addEventListener("click", (ev) => { ev.stopPropagation(); stagedMsgs.removeAt(id, i); persistDrafts(); renderStagedStrip(id); });
     row.append(mark, label, hint, x);
     chip.appendChild(row);
-    strip.appendChild(chip);
+    list.appendChild(chip);
   });
+  strip.appendChild(list);
+  list.scrollTop = opts?.reveal === "last" ? list.scrollHeight : (stagedScroll.get(id) || 0);
 }
 
 function beginComposerEdit(sid: string, uuid: string, orig: string): void {
@@ -13729,20 +13784,8 @@ function setCitation(id: string, cite: Citation): void {
   if (id === activeId) { renderComposerChips(id); focusComposer(); }
 }
 
-// The outgoing body for QUOTE citations (the user 2026-07-13): the highlighted text rides ahead of the
-// typed message as a markdown quote block, so the agent knows exactly which part is being replied to.
-// Also what the chip's audit preview shows — one function, no drift. Stacked chips (the user 2026-08-04)
-// become one section each, in the order they sit in the strip. `src` (the VS Code editor flavor,
-// 2026-07-13) names where a highlight came from — a workspace-relative file:lines — so that section's
-// lead-in points the agent at the code, not the conversation.
-function quoteReplyBody(cites: { quote?: string; src?: string | null }[], text: string): string {
-  const sections = cites.map((c) => {
-    const q = (c.quote || "").split("\n").map((l) => "> " + l).join("\n");
-    const lead = c.src ? "Replying to this highlighted code (" + c.src + "):" : "Replying to this part of the conversation:";
-    return lead + "\n" + q;
-  });
-  return text ? sections.join("\n\n") + "\n\n" + text : sections.join("\n\n");
-}
+// quoteReplyBody, the outgoing body for QUOTE citations, lives in staged-messages.ts: the live send, the
+// staged release and the chip's audit preview compose from that one function, and its test executes it.
 
 // HIGHLIGHT-TO-REPLY (the user 2026-07-13): selecting text in the chat transcript seeds the composer chip
 // as reply context, exactly like a distilled-summary click — but quote-flavored. Event-based on
@@ -15162,7 +15205,7 @@ function setupComposer() {
     drafts.delete(activeId); draftStartedAt.delete(activeId);
     ta.value = ""; composerManualH = null; ta.style.height = "";
     persistDrafts();
-    renderStagedStrip(activeId);
+    renderStagedStrip(activeId, { reveal: "last" });   // the new item is the one event that moves the list: show it
   };
   const sendComposer = (opts?: { pastShipGate?: boolean }) => {
     const typed = ta.value.trim();
@@ -15272,17 +15315,18 @@ function setupComposer() {
         return;
       }
       lastSent.set(activeId, text);   // remembered for a possible Ctrl+C restore
-      // STAGED first (the user 2026-08-15): the held run releases in stage order, each message with the
-      // context it was written against, and the message being typed right now lands LAST — the reading
-      // the user composed: quote → comment, quote → comment, then the wrap-up. The guards above (host
-      // down, provisional) have already passed, so nothing staged can be half-lost here.
-      flushStaged(sid);
+      // The STAGED run and this message go together (the user 2026-08-15): the held items in stage order,
+      // each with the context it was written against, and the message being typed right now last, the
+      // reading the user composed: quote, comment, quote, comment, then the wrap-up. flushStaged composes
+      // them into one message (stagedPosts says which items still go alone) and routes every post through
+      // routeUserMessage; with nothing staged that is this message as itself. The guards above (host down,
+      // provisional) have already passed, so nothing staged can be half-lost here.
       // A pending citation chip → send as a FOLLOW-UP on that goal (the user 2026-07-01): askFollowUp wraps the
       // text with the goal's context + the romp-goal-id marker (kernel side), so the goal reopens (done→working,
       // unless cleared) and the chat renders the ↩ Follow-up header — the same path the Follow-up button uses,
       // just seeded by the click. A QUOTE chip (highlighted transcript text, the user 2026-07-13) has no goal:
       // it wraps client-side (quoteReplyBody) into a plain message. No chip → plain sendMessage. The three
-      // branches live in routeUserMessage — ONE routing owner, shared with the staged flush above.
+      // branches live in routeUserMessage, the ONE routing owner.
       // Inside it, `sid` is what ROUTES this to the owning kernel in a federated dashboard (the user
       // 2026-07-29): federation keys routing off `id`/`sid` only, and an `itemId` ("‹sid›:‹goal›") can't
       // be one — its own colon would read the session uuid as a host. Without the sid a follow-up on a
@@ -15290,7 +15334,7 @@ function setupComposer() {
       // uuid — nothing sent, no error, the card flashing to Working and back. The kernel keeps deriving
       // its sid from itemId, so this is inert locally; every other card op carries the sid the same way.
       const cites = composerCitations.get(activeId);
-      routeUserMessage(activeId, text, cites, attached.filter((p) => previewKind(p) === "img"));
+      flushStaged(sid, { text, cites, imgPaths: attached.filter((p) => previewKind(p) === "img") });
       // (a citation follow-up/quote has its own kernel-side echo path; the optimistic bubble covers the plain send)
       if (cites) { composerCitations.delete(activeId); renderComposerChips(activeId); }   // consumed on send
       sendOnShip.delete(sid);                       // a send happened — any held one is superseded

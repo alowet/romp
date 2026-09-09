@@ -1051,6 +1051,23 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
 .staged-head .staged-go { margin-left: auto; background: none; border: 1px solid var(--accent); color: var(--accent);
   border-radius: 5px; font: inherit; padding: 1px 8px; cursor: pointer; }
 .staged-head .staged-go:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-wash); }   /* the feed word-button hover (2026-08-25) */
+/* the head's caret and label: a click collapses the strip to the head line alone, count and Send now
+   still on it; the caret is a real button so the keyboard reaches it. It wears --dim like the label and
+   the chip ✕'s padding (2px 4px), so its hit target is that of the strip's other small control (about
+   13 by 15px) rather than the glyph's own 9px: the one control the keyboard and a finger reach */
+.staged-head .staged-caret { flex: 0 0 auto; background: none; border: 0; padding: 2px 4px; color: var(--dim); font: inherit; line-height: 1; cursor: pointer; }
+.staged-head .staged-lbl { cursor: pointer; }
+/* the items in their own scrolling list UNDER the head, about four items tall: a dozen staged comments
+   otherwise fill the page below the strip and push the transcript out of view. A staged item with one
+   quote is 50px (the quote pill 22.8px = 12px text at the pill's 1.4 line height plus 2px padding and
+   1px border top and bottom; the comment row 19.2px = 12px text at the page's 1.6 line height; the 2px
+   gap between them; the item's 2px padding and 1px border top and bottom), so four items and the three
+   3px gaps between them are 209px. The head with the count and Send now sits outside the scroll; an
+   expanded item grows inside it. overflow-x hidden, as on every scroll container in the pane: a
+   scrolling list computes overflow-x to auto on its own, and an expanded item holding one unbroken
+   token (a digest, a query string) wider than the list would give the pane a sideways scroll; the open
+   labels below wrap such a token so it stays readable. */
+.staged-list { display: flex; flex-direction: column; gap: 3px; min-height: 0; max-height: 209px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; }
 /* the chips strip's Stage button (the user 2026-08-23; moved 2026-08-24): it FOLLOWS the blue
    context chips in the strip's column — immediately after what it acts on, where its meaning reads;
    right-justified it floated detached. Exists exactly while context is held (the strip renders it,
@@ -1075,12 +1092,12 @@ body.composer-resizing { cursor: ns-resize; user-select: none; }
    one-line-ellipsis-then-expand read as everything else here. min-width:0 + max-width guard the
    pane against sideways growth at every level. */
 .staged-cite { min-width: 0; max-width: 100%; cursor: pointer; }
-.staged-cite.open .composer-chip-label { white-space: pre-wrap; overflow: visible; }
+.staged-cite.open .composer-chip-label { white-space: pre-wrap; overflow: visible; overflow-wrap: anywhere; }
 .staged-cite.open { align-items: flex-start; }
 /* min-width:0 lets the flex label actually SHRINK — without it the line ran off the pane edge with no
    ellipsis (the user 2026-08-15); expanded, the same label wraps to the full text */
 .staged-chip .composer-chip-label { flex: 1 1 auto; max-width: 100%; min-width: 0; }
-.staged-chip.open .staged-row .composer-chip-label { white-space: pre-wrap; overflow: visible; }
+.staged-chip.open .staged-row .composer-chip-label { white-space: pre-wrap; overflow: visible; overflow-wrap: anywhere; }
 .staged-chip.open .staged-row { align-items: flex-start; }
 .staged-expand { flex: 0 0 auto; color: var(--dim); font-size: 0.86em; }   /* chrome, not message text */
 .composer-chip-x {
