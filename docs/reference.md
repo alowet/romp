@@ -317,7 +317,7 @@ a remembered key pick on a helper-less machine already fell to the login, and
 the fall is said once per process as a problem row. An explicit pick that
 names the missing side (a session picked "login" on a box that later lost its
 login) launches on the other side when one exists and says so once per session
-start, on the card's Billing sub-line as `⚠ login unavailable, billing API key`
+start, on the tab menu's Billing sub-line as `⚠ login unavailable, billing API key`
 and in the log; the fall itself rides the status as `authPickFell`, so the hover
 and the sub-line never infer one. A pick with nothing to fall to (a box with
 neither side) launches as picked and the CLI decides; the sub-line then says
@@ -351,14 +351,25 @@ the kernel does not control, and resolves its credential the way any `claude`
 in a terminal does.
 
 A tab not yet loaded after a reconnect says "Not loaded yet — click to load"
-instead, until its transcript arrives. Each chat tab's hover tooltip carries
-the same fact as a `Billing` row, `API key`, or `Login (name@example.com)`,
-whenever the session's backend
-reports it, one-auth machines included; only tmux sessions, whose billing romp
-cannot know, show no row. When the CLI's own report disagrees with what the
-session was launched for (a login pick whose CLI reports a key, a key pick
-whose CLI landed on the login), the row carries both: `Login (CLI reports API
-key)`.
+instead, until its transcript arrives.
+
+An SDK session's chat tab carries the same fact as a `Billing` row in its hover
+tooltip, one-auth machines included; tmux sessions, whose billing romp cannot
+know, and Codex sessions, which bill no Claude account, show no row. The row
+has four readings. Unless one of the three cases below applies, it reads
+`API key` or `Login (name@example.com)` (`Login` alone when the account name is
+unknown). While a switch is still reconnecting the session, the row appends
+`(applying — not confirmed yet)` to the side: `Login (applying — not confirmed
+yet)`. A pick naming a side this machine cannot bill leads with the warning,
+the reason, and the side the launch fell to: `⚠ Login picked, but no Claude
+login signed in on this machine — this session bills the API key`; with
+nothing to fall to, the tail says the launch went out as picked. A pick the
+CLI's own report contradicts (a login pick whose CLI reports a key, a key pick
+whose CLI landed on the login) leads with the warning too: `⚠ Login picked, but
+the CLI reports the API key — this session bills that`, and, for a key pick,
+the same with the sides swapped. The tab menu's Billing sub-line says the same
+in fewer words: `API key` or `Login (name@example.com)`, `applying…`, `⚠ login
+unavailable, billing API key`, and `⚠ CLI reports API key`.
 
 Failures are loud rather than silent: a session that lands on the other auth
 than it was launched for is flagged in the Log panel, and a dead credential

@@ -386,7 +386,8 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 .tab-group-head.dragging { opacity: 0.45; }
 .tab-group-head.drop-target { box-shadow: inset 2px 0 0 var(--accent); }
 /* the disclosure chevron: ▸ folded, turned down while open — the fold-caret idiom (a CSS transition on
-   the flip, no timer) */
+   the flip, no timer). Right after the chip with the count after it (T284), the feed's grouped headers'
+   order; the header is content-sized, so the DOM order alone places them. */
 .tab-group-caret { display: inline-block; flex: 0 0 auto; width: 0.9em; text-align: center; transition: transform 0.12s ease; }
 .tab-group-head:not(.collapsed) .tab-group-caret { transform: rotate(90deg); }
 /* the tag's color as a short bar, not a dot: a dot beside a name is a session pip */
@@ -636,6 +637,9 @@ body.chat-theme-yatharth .tab.active.colored:not(.tab-blocked) {
 /* the tab menu's Tags flyout (the user 2026-08-24): identity dot per union tag, ✕ = remove-
    everywhere, an inline New tag… input — all in the menu vocabulary, no new font sizes */
 .ctx-tag-dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; }
+/* a tag chip standing for an UNSELECTED toggle (the tag-lens menu, T283): faded, its colour kept —
+   the state class; tag-menu.ts paints the same opacity inline for a sheet-less host (TAG_CHIP_OFF_OPACITY) */
+.tag-chip-off { opacity: 0.45; }
 .ctx-tag-x { flex: 0 0 auto; background: none; border: none; color: var(--dim); cursor: pointer; font: inherit; padding: 0 2px; }
 .ctx-tag-x:hover { color: var(--fg); }
 .ctx-item-newtag { cursor: default; }
@@ -3592,6 +3596,9 @@ body.filebrowse-open { overflow: hidden; }
 /* a refusal explains itself in place, in the kernel's own words (too large — with the size and the
    cap; not a text file; not found) over the path it was asked for. Never a blank pane. */
 .fileview-err { padding: 18px 14px; font-size: 0.86em; color: var(--warn); }
+/* the edit-mode notice (file-view.ts noteBar) is a row of the card, between the title bar and the body:
+   it keeps its height and the body row shrinks under it, so the editor's 100% is the body it can see */
+.fileview > .fileview-err { flex: 0 0 auto; }
 .fileview-err-hint { margin-top: 6px; color: var(--dim); font-size: 0.92em;
   font-family: var(--mono, ui-monospace, monospace); word-break: break-all; }
 /* the way out of a refusal: when the file exists but cannot render (413/415), the kernel's words are
