@@ -3635,6 +3635,7 @@ class SdkSession:
         #   because romp holds no key source (_options): Claude Code's own credential — its apiKeyHelper
         #   or its login — is what pays, said once per process in the log
         self._pick_fell_said = ""    # the pick whose fall to the other side _options has said for THIS
+        self._pick_unknown_said = ""     # the 'cannot tell, launching with the pick as is' row: once per session and pick
         #   session (once per session, not per reconnect; the user 2026-09-08)
         self._last_cost_total = 0.0   # the CLI's totalCostUSD is CUMULATIVE per process (verified in
         #   the bundle: the result event's total_cost_usd sits beside total_duration/lines counters),
@@ -6506,9 +6507,12 @@ class SdkSession:
                 "modelPending": bool(self._model_pending),   # a /model switch resolving → the badge shows switching-dots
                 "effortPending": bool(self._effort_pending),   # an /effort switch reconnecting → effort-badge dots + "Reloading session…"
                 "auth": self.effective_auth(),   # which account this session bills ('login'|'key') → gear badge
-                # the pick this box cannot bill ("login"|"key"|""): the launch fell to the other side
-                # (_options) and the Billing menu says so under the still-check-marked pick (2026-09-08)
+                # the pick this box cannot bill ("login"|"key"|""), and the side the launch fell to when one
+                # exists ("login"|"key"|""; _options decides both from pick_fall): the Billing menu keeps the
+                # pick check-marked and says which side bills, or that nothing was there to fall to (2026-09-08,
+                # the fall carried explicitly 2026-09-09)
                 "authPickUnavailable": self.backend.pick_unavailable(self.auth),
+                "authPickFell": self.backend.pick_fall(self.auth),
                 "authLive": self.auth_live,   # what the CLI's init actually reported ("" until one
                 #   lands) — the Billing row says so when it disagrees with the launch intent above
                 #   (a key found via apiKeyHelper bills the key while `auth` still reads login)
@@ -6965,6 +6969,34 @@ class SdkBackend:
         # "waiting" (ResultMessage), so it stays nudge-eligible. The dormant in-flight→waiting DISPLAY heal lives
         # independently in live_sessions, so the feed/fleet still render dormant sessions as waiting.
 
+    def _say_settings_unreadable(self, e) -> None:
+        """One problem row per process: the operator's Claude Code settings cannot be read just now (Claude Code
+        rewrites them; a transient state). Every reader of them in this backend answers cannot-tell meanwhile."""
+        self._helper_read_err = str(e)
+        if not self._helper_read_said:
+            self._helper_read_said = True
+            self._log("auth: %s; cannot tell which side this box bills until it reads: no launch falls on it, "
+                      "the seed and the judges read it as no helper" % e, problem=True)
+
+    def key_state(self) -> str:
+        """"ok" | "missing" | "unknown": an apiKeyHelper is configured in the operator's settings, is not, or the
+        settings cannot be read just now. The launch-side fall (a login pick with no login bills the key) keys
+        on "ok" alone; "unknown" is cannot-tell and never moves a launch (review 2026-09-09)."""
+        try:
+            return "ok" if _cred.key_available() else "missing"
+        except _cred.CredentialError as e:
+            self._say_settings_unreadable(e)
+            return "unknown"
+
+    def _helper_source_read(self):
+        """(credentials.helper_source(), readable): ("managed" | "user" | None, True), or (None, False) when the
+        settings cannot be read just now, so a caller can tell "no managed helper" from "cannot tell"."""
+        try:
+            return _cred.helper_source(), True
+        except _cred.CredentialError as e:
+            self._say_settings_unreadable(e)
+            return None, False
+
     @property
     def key_available(self) -> bool:
         """Whether a session with no login pick bills the API key on this box: an apiKeyHelper is configured in
@@ -6973,14 +7005,8 @@ class SdkBackend:
         seed's gate, the launch's record of what it meant and the judges' default. A project's own settings
         file is Claude Code's business (it runs that helper behind its trust prompt); the per-init auth check
         reports where such a session landed. A settings file that cannot be read is a problem row, once, and
-        reads as no helper until it reads."""
-        try:
-            return _cred.key_available()
-        except _cred.CredentialError as e:
-            if not self._helper_read_said:
-                self._helper_read_said = True
-                self._log("auth: %s; the box reads as having no apiKeyHelper until it does" % e, problem=True)
-            return False
+        reads as no helper here until it reads; the launch-side fall asks key_state, where it is cannot-tell."""
+        return self.key_state() == "ok"
 
     def _note_seed_skipped(self, side: str = "key") -> None:
         """Said ONCE per process and side, as a problem row: the remembered Billing default names a side this
@@ -8324,12 +8350,13 @@ class SdkBackend:
         # (authPickUnavailable): the user's intent is kept, the launch is honest about what it did. A
         # pick the box cannot bill with NOTHING to fall to (a key pick on a box with neither) launches
         # plain and the CLI decides, as before.
-        side = sess.auth
-        fell = self.pick_unavailable(side)
-        if fell == "login" and keyed_box:
-            side = "key"
-        elif fell == "key" and not self.auth_unavailable_why("login"):
-            side = "login"
+        side = self.pick_fall(sess.auth) or sess.auth   # the ONE decision, shared with the status rows (authPickFell)
+        if side == sess.auth and sess.auth in ("login", "key") and sess._pick_unknown_said != sess.auth:
+            why = self.pick_unknown(sess.auth)          # cannot tell just now: the pick stands, said once per session
+            if why:
+                sess._pick_unknown_said = sess.auth
+                self._log("auth (%s): cannot tell whether this box can bill '%s' (%s); launching with the pick as is"
+                          % (sess.name, sess.auth, why), problem=True)
         if side != sess.auth and sess._pick_fell_said != sess.auth:
             sess._pick_fell_said = sess.auth
             self._log("auth (%s): billing pick '%s' cannot apply: %s; billing the %s"
@@ -10260,13 +10287,14 @@ class SdkBackend:
         side is a configured apiKeyHelper (read, never run). One vocabulary for every surface, so the
         picker, the tab menu and the log agree on the reason (the user 2026-09-08)."""
         if side == "login":
-            if _cred.helper_source() == "managed":
+            src, readable = self._helper_source_read()
+            if readable and src == "managed":
                 return _cred.WHY_MANAGED_HELPER
-            if not self.login_ok():
-                return _cred.WHY_NO_LOGIN
+            if self.login_ok() is False:        # None = the account file cannot be read just now: cannot tell,
+                return _cred.WHY_NO_LOGIN       #   never "no login" (review 2026-09-09)
             return ""
         if side == "key":
-            return "" if self.key_available else _cred.WHY_NO_HELPER
+            return _cred.WHY_NO_HELPER if self.key_state() == "missing" else ""   # "unknown" is cannot tell
         return ""
 
     def auth_avail(self) -> dict:
@@ -10291,6 +10319,35 @@ class SdkBackend:
         (_options falls to the side that exists, never onto a login that does not; the user 2026-09-08)."""
         if auth in ("login", "key") and self.auth_unavailable_why(auth):
             return auth
+        return ""
+
+    def pick_fall(self, auth: str) -> str:
+        """The side a launch with pick `auth` bills INSTEAD, or "" when it bills the pick: a login pick this box
+        cannot bill falls to the key when a helper is configured, a key pick falls to the login when one is
+        signed in and no managed helper outranks it. A pick with nothing to fall to launches plain (the CLI
+        decides), and a side whose availability cannot be read just now (key_state "unknown", login_ok None,
+        unreadable settings) never receives a fall. The status field `authPickFell`, read by the tab hover
+        and the Billing sub-line, and the one place _options decides (review 2026-09-09: the hover inferred a
+        fall from authPickUnavailable alone and claimed one on a box with neither side)."""
+        fell = self.pick_unavailable(auth)
+        if fell == "login" and self.key_state() == "ok":
+            return "key"
+        if fell == "key":
+            src, readable = self._helper_source_read()
+            if readable and src != "managed" and self.login_ok() is True:
+                return "login"
+        return ""
+
+    def pick_unknown(self, auth: str) -> str:
+        """Why the box cannot tell whether it bills `auth` just now, or "": the operator's settings unreadable
+        (either side), or the account file unreadable (login). The launch says it once and keeps the pick."""
+        if auth == "key" and self.key_state() == "unknown":
+            return self._helper_read_err or "Claude Code settings cannot be read"
+        if auth == "login":
+            if not self._helper_source_read()[1]:
+                return self._helper_read_err or "Claude Code settings cannot be read"
+            if self.login_ok() is None:
+                return "the Claude login state (~/.claude.json) cannot be read"
         return ""
 
     def sid_for_name(self, name: str) -> str:
@@ -10544,6 +10601,7 @@ class SdkBackend:
                     "effort": reg.get("effort", ""),
                     "auth": self.default_auth(reg),
                     "authPickUnavailable": self.pick_unavailable(reg.get("auth") or ""),   # same as snapshot()
+                    "authPickFell": self.pick_fall(reg.get("auth") or ""),
                     # the persisted CLI truth (apiKeyAuth, the liveModel pattern) so a dormant
                     # session's Billing row keeps telling it; absent = no init ever landed
                     "authLive": ("key" if reg.get("apiKeyAuth") else "login")

@@ -316,9 +316,15 @@ pick on a machine with no login seeds new sessions on the API key, exactly as
 a remembered key pick on a helper-less machine already fell to the login, and
 the fall is said once per process as a problem row. An explicit pick that
 names the missing side (a session picked "login" on a box that later lost its
-login) launches on the other side and says so once, on the card's Billing
-sub-line as `⚠ login unavailable, billing API key` and in the log; nothing
-ever launches onto a login that is not signed in. `setAuth` refuses the
+login) launches on the other side when one exists and says so once per session
+start, on the card's Billing sub-line as `⚠ login unavailable, billing API key`
+and in the log; the fall itself rides the status as `authPickFell`, so the hover
+and the sub-line never infer one. A pick with nothing to fall to (a box with
+neither side) launches as picked and the CLI decides; the sub-line then says
+the side is unavailable and claims no fall. A side whose availability cannot
+be read just now (the operator's settings file, or `~/.claude.json`, mid-rewrite
+or unreadable) is cannot-tell: the launch keeps the pick as is, says so once
+per session, and never falls on a read failure. `setAuth` refuses the
 missing side with that same reason in the toast.
 
 A pick reaches the CLI through the session's per-session settings layer, the

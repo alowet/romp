@@ -81,7 +81,7 @@ test("the switching CONTROL is the tab menu's Billing submenu, both sides listed
   assert.match(RENDER, /if \(st\.auth !== c\.value && vscodeApi\) vscodeApi\.postMessage\(\{ type: "setAuth", id, value: c\.value \}\);/);
   // the item's sub-line names the current billing, or the applying reconnect
   assert.match(RENDER, /st\.authPending \? "applying…"/);
-  assert.match(RENDER, /auth\?: string; authLive\?: string; authPending\?: boolean; authBoth\?: boolean; authAvail\?: AuthAvail; authPickUnavailable\?: string; authAcct\?: string;/);
+  assert.match(RENDER, /auth\?: string; authLive\?: string; authPending\?: boolean; authBoth\?: boolean; authAvail\?: AuthAvail; authPickUnavailable\?: string; authPickFell\?: string; authAcct\?: string;/);   // 2026-09-09: the fall the launch took rides beside the unavailable pick
 });
 
 test("no key material reaches the webview — no tail plumbing survives anywhere", () => {
@@ -115,11 +115,11 @@ test("the chat tab hover says Billing whenever the backend reports it, naming th
 
 test("set_auth refuses a login pick on a box with no login — the same bar the key side always had (T124)", () => {
   const BACKEND = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "sdk_backend.py"), "utf8");
-  assert.ok(BACKEND.includes('why = self.auth_unavailable_why(value)') && BACKEND.includes('if not self.login_ok():'),   // 2026-09-08: one reason vocabulary (credentials.WHY_*), login_ok still the probe
+  assert.ok(BACKEND.includes('why = self.auth_unavailable_why(value)') && BACKEND.includes('if self.login_ok() is False:'),   // 2026-09-08: one reason vocabulary (credentials.WHY_*), login_ok still the probe; 2026-09-09: tri-state, None = cannot tell
     "refuse loudly at pick time when the box demonstrably lacks the credential");
   const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
-  assert.ok(KERNEL.includes("_sdk_backend.login_ok = lambda: bool(_claude_account())"),
-    "the probe is the credential store — the authority the usage bars trust");
+  assert.ok(KERNEL.includes('_sdk_backend.login_ok = lambda: (None if _claude_account_state() == "unreadable" else bool(_claude_account()))'),
+    "the probe is the credential store — the authority the usage bars trust; an unreadable store is cannot-tell, never no-login (2026-09-09)");
   assert.ok(KERNEL.includes("or this machine has no Claude login to switch to."),
     "the warn toast names the login case");
 });

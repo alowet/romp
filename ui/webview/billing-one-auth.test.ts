@@ -30,8 +30,15 @@ test("both options are listed; the unavailable one is greyed, titled with its re
   assert.match(STYLES, /\.ctx-sub \.ctx-item\.disabled \{ opacity: 0\.45; cursor: default; \}/);
 });
 
-test("a pick that fell to the other side is said in the sub-line", () => {
+test("a pick that fell to the other side is said in the sub-line, from the kernel's word on the fall", () => {
   assert.match(RENDER, /st\.authPickUnavailable === st\.auth\s*\n(?:\s*\/\/[^\n]*\n)*\s*\? `⚠ \$\{wordOf\(st\.auth\)\} unavailable`/);
+  // the fall itself is the kernel's authPickFell (the launch's own decision), read by BOTH surfaces; an older
+  // kernel without the field is inferred the way the sub-line always did (the other side exists)
+  assert.match(RENDER, /authPickUnavailable\?: string; authPickFell\?: string;/);
+  assert.match(RENDER, /function authFellTo\(st: Status\): string \{\s*\n\s*if \(st\.authPickFell !== undefined\) return st\.authPickFell \|\| "";/);
+  assert.match(RENDER, /\+ \(authFellTo\(st\) \? `, billing \$\{wordOf\(authFellTo\(st\)\)\}` : ""\)/);
+  assert.match(RENDER, /\+ \(authFellTo\(s\.status\) \? ` — this session bills \$\{authFellTo\(s\.status\) === "key" \? "the API key" : "the login"\}`/);
+  assert.match(RENDER, /: " — nothing to fall to, so the launch went out as picked"\)/);
 });
 
 test("the kernel's status carries authAvail with reasons, and authBoth only for older clients", () => {

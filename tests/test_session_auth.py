@@ -335,6 +335,237 @@ class PickFallsToTheAvailableSide(_OptionsHarness):
         self.assertEqual(self.be.live_sessions()[sid]["authPickUnavailable"], "")
 
 
+class CannotTell(_OptionsHarness):
+    """A side whose availability cannot be read just now never moves a launch (review 2026-09-09): an unreadable
+    or non-JSON operator settings file (Claude Code rewrites it) or an unreadable ~/.claude.json reads as
+    cannot-tell on every path that used to raise or to read as the missing side; the launch keeps the pick as
+    is and says so once per session."""
+
+    def _break_settings(self):
+        Path(self.cfg, "settings.json").write_text("{not json")     # mid-rewrite
+        sb._cred.forget_helper_key()
+
+    def test_an_unreadable_settings_file_is_cannot_tell_for_both_sides_and_raises_nowhere(self):
+        self._break_settings()
+        self.assertEqual(self.be.key_state(), "unknown")
+        self.assertFalse(self.be.key_available, "the seed and the judges' default still read it as no helper")
+        self.assertEqual(self.be.auth_unavailable_why("key"), "", "not 'no helper': cannot tell")
+        self.assertEqual(self.be.auth_unavailable_why("login"), "", "not 'managed': cannot tell")
+        self.assertEqual((self.be.pick_unavailable("login"), self.be.pick_unavailable("key")), ("", ""))
+        self.assertEqual((self.be.pick_fall("login"), self.be.pick_fall("key")), ("", ""))
+        snap = self._sess(1, auth="login").snapshot()                 # raised CredentialError out of helper_source before
+        self.assertEqual((snap["authPickUnavailable"], snap["authPickFell"]), ("", ""))
+        sid = self.be.spawn("n", "/tmp", auth="key")
+        row = self.be.live_sessions()[sid]
+        self.assertEqual((row["authPickUnavailable"], row["authPickFell"]), ("", ""))
+        rows = [p["text"] for p in self.be.problems(20) if "cannot tell which side this box bills" in p["text"]]
+        self.assertEqual(len(rows), 1, "the unreadable settings are said once per process")
+
+    def test_a_key_pick_launches_as_picked_and_says_so_once_when_the_settings_cannot_be_read(self):
+        self._break_settings()
+        s = self._sess(2, auth="key")
+        kw = self._options_kw(s)
+        self.assertNotIn("apiKeyHelper", self._settings_of(kw), "no login suppression: the pick stands")
+        self.assertEqual(s._pick_fell_said, "", "no fall")
+        self._options_kw(s)                                           # a reconnect
+        rows = [p["text"] for p in self.be.problems(20) if "launching with the pick as is" in p["text"]]
+        self.assertEqual(len(rows), 1, "once per session, not per reconnect")
+        self.assertIn("'key'", rows[0])
+
+    def test_a_login_pick_launches_as_picked_when_the_settings_cannot_be_read(self):
+        self._break_settings()
+        s = self._sess(3, auth="login")
+        kw = self._options_kw(s)
+        self.assertEqual(self._settings_of(kw).get("apiKeyHelper"), "", "the login launch, suppression and all")
+        self.assertFalse(s._launched_keyed)
+        rows = [p["text"] for p in self.be.problems(20) if "launching with the pick as is" in p["text"]]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("'login'", rows[0])
+
+    def test_an_unreadable_account_file_never_falls_a_login_pick(self):
+        self.be.login_ok = lambda: None                               # the kernel's probe: ~/.claude.json mid-rewrite
+        self.assertEqual(self.be.auth_unavailable_why("login"), "")
+        self.assertEqual(self.be.pick_fall("login"), "", "a helper is configured, but cannot-tell never falls")
+        s = self._sess(4, auth="login")
+        kw = self._options_kw(s)
+        self.assertEqual(self._settings_of(kw).get("apiKeyHelper"), "", "launched on the login as picked")
+        self.assertEqual(s._pick_fell_said, "")
+        rows = [p["text"] for p in self.be.problems(20) if "launching with the pick as is" in p["text"]]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("~/.claude.json", rows[0])
+        self.be.login_ok = lambda: False                              # the read heals and says: no account
+        self.assertEqual(self.be.pick_fall("login"), "key", "now the fall")
+
+    def test_a_key_pick_never_falls_onto_a_login_that_cannot_be_read(self):
+        self._no_helper()
+        self.be.login_ok = lambda: None
+        self.assertEqual(self.be.pick_unavailable("key"), "key", "the helper is known missing")
+        self.assertEqual(self.be.pick_fall("key"), "", "but the login is cannot-tell: no fall")
+        s = self._sess(5, auth="key")
+        kw = self._options_kw(s)
+        self.assertNotIn("apiKeyHelper", self._settings_of(kw))
+        self.assertTrue(s._launched_unkeyed_pick, "as picked: the CLI decides, and the per-init check knows the pick")
+
+
+class TheFallIsCarriedInStatus(_OptionsHarness):
+    """authPickFell says which side a pick this box cannot bill actually fell to, "" when nothing did; the tab
+    hover and the Billing sub-line read it instead of inferring a fall from authPickUnavailable alone (review
+    2026-09-09: on a box with neither side the hover claimed a fall that never happened)."""
+
+    def test_a_login_pick_with_a_helper_falls_and_says_key(self):
+        self.be.login_ok = lambda: False
+        snap = self._sess(1, auth="login").snapshot()
+        self.assertEqual((snap["authPickUnavailable"], snap["authPickFell"]), ("login", "key"))
+
+    def test_a_login_pick_on_a_box_with_neither_side_is_unavailable_but_fell_nowhere(self):
+        self._no_helper()
+        self.be.login_ok = lambda: False
+        s = self._sess(2, auth="login")
+        snap = s.snapshot()
+        self.assertEqual((snap["authPickUnavailable"], snap["authPickFell"]), ("login", ""))
+        kw = self._options_kw(s)
+        self.assertEqual(self._settings_of(kw).get("apiKeyHelper"), "", "launched as picked: the CLI decides")
+        self.assertEqual(s._pick_fell_said, "", "no fall, no fall notice")
+        sid = self.be.spawn("n", "/tmp", auth="login")
+        row = self.be.live_sessions()[sid]
+        self.assertEqual((row["authPickUnavailable"], row["authPickFell"]), ("login", ""), "the dormant twin agrees")
+
+    def test_a_key_pick_on_a_helperless_box_with_a_login_says_login(self):
+        self._no_helper()
+        self.be.login_ok = lambda: True
+        self.assertEqual(self._sess(3, auth="key").snapshot()["authPickFell"], "login")
+
+    def test_the_options_and_the_status_decide_the_same_way(self):
+        # the launch's side IS pick_fall's answer: one decision, two readers
+        self.be.login_ok = lambda: False
+        s = self._sess(4, auth="login")
+        self._options_kw(s)
+        self.assertTrue(s._launched_keyed)
+        self.assertEqual(self.be.pick_fall("login"), "key")
+
+    def test_the_webview_reads_the_carried_fall_on_both_surfaces(self):
+        src = (Path(HERE).parent / "ui" / "webview" / "render.ts").read_text()
+        self.assertIn("authPickFell?: string;", src)
+        self.assertIn("function authFellTo(st: Status): string", src)
+        self.assertIn("authFellTo(s.status)", src, "the tab hover")
+        self.assertIn("authFellTo(st)", src, "the Billing sub-line")
+
+
+class AccountReadStates(unittest.TestCase):
+    """~/.claude.json names a signed-in account ("ok"), names none ("none"), or cannot be read just now
+    ("unreadable": a stat error, or bytes that are not JSON during Claude Code's non-atomic rewrite). A failed
+    read is never cached against the mtime, and the backend's probe reads it as cannot-tell (None)."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self._home = os.environ.get("HOME")
+        os.environ["HOME"] = self.home
+        self._saved = dict(km._ACCT_CACHE)
+        km._ACCT_CACHE.update({"mtime": -1.0, "val": "", "label": "", "state": "none"})
+
+    def tearDown(self):
+        if self._home is not None:
+            os.environ["HOME"] = self._home
+        km._ACCT_CACHE.update(self._saved)
+
+    def _write(self, text, t):
+        p = Path(self.home, ".claude.json")
+        p.write_text(text)
+        os.utime(p, (t, t))                                           # a distinct mtime per write, whatever the clock does
+
+    def test_the_three_states_and_no_caching_of_a_failed_read(self):
+        self.assertEqual(km._claude_account_state(), "none", "no file")
+        self._write(json.dumps({"oauthAccount": {"accountUuid": "11111111-2222-3333-4444-555555555555",
+                                                 "emailAddress": "user@example.com"}}), 1_800_000_000)
+        self.assertEqual(km._claude_account_state(), "ok")
+        self.assertTrue(km._claude_account())
+        self.assertEqual(km._claude_account_label(), "user@example.com")
+        self._write('{"oauthAccount": {"accountUu', 1_800_000_001)    # mid-rewrite
+        self.assertEqual(km._claude_account_state(), "unreadable")
+        self.assertEqual((km._claude_account(), km._claude_account_label()), ("", ""))
+        self.assertEqual(km._ACCT_CACHE["mtime"], -1.0, "a failed read is not cached against the mtime: the next read retries")
+        self._write(json.dumps({"oauthAccount": {"accountUuid": "11111111-2222-3333-4444-555555555555"}}), 1_800_000_001)
+        self.assertEqual(km._claude_account_state(), "ok", "the same mtime, re-read: the rewrite completed")
+        self._write(json.dumps({}), 1_800_000_002)
+        self.assertEqual(km._claude_account_state(), "none", "a file with no account")
+
+    def test_the_backends_probe_is_tri_state(self):
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        self.assertIn('_sdk_backend.login_ok = lambda: (None if _claude_account_state() == "unreadable" else bool(_claude_account()))', src)
+
+    def test_the_picker_treats_unreadable_as_available_and_keeps_a_remembered_login_pick(self):
+        saved = (km._sdk, km._claude_account, km._claude_account_label, km._claude_account_state, km.jd._cred.helper_source)
+        p = km.jd.STATE / "sdk-defaults.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            km._sdk = lambda: type("B", (), {"key_available": True})()
+            km._claude_account = lambda: ""
+            km._claude_account_label = lambda: ""
+            km._claude_account_state = lambda: "unreadable"
+            km.jd._cred.helper_source = lambda: "user"
+            a = km._auth_avail()
+            self.assertTrue(a["login"], "cannot tell is not 'no login'")
+            self.assertNotIn("loginWhy", a)
+            p.write_text(json.dumps({"auth": "login"}))
+            self.assertEqual(km._auth_avail()["default"], "login", "a remembered login pick does not fall on a read failure")
+            km._claude_account_state = lambda: "none"
+            self.assertEqual(km._auth_avail()["default"], "key", "…and falls once the read says: no account")
+            self.assertEqual(km._auth_avail()["loginWhy"], km.jd._cred.WHY_NO_LOGIN)
+        finally:
+            (km._sdk, km._claude_account, km._claude_account_label, km._claude_account_state, km.jd._cred.helper_source) = saved
+            p.unlink(missing_ok=True)
+
+    def test_an_unreadable_settings_file_does_not_read_as_managed_in_the_picker(self):
+        saved = (km._sdk, km._claude_account, km._claude_account_label, km._claude_account_state, km.jd._cred.helper_source)
+        try:
+            km._sdk = lambda: type("B", (), {"key_available": False})()
+            km._claude_account = lambda: "aaaaaaaaaaaa"
+            km._claude_account_label = lambda: "user@example.com"
+            km._claude_account_state = lambda: "ok"
+
+            def boom():
+                raise km.jd._cred.CredentialError("Claude Code settings file is not valid JSON: x")
+            km.jd._cred.helper_source = boom
+            a = km._auth_avail()                                      # used to raise out of the picker's reply
+            self.assertTrue(a["login"])
+            self.assertNotIn("loginWhy", a)
+        finally:
+            (km._sdk, km._claude_account, km._claude_account_label, km._claude_account_state, km.jd._cred.helper_source) = saved
+
+
+class AvailabilityOncePerCycle(unittest.TestCase):
+    """build_session asks for the availability half per session per push; inside a pusher cycle it is computed
+    once (the cycle's _live_scope memo), outside one it is fresh (review 2026-09-09: each answer re-read
+    sdk-defaults.json and both operator settings files)."""
+
+    def test_one_compute_per_cycle_fresh_outside(self):
+        calls, real = [], km._auth_avail
+        km._auth_avail = lambda: (calls.append(1), {"login": True, "key": False, "acct": "", "default": "login",
+                                                    "keyWhy": km.jd._cred.WHY_NO_HELPER})[1]
+        try:
+            km._live_scope.auth = {}                                  # a cycle opens
+            a = km._auth_avail_status()
+            b = km._auth_avail_status()
+            self.assertEqual(len(calls), 1, "one compute for the cycle")
+            self.assertEqual(a, b)
+            self.assertEqual(a, {"login": True, "key": False, "keyWhy": km.jd._cred.WHY_NO_HELPER}, "the status half only")
+            a["login"] = False
+            self.assertTrue(km._auth_avail_status()["login"], "a caller's mutation does not leak into the memo")
+            km._live_scope.auth = None                                # the cycle closes
+            km._auth_avail_status()
+            km._auth_avail_status()
+            self.assertEqual(len(calls), 3, "outside a cycle: fresh every time")
+        finally:
+            km._auth_avail = real
+            km._live_scope.auth = None
+
+    def test_the_cycle_opens_and_closes_the_memo(self):
+        src = open(os.path.join(BIN, "romp-kernel")).read()
+        self.assertIn("_live_scope.auth = {}", src)
+        i = src.index("_live_scope.auth = {}")
+        self.assertIn("_live_scope.auth = None", src[i:], "reset in the cycle's finally")
+
+
 class FallbackBothWays(_Keyed):
     """The default and a remembered pick fall to the side that exists, in both directions."""
 
@@ -653,16 +884,17 @@ class Availability(unittest.TestCase):
 
     def setUp(self):
         self.real_sdk, self.real_acct, self.real_label = km._sdk, km._claude_account, km._claude_account_label
-        self.real_source = km.jd._cred.helper_source
+        self.real_state, self.real_source = km._claude_account_state, km.jd._cred.helper_source
 
     def tearDown(self):
         km._sdk, km._claude_account, km._claude_account_label = self.real_sdk, self.real_acct, self.real_label
-        km.jd._cred.helper_source = self.real_source
+        km._claude_account_state, km.jd._cred.helper_source = self.real_state, self.real_source
 
     def _world(self, key, acct, label="user@example.com", managed=False):
         km._sdk = lambda: type("B", (), {"key_available": bool(key)})()
         km._claude_account = lambda: acct
         km._claude_account_label = lambda: (label if acct else "")
+        km._claude_account_state = lambda: ("ok" if acct else "none")   # the box's account file, never the runner's
         km.jd._cred.helper_source = lambda: ("managed" if managed else ("user" if key else None))
 
     def test_a_managed_helper_removes_the_login_choice(self):
