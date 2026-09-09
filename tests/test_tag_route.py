@@ -1711,8 +1711,8 @@ class APeerShowsAFaultingHostsTagsAsStale(_ViewsFaultMixin, _TagRouteHarness):
         with _reads_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(km._apply_pending_tag_edits(self.peer), 0, "the 503: the kept reading decides nothing either")
             self.assertEqual(len(km._pending_tag_rows()), 1)
-            self.assertEqual(self._bytes(), before)
             self.assertIn("the tag store could not be read (read failed: [Errno 5]", self.peer["viewsFault"])
+        self.assertEqual(self._bytes(), before, "nothing was forwarded while the read faulted (read once it can be)")
         self.assertEqual(km._apply_pending_tag_edits(self.peer), 1, "the disk heals: the clean read confirms, and the delete lands")
         self.assertNotIn("viewsFault", self.peer)
         self.assertEqual(km._pending_tag_rows(), [], "retired once, on evidence")
