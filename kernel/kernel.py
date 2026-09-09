@@ -29143,7 +29143,9 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                             # record's origin stamp, then the notification's own <summary>. The chat renders a
                             # sourced event as a labelled notice card — "Background agent finished · <description>",
                             # "System notice", "From <session>" — never the blue bubble (render.ts renderInjected).
-                            src = em.injected_source(author, a.get("origin"), reminders)
+                            # …and the lifted preamble rides along: it is what names an UNSTAMPED scheduled firing,
+                            # which otherwise fell back to the unlabelled neutral note (review find, 2026-09-09, on #1099)
+                            src = em.injected_source(author, a.get("origin"), reminders, preamble)
                             if src:
                                 ev["source"] = src
                             if preamble:

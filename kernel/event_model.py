@@ -828,15 +828,22 @@ def author_of(blocks, prompt_source, postal_index, sdk_human=False, origin=None)
     above), so an UNMARKED "sdk" prompt here is the human → render it as the blue human bubble.
     Off (the default) elsewhere, where "sdk" means a genuine programmatic/autonomous injection."""
     okind = origin.get("kind") if isinstance(origin, dict) else None
-    if okind == "task-notification":
-        if origin.get("subkind") == "scheduled-trigger":
+    osub = origin.get("subkind") if isinstance(origin, dict) else None
+    # A peer STAMP is kind "peer" OR a task-notification whose subkind is "peer-send-message", the SDK's other
+    # task-channel subkind (claude_agent_sdk TaskNotificationOriginSubkind): a message sent from another of the
+    # user's sessions. Another session's words, classified exactly like kind "peer": never a background
+    # task's report, so it neither opens nor folds into a task turn, and the task channel's own preamble on
+    # its text cannot re-read it as one (review find, 2026-09-09, on #1099).
+    peer_stamp = okind == "peer" or (okind == "task-notification" and osub == "peer-send-message")
+    if okind == "task-notification" and not peer_stamp:
+        if osub == "scheduled-trigger":
             return "sdk"                          # a scheduled task's fired PROMPT: programmatic, but real work follows
         return "system"                           # a background task's completion → folds in, never a goal
     text = _text_of(blocks)
     if text:
-        if SYSTEM_WRAPPER_RE.match(text):         # a harness <task-notification> / <system-reminder> / its preamble
+        if SYSTEM_WRAPPER_RE.match(text) and not peer_stamp:   # a harness <task-notification> / <system-reminder> / its preamble
             return "system"                       # → author 'system' so _is_opener folds it in, never a goal
-        if SCHEDULED_PREAMBLE_RE.match(text):     # a scheduled task's fired prompt, unstamped → programmatic prompt
+        if SCHEDULED_PREAMBLE_RE.match(text) and not peer_stamp:   # a scheduled task's fired prompt, unstamped → programmatic prompt
             return "sdk"
         if TEAMMATE_MSG_RE.match(text):           # Claude Code's native agent-to-agent delivery, not the user typing
             return "teammate"                     # → its own collapsed chat card; a non-opener (like 'system'), so
@@ -859,9 +866,10 @@ def author_of(blocks, prompt_source, postal_index, sdk_human=False, origin=None)
             return "romp"
     if okind and okind != "human":
         # Stamped as injected, and no romp/postal marker claimed it above: a peer session's (or an
-        # in-process background subagent's) message → the teammate card; everything else the CLI
-        # injects (coordinator, channel, auto-continuation, observer…) → a programmatic prompt.
-        return "teammate" if okind == "peer" else "sdk"
+        # in-process background subagent's) message, by kind "peer" or the task channel's "peer-send-message"
+        # subkind → the teammate card; everything else the CLI injects (coordinator, channel,
+        # auto-continuation, observer…) → a programmatic prompt.
+        return "teammate" if peer_stamp else "sdk"
     if prompt_source == "sdk":
         return "human" if sdk_human else "sdk"
     if prompt_source == "system":
@@ -954,13 +962,18 @@ def strip_harness_preamble(text):
     return rest, pre
 
 
-def injected_source(author, origin, reminders=()):
+def injected_source(author, origin, reminders=(), preamble=""):
     """The SOURCE a harness-injected user-role record is shown under (the chat's notice head), or None for
     the human's own words. `kind`: "subagent" (a background agent came to rest — name = its description,
     the one the model itself sees in the notification's <summary>), "task" (a background command),
     "system" (a harness notice: a bare reminder, a scheduled task's firing, an automatic continuation…),
     "peer" (another session / the coordinating session / an MCP channel — postal has its own card and
     never reaches here). Pure: the kernel's chat build and its tests read it the same way.
+
+    preamble: the harness paragraph strip_harness_preamble lifted off the record's text, when there was
+    one. It is the fallback that names an UNSTAMPED scheduled firing (an older CLI, the live echo): the
+    stamped path labels it "Scheduled task", and the text path must not hand the same record back as an
+    unlabelled neutral note (review find, 2026-09-09, on #1099).
 
     The user asked whether the model can tell WHICH subagent a notification came from (2026-09-07): it
     can — the notification names the task id, the launching tool-use id and the agent's description in
@@ -969,6 +982,14 @@ def injected_source(author, origin, reminders=()):
         return None
     okind = (origin or {}).get("kind") if isinstance(origin, dict) else None
     sub = (origin or {}).get("subkind") if isinstance(origin, dict) else None
+    # kind "peer", or the task channel's "peer-send-message" subkind (a message from another of the user's
+    # sessions): the peer notice, never a finished background task, so the notification-naming loop below
+    # never runs for it either (review find, 2026-09-09, on #1099). Same rule as author_of's peer_stamp.
+    peer_stamp = okind == "peer" or (okind == "task-notification" and sub == "peer-send-message")
+    if peer_stamp:
+        # a "peer-send-message" stamp carries none of kind "peer"'s sender fields, so it reads "another session"
+        return {"kind": "peer", "name": origin.get("name") or origin.get("from") or "another session",
+                "subagent": bool(origin.get("senderTaskId"))}
     # The notification names its task only when the RECORD is the notification: a system-authored (or
     # author-less live) record, or one stamped task-notification. An unstamped programmatic prompt that
     # merely arrived with a notification attached keeps today's neutral note with the card nested under it.
@@ -989,9 +1010,6 @@ def injected_source(author, origin, reminders=()):
         if sub == "scheduled-trigger":
             return {"kind": "system", "label": "Scheduled task"}
         return {"kind": "task", "name": "background task", "status": ""}
-    if okind == "peer":
-        return {"kind": "peer", "name": origin.get("name") or origin.get("from") or "another session",
-                "subagent": bool(origin.get("senderTaskId"))}
     if okind == "coordinator":
         return {"kind": "peer", "name": "the coordinating session", "subagent": False}
     if okind == "channel":
@@ -1004,6 +1022,11 @@ def injected_source(author, origin, reminders=()):
         return {"kind": "system", "label": okind.replace("-", " ")}
     if author == "system":
         return {"kind": "system", "label": "System reminder"}   # a bare <system-reminder> record, unstamped
+    if preamble and SCHEDULED_PREAMBLE_RE.match(preamble):
+        # unstamped, but the lifted preamble itself says what fired the prompt: the same label the stamped
+        # path gives it, with the preamble kept on the event for the card's fold: nothing the text path
+        # labelled before becomes an unlabelled note (review find, 2026-09-09, on #1099)
+        return {"kind": "system", "label": "Scheduled task"}
     return None   # an unstamped 'sdk' prompt keeps today's neutral note; a teammate has its own card
 
 

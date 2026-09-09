@@ -286,7 +286,7 @@ from rather than re-scanning the text and landing on a different one.
 
 | value | author | shown as |
 |---|---|---|
-| `"task-notification"` | `system` (`sdk` when `subkind` is `scheduled-trigger`: a fired prompt opens a turn) | the background agent's / command's notice card, named from the notification's own `<summary>` |
+| `"task-notification"` | `system` (`sdk` when `subkind` is `scheduled-trigger`: a fired prompt opens a turn; `teammate` when `subkind` is `peer-send-message`: a message from another of the user's sessions on the task channel, never a finished task) | the background agent's / command's notice card, named from the notification's own `<summary>`; a scheduled firing is the "Scheduled task" system notice, which an UNSTAMPED firing keeps too by its lifted preamble; a `peer-send-message` is the peer notice ("From another session": that subkind carries no sender fields) |
 | `"peer"` | `teammate` | the teammate card, "from" the sender's `name` / `from`; a `senderTaskId` marks one of this session's background agents |
 | `"coordinator"`, `"channel"`, `"auto-continuation"`, `"observer"`, `"unclassified"`, anything newer | `sdk` | a system/peer notice card with the kind as its label |
 | `"human"` / *(absent)* | by `promptSource` and text, as before | the user's bubble |

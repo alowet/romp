@@ -9590,8 +9590,12 @@ function scrollToAnchor(uuid: string): boolean {
   // node's prompt IS the incoming message) — never an assistant turn. A peer opener
   // used to be refused here (.turn-postal-service isn't .turn-user) and fall through to the
   // time fallback; accepting postal lets it resolve BY ID instead (the user 2026-06-20).
+  // A harness-injected record's notice card (.turn-notice, renderInjected) is a user-role message too: a
+  // turn opened by a STAMPED prompt (a scheduled task's firing) renders as a sourced notice, not .turn-user,
+  // so a prompt-intent link into it was refused as the wrong kind (review find, 2026-09-09, on #1099).
   if (pendingAnchorIntent === "user"
-      && !target.classList.contains("turn-user") && !target.classList.contains("turn-postal-service")) {
+      && !target.classList.contains("turn-user") && !target.classList.contains("turn-postal-service")
+      && !target.classList.contains("turn-notice")) {
     pendingAnchor = null; pendingAnchorIntent = null; landTrail.push("pointer-wrong-kind"); return false;
   }
   pendingAnchor = null; pendingAnchorIntent = null;

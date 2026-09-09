@@ -31,7 +31,11 @@ test("agent + reminder notices are NESTED (bare card, no inner turn/dot) so they
   // the fix (the user 2026-07-06): these are appended INSIDE the carrying user turn, so a turn-in-a-turn drew
   // a 2nd rail + dot, indented another 24px → the card floated off the timeline. Nested = bare card.
   assert.match(NOTICE, /if \(o\.nested\) return card;/);
-  assert.match(RENDER, /variant: "agent", chip, head, body[\s\S]*?nested: true/);
+  // the agent card nests by DEFAULT (the carrying human turn's call passes no opts) and stands on its own rail
+  // only when renderInjected asks for it (nested: false): pinned on renderAgentNotif's own body, not the whole
+  // file, where a lazy span onto any later `nested: true` had made this line vacuous (review find, 2026-09-09, on #1099)
+  assert.match(AGENT, /opts: \{ nested\?: boolean; preamble\?: string \} = \{\}/, "nested unless told otherwise");
+  assert.match(AGENT, /noticeCard\(\{ variant: "agent", chip, head, body, key,\s+collapsible: hasBody, nested: opts\.nested !== false \}\)/);
   assert.match(RENDER, /variant: "reminder", chip: "system"[\s\S]*?nested: true/);
   assert.match(CSS, /\.notice-nested \{ margin-top: 8px; \}/);
   // the standalone (romp system) path still keeps its own rail dot
