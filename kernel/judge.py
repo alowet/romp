@@ -165,6 +165,7 @@ def _rebind_state(path):
     _STORE_FAULTS.clear()   # unreadable-store episodes belong to the old root's files
     _CHAIN_MEMO.clear()     # the write-moment chain memo keys on paths under STATESDIR; a new root is a new world
     _COURIER_SEEN.clear()   # the courier gate keys on the old root's files
+    _PLANNER_SEEN.clear()   # ...and the planner gate
     _BACKREF_MEMO["slot"] = None   # ...and so does the sender-board walk's map
     _CAPTIONS_MEMO.clear(); _GOALARCH_MEMO.clear()   # ...and the per-file read memos
     _episode_memo.clear()   # ...and so are the episode-log reads
@@ -2175,6 +2176,55 @@ _PARSE_CACHE = {}          # fsid -> (fileset_key, parsed_session)
 # anyway). A parse the cache does not hold (a stubbed one) is never keyed, so never skipped. Pruned to
 # the pass's fleet, so bounded by it; a rebound state root clears it.
 _COURIER_SEEN = {}         # fsid -> the scan key of its last pass that found nothing to place
+
+# ── the planner's change gate (2026-09-09) ──
+# _plan_session re-derived every session's segmentation, plan units and placement normalization on every
+# planner pass; on the maintainer's box the planner worker pool was 37% of the process's samples. A
+# session whose inputs have not moved since a pass that placed nothing, collected no unit and left its
+# store where it was has no new information for the planner by construction, so the pass returns at once.
+# The key is every input the pass reads, taken BEFORE the store read (the chain-memo rule): the parse
+# cache's fileset key bound to the session object, the store file's key with its journal's and archive's,
+# the episode log's key, the session's task-store files (each name with its key: the declared-plan sync
+# reads them), the reg file's key, and the transcript path. Recorded only when the pass did nothing and the
+# store's key after the pass equals the one before it (a heal, a mint, a retirement or a rollup change
+# moves it); a pass with units, placements or a moved store is planned again next pass whatever the key
+# says. A parse the cache does not hold is never keyed. Pruned to the pass's fleet; a rebound root clears.
+_PLANNER_SEEN = {}         # fsid -> the plan key of its last pass that had nothing to do
+_PLANNER_STATS = {"skipped": 0, "planned": 0, "recorded": 0}
+
+
+def planner_skip_stats():
+    """A copy of the planner gate's counters for /perf (memos.plannerSkip)."""
+    return dict(_PLANNER_STATS)
+
+
+def _task_store_key(fsid):
+    """The session's Claude task store (<config>/tasks/<fsid>/*.json, what em.task_store_plan reads) as a key:
+    each file's name with its stat, or None when the directory is absent; a listing error is a fresh sentinel
+    (never equal), so a store that cannot be read is never skipped over."""
+    d = Path(os.environ.get("CLAUDE_CONFIG_DIR") or str(em.HOME / ".claude")) / "tasks" / fsid
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return object()
+    return tuple((n, _file_key(str(d / n))) for n in names)
+
+
+def _plan_key(fsid, path, session):
+    """Every input _plan_session reads, or None when the parse is not the cache's own (never skip what cannot
+    be keyed). Taken before the store read."""
+    pk = _PARSE_CACHE.get(fsid)
+    if pk is None or pk[1] is not session:
+        return None
+    return (str(path), pk[0], _store_key(fsid), _file_key(str(EPIDIR / (fsid + ".jsonl"))),
+            _task_store_key(fsid), _file_key(str(SDKDIR / (fsid + ".json"))))
+
+
+def _store_key(fsid):
+    """The goal store's three inputs as one key: the store file, its override journal, its archive."""
+    return (_file_key(str(GOALDIR / (fsid + ".json"))), _journal_key(fsid), _archive_key(fsid))
 _COURIER_STATS = {"skipped": 0, "scanned": 0, "recorded": 0}
 
 
@@ -8909,6 +8959,11 @@ def _plan_session(fsid, path, now):
     re-examinable — until the courier plants a real goal). Returns placements made."""
     _judge_ctx.fsid = fsid                            # usage logging: attribute this session's judge calls
     session = parsed_session(fsid, [path], now)
+    pkey = _plan_key(fsid, path, session)             # BEFORE the store read (the chain-memo rule)
+    if pkey is not None and _PLANNER_SEEN.get(fsid) == pkey:
+        _PLANNER_STATS["skipped"] += 1               # nothing moved since a pass that had nothing to do
+        return 0
+    _PLANNER_STATS["planned"] += 1
     store = load_goals(fsid)
     if _heal_quote_titles(store) + _heal_floor_titles(fsid, store) \
             + _heal_ticket_titles(store):              # + ticket-led titles (T146, the live-failure heal)
@@ -9387,6 +9442,12 @@ def _plan_session(fsid, path, now):
     #                                                   by the save just below
     rollup_status(store, _session_settled(fsid, path, session, store))
     save_goals(fsid, store)
+    if pkey is not None:
+        if placed == 0 and not units and not retired and _store_key(fsid) == pkey[2]:
+            _PLANNER_SEEN[fsid] = pkey               # nothing to do and nothing written: skipped until an input moves
+            _PLANNER_STATS["recorded"] += 1
+        else:
+            _PLANNER_SEEN.pop(fsid, None)            # work done or the store moved: planned again next pass
     return placed
 
 
@@ -9410,6 +9471,8 @@ def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=Fal
     if now is None:
         now = int(time.time())
     fleet = [s for s in discover(now) if not _hidden_from_feed(s[0])][:sessions_cap]   # muted sessions are out of task tracking
+    for _gone in [f for f in _PLANNER_SEEN if f not in {s[0] for s in fleet}]:
+        _PLANNER_SEEN.pop(_gone, None)                # the planner gate, bounded by the pass's fleet
     placed = 0
     with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_plan_session, fsid, str(path), now): fsid for fsid, path, anchor, name in fleet}
