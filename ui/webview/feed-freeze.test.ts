@@ -166,7 +166,8 @@ test("badges wear the header conventions: accent adds, block-red removes, the co
   // painted on the build-once column heads and the data-fsid-stamped session headers; cleared when quiet
   assert.match(FEED, /put\(document\.querySelector\("\.feed-col\.col-" \+ key \+ " \.feed-col-head"\), d\.cols\[key\]\);/);
   assert.match(FEED, /h\.setAttribute\("data-fsid", e\.sid\);/);
-  assert.match(FEED, /put\(h, groupedNow \? d\.sess\[h\.getAttribute\("data-fsid"\) \|\| ""\] : undefined\);/);
+  assert.match(FEED, /const c = groupedNow \? d\.sess\[sid\] : undefined;\s*if \(sid !== hoveredSid\) \{ put\(h, c\); return; \}/,
+    "every header but the hovered one carries its in-row badge (the hovered one's floats — T285)");
   assert.match(FEED, /document\.querySelectorAll\("\.freeze-badge"\)\.forEach\(\(n\) => n\.remove\(\)\);/,
     "nothing pending → every badge comes off");
   // local renders while frozen re-sync the hints, so a rebuilt board never strands a stale count
@@ -195,7 +196,14 @@ test("a session header row holds the same gate a card holds: a push while it is 
   const heal = FEED.slice(FEED.indexOf("// Stale-freeze heal (hover-freeze)"), FEED.indexOf("paintFreezeBadges();   // hover-freeze: local renders"));
   assert.match(heal, /querySelector<HTMLElement>\("\.feed-cols \.fitem:hover, \.feed-sess-head:hover"\)/, "a hovered header keeps the freeze live across a local render");
   assert.match(heal, /hov\.classList\.contains\("feed-sess-head"\) \? sessFreezeKey\(hov\) : kbHoverId\(hov\)/);
-  // the badge painter already hints the deferred churn beside each header — the same pending indicator
-  assert.match(FEED, /document\.querySelectorAll<HTMLElement>\("\.feed-sess-head"\)\.forEach\(\(h\) => \{\s*put\(h, groupedNow \? d\.sess\[h\.getAttribute\("data-fsid"\) \|\| ""\] : undefined\);/);
+  // the same pending indicator beside each header — but NEVER inside the hovered row (review find): an in-row
+  // badge lands after the auto-margin Clear all and slides it out from under the pointer, the very click loss
+  // this hold prevents. The hovered header's badge floats: body-mounted, pointer-inert, its row's rect untouched.
+  const paint = FEED.slice(FEED.indexOf("function paintFreezeBadges(): void {"), FEED.indexOf("// ── CARD KEYBOARD SCOPE"));
+  assert.match(paint, /const hoveredSid = freezeKey && freezeKey\.startsWith\("h:"\) \? freezeKey\.slice\(2\) : null;/);
+  assert.match(paint, /if \(sid !== hoveredSid\) \{ put\(h, c\); return; \}\s*put\(h, undefined\);/, "every other header keeps its in-row badge; the hovered one carries none");
+  assert.match(paint, /headNote\.id = "freeze-headnote"; document\.body\.appendChild\(headNote\);/, "…its hint is body-mounted");
+  assert.match(paint, /headNote\.style\.top = Math\.round\(r\.bottom \+ 2\) \+ "px";/, "…placed just under the row, right-aligned");
+  assert.match(CSS, /#freeze-headnote \{ position: fixed; z-index: 6; pointer-events: none;/, "pointer-inert, like the card's self-note");
 });
 

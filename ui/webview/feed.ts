@@ -5342,7 +5342,7 @@ function pendingSelfChanged(key: string): boolean {
 }
 function paintFreezeBadges(): void {
   if (!pendingFeedPayload) {
-    document.querySelectorAll(".freeze-badge").forEach((n) => n.remove());
+    document.querySelectorAll(".freeze-badge").forEach((n) => n.remove());   // the floating header note is one too
     document.getElementById("freeze-selfnote")?.remove();
     return;
   }
@@ -5359,9 +5359,27 @@ function paintFreezeBadges(): void {
     put(document.querySelector(".feed-col.col-" + key + " .feed-col-head"), d.cols[key]);
   }
   const groupedNow = feedPrefs().grouped;
+  // The HOVERED header row must not change shape (T285 review): a badge appended inside it lands after the
+  // auto-margin Clear all and slides that button out from under the pointer — the click loss the header
+  // hold exists to prevent, caused by the hold's own hint. That row's badge floats instead: body-mounted,
+  // pointer-inert, right-aligned just under the row (the self-note idiom), so the row's rect stands.
+  const hoveredSid = freezeKey && freezeKey.startsWith("h:") ? freezeKey.slice(2) : null;
+  let headNote = document.getElementById("freeze-headnote") as HTMLElement | null;
+  let floated = false;
   document.querySelectorAll<HTMLElement>(".feed-sess-head").forEach((h) => {
-    put(h, groupedNow ? d.sess[h.getAttribute("data-fsid") || ""] : undefined);
+    const sid = h.getAttribute("data-fsid") || "";
+    const c = groupedNow ? d.sess[sid] : undefined;
+    if (sid !== hoveredSid) { put(h, c); return; }
+    put(h, undefined);                                   // never inside the hovered row
+    if (!c || (!c.add && !c.del)) return;
+    if (!headNote) { headNote = el("div", "freeze-badge"); headNote.id = "freeze-headnote"; document.body.appendChild(headNote); }
+    paintFreezeParts(headNote, c);
+    const r = h.getBoundingClientRect();
+    headNote.style.top = Math.round(r.bottom + 2) + "px";
+    headNote.style.right = Math.max(0, Math.round(window.innerWidth - r.right)) + "px";
+    floated = true;
   });
+  if (!floated) headNote?.remove();
   // the hovered/keyed card's OWN pending update — its own line, independent of the churn badges
   // (both show when both are true). Body-mounted and pointer-inert: it must never affect hover,
   // and the frozen card's rect is stable by construction (that is the freeze's whole contract).
