@@ -1103,33 +1103,18 @@ class CodexBackend:
                 # verification — the r28 kernel-layer reorder missed this layer)
                 s.name = old_name
                 raise
-            nf = self.state / "names" / s.sid
-            try:
-                old_line = nf.read_bytes()
-            except OSError:
-                old_line = None
             try:
                 self._write_name(s)       # keep the shared identity file in sync (colours preserved)
             except BaseException:
                 s.name = old_name         # compensate: the registry write above is re-run with
                 #                           the old name so the stores stay agreed; the raise
                 #                           still reaches the caller (loud)
-                if old_line is not None:
-                    try:
-                        nf.write_bytes(old_line)   # write_text TRUNCATES before it fails — an
-                        #                            ENOSPC left the identity file (and its
-                        #                            colours) empty (the r29 verification)
-                    except OSError as e2:
-                        self.log("codex rename: names/%s left truncated by a failed write (%s)"
-                                 % (s.sid, e2))
-                else:
-                    try:
-                        nf.unlink(missing_ok=True)  # _write_name may have CREATED a partial file
-                        #                             holding the NEW name — a failed rename must
-                        #                             not stay published (the r30 verification)
-                    except OSError as e2:
-                        self.log("codex rename: a partial names/%s could not be removed (%s)"
-                                 % (s.sid, e2))
+                # No restore write for the names file: _write_name is tmp + os.replace and removes
+                # its own temp (the r32 shape), so a raise leaves names/<sid> exactly as it was — and
+                # creates nothing when there was no file. The in-place nf.write_bytes the r29/r30
+                # branches carried predates that: it was the one non-atomic write on this path, an
+                # mtime bump for no content change, and under the very ENOSPC it existed for it
+                # truncated a good file to nothing, then blamed "a failed write" (review, 2026-09-08).
                 try:
                     self._save_registry(s, fields=("name",))
                 except Exception as e2:

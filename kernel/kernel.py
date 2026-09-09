@@ -11671,6 +11671,14 @@ def _claim_session_name(nm, kind, sid="", own=""):
     return refusal
 
 
+class _RenameOutcome(Exception):
+    """A backend's rename that ended in a state needing its OWN words to the asker: both doors speak the
+    text verbatim (a WS warn, the route's error), where any other raise is rendered as "the rename did
+    not take — <errno>". Raised by _rename_session when tmux renamed the session but the name on file
+    could not follow: neither "renamed" (every surface reads the file) nor "did not take" (tmux did) is
+    true, so the asker hears exactly what happened and what they will see."""
+
+
 def _rename_claimed(be, sid, nm):
     """The rename door's one act, shared by POST /rename and the WS renameSession op (not _rename_session:
     that name is the tmux backend's own rename helper further down) — `nm` already
@@ -11679,8 +11687,13 @@ def _rename_claimed(be, sid, nm):
     other name is claimed (kind rename) and verified against a live snapshot taken under the claim,
     outside the claims lock; be.rename runs under the claim — it rewrites the reg and the names/ entry,
     so the next snapshot answers the new name — and the claim is released either way. Returns
-    (ok, refusal): a non-empty refusal names a taken or in-flight name; ok False with no refusal is the
-    backend declining (a sid it does not know), which the doors already report."""
+    (ok, refusal): a non-empty refusal names a taken or in-flight name, or what a backend that RAISED
+    said — a _RenameOutcome verbatim; any other exception (a names-file write that failed: ENOSPC,
+    EROFS, a permission fault — the backends compensate and re-raise so the asker hears it) as "the
+    rename did not take" with the errno, the same words for every backend. Left to escape, the WS
+    arm's exception reached the receive loop's catch-all, which logged it and told the client nothing,
+    and the route answered a 500 traceback. ok False with no refusal is the backend declining (a sid it
+    does not know, or a names entry that does not exist), which the doors already report."""
     if _name_of(sid) == nm:
         return True, ""
     refusal = _claim_session_name(nm, "rename", sid)
@@ -11688,6 +11701,12 @@ def _rename_claimed(be, sid, nm):
         return False, refusal
     try:
         return bool(be and be.rename(sid, nm)), ""
+    except _RenameOutcome as e:
+        return False, str(e)                             # logged where it was raised, with the cause
+    except Exception as e:
+        sys.stderr.write("rename %s → '%s': %s\n" % (sid[:8], nm, traceback.format_exc()))
+        return False, "the rename did not take — %s" % (_errno_text(e) if isinstance(e, OSError)
+                                                        else (str(e) or type(e).__name__))
     finally:
         _release_name(nm)
 
@@ -15516,11 +15535,14 @@ class TmuxBackend(sb.SessionBackend):
 
     def rename_by_name(self, old, new, t=5):
         """True when tmux took the rename — _rename_session publishes the names/ entry on that answer
-        alone, so a name tmux refused is never published (fail loudly, 2026-09-08)."""
+        alone, so a name tmux refused is never published (fail loudly, 2026-09-08). Through _tmux_argv
+        like every other primitive here: as a bare argv it went to the DEFAULT tmux server, so with a
+        per-kernel socket (ROMP_TMUX_SOCKET) a live rename asked a server that had never heard of the
+        session — tmux refused, the rename did not take, and nothing said why."""
         if not self.available():          # no tmux → nothing to rename; stay inert like every primitive above
             return False
         try:
-            r = subprocess.run(["tmux", "rename-session", "-t", old, new], timeout=t,
+            r = subprocess.run(self._tmux_argv(["rename-session", "-t", old, new]), timeout=t,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return getattr(r, "returncode", 1) == 0
         except Exception:
@@ -15714,7 +15736,9 @@ class TmuxBackend(sb.SessionBackend):
         return True
 
     def rename(self, sid, new_name):
-        return _rename_session(str(sid), new_name) is not None   # live → tmux rename hook; dead → names file
+        # live → tmux rename + names file; dead → names file. False (None below) only when there is no
+        # names entry to rewrite; a names-file FAULT raises through, so the door says the errno
+        return _rename_session(str(sid), new_name) is not None
 
     def move(self, sid, cwd):
         # No relocation primitive exists for a TUI session: /cd is interactive and romp would have to
@@ -16119,14 +16143,17 @@ def _tmux_name_of(sid):
 
 def _set_name(sid, name):
     """Rewrite a session's names-registry DISPLAY name (1st tab field), preserving its dir + identity
-    color. Used for a DEAD (read-only) tab, which has no tmux session for the rename hook to sync."""
-    try:
-        parts = (NAMES / sid).read_text().rstrip("\n").split("\t")
-    except Exception:
-        return
+    color. Used for a DEAD (read-only) tab, which has no tmux session for the rename hook to sync, and
+    right after a LIVE tmux rename (so the live snapshot answers the new name before the claim frees).
+    Returns True once the file is published; a names/ entry that cannot be read (absent, or not text)
+    or a publish that fails RAISES, the way _atomic_write already does — the old silent `return` on an
+    unreadable entry, and the unchecked write, let _rename_session answer the accepted name over a
+    file it never rewrote, and the doors told the user "renamed" (fail loudly, 2026-09-08)."""
+    parts = (NAMES / sid).read_text().rstrip("\n").split("\t")
     parts += [""] * (4 - len(parts))
     parts[0] = name
     _atomic_write(NAMES / sid, "\t".join(parts[:4]) + "\n")   # atomic publish
+    return True
 
 
 def _rename_session(sid, name):
@@ -16138,9 +16165,18 @@ def _rename_session(sid, name):
     release and the hook's write the live snapshot still lacked the new name, so a second claimant
     could create a session under it. The hook's later write is idempotent. A rename tmux refused is
     reported (None) and publishes nothing, where it used to read as renamed. A DEAD (read-only) tab
-    has no tmux session, so only the names file is written. The names-file change is what
-    _producer_sig watches, so the new name re-pushes to every surface. Returns the accepted name, or
-    None if rejected (bad chars, or tmux declined). Split out so it's unit-testable. (the user 2026-06-16)"""
+    has no tmux session, so only the names file is written — a names file that could not be rewritten
+    (ENOSPC, EROFS, a permission fault) RAISES through the backend, so the doors say the errno, the
+    same words the SDK backend's failure gets — a dead Codex tab's registry/names fault included; only
+    an entry that does not exist (or a Codex row the backend no longer knows) is reported as None
+    (nothing known to rename — the doors' "is that session known" question is then the right one).
+    Both used to read as renamed with nothing written. When tmux DID rename but the names file could
+    not follow, every surface still reads the old name, so neither "renamed" nor "did not take" is
+    true: a _RenameOutcome tells the asker exactly that, with the cause, and the log claims the
+    after-rename hook's later rewrite only when there is an entry for it to rewrite (bin/romp's hook
+    returns early on an absent one). The names-file change is what _producer_sig watches, so the new
+    name re-pushes to every surface. Returns the accepted name, or None if rejected (bad chars, tmux
+    declined, or no entry to rewrite). Split out so it's unit-testable. (the user 2026-06-16)"""
     name = (name or "").strip()
     if not NAME_RE.match(name):
         return None
@@ -16148,16 +16184,37 @@ def _rename_session(sid, name):
     if live:
         if live != name and not _TMUX.rename_by_name(live, name):
             return None                                # tmux declined: nothing renamed, nothing published
-        _set_name(sid, name)                           # publish now — the live snapshot answers before the claim frees
+        try:
+            _set_name(sid, name)                       # publish now — the live snapshot answers before the claim frees
+        except Exception as e:
+            why = _errno_text(e) if isinstance(e, OSError) else (str(e) or type(e).__name__)
+            absent = isinstance(e, FileNotFoundError)    # no entry: nothing for the hook to rewrite, no old name on file
+            sys.stderr.write("rename '%s' → '%s': tmux renamed the session but names/%s could not be rewritten "
+                             "(%s)%s\n" % (live, name, sid, why,
+                                           "; there is no entry for the after-rename hook to rewrite either"
+                                           if absent else "; the after-rename hook rewrites it later"))
+            raise _RenameOutcome(("the terminal session was renamed, but there is no name on file for it here "
+                                  "to update (%s)" if absent else
+                                  "the terminal session was renamed, but its name on file could not be updated "
+                                  "(%s) — it keeps its old name here until that write lands") % why) from e
     else:
         cx = _codex()
         if cx is not None and cx._session(sid) is not None:
-            try:
-                cx.rename(sid, name)                   # the Codex registry's durable name (docs/codex.md)
-            except Exception as e:
-                sys.stderr.write("codex rename '%s': %s\n" % (sid, e))
+            # a DEAD Codex tab (owns() is False, so the doors route it here): the Codex registry's durable
+            # name first (docs/codex.md), so a revive wears the new name. A FAULT — its registry save or
+            # its names write; the backend compensates and re-raises — propagates like every other
+            # backend's, so the asker hears the errno; the old catch mapped it to None and so to "is that
+            # session known", a false cause. False is the one "nothing to rename" answer: the row was
+            # there a moment ago and the backend no longer knows it.
+            if not cx.rename(sid, name):
+                sys.stderr.write("codex rename '%s': the Codex backend no longer knows %s — nothing renamed\n"
+                                 % (name, sid))
                 return None
-        _set_name(sid, name)                           # dead tab → names file directly
+        try:
+            _set_name(sid, name)                       # dead tab → names file directly; a FAULT raises through
+        except FileNotFoundError:
+            sys.stderr.write("rename '%s': no names/%s entry to rewrite — nothing renamed\n" % (name, sid))
+            return None                                # nothing known to rename: the doors ask if the session is known
     return name
 
 
