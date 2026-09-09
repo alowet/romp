@@ -14321,13 +14321,9 @@ def _courier_link_wanted(store, seg_id, mid):
     """Read-only: (top, peer_sid, peer_gid) when `mid`'s courier link is missing from the store and has a
     placed top to attach to, else None. The idempotency half of _attach_courier_link, split out so the
     scan can ask it of the shared view."""
+    if _courier_link_present(store, mid):
+        return None
     nodes = store.get("nodes", {})
-    for nd in nodes.values():
-        o = nd.get("origin")
-        if isinstance(o, dict) and o.get("msgId") == mid:
-            return None
-        if any(isinstance(l, dict) and l.get("msgId") == mid for l in (nd.get("links") or [])):
-            return None
     tgt = store.get("placements", {}).get(seg_id)
     if not tgt or tgt not in nodes:
         return None
@@ -14336,6 +14332,19 @@ def _courier_link_wanted(store, seg_id, mid):
     if not (peer_sid and peer_gid):
         return None
     return (top, peer_sid, peer_gid)
+
+
+def _courier_link_present(store, mid):
+    """Read-only: does the store already carry `mid` anywhere, as a node's origin or a link? The scan's
+    change gate keeps a session unrecorded while a placed delegate lacks its link: the repair's other input
+    is the SENDER's store (_handoff_backref), outside the session's own key."""
+    for nd in store.get("nodes", {}).values():
+        o = nd.get("origin")
+        if isinstance(o, dict) and o.get("msgId") == mid:
+            return True
+        if any(isinstance(l, dict) and l.get("msgId") == mid for l in (nd.get("links") or [])):
+            return True
+    return False
 
 
 def _serving_dispatch(session, store, fsid, upto_seg_id):
@@ -15066,7 +15075,7 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=
         closed[fsid] = _session_settled(fsid, str(path), session, cstore)
         placed_ids = cstore["placements"]
         floor = episode_floor(fsid)
-        n_pending0 = len(pending)
+        n_pending0, repair_open = len(pending), False
         for turn in session["turns"]:
             for seg in _segs(turn, cstore):
                 if seg["id"] in placed_ids:
@@ -15079,9 +15088,12 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=
                     try:
                         pm0 = _seg_peer(seg)
                         if (pm0 and pm0[0] and pm0[1] and _seg_peer_kind(seg) == "delegate"
-                                and _courier_link_wanted(cstore, seg["id"], pm0[1]) is not None):
-                            _attach_courier_link(load_goals(fsid), seg["id"], pm0[1])   # a writer: its own load,
-                            #                                                              only when the view says the link is missing
+                                and not _courier_link_present(cstore, pm0[1])):
+                            repair_open = True     # the link is missing; whether it can attach depends on the
+                            #                        SENDER's store (_handoff_backref), outside this session's key,
+                            #                        so the session is scanned again next pass, as before
+                            if _courier_link_wanted(cstore, seg["id"], pm0[1]) is not None:
+                                _attach_courier_link(load_goals(fsid), seg["id"], pm0[1])   # a writer: its own load
                     except Exception as e:             # bookkeeping, but its failure is not nothing (T111)
                         _log_judge_error("courier", fsid, "pass-crash", note="link-attach: %r" % e)
                     continue
@@ -15104,8 +15116,8 @@ def run_courier(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=
                 pending.append((seg["t"], fsid, seg["id"], _unit_text(seg["atoms"]), pm[1], pm[0],
                                 _seg_peer_kind(seg), _seg_anchor(seg), str(path)))
         if skey is not None:
-            if len(pending) == n_pending0:
-                _COURIER_SEEN[fsid] = skey             # nothing to place: the next pass skips it until an input moves
+            if len(pending) == n_pending0 and not repair_open:
+                _COURIER_SEEN[fsid] = skey             # nothing to place, no link to repair: skipped until an input moves
                 _COURIER_STATS["recorded"] += 1
             else:
                 _COURIER_SEEN.pop(fsid, None)          # rows to place: scanned again next pass whatever the key says

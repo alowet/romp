@@ -241,6 +241,52 @@ class CourierSkip(_World):
         self.assertEqual(gated, ungated, "the same placements and planted nodes either way")
         self.assertEqual(len(gated[B][1]), 2, "B's second delegate planted")
 
+    def test_a_placed_delegate_without_its_link_keeps_the_session_scanned_until_the_repair_lands(self):
+        # PLANNER-FIRST PLACEMENT: A's delegate segment sits under a plain top with no courier link, and no
+        # sender tracks the message yet. The repair's other input is the SENDER's store (_handoff_backref),
+        # outside A's key, so A is never recorded while the link is missing; once the sender's tracking node
+        # exists, the next pass attaches the link through a writer load, and only then does A settle.
+        path = self.proj_dir / (A + ".jsonl")
+        mid_a = self.recs[A][0]["message"]["content"].split("romp-msg-id: ")[1].split(" ")[0]
+        session = jd.parsed_session(A, [str(path)], T0 + 200)
+        fresh = jd.load_goals(A)
+        seg = next(sg for tn in session["turns"] for sg in jd._segs(tn, fresh) if (jd._seg_peer(sg) or ("",))[0])
+        top = {"id": A + ":g1", "text": "Look after the subnet", "parentId": None, "nodeComplete": False,
+               "blocked": False, "cleared": False, "trail": [], "t": T0}
+        jd.GOALDIR.mkdir(parents=True, exist_ok=True)
+        (jd.GOALDIR / (A + ".json")).write_text(json.dumps(
+            {"rompUuid": A, "seq": 1, "lastNode": top["id"], "closedTurns": [], "nodes": {top["id"]: top},
+             "placements": {seg["id"]: top["id"]}, "status": {top["id"]: "working"}}))
+        self._reset_memos()
+        self.run_pass()                                   # B and C place; A has nothing pending but an open repair
+        self.assertEqual(self.run_pass(), (3, 0, 2), "B and C recorded; A stays scanned: its link is missing")
+        self.assertEqual(self.run_pass(), (1, 2, 0), "A alone, every pass, while no sender tracks the message")
+        self.assertNotIn("links", jd.load_goals(A)["nodes"][top["id"]])
+        # the sender's tracking node appears (a names entry and a transcript make the sender discoverable, the way
+        # _handoff_backref finds sender boards; its store carries the handoff)
+        (jd.NAMES / SENDER).write_text("sender\t%s\t#abcdef\n" % str(Path(self.td.name) / "launchdir"))
+        (self.proj_dir / (SENDER + ".jsonl")).write_text(json.dumps(uline(T0 - 100, "hand the subnet check to worker0", "s1"))
+                                                         + "\n" + json.dumps(aline(T0 - 90, "Delegated.", "s2", "s1")) + "\n")
+        snd = jd.load_goals(SENDER)
+        snd["nodes"][SENDER + ":g1"] = {"id": SENDER + ":g1", "text": "delegated to worker0", "parentId": None,
+                                        "nodeComplete": False, "blocked": False, "cleared": False, "trail": [],
+                                        "t": T0, "handoff": {"peer": A, "msgId": mid_a}}
+        snd["status"][SENDER + ":g1"] = "working"
+        jd.save_goals(SENDER, snd)
+        private, o_load = [], jd.load_goals
+        jd.load_goals = lambda fsid: (private.append(fsid), o_load(fsid))[1]
+        try:
+            self.assertEqual(self.run_pass(), (2, 2, 1), "A and the now-discoverable sender scanned, B and C skipped; "
+                                                         "the sender records, A does not yet (its store just moved)")
+        finally:
+            jd.load_goals = o_load
+        self.assertIn(A, private, "the repair took a writer load for A")
+        links = jd.load_goals(A)["nodes"][top["id"]].get("links") or []
+        self.assertEqual([l.get("msgId") for l in links], [mid_a], "the link attached")
+        self.assertEqual(self.run_pass(), (1, 3, 1), "A's store moved with the link: scanned once more and recorded; "
+                                                     "B, C and the sender skipped")
+        self.assertEqual(self.run_pass(), (0, 4, 0), "and now every session is settled")
+
     def test_a_parse_the_cache_does_not_hold_is_never_skipped(self):
         real = jd.parsed_session
         jd.parsed_session = lambda fsid, paths, now: dict(real(fsid, paths, now))   # a copy: not the cache's object
