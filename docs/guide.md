@@ -502,7 +502,10 @@ internet and your agents, with no device check in front of it.
 #### Notifications on your phone
 
 Romp can buzz your phone when a session needs you or finishes a task, so you can
-put the phone down while the sessions work. On an iPhone, first add Romp to the
+put the phone down while the sessions work. Every notification is titled with
+the session's name: **Romp needs you: web** when that session is waiting on you,
+and **Romp: web** for anything else (a task finished, a turn ended); the line
+under it says what happened. On an iPhone, first add Romp to the
 Home Screen (share sheet, then **Add to Home Screen**) and open it from there:
 iOS only lets an installed app receive notifications, so in a plain Safari tab
 the option stays off and says so. On Android and on a desktop browser the page
