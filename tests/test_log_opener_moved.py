@@ -44,13 +44,29 @@ class SourcePins(unittest.TestCase):
         self.assertIn("window.__rompOpenErrs=open;", km._LANDING_ERRS_JS)
 
     def test_the_gear_button_is_the_last_row_of_updates_and_debug_and_opens_the_shell_panel(self):
-        self.assertIn("<button id=rs-log-open class=ra-openbtn hidden>Open log</button>", GEAR, "the same button chrome as Token usage analytics")
+        self.assertIn("<button id=rs-log-open class=ra-openbtn hidden>Open log<span class=rs-log-n hidden></span></button>", GEAR, "the same button chrome as Token usage analytics")
         self.assertLess(GEAR.index("id=ra-open"), GEAR.index("id=rs-log-open"))
         self.assertLess(GEAR.index("id=rs-log-open"), GEAR.index("id=rsver"), "the section's last row, before the version block")
         self.assertIn("lg.onclick = function () { closeSettings(); try { window.parent.postMessage({ romp: 'openLog' }, '*'); }", GEAR,
                       "the modal closes first, then asks the shell (the panels never stack)")
         self.assertIn("lg.hidden = !web;", GEAR, "web shell only: VS Code's parent has no Log panel")
         self.assertIn("if(m.romp==='openLog'&&window.__rompOpenErrs)window.__rompOpenErrs();", km._LANDING_SETTINGS_JS)
+
+    def test_the_unread_count_rides_the_open_log_button(self):
+        # the bar's opener drew the unread count; with it gone the count travels to the gear's button (the manager's
+        # review nit, 2026-09-09): the shell posts it on every repaint and on the panel's query, the button renders
+        # "Open log · N" with the count in the triangle's red
+        k = open(os.path.join(ROOT, "kernel", "kernel.py"), encoding="utf-8").read()
+        g = open(os.path.join(ROOT, "ui", "webview", "gear.js"), encoding="utf-8").read()
+        css = open(os.path.join(ROOT, "ui", "webview", "gear.css"), encoding="utf-8").read()
+        self.assertIn("tell(n);if(!back.hidden)renderList();}", k, "paint() tells the feed pane")
+        self.assertIn("postMessage({romp:'logUnseen',n:(n===undefined?unseen():n)},'*')", k)
+        self.assertIn("if(m&&m.romp==='logUnseenQuery')tell();", k, "…and answers the panel's query")
+        self.assertIn("<button id=rs-log-open class=ra-openbtn hidden>Open log<span class=rs-log-n hidden></span></button>", g)
+        self.assertIn("if (m && m.romp === 'logUnseen') window.__rompSetLogCount(m.n);", g)
+        self.assertIn("lgn.textContent = n <= 0 ? '' : ' \\u00b7 ' + (n > 9 ? '9+' : String(n));", g)
+        self.assertIn("window.parent.postMessage({ romp: 'logUnseenQuery' }, '*');", g, "the panel asks when it opens")
+        self.assertIn(".rs-log-n { color: #ff6b6b; font-weight: 600; }", css, "the triangle's red, a status colour")
 
     def test_the_other_openers_are_unchanged(self):
         self.assertIn('registerCommand({ id: "log.open", title: "Open the log", run: () => { if (w.__rompOpenErrs) w.__rompOpenErrs(); } });', PALETTE)

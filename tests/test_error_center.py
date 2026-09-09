@@ -145,7 +145,8 @@ const jumpRow = EL['rerr-list'].children[0];
 out.jump = { linky: jumpRow.className.indexOf('link') >= 0 };
 jumpRow.fire('click');
 out.jump.closed = EL['rerr-back'].hidden;
-out.jump.posted = POSTED[POSTED.length - 1] || null;
+out.jump.posted = POSTED.filter((m) => m.romp === 'revealCard').pop() || null;   // paint() also posts the unread count (T290)
+out.unseenPosts = POSTED.filter((m) => m.romp === 'logUnseen').map((m) => m.n);
 out.jump.toggles = TOGGLES.join('|');
 // …while a kernel-minted entry (no target) is not clickable
 out.plainRowLinky = EL['rerr-list'].children[1].className.indexOf('link') >= 0;
@@ -258,6 +259,9 @@ class ErrorCenterExecutes(unittest.TestCase):
         self.assertTrue(a["linky"], "a targeted entry renders as a link row")
         self.assertTrue(a["closed"], "the popover closes on jump")
         self.assertEqual(a["posted"], {"romp": "revealCard", "itemId": "TESTSID:g9", "sid": "TESTSID"})
+        # the unread count rides into the feed pane for the gear's Open log button (T290): the drop posted a 1,
+        # opening the Log (everything seen) posted a 0
+        self.assertIn(1, self.out["unseenPosts"]); self.assertIn(0, self.out["unseenPosts"])
         self.assertIn("feed:true", a["toggles"], "the feed pane is revealed for the jump")
         self.assertFalse(self.out["plainRowLinky"], "a kernel-minted entry with no target is not a link")
 

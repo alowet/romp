@@ -42563,7 +42563,12 @@ function paint(){var n=unseen();
 [icon,micon].forEach(function(el){if(!el)return;
 el.classList.toggle('has',n>0||(kindOn('conn')&&liveDown()));
 var t=el.querySelector('.rerr-n');if(t)t.textContent=n<=0?'!':(n>9?'+':String(n));});
-if(!back.hidden)renderList();}
+tell(n);if(!back.hidden)renderList();}
+// The bar's opener carried the unread count (T290 took it off the bar): the count now rides the gear's
+// "Open log" button, in the feed pane's document — told on every repaint and on the panel's own query.
+function tell(n){var f=document.getElementById('f-feed');
+try{f&&f.contentWindow&&f.contentWindow.postMessage({romp:'logUnseen',n:(n===undefined?unseen():n)},'*');}catch(e){}}
+window.addEventListener('message',function(e){var m=e.data;if(m&&m.romp==='logUnseenQuery')tell();});
 // each entry leads with the chip its card wears in the feed, so the vocabulary matches across surfaces
 var KINDS=['conn','limit','judge','warn','stalled','nudge','retry','apierror','sdk','sync','locate','cleared','refused','undelivered'];
 var KINDLBL={conn:'offline',limit:'limit',judge:'judge',warn:'warning',stalled:'stalled',
