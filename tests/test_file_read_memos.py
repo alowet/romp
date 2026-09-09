@@ -9,12 +9,14 @@ file three times per session per index pass (19% of the thread), the archive loa
 Pins: parsed once then served; the derived readers equal the direct derivations; an append re-derives, including
 one the file clock cannot see; a write landing during the read is served no further than that call; an absent
 file is empty and never cached; a malformed line is skipped; the memos are bounded; the archive's writers get a
-fresh object; the switched callers; a rebound root forgets; the counters.
+fresh object; the switched callers; a rebound root forgets; the counters; two fills at the cap on two
+threads neither raise nor overflow it.
 
 Synthetic ids under a private synthetic sid; a temp state root."""
 import json
 import os
 import tempfile
+import threading
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -254,6 +256,145 @@ class GoalArchiveMemo(_Memo):
         for fn in (jd.captions_memo_stats, jd.goal_archive_memo_stats):
             s = fn(); k = next(iter(s)); s[k] = 99
             self.assertNotEqual(fn()[k], 99)
+
+
+class _HookedMemo(dict):
+    """A dict with an optional hook before dict.pop and one before dict.__setitem__; every other operation
+    (len, in, get, iter, clear) is the plain dict's, and so are these two when no hook is set. The eviction
+    tests rebind the module's archive memo to one so a thread can be held at a chosen point inside _memo_put:
+    about to pop its chosen victim, or about to insert after its eviction."""
+    before_pop = None
+    before_set = None
+
+    def pop(self, key, *default):
+        if self.before_pop is not None:
+            self.before_pop(key)
+        return dict.pop(self, key, *default)
+
+    def __setitem__(self, key, val):
+        if self.before_set is not None:
+            self.before_set(key)
+        dict.__setitem__(self, key, val)
+
+
+class MemoEviction(_Memo):
+    """The eviction at the cap is filled from many threads (every load_goals that replays a restore row, the
+    index tier, the planner workers). Two fills for new sids at the cap must neither raise nor overflow the
+    cap. Both tests run real fills through load_goal_archive_shared with the cap patched to 4, and make the
+    interleaving deterministic with hooks on the memo: the first holds both threads at the point where both
+    have chosen the same victim (before the pop), the second holds one thread between its pop and its insert
+    (before the insert). Without a lock around the eviction and the insert, the first raises KeyError out of
+    the fill (both pop the same key) and the second leaves five entries; a lock around the pop alone still
+    fails the second, since the other thread measures the size in the gap. Each hold is bounded by a timeout
+    (about one second on the green path, where the lock keeps the other thread out until the hold expires)
+    and every thread is joined under a wall-clock cap that fails loudly. Only the red side depends on timing:
+    without the lock the second thread must reach its hold within the first's one-second wait, so a heavily
+    loaded machine can let an unlocked judge pass; the green path holds under any load."""
+    CAP = 4
+    JOIN_S = 10.0
+    HOLD_S = 1.0
+    OLD = ["11111111-2222-3333-4444-6666666666%02d" % (20 + i) for i in range(4)]
+    NEW1 = "11111111-2222-3333-4444-666666666631"
+    NEW2 = "11111111-2222-3333-4444-666666666632"
+
+    def setUp(self):
+        super().setUp()
+        self.memo = _HookedMemo()
+        for sid in self.OLD:
+            self.memo[sid] = ((1, 2, 3), {})            # placeholder entries: the memo is at the cap
+        for sid in (self.NEW1, self.NEW2):              # real files, so _file_key is a tuple and _memo_put is reached
+            (jd.GOALARCHDIR / (sid + ".json")).write_text(
+                json.dumps({"rompUuid": sid, "nodes": {}, "status": {}}))
+        self.saved = (jd._GOALARCH_MEMO, jd._FILE_MEMO_MAX)
+        jd._GOALARCH_MEMO, jd._FILE_MEMO_MAX = self.memo, self.CAP
+
+    def tearDown(self):
+        jd._GOALARCH_MEMO, jd._FILE_MEMO_MAX = self.saved   # the module's own dict back before the rebind clears it
+        super().tearDown()
+
+    def _run(self, *targets):
+        """Run each target on its own thread; the exceptions they raised, in the order the threads were started.
+        A thread still alive at the cap is a failure, not a hang: the threads are daemons, so a fill that
+        deadlocks fails the check below without then holding the process open at exit."""
+        errors = [[] for _ in targets]
+
+        def wrap(i, fn):
+            def go():
+                try:
+                    fn()
+                except BaseException as e:      # noqa: BLE001 - the test reports what the fill raised
+                    errors[i].append(e)
+            return go
+        threads = [threading.Thread(target=wrap(i, fn), name="fill-%d" % i, daemon=True)
+                   for i, fn in enumerate(targets)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=self.JOIN_S)
+        self.assertFalse([t.name for t in threads if t.is_alive()], "a fill did not finish within the cap")
+        return [e for es in errors for e in es]
+
+    def _check_shape(self):
+        self.assertEqual(len(self.memo), self.CAP, "the cap holds")
+        self.assertIn(self.NEW1, self.memo); self.assertIn(self.NEW2, self.memo)
+        for ent in self.memo.values():
+            self.assertIsInstance(ent, tuple); self.assertEqual(len(ent), 2)
+        self.assertEqual(jd._GOALARCH_STATS["served"], 0, "both calls were fills")   # never incremented here, so
+        #                                                   race-free. `loaded` is unlocked by design (a lost
+        #                                                   increment under-counts a diagnostic) and is pinned
+        #                                                   only where the two increments are ordered.
+
+    def test_two_fills_at_the_cap_that_chose_the_same_victim_evict_without_raising(self):
+        # Both threads compute next(iter(memo)) before either pops: the hook before dict.pop parks each at a
+        # two-party barrier. Without the lock both arrive (the dict is unchanged while the first waits), the
+        # barrier releases both, and the second dict.pop of the same key raises KeyError out of the fill. With
+        # the lock the first holds it through the barrier's timeout, pops and inserts; the second then chooses
+        # the next oldest key, its barrier call raises BrokenBarrierError at once (swallowed), and it evicts
+        # and inserts in turn.
+        barrier = threading.Barrier(2)
+
+        def hold(_key):
+            try:
+                barrier.wait(timeout=self.HOLD_S)
+            except threading.BrokenBarrierError:
+                pass
+        self.memo.before_pop = hold
+        errors = self._run(lambda: jd.load_goal_archive_shared(self.NEW1),
+                           lambda: jd.load_goal_archive_shared(self.NEW2))
+        self.assertEqual(errors, [], "a fill raised out of the eviction: %r" % errors)
+        self._check_shape()
+
+    def test_a_fill_landing_between_another_fills_eviction_and_insert_does_not_overflow_the_cap(self):
+        # The first thread is held after its pop and before its insert (the hook before dict.__setitem__, on
+        # that thread only); the second fills while it waits. Without the lock the second sees three entries,
+        # skips the eviction and inserts, and the first's insert then makes five. With the lock the second
+        # blocks until the first's hold expires and it inserts, then evicts one itself. A lock around the pop
+        # alone leaves the gap open and fails here too: the hold sits at the insert, outside such a lock.
+        first = []
+        evicted, other_done = threading.Event(), threading.Event()
+
+        def gap(_key):
+            if first and threading.get_ident() == first[0]:
+                evicted.set()
+                other_done.wait(timeout=self.HOLD_S)
+        self.memo.before_set = gap
+
+        def fill_first():
+            first.append(threading.get_ident())
+            jd.load_goal_archive_shared(self.NEW1)
+
+        def fill_second():
+            self.assertTrue(evicted.wait(timeout=self.JOIN_S), "the first fill never reached its insert")
+            try:
+                jd.load_goal_archive_shared(self.NEW2)
+            finally:
+                other_done.set()
+        errors = self._run(fill_first, fill_second)
+        self.assertEqual(errors, [], "a fill raised: %r" % errors)
+        self.assertTrue(evicted.is_set(), "the first fill evicted and reached its insert")
+        self._check_shape()
+        self.assertEqual(jd._GOALARCH_STATS["loaded"], 2)   # exact here: the second fill starts after the first's
+        #                                                     increment, so the unlocked counter is ordered
 
 
 if __name__ == "__main__":

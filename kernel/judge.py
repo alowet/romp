@@ -2611,16 +2611,27 @@ def tasks_for(fsid, leaf, files, now):
 # every index pass (19% of the thread), and load_goal_archive decoded goals-archive/<sid>.json per call
 # (11%). Each file is now parsed once per file state: the key is _file_key (inode, mtime_ns, size) taken
 # BEFORE the read (the chain-memo rule), so a row appended during the read moves the key the next call
-# takes and content read mid-write is served no further than that call; an absent or unreadable file is
-# never cached; a stat error (a fresh sentinel key) never matches. Bounded at _FILE_MEMO_MAX entries,
-# oldest-inserted out; a rebound state root clears both. The captions memo serves the three readers from
-# one parse; the archive memo serves READERS only (load_goal_archive_shared): every archiver keeps
-# load_goal_archive, a fresh private object it mutates and saves.
+# takes and content read mid-write is served no further than that call; an absent file is never cached
+# (its key is None); a stat error (a fresh sentinel key) never matches. An existing file that cannot be
+# read is [] and never cached by the captions memo; the archive memo caches load_goal_archive's answer
+# for it, the empty shape, the same answer the fresh loader gives every archiver for that file. Bounded
+# at _FILE_MEMO_MAX entries, oldest-inserted out, the eviction and the insert under _FILE_MEMO_LOCK; a
+# rebound state root clears both. The captions memo serves the three readers from one parse; the archive
+# memo serves READERS only (load_goal_archive_shared): every archiver keeps load_goal_archive, a fresh
+# private object it mutates and saves.
 _CAPTIONS_MEMO = {}        # fsid -> (file key taken before the read, the parsed rows)
 _CAPTIONS_STATS = {"served": 0, "parsed": 0}
 _GOALARCH_MEMO = {}        # fsid -> (file key taken before the read, the guarded archive store: read-only)
 _GOALARCH_STATS = {"served": 0, "loaded": 0}
 _FILE_MEMO_MAX = 256
+_FILE_MEMO_LOCK = threading.Lock()   # the two memos are filled from the index tier, the planner workers and
+#                                      every load_goals caller (a journaled restore row): the eviction's
+#                                      iterate-and-pop and the insert of a new key run under it. Reads do not:
+#                                      a served entry is one dict read of a whole tuple, and a stale or missing
+#                                      read re-derives (the chain memo's two-misses-both-build rule). A LEAF
+#                                      lock: nothing inside _memo_put takes another, so reaching it under
+#                                      _GOAL_ARCH_LOCK (an archiver whose load_goals replays a restore row) is
+#                                      safe; keep it that way.
 
 
 def captions_memo_stats():
@@ -2632,9 +2643,18 @@ def goal_archive_memo_stats():
 
 
 def _memo_put(memo, fsid, key, val):
-    if fsid not in memo and len(memo) >= _FILE_MEMO_MAX:
-        memo.pop(next(iter(memo)))                        # oldest-inserted out: bounded by construction
-    memo[fsid] = (key, val)
+    """Memoize `val` under `fsid` at `key`, evicting the oldest-inserted entry when a NEW key arrives at the
+    cap. The whole step holds _FILE_MEMO_LOCK: unlocked, two fills for new sids at the cap chose the same
+    oldest key (the second pop raised KeyError) or one changed the size under the other's iteration
+    (RuntimeError); the raise passed _or_fault (OSError only) into every load_goals caller, and in the index
+    tier's serial caption loop, which has no per-session guard, it ended the pass for every session (review
+    find on #1171, 2026-09-09). With every size change under the lock a single eviction per fill suffices, so
+    the `if` stays. The counters and the served checks in the two readers stay outside it on purpose: the
+    served read is one dict read, and a lost `+= 1` under-counts a diagnostic and raises nothing."""
+    with _FILE_MEMO_LOCK:
+        if fsid not in memo and len(memo) >= _FILE_MEMO_MAX:
+            memo.pop(next(iter(memo)))                    # oldest-inserted out: bounded by construction
+        memo[fsid] = (key, val)
 
 
 def _captions_rows(fsid):
@@ -4582,11 +4602,15 @@ def save_goals(fsid, store):
 
 
 def load_goal_archive(fsid):
-    """The CLEARED-goal archive for a session (goals-archive/<fsid>.json) — dismissed top goals + their
-    subtrees moved out of the live store by the kernel's compaction sweep. Same shape as the live store
-    (nodes/status). The judge reads this ONLY as read-only context (_cleared_context, for the live re-plan's
-    <recently-cleared> block) — its placements dedup + view-cleared sealing keep it from ever re-minting an
-    archived node; the kernel's undo-clear restore and the ledger merge are the mutating readers."""
+    """The CLEARED-goal archive for a session (goals-archive/<fsid>.json): dismissed top goals and their
+    subtrees moved out of the live store, in the live store's shape (nodes/status). This is the FRESH loader,
+    a private object per call: the archivers (archive_goal_nodes here, for the rewind take and the dead-branch
+    reconciliation; the kernel's store compaction and undo restore) load through it and save under
+    _GOAL_ARCH_LOCK. The judge's readers (_cleared_context for the live re-plan's <recently-cleared> block,
+    the override replay, the peer-node joins, the propagate pass) take load_goal_archive_shared, its twin,
+    which serves one loaded object per file state; the re-plan's placements dedup and view-cleared sealing
+    keep it from ever re-minting an archived node. Any failure to read or decode an existing file answers the
+    empty shape, and the shared twin memoizes that answer for the file as it stands."""
     try:
         return _guard_nodes(json.loads((GOALARCHDIR / (fsid + ".json")).read_text()))
     except Exception:
