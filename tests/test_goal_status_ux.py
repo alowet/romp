@@ -130,6 +130,9 @@ class NodeLogRows(unittest.TestCase):
 
 
 class SubNodeDrop(unittest.TestCase):
+    """The item-level "Drop" (nodeOverride op:clear): the same user-authority clear seam as a card
+    Clear, scoped to ONE sub — checks it off as no-longer-needed without claiming completion."""
+
     def setUp(self):
         # the kernel's judge is one module object shared by every test module in the process, so a store saved at its import-bound GOALDIR outlives the module and reaches every later module's feed for the placeholder sid (T281/T282); a private root for the duration.
         self._td = tempfile.TemporaryDirectory()
@@ -153,8 +156,6 @@ class SubNodeDrop(unittest.TestCase):
         self.assertEqual((shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None), before,
                          "the run-wide goals directory is untouched by this module")
 
-    """The item-level "Drop" (nodeOverride op:clear): the same user-authority clear seam as a card
-    Clear, scoped to ONE sub — checks it off as no-longer-needed without claiming completion."""
 
     TOP = SID + ":g10"
     SUB = SID + ":g11"

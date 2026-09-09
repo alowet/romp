@@ -1310,6 +1310,7 @@ class ClearedSeal(unittest.TestCase):
 
     def tearDown(self):
         jd._rebind_state(self._saved_state)
+        shutil.rmtree(self._td, ignore_errors=True)
 
     def test_the_stores_this_class_saves_do_not_outlive_it(self):
         # The residue pin (T282): a store saved through this module's judge (the object every kernel shares) lands
@@ -1323,7 +1324,6 @@ class ClearedSeal(unittest.TestCase):
         self.assertTrue((Path(self._td) / "goals" / (SID + ".json")).exists(), "the store lives under the sandbox root")
         self.assertEqual((shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None), before,
                          "the run-wide goals directory is untouched by this class")
-        shutil.rmtree(self._td, ignore_errors=True)
 
     def _view_clear(self, *ids):
         with (jd.STATE / "cleared.jsonl").open("a") as f:
@@ -5004,6 +5004,7 @@ class DistillAtDone(unittest.TestCase):
 
     def tearDown(self):
         jd.STATE, jd.STATESDIR, jd.distill_llm = self._saved
+        jd._rebind_state(jd.STATE)   # the tuple restores STATE; every derived dir follows it (T282)
         shutil.rmtree(self._td, ignore_errors=True)
 
     def _write(self, status="working", confirming=True, log=None, **nd_extra):
@@ -7592,6 +7593,7 @@ class LiveReplan(unittest.TestCase):
         self.saved = (jd.GOALDIR, jd.GOALARCHDIR, jd.PCACHE, jd.STATE,
                       jd.plan_llm, jd.opener_llm, jd._group_store)
         jd.GOALDIR, jd.GOALARCHDIR = td / "goals", td / "goals-archive"
+        jd._rebind_state(Path(td))   # every derived dir moves too; the explicit ones below still win (T282)
         jd.PCACHE, jd.STATE = td / "pcache", td
         jd.GOALDIR.mkdir()
         jd._group_store = lambda *a, **k: None           # never fire the real grouper model
@@ -8405,6 +8407,7 @@ class OrphanedHistory(unittest.TestCase):
 
     def tearDown(self):
         jd.STATE, jd.ERRORS = self._saved_state, self._saved_errors
+        jd._rebind_state(jd.STATE)   # the tuple restores STATE; every derived dir follows it (T282)
         jd.distill_llm = self._saved_distill
         shutil.rmtree(self._td, ignore_errors=True)
 
