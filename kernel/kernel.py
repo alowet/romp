@@ -397,7 +397,8 @@ class _PerfStats:
         # chain memo. `goals.loads` is the writer's loader alone; the pusher's loads show under memos.shared.
         memos = {}
         for key, read in (("pass", _goals_memo_report), ("shared", jd.shared_store_stats),
-                          ("chain", jd.chain_memo_stats), ("courierSkip", jd.courier_skip_stats)):
+                          ("chain", jd.chain_memo_stats), ("courierSkip", jd.courier_skip_stats),
+                          ("backref", jd.backref_memo_stats)):
             try:
                 memos[key] = read()
             except Exception:

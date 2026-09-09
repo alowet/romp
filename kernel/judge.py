@@ -165,6 +165,7 @@ def _rebind_state(path):
     _STORE_FAULTS.clear()   # unreadable-store episodes belong to the old root's files
     _CHAIN_MEMO.clear()     # the write-moment chain memo keys on paths under STATESDIR; a new root is a new world
     _COURIER_SEEN.clear()   # the courier gate keys on the old root's files
+    _BACKREF_MEMO["slot"] = None   # ...and so does the sender-board walk's map
     _episode_memo.clear()   # ...and so are the episode-log reads
     _head_memo.clear()      # transcript heads are immutable per path, but a rebind swaps the whole world of paths
     _namefp_memo.clear()    # names-entry content is memoized per SID against same-second mtimes — across a
@@ -14407,17 +14408,51 @@ def _serving_ref(serving):
     return ref
 
 
+_BACKREF_MEMO = {"slot": None}     # (key, {msgId: (sender sid, node id)}) or None: the sender-board walk, keyed on its inputs
+_BACKREF_STATS = {"served": 0, "built": 0}
+
+
+def backref_memo_stats():
+    """A copy of the backref memo's counters for /perf (memos.backref)."""
+    return dict(_BACKREF_STATS)
+
+
+def _backref_key(fleet):
+    """Every input the sender-board walk reads, taken BEFORE the reads (the chain-memo rule): the discover
+    order and, per session, the store file's key with its journal's and archive's (the shared view's inputs;
+    a journal replay can complete a handoff node, which drops it from the map)."""
+    return tuple((fsid, _file_key(str(GOALDIR / (fsid + ".json"))), _journal_key(fsid), _archive_key(fsid))
+                 for fsid, path, anchor, name in fleet)
+
+
 def _handoff_backref(mid):
     """(sender sid, sender tracking-node id) for a delegate message id — read from the SENDER boards'
     own handoff nodes (the durable record _plant_handoff_track wrote at send time). '' pair when no
-    sender tracks this message (a delegate from a non-romp source, or the sender's store is gone)."""
-    for fsid, path, anchor, name in discover(int(time.time())):
-        st = load_goals(fsid)
+    sender tracks this message (a delegate from a non-romp source, or the sender's store is gone).
+
+    Built once per state of its inputs and served while they stand (2026-09-09): every call walked every
+    discovered session's store with the writer's loader, and the courier asked it for each placed
+    delegate whose link was missing, on every triage pass. The map answers every message id from one
+    walk over the read-only view; its key is _backref_key, taken before the reads, so a store written
+    during the walk moves the key the next call takes (a set read mid-write is served no further than
+    that call). The first sender in discover order wins, as the walk answered; a completed handoff node
+    is no backref. A store that raises leaves nothing cached (the caller's own boundary logs it)."""
+    fleet = discover(int(time.time()))
+    key = _backref_key(fleet)
+    slot = _BACKREF_MEMO["slot"]
+    if slot is not None and slot[0] == key:
+        _BACKREF_STATS["served"] += 1
+        return slot[1].get(mid, ("", ""))
+    mp = {}
+    for fsid, path, anchor, name in fleet:
+        st = load_goals_shared(fsid)
         for nid, nd in st.get("nodes", {}).items():
             h = nd.get("handoff")
-            if isinstance(h, dict) and h.get("msgId") == mid and not nd.get("nodeComplete"):
-                return fsid, nid
-    return "", ""
+            if isinstance(h, dict) and h.get("msgId") is not None and not nd.get("nodeComplete"):
+                mp.setdefault(h["msgId"], (fsid, nid))
+    _BACKREF_STATS["built"] += 1
+    _BACKREF_MEMO["slot"] = (key, mp)
+    return mp.get(mid, ("", ""))
 
 
 def _plant_handoff_track(store, parent_id, text, peer_sid, peer_name, t, mid, tracked=False, to_sid=None):
