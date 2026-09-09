@@ -463,6 +463,29 @@ permission/API-error floors: one interrupt at a time, the present event first.
   read fresh each pass; empty = `ROMP_JUDGE_CONCURRENCY` as read at load,
   else 6). Every pool reads it at call time (`_conc`, or `_judge_concurrency()`
   directly); `DEATH_DRAIN_PER_PASS` alone stays on the load-time value.
+- Skips: the six triage tiers (planner, closer, unblocker, grouper,
+  consolidator, distiller) run behind an evidence gate. Before a session is
+  submitted, the runner takes the tier's signature: the identity (inode,
+  mtime, size) of every file the tier's decision path reads, the store with
+  its journal and archive among them, and for the planner, closer and
+  unblocker the pass's pinned parse pair. A session whose signature equals
+  the one the tier stamped after its last complete run is skipped, and its
+  pass watermark is stamped as for a pass that found nothing to do. A run
+  stamps only when it returned normally and set no completeness bit; a
+  deferral without a write, an empty reply, a failed call, a raise, or a side
+  file that exists and did not read leaves no stamp, and the session runs
+  again next pass. The stamps are process state, so the first pass after a
+  restart is a full walk. The planner has a second gate inside
+  `_plan_session`: a session whose inputs have not moved since a pass that
+  placed nothing, left the store's key where it was and ran to completion
+  returns before the store read. The evidence gate keys on the same inputs
+  (the reg by its `spawnedAt` and backend values rather than by identity) and
+  on `cleared.jsonl`, the death marker and the stall records besides, so an
+  idle session stops at the evidence gate; the inner gate's counters
+  (`memos.plannerSkip` on `GET /perf`, see `docs/reference.md`) count only
+  the sessions the evidence gate ran. Outside
+  a pass frame (`romp-judge --plan`) the evidence gate stamps nothing, and
+  the inner gate does the skipping.
 - Logs: `STATE/judge-usage.jsonl` (per-call cost, one name per prompt),
   `STATE/judge-errors.jsonl` (the row contract above; kinds are parse,
   call, give-up, sweep-cut, cite-miss, rate-limited, task-store, history-unreadable,
