@@ -3879,7 +3879,9 @@ def _timeline_views_display():
     blob this kernel served or wrote when the cache holds one, else None -- UNPROVED either way, NEVER
     CACHED, loud once per episode (_note_state_fault), and NAMED: `fault` is the _StateUnreadable the
     blob is served under, None after a read that proved the file state it served (a cache hit at the
-    file's key, a clean read, a missing store). The empty default is not served here (review find,
+    file's key, a clean read, a missing store) -- and a proving read that ENDS an episode marks the views
+    dirty (_views_read_clean), so the payloads cached under the marker are rebuilt on the heal. The empty
+    default is not served here (review find,
     2026-09-08): carried on a frame it is a seq-less empty store that every dashboard adopts as the
     store's word; _timeline_views stands it in for the filtering callers, and _views_payload carries the
     fault instead. Until this change a fault was folded
@@ -3903,7 +3905,7 @@ def _timeline_views_display():
         # keeps a recreated store from being judged against a store that no longer exists. The seq
         # floor is kept (_VIEWS_SEQ_FLOOR): a recreated file is still ORDERED past what was served.
         _flags_cache.pop(str(p), None)
-        _clear_state_fault(p)
+        _views_read_clean(p)
         return _norm_timeline_views({}), None
     except OSError as e:
         # The store EXISTS but cannot be stat'ed (a state dir that cannot be searched): the last blob
@@ -3914,14 +3916,14 @@ def _timeline_views_display():
         _note_state_fault(exc)
         return (hit[1] if hit is not None else None), exc
     if hit is not None and hit[0] == key:
-        _clear_state_fault(p)
+        _views_read_clean(p)
         return hit[1], None
     try:
         d = _read_state_json(p, st, expect=dict)
     except _StateUnreadable as e:
         _note_state_fault(e)
         return (hit[1] if hit is not None else None), e
-    _clear_state_fault(p)
+    _views_read_clean(p)
     if d is None:
         # gone between the stat and the read, or quarantined aside just now: the store IS empty from
         # here, and the entry is forgotten as for a missing store (a file that then appears is not
@@ -4067,6 +4069,29 @@ def _timeline_views_display():
     d = _norm_timeline_views(d)
     _views_cache_put(p, key, d)
     return d, None
+
+
+def _views_read_clean(p):
+    """A read of the views store that proved its state (a hit at the file's key, the file read, a store found
+    missing): the fault episode ends (_clear_state_fault) -- and when one WAS open, the views are marked
+    dirty, so the pusher rebuilds the feed and timeline payloads it cached during the episode on THIS event,
+    the heal, not at the next unrelated change of their signature. The fault's start moves the signature by
+    itself (the once-per-episode notice bumps _sync_notice_count, a signature input); its end moved nothing
+    a READ fault touches (a stat fault also drops and restores the file's mtime key in the signature, so
+    there the heal already rebuilt and this mark is one idempotent build), so under a read fault the frames
+    built under `viewsFault` stood, marker and all, until the clock bucket or
+    some other change rebuilt them. ANY episode, not only a cold-cache one: _note_state_fault registers the
+    fault on the primed-cache arms too (the last-known blob served, marked), so the heal after one of those
+    costs one rebuild as well -- spurious when the file did not move under the fault (the payloads carry the
+    blob the file holds, with a marker to shed), and wanted when it did (the last-known blob served was
+    behind the file, and the read that ends the episode is the one that finds out). The tabOrder frame needs
+    no mark: it is built on every pusher cycle. Wrapping _clear_state_fault rather than changing it: the
+    flags, order and bell readers end their episodes there too and cache no payload of their own."""
+    if str(p) in _state_fault_seen:
+        _clear_state_fault(p)
+        _mark_views_dirty()
+    else:
+        _clear_state_fault(p)
 
 
 def _timeline_views_proved():
@@ -4774,7 +4799,14 @@ def _apply_pending_tag_edits(r):
     host's views FRESH first (ask the host, never the cache) and moves state only where the
     evidence says the ruling still applies; every outcome logs to tunnel-dials.jsonl (the reattach
     is a tunnel event). Terminal outcomes retire the row; a transport failure keeps it for the
-    next pass, so a link that drops mid-apply loses nothing."""
+    next pass, so a link that drops mid-apply loses nothing. Nor does a host whose store is FAULTING
+    (review find, 2026-09-09, on #1096): a reading the host could not prove (its /views answered a
+    retryable 503, so the poll kept the last reading, or a blob marked `viewsFault`) decides nothing.
+    The row waits for a clean read, read off the marker _poll_remote_views leaves on the host's row (or
+    on the blob itself), and a forward the host refuses RETRYABLY (its own store faulted at the write)
+    keeps the row too. Before this, the kept reading passed for a fresh one: a journaled delete or
+    rename found its tag, forwarded, and retired on the host's fault refusal as "refused", while the
+    host's store never took it."""
     host = r.get("host") or ""
     rows = [x for x in _pending_tag_rows() if x.get("host") == host]
     if not rows:
@@ -4793,6 +4825,13 @@ def _apply_pending_tag_edits(r):
     # pending and every forward failing nothing retires, and this re-read stamps the poll gate, so the
     # pass's own poll serves the cache and never sees it.
     _cache_remote_views(r, rv)
+    fault = r.get("viewsFault") or rv.get("viewsFault")
+    if isinstance(fault, str) and fault:
+        # the host said it could not read its store: what the poll returned is the last reading kept (the
+        # 503) or a blob the host marked unproved, and a ruling is never retired against either
+        _tunnel_log(host, "pending-tag-edits", note="views unproved (%s), retrying next pass" % fault,
+                    pending=len(rows))
+        return 0
     by_name = {}                                 # keyed on the name basis: the host's raw name may be padded
     for t in (rv.get("tags") or []):
         if isinstance(t, dict):
@@ -4926,9 +4965,12 @@ def _views_client(v=None):
         # from the untagged view and keep their tag views pickable while the link reconnects
         # (bounded staleness: the auto-reconnect heals within a pass; detach pops the row and its
         # cache with it — intent-consistent).
-        cand = [(r["host"], r.get("views")) for r in _remotes.values()
+        # ...and the host's own word on that read: `viewsFault` on the row (_poll_remote_views) means the
+        # host could not prove the reading it keeps, and every rendered tag of that host wears the text, so
+        # a pane can show them as stale rather than fresh (review find, 2026-09-09, on #1096)
+        cand = [(r["host"], r.get("views"), r.get("viewsFault")) for r in _remotes.values()
                 if isinstance(r.get("views"), dict)]
-    for host, rv in sorted(cand):
+    for host, rv, hfault in sorted(cand, key=lambda x: x[0]):
         # the host's OWN store's write seq, on every row of its tags: a remote rename rides this kernel's
         # blob with no change to the local `seq`, so a client ordering what a blob says about a remote
         # tag (tab-groups.ts followTagRenames — a pane stands down on evidence older than its memory's)
@@ -4948,6 +4990,8 @@ def _views_client(v=None):
                    "members": [_remote_tag_member_str(host, m) for m in members]}
             if hseq:
                 row["seq"] = hseq
+            if isinstance(hfault, str) and hfault:
+                row["viewsFault"] = hfault
             remote.append(row)
     if remote:
         v["remoteTags"] = remote
@@ -6306,6 +6350,10 @@ def _conserve_tick(now):
         _conserve_last_viewer[0] = now
     elif now - _conserve_last_viewer[0] < CONSERVE_VIEWER_LEASE_S:
         return   # the lease: a reloading page is not a closed dashboard
+    # Under a views read fault this is the last blob served, or -- with nothing served yet -- the empty
+    # default (_timeline_views), whose per-surface lens is ALL: every session then reads as tab-open, so a
+    # fault never closes a session, and at worst restarts the grace clocks the next readable pass counts
+    # from. A stand-down would keep the clocks; the fail-safe direction is already the outcome.
     vc = _views_client()
     running = be.running_sids()
     rows = be.live_sessions()
@@ -18546,7 +18594,18 @@ def _poll_remote_views(r):
     _views_client joins them per host (never merging — the federation counter rule). Same shape and
     rate-gate as _poll_remote_usage; on a blip the last good reading stands (a down host simply
     stops contributing when its status leaves "up"). An older remote without the route answers
-    non-200 → None, and the union just never includes it — nothing breaks across versions."""
+    non-200 → None, and the union just never includes it — nothing breaks across versions.
+
+    A host under a views READ FAULT says so on the route (the 2026-09-08 review): nothing good is a
+    retryable 503, a last-good blob a 200 marked `viewsFault`. Either way the reading this row keeps is one
+    the host could not vouch for, and the row says so too: `viewsFault` (the host's fault text) rides the
+    row from the 503's body or the blob's marker until a clean 200 sheds it (the read that ends the
+    episode, no timer), so _views_client renders the host's tags as stale rather than fresh and
+    _apply_pending_tag_edits never retires a journaled edit on a reading the host did not prove (review
+    find, 2026-09-09, on #1096: the 503's body was dropped and the marked blob's marker stored unread, so on
+    the peer a faulting host was indistinguishable from a healthy one). Said once per episode in the log,
+    as the local path's notice is (_note_remote_views_fault). Any other non-200, and a failed dial, keep
+    the reading AND the marker as they were: neither proves anything."""
     import urllib.parse
     now = time.time()
     if now - float(r.get("_views_at") or 0) < REMOTE_VIEWS_EVERY:
@@ -18559,12 +18618,66 @@ def _poll_remote_views(r):
         data = resp.read()
         c.close()
         if resp.status != 200:
+            if resp.status == 503:
+                text = _remote_views_fault_text(data)
+                if text:
+                    _note_remote_views_fault(r, text)
             return r.get("views")
         u = json.loads(data.decode("utf-8"))
         r["_views_at"] = now
-        return u if isinstance(u, dict) else r.get("views")
+        if not isinstance(u, dict):
+            return r.get("views")
+        if isinstance(u.get("viewsFault"), str) and u["viewsFault"]:
+            _note_remote_views_fault(r, u["viewsFault"])
+        else:
+            _clear_remote_views_fault(r)
+        return u
     except Exception:
         return r.get("views")
+
+
+def _remote_views_fault_text(data):
+    """The fault a host's retryable 503 on GET /views names, in the host's own words minus its advice to the
+    poller (the body's `error` ends in "retry", which is for this dialer, not for the person reading the
+    peer's dashboard); None for a 503 that is not the route's refusal (a proxy's, a body that is not JSON),
+    which then counts as any other non-200: the reading stands, nothing is marked."""
+    try:
+        body = json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+    if not (isinstance(body, dict) and body.get("retryable") and isinstance(body.get("error"), str)):
+        return None
+    text = body["error"].strip()
+    tail = " \u2014 retry"
+    if text.endswith(tail):
+        text = text[:-len(tail)].rstrip()
+    return text or None
+
+
+def _note_remote_views_fault(r, text):
+    """A polled host could not prove the /views reading this row keeps (a retryable 503 with nothing good,
+    or a last-good blob marked `viewsFault`): the row wears the host's fault text as `viewsFault`, said ONCE
+    per episode in the log (one stderr line and one tunnel-dials.jsonl record the first time this text is
+    seen for the row; a repeat of the same text files nothing), and the views are marked dirty on the
+    marker's ARRIVAL alone, so the peer's frames repaint the host's tags as stale on this event and not per
+    pass (a poll of the same fault changes nothing). The kept `views` stands, as on any blip; only what the
+    row says about it changes. A clean 200 ends the episode (_clear_remote_views_fault)."""
+    if r.get("viewsFault") == text:
+        return
+    r["viewsFault"] = text
+    host = r.get("host") or "?"
+    sys.stderr.write("romp-kernel: %s: %s; showing its last-known tags\n" % (host, text))
+    _tunnel_log(host, "views-fault", note=text)
+    _mark_views_dirty()
+
+
+def _clear_remote_views_fault(r):
+    """A clean 200 from the host's /views is the read that ends its fault episode: the marker goes, the end
+    is logged once, and the views are marked dirty so the host's tags render fresh again on this event."""
+    if r.pop("viewsFault", None) is None:
+        return
+    _tunnel_log(r.get("host") or "?", "views-fault", note="cleared: the host's tag store reads again")
+    _mark_views_dirty()
 
 
 def _cache_remote_views(r, rviews):
@@ -45566,7 +45679,24 @@ class Handler(BaseHTTPRequestHandler):
                 # tag federation v0. CANONICAL shape (member pairs), remoteTags absent on purpose:
                 # a polling kernel re-spells pairs for ITS viewer, and never re-imports another
                 # viewer's join (no transitive unions in v0). `romp tag` maps either spelling.
-                return self._send(200, json.dumps(_timeline_views()), "application/json", cache="no-cache")
+                # Under a READ FAULT the route says so, like every frame (_views_payload): with a last-good
+                # blob, the blob marked `viewsFault` under a 200 (a polling peer reads `tags` and `seq` and
+                # ignores the key -- its content compare stores the marked reading once, so the marker's
+                # arrival and departure each cost the peer one rebuild, nothing between; `romp tag --json`
+                # prints it, the bare listing reads `tags` and ignores it); with NOTHING good -- a cold cache
+                # -- a retryable 503 naming the fault, never the empty default under a 200: a polling peer
+                # keeps its last reading on any non-200 (_poll_remote_views), where a 200 `tags: []` replaced
+                # it and emptied this host's tags on every one of the peer's dashboards with nothing said
+                # there. `romp tag` reads the body's `error` once it stops treating a 5xx as an unreachable
+                # kernel (its own change); a curl -sf caller sees a failed fetch, which is the loud end.
+                views, fault = _timeline_views_display()
+                if views is None:
+                    return self._send(503, json.dumps({"ok": False, "retryable": True,
+                                                       "error": "%s \u2014 retry" % _views_fault_text(fault)}),
+                                      "application/json", cache="no-cache")
+                if fault is not None:
+                    views = dict(views, viewsFault=_views_fault_text(fault))
+                return self._send(200, json.dumps(views), "application/json", cache="no-cache")
             if p == "/models":                                # the ONE model + effort choice list — chat statusline, timeline lanes, AND judge settings all read it (the user 2026-07-02: no hardcoding in multiple places)
                 # each choice carries its colormap tint (the user 2026-08-17: the new-comment dialog's
                 # selectors wear the same colors the statusline badges do, for ANY pick — the badge
