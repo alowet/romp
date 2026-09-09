@@ -115,7 +115,9 @@ class DeliveryRidesTheSettle(unittest.TestCase):
         km._moving.clear()
         km._drain_hold.clear()
         km._refresh_parse_failures.clear()
-        km._LOOPS_STOP.clear()
+        producer = getattr(self, "producer", None)
+        if producer is None or not producer.is_alive():
+            km._LOOPS_STOP.clear()                   # a producer still alive keeps the stop set: it exits at its next check
         self.assertEqual(wait_for_census(self._census0), [], "no thread of this test outlives it (T282)")
 
     def test_parked_op_delivers_on_settle_while_a_judge_pass_is_stuck(self):
@@ -141,7 +143,7 @@ class DeliveryRidesTheSettle(unittest.TestCase):
              mock.patch.object(km.jd, "end_pass_frame", lambda f: None), \
              mock.patch.object(km.jd, "consume_judge_recovery", lambda: False), \
              mock.patch.object(km, "_apply_pending_ops", counting_apply):
-            producer = threading.Thread(target=km._producer, name="producer-under-test", daemon=True)
+            producer = self.producer = threading.Thread(target=km._producer, name="producer-under-test", daemon=True)
             producer.start()
             deadline = time.time() + 5
             while time.time() < deadline and not any(t.name == "triage" for t in threading.enumerate()):

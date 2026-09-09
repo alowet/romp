@@ -26,17 +26,28 @@ os.environ.pop("ROMP_STATE_DIR", None)  # a live kernel's export outranks the XD
 km = SourceFileLoader("romp_kernel_hb", os.path.join(BIN, "romp-kernel")).load_module()
 
 
+# The pusher cycle's tick jobs, every one but the push itself (the parked-ops module keeps the same list): stubbed
+# for this class so a real cycle does nothing beyond the push under test.
+_TICK_JOBS = ("_apply_pending_ops", "_turn_notify_tick", "_lift_spent_awaiting", "_death_sweep_tick", "_end_on_idle_sweep",
+              "_deferral_sweep_tick", "_auto_nudge_tick", "_interrupt_block_tick", "_auto_pause_on_limit",
+              "_usage_poll_tick", "_auto_pause_on_spend_limit", "_auto_resume_retry", "_auto_resume_session_retry",
+              "_auto_retry_tick", "_idle_queue_drive_tick", "_clear_done_working_notes")
+
+
 class WsHeartbeat(unittest.TestCase):
     def setUp(self):
         self.census0 = thread_census()
         self.saved_ka = km.KEEPALIVE_S
         self.saved_push_all = km._push_all
-        # A real _pusher cycle runs the tick jobs before its push; on a module-fresh kernel the usage poll fires on
-        # the FIRST cycle and builds a real SdkBackend (re-executing sdk_backend.py into the shared module and
-        # touching the shared judge's latches). These tests are about the beat, so the cycle's jobs and the
-        # backend are stubbed for the class; each test still chooses its own _push_all.
-        self.saved_jobs = (km._pusher_cycle_jobs, km._sdk)
-        km._pusher_cycle_jobs = lambda *a, **k: None
+        # A real _pusher cycle runs its push and then the tick jobs (all inside _pusher_cycle_jobs, the push's only
+        # caller); on a module-fresh kernel the usage poll fires on the FIRST cycle and builds a real SdkBackend
+        # (re-executing sdk_backend.py into the shared module and touching the shared judge's latches). These
+        # tests are about the beat, so the tick JOBS and the backend are stubbed one by one, while _push_all is
+        # left to each test: the wedged test's push must stay reachable, or its wedge never happens.
+        self.saved_jobs = {name: getattr(km, name) for name in _TICK_JOBS if hasattr(km, name)}
+        for name in self.saved_jobs:
+            setattr(km, name, lambda *a, **k: None)
+        self.saved_sdk = km._sdk
         km._sdk = lambda: None
         self.threads = []                              # every loop this test starts; tearDown ends them
         self.wedge = None
@@ -61,7 +72,9 @@ class WsHeartbeat(unittest.TestCase):
             km._LOOPS_STOP.clear()                     # every loop ended: the seam is free for the next test
         # (a loop still alive keeps the stop set, so it exits at its next check instead of running on; the
         #  census assertion below then reports it)
-        km._pusher_cycle_jobs, km._sdk = self.saved_jobs
+        for name, fn in self.saved_jobs.items():
+            setattr(km, name, fn)
+        km._sdk = self.saved_sdk
         km.KEEPALIVE_S = self.saved_ka
         with km._clients_lock:
             km._clients[:] = self.saved_clients
@@ -100,9 +113,14 @@ class WsHeartbeat(unittest.TestCase):
         frames = self._fake_client()
         km.KEEPALIVE_S = 0.05
         self.wedge = threading.Event()                  # not set while the test runs → the push never returns
-        km._push_all = lambda *a, **k: self.wedge.wait()   # accepts the cycle's snapshot kwarg
+        wedged = threading.Event()                      # set by the push itself: proof the pusher IS wedged
+        def push_all(*a, **k):                          # accepts the cycle's snapshot kwarg
+            wedged.set()
+            self.wedge.wait()
+        km._push_all = push_all
         self._start(km._pusher)
         self._start(km._heartbeat)
+        self.assertTrue(wedged.wait(3.0), "the pusher reached its push and is wedged there (else this test proves nothing)")
         deadline = time.time() + 3.0
         while time.time() < deadline and len(frames) < 3:
             time.sleep(0.02)
