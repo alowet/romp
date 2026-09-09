@@ -40,11 +40,16 @@ class WirePrompt(unittest.TestCase):
     def test_the_first_non_empty_line_rides_and_the_rest_does_not(self):
         self.assertEqual(km._wire_prompt("\n\n  Fix the parser  \nsecond line\nthird"), "Fix the parser")
 
-    def test_romp_marks_are_removed_before_the_line_is_picked(self):
-        # an injected notice: the marks would otherwise be the first line, or eat the cap
+    def test_romp_marks_and_a_leading_label_are_removed_before_the_line_is_picked(self):
+        # an injected notice: the marks (or the label alone) would otherwise be the first line, or eat the cap;
+        # the view removed both from the WHOLE text before picking its line, so the kernel does the same
         self.assertEqual(km._wire_prompt("<!-- romp-injected --><!-- romp-system -->[romp] The kernel restarted\nmore"),
-                         "[romp] The kernel restarted", "the [romp] label stays: the view strips it, as today")
+                         "The kernel restarted")
         self.assertEqual(km._wire_prompt("<!-- romp-note: a\nmulti-line mark -->\nReal ask"), "Real ask")
+        self.assertEqual(km._wire_prompt("[romp]\nPlease restart the build"), "Please restart the build",
+                         "a label alone on line one must not become the line the tip strips to nothing")
+        self.assertEqual(km._wire_prompt("  [ROMP]  \n\nAsk"), "Ask")
+        self.assertEqual(km._wire_prompt("Ask mentions [romp] mid-line"), "Ask mentions [romp] mid-line", "only a LEADING label")
 
     def test_a_long_first_line_is_cut_with_an_ellipsis(self):
         long = " ".join("word%d" % i for i in range(200))      # varied words: a long ask, not a repeat storm
@@ -68,8 +73,11 @@ class WirePrompt(unittest.TestCase):
 class BarLiteral(unittest.TestCase):
     def setUp(self):
         self.src = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
-        i = self.src.index('"id": seg["id"], "promptId": seg.get("trigger"), "workId": work_uuid,')
-        self.literal = self.src[i:self.src.index('"replyUuid": reply_uuid})', i) + len('"replyUuid": reply_uuid})')]
+        head, tail = '"id": seg["id"], "promptId": seg.get("trigger"), "workId": work_uuid,', '"replyUuid": reply_uuid})'
+        self.assertIn(head, self.src, "the bar literal's first line moved or was reflowed: re-anchor this pin")
+        i = self.src.index(head)
+        self.assertIn(tail, self.src[i:], "the bar literal's last key moved: re-anchor this pin")
+        self.literal = self.src[i:self.src.index(tail, i) + len(tail)]
 
     def test_the_bar_carries_the_wire_prompt_and_none_of_the_duplicates(self):
         self.assertIn('"prompt": _wire_prompt(full_prompt)', self.literal)
@@ -125,6 +133,13 @@ class MessageBinder(unittest.TestCase):
         self.assertEqual((m["exec"], m["pending"]), (990, True), "documents the fallback a memoized lane takes")
 
 
+class MemoCarriesPrompts(unittest.TestCase):
+    def test_the_dead_lane_memo_stores_the_lanes_full_prompts_and_a_hit_hands_them_to_the_binder(self):
+        src = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
+        self.assertIn('"prompts": {b["id"]: full_prompts[b["id"]] for b in bars if b["id"] in full_prompts}', src)
+        self.assertIn('full_prompts.update(cached.get("prompts") or {})', src)
+
+
 class FrameSize(unittest.TestCase):
     def test_the_wire_shape_is_well_under_two_thirds_of_the_old_on_a_devbox_sized_payload(self):
         old = _old_bars()
@@ -147,3 +162,4 @@ class Fixture(unittest.TestCase):
             self.assertEqual(wire_bar(old, fx["sid"]), wire, old["id"])
         self.assertTrue(any(len(o["prompt"]) > km._WIRE_PROMPT_MAX for o in fx["old"]), "the fixture covers a cut")
         self.assertTrue(any(o["prompt"].startswith("<!-- romp-") for o in fx["old"]), "…and an injected notice")
+        self.assertTrue(any(o["prompt"].startswith("[romp]\n") for o in fx["old"]), "…and a label alone on line one")

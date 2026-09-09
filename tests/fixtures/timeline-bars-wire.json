@@ -126,6 +126,27 @@
    "romp": false,
    "workUuid": null,
    "replyUuid": null
+  },
+  {
+   "id": "aaaaaaaa-0006-4000-8000-000000000000",
+   "promptId": "aaaaaaaa-0006-4000-8000-000000000000",
+   "workId": "aaaaaaaa-0006-4000-8000-000000000001",
+   "start": 1060,
+   "end": 1065,
+   "open": false,
+   "cont": false,
+   "prompt": "[romp]\nPlease restart the build",
+   "summary": "invented caption 6",
+   "msgCaption": "",
+   "src": "typed",
+   "mids": [],
+   "pending": false,
+   "tid": "11111111-2222-3333-4444-555555555555",
+   "uuid": "aaaaaaaa-0006-4000-8000-000000000000",
+   "nudgeAuto": false,
+   "romp": true,
+   "workUuid": "aaaaaaaa-0006-4000-8000-000000000001",
+   "replyUuid": "aaaaaaaa-0006-4000-8000-000000000002"
   }
  ],
  "wire": [
@@ -155,7 +176,7 @@
    "end": 1015,
    "open": false,
    "cont": false,
-   "prompt": "[romp] The kernel restarted and cut this turn.",
+   "prompt": "The kernel restarted and cut this turn.",
    "summary": "invented caption 1",
    "msgCaption": "",
    "src": "typed",
@@ -236,6 +257,24 @@
    "nudgeAuto": false,
    "romp": false,
    "replyUuid": null
+  },
+  {
+   "id": "aaaaaaaa-0006-4000-8000-000000000000",
+   "promptId": "aaaaaaaa-0006-4000-8000-000000000000",
+   "workId": "aaaaaaaa-0006-4000-8000-000000000001",
+   "start": 1060,
+   "end": 1065,
+   "open": false,
+   "cont": false,
+   "prompt": "Please restart the build",
+   "summary": "invented caption 6",
+   "msgCaption": "",
+   "src": "typed",
+   "mids": [],
+   "pending": false,
+   "nudgeAuto": false,
+   "romp": true,
+   "replyUuid": "aaaaaaaa-0006-4000-8000-000000000002"
   }
  ]
 }

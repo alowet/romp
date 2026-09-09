@@ -34558,7 +34558,8 @@ def _node_anchor_uuids(nd, seg_trig, seg_work):
 
 
 _WIRE_PROMPT_MAX = 400     # chars of the first non-empty line a bar carries; the tip shows at most 90 of them
-_ROMP_MARK_RE = re.compile(r"<!--\s*romp-[\s\S]*?-->")
+_ROMP_MARK_RE = re.compile(r"<!--\s*romp-[\s\S]*?-->")      # the view's stripRompMarks
+_ROMP_LABEL_RE = re.compile(r"^\s*\[romp\]\s*", re.I)       # the view's stripRompLabel: a LEADING label, newlines included
 
 
 def _collapse_repeat(s):
@@ -34572,14 +34573,15 @@ def _collapse_repeat(s):
 
 
 def _wire_prompt(text, cap=_WIRE_PROMPT_MAX):
-    """What a bar carries of its prompt on the wire (T278b): the FIRST non-empty line, romp's own
-    `<!-- romp-… -->` marks removed first (the view removes them too; removing them here keeps a long injected
-    preamble from eating the line), the repeat storm collapsed, cut at `cap` characters with an ellipsis. The
-    tip is the prompt's only reader and shows at most 90 characters of that first line (reqText in
-    ui/romp-timeline-view.js); the full text is a click away, since the dot opens the chat at the prompt. On
-    the devbox the prompt field was 8.2 MB of a 20.4 MB bars frame, 40% of what every timeline pane
-    downloaded on connect. The `[romp]` label stays for the view to strip, as it does today."""
-    s = _collapse_repeat(_ROMP_MARK_RE.sub("", text or ""))
+    """What a bar carries of its prompt on the wire (T278b): the FIRST non-empty line, after the view's own
+    three passes in the view's order (reqText in ui/romp-timeline-view.js): romp's `<!-- romp-… -->` marks
+    removed, a LEADING `[romp]` label removed (anchored at the text's start, so a label alone on line one
+    does not become the line the tip then strips to nothing), the repeat storm collapsed over the whole
+    text; then cut at `cap` characters with an ellipsis. The tip shows at most 90 characters of that line
+    and is the prompt's only reader; the full text is a click away, since the dot opens the chat at the
+    prompt. On the devbox the prompt field was 8.2 MB of a 20.4 MB bars frame, 40% of what every timeline
+    pane downloaded on connect."""
+    s = _collapse_repeat(_ROMP_LABEL_RE.sub("", _ROMP_MARK_RE.sub("", text or "")))
     first = next((l for l in s.split("\n") if l.strip()), "").strip()
     if len(first) > cap:
         return first[:cap].rstrip() + "…"
@@ -34664,8 +34666,8 @@ def _bind_message_execs(messages, turns, prompts=None):
     the connector then honestly shows transit = sent → became-actionable.
     `prompts` is {bar id: the FULL prompt text} from the builder (T278b): a bar's `prompt` on the wire is
     its first line, capped, and a postal delivery names its sender on a later line, so the heuristic reads
-    the full text where the builder has it (a lane served from the dead-lane memo falls back to the wire
-    line: its bars are hours old, past MSG_MAX_LAG of any message that could still bind)."""
+    the full text where the builder has it; a lane served from the dead-lane memo carries its prompts in
+    the memo, so a lane that died within an hour of a message it received still binds on later builds."""
     idTurn = {}
     for sid, bars in turns.items():
         for bar in bars:
@@ -35513,6 +35515,7 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
         bars, last_t, seg_ends = [], None, {}            # seg_ends: seg-start t → work-END t (for completion marks)
         if lane_hit is not None:
             bars, last_t = cached["bars"], cached["last_t"]
+            full_prompts.update(cached.get("prompts") or {})   # the memoized lane's full prompts, for the binder (T278b)
         for ti, turn in enumerate(st_turns):
             turn_open = (live and ti == len(st_turns) - 1 and not turn["ended"]
                          and not any(x["type"] == "idle" for x in turn["atoms"])
@@ -35605,7 +35608,10 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
             if lane_key is not None:
                 if len(_dead_lane_memo) > _DEAD_LANE_MEMO_MAX:      # bounded by the lane window; evict oldest-inserted
                     _dead_lane_memo.pop(next(iter(_dead_lane_memo)))
-                _dead_lane_memo[sid] = (lane_key, {"bars": bars, "compactions": compactions, "last_t": last_t, "marks": marks})
+                _dead_lane_memo[sid] = (lane_key, {"bars": bars, "compactions": compactions, "last_t": last_t, "marks": marks,
+                                                   # the lane's full prompts (T278b): the binder's sender heuristic reads
+                                                   # them, and a lane can die within an hour of a message it received
+                                                   "prompts": {b["id"]: full_prompts[b["id"]] for b in bars if b["id"] in full_prompts}})
                 # the parse has done its work for this dead lane: drop it (the RSS lever); a lane that moves
                 # re-parses once, and a session that revives is parsed by its chat build as before
                 _parse_cache.pop(s["path"], None)
