@@ -210,6 +210,37 @@ class Chain(unittest.TestCase):
                     item_completed(user_item("hello", "u1")))
         self.assertEqual(len(recs), 1)
 
+    def test_several_inputs_land_as_one_text_block_each(self):
+        # The backend starts a turn from its WHOLE queue, one input per queued send, and the app-server
+        # answers one userMessage item carrying them all. Each input is its own text block: a user record
+        # with several text blocks is a shape the kernel already reads per block (_atom_user_texts, behind
+        # the echo prune and the pending-bubble pass; romp bundles its own injected messages that way).
+        # Joined into one block ("first send\nsecond send") the record matches no send's echo, and the
+        # echoes of a turn started from several sends never retire. A placeholder for a non-text input is
+        # a block of its own.
+        n = norm()
+        two = {"type": "userMessage", "id": "u1",
+               "content": [{"type": "text", "text": "first send"},
+                           {"type": "text", "text": "  second send\n"}]}
+        recs = feed(n, turn_started(), item_completed(two))
+        self.assertEqual([r["type"] for r in recs], ["user"], "one record for the one item")
+        self.assertEqual(recs[0]["message"]["content"],
+                         [{"type": "text", "text": "first send"}, {"type": "text", "text": "second send"}],
+                         "a block per input, each stripped of outer whitespace")
+        mixed = {"type": "userMessage", "id": "u2",
+                 "content": [{"type": "text", "text": "   "},
+                             {"type": "localImage", "path": "/TESTDIR/shot.png"},
+                             {"type": "skill", "name": "review"},
+                             {"type": "text", "text": "and the tests"}]}
+        recs = feed(n, item_completed(mixed))
+        self.assertEqual([b["text"] for b in recs[0]["message"]["content"]],
+                         ["[Image: /TESTDIR/shot.png]", "review", "and the tests"],
+                         "a blank input is dropped; placeholders keep their own block")
+        # one text input writes exactly what it wrote before: one block, outer whitespace stripped
+        recs = feed(n, item_completed(user_item("  fix the flaky test\n", "u3")))
+        self.assertEqual(recs[0]["message"]["content"], [{"type": "text", "text": "fix the flaky test"}])
+        self.assertEqual(feed(n, item_completed(user_item("  ", "u4"))), [], "every input blank: no record")
+
     def test_compaction_stitch(self):
         n = norm()
         recs = feed(n,

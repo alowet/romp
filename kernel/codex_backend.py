@@ -705,19 +705,43 @@ class CodexBackend:
         with open(path, "a", encoding="utf-8") as f:
             for r in recs:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        # a landed user record replaces its optimistic echo (uuid-independent: match by text)
-        landed = {self._rec_text(r) for r in recs if r.get("type") == "user"}
+        # A landed user record replaces its optimistic echoes (uuid-independent: match by text, under
+        # echo_text_key on both sides). ONE echo per landed text BLOCK, the OLDEST carrying the text. A
+        # block is one send: the worker starts a turn from its whole queue, one input per queued send, and
+        # the normalizer writes the app-server's one userMessage item as one record with a block per input
+        # (codex_events._user_input_texts), so a turn started from two queued sends lands both echoes here;
+        # a one-send record is one block. One per key, not every echo carrying it: a second identical
+        # STEER (delivered mid-turn, never queued) keeps its echo when the first one's record lands, and a
+        # second send dropped after that (the client dying mid-queue) stays visible. The kernel's
+        # prune_live is the other retire, floored by record time; this one sees only the records it just
+        # wrote.
+        landed = [t for r in recs if r.get("type") == "user" for t in self._rec_texts(r)]
         if landed:
             with s.lock:
-                s.echoes = [e for e in s.echoes if e["text"] not in landed]
+                kept = list(s.echoes)
+                for text in landed:
+                    for i, e in enumerate(kept):
+                        if echo_text_key(e.get("text")) == text:
+                            del kept[i]
+                            break
+                if len(kept) != len(s.echoes):
+                    s.echoes = kept
 
     @staticmethod
-    def _rec_text(rec):
+    def _rec_texts(rec):
+        """A user record's texts under the shared key rule (echo_text_key: outer whitespace stripped,
+        nothing else), the key send() stores on the echo and _append and prune_live compare: one entry per
+        text BLOCK (a string content is one entry), empty ones dropped. Per block and never the blocks
+        joined: each block of a Codex user record is one send (see _append), and this retire takes exactly
+        one echo per send. The kernel's prune_live also matches the record's space-joined text
+        (_atom_user_texts yields the joined text and each block), floored by record time; that match is
+        not repeated here."""
         c = (rec.get("message") or {}).get("content")
         if isinstance(c, list):
-            return " ".join(b.get("text", "") for b in c
-                            if isinstance(b, dict) and b.get("type") == "text").strip()
-        return (c or "").strip() if isinstance(c, str) else ""
+            keys = [echo_text_key(b.get("text")) for b in c if isinstance(b, dict) and b.get("type") == "text"]
+        else:
+            keys = [echo_text_key(c)]
+        return [k for k in keys if k]
 
     # ── liveness / identity ──────────────────────────────────────────────────────────────────────
     def end_marker(self, sid):
@@ -780,10 +804,10 @@ class CodexBackend:
             # WHOLE seconds, as the SDK and tmux echoes stamp theirs: record times are parse_z's int
             # seconds and prune_live lands an echo by text only through a record at or after its send,
             # so a float stamp would keep an echo whose record was written later in the same second. The
-            # text is stored under the shared key rule (echo_text_key), the key prune_live compares
-            # against; for a str that is the stripped text _append matches.
-            s.echoes.append({"text": echo_text_key(text), "t": int(time.time()),
-                             "uuid": "echo-%s" % uuidlib.uuid4().hex[:8]})
+            # text is stored under the shared key rule (echo_text_key), the key prune_live and _append
+            # compare against. The uuid is kept: it names THIS send's echo on the dead path below.
+            echo_uuid = "echo-%s" % uuidlib.uuid4().hex[:8]
+            s.echoes.append({"text": echo_text_key(text), "t": int(time.time()), "uuid": echo_uuid})
             turn_id = s.turn_id
             tid = s.tid
         if c is not None and turn_id:
@@ -796,7 +820,11 @@ class CodexBackend:
                 pass
         with s.lock:
             if s.dead:
-                s.echoes = [e for e in s.echoes if e["text"] != text.strip()]
+                # The session died during the steer RPC: take back THIS send's echo, by the uuid minted
+                # above, and no other. Retiring by text would take an earlier same-text send the
+                # app-server never recorded with it. prune_live's rule applies here too: a send the
+                # app-server never records stays visible, and no other send's failure retires it.
+                s.echoes = [e for e in s.echoes if e["uuid"] != echo_uuid]
                 return False
             entry_id = "q-%s" % uuidlib.uuid4().hex
             s.queue.append(text)
@@ -1463,7 +1491,10 @@ class CodexBackend:
         compared under echo_text_key on BOTH sides. Record times are parse_z's whole seconds, so send()
         stamps the echo with int(time.time()) as the SDK and tmux echoes do: a float stamp would keep an
         echo whose record was written later in the same second. The backend's own _append retire is the
-        other exit; it sees only the records it just wrote.
+        other exit; it sees only the records it just wrote and takes one echo per landed text block, the
+        oldest carrying the text (a turn started from several queued sends lands as one record with a
+        block per send; _atom_user_texts yields each block, so this prune lands every echo of such a turn
+        too).
 
         `human_floor` (the newest genuine-human record's time) is accepted and retires nothing here. No
         floor retires a plain input echo on any backend: a send the app-server never records must stay
