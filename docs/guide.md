@@ -671,3 +671,14 @@ themselves. The analytics modal in settings shows what you actually spent,
 separating your sessions from the judge pipeline. You can also reconfigure the
 judges from the gear: the high-volume indexing tier defaults to Haiku, and the
 judgment tier defaults to Sonnet.
+
+The bottom bar's **API** cell, a dot and a word, shows how the API is treating
+your sessions. Gray **ok** means no session is waiting on the API. Amber shows
+how many sessions are waiting and names the problem: **rate limited**,
+**overloaded**, **offline** (this machine cannot reach the API), or **errors**.
+Red **paused** means auto-retry and the judges are stopped, and says why: a
+usage limit, the monthly spend cap, or that you stopped them. Hover for the same
+reading with the waiting sessions listed. Click the cell, or press Enter on it,
+for the detail: each waiting session (click one to open that session), a button
+that stops auto-retry for every session while sessions are waiting and resumes
+it while paused, and links to the usage figures and the Log.
