@@ -382,6 +382,15 @@ const menuCheckStyleFor = (p) => 'position:absolute;right:6px;top:50%;transform:
   + 'background:' + p.accentSolid + ';color:#fff;border-radius:50%;width:13px;height:13px;font-size:9px;'
   + 'font-weight:900;display:inline-flex;align-items:center;justify-content:center;line-height:1;';
 let MENU_STYLE = null, MENU_CHECK_STYLE = null;   // set by applyPal() below (dark by default)
+// THE TAG CHIP in the views menu (T283b, the user 2026-09-09: menus wear one vocabulary): the shared tag-lens
+// menu renders each tag as the tag chip itself acting as a toggle (ui/webview/tag-menu.ts tagChip + T283's
+// loop); this pane inlines the RESOLVED twin, since it may live in a foreign document that loads no module.
+// TAG_CHIP_STYLE is tagChip's pill byte for byte up to the colour (a drift test compares); the fade is the
+// shared TAG_CHIP_OFF_OPACITY, and the class names the state for a host that does load the sheets.
+const TAG_CHIP_STYLE = 'display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border-radius:9px;font-size:0.82em;border:1px solid ';
+const TAG_CHIP_OFF_OPACITY = '0.45';
+const TAG_CHIP_OFF_CLASS = 'tag-chip-off';
+const TAG_CHIP_ROW_STYLE = 'padding:3px 8px;border-radius:4px;cursor:pointer;white-space:nowrap;display:flex;align-items:center;';
 // Judging band: a compact second timeline UNDER the session lanes, on the SAME axis — one row per
 // summarizer judge (docs/judges.md). Each mark is FILLED with the colour of the SESSION it acted on and
 // OUTLINED in the judge's OWN colour (so a bar reads as "judge X on session Y"). Fed by
@@ -3969,19 +3978,35 @@ class TimelinePanel {
     menu.setAttribute('style', 'position:fixed;z-index:1001;min-width:200px;' + MENU_STYLE);
     menu.dataset.rompMenu = '1';   // the echo writers skip in-menu presses (T213)
     menu.addEventListener('click', (e) => e.stopPropagation());
+    // a plain row (All, (no tags), Configure tags…): the label, the ✓ when current. The tags are not rows any
+    // more but CHIPS (tagRow below, T283b), so the colour dot the tag rows wore is gone, as in the shared menu
     const item = (label, opts) => {
       const row = menu.createDiv();
       row.setAttribute('style', 'padding:4px 22px 4px 8px;border-radius:4px;cursor:pointer;position:relative;white-space:nowrap;'
         + (opts && opts.dim ? 'opacity:0.85;' : ''));
-      if (opts && opts.dot) {
-        const d = row.createSpan();
-        d.setAttribute('style', 'display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;background:' + opts.dot + ';');
-      }
       row.appendChild(document.createTextNode(label));
       if (opts && opts.current) {
         const c = row.createSpan({ text: '✓' });
         c.setAttribute('style', MENU_CHECK_STYLE);
       }
+      row.addEventListener('mouseenter', () => { row.style.background = HOVER_BG; });
+      row.addEventListener('mouseleave', () => { row.style.background = 'transparent'; });
+      return row;
+    };
+    // one tag per line, the chip at the left: the chip IS the toggle (aria-pressed), full colour when selected,
+    // faded when not, its colour kept — the pill tagChip builds for every other surface, resolved here (T283b).
+    // The uncoloured fallback is the palette's muted text, the theme token's resolved value (MODEL_FG).
+    const tagRow = (name, color, on) => {
+      const row = menu.createDiv();
+      row.setAttribute('style', TAG_CHIP_ROW_STYLE);
+      const col = color || MODEL_FG;
+      const chip = row.createSpan({ text: name });
+      chip.setAttribute('style', TAG_CHIP_STYLE + col + ';color:' + col + ';background:transparent;white-space:nowrap;'
+        + (on ? '' : 'opacity:' + TAG_CHIP_OFF_OPACITY + ';'));
+      if (!on) chip.classList.add(TAG_CHIP_OFF_CLASS);
+      chip.setAttribute('role', 'button');
+      chip.setAttribute('aria-pressed', on ? 'true' : 'false');
+      chip.setAttribute('title', on ? 'selected \u2014 click to drop it from the filter' : 'click to add it to the filter');
       row.addEventListener('mouseenter', () => { row.style.background = HOVER_BG; });
       row.addEventListener('mouseleave', () => { row.style.background = 'transparent'; });
       return row;
@@ -4014,7 +4039,7 @@ class TimelinePanel {
       item('(no tags)', { current: !lensAll(lens) && !!lens.none })
         .addEventListener('click', () => apply(lensToggle(lens, 'none'), false));
       for (const g of viewTagUnion(v))
-        item(g.name, { dot: g.color || MODEL_FG, current: !lensAll(lens) && (lens.tags || []).indexOf(g.name) >= 0 })
+        tagRow(g.name, g.color, !lensAll(lens) && (lens.tags || []).indexOf(g.name) >= 0)
           .addEventListener('click', () => apply(lensToggle(lens, { tag: g.name }), false));
       sep();
       item('Configure tags…', { dim: true }).addEventListener('click', () => {

@@ -1,8 +1,8 @@
 // The SHARED tag-lens menu (the user 2026-08-25): one component every webview surface mounts —
 // the outline pane, the chat tab strip, the feed's local filter. (The timeline inlines its OWN copy
-// of this menu in MENU_STYLE, since it may live in Obsidian's document and loads no modules; that
-// copy still draws each tag as a colour-dot row with a ✓, not as the chips below — T283 changed the
-// shared component only, the timeline's mirror is its own follow-up.) The menu is
+// of this menu in MENU_STYLE, since it may live in Obsidian's document and loads no modules; since
+// T283b that copy builds the same chip rows from its palette's RESOLVED values — tagRow / TAG_CHIP_STYLE in
+// ui/romp-timeline-view.js — and ui/timeline-tag-chips.test.ts pins the drift between the two.) The menu is
 // multi-select toggles on ONE surface's lens: All a plain exclusive pick, (no tags) toggling with
 // the ✓ when selected, and every name-keyed union tag as ITS OWN CHIP acting as a toggle button
 // (the user 2026-09-09, T283: the pill every surface already wears, one tag per line with the chip
