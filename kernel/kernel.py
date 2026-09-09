@@ -14000,6 +14000,14 @@ def _sdk_locked():
             # observes the transition; the judge store owns the card; the kernel wires the two
             type(_sdk_backend).on_model_fallback = staticmethod(
                 lambda sid, frm, to: (jd.mint_fallback_card(sid, frm, to), _push_soon()))
+            # a SAFEGUARDS refusal the CLI retried on a fallback model (T279): the same wiring shape —
+            # the backend observes the frame (and names the capacity card this turn's learn minted for
+            # the swap), the judge store files the refusal and folds that card into it, the kernel
+            # wires the two
+            type(_sdk_backend).on_model_refusal_fallback = staticmethod(
+                lambda sid, frm, to, cat, expl, scope, caps, ep: (
+                    jd.mint_refusal_fallback_card(sid, frm, to, cat, expl, scope, capacity_gids=caps, episode=ep),
+                    _push_soon()))
             # a version the CLI REFUSED must leave the pick memory too: the backend rules on the CLI's
             # answer, the kernel owns model-picks.json — the same wiring shape
             type(_sdk_backend).on_model_refused = staticmethod(_model_pick_refused)
@@ -29712,10 +29720,15 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
             elif a["type"] == "system" and a.get("subtype") == "model_refusal_fallback":
                 # Safeguards flagged the prompt and the CLI retried the turn on a fallback model — the
                 # reply that follows came from a DIFFERENT model, and the swap must be visible in the
-                # chat, never silent (the user 2026-08-03). Raw model ids; the client prettifies.
+                # chat, never silent (the user 2026-08-03). Raw model ids; the client prettifies. The
+                # refusal's category (the notice's head) and the API's explanation (its fold) ride along,
+                # with the scope: 'session' = the session model is swapped, 'local' = one reply (T279).
                 events.append({"kind": "modelFallback", "uuid": a.get("uuid"), "ts": ts,
                                "from": a.get("fallback_from") or "", "to": a.get("fallback_to") or "",
-                               "md": a.get("content") or ""})
+                               "md": a.get("content") or "",
+                               "category": a.get("refusal_category") or "",
+                               "explanation": a.get("refusal_explanation") or "",
+                               "scope": a.get("scope") or "session"})
     # Agent/Task cards: the agent join, the running preview, the landed report (plans/subagent-transcripts.md).
     # Tail events only in fold mode — the sealed prefix's cards are gated by _chat_agents_moved and held
     # open by _chat_agent_open_at below.

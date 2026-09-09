@@ -2148,6 +2148,13 @@ class FileAdapter:
                        "content": r.get("content") or "",          # the CLI's full explanation
                        "fallback_from": r.get("originalModel") or "",
                        "fallback_to": r.get("fallbackModel") or "",
+                       # T279: the refusal category (an open string; null when neither lane carried one),
+                       # the API's explanation (display-only prose; null on server-lane banners) and the
+                       # scope ('session' = the session model is swapped; 'local' = a subagent's or a
+                       # side question's reply only; absent on older CLIs = session)
+                       "refusal_category": r.get("apiRefusalCategory") or "",
+                       "refusal_explanation": r.get("apiRefusalExplanation") or "",
+                       "scope": r.get("scope") or "session",
                        "_seq": seq}
             # other system subtypes (turn_duration, stop_hook_summary, local_command,
             # away_summary) are harness bookkeeping, not conversational messages -> skipped.

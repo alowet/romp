@@ -3662,6 +3662,7 @@ class SdkSession:
         # BEFORE the ResultMessage that carries api_error_status, so the settle pairs the two.
         self.auth_label = "unknown"
         self._ah_turn = 0
+        self._swap_cards = []        # (pretty from, pretty to, card gid) per capacity fallback learned this turn (T279)
         self._ah_gaveup = None
         self._interrupted = False                    # user interrupted the in-flight turn → snapshot reads 'waiting' (display only; inflight stays event-driven)
         self._intr_level = 0                         # interrupt escalation rung this episode (interrupt_action); reset on settle / fresh turn
@@ -4954,7 +4955,19 @@ class SdkSession:
             fb = getattr(type(self.backend), "on_model_fallback", None)
             if fb:
                 try:
-                    fb(self.sid, self.model, pm)
+                    ret = fb(self.sid, self.model, pm)
+                    # T279: keep the swap and the card it minted until the turn settles. A safeguards
+                    # refusal the CLI retried on the fallback model looks exactly like this from here
+                    # (the retried leg streams on the fallback model), and its cause arrives only in the
+                    # CLI's END-OF-TURN model_refusal_fallback notice — whose filing then folds exactly
+                    # this card, by id, into the refusal card (one swap, one card). The kernel's hook
+                    # returns (gid, ...); a test double may return None.
+                    gid = ret[0] if isinstance(ret, tuple) and ret else (ret if isinstance(ret, str) else None)
+                    if gid:
+                        cards = getattr(self, "_swap_cards", None)     # (__new__-built doubles skip __init__)
+                        if cards is None:
+                            cards = self._swap_cards = []
+                        cards.append((self.model, pm, gid))
                 except Exception as e:
                     self.backend._log("model-fallback card (%s): %s" % (self.name, e), problem=True)
         self.model = pm
@@ -4967,6 +4980,46 @@ class SdkSession:
         except Exception as e:
             self.backend._log("model learn (%s): registry write failed: %s" % (self.name, e))
         self.backend._poke()
+
+    def _on_refusal_fallback(self, d: dict):
+        """File a streamed model_refusal_fallback frame through the kernel-wired hook (the branch in
+        _on_message). PRETTY names, like the capacity path's learn (self.model / pm), so the swap the
+        notice names is the swap the learn recorded. A null category / explanation becomes "" (the
+        schema: null is normal, not an error); an absent scope is 'session'. The frame carries every
+        capacity card this turn's learn minted (_swap_cards) and the episode key (the refused prompt's
+        uuid), so the store can fold the cards that belong to this swap. Loud where the frame or the
+        wiring is broken: a frame without model ids (the schema marks both required) is a logged problem
+        and files nothing rather than a card reading "? → a fallback model"; an unwired hook is said once
+        per kernel life, never a silent drop. A `provisional` frame (an intermediate hop of a multi-hop
+        chain: the first fallback refused too) files like any other: on the CLI's chain path no final
+        frame need follow it, so skipping it would drop the filing, and a later hop of the same episode
+        folds its card in the store. A failing hook is a logged problem, never a raise into the stream
+        loop."""
+        if not isinstance(d, dict) or not d.get("original_model") or not d.get("fallback_model"):
+            self.backend._log("sdk: model_refusal_fallback frame without model ids — keys=%r; nothing filed"
+                              % (sorted(d)[:20] if isinstance(d, dict) else type(d).__name__,), problem=True)
+            return
+        frm = pretty_model(str(d.get("original_model") or ""))
+        to = pretty_model(str(d.get("fallback_model") or ""))
+        cat = str(d.get("api_refusal_category") or "").strip()
+        expl = str(d.get("api_refusal_explanation") or "").strip()
+        scope = str(d.get("scope") or "session")
+        episode = str(d.get("refused_user_message_uuid") or "")
+        # A 'local' refusal (a subagent's or a side question's reply) never swapped the session's model,
+        # so none of this turn's cards is its own.
+        caps = [] if scope == "local" else [c[2] for c in (getattr(self, "_swap_cards", None) or []) if c[2]]
+        hook = getattr(type(self.backend), "on_model_refusal_fallback", None)
+        if not hook:
+            memo = "model_refusal_fallback:no-hook"
+            if memo not in SdkSession._sys_subtypes_seen:
+                SdkSession._sys_subtypes_seen.add(memo)
+                self.backend._log("sdk: a model_refusal_fallback frame arrived but no on_model_refusal_fallback "
+                                  "hook is wired — the refusal is not filed (first seen this kernel life)")
+            return
+        try:
+            hook(self.sid, frm, to, cat, expl, scope, caps, episode)
+        except Exception as e:
+            self.backend._log("refusal-fallback card (%s): %s" % (self.name, e), problem=True)
 
     def _resolve_model_pending(self, pm) -> bool:
         """If a /model switch is pending and the observed live name `pm` now reflects the chosen alias,
@@ -5426,6 +5479,18 @@ class SdkSession:
             # off subtype+data (the typed subclasses need a newer SDK; the raw payload is identical).
             # Terminal statuses clear from EITHER message kind — a TaskStop can suppress the notification.
             self._on_task_event(msg.subtype, msg.data if isinstance(msg.data, dict) else {})
+        elif isinstance(msg, SystemMessage) and msg.subtype == "model_refusal_fallback":
+            # The CLI's structured record of a SAFEGUARDS refusal it retried on a fallback model (T279):
+            # the model's classifier declined the request and the turn re-ran on the configured fallback,
+            # so the reply that follows came from a different model, for a reason the user should see.
+            # Fields per the CLI's stream-json schema (bundled CLI 2.1.259): original_model /
+            # fallback_model; api_refusal_category (an open string; new categories ship ahead of schema
+            # updates; null when neither lane carried one, which is normal); api_refusal_explanation
+            # (display-only prose; null on server-lane banners); scope ('session': the session model is
+            # swapped; 'local': a subagent / side reply only; absent on older CLIs, read as session).
+            # Filed for the judges through the kernel-wired hook, the on_model_fallback way. The chat
+            # notice itself comes from the transcript record (event_model -> build_session modelFallback).
+            self._on_refusal_fallback(msg.data if isinstance(getattr(msg, "data", None), dict) else {})
         elif isinstance(msg, SystemMessage):
             # A subtype no branch above handles. Logged ONCE per subtype per kernel life (keys only, no
             # values): the CLI's stream-json allowlist decides what reaches us, and a frame kind it
@@ -5586,6 +5651,8 @@ class SdkSession:
                 # the CLI, its next streamed atom re-asserts 'working' via _forward — the stream is the truth.
                 self.inflight = 0
                 self._inflight_texts.clear()           # the CLI processed everything fed — same settle semantics
+                self._swap_cards = []                  # T279: a capacity card learned this turn is claimable only by
+                #                                        this turn's refusal notice — the settle is the deciding event
                 # A /compact that found NOTHING to compact emits no boundary — the turn just settles here. Clear
                 # the authoritative flag so parked ops proceed immediately, instead of waiting out a 180s cap.
                 self._compacting = False

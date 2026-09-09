@@ -252,7 +252,7 @@ type ChatEvent = (
   // transcript's system/model_refusal_fallback record). The reply that follows came from a DIFFERENT
   // model — conversation state that must be apparent in the chat, never silent (the user 2026-08-03).
   // from/to are raw model ids; md is the CLI's full explanation, one click away.
-  | { kind: "modelFallback"; from?: string; to?: string; md?: string; ts?: string; uuid?: string }
+  | { kind: "modelFallback"; from?: string; to?: string; md?: string; category?: string; explanation?: string; scope?: string; ts?: string; uuid?: string }
   // Pinned, collapsed "system context" card at the top of the transcript (the user 2026-06-19): the
   // CLAUDE.md instructions in effect + session config. NOT the verbatim harness prompt — it's never
   // recorded, so it can't be shown (renderSystem says so). No ts/uuid → off the rail (no dot/hover).
@@ -1457,7 +1457,8 @@ function foldable(label: string, content: HTMLElement, key?: string): HTMLElemen
 // detached from the timeline. Nested → return the bare card; it sits in the parent turn's rail column under
 // its single dot (connected, like any in-turn card). A standalone notice (romp system) IS its own top-level
 // turn, so it keeps the .turn wrapper + dot.
-function noticeCard(o: { variant: "agent" | "romp" | "reminder" | "compact" | "clear" | "peer"; chip: string; logo?: boolean;
+type NoticeVariant = "agent" | "romp" | "reminder" | "compact" | "clear" | "peer" | "refusal";
+function noticeCard(o: { variant: NoticeVariant; chip: string; logo?: boolean;
                         head: string; body: HTMLElement; collapsible?: boolean; key?: string;
                         nested?: boolean }): HTMLElement {
   const card = el("div", "notice-card notice-card-" + o.variant + (o.nested ? " notice-nested" : ""));
@@ -3876,30 +3877,32 @@ function renderCmdGesture(ev: Extract<ChatEvent, { kind: "cmdGesture" }>): HTMLE
   return turn;
 }
 
-// The durable "safeguards flagged → switched model" note (the user 2026-08-03: a mid-turn model swap
-// must be apparent in the chat, never silent). Slim rail line in the warning voice, placed where the
-// retry started — i.e. just above the fallback model's reply. The CLI's full explanation (why the
-// safeguards fired, the /feedback pointer) expands on click; fold state survives re-renders via the
-// record's uuid key.
 function renderModelFallback(ev: Extract<ChatEvent, { kind: "modelFallback" }>): HTMLElement {
-  const turn = el("div", "turn turn-retried turn-modelswap");
-  turn.appendChild(dot("ring"));
-  const line = el("div", "retried-line modelswap-line");
-  const txt = el("span", "retried-text modelswap-text");
+  // A safeguards refusal the CLI retried on a fallback model: the swap must be visible where it happened
+  // (the user 2026-08-03), as a SOURCED notice in the shared notice-card grammar (T279). The head is the
+  // gist: whose safeguards flagged the message, the refusal category when the API named one, and which
+  // model answered instead. The fold holds the API's explanation (when it sent one) and the CLI's own
+  // line, verbatim. 'local' scope: only that reply (a subagent's or a side question's) came from the
+  // fallback model and the session's model is unchanged, so the head says so instead of "switched".
   const from = ev.from ? prettyModel(ev.from) : "";
   const to = ev.to ? prettyModel(ev.to) : "a fallback model";
-  txt.textContent = `${from || "The model"}'s safeguards flagged this message · switched to ${to}`;
-  line.appendChild(txt);
-  turn.appendChild(line);
-  if (ev.md) {
-    const body = el("div", "modelswap-body");
-    body.textContent = ev.md;
-    const key = ev.uuid ? "mswap:" + ev.uuid : undefined;
-    applyFold(body, "expanded", key);
-    line.title = "click for the full notice";
-    line.addEventListener("click", () => rememberFold(body, "expanded", key));
-    turn.appendChild(body);
-  }
+  const cat = (ev.category || "").trim();
+  const local = ev.scope === "local";
+  const head = `${from || "The model"}'s safeguards flagged this message${cat ? ` (${cat})` : ""} · ` +
+    (local ? `this reply came from ${to}` : `switched to ${to}`);
+  const body = el("div", "refusal-notice");
+  // the fold's first line restates the swap and the category: a narrow pane ellipsizes the head from the
+  // right, which cuts exactly these two facts, and a compact view must never dead-end (the full head is
+  // the hover too)
+  const swapLine = el("div", "refusal-swap");
+  swapLine.textContent = `${from || "the model"} → ${to}${cat ? " · " + cat : ""}`;
+  body.appendChild(swapLine);
+  const expl = (ev.explanation || "").trim();
+  if (expl) { const p = el("div", "refusal-explanation"); p.textContent = expl; body.appendChild(p); }
+  if (ev.md) { const p = el("div", "refusal-cli-line"); p.textContent = ev.md; body.appendChild(p); }
+  const turn = noticeCard({ variant: "refusal", chip: "safeguards", head, body,
+                            collapsible: body.childNodes.length > 0, key: ev.uuid ? "mswap:" + ev.uuid : undefined });
+  turn.querySelector(".notice-head-text")?.setAttribute("title", head);
   return turn;
 }
 
