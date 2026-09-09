@@ -11198,7 +11198,7 @@ function dressReplyChip(b: HTMLButtonElement, dir: Dir, chip: ReadyChip | null):
 }
 function updateReplyChips(): void {
   const c = document.getElementById("content");
-  const s = activeId ? sessions.get(activeId) : null;
+  const s = activeId ? liveSession(activeId) : null;   // a skeleton tab's stale session shows no chips (skeleton-tabs-wiring.test.ts)
   const v = activeId ? views.get(activeId) : null;
   const H = c ? c.clientHeight : 0;
   const ready = activeId ? (commentThreads.get(activeId) || []).filter(isReplyReady) : [];
