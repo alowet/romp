@@ -19506,17 +19506,21 @@ def _pr_watch_notice(verdict, repo, pr, detail="", replay=False, ended_owner="")
            else "you asked romp to watch")
     if verdict == "merged":
         body = "[romp] The pull request %s has MERGED: %s. This watch is done." % (who, ref)
+        gist = "pull request %s merged" % ref
     elif verdict == "closed":
         body = ("[romp] The pull request %s was CLOSED without merging: %s. "
                 "This watch is done." % (who, ref))
+        gist = "pull request %s closed without merging" % ref
     elif verdict == "failed":
         body = ("[romp] The pull request %s has a FAILED check (%s): %s. "
                 "It will not land on its own — it needs your attention. This watch is done."
                 % (who, detail or "a check", ref))
+        gist = "pull request %s has a failed check" % ref
     else:   # the loud gh-failure retire
         body = ("[romp] romp could not read %s (gh said: %s) after several tries, so this watch was "
                 "dropped — check `gh auth status` on this machine and re-register with `romp watch-pr` "
                 "if you still need it." % (ref, detail or "an unknown error"))
+        gist = "the watch on pull request %s was dropped" % ref
     if ended_owner:
         body += " That session has ended, so this comes to you as the escalation contact named for it."
     if replay:
@@ -19524,6 +19528,9 @@ def _pr_watch_notice(verdict, repo, pr, detail="", replay=False, ended_owner="")
     # romp-injected: the chat classifies by MARKER, never by prose (T130) — without it this notice
     # rendered as a generic tagged machine message instead of wearing the romp attribution the
     # nudges wear; romp-system marks the mechanics-notice family; the tag stays as the shape's id.
+    # romp-gist is the one-line user-facing head the chat shows (2026-09-08, see sdk_backend); it
+    # closes the prose line so the marker tail below stays LAST (test_pr_watch pins the tail's end).
+    body += _romp_gist(gist)
     return body + "\n\n<!-- romp-injected --><!-- romp-system --><!-- romp-tag: pr-watch -->"
 
 
@@ -20025,6 +20032,8 @@ def _watch_notice(kind, row, detail=""):
     watch service, like the pr-watch and restart notices). PURE for the voice test. The session's
     own `note` leads when present — the user's words for what they were waiting on."""
     what = row.get("note") or ("`%s`" % str(row.get("cmd") or "")[:120])
+    gist = {"met": "the condition it was watching now holds", "timeout": "a watch timed out without holding",
+            "soft": "still watching past the requested bound"}.get(kind, "a watch command could not run")
     if kind == "met":
         body = ("[romp] The condition you asked romp to watch now HOLDS: %s. This watch is done."
                 % what)
@@ -20045,7 +20054,8 @@ def _watch_notice(kind, row, detail=""):
         body = ("[romp] The watch command could not run at all (%s): %s. This watch was dropped — "
                 "fix the command and re-register with `romp watch`."
                 % (detail or "exec failed", what))
-    # same marker discipline as the pr-watch notice above (T130)
+    # same marker discipline as the pr-watch notice above (T130); the gist closes the prose line, the tail stays last
+    body += _romp_gist(gist)
     return body + "\n\n<!-- romp-injected --><!-- romp-system --><!-- romp-tag: watch -->"
 
 
@@ -22868,9 +22878,28 @@ def _genuine_queued(text):
     return not ("romp-msg-id" in t or t.startswith("####################") or "\U0001F4EC" in t)
 
 
+# A [romp] mechanics notice's ONE-LINE, user-facing head (2026-09-08): `<!-- romp-gist: … -->`, written by the
+# notice's emitter beside its other markers (sdk_backend BOOT_RESUME_NUDGE & co., _pr_watch_notice,
+# _watch_notice) and lifted here into ev["gist"], so the chat never has to show the agent-facing body's first
+# sentence as a head. Comment form only, like every other romp marker: prose merely mentioning a gist is not one.
+ROMP_GIST_RE = re.compile(r"<!--\s*romp-gist:\s*(.*?)\s*-->")
+
+
+def _romp_gist(text):
+    """The marker an emitter appends to a romp SYSTEM notice — the head the chat shows for it."""
+    return "<!-- romp-gist: %s -->" % str(text or "").replace("-->", "").strip()
+
+
+def _romp_system_gist(text):
+    """The lifted gist of a romp SYSTEM notice, or None when the notice predates gists (the chat falls back to
+    the first line then, as it always did)."""
+    m = ROMP_GIST_RE.search(text or "")
+    return m.group(1) if m else None
+
+
 def _queued_romp_flags(text):
-    """The flags a LANDED romp-injected message gets from its markers (romp / rompSystem / rompAuto — see the
-    user-event build), read off a QUEUED text so the client can draw the same gray romp notice grammar for a
+    """The flags a LANDED romp-injected message gets from its markers (romp / rompSystem / rompAuto / gist — see
+    the user-event build), read off a QUEUED text so the client can draw the same gray romp notice grammar for a
     notice romp itself queued (T243, the user 2026-09-07: a queued watch notice wore the user's own pending
     bubble). The markers stay in the text; the client hides them the way the landed card does."""
     t = text or ""
@@ -22879,6 +22908,9 @@ def _queued_romp_flags(text):
         out["romp"] = True
     if "<!-- romp-system -->" in t:
         out["rompSystem"] = True
+        g = _romp_system_gist(t)
+        if g:
+            out["gist"] = g
     if "<!-- romp-auto -->" in t:
         out["rompAuto"] = True
     return out
@@ -30316,6 +30348,9 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                                     ev["rompSystem"] = True  #   distinctly → its OWN notice card, not a nudge bubble.
                                     #   Comment form only (the user 2026-07-08): content merely MENTIONING
                                     #   romp-system must not flip the card kind (same class as ROMP_INJECT_RE).
+                                    g = _romp_system_gist(text)   # the notice's user-facing head (2026-09-08)
+                                    if g:
+                                        ev["gist"] = g
                             if imgs:
                                 ev["images"] = imgs
                             events.append(ev)
