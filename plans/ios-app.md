@@ -18,6 +18,13 @@ heuristics; a dead sid gets the revive prompt, never a silent miss) and, for a c
 with `replaceState`. The app icon wears the count (`navigator.setAppBadge` — the SW paints it while
 the app is closed, the shell trues it up over its WS on connect and on every change).
 Implementation notes that amend this sketch:
+- A tap on a Home Screen app alive in the BACKGROUND reaches none of the roads above (2026-09-09, on
+  a real iPhone): iOS lists no window client for it, so the worker takes `openWindow`; iOS brings the
+  existing page forward without a load (no link) and without a client to message, then ends the
+  worker. The worker therefore writes every session-addressed tap to the Cache API first (one entry,
+  `/__romp/tap` in the `romp-tap` cache) and the shell reads it on boot, `visibilitychange`→visible,
+  `pageshow` and window `focus`, landing it once by id (`via: 'store'`), deleting the entry and acking
+  the worker. A boot on the deep link drops the stored tap rather than landing it twice.
 - The shell background is `#1e1e1e`, not the `#101418` guessed below (that is the login page);
   the manifest and theme-color use `#1e1e1e`.
 - The manifest and the three icon PNGs are served auth-EXEMPT: browsers fetch a manifest (and
