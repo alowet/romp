@@ -4449,8 +4449,10 @@ def _judge_timeline_views(blob, base=None, seq_floor=0, edited=None, foreign=Non
         # blob missing its own creates. Rows only, never stored — the bound stands.
         # ROWS ARE BOUNDED to `bound` of them (the 2026-09-05 review): the rows, the loud
         # notice and the ack's `error` were O(N) in the posted array, so a 100k-entry post (a client
-        # bug, or any page holding the socket) drew a ~22 MB ack that overran WS_QUEUE_BYTES and
-        # dropped the poster's own socket before the ack was queued. Every unread store tag is still
+        # bug, or any page holding the socket) drew a ~22 MB ack, which under the budget rule of the
+        # time (queued bytes plus the frame against WS_QUEUE_BYTES) dropped the poster's own socket
+        # before the ack was queued; since T278 a lone big frame is delivered, and the bound stands
+        # for the pane's sake, a 22 MB ack being nothing a client should have to parse. Every unread store tag is still
         # kept, however far past the bound its copy sat (at most the store's 32); past the first
         # `bound` unread entries the rest are ONE summary row carrying their count and how many of
         # them `edited` names (`moreEdited`), which the door's ok rule reads — a client whose own
@@ -35685,6 +35687,19 @@ def _ws_accept(key):
 # stall being fixed here (caught by test_ws_send_bounded, which overran a 32-frame cap with 40 keepalives
 # a healthy client would have drained fine). Bytes track the thing that actually matters: a client behind
 # by 16 MB of view payloads has stopped reading, while any burst of ~40-byte keepalives is noise.
+# "Behind" is the bytes queued beyond the LARGEST frame in the queue (T278, 2026-09-08): one frame may be
+# arbitrarily big and is not the peer's fault; everything else waiting is the backlog, and the budget bounds a
+# peer that has stopped draining, not a frame that is simply big. The largest, not the head: a connect push
+# enqueues the small lanes skeleton, then the 17 MB bars, then two small frames within microseconds, and
+# whether the skeleton has left the queue by the time the small frames arrive is a scheduling accident.
+# The devbox's timeline-bars frame grew to 17.7 MB against this budget, so every fresh timeline connection
+# was dropped on its FIRST frame ("0 bytes behind"), reconnected, and was dropped again — 299 drops in one
+# evening, a 17 MB frame rebuilt and serialized several times a minute for nothing, and a laptop that never
+# saw this machine's bars. An empty queue accepts any frame; a healthy peer drains the head at wire speed
+# while the small deltas queue behind it; a wedged peer's stuck head lets the backlog behind it grow past
+# the budget, which is the drop. Frame sizes ride a deque beside the queue (qsizes), appended and enqueued
+# as ONE step under the client's queue lock and popped as each frame completes: one sender thread, one
+# queue, so completions are FIFO and the deque mirrors the queue exactly.
 WS_QUEUE_BYTES = int(os.environ.get("ROMP_WS_QUEUE_BYTES", str(16 * 1024 * 1024)))
 
 
@@ -35737,15 +35752,25 @@ def _ws_sender(q, sock, lock, client):
         finally:
             with client["qlock"]:              # released whether the frame landed or the socket died
                 client["qbytes"] -= len(s)
+                sizes = client.get("qsizes")
+                if sizes:
+                    sizes.popleft()            # this frame was the head of both; the next queued frame is now in flight
 
 
 def _mk_ws_send(q, sock, client):
-    """The client's `send`: enqueue, never block. Past WS_QUEUE_BYTES the peer has stopped draining, so the
-    client is dropped and its socket shut down — which also unblocks its sender thread, parked in a write
-    that will now fail, instead of leaking it for the life of the kernel."""
+    """The client's `send`: enqueue, never block. With more than WS_QUEUE_BYTES queued beyond the largest queued
+    frame the peer has stopped draining (T278: a frame that is merely big is delivered; see the budget's
+    comment), so the client is dropped and its socket shut down — which also unblocks its sender thread,
+    parked in a write that will now fail, instead of leaking it for the life of the kernel. The size append and
+    the enqueue are one step under the queue lock: two producers (the pusher and the heartbeat, or a handler's
+    direct reply) interleaving between them would leave the deque in a different order from the queue."""
     def send(s):
         with client["qlock"]:
-            if client["qbytes"] + len(s) > WS_QUEUE_BYTES:
+            sizes = client.get("qsizes")
+            if sizes is None:
+                sizes = client["qsizes"] = collections.deque()
+            behind = client["qbytes"] - (max(sizes) if sizes else 0)
+            if behind > WS_QUEUE_BYTES:
                 client["alive"] = False
                 try:
                     sock.shutdown(socket.SHUT_RDWR)
@@ -35753,12 +35778,13 @@ def _mk_ws_send(q, sock, client):
                     pass
                 # Raise: every caller already treats an exception from send as "mark this client dead".
                 # Logged HERE, once per client (_note_ws_drop): the drop is loud whichever caller's frame
-                # tipped the budget — the ~60 direct client["send"] replies as much as the push paths.
-                why = "%d bytes behind" % client["qbytes"]
+                # found the backlog past the budget — the ~60 direct client["send"] replies as much as the push paths.
+                why = "%d bytes behind" % behind
                 _note_ws_drop(client, why, len(s))
                 raise OSError("ws client %s is %s — dropping" % (client.get("app"), why))
             client["qbytes"] += len(s)
-        q.put(s)                               # unbounded; the byte budget above is the real bound
+            sizes.append(len(s))
+            q.put(s)                           # unbounded, never blocks; the byte budget above is the real bound
     return send
 
 
