@@ -3799,6 +3799,14 @@ def _replay_overrides(fsid, store, lines=None):
             return False
     applied = False                                    # any write → load_goals re-runs rollup (one truth)
     arch_nodes = None                                  # the archive is read once, only if a restore entry needs it
+    last_seal = {}                                     # node -> the LAST clear/unclear row's op, in journal order: a
+    for ln in lines:                                   # clear, undo and clear inside one second are settled by the rows'
+        try:                                           # order, not by their integer seconds (review find, 2026-09-09)
+            ev0 = json.loads(ln)
+        except ValueError:
+            continue
+        if ev0.get("op") in ("clear", "unclear") and ev0.get("node"):
+            last_seal[ev0["node"]] = ev0["op"]
     for ln in lines:
         try:
             ev = json.loads(ln)
@@ -3880,9 +3888,9 @@ def _replay_overrides(fsid, store, lines=None):
             # reopen (e.g. the card reply seconds after the restore) must NOT eat it, so `later` is
             # deliberately not consulted. was_done mirrors _mark_nodes_cleared: re-settle a completed
             # top so the restored card returns to Completed, not Working.
-            if _twin("reopen", undo=True) or any(e.get("kind") == "clear"
-                                                 and int(e.get("ev_t") or 0) > t for e in uev):
-                continue                               # survived, or re-dismissed since
+            if _twin("reopen", undo=True) or last_seal.get(ev.get("node")) == "clear" or any(
+                    e.get("kind") == "clear" and int(e.get("ev_t") or 0) > t for e in uev):
+                continue                               # survived, re-dismissed by a LATER row (journal order, 2026-09-09), or since
             was_done = nd.get("parentId") is None and (
                 store.get("status", {}).get(ev.get("node")) == "completed" or nd.get("nodeComplete"))
             if record_verdict(store, nd, "user", "reopen", t, why="undo clear", undo=True):
@@ -3894,12 +3902,11 @@ def _replay_overrides(fsid, store, lines=None):
             # save clobbered re-seals exactly as the live one did (2026-09-09; the unclear arm's mirror).
             # Voided by a LATER undo: a strictly-later user reopen (the undo-clear's own verdict, or its
             # replayed "unclear" row) outranks this entry; the twin check keeps the survived write as is.
-            if nd.get("cleared") or _twin("clear") or any(e.get("kind") == "reopen"
-                                                          and int(e.get("ev_t") or 0) >= t for e in uev):
-                continue                               # sealed already, survived, or undone at or after it (an undo in
-                #                                        the clear's own second is the later gesture: the ledger's undo
-                #                                        row follows its clear row, so at-or-after voids, unlike the
-                #                                        unclear arm, where a later clear is the only voider)
+            if nd.get("cleared") or _twin("clear") or last_seal.get(ev.get("node")) != "clear" \
+                    or any(e.get("kind") == "reopen" and int(e.get("ev_t") or 0) > t for e in uev):
+                continue                               # sealed already, survived, undone by a LATER row (the undo's
+                #                                        unclear row follows its clear row in the journal, whatever the
+                #                                        seconds say), or reopened strictly later by another gesture
             if record_verdict(store, nd, ev.get("src") or "user", "clear", t,
                               why=ev.get("why") or "cleared from the feed"):
                 applied = True

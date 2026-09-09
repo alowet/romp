@@ -375,6 +375,33 @@ export function mergeHostOrder(perHost: Record<string, readonly string[]>, hostS
  *  had been quiet. The pair comes from the LOCAL host's frame; with no local frame yet, from the newest
  *  remote arrival that carries a clock — the same host for both halves, so they always describe one frame.
  *  Absent `arrivedAt` (a caller with no wire), no `nowAt` is set and the pane anchors on its own arrival. */
+/** Apply the viewer's foreign cleared ids (bare, from the local payload) over REMOTE rows of a merged feed:
+ *  remote asks/items they name are dropped; remote archived tops they name read cleared, rolled down to the
+ *  subtree (the live tree's top-only cross-off). Rewrites `merged.asks`/`merged.items` and each remote ledger
+ *  entry's archivedTops with fresh row objects; the host payloads' own rows are not mutated. No-op without ids. */
+export function applyViewerClears(merged: any, ledgers: any[], clearedForeign: any): void {
+  const foreign = new Set<string>(Array.isArray(clearedForeign) ? clearedForeign.filter((x: any) => typeof x === "string") : []);
+  if (!foreign.size) return;
+  const hit = (id: any) => typeof id === "string" && hostOf(id) !== LOCAL && foreign.has(bareId(id));
+  merged.asks = merged.asks.filter((a: any) => !hit(a?.itemId));
+  merged.items = merged.items.filter((c: any) => !hit(c?.itemId));
+  ledgers.forEach((l: any, i: number) => {
+    if (!l || typeof l.sid !== "string" || hostOf(l.sid) === LOCAL) return;
+    const tops = l.ledger?.archivedTops;
+    if (!Array.isArray(tops) || !tops.length) return;
+    let rootCleared = false, changed = false;
+    const out = tops.map((n: any) => {
+      if (n?.depth === 0) rootCleared = !!n.cleared || hit(n.id);
+      const c = !!n?.cleared || hit(n?.id) || (n?.depth !== 0 && rootCleared);
+      if (c === !!n?.cleared) return n;
+      changed = true;
+      return { ...n, cleared: c };
+    });
+    // a fresh ENTRY too, never the host payload's own object: the merge pushed those by reference
+    if (changed) ledgers[i] = { ...l, ledger: { ...l.ledger, archivedTops: out } };
+  });
+}
+
 export function mergeHostFeeds(perHost: Record<string, any>, hostSeq: readonly string[],
                                view: readonly string[] = [], deadHosts: readonly string[] = [],
                                arrivedAt: Record<string, number> = {}): any {
@@ -440,6 +467,14 @@ export function mergeHostFeeds(perHost: Record<string, any>, hostSeq: readonly s
   // the grouped feed ranks its session runs off `order`, so it takes the viewer's arrangement like the tab
   // strip does — the two surfaces have to agree or the feed's groups and the tabs read in different orders.
   merged.order = applyViewOrder(merged.order, view);
+  // The VIEWER's ledger over remote rows (review find, 2026-09-09): a remote kernel's feed and its archive
+  // projection read only their own cleared.jsonl, and the local ledger can hold a remote card's clear (a
+  // gesture taken while the owner was unreachable, a ledger copied between machines, an older client). The
+  // local payload carries those ids (kernel: clearedForeign, bare); a remote ask or item they name is
+  // dropped, and a remote archived top they name reads cleared, its subtree with it, exactly as the owning
+  // kernel's own overlay would have read them. Local rows are untouched: the local kernel already applied
+  // its ledger to them.
+  applyViewerClears(merged, ledgers, local.clearedForeign);
   if (anyLedgers) merged.ledgers = ledgers;
   else delete merged.ledgers;
   if (anyDismissed) merged.dismissedCount = dismissed;
