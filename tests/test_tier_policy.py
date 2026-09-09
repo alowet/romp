@@ -1206,7 +1206,7 @@ class DeclaredTier(unittest.TestCase):
         # tracking image or text that reads like an approval must come back as literal text (a code span,
         # with any backtick of its own removed so the span cannot be broken out of)
         # (first words that are no tier: under T273b a tier word followed by prose is a declaration)
-        for raw in ("<img src=https://x.example/p.png>", "[fix](https://x.example) approved", "notatier` **APPROVED** `"):
+        for raw in ("<img src=https://x.example/p.png>", "[notatier](https://x.example) approved", "notatier` **APPROVED** `"):
             tier, why = tp.declared_tier("Tier: " + raw)
             self.assertIsNone(tier)
             shown = raw.replace("`", "").strip()          # the excerpt drops the value's own backticks, then trims

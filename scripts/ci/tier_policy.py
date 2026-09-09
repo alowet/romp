@@ -94,12 +94,16 @@ _ODD_MAX, _ODD_LEN = 3, 40    # the check summary quotes a bounded excerpt of a 
 _WORD_SPLIT = re.compile("[\\s`*_.,;:!?()\\[\\]{}<>\"'\u2018\u2019\u201c\u201d\u00ab\u00bb\u2026\u2014\u2013/]+")
 
 
+_HTML_TAG = re.compile(r"<[^<>\n]*>")   # inline HTML around the word (<b>fix</b>) renders as the word alone
+
+
 def _tier_words(raw):
-    """The words of a tier line's value, each read as a tier or None: split on whitespace, markup and
-    punctuation (the alias mapped, lower-cased, an inner hyphen kept: major-feature; a hyphen at a word's
-    ends dropped). Empty words are dropped. Pure."""
+    """The words of a tier line's value, each read as a tier or None: inline HTML tags removed, then split on
+    whitespace, markup and punctuation (the alias mapped, lower-cased, an inner hyphen kept: major-feature; a
+    hyphen at a word's ends dropped). Empty words are dropped. Pure. The template's placeholder is one tag
+    and so reads as no words; the summary still quotes it, from the raw value."""
     out = []
-    for w in _WORD_SPLIT.split(raw or ""):
+    for w in _WORD_SPLIT.split(_HTML_TAG.sub(" ", raw or "")):
         w = w.strip("-").lower()
         if w:
             out.append(TIER_ALIASES.get(w, w) if TIER_ALIASES.get(w, w) in TIERS else None)
