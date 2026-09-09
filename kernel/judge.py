@@ -947,8 +947,10 @@ def _log_judge_error(judge, fsid, err, note=None, goal=None, seg=None):
              behind and the shape of the menu that died), "store-quarantined" (a goals store that
              could not be parsed was moved aside to <file>.corrupt-<stamp> and the session started fresh),
              "store-unreadable" (a goals store that cannot be READ — EACCES, EIO — filed once per fault
-             episode by load_goals_or_fault; inside a judge pass the raise instead reaches the pass
-             wrapper's "pass-crash" row), "store-unwritable" (a goals store that read but whose publish
+             episode by load_goals_or_fault and the readers that share its boundary, run_propagate's
+             recipient read and the courier's sender-board walk among them; a reader inside a judge pass
+             that loads a store strictly instead raises into the pass wrapper's "pass-crash" row),
+             "store-unwritable" (a goals store that read but whose publish
              then failed under a user gesture, the save path's own strict read or the write itself; filed
              once per fault episode by save_goals_or_fault, and the gesture is answered on its socket)
       note   the evidence — reply tail, error message, exception name, or the give-up scope + re-arm
@@ -14554,22 +14556,42 @@ def _handoff_backref(mid):
     walk over the read-only view; its key is _backref_key, taken before the reads, so a store written
     during the walk moves the key the next call takes (a set read mid-write is served no further than
     that call). The first sender in discover order wins, as the walk answered; a completed handoff node
-    is no backref. A store that raises leaves nothing cached (the caller's own boundary logs it)."""
+    is no backref.
+
+    A sender store that cannot be read (EACCES, EIO, a directory at the path) is SKIPPED for this call
+    through the per-session boundary (load_goals_shared_or_fault: one store-unreadable row per fault
+    episode, as every other reader of a goal store files it), and the other senders answer. The fault is
+    one sender's; left to raise it failed the lookup for every message id and every recipient, so the
+    courier filed a link-attach pass-crash row per placed unlinked delegate per pass and landed no link
+    anywhere (the walk the memo replaced had answered every sender before the fault). The map is then
+    NOT published: a fault moves no file key (a permission fix changes neither inode, mtime nor size),
+    so a cached map missing a sender would be served after the store reads again. While the fault lasts,
+    a call whose key no longer matches the published map walks the read-only views again, which the shared
+    store cache serves (a map published before the fault keeps serving while its key stands: the content it
+    describes has not changed); a recipient whose sender is the faulted store gets the '' pair, attaches
+    nothing, and the courier gate keeps it scanned until the sender reads again, the wait it already models
+    for a sender that does not yet track the message. The boundary catches OSError only, as every reader
+    boundary does: any other raise out of a sender's read leaves the walk as before, cached nowhere and
+    filed by the courier's own catch."""
     fleet = discover(int(time.time()))
     key = _backref_key(fleet)
     slot = _BACKREF_MEMO["slot"]
     if slot is not None and slot[0] == key:
         _BACKREF_STATS["served"] += 1
         return slot[1].get(mid, ("", ""))
-    mp = {}
+    mp, partial = {}, False
     for fsid, path, anchor, name in fleet:
-        st = load_goals_shared(fsid)
+        st, fault = load_goals_shared_or_fault(fsid)
+        if fault is not None:
+            partial = True                           # this sender's row is filed; the others still answer
+            continue
         for nid, nd in st.get("nodes", {}).items():
             h = nd.get("handoff")
             if isinstance(h, dict) and h.get("msgId") is not None and not nd.get("nodeComplete"):
                 mp.setdefault(h["msgId"], (fsid, nid))
     _BACKREF_STATS["built"] += 1
-    _BACKREF_MEMO["slot"] = (key, mp)
+    if not partial:
+        _BACKREF_MEMO["slot"] = (key, mp)            # a map missing a sender is not published (see above)
     return mp.get(mid, ("", ""))
 
 
