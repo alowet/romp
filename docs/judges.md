@@ -459,6 +459,10 @@ permission/API-error floors: one interrupt at a time, the present event first.
 
 - Toggles: `CLOSER_ON`, `GROUPER_ON`, `DISTILLER_ON`, `CONSOLIDATE_ON`.
   Models: `STATE/judge-model` (triage), `STATE/index-model`.
+  Pool width: `STATE/judge-concurrency` (the gear's Judge concurrency, 1..16,
+  read fresh each pass; empty = `ROMP_JUDGE_CONCURRENCY` as read at load,
+  else 6). Every pool reads it at call time (`_conc`, or `_judge_concurrency()`
+  directly); `DEATH_DRAIN_PER_PASS` alone stays on the load-time value.
 - Logs: `STATE/judge-usage.jsonl` (per-call cost, one name per prompt),
   `STATE/judge-errors.jsonl` (the row contract above; kinds are parse,
   call, give-up, sweep-cut, cite-miss, rate-limited, task-store, history-unreadable,
