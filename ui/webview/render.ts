@@ -1,6 +1,5 @@
 import { marked } from "marked";
-import DOMPurify from "dompurify";
-import type { Config } from "dompurify";   // the one sanitizer profile both md() and userMd() share
+import { sanitizeMd, userContentTarget } from "./md-sanitize";   // the one sanitizer every markdown surface shares, and the lookup for a message's own `#` links
 import hljs from "highlight.js/lib/core";
 import bash from "highlight.js/lib/languages/bash";
 import python from "highlight.js/lib/languages/python";
@@ -1122,15 +1121,13 @@ function el(tag: string, cls?: string): HTMLElement {
   return e;
 }
 
-// ONE sanitizer profile for both renderers. svg profile too (the user 2026-08-19): KaTeX's html output
-// still draws STRETCHY glyphs — \sqrt radicals, wide accents, extensible arrows — as inline <svg><path>,
-// and the html-only profile silently ate them: $\sqrt{d}$ rendered as a bare serif "d", the radical gone.
-// DOMPurify's svg profile is still sanitized (no scripts, handlers, or foreignObject). Keep data: URIs on
-// <img> (the CSP allows them and inline transcript images rely on them).
-// ALLOW_DATA_ATTR: false (2026-09-07): transcript HTML must not mint data-* attributes — the chat's
-// document-level delegate keys every action off data-act, so a `<span data-act="stopRetrying">` in a
-// message would post an interrupt on a click. Nothing the renderer needs rides data-* through md().
-const MD_PURIFY: Config = { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"], ALLOW_DATA_ATTR: false };
+// ONE sanitizer for both renderers, shared with the file viewer: sanitizeMd in md-sanitize.ts holds the
+// profile (html + svg, data: URIs on <img>, no data-*, and rules modelled on GitHub's for a message's own
+// HTML: no <style>, no form controls, prefixed ids, colour-only inline styles) and returns the sanitized <body>
+// for the DOM walk below. KaTeX is rendered AFTER the sanitizer, into the inert placeholders the math
+// extensions emit (math.ts renderMathPlaceholders): its layout is all inline style, which the colour-only
+// rule would strip, so it never passes through DOMPurify; the fill is a post-pass sanitizeMd itself runs,
+// registered by chat-md.ts, the module that installs the grammar.
 
 function md(src: string, repo: string | null = prRepoFor()): string {
   // Transcript text (user prompts, assistant output, subagent reports, postal
@@ -1138,15 +1135,15 @@ function md(src: string, repo: string | null = prRepoFor()): string {
   // must be sanitized before it ever reaches .innerHTML — otherwise a payload
   // like `<img src=x onerror=...>` or `[x](javascript:...)` runs in the webview
   // (which can postMessage the host to open files / drive sessions). DOMPurify
-  // strips event-handler attributes and dangerous URL schemes (profile: MD_PURIFY).
+  // strips event-handler attributes and dangerous URL schemes (md-sanitize.ts).
   try {
     const dirty = marked.parse(src) as string;
-    // RETURN_DOM hands back the sanitized <body> instead of its innerHTML — the same nodes, ours to
-    // walk once before the serialization DOMPurify would otherwise have done itself: PR references
+    // sanitizeMd hands back the sanitized <body> instead of its innerHTML: the same nodes, ours to
+    // walk once before the serialization DOMPurify would otherwise have done itself. PR references
     // in the prose (`#123`, `PR #123`, `owner/repo#123`) become links to the session's repository
     // (pr-links.ts; the user 2026-09-06). Text inside code, pre or an existing anchor is skipped, so
     // the sanitizer's verdicts stand and a marked-autolinked GitHub URL is never wrapped twice.
-    const clean = DOMPurify.sanitize(dirty, { ...MD_PURIFY, RETURN_DOM: true }) as HTMLElement;   // the sanitized <body>
+    const clean = sanitizeMd(dirty);   // the sanitized <body>, its math rendered
     linkifyPrRefs(clean, repo);
     return clean.innerHTML;
   } catch { const d = document.createElement("div"); d.textContent = src; return d.innerHTML; }
@@ -1160,7 +1157,7 @@ function md(src: string, repo: string | null = prRepoFor()): string {
 // walk as md(): a `#123` the user typed links to the session's repository too.
 function userMd(src: string, repo: string | null = prRepoFor()): string {
   try {
-    const clean = DOMPurify.sanitize(userMdHtml(src), { ...MD_PURIFY, RETURN_DOM: true }) as HTMLElement;
+    const clean = sanitizeMd(userMdHtml(src));   // the sanitized <body>, its math rendered
     linkifyPrRefs(clean, repo);
     return clean.innerHTML;
   } catch { const d = document.createElement("div"); d.textContent = src; return d.innerHTML; }
@@ -1330,7 +1327,45 @@ document.addEventListener("click", (e) => {
   const a = (e.target as HTMLElement)?.closest?.("a[href]") as HTMLAnchorElement | null;
   if (!a) return;
   const href = a.getAttribute("href") || "";
-  if (!/^[a-z][a-z0-9+.-]*:/i.test(href)) return; // fragment/relative — leave alone
+  if (href.startsWith("#")) {
+    // An in-page anchor in a message (a footnote's back link, `[section](#install)` over the reply's own `<a name>`):
+    // the sanitizer prefixes every author id and name user-content- (md-sanitize.ts, GitHub's rule) and leaves the
+    // href as written, so the browser's default lookup, which reads the bare name, finds nothing and the click would
+    // die. Resolved here the way GitHub's page script does: the target is looked up under the prefix or bare
+    // (userContentTarget), in the message's own rendered body first (its note before a same-named element in an
+    // older message), then the whole document; found, it is revealed and scrolled into view and the default action
+    // cancelled (the hash stays as it was: the target is not a page location). Not found, the click is left to the
+    // browser, as it was. A modified click (ctrl, ⌘ or shift asked the browser for a tab or a window) keeps the
+    // browser's, the rule the .md-URL arm below applies. The bodies: `.md`, which every body md() and userMd()
+    // fill wears, and a comment thread's agent reply (commentMsgEl: `div.cmt-msg.agent`), the one body md() fills
+    // that does not; an anchor the page built itself carries a data-act and stands in neither. A link outside a
+    // message (the file viewer's own section links, fv-anchor) is not this handler's: the viewer lands those itself.
+    if (e.ctrlKey || e.metaKey || e.shiftKey) return;
+    const msg = a.hasAttribute("data-act") ? null : a.closest(".md, .cmt-msg.agent");
+    if (!msg) return;
+    let frag = href.slice(1);
+    try { frag = decodeURIComponent(frag); } catch { /* a malformed escape: the spelling as written */ }
+    const target = frag ? userContentTarget(msg, frag) || userContentTarget(document, frag) : undefined;
+    if (!target) return;
+    e.preventDefault();
+    // The browser's fragment navigation REVEALS the target before it scrolls (the HTML spec's ancestor revealing
+    // steps): every closed <details> whose content holds the target is opened, and a `hidden="until-found"` on the
+    // target or an ancestor is removed. scrollIntoView does neither, so the same steps run here, ahead of the
+    // scroll; both shapes pass the sanitizer (details, summary and hidden are kept). A target inside a details'
+    // own <summary> is in view already and opens nothing, as in the browser.
+    for (let n: Element | null = target; n; n = n.parentElement) {
+      if ((n.getAttribute("hidden") || "").toLowerCase() === "until-found") n.removeAttribute("hidden");
+      const p = n.parentElement;
+      if (p && p.localName === "details" && n.localName !== "summary" && !p.hasAttribute("open")) p.setAttribute("open", "");
+    }
+    // a target inside the transcript moves #content, so the move is the pane's own write (every mover of #content
+    // is a writeScroll, attributed); a target elsewhere on the page scrolls its own container the browser's way
+    const cont = document.getElementById("content");
+    if (cont && cont.contains(target)) scrollElInto(cont, target, "start", "section-link");
+    else target.scrollIntoView({ block: "start" });
+    return;
+  }
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(href)) return; // relative: leave alone
   e.preventDefault();
   e.stopPropagation();
   if (location.protocol === "http:" || location.protocol === "https:") {

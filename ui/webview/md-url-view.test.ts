@@ -16,6 +16,7 @@ import * as path from "node:path";
 const web = (f: string) => fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", f), "utf8");
 const RENDER = web("render.ts");
 const VIEW = web("file-view.ts");
+const SANITIZE = web("md-sanitize.ts");   // the one sanitizer both md() and mdBlock call (sanitizeMd)
 const CHAT_CSS = web("styles.css");
 const FEED_CSS = web("feed.css");
 const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
@@ -264,12 +265,12 @@ test("EVERY exit that stops short of consuming the body aborts this open's contr
 
 // ── 5. relative references inside the rendered document ──
 
-test("mdBlock takes the document's location and rewrites relative img/src and a/href AFTER DOMPurify", () => {
+test("mdBlock takes the document's location and rewrites relative img/src and a/href AFTER the sanitizer", () => {
   assert.match(VIEW, /type MdDocLoc = \{ kind: "url"; href: string \} \| \{ kind: "file"; path: string; sid: string \| null \};/);
   assert.match(VIEW, /function mdBlock\(text: string, doc\?: MdDocLoc\): HTMLElement \{/);
-  const sanitize = MD_FN.indexOf("DOMPurify.sanitize(");
+  const sanitize = MD_FN.indexOf("sanitizeMd(");
   const rewrite = MD_FN.indexOf("resolveDocRelative(");
-  assert.ok(sanitize > -1 && rewrite > sanitize, "sanitise first; the rewrite only ever sees what DOMPurify kept");
+  assert.ok(sanitize > -1 && rewrite > sanitize, "sanitise first; the rewrite only ever sees what the sanitizer kept");
   // the ATTRIBUTE, never the property — .src/.href are already resolved against the page (the wrong base)
   assert.match(MD_FN, /const src = img\.getAttribute\("src"\) \|\| "";/);
   assert.match(MD_FN, /const href = a\.getAttribute\("href"\) \|\| "";/);
@@ -390,14 +391,16 @@ test("URL mode: a 200 labelled text/html is refused as a web page, with the way 
 test("rendered markdown never carries data-* attributes into the page, in the viewer and in the chat alike", () => {
   // a document's or a message's raw HTML with data-act=\"stopRetrying\" would otherwise bubble to the
   // document-level delegate and interrupt the active session on a click
-  const sanitizes = (MD_FN.match(/DOMPurify\.sanitize\([^)]*\)/g) || []);
+  // both go through sanitizeMd (md-sanitize.ts), whose one profile forbids data-*
+  const sanitizes = (MD_FN.match(/sanitizeMd\([^)]*\)/g) || []);
   assert.equal(sanitizes.length, 1);
-  assert.match(sanitizes[0], /ALLOW_DATA_ATTR: false/);
+  assert.match(sanitizes[0], /sanitizeMd\(dirty\)/);
   const chatMd = (RENDER.split("function md(src: string, repo: string | null = prRepoFor()): string {")[1] || "").split("\nfunction ")[0];   // the signature carries the PR-link repo (pr-links.ts)
-  assert.match(chatMd, /DOMPurify\.sanitize\(dirty, \{ \.\.\.MD_PURIFY, RETURN_DOM: true \}\)/);
-  assert.match(RENDER, /const MD_PURIFY: Config = \{.*ALLOW_DATA_ATTR: false \};/, "the chat's shared sanitizer config forbids data-*");
+  assert.match(chatMd, /const clean = sanitizeMd\(dirty\);/);
+  assert.match(SANITIZE, /export const MD_PURIFY: Config = \{[\s\S]*?ALLOW_DATA_ATTR: false,[\s\S]*?\};/, "the shared sanitizer's profile forbids data-*");
+  assert.doesNotMatch(VIEW + RENDER, /ALLOW_DATA_ATTR|DOMPurify\.sanitize\(/, "neither caller spells a profile of its own");
   // the viewer's own stamps are set AFTER the sanitize, so they are unaffected
-  assert.ok(MD_FN.indexOf("DOMPurify.sanitize(") < MD_FN.indexOf('a.dataset.act = "fv-open"'));
+  assert.ok(MD_FN.indexOf("sanitizeMd(") < MD_FN.indexOf('a.dataset.act = "fv-open"'));
 });
 
 test("local file mode: a sibling link's #fragment lands after the first RENDERED paint, once", () => {

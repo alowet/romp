@@ -11,9 +11,12 @@
 // Both take the SAME extensions from `chatMdExtensions`, so a user message with math or strikethrough
 // renders exactly as it did before — only its newlines are kept. Pure (no DOM): the executed tests import
 // it directly, the way render-math.test.ts exercises math.ts. Sanitizing is the caller's job: render.ts's
-// userMd() runs the output through the same DOMPurify profile md() uses before it ever reaches innerHTML.
+// userMd() runs the output through the same sanitizer md() uses (sanitizeMd, md-sanitize.ts) before it ever
+// reaches innerHTML; the math fill rides that sanitize as a registered post-pass (below), so no caller
+// renders it by hand.
 import { Marked, type MarkedExtension } from "marked";
-import { mathBlock, mathInline } from "./math";
+import { mathBlock, mathInline, renderMathPlaceholders } from "./math";
+import { registerMdPostPass } from "./md-sanitize";
 
 // Strikethrough requires DOUBLE tildes (the user 2026-06-26). marked's built-in GFM `del` tokenizer also
 // fires on a SINGLE tilde, so prose like "near the ~21 Wh/day budget … gives ~1.5–2 days" renders as one big
@@ -30,16 +33,24 @@ export const delDoubleTilde = {
 } as MarkedExtension;
 
 // TeX math ($..$, $$..$$, \(..\), \[..\]) rendered via KaTeX. All delimiter heuristics (the
-// $-vs-shell/price disambiguation) live in math.ts; the output is plain spans + inline styles
-// (output: "html"), which DOMPurify's html profile in md() passes through unchanged.
+// $-vs-shell/price disambiguation) live in math.ts. The extensions emit an inert placeholder (the TeX as
+// text under md-math-inline / md-math-display), and KaTeX is rendered into it AFTER the sanitizer (math.ts
+// renderMathPlaceholders), because sanitizeMd keeps only colour in an inline style and KaTeX's layout is all
+// inline style. The fill is registered here, once, as a sanitizeMd post-pass: the grammar and its fill travel
+// together, so every sanitizeMd call in a bundle that parses with this grammar renders math (the chat's md()
+// and userMd(); the viewer's mdBlock when it runs inside the chat page, whose marked singleton render.ts
+// arms with these extensions), and a bundle that never imports this module (feed.js) has neither the
+// grammar nor KaTeX.
 export const chatMdExtensions: MarkedExtension[] = [delDoubleTilde, { extensions: [mathBlock, mathInline] }];
+registerMdPostPass(renderMathPlaceholders);
 
 // The user-text instance: the chat grammar with hard line breaks. Its own `Marked` so the singleton's
 // `breaks: false` — every assistant message — is untouched.
 export const userMarked = new Marked({ gfm: true, breaks: true }, ...chatMdExtensions);
 
 /** marked's HTML for the user's own typed text: newlines kept as <br>, otherwise the chat grammar.
- *  UNSANITIZED — render.ts's userMd() is the only caller that reaches innerHTML, and it purifies first. */
+ *  UNSANITIZED: render.ts's userMd() is the only caller that reaches innerHTML; it purifies first, and the
+ *  sanitize renders the math placeholders (the post-pass registered above) on the sanitized DOM. */
 export function userMdHtml(src: string): string {
   return userMarked.parse(src) as string;
 }
