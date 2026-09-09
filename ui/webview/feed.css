@@ -1650,6 +1650,9 @@ a.fileview-gh-note { border-style: dashed; }
 .ctx-item-toggle .ctx-icon.off { color: var(--dim); }
 .ctx-item-body { display: flex; flex-direction: column; line-height: 1.25; }
 .ctx-item-sub { font-size: 0.82em; opacity: 0.6; }
+/* a tag chip standing for an UNSELECTED toggle (the tag-lens menu, T283): faded, its colour kept —
+   the state class; tag-menu.ts paints the same opacity inline for a sheet-less host (TAG_CHIP_OFF_OPACITY) */
+.tag-chip-off { opacity: 0.45; }
 /* the bell BUTTON (the user 2026-07-28, round 4): inline in row1's metadata cluster, right after the
    timestamp — shown only once the card is hovered or it's armed. Off = slashed dim bell; armed (.on) =
    accent bell, always visible. Accent = mechanics chrome, never a status colour.

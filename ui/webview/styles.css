@@ -629,6 +629,9 @@ body.chat-theme-yatharth .tab.active.colored:not(.tab-blocked) {
 /* the tab menu's Tags flyout (the user 2026-08-24): identity dot per union tag, ✕ = remove-
    everywhere, an inline New tag… input — all in the menu vocabulary, no new font sizes */
 .ctx-tag-dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; }
+/* a tag chip standing for an UNSELECTED toggle (the tag-lens menu, T283): faded, its colour kept —
+   the state class; tag-menu.ts paints the same opacity inline for a sheet-less host (TAG_CHIP_OFF_OPACITY) */
+.tag-chip-off { opacity: 0.45; }
 .ctx-tag-x { flex: 0 0 auto; background: none; border: none; color: var(--dim); cursor: pointer; font: inherit; padding: 0 2px; }
 .ctx-tag-x:hover { color: var(--fg); }
 .ctx-item-newtag { cursor: default; }
