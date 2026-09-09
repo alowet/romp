@@ -381,6 +381,7 @@ class _PerfStats:
                 memos[key] = read()
             except Exception:
                 memos[key] = {}
+        memos["nudgeGate"] = dict(_NUDGE_GATE_STATS)   # the nudge walk's placement gate: served vs re-derived (2026-09-09)
         now = time.time()
         return {"now": now, "since": since, "uptime_s": now - _STARTED, "log": _PERF,
                 "process": _process_stats(), "pusher": pusher, "stages_ms": stages,
@@ -8459,7 +8460,7 @@ def _intr_block_stands(sid, gid):
     once the file read again."""
     if not gid:
         return False
-    store, fault = jd.load_goals_or_fault(sid)
+    store, fault = jd.load_goals_shared_or_fault(sid)   # a pure read: the shared view, one parse per file version (2026-09-09)
     if fault is not None:
         return True
     nd = store.get("nodes", {}).get(gid)
@@ -10766,6 +10767,58 @@ def _nudge_response_ready(turns, store, rec, gid, now):
     return True, resp
 
 
+_nudge_gate_memo = {}            # sid -> (parse key, the shared view object, clears-log stat, unplanned): the gate's answer while its inputs stand
+_NUDGE_GATE_STATS = {"served": 0, "derived": 0}   # /perf memos.nudgeGate: how often the walk re-derived the gate
+_NUDGE_GATE_MEMO_MAX = 512
+
+
+def _nudge_placement_gate(sid, turns, store):
+    """The planner-placement gate's answer (is any unit of this parse still unplaced?), DERIVED ONCE per
+    (parse, store) and served while both stand (2026-09-09). The derivation re-segments every turn, applies
+    the seams, builds the plan units and normalizes every recorded placement key; on the maintainer's box it
+    was 70% of the kernel's CPU, run for every idle session on every pusher cycle with nothing changed
+    (py-spy: _seg_key, _placed_key, _segment_id, _mint_quote under _auto_nudge_session). Its inputs: the
+    parse, the store's bytes, and the clears log (_placed_key scopes its fuzzy match by the episode floor).
+
+    Both halves are IDENTITY-bound, never stat'd after the read (review 2026-09-09: the first cut stat'd the
+    store file after the walk had read the view, so a placement a judge published in between was keyed under
+    the NEW file with the OLD bytes' answer and served until the store next moved). The parse half is
+    parsed_session's cached object; the store half is the shared read-only view object itself, which the
+    shared loader replaces whenever the store, its override journal or the archive moves, and the answer is
+    cached only when that view is STILL the current one after the derivation. The clears log's stat is taken
+    BEFORE the derivation, so a boundary appended during it leaves a key the next cycle's stat cannot match.
+    A parse the cache does not hold, or a store that is not the current shared view, is derived every time
+    and never cached. The exception path is unchanged: a gate that cannot be computed waves nothing through
+    silently, and is never cached."""
+    pk = jd._PARSE_CACHE.get(sid)
+    parse_key = pk[0] if (pk is not None and pk[1] is not None and pk[1].get("turns") is turns) else None
+    epi = _stat_key(jd.EPIDIR / (sid + ".jsonl")) if parse_key is not None else None
+    hit = _nudge_gate_memo.get(sid) if parse_key is not None else None
+    if hit is not None and hit[0] == parse_key and hit[1] is store and hit[2] == epi:
+        _NUDGE_GATE_STATS["served"] += 1
+        return hit[3]
+    try:
+        _live = {sg["id"] for tn in turns for sg in jd._segs(tn, store)}
+        unplanned = any(not jd._placed_key(store.get("placements") or {}, jd._unit_key(u[0], u[1]), _live)
+                        for u in jd.plan_units({"turns": turns}, store))
+    except Exception:
+        unplanned = False                        # minimal/legacy turn shapes → the closer gate stands alone,
+        sys.stderr.write("auto-nudge placement gate (session %s): %s\n"   # but never SILENTLY (the user
+                         % (sid, traceback.format_exc()))                 #  2026-07-21: a mute gate error
+        return unplanned                         #  would wave nudges through); a failed derivation is not cached
+    _NUDGE_GATE_STATS["derived"] += 1
+    if parse_key is not None:
+        try:
+            current, _f = jd.load_goals_shared_or_fault(sid)   # a stat and a compare on the shared loader's key
+        except Exception:
+            current = None
+        if current is store:                     # the view we derived from is still the store's current one
+            if len(_nudge_gate_memo) > _NUDGE_GATE_MEMO_MAX:      # bounded by the session count; evict oldest-inserted
+                _nudge_gate_memo.pop(next(iter(_nudge_gate_memo)))
+            _nudge_gate_memo[sid] = (parse_key, store, epi, unplanned)
+    return unplanned
+
+
 def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only=False):
     """One session's slice of the auto-nudge tick: the session-level gates, then the fire/stamp
     walk over its still-'working' top goals. Split from _auto_nudge_tick so the tick isolates
@@ -10852,7 +10905,12 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only
     # deliberately NOT the arm: a romp-injected turn can never become the arm, so a verdict about one is
     # newer than the arm FOREVER (see _nudge_fire_list's deadlock note).
     seen = next((tn for tn in reversed(turns) if tn.get("ended")), None)
-    store, fault = jd.load_goals_or_fault(sid)
+    # The walk's READ of the store (2026-09-09): the shared read-only view every pusher builder reads, one
+    # parse per file version instead of a fresh load per idle session per cycle (66 loads a cycle on the
+    # maintainer's box, most of them this line). Every writer downstream reloads at its write moment
+    # (_wake_goal's _fresh, _nudge_fire_list's and the fire path's jd.load_goals), and a write through the
+    # view raises FrozenStoreError rather than landing, so a future writer that forgets fails loudly.
+    store, fault = jd.load_goals_shared_or_fault(sid)
     if fault is not None:
         return None                                  # its row is filed; nothing fires or stamps on a store we cannot read
     # Don't nudge until the CLOSER has classified this turn AT ITS CURRENT SIZE (session-level gate). A turn
@@ -10870,15 +10928,7 @@ def _auto_nudge_session(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only
     # the unit's PLACEMENT (a skip records one too — key presence marks the phase processed), the same
     # event the nudge-failed stamp below already waits on; require the queue empty before ANY fire.
     # Event-based: the placement's landing opens the gate on the next tick.
-    try:
-        _live = {sg["id"] for tn in turns for sg in jd._segs(tn, store)}
-        _unplanned = any(not jd._placed_key(store.get("placements") or {}, jd._unit_key(u[0], u[1]), _live)
-                         for u in jd.plan_units({"turns": turns}, store))
-    except Exception:
-        _unplanned = False                       # minimal/legacy turn shapes → the closer gate stands alone,
-        sys.stderr.write("auto-nudge placement gate (session %s): %s\n"   # but never SILENTLY (the user
-                         % (sid, traceback.format_exc()))                 #  2026-07-21: a mute gate error
-        #                                                                    would wave nudges through)
+    _unplanned = _nudge_placement_gate(sid, turns, store)
     if _unplanned:
         return "planner-queue"
     nodes, status = store.get("nodes", {}), store.get("status", {})

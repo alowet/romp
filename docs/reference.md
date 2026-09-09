@@ -899,15 +899,19 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   loader (`load_goals`) and `save_goals`; the pusher's read-only loads go
   through the shared store cache and show under `memos.shared`, not here. A
   save that would rewrite identical bytes is a save without a write.
-- `memos`: the three identity memos on the goal-store path. `pass` is the
+- `memos`: the identity memos on the goal-store path. `pass` is the
   judge pass's stat-keyed store memo (`hit`, `miss`, `fail`, `evict`, `punch`,
   and its occupancy `entries`, `bytes`); `shared` is the pusher's shared
   read-only store cache (`hit`, `miss`, `compare_miss`, `refuse`, `dup`,
   `absent`, `corrupt`, `unreadable_journal`, `evict`, `fallback`, `poisoned`,
   with `entries`, `bytes` and `off`); `chain` is the write-moment chain memo
-  (`hit`, `miss`, `populate`, `bypass`). The compaction sweep after each judge
-  pass evicts from `pass` and `shared` the entries of stores no session in the
-  discover window owns, so both stay bounded by the live board.
+  (`hit`, `miss`, `populate`, `bypass`); `nudgeGate` is the auto-nudge walk's
+  planner-placement gate, derived once per (parse, store) and served while
+  both stand (`served`, `derived`; a healthy quiet box serves almost every
+  cycle). The compaction sweep after each judge pass evicts from `pass` and
+  `shared` the entries of stores no session in the discover window owns, so
+  both stay bounded by the live board; the gate memo is bounded by the session
+  count.
 - `judge`: `passes`, `ms_sum`, `ms_last`, `ms_mean` (wall time; a pass waits
   on model calls), `cpu_ms_sum` (CPU time of the judge tier threads and every
   per-session worker they run; the workers' share is `cpu_ms_workers`).
