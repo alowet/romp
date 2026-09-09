@@ -119,7 +119,7 @@ machinery on such boxes without it.
 
 | Codex event | Transcript record |
 |---|---|
-| `item/*` userMessage | `user` record, `promptSource:"sdk"` (human on a programmatic session, same as the SDK backend) |
+| `item/*` userMessage | `user` record, one text block per input (a turn started from several queued sends lands each of them), `promptSource:"sdk"` (human on a programmatic session, same as the SDK backend) |
 | `item/completed` agentMessage | assistant text — HELD, flushed with `stop_reason:null` when more items follow, `"end_turn"` at `turn/completed` (records are append-only; the turn's last message must land already-stamped) |
 | `item/completed` reasoning | assistant `thinking` block |
 | `item/started` commandExecution | assistant `tool_use` (name `Bash`, input {command}) |

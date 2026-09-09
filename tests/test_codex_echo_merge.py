@@ -6,9 +6,10 @@ merge would paint a Codex echo as a solid user atom beside its own queued bubble
 beside its landed record, and count an echo-only merge as live ASSISTANT work, forcing the last turn
 open: a false "working" chip for a session whose only live item is a pending send. The atoms carry
 `_echo_text` now, and this module runs the REAL kernel merge (_merge_live_atoms) over the REAL backend (a
-scripted fake app-server client: no SDK, no network, no turn ever streams) to pin the consequences. The
-kernel is loaded the way tests/test_kernel_fed_echo_absorbed.py loads it. Synthetic fixtures only (the
-notes-api demo domain).
+scripted fake app-server client: no SDK, no network, no turn ever streams) to pin the consequences, and
+the case of a turn started from two queued sends: the real normalizer lands it as one record with a text
+block per send, and the merge retires both echoes. The kernel is loaded the way
+tests/test_kernel_fed_echo_absorbed.py loads it. Synthetic fixtures only (the notes-api demo domain).
 """
 import os
 import tempfile
@@ -121,6 +122,33 @@ class CodexEchoMerge(unittest.TestCase):
         self.assertIs(merged, sess, "and the merge painted nothing beside the record")
         texts = [t for a in sess["turns"][-1]["atoms"] for t in km._atom_user_texts(a)]
         self.assertEqual(texts.count("and the tests"), 1)
+
+    def test_a_two_block_record_in_the_sends_second_retires_both_echoes_and_paints_each_text_once(self):
+        # Two sends queued before a turn starts go out as ONE turn (an input per send) and the app-server
+        # answers one userMessage item carrying both; the REAL normalizer writes it as one user record with
+        # a text block per input (codex_events._user_input_texts), the kernel's _atom_user_texts yields each
+        # block, and prune_live lands both echoes. Joined into one block the record matches neither echo:
+        # both stay live for good and paint as user bubbles beside the record in every later build.
+        self.assertTrue(self.be.send(self.sid, "first send"))
+        self.assertTrue(self.be.send(self.sid, "second send"))
+        self.assertEqual([a["_echo_text"] for a in self.be.live_atoms(self.sid)], ["first send", "second send"])
+        t_echo = max(a["t"] for a in self.be.live_atoms(self.sid))
+        norm = cb._events.ThreadNormalizer("T-1", cwd="/TESTDIR", model="gpt-5-test", version="codex",
+                                           clock=lambda: t_echo)
+        rec, = norm.handle("item/completed", {
+            "threadId": "T-1", "turnId": "t-live", "completedAtMs": t_echo * 1000,
+            "item": {"type": "userMessage", "id": "u2",
+                     "content": [{"type": "text", "text": "first send"},
+                                 {"type": "text", "text": "second send"}]}})
+        self.assertEqual(rec["type"], "user")
+        atom = {"type": "user", "uuid": rec["uuid"], "t": t_echo, "author": "human", "message": rec["message"]}
+        sess = self._session(atom)                                           # lands within the sends' second
+        merged = km._merge_live_atoms(sess, self.sid)
+        self.assertEqual(self.be.live_atoms(self.sid), [], "prune_live retired both echoes, one per block")
+        self.assertIs(merged, sess, "and the merge painted nothing beside the record")
+        texts = [t for a in sess["turns"][-1]["atoms"] for t in km._atom_user_texts(a)]
+        self.assertEqual(texts.count("first send"), 1)
+        self.assertEqual(texts.count("second send"), 1)
 
 
 if __name__ == "__main__":
