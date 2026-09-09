@@ -57,7 +57,7 @@ def _timeline(nbars=2, now=1, unkeyable=False):
     turns = {SID: [{"id": "b%d" % i, "t": i, "end": i + 1, "open": False} for i in range(nbars)]}
     return {"type": "timeline", "sessions": [{"id": SID, "name": "web"}],
             "turns": None if unkeyable else turns,        # None where a dict belongs: _delta_parts cannot key it
-            "judging": [], "messages": [], "now": now}
+            "judging": {}, "messages": [], "now": now}
 
 
 def _bars_of(tl, warming=False):
@@ -139,9 +139,9 @@ class OneEncodePerBuild(unittest.TestCase):
             s0 = dict(km._wire_stats)
             km._push([dfeed, legacy, tl])
             self.assertEqual(sum(splits.values()), 4, "one per-entry pass per payload: the feed's one collection, the bars' three")
-            self.assertEqual([f["type"] for f in dfeed["frames"]], ["feed"]); self.assertIn("_keys", dfeed["frames"][0])
+            self.assertEqual([f["type"] for f in dfeed["frames"]], ["feed"]); self.assertNotIn("_keys", dfeed["frames"][0], "no full carries a key list (T278c)")
             self.assertEqual([f["type"] for f in legacy["frames"]], ["feed"]); self.assertNotIn("_keys", legacy["frames"][0])
-            self.assertEqual([f["type"] for f in tl["frames"]], ["data", "bars"]); self.assertIn("_keys", tl["frames"][1])
+            self.assertEqual([f["type"] for f in tl["frames"]], ["data", "bars"]); self.assertNotIn("_keys", tl["frames"][1], "no full carries a key list (T278c)")
             self.assertEqual(_delta(km._wire_stats, s0), {"feed_body": 1, "bars_body": 1, "split_miss": 4},
                              "one whole frame each, shared by the keyed full and the legacy client; four collections split")
             self.assertEqual(km._feed_wire[4], km._parts_sig(km._feed_wire[5]), "the feed's signature is the split's tuple")
@@ -209,7 +209,7 @@ class OneEncodePerBuild(unittest.TestCase):
                          "the turns split ran and raised; the collections after it were never reached")
         self.assertEqual(err.getvalue().count("cannot be keyed"), 1, "said once, as before")
         w.timeline = _timeline(unkeyable=True, now=2)            # a rebuild: the whole frame goes again
-        w.timeline["judging"] = [{"sid": SID, "judge": "closer", "t": 1, "t1": 2}]
+        w.timeline["judging"] = km._compact_judging([{"sid": SID, "judge": "closer", "t": 1, "t1": 2}])   # per lane, compact (T278c)
         with redirect_stderr(err):
             km._push([tl])
         self.assertEqual([f["type"] for f in tl["frames"]], ["data", "bars", "bars"],
@@ -482,7 +482,7 @@ class ANonJsonValueOnTheWireIsCountedAndSaidOnce(unittest.TestCase):
         s0 = dict(km._wire_stats); err = io.StringIO()
         with redirect_stderr(err):
             km._push([tl])
-        self.assertIn("_keys", tl["frames"][1])
+        self.assertNotIn("_keys", tl["frames"][1], "no full carries a key list (T278c)")
         self.assertEqual(tl["frames"][1]["turns"][SID][0]["tags"], "{'a'}")
         self.assertEqual(_delta(km._wire_stats, s0), {"bars_body": 1, "default_str": 2, "split_miss": 3}, "the split and the keyed full")
         nxt = _timeline(nbars=3, now=2); nxt["turns"][SID][0]["tags"] = {"a"}; nxt["turns"][SID][1]["tags"] = {"b"}
@@ -624,7 +624,7 @@ class ARaisingSerializerLeavesThePusherAlive(unittest.TestCase):
         self.assertIsNotNone(km._feed_wire, "the fill stood"); self.assertFalse(km._feed_wire[3].materialized())
         km._push([legacy, dfeed])                                # the encode works again: the same build's frame goes
         self.assertEqual([f["type"] for f in legacy["frames"]], ["feed"]); self.assertEqual([f["type"] for f in dfeed["frames"]], ["feed"])
-        self.assertIn("_keys", dfeed["frames"][0])
+        self.assertNotIn("_keys", dfeed["frames"][0], "no full carries a key list (T278c)")
         self.assertTrue(km._feed_wire[3].materialized())
 
     def test_the_cycle_loop_survives_a_push_all_that_raises(self):

@@ -141,7 +141,7 @@ class InjectedTurnDeadlockEndToEnd(unittest.TestCase):
             "_interrupt_suppresses_nudge", "_backend_queued", "_backend_rewind_pending",
             "_last_state", "_session_awaiting", "_closer_settled", "_revivers_pending",
             "_pending_ops")}
-        self._orig_jd = {n: getattr(jd, n) for n in ("parsed_session", "load_goals", "_segs", "plan_units")}
+        self._orig_jd = {n: getattr(jd, n) for n in ("parsed_session", "load_goals", "load_goals_shared_or_fault", "_segs", "plan_units")}
         self._orig_backend = km.Sessions.backend_for
         km._session_flag = lambda sid, flag: False
         km._compacting_now = lambda sid: False
@@ -163,6 +163,7 @@ class InjectedTurnDeadlockEndToEnd(unittest.TestCase):
         jd.parsed_session = lambda sid, paths, now: {"turns": self.turns}
         self.store = _store({G1: _node(G1, "Ship the reconnect banner", log=_incident_log())})
         jd.load_goals = lambda sid: self.store
+        jd.load_goals_shared_or_fault = lambda sid: (self.store, None)   # the walk reads the shared view; the fresh re-read stays on load_goals
         self.sent = []
         test = self
 

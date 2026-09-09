@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
@@ -25,6 +26,31 @@ NOW = int(time.time())
 
 
 class ResolveNode(unittest.TestCase):
+    def setUp(self):
+        # kern.jd is one module object shared by every test module in the process; the store this test saves and
+        # the resolve it journals at the import-bound root outlived the module and were replayed onto every later
+        # module's feed for the placeholder sid (T281). A private root for the duration.
+        self._td = tempfile.TemporaryDirectory()
+        self._state = jd.STATE
+        jd._rebind_state(Path(self._td.name))
+
+    def tearDown(self):
+        jd._rebind_state(self._state)
+        self._td.cleanup()
+
+    def test_the_store_and_the_journal_do_not_outlive_the_module(self):
+        # The residue pin (T281): after the resolve, this test's store and journal live under its own root; the
+        # run-wide root (what every later module's feed reads) is exactly as it was.
+        shared = [Path(self._state) / "goals" / (SID + ".json"), Path(self._state) / "overrides" / (SID + ".jsonl")]
+        before = [(p.exists(), p.stat().st_size if p.exists() else None) for p in shared]
+        jd.save_goals(SID, {"rompUuid": SID, "seq": 1, "placements": {}, "status": {},
+                            "nodes": {GID: {"id": GID, "text": "Ship the widget", "parentId": None, "nodeComplete": False,
+                                            "blocked": False, "cleared": False, "trail": [], "t": NOW - 600, "mt": NOW - 300}}})
+        self.assertTrue(kern._resolve_node(SID, GID))
+        self.assertTrue((Path(self._td.name) / "goals" / (SID + ".json")).exists(), "the store lives under this test's root")
+        self.assertEqual([(p.exists(), p.stat().st_size if p.exists() else None) for p in shared], before,
+                         "the run-wide store and journal for the placeholder sid are untouched by this module")
+
     def test_user_resolve_is_evented_and_survives_the_rollup(self):
         store = {"rompUuid": SID, "seq": 1, "placements": {}, "status": {},
                  "nodes": {GID: {"id": GID, "text": "Ship the widget", "parentId": None,

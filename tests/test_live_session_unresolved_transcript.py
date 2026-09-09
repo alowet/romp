@@ -31,6 +31,11 @@ class _World(unittest.TestCase):
         self.td = tempfile.TemporaryDirectory()
         root = Path(self.td.name)
         self.cwd = root / "work"; self.cwd.mkdir()
+        # The kernel's judge is one module object shared by every test module in the process, so a names entry
+        # and the session order this world writes at its import-bound root outlived the module and were read by
+        # every later module's feed (T281). The world lives under this test's root for the duration.
+        self._state = jd.STATE
+        jd._rebind_state(root / "state")
         # names registry entry: name \t cwd \t #bg  (written at launch for both backends). The kernel binds
         # NAMES at import while the ONE romp_judge module is re-executed by every later kernel load in the
         # suite, so km.NAMES and jd.NAMES can name different roots under the full run — align them.
@@ -62,6 +67,7 @@ class _World(unittest.TestCase):
             try: f.unlink()
             except OSError: pass
         self.td.cleanup()
+        jd._rebind_state(self._state)   # last: everything above cleans under THIS test's root
 
     def _alive_sids(self):
         jd._discover_cache.clear()

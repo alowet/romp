@@ -39,9 +39,21 @@ future stream substrate is a near passthrough.
   user-prompt atom; mid-turn prompts (absorbed) and decisions stay inside the turn.
   Whether to sub-segment there is a higher-layer choice.
 - **Authorship is the one real addition over the stream.** A user atom carries an
-  `author` (human / sdk / system / peer), because the stream cannot tell a peer
-  romp message from a human prompt. Author + position (opener vs mid-turn) +
+  `author` (human / sdk / system / teammate / peer), because the stream cannot tell a
+  peer romp message from a human prompt. Author + position (opener vs mid-turn) +
   content together derive the finer distinctions.
+- **Authorship is field-first (2026-09-08).** The record's own `origin.kind` — the
+  CLI's provenance stamp on every turn it injects on its own (`claude_agent_sdk`
+  `MessageOrigin`: `task-notification`, `peer`, `coordinator`, `channel`,
+  `auto-continuation`, `observer`, …) — is read before any text shape; the
+  wrapper-tag and lead-in tests are the fallback for unstamped records. Any kind
+  other than `human` is never the human, whatever `sdk_human` says. The stamp rides
+  the atom as `origin` (documented keys only), and the kernel's chat build turns it
+  into the event's `source` — the head of the notice card the chat shows instead of a
+  bubble. Triggered by Claude Code 2.1.263, which put a fixed preamble paragraph
+  (`[SYSTEM NOTIFICATION - NOT USER INPUT]`) ahead of `<task-notification>`: the
+  tag-anchored test stopped matching and every background agent's report rendered as
+  the user's own bubble.
 - **Openers are `human`, `sdk`, and `peer`; `system` is not an opener.** `system`
   atoms are harness injections (e.g. `<task-notification>` when a background
   task/agent completes); they fold into the current work, never start a new ask.
@@ -128,11 +140,16 @@ interface Trigger {
 interface Atom {
   // Parity with the streaming API:
   type: "assistant" | "user" | "system" | "result" | "idle";   // "idle" is ours
-  subtype?: "compact_boundary" | "status" | "task_notification"; // when type==="system"
+  subtype?: "compact_boundary" | "status" | "task_notification"
+          | "model_refusal_fallback";                          // when type==="system"
   uuid: string;             // message id (same value in stream and transcript)
   session_id: string;       // = rompUuid
   message?: ApiMessage;     // assistant/user: the Anthropic message object (below)
   compact_metadata?: { trigger: "auto" | "manual"; pre_tokens: number }; // system:compact_boundary
+  content?: string; fallback_from?: string; fallback_to?: string;   // system:model_refusal_fallback — the CLI's
+  refusal_category?: string; refusal_explanation?: string;          //   line, the swap, the refusal's category and
+  scope?: "session" | "local";                                      //   the API's explanation ("" when the record
+                                                                    //   carried none), the scope (absent = session)
   result?: {                // type==="result"
     subtype: "success" | "error_during_execution" | "error_max_turns" | string;
     num_turns: number; stop_reason: string | null;
@@ -269,6 +286,15 @@ from rather than re-scanning the text and landing on a different one.
 | `"queued"` | human keystroke while busy, queued |
 | `"system"` | harness control injection; observed example `<task-notification>` (a background task/agent completed) |
 | *(absent)* | hook-injected (postal) and `tool_result` lines carry no `promptSource` |
+
+`origin.kind` values on disk (the CLI's stamp; read FIRST — see the authorship bullet above):
+
+| value | author | shown as |
+|---|---|---|
+| `"task-notification"` | `system` (`sdk` when `subkind` is `scheduled-trigger`: a fired prompt opens a turn; `teammate` when `subkind` is `peer-send-message`: a message from another of the user's sessions on the task channel, never a finished task) | the background agent's / command's notice card, named from the notification's own `<summary>`; a scheduled firing is the "Scheduled task" system notice, which an UNSTAMPED firing keeps too by its lifted preamble; a `peer-send-message` is the peer notice ("From another session": that subkind carries no sender fields) |
+| `"peer"` | `teammate` | the teammate card, "from" the sender's `name` / `from`; a `senderTaskId` marks one of this session's background agents |
+| `"coordinator"`, `"channel"`, `"auto-continuation"`, `"observer"`, `"unclassified"`, anything newer | `sdk` | a system/peer notice card with the kind as its label |
+| `"human"` / *(absent)* | by `promptSource` and text, as before | the user's bubble |
 
 **Turn-opener rule.** A turn opener is a genuine new prompt (`author ∈ {human,
 sdk}`) or a postal message (`author: {peer}`). `system` atoms

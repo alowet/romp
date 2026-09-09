@@ -39,6 +39,29 @@ class SentNothing:
 
 
 class ClearIsSilent(unittest.TestCase):
+    def setUp(self):
+        # the kernel's judge is one module object shared by every test module in the process, so a store saved at its import-bound GOALDIR outlives the module and reaches every later module's feed for the placeholder sid (T281/T282); a private root for the duration.
+        self._td = tempfile.TemporaryDirectory()
+        self._state = jd.STATE
+        jd._rebind_state(Path(self._td.name))
+
+    def tearDown(self):
+        jd._rebind_state(self._state)
+        self._td.cleanup()
+
+    def test_the_store_this_module_saves_does_not_outlive_it(self):
+        # The residue pin (T281/T282): a store saved through the shared judge lands under this test's root and
+        # the run-wide root (what every later module's feed reads) is exactly as it was.
+        shared = Path(self._state) / "goals" / (SID + ".json")
+        before = (shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None)
+        st = jd.load_goals(SID)
+        st["nodes"][SID + ":t282"] = jd.GuardedNode({"id": SID + ":t282", "text": "a note", "parentId": None, "nodeComplete": False,
+                                                        "blocked": False, "cleared": False, "trail": [], "t": 1, "mt": 1, "log": []})
+        jd.save_goals(SID, st)
+        self.assertTrue((Path(self._td.name) / "goals" / (SID + ".json")).exists(), "the store lives under this module's root")
+        self.assertEqual((shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None), before,
+                         "the run-wide goals directory is untouched by this module")
+
     def test_clearing_an_open_card_sends_the_session_nothing(self):
         store = jd.load_goals(SID)
         store["nodes"][G_OPEN] = jd.GuardedNode({"id": G_OPEN, "text": "build the exporter",

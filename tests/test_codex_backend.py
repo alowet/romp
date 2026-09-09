@@ -19,6 +19,8 @@ import time
 import unittest
 from unittest import mock
 from importlib.machinery import SourceFileLoader
+
+from tests.conftest import thread_census, wait_for_census
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -84,6 +86,41 @@ def note(method, params):
     return SimpleNamespace(method=method, payload=_Payload(params))
 
 
+_CLIENTS = []                    # every FakeClient made by this module
+_BACKENDS = []                   # every CodexBackend made by this module
+_CENSUS0 = []
+_ORIG_INIT = []
+
+
+def setUpModule():
+    # Residue hygiene (T282): each backend this module builds starts a global pump per client and a worker per
+    # session, daemon threads that parked on the fake client forever and outlived the module (64 of them under
+    # the full suite). Every backend and client is recorded here and ended in tearDownModule, which then pins
+    # the thread census back to what it was when the module started.
+    _CENSUS0[:] = [thread_census()]
+    orig = cb.CodexBackend.__init__
+
+    def recording_init(self, *a, **k):
+        orig(self, *a, **k)
+        _BACKENDS.append(self)
+    _ORIG_INIT[:] = [orig]
+    cb.CodexBackend.__init__ = recording_init
+
+
+def tearDownModule():
+    cb.CodexBackend.__init__ = _ORIG_INIT[0]
+    for be in _BACKENDS:
+        for _, sess in be._session_items():          # a worker returns when it wakes to a dead session
+            with sess.lock:
+                sess.dead = True
+            sess.kick.set()
+    for c in _CLIENTS:
+        c.close()                                    # a pump returns when its client reads as closed
+    _BACKENDS.clear(); _CLIENTS.clear()
+    left = wait_for_census(_CENSUS0[0], timeout=10)
+    assert left == [], "threads outlived this module: %r" % left
+
+
 class FakeClient:
     """Scripted app-server: turn_start opens a queue and streams either the injected script or a
     default echo turn (userMessage + agentMessage + tokenUsage + completed)."""
@@ -95,6 +132,8 @@ class FakeClient:
         self.hold_open = False      # script the turn to stay open (steer/interrupt tests)
         self._n = 0
         self._global = queue.Queue()
+        self._closed = False
+        _CLIENTS.append(self)       # every client ever made is closed when the module ends (T282)
 
     # bookkeeping helpers ------------------------------------------------------------------
     def _rec(self, name, *a):
@@ -113,6 +152,8 @@ class FakeClient:
 
     def close(self):
         self._rec("close")
+        self._closed = True
+        self._global.put(None)      # wakes the backend's global pump, which reads the close and stops (T282)
 
     def thread_start(self, params=None):
         self._rec("thread_start", params)
@@ -186,7 +227,10 @@ class FakeClient:
                                                      "status": "interrupted"}}))
 
     def next_notification(self):
-        return self._global.get()   # blocks forever — the global pump just parks in tests
+        n = self._global.get()      # parks the backend's global pump until a notification or the close
+        if n is None or self._closed:
+            raise RuntimeError("client closed")   # the pump logs "global pump stopped" and returns
+        return n
 
 
 def build(tmp=None, factory=None):
@@ -1139,6 +1183,122 @@ for i in range(20):
         self.assertTrue(be.kill(sid))   # kill's held-final drain notifies too — same reentry
 
 
+class _Clock:
+    """A clock the backend module reads through its `time` global: time() answers `now`, everything
+    else (monotonic, sleep) is the real module's. Patched onto the backend MODULE for one send() call,
+    never onto the time module, so nothing outside the backend sees it."""
+
+    def __init__(self, now):
+        self.now = now
+
+    def time(self):
+        return self.now
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+class PruneLive(unittest.TestCase):
+    """The kernel's _merge_live_atoms calls be.prune_live(sid, tx_uuids, tx_text_t, human_floor), four
+    positional arguments, and CodexBackend.prune_live took three: every live merge of a Codex session
+    holding an echo raised TypeError (the chat build and the feed's merge failed outright; the timeline
+    bars logged a live-merge failure). The call shape is pinned across every backend in
+    tests/test_backend_call_parity.py; this class covers the behaviour in the kernel's REAL shapes:
+    record times are parse_z's whole seconds (the mapping's values are floats of them), and the echo's
+    own stamp is int(time.time()), as the SDK and tmux echoes stamp theirs."""
+
+    def _with_echo(self, text="ship it", t=1000):
+        be, fake, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        s = be._session(sid)
+        with s.lock:
+            s.echoes.append({"text": text, "t": t, "uuid": "echo-11111111"})
+        return be, sid
+
+    def _sent(self, be, sid, text, now):
+        """An echo through send() itself, on the steer path (an open turn: nothing queues, no worker
+        thread runs), with the backend's clock reading `now`."""
+        s = be._session(sid)
+        with s.lock:
+            s.turn_id = "t-live"
+        with mock.patch.object(cb, "time", _Clock(now)):
+            self.assertTrue(be.send(sid, text))
+
+    def test_accepts_the_kernels_four_positional_arguments_and_no_floor_retires_a_plain_echo(self):
+        be, sid = self._with_echo()
+        be.prune_live(sid, frozenset(), {}, 2000)          # the exact caller shape: a set, a mapping, a floor
+        self.assertEqual(len(be.live_atoms(sid)), 1,
+                         "no floor retires a plain echo: a send the app-server never records must stay visible")
+
+    def test_text_lands_only_through_a_record_at_or_after_the_send(self):
+        # "ok" sent twice: the first record predates the second echo, so it must not retire it; a record
+        # stamped at or after the send does. Whole-second record times, as the kernel derives them.
+        be, sid = self._with_echo("ok", t=1000)
+        be.prune_live(sid, frozenset(), {"ok": 999.0}, 0)
+        self.assertEqual(len(be.live_atoms(sid)), 1, "an older record with the same text is not this send")
+        be.prune_live(sid, frozenset(), {"ok": 1000.0}, 0)
+        self.assertEqual(be.live_atoms(sid), [], "a record at the send's second lands it")
+
+    def test_a_record_later_in_the_sends_own_second_lands_the_echo(self):
+        # The echo is stamped in WHOLE seconds like the SDK's and the tmux echo's. A float stamp (1000.3)
+        # would keep an echo whose record was written at 1000.7: parse_z reads that record as 1000, and
+        # 1000 >= 1000.3 is false, the same-second case the SDK retires.
+        be, fake, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        self._sent(be, sid, "ok", 1000.3)
+        atom, = be.live_atoms(sid)
+        self.assertIsInstance(atom["t"], int)
+        self.assertEqual(atom["t"], 1000)
+        be.prune_live(sid, frozenset(), {"ok": 999.0}, 0)
+        self.assertEqual(len(be.live_atoms(sid)), 1, "the second before the send is not this send")
+        be.prune_live(sid, frozenset(), {"ok": 1000.0}, 0)
+        self.assertEqual(be.live_atoms(sid), [], "a record later in the send's own second lands it")
+
+    def test_text_compares_under_the_shared_key_rule_on_both_sides(self):
+        # The ECHO side: an echo whose stored text carries outer whitespace (injected directly, past
+        # send()'s own keying) still lands against the kernel's stripped key.
+        be, sid = self._with_echo("  ship it\n", t=1000)
+        be.prune_live(sid, frozenset(), {"ship it": 1001.0}, 0)
+        self.assertEqual(be.live_atoms(sid), [], "the echo's text is keyed before the comparison")
+        # The SET side: an older caller's plain set, unstripped, keyed the same way and unfloored.
+        be2, sid2 = self._with_echo("ship it", t=1000)
+        be2.prune_live(sid2, frozenset(), {"  ship it\n"}, 0)
+        self.assertEqual(be2.live_atoms(sid2), [], "a plain set keeps the unfloored match, keyed the same way")
+
+    def test_uuid_retires(self):
+        be, sid = self._with_echo("ship it", t=1000)
+        s = be._session(sid)
+        with s.lock:
+            s.echoes.append({"text": "and the tests", "t": 1000, "uuid": "echo-22222222"})
+        be.prune_live(sid, frozenset({"echo-11111111"}), {}, 0)
+        self.assertEqual([a["uuid"] for a in be.live_atoms(sid)], ["echo-22222222"], "by uuid, that echo only")
+
+    def test_unknown_sid_is_a_no_op(self):
+        be, _, _ = build()
+        be.prune_live("7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f", frozenset(), {}, 0)
+
+
+class EchoAtoms(unittest.TestCase):
+    """What the kernel reads off a Codex echo. `_echo_text` is the marker every kernel reader of an input
+    echo keys on (SdkBackend's echo atoms carry it): _merge_live_atoms hides the echo behind its queued
+    bubble and never counts it as live work, and build_session's queued-bubble pass enlists it while the
+    session is busy. Without it a Codex echo would paint as a solid user atom beside its own queued bubble
+    and force the last turn open (the merge itself is pinned in tests/test_codex_echo_merge.py)."""
+
+    def test_the_echo_atom_is_marked_as_an_input_echo(self):
+        be, fake, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        s = be._session(sid)
+        with s.lock:
+            s.turn_id = "t-live"                           # an open turn: send() steers, nothing queues
+        self.assertTrue(be.send(sid, "  ship it\n"))
+        atom, = be.live_atoms(sid)
+        self.assertEqual(atom["_echo_text"], "ship it", "the sent text, under the shared key rule")
+        self.assertEqual(atom["message"]["content"][0]["text"], "ship it")
+        self.assertEqual(atom["author"], "human")
+        self.assertNotIn("command", atom, "a plain echo carries no command flag")
+
+
 class LaunchErrorNames(unittest.TestCase):
     """A LIVE launch-error row without a shared name let a retry mint a duplicate live session
     under the same name (the v1.3.12 audit's P2) — both failure branches now write names/."""
@@ -1313,29 +1473,39 @@ class RaisingRegistryTransactions(unittest.TestCase):
                              "neither the file nor its temp exists: a failed rename publishes nothing")
             self.assertEqual(be._session(sid).name, "webby")
 
-    def test_a_names_write_failure_after_thread_start_is_restored_not_fatal(self):
-        # the r30 verification: _prepare_thread's unguarded names write truncated the identity
-        # file permanently — no later path rewrites it (resume skips the create branch)
+    def test_a_failed_names_write_after_thread_start_leaves_the_file_untouched(self):
+        # the r30 verification, rewritten to the truth (2026-09-09, the twin of #1138's rename
+        # rewrite): the old form mocked _write_name with a fake that truncated the file IN PLACE —
+        # something the real tmp+os.replace writer cannot do — and pinned an in-place RESTORE that,
+        # under the very ENOSPC it existed for, truncated a good file to nothing and then blamed "a
+        # failed write". _disk_full drives the REAL writer with the fault beneath it and models
+        # ENOSPC for any in-place write aimed at the file; on origin/main the restore itself
+        # empties the file. No later path rewrites it (resume skips the create branch)
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             fake = FakeClient()
-            be = cb.CodexBackend(td, client_factory=lambda: fake)
+            logs = []
+            be = cb.CodexBackend(td, client_factory=lambda: fake, log=logs.append)
             sid = be.spawn("webby", "/tmp")
             s = be._session(sid)
-            nf = os.path.join(td, "names", sid)
-            old_line = open(nf).read()
+            nf = Path(td) / "names" / sid
+            old_line = nf.read_bytes()
+            old_mtime = nf.stat().st_mtime_ns
             s.tid = "pending-%s" % sid[:8]         # force the create path
             s.loaded = False
-
-            def truncating_write(s2, bg="", fg=""):
-                open(nf, "w").close()
-                raise OSError(28, "No space left on device")
-            with mock.patch.object(be, "_write_name", side_effect=truncating_write):
+            with _disk_full(nf):
                 ok = be._prepare_thread(s, fake)
             self.assertTrue(ok, "the thread is healthy — the turn proceeds")
-            self.assertEqual(open(nf).read(), old_line,
-                             "the truncation cannot outlive the failure")
             self.assertTrue(s.loaded)
+            self.assertEqual(nf.read_bytes(), old_line,
+                             "byte-identical: the atomic writer left it, and nothing rewrote it in place")
+            self.assertEqual(nf.stat().st_mtime_ns, old_mtime,
+                             "no rewrite for no content change — the names producers watch the mtime")
+            self.assertEqual(sorted(p.name for p in nf.parent.iterdir()), [sid], "no staging file left behind")
+            said = [m for m in logs if "after thread start" in m]
+            self.assertEqual(len(said), 1, logs)
+            self.assertIn("[Errno 28]", said[0], "the log names the errno")
+            self.assertNotIn("restored", said[0], "nothing was restored, so the log does not say so")
 
     def test_a_corrupt_names_file_is_healed_by_the_next_write(self):
         # the r31 verification: non-UTF-8 names bytes sailed through _write_name's OSError-only
@@ -1394,25 +1564,27 @@ class RaisingRegistryTransactions(unittest.TestCase):
     def test_an_unpublishable_name_after_thread_start_says_so(self):
         # the r31 verification: the no-prior-file leg logged "was restored" when the partial
         # file was actually unlinked — and the state it leaves (live row, no published name) is
-        # the duplicate-name hole, which the log must NAME
+        # the duplicate-name hole, which the log must NAME. Since 2026-09-09 the REAL writer runs
+        # under _disk_full (green on origin/main as well — its unlink branch was a no-op there);
+        # kept as the pin for the absent-entry shape: a failed first publish creates nothing
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             fake = FakeClient()
-            be = cb.CodexBackend(td, client_factory=lambda: fake)
+            logs = []
+            be = cb.CodexBackend(td, client_factory=lambda: fake, log=logs.append)
             sid = be.spawn("webby", "/tmp")
             s = be._session(sid)
-            nf = os.path.join(td, "names", sid)
-            os.unlink(nf)                          # no prior file to restore
+            nf = Path(td) / "names" / sid
+            os.unlink(nf)                          # a legacy row predating the names write
             s.tid = "pending-%s" % sid[:8]
             s.loaded = False
-            logs = []
-            with mock.patch.object(be, "log", side_effect=lambda m: logs.append(m)):
-                with mock.patch.object(be, "_write_name",
-                                       side_effect=OSError(28, "No space left on device")):
-                    ok = be._prepare_thread(s, fake)
+            with _disk_full(nf):
+                ok = be._prepare_thread(s, fake)
             self.assertTrue(ok, "the healthy turn still proceeds")
-            self.assertTrue(any("could not be published" in m for m in logs), logs)
-            self.assertFalse(any("was restored" in m for m in logs),
+            self.assertEqual(sorted(p.name for p in nf.parent.iterdir()), [],
+                             "neither the file nor its temp exists: a failed publish leaves nothing")
+            self.assertTrue(any("could not be published" in m and "[Errno 28]" in m for m in logs), logs)
+            self.assertFalse(any("restored" in m for m in logs),
                              "the log must not claim a restore that never happened")
 
     def test_resume_never_overwrites_a_fresher_registry_name(self):

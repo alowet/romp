@@ -36,6 +36,12 @@ WID = "11111111-2222-3333-4444-555555555555"
 
 class ClientDiagRotationTest(unittest.TestCase):
     def setUp(self):
+        # A private state root (T282): km.jd is the judge module every test module shares, and its STATE is whatever
+        # the last module left, once a directory another module had already removed; the writer under test then
+        # had nowhere to write and these tests read a file that was never made.
+        self._saved_state = km.jd.STATE
+        self._td = tempfile.TemporaryDirectory()
+        km.jd._rebind_state(pathlib.Path(self._td.name))
         self.fp = km.jd.STATE / "client-diag.jsonl"
         self.fp1 = km.jd.STATE / "client-diag.jsonl.1"
         for f in (self.fp, self.fp1):
@@ -50,6 +56,8 @@ class ClientDiagRotationTest(unittest.TestCase):
         for f in (self.fp, self.fp1):
             if f.exists():
                 f.unlink()
+        km.jd._rebind_state(self._saved_state)
+        self._td.cleanup()
 
     def post(self, i):
         """One breadcrumb through the real dispatch: what the shim sends for a pane's minute row."""

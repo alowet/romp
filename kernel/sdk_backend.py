@@ -957,6 +957,18 @@ def msg_to_atom(msg, sid, fsid, t, skill_tool_ids=()):
             # same consumed-keys gate as the file adapter: a Read result's dict holds the whole
             # file — carrying shapes nothing reads only bloats the live tail
             atom["toolUseResult"] = tur
+        # The CLI's PROVENANCE stamp (UserMessage.origin — claude_agent_sdk MessageOrigin) rides the live
+        # atom exactly as the file adapter carries the record's `origin` (event_model._record_origin): it
+        # is how the chat knows a streamed user-role turn is a background task's notification, a peer's
+        # message or a scheduled firing and not the composer's words (the user 2026-09-07). The stream
+        # LEADS the disk write, so without it the live tail showed the CLI's preamble paragraph as a
+        # message until the transcript record superseded it.
+        origin = getattr(msg, "origin", None)
+        if isinstance(origin, dict) and isinstance(origin.get("kind"), str):
+            o = {k: origin[k] for k in ORIGIN_KEYS if isinstance(origin.get(k), str)}
+            if len(o.get("body") or "") > _ORIGIN_BODY_CAP:
+                o["body"] = o["body"][:_ORIGIN_BODY_CAP]
+            atom["origin"] = o
         return atom
     return None
 
@@ -966,6 +978,10 @@ def msg_to_atom(msg, sid, fsid, t, skill_tool_ids=()):
 # holds the two sets equal). Widen both together when a new consumer appears; never carry-all.
 TUR_CONSUMED_KEYS = frozenset(("answers", "structuredPatch", "agentId", "isAsync"))   # + the Agent tool's
 #   join/background flag (plans/subagent-transcripts.md, 2026-09-05) — widened in step with event_model
+# The origin keys the live atom carries — MIRRORS event_model._ORIGIN_KEYS / _RESULT_CAP (same standalone-
+# module reason as TUR_CONSUMED_KEYS above; a drift pin in tests/test_injected_origin.py holds them equal).
+ORIGIN_KEYS = ("kind", "subkind", "name", "from", "server", "senderTaskId", "body")
+_ORIGIN_BODY_CAP = 16000
 
 TYPE_SOMETHING = "Type something"   # meta-option label the webview turns into the inline "add your own" field
 
@@ -2643,6 +2659,113 @@ def find_orphan_clis(ps_lines: list[str], lastsids: list[str], own_pid: int) -> 
     return out
 
 
+# ENDING A CUT TURN'S WHOLE TREE (T276, the user 2026-09-08). Reaping the orphaned CLI alone left its Bash
+# tool's processes alive: a stress harness's 32 busy loops and a benchmark's 11 (setsid'd from tool shells,
+# re-parented to the user manager once the shells died) burned cores for over an hour after restarts.
+# The CLI runs in a transient scope of its own when bin/romp-cli-scope is in use (`romp-session-<sid8>-
+# <pid>-<t>.scope`), and a scope holds EVERY process the CLI ever spawned — setsid changes the session,
+# not the cgroup — so stopping the unit ends the tree, dead intermediates included. Without a scope the
+# fallback walks the process tree from the CLI in the `ps` listing and signals each descendant's process
+# group (a tool shell's setsid child leads its own group), then the CLI; a descendant whose parent died
+# before the walk is out of reach there — the scope is what closes that gap, which is why it is tried
+# first. Nothing outside the CLI's own scope or tree is ever signaled: the walk is by ppid from the CLI,
+# and the scope list is filtered to OUR sessions' units whose pid is not a live child of this kernel.
+SESSION_SCOPE_PREFIX = "romp-session-"
+_SESSION_SCOPE_RE = re.compile(r"romp-session-([0-9a-fA-F]{1,8})-(\d+)-\d+\.scope\Z")
+SCOPE_LIST_ARGV = ["systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", "--no-pager",
+                   SESSION_SCOPE_PREFIX + "*.scope"]
+SCOPE_STOP_TIMEOUT = 15.0     # systemd's own stop: SIGTERM to the cgroup, SIGKILL at its TimeoutStopSec
+TREE_KILL_GRACE = 1.0         # seconds for SIGTERM to land on the tree before SIGKILL
+
+
+def scope_unit_of(cgroup_text: str) -> str | None:
+    """The romp session scope a /proc/<pid>/cgroup listing places the process in (cgroup v2: one
+    `0::/user.slice/…/romp-session-<sid8>-<pid>-<t>.scope` line; the legacy hierarchy's lines carry the
+    same path per controller), or None when the process runs in no such scope."""
+    for ln in cgroup_text.splitlines():
+        path = ln.rsplit(":", 1)[-1]
+        for comp in path.split("/"):
+            if comp.startswith(SESSION_SCOPE_PREFIX) and comp.endswith(".scope"):
+                return comp
+    return None
+
+
+def scope_pid(unit: str) -> int | None:
+    """The pid a session scope's name carries — the pid its CLI ran as (bin/romp-cli-scope's naming)."""
+    m = _SESSION_SCOPE_RE.match(unit.strip())
+    return int(m.group(2)) if m else None
+
+
+def session_scope_units(list_lines: list[str], lastsids: list[str]) -> list[str]:
+    """The session scopes in a `systemctl --user list-units 'romp-session-*.scope' --plain --no-legend`
+    listing that belong to one of OUR sessions (the name's sid8 is the first 8 characters of a lastSid),
+    in listing order. Another kernel's sessions (other sids) never match. Pure."""
+    sid8 = {s[:8].lower() for s in lastsids if s}
+    out = []
+    for ln in list_lines:
+        head = ln.strip().split(None, 1)
+        if not head:
+            continue
+        m = _SESSION_SCOPE_RE.match(head[0])
+        if m and m.group(1).lower() in sid8:
+            out.append(head[0])
+    return out
+
+
+def descendants(ps_lines: list[str], root: int) -> list[int]:
+    """Every process under `root` in a PS_ARGV listing (`pid ppid command`), by the ppid chain, parents
+    before their children. A process whose parent died before the listing has re-parented away from
+    the tree and is NOT found here — the scope path covers those. Pure."""
+    kids: dict[int, list[int]] = {}
+    for ln in ps_lines:
+        parts = ln.strip().split(None, 2)
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        kids.setdefault(int(parts[1]), []).append(int(parts[0]))
+    out: list[int] = []
+    stack = [root]
+    seen = {root}
+    while stack:
+        p = stack.pop()
+        for c in kids.get(p, []):
+            if c in seen:
+                continue
+            seen.add(c)
+            out.append(c)
+            stack.append(c)
+    return out
+
+
+def _read_cgroup(pid: int) -> str:
+    """/proc/<pid>/cgroup, or "" where it cannot be read (no procfs, the pid gone)."""
+    try:
+        with open("/proc/%d/cgroup" % pid) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _read_starttime(pid: int) -> int | None:
+    """The process start time (clock ticks since boot, /proc/<pid>/stat field 22) — a pid's identity across a
+    reuse; None where it cannot be read (no procfs, the pid gone)."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            tail = f.read().rsplit(")", 1)[1].split()
+        return int(tail[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _read_ppid(pid: int) -> int | None:
+    """The parent pid from /proc/<pid>/stat, or None where it cannot be read."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            tail = f.read().rsplit(")", 1)[1].split()   # the comm field may hold spaces and parens
+        return int(tail[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def find_session_cli(ps_lines: list[str], sids: list[str], parent_pid: int) -> int | None:
     """The LIVE CLI pid holding one of `sids` as a child of `parent_pid` (this kernel), or None.
     The interrupt escalation's (and the drain reap's) target: same signature match as
@@ -3539,6 +3662,7 @@ class SdkSession:
         # BEFORE the ResultMessage that carries api_error_status, so the settle pairs the two.
         self.auth_label = "unknown"
         self._ah_turn = 0
+        self._swap_cards = []        # (pretty from, pretty to, card gid) per capacity fallback learned this turn (T279)
         self._ah_gaveup = None
         self._interrupted = False                    # user interrupted the in-flight turn → snapshot reads 'waiting' (display only; inflight stays event-driven)
         self._intr_level = 0                         # interrupt escalation rung this episode (interrupt_action); reset on settle / fresh turn
@@ -4834,7 +4958,19 @@ class SdkSession:
             fb = getattr(type(self.backend), "on_model_fallback", None)
             if fb:
                 try:
-                    fb(self.sid, self.model, pm)
+                    ret = fb(self.sid, self.model, pm)
+                    # T279: keep the swap and the card it minted until the turn settles. A safeguards
+                    # refusal the CLI retried on the fallback model looks exactly like this from here
+                    # (the retried leg streams on the fallback model), and its cause arrives only in the
+                    # CLI's END-OF-TURN model_refusal_fallback notice — whose filing then folds exactly
+                    # this card, by id, into the refusal card (one swap, one card). The kernel's hook
+                    # returns (gid, ...); a test double may return None.
+                    gid = ret[0] if isinstance(ret, tuple) and ret else (ret if isinstance(ret, str) else None)
+                    if gid:
+                        cards = getattr(self, "_swap_cards", None)     # (__new__-built doubles skip __init__)
+                        if cards is None:
+                            cards = self._swap_cards = []
+                        cards.append((self.model, pm, gid))
                 except Exception as e:
                     self.backend._log("model-fallback card (%s): %s" % (self.name, e), problem=True)
         self.model = pm
@@ -4847,6 +4983,46 @@ class SdkSession:
         except Exception as e:
             self.backend._log("model learn (%s): registry write failed: %s" % (self.name, e))
         self.backend._poke()
+
+    def _on_refusal_fallback(self, d: dict):
+        """File a streamed model_refusal_fallback frame through the kernel-wired hook (the branch in
+        _on_message). PRETTY names, like the capacity path's learn (self.model / pm), so the swap the
+        notice names is the swap the learn recorded. A null category / explanation becomes "" (the
+        schema: null is normal, not an error); an absent scope is 'session'. The frame carries every
+        capacity card this turn's learn minted (_swap_cards) and the episode key (the refused prompt's
+        uuid), so the store can fold the cards that belong to this swap. Loud where the frame or the
+        wiring is broken: a frame without model ids (the schema marks both required) is a logged problem
+        and files nothing rather than a card reading "? → a fallback model"; an unwired hook is said once
+        per kernel life, never a silent drop. A `provisional` frame (an intermediate hop of a multi-hop
+        chain: the first fallback refused too) files like any other: on the CLI's chain path no final
+        frame need follow it, so skipping it would drop the filing, and a later hop of the same episode
+        folds its card in the store. A failing hook is a logged problem, never a raise into the stream
+        loop."""
+        if not isinstance(d, dict) or not d.get("original_model") or not d.get("fallback_model"):
+            self.backend._log("sdk: model_refusal_fallback frame without model ids — keys=%r; nothing filed"
+                              % (sorted(d)[:20] if isinstance(d, dict) else type(d).__name__,), problem=True)
+            return
+        frm = pretty_model(str(d.get("original_model") or ""))
+        to = pretty_model(str(d.get("fallback_model") or ""))
+        cat = str(d.get("api_refusal_category") or "").strip()
+        expl = str(d.get("api_refusal_explanation") or "").strip()
+        scope = str(d.get("scope") or "session")
+        episode = str(d.get("refused_user_message_uuid") or "")
+        # A 'local' refusal (a subagent's or a side question's reply) never swapped the session's model,
+        # so none of this turn's cards is its own.
+        caps = [] if scope == "local" else [c[2] for c in (getattr(self, "_swap_cards", None) or []) if c[2]]
+        hook = getattr(type(self.backend), "on_model_refusal_fallback", None)
+        if not hook:
+            memo = "model_refusal_fallback:no-hook"
+            if memo not in SdkSession._sys_subtypes_seen:
+                SdkSession._sys_subtypes_seen.add(memo)
+                self.backend._log("sdk: a model_refusal_fallback frame arrived but no on_model_refusal_fallback "
+                                  "hook is wired — the refusal is not filed (first seen this kernel life)")
+            return
+        try:
+            hook(self.sid, frm, to, cat, expl, scope, caps, episode)
+        except Exception as e:
+            self.backend._log("refusal-fallback card (%s): %s" % (self.name, e), problem=True)
 
     def _resolve_model_pending(self, pm) -> bool:
         """If a /model switch is pending and the observed live name `pm` now reflects the chosen alias,
@@ -5306,6 +5482,18 @@ class SdkSession:
             # off subtype+data (the typed subclasses need a newer SDK; the raw payload is identical).
             # Terminal statuses clear from EITHER message kind — a TaskStop can suppress the notification.
             self._on_task_event(msg.subtype, msg.data if isinstance(msg.data, dict) else {})
+        elif isinstance(msg, SystemMessage) and msg.subtype == "model_refusal_fallback":
+            # The CLI's structured record of a SAFEGUARDS refusal it retried on a fallback model (T279):
+            # the model's classifier declined the request and the turn re-ran on the configured fallback,
+            # so the reply that follows came from a different model, for a reason the user should see.
+            # Fields per the CLI's stream-json schema (bundled CLI 2.1.259): original_model /
+            # fallback_model; api_refusal_category (an open string; new categories ship ahead of schema
+            # updates; null when neither lane carried one, which is normal); api_refusal_explanation
+            # (display-only prose; null on server-lane banners); scope ('session': the session model is
+            # swapped; 'local': a subagent / side reply only; absent on older CLIs, read as session).
+            # Filed for the judges through the kernel-wired hook, the on_model_fallback way. The chat
+            # notice itself comes from the transcript record (event_model -> build_session modelFallback).
+            self._on_refusal_fallback(msg.data if isinstance(getattr(msg, "data", None), dict) else {})
         elif isinstance(msg, SystemMessage):
             # A subtype no branch above handles. Logged ONCE per subtype per kernel life (keys only, no
             # values): the CLI's stream-json allowlist decides what reaches us, and a frame kind it
@@ -5466,6 +5654,8 @@ class SdkSession:
                 # the CLI, its next streamed atom re-asserts 'working' via _forward — the stream is the truth.
                 self.inflight = 0
                 self._inflight_texts.clear()           # the CLI processed everything fed — same settle semantics
+                self._swap_cards = []                  # T279: a capacity card learned this turn is claimable only by
+                #                                        this turn's refusal notice — the settle is the deciding event
                 # A /compact that found NOTHING to compact emits no boundary — the turn just settles here. Clear
                 # the authoritative flag so parked ops proceed immediately, instead of waiting out a 180s cap.
                 self._compacting = False
@@ -7051,6 +7241,125 @@ class SdkBackend:
             self._log("session cli pid (%s): %s" % (session.name, e))
             return None
 
+    def _pid_alive(self, pid: int) -> bool:
+        """Does `pid` still exist? procfs where there is one (no signal sent, so a patched os.kill in
+        tests records only the real signals); `kill(pid, 0)` elsewhere."""
+        if os.path.isdir("/proc"):
+            return os.path.exists("/proc/%d" % pid)
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def _end_cli_tree(self, pid: int, ps_lines: list[str], kill=None, run=None, cgroup=None,
+                      killpg=None, alive=None, sleep=None, now=None) -> dict:
+        """End an orphaned session CLI and EVERYTHING it left behind (T276): its scope unit when it runs
+        in one (systemd ends every process in the cgroup, a tool shell's setsid children and any
+        re-parented leftover included), and, always, the process tree the `ps` listing still shows
+        under it — each descendant's own process group where it leads one (a setsid child), else the
+        process; children before the CLI, SIGTERM first, SIGKILL after TREE_KILL_GRACE for whatever
+        stayed. Nothing outside the tree is signaled: this kernel's own group is never a target, and a
+        group is signaled only when a descendant of THIS CLI leads it. `kill`, `run` and `cgroup` are
+        the test seams, resolved at call time so a patched os.kill / subprocess.run is honoured. Returns
+        what happened, for the reconcile's log line."""
+        kill = kill or os.kill
+        run = run or subprocess.run
+        cgroup = cgroup or _read_cgroup
+        # the process-group kill, the liveness poll and the grace clock are seams too (T276c): a test then
+        # pins the exact signal sequence with no real process, pid or second behind it
+        killpg = killpg or os.killpg
+        alive = alive or self._pid_alive
+        sleep = sleep or time.sleep
+        now = now or time.time
+        unit = scope_unit_of(cgroup(pid) or "")
+        # The scope must be the CLI's OWN: bin/romp-cli-scope names the unit with the pid the CLI runs as
+        # (`romp-session-<sid8>-$$-$t`, then execs into it), so a CLI in its own scope always carries its pid
+        # in the name. A CLI whose cgroup names a scope with ANOTHER pid merely INHERITED it — a kernel launched
+        # from inside a romp session's tool shell spawns CLIs inside that session's scope — and stopping that
+        # unit would end the launching session, not the orphan (the lean review of T276, 2026-09-09: the
+        # real-process test did exactly that to the session running it). Such a CLI is treated as unscoped.
+        if unit and scope_pid(unit) != pid:
+            self._log("cut-turn reap: pid %d sits in %s, a scope it did not start (inherited) — tree walk only" % (pid, unit))
+            unit = None
+        stopped = False
+        if unit:
+            try:
+                res = run(["systemctl", "--user", "stop", unit], capture_output=True, text=True, timeout=SCOPE_STOP_TIMEOUT)
+                stopped = (getattr(res, "returncode", 0) == 0)
+                if not stopped:
+                    err = ((getattr(res, "stderr", "") or "").strip().splitlines() or ["(no stderr)"])[0]
+                    self._log("cut-turn reap: systemctl stop %s exited %s: %s; the tree walk still runs" % (unit, getattr(res, "returncode", "?"), err))
+            except Exception as e:
+                self._log("cut-turn reap: stopping %s failed (%s); falling back to the process tree" % (unit, e))
+        own_pg = None
+        try:
+            own_pg = os.getpgid(0)
+        except OSError:
+            pass
+        targets = [p for p in descendants(ps_lines, pid) if p != os.getpid()] + [pid]
+        # a pid reused by an unrelated process between the ps snapshot and a signal must not be hit: remember
+        # each target's start time (procfs) and skip any whose identity changed; no procfs → no such check
+        born = {p: _read_starttime(p) for p in targets}
+        def same(p) -> bool:
+            b = born.get(p)
+            return b is None or _read_starttime(p) == b
+        def signal_all(sig, only_alive: bool) -> int:
+            n = 0
+            for p in targets:
+                if only_alive and not alive(p):
+                    continue
+                if not same(p):
+                    continue          # the pid now names another process
+                try:
+                    pg = os.getpgid(p)
+                except OSError:
+                    pg = None
+                try:
+                    if pg is not None and pg == p and pg != own_pg:
+                        killpg(pg, sig)             # a setsid'd tool child leads its own group: take the group
+                    else:
+                        kill(p, sig)
+                    n += 1
+                except (ProcessLookupError, PermissionError):
+                    pass
+            return n
+        signaled = signal_all(signal.SIGTERM, False)   # unconditionally: the OS answers for a pid already gone
+        deadline = now() + TREE_KILL_GRACE
+        while now() < deadline and any(alive(p) for p in targets):
+            sleep(0.05)
+        forced = signal_all(signal.SIGKILL, True) if any(alive(p) for p in targets) else 0
+        return {"scope": unit if stopped else None, "signaled": signaled, "forced": forced, "tree": len(targets) - 1}
+
+    def _stop_leftover_scopes(self, lastsids: list[str], run=None) -> int:
+        """Stop the session scopes of OUR sessions whose CLI is not a live child of this kernel (T276):
+        a scope outlives its CLI when a tool's setsid children keep running — exactly the loops the
+        pid-only reap left behind once their shells had died and re-parented. Every process in the
+        scope belongs to that session by construction. A unit whose pid is this kernel's own child
+        (a session already started before this sweep) is left alone. No systemctl (macOS, a box without
+        the user manager) → nothing to sweep. `run` is the test seam, resolved at call time."""
+        run = run or subprocess.run
+        try:
+            listing = run(SCOPE_LIST_ARGV, capture_output=True, text=True, timeout=10).stdout or ""
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return 0
+        except Exception as e:
+            self._log("cut-turn reap: listing session scopes failed: %s" % e)
+            return 0
+        stopped = 0
+        for unit in session_scope_units(listing.splitlines(), lastsids):
+            sp = scope_pid(unit)
+            if sp is not None and (sp == os.getpid() or (self._pid_alive(sp) and _read_ppid(sp) == os.getpid())):
+                continue            # this kernel's live session
+            try:
+                run(["systemctl", "--user", "stop", unit], capture_output=True, text=True, timeout=SCOPE_STOP_TIMEOUT)
+                stopped += 1
+            except Exception as e:
+                self._log("cut-turn reap: stopping leftover %s failed: %s" % (unit, e))
+        return stopped
+
     def _boot_reconcile(self, regs: list[dict]) -> None:
         """The kernel just booted — reconcile what the previous kernel's death left behind. Event-keyed
         on the boot itself plus each session's state tail, never on ages or timers:
@@ -7077,18 +7386,23 @@ class SdkBackend:
         try:
             alive = [r for r in regs if r.get("alive") and r.get("sid")]
             reaped = 0
+            scopes_stopped = 0
             lastsids = [str(r.get("lastSid") or "") for r in alive if r.get("lastSid")]
             if lastsids:
                 try:
                     ps = subprocess.run(PS_ARGV, capture_output=True, text=True, timeout=10).stdout
-                    for pid in find_orphan_clis(ps.splitlines(), lastsids, os.getpid()):
+                    ps_lines = ps.splitlines()
+                    for pid in find_orphan_clis(ps_lines, lastsids, os.getpid()):
                         if pid == os.getpid():
                             continue
+                        # the CLI AND its tree (T276): its scope unit, then every process still under it
                         try:
-                            os.kill(pid, signal.SIGTERM)
+                            self._end_cli_tree(pid, ps_lines)
                             reaped += 1
                         except (ProcessLookupError, PermissionError):
                             pass
+                    # …and the scopes whose CLI already died but whose children live on
+                    scopes_stopped = self._stop_leftover_scopes(lastsids)
                 except Exception:
                     self._log("boot reconcile: orphan reap failed: %s" % traceback.format_exc())
             resumed, restored, notified = 0, 0, 0
@@ -7175,10 +7489,11 @@ class SdkBackend:
                 except Exception:
                     self._log("boot reconcile: session %s failed (sweep continues): %s"
                               % (r.get("sid"), traceback.format_exc()))
-            if reaped or resumed or restored or notified:
+            if reaped or resumed or restored or notified or scopes_stopped:
                 self._log("boot reconcile: resumed %d cut turn(s), restored %d queued message(s), "
-                          "notified %d session(s) of dead background tasks, reaped %d orphaned CLI(s)"
-                          % (resumed, restored, notified, reaped))
+                          "notified %d session(s) of dead background tasks, reaped %d orphaned CLI(s) with their "
+                          "process trees, stopped %d leftover session scope(s)"
+                          % (resumed, restored, notified, reaped, scopes_stopped))
                 self._poke()
             # STAGGERED spawn (see BOOT_RESUME_CONCURRENCY): every reg above is already fixed —
             # queues persisted, heals applied — so even a death mid-stagger loses nothing (the next

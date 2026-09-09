@@ -8,6 +8,7 @@ import os
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
+from pathlib import Path
 import tempfile
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -37,16 +38,34 @@ def _run_undo(archive):
     jd.save_goal_archive = lambda sid, a: None
     jd.load_goals = lambda sid: live
     jd.save_goals = lambda sid, s: None
+    # The stores are in memory, but the undo pair still JOURNALS: the override rows and cleared.jsonl land under
+    # the kernel's judge, one module object shared by every test module in the process, so at its import-bound
+    # root they outlived this module and were replayed onto every later module's feed for the placeholder sid
+    # (T281). A private root for the duration.
+    saved_state = jd.STATE
+    jd._rebind_state(Path(tempfile.mkdtemp()))
     try:
         km._restore_goal_archive([IID])
         km._mark_nodes_cleared([IID], False)
     finally:
         for n, fn in orig.items():
             setattr(jd, n, fn)
+        jd._rebind_state(saved_state)
     return live
 
 
 class UndoRestoreCompleted(unittest.TestCase):
+    def test_the_undo_journal_does_not_outlive_the_module(self):
+        # The residue pin (T281): the rows the undo pair journals stay under the private root; the run-wide root's
+        # override journal and cleared.jsonl for the placeholder sid are exactly as they were.
+        jd = km.jd
+        shared = [jd.STATE / "overrides" / (SID + ".jsonl"), jd.STATE / "cleared.jsonl"]
+        before = [(p.exists(), p.stat().st_size if p.exists() else None) for p in shared]
+        _run_undo({"nodes": {IID: {"id": IID, "parentId": None, "nodeComplete": True, "cleared": True,
+                                   "text": "x", "t": NOW - 900, "mt": NOW - 600}}, "status": {IID: "completed"}})
+        self.assertEqual([(p.exists(), p.stat().st_size if p.exists() else None) for p in shared], before,
+                         "the run-wide journal and cleared log are untouched by this module")
+
     def test_completed_top_comes_back_with_sticky_settledDone(self):
         # a roll-down-completed top that LACKS settledDone (the ≈5% gap) — the case that used to flicker:
         # the top's own nodeComplete is False; its rolled-up done child carries the completion bottom-up

@@ -906,8 +906,14 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
 - `pusher`: `cycles`, `wakes` (every wake call; a burst of wakes runs one
   cycle), `wakes_event` and `wakes_backstop` (how the loop's wait ended),
   `cycle_ms_sum`, `cycle_ms_max` (since start), `cycle_ms_last`,
-  `cycle_cpu_ms_sum` (the pusher thread's own CPU time), and `cycle_ms_p50`,
-  `cycle_ms_p90`, `cycle_ms_ring_max`, `ring_n` from the last 256 cycles.
+  `cycle_cpu_ms_sum` (the pusher thread's own CPU time), `cycle_ms_p50`,
+  `cycle_ms_p90`, `cycle_ms_ring_max`, `ring_n` from the last 256 cycles,
+  `sends` (every payload that went to a client; a deduped frame the client
+  already holds is not one), and `idle_cycles`, `idle_ms_sum`, `idle_cpu_ms_sum`
+  (cycles that set no wake, sent no payload and saved no goal store: what a
+  longer wait between cycles would have skipped; a conservative undercount,
+  since a wake set by another thread or a periodic repost of an unchanged
+  frame marks a cycle busy).
 - `stages_ms`: `jobs` (the cycle's tick jobs outside the push), `push`, and
   inside it `push.chat`, `push.feed`, `push.timeline`, `push.send`. The
   `push.*` stages count every push, including the one a connecting page gets,
@@ -920,15 +926,24 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   loader (`load_goals`) and `save_goals`; the pusher's read-only loads go
   through the shared store cache and show under `memos.shared`, not here. A
   save that would rewrite identical bytes is a save without a write.
-- `memos`: the three identity memos on the goal-store path. `pass` is the
+- `memos`: the identity memos on the goal-store path. `pass` is the
   judge pass's stat-keyed store memo (`hit`, `miss`, `fail`, `evict`, `punch`,
   and its occupancy `entries`, `bytes`); `shared` is the pusher's shared
   read-only store cache (`hit`, `miss`, `compare_miss`, `refuse`, `dup`,
   `absent`, `corrupt`, `unreadable_journal`, `evict`, `fallback`, `poisoned`,
   with `entries`, `bytes` and `off`); `chain` is the write-moment chain memo
-  (`hit`, `miss`, `populate`, `bypass`). The compaction sweep after each judge
-  pass evicts from `pass` and `shared` the entries of stores no session in the
-  discover window owns, so both stay bounded by the live board.
+  (`hit`, `miss`, `populate`, `bypass`); `nudgeGate` is the auto-nudge walk's
+  planner-placement gate, derived once per (parse, store) and served while
+  both stand (`served`, `derived`; a healthy quiet box serves almost every
+  cycle); `cleared` is the feed's clear set, parsed once per state of
+  `cleared.jsonl` (its stat, taken before the read) and served while the file
+  stands (`served`, `derived`); `courierSkip` is the courier's change gate
+  (`skipped`, `scanned`, `recorded`: a session whose parse, store, journal,
+  archive and episode log have not moved since a scan that found nothing to
+  place is skipped whole). The compaction sweep after each judge pass evicts from `pass` and
+  `shared` the entries of stores no session in the discover window owns, so
+  both stay bounded by the live board; the gate memo is bounded by the session
+  count.
 - `judge`: `passes`, `ms_sum`, `ms_last`, `ms_mean` (wall time; a pass waits
   on model calls), `cpu_ms_sum` (CPU time of the judge tier threads and every
   per-session worker they run; the workers' share is `cpu_ms_workers`).

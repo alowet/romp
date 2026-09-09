@@ -49,10 +49,11 @@ class _Sock:
         pass
 
 
-def _budgeted(app, wid, behind=10):
-    """A client with the kernel's OWN send (_mk_ws_send), `behind` bytes under the drop budget: the next
-    frame that size or larger tips it."""
-    client = {"app": app, "wid": wid, "alive": True, "qbytes": km.WS_QUEUE_BYTES - behind,
+def _budgeted(app, wid, over=10):
+    """A client with the kernel's OWN send (_mk_ws_send), already `over` bytes PAST the drop budget with
+    nothing in flight (T278: "behind" is the backlog behind the head frame, and a backlog past the budget
+    drops the client on its next frame, whatever that frame's size)."""
+    client = {"app": app, "wid": wid, "alive": True, "qbytes": km.WS_QUEUE_BYTES + over,
               "qlock": threading.Lock()}
     client["send"] = km._mk_ws_send(queue.Queue(), _Sock(), client)
     return client
@@ -160,7 +161,9 @@ class DroppedClientsAreLoud(unittest.TestCase):
         pre = json.dumps(first)
         km._send_slot(client, "feed", first, pre, km._dedup_sig(first, pre))
         self.assertIn("feed", client.get("dstate", {}), "the keyed full went, and the client is held as its base")
-        client["qbytes"] = km.WS_QUEUE_BYTES - 10                    # the next frame — a small delta — tips it
+        # the backlog BEHIND the held full (the head of the queue, in flight) is past the budget: the next
+        # frame — a small delta — drops it (T278: the head itself never counts as "behind")
+        client["qbytes"] = client["qsizes"][0] + km.WS_QUEUE_BYTES + 10
         second = feed("Wire the notes-api health route, then its test")
         pre2 = json.dumps(second)
         err, old = io.StringIO(), sys.stderr

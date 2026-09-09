@@ -40,6 +40,14 @@ from pathlib import Path
 HERE = Path(os.path.dirname(os.path.realpath(__file__)))
 _events = SourceFileLoader("romp_codex_events", str(HERE / "codex_events.py")).load_module()
 _runtime = SourceFileLoader("romp_codex_runtime", str(HERE / "codex_runtime.py")).load_module()
+# The by-text KEY RULE (session_backend.echo_text_key): the one normalization under which an input echo's
+# text is compared with a transcript record's, shared with the kernel's _atom_user_texts and
+# SdkBackend.prune_live, so an echo whose text carries a trailing newline still lands. The kernel's own
+# copy of that module when it is loaded (kernel.py loads it as romp_session_backend, and TmuxBackend
+# subclasses that copy's ABC); otherwise the file is loaded under its OWN module name, as sdk_backend
+# does, so re-executing the source never rebinds the ABC out from under a subclass.
+echo_text_key = (sys.modules.get("romp_session_backend") or SourceFileLoader(
+    "romp_session_backend_keys", str(HERE / "session_backend.py")).load_module()).echo_text_key
 
 SDK_PIN = "openai-codex==0.144.4"     # bin/romp-codex-setup installs exactly this into codexvenv
 SETUP_HINT = ("Session not created: the Codex backend isn't installed. "
@@ -769,7 +777,12 @@ class CodexBackend:
         with s.lock:
             if s.dead:
                 return False
-            s.echoes.append({"text": text.strip(), "t": time.time(),
+            # WHOLE seconds, as the SDK and tmux echoes stamp theirs: record times are parse_z's int
+            # seconds and prune_live lands an echo by text only through a record at or after its send,
+            # so a float stamp would keep an echo whose record was written later in the same second. The
+            # text is stored under the shared key rule (echo_text_key), the key prune_live compares
+            # against; for a str that is the stripped text _append matches.
+            s.echoes.append({"text": echo_text_key(text), "t": int(time.time()),
                              "uuid": "echo-%s" % uuidlib.uuid4().hex[:8]})
             turn_id = s.turn_id
             tid = s.tid
@@ -1173,34 +1186,27 @@ class CodexBackend:
                 s.norm = None
             self._ensure_norm(s)
             self.transcript_path(s.sid).touch()
-            nf = self.state / "names" / s.sid
-            try:
-                old_line = nf.read_bytes()
-            except OSError:
-                old_line = None
             try:
                 self._write_name(s)
             except (OSError, UnicodeDecodeError) as e:
                 # the thread is HEALTHY — failing the turn over a cosmetic identity write would
                 # be worse (a decode failure from crash residue sailed through an OSError-only
-                # catch and DID fail the turn, unhealed forever — the r31 verification) — but
-                # the write must not leave residue either. Restore the old line, or remove the
-                # partial file.
-                try:
-                    if old_line is not None:
-                        nf.write_bytes(old_line)
-                        self.log("codex: names/%s write failed after thread start (%s) — the "
-                                 "identity file was restored; it refreshes on the next rename"
-                                 % (s.sid, e))
-                    else:
-                        nf.unlink(missing_ok=True)
-                        self.log("codex: names/%s could not be published after thread start "
-                                 "(%s) — the session runs UNNAMED on shared surfaces until a "
-                                 "rename lands; a same-name create may collide meanwhile"
-                                 % (s.sid, e))
-                except OSError:
-                    self.log("codex: names/%s left in an unknown state by a failed write (%s)"
-                             % (s.sid, e))
+                # catch and DID fail the turn, unhealed forever — the r31 verification). No
+                # restore write for the names file: _write_name is tmp + os.replace and removes
+                # its own temp (the r32 shape), so a raise leaves names/<sid> exactly as it was —
+                # and creates nothing when there was no file. The in-place nf.write_bytes(old_line)
+                # this branch carried predates that: it was the one non-atomic write on this path,
+                # an mtime bump for no content change, and under the very ENOSPC it existed for it
+                # truncated a good file to nothing, then blamed "a failed write" (#1138 dropped the
+                # same shape from rename; this is its twin, 2026-09-09). The log still says which
+                # of the two states the file is in — READ after the fact, never rewritten.
+                if (self.state / "names" / s.sid).is_file():
+                    self.log("codex: names/%s write failed after thread start (%s) — the identity "
+                             "file kept its old line; it refreshes on the next rename" % (s.sid, e))
+                else:
+                    self.log("codex: names/%s could not be published after thread start (%s) — "
+                             "the session runs UNNAMED on shared surfaces until a rename lands; "
+                             "a same-name create may collide meanwhile" % (s.sid, e))
             self.push()
             return True
         c.thread_resume(tid, {"cwd": cwd, **_approval_params(s.mode),
@@ -1432,20 +1438,58 @@ class CodexBackend:
         if not s:
             return []
         with s.lock:
+            # `_echo_text` marks the atom as an INPUT ECHO to the kernel, as SdkBackend's echo atoms do:
+            # _merge_live_atoms hides it behind its queued bubble (shown_texts) and never counts it as
+            # live work (an echo-only merge keeps the turn's real ended state), and build_session's
+            # queued-bubble pass enlists it while the session is busy. Without the marker an echo paints
+            # as a solid user atom beside its own queued bubble and forces the last turn open: a false
+            # "working" chip for a session whose only live item is a pending send.
             return [{"type": "user", "uuid": e["uuid"], "session_id": sid, "fsid": s.tid,
-                     "t": e["t"], "parentUuid": None, "author": "human",
+                     "t": e["t"], "parentUuid": None, "author": "human", "_echo_text": e["text"],
                      "message": {"role": "user",
                                  "content": [{"type": "text", "text": e["text"]}]}}
                     for e in s.echoes]
 
-    def prune_live(self, sid, tx_uuids, tx_user_texts=()):
+    def prune_live(self, sid, tx_uuids, tx_user_texts=(), human_floor=0):
+        """Drop the optimistic input echoes the transcript has caught up on, in the SessionBackend
+        contract's full call shape (the kernel's _merge_live_atoms passes sid, tx_uuids, tx_text_t and
+        human_floor positionally; tests/test_backend_call_parity.py pins the shape against every backend).
+
+        An echo retires on the events SdkBackend.prune_live names: its uuid is on disk, or its text
+        LANDED. `tx_user_texts` as a MAPPING (text -> the newest record time carrying it) lands the echo
+        only through a record written at or after its own send: this prune sees the whole transcript, and
+        without that floor a repeated text ("ok" twice) would retire the second echo the moment it was
+        sent (the SDK's T237b case); a plain set (an older caller) keeps the unfloored match. Texts are
+        compared under echo_text_key on BOTH sides. Record times are parse_z's whole seconds, so send()
+        stamps the echo with int(time.time()) as the SDK and tmux echoes do: a float stamp would keep an
+        echo whose record was written later in the same second. The backend's own _append retire is the
+        other exit; it sees only the records it just wrote.
+
+        `human_floor` (the newest genuine-human record's time) is accepted and retires nothing here. No
+        floor retires a plain input echo on any backend: a send the app-server never records must stay
+        visible. The SDK uses the floor to retire its streamed slash-command feedback, atoms carrying
+        `command`, and no Codex echo carries that flag: send() mints plain echoes only."""
         s = self._session(sid)
         if not s:
             return
-        texts = {t.strip() for t in tx_user_texts or ()}
+        uuids = tx_uuids or ()
+        text_t = tx_user_texts if isinstance(tx_user_texts, dict) else None
+        keys = None if text_t is not None else {echo_text_key(t) for t in (tx_user_texts or ())} - {""}
+
+        def _landed(e):
+            if e.get("uuid") in uuids:
+                return True
+            key = echo_text_key(e.get("text"))
+            if not key:
+                return False
+            if text_t is None:
+                return key in keys
+            return key in text_t and float(text_t[key] or 0) >= float(e.get("t") or 0)
+
         with s.lock:
-            s.echoes = [e for e in s.echoes
-                        if e["uuid"] not in (tx_uuids or ()) and e["text"] not in texts]
+            kept = [e for e in s.echoes if not _landed(e)]
+            if len(kept) != len(s.echoes):
+                s.echoes = kept
 
     # ── ask picker (no Codex equivalent in phase 1) ─────────────────────────────────────────────
     def on_ask(self, sid, kind, payload=None):

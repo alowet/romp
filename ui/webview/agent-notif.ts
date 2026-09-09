@@ -23,6 +23,18 @@ export interface AgentNotif {
   toolUseId: string;  // joins to the event's taskOutputs → a command's shell + output tail
 }
 
+// The card's one-line head, in the user's terms (the user 2026-09-07): "Background agent finished · <description>"
+// rather than the bare "<description> · completed" — the head must say WHAT this is (a background agent's
+// report, not a message anyone typed) before it says which one. A command keeps its exit code; a failed
+// status reads as "failed". Pure, so the test executes the exact strings the card shows.
+export function notifHead(a: AgentNotif): string {
+  const status = (a.status || "").trim().toLowerCase();
+  const word = !status || status === "completed" ? "finished" : status === "killed" || status === "stopped" ? "stopped" : status;
+  if (a.kind === "agent") return `Background agent ${word} · ${a.label}`;
+  if (a.kind === "command") return `Background command ${word} · ${a.label}` + (/^exit \d+$/.test(a.detail) ? ` · ${a.detail}` : "");
+  return `Background task ${word} · ${a.label}`;
+}
+
 export function parseAgentNotif(text: string): AgentNotif | null {
   // Only a task-notification (has a <task-id> or an Agent/Background-command summary); a plain reminder → null.
   if (!/<task-id>|<summary>\s*(?:Agent|Background command)\b/.test(text)) return null;
