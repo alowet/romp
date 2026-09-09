@@ -42,6 +42,7 @@ import { StagedStack } from "./staged-messages";
 import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, queuedCopyToHide, dropPending, bareGroupLabel, sentAtLabel } from "./send-pending";
 import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued, type HeldMemory } from "./queued-held";
 import { reloadHoldReason } from "./reload-hold";
+import { liveNotices, keepReloadNotices, takeReloadNotices } from "./reload-notices";
 import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional } from "./provisional";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
@@ -10040,7 +10041,7 @@ function landToast(msg: string) {
 // acknowledgement). The Escape listener never stops propagation: clearing a toast is
 // additive noise-removal, not a key the rest of the UI loses — and overlay consumers
 // that capture Escape (the lightbox, the viewer) still peel first by construction.
-function warnToast(msg: string) {
+function warnToast(msg: string): HTMLElement {
   let box = document.getElementById("warn-toasts");
   if (!box) {
     box = el("div", "");
@@ -10065,7 +10066,17 @@ function warnToast(msg: string) {
   box.appendChild(t);
   setTimeout(() => t.classList.add("fade"), 11000);
   setTimeout(() => t.remove(), 12000);
+  return t;   // the toast, for a caller that marks it (ephemeralWarnToast)
 }
+// A toast the page that follows a reload must not repeat. The staged sends' refusal ("Can't send yet") reports a STATE:
+// the session's host is unreachable (hostIsDown, a remote host's tunnel) or its tab is still being created
+// (isProvisionalId). The fresh page shows that state for itself (the host mark and the staged strip; a provisional tab
+// does not survive a reload), so replayed by persistNoticesForReload it would be redundant at best and stale at worst.
+// The mark keeps it out of the replay (reload-notices.ts liveNotices reads only the toasts without it). Toasts that
+// report what HAPPENED to a send or a file stay unmarked, since what they say is as true after the reload as before:
+// the nack (the attachment was not saved, the held message not sent), the dismissal and the other-tab ack (the held
+// message not sent), the refusal on a disconnected host (this message was not sent and is still in the composer).
+function ephemeralWarnToast(msg: string): void { warnToast(msg).dataset.ephemeral = "1"; }
 
 // Tail-windowing (see the View comment): a fresh/rewound view renders only the
 // last WINDOW_TAIL events; scrolling within EXPAND_TRIGGER_PX of the top reveals
@@ -11065,7 +11076,21 @@ function persistScrollForReload(): void {
   const rec = reloadScrollRecord(activeId, content.scrollTop, stick, stick ? null : captureScrollAnchor(content, v));
   try { if (rec) sessionStorage.setItem(RELOAD_SCROLL_KEY, JSON.stringify(rec)); } catch { /* ignore */ }
 }
-(window as any).__rompPersistForReload = persistScrollForReload;
+// The warning toasts on screen when the CORE reloads the page. A toast is DOM only and lives 12 s, and the core's restart
+// reload follows the last pending ship's retirement on the next task (it held for the ship: __rompPaneBusy's 'upload' or
+// 'held-send', ended by endReloadHoldIfIdle), so the nack saying an attachment was not saved and the held message not
+// sent, or the dismissal of the last pending chip or the ack landing on another tab, each saying the message was not
+// sent, was appended one task before the page went and the fresh page's loss toast had nothing to say (shipsInFlight
+// was already empty). Their texts ride THIS tab's sessionStorage (reload-notices.ts; per tab for the scroll record's
+// reason) and the fresh page shows them again once,
+// after the loss toast. The core's synchronous hook alone writes them: a navigation of the user's own (pagehide) says
+// nothing twice, the way the loss toast fires once and not on every load (tests/test_ship_reship.py ReloadLossToast),
+// while the scroll record rides both as before.
+function persistNoticesForReload(): void {
+  try { keepReloadNotices(sessionStorage, liveNotices(document.getElementById("warn-toasts"))); } catch { /* ignore */ }
+}
+function persistForReload(): void { persistScrollForReload(); persistNoticesForReload(); }   // the core's hook: both records
+(window as any).__rompPersistForReload = persistForReload;
 window.addEventListener("pagehide", persistScrollForReload);
 
 function captureScrollAnchor(content: HTMLElement, v: View): { uuid: string; y: number } | null {
@@ -13554,6 +13579,10 @@ try {
     }
   }
 } catch { /* ignore */ }
+// The notices the last page was showing when the reload core took it (persistNoticesForReload): shown again once, after
+// the loss toast above, and the record taken out of sessionStorage in the same call so a later load says nothing (one
+// reload, one replay: the scroll record's idiom).
+try { for (const text of takeReloadNotices(sessionStorage)) warnToast(text); } catch { /* ignore */ }
 
 // Composer EDIT mode (per session): set when the user clicks a bubble's edit affordance — the composer
 // then sends a rewindSend (branch from just before that message) instead of a plain message. The chip
@@ -13621,7 +13650,7 @@ function renderStagedStrip(id: string | null): void {
   go.addEventListener("click", () => {
     if (!id) return;
     if (hostIsDown(id) || isProvisionalId(id)) {
-      warnToast("Can't send yet — the session isn't reachable. They stay staged.");
+      ephemeralWarnToast("Can't send yet — the session isn't reachable. They stay staged.");
       return;
     }
     flushStaged(id);
@@ -15445,7 +15474,7 @@ function setupComposer() {
     // an empty plain send with a staged stack = "go": release what's held, nothing new to add
     if (!typed && !(composerFiles.get(activeId) || []).length && stagedMsgs.count(activeId)) {
       if (hostIsDown(activeId) || isProvisionalId(activeId)) {
-        warnToast("Can't send yet — the session isn't reachable. They stay staged.");
+        ephemeralWarnToast("Can't send yet — the session isn't reachable. They stay staged.");
         return;
       }
       flushStaged(activeId);
