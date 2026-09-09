@@ -2184,11 +2184,15 @@ _COURIER_SEEN = {}         # fsid -> the scan key of its last pass that found no
 # store where it was has no new information for the planner by construction, so the pass returns at once.
 # The key is every input the pass reads, taken BEFORE the store read (the chain-memo rule): the parse
 # cache's fileset key bound to the session object, the store file's key with its journal's and archive's,
-# the episode log's key, the session's task-store files (each name with its key: the declared-plan sync
-# reads them), the reg file's key, and the transcript path. Recorded only when the pass did nothing and the
-# store's key after the pass equals the one before it (a heal, a mint, a retirement or a rollup change
-# moves it); a pass with units, placements or a moved store is planned again next pass whatever the key
-# says. A parse the cache does not hold is never keyed. Pruned to the pass's fleet; a rebound root clears.
+# the episode log's key, the LEAF's task-store files (each name with its key: the declared-plan sync reads
+# the leaf fsid's directory, which a /clear forks away from an SDK session's sid), the reg file's key, the
+# captions file's key (the floor-title heal reads it), each running background launch with whether it has
+# crossed its deadline under the pass clock (the settle's one input no file records; see _bg_expiry_key),
+# and the transcript path. Recorded only when the pass did nothing and the store's key after the pass
+# equals the one before it (a heal, a mint, a retirement or a rollup change moves it); a pass with units,
+# placements or a moved store is planned again next pass whatever the key says. A parse the cache does not
+# hold is never keyed, nor is an expiry view that cannot be computed. Pruned to the sessions the pass
+# discovered; a rebound root clears.
 _PLANNER_SEEN = {}         # fsid -> the plan key of its last pass that had nothing to do
 _PLANNER_STATS = {"skipped": 0, "planned": 0, "recorded": 0}
 
@@ -2199,9 +2203,11 @@ def planner_skip_stats():
 
 
 def _task_store_key(fsid):
-    """The session's Claude task store (<config>/tasks/<fsid>/*.json, what em.task_store_plan reads) as a key:
-    each file's name with its stat, or None when the directory is absent; a listing error is a fresh sentinel
-    (never equal), so a store that cannot be read is never skipped over."""
+    """A Claude task store (<config>/tasks/<fsid>/*.json) as a key: each file's name with its stat, or None when
+    the directory is absent; a listing error is a fresh sentinel (never equal), so a store that cannot be read
+    is never skipped over. The planner hands in the LEAF fsid, the directory em.task_store_plan reads for the
+    declared-plan sync: an SDK session's /clear forks its transcript to a new fsid under the same romp sid, and
+    the agent's to-dos live under the fsid it is running as, not the sid."""
     d = Path(os.environ.get("CLAUDE_CONFIG_DIR") or str(em.HOME / ".claude")) / "tasks" / fsid
     try:
         names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
@@ -2212,14 +2218,20 @@ def _task_store_key(fsid):
     return tuple((n, _file_key(str(d / n))) for n in names)
 
 
-def _plan_key(fsid, path, session):
+def _plan_key(fsid, path, session, now):
     """Every input _plan_session reads, or None when the parse is not the cache's own (never skip what cannot
-    be keyed). Taken before the store read."""
+    be keyed). Taken before the store read. Index 2 is the store key: the record rule compares it after the
+    pass, so new terms go after the existing ones. Three terms beyond the files the pass opens by sid: the
+    LEAF's task store (the directory the declared-plan sync reads, which differs from the sid's for every SDK
+    session after a /clear), the captions file (the floor-title heal reads it), and each running background
+    launch with whether it has crossed its deadline under the pass clock `now` (_bg_expiry_key: the settle
+    reads that crossing and no file records it)."""
     pk = _PARSE_CACHE.get(fsid)
     if pk is None or pk[1] is not session:
         return None
     return (str(path), pk[0], _store_key(fsid), _file_key(str(EPIDIR / (fsid + ".jsonl"))),
-            _task_store_key(fsid), _file_key(str(SDKDIR / (fsid + ".json"))))
+            _task_store_key(session.get("leafFsid") or fsid), _file_key(str(SDKDIR / (fsid + ".json"))),
+            _file_key(str(CAPDIR / (fsid + ".jsonl"))), _bg_expiry_key(path, now))
 
 
 def _store_key(fsid):
@@ -7235,16 +7247,39 @@ def _session_closed(session):
 _BG_SCAN_CACHE = {}                       # path -> em.fold_records entry (running tasks) — mirrors the kernel's _bg_scan_cached
 
 
-def _bg_unresolved(path):
+def _bg_unresolved(path, now=None):
     """The transcript's still-RUNNING background launches (em._scan_bg_tasks pairing), folded append-incrementally.
     The DURABLE awaited-work source: the pairing lives in the transcript, so unlike any live backend
-    snapshot it survives a kernel restart and covers tmux CLIs whose tasks outlive the kernel."""
+    snapshot it survives a kernel restart and covers tmux CLIs whose tasks outlive the kernel.
+    `now`: the pass's clock when the planner hands it in (one clock for its key's expiry term and the
+    settle that term gates, so the two cannot disagree at the crossing); the wall clock otherwise."""
     # folds append-incrementally since 2026-09-03: a changed transcript steps only its appended records
     tasks = em.scan_bg_tasks_cached(path, _BG_SCAN_CACHE)
     # expiry is applied OUTSIDE the cache with a fresh now: a monitor whose CLI died mid-watch has no
     # terminal record, and an idle transcript never busts the mtime key — a cached verdict would say
     # "running" forever (see em._bg_expired)
-    return [t for t in tasks if not em._bg_expired(t, time.time())]
+    if now is None:
+        now = time.time()
+    return [t for t in tasks if not em._bg_expired(t, now)]
+
+
+def _bg_expiry_key(path, now):
+    """The settle's one input no file records, as a term of the planner gate's key: each running background
+    launch the transcript pairs (the judge's running-only fold, the set _awaiting_bg_hold filters) with
+    WHETHER its recorded deadline has passed under `now`, sorted. A clock fact keyed as the boolean it
+    resolves to, the shape of the kernel's awaiting-lift gate (_lift_spent_awaiting): the term moves once,
+    at the crossing, and the crossing itself re-plans the session, so a done focus top that a watch whose
+    CLI died mid-watch held at 'working' completes when the watch can no longer return. A launch with no
+    recorded ceiling (a backgrounded Bash, a dev server) is a stable False and never re-plans an idle
+    session; a ghost launch (before the live CLI's epoch) is a superset entry that costs one re-plan at a
+    crossing that cannot change the verdict, as the kernel's gate accepts. A scan that raises answers a
+    fresh sentinel (never equal, _task_store_key's listing-error rule), so a session whose view cannot be
+    computed is planned every pass; the settle's own call then raises as it does today."""
+    try:
+        return tuple(sorted((str(t.get("id") or ""), bool(em._bg_expired(t, now)))
+                            for t in em.scan_bg_tasks_cached(path, _BG_SCAN_CACHE)))
+    except Exception:
+        return object()
 
 
 def _death_marker(sid):
@@ -7281,7 +7316,7 @@ def _cli_epoch(sid):
     return max(sp or 0, mt or 0)
 
 
-def _awaiting_bg_hold(fsid, path, session, store):
+def _awaiting_bg_hold(fsid, path, session, store, now=None):
     """True while the session is awaiting its own dispatched background work — the settle must hold.
 
     A turn that ends with a live awaited task has NOT handed back the floor: the harness re-invokes the
@@ -7300,8 +7335,8 @@ def _awaiting_bg_hold(fsid, path, session, store):
         same placed-unstamped-is-a-service rule as the kernel's _bg_split, translated to judge-native
         events. A live awaitingWhy stamp re-affirms the hold past that audit; its lift releases it.
     Pre-verdict the hold is conservative (a launch whose turn nothing has swept always holds), matching
-    _bg_split's PENDING→awaited prior."""
-    tasks = _bg_unresolved(path)
+    _bg_split's PENDING→awaited prior. `now`: the pass's clock for the expiry view (see _bg_unresolved)."""
+    tasks = _bg_unresolved(path, now)
     if not tasks:
         return False
     sp = _cli_epoch(fsid)
@@ -7327,11 +7362,11 @@ def _awaiting_bg_hold(fsid, path, session, store):
     return any(launch_turn.get(t["id"]) not in swept for t in tasks)
 
 
-def _session_settled(fsid, path, session, store):
+def _session_settled(fsid, path, session, store, now=None):
     """The rollup's settled gate: the turn ended AND nothing the session dispatched is still awaited.
     _session_closed alone read the 'ended' proxy; this keys the settle on the event it was
     approximating — the session actually handing back the floor."""
-    return _session_closed(session) and not _awaiting_bg_hold(fsid, path, session, store)
+    return _session_closed(session) and not _awaiting_bg_hold(fsid, path, session, store, now)
 
 
 def _prompt_anchor_uuid(seg):
@@ -8959,7 +8994,7 @@ def _plan_session(fsid, path, now):
     re-examinable — until the courier plants a real goal). Returns placements made."""
     _judge_ctx.fsid = fsid                            # usage logging: attribute this session's judge calls
     session = parsed_session(fsid, [path], now)
-    pkey = _plan_key(fsid, path, session)             # BEFORE the store read (the chain-memo rule)
+    pkey = _plan_key(fsid, path, session, now)        # BEFORE the store read (the chain-memo rule)
     if pkey is not None and _PLANNER_SEEN.get(fsid) == pkey:
         _PLANNER_STATS["skipped"] += 1               # nothing moved since a pass that had nothing to do
         return 0
@@ -9440,7 +9475,7 @@ def _plan_session(fsid, path, now):
     _latch_ask_anchors(fsid, session, store)          # durable ask-unit anchor verdicts — no LLM,
     #                                                   idempotent (latched nodes skip), persisted
     #                                                   by the save just below
-    rollup_status(store, _session_settled(fsid, path, session, store))
+    rollup_status(store, _session_settled(fsid, path, session, store, now))
     save_goals(fsid, store)
     if pkey is not None:
         if placed == 0 and not units and not retired and _store_key(fsid) == pkey[2]:
@@ -9472,7 +9507,7 @@ def run_plan(now=None, sessions_cap=PLAN_SESSIONS, concurrency=None, verbose=Fal
         now = int(time.time())
     fleet = [s for s in discover(now) if not _hidden_from_feed(s[0])][:sessions_cap]   # muted sessions are out of task tracking
     for _gone in [f for f in _PLANNER_SEEN if f not in {s[0] for s in fleet}]:
-        _PLANNER_SEEN.pop(_gone, None)                # the planner gate, bounded by the pass's fleet
+        _PLANNER_SEEN.pop(_gone, None)                # the planner gate, bounded by the sessions this pass discovered
     placed = 0
     with ThreadPoolExecutor(max_workers=_conc(concurrency)) as ex:
         futs = {ex.submit(_plan_session, fsid, str(path), now): fsid for fsid, path, anchor, name in fleet}
