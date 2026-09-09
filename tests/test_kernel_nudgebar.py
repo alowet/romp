@@ -80,7 +80,7 @@ class NudgeBar(unittest.TestCase):
         self.td.cleanup()
 
     def _bars(self):
-        bars = km.build_timeline(NOW)["turns"][SID]
+        bars = [km._expand_bar(b) for b in km.build_timeline(NOW)["turns"][SID]]   # the wire bars, long-named (T278c)
         return {b["id"]: b for b in bars}
 
     def test_bars_carry_only_the_auto_nudge_flag(self):
