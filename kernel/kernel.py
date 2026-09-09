@@ -16628,7 +16628,40 @@ def _note_poll(r, answered):
         return False
     r["ok_polls"] = 0
     r["misses"] = int(r.get("misses") or 0) + 1
+    r["_poll_miss"] = True                           # a REAL silent poll: the recovery counter's evidence (T291b)
     return r["misses"] >= STALE_MISSES
+
+
+def _note_recovery(r, st):
+    """The row's RECOVERY counter (T291b, the user 2026-09-09): bumped once when a pass that ANSWERED finds
+    the row had missed polls, or was not up — the event a dashboard needs when a data-path request failed
+    through a link whose status never left "up" (a request that timed out mid-transfer, a re-dial the
+    supervisor's next poll answered): /tunnels serves it, and the dashboard's poll treats a change as the
+    host coming back (hostUp), so the previews parked on that link make their one attempt. Called once per
+    pass after `st` is final and before the pass overwrites the row's status.
+    Two guards from the review: (1) only a pass whose poll answered counts — after this pass's bookkeeping
+    that is exactly misses == 0 (a second silent poll under the stale bound keeps the row's "up" without
+    anyone answering, and must not read as a recovery); (2) a miss a DATA PATH preloaded (_demand_redial's
+    timeout) mints one bump until a real silent poll or a status change re-arms it, so a request that keeps
+    stalling on a healthy link cannot mint its own recovery, retry, stall, and mint again forever. A steady
+    healthy row never bumps; a fresh boot starts at 0 (the counter describes THIS process, like the poll run
+    counters, and is not saved). Returns whether it bumped."""
+    answered = st == "up" and int(r.get("misses") or 0) == 0
+    if not answered:
+        if st != "up":
+            r.pop("_demand_bumped", None)            # a status change re-arms the demand path
+        return False
+    real_miss = bool(r.pop("_poll_miss", False))
+    demand_miss = bool(r.pop("_demand_miss", False))
+    had_miss = real_miss or (demand_miss and not r.get("_demand_bumped"))
+    bumped = had_miss or r.get("status") != "up"
+    if bumped:
+        r["upSeq"] = int(r.get("upSeq") or 0) + 1
+    if bumped and demand_miss and not real_miss:
+        r["_demand_bumped"] = True                   # one demand-sourced bump until the link shows a real miss
+    if real_miss:
+        r.pop("_demand_bumped", None)
+    return bumped
 
 
 def _tunnel_established(r):
@@ -17980,7 +18013,16 @@ def _demand_redial(host, kind):
     finish — each user action buys at most one fresh dial, never a storm."""
     with _remotes_lock:
         r = _remotes.get(host)
-        if not r or r.get("checkin_peer"):
+        if not r:
+            return
+        if r.get("checkin_peer"):
+            # no ssh of ours to terminate or back off; but a starved request is still one silent poll's worth
+            # of evidence (T291b): the woken pass's answer bumps the recovery counter the same way it does
+            # for an ssh row, so a mobile's link that stayed "up" heals its parked previews too
+            if kind == "timeout":
+                r["misses"] = max(int(r.get("misses") or 0), STALE_MISSES - 1)
+                r["_demand_miss"] = True
+                _tunnel_wake.set()
             return
         alive = _tunnel_proc_alive(r)
         if kind == "refused" and alive and isinstance(r.get("restartExpected"), dict):
@@ -17997,6 +18039,7 @@ def _demand_redial(host, kind):
                 pass
         elif alive and kind == "timeout":
             r["misses"] = max(r.get("misses", 0), STALE_MISSES - 1)
+            r["_demand_miss"] = True                 # a data-path preload, not a real silent poll (T291b: one bump until a real miss)
     _tunnel_wake.set()
 
 
@@ -18147,7 +18190,9 @@ def _remote_public(r):
             "fails": int(r.get("fails") or 0), "nextTry": int(r.get("next_try") or 0),
             # not live: everything above derived from kernel_sha / the peer's declared tier is a memory of
             # the last successful exchange. lastOk is when that was (0 = never seen up this process).
-            "stale": stale, "lastOk": int(r.get("last_ok") or 0)}
+            "stale": stale, "lastOk": int(r.get("last_ok") or 0),
+            # the recovery counter (T291b): a change while "up" is a link that answered again after misses
+            "upSeq": int(r.get("upSeq") or 0)}
 
 
 _remotes_saved_sig = None   # signature of the last blob written — lets the supervisor save ONLY on a real
@@ -18164,6 +18209,8 @@ _NOT_SAVED = ("proc",       # the live Popen
               #               survive a kernel restart; the boot's first poll re-reads, the gate unstamped
               "misses",     # the poll run counters: they describe THIS connection, and a fresh boot
               "ok_polls",   # dials from scratch, so carrying them across would judge a link that is gone
+              "upSeq",      # the recovery counter (T291b): the same per-process story; the dashboard skips a first observation
+              "_poll_miss", "_demand_miss", "_demand_bumped",   # the counter's evidence marks: this process's, like misses
               "_checkin_refused")   # the mobile's memo of a hub refusing the name it declared: a boot is
 #                                     an event that re-arms the send (review find, 2026-09-08)
 
@@ -21281,6 +21328,7 @@ def _tunnel_supervisor():
                         elif silent:
                             # a miss, but not yet a run of them: say so and leave the link alone
                             st = r.get("status") or st
+                    _note_recovery(r, st)   # an answered pass after misses, or a not-up→up: the dashboard's hostUp (T291b)
                     if not (st == "down" and r.get("status") == "error") and not r.get("booting"):
                         # Every status CHANGE on the record, so an outage leaves a timeline instead of a
                         # single end-state to reason backwards from: when it flipped, what the end-to-end
