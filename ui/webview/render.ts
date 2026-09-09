@@ -13434,6 +13434,10 @@ window.addEventListener("romp:wsup", () => {
 window.addEventListener("romp:hostRelayUp", (e) => {
   const h = String((((e as CustomEvent).detail || {}) as any).host || "");
   if (h) reshipPendingUploads([h]);
+  // …and the figure previews parked on that host's link (T291): the relay socket's open is the reconnect-class
+  // event a remote kernel's restart produces (it fires neither romp:wsup nor hostUp), so settled previews
+  // make their one attempt here as well
+  refreshSettledPreviews();
   // …and the tab this pane is LOOKING AT, when that host owns it (T246, the user 2026-09-07): the relay's
   // open is the moment the remote kernel holds a FRESH client for this pane — after that kernel restarted,
   // one with no active tab at all. Its pusher keys only a client's active tab on the live change key (the
