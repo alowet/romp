@@ -5788,6 +5788,11 @@ function renderTabs() {
     surfaceLens(effViews(), "chat"), unions,
     visibleIds.map((id) => {
       const s = sessions.get(id), down = hostIsDown(id), note = down ? hostDownNote(id) : "";
+      if (renderKind(skeletonTabs, id, !!s) === "skeleton") {                                              // makeSkeletonTab's reads:
+        const m = tabMeta.get(id), kst = skeletonTabs.status.get(id) as Status | undefined;               // the kernel's list + its
+        return ["k", m?.name || s?.name, (m?.color || s?.color)?.bg, (m?.color || s?.color)?.fg, id === peekId,   // status frames, never the
+                kst?.state, kst && tabStateClass(kst), !!kst?.faded, kst?.ctx, kst?.ctxColor, kst?.ctxTone, down, note];   // stale session's status
+      }
       if (!s) { const m = tabMeta.get(id); return ["p", m?.name, m?.color?.bg, m?.color?.fg, down, note]; }   // makePlaceholderTab's reads
       const st = s.status;
       return [s.name, s.color?.bg, s.color?.fg, st.state, tabStateClass(st), !!st.faded,

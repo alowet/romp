@@ -85,3 +85,14 @@ test("what follows a render runs on both paths: the placeholder and the all-hidd
   assert.match(after, /const blank = !visibleIds\.length && ids\.length > 0 && !tabInView\(activeId\);/);
   assert.ok(!fn.includes("allHiddenBlanked"), "renderTabs itself does not blank or restore: only the aftermath, which both paths reach");
 });
+
+test("a skeleton tab is an input of its own: the kind, the strip meta and the stored status frame, never the stale session's status", () => {
+  // the reconnect regime (2026-09-09): a skeleton id may still hold its pre-outage session in memory, so a
+  // signature that read only `sessions` was equal before and after the kernel's skeleton list landed — and the
+  // strip never repainted into skeletons. The skeleton's own reads join the list ahead of the session's.
+  assert.match(sig, /if \(renderKind\(skeletonTabs, id, !!s\) === "skeleton"\) \{/, "the kind is decided inside the signature");
+  assert.match(sig, /skeletonTabs\.status\.get\(id\)/, "the stored status frame is an input");
+  assert.match(sig, /return \["k", m\?\.name \|\| s\?\.name,/, "a skeleton row is keyed apart from a placeholder's and a session's");
+  assert.ok(sig.indexOf('=== "skeleton"') < sig.indexOf('return ["p", m?.name'), "the skeleton branch precedes the placeholder branch, as in the render loop");
+});
+

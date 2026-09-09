@@ -350,8 +350,8 @@ covered by the picker: their CLI lives in the tmux server's environment, which
 the kernel does not control, and resolves its credential the way any `claude`
 in a terminal does.
 
-A tab not yet loaded after a reconnect says "Not loaded yet — click to load"
-instead, until its transcript arrives.
+A tab not yet loaded after a reconnect shows "Not loaded yet — click to load"
+as its hover tooltip, until its transcript arrives.
 
 An SDK session's chat tab carries the same fact as a `Billing` row in its hover
 tooltip, one-auth machines included; tmux sessions, whose billing romp cannot

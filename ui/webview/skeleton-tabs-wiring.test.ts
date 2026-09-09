@@ -202,3 +202,12 @@ test("the statusline over a skeleton tab says Loading, the word its loader uses,
   assert.match(usl, /const loading = skeletonTabs\.ids\.has\(activeId\) \|\| skeletonLoading === activeId;\s*\n\s*sl\.replaceChildren\(openingLine\(loading \? "Loading session" : "Opening session"\)\);/);
   assert.match(RENDER, /function openingLine\(text = "Opening session"\): HTMLElement \{/);
 });
+
+test("the strip's repaint gate sees a skeleton: the signature reads renderKind and the stored status, not the stale session", () => {
+  const rt = fn("renderTabs");
+  const sig = rt.slice(rt.indexOf("const stripSig = JSON.stringify(["), rt.indexOf("const mslotEl = "));
+  assert.ok(sig.length > 0, "the signature located");
+  assert.match(sig, /renderKind\(skeletonTabs, id, !!s\) === "skeleton"/);
+  assert.match(sig, /skeletonTabs\.status\.get\(id\)/);
+});
+
