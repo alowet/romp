@@ -24,15 +24,16 @@ complementary views of what the agents are doing:
 **Reviewing a document.** Select any passage in the file viewer and it lands in the
 composer as a quote chip, labeled with the file and the line the passage lives on. Type
 what should change and press **⌘⏎** to set the note aside; keep reading, select the next
-passage, and repeat — each staged note remembers its quote and its place. **⏎** sends
-everything you staged along with whatever is in the box, so the session applies the lot
-in one pass, and you never copy a line out of the document by hand. The line in each
-label is checked against the file at the moment you select, so numbers that moved under
-you are caught rather than quietly carried. When several sessions work in the same
-repository, or in worktrees of it, the viewer's title bar says which one you opened the
-file from: a chip with the session's name, in the same color as its tab. The title bar's
-**GitHub ↗** button opens the file on GitHub. While the check runs, the button waits dimmed
-with pulsing dots beside it.
+passage, and repeat — each staged note remembers its quote and its place. The list above
+the composer shows about four staged notes and scrolls for the rest; its caret collapses
+it to the count. **⏎** sends everything you staged along with whatever is in the box as
+one message, so the session applies the lot in one pass, and you never copy a line out of
+the document by hand. The line in each label is checked against the file at the moment
+you select, so numbers that moved under you are caught rather than quietly carried. When
+several sessions work in the same repository, or in worktrees of it, the viewer's title
+bar says which one you opened the file from: a chip with the session's name, in the same
+color as its tab. The title bar's **GitHub ↗** button opens the file on GitHub. While the
+check runs, the button waits dimmed with pulsing dots beside it.
 When there is nothing to open, the button stays in place, dimmed, and a caption beside it
 says why (the file is not in a git repository or not committed — untracked, staged but in no
 commit, or on a branch with no commits yet — the repository has no origin remote, its origin
