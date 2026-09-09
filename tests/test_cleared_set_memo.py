@@ -157,17 +157,52 @@ class ClearSetMemo(_Memo):
         self.assertEqual(km._cleared_ids(), {G1: NOW - 100, G2: NOW})
 
 
-class PassHoist(unittest.TestCase):
-    def test_the_pass_parses_once_and_hands_every_session_the_set(self):
-        src = inspect.getsource(km._auto_nudge_pass)
-        self.assertIn("cleared = _cleared_ids()", src, "hoisted before the alive loop")
-        self.assertIn("cleared=cleared", src, "and handed to every session")
+class PassHoist(_Memo):
+    def test_the_pass_parses_once_and_hands_every_session_the_same_set(self):
+        # BEHAVIOURAL, not a source pin: two alive sessions, the real pass, the walk a recorder. The clear
+        # log is parsed once for the pass and both walks receive the very same dict.
+        self._append(self._clear(G1, NOW - 100))
+        A, B = SID, "11111111-2222-3333-4444-888888888803"
+        seen, calls = [], []
+        real = km._cleared_ids
+
+        def counting():
+            calls.append(1)
+            return real()
+
+        def walk(s, now, tmux, nudged, waitfor, alive_ids=None, wake_only=False, cleared=None):
+            seen.append(cleared)
+            return False
+        saved = {n: getattr(km, n) for n in
+                 ("_cleared_ids", "_alive_sessions", "_wait_for_graph", "_auto_nudge_session", "_compact_suggest_tick",
+                  "_debt_backstop_tick", "_dead_wait_sweep", "_awaiting_wake_outcomes", "_push_soon",
+                  "_pop_walk_gate", "_put_walk_gate")}
+        km._cleared_ids = counting
+        km._alive_sessions = lambda now, tmux: [{"sid": A, "path": "/nonexistent-a.jsonl"},
+                                                {"sid": B, "path": "/nonexistent-b.jsonl"}]
+        km._wait_for_graph = lambda now, alive_ids: {}
+        km._auto_nudge_session = walk
+        km._compact_suggest_tick = lambda sid, tm, now: False
+        km._debt_backstop_tick = lambda now: None
+        km._dead_wait_sweep = lambda alive_ids, nudged, now: None
+        km._awaiting_wake_outcomes = lambda now, alive_ids: False
+        km._push_soon = lambda: None
+        km._pop_walk_gate = lambda sid: None
+        km._put_walk_gate = lambda sid, gate, now: None
+        try:
+            km._auto_nudge_pass(NOW, {}, run_dead_wait=False)
+        finally:
+            for n, v in saved.items():
+                setattr(km, n, v)
+        self.assertEqual(len(seen), 2, "both sessions walked")
+        self.assertEqual(calls, [1], "the clear log parsed once for the pass")
+        self.assertIs(seen[0], seen[1], "one set, handed to every session")
+        self.assertEqual(seen[0], {G1: NOW - 100})
+
+    def test_a_walk_without_the_set_derives_it_as_before(self):
         params = inspect.signature(km._auto_nudge_session).parameters
         self.assertIn("cleared", params)
-        self.assertIsNone(params["cleared"].default, "a caller without the set (the tests' direct calls) still works")
-        walk = inspect.getsource(km._auto_nudge_session)
-        self.assertIn("_cleared_ids() if cleared is None else cleared", walk)
-        self.assertEqual(walk.count("_cleared_ids("), 1, "the walk's only read is the fallback")
+        self.assertIsNone(params["cleared"].default)
 
     def test_the_counters_ride_the_perf_snapshot(self):
         snap = km._PERF_STATS.snapshot()

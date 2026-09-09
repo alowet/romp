@@ -789,25 +789,31 @@ class AwaitingWakeOutcomeSweep(unittest.TestCase):
         self.assertFalse(km.jd.load_goals(SID)["nodes"][self.gid]["blocked"])
 
 
-    def test_sweep_decides_through_the_shared_view_and_never_asks_the_writer_for_an_inert_record(self):
+    def test_sweep_escalates_through_the_view_and_the_writer_loads_only_to_stamp(self):
         # T267d (2026-09-09): the sweep's per-record store read takes the shared read-only view
         # (kernel/judge.py load_goals_shared); a fresh writer load per record was the pusher's remaining
-        # goal loads once the walk's own read moved. Decisions unchanged: a walked, ungated record is the
-        # walk's, and the writer's loader is never asked for it.
+        # goal loads once the walk's own read moved. Decision unchanged: a silent due wake the walk cannot
+        # reach still escalates; the view is read once for the record, and the writer's loader is asked
+        # exactly once, by the stamp itself (_mark_nudge_failed), never to decide.
         now = 1_000_000
         self._seed_goal(at=now - 20 * 3600)
-        self._seed_rec({"wake": True, "anchor": now - 20 * 3600, "count": 1, "lastTurnId": "t1",
-                        "armAtoms": 0, "at": now - 3600})
+        self._seed_rec({"wake": True, "anchor": now - 20 * 3600, "count": 1, "lastTurnId": "t0",
+                        "armAtoms": 0, "at": now - 7 * 3600})
         km.jd._shared_clear()
-        private, o_load = [], km.jd.load_goals
-        km.jd.load_goals = lambda fsid: (private.append(fsid), o_load(fsid))[1]
-        stats0 = km.jd.shared_store_stats()
+        reads, o_load, o_view = [], km.jd.load_goals, km.jd.load_goals_shared
+        km.jd.load_goals = lambda fsid: (reads.append("writer"), o_load(fsid))[1]
+        km.jd.load_goals_shared = lambda fsid: (reads.append("view"), o_view(fsid))[1]
         try:
-            self.assertFalse(km._awaiting_wake_outcomes(now, walked={SID}))
+            self.assertTrue(km._awaiting_wake_outcomes(now))
         finally:
-            km.jd.load_goals = o_load
-        self.assertEqual(private, [], "the writer's loader is never asked to decide")
-        self.assertFalse(km.jd.load_goals(SID)["nodes"][self.gid]["blocked"])
+            km.jd.load_goals, km.jd.load_goals_shared = o_load, o_view
+        self.assertEqual(reads[0], "view", "the decision reads the view")
+        self.assertEqual(reads.count("view"), 1, "once, for the record")
+        self.assertTrue(len(reads) > 1 and all(r == "writer" for r in reads[1:]),
+                        "every writer load belongs to the stamp, after the decision: %r" % reads)
+        store = km.jd.load_goals(SID)
+        self.assertTrue(store["nodes"][self.gid]["blocked"], "the same escalation as before")
+        self.assertEqual(store["nodes"][self.gid].get("blockWhy"), km.jd.WAKE_BLOCK_WHY)
 
     def test_sweep_leaves_a_cleared_card_alone_through_the_view(self):
         # a due wake whose card the user cleared: the record is inert (not 'working'), no block, no writer load

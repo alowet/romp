@@ -9166,7 +9166,9 @@ def _auto_nudge_pass(now, tmux, run_dead_wait):
     alive_ids = {s["sid"] for s in alive}
     waitfor = _wait_for_graph(now, alive_ids)             # {sid:{peerSid,name,inCycle}} — the peer-wait gate
     fired = False
-    cleared = _cleared_ids()                              # one parsed clear set for every session this pass walks (2026-09-09)
+    cleared = _cleared_ids()                              # one parsed clear set for every session this pass walks (2026-09-09):
+    #                                                       a clear landing mid-pass reaches the later sessions next pass; the
+    #                                                       node's own cleared flag, written in the same gesture, covers the gap
     for s in alive:
         # PER-SESSION ISOLATION (2026-07-16): one session's failure — a bad backend snapshot, a
         # malformed store — must not abort the whole tick and silence nudging fleet-wide. A
@@ -30559,7 +30561,8 @@ def build_episode(sid, now):
 
 # ───────────────────────── feed clear / undo (inbox-zero) ─────────────────────────
 _CLEARED_MEMO = {"slot": None}     # (key, parsed set) or None: the clear log's stat taken BEFORE the read, and the set read under it
-_CLEARED_STATS = {"served": 0, "derived": 0}
+_CLEARED_STATS = {"served": 0, "derived": 0}   # bumped from the pusher AND socket threads (undo, connect-time builds) with
+#                                                no lock: a lost count under a race is tolerated, these are diagnostics only
 
 
 def _cleared_ids():
@@ -30599,7 +30602,7 @@ def _cleared_ids():
                 cur[iid] = o.get("t", 0)
     except OSError:
         _CLEARED_STATS["derived"] += 1
-        return cur                                       # vanished between the stat and the read: empty, uncached
+        return cur                                       # absent, vanished after the stat, or unreadable: empty, uncached
     _CLEARED_STATS["derived"] += 1
     if key is not None:
         _CLEARED_MEMO["slot"] = (key, cur)
