@@ -155,7 +155,9 @@ class DisconnectBanner(unittest.TestCase):
         # a pane's build-drift raise rides the same wsStale channel tagged build:1 → the shell shows
         # BUILDMSG (not the connection wording), and latches it so its own /version poll — whose token
         # may be current — can't clear the prompt out from under the stale pane (the user 2026-07-13)
-        self.assertIn("if(m.build){buildStale=true;show(BUILDMSG);}else{connStale=true;show(CONNMSG);}", km._STALE_JS)
+        # T265 (the user 2026-09-08): a build:1 is handed to the reload core (the page reloads itself); the
+        # BUILDMSG wording shows only where the core is absent
+        self.assertIn("if(m.build){if(RL)RL.request('build','');else{buildStale=true;show(BUILDMSG);}}else{connStale=true;show(CONNMSG);}", km._STALE_JS)
         self.assertIn("!connStale&&!buildStale", km._STALE_JS, "the poll's clear respects both latches")
         self.assertIn("connStale=false;buildStale=false;", km._STALE_JS, "Dismiss clears both")
 

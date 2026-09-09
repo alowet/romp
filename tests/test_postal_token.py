@@ -335,6 +335,12 @@ class _PostalTokenFile(unittest.TestCase):
     def setUp(self):
         self.f = ps.STATE.parent / "serve-token"
         self.lock = self.f.with_name("serve-token.lock")
+        # The fixture owns its state directory (T274, 2026-09-08): the module's XDG_STATE_HOME is a fresh temp dir,
+        # and only the two minting cases (birth, the flock race) create STATE.parent through the loader. Run alone —
+        # a parallel worker scheduling one of the other six by itself — those wrote the token, the lock, or the
+        # symlink into a directory that did not exist yet and failed on the parent, then again in _restore. Serially
+        # they passed on a sibling's side effect, which is not a fixture.
+        self.f.parent.mkdir(parents=True, exist_ok=True)
         self._env = self._umask = None
         self.addCleanup(self._restore)      # registered FIRST: a failing _clear() must not leak a zeroed umask
         self._env = os.environ.pop("ROMP_SERVE_TOKEN", None)
@@ -566,6 +572,193 @@ class PostalLockFailureIsFailClosed(_PostalTokenFile):
         self.assertNotIn("Make the file yours", str(cm.exception), "not a token file that does not exist (review find, 2026-09-08)")
         self.assertFalse(self.f.exists(), "nothing minted unlocked")
         self.assertEqual(self._temps(), [])
+
+
+def _call(port, path, method="GET", payload=None):
+    """(status, body) over the real Handler, token in hand — a refusal answers a JSON body too."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), data=data, method=method,
+                                 headers={"X-Romp-Token": TOK, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
+_RCP = "22222222-3333-4444-5555-666666666666"
+_SND = "11111111-2222-3333-4444-555555555555"
+
+
+class _LiveBus(unittest.TestCase):
+    """A real ThreadingHTTPServer on ps.Handler: the routes below are pinned by their HTTP answers,
+    not by calling read_box / deliver directly — the defects were in what the socket saw."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), ps.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def setUp(self):
+        self._saved = (ps.TLDIR, ps._log, ps.resolve_recipient)
+        self.logged = []
+        ps._log = lambda m: self.logged.append(m)
+        if hasattr(ps, "_TL_FAULT"):
+            ps._TL_FAULT[0] = False
+        getattr(ps, "_UNREADABLE_SAID", set()).clear()
+
+    def tearDown(self):
+        ps.TLDIR, ps._log, ps.resolve_recipient = self._saved
+        if hasattr(ps, "_TL_FAULT"):
+            ps._TL_FAULT[0] = False
+        ps.PEERS.pop("farhost", None)
+
+    def _break_the_log(self):
+        # TLDIR under a regular FILE: mkdir raises (ENOTDIR), so the REAL _tl_append fails the way a
+        # full or read-only disk fails it
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(lambda: os.unlink(path))
+        ps.TLDIR = Path(path) / "timeline"
+
+
+class InboxSurvivesAnUnreadableFile(_LiveBus):
+    """One unreadable file in new/ (EACCES here; EIO in the wild) used to raise out of read_box, and
+    do_GET has no handler: socketserver printed the traceback and closed the socket with NO HTTP
+    answer, on every /inbox and /drain, so the session got no mail at all (2026-09-08). The rest of
+    the box is served, and the file is moved ASIDE once (review find, 2026-09-08): to
+    `<mailbox>/<name>.corrupt-<stamp>`, beside new/ and out of every listing, never deleted; with one
+    log line, one bell row through the kernel, a terminal row that closes the sender's receipt as
+    refused, and the pending marker no longer latched. The first cut left the file in place, said
+    once: re-skipped every poll, the marker up forever, the receipt pending forever, and nothing the
+    user could see. Mutants: the move dropped (the file stays, the marker latches); the row dropped
+    (the receipt reads pending); the notice dropped (the log alone knows)."""
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-0 file; the fault cannot be staged")
+    def test_the_file_is_moved_aside_once_the_rest_is_served_and_the_sender_hears_refused(self):
+        import errno
+        import shutil
+        shutil.rmtree(ps.MAILROOT / _RCP, ignore_errors=True)
+        shutil.rmtree(ps.MAILPENDING, ignore_errors=True)
+        td = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(td, ignore_errors=True))
+        ps.TLDIR = Path(td)
+        told, saved_post = [], ps._kernel_post
+        ps._kernel_post = lambda path, body, timeout=2: told.append((path, body)) or {"ok": True}
+        self.addCleanup(lambda: setattr(ps, "_kernel_post", saved_post))
+        ps.deliver(_RCP, "web", _SND, "the readable one", kind="coordinate")
+        bad = ps.deliver(_RCP, "web", _SND, "never readable", kind="question")   # a real send: its sent row stands
+        badf = ps.MAILROOT / _RCP / "new" / bad
+        os.chmod(badf, 0)
+        status, body = _call(self.port, "/inbox?id=%s&peek=1" % _RCP)
+        self.assertEqual(status, 200, "the inbox answers")
+        self.assertEqual([m["body"] for m in body["messages"]], ["the readable one"],
+                         "the rest of the box is served")
+        self.assertFalse(badf.exists(), "the unreadable file leaves new/")
+        aside = [p.name for p in (ps.MAILROOT / _RCP).iterdir() if p.name.startswith(bad + ".corrupt-")]
+        self.assertEqual(len(aside), 1, "moved aside beside new/, kept as evidence")
+        status, body = _call(self.port, "/inbox?id=%s&peek=1" % _RCP)
+        self.assertEqual((status, [m["body"] for m in body["messages"]]), (200, ["the readable one"]))
+        said = [m for m in self.logged if bad in m]
+        self.assertEqual(len(said), 1, "said once across two polls, not per poll")
+        self.assertIn("errno %d" % errno.EACCES, said[0], "naming the errno")
+        self.assertIn(aside[0], said[0], "and where it went")
+        self.assertEqual([(p, "moved aside" in b.get("text", "")) for p, b in told], [("/postal-notice", True)],
+                         "one bell row through the kernel, not one per poll")
+        rows = [json.loads(l) for l in (Path(td) / "messages.jsonl").read_text().splitlines() if l]
+        self.assertEqual([r["ev"] for r in rows if r.get("id") == bad], ["sent", "bounced"],
+                         "the ledger closes on the id nobody can read")
+        rec = [r for r in ps._sent_receipts(_SND) if r["id"] == bad][0]
+        self.assertTrue(rec["bounced"])
+        self.assertTrue(rec["bouncedWhy"].startswith(ps.WHY_INBOX_UNREADABLE))
+        txt = ps.format_receipts([rec])
+        self.assertIn("refused", txt)
+        self.assertNotIn("returned to you", txt, "no return note exists for a refusal")
+        _call(self.port, "/inbox?id=%s" % _RCP)                        # the drain consumes the readable one
+        self.assertFalse((ps.MAILPENDING / _RCP).exists(),
+                         "the pending marker is not latched by a file nobody can read")
+
+
+class SendRefusesWhenTheRowCannotLand(_LiveBus):
+    """The /send route answers ok:false — 503, so the tool and CLI clients, which raise only on a
+    non-2xx, surface it — when the sent row cannot be written, on BOTH legs: the relay park and the
+    local delivery. On origin/main both answered ok:true: the relay leg parked the message and
+    appended the row afterwards regardless, and deliver() published before its best-effort row."""
+
+    def _far(self):
+        ps.resolve_recipient = lambda to, frm_id="": {"kind": "relay", "host": "farhost",
+                                                       "agent": {"name": to, "id": _RCP}}
+        ps.PEERS["farhost"] = {"up": True, "port": 1}
+
+    def _send(self, kind="coordinate"):
+        return _call(self.port, "/send", "POST", {"to": "api", "from": "web", "from_id": _SND,
+                                                  "body": "the staging port?", "kind": kind})
+
+    def test_the_relay_leg_answers_ok_false_and_parks_nothing(self):
+        import shutil
+        shutil.rmtree(ps.OUTBOX / "farhost", ignore_errors=True)
+        self._far()
+        self._break_the_log()
+        status, body = self._send()
+        self.assertEqual(status, 503)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("not recorded", body.get("error", ""))
+        self.assertIn("retry", body.get("error", ""))
+        self.assertEqual(ps.outbox_list("farhost"), [], "nothing parked without its row")
+
+    def test_the_relay_leg_still_answers_ok_when_the_row_lands(self):
+        import shutil
+        shutil.rmtree(ps.OUTBOX / "farhost", ignore_errors=True)
+        self._far()
+        td = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(td, ignore_errors=True))
+        ps.TLDIR = Path(td)
+        status, body = self._send()
+        self.assertEqual((status, body.get("ok")), (200, True))
+        self.assertEqual([m["mid"] for m in ps.outbox_list("farhost")], [body["id"]], "parked, with its row")
+        rows = [json.loads(l) for l in (Path(td) / "messages.jsonl").read_text().splitlines() if l]
+        self.assertEqual([(r["ev"], r["id"]) for r in rows], [("sent", body["id"])])
+
+    def test_the_local_leg_answers_ok_false_and_delivers_nothing(self):
+        import shutil
+        shutil.rmtree(ps.MAILROOT / _RCP, ignore_errors=True)
+        ps.resolve_recipient = lambda to, frm_id="": {"kind": "direct",
+                                                       "agent": {"name": to, "id": _RCP, "remote": False}}
+        self._break_the_log()
+        status, body = self._send(kind="question")
+        self.assertEqual(status, 503)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("not delivered", body.get("error", ""))
+        newd = ps.MAILROOT / _RCP / "new"
+        self.assertEqual([p.name for p in newd.iterdir()] if newd.is_dir() else [], [], "no mail without its row")
+
+    def test_a_park_that_fails_after_the_row_closes_the_ledger_and_refuses(self):
+        # mutant: outbox_put's False ignored → 200 "relaying" with a sent row and nothing parked
+        import shutil
+        self._far()
+        td = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(td, ignore_errors=True))
+        ps.TLDIR = Path(td)
+        saved = ps.outbox_put
+        ps.outbox_put = lambda h, m: False                  # the record could not be written
+        try:
+            status, body = self._send()
+        finally:
+            ps.outbox_put = saved
+        self.assertEqual(status, 503)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("could not be parked", body.get("error", ""))
+        rows = [json.loads(l) for l in (Path(td) / "messages.jsonl").read_text().splitlines() if l]
+        self.assertEqual([r["ev"] for r in rows], ["sent", "bounced"], "the ledger closes on the refused id")
+        self.assertEqual(rows[0]["id"], rows[1]["id"])
+        self.assertEqual(rows[1]["why"], ps.WHY_NOT_PARKED)
+
 
 
 if __name__ == "__main__":

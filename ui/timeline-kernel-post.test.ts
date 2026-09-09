@@ -76,11 +76,16 @@ async function asObsidian(records: { port?: number | string; token?: string; env
   }
 }
 
-// a kernel stand-in on loopback: keeps every request, answers what the test says — a JSON body, or
-// `raw` text, or (`drop`) headers and a partial body followed by a destroyed socket
-type Seen = { method: string; url: string; headers: http.IncomingHttpHeaders; body: any };
-type Answer = { status: number; body?: any; raw?: string; drop?: boolean };
-function kernel(answer: (req: Seen) => Answer) {
+// a kernel stand-in on loopback: keeps every request (with the client port it came in on), answers what
+// the test says: a JSON body, or `raw` text, or (`drop`) headers and a partial body followed by a
+// destroyed socket. GET /healthz, the identity the panel asks for before it sends a token, is answered
+// as a romp kernel answers it (200 "ok" with X-Romp-Boot) unless the test hands the stand-in another
+// answer (`healthz`: what a squatter on the port would say)
+type Seen = { method: string; url: string; headers: http.IncomingHttpHeaders; body: any; remotePort: number };
+type Answer = { status: number; body?: any; raw?: string; drop?: boolean; headers?: Record<string, string> };
+const HEALTHZ_KERNEL: Answer = { status: 200, raw: "ok", headers: { "X-Romp-Boot": "4242.1781000000" } };
+const posts = (k: { seen: Seen[] }) => k.seen.filter((q) => q.method === "POST");
+function kernel(answer: (req: Seen) => Answer, opts: { healthz?: Answer } = {}) {
   return new Promise<{ port: number; seen: Seen[]; close: () => Promise<void> }>((resolve) => {
     const seen: Seen[] = [];
     const srv = http.createServer((req, res) => {
@@ -90,11 +95,11 @@ function kernel(answer: (req: Seen) => Answer) {
       req.on("end", () => {
         let body: any = null;
         try { body = text ? JSON.parse(text) : null; } catch { body = text; }
-        const rec: Seen = { method: req.method || "", url: req.url || "", headers: req.headers, body };
+        const rec: Seen = { method: req.method || "", url: req.url || "", headers: req.headers, body, remotePort: req.socket.remotePort || 0 };
         seen.push(rec);
-        const a = answer(rec);
+        const a = (rec.method === "GET" && rec.url === "/healthz") ? (opts.healthz || HEALTHZ_KERNEL) : answer(rec);
         if (a.drop) { res.writeHead(a.status, { "Content-Type": "application/json", "Content-Length": "40" }); res.write('{"ok":'); setTimeout(() => res.destroy(), 5); return; }
-        res.writeHead(a.status, { "Content-Type": a.raw !== undefined ? "text/plain" : "application/json" });
+        res.writeHead(a.status, Object.assign({ "Content-Type": a.raw !== undefined ? "text/plain" : "application/json" }, a.headers || {}));
         res.end(a.raw !== undefined ? a.raw : JSON.stringify(a.body));
       });
     });
@@ -116,8 +121,10 @@ test("executed: the token rides the header from the kernel's 0600 file, the port
       const r = await panel()._kernelPost("/flag", { id: SID, flag: "hideFromFeed", value: true });
       assert.equal(r.ok, true);
       assert.equal(r.body.value, true, "the kernel's answer rides back whole");
-      assert.equal(k.seen.length, 1, "one request");
-      const q = k.seen[0];
+      assert.equal(k.seen.length, 2, "the proof, then the write");
+      assert.deepEqual([k.seen[0].method, k.seen[0].url, k.seen[0].headers["x-romp-token"]], ["GET", "/healthz", undefined], "the port proves itself first, with no token in that request");
+      assert.equal(k.seen[0].remotePort, k.seen[1].remotePort, "the write rides the connection that proved itself");
+      const q = k.seen[1];
       assert.equal(q.method, "POST");
       assert.equal(q.url, "/flag", "the route and nothing else — no token in the URL");
       assert.equal(q.headers["x-romp-token"], TOKEN, "the token from the file, in the header every kernel client uses");
@@ -132,7 +139,7 @@ test("executed: the token rides the header from the kernel's 0600 file, the port
   assert.match(kp, /e\.code !== 'ENOENT'\) return unreadable\('port record'/, "…an unreadable record is said, never read as 'not running'…");
   assert.match(kp, /envVar = pick\('ROMP_KERNEL_PORT'\) \? 'ROMP_KERNEL_PORT' : \(pick\('ROMP_SERVE_PORT'\) \? 'ROMP_SERVE_PORT' : ''\);\s*\n\s*envRaw = envVar \? pick\(envVar\) : '29855';/,
     "…and only a MISSING record falls to the CLI's resolution: the environment in _kernel_urls' order, else bin/romp's one default");
-  assert.match(kp, /bin\/romp's default, \$\{ROMP_KERNEL_PORT:-29855\}/, "the comment names the rule the panel actually mirrors (keyswap alone probes two more ports)");
+  assert.match(kp, /bin\/romp's default, \$\{ROMP_KERNEL_PORT:-29855\}/, "the comment names the rule the panel actually mirrors");
   assert.match(kp, /require\('http'\)\.request\(/, "Node's http, not fetch: no CORS preflight from Obsidian's app:// origin can read as a kernel that is down");
 });
 
@@ -207,12 +214,13 @@ test("executed: no serve-port record → the CLI's port (env, else 29855) is tri
     await asObsidian({ token: TOKEN, envPort: k.port }, async () => {
       const r = await panel()._kernelPost("/flag", { id: SID, flag: "hideFromFeed", value: true });
       assert.equal(r.ok, true, "ROMP_KERNEL_PORT, as bin/romp resolves it");
-      assert.equal(k.seen.length, 1);
-      assert.equal(k.seen[0].headers["x-romp-token"], TOKEN);
+      assert.equal(posts(k).length, 1);
+      assert.equal(posts(k)[0].headers["x-romp-token"], TOKEN);
+      assert.deepEqual([k.seen[0].method, k.seen[0].url], ["GET", "/healthz"], "the fallback port proves itself first, like the recorded one");
       delete process.env.ROMP_KERNEL_PORT; process.env.ROMP_SERVE_PORT = String(k.port);
       const r2 = await panel()._kernelPost("/flag", { id: SID, flag: "hideFromFeed", value: true });
-      assert.equal(r2.ok, true, "ROMP_SERVE_PORT too, as cli/keyswap.py resolves it");
-      assert.equal(k.seen.length, 2);
+      assert.equal(r2.ok, true, "ROMP_SERVE_PORT too, as the CLI resolves it");
+      assert.equal(posts(k).length, 2);
     });
   } finally { await k.close(); }
   // a kernel there from before these routes: 404, named as such — not "not running"
@@ -698,4 +706,139 @@ test("plain node never posts: the writers do nothing without a host hook or Elec
   assert.equal(p._viewsWrites.length, 0, "no write record was minted for a write that never left");
   assert.match(SRC, /_kernelHost\(\) \{[\s\S]{0,500}if \(typeof process === 'undefined' \|\| !process\.versions \|\| !process\.versions\.electron\) return null;/,
     "the one Electron-or-nothing guard every writer takes");
+});
+
+test("executed: before the token leaves this panel the port must prove itself over GET /healthz with no token; a port another service answers on receives nothing else and is refused by name (review find, 2026-09-08, on #1078)", async () => {
+  // a stale serve-port record that some other local service now listens on: every shape a squatter can
+  // answer the proof with. The stand-in would ACCEPT the POST if it ever arrived, so a token leaking
+  // through would read as ok:true here
+  const squatters: [string, Answer][] = [
+    ["a plain 200 OK", { status: 200, raw: "OK" }],
+    ["a JSON service", { status: 200, body: { ok: true } }],
+    ["a 404", { status: 404, raw: "not found" }],
+    ["the body without the kernel identity header", { status: 200, raw: "ok" }],
+    ["the header on the wrong body", { status: 200, raw: "ready", headers: { "X-Romp-Boot": "1.2" } }],
+  ];
+  for (const [label, hz] of squatters) {
+    const sq = await kernel(() => ({ status: 200, body: { ok: true, id: SID, flag: "hideFromFeed", value: true } }), { healthz: hz });
+    try {
+      await asObsidian({ port: sq.port, token: TOKEN }, async () => {
+        const p = panel();
+        const r = await p._kernelPost("/flag", { id: SID, flag: "hideFromFeed", value: true });
+        assert.deepEqual([r.ok, r.unreachable, r.foreign], [false, true, true], label);
+        assert.ok(r.error.startsWith("127.0.0.1:" + sq.port + " answered, but not as a romp kernel (GET /healthz answered HTTP " + hz.status), label + ": " + r.error);
+        assert.ok(r.error.endsWith("); this panel's token was not sent to it"), label + ": " + r.error);
+        assert.equal(sq.seen.length, 1, label + ": the proof and nothing after it");
+        assert.deepEqual([sq.seen[0].method, sq.seen[0].url], ["GET", "/healthz"], label);
+        // the writer, as the gear runs it: the toggle goes back where the click found it and the gear says why
+        const s = p.data.sessions[0];
+        await gearClick(p, s, true);
+        assert.deepEqual([s.hideFromFeed, p._pendingFlags], [false, {}], label);
+        assert.ok(p._laneRefusal.text.startsWith("couldn't save that setting — 127.0.0.1:" + sq.port + " answered, but not as a romp kernel"), label + ": " + p._laneRefusal.text);
+        for (const q of sq.seen) {
+          assert.equal(q.headers["x-romp-token"], undefined, label + ": no token ever reached the port");
+          assert.equal(q.headers["authorization"], undefined, label);
+          assert.equal(q.method + " " + q.url, "GET /healthz", label + ": nothing but token-less proofs");
+        }
+      });
+    } finally { await sq.close(); }
+  }
+  // the CLI-default fallback (no record) goes through the very same proof: a squatter there sees no token either
+  const sq2 = await kernel(() => ({ status: 200, body: { ok: true } }), { healthz: { status: 200, raw: "OK" } });
+  try {
+    await asObsidian({ token: TOKEN, envPort: sq2.port }, async () => {
+      const r = await panel()._kernelPost("/order", { order: [SID] });
+      assert.deepEqual([r.ok, r.unreachable, r.foreign], [false, true, true]);
+      assert.equal(sq2.seen.length, 1);
+      assert.ok(sq2.seen.every((q) => q.method === "GET" && q.url === "/healthz" && q.headers["x-romp-token"] === undefined), "the fallback port is asked to prove itself and the token stays home");
+    });
+  } finally { await sq2.close(); }
+  // a kernel that proves itself gets the write: the proof first, the token only on the POST, both on one connection
+  const k = await kernel(() => ({ status: 200, body: { ok: true, order: [SID] } }));
+  try {
+    await asObsidian({ port: k.port, token: TOKEN }, async () => {
+      const r = await panel()._kernelPost("/order", { order: [SID] });
+      assert.equal(r.ok, true);
+      assert.deepEqual(k.seen.map((q) => [q.method, q.url, q.headers["x-romp-token"]]), [["GET", "/healthz", undefined], ["POST", "/order", TOKEN]]);
+      assert.equal(k.seen[0].remotePort, k.seen[1].remotePort, "the token rides the connection that answered as a romp kernel");
+    });
+  } finally { await k.close(); }
+  // nothing answering on the proof is still plainly 'not running' (the record's word), never 'not a romp kernel'
+  await asObsidian({ token: TOKEN, port: await closedPort() }, async () => {
+    const r = await panel()._kernelPost("/flag", { id: SID, flag: "hideFromFeed", value: true });
+    assert.deepEqual([r.ok, r.unreachable, r.foreign, r.error], [false, true, undefined, KERNEL_DOWN]);
+  });
+  // the shape: the proof gates the POST, on loopback, the liveness route, no token in that request
+  const kp = SRC.slice(SRC.indexOf("  _kernelPost(route, body) {"), SRC.indexOf("  _kernelProve(port, agent, down) {"));
+  assert.ok(kp.length > 0 && kp.length < 9000, "the writer's slice");
+  assert.match(kp, /return this\._kernelProve\(port, agent, down\)\.then\(\(proof\) => \{\s*\n\s*if \(!proof\.ok\) \{ teardown\(\); return proof; \}/, "the proof gates the POST; a failed proof is the answer, and no request follows it");
+  assert.ok(kp.indexOf("this._kernelProve(") < kp.indexOf("'X-Romp-Token': tok"), "the proof is asked before the token is put in any header");
+  const pv = SRC.slice(SRC.indexOf("  _kernelProve(port, agent, down) {"), SRC.indexOf("  _kernelProve(port, agent, down) {") + 3500);
+  assert.match(pv, /host: '127\.0\.0\.1', port, path: '\/healthz', method: 'GET', agent: agent \|\| undefined \}/, "loopback only, the liveness route, no headers at all");
+  assert.doesNotMatch(pv, /X-Romp-Token|\btok\b/, "no token in the proof");
+  assert.ok(pv.includes("if (st === 200 && text.trim() === 'ok' && /^\\d+\\.\\d+$/.test(boot)) return finish({ ok: true, boot });"),
+    "the frozen liveness body and the kernel identity header (X-Romp-Boot: <pid>.<epoch>), both required");
+  // the fallback is STATED, in the panel, the kernel's record docstring and the reference, as what it is
+  assert.match(SRC, /the port the CLI resolves: ROMP_KERNEL_PORT, then ROMP_SERVE_PORT, else 29855\. Record or fallback,\s*\n\s*\/\/ the port must first PROVE itself a romp kernel/, "the panel's comment");
+  assert.doesNotMatch(SRC, /the port from the kernel's own\s*\n\s*\/\/ record \(never a guess\)/, "the sentence that was untrue is gone");
+  const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
+  assert.match(KERNEL, /the panel tries the port the CLI resolves -- ROMP_KERNEL_PORT,\s*\n\s*then ROMP_SERVE_PORT, else 29855/, "the serve-port record's docstring");
+  assert.match(KERNEL, /the panel first asks the port to prove itself over GET \/healthz/, "and it names the proof");
+  assert.doesNotMatch(KERNEL, /never guessing a port or falling back to a write the kernel cannot check/, "the record's untrue sentence is gone");
+  const DOCS = fs.readFileSync(path.resolve(process.cwd(), "..", "docs", "reference.md"), "utf8");
+  assert.match(DOCS, /it tries the port the command line resolves, `ROMP_KERNEL_PORT`, then\s*\n`ROMP_SERVE_PORT`, else `29855`/, "the reference");
+  assert.match(DOCS, /`GET \/healthz` with no token, on `127\.0\.0\.1` only, must answer `200 ok` with\s*\nthe kernel's `X-Romp-Boot` identity before the token is sent/);
+});
+
+test("executed: the not-saved note is reconciled on the store read: a poll that shows the store carrying the held filter releases it and repaints the Filter menu; a different store value or a stale frame leaves it (review find, 2026-09-08, on #1078)", async () => {
+  await withDom(() => asObsidian({}, async () => {
+    const p = panel();
+    const answers: any[] = [];
+    p._kernelPost = () => Promise.resolve(answers.shift());
+    const S = { active: "all", actives: { timeline: { all: true } }, seq: 3, tags: [{ id: "gA", name: "web", color: "#3b82f6", members: [SID] }] };
+    p._views = S;
+    p._openViewsMenu(makeNode("button"));
+    const menu = p._viewsMenu;
+    // no kernel takes the lens write: held locally, said in the menu
+    answers.push({ ok: false, unreachable: true, error: KERNEL_DOWN });
+    rowNamed(menu, "web")._listeners.click();
+    await tick();
+    assert.ok(rows(menu).includes("⚠ this filter is not saved — " + KERNEL_DOWN), "held, and said: " + JSON.stringify(rows(menu)));
+    assert.deepEqual(timelineLens(p._curViews()).tags, ["web"]);
+    // a poll whose store carries a DIFFERENT timeline filter (a dashboard picked another tag): the viewer's own
+    // unsaved choice still stands, note and all
+    const tags = S.tags.concat([{ id: "gB", name: "other", color: "#ef4444", members: [SID2] }]);
+    const other = Object.assign({}, S, { actives: { timeline: { tags: ["other"] }, chat: { all: true } }, seq: 4, tags });
+    assert.equal(p._takeViews(other), true, "adopted");
+    assert.deepEqual(timelineLens(p._curViews()).tags, ["web"], "the held filter still shows over the store's");
+    assert.ok(rows(menu).includes("⚠ this filter is not saved — " + KERNEL_DOWN), "still unsaved, still said");
+    // a stale frame (an older seq) adopts nothing and settles nothing
+    assert.equal(p._takeViews(Object.assign({}, other, { actives: { timeline: { tags: ["web"] } }, seq: 2 })), false);
+    assert.ok(p._localLens, "a frame the gate turned away is not the store");
+    assert.ok(rows(menu).includes("⚠ this filter is not saved — " + KERNEL_DOWN));
+    // the poll that shows the store carrying the very filter (a dashboard saved it, or this panel's own write landed
+    // after an answer that read as unreachable): released on that read, the note gone, the menu repainted in place
+    const saved = Object.assign({}, other, { actives: { timeline: { tags: ["web"] }, chat: { all: true } }, seq: 5 });
+    assert.equal(p._takeViews(saved), true);
+    assert.equal(p._localLens, null, "nothing held: the store has it");
+    assert.ok(!rows(menu).some((t: string) => t.startsWith("⚠")), "the note went with it: " + JSON.stringify(rows(menu)));
+    assert.ok(rowNamed(menu, "web").textContent.endsWith("✓"), "the filter shows, as the store's now");
+    assert.deepEqual(timelineLens(p._curViews()).tags, ["web"]);
+    p._closeViewsMenu();
+  }));
+  // per key: only the keys the store now carries are released; the rest stay held with the reason, and a
+  // second read with nothing new releases nothing (no repaint for nothing)
+  const p = panel();
+  p._views = { active: "all", actives: { timeline: { tags: ["web"] }, chat: { all: true } }, tagOrder: ["web", "api"], seq: 9,
+               tags: [{ id: "gA", name: "web", color: "#3b82f6", members: [] }, { id: "gB", name: "api", color: "#ef4444", members: [] }] };
+  p._localLens = { fields: { actives: { timeline: { tags: ["web"] }, chat: { tags: ["api"] } }, tagOrder: ["web", "api"] }, reason: KERNEL_DOWN };
+  assert.equal(p._reconcileLocalLens(), true);
+  assert.deepEqual(p._localLens, { fields: { actives: { chat: { tags: ["api"] } } }, reason: KERNEL_DOWN }, "the timeline filter and the pill order the store carries are released; the chat filter it does not is held");
+  assert.equal(p._reconcileLocalLens(), false, "nothing more to release");
+  p._localLens = null;
+  assert.equal(p._reconcileLocalLens(), false);
+  // the event: the store read, in _takeViews (the poll's update() and the ack's viewsAck both land there) and the caps adoption
+  assert.match(SRC, /if \(data\.views\) this\._takeViews\(data\.views\);/, "the poll adopts the store through _takeViews");
+  assert.match(SRC, /this\._views = v; this\._rejectedViews = null;\s*\n\s*if \(this\._reconcileLocalLens\(\)\) this\._repaintTagSurfaces\(\);/, "…which reconciles the held lens on adoption and repaints only when something was released");
+  assert.match(SRC, /if \(adopted\) \{ this\._views = this\._rejectedViews; this\._reconcileLocalLens\(\); \}/, "the caps frame's adoption too");
 });

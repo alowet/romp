@@ -44,7 +44,7 @@ test("the OPEN gate dialog resolves itself on the last ack: closes and sends, no
   assert.match(RENDER, /const gateOpen = shipGateSid === owner;/);
   assert.match(RENDER, /if \(gateOpen\) \{ shipGateSid = null; closeConfirm\(null\); \}/,
     "the dialog dismisses itself the moment the last ship lands, then the send fires");
-  assert.match(RENDER, /shipGateSid = null;\n\s*if \(v === "now"\)/,
+  assert.match(RENDER, /shipGateSid = null; endReloadHoldIfIdle\(\);\n\s*if \(v === "now"\)/,
     "any button (or cancel) un-registers the gate — the ack path can never resolve a closed dialog");
   // a FAILED save also moots the dialog — it closes, but never auto-sends without the file
   assert.match(RENDER, /const gateWasOpen = shipGateSid === owner;/);

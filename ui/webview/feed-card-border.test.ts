@@ -41,15 +41,15 @@ test("the border colour is CSS-driven from the channels: 0.5α at rest", () => {
   assert.match(CSS, /\.fitem\.ask, \.fitem\.fgroup \{ border-color: rgba\(var\(--card-r, 255\), var\(--card-g, 255\), var\(--card-b, 255\), 0\.5\); \}/);
 });
 
-test("the highlight BOLDS the same colour (no white ring): pinned 0.85α, focused full + a same-colour ring", () => {
+test("the highlight BOLDS the same colour (no white ring): pinned 0.85α, focused full alpha + the lift shadow, paint only", () => {
   assert.match(CSS, /\.fitem\.ask\.pinned  \{ border-color: rgba\(var\(--card-r, 255\), var\(--card-g, 255\), var\(--card-b, 255\), 0\.85\); \}/);
-  // focused = full-opacity border, one touch bolder as a SINGLE paint: the border grows 1px with a
-  // compensating negative margin (T221 — a box-shadow ring was a second paint whose contact with the
-  // border seamed on the user's renderer; flow position and content box stay identical). The
-  // selector also carries .dot-hl since 2026-07-23, so a hover from another pane looks like a mouse
-  // hover instead of the old neutral white outline — matched loosely so it survives further sharing.
+  // focused = full-opacity border at the SAME 2px width, plus the lift shadow — paint only (T270, the user
+  // 2026-09-08: the T221 border-grow-plus-negative-margin kept the CSS boxes still but moved the rendered
+  // text a device pixel on their display; a ring was T221's seam). The selector also carries .dot-hl since
+  // 2026-07-23, so a hover from another pane looks like a mouse hover instead of the old neutral white
+  // outline — matched loosely so it survives further sharing.
   assert.match(CSS, /\.fitem\.ask\.focused[^{]*\{[\s\S]*?border-color: rgb\(var\(--card-r, 255\), var\(--card-g, 255\), var\(--card-b, 255\)\);/);
-  assert.match(CSS, /\.fitem\.ask\.focused[^{]*\{[\s\S]*?border-width: 3px; margin: -1px;/);
+  assert.doesNotMatch(CSS, /\.fitem\.ask\.focused[^{]*\{[^}]*(border-width|margin|padding)/, "no layout property changes with the hover");
   assert.match(CSS, /\.fitem\.ask\.focused[^{]*\{[\s\S]*?box-shadow: 0 2px 7px/,
     "the lift shadow stays; the ring layer is gone");
   // no white ring anywhere in the highlight

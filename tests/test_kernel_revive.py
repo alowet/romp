@@ -88,10 +88,14 @@ class ReviveSession(unittest.TestCase):
         km._sdk = lambda: FakeSdk(connect_ok=False)
         km._revive_session(SID, CLIENT)
         self.assertEqual(self.focused, [], "a failed revive must not focus a still-dead session")
-        self.assertEqual(len(self.sent), 1)
-        app, msg, wid = self.sent[0]
-        self.assertEqual((app, msg["type"], msg["id"], wid), ("chat", "reviveFailed", SID, "win-A"),
-                         "the failure notice goes to the window whose revive loader is up")
+        # BOTH panes of the asking dashboard hear it (review find, 2026-09-08): the chat clears its revive
+        # loader, and the feed re-arms the parked card's Revive button it latched on the click. A refusal that
+        # reached the chat alone left that button "Reviving…" until the card happened to be re-sent, which
+        # for a parked handoff older than the colour ramp's ceiling is never.
+        self.assertEqual([(app, msg["type"], msg["id"], wid) for app, msg, wid in self.sent],
+                         [("chat", "reviveFailed", SID, "win-A"), ("feed", "reviveFailed", SID, "win-A")],
+                         "the failure notice goes to the window whose revive loader and latched button are up")
+        self.assertEqual(self.sent[0][1], self.sent[1][1], "one notice, the same words, to both panes")
 
     def test_tmux_session_revives_via_romp_resume_detach(self):
         km._sdk = lambda: None
@@ -111,6 +115,7 @@ class ReviveSession(unittest.TestCase):
         self._stub_run(returncode=3, stderr="no transcript for that uuid")
         km._revive_session(SID, CLIENT)
         self.assertEqual(self.focused, [])
+        self.assertEqual([app for app, _, _ in self.sent], ["chat", "feed"], "the asker's chat and feed both hear it")
         _, msg, _ = self.sent[0]
         self.assertEqual(msg["type"], "reviveFailed")
         self.assertIn("no transcript", msg["text"], "the launcher's stderr reaches the user, not DEVNULL")

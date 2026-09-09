@@ -154,5 +154,58 @@ class Chrome(unittest.TestCase):
         self.assertEqual(len(prefixes), 2, "the directional message indicator is set on both ends")
 
 
+class PostalNoticeRoute(unittest.TestCase):
+    """POST /postal-notice: the bus's one door to the dashboard (review find, 2026-09-08). A mail file
+    it had to move aside, a return note it could not deliver, temps a crash left: each lands as one
+    row on the ring the bell mirrors, under the `refused` kind, with the bus's own text. Token-gated
+    like every POST; a body with no text files nothing."""
+
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        from http.server import ThreadingHTTPServer
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), km.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def _post(self, body, token=True):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        hdrs = {"Content-Type": "application/json"}
+        if token:
+            hdrs["X-Romp-Token"] = km.TOKEN
+        c.request("POST", "/postal-notice", json.dumps(body), hdrs)
+        r = c.getresponse()
+        raw = r.read().decode()
+        c.close()
+        try:
+            return r.status, json.loads(raw or "{}")
+        except ValueError:
+            return r.status, raw
+
+    def test_a_notice_files_one_refused_row_and_an_empty_one_files_nothing(self):
+        before = km._sync_notice_count()
+        status, out = self._post({"text": "mail for web: 1.2_ab.TESTHOST could not be read (errno 13); moved aside"})
+        self.assertEqual((status, out.get("ok")), (200, True))
+        self.assertEqual(km._sync_notice_count(), before + 1, "exactly one row")
+        row = km._sync_notice_rows()[-1]
+        self.assertEqual((row["kind"], row["ok"]), ("refused", False), "the kind a fault wears, never a machine sync")
+        self.assertIn("moved aside", row["text"], "the bus's own text, unchanged")
+        status, out = self._post({"text": "   "})
+        self.assertEqual((status, out.get("ok")), (400, False))
+        self.assertIn("text required", out.get("error", ""))
+        status, out = self._post("not an object")
+        self.assertEqual(status, 400)
+        self.assertEqual(km._sync_notice_count(), before + 1, "a refused body files nothing")
+        status, _ = self._post({"text": "anonymous"}, token=False)
+        self.assertEqual(status, 403, "token-gated like every POST")
+        self.assertEqual(km._sync_notice_count(), before + 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -92,6 +92,10 @@ class RefusesForeignDriveOps(unittest.TestCase):
         self.assertEqual(msg["copy"], "did you get this?")
         # …and the sid rides along, so the shell's error-center entry says WHICH session it was meant for
         self.assertEqual(msg["sid"], THEIRS)
+        # …and the REQUEST it answers (review find, 2026-09-08): the feed latches a button on the click (Retry →
+        # "Retrying…", Continue → "Sent") and re-arms it on the kernel's reply for THAT post, never every latch
+        # the session holds, and never on a clock, so the reply names the op and the card it was for
+        self.assertEqual((msg["op"], msg["itemId"]), ("sendMessage", ""))
 
     def test_a_card_reply_is_refused_the_same_way(self):
         # the exact shape that lost real messages: askFollowUp derives its sid from the itemId
@@ -100,6 +104,8 @@ class RefusesForeignDriveOps(unittest.TestCase):
         self.assertEqual(self.sent[0]["type"], "err")
         self.assertEqual(self.sent[0]["copy"], "and the fix?")
         self.assertIn("reply", self.sent[0]["title"])
+        self.assertEqual((self.sent[0]["op"], self.sent[0]["itemId"]), ("askFollowUp", THEIRS + ":g4"),
+                         "the card's own latch is the one this refusal releases")
 
     def test_our_own_session_is_untouched(self):
         km._drive({"type": "sendMessage", "id": OURS, "text": "hello"}, self.client)

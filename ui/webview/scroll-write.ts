@@ -13,6 +13,18 @@
 
 export const SCROLL_DIAG_CAP_PER_MINUTE = 40;
 
+/** The cap a page actually runs with: the default, or the positive integer in localStorage under
+ *  "romp:scrollDiagCap" (T262j, the user 2026-09-08: a capture on their laptop hit the 40/min gesture cap within
+ *  seconds of trackpad scrolling, and every unwritten move for the rest of the minute went unrecorded; a laptop
+ *  capturing sets the key, everyone else keeps the default). Anything that is not a positive integer → the default. */
+export const SCROLL_DIAG_CAP_KEY = "romp:scrollDiagCap";
+export function readScrollDiagCap(getItem: (key: string) => string | null): number {
+  let raw: string | null = null;
+  try { raw = getItem(SCROLL_DIAG_CAP_KEY); } catch { raw = null; }
+  const n = raw == null ? NaN : Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : SCROLL_DIAG_CAP_PER_MINUTE;
+}
+
 /** One kind of row's budget for one session within the current minute: "send" while under the cap, "cap"
  *  exactly once at the cap (the caller files a capped row), "drop" past it until the minute rolls. */
 export class ScrollDiagBudget {
@@ -35,7 +47,60 @@ export function classifyScroll(scrollTop: number, lastWriteAfter: number | null)
   return lastWriteAfter != null && Math.abs(scrollTop - lastWriteAfter) <= 1 ? "write-echo" : "gesture";
 }
 
-/** The breadcrumb for one write that moved the view. */
-export function scrollWriteRow(sid: string, writer: string, before: number, after: number, stick: boolean) {
-  return { sid, writer, before, after, delta: after - before, stick, gesture: false as const };
+/** One childList mutation of a tail container, reduced to what the row needs: the classes of the nodes removed at
+ *  the END, the classes of the nodes added at the end, and whether a removed node came back in the same task. */
+export interface TailMutation { removed: Array<{ cls: string }>; added: Array<{ cls: string }>; atEnd: boolean; }
+export function summarizeTailMutations(records: TailMutation[]): { removedTail: string[]; addedTail: string[]; reAdded: boolean } | null {
+  const removedTail: Array<{ cls: string }> = [], addedTail: Array<{ cls: string }> = [];
+  for (const r of records) {
+    if (!r.atEnd) continue;
+    removedTail.push(...r.removed); addedTail.push(...r.added);
+  }
+  if (!removedTail.length) return null;
+  const reAdded = removedTail.some((n) => addedTail.indexOf(n) >= 0);
+  return { removedTail: removedTail.map((n) => String(n.cls || "").slice(0, 40)), addedTail: addedTail.map((n) => String(n.cls || "").slice(0, 40)), reAdded };
+}
+
+/** The breadcrumb for a tail element leaving the DOM (T262j, the user 2026-09-08): the remaining snap is a clamp
+ *  against a transcript momentarily shorter WITHIN a frame — a tail node removed, a layout forced, the node back
+ *  before the frame ends — which no ResizeObserver can see. `shBefore` = the last scroll height the pane recorded,
+ *  `shAfter` = the height once the mutations settled; `reAdded` = the same node came back in the same task. */
+export function tailMutRow(sid: string, m: { removedTail: string[]; addedTail: string[]; reAdded: boolean }, shBefore: number, shAfter: number, st: number, ch: number, where: "view" | "live-ask") {
+  const clip = (a: string[]) => a.slice(0, 4).map((c) => String(c).slice(0, 40));
+  return { sid, where, removed: clip(m.removedTail), added: clip(m.addedTail), reAdded: m.reAdded, shBefore, shAfter, st, ch };
+}
+
+/** The breadcrumb for one re-size of a view's virtualization spacers (T262j): a top spacer re-estimate paired with
+ *  a bottom one leaves scrollHeight unchanged yet moves everything under the top spacer, and Chrome's scroll
+ *  anchoring then moves the reader by the same amount with no pane write. `top`/`bot` = [before, after] heights. */
+export function spacerRow(sid: string, topBefore: number, topAfter: number, botBefore: number, botAfter: number, sh = 0, ch = 0) {
+  return { sid, top: [topBefore, topAfter], bot: [botBefore, botAfter], dTop: topAfter - topBefore, dBot: botAfter - botBefore, sh, ch };
+}
+
+/** The breadcrumb for one height change of the transcript's TAIL outside the append path (T262f, the user
+ *  2026-09-08): the active view's element or the live-ask host grew or shrank, by `dh` px, with `last` naming the
+ *  tail element (its class list, or "live-ask"). Chrome moves a bottom reader down itself when the tail grows and
+ *  clamps them back when it shrinks — both unwritten, so the scroll rows alone cannot say WHICH element flapped;
+ *  this row, filed beside them, names it. `stick` = the view's recorded follow mode at the change. */
+export function tailChangeRow(sid: string, dh: number, last: string, stick: boolean, sh = 0, ch = 0) {
+  return { sid, dh, last: String(last || "").slice(0, 60), stick, sh, ch };
+}
+
+/** The class list of the tail element of a view: its last child that is not a virtualization spacer. */
+export function tailLabel(children: ArrayLike<{ className?: string }>): string {
+  for (let i = children.length - 1; i >= 0; i--) {
+    const c = String(children[i]?.className || "");
+    if (c.indexOf("tx-spacer") < 0) return c;
+  }
+  return "";
+}
+
+/** The breadcrumb for one write that moved the view. `sh`/`ch` = #content's scrollHeight/clientHeight after the
+ *  write (T262e, the user 2026-09-08: their laptop's rows showed the view moving UP by the same 95 px on two
+ *  sessions with no write between the rows — an UNWRITTEN move, which the rows could not classify: a browser
+ *  CLAMP after the transcript's tail shrank (scrollHeight drops, the new top equals scrollHeight − clientHeight)
+ *  reads exactly like the browser's scroll anchoring absorbing a layout change above the viewport (scrollHeight
+ *  unchanged). With both numbers on every row the next log tells them apart in one pass.) */
+export function scrollWriteRow(sid: string, writer: string, before: number, after: number, stick: boolean, sh = 0, ch = 0) {
+  return { sid, writer, before, after, delta: after - before, stick, gesture: false as const, sh, ch };
 }

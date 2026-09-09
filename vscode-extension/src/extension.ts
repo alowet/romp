@@ -114,7 +114,10 @@ function maybeBuildNotice(dv: unknown): void {
 // AUTH-EXEMPT route: anything answering on the kernel port could then choose the directory we ran a
 // shell command from, and drive the prompt that invites the click besides. When this copy isn't a
 // checkout it can't rebuild anything, so we say so and point at the terminal rather than running some
-// other install.sh. Reload stays a user click, never automatic (prefer-reload-banner-not-auto).
+// other install.sh. Reload stays a user click here, never automatic: the served dashboard reloads ITSELF on a
+// kernel restart or a newer bundle since 2026-09-08 (superseding the 2026-07-13 banner preference, T265), but a
+// VS Code webview reload cannot fix bundled-code drift — the bundle comes from the installed VSIX, so only a
+// reinstall plus the editor's own reload lands new code, and that is the user's click.
 let updating = false;
 async function updateExtension(): Promise<void> {
   if (updating) return;                                    // one run per host (double-click, or toast + palette)

@@ -9,6 +9,7 @@ Synthetic only: no real session data; the fake tmux is a stub path.
 import os
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 import tempfile
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -129,6 +130,34 @@ class TmuxOptional(unittest.TestCase):
         self.tb._fire(["set", "-t", "web", "@romp", "1"])
         self.assertTrue(seen, "with tmux present the backend must actually shell out again")
         self.assertEqual(seen[0][0], "tmux")
+
+    # ── the per-kernel tmux server (ROMP_TMUX_SOCKET) ─────────────────────────
+    def test_rename_reaches_the_per_kernel_tmux_server(self):
+        """ROMP_TMUX_SOCKET names the tmux server THIS kernel's sessions live on, and every primitive
+        prepends `-L <sock>` through _tmux_argv — except rename_by_name, which shelled a bare argv: with
+        a socket configured a live rename went to the DEFAULT server, where the session does not exist,
+        so tmux refused, the rename did not take, and nothing said why. The kill beside it is the
+        control: the two must name the same server."""
+        self._has_tmux()
+        spawn = _SpawnCounter()
+        km.subprocess.run = spawn
+        with mock.patch.dict(os.environ, {"ROMP_TMUX_SOCKET": "romp-test-sock"}):
+            self.assertTrue(self.tb.rename_by_name("web", "api"))
+            self.tb.kill_by_name("web")
+        self.assertEqual(spawn.calls,
+                         [["tmux", "-L", "romp-test-sock", "rename-session", "-t", "web", "api"],
+                          ["tmux", "-L", "romp-test-sock", "kill-session", "-t", "web"]],
+                         "the rename must reach the server the session lives on, like the kill does")
+
+    def test_rename_argv_is_bare_without_a_socket(self):
+        """Unset → the default server, exactly as before (the argv the older rename pins assert)."""
+        self._has_tmux()
+        spawn = _SpawnCounter()
+        km.subprocess.run = spawn
+        with mock.patch.dict(os.environ):
+            os.environ.pop("ROMP_TMUX_SOCKET", None)
+            self.assertTrue(self.tb.rename_by_name("web", "api"))
+        self.assertEqual(spawn.calls, [["tmux", "rename-session", "-t", "web", "api"]])
 
 
 if __name__ == "__main__":

@@ -54,7 +54,10 @@ test("the sessions pane speaks the same three-way language", () => {
 });
 
 test("the tab strip draws the gray ring for a missing state and nothing for idle", () => {
-  assert.match(RENDER, /else if \(!st\) tab\.appendChild\(el\("span", "tab-dot unknown"\)\);/);
+  // the unknown ring comes from the one dot rule (tabDotClass, T262g): a missing state → "tab-dot unknown"
+  const TS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "tab-state.ts"), "utf8");
+  assert.match(TS, /if \(!st\) return "tab-dot unknown";/);
+  assert.match(RENDER, /const dotCls = tabDotClass\(st\);/);
   // ready/idle reaches no branch at all — the ladder ends without appending
   assert.ok(!/tab-dot ready/.test(RENDER), "no ready pip on the strip");
 });

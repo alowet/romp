@@ -71,8 +71,8 @@ several. Right-click a tab and open **Tags** to add or remove them. Tags filter 
 surface (the tag button in the strip narrows the tabs to the tags you pick), and they group
 the tabs: as soon as any session carries a tag, the strip shows one section per tag, in your
 tag order, each with a header in the tag's color, and the untagged sessions after a divider
-at the end. A session with several tags sits under the first of them in your tag order; its
-other tags still filter. Each header shows a chevron, the tag's color, its name, and a
+at the end. A session with several tags appears under each of them; every copy is the same
+session (click either to open it, and closing either ends it). Each header shows a chevron, the tag's color, its name, and a
 member count. Click a header, or press Enter on it, to fold its section down to the header
 alone; the count then says how many tabs are folded away, and a small dot after it says when
 one of them is working or waiting on you (hover it for their names). To keep one tab visible
@@ -85,7 +85,7 @@ folds (its header says so, and a click there changes nothing), and the `archived
 starts folded. Drag a header to reorder the groups, which
 reorders the tags on every surface (the timeline's tag table shows the same order). To move
 a tab into another group, right-click it and pick **Move to <tag>** under **Tags**: one click
-adds that tag and drops the tab's current group tag, leaving its other tags alone. The row's
+adds that tag and drops the tag of the group you right-clicked it in, leaving its other tags alone. The row's
 **+** adds the tag without moving the tab. **Group tabs by tag**, at the foot of the tag
 button's menu, turns the sections off for this browser.
 
@@ -170,6 +170,8 @@ exchange is visible to you. Each session gets mail tools: send a message to a
 session by name, check the inbox, and see who is live. Each session also
 publishes a working note saying what it currently holds, so agents can see who
 to talk to instead of messaging each other to find out.
+
+Not the same tools: romp peers are discovered only through the postal service's `list_agents`. Claude Code also ships its own `ListAgents` and `SendMessage` tools, which list the account's Anthropic cloud sessions and this session's own subagents: a different system, and a cloud session in that list is easy to mistake for a romp peer (the user 2026-09-08, who found one there that read like a session of theirs). The recommended setting is `"permissions": { "deny": ["ListAgents"] }` in the Claude Code settings, so the only list of agents a session sees is romp's; `SendMessage` must stay allowed, because continuing a subagent uses it.
 
 The timeline draws an arc for each message. Hover one for its gist:
 

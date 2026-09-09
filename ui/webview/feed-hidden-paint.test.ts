@@ -131,7 +131,11 @@ test("render() is gated first, on the shared pure decision, and nothing else in 
   assert.match(SRC, /import \{ paintHeld, paintReleased \} from "\.\/paint-gate";/);
   assert.match(SRC, /function render\(\) \{\n  const list = document\.getElementById\("feed-list"\)!;\n  if \(!feedWatching\) \{ feedWatching = true; watchFeedVisibility\(list\); \}\n  if \(paintHeld\(document\.hidden, feedIntersecting, list\.childElementCount > 0\)\) \{ paintDirty = true; return; \}\n  pruneTip\(\);/,
     "the gate precedes every paint-side step (pruneTip, applyFollowMove, the footer, the columns)");
-  assert.equal(SRC.split("paintHeld(").length - 1, 1, "one gate, in render(): no other path is withheld");
+  // two gates, both PAINTS: render(), and the 15 s age pass (feed-age.ts liveRefresher) that rewrites the stamped
+  // labels on the cards render() did not repaint — it reads the same decision, so the feed has one meaning of
+  // "hidden"; no state path is withheld
+  assert.equal(SRC.split("paintHeld(").length - 1, 2, "two gates: render() and the age pass; no other path is withheld");
+  assert.match(SRC, /const live = liveRefresher\(\{ hidden: \(\) => paintHeld\(document\.hidden, feedIntersecting, true\), pass: livePass \}\);/);
   assert.match(SRC, /let feedIntersecting = true;/, "visible until the observer says otherwise: no observer → the tab alone gates");
 });
 
@@ -146,7 +150,7 @@ test("the flip is skipped exactly once after a release, and prevCols still recor
 test("BOTH release events run the same release: visibilitychange→visible and the observer's callback", () => {
   assert.match(SRC, /document\.addEventListener\("visibilitychange", \(\) => \{ if \(!document\.hidden\) releasePaint\(\); \}\);/);
   const watch = body("watchFeedVisibility");
-  assert.match(watch, /new IntersectionObserver\(\(entries\) => \{\n\s*feedIntersecting = entries\.some\(\(e\) => e\.isIntersecting\);\n\s*releasePaint\(\);\n\s*\}\)\.observe\(list\);/);
+  assert.match(watch, /new IntersectionObserver\(\(entries\) => \{\n\s*feedIntersecting = entries\.some\(\(e\) => e\.isIntersecting\);\n\s*releasePaint\(\);\n\s*live\.catchUp\(\);[^\n]*\n\s*\}\)\.observe\(list\);/);
   assert.match(watch, /if \(typeof IntersectionObserver === "undefined"\) return;/);
 });
 

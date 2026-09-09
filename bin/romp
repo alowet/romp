@@ -646,7 +646,6 @@ EOF
     _romp_cmd "romp update [host]"         romp-update  "Push this machine's committed romp to attached remotes and restart them"
     _romp_cmd "romp up"                    romp-manager "Run the kernel manager in the foreground (rare — the login service runs it)"
     _romp_cmd "romp version"               romp-version "Versions across the parts (tree, kernel, served vs built bundles)"
-    _romp_cmd "romp keyswap [<name>]"      romp-keyswap "Select a key command, 1Password reference or legacy key (service.env.<name>; --cycle-all reconnects running sessions)"
     _romp_cmd "romp spend-rebuild"         romp-spend-rebuild "Recount the spend ledger's token columns from the transcripts (dry run; --apply writes, dollars untouched)"
     _romp_cmd "romp uninstall"             romp-uninstall "Remove romp's installed footprint (--purge also deletes recorded state)"
     _romp_cmd "romp help"                  -            "Show this help"
@@ -724,36 +723,17 @@ if [[ "${1:-}" == "update" ]]; then
     exec romp-update "$@"
 fi
 
-# `romp keyswap [<name>] [--cycle <session,...> | --cycle-all]` selects ROMP_API_KEY_CMD, ROMP_API_KEY_REF
-# or a legacy ANTHROPIC_API_KEY from a sibling service.env.<name>, removing the competing assignment. Listing
-# and selection inspect sources without fetching secrets; --cycle asks the kernel to reconnect
-# sessions, resolving provider keys at launch. Delegates to romp-keyswap (python); never prints keys.
+# `romp keyswap` is retired (the user 2026-09-08): romp holds no API key. The command word keeps an
+# answer so an old habit learns the new procedure instead of failing with "unknown command".
 if [[ "${1:-}" == "keyswap" ]]; then
-    shift
-    exec romp-keyswap "$@"
+    cat >&2 <<'EOF'
+romp keyswap is retired: romp holds no API key. Sessions and judges authenticate through Claude Code's own
+apiKeyHelper (see docs/reference.md, "Rotating the key"). To rotate, change the vault item the helper reads;
+Claude Code re-runs the helper after its TTL and on a 401 or 403, so running sessions pick the new key up
+with no reconnect. Declare the billing with ROMP_EXPECTED_AUTH=key in service.env.
+EOF
+    exit 2
 fi
-
-# Is romp itself the one fetching the key? Yes when a key PROVIDER is configured — a key command
-# (ROMP_API_KEY_CMD, 2026-09-07) or a 1Password reference (ROMP_API_KEY_REF) — in this environment, or as
-# a line of the service env file (the same file and the same line-by-line read as bin/romp-node-launch
-# and bin/romp-service, never sourced). The kernel's keysource.provider_consumer answers the same
-# question from Python; a kernel-spawned `romp new` may lack the variable when the provider was swapped
-# in with no manager restart, so the file decides too. The name predates the command kind.
-_romp_op_consumer() {
-    [[ -n "${ROMP_API_KEY_REF:-}" ]] && return 0
-    [[ -n "${ROMP_API_KEY_CMD:-}" ]] && return 0
-    local _f="${ROMP_SERVICE_ENV_FILE:-${ROMP_SERVICE_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/romp/service.env}}"
-    [[ -f "$_f" ]] || return 1
-    local _line
-    while IFS= read -r _line || [[ -n "$_line" ]]; do
-        _line="${_line#"${_line%%[![:space:]]*}"}"
-        case "$_line" in
-            ROMP_API_KEY_REF=*) return 0 ;;
-            ROMP_API_KEY_CMD=*) return 0 ;;
-        esac
-    done < "$_f"
-    return 1
-}
 # `romp spend-rebuild [--apply] [--by-session]` — recount the TOKEN columns of spend.json from the
 # transcripts' own per-call usage (the user 2026-09-06: the ledger under-counted every turn but a
 # process's first, because the result's flat `usage` is per-turn on current Claude Code and was
@@ -1689,13 +1669,71 @@ if [[ "${1:-}" == "tag" || "${1:-}" == "group" ]]; then
         echo "romp tag: the kernel isn't running (no serve token). Start romp (the login service, or \`romp up\`) first." >&2
         exit 1
     fi
-    if [[ -z "$_gr_name" ]]; then
-        _resp="$(_romp_token_cfg | curl -sf -m 10 --config - "http://127.0.0.1:$_kport/views")" \
-            || { echo "romp tag: kernel not reachable on :$_kport (is romp running?)" >&2; exit 1; }
-        if $_gr_json; then
-            printf '%s\n' "$_resp"
-            exit 0
+    # One kernel round trip for this verb, the GET of its tag store and the POST of an edit alike:
+    # the body on stdout and 0 when the kernel answered 2xx. Never `curl -sf` here: -f folds EVERY
+    # non-2xx into the exit a dead kernel gets and throws the body away, so a kernel that ANSWERED —
+    # a 503 with {ok:false, retryable, error} while the store cannot be read (a polling peer needs
+    # the non-200 to keep its last reading), a 400 with the reason it refused an edit, a 403 for a
+    # token it does not hold — read as "not reachable", and the person was told to restart a kernel
+    # that was up and explaining itself. The status rides -w and is read here, the way `romp perf`
+    # reads its own: a connection failure (curl's own nonzero exit, no status) keeps the "not
+    # reachable" line; a non-2xx whose JSON body carries `error` prints the kernel's words (plus
+    # "retry" when the body says the fault is retryable and the text does not already say so); a
+    # refused token is named as such; anything else prints the status and whatever came with it,
+    # never a guess. Exit 1 on every refusal, as the 200 ok:false refusal below exits. With `json`,
+    # a JSON refusal body is printed as is on stdout — the same answer a script reads on a 2xx, now
+    # saying ok:false and why, so it needs no second parser — and only a non-JSON answer is said as
+    # prose on stderr. The body reaches the parser on stdin, never argv: one argument is capped at
+    # 128 KB, so a larger answer would have defeated the parse and been echoed whole; and the prose
+    # echo shows the first 2 KB with a count of what was cut, since a terminal is not the place for
+    # a whole error page.
+    _tag_curl() {   # _tag_curl [json] <curl args…>: the 2xx body on stdout, or the failure said and 1
+        local _json=0 _out _code _body _line _rc _shown _more
+        if [[ "${1:-}" == json ]]; then _json=1; shift; fi
+        _out="$(_romp_token_cfg | curl -s --config - -w '\n%{http_code}' "$@")" \
+            || { echo "romp tag: kernel not reachable on :$_kport (is romp running?)" >&2; return 1; }
+        _code="${_out##*$'\n'}"
+        _body="${_out%$'\n'*}"
+        case "$_code" in
+            2??) if [[ $_json -eq 1 ]]; then printf '%s\n' "$_body"; else printf '%s' "$_body"; fi; return 0 ;;
+        esac
+        # exits 0 with the line to say for a JSON object carrying `error`; 3 for JSON without one; 1 for a body that is not JSON
+        _line="$(printf '%s' "$_body" | python3 -c '
+import json, sys
+try:
+    v = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+e = v.get("error") if isinstance(v, dict) else None
+if not e:
+    sys.exit(3)
+e = str(e)
+if v.get("retryable") and "retry" not in e.lower():
+    e += " \u2014 retry"
+print(e)
+' 2>/dev/null)" && _rc=0 || _rc=$?
+        if [[ $_json -eq 1 && ( $_rc -eq 0 || $_rc -eq 3 ) ]]; then
+            printf '%s\n' "$_body"; return 1
+        elif [[ $_rc -eq 0 ]]; then
+            echo "romp tag: $_line" >&2; return 1
         fi
+        case "$_code" in
+            401|403) echo "romp tag: the kernel on :$_kport refused the serve token (HTTP $_code); is ROMP_KERNEL_PORT pointing at another kernel?" >&2 ;;
+            *)       if [[ -n "$_body" ]]; then
+                         _shown="$(printf '%s' "$_body" | head -c 2048)"
+                         _more=$(( $(printf '%s' "$_body" | wc -c) - 2048 ))
+                         [[ $_more -gt 0 ]] && _shown+=" ... ($_more more bytes)"
+                         echo "romp tag: the kernel on :$_kport answered HTTP $_code: $_shown" >&2
+                     else echo "romp tag: the kernel on :$_kport answered HTTP $_code with no explanation" >&2; fi ;;
+        esac
+        return 1
+    }
+    if [[ -z "$_gr_name" ]]; then
+        if $_gr_json; then
+            _tag_curl json -m 10 "http://127.0.0.1:$_kport/views" && exit 0
+            exit 1
+        fi
+        _resp="$(_tag_curl -m 10 "http://127.0.0.1:$_kport/views")" || exit 1
         _rows="$(_romp_token_cfg | curl -sf -m 10 --config - "http://127.0.0.1:$_kport/sessions" 2>/dev/null)" || _rows='[]'
         python3 -c '
 import json, sys
@@ -1727,8 +1765,7 @@ for g in groups:
     if [[ $_gr_add_seen -eq 0 && $_gr_rm_seen -eq 0 && $_gr_cset -eq 0 && $_gr_del -eq 0 && -z "$_gr_rename" ]]; then
         # a bare name is a READ of that one group, never a write — POSTing here would CREATE a
         # missing group, so a typo'd "view" would mint a phantom and burn one of the 32 slots
-        _resp="$(_romp_token_cfg | curl -sf -m 10 --config - "http://127.0.0.1:$_kport/views")" \
-            || { echo "romp tag: kernel not reachable on :$_kport (is romp running?)" >&2; exit 1; }
+        _resp="$(_tag_curl -m 10 "http://127.0.0.1:$_kport/views")" || exit 1
         _rows="$(_romp_token_cfg | curl -sf -m 10 --config - "http://127.0.0.1:$_kport/sessions" 2>/dev/null)" || _rows='[]'
         if ! python3 -c '
 import json, sys
@@ -1769,9 +1806,10 @@ if sys.argv[6]:
 print(json.dumps(body))
 ' "$_gr_name" "$_gr_cset" "$_gr_color" "$_gr_del" "$_gr_host" "$_gr_rename" "${#_gr_add[@]}" \
         "${_gr_add[@]+"${_gr_add[@]}"}" "${_gr_remove[@]+"${_gr_remove[@]}"}")"
-    _resp="$(_romp_token_cfg | curl -sf -m 15 --config - -X POST "http://127.0.0.1:$_kport/tag" \
-                  -H 'Content-Type: application/json' -d "$_payload")" \
-        || { echo "romp tag: kernel not reachable on :$_kport (is romp running?)" >&2; exit 1; }
+    # the same status-reading call as the reads: a 400 with the kernel's reason for refusing the
+    # edit, or a 403, is said in its words, never as a kernel that is down
+    _resp="$(_tag_curl -m 15 -X POST "http://127.0.0.1:$_kport/tag" \
+                  -H 'Content-Type: application/json' -d "$_payload")" || exit 1
     if [[ "$_resp" == *'"ok": true'* || "$_resp" == *'"ok":true'* ]]; then
         _rows="$(_romp_token_cfg | curl -sf -m 10 --config - "http://127.0.0.1:$_kport/sessions" 2>/dev/null)" || _rows='[]'
         python3 -c '
@@ -2326,9 +2364,9 @@ case "${1:-}" in
                            # NAME=VALUE, split on the FIRST '=' (values may carry '='); an empty
                            # VALUE is meaningful (explicitly setting empty), but a missing '=' or a
                            # NAME outside [A-Za-z_][A-Za-z0-9_]* is a usage error, never a silent
-                           # skip. Toggles only (FEATURE_FLAG=1, CLAUDE_CODE_*) — real secrets stay
-                           # behind ROMP_API_KEY_REF or the apiKeyHelper, since this payload is copied into
-                           # per-sid files and the session registry.
+                           # skip. Toggles only (FEATURE_FLAG=1, CLAUDE_CODE_*): real secrets stay
+                           # behind Claude Code's apiKeyHelper (romp holds no key, and a credential name is
+                           # refused here), since this payload is copied into per-sid files and the registry.
                            if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then
                                echo "usage: romp new [-t] [-d <dir>] [-m <text>] [--tag <label>] [--model <id>] [--effort <level>] [--env NAME=VALUE] [--no-env] [--in <tag>] [--no-inherit] <name>" >&2; exit 2
                            fi
@@ -2858,23 +2896,13 @@ if tmux has-session -t "=$name" 2>/dev/null; then
         tmux attach-session -t "$name"
     fi
 else
-    # op's credential never rides a session: when romp itself runs `op` (a reference is configured), the
-    # tmux SERVER's globals — what every new pane inherits — are scrubbed of it before the pane exists
-    # (review, 2026-09-05: the server the manager started carried service.env's token to `exec claude`).
-    # The manager's startup ANTHROPIC_API_KEY goes with it: once a provider (a key command or a reference)
-    # governs, a pane billing the key the manager started with bills a key nobody chose (a keyswap retired
-    # it); without the variable the pane falls to Claude Code's own auth. A box with no provider keeps
-    # both — static-key panes rely on the inheritance. "Configured" is the client's environment OR the env
-    # file's own line (2026-09-06): a kernel-spawned `romp new` on a box that swapped to a provider without
-    # a manager restart carries no ROMP_API_KEY_* variable, and the guard on the variable alone left the
-    # token in place.
-    # The name list mirrors kernel/keysource.py is_tmux_scrub_name.
-    if _romp_op_consumer; then
-        tmux show-environment -g 2>/dev/null \
-            | sed -n -E 's/^(OP_SERVICE_ACCOUNT_TOKEN|OP_CONNECT_HOST|OP_CONNECT_TOKEN|OP_ACCOUNT|OP_SESSION_[A-Za-z0-9_]*|ANTHROPIC_API_KEY)=.*/\1/p' \
-            | while IFS= read -r op_var; do
-                [[ -n "$op_var" ]] && tmux set-environment -gu "$op_var" 2>/dev/null || true
-            done
+    # A pane inherits the tmux SERVER's globals, and romp holds no API key (2026-09-08): a leftover
+    # ANTHROPIC_API_KEY there would bill this terminal session to a key nobody chose and could be printed
+    # from inside it, while the kernel alone refused to boot on the same variable. Refuse, loudly, and say
+    # where the variable comes from; never scrub it quietly.
+    if tmux show-environment -g 2>/dev/null | grep -q '^ANTHROPIC_API_KEY='; then
+        echo "[romp] refusing to start '$name': the tmux server's environment carries ANTHROPIC_API_KEY. romp holds no API key; remove it from service.env (and any exported variable), restart the manager (romp on restart) so the server starts clean, and configure apiKeyHelper in Claude Code's settings instead (docs/reference.md)." >&2
+        exit 1
     fi
     # Create new detached session in working directory
     tmux new-session -d -s "$name" -c "$work_dir"

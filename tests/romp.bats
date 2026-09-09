@@ -119,6 +119,8 @@ teardown() {
     # Tests that launch a background romp-manager record its pid in MGR_PID so we
     # always reap it (and its child kernels), even if an assertion aborted the test.
     [[ -n "${MGR_PID:-}" ]] && kill "$MGR_PID" 2>/dev/null
+    # the stub kernel the `romp tag` tests start (_stub_tag_kernel) serves until reaped here
+    [[ -n "${TAG_KERNEL_PID:-}" ]] && kill "$TAG_KERNEL_PID" 2>/dev/null
     # The kill before the rm (a server the real tmux started must not outlive the test), and last, so
     # its failure is teardown's status: bats swallows a failing command mid-teardown.
     tmux_private_kill && rm -rf "$TEST_DIR"
@@ -171,7 +173,12 @@ if [[ -n "${MOCK_CURL_NEW_400:-}" && "$url" == */new ]]; then
   echo '{"ok": false, "error": "env: ROMP_SID is reserved — romp sets the session identity env itself"}'
   exit 0
 fi
-echo '{"ok": true}'
+# `romp tag`'s GET asks for the status as a trailer (-w '\n%{http_code}'), the way `romp perf`
+# does: append it as real curl would, so the read sees a 200 and not a body it must report as an
+# answer with no status
+_w=""; _prev=""
+for a in "$@"; do [[ "$_prev" == "-w" ]] && _w="$a"; _prev="$a"; done
+if [[ -n "$_w" ]]; then printf '{"ok": true}%b' "${_w//\%\{http_code\}/200}"; else echo '{"ok": true}'; fi
 MOCK
     chmod +x "$MOCK_DIR/curl"
 }
@@ -382,6 +389,7 @@ MOCK
     run run_romp tag workers
     grep -q '/views' "$MOCK_LOG"
     [ "$(grep -c '/tag' "$MOCK_LOG")" -eq 0 ]
+  [ "$status" -eq 1 ] && [[ "$output" == *"no tag named"* ]]   # the mock's -w trailer parsed: a good 200 body reaches the read (review pin)
 }
 
 @test "tag: --host rides the payload (an edit on an attached kernel's store)" {
@@ -450,6 +458,192 @@ MOCK
     run run_romp group workers --add exp-web
     [ "$status" -eq 0 ]
     grep '/tag' "$MOCK_LOG" | grep -q '"name": *"workers"'
+}
+
+# Helper — a stub kernel for `romp tag`, with REAL curl in front of it: answers GET /views and POST
+# /tag with the given HTTP status and body (GET /sessions with an empty list, so members print as
+# ids) on a free loopback port announced through a file written after the bind (the
+# romp-headless.bats pattern), and serves until teardown reaps it — a listing is two GETs. A body
+# argument starting with `@` names a file to serve, for a body too large to ride argv. The curl mock
+# above is the wrong stand-in here: the subject is what the CLI makes of a status that `curl -sf`
+# used to swallow, and a mock that emulates -w would be testing its own emulation.
+_stub_tag_kernel() {   # $1 = HTTP status for GET /views and POST /tag, $2 = its body (or @file)
+    python3 - "$1" "$2" "$TEST_DIR/port" <<'PY' &
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+code, arg, portfile = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+body = open(arg[1:], "rb").read() if arg.startswith("@") else arg.encode()
+class H(BaseHTTPRequestHandler):
+    def _answer(self, out, st):
+        self.send_response(st); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out))); self.end_headers()
+        self.wfile.write(out)
+    def do_GET(self):
+        out, st = (body, code) if self.path.startswith("/views") else (b"[]", 200)
+        self._answer(out, st)
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))   # drain, so curl's write lands
+        out, st = (body, code) if self.path.startswith("/tag") else (b"not found", 404)
+        self._answer(out, st)
+    def log_message(self, *a): pass
+srv = HTTPServer(("127.0.0.1", 0), H)
+with open(portfile, "w") as f:
+    f.write(str(srv.server_address[1]))
+srv.serve_forever()
+PY
+    TAG_KERNEL_PID=$!
+    until [ -s "$TEST_DIR/port" ]; do sleep 0.05; done
+    export ROMP_KERNEL_PORT="$(cat "$TEST_DIR/port")"
+}
+
+@test "tag: a kernel that answered 503 with its reason is repeated in its words, never called unreachable" {
+    # the tag store unreadable under a cold cache: the kernel answers GET /views with a 503 carrying
+    # {ok:false, retryable, error} (a polling peer needs the non-200 to keep its last reading).
+    # `curl -sf` threw that body away and told the person to restart a kernel that was up and
+    # explaining itself — and a restart cannot mend a disk fault
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_tag_kernel 503 '{"ok": false, "retryable": true, "error": "the tag store could not be read (read failed: [Errno 5] Input/output error) — retry"}'
+    run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the tag store could not be read (read failed: [Errno 5] Input/output error) — retry"* ]]
+    [[ "$output" != *"retry — retry"* ]]      # a text that already says retry is not told twice
+    [[ "$output" != *"not reachable"* ]]
+    # the bare-name read is the same GET and says the same — not "no tag named"
+    run run_romp tag workers
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"the tag store could not be read"* ]]
+    [[ "$output" != *"not reachable"* ]]
+    [[ "$output" != *"no tag named"* ]]
+}
+
+@test "tag: a retryable refusal whose text does not say so gets 'retry' added" {
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_tag_kernel 503 '{"ok": false, "retryable": true, "error": "the tag store is being rebuilt"}'
+    run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the tag store is being rebuilt — retry"* ]]
+}
+
+@test "tag: a 2xx answer still lists — the status-reading GET changes nothing on the good path" {
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_tag_kernel 200 '{"active": "all", "tags": [{"id": "t1", "name": "workers", "color": "#54B204", "members": ["11111111-2222-3333-4444-555555555555"]}]}'
+    run run_romp tag
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"active view: All"* ]]
+    [[ "$output" == *"workers  #54B204  1 member: 11111111-2222-3333-4444-555555555555"* ]]
+    run run_romp tag workers
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"workers  #54B204  1 member"* ]]
+    run run_romp tag --json
+    [ "$status" -eq 0 ]
+    [ "$output" = '{"active": "all", "tags": [{"id": "t1", "name": "workers", "color": "#54B204", "members": ["11111111-2222-3333-4444-555555555555"]}]}' ]
+}
+
+@test "tag: nothing listening on the port is still 'kernel not reachable'" {
+    export ROMP_SERVE_TOKEN=testtok
+    local port; free_port port
+    ROMP_KERNEL_PORT="$port" run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: kernel not reachable on :$port (is romp running?)"* ]]
+    ROMP_KERNEL_PORT="$port" run run_romp tag --json
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"kernel not reachable"* ]]
+}
+
+@test "tag --json: a non-2xx JSON answer is printed as is — a script reads ok:false and the reason — and exits 1" {
+    # --json hands a script the kernel's answer; a refusal is still that answer, and it already says
+    # ok:false and why, so the script needs no second parser. Only a non-JSON answer is said as prose.
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_tag_kernel 503 '{"ok": false, "retryable": true, "error": "the tag store could not be read (read failed: [Errno 5] Input/output error) — retry"}'
+    run run_romp tag --json
+    [ "$status" -eq 1 ]
+    [ "$output" = '{"ok": false, "retryable": true, "error": "the tag store could not be read (read failed: [Errno 5] Input/output error) — retry"}' ]
+}
+
+@test "tag: a 403 is a refused token, named as such (the kernel's plain-text answer is not JSON)" {
+    # what the kernel answers a GET /views carrying another kernel's token TODAY; -f read it as dead
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_tag_kernel 403 'forbidden: token required'
+    run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the kernel on :$ROMP_KERNEL_PORT refused the serve token (HTTP 403)"* ]]
+    [[ "$output" != *"not reachable"* ]]
+    # --json has no JSON to print: the same prose line
+    run run_romp tag --json
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"refused the serve token (HTTP 403)"* ]]
+}
+
+@test "tag: a non-2xx with no JSON reason prints the status with what came with it, or says nothing came" {
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_tag_kernel 500 '<h1>Internal Server Error</h1>'
+    run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the kernel on :$ROMP_KERNEL_PORT answered HTTP 500: <h1>Internal Server Error</h1>"* ]]
+    [[ "$output" != *"not reachable"* ]]
+    kill "$TAG_KERNEL_PID"; wait "$TAG_KERNEL_PID" 2>/dev/null || true; rm -f "$TEST_DIR/port"
+    _stub_tag_kernel 502 ''
+    run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the kernel on :$ROMP_KERNEL_PORT answered HTTP 502 with no explanation"* ]]
+}
+
+@test "tag write: a POST /tag the kernel answered 400 with its reason is repeated in its words, never called unreachable" {
+    # the kernel refuses a bad name or payload with a 400 and a JSON reason; on the write leg `curl -sf`
+    # still folded that into "not reachable" after the read leg had learned better (review fix)
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_tag_kernel 400 '{"ok": false, "error": "a tag name is 1 to 40 characters"}'
+    run run_romp tag workers --add exp-web
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: a tag name is 1 to 40 characters"* ]]
+    [[ "$output" != *"not reachable"* ]]
+    [[ "$output" != *testtok* ]]           # the serve token rides a header and is in no printed line
+    # every edit posts through the same call: --delete says the same
+    run run_romp tag workers --delete
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: a tag name is 1 to 40 characters"* ]]
+    [[ "$output" != *"not reachable"* ]]
+    [[ "$output" != *testtok* ]]
+}
+
+@test "tag write: a 403 on POST /tag is a refused token, named as such" {
+    export ROMP_SERVE_TOKEN=testtok
+    _stub_tag_kernel 403 'forbidden: token required'
+    run run_romp tag workers --add exp-web
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the kernel on :$ROMP_KERNEL_PORT refused the serve token (HTTP 403)"* ]]
+    [[ "$output" != *"not reachable"* ]]
+    [[ "$output" != *testtok* ]]
+}
+
+@test "tag write: nothing listening on the port is still 'kernel not reachable'" {
+    export ROMP_SERVE_TOKEN=testtok
+    local port; free_port port
+    ROMP_KERNEL_PORT="$port" run run_romp tag workers --add exp-web
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: kernel not reachable on :$port (is romp running?)"* ]]
+    [[ "$output" != *testtok* ]]
+}
+
+@test "tag: an oversized answer is echoed bounded when it is not JSON, and still read when it is" {
+    # a body over 128 KB cannot ride argv (E2BIG), so the JSON parse reads it from stdin; and the prose
+    # echo of a body that is not JSON shows the status plus its first 2 KB, then how much more there was
+    export ROMP_SERVE_TOKEN=testtok
+    python3 -c 'import sys; sys.stdout.write("<h1>Internal Server Error</h1>" + "x" * 200000)' > "$TEST_DIR/big"
+    _stub_tag_kernel 500 "@$TEST_DIR/big"
+    run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the kernel on :$ROMP_KERNEL_PORT answered HTTP 500: <h1>Internal Server Error</h1>xxx"* ]]
+    [[ "$output" == *" ... (197982 more bytes)"* ]]
+    [ "${#output}" -lt 2300 ]
+    [[ "$output" != *"not reachable"* ]]
+    kill "$TAG_KERNEL_PID"; wait "$TAG_KERNEL_PID" 2>/dev/null || true; rm -f "$TEST_DIR/port"
+    python3 -c 'import json, sys; sys.stdout.write(json.dumps({"ok": False, "error": "the tag store could not be read", "detail": "y" * 200000}))' > "$TEST_DIR/bigjson"
+    _stub_tag_kernel 503 "@$TEST_DIR/bigjson"
+    run run_romp tag
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"romp tag: the tag store could not be read"* ]]
+    [ "${#output}" -lt 200 ]
 }
 
 @test "color/tag: usage errors exit 2" {
@@ -783,79 +977,34 @@ MOCK
     grep -q 'tmux attach-session -t myproject' "$MOCK_LOG"
 }
 
-# The tmux SERVER's globals are what a new pane inherits; when romp itself runs `op` (a reference is
-# configured) the launcher unsets op's credential names AND the manager's startup ANTHROPIC_API_KEY
-# there before `new-session` — a pane on a reference-governed box never bills a stale key (2026-09-06).
+# The tmux SERVER's globals are what a new pane inherits. romp holds no API key (2026-09-08), so a leftover
+# ANTHROPIC_API_KEY there is refused before the pane exists: the kernel alone refusing to boot on the same
+# variable left this path open (a review find), and a quiet scrub would hide the misconfiguration.
 _stale_server_globals() {
     export MOCK_TMUX_GLOBALS_FILE="$TEST_DIR/mock_globals.txt"
     printf '%s\n' "OP_SERVICE_ACCOUNT_TOKEN=synthetic-op-token" "OP_SESSION_acct=synthetic-session" \
         "ANTHROPIC_API_KEY=synthetic-stale-key" "PATH=/usr/bin" "HOME=/nonexistent" > "$MOCK_TMUX_GLOBALS_FILE"
 }
 
-@test "new -t: a reference in the CLIENT env scrubs op's names and ANTHROPIC_API_KEY from the tmux server" {
+@test "new -t: a leftover ANTHROPIC_API_KEY in the tmux server's globals refuses the session, loudly, without scrubbing" {
     _stale_server_globals
-    ROMP_API_KEY_REF="op://test-vault/test-item/credential" run run_romp new -t myproject
-    [ "$status" -eq 0 ]
-    grep -q 'tmux set-environment -gu OP_SERVICE_ACCOUNT_TOKEN' "$MOCK_LOG"
-    grep -q 'tmux set-environment -gu OP_SESSION_acct' "$MOCK_LOG"
-    grep -q 'tmux set-environment -gu ANTHROPIC_API_KEY' "$MOCK_LOG"
-    ! grep -q 'tmux set-environment -gu PATH' "$MOCK_LOG"
-    ! grep -q 'tmux set-environment -gu HOME' "$MOCK_LOG"
-    # the scrub comes BEFORE the pane exists
-    [ "$(grep -n 'set-environment -gu ANTHROPIC_API_KEY' "$MOCK_LOG" | cut -d: -f1)" -lt \
-      "$(grep -n 'tmux new-session' "$MOCK_LOG" | cut -d: -f1)" ]
+    run run_romp new -t myproject
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"ANTHROPIC_API_KEY"* ]]
+    [[ "$output" == *"apiKeyHelper"* ]]
+    [[ "$output" != *"synthetic-stale-key"* ]]
+    ! grep -q 'new-session' "$MOCK_LOG"
+    ! grep -q 'set-environment' "$MOCK_LOG"
 }
 
-@test "new -t: a reference in the env FILE alone (a keyswap with no restart) scrubs the tmux server too" {
-    # Regression (2026-09-06): the guard read only the client's ROMP_API_KEY_REF, which a kernel-spawned
-    # `romp new` lacks when the reference was swapped into service.env after the manager started.
-    _stale_server_globals
-    unset ROMP_API_KEY_REF
-    # Name the file explicitly: CI runners export XDG_CONFIG_HOME, so "$HOME/.config" is not where the
-    # launcher would look (the keyswap tests pin the path the same way).
-    export ROMP_SERVICE_ENV_FILE="$TEST_DIR/service.env"
-    printf '%s\n' "# the service env" "ROMP_PERF=1" "  ROMP_API_KEY_REF=op://test-vault/test-item/credential" \
-        > "$ROMP_SERVICE_ENV_FILE"
+@test "new -t: clean server globals (op's names, a login token) start the session and touch nothing" {
+    export MOCK_TMUX_GLOBALS_FILE="$TEST_DIR/mock_globals.txt"
+    printf '%s\n' "OP_SERVICE_ACCOUNT_TOKEN=synthetic-op-token" "ANTHROPIC_AUTH_TOKEN=synthetic-bearer" \
+        "PATH=/usr/bin" > "$MOCK_TMUX_GLOBALS_FILE"
     run run_romp new -t myproject
     [ "$status" -eq 0 ]
-    grep -q 'tmux set-environment -gu OP_SERVICE_ACCOUNT_TOKEN' "$MOCK_LOG"
-    grep -q 'tmux set-environment -gu ANTHROPIC_API_KEY' "$MOCK_LOG"
-}
-
-@test "new -t: a key command line (ROMP_API_KEY_CMD) in the env FILE alone is a provider too and scrubs the tmux server" {
-    # 2026-09-07: the generic provider. With a key command governing, ANTHROPIC_API_KEY must still leave
-    # the server's globals (a keyswap retired it), and op's names go too if they are present.
-    _stale_server_globals
-    unset ROMP_API_KEY_REF ROMP_API_KEY_CMD
-    export ROMP_SERVICE_ENV_FILE="$TEST_DIR/service.env"     # CI runners export XDG_CONFIG_HOME: pin the path
-    printf '%s\n' "ROMP_PERF=1" "ROMP_API_KEY_CMD=fetch-synthetic-key --field api" > "$ROMP_SERVICE_ENV_FILE"
-    run run_romp new -t myproject
-    [ "$status" -eq 0 ]
-    grep -q 'tmux set-environment -gu ANTHROPIC_API_KEY' "$MOCK_LOG"
-    grep -q 'tmux set-environment -gu OP_SERVICE_ACCOUNT_TOKEN' "$MOCK_LOG"
-    [ "$(grep -n 'set-environment -gu ANTHROPIC_API_KEY' "$MOCK_LOG" | cut -d: -f1)" -lt \
-      "$(grep -n 'tmux new-session' "$MOCK_LOG" | cut -d: -f1)" ]
-}
-
-@test "new -t: a key command in the CLIENT env scrubs the tmux server too" {
-    _stale_server_globals
-    unset ROMP_API_KEY_REF
-    export ROMP_SERVICE_ENV_FILE="$TEST_DIR/service.env"
-    printf '%s\n' "ROMP_PERF=1" > "$ROMP_SERVICE_ENV_FILE"
-    ROMP_API_KEY_CMD="fetch-synthetic-key --field api" run run_romp new -t myproject
-    [ "$status" -eq 0 ]
-    grep -q 'tmux set-environment -gu ANTHROPIC_API_KEY' "$MOCK_LOG"
-}
-
-@test "new -t: no reference anywhere leaves the tmux server's environment alone (static-key and helper boxes)" {
-    _stale_server_globals
-    unset ROMP_API_KEY_REF
-    export ROMP_SERVICE_ENV_FILE="$TEST_DIR/service.env"
-    printf '%s\n' "ANTHROPIC_API_KEY=synthetic-static-key" > "$ROMP_SERVICE_ENV_FILE"
-    run run_romp new -t myproject
-    [ "$status" -eq 0 ]
-    ! grep -q 'set-environment -gu' "$MOCK_LOG"
-    ! grep -q 'show-environment' "$MOCK_LOG"
+    grep -q 'new-session' "$MOCK_LOG"
+    ! grep -q 'set-environment' "$MOCK_LOG"
 }
 
 @test "new -t on a 2.1.224+ claude: inbound-accept setting + @romp-inbound-accept tag" {
@@ -1954,63 +2103,26 @@ PY
     [[ "$output" == *"--env NAME=VALUE"* ]]
 }
 
-# ─── romp keyswap — switch the sessions' API key with no restart ──────
-# End-to-end through the dispatcher and the real cli/keyswap.py, against a temp
-# env file (ROMP_SERVICE_ENV_FILE): the mock-PATH shadowing other dispatch tests
-# use cannot shadow romp-keyswap, since bin/romp prepends its own bin dir. Fake
-# keys only, and the point of the assertions is that no key value is printed.
-
-_keyswap_files() {
+# ─── romp keyswap is retired (2026-09-08): romp holds no API key ──────
+@test "keyswap: retired; prints the rotation procedure and exits 2 without touching anything" {
     export ROMP_SERVICE_ENV_FILE="$TEST_DIR/service.env"
-    # romp keyswap now asks the running kernel which key it reads (a /keycycle read) on every run, and
-    # honours ROMP_KERNEL_PORT as the ONLY port it probes — pin a dead port so a developer box with a
-    # live kernel on the default port stays out of these cases (CI has no kernel either way)
-    export ROMP_KERNEL_PORT=1
-    printf 'ROMP_PERF=1\nANTHROPIC_API_KEY=sk-ant-TEST-0000\nROMP_EXPECTED_AUTH=key\n' \
-        > "$ROMP_SERVICE_ENV_FILE"
-    chmod 600 "$ROMP_SERVICE_ENV_FILE"
-    printf 'ANTHROPIC_API_KEY=sk-ant-TEST-1111\n' > "$ROMP_SERVICE_ENV_FILE.lowprio"
-    chmod 600 "$ROMP_SERVICE_ENV_FILE.lowprio"
-}
-
-@test "keyswap: bare reports the live key and its candidates, by fingerprint only" {
-    command -v python3 >/dev/null 2>&1 || skip "python3 not available"
-    touch "$MOCK_LOG"
-    _keyswap_files
-    run run_romp keyswap
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"sha256:"* ]]
-    [[ "$output" == *"lowprio"* ]]
-    [[ "$output" != *"sk-ant-TEST"* ]]          # never a key value on a surface
-    grep -q 'ANTHROPIC_API_KEY=sk-ant-TEST-0000' "$ROMP_SERVICE_ENV_FILE"   # read-only
-}
-
-@test "keyswap: a named source rewrites only the key line and keeps mode 600" {
-    command -v python3 >/dev/null 2>&1 || skip "python3 not available"
-    touch "$MOCK_LOG"
-    _keyswap_files
-    run run_romp keyswap lowprio
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"no manager restart needed"* ]]
-    [[ "$output" != *"sk-ant-TEST"* ]]
-    grep -q 'ANTHROPIC_API_KEY=sk-ant-TEST-1111' "$ROMP_SERVICE_ENV_FILE"
-    grep -q 'ROMP_PERF=1' "$ROMP_SERVICE_ENV_FILE"                 # every other line survives
-    grep -q 'ROMP_EXPECTED_AUTH=key' "$ROMP_SERVICE_ENV_FILE"
-    [ "$(ls -l "$ROMP_SERVICE_ENV_FILE" | cut -c1-10)" = "-rw-------" ]
-}
-
-@test "keyswap: an unknown source is a loud refusal that touches nothing" {
-    command -v python3 >/dev/null 2>&1 || skip "python3 not available"
-    touch "$MOCK_LOG"
-    _keyswap_files
-    run run_romp keyswap nosuch
+    printf 'ROMP_EXPECTED_AUTH=key\n' > "$TEST_DIR/service.env"
+    run "$ROMP_SCRIPT" keyswap anything --cycle-all
     [ "$status" -eq 2 ]
-    [[ "$output" == *"no such key file"* ]]
-    grep -q 'ANTHROPIC_API_KEY=sk-ant-TEST-0000' "$ROMP_SERVICE_ENV_FILE"
+    [[ "$output" == *"romp keyswap is retired"* ]]
+    [[ "$output" == *"apiKeyHelper"* ]]
+    [[ "$output" == *"ROMP_EXPECTED_AUTH=key"* ]]
+    [ "$(cat "$TEST_DIR/service.env")" = "ROMP_EXPECTED_AUTH=key" ]
 }
 
-@test "keyswap: help names it (the presence-checked command list)" {
-    run run_romp -h
+@test "keyswap: the help table no longer lists it, and no romp entry point reads the retired provider names" {
+    run "$ROMP_SCRIPT" help
     [ "$status" -eq 0 ]
-    [[ "$output" == *"romp keyswap"* ]]
+    [[ "$output" != *"keyswap"* ]]
+    # the only mention left in bin/romp is the retirement note itself
+    local hits
+    hits="$(grep -c 'ROMP_API_KEY_CMD\|ROMP_API_KEY_REF\|_romp_op_consumer' "$ROMP_SCRIPT" || true)"
+    [ "$hits" -le 1 ]
+    ! grep -q 'serviceEnvHasRef\|PROVIDER_VARS' "$(dirname "$ROMP_SCRIPT")/romp-manager"
 }
+

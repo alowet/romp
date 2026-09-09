@@ -82,12 +82,15 @@ test("the hover popover never survives a drag (defect 2, the user's recording)",
 
 test("drop commits through the SAME reorderTo — neighbor + side, hidden-view ids keep their places", () => {
   const body = between('tabs.addEventListener("drop"', "});");
-  assert.match(body, /if \(prev\?\.dataset\?\.id\) reorderTo\(draggedId, prev\.dataset\.id, true\);/);
-  assert.match(body, /else if \(next\?\.dataset\?\.id\) reorderTo\(draggedId, next\.dataset\.id, false\);/);
+  assert.match(body, /if \(prev\?\.dataset\?\.id\) \{ reorderTo\(draggedId, prev\.dataset\.id, true\); tabDragCommitted = true; \}/);
+  assert.match(body, /else if \(next\?\.dataset\?\.id\) \{ reorderTo\(draggedId, next\.dataset\.id, false\); tabDragCommitted = true; \}/,
+    "committed only when a reorder ran (T264b): no neighbour → dragend's cancel path FLIPs the copy home");
   // the neighbours are TABS (tab groups, 2026-09-04): a section header or separator beside the
   // dropped tab is skipped, so a drop at a section's edge still names the nearest tab and its side
-  assert.match(body, /const prev = tabBefore\(dragged\.previousElementSibling\);/);
-  assert.match(body, /const next = tabAfter\(dragged\.nextElementSibling\);/);
+  assert.match(body, /const prevIn = tabBefore\(dragged\.previousElementSibling\), nextIn = tabAfter\(dragged\.nextElementSibling\);/,
+    "the neighbours inside the dragged copy's own group first (T264b)");
+  assert.match(body, /const prev = prevIn \?\? \(nextIn \? null : walk\(dragged\.previousElementSibling, back, false\)\);/,
+    "…falling back across groups only when the group holds no other tab");
   // …and a drop changes no membership: a tab landing in another section re-sections on the next
   // render — the tab menu's "Move to" rows are the membership path (v1)
   assert.doesNotMatch(body, /editUnion|moveUnion|editTag/, "no tag write on a tab drop");

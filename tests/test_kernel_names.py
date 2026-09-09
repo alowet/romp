@@ -23,6 +23,8 @@ The concurrency here is EVENT-keyed: the first creator parks on a threading.Even
 its durable registration while the second door tries the same name; nothing sleeps. Synthetic fixtures
 only — placeholder sids and the demo names (web / api).
 """
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -80,6 +82,25 @@ def _rm_threads():
             for f in d.glob("*.json"):
                 f.unlink()
     km._thread_reg_memo.clear()
+
+
+LINE = "web\t/work/web\t#112233\t#ffffff\n"    # the names/<sid> entry of a session named web
+
+
+@contextlib.contextmanager
+def _publish_fails(path, err=28, text="No space left on device"):
+    """A fault BENEATH the real writer: os.replace onto `path` (the atomic publish) raises; every other
+    replace proceeds. The writer runs for real — its temp, its cleanup — so what the file and its
+    directory look like afterwards is the writer's doing, not a mock's guarantee."""
+    real = os.replace
+    want = os.path.realpath(str(path))
+
+    def replace(src, dst, *a, **k):
+        if os.path.realpath(str(dst)) == want:
+            raise OSError(err, text)
+        return real(src, dst, *a, **k)
+    with mock.patch.object(os, "replace", replace):
+        yield
 
 
 class _ParkingSdk:
@@ -504,6 +525,39 @@ class RenameDoors(_Routes):
         self.assertEqual(self.renames, [(SID, "web2")], "the backend was asked, and declined")
         self.assertEqual(self.claims(), {}, "the declined rename's claim is released")
 
+    def _raising_backend(self):
+        # a names-file write that failed under the backend's rename (ENOSPC here): the backends
+        # compensate and RE-RAISE so the asker hears it — and the doors must turn that into words
+        def raising(sid, name):
+            self.renames.append((sid, name))
+            raise OSError(28, "No space left on device")
+        self.be.rename = raising
+
+    def test_a_backend_that_raises_is_said_to_the_ws_asker_and_releases_the_claim(self):
+        # on origin/main: OSError: [Errno 28] No space left on device — escaped km._drive; live, the
+        # receive loop's catch-all logged it and the client heard nothing
+        frames = []
+        client = {"send": lambda s: frames.append(json.loads(s))}
+        self._raising_backend()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(km._drive({"type": "renameSession", "id": SID, "name": "web2"}, client))
+        self.assertEqual([f["type"] for f in frames], ["warn"], frames)
+        self.assertIn("the rename did not take", frames[0]["text"])
+        self.assertIn("No space left on device", frames[0]["text"], "the asker hears WHY")
+        self.assertEqual(self.renames, [(SID, "web2")], "the backend was asked, and raised")
+        self.assertEqual(self.claims(), {}, "the failed rename's claim is released")
+
+    def test_a_backend_that_raises_is_said_to_the_route_asker(self):
+        # on origin/main: do_POST's catch-all answered a 500 whose body is a traceback, not JSON
+        self._raising_backend()
+        with contextlib.redirect_stderr(io.StringIO()):
+            st, r = self.post("/rename", {"target": "web", "name": "web2"})
+        self.assertEqual(st, 200, r)
+        self.assertFalse(r.get("ok"), r)
+        self.assertIn("the rename did not take", r.get("error") or "")
+        self.assertIn("No space left on device", r.get("error") or "", "the asker hears WHY")
+        self.assertEqual(self.claims(), {}, "the failed rename's claim is released")
+
 
 class ForkDoor(_Base):
     def setUp(self):
@@ -610,7 +664,10 @@ class ReviveDoor(_Base):
         self.live = {"web": SID2}
         km._revive_session(SID, self.client)
         self.assertEqual([c[:3] for c in self.sdk.calls], [], "the dead session came up beside a live namesake")
-        self.assertEqual([(a, m["type"], m["id"], w) for a, m, w in self.sent], [("chat", "reviveFailed", SID, "win-A")])
+        # the asker's chat AND feed hear it (the feed's parked card latched Revive on the click and re-arms
+        # on the refusal for its own sid; review find 2026-09-08), the shape every other revive refusal takes
+        self.assertEqual([(a, m["type"], m["id"], w) for a, m, w in self.sent],
+                         [("chat", "reviveFailed", SID, "win-A"), ("feed", "reviveFailed", SID, "win-A")])
         self.assertIn("already running", self.sent[0][1]["text"])
         self.assertEqual(self.reveals, [], "a refused revive focuses nothing")
 
@@ -619,6 +676,7 @@ class ReviveDoor(_Base):
         self.hold("web")
         km._revive_session(SID, self.client)
         self.assertEqual(self.sdk.calls, [])
+        self.assertEqual([a for a, _, _ in self.sent], ["chat", "feed"], "the asker's chat and feed both hear it")
         self.assertIn("being created", self.sent[0][1]["text"])
 
     def test_a_free_name_is_held_through_the_resume_and_released_after(self):
@@ -800,11 +858,181 @@ class LiveTmuxRenamePublishesTheName(_Base):
             returncode = 1
         with mock.patch.dict(os.environ, {"ROMP_TMUX_AVAILABLE": "1"}), \
                 mock.patch.object(km.subprocess, "run", lambda cmd, *a, **k: argv.append(cmd) or _Declined()):
+            os.environ.pop("ROMP_TMUX_SOCKET", None)   # this pins the bare, no-socket argv (a socket prepends -L)
             ok, refusal = km._rename_claimed(km._TMUX, SID, "web2")
         self.assertEqual(argv, [["tmux", "rename-session", "-t", "web", "web2"]], "tmux was asked, once")
         self.assertEqual((ok, refusal), (False, ""), "the backend declined — the doors say so")
         self.assertEqual(km._live_names(km._tmux_sessions()), {"web": SID}, "a name tmux refused is never published")
         self.assertEqual(self.claims(), {})
+
+    def test_a_live_rename_whose_names_file_cannot_follow_says_so_in_its_own_words(self):
+        # on origin/main: AttributeError: module 'romp_kernel_names' has no attribute '_RenameOutcome'
+        # (there, _set_name's unchecked publish escaped _rename_session as the bare OSError). The fault
+        # is injected BENEATH _atomic_write — the publish's os.replace — so the real writer runs and the
+        # file's state afterwards is its doing, not a raising mock's
+        err = io.StringIO()
+        with mock.patch.object(km._TMUX, "rename_by_name", lambda old, new, t=5: self.renamed.append((old, new)) or True), \
+                _publish_fails(km.NAMES / SID), contextlib.redirect_stderr(err):
+            with self.assertRaises(km._RenameOutcome) as cm:
+                km._rename_session(SID, "web2")
+        self.assertEqual(self.renamed, [("web", "web2")], "tmux renamed it")
+        self.assertIn("was renamed, but its name on file could not be updated ([Errno 28] No space left on device)",
+                      str(cm.exception), "the asker's words: neither 'renamed' nor 'did not take' is true")
+        self.assertIn("names/%s could not be rewritten ([Errno 28]" % SID, err.getvalue(), "the log says why")
+        self.assertEqual((km.NAMES / SID).read_text(), LINE, "the real writer left the file byte-identical")
+        self.assertEqual(sorted(p.name for p in km.NAMES.iterdir()), [SID], "and no temp behind")
+
+    def test_a_dead_tab_rename_with_no_names_entry_is_reported_not_claimed(self):
+        # on origin/main: AssertionError: 'web2' is not None — _set_name's silent return on an
+        # unreadable entry read as renamed, and the doors said "renamed" over nothing written
+        self.patch("_tmux_name_of", lambda sid: None)
+        self.patch("_codex", lambda: None)
+        (km.NAMES / SID).unlink()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(km._rename_session(SID, "web2"), "no entry to rewrite: the rename did not take")
+        self.assertFalse((km.NAMES / SID).exists(),
+                         "no entry is invented: one with an empty dir would break every transcript path")
+
+
+class RenameFaultsThroughTheDoors(_Routes):
+    """What the asker hears when the names file cannot follow a rename, through BOTH doors (the WS
+    renameSession arm and POST /rename) over the real tmux backend and a real names registry, with the
+    fault injected BENEATH the writer (the atomic publish fails), so the file's state afterwards is the
+    writer's doing. A dead tab's fault used to reach the asker as the pre-existing "is that session
+    known to this kernel?" — a false cause — while the same fault one backend over (SDK) said the errno;
+    a live rename tmux took but the file did not follow answered "renamed" while every surface kept
+    reading the old name, so the tab wore the new label and silently reverted (review, 2026-09-08)."""
+
+    def setUp(self):
+        super().setUp()
+        self.names = Path(tempfile.mkdtemp())
+        (self.names / SID).write_text(LINE)
+        self.patch("NAMES", self.names)
+        self.patch("_live_names", _REAL_LIVE_NAMES)      # the real registry reader over a private registry
+        self.patch("_kernel_knows", lambda sid: True)
+        self.patch("_codex", lambda: None)
+        self.patch_backend_for(lambda sid: km._TMUX)
+        self.frames, self.renamed, self.err = [], [], io.StringIO()
+        self.client = {"send": lambda s: self.frames.append(json.loads(s))}
+
+    def as_dead(self):   # (not `dead`/`live`: _Base.setUp owns self.live, the snapshot dict)
+        self.patch("_tmux_sessions", lambda: {})
+        self.patch("_tmux_name_of", lambda sid: None)
+
+    def as_live(self):
+        self.patch("_tmux_sessions", lambda: {SID: {}})
+        self.patch("_tmux_name_of", lambda sid: "web")
+        pr = mock.patch.object(km._TMUX, "rename_by_name",
+                               lambda old, new, t=5: self.renamed.append((old, new)) or True)
+        pr.start()
+        self.addCleanup(pr.stop)
+
+    def ws(self, name="web2"):
+        with contextlib.redirect_stderr(self.err):
+            self.assertTrue(km._drive({"type": "renameSession", "id": SID, "name": name}, self.client))
+        return self.frames[-1]
+
+    def route(self, target, name="web2"):
+        with contextlib.redirect_stderr(self.err):
+            return self.post("/rename", {"target": target, "name": name})
+
+    def test_a_dead_tab_fault_reaches_the_ws_asker_as_the_errno(self):
+        # on origin/main: OSError: [Errno 28] No space left on device — escaped km._drive
+        self.as_dead()
+        with _publish_fails(self.names / SID):
+            f = self.ws()
+        self.assertEqual(f["type"], "warn", f)
+        self.assertIn("the rename did not take — [Errno 28] No space left on device", f["text"])
+        self.assertNotIn("is that session known", f["text"], "a fault is not an unknown session")
+        self.assertEqual((self.names / SID).read_text(), LINE)
+        self.assertEqual(sorted(p.name for p in self.names.iterdir()), [SID], "no temp left behind")
+        self.assertEqual(self.claims(), {}, "the claim is released")
+
+    def test_a_dead_tab_fault_reaches_the_route_asker_as_the_errno(self):
+        # on origin/main: json.decoder.JSONDecodeError — the route answered a 500 traceback
+        self.as_dead()
+        with _publish_fails(self.names / SID):
+            st, r = self.route(SID)                 # dead: no live name resolves, so the sid is the target
+        self.assertEqual(st, 200, r)
+        self.assertFalse(r.get("ok"), r)
+        self.assertIn("the rename did not take — [Errno 28] No space left on device", r.get("error") or "")
+        self.assertEqual(self.claims(), {})
+
+    def test_a_dead_tab_with_no_entry_is_the_one_case_that_asks_if_the_session_is_known(self):
+        # on origin/main: 'renamed' != 'warn' — the silent return read as renamed
+        self.as_dead()
+        (self.names / SID).unlink()
+        f = self.ws()
+        self.assertEqual(f["type"], "warn", f)
+        self.assertIn("is that session known to this kernel", f["text"])
+        self.assertFalse((self.names / SID).exists(), "no entry is invented")
+
+    def test_a_live_rename_tmux_took_but_the_file_did_not_is_said_in_its_own_words(self):
+        # on origin/main: OSError: [Errno 28] No space left on device — escaped km._drive
+        self.as_live()
+        with _publish_fails(self.names / SID):
+            f = self.ws()
+        self.assertEqual(self.renamed, [("web", "web2")], "tmux renamed the session")
+        self.assertEqual(f["type"], "warn", f)
+        self.assertIn("was renamed, but its name on file could not be updated", f["text"])
+        self.assertIn("[Errno 28] No space left on device", f["text"], "with the cause")
+        self.assertNotIn("did not take", f["text"], "tmux did take it")
+        self.assertEqual((self.names / SID).read_text(), LINE, "what every surface reads is unchanged — as the asker was told")
+        self.assertIn("the after-rename hook rewrites it later", self.err.getvalue(),
+                      "the entry exists: the hook's later rewrite is a true promise")
+        self.assertEqual(self.claims(), {})
+
+    def test_a_live_rename_the_file_did_not_follow_answers_the_route_ok_false(self):
+        # on origin/main: json.decoder.JSONDecodeError — the route answered a 500 traceback
+        self.as_live()
+        with _publish_fails(self.names / SID):
+            st, r = self.route("web")
+        self.assertEqual(st, 200, r)
+        self.assertFalse(r.get("ok"), r)
+        self.assertIn("was renamed, but its name on file could not be updated", r.get("error") or "")
+        self.assertIn("[Errno 28] No space left on device", r.get("error") or "")
+
+    def test_a_dead_codex_tab_fault_reaches_the_asker_as_the_errno_too(self):
+        # on origin/main: the Codex branch's catch mapped the raise to None → "is that session known to
+        # this kernel?", a false cause — the same class this commit fixes for the tmux and SDK paths.
+        # A REAL CodexBackend over its own state dir: a dead Codex tab is not owned (owns() is alive-only),
+        # so the doors route it to the tmux backend, whose dead path renames the Codex registry's
+        # durable name first; the fault is beneath its real names writer (the atomic publish)
+        cb = SourceFileLoader("romp_codex_backend_names",
+                              os.path.join(os.path.dirname(HERE), "kernel", "codex_backend.py")).load_module()
+        st = Path(tempfile.mkdtemp())
+        cx = cb.CodexBackend(st, client_factory=lambda: None)
+        self.assertEqual(cx.spawn("web", "/work/web", sid=SID), SID)
+        self.names = st / "names"
+        (self.names / SID).write_text(LINE)      # the colours the palette picker adds later; the writer preserves them
+        self.patch("NAMES", self.names)
+        self.patch("_codex", lambda: cx)
+        self.as_dead()
+        with _publish_fails(self.names / SID):
+            f = self.ws()
+        self.assertEqual(f["type"], "warn", f)
+        self.assertIn("the rename did not take — [Errno 28] No space left on device", f["text"])
+        self.assertNotIn("is that session known", f["text"], "a fault is not an unknown session")
+        self.assertEqual((self.names / SID).read_text(), LINE, "the real writer left the file byte-identical")
+        self.assertEqual(sorted(p.name for p in self.names.iterdir()), [SID], "no temp left behind")
+        self.assertEqual(cx._session(SID).name, "web", "the Codex backend's in-memory name never moved")
+        rows = json.loads((st / "codex" / "registry.json").read_text())
+        self.assertEqual(rows[SID]["name"], "web", "the Codex registry write was re-run with the old name")
+        self.assertEqual(self.claims(), {}, "the claim is released")
+
+    def test_a_live_rename_with_no_entry_does_not_promise_the_hook(self):
+        # on origin/main: 'renamed' != 'warn' — _set_name's silent return read as renamed
+        self.as_live()
+        (self.names / SID).unlink()
+        f = self.ws()
+        self.assertEqual(f["type"], "warn", f)
+        self.assertIn("the terminal session was renamed, but there is no name on file for it here to update ([Errno 2]",
+                      f["text"], "the asker's words for an absent entry")
+        self.assertNotIn("until that write lands", f["text"],
+                         "no write will land, and there is no old name on file to keep — say neither")
+        log = self.err.getvalue()
+        self.assertIn("no entry for the after-rename hook to rewrite", log)
+        self.assertNotIn("rewrites it later", log, "bin/romp's hook returns early on an absent entry: no false promise")
 
 
 class LockDiscipline(_Base):

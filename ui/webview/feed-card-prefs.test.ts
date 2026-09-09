@@ -15,8 +15,10 @@ test("feed prefs from romp:settings: newestFirst/collapsed default OFF, grouped 
   // newestFirst + collapsed default OFF (=== true); grouped defaults ON (!== false — the user 2026-07-13:
   // by-session grouping is the feed's normal reading mode, the footer Group toggle opts OUT).
   // `subgoals` is no longer a feed-wide pref (per-card button now).
-  assert.match(FEED, /return \{ newestFirst: s\.newestFirst === true, collapsed: s\.collapsed === true, grouped: s\.grouped !== false,\s*\n\s*stacked: s\.stacked === true \};/);
-  assert.match(FEED, /catch \{ return \{ newestFirst: false, collapsed: false, grouped: true, stacked: false \}; \}/);
+  assert.match(FEED, /prefsMemo = \{ newestFirst: s\.newestFirst === true, collapsed: s\.collapsed === true, grouped: s\.grouped !== false,\s*\n\s*stacked: s\.stacked === true, colormap: String\(s\.colormap \|\| "aurora"\)\.toLowerCase\(\) \};/);
+  assert.match(FEED, /const PREFS_DEFAULT: FeedPrefs = \{ newestFirst: false, collapsed: false, grouped: true, stacked: false, colormap: "aurora" \};/);
+  // memoised on the raw settings string: the same string returns the same object, a changed one re-parses
+  assert.match(FEED, /if \(raw === prefsRaw\) return prefsMemo;/);
   assert.doesNotMatch(FEED, /s\.subgoals/, "no feed-wide subgoals pref — it's a per-card toggle now");
   assert.doesNotMatch(FEED, /explanations/);   // every trace of the old pref is gone from the feed
 });

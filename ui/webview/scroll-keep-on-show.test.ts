@@ -77,9 +77,9 @@ test("render.ts: the reshow decision counts a live durable seek for the tab as n
 });
 
 test("render.ts: the #content scroll listener keeps the active view's saved spot current (passive, no timer)", () => {
-  assert.match(RENDER, /import \{ followReader, keepPlaceAcrossShow, followTail, atBottomDist \} from "\.\/scroll-keep";/);   // + followTail (T262: follow only on new content)
+  assert.match(RENDER, /import \{ followReader, keepPlaceAcrossShow, followTail, atBottomDist, followBoxBelow, followTailShrink \} from "\.\/scroll-keep";/);   // + followTail (T262: follow only on new content)
   // …and stands down while a deferred build is pending: the reveal's clamp fires a scroll event before the land
-  assert.match(RENDER, /c\.addEventListener\("scroll", \(\) => \{\n\s*if \(c\.clientHeight <= 0\) return;\n\s*followReader\(activeId \? views\.get\(activeId\) : null, c\.scrollTop, atBottom\(c\), pendingBuildRaf != null\);\n(?:.*\n){0,4}?\s*\}, \{ passive: true \}\);/);
+  assert.match(RENDER, /c\.addEventListener\("scroll", \(\) => \{\n\s*if \(c\.clientHeight <= 0\) return;\n\s*followReader\(activeId \? views\.get\(activeId\) : null, c\.scrollTop, atBottom\(c\), pendingBuildRaf != null\);\n(?:.*\n){0,5}?\s*\}, \{ passive: true \}\);/);
   // landActive's landing rule itself is unchanged — its INPUT is what the fix repairs
   assert.match(RENDER, /if \(!v\.shown \|\| v\.stick\) writeScroll\(content, content\.scrollHeight, "land-bottom", true\);\n\s*else writeScroll\(content, v\.scrollTop, "land-saved"\);/);   // (T262: every #content write rides writeScroll)
 });
@@ -90,8 +90,8 @@ test("render.ts: showActive keeps the reader's place across a re-show of the vie
   const body = m![1];
   assert.match(body, /const reshow = keepPlaceAcrossShow\(v, v\.el\.style\.display !== "none", content\.clientHeight > 0, navigating\);/);
   assert.match(body, /const keepAnchor = reshow \? \(keep !== undefined \? keep : \(!atBottom\(content\) \? captureScrollAnchor\(content, v\) : null\)\) : null;[^\n]*/, "captured BEFORE the rebuild, like appendActive — or handed in by a caller that had to empty the DOM first");
-  const restores = body.match(/if \(keepAnchor(?: && cc)?\) restoreScrollAnchor\(/g) || [];
-  assert.equal(restores.length, 2, "restored after landActive on the light path AND inside the deferred heavy build");
+  const restores = body.match(/if \(keepAnchor(?: && cc)?\) keepPlaceAcrossWindow\(/g) || [];
+  assert.equal(restores.length, 2, "restored after landActive on the light path AND inside the deferred heavy build (through the window-aware keep, T262l)");
   // the big-view re-collapse to the tail is a SWITCH rule: a re-show of the view on screen must not snap it to the bottom
   assert.match(body, /if \(!reshow && !pendingAnchor && pendingAnchorT == null\n\s*&& v\.el\.querySelectorAll\("\.turn"\)\.length > WINDOW_CAP\)/);
 });

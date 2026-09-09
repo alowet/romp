@@ -34,9 +34,9 @@ test("session rank = the kernel's session-order list (tab/lane order); unknown s
 test("a name+dot header entry opens each session's run; only runs that exist get one", () => {
   // `folded` joined the header entry with collapsible threads (feed-thread-fold.test.ts, 2026-07-31):
   // it counts the cards a FOLDED header stands in for, and is 0 while the thread is open.
-  assert.match(FEED, /\{ kind: "sess"; t: number; sid: string; name: string; color: \{ bg: string; fg: string \} \| null; live: boolean; folded: number \}/);
+  assert.match(FEED, /\{ kind: "sess"; t: number; sid: string; col: Column; name: string; color: \{ bg: string; fg: string \} \| null; live: boolean; folded: number \}/, "the header entry names its column (T263c: the fold is per session per column)");
   assert.match(FEED, /if \(s !== cur\) \{/);
-  assert.match(FEED, /head = \{ kind: "sess", t: e\.t, sid: s, name: src\.name, color: src\.color \|\| null, live: !!src\.live, folded: 0 \};\s*\n\s*withHeads\.push\(head\);/);
+  assert.match(FEED, /head = \{ kind: "sess", t: e\.t, sid: s, col: k, name: src\.name, color: src\.color \|\| null, live: !!src\.live, folded: 0 \};\s*\n\s*withHeads\.push\(head\);/);
   // reconcile keys headers per (column, sid) — one session can head a run in EVERY column
   assert.match(FEED, /key = "s:" \+ listEl\.id \+ ":" \+ e\.sid;/);
   // the header carries the identity: colored name, host prefix treatment, the yellow working dot

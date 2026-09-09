@@ -67,10 +67,14 @@ def _reads_fault(target):
         Path.read_bytes, Path.read_text = real_rb, real_rt
 
 
+class _Server(ThreadingHTTPServer):
+    request_queue_size = 128   # socketserver's default backlog is 5; the concurrent-writer tests below open 32 at once
+
+
 class _Routes(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), km.Handler)
+        cls.srv = _Server(("127.0.0.1", 0), km.Handler)
         cls.port = cls.srv.server_address[1]
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
 
@@ -378,3 +382,156 @@ class PortRecord(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class _LockSpy:
+    """Stands in for one store's lock (_flags_lock / _order_lock) for the duration of a test and says,
+    without a timer, when a second writer is WAITING on it: the interleaving tests below release the
+    first writer on exactly that event (or on the second writer having landed, when there is no lock to
+    wait on). Delegates the lock itself."""
+
+    def __init__(self, lock, progressed):
+        self._lock, self._progressed = lock, progressed
+
+    def __enter__(self):
+        if self._lock.locked():
+            self._progressed.set()                   # a writer is queued behind the one holding the store
+        return self._lock.__enter__()
+
+    def __exit__(self, *a):
+        return self._lock.__exit__(*a)
+
+
+class ConcurrentWriters(_Routes):
+    """Two writers of one store, at once (review find, 2026-09-08, on #1078). The route and the socket
+    arm land through the same setters, and those setters are read-modify-writes of a whole JSON file:
+    unlocked, two writers that read the same store both publish, the later publish drops the earlier
+    one's change, and BOTH are acked ok:true -- the probe that found it kept 8 to 13 of 40 concurrent
+    route writes. The setters now hold a per-store lock across the read and the publish (_flags_lock,
+    _order_lock), so every writer's change survives and the acks stay truthful.
+
+    The interleaving tests force the lost-update ORDER rather than hoping for it: the first writer is
+    held after its proved read (the read patched to wait on an event), the second writer is started,
+    and the first is released only once the second has either LANDED (no lock: it read the same
+    snapshot and published) or is WAITING on the store's lock (_LockSpy) -- both events, no timers --
+    so without the lock the loss is certain, and with it the test never waits on a clock."""
+
+    def _interleave(self, lock_name, read_name, first, second):
+        """Run `first` up to and through its proved read, start `second`, wait for it to land or to
+        queue on the lock, release `first`, join both. Returns their results."""
+        read_done, go, progressed = threading.Event(), threading.Event(), threading.Event()
+        real_read = getattr(km, read_name)
+        real_lock = getattr(km, lock_name, None)      # absent on a kernel without the lock: nothing waits
+
+        def patched_read():
+            # the FIRST proved read is the first writer's (the second is not started until it has read);
+            # it runs on the server's handler thread for a route write, on the test's thread for a socket
+            # write, so the call order, not the thread, names it
+            r = real_read()
+            if not read_done.is_set():
+                read_done.set()
+                self.assertTrue(go.wait(20), "the first writer was never released")
+            return r
+
+        setattr(km, read_name, patched_read)
+        setattr(km, lock_name, _LockSpy(real_lock or threading.Lock(), progressed))
+        res = [None, None]
+        try:
+            t1 = threading.Thread(target=lambda: res.__setitem__(0, first()))
+            t1.start()
+            self.assertTrue(read_done.wait(20), "the first writer never read the store")
+
+            def run_second():
+                res[1] = second()
+                progressed.set()                     # landed (no lock) -- the other way to progress
+            t2 = threading.Thread(target=run_second)
+            t2.start()
+            self.assertTrue(progressed.wait(20), "the second writer neither landed nor queued on the lock")
+            go.set()
+            t1.join(20); t2.join(20)
+            self.assertFalse(t1.is_alive() or t2.is_alive(), "a writer hung")
+        finally:
+            setattr(km, read_name, real_read)
+            if real_lock is None:
+                delattr(km, lock_name)
+            else:
+                setattr(km, lock_name, real_lock)
+        return res
+
+    def _flags_file(self):
+        p = km.jd.STATE / "session-flags.json"
+        return json.loads(p.read_text()) if p.exists() else None
+
+    def _order_file(self):
+        return json.loads((km.jd.STATE / "session-order.json").read_text())
+
+    def test_n_concurrent_flag_posts_through_the_route_all_survive_and_every_ack_is_true(self):
+        n = 32
+        sids = ["%08x-1111-2222-3333-444444444444" % i for i in range(n)]
+        gate = threading.Barrier(n)
+        acks = [None] * n
+
+        def post(i):
+            gate.wait(20)                            # every request in flight together, then the handler threads race
+            try:
+                acks[i] = self._post("/flag", {"id": sids[i], "flag": "hideFromFeed", "value": True})
+            except Exception as e:                   # a transport failure is a finding too, said as such
+                acks[i] = ("EXC", repr(e))
+        ts = [threading.Thread(target=post, args=(i,)) for i in range(n)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(60)
+        self.assertFalse(any(t.is_alive() for t in ts))
+        flags = self._flags_file() or {}
+        self.assertEqual(sorted(flags), sorted(sids),
+                         "%d of %d writes survive -- an ack must mean the toggle is in the store; acks: %s"
+                         % (len(flags), n, sorted(set(str(a[0]) for a in acks))))
+        self.assertTrue(all(flags[s] == {"hideFromFeed": True} for s in sids))
+        self.assertEqual([a[0] for a in acks], [200] * n, acks)
+        self.assertTrue(all(a[1].get("ok") is True for a in acks), "every writer was acked ok")
+
+    def test_a_route_write_and_a_socket_write_interleaved_both_survive(self):
+        r = self._interleave(
+            "_flags_lock", "_session_flags_proved",
+            lambda: self._post("/flag", {"id": SID, "flag": "hideFromFeed", "value": True}),
+            lambda: self._ws({"type": "setSessionFlag", "id": SID2, "flag": "postalServiceOff", "value": True}))
+        self.assertEqual(r[0], (200, {"ok": True, "id": SID, "flag": "hideFromFeed", "value": True}))
+        self.assertEqual(r[1], [], "the socket arm sent no refusal")
+        self.assertEqual(self._flags_file(), {SID: {"hideFromFeed": True}, SID2: {"postalServiceOff": True}},
+                         "both acked toggles are in the store; neither writer's publish dropped the other's")
+
+    def test_two_flag_posts_interleaved_both_survive(self):
+        r = self._interleave(
+            "_flags_lock", "_session_flags_proved",
+            lambda: self._post("/flag", {"id": SID, "flag": "notify", "value": True}),
+            lambda: self._post("/flag", {"id": SID2, "flag": "hideFromFeed", "value": True}))
+        self.assertTrue(r[0][1]["ok"] and r[1][1]["ok"])
+        self.assertEqual(self._flags_file(), {SID: {"notify": True}, SID2: {"hideFromFeed": True}})
+
+    def test_an_order_post_and_a_socket_drag_interleaved_both_survive(self):
+        (km.jd.STATE / "session-order.json").write_text(json.dumps([A, B, C, D]))
+        r = self._interleave(
+            "_order_lock", "_session_order_proved",
+            lambda: self._post("/order", {"order": [B, A]}),           # the Obsidian panel swaps the first two lanes
+            lambda: self._ws({"type": "reorderTabs", "order": [D, C]}))   # a dashboard swaps the last two tabs
+        self.assertEqual(r[0][1]["ok"], True)
+        self.assertEqual(r[1], [], "the socket arm sent no refusal")
+        self.assertEqual(self._order_file(), [B, A, D, C], "both drags are in the store, each in the slots it touched")
+        self.assertEqual(r[0][1]["order"], [B, A, C, D],
+                         "the route's ack is the order it published: its own swap on the store it read, the queued drag landing after")
+
+    def test_the_locks_are_per_store_and_taken_by_every_writer_of_the_store(self):
+        src = inspect.getsource(km)
+        self.assertIsInstance(km._flags_lock, type(threading.Lock()))
+        self.assertIsInstance(km._order_lock, type(threading.Lock()))
+        for fn in (km._set_session_flag, km._set_notify_session):
+            self.assertIn("with _flags_lock:", inspect.getsource(fn), fn.__name__)
+        for fn in (km._reorder_session_order, km._gc_session_order, km._ordered):
+            self.assertIn("with _order_lock:", inspect.getsource(fn), fn.__name__)
+        route = inspect.getsource(km._state_write_route)
+        self.assertIn("_reorder_session_order(order)", route, "the route lands the drag through the locked step")
+        self.assertNotIn("_write_session_order(merged)", route)
+        arm = src[src.index('msg.get("type") in ("reorderTabs", "writeOrder")'):][:1500]
+        self.assertIn('_reorder_session_order(msg["order"])', arm, "so does the socket arm")
+        self.assertNotIn("_write_session_order(_merged)", arm)

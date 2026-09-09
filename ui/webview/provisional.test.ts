@@ -99,7 +99,10 @@ test("creating a session opens the provisional tab instead of a modal", () => {
     "the chip says what this phase IS — the session is opening");
   assert.doesNotMatch(RENDER, /state: "working", sinceEpoch: Math\.floor/, "the broken-clock seed is gone");
   // …and the tab strip shows the accent loader dot for the opening state, so the starting tab has a cue
-  assert.match(RENDER, /else if \(st === "opening"\) tab\.appendChild\(el\("span", "tab-dot opening"\)\);/);
+  // the opening dot comes from the one dot rule (tabDotClass, T262g)
+  const TS = fs.readFileSync(path.resolve(process.cwd(), "..", "ui", "webview", "tab-state.ts"), "utf8");
+  assert.match(TS, /if \(st === "opening"\) return "tab-dot opening";/);
+  assert.match(RENDER, /const dotCls = tabDotClass\(st\);/);
   assert.match(CSS, /\.tab-dot\.opening \{ background: var\(--accent\); animation: opening-line-pulse/);
   assert.match(RENDER, /order\.push\(id\);/, "the tab survives reconcileTabOrder as a not-yet-kernel-known extra");
 });

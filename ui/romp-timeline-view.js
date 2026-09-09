@@ -3480,7 +3480,11 @@ class TimelinePanel {
   // spent on one of those missed the restored store the router adopted next (viewsAnnouncedAfter).
   _takeViews(v) {
     if (!v) return false;
-    if (viewsAdopts(this._views, v, this._announcedViewsSeq)) { this._announcedViewsSeq = viewsAnnouncedAfter(this._views, v, this._announcedViewsSeq); this._views = v; this._rejectedViews = null; return true; }
+    if (viewsAdopts(this._views, v, this._announcedViewsSeq)) {
+      this._announcedViewsSeq = viewsAnnouncedAfter(this._views, v, this._announcedViewsSeq); this._views = v; this._rejectedViews = null;
+      if (this._reconcileLocalLens()) this._repaintTagSurfaces();   // the store now carries a filter held as unsaved: its note goes
+      return true;
+    }
     this._rejectedViews = v;
     if (!this._staleViewsLogged) {
       this._staleViewsLogged = true;
@@ -3528,7 +3532,7 @@ class TimelinePanel {
     this._caps = new Set((m && Array.isArray(m.caps)) ? m.caps.filter((c) => typeof c === 'string') : []);
     const served = m ? m.viewsSeq : undefined;
     const adopted = viewsCapsAdopts(this._rejectedViews, served);
-    if (adopted) this._views = this._rejectedViews;
+    if (adopted) { this._views = this._rejectedViews; this._reconcileLocalLens(); }   // an adoption is a store read too; repainted below
     this._announcedViewsSeq = adopted ? null : viewsAnnouncedSeq(served);
     this._rejectedViews = null;
     if (this._viewsWrites.length) {
@@ -3754,6 +3758,24 @@ class TimelinePanel {
     if (Object.keys(held.actives).length) fields.actives = held.actives;
     if (held.tagOrder) fields.tagOrder = held.tagOrder;
     return Object.keys(fields).length ? { fields, reason } : null;
+  }
+  // The store read is the other event that settles an unsaved filter (review find, 2026-09-08, on
+  // #1078): a held key whose value the adopted store now carries, because a dashboard saved that same
+  // filter, or this panel's own write landed after an answer that read as unreachable, is released on
+  // the poll or ack that shows it (_takeViews), so the not-saved note never outlives the fact. A key the
+  // store carries with a DIFFERENT value stays held: that is still the viewer's own unsaved choice.
+  // Returns whether anything was released, for the caller's repaint.
+  _reconcileLocalLens() {
+    if (!this._localLens) return false;
+    const store = this._views || {}, f = this._localLens.fields;
+    const held = { active: f.active, actives: Object.assign({}, f.actives || {}), tagOrder: f.tagOrder };
+    if (held.active !== undefined && lensSame(held.active, store.active)) delete held.active;
+    for (const k of Object.keys(held.actives)) if (lensSame(held.actives[k], (store.actives || {})[k])) delete held.actives[k];
+    if (held.tagOrder && lensSame(held.tagOrder, shownTagOrder(store))) delete held.tagOrder;
+    const next = this._heldLens(held, this._localLens.reason);
+    if (lensSame(next && next.fields, this._localLens.fields)) return false;
+    this._localLens = next;
+    return true;
   }
 
   // the viewsAck frame for a POST /views answer: the route's own document when a kernel ruled; a
@@ -4723,11 +4745,17 @@ class TimelinePanel {
   // it cannot check, since this panel cannot tell "no kernel anywhere" from "a kernel it cannot see"
   // (a stale record, another port, a token from another state dir), and the second case is exactly the
   // race this removes. Same-user trust boundary as every kernel client: the serve token comes from the
-  // kernel's 0600 file and rides the X-Romp-Token header (never a URL), the port from the kernel's own
-  // record (never a guess). A panel reading SYNCED state on another machine finds a record no kernel of
-  // its own answers on and lands in the same refusal. Node's http, not fetch: a fetch from Obsidian's
-  // app:// origin with a custom header needs a CORS preflight, and a failed preflight reads exactly like
-  // a kernel that is down.
+  // kernel's 0600 file and rides the X-Romp-Token header (never a URL). The port is the kernel's own
+  // record (serve-port), or, with NO record (a kernel older than this panel wrote the token and no port),
+  // the port the CLI resolves: ROMP_KERNEL_PORT, then ROMP_SERVE_PORT, else 29855. Record or fallback,
+  // the port must first PROVE itself a romp kernel before any token leaves this panel (_kernelProve: GET
+  // /healthz with no token, on 127.0.0.1 only, answered 200 "ok" with the X-Romp-Boot identity), and the
+  // POST then rides the connection that proved itself; a port that answers as anything else, a stale
+  // record another local service now listens on, is refused by name and never sees the token (review
+  // find, 2026-09-08, on #1078). A panel reading SYNCED state on another machine finds a record no
+  // kernel of its own answers on and lands in the same refusal. Node's http, not fetch: a fetch from
+  // Obsidian's app:// origin with a custom header needs a CORS preflight, and a failed preflight reads
+  // exactly like a kernel that is down.
   _kernelHost() {
     // Electron (Obsidian) only: a bare-node run (the test runner) and a browser page (which has its host
     // hooks) have no kernel to post to from here — the guard the file writers wore (the user 2026-07-02)
@@ -4754,11 +4782,13 @@ class TimelinePanel {
   // request: nothing answering (KERNEL_DOWN, or KERNEL_DOWN_NO_RECORD when the port was the CLI's
   // default rather than the kernel's record), a record or token file this panel could not read, a
   // kernel that predates the route (a 404), or some other local service that now owns the recorded
-  // port (`foreign`: a 2xx that is not a romp answer — read as accepted, that left the optimistic toggle
-  // re-applied on every push until a value that never comes, the silent divergence this change exists
-  // to remove). A body that stalls or a socket that drops after the headers settles too (res 'error' /
-  // 'aborted' / 'close' behind the done guard): unsettled, the optimistic state stood forever with no
-  // message, and the unhandled 'error' was an uncaught exception in the renderer.
+  // port (`foreign`: a port that fails the identity check before the POST, or a 2xx that is not a romp
+  // answer; read as accepted, that left the optimistic toggle re-applied on every push until a value
+  // that never comes, the silent divergence this change exists to remove). The token leaves this panel
+  // only AFTER the port has proved itself (_kernelProve), and rides the connection that did. A body that
+  // stalls or a socket that drops after the headers settles too (res 'error' / 'aborted' / 'close'
+  // behind the done guard): unsettled, the optimistic state stood forever with no message, and the
+  // unhandled 'error' was an uncaught exception in the renderer.
   _kernelPost(route, body) {
     const h = this._kernelHost();
     if (!h) return Promise.resolve({ ok: false, unreachable: true, error: KERNEL_DOWN });
@@ -4774,9 +4804,9 @@ class TimelinePanel {
     catch (e) {
       if (!e || e.code !== 'ENOENT') return unreadable('port record', at('serve-port'), e);
       // no record: a kernel older than this panel writes the token and no port. Resolve the port the way
-      // the CLI does — the environment in cli/keyswap.py _kernel_urls' order (ROMP_KERNEL_PORT, then
+      // the CLI does — the environment in the CLI's order (ROMP_KERNEL_PORT, then
       // ROMP_SERVE_PORT; an empty value is unset), else bin/romp's default, ${ROMP_KERNEL_PORT:-29855}
-      // (keyswap alone goes on to probe two older ports; this panel does not) — and try it; only a
+      // (this panel probes no older ports) — and try it; only a
       // refused connection then reads as down. An unusable override is refused, never silently replaced
       // by the default (_kernel_urls' rule: that replacement hands the token to whatever answers there).
       recorded = false;
@@ -4791,14 +4821,22 @@ class TimelinePanel {
         : envVar + '=' + JSON.stringify(envRaw) + ' is not a port' });
     const down = recorded ? KERNEL_DOWN : KERNEL_DOWN_NO_RECORD;
     const where = '127.0.0.1:' + port;
-    return new Promise((resolve) => {
+    // one keep-alive connection for the proof and the write, so the token rides the very connection that
+    // answered as a romp kernel (best effort: a server that closes after the proof gets a fresh connection
+    // to the same port, the proof still immediately before it); torn down when the write settles
+    let agent = null;
+    try { agent = new (require('http').Agent)({ keepAlive: true, maxSockets: 1 }); } catch (e) { agent = null; }
+    const teardown = () => { try { if (agent) agent.destroy(); } catch (e) {} };
+    return this._kernelProve(port, agent, down).then((proof) => {
+      if (!proof.ok) { teardown(); return proof; }              // no token was sent; the refusal names the port
+      return new Promise((resolve) => {
       let done = false;
-      const finish = (r) => { if (!done) { done = true; resolve(r); } };
+      const finish = (r) => { if (!done) { done = true; teardown(); resolve(r); } };
       const dropped = () => finish({ ok: false, unreachable: true, error: down });
       try {
         const data = JSON.stringify(body);
         const req = require('http').request({
-          host: '127.0.0.1', port, path: route, method: 'POST',
+          host: '127.0.0.1', port, path: route, method: 'POST', agent: agent || undefined,
           headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), 'X-Romp-Token': tok },
         }, (res) => {
           let text = '';
@@ -4826,6 +4864,42 @@ class TimelinePanel {
         req.on('error', dropped);
         req.setTimeout(10000, () => req.destroy());
         req.end(data);
+      } catch (e) { dropped(); }
+      });
+    });
+  }
+
+  // Before any token leaves this panel, the port must prove it is a romp kernel (review find, 2026-09-08,
+  // on #1078): GET /healthz, the kernel's auth-exempt liveness route, with NO token, on 127.0.0.1 only,
+  // answered 200 with the frozen body "ok" and the X-Romp-Boot kernel identity (<pid>.<epoch>, the header
+  // the restart flow keys on). Until this check the token was sent to whatever listened on the recorded
+  // port, so a stale serve-port record another local service had since bound received it. Anything else
+  // on the port is refused by name (`foreign`) and never sees the token; nothing answering is the caller's
+  // `down` text. Rides `agent`, the keep-alive connection the POST then reuses. Resolves {ok:true, boot}
+  // or the writer's refusal shape; never rejects.
+  _kernelProve(port, agent, down) {
+    const where = '127.0.0.1:' + port;
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (r) => { if (!done) { done = true; resolve(r); } };
+      const dropped = () => finish({ ok: false, unreachable: true, error: down });
+      const foreign = (why) => finish({ ok: false, unreachable: true, foreign: true,
+        error: where + ' answered, but not as a romp kernel (' + why + "); this panel's token was not sent to it" });
+      try {
+        const req = require('http').request({ host: '127.0.0.1', port, path: '/healthz', method: 'GET', agent: agent || undefined }, (res) => {
+          let text = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => { if (text.length < 4096) text += c; });
+          res.on('error', dropped); res.on('aborted', dropped); res.on('close', dropped);
+          res.on('end', () => {
+            const st = res.statusCode || 0, boot = String(res.headers['x-romp-boot'] || '');
+            if (st === 200 && text.trim() === 'ok' && /^\d+\.\d+$/.test(boot)) return finish({ ok: true, boot });
+            foreign('GET /healthz answered HTTP ' + st + (boot ? '' : ' with no kernel identity'));
+          });
+        });
+        req.on('error', dropped);
+        req.setTimeout(10000, () => req.destroy());
+        req.end();
       } catch (e) { dropped(); }
     });
   }
