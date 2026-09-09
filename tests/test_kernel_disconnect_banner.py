@@ -47,7 +47,7 @@ class DisconnectBanner(unittest.TestCase):
         self.assertIn('if(wasReconn){var ann=restartAnnounced&&Date.now()-restartAnnounced<30000;'
                       'restartAnnounced=0;', js)   # T217: the announced-restart latch spends inside the gate
         self.assertIn('if(!ann)armStale(pendingWhy||"reconnect");', js)
-        self.assertIn('try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}}', js)
+        self.assertIn('try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}\nenqueue({type:"wsup"});}', js)
         self.assertNotIn("if(everConnected){location.reload();return;}", js,
                          "the silent auto-reload-on-reconnect is replaced by a reload PROMPT")
         self.assertNotIn("ws.onclose=function(){setTimeout(function(){location.reload();},1500);};", js,

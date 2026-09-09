@@ -104,6 +104,20 @@ adds that tag and drops the tag of the group you right-clicked it in, leaving it
 **+** adds the tag without moving the tab. **Group tabs by tag**, at the foot of the tag
 button's menu, turns the sections off for this browser.
 
+**Coming back after a dropped connection.** When the dashboard's link to the kernel
+drops and comes back (a laptop lid closed and opened, a network change, a phone that
+slept), the page does not fetch every session again. The kernel sends the session you
+were reading in full and lists the others as skeleton tabs: the strip is complete at
+once, each tab with its name, color and status, and a transcript arrives only when it
+is wanted. Click a skeleton tab and the romp loader stands in until its transcript
+lands; the tabs you do not click fill in one at a time while the page is idle, never
+while the browser tab is hidden. Until then a skeleton tab's hover tooltip says it is
+not loaded yet.
+
+![After a reconnect, the tab you were reading is back in full while the other tabs wait as skeletons](assets/guide/reconnect-skeleton-tabs.png){ width="32%" }
+![Clicking a skeleton tab puts up the loader until its transcript arrives](assets/guide/reconnect-skeleton-click.png){ width="32%" }
+![The clicked tab, loaded](assets/guide/reconnect-skeleton-loaded.png){ width="32%" }
+
 ### The feed
 
 The feed is Romp's task-management layer: a card for each task. Romp's

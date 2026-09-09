@@ -157,7 +157,7 @@ class RenderHandlesTheTail(unittest.TestCase):
         # the gap check runs in KERNEL coordinates — the client's injected optimistic tail is not part
         # of the kernel's index space, and counting it masked genuine gaps (the user 2026-08-09)
         self.assertIn("if (from > kernelLen) {", r)
-        self.assertIn("requestFullSession(msg.id);", r)
+        self.assertIn('requestFullSession(msg.id, "gap");', r)   # 2026-09-07: the ask names its reason (skeleton tabs)
         self.assertIn("s.events.length = from;", r)                            # truncate the superseded tail
         self.assertIn("for (const e of (msg.events || [])) s.events.push(e);", r)  # append the suffix
         self.assertIn("v.rendered = Math.min(v.rendered, from);", r)           # repaint from the exact change

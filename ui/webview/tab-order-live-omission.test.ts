@@ -31,7 +31,7 @@ test("the tabOrder message hands applyTabOrder the frame's live array", () => {
 });
 
 test("federation carries the live set through the per-host merge, prunes it on close, drops it on detach", () => {
-  assert.match(FED, /const ARRAY_ID = \["order", "names", "working", "awaiting", "stateUnknown", "live"\];/);
+  assert.match(FED, /const ARRAY_ID = \["order", "names", "working", "awaiting", "stateUnknown", "live", "skeleton"\];/);   // + skeleton: the reconnect strip's not-yet-loaded tabs ride the same pass
   assert.match(FED, /private perHostLive: Record<string, string\[\]> = \{\};/);
   assert.match(FED, /this\.perHostLive\[host\] = Array\.isArray\(m\.live\) \? m\.live\.filter\(\(x: any\) => typeof x === "string"\) : \[\];/);
   assert.match(FED, /if \(this\.perHostLive\[host\]\) this\.perHostLive\[host\] = this\.perHostLive\[host\]\.filter\(\(x\) => x !== gone\);/);

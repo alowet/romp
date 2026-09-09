@@ -52,7 +52,10 @@ function dashboardWid(): string {
 // The shapes a kernel→browser message can carry a session id in. Kept generic (by field name, not by
 // message type) so a new message type that reuses these field names is covered automatically:
 const SCALAR_ID = ["id", "sid"]; //               a single session id
-const ARRAY_ID = ["order", "names", "working", "awaiting", "stateUnknown", "live"]; // an array of session ids
+// `skeleton` (2026-09-07): the tab strip's "listed but not re-sent" sids after a reconnect — ids like
+// the order, so they must arrive prefixed like the order or the pane's set never matches its tabs.
+// `live` (T258): the sids the kernel affirms live this build, the pane's omission guard.
+const ARRAY_ID = ["order", "names", "working", "awaiting", "stateUnknown", "live", "skeleton"]; // an array of session ids
 const OBJ_SID = ["asks", "items", "ledgers", "sessions"]; //  an array of objects keyed by `.sid`
 const OBJ_ID = ["tabs"]; //                       an array of objects keyed by `.id`
 
@@ -770,6 +773,14 @@ export class FederationManager {
   private perHostOrder: Record<string, string[]> = {};
   private perHostTabs: Record<string, any[]> = {};
   private perHostLive: Record<string, string[]> = {};   // each host's affirmed-live sids (T258): the merged tabOrder carries their union
+  // Each host's `skeleton` slice of its tab strip (the user 2026-09-07): after a reconnect the local kernel
+  // lists the sessions it is NOT re-sending in full, and the chat pane draws those as "loads on your
+  // click" instead of from the stale copy it still holds. inbound REBUILDS the strip it hands the pane
+  // from these stores, so without a store of its own the key was dropped and every stale session read
+  // as loaded. Same rule as the pane's: an array REPLACES the slice; an absent key KEEPS it, pruned to
+  // that host's new order (the kernel omits the key only when its set is empty, but the pane shim's
+  // FIFO replaces a queued strip with a newer one, so absent means "no news", never "none").
+  private perHostSkeleton: Record<string, string[]> = {};
   private localViews: any = null;   // the LOCAL kernel's session-views blob, carried on merged tabOrder re-emits
   private localViewsRejected: any = null;   // the last LOCAL tabOrder blob the seq gate turned away since it last adopted one — the caps frame adopts it (inbound)
   private tlViewsRejected: any = null;      // the same for the LOCAL lanes payload's blob (perHostTl[LOCAL].views)
@@ -1022,6 +1033,7 @@ export class FederationManager {
       if (this.perHostOrder[host]) this.perHostOrder[host] = this.perHostOrder[host].filter((x) => x !== gone);
       if (this.perHostTabs[host]) this.perHostTabs[host] = this.perHostTabs[host].filter((t: any) => !(t && t.id === gone));
       if (this.perHostLive[host]) this.perHostLive[host] = this.perHostLive[host].filter((x) => x !== gone);
+      if (this.perHostSkeleton[host]) this.perHostSkeleton[host] = this.perHostSkeleton[host].filter((x) => x !== gone);
       this.perHostSids[host]?.delete(gone);
       window.dispatchEvent(new MessageEvent("message", { data: m }));
       this.emitMergedOrder();
@@ -1033,6 +1045,14 @@ export class FederationManager {
       this.perHostOrder[host] = Array.isArray(m.order) ? m.order.filter((x: any) => typeof x === "string") : [];
       this.perHostTabs[host] = Array.isArray(m.tabs) ? m.tabs : [];
       this.perHostLive[host] = Array.isArray(m.live) ? m.live.filter((x: any) => typeof x === "string") : [];
+      // the skeleton slice: array → replace; absent → keep, pruned to the order this frame just set
+      // (a sid that left the strip left the set with it; see the store's comment for why absent ≠ none)
+      if (Array.isArray(m.skeleton)) {
+        this.perHostSkeleton[host] = m.skeleton.filter((x: any) => typeof x === "string");
+      } else if (this.perHostSkeleton[host]) {
+        const listed = new Set(this.perHostOrder[host]);
+        this.perHostSkeleton[host] = this.perHostSkeleton[host].filter((x) => listed.has(x));
+      }
       // session VIEWS (the user 2026-08-18): the blob is the LOCAL kernel's viewer pref (ids arrive
       // host-prefixed inside it already) — remote kernels' copies are their own dashboards' prefs.
       // Without this passthrough the merged re-emit silently dropped the field and the browser
@@ -1180,7 +1200,12 @@ export class FederationManager {
     const tabs = this.hostSeq.flatMap((h) => this.perHostTabs[h] || []);
     const live = this.hostSeq.flatMap((h) => this.perHostLive[h] || []);   // T258: the union the pane's omission guard reads
     this.publishPending();
+    // `skeleton` rides EVERY merged strip, an array even when empty: the pane's rule is "array → replace,
+    // absent → keep", and this frame is the union of every host's slice — the authority the pane must
+    // replace from. Leaving the key off an empty union would tell the pane "no news" and let a set the
+    // kernel has since emptied (a `closed`, a release) linger as skeleton chips over loaded sessions.
     const data: any = { type: "tabOrder", order, tabs, live, views: this.localViews ?? undefined, selfHost: this.localSelfHost || undefined };
+    data.skeleton = this.hostSeq.flatMap((h) => this.perHostSkeleton[h] || []);
     // Provenance for the chat's close backstop (T233): a FRESH emission is driven by one host's own
     // tabOrder push and names that host (`freshHost`) — only ITS ids are that kernel's current word; the
     // other hosts' slices ride along from the store. A SYNTHETIC re-emit (a view-order storage event, a
@@ -1501,6 +1526,7 @@ export class FederationManager {
     delete this.perHostOrder[host];
     delete this.perHostTabs[host];
     delete this.perHostLive[host];
+    delete this.perHostSkeleton[host];   // with its order: a re-attach's first strip must not inherit a stale set
     delete this.perHostSids[host];
     delete this.perHostFeed[host];
     delete this.perHostFeedAt[host];

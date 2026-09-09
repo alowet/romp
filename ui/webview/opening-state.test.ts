@@ -56,9 +56,9 @@ test("create + connect push the ONE session directly instead of waiting out a fu
 });
 
 test("the statusline shows Opening + dots for BOTH the pre-payload tab and the kernel's opening state", () => {
-  assert.match(RENDER, /function openingLine\(\): HTMLElement/);
+  assert.match(RENDER, /function openingLine\(text = "Opening session"\): HTMLElement/);   // the text is a parameter since 2026-09-08: a skeleton tab (a running session whose transcript is on its way) says "Loading session"
   // pre-payload: a placeholder tab used to leave the PREVIOUS tab's statusline standing
-  assert.match(RENDER, /if \(activeId && !s\) \{[\s\S]{0,700}?sl\.replaceChildren\(openingLine\(\)\);\s*\n\s*return;/);
+  assert.match(RENDER, /if \(activeId && !s\) \{[\s\S]{0,700}?sl\.replaceChildren\(openingLine\(loading \? "Loading session" : "Opening session"\)\);\s*\n\s*return;/);
   // kernel-reported opening rides the same line
   assert.match(RENDER, /s\.status\.state === "opening"/);
   assert.match(RENDER, /"opening"/);

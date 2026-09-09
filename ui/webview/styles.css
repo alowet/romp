@@ -536,6 +536,13 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 .tab.tab-placeholder.colored .tab-label { opacity: 0.75; }   /* keep the identity color but a touch muted while loading */
 /* the pane-local wait while a clicked loading tab's payload is still on its way (showActive) */
 .tab-loading-wait { display: flex; align-items: center; justify-content: center; min-height: 60vh; }
+/* SKELETON tab (2026-09-07): a tab the kernel LISTS but this page holds no current copy of — after a redial the
+   kernel sends only the active tab in full and withholds the rest (skeleton-tabs.ts), each resting here until a
+   click or the idle prefetch loads it. Distinct from the placeholder by construction: NO swirl (that means "romp is
+   generating this", a transient — this is a running session at rest), the identity color kept, the label a touch
+   muted at the placeholder's own 0.75 (no new opacity vocabulary), and an honest chip — the kernel's status dot, or
+   the gray unknown ring until the first status frame lands (render.ts makeSkeletonTab / applyTabStatus). */
+.tab.tab-skeleton .tab-label { opacity: 0.75; }
 .tab-ph-swirl { width: 12px; height: 12px; border-radius: 2px; flex: none;
   animation: tab-ph-swirl-spin 7s linear infinite; }   /* .tab is flex with its own gap, so no margin needed */
 @keyframes tab-ph-swirl-spin { to { transform: rotate(-360deg); } }

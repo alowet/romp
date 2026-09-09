@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { createRequire } from "node:module";
 import { planStrip, parseTabGroups, headWords } from "./tab-groups";
 import { tabStateClass, tabDotClass, sectionPip, sectionPipMembers, sectionPipTitle } from "./tab-state";
+import { newSkeletonState, renderKind } from "./skeleton-tabs";
 import type { TagUnion } from "./session-views";
 
 const requireCjs = createRequire(__filename);
@@ -63,6 +64,8 @@ type Hooks = {
   heads: HeadCall[];          // every group header the paint minted, in order
   planStrip: typeof planStrip; parseTabGroups: typeof parseTabGroups; headWords: typeof headWords;
   tabStateClass: typeof tabStateClass; tabDotClass: typeof tabDotClass; sectionPip: typeof sectionPip; sectionPipMembers: typeof sectionPipMembers; sectionPipTitle: typeof sectionPipTitle;
+  newSkeletonState: typeof newSkeletonState; renderKind: typeof renderKind;   // the skeleton strip (2026-09-07): empty here, so every listed id is a loaded tab or a placeholder
+  skeletons: number;          // skeleton tabs minted (none expected: the set stays empty in these worlds)
 };
 type Api = {
   renderTabs: () => void; sig: () => string; folded: () => Set<string>;
@@ -74,10 +77,15 @@ type Api = {
 function lift(): (hooks: Hooks) => Api {
   const a = RENDER.indexOf("function renderTabs() {"), b = RENDER.indexOf("// Right-click context menu on a tab.", a);
   assert.ok(a > 0 && b > a, "anchors not found — renderTabs or the context-menu comment moved; re-anchor");
-  const js = requireCjs("esbuild").transformSync(RENDER.slice(a, b), { loader: "ts" }).code;
+  // the chip, the drag listeners and the context gauge live in helpers above renderTabs, shared with the
+  // skeleton tab (2026-09-07): lifted for real, so the paint wears the state class and a dragstart resets the signature
+  const h0 = RENDER.indexOf("function applyTabStatus("), h1 = RENDER.indexOf("// SKELETON tab (2026-09-07)", h0);
+  const g0 = RENDER.indexOf("function appendTabCtxGauge(", h1), g1 = RENDER.indexOf("// A loading PLACEHOLDER tab", g0);
+  assert.ok(h0 > 0 && h1 > h0 && g0 > h1 && g1 > g0, "anchors not found — applyTabStatus / wireTabDrag / appendTabCtxGauge or the skeleton-tab / placeholder comments moved; re-anchor");
+  const js = requireCjs("esbuild").transformSync(RENDER.slice(h0, h1) + RENDER.slice(g0, g1) + RENDER.slice(a, b), { loader: "ts" }).code;
   const prelude = `
     let renameActive = false, renderPendingAfterRename = false, tabPointerHeld = false, renderPendingWhilePressed = false;
-    let tabStripSig = "", activeId = null, peekId = null, allHiddenBlanked = false, draggedId = null, tabDragCommitted = false;
+    let tabStripSig = "", activeId = null, peekId = null, allHiddenBlanked = false, draggedId = null, draggedEl = null, tabDragCommitted = false;
     let order = [], closingTabs = new Set(), tabMeta = new Map(), sessions = new Map(), views = new Map();
     let collapsedTabIds = new Set(), draggedGroup = null, provisionalId = null, provisionalTags = [];
     let settings = { tabCtx: "over50", theme: "classic", colormap: "aurora" };
@@ -92,6 +100,8 @@ function lift(): (hooks: Hooks) => Api {
     const titleWithKey = () => H.keyHint; const surfaceLens = () => H.lens; const effViews = () => null; const viewTagUnion = () => H.unions;
     const hostIsDown = (id) => H.down.has(id); const hostDownNote = (id) => H.notes[id] ?? "";
     function makePlaceholderTab(id) { const t = el("div", "tab tab-placeholder"); t.dataset.id = id; H.placeholders++; return t; }
+    const skeletonTabs = H.newSkeletonState(); const renderKind = H.renderKind;
+    function makeSkeletonTab(id) { const t = el("div", "tab tab-skeleton"); t.dataset.id = id; H.skeletons++; return t; }
     // the sectioned strip's pure rules, for real; the header builder a recorder
     const planStrip = H.planStrip; const headWords = H.headWords;
     const readTabGroups = (u) => H.parseTabGroups(H.groupsRaw, u);
@@ -139,7 +149,8 @@ function world(): { H: Hooks; api: Api; sessions: Map<string, any>; tabMeta: Map
   const H: Hooks = { FakeEl, bar: new FakeEl("div"), mslot: null, only: "", hidden: new Set(), down: new Set(), notes: {},
                      keyHint: "Open a session (K)", lens: { all: true }, unions: [], tips: [], aftermaths: [], rowPaints: 0, tagSyncs: 0, placeholders: 0,
                      groupsRaw: null, phone: false, heads: [],
-                     planStrip, parseTabGroups, headWords, tabStateClass, tabDotClass, sectionPip, sectionPipMembers, sectionPipTitle };
+                     planStrip, parseTabGroups, headWords, tabStateClass, tabDotClass, sectionPip, sectionPipMembers, sectionPipTitle,
+                     newSkeletonState, renderKind, skeletons: 0 };
   const api = lift()(H);
   const sessions = new Map<string, any>([["a", session("web", "ready")], ["b", session("api", "working")]]);
   const tabMeta = new Map<string, any>([["p", { name: "tests", color: { bg: "#112233", fg: "#ffffff" } }]]);

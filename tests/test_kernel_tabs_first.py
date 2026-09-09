@@ -25,8 +25,14 @@ class TabsFirst(unittest.TestCase):
         src = inspect.getsource(km._push)
         self.assertIn('tab_meta = [{"id": s["sid"], "name": s.get("name", ""), "color": _name_color(s["sid"])}', src,
                       "the periodic push builds a name+color list per tab")
-        self.assertIn('_send_client(c, ("taborder",), _tab_order_frame(tab_order, tab_meta, tmux))', src,
-                      "and ships it as the tabs field alongside the sid order, in the frame's one spelling")
+        # 2026-09-07: the frame itself moved into _tab_order_frame — the ONE builder (T258: it carries the
+        # affirmed-live sids; and a reconnecting client's skeleton list) — so the pusher hands its order + meta
+        # + liveness to _send_tab_order, which builds the frame per client
+        self.assertIn('_send_tab_order(c, tab_order, tab_meta, tmux)', src,
+                      "and ships it as the tabs field alongside the sid order, through the one strip builder")
+        self.assertIn('fr = {"type": "tabOrder", "order": list(order), "tabs": tabs, "selfHost": _self_host(),\n'
+                      '          **_views_payload(), "live": sorted({str(x) for x in live})}',
+                      inspect.getsource(km._tab_order_frame), "the builder's frame keeps today's shape")
 
     def test_every_tab_order_frame_names_this_kernels_own_host(self):
         # the chat reads a postal card's sender host against the viewing kernel's own name (its
@@ -39,21 +45,24 @@ class TabsFirst(unittest.TestCase):
         self.assertEqual(frame["type"], "tabOrder")
         self.assertEqual(frame["selfHost"], km._self_host())
         self.assertEqual(sorted(frame), ["live", "order", "selfHost", "tabs", "type", "views"])
-        # the four senders share the one spelling: the pusher's tabs-first send, the off-cycle session push,
-        # the close confirmation and the WS 'ready' handler's connect-time frame — a fifth inline dict would
-        # drop the field again
+        # the four senders share the one spelling — the pusher's tabs-first send, the off-cycle session push,
+        # the close confirmation and the WS 'ready' handler's connect-time frame all hand their order + meta +
+        # liveness to _send_tab_order, the builder's ONE caller (2026-09-07: it builds the frame per client,
+        # so a reconnecting client's skeleton list can ride it) — a fifth inline dict would drop the field again
         text = open(KPATH).read()
-        self.assertEqual(text.count('_send_client(c, ("taborder",), _tab_order_frame(tab_order, tab_meta, tmux))'), 2)
-        self.assertEqual(text.count("frame = _tab_order_frame(tab_order, tab_meta, tmux)"), 1)
-        self.assertEqual(text.count("_frame = _tab_order_frame(_o, _tabs, _tm)"), 1)
+        self.assertEqual(text.count('_send_client(c, ("taborder",), _tab_order_frame(tab_order, tab_meta, live, c))'), 1)
+        self.assertEqual(text.count("_tab_order_frame(tab_order, tab_meta, live, c)"), 1, "the builder's one caller: _send_tab_order")
+        self.assertEqual(text.count("_send_tab_order(c, tab_order, tab_meta, tmux)"), 3)
+        self.assertEqual(text.count("_send_tab_order(client, _o, _tabs, _tm)"), 1)
         self.assertEqual(text.count('{"type": "tabOrder"'), 1, "the literal lives in _tab_order_frame alone")
-        self.assertIn("_tab_order_frame(tab_order, tab_meta, tmux)", inspect.getsource(km._push_session_now))
-        self.assertIn("_tab_order_frame(tab_order, tab_meta, tmux)", inspect.getsource(km._confirm_close_now))
+        self.assertIn("_send_tab_order(c, tab_order, tab_meta, tmux)", inspect.getsource(km._push_session_now))
+        self.assertIn("_send_tab_order(c, tab_order, tab_meta, tmux)", inspect.getsource(km._confirm_close_now))
 
     def test_connect_ready_handler_also_sends_tabs(self):
         text = open(KPATH).read()
-        self.assertIn('_frame = _tab_order_frame(_o, _tabs, _tm)', text,
-                      "the WS 'ready' connect push also carries name+color tabs, in the frame's one spelling")
+        # 2026-09-07: the direct send goes through _send_tab_order too (one frame builder, one dedup slot)
+        self.assertIn('_send_tab_order(client, _o, _tabs, _tm)', text,
+                      "the WS 'ready' connect push also carries name+color tabs")
         self.assertIn('_tabs = [{"id": s["sid"], "name": s.get("name", ""), "color": _name_color(s["sid"])}', text)
 
     def test_name_color_shape_matches_the_client_color_type(self):

@@ -76,7 +76,7 @@ class PaneLoaderReconnect(unittest.TestCase):
         self.assertIn('if(wasReconn){var ann=restartAnnounced&&Date.now()-restartAnnounced<30000;'
                       'restartAnnounced=0;', shim,
                       "the wasReconn gate stands; T217 spends the announced-restart latch inside it")
-        self.assertIn('try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}}', shim,
+        self.assertIn('try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}\nenqueue({type:"wsup"});}', shim,
                       "wsup still rides the same wasReconn gate as the reload prompt")
         self.assertIn("var wasReconn=everConnected;everConnected=true;", shim,
                       "and wasReconn still means 'this socket had connected before'")
