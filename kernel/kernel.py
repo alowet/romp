@@ -14067,23 +14067,29 @@ def _auth_key_present():
 
 
 def _auth_both():
-    """True when this machine offers BOTH billing choices (a signed-in login and a manager-env key) —
-    the condition for the per-session auth selector to exist anywhere (picker, gear). Cheap per-push:
-    _claude_account is mtime-cached and the key is an attribute read."""
+    """True when this machine offers BOTH billing choices (a signed-in login and a configured apiKeyHelper).
+    Since 2026-09-08 it gates NOTHING in the UI (the Billing menu lists both choices always, greying the
+    one this box cannot bill: _auth_avail) and rides the status payload for older clients only. Cheap
+    per-push: _claude_account is mtime-cached and the key is an attribute read."""
     return _auth_key_present() and bool(_claude_account()) and jd._cred.helper_source() != "managed"
 
 
 def _auth_avail():
-    """Which billing choices this machine can offer a session: {'login','key','acct','default'}. The
-    picker's Billing row is ALWAYS there for an SDK session (the user 2026-08-09): BUTTONS when both
-    choices are real, and when only one is, the same row simply WRITES OUT which one applies — informative,
-    not a one-option selector (which is what the earlier disappearing rule was really against, the user
-    2026-08-08). login = the credential store names a signed-in account (_claude_account — the same
-    authority the usage bars trust; a stale login still fails LOUDLY per session via apiKeySource/authErr
-    rather than being second-guessed here). key = an apiKeyHelper is configured in Claude Code's settings
-    (read, never run; romp holds no key: see _auth_key_present). acct = the login's display name (_claude_account_label),
-    so 'Login' can say WHICH account it means. default = what a fresh session would use absent an
-    explicit pick."""
+    """Which billing choices this machine can offer a session: {'login','key','acct','default', and
+    'loginWhy'/'keyWhy' for each side it cannot bill}. The Billing controls are ALWAYS there for an SDK
+    session (the user 2026-08-09, sharpened 2026-09-08: the picker never disappears): the tab menu's
+    submenu lists BOTH choices and greys the unavailable one with its reason in the hover, the new-session
+    picker's row writes out the one that applies. login = the credential store names a signed-in account
+    (_claude_account — the same authority the usage bars trust; a stale login still fails LOUDLY per
+    session via apiKeySource/authErr rather than being second-guessed here) AND no MANAGED apiKeyHelper
+    (a managed helper outranks the per-session layer a login pick rides, so no pick could apply; set_auth
+    refuses it with the same reason). key = an apiKeyHelper is configured in Claude Code's settings (read,
+    never run; romp holds no key: see _auth_key_present). acct = the login's display name
+    (_claude_account_label), so 'Login' can say WHICH account it means. default = what a fresh session
+    would use absent an explicit pick: the remembered pick when this box can bill it, else the side that
+    exists, in BOTH directions (the user 2026-09-08: a remembered login pick on a box with no login falls
+    to the key, exactly as a remembered key pick on a helper-less box already fell to the login). The
+    reason sentences are credentials.py's, one vocabulary for every surface."""
     key = _auth_key_present()
     d = {}
     try:
@@ -14091,14 +14097,27 @@ def _auth_avail():
         d = d if isinstance(d, dict) else {}
     except Exception:
         d = {}
+    managed = jd._cred.helper_source() == "managed"
+    login_ok = bool(_claude_account()) and not managed
     default = d.get("auth") if d.get("auth") in ("login", "key") else ("key" if key else "login")
     if default == "key" and not key:
         default = "login"
-    # a MANAGED helper outranks the per-session layer, so no login pick could apply there: the login side is
-    # not offered on such a box (set_auth refuses it too, with the reason; review 2026-09-08)
-    login_ok = bool(_claude_account()) and jd._cred.helper_source() != "managed"
-    return {"login": login_ok, "key": key,
-            "acct": _claude_account_label(), "default": default}
+    elif default == "login" and not login_ok and key:
+        default = "key"
+    out = {"login": login_ok, "key": key,
+           "acct": _claude_account_label(), "default": default}
+    if not login_ok:
+        out["loginWhy"] = jd._cred.WHY_MANAGED_HELPER if managed else jd._cred.WHY_NO_LOGIN
+    if not key:
+        out["keyWhy"] = jd._cred.WHY_NO_HELPER
+    return out
+
+
+def _auth_avail_status():
+    """_auth_avail's availability half for the per-session status payload: {login, key, loginWhy?, keyWhy?}
+    — no acct (authAcct rides beside it) and no default (a live session has its own pick)."""
+    a = _auth_avail()
+    return {k: a[k] for k in ("login", "key", "loginWhy", "keyWhy") if k in a}
 
 
 def _cap_switch_offer(sid, aerr):
@@ -14968,10 +14987,15 @@ def _drive(msg, client):
         # like /effort; mid-compaction → parked in the same FIFO. LOUD on refusal (fail loudly): tmux
         # sessions and a keyless manager can't apply it, and a silent swallow leaves a dead control.
         if not _set_auth_or_park(be, sid, str(msg["value"])):
+            # the backend names the reason it refused (no login signed in / no apiKeyHelper / a managed
+            # helper: auth_unavailable_why) when it had one; the generic text covers the rest (a tmux
+            # session, an unknown sid)
+            why = str(getattr(be, "auth_unavailable_why", lambda v: "")(str(msg["value"])) or "")
             client["send"](json.dumps({"type": "warn",
-                                       "text": "Couldn't switch the account this session bills — "
-                                               "it isn't an SDK session, no API key is configured, "
-                                               "or this machine has no Claude login to switch to."}))
+                                       "text": ("Couldn't switch the account this session bills: %s." % why) if why
+                                       else "Couldn't switch the account this session bills — "
+                                            "it isn't an SDK session, no API key is configured, "
+                                            "or this machine has no Claude login to switch to."}))
         _push_soon()
     elif t == "stopTask" and msg.get("taskId"):
         # the SDK's designed stop_task control request, addressed by the id the bg-task box shows.
@@ -16087,6 +16111,13 @@ class Sessions:
                                 "fast": st.get("fast", ""),   # fast-mode state from the CLI's init ("on"/"off"/"cooldown"; "" = unknown → no badge)
                                 "fastReason": st.get("fastReason", ""),   # init's disabled_reason — non-empty hides the chat toggle
                                 "auth": st.get("auth", ""),   # which account this session bills ('login'|'key') → gear badge
+                                # the CLI's own init report ('key'|'login', "" until one lands): the
+                                # Billing row's live truth. Merged since 2026-09-08 — the status push read
+                                # it off this map from the start, and nothing had ever put it here
+                                "authLive": st.get("authLive", ""),
+                                # the explicit pick this box cannot bill ("login"|"key"|""): the launch
+                                # fell to the other side, the Billing menu says so (2026-09-08)
+                                "authPickUnavailable": st.get("authPickUnavailable", ""),
                                 "authPending": bool(st.get("authPending")),   # an /auth switch reconnecting → badge dots
                                 "color": (st.get("color") or None), "mode": st.get("mode", ""), "backend": "sdk",
                                 "subagents": st.get("subagents") or [],   # live Task subagents (SDK only) → lane pill
@@ -30171,9 +30202,16 @@ def build_session(sid, now, tmux=None, path_override=None, tail_cap_t=None, side
                   # renders it when it disagrees with the intent above (a key found via apiKeyHelper
                   # bills the key while `auth` still reads login; the user 2026-08-15)
                   "authLive": tm.get("authLive", ""),
-                  # whether this machine offers BOTH choices — the gate for the CONTROLS (statusline
-                  # badge menu / picker buttons); display no longer hangs on it (the user 2026-08-09)
+                  # whether this machine offers BOTH choices. No longer a gate (the user 2026-09-08: the
+                  # Billing menu lists both choices always and greys the one this box cannot bill, from
+                  # authAvail below); kept for older clients
                   "authBoth": _auth_both(),
+                  # which choices this box can bill, and why not for the other: {login, key, loginWhy?,
+                  # keyWhy?} — the Billing menu's greyed option and its hover (_auth_avail)
+                  "authAvail": _auth_avail_status(),
+                  # the explicit pick this box cannot bill ("login"|"key"|"") — the launch fell to the
+                  # other side (sdk_backend._options) and the menu's sub-line says so under the pick
+                  "authPickUnavailable": tm.get("authPickUnavailable", ""),
                   # the login's display name, shown beside 'Login' (the user 2026-08-09); "" when no login
                   "authAcct": _claude_account_label(),
                   "authPending": bool(tm.get("authPending")),   # an /auth reconnect applying → badge dots
@@ -47995,8 +48033,8 @@ class Handler(BaseHTTPRequestHandler):
                                        # …and whether Browse… can do anything here, so a kernel with no
                                        # desktop shows the button as unavailable rather than inert.
                                        "nativeDialogs": _native_dialogs(),
-                                       # billing choices THIS host can offer a new session — the picker
-                                       # shows its auth control only when both are real (see _auth_avail)
+                                       # billing choices THIS host can offer a new session, with the
+                                       # reason for any it cannot — the picker's Billing row (see _auth_avail)
                                        "authAvail": _auth_avail(),
                                        # this machine's name (the identity peers see) — the picker's
                                        # Host row labels its this-machine option with it, so every
