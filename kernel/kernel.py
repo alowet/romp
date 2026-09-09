@@ -43363,7 +43363,12 @@ function hearBlur(f){try{if(!f.contentDocument)return;f.contentWindow.addEventLi
 f.addEventListener('load',function(){hearBlur(f);});hearBlur(f);});   // now (already loaded) + on every (re)load, as the Alt+Arrow wiring does
 var bar=document.getElementById('mtabs');if(!bar)return;
 var F={chat:document.getElementById('f-chat'),fleet:document.getElementById('f-fleet'),feed:document.getElementById('f-feed'),timeline:document.getElementById('f-timeline')};
-var B=bar.querySelectorAll('button'),KT='romp-mobile-tab';
+// ONLY the pane tabs (the user 2026-09-08, on the phone: the bell wore its OFF slash while its popover said
+// on). This list once took EVERY button in the bar, and show() toggled `.on` to data-pane===p on each — for
+// the action buttons and the bell (no data-pane) that is always off, so every pane switch stripped the
+// bell's `.on`, the class _LANDING_PUSH_JS paints from the master + this device's subscription and the
+// slash rule keys on, until the next paint event. A tab or a reveal decides which pane shows, nothing else.
+var B=bar.querySelectorAll('button[data-pane]'),KT='romp-mobile-tab';
 function show(p){if(!F[p])return;document.body.setAttribute('data-tab',p);for(var k in F)F[k].classList.toggle('m-on',k===p);
 for(var i=0;i<B.length;i++)B[i].classList.toggle('on',B[i].getAttribute('data-pane')===p);
 try{localStorage.setItem(KT,p);}catch(e){}}
@@ -43373,7 +43378,7 @@ try{localStorage.setItem(KT,p);}catch(e){}}
 // jump (feed) and toggleFleet (chat) precedents use; it persists via romp-panes like any manual toggle.
 // Guarded: the collapse script that defines __rompPaneToggle parses after this one — fine at message time.
 function reveal(p){try{window.__rompPaneToggle&&window.__rompPaneToggle(p,true);}catch(e){}show(p);}
-for(var i=0;i<B.length;i++)(function(b){var pk=b.getAttribute('data-pane');if(pk){b.addEventListener('click',function(){show(pk);});}})(B[i]);
+for(var i=0;i<B.length;i++)(function(b){var pk=b.getAttribute('data-pane');b.addEventListener('click',function(){show(pk);});})(B[i]);
 // the rail's actions on mobile: settings opens the feed iframe's modal (same path as the desktop
 // gear), net opens the shell's remotes panel, usage opens the tooltip's window bars as a modal, and
 // restart reuses the rail refresh's kernel restart (the user 2026-07-22 — the rail is hidden on mobile)
