@@ -86,6 +86,7 @@ class _World(unittest.TestCase):
         jd.ERRORS = td / "judge-errors.jsonl"
         jd.MESSAGES.write_text("")
         self.recs = {sid: [] for sid in self.SIDS}
+        self.mid_of = {sid: [] for sid in self.SIDS}   # the message ids delivered to each session, in order
         self.mids = 0
         self._reset_memos()
         jd._COURIER_SEEN.clear()
@@ -118,6 +119,7 @@ class _World(unittest.TestCase):
         """One peer message (a declared delegate) lands in `sid`'s transcript, with its postal row."""
         self.mids += 1
         mid = "%d.%05d_%05d.TESTHOST" % (T0, self.mids, self.mids)
+        self.mid_of[sid].append(mid)
         with jd.MESSAGES.open("a") as f:
             f.write(json.dumps({"t": t - 5, "ev": "sent", "id": mid, "from": "sender", "from_id": SENDER,
                                 "to_id": sid, "kind": "delegate",
@@ -247,7 +249,7 @@ class CourierSkip(_World):
         # outside A's key, so A is never recorded while the link is missing; once the sender's tracking node
         # exists, the next pass attaches the link through a writer load, and only then does A settle.
         path = self.proj_dir / (A + ".jsonl")
-        mid_a = self.recs[A][0]["message"]["content"].split("romp-msg-id: ")[1].split(" ")[0]
+        mid_a = self.mid_of[A][0]
         session = jd.parsed_session(A, [str(path)], T0 + 200)
         fresh = jd.load_goals(A)
         seg = next(sg for tn in session["turns"] for sg in jd._segs(tn, fresh) if (jd._seg_peer(sg) or ("",))[0])
