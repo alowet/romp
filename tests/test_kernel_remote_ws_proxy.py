@@ -93,8 +93,16 @@ class _FakeRemoteKernel:
             self.done.set()
 
     def close(self):
-        # End the serve thread (T282): a listening socket closed from another thread does not wake accept()
-        # on Linux; shutdown() does. Then wait for the thread's exit, bounded.
+        # End the serve thread (T282). A fake nobody dialed is parked in accept(): closing the listening socket
+        # from another thread does not wake it (on Linux shutdown() does, on macOS/BSD neither does), so a
+        # throwaway dial that ends at once wakes it portably: accept() returns, recv() sees the EOF, the thread
+        # ends. Then shut down and close the listener and wait for the thread's exit, bounded.
+        if not self.done.is_set():
+            try:
+                with socket.create_connection(("127.0.0.1", self.port), timeout=1):
+                    pass
+            except OSError:
+                pass
         for op in (lambda: self.srv.shutdown(socket.SHUT_RDWR), self.srv.close):
             try:
                 op()

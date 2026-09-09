@@ -137,10 +137,14 @@ class Chrome(unittest.TestCase):
         km._identity_of = lambda sid: ("#abc", "#fff")
 
     def tearDown(self):
+        # The expiry thread reads BADGE_TTL and the stubbed show_var on ITS first instructions; wait for it to end
+        # while both are still in place (restoring first would let a late-scheduled thread read the 300 s constant
+        # and the real tmux client), then put the class back as it was.
+        left = wait_for_census(self._census0)
         (self.T.set_var, self.T.fire, self.T.display, self.T.show_var, self.T.refresh_client,
          km._name_of, km._identity_of) = self.saved
         self.T.__dict__.pop("BADGE_TTL", None)                  # back to the class constant
-        self.assertEqual(wait_for_census(self._census0), [], "no badge-expiry thread outlives the test (T282)")
+        self.assertEqual(left, [], "no badge-expiry thread outlives the test (T282)")
 
     def test_mail_badge_paints_the_recipient(self):
         km._name_of = lambda sid: "recip" if sid == "r" else None

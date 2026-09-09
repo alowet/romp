@@ -7894,8 +7894,9 @@ class FailureContract(unittest.TestCase):
     event (the turn gaining atoms / the top set changing)."""
 
     def setUp(self):
+        self._saved_state = jd.STATE
         self._td = tempfile.mkdtemp()
-        jd._rebind_state(Path(self._td))
+        jd._rebind_state(Path(self._td))   # GOALDIR and every derived dir move too (T282)
         # the model-health latch is process-global, keyed by model: the failing calls below push "model-x"
         # and "gpt-5-test" past the degraded cap, so snapshot it here and restore it after — a later test
         # must not inherit a degraded model (review nit, 2026-09-03)
@@ -7904,6 +7905,7 @@ class FailureContract(unittest.TestCase):
                             {m: dict(st) for m, st in jd._CALL_HEALTH["stats"].items()})
 
     def tearDown(self):
+        jd._rebind_state(self._saved_state)   # the shared judge goes back to the run-wide root (T282)
         shutil.rmtree(self._td, ignore_errors=True)
         with jd._health_lock:
             jd._CALL_HEALTH["degraded"].clear()
