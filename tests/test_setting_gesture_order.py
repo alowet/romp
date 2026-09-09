@@ -795,7 +795,7 @@ class VersionReportsEveryStoredStamp(_Base):
     def test_a_fresh_install_reports_every_store_at_zero(self):
         gts = km._version_info()["settingsGt"]
         self.assertEqual(set(gts), set(km._GT_STORES), "one key per gt-gated store, no more, no less")
-        self.assertEqual(len(km._GT_STORES), 15, "five toggles/modes + ten judge-tier stores (judge-concurrency since T277)")
+        self.assertEqual(len(km._GT_STORES), 16, "five toggles/modes + eleven kernel-side stores (judge-concurrency since T277, tmux-backend since T288)")
         self.assertEqual(set(gts.values()), {0}, "nothing applied yet reads 0 — nothing to outrank")
         self.assertEqual(json.loads(json.dumps(gts)), gts, "plain JSON — ints, no paths, nothing to redact")
 
@@ -836,7 +836,8 @@ class VersionReportsEveryStoredStamp(_Base):
                  {"type": "setIndexEffort", "effort": "high"}, {"type": "setJudgeConcurrency", "value": "4"},
                  {"type": "setDistillModel", "model": "haiku"},
                  {"type": "setDistillEffort", "effort": "high"}, {"type": "setCommentModel", "model": "haiku"},
-                 {"type": "setCommentEffort", "effort": "high"}, {"type": "setCommentFast", "fast": "on"}]
+                 {"type": "setCommentEffort", "effort": "high"}, {"type": "setCommentFast", "fast": "on"},
+                 {"type": "setTmuxBackend", "enabled": True}]
         older = [{"type": "setAutoNudge", "enabled": True}, {"type": "setCompactSuggest", "enabled": False},
                  {"type": "setFileEditing", "enabled": False}, {"type": "setUpdateMode", "mode": "off"},
                  {"type": "setThinkingSummaries", "enabled": False}, {"type": "setJudgeModel", "model": "opus"},
@@ -844,14 +845,15 @@ class VersionReportsEveryStoredStamp(_Base):
                  {"type": "setIndexEffort", "effort": "low"}, {"type": "setJudgeConcurrency", "value": "2"},
                  {"type": "setDistillModel", "model": "triage"},
                  {"type": "setDistillEffort", "effort": "low"}, {"type": "setCommentModel", "model": "session"},
-                 {"type": "setCommentEffort", "effort": "session"}, {"type": "setCommentFast", "fast": "session"}]
+                 {"type": "setCommentEffort", "effort": "session"}, {"type": "setCommentFast", "fast": "session"},
+                 {"type": "setTmuxBackend", "enabled": False}]
         with contextlib.redirect_stderr(io.StringIO()):
             for n, o in zip(newer, older):
                 km.Handler._dispatch_ws(types.SimpleNamespace(), dict(n, gt=T_NEW), client)
                 km.Handler._dispatch_ws(types.SimpleNamespace(), dict(o, gt=T_OLD), client)
         named = {m["setting"] for m in sent if m.get("type") == "settingStale"}
         self.assertEqual(named, set(km._version_info()["settingsGt"]), "frames and the report share one vocabulary")
-        self.assertEqual(len(named), 15)   # ten judge-tier stores since T277
+        self.assertEqual(len(named), 16)   # eleven kernel-side stores since T288
 
 
 class ASkewedClockCannotLockTheStore(_Base):
