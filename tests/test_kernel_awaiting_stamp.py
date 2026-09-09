@@ -789,6 +789,69 @@ class AwaitingWakeOutcomeSweep(unittest.TestCase):
         self.assertFalse(km.jd.load_goals(SID)["nodes"][self.gid]["blocked"])
 
 
+    def test_sweep_decides_through_the_shared_view_and_never_asks_the_writer_for_an_inert_record(self):
+        # T267d (2026-09-09): the sweep's per-record store read takes the shared read-only view
+        # (kernel/judge.py load_goals_shared); a fresh writer load per record was the pusher's remaining
+        # goal loads once the walk's own read moved. Decisions unchanged: a walked, ungated record is the
+        # walk's, and the writer's loader is never asked for it.
+        now = 1_000_000
+        self._seed_goal(at=now - 20 * 3600)
+        self._seed_rec({"wake": True, "anchor": now - 20 * 3600, "count": 1, "lastTurnId": "t1",
+                        "armAtoms": 0, "at": now - 3600})
+        km.jd._shared_clear()
+        private, o_load = [], km.jd.load_goals
+        km.jd.load_goals = lambda fsid: (private.append(fsid), o_load(fsid))[1]
+        stats0 = km.jd.shared_store_stats()
+        try:
+            self.assertFalse(km._awaiting_wake_outcomes(now, walked={SID}))
+        finally:
+            km.jd.load_goals = o_load
+        self.assertEqual(private, [], "the writer's loader is never asked to decide")
+        self.assertFalse(km.jd.load_goals(SID)["nodes"][self.gid]["blocked"])
+
+    def test_sweep_leaves_a_cleared_card_alone_through_the_view(self):
+        # a due wake whose card the user cleared: the record is inert (not 'working'), no block, no writer load
+        now = 1_000_000
+        self._seed_goal(at=now - 20 * 3600)
+        d = json.loads((km.jd.GOALDIR / (SID + ".json")).read_text())
+        d["status"][self.gid] = "cleared"
+        (km.jd.GOALDIR / (SID + ".json")).write_text(json.dumps(d))
+        self._seed_rec({"wake": True, "anchor": now - 20 * 3600, "count": 1, "lastTurnId": "t0",
+                        "armAtoms": 0, "at": now - 7 * 3600})
+        km.jd._shared_clear()
+        private, o_load = [], km.jd.load_goals
+        km.jd.load_goals = lambda fsid: (private.append(fsid), o_load(fsid))[1]
+        stats0 = km.jd.shared_store_stats()
+        try:
+            self.assertFalse(km._awaiting_wake_outcomes(now))
+        finally:
+            km.jd.load_goals = o_load
+        self.assertEqual(private, [])
+        self.assertEqual(km.jd.shared_store_stats()["miss"] - stats0["miss"], 1, "one view read for the record")
+        self.assertFalse(km.jd.load_goals(SID)["nodes"][self.gid].get("blocked"))
+
+    def test_sweep_files_an_answer_through_one_writer_load(self):
+        # the answered leg SAVES (record_verdict + save_goals), so it alone takes a writer load, exactly one
+        now = 1_000_000
+        self._seed_goal(at=now - 20 * 3600)
+        self._seed_rec({"wake": True, "anchor": now - 20 * 3600, "count": 1, "lastTurnId": "t1",
+                        "armAtoms": 0, "at": now - 7 * 3600})
+        km.jd._shared_clear()
+        saved = km._nudge_response_ready
+        km._nudge_response_ready = lambda *a, **k: (True, {"id": "s9", "t": now - 6 * 3600})
+        private, o_load = [], km.jd.load_goals
+        km.jd.load_goals = lambda fsid: (private.append(fsid), o_load(fsid))[1]
+        try:
+            self.assertFalse(km._awaiting_wake_outcomes(now))
+        finally:
+            km._nudge_response_ready = saved
+            km.jd.load_goals = o_load
+        self.assertEqual(private, [SID], "one writer load, for the filing")
+        self.assertEqual(km._auto_nudge_data()["nudged"][self.gid].get("answeredAt"), now - 6 * 3600)
+        self.assertFalse(km.jd.load_goals(SID)["nodes"][self.gid]["blocked"])
+        self.assertEqual(km.jd.shared_store_stats()["off"], 0, "no write ever reached the frozen view")
+
+
 class WakeBodyKeepsItsCopy(unittest.TestCase):
     """_followup_body(wake=True): the wake's ask survives the hierarchical enumeration branch. The generic
     status ask invites an answer from memory — the audited session twice reassured from memory that its

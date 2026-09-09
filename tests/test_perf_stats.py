@@ -115,9 +115,11 @@ class Collector(unittest.TestCase):
         self.assertIn("cpu_ms_workers", snap["judge"])
         self.assertEqual(set(snap["goals"]), {"loads", "saves", "writes"}, "read through jd.goal_io_stats")
         # the three identity memos' readers land here (review find, 2026-09-08: they had no consumer)
-        self.assertEqual(set(snap["memos"]), {"pass", "shared", "chain", "nudgeGate"})
+        self.assertEqual(set(snap["memos"]), {"pass", "shared", "chain", "nudgeGate", "cleared"})
         self.assertEqual(snap["memos"]["nudgeGate"], {"served": 0, "derived": 0},
                          "the nudge walk's placement gate: served vs re-derived (2026-09-09)")
+        self.assertEqual(set(snap["memos"]["cleared"]), {"served", "derived"},
+                         "the clear set: parsed once per file state, served while it stands (2026-09-09)")
         self.assertEqual(snap["memos"]["pass"], km._goals_memo_report())
         self.assertEqual(snap["memos"]["shared"], km.jd.shared_store_stats())
         self.assertEqual(snap["memos"]["chain"], km.jd.chain_memo_stats())
