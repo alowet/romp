@@ -34570,6 +34570,37 @@ def _node_anchor_uuids(nd, seg_trig, seg_work):
     return (prompt, work)
 
 
+_WIRE_PROMPT_MAX = 400     # chars of the first non-empty line a bar carries; the tip shows at most 90 of them
+_ROMP_MARK_RE = re.compile(r"<!--\s*romp-[\s\S]*?-->")      # the view's stripRompMarks
+_ROMP_LABEL_RE = re.compile(r"^\s*\[romp\]\s*", re.I)       # the view's stripRompLabel: a LEADING label, newlines included
+
+
+def _collapse_repeat(s):
+    """The view's collapseRepeat, mirrored: a text that is nothing but one token repeated ("retry retry retry",
+    an auto-retry storm coalesced into one message) reads "retry ×3"; any variety leaves it untouched. Done
+    here so the count is taken over the WHOLE text before the wire cut below shortens it."""
+    toks = (s or "").split()
+    if len(toks) > 1 and all(t.lower() == toks[0].lower() for t in toks):
+        return "%s ×%d" % (toks[0], len(toks))
+    return s
+
+
+def _wire_prompt(text, cap=_WIRE_PROMPT_MAX):
+    """What a bar carries of its prompt on the wire (T278b): the FIRST non-empty line, after the view's own
+    three passes in the view's order (reqText in ui/romp-timeline-view.js): romp's `<!-- romp-… -->` marks
+    removed, a LEADING `[romp]` label removed (anchored at the text's start, so a label alone on line one
+    does not become the line the tip then strips to nothing), the repeat storm collapsed over the whole
+    text; then cut at `cap` characters with an ellipsis. The tip shows at most 90 characters of that line
+    and is the prompt's only reader; the full text is a click away, since the dot opens the chat at the
+    prompt. On the devbox the prompt field was 8.2 MB of a 20.4 MB bars frame, 40% of what every timeline
+    pane downloaded on connect."""
+    s = _collapse_repeat(_ROMP_LABEL_RE.sub("", _ROMP_MARK_RE.sub("", text or "")))
+    first = next((l for l in s.split("\n") if l.strip()), "").strip()
+    if len(first) > cap:
+        return first[:cap].rstrip() + "…"
+    return first
+
+
 def _seg_prompt(seg):
     """The segment's request text (its trigger/opener atom) for the prompt-dot tooltip."""
     trig = seg.get("trigger")
@@ -34640,12 +34671,16 @@ def _seg_mids(seg):
     return ids
 
 
-def _bind_message_execs(messages, turns):
+def _bind_message_execs(messages, turns, prompts=None):
     """Refine each connector's exec to the recipient's true PROCESS-START (when it picked the message
     up), not the log delivery time — which for a busy recipient is QUEUE/paste time, not when the work
     began. Exact id-join via the recipient segment's mids; else a text-heuristic (a segment soon after
     send whose prompt names the sender). Mutates messages. Ported from obsidian/romp-timeline-data.js —
-    the connector then honestly shows transit = sent → became-actionable."""
+    the connector then honestly shows transit = sent → became-actionable.
+    `prompts` is {bar id: the FULL prompt text} from the builder (T278b): a bar's `prompt` on the wire is
+    its first line, capped, and a postal delivery names its sender on a later line, so the heuristic reads
+    the full text where the builder has it; a lane served from the dead-lane memo carries its prompts in
+    the memo, so a lane that died within an hour of a message it received still binds on later builds."""
     idTurn = {}
     for sid, bars in turns.items():
         for bar in bars:
@@ -34662,7 +34697,7 @@ def _bind_message_execs(messages, turns):
         for bar in sorted(turns.get(m.get("toId"), []), key=lambda b: b["start"]):
             if bar["start"] > m["sent"] + MSG_MAX_LAG:
                 break                                       # sorted: nothing further can match
-            p = bar.get("prompt") or ""
+            p = (prompts or {}).get(bar.get("id")) or bar.get("prompt") or ""
             if bar["start"] >= m["sent"] - 5 and p and (m.get("fromOrig", "") in p or m.get("from", "") in p):
                 m["exec"], m["pending"] = bar["start"], False   # text-heuristic match → process-start
                 break
@@ -35387,6 +35422,7 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
         alive = [s for s in alive if not (s["sid"] in _dismissed_lanes and tmux.get(s["sid"]) is None)]
     id2name = {s["sid"]: s["name"] for s in alive}
     sessions, turns, semantic = [], {}, []   # `semantic`: artifact-derived marks (for gloss text); the band's marks are RUN spans, below
+    full_prompts = {}                        # bar id -> the whole prompt, for _bind_message_execs; the wire carries the first line (T278b)
     ctx_stops = cm.stops_for(_colormap())    # the GLOBAL colormap (the user 2026-06-26): color the per-lane context bar server-side
     # BRANCH LINEAGE on the timeline (the user 2026-08-14: a fork drawn like a git graph). branch_of
     # maps a forked lane to its durable forkedFrom — only while the PARENT's lane is in this build:
@@ -35492,6 +35528,7 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
         bars, last_t, seg_ends = [], None, {}            # seg_ends: seg-start t → work-END t (for completion marks)
         if lane_hit is not None:
             bars, last_t = cached["bars"], cached["last_t"]
+            full_prompts.update(cached.get("prompts") or {})   # the memoized lane's full prompts, for the binder (T278b)
         for ti, turn in enumerate(st_turns):
             turn_open = (live and ti == len(st_turns) - 1 and not turn["ended"]
                          and not any(x["type"] == "idle" for x in turn["atoms"])
@@ -35523,6 +35560,7 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
                 cap = _seg_work_caption(caps, seg["id"])       # WORK caption (the bar) — drift-safe
                 msg_cap = _seg_caption(caps, seg["id"])    # MESSAGE caption (the dot) — gist of the ask, ready early; drift-safe
                 work_uuid, reply_uuid = _seg_anchors(seg["atoms"])
+                full_prompts[seg["id"]] = full_prompt = _seg_prompt(seg)
                 trig = next((x for x in seg["atoms"] if x.get("uuid") == seg.get("trigger")), None)
                 author = (trig or {}).get("author")
                 src = "queued" if isinstance(author, dict) else "typed"
@@ -35535,9 +35573,15 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
                         "start": bstart, "end": bend,
                         "open": turn_open and si == len(segs) - 1 and sj == len(spans) - 1 and bend == seg["end"],
                         "cont": sj > 0,                   # a post-sleep continuation piece: NO new prompt dot (the one prompt was at the first piece)
-                        "prompt": _seg_prompt(seg), "summary": cap, "msgCaption": msg_cap,
+                        # the WIRE prompt (T278b): the first line, capped — the tip shows 90 chars of it and nothing
+                        # else reads it. Three fields that every bar carried were exact duplicates and are gone
+                        # from the wire: `tid` (the lane key this list sits under), `uuid` (= promptId) and
+                        # `workUuid` (= workId); the view reads the lane key, promptId and workId instead (workAnchorOf,
+                        # the dot and bar clicks, the focus anchor).
+                        # Measured on the devbox: 8,562 bars, prompts 8.2 MB and the three duplicates 1.2 MB of a
+                        # 20.4 MB frame that took 22 s to reach the laptop.
+                        "prompt": _wire_prompt(full_prompt), "summary": cap, "msgCaption": msg_cap,
                         "src": src, "mids": _seg_mids(seg), "pending": False,
-                        "tid": sid, "uuid": seg.get("trigger"),
                         "nudgeAuto": bool((trig or {}).get("rompAuto")),   # an AUTO-nudge specifically → the tip captions it 'romp · nudge'
                         # ANY romp-authored prompt (auto-nudge, Nudge button, auto-retry — author 'romp' via
                         # ROMP_INJECT_RE) wears the romp logo on its dot (the user 2026-07-16: an auto-retry
@@ -35545,7 +35589,7 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
                         # the 2026-07-05 rule already superseded 2026-06-23's auto-only logo: at the data level a
                         # retry and a nudge are both just romp-injected, and either way it wasn't the human typing.
                         "romp": bool(author == "romp"),
-                        "workUuid": work_uuid, "replyUuid": reply_uuid})
+                        "replyUuid": reply_uuid})
         if not with_bars and last_t is None:
             try:
                 last_t = os.stat(s["path"]).st_mtime     # lane `since` ≈ the transcript's last write (last activity), no parse
@@ -35577,7 +35621,10 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
             if lane_key is not None:
                 if len(_dead_lane_memo) > _DEAD_LANE_MEMO_MAX:      # bounded by the lane window; evict oldest-inserted
                     _dead_lane_memo.pop(next(iter(_dead_lane_memo)))
-                _dead_lane_memo[sid] = (lane_key, {"bars": bars, "compactions": compactions, "last_t": last_t, "marks": marks})
+                _dead_lane_memo[sid] = (lane_key, {"bars": bars, "compactions": compactions, "last_t": last_t, "marks": marks,
+                                                   # the lane's full prompts (T278b): the binder's sender heuristic reads
+                                                   # them, and a lane can die within an hour of a message it received
+                                                   "prompts": {b["id"]: full_prompts[b["id"]] for b in bars if b["id"] in full_prompts}})
                 # the parse has done its work for this dead lane: drop it (the RSS lever); a lane that moves
                 # re-parses once, and a session that revives is parsed by its chat build as before
                 _parse_cache.pop(s["path"], None)
@@ -35653,7 +35700,7 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
             # recipient can never read its mail; a dead-lane sender still draws its old arrows)
             messages = _postal_messages(now, set(id2name), id2name,
                                         {s for s in id2name if tmux.get(s) is not None})
-            _bind_message_execs(messages, turns)         # connector exec → the recipient's process-start (real transit)
+            _bind_message_execs(messages, turns, full_prompts)   # connector exec → the recipient's process-start (real transit)
             # mids STAY on the wire (2026-08-17): the merged-view dmid join (romp-timeline-view.js) re-binds
             # a relayed connector's exec to the recipient turn by bar mids — the 2026-07-07 payload-audit pop
             # ("no client ever read them") predated that 2026-08-06 feature and had silently starved it: the

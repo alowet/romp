@@ -234,8 +234,7 @@ class WedgedClientCannotStallTheSendLoop(unittest.TestCase):
             bars.append({"id": "t%d" % i, "promptId": "p%d" % i, "workId": "w%d" % i, "start": 1000 + 10 * i,
                          "end": 1005 + 10 * i, "open": False, "cont": False, "prompt": "invented prompt %d" % i,
                          "summary": "invented work caption %d" % i, "msgCaption": "gist %d" % i, "src": "typed",
-                         "mids": [], "pending": False, "tid": sid, "uuid": "u%d" % i, "nudgeAuto": False,
-                         "romp": False, "workUuid": "w%d" % i, "replyUuid": "r%d" % i})
+                         "mids": [], "pending": False, "nudgeAuto": False, "romp": False, "replyUuid": "r%d" % i})
             i += 1
         return {"type": "bars", "turns": {sid: bars}, "judging": [], "messages": [], "now": 2000, "warming": False}
 

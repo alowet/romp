@@ -560,7 +560,7 @@ function dragAxis(dx, dy, threshold) {
 // usually a thinking block), then workUuid (first reply line), then the boundary
 // uuid (an interrupted period has no reply at all). Shared by the focus handler
 // and the work-bar click so the two landings can never drift apart again.
-function workAnchorOf(t) { return (t && (t.replyUuid || t.workUuid || t.uuid)) || null; }
+function workAnchorOf(t) { return (t && (t.replyUuid || t.workId || t.promptId)) || null; }   // T278b: workId/promptId ARE the work/prompt uuids; the wire no longer repeats them as workUuid/uuid
 
 // Which ATOM of a turn a highlight set covers — `hit(id)` = membership in the active DAG-journey
 // ∪ hover set. A turn renders two glyphs: the prompt DOT and the work-period BAR. The DOT lights
@@ -1571,7 +1571,7 @@ class TimelinePanel {
   _laneTid(s) {
     const turns = (this.data && this.data.turns && this.data.turns[s.id]) || [];
     const t = turns.length ? turns[turns.length - 1] : null;
-    return (t && t.tid) || s.id;
+    return s.id;   // T278b: a bar carries no tid on the wire; the lane key is the session it belongs to
   }
   openSelected(preserveFocus) {
     const s = (this._vis || []).find((x) => x.id === this.selectedSid);
@@ -2215,13 +2215,13 @@ class TimelinePanel {
     this._scheduleDraw();
   }
 
-  // resolve the chat's active tab {tid,name} to a lane sid: precise by transcript id (a lane's turn
-  // carries that tid), else by name. null if no lane matches.
+  // resolve the chat's active tab {tid,name} to a lane sid: precise by transcript id (the lane IS keyed by
+  // it; bars carry no tid of their own since T278b), else by name. null if no lane matches.
   _sidForActiveChat(ac) {
     if (!ac || !this.data || !this.data.sessions) return null;
     const turns = this.data.turns || {};
     if (ac.tid) {
-      for (const s of this.data.sessions) { if ((turns[s.id] || []).some((t) => t.tid === ac.tid)) return s.id; }
+      if (this.data.sessions.some((s) => s.id === ac.tid)) return ac.tid;
     }
     if (ac.name) { const s = this.data.sessions.find((x) => x.name === ac.name); if (s) return s.id; }
     return null;
@@ -2394,13 +2394,9 @@ class TimelinePanel {
   // scroll its lane into view, and pulse a ring at (time, lane).
   // Resolve the focus `sid` (update_feed writes the event's transcript fsid) to the lane that actually
   // draws it. Usually fsid === the lane's romp SID; but a FORKED session is merged into ONE lane keyed
-  // by the root SID, with the fork's fsid surfacing as a turn's `tid` — so fall back to a tid match.
+  // by the root SID (bars carry no tid of their own since T278b: the lane key is the session).
   _laneForFocusSid(sid) {
-    if (!sid || !this.data || !this.data.sessions) return sid;
-    if (this.data.sessions.some((s) => s.id === sid)) return sid;            // direct lane id
-    const turns = this.data.turns || {};
-    for (const s of this.data.sessions) { if ((turns[s.id] || []).some((t) => t.tid === sid)) return s.id; }  // fork fsid → merged lane
-    return sid;
+    return sid;   // the lane IS the session id: bars never carried a tid other than their lane key (T278b dropped the field)
   }
   // Exact event id-join (the canonical key — romp-events `e.id` == the feed itemId, now on each turn):
   // find the turn whose id matches and return its lane + exact start. Beats sid+t (no time drift, and
@@ -2409,7 +2405,7 @@ class TimelinePanel {
     if (!id || !this.data || !this.data.sessions) return null;
     const turns = this.data.turns || {};
     for (const s of this.data.sessions) {
-      for (const t of (turns[s.id] || [])) { if (t.id === id) return { sid: s.id, t: t.start, end: t.end, tid: t.tid, uuid: t.uuid, workUuid: t.workUuid, replyUuid: t.replyUuid, src: t.src }; }
+      for (const t of (turns[s.id] || [])) { if (t.id === id) return { sid: s.id, t: t.start, end: t.end, promptId: t.promptId, workId: t.workId, replyUuid: t.replyUuid, src: t.src }; }   // bar-shaped keys: workAnchorOf reads them
     }
     return null;
   }
@@ -2559,10 +2555,10 @@ class TimelinePanel {
     // prompt opens its prompt line (uuid). anchorT (the turn/event time) rides along belt-and-braces so
     // the chat scrolls by time if the uuid anchor misses. On a _focusTargetById MISS (event outside the
     // loaded window) we STILL open the lane by time (anchorT=f.t) rather than silently doing nothing.
-    if (byId && byId.tid) {
-      const a = onWork ? workAnchorOf(byId) : byId.uuid;
+    if (byId) {
+      const a = onWork ? workAnchorOf(byId) : byId.promptId;
       // !onWork = we resolved to the boundary uuid = PROMPT-intent → anchorKind=user (kind-safe fallback)
-      this.openChat(byId.tid, a, false, false, byId.t, onWork ? undefined : 'user');
+      this.openChat(byId.sid, a, false, false, byId.t, onWork ? undefined : 'user');
     } else if (sid && f.t != null) {
       const lane = this.data.sessions.find((x) => x.id === sid);
       // byId missed → pure time fallback; a 'prompt'-anchored focus is still prompt-intent
@@ -4932,7 +4928,7 @@ class TimelinePanel {
       const d = (t >= x.start && t <= x.end) ? 0 : Math.min(Math.abs(t - x.start), Math.abs(t - x.end));
       if (d < bestd) { bestd = d; best = x; }
     }
-    return best;   // {tid,uuid,...} or null → openChat no-ops on a null anchor
+    return best;   // a bar {id,promptId,replyUuid,...} or null → openChat no-ops on a null anchor
   }
 
   draw() {
@@ -5303,7 +5299,7 @@ class TimelinePanel {
         // period's start as the by-time fallback. This was a bare lane-open with NO anchor, so every
         // work-bar click visibly did nothing while prompt-dot clicks worked (the user, 2026-06-12).
         // The prompt dot keeps the prompt-line uuid.
-        hit.addEventListener('click', () => { this._select(s.id); this.openChat(t.tid || this._laneTid(s), workAnchorOf(t), false, false, t.start); });
+        hit.addEventListener('click', () => { this._select(s.id); this.openChat(s.id, workAnchorOf(t), false, false, t.start); });
         plot.appendChild(hit);
         if (liveEdge) riders.push({ el: bar, attr: 'width', base: bwRaw, min: 2 }, { el: hit, attr: 'width', base: bwRaw, min: 2 });   // the un-clamped extent with the 2 px floor: a just-opened bar grows as a full draw would draw it
       });
@@ -5772,7 +5768,7 @@ class TimelinePanel {
     // user 2026-08-24). A nameless row falls back to the raw id: information, not an empty span
     // (the CLI's unmappable-member precedent).
     const msgHtml = (mm) => () => { const col = colorOf(mm.fromId); return '<div class="r"><span class="chip" style="background:' + col + '"></span><span class="who" style="color:' + col + '">' + esc(mm.from || mm.fromId) + '</span><span class="ar">→</span><span class="who" style="color:' + colorOf(mm.toId) + '">' + esc(mm.to || mm.toId) + '</span>' + (mm.pending ? ' <span class="k">pending</span>' : '') + '<span class="t">' + clock(mm.sent) + (mm.pending ? ' → …' : ' → ' + clock(mm.exec)) + '</span></div>' + this.body(esc(mm.summary || mm.text || '')); };
-    const msgNav = (mm) => () => { const an = this.nearestTurnAnchor(mm.toId, execAt(mm)); this._select(mm.toId); this.openChat((an && an.tid) || mm.toId, mm.id || (an && (an.uuid || an.replyUuid)), false, false, execAt(mm)); };   // land on the message's OWN postal card BY ID — the chat matches mm.id to the card's data-mid (the user 2026-06-20); nearest-turn uuid / time only as fallback
+    const msgNav = (mm) => () => { const an = this.nearestTurnAnchor(mm.toId, execAt(mm)); this._select(mm.toId); this.openChat(mm.toId, mm.id || (an && (an.promptId || an.replyUuid)), false, false, execAt(mm)); };   // land on the message's OWN postal card BY ID — the chat matches mm.id to the card's data-mid (the user 2026-06-20); nearest-turn uuid / time only as fallback
     // OVERLAP HOVER (the user 2026-08-24): message marks stack — several exchanges on one pair, a
     // stub riding another's track — and the topmost hit swallowed the hover, so the modal named ONE
     // message where the cursor covered several. Resolve every message element under the point
@@ -6026,7 +6022,7 @@ class TimelinePanel {
           : isRomp
           ? () => '<div class="r"><img src="' + mediaUrl('romp-swirl-glyph.svg') + '" width="13" height="13" style="vertical-align:-2px;margin-right:5px;border-radius:2px"><span class="who" style="color:#fff">romp</span><span class="t">' + clock(startAt(t)) + '</span></div>' + this.body(this.req(t))
           : () => '<div class="r"><span class="chip" style="background:' + s.color + '"></span><span class="who" style="color:' + s.color + '">' + esc(s.name) + '</span><span class="t">' + clock(startAt(t)) + '</span></div>' + this.body(this.req(t));
-        dot(dx, y, isRomp ? '#000' : s.color, tip, () => { this._select(s.id); this.openChat(t.tid || s.id, t.uuid, false, false, startAt(t), 'user'); }, null, dotLit(t, dagOrHover));   // romp message → a black dot (the swirl reads on it); prompt-intent → time fallback restricted to user turns
+        dot(dx, y, isRomp ? '#000' : s.color, tip, () => { this._select(s.id); this.openChat(s.id, t.promptId, false, false, startAt(t), 'user'); }, null, dotLit(t, dagOrHover));   // romp message → a black dot (the swirl reads on it); prompt-intent → time fallback restricted to user turns
         if (isRomp) {                                    // the romp favicon swirl INSIDE the black dot; pointer-events:none → the dot keeps its hover/click
           const sz = DOT_R * 1.9;
           nearEdge(plot.appendChild(el('image', { x: dx - sz / 2, y: y - sz / 2, width: sz, height: sz, href: mediaUrl('romp-swirl-glyph.svg'), 'pointer-events': 'none' })), dx);
