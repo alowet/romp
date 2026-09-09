@@ -411,7 +411,10 @@ output, cache writes, and cache reads. Cache reads are most of it: every API
 call within a turn (one per tool step) re-reads the whole context from the
 cache, so a long session's single turn can read tens of millions of tokens at
 a tenth of the input price. The hover splits each window's count by kind, so
-the size of the number carries its explanation.
+the size of the number carries its explanation. A result that carries no
+per-model usage map is counted from the main loop alone, and the error center
+says so once: once per session when the CLI left the map out, once per kernel
+run when the Agent SDK the kernel imported has no field for it.
 
 ### Self-scheduled work wakes an idle session
 
