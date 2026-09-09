@@ -3210,6 +3210,30 @@ ENV_RESERVED_NAMES = ("ROMP_SID", "ROMP_SESSION_NAME")
 AUTH_ENV_NAMES = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
 
 
+def env_credential_names(environ) -> list:
+    """Credential-shaped variable names in `environ` that reach every session's CLI and its tool shells.
+
+    The SDK transport merges this process's environment under options.env and hands the whole thing to
+    the CLI, and romp holds no key of its own (credentials.py, 2026-09-08): the login tokens
+    startup_auth_env claims are the only names it takes out of its environment, and the retired provider
+    names stop the kernel at boot (credentials.check_boot_environment) before a backend exists. So any
+    name of a credential's shape still in the kernel's environment when a backend is built is inherited
+    by every session and every shell it spawns. The shape is two suffixes, _API_KEY and _TOKEN, plus
+    1Password's own names exactly as credentials.py draws them (is_op_env_name: the service-account and
+    Connect tokens, the account and host beside them, and OP_SESSION_<account>, which `op signin` exports
+    and which ends in neither suffix; the boot check refuses those names too, so the boot line and the
+    boot check agree on what an op name is). A name of another shape stays unnamed, and the boot line
+    says what shape it checked. Returns the names, sorted, for a one-line boot notice; values are tested
+    for emptiness only and never logged. The one exclusion is romp's own control token, which is not a
+    provider credential; no name the claim removes is excluded here, so a login token still present when
+    this runs did reach sessions and is named, and the call's place after the claim is what keeps it off
+    the line.
+    """
+    return sorted(n for n in environ
+                  if n != "ROMP_SERVE_TOKEN" and (environ.get(n) or "").strip()
+                  and (n.endswith("_API_KEY") or n.endswith("_TOKEN") or _cred.is_op_env_name(n)))
+
+
 def env_request_error(env, auth: str = "") -> str:
     """Why `env` is NOT a valid per-session env payload — "" when it is (an empty dict is a valid,
     vacuous one). A payload is a dict of NAME → string-value pairs, names in the shell-identifier
@@ -3458,6 +3482,7 @@ def _cli_refusal(e: BaseException) -> bool:
             and not str(e).startswith("Control request timeout"))
 
 
+_ENV_CRED_NAMES_SAID = False    # the boot line naming credential-shaped env names that reach sessions, once per process
 _STARTUP_AUTH_ENV: dict | None = None
 _WORK_AUTH_LOCK = threading.RLock()
 
@@ -7337,6 +7362,8 @@ class SdkBackend:
         self._problems: list[dict] = []
         self._problem_seq = 0
         self._problem_lock = threading.Lock()
+        self._note_env_credential_names()   # name what the kernel's environment leaks into every session, once;
+        #                                     after startup_auth_env's claim above, so it names what sessions inherit
         # The /api-health aggregator (one ring, one lock; see ApiHealth). Fed from _on_message on each
         # session's thread, read by the kernel's route; the salt is minted lazily at the first label.
         self.api_health = ApiHealth(self.state_dir, log=self._log)
@@ -7453,6 +7480,31 @@ class SdkBackend:
         reports where such a session landed. A settings file that cannot be read is a problem row, once, and
         reads as no helper here until it reads; the launch-side fall asks key_state, where it is cannot-tell."""
         return self.key_state() == "ok"
+
+    def _note_env_credential_names(self) -> None:
+        """Say ONCE, at boot, which credential-shaped names in the kernel's own environment reach every
+        session's CLI and its tool shells (env_credential_names): the transport hands the CLI this
+        process's environment, and romp takes only the login tokens out of it (startup_auth_env); the
+        retired provider names and 1Password's never get this far, credentials.check_boot_environment stops
+        the kernel on them. Runs AFTER startup_auth_env has claimed the tokens, so what is named is what a
+        session actually inherits: the helper excludes no name the claim removes, so the order is what keeps
+        a login token off the line. An informational line, not a problem: an installation may put a second
+        provider's key there on purpose. Filed with problem=False explicitly, because _log's default
+        classifies a line by whether an exception is being handled at the moment, and a boot that happens
+        on a handler's retry path must not turn this line into a problem row. Names only, no value logged;
+        the copy says what shape was checked; nothing said on a box whose environment carries none."""
+        global _ENV_CRED_NAMES_SAID
+        if _ENV_CRED_NAMES_SAID:
+            return
+        names = env_credential_names(os.environ)
+        if not names:
+            return
+        _ENV_CRED_NAMES_SAID = True
+        self._log("names in the kernel's own environment shaped like credentials (ending _API_KEY or _TOKEN, "
+                  "or 1Password's own OP_* names) reach every session's CLI and the shells it spawns (the SDK "
+                  "hands the CLI this process's environment): %s. Values are never logged; names of another "
+                  "shape are not checked. Move any that a session should not see out of the manager's "
+                  "environment (its service.env or service unit)." % ", ".join(names), problem=False)
 
     def _note_seed_skipped(self, side: str = "key") -> None:
         """Said ONCE per process and side, as a problem row: the remembered Billing default names a side this
