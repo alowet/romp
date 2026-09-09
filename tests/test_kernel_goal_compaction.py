@@ -300,8 +300,13 @@ class ClearedLedgerIsAuthoritativeAcrossTheCompaction(unittest.TestCase):
                          "the foreign clear rides; the local one and the undone one do not")
         src = open(os.path.join(BIN, "romp-kernel")).read()
         self.assertIn('"clearedForeign": _cleared_foreign(cleared),', src, "on the feed payload beside dismissedCount")
-        many = {"%s:g%d" % (foreign_sid, i): i for i in range(700)}
-        self.assertEqual(len(km._cleared_foreign(many)), 500, "capped")
+        many = {"%s:g%d" % (foreign_sid, i): 1_000_000 + i for i in range(700)}
+        got = km._cleared_foreign(many)
+        self.assertEqual(len(got), 500, "capped")
+        self.assertEqual(got[0], "%s:g699" % foreign_sid, "newest first under the cap (T287: yesterday's clears must ride)")
+        self.assertNotIn("%s:g0" % foreign_sid, got, "the oldest fall off, not the newest")
+        junk = {"g448": 5, "g7": 6, foreign_sid + ":g1": 7}
+        self.assertEqual(km._cleared_foreign(junk), [foreign_sid + ":g1"], "a bare node id with no session rides nowhere")
 
     def test_the_compaction_stamps_a_root_only_the_ledger_clears(self):
         self._completed_top("g4")

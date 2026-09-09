@@ -78,7 +78,8 @@ const KERNEL_SETTING = new Set(["setAutoNudge", "setJudgeModel", "setIndexModel"
                                 "setJudgeConcurrency",   // T277: the judges' pool width, one value across machines
                                 "setDistillModel", "setDistillEffort", "setFileEditing",
                                 "setCompactSuggest",
-                                "setCommentModel", "setCommentEffort", "setCommentFast"]);
+                                "setCommentModel", "setCommentEffort", "setCommentFast",
+                                "setTmuxBackend"]);   // T288: the tmux backend's offer, one value across machines
 
 /** Return a COPY of an inbound message with every session-id field prefixed by `host`. The local host
  *  ("") is the identity transform, so local messages are untouched. Unknown fields pass through. */
@@ -260,6 +261,13 @@ export interface Route {
  *  name, which inbound prefixing made `host:name`) route to a KNOWN host only — a local name that happens
  *  to contain ":" must never misroute — and messages with no sid that mean the same thing on every kernel
  *  (a hover CLEAR, the gear's kernel-side settings) fan out to all of them. */
+/** `id` without `host`'s own prefix when it carries it ("host:rest" → "rest"), else unchanged: the strip a remote
+ *  route applies to what it sends, so an id that never had the prefix (a card id "sid:gN") keeps every part. The
+ *  first-colon cut (bareId) is right only for ids KNOWN to be prefixed, and an outbound message mixes both. */
+export function stripHost(host: string, id: string): string {
+  return host && typeof id === "string" && id.startsWith(host + ":") ? id.slice(host.length + 1) : id;
+}
+
 export function routeOutbound(msg: any, knownHosts?: ReadonlySet<string>): Route[] {
   if (!msg || typeof msg !== "object") return [{ host: LOCAL, msg }];
 
@@ -326,9 +334,13 @@ export function routeOutbound(msg: any, knownHosts?: ReadonlySet<string>): Route
   }
   if (host !== LOCAL) {
     const out: any = { ...msg };
-    for (const k of SCALAR_ID) if (typeof out[k] === "string") out[k] = bareId(out[k]);
-    // a batched clear (askClearMany) carries the session's card ids too — the remote kernel wants them bare
-    if (Array.isArray(out.itemIds)) out.itemIds = out.itemIds.map((x: any) => typeof x === "string" ? bareId(x) : x);
+    for (const k of SCALAR_ID) if (typeof out[k] === "string") out[k] = stripHost(host, out[k]);
+    // a batched clear (askClearMany) carries the session's card ids too — the remote kernel wants them without
+    // the host prefix. ONLY the host prefix (T287, the user 2026-09-09): a card id is "sid:gN" and prefixInbound
+    // prefixes the ask's sid, not its item ids, so the first-colon cut bareId makes turned "sid:g448" into
+    // "g448"; the owning kernel then recorded a node id with no session, cleared nothing, and the cards the
+    // laptop's session-header Clear all had crossed off came back with the next payload and every restart.
+    if (Array.isArray(out.itemIds)) out.itemIds = out.itemIds.map((x: any) => typeof x === "string" ? stripHost(host, x) : x);
     return [{ host, msg: out }];
   }
 
@@ -391,17 +403,21 @@ export function mergeHostOrder(perHost: Record<string, readonly string[]>, hostS
 export function applyViewerClears(merged: any, ledgers: any[], clearedForeign: any): void {
   const foreign = new Set<string>(Array.isArray(clearedForeign) ? clearedForeign.filter((x: any) => typeof x === "string") : []);
   if (!foreign.size) return;
-  const hit = (id: any) => typeof id === "string" && hostOf(id) !== LOCAL && foreign.has(bareId(id));
-  merged.asks = merged.asks.filter((a: any) => !hit(a?.itemId));
-  merged.items = merged.items.filter((c: any) => !hit(c?.itemId));
+  // Remoteness is the ROW's sid (prefixInbound prefixes it: "host:sid"); the item and node ids are unprefixed
+  // ("sid:gN") and compare as they are against the bare foreign ids (T287: reading the id's own first colon as
+  // a host took the uuid for a host and compared "gN", so nothing ever matched).
+  const remote = (sid: any) => typeof sid === "string" && hostOf(sid) !== LOCAL;
+  const hit = (sid: any, id: any) => remote(sid) && typeof id === "string" && foreign.has(id);
+  merged.asks = merged.asks.filter((a: any) => !hit(a?.sid, a?.itemId));
+  merged.items = merged.items.filter((c: any) => !hit(c?.sid, c?.itemId));
   ledgers.forEach((l: any, i: number) => {
-    if (!l || typeof l.sid !== "string" || hostOf(l.sid) === LOCAL) return;
+    if (!l || !remote(l.sid)) return;
     const tops = l.ledger?.archivedTops;
     if (!Array.isArray(tops) || !tops.length) return;
     let rootCleared = false, changed = false;
     const out = tops.map((n: any) => {
-      if (n?.depth === 0) rootCleared = !!n.cleared || hit(n.id);
-      const c = !!n?.cleared || hit(n?.id) || (n?.depth !== 0 && rootCleared);
+      if (n?.depth === 0) rootCleared = !!n.cleared || (typeof n.id === "string" && foreign.has(n.id));
+      const c = !!n?.cleared || (typeof n?.id === "string" && foreign.has(n.id)) || (n?.depth !== 0 && rootCleared);
       if (c === !!n?.cleared) return n;
       changed = true;
       return { ...n, cleared: c };

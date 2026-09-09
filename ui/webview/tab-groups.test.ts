@@ -297,7 +297,7 @@ test("the picker's Tags row is for SDK and Codex sessions: disabled behind a not
   assert.match(sync, /wrap\.classList\.toggle\("disabled", !takes\);/);
   assert.match(sync, /\.forEach\(\(b\) => \{ b\.disabled = !takes; \}\);/);
   assert.match(sync, /note\.style\.display = takes \? "none" : "";/);
-  assert.match(RENDER, /tgNote\.textContent = "Tags apply to SDK and Codex sessions";/);
+  assert.match(RENDER, /tgNote\.textContent = `Tags apply to \$\{backendLabel\("sdk"\)\} and \$\{backendLabel\("codex"\)\} sessions`;/, "the shared names (T288)");
   assert.match(RENDER, /beWrap\.addEventListener\("click", \(\) => \{ syncPickerAuth\(\); syncPickerTags\(\); \}\);/, "re-decided on every backend toggle");
   assert.match(RENDER, /syncPickerTags\(\);\s+\/\/ the backend toggle was just reset/, "…and on every open, after the backend reset");
   assert.match(RENDER, /const tags = backendTakesTags\(backend\)\s*\n\s*\? Array\.from\(tgWrap\.querySelectorAll<HTMLElement>\("\.picker-be-opt\.sel"\)\)/,

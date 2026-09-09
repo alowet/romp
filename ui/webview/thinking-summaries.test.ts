@@ -48,7 +48,7 @@ test("the gear has a Thinking summaries checkbox among the kernel-side toggles, 
     "…between Conserve memory and File editing, with the other kernel-side toggles");
   const row = GEAR.slice(at, at + 1200);
   assert.match(row, /<b>Thinking summaries<\/b>/);
-  assert.ok(/new SDK session/.test(row) && /running session picks the change up at its next reconnect/.test(row),
+  assert.ok(/new Claude Code session/.test(row) && /running session picks the change up at its next reconnect/.test(row),   // the backend's name since T288
     "the sub-copy is honest that a running session is not switched live");
   // …and names the events that actually reconnect one (sdk_backend's request_reconnect callers), never a
   // model switch: set_model applies live over the SDK control channel and reconnects nothing, so copy that

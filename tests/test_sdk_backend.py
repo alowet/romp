@@ -2976,10 +2976,9 @@ class SpendRecord(unittest.TestCase):
         self.assertIn('"spend": _spend_windows()', ksrc)
         self.assertIn("def _spend_windows(keyed_only=False):", ksrc)   # keyed_only: the mixed-host API sum (test_session_auth)
 
-    def _spend_session(self):
+    def _spend_session(self, sid="11111111-2222-3333-4444-bbbbbbbbbbbb", name="n"):
         import asyncio
-        sid = "11111111-2222-3333-4444-bbbbbbbbbbbb"
-        s = sb.SdkSession(self.be, {"sid": sid, "name": "n", "cwd": "/tmp"})
+        s = sb.SdkSession(self.be, {"sid": sid, "name": name, "cwd": "/tmp"})
         self.be._forward = lambda sess, msg: None
         self.be._turn_completed = lambda sid: None
         async def _noop(): pass
@@ -3091,6 +3090,118 @@ class SpendRecord(unittest.TestCase):
         self.assertEqual(day()["tokIn"], 300, "a turn smaller than the last folds whole too — there is no watermark on a per-turn figure")
         self.assertAlmostEqual(day()["usd"], 3.0, msg="the dollars stay a delta of their running total")
         self.assertEqual(s._last_usage_totals, {}, "the per-turn dict leaves the modelUsage watermarks untouched")
+
+    def test_a_paid_result_without_model_usage_says_so_once_per_session(self):
+        """The fallback above was SILENT: a paid result with no modelUsage map recorded the flat dict and
+        the day's token columns became main-loop-only figures with nothing in the error center saying
+        so. The field is present here (None, then an empty map), so the SDK has it and the CLI sent
+        nothing on this result: that is THIS session's CLI's doing, so the line names the session and
+        is said once per session, not once per turn. The count itself is unchanged."""
+        s, run, day = self._spend_session(name="web")
+        def _result(total, turn_in, mu):
+            r = _ResultMessage()
+            r.total_cost_usd = total
+            r.usage = {"input_tokens": turn_in, "output_tokens": 20}
+            r.model_usage = mu                    # the attribute exists: a current SDK, a CLI that sent no map
+            return r
+        run(_result(1.0, 100, None))
+        run(_result(2.0, 140, {}))
+        self.assertEqual(day()["tokIn"], 240, "each per-turn figure still lands whole")
+        self.assertAlmostEqual(day()["usd"], 2.0)
+        probs = [p["text"] for p in self.be.problems()]
+        self.assertEqual(len(probs), 1, "one line per session, not one per turn: %r" % probs)
+        self.assertIn("no modelUsage", probs[0])
+        self.assertIn("spend (web)", probs[0], "the CLI cause is this session's, so the line names it")
+        self.assertNotIn("model_usage field", probs[0], "the SDK remedy is not given for a CLI omission")
+        self.assertTrue(s._usage_fallback_noted)
+        self.assertFalse(self.be._usage_fallback_sdk_noted, "the CLI cause never spends the SDK cause's flag")
+        run(_result(3.0, 50, self._model_map(5000)))     # the map is back: the count diffs it, nothing new to say
+        self.assertEqual(day()["tokIn"], 5240)
+        self.assertEqual(len(self.be.problems()), 1)
+        # the scope is the session, not the backend: another session's CLI omission is said for that session
+        api, run_api, _ = self._spend_session("11111111-2222-3333-4444-aaaaaaaaaaaa", name="api")
+        run_api(_result(1.0, 10, None))
+        probs = [p["text"] for p in self.be.problems()]
+        self.assertEqual(len(probs), 2, "a second session says it once for itself: %r" % probs)
+        self.assertIn("spend (api)", probs[1])
+        self.assertTrue(api._usage_fallback_noted)
+        self.assertEqual(day()["tokIn"], 5250)
+
+    def test_a_log_callback_that_raises_on_the_notice_never_costs_the_turn_its_count(self):
+        """The notice is said from inside the token count, ahead of the spend write and after the cost
+        watermark moved: a log callback that raised there would propagate out of _turn_usage and the
+        turn's dollars and tokens would go unrecorded for the sake of a line. The line is not worth the
+        count. The ring row has landed by the time the callback runs, so the raise is swallowed and the
+        count proceeds; the settle's own containment never has to hear of it."""
+        s, run, day = self._spend_session(name="web")
+        def badlog(m):
+            if "no modelUsage" in str(m):
+                raise OSError(32, "Broken pipe")
+        self.be._log_cb = badlog                  # armed after construction (construction logs too)
+        r = _ResultMessage()
+        r.total_cost_usd = 1.0
+        r.usage = {"input_tokens": 100, "output_tokens": 20}
+        r.model_usage = None
+        run(r)
+        self.assertEqual(day()["tokIn"], 100, "the count landed although the notice's callback raised")
+        self.assertAlmostEqual(day()["usd"], 1.0)
+        probs = [p["text"] for p in self.be.problems()]
+        self.assertEqual(len(probs), 1, "the ring row landed before the callback raised: %r" % probs)
+        self.assertIn("spend (web)", probs[0])
+        self.assertTrue(s._usage_fallback_noted)
+
+    def test_an_sdk_whose_result_message_lacks_the_field_is_said_once_per_kernel_life(self):
+        """A ResultMessage with no model_usage ATTRIBUTE at all is the imported SDK's doing: the current
+        claude-agent-sdk declares the field (None when the CLI sends nothing), so a result without it
+        means the kernel imported an older copy found on sys.path ahead of the dedicated venv's. One
+        fact for every session this kernel runs, so the line names no session, names the remedy, and is
+        said once per backend: two sessions and three paid turns produce one line, and a fresh
+        SdkSession for a sid already seen (a dormant revive) adds nothing. The line names the copy by
+        path (the remedy is then a path, not a search), read off the imported module: a stand-in module
+        supplies one here, since this test interpreter has no SDK of its own."""
+        import sys
+        import types
+        fake = types.ModuleType("claude_agent_sdk")
+        fake.__file__ = "/synthetic/site-packages/claude_agent_sdk/__init__.py"
+        saved = sys.modules.get("claude_agent_sdk")
+        sys.modules["claude_agent_sdk"] = fake
+        def restore():
+            if saved is None:
+                sys.modules.pop("claude_agent_sdk", None)
+            else:
+                sys.modules["claude_agent_sdk"] = saved
+        self.addCleanup(restore)
+        web, run_web, day = self._spend_session("11111111-2222-3333-4444-aaaaaaaaaaaa", name="web")
+        api, run_api, _ = self._spend_session("11111111-2222-3333-4444-bbbbbbbbbbbb", name="api")
+        def _result(total):
+            r = _ResultMessage()                  # no model_usage attribute at all
+            r.total_cost_usd = total
+            r.usage = {"input_tokens": 100, "output_tokens": 20}
+            return r
+        r0 = _result(0)                           # a zero-cost result never reaches the token count (total > 0)
+        run_web(r0)
+        self.assertEqual(self.be.problems(), [])
+        run_web(_result(1.0))
+        run_api(_result(1.0))
+        run_web(_result(2.0))
+        self.assertEqual(day()["tokIn"], 300, "every turn's tokens still land, counted whole")
+        probs = [p["text"] for p in self.be.problems()]
+        self.assertEqual(len(probs), 1, "one line for one host-level remedy: %r" % probs)
+        self.assertIn("model_usage field", probs[0])
+        self.assertIn("romp-sdk-setup", probs[0], "the remedy names the venv the kernel should be importing from")
+        self.assertIn(fake.__file__, probs[0], "the line names the copy the kernel imported, by path")
+        self.assertTrue(probs[0].startswith("spend: "), "a host-level line names no session: %r" % probs[0])
+        self.assertNotIn("spend (web)", probs[0])
+        self.assertNotIn("spend (api)", probs[0])
+        self.assertTrue(self.be._usage_fallback_sdk_noted)
+        self.assertFalse(web._usage_fallback_noted, "the per-session flag is the CLI cause's, untouched")
+        self.assertFalse(api._usage_fallback_noted)
+        again, run_again, _ = self._spend_session("11111111-2222-3333-4444-aaaaaaaaaaaa", name="web")
+        run_again(_result(1.0))
+        self.assertEqual(len(self.be.problems()), 1, "a revive of a seen sid adds nothing")
+        self.assertEqual(day()["tokIn"], 400)
+        sys.modules.pop("claude_agent_sdk")       # no SDK loaded at all: the line still reads, and says so
+        self.assertIn("(an unknown path)", sb.usage_fallback_notice("web", _result(1.0)))
 
     def test_the_keyed_sub_count_carries_the_by_kind_split(self):
         # the hover splits each window's tokens by kind; a mixed host's API readout sums ONLY the keyed

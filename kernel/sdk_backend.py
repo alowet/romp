@@ -2477,6 +2477,37 @@ def sdk_importable() -> bool:
         return False
 
 
+def usage_fallback_is_sdk(msg) -> bool:
+    """A paid result carried no modelUsage map (SdkSession._turn_usage read the flat `usage` dict instead): is
+    that the imported SDK's doing? The current claude-agent-sdk declares `model_usage` as a field of
+    ResultMessage, None when the CLI sends no map, so a result with no such ATTRIBUTE at all came from
+    an older copy of the SDK, whichever one the kernel's interpreter imported: a copy found on sys.path
+    ahead of the dedicated venv's (kernel._ensure_sdk_on_path takes an importable copy first), or the
+    venv's own, as old as its last bin/romp-sdk-setup run. That is a fact about the host, the same for
+    every session this kernel runs; a field that is there but empty is this session's CLI's doing on
+    this result."""
+    return not hasattr(msg, "model_usage")
+
+
+def usage_fallback_notice(name, msg) -> str:
+    """The problem line for a paid result with no modelUsage map, by the cause usage_fallback_is_sdk
+    tells apart. The SDK cause names no session (it holds for all of them) and names the copy the
+    kernel imported, so the remedy is a path and not a search; the CLI cause names the session. Either
+    way the reader learns what the token columns now count and that the dollars are unaffected: the
+    flat dict is the main loop's own per-turn total, so what subagents and sidechains spent is not in
+    it, while total_cost_usd stays the process total."""
+    if usage_fallback_is_sdk(msg):
+        where = getattr(sys.modules.get("claude_agent_sdk"), "__file__", None) or "an unknown path"
+        return ("spend: every session's token columns count the main loop alone from here on (no subagent or "
+                "sidechain tokens; the dollars are unaffected). Cause: the claude-agent-sdk the kernel imported "
+                "(%s) has no model_usage field on ResultMessage, so the CLI's modelUsage map never reaches the "
+                "kernel. Run bin/romp-sdk-setup to install a current one, or remove a copy that shadows the "
+                "venv's, then restart romp." % where)
+    return ("spend (%s): a paid turn's tokens were recorded from the main loop alone (no subagent or sidechain "
+            "tokens; the dollars are unaffected): the CLI emitted no modelUsage on the result. Said once per "
+            "session." % name)
+
+
 # What the SDK puts on ProcessError.stderr when NOBODY registered an options.stderr callback: it does
 # not pipe the child's stderr at all, and substitutes this literal (subprocess_cli.py). Surfacing it is
 # worse than useless — it tells the user to go read an output romp never captured, and it outranked the
@@ -3775,6 +3806,9 @@ class SdkSession:
         #   total when the deltas were written (`usage: this.totalUsage`) and is the TURN's own total
         #   on the current CLI — diffing it under-counted every turn but the first (the user
         #   2026-09-06). Which counter is which, and the measurement: _turn_usage.
+        self._usage_fallback_noted = False  # the once-per-session line for a paid result whose modelUsage map
+        #   is there but empty (usage_fallback_notice, the CLI cause); the SDK cause is said once per
+        #   backend on its flag, _usage_fallback_sdk_noted (see _note_usage_fallback)
         # Pending conversation REWIND (the chat's edit-message branch): the target record uuid +
         # the transcript leaf recorded at request time (the one-shot guard — see rewind_disposition).
         # Seeded from the reg so a kernel death mid-rewind re-applies it iff nothing landed since.
@@ -5120,7 +5154,8 @@ class SdkSession:
           of every turn — roughly half a day's tokens went missing, and five sessions' recorded
           totals matched that subtraction to the token (the user 2026-09-06, who did not believe
           the count and was right, in the other direction). So the flat dict is never diffed: when
-          the map is absent (an older CLI) it folds WHOLE.
+          the map is absent it folds WHOLE, and the fallback is said once (_note_usage_fallback): it
+          is the main loop's count alone, and a reader of the token columns has to know that.
         Cache reads dominate either way — every API call of a turn re-reads the whole context — and
         the hover breaks the count down by kind so the size of the number has its explanation."""
         mu = getattr(msg, "model_usage", None)
@@ -5140,7 +5175,38 @@ class SdkSession:
             return out
         u = getattr(msg, "usage", None)
         u = u if isinstance(u, dict) else {}
-        return {k: (int(u[k]) if isinstance(u.get(k), (int, float)) else 0) for k, _ in self._USAGE_KEYS}
+        out = {k: (int(u[k]) if isinstance(u.get(k), (int, float)) else 0) for k, _ in self._USAGE_KEYS}
+        self._note_usage_fallback(msg)   # after the count: a count that raises is the containment's one report
+        return out
+
+    def _note_usage_fallback(self, msg):
+        """_turn_usage read the flat `usage` dict because the paid result carried no modelUsage map:
+        this turn's token columns are the main loop's count alone. Recorded silently before, so a kernel
+        on an old SDK under-counted every session with nothing in the error center naming why. Said as a
+        problem the user can act on (usage_fallback_notice), by the cause the message tells apart
+        (usage_fallback_is_sdk): the SDK cause is the host's, one for every session this kernel runs, so
+        it is said ONCE PER BACKEND on the backend's flag (per session it would be one near-identical
+        card per live session, and another per dormant revive, for a single remedy), checked and set
+        under the backend's lock because sessions settle on their own threads and a bare check-then-set
+        lets two first paid results both say it; the CLI cause is this session's, so once per session on
+        its own flag, which only this session's thread touches. The line is not worth the count: this
+        runs inside the token count, ahead of the spend write and after the cost watermark moved, so a
+        log callback that raises here would lose the turn's dollars and tokens for the sake of a line.
+        The raise is swallowed instead (the flag is set first, and the ring row lands before the callback
+        runs, so nothing is said twice). The `total > 0` gate in the settle keeps zero-cost results out."""
+        if usage_fallback_is_sdk(msg):
+            with self.backend._lock:
+                if self.backend._usage_fallback_sdk_noted:
+                    return
+                self.backend._usage_fallback_sdk_noted = True
+        else:
+            if self._usage_fallback_noted:
+                return
+            self._usage_fallback_noted = True
+        try:
+            self.backend._log(usage_fallback_notice(self.name, msg), problem=True)
+        except Exception:
+            pass    # a raising log callback: the count proceeds (the docstring's rule)
 
     async def _drain(self, client, AssistantMessage, ResultMessage, SystemMessage):
         """The receive loop. Every streamed message goes through _handle_stream_message, which keeps
@@ -7028,6 +7094,8 @@ class SdkBackend:
         self.append_prompt_path = append_prompt_path
         self._log_cb = log
         self._thinking_override_logged = False   # thinking_override_note said once per backend (see _options)
+        self._usage_fallback_sdk_noted = False   # usage_fallback_notice's SDK cause said once per backend: the
+        #   imported SDK is one fact for every session (SdkSession._note_usage_fallback)
         self.sessions: dict[str, SdkSession] = {}
         self._lock = threading.Lock()
         self._turn_seq: dict = {}                 # sid -> turns ended this kernel life (turn_seq; under _lock)

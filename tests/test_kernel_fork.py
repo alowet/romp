@@ -208,7 +208,7 @@ class ForkSessionOp(unittest.TestCase):
 
     def test_tmux_backend_refused(self):
         km.Sessions.backend_for = lambda sid: object()   # no .fork
-        self.assertIn("SDK backend", km._fork_session(PARENT, "", "api-fork") or "")
+        self.assertIn("needs a Claude Code session", km._fork_session(PARENT, "", "api-fork") or "")   # the backend's name since T288
 
     def test_seeding_precedes_the_backend_and_the_cut_resolves_like_a_rewind(self):
         self.assertIsNone(km._fork_session(PARENT, "u2", "api-fork"))
