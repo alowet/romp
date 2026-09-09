@@ -130,7 +130,7 @@ class MessageBinder(unittest.TestCase):
 
     def test_without_them_the_wire_line_alone_cannot_name_the_sender(self):
         m = self._case(lambda d: None)
-        self.assertEqual((m["exec"], m["pending"]), (990, True), "documents the fallback a memoized lane takes")
+        self.assertEqual((m["exec"], m["pending"]), (990, True), "a caller passing no prompts reads the wire line alone")
 
 
 class MemoCarriesPrompts(unittest.TestCase):
