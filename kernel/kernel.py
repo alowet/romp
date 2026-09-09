@@ -14142,6 +14142,7 @@ CODEX_SETUP_HINT = ("Session not created: the Codex backend isn't installed. "
 
 _codex_backend = None   # None = not built yet, False = module unavailable, else the CodexBackend
 _codex_lock = threading.Lock()
+_codex_catalog_fault = [None]   # the last /models catalog raise logged (str), or None: see _note_codex_catalog_fault
 
 
 def _codex():
@@ -14169,6 +14170,19 @@ def _codex():
                 sys.stderr.write("codex-backend unavailable: %s\n" % traceback.format_exc())
                 _codex_backend = False
         return _codex_backend or None
+
+
+def _note_codex_catalog_fault(why):
+    """Log a raise out of the Codex backend's catalog read (model_catalog or model_catalog_error) ONCE per
+    distinct reason, from GET /models. Every picker open and every models frame re-reads the route, so a
+    line per read would repeat for as long as the fault lasts; the backend logs its own recorded reasons
+    (an empty page, a failed model_list, a client in backoff) the same way. `why` None clears the latch
+    (the read returned without raising), so the same fault after a recovery is a new line. The line
+    carries the backend's own `codex-backend:` prefix so every Codex line in the kernel log greps together."""
+    if why != _codex_catalog_fault[0]:
+        _codex_catalog_fault[0] = why
+        if why:
+            sys.stderr.write("codex-backend: %s\n" % why)
 
 
 def _codex_ready():
@@ -46522,18 +46536,34 @@ class Handler(BaseHTTPRequestHandler):
                 # (docs/codex.md) — models from the app-server's own list via the backend (the
                 # authoritative source; [] until the backend runs, so no picker ever shows another
                 # vendor's models); efforts are the four Codex accepts — max/ultracode are Claude-only.
+                # The section's `error` field names WHY `models` is empty: null beside a non-empty list,
+                # else one sentence for the picker to show (a string, never an object or a code).
+                # Without it the picker opens on a blank menu with no word of why: the backend's
+                # model_catalog() answers [] when its client is in retry backoff, when model_list
+                # raised or when the app-server listed no models (CodexBackend.model_catalog_error
+                # names which), a raise out of it would land here as the same empty list, and the
+                # closed gate below and an absent backend serve the same [] too. The last two name
+                # themselves so an empty list is never read as the app-server's answer.
                 cx = _codex()
-                cx_models = []
+                cx_models, cx_err = [], None
                 # Codex is consulted ONLY where this machine opted in — the Codex default backend, the
                 # Codex judge engine, or a live Codex session. model_catalog() builds the client, which
                 # SPAWNS `codex app-server`; unconditional, every dashboard load spawned (or repeatedly
                 # failed to spawn) it on every install, the opposite of off-by-default (PR #885 review).
                 if cx and (_default_backend() == "codex" or _judge_engine_name() == "codex"
                            or bool(cx.live_sessions())):
+                    fault = None
                     try:
                         cx_models = cx.model_catalog()
-                    except Exception:
-                        pass
+                        if not cx_models:
+                            cx_err = cx.model_catalog_error() or "the Codex app-server sent no model list"
+                    except Exception as e:
+                        fault = cx_err = "model catalog: %s" % (str(e) or e.__class__.__name__)
+                    _note_codex_catalog_fault(fault)   # a raise is logged once per distinct reason; None clears
+                elif cx:
+                    cx_err = "no live Codex session; the list is read once one runs"
+                else:
+                    cx_err = "the Codex backend is unavailable (see the kernel log)"
                 return self._send(200, json.dumps(
                     # `rev` is the pick memory's revision — the models frame's counter (_models_changed),
                     # read here BEFORE the picks so a payload never carries a rev newer than its list: a
@@ -46548,7 +46578,7 @@ class Handler(BaseHTTPRequestHandler):
                                 for c in MODEL_CHOICES],
                      "efforts": [dict(c, color=_effort_color(c["value"], _stops), tone=_effort_tone(c["value"]))
                                  for c in EFFORT_CHOICES],
-                     "codex": {"models": cx_models,
+                     "codex": {"models": cx_models, "error": cx_err,
                                "efforts": [{"value": v, "label": v}
                                            for v in ("low", "medium", "high", "xhigh")]},
                      # the create dialog's pre-read (the user 2026-08-29): what a new comment thread

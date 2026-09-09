@@ -1187,6 +1187,72 @@ for i in range(20):
         self.assertEqual(cat, [{"value": "gpt-5-test", "label": "GPT-5 Test"}])
         be.model_catalog()
         self.assertEqual(len(fake.called("model_list")), 1, "catalog is fetched once, then cached")
+        self.assertIsNone(be.model_catalog_error(), "a held catalog carries no error")
+
+    def test_model_catalog_empty_answer_is_not_cached_and_is_named(self):
+        # The picker opened on a blank menu and stayed blank for the life of the kernel: the app-server's
+        # first answer was an empty page, and `[] is not None`, so the empty list was cached as the catalog.
+        # Only a non-empty list is held; an empty answer is named and the next read asks again.
+        be, fake, _ = build()
+        logged = []
+        be.log = logged.append
+        real = fake.model_list
+        pages, asked = [SimpleNamespace(data=[])], []
+
+        def paged(*a, **k):
+            asked.append(1)
+            return pages.pop() if pages else real(*a, **k)
+        fake.model_list = paged
+        self.assertEqual(be.model_catalog(), [])
+        self.assertEqual(be.model_catalog(), [{"value": "gpt-5-test", "label": "GPT-5 Test"}],
+                         "an empty answer is not the catalog: the next read asks the app-server again")
+        self.assertEqual(len(asked), 2)
+        self.assertEqual(logged.count("the Codex app-server listed no models"), 1, "the empty answer is named, once")
+        self.assertIsNone(be.model_catalog_error(), "the held list clears the reason")
+        be.model_catalog()
+        self.assertEqual(len(asked), 2, "the non-empty list is the one that is cached")
+
+    def test_model_catalog_failure_is_named_and_logged_once_per_reason(self):
+        # model_list raised: the backend answered [] and logged a line per call, and the caller had no way to
+        # read why. The reason is readable (model_catalog_error) and logged once per DISTINCT reason: the
+        # kernel re-reads the catalog on every picker open, so a per-call line repeats for as long as the
+        # fault lasts. A later good answer clears the reason.
+        be, fake, _ = build()
+        logged = []
+        be.log = logged.append
+        real = fake.model_list
+        faults = [RuntimeError("app-server not ready"), RuntimeError("app-server not ready"), RuntimeError("pump died")]
+
+        def flaky(*a, **k):
+            if faults:
+                raise faults.pop(0)
+            return real(*a, **k)
+        fake.model_list = flaky
+        named = lambda: [l for l in logged if l.startswith("model_list failed")]
+        self.assertEqual(be.model_catalog(), [])
+        self.assertEqual(be.model_catalog_error(), "model_list failed: app-server not ready")
+        self.assertEqual(be.model_catalog(), [], "the same fault again")
+        self.assertEqual(named(), ["model_list failed: app-server not ready"], "one line for one reason, however many reads")
+        self.assertEqual(be.model_catalog(), [])
+        self.assertEqual(be.model_catalog_error(), "model_list failed: pump died")
+        self.assertEqual(named(), ["model_list failed: app-server not ready", "model_list failed: pump died"],
+                         "a different reason is a new line")
+        self.assertEqual(be.model_catalog(), [{"value": "gpt-5-test", "label": "GPT-5 Test"}],
+                         "the next read retries instead of serving the failed answer")
+        self.assertIsNone(be.model_catalog_error())
+
+    def test_model_catalog_without_a_client_names_the_client_failure(self):
+        # _get_client() None (the factory failed; the client sits in its retry backoff) answered [] with
+        # nothing logged and nothing for the caller to show. The reason carries the client's own failure text.
+        be, _, _ = build(factory=lambda: (_ for _ in ()).throw(RuntimeError("codex login missing")))
+        logged = []
+        be.log = logged.append
+        self.assertEqual(be.model_catalog(), [])
+        want = "the Codex app-server client is unavailable: codex login missing"
+        self.assertEqual(logged.count(want), 1, logged)
+        self.assertEqual(be.model_catalog_error(), want)
+        self.assertEqual(be.model_catalog(), [])
+        self.assertEqual(logged.count(want), 1, "the same reason is logged once, not once per read")
 
     def test_deliver_and_wake_reach_the_agent(self):
         be, fake, _ = build()
