@@ -4753,7 +4753,14 @@ def _apply_pending_tag_edits(r):
     host's views FRESH first (ask the host, never the cache) and moves state only where the
     evidence says the ruling still applies; every outcome logs to tunnel-dials.jsonl (the reattach
     is a tunnel event). Terminal outcomes retire the row; a transport failure keeps it for the
-    next pass, so a link that drops mid-apply loses nothing."""
+    next pass, so a link that drops mid-apply loses nothing. Nor does a host whose store is FAULTING
+    (review find, 2026-09-09, on #1096): a reading the host could not prove (its /views answered a
+    retryable 503, so the poll kept the last reading, or a blob marked `viewsFault`) decides nothing.
+    The row waits for a clean read, read off the marker _poll_remote_views leaves on the host's row (or
+    on the blob itself), and a forward the host refuses RETRYABLY (its own store faulted at the write)
+    keeps the row too. Before this, the kept reading passed for a fresh one: a journaled delete or
+    rename found its tag, forwarded, and retired on the host's fault refusal as "refused", while the
+    host's store never took it."""
     host = r.get("host") or ""
     rows = [x for x in _pending_tag_rows() if x.get("host") == host]
     if not rows:
@@ -4772,6 +4779,13 @@ def _apply_pending_tag_edits(r):
     # pending and every forward failing nothing retires, and this re-read stamps the poll gate, so the
     # pass's own poll serves the cache and never sees it.
     _cache_remote_views(r, rv)
+    fault = r.get("viewsFault") or rv.get("viewsFault")
+    if isinstance(fault, str) and fault:
+        # the host said it could not read its store: what the poll returned is the last reading kept (the
+        # 503) or a blob the host marked unproved, and a ruling is never retired against either
+        _tunnel_log(host, "pending-tag-edits", note="views unproved (%s), retrying next pass" % fault,
+                    pending=len(rows))
+        return 0
     by_name = {}                                 # keyed on the name basis: the host's raw name may be padded
     for t in (rv.get("tags") or []):
         if isinstance(t, dict):
@@ -4811,6 +4825,13 @@ def _apply_pending_tag_edits(r):
                         outcome="transport failed — retrying next pass")
             continue
         ok = bool(ans.get("ok"))
+        if not ok and ans.get("retryable"):
+            # the host's own store faulted at the write (its /tag answers ok:false + retryable, the
+            # 2026-09-08 review's shape): not a ruling on the edit, so the row waits for the pass after
+            # the heal, as on a transport failure
+            _tunnel_log(host, "pending-tag-edit", name=row.get("name"), op=_row_op(row),
+                        outcome="the host could not take it now (%s), retrying next pass" % (ans.get("error") or "?"))
+            continue
         _tunnel_log(host, "pending-tag-edit", name=row.get("name"), op=_row_op(row),
                     outcome=("applied" if ok else "refused by the host: %s" % (ans.get("error") or "?")))
         retired.append(row)                      # a refusal is the host's own answer — terminal
@@ -4869,9 +4890,12 @@ def _views_client(v=None):
         # from the untagged view and keep their tag views pickable while the link reconnects
         # (bounded staleness: the auto-reconnect heals within a pass; detach pops the row and its
         # cache with it — intent-consistent).
-        cand = [(r["host"], r.get("views")) for r in _remotes.values()
+        # ...and the host's own word on that read: `viewsFault` on the row (_poll_remote_views) means the
+        # host could not prove the reading it keeps, and every rendered tag of that host wears the text, so
+        # a pane can show them as stale rather than fresh (review find, 2026-09-09, on #1096)
+        cand = [(r["host"], r.get("views"), r.get("viewsFault")) for r in _remotes.values()
                 if isinstance(r.get("views"), dict)]
-    for host, rv in sorted(cand):
+    for host, rv, hfault in sorted(cand, key=lambda x: x[0]):
         # the host's OWN store's write seq, on every row of its tags: a remote rename rides this kernel's
         # blob with no change to the local `seq`, so a client ordering what a blob says about a remote
         # tag (tab-groups.ts followTagRenames — a pane stands down on evidence older than its memory's)
@@ -4891,6 +4915,8 @@ def _views_client(v=None):
                    "members": [_remote_tag_member_str(host, m) for m in members]}
             if hseq:
                 row["seq"] = hseq
+            if isinstance(hfault, str) and hfault:
+                row["viewsFault"] = hfault
             remote.append(row)
     if remote:
         v["remoteTags"] = remote
@@ -18287,7 +18313,18 @@ def _poll_remote_views(r):
     _views_client joins them per host (never merging — the federation counter rule). Same shape and
     rate-gate as _poll_remote_usage; on a blip the last good reading stands (a down host simply
     stops contributing when its status leaves "up"). An older remote without the route answers
-    non-200 → None, and the union just never includes it — nothing breaks across versions."""
+    non-200 → None, and the union just never includes it — nothing breaks across versions.
+
+    A host under a views READ FAULT says so on the route (the 2026-09-08 review): nothing good is a
+    retryable 503, a last-good blob a 200 marked `viewsFault`. Either way the reading this row keeps is one
+    the host could not vouch for, and the row says so too: `viewsFault` (the host's fault text) rides the
+    row from the 503's body or the blob's marker until a clean 200 sheds it (the read that ends the
+    episode, no timer), so _views_client renders the host's tags as stale rather than fresh and
+    _apply_pending_tag_edits never retires a journaled edit on a reading the host did not prove (review
+    find, 2026-09-09, on #1096: the 503's body was dropped and the marked blob's marker stored unread, so on
+    the peer a faulting host was indistinguishable from a healthy one). Said once per episode in the log,
+    as the local path's notice is (_note_remote_views_fault). Any other non-200, and a failed dial, keep
+    the reading AND the marker as they were: neither proves anything."""
     import urllib.parse
     now = time.time()
     if now - float(r.get("_views_at") or 0) < REMOTE_VIEWS_EVERY:
@@ -18300,12 +18337,66 @@ def _poll_remote_views(r):
         data = resp.read()
         c.close()
         if resp.status != 200:
+            if resp.status == 503:
+                text = _remote_views_fault_text(data)
+                if text:
+                    _note_remote_views_fault(r, text)
             return r.get("views")
         u = json.loads(data.decode("utf-8"))
         r["_views_at"] = now
-        return u if isinstance(u, dict) else r.get("views")
+        if not isinstance(u, dict):
+            return r.get("views")
+        if isinstance(u.get("viewsFault"), str) and u["viewsFault"]:
+            _note_remote_views_fault(r, u["viewsFault"])
+        else:
+            _clear_remote_views_fault(r)
+        return u
     except Exception:
         return r.get("views")
+
+
+def _remote_views_fault_text(data):
+    """The fault a host's retryable 503 on GET /views names, in the host's own words minus its advice to the
+    poller (the body's `error` ends in "retry", which is for this dialer, not for the person reading the
+    peer's dashboard); None for a 503 that is not the route's refusal (a proxy's, a body that is not JSON),
+    which then counts as any other non-200: the reading stands, nothing is marked."""
+    try:
+        body = json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+    if not (isinstance(body, dict) and body.get("retryable") and isinstance(body.get("error"), str)):
+        return None
+    text = body["error"].strip()
+    tail = " \u2014 retry"
+    if text.endswith(tail):
+        text = text[:-len(tail)].rstrip()
+    return text or None
+
+
+def _note_remote_views_fault(r, text):
+    """A polled host could not prove the /views reading this row keeps (a retryable 503 with nothing good,
+    or a last-good blob marked `viewsFault`): the row wears the host's fault text as `viewsFault`, said ONCE
+    per episode in the log (one stderr line and one tunnel-dials.jsonl record the first time this text is
+    seen for the row; a repeat of the same text files nothing), and the views are marked dirty on the
+    marker's ARRIVAL alone, so the peer's frames repaint the host's tags as stale on this event and not per
+    pass (a poll of the same fault changes nothing). The kept `views` stands, as on any blip; only what the
+    row says about it changes. A clean 200 ends the episode (_clear_remote_views_fault)."""
+    if r.get("viewsFault") == text:
+        return
+    r["viewsFault"] = text
+    host = r.get("host") or "?"
+    sys.stderr.write("romp-kernel: %s: %s; showing its last-known tags\n" % (host, text))
+    _tunnel_log(host, "views-fault", note=text)
+    _mark_views_dirty()
+
+
+def _clear_remote_views_fault(r):
+    """A clean 200 from the host's /views is the read that ends its fault episode: the marker goes, the end
+    is logged once, and the views are marked dirty so the host's tags render fresh again on this event."""
+    if r.pop("viewsFault", None) is None:
+        return
+    _tunnel_log(r.get("host") or "?", "views-fault", note="cleared: the host's tag store reads again")
+    _mark_views_dirty()
 
 
 def _cache_remote_views(r, rviews):

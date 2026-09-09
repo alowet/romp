@@ -1489,7 +1489,9 @@ class GetViewsSaysSoToo(_ViewsFaultMixin, _TagRouteHarness):
             self.assertIs(km._poll_remote_views(peer), good, "the peer keeps its last reading on the non-200, as on any blip")
             self.assertFalse(km._cache_remote_views(peer, km._poll_remote_views(peer)),
                              "...and stores nothing new: this host's tags stand on every one of the peer's dashboards")
-            self.assertEqual(len(self.dirty), marks, "nothing to repaint anywhere: only the seed marked")
+            self.assertEqual(len(self.dirty), marks + 1,
+                             "one repaint, for the stale marker's arrival on the peer's row (APeerShowsAFaultingHostsTagsAsStale); "
+                             "the kept reading itself moved nothing, and the second poll of the same fault marked nothing")
             self.assertEqual(len(self._faults()), 1, "said once for the episode, however many GETs and polls")
         with _stat_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):      # the stat arm on a cold cache: the same answer
             st, body = self._get_views()
@@ -1594,6 +1596,144 @@ class TheHealRepaintsAtOnce(_ViewsFaultMixin, _TagRouteHarness):
         finally:
             km._built_feed[:] = saved[0]
             km._views_dirty[0] = saved[1]
+
+
+class APeerShowsAFaultingHostsTagsAsStale(_ViewsFaultMixin, _TagRouteHarness):
+    """The peer half of the route's fault contract (review find, 2026-09-09, on #1096). GetViewsSaysSoToo proves
+    the poller keeps its last reading through the 503 and stores the marked blob; but the peer's ROW said
+    nothing about either, so on the peer a faulting host was indistinguishable from a healthy one, and
+    _apply_pending_tag_edits took the kept reading for a fresh one: a journaled delete or rename found its
+    tag, forwarded, and retired on the host's fault refusal while the host's store never took it. Now the row
+    wears the host's fault as `viewsFault` from the 503's body or the blob's marker until a clean 200 sheds it
+    (the read that ends the episode, no timer), _views_client stamps every rendered tag of that host with it,
+    and the apply stands down on a marked row. The host here is the harness's own server, dialled by the real
+    poller and the real forward; the row is registered as an attached host, since the journal and the renderer
+    both read the registry."""
+
+    def setUp(self):
+        super().setUp()
+        self._peer_saved = (dict(km._remotes), km._remote_forward)
+        self._fresh_journal()
+        km._remotes.clear()
+        self.peer = {"host": "TESTHOST", "status": "up", "local_port": self.port,
+                     "token": os.environ["ROMP_SERVE_TOKEN"]}
+        km._remotes["TESTHOST"] = self.peer
+
+    def tearDown(self):
+        km._remotes.clear(); km._remotes.update(self._peer_saved[0])
+        km._remote_forward = self._peer_saved[1]
+        self._fresh_journal()
+        super().tearDown()
+
+    def _fresh_journal(self):
+        """The pending-edit journal (file + module cache) starts and ends empty: the cache is module state, and
+        the harness swaps the state dir per test."""
+        try:
+            km._pending_tag_path().unlink()
+        except OSError:
+            pass
+        with km._PENDING_TAG_LOCK:
+            km._PENDING_TAG_CACHE["rows"] = None
+
+    def _poll(self):
+        """One real dial of the host's /views, the rate gate dropped (the gate is not the subject)."""
+        self.peer.pop("_views_at", None)
+        return km._poll_remote_views(self.peer)
+
+    def _host_rows(self):
+        """The host's tags as the peer's frames render them (_views_client's remoteTags rows for this host)."""
+        return [t for t in km._views_client().get("remoteTags") or [] if t.get("host") == "TESTHOST"]
+
+    def test_the_row_wears_the_hosts_fault_from_the_503_and_sheds_it_on_the_clean_read(self):
+        self._seed("workers")
+        st, good = self._views()
+        self.assertTrue(km._cache_remote_views(self.peer, self._poll()), "the clean reading lands on the row")
+        kept = self.peer["views"]
+        self.assertEqual(kept, good)
+        self.assertNotIn("viewsFault", self.peer, "a proved reading wears no marker")
+        self.assertEqual([("viewsFault" in t) for t in self._host_rows()], [False], "...and renders fresh")
+        marks = len(self.dirty)
+        km._flags_cache.clear()                                            # a kernel that never served the store
+        err = io.StringIO()
+        with _reads_fault(km._views_path()), contextlib.redirect_stderr(err):
+            self.assertIs(self._poll(), kept, "the 503: the last reading is kept, as the route's contract says")
+            self.assertIn("the tag store could not be read (read failed: [Errno 5]", self.peer["viewsFault"],
+                          "...and the row says the host could not vouch for it")
+            self.assertFalse(self.peer["viewsFault"].endswith("retry"), "the host's fault, not its advice to the poller")
+            self.assertEqual(len(self.dirty), marks + 1, "the marker's arrival is one repaint on the peer")
+            self.assertEqual([t["viewsFault"] for t in self._host_rows()], [self.peer["viewsFault"]],
+                             "the host's rendered tags wear it: stale, not fresh")
+            self.assertIs(self._poll(), kept)
+            self.assertEqual(len(self.dirty), marks + 1, "a second poll of the same fault repaints nothing")
+            self.assertEqual(len(self._faults()), 1, "the host's own notice is filed once; the peer files none of its own")
+        self.assertEqual(err.getvalue().count("showing its last-known tags"), 1, "said once for the episode in the log")
+        st, healed = self._views()                                         # the disk heals: the host's own read ends ITS episode
+        self.assertEqual((st, healed), (200, good))                        # (and marks once, TheHealRepaintsAtOnce's subject: this kernel is the host too)
+        n = len(self.dirty)
+        self.assertEqual(self._poll(), good, "the peer's next poll: a clean 200")
+        self.assertNotIn("viewsFault", self.peer, "the clean read is the event that sheds the marker")
+        self.assertEqual(len(self.dirty), n + 1, "...and its departure is the other repaint on the peer")
+        self.assertEqual([("viewsFault" in t) for t in self._host_rows()], [False])
+        self.assertEqual(err.getvalue().count("showing its last-known tags"), 1, "the heal adds no line")
+
+    def test_the_row_wears_the_marked_blobs_marker_too(self):
+        self._seed("workers", "reviewers")                                  # the writes primed the cache
+        self.assertTrue(km._cache_remote_views(self.peer, self._poll()))
+        marks = len(self.dirty)
+        with _stat_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):   # a warm cache: the marked blob
+            marked = self._poll()
+            self.assertIn("the tag store could not be read (stat failed:", marked["viewsFault"])
+            self.assertEqual(self.peer["viewsFault"], marked["viewsFault"], "the blob's marker is the row's")
+            self.assertEqual(len(self.dirty), marks + 1, "the marker's arrival is one repaint")
+            self.assertTrue(km._cache_remote_views(self.peer, marked), "the marked reading lands, as GetViewsSaysSoToo proves")
+            rows = self._host_rows()
+            self.assertEqual(sorted(t["name"] for t in rows), ["reviewers", "workers"])
+            self.assertEqual({t["viewsFault"] for t in rows}, {marked["viewsFault"]}, "every one of the host's tags reads stale")
+            self.assertEqual(self._poll(), marked)
+            self.assertEqual(self.peer["viewsFault"], marked["viewsFault"], "a later poll of the same fault changes nothing")
+        clean = self._poll()                                               # the disk heals
+        self.assertNotIn("viewsFault", clean)
+        self.assertNotIn("viewsFault", self.peer, "shed on the clean read")
+        self.assertTrue(km._cache_remote_views(self.peer, clean))
+        self.assertFalse(any("viewsFault" in t for t in self._host_rows()), "and the host's tags render fresh again")
+
+    def test_a_journaled_delete_stays_pending_on_a_kept_reading_and_retires_on_the_clean_one(self):
+        self._seed("workers")                                              # the writes primed the cache
+        self.assertTrue(km._cache_remote_views(self.peer, self._poll()), "the host's tags, as the ruling will see them")
+        self.assertTrue(km._queue_pending_tag_edit("TESTHOST", {"name": "workers", "delete": True}))
+        self.assertEqual(len(km._pending_tag_rows()), 1)
+        before = self._bytes()
+        with _stat_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):   # a warm cache: the marked blob
+            self.assertEqual(km._apply_pending_tag_edits(self.peer), 0, "a marked blob decides nothing")
+            self.assertEqual(len(km._pending_tag_rows()), 1, "the row waits for a read the host can vouch for")
+            self.assertEqual(self._bytes(), before, "nothing was forwarded: the host's store is as it was")
+        km._flags_cache.clear()                                            # a kernel that never served the store
+        with _reads_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(km._apply_pending_tag_edits(self.peer), 0, "the 503: the kept reading decides nothing either")
+            self.assertEqual(len(km._pending_tag_rows()), 1)
+            self.assertEqual(self._bytes(), before)
+            self.assertIn("the tag store could not be read (read failed: [Errno 5]", self.peer["viewsFault"])
+        self.assertEqual(km._apply_pending_tag_edits(self.peer), 1, "the disk heals: the clean read confirms, and the delete lands")
+        self.assertNotIn("viewsFault", self.peer)
+        self.assertEqual(km._pending_tag_rows(), [], "retired once, on evidence")
+        self.assertEqual(km._timeline_views()["tags"], [], "the host's store took it")
+
+    def test_a_retryable_refusal_from_the_host_keeps_the_row_too(self):
+        # the other disk fault on the host: its store READS but the delete's PUBLISH fails, so its /tag answers
+        # ok:false + retryable (ViewsStoreUnwritableRefuses); the apply took that for the host's ruling and retired
+        # the row as "refused"
+        self._seed("workers")
+        self.assertTrue(km._cache_remote_views(self.peer, self._poll()))
+        self.assertTrue(km._queue_pending_tag_edit("TESTHOST", {"name": "workers", "delete": True}))
+        before = self._bytes()
+        with _writes_fault(km._views_path()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(km._apply_pending_tag_edits(self.peer), 0)
+            self.assertEqual(len(km._pending_tag_rows()), 1, "the host said retry: the row waits, never retired as refused")
+            self.assertEqual(self._bytes(), before)
+            self.assertEqual(len(self._faults("written")), 1)
+        self.assertEqual(km._apply_pending_tag_edits(self.peer), 1, "the disk heals: the delete lands")
+        self.assertEqual(km._pending_tag_rows(), [])
+        self.assertEqual(km._timeline_views()["tags"], [])
 
 
 if __name__ == "__main__":
