@@ -15,6 +15,8 @@ import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+from tests.conftest import restore_env
+
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
 
@@ -33,6 +35,7 @@ ps = SourceFileLoader("romp_postal_selfid", os.path.join(BIN, "romp-postal-servi
 
 class ForkedSelfIdentity(unittest.TestCase):
     def setUp(self):
+        self._prior_seam = os.environ.get("ROMP_SESSIONS_FILE")
         os.environ["ROMP_SESSIONS_FILE"] = _SESS
         self._env = os.environ.get("CLAUDE_CODE_SESSION_ID")
 
@@ -41,6 +44,7 @@ class ForkedSelfIdentity(unittest.TestCase):
             os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
         else:
             os.environ["CLAUDE_CODE_SESSION_ID"] = self._env
+        restore_env("ROMP_SESSIONS_FILE", self._prior_seam)
 
     def test_exact_id_match_resolves_directly(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = STABLE

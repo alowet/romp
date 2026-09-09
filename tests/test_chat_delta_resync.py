@@ -22,6 +22,8 @@ import re
 from importlib.machinery import SourceFileLoader
 import tempfile
 
+import pytest
+
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin")
 # Hermetic state BEFORE the loads — they resolve their state root at import time, and only
 # pytest runs conftest's floor (a bare unittest or script run otherwise writes REAL state).
@@ -139,12 +141,21 @@ def test_chat_diff_append_starts_at_the_previous_total():
 
 # ───────────────────────── (2) the fork-lane states key ─────────────────────────
 
-def test_build_sig_folds_in_the_anchor_states_file(tmp_path):
+@pytest.fixture
+def state_root(tmp_path):
+    """The judge rebound to a private state root for one test, and back afterwards: the judge module is
+    shared by every test module in the process, so a root left behind is what the next module reads."""
+    saved = jd.STATE
+    jd._rebind_state(tmp_path)
+    yield tmp_path
+    jd._rebind_state(saved)
+
+
+def test_build_sig_folds_in_the_anchor_states_file(state_root):
     """A forked lane is keyed by a new fsid but keeps writing states/<anchor>.jsonl. The signature must
     stat the anchor's file too, or a settle (which touches ONLY states/) never busts the cached payload
     and the lane latches on 'working'."""
-    jd._rebind_state(tmp_path)
-    km.jd = jd
+    tmp_path = state_root
     (tmp_path / "states").mkdir(parents=True, exist_ok=True)
     tx = tmp_path / "fork.jsonl"
     tx.write_text('{"type":"user"}\n')
@@ -164,10 +175,9 @@ def test_build_sig_folds_in_the_anchor_states_file(tmp_path):
     assert before != after, "a settle under the ANCHOR sid must bust the fork lane's chat cache"
 
 
-def test_build_sig_still_tracks_the_fsid_states_file(tmp_path):
+def test_build_sig_still_tracks_the_fsid_states_file(state_root):
     """The common case (sid == fsid, no fork) must keep working."""
-    jd._rebind_state(tmp_path)
-    km.jd = jd
+    tmp_path = state_root
     (tmp_path / "states").mkdir(parents=True, exist_ok=True)
     sid = "11111111-2222-3333-4444-555555555555"
     tx = tmp_path / (sid + ".jsonl")
@@ -181,11 +191,10 @@ def test_build_sig_still_tracks_the_fsid_states_file(tmp_path):
     assert before != km._chat_build_sig(sess)
 
 
-def test_build_sig_keys_the_rows_context_percentage(tmp_path):
+def test_build_sig_keys_the_rows_context_percentage(state_root):
     """The snapshot row's context-% is `context`, the key the merged liveness row writes; the sig read `ctx`,
     which no row carries, so a background tab's context change never busted its chat cache."""
-    jd._rebind_state(tmp_path)
-    km.jd = jd
+    tmp_path = state_root
     sid = "11111111-2222-3333-4444-555555555555"
     tx = tmp_path / (sid + ".jsonl")
     tx.write_text('{"type":"user"}\n')
