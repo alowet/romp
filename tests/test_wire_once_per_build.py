@@ -135,7 +135,7 @@ class OneEncodePerBuild(unittest.TestCase):
         tl = _client("timeline")                                  # every timeline pane: slot deltas
         splits = collections.Counter()
         real_split = km._delta_split
-        with mock.patch.object(km, "_delta_split", side_effect=lambda kind, v: splits.update([kind]) or real_split(kind, v)):
+        with mock.patch.object(km, "_delta_split", side_effect=lambda kind, v, **kw: splits.update([kind]) or real_split(kind, v, **kw)):
             s0 = dict(km._wire_stats)
             km._push([dfeed, legacy, tl])
             self.assertEqual(sum(splits.values()), 4, "one per-entry pass per payload: the feed's one collection, the bars' three")
@@ -228,7 +228,7 @@ class ALedgersOnlyRefillEncodesNoCard(unittest.TestCase):
         first = dict(src, ledgers=[{"sid": SID, "name": "web", "status": "idle"}])
         refill = dict(src, ledgers=[{"sid": SID, "name": "web", "status": "working"}])   # the same asks list, another remainder
         splits = collections.Counter(); real_split = km._delta_split
-        with mock.patch.object(km, "_delta_split", side_effect=lambda kind, v: splits.update([kind]) or real_split(kind, v)):
+        with mock.patch.object(km, "_delta_split", side_effect=lambda kind, v, **kw: splits.update([kind]) or real_split(kind, v, **kw)):
             s0 = dict(km._wire_stats)
             p1 = km._delta_parts("feed", first)
             self.assertEqual(dict(splits), {"byid:itemId": 1}); self.assertEqual(_delta(km._wire_stats, s0), {"split_miss": 1})
@@ -255,7 +255,7 @@ class ALedgersOnlyRefillEncodesNoCard(unittest.TestCase):
         w = _World(self, feed=_feed())
         board, dfeed = _client("fleet"), _client("feed")
         splits = collections.Counter(); real_split = km._delta_split
-        with mock.patch.object(km, "_delta_split", side_effect=lambda kind, v: splits.update([kind]) or real_split(kind, v)):
+        with mock.patch.object(km, "_delta_split", side_effect=lambda kind, v, **kw: splits.update([kind]) or real_split(kind, v, **kw)):
             s0 = dict(km._wire_stats)
             km._push([board])                                     # an app="fleet" client: the cycle attaches ledgers to the copy
             self.assertEqual(dict(splits), {"byid:itemId": 1}); self.assertEqual(km._feed_wire[1], [])
@@ -278,7 +278,7 @@ class ALedgersOnlyRefillEncodesNoCard(unittest.TestCase):
         _World(self)
         tl = _timeline(nbars=3)
         splits = collections.Counter(); real_split = km._delta_split
-        with mock.patch.object(km, "_delta_split", side_effect=lambda kind, v: splits.update([kind]) or real_split(kind, v)):
+        with mock.patch.object(km, "_delta_split", side_effect=lambda kind, v, **kw: splits.update([kind]) or real_split(kind, v, **kw)):
             s0 = dict(km._wire_stats)
             p1 = km._delta_parts("bars", _bars_of(tl, warming=True))
             self.assertEqual(sum(splits.values()), 3); self.assertEqual(_delta(km._wire_stats, s0), {"split_miss": 3})

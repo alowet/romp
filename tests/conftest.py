@@ -125,38 +125,32 @@ os.environ["CLAUDE_CONFIG_DIR"] = _CLAUDE_CONFIG
 # safe against every consumer. Import-time, so collection-time code is floored too.
 os.environ["ROMP_MANAGER_PORT"] = "1"
 
-# No test may read the REAL service.env (2026-09-04): sdk_backend.work_api_key now reads the manager
-# env file LIVE (kernel/keysource.py) instead of popping os.environ once, so on a machine running a
-# live romp every auth test would otherwise resolve the developer's ACTUAL API key — quietly billing
-# nothing, but making the key material a test input, putting it one assertion message away from a
-# terminal, and making the pinned fixture-key tests pass or fail on whether this box happens to have
-# a key configured. Pointed at a path inside the temp state root that is never created, so every read
-# is the "no file" case and the startup-pop fallback governs, exactly as before the live source
-# existed. Both spellings, because keysource accepts both. Import-time (collection is floored too)
-# plus a per-test re-assert below, on the same reasoning as the manager port.
+# No test may read the REAL service.env (2026-09-04; the reason changed on 2026-09-08): the kernel's boot
+# check (kernel/credentials.py) reads the manager env file for retired provider lines, so on a machine whose
+# file still carries one every kernel-loading test would refuse to start. Pointed at a path inside the temp
+# state root that is never created, so every read is the "no file" case. Both spellings, because the
+# path resolver accepts both. Import-time (collection is floored too) plus a per-test re-assert below, on
+# the same reasoning as the manager port.
 _NO_SERVICE_ENV = os.path.join(os.environ["XDG_STATE_HOME"], "no-such-service.env")
 os.environ["ROMP_SERVICE_ENV_FILE"] = _NO_SERVICE_ENV
 os.environ["ROMP_SERVICE_ENV"] = _NO_SERVICE_ENV
-# No test starts with a KEY SOURCE the developer's shell configured (2026-09-08). Every session shell
-# under a romp-managed manager inherits the manager's credentials: ANTHROPIC_API_KEY (the startup key
-# sdk_backend.startup_api_key claims), ROMP_API_KEY_CMD and ROMP_API_KEY_REF (the runtime providers
-# keysource._env_provider selects straight from the environment when the isolated env file above is
-# absent), ROMP_EXPECTED_AUTH (the box-wide auth declaration), the competing token credentials
-# sdk_backend.startup_auth_env claims, and 1Password's own names keysource.claim_op_env takes. A
-# test that constructs a backend, resolves a key or asks default_auth then reads the DEVELOPER'S
-# configuration: 73 tests across eight modules went red on a box running the command key source
-# while CI, which exports none of these, stayed green (the manager's full run, 2026-09-08). Popped at
-# import so module-level loads see the clean baseline, and re-asserted per test below; a test that
-# wants a source sets a synthetic one itself in setUp, which runs after the fixture. The list is the
-# code's own constants (tests/test_key_source_floor.py pins it against keysource.SOURCE_VARS,
-# keysource.OP_ENV_NAMES / OP_ENV_PREFIX and sdk_backend.AUTH_ENV_NAMES).
+# No test starts with a CREDENTIAL the developer's shell configured (2026-09-08). Every session shell under
+# a romp-managed manager inherits the manager's environment: the retired provider names (which the boot
+# check now refuses outright), ROMP_EXPECTED_AUTH (the box-wide auth declaration), the login tokens
+# sdk_backend.startup_auth_env claims, and the 1Password CLI's own names. A test that constructs a backend
+# or asks default_auth would otherwise read the DEVELOPER'S configuration: 73 tests across eight modules
+# went red on a box running a key command while CI, which exports none of these, stayed green (the
+# manager's full run, 2026-09-08). Popped at import so module-level loads see the clean baseline, and
+# re-asserted per test below; a test that wants a credential sets a synthetic one itself in setUp, which
+# runs after the fixture. The list is the code's own (tests/test_key_source_floor.py pins it against
+# credentials.FLOOR_ENV_NAMES / FLOOR_ENV_PREFIXES and sdk_backend.AUTH_ENV_NAMES).
 KEY_SOURCE_ENV_NAMES = (
-    "ANTHROPIC_API_KEY", "ROMP_API_KEY_REF", "ROMP_API_KEY_CMD",          # keysource.SOURCE_VARS
-    "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",                     # sdk_backend.AUTH_ENV_NAMES (the rest)
+    "ROMP_API_KEY_CMD", "ROMP_API_KEY_REF", "ANTHROPIC_API_KEY",          # credentials.RETIRED_VARS
+    "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",                     # credentials.LOGIN_TOKEN_VARS
     "ROMP_EXPECTED_AUTH",                                                  # the auth declaration
-    "OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN", "OP_ACCOUNT",   # keysource.OP_ENV_NAMES
+    "OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN", "OP_ACCOUNT",   # credentials.OP_ENV_NAMES
 )
-KEY_SOURCE_ENV_PREFIXES = ("OP_SESSION_",)                                # keysource.OP_ENV_PREFIX
+KEY_SOURCE_ENV_PREFIXES = ("OP_SESSION_",)                                # credentials.OP_ENV_PREFIX
 
 
 def _scrub_key_source_env():
@@ -168,23 +162,29 @@ def _scrub_key_source_env():
 
 _scrub_key_source_env()
 # Every shell under a romp-managed session inherits ROMP_SUPERVISED=1 from the kernel (the service
-# unit exports it), and keysource gives that variable authority: a supervised manager reads the env
-# file only and ignores a startup key. Twenty-five tests that stage a startup key went red when the
-# suite ran from inside a romp session while CI stayed green (review find, 2026-09-05). The floor is
-# the unsupervised case; a test that wants supervision sets the variable itself.
+# unit exports it). The variable used to give the retired key-source module authority over a startup key;
+# it is still popped so a test's world is the unsupervised baseline (review find, 2026-09-05), and a test
+# that wants supervision sets the variable itself.
 os.environ.pop("ROMP_SUPERVISED", None)
 
 
-def _reset_keysource_state():
-    """keysource remembers which path selected which source for the PROCESS (that is the resurrection
-    guard); under one pytest process that memory would leak between test modules. Every loaded copy of
-    the module (each SourceFileLoader name is its own module object) is reset."""
+# No test may read the box's REAL managed settings (2026-09-08): credentials.py reads
+# /etc/claude-code/managed-settings.json (or the macOS path) as the top of Claude Code's precedence, so a
+# test asserting "no helper" would lie on a box whose administrator set one there. Every loaded copy of the
+# module is pointed at a path inside the temp state root that is never created; a test that wants a managed
+# file stubs managed_settings_path itself in setUp, after this fixture.
+_NO_MANAGED_SETTINGS = os.path.join(os.environ["XDG_STATE_HOME"], "no-such-managed-settings.json")
+
+
+def _reset_credential_state():
+    """credentials.py memoizes the helper's value in process memory for its TTL; under one pytest process
+    that memo would leak between test modules. Every loaded copy of the module is reset, and its managed
+    settings path floored (above)."""
     import sys
     for name, m in list(sys.modules.items()):
-        if "keysource" in name and hasattr(m, "_AUTHORITATIVE_PATHS"):
-            m._AUTHORITATIVE_PATHS.clear()
-            getattr(m, "_ENV_PROVIDER_PATHS", set()).clear()
-            m._CACHE = ((), "")
+        if "credentials" in name and hasattr(m, "forget_helper_key"):
+            m.forget_helper_key()
+            m.managed_settings_path = lambda: _NO_MANAGED_SETTINGS
 
 
 @pytest.fixture(autouse=True)
@@ -197,7 +197,7 @@ def _no_real_service_env():
         os.environ[var] = _NO_SERVICE_ENV
     _scrub_key_source_env()
     os.environ.pop("ROMP_SUPERVISED", None)
-    _reset_keysource_state()
+    _reset_credential_state()
     yield
 
 
@@ -283,13 +283,12 @@ def _no_cli_scope():
     yield
 
 
-# No test may reach the machine's REAL tmux server (2026-09-06): keysource.claim_op_env scrubs the tmux
-# server's globals the moment romp becomes the op consumer, which any test that configures a reference
-# and constructs the SDK backend (or resolves a key) does — and on a developer's box that `tmux
-# set-environment -gu` would land on the live server every session runs in. The same private socket
-# directory the bats suites use (tests/tmux-private.bash): tmux puts every socket, `-L` ones included,
-# under $TMUX_TMPDIR/tmux-<uid>/, and the directory must exist or tmux 3.4 silently falls back to the
-# default. No server ever exists there, so a scrub from a test exits with "no server running".
+# No test may reach the machine's REAL tmux server (2026-09-06; the reason changed on 2026-09-08): the
+# retired key-source module used to scrub the live server's globals from inside a test, and any tmux-backed
+# test still runs its commands somewhere. The same private socket directory the bats suites use
+# (tests/tmux-private.bash): tmux puts every socket, `-L` ones included, under $TMUX_TMPDIR/tmux-<uid>/,
+# and the directory must exist or tmux 3.4 silently falls back to the default. No server ever exists
+# there, so a tmux command from a test exits with "no server running" instead of touching the live one.
 os.environ["TMUX_TMPDIR"] = tempfile.mkdtemp(prefix="romp-tests-tmux-")
 os.environ.pop("TMUX", None)
 os.environ.pop("ROMP_TMUX_SOCKET", None)

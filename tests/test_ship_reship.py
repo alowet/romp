@@ -71,6 +71,26 @@ class SourcePins(unittest.TestCase):
         self.assertIn('ack["shipId"] = str(msg["shipId"])', KERNEL_SRC)
         self.assertIn("if (ackShip && !shipOwner(ackShip)) return;", RENDER)
 
+    def test_the_pane_holds_the_dashboards_reload_while_a_ship_or_a_held_send_is_in_flight(self):
+        # T272 (2026-09-08): the dashboard reloads itself on a kernel restart (T265), and a reload costs an upload in
+        # flight its bytes and a held send its release — the very wedge the reconnect re-ship heals in the same page.
+        # So the chat pane answers the reload core's busy ask while either is pending; the shim's own reasons first.
+        self.assertIn('(window as any).__rompPaneBusy = (): string => {', RENDER)
+        self.assertIn('if (pendingShips.size) return "upload";', RENDER)
+        self.assertIn('if (shipGateSid) return "held-send";', RENDER)
+        self.assertIn('const shimBusy = (window as any).__rompPaneBusy as (() => string) | undefined;', RENDER)
+
+    def test_the_chat_page_loads_the_shim_before_the_bundle_so_the_busy_report_wraps_the_shims(self):
+        # the wrapper above reads the shim's window.__rompPaneBusy first and replaces it; that only holds because the
+        # chat page emits the shim inline BEFORE <script src=/dist/render.js> — the other order would let the shim's
+        # own assignment overwrite the wrapper and drop the upload and held-send reasons with every pin above green
+        src = open(os.path.join(ROOT, "kernel", "kernel.py"), encoding="utf-8").read()
+        page = src[src.index("def _chat_page():"):src.index("\ndef ", src.index("def _chat_page():") + 10)]
+        self.assertLess(page.index("<script>%s</script>"), page.index("/dist/render.js"), "the shim's script precedes the bundle in the chat page")
+        self.assertIn('_shim("chat", v)', page)
+        self.assertIn('window.__rompPaneBusy=function(){return (everConnected&&queue.length>queuedDiag)?"sends":"";};', src,
+                      "the shim defines the hook the pane wraps")
+
     def test_a_reload_loss_is_loud_never_a_silent_vanish(self):
         self.assertIn("shipsInFlight: [...pendingShips.values()].flat().map((p) => p.name)", RENDER)
         self.assertIn("still uploading when this page reloaded, so it was NOT attached", RENDER)
@@ -127,20 +147,48 @@ const k2 = spawn(cfg.relaunch.cmd, [], { env: cfg.relaunch.env, detached: true,
   stdio: ["ignore", fs.openSync(cfg.relaunch.log, "a"), fs.openSync(cfg.relaunch.log, "a")] });
 k2.unref();   // the kernel outlives this driver — an un-unref'd child held node open past RESULT
 fs.writeSync(1, "KPID:" + k2.pid + "\n");
+// T272: the restart's reload request normally rides the next keepalive (its cadence, not this test's); it is raised
+// HERE, while the ship is pending and the send held, so the hold is exercised on every run: on a pane without the
+// busy report the page reloads at once and the wait below dies (reloadedEarly), which is the failure this pins. The
+// probe marks THIS page: its disappearance is the reload firing on its own once the pane is idle again.
+await page.evaluate(() => { window.__probe = 1; const R = window.__rompReload; if (R) R.request("restart", "forced-by-the-test"); }).catch(() => {});
 // today (pre-fix) this wait dies: the chip pulses forever and the held send never fires.
 // with the fix: romp:wsup re-ships, the ack retires the chip, and fireHeldSend sends the message.
-const healed = await page.waitForFunction((msg) => {
+// T272: the dashboard reloads itself on the restart (a new boot id, T265) — but only once this pane is no longer
+// busy: the pending ship and the held send hold the reload (render.ts __rompPaneBusy) until the ack lands and the
+// send fires, all on THIS page. A reload before that would take the upload's bytes with it (the loss toast) and
+// leave the send unfired: an early navigation here is the failure this test exists for, so it is recorded, never
+// swallowed.
+let reloadedEarly = false;
+// the heal is measured INSIDE the wait, on the page that healed: the reload the restart owes is let through the
+// instant the pane is idle again (the last ack and the held send's release tell the core, endReloadHoldIfIdle), so a
+// measurement taken a poll later may find a fresh page. The predicate also records that the reload was owed and
+// WAITING while the pane was busy (window.__rompReload.owed() && !fired() with the chip still pending) — the held
+// reload this fix is for.
+const heal = await page.waitForFunction((msg) => {
+  const R = window.__rompReload;
   const input = document.getElementById("composer-input");
   const pending = document.querySelectorAll(".composer-file-pending").length;
   const content = document.getElementById("content");
-  return pending === 0 && input && input.value === "" &&
-         !!content && content.textContent.includes(msg);
-}, cfg.msg, { timeout: 45000 }).then(() => true).catch(() => false);
-out.wedge.healedAfterRestart = healed;
-out.wedge.pendingAfterRestart = await page.locator(".composer-file-pending").count();
-out.wedge.inputAfterRestart = await page.inputValue("#composer-input");
-out.wedge.contentHasMsg = await page.evaluate(
-  (msg) => (document.getElementById("content")?.textContent || "").includes(msg), cfg.msg);
+  if (R && R.owed() && !R.fired() && pending > 0) window.__t272HeldWhileBusy = String(R.waiting || "busy");
+  const ok = pending === 0 && !!input && input.value === "" && !!content && content.textContent.includes(msg);
+  return ok ? JSON.stringify({ pending, input: input.value, hasMsg: true, held: window.__t272HeldWhileBusy || null,
+                               owedNow: !!(R && R.owed()), firedNow: !!(R && R.fired()) }) : false;
+}, cfg.msg, { timeout: 45000 }).then(async (h) => JSON.parse(await h.jsonValue()))
+  .catch((e) => { if (/context was destroyed|navigation/i.test(String(e))) reloadedEarly = true; return null; });
+out.wedge.healedAfterRestart = !!heal;
+out.wedge.reloadedEarly = reloadedEarly;
+out.wedge.pendingAfterRestart = heal ? heal.pending : -1;
+out.wedge.inputAfterRestart = heal ? heal.input : null;
+out.wedge.contentHasMsg = heal ? heal.hasMsg : false;
+out.wedge.reloadHeldWhileBusy = heal ? heal.held : null;
+out.wedge.reloadOwedAfterHeal = heal ? heal.owedNow : null;
+// now the pane is idle: the owed reload fires ON ITS OWN (the ending event, never a nudge from this driver) — wait for
+// the page to go, then follow it
+out.wedge.reloadFiredAfterHeal = await page.waitForFunction(() => window.__probe !== 1, null, { timeout: 20000 }).then(() => true).catch(() => false);
+await page.waitForLoadState("load").catch(() => {});
+await page.waitForSelector("#composer-input", { timeout: 20000 });
+await page.waitForTimeout(500);
 if (cfg.shots) await page.screenshot({ path: cfg.shots + "-wedge.png" });
 
 // ---- regression: a normal ship+send against the restarted kernel, untouched ----
@@ -310,10 +358,16 @@ class ServedWedge(_ShipLab):
                          "the held send keeps the composer text until the upload settles: %r" % w)
         self.assertEqual(w["chipStillPendingHeld"], 1, "the chip is honestly pending while held: %r" % w)
         # the heart of T215: after the restart the reconnect re-ships, the ack lands, the send fires
+        self.assertFalse(w.get("reloadedEarly"), "the dashboard's own reload on the restart must WAIT for the pending ship and the "
+                                                  "held send (T272): a reload first would lose the upload's bytes and leave the send unfired: %r" % w)
         self.assertTrue(w["healedAfterRestart"],
                         "the reconnect must re-ship and release the held send — pre-fix this pulses "
                         "forever and the send never fires: %r (kernel log tail: %s)"
                         % (w, Path(self.klog).read_text()[-500:]))
+        self.assertIn(w.get("reloadHeldWhileBusy"), ("upload", "held-send", "sends"),
+                      "the restart's reload was owed and WAITING on this pane while the ship and the held send were in flight: %r" % w)
+        self.assertTrue(w.get("reloadFiredAfterHeal"), "…and fired on its own once the ack landed and the send left (the ending event, "
+                                                       "render.ts endReloadHoldIfIdle) — never waiting for the user's next click: %r" % w)
         self.assertEqual(w["pendingAfterRestart"], 0, "no chip may pulse over an upload that settled: %r" % w)
         self.assertEqual(w["inputAfterRestart"], "", "the held send must have fired: %r" % w)
         self.assertTrue(w["contentHasMsg"], "the sent message must be in the transcript view: %r" % w)

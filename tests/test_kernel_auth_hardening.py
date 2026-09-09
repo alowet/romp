@@ -16,6 +16,7 @@ Synthetic only — no real session data; the gate decision touches no session st
 Mirrors tests/test_kernel_ws_auth.py's module load order.
 """
 import io
+import hashlib
 import json
 import os
 import socket
@@ -643,7 +644,7 @@ class PostBodyGateOverTheWire(unittest.TestCase):
 
 
 _AH_KEY_MATERIAL = "test-key-material-" + "z" * 28   # invented; not shaped like any provider's key
-_AH_KEY_FP = sb._keysrc.fingerprint(_AH_KEY_MATERIAL)   # what a keyed launch records (_launched_key_fp)
+_AH_KEY_FP = hashlib.sha256(_AH_KEY_MATERIAL.encode()).hexdigest()[:12]   # a synthetic 12-hex identity for the label under test
 
 
 class _ApiHealthBackend:

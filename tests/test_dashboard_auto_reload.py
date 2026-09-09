@@ -222,7 +222,21 @@ var R = window.__rompReload;
 STORE["romp:reloaded"] = JSON.stringify({ reason: "build", detail: "9", from: 6, path: "/feed", t: 1 });
 out({ first: R.announce(null), left: STORE["romp:reloaded"] || null });""")
         self.assertIsNone(s3["first"], "a marker another page wrote (a standalone /feed reload) is not this page's to announce")
-        self.assertIsNone(s3["left"], "…but it is consumed, so it cannot be misattributed later")
+        self.assertIsNotNone(s3["left"], "…and it is LEFT for the page it names (T272, 2026-09-08): sessionStorage is shared across the shell "
+                                         "and its same-origin panes, and a pane's shim that read as standalone for a beat consumed the "
+                                         "shell's marker before the path check — the shell then found nothing to announce, and the "
+                                         "notification-center line the served test waits for never appeared")
+        # the shell's marker (path "/") survives a pane's early announce and is announced by the shell itself, once
+        s4 = run_core("""
+var R = window.__rompReload; var notes = [];
+STORE["romp:reloaded"] = JSON.stringify({ reason: "restart", detail: "2.2", from: 6, path: "/", t: 1 });
+location.pathname = "/chat"; var pane = R.announce(null);
+location.pathname = "/"; var shell = R.announce(function (k, t) { notes.push([k, t]); }); var again = R.announce(null);
+out({ pane: pane, shell: shell, again: again, notes: notes, left: STORE["romp:reloaded"] || null });""")
+        self.assertIsNone(s4["pane"], "the chat pane leaves the shell's marker alone")
+        self.assertEqual(s4["shell"], "Reloaded onto build 7 — the kernel restarted.", "the shell announces its own reload")
+        self.assertEqual(s4["notes"], [["reload", "Reloaded onto build 7 — the kernel restarted."]])
+        self.assertIsNone(s4["again"], "one line per reload"); self.assertIsNone(s4["left"], "consumed by its own page")
 
     def test_the_shell_composes_gesture_state_across_its_panes_and_a_pane_forwards_its_request(self):
         s = run_core("""
