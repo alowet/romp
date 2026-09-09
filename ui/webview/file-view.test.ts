@@ -256,17 +256,18 @@ test("format prefs: rendered is the markdown default, and a corrupt entry reads 
 });
 
 // B: the toggle itself — markdown only, and the rendered path is sanitized. These are arbitrary bytes
-// off a disk and marked emits raw HTML verbatim, so DOMPurify sits between it and .innerHTML with the
-// same profile the chat's md() uses (render.ts).
+// off a disk and marked emits raw HTML verbatim, so DOMPurify sits between it and the DOM, through the
+// ONE sanitizer the chat's md() uses too (sanitizeMd, md-sanitize.ts); what it does to a file's own HTML
+// is executed in headless Chromium by md-sanitize-browser.test.ts.
 test("Raw ⇄ Rendered exists for markdown ONLY, and nothing reaches innerHTML unsanitized", () => {
   assert.match(VIEW, /const isMd = langFor\(path\) === "markdown";/);
   // the two buttons are built inside the isMd gate — a .py file shows no Rendered/Raw toggle
   assert.match(VIEW, /if \(isMd\) \{\s*\n\s*for \(const mode of \["rendered", "raw"\] as const\)/);
   assert.match(VIEW, /const rendered = isMd && fmt\.md === "rendered";/, "non-md never renders as prose");
-  assert.match(VIEW, /import DOMPurify from "dompurify";/);
-  // html + svg, in lockstep with the chat's md(): KaTeX draws stretchy glyphs as inline <svg>
-  // …and data-* never rides in from a document's raw HTML: the page's delegates key actions off data-act
-  assert.match(VIEW, /box\.innerHTML = DOMPurify\.sanitize\(dirty, \{ USE_PROFILES: \{ html: true, svg: true \}, ADD_DATA_URI_TAGS: \["img"\], ALLOW_DATA_ATTR: false \}\);/);
+  assert.match(VIEW, /import \{ sanitizeMd \} from "\.\/md-sanitize";/);
+  assert.doesNotMatch(VIEW, /from "dompurify"/, "the viewer spells no profile of its own: every option comes through md-sanitize.ts");
+  // the sanitized <body>'s children are adopted as they are (no re-parse of a serialized string)
+  assert.match(VIEW, /box\.replaceChildren\(\.\.\.Array\.from\(sanitizeMd\(dirty\)\.childNodes\)\);/);
   // a README's links open a NEW tab rather than navigating the hosting pane's document away
   assert.match(VIEW, /target = "_blank"/);
   assert.match(VIEW, /rel = "noopener"/);

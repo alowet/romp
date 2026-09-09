@@ -3568,8 +3568,18 @@ function makeSessHead(): HTMLElement {
   h.append(nm, fold, cnt, svc, clr, svcList);
   (h as any)._name = nm; (h as any)._fold = fold; (h as any)._foldn = cnt;
   (h as any)._svc = svc; (h as any)._svcList = svcList; (h as any)._clear = clr;
+  // HOVER-FREEZE for the header row too (the user 2026-09-09, T285): a push while the pointer rests on the
+  // row — its name, its caret, its Clear all — must not rebuild the row under the pointer (the click-safety
+  // rule; a rebuilt Clear all lost the click). The row holds the same payload gate a card holds, keyed by
+  // the session it stands for, and releases it on mouseleave exactly like a card; entering the row's own
+  // buttons is entering the row (mouseenter/leave do not fire between a row and its children).
+  h.addEventListener("mouseenter", () => freezeEnter(sessFreezeKey(h)));
+  h.addEventListener("mouseleave", () => freezeLeave(sessFreezeKey(h)));
   return h;
 }
+/** The hover-freeze key a session header holds: "h:<sid>", read from the data-fsid stamp at event time (grouped
+ *  mode re-homes and re-stamps headers across renders; the stamp is the row's identity). */
+function sessFreezeKey(h: HTMLElement): string { return "h:" + (h.getAttribute("data-fsid") || ""); }
 function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
   // the hover-freeze badge painter finds headers by sid; compare first, like the labels below — the DOM's
   // change-an-attribute steps queue a mutation record for a same-value write too
@@ -5022,9 +5032,10 @@ function render() {
   // is stale, clear it and flush the queue; a DIFFERENT card under the pointer (re-keyed in place,
   // so no enter event ever fired) → re-arm to the element actually being hovered.
   if (freezeKey) {
-    const hov = document.querySelector<HTMLElement>(".feed-cols .fitem:hover");
+    // a card OR a session header under the pointer (T285): both hold the gate
+    const hov = document.querySelector<HTMLElement>(".feed-cols .fitem:hover, .feed-sess-head:hover");
     if (!hov) { freezeKey = null; flushFreeze(); }
-    else { const k = kbHoverId(hov); if (k && k !== freezeKey) freezeKey = k; }
+    else { const k = hov.classList.contains("feed-sess-head") ? sessFreezeKey(hov) : kbHoverId(hov); if (k && k !== freezeKey) freezeKey = k; }
   }
   paintFreezeBadges();   // hover-freeze: local renders while frozen re-sync the +N/-N hints (no-op unfrozen)
   // stale-ring heal: releaseTabScope sweeps the DOCUMENT, but a card DETACHED at release (filtered
@@ -5240,10 +5251,10 @@ function mirrorBadges(items: AskItem[], clears: ClearNoticeRow[], sdk: SdkNotice
 }
 
 // ── HOVER-FREEZE (the user 2026-08-24) ──────────────────────────────────────────────────────────
-// While the pointer rests on a card, the board must not move under it: incoming feed payloads QUEUE
-// (newest wins — intermediate states were never on screen, so nothing owes them an animation)
-// instead of rendering, and the deferred churn shows as a subtle +N/-N beside the column pills and,
-// in grouped mode, the session headers. Only the PAYLOAD path defers: the hovered card's own
+// While the pointer rests on a card — or on a session header row and its buttons (T285) — the board
+// must not move under it: incoming feed payloads QUEUE (newest wins — intermediate states were never
+// on screen, so nothing owes them an animation) instead of rendering, and the deferred churn shows
+// as a subtle +N/-N beside the column pills and, in grouped mode, the session headers. Only the PAYLOAD path defers: the hovered card's own
 // controls and every local gesture still render live from the displayed model. Flush is event-based
 // (repo rule, no timers): the hovered card's mouseleave applies everything at once — a card CLEARED
 // under the pointer flushes too, via its synthetic mouseleave — and window blur is the backstop.
@@ -5331,7 +5342,7 @@ function pendingSelfChanged(key: string): boolean {
 }
 function paintFreezeBadges(): void {
   if (!pendingFeedPayload) {
-    document.querySelectorAll(".freeze-badge").forEach((n) => n.remove());
+    document.querySelectorAll(".freeze-badge").forEach((n) => n.remove());   // the floating header note is one too
     document.getElementById("freeze-selfnote")?.remove();
     return;
   }
@@ -5348,9 +5359,27 @@ function paintFreezeBadges(): void {
     put(document.querySelector(".feed-col.col-" + key + " .feed-col-head"), d.cols[key]);
   }
   const groupedNow = feedPrefs().grouped;
+  // The HOVERED header row must not change shape (T285 review): a badge appended inside it lands after the
+  // auto-margin Clear all and slides that button out from under the pointer — the click loss the header
+  // hold exists to prevent, caused by the hold's own hint. That row's badge floats instead: body-mounted,
+  // pointer-inert, right-aligned just under the row (the self-note idiom), so the row's rect stands.
+  const hoveredSid = freezeKey && freezeKey.startsWith("h:") ? freezeKey.slice(2) : null;
+  let headNote = document.getElementById("freeze-headnote") as HTMLElement | null;
+  let floated = false;
   document.querySelectorAll<HTMLElement>(".feed-sess-head").forEach((h) => {
-    put(h, groupedNow ? d.sess[h.getAttribute("data-fsid") || ""] : undefined);
+    const sid = h.getAttribute("data-fsid") || "";
+    const c = groupedNow ? d.sess[sid] : undefined;
+    if (sid !== hoveredSid) { put(h, c); return; }
+    put(h, undefined);                                   // never inside the hovered row
+    if (!c || (!c.add && !c.del)) return;
+    if (!headNote) { headNote = el("div", "freeze-badge"); headNote.id = "freeze-headnote"; document.body.appendChild(headNote); }
+    paintFreezeParts(headNote, c);
+    const r = h.getBoundingClientRect();
+    headNote.style.top = Math.round(r.bottom + 2) + "px";
+    headNote.style.right = Math.max(0, Math.round(window.innerWidth - r.right)) + "px";
+    floated = true;
   });
+  if (!floated) headNote?.remove();
   // the hovered/keyed card's OWN pending update — its own line, independent of the churn badges
   // (both show when both are true). Body-mounted and pointer-inert: it must never affect hover,
   // and the frozen card's rect is stable by construction (that is the freeze's whole contract).

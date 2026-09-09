@@ -386,7 +386,8 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 .tab-group-head.dragging { opacity: 0.45; }
 .tab-group-head.drop-target { box-shadow: inset 2px 0 0 var(--accent); }
 /* the disclosure chevron: ▸ folded, turned down while open — the fold-caret idiom (a CSS transition on
-   the flip, no timer) */
+   the flip, no timer). Right after the chip with the count after it (T284), the feed's grouped headers'
+   order; the header is content-sized, so the DOM order alone places them. */
 .tab-group-caret { display: inline-block; flex: 0 0 auto; width: 0.9em; text-align: center; transition: transform 0.12s ease; }
 .tab-group-head:not(.collapsed) .tab-group-caret { transform: rotate(90deg); }
 /* the tag's color as a short bar, not a dot: a dot beside a name is a session pip */
@@ -535,6 +536,13 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 .tab.tab-placeholder.colored .tab-label { opacity: 0.75; }   /* keep the identity color but a touch muted while loading */
 /* the pane-local wait while a clicked loading tab's payload is still on its way (showActive) */
 .tab-loading-wait { display: flex; align-items: center; justify-content: center; min-height: 60vh; }
+/* SKELETON tab (2026-09-07): a tab the kernel LISTS but this page holds no current copy of — after a redial the
+   kernel sends only the active tab in full and withholds the rest (skeleton-tabs.ts), each resting here until a
+   click or the idle prefetch loads it. Distinct from the placeholder by construction: NO swirl (that means "romp is
+   generating this", a transient — this is a running session at rest), the identity color kept, the label a touch
+   muted at the placeholder's own 0.75 (no new opacity vocabulary), and an honest chip — the kernel's status dot, or
+   the gray unknown ring until the first status frame lands (render.ts makeSkeletonTab / applyTabStatus). */
+.tab.tab-skeleton .tab-label { opacity: 0.75; }
 .tab-ph-swirl { width: 12px; height: 12px; border-radius: 2px; flex: none;
   animation: tab-ph-swirl-spin 7s linear infinite; }   /* .tab is flex with its own gap, so no margin needed */
 @keyframes tab-ph-swirl-spin { to { transform: rotate(-360deg); } }
@@ -629,6 +637,9 @@ body.chat-theme-yatharth .tab.active.colored:not(.tab-blocked) {
 /* the tab menu's Tags flyout (the user 2026-08-24): identity dot per union tag, ✕ = remove-
    everywhere, an inline New tag… input — all in the menu vocabulary, no new font sizes */
 .ctx-tag-dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; }
+/* a tag chip standing for an UNSELECTED toggle (the tag-lens menu, T283): faded, its colour kept —
+   the state class; tag-menu.ts paints the same opacity inline for a sheet-less host (TAG_CHIP_OFF_OPACITY) */
+.tag-chip-off { opacity: 0.45; }
 .ctx-tag-x { flex: 0 0 auto; background: none; border: none; color: var(--dim); cursor: pointer; font: inherit; padding: 0 2px; }
 .ctx-tag-x:hover { color: var(--fg); }
 .ctx-item-newtag { cursor: default; }
@@ -644,6 +655,11 @@ body.chat-theme-yatharth .tab.active.colored:not(.tab-blocked) {
 .ctx-caret { margin-left: auto; padding-left: 10px; opacity: 0.55; align-self: center; }
 .ctx-sub { z-index: 101; }
 .ctx-sub .ctx-item { padding-right: 26px; position: relative; }
+/* a choice this box cannot bill (the Billing flyout, the user 2026-09-08: both options always listed,
+   the unavailable one greyed with the reason in its title, inert) — the same dim-and-no-hover the
+   feed view menu's .forced items wear */
+.ctx-sub .ctx-item.disabled { opacity: 0.45; cursor: default; }
+.ctx-sub .ctx-item.disabled:hover { background: transparent; color: inherit; }   /* .ctx-item:hover also recolours */
 .ctx-sub .ctx-item.current::after {
   content: "✓"; position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
   background: var(--check-bg); color: #fff; border-radius: 50%;
@@ -3580,6 +3596,9 @@ body.filebrowse-open { overflow: hidden; }
 /* a refusal explains itself in place, in the kernel's own words (too large — with the size and the
    cap; not a text file; not found) over the path it was asked for. Never a blank pane. */
 .fileview-err { padding: 18px 14px; font-size: 0.86em; color: var(--warn); }
+/* the edit-mode notice (file-view.ts noteBar) is a row of the card, between the title bar and the body:
+   it keeps its height and the body row shrinks under it, so the editor's 100% is the body it can see */
+.fileview > .fileview-err { flex: 0 0 auto; }
 .fileview-err-hint { margin-top: 6px; color: var(--dim); font-size: 0.92em;
   font-family: var(--mono, ui-monospace, monospace); word-break: break-all; }
 /* the way out of a refusal: when the file exists but cannot render (413/415), the kernel's words are
@@ -3624,7 +3643,14 @@ body.filebrowse-open { overflow: hidden; }
    sheets — the .romp-acted precedent); font sizes reuse what this surface already wears (the page base,
    12px mono, the err-hint's 0.92em). Vars the feed sheet does not define carry the chat's literals as
    fallbacks (feed-css-vars.test.ts holds that line). */
-.fileview-md { padding: 14px 18px; max-width: 860px; overflow-wrap: anywhere; font-family: var(--font-prose); }
+/* contain: layout makes .fileview-md the containing block for any fixed or absolutely positioned descendant: an
+   element in a file that reaches `position: fixed` (a class of the page's it happens to wear; the sanitizer drops
+   an inline one) stays inside the note instead of covering the viewer's chrome. Layout only, not paint: the
+   body's vertical scroll is untouched. Content wider than .fileview-md becomes ink overflow the body cannot
+   scroll to, so the media rules below cap an <svg>, <canvas> or <video> at the column as `.fileview-md img`
+   already does, and the table rule below gives a table wider than the column a horizontal scroll of its own.
+   Pinned byte-equal in both sheets (fileview-parity.test.ts). */
+.fileview-md { padding: 14px 18px; max-width: 860px; overflow-wrap: anywhere; font-family: var(--font-prose); contain: layout; }
 .fileview-md > :first-child { margin-top: 0; }
 .fileview-md > :last-child { margin-bottom: 0; }
 .fileview-md p { margin: 0.5em 0; }
@@ -3657,10 +3683,22 @@ body.filebrowse-open { overflow: hidden; }
   font-family: var(--mono, ui-monospace, monospace); font-size: 12px; line-height: 1.5;
   color: var(--code-fg, #e1c08d); white-space: pre-wrap; overflow-wrap: anywhere;
 }
-.fileview-md table { border-collapse: collapse; margin: 0.6em 0; }
+/* A table wider than the column (a `nowrap` cell, many columns) scrolls sideways on its own, as on GitHub: a block
+   box shrink-wrapped to its content (width: max-content) and capped at the column, with the overflow scrollable.
+   Under contain: layout the body cannot scroll to what a table lets run past the column, so the table has to.
+   border-collapse is inherited by the anonymous table box the block wraps, so the cell borders still collapse. */
+.fileview-md table { border-collapse: collapse; margin: 0.6em 0; display: block; width: max-content; max-width: 100%; overflow-x: auto; }
 .fileview-md th, .fileview-md td { border: 1px solid var(--box-border); padding: 4px 10px; text-align: left; }
 .fileview-md th { background: var(--box-bg); }
 .fileview-md img { max-width: 100%; }
+/* Media a file draws itself (an inline <svg> diagram, a <canvas>, a <video>) fits the column the way an <img> does:
+   under contain: layout anything wider than .fileview-md is clipped at the body's edge and unreachable. :where() keeps
+   the selectors at element specificity, so KaTeX's own rules for the <svg> glyphs it draws inside a formula
+   (`.katex svg`, sized by its sheet) still outrank them. height: auto keeps a pixel-sized svg's or canvas's own
+   ratio (its viewBox, or its width and height) as the cap shrinks it; a percentage-width element is never shrunk by
+   the cap and keeps the author's height. */
+:where(.fileview-md) svg, :where(.fileview-md) canvas, :where(.fileview-md) video { max-width: 100%; }
+:where(.fileview-md :is(svg, canvas)[width]:not([width$="%"])) { height: auto; }
 
 /* ── the viewer's image + PDF bodies (a .png used to open as line-numbered mojibake). The <img>
    wears the lightbox image's own treatment (.romp-lightbox-img: capped, object-fit contain, the

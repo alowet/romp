@@ -41,6 +41,7 @@ class SessionRetrySuppress(unittest.TestCase):
         self.dir = Path(self.td.name)
         self._orig = {k: getattr(km, k) for k in
                       ("_alive_sessions", "_parse_cached", "_session_chip", "_mark_views_dirty")}
+        self._saved_state = km.jd.STATE
         km.jd.STATE = self.dir                          # retry-suppressed.json lives under jd.STATE
         km._retry_suppress_cache.clear()                # the file cache is process-global — reset per test
         km._mark_views_dirty = lambda *a, **k: None     # no clients in the test
@@ -48,6 +49,7 @@ class SessionRetrySuppress(unittest.TestCase):
     def tearDown(self):
         for k, v in self._orig.items():
             setattr(km, k, v)
+        km.jd.STATE = self._saved_state                 # km.jd is the shared judge module, whatever name the kernel loaded under
         self.td.cleanup()
 
     # --- arming ---

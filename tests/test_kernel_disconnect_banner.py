@@ -47,7 +47,7 @@ class DisconnectBanner(unittest.TestCase):
         self.assertIn('if(wasReconn){var ann=restartAnnounced&&Date.now()-restartAnnounced<30000;'
                       'restartAnnounced=0;', js)   # T217: the announced-restart latch spends inside the gate
         self.assertIn('if(!ann)armStale(pendingWhy||"reconnect");', js)
-        self.assertIn('try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}}', js)
+        self.assertIn('try{window.dispatchEvent(new Event("romp:wsup"));}catch(e){}\nenqueue({type:"wsup"});}', js)
         self.assertNotIn("if(everConnected){location.reload();return;}", js,
                          "the silent auto-reload-on-reconnect is replaced by a reload PROMPT")
         self.assertNotIn("ws.onclose=function(){setTimeout(function(){location.reload();},1500);};", js,
@@ -247,7 +247,10 @@ class DisconnectBanner(unittest.TestCase):
         # old fixed top banner is GONE (it got in the way, the user 2026-07-27)
         self.assertIn("var s=(m.state==='up')?'up':'down',prev=st[m.app];st[m.app]=s;", km._LANDING_ERRS_JS)
         land = inspect.getsource(km._landing)
-        self.assertIn("id=rail-errs", land, "the bell sits in the bottom bar's action cluster")
+        self.assertNotIn("id=rail-errs", land, "the Log's opener left the bottom bar's action cluster (T290): it opens from the gear")
+        self.assertIn("if(m.romp==='openLog'&&window.__rompOpenErrs)window.__rompOpenErrs();", km._LANDING_SETTINGS_JS,
+                      "the gear's Open log reaches the shell's panel")
+        self.assertIn("if(!back||!list)return;", km._LANDING_ERRS_JS, "the center's script stands without the bar icon")
         self.assertIn("id=rerr-back", land, "the popover backdrop is in the shell body")
         self.assertIn("_LANDING_ERRS_JS", land, "the center's script is injected into the shell")
         self.assertNotIn("id=romp-offline", land, "the top banner element is gone")

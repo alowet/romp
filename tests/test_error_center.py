@@ -145,7 +145,8 @@ const jumpRow = EL['rerr-list'].children[0];
 out.jump = { linky: jumpRow.className.indexOf('link') >= 0 };
 jumpRow.fire('click');
 out.jump.closed = EL['rerr-back'].hidden;
-out.jump.posted = POSTED[POSTED.length - 1] || null;
+out.jump.posted = POSTED.filter((m) => m.romp === 'revealCard').pop() || null;   // paint() also posts the unread count (T290)
+out.unseenPosts = POSTED.filter((m) => m.romp === 'logUnseen').map((m) => m.n);
 out.jump.toggles = TOGGLES.join('|');
 // …while a kernel-minted entry (no target) is not clickable
 out.plainRowLinky = EL['rerr-list'].children[1].className.indexOf('link') >= 0;
@@ -258,6 +259,9 @@ class ErrorCenterExecutes(unittest.TestCase):
         self.assertTrue(a["linky"], "a targeted entry renders as a link row")
         self.assertTrue(a["closed"], "the popover closes on jump")
         self.assertEqual(a["posted"], {"romp": "revealCard", "itemId": "TESTSID:g9", "sid": "TESTSID"})
+        # the unread count rides into the feed pane for the gear's Open log button (T290): the drop posted a 1,
+        # opening the Log (everything seen) posted a 0
+        self.assertIn(1, self.out["unseenPosts"]); self.assertIn(0, self.out["unseenPosts"])
         self.assertIn("feed:true", a["toggles"], "the feed pane is revealed for the jump")
         self.assertFalse(self.out["plainRowLinky"], "a kernel-minted entry with no target is not a link")
 
@@ -270,13 +274,13 @@ class ErrorCenterExecutes(unittest.TestCase):
 class ErrorCenterWiring(unittest.TestCase):
     def test_the_shell_mounts_bell_popover_and_script(self):
         html = km._landing()
-        for pin in ("id=rail-errs", "id=rerr-back", "id=rerr-list", "id=rerr-clear", "id=merr"):
+        for pin in ("id=rerr-back", "id=rerr-list", "id=rerr-clear", "id=merr"):   # the desktop bar's opener left (T290)
             self.assertIn(pin, html)
         self.assertNotIn("rerr-badge", html)   # the CORNER badge clipped and is gone (the user 2026-07-27);
         # the count lives INSIDE the glyph (the user 2026-07-28): an svg <text> the JS drives,
         # reddening with the outline via fill=currentColor
         self.assertIn("<text class='rerr-n'", html)
-        self.assertEqual(html.count("class='rerr-n'"), 2, "rail + mobile, both from the ONE _ERRS_SVG")
+        self.assertEqual(html.count("class='rerr-n'"), 1, "the mobile bar's only, from the ONE _ERRS_SVG (the desktop bar's opener left, T290)")
         self.assertIn("n>9?'+':String(n)", html)
         # the errors glyph is a warning TRIANGLE since 2026-07-28 — the BELL shape now belongs to the
         # session/card notification toggles, so the error center must not wear it; when nothing is
@@ -285,9 +289,9 @@ class ErrorCenterWiring(unittest.TestCase):
         self.assertIn("n<=0?'!'", html)
         self.assertNotIn("M8 2 C5.8 2 4.5 3.7", html, "the old bell path left the shell entirely")
         # "Log", not "Errors" (the user 2026-07-29): quiet informational kinds live here too, so the
-        # old name oversold every entry as a problem. BOTH glyphs (rail + mobile) say what it is.
+        # old name oversold every entry as a problem. the mobile glyph says what it is (the rail's copy left with T290).
         self.assertIn("title='Log — click to open'", html)
-        self.assertEqual(html.count("title='Log — click to open'"), 2)
+        self.assertEqual(html.count("title='Log — click to open'"), 1, "the mobile bar's #merr only (T290)")
         self.assertIn("<div class=rerr-top>Log<span class=sp></span>", html)
         self.assertNotIn("aria-label=Errors", html)
         # the panel speaks the shared modal vocabulary (network panel / settings card), never the

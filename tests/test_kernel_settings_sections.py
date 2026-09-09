@@ -62,7 +62,8 @@ class SettingsSectionsTest(unittest.TestCase):
         self.assertLess(h.index(">Updates & debug<"), h.index("id=rs-judges-index"))
         self.assertLess(h.index(">Updates & debug<"), h.index("id=rs-judges-triage"))
         self.assertLess(h.index("id=rs-judges-triage"), h.index("id=ra-open"))
-        self.assertLess(h.index("id=ra-open"), h.index("id=rsver"), "version is the very bottom")
+        self.assertLess(h.index("id=ra-open"), h.index("id=rs-log-open"), "Open log is the section's last row (T290)")
+        self.assertLess(h.index("id=rs-log-open"), h.index("id=rsver"), "version is the very bottom")
         self.assertNotIn("id=rs-debug", h)   # the single Debug toggle is gone
         # the judge toggles read as a DEBUG *show* control, not an on/off for the judges (the user 2026-06-30):
         # labels lead with "Show", and the sub spells out that it doesn't enable/disable them
@@ -71,10 +72,19 @@ class SettingsSectionsTest(unittest.TestCase):
         self.assertIn("does NOT turn the judges on or off", h)
 
     def test_the_sdk_backend_is_labelled_plain_sdk(self):
-        # "SDK", not "SDK (headless)" (the user 2026-07-12): it drives the same full chat UI
+        # the backends as the user reads them (T288, the user 2026-09-09): "Claude Code" (the default, no
+        # qualifier — never "SDK" in copy a person reads), "Claude Code (tmux)", "Codex"
         h = _gear_src()
-        self.assertIn("<option value=sdk>SDK</option>", h)
+        self.assertIn("<option value=sdk>Claude Code</option><option value=tmux>Claude Code (tmux)</option><option value=codex>Codex</option>", h)
         self.assertNotIn("headless", h)
+        self.assertNotIn(">SDK<", h)
+        self.assertNotIn("SDK runs via", h)
+        self.assertNotIn("new SDK session", h)
+        # the tmux backend's offer: a checkbox in Updates & debug, off by default, stamped and propagated like the
+        # judge knobs; the Default backend list follows it in the same modal (paintBackendOffer)
+        self.assertTrue(h.index(">Updates & debug<") < h.index("id=rs-tmuxbackend") < h.index("id=rs-judges-index"))
+        self.assertIn("<b>Enable Claude Code tmux backend <span class=rs-mixed hidden></span></b>", h)
+        self.assertIn("id=rs-backend-note", h, "the sub-line that says a saved tmux default is set aside")
 
     def test_judge_rows_are_one_line_label_plus_picker(self):
         # label + picker share the line (the user 2026-07-12): nine .rs-jrow rows — six judge rows

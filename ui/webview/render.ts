@@ -1,6 +1,5 @@
 import { marked } from "marked";
-import DOMPurify from "dompurify";
-import type { Config } from "dompurify";   // the one sanitizer profile both md() and userMd() share
+import { sanitizeMd, userContentTarget } from "./md-sanitize";   // the one sanitizer every markdown surface shares, and the lookup for a message's own `#` links
 import hljs from "highlight.js/lib/core";
 import bash from "highlight.js/lib/languages/bash";
 import python from "highlight.js/lib/languages/python";
@@ -25,10 +24,12 @@ import { markerLabel, dayContext } from "./time-marker";
 import { compactDisplay, toolCounts, type DisplayItem } from "./compact";
 import { senderKind, SenderKind } from "./sender-identity";
 import { loadSettings, onExternalSettingsChange, installSettingsSync, type RompSettings } from "./settings";
+import { backendLabel, effectiveDefaultBackend } from "./backend-names";
 import { delegate } from "./actions";
 import { awaitWord, awaitBreakdown, groupRows, GROUP_TITLE, workingFor, type AwaitRow } from "./spin-caption";
 import { isClearCmd, openTopTitles, clearConfirmDetail, endConfirmDetail } from "./clear-confirm";
 import { prebuildPlan, type ViewState } from "./prebuild";
+import { newSkeletonState, applyTabOrderSkeleton, onStatus, onFull, onDismiss, onSocketUp, nextPrefetch, renderKind } from "./skeleton-tabs";
 import { reconcileTabOrder } from "./tab-order";
 import { writeViewOrder } from "./view-order";
 import { planStrip, readTabGroups, writeTabGroups, setSectionCollapsed, sectionRef, isPinned, setPinned, prunePinned, reachableFrom, headWords,
@@ -57,6 +58,7 @@ import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser
 import { pastedFilePath } from "./paste-path";
 import { insertAtCaret } from "./composer-insert";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
+import { defaultCommentName, defaultBreakoutName, defaultForkName, nameToSend } from "./comment-name";
 import { followReader, keepPlaceAcrossShow, followTail, atBottomDist, followBoxBelow, followTailShrink } from "./scroll-keep";
 import { retainLiveOmitted } from "./tab-order";
 import { userTurnShows } from "./user-turn-content";
@@ -264,7 +266,21 @@ interface TodoTask { id: string; subject: string; activeForm?: string; status: s
 
 type ChipState = "working" | "ready" | "needsInput" | "awaiting" | "awaitingBg" | "idle" | "closed" | "compacting" | "clearing" | "blocked" | "retrying" | "interrupting" | "opening";   // needsInput = a live permission/picker prompt (on YOU) — renamed from the legacy "awaiting" (2026-08-15), which stays accepted for OLDER REMOTE KERNELS across federation; awaitingBg = idle main thread waiting on background work it dispatched (the user 2026-07-13)
 type PeerIdent = { name: string; host?: string; sid?: string; color?: { bg: string; fg: string } | null };   // a named peer behind a peer-kind wait (kernel _peer_identity, 2026-08-26)
-interface Status { state: ChipState; sinceEpoch: number | null; awaitingWhy?: string | null; awaitingKind?: string | null; awaitingPeers?: PeerIdent[] | null; awaitingTasks?: string[]; awaitingTaskIds?: string[]; awaitingCount?: number | null; awaitingItems?: AwaitRow[]; effort?: string; model?: string; modelPending?: boolean; effortPending?: boolean; mode?: string; fast?: string; auth?: string; authLive?: string; authPending?: boolean; authBoth?: boolean; authAcct?: string; ctx?: string; ctxOver?: boolean; ctxColor?: number[]; modelColor?: number[]; effortColor?: number[]; modelTone?: number[]; effortTone?: number[]; ctxTone?: number[]; faded?: boolean; backend?: string; apiTooLong?: boolean; apiSpendLimit?: boolean; apiModelLimit?: boolean; apiAuthErr?: boolean; apiRefusal?: boolean; retrySuppressed?: boolean; retryNextAt?: number | null; retryTries?: number | null; }   // awaitingWhy/awaitingTasks = what an awaitingBg session is waiting on (kernel _session_awaiting's phrasing + the live awaited task descriptions) — the #bg-tasks box renders it as the header of the in-flight rows (renderBgTasks; the user 2026-08-13, who moved it out of the statusline the same day PR #350 put it there)   // retrySuppressed = the user interrupted this thread's API-error storm → romp's auto-retry stays OFF for it until a successful turn re-arms (the user 2026-07-06). backend = "tmux" | "sdk"; apiTooLong = the "blocked" is a "prompt is too long" error (on you → red tab) vs a transient API error (amber/retrying); apiSpendLimit = a monthly spend cap (on you → raise it; NEVER auto-retried — retrying can't fix it, the user 2026-07-14); apiModelLimit = this session's MODEL is out of allowance (on you → switch model or add credits; not auto-retried either, the user 2026-08-01); apiRefusal = the model's safeguards refused the prompt itself (on you → rewrite it or drop the thread; never auto-retried — a refusal is deterministic on the same input, so a retry just manufactures the same refusal, the user 2026-08-15); ctxColor = the GLOBAL colormap's RGB for the context%, computed server-side; modelColor/effortColor = the same map's RGB tint for the model name + effort (by capability/effort rank), server-computed; modelPending = a /model switch is resolving → the badge shows switching-dots until the new name lands (server-driven, event-based, the user 2026-07-03); fast = the CLI's fast-mode state ("on"/"off"/"cooldown", from the SDK init's fast_mode_state; absent = unknown/unavailable → no fast badge)
+// which billing sides this box can bill, and why not for the other (kernel _auth_avail, 2026-09-08): the
+// Billing submenu lists both and greys the unavailable one with the reason in its hover
+interface AuthAvail { login?: boolean; key?: boolean; loginWhy?: string; keyWhy?: string; acct?: string; default?: string }
+interface Status { state: ChipState; sinceEpoch: number | null; awaitingWhy?: string | null; awaitingKind?: string | null; awaitingPeers?: PeerIdent[] | null; awaitingTasks?: string[]; awaitingTaskIds?: string[]; awaitingCount?: number | null; awaitingItems?: AwaitRow[]; effort?: string; model?: string; modelPending?: boolean; effortPending?: boolean; mode?: string; fast?: string; auth?: string; authLive?: string; authPending?: boolean; authBoth?: boolean; authAvail?: AuthAvail; authPickUnavailable?: string; authPickFell?: string; authAcct?: string; ctx?: string; ctxOver?: boolean; ctxColor?: number[]; modelColor?: number[]; effortColor?: number[]; modelTone?: number[]; effortTone?: number[]; ctxTone?: number[]; faded?: boolean; backend?: string; apiTooLong?: boolean; apiSpendLimit?: boolean; apiModelLimit?: boolean; apiAuthErr?: boolean; apiRefusal?: boolean; retrySuppressed?: boolean; retryNextAt?: number | null; retryTries?: number | null; }   // awaitingWhy/awaitingTasks = what an awaitingBg session is waiting on (kernel _session_awaiting's phrasing + the live awaited task descriptions) — the #bg-tasks box renders it as the header of the in-flight rows (renderBgTasks; the user 2026-08-13, who moved it out of the statusline the same day PR #350 put it there)   // retrySuppressed = the user interrupted this thread's API-error storm → romp's auto-retry stays OFF for it until a successful turn re-arms (the user 2026-07-06). backend = "tmux" | "sdk"; apiTooLong = the "blocked" is a "prompt is too long" error (on you → red tab) vs a transient API error (amber/retrying); apiSpendLimit = a monthly spend cap (on you → raise it; NEVER auto-retried — retrying can't fix it, the user 2026-07-14); apiModelLimit = this session's MODEL is out of allowance (on you → switch model or add credits; not auto-retried either, the user 2026-08-01); apiRefusal = the model's safeguards refused the prompt itself (on you → rewrite it or drop the thread; never auto-retried — a refusal is deterministic on the same input, so a retry just manufactures the same refusal, the user 2026-08-15); ctxColor = the GLOBAL colormap's RGB for the context%, computed server-side; modelColor/effortColor = the same map's RGB tint for the model name + effort (by capability/effort rank), server-computed; modelPending = a /model switch is resolving → the badge shows switching-dots until the new name lands (server-driven, event-based, the user 2026-07-03); fast = the CLI's fast-mode state ("on"/"off"/"cooldown", from the SDK init's fast_mode_state; absent = unknown/unavailable → no fast badge)
+
+// The side a pick this box cannot bill actually fell to ("login" | "key"), "" when nothing did: the kernel's
+// authPickFell (the launch's own decision, 2026-09-09). An older kernel without the field is read the way the
+// Billing sub-line always inferred it: the pick is unavailable and the other side exists.
+function authFellTo(st: Status): string {
+  if (st.authPickFell !== undefined) return st.authPickFell || "";
+  if (!st.auth || st.authPickUnavailable !== st.auth) return "";
+  const other = st.auth === "key" ? "login" : "key";
+  const avail: AuthAvail = st.authAvail || { login: true, key: true };
+  return avail[other] ? other : "";
+}
 interface Color { bg: string; fg: string; }
 // A run_in_background task surfaced in the #bg-tasks box (the kernel's _bg_tasks): a one-line summary +
 // status, expandable to the command + its output. status = running | completed | failed. For a dispatched
@@ -627,6 +643,25 @@ const CLOSE_ACK_MS = 15_000;
 // Optimistic label/color edits awaiting their kernel echo — holds a stale in-flight push from
 // reverting the strip (see tab-meta.ts; the sessionViews pending machinery's reasoning).
 const pendingTabMeta = new Map<string, PendingTabMeta>();
+// Tabs the kernel LISTS but is withholding from this page (skeleton-tabs.ts, 2026-09-07): after a redial the
+// kernel sends only the active tab in full and names the rest here, each carrying a status frame instead of
+// a transcript. Declared up here beside tabMeta and closingTabs for the same reason they are: renderTabs reads it.
+const skeletonTabs = newSkeletonState();
+// The skeleton tab the user is LOOKING AT while its full is on the way (showActive's loader branch). Latched for
+// upsert, because on the click path the strip that RELEASES the id (the kernel dropped it from the set when it sent
+// the full) lands BEFORE the full itself, so by the time the frame arrives the id is no longer in the set and
+// onFull() reports it was never a skeleton — appendActive would then append onto the hidden view and the loader
+// would stay up over a current transcript (review find 2026-09-07). Cleared when showActive shows a real view.
+let skeletonLoading: string | null = null;
+// The session a DISPLAY path may read for `id` — undefined while the tab is a skeleton, even though a stale
+// pre-outage `sessions` entry is kept underneath (upsert appends onto it later, so the DOM and the reader's
+// scroll survive). Every active-tab display path — showActive and its callees, the statusline, the ticks,
+// the rails, the fork/comment gates — reads through this; bookkeeping paths (drafts, MRU, reconcile, names)
+// keep sessions.get: a stale name is still the tab's name. Showing the stale copy as current is the lie
+// this exists to make impossible.
+function liveSession(id: string | null | undefined): Session | undefined {
+  return id && !skeletonTabs.ids.has(id) ? sessions.get(id) : undefined;
+}
 // The romp identity palette for the tab right-click color picker (the user 2026-06-29). Fetched once from the
 // kernel's /palette so the client holds no color literals; empty until it lands (the menu just omits the row).
 // The palette is SELECTABLE now (the user 2026-07-12): a {type:"palette"} push lands the new set on switch.
@@ -1108,15 +1143,13 @@ function el(tag: string, cls?: string): HTMLElement {
   return e;
 }
 
-// ONE sanitizer profile for both renderers. svg profile too (the user 2026-08-19): KaTeX's html output
-// still draws STRETCHY glyphs — \sqrt radicals, wide accents, extensible arrows — as inline <svg><path>,
-// and the html-only profile silently ate them: $\sqrt{d}$ rendered as a bare serif "d", the radical gone.
-// DOMPurify's svg profile is still sanitized (no scripts, handlers, or foreignObject). Keep data: URIs on
-// <img> (the CSP allows them and inline transcript images rely on them).
-// ALLOW_DATA_ATTR: false (2026-09-07): transcript HTML must not mint data-* attributes — the chat's
-// document-level delegate keys every action off data-act, so a `<span data-act="stopRetrying">` in a
-// message would post an interrupt on a click. Nothing the renderer needs rides data-* through md().
-const MD_PURIFY: Config = { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"], ALLOW_DATA_ATTR: false };
+// ONE sanitizer for both renderers, shared with the file viewer: sanitizeMd in md-sanitize.ts holds the
+// profile (html + svg, data: URIs on <img>, no data-*, and rules modelled on GitHub's for a message's own
+// HTML: no <style>, no form controls, prefixed ids, colour-only inline styles) and returns the sanitized <body>
+// for the DOM walk below. KaTeX is rendered AFTER the sanitizer, into the inert placeholders the math
+// extensions emit (math.ts renderMathPlaceholders): its layout is all inline style, which the colour-only
+// rule would strip, so it never passes through DOMPurify; the fill is a post-pass sanitizeMd itself runs,
+// registered by chat-md.ts, the module that installs the grammar.
 
 function md(src: string, repo: string | null = prRepoFor()): string {
   // Transcript text (user prompts, assistant output, subagent reports, postal
@@ -1124,15 +1157,15 @@ function md(src: string, repo: string | null = prRepoFor()): string {
   // must be sanitized before it ever reaches .innerHTML — otherwise a payload
   // like `<img src=x onerror=...>` or `[x](javascript:...)` runs in the webview
   // (which can postMessage the host to open files / drive sessions). DOMPurify
-  // strips event-handler attributes and dangerous URL schemes (profile: MD_PURIFY).
+  // strips event-handler attributes and dangerous URL schemes (md-sanitize.ts).
   try {
     const dirty = marked.parse(src) as string;
-    // RETURN_DOM hands back the sanitized <body> instead of its innerHTML — the same nodes, ours to
-    // walk once before the serialization DOMPurify would otherwise have done itself: PR references
+    // sanitizeMd hands back the sanitized <body> instead of its innerHTML: the same nodes, ours to
+    // walk once before the serialization DOMPurify would otherwise have done itself. PR references
     // in the prose (`#123`, `PR #123`, `owner/repo#123`) become links to the session's repository
     // (pr-links.ts; the user 2026-09-06). Text inside code, pre or an existing anchor is skipped, so
     // the sanitizer's verdicts stand and a marked-autolinked GitHub URL is never wrapped twice.
-    const clean = DOMPurify.sanitize(dirty, { ...MD_PURIFY, RETURN_DOM: true }) as HTMLElement;   // the sanitized <body>
+    const clean = sanitizeMd(dirty);   // the sanitized <body>, its math rendered
     linkifyPrRefs(clean, repo);
     return clean.innerHTML;
   } catch { const d = document.createElement("div"); d.textContent = src; return d.innerHTML; }
@@ -1146,7 +1179,7 @@ function md(src: string, repo: string | null = prRepoFor()): string {
 // walk as md(): a `#123` the user typed links to the session's repository too.
 function userMd(src: string, repo: string | null = prRepoFor()): string {
   try {
-    const clean = DOMPurify.sanitize(userMdHtml(src), { ...MD_PURIFY, RETURN_DOM: true }) as HTMLElement;
+    const clean = sanitizeMd(userMdHtml(src));   // the sanitized <body>, its math rendered
     linkifyPrRefs(clean, repo);
     return clean.innerHTML;
   } catch { const d = document.createElement("div"); d.textContent = src; return d.innerHTML; }
@@ -1316,7 +1349,45 @@ document.addEventListener("click", (e) => {
   const a = (e.target as HTMLElement)?.closest?.("a[href]") as HTMLAnchorElement | null;
   if (!a) return;
   const href = a.getAttribute("href") || "";
-  if (!/^[a-z][a-z0-9+.-]*:/i.test(href)) return; // fragment/relative — leave alone
+  if (href.startsWith("#")) {
+    // An in-page anchor in a message (a footnote's back link, `[section](#install)` over the reply's own `<a name>`):
+    // the sanitizer prefixes every author id and name user-content- (md-sanitize.ts, GitHub's rule) and leaves the
+    // href as written, so the browser's default lookup, which reads the bare name, finds nothing and the click would
+    // die. Resolved here the way GitHub's page script does: the target is looked up under the prefix or bare
+    // (userContentTarget), in the message's own rendered body first (its note before a same-named element in an
+    // older message), then the whole document; found, it is revealed and scrolled into view and the default action
+    // cancelled (the hash stays as it was: the target is not a page location). Not found, the click is left to the
+    // browser, as it was. A modified click (ctrl, ⌘ or shift asked the browser for a tab or a window) keeps the
+    // browser's, the rule the .md-URL arm below applies. The bodies: `.md`, which every body md() and userMd()
+    // fill wears, and a comment thread's agent reply (commentMsgEl: `div.cmt-msg.agent`), the one body md() fills
+    // that does not; an anchor the page built itself carries a data-act and stands in neither. A link outside a
+    // message (the file viewer's own section links, fv-anchor) is not this handler's: the viewer lands those itself.
+    if (e.ctrlKey || e.metaKey || e.shiftKey) return;
+    const msg = a.hasAttribute("data-act") ? null : a.closest(".md, .cmt-msg.agent");
+    if (!msg) return;
+    let frag = href.slice(1);
+    try { frag = decodeURIComponent(frag); } catch { /* a malformed escape: the spelling as written */ }
+    const target = frag ? userContentTarget(msg, frag) || userContentTarget(document, frag) : undefined;
+    if (!target) return;
+    e.preventDefault();
+    // The browser's fragment navigation REVEALS the target before it scrolls (the HTML spec's ancestor revealing
+    // steps): every closed <details> whose content holds the target is opened, and a `hidden="until-found"` on the
+    // target or an ancestor is removed. scrollIntoView does neither, so the same steps run here, ahead of the
+    // scroll; both shapes pass the sanitizer (details, summary and hidden are kept). A target inside a details'
+    // own <summary> is in view already and opens nothing, as in the browser.
+    for (let n: Element | null = target; n; n = n.parentElement) {
+      if ((n.getAttribute("hidden") || "").toLowerCase() === "until-found") n.removeAttribute("hidden");
+      const p = n.parentElement;
+      if (p && p.localName === "details" && n.localName !== "summary" && !p.hasAttribute("open")) p.setAttribute("open", "");
+    }
+    // a target inside the transcript moves #content, so the move is the pane's own write (every mover of #content
+    // is a writeScroll, attributed); a target elsewhere on the page scrolls its own container the browser's way
+    const cont = document.getElementById("content");
+    if (cont && cont.contains(target)) scrollElInto(cont, target, "start", "section-link");
+    else target.scrollIntoView({ block: "start" });
+    return;
+  }
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(href)) return; // relative: leave alone
   e.preventDefault();
   e.stopPropagation();
   if (location.protocol === "http:" || location.protocol === "https:") {
@@ -2604,7 +2675,7 @@ function paintScrollMarks(): void {
   const box = ensureScrollMarks();
   const content = document.getElementById("content");
   const v = activeId ? views.get(activeId) : null;
-  const s = activeId ? sessions.get(activeId) : null;
+  const s = activeId ? liveSession(activeId) : null;
   if (!content || !v || !s || v.el.style.display === "none") { box.style.display = "none"; scrollMarksSig = ""; return; }
   const cRect = content.getBoundingClientRect();
   // The WHOLE loaded conversation gets notches, not just the rendered DOM window (the user
@@ -4283,7 +4354,7 @@ function renderApiError(ev: Extract<ChatEvent, { kind: "apiError" }>): HTMLEleme
   // unblock is dismissing that dialog, so the tmux card offers exactly that (the kernel verifies the
   // menu is up, then sends Esc — cancel, never a billing change). An SDK spend-cap card names the fix
   // (raise the cap) with no dead button at all.
-  const st = activeId ? sessions.get(activeId)?.status : undefined;
+  const st = activeId ? liveSession(activeId)?.status : undefined;
   // A spent MODEL allowance gets no Retry either (the user 2026-08-01): "retry" re-fails until the model
   // changes or its own window resets, so the card names the fix instead of offering a button that cannot work.
   // A dead CREDENTIAL is the same shape (the user 2026-08-08, per-session auth): retrying re-presents the
@@ -4327,7 +4398,7 @@ function renderApiError(ev: Extract<ChatEvent, { kind: "apiError" }>): HTMLEleme
   const paused = globalRetryPaused;
   // Per-thread suppression (the user 2026-07-06): the user interrupted THIS thread's storm → its auto-retry is
   // held off until a successful turn re-arms it. Distinct from the global pause; "Retry now" + a message still work.
-  const suppressed = activeId ? !!sessions.get(activeId)?.status.retrySuppressed : false;
+  const suppressed = activeId ? !!liveSession(activeId)?.status.retrySuppressed : false;
   if (refusal) countdown.textContent = REFUSAL_REMEDY;   // never "retrying soon…": a refusal is deterministic, and the tick RE-ASSERTS this line every second
   else if (spendCap) countdown.textContent = "spend limit reached — raise it at claude.ai/settings/usage";   // never "retrying soon…": the tick skips spend-capped threads
   else if (paused) countdown.textContent = retryPausedText();   // a usage-limit pause counts down to the window reset
@@ -4421,7 +4492,7 @@ function apiRetryTick(): void {
   const cds = document.querySelectorAll(".apierror-countdown");
   const cd = cds.length ? (cds[cds.length - 1] as HTMLElement) : null;
   if (cd) {
-    const active = activeId ? sessions.get(activeId) : null;
+    const active = activeId ? liveSession(activeId) : null;
     if (active?.status.apiRefusal) {
       // A refusal is never auto-retried, so there is no countdown to show — hold the remedy line.
       // FIRST in the ladder: the global pause is about auto-retry, which a refusal never gets. Writing
@@ -4994,6 +5065,26 @@ function applyTabOrder(o: any, tabs?: any, report?: OrderReport, live?: any) {
   for (const id of kernelOrder) kernelListed.add(id);
   renderTabs();
 }
+// The tabOrder frame's `skeleton` list (2026-09-07): the tabs the kernel is withholding from this page after a
+// redial (skeleton-tabs.ts). Applied BEFORE applyTabOrder — the dispatch calls this first — so the ONE
+// renderTabs inside it paints the final state, with no intermediate frame wearing the old set.
+function noteSkeletonTabOrder(m: any): void {
+  const kernelOrder: string[] = Array.isArray(m.order) ? m.order.filter((x: any) => typeof x === "string") : [];
+  const changed = applyTabOrderSkeleton(skeletonTabs, m.skeleton, kernelOrder);
+  // One breadcrumb per reconnect that produced a set (client-diag.jsonl), so the regime is named from the
+  // user's machine: re-armed by the socket opening (romp:wsup), spent by the first strip carrying a non-empty
+  // list. Not per frame — the key rides every strip while the set is non-empty (the shim's FIFO replaces a
+  // queued strip with a newer one, so a frame without it would erase the set), and that would be a row a cycle.
+  if (skeletonDiagArmed && Array.isArray(m.skeleton) && skeletonTabs.ids.size) {
+    skeletonDiagArmed = false;
+    vscodeApi?.postMessage({ type: "clientDiag", surface: "chat", what: "skeleton", data: { n: skeletonTabs.ids.size, active: activeId } });
+  }
+  // The tab we are ON just became a skeleton (a click landed between the redial and the kernel's strip, or the
+  // kernel's active hint named a tab this page was not showing): its stale view is still on screen. Re-show —
+  // the loader replaces the stale transcript and the ask goes out (showActive's skeleton branch). Keyed on the
+  // set CHANGING, so an unchanged strip never re-runs it.
+  if (changed && activeId && skeletonTabs.ids.has(activeId)) showActive();
+}
 // Order-audit instrumentation (the user 2026-07-02): tabs STILL occasionally reorder themselves and code
 // reading alone has never found why, so watch the RENDERED order itself. Whenever two tabs present in both
 // the previous and the current render swap relative slots (a permutation — adds/drops are routine churn),
@@ -5117,7 +5208,7 @@ function showTabTip(tab: HTMLElement, s: Session): void {
   if (s.status.effort) rows.push(["Effort", s.status.effort]);
   // Backend is a plain labelled FIELD now, under the others (the user 2026-07-08 — no longer a coloured
   // "SDK backend" badge at the top of the tooltip; it reads as one of the session's config fields).
-  if (be === "sdk" || be === "tmux" || be === "codex") rows.push(["Backend", be === "sdk" ? "SDK" : be === "codex" ? "Codex" : "tmux"]);
+  if (be === "sdk" || be === "tmux" || be === "codex") rows.push(["Backend", backendLabel(be)]);   // the shared names (T288); a tmux session keeps its label whatever the offer setting says
   // Billing: whether this tab bills the API key or the Claude login — and WHICH login account (the
   // user 2026-08-09: shown whenever the backend reports it, one-auth machines included; only a tmux
   // session, whose CLI env romp does not control, reports nothing). No key material, ever.
@@ -5131,6 +5222,14 @@ function showTabTip(tab: HTMLElement, s: Session): void {
   if (s.status.auth) rows.push(["Billing",
     s.status.authPending
       ? (s.status.auth === "key" ? "API key" : "Login") + " (applying — not confirmed yet)"
+      // the pick names a side this box cannot bill (the kernel's authPickUnavailable, with the reason
+      // in authAvail): the launch went to the other side, and the row says so (the user 2026-09-08)
+      : s.status.authPickUnavailable === s.status.auth
+        ? `⚠ ${s.status.auth === "key" ? "API key" : "Login"} picked, but ${(s.status.auth === "key" ? s.status.authAvail?.keyWhy : s.status.authAvail?.loginWhy) || "this machine cannot bill it"}`
+          // the fall is the kernel's word (authFellTo), never inferred from the pick alone: on a box with
+          // neither side the launch went out as picked and the CLI decided (2026-09-09)
+          + (authFellTo(s.status) ? ` — this session bills ${authFellTo(s.status) === "key" ? "the API key" : "the login"}`
+                                  : " — nothing to fall to, so the launch went out as picked")
       : s.status.authLive && s.status.authLive !== s.status.auth
         ? `⚠ ${s.status.auth === "key" ? "API key" : "Login"} picked, but the CLI reports `
           + `${s.status.authLive === "key" ? "the API key" : "the login"} — this session bills that`
@@ -5281,18 +5380,25 @@ function makeGroupHead(sec: TabSection, collapsed: boolean, holdsActive: boolean
       if (e.key === "Enter" || e.key === " ") { e.preventDefault(); head.click(); }
     });
   }
+  // The header's order mirrors the feed's grouped headers (T284, the user 2026-09-09: the caret sat
+  // beside the chip at the left; the feed's Working / Blocked / Completed headers and its session
+  // headers put the name at the left and the caret with its count together at the RIGHT): the tag's
+  // chip first, then the caret and the count right after it, then (folded) the gist's pip last — so
+  // the folded and the open row share one shape and the caret is always the chip's neighbour. The
+  // whole row stays the fold's click target, the keyboard and aria paths above are unchanged, and the
+  // fold state key (the tag's name) is unchanged.
+  // The tag as THE CHIP it wears everywhere (T251, the user 2026-09-07: the swatch+name pair read as a
+  // plain label; the chip says "this is the tag" the way the tags bar and the feed say it, so which
+  // tabs belong to which group reads at a glance). The shared builder from tag-menu.ts — one
+  // vocabulary, never a lookalike — inheriting the header's own sub-line size (no nested em).
+  const chip = tagChip(name, sec.color, { inheritSize: true });
+  chip.classList.add("tab-group-chip");
+  head.appendChild(chip);
+  // the caret and the count, right after the chip (the feed's order: name, caret, then count)
   const caret = el("span", "tab-group-caret");
   caret.textContent = "▸";                       // turned down by CSS while open (.tab-group-head:not(.collapsed))
   caret.setAttribute("aria-hidden", "true");
   head.appendChild(caret);
-  // the tag as THE CHIP it wears everywhere (T251, the user 2026-09-07: the swatch+name pair read as a
-  // plain label; the chip says "this is the tag" the way the tags bar and the feed say it, so which
-  // tabs belong to which group reads at a glance). The shared builder from tag-menu.ts — one
-  // vocabulary, never a lookalike — inheriting the header's own sub-line size (no nested em). The
-  // count rides right after it in the same row.
-  const chip = tagChip(name, sec.color, { inheritSize: true });
-  chip.classList.add("tab-group-chip");
-  head.appendChild(chip);
   const n = el("span", "tab-group-count");
   n.textContent = words.count;   // folded: the hidden members — a pinned one shows itself; all pinned: the total (headWords)
   head.appendChild(n);
@@ -5356,6 +5462,150 @@ function sectionHeadOf(node: HTMLElement): HTMLElement | null {
     n = n.previousElementSibling;
   }
   return null;
+}
+
+// ── tab builders shared by the loaded tab (renderTabs) and the skeleton tab (2026-09-07) ──────────────────────
+// The chip — the status → class/dot/bar block every tab wears, lifted out of renderTabs (2026-09-07) so a
+// SKELETON tab draws EXACTLY the same chip from the status frames the kernel still sends it, and never from
+// the stale pre-outage session it holds underneath. `s.status` may be EMPTY (a skeleton before its first
+// status frame lands): no state → the gray "unknown" ring, the honest "listed, state not yet known". Returns
+// the state so the caller can finish its own chrome (the ✕ title, the gauge).
+function applyTabStatus(tab: HTMLElement, s: { status: Partial<Status> }): ChipState | undefined {
+  const st = s.status.state;
+  // the state class — working gold, an on-YOU block alarm-red dashed vs a transient API error's
+  // amber auto-retry, awaiting, compacting, closed — is tab-state.ts's rule, shared with the
+  // folded section header's pip so the two can never disagree on what is red, and read by the
+  // strip's signature (renderTabs) so a state whose class changed always repaints
+  const stateCls = tabStateClass(s.status);
+  if (stateCls) tab.classList.add(stateCls);
+  if (s.status.faded) tab.classList.add("at-rest");
+  // WORKING shows a yellow dot; AWAITING-BG the same dot in await-green — matching the chip's color, so the
+  // tab reads the split at a glance (the user 2026-07-13); BLOCKED (API error) gets NO dot — the dashed
+  // red tab highlight instead (the user 2026-06-16). MISSING state: an explicit gray ring, so a bare tab
+  // can only mean a state with its own treatment or a healthy idle one, never a hole. OPENING: the accent
+  // loader dot (the user 2026-08-10). The slot itself is there in EVERY state (T262g, the user 2026-09-08):
+  // a dot that came and went with the state changed the tab's width, and with the strip at a wrap boundary
+  // that added or removed a row and slid the transcript under the reader by a row's height (tabDotClass).
+  const dotCls = tabDotClass(st);
+  if (dotCls) tab.appendChild(el("span", dotCls));
+  // compacting → a tiny animated compaction bar before the name (the tab gets no outline for this state,
+  // so the bar IS the cue). A teal fill whose right edge slides left and loops — the same "compression"
+  // motion as the statusline ctx-scan bar (.ctx-compress), miniaturised. Replaces the static ⇲ glyph the
+  // user disliked (2026-06-24): motion reads as a transient PROCESS, not a status colour. Compacting can't
+  // coincide with working, so no dot clash.
+  if (st === "compacting") {
+    const ci = el("span", "tab-compacting-bar");
+    const cfill = el("span", "tab-compacting-fill");
+    applyCompactSweep(cfill);   // phase-sync across re-renders (the anim no longer restarts) + colormap gradient
+    ci.appendChild(cfill);
+    ci.title = "compacting — compressing the conversation to free up context";
+    tab.appendChild(ci);
+  }
+  return st;
+}
+
+// Drag-to-reorder (synced with the timeline via the shared session-order file), shared by loaded and skeleton
+// tabs — a skeleton is a real live session, so reordering it is legitimate. Lifted verbatim out of renderTabs.
+function wireTabDrag(tab: HTMLElement, id: string): void {
+  // Exactly ONE thing on screen may look like the dragged tab (T133, the user 2026-08-27: the
+  // native drag image following the pointer PLUS the dimmed in-flow tab read as a ghost
+  // duplicate, unlike any other software they knew). The native image is blanked, and the dimmed
+  // in-flow element — the one that live-reorders through the strip — is the single provisional
+  // visual, browser-style. dragImageBlank must be a rendered DOM node at dragstart (Chromium
+  // snapshots it), hence the fixed off-viewport 1px div installed once below.
+  tab.addEventListener("dragstart", (e) => {
+    draggedId = id; draggedEl = tab; tabDragCommitted = false;
+    tabStripSig = "";   // the drag live-reorders the strip's DOM: whatever the order ends up, the next render rebuilds
+    if (e.dataTransfer) { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setDragImage(dragImageBlank(), 0, 0); }
+    tab.classList.add("dragging");
+    hideTabTip();                        // defect 2 (2026-08-28): the hover popover pinned open through the gesture
+    snapshotDragGeometry(tab);           // widths once at dragstart — the virtual hit-test's stable input (dragslot.ts)
+  });
+  // dragend closes EVERY drag (drop, Escape, released outside). The pointerdown that started the
+  // drag latched tabPointerHeld, and the drag swallowed the matching pointerup — so the hold is
+  // released here by hand, covering the whole gesture against pushes (the click-safe rule). A
+  // CANCELLED drag re-renders from the untouched order and everything FLIP-animates home — that
+  // render also folds in any push that arrived, deferred, mid-drag. A committed drop's reorderTo
+  // already asked for its render; it ran deferred, so flush it.
+  tab.addEventListener("dragend", () => {
+    const cancelled = !tabDragCommitted;
+    draggedId = null; draggedEl = null; tabDragCommitted = false;
+    tab.classList.remove("dragging");
+    tabPointerHeld = false;
+    const pending = renderPendingWhilePressed;
+    renderPendingWhilePressed = false;
+    if (cancelled) flipTabs(() => renderTabs());
+    else if (pending) setTimeout(() => renderTabs(), 0);
+  });
+}
+
+// SKELETON tab (2026-09-07): a tab the kernel LISTS but this page holds no CURRENT copy of. After a redial the
+// kernel sends only the active tab in full and withholds every background tab (skeleton-tabs.ts); each rests
+// here until a click or the idle prefetch loads it. The loaded-tab chrome minus what it does not know: name +
+// identity color from the pushed tab meta (falling back to the stale session's — a name is still the name);
+// the SAME chip as a loaded tab, read ONLY from the kernel's status frames (the gray unknown ring until the
+// first lands); select / keyboard / drag / ✕ / context menu exactly as a loaded tab (the stable #tabs delegate:
+// click-safe); the label a touch muted; a native title saying what a click does. NO swirl — the swirl means
+// "romp is generating this", a transient, and this is a running session at rest. No rich hover tip: that reads
+// a session's dir/model, which a skeleton has not got. Distinct from the two existing states by construction:
+// a placeholder is "coming", a skeleton is "resting, loads on your click", a loaded tab is unchanged.
+function makeSkeletonTab(id: string): HTMLElement {
+  const meta = tabMeta.get(id);
+  const stale = sessions.get(id);   // identity only — never its events or status (see liveSession)
+  const name = meta?.name || stale?.name || "";
+  const color = meta?.color || stale?.color || null;
+  const tab = el("div", "tab tab-skeleton" + (id === activeId ? " active" : ""));
+  tab.tabIndex = 0;
+  tab.dataset.id = id;
+  tab.dataset.act = "select";   // click → setActive via the stable #tabs delegate (./actions), click-safe as every tab
+  tab.addEventListener("keydown", onTabKey);
+  tab.draggable = true;
+  wireTabDrag(tab, id);
+  if (color) {
+    tab.style.setProperty("--chip-bg", color.bg);
+    tab.style.setProperty("--chip-fg", color.fg);
+    tab.classList.add("colored");
+  }
+  if (id === peekId) tab.classList.add("tab-peek");
+  const status = skeletonTabs.status.get(id) as Status | undefined;
+  applyTabStatus(tab, { status: status ?? {} });   // no status yet → the unknown ring, never a pre-outage state
+  const label = el("span", "tab-label");
+  label.replaceChildren(...hostNameNodes(name, id));
+  tab.appendChild(label);
+  if (status) appendTabCtxGauge(tab, { status });
+  tab.title = "Not loaded yet — click to load";
+  const closeBtn = el("span", "tab-close");
+  closeBtn.textContent = "×";
+  // a live session: its ✕ routes through the same End-session confirm as a loaded tab; a DEAD one (the kernel's
+  // status frame says `closed` — a kept read-only tab) drops like a dead loaded tab, with no confirm to end
+  // what is already over (review find 2026-09-08: the skeleton offered "End session" on a session that had ended)
+  const dead = status?.state === "closed";
+  closeBtn.title = dead ? "Close tab" : "End session";
+  if (dead) closeBtn.dataset.dead = "1";
+  closeBtn.dataset.act = "close";
+  closeBtn.dataset.id = id;
+  tab.appendChild(closeBtn);
+  // right-click → the same context menu (rename / color / end are about the session, which is running)
+  tab.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); showTabMenu(e, id, tab.dataset.copy); });   // the copy's group rides along (T264b)
+  return tab;
+}
+
+// The slim vertical context gauge right of the name (the user 2026-08-08), shared the same way as the chip.
+// Drawn AFTER the label by both callers, so the ✕ keeps the tab's right edge. (Defined below makeSkeletonTab
+// on purpose: tab-ctx-gauge.test.ts orders the file's FIRST label append before its first gauge append,
+// and tabs-first.test.ts wants nothing between makePlaceholderTab and renderTabs but the placeholder.)
+function appendTabCtxGauge(tab: HTMLElement, s: { status: Partial<Status> }): void {
+  const st = s.status.state;
+  // Slim vertical context gauge right of the name (the user 2026-08-08): the statusline battery's
+  // fill % + colormap colour, rotated upright and with no % text — so "this session is filling up"
+  // reads at a glance across the whole strip. Skipped while compacting (the compacting bar owns that
+  // moment, and the % is about to be wrong) and on dead tabs. gear → Chat picks WHEN it shows:
+  // only once ≥50% full (the default — a gauge on every quiet tab is clutter; it appears when it
+  // has news), always, or never (the user 2026-08-08 v2, replacing the on/off toggle).
+  if (settings.tabCtx !== "never" && s.status.ctx && st !== "compacting" && st !== "closed") {
+    const pct = Math.max(0, Math.min(100, parseInt(s.status.ctx, 10) || 0));
+    if (settings.tabCtx === "always" || pct >= 50) tab.appendChild(tabCtxGauge(s.status.ctx, pickTone(s.status.ctxColor, s.status.ctxTone)));
+  }
 }
 
 // A loading PLACEHOLDER tab (the user 2026-06-26): name + identity color from the kernel's tabOrder push,
@@ -5575,6 +5825,11 @@ function renderTabs() {
     surfaceLens(effViews(), "chat"), unions,
     visibleIds.map((id) => {
       const s = sessions.get(id), down = hostIsDown(id), note = down ? hostDownNote(id) : "";
+      if (renderKind(skeletonTabs, id, !!s) === "skeleton") {                                              // makeSkeletonTab's reads:
+        const m = tabMeta.get(id), kst = skeletonTabs.status.get(id) as Status | undefined;               // the kernel's list + its
+        return ["k", m?.name || s?.name, (m?.color || s?.color)?.bg, (m?.color || s?.color)?.fg, id === peekId,   // status frames, never the
+                kst?.state, kst && tabStateClass(kst), !!kst?.faded, kst?.ctx, kst?.ctxColor, kst?.ctxTone, down, note];   // stale session's status
+      }
       if (!s) { const m = tabMeta.get(id); return ["p", m?.name, m?.color?.bg, m?.color?.fg, down, note]; }   // makePlaceholderTab's reads
       const st = s.status;
       return [s.name, s.color?.bg, s.color?.fg, st.state, tabStateClass(st), !!st.faded,
@@ -5615,6 +5870,12 @@ function renderTabs() {
     }
     const id = item.id;
     const s = sessions.get(id);
+    // a SKELETON draws from the kernel's list + its status frames, never from the stale session it may hold (2026-09-07)
+    if (renderKind(skeletonTabs, id, !!s) === "skeleton") {
+      const sk = makeSkeletonTab(id);
+      if (copyGroup !== undefined) sk.dataset.copy = copyGroup ?? "";   // a skeleton copy per group too — flipTabs keys per copy (T264b)
+      bar.appendChild(sk); continue;
+    }
     if (!s) {
       const ph = makePlaceholderTab(id);
       if (copyGroup !== undefined) ph.dataset.copy = copyGroup ?? "";   // a placeholder copy per group too — flipTabs keys per copy (T264b)
@@ -5629,72 +5890,14 @@ function renderTabs() {
     // drag-to-reorder (synced with the timeline via the shared session-order file). A subagent viewer
     // stays put: it is client-only, and a reorder would post its id into the kernel's order.
     tab.draggable = !s.sub;
-    // Exactly ONE thing on screen may look like the dragged tab (T133, the user 2026-08-27: the
-    // native drag image following the pointer PLUS the dimmed in-flow tab read as a ghost
-    // duplicate — "not how most softwares show it"). The native image is blanked, and the dimmed
-    // in-flow element — the one that live-reorders through the strip — is the single provisional
-    // visual, browser-style. dragImageBlank must be a rendered DOM node at dragstart (Chromium
-    // snapshots it), hence the fixed off-viewport 1px div installed once below.
-    tab.addEventListener("dragstart", (e) => {
-      draggedId = id; draggedEl = tab; tabDragCommitted = false;
-      tabStripSig = "";   // the drag live-reorders the strip's DOM: whatever the order ends up, the next render rebuilds
-      if (e.dataTransfer) { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setDragImage(dragImageBlank(), 0, 0); }
-      tab.classList.add("dragging");
-      hideTabTip();                        // defect 2 (2026-08-28): the hover popover pinned open through the gesture
-      snapshotDragGeometry(tab);           // widths once at dragstart — the virtual hit-test's stable input (dragslot.ts)
-    });
-    // dragend closes EVERY drag (drop, Escape, released outside). The pointerdown that started the
-    // drag latched tabPointerHeld, and the drag swallowed the matching pointerup — so the hold is
-    // released here by hand, covering the whole gesture against pushes (the click-safe rule). A
-    // CANCELLED drag re-renders from the untouched order and everything FLIP-animates home — that
-    // render also folds in any push that arrived, deferred, mid-drag. A committed drop's reorderTo
-    // already asked for its render; it ran deferred, so flush it.
-    tab.addEventListener("dragend", () => {
-      const cancelled = !tabDragCommitted;
-      draggedId = null; draggedEl = null; tabDragCommitted = false;
-      tab.classList.remove("dragging");
-      tabPointerHeld = false;
-      const pending = renderPendingWhilePressed;
-      renderPendingWhilePressed = false;
-      if (cancelled) flipTabs(() => renderTabs());
-      else if (pending) setTimeout(() => renderTabs(), 0);
-    });
+    wireTabDrag(tab, id);   // the dragstart/dragend pair, shared with the skeleton tab (2026-09-07)
     if (s.color) {
       tab.style.setProperty("--chip-bg", s.color.bg);
       tab.style.setProperty("--chip-fg", s.color.fg);
       tab.classList.add("colored");
     }
     if (id === peekId) tab.classList.add("tab-peek");   // ephemeral peek — ghost/dashed dress (styles.css)
-    const st = s.status.state;
-    // the state class — working gold, an on-YOU block alarm-red dashed vs a transient API error's
-    // amber auto-retry, awaiting, compacting, closed — is tab-state.ts's rule, shared with the
-    // folded section header's pip so the two can never disagree on what is red, and read by the
-    // strip's signature above so a state whose class changed always repaints
-    const stateCls = tabStateClass(s.status);
-    if (stateCls) tab.classList.add(stateCls);
-    if (s.status.faded) tab.classList.add("at-rest");
-    // WORKING shows a yellow dot; AWAITING-BG the same dot in await-green — matching the chip's color, so the
-    // tab reads the split at a glance (the user 2026-07-13); BLOCKED (API error) gets NO dot — the dashed
-    // red tab highlight instead (the user 2026-06-16). MISSING state: an explicit gray ring, so a bare tab
-    // can only mean a state with its own treatment or a healthy idle one, never a hole. OPENING: the accent
-    // loader dot (the user 2026-08-10). The slot itself is there in EVERY state (T262g, the user 2026-09-08):
-    // a dot that came and went with the state changed the tab's width, and with the strip at a wrap boundary
-    // that added or removed a row and slid the transcript under the reader by a row's height (tabDotClass).
-    const dotCls = tabDotClass(st);
-    if (dotCls) tab.appendChild(el("span", dotCls));
-    // compacting → a tiny animated compaction bar before the name (the tab gets no outline for this state,
-    // so the bar IS the cue). A teal fill whose right edge slides left and loops — the same "compression"
-    // motion as the statusline ctx-scan bar (.ctx-compress), miniaturised. Replaces the static ⇲ glyph the
-    // user disliked (2026-06-24): motion reads as a transient PROCESS, not a status colour. Compacting can't
-    // coincide with working, so no dot clash.
-    if (st === "compacting") {
-      const ci = el("span", "tab-compacting-bar");
-      const cfill = el("span", "tab-compacting-fill");
-      applyCompactSweep(cfill);   // phase-sync across re-renders (the anim no longer restarts) + colormap gradient
-      ci.appendChild(cfill);
-      ci.title = "compacting — compressing the conversation to free up context";
-      tab.appendChild(ci);
-    }
+    const st = applyTabStatus(tab, s);   // the chip (status → class/dot/bar), shared with the skeleton tab (2026-09-07)
     const label = el("span", "tab-label");
     label.replaceChildren(...hostNameNodes(s.name, id));   // remote "host:" prefix renders as quiet metadata
     // ...and the whole tab dims when that host is unreachable, so a disconnected session reads as one at
@@ -5712,16 +5915,7 @@ function renderTabs() {
       tab.addEventListener("mouseleave", () => { label.style.color = fadedColor(full); label.classList.add("name-faded"); });
     }
     tab.appendChild(label);
-    // Slim vertical context gauge right of the name (the user 2026-08-08): the statusline battery's
-    // fill % + colormap colour, rotated upright and with no % text — so "this session is filling up"
-    // reads at a glance across the whole strip. Skipped while compacting (the compacting bar owns that
-    // moment, and the % is about to be wrong) and on dead tabs. gear → Chat picks WHEN it shows:
-    // only once ≥50% full (the default — a gauge on every quiet tab is clutter; it appears when it
-    // has news), always, or never (the user 2026-08-08 v2, replacing the on/off toggle).
-    if (settings.tabCtx !== "never" && s.status.ctx && st !== "compacting" && st !== "closed") {
-      const pct = Math.max(0, Math.min(100, parseInt(s.status.ctx, 10) || 0));
-      if (settings.tabCtx === "always" || pct >= 50) tab.appendChild(tabCtxGauge(s.status.ctx, pickTone(s.status.ctxColor, s.status.ctxTone)));
-    }
+    appendTabCtxGauge(tab, s);   // the context gauge, shared with the skeleton tab (2026-09-07)
     // Rich hover tooltip (custom DOM — a native title can't colour/bold): backend in its own colour, the
     // full dir path, and mode/model/effort/context each on a line (the user 2026-06-23). See showTabTip.
     if (!s.sub) {   // the rich tip reads a real session's dir/branch/model; a viewer has none of them
@@ -5889,7 +6083,7 @@ function showSelectionMenu(e: MouseEvent) {
   // about the passage — and Quote is the lighter one. Comment only when the selection sits in a real
   // transcript turn (transcriptSelection's uuid) on a real session.
   const q = transcriptSelection();
-  if (q?.uuid && activeId && !isProvisionalId(activeId) && sessions.get(activeId)) {
+  if (q?.uuid && activeId && !isProvisionalId(activeId) && liveSession(activeId)) {
     const sid = activeId, uuid = q.uuid, qtext = q.text;
     mk("Comment", () => openCommentComposer(sid, uuid, qtext, e.clientX, e.clientY));
   }
@@ -6059,13 +6253,21 @@ function showTabMenu(e: MouseEvent, id: string, copy?: string) {   // `copy`: th
   // backgrounding; the kernel migrated existing hidden entries into the "archived" tag. revealIn
   // survives for the picker's tagged-session jump.)
   // Billing submenu (the user 2026-08-09, who wants the login/API-key switch here rather than as a
-  // statusline badge). Only when the machine offers BOTH choices (st.authBoth) — a one-auth machine
-  // keeps the fact on the tab hover, never a dead selector — and the key stays labelled plainly
-  // 'API key', no fragment of it anywhere. Clicking opens a flyout with the two choices, the
-  // session's current one check-marked; a pick posts the same setAuth the badge used (the session
-  // reconnects to apply, so the sub-line says "applying…" while st.authPending rides the status).
+  // statusline badge). For EVERY SDK session (st.auth is set; the user 2026-09-08: the picker never
+  // disappears — it once existed only when the machine offered both choices, so a one-auth box had
+  // the fact on the tab hover and no control beside it). The flyout lists BOTH choices always; the one
+  // this box cannot bill (st.authAvail, with the kernel's reason) renders disabled, greyed, the reason
+  // in its hover, and a click on it posts nothing. The session's current pick is check-marked even
+  // when it is the unavailable one: the launch fell to the other side (st.authPickUnavailable, the
+  // kernel's honest record) and the sub-line says so. The key stays labelled plainly 'API key', no
+  // fragment of it anywhere. A pick posts the same setAuth the badge used (the session reconnects to
+  // apply, so the sub-line says "applying…" while st.authPending rides the status). An older kernel
+  // sends no authAvail: its authBoth keeps the old both-or-nothing gate.
   const st = s ? s.status : null;
-  if (st && st.auth && st.authBoth) {
+  if (st && st.auth && (st.authAvail || st.authBoth)) {
+    const avail: AuthAvail = st.authAvail || { login: true, key: true };
+    const otherOf = (v: string) => (v === "key" ? "login" : "key");
+    const wordOf = (v: string) => (v === "key" ? "API key" : "login");
     // (no divider: billing sits in the behavior section with the toggles — the by-kind grouping)
     const item = el("div", "ctx-item ctx-item-toggle ctx-item-billing");
     item.appendChild(ctxIcon("bill", false));
@@ -6073,6 +6275,9 @@ function showTabMenu(e: MouseEvent, id: string, copy?: string) {   // `copy`: th
     const l = el("span", "ctx-item-label"); l.textContent = "Billing"; bodyEl.appendChild(l);
     const sb = el("span", "ctx-item-sub");
     sb.textContent = st.authPending ? "applying…"
+      : st.authPickUnavailable === st.auth
+        // the pick names a side this box cannot bill — the launch went to the other one when it exists
+        ? `⚠ ${wordOf(st.auth)} unavailable` + (authFellTo(st) ? `, billing ${wordOf(authFellTo(st))}` : "")
       : st.authLive && st.authLive !== st.auth
         ? `⚠ CLI reports ${st.authLive === "key" ? "API key" : "login"}`   // the pick did not take — say so where the switch lives (T124)
         : (st.auth === "key" ? "API key" : (st.authAcct ? `Login (${st.authAcct})` : "Login"));
@@ -6084,12 +6289,17 @@ function showTabMenu(e: MouseEvent, id: string, copy?: string) {   // `copy`: th
       const open = menu.querySelector(".ctx-sub");
       if (open) { open.remove(); return; }                       // second click folds the flyout
       const sub = el("div", "ctx-menu ctx-sub");
-      for (const c of [{ label: st.authAcct ? `Login (${st.authAcct})` : "Login", value: "login" },
-                       { label: "API key", value: "key" }]) {
-        const opt = el("div", "ctx-item" + (st.auth === c.value ? " current" : ""));
+      for (const c of [{ label: st.authAcct ? `Login (${st.authAcct})` : "Login", value: "login", why: avail.login ? "" : (avail.loginWhy || "no Claude login signed in on this machine") },
+                       { label: "API key", value: "key", why: avail.key ? "" : (avail.keyWhy || "no apiKeyHelper configured") }]) {
+        const opt = el("div", "ctx-item" + (st.auth === c.value ? " current" : "") + (c.why ? " disabled" : ""));
         opt.textContent = c.label;
+        if (c.why) {   // unavailable here: greyed, the reason on hover, inert (the user 2026-09-08)
+          opt.title = c.why;
+          opt.setAttribute("aria-disabled", "true");
+        }
         opt.addEventListener("click", (ev2) => {
           ev2.stopPropagation();
+          if (c.why) return;                                       // a disabled option posts nothing, and the menu stays
           dismissTabMenu();
           if (st.auth !== c.value && vscodeApi) vscodeApi.postMessage({ type: "setAuth", id, value: c.value });
         });
@@ -7002,6 +7212,15 @@ function dirPrefill(host: string): string {
 // The capability rides in on the local sessionList; assume yes until a kernel says otherwise, so an older
 // kernel that doesn't send it keeps the button it always had.
 let kernelNativeDialogs = true;
+// Whether the + picker OFFERS "Claude Code (tmux)" (T288, the user 2026-09-09): a kernel setting, off by default,
+// carried on the local sessionList reply. It gates the offer alone: an existing tmux session keeps working and
+// keeps its tooltip label whatever it says. Assumed off until a kernel says on (an older kernel sends none).
+let kernelTmuxBackend = false;
+// whether the user clicked a Backend toggle during THIS open of the picker: the sessionList reply, which lands after
+// the open reset the row, re-applies the effective default only while no explicit pick stands (the review's find:
+// a saved tmux default with the setting on landed on Claude Code on the first open, since the reset ran before
+// the reply said the toggle was on offer), and never undoes a pick the user made
+let pickerBackendPicked = false;
 
 // The two cases are shown differently, because one of them can change and the other cannot. A REMOTE host
 // is one click back to local, so the button stays in place, disabled, saying so. A kernel with no desktop
@@ -7039,13 +7258,33 @@ function requestSessionList(host: string): void {
 // rule was really against). The row still disappears when the backend toggle says tmux (that CLI
 // lives in the tmux server's environment, which the kernel does not control) and until the host's
 // sessionList reply carries authAvail (an older kernel never answers with one).
-let pickerAuthAvail: { login?: boolean; key?: boolean; acct?: string; default?: string } | null = null;
+let pickerAuthAvail: AuthAvail | null = null;
 
 // the picker's selected Backend chip — the Backend row alone (the Billing, Host and Tags rows wear the
 // same chip grammar, and a selected tag chip must never read as a backend)
 function pickerBackendChoice(): string {
   const beSel = document.querySelector("#picker .picker-backend:not(.picker-host):not(.picker-auth):not(.picker-tags) .picker-be-opt.sel") as HTMLElement | null;
-  return beSel?.dataset.be || loadSettings().backend;
+  return beSel?.dataset.be || effectiveDefaultBackend(loadSettings().backend, kernelTmuxBackend);
+}
+
+// The Backend row offers "Claude Code (tmux)" only while the kernel setting is on (T288): the toggle hides
+// otherwise, and a hidden toggle that was selected hands the selection to the effective default, so the create
+// can never send a backend the picker does not show. Re-run on every open and on the local sessionList reply.
+function syncPickerBackends(): void {
+  const wrap = document.querySelector("#picker .picker-backend:not(.picker-host):not(.picker-auth):not(.picker-tags)") as HTMLElement | null;
+  if (!wrap) return;
+  const tmuxBtn = wrap.querySelector('.picker-be-opt[data-be="tmux"]') as HTMLElement | null;
+  if (tmuxBtn) tmuxBtn.style.display = kernelTmuxBackend ? "" : "none";
+  // the effective default is re-applied while the user has not picked this open (so a saved tmux default lands
+  // once the reply says the toggle is on offer), and always when the selected toggle went off offer
+  const def = effectiveDefaultBackend(loadSettings().backend, kernelTmuxBackend);
+  const cur = wrap.querySelector(".picker-be-opt.sel") as HTMLElement | null;
+  if (!pickerBackendPicked || (!kernelTmuxBackend && cur?.dataset.be === "tmux")) {
+    if (cur?.dataset.be !== def) {
+      wrap.querySelectorAll(".picker-be-opt").forEach((x) => x.classList.toggle("sel", (x as HTMLElement).dataset.be === def));
+      syncPickerAuth(); syncPickerTags();
+    }
+  }
 }
 
 // the backends whose create takes `tags`: the kernel applies parent/tags on an SDK or a Codex create
@@ -7082,6 +7321,9 @@ function syncPickerAuth(): void {
     fixed.style.display = both ? "none" : "";
     // one real choice → written out in the buttons' place, naming the login account when known
     fixed.textContent = both ? "" : (a!.key ? "API key" : (a!.acct ? `Login (${a!.acct})` : "Login"));
+    // …and the hover says why the OTHER side is not on offer (the kernel's reason, 2026-09-08)
+    fixed.title = both ? "" : (a!.key ? `Login unavailable: ${a!.loginWhy || "no Claude login signed in on this machine"}`
+                                      : `API key unavailable: ${a!.keyWhy || "no apiKeyHelper configured"}`);
   }
   if (!both) return;   // the fixed text is the whole row — nothing to seed
   // the Login button's hover names WHICH account (the user 2026-08-09)
@@ -7356,12 +7598,14 @@ function openPicker(pick = false, prompt?: string, allowNew = false) {
     const mkBe = (val: string, txt: string, tip: string) => {
       const b = el("button", "picker-be-opt") as HTMLButtonElement;
       b.type = "button"; b.textContent = txt; b.title = tip; b.dataset.be = val;
-      b.addEventListener("click", () => beWrap.querySelectorAll(".picker-be-opt").forEach((x) => x.classList.toggle("sel", x === b)));
+      b.addEventListener("click", () => { pickerBackendPicked = true; beWrap.querySelectorAll(".picker-be-opt").forEach((x) => x.classList.toggle("sel", x === b)); });
       return b;
     };
-    beWrap.append(beLabel, mkBe("sdk", "SDK", "Runs via the Claude Agent SDK."),   // not "headless" — same full chat UI (the user 2026-07-12)
-                  mkBe("tmux", "tmux", "Drives a real terminal pane (tmux)."),   // SDK first — the de-facto default (the user 2026-07-02)
-                  mkBe("codex", "Codex", "Runs an OpenAI Codex agent (the host needs romp-codex-setup + codex login)."));
+    // the labels come from backend-names.ts (T288): "Claude Code" (the default, no qualifier), "Claude Code (tmux)"
+    // (offered only while the kernel setting is on — syncPickerBackends), "Codex"; the ids are unchanged
+    beWrap.append(beLabel, mkBe("sdk", backendLabel("sdk"), "The default: romp runs the Claude Code session itself, with the same full chat."),   // first — the de-facto default (the user 2026-07-02)
+                  mkBe("tmux", backendLabel("tmux"), "Drives a Claude Code session in a real terminal pane (tmux); offered while the tmux backend is enabled in the gear."),
+                  mkBe("codex", backendLabel("codex"), "Runs an OpenAI Codex agent (the host needs romp-codex-setup + codex login)."));
     // the billing row exists only for SDK sessions, the Tags row only for backends whose create takes
     // tags (backendTakesTags) — re-decide both on every backend toggle
     beWrap.addEventListener("click", () => { syncPickerAuth(); syncPickerTags(); });
@@ -7395,7 +7639,7 @@ function openPicker(pick = false, prompt?: string, allowNew = false) {
     const tgLabel = el("span", "picker-backend-label"); tgLabel.textContent = "Tags";
     tgWrap.appendChild(tgLabel);
     const tgNote = el("span", "picker-auth-fixed picker-tags-note");   // the Billing row's written-out text style
-    tgNote.textContent = "Tags apply to SDK and Codex sessions";
+    tgNote.textContent = `Tags apply to ${backendLabel("sdk")} and ${backendLabel("codex")} sessions`;   // the shared names (T288)
     tgNote.style.display = "none";
     tgWrap.appendChild(tgNote);
     // per-session HOST picker (federation, the user 2026-07-02): local | each attached SSH host — the new
@@ -7439,7 +7683,7 @@ function openPicker(pick = false, prompt?: string, allowNew = false) {
       // create as names; the owning kernel resolves them by name, minting a missing one like POST /tag.
       // SDK and Codex creates (backendTakesTags) — a tmux create carries none (the row is disabled for
       // it, and the kernel refuses tags on a terminal create)
-      const backend = beSel?.dataset.be || loadSettings().backend;
+      const backend = beSel?.dataset.be || effectiveDefaultBackend(loadSettings().backend, kernelTmuxBackend);
       const tags = backendTakesTags(backend)
         ? Array.from(tgWrap.querySelectorAll<HTMLElement>(".picker-be-opt.sel")).map((x) => x.dataset.tag || "").filter(Boolean)
         : [];
@@ -7498,8 +7742,10 @@ function openPicker(pick = false, prompt?: string, allowNew = false) {
   const beWrapEl = overlay.querySelector(".picker-backend:not(.picker-host):not(.picker-auth)") as HTMLElement | null;
   if (beWrapEl) {   // reset the backend toggle to the gear default each open (overridable for this session)
     beWrapEl.style.display = pick ? "none" : "";
-    const def = loadSettings().backend || "tmux";
+    pickerBackendPicked = false;   // a fresh open: the row follows the effective default until the user picks
+    const def = effectiveDefaultBackend(loadSettings().backend, kernelTmuxBackend);   // a saved tmux default while it is off → Claude Code
     beWrapEl.querySelectorAll(".picker-be-opt").forEach((x) => x.classList.toggle("sel", (x as HTMLElement).dataset.be === def));
+    syncPickerBackends();
   }
   const auWrapEl = overlay.querySelector(".picker-auth") as HTMLElement | null;
   if (auWrapEl) {   // fresh open: forget last time's pick + availability; the local sessionList reply re-arms it
@@ -7836,7 +8082,7 @@ function moveFailedLocal(sid: string, name: string, text: string): void {
 // joined by NAME when the real session lands — exactly the picker-create flow.
 function showForkPrompt(sid: string, uuid: string): void {
   const sess = sessions.get(sid);
-  const base = (sess?.name || "session").replace(/[^A-Za-z0-9._-]/g, "-");
+  const base = defaultForkName(sess?.name, sid);   // the bare name: the host label is this viewer's (T289)
   document.getElementById("fork-prompt")?.remove();
   const overlay = el("div", "picker-overlay confirm-overlay"); overlay.id = "fork-prompt";
   const box = el("div", "picker-box confirm-box");
@@ -7846,7 +8092,7 @@ function showForkPrompt(sid: string, uuid: string): void {
     ? "A new session continues the conversation to just below this response; this one is untouched."
     : "A new session continues this whole conversation; this one is untouched.";
   const input = document.createElement("input");
-  input.type = "text"; input.className = "fork-name"; input.value = base + "-fork";
+  input.type = "text"; input.className = "fork-name"; input.value = base;
   input.setAttribute("autocapitalize", "off"); input.setAttribute("autocomplete", "off");
   input.setAttribute("autocorrect", "off"); input.setAttribute("spellcheck", "false");
   const actions = el("div", "confirm-actions");
@@ -8154,7 +8400,7 @@ function updateCommentRail(): void {
   let rail = document.getElementById("cmt-rail");
   const content = document.getElementById("content");
   const v = activeId ? views.get(activeId) : null;
-  const s = activeId ? sessions.get(activeId) : null;
+  const s = activeId ? liveSession(activeId) : null;
   const threads = ((activeId && commentThreads.get(activeId)) || [])
     .filter((t) => t.status === "open" || t.status === "resolved" || t.status === "merged");
   if (!content || !v || !s || !threads.length || v.el.style.display === "none") { rail?.remove(); cmtRailSig = ""; return; }
@@ -8676,7 +8922,10 @@ function commentSendFromPop(pop: HTMLElement): void {
   const create = pendingCommentAnchor;
   if (create) {
     const nameBox = pop.querySelector(".cmt-name") as HTMLInputElement | null;
-    const nm = (nameBox?.value || "").trim();
+    // an UNTOUCHED prefill is sent as "" — the kernel picks its own default (bare name, next free number);
+    // only a name the user typed is theirs (T289: the prefill, sent as a chosen name, collided with the
+    // thread the same prefill had named before, and the owning kernel refused the create)
+    const nm = nameToSend(nameBox?.value || "", nameBox?.dataset.prefill || "");
     if (nm && !/^[A-Za-z0-9._-]+$/.test(nm)) { nameBox?.classList.add("bad"); nameBox?.focus(); return; }
     if (send) { send.disabled = true; send.classList.add("busy"); }   // ack before the round-trip (the ➤
     //                                       dims); the draft survives until commentCreated adopts the thread
@@ -8685,7 +8934,8 @@ function commentSendFromPop(pop: HTMLElement): void {
     // so its never-listed tid unwraps through the standard sweep the moment the real thread lands
     const synth: CommentThread = { tid: "pending:" + create.uuid, anchorUuid: create.uuid,
       exact: create.exact, status: "open", createdT: Date.now() / 1000, state: "working",
-      unread: false, replyOwed: true, promotedName: "", msgs: [], name: nm || "comment", color: create.color || "" };
+      unread: false, replyOwed: true, promotedName: "", msgs: [],
+      name: nm || nameBox?.dataset.prefill || "comment", color: create.color || "" };   // the hint, until the kernel's frame names it
     const cur0 = commentThreads.get(create.sid) || [];
     commentThreads.set(create.sid, [...cur0.filter((t) => t.tid !== synth.tid), synth]);
     cmtAwaitBase.set(synth.tid, { ...CMT_LATCH_ZERO });   // the SEND gesture latches the pulse — before any kernel round-trip (T102); released once a frame acknowledges the send (T237)
@@ -8759,7 +9009,10 @@ function renderCommentPopover(): void {
   if (create) {
     // the name lives IN the header — "New comment: <name>" — bold and editable right there (the
     // user 2026-08-17); prefilled <session>-comment-<N>, drafted under its own key so a refused
-    // create hands an edited name back too
+    // create hands an edited name back too. The prefill is a HINT built from the session's BARE name
+    // (a remote session displays as "host:name", and the host is this viewer's label, never part of
+    // the name the owning kernel knows — comment-name.ts); left untouched, it is sent as "" and the
+    // kernel picks its own default (T289).
     const nk = "newname:" + create.uuid;
     nameBox = document.createElement("input");
     nameBox.type = "text";
@@ -8768,10 +9021,10 @@ function renderCommentPopover(): void {
     nameBox.setAttribute("autocomplete", "off");
     nameBox.setAttribute("spellcheck", "false");
     const sess0 = sessions.get(sid);
-    nameBox.value = commentDrafts.get(nk)
-      || ((sess0?.name || "session").replace(/[^A-Za-z0-9._-]/g, "-")
-          + "-comment-" + ((commentThreads.get(sid) || []).length + 1));
-    nameBox.title = "The comment's name — edit it right here";
+    const prefill = defaultCommentName(sess0?.name, sid, (commentThreads.get(sid) || []).length);
+    nameBox.dataset.prefill = prefill;
+    nameBox.value = commentDrafts.get(nk) || prefill;
+    nameBox.title = "Suggested name; type to choose your own";
     if (create.color) nameBox.style.color = create.color;   // its identity color, distinct from the parent's
     const nb = nameBox;
     nb.addEventListener("input", () => { nb.classList.remove("bad"); commentDrafts.set(nk, nb.value); });
@@ -9084,7 +9337,7 @@ function renderCommentPopover(): void {
 function showBreakoutPrompt(sid: string, tid: string): void {
   const sess = sessions.get(sid);
   const thName = (commentThreads.get(sid) || []).find((t) => t.tid === tid)?.name || "";
-  const base = thName || ((sess?.name || "session").replace(/[^A-Za-z0-9._-]/g, "-") + "-thread");
+  const base = thName || defaultBreakoutName(sess?.name, sid);   // the bare name: the host label is this viewer's (T289)
   document.getElementById("fork-prompt")?.remove();
   const overlay = el("div", "picker-overlay confirm-overlay");
   overlay.id = "fork-prompt";
@@ -9566,7 +9819,7 @@ function scrollToAnchor(uuid: string): boolean {
   // event, render a fresh window AROUND its unit, then re-query — the "load it when you jump there" behaviour.
   // (No match anywhere → genuinely off the active path; stash for the next render pass.)
   if (!target && v && activeId) {
-    const s = sessions.get(activeId);
+    const s = liveSession(activeId);
     // resultUuid too: an ANSWERED AskUserQuestion turn is anchored by its answer line's uuid
     // (renderEvent's data-uuid — the uuid the timeline emits for the decision), which no event
     // carries as its OWN uuid, so a uuid/mid-only lookup missed it and this recovery never ran.
@@ -9660,7 +9913,7 @@ function scrollToAnchor(uuid: string): boolean {
  *  RESIDENT events, landed with the honest note. Returns true when it landed. */
 function landNearestMoment(t: number): boolean {
   const v = activeId ? views.get(activeId) : null;
-  const s = activeId ? sessions.get(activeId) : null;
+  const s = activeId ? liveSession(activeId) : null;
   if (!v || !s || !s.events.length) return false;
   let best = -1, bestD = Infinity, headEp: number | null = null;
   for (let i = 0; i < s.events.length; i++) {
@@ -10442,11 +10695,27 @@ function schedulePrebuild(): void {
 function cancelPrebuild(): void {
   if (prebuildHandle != null) { cancelIdle(prebuildHandle); prebuildHandle = null; }
 }
+// The pane iframe is display:none (the phone shell parks off-screen panes that way) — the shim's own test,
+// mirrored, so the skeleton prefetch below never spends bytes on a pane nobody can see.
+function paneHidden(): boolean {
+  try { return window.parent !== window && (window.innerWidth === 0 || window.innerHeight === 0); } catch { return false; }
+}
+// The prefetch never runs while the browser tab is hidden (nextPrefetch); coming back is the event that re-arms
+// it. (A display:none pane has no event for its CSS flip — it re-arms on the next upsert / click instead.)
+document.addEventListener("visibilitychange", () => { if (!document.hidden) schedulePrebuild(); });
 
 function runPrebuild(deadline: IdleDeadline): void {
   prebuildHandle = null;
   if (pendingBuildRaf != null) { schedulePrebuild(); return; } // active tab mid-build → yield, retry next idle
+  // Idle PREFETCH of the skeleton tabs (2026-09-07): one per idle callback, the kernel's order (cheapest
+  // transcript first), never while this browser tab is hidden or the pane is display:none, never while one
+  // is already in flight (a 1 MB full ahead of the active tab's 2 KB tail on a slow link delays that tail;
+  // one at a time bounds it). The upsert that lands it calls schedulePrebuild, so the chain re-arms itself
+  // one tab per idle until the set is empty. A click always wins: same message, awaitingFull dedups.
+  const next = nextPrefetch(skeletonTabs, activeId, awaitingFull, document.hidden || paneHidden(), tabInView);
+  if (next) requestFullSession(next, "prefetch");
   const viewState = (id: string): ViewState | null => {
+    if (skeletonTabs.ids.has(id)) return null;   // a skeleton's stale session must never get its DOM pre-built
     const s = sessions.get(id);
     if (!s) return null;
     const v = views.get(id);
@@ -10500,7 +10769,7 @@ function showActive(keep?: { uuid: string; y: number } | null) {
   renderLiveAsk(); // swap in the active session's pending picker (or hide if none)
   renderBgTasks(); // swap in the active session's background-task box (or hide if none)
   let empty = document.getElementById("empty-state");
-  const s = activeId ? sessions.get(activeId) : null;
+  const s = activeId ? liveSession(activeId) : null;
   if (!s) {
     for (const v of views.values()) v.el.style.display = "none";
     renderSubHead();   // no active viewer → the header goes
@@ -10516,9 +10785,21 @@ function showActive(keep?: { uuid: string; y: number } | null) {
       wait.id = "tab-loading";
       const meta = tabMeta.get(activeId);
       const what = meta?.name ? "“" + meta.name + "”" : (hostOf(activeId) ? "a session on " + hostOf(activeId) : "“session”");
-      wait.appendChild(rompLoaderInner("opening " + what + "…"));
+      // A SKELETON active (2026-09-07) — a running session this page holds no current copy of — takes this
+      // same branch: every view hidden, the loader up (this IS the click acknowledgement, before any kernel
+      // round trip), but it is LOADING, not opening: "opening" would claim a start that is not happening.
+      const skeleton = skeletonTabs.ids.has(activeId);
+      skeletonLoading = skeleton ? activeId : null;   // latched for upsert (see the declaration)
+      if (skeleton) wait.appendChild(rompLoaderInner("loading " + what + "…"));
+      else wait.appendChild(rompLoaderInner("opening " + what + "…"));
       content.appendChild(wait);
       if (empty) empty.style.display = "none";
+      // …and ask for it NOW. Every path that lands on a skeleton active comes through here — the click
+      // (setActive), the teardown's MRU fallback (dismissSession), a strip that re-lists the tab we are on
+      // (noteSkeletonTabOrder) — and nothing else would load it: the idle prefetch skips the active tab by
+      // design. AFTER notifyActive above, so `activeTab` precedes `needFull` on the wire and the kernel builds
+      // this tab first; the awaitingFull guard makes it one ask per outstanding load.
+      if (skeleton) requestFullSession(activeId, "skeleton-click");
     } else if (!empty) {
       empty = el("div", "empty-state"); empty.id = "empty-state";
       empty.textContent = "No session open — click + to add one.";
@@ -10529,6 +10810,7 @@ function showActive(keep?: { uuid: string; y: number } | null) {
     return;
   }
   document.getElementById("tab-loading")?.remove();   // the payload landed — the real view takes over in place
+  skeletonLoading = null;                              // …so nothing is loading in the reader's face any more
   if (empty) empty.style.display = "none";
   restoreActiveDraftOnce();   // after a reload, drop the active tab's persisted draft back into the box (once)
   // A closed (dead) session is READ-ONLY: disable the composer so a message can't be black-holed into
@@ -10839,7 +11121,7 @@ function syncHostOfflineFoot(): void {
 
 function appendActive() {
   const content = document.getElementById("content");
-  if (!content || !activeId) { showActive(); return; }
+  if (!content || !activeId || skeletonTabs.ids.has(activeId)) { showActive(); return; }   // a skeleton active has no current view to append to — the loader stays (2026-09-07)
   const v = views.get(activeId);
   // Follow-the-tail engages ONLY once content actually overflows (the user 2026-08-25: with slack
   // below, a streaming reply should write IN PLACE and grow a scrollbar, not jump the view to the
@@ -11156,7 +11438,7 @@ function virtualizeToViewport(): void {
   if (revirtBusy || !activeId) return;
   const v = views.get(activeId);
   const content = document.getElementById("content");
-  const s = sessions.get(activeId);
+  const s = liveSession(activeId);
   if (!v || !content || !s) return;
   const total = v.unitTotal ?? 0;
   const moreOnServer = (s.headFrom ?? 0) > 0;   // older history not yet resident (wire tail-windowing)
@@ -11514,7 +11796,7 @@ function renderSubHead(): void {
   const content = document.getElementById("content");
   if (!content) return;
   let host = document.getElementById("sub-head");
-  const s = activeId ? sessions.get(activeId) : null;
+  const s = activeId ? liveSession(activeId) : null;
   if (!s || !s.sub) { if (host) host.remove(); return; }
   if (!host) { host = el("div", "sub-head"); host.id = "sub-head"; content.insertBefore(host, content.firstChild); }
   host.replaceChildren();
@@ -11548,7 +11830,7 @@ function renderBgTasks() {
   const host = document.getElementById("bg-tasks");
   if (!host) return;
   host.replaceChildren();
-  const s = activeId ? sessions.get(activeId) : null;
+  const s = activeId ? liveSession(activeId) : null;
   const tasks: BgTask[] = (s && s.bgTasks && s.bgTasks.tasks) || [];
   // Keyed on CONTENT, never the chip state (the user 2026-08-30, paraphrased: even while working, anything
   // the session has in flight shows at the chat bottom). The rows ride awaitingItems in both turn states;
@@ -11873,7 +12155,7 @@ function renderLiveAsk() {
   // inline "add your own" field, and the NORMAL composer becomes that field (see composerAnswersAsk /
   // sendComposer). So you keep every control in view and can still type a free-text answer.
   if (footer) footer.style.display = "";
-  if (!activeId || !liveAsks.has(activeId)) {
+  if (!activeId || skeletonTabs.ids.has(activeId) || !liveAsks.has(activeId)) {   // a skeleton's pre-outage picker is stale — hidden until the tab loads (2026-09-07)
     host.style.display = "none";
     liveTextValue = "";
     setComposerAskMode();   // no picker → the composer's normal placeholder + behavior
@@ -12394,12 +12676,13 @@ const FAST_CHOICES: { label: string; value: string }[] = [
   { label: "Fast", value: "on" },
   { label: "Slow", value: "off" },
 ];
-// Per-session billing (the user 2026-08-08) — the Claude login vs the API key the manager's
-// environment carries — is no longer a statusline badge: the SWITCHING control lives in the tab's
-// right-click menu (showTabMenu's Billing flyout, the user 2026-08-09), still gated on st.authBoth
-// so a one-auth machine shows no dead selector, and still labelled plainly 'API key' — no fragment
-// of the key, not even a last-4 tail, is shipped or shown (2026-08-08, evening). The tab hover's
-// Billing row keeps carrying the fact everywhere.
+// Per-session billing (the user 2026-08-08) — the Claude login vs the API key behind Claude Code's
+// apiKeyHelper — is no longer a statusline badge: the SWITCHING control lives in the tab's
+// right-click menu (showTabMenu's Billing flyout, the user 2026-08-09), on every SDK session since
+// 2026-09-08 (both choices listed, the one this box cannot bill greyed with the reason; it was gated
+// on st.authBoth before), and still labelled plainly 'API key' — no fragment of the key, not even a
+// last-4 tail, is shipped or shown (2026-08-08, evening). The tab hover's Billing row keeps carrying
+// the fact everywhere.
 // the fast-mode state ("on"/"off"/"cooldown") → the badge label. ONE WORD (the user 2026-08-10, on a
 // phone-width statusline), but the WORD carries the state: off reads "Slow", not a second "Fast" —
 // tint alone (orange on, dim off) didn't say which side the toggle was on (the user 2026-08-11).
@@ -12600,7 +12883,7 @@ function toggleMetaMenu(kind: MetaKind, btn: HTMLElement, forSid?: string | null
   const th0 = forThread ? openCommentThread()?.th : null;
   if (forThread && !th0) return;
   const status: Status | null = forThread ? threadMetaStatus(th0!)
-    : (activeId ? sessions.get(activeId)?.status ?? null : null);
+    : (activeId ? liveSession(activeId)?.status ?? null : null);
   const opSid = forThread ? forSid! : activeId;
   if (!status || !opSid) return;
   // a pending permission/picker prompt owns the pane's keyboard — injecting a
@@ -12757,7 +13040,7 @@ function ctxBar(): HTMLElement {
   bar.appendChild(el("span", "ctx-text"));
   bar.appendChild(el("span", "ctx-scan"));   // compacting: teal rectangle whose right edge compresses leftward (as on the timeline)
   bar.addEventListener("click", () => {
-    const s = activeId ? sessions.get(activeId) : null;
+    const s = activeId ? liveSession(activeId) : null;
     if (!s || !vscodeApi) return;
     // awaiting: the pane's keyboard belongs to the prompt; compacting/closed: nothing to do
     if (s.status.state === "needsInput" || s.status.state === "awaiting" || s.status.state === "compacting" || s.status.state === "closed") return;
@@ -12856,9 +13139,9 @@ function stopButton(state?: ChipState): HTMLElement {
 // The "Opening session" line + three staggered accent dots (the loading-state rule's small form): shown
 // while a tab has NO session payload yet AND while the kernel itself reports state "opening" (spawned,
 // transcript not on disk). Both clear on real events — the first payload, the first record.
-function openingLine(): HTMLElement {
+function openingLine(text = "Opening session"): HTMLElement {
   const c = el("span", "compacting-line opening-line");
-  c.appendChild(document.createTextNode("Opening session"));
+  c.appendChild(document.createTextNode(text));
   const dots = el("span", "opening-line-dots");
   for (let i = 0; i < 3; i++) dots.appendChild(el("span"));
   c.appendChild(dots);
@@ -12867,13 +13150,16 @@ function openingLine(): HTMLElement {
 
 function updateStatusline() {
   const sl = document.getElementById("statusline");
-  const s = activeId ? sessions.get(activeId) : null;
+  const s = activeId ? liveSession(activeId) : null;
   if (!sl) return;
   if (activeId && !s) {
     // the tab is a loading placeholder (its session payload hasn't arrived) — the statusline said
     // whatever the PREVIOUS tab said, or a spawn stub's "Working" over a broken clock (the user
-    // 2026-08-05, who wanted "opening" and animated dots until it's ready)
-    sl.replaceChildren(openingLine());
+    // 2026-08-05, who wanted "opening" and animated dots until it's ready). A skeleton tab is a RUNNING
+    // session whose transcript is on its way, not one being opened: its line says so, the word the
+    // tab's own loader uses (review find 2026-09-08: "Opening session" over a "loading" tab)
+    const loading = skeletonTabs.ids.has(activeId) || skeletonLoading === activeId;
+    sl.replaceChildren(openingLine(loading ? "Loading session" : "Opening session"));
     return;
   }
   if (!s) return;
@@ -13156,6 +13442,10 @@ window.addEventListener("romp:wsup", () => {
 window.addEventListener("romp:hostRelayUp", (e) => {
   const h = String((((e as CustomEvent).detail || {}) as any).host || "");
   if (h) reshipPendingUploads([h]);
+  // …and the figure previews parked on that host's link (T291): the relay socket's open is the reconnect-class
+  // event a remote kernel's restart produces (it fires neither romp:wsup nor hostUp), so settled previews
+  // make their one attempt here as well
+  refreshSettledPreviews();
   // …and the tab this pane is LOOKING AT, when that host owns it (T246, the user 2026-09-07): the relay's
   // open is the moment the remote kernel holds a FRESH client for this pane — after that kernel restarted,
   // one with no active tab at all. Its pusher keys only a client's active tab on the live change key (the
@@ -14002,6 +14292,7 @@ function upsert(msg: any) {
   const existed = sessions.has(msg.id);
   const prev = sessions.get(msg.id);
   awaitingFull.delete(msg.id);   // a full session landed → this session is re-based; a later gap may ask again
+  const wasSkeleton = onFull(skeletonTabs, msg.id);   // …and the tab is loaded: it leaves the skeleton set (the kernel released it when it sent this frame)
   // A frame that would take a HELD transcript from content to nothing is status-shaped, never a wipe (T249b,
   // the user 2026-09-07): the kernel sent `events: []` for a session with content when its read of the transcript
   // failed for a cycle, the pane blanked to a placeholder, and the content frame that followed re-landed the
@@ -14106,9 +14397,12 @@ function upsert(msg: any) {
   // Active tab: a content refresh appends + preserves scroll (appendActive); a new tab or a fork
   // lands at the bottom/anchor (showActive). This is what keeps new pushes from snapping to bottom.
   if (msg.id === activeId) {
-    // an ADOPTION is a first show even for a payload this page already held: the no-active-tab state hid
+    // A SKELETON that just loaded (2026-09-07) re-shows its view: the loader is up and its view hidden, and
+    // appendActive would append onto that hidden view; showActive drops #tab-loading and syncs the kept DOM.
+    // An ADOPTION is a first show even for a payload this page already held: the no-active-tab state hid
     // every view, and appendActive never re-reveals one (T236 harness: a tab active over "No session open")
-    if (existed && !forked && !firstBuild && !adopted) {
+    if (wasSkeleton || skeletonLoading === msg.id) showActive();   // …or the strip released it a frame before its full arrived
+    else if (existed && !forked && !firstBuild && !adopted) {
       appendActive();
     } else {
       showActive();
@@ -14133,8 +14427,9 @@ function upsert(msg: any) {
 
 function update(msg: any) {
   retryCmtCreates(String(msg.id || ""));   // ditto for the delta path (T106)
+  if (skeletonTabs.ids.has(msg.id)) { requestFullSession(msg.id, "skeleton-delta"); return; }   // a delta for a tab held as skeleton: the kernel sends none (contract), and onto the stale base it could splice a suffix the outage changed — the no-base repair (2026-09-07)
   const s = sessions.get(msg.id);
-  if (!s) { requestFullSession(msg.id); return; }   // a delta with no base is PROOF of desync (see chatTail)
+  if (!s) { requestFullSession(msg.id, "nobase"); return; }   // a delta with no base is PROOF of desync (see chatTail)
   s.events = msg.events || s.events;
   const before = awaitKey(s.status);
   s.status = msg.status || s.status;
@@ -14171,19 +14466,34 @@ function notifyShell(kind: string, text: string, sid?: string): void {
 // so the next gap can ask again.
 const awaitingFull = new Set<string>();
 const emptyFrameDiagSent = new Set<string>();   // sids whose empty session frame was filed once (see upsert / frame-merge.ts)
-function requestFullSession(id: string): void {
+// `why` is a one-word diagnostic the kernel ignores (2026-09-07): gap = a delta past what we hold; nobase = a
+// delta for a session we hold nothing of; skeleton-click = the active tab is a skeleton; prefetch = the idle
+// chain; skeleton-delta = a delta for a tab held as skeleton (a contract violation). The return-to-tab harness
+// counts asks by it — a nobase on a reconnect row means the skeleton branch missed a frame type.
+type NeedFullWhy = "gap" | "nobase" | "skeleton-click" | "prefetch" | "skeleton-delta";
+function requestFullSession(id: string, why: NeedFullWhy): void {
   if (!id || awaitingFull.has(id)) return;
   awaitingFull.add(id);
-  vscodeApi?.postMessage({ type: "needFull", id });
+  vscodeApi?.postMessage({ type: "needFull", id, why });
 }
 // A reconnect mints a FRESH kernel-side client (its echat starts empty, so full frames are already
 // guaranteed) — but an ask parked against the dead socket would gag the new socket's repair path
 // forever (awaitingFull only clears when the reply lands, and the dead socket's never will).
 window.addEventListener("romp:wsup", () => awaitingFull.clear());
+// …and the same socket-open resets what this page learned on the dead one: the fulls it received there (so the
+// new socket's skeleton list may re-list them — they are stale after the outage; skeleton-tabs.ts) and the
+// one-per-reconnect diagnostic row noteSkeletonTabOrder posts.
+let skeletonDiagArmed = true;
+// (the skeleton state's socket flip rides the shim's {type:"wsup"} FRAME, dispatched above in frame order — not this
+// event, which fires at onopen while the dead socket's last frames may still be draining from the FIFO)
 // A send still unconfirmed at the socket's down edge may never have reached the kernel: say so on its bubble
 window.addEventListener("romp:wsdown", () => markPendingLost("connection"));
 
 function chatTail(msg: any) {
+  // A tail for a tab held as SKELETON (2026-09-07) violates the contract — the kernel sends such a tab status
+  // frames only — and applying it onto the stale pre-outage base could splice a suffix onto a prefix the outage
+  // changed. A delta with no TRUSTED base is proof of desync, exactly like the no-base case below: ask.
+  if (skeletonTabs.ids.has(msg.id)) { requestFullSession(msg.id, "skeleton-delta"); return; }
   const s = sessions.get(msg.id);
   if (!s) {
     // A delta for a session we hold NO base for is PROOF of desync, not noise to ignore: the full
@@ -14192,7 +14502,7 @@ function chatTail(msg: any) {
     // advances on SEND — so deltas are all it will ever volunteer, and the tab sat on the
     // « opening … » placeholder forever (the user 2026-09-02; a duplicated browser tab won the
     // race via cached bundles, a reload only sometimes). Ask for the base instead of waiting.
-    requestFullSession(msg.id);
+    requestFullSession(msg.id, "nobase");
     return;
   }
   // msg.from is a GLOBAL transcript index; the resident events are the tail [headFrom, …) → map to local.
@@ -14217,7 +14527,7 @@ function chatTail(msg: any) {
     // went stale twice in one afternoon: locate-audit.jsonl recorded six pointer-not-rendered misses, then
     // pointer-exact on the SAME anchor the moment a kernel restart forced a reconnect).
     // So ASK for the full session — the one message that closes this desync class whatever opened it.
-    requestFullSession(msg.id);
+    requestFullSession(msg.id, "gap");
     return;
   }
   if (from < 0) return;                            // below the loaded head → our resident tail is still valid
@@ -14363,8 +14673,13 @@ function awaitKey(st: Status | undefined): string {
 }
 
 function statusOnly(msg: any) {
+  // A SKELETON tab's status (2026-09-07): the kernel withholds its transcript and sends this instead, so the
+  // chip stays honest. Store it and repaint the strip ONCE per animation frame (sixteen of these land in one
+  // burst after a redial) — never the no-base repair below, which would ask for the full and defeat the
+  // skeleton for every tab within a cycle.
+  if (onStatus(skeletonTabs, msg.id, msg.status) === "skeleton") { scheduleRenderTabs(); return; }
   const s = sessions.get(msg.id);
-  if (!s) { requestFullSession(msg.id); return; }   // a delta with no base is PROOF of desync (see chatTail)
+  if (!s) { requestFullSession(msg.id, "nobase"); return; }   // a delta with no base is PROOF of desync (see chatTail)
   const before = awaitKey(s.status);
   s.status = msg.status || s.status;
   renderTabs();                          // status-only push → repaint the chip; order is untouched
@@ -14517,6 +14832,7 @@ function dismissSession(id: string, why: DismissWhy, doomed?: ReadonlySet<string
   const name = sessions.get(id)?.name || tabMeta.get(id)?.name || id;   // read before the maps forget it
   if (wasActive) stashActiveDraft(id);   // FIRST: what is on screen belongs to this id, whatever happens next
   sessions.delete(id);
+  onDismiss(skeletonTabs, id);   // a tab that left the strip (✕, the kernel's omission, a host drop) has nothing left to load (2026-09-07)
   liveAsks.delete(id);
   ledgers.delete(id);
   if (why === "close" || why === "end") {
@@ -14608,6 +14924,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
   // dropFile was not delivered" toast (and tore down an in-flight provisional create) an RTT before
   // the relay's own onopen re-shipped correctly. romp:hostRelayUp IS that onopen — the one exact event.
   if (m.type === "hostUp") { refreshSettledPreviews(); healPathImgs(); }
+  if (m.type === "tabOrder") noteSkeletonTabOrder(m);   // BEFORE the chain's applyTabOrder below: one repaint, final skeleton set (2026-09-07)
   if (m.type === "session") upsert(m);
   else if (m.type === "globalRetryPaused") {
     globalRetryPaused = !!m.value;
@@ -14627,6 +14944,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
   else if (m.type === "chatEpisode") chatEpisode(m);
   else if (m.type === "subagent") applySubagentFrame(m);
   else if (m.type === "update") update(m);
+  else if (m.type === "wsup") { onSocketUp(skeletonTabs); skeletonDiagArmed = true; }   // the shim's socket-flip marker, in FRAME order: the dead socket's frames may still be draining from the FIFO when onopen fires (review find 2026-09-07)
   else if (m.type === "status") statusOnly(m);
   else if (m.type === "focus") {
     revealSelfPane();   // every focus is someone jumping HERE — on mobile, come forward (incl. from a remote kernel)
@@ -14789,6 +15107,9 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       kernelNativeDialogs = m.nativeDialogs;
       applyBrowseState(pickerHost());
     }
+    // the tmux backend's offer (T288): the LOCAL kernel's setting; the Backend row follows it while the picker
+    // is on screen (the reply lands after the open), and an older kernel that sends none leaves the row as it was
+    if (typeof m.tmuxBackend === "boolean" && !from) { kernelTmuxBackend = m.tmuxBackend; syncPickerBackends(); }
     // the selected host's billing choices ride its own list reply — this is what arms (or hides) the
     // picker's Billing row (the user 2026-08-08); an older kernel sends none and the row stays away
     pickerAuthAvail = (m.authAvail && typeof m.authAvail === "object") ? m.authAvail : null;
@@ -14999,6 +15320,9 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
   else if (m.type === "commentCreated" && m.id && m.tid) {
     if (m.uuid) cmtCreateInFlight.delete(String(m.uuid));   // the ack retires the retry hold
     if (m.uuid) commentDrafts.delete("new:" + String(m.uuid));
+    if (m.uuid) commentDrafts.delete("newname:" + String(m.uuid));   // a typed name dies with its ack even when the
+    //                                                                  popover closed first — else it resurfaces as a
+    //                                                                  TAKEN name on the next comment here (T289 review)
     if (pendingCommentAnchor && pendingCommentAnchor.sid === m.id) {
       const tid = String(m.tid);
       if ((commentThreads.get(String(m.id)) || []).some((t) => t.tid === tid)) adoptCommentThread(String(m.id), tid);
@@ -15040,7 +15364,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
 // Tick the working timer (the chip color-pulse is pure CSS) and keep the model/ctx
 // meta fresh as status updates land.
 setInterval(() => {
-  const s = activeId ? sessions.get(activeId) : null;
+  const s = activeId ? liveSession(activeId) : null;
   if (!s) return;
   if (s.status.state === "working" || s.status.state === "awaitingBg") {
     const timer = document.getElementById("work-timer");
@@ -15180,7 +15504,7 @@ function setupComposer() {
       pendingRewind.set(activeId, { uuid: editing.uuid, text: typed, ts: Date.now() });
       composerEdits.delete(activeId);
       renderComposerChips(activeId);
-      const s = sessions.get(activeId);
+      const s = liveSession(activeId);
       if (s) { reconcileRewind(s); appendActive(); }   // paint the overlay NOW (stale → window re-render)
       drafts.delete(activeId); draftStartedAt.delete(activeId); persistDrafts();
       ta.value = ""; composerManualH = null; ta.style.height = "";

@@ -262,11 +262,11 @@ CLI's own picker), a value the kernel cannot vouch for (a typo), or a longer
 message that merely opens with the command goes to the CLI verbatim, and the
 chat shows the CLI's own reply.
 
-The two backends apply the change differently. An SDK session switches model
-live but reloads to apply a new effort: the chat shows "Reloading session…"
-and the effort badge shows switching-dots until the reload completes, and a
-session that is mid-turn reloads when the turn ends. A terminal (tmux) session
-gets the CLI's own command typed into its pane. `/model` there asks for a
+The backends apply the change differently. A Claude Code session switches
+model live but reloads to apply a new effort: the chat shows "Reloading
+session…" and the effort badge shows switching-dots until the reload completes,
+and a session that is mid-turn reloads when the turn ends. A Claude Code (tmux)
+session gets the CLI's own command typed into its pane. `/model` there asks for a
 confirmation, which the kernel accepts on your behalf so the pane is never
 left waiting on a keystroke the dashboard cannot send; `/effort` and `/fast`
 apply in place.
@@ -296,15 +296,36 @@ romp to hold no key). The per-session pick decides only whether the helper
 runs for that session.
 
 The new-session picker's **Billing** row states the case whenever the backend
-toggle says SDK: segmented buttons when the selected host offers both choices,
+toggle says Claude Code: segmented buttons when the selected host offers both choices,
 and with only one real choice, the same spot writes out which applies,
 `Login (name@example.com)` or `API key`. The key choice exists when Claude
 Code's settings for the kernel's working directory carry a helper; romp reads
-the setting and never runs it for this. A live session additionally wears a
-statusline badge for *switching*, beside mode/model/effort, and that control
-keeps the stricter rule: it exists only when both choices are real (a
-one-option selector is noise). Switching reconnects the session to apply, with
-the same switching-dots the effort badge wears.
+the setting and never runs it for this. A live session's tab menu carries a
+**Billing** submenu that lists BOTH choices on every box (since 2026-09-08; it
+used to exist only when both were real): the choice this machine cannot bill
+is greyed and inert, with the reason in its hover, `no Claude login signed in
+on this machine`, `no apiKeyHelper configured`, or `the apiKeyHelper is set in
+managed settings, login cannot apply`. The status payload carries the same
+availability as `authAvail` (`authBoth` rides beside it for older clients).
+Switching reconnects the session to apply, with the same switching-dots the
+effort badge wears.
+
+On a one-auth box the picker never chooses the missing side. The remembered
+default falls to the side that exists, in both directions: a remembered login
+pick on a machine with no login seeds new sessions on the API key, exactly as
+a remembered key pick on a helper-less machine already fell to the login, and
+the fall is said once per process as a problem row. An explicit pick that
+names the missing side (a session picked "login" on a box that later lost its
+login) launches on the other side when one exists and says so once per session
+start, on the tab menu's Billing sub-line as `⚠ login unavailable, billing API key`
+and in the log; the fall itself rides the status as `authPickFell`, so the hover
+and the sub-line never infer one. A pick with nothing to fall to (a box with
+neither side) launches as picked and the CLI decides; the sub-line then says
+the side is unavailable and claims no fall. A side whose availability cannot
+be read just now (the operator's settings file, or `~/.claude.json`, mid-rewrite
+or unreadable) is cannot-tell: the launch keeps the pick as is, says so once
+per session, and never falls on a read failure. `setAuth` refuses the
+missing side with that same reason in the toast.
 
 A pick reaches the CLI through the session's per-session settings layer, the
 file the SDK hands the CLI as its `--settings` argument. A login pick writes
@@ -329,13 +350,26 @@ covered by the picker: their CLI lives in the tmux server's environment, which
 the kernel does not control, and resolves its credential the way any `claude`
 in a terminal does.
 
-Each chat tab's hover tooltip carries the same fact as a `Billing` row,
-`API key`, or `Login (name@example.com)`, whenever the session's backend
-reports it, one-auth machines included; only tmux sessions, whose billing romp
-cannot know, show no row. When the CLI's own report disagrees with what the
-session was launched for (a login pick whose CLI reports a key, a key pick
-whose CLI landed on the login), the row carries both: `Login (CLI reports API
-key)`.
+A tab not yet loaded after a reconnect shows "Not loaded yet — click to load"
+as its hover tooltip, until its transcript arrives.
+
+An SDK session's chat tab carries the same fact as a `Billing` row in its hover
+tooltip, one-auth machines included; tmux sessions, whose billing romp cannot
+know, and Codex sessions, which bill no Claude account, show no row. The row
+has four readings. Unless one of the three cases below applies, it reads
+`API key` or `Login (name@example.com)` (`Login` alone when the account name is
+unknown). While a switch is still reconnecting the session, the row appends
+`(applying — not confirmed yet)` to the side: `Login (applying — not confirmed
+yet)`. A pick naming a side this machine cannot bill leads with the warning,
+the reason, and the side the launch fell to: `⚠ Login picked, but no Claude
+login signed in on this machine — this session bills the API key`; with
+nothing to fall to, the tail says the launch went out as picked. A pick the
+CLI's own report contradicts (a login pick whose CLI reports a key, a key pick
+whose CLI landed on the login) leads with the warning too: `⚠ Login picked, but
+the CLI reports the API key — this session bills that`, and, for a key pick,
+the same with the sides swapped. The tab menu's Billing sub-line says the same
+in fewer words: `API key` or `Login (name@example.com)`, `applying…`, `⚠ login
+unavailable, billing API key`, and `⚠ CLI reports API key`.
 
 Failures are loud rather than silent: a session that lands on the other auth
 than it was launched for is flagged in the Log panel, and a dead credential
@@ -380,7 +414,10 @@ output, cache writes, and cache reads. Cache reads are most of it: every API
 call within a turn (one per tool step) re-reads the whole context from the
 cache, so a long session's single turn can read tens of millions of tokens at
 a tenth of the input price. The hover splits each window's count by kind, so
-the size of the number carries its explanation.
+the size of the number carries its explanation. A result that carries no
+per-model usage map is counted from the main loop alone, and the error center
+says so once: once per session when the CLI left the map out, once per kernel
+run when the Agent SDK the kernel imported has no field for it.
 
 ### Self-scheduled work wakes an idle session
 
@@ -411,7 +448,8 @@ For `./install.sh`:
 
 - `ROMP_NO_SERVICE=1` skips the login service.
 - `ROMP_NO_EXT=1` skips the VS Code / Cursor extension.
-- `ROMP_NO_SDK=1` skips the SDK backend's venv (tmux sessions still work).
+- `ROMP_NO_SDK=1` skips the Claude Code backend's Agent SDK venv (Claude Code
+  (tmux) sessions still work).
 
 For the one-line installer (`bootstrap.sh`), which passes all of the above
 through to `install.sh`:
@@ -434,6 +472,21 @@ through to `install.sh`:
   applies on the judges' next pass with no restart, wins over the variable,
   and follows to every connected machine like the other judge settings; its
   Default option clears the setting back to the variable, else 6.
+
+### Session backends
+
+- **Enable Claude Code tmux backend** (the gear's Updates & debug section; off
+  by default) decides whether the new-session picker and the gear's Default
+  backend list offer **Claude Code (tmux)**, a Claude Code session in a
+  terminal pane that Romp follows by reading the terminal. The setting gates
+  the offer alone: sessions already running on that backend keep working and
+  keep their label, `romp new -t` still works, and a saved default of Claude
+  Code (tmux) is set aside while the setting is off (new sessions use Claude
+  Code) and returns when it comes back. Like the judge settings, a change
+  applies at once, without a restart, and follows to every connected machine.
+  The backends read as **Claude Code** (the default), **Claude Code (tmux)**
+  and **Codex** everywhere: the picker, the gear, the tab tooltip's Backend
+  row.
 
 ### Ports
 
@@ -885,8 +938,14 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
 - `pusher`: `cycles`, `wakes` (every wake call; a burst of wakes runs one
   cycle), `wakes_event` and `wakes_backstop` (how the loop's wait ended),
   `cycle_ms_sum`, `cycle_ms_max` (since start), `cycle_ms_last`,
-  `cycle_cpu_ms_sum` (the pusher thread's own CPU time), and `cycle_ms_p50`,
-  `cycle_ms_p90`, `cycle_ms_ring_max`, `ring_n` from the last 256 cycles.
+  `cycle_cpu_ms_sum` (the pusher thread's own CPU time), `cycle_ms_p50`,
+  `cycle_ms_p90`, `cycle_ms_ring_max`, `ring_n` from the last 256 cycles,
+  `sends` (every payload that went to a client; a deduped frame the client
+  already holds is not one), and `idle_cycles`, `idle_ms_sum`, `idle_cpu_ms_sum`
+  (cycles that set no wake, sent no payload and saved no goal store: what a
+  longer wait between cycles would have skipped; a conservative undercount,
+  since a wake set by another thread or a periodic repost of an unchanged
+  frame marks a cycle busy).
 - `stages_ms`: `jobs` (the cycle's tick jobs outside the push), `push`, and
   inside it `push.chat`, `push.feed`, `push.timeline`, `push.send`. The
   `push.*` stages count every push, including the one a connecting page gets,
@@ -899,15 +958,33 @@ The snapshot's fields, all plain numbers (`ms` is milliseconds of wall time):
   loader (`load_goals`) and `save_goals`; the pusher's read-only loads go
   through the shared store cache and show under `memos.shared`, not here. A
   save that would rewrite identical bytes is a save without a write.
-- `memos`: the three identity memos on the goal-store path. `pass` is the
+- `memos`: the identity memos on the goal-store path. `pass` is the
   judge pass's stat-keyed store memo (`hit`, `miss`, `fail`, `evict`, `punch`,
   and its occupancy `entries`, `bytes`); `shared` is the pusher's shared
   read-only store cache (`hit`, `miss`, `compare_miss`, `refuse`, `dup`,
   `absent`, `corrupt`, `unreadable_journal`, `evict`, `fallback`, `poisoned`,
   with `entries`, `bytes` and `off`); `chain` is the write-moment chain memo
-  (`hit`, `miss`, `populate`, `bypass`). The compaction sweep after each judge
-  pass evicts from `pass` and `shared` the entries of stores no session in the
-  discover window owns, so both stay bounded by the live board.
+  (`hit`, `miss`, `populate`, `bypass`); `nudgeGate` is the auto-nudge walk's
+  planner-placement gate, derived once per (parse, store) and served while
+  both stand (`served`, `derived`; a healthy quiet box serves almost every
+  cycle); `cleared` is the feed's clear set, parsed once per state of
+  `cleared.jsonl` (its stat, taken before the read) and served while the file
+  stands (`served`, `derived`); `courierSkip` is the courier's change gate
+  (`skipped`, `scanned`, `recorded`: a session whose parse, store, journal,
+  archive and episode log have not moved since a scan that found nothing to
+  place is skipped whole); `backref` is the sender-board walk behind the
+  courier's link repair, built once per state of the sender stores and served
+  while they stand (`served`, `built`); `captions` and `goalArchive` are the
+  per-file read memos behind the index tier's caption readers and the re-plan's
+  cleared context, each parsed once per file state (`served`, `parsed` or
+  `loaded`); `plannerSkip` is the planner's change gate (`skipped`, `planned`,
+  `recorded`: a session whose parse, store, journal, archive, episode log,
+  its leaf's task store, captions file and reg have not moved since a pass
+  that had nothing to do, and none of whose running background launches has
+  crossed its deadline, is not planned again). The compaction sweep after
+  each judge pass evicts from `pass` and `shared` the entries of stores no
+  session in the discover window owns, so both stay bounded by the live
+  board; the gate memo is bounded by the session count.
 - `judge`: `passes`, `ms_sum`, `ms_last`, `ms_mean` (wall time; a pass waits
   on model calls), `cpu_ms_sum` (CPU time of the judge tier threads and every
   per-session worker they run; the workers' share is `cpu_ms_workers`).
@@ -1402,5 +1479,5 @@ Effective immediately, no restart.
 `touch` to **enable**, `rm` to turn back off:
 
 - `~/.claude/romp-summarize-on`: the live tmux activity phrase. Off by default,
-  because it spends tokens on every turn and the SDK backend reports what a
-  session is doing without it.
+  because it spends tokens on every turn and the Claude Code backend reports
+  what a session is doing without it.

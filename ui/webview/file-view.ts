@@ -17,7 +17,7 @@
 // whichever bundle imports it gets the identical modal.
 import hljs from "highlight.js/lib/core";
 import { marked } from "marked";
-import DOMPurify from "dompurify";
+import { sanitizeMd } from "./md-sanitize";
 import { hostOf, bareId, hostNameNodes } from "./host-prefix";
 import { fileUrl } from "./preview";
 import { openPdfTab, wantsOwnTab } from "./preview";   // a PDF's own tab, and the gesture that asks for it
@@ -564,6 +564,11 @@ export function openFileView(path: string, sid?: string | null, frag?: string | 
     // an in-document `[top](#evidence)` lands on its heading (mdBlock minted the ids) — never a tab
     "fv-anchor": (a, ev) => { ev.preventDefault(); scrollToFragment(body, a.getAttribute("href") || ""); },
   });
+  // A submit inside the body never navigates the pane's document. The sanitizer drops <form> and every
+  // form control (md-sanitize.ts), so this is the backstop: a note's `<form action=...><button>` used to
+  // take the pane's document to the action URL. One listener per open on the stable body, like the click
+  // delegate above, so it survives every Rendered ⇄ Raw swap of the body's children.
+  body.addEventListener("submit", (ev) => { ev.preventDefault(); });
   // Per the loading-state rule the first thing up is the romp loader, not a blank pane — a file coming
   // over an ssh tunnel to a phone is a real wait.
   const load = el("div", "fileview-load");
@@ -574,6 +579,27 @@ export function openFileView(path: string, sid?: string | null, frag?: string | 
   box.appendChild(bar); box.appendChild(body);
   wrap.appendChild(box);
   document.body.appendChild(wrap);
+
+  // The edit-mode notice (a degraded editor, a refused save): one at a time, replacing the last, mounted as
+  // a child of the card between the title bar and the body. It used to be prepended inside the body, above
+  // an editor whose height is 100% of that same body, so the body's content was the bar plus the whole body:
+  // the editor's bottom rows were cut off by the bar's height, and the body's own scroll carried the bar
+  // out of view. As a row of the card (a column flex container; .fileview > .fileview-err keeps its height)
+  // the body shrinks under it and the editor's 100% resolves against what is left. Nothing swaps the card's
+  // children, so leaving edit mode removes the notice itself (exitEdit). Held by reference, THIS card's
+  // notice and no other: a viewer that was replaced (Reload file re-opens fresh) keeps its keydown handler
+  // and still runs its exitEdit on Escape, and a lookup by id from there would strip the live card's notice
+  // while that card is still in edit mode.
+  let note: HTMLElement | null = null;
+  const noteBar = (msg: string): HTMLElement => {
+    note?.remove();
+    const bar2 = el("div", "fileview-err");
+    bar2.id = "fileview-save-err";
+    bar2.textContent = msg;
+    box.insertBefore(bar2, body);
+    note = bar2;
+    return bar2;
+  };
 
   // A 200 whose bytes will not DECODE — a zero-byte file, a mid-write/truncated image — fires the
   // img's error event and used to leave the browser's mute broken-image glyph: no reason, no way
@@ -739,12 +765,9 @@ export function openFileView(path: string, sid?: string | null, frag?: string | 
       cm.focus();
     }).catch((err) => {
       if (!editing || my !== editSeq) return;
-      document.getElementById("fileview-save-err")?.remove();
-      const bar2 = el("div", "fileview-err");   // loud: say the editor is degraded, never pretend
-      bar2.id = "fileview-save-err";
-      bar2.textContent = String(err && (err as Error).message || err) + " — editing in the plain fallback editor.";
       enterFallback();
-      body.prepend(bar2);
+      // loud: say the editor is degraded, never pretend
+      noteBar(String(err && (err as Error).message || err) + " — editing in the plain fallback editor.");
     });
   };
   const exitEdit = () => {
@@ -752,6 +775,9 @@ export function openFileView(path: string, sid?: string | null, frag?: string | 
     cm?.destroy(); cm = null;
     editHooks = null;                           // a cancelled save's late ack must not touch a NEW session
     saveBtn.disabled = false; saveBtn.textContent = "Save";
+    // the notice is a row of the card (noteBar), so the body swap below no longer takes it: a save that
+    // landed, Cancel and Escape all leave through here, and none may leave a stale notice standing
+    note?.remove(); note = null;
     renderBody();
   };
   const doSave = () => {
@@ -778,13 +804,11 @@ export function openFileView(path: string, sid?: string | null, frag?: string | 
       },
       failed: (err) => {
         saveBtn.disabled = false; saveBtn.textContent = "Save";
-        // Loud, in place, and the BUFFER SURVIVES: the error bar sits above the textarea. A conflict
-        // (the disk moved — an agent wrote it) offers Reload, which re-opens fresh — behind the same
-        // discard confirm, so the user's edits are never thrown away silently (never a merge UI).
-        document.getElementById("fileview-save-err")?.remove();
-        const bar2 = el("div", "fileview-err");
-        bar2.id = "fileview-save-err";
-        bar2.textContent = err;
+        // Loud, in place, and the BUFFER SURVIVES: the error bar sits above the body that holds the
+        // textarea. A conflict (the disk moved: an agent wrote it) carries a Reload button, which re-opens
+        // fresh behind the same discard confirm, so the user's edits are never thrown away silently (never
+        // a merge UI).
+        const bar2 = noteBar(err);
         if (/changed on disk/.test(err)) {
           const re = el("button", "fileview-btn fileview-err-dl") as HTMLButtonElement;
           re.type = "button"; re.textContent = "Reload file";
@@ -796,7 +820,6 @@ export function openFileView(path: string, sid?: string | null, frag?: string | 
           });
           bar2.appendChild(re);
         }
-        body.prepend(bar2);
       },
     };
     post({ type: "saveFile", path, sid: sid || undefined, content, baseMtimeNs: mtimeNs, reqId: saveSeq });
@@ -979,6 +1002,7 @@ export function openUrlView(href: string): void {
   delegate(body, {
     "fv-anchor": (a, ev) => { ev.preventDefault(); scrollToFragment(body, a.getAttribute("href") || ""); },
   });
+  body.addEventListener("submit", (ev) => { ev.preventDefault(); });   // the local viewer's backstop (openFileView), same reason
   body.appendChild(loaderEl());                        // loader first; the fetch below replaces it
   box.appendChild(bar); box.appendChild(body);
   wrap.appendChild(box);
@@ -1176,21 +1200,22 @@ function scrollToFragment(box: HTMLElement, fragment: string): boolean {
 type MdDocLoc = { kind: "url"; href: string } | { kind: "file"; path: string; sid: string | null };
 
 // Markdown rendered as the prose it means (the user 2026-08-09: Rendered is the default, Raw one click
-// away). The file is arbitrary bytes off a disk and marked emits raw HTML verbatim, so — exactly like the
-// chat's md() in render.ts — the output goes through DOMPurify before it ever reaches .innerHTML: an
-// <img onerror> or a javascript: href in a README must never run in the dashboard.
+// away). The file is arbitrary bytes off a disk and marked emits raw HTML verbatim, so, exactly like the
+// chat's md() in render.ts, the output goes through the shared sanitizer (sanitizeMd, md-sanitize.ts)
+// before it ever reaches the DOM: an <img onerror> or a javascript: href in a README must never run in
+// the dashboard, and a README's <style>, form or fixed-positioned div must never reach the viewer's chrome.
 function mdBlock(text: string, doc?: MdDocLoc): HTMLElement {
   const box = el("div", "fileview-md");
   try {
     const dirty = marked.parse(text) as string;
-    // html + svg, in lockstep with the chat's md(): KaTeX draws stretchy glyphs (\sqrt radicals,
-    // wide accents) as inline <svg> even in html output, and the html-only profile ate them.
-    // ALLOW_DATA_ATTR: false — a document's raw HTML must not carry data-* into the page: the viewer's
-    // body delegate lets an act it does not own bubble to render.ts's document-level delegate, so a
-    // `<span data-act="stopRetrying">` in a published report would interrupt the active session on a
-    // click (review find on #958, 2026-09-07). The viewer's own fv-open / fv-anchor stamps are set
-    // AFTER this sanitize, so they are unaffected.
-    box.innerHTML = DOMPurify.sanitize(dirty, { USE_PROFILES: { html: true, svg: true }, ADD_DATA_URI_TAGS: ["img"], ALLOW_DATA_ATTR: false });
+    // The one sanitizer the chat's md() uses too (md-sanitize.ts): html + svg (a note's own inline SVG), no
+    // data-* (a document's `<span data-act="stopRetrying">` would otherwise bubble to render.ts's
+    // document-level delegate and interrupt the active session; review find on #958, 2026-09-07), and
+    // rules modelled on GitHub's for a note's own HTML: no <style>, no form controls, ids and names prefixed
+    // user-content-, inline style reduced to its colours, no background attribute. The sanitized <body>'s
+    // children are adopted as they are, no re-parse. The viewer's own stamps (heading ids, fv-open,
+    // fv-anchor) are set AFTER this sanitize, so they are unaffected and never prefixed.
+    box.replaceChildren(...Array.from(sanitizeMd(dirty).childNodes));
   } catch {
     box.textContent = text;                            // a marked bug must never cost the content
   }

@@ -72,9 +72,10 @@ test("a local render that detaches or re-keys the hovered element heals the free
   // found in review 2026-08-24: a removed element never fires mouseleave — typing in search can
   // filter the hovered card out, and toggling Group swaps it for a group card in place with no
   // enter/leave events. The render tail checks live pointer truth per render — event-based.
-  assert.match(FEED, /const hov = document\.querySelector<HTMLElement>\("\.feed-cols \.fitem:hover"\);/);
+  assert.match(FEED, /const hov = document\.querySelector<HTMLElement>\("\.feed-cols \.fitem:hover, \.feed-sess-head:hover"\);/,
+    "a card or a session header under the pointer is pointer truth (T285 added the header)");
   assert.match(FEED, /if \(!hov\) \{ freezeKey = null; flushFreeze\(\); \}/);
-  assert.match(FEED, /else \{ const k = kbHoverId\(hov\); if \(k && k !== freezeKey\) freezeKey = k; \}/,
+  assert.match(FEED, /else \{ const k = hov\.classList\.contains\("feed-sess-head"\) \? sessFreezeKey\(hov\) : kbHoverId\(hov\); if \(k && k !== freezeKey\) freezeKey = k; \}/,
     "a re-keyed card under a stationary pointer re-arms to the element actually hovered");
 });
 
@@ -165,9 +166,44 @@ test("badges wear the header conventions: accent adds, block-red removes, the co
   // painted on the build-once column heads and the data-fsid-stamped session headers; cleared when quiet
   assert.match(FEED, /put\(document\.querySelector\("\.feed-col\.col-" \+ key \+ " \.feed-col-head"\), d\.cols\[key\]\);/);
   assert.match(FEED, /h\.setAttribute\("data-fsid", e\.sid\);/);
-  assert.match(FEED, /put\(h, groupedNow \? d\.sess\[h\.getAttribute\("data-fsid"\) \|\| ""\] : undefined\);/);
+  assert.match(FEED, /const c = groupedNow \? d\.sess\[sid\] : undefined;\s*if \(sid !== hoveredSid\) \{ put\(h, c\); return; \}/,
+    "every header but the hovered one carries its in-row badge (the hovered one's floats — T285)");
   assert.match(FEED, /document\.querySelectorAll\("\.freeze-badge"\)\.forEach\(\(n\) => n\.remove\(\)\);/,
     "nothing pending → every badge comes off");
   // local renders while frozen re-sync the hints, so a rebuilt board never strands a stale count
   assert.match(FEED, /paintFreezeBadges\(\);   \/\/ hover-freeze: local renders while frozen re-sync/);
 });
+
+test("a session header row holds the same gate a card holds: a push while it is hovered is queued, never rebuilt under the pointer; leaving releases (T285)", () => {
+  const head = FEED.slice(FEED.indexOf("function makeSessHead()"), FEED.indexOf("function updateSessHead("));
+  // the row (name, caret, Clear all inside it) enters and leaves the freeze by the session it stands for
+  assert.match(head, /h\.addEventListener\("mouseenter", \(\) => freezeEnter\(sessFreezeKey\(h\)\)\);/, "hovering the header row arms the gate");
+  assert.match(head, /h\.addEventListener\("mouseleave", \(\) => freezeLeave\(sessFreezeKey\(h\)\)\);/, "leaving it releases (the flush follows)");
+  assert.match(FEED, /function sessFreezeKey\(h: HTMLElement\): string \{ return "h:" \+ \(h\.getAttribute\("data-fsid"\) \|\| ""\); \}/,
+    "keyed by the data-fsid stamp read at event time — the row's identity across re-homing renders");
+  // the payload path is ONE gate for both holders: while any freeze key is set, the payload is queued and
+  // NOTHING renders — so updateSessHead never runs and the hovered row (its Clear all included) stands
+  const gate = FEED.slice(FEED.indexOf('if (m.type === "feed") {'), FEED.indexOf('} else if (m.type === "hoverCards") {'));
+  assert.match(gate, /if \(freezeKey \|\| tabScopeKey\) \{ pendingFeedPayload = m; paintFreezeBadges\(\); return; \}/,
+    "a push during header hover is held: queued, badges painted, no render");
+  assert.match(gate, /applyFeedPayload\(m\);/, "…and applies only when nothing holds the gate");
+  // the release re-renders: mouseleave → freezeLeave → flushFreeze → applyFeedPayload of the newest payload
+  const leave = FEED.slice(FEED.indexOf("function freezeLeave(key: string): void {"), FEED.indexOf("let flushQueued = false;"));
+  assert.match(leave, /if \(freezeKey !== key\) return;\s*freezeKey = null;\s*flushFreeze\(\);/);
+  const flush = FEED.slice(FEED.indexOf("function flushFreeze(): void {"), FEED.indexOf('window.addEventListener("blur", () => { releaseTabScope();'));
+  assert.match(flush, /if \(m\) applyFeedPayload\(m\);/, "the queued payload renders on release");
+  // the stale-freeze heal reads a hovered header as pointer truth, keyed the same way
+  const heal = FEED.slice(FEED.indexOf("// Stale-freeze heal (hover-freeze)"), FEED.indexOf("paintFreezeBadges();   // hover-freeze: local renders"));
+  assert.match(heal, /querySelector<HTMLElement>\("\.feed-cols \.fitem:hover, \.feed-sess-head:hover"\)/, "a hovered header keeps the freeze live across a local render");
+  assert.match(heal, /hov\.classList\.contains\("feed-sess-head"\) \? sessFreezeKey\(hov\) : kbHoverId\(hov\)/);
+  // the same pending indicator beside each header — but NEVER inside the hovered row (review find): an in-row
+  // badge lands after the auto-margin Clear all and slides it out from under the pointer, the very click loss
+  // this hold prevents. The hovered header's badge floats: body-mounted, pointer-inert, its row's rect untouched.
+  const paint = FEED.slice(FEED.indexOf("function paintFreezeBadges(): void {"), FEED.indexOf("// ── CARD KEYBOARD SCOPE"));
+  assert.match(paint, /const hoveredSid = freezeKey && freezeKey\.startsWith\("h:"\) \? freezeKey\.slice\(2\) : null;/);
+  assert.match(paint, /if \(sid !== hoveredSid\) \{ put\(h, c\); return; \}\s*put\(h, undefined\);/, "every other header keeps its in-row badge; the hovered one carries none");
+  assert.match(paint, /headNote\.id = "freeze-headnote"; document\.body\.appendChild\(headNote\);/, "…its hint is body-mounted");
+  assert.match(paint, /headNote\.style\.top = Math\.round\(r\.bottom \+ 2\) \+ "px";/, "…placed just under the row, right-aligned");
+  assert.match(CSS, /#freeze-headnote \{ position: fixed; z-index: 6; pointer-events: none;/, "pointer-inert, like the card's self-note");
+});
+

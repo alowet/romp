@@ -21,6 +21,7 @@
 // into the HTML before — /models was already the single source of truth).
 
 var gclock = require('./gesture-clock.js');   // every `gt` below is minted here (see that file)
+var BN = require('./backend-names.ts');   // the backends' user-facing names and the offer rule (T288)
 function kb() { return (typeof window !== 'undefined' && window.__rompKernelBase) || ''; }
 function ku(path) {
   var tok = (typeof window !== 'undefined' && window.__rompKernelToken) || '';
@@ -70,10 +71,10 @@ var GEAR_HTML =
   "<button id=rs-defaultdir-browse type=button style='flex:0 0 auto;cursor:pointer;background:var(--btn-bg, #2a2a2a);color:var(--fg, #ccc);border:1px solid var(--hairline, #3a3a3a);border-radius:5px;padding:3px 8px'>Browse…</button>" +
   '</div></span></div>' +
   "<div class='rs-row rs-sep' style='cursor:default'><span style='flex:1 1 auto'><b>Default backend</b>" +
-  '<span class=rs-sub>What the + button uses for a NEW session — tmux drives a terminal pane; SDK runs via the Agent SDK; Codex runs an OpenAI Codex agent (docs/codex.md). All kinds run side by side; this only sets the default.</span>' +
+  '<span class=rs-sub>What the + button uses for a NEW session. Claude Code runs the session through romp itself; Claude Code (tmux) drives a terminal pane and is on offer only while the tmux backend is enabled (Updates & debug); Codex runs an OpenAI Codex agent (docs/codex.md). All kinds run side by side; this only sets the default.</span>' +
   "<select id=rs-backend style='display:none'>" +
-  '<option value=sdk>SDK</option><option value=tmux>tmux (terminal)</option><option value=codex>Codex</option>' +
-  '</select></span></div>' +
+  '<option value=sdk>Claude Code</option><option value=tmux>Claude Code (tmux)</option><option value=codex>Codex</option>' +
+  '</select><span id=rs-backend-note class=rs-sub hidden></span></span></div>' +
   "<label class='rs-row rs-sep'><input type=checkbox id=rs-autonudge>" +
   '<span><b>Auto Nudge</b><span class=rs-mixed id=rs-autonudge-split hidden></span>' +
   '<span class=rs-sub id=rs-autonudge-sub>' + AUTONUDGE_SUB + '</span>' +
@@ -88,7 +89,7 @@ var GEAR_HTML =
   '</span></label>' +
   "<label class='rs-row'><input type=checkbox id=rs-thinksum>" +
   '<span><b>Thinking summaries</b>' +
-  '<span class=rs-sub>For every new SDK session, ask the API for reasoning summaries and show them in the chat, folded to two lines (click to expand). Compact transcript still hides them. If thinking was turned off for this install, this turns adaptive thinking on as well. A running session picks the change up at its next reconnect: an effort or billing switch, the first fast-mode opt-in, or a kernel restart. Switching the model applies live and does not reconnect. Off by default; this kernel keeps its own copy.</span>' +
+  '<span class=rs-sub>For every new Claude Code session, ask the API for reasoning summaries and show them in the chat, folded to two lines (click to expand). Compact transcript still hides them. If thinking was turned off for this install, this turns adaptive thinking on as well. A running session picks the change up at its next reconnect: an effort or billing switch, the first fast-mode opt-in, or a kernel restart. Switching the model applies live and does not reconnect. Off by default; this kernel keeps its own copy.</span>' +
   '</span></label>' +
   "<label class='rs-row'><input type=checkbox id=rs-fileedit>" +
   '<span><b>File editing</b><span class=rs-mixed hidden></span>' +
@@ -158,10 +159,14 @@ var GEAR_HTML =
   "<div class='rs-row rs-jrow'><b>Judge concurrency <span class=rs-mixed hidden></span></b><span class=rs-sub>How many judge calls run at once, across every tier. Default is 6, or the ROMP_JUDGE_CONCURRENCY the kernel's service environment sets. Applies on the judges' next pass; no restart. Follows to every connected machine's kernel.</span><select id=rs-judgeconc></select></div>" +
   '<div class=rs-sec>Updates & debug</div>' +
   "<div class='rs-row' style='cursor:default'><span style='flex:1 1 auto'><b>Automatic updates <span class=rs-mixed hidden></span></b>" +
-  '<span class=rs-sub>romp watches for new tagged releases (every 6 hours) AND new commits on main (origin polled every few minutes, plus a restart offer when updated code sits on disk unbooted) — one banner covers both, and acting on it converges every attached machine. Check and ask (the default) offers the banner with an Update button; Install automatically converges by itself, restarting at the next quiet moment; Off never checks. Kernel-side setting.</span>' +
+  '<span class=rs-sub>romp watches for new tagged releases (every 6 hours) AND new commits on main (origin polled every few minutes, plus a restart offer when updated code sits on disk unbooted) — one banner covers both, and acting on it converges every attached machine. Check and ask (the default) offers the banner with an Update button; Install automatically converges by itself: a change to kernel code restarts it at once (turns in flight are cut and resume with their history); anything else (the UI, the docs, the postal bus) converges in place with the kernel left up; Off never checks. Kernel-side setting.</span>' +
   "<select id=rs-updates style='display:none'>" +
   '<option value=ask>Check and ask</option><option value=auto>Install automatically</option><option value=off>Off</option>' +
   '</select></span></div>' +
+  "<label class=rs-row><input type=checkbox id=rs-tmuxbackend>" +
+  '<span><b>Enable Claude Code tmux backend <span class=rs-mixed hidden></span></b>' +
+  '<span class=rs-sub>Offers Claude Code (tmux) in the + picker and the Default backend list: a Claude Code session in a terminal pane that romp follows by reading the terminal, less reliable than Claude Code itself. Off by default. Sessions already running on it keep working either way; this only sets what the picker offers. Follows to every connected machine\'s kernel.</span>' +
+  '</span></label>' +
   
   '<div class=rs-judges>' +
   '<label class=rs-row rs-half><input type=checkbox id=rs-judges-index>' +
@@ -174,7 +179,8 @@ var GEAR_HTML =
   '</span></label>' +
   '</div>' +
   "<div class=rs-sep style='padding-top:8px'>" +
-  '<button id=ra-open class=ra-openbtn>Token usage analytics</button></div>' +
+  '<button id=ra-open class=ra-openbtn>Token usage analytics</button>' +
+  '<button id=rs-log-open class=ra-openbtn hidden>Open log<span class=rs-log-n hidden></span></button></div>' +   // T290: the Log moved here from the bottom bar (web shell only); the span is the unread count
   "<div class='rs-h rs-sep'>romp · version</div>" +
   '<div id=rsver>…</div></div></div>' +
   '<div id=rs-login-modal hidden>' +
@@ -232,6 +238,7 @@ function initGear(post) {
     dm = document.getElementById('rs-distillmodel'), de = document.getElementById('rs-distilleffort'),
     cmm = document.getElementById('rs-cmtmodel'), cme = document.getElementById('rs-cmteffort'),
     cmf = document.getElementById('rs-cmtfast'),
+    tb = document.getElementById('rs-tmuxbackend'), bkn = document.getElementById('rs-backend-note'),
     fe = document.getElementById('rs-fileedit'),
     ths = document.getElementById('rs-thinksum'),
     ans = document.getElementById('rs-autonudge-split'), asub = document.getElementById('rs-autonudge-sub');
@@ -724,6 +731,23 @@ function initGear(post) {
   if (cmm) cmm.addEventListener('change', function () { post({ type: 'setCommentModel', model: cmm.value, gt: gclock.stamp('comment-model') }); cmtFastGate(true); });
   if (cme) cme.addEventListener('change', function () { post({ type: 'setCommentEffort', effort: cme.value, gt: gclock.stamp('comment-effort') }); });
   if (cmf) cmf.addEventListener('change', function () { post({ type: 'setCommentFast', fast: cmf.checked ? 'on' : 'session', gt: gclock.stamp('comment-fast') }); });
+  // the tmux backend's offer (T288): a kernel setting like the judge knobs (stamped, propagated); the Default
+  // backend list repaints at once so the pick and the offer never disagree in the same modal
+  if (tb) tb.addEventListener('change', function () { post({ type: 'setTmuxBackend', enabled: tb.checked, gt: gclock.stamp('tmux-backend') }); paintBackendOffer(tb.checked); });
+  // "Claude Code (tmux)" is in the Default backend list only while the setting is on; a saved default of tmux
+  // while it is off is set aside (the select shows Claude Code and the note says so), never erased: it returns
+  // with the setting. The option is removed rather than hidden: the facade paints from sel.options.
+  function paintBackendOffer(on) {
+    if (!bk) return;
+    var opt = bk.querySelector('option[value=tmux]');
+    if (on && !opt) { opt = document.createElement('option'); opt.value = 'tmux'; opt.textContent = BN.backendLabel('tmux'); bk.insertBefore(opt, bk.querySelector('option[value=codex]')); }
+    else if (!on && opt) opt.remove();
+    var pref = load().backend || 'sdk', eff = BN.effectiveDefaultBackend(pref, on);
+    bk.value = eff;
+    if (bkn) { bkn.hidden = eff === pref; bkn.textContent = eff === pref ? '' : 'Your saved default, ' + BN.backendLabel(pref) + ', is set aside while the tmux backend is off; new sessions use ' + BN.backendLabel(eff) + '.'; }
+    repaintSelectPicks();
+  }
+  paintBackendOffer(tb ? tb.checked : false);   // the list assumes OFF until a kernel says on (the picker's rule), so the two never disagree on the offer
   // feed-colormap preview bar: a horizontal gradient of the SELECTED map's stops (mirrors render.ts COLORMAPS).
   var CMAPS = { aurora: [[84, 178, 4], [0, 180, 115], [35, 175, 156], [66, 169, 176], [25, 168, 201], [14, 164, 227], [74, 155, 241], [113, 145, 244], [144, 136, 240]],
     hawaii: [[140, 2, 115], [146, 46, 85], [151, 78, 62], [155, 111, 40], [156, 150, 28], [137, 189, 74], [107, 212, 142], [103, 233, 213], [179, 242, 253]],
@@ -761,7 +785,7 @@ function initGear(post) {
   if (plBtn) plBtn.addEventListener('click', function (e) { e.stopPropagation(); plBuild(); if (plList) plList.hidden = !plList.hidden; });
   document.addEventListener('click', function (e) { var w = document.getElementById('rs-pal');
     if (plList && !plList.hidden && w && !w.contains(e.target)) plList.hidden = true; });
-  if (bk) bk.addEventListener('change', function () { var s = load(); s.backend = bk.value; save(s); });   // webview-local pref read at createSession time
+  if (bk) bk.addEventListener('change', function () { var s = load(); s.backend = bk.value; save(s); paintBackendOffer(tb ? tb.checked : false); });   // webview-local pref read at createSession time; the set-aside note follows the new pick (T288)
   if (dd) dd.addEventListener('change', function () { var v = dd.value.trim(); var s = load(); s.defaultDir = v; save(s);
     post({ type: 'setDefaultDir', value: v }); });   // persist kernel-side: _default_create_dir reads this file FIRST
   var ddb = document.getElementById('rs-defaultdir-browse');
@@ -787,7 +811,7 @@ function initGear(post) {
     'index-model': 'Indexing model', 'index-effort': 'Indexing effort', 'judge-concurrency': 'Judge concurrency',
     'distill-model': 'Distilling model', 'distill-effort': 'Distilling effort',
     'comment-model': 'Comment model', 'comment-effort': 'Comment effort',
-    'comment-fast': 'Fast comment threads', 'thinking-summaries': 'Thinking summaries' };
+    'comment-fast': 'Fast comment threads', 'tmux-backend': 'Claude Code tmux backend', 'thinking-summaries': 'Thinking summaries' };
   // store name → the message type that sets it: the whitelist for the toast's Apply anyway (a frame
   // may re-issue the one setting it names, nothing else) and the completeness pin's map
   // (gear.test.ts checks every emitter stamps through the clock under its own store name)
@@ -796,7 +820,8 @@ function initGear(post) {
     'judge-model': 'setJudgeModel', 'judge-effort': 'setJudgeEffort',
     'index-model': 'setIndexModel', 'index-effort': 'setIndexEffort', 'judge-concurrency': 'setJudgeConcurrency',
     'distill-model': 'setDistillModel', 'distill-effort': 'setDistillEffort',
-    'comment-model': 'setCommentModel', 'comment-effort': 'setCommentEffort', 'comment-fast': 'setCommentFast' };
+    'comment-model': 'setCommentModel', 'comment-effort': 'setCommentEffort', 'comment-fast': 'setCommentFast',
+    'tmux-backend': 'setTmuxBackend' };
   // store name → the words its select shows for the sentinel options whose value is not the word. The
   // effort selects' Default is the EMPTY value (no effort flag), which read as no value at all, so a
   // refused Default pick drew the value-less copy and a plain Apply anyway — in the frozen-tab case, the
@@ -1070,7 +1095,7 @@ function initGear(post) {
     [['updateMode', upm], ['judgeModel', jm], ['judgeEffort', je], ['indexModel', im],
      ['indexEffort', ie], ['judgeConcurrency', jc], ['distillModel', dm], ['distillEffort', de], ['fileEditing', fe],
      ['compactSuggest', csg],
-     ['commentModel', cmm], ['commentEffort', cme], ['commentFast', cmf]].forEach(function (pair) {
+     ['commentModel', cmm], ['commentEffort', cme], ['commentFast', cmf], ['tmuxBackend', tb]].forEach(function (pair) {
       var key = pair[0], el = pair[1];
       if (!el) return;
       var row = el.closest ? el.closest('.rs-row') : null;
@@ -1115,6 +1140,7 @@ function initGear(post) {
     if (typeof v.commentModel === 'string') setShow(cmm, v.commentModel);   // RAW: "session" selects Same as the session
     if (typeof v.commentEffort === 'string') setShow(cme, v.commentEffort);
     if (cmf && typeof v.commentFast === 'string') cmf.checked = v.commentFast === 'on';
+    if (tb && typeof v.tmuxBackend === 'string') { tb.checked = v.tmuxBackend === 'on'; paintBackendOffer(tb.checked); }   // T288: the offer, then the list follows it
     cmtFastGate(false);
     if (dd && typeof v.defaultDir === 'string') dd.value = v.defaultDir;   // the kernel's persisted default is authoritative
     // Browse… draws on the KERNEL's screen, and a kernel with no desktop has none — the click used to
@@ -1162,7 +1188,8 @@ function initGear(post) {
     // settings-open, which is what un-hides #feed-pane when the feed is toggled off — measuring first
     // burned the whole 5-frame retry against a display:none pane, latched rs-pane-gone, and the
     // full-viewport fallback box blacked out every pane behind the modal.
-    p.hidden = false; feedFull(true); setModalCls(true); var s = load(); cc.checked = !!s.compact; jix.checked = (s.showIndexJudges !== undefined ? !!s.showIndexJudges : !!s.debug); jtr.checked = (s.showTriageJudges !== undefined ? !!s.showTriageJudges : !!s.debug); if (gb) gb.checked = s.showBranch === true; if (tc) tc.value = tabCtxMode(s.tabCtx); tcPaint(); csPaint(); ttPaint(); if (cg) cg.checked = s.collapseGaps !== false; if (ao) ao.checked = s.activeOnly !== false; if (fc) fc.checked = s.collapsed === true; cmBuild(); cmPaint(s.colormap || 'aurora'); if (bk) bk.value = s.backend || 'sdk'; if (dd) dd.value = s.defaultDir || ''; plFill(); fill(); }
+    try { if (window.parent !== window) window.parent.postMessage({ romp: 'logUnseenQuery' }, '*'); } catch (e) { /* no shell to ask */ }   // T290: the Open log count
+    p.hidden = false; feedFull(true); setModalCls(true); var s = load(); cc.checked = !!s.compact; jix.checked = (s.showIndexJudges !== undefined ? !!s.showIndexJudges : !!s.debug); jtr.checked = (s.showTriageJudges !== undefined ? !!s.showTriageJudges : !!s.debug); if (gb) gb.checked = s.showBranch === true; if (tc) tc.value = tabCtxMode(s.tabCtx); tcPaint(); csPaint(); ttPaint(); if (cg) cg.checked = s.collapseGaps !== false; if (ao) ao.checked = s.activeOnly !== false; if (fc) fc.checked = s.collapsed === true; cmBuild(); cmPaint(s.colormap || 'aurora'); paintBackendOffer(tb ? tb.checked : false); if (dd) dd.value = s.defaultDir || ''; plFill(); fill(); }
   if (g) g.onclick = function (e) { e.stopPropagation(); openSettings(); };   // hidden anchor; hosts open via the message below
   window.addEventListener('message', function (e) { if (e.data && e.data.romp === 'openSettings') openSettings(); });
   // The shortcuts row: the web shell (same-origin parent) gets the customize link — it opens the
@@ -1176,6 +1203,21 @@ function initGear(post) {
     if (vrow) vrow.hidden = web;
     var kb2 = document.getElementById('rs-keys-btn');
     if (kb2) kb2.onclick = function () { closeSettings(); try { window.parent.postMessage({ romp: 'openKeys' }, '*'); } catch (e) { /* no shell to ask */ } };
+    // "Open log" (T290, the user 2026-09-09): the Log left the bottom bar; this button, the last row of Updates &
+    // debug, opens the shell's Log panel (a centered modal over the dimmed dashboard, the panels rule). The modal
+    // closes first so the two never stack. Web shell only: VS Code's cross-origin parent has no Log panel.
+    var lg = document.getElementById('rs-log-open');
+    if (lg) { lg.hidden = !web; lg.onclick = function () { closeSettings(); try { window.parent.postMessage({ romp: 'openLog' }, '*'); } catch (e) { /* no shell to ask */ } }; }
+    // the unread count the bar's opener used to draw (T290): the shell posts {romp:'logUnseen', n} on every
+    // repaint of its Log and answers {romp:'logUnseenQuery'}; the label reads "Open log · N" (9+ past nine)
+    var lgn = lg ? lg.querySelector('.rs-log-n') : null;
+    window.__rompSetLogCount = function (n) {
+      if (!lgn) return;
+      n = Number(n) || 0;
+      lgn.hidden = n <= 0;
+      lgn.textContent = n <= 0 ? '' : ' \u00b7 ' + (n > 9 ? '9+' : String(n));
+    };
+    window.addEventListener('message', function (e) { var m = e.data; if (m && m.romp === 'logUnseen') window.__rompSetLogCount(m.n); });
   })();
   p.addEventListener('click', function (e) { if (e.target === p) closeSettings(); });   // click the dimmed backdrop (not the card) → close
   document.addEventListener('click', function (e) { if (!p.hidden && e.target !== g && !p.contains(e.target)) closeSettings(); });

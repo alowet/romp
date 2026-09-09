@@ -29,7 +29,7 @@ test("the picker's Billing row shows for SDK whenever availability is known", ()
   // (pickerBackendChoice reads the Backend row's chip alone since tab groups, 2026-09-04 — the Tags
   // row wears the same chip grammar, and a selected tag must never read as the backend)
   assert.match(RENDER, /const show = !pickMode && !!\(a && \(a\.login \|\| a\.key\)\) && pickerBackendChoice\(\) === "sdk";/);
-  assert.match(RENDER, /function pickerBackendChoice\(\): string \{\s*\n\s*const beSel = document\.querySelector\("#picker \.picker-backend:not\(\.picker-host\):not\(\.picker-auth\):not\(\.picker-tags\) \.picker-be-opt\.sel"\) as HTMLElement \| null;\s*\n\s*return beSel\?\.dataset\.be \|\| loadSettings\(\)\.backend;/);
+  assert.match(RENDER, /function pickerBackendChoice\(\): string \{\s*\n\s*const beSel = document\.querySelector\("#picker \.picker-backend:not\(\.picker-host\):not\(\.picker-auth\):not\(\.picker-tags\) \.picker-be-opt\.sel"\) as HTMLElement \| null;\s*\n\s*return beSel\?\.dataset\.be \|\| effectiveDefaultBackend\(loadSettings\(\)\.backend, kernelTmuxBackend\);/);
   assert.match(RENDER, /const both = !!\(a!\.login && a!\.key\);/);
   assert.match(RENDER, /auWrap\.style\.display = "none";\s*\/\/ hidden until a sessionList reply carries authAvail/);
   assert.match(RENDER, /beWrap\.addEventListener\("click", \(\) => \{ syncPickerAuth\(\); syncPickerTags\(\); \}\);/);   // the Tags row follows the backend pick too (tab groups)
@@ -64,24 +64,24 @@ test("the pick rides createSession, omitted when the row is hidden or written-ou
   assert.match(RENDER, /const def = a!\.default === "key" \? "key" : "login";/);
 });
 
-test("the switching CONTROL is the tab menu's Billing submenu, gated on both", () => {
+test("the switching CONTROL is the tab menu's Billing submenu, both sides listed (the unavailable one greyed)", () => {
   // moved OUT of the statusline (the user 2026-08-09): no auth badge kind survives there
   assert.match(RENDER, /type MetaKind = "mode" \| "model" \| "effort" \| "fast";/);
   assert.doesNotMatch(RENDER, /metaButton\("auth"/);
   assert.doesNotMatch(RENDER, /AUTH_CHOICES/);
   // …and INTO showTabMenu: only when the machine offers both choices does the item exist at all
   // (a one-auth machine keeps the fact on the tab hover, never a dead selector)
-  assert.match(RENDER, /if \(st && st\.auth && st\.authBoth\) \{/);
+  assert.match(RENDER, /if \(st && st\.auth && \(st\.authAvail \|\| st\.authBoth\)\) \{/);   // 2026-09-08: availability, not only both
   // the flyout offers the two plain labels — Login named by its account, the key by NO material —
   // with the session's current choice check-marked
-  assert.match(RENDER, /\{ label: st\.authAcct \? `Login \(\$\{st\.authAcct\}\)` : "Login", value: "login" \},/);
-  assert.match(RENDER, /\{ label: "API key", value: "key" \}\]/);
-  assert.match(RENDER, /el\("div", "ctx-item" \+ \(st\.auth === c\.value \? " current" : ""\)\)/);
+  assert.match(RENDER, /\{ label: st\.authAcct \? `Login \(\$\{st\.authAcct\}\)` : "Login", value: "login", why: avail\.login \? "" : /);   // 2026-09-08: each option carries the reason it is greyed, or ""
+  assert.match(RENDER, /\{ label: "API key", value: "key", why: avail\.key \? "" : /);   // 2026-09-08: reason field, see above
+  assert.match(RENDER, /el\("div", "ctx-item" \+ \(st\.auth === c\.value \? " current" : ""\) \+ \(c\.why \? " disabled" : ""\)\)/);   // 2026-09-08: the unavailable side is greyed, never hidden
   // a pick posts the same setAuth the badge used, and only a CHANGE posts (current = dismiss)
   assert.match(RENDER, /if \(st\.auth !== c\.value && vscodeApi\) vscodeApi\.postMessage\(\{ type: "setAuth", id, value: c\.value \}\);/);
   // the item's sub-line names the current billing, or the applying reconnect
   assert.match(RENDER, /st\.authPending \? "applying…"/);
-  assert.match(RENDER, /auth\?: string; authLive\?: string; authPending\?: boolean; authBoth\?: boolean; authAcct\?: string;/);
+  assert.match(RENDER, /auth\?: string; authLive\?: string; authPending\?: boolean; authBoth\?: boolean; authAvail\?: AuthAvail; authPickUnavailable\?: string; authPickFell\?: string; authAcct\?: string;/);   // 2026-09-09: the fall the launch took rides beside the unavailable pick
 });
 
 test("no key material reaches the webview — no tail plumbing survives anywhere", () => {
@@ -96,6 +96,7 @@ test("the chat tab hover says Billing whenever the backend reports it, naming th
   // ungated on machine shape (the user 2026-08-09: one-auth machines included; only a tmux session,
   // whose CLI env romp does not control, reports nothing) — and 'Login (account)' when known
   assert.match(RENDER, /s\.status\.auth === "key" \? "API key"\s*\n\s*: \(s\.status\.authAcct \? `Login \(\$\{s\.status\.authAcct\}\)` : "Login"\)\]\);/);
+  assert.match(RENDER, /: s\.status\.authPickUnavailable === s\.status\.auth\s*\n(?:\s*\/\/[^\n]*\n)*\s*\? `⚠ /);   // 2026-09-08: a pick this box cannot bill is said on the hover too
   // …and the row tells the TRUTH in every landing shape (T124, superseding the quiet-parenthetical
   // form: after a switch the row showed the pick as applied fact through the whole reconnect
   // window, and a wrong-side landing read as an aside). A PENDING pick says "applying — not
@@ -108,17 +109,17 @@ test("the chat tab hover says Billing whenever the backend reports it, naming th
   assert.match(RENDER, /⚠ \$\{s\.status\.auth === "key" \? "API key" : "Login"\} picked, but the CLI reports `\s*\n\s*\+ `\$\{s\.status\.authLive === "key" \? "the API key" : "the login"\} — this session bills that`/,
     "a confirmed contradiction leads with the warning");
   // the SWITCH CONTROL (the Billing submenu) carries the same truth where the pick lives
-  assert.match(RENDER, /sb\.textContent = st\.authPending \? "applying…"\s*\n\s*: st\.authLive && st\.authLive !== st\.auth\s*\n\s*\? `⚠ CLI reports \$\{st\.authLive === "key" \? "API key" : "login"\}`/,
+  assert.match(RENDER, /sb\.textContent = st\.authPending \? "applying…"\s*\n\s*: st\.authPickUnavailable === st\.auth\s*\n(?:\s*\/\/[^\n]*\n)*\s*\? `⚠ \$\{wordOf\(st\.auth\)\} unavailable`[^\n]*\n\s*: st\.authLive && st\.authLive !== st\.auth\s*\n\s*\? `⚠ CLI reports \$\{st\.authLive === "key" \? "API key" : "login"\}`/,
     "the submenu sub-line shows the contradiction, not the unapplied pick");
 });
 
 test("set_auth refuses a login pick on a box with no login — the same bar the key side always had (T124)", () => {
   const BACKEND = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "sdk_backend.py"), "utf8");
-  assert.ok(BACKEND.includes('if value == "login" and not self.login_ok():'),
+  assert.ok(BACKEND.includes('why = self.auth_unavailable_why(value)') && BACKEND.includes('if self.login_ok() is False:'),   // 2026-09-08: one reason vocabulary (credentials.WHY_*), login_ok still the probe; 2026-09-09: tri-state, None = cannot tell
     "refuse loudly at pick time when the box demonstrably lacks the credential");
   const KERNEL = fs.readFileSync(path.resolve(process.cwd(), "..", "kernel", "kernel.py"), "utf8");
-  assert.ok(KERNEL.includes("_sdk_backend.login_ok = lambda: bool(_claude_account())"),
-    "the probe is the credential store — the authority the usage bars trust");
+  assert.ok(KERNEL.includes('_sdk_backend.login_ok = lambda: (None if _claude_account_state() == "unreadable" else bool(_claude_account()))'),
+    "the probe is the credential store — the authority the usage bars trust; an unreadable store is cannot-tell, never no-login (2026-09-09)");
   assert.ok(KERNEL.includes("or this machine has no Claude login to switch to."),
     "the warn toast names the login case");
 });

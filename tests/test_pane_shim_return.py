@@ -284,7 +284,9 @@ open();recv({type:"ka"});recv({type:"restarting"});out({fifo:FIFO.length,armed:f
     def test_abandon_does_not_clear_the_fifo(self):
         r = _run(self.KEY + r"""
 open();recv({type:"feed",n:1});recv({type:"session",n:1});abandon();connect();open();recv({type:"chatTail",n:2});runFlushes();out({got:delivered.map(k)});""")
-        self.assertEqual(r["got"], ["feed1", "session1", "chatTail2"], "the old socket's frames are the newest state; the new socket's enter behind")
+        self.assertEqual(r["got"], ["feed1", "session1", "wsup", "chatTail2"],
+                         "the old socket's frames are the newest state; the reconnect's own marker frame enters "
+                         "behind them, and the new socket's frames behind that")
 
     def test_the_hop_is_a_message_channel_and_the_shim_has_no_raf(self):
         js = km._shim("chat", 1)
@@ -555,6 +557,48 @@ out({got:delivered.map(function(m){return m.id;}),fifo:FIFO.length,armed:flushAr
         self.assertIn("var FLUSH_MS=8;", js)
         self.assertIn("if(FIFO.length&&Date.now()-t0>=FLUSH_MS){flushArmed=true;ch.port2.postMessage(0);break;}", js)
         self.assertIn("while(FIFO.length){var m=FIFO.shift();", js, "drained from the head, in order")
+
+
+class ReconnectFlag(unittest.TestCase):
+    """The redial declares itself (2026-09-07). `everConnected` is true exactly when THIS page has opened a socket
+    before — the one party that knows it may already hold sessions it can reload lazily — so a redial's URL ends
+    with &reconnect=1 and the kernel skeletons the tabs the page is not looking at (tests/test_chat_skeleton_
+    reconnect.py). The FIRST dial never carries it: a fresh page holds nothing and must get everything, as today.
+    The twin-retire at registration was rejected as the signal: it misses a socket the kernel already dropped."""
+
+    def test_the_first_dial_has_no_flag_and_every_redial_carries_it_after_iid_and_active(self):
+        r = _run(r"""
+function redial(){var live=timers.filter(function(t){return t.live&&t.fn.name==="connect";});live[live.length-1].fn();}
+var first=sockets[0].url;
+localStorage.getItem=function(){return JSON.stringify({activeId:"S1"});};   // the page persisted its active tab before the drop
+open();recv({type:"ka"});sock().readyState=3;sock().onclose();redial();var second=sock().url;
+localStorage.getItem=function(){return null;};                              // a page with no hint still says it reconnected
+open();recv({type:"ka"});sock().readyState=3;sock().onclose();redial();var third=sock().url;
+out({first:first,second:second,third:third,n:sockets.length});""")
+        self.assertEqual(r["n"], 3)
+        self.assertNotIn("reconnect", r["first"], "a fresh page holds nothing: no flag on the first dial")
+        self.assertTrue(r["first"].startswith("ws://TESTHOST/ws?app=test&delta=1&iid="), r["first"])
+        self.assertTrue(r["second"].startswith("ws://TESTHOST/ws?app=test&delta=1&iid="), r["second"])
+        self.assertTrue(r["second"].endswith("&active=S1&reconnect=1"),
+                        "the flag is APPENDED after the active hint, so the kernel's active-first build is untouched: " + r["second"])
+        self.assertTrue(r["third"].endswith("&reconnect=1") and "active=" not in r["third"],
+                        "no hint → the kernel sends everything, but the page still names itself a reconnect: " + r["third"])
+        self.assertEqual(r["third"].count("&reconnect=1"), 1)
+
+
+class SocketFlipMarker(unittest.TestCase):
+    """The socket flip reaches the bundle as a FRAME ({type:"wsup"}) through the FIFO, in order with the frames — a
+    bundle that scopes 'loaded on this socket' must not learn the flip at onopen while the dead socket's last frames
+    are still draining (review find 2026-09-07). A first open sends none."""
+
+    def test_a_reconnect_open_enqueues_the_marker_first_and_a_first_open_does_not(self):
+        r = _run(r"""
+open();var first=FIFO.length;recv({type:"ka"});sock().readyState=3;sock().onclose();timers[timers.length-1].fn();open();
+var afterRedial=FIFO.map(function(m){return m.type;});runFlushes();
+out({first:first,afterRedial:afterRedial,delivered:delivered.map(function(m){return m.type;})});""")
+        self.assertEqual(r["first"], 0, "a first open is not a flip")
+        self.assertEqual(r["afterRedial"], ["wsup"], "the redial's open enqueues the marker, before any frame of the new socket")
+        self.assertEqual(r["delivered"], ["wsup"])
 
 
 if __name__ == "__main__":

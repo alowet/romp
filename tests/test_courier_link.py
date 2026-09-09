@@ -11,6 +11,7 @@ import os
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
@@ -52,6 +53,10 @@ def _seed_recipient(placed_under_existing=True):
 
 class CourierLinkRepair(unittest.TestCase):
     def setUp(self):
+        # the kernel's judge is one module object shared by every test module in the process, so a store saved at its import-bound GOALDIR outlives the module and reaches every later module's feed for the placeholder sid (T281/T282); a private root for the duration.
+        self._td = tempfile.TemporaryDirectory()
+        self._state = jd.STATE
+        jd._rebind_state(Path(self._td.name))
         self._saved = jd.discover
         jd.discover = lambda now, window=None, forks=True: [
             (SENDER, "/dev/null", None, "web"), (RECIP, "/dev/null", None, "api")]
@@ -60,8 +65,21 @@ class CourierLinkRepair(unittest.TestCase):
 
     def tearDown(self):
         jd.discover = self._saved
-        for f in jd.GOALDIR.glob("*"):
-            f.unlink()
+        jd._rebind_state(self._state)
+        self._td.cleanup()
+
+    def test_the_store_this_module_saves_does_not_outlive_it(self):
+        # The residue pin (T281/T282): a store saved through the shared judge lands under this test's root and
+        # the run-wide root (what every later module's feed reads) is exactly as it was.
+        shared = Path(self._state) / "goals" / (SENDER + ".json")
+        before = (shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None)
+        st = jd.load_goals(SENDER)
+        st["nodes"][SENDER + ":t282"] = jd.GuardedNode({"id": SENDER + ":t282", "text": "a note", "parentId": None, "nodeComplete": False,
+                                                        "blocked": False, "cleared": False, "trail": [], "t": 1, "mt": 1, "log": []})
+        jd.save_goals(SENDER, st)
+        self.assertTrue((Path(self._td.name) / "goals" / (SENDER + ".json")).exists(), "the store lives under this module's root")
+        self.assertEqual((shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None), before,
+                         "the run-wide goals directory is untouched by this module")
 
     def test_link_attaches_to_the_placed_top_and_is_idempotent(self):
         st = jd.load_goals(RECIP)
@@ -125,12 +143,17 @@ class CourierLinkRepair(unittest.TestCase):
 
     def test_courier_scan_carries_the_repair_branch(self):
         src = open(os.path.join(BIN, "romp-judge")).read()
-        self.assertIn("_attach_courier_link(cstore, seg[\"id\"], pm0[1])", src)
+        # the scan asks the read-only view whether the link is missing and loads for the write only then (2026-09-09)
+        self.assertIn("_courier_link_wanted(cstore, seg[\"id\"], pm0[1]) is not None", src)
+        self.assertIn("_attach_courier_link(load_goals(fsid), seg[\"id\"], pm0[1])", src)
         self.assertIn('_seg_peer_kind(seg) == "delegate"', src)
 
 
 class DormantHandoffConverts(unittest.TestCase):
     def setUp(self):
+        self._td = tempfile.TemporaryDirectory()      # a private root: see CourierLinkRepair.setUp
+        self._state = jd.STATE
+        jd._rebind_state(Path(self._td.name))
         _seed_sender()
         d = jd.STATE / "states"
         d.mkdir(parents=True, exist_ok=True)
@@ -151,11 +174,8 @@ class DormantHandoffConverts(unittest.TestCase):
     def tearDown(self):
         for nm in ("available", "alive_sids"):
             km._TMUX.__dict__.pop(nm, None)   # instance attrs shadow the class methods; drop them
-        for f in jd.GOALDIR.glob("*"):
-            f.unlink()
-        for f in (jd.STATE / "states").glob("*"):
-            f.unlink()
-        (jd.NAMES / SENDER).unlink(missing_ok=True)
+        jd._rebind_state(self._state)                # the private root goes with the tempdir
+        self._td.cleanup()
 
     def test_dormant_sender_handoff_blocks_with_the_dead_wait_why(self):
         km._dead_wait_sweep(set(), self.nudged, T + 900)

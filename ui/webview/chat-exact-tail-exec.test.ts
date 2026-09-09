@@ -37,6 +37,7 @@ function liftChatTail(): (hooks: TailHooks) => TailApi {
     const ledgers = new Map();
     const H = HOOKS;
     const requestFullSession = (id) => { H.fulls.push(id); };
+    const skeletonTabs = { ids: new Set(HOOKS.skeleton || []) };   // a skeleton tab's tail asks for the full instead of splicing (the reconnect regime); the default world holds none
     const isOptimistic = (e) => !!e.opt;
     const stripOptimistic = (s) => { s.events = s.events.filter((e) => !e.opt); H.strips++; };
     const reconcileRewind = (s, bound) => { H.rewinds.push([s.id, bound]); };
@@ -66,6 +67,18 @@ function tailWorld(opts: { rendered: number; winEnd: number; unitTotal: number; 
   api.set({ sessions: new Map([["A", s]]), views: new Map([["A", v]]), activeId: opts.active ? "A" : "B" });
   return { H, api, s, v };
 }
+
+test("a tail for a skeleton tab asks for the full session and touches nothing: the page holds no current copy to splice onto", () => {
+  const { H, api, s, v } = tailWorld({ rendered: 10, winEnd: 10, unitTotal: 10, active: true });
+  const skel = liftChatTail()({ ...H, skeleton: ["A"] } as any);
+  skel.set({ sessions: new Map([["A", s]]), views: new Map([["A", v]]), activeId: "A" });
+  skel.chatTail({ id: "A", from: 7, events: [{ kind: "assistant", uuid: "e7b" }] });
+  assert.deepEqual(H.fulls, ["A"], "the full is asked for once");
+  assert.equal(s.events.length, 10, "the held events are not spliced");
+  assert.equal(v.rendered, 10, "nothing repaints");
+  assert.equal(H.rewinds.length, 0);
+  assert.equal(H.appends, 0);
+});
 
 test("the active view re-renders from the kernel's exact first changed event; the rewind pass is bounded there", () => {
   const { H, api, s, v } = tailWorld({ rendered: 10, winEnd: 10, unitTotal: 10, active: true });

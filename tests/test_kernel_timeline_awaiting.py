@@ -162,7 +162,7 @@ class TimelineLiveTail(TimelineAwaiting):
         try:
             tl = km.build_timeline(NOW, with_bars=True)
             bars = tl["turns"].get(SID) or []
-            live_bar = next((b for b in bars if b["start"] >= NOW - 21), None)
+            live_bar = km._expand_bar(next((b for b in bars if b["start"] >= NOW - 21), None))   # the wire bar, long-named (T278c)
             self.assertIsNotNone(live_bar, "the /model invocation forms a segment NOW, not after a later "
                                  "disk write: %r" % [(b["start"], b["end"]) for b in bars])
             self.assertEqual(live_bar["promptId"], "cmd:1:model", "the dot anchors on the invocation atom")

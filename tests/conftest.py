@@ -318,6 +318,95 @@ def _stub_place_llm(monkeypatch):
     yield
 
 
+# No test may leave the shared judge or a call-time environment seam changed (2026-09-09). kernel.py
+# loads the judge as SourceFileLoader("romp_judge", ...).load_module(), and load_module re-executes
+# into the module object already in sys.modules under that name, so every kernel-loading test
+# module's km.jd is ONE process-wide object. A test that rebinds jd.STATE to a temp dir and removes
+# that dir in tearDown without restoring the prior value leaves every later STATE reader in the
+# process pointing at a removed directory: a FileNotFoundError on restart-audit.jsonl or
+# timeline-views.json, or a silent empty read where the writer swallows OSError. The postal
+# sessions-file seam has the same shape: postal_service reads ROMP_SESSIONS_FILE from os.environ at
+# call time, so a tearDown that pops it instead of restoring the prior value leaves a later module,
+# which set the seam once at import, resolving no local sessions. Neither shows when the victim runs
+# alone, and the serial order of the whole suite passes only because a test that loads a kernel
+# between the cause and the victim re-executes judge.py and rebinds the roots; any other order (a
+# subset, another scheduler) fails a module that did nothing wrong. This fixture names the cause
+# instead: it snapshots the shared judge's STATE and PROJECTS and the watched environment names
+# before each test and fails the test that changed one and did not restore it, or left a path that
+# was a directory pointing at nothing. Transition-based on purpose: a module-level preamble runs at
+# collection, before any snapshot, and is not seen; a test that changes and restores is quiet; and a
+# test that merely runs under another test's leftover is not blamed for it. A test that loads a
+# kernel (or the judge itself) re-executes judge.py into the shared module, which rebinds every root
+# from the environment as it stands at that moment: that is the loader's reset, made from values
+# other modules' import-time writes decide, not a directory the test made and removed, so the path
+# check compares no values for that test (the re-execution recreates every function object, which is
+# how it is told apart from an assignment). Only the values: judge.py creates STATE at import, so a
+# STATE that is not a directory after a reload is the test's own doing and is still named, and the
+# environment names are still checked. Values of the environment names are never printed (one of
+# them is a credential), only the kind of change.
+_SHARED_JUDGE_PATHS = ("STATE", "PROJECTS")
+_SEAM_ENV_NAMES = ("ROMP_SESSIONS_FILE", "ROMP_SERVE_TOKEN")
+
+
+def _shared_judge_paths():
+    """({name: (path text or None, is a directory)}, marker) for the shared judge's watched globals,
+    the marker being a function object judge.py defines (a re-execution replaces it); ({}, None) when
+    no module has loaded the judge under its shared name yet."""
+    jd = sys.modules.get("romp_judge")
+    if jd is None:
+        return {}, None
+    out = {}
+    for name in _SHARED_JUDGE_PATHS:
+        p = getattr(jd, name, None)
+        text = None if p is None else str(p)
+        out[name] = (text, text is not None and os.path.isdir(text))
+    return out, vars(jd).get("_rebind_state")
+
+
+@pytest.fixture(autouse=True)
+def _shared_state_restored(request):
+    paths_before, marker_before = _shared_judge_paths()
+    env_before = {name: os.environ.get(name) for name in _SEAM_ENV_NAMES}
+    yield
+    paths_after, marker_after = _shared_judge_paths()
+    left = []
+    if marker_after is marker_before:      # not re-executed: whatever differs, this test assigned
+        for name, (text0, isdir0) in paths_before.items():
+            text1, isdir1 = paths_after.get(name, (None, False))
+            if text1 != text0:
+                left.append("romp_judge.%s changed from %s to %s" % (name, text0, text1))
+            elif isdir0 and not isdir1:
+                left.append("romp_judge.%s %s was a directory and is gone" % (name, text0))
+    else:                                  # re-executed: the loader bound the roots, and created STATE
+        text1, isdir1 = paths_after.get("STATE", (None, False))
+        if text1 is not None and not isdir1:
+            left.append("romp_judge.STATE %s is not a directory after the test reloaded the judge" % text1)
+    for name in _SEAM_ENV_NAMES:
+        v0, v1 = env_before[name], os.environ.get(name)
+        if v0 == v1:
+            continue
+        if v1 is None:
+            left.append("%s was set and is now unset" % name)
+        elif v0 is None:
+            left.append("%s was unset and is now set" % name)
+        else:
+            left.append("%s was changed" % name)
+    if left:
+        pytest.fail("%s left shared state changed after its teardown: %s. Save the prior value before "
+                    "changing it and put it back at the end of the test; for a path, before removing the "
+                    "directory it named." % (request.node.nodeid, "; ".join(left)), pytrace=False)
+
+
+def restore_env(name, prior):
+    """Put the environment name back the way a test found it: `prior` is the os.environ.get(name) taken before
+    the test changed it, None meaning unset. A tearDown that pops the name instead leaves a later module in the
+    process without the value its own import set; this is the restore the fixture above expects."""
+    if prior is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = prior
+
+
 # No test report may carry a process-environment VALUE, or a credential-shaped token (2026-09-05). A
 # test that renders an env mapping in an assertion (assertNotIn on os.environ, on a _judge_env() copy
 # of it, on a launch env) prints the whole mapping when it fails, and on a developer's box that
@@ -610,3 +699,40 @@ def pytest_collectreport(report):
     Redacted BEFORE the other implementations see it: the terminal reporter files it from here."""
     _redact_report(report)
     yield
+
+
+# ── thread census (T282) ──────────────────────────────────────────────────────────────────────────────
+# A test that starts a real kernel loop, a backend pump or a fake server must end it before its module ends: a
+# daemon thread that outlives its module runs against whatever the shared modules (the judge, the event model)
+# are bound to by then. These two helpers are the pin every such module carries, and the module-boundary
+# tracer reads the same census, so a leak is named by the module that made it.
+def thread_census():
+    """The live non-main threads as stable descriptors: the target's qualified name when the thread has one,
+    else its name; pytest-timeout's own watchdog thread excluded. Sorted, so two censuses compare directly."""
+    import threading
+    out = []
+    for t in threading.enumerate():
+        if t is threading.main_thread():
+            continue
+        target = getattr(t, "_target", None)
+        mod = (getattr(target, "__module__", "") or "") if target is not None else ""
+        if t.name.startswith("pytest_timeout") or mod.startswith("pytest_timeout"):
+            continue
+        out.append("%s.%s" % (mod, getattr(target, "__qualname__", None) or repr(target)) if target is not None else t.name)
+    return sorted(out)
+
+
+def wait_for_census(before, timeout=5.0):
+    """The threads alive now that were NOT in `before`, once that set is empty or at the deadline: a module's pin is
+    "nothing this module started outlives it", so a thread from an EARLIER module that happens to end during this one
+    cannot fail it, and a thread this module started has a moment (20 ms polls, up to `timeout`) to reach its exit
+    after join(timeout) returned. Returns the sorted leftovers; a clean module gets []."""
+    import collections
+    import time
+    deadline = time.monotonic() + timeout
+    base = collections.Counter(before)
+    while True:
+        extra = sorted((collections.Counter(thread_census()) - base).elements())   # by COUNT: a second thread of a
+        if not extra or time.monotonic() >= deadline:                              # kind already present is a leftover
+            return extra
+        time.sleep(0.02)

@@ -382,10 +382,20 @@ const menuCheckStyleFor = (p) => 'position:absolute;right:6px;top:50%;transform:
   + 'background:' + p.accentSolid + ';color:#fff;border-radius:50%;width:13px;height:13px;font-size:9px;'
   + 'font-weight:900;display:inline-flex;align-items:center;justify-content:center;line-height:1;';
 let MENU_STYLE = null, MENU_CHECK_STYLE = null;   // set by applyPal() below (dark by default)
+// THE TAG CHIP in the views menu (T283b, the user 2026-09-09: menus wear one vocabulary): the shared tag-lens
+// menu renders each tag as the tag chip itself acting as a toggle (ui/webview/tag-menu.ts tagChip + T283's
+// loop); this pane inlines the RESOLVED twin, since it may live in a foreign document that loads no module.
+// TAG_CHIP_STYLE is tagChip's pill byte for byte up to the colour (a drift test compares); the fade is the
+// shared TAG_CHIP_OFF_OPACITY, and the class names the state for a host that does load the sheets.
+const TAG_CHIP_STYLE = 'display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border-radius:9px;font-size:0.82em;border:1px solid ';
+const TAG_CHIP_OFF_OPACITY = '0.45';
+const TAG_CHIP_OFF_CLASS = 'tag-chip-off';
+const TAG_CHIP_ROW_STYLE = 'padding:3px 8px;border-radius:4px;cursor:pointer;white-space:nowrap;display:flex;align-items:center;';
 // Judging band: a compact second timeline UNDER the session lanes, on the SAME axis — one row per
 // summarizer judge (docs/judges.md). Each mark is FILLED with the colour of the SESSION it acted on and
 // OUTLINED in the judge's OWN colour (so a bar reads as "judge X on session Y"). Fed by
-// data.judging = [{judge, sid, t, kind, text}]. Each judge's colour is a distinct hue from the romp palette.
+// data.judging = [{judge, sid, t, t1, kind, text, ms, in, out, sent, recv, open}] once expanded (expandJudging); on the
+// wire it rides per lane as compact entries (T278c). Each judge's colour is a distinct hue from the romp palette.
 // Each judge belongs to a SET (the user 2026-06-29): 'index' = the captioner + archiver (caption/archive
 // bookkeeping); 'triage' = planner/grouper/closer/distiller/courier (goal triage). The two settings toggles
 // (showIndexJudges / showTriageJudges) gate each set's rows on the band — see judgesShown().
@@ -560,6 +570,53 @@ function dragAxis(dx, dy, threshold) {
 // usually a thinking block), then workUuid (first reply line), then the boundary
 // uuid (an interrupted period has no reply at all). Shared by the focus handler
 // and the work-bar click so the two landings can never drift apart again.
+// THE WIRE BAR (T278c): the kernel sends a bar as {id, start, end} plus one-letter keys with every default
+// omitted, and the judging band per lane as compact entries (see kernel/kernel.py _BAR_WIRE / _JUDGING_WIRE);
+// the expanders below give every reader the long names it always had, once per frame at the boundary
+// (_mergeBars). A lane array the shim hands back unchanged across a delta expands once and is reused: the
+// per-lane caches keyed on array identity keep working. A long-named bar (an older kernel, a test fixture)
+// passes through with its defaults filled. BAR_WIRE is the kernel's table, byte for byte (a test compares).
+const BAR_WIRE = { p: ['promptId', null], w: ['workId', null], r: ['replyUuid', null], q: ['prompt', ''], c: ['summary', ''],
+  m: ['msgCaption', ''], s: ['src', 'typed'], d: ['mids', []], u: ['open', false], t: ['cont', false], a: ['nudgeAuto', false], o: ['romp', false] };
+const JUDGING_WIRE = { j: ['judge', null], kd: ['kind', 'run'], x: ['text', ''], ms: ['ms', 0], in: ['in', 0], out: ['out', 0], s: ['sent', null], r: ['recv', null], u: ['open', false] };
+function expandBar(b) {
+  if (!b || typeof b !== 'object') return b;
+  const out = { id: b.id, start: b.start, end: b.end };
+  for (const short in BAR_WIRE) {
+    const [name, dflt] = BAR_WIRE[short];
+    out[name] = (short in b) ? b[short] : (name in b) ? b[name] : (Array.isArray(dflt) ? [] : dflt);
+  }
+  out.pending = ('pending' in b) ? !!b.pending : false;
+  for (const k in b) if (!(k in BAR_WIRE) && !(k in out)) out[k] = b[k];   // anything else rides through (a fixture's extras)
+  return out;
+}
+const _lanesExpanded = new WeakMap();   // wire lane array -> its expanded array: an untouched lane keeps its identity
+function expandBars(turns) {
+  const out = {};
+  for (const sid in (turns || {})) {
+    const lane = turns[sid];
+    if (!Array.isArray(lane)) { out[sid] = lane; continue; }
+    let ex = _lanesExpanded.get(lane);
+    if (!ex) { ex = lane.map(expandBar); _lanesExpanded.set(lane, ex); }
+    out[sid] = ex;
+  }
+  return out;
+}
+function expandJudging(j) {
+  if (Array.isArray(j)) return j;                    // the legacy flat list (an older kernel), or an empty band
+  const out = [];
+  for (const sid in (j || {})) {
+    const lane = j[sid];
+    if (!Array.isArray(lane)) continue;
+    for (const c of lane) {
+      const e = { judge: c.j, sid, t: c.t };
+      if ('t1' in c) e.t1 = c.t1;
+      for (const short in JUDGING_WIRE) { if (short === 'j') continue; const [name, dflt] = JUDGING_WIRE[short]; e[name] = (short in c) ? c[short] : dflt; }
+      out.push(e);
+    }
+  }
+  return out;
+}
 function workAnchorOf(t) { return (t && (t.replyUuid || t.workId || t.promptId)) || null; }   // T278b: workId/promptId ARE the work/prompt uuids; the wire no longer repeats them as workUuid/uuid
 
 // Which ATOM of a turn a highlight set covers — `hit(id)` = membership in the active DAG-journey
@@ -2056,6 +2113,11 @@ class TimelinePanel {
     // applyBars lands. Read the RAW turns BEFORE the prev-carry below back-fills them.
     const ownBars = !!(data.turns && Object.keys(data.turns).length);
     if (ownBars) this._barsLoaded = true;
+    // the wire's shapes are expanded HERE for every payload (T278c), as _mergeBars does for the two-message path:
+    // a full one-shot payload carries compact bars and per-lane judging, and the lanes SKELETON carries judging
+    // as an empty map, which the judge band's draw would otherwise read as a list on a cold start
+    if (ownBars) data.turns = expandBars(data.turns);
+    if (data.judging !== undefined) data.judging = expandJudging(data.judging);
     if (data.turns) for (const k of Object.keys(data.turns)) this._barsSeen.add(k);
     const prev = this.data;
     if (prev && (!data.turns || !Object.keys(data.turns).length)) {
@@ -2170,9 +2232,9 @@ class TimelinePanel {
   // turns/judging/messages, the loader latch, the live edge's clock (2026-09-07). applyBars() paints after
   // it; update() runs it for a frame that was parked ahead of its skeleton.
   _mergeBars(m) {
-    this.data.turns = m.turns || {};
+    this.data.turns = expandBars(m.turns || {});      // the wire's compact bars, long-named for every reader (T278c)
     for (const k of Object.keys(this.data.turns)) this._barsSeen.add(k);
-    this.data.judging = m.judging || [];
+    this.data.judging = expandJudging(m.judging || []);
     this.data.messages = m.messages || [];
     // (nudges array retired 2026-07-07 payload audit: auto-nudges render from the bar's nudgeAuto)
     // Keep the romp loader up through the COLD warm-up rather than flashing "no romp activity" (the user
@@ -3916,19 +3978,35 @@ class TimelinePanel {
     menu.setAttribute('style', 'position:fixed;z-index:1001;min-width:200px;' + MENU_STYLE);
     menu.dataset.rompMenu = '1';   // the echo writers skip in-menu presses (T213)
     menu.addEventListener('click', (e) => e.stopPropagation());
+    // a plain row (All, (no tags), Configure tags…): the label, the ✓ when current. The tags are not rows any
+    // more but CHIPS (tagRow below, T283b), so the colour dot the tag rows wore is gone, as in the shared menu
     const item = (label, opts) => {
       const row = menu.createDiv();
       row.setAttribute('style', 'padding:4px 22px 4px 8px;border-radius:4px;cursor:pointer;position:relative;white-space:nowrap;'
         + (opts && opts.dim ? 'opacity:0.85;' : ''));
-      if (opts && opts.dot) {
-        const d = row.createSpan();
-        d.setAttribute('style', 'display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;background:' + opts.dot + ';');
-      }
       row.appendChild(document.createTextNode(label));
       if (opts && opts.current) {
         const c = row.createSpan({ text: '✓' });
         c.setAttribute('style', MENU_CHECK_STYLE);
       }
+      row.addEventListener('mouseenter', () => { row.style.background = HOVER_BG; });
+      row.addEventListener('mouseleave', () => { row.style.background = 'transparent'; });
+      return row;
+    };
+    // one tag per line, the chip at the left: the chip IS the toggle (aria-pressed), full colour when selected,
+    // faded when not, its colour kept — the pill tagChip builds for every other surface, resolved here (T283b).
+    // The uncoloured fallback is the palette's muted text, the theme token's resolved value (MODEL_FG).
+    const tagRow = (name, color, on) => {
+      const row = menu.createDiv();
+      row.setAttribute('style', TAG_CHIP_ROW_STYLE);
+      const col = color || MODEL_FG;
+      const chip = row.createSpan({ text: name });
+      chip.setAttribute('style', TAG_CHIP_STYLE + col + ';color:' + col + ';background:transparent;white-space:nowrap;'
+        + (on ? '' : 'opacity:' + TAG_CHIP_OFF_OPACITY + ';'));
+      if (!on) chip.classList.add(TAG_CHIP_OFF_CLASS);
+      chip.setAttribute('role', 'button');
+      chip.setAttribute('aria-pressed', on ? 'true' : 'false');
+      chip.setAttribute('title', on ? 'selected \u2014 click to drop it from the filter' : 'click to add it to the filter');
       row.addEventListener('mouseenter', () => { row.style.background = HOVER_BG; });
       row.addEventListener('mouseleave', () => { row.style.background = 'transparent'; });
       return row;
@@ -3961,7 +4039,7 @@ class TimelinePanel {
       item('(no tags)', { current: !lensAll(lens) && !!lens.none })
         .addEventListener('click', () => apply(lensToggle(lens, 'none'), false));
       for (const g of viewTagUnion(v))
-        item(g.name, { dot: g.color || MODEL_FG, current: !lensAll(lens) && (lens.tags || []).indexOf(g.name) >= 0 })
+        tagRow(g.name, g.color, !lensAll(lens) && (lens.tags || []).indexOf(g.name) >= 0)
           .addEventListener('click', () => apply(lensToggle(lens, { tag: g.name }), false));
       sep();
       item('Configure tags…', { dim: true }).addEventListener('click', () => {
@@ -6283,4 +6361,4 @@ class TimelinePanel {
   body(s) { return s ? '<div class="b">' + s + '</div>' : ''; }
 }
 
-module.exports = { TimelinePanel, badgeFor, roundedPath, crossX, workAnchorOf, idleGaps, fmtSpan, dotLit, barLit, interpNow, shouldReanchorEdge, reanchorEdge, isFreshNowSample, barEndT, dragAxis, stripRompMarks, collapseRepeat, reqText, menuTop, offsetRect, viewVisible, viewLabel, viewMoreCount, viewToggleMember, viewTagUnion, lensAll, lensToggle, lensVisible, lensLabel, timelineLens, loadModelChoices, MODEL_CHOICES };
+module.exports = { TimelinePanel, expandBar, expandBars, expandJudging, BAR_WIRE, JUDGING_WIRE, badgeFor, roundedPath, crossX, workAnchorOf, idleGaps, fmtSpan, dotLit, barLit, interpNow, shouldReanchorEdge, reanchorEdge, isFreshNowSample, barEndT, dragAxis, stripRompMarks, collapseRepeat, reqText, menuTop, offsetRect, viewVisible, viewLabel, viewMoreCount, viewToggleMember, viewTagUnion, lensAll, lensToggle, lensVisible, lensLabel, timelineLens, loadModelChoices, MODEL_CHOICES };

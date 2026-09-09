@@ -29,11 +29,14 @@ guarded.
 
 Synthetic only: invented logins, placeholder shas, TESTHOST-free."""
 import importlib.util
+import io
 import os
 import re
+import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 import urllib.error
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -667,10 +670,12 @@ class WorkflowPins(unittest.TestCase):
     def test_the_job_name_is_NOT_the_check_name(self):
         # the job's own check run must not share the required check's name: two same-named runs per
         # head (the job's, frozen at push time, and the API-posted verdict the hourly sweep moves) leave
-        # it undocumented which one the ruleset honors - so only the API-posted verdict carries the name
+        # it undocumented which one the ruleset honors - so only the API-posted verdict carries the name.
+        # The pin covers the bare and the quoted spellings (the file quotes names now), anchored to the
+        # end of the value: "Tier policy: post verdict" passes, `name: "Tier policy"` does not
         jobs = self.wf[self.wf.index("\njobs:"):]
-        self.assertIn("    name: Tier policy evaluation", jobs)
-        self.assertNotRegex(jobs, r"name: Tier policy[ \t]*\n")
+        self.assertIn('    name: "Tier policy: post verdict"', jobs)   # T273c: the row says what the job does (quoted: the colon)
+        self.assertNotRegex(jobs, r"""name: ["']?Tier policy["']?[ \t]*(?:#.*)?\n""")
 
     def test_the_three_tier_label_lists_agree(self):
         wf = open(os.path.join(os.path.dirname(HERE), ".github", "workflows", "pr-tier.yml")).read()
@@ -988,6 +993,37 @@ class FetcherShapes(unittest.TestCase):
         self.assertEqual(failed[0]["conclusion"], "failure")
         self.assertIn("evaluation failed", failed[0]["output"]["title"])
 
+    def test_a_failed_verdict_post_fails_the_job(self):
+        # the POST half of "a fetch or post error fails the job" (T273c): the verdict is the check run, so a
+        # /check-runs POST the API refuses (a 502, a token without checks:write) must reach the job as the
+        # error it is, never as exit 0 beside a verdict nobody posted. The final post_check sits outside
+        # run_one's try, so its error propagates straight through main; nothing retries or swallows it
+        real = self.tc._req
+        attempted = []
+
+        def refusing(method, path, token, body=None):
+            if method == "POST" and path.endswith("/check-runs"):
+                attempted.append(body)
+                raise urllib.error.HTTPError(path, 502, "Bad Gateway", {}, None)
+            return real(method, path, token, body)
+        self.tc._req = refusing
+        with unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok", "GITHUB_REPOSITORY": "romp-on/romp"}):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.tc.main(["--pr", "42"])
+            self.assertEqual(cm.exception.code, 502, "the post's own error is what reaches the job")
+            self.assertEqual([b["conclusion"] for b in attempted], ["success"],
+                             "one attempt, the real verdict: the refused post is neither retried nor swallowed")
+            # when the evaluation ALSO failed, the "evaluation failed" verdict is attempted (never a silent gap
+            # on a required check), its post fails the same way, and that error, not exit 0, reaches the job
+            attempted.clear()
+            self.served = set()
+            self.files_error = 500
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.tc.main(["--pr", "42"])
+            self.assertEqual(cm.exception.code, 502)
+            self.assertEqual(len(attempted), 1)
+            self.assertIn("evaluation failed", attempted[0]["output"]["title"])
+
     def test_build_record_survives_the_documented_shapes_and_has_no_time_field(self):
         rec = self.tc.build_record("romp-on/romp", 42, "tok")
         self.assertEqual(set(rec), {"number", "author", "labels", "head_sha", "files", "files_truncated", "reviews",
@@ -1287,3 +1323,53 @@ class DeclaredTier(unittest.TestCase):
         v = tp.evaluate(pr(labels=["fix", "feature"], body="Tier: fix"))
         self.assertEqual(v["conclusion"], "failure")
         self.assertIn("2", v["title"])
+
+
+class JobExitCode(unittest.TestCase):
+    """The workflow JOB's status is not the verdict (T273c, the user 2026-09-09, who read a contributor's PR with
+    seven red rows as broken when one gate was waiting on them): the verdict is the check run the script posts,
+    so the job exits 0 whenever it evaluated and posted, whatever the verdict said, and nonzero only when the
+    evaluation itself failed (could not fetch, could not post)."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location(
+            "tier_policy_check_exit", os.path.join(os.path.dirname(HERE), "scripts", "ci", "tier_policy_check.py"))
+        self.tc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.tc)
+        os.environ["GITHUB_TOKEN"] = "tok"
+        self.addCleanup(os.environ.pop, "GITHUB_TOKEN", None)
+
+    def test_a_failing_verdict_is_a_posted_verdict_and_the_job_exits_zero(self):
+        self.tc.run_one = lambda repo, n, token: {"conclusion": "failure", "title": "Tier policy: feature",
+                                                  "summary": "A feature by a non-admin author needs an admin's approval: none yet."}
+        self.assertEqual(self.tc.main(["--pr", "42"]), 0, "the verdict is the check run's conclusion, not the job's")
+
+    def test_a_passing_verdict_exits_zero_too(self):
+        self.tc.run_one = lambda repo, n, token: {"conclusion": "success", "title": "Tier policy: fix", "summary": "ok"}
+        self.assertEqual(self.tc.main(["--pr", "42"]), 0)
+
+    def test_an_evaluation_error_still_fails_the_job(self):
+        def boom(repo, n, token):
+            raise RuntimeError("the API said 502")
+        self.tc.run_one = boom
+        with self.assertRaises(RuntimeError):
+            self.tc.main(["--pr", "42"])
+
+    def test_the_hourly_pass_exits_zero_on_failing_verdicts_and_nonzero_on_an_error(self):
+        self.tc._get_all = lambda path, token: [{"number": 1}, {"number": 2}]
+        verdicts = {1: {"conclusion": "failure", "title": "t", "summary": "s"}, 2: {"conclusion": "success", "title": "t", "summary": "s"}}
+        self.tc.run_one = lambda repo, n, token: verdicts[n]
+        self.assertEqual(self.tc.main(["--all-open"]), 0, "two posted verdicts, one of them failing: the sweep did its job")
+
+        def one_boom(repo, n, token):
+            if n == 2:
+                raise RuntimeError("could not post")
+            return verdicts[1]
+        self.tc.run_one = one_boom
+        err, old = io.StringIO(), sys.stderr
+        sys.stderr = err
+        try:
+            self.assertEqual(self.tc.main(["--all-open"]), 1, "one PR's evaluation failed: the job says so")
+        finally:
+            sys.stderr = old
+        self.assertIn("could not post", err.getvalue())

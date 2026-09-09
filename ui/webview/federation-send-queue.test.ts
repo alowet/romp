@@ -165,7 +165,7 @@ test("a NON-setting drop stays a drop — but leaves a client-diag breadcrumb an
 test("the undoClear send site drops loudly too: diag + warn on a down socket", () => {
   withFed((fm, winEvents, localSends) => {
     attach(fm, "TESTHOSTA"); // still CONNECTING
-    fm.lastClearHost = "TESTHOSTA";
+    fm.lastClearHosts = ["TESTHOSTA"];   // T286: the hosts the last clear reached (one here)
     fm.outbound({ type: "undoClear" });
     const dg = diags(localSends, "senddrop");
     assert.equal(dg.length, 1);
@@ -358,8 +358,10 @@ test("the queue and the flush never mint a timestamp — gt is stamped at the ge
 
 test("both outbound remote send sites route through sendRemote — no raw inline drop path remains", () => {
   const outb = FED.slice(FED.indexOf("outbound(m: any): void {"), FED.indexOf("private dropWarn"));
-  assert.match(outb, /this\.sendRemote\(this\.lastClearHost, m\);/);
-  assert.match(outb, /this\.sendRemote\(r\.host, r\.msg\);/);
+  // T286: both sites go through the one sendTo helper, whose remote arm is sendRemote
+  assert.match(outb, /for \(const h of hosts\) this\.sendTo\(h, m\);/);
+  assert.match(outb, /for \(const r of routes\) this\.sendTo\(r\.host, r\.msg\);/);
+  assert.match(outb, /private sendTo\(host: string, msg: any\): void \{[\s\S]*?this\.sendRemote\(host, msg\);/);
   assert.doesNotMatch(outb, /readyState === 1\) c\.ws\.send/,
     "the old drop-if-not-open inline sends must not come back");
 });

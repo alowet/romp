@@ -14,7 +14,8 @@ SRC = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py"), encoding=
 
 class HotkeyHints(unittest.TestCase):
     def test_every_rail_button_with_a_command_carries_its_id(self):
-        for el_id, cmd in [("rail-errs", "log.open"), ("rail-refresh", "kernel.restart"),
+        # the Log's opener left the rail (T290): log.open stays a palette command and the mobile bar's #merr
+        for el_id, cmd in [("rail-refresh", "kernel.restart"),
                            ("rail-net", "net.open"), ("rail-gear", "settings.open"),
                            ("rail-usage", "usage.open")]:
             self.assertRegex(SRC, "id=%s data-keycmd=%s|id=%s[^>]* data-keycmd=%s" % (el_id, cmd, el_id, cmd),

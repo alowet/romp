@@ -22,6 +22,8 @@ import uuid
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+from tests.conftest import restore_env
+
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
 
@@ -46,10 +48,13 @@ def _fresh_mid():
 
 class _RelayBase(unittest.TestCase):
     def setUp(self):
-        os.environ.pop("ROMP_SESSIONS_FILE", None)
+        # no seam unless a test sets one: the source under test is the kernel listing. The prior value
+        # goes back at cleanup, because the bus reads the seam from os.environ at call time and a later
+        # module in the same process may have set it once at import.
+        self._prior_seam = os.environ.pop("ROMP_SESSIONS_FILE", None)
         self._base = pm.KERNEL_BASE
         self.addCleanup(lambda: (setattr(pm, "KERNEL_BASE", self._base),
-                                 os.environ.pop("ROMP_SESSIONS_FILE", None),
+                                 restore_env("ROMP_SESSIONS_FILE", self._prior_seam),
                                  pm.HEARTBEATS.clear()))
 
     def _msg(self, to):

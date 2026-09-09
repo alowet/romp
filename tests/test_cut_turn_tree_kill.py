@@ -165,6 +165,30 @@ class ScopePath(unittest.TestCase):
         self.assertIsNone(out["scope"])
         self.assertEqual(out["tree"], 2)
 
+    def test_a_survivor_of_the_grace_gets_sigkill_on_a_fake_clock(self):
+        # The escalation, pinned with no real process, pid or second behind it (T276c): the liveness poll,
+        # the grace sleep and the clock are seams. The loop ignores its SIGTERM; the clock steps past the
+        # grace in recorded sleeps; exactly the survivor is SIGKILLed, once, after every SIGTERM.
+        be = _backend()
+        killed, slept, clock = [], [], [0.0]
+        ps = ("  %d %d /x/claude --input-format stream-json --resume %s\n"
+              "  %d %d bash -c tool\n"
+              "  %d %d sleep 300\n") % (CLI, MANAGER, SID, TOOL, CLI, LOOP, TOOL)
+        def alive(p):                    # the loop outlives its SIGTERM until its SIGKILL is recorded
+            return p == LOOP and (LOOP, signal.SIGKILL) not in killed
+        def sleep(s):
+            slept.append(s); clock[0] += s
+        out = be._end_cli_tree(CLI, ps.splitlines(), kill=lambda p, s: killed.append((p, s)),
+                               killpg=lambda g, s: killed.append(("pg", g, s)),   # a group kill would show up, not fire
+                               run=lambda *a, **k: None, cgroup=lambda pid: "",
+                               alive=alive, sleep=sleep, now=lambda: clock[0])
+        self.assertEqual(killed, [(TOOL, signal.SIGTERM), (LOOP, signal.SIGTERM), (CLI, signal.SIGTERM),
+                                  (LOOP, signal.SIGKILL)],
+                         "SIGTERM to the tree children-first then the CLI; SIGKILL to the one survivor only")
+        self.assertTrue(slept and all(s == 0.05 for s in slept), "the grace waits in short recorded sleeps")
+        self.assertGreaterEqual(clock[0], sb.TREE_KILL_GRACE, "…until the fake clock passes the grace")
+        self.assertEqual((out["signaled"], out["forced"], out["tree"]), (3, 1, 2))
+
     def test_the_leftover_scope_sweep_stops_our_dead_sessions_scopes_only(self):
         be = _backend()
         # a real child of THIS process stands in for "this kernel's live session": its unit is skipped
@@ -234,16 +258,25 @@ class RealProcessTree(unittest.TestCase):
         # a bystander outside the tree
         by = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(by.wait, timeout=10); self.addCleanup(by.kill)
+        # Wait for the LOOP itself, not for any process wearing the marker: the fake CLI's own argv carries it too,
+        # so a poll on _marker_pids alone was satisfied the instant the shell existed, before its setsid'd child
+        # had started; on a slow runner the descendant check below then found no loop (T276d, CI 3.13 once).
         deadline = time.time() + 5
-        while time.time() < deadline and not self._marker_pids(marker):
+        while time.time() < deadline and not self._loop_pids(marker, cli.pid):
             time.sleep(0.05)
-        self.assertTrue(self._marker_pids(marker), "the detached loop is running before the cut")
+        self.assertTrue(self._loop_pids(marker, cli.pid), "the detached loop itself is running before the cut")
         return cli, by, marker
 
     @staticmethod
     def _marker_pids(marker):
         out = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout.split()
         return [int(x) for x in out if x.isdigit() and int(x) != os.getpid()]
+
+    def _loop_pids(self, marker, cli_pid):
+        """The setsid'd loop's pid(s): every process wearing the marker except the fake CLI shell (whose argv carries
+        it too). pgrep reads /proc/<pid>/cmdline, which a killed-but-unreaped process no longer has, so a pid listed
+        here is a live loop, never a zombie."""
+        return [p for p in self._marker_pids(marker) if p != cli_pid]
 
     def _kill_marker(self, marker):
         for p in self._marker_pids(marker):
@@ -254,14 +287,17 @@ class RealProcessTree(unittest.TestCase):
         cli, by, marker = self._tree()
         be = _backend()
         ps = subprocess.run(sb.PS_ARGV, capture_output=True, text=True, timeout=10).stdout.splitlines()
-        loop_pids = [p for p in self._marker_pids(marker) if p != cli.pid]   # the fake CLI's own argv carries the marker too
+        loop_pids = self._loop_pids(marker, cli.pid)
         self.assertTrue(loop_pids and all(p in sb.descendants(ps, cli.pid) for p in loop_pids),
                         "the setsid'd loop is still the CLI's descendant by ppid: %r vs %r" % (loop_pids, sb.descendants(ps, cli.pid)))
         out = be._end_cli_tree(cli.pid, ps, cgroup=lambda p: "")
+        # Bounded poll for the loop to be GONE (the reaper's own poll shape: liveness, up to a few seconds): the
+        # SIGKILL has been sent when _end_cli_tree returns, but a slow runner may not have taken the process off
+        # the table yet. The bystander check stays immediate and strict.
         deadline = time.time() + 5
-        while time.time() < deadline and (self._marker_pids(marker) or cli.poll() is None):
+        while time.time() < deadline and (self._loop_pids(marker, cli.pid) or cli.poll() is None):
             time.sleep(0.05)
-        self.assertEqual(self._marker_pids(marker), [], "the detached loop died with the cut turn")
+        self.assertEqual(self._loop_pids(marker, cli.pid), [], "the detached loop died with the cut turn")
         self.assertIsNotNone(cli.poll(), "the CLI is gone")
         self.assertIsNone(by.poll(), "the bystander outside the tree was never signaled")
         self.assertGreaterEqual(out["tree"], 1)

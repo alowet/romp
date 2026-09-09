@@ -25,6 +25,16 @@ Implementation notes that amend this sketch:
   `/__romp/tap` in the `romp-tap` cache) and the shell reads it on boot, `visibilitychange`→visible,
   `pageshow` and window `focus`, landing it once by id (`via: 'store'`), deleting the entry and acking
   the worker. A boot on the deep link drops the stored tap rather than landing it twice.
+- Later that day, the app WARM: three taps, three 201s from the push service, and no trace of the click
+  handler at all (no message, no link, an empty store). Two things now settle whether the worker ran:
+  the worker leaves a FINGERPRINT beside the tap (`/__romp/sw`: a version baked at serve time — the
+  kernel's sha + dist token, the string the shell page carries too — plus install/activate/last-push/
+  last-click stamps and a click count), which the shell folds into every `tap-resume` row (`sw-stale`
+  on a mismatch; `registration.update()` at boot and on every visible); and every session-addressed
+  push writes the notification it shows to `/__romp/shown` BEFORE attempting the show, so a page that
+  comes forward with that record and no tap OFFERS the session instead of jumping — a bottom-left chip
+  ("Open <name> · from the notification", with a dismiss) that lands by the same path (`via: 'offer'`)
+  when taken. A stored tap outranks the offer; the session already in front retires it.
 - The shell background is `#1e1e1e`, not the `#101418` guessed below (that is the login page);
   the manifest and theme-color use `#1e1e1e`.
 - The manifest and the three icon PNGs are served auth-EXEMPT: browsers fetch a manifest (and

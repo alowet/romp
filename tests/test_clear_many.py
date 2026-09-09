@@ -73,5 +73,50 @@ class ClearMany(unittest.TestCase):
         self.assertEqual(self.chat, [])
 
 
+
+
+class TwoKernelsClearAllEachTheirOwn(unittest.TestCase):
+    """The board-wide Clear all reaches every attached kernel (T286): the client broadcasts it (federation.ts, pinned
+    in ui/webview/feed-clear-all-broadcast.test.ts) and each kernel clears ITS OWN feed's cards and appends ITS OWN
+    ledger rows, so an Undo on each side restores that side whole. Two state roots stand in for two kernels."""
+
+    SID_B = "11111111-2222-3333-4444-666666666666"
+
+    def setUp(self):
+        self.roots = [tempfile.TemporaryDirectory(), tempfile.TemporaryDirectory()]
+        self._saved = (km.jd.STATE, km._mark_views_dirty, km._send_to_app)
+        km._mark_views_dirty = lambda: None
+        km._send_to_app = lambda app, m: None
+
+    def tearDown(self):
+        km.jd.STATE, km._mark_views_dirty, km._send_to_app = self._saved
+        for r in self.roots:
+            r.cleanup()
+
+    def _on(self, i):
+        km.jd.STATE = Path(self.roots[i].name)
+        km._CLEARED_MEMO["slot"] = None
+
+    def _ledger(self, i):
+        p = Path(self.roots[i].name) / "cleared.jsonl"
+        return [json.loads(l) for l in p.read_text().splitlines() if l.strip()] if p.exists() else []
+
+    def test_each_kernel_clears_its_own_cards_writes_its_own_rows_and_undoes_its_own_batch(self):
+        a_ids, b_ids = IDS, [self.SID_B + ":g1", self.SID_B + ":g2"]
+        self._on(0); km._clear_all(a_ids)                 # the broadcast lands on kernel A: its cards
+        self._on(1); km._clear_all(b_ids)                 # ...and on kernel B: its cards
+        self.assertEqual([r["id"] for r in self._ledger(0)], a_ids, "A's ledger carries A's rows only")
+        self.assertEqual([r["id"] for r in self._ledger(1)], b_ids, "B's ledger carries B's rows only")
+        self._on(0); self.assertEqual(set(km._cleared_ids()), set(a_ids), "the board on A shows none of A's cards")
+        self._on(1); self.assertEqual(set(km._cleared_ids()), set(b_ids))
+        # Undo, sent to both kernels by the client: each restores its own batch whole
+        self._on(0); km._undo_clear()
+        self._on(1); km._undo_clear()
+        self._on(0); self.assertEqual(km._cleared_ids(), {}, "A restored")
+        self._on(1); self.assertEqual(km._cleared_ids(), {}, "B restored")
+        self.assertEqual([r.get("op") for r in self._ledger(0)][-3:], ["undo"] * 3, "A's undo rows name A's batch")
+        self.assertNotIn(self.SID_B, "".join(r["id"] for r in self._ledger(0)), "A never learned of B's cards")
+
+
 if __name__ == "__main__":
     unittest.main()

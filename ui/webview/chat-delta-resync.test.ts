@@ -23,8 +23,10 @@ test("a delta gap asks the kernel for a full session instead of freezing", () =>
     "chatTail must treat a too-far-ahead delta as its own case, not fold it into the silent return");
   assert.match(RENDER, /const kernelLen = s\.events\.reduce\(\(n, e\) => n \+ \(isOptimistic\(e\) \|\| isHeldGroup\(e\) \? 0 : 1\), 0\);/,
     "…in kernel coordinates: our injections are counted out (since T252 a bubble sits at its send slot, mid-array) — and only counted here, the strip happens once the delta is applied");
-  assert.match(RENDER, /requestFullSession\(msg\.id\);/, "…and request a re-base");
-  assert.match(RENDER, /vscodeApi\?\.postMessage\(\{ type: "needFull", id \}\)/,
+  // since 2026-09-07 every ask names its WHY (a one-word diagnostic the kernel ignores; the return-to-tab
+  // harness counts asks by it — skeleton-tabs-wiring.test.ts pins the vocabulary); the gap is "gap"
+  assert.match(RENDER, /requestFullSession\(msg\.id, "gap"\);/, "…and request a re-base");
+  assert.match(RENDER, /vscodeApi\?\.postMessage\(\{ type: "needFull", id, why \}\)/,
     "the resync request must actually reach the kernel");
 });
 
@@ -82,12 +84,17 @@ test("a delta with NO base at all is a desync too — every delta path asks for 
   // message listener existed, so the pane holds nothing while the kernel volunteers only deltas. Each
   // delta shape must ask for the base instead of silently returning (the old `if (!s) return;`).
   const chatTailFn = RENDER.slice(RENDER.indexOf("function chatTail(msg"), RENDER.indexOf("function statusOnly(msg"));
-  assert.match(chatTailFn, /if \(!s\) \{[\s\S]{0,900}?requestFullSession\(msg\.id\);\s*\n\s*return;\s*\n\s*\}/,
+  assert.match(chatTailFn, /if \(!s\) \{[\s\S]{0,900}?requestFullSession\(msg\.id, "nobase"\);\s*\n\s*return;\s*\n\s*\}/,
     "chatTail: no base → ask, don't wait forever");
   const updateFn = RENDER.slice(RENDER.indexOf("function update(msg"), RENDER.indexOf("function chatTail(msg"));
-  assert.match(updateFn, /if \(!s\) \{ requestFullSession\(msg\.id\); return; \}/, "update: same");
-  const statusFn = RENDER.slice(RENDER.indexOf("function statusOnly(msg"), RENDER.indexOf("function statusOnly(msg") + 400);
-  assert.match(statusFn, /if \(!s\) \{ requestFullSession\(msg\.id\); return; \}/, "statusOnly: same");
+  assert.match(updateFn, /if \(!s\) \{ requestFullSession\(msg\.id, "nobase"\); return; \}/, "update: same");
+  // The window is 1100 characters since 2026-09-07 (it was 400): statusOnly now OPENS with the skeleton-tab
+  // branch — a status frame for a tab the kernel is withholding after a redial is stored for the chip, not a
+  // desync — and its comment pushed the no-base line past the old window. That failure was the intended
+  // tripwire; the widening is deliberate, and the no-base contract below is byte-for-byte what it was (plus
+  // the why). skeleton-tabs-wiring.test.ts pins that the skeleton branch comes FIRST and never asks.
+  const statusFn = RENDER.slice(RENDER.indexOf("function statusOnly(msg"), RENDER.indexOf("function statusOnly(msg") + 1100);
+  assert.match(statusFn, /if \(!s\) \{ requestFullSession\(msg\.id, "nobase"\); return; \}/, "statusOnly: same");
 });
 
 test("a reconnect clears parked asks — a dead socket's pending needFull can never gag the new one", () => {

@@ -786,6 +786,133 @@ def last_record_uuid(path, tail_bytes: int = 262144) -> str:
     return ""
 
 
+# The first result after a connect whose cost delta exceeds this is traced as an INFO line in the settle
+# (SdkSession._on_message), never a problem. On the CLI as probed (print mode, 2026-09-06) a resumed
+# process starts its counters at zero: a resume neither restores a cost-state record nor arms its writer.
+# So a first delta this large is the turn's own cost, recorded right, with nothing for the user to act
+# on; a problem row here would send them to check a figure that is correct. The trace is for the day a
+# CLI restores cost history in print mode: then a first result carries the whole history in
+# total_cost_usd, and the figure is wrong only if that restore and the connect-time seed read different
+# files (last_cost_state).
+SANE_TURN_USD = 200.0
+
+
+def cost_state_watermarks(o):
+    """The watermarks a CLI would hold after restoring the `cost-state` transcript record `o`, or None
+    when `o` is not one or its total is unusable: {"total": float, "tokens": {snake_case: int}}. The
+    tokens are the record's modelUsage summed per field across models into the four keys
+    SdkSession._turn_usage diffs against, the same sum it makes of a result's map; an absent or empty
+    map seeds no token watermarks."""
+    if not isinstance(o, dict) or o.get("type") != "cost-state":
+        return None
+    total = o.get("totalCostUSD")
+    if not isinstance(total, (int, float)) or not (0 <= total < float("inf")):
+        return None
+    tokens = {}
+    mu = o.get("modelUsage")
+    if isinstance(mu, dict) and mu:
+        tokens = {k: 0 for k, _ in SdkSession._USAGE_KEYS}
+        for m in mu.values():
+            if not isinstance(m, dict):
+                continue
+            for k, mk in SdkSession._USAGE_KEYS:
+                v = m.get(mk)
+                tokens[k] += int(v) if isinstance(v, (int, float)) else 0
+    return {"total": float(total), "tokens": tokens}
+
+
+def last_cost_state(path, scan_bytes: int = 8 << 20, max_line: int = 4 << 20):
+    """The resumed transcript's LAST `cost-state` record, as the watermarks a CLI that restores it would
+    hold (cost_state_watermarks), or None when the file has no such record or cannot be read.
+
+    Why read it: the CLI has a restore path for this record. Its transcript loader files `cost-state`
+    as last-wins, its writer emits totalCostUSD and modelUsage, the two counters the settle diffs, and
+    a resume that restores the record sets both. Should a CLI restore them in print mode, the first
+    result after a reconnect would carry the whole session's history in total_cost_usd, and watermarks
+    reset to zero would record that history as one turn's spend; seeding from the same file the CLI
+    reads makes the first delta this turn's own work. The seed reads transcript_path(cwd, resume_sid)
+    and reads it again when init corrects the cwd (the CLI's own string keys its transcript path), with
+    the sid the CLI LOADED when that init also landed a new fsid, so the two sides open the same file
+    (SdkSession._seed_spend_watermarks).
+
+    What the CLI does today, as probed in print mode (2026-09-06): its writer runs only once the process
+    has claimed its cost state. The interactive TUI claims it at startup; a print-mode (SDK) process
+    claims it only through the /clear session-id rotation, and a print-mode resume claims nothing and
+    restores nothing. The /clear saver runs before the rotation, so the SECOND and later /clear in one
+    process appends a record to the conversation that /clear abandons; the conversation romp resumes
+    (the reg's lastSid, the current one) never carries one. So every seed today reads zero, and the
+    CLI's counters start at zero on the same resume: the two agree. A record reaches a resumed file two
+    ways: a lastSid left on an abandoned conversation (the kernel dying between the saver's write and
+    the init flip), and a transcript the interactive CLI wrote (its writer runs from startup) that romp
+    later resumes; the print-mode CLI still starts at zero in both, and the shrunken-counter rule
+    records the first turn whole while its own total sits below the seed. The residual: a first
+    turn costlier than the whole recorded history is under-counted by the seed, and the same holds per
+    token field (_turn_usage diffs each field on its own), so a first turn whose count in one field
+    exceeds the recorded history's is under-counted in that field.
+
+    Scans BACKWARDS in 64 KB chunks and stops at the first hit, so a transcript that carries the record
+    costs a chunk or two. A line split across chunks is reassembled ONCE, when the scan reaches the
+    newline before it: its pieces are kept in a list as the chunks arrive and joined there, so each byte
+    read is copied a fixed number of times however long the line is (concatenating the carried fragment
+    onto every chunk copied it once per chunk, quadratic in the line; review find, 2026-09-09). A line
+    longer than `max_line` (4 MB by default) is not a record, since a record is under 1 KB: its pieces
+    are dropped as they arrive and the line is skipped unjoined, which also bounds the memory the scan
+    holds by the cap rather than by the line. The scan is BOUNDED to the last `scan_bytes` (8 MB by
+    default; last_record_uuid's tail read has the same reason: a transcript can be tens of MB and this
+    runs on the event loop at every connect): a record older than that is treated as absent, which is
+    the answer the print-mode CLI gives for its own counters today (it restores nothing), so the two
+    sides still agree (review find, 2026-09-09); the line the bound cuts through is a fragment and is
+    never joined."""
+    marker = b'"cost-state"'
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            floor = max(0, pos - int(scan_bytes))   # the oldest byte the bounded scan may reach
+            frags = []          # the pieces read so far of the line the last chunk opened with, in file
+            #                     order (each chunk read is earlier in the file than the one before)
+            carried = 0         # that line's length so far, counted whether or not its pieces are kept: past
+            #                     max_line the line is not a record, so its pieces are dropped as they
+            #                     arrive and the line is skipped without a join
+            while pos > floor:
+                step = min(pos - floor, 1 << 16)
+                pos -= step
+                f.seek(pos)
+                parts = f.read(step).split(b"\n")   # leading piece, complete lines, trailing piece; ONE
+                #                                      element when the chunk holds no newline at all
+                lines = []                          # the lines this chunk completes, newest first
+                if len(parts) > 1:
+                    # the carried line begins after this chunk's last newline: its pieces are joined here
+                    if carried + len(parts[-1]) <= max_line:
+                        lines.append(b"".join([parts[-1]] + frags))
+                    lines.extend(reversed(parts[1:-1]))
+                    frags, carried = [], 0
+                if pos == 0:
+                    # the file's head: the leading piece is the start of the carried line, or all of it
+                    if carried + len(parts[0]) <= max_line:
+                        lines.append(b"".join([parts[0]] + frags))
+                else:
+                    # the leading piece continues into the earlier chunk: carried, not copied, while the
+                    # line is short enough to be a record
+                    carried += len(parts[0])
+                    if carried <= max_line:
+                        frags.insert(0, parts[0])
+                    else:
+                        frags = []
+                for line in lines:
+                    if len(line) > max_line or marker not in line:
+                        continue
+                    try:
+                        rec = cost_state_watermarks(json.loads(line))
+                    except (ValueError, OverflowError, TypeError):
+                        continue                # not JSON, or a field no int() takes: skipped like an unusable total
+                    if rec is not None:
+                        return rec
+    except OSError:
+        return None
+    return None
+
+
 def rewind_disposition(rewind_to: str, rewind_leaf: str, leaf_now: str) -> str:
     """Should a (re)connect apply a pending conversation rewind? ONE-SHOT and event-guarded:
     "apply"  — a rewind is pending and the transcript's leaf is still the one recorded at
@@ -2477,6 +2604,37 @@ def sdk_importable() -> bool:
         return False
 
 
+def usage_fallback_is_sdk(msg) -> bool:
+    """A paid result carried no modelUsage map (SdkSession._turn_usage read the flat `usage` dict instead): is
+    that the imported SDK's doing? The current claude-agent-sdk declares `model_usage` as a field of
+    ResultMessage, None when the CLI sends no map, so a result with no such ATTRIBUTE at all came from
+    an older copy of the SDK, whichever one the kernel's interpreter imported: a copy found on sys.path
+    ahead of the dedicated venv's (kernel._ensure_sdk_on_path takes an importable copy first), or the
+    venv's own, as old as its last bin/romp-sdk-setup run. That is a fact about the host, the same for
+    every session this kernel runs; a field that is there but empty is this session's CLI's doing on
+    this result."""
+    return not hasattr(msg, "model_usage")
+
+
+def usage_fallback_notice(name, msg) -> str:
+    """The problem line for a paid result with no modelUsage map, by the cause usage_fallback_is_sdk
+    tells apart. The SDK cause names no session (it holds for all of them) and names the copy the
+    kernel imported, so the remedy is a path and not a search; the CLI cause names the session. Either
+    way the reader learns what the token columns now count and that the dollars are unaffected: the
+    flat dict is the main loop's own per-turn total, so what subagents and sidechains spent is not in
+    it, while total_cost_usd stays the process total."""
+    if usage_fallback_is_sdk(msg):
+        where = getattr(sys.modules.get("claude_agent_sdk"), "__file__", None) or "an unknown path"
+        return ("spend: every session's token columns count the main loop alone from here on (no subagent or "
+                "sidechain tokens; the dollars are unaffected). Cause: the claude-agent-sdk the kernel imported "
+                "(%s) has no model_usage field on ResultMessage, so the CLI's modelUsage map never reaches the "
+                "kernel. Run bin/romp-sdk-setup to install a current one, or remove a copy that shadows the "
+                "venv's, then restart romp." % where)
+    return ("spend (%s): a paid turn's tokens were recorded from the main loop alone (no subagent or sidechain "
+            "tokens; the dollars are unaffected): the CLI emitted no modelUsage on the result. Said once per "
+            "session." % name)
+
+
 # What the SDK puts on ProcessError.stderr when NOBODY registered an options.stderr callback: it does
 # not pipe the child's stderr at all, and substitutes this literal (subprocess_cli.py). Surfacing it is
 # worse than useless — it tells the user to go read an output romp never captured, and it outranked the
@@ -3758,11 +3916,16 @@ class SdkSession:
         self._launched_unkeyed_pick = False  # an explicit API-key pick that launched with NOTHING injected
         #   because romp holds no key source (_options): Claude Code's own credential — its apiKeyHelper
         #   or its login — is what pays, said once per process in the log
+        self._pick_fell_said = ""    # the pick whose fall to the other side _options has said for THIS
+        self._pick_unknown_said = ""     # the 'cannot tell, launching with the pick as is' row: once per session and pick
+        #   session (once per session, not per reconnect; the user 2026-09-08)
         self._last_cost_total = 0.0   # the CLI's totalCostUSD is CUMULATIVE per process (verified in
         #   the bundle: the result event's total_cost_usd sits beside total_duration/lines counters),
         #   so spend folds the DELTA between results — folding the raw value re-added the whole
         #   session-so-far cost every turn (the user 2026-08-08, whose spend line was fiction). Reset
-        #   at each connect: a fresh CLI process starts its counter at zero.
+        #   at each connect to what the CLI process it starts holds: zero for a fresh process, or the
+        #   totals of the resumed transcript's last cost-state record when it carries one
+        #   (_seed_spend_watermarks, last_cost_state).
         self._last_usage_totals = {}  # the TOKEN watermarks — kept against the result's `model_usage`
         #   map (the CLI's modelUsage), the per-model counter the CLI documents as cumulative like
         #   total_cost_usd, same lifecycle, so each field folds as a delta exactly like the dollars.
@@ -3772,6 +3935,12 @@ class SdkSession:
         #   total when the deltas were written (`usage: this.totalUsage`) and is the TURN's own total
         #   on the current CLI — diffing it under-counted every turn but the first (the user
         #   2026-09-06). Which counter is which, and the measurement: _turn_usage.
+        self._spend_first_result = False   # True from a connect until its first result settles: that result's
+        #   delta is checked against SANE_TURN_USD (an info-line trace; see the constant), and the init
+        #   handler may re-seed the watermarks while it is still True (a cwd correction; _seed_spend_watermarks)
+        self._usage_fallback_noted = False  # the once-per-session line for a paid result whose modelUsage map
+        #   is there but empty (usage_fallback_notice, the CLI cause); the SDK cause is said once per
+        #   backend on its flag, _usage_fallback_sdk_noted (see _note_usage_fallback)
         # Pending conversation REWIND (the chat's edit-message branch): the target record uuid +
         # the transcript leaf recorded at request time (the one-shot guard — see rewind_disposition).
         # Seeded from the reg so a kernel death mid-rewind re-applies it iff nothing landed since.
@@ -4789,8 +4958,8 @@ class SdkSession:
                     # create, the ready chip landing at 5-12s with the cycle).
                     self.backend._push_session(self.sid)
                     self._connected.set()   # the control channel exists from here (move() waits on this)
-                    self._last_cost_total = 0.0   # a fresh CLI process starts its cumulative cost at zero
-                    self._last_usage_totals = {}  # …and its cumulative token counters
+                    self._seed_spend_watermarks()   # a fresh CLI process starts its cumulative counters at
+                    #   zero, or at what it restores from the resumed transcript's cost-state record
                     # The CLI is demonstrably up, so any recorded launch failure is HISTORY — clear it
                     # here, at the proof, rather than on a timer. This is what lifts the usage-limit
                     # hold once the window resets: the next _ensure connects, the error record goes, and
@@ -5117,7 +5286,8 @@ class SdkSession:
           of every turn — roughly half a day's tokens went missing, and five sessions' recorded
           totals matched that subtraction to the token (the user 2026-09-06, who did not believe
           the count and was right, in the other direction). So the flat dict is never diffed: when
-          the map is absent (an older CLI) it folds WHOLE.
+          the map is absent it folds WHOLE, and the fallback is said once (_note_usage_fallback): it
+          is the main loop's count alone, and a reader of the token columns has to know that.
         Cache reads dominate either way — every API call of a turn re-reads the whole context — and
         the hover breaks the count down by kind so the size of the number has its explanation."""
         mu = getattr(msg, "model_usage", None)
@@ -5137,7 +5307,66 @@ class SdkSession:
             return out
         u = getattr(msg, "usage", None)
         u = u if isinstance(u, dict) else {}
-        return {k: (int(u[k]) if isinstance(u.get(k), (int, float)) else 0) for k, _ in self._USAGE_KEYS}
+        out = {k: (int(u[k]) if isinstance(u.get(k), (int, float)) else 0) for k, _ in self._USAGE_KEYS}
+        self._note_usage_fallback(msg)   # after the count: a count that raises is the containment's one report
+        return out
+
+    def _note_usage_fallback(self, msg):
+        """_turn_usage read the flat `usage` dict because the paid result carried no modelUsage map:
+        this turn's token columns are the main loop's count alone. Recorded silently before, so a kernel
+        on an old SDK under-counted every session with nothing in the error center naming why. Said as a
+        problem the user can act on (usage_fallback_notice), by the cause the message tells apart
+        (usage_fallback_is_sdk): the SDK cause is the host's, one for every session this kernel runs, so
+        it is said ONCE PER BACKEND on the backend's flag (per session it would be one near-identical
+        card per live session, and another per dormant revive, for a single remedy), checked and set
+        under the backend's lock because sessions settle on their own threads and a bare check-then-set
+        lets two first paid results both say it; the CLI cause is this session's, so once per session on
+        its own flag, which only this session's thread touches. The line is not worth the count: this
+        runs inside the token count, ahead of the spend write and after the cost watermark moved, so a
+        log callback that raises here would lose the turn's dollars and tokens for the sake of a line.
+        The raise is swallowed instead (the flag is set first, and the ring row lands before the callback
+        runs, so nothing is said twice). The `total > 0` gate in the settle keeps zero-cost results out."""
+        if usage_fallback_is_sdk(msg):
+            with self.backend._lock:
+                if self.backend._usage_fallback_sdk_noted:
+                    return
+                self.backend._usage_fallback_sdk_noted = True
+        else:
+            if self._usage_fallback_noted:
+                return
+            self._usage_fallback_noted = True
+        try:
+            self.backend._log(usage_fallback_notice(self.name, msg), problem=True)
+        except Exception:
+            pass    # a raising log callback: the count proceeds (the docstring's rule)
+
+    def _seed_spend_watermarks(self, resume_sid=None):
+        """Reset the spend watermarks for the CLI process a connect just started: zero for a fresh
+        process, or, when the resumed transcript carries a `cost-state` record, the counters that record
+        holds, because a CLI that restores them reports its first total_cost_usd as the whole session's
+        history plus this turn (last_cost_state has the full story, including why every seed reads zero
+        on the CLI as probed). Arms the first-result check either way. Called at connect, and again from
+        the init handler when the CLI's cwd corrects the registry's before any result has settled: the
+        transcript path is keyed on the cwd, so that is when the seed can have read the wrong file. That
+        second call is for a resumed session only (a fresh process has no loaded transcript to read), and
+        an init that ends a /clear skips it: the watermarks keep the zero the event set.
+        `resume_sid` names the transcript the CLI LOADED when that differs from self.resume_sid: the
+        init that corrects the cwd may in the same message have landed a new fsid, and the file a
+        restoring CLI took its counters from is the old one; the new fsid's file has no record yet."""
+        self._last_cost_total = 0.0   # a fresh CLI process starts its cumulative cost at zero
+        self._last_usage_totals = {}  # and its cumulative token counters
+        self._spend_first_result = True
+        sid = resume_sid or self.resume_sid
+        if not sid:
+            return
+        cs = last_cost_state(transcript_path(self.cwd, sid))
+        if not cs:
+            return
+        self._last_cost_total = cs["total"]
+        self._last_usage_totals = dict(cs["tokens"])
+        self.backend._log("spend: %s resumes a transcript with a cost-state record: watermarks seeded at its "
+                          "totals (cumulative $%.2f) so the first result records only this turn"
+                          % (self.name, cs["total"]), problem=False)
 
     async def _drain(self, client, AssistantMessage, ResultMessage, SystemMessage):
         """The receive loop. Every streamed message goes through _handle_stream_message, which keeps
@@ -5332,6 +5561,8 @@ class SdkSession:
             # rail's /usage bars — see _note_auth_source.
             self.backend._note_auth_source(self, d.get("apiKeySource"))
             fsid = d.get("session_id")
+            loaded_sid = self.resume_sid   # the transcript the CLI LOADED: a flip below moves resume_sid to the
+            #                                fsid it will WRITE, and the spend re-seed wants the former
             if fsid and fsid != self.resume_sid:
                 old = self.resume_sid
                 self.resume_sid = fsid
@@ -5347,6 +5578,8 @@ class SdkSession:
                     # rule in _turn_usage / the cost delta stays as the backstop for a reset we did not see.
                     self._last_cost_total = 0.0
                     self._last_usage_totals = {}
+                    loaded_sid = None   # zero IS the seed here: the cwd re-seed below stands down (the loaded
+                    #                     file may carry a record the /clear saver wrote as it abandoned it)
                 # A RESUME landing on a NEW fsid = a fresh-headed fork: record the old->new lineage
                 # (see append_resume_fork for the full story — the parser stitches the chain from it,
                 # the user 2026-08-14). A /clear's flip and a born-as-a-fork copy record nothing.
@@ -5373,6 +5606,15 @@ class SdkSession:
                 self.backend._log("sdk %s: adopting CLI cwd %r (registry had %r)" % (self.sid[:8], cli_cwd, self.cwd))
                 self.cwd = cli_cwd
                 self.backend._update_reg(self.sid, cwd=cli_cwd)
+                if loaded_sid and getattr(self, "_spend_first_result", False):   # getattr: __new__-built test doubles
+                    # The connect-time seed read the transcript under the REGISTRY's cwd; the CLI loaded the
+                    # one under ITS cwd (the same keying). No result has settled since the connect, so re-seed
+                    # from the file the CLI opened: a registry variant that holds no transcript left the seed
+                    # at zero for a file that carries a record, or the reverse. Never after a settle: resetting
+                    # the watermarks mid-process would count the cumulative counters whole again. The file the
+                    # CLI opened is the PRE-flip sid's: when this same init also landed a new fsid, resume_sid
+                    # now names the file the CLI will write, which holds no record yet.
+                    self._seed_spend_watermarks(resume_sid=loaded_sid)
             self.backend._poke()   # publish the model + permission-mode from init promptly: the snapshot reads
                                    # self.model, but with no poke the new model would wait out the 3s producer
                                    # backstop. NB: this init branch fires only once the FIRST turn arrives — the
@@ -5611,6 +5853,8 @@ class SdkSession:
                 if isinstance(total, (int, float)) and total > 0:
                     delta = total - self._last_cost_total if total >= self._last_cost_total else total
                     self._last_cost_total = float(total)
+                    first = getattr(self, "_spend_first_result", False)   # getattr: __new__-built test doubles
+                    self._spend_first_result = False   # the watermark moved: the process's first result is in
                     # the tokens: THIS turn's counts, from whichever result counter is a running total —
                     # the two are not the same kind (see _turn_usage; the flat `usage` is per-turn now)
                     turn_u = self._turn_usage(msg)
@@ -5620,6 +5864,19 @@ class SdkSession:
                     #   rail and the optimizer; a deliberate fork has no threadOf and bills itself)
                     #   + token readout; keyed = THIS session's init-reported auth, so the API sum stays
                     #   honest on a mixed host (see _record_spend)
+                    if first and delta > SANE_TURN_USD:
+                        # A first-after-connect delta above the mark: on the CLI as probed a resumed process
+                        # starts its counters at zero (SANE_TURN_USD), so this is the turn's own cost, recorded
+                        # as is and traced as an INFO line, not a problem: the figure is right and there is
+                        # nothing for the user to act on. It is wrong only if a CLI that restores cost history
+                        # read a different file than the connect-time seed (last_cost_state). After the record,
+                        # so a raising log callback costs the line and never the count.
+                        self.backend._log("spend: %s's first result after connect cost $%.2f, above %.0f USD for "
+                                          "one turn (the CLI's cumulative total: $%.2f). Recorded as is: a resumed "
+                                          "CLI process starts its cost at zero, so this is the turn's own cost. It "
+                                          "would be wrong only if a CLI that restores cost history read a different "
+                                          "transcript than the connect-time seed (last_cost_state)."
+                                          % (self.name, delta, SANE_TURN_USD, total), problem=False)
             finally:
                 # THE SETTLE — everything that makes the turn over for the kernel — runs whatever the
                 # bookkeeping above did (the rewind flags, the live-tail sweep, the refreshes, the spend
@@ -6694,6 +6951,12 @@ class SdkSession:
                 "modelPending": bool(self._model_pending),   # a /model switch resolving → the badge shows switching-dots
                 "effortPending": bool(self._effort_pending),   # an /effort switch reconnecting → effort-badge dots + "Reloading session…"
                 "auth": self.effective_auth(),   # which account this session bills ('login'|'key') → gear badge
+                # the pick this box cannot bill ("login"|"key"|""), and the side the launch fell to when one
+                # exists ("login"|"key"|""; _options decides both from pick_fall): the Billing menu keeps the
+                # pick check-marked and says which side bills, or that nothing was there to fall to (2026-09-08,
+                # the fall carried explicitly 2026-09-09)
+                "authPickUnavailable": self.backend.pick_unavailable(self.auth),
+                "authPickFell": self.backend.pick_fall(self.auth),
                 "authLive": self.auth_live,   # what the CLI's init actually reported ("" until one
                 #   lands) — the Billing row says so when it disagrees with the launch intent above
                 #   (a key found via apiKeyHelper bills the key while `auth` still reads login)
@@ -7019,6 +7282,8 @@ class SdkBackend:
         self.append_prompt_path = append_prompt_path
         self._log_cb = log
         self._thinking_override_logged = False   # thinking_override_note said once per backend (see _options)
+        self._usage_fallback_sdk_noted = False   # usage_fallback_notice's SDK cause said once per backend: the
+        #   imported SDK is one fact for every session (SdkSession._note_usage_fallback)
         self.sessions: dict[str, SdkSession] = {}
         self._lock = threading.Lock()
         self._turn_seq: dict = {}                 # sid -> turns ended this kernel life (turn_seq; under _lock)
@@ -7055,6 +7320,7 @@ class SdkBackend:
         self._drain_park = ""                     # the manager's park identity (?park=<since>) the episode is keyed on (T240c)
         self._drain_wake_timer = None
         self.login_ok = lambda: True              # the kernel wires its credential-store probe (T124); permissive unwired
+        self.last_auth_refusal = ""               # why the last set_auth refused (auth_unavailable_why) → the kernel's toast names it
         self._usage_all_keyed = False             # refresh_usage's one-shot: the last refresh found only
         #                                           keyed candidates (already logged); reset when a
         #                                           pollable session exists again, so the 60s rail timer
@@ -7063,9 +7329,8 @@ class SdkBackend:
         startup_auth_env()                        # the login tokens leave this process's environment: the
         #   transport merges options.env over it, so a token left there would ride every launch, a
         #   key-billed one included. romp holds no API key (credentials.py, 2026-09-08).
-        self._seed_skip_said = False              # the "remembered key pick set aside, no helper" row: once per process
+        self._seed_skip_said = set()              # the "remembered pick set aside, side unavailable" rows: once per process and side
         self._helper_read_said = False            # the "Claude Code settings unreadable" row: once per process
-        self._managed_login_said = False          # the "login pick cannot apply, managed helper" row: once per process
         # Backend PROBLEMS, kept in a bounded ring so the dashboard can show them (see _log): until
         # 2026-07-28 every SDK failure went to the kernel log alone, which nobody tails, so a session
         # whose stream died or whose model switch was refused just looked odd with no way to find out.
@@ -7150,6 +7415,34 @@ class SdkBackend:
         # "waiting" (ResultMessage), so it stays nudge-eligible. The dormant in-flight→waiting DISPLAY heal lives
         # independently in live_sessions, so the feed/fleet still render dormant sessions as waiting.
 
+    def _say_settings_unreadable(self, e) -> None:
+        """One problem row per process: the operator's Claude Code settings cannot be read just now (Claude Code
+        rewrites them; a transient state). Every reader of them in this backend answers cannot-tell meanwhile."""
+        self._helper_read_err = str(e)
+        if not self._helper_read_said:
+            self._helper_read_said = True
+            self._log("auth: %s; cannot tell which side this box bills until it reads: no launch falls on it, "
+                      "the seed and the judges read it as no helper" % e, problem=True)
+
+    def key_state(self) -> str:
+        """"ok" | "missing" | "unknown": an apiKeyHelper is configured in the operator's settings, is not, or the
+        settings cannot be read just now. The launch-side fall (a login pick with no login bills the key) keys
+        on "ok" alone; "unknown" is cannot-tell and never moves a launch (review 2026-09-09)."""
+        try:
+            return "ok" if _cred.key_available() else "missing"
+        except _cred.CredentialError as e:
+            self._say_settings_unreadable(e)
+            return "unknown"
+
+    def _helper_source_read(self):
+        """(credentials.helper_source(), readable): ("managed" | "user" | None, True), or (None, False) when the
+        settings cannot be read just now, so a caller can tell "no managed helper" from "cannot tell"."""
+        try:
+            return _cred.helper_source(), True
+        except _cred.CredentialError as e:
+            self._say_settings_unreadable(e)
+            return None, False
+
     @property
     def key_available(self) -> bool:
         """Whether a session with no login pick bills the API key on this box: an apiKeyHelper is configured in
@@ -7158,25 +7451,26 @@ class SdkBackend:
         seed's gate, the launch's record of what it meant and the judges' default. A project's own settings
         file is Claude Code's business (it runs that helper behind its trust prompt); the per-init auth check
         reports where such a session landed. A settings file that cannot be read is a problem row, once, and
-        reads as no helper until it reads."""
-        try:
-            return _cred.key_available()
-        except _cred.CredentialError as e:
-            if not self._helper_read_said:
-                self._helper_read_said = True
-                self._log("auth: %s; the box reads as having no apiKeyHelper until it does" % e, problem=True)
-            return False
+        reads as no helper here until it reads; the launch-side fall asks key_state, where it is cannot-tell."""
+        return self.key_state() == "ok"
 
-    def _note_seed_skipped(self) -> None:
-        """Said ONCE per process, as a problem row: the remembered Billing default is the API key, but Claude
-        Code's settings carry no apiKeyHelper, so new sessions are left unpicked (spawn): the picker offers no
-        key choice on this box, and a pick the user made is being set aside without a word otherwise."""
-        if self._seed_skip_said:
+    def _note_seed_skipped(self, side: str = "key") -> None:
+        """Said ONCE per process and side, as a problem row: the remembered Billing default names a side this
+        box cannot bill (the API key with no apiKeyHelper in Claude Code's settings; the login with none
+        signed in, or under a managed helper), so new sessions are left unpicked (spawn) and bill the side
+        that exists: the picker greys that choice on this box, and a pick the user made is being set aside
+        without a word otherwise."""
+        if side in self._seed_skip_said:
             return
-        self._seed_skip_said = True
-        self._log("the remembered Billing pick is the API key but Claude Code's settings carry no apiKeyHelper, so "
-                  "new sessions start unpicked and bill whatever the CLI resolves; configure apiKeyHelper in %s to "
-                  "apply the pick" % os.path.join(_cred.claude_config_dir(), "settings.json"), problem=True)
+        self._seed_skip_said.add(side)
+        if side == "key":
+            self._log("the remembered Billing pick is the API key but Claude Code's settings carry no apiKeyHelper, so "
+                      "new sessions start unpicked and bill whatever the CLI resolves; configure apiKeyHelper in %s to "
+                      "apply the pick" % os.path.join(_cred.claude_config_dir(), "settings.json"), problem=True)
+        else:
+            self._log("the remembered Billing pick is the login but %s, so new sessions start unpicked and bill "
+                      "the API key; sign in (claude /login) to apply the pick"
+                      % self.auth_unavailable_why("login"), problem=True)
 
     def _heal_stale_awaiting(self, sid: str) -> None:
         """Clear a stale awaiting:true overlay for a NOT-running session. A dormant SDK session can't have live
@@ -7216,7 +7510,8 @@ class SdkBackend:
         except PermissionError:
             return True
 
-    def _end_cli_tree(self, pid: int, ps_lines: list[str], kill=None, run=None, cgroup=None) -> dict:
+    def _end_cli_tree(self, pid: int, ps_lines: list[str], kill=None, run=None, cgroup=None,
+                      killpg=None, alive=None, sleep=None, now=None) -> dict:
         """End an orphaned session CLI and EVERYTHING it left behind (T276): its scope unit when it runs
         in one (systemd ends every process in the cgroup, a tool shell's setsid children and any
         re-parented leftover included), and, always, the process tree the `ps` listing still shows
@@ -7229,6 +7524,12 @@ class SdkBackend:
         kill = kill or os.kill
         run = run or subprocess.run
         cgroup = cgroup or _read_cgroup
+        # the process-group kill, the liveness poll and the grace clock are seams too (T276c): a test then
+        # pins the exact signal sequence with no real process, pid or second behind it
+        killpg = killpg or os.killpg
+        alive = alive or self._pid_alive
+        sleep = sleep or time.sleep
+        now = now or time.time
         unit = scope_unit_of(cgroup(pid) or "")
         # The scope must be the CLI's OWN: bin/romp-cli-scope names the unit with the pid the CLI runs as
         # (`romp-session-<sid8>-$$-$t`, then execs into it), so a CLI in its own scope always carries its pid
@@ -7264,7 +7565,7 @@ class SdkBackend:
         def signal_all(sig, only_alive: bool) -> int:
             n = 0
             for p in targets:
-                if only_alive and not self._pid_alive(p):
+                if only_alive and not alive(p):
                     continue
                 if not same(p):
                     continue          # the pid now names another process
@@ -7274,7 +7575,7 @@ class SdkBackend:
                     pg = None
                 try:
                     if pg is not None and pg == p and pg != own_pg:
-                        os.killpg(pg, sig)          # a setsid'd tool child leads its own group: take the group
+                        killpg(pg, sig)             # a setsid'd tool child leads its own group: take the group
                     else:
                         kill(p, sig)
                     n += 1
@@ -7282,10 +7583,10 @@ class SdkBackend:
                     pass
             return n
         signaled = signal_all(signal.SIGTERM, False)   # unconditionally: the OS answers for a pid already gone
-        deadline = time.time() + TREE_KILL_GRACE
-        while time.time() < deadline and any(self._pid_alive(p) for p in targets):
-            time.sleep(0.05)
-        forced = signal_all(signal.SIGKILL, True) if any(self._pid_alive(p) for p in targets) else 0
+        deadline = now() + TREE_KILL_GRACE
+        while now() < deadline and any(alive(p) for p in targets):
+            sleep(0.05)
+        forced = signal_all(signal.SIGKILL, True) if any(alive(p) for p in targets) else 0
         return {"scope": unit if stopped else None, "signaled": signaled, "forced": forced, "tree": len(targets) - 1}
 
     def _stop_leftover_scopes(self, lastsids: list[str], run=None) -> int:
@@ -8606,28 +8907,43 @@ class SdkBackend:
         # the value the CLI takes as unset; verified on 2.1.257): in the CLI's precedence the helper outranks
         # every login form, so without this a login pick on a helper box would bill the key. A key pick, or
         # no pick, launches plain and the CLI runs the helper itself; romp injects no key, ever.
-        login = sess.auth == "login"
         keyed_box = self.key_available
-        if login and _cred.helper_source() == "managed":
-            # a MANAGED helper outranks the per-session layer in the CLI's precedence, so the suppression
-            # below cannot apply and this launch bills the key despite the pick: said, once per process,
-            # in the problem ring (set_auth refuses a new login pick on such a box; this is a pick that
-            # predates the managed helper). Never quiet (the user 2026-08-08: a session billing the wrong
-            # account must never pass silently).
-            if not self._managed_login_said:
-                self._managed_login_said = True
-                self._log("auth (%s): the login pick cannot apply, the apiKeyHelper is set in managed settings, "
-                          "which outrank the per-session layer; the session bills the key" % sess.name, problem=True)
+        # The side this launch bills: the pick, unless the box cannot bill it and CAN bill the other —
+        # then the launch falls to the side that exists (the user 2026-09-08: no login on the box means
+        # everything bills the key, never a dead login; the mirror case, a key pick on a helper-less box
+        # with a login, bills the login). Two picks fall this way: a stale login pick on a box whose
+        # login is gone (or whose apiKeyHelper is MANAGED, which outranks the per-session layer the
+        # login pick rides, so the suppression below could not apply and the launch billed the key
+        # anyway; set_auth refuses a new pick of either kind, this is a pick that predates the change),
+        # and a key pick whose helper is gone. Said once per session in the problem ring, never quiet
+        # (the user 2026-08-08: a session billing the wrong account must never pass silently), and the
+        # pick itself stays in the reg and the Billing menu, check-marked, with the fall beside it
+        # (authPickUnavailable): the user's intent is kept, the launch is honest about what it did. A
+        # pick the box cannot bill with NOTHING to fall to (a key pick on a box with neither) launches
+        # plain and the CLI decides, as before.
+        side = self.pick_fall(sess.auth) or sess.auth   # the ONE decision, shared with the status rows (authPickFell)
+        if side == sess.auth and sess.auth in ("login", "key") and sess._pick_unknown_said != sess.auth:
+            why = self.pick_unknown(sess.auth)          # cannot tell just now: the pick stands, said once per session
+            if why:
+                sess._pick_unknown_said = sess.auth
+                self._log("auth (%s): cannot tell whether this box can bill '%s' (%s); launching with the pick as is"
+                          % (sess.name, sess.auth, why), problem=True)
+        if side != sess.auth and sess._pick_fell_said != sess.auth:
+            sess._pick_fell_said = sess.auth
+            self._log("auth (%s): billing pick '%s' cannot apply: %s; billing the %s"
+                      % (sess.name, sess.auth, self.auth_unavailable_why(sess.auth),
+                         "API key" if side == "key" else "login"), problem=True)
+        login = side == "login"
         fs = flag_settings_path(self.state_dir, sess.sid,
                                 ultracode=(sess.effort or "") == "ultracode", fast=sess.fast_opt,
                                 env=env_vars, no_helper=login, log=self._log)
         if fs:
             kw["settings"] = fs
         # What the launch MEANT, for _note_auth_source's per-init check: keyed when the box's helper will
-        # bill the key for this session; an explicit key pick with no helper anywhere leaves the CLI to
-        # decide, and a login landing then is the pick contradicted.
+        # bill the key for this session; an explicit key pick with no helper anywhere (and no login to
+        # fall to) leaves the CLI to decide, and a login landing then is the pick contradicted.
         launch_keyed = not login and keyed_box
-        if login or (sess.auth != "key" and not keyed_box):
+        if login or (side != "key" and not keyed_box):
             # The login tokens claimed at boot ride every launch that bills the login: a login pick, and an
             # unpicked session on a box with no helper (its effective billing IS the login, and the judges'
             # login path restores the same tokens; review 2026-09-08: the first cut restored them for the
@@ -8638,7 +8954,7 @@ class SdkBackend:
         else:
             kw["env"] = dict(kw["env"], **helper_fast_org_env(self._log, sess.cwd))
         sess._launched_keyed = launch_keyed
-        sess._launched_unkeyed_pick = sess.auth == "key" and not launch_keyed
+        sess._launched_unkeyed_pick = side == "key" and not launch_keyed
         return ClaudeAgentOptions(**kw)
 
     # ---- lifecycle (kernel-thread API) ----
@@ -8673,17 +8989,20 @@ class SdkBackend:
         # Auth: the picker's explicit pick wins; else the remembered default (a gear /auth pick on any
         # session); unset stays unset — effective_auth's fallback IS the pre-selector behavior.
         a = auth if auth in ("login", "key") else (d.get("auth") if d.get("auth") in ("login", "key") else "")
-        if a == "key" and not auth and not self.key_available:
-            # A REMEMBERED key default on a box with no key source seeds nothing. Not because of the launch
-            # or the per-init check: both come out the same either way (nothing of romp's injected, and a
-            # login landing rings through the remembered pick in _declared_auth just as it would through a
-            # seeded one). Because the picker offers no key choice on this box (_auth_avail shows login), so
-            # a re-seed would apply a pick the user cannot make here, and because what the session SAYS
-            # about itself — Billing badge, judge billing, cycling — should read what it is: unpicked. A
-            # remembered pick set aside is said once, as a problem row (review find, 2026-09-07). A re-seed
-            # is never an explicit pick (_declared_auth); an EXPLICIT `auth` from the picker still lands.
+        if a and not auth and self.pick_unavailable(a):
+            # A REMEMBERED default the box cannot bill seeds nothing: a key default with no helper (review
+            # find, 2026-09-07), and since 2026-09-08 a login default with no signed-in login (or a managed
+            # helper), symmetric (the user: no login on the box means everything bills the key, never a
+            # dead login). Not because of the launch or the per-init check: both come out the same either
+            # way (nothing of romp's injected, and a wrong-side landing rings through the remembered pick
+            # in _declared_auth just as it would through a seeded one). Because the picker greys that
+            # choice on this box (_auth_avail), so a re-seed would apply a pick the user cannot make here,
+            # and because what the session SAYS about itself — Billing badge, judge billing, cycling —
+            # should read what it is: unpicked, billing the side that exists. A remembered pick set aside
+            # is said once, as a problem row. A re-seed is never an explicit pick (_declared_auth); an
+            # EXPLICIT `auth` from the picker still lands.
+            self._note_seed_skipped(a)
             a = ""
-            self._note_seed_skipped()
         if a:
             reg["auth"] = a
         # Per-session env is a per-spawn ask, never a remembered default (a var one session needed is
@@ -10478,20 +10797,20 @@ class SdkBackend:
         next init confirms via apiKeySource (_note_auth_source flags a landing on the wrong side)."""
         if value not in ("login", "key"):
             return False
-        if value == "key" and not self.key_available:
-            return False   # no apiKeyHelper on this box: the UI never offers this; refuse rather than half-apply
-        if value == "login" and _cred.helper_source() == "managed":
-            # a managed helper outranks the per-session layer, so a login pick could not disable it and the
-            # session would bill the key despite the pick: refuse, and say why (review 2026-09-08)
-            self._log("auth: a login pick cannot apply on this box, the apiKeyHelper is set in managed settings, "
-                      "which outrank the per-session layer; remove it there to bill the login", problem=True)
-            return False
-        if value == "login" and not self.login_ok():
-            # the SAME bar the key side always had (T124: set_auth accepted 'login' unconditionally,
-            # so on a login-less box the pick sat in the UI as applied fact while the reconnect
-            # errored or landed keyed via an apiKeyHelper — the silent-degrade class). login_ok is
-            # the kernel's credential-store probe (the authority the usage bars trust); the default
-            # is permissive so a bare backend (tests, no kernel wiring) keeps the old behavior.
+        why = self.auth_unavailable_why(value)
+        if why:
+            # The pick names a side this box cannot bill: refuse, and SAY WHY, in the problem ring and in
+            # the kernel's toast (the user 2026-09-08: a bare refusal left the reason to guesswork). The
+            # key side is the bar it always had (no apiKeyHelper: the UI greys the option; refuse rather
+            # than half-apply). The login side has the SAME bar since T124 (set_auth once accepted 'login'
+            # unconditionally, so on a login-less box the pick sat in the UI as applied fact while the
+            # reconnect errored or landed keyed via an apiKeyHelper, the silent-degrade class) and, since
+            # the 2026-09-08 review, the managed-helper bar (a managed helper outranks the per-session
+            # layer, so no login pick could disable it). login_ok is the kernel's credential-store probe
+            # (the authority the usage bars trust); its default is permissive so a bare backend (tests, no
+            # kernel wiring) keeps the old behavior.
+            self.last_auth_refusal = why
+            self._log("auth: a %s pick cannot apply on this box: %s" % (value, why), problem=True)
             return False
         if not read_reg(self.state_dir, sid):
             return False
@@ -10516,11 +10835,91 @@ class SdkBackend:
 
     def default_auth(self, reg: dict | None = None) -> str:
         """The auth a session with no live SdkSession object would launch with — the dormant twin of
-        SdkSession.effective_auth(), reading the same registry field with the same fallback."""
+        SdkSession.effective_auth(), reading the same registry field with the same fallback. An explicit
+        pick is returned as picked even when the box cannot bill it (the Billing menu check-marks the
+        PICK; pick_unavailable beside it says the launch went to the other side)."""
         a = (reg or {}).get("auth")
         if a in ("login", "key"):
             return a
+        return self.fallback_auth()
+
+    def fallback_auth(self) -> str:
+        """What an UNPICKED session bills on this box: the key when an apiKeyHelper is configured, else the
+        login. Falls to whichever side exists, in BOTH directions (the user 2026-09-08: no login on the box
+        means everything bills the key, never a dead login) — a box with neither still reads login, the
+        CLI's own resolution, and the launch's auth check rings on what lands."""
         return "key" if self.key_available else "login"
+
+    def auth_unavailable_why(self, side: str) -> str:
+        """Why this box cannot bill `side` ("login" | "key"), as ONE plain sentence for the refusal toast,
+        the problem ring and the Billing menu's greyed option — "" when it can. The login side is the
+        kernel's credential-store probe (login_ok) AND the absence of a managed apiKeyHelper (which
+        outranks the per-session layer a login pick rides, so the pick could not disable it); the key
+        side is a configured apiKeyHelper (read, never run). One vocabulary for every surface, so the
+        picker, the tab menu and the log agree on the reason (the user 2026-09-08)."""
+        if side == "login":
+            src, readable = self._helper_source_read()
+            if readable and src == "managed":
+                return _cred.WHY_MANAGED_HELPER
+            if self.login_ok() is False:        # None = the account file cannot be read just now: cannot tell,
+                return _cred.WHY_NO_LOGIN       #   never "no login" (review 2026-09-09)
+            return ""
+        if side == "key":
+            return _cred.WHY_NO_HELPER if self.key_state() == "missing" else ""   # "unknown" is cannot tell
+        return ""
+
+    def auth_avail(self) -> dict:
+        """The Billing availability the status push carries per session (`authAvail`): {login, key, loginWhy?,
+        keyWhy?}. The webview lists BOTH options always and greys the unavailable one with its reason in
+        the hover — the picker never disappears (the user 2026-09-08; the earlier both-or-nothing gate
+        hid the row on every one-auth box, so the fact of what a session bills had no control beside it).
+        The kernel's _auth_avail (the new-session picker's reply) carries the same two reasons."""
+        lw, kw_ = self.auth_unavailable_why("login"), self.auth_unavailable_why("key")
+        d = {"login": not lw, "key": not kw_}
+        if lw:
+            d["loginWhy"] = lw
+        if kw_:
+            d["keyWhy"] = kw_
+        return d
+
+    def pick_unavailable(self, auth: str) -> str:
+        """The explicit pick this box cannot bill, when `auth` names one: "login" for a login pick with no
+        signed-in login (or under a managed helper), "key" for a key pick with no apiKeyHelper, "" for an
+        unpicked session or a pick the box can apply. The status field `authPickUnavailable`: the Billing
+        menu keeps the pick check-marked and its sub-line says which side the launch actually went to
+        (_options falls to the side that exists, never onto a login that does not; the user 2026-09-08)."""
+        if auth in ("login", "key") and self.auth_unavailable_why(auth):
+            return auth
+        return ""
+
+    def pick_fall(self, auth: str) -> str:
+        """The side a launch with pick `auth` bills INSTEAD, or "" when it bills the pick: a login pick this box
+        cannot bill falls to the key when a helper is configured, a key pick falls to the login when one is
+        signed in and no managed helper outranks it. A pick with nothing to fall to launches plain (the CLI
+        decides), and a side whose availability cannot be read just now (key_state "unknown", login_ok None,
+        unreadable settings) never receives a fall. The status field `authPickFell`, read by the tab hover
+        and the Billing sub-line, and the one place _options decides (review 2026-09-09: the hover inferred a
+        fall from authPickUnavailable alone and claimed one on a box with neither side)."""
+        fell = self.pick_unavailable(auth)
+        if fell == "login" and self.key_state() == "ok":
+            return "key"
+        if fell == "key":
+            src, readable = self._helper_source_read()
+            if readable and src != "managed" and self.login_ok() is True:
+                return "login"
+        return ""
+
+    def pick_unknown(self, auth: str) -> str:
+        """Why the box cannot tell whether it bills `auth` just now, or "": the operator's settings unreadable
+        (either side), or the account file unreadable (login). The launch says it once and keeps the pick."""
+        if auth == "key" and self.key_state() == "unknown":
+            return self._helper_read_err or "Claude Code settings cannot be read"
+        if auth == "login":
+            if not self._helper_source_read()[1]:
+                return self._helper_read_err or "Claude Code settings cannot be read"
+            if self.login_ok() is None:
+                return "the Claude login state (~/.claude.json) cannot be read"
+        return ""
 
     def sid_for_name(self, name: str) -> str:
         """The sid of the ONE alive session (not a comment thread) whose reg carries `name`, else "".
@@ -10772,6 +11171,8 @@ class SdkBackend:
                     "effortPending": bool(reg.get("effortPending")),
                     "effort": reg.get("effort", ""),
                     "auth": self.default_auth(reg),
+                    "authPickUnavailable": self.pick_unavailable(reg.get("auth") or ""),   # same as snapshot()
+                    "authPickFell": self.pick_fall(reg.get("auth") or ""),
                     # the persisted CLI truth (apiKeyAuth, the liveModel pattern) so a dormant
                     # session's Billing row keeps telling it; absent = no init ever landed
                     "authLive": ("key" if reg.get("apiKeyAuth") else "login")

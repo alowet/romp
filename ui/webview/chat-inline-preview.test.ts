@@ -61,8 +61,10 @@ test("the failure chip narrates what happens next, escalates on repeat, and a re
   // while auto-retries remain the box KEEPS its loading persona (swirl + note, whole box tappable);
   // the ⚠ chip is the GIVE-UP state only (the user 2026-08-16, third report: state bouncing between
   // "trying" and "unavailable" on every retry cycle read as impatient even when it eventually loaded)
-  assert.match(pf, /if \(autoRetries > 0 \|\| transient\) \{\s*\n\s*if \(!transient\) autoRetries--;\s*\n\s*failedPreviews\.set\(box, \(\) => build\(true\)\);/);
-  assert.match(pf, /\+ " — retrying · tap to retry now";/);
+  // a LINK failure registers for the reconnect-class heal only, a real verdict spends the budget on the per-message heal (T291)
+  assert.match(pf, /if \(autoRetries > 0 \|\| transient\) \{[\s\S]*?if \(transient\) settledPreviews\.set\(box, \(\) => build\(true\)\);\s*\n\s*else \{ autoRetries--; failedPreviews\.set\(box, \(\) => build\(true\)\); \}/);
+  assert.match(pf, /\+ \(transient \? " — retries when the link is back · tap to retry now" : " — retrying · tap to retry now"\)\);/,   // set on the reused note; the link case says what will happen (T291)
+    "the note says what happens next: a retry on the link's return, or the bounded retrying");
   assert.match(pf, /wait\.onclick = \(ev\) => \{ ev\.stopPropagation\(\); autoRetries = 3; ackTap\(ev\); build\(true\); \};/,
     "the whole retrying box is the tap target — a tap re-arms persistence and acknowledges");
   assert.match(pf, /"⚠ preview unavailable"\)\)\s*\n\s*\+ " — tap to retry";/,
@@ -79,16 +81,19 @@ test("the failure chip narrates what happens next, escalates on repeat, and a re
   assert.match(pf, /if \(!box\.isConnected\) return;/);
 });
 
-test("a failed preview heals on the next kernel push — the kernel-is-back event, not a tap or a timer", () => {
+test("a failed preview heals on the next kernel push (a link failure: on the reconnect event) — never a tap or a timer", () => {
   // the 2026-08-15 report: the fetch died in a converge-restart window, and delta-send never rebuilds
   // an old turn's DOM, so the chip sat until a human tapped it. Any incoming kernel message proves the
   // kernel is reachable again; no pushes arrive while it's down, so retry-on-push can't spam.
   const pf = PREVIEW.slice(PREVIEW.indexOf("export function previewFull"));
   assert.match(pf, /let autoRetries = 3;/, "bounded — a genuinely-dead file settles on the tap chip");
   // a failure naming the LINK, not the image, never spends the budget (the user 2026-08-17: the
-  // kernel-restart tunnel window burned all three attempts right before the link came back)
+  // kernel-restart tunnel window burned all three attempts right before the link came back) — and since
+  // T291 it waits for the reconnect-class event instead of re-attempting on every push (a dead link
+  // answered every push of a streaming session instantly, and each attempt moved the transcript)
   assert.match(pf, /const transient = \/tunnel to \.\* is not answering\|no attached host\|re-dialing\/i\.test\(lastErr\);/);
-  assert.match(pf, /if \(autoRetries > 0 \|\| transient\) \{\s*\n\s*if \(!transient\) autoRetries--;\s*\n\s*failedPreviews\.set\(box, \(\) => build\(true\)\);/);
+  // a LINK failure registers for the reconnect-class heal only, a real verdict spends the budget on the per-message heal (T291)
+  assert.match(pf, /if \(autoRetries > 0 \|\| transient\) \{[\s\S]*?if \(transient\) settledPreviews\.set\(box, \(\) => build\(true\)\);\s*\n\s*else \{ autoRetries--; failedPreviews\.set\(box, \(\) => build\(true\)\); \}/);
   assert.match(PREVIEW, /export function retryFailedPreviews\(\): void/);
   assert.match(PREVIEW, /if \(box\.isConnected\) rebuild\(\);/, "a re-rendered turn's fresh box supersedes the old");
   assert.match(RENDER, /retryFailedPreviews\(\);/, "called from the kernel message handler");
