@@ -6592,7 +6592,9 @@ class ViewBuilder(unittest.TestCase):
         self.assertEqual(bar["prompt"], "fix the feed flicker")
         self.assertEqual(bar["summary"], "Fixed the feed flicker", "caption binds to the segment id")
         self.assertEqual(bar["src"], "typed")
-        self.assertEqual(bar["workUuid"], "a1", "first assistant atom = work anchor")
+        self.assertEqual(bar["workId"], "a1", "first assistant atom = work anchor")
+        for gone in ("tid", "uuid", "workUuid"):
+            self.assertNotIn(gone, bar, "T278b: %s left the wire (the lane key, promptId and workId carry it)" % gone)
         self.assertEqual(bar["replyUuid"], "a2", "last assistant-with-text = reply anchor")
         self.assertFalse(bar["open"], "the turn ended -> bar not open")
 
