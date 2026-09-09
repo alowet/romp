@@ -10,6 +10,8 @@ FRESH at apply time, a same-named tag CREATED there after the ruling survives (t
 creation ms), and the same tag EDITED there after the ruling makes the queued edit yield (the v2
 per-tag mtime, stamped at the store's one write door). ADD never queues. Synthetic hosts/sids only.
 """
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -41,6 +43,7 @@ def _fresh_journal():
         pass
     with km._PENDING_TAG_LOCK:
         km._PENDING_TAG_CACHE["rows"] = None
+    getattr(km, "_pending_tag_faults", {}).clear()   # the once-per-episode fault lines are module state too
 
 
 def _attach(views=None, status="up"):
@@ -191,6 +194,117 @@ class LateApply(unittest.TestCase):
         self.assertEqual(km._apply_pending_tag_edits(self.r), 0)
         self.assertEqual(self.forwarded, [])
         self.assertEqual(len(km._pending_tag_rows()), 1)
+
+    # the /tag route's STORE-FAULT refusal: 200 {ok:false, retryable:true, error} -- the disk's answer,
+    # not the host's ruling (the route's own shape; the PR-watch route wears the same key on a save fault)
+    _STORE_FAULT = {"ok": False, "retryable": True,
+                    "error": "the tag store could not be read (read failed: [Errno 5] Input/output error) \u2014 retry"}
+
+    def _pass(self, answer):
+        """One apply pass against a host whose /tag answers `answer`; returns (applied, stderr text)."""
+        km._remote_forward = lambda r, path, body: (self.forwarded.append((path, body)) or dict(answer))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            n = km._apply_pending_tag_edits(self.r)
+        return n, err.getvalue()
+
+    def _dial_outcomes(self):
+        try:
+            recs = [json.loads(ln) for ln in km.TUNNEL_LOG.read_text().splitlines() if ln.strip()]
+        except OSError:
+            recs = []
+        return [x.get("outcome") for x in recs if x.get("event") == "pending-tag-edit"]
+
+    def test_a_retryable_store_fault_on_the_host_keeps_the_row_and_the_next_pass_lands_it(self):
+        """On main the host's store fault retired the row as "refused by the host": a pending delete was lost
+        to a transient disk fault on the host -- the case the journal exists to survive."""
+        self._rule({"delete": True})
+        self._host_answers([_remote_tag("g100", "web")])
+        n, err = self._pass(self._STORE_FAULT)
+        self.assertEqual(n, 0)
+        self.assertEqual(len(km._pending_tag_rows()), 1, "the disk's answer is not the host's ruling: the row stays")
+        lines = [ln for ln in err.splitlines() if "pending-tag-edits" in ln]
+        self.assertEqual(len(lines), 1, err)
+        for word in ('delete of "web"', HOST, "could not be read", "retrying next pass"):
+            self.assertIn(word, lines[0])
+        v = km._views_client()
+        self.assertEqual(v.get("pendingTagEdits"), [{"host": HOST, "name": "web", "op": "delete"}])
+        self.assertEqual(next(t for t in v["remoteTags"] if t["name"] == "web").get("pending"), "delete",
+                         "the badge stays while the edit is still owed")
+        self.assertIn("the host's tag store faulted: the tag store could not be read (read failed: [Errno 5] "
+                      "Input/output error) \u2014 retry \u2014 kept; retried every pass, recorded once", self._dial_outcomes())
+        # the next pass: the host's store is back, and the SAME row lands
+        n, err = self._pass({"ok": True, "deleted": True})
+        self.assertEqual(n, 1)
+        self.assertEqual([b for _, b in self.forwarded], [{"name": "web", "delete": True}] * 2)
+        self.assertEqual(km._pending_tag_rows(), [])
+        self.assertEqual(err, "", "landing is not a fault")
+        self.assertEqual(self._dial_outcomes()[-1], "applied after 1 faulting pass", "the landing record carries the count")
+        v = km._views_client()
+        self.assertNotIn("pendingTagEdits", v)
+        self.assertIsNone(next(t for t in v["remoteTags"] if t["name"] == "web").get("pending"), "the badge clears")
+        self.assertEqual(km._pending_tag_faults, {}, "the episode ended with its row")
+
+    def test_a_refusal_without_retryable_is_the_hosts_ruling_and_retires(self):
+        self._rule({"delete": True})
+        self._host_answers([_remote_tag("g100", "web")])
+        n, err = self._pass({"ok": False, "error": 'no tag named "web"'})
+        self.assertEqual(n, 0)
+        self.assertEqual(km._pending_tag_rows(), [], "the host's own words are terminal, as before")
+        self.assertEqual(err, "")
+        self.assertIn('refused by the host: no tag named "web"', self._dial_outcomes())
+
+    def test_a_host_that_keeps_faulting_is_said_once_and_a_fresh_ruling_afresh(self):
+        self._rule({"delete": True})
+        self._host_answers([_remote_tag("g100", "web")])
+        seen = len(self._dial_outcomes())          # the dial log is the module's shared state: count from here
+        said = []
+        for _ in range(3):
+            n, err = self._pass(self._STORE_FAULT)
+            self.assertEqual(n, 0)
+            self.assertEqual(len(km._pending_tag_rows()), 1, "still pending after every faulting pass")
+            said += [ln for ln in err.splitlines() if "pending-tag-edits" in ln]
+        self.assertEqual(len(said), 1, "one stderr line per row per episode, not one per pass")
+        self.assertEqual(len(self.forwarded), 3, "…while every pass still asks the host")
+        self.assertEqual(len(self._dial_outcomes()[seen:]), 1,
+                         "one dial record per episode too: a host whose disk stays bad must not rotate the dial log away")
+        self.assertTrue(self._dial_outcomes()[-1].startswith("the host's tag store faulted: "))
+        # the episode ends when the row retires -- here on the host's own ruling, which says how long it took
+        n, err = self._pass({"ok": False, "error": 'no tag named "web"'})
+        self.assertEqual((n, km._pending_tag_rows(), err), (0, [], ""))
+        self.assertEqual(self._dial_outcomes()[-1], 'refused by the host: no tag named "web" after 3 faulting passes')
+        self.assertEqual(km._pending_tag_faults, {})
+        # a NEW ruling on the same tag is a new row, and a fault on it is said afresh
+        self.r["views"] = {"tags": [_remote_tag("g100", "web")]}
+        self._rule({"rename": "site"})
+        n, err = self._pass(self._STORE_FAULT)
+        self.assertEqual(n, 0)
+        lines = [ln for ln in err.splitlines() if "pending-tag-edits" in ln]
+        self.assertEqual(len(lines), 1, err)
+        self.assertIn('rename of "web"', lines[0])
+        self.assertEqual(len(km._pending_tag_rows()), 1)
+
+    def test_a_supersede_mid_episode_is_a_new_row_and_is_said_afresh(self):
+        """_queue_pending_tag_edit coalesces: a delete ruled while a rename is still queued REPLACES the
+        rename's row (op and ruledAt change), so the prune drops the old key and the new row's fault is a
+        new episode -- said afresh. (A same-op re-rule within one wall-clock second shares its key: a
+        degenerate case that only folds two lines into one.)"""
+        self._rule({"rename": "site"})
+        self._host_answers([_remote_tag("g100", "web")])
+        n, err = self._pass(self._STORE_FAULT)
+        lines = [ln for ln in err.splitlines() if "pending-tag-edits" in ln]
+        self.assertEqual((n, len(lines)), (0, 1), err)
+        self.assertIn('rename of "web"', lines[0])
+        self._rule({"delete": True})                         # the supersede: one row, the delete's
+        rows = km._pending_tag_rows()
+        self.assertEqual([km._row_op(x) for x in rows], ["delete"])
+        n, err = self._pass(self._STORE_FAULT)
+        lines = [ln for ln in err.splitlines() if "pending-tag-edits" in ln]
+        self.assertEqual((n, len(lines)), (0, 1), "a second line: the delete is a new row, hence a new episode")
+        self.assertIn('delete of "web"', lines[0])
+        self.assertEqual(set(km._pending_tag_faults), {km._pending_tag_row_key(rows[0])},
+                         "after the prune the map holds only the live row's key")
+        self.assertEqual(len(self.forwarded), 2)
 
     def test_a_changed_reading_marks_the_views_dirty_with_nothing_retired(self):
         """The apply's fresh read stored the reading BARE, and _mark_views_dirty fired only when a row

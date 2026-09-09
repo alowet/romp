@@ -124,7 +124,7 @@ class JudgeSettings(unittest.TestCase):
         (jd.STATE / "index-effort").write_text("low")
         jd._state_cache.clear()
         seen, saved_cmd = {}, jd._judge_cmd
-        jd._judge_cmd = lambda model, sysp, effort=None: (seen.__setitem__(model, effort) or ["true"])
+        jd._judge_cmd = lambda model, sysp, effort=None, **kw: (seen.__setitem__(model, effort) or ["true"])
         saved_env, saved_paused = jd._judge_env, (jd.STATE / "retry-paused.json")
         try:
             jd._judge_run("sonnet", "SYS", "u", tier="triage")

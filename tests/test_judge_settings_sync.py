@@ -220,13 +220,14 @@ class OneHopNeverALoop(unittest.TestCase):
                      'args=({"indexModel": str(msg["model"]), "gt": _jgt},)',
                      'args=({"judgeEffort": str(msg.get("effort") or ""), "gt": _jgt},)',
                      'args=({"indexEffort": str(msg.get("effort") or ""), "gt": _jgt},)',
+                     'args=({"judgeConcurrency": str(msg.get("value") or ""), "gt": _jgt},)',   # T277
                      'args=({"distillModel": str(msg["model"]), "gt": _jgt},)',
                      'args=({"distillEffort": str(msg["effort"]), "gt": _jgt},)',
                      'args=({"commentModel": str(msg["model"]), "gt": _jgt},)',
                      'args=({"commentEffort": str(msg["effort"]), "gt": _jgt},)',
                      'args=({"commentFast": str(msg["fast"]), "gt": _jgt},)'):
             self.assertIn(frag, self.src, frag)
-        self.assertGreaterEqual(self.src.count("if _jgt is not None:"), 9,
+        self.assertGreaterEqual(self.src.count("if _jgt is not None:"), 10,
                                 "every judge-tier fan-out is gated on the pick actually applying")
 
     def test_the_gear_copy_says_the_pick_follows(self):

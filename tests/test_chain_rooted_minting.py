@@ -1018,6 +1018,23 @@ class QuietReportBack(unittest.TestCase):
         self.assertFalse(jd.load_goals(MGR)["nodes"][MGR + ":t1"].get("nodeComplete"),
                          "a linked recipient goal exists — its completion is the event, not the reply")
 
+    def test_a_reply_that_came_back_completes_nothing(self):
+        # 2026-09-08: the worker's report was bounced back to it (the oversize push: the message is not
+        # put back in the manager's box) or recalled before the manager read it — a report the manager
+        # never received is not a report-back, so the tracker stays open. Guard:
+        # test_a_quiet_tracker_completes_on_the_reply (the same world, nothing naming the reply).
+        for name, terminal in (("bounced", {"t": T0 + 950, "ev": "bounced", "id": "r1", "to": "web", "host": "",
+                                            "why": "your message is 90000 bytes as delivered, over the limit"}),
+                               ("recalled", {"t": T0 + 950, "ev": "recall", "id": "r1"})):
+            self._world(quiet=True, reply_at=T0 + 900)
+            with jd.MESSAGES.open("a") as fh:
+                fh.write(json.dumps(terminal) + "\n")
+            jd._PEER_ASK_CACHE[:] = [None, ({}, {}, {})]
+            jd.run_propagate(now=NOW)
+            nd = jd.load_goals(MGR)["nodes"][MGR + ":t1"]
+            self.assertFalse(nd.get("nodeComplete"),
+                             "%s: base — marked done, reported back by a message the manager never got" % name)
+
 
 class NeedsYouStillSurfaces(unittest.TestCase):
     """THE CRITICAL PIN: quiet filing leaves zero goal nodes, and the needs-you surfaces are

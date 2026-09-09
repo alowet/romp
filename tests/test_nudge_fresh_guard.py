@@ -60,7 +60,7 @@ class FreshGuard(unittest.TestCase):
             "_interrupt_suppresses_nudge", "_backend_queued", "_backend_rewind_pending",
             "_last_state", "_session_awaiting", "_closer_settled", "_revivers_pending",
             "_pending_ops", "_last_assistant_report", "_all_outstanding_delegated")}
-        self._orig_jd = {n: getattr(jd, n) for n in ("parsed_session", "load_goals", "_segs",
+        self._orig_jd = {n: getattr(jd, n) for n in ("parsed_session", "load_goals", "load_goals_shared_or_fault", "_segs",
                                                      "plan_units", "nudge_redundant")}
         self._orig_backend = km.Sessions.backend_for
         km._session_flag = lambda sid, flag: False
@@ -85,6 +85,7 @@ class FreshGuard(unittest.TestCase):
         jd.parsed_session = lambda sid, paths, now: {"turns": self.turns}
         self.store = _store()
         jd.load_goals = lambda sid: self.store
+        jd.load_goals_shared_or_fault = lambda sid: (self.store, None)   # the walk reads the shared view; the fresh re-read stays on load_goals
         self.sent = []
         # the tail reads the gate makes, in order: [snapshot, fire-time freshness re-read]
         self.reports = [("working through the queue", ARM_T + 50),
@@ -260,6 +261,7 @@ class FreshGuard(unittest.TestCase):
         working, resolved = self.store, _store()
         resolved["status"][G1] = "completed"
         jd.load_goals = lambda sid: resolved if test.judge_calls else working
+        jd.load_goals_shared_or_fault = lambda sid: (working, None)
         self.judge_replies = [False]
         self._tick()
         self.assertEqual(self.sent, [], "nothing survives → nothing sends")
@@ -272,6 +274,7 @@ class FreshGuard(unittest.TestCase):
         working, blocked = self.store, _store()
         blocked["status"][G1] = "blocked"
         jd.load_goals = lambda sid: blocked if test.judge_calls else working
+        jd.load_goals_shared_or_fault = lambda sid: (working, None)
         self.judge_replies = [False]
         self._tick()
         self.assertEqual(self.sent, [])

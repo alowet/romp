@@ -39,7 +39,7 @@ test("the row carries what left, whether it came back, and the scroll height bef
 
 test("render.ts observes the active view's children and the live-ask host's, and files the row through the capped diag path", () => {
   assert.match(RENDER, /import \{[^}]*\bsummarizeTailMutations\b[^}]*\btailMutRow\b[^}]*\} from "\.\/scroll-write";/);
-  assert.match(RENDER, /function scrollDiagRow\(kind: "scrollwrite" \| "scrollgesture" \| "tailchange" \| "spacer" \| "tailmut", data: any\): void \{/);
+  assert.match(RENDER, /function scrollDiagRow\(kind: "scrollwrite" \| "scrollgesture" \| "tailchange" \| "spacer" \| "tailmut" \| "unitchange", data: any\): void \{/);
   assert.match(RENDER, /mo\?: MutationObserver; \}/, "the View carries its mutation observer");
   assert.match(RENDER, /v\.mo = new MutationObserver\(\(records\) => \{/);
   assert.match(RENDER, /v\.mo\.observe\(elv, \{ childList: true \}\);/);

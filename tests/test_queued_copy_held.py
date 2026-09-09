@@ -65,6 +65,12 @@ const page = await browser.newPage({ viewport: { width: 1000, height: 600 } });
 await page.addInitScript(() => {
   window.__rows = []; window.__frames = [];
   window.addEventListener("message", (e) => { const m = e.data; if (m && (m.type === "session" || m.type === "update" || m.type === "chatTail")) window.__frames.push(m); });
+  // while the synthetic sequence runs, the kernel's own frames for this session are held back (a status-only tail
+  // would truncate the injected events): the shim's socket handler is wrapped at the prototype
+  window.__quiet = false;
+  const desc = Object.getOwnPropertyDescriptor(WebSocket.prototype, "onmessage");
+  Object.defineProperty(WebSocket.prototype, "onmessage", { configurable: true, get() { return desc.get.call(this); },
+    set(fn) { desc.set.call(this, (ev) => { if (window.__quiet) { try { const m = JSON.parse(ev.data); if (m && (m.type === "chatTail" || m.type === "update" || m.type === "session" || m.type === "status")) return; } catch (e) {} } return fn.call(this, ev); }); } });
   const orig = WebSocket.prototype.send;
   WebSocket.prototype.send = function (d) {
     try { const m = JSON.parse(d); if (m && m.type === "clientDiag" && m.surface === "chat" && /^scroll/.test(m.what || "")) window.__rows.push({ what: m.what, writer: m.data && m.data.writer, before: m.data && m.data.before, after: m.data && m.data.after, sh: m.data && m.data.sh }); } catch (e) {}
@@ -106,8 +112,8 @@ const run = async (label, qid, uuid) => {
   await inject(landed(base, qid, uuid)); await page.waitForTimeout(400); out.landed = await measure();
   return out;
 };
-// a bottom reader
-await page.evaluate(() => { const c = document.getElementById("content"); c.scrollTop = c.scrollHeight; window.__rows = []; });
+// a bottom reader; from here on only the synthetic frames reach the page
+await page.evaluate(() => { const c = document.getElementById("content"); c.scrollTop = c.scrollHeight; window.__rows = []; window.__quiet = true; });
 await page.waitForTimeout(300);
 const start = await measure();
 const idPath = await run("id", "echo:m1", "am1");
@@ -270,6 +276,94 @@ class ServedQueuedCopyHeld(unittest.TestCase):
         # an off-bottom reader: nothing moves at all
         for k in ("card", "taken", "taken2", "landed"):
             self.assertEqual(off[k]["top"], r["offStart"]["top"], "an off-bottom reader is never moved (%s): %r vs %r" % (k, off[k], r["offStart"]))
+
+
+    def test_our_own_send_in_the_fed_gap_is_one_bubble(self):
+        # the tail fix's review: with our copy gone from the queue (held by the pane) and the kernel's echo showing, the
+        # echo cover skipped hiding the held copy — two bubbles for one message (three with the echo)
+        cfg = os.path.join(self.lab, "cfg.json")
+        with open(cfg, "w") as f:
+            json.dump({"chat": "http://127.0.0.1:%d/chat?token=%s" % (self.port, self.token), "text": "and also update the docstring"}, f)
+        driver = os.path.join(self.lab, "driver-fed.mjs")
+        with open(driver, "w") as f:
+            f.write(DRIVER_FED)
+        p = subprocess.run(["node", driver], capture_output=True, text=True, timeout=240,
+                           env=dict(os.environ, EXT_PKG=os.path.join(EXT, "package.json"), CFG=cfg))
+        if p.returncode == 3:
+            raise unittest.SkipTest("no playwright browser on this box — the served guard needs one (CI installs none)")
+        self.assertEqual(p.returncode, 0, "driver failed:\n" + p.stdout[-3000:] + p.stderr[-3000:])
+        line = next((ln for ln in p.stdout.splitlines() if ln.startswith("RESULT:")), None)
+        self.assertIsNotNone(line, "driver printed no result:\n" + p.stdout[-3000:])
+        r = json.loads(line[len("RESULT:"):])
+        print("T262M:", json.dumps(r))
+        self.assertEqual(r["dropped"], 1, "the send was dropped at the socket: the pane's bubble is the only copy of ours")
+        self.assertEqual((r["pressed"]["bubbles"], r["pressed"]["users"]), (1, 0), "our bubble at the press: %r" % r["pressed"])
+        self.assertEqual((r["queued"]["bubbles"], r["queued"]["users"]), (1, 0), "the kernel's queued copy hidden for ours: %r" % r["queued"])
+        self.assertEqual(r["fed"]["total"], 1, "the fed gap: the echo hidden, the held copy hidden, ours the one bubble: %r" % r["fed"])
+        self.assertEqual(r["fed2"]["total"], 1, "…and on the next push too: %r" % r["fed2"])
+        self.assertEqual((r["landed"]["bubbles"], r["landed"]["users"]), (0, 1), "the landing takes the slot: %r" % r["landed"])
+
+
+DRIVER_FED = r"""
+import { createRequire } from "node:module";
+import fs from "node:fs";
+const require = createRequire(process.env.EXT_PKG);
+const { chromium } = require("playwright");
+const cfg = JSON.parse(fs.readFileSync(process.env.CFG, "utf8"));
+let browser;
+try { browser = await chromium.launch(); }
+catch (e) { console.error("browser-launch-failed: " + e); process.exit(3); }
+const page = await browser.newPage({ viewport: { width: 1000, height: 600 } });
+await page.addInitScript(() => {
+  window.__frames = []; window.__quiet = false; window.__dropped = 0;
+  window.addEventListener("message", (e) => { const m = e.data; if (m && (m.type === "session" || m.type === "update" || m.type === "chatTail")) window.__frames.push(m); });
+  const desc = Object.getOwnPropertyDescriptor(WebSocket.prototype, "onmessage");
+  Object.defineProperty(WebSocket.prototype, "onmessage", { configurable: true, get() { return desc.get.call(this); },
+    set(fn) { desc.set.call(this, (ev) => { if (window.__quiet) { try { const m = JSON.parse(ev.data); if (m && (m.type === "chatTail" || m.type === "update" || m.type === "session" || m.type === "status")) return; } catch (e) {} } return fn.call(this, ev); }); } });
+  const orig = WebSocket.prototype.send;
+  WebSocket.prototype.send = function (d) { try { const m = JSON.parse(d); if (m && m.type === "sendMessage") { window.__dropped++; return; } } catch (e) {} return orig.call(this, d); };
+});
+await page.goto(cfg.chat);
+await page.waitForSelector("#tabs .tab, #tabs [data-sid]", { timeout: 20000 });
+await page.waitForSelector(".turn.turn-user", { timeout: 20000 });
+await page.waitForFunction(() => window.__frames.some((m) => m.type === "session" && Array.isArray(m.events) && m.events.length > 3), null, { timeout: 20000 });
+const base = await page.evaluate(() => { const fr = window.__frames.filter((m) => m.type === "session" && Array.isArray(m.events)); return fr[fr.length - 1]; });
+base.events = base.events.filter((e) => !(e.uuid || "").startsWith("optimistic:"));
+const measure = () => page.evaluate((text) => {
+  const vis = (n) => !!n && n.style.display !== "none" && !n.classList.contains("turn-echo-hidden") && !n.classList.contains("turn-queued-hidden");
+  const bubbles = Array.from(document.querySelectorAll(".turn-queued .queued-bubble")).filter((b) => vis(b.closest(".turn-queued")) && (b.textContent || "").includes(text));
+  const users = Array.from(document.querySelectorAll(".turn.turn-user")).filter((t) => vis(t) && (t.textContent || "").includes(text));
+  return { bubbles: bubbles.length, users: users.length, total: bubbles.length + users.length,
+           landingMarked: document.querySelectorAll(".turn-queued .queued-bubble.landing").length };
+}, cfg.text);
+const inject = (frame) => page.evaluate((f) => { window.postMessage(f, "*"); }, frame);
+// our send (dropped at the socket): its bubble
+await page.evaluate(() => { window.__quiet = true; });
+await page.fill("#composer-input", cfg.text);
+await page.press("#composer-input", "Enter");
+await page.waitForSelector(".turn-queued", { timeout: 10000 });
+await page.waitForTimeout(300);
+const pressed = await measure();
+// the kernel lists our copy with its id → ours stays, the kernel's copy hidden
+await inject({ ...base, type: "update", events: [...base.events, { kind: "queued", texts: [{ md: cfg.text, qid: "echo:m9", qts: Date.now(), cancelable: true, idx: 0 }] }] });
+await page.waitForTimeout(400);
+const queued = await measure();
+// the fed gap: the copy left the queue (held by the pane), the kernel's echo shows
+await inject({ ...base, type: "update", events: [...base.events, { kind: "user", md: cfg.text, uuid: "echo:m9", ts: new Date().toISOString() }] });
+await page.waitForTimeout(400);
+const fed = await measure();
+await inject({ ...base, type: "update", events: [...base.events, { kind: "user", md: cfg.text, uuid: "echo:m9", ts: new Date().toISOString() }] });
+await page.waitForTimeout(400);
+const fed2 = await measure();
+// the landing takes the slot
+await inject({ ...base, type: "update", events: [...base.events, { kind: "user", md: cfg.text, uuid: "am9", ts: new Date().toISOString(), qid: "echo:m9", human: true }] });
+await page.waitForTimeout(400);
+const landed = await measure();
+fs.writeSync(1, "RESULT:" + JSON.stringify({ pressed, queued, fed, fed2, landed, dropped: await page.evaluate(() => window.__dropped) }) + "\n");
+await browser.close();
+process.exit(0);
+"""
+
 
 
 if __name__ == "__main__":

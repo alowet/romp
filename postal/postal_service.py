@@ -40,6 +40,8 @@ import errno
 import fcntl
 import hashlib
 import hmac
+import http.client
+import itertools
 import json
 import os
 import random
@@ -962,7 +964,10 @@ def format_receipts(recs):
         elif r.get("parked"):                  # cross-host, still in the outbox awaiting relay
             # "(unreachable)" ONLY when the link is actually down (the user 2026-08-24): a healthy
             # queue is normal transit, not a failure. An older bus omits parkedUp — claim nothing.
-            if r.get("parkedUp"):
+            if r.get("carried"):               # it left with an exchange; the far side's ack is not back
+                st = "left for %s %s — awaiting delivery confirmation · id %s" % (
+                    r["parked"], _hhmm_epoch(r["carried"]), r.get("id", "?"))
+            elif r.get("parkedUp"):
                 st = "queued for relay to %s · id %s" % (r["parked"], r.get("id", "?"))
             elif "parkedUp" in r:
                 st = "parked for %s (unreachable) — delivers on reconnect · id %s" % (r["parked"], r.get("id", "?"))
@@ -1412,12 +1417,44 @@ def resolve_recipient(to, frm_id=""):
     return {"kind": "error", "status": 404, "error": "no live romp session named '%s'" % to}
 
 
-def _recall(from_id, to, mid):
+WHY_CARRIED = "already left for %s and can no longer be withdrawn"        # _recall: a carried outbox record
+WHY_IN_FLIGHT = "is on its way to %s right now (try again in a moment)"    # _recall: a record an exchange is carrying
+
+def _recall(from_id, to, mid, kept=None):
     """Unsend UNREAD mail: delete messages still sitting in a recipient's `new/`
     (queued or parked) that were sent BY from_id. With `to`, scope to that one
     recipient; with `mid` (and no `to`), find it across mailboxes; both narrows to
     one message. Only the original sender's own messages are touched. Already-read
-    mail has left `new/` and can't be recalled. Returns [{to, id, body}] removed."""
+    mail has left `new/` and can't be recalled. Returns [{to, id, body}] removed.
+
+    Cross-host mail parked in the OUTBOX is recallable only until an exchange CARRIES it
+    (2026-09-08). The record does not leave the outbox when it rides — it leaves on the
+    end-to-end ack, one round trip later at best and a whole outage later when a response was
+    lost — and the far bus delivers on arrival, so in that window the recipient already holds
+    the message and may be answering it. Unlinking the record then, as this arm used to, and
+    filing a terminal recall row for it, told the sender's receipts (and every reader that
+    treats a recall as final) that a read message had been withdrawn. Two states refuse here
+    now, both exact events of the exchange, and a refused record stays, no row is written, and
+    the refusal is appended to `kept` (a list the caller passes; None drops them) as {to, id,
+    host, carried, why, body} so the sender is told in plain words:
+    - CARRIED (`carried` on the record, durable): the exchange's OUTCOME said the record reached
+      the far bus — the dialer got a response, or its dial failed only after the request went
+      out; the dialed side's response write returned (_mark_carried has the event per side).
+      "already left for <host> and can no longer be withdrawn".
+    - IN FLIGHT (_inflight, in memory): an open exchange — any of them; two run at once for one
+      host — listed the record and its outcome is not in yet: the bytes are on the wire or about
+      to be, so a recall can neither be granted (the
+      recipient may already hold them) nor told they left (a refused dial means they never
+      will). "is on its way to <host> right now (try again in a moment)": the outcome, seconds
+      away, turns it into the carried refusal or frees the record for the recall.
+    The check and the unlink here share _outbox_lock with the listing that puts a record in
+    flight (_relays_for) and the outcome that marks or frees it (_flight_done), so a recall
+    either unlinks before the listing sees the record, or meets one of the two refusals; never
+    a granted recall for a record an exchange is carrying.
+
+    Every recall row names the box it came from — `box: 'new'` (a recipient's maildir) or
+    `box: 'outbox'` (a parked cross-host record, with `host`) — so a reader can tell the two
+    apart by an explicit field instead of an id's shape."""
     if not from_id:
         return []
     listing = []                                 # ONE listing per recall, at first need; every name lookup reads it
@@ -1466,33 +1503,44 @@ def _recall(from_id, to, mid):
             except Exception:
                 continue
             removed.append({"to": _name_for_id(rid, rows=_rows()), "id": f.name, "body": " ".join(body.split())[:120]})
-            _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "recall", "id": f.name})
+            _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "recall", "id": f.name, "box": "new"})
         _mark_pending(rid)         # recall may have emptied new/ -> reconcile the marker
     if peers_on() and OUTBOX.is_dir():
-        # A recall that beats the truck always wins: parked cross-host mail is still local, so the
-        # sender can unsend it right up until the exchange carries it. Forwarded mail (origin set)
-        # belongs to a sender on another host — never touched here.
+        # A recall that beats the truck wins: parked cross-host mail is still local, so the sender
+        # can unsend it right up until an exchange carries it — and not one moment after (the
+        # `carried` mark; see the docstring). Forwarded mail (origin set) belongs to a sender on
+        # another host — never touched here.
         for hostdir in OUTBOX.iterdir():
             if not hostdir.is_dir():
                 continue
             for f in list(hostdir.glob("*.json")):
                 if mid and f.stem != mid:
                     continue
-                try:
-                    msg = json.loads(f.read_text())
-                except Exception:
-                    continue
-                if msg.get("frm_id") != from_id or msg.get("origin"):
-                    continue
-                if to and (msg.get("to") or "") != to and "%s:%s" % (hostdir.name, msg.get("to") or "") != to:
-                    continue
-                try:
-                    f.unlink()
-                except Exception:
-                    continue
+                with _outbox_lock:                   # the listing, the mark and this unlink share it: no
+                    try:                             # unlink of a record an exchange is carrying right now
+                        msg = json.loads(f.read_text())
+                    except Exception:
+                        continue
+                    if msg.get("frm_id") != from_id or msg.get("origin"):
+                        continue
+                    if to and (msg.get("to") or "") != to and "%s:%s" % (hostdir.name, msg.get("to") or "") != to:
+                        continue
+                    riding = any(f.stem in mids for mids in (_inflight.get(hostdir.name) or {}).values())
+                    if msg.get("carried") or riding:
+                        if kept is not None:
+                            kept.append({"to": "%s:%s" % (hostdir.name, msg.get("to") or "?"), "id": f.stem,
+                                         "host": hostdir.name, "carried": msg.get("carried"),
+                                         "why": (WHY_CARRIED if msg.get("carried") else WHY_IN_FLIGHT) % hostdir.name,
+                                         "body": " ".join((msg.get("body") or "").split())[:120]})
+                        continue                     # it stays; no row: nothing about it changed
+                    try:
+                        f.unlink()
+                    except Exception:
+                        continue
                 removed.append({"to": "%s:%s" % (hostdir.name, msg.get("to") or "?"), "id": f.stem,
                                 "body": " ".join((msg.get("body") or "").split())[:120]})
-                _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "recall", "id": f.stem})
+                _tl_append("messages.jsonl", {"t": int(time.time()), "ev": "recall", "id": f.stem,
+                                              "box": "outbox", "host": hostdir.name})
     return removed
 
 def _sent_receipts(mid):
@@ -1521,13 +1569,14 @@ def _sent_receipts(mid):
             bounced[e["id"]] = e["t"]
             bounced_why[e["id"]] = str(e.get("why") or "")   # a REFUSAL's why renders apart (format_receipts)
 
-    def _parked(i, e):                               # still in the outbox → honestly parked, not lost
-        tid = e.get("to_id", "")
+    def _parked(i, e):                               # still in the outbox → honestly parked, not lost:
+        tid = e.get("to_id", "")                     # (host, record) — the record carries the carry mark
         if tid.startswith("peer:") and not relays.get(i) and not bounced.get(i) and not recalls.get(i):
             h = tid[5:]
-            if outbox_get(h, i):
-                return h
-        return None
+            rec = outbox_get(h, i)
+            if rec:
+                return h, rec
+        return None, None
 
     listing = []                                 # one GET /sessions for every row without toName, at first need
 
@@ -1537,7 +1586,7 @@ def _sent_receipts(mid):
         return _name_for_id(sid, rows=listing[0])
 
     def _row(i, e):
-        h = _parked(i, e)
+        h, rec = _parked(i, e)
         r = {"to": e.get("toName") or _name(e.get("to_id", "")), "id": i, "sent": e["t"],
              "exec": execs.get(i), "recalled": recalls.get(i),
              "relayed": relays.get(i), "bounced": bounced.get(i), "parked": h}
@@ -1549,6 +1598,10 @@ def _sent_receipts(mid):
             # just in transit, and labeling it "(unreachable)" cried wolf on every normal relay.
             # PEERS is the authoritative dial state the send path already branches on.
             r["parkedUp"] = bool((PEERS.get(h) or {}).get("up"))
+            if rec.get("carried"):
+                # an exchange CARRIED it and the ack is not back (2026-09-08): the same fact the
+                # recall refuses on, so the two surfaces agree (additive: an older client ignores it)
+                r["carried"] = rec["carried"]
         return r
 
     out = [_row(i, e) for i, e in sent.items()]
@@ -2193,8 +2246,22 @@ class Handler(BaseHTTPRequestHandler):
             payload, status = peer_update(data)
             return self._send(payload, status)
         if u.path == "/peer-exchange":             # a peer bus dialing us through the kernel's -L forward
-            payload, status = peer_exchange_handle(data)
-            return self._send(payload, status)
+            flight = []                            # the ids of the flights the handler's listings registered
+            payload, status = peer_exchange_handle(data, flight=flight)
+            # The relays in a 200 leave with this write (2026-09-08): _send writes through the handler's
+            # unbuffered wfile (wbufsize 0 — sendall), so a return means the socket took the bytes and a
+            # dead socket raises here. Returned → the flight ends carried; raised → freed, nothing left,
+            # they ride the next exchange (a re-relay is deduped over there).
+            host = _exchange_peer_name(data)
+            try:
+                self._send(payload, status)
+            except Exception:
+                for fid in flight:
+                    _flight_done(host, fid, carried=False)
+                raise
+            for fid in flight:
+                _flight_done(host, fid, carried=(status == 200))
+            return
         if u.path == "/send":
             to = data.get("to", "")
             frm, frm_id = data.get("from", "unknown"), data.get("from_id", "")
@@ -2323,8 +2390,9 @@ class Handler(BaseHTTPRequestHandler):
             frm_id = data.get("from_id", "")
             if not frm_id:
                 return self._send({"error": "missing from_id"}, 400)
-            removed = _recall(frm_id, data.get("to", ""), data.get("id", ""))
-            return self._send({"ok": True, "removed": removed})
+            kept = []                                # carried outbox items the recall refused (additive:
+            removed = _recall(frm_id, data.get("to", ""), data.get("id", ""), kept=kept)   # an older client
+            return self._send({"ok": True, "removed": removed, "kept": kept})               # ignores the key)
         if u.path == "/wake":
             sid = data.get("id", "")
             if sid and _safe_id(sid):                         # force-deliver on revive once the prompt is live
@@ -2628,7 +2696,7 @@ def _sweep_unfinished_writes():
                 return True
         return False
 
-    removed, closed, standing, recovered = 0, 0, 0, 0
+    removed, closed, standing, recovered, standing_records = 0, 0, 0, 0, 0
     try:
         boxes = [b for b in MAILROOT.iterdir() if b.is_dir()] if MAILROOT.is_dir() else []
     except OSError:
@@ -2669,13 +2737,24 @@ def _sweep_unfinished_writes():
             except OSError:
                 continue
             for f in temps:
+                mid = f.name.split(".json.tmp-", 1)[0]
+                record_stands = (hostdir / (mid + ".json")).exists()
                 try:
                     f.unlink()
                 except OSError as e:
                     _log("unfinished %s record %s could not be removed (%s)" % (store.name, f.name, e))
                     continue
                 removed += 1
-                mid = f.name.split(".json.tmp-", 1)[0]
+                if record_stands:
+                    # the temp of a REWRITE of a standing record (_mark_carried publishes the carry mark
+                    # through the same temp-and-replace), cut short: the record itself stands and its
+                    # message is parked, so its ledger is left alone (2026-09-08). Closing it as never
+                    # parked — the reading when outbox_put was the only temp writer — read a parked
+                    # message as refused to its sender.
+                    standing_records += 1
+                    _log("unfinished %s record %s for %s removed at start; the record itself stands (the temp of "
+                         "a rewrite the stop cut short), its ledger left alone" % (store.name, f.name, hostdir.name))
+                    continue
                 if why:
                     closed += _close(mid, {"host": hostdir.name, "why": why})
                 _log("unfinished %s record %s for %s removed at start" % (store.name, f.name, hostdir.name))
@@ -2686,6 +2765,9 @@ def _sweep_unfinished_writes():
         if standing:
             parts.append("%d of them the temp of a message that had reached the inbox, its ledger left alone"
                          % standing)
+        if standing_records:
+            parts.append("%d of them the temp of a record that stands, its ledger left alone"
+                         % standing_records)
     if recovered:
         parts.append("%d delivered message(s) stood in an inbox with no sent row (the restart cut the delivery "
                      "after the publish); each has its row now" % recovered)
@@ -3004,6 +3086,14 @@ _peer_wakes = {}                           # host -> threading.Event (long-poll 
 _peer_threads = {}                         # host -> Thread (one dialer loop per up peer)
 _peer_pending = {}                         # host -> {"acks": [mid], "bounces": [{mid, why}]} for the NEXT request
 _peer_lock = threading.Lock()
+_outbox_lock = threading.Lock()            # serializes an outbox record's listing-into-flight, carry mark and
+#                                            unlink (recall, ack, bounce): none interleaves (_relays_for, _flight_done)
+_inflight = {}                             # host -> {flight id: {mid}}: the records each OPEN exchange is carrying, from
+#                                            its listing to its outcome; a recall meanwhile is "on its way" (_recall). Two
+#                                            exchanges for one host run at once by design (our dialer and their dial of
+#                                            us), so each listing is its own flight and ending one releases nothing another
+#                                            still holds. Memory only: a restart ends every exchange, so it empties itself
+_flight_seq = itertools.count(1)           # flight ids, minted under _outbox_lock (_relays_for)
 
 def _host_name_candidates():
     """Raw machine-name candidates for the self_host fallback, most meaningful first. macOS keeps
@@ -3252,11 +3342,100 @@ def outbox_get(host, mid):
 def outbox_del(host, mid):
     if not (_safe_id(host) and _safe_id(mid)):   # host/mid are path components — block traversal
         return False
-    try:
-        (OUTBOX / host / (mid + ".json")).unlink()
-        return True
-    except Exception:
+    with _outbox_lock:                           # never interleaved with a listing or a carry mark (_flight_done)
+        try:
+            (OUTBOX / host / (mid + ".json")).unlink()
+            return True
+        except Exception:
+            return False
+
+_CARRY_KEYS = ("carried", "carriedVia")        # the record's carry mark; never on the wire (_wire_form)
+
+def _mark_carried(host, mid):
+    """Record on outbox/<host>/<mid> that an exchange CARRIED it: `carried` (epoch of the first
+    departure) and `carriedVia` (the host it left for), published by the same atomic rewrite every
+    store record gets (_atomic_json_put), so the mark stands across a bus restart — the ack that
+    ends the record may arrive after one. True iff the record stands and is marked (2026-09-08).
+
+    The mark lands AFTER the departure, keyed on the exchange's outcome, never on the request
+    being built: a mark at build time survived every failed dial (protocol drift waits 60 s; a
+    refused connection during a restart), refusing a recall for bytes that never left. The
+    events, per side: the DIALER marks when its dial returns a response (peer_exchange_apply,
+    after the acks and bounces, so a record the ack just deleted is simply not there to mark) or
+    fails only AFTER the request went out (a read timeout, an undecodable body): the far bus may
+    have taken the relays and answered into the void (_peer_exchange_once); the DIALED side marks
+    once its response write returned (the /peer-exchange route). A dial the far bus refused with a
+    status (any HTTP error precedes relay intake), that never connected (urllib.error.URLError), or
+    whose socket closed before any status line came back (through the ssh forward, a far bus not
+    listening; review find 2026-09-09) marks nothing. From the listing to that outcome the record is IN FLIGHT
+    (_inflight), which the recall refuses as on its way — so no recall is granted for a record on
+    the wire, and none is told "left" for one that never did.
+
+    Why an exact mark and not the outbox's residency: a record stays in the outbox until the
+    END-TO-END ack, one round trip normally and a whole outage when a response was lost — and the
+    far side delivers on arrival; nothing distinguished a carried record from a parked one, so a
+    recall in that window unlinked a message the recipient already held (_recall has the rest). A
+    re-relay after a lost response finds the mark and writes nothing: the first departure is the
+    fact. False when the record is gone (acked, bounced or recalled first) or when the mark could
+    not be written — then the record RODE and its departure is not recorded, so a recall can still
+    withdraw it (the behaviour before this mark); said in the log by id. Takes _outbox_lock; the
+    _locked form is for callers already holding it (_flight_done)."""
+    with _outbox_lock:
+        return _mark_carried_locked(host, mid)
+
+def _mark_carried_locked(host, mid):
+    if not (_safe_id(host) and _safe_id(mid)):
         return False
+    rec = outbox_get(host, mid)
+    if not rec:
+        return False
+    if rec.get("carried"):
+        return True
+    rec["carried"], rec["carriedVia"] = int(time.time()), host
+    try:
+        _atomic_json_put(OUTBOX / host / (mid + ".json"), rec)
+    except OSError as e:
+        _log("outbox %s/%s: it rode an exchange but its departure could not be recorded (%s); a recall "
+             "can still withdraw it" % (host, mid, e))
+        return False
+    return True
+
+def _wire_form(m):
+    """The record as it rides an exchange: the carry mark stays home. It is this bus's bookkeeping
+    (a forwarding hub would otherwise inherit a `carried` it never carried and re-mark it on its own
+    departure), and keeping it off the wire keeps a record's measured size under the relay budget
+    the same before and after its first departure."""
+    return {k: v for k, v in m.items() if k not in _CARRY_KEYS}
+
+def _flight_done(host, flight_id, carried):
+    """The OUTCOME of one exchange for the flight its listing registered (_relays_for): the flight is
+    popped, and when `carried` — the bytes reached the far bus (the events are in _mark_carried) —
+    each of its records takes the durable mark first, under the one lock, so no instant exists in
+    which a record is neither in flight nor marked. `carried` False frees the flight's records: the
+    request never arrived, and a recall wins again exactly as before the listing — unless another
+    OPEN flight for the host still holds the record (two exchanges for one host run at once by
+    design), in which case it stays on its way until that one ends. Ending one flight never
+    releases what another holds: the first cut kept one set per host, and the first outcome to
+    land released a record the other exchange was still carrying (review find, 2026-09-08). A
+    second call for the same flight, or an unknown id, is a no-op: the fold-then-exception path in
+    _peer_exchange_once relies on that."""
+    with _outbox_lock:
+        mids = (_inflight.get(host) or {}).pop(flight_id, None)
+        if not mids:
+            return
+        if carried:
+            for mid in mids:
+                _mark_carried_locked(host, mid)
+
+def _mark_relays_carried(host, relays):
+    """Mark wire `relays` (anything with a mid) carried, for a fold that runs without a flight to end
+    (peer_exchange_apply driven directly — the tests' build → handle → apply): a response still means
+    the relays reached the far bus."""
+    with _outbox_lock:
+        for m in relays or []:
+            mid = str((m or {}).get("mid") or "")
+            if mid:
+                _mark_carried_locked(host, mid)
 
 def readbox_put(host, rec):
     """Park one read receipt for `host` (readbox/<host>/<mid>.json) and poke its exchange. Keyed by
@@ -3815,6 +3994,7 @@ def _budget_relays(host, msgs, budget=None):
     budget = _RELAY_BUDGET_BYTES if budget is None else budget
     out, used = [], 0
     for m in msgs:
+        m = _wire_form(m)                            # measured and emitted as it rides: the carry mark stays home
         n = len(json.dumps(m).encode("utf-8"))
         if n > budget:
             _log("peer %s: relay %s is %d bytes, over the %d-byte exchange limit; bounced to its sender"
@@ -3828,10 +4008,51 @@ def _budget_relays(host, msgs, budget=None):
         used += n
     return out
 
+def _relays_for(host, flight=None):
+    """The relays ONE exchange carries for `host`, from either side of it: the outbox's budgeted prefix
+    (_budget_relays), in wire form, registered under _outbox_lock as ONE flight of this exchange's own
+    — a record a recall removed between the listing and here is left out, so nothing rides that the
+    ledger has closed, and from here to the exchange's outcome (_flight_done) a recall meets the
+    on-its-way refusal instead of unlinking a record whose bytes may already be delivered. `flight`
+    is a list the caller passes to receive the flight's id (an out-parameter, so the wire dict gains
+    nothing); the caller ends it at the outcome. A listing that finds nothing registers no flight, and
+    neither does one with no list to hand the id to: a listing with no flight to end is a read, not a
+    departure (the tests' direct build → handle → apply; the fold then marks by mid), and an entry
+    nobody can end must never be left in _inflight. A record another open flight already holds is
+    listed all the same: skipping it would hold a message
+    back for up to a dial timeout when only one direction of the link works. Nothing durable is
+    written here: the carry mark waits for the outcome (_mark_carried)."""
+    rel = _budget_relays(host, outbox_list(host))     # outside the lock: an oversize relay bounces from here
+    out, mids = [], set()
+    with _outbox_lock:
+        for m in rel:
+            mid = m.get("mid") or ""
+            if not mid or outbox_get(host, mid) is None:
+                continue                             # gone since the listing (recalled, acked, bounced)
+            mids.add(mid)
+            out.append(m)
+        if mids and flight is not None:
+            fid = next(_flight_seq)
+            _inflight.setdefault(host, {})[fid] = mids
+            flight.append(fid)
+    return out
 
-def peer_exchange_handle(data):
+
+def _exchange_peer_name(data):
+    """The name the dialed side files a dialer under: its declared host, canonicalized to the alias we
+    already peer with when its busId proves it is that bus (_canon_peer_name). ONE function for the
+    handler and for the route that marks the response's relays carried after the write (2026-09-08):
+    the handler's own canonicalization files the busId row this lookup reads, so the two agree."""
+    host = str((data or {}).get("host") or "").strip()
+    return _canon_peer_name(host, str((data or {}).get("busId") or ""))
+
+def peer_exchange_handle(data, flight=None):
     """The DIALED side of one exchange. Returns (payload, status). Relays ride under _RELAY_BUDGET_BYTES
-    (_budget_relays), the request side's bound mirrored, so the response is bounded the same way."""
+    (_budget_relays), the request side's bound mirrored, so the response is bounded the same way. The
+    relays it hands out are IN FLIGHT from the listing (_relays_for, which appends the flight's id to
+    `flight`, a list the route passes); the departure event is the response write, so the route ends
+    the flight carried once _send returned (2026-09-08), and freed when it raised — nothing here
+    touches the record or the wire form."""
     host = str((data or {}).get("host") or "").strip()
     if not host:
         return {"error": "host required"}, 400
@@ -3841,7 +4062,7 @@ def peer_exchange_handle(data):
     # Canonicalize BEFORE anything keys on the name: presence files under the alias (no duplicate
     # session rows), and the relays below are trust-judged under the alias the user actually tiered.
     bus_id = str((data or {}).get("busId") or "")
-    host = _canon_peer_name(host, bus_id)
+    host = _exchange_peer_name(data)
     if not _safe_id(host):
         # An unkeyable name would HALF-work: presence lands (PEER_STATE is a dict), but outbox_put
         # refuses it as a path component, so every reply parks "unreachable" with no error anywhere
@@ -3887,39 +4108,49 @@ def peer_exchange_handle(data):
 
     a2, b2 = _drain_backflow()
     acks, bounces = acks + a2, bounces + b2
-    rel, reads = _budget_relays(host, outbox_list(host)), readbox_list(host)
+    reads, rel = readbox_list(host), _relays_for(host, flight)   # the listing last: it puts records in flight
     if not rel and not reads and data.get("wait") and not acks and not bounces:
         # nothing to hand back → park on the wake so anything we accept mid-wait crosses instantly
         _peer_wake(host).clear()
         _peer_wake(host).wait(EXCHANGE_WAIT)
-        rel, reads = _budget_relays(host, outbox_list(host)), readbox_list(host)
+        reads, rel = readbox_list(host), _relays_for(host, flight)
         a2, b2 = _drain_backflow()
         acks, bounces = acks + a2, bounces + b2
     # `reads` stay parked until the dialer's NEXT request readAcks them — a response can vanish
     # after we send it, so the dialed side never clears on send. Re-applying a duplicate is a no-op.
-    return {"host": self_host(), "epoch": BUS_EPOCH, "proto": PEER_PROTO, "busId": BUS_ID,
-            "presence": fleet_presence(host), "holds": holds_payload(host),
-            "tier": my_tier_of(host),                # how WE hold the dialer's mail (display/mirror, never the gate)
-            "relays": rel, "acks": acks, "bounces": bounces, "reads": reads,
-            "readsKept": reads_kept}, 200            # see _read_arrived (2026-09-08)
+    try:
+        return {"host": self_host(), "epoch": BUS_EPOCH, "proto": PEER_PROTO, "busId": BUS_ID,
+                "presence": fleet_presence(host), "holds": holds_payload(host),
+                "tier": my_tier_of(host),            # how WE hold the dialer's mail (display/mirror, never the gate)
+                "relays": rel, "acks": acks, "bounces": bounces, "reads": reads,
+                "readsKept": reads_kept}, 200        # see _read_arrived (2026-09-08)
+    except Exception:
+        for fid in flight or []:
+            _flight_done(host, fid, carried=False)   # no response will carry them: freed, they ride next time
+        raise
 
-def build_exchange_request(host, wait=True):
+def build_exchange_request(host, wait=True, flight=None):
     """The DIALER's request for one exchange. The relays are the outbox's oldest-first prefix under
     _RELAY_BUDGET_BYTES (_budget_relays); the rest ride the next round, so a backlog drains over a few
     exchanges instead of being refused whole."""
     p = _pending(host)
     with _peer_lock:
         acks, bounces, read_acks = list(p["acks"]), list(p["bounces"]), list(p.get("readAcks") or [])
-    relays = _budget_relays(host, outbox_list(host))          # may bounce (a backward bounce joins the
-    #                                                           origin's pending queue): after the snapshot
-    return {"host": self_host(), "epoch": BUS_EPOCH, "proto": PEER_PROTO, "busId": BUS_ID,
-            "presence": fleet_presence(host), "holds": holds_payload(host),
-            "tier": my_tier_of(host),                # how WE hold the dialed host's mail
-            "relays": relays,
-            "acks": acks, "bounces": bounces,
-            "reads": readbox_list(host), "readAcks": read_acks, "wait": bool(wait)}
+    req = {"host": self_host(), "epoch": BUS_EPOCH, "proto": PEER_PROTO, "busId": BUS_ID,
+           "presence": fleet_presence(host), "holds": holds_payload(host),
+           "tier": my_tier_of(host),                 # how WE hold the dialed host's mail
+           "acks": acks, "bounces": bounces,
+           "reads": readbox_list(host), "readAcks": read_acks, "wait": bool(wait)}
+    req["relays"] = _relays_for(host, flight)    # may bounce (a backward bounce joins the origin's pending
+    #                                              queue): after the snapshot. Each relay is IN FLIGHT from
+    #                                              here (a recall is told it is on its way) until the dial's
+    #                                              outcome marks it carried or frees it (_peer_exchange_once,
+    #                                              through the flight id `flight` receives; the wire gains nothing).
+    #                                              The LAST step on purpose: nothing after it can raise and
+    #                                              leave a record in flight with no outcome to free it
+    return req
 
-def peer_exchange_apply(host, req_sent, resp):
+def peer_exchange_apply(host, req_sent, resp, flight=None):
     """The DIALER's half: fold one exchange response in. `req_sent` is the request that produced it —
     its included acks/bounces/readAcks are now delivered and leave the pending queue (kept on send
     failure), and its reads leave the readbox: a response means the dialed side processed the whole
@@ -3951,6 +4182,16 @@ def peer_exchange_apply(host, req_sent, resp):
         _ack_arrived(host, mid)
     for b in resp.get("bounces") or []:
         _bounce_arrived(host, b)
+    # A response means the dialed side processed the whole request: the relays it carried have
+    # LEFT (2026-09-08). Marked after the acks and bounces above, so a record they just closed is
+    # simply not there to mark, and no temp is ever written beside a record about to be deleted.
+    # `flight`: the ids the request's build registered (_peer_exchange_once passes them); a caller
+    # without one (build → handle → apply driven directly) still marks the relays it carried.
+    if flight:
+        for fid in flight:
+            _flight_done(host, fid, carried=True)
+    else:
+        _mark_relays_carried(host, req_sent.get("relays") or [])
     for r in resp.get("reads") or []:                # response-carried receipts: apply, ack on the NEXT dial
         if not _read_arrived(host, r):
             continue                                 # not applied → no readAck: the dialed side re-sends it
@@ -4030,50 +4271,98 @@ def _peer_http(port, payload, token=""):
     with urllib.request.urlopen(req, timeout=EXCHANGE_WAIT + 10) as r:
         return json.loads(r.read().decode() or "{}")
 
+def _peer_exchange_once(host, port, token):
+    """One exchange with `host`, from the request to the folded-in response. Returns the OUTCOME, which
+    is also the carry event for the request's relays (2026-09-08; _flight_done):
+    - 'ok': a response. peer_exchange_apply folds it in and marks the relays carried after the acks
+      and bounces; if the fold itself fails the relays are marked here (the far bus answered, so it
+      processed them) and the failure is said.
+    - 'lost': raised AFTER the request went out (a read timeout, an undecodable body, anything else
+      urllib does not wrap): the far bus may have taken the relays and answered into the void, so
+      they are marked carried; the re-relay next round is deduped over there.
+    - 'unsent': urllib.error.URLError — the connect or the send failed (refused, unresolved, a connect
+      timeout, a pipe broken mid-send): the request never arrived; nothing is marked. Also a socket
+      that closed before any status line came back (RemoteDisconnected, a reset): through the ssh
+      forward that is a far bus not listening, not an answer lost (the arm below has the shape).
+    - 'drift': HTTP 409, the protocol handshake refused it before any relay was read; nothing marked.
+    - 'refused': any other HTTP status — the token gate, the unsafe-host check, a bad body — all of
+      which precede relay intake (a handler exception over there yields no response at all, not a
+      status); nothing marked. Each distinct refusal is said once.
+    _peer_loop keys its waits on the return."""
+    flight = []                                  # the id of the flight the build registers (out-parameter)
+    req = build_exchange_request(host, wait=True, flight=flight)
+
+    def _end(carried):
+        for fid in flight:
+            _flight_done(host, fid, carried=carried)
+    try:
+        resp = _peer_http(port, req, token)
+    except urllib.error.HTTPError as e:
+        _end(False)                                  # answered before intake: nothing left
+        if e.code == 409:
+            st = PEER_STATE.setdefault(host, {})
+            if st.get("drift") != "proto":
+                st["drift"] = "proto"
+                _log("peer %s: protocol drift — update romp on one side" % host)
+            return "drift"
+        body = ""
+        try:
+            body = " ".join((e.read() or b"").decode("utf-8", "replace").split())[:200]
+        except Exception:
+            pass
+        st = PEER_STATE.setdefault(host, {})
+        if st.get("refused") != (e.code, body):      # each DISTINCT refusal once, not per retry —
+            st["refused"] = (e.code, body)           # a 4xx (e.g. the unsafe-host gate) otherwise
+            _log("peer %s: exchange refused (HTTP %s) %s" % (host, e.code, body))   # retries silently forever
+        return "refused"
+    except urllib.error.URLError:
+        _end(False)                                  # the request never arrived
+        return "unsent"
+    except (http.client.RemoteDisconnected, http.client.BadStatusLine, ConnectionResetError, BrokenPipeError):
+        # The socket closed before any status line came back. urllib wraps only the connect and the
+        # send (h.request) in URLError; a failure in getresponse propagates raw, and through the
+        # kernel's ssh -L forward that is the shape of a far bus that is not listening (its restart
+        # window, a crash): the LOCAL ssh listener accepts the TCP connection, the request goes out
+        # to it, ssh fails the channel and closes the socket, and no bus ever read a byte. The generic
+        # arm below took that for a lost answer and marked every record in the flight carried, a
+        # durable mark, so through every far-bus restart the sender was refused a recall for messages
+        # still in its own outbox (review find, 2026-09-09). A far handler that died AFTER delivering
+        # also closes without a status line, but the re-relay next round is deduped over there by id:
+        # re-sending is safe where a false carried mark is not, so nothing is marked.
+        _end(False)
+        return "unsent"
+    except Exception:
+        _end(True)                                   # it went out; the answer was lost
+        return "lost"
+    try:
+        peer_exchange_apply(host, req, resp, flight=flight)
+    except Exception as e:
+        _log("peer %s: apply failed: %s" % (host, e))
+        _end(True)                                   # the far bus answered: the relays reached it (a no-op
+        #                                              when the fold got as far as ending the flight itself)
+    return "ok"
+
 def _peer_loop(host):
     """One dialer per up peer: exchange, fold the response in, repeat — the dialed side's long-poll
     sets the pace, so a healthy loop is one parked request, not a poll. Exponential backoff (capped
-    30s) on connection errors only; exits when the kernel marks the peer down or the flag drops."""
+    30s) on connection errors only; exits when the kernel marks the peer down or the flag drops.
+    The body is _peer_exchange_once; this loop only paces it."""
     fails = 0
     while peers_on():
         p = PEERS.get(host)
         if not p or not p.get("up"):
             break
-        req = build_exchange_request(host, wait=True)
-        try:
-            resp = _peer_http(p["port"], req, p.get("token") or "")
-        except urllib.error.HTTPError as e:
-            if e.code == 409:
-                st = PEER_STATE.setdefault(host, {})
-                if st.get("drift") != "proto":
-                    st["drift"] = "proto"
-                    _log("peer %s: protocol drift — update romp on one side" % host)
-                _peer_wake(host).clear()
-                _peer_wake(host).wait(60)
-                continue
-            body = ""
-            try:
-                body = " ".join((e.read() or b"").decode("utf-8", "replace").split())[:200]
-            except Exception:
-                pass
-            st = PEER_STATE.setdefault(host, {})
-            if st.get("refused") != (e.code, body):      # each DISTINCT refusal once, not per retry —
-                st["refused"] = (e.code, body)           # a 4xx (e.g. the unsafe-host gate) otherwise
-                _log("peer %s: exchange refused (HTTP %s) %s" % (host, e.code, body))   # retries silently forever
-            fails += 1
-            _peer_wake(host).clear()
-            _peer_wake(host).wait(min(30, 2 ** min(fails, 5)))
+        outcome = _peer_exchange_once(host, p["port"], p.get("token") or "")
+        if outcome == "ok":
+            fails = 0
             continue
-        except Exception:
-            fails += 1
+        if outcome == "drift":
             _peer_wake(host).clear()
-            _peer_wake(host).wait(min(30, 2 ** min(fails, 5)))
+            _peer_wake(host).wait(60)
             continue
-        fails = 0
-        try:
-            peer_exchange_apply(host, req, resp)
-        except Exception as e:
-            _log("peer %s: apply failed: %s" % (host, e))
+        fails += 1
+        _peer_wake(host).clear()
+        _peer_wake(host).wait(min(30, 2 ** min(fails, 5)))
     with _peer_lock:
         _peer_threads.pop(host, None)
 
@@ -4309,7 +4598,7 @@ MCP_TOOLS = [
      "description": "See your recently sent messages and whether each was read/acted on by the recipient yet, or is still pending — instead of asking 'did you get it?'.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "recall_message",
-     "description": "Unsend a still-unread (queued) message when the ask went moot. Give 'to' to recall your unread message(s) to them, or add 'id' (from check_sent) for one. Only your own unread messages; anything already read is gone.",
+     "description": "Withdraw a message that is still here when the ask went moot: unread mail to a session on this machine, or mail to another machine that has not left for it yet (check_sent shows which). Give 'to' to withdraw your message(s) to them, or add 'id' (from check_sent) for one. Only your own; anything already read, or already on its way to another machine, is gone.",
      "inputSchema": {"type": "object",
                      "properties": {"to": {"type": "string", "description": "recipient session name (or UUID) whose queued message(s) from you to cancel"},
                                     "id": {"type": "string", "description": "optional specific message id (from check_sent) to recall just that one"}}}},
@@ -4402,13 +4691,23 @@ def _mcp_call(name, args):
             return "Give 'to' (the recipient) and/or 'id' to recall.", True
         if not mid:
             return "Not inside a romp session.", True
-        removed = _http("POST", "/recall", {"from_id": mid, "to": to, "id": rid}).get("removed", [])
-        if not removed:
+        res = _http("POST", "/recall", {"from_id": mid, "to": to, "id": rid})
+        removed, kept = res.get("removed", []), res.get("kept", [])
+        if not removed and not kept:
             return ("Nothing to recall — no unread message from you matched "
-                    "(it was already read, or nothing's queued there).", False)
-        lines = ["Recalled %d message(s) before they were read:" % len(removed)]
-        for r in removed:
-            lines.append("  ✕ to %s: %s" % (r["to"], r["body"]))
+                    "(it was already read or delivered, or nothing's queued there).", False)
+        lines = []
+        if removed:
+            lines.append("Recalled %d message(s) before they were read:" % len(removed))
+            for r in removed:
+                lines.append("  ✕ to %s: %s" % (r["to"], r["body"]))
+        for k in kept:                           # an outbox item the bus refused to withdraw (2026-09-08): carried
+            #                                      (it left; the tail says what that may mean) or in flight (try
+            #                                      again in a moment — never "too late" in the same breath)
+            why = k.get("why") or (WHY_CARRIED % k.get("host", "?"))
+            tail = "; they may already have read it" if k.get("carried") else ""
+            lines.append('  ✗ NOT recalled — to %s (id %s): it %s%s. "%s"'
+                         % (k.get("to", "?"), k.get("id", "?"), why, tail, k.get("body", "")))
         return "\n".join(lines), False
     return "Unknown tool: %s" % name, True
 
@@ -4577,13 +4876,18 @@ def cli_recall(argv):
     if not ensure():
         sys.stderr.write("[romp mail] %s\n" % _unreachable_hint()); return 1
     try:
-        removed = _http("POST", "/recall", {"from_id": my_id() or "", "to": to, "id": rid}).get("removed", [])
+        res = _http("POST", "/recall", {"from_id": my_id() or "", "to": to, "id": rid})
     except BusError as e:
         sys.stderr.write("[romp mail] %s\n" % e); return 1
-    if not removed:
-        print("[romp mail] nothing to recall (already read, or none queued to '%s')" % to)
-    else:
+    removed, kept = res.get("removed", []), res.get("kept", [])
+    for k in kept:                               # an outbox item the bus refused to withdraw (2026-09-08); the
+        why = k.get("why") or (WHY_CARRIED % k.get("host", "?"))   # "too late" tail only for one that has left
+        tail = "; they may already have read it" if k.get("carried") else ""
+        print("[romp mail] not recalled: the message to '%s' (id %s) %s%s" % (k.get("to", "?"), k.get("id", "?"), why, tail))
+    if removed:
         print("[romp mail] recalled %d message(s) to '%s' before they were read" % (len(removed), to))
+    elif not kept:
+        print("[romp mail] nothing to recall (already read or delivered, or none queued to '%s')" % to)
     return 0
 
 def cli_wake(argv):

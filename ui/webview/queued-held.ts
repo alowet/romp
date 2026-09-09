@@ -44,47 +44,77 @@ export function landsCopy(e: HeldEvent, c: { md: string; qid?: string }): boolea
   return Array.isArray(e.blocks) && e.blocks.some((b) => typeof b === "string" && sameText(b, c.md));
 }
 
-/** Index of the last KERNEL event (not our own bubble), or -1. */
-function lastKernelIdx(events: HeldEvent[]): number {
-  for (let i = events.length - 1; i >= 0; i--) if (!isOptimistic(events[i].uuid) && events[i].kind !== "queued") return i;
-  return -1;
+/** The uuid of the last KERNEL event that carries one (not our own bubble, not a queued group, not a uuid-less
+ *  compacting/clearing marker), or null: the anchor a hold is judged against. */
+export function lastKernelUuid(events: HeldEvent[]): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.kind === "queued" || !e.uuid || isOptimistic(e.uuid)) continue;
+    return e.uuid;
+  }
+  return null;
 }
+
+/** The per-session memory between pushes: the kernel's queued copies on the previous push and the anchor of
+ *  that push (its last kernel uuid) — a copy that vanished on THIS push is judged against landings after the
+ *  PREVIOUS push's tail, so a copy that vanishes and lands in one push is released, never held. */
+export type HeldMemory = { prev: HeldQueued[]; anchor: string | null; held: HeldCopy[] };
+
+/** What this push knows besides its events: the copies the user cancelled here (the ✕: the kernel will drop
+ *  them and nothing lands — never held), and whether the session has SETTLED (not working: a copy the queue no
+ *  longer lists on a settled session was cancelled or dropped, since a taken copy starts a turn). */
+export type HeldContext = { cancelled?: (c: { md: string; qid?: string }) => boolean; settled?: boolean };
 
 /** One push's decision. `prev` = the kernel's queued copies on the previous push (its tail group, our own bubble
  *  and hidden copies excluded); `held` = the copies held so far; `events` = this push's KERNEL events (our
  *  injections stripped); `cur` = this push's queued copies. Returns the copies to keep holding — each rendered
  *  in the tail group marked `landing` — and the previous-copies memory for the next push. */
-export function reconcileHeld(prev: HeldQueued[], held: HeldCopy[], events: HeldEvent[], cur: HeldQueued[]): { held: HeldCopy[]; prev: HeldQueued[] } {
+export function reconcileHeld(mem: HeldMemory, events: HeldEvent[], cur: HeldQueued[], ctx: HeldContext = {}): HeldMemory {
   const kernelCopies = cur.filter((t) => typeof t.md === "string" && !t.optimistic && !t.landing);
-  const listed = (c: { md: string; qid?: string }): boolean =>
-    kernelCopies.some((t) => c.qid ? t.qid === c.qid : (!t.qid && sameText(t.md as string, c.md)));
-  const out: HeldCopy[] = [];
-  const consider = (c: HeldCopy) => {
-    if (listed(c)) return;                                              // queued again: nothing to hold
-    // only a landing AFTER the anchor (the last kernel event when the copy vanished) is the copy's — the way the
-    // pending path reads landings after the send: an older same-text record is history, not this copy (matters for
-    // the id-less text fallback; an id is unique wherever it sits)
+  const prevCopies = mem.prev.filter((p) => typeof p.md === "string" && !p.optimistic && !p.landing && !p.hiddenByPending);
+  // copies are counted per identity, else per TEXT: two identical id-less copies with one taken leave one listed,
+  // and the one that left is the one to hold; a key listed MORE than on the previous push has a held copy back
+  const keyOf = (c: { md?: string; qid?: string }): string => c.qid || "text:" + (c.md as string).trim();
+  const countBy = (list: { md?: string; qid?: string }[]): Map<string, number> => {
+    const m = new Map<string, number>();
+    for (const c of list) m.set(keyOf(c), (m.get(keyOf(c)) || 0) + 1);
+    return m;
+  };
+  const prevN = countBy(prevCopies), curN = countBy(kernelCopies);
+  const candidates: HeldCopy[] = [];
+  const keys = new Set<string>([...prevN.keys(), ...mem.held.map(keyOf)]);
+  for (const k of keys) {
+    const carried = mem.held.filter((h) => keyOf(h) === k).map((h) => ({ ...h, pushes: h.pushes + 1 }));
+    const relisted = Math.max(0, (curN.get(k) || 0) - (prevN.get(k) || 0));   // came back to the queue: not held
+    candidates.push(...carried.slice(relisted));
+    const vanished = Math.max(0, (prevN.get(k) || 0) - (curN.get(k) || 0));
+    for (const p of prevCopies.filter((c) => keyOf(c) === k).slice(0, vanished))
+      candidates.push({ md: p.md as string, qid: p.qid, qts: p.qts, romp: p.romp, rompSystem: p.rompSystem, rompAuto: p.rompAuto,
+                        followUp: p.followUp, goal: p.goal, fuCtx: p.fuCtx, imgPaths: p.imgPaths, since: mem.anchor, pushes: 0 });
+  }
+  // the landings after each candidate's anchor; a landing that RELEASES a held copy is that copy's, not a "later"
+  // one for its siblings (two copies taken at one boundary land one record at a time)
+  const afterOf = (c: HeldCopy): HeldEvent[] => {
     const from = c.since === null ? -1 : events.findIndex((e) => e.uuid === c.since);
-    const after = c.since === null || from < 0 ? events : events.slice(from + 1);
-    if (after.some((e) => landsCopy(e, c))) return;                     // its atom is here: it takes the slot
-    if (!c.qid && c.pushes >= 1) return;                                // id-less: one push by text, then never a phantom
+    return c.since === null || from < 0 ? events : events.slice(from + 1);
+  };
+  const anchorGone = (c: HeldCopy): boolean => c.since !== null && !events.some((e) => e.uuid === c.since);
+  const releasing = new Set<HeldEvent>();
+  for (const c of candidates) { const hit = afterOf(c).find((e) => landsCopy(e, c)); if (hit) releasing.add(hit); }
+  const out: HeldCopy[] = [];
+  for (const c of candidates) {
+    if (ctx.cancelled && ctx.cancelled(c)) continue;                   // the user cancelled it here: nothing will land
+    const after = afterOf(c);
+    if (after.some((e) => landsCopy(e, c))) continue;                   // its atom is here: it takes the slot
+    if (!c.qid && c.pushes >= 1) continue;                              // id-less: one push by text, then never a phantom
+    if (ctx.settled) continue;                                          // a settled session took nothing: cancelled or dropped
     if (c.qid && c.since !== null) {                                    // a later landing means the CLI passed it
-      const later = after.some((e) => e.kind === "user" && !isEcho(e.uuid) && !isOptimistic(e.uuid) && !e.undelivered);
-      if (from < 0 || later) return;                                    // (its anchor left the window: the same reading)
+      const later = after.some((e) => e.kind === "user" && !isEcho(e.uuid) && !isOptimistic(e.uuid) && !e.undelivered && !releasing.has(e));
+      if (anchorGone(c) || later) continue;                             // (its anchor left the window: the same reading)
     }
     out.push(c);
-  };
-  for (const h of held) consider({ ...h, pushes: h.pushes + 1 });
-  const anchor = events[lastKernelIdx(events)]?.uuid ?? null;
-  for (const p of prev) {
-    if (typeof p.md !== "string" || p.optimistic || p.landing || p.hiddenByPending) continue;
-    const pmd: string = p.md;
-    if (held.some((h) => h.qid ? h.qid === p.qid : (!p.qid && sameText(h.md, pmd)))) continue;   // already held
-    if (listed({ md: pmd, qid: p.qid })) continue;
-    consider({ md: pmd, qid: p.qid, qts: p.qts, romp: p.romp, rompSystem: p.rompSystem, rompAuto: p.rompAuto,
-               followUp: p.followUp, goal: p.goal, fuCtx: p.fuCtx, imgPaths: p.imgPaths, since: anchor, pushes: 0 });
   }
-  return { held: out, prev: kernelCopies.map((t) => ({ ...t })) };
+  return { held: out, prev: kernelCopies.map((t) => ({ ...t })), anchor: lastKernelUuid(events) };
 }
 
 /** The queued copies a held copy renders as: the same card, marked `landing`, never cancelable (the kernel no

@@ -1,0 +1,48 @@
+<!-- SYNTHETIC fixture: harness-INJECTED user-role records as the chat renders them since 2026-09-08 (the user
+     2026-09-07: background-agent reports and system notices were wearing the user's own bubble). Class for class
+     what renderInjected / renderAgentNotif(nested:false) / noticeCard emit: a REAL user bubble, then a background
+     agent's completion as an agent notice on its own rail (closed — the gist is the head), a system notice OPEN to
+     show the folded body and the "harness note" (the CLI's preamble, one click away, never the message), and a
+     peer session's message in the peer variant. Invented content (notes-api demo domain). Run, both themes:
+       tools/ui-verify/shot.sh --css ui/webview/styles.css --body tools/ui-verify/fixtures/injected-notices.html \
+           --out /tmp/injected-shots/dark.png --size 720x640 --extra-css 'body{display:block;padding:10px 20px}'
+       tools/ui-verify/shot.sh --css ui/webview/styles.css --body tools/ui-verify/fixtures/injected-notices.html \
+           --out /tmp/injected-shots/light.png --size 720x640 --extra-css 'body{display:block;padding:10px 20px}' \
+           --body-class "theme-light chat-theme-yatharth"
+-->
+<!-- 1. the user's own words: the blue bubble, right-aligned, blue dot -->
+<div class="turn turn-user">
+  <span class="dot user"></span>
+  <div class="user-bubble md"><p>Run the api tests in the background and tell me what breaks.</p></div>
+</div>
+<div class="turn"><span class="dot ring"></span><div class="assistant md"><p>Started a background agent on the test suite; I'll keep going on the readme meanwhile.</p></div></div>
+<!-- 2. the background agent came to rest: its OWN notice on the rail (was: the preamble paragraph in a blue bubble) -->
+<div class="turn turn-notice notice-agent">
+  <span class="dot ring notice-dot notice-dot-agent"></span>
+  <div class="notice-card notice-card-agent notice-collapsible">
+    <div class="notice-head"><span class="notice-caret">▸</span><span class="notice-chip notice-chip-agent">agent</span><span class="notice-head-text">Background agent finished · check the api tests</span></div>
+    <div class="notice-body"><div class="notice-md md"><p>3 failures, all in <code>tests/test_api.py</code>: the export route returns 500 on an empty note.</p></div></div>
+  </div>
+</div>
+<!-- 3. a system notice, OPEN: the stored prompt as the body, the CLI's preamble under "harness note" -->
+<div class="turn turn-notice notice-reminder">
+  <span class="dot ring notice-dot notice-dot-reminder"></span>
+  <div class="notice-card notice-card-reminder notice-collapsible notice-open">
+    <div class="notice-head"><span class="notice-caret">▾</span><span class="notice-chip notice-chip-reminder">system</span><span class="notice-head-text">System notice · Scheduled task</span></div>
+    <div class="notice-body"><div class="notice-md md">
+      <div class="md"><p>Sweep the notes-api routes for slow spots and report.</p></div>
+      <div class="notice-sub">harness note</div>
+      <pre class="io-pre fold-pre">[SCHEDULED TASK - AUTOMATED FIRING OF A CONFIGURED PROMPT]
+This turn was started automatically by a schedule, not typed live by the user.</pre>
+    </div></div>
+  </div>
+</div>
+<!-- 4. a peer session's message: the dashed neutral peer variant, "From <session>" -->
+<div class="turn turn-notice notice-peer">
+  <span class="dot ring notice-dot notice-dot-peer"></span>
+  <div class="notice-card notice-card-peer notice-collapsible">
+    <div class="notice-head"><span class="notice-caret">▸</span><span class="notice-chip notice-chip-peer">peer</span><span class="notice-head-text">From web</span></div>
+    <div class="notice-body"><div class="notice-md md"><p>The routes are ready for review on the api branch.</p></div></div>
+  </div>
+</div>
+<div class="turn"><span class="dot ring"></span><div class="assistant md"><p>Fixing the export route's empty-note case now.</p></div></div>
