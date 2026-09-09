@@ -30728,7 +30728,11 @@ def _cleared_foreign(cleared):
             local.update(n[:-5] for n in os.listdir(d) if n.endswith(".json"))
         except OSError:
             pass
-    return sorted(i for i in cleared if i.rsplit(":", 1)[0] not in local)[:500]
+    # newest first under the cap (T287: a cut by id text dropped yesterday's clears on a long ledger), and only
+    # ids that name a session (a bare node id a mis-stripped route once recorded matches no card anywhere)
+    foreign = [i for i in cleared if ":" in i and i.rsplit(":", 1)[0] not in local]
+    foreign.sort(key=lambda i: (-(cleared.get(i) or 0), i))
+    return foreign[:500]
 
 
 def _cleared_ids():
