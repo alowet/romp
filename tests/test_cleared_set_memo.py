@@ -69,13 +69,19 @@ class _Memo(unittest.TestCase):
 class ClearSetMemo(_Memo):
     def test_parsed_once_then_served_while_the_file_stands(self):
         self._append(self._clear(G1, NOW - 100), self._clear(G2, NOW - 50))
-        with patch.object(Path, "read_text", wraps=Path.read_text, autospec=True) as rt:
+        real, reads = Path.read_text, []                 # a plain wrapper: an autospec'd wrap does not call through on 3.10
+
+        def counting(p, *a, **k):
+            if p == self.path:
+                reads.append(p)
+            return real(p, *a, **k)
+        with patch.object(Path, "read_text", counting):
             a = km._cleared_ids()
             b = km._cleared_ids()
             c = km._cleared_ids()
         self.assertEqual(a, {G1: NOW - 100, G2: NOW - 50})
         self.assertIs(b, a); self.assertIs(c, a)
-        self.assertEqual(rt.call_count, 1, "one read of the log over three calls")
+        self.assertEqual(len(reads), 1, "one read of the log over three calls")
         self.assertEqual(km._CLEARED_STATS, {"served": 2, "derived": 1})
 
     def test_an_append_re_derives_even_when_the_file_clock_does_not_move(self):
