@@ -42091,11 +42091,9 @@ if(m.type==='editorSelection'&&typeof m.text==='string'){var fc=document.getElem
 // the browser owns the restore: browseClosed alone puts a brought-forward feed back the way it was
 if(m.romp==='browseClosed'&&window.__rompFeedWasOff){window.__rompFeedWasOff=false;
   try{window.__rompPaneToggle&&window.__rompPaneToggle('feed',false);}catch(e){}}});
-// One id per dashboard (per browser tab/window), minted here so every pane in it reports the same one.
-// sessionStorage, deliberately: it survives a reload (the panes keep their identity) and a second window
-// gets its own, which is what makes "the dashboard that asked" a thing the kernel can address.
-try{if(!sessionStorage.getItem('romp:wid'))sessionStorage.setItem('romp:wid',
-  (crypto.randomUUID?crypto.randomUUID():String(Math.random()).slice(2)));}catch(e){}
+// The dashboard's one id (sessionStorage 'romp:wid') is minted by the HEAD script, before the parser reaches an
+// <iframe>, so no pane can connect ahead of it. It was minted here until 2026-09-09 — after the iframes — and
+// the chat pane's socket sometimes carried no wid, so a reveal aimed at this dashboard parked for good.
 // the rail's ⛭ opens the feed iframe's settings modal (the feed owns the modal); the CSS lifts the iframe
 // full-window while body.settings-open, so it works even when the feed pane is toggled off (the user 2026-06-25).
 var gear=document.getElementById('rail-gear');
@@ -43573,7 +43571,19 @@ def _landing():
             # env(safe-area-inset-*) under cover. navigator.standalone is iOS-only and standalone-only,
             # so this runtime flip can never reach Android Chrome/Firefox, whose cover bugs above stand.
             # It also tags <html class=ios-standalone>, the key the #mtabs inset padding hangs on.
-            "<script>if(navigator.standalone){document.documentElement.className+=' ios-standalone';"
+            # One id per dashboard (per browser tab/window), minted HERE — in the head, before the parser reaches
+            # a single <iframe> — so every pane in it reports the same one over its socket. sessionStorage,
+            # deliberately: it survives a reload (the panes keep their identity) and a second window gets its
+            # own, which is what makes "the dashboard that asked" a thing the kernel can address. It used to be
+            # minted by the body script, AFTER the iframes: on a fast origin the chat pane's shim read
+            # sessionStorage and connected before that script ran, so its socket carried no wid, and a reveal
+            # the kernel aimed at this dashboard's wid found no chat socket to deliver to — parked for a ready
+            # that never comes on a live page (2026-09-09, the served tap-resume test on localhost, two runs in
+            # three; a phone's first-ever load runs the same race). Same <script> as the standalone flip: the
+            # shell's script count is pinned, and both must run before anything else does.
+            "<script>try{if(!sessionStorage.getItem('romp:wid'))sessionStorage.setItem('romp:wid',"
+            "(crypto.randomUUID?crypto.randomUUID():String(Math.random()).slice(2)));}catch(e){}"
+            "if(navigator.standalone){document.documentElement.className+=' ios-standalone';"
             "var _vp=document.querySelector('meta[name=viewport]');"
             "_vp.setAttribute('content',_vp.getAttribute('content')+',viewport-fit=cover');}</script>"
             # the install surface (plans/ios-app.md proposal 1): manifest + touch icon + Apple metas on
