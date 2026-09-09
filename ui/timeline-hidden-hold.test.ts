@@ -94,11 +94,11 @@ function synthData() {
 }
 // The wire shape: a {type:"data"} lanes skeleton (no turns) and the {type:"bars"} detail that follows it.
 function skeletonOf(full: any, dNow = 0) {
-  return { now: full.now + dNow, sessions: full.sessions, turns: {}, judging: [], messages: [], nudges: [],
+  return { now: full.now + dNow, sessions: full.sessions, turns: {}, judging: {}, messages: [], nudges: [],
            activeChat: null, focus: null, hover: null, usage: null };
 }
 function barsOf(full: any, dNow = 0) {
-  return { type: "bars", turns: full.turns, judging: [], messages: [], nudges: [], now: full.now + dNow };
+  return { type: "bars", turns: full.turns, judging: {}, messages: [], nudges: [], now: full.now + dNow };
 }
 
 function mk() {

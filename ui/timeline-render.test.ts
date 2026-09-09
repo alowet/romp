@@ -750,9 +750,29 @@ test("prompt-dot hover shows the MESSAGE caption once ready, falling back to the
 // turns/judging/messages/nudges) which paints instantly, then {type:"bars"} = the heavy detail. update()
 // renders the skeleton; applyBars() fills the bars; and a skeleton-only update must NOT blink the bars out.
 function skeletonOf(full: any) {
-  return { now: full.now, sessions: full.sessions, turns: {}, judging: [], messages: [], nudges: [],
+  // the kernel's lanes skeleton: turns and judging EMPTY, judging as a map since the wire carries it per lane (T278c)
+  return { now: full.now, sessions: full.sessions, turns: {}, judging: {}, messages: [], nudges: [],
            activeChat: null, focus: null, hover: null, usage: null };
 }
+
+test("a cold start on the skeleton's empty judging map draws the judge band without throwing once the backstop fires", () => {
+  // the skeleton carries judging as {} (T278c); before update() expanded every payload's judging, a cold start
+  // (no previous data to carry) kept the object, and the judge band's draw read a list method on it once the
+  // loader backstop set the bars loaded: a blank pane with no loader until a bars frame landed
+  g.localStorage.getItem = (k: string) => (k === "romp:settings" ? JSON.stringify({ debug: true }) : null);
+  try {
+    const panel: any = new TimelinePanel(makeNode("div"));
+    const full = synthData();
+    panel.update(skeletonOf(full));
+    assert.deepEqual(panel.data.judging, [], "the empty map expands to the empty list every reader expects");
+    if (panel._loaderBackstop != null) { clearTimeout(panel._loaderBackstop); panel._loaderBackstop = null; }
+    panel._barsLoaded = true;                                      // what the backstop does before it draws
+    assert.doesNotThrow(() => panel.draw());
+    assert.ok(panel.svg.children.length > 3, "lanes and the band's chrome are drawn, not a blank plot");
+  } finally {
+    g.localStorage.getItem = () => null;
+  }
+});
 test("applyBars fills the deferred bars onto a lanes-only skeleton, and draw() emits them", () => {
   const panel: any = new TimelinePanel(makeNode("div"));
   const full = synthData();

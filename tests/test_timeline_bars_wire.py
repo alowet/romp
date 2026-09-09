@@ -202,7 +202,7 @@ class FrameSize(unittest.TestCase):
         self.assertEqual(sum(len(v) for v in new["turns"].values()), 8000)
         self.assertEqual(sum(len(v) for v in new["judging"].values()), 14000)
         self.assertLess(n_new / n_old, 0.65, "old %d B, new %d B: ratio %.2f" % (n_old, n_new, n_new / n_old))
-        self.assertGreater(n_new / n_old, 0.3, "the fixture is not a strawman: the ids, times and captions still ride")
+        self.assertGreater(n_new / n_old, 0.5, "the fixture is not a strawman: the ids, times and captions still ride")
 
 
 class Fixture(unittest.TestCase):
