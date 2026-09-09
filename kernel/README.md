@@ -1,4 +1,4 @@
-# kernel/ — the always-on core
+# kernel/: the always-on core
 
 The Python backend: one process (`kernel.py`) that reads every session's Claude
 Code transcript, builds the event tree, runs the judges, drives the session
@@ -12,33 +12,37 @@ Layered bottom-up:
 |---|---|---|
 | `event_model.py` | 1 | Transcript JSONL → event tree (atoms / segments / turns). The schema is pinned in `docs/event-model.md`. |
 | `judge.py` | 2 | The judge engine + every judge prompt (captioner, archiver, planner, …). Writes the durable records (captions, archive, goal tree). `docs/judges.md`. |
-| `kernel.py` | 3 | The read side: selects and displays what the layers below computed — HTTP + WebSocket server, pane payload builders, session lifecycle, nudges. `docs/read-side.md`. |
+| `kernel.py` | 3 | The read side: selects and displays what the layers below computed: HTTP + WebSocket server, pane payload builders, session lifecycle, nudges. `docs/read-side.md`. |
 
 Session control (how romp drives Claude Code) sits behind one seam:
 
 | File | What it is |
 |---|---|
-| `session_backend.py` | The `SessionBackend` ABC — the single interface both backends implement (guarded by `tests/test_session_api.py`). |
+| `session_backend.py` | The `SessionBackend` ABC, the single interface both backends implement (guarded by `tests/test_session_api.py`). |
 | `sdk_backend.py` | The Agent SDK backend (current default): an exact, event-based control channel. `docs/sdk-backend.md`. The tmux backend lives inside `kernel.py` (`TmuxBackend`). |
 | `askparse.py` | tmux backend only: recovers the AskUserQuestion picker from a captured pane (SDK sessions get it natively). |
 
 Shared lookup tables: `colormap.py` (recency tints, single source shared with
 the web bundles) and `palette.py` (session-identity colors).
 
-`keysource.py` selects the manager's live API key source: a key command
-(`ROMP_API_KEY_CMD=<command line>`, any secret manager's CLI printing the key,
-Claude Code's apiKeyHelper contract), the 1Password shorthand
-(`ROMP_API_KEY_REF=op://vault/item/field`, the same through `op read
---no-newline`), or a legacy `ANTHROPIC_API_KEY`. Source inspection is separate
-from resolution so UI/status reads do not fetch secrets. A selected provider is
-run, in a minimal environment, for each Claude session launch/reconnect,
-key-billed judge call, and direct model-catalog refresh. Explicit cycle checks also resolve the key
-to detect rotations; a reconnect resolves it again at launch. Resolved provider
-keys are not cached or written to disk. Resolution failures fail closed.
-`cli/keyswap.py` (`romp keyswap`) shares the path and parser to switch references or legacy keys without
-resolving them. Removing a service-file source cannot restore a stale startup
-key. See `docs/reference.md` for migration and service authentication setup.
+`credentials.py` is the whole of romp's contact with API credentials, and romp
+holds no key (the user 2026-09-08, who wants romp to hold no key). Sessions and
+judge children authenticate through Claude Code's own resolution: the
+`apiKeyHelper` in its settings for a key, the login otherwise, with a
+login-billed launch disabling the helper through its per-session settings layer
+(`"apiKeyHelper": ""` in the file the SDK hands the CLI as `--settings`). The
+module has three parts. The settings reader (`api_key_helper`) resolves the
+helper from the four settings files in Claude Code's precedence for a working
+directory; the picker, the spawn seed and the judges' default read it and never
+run it. The in-process helper runner (`helper_key`) serves the kernel's two own
+API calls, the model catalog refresh and the fast-mode org probe; the value
+lives in process memory for the helper's TTL and reaches no environment
+variable, file or log line. The boot check (`check_boot_environment`) stops the
+kernel before anything is spawned when a retired key path is still configured
+(a provider line in `service.env`, the marker beside it, or a key in the
+kernel's own environment), naming variable names and paths only. See
+`docs/reference.md` for setup and rotation.
 
 Everything here is loaded by file path (`SourceFileLoader`), not installed as a
-package — the repo runs straight from a git clone. Python tests live in
+package; the repo runs straight from a git clone. Python tests live in
 `tests/test_*.py`.

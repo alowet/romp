@@ -19,10 +19,11 @@ test("the header's Clear IS the card's Clear: one builder, one class set, a layo
   // the user 2026-09-08 (twice): same size, the outline, blue on hover — so the card, the turn-group and the
   // header all build their Clear with clearButton(), which mints the .fdismiss button; the header adds only
   // a positional class and its behaviour
-  assert.match(FEED, /function clearButton\(title: string\): HTMLElement \{\s*\n\s*const b = el\("button", "fdismiss"\);\s*\n\s*b\.textContent = "Clear";\s*\n\s*b\.title = title;/);
+  assert.match(FEED, /function clearButton\(title: string, label = "Clear"\): HTMLElement \{\s*\n\s*const b = el\("button", "fdismiss"\);\s*\n\s*b\.textContent = label;[^\n]*\n\s*b\.title = title;/,
+    "one builder; the label is the only knob (T271: the header's reads \"Clear all\")");
   assert.match(FEED, /const clr = clearButton\("clear this task"\);/, "the card");
   assert.match(FEED, /const clr = clearButton\("clear ALL sub-asks of this request \(inbox-zero\)"\);/, "the turn-group");
-  assert.match(FEED, /const clr = clearButton\("clear every card for this session"\);\s*\n\s*clr\.classList\.add\("feed-sess-clear"\); clr\.dataset\.act = "sess-clear";/, "the header");
+  assert.match(FEED, /const clr = clearButton\("clear every card for this session", "Clear all"\);[^\n]*\n\s*clr\.classList\.add\("feed-sess-clear"\); clr\.dataset\.act = "sess-clear";/, "the header");
   assert.doesNotMatch(FEED, /el\("button", "feed-sess-clear"\)/, "no lookalike element");
   // the tooltip keeps the sibling grammar: a lowercase verb phrase, like the card's "clear this task"
   assert.match(FEED, /sclr\.setAttribute\("aria-label", "clear every card for " \+ e\.name\);/);
@@ -34,7 +35,7 @@ test("the header's Clear IS the card's Clear: one builder, one class set, a layo
 test("grouped mode only: headers (and so the control) are emitted under the grouped guard", () => {
   const guard = FEED.indexOf("if (feedPrefs().grouped) {\n    const rank = new Map(sessionOrder.map(");
   assert.ok(guard > 0, "the grouped-mode header build lives under the grouped guard");
-  assert.match(FEED.slice(guard, guard + 2500), /head = \{ kind: "sess", t: e\.t, sid: s, name: src\.name/);
+  assert.match(FEED.slice(guard, guard + 2500), /head = \{ kind: "sess", t: e\.t, sid: s, col: k, name: src\.name/);
   assert.match(FEED, /function dressHeaderIfLast\(card: HTMLElement, sid: string\): void \{\s*\n\s*if \(!feedPrefs\(\)\.grouped\) return;/);
 });
 
@@ -99,4 +100,12 @@ test("the header Clear's own class carries layout only; size, outline and the ac
   assert.match(CSS, /\.fdismiss \{\s*\n\s*font: inherit; font-size: 0\.72em; font-weight: 400; cursor: pointer; white-space: nowrap;/);
   assert.match(CSS, /border: 1px solid var\(--card-border\); border-radius: 6px;/);
   assert.match(CSS, /\.fdismiss:hover \{ border-color: var\(--accent\); color: var\(--accent\); background: var\(--accent-wash\); \}/);
+});
+
+test("the header's button reads \"Clear all\" in the card Clear's exact chrome (T271, the user 2026-09-08)", () => {
+  // the card's own Clear keeps its one word; the session-wide one says what it clears — same builder, same
+  // .fdismiss class, the label the only difference
+  assert.match(FEED, /function clearButton\(title: string, label = "Clear"\): HTMLElement \{\s*\n\s*const b = el\("button", "fdismiss"\);\s*\n\s*b\.textContent = label;/);
+  assert.match(FEED, /clearButton\("clear every card for this session", "Clear all"\)/);
+  assert.doesNotMatch(FEED, /clearButton\([^)]*, "Clear"\)/, "no caller spells the default; a card's Clear is the bare builder");
 });

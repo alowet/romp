@@ -57,7 +57,7 @@ test("a failed kernel save is NACKED and surfaces loudly — never a silent stuc
   assert.match(KERNEL, /ack = \{"type": "dropSaveFailed", "name": str\(msg\["name"\]\)\}/);   // built then shipId-stamped (T215)
   // client: the nack retires the chip and says so in a toast
   assert.match(RENDER, /m\.type === "dropSaveFailed" && typeof m\.name === "string"/);
-  assert.match(RENDER, /retirePendingShip\(m\.name, nackShip\) \|\| activeId;[\s\S]{0,300}warnToast\(m\.name \+ " couldn't be saved on the kernel/);
+  assert.match(RENDER, /retirePendingShip\(m\.name, nackShip\) \|\| activeId;[\s\S]{0,400}warnToast\(m\.name \+ " couldn't be saved on the kernel/);   // the nack also ends the reload hold (T272)
   // a FileReader failure retires it too — an unreadable file must not pulse forever
   assert.match(RENDER, /reader\.onerror = \(\) => retirePendingShip\(name, shipId\);/);
 });

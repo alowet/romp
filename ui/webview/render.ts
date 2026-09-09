@@ -39,7 +39,8 @@ import { DEFAULT_CHORDS } from "./commands";
 import { NavHistory } from "./nav-history";
 import { StagedStack } from "./staged-messages";
 import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, queuedCopyToHide, dropPending, bareGroupLabel, sentAtLabel } from "./send-pending";
-import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued } from "./queued-held";
+import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued, type HeldMemory } from "./queued-held";
+import { reloadHoldReason } from "./reload-hold";
 import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional } from "./provisional";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
@@ -58,7 +59,7 @@ import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDown
 import { followReader, keepPlaceAcrossShow, followTail, atBottomDist, followBoxBelow, followTailShrink } from "./scroll-keep";
 import { retainLiveOmitted } from "./tab-order";
 import { userTurnShows } from "./user-turn-content";
-import { ScrollDiagBudget, classifyScroll, scrollWriteRow, tailChangeRow, tailLabel, spacerRow, readScrollDiagCap, summarizeTailMutations, tailMutRow } from "./scroll-write";
+import { ScrollDiagBudget, classifyScroll, scrollWriteRow, tailChangeRow, tailLabel, spacerRow, readScrollDiagCap, summarizeTailMutations, tailMutRow, unitChangeRow, unitChanges, boxChanges, boxLabel, BOX_FROM_TAIL } from "./scroll-write";
 import { reloadScrollRecord, takeReloadScroll, type ReloadScroll } from "./reload-restore";
 import { keepResidentEvents } from "./frame-merge";
 import { activeTabToReannounce } from "./relay-active";
@@ -451,12 +452,38 @@ function stripOptimistic(s: Session, keepHeld = false): void {
 // pending sends are reconciled (a held copy of OUR text is then hidden for our bubble like any kernel copy).
 const HELD_PREFIX = "held:";
 const isHeldGroup = (e: ChatEvent): boolean => e.kind === "queued" && !!e.uuid && e.uuid.startsWith(HELD_PREFIX);
-const heldQueued = new Map<string, { prev: HeldQueued[]; held: HeldCopy[] }>();
+const heldQueued = new Map<string, HeldMemory>();
+// the copies the user cancelled with the ✕ on this client, per session (their qid, or their text when the kernel
+// gave none): the kernel drops them and nothing lands, so a vanished cancelled copy is never held; the entry is
+// forgotten once the queue no longer lists the copy (the cancel took effect) — event-based, no timer
+const cancelledQueued = new Map<string, { qid?: string; md: string }[]>();
+function noteCancelledQueued(sid: string, md: string, qid?: string): void {
+  const list = cancelledQueued.get(sid) || [];
+  list.push({ qid, md });
+  cancelledQueued.set(sid, list);
+}
 function reconcileHeldCopies(s: Session): void {
-  const mem = heldQueued.get(s.id) || { prev: [], held: [] };
+  // idempotent: a frame that kept the resident events (an empty full frame) still carries the previous pass's held
+  // marks and group — cleared first, so the pass recomputes from the kernel's copies alone
+  for (let i = s.events.length - 1; i >= 0; i--) {
+    const e = s.events[i];
+    if (isHeldGroup(e)) { s.events.splice(i, 1); continue; }
+    if (e.kind === "queued" && e.texts.some((t) => t.landing)) s.events[i] = { ...e, texts: e.texts.filter((t) => !t.landing) };
+  }
+  const mem = heldQueued.get(s.id) || { prev: [], anchor: null, held: [] };
   const qi = tailQueuedIdx(s.events);
   const cur = qi >= 0 ? ((s.events[qi] as Extract<ChatEvent, { kind: "queued" }>).texts as HeldQueued[]) : [];
-  const r = reconcileHeld(mem.prev, mem.held, s.events as any, cur);
+  const cancelled = cancelledQueued.get(s.id) || [];
+  const settled = !(s.status.state === "working" || s.status.state === "compacting");
+  const r = reconcileHeld(mem, s.events as any, cur, {
+    settled,
+    cancelled: (c) => cancelled.some((x) => x.qid && c.qid ? x.qid === c.qid : x.md.trim() === c.md.trim()),
+  });
+  // a cancel has taken effect once the kernel's queue no longer lists the copy: forget it
+  if (cancelled.length) {
+    const still = cancelled.filter((x) => cur.some((t) => x.qid && t.qid ? t.qid === x.qid : (typeof t.md === "string" && t.md.trim() === x.md.trim())));
+    if (still.length) cancelledQueued.set(s.id, still); else cancelledQueued.delete(s.id);
+  }
   heldQueued.set(s.id, r);
   // the held set changed (a copy taken, a copy landed): the frame may keep its LENGTH while a held card gives way to
   // the landed atom, and the repaint's no-op fast path reads length alone — so the view is marked stale here
@@ -1036,7 +1063,7 @@ let landTrail: string[] = [];
 // count is NOT len − winStart + spacer: a unit may own more than one node (the day
 // divider that opens a new day precedes its turn), so anything mapping DOM back to
 // units reads data-unit off the node rather than counting children.
-interface View { el: HTMLElement; rendered: number; scrollTop: number; stick: boolean; shown: boolean; stale: boolean; winStart: number; winEnd?: number; avgTurnH?: number; spacerCount?: number; spacerCountBot?: number; unitTotal?: number; working?: boolean; ro?: ResizeObserver; mo?: MutationObserver; }   // working: the session's state at the last sync, the "worked …" footer's one non-event input (syncViewInner)
+interface View { el: HTMLElement; rendered: number; scrollTop: number; stick: boolean; shown: boolean; stale: boolean; winStart: number; winEnd?: number; avgTurnH?: number; spacerCount?: number; spacerCountBot?: number; unitTotal?: number; working?: boolean; uo?: ResizeObserver; uh?: WeakMap<Element, number>; ro?: ResizeObserver; mo?: MutationObserver; }   // working: the session's state at the last sync, the "worked …" footer's one non-event input (syncViewInner)
 const views = new Map<string, View>();
 
 // Pending pickers (AskUserQuestion / tool-permission) keyed by session id. These
@@ -1876,6 +1903,10 @@ function renderEvent(ev: ChatEvent, prevEpoch?: number | null, worked?: number |
     const hid = el("div", "turn turn-user turn-echo-hidden"); hid.style.display = "none"; return hid;
   }
   const turn = renderEventInner(ev);
+  // OUR cached pending group comes back as the SAME element on every push (renderPendingGroup): its anchors, hover
+  // wiring and rail chrome were attached the first time and must not accumulate (T262h follow-up)
+  if (turn.dataset.wired === "1") return turn;
+  if (ev.kind === "queued" && isOptimistic(ev) && ev.bare) turn.dataset.wired = "1";
   // pending-rewind overlay (reconcileRewind): this turn sits AFTER an edited message — it belongs to
   // the branch being abandoned, so it dims until the kernel's rewound payload replaces it
   if ((ev as any).rewound) turn.classList.add("rewound");
@@ -3965,7 +3996,8 @@ function fillBareLabel(label: HTMLElement, nLost: number, nSending: number): voi
 const pendingGroupNode = new Map<string, { sig: string; node: HTMLElement }>();
 function renderPendingGroup(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
   const sid = renderingSid || activeId || "";
-  const sig = JSON.stringify(ev.texts.map((t) => [t.md, !!t.lost, t.qts, t.imgPaths || null])) + "|" + JSON.stringify(ev.held || null);
+  const sig = JSON.stringify(ev.texts.map((t) => [t.md, !!t.lost, t.qts, t.imgPaths || null])) + "|" + JSON.stringify(ev.held || null)
+    + (ev.held && ev.held.resetsAt ? "|" + Math.floor(Date.now() / 60000) : "");   // a held countdown reads the minute: re-rendered as it ticks
   const fresh = renderQueued(ev);
   const cached = pendingGroupNode.get(sid);
   if (cached && cached.node.isConnected !== undefined) {
@@ -4033,7 +4065,8 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
       : askNote;
     const label = el("span", "queued-count");
     label.dataset.why = why;      // the ✕'s recount rewrites the count and keeps this suffix as-is
-    label.textContent = queuedCountText(n, nCmd, nSys, nNudge) + why;
+    // every copy taken but not landed (T262i): the head says so, so a held card never reads as a queued one
+    label.textContent = (texts.every((t) => t.landing) ? `${n} ${n === 1 ? "message" : "messages"} landing…` : queuedCountText(n, nCmd, nSys, nNudge)) + why;
     // `detail` is the CLI's OWN sentence about the limit (it carries the reset time as a wall clock, which
     // is why that flavor has no epoch to count down to). One level deeper on hover, per the compact-by-
     // default rule — the head keeps its one-line reason.
@@ -9415,7 +9448,7 @@ function tailMutations(records: MutationRecord[]): { removedTail: string[]; adde
 // the cap is the default unless the page's localStorage says otherwise (a laptop capturing raises it; T262j)
 const scrollDiagCap = readScrollDiagCap((k) => { try { return localStorage.getItem(k); } catch { return null; } });
 const scrollDiag = new ScrollDiagBudget(scrollDiagCap);
-function scrollDiagRow(kind: "scrollwrite" | "scrollgesture" | "tailchange" | "spacer" | "tailmut", data: any): void {
+function scrollDiagRow(kind: "scrollwrite" | "scrollgesture" | "tailchange" | "spacer" | "tailmut" | "unitchange", data: any): void {
   const v = scrollDiag.take(activeId || "", kind, Date.now());
   if (v === "drop") return;
   vscodeApi?.postMessage(v === "cap"
@@ -9783,8 +9816,42 @@ function ensureView(id: string): View {
       // ResizeObserver (frame-end sizes only) yet clamps the reader if a layout is forced in between — the remaining
       // snap's shape. Every removal at the END of the active view files a tailmut row: what left, whether it came
       // back in the same task, the scroll height the pane last recorded and the one after.
+      // …and a ResizeObserver over EVERY unit in the rendered window (T262n, the user 2026-09-08: an eleven-minute
+      // laptop capture held one unwritten move, a 24 px shrink with the reader at the bottom, and no row named what
+      // shrank). The rail above says the view changed height and names the TAIL; a unit above the tail changing height
+      // in place (a tool head folding, a figure sizing in, a status line going) moves the view by the same amount and
+      // the rail's row can only name the tail. This one names the unit: its class, how many units above the tail it
+      // sits, the view's recorded follow mode and the measured bottom at the read. A row only: no write, no rule. The
+      // tail unit is left to the rail's row (unitChanges skips it), spacers to their spacer rows. Units join and leave
+      // this observer through the mutation observer below (a window slide replaces them all), and a unit's first
+      // observation is its baseline, never a row. Same per-kind, per-minute cap as every other row.
+      const view3 = v;
+      const unitHeights = new WeakMap<Element, number>();
+      v.uh = unitHeights;
+      let unitW = -1;   // the view's width at the last observation: a change means every unit reflowed, not a unit that changed
+      const unitOf = (n: Element) => { const u = (n as HTMLElement).dataset?.unit; return u != null && u !== "" ? Number(u) : undefined; };
+      v.uo = new ResizeObserver((entries) => {
+        // A hidden view's units have no box: the observer reports each at 0x0 on hide and at its full height on
+        // re-show, neither a change in the unit (the review's find: one switch back would have filed a row per unit
+        // and burnt the minute's cap). The hide forgets the reported baselines and files nothing; the re-show
+        // observation records fresh ones, like a first show. Covers the tab switch and stripAftermath's blank.
+        if (view3.el.style.display === "none") { for (const e of entries) unitHeights.delete(e.target); return; }
+        // …and a width change reflows every unit at once (a resize, a scrollbar appearing): the new heights become
+        // the baselines and nothing is filed — a hundred honest rows would say nothing about any one unit.
+        const w = view3.el.clientWidth;
+        if (w !== unitW) { unitW = w; for (const e of entries) unitHeights.set(e.target, e.contentRect?.height ?? 0); return; }
+        const changes = unitChanges(entries.map((e) => ({ target: e.target, height: e.contentRect?.height ?? 0 })), view3.el.children, unitHeights, unitOf);
+        const content = document.getElementById("content");
+        if (!content || activeId !== id || !view3.shown) return;   // baselines are recorded above regardless; an inactive view files nothing
+        for (const c of changes)
+          scrollDiagRow("unitchange", unitChangeRow(id, c.dh, c.cls, c.fromTail, view3.stick, atBottom(content), content.scrollHeight, content.clientHeight));
+      });
       const view2 = v;
       v.mo = new MutationObserver((records) => {
+        for (const rec of records) {   // units entering the window are observed, units leaving are dropped (T262n)
+          rec.addedNodes.forEach((n) => { if (n instanceof Element) view2.uo?.observe(n); });
+          rec.removedNodes.forEach((n) => { if (n instanceof Element) { view2.uo?.unobserve(n); unitHeights.delete(n); } });
+        }
         if (activeId !== id || !view2.shown) return;
         const m = tailMutations(records);
         if (!m) return;
@@ -10853,6 +10920,39 @@ if (typeof ResizeObserver === "function") {
       }
       tailLastH = h;
     }).observe(tailHost);
+  }
+}
+// …and the scroller's boxes OUTSIDE the thread (the T262n follow-up, the user's 2026-09-08 laptop capture: its one
+// unwritten move, a 24 px shrink with the reader at the bottom, had no tailchange row, so it came from outside the
+// thread element, on a remote-host tab, where the one such box is the host-offline foot). #content's direct children
+// that are not a thread and not the live-ask host — the foot, #sub-head, the build placeholders — file the unit row
+// with fromTail BOX_FROM_TAIL, named by id else class: on appearing (their height, read once), on changing in place
+// (the observer) and on leaving (the height they had). A box removed under a bottom reader is exactly a clamp to the
+// bottom by its height, and the browser writes nothing; the row is attribution only, nothing moves for it.
+if (typeof ResizeObserver === "function") {
+  const c = document.getElementById("content");
+  if (c) {
+    const boxHeights = new WeakMap<Element, number>();
+    const isBox = (n: Node): n is HTMLElement => n instanceof HTMLElement && !n.classList.contains("thread") && n.id !== "live-ask";
+    const fileBox = (dh: number, cls: string) => {
+      const v = activeId ? views.get(activeId) : null;
+      if (!dh || !v || !v.shown || c.clientHeight <= 0) return;
+      scrollDiagRow("unitchange", unitChangeRow(activeId || "", dh, cls, BOX_FROM_TAIL, v.stick, atBottom(c), c.scrollHeight, c.clientHeight));
+    };
+    const boxRo = new ResizeObserver((entries) => {   // offsetHeight both here and at the baseline: one measure, no false first row
+      // the whole pane hidden measures every box at 0: forget those baselines and file nothing; the re-show
+      // observation is a fresh baseline (the same rule as the unit observer's hide)
+      if (c.clientHeight <= 0) { for (const e of entries) boxHeights.delete(e.target); return; }
+      for (const b of boxChanges(entries.map((e) => ({ target: e.target as HTMLElement, height: (e.target as HTMLElement).offsetHeight })), boxHeights)) fileBox(b.dh, b.cls);
+    });
+    const watchBox = (n: HTMLElement): number => { const h = n.offsetHeight; boxHeights.set(n, h); boxRo.observe(n); return h; };
+    for (const n of Array.from(c.children)) if (isBox(n)) watchBox(n);   // what is there now is the baseline, no row
+    new MutationObserver((records) => {
+      for (const rec of records) {
+        rec.removedNodes.forEach((n) => { if (isBox(n)) { const h = boxHeights.get(n) || 0; boxRo.unobserve(n); boxHeights.delete(n); fileBox(-h, boxLabel(n)); } });
+        rec.addedNodes.forEach((n) => { if (isBox(n)) fileBox(watchBox(n), boxLabel(n)); });
+      }
+    }).observe(c, { childList: true });
   }
 }
 // Boxes ABOVE the transcript grow/shrink → keep the chat text visually anchored (the user 2026-06-30 for
@@ -12950,6 +13050,7 @@ function retirePendingShip(key: string, shipId?: string): string | null {
     if (!list.length) pendingShips.delete(id);
     persistDrafts();
     if (id === activeId) renderComposerFiles(id);
+    endReloadHoldIfIdle();
     return id;
   }
   return null;
@@ -13017,6 +13118,29 @@ let shipGateSid: string | null = null;
 // Assigned by setupComposer (sendComposer lives in its closure); the WS ack handler fires a held
 // send through it when the last pending ship lands.
 let fireHeldSend: () => void = () => {};
+// The reload core (kernel.py _RELOAD_CORE_JS) asks every pane before it reloads the page (T265). A page reload
+// costs an upload in flight its bytes (persistDrafts keeps only the names, for the loss toast) and a send held on
+// the upload gate its release — the T215 wedge the reconnect re-ship heals in the same page. So while a ship
+// awaits its ack, or a send is held on one, this pane reports itself busy and the core waits for the ending event
+// (the ack retires the chip, the held send fires) before it fires; the shim's own reasons come first (T272).
+{
+  const shimBusy = (window as any).__rompPaneBusy as (() => string) | undefined;
+  (window as any).__rompPaneBusy = (): string => {
+    const b = shimBusy ? shimBusy() : "";
+    if (b) return b;
+    // only ships whose ack can still arrive hold (reload-hold.ts): a ship to a host whose relay is down, or to a host
+    // no longer attached, would otherwise hold every reload of this tab for good (the review of this hold)
+    return reloadHoldReason([...pendingShips.keys()], shipGateSid, (window as any).__rompFed);
+  };
+}
+// The ENDING event of those holds, told to the core the way the shim tells it its own (kernel.py ws.onopen →
+// __rompReload.ended()): the moment the last pending ship retires and no send is held, an owed reload may fire. The
+// core re-tries only on gesture ends, blur, a fresh request or the shell's poll, so without this a standalone page
+// stayed on the old build until the user's next unrelated click (the review of this change).
+function endReloadHoldIfIdle(): void {
+  if (pendingShips.size || shipGateSid) return;
+  try { (window as any).__rompReload?.ended?.(); } catch { /* a page without the core (the VS Code webview) */ }
+}
 
 // Persist drafts across a full RELOAD (the user 2026-06-25: a half-typed message must survive a refresh, not
 // only a tab switch). The Map is in-memory, so mirror it into the webview's persisted state — the same store
@@ -13399,6 +13523,7 @@ function renderComposerFiles(id: string | null): void {
         if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }
         if (held || gateWasOpen) warnToast("The pending upload was dismissed — your held message was NOT sent.");
       }
+      endReloadHoldIfIdle();   // after the settle above cleared the gate: the dismissed last chip ends the hold (T272)
       renderComposerFiles(id);
     });
     box.appendChild(x);
@@ -13894,7 +14019,7 @@ function upsert(msg: any) {
   }
   if (forked) {
     const v = views.get(msg.id);
-    if (v) { v.ro?.disconnect(); v.mo?.disconnect(); v.el.remove(); views.delete(msg.id); }
+    if (v) { v.uo?.disconnect(); v.ro?.disconnect(); v.mo?.disconnect(); v.el.remove(); views.delete(msg.id); }
   } else if (existed && !kept) {
     // A full frame replaces every event object and can differ from what this view rendered ANYWHERE (it is
     // what the kernel sends a client it believes is behind): the tail path trusts v.rendered as the exact
@@ -14344,7 +14469,7 @@ function dismissSession(id: string, why: DismissWhy, doomed?: ReadonlySet<string
     persistDrafts();   // a host drop / omission KEEPS it all (see DismissWhy) — the stash above may have updated the copy
   }
   const v = views.get(id);
-  if (v) { v.ro?.disconnect(); v.mo?.disconnect(); v.el.remove(); views.delete(id); }
+  if (v) { v.uo?.disconnect(); v.ro?.disconnect(); v.mo?.disconnect(); v.el.remove(); views.delete(id); }
   const oi = order.indexOf(id); if (oi >= 0) order.splice(oi, 1);
   const mi = mru.indexOf(id); if (mi >= 0) mru.splice(mi, 1);   // before the fallback read below — never the dead id
   renderTabs();                          // tab removed from `order` above → repaint without it
@@ -14717,6 +14842,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       if (gateOpen) { shipGateSid = null; closeConfirm(null); }
       if (owner === activeId) fireHeldSend();
       else warnToast("attachments finished uploading on another tab — the held message was not sent; review it there.");
+      endReloadHoldIfIdle();   // the ending event follows the release: the held send has been posted
     }
   } else if (m.type === "dropSaveFailed" && typeof m.name === "string") {
     // the kernel could not SAVE the shipped bytes — clear the pending chip and say so loudly,
@@ -14728,6 +14854,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     const held = !!owner && sendOnShip.delete(owner);    // a held send must not fire without the file it waited for
     const gateWasOpen = shipGateSid === owner;
     if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }   // the question is moot — but a failed save never auto-sends
+    endReloadHoldIfIdle();
     warnToast(m.name + " couldn't be saved on the kernel, so it was not attached — try again."
               + (held || gateWasOpen ? " Your message was NOT sent." : ""));
     if (owner && owner === activeId) renderComposerFiles(owner);   // the held-send button state clears with the hold
@@ -14956,7 +15083,7 @@ function setupComposer() {
                   [{ label: "Wait for the upload", value: "wait" },
                    { label: "Send without " + them, value: "now", danger: true }],
                   (v) => {
-                    shipGateSid = null;
+                    shipGateSid = null; endReloadHoldIfIdle();
                     if (v === "now") sendComposer({ pastShipGate: true });
                     else if (v === "wait") { sendOnShip.add(sid); renderComposerFiles(sid); }
                   });
@@ -15834,6 +15961,7 @@ setupSettings();
       const provisional = isProvisionalId(sidQ);
       if (provisional && qmd) forgetProvisionalSend(qmd);
       const msg: Record<string, unknown> = { type: "cancelQueued", id: sidQ, md: qmd };
+      if (qmd && el.dataset.qopt !== "1") noteCancelledQueued(sidQ, qmd, el.dataset.qid || undefined);   // a kernel copy: never held once it vanishes (T262i)
       if (el.dataset.qidx !== undefined) msg.idx = Number(el.dataset.qidx);
       if (el.dataset.qpark !== undefined) msg.park = Number(el.dataset.qpark);
       if (!provisional) vscodeApi.postMessage(msg);

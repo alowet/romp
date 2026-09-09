@@ -286,7 +286,27 @@ not a session); the recipient's stable id rides the additive `to_sid` key (rows 
 isn't in the log (legacy/rare).
 Two rules the wait readers apply to these rows: only a `question` or a `delegate` opens
 a wait, so the answered clock walks reply-requiring sends and a coordinate-only exchange
-neither opens nor reopens one (a reply of any kind still answers). A row without
+neither opens nor reopens one (a reply of any kind still answers). Two rows are
+terminal for the sent row whose id they name: `bounced` (the send came back: the peer
+refused it, the recipient exited, it never left) and a maildir `recall` (the sender
+withdrew it before anyone read it: that arm unlinks the message unread from the
+recipient's new/). An outbox recall — its row names a relay mid, `px-…` — is NOT read
+as terminal: the outbox item outlives the carry until the end-to-end ack, so the far
+recipient may already hold the message; a recalled cross-host send stays an open ask
+(a bus follow-up: refuse to recall a carried item, or stamp the row with its box).
+Either terminal row closes that ask for every reader that opens a wait from a sent
+row — the chip, the stamp clock, the closer's admit gate, the debt reminder's outcome,
+the courier's plant: the row is neither an ask nor an answer, so the sender is not
+waiting on a peer that never got it, a reply that came back or was withdrawn unread
+answers nothing (the edge stands, the replier still owes, no tracker reads "reported
+back" on a report the asker never received), and a stamp filed before the return is
+superseded by it as by a reply. Cross-host that bites on the replier's own host for a
+refused relay, and on the asker's host when its own orphan sweep destroys the
+delivered copy unread — the two hosts then disagree, honestly, and the remote replier
+is not told (the sweep's note reaches local senders only). A handoff tracker planted
+before the return arrived is not closed this way. The row is the event, keyed to the
+message it names, so a newer live ask keeps waiting whatever came back for an older
+one. A row without
 `to_sid` keys by whoever wore the name AT the row's send time, so a pre-2026-09-08 ask
 to a recreated same-named peer whose first sighting here is its own reply stays keyed
 to the prior wearer and reads open until the 6h wake: a known residual, legacy rows

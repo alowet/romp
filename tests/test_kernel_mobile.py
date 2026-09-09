@@ -3,7 +3,9 @@
 narrow/touch viewport, and the kernel tells the shell to switch to Chat when a feed/timeline tap
 brings the chat forward. Pure-HTML + routing asserts; no real session data.
 """
+import json
 import os
+import subprocess
 import unittest
 from importlib.machinery import SourceFileLoader
 import tempfile
@@ -426,6 +428,347 @@ class RevealRouting(unittest.TestCase):
         shell_msg = next(m for a, _, m in sent if a == "shell")
         self.assertEqual(chat_msg["id"], "s1")        # the original focus payload is preserved verbatim
         self.assertEqual(shell_msg, {"type": "reveal", "pane": "chat"})
+
+
+# A node stand-in for the phone: the shell's mobile script runs against a stub window whose visual
+# viewport the driver shrinks and grows by hand, so the fit's INPUTS are exact and its OUTPUT (the
+# --app-h / --mtabs-h it publishes) is read back. Same shape as test_kernel_webpush's reveal harness.
+_FIT_HARNESS = r"""
+'use strict';
+const PROPS = {}, SETS = [], RAF = [], WIN = {}, DOC = {}, VV = {}, CHAT = {}, LOADS = [];
+const on = (book) => (k, f) => { (book[k] = book[k] || []).push(f); };
+global.window = global;
+global.innerHeight = 844; global.innerWidth = 390; global.scrollY = 0;
+global.scrollTo = () => {};
+global.matchMedia = () => ({ matches: true });                 // a coarse pointer: the phone
+global.requestAnimationFrame = (f) => { RAF.push(f); return RAF.length; };
+global.addEventListener = on(WIN);
+global.visualViewport = { height: 844, scale: 1, addEventListener: on(VV) };
+const pane = (id) => ({ id, classList: { toggle() {} }, contentDocument: {},
+  contentWindow: { addEventListener: on(id === 'f-chat' ? CHAT : {}) },
+  addEventListener: (k) => { if (k === 'load') LOADS.push(id); } });
+const PANES = { 'f-chat': pane('f-chat'), 'f-fleet': pane('f-fleet'), 'f-feed': pane('f-feed'), 'f-timeline': pane('f-timeline') };
+const BAR = { offsetHeight: 44, querySelectorAll: () => [] };
+global.document = {
+  visibilityState: 'visible',
+  addEventListener: on(DOC),
+  documentElement: { scrollTop: 0, style: { setProperty: (k, v) => { PROPS[k] = v; SETS.push(k); } } },
+  body: { setAttribute() {} },
+  getElementById: (id) => (id === 'mtabs' ? BAR : (PANES[id] || null)),
+};
+global.localStorage = { getItem: () => null, setItem() {} };
+"""
+_FIT_DRIVER = r"""
+const fire = (book, k) => (book[k] || []).forEach((f) => f({}));
+const flush = () => { RAF.splice(0).forEach((f) => f(0)); };            // one frame: run what this frame queued
+const appH = () => PROPS['--app-h'], barH = () => PROPS['--mtabs-h'];
+const fits = () => SETS.filter((k) => k === '--app-h').length;
+const out = {};
+out.bound = { win: Object.keys(WIN).sort(), doc: Object.keys(DOC).sort(), vv: Object.keys(VV).sort(),
+  chat: Object.keys(CHAT).sort(), loads: LOADS.slice().sort() };
+out.boot = { appH: appH(), barH: barH(), rafPending: RAF.length };
+// the keyboard slides up: iOS shrinks the visual viewport while innerHeight stands still
+visualViewport.height = 460; fire(VV, 'resize'); flush();
+out.kbUp = { appH: appH(), barH: barH() };
+// the keyboard goes away and NO viewport event arrives: the composer's blur is the only word
+visualViewport.height = 844; fire(CHAT, 'focusout');
+out.blurBeforeFrame = appH();
+flush();
+out.kbDown = { appH: appH(), barH: barH() };
+// resume: backgrounded with the keyboard up; iOS dropped it while the page was frozen, no event delivered
+visualViewport.height = 460; fire(VV, 'resize'); flush();
+document.visibilityState = 'hidden'; fire(DOC, 'visibilitychange');
+const beforeHidden = fits(); flush(); out.hiddenFits = fits() - beforeHidden;
+visualViewport.height = 844; document.visibilityState = 'visible'; fire(DOC, 'visibilitychange'); flush();
+out.resume = { appH: appH(), barH: barH() };
+// resume where iOS reports the FINAL geometry a beat late: the fit at visible reads the stale height,
+// and the visual-viewport resize that follows is what corrects it
+visualViewport.height = 460; fire(VV, 'resize'); flush();
+document.visibilityState = 'hidden'; fire(DOC, 'visibilitychange'); flush();
+document.visibilityState = 'visible'; fire(DOC, 'visibilitychange'); flush();
+out.resumeStale = appH();
+visualViewport.height = 844; fire(VV, 'resize'); flush();
+out.resumeSettled = appH();
+// a burst of events fits ONCE, on the next frame
+const before = fits();
+fire(VV, 'resize'); fire(VV, 'scroll'); fire(WIN, 'resize'); fire(WIN, 'focus'); fire(WIN, 'pageshow'); fire(DOC, 'focusout');
+out.burst = { beforeFlush: fits() - before, pendingRafs: RAF.length };
+flush();
+out.burst.afterFlush = fits() - before;
+// every bound event refits on its own, reading the geometry fresh each time
+const each = {};
+for (const [book, k, tag] of [[WIN, 'focus', ''], [WIN, 'pageshow', ''], [WIN, 'orientationchange', ''], [WIN, 'resize', ''],
+                              [VV, 'scroll', '@vv'], [VV, 'resize', '@vv'], [DOC, 'focusout', '@doc']]) {
+  visualViewport.height = 700; fire(book, k); flush(); const a = appH();
+  visualViewport.height = 844; fire(book, k); flush(); each[k + tag] = [a, appH()];
+}
+out.each = each;
+// a page offset the UA forced (iOS's input reveal) is undone on the same frame
+global.scrollY = 120; let scrolled = null; global.scrollTo = (x, y) => { scrolled = [x, y]; global.scrollY = 0; };
+fire(VV, 'scroll'); flush(); out.scrollReset = scrolled;
+console.log(JSON.stringify(out));
+"""
+
+
+class MobileFitExecutes(unittest.TestCase):
+    """The installed iPhone app came back from the background with the chat pane filling only the
+    top ~60% of the screen: the composer mid-screen, a keyboard-tall blank band under it, the tab
+    bar at the very bottom (the user 2026-09-08). --app-h had been measured while the keyboard was
+    up and nothing re-measured it: the keyboard fell while the page was frozen, so the visual
+    viewport's resize (the only keyboard event the fit listened to) never arrived, and on iOS the
+    same resize sometimes fails to fire for a keyboard the composer's blur dismissed. The fix binds
+    the fit to every event that moves the real viewport (visibilitychange, window focus, the
+    composer's focusout heard through the same-origin pane window, alongside the resize / scroll /
+    orientationchange / pageshow it already had), coalesces a burst to one fit per animation frame,
+    and always recomputes from scratch, so a viewport that grows back is never left short."""
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(_FIT_HARNESS + km._LANDING_MOBILE_JS + _FIT_DRIVER)
+            path = f.name
+        try:
+            r = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
+        finally:
+            os.unlink(path)
+        assert r.returncode == 0, "the mobile script threw: " + r.stderr[:800]
+        cls.out = json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_the_fit_is_bound_to_every_event_that_moves_the_real_viewport(self):
+        b = self.out["bound"]
+        for ev in ("resize", "orientationchange", "pageshow", "focus"):
+            self.assertIn(ev, b["win"], ev)
+        for ev in ("visibilitychange", "focusout"):
+            self.assertIn(ev, b["doc"], ev)
+        self.assertEqual(b["vv"], ["resize", "scroll"])
+        # the composer lives in the chat pane's document: its blur (keyboard dismissal) is heard
+        # through the same-origin pane window, wired now and again on every (re)load
+        self.assertEqual(b["chat"], ["focusout"])
+        self.assertIn("f-chat", b["loads"])
+
+    def test_boot_fits_at_once_from_the_visual_viewport(self):
+        # the first paint is right without waiting a frame; the bar's reservation is measured too
+        self.assertEqual(self.out["boot"], {"appH": "844px", "barH": "44px", "rafPending": 0})
+
+    def test_the_keyboard_shrinks_the_shell_and_the_composers_blur_alone_grows_it_back(self):
+        self.assertEqual(self.out["kbUp"], {"appH": "460px", "barH": "0px"})
+        self.assertEqual(self.out["blurBeforeFrame"], "460px", "events schedule a frame; they do not fit inline")
+        self.assertEqual(self.out["kbDown"], {"appH": "844px", "barH": "44px"})
+
+    def test_coming_back_to_the_foreground_refits_a_keyboard_that_fell_while_hidden(self):
+        self.assertEqual(self.out["hiddenFits"], 0, "going hidden is not new geometry")
+        self.assertEqual(self.out["resume"], {"appH": "844px", "barH": "44px"})
+
+    def test_a_resume_whose_final_geometry_lands_late_is_fitted_twice(self):
+        # belt and braces: the fit at visible reads what iOS reports then; the visual-viewport resize
+        # that follows a beat later is bound permanently, so it is the second fit — no timer
+        self.assertEqual(self.out["resumeStale"], "460px")
+        self.assertEqual(self.out["resumeSettled"], "844px")
+
+    def test_a_burst_of_viewport_events_fits_once_per_frame(self):
+        self.assertEqual(self.out["burst"], {"beforeFlush": 0, "pendingRafs": 1, "afterFlush": 1})
+
+    def test_each_bound_event_refits_from_scratch_on_its_own(self):
+        for ev, seen in self.out["each"].items():
+            self.assertEqual(seen, ["700px", "844px"], ev)
+
+    def test_a_ua_forced_page_offset_is_undone_on_the_same_frame(self):
+        self.assertEqual(self.out["scrollReset"], [0, 0])
+
+
+# A node stand-in for the installed phone app with a REAL class list: the shell's mobile script and
+# its bell script run in the shell's own order against a stub DOM whose elements keep classes,
+# attributes and listeners, so the bell's `.on` (the slash rule keys on its absence) is state read
+# back after each transition — a tab tap, a reveal, the kernel's notifyAll frame, the popover's own
+# switches — not a pin on the source text. Same shape as the fit harness above.
+_BELL_HARNESS = r"""
+'use strict';
+class El {
+  constructor(tag, attrs) { this.tag = tag; this.attrs = Object.assign({}, attrs || {}); this.children = []; this.parentNode = null;
+    this.hidden = false; this.style = {}; this.textContent = ''; this.disabled = false; this.L = {}; this.contentDocument = null;
+    const cls = new Set((this.attrs['class'] || '').split(/\s+/).filter(Boolean));
+    this.classList = { add: (c) => cls.add(c), remove: (c) => cls.delete(c), contains: (c) => cls.has(c),
+      toggle: (c, f) => { const on = f === undefined ? !cls.has(c) : !!f; if (on) cls.add(c); else cls.delete(c); return on; } }; }
+  get id() { return this.attrs.id || ''; }
+  append(...k) { k.forEach((c) => { c.parentNode = this; this.children.push(c); }); return this; }
+  getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+  setAttribute(k, v) { this.attrs[k] = String(v); }
+  addEventListener(k, f) { (this.L[k] = this.L[k] || []).push(f); }
+  fire(k, ev) { const e = Object.assign({ target: this }, ev || {}); for (let n = this; n; n = n.parentNode) (n.L[k] || []).forEach((f) => f(e)); }
+  all() { return this.children.flatMap((c) => [c, ...c.all()]); }
+  matches(sel) {                                   // one compound selector: tag, #id, .class, [attr], [attr=val]
+    const m = sel.match(/^([a-z]*)((?:[#.][\w-]+|\[[\w-]+(?:=[\w-]+)?\])*)$/); if (!m) throw new Error('selector ' + sel);
+    if (m[1] && m[1] !== this.tag) return false;
+    for (const p of m[2].match(/[#.][\w-]+|\[[^\]]+\]/g) || []) {
+      if (p[0] === '#') { if (this.id !== p.slice(1)) return false; }
+      else if (p[0] === '.') { if (!this.classList.contains(p.slice(1))) return false; }
+      else { const [k, v] = p.slice(1, -1).split('='); if (!(k in this.attrs) || (v !== undefined && this.attrs[k] !== v)) return false; } }
+    return true; }
+  querySelectorAll(sel) { const parts = sel.split(',').map((s) => s.trim()); return this.all().filter((e) => parts.some((p) => e.matches(p))); }
+  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  getBoundingClientRect() { return { top: 800, right: 380, bottom: 844, left: 340 }; }
+}
+// the shell's markup, reduced to the nodes the two scripts touch
+const root = new El('html'), body = new El('body'); root.append(body);
+['f-chat', 'f-fleet', 'f-feed', 'f-timeline'].forEach((id) => { const p = new El('iframe', { id }); p.contentWindow = { addEventListener() {} }; body.append(p); });
+const railBell = new El('div', { class: 'rail-act', id: 'rail-bell' }); railBell.hidden = true;
+body.append(new El('div', { class: 'rail-acts' }).append(railBell));
+const bar = new El('nav', { id: 'mtabs' }); bar.offsetHeight = 44;
+['chat', 'fleet', 'feed', 'timeline'].forEach((k) => bar.append(new El('button', k === 'chat' ? { 'data-pane': k, class: 'on' } : { 'data-pane': k })));
+bar.append(new El('span', { class: 'mtabs-div' }));
+['usage', 'net', 'restart', 'errs'].forEach((a) => bar.append(new El('button', { class: 'mact', 'data-act': a })));
+const mbell = new El('button', { class: 'mact', id: 'mbell' }); mbell.hidden = true; bar.append(mbell);
+bar.append(new El('button', { class: 'mact', 'data-act': 'settings' }));
+body.append(bar);
+const back = new El('div', { id: 'rbell-back' }); back.hidden = true;
+const pop = new El('div', { id: 'rbell-pop' }), rows = {};
+['all', 'dev', 'turns'].forEach((a) => { rows[a] = new El('div', { class: 'rbp-row', 'data-act': a }).append(new El('span', { class: 'rbp-sw' })); pop.append(rows[a]); });
+pop.append(new El('div', { id: 'rbp-dev-sub' }), new El('button', { id: 'rbp-test', 'data-act': 'test' }), new El('div', { id: 'rbp-test-out' }));
+back.append(pop); body.append(back);
+// the window: a coarse pointer, a live shell socket the driver feeds frames into
+const WIN = {}, WSS = [], POSTS = [];
+const on = (book) => (k, f) => { (book[k] = book[k] || []).push(f); };
+global.window = global;
+global.innerHeight = 844; global.innerWidth = 390; global.scrollY = 0; global.scrollTo = () => {};
+global.matchMedia = () => ({ matches: true });
+global.requestAnimationFrame = () => 1;
+global.addEventListener = on(WIN);
+global.visualViewport = { height: 844, scale: 1, addEventListener() {} };
+global.document = { visibilityState: 'visible', addEventListener() {}, body,
+  documentElement: { scrollTop: 0, style: { setProperty() {} } },
+  getElementById: (id) => root.querySelector('#' + id),
+  querySelectorAll: (s) => root.querySelectorAll(s), querySelector: (s) => root.querySelector(s) };
+global.localStorage = { getItem: () => null, setItem() {} };
+global.location = { protocol: 'https:', host: 'TESTHOST' };
+global.WebSocket = class { constructor(u) { this.url = u; WSS.push(this); } send() {} };
+// the Push API: this browser holds a subscription at boot; the popover's row can drop and re-take it
+let SUB = null;
+const mkSub = (n) => ({ endpoint: 'https://push.example/dev-' + n, unsubscribe() { SUB = null; return Promise.resolve(true); }, toJSON() { return { endpoint: this.endpoint }; } });
+SUB = mkSub(1);
+const REG = { pushManager: { getSubscription: () => Promise.resolve(SUB), subscribe: () => { SUB = mkSub(2); return Promise.resolve(SUB); } } };
+Object.defineProperty(global, 'navigator', { configurable: true, value:   // node 22's own navigator is a getter-only global
+  { serviceWorker: { getRegistration: () => Promise.resolve(REG), register: () => Promise.resolve(REG), ready: Promise.resolve(REG) } } });
+global.PushManager = function () {};
+global.Notification = { permission: 'granted', requestPermission: () => Promise.resolve('granted') };
+const GETS = { '/notify-all': { on: true }, '/notify-turns': { on: false }, '/push/vapid-key': { key: 'BAAA' } };
+global.fetch = (path, init) => { const post = !!(init && init.method === 'POST'); if (post) POSTS.push([path, JSON.parse(init.body)]);
+  const b = post ? { ok: true } : (GETS[path] || {});
+  return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(b), text: () => Promise.resolve(JSON.stringify(b)) }); };
+"""
+_BELL_DRIVER = r"""
+const settle = async () => { for (let i = 0; i < 40; i++) await new Promise((r) => setImmediate(r)); };
+const sw = (k) => rows[k].querySelector('.rbp-sw').classList.contains('on');
+const state = () => ({ mbell: mbell.classList.contains('on'), rail: railBell.classList.contains('on'),
+  title: [mbell.getAttribute('title'), railBell.getAttribute('title')], rows: { all: sw('all'), dev: sw('dev') },
+  tabs: bar.querySelectorAll('button[data-pane]').filter((b) => b.classList.contains('on')).map((b) => b.getAttribute('data-pane')) });
+const ws = () => WSS[WSS.length - 1];
+const frame = (m) => ws().onmessage({ data: JSON.stringify(m) });
+const post = (m) => (WIN.message || []).forEach((f) => f({ data: m }));
+(async () => {
+  const out = {};
+  (0, eval)(MOBILE_JS); (0, eval)(PUSH_JS);          // the shell's order: the tab bar's script parses first, the bell's after it
+  out.revealed = { mbell: !mbell.hidden, rail: !railBell.hidden };
+  await settle();
+  out.boot = state();                                // master on + subscribed: lit, and no popover was opened
+  bar.querySelector('button[data-pane=feed]').fire('click'); out.tabTap = state();
+  post({ romp: 'reveal', pane: 'chat' });            out.revealMsg = state();
+  frame({ type: 'reveal', pane: 'timeline' });       out.revealFrame = state();
+  post({ romp: 'toggleFleet', to: 'fleet' });        out.listJump = state();   // the chat header's jump to the sessions list
+  frame({ type: 'notifyAll', on: false }); out.masterOffFrame = state();
+  frame({ type: 'notifyAll', on: true });  out.masterOnFrame = state();
+  rows.dev.fire('click'); await settle(); out.devOff = state();          // the popover's This-device row: unsubscribes
+  bar.querySelector('button[data-pane=chat]').fire('click'); out.devOffTabTap = state();
+  rows.dev.fire('click'); await settle(); out.devOn = state();           // …and re-subscribes
+  rows.all.fire('click'); await settle(); out.masterOffRow = state();    // the master row itself
+  rows.all.fire('click'); await settle(); out.masterOnRow = state();
+  bar.querySelector('button[data-pane=feed]').fire('click'); out.finalTabTap = state();
+  out.posts = POSTS.map((p) => p[0]);
+  console.log(JSON.stringify(out));
+})().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+class MobileBellExecutes(unittest.TestCase):
+    """The installed iPhone app, light theme (the user 2026-09-08): the bell popover showed all three
+    switches on — Notifications, This device, the turn-finished one — while the tab bar's bell wore
+    the OFF slash. The bell script paints `.on` on both bells from the master + this device's
+    subscription and was right at boot; then the tab bar's switcher took it away. `show(p)` ran over
+    EVERY button in #mtabs — the pane tabs, the action buttons and the bell among them — toggling
+    `.on` to `data-pane===p`, which for the bell (no data-pane) is always off. So every pane switch
+    (a tab tap, a notification's reveal, the chat header's jump to the sessions list) slashed a subscribed bell until the next
+    paint event, while the popover's rows, painted from the same state, still said on. The switcher
+    now owns only the pane tabs (`button[data-pane]`); the bell's class is the bell script's alone."""
+
+    @classmethod
+    def setUpClass(cls):
+        src = "const MOBILE_JS=%s;const PUSH_JS=%s;" % (json.dumps(km._LANDING_MOBILE_JS), json.dumps(km._LANDING_PUSH_JS))
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(_BELL_HARNESS + src + _BELL_DRIVER)
+            path = f.name
+        try:
+            r = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
+        finally:
+            os.unlink(path)
+        assert r.returncode == 0, "the shell scripts threw: " + r.stderr[:1200]
+        cls.out = json.loads(r.stdout.strip().splitlines()[-1])
+
+    LIT = "Notifications on — tap for options"
+
+    def _lit(self, s, where):
+        self.assertEqual((s["mbell"], s["rail"]), (True, True), where + ": both bells lit")
+        self.assertEqual(s["title"], [self.LIT, self.LIT], where)
+
+    def test_boot_lights_a_subscribed_device_without_opening_the_popover(self):
+        self.assertEqual(self.out["revealed"], {"mbell": True, "rail": True}, "the Push API exists here: both bells show")
+        s = self.out["boot"]
+        self._lit(s, "boot")
+        self.assertEqual(s["rows"], {"all": True, "dev": True})
+        self.assertEqual(s["tabs"], ["chat"])
+
+    def test_a_pane_switch_leaves_the_bell_alone(self):
+        # the bug: a tab tap (and every other route into show()) stripped `.on` from the bell while
+        # the popover's rows still said on — the glyph and the popover disagreed
+        for where in ("tabTap", "revealMsg", "revealFrame", "listJump"):
+            s = self.out[where]
+            self._lit(s, where)
+            self.assertEqual(s["rows"], {"all": True, "dev": True}, where)
+        self.assertEqual(self.out["tabTap"]["tabs"], ["feed"], "the tap still switches the pane")
+        self.assertEqual(self.out["revealMsg"]["tabs"], ["chat"])
+        self.assertEqual(self.out["revealFrame"]["tabs"], ["timeline"])
+        self.assertEqual(self.out["listJump"]["tabs"], ["fleet"])
+
+    def test_the_kernels_master_frame_repaints_both_bells(self):
+        off = self.out["masterOffFrame"]
+        self.assertEqual((off["mbell"], off["rail"]), (False, False))
+        self.assertEqual(off["title"], ["Notifications off for all devices"] * 2)
+        self.assertEqual(off["rows"], {"all": False, "dev": True}, "the device row keeps its own truth")
+        self._lit(self.out["masterOnFrame"], "masterOnFrame")
+
+    def test_this_devices_switch_slashes_and_relights_both_bells_and_a_tab_tap_keeps_the_slash(self):
+        off = self.out["devOff"]
+        self.assertEqual((off["mbell"], off["rail"]), (False, False))
+        self.assertEqual(off["title"], ["Notifications off on this device"] * 2)
+        self.assertEqual(off["rows"], {"all": True, "dev": False})
+        # a pane switch with the device off must not light it either: the switcher paints nothing on the bell
+        tap = self.out["devOffTabTap"]
+        self.assertEqual((tap["mbell"], tap["rail"], tap["tabs"]), (False, False, ["chat"]))
+        self.assertEqual(tap["title"], ["Notifications off on this device"] * 2)
+        self._lit(self.out["devOn"], "devOn")
+        self.assertEqual(self.out["devOn"]["rows"], {"all": True, "dev": True})
+
+    def test_the_master_row_and_a_final_tab_tap(self):
+        off = self.out["masterOffRow"]
+        self.assertEqual((off["mbell"], off["rail"]), (False, False))
+        self.assertEqual(off["title"], ["Notifications off for all devices"] * 2)
+        self._lit(self.out["masterOnRow"], "masterOnRow")
+        self._lit(self.out["finalTabTap"], "finalTabTap")
+        self.assertEqual(self.out["finalTabTap"]["tabs"], ["feed"])
+        self.assertEqual(self.out["posts"], ["/push/unsubscribe", "/push/subscribe", "/notify-all", "/notify-all"])
+
+    def test_the_switcher_selects_only_the_pane_tabs(self):
+        js = km._LANDING_MOBILE_JS
+        self.assertIn("var B=bar.querySelectorAll('button[data-pane]')", js)
+        self.assertNotIn("bar.querySelectorAll('button'),", js)
 
 
 if __name__ == "__main__":

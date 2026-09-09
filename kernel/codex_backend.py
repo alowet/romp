@@ -1103,33 +1103,18 @@ class CodexBackend:
                 # verification — the r28 kernel-layer reorder missed this layer)
                 s.name = old_name
                 raise
-            nf = self.state / "names" / s.sid
-            try:
-                old_line = nf.read_bytes()
-            except OSError:
-                old_line = None
             try:
                 self._write_name(s)       # keep the shared identity file in sync (colours preserved)
             except BaseException:
                 s.name = old_name         # compensate: the registry write above is re-run with
                 #                           the old name so the stores stay agreed; the raise
                 #                           still reaches the caller (loud)
-                if old_line is not None:
-                    try:
-                        nf.write_bytes(old_line)   # write_text TRUNCATES before it fails — an
-                        #                            ENOSPC left the identity file (and its
-                        #                            colours) empty (the r29 verification)
-                    except OSError as e2:
-                        self.log("codex rename: names/%s left truncated by a failed write (%s)"
-                                 % (s.sid, e2))
-                else:
-                    try:
-                        nf.unlink(missing_ok=True)  # _write_name may have CREATED a partial file
-                        #                             holding the NEW name — a failed rename must
-                        #                             not stay published (the r30 verification)
-                    except OSError as e2:
-                        self.log("codex rename: a partial names/%s could not be removed (%s)"
-                                 % (s.sid, e2))
+                # No restore write for the names file: _write_name is tmp + os.replace and removes
+                # its own temp (the r32 shape), so a raise leaves names/<sid> exactly as it was — and
+                # creates nothing when there was no file. The in-place nf.write_bytes the r29/r30
+                # branches carried predates that: it was the one non-atomic write on this path, an
+                # mtime bump for no content change, and under the very ENOSPC it existed for it
+                # truncated a good file to nothing, then blamed "a failed write" (review, 2026-09-08).
                 try:
                     self._save_registry(s, fields=("name",))
                 except Exception as e2:
@@ -1188,34 +1173,27 @@ class CodexBackend:
                 s.norm = None
             self._ensure_norm(s)
             self.transcript_path(s.sid).touch()
-            nf = self.state / "names" / s.sid
-            try:
-                old_line = nf.read_bytes()
-            except OSError:
-                old_line = None
             try:
                 self._write_name(s)
             except (OSError, UnicodeDecodeError) as e:
                 # the thread is HEALTHY — failing the turn over a cosmetic identity write would
                 # be worse (a decode failure from crash residue sailed through an OSError-only
-                # catch and DID fail the turn, unhealed forever — the r31 verification) — but
-                # the write must not leave residue either. Restore the old line, or remove the
-                # partial file.
-                try:
-                    if old_line is not None:
-                        nf.write_bytes(old_line)
-                        self.log("codex: names/%s write failed after thread start (%s) — the "
-                                 "identity file was restored; it refreshes on the next rename"
-                                 % (s.sid, e))
-                    else:
-                        nf.unlink(missing_ok=True)
-                        self.log("codex: names/%s could not be published after thread start "
-                                 "(%s) — the session runs UNNAMED on shared surfaces until a "
-                                 "rename lands; a same-name create may collide meanwhile"
-                                 % (s.sid, e))
-                except OSError:
-                    self.log("codex: names/%s left in an unknown state by a failed write (%s)"
-                             % (s.sid, e))
+                # catch and DID fail the turn, unhealed forever — the r31 verification). No
+                # restore write for the names file: _write_name is tmp + os.replace and removes
+                # its own temp (the r32 shape), so a raise leaves names/<sid> exactly as it was —
+                # and creates nothing when there was no file. The in-place nf.write_bytes(old_line)
+                # this branch carried predates that: it was the one non-atomic write on this path,
+                # an mtime bump for no content change, and under the very ENOSPC it existed for it
+                # truncated a good file to nothing, then blamed "a failed write" (#1138 dropped the
+                # same shape from rename; this is its twin, 2026-09-09). The log still says which
+                # of the two states the file is in — READ after the fact, never rewritten.
+                if (self.state / "names" / s.sid).is_file():
+                    self.log("codex: names/%s write failed after thread start (%s) — the identity "
+                             "file kept its old line; it refreshes on the next rename" % (s.sid, e))
+                else:
+                    self.log("codex: names/%s could not be published after thread start (%s) — "
+                             "the session runs UNNAMED on shared surfaces until a rename lands; "
+                             "a same-name create may collide meanwhile" % (s.sid, e))
             self.push()
             return True
         c.thread_resume(tid, {"cwd": cwd, **_approval_params(s.mode),

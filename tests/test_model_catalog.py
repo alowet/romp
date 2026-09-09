@@ -210,17 +210,19 @@ class FetchAndFallback(unittest.TestCase):
         self.td = tempfile.TemporaryDirectory()
         self._state = jd.STATE
         jd.STATE = Path(self.td.name)
-        self._url, self._fn = km.MODELS_API_URL, getattr(jd, "_WORK_KEY_FN", None)
+        self._url = km.MODELS_API_URL
         self._login_fn = jd._LOGIN_AUTH_ENV_FN
         jd._LOGIN_AUTH_ENV_FN = None
-        self._source_env = {k: os.environ.get(k) for k in
-                            ("ROMP_SERVICE_ENV_FILE", "ROMP_API_KEY_REF", "ANTHROPIC_AUTH_TOKEN")}
-        os.environ["ROMP_SERVICE_ENV_FILE"] = str(Path(self.td.name) / "service.env")
-        os.environ.pop("ROMP_API_KEY_REF", None)
+        self._source_env = {k: os.environ.get(k) for k in ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CONFIG_DIR")}
         os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-        self._env_key = os.environ.get("ANTHROPIC_API_KEY")
-        os.environ["ANTHROPIC_API_KEY"] = "synthetic-test-credential"   # the fake sees only this (never a key-shaped string: the pre-commit scanner)
-        jd._WORK_KEY_FN = None
+        # The kernel's credential is Claude Code's apiKeyHelper, run in-process (2026-09-08): a fixture helper
+        # in a per-test CLAUDE_CONFIG_DIR prints a synthetic value (never key-shaped: the pre-commit scanner)
+        # and counts its runs, so the memo and the "never persisted" property can be asserted.
+        self.cfg = tempfile.mkdtemp()
+        os.environ["CLAUDE_CONFIG_DIR"] = self.cfg
+        self.helper_runs = Path(self.cfg) / "runs"
+        self._helper("#!/bin/sh\nprintf '.' >> '%s'\necho synthetic-test-credential\n" % self.helper_runs)
+        km.jd._cred.forget_helper_key()
         km.MODELS_API_URL = "http://127.0.0.1:%d/v1/models" % self.port
         _FakeModelsAPI.rows, _FakeModelsAPI.status, _FakeModelsAPI.page_size = list(FAKE_ROWS), 200, 100
         _FakeModelsAPI.seen = []
@@ -230,19 +232,29 @@ class FetchAndFallback(unittest.TestCase):
     def tearDown(self):
         _reset_catalog()
         km.MODELS_API_URL = self._url
-        jd._WORK_KEY_FN = self._fn
         jd._LOGIN_AUTH_ENV_FN = self._login_fn
+        km.jd._cred.forget_helper_key()
         for key, value in self._source_env.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-        if self._env_key is None:
-            os.environ.pop("ANTHROPIC_API_KEY", None)
-        else:
-            os.environ["ANTHROPIC_API_KEY"] = self._env_key
         jd.STATE = self._state
         self.td.cleanup()
+
+    def _helper(self, body):
+        """(Re)write the fixture helper Claude Code's user settings name."""
+        script = Path(self.cfg) / "helper.sh"
+        script.write_text(body)
+        script.chmod(0o700)
+        (Path(self.cfg) / "settings.json").write_text(json.dumps({"apiKeyHelper": str(script)}))
+        km.jd._cred.forget_helper_key()
+
+    def _runs(self):
+        try:
+            return len(self.helper_runs.read_text())
+        except OSError:
+            return 0
 
     def _clients(self):
         """Fake dashboard clients on the kernel's client list — one per app that hosts a picker — so the
@@ -306,50 +318,39 @@ class FetchAndFallback(unittest.TestCase):
         self.assertIn("URLError", km._catalog_status["lastError"])
         self.assertIn("Models API unreachable", log)
 
-    def test_no_credential_says_so_and_serves_the_seed(self):
-        os.environ.pop("ANTHROPIC_API_KEY", None)
-        os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+    def test_no_helper_says_so_and_serves_the_seed(self):
+        os.unlink(Path(self.cfg) / "settings.json")
+        km.jd._cred.forget_helper_key()
         started, log = self._refresh("boot")
         self.assertTrue(started)
         self.assertEqual(_FakeModelsAPI.seen, [], "no request without a credential")
-        self.assertIn("no API credential", km._catalog_status["lastError"])
-        self.assertIn("no API credential the kernel can use", log)
+        self.assertIn("no apiKeyHelper", km._catalog_status["lastError"])
+        self.assertIn("no apiKeyHelper in Claude Code's settings for the kernel to run", log)
         self.assertEqual(km.MODEL_VERSIONS["fable"][0]["value"], "claude-fable-5-1", "seed still serves")
 
-    def test_provider_failure_never_falls_back_to_an_ambient_key_or_token(self):
+    def test_a_failing_helper_never_falls_back_to_an_ambient_token_and_says_only_static_words(self):
         os.environ["ANTHROPIC_AUTH_TOKEN"] = "synthetic-ambient-token"
-        jd._WORK_KEY_FN = Mock(side_effect=jd._keysrc.KeySourceError("1Password retrieval failed"))
+        self._helper("#!/bin/sh\necho 'this line would be a secret' >&2\nexit 1\n")
         started, log = self._refresh()
         self.assertTrue(started)
-        jd._WORK_KEY_FN.assert_called_once_with()
         self.assertEqual(_FakeModelsAPI.seen, [])
-        self.assertIn("1Password retrieval failed", km._catalog_status["lastError"])
+        self.assertIn("apiKeyHelper failed", km._catalog_status["lastError"])
         self.assertNotIn("synthetic-ambient-token", log)
-        self.assertNotIn("synthetic-test-credential", log)
+        self.assertNotIn("would be a secret", log, "the helper's stderr is discarded, never logged")
         self.assertFalse(km._catalog_status["inflight"])
 
-    def test_runtime_reference_is_resolved_once_per_catalog_refresh_without_persistence(self):
-        ref = "op://test-vault/test-item/api-key"
-        os.environ["ROMP_API_KEY_REF"] = ref
-        with patch.object(jd._keysrc.subprocess, "run",
-                          return_value=Mock(returncode=0, stdout=b"synthetic-runtime-key")) as run:
-            self._refresh()
-            self.assertEqual(run.call_count, 1)
-            self._refresh()
-            self.assertEqual(run.call_count, 2)
+    def test_the_helper_runs_once_per_ttl_and_its_value_is_never_persisted(self):
+        self._refresh()
+        self.assertEqual(self._runs(), 1)
+        self._refresh()
+        self.assertEqual(self._runs(), 1, "within the TTL the in-memory memo answers")
+        km.jd._cred.forget_helper_key()
+        self._refresh()
+        self.assertEqual(self._runs(), 2, "past the TTL (or a changed helper) it runs again")
         self.assertTrue(_FakeModelsAPI.seen)
         for file in Path(self.td.name).rglob("*"):
             if file.is_file():
-                self.assertNotIn(b"synthetic-runtime-key", file.read_bytes())
-
-    def test_invalid_reference_prevents_requests_and_does_not_use_legacy_key(self):
-        Path(os.environ["ROMP_SERVICE_ENV_FILE"]).write_text("ROMP_API_KEY_REF=\n")
-        with patch.object(jd._keysrc.subprocess, "run") as run:
-            started, _ = self._refresh()
-        self.assertTrue(started)
-        run.assert_not_called()
-        self.assertEqual(_FakeModelsAPI.seen, [])
-        self.assertIn("ROMP_API_KEY_REF", km._catalog_status["lastError"])
+                self.assertNotIn(b"synthetic-test-credential", file.read_bytes(), "never on disk")
 
     def test_a_fetch_that_adds_ids_tells_every_open_picker_to_re_read_models(self):
         # the refresh used to call _push_soon() here, its comment claiming the pickers re-read /models
