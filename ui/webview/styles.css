@@ -1386,6 +1386,12 @@ body.chat-theme-yatharth .meta-btn.mode-risky, body.chat-theme-yatharth .meta-it
   color: var(--fg); position: relative; white-space: nowrap;
 }
 .meta-item:hover { background: var(--menu-hover); }   /* the themed row wash (T226) */
+/* the one row a Codex menu shows when it has no list: a statement, not a choice, so no pointer
+   and no hover wash; its sub-line carries the kernel's reason, which wraps: a reason is a sentence, and
+   .meta-item's nowrap would run it past the panel's edge */
+.meta-item.meta-empty { cursor: default; white-space: normal; max-width: 280px; }
+.meta-item.meta-empty:hover { background: none; }
+.meta-item-sub .meta-dots { margin-left: 5px; vertical-align: middle; }   /* the wait's loader dots, beside the text */
 /* second line for a choice whose consequence its label doesn't carry (Bypass permissions). Same
    0.82em / 0.6 opacity as .ctx-item-sub — one sub-line size across every romp menu. */
 .meta-item-sub { font-size: 0.82em; opacity: 0.6; }

@@ -12592,6 +12592,13 @@ const EFFORT_CHOICES: { label: string; value: string; color?: number[] | null }[
 // run: an empty model menu beats offering another vendor's models (docs/codex.md).
 const CODEX_MODEL_CHOICES: { label: string; value: string; color?: number[] | null }[] = [];
 const CODEX_EFFORT_CHOICES: { label: string; value: string; color?: number[] | null }[] = [];
+// Why the Codex list is empty, when it is: the payload's `codex.error` (the app-server client not up yet,
+// a failed model list, no live Codex session). A Codex menu with no list shows it in place of a
+// blank menu. "" while a list is held or the field is absent.
+let CODEX_MODELS_ERROR = "";
+// Set by an open menu that found its list empty: called once per applied /models read so the menu can
+// rebuild with the list that just landed, or show the fresh reason. Cleared with the menu (closeMetaMenu).
+let onModelChoicesLoaded: (() => void) | null = null;
 // Loaded at page load and RE-LOADED on the kernel's {type:"models"} frame — the pick memory moved (a
 // version pinned, a family un-pinned by Latest, a refused pin dropped; from this tab, another dashboard,
 // or the kernel itself) or the catalog grew. A family's `default` is what its row SENDS, so a list
@@ -12604,14 +12611,24 @@ const CODEX_EFFORT_CHOICES: { label: string; value: string; color?: number[] | n
 // until the next change. A payload without a rev (an older kernel) always applies.
 let modelChoicesRev = -1;
 function loadModelChoices(): void {
-  fetch(kernelUrl("/models"), { cache: "no-store" }).then((r) => r.json()).then((d) => {
+  // a non-2xx (a 403 from a token the kernel refused, a 500) answers with an empty or text body, and
+  // .json() on it read as a bare parse message ("Unexpected end of JSON input"); name the status instead
+  fetch(kernelUrl("/models"), { cache: "no-store" }).then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }).then((d) => {
     if (typeof d.rev === "number") { if (d.rev < modelChoicesRev) return; modelChoicesRev = d.rev; }
     if (Array.isArray(d.models)) { MODEL_CHOICES.length = 0; MODEL_CHOICES.push(...d.models, { label: "Default", value: "default" }); }
     if (Array.isArray(d.efforts)) { EFFORT_CHOICES.length = 0; EFFORT_CHOICES.push(...d.efforts); }
     if (d.codex && Array.isArray(d.codex.models)) { CODEX_MODEL_CHOICES.length = 0; CODEX_MODEL_CHOICES.push(...d.codex.models); }
     if (d.codex && Array.isArray(d.codex.efforts)) { CODEX_EFFORT_CHOICES.length = 0; CODEX_EFFORT_CHOICES.push(...d.codex.efforts); }
+    if (d.codex) CODEX_MODELS_ERROR = typeof d.codex.error === "string" ? d.codex.error : "";
     if (d.commentDefaults) adoptCommentDefaults(d.commentDefaults);
-  }).catch(() => { /* picker stays as it was until it lands */ });
+    if (onModelChoicesLoaded) onModelChoicesLoaded();   // once per APPLIED read: a response the rev check dropped never fires it
+  }).catch((e) => {
+    // A menu waiting on this read hears that it failed: its row would otherwise keep promising an answer
+    // that was never coming. With no menu waiting, the picker stays as it was until a read lands.
+    if (!onModelChoicesLoaded) return;
+    CODEX_MODELS_ERROR = "could not read the model list: " + (e instanceof Error ? e.message : String(e));
+    onModelChoicesLoaded();
+  });
 }
 loadModelChoices();
 // The kernel's default-comment settings, RAW ("session" = same as the session — the user 2026-08-29):
@@ -12803,6 +12820,7 @@ function metaDots(): HTMLElement {
 function metaButton(kind: MetaKind, text: string, forSid?: string | null): HTMLElement {
   const btn = el("span", "meta-btn");
   btn.dataset.kind = kind;
+  if (forSid) btn.dataset.sid = forSid;   // a popover's badges name their thread; the chat's carry no session (metaAnchor)
   if (kind === "mode") {   // the permission glyph, always beside its text (never instead of it)
     const ico = el("span", "meta-ico mode-ico");
     ico.innerHTML = modeIconSvg(text);   // refreshed by the sync loop below from st.mode
@@ -12896,6 +12914,20 @@ function closeMetaMenu() {
   document.querySelectorAll(".meta-sub").forEach((n) => n.remove());   // an open version submenu goes with its menu
   metaMenuEl?.remove();
   metaMenuEl = null;
+  onModelChoicesLoaded = null;   // the rebuild hook belongs to the menu it was set for
+}
+// The badge a menu anchors to, as it stands NOW: `btn` while it is still in the document, else the connected
+// badge of the same kind for the same session (a popover's by data-sid; the chat's carry none) that the last
+// statusline rebuild put in its place, else null. updateStatusline builds a fresh spinner-meta on every
+// kernel push, so a button captured at open is often detached by the time a deferred rebuild wants it, and
+// a menu placed from a detached element's rect (all zeros) lands off-screen. A null says: leave the menu
+// closed; the next open builds against a live badge.
+function metaAnchor(kind: MetaKind, forSid: string | null | undefined, btn: HTMLElement): HTMLElement | null {
+  if (btn.isConnected) return btn;
+  const want = forSid || "";
+  const found = (Array.from(document.querySelectorAll(".meta-btn")) as HTMLElement[])
+    .find((b) => b.dataset.kind === kind && (b.dataset.sid || "") === want && b.isConnected);
+  return found || null;
 }
 function toggleMetaMenu(kind: MetaKind, btn: HTMLElement, forSid?: string | null) {
   const wasOpen = metaMenuEl?.dataset.kind === kind;
@@ -12933,7 +12965,43 @@ function toggleMetaMenu(kind: MetaKind, btn: HTMLElement, forSid?: string | null
   // An sdkOnly entry is dropped on tmux rather than shown-and-refused: the backend cannot apply it,
   // and a menu that lists a mode you can't have is worse than one that doesn't. Codex sessions read
   // their own vocabulary via metaChoices (docs/codex.md) before the same filter.
-  for (const c of metaChoices(kind, s.status).filter((c) => !c.sdkOnly || s.status.backend === "sdk")) {
+  const rows = metaChoices(kind, s.status).filter((c) => !c.sdkOnly || s.status.backend === "sdk");
+  if (!rows.length && s.status.backend === "codex" && (kind === "model" || kind === "effort")) {
+    // A Codex menu with no list says why instead of opening blank: the badge above it shows the
+    // session's default while the list under it is empty. The reason is the kernel's `codex.error`. The
+    // open itself re-reads the list (one fetch): a held reason may be stale, and a dashboard loaded before
+    // the first Codex session holds none; the row waits with the dots only while no reason is held. When
+    // the read lands the menu rebuilds with the list, or the row shows the fresh reason. A statement, not
+    // a choice: it takes no click and no focus.
+    const empty = el("div", "meta-item meta-empty");
+    const head = el("div");
+    head.textContent = kind === "model" ? "No model list from Codex" : "No effort list from Codex";
+    const sub = el("div", "meta-item-sub");
+    sub.textContent = CODEX_MODELS_ERROR || "asking for the list now";
+    if (!CODEX_MODELS_ERROR) sub.appendChild(metaDots());   // a wait wears the loader's dots
+    empty.append(head, sub);
+    menu.appendChild(empty);
+    onModelChoicesLoaded = () => {
+      if (metaMenuEl !== menu) return;
+      // The chat's badges carry no session, so a menu opened on a tab that dismissSession has since removed
+      // (activeId moves to the most recent survivor there, without setActive's closeMetaMenu) cannot be told
+      // from the survivor's menu by its badge: it would re-anchor on the survivor's badge of the same kind,
+      // or write the stale reason row over the survivor's tab. Close it instead; a thread's popover names
+      // its own sid and is never the active tab, so its rebuild below is unchanged.
+      if (!forThread && activeId !== opSid) { closeMetaMenu(); return; }
+      const now = metaChoices(kind, s.status).filter((c) => !c.sdkOnly || s.status.backend === "sdk");
+      if (!now.length) { sub.textContent = CODEX_MODELS_ERROR || (kind === "model" ? "no model list yet" : "no effort list yet"); return; }   // textContent drops the dots
+      // The list landed: rebuild against the badge as it stands now, not the one captured at open. The spawn
+      // that makes the list readable also pushes, and every push rebuilds the statusline, so the captured
+      // button is often detached by the time the re-read lands; with no live badge for this kind and session
+      // (the popover closed, the statusline emptied) the menu stays closed and the next open reads the list.
+      closeMetaMenu();
+      const anchor = metaAnchor(kind, forSid, btn);
+      if (anchor) toggleMetaMenu(kind, anchor, forSid);
+    };
+    loadModelChoices();
+  }
+  for (const c of rows) {
     const item = el("div", "meta-item" + (isCurrentMeta(kind, s.status, c.value) ? " current" : ""));
     item.tabIndex = 0;
     const rowIco = kind === "mode" ? el("span", "meta-ico mode-ico") : null;
