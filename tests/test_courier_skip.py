@@ -303,6 +303,39 @@ class CourierSkip(_World):
         self.assertEqual(self.run_pass(), (3, 0, 3), "second pass: nothing to place, no repair open, all recorded")
         self.assertEqual(self.run_pass(), (0, 3, 0), "third pass: all skipped")
 
+    def test_a_segment_placed_under_a_shifted_key_is_not_queued_and_the_session_records(self):
+        # DRIFT (measured live, 2026-09-09): a peer segment whose parse t shifted after its placement was
+        # recorded is no exact member of placements, so the scan queued it every pass; the placement loop
+        # then loaded the store (a writer load per row per pass) and dropped the row through _placed_key
+        # unwritten. Every such session stayed unrecorded, and the courier's loads per pass did not fall.
+        # The scan applies the same drift-tolerant rule: no row, no load, the session records and skips.
+        path = self.proj_dir / (A + ".jsonl")
+        session = jd.parsed_session(A, [str(path)], T0 + 200)
+        fresh = jd.load_goals(A)
+        seg = next(sg for tn in session["turns"] for sg in jd._segs(tn, fresh) if (jd._seg_peer(sg) or ("",))[0])
+        sid, t, texthash = seg["id"].rsplit(":", 2)
+        shifted = "%s:%d:%s" % (sid, int(t) + 7, texthash)          # the same segment, recorded seven seconds later
+        self.assertTrue(jd._placed_key({shifted: "x"}, seg["id"]), "premise: the drift-tolerant rule matches")
+        top = {"id": A + ":g1", "text": "Look after the subnet", "parentId": None, "nodeComplete": False,
+               "blocked": False, "cleared": False, "trail": [], "t": T0,
+               "origin": {"peer": SENDER, "goalId": SENDER + ":g1", "msgId": self.mid_of[A][0]}}
+        jd.GOALDIR.mkdir(parents=True, exist_ok=True)
+        (jd.GOALDIR / (A + ".json")).write_text(json.dumps(
+            {"rompUuid": A, "seq": 1, "lastNode": top["id"], "closedTurns": [], "nodes": {top["id"]: top},
+             "placements": {shifted: top["id"]}, "status": {top["id"]: "working"}}))
+        self._reset_memos()
+        private, o_load = [], jd.load_goals
+        jd.load_goals = lambda fsid: (private.append(fsid), o_load(fsid))[1]
+        try:
+            self.assertEqual(self.run_pass(), (3, 0, 1), "A records at once: nothing queued; B and C place")
+        finally:
+            jd.load_goals = o_load
+        self.assertNotIn(A, private, "no writer load for A: its segment never reached the placement loop")
+        self.assertEqual(self.run_pass(), (2, 1, 2), "A skipped; B and C record")
+        self.assertEqual(self.run_pass(), (0, 3, 0))
+        self.assertEqual(json.loads((jd.GOALDIR / (A + ".json")).read_text())["placements"], {shifted: top["id"]},
+                         "A's store untouched: the drifted placement stands as recorded")
+
     def test_a_parse_the_cache_does_not_hold_is_never_skipped(self):
         real = jd.parsed_session
         jd.parsed_session = lambda fsid, paths, now: dict(real(fsid, paths, now))   # a copy: not the cache's object
