@@ -287,7 +287,7 @@ class ErrorCenterWiring(unittest.TestCase):
         # "Log", not "Errors" (the user 2026-07-29): quiet informational kinds live here too, so the
         # old name oversold every entry as a problem. BOTH glyphs (rail + mobile) say what it is.
         self.assertIn("title='Log — click to open'", html)
-        self.assertEqual(html.count("title='Log — click to open'"), 2)
+        self.assertEqual(html.count("title='Log — click to open'"), 1, "the mobile bar's #merr only (T290)")
         self.assertIn("<div class=rerr-top>Log<span class=sp></span>", html)
         self.assertNotIn("aria-label=Errors", html)
         # the panel speaks the shared modal vocabulary (network panel / settings card), never the
