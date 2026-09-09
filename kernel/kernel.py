@@ -13468,6 +13468,67 @@ def _comment_markers(sid):
 ANCHOR_LAG_ERR = "that message isn't in the transcript yet; try again in a moment"
 _parked_creates = []                       # [{sid,uuid,exact,text,name,model,effort,fast,color,tries}]
 _PARK_MAX_TRIES = 30                       # pusher cycles (~15-90s) — past this the record isn't coming
+# A create's IDENTITY (T289): (parent sid, anchor uuid, passage, text) -> the thread it made. A lag-parked
+# create is retried by BOTH the pusher (above) and the client (its frame-keyed re-post), and a popover
+# whose ack was lost sends its create again; the second copy used to collide on its explicit name and
+# come back as the create door's refusal toast (the user 2026-09-09, on a remote session), or — with the
+# name now left to the kernel's default — would mint a SECOND thread for one comment. The memo answers a
+# repeat with the SAME thread's ack, and a parked copy is parked once. Bounded (oldest out), in memory:
+# a kernel restart forgets it, and the client's re-post after one creates exactly once.
+_recent_creates = {}                       # (sid, uuid, exact, text) -> tid
+_RECENT_CREATES_MAX = 256
+# The two doors that can run one create — the WS handler on a server thread and _retry_parked_creates on
+# the pusher — reserve the identity under ONE lock before creating (review, 2026-09-09): the pusher sends
+# the chat frame before it retries parked creates, the client re-posts on that very frame, and with no
+# reservation both copies ran _comment_create before either was noted, minting twins (or, under an
+# explicit name, the create door's refusal the branch set out to remove). RLock: the helpers below take
+# it and so do their callers' compound steps.
+_create_lock = threading.RLock()
+_inflight_creates = set()                  # keys whose _comment_create is running right now, either door
+
+
+def _create_key(sid, uuid, exact, text):
+    return (str(sid), str(uuid), str(exact), str(text))
+
+
+def _note_create(key, tid):
+    with _create_lock:
+        _recent_creates[key] = tid
+        while len(_recent_creates) > _RECENT_CREATES_MAX:
+            _recent_creates.pop(next(iter(_recent_creates)), None)
+
+
+def _repeat_create_tid(key):
+    """The OPEN thread an identical create already made, else None. A resolved, merged or promoted thread
+    cannot take a message, so a same-worded comment after that is a new comment, never a swallowed repeat
+    (review, 2026-09-09); a deleted one is gone from the store and the memo forgets it."""
+    with _create_lock:
+        tid = _recent_creates.get(key)
+        row = _comment_thread(key[0], tid) if tid else None
+        if row and (row.get("status") or "open") == "open":
+            return tid
+        _recent_creates.pop(key, None)
+        return None
+
+
+def _reserve_create(key):
+    """Claim one create's identity for the caller, atomically: ("repeat", tid) when the same comment was
+    already made and its thread is open; ("busy", None) when another door is creating or holding it parked
+    right now; ("free", None) after marking it in flight — the caller must _release_create in a finally."""
+    with _create_lock:
+        again = _repeat_create_tid(key)
+        if again:
+            return "repeat", again
+        if key in _inflight_creates or any(_create_key(pk["sid"], pk["uuid"], pk["exact"], pk["text"]) == key
+                                           for pk in _parked_creates):
+            return "busy", None
+        _inflight_creates.add(key)
+        return "free", None
+
+
+def _release_create(key):
+    with _create_lock:
+        _inflight_creates.discard(key)
 
 
 def _retry_parked_creates():
@@ -13479,13 +13540,29 @@ def _retry_parked_creates():
     if not _parked_creates:
         return
     for pk in list(_parked_creates):
+        key = _create_key(pk["sid"], pk["uuid"], pk["exact"], pk["text"])
+        with _create_lock:
+            if _repeat_create_tid(key):            # the client's re-post already made it: the park is moot
+                if pk in _parked_creates:
+                    _parked_creates.remove(pk)
+                continue
+            if key in _inflight_creates:           # the WS door is creating it this instant: not twice
+                continue
+            _inflight_creates.add(key)
         pk["tries"] += 1
-        err, tid = _comment_create(pk["sid"], pk["uuid"], pk["exact"], pk["text"], name=pk["name"],
-                                   model=pk["model"], effort=pk["effort"], fast=pk.get("fast", ""),
-                                   color=pk["color"])
-        if err == ANCHOR_LAG_ERR and pk["tries"] < _PARK_MAX_TRIES:
-            continue
-        _parked_creates.remove(pk)
+        try:
+            err, tid = _comment_create(pk["sid"], pk["uuid"], pk["exact"], pk["text"], name=pk["name"],
+                                       model=pk["model"], effort=pk["effort"], fast=pk.get("fast", ""),
+                                       color=pk["color"])
+            with _create_lock:                     # note BEFORE the park is dropped: no gap where the
+                if not err:                        # identity is neither parked nor noted
+                    _note_create(key, tid)
+                if err == ANCHOR_LAG_ERR and pk["tries"] < _PARK_MAX_TRIES:
+                    continue
+                if pk in _parked_creates:
+                    _parked_creates.remove(pk)
+        finally:
+            _release_create(key)
         if not err:
             fr = _comments_frame(pk["sid"])
             with _clients_lock:
@@ -15250,25 +15327,54 @@ def _drive(msg, client):
         # Anchor a comment thread on a highlighted passage (the user 2026-08-13). LOUD on refusal; on
         # success a commentCreated ack names the new thread (the popover adopts exactly it — never a
         # guess) and the fresh {type:"comments"} frame rides straight back, ahead of the pusher cycle.
-        err, tid = _comment_create(sid, str(msg["uuid"]), str(msg["exact"]), str(msg["text"]),
-                                   name=str(msg.get("name") or ""),
-                                   model=str(msg.get("model") or ""), effort=str(msg.get("effort") or ""),
-                                   fast=str(msg.get("fast") or ""),
-                                   color=str(msg.get("color") or ""))
+        # A REPEAT of a create this kernel already completed (a client re-post after a lost ack or a
+        # parked copy that landed) is the same comment: answer with the same thread, never a twin (T289).
+        key = _create_key(sid, msg["uuid"], msg["exact"], msg["text"])
+        state, again = _reserve_create(key)
+        if state == "repeat":
+            sys.stderr.write("comment create repeated (%s): the same comment again, answered with thread %s\n"
+                             % (sid[:8], str(again)[:8]))   # a collapse is visible, never silent
+            fr = _comments_frame(sid)
+            if fr:
+                client["send"](json.dumps(fr))
+            client["send"](json.dumps({"type": "commentCreated", "id": sid, "tid": again, "uuid": str(msg["uuid"])}))
+            return True
+        if state == "busy":
+            # the other door holds this create (parked, or mid-create on the pusher): the typed transient
+            # nack keeps the popover's mark alive, and the pusher's success acks every chat client
+            client["send"](json.dumps({"type": "commentCreateFailed", "id": sid, "uuid": str(msg["uuid"]),
+                                       "transient": True, "text": ANCHOR_LAG_ERR}))
+            return True
+        try:
+            err, tid = _comment_create(sid, str(msg["uuid"]), str(msg["exact"]), str(msg["text"]),
+                                       name=str(msg.get("name") or ""),
+                                       model=str(msg.get("model") or ""), effort=str(msg.get("effort") or ""),
+                                       fast=str(msg.get("fast") or ""),
+                                       color=str(msg.get("color") or ""))
+            if not err:
+                _note_create(key, tid)
+        finally:
+            _release_create(key)
         if err:
             # a TRANSIENT refusal (the live-streamed reply's file flush lagging) PARKS the create —
             # the pusher retries it each cycle until the transcript catches up — and the typed nack
             # keeps the client's optimistic mark alive; no toast for plumbing the retry makes moot.
-            # Every real refusal stays loud (fail loudly).
+            # Every real refusal stays loud (fail loudly). Parked ONCE per create identity (T289): the
+            # client re-posts the same create on every frame while the nack stands.
             if err == ANCHOR_LAG_ERR:
-                _parked_creates.append({"sid": sid, "uuid": str(msg["uuid"]), "exact": str(msg["exact"]),
-                                        "text": str(msg["text"]), "name": str(msg.get("name") or ""),
-                                        "model": str(msg.get("model") or ""),
-                                        "effort": str(msg.get("effort") or ""),
-                                        "fast": str(msg.get("fast") or ""),
-                                        "color": str(msg.get("color") or ""), "tries": 0})
+                with _create_lock:
+                    if not any(_create_key(pk["sid"], pk["uuid"], pk["exact"], pk["text"]) == key for pk in _parked_creates):
+                        _parked_creates.append({"sid": sid, "uuid": str(msg["uuid"]), "exact": str(msg["exact"]),
+                                                "text": str(msg["text"]), "name": str(msg.get("name") or ""),
+                                                "model": str(msg.get("model") or ""),
+                                                "effort": str(msg.get("effort") or ""),
+                                                "fast": str(msg.get("fast") or ""),
+                                                "color": str(msg.get("color") or ""), "tries": 0})
             else:
                 client["send"](json.dumps({"type": "warn", "text": err}))
+                # the kernel log carries the refusal too (T289): a name refused at this door showed only
+                # as a toast on the viewer, and the refusing kernel's log held no trace of what the user saw
+                sys.stderr.write("comment create refused (%s, name %r): %s\n" % (sid[:8], str(msg.get("name") or "")[:80], err))
             client["send"](json.dumps({"type": "commentCreateFailed", "id": sid,
                                        "uuid": str(msg["uuid"]), "transient": err == ANCHOR_LAG_ERR,
                                        "text": err}))
@@ -15310,6 +15416,7 @@ def _drive(msg, client):
         err = _comment_promote(sid, str(msg["tid"]), str(msg["name"]), client=client)
         if err:
             client["send"](json.dumps({"type": "warn", "text": err}))
+            sys.stderr.write("comment promote refused (%s, name %r): %s\n" % (sid[:8], str(msg["name"])[:80], err))   # T289
     elif t == "endSession":
         sys.stderr.write("kill: %s via endSession WS op\n" % sid)   # kill attribution (the user 2026-07-16)
         be.kill(sid); _record_death(sid, int(time.time()), "kill")   # the one SDK event with no designed reviver
@@ -15322,7 +15429,9 @@ def _drive(msg, client):
         if not NAME_RE.match(new):
             client["send"](json.dumps({"type": "warn", "text": "session names use letters, digits, . _ - only."}))
         elif _thread_name_refusal(new, _thread_names()):     # a thread's name — never relabel onto it (T223)
-            client["send"](json.dumps({"type": "warn", "text": _thread_name_refusal(new, _thread_names())}))
+            _tref = _thread_name_refusal(new, _thread_names())
+            client["send"](json.dumps({"type": "warn", "text": _tref}))
+            sys.stderr.write("rename refused (%s, name %r): %s\n" % (sid[:8], new, _tref))   # T289: the log carries it too
         else:
             # the live-name check this op never had: _rename_claimed claims the name (kind rename)
             # before be.rename — a running session's name, or one being created right now, is refused

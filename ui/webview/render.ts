@@ -58,6 +58,7 @@ import { initFileBrowse, openFileBrowse } from "./file-browse";   // the browser
 import { pastedFilePath } from "./paste-path";
 import { insertAtCaret } from "./composer-insert";
 import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDownNote } from "./host-prefix";
+import { defaultCommentName, defaultBreakoutName, defaultForkName, nameToSend } from "./comment-name";
 import { followReader, keepPlaceAcrossShow, followTail, atBottomDist, followBoxBelow, followTailShrink } from "./scroll-keep";
 import { retainLiveOmitted } from "./tab-order";
 import { userTurnShows } from "./user-turn-content";
@@ -8081,7 +8082,7 @@ function moveFailedLocal(sid: string, name: string, text: string): void {
 // joined by NAME when the real session lands — exactly the picker-create flow.
 function showForkPrompt(sid: string, uuid: string): void {
   const sess = sessions.get(sid);
-  const base = (sess?.name || "session").replace(/[^A-Za-z0-9._-]/g, "-");
+  const base = defaultForkName(sess?.name, sid);   // the bare name: the host label is this viewer's (T289)
   document.getElementById("fork-prompt")?.remove();
   const overlay = el("div", "picker-overlay confirm-overlay"); overlay.id = "fork-prompt";
   const box = el("div", "picker-box confirm-box");
@@ -8091,7 +8092,7 @@ function showForkPrompt(sid: string, uuid: string): void {
     ? "A new session continues the conversation to just below this response; this one is untouched."
     : "A new session continues this whole conversation; this one is untouched.";
   const input = document.createElement("input");
-  input.type = "text"; input.className = "fork-name"; input.value = base + "-fork";
+  input.type = "text"; input.className = "fork-name"; input.value = base;
   input.setAttribute("autocapitalize", "off"); input.setAttribute("autocomplete", "off");
   input.setAttribute("autocorrect", "off"); input.setAttribute("spellcheck", "false");
   const actions = el("div", "confirm-actions");
@@ -8921,7 +8922,10 @@ function commentSendFromPop(pop: HTMLElement): void {
   const create = pendingCommentAnchor;
   if (create) {
     const nameBox = pop.querySelector(".cmt-name") as HTMLInputElement | null;
-    const nm = (nameBox?.value || "").trim();
+    // an UNTOUCHED prefill is sent as "" — the kernel picks its own default (bare name, next free number);
+    // only a name the user typed is theirs (T289: the prefill, sent as a chosen name, collided with the
+    // thread the same prefill had named before, and the owning kernel refused the create)
+    const nm = nameToSend(nameBox?.value || "", nameBox?.dataset.prefill || "");
     if (nm && !/^[A-Za-z0-9._-]+$/.test(nm)) { nameBox?.classList.add("bad"); nameBox?.focus(); return; }
     if (send) { send.disabled = true; send.classList.add("busy"); }   // ack before the round-trip (the ➤
     //                                       dims); the draft survives until commentCreated adopts the thread
@@ -8930,7 +8934,8 @@ function commentSendFromPop(pop: HTMLElement): void {
     // so its never-listed tid unwraps through the standard sweep the moment the real thread lands
     const synth: CommentThread = { tid: "pending:" + create.uuid, anchorUuid: create.uuid,
       exact: create.exact, status: "open", createdT: Date.now() / 1000, state: "working",
-      unread: false, replyOwed: true, promotedName: "", msgs: [], name: nm || "comment", color: create.color || "" };
+      unread: false, replyOwed: true, promotedName: "", msgs: [],
+      name: nm || nameBox?.dataset.prefill || "comment", color: create.color || "" };   // the hint, until the kernel's frame names it
     const cur0 = commentThreads.get(create.sid) || [];
     commentThreads.set(create.sid, [...cur0.filter((t) => t.tid !== synth.tid), synth]);
     cmtAwaitBase.set(synth.tid, { ...CMT_LATCH_ZERO });   // the SEND gesture latches the pulse — before any kernel round-trip (T102); released once a frame acknowledges the send (T237)
@@ -9004,7 +9009,10 @@ function renderCommentPopover(): void {
   if (create) {
     // the name lives IN the header — "New comment: <name>" — bold and editable right there (the
     // user 2026-08-17); prefilled <session>-comment-<N>, drafted under its own key so a refused
-    // create hands an edited name back too
+    // create hands an edited name back too. The prefill is a HINT built from the session's BARE name
+    // (a remote session displays as "host:name", and the host is this viewer's label, never part of
+    // the name the owning kernel knows — comment-name.ts); left untouched, it is sent as "" and the
+    // kernel picks its own default (T289).
     const nk = "newname:" + create.uuid;
     nameBox = document.createElement("input");
     nameBox.type = "text";
@@ -9013,10 +9021,10 @@ function renderCommentPopover(): void {
     nameBox.setAttribute("autocomplete", "off");
     nameBox.setAttribute("spellcheck", "false");
     const sess0 = sessions.get(sid);
-    nameBox.value = commentDrafts.get(nk)
-      || ((sess0?.name || "session").replace(/[^A-Za-z0-9._-]/g, "-")
-          + "-comment-" + ((commentThreads.get(sid) || []).length + 1));
-    nameBox.title = "The comment's name — edit it right here";
+    const prefill = defaultCommentName(sess0?.name, sid, (commentThreads.get(sid) || []).length);
+    nameBox.dataset.prefill = prefill;
+    nameBox.value = commentDrafts.get(nk) || prefill;
+    nameBox.title = "Suggested name; type to choose your own";
     if (create.color) nameBox.style.color = create.color;   // its identity color, distinct from the parent's
     const nb = nameBox;
     nb.addEventListener("input", () => { nb.classList.remove("bad"); commentDrafts.set(nk, nb.value); });
@@ -9329,7 +9337,7 @@ function renderCommentPopover(): void {
 function showBreakoutPrompt(sid: string, tid: string): void {
   const sess = sessions.get(sid);
   const thName = (commentThreads.get(sid) || []).find((t) => t.tid === tid)?.name || "";
-  const base = thName || ((sess?.name || "session").replace(/[^A-Za-z0-9._-]/g, "-") + "-thread");
+  const base = thName || defaultBreakoutName(sess?.name, sid);   // the bare name: the host label is this viewer's (T289)
   document.getElementById("fork-prompt")?.remove();
   const overlay = el("div", "picker-overlay confirm-overlay");
   overlay.id = "fork-prompt";
@@ -15312,6 +15320,9 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
   else if (m.type === "commentCreated" && m.id && m.tid) {
     if (m.uuid) cmtCreateInFlight.delete(String(m.uuid));   // the ack retires the retry hold
     if (m.uuid) commentDrafts.delete("new:" + String(m.uuid));
+    if (m.uuid) commentDrafts.delete("newname:" + String(m.uuid));   // a typed name dies with its ack even when the
+    //                                                                  popover closed first — else it resurfaces as a
+    //                                                                  TAKEN name on the next comment here (T289 review)
     if (pendingCommentAnchor && pendingCommentAnchor.sid === m.id) {
       const tid = String(m.tid);
       if ((commentThreads.get(String(m.id)) || []).some((t) => t.tid === tid)) adoptCommentThread(String(m.id), tid);
