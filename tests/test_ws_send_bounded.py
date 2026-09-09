@@ -307,8 +307,9 @@ class WedgedClientCannotStallTheSendLoop(unittest.TestCase):
                 why = str(e)
                 break
         self.assertFalse(c["alive"], "the backlog behind the stuck head did pass the budget")
-        self.assertGreaterEqual(accepted, 8, "the frames that fit behind the head were accepted (%d)" % accepted)
-        self.assertLessEqual(accepted, 10)
+        # exact and deterministic: before the k-th small frame the backlog is (k-1) x 8 KiB, and the drop comes
+        # when it passes 64 KiB, at k = 10, so nine small frames were accepted behind the head
+        self.assertEqual(accepted, 9, "the frames that fit behind the head were accepted (%d)" % accepted)
         self.assertIn("bytes behind", why)
         behind = int(why.split(" is ")[1].split(" bytes")[0])
         self.assertLess(behind, len(head), "the count names the backlog, not the frame in flight")

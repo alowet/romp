@@ -4424,8 +4424,10 @@ def _judge_timeline_views(blob, base=None, seq_floor=0, edited=None, foreign=Non
         # blob missing its own creates. Rows only, never stored — the bound stands.
         # ROWS ARE BOUNDED to `bound` of them (the 2026-09-05 review): the rows, the loud
         # notice and the ack's `error` were O(N) in the posted array, so a 100k-entry post (a client
-        # bug, or any page holding the socket) drew a ~22 MB ack that overran WS_QUEUE_BYTES and
-        # dropped the poster's own socket before the ack was queued. Every unread store tag is still
+        # bug, or any page holding the socket) drew a ~22 MB ack, which under the budget rule of the
+        # time (queued bytes plus the frame against WS_QUEUE_BYTES) dropped the poster's own socket
+        # before the ack was queued; since T278 a lone big frame is delivered, and the bound stands
+        # for the pane's sake, a 22 MB ack being nothing a client should have to parse. Every unread store tag is still
         # kept, however far past the bound its copy sat (at most the store's 32); past the first
         # `bound` unread entries the rest are ONE summary row carrying their count and how many of
         # them `edited` names (`moreEdited`), which the door's ok rule reads — a client whose own
