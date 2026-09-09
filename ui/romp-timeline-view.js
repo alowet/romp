@@ -2104,12 +2104,11 @@ class TimelinePanel {
     // applyBars lands. Read the RAW turns BEFORE the prev-carry below back-fills them.
     const ownBars = !!(data.turns && Object.keys(data.turns).length);
     if (ownBars) this._barsLoaded = true;
-    if (ownBars) {
-      // a full one-shot payload carries the wire's compact bars and per-lane judging (T278c): expand them here as
-      // _mergeBars does for the two-message path, so every reader below sees the long names
-      data.turns = expandBars(data.turns);
-      if (data.judging !== undefined) data.judging = expandJudging(data.judging);
-    }
+    // the wire's shapes are expanded HERE for every payload (T278c), as _mergeBars does for the two-message path:
+    // a full one-shot payload carries compact bars and per-lane judging, and the lanes SKELETON carries judging
+    // as an empty map, which the judge band's draw would otherwise read as a list on a cold start
+    if (ownBars) data.turns = expandBars(data.turns);
+    if (data.judging !== undefined) data.judging = expandJudging(data.judging);
     if (data.turns) for (const k of Object.keys(data.turns)) this._barsSeen.add(k);
     const prev = this.data;
     if (prev && (!data.turns || !Object.keys(data.turns).length)) {

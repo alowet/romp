@@ -34633,16 +34633,25 @@ _JUDGING_WIRE = {"j": ("judge", None), "kd": ("kind", "run"), "x": ("text", ""),
 _JUDGING_TEXT_MAX = 90
 
 
+def _js_num(v):
+    """A number spelled as JavaScript's String() spells it, for a key both sides must mint alike: an integral float
+    without its ".0" (Python str(1010.0) is "1010.0", JS String(1010) is "1010"); anything else as repr."""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
 def _compact_judging(entries):
     """{lane sid: [compact entries]} from the builder's list of {judge, sid, t, t1, kind, text, ms, in, out, sent,
-    recv, open}. Pure. An entry without a sid lands under the empty lane key."""
+    recv, open}. Pure. An entry without a sid lands under the empty lane key. The federation code carries a twin
+    (judgingToWire in ui/webview/federation.ts) for an older kernel's flat list; the fixture pins both."""
     out = {}
     for e in entries or []:
         # the key is (t, judge), not (t, judge, t1): an in-flight run's t1 is the build clock, so a key carrying it
         # changed every build and the run crossed as a delete plus a set per frame; with a stable key it is one
         # changed entry. Two runs of one judge sent at the same instant would collide and take positional keys,
         # which the delta path handles exactly (they just delta less well)
-        c = {"k": "%s\x1f%s" % (e.get("t"), e.get("judge")), "t": e.get("t"), "j": e.get("judge")}
+        c = {"k": "%s\x1f%s" % (_js_num(e.get("t")), e.get("judge")), "t": e.get("t"), "j": e.get("judge")}
         if e.get("t1") is not None:
             c["t1"] = e["t1"]
         kd = e.get("kind")
@@ -35686,7 +35695,7 @@ def build_timeline(now, tmux=None, with_bars=True, live_only=False):
                     if author == "romp":
                         # ANY romp-authored prompt (auto-nudge, Nudge button, auto-retry — author 'romp' via
                         # ROMP_INJECT_RE) wears the romp logo on its dot (the user 2026-07-16: an auto-retry
-                        # "rendered as a user prompt instead of a ROMP logo thing"), mirroring the chat's 2026-07-05 rule
+                        # whose dot had drawn as a human prompt instead of wearing the logo), mirroring the chat's 2026-07-05 rule
                         bar["o"] = True
                     bars.append(bar)
         if not with_bars and last_t is None:
@@ -36736,8 +36745,8 @@ def _delta_keyer(kind):
             return None if v is None or v == "" else prefix + str(v)   # "" would spell a lane's bare-prefix marker
         return key
     if kind.startswith("bykeys:"):
-        # no slot uses a composite kind since T278c (judging keys by a kernel-minted string `k`): kept for a
-        # future list without an id field, but note the shim derives keys from STRING fields only
+        # unused since T278c (judging keys by a kernel-minted string `k`), and the shim has NO composite path:
+        # a new bykeys slot would need one there too, deriving from string fields only
         fields = tuple(kind.split(":", 1)[1].split(","))
 
         def key(it, prefix=""):
@@ -41261,7 +41270,7 @@ var DELTA_KINDS={bars:{turns:"dictlist:id",judging:"dictlist:k",messages:"byid"}
 // Python did. The old bykeys judging composite spelled floats and needed a carried key list; judging now keys by a kernel-minted k.
 function keyOf(kind,it,pre){if(!it||typeof it!=="object")return null;var f=kind==="byid"?"id":kind.slice(kind.indexOf(":")+1);var v=it[f];return(v===null||v===undefined||v==="")?null:(pre||"")+String(v);}
 function buildMaps(m){var kinds=DELTA_KINDS[m.type]||{},maps={};for(var name in kinds){var kind=kinds[name],v=m[name],order=[],items={};
-var put=function(kk,val,pre){if(kk===null||items.hasOwnProperty(kk)){var n=order.length;for(;;){kk=(pre||"")+"#"+n;if(!items.hasOwnProperty(kk))break;n++;}}items[kk]=val;order.push(kk);};
+var put=function(kk,val,pre){if(kk===null||Object.prototype.hasOwnProperty.call(items,kk)){var n=order.length;for(;;){kk=(pre||"")+"#"+n;if(!Object.prototype.hasOwnProperty.call(items,kk))break;n++;}}items[kk]=val;order.push(kk);};
 if(kind==="dict"){if(v&&typeof v==="object"&&!Array.isArray(v))for(var dk in v)put(String(dk),v[dk],"");}
 else if(kind.indexOf("dictlist:")===0){if(v&&typeof v==="object"&&!Array.isArray(v))for(var lane in v){var pre=lane+SEP,lst=v[lane];if(!Array.isArray(lst)||!lst.length){put(pre,lst,"");continue;}for(var i=0;i<lst.length;i++)put(keyOf(kind,lst[i],pre),lst[i],pre);}}
 else{if(Array.isArray(v))for(var i2=0;i2<v.length;i2++)put(keyOf(kind,v[i2],""),v[i2],"");}

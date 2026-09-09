@@ -549,6 +549,10 @@ class ShimDecoderMatchesTheKernel(unittest.TestCase):
             # an empty id and a real id spelling a positional key; then the `warming` key leaves the payload
             _bars({S1: [{"id": "", "t": 1}, {"id": "b2", "t": 2}], S3: turn(S3, 2)}, [], [{"id": "#1", "x": 0}, {"x": 1}], now=1035, warming=True),
             dict((kk, v) for kk, v in _bars({S1: [{"id": "", "t": 1}, {"id": "b2", "t": 3}], S3: turn(S3, 2)}, [], [{"id": "#1", "x": 0}, {"x": 5}], now=1040).items() if kk != "warming"),
+            # duplicate ids in one lane (a segment split by a host sleep gives every piece the segment's id): the
+            # second takes a positional key on both sides (T278c: the shim derives keys, so it must agree here too)
+            _bars({S1: [{"id": "dup", "t": 1}, {"id": "dup", "t": 2}, {"id": "b3", "t": 3}], S3: turn(S3, 2)}, [], [{"id": "#1", "x": 0}, {"x": 5}], now=1045),
+            _bars({S1: [{"id": "dup", "t": 1}, {"id": "dup", "t": 9}, {"id": "b3", "t": 3}], S3: turn(S3, 2)}, [], [{"id": "#1", "x": 0}, {"x": 5}], now=1050),
         ]
         frames = []
         for p in payloads:

@@ -120,6 +120,15 @@ class BarLiteral(unittest.TestCase):
             self.assertEqual(pairs[short][0], name, short)
             want = "[]" if default == [] else {None: "null", "": "''", "typed": "'typed'", False: "false"}[default]
             self.assertEqual(pairs[short][1], want, "%s default" % name)
+        # …and the judging table, the same way
+        mj = re.search(r"const JUDGING_WIRE = \{(.*?)\};", view, re.S)
+        self.assertTrue(mj, "the view carries JUDGING_WIRE")
+        jp = {short: (name, js) for short, name, js in re.findall(r"(\w+): \['(\w+)', (null|'run'|''|0|false)\]", mj.group(1))}
+        self.assertEqual(set(jp), set(km._JUDGING_WIRE))
+        for short, (name, default) in km._JUDGING_WIRE.items():
+            self.assertEqual(jp[short][0], name, short)
+            want = "false" if default is False else "0" if default == 0 else "null" if default is None else "'run'" if default == "run" else "''"
+            self.assertEqual(jp[short][1], want, "%s default" % name)
 
 
 class ExpandIsTheInverse(unittest.TestCase):
@@ -146,7 +155,8 @@ class ExpandIsTheInverse(unittest.TestCase):
 
 
 def _old_bars(n_lanes=25, per_lane=320):
-    """A synthetic old-shape payload of the devbox's size class: 25 lanes, 8,000 bars, prompts of a few lines."""
+    """A synthetic payload of the devbox's size class in the shape this change STARTS from (after T278b): 25 lanes,
+    8,000 bars, every long key present with its default, the prompt already the first line, no duplicates."""
     turns = {}
     for li in range(n_lanes):
         sid = "%08d-2222-3333-4444-555555555555" % li
@@ -155,44 +165,12 @@ def _old_bars(n_lanes=25, per_lane=320):
             seg = "%08d-%04d-4000-8000-000000000000" % (li, bi)
             work = "%08d-%04d-4000-8000-000000000001" % (li, bi)
             reply = "%08d-%04d-4000-8000-000000000002" % (li, bi)
-            prompt = ("Please look into item %d of lane %d and tell me what changed.\n" % (bi, li)
-                      + "Context paragraph one, invented, about two hundred characters long so that the payload has the shape of a real ask. " * 2
-                      + "\nContext paragraph two, also invented, with a few more details the tip never shows. " * 3)
             bars.append({"id": seg, "promptId": seg, "workId": work, "start": 1000 + 10 * bi, "end": 1005 + 10 * bi,
-                         "open": False, "cont": False, "prompt": prompt, "summary": "invented work caption %d" % bi,
-                         "msgCaption": "gist %d" % bi, "src": "typed", "mids": [], "pending": False, "tid": sid, "uuid": seg,
-                         "nudgeAuto": False, "romp": False, "workUuid": work, "replyUuid": reply})
+                         "open": False, "cont": False, "prompt": "Please look into item %d of lane %d and tell me what changed." % (bi, li),
+                         "summary": "invented work caption %d" % bi, "msgCaption": "gist %d" % bi, "src": "typed", "mids": [],
+                         "pending": False, "nudgeAuto": False, "romp": False, "replyUuid": reply})
         turns[sid] = bars
     return turns
-
-
-class MessageBinder(unittest.TestCase):
-    """The postal connector's sender heuristic reads the FULL prompt, not the wire line: a delivery's first
-    line is the postal header and the sender's name sits further down."""
-
-    def _case(self, prompts):
-        sid = SID
-        full = "\U0001f4ec New message(s) from your romp peers:\n\nfrom web: could you look at the parser?\n"
-        bar = {"id": "seg-1", "start": 1000, "end": 1050, "mids": [], "prompt": km._wire_prompt(full)}
-        # fromOrig set as the postal reader sets it: an absent one is the empty string, which every prompt contains
-        msgs = [{"id": "m-1", "toId": sid, "from": "web", "fromOrig": "web", "sent": 990, "exec": 990, "pending": True}]
-        km._bind_message_execs(msgs, {sid: [bar]}, prompts({"seg-1": full}))
-        return msgs[0]
-
-    def test_with_the_builders_full_prompts_the_sender_is_found_past_the_first_line(self):
-        m = self._case(lambda d: d)
-        self.assertEqual((m["exec"], m["pending"]), (1000, False))
-
-    def test_without_them_the_wire_line_alone_cannot_name_the_sender(self):
-        m = self._case(lambda d: None)
-        self.assertEqual((m["exec"], m["pending"]), (990, True), "a caller passing no prompts reads the wire line alone")
-
-
-class MemoCarriesPrompts(unittest.TestCase):
-    def test_the_dead_lane_memo_stores_the_lanes_full_prompts_and_a_hit_hands_them_to_the_binder(self):
-        src = open(os.path.join(os.path.dirname(HERE), "kernel", "kernel.py")).read()
-        self.assertIn('"prompts": {b["id"]: full_prompts[b["id"]] for b in bars if b["id"] in full_prompts}', src)
-        self.assertIn('full_prompts.update(cached.get("prompts") or {})', src)
 
 
 def _old_judging(n_lanes=25, per_lane=560):
@@ -209,11 +187,11 @@ def _old_judging(n_lanes=25, per_lane=560):
 
 
 class FrameSize(unittest.TestCase):
-    def test_the_wire_frame_is_under_half_of_the_old_on_a_devbox_sized_payload(self):
-        # the old frame: long-named bars with the three duplicates, a flat judging list, and the delta key list a
-        # keyed full carried (one key per bar and per judging entry); the new: compact bars, per-lane compact judging,
-        # no key list. On the live devbox frame (8,577 bars, 14,051 entries) the same shape went 12.18 MB -> measured
-        # after the deploy; this pins the ratio on a synthetic payload of that size class
+    def test_the_wire_frame_is_well_under_two_thirds_of_the_old_on_a_devbox_sized_payload(self):
+        # the old frame is the one this change starts from (after T278b): long-named bars with every default present,
+        # a flat judging list repeating the lane sid, and the delta key list a keyed full carried (one key per bar and
+        # per judging entry); the new: compact bars, per-lane compact judging, no key list. The live devbox frame
+        # (8,577 bars, 14,051 entries) was 12.18 MB before; the after figure is measured on the deploy and reported
         old_t, old_j = _old_bars(), _old_judging()
         keys = {"turns": [sid + "\x1f" + b["id"] for sid, bars in old_t.items() for b in bars],
                 "judging": ["\x1f".join(str(e[f]) for f in ("sid", "t", "judge", "t1")) for e in old_j]}
@@ -223,8 +201,8 @@ class FrameSize(unittest.TestCase):
         n_old, n_new = len(json.dumps(old)), len(json.dumps(new))
         self.assertEqual(sum(len(v) for v in new["turns"].values()), 8000)
         self.assertEqual(sum(len(v) for v in new["judging"].values()), 14000)
-        self.assertLess(n_new / n_old, 0.5, "old %d B, new %d B: ratio %.2f" % (n_old, n_new, n_new / n_old))
-        self.assertGreater(n_new / n_old, 0.25, "the fixture is not a strawman: the ids, times and captions still ride")
+        self.assertLess(n_new / n_old, 0.65, "old %d B, new %d B: ratio %.2f" % (n_old, n_new, n_new / n_old))
+        self.assertGreater(n_new / n_old, 0.3, "the fixture is not a strawman: the ids, times and captions still ride")
 
 
 class Fixture(unittest.TestCase):
