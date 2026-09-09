@@ -125,38 +125,32 @@ os.environ["CLAUDE_CONFIG_DIR"] = _CLAUDE_CONFIG
 # safe against every consumer. Import-time, so collection-time code is floored too.
 os.environ["ROMP_MANAGER_PORT"] = "1"
 
-# No test may read the REAL service.env (2026-09-04): sdk_backend.work_api_key now reads the manager
-# env file LIVE (kernel/keysource.py) instead of popping os.environ once, so on a machine running a
-# live romp every auth test would otherwise resolve the developer's ACTUAL API key — quietly billing
-# nothing, but making the key material a test input, putting it one assertion message away from a
-# terminal, and making the pinned fixture-key tests pass or fail on whether this box happens to have
-# a key configured. Pointed at a path inside the temp state root that is never created, so every read
-# is the "no file" case and the startup-pop fallback governs, exactly as before the live source
-# existed. Both spellings, because keysource accepts both. Import-time (collection is floored too)
-# plus a per-test re-assert below, on the same reasoning as the manager port.
+# No test may read the REAL service.env (2026-09-04; the reason changed on 2026-09-08): the kernel's boot
+# check (kernel/credentials.py) reads the manager env file for retired provider lines, so on a machine whose
+# file still carries one every kernel-loading test would refuse to start. Pointed at a path inside the temp
+# state root that is never created, so every read is the "no file" case. Both spellings, because the
+# path resolver accepts both. Import-time (collection is floored too) plus a per-test re-assert below, on
+# the same reasoning as the manager port.
 _NO_SERVICE_ENV = os.path.join(os.environ["XDG_STATE_HOME"], "no-such-service.env")
 os.environ["ROMP_SERVICE_ENV_FILE"] = _NO_SERVICE_ENV
 os.environ["ROMP_SERVICE_ENV"] = _NO_SERVICE_ENV
-# No test starts with a KEY SOURCE the developer's shell configured (2026-09-08). Every session shell
-# under a romp-managed manager inherits the manager's credentials: ANTHROPIC_API_KEY (the startup key
-# sdk_backend.startup_api_key claims), ROMP_API_KEY_CMD and ROMP_API_KEY_REF (the runtime providers
-# keysource._env_provider selects straight from the environment when the isolated env file above is
-# absent), ROMP_EXPECTED_AUTH (the box-wide auth declaration), the competing token credentials
-# sdk_backend.startup_auth_env claims, and 1Password's own names keysource.claim_op_env takes. A
-# test that constructs a backend, resolves a key or asks default_auth then reads the DEVELOPER'S
-# configuration: 73 tests across eight modules went red on a box running the command key source
-# while CI, which exports none of these, stayed green (the manager's full run, 2026-09-08). Popped at
-# import so module-level loads see the clean baseline, and re-asserted per test below; a test that
-# wants a source sets a synthetic one itself in setUp, which runs after the fixture. The list is the
-# code's own constants (tests/test_key_source_floor.py pins it against keysource.SOURCE_VARS,
-# keysource.OP_ENV_NAMES / OP_ENV_PREFIX and sdk_backend.AUTH_ENV_NAMES).
+# No test starts with a CREDENTIAL the developer's shell configured (2026-09-08). Every session shell under
+# a romp-managed manager inherits the manager's environment: the retired provider names (which the boot
+# check now refuses outright), ROMP_EXPECTED_AUTH (the box-wide auth declaration), the login tokens
+# sdk_backend.startup_auth_env claims, and the 1Password CLI's own names. A test that constructs a backend
+# or asks default_auth would otherwise read the DEVELOPER'S configuration: 73 tests across eight modules
+# went red on a box running a key command while CI, which exports none of these, stayed green (the
+# manager's full run, 2026-09-08). Popped at import so module-level loads see the clean baseline, and
+# re-asserted per test below; a test that wants a credential sets a synthetic one itself in setUp, which
+# runs after the fixture. The list is the code's own (tests/test_key_source_floor.py pins it against
+# credentials.FLOOR_ENV_NAMES / FLOOR_ENV_PREFIXES and sdk_backend.AUTH_ENV_NAMES).
 KEY_SOURCE_ENV_NAMES = (
-    "ANTHROPIC_API_KEY", "ROMP_API_KEY_REF", "ROMP_API_KEY_CMD",          # keysource.SOURCE_VARS
-    "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",                     # sdk_backend.AUTH_ENV_NAMES (the rest)
+    "ROMP_API_KEY_CMD", "ROMP_API_KEY_REF", "ANTHROPIC_API_KEY",          # credentials.RETIRED_VARS
+    "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",                     # credentials.LOGIN_TOKEN_VARS
     "ROMP_EXPECTED_AUTH",                                                  # the auth declaration
-    "OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN", "OP_ACCOUNT",   # keysource.OP_ENV_NAMES
+    "OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN", "OP_ACCOUNT",   # credentials.OP_ENV_NAMES
 )
-KEY_SOURCE_ENV_PREFIXES = ("OP_SESSION_",)                                # keysource.OP_ENV_PREFIX
+KEY_SOURCE_ENV_PREFIXES = ("OP_SESSION_",)                                # credentials.OP_ENV_PREFIX
 
 
 def _scrub_key_source_env():
@@ -168,23 +162,29 @@ def _scrub_key_source_env():
 
 _scrub_key_source_env()
 # Every shell under a romp-managed session inherits ROMP_SUPERVISED=1 from the kernel (the service
-# unit exports it), and keysource gives that variable authority: a supervised manager reads the env
-# file only and ignores a startup key. Twenty-five tests that stage a startup key went red when the
-# suite ran from inside a romp session while CI stayed green (review find, 2026-09-05). The floor is
-# the unsupervised case; a test that wants supervision sets the variable itself.
+# unit exports it). The variable used to give the retired key-source module authority over a startup key;
+# it is still popped so a test's world is the unsupervised baseline (review find, 2026-09-05), and a test
+# that wants supervision sets the variable itself.
 os.environ.pop("ROMP_SUPERVISED", None)
 
 
-def _reset_keysource_state():
-    """keysource remembers which path selected which source for the PROCESS (that is the resurrection
-    guard); under one pytest process that memory would leak between test modules. Every loaded copy of
-    the module (each SourceFileLoader name is its own module object) is reset."""
+# No test may read the box's REAL managed settings (2026-09-08): credentials.py reads
+# /etc/claude-code/managed-settings.json (or the macOS path) as the top of Claude Code's precedence, so a
+# test asserting "no helper" would lie on a box whose administrator set one there. Every loaded copy of the
+# module is pointed at a path inside the temp state root that is never created; a test that wants a managed
+# file stubs managed_settings_path itself in setUp, after this fixture.
+_NO_MANAGED_SETTINGS = os.path.join(os.environ["XDG_STATE_HOME"], "no-such-managed-settings.json")
+
+
+def _reset_credential_state():
+    """credentials.py memoizes the helper's value in process memory for its TTL; under one pytest process
+    that memo would leak between test modules. Every loaded copy of the module is reset, and its managed
+    settings path floored (above)."""
     import sys
     for name, m in list(sys.modules.items()):
-        if "keysource" in name and hasattr(m, "_AUTHORITATIVE_PATHS"):
-            m._AUTHORITATIVE_PATHS.clear()
-            getattr(m, "_ENV_PROVIDER_PATHS", set()).clear()
-            m._CACHE = ((), "")
+        if "credentials" in name and hasattr(m, "forget_helper_key"):
+            m.forget_helper_key()
+            m.managed_settings_path = lambda: _NO_MANAGED_SETTINGS
 
 
 @pytest.fixture(autouse=True)
@@ -197,7 +197,7 @@ def _no_real_service_env():
         os.environ[var] = _NO_SERVICE_ENV
     _scrub_key_source_env()
     os.environ.pop("ROMP_SUPERVISED", None)
-    _reset_keysource_state()
+    _reset_credential_state()
     yield
 
 
@@ -283,13 +283,12 @@ def _no_cli_scope():
     yield
 
 
-# No test may reach the machine's REAL tmux server (2026-09-06): keysource.claim_op_env scrubs the tmux
-# server's globals the moment romp becomes the op consumer, which any test that configures a reference
-# and constructs the SDK backend (or resolves a key) does — and on a developer's box that `tmux
-# set-environment -gu` would land on the live server every session runs in. The same private socket
-# directory the bats suites use (tests/tmux-private.bash): tmux puts every socket, `-L` ones included,
-# under $TMUX_TMPDIR/tmux-<uid>/, and the directory must exist or tmux 3.4 silently falls back to the
-# default. No server ever exists there, so a scrub from a test exits with "no server running".
+# No test may reach the machine's REAL tmux server (2026-09-06; the reason changed on 2026-09-08): the
+# retired key-source module used to scrub the live server's globals from inside a test, and any tmux-backed
+# test still runs its commands somewhere. The same private socket directory the bats suites use
+# (tests/tmux-private.bash): tmux puts every socket, `-L` ones included, under $TMUX_TMPDIR/tmux-<uid>/,
+# and the directory must exist or tmux 3.4 silently falls back to the default. No server ever exists
+# there, so a tmux command from a test exits with "no server running" instead of touching the live one.
 os.environ["TMUX_TMPDIR"] = tempfile.mkdtemp(prefix="romp-tests-tmux-")
 os.environ.pop("TMUX", None)
 os.environ.pop("ROMP_TMUX_SOCKET", None)
@@ -317,6 +316,95 @@ def _stub_place_llm(monkeypatch):
                 seen.add(id(j))
                 monkeypatch.setattr(j, "place_llm", lambda *a, **k: "")
     yield
+
+
+# No test may leave the shared judge or a call-time environment seam changed (2026-09-09). kernel.py
+# loads the judge as SourceFileLoader("romp_judge", ...).load_module(), and load_module re-executes
+# into the module object already in sys.modules under that name, so every kernel-loading test
+# module's km.jd is ONE process-wide object. A test that rebinds jd.STATE to a temp dir and removes
+# that dir in tearDown without restoring the prior value leaves every later STATE reader in the
+# process pointing at a removed directory: a FileNotFoundError on restart-audit.jsonl or
+# timeline-views.json, or a silent empty read where the writer swallows OSError. The postal
+# sessions-file seam has the same shape: postal_service reads ROMP_SESSIONS_FILE from os.environ at
+# call time, so a tearDown that pops it instead of restoring the prior value leaves a later module,
+# which set the seam once at import, resolving no local sessions. Neither shows when the victim runs
+# alone, and the serial order of the whole suite passes only because a test that loads a kernel
+# between the cause and the victim re-executes judge.py and rebinds the roots; any other order (a
+# subset, another scheduler) fails a module that did nothing wrong. This fixture names the cause
+# instead: it snapshots the shared judge's STATE and PROJECTS and the watched environment names
+# before each test and fails the test that changed one and did not restore it, or left a path that
+# was a directory pointing at nothing. Transition-based on purpose: a module-level preamble runs at
+# collection, before any snapshot, and is not seen; a test that changes and restores is quiet; and a
+# test that merely runs under another test's leftover is not blamed for it. A test that loads a
+# kernel (or the judge itself) re-executes judge.py into the shared module, which rebinds every root
+# from the environment as it stands at that moment: that is the loader's reset, made from values
+# other modules' import-time writes decide, not a directory the test made and removed, so the path
+# check compares no values for that test (the re-execution recreates every function object, which is
+# how it is told apart from an assignment). Only the values: judge.py creates STATE at import, so a
+# STATE that is not a directory after a reload is the test's own doing and is still named, and the
+# environment names are still checked. Values of the environment names are never printed (one of
+# them is a credential), only the kind of change.
+_SHARED_JUDGE_PATHS = ("STATE", "PROJECTS")
+_SEAM_ENV_NAMES = ("ROMP_SESSIONS_FILE", "ROMP_SERVE_TOKEN")
+
+
+def _shared_judge_paths():
+    """({name: (path text or None, is a directory)}, marker) for the shared judge's watched globals,
+    the marker being a function object judge.py defines (a re-execution replaces it); ({}, None) when
+    no module has loaded the judge under its shared name yet."""
+    jd = sys.modules.get("romp_judge")
+    if jd is None:
+        return {}, None
+    out = {}
+    for name in _SHARED_JUDGE_PATHS:
+        p = getattr(jd, name, None)
+        text = None if p is None else str(p)
+        out[name] = (text, text is not None and os.path.isdir(text))
+    return out, vars(jd).get("_rebind_state")
+
+
+@pytest.fixture(autouse=True)
+def _shared_state_restored(request):
+    paths_before, marker_before = _shared_judge_paths()
+    env_before = {name: os.environ.get(name) for name in _SEAM_ENV_NAMES}
+    yield
+    paths_after, marker_after = _shared_judge_paths()
+    left = []
+    if marker_after is marker_before:      # not re-executed: whatever differs, this test assigned
+        for name, (text0, isdir0) in paths_before.items():
+            text1, isdir1 = paths_after.get(name, (None, False))
+            if text1 != text0:
+                left.append("romp_judge.%s changed from %s to %s" % (name, text0, text1))
+            elif isdir0 and not isdir1:
+                left.append("romp_judge.%s %s was a directory and is gone" % (name, text0))
+    else:                                  # re-executed: the loader bound the roots, and created STATE
+        text1, isdir1 = paths_after.get("STATE", (None, False))
+        if text1 is not None and not isdir1:
+            left.append("romp_judge.STATE %s is not a directory after the test reloaded the judge" % text1)
+    for name in _SEAM_ENV_NAMES:
+        v0, v1 = env_before[name], os.environ.get(name)
+        if v0 == v1:
+            continue
+        if v1 is None:
+            left.append("%s was set and is now unset" % name)
+        elif v0 is None:
+            left.append("%s was unset and is now set" % name)
+        else:
+            left.append("%s was changed" % name)
+    if left:
+        pytest.fail("%s left shared state changed after its teardown: %s. Save the prior value before "
+                    "changing it and put it back at the end of the test; for a path, before removing the "
+                    "directory it named." % (request.node.nodeid, "; ".join(left)), pytrace=False)
+
+
+def restore_env(name, prior):
+    """Put the environment name back the way a test found it: `prior` is the os.environ.get(name) taken before
+    the test changed it, None meaning unset. A tearDown that pops the name instead leaves a later module in the
+    process without the value its own import set; this is the restore the fixture above expects."""
+    if prior is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = prior
 
 
 # No test report may carry a process-environment VALUE, or a credential-shaped token (2026-09-05). A
@@ -611,3 +699,40 @@ def pytest_collectreport(report):
     Redacted BEFORE the other implementations see it: the terminal reporter files it from here."""
     _redact_report(report)
     yield
+
+
+# ── thread census (T282) ──────────────────────────────────────────────────────────────────────────────
+# A test that starts a real kernel loop, a backend pump or a fake server must end it before its module ends: a
+# daemon thread that outlives its module runs against whatever the shared modules (the judge, the event model)
+# are bound to by then. These two helpers are the pin every such module carries, and the module-boundary
+# tracer reads the same census, so a leak is named by the module that made it.
+def thread_census():
+    """The live non-main threads as stable descriptors: the target's qualified name when the thread has one,
+    else its name; pytest-timeout's own watchdog thread excluded. Sorted, so two censuses compare directly."""
+    import threading
+    out = []
+    for t in threading.enumerate():
+        if t is threading.main_thread():
+            continue
+        target = getattr(t, "_target", None)
+        mod = (getattr(target, "__module__", "") or "") if target is not None else ""
+        if t.name.startswith("pytest_timeout") or mod.startswith("pytest_timeout"):
+            continue
+        out.append("%s.%s" % (mod, getattr(target, "__qualname__", None) or repr(target)) if target is not None else t.name)
+    return sorted(out)
+
+
+def wait_for_census(before, timeout=5.0):
+    """The threads alive now that were NOT in `before`, once that set is empty or at the deadline: a module's pin is
+    "nothing this module started outlives it", so a thread from an EARLIER module that happens to end during this one
+    cannot fail it, and a thread this module started has a moment (20 ms polls, up to `timeout`) to reach its exit
+    after join(timeout) returned. Returns the sorted leftovers; a clean module gets []."""
+    import collections
+    import time
+    deadline = time.monotonic() + timeout
+    base = collections.Counter(before)
+    while True:
+        extra = sorted((collections.Counter(thread_census()) - base).elements())   # by COUNT: a second thread of a
+        if not extra or time.monotonic() >= deadline:                              # kind already present is a leftover
+            return extra
+        time.sleep(0.02)

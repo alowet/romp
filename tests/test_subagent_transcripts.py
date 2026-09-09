@@ -96,6 +96,7 @@ class World(unittest.TestCase):
     FOREGROUND agent (its tool_result is the report), each with its own file under subagents/."""
 
     def setUp(self):
+        self._saved_state, self._saved_projects = jd.STATE, jd.PROJECTS
         self._td = tempfile.mkdtemp()
         jd._rebind_state(Path(self._td))
         jd.PROJECTS = Path(self._td) / "projects"
@@ -162,6 +163,11 @@ class World(unittest.TestCase):
             cache.clear()
 
     def tearDown(self):
+        # the judge module is shared process-wide: rebind STATE and PROJECTS to what they were, and drop the
+        # discover results computed under this test's roots, before the roots are removed
+        jd._rebind_state(self._saved_state)
+        jd.PROJECTS = self._saved_projects
+        jd._discover_cache.clear()
         shutil.rmtree(self._td, ignore_errors=True)
 
     def _agent_records(self, aid, t, calls, closing="All four tests pass now; one flaky case was re-run."):

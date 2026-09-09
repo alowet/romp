@@ -100,7 +100,9 @@ broad `git add` will sweep up your work). Conventions:
      `origin`, which is then romp-on itself). `remote.pushDefault` points at `origin`,
      so a bare `git push` does the same. Never push to `upstream`: the server rejects
      it, and naming it in scripts bakes in a failure.
-  2. `gh pr create --repo romp-on/romp --label <tier>` (gh detects the fork head), then
+  2. `gh pr create --repo romp-on/romp --label <tier>` (gh detects the fork head; a
+     contributor who cannot label writes `Tier: fix` on a line of the body instead, and the
+     tier workflow applies the label), then
      `gh pr merge --auto --merge`: it lands itself when the required checks pass, and
      the Tier policy check is one of them. Green CI alone lands `docs` and `fix` for
      every author, and `feature` too when the author is the repository owner (an
@@ -121,7 +123,9 @@ broad `git add` will sweep up your work). Conventions:
   fetches PR data and posts the verdict. See `docs/pr-tiers.md`. Roles are the author's
   collaborator permission: admin is the repository owner; write or maintain is a member;
   anyone else is a contributor (the check gates members and contributors alike). The author
-  picks the tier at filing time:
+  picks the tier at filing time, as the label or, for a contributor who cannot label, as a
+  `Tier: fix` line in the PR body that the tier workflow turns into the label (a label already
+  present wins; maintainers re-tier by relabeling):
   - `docs` (tier 0; renamed from `tests-only`): documentation. To the check it is the same
     tier as `fix`: merges on green for every author.
   - `fix` (tier 1): a bug fix with a test that fails before it. Merges on green for every
@@ -179,7 +183,18 @@ mid-test. The failure is ordering-dependent: green alone, red only under the ful
 suite. Tests that mint goals therefore use a private synthetic sid of their own
 (any invented uuid; still synthetic, never real) and clean their sid's journal in
 tearDown. Precedent + worked diagnosis: the model-fallback dedupe tests' class
-docstring (`tests/test_model_fallback_card.py`, DedupeBackstop).
+docstring (`tests/test_model_fallback_card.py`, DedupeBackstop). A second face of
+the same collision (2026-09-08, four end-to-end tests green alone and red in CI's
+serial order): a test that exercises the nudge walk and stubs `jd.load_goals` as
+the walk's snapshot must ALSO stub `jd.load_goals_shared_or_fault`, the walk's
+shared read-only view since the jobs-stage change, and move the goal directory
+with the state (`jd._rebind_state(tmp)` repoints GOALDIR and every derived dir;
+assigning `jd.STATE` alone leaves GOALDIR where import bound it), because the
+shared view reads a store FILE when one exists and delegates to `load_goals` only
+when none does, so an earlier module's store for the shared placeholder sid at the
+unrebound GOALDIR was what the walk read (no goal due, no fire, a deferral never
+cleared, a KeyError). Precedent: `tests/test_nudge_injected_turn_arm.py`,
+`test_nudge_fresh_guard.py`, `test_nudge_memo_deadlock.py`, `test_nudge_bundle.py`.
 
 ## Authoritative sources — fail loudly, don't degrade silently (user rule, 2026-07-03)
 Read state from its AUTHORITATIVE source — a designed API, or the live store that

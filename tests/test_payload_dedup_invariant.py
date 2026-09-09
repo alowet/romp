@@ -135,6 +135,7 @@ class BuiltFeedIsClockInvariantApartFromTheClockItself(unittest.TestCase):
 
         self.saved = (jd.NAMES, jd.PROJECTS, jd.CAPDIR, jd.ARCHDIR, jd.GOALDIR, jd.STATE,
                       km.NAMES, km._GLOBAL_CLAUDE_MD, km.jd.NAMES, km.jd.PROJECTS)
+        self.saved_kernel_state = km.jd.STATE
         jd.NAMES, jd.PROJECTS = names, proj
         jd.CAPDIR, jd.ARCHDIR, jd.GOALDIR = td / "captions", td / "archive", td / "goals"
         jd.STATE = td
@@ -143,6 +144,14 @@ class BuiltFeedIsClockInvariantApartFromTheClockItself(unittest.TestCase):
         # SourceFileLoader load), so discover() — which the kernel runs through km.jd — never saw this
         # fixture's names/ or transcript: the session was invisible and the invariant held hollowly. Reach
         # the kernel's copy too, so the fixture's transcript is the one the feed builds from (T258).
+        # And the kernel's judge is ONE module object for every test module in the process (each kernel
+        # load re-executes bin/romp-judge into the same sys.modules entry), so its STATE — goals, the
+        # override journals, cleared.jsonl, session-order.json — is a directory the whole run shares.
+        # Built over it, this feed carried whatever store an earlier module left for the placeholder sid,
+        # and a writer of that world between the two builds re-sent the feed (T281, CI 2026-09-09). The
+        # feed builds over THIS fixture's state root and nothing else: _rebind_state moves GOALDIR and
+        # every derived dir with it (assigning STATE alone would not).
+        km.jd._rebind_state(td)
         km.jd.NAMES, km.jd.PROJECTS = names, proj
         km._GLOBAL_CLAUDE_MD = td / "no-global-claude.md"
         # Fixed so the stub itself contributes nothing clock-derived (mirrors the chat invariant test).
@@ -155,6 +164,7 @@ class BuiltFeedIsClockInvariantApartFromTheClockItself(unittest.TestCase):
         km.build_feed(NOW - 1, self.tmux)
 
     def tearDown(self):
+        km.jd._rebind_state(self.saved_kernel_state)
         (jd.NAMES, jd.PROJECTS, jd.CAPDIR, jd.ARCHDIR, jd.GOALDIR, jd.STATE,
          km.NAMES, km._GLOBAL_CLAUDE_MD, km.jd.NAMES, km.jd.PROJECTS) = self.saved
         self.td.cleanup()
@@ -178,6 +188,35 @@ class BuiltFeedIsClockInvariantApartFromTheClockItself(unittest.TestCase):
         km._send_client(client, ("feed",), km.build_feed(NOW + 600, self.tmux))
         self.assertEqual(len(sent), 1,
                          "an unchanging fleet must not re-send the feed just because time passed")
+
+    def test_the_feed_is_built_over_this_fixtures_world_not_the_runs_shared_one(self):
+        """The kernel's judge module is shared by every test module in the process, so a goal store another
+        module left for the placeholder sid at the run-wide GOALDIR used to be part of THIS feed (T281). A
+        store planted there now changes nothing here: the feed reads this fixture's goals directory."""
+        foreign = Path(self.saved_kernel_state) / "goals"
+        planted = foreign / (SID + ".json")
+        original = planted.read_bytes() if planted.exists() else None     # another module's store, if one is there
+        made_dir = not foreign.exists()
+        foreign.mkdir(parents=True, exist_ok=True)
+        store = json.loads(original) if original else {"nodes": {}, "status": {}}
+        store.setdefault("nodes", {})["t281-foreign"] = {"id": "t281-foreign", "title": "a card another module left",
+                                                          "parentId": None, "status": "open"}
+        planted.write_text(json.dumps(store))                              # always planted, so the assertion has teeth
+
+        def restore():
+            if original is not None:
+                planted.write_bytes(original)
+            else:
+                planted.unlink(missing_ok=True)
+                if made_dir:
+                    try:
+                        os.rmdir(foreign)
+                    except OSError:
+                        pass
+        self.addCleanup(restore)
+        self.assertNotIn("t281-foreign", json.dumps(km.build_feed(NOW, self.tmux), default=str),
+                         "a store at the run-wide goals directory is not this feed's input")
+        self.assertEqual(km.jd.GOALDIR, Path(self.td.name) / "goals", "the kernel's judge reads this fixture's goals")
 
 
 if __name__ == "__main__":

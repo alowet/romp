@@ -41,10 +41,12 @@ import { NavHistory } from "./nav-history";
 import { StagedStack } from "./staged-messages";
 import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, queuedCopyToHide, dropPending, bareGroupLabel, sentAtLabel } from "./send-pending";
 import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued, type HeldMemory } from "./queued-held";
+import { reloadHoldReason } from "./reload-hold";
 import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional } from "./provisional";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
-import { parseAgentNotif, type AgentNotif } from "./agent-notif";
+import { parseAgentNotif, notifHead, type AgentNotif } from "./agent-notif";
+import { injectedHead, type InjectedSource } from "./injected-source";
 import { subTabId, isSubId, subParts, subLabel, gistLines, stepLines, stepsNote, agentFoldLabel, subHeadParts, openIconSvg, pinIconSvg, type SubMeta, type AgentGist, type AgentGistRow, type GistLine } from "./subagent-view";
 import { previewKind, previewFull, canPreview, fileUrl, retryFailedPreviews, refreshSettledPreviews, installMdImgHeal, setLightboxNav, type LightboxNavEntry } from "./preview";
 import { openFileClick } from "./file-view";                  // a clicked file WITH its gesture (pdf-new-tab.test.ts)
@@ -59,7 +61,7 @@ import { hostNameNodes, hostPartsNodes, hostPrefix, hostOf, hostIsDown, hostDown
 import { followReader, keepPlaceAcrossShow, followTail, atBottomDist, followBoxBelow, followTailShrink } from "./scroll-keep";
 import { retainLiveOmitted } from "./tab-order";
 import { userTurnShows } from "./user-turn-content";
-import { ScrollDiagBudget, classifyScroll, scrollWriteRow, tailChangeRow, tailLabel, spacerRow, readScrollDiagCap, summarizeTailMutations, tailMutRow } from "./scroll-write";
+import { ScrollDiagBudget, classifyScroll, scrollWriteRow, tailChangeRow, tailLabel, spacerRow, readScrollDiagCap, summarizeTailMutations, tailMutRow, unitChangeRow, unitChanges, boxChanges, boxLabel, BOX_FROM_TAIL } from "./scroll-write";
 import { reloadScrollRecord, takeReloadScroll, type ReloadScroll } from "./reload-restore";
 import { keepResidentEvents } from "./frame-merge";
 import { activeTabToReannounce } from "./relay-active";
@@ -107,7 +109,10 @@ type TaskOutputs = Record<string, { command: string; output: string }>;
 type ChatEvent = (
   // mid/mids: postal message ids the kernel could NOT resolve into cards, carried on the raw turn so a
   // timeline arc into it still lands (see _hydrate_postal's unresolved path)
-  | { kind: "user"; md: string; uuid?: string; ts?: string; reminders?: string[]; taskOutputs?: TaskOutputs; human?: boolean; romp?: boolean; rompAuto?: boolean; rompSystem?: boolean; followUp?: boolean; goal?: string; fuCtx?: string; canned?: string; tag?: string; mid?: string; mids?: string[]; images?: { src: string; path?: string }[]; undelivered?: boolean; echoT?: number; absorbed?: boolean; sentAt?: number; hiddenByPending?: boolean; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }
+  // source/preamble: a harness-INJECTED record (kernel injected_source — a background agent's completion, a
+  // system notice, a peer's message) and the CLI's note-to-the-model paragraph lifted out of its text; the
+  // event renders as a labelled notice (renderInjected), never the user's bubble (the user 2026-09-07)
+  | { kind: "user"; md: string; uuid?: string; ts?: string; reminders?: string[]; taskOutputs?: TaskOutputs; human?: boolean; romp?: boolean; rompAuto?: boolean; rompSystem?: boolean; followUp?: boolean; goal?: string; fuCtx?: string; canned?: string; tag?: string; mid?: string; mids?: string[]; images?: { src: string; path?: string }[]; undelivered?: boolean; echoT?: number; absorbed?: boolean; sentAt?: number; hiddenByPending?: boolean; source?: InjectedSource; preamble?: string; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }
   | { kind: "assistant"; md: string; uuid?: string; ts?: string; spacePaths?: string[]; pathLinks?: Record<string, string>; pathPins?: Record<string, string> }   // spacePaths: backticked filenames WITH spaces the kernel verified exist (build_session _space_paths) → whole-span links. pathLinks: path-shaped tokens the kernel verified against the filesystem, token → real open target (build_session _path_links) — the linkifier's gate
   | { kind: "thinking"; text: string; encrypted: boolean; uuid?: string; ts?: string }
   | {
@@ -171,7 +176,7 @@ type ChatEvent = (
   // Claude Code's NATIVE teammate/agent-message channel (one agent messaged this session) — distinct from
   // romp's postal service, so it gets its OWN neutral collapsed card, NOT the per-peer-colored postal card
   // and NOT a blue "you typed this" bubble. blocks = one per sending agent {id, summary?, body}.
-  | { kind: "teammate"; blocks: { id: string; summary?: string; body: string }[]; ts?: string; uuid?: string }
+  | { kind: "teammate"; blocks: { id: string; summary?: string; body: string }[]; ts?: string; uuid?: string; source?: InjectedSource }
   // Claude Code's Task to-do list, folded into one live checklist.
   | { kind: "todo"; tasks: TodoTask[]; error?: string; ts?: string; uuid?: string }
   // A CLIENT-side optimistic echo of a just-sent message is one of these (uuid OPT_PREFIX), injected at the
@@ -249,7 +254,7 @@ type ChatEvent = (
   // transcript's system/model_refusal_fallback record). The reply that follows came from a DIFFERENT
   // model — conversation state that must be apparent in the chat, never silent (the user 2026-08-03).
   // from/to are raw model ids; md is the CLI's full explanation, one click away.
-  | { kind: "modelFallback"; from?: string; to?: string; md?: string; ts?: string; uuid?: string }
+  | { kind: "modelFallback"; from?: string; to?: string; md?: string; category?: string; explanation?: string; scope?: string; ts?: string; uuid?: string }
   // Pinned, collapsed "system context" card at the top of the transcript (the user 2026-06-19): the
   // CLAUDE.md instructions in effect + session config. NOT the verbatim harness prompt — it's never
   // recorded, so it can't be shown (renderSystem says so). No ts/uuid → off the rail (no dot/hover).
@@ -261,7 +266,21 @@ interface TodoTask { id: string; subject: string; activeForm?: string; status: s
 
 type ChipState = "working" | "ready" | "needsInput" | "awaiting" | "awaitingBg" | "idle" | "closed" | "compacting" | "clearing" | "blocked" | "retrying" | "interrupting" | "opening";   // needsInput = a live permission/picker prompt (on YOU) — renamed from the legacy "awaiting" (2026-08-15), which stays accepted for OLDER REMOTE KERNELS across federation; awaitingBg = idle main thread waiting on background work it dispatched (the user 2026-07-13)
 type PeerIdent = { name: string; host?: string; sid?: string; color?: { bg: string; fg: string } | null };   // a named peer behind a peer-kind wait (kernel _peer_identity, 2026-08-26)
-interface Status { state: ChipState; sinceEpoch: number | null; awaitingWhy?: string | null; awaitingKind?: string | null; awaitingPeers?: PeerIdent[] | null; awaitingTasks?: string[]; awaitingTaskIds?: string[]; awaitingCount?: number | null; awaitingItems?: AwaitRow[]; effort?: string; model?: string; modelPending?: boolean; effortPending?: boolean; mode?: string; fast?: string; auth?: string; authLive?: string; authPending?: boolean; authBoth?: boolean; authAcct?: string; ctx?: string; ctxOver?: boolean; ctxColor?: number[]; modelColor?: number[]; effortColor?: number[]; modelTone?: number[]; effortTone?: number[]; ctxTone?: number[]; faded?: boolean; backend?: string; apiTooLong?: boolean; apiSpendLimit?: boolean; apiModelLimit?: boolean; apiAuthErr?: boolean; apiRefusal?: boolean; retrySuppressed?: boolean; retryNextAt?: number | null; retryTries?: number | null; }   // awaitingWhy/awaitingTasks = what an awaitingBg session is waiting on (kernel _session_awaiting's phrasing + the live awaited task descriptions) — the #bg-tasks box renders it as the header of the in-flight rows (renderBgTasks; the user 2026-08-13, who moved it out of the statusline the same day PR #350 put it there)   // retrySuppressed = the user interrupted this thread's API-error storm → romp's auto-retry stays OFF for it until a successful turn re-arms (the user 2026-07-06). backend = "tmux" | "sdk"; apiTooLong = the "blocked" is a "prompt is too long" error (on you → red tab) vs a transient API error (amber/retrying); apiSpendLimit = a monthly spend cap (on you → raise it; NEVER auto-retried — retrying can't fix it, the user 2026-07-14); apiModelLimit = this session's MODEL is out of allowance (on you → switch model or add credits; not auto-retried either, the user 2026-08-01); apiRefusal = the model's safeguards refused the prompt itself (on you → rewrite it or drop the thread; never auto-retried — a refusal is deterministic on the same input, so a retry just manufactures the same refusal, the user 2026-08-15); ctxColor = the GLOBAL colormap's RGB for the context%, computed server-side; modelColor/effortColor = the same map's RGB tint for the model name + effort (by capability/effort rank), server-computed; modelPending = a /model switch is resolving → the badge shows switching-dots until the new name lands (server-driven, event-based, the user 2026-07-03); fast = the CLI's fast-mode state ("on"/"off"/"cooldown", from the SDK init's fast_mode_state; absent = unknown/unavailable → no fast badge)
+// which billing sides this box can bill, and why not for the other (kernel _auth_avail, 2026-09-08): the
+// Billing submenu lists both and greys the unavailable one with the reason in its hover
+interface AuthAvail { login?: boolean; key?: boolean; loginWhy?: string; keyWhy?: string; acct?: string; default?: string }
+interface Status { state: ChipState; sinceEpoch: number | null; awaitingWhy?: string | null; awaitingKind?: string | null; awaitingPeers?: PeerIdent[] | null; awaitingTasks?: string[]; awaitingTaskIds?: string[]; awaitingCount?: number | null; awaitingItems?: AwaitRow[]; effort?: string; model?: string; modelPending?: boolean; effortPending?: boolean; mode?: string; fast?: string; auth?: string; authLive?: string; authPending?: boolean; authBoth?: boolean; authAvail?: AuthAvail; authPickUnavailable?: string; authPickFell?: string; authAcct?: string; ctx?: string; ctxOver?: boolean; ctxColor?: number[]; modelColor?: number[]; effortColor?: number[]; modelTone?: number[]; effortTone?: number[]; ctxTone?: number[]; faded?: boolean; backend?: string; apiTooLong?: boolean; apiSpendLimit?: boolean; apiModelLimit?: boolean; apiAuthErr?: boolean; apiRefusal?: boolean; retrySuppressed?: boolean; retryNextAt?: number | null; retryTries?: number | null; }   // awaitingWhy/awaitingTasks = what an awaitingBg session is waiting on (kernel _session_awaiting's phrasing + the live awaited task descriptions) — the #bg-tasks box renders it as the header of the in-flight rows (renderBgTasks; the user 2026-08-13, who moved it out of the statusline the same day PR #350 put it there)   // retrySuppressed = the user interrupted this thread's API-error storm → romp's auto-retry stays OFF for it until a successful turn re-arms (the user 2026-07-06). backend = "tmux" | "sdk"; apiTooLong = the "blocked" is a "prompt is too long" error (on you → red tab) vs a transient API error (amber/retrying); apiSpendLimit = a monthly spend cap (on you → raise it; NEVER auto-retried — retrying can't fix it, the user 2026-07-14); apiModelLimit = this session's MODEL is out of allowance (on you → switch model or add credits; not auto-retried either, the user 2026-08-01); apiRefusal = the model's safeguards refused the prompt itself (on you → rewrite it or drop the thread; never auto-retried — a refusal is deterministic on the same input, so a retry just manufactures the same refusal, the user 2026-08-15); ctxColor = the GLOBAL colormap's RGB for the context%, computed server-side; modelColor/effortColor = the same map's RGB tint for the model name + effort (by capability/effort rank), server-computed; modelPending = a /model switch is resolving → the badge shows switching-dots until the new name lands (server-driven, event-based, the user 2026-07-03); fast = the CLI's fast-mode state ("on"/"off"/"cooldown", from the SDK init's fast_mode_state; absent = unknown/unavailable → no fast badge)
+
+// The side a pick this box cannot bill actually fell to ("login" | "key"), "" when nothing did: the kernel's
+// authPickFell (the launch's own decision, 2026-09-09). An older kernel without the field is read the way the
+// Billing sub-line always inferred it: the pick is unavailable and the other side exists.
+function authFellTo(st: Status): string {
+  if (st.authPickFell !== undefined) return st.authPickFell || "";
+  if (!st.auth || st.authPickUnavailable !== st.auth) return "";
+  const other = st.auth === "key" ? "login" : "key";
+  const avail: AuthAvail = st.authAvail || { login: true, key: true };
+  return avail[other] ? other : "";
+}
 interface Color { bg: string; fg: string; }
 // A run_in_background task surfaced in the #bg-tasks box (the kernel's _bg_tasks): a one-line summary +
 // status, expandable to the command + its output. status = running | completed | failed. For a dispatched
@@ -1064,7 +1083,7 @@ let landTrail: string[] = [];
 // count is NOT len − winStart + spacer: a unit may own more than one node (the day
 // divider that opens a new day precedes its turn), so anything mapping DOM back to
 // units reads data-unit off the node rather than counting children.
-interface View { el: HTMLElement; rendered: number; scrollTop: number; stick: boolean; shown: boolean; stale: boolean; winStart: number; winEnd?: number; avgTurnH?: number; spacerCount?: number; spacerCountBot?: number; unitTotal?: number; working?: boolean; ro?: ResizeObserver; mo?: MutationObserver; }   // working: the session's state at the last sync, the "worked …" footer's one non-event input (syncViewInner)
+interface View { el: HTMLElement; rendered: number; scrollTop: number; stick: boolean; shown: boolean; stale: boolean; winStart: number; winEnd?: number; avgTurnH?: number; spacerCount?: number; spacerCountBot?: number; unitTotal?: number; working?: boolean; uo?: ResizeObserver; uh?: WeakMap<Element, number>; ro?: ResizeObserver; mo?: MutationObserver; }   // working: the session's state at the last sync, the "worked …" footer's one non-event input (syncViewInner)
 const views = new Map<string, View>();
 
 // Pending pickers (AskUserQuestion / tool-permission) keyed by session id. These
@@ -1454,7 +1473,8 @@ function foldable(label: string, content: HTMLElement, key?: string): HTMLElemen
 // detached from the timeline. Nested → return the bare card; it sits in the parent turn's rail column under
 // its single dot (connected, like any in-turn card). A standalone notice (romp system) IS its own top-level
 // turn, so it keeps the .turn wrapper + dot.
-function noticeCard(o: { variant: "agent" | "romp" | "reminder" | "compact" | "clear"; chip: string; logo?: boolean;
+type NoticeVariant = "agent" | "romp" | "reminder" | "compact" | "clear" | "peer" | "refusal";
+function noticeCard(o: { variant: NoticeVariant; chip: string; logo?: boolean;
                         head: string; body: HTMLElement; collapsible?: boolean; key?: string;
                         nested?: boolean }): HTMLElement {
   const card = el("div", "notice-card notice-card-" + o.variant + (o.nested ? " notice-nested" : ""));
@@ -1503,9 +1523,10 @@ function noticeCard(o: { variant: "agent" | "romp" | "reminder" | "compact" | "c
 //     tool-use-id (ev.taskOutputs — the client can't read the output file itself).
 // When there is genuinely nothing more than the gist, the card renders FLAT (no caret, no repeated body) —
 // honest, and no dead-end. The pure parse lives in agent-notif.ts (testable); this owns the DOM.
-function renderAgentNotif(a: AgentNotif, outputs?: TaskOutputs, key?: string): HTMLElement {
+function renderAgentNotif(a: AgentNotif, outputs?: TaskOutputs, key?: string,
+                          opts: { nested?: boolean; preamble?: string } = {}): HTMLElement {
   const chip = a.kind === "agent" ? "agent" : "task";       // a Bash command is a task, not an "agent"
-  const head = a.detail ? `${a.label} · ${a.detail}` : a.label;
+  const head = notifHead(a);                                // "Background agent finished · <description>" (the user 2026-09-07)
   const body = el("div", "notice-md md");
   const extra = a.toolUseId && outputs ? outputs[a.toolUseId] : undefined;
   let hasBody = false;
@@ -1516,8 +1537,47 @@ function renderAgentNotif(a: AgentNotif, outputs?: TaskOutputs, key?: string): H
     if (extra.output) { const lbl = el("div", "notice-sub"); lbl.textContent = "output"; body.appendChild(lbl); body.appendChild(preEl(extra.output)); }
     hasBody = true;
   }
+  if (opts.preamble) { appendHarnessNote(body, opts.preamble); hasBody = true; }
+  // nested (the default) inside a carrying HUMAN turn — a prompt that arrived with a notification attached;
+  // on its OWN rail (nested: false) when the record was nothing but the notification (renderInjected)
   return noticeCard({ variant: "agent", chip, head, body, key,
-                      collapsible: hasBody, nested: true });   // flat when the gist is all there is; rendered inside the carrying user turn
+                      collapsible: hasBody, nested: opts.nested !== false });   // flat when the gist is all there is
+}
+
+// The CLI's note-to-the-model paragraph ("[SYSTEM NOTIFICATION - NOT USER INPUT] …"), kept one click away
+// inside a notice body under a dim "harness note" label — never shown as the message (the user 2026-09-07).
+function appendHarnessNote(body: HTMLElement, preamble: string): void {
+  const lbl = el("div", "notice-sub"); lbl.textContent = "harness note";
+  body.appendChild(lbl);
+  body.appendChild(preEl(preamble));
+}
+
+// A harness-INJECTED user-role record — a background agent's completion, a system notice, a scheduled task's
+// firing, a peer's message — rendered as a labelled notice on the left rail, never the user's bubble (the
+// user 2026-09-07: subagent reports and system notices were showing as their own typed words). The kernel
+// classifies by the record's OWN fields (origin.kind, then the notification's <summary>) and ships
+// `source`; this owns the DOM. Head = the source in the user's terms (injected-source.ts); body = the
+// report / message, folded by default (progressive disclosure); the CLI's preamble sits under "harness
+// note" inside the fold. Compact transcript treats it like every other notice card (its own collapse).
+function renderInjected(ev: Extract<ChatEvent, { kind: "user" }>): HTMLElement {
+  const src = ev.source as InjectedSource;
+  const notifs: { a: AgentNotif; i: number }[] = [];
+  const plain: string[] = [];
+  (ev.reminders || []).forEach((r, i) => { const a = parseAgentNotif(r); if (a) notifs.push({ a, i }); else plain.push(r); });
+  const text = (ev.md || "").replace(/<!--[\s\S]*?-->/g, "").trim();
+  const key = ev.uuid ? "inj:" + ev.uuid : undefined;
+  if (notifs.length === 1 && !text && !plain.length) {
+    // the common record: one background task came to rest and that is all it says → the task's own card,
+    // on its own rail; its body is the agent's report (or the command's shell + output tail)
+    return renderAgentNotif(notifs[0].a, ev.taskOutputs, key, { nested: false, preamble: ev.preamble });
+  }
+  const h = injectedHead(src);
+  const body = el("div", "notice-md md");
+  if (text) { const t = el("div", "md"); t.innerHTML = md(text); highlight(t); body.appendChild(t); }
+  for (const { a, i } of notifs) body.appendChild(renderAgentNotif(a, ev.taskOutputs, ev.uuid ? "agn:" + ev.uuid + ":" + i : undefined));
+  for (const r of plain) body.appendChild(preEl(r));
+  if (ev.preamble) appendHarnessNote(body, ev.preamble);
+  return noticeCard({ variant: h.variant, chip: h.chip, head: h.head, body, key, collapsible: body.childNodes.length > 0 });
 }
 
 // ---- path-source pasted images ----
@@ -2802,6 +2862,11 @@ function renderEventInner(ev: ChatEvent): HTMLElement {
                           collapsible: more,
                           key: ev.uuid ? "rsys:" + ev.uuid : undefined });
     }
+    // A harness-INJECTED record the kernel could NAME (ev.source: a background agent's completion, a system
+    // notice, a peer's message) → its labelled notice card, never a bubble of any color (the user 2026-09-07).
+    // Never for a genuine prompt (human), even one that arrived with a notification attached — that stays the
+    // blue bubble with the nested agent card below it.
+    if (ev.source && !ev.human) return renderInjected(ev);
     // Three flavors of a "user-role" turn: a GENUINE typed prompt → the blue right-aligned bubble; a
     // message romp INJECTED (a feed nudge / follow-up — ev.romp) → a GRAY right-aligned bubble with a
     // "romp" tag, so it's clear romp (not you) sent it (the user 2026-06-19); everything else harness-
@@ -3828,30 +3893,32 @@ function renderCmdGesture(ev: Extract<ChatEvent, { kind: "cmdGesture" }>): HTMLE
   return turn;
 }
 
-// The durable "safeguards flagged → switched model" note (the user 2026-08-03: a mid-turn model swap
-// must be apparent in the chat, never silent). Slim rail line in the warning voice, placed where the
-// retry started — i.e. just above the fallback model's reply. The CLI's full explanation (why the
-// safeguards fired, the /feedback pointer) expands on click; fold state survives re-renders via the
-// record's uuid key.
 function renderModelFallback(ev: Extract<ChatEvent, { kind: "modelFallback" }>): HTMLElement {
-  const turn = el("div", "turn turn-retried turn-modelswap");
-  turn.appendChild(dot("ring"));
-  const line = el("div", "retried-line modelswap-line");
-  const txt = el("span", "retried-text modelswap-text");
+  // A safeguards refusal the CLI retried on a fallback model: the swap must be visible where it happened
+  // (the user 2026-08-03), as a SOURCED notice in the shared notice-card grammar (T279). The head is the
+  // gist: whose safeguards flagged the message, the refusal category when the API named one, and which
+  // model answered instead. The fold holds the API's explanation (when it sent one) and the CLI's own
+  // line, verbatim. 'local' scope: only that reply (a subagent's or a side question's) came from the
+  // fallback model and the session's model is unchanged, so the head says so instead of "switched".
   const from = ev.from ? prettyModel(ev.from) : "";
   const to = ev.to ? prettyModel(ev.to) : "a fallback model";
-  txt.textContent = `${from || "The model"}'s safeguards flagged this message · switched to ${to}`;
-  line.appendChild(txt);
-  turn.appendChild(line);
-  if (ev.md) {
-    const body = el("div", "modelswap-body");
-    body.textContent = ev.md;
-    const key = ev.uuid ? "mswap:" + ev.uuid : undefined;
-    applyFold(body, "expanded", key);
-    line.title = "click for the full notice";
-    line.addEventListener("click", () => rememberFold(body, "expanded", key));
-    turn.appendChild(body);
-  }
+  const cat = (ev.category || "").trim();
+  const local = ev.scope === "local";
+  const head = `${from || "The model"}'s safeguards flagged this message${cat ? ` (${cat})` : ""} · ` +
+    (local ? `this reply came from ${to}` : `switched to ${to}`);
+  const body = el("div", "refusal-notice");
+  // the fold's first line restates the swap and the category: a narrow pane ellipsizes the head from the
+  // right, which cuts exactly these two facts, and a compact view must never dead-end (the full head is
+  // the hover too)
+  const swapLine = el("div", "refusal-swap");
+  swapLine.textContent = `${from || "the model"} → ${to}${cat ? " · " + cat : ""}`;
+  body.appendChild(swapLine);
+  const expl = (ev.explanation || "").trim();
+  if (expl) { const p = el("div", "refusal-explanation"); p.textContent = expl; body.appendChild(p); }
+  if (ev.md) { const p = el("div", "refusal-cli-line"); p.textContent = ev.md; body.appendChild(p); }
+  const turn = noticeCard({ variant: "refusal", chip: "safeguards", head, body,
+                            collapsible: body.childNodes.length > 0, key: ev.uuid ? "mswap:" + ev.uuid : undefined });
+  turn.querySelector(".notice-head-text")?.setAttribute("title", head);
   return turn;
 }
 
@@ -4751,11 +4818,16 @@ function renderTeammate(ev: Extract<ChatEvent, { kind: "teammate" }>): HTMLEleme
 
   const head = el("div", "teammate-head");
   const tag = el("span", "teammate-tag");
-  tag.textContent = "teammate";
-  tag.title = "a message from another Claude agent — not from you, not the romp postal service";
+  // the kernel's source (origin-stamped deliveries, CLI 2.1.263): one of THIS session's background agents
+  // messaging its parent is labelled so, not as a "teammate" from elsewhere (the user 2026-09-07)
+  const fromSub = !!(ev.source && ev.source.subagent);
+  tag.textContent = fromSub ? "background agent" : "teammate";
+  tag.title = fromSub ? "a message from one of this session's background agents — not from you"
+    : "a message from another Claude agent — not from you, not the romp postal service";
   head.appendChild(tag);
   // the sending agent name(s) as PLAIN text — no colored session chip (that's the postal card's language)
   const ids = (ev.blocks || []).map((b) => b.id).filter(Boolean);
+  if (!ids.length && ev.source && ev.source.name) ids.push(ev.source.name);
   if (ids.length) {
     const names = el("span", "teammate-names");
     names.textContent = ids.length <= 3 ? ids.join(", ") : ids.slice(0, 2).join(", ") + ", +" + (ids.length - 2);
@@ -5075,6 +5147,14 @@ function showTabTip(tab: HTMLElement, s: Session): void {
   if (s.status.auth) rows.push(["Billing",
     s.status.authPending
       ? (s.status.auth === "key" ? "API key" : "Login") + " (applying — not confirmed yet)"
+      // the pick names a side this box cannot bill (the kernel's authPickUnavailable, with the reason
+      // in authAvail): the launch went to the other side, and the row says so (the user 2026-09-08)
+      : s.status.authPickUnavailable === s.status.auth
+        ? `⚠ ${s.status.auth === "key" ? "API key" : "Login"} picked, but ${(s.status.auth === "key" ? s.status.authAvail?.keyWhy : s.status.authAvail?.loginWhy) || "this machine cannot bill it"}`
+          // the fall is the kernel's word (authFellTo), never inferred from the pick alone: on a box with
+          // neither side the launch went out as picked and the CLI decided (2026-09-09)
+          + (authFellTo(s.status) ? ` — this session bills ${authFellTo(s.status) === "key" ? "the API key" : "the login"}`
+                                  : " — nothing to fall to, so the launch went out as picked")
       : s.status.authLive && s.status.authLive !== s.status.auth
         ? `⚠ ${s.status.auth === "key" ? "API key" : "Login"} picked, but the CLI reports `
           + `${s.status.authLive === "key" ? "the API key" : "the login"} — this session bills that`
@@ -6003,13 +6083,21 @@ function showTabMenu(e: MouseEvent, id: string, copy?: string) {   // `copy`: th
   // backgrounding; the kernel migrated existing hidden entries into the "archived" tag. revealIn
   // survives for the picker's tagged-session jump.)
   // Billing submenu (the user 2026-08-09, who wants the login/API-key switch here rather than as a
-  // statusline badge). Only when the machine offers BOTH choices (st.authBoth) — a one-auth machine
-  // keeps the fact on the tab hover, never a dead selector — and the key stays labelled plainly
-  // 'API key', no fragment of it anywhere. Clicking opens a flyout with the two choices, the
-  // session's current one check-marked; a pick posts the same setAuth the badge used (the session
-  // reconnects to apply, so the sub-line says "applying…" while st.authPending rides the status).
+  // statusline badge). For EVERY SDK session (st.auth is set; the user 2026-09-08: the picker never
+  // disappears — it once existed only when the machine offered both choices, so a one-auth box had
+  // the fact on the tab hover and no control beside it). The flyout lists BOTH choices always; the one
+  // this box cannot bill (st.authAvail, with the kernel's reason) renders disabled, greyed, the reason
+  // in its hover, and a click on it posts nothing. The session's current pick is check-marked even
+  // when it is the unavailable one: the launch fell to the other side (st.authPickUnavailable, the
+  // kernel's honest record) and the sub-line says so. The key stays labelled plainly 'API key', no
+  // fragment of it anywhere. A pick posts the same setAuth the badge used (the session reconnects to
+  // apply, so the sub-line says "applying…" while st.authPending rides the status). An older kernel
+  // sends no authAvail: its authBoth keeps the old both-or-nothing gate.
   const st = s ? s.status : null;
-  if (st && st.auth && st.authBoth) {
+  if (st && st.auth && (st.authAvail || st.authBoth)) {
+    const avail: AuthAvail = st.authAvail || { login: true, key: true };
+    const otherOf = (v: string) => (v === "key" ? "login" : "key");
+    const wordOf = (v: string) => (v === "key" ? "API key" : "login");
     // (no divider: billing sits in the behavior section with the toggles — the by-kind grouping)
     const item = el("div", "ctx-item ctx-item-toggle ctx-item-billing");
     item.appendChild(ctxIcon("bill", false));
@@ -6017,6 +6105,9 @@ function showTabMenu(e: MouseEvent, id: string, copy?: string) {   // `copy`: th
     const l = el("span", "ctx-item-label"); l.textContent = "Billing"; bodyEl.appendChild(l);
     const sb = el("span", "ctx-item-sub");
     sb.textContent = st.authPending ? "applying…"
+      : st.authPickUnavailable === st.auth
+        // the pick names a side this box cannot bill — the launch went to the other one when it exists
+        ? `⚠ ${wordOf(st.auth)} unavailable` + (authFellTo(st) ? `, billing ${wordOf(authFellTo(st))}` : "")
       : st.authLive && st.authLive !== st.auth
         ? `⚠ CLI reports ${st.authLive === "key" ? "API key" : "login"}`   // the pick did not take — say so where the switch lives (T124)
         : (st.auth === "key" ? "API key" : (st.authAcct ? `Login (${st.authAcct})` : "Login"));
@@ -6028,12 +6119,17 @@ function showTabMenu(e: MouseEvent, id: string, copy?: string) {   // `copy`: th
       const open = menu.querySelector(".ctx-sub");
       if (open) { open.remove(); return; }                       // second click folds the flyout
       const sub = el("div", "ctx-menu ctx-sub");
-      for (const c of [{ label: st.authAcct ? `Login (${st.authAcct})` : "Login", value: "login" },
-                       { label: "API key", value: "key" }]) {
-        const opt = el("div", "ctx-item" + (st.auth === c.value ? " current" : ""));
+      for (const c of [{ label: st.authAcct ? `Login (${st.authAcct})` : "Login", value: "login", why: avail.login ? "" : (avail.loginWhy || "no Claude login signed in on this machine") },
+                       { label: "API key", value: "key", why: avail.key ? "" : (avail.keyWhy || "no apiKeyHelper configured") }]) {
+        const opt = el("div", "ctx-item" + (st.auth === c.value ? " current" : "") + (c.why ? " disabled" : ""));
         opt.textContent = c.label;
+        if (c.why) {   // unavailable here: greyed, the reason on hover, inert (the user 2026-09-08)
+          opt.title = c.why;
+          opt.setAttribute("aria-disabled", "true");
+        }
         opt.addEventListener("click", (ev2) => {
           ev2.stopPropagation();
+          if (c.why) return;                                       // a disabled option posts nothing, and the menu stays
           dismissTabMenu();
           if (st.auth !== c.value && vscodeApi) vscodeApi.postMessage({ type: "setAuth", id, value: c.value });
         });
@@ -6983,7 +7079,7 @@ function requestSessionList(host: string): void {
 // rule was really against). The row still disappears when the backend toggle says tmux (that CLI
 // lives in the tmux server's environment, which the kernel does not control) and until the host's
 // sessionList reply carries authAvail (an older kernel never answers with one).
-let pickerAuthAvail: { login?: boolean; key?: boolean; acct?: string; default?: string } | null = null;
+let pickerAuthAvail: AuthAvail | null = null;
 
 // the picker's selected Backend chip — the Backend row alone (the Billing, Host and Tags rows wear the
 // same chip grammar, and a selected tag chip must never read as a backend)
@@ -7026,6 +7122,9 @@ function syncPickerAuth(): void {
     fixed.style.display = both ? "none" : "";
     // one real choice → written out in the buttons' place, naming the login account when known
     fixed.textContent = both ? "" : (a!.key ? "API key" : (a!.acct ? `Login (${a!.acct})` : "Login"));
+    // …and the hover says why the OTHER side is not on offer (the kernel's reason, 2026-09-08)
+    fixed.title = both ? "" : (a!.key ? `Login unavailable: ${a!.loginWhy || "no Claude login signed in on this machine"}`
+                                      : `API key unavailable: ${a!.keyWhy || "no apiKeyHelper configured"}`);
   }
   if (!both) return;   // the fixed text is the whole row — nothing to seed
   // the Login button's hover names WHICH account (the user 2026-08-09)
@@ -9452,7 +9551,7 @@ function tailMutations(records: MutationRecord[]): { removedTail: string[]; adde
 // the cap is the default unless the page's localStorage says otherwise (a laptop capturing raises it; T262j)
 const scrollDiagCap = readScrollDiagCap((k) => { try { return localStorage.getItem(k); } catch { return null; } });
 const scrollDiag = new ScrollDiagBudget(scrollDiagCap);
-function scrollDiagRow(kind: "scrollwrite" | "scrollgesture" | "tailchange" | "spacer" | "tailmut", data: any): void {
+function scrollDiagRow(kind: "scrollwrite" | "scrollgesture" | "tailchange" | "spacer" | "tailmut" | "unitchange", data: any): void {
   const v = scrollDiag.take(activeId || "", kind, Date.now());
   if (v === "drop") return;
   vscodeApi?.postMessage(v === "cap"
@@ -9573,8 +9672,12 @@ function scrollToAnchor(uuid: string): boolean {
   // node's prompt IS the incoming message) — never an assistant turn. A peer opener
   // used to be refused here (.turn-postal-service isn't .turn-user) and fall through to the
   // time fallback; accepting postal lets it resolve BY ID instead (the user 2026-06-20).
+  // A harness-injected record's notice card (.turn-notice, renderInjected) is a user-role message too: a
+  // turn opened by a STAMPED prompt (a scheduled task's firing) renders as a sourced notice, not .turn-user,
+  // so a prompt-intent link into it was refused as the wrong kind (review find, 2026-09-09, on #1099).
   if (pendingAnchorIntent === "user"
-      && !target.classList.contains("turn-user") && !target.classList.contains("turn-postal-service")) {
+      && !target.classList.contains("turn-user") && !target.classList.contains("turn-postal-service")
+      && !target.classList.contains("turn-notice")) {
     pendingAnchor = null; pendingAnchorIntent = null; landTrail.push("pointer-wrong-kind"); return false;
   }
   pendingAnchor = null; pendingAnchorIntent = null;
@@ -9820,8 +9923,42 @@ function ensureView(id: string): View {
       // ResizeObserver (frame-end sizes only) yet clamps the reader if a layout is forced in between — the remaining
       // snap's shape. Every removal at the END of the active view files a tailmut row: what left, whether it came
       // back in the same task, the scroll height the pane last recorded and the one after.
+      // …and a ResizeObserver over EVERY unit in the rendered window (T262n, the user 2026-09-08: an eleven-minute
+      // laptop capture held one unwritten move, a 24 px shrink with the reader at the bottom, and no row named what
+      // shrank). The rail above says the view changed height and names the TAIL; a unit above the tail changing height
+      // in place (a tool head folding, a figure sizing in, a status line going) moves the view by the same amount and
+      // the rail's row can only name the tail. This one names the unit: its class, how many units above the tail it
+      // sits, the view's recorded follow mode and the measured bottom at the read. A row only: no write, no rule. The
+      // tail unit is left to the rail's row (unitChanges skips it), spacers to their spacer rows. Units join and leave
+      // this observer through the mutation observer below (a window slide replaces them all), and a unit's first
+      // observation is its baseline, never a row. Same per-kind, per-minute cap as every other row.
+      const view3 = v;
+      const unitHeights = new WeakMap<Element, number>();
+      v.uh = unitHeights;
+      let unitW = -1;   // the view's width at the last observation: a change means every unit reflowed, not a unit that changed
+      const unitOf = (n: Element) => { const u = (n as HTMLElement).dataset?.unit; return u != null && u !== "" ? Number(u) : undefined; };
+      v.uo = new ResizeObserver((entries) => {
+        // A hidden view's units have no box: the observer reports each at 0x0 on hide and at its full height on
+        // re-show, neither a change in the unit (the review's find: one switch back would have filed a row per unit
+        // and burnt the minute's cap). The hide forgets the reported baselines and files nothing; the re-show
+        // observation records fresh ones, like a first show. Covers the tab switch and stripAftermath's blank.
+        if (view3.el.style.display === "none") { for (const e of entries) unitHeights.delete(e.target); return; }
+        // …and a width change reflows every unit at once (a resize, a scrollbar appearing): the new heights become
+        // the baselines and nothing is filed — a hundred honest rows would say nothing about any one unit.
+        const w = view3.el.clientWidth;
+        if (w !== unitW) { unitW = w; for (const e of entries) unitHeights.set(e.target, e.contentRect?.height ?? 0); return; }
+        const changes = unitChanges(entries.map((e) => ({ target: e.target, height: e.contentRect?.height ?? 0 })), view3.el.children, unitHeights, unitOf);
+        const content = document.getElementById("content");
+        if (!content || activeId !== id || !view3.shown) return;   // baselines are recorded above regardless; an inactive view files nothing
+        for (const c of changes)
+          scrollDiagRow("unitchange", unitChangeRow(id, c.dh, c.cls, c.fromTail, view3.stick, atBottom(content), content.scrollHeight, content.clientHeight));
+      });
       const view2 = v;
       v.mo = new MutationObserver((records) => {
+        for (const rec of records) {   // units entering the window are observed, units leaving are dropped (T262n)
+          rec.addedNodes.forEach((n) => { if (n instanceof Element) view2.uo?.observe(n); });
+          rec.removedNodes.forEach((n) => { if (n instanceof Element) { view2.uo?.unobserve(n); unitHeights.delete(n); } });
+        }
         if (activeId !== id || !view2.shown) return;
         const m = tailMutations(records);
         if (!m) return;
@@ -10997,6 +11134,39 @@ if (typeof ResizeObserver === "function") {
       }
       tailLastH = h;
     }).observe(tailHost);
+  }
+}
+// …and the scroller's boxes OUTSIDE the thread (the T262n follow-up, the user's 2026-09-08 laptop capture: its one
+// unwritten move, a 24 px shrink with the reader at the bottom, had no tailchange row, so it came from outside the
+// thread element, on a remote-host tab, where the one such box is the host-offline foot). #content's direct children
+// that are not a thread and not the live-ask host — the foot, #sub-head, the build placeholders — file the unit row
+// with fromTail BOX_FROM_TAIL, named by id else class: on appearing (their height, read once), on changing in place
+// (the observer) and on leaving (the height they had). A box removed under a bottom reader is exactly a clamp to the
+// bottom by its height, and the browser writes nothing; the row is attribution only, nothing moves for it.
+if (typeof ResizeObserver === "function") {
+  const c = document.getElementById("content");
+  if (c) {
+    const boxHeights = new WeakMap<Element, number>();
+    const isBox = (n: Node): n is HTMLElement => n instanceof HTMLElement && !n.classList.contains("thread") && n.id !== "live-ask";
+    const fileBox = (dh: number, cls: string) => {
+      const v = activeId ? views.get(activeId) : null;
+      if (!dh || !v || !v.shown || c.clientHeight <= 0) return;
+      scrollDiagRow("unitchange", unitChangeRow(activeId || "", dh, cls, BOX_FROM_TAIL, v.stick, atBottom(c), c.scrollHeight, c.clientHeight));
+    };
+    const boxRo = new ResizeObserver((entries) => {   // offsetHeight both here and at the baseline: one measure, no false first row
+      // the whole pane hidden measures every box at 0: forget those baselines and file nothing; the re-show
+      // observation is a fresh baseline (the same rule as the unit observer's hide)
+      if (c.clientHeight <= 0) { for (const e of entries) boxHeights.delete(e.target); return; }
+      for (const b of boxChanges(entries.map((e) => ({ target: e.target as HTMLElement, height: (e.target as HTMLElement).offsetHeight })), boxHeights)) fileBox(b.dh, b.cls);
+    });
+    const watchBox = (n: HTMLElement): number => { const h = n.offsetHeight; boxHeights.set(n, h); boxRo.observe(n); return h; };
+    for (const n of Array.from(c.children)) if (isBox(n)) watchBox(n);   // what is there now is the baseline, no row
+    new MutationObserver((records) => {
+      for (const rec of records) {
+        rec.removedNodes.forEach((n) => { if (isBox(n)) { const h = boxHeights.get(n) || 0; boxRo.unobserve(n); boxHeights.delete(n); fileBox(-h, boxLabel(n)); } });
+        rec.addedNodes.forEach((n) => { if (isBox(n)) fileBox(watchBox(n), boxLabel(n)); });
+      }
+    }).observe(c, { childList: true });
   }
 }
 // Boxes ABOVE the transcript grow/shrink → keep the chat text visually anchored (the user 2026-06-30 for
@@ -12377,12 +12547,13 @@ const FAST_CHOICES: { label: string; value: string }[] = [
   { label: "Fast", value: "on" },
   { label: "Slow", value: "off" },
 ];
-// Per-session billing (the user 2026-08-08) — the Claude login vs the API key the manager's
-// environment carries — is no longer a statusline badge: the SWITCHING control lives in the tab's
-// right-click menu (showTabMenu's Billing flyout, the user 2026-08-09), still gated on st.authBoth
-// so a one-auth machine shows no dead selector, and still labelled plainly 'API key' — no fragment
-// of the key, not even a last-4 tail, is shipped or shown (2026-08-08, evening). The tab hover's
-// Billing row keeps carrying the fact everywhere.
+// Per-session billing (the user 2026-08-08) — the Claude login vs the API key behind Claude Code's
+// apiKeyHelper — is no longer a statusline badge: the SWITCHING control lives in the tab's
+// right-click menu (showTabMenu's Billing flyout, the user 2026-08-09), on every SDK session since
+// 2026-09-08 (both choices listed, the one this box cannot bill greyed with the reason; it was gated
+// on st.authBoth before), and still labelled plainly 'API key' — no fragment of the key, not even a
+// last-4 tail, is shipped or shown (2026-08-08, evening). The tab hover's Billing row keeps carrying
+// the fact everywhere.
 // the fast-mode state ("on"/"off"/"cooldown") → the badge label. ONE WORD (the user 2026-08-10, on a
 // phone-width statusline), but the WORD carries the state: off reads "Slow", not a second "Fast" —
 // tint alone (orange on, dim off) didn't say which side the toggle was on (the user 2026-08-11).
@@ -13094,6 +13265,7 @@ function retirePendingShip(key: string, shipId?: string): string | null {
     if (!list.length) pendingShips.delete(id);
     persistDrafts();
     if (id === activeId) renderComposerFiles(id);
+    endReloadHoldIfIdle();
     return id;
   }
   return null;
@@ -13161,6 +13333,29 @@ let shipGateSid: string | null = null;
 // Assigned by setupComposer (sendComposer lives in its closure); the WS ack handler fires a held
 // send through it when the last pending ship lands.
 let fireHeldSend: () => void = () => {};
+// The reload core (kernel.py _RELOAD_CORE_JS) asks every pane before it reloads the page (T265). A page reload
+// costs an upload in flight its bytes (persistDrafts keeps only the names, for the loss toast) and a send held on
+// the upload gate its release — the T215 wedge the reconnect re-ship heals in the same page. So while a ship
+// awaits its ack, or a send is held on one, this pane reports itself busy and the core waits for the ending event
+// (the ack retires the chip, the held send fires) before it fires; the shim's own reasons come first (T272).
+{
+  const shimBusy = (window as any).__rompPaneBusy as (() => string) | undefined;
+  (window as any).__rompPaneBusy = (): string => {
+    const b = shimBusy ? shimBusy() : "";
+    if (b) return b;
+    // only ships whose ack can still arrive hold (reload-hold.ts): a ship to a host whose relay is down, or to a host
+    // no longer attached, would otherwise hold every reload of this tab for good (the review of this hold)
+    return reloadHoldReason([...pendingShips.keys()], shipGateSid, (window as any).__rompFed);
+  };
+}
+// The ENDING event of those holds, told to the core the way the shim tells it its own (kernel.py ws.onopen →
+// __rompReload.ended()): the moment the last pending ship retires and no send is held, an owed reload may fire. The
+// core re-tries only on gesture ends, blur, a fresh request or the shell's poll, so without this a standalone page
+// stayed on the old build until the user's next unrelated click (the review of this change).
+function endReloadHoldIfIdle(): void {
+  if (pendingShips.size || shipGateSid) return;
+  try { (window as any).__rompReload?.ended?.(); } catch { /* a page without the core (the VS Code webview) */ }
+}
 
 // Persist drafts across a full RELOAD (the user 2026-06-25: a half-typed message must survive a refresh, not
 // only a tab switch). The Map is in-memory, so mirror it into the webview's persisted state — the same store
@@ -13543,6 +13738,7 @@ function renderComposerFiles(id: string | null): void {
         if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }
         if (held || gateWasOpen) warnToast("The pending upload was dismissed — your held message was NOT sent.");
       }
+      endReloadHoldIfIdle();   // after the settle above cleared the gate: the dismissed last chip ends the hold (T272)
       renderComposerFiles(id);
     });
     box.appendChild(x);
@@ -14038,7 +14234,7 @@ function upsert(msg: any) {
   }
   if (forked) {
     const v = views.get(msg.id);
-    if (v) { v.ro?.disconnect(); v.mo?.disconnect(); v.el.remove(); views.delete(msg.id); }
+    if (v) { v.uo?.disconnect(); v.ro?.disconnect(); v.mo?.disconnect(); v.el.remove(); views.delete(msg.id); }
   } else if (existed && !kept) {
     // A full frame replaces every event object and can differ from what this view rendered ANYWHERE (it is
     // what the kernel sends a client it believes is behind): the tail path trusts v.rendered as the exact
@@ -14488,7 +14684,7 @@ function dismissSession(id: string, why: DismissWhy, doomed?: ReadonlySet<string
     persistDrafts();   // a host drop / omission KEEPS it all (see DismissWhy) — the stash above may have updated the copy
   }
   const v = views.get(id);
-  if (v) { v.ro?.disconnect(); v.mo?.disconnect(); v.el.remove(); views.delete(id); }
+  if (v) { v.uo?.disconnect(); v.ro?.disconnect(); v.mo?.disconnect(); v.el.remove(); views.delete(id); }
   const oi = order.indexOf(id); if (oi >= 0) order.splice(oi, 1);
   const mi = mru.indexOf(id); if (mi >= 0) mru.splice(mi, 1);   // before the fallback read below — never the dead id
   renderTabs();                          // tab removed from `order` above → repaint without it
@@ -14861,6 +15057,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       if (gateOpen) { shipGateSid = null; closeConfirm(null); }
       if (owner === activeId) fireHeldSend();
       else warnToast("attachments finished uploading on another tab — the held message was not sent; review it there.");
+      endReloadHoldIfIdle();   // the ending event follows the release: the held send has been posted
     }
   } else if (m.type === "dropSaveFailed" && typeof m.name === "string") {
     // the kernel could not SAVE the shipped bytes — clear the pending chip and say so loudly,
@@ -14872,6 +15069,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     const held = !!owner && sendOnShip.delete(owner);    // a held send must not fire without the file it waited for
     const gateWasOpen = shipGateSid === owner;
     if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }   // the question is moot — but a failed save never auto-sends
+    endReloadHoldIfIdle();
     warnToast(m.name + " couldn't be saved on the kernel, so it was not attached — try again."
               + (held || gateWasOpen ? " Your message was NOT sent." : ""));
     if (owner && owner === activeId) renderComposerFiles(owner);   // the held-send button state clears with the hold
@@ -15100,7 +15298,7 @@ function setupComposer() {
                   [{ label: "Wait for the upload", value: "wait" },
                    { label: "Send without " + them, value: "now", danger: true }],
                   (v) => {
-                    shipGateSid = null;
+                    shipGateSid = null; endReloadHoldIfIdle();
                     if (v === "now") sendComposer({ pastShipGate: true });
                     else if (v === "wait") { sendOnShip.add(sid); renderComposerFiles(sid); }
                   });

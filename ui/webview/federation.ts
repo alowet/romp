@@ -75,6 +75,7 @@ const OBJ_ID = ["tabs"]; //                       an array of objects keyed by `
 // them).
 const KERNEL_SETTING = new Set(["setAutoNudge", "setJudgeModel", "setIndexModel",
                                 "setJudgeEffort", "setIndexEffort", "setUpdateMode",
+                                "setJudgeConcurrency",   // T277: the judges' pool width, one value across machines
                                 "setDistillModel", "setDistillEffort", "setFileEditing",
                                 "setCompactSuggest",
                                 "setCommentModel", "setCommentEffort", "setCommentFast"]);
@@ -191,9 +192,36 @@ function _prefixTimelineDetail(host: string, d: any): any {
       if (typeof c.toId === "string") c.toId = prefixId(host, c.toId);
       return c;
     });
-  for (const k of ["judging"])
-    if (Array.isArray(out[k]))
-      out[k] = out[k].map((e: any) => (e && typeof e === "object" && typeof e.sid === "string" ? { ...e, sid: prefixId(host, e.sid) } : e));
+  // judging rides PER LANE, compact (T278c: {sid: [{k, t, t1, j, ...}]}), so its keys are prefixed like the
+  // lanes'; an older kernel's flat list (entries carrying `sid`) is converted to that shape first, so the
+  // merge below and the pane's expander see one shape whatever build each host runs
+  if (out.judging !== undefined) {
+    const jw = judgingToWire(out.judging);
+    const j: any = {};
+    for (const [sid, lane] of Object.entries(jw)) j[prefixId(host, sid)] = lane;
+    out.judging = j;
+  }
+  return out;
+}
+
+/** The compact per-lane judging shape from either shape: a flat list of {judge, sid, t, t1, kind, text, ms, in, out,
+ *  sent, recv, open} (a kernel older than T278c) is grouped by sid into the kernel's compact entries; a map passes
+ *  through. Mirrors kernel/kernel.py _compact_judging. */
+export function judgingToWire(j: any): Record<string, any[]> {
+  if (!Array.isArray(j)) return (j && typeof j === "object") ? j : {};
+  const out: Record<string, any[]> = {};
+  for (const e of j) {
+    if (!e || typeof e !== "object") continue;
+    const c: any = { k: `${e.t}\u001f${e.judge}`, t: e.t, j: e.judge };   // (t, judge): the kernel's key, stable for an in-flight run
+    if (e.t1 !== undefined && e.t1 !== null) c.t1 = e.t1;
+    if (e.kind && e.kind !== "run") c.kd = e.kind;
+    if (e.text) c.x = String(e.text).slice(0, 90);
+    for (const f of ["ms", "in", "out"]) if (e[f]) c[f] = e[f];
+    if (e.sent !== undefined && e.sent !== null) c.s = e.sent;
+    if (e.recv !== undefined && e.recv !== null) c.r = e.recv;
+    if (e.open) c.u = true;
+    (out[String(e.sid ?? "")] ||= []).push(c);
+  }
   return out;
 }
 
@@ -450,7 +478,8 @@ export function mergeHostFeeds(perHost: Record<string, any>, hostSeq: readonly s
 // sender-clock COPY of sent in exec, which therefore shifts with its emitter like sent itself.
 const SKEW_FLOOR_S = 1;
 const BAR_TIMES = ["start", "end"] as const;      // turns[sid] bars
-const MARK_TIMES = ["t"] as const;                // judging / nudge marks
+const MARK_TIMES = ["t"] as const;                // nudge marks
+const JUDGING_TIMES = ["t", "t1", "s", "r"] as const;   // a compact judging entry's clocks (T278c)
 const LANE_TIMES = ["since"] as const;            // session rows
 
 export function hostOffsets(perHost: Record<string, any>): Record<string, number> {
@@ -484,8 +513,13 @@ export function rebaseHostTimes(d: any, off: number): any {
       t[sid] = Array.isArray(bars) ? bars.map((b: any) => shiftRow(b, BAR_TIMES, off)) : bars;
     c.turns = t;
   }
-  for (const k of ["judging", "nudges"] as const)
-    if (Array.isArray(c[k])) c[k] = c[k].map((m: any) => shiftRow(m, MARK_TIMES, off));
+  if (Array.isArray(c.nudges)) c.nudges = c.nudges.map((m: any) => shiftRow(m, MARK_TIMES, off));
+  if (c.judging !== undefined) {
+    const jw = judgingToWire(c.judging);
+    const j: any = {};
+    for (const [sid, lane] of Object.entries(jw)) j[sid] = Array.isArray(lane) ? lane.map((e: any) => shiftRow(e, JUDGING_TIMES, off)) : lane;
+    c.judging = j;
+  }
   if (Array.isArray(c.messages))
     c.messages = c.messages.map((m: any) => {
       const s = shiftRow(m, ["sent"], off);
@@ -552,13 +586,14 @@ export function mergeHostTimelines(perHost: Record<string, any>, hostSeq: readon
                                    view: readonly string[] = [], deadHosts: readonly string[] = []): any {
   const local = perHost[LOCAL] || {};
   const offsets = hostOffsets(perHost);   // each host's clock vs the local authority, this merge
-  const merged: any = { ...local, sessions: [], turns: {}, messages: [], judging: [] };
+  const merged: any = { ...local, sessions: [], turns: {}, messages: [], judging: {} };
   for (const h of hostSeq) {
     const d = rebaseHostTimes(perHost[h], offsets[h] || 0);
     if (!d) continue;
     if (Array.isArray(d.sessions)) merged.sessions.push(...d.sessions.map((s: any) => ({ ...s, host: h })));
     if (d.turns && typeof d.turns === "object") Object.assign(merged.turns, d.turns);
-    for (const k of ["messages", "judging"]) if (Array.isArray(d[k])) merged[k].push(...d[k]);
+    if (Array.isArray(d.messages)) merged.messages.push(...d.messages);
+    if (d.judging !== undefined) Object.assign(merged.judging, judgingToWire(d.judging));   // per lane, like turns (T278c)
   }
   // lanes are the third surface reading this order (chat strip, feed groups, timeline lanes): arrange them
   // the same way, before the message stitch, which pairs postal arrows against the lane list.
@@ -584,12 +619,13 @@ export function mergeHostBars(perHost: Record<string, any>, hostSeq: readonly st
                               sessions: readonly any[] = []): any {
   const local = perHost[LOCAL] || {};
   const offsets = hostOffsets(perHost);   // each host's clock vs the local authority, this merge
-  const merged: any = { ...local, type: "bars", turns: {}, messages: [], judging: [], warming: false };
+  const merged: any = { ...local, type: "bars", turns: {}, messages: [], judging: {}, warming: false };
   for (const h of hostSeq) {
     const b = rebaseHostTimes(perHost[h], offsets[h] || 0);
     if (!b) continue;
     if (b.turns && typeof b.turns === "object") Object.assign(merged.turns, b.turns);
-    for (const k of ["messages", "judging", "nudges"]) if (Array.isArray(b[k])) merged[k].push(...b[k]);
+    for (const k of ["messages", "nudges"]) if (Array.isArray(b[k]) && Array.isArray(merged[k])) merged[k].push(...b[k]);
+    if (b.judging !== undefined) Object.assign(merged.judging, judgingToWire(b.judging));   // per lane, like turns (T278c)
     if (b.warming) merged.warming = true;   // still warming if ANY host's build is the cold partial (keep the loader)
   }
   merged.messages = rebaseExecs(stitchMessages(merged.messages, sessions), offsets);

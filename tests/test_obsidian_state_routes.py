@@ -85,7 +85,9 @@ class _Routes(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self._state = km.jd.STATE
-        km.jd.STATE = Path(self.td.name)
+        # _rebind_state, not STATE alone: the kernel's judge is one module object shared by every test module in the process (each kernel load re-executes bin/romp-judge into the same sys.modules entry); a store written at its import-bound GOALDIR is read by every later module's feed (T281). Assigning STATE left GOALDIR at the run-wide root, so every
+        # goal store these routes saved for the placeholder sid outlived this module.
+        km.jd._rebind_state(Path(self.td.name))
         km._flags_cache.clear()
         self._saved = (km._mark_views_dirty, km._sync_notice)
         self.dirty, self.notices = [], []
@@ -94,9 +96,19 @@ class _Routes(unittest.TestCase):
 
     def tearDown(self):
         km._mark_views_dirty, km._sync_notice = self._saved
-        km.jd.STATE = self._state
+        km.jd._rebind_state(self._state)
         km._flags_cache.clear()
         self.td.cleanup()
+
+    def test_the_stores_these_routes_write_do_not_outlive_the_module(self):
+        # The residue pin (T281): a store saved through the kernel's judge lands under THIS test's root, and the
+        # run-wide root (what every later module's feed reads) is left exactly as it was.
+        shared = Path(self._state) / "goals" / (SID + ".json")
+        before = (shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None)
+        km.jd.save_goals(SID, {"nodes": {SID + ":t281": {"id": SID + ":t281", "text": "a note", "parentId": None, "t": 1, "mt": 1}}})
+        self.assertTrue((Path(self.td.name) / "goals" / (SID + ".json")).exists(), "the store lives under this module's root")
+        self.assertEqual((shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None), before,
+                         "the run-wide goals directory is untouched by this module")
 
     def _post(self, path, body=None, raw=None, token=os.environ["ROMP_SERVE_TOKEN"]):
         headers = {"Content-Type": "application/json"}

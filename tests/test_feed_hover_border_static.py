@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""T270 (the user 2026-09-08): hovering a card in the feed's group-by-session view thickens its coloured
-border, and that must NOT move the card's text, nor the card below. Their recording showed the hovered
+"""T270 (the user 2026-09-08): hovering a card in the feed's group-by-session view bolds its coloured border
+by colour and shadow, and that must NOT move the card's text, nor the card below. Their recording showed the hovered
 card's text block shifting 1 px down and 1 px right and the card under it dropping 1 px.
 
 The served guard drives the real /feed page from a hermetic kernel with a synthetic payload (one session,
 two cards in the same column, grouped mode), hovers the first card, and compares the CONTENT boxes: the
 hovered card's text block and the second card must sit exactly where they sat at rest, while the border
-paint does thicken (the hover cue itself stays). Skips LOUDLY without the extension deps or a Playwright
+colour bolds and the shadow lifts (the hover cue itself stays). The regression pins are the computed-style
+equalities (border width, margin, padding) and the card's OUTER box; the content-box rects are consistency
+checks that also held under the earlier border-grow rule. Skips LOUDLY without the extension deps or a Playwright
 browser (CI installs none). FEED_HOVER_SHOTS=<path-prefix> writes rest + hover screenshots. All fixtures
 synthetic (the notes-api demo world).
 """
@@ -75,7 +77,8 @@ await page.waitForTimeout(250);
 const rest = await measure();
 if (cfg.shots) await page.screenshot({ path: cfg.shots + "-rest.png", clip: { x: 0, y: 0, width: 420, height: 320 } });
 await page.hover(`[data-key="a:${cfg.top}"] .fitem-main`);
-await page.waitForTimeout(350);   // the hover class lands on mouseenter; the transition is 0.12 s
+await page.waitForSelector(`[data-key="a:${cfg.top}"].focused`, { timeout: 5000 });   // the class lands after the 120 ms hover-intent debounce (event-keyed wait)
+await page.waitForTimeout(200);   // the box-shadow transition is 0.12 s
 const hover = await measure();
 if (cfg.shots) await page.screenshot({ path: cfg.shots + "-hover.png", clip: { x: 0, y: 0, width: 420, height: 320 } });
 fs.writeSync(1, "RESULT:" + JSON.stringify({ rest, hover, errors }) + "\n");
@@ -124,7 +127,7 @@ class ServedHoverKeepsTextStill(unittest.TestCase):
             cls.kernel.wait()
         shutil.rmtree(getattr(cls, "lab", ""), ignore_errors=True)
 
-    def test_hovering_a_card_thickens_its_border_without_moving_its_text_or_the_card_below(self):
+    def test_hovering_a_card_bolds_its_border_colour_without_moving_its_text_or_the_card_below(self):
         cfg = os.path.join(self.lab, "cfg.json")
         with open(cfg, "w") as f:
             json.dump({"feed": "http://127.0.0.1:%d/feed?token=%s" % (self.port, self.token), "sid": SID,
@@ -151,6 +154,7 @@ class ServedHoverKeepsTextStill(unittest.TestCase):
         self.assertEqual(rest["border"], hover["border"], "border width unchanged: rest %r hover %r" % (rest["border"], hover["border"]))
         self.assertEqual(rest["margin"], hover["margin"], "margin unchanged: rest %r hover %r" % (rest["margin"], hover["margin"]))
         self.assertEqual(rest["padding"], hover["padding"], "padding unchanged: rest %r hover %r" % (rest["padding"], hover["padding"]))
+        self.assertEqual(rest["topCard"], hover["topCard"], "the card's outer box is unchanged — paint only (red on the border-grow rule): rest %r hover %r" % (rest["topCard"], hover["topCard"]))
         # …and so nothing inside or below moved — the text block and the card below keep their exact boxes
         self.assertEqual(rest["topMain"], hover["topMain"], "the hovered card's content box did not move: rest %r hover %r" % (rest["topMain"], hover["topMain"]))
         self.assertEqual(rest["topText"], hover["topText"], "…nor its first text block: rest %r hover %r" % (rest["topText"], hover["topText"]))

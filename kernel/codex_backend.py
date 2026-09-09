@@ -40,6 +40,14 @@ from pathlib import Path
 HERE = Path(os.path.dirname(os.path.realpath(__file__)))
 _events = SourceFileLoader("romp_codex_events", str(HERE / "codex_events.py")).load_module()
 _runtime = SourceFileLoader("romp_codex_runtime", str(HERE / "codex_runtime.py")).load_module()
+# The by-text KEY RULE (session_backend.echo_text_key): the one normalization under which an input echo's
+# text is compared with a transcript record's, shared with the kernel's _atom_user_texts and
+# SdkBackend.prune_live, so an echo whose text carries a trailing newline still lands. The kernel's own
+# copy of that module when it is loaded (kernel.py loads it as romp_session_backend, and TmuxBackend
+# subclasses that copy's ABC); otherwise the file is loaded under its OWN module name, as sdk_backend
+# does, so re-executing the source never rebinds the ABC out from under a subclass.
+echo_text_key = (sys.modules.get("romp_session_backend") or SourceFileLoader(
+    "romp_session_backend_keys", str(HERE / "session_backend.py")).load_module()).echo_text_key
 
 SDK_PIN = "openai-codex==0.144.4"     # bin/romp-codex-setup installs exactly this into codexvenv
 SETUP_HINT = ("Session not created: the Codex backend isn't installed. "
@@ -277,7 +285,9 @@ class CodexBackend:
         self._client_retry_at = 0.0
         self._client_failures = 0
         self._client_generation = 0   # successful app-server client installations
-        self._catalog = None          # model_catalog() cache — fetched once per process
+        self._catalog = None          # model_catalog() cache: a NON-EMPTY list, fetched once per process
+        self._catalog_err = None      # why the last model_catalog() answered [] (str), or None
+        self._catalog_lock = threading.Lock()   # one model_catalog() read at a time (see its docstring)
         self._client_lock = threading.Lock()
         self._sessions = {}           # sid → _Session
         self._sessions_lock = threading.RLock()
@@ -697,19 +707,43 @@ class CodexBackend:
         with open(path, "a", encoding="utf-8") as f:
             for r in recs:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        # a landed user record replaces its optimistic echo (uuid-independent: match by text)
-        landed = {self._rec_text(r) for r in recs if r.get("type") == "user"}
+        # A landed user record replaces its optimistic echoes (uuid-independent: match by text, under
+        # echo_text_key on both sides). ONE echo per landed text BLOCK, the OLDEST carrying the text. A
+        # block is one send: the worker starts a turn from its whole queue, one input per queued send, and
+        # the normalizer writes the app-server's one userMessage item as one record with a block per input
+        # (codex_events._user_input_texts), so a turn started from two queued sends lands both echoes here;
+        # a one-send record is one block. One per key, not every echo carrying it: a second identical
+        # STEER (delivered mid-turn, never queued) keeps its echo when the first one's record lands, and a
+        # second send dropped after that (the client dying mid-queue) stays visible. The kernel's
+        # prune_live is the other retire, floored by record time; this one sees only the records it just
+        # wrote.
+        landed = [t for r in recs if r.get("type") == "user" for t in self._rec_texts(r)]
         if landed:
             with s.lock:
-                s.echoes = [e for e in s.echoes if e["text"] not in landed]
+                kept = list(s.echoes)
+                for text in landed:
+                    for i, e in enumerate(kept):
+                        if echo_text_key(e.get("text")) == text:
+                            del kept[i]
+                            break
+                if len(kept) != len(s.echoes):
+                    s.echoes = kept
 
     @staticmethod
-    def _rec_text(rec):
+    def _rec_texts(rec):
+        """A user record's texts under the shared key rule (echo_text_key: outer whitespace stripped,
+        nothing else), the key send() stores on the echo and _append and prune_live compare: one entry per
+        text BLOCK (a string content is one entry), empty ones dropped. Per block and never the blocks
+        joined: each block of a Codex user record is one send (see _append), and this retire takes exactly
+        one echo per send. The kernel's prune_live also matches the record's space-joined text
+        (_atom_user_texts yields the joined text and each block), floored by record time; that match is
+        not repeated here."""
         c = (rec.get("message") or {}).get("content")
         if isinstance(c, list):
-            return " ".join(b.get("text", "") for b in c
-                            if isinstance(b, dict) and b.get("type") == "text").strip()
-        return (c or "").strip() if isinstance(c, str) else ""
+            keys = [echo_text_key(b.get("text")) for b in c if isinstance(b, dict) and b.get("type") == "text"]
+        else:
+            keys = [echo_text_key(c)]
+        return [k for k in keys if k]
 
     # ── liveness / identity ──────────────────────────────────────────────────────────────────────
     def end_marker(self, sid):
@@ -769,8 +803,13 @@ class CodexBackend:
         with s.lock:
             if s.dead:
                 return False
-            s.echoes.append({"text": text.strip(), "t": time.time(),
-                             "uuid": "echo-%s" % uuidlib.uuid4().hex[:8]})
+            # WHOLE seconds, as the SDK and tmux echoes stamp theirs: record times are parse_z's int
+            # seconds and prune_live lands an echo by text only through a record at or after its send,
+            # so a float stamp would keep an echo whose record was written later in the same second. The
+            # text is stored under the shared key rule (echo_text_key), the key prune_live and _append
+            # compare against. The uuid is kept: it names THIS send's echo on the dead path below.
+            echo_uuid = "echo-%s" % uuidlib.uuid4().hex[:8]
+            s.echoes.append({"text": echo_text_key(text), "t": int(time.time()), "uuid": echo_uuid})
             turn_id = s.turn_id
             tid = s.tid
         if c is not None and turn_id:
@@ -783,7 +822,11 @@ class CodexBackend:
                 pass
         with s.lock:
             if s.dead:
-                s.echoes = [e for e in s.echoes if e["text"] != text.strip()]
+                # The session died during the steer RPC: take back THIS send's echo, by the uuid minted
+                # above, and no other. Retiring by text would take an earlier same-text send the
+                # app-server never recorded with it. prune_live's rule applies here too: a send the
+                # app-server never records stays visible, and no other send's failure retires it.
+                s.echoes = [e for e in s.echoes if e["uuid"] != echo_uuid]
                 return False
             entry_id = "q-%s" % uuidlib.uuid4().hex
             s.queue.append(text)
@@ -839,24 +882,59 @@ class CodexBackend:
 
     def model_catalog(self):
         """[{value,label}] for the UI's model picker — the app-server's own model list (the ONE
-        authoritative source), fetched once per process and cached. [] when the client is
-        unavailable (the picker then shows nothing rather than another vendor's list). A plan
-        account may still refuse some listed models per turn — that failure surfaces loudly as
-        the turn's error card, and switching back is one click."""
-        if self._catalog is not None:
-            return self._catalog
-        c = self._get_client()
-        if c is None:
-            return []
-        try:
-            ms = c.model_list()
-            self._catalog = [{"value": m.id, "label": getattr(m, "display_name", None) or m.id}
-                             for m in (getattr(ms, "data", None) or [])
-                             if not getattr(m, "hidden", False)]
-        except Exception as e:
-            self.log("model_list failed: %s" % e)
-            return []
-        return self._catalog
+        authoritative source), fetched once per process and cached. [] when the list cannot be had,
+        and then model_catalog_error() says WHY (the picker shows nothing rather than another vendor's
+        list, and the kernel's /models hands the reason on). Three ways to [], each recorded: the
+        client is unavailable (_get_client() None: the factory failed, or the client sits in its retry
+        backoff), model_list raised, or the app-server answered an EMPTY page. Only a NON-EMPTY list is
+        cached: an empty page `is not None`, and caching it would hold the empty catalog for the life of
+        the process, a blank menu on every later picker open after the app-server has models to list.
+        Each failure is logged once per DISTINCT reason, not once per call: the kernel
+        re-reads the catalog on every picker open and every models frame, and a per-call line repeats
+        for as long as the fault lasts. The read runs under _catalog_lock: /models is served from handler
+        threads, and two readers racing the same first read would otherwise both log the same reason, or
+        one that found no client would record its reason after the other had stored the list and cleared
+        it, a stale reason beside a held catalog. A plan account may still refuse some listed models per
+        turn — that failure surfaces loudly as the turn's error card, and switching back is one click."""
+        with self._catalog_lock:
+            if self._catalog:
+                return self._catalog
+            c = self._get_client()
+            if c is None:
+                self._note_catalog_error("the Codex app-server client is unavailable: %s"
+                                         % (self._client_err or "not started yet"))
+                return []
+            try:
+                ms = c.model_list()
+                rows = [{"value": m.id, "label": getattr(m, "display_name", None) or m.id}
+                        for m in (getattr(ms, "data", None) or [])
+                        if not getattr(m, "hidden", False)]
+            except Exception as e:
+                self._note_catalog_error("model_list failed: %s" % (str(e) or e.__class__.__name__))
+                return []
+            if not rows:
+                self._note_catalog_error("the Codex app-server listed no models")
+                return []
+            self._catalog = rows
+            self._catalog_err = None
+            return rows
+
+    def _note_catalog_error(self, why):
+        """Record why model_catalog() answered [] and log it once per distinct reason (see model_catalog).
+        Caller owns _catalog_lock."""
+        if why != self._catalog_err:
+            self.log(why)
+        self._catalog_err = why
+
+    def model_catalog_error(self):
+        """Why the last model_catalog() answered [] (one sentence for a picker to show), or None when
+        a catalog is held or none has been asked for yet. The kernel's /models reads it after an empty
+        answer; the failure is the app-server's or the client's, so the sentence names that side.
+        Read under _catalog_lock like every writer of the reason, so a concurrent read that is mid-way
+        through storing a list or recording its own reason cannot hand this caller a half-updated value
+        (review find, 2026-09-09)."""
+        with self._catalog_lock:
+            return self._catalog_err
 
     def set_mode(self, sid, mode):
         s = self._session(sid)
@@ -1103,33 +1181,18 @@ class CodexBackend:
                 # verification — the r28 kernel-layer reorder missed this layer)
                 s.name = old_name
                 raise
-            nf = self.state / "names" / s.sid
-            try:
-                old_line = nf.read_bytes()
-            except OSError:
-                old_line = None
             try:
                 self._write_name(s)       # keep the shared identity file in sync (colours preserved)
             except BaseException:
                 s.name = old_name         # compensate: the registry write above is re-run with
                 #                           the old name so the stores stay agreed; the raise
                 #                           still reaches the caller (loud)
-                if old_line is not None:
-                    try:
-                        nf.write_bytes(old_line)   # write_text TRUNCATES before it fails — an
-                        #                            ENOSPC left the identity file (and its
-                        #                            colours) empty (the r29 verification)
-                    except OSError as e2:
-                        self.log("codex rename: names/%s left truncated by a failed write (%s)"
-                                 % (s.sid, e2))
-                else:
-                    try:
-                        nf.unlink(missing_ok=True)  # _write_name may have CREATED a partial file
-                        #                             holding the NEW name — a failed rename must
-                        #                             not stay published (the r30 verification)
-                    except OSError as e2:
-                        self.log("codex rename: a partial names/%s could not be removed (%s)"
-                                 % (s.sid, e2))
+                # No restore write for the names file: _write_name is tmp + os.replace and removes
+                # its own temp (the r32 shape), so a raise leaves names/<sid> exactly as it was — and
+                # creates nothing when there was no file. The in-place nf.write_bytes the r29/r30
+                # branches carried predates that: it was the one non-atomic write on this path, an
+                # mtime bump for no content change, and under the very ENOSPC it existed for it
+                # truncated a good file to nothing, then blamed "a failed write" (review, 2026-09-08).
                 try:
                     self._save_registry(s, fields=("name",))
                 except Exception as e2:
@@ -1188,34 +1251,27 @@ class CodexBackend:
                 s.norm = None
             self._ensure_norm(s)
             self.transcript_path(s.sid).touch()
-            nf = self.state / "names" / s.sid
-            try:
-                old_line = nf.read_bytes()
-            except OSError:
-                old_line = None
             try:
                 self._write_name(s)
             except (OSError, UnicodeDecodeError) as e:
                 # the thread is HEALTHY — failing the turn over a cosmetic identity write would
                 # be worse (a decode failure from crash residue sailed through an OSError-only
-                # catch and DID fail the turn, unhealed forever — the r31 verification) — but
-                # the write must not leave residue either. Restore the old line, or remove the
-                # partial file.
-                try:
-                    if old_line is not None:
-                        nf.write_bytes(old_line)
-                        self.log("codex: names/%s write failed after thread start (%s) — the "
-                                 "identity file was restored; it refreshes on the next rename"
-                                 % (s.sid, e))
-                    else:
-                        nf.unlink(missing_ok=True)
-                        self.log("codex: names/%s could not be published after thread start "
-                                 "(%s) — the session runs UNNAMED on shared surfaces until a "
-                                 "rename lands; a same-name create may collide meanwhile"
-                                 % (s.sid, e))
-                except OSError:
-                    self.log("codex: names/%s left in an unknown state by a failed write (%s)"
-                             % (s.sid, e))
+                # catch and DID fail the turn, unhealed forever — the r31 verification). No
+                # restore write for the names file: _write_name is tmp + os.replace and removes
+                # its own temp (the r32 shape), so a raise leaves names/<sid> exactly as it was —
+                # and creates nothing when there was no file. The in-place nf.write_bytes(old_line)
+                # this branch carried predates that: it was the one non-atomic write on this path,
+                # an mtime bump for no content change, and under the very ENOSPC it existed for it
+                # truncated a good file to nothing, then blamed "a failed write" (#1138 dropped the
+                # same shape from rename; this is its twin, 2026-09-09). The log still says which
+                # of the two states the file is in — READ after the fact, never rewritten.
+                if (self.state / "names" / s.sid).is_file():
+                    self.log("codex: names/%s write failed after thread start (%s) — the identity "
+                             "file kept its old line; it refreshes on the next rename" % (s.sid, e))
+                else:
+                    self.log("codex: names/%s could not be published after thread start (%s) — "
+                             "the session runs UNNAMED on shared surfaces until a rename lands; "
+                             "a same-name create may collide meanwhile" % (s.sid, e))
             self.push()
             return True
         c.thread_resume(tid, {"cwd": cwd, **_approval_params(s.mode),
@@ -1447,20 +1503,61 @@ class CodexBackend:
         if not s:
             return []
         with s.lock:
+            # `_echo_text` marks the atom as an INPUT ECHO to the kernel, as SdkBackend's echo atoms do:
+            # _merge_live_atoms hides it behind its queued bubble (shown_texts) and never counts it as
+            # live work (an echo-only merge keeps the turn's real ended state), and build_session's
+            # queued-bubble pass enlists it while the session is busy. Without the marker an echo paints
+            # as a solid user atom beside its own queued bubble and forces the last turn open: a false
+            # "working" chip for a session whose only live item is a pending send.
             return [{"type": "user", "uuid": e["uuid"], "session_id": sid, "fsid": s.tid,
-                     "t": e["t"], "parentUuid": None, "author": "human",
+                     "t": e["t"], "parentUuid": None, "author": "human", "_echo_text": e["text"],
                      "message": {"role": "user",
                                  "content": [{"type": "text", "text": e["text"]}]}}
                     for e in s.echoes]
 
-    def prune_live(self, sid, tx_uuids, tx_user_texts=()):
+    def prune_live(self, sid, tx_uuids, tx_user_texts=(), human_floor=0):
+        """Drop the optimistic input echoes the transcript has caught up on, in the SessionBackend
+        contract's full call shape (the kernel's _merge_live_atoms passes sid, tx_uuids, tx_text_t and
+        human_floor positionally; tests/test_backend_call_parity.py pins the shape against every backend).
+
+        An echo retires on the events SdkBackend.prune_live names: its uuid is on disk, or its text
+        LANDED. `tx_user_texts` as a MAPPING (text -> the newest record time carrying it) lands the echo
+        only through a record written at or after its own send: this prune sees the whole transcript, and
+        without that floor a repeated text ("ok" twice) would retire the second echo the moment it was
+        sent (the SDK's T237b case); a plain set (an older caller) keeps the unfloored match. Texts are
+        compared under echo_text_key on BOTH sides. Record times are parse_z's whole seconds, so send()
+        stamps the echo with int(time.time()) as the SDK and tmux echoes do: a float stamp would keep an
+        echo whose record was written later in the same second. The backend's own _append retire is the
+        other exit; it sees only the records it just wrote and takes one echo per landed text block, the
+        oldest carrying the text (a turn started from several queued sends lands as one record with a
+        block per send; _atom_user_texts yields each block, so this prune lands every echo of such a turn
+        too).
+
+        `human_floor` (the newest genuine-human record's time) is accepted and retires nothing here. No
+        floor retires a plain input echo on any backend: a send the app-server never records must stay
+        visible. The SDK uses the floor to retire its streamed slash-command feedback, atoms carrying
+        `command`, and no Codex echo carries that flag: send() mints plain echoes only."""
         s = self._session(sid)
         if not s:
             return
-        texts = {t.strip() for t in tx_user_texts or ()}
+        uuids = tx_uuids or ()
+        text_t = tx_user_texts if isinstance(tx_user_texts, dict) else None
+        keys = None if text_t is not None else {echo_text_key(t) for t in (tx_user_texts or ())} - {""}
+
+        def _landed(e):
+            if e.get("uuid") in uuids:
+                return True
+            key = echo_text_key(e.get("text"))
+            if not key:
+                return False
+            if text_t is None:
+                return key in keys
+            return key in text_t and float(text_t[key] or 0) >= float(e.get("t") or 0)
+
         with s.lock:
-            s.echoes = [e for e in s.echoes
-                        if e["uuid"] not in (tx_uuids or ()) and e["text"] not in texts]
+            kept = [e for e in s.echoes if not _landed(e)]
+            if len(kept) != len(s.echoes):
+                s.echoes = kept
 
     # ── ask picker (no Codex equivalent in phase 1) ─────────────────────────────────────────────
     def on_ask(self, sid, kind, payload=None):

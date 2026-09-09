@@ -7,6 +7,7 @@ surfaces as launch_error text instead of a silent non-start. All data synthetic 
 
 Run:    python3 tests/test_codex_backend.py
 """
+import contextlib
 import json
 import os
 import queue
@@ -18,6 +19,8 @@ import time
 import unittest
 from unittest import mock
 from importlib.machinery import SourceFileLoader
+
+from tests.conftest import thread_census, wait_for_census
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +31,28 @@ os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
 os.environ.pop("ROMP_STATE_DIR", None)
 cb = SourceFileLoader("romp_codex_backend", os.path.join(ROOT, "kernel", "codex_backend.py")).load_module()
 sb = SourceFileLoader("romp_session_backend", os.path.join(ROOT, "kernel", "session_backend.py")).load_module()
+
+
+@contextlib.contextmanager
+def _disk_full(nf):
+    """ENOSPC beneath the REAL names writer: the publish (os.replace onto names/<sid>) fails, and an
+    in-place write to that file does what ENOSPC does to one — truncates, then fails. Every other path
+    proceeds, so only the writer under test, and any restore aimed at its file, feel the full disk."""
+    want = os.path.realpath(str(nf))
+    real_replace, real_wb = os.replace, Path.write_bytes
+
+    def replace(src, dst, *a, **k):
+        if os.path.realpath(str(dst)) == want:
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst, *a, **k)
+
+    def write_bytes(self, data, *a, **k):
+        if os.path.realpath(str(self)) == want:
+            open(self, "w").close()
+            raise OSError(28, "No space left on device")
+        return real_wb(self, data, *a, **k)
+    with mock.patch.object(os, "replace", replace), mock.patch.object(Path, "write_bytes", write_bytes):
+        yield
 
 
 def until(fn, timeout=5.0, step=0.01):
@@ -61,6 +86,41 @@ def note(method, params):
     return SimpleNamespace(method=method, payload=_Payload(params))
 
 
+_CLIENTS = []                    # every FakeClient made by this module
+_BACKENDS = []                   # every CodexBackend made by this module
+_CENSUS0 = []
+_ORIG_INIT = []
+
+
+def setUpModule():
+    # Residue hygiene (T282): each backend this module builds starts a global pump per client and a worker per
+    # session, daemon threads that parked on the fake client forever and outlived the module (64 of them under
+    # the full suite). Every backend and client is recorded here and ended in tearDownModule, which then pins
+    # the thread census back to what it was when the module started.
+    _CENSUS0[:] = [thread_census()]
+    orig = cb.CodexBackend.__init__
+
+    def recording_init(self, *a, **k):
+        orig(self, *a, **k)
+        _BACKENDS.append(self)
+    _ORIG_INIT[:] = [orig]
+    cb.CodexBackend.__init__ = recording_init
+
+
+def tearDownModule():
+    cb.CodexBackend.__init__ = _ORIG_INIT[0]
+    for be in _BACKENDS:
+        for _, sess in be._session_items():          # a worker returns when it wakes to a dead session
+            with sess.lock:
+                sess.dead = True
+            sess.kick.set()
+    for c in _CLIENTS:
+        c.close()                                    # a pump returns when its client reads as closed
+    _BACKENDS.clear(); _CLIENTS.clear()
+    left = wait_for_census(_CENSUS0[0], timeout=10)
+    assert left == [], "threads outlived this module: %r" % left
+
+
 class FakeClient:
     """Scripted app-server: turn_start opens a queue and streams either the injected script or a
     default echo turn (userMessage + agentMessage + tokenUsage + completed)."""
@@ -72,6 +132,8 @@ class FakeClient:
         self.hold_open = False      # script the turn to stay open (steer/interrupt tests)
         self._n = 0
         self._global = queue.Queue()
+        self._closed = False
+        _CLIENTS.append(self)       # every client ever made is closed when the module ends (T282)
 
     # bookkeeping helpers ------------------------------------------------------------------
     def _rec(self, name, *a):
@@ -90,6 +152,8 @@ class FakeClient:
 
     def close(self):
         self._rec("close")
+        self._closed = True
+        self._global.put(None)      # wakes the backend's global pump, which reads the close and stops (T282)
 
     def thread_start(self, params=None):
         self._rec("thread_start", params)
@@ -119,10 +183,12 @@ class FakeClient:
         ms = 1781100000000 + self._n * 100000
         text = " ".join(i.get("text", "") for i in input_items)
         if script is None:
+            # the app-server's shape: ONE userMessage item carrying the turn's input list, an entry per
+            # input (the worker sends one input per queued send), never the inputs joined into one text
             script = [
                 ("item/completed", {"threadId": tid, "turnId": turn_id, "completedAtMs": ms,
                                     "item": {"type": "userMessage", "id": "u-%d" % self._n,
-                                             "content": [{"type": "text", "text": text}]}}),
+                                             "content": list(input_items)}}),
                 ("item/completed", {"threadId": tid, "turnId": turn_id, "completedAtMs": ms + 1000,
                                     "item": {"type": "agentMessage", "id": "a-%d" % self._n,
                                              "text": "ack: " + text}}),
@@ -163,7 +229,10 @@ class FakeClient:
                                                      "status": "interrupted"}}))
 
     def next_notification(self):
-        return self._global.get()   # blocks forever — the global pump just parks in tests
+        n = self._global.get()      # parks the backend's global pump until a notification or the close
+        if n is None or self._closed:
+            raise RuntimeError("client closed")   # the pump logs "global pump stopped" and returns
+        return n
 
 
 def build(tmp=None, factory=None):
@@ -353,6 +422,36 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(params["permissions"], "romp_workspace")
         self.assertEqual(params["runtimeWorkspaceRoots"], ["/TESTDIR"])
         self.assertNotIn("sandboxPolicy", params)
+
+    def test_two_sends_queued_before_the_turn_land_as_two_blocks_and_retire_both_echoes(self):
+        # Two sends queued before the worker starts a turn (an idle session sent twice quickly, sends
+        # while the client is down or backing off, a resume after a kernel restart) go out as ONE
+        # turn_start with an input per send; the app-server answers one userMessage item carrying both,
+        # and the normalizer lands it as one record with a text block per input. Joined into one block
+        # the record matches neither echo, and both echoes stay live for good, painted beside the record
+        # in every later build.
+        be, fake, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        be._ensure_worker = lambda s: None             # hold the worker so both sends queue
+        self.assertTrue(be.send(sid, "first send"))
+        self.assertTrue(be.send(sid, "second send"))
+        del be._ensure_worker                          # the class method is back in place
+        self.assertEqual([a["_echo_text"] for a in be.live_atoms(sid)], ["first send", "second send"])
+        self.assertTrue(be.wake(sid))
+        self.assertTrue(until(lambda: not be.busy(sid) and not be.pending_queued(sid)))
+        starts = fake.called("turn_start")
+        self.assertEqual(len(starts), 1, "one turn for the whole queue")
+        self.assertEqual([i["text"] for i in starts[0][2]], ["first send", "second send"])
+        recs = [json.loads(l) for l in Path(be.transcript_path(sid)).read_text().splitlines()]
+        users = [r for r in recs if r["type"] == "user"]
+        self.assertEqual(len(users), 1, "one user record for the one item")
+        self.assertEqual(users[0]["message"]["content"],
+                         [{"type": "text", "text": "first send"}, {"type": "text", "text": "second send"}],
+                         "a text block per send, never the sends joined")
+        self.assertTrue(until(lambda: be.live_atoms(sid) == []), "both echoes retired, one per block")
+        s = be._session(sid)
+        with s.lock:
+            self.assertEqual(s.echoes, [])
 
     def test_send_during_open_turn_steers(self):
         be, fake, _ = build()
@@ -1088,6 +1187,72 @@ for i in range(20):
         self.assertEqual(cat, [{"value": "gpt-5-test", "label": "GPT-5 Test"}])
         be.model_catalog()
         self.assertEqual(len(fake.called("model_list")), 1, "catalog is fetched once, then cached")
+        self.assertIsNone(be.model_catalog_error(), "a held catalog carries no error")
+
+    def test_model_catalog_empty_answer_is_not_cached_and_is_named(self):
+        # The picker opened on a blank menu and stayed blank for the life of the kernel: the app-server's
+        # first answer was an empty page, and `[] is not None`, so the empty list was cached as the catalog.
+        # Only a non-empty list is held; an empty answer is named and the next read asks again.
+        be, fake, _ = build()
+        logged = []
+        be.log = logged.append
+        real = fake.model_list
+        pages, asked = [SimpleNamespace(data=[])], []
+
+        def paged(*a, **k):
+            asked.append(1)
+            return pages.pop() if pages else real(*a, **k)
+        fake.model_list = paged
+        self.assertEqual(be.model_catalog(), [])
+        self.assertEqual(be.model_catalog(), [{"value": "gpt-5-test", "label": "GPT-5 Test"}],
+                         "an empty answer is not the catalog: the next read asks the app-server again")
+        self.assertEqual(len(asked), 2)
+        self.assertEqual(logged.count("the Codex app-server listed no models"), 1, "the empty answer is named, once")
+        self.assertIsNone(be.model_catalog_error(), "the held list clears the reason")
+        be.model_catalog()
+        self.assertEqual(len(asked), 2, "the non-empty list is the one that is cached")
+
+    def test_model_catalog_failure_is_named_and_logged_once_per_reason(self):
+        # model_list raised: the backend answered [] and logged a line per call, and the caller had no way to
+        # read why. The reason is readable (model_catalog_error) and logged once per DISTINCT reason: the
+        # kernel re-reads the catalog on every picker open, so a per-call line repeats for as long as the
+        # fault lasts. A later good answer clears the reason.
+        be, fake, _ = build()
+        logged = []
+        be.log = logged.append
+        real = fake.model_list
+        faults = [RuntimeError("app-server not ready"), RuntimeError("app-server not ready"), RuntimeError("pump died")]
+
+        def flaky(*a, **k):
+            if faults:
+                raise faults.pop(0)
+            return real(*a, **k)
+        fake.model_list = flaky
+        named = lambda: [l for l in logged if l.startswith("model_list failed")]
+        self.assertEqual(be.model_catalog(), [])
+        self.assertEqual(be.model_catalog_error(), "model_list failed: app-server not ready")
+        self.assertEqual(be.model_catalog(), [], "the same fault again")
+        self.assertEqual(named(), ["model_list failed: app-server not ready"], "one line for one reason, however many reads")
+        self.assertEqual(be.model_catalog(), [])
+        self.assertEqual(be.model_catalog_error(), "model_list failed: pump died")
+        self.assertEqual(named(), ["model_list failed: app-server not ready", "model_list failed: pump died"],
+                         "a different reason is a new line")
+        self.assertEqual(be.model_catalog(), [{"value": "gpt-5-test", "label": "GPT-5 Test"}],
+                         "the next read retries instead of serving the failed answer")
+        self.assertIsNone(be.model_catalog_error())
+
+    def test_model_catalog_without_a_client_names_the_client_failure(self):
+        # _get_client() None (the factory failed; the client sits in its retry backoff) answered [] with
+        # nothing logged and nothing for the caller to show. The reason carries the client's own failure text.
+        be, _, _ = build(factory=lambda: (_ for _ in ()).throw(RuntimeError("codex login missing")))
+        logged = []
+        be.log = logged.append
+        self.assertEqual(be.model_catalog(), [])
+        want = "the Codex app-server client is unavailable: codex login missing"
+        self.assertEqual(logged.count(want), 1, logged)
+        self.assertEqual(be.model_catalog_error(), want)
+        self.assertEqual(be.model_catalog(), [])
+        self.assertEqual(logged.count(want), 1, "the same reason is logged once, not once per read")
 
     def test_deliver_and_wake_reach_the_agent(self):
         be, fake, _ = build()
@@ -1114,6 +1279,230 @@ for i in range(20):
         recs = [json.loads(l) for l in Path(be.transcript_path(sid)).read_text().splitlines()]
         self.assertTrue(any(r["type"] == "assistant" for r in recs))
         self.assertTrue(be.kill(sid))   # kill's held-final drain notifies too — same reentry
+
+
+class _Clock:
+    """A clock the backend module reads through its `time` global: time() answers `now`, everything
+    else (monotonic, sleep) is the real module's. Patched onto the backend MODULE for one send() call,
+    never onto the time module, so nothing outside the backend sees it."""
+
+    def __init__(self, now):
+        self.now = now
+
+    def time(self):
+        return self.now
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+class PruneLive(unittest.TestCase):
+    """The kernel's _merge_live_atoms calls be.prune_live(sid, tx_uuids, tx_text_t, human_floor), four
+    positional arguments, and CodexBackend.prune_live took three: every live merge of a Codex session
+    holding an echo raised TypeError (the chat build and the feed's merge failed outright; the timeline
+    bars logged a live-merge failure). The call shape is pinned across every backend in
+    tests/test_backend_call_parity.py; this class covers the behaviour in the kernel's REAL shapes:
+    record times are parse_z's whole seconds (the mapping's values are floats of them), and the echo's
+    own stamp is int(time.time()), as the SDK and tmux echoes stamp theirs."""
+
+    def _with_echo(self, text="ship it", t=1000):
+        be, fake, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        s = be._session(sid)
+        with s.lock:
+            s.echoes.append({"text": text, "t": t, "uuid": "echo-11111111"})
+        return be, sid
+
+    def _sent(self, be, sid, text, now):
+        """An echo through send() itself, on the steer path (an open turn: nothing queues, no worker
+        thread runs), with the backend's clock reading `now`."""
+        s = be._session(sid)
+        with s.lock:
+            s.turn_id = "t-live"
+        with mock.patch.object(cb, "time", _Clock(now)):
+            self.assertTrue(be.send(sid, text))
+
+    def test_accepts_the_kernels_four_positional_arguments_and_no_floor_retires_a_plain_echo(self):
+        be, sid = self._with_echo()
+        be.prune_live(sid, frozenset(), {}, 2000)          # the exact caller shape: a set, a mapping, a floor
+        self.assertEqual(len(be.live_atoms(sid)), 1,
+                         "no floor retires a plain echo: a send the app-server never records must stay visible")
+
+    def test_text_lands_only_through_a_record_at_or_after_the_send(self):
+        # "ok" sent twice: the first record predates the second echo, so it must not retire it; a record
+        # stamped at or after the send does. Whole-second record times, as the kernel derives them.
+        be, sid = self._with_echo("ok", t=1000)
+        be.prune_live(sid, frozenset(), {"ok": 999.0}, 0)
+        self.assertEqual(len(be.live_atoms(sid)), 1, "an older record with the same text is not this send")
+        be.prune_live(sid, frozenset(), {"ok": 1000.0}, 0)
+        self.assertEqual(be.live_atoms(sid), [], "a record at the send's second lands it")
+
+    def test_a_record_later_in_the_sends_own_second_lands_the_echo(self):
+        # The echo is stamped in WHOLE seconds like the SDK's and the tmux echo's. A float stamp (1000.3)
+        # would keep an echo whose record was written at 1000.7: parse_z reads that record as 1000, and
+        # 1000 >= 1000.3 is false, the same-second case the SDK retires.
+        be, fake, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        self._sent(be, sid, "ok", 1000.3)
+        atom, = be.live_atoms(sid)
+        self.assertIsInstance(atom["t"], int)
+        self.assertEqual(atom["t"], 1000)
+        be.prune_live(sid, frozenset(), {"ok": 999.0}, 0)
+        self.assertEqual(len(be.live_atoms(sid)), 1, "the second before the send is not this send")
+        be.prune_live(sid, frozenset(), {"ok": 1000.0}, 0)
+        self.assertEqual(be.live_atoms(sid), [], "a record later in the send's own second lands it")
+
+    def test_text_compares_under_the_shared_key_rule_on_both_sides(self):
+        # The ECHO side: an echo whose stored text carries outer whitespace (injected directly, past
+        # send()'s own keying) still lands against the kernel's stripped key.
+        be, sid = self._with_echo("  ship it\n", t=1000)
+        be.prune_live(sid, frozenset(), {"ship it": 1001.0}, 0)
+        self.assertEqual(be.live_atoms(sid), [], "the echo's text is keyed before the comparison")
+        # The SET side: an older caller's plain set, unstripped, keyed the same way and unfloored.
+        be2, sid2 = self._with_echo("ship it", t=1000)
+        be2.prune_live(sid2, frozenset(), {"  ship it\n"}, 0)
+        self.assertEqual(be2.live_atoms(sid2), [], "a plain set keeps the unfloored match, keyed the same way")
+
+    def test_uuid_retires(self):
+        be, sid = self._with_echo("ship it", t=1000)
+        s = be._session(sid)
+        with s.lock:
+            s.echoes.append({"text": "and the tests", "t": 1000, "uuid": "echo-22222222"})
+        be.prune_live(sid, frozenset({"echo-11111111"}), {}, 0)
+        self.assertEqual([a["uuid"] for a in be.live_atoms(sid)], ["echo-22222222"], "by uuid, that echo only")
+
+    def test_unknown_sid_is_a_no_op(self):
+        be, _, _ = build()
+        be.prune_live("7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f", frozenset(), {}, 0)
+
+
+class EchoAtoms(unittest.TestCase):
+    """What the kernel reads off a Codex echo, and how the backend's own retire takes echoes back.
+    `_echo_text` is the marker every kernel reader of an input echo keys on (SdkBackend's echo atoms carry
+    it): _merge_live_atoms hides the echo behind its queued bubble and never counts it as live work, and
+    build_session's queued-bubble pass enlists it while the session is busy. Without it a Codex echo would
+    paint as a solid user atom beside its own queued bubble and force the last turn open (the merge itself
+    is pinned in tests/test_codex_echo_merge.py). Each echo is ONE send: _append takes one echo per landed
+    text BLOCK (a turn started from several queued sends lands as one record with a block per send), the
+    oldest carrying the text, and send()'s dead path takes back only the echo it minted."""
+
+    def test_the_echo_atom_is_marked_as_an_input_echo(self):
+        be, fake, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        s = be._session(sid)
+        with s.lock:
+            s.turn_id = "t-live"                           # an open turn: send() steers, nothing queues
+        self.assertTrue(be.send(sid, "  ship it\n"))
+        atom, = be.live_atoms(sid)
+        self.assertEqual(atom["_echo_text"], "ship it", "the sent text, under the shared key rule")
+        self.assertEqual(atom["message"]["content"][0]["text"], "ship it")
+        self.assertEqual(atom["author"], "human")
+        self.assertNotIn("command", atom, "a plain echo carries no command flag")
+
+    @staticmethod
+    def _rec(kind, uid, text):
+        return {"type": kind, "uuid": uid, "message": {"role": kind, "content": [{"type": "text", "text": text}]}}
+
+    def test_a_landed_record_retires_one_echo_the_oldest_carrying_its_text(self):
+        # One block is one send (each record here has one). Dropping EVERY echo carrying the landed text
+        # loses the second echo of a text sent twice when the first record lands, and a second send dropped
+        # after that (the client dying mid-queue) leaves nothing visible. The kernel's prune_live, floored
+        # by record time, is the other retire; this one sees only the records it just wrote.
+        be, fake, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        s = be._session(sid)
+        with s.lock:
+            s.echoes.extend([{"text": "ok", "t": 1000, "uuid": "echo-11111111"},
+                             {"text": "ok", "t": 1001, "uuid": "echo-22222222"},
+                             {"text": "ship it", "t": 1002, "uuid": "echo-33333333"}])
+        with s.norm_lock:                                  # _append's contract: the caller holds it
+            be._append(s, [self._rec("user", "u-1", "  ok \n")])   # the record side is keyed the same way
+        self.assertEqual([a["uuid"] for a in be.live_atoms(sid)], ["echo-22222222", "echo-33333333"],
+                         "one record, one echo: the oldest carrying its text")
+        with s.norm_lock:
+            be._append(s, [self._rec("user", "u-2", "ok"), self._rec("assistant", "a-1", "ship it")])
+        self.assertEqual([a["uuid"] for a in be.live_atoms(sid)], ["echo-33333333"],
+                         "the second record takes the second echo; an assistant record takes none")
+        with s.norm_lock:
+            be._append(s, [self._rec("user", "u-3", "ok")])
+        self.assertEqual([a["uuid"] for a in be.live_atoms(sid)], ["echo-33333333"],
+                         "a record with no echo left to take retires nothing else")
+
+    @staticmethod
+    def _two_block_record(uid="u-1"):
+        """Shaped like the record the normalizer writes for a turn started from two queued sends (the
+        app-server's one userMessage item, a block per input; codex_events._user_input_texts), with one
+        block left padded so the key rule on the record side is exercised."""
+        return {"type": "user", "uuid": uid,
+                "message": {"role": "user", "content": [{"type": "text", "text": "first send"},
+                                                         {"type": "text", "text": "  second send\n"}]}}
+
+    def test_a_two_block_record_retires_one_echo_per_block(self):
+        # A turn started from two queued sends lands one record with a block per send. One echo per block,
+        # the oldest carrying the text: a joined reading of the record ("first send second send") matches
+        # neither echo and both stay live for good, and taking every echo carrying a landed text would take
+        # a later repeat of the first send with it.
+        be, fake, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        s = be._session(sid)
+        with s.lock:
+            s.echoes.extend([{"text": "first send", "t": 1000, "uuid": "echo-11111111"},
+                             {"text": "second send", "t": 1000, "uuid": "echo-22222222"},
+                             {"text": "third send", "t": 1001, "uuid": "echo-33333333"},
+                             {"text": "first send", "t": 1002, "uuid": "echo-44444444"}])   # sent again, later
+        with s.norm_lock:
+            be._append(s, [self._two_block_record()])
+        self.assertEqual([a["uuid"] for a in be.live_atoms(sid)], ["echo-33333333", "echo-44444444"],
+                         "one record with two blocks retires two echoes, one per block, the oldest of each")
+
+    def test_a_joined_text_echo_does_not_match_a_two_block_record(self):
+        # Per block, never the blocks joined: an echo spelling both texts in ONE message is a third send
+        # the app-server has not recorded, and a joined key (space- or newline-joined) would retire it
+        # against the two-send record. (The kernel's prune_live does match the joined text, floored by
+        # record time; this pins the backend's own retire.) The record is spelled unpadded so a space-join
+        # of its blocks is exactly the first echo's text: a padded block would join to three spaces, match
+        # nothing, and pass for the wrong reason.
+        be, fake, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        s = be._session(sid)
+        with s.lock:
+            s.echoes.extend([{"text": "first send second send", "t": 1000, "uuid": "echo-11111111"},
+                             {"text": "first send\nsecond send", "t": 1000, "uuid": "echo-22222222"}])
+        rec = {"type": "user", "uuid": "u-1",
+               "message": {"role": "user", "content": [{"type": "text", "text": "first send"},
+                                                        {"type": "text", "text": "second send"}]}}
+        with s.norm_lock:
+            be._append(s, [rec])
+        self.assertEqual([a["uuid"] for a in be.live_atoms(sid)], ["echo-11111111", "echo-22222222"],
+                         "neither joined spelling is a block of the record")
+        self.assertEqual(be._rec_texts(self._two_block_record()), ["first send", "second send"],
+                         "one key per block, stripped")
+        self.assertEqual(be._rec_texts({"type": "user", "message": {"role": "user", "content": "  plain \n"}}),
+                         ["plain"], "a string content is one entry")
+        self.assertEqual(be._rec_texts({"type": "user", "message": {"role": "user", "content": [
+            {"type": "text", "text": "   "}, {"type": "image", "source": {}}]}}), [],
+            "blank and non-text blocks key nothing")
+
+    def test_a_send_that_finds_the_session_dead_takes_back_only_its_own_echo(self):
+        # send() minted an echo, steered, and found the session dead under its second lock (it died during
+        # the steer RPC). It takes back the echo it minted, by uuid, and no other: an earlier same-text
+        # send the app-server never recorded must stay visible, the rule prune_live states.
+        be, fake, _ = build()
+        sid = be.spawn("web", "/TESTDIR")
+        s = be._session(sid)
+        with s.lock:
+            s.turn_id = "t-live"                           # an open turn: send() steers
+            s.echoes.append({"text": "ok", "t": 1000, "uuid": "echo-11111111"})   # an earlier, unrecorded send
+
+        def dies_mid_steer(tid, expected_turn_id, input_items):
+            with s.lock:
+                s.dead = True
+            raise RuntimeError("synthetic: the app-server went away during the steer")
+
+        fake.turn_steer = dies_mid_steer
+        self.assertFalse(be.send(sid, "ok"))
+        self.assertEqual([a["uuid"] for a in be.live_atoms(sid)], ["echo-11111111"],
+                         "the earlier echo survives; only the failed send's own echo is taken back")
 
 
 class LaunchErrorNames(unittest.TestCase):
@@ -1250,71 +1639,79 @@ class RaisingRegistryTransactions(unittest.TestCase):
                              "without it the registry alone holds the new name and applies the "
                              "'failed' rename at the next restart")
 
-    def test_a_truncating_names_write_in_rename_is_restored(self):
-        # the r30 mutant hunt: the chmod-0444 fixture fails AT OPEN without truncating, so
-        # deleting the bytes-restore stayed green — this drives the ENOSPC shape the fix names
-        # (write_text truncates, THEN fails)
+    def test_a_failed_publish_in_rename_leaves_the_names_file_untouched(self):
+        # rewritten to the truth (review, 2026-09-08): the old form mocked _write_name with a fake that
+        # truncated the file IN PLACE — something the real tmp+os.replace writer cannot do — and pinned
+        # an in-place RESTORE that, under the very ENOSPC it existed for, truncated a good file to
+        # nothing and then blamed "a failed write". _disk_full drives the REAL writer with the fault
+        # beneath it and models ENOSPC for any in-place write aimed at the file; on origin/main the
+        # restore itself empties the file
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             be = cb.CodexBackend(td, client_factory=lambda: None)
             sid = be.spawn("webby", "/tmp")
-            nf = os.path.join(td, "names", sid)
-            old_line = open(nf).read()
-
-            def truncating_write(s2, bg="", fg=""):
-                open(nf, "w").close()              # the open('w') truncation
-                raise OSError(28, "No space left on device")
-            with mock.patch.object(be, "_write_name", side_effect=truncating_write):
+            nf = Path(td) / "names" / sid
+            old_line = nf.read_text()
+            with _disk_full(nf):
                 with self.assertRaises(OSError):
                     be.rename(sid, "newname")
-            self.assertEqual(open(nf).read(), old_line,
-                             "the compensation restores the truncated identity line")
+            self.assertEqual(nf.read_text(), old_line,
+                             "byte-identical: the atomic writer left it, and nothing rewrote it in place")
+            self.assertEqual(sorted(p.name for p in nf.parent.iterdir()), [sid], "no staging file left behind")
+            self.assertEqual(be._session(sid).name, "webby", "memory kept the old name")
+            rows = json.loads((Path(td) / "codex" / "registry.json").read_text())
+            self.assertEqual(rows[sid]["name"], "webby", "the registry write was re-run with the old name")
+
+    def test_a_failed_first_publish_in_rename_creates_nothing(self):
+        # rewritten to the truth (review, 2026-09-08): the old fake CREATED a partial file, which the
+        # real writer never can (it publishes whole or not at all). Green on origin/main as well — its
+        # unlink branch was a no-op there — kept as the pin for the absent-entry shape
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            be = cb.CodexBackend(td, client_factory=lambda: None)
+            sid = be.spawn("webby", "/tmp")
+            nf = Path(td) / "names" / sid
+            os.unlink(nf)                          # a legacy row predating the names write
+            with _disk_full(nf):
+                with self.assertRaises(OSError):
+                    be.rename(sid, "newname")
+            self.assertEqual(sorted(p.name for p in nf.parent.iterdir()), [],
+                             "neither the file nor its temp exists: a failed rename publishes nothing")
             self.assertEqual(be._session(sid).name, "webby")
 
-    def test_a_failed_rename_of_an_absent_names_file_stays_unpublished(self):
-        # the r30 verification: with no file to snapshot, _write_name CREATED a partial file
-        # holding the NEW name — the failed rename stayed published, silently
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            be = cb.CodexBackend(td, client_factory=lambda: None)
-            sid = be.spawn("webby", "/tmp")
-            nf = os.path.join(td, "names", sid)
-            os.unlink(nf)                          # a legacy row predating the names write
-
-            def partial_write(s2, bg="", fg=""):
-                with open(nf, "w") as f:
-                    f.write("newname\t")           # partial line lands, then the write dies
-                raise OSError(28, "No space left on device")
-            with mock.patch.object(be, "_write_name", side_effect=partial_write):
-                with self.assertRaises(OSError):
-                    be.rename(sid, "newname")
-            self.assertFalse(os.path.exists(nf),
-                             "the partial NEW-name file is removed — a failed rename must not "
-                             "stay published")
-
-    def test_a_names_write_failure_after_thread_start_is_restored_not_fatal(self):
-        # the r30 verification: _prepare_thread's unguarded names write truncated the identity
-        # file permanently — no later path rewrites it (resume skips the create branch)
+    def test_a_failed_names_write_after_thread_start_leaves_the_file_untouched(self):
+        # the r30 verification, rewritten to the truth (2026-09-09, the twin of #1138's rename
+        # rewrite): the old form mocked _write_name with a fake that truncated the file IN PLACE —
+        # something the real tmp+os.replace writer cannot do — and pinned an in-place RESTORE that,
+        # under the very ENOSPC it existed for, truncated a good file to nothing and then blamed "a
+        # failed write". _disk_full drives the REAL writer with the fault beneath it and models
+        # ENOSPC for any in-place write aimed at the file; on origin/main the restore itself
+        # empties the file. No later path rewrites it (resume skips the create branch)
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             fake = FakeClient()
-            be = cb.CodexBackend(td, client_factory=lambda: fake)
+            logs = []
+            be = cb.CodexBackend(td, client_factory=lambda: fake, log=logs.append)
             sid = be.spawn("webby", "/tmp")
             s = be._session(sid)
-            nf = os.path.join(td, "names", sid)
-            old_line = open(nf).read()
+            nf = Path(td) / "names" / sid
+            old_line = nf.read_bytes()
+            old_mtime = nf.stat().st_mtime_ns
             s.tid = "pending-%s" % sid[:8]         # force the create path
             s.loaded = False
-
-            def truncating_write(s2, bg="", fg=""):
-                open(nf, "w").close()
-                raise OSError(28, "No space left on device")
-            with mock.patch.object(be, "_write_name", side_effect=truncating_write):
+            with _disk_full(nf):
                 ok = be._prepare_thread(s, fake)
             self.assertTrue(ok, "the thread is healthy — the turn proceeds")
-            self.assertEqual(open(nf).read(), old_line,
-                             "the truncation cannot outlive the failure")
             self.assertTrue(s.loaded)
+            self.assertEqual(nf.read_bytes(), old_line,
+                             "byte-identical: the atomic writer left it, and nothing rewrote it in place")
+            self.assertEqual(nf.stat().st_mtime_ns, old_mtime,
+                             "no rewrite for no content change — the names producers watch the mtime")
+            self.assertEqual(sorted(p.name for p in nf.parent.iterdir()), [sid], "no staging file left behind")
+            said = [m for m in logs if "after thread start" in m]
+            self.assertEqual(len(said), 1, logs)
+            self.assertIn("[Errno 28]", said[0], "the log names the errno")
+            self.assertNotIn("restored", said[0], "nothing was restored, so the log does not say so")
 
     def test_a_corrupt_names_file_is_healed_by_the_next_write(self):
         # the r31 verification: non-UTF-8 names bytes sailed through _write_name's OSError-only
@@ -1373,25 +1770,27 @@ class RaisingRegistryTransactions(unittest.TestCase):
     def test_an_unpublishable_name_after_thread_start_says_so(self):
         # the r31 verification: the no-prior-file leg logged "was restored" when the partial
         # file was actually unlinked — and the state it leaves (live row, no published name) is
-        # the duplicate-name hole, which the log must NAME
+        # the duplicate-name hole, which the log must NAME. Since 2026-09-09 the REAL writer runs
+        # under _disk_full (green on origin/main as well — its unlink branch was a no-op there);
+        # kept as the pin for the absent-entry shape: a failed first publish creates nothing
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             fake = FakeClient()
-            be = cb.CodexBackend(td, client_factory=lambda: fake)
+            logs = []
+            be = cb.CodexBackend(td, client_factory=lambda: fake, log=logs.append)
             sid = be.spawn("webby", "/tmp")
             s = be._session(sid)
-            nf = os.path.join(td, "names", sid)
-            os.unlink(nf)                          # no prior file to restore
+            nf = Path(td) / "names" / sid
+            os.unlink(nf)                          # a legacy row predating the names write
             s.tid = "pending-%s" % sid[:8]
             s.loaded = False
-            logs = []
-            with mock.patch.object(be, "log", side_effect=lambda m: logs.append(m)):
-                with mock.patch.object(be, "_write_name",
-                                       side_effect=OSError(28, "No space left on device")):
-                    ok = be._prepare_thread(s, fake)
+            with _disk_full(nf):
+                ok = be._prepare_thread(s, fake)
             self.assertTrue(ok, "the healthy turn still proceeds")
-            self.assertTrue(any("could not be published" in m for m in logs), logs)
-            self.assertFalse(any("was restored" in m for m in logs),
+            self.assertEqual(sorted(p.name for p in nf.parent.iterdir()), [],
+                             "neither the file nor its temp exists: a failed publish leaves nothing")
+            self.assertTrue(any("could not be published" in m and "[Errno 28]" in m for m in logs), logs)
+            self.assertFalse(any("restored" in m for m in logs),
                              "the log must not claim a restore that never happened")
 
     def test_resume_never_overwrites_a_fresher_registry_name(self):

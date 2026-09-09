@@ -50,14 +50,11 @@ class _Backend(unittest.TestCase):
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
-        self._stash_before = sb._WORK_KEY
-        sb._WORK_KEY = ""                          # never claim a real key from this process's env
         self._fetch_before = sb._fetch_key_fast_org
         sb._fetch_key_fast_org = lambda key: None  # the fast-org probe is a real HTTPS GET — never from a test
         self.be = sb.SdkBackend(self.d, "/bin/true", lambda *a, **k: None)
 
     def tearDown(self):
-        sb._WORK_KEY = self._stash_before
         sb._fetch_key_fast_org = self._fetch_before
 
     def _reg(self, sid):
@@ -458,38 +455,18 @@ class ValidatorLockstep(unittest.TestCase):
 
     CREDENTIALS = ({"ANTHROPIC_API_KEY": "x"}, {"ANTHROPIC_AUTH_TOKEN": "x"}, {"CLAUDE_CODE_OAUTH_TOKEN": "x"})
 
-    def test_the_copies_agree_on_credentials_with_and_without_runtime_retrieval(self):
-        """Under runtime API-key retrieval a per-session API key is reserved (it competes with the source); a
-        login session's token override is not (review find, 2026-09-05). Both copies, both worlds."""
-        import tempfile
+    def test_the_copies_agree_that_a_credential_name_is_always_reserved(self):
+        """romp holds no API key (2026-09-08): a session's credential is Claude Code's own resolution, so a
+        per-session env payload naming any credential variable is refused for EVERY pick, in both copies,
+        with the same words. Before this the key competed only while romp ran a provider, and a login
+        session's own token override passed."""
         km = self._kernel()
-        for payload in self.CREDENTIALS:                       # no source configured: all three pass
-            self.assertEqual(km._env_error(payload), "")
-            self.assertEqual(sb.env_request_error(payload), "")
-        d = tempfile.mkdtemp()
-        path = os.path.join(d, "service.env")
-        with open(path, "w") as fh:
-            fh.write("ROMP_API_KEY_REF=op://test-vault/test-item/credential\n")
-        saved = {k: os.environ.get(k) for k in ("ROMP_SERVICE_ENV_FILE", "ROMP_SERVICE_ENV")}
-        try:
-            os.environ["ROMP_SERVICE_ENV_FILE"] = path; os.environ["ROMP_SERVICE_ENV"] = path
-            for m in (km.jd._keysrc, sb._keysrc):
-                m._CACHE = ((), ""); m._AUTHORITATIVE_PATHS.clear()
-            for auth in ("", "key", "login"):
-                verdicts = [(km._env_error(p, auth), sb.env_request_error(p, auth)) for p in self.CREDENTIALS]
-                for a, b in verdicts:
-                    self.assertEqual(a, b, "the copies must stay in lockstep under runtime retrieval (auth=%r)" % auth)
-                self.assertIn("reserved while runtime API key retrieval", verdicts[0][0], "the API key always competes")
-                if auth == "login":
-                    self.assertEqual(verdicts[1][0], ""); self.assertEqual(verdicts[2][0], "")   # its own token stays
-                else:
-                    self.assertIn("reserved", verdicts[1][0]); self.assertIn("reserved", verdicts[2][0])   # keyed: no competing token
-        finally:
-            for k, v in saved.items():
-                if v is None: os.environ.pop(k, None)
-                else: os.environ[k] = v
-            for m in (km.jd._keysrc, sb._keysrc):
-                m._CACHE = ((), ""); m._AUTHORITATIVE_PATHS.clear()
+        for auth in ("", "key", "login"):
+            for p in self.CREDENTIALS:
+                a, b = km._env_error(p, auth), sb.env_request_error(p, auth)
+                self.assertEqual(a, b, "the copies must stay in lockstep (auth=%r, payload %r)" % (auth, p))
+                self.assertIn("is reserved: a session's credential is Claude Code's own", a)
+                self.assertIn(next(iter(p)), a, "the offender is named")
 
 
 class DrivePlumbing(unittest.TestCase):

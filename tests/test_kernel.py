@@ -1000,7 +1000,7 @@ class ViewBuilder(unittest.TestCase):
         # The real case: the lid closed mid-segment, so a CLOSED bar's own [start,end] enclose the sleep.
         # The bar must clip to the suspension start, not render as one long span (the user 2026-06-18).
         def first_bar():
-            return km.build_timeline(NOW)["turns"][SID][0]
+            return km._expand_bar(km.build_timeline(NOW)["turns"][SID][0])
         saved = list(km._downtime)
         km._downtime[:] = []
         try:
@@ -1033,7 +1033,7 @@ class ViewBuilder(unittest.TestCase):
         saved = list(km._downtime)
         km._downtime[:] = [(NOW + 100, NOW + 7900)]      # a ~2h sleep AFTER the pre-sleep work, BEFORE the post-wake work
         try:
-            bars = km.build_timeline(NOW + 8100)["turns"][SID]
+            bars = [km._expand_bar(b) for b in km.build_timeline(NOW + 8100)["turns"][SID]]   # the wire bars, long-named (T278c)
             post = [b for b in bars if b["start"] >= NOW]          # the long segment's pieces (start at/after its prompt)
             self.assertEqual(len(post), 2, "the segment straddling a sleep renders as TWO bars, not one truncated one")
             pre_bar, post_bar = sorted(post, key=lambda b: b["start"])
@@ -4452,7 +4452,9 @@ class ViewBuilder(unittest.TestCase):
         km._tmux_name_of = lambda s: "testsess"
         km.subprocess.run = lambda cmd, *a, **k: (calls.append(cmd), _R())[1]
         try:
-            out = km._rename_session(SID, "newname")
+            with mock.patch.dict(os.environ):
+                os.environ.pop("ROMP_TMUX_SOCKET", None)   # the bare argv this pins is the no-socket one:
+                out = km._rename_session(SID, "newname")   # a per-kernel socket prepends -L (test_tmux_optional)
             self.assertEqual(out, "newname")
             self.assertTrue(any(c[:2] == ["tmux", "rename-session"] and "newname" in c for c in calls),
                             "live rename must call `tmux rename-session ... newname`")
@@ -6439,7 +6441,7 @@ class ViewBuilder(unittest.TestCase):
     def test_timeline_bars_carry_prompt_and_work_ids(self):
         """Timeline bars carry promptId (the dot atom) + workId (the bar atom) — the targets the chat
         hover's tlId matches, splitting message→dot from work→bar in the view's dotLit/barLit."""
-        bars = km.build_timeline(NOW)["turns"][SID]
+        bars = [km._expand_bar(b) for b in km.build_timeline(NOW)["turns"][SID]]   # the wire bars, long-named (T278c)
         seg = em.segments(em.parse_session(str(self.tpath), rompuuid=SID,
                                            candidate_files=[str(self.tpath)], now=NOW)["turns"][0])[0]
         self.assertEqual(bars[0]["promptId"], seg["trigger"], "bar promptId = the prompt atom (dot)")
@@ -6582,7 +6584,7 @@ class ViewBuilder(unittest.TestCase):
         self.assertEqual(lane["color"], "#abcdef", "lane color is the hex string, not {bg,fg}")
         self.assertEqual(lane["state"], "ready", "turn ended → chip 'ready' (the shared derivation, the user 2026-07-03)")
         self.assertEqual(lane["model"], "", "tmux-sourced lane decorations are deferred")
-        bars = m["turns"][SID]
+        bars = [km._expand_bar(b) for b in m["turns"][SID]]   # the wire bars, long-named (T278c)
         self.assertEqual(len(bars), 1, "the one-input turn is one segment bar")
         bar = bars[0]
         self.assertEqual(bar["start"], T0)
@@ -6590,7 +6592,9 @@ class ViewBuilder(unittest.TestCase):
         self.assertEqual(bar["prompt"], "fix the feed flicker")
         self.assertEqual(bar["summary"], "Fixed the feed flicker", "caption binds to the segment id")
         self.assertEqual(bar["src"], "typed")
-        self.assertEqual(bar["workUuid"], "a1", "first assistant atom = work anchor")
+        self.assertEqual(bar["workId"], "a1", "first assistant atom = work anchor")
+        for gone in ("tid", "uuid", "workUuid"):
+            self.assertNotIn(gone, bar, "T278b: %s left the wire (the lane key, promptId and workId carry it)" % gone)
         self.assertEqual(bar["replyUuid"], "a2", "last assistant-with-text = reply anchor")
         self.assertFalse(bar["open"], "the turn ended -> bar not open")
 
@@ -6616,7 +6620,7 @@ class ViewBuilder(unittest.TestCase):
         lane = next(s for s in m["sessions"] if s["id"] == SID)
         self.assertFalse(lane["live"], "session is dead (not in tmux)")
         self.assertEqual(lane["state"], "idle", "a dead lane with an unfinished turn is idle, NOT working")
-        self.assertFalse(m["turns"][SID][-1]["open"], "a dead lane's last bar is not an open (growing-to-now) bar")
+        self.assertFalse(km._expand_bar(m["turns"][SID][-1])["open"], "a dead lane's last bar is not an open (growing-to-now) bar")
 
     def test_lane_and_helper_report_backend(self):
         """Each session carries a backend label ('sdk'|'tmux') so the ui peer can show it (tab tooltip +
