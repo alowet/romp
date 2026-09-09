@@ -26,6 +26,7 @@ import { senderKind, SenderKind } from "./sender-identity";
 import { loadSettings, onExternalSettingsChange, installSettingsSync, type RompSettings } from "./settings";
 import { backendLabel, effectiveDefaultBackend } from "./backend-names";
 import { delegate } from "./actions";
+import { flash } from "./actions";   // its own line: the import above is pinned verbatim by click-safe.test.ts (the file-view precedent)
 import { awaitWord, awaitBreakdown, groupRows, GROUP_TITLE, workingFor, type AwaitRow } from "./spin-caption";
 import { isClearCmd, openTopTitles, clearConfirmDetail, endConfirmDetail } from "./clear-confirm";
 import { prebuildPlan, type ViewState } from "./prebuild";
@@ -74,6 +75,7 @@ import { apiErrorReason } from "./api-error-reason";
 import { chatMdExtensions, userMdHtml } from "./chat-md";
 import { setTip, pruneTip } from "./tip";
 import { agentCount, replyOwed, threadsByAnchor, threadBusy, threadStuck, findAnchorRange, sliceRanges, prunePending, type CommentThread } from "./comments";
+import { isReplyReady, placeMark, placeWindowed, readyChips, replyLine, chipLabel, chipTip, chipAria, type Dir, type ReadyMark, type ReadyChip } from "./reply-ready";
 import { dragSlotIndex } from "./dragslot";
 import { perfFrameHandler } from "./perf-telemetry";
 import { linkifyPrRefs, senderPrRepo, postalSenderHost } from "./pr-links";
@@ -8297,7 +8299,7 @@ function applyCommentMarks(sid: string): void {
   // the rail cue clears first (idempotent re-apply): a thread viewed, resolved, or removed must
   // drop its turn's tint on this very pass, not linger until the next anchor match
   for (const t of Array.from(v.el.querySelectorAll(".turn.cmt-rail-unread"))) t.classList.remove("cmt-rail-unread");
-  if (!threads.length) return;
+  if (!threads.length) { if (sid === activeId) updateReplyChips(); return; }   // no threads → no chips (the last one resolved/deleted)
   for (const [uuid, list] of threadsByAnchor(threads)) {
     const turn = v.el.querySelector(`.turn[data-uuid="${cssEscape(uuid)}"]`) as HTMLElement | null;
     if (!turn) continue;                       // windowed out — the mark returns when the turn does
@@ -8308,6 +8310,9 @@ function applyCommentMarks(sid: string): void {
     // openCommentPopover drops the unread flag and re-runs this pass.
     turn.classList.toggle("cmt-rail-unread", list.some((t) => !!t.unread && t.status === "open"));
   }
+  // the reply chips MEASURE the marks (above/below the viewport), so they recount after this pass has the
+  // highlights back in the DOM — this is the comments frame's and every transcript rebuild's hook for them
+  if (sid === activeId) updateReplyChips();
 }
 
 /** The parent side of a branch (the user 2026-08-13): a small "↳ <name>" chip on the turn a fork
@@ -11216,6 +11221,7 @@ function updateJumpBtn(): void {
   const off = c.scrollHeight > c.clientHeight + 2 && !atBottom(c);   // the chip: shown the moment the reader leaves the true bottom
   jumpBtn.hidden = !off;
   if (off) jumpBtn.style.bottom = (Math.max(0, window.innerHeight - c.getBoundingClientRect().bottom) + 8) + "px";
+  updateReplyChips();   // the reply chips stack on this chip's slot and count against this scroll position — same events, same measure
 }
 jumpBtn.onclick = () => {
   const c = document.getElementById("content");
@@ -11234,6 +11240,112 @@ jumpBtn.onclick = () => {
   }
 }
 window.addEventListener("resize", updateJumpBtn);
+// ── replies ready (the user 2026-09-08) ──────────────────────────────────────────────────────────
+// A reply lands on a comment you scrolled away from, and you forget to come back: the mark's ring and the
+// rail tick say so only where you happen to be looking. Two chips stacked ABOVE the jump chip — "↑ 2 replies
+// unread" / "↓ 1 reply unread" — count the unread landed replies (the kernel's unread bit on an open thread,
+// isReplyReady: the mark's own .unread rule) whose marks sit wholly above / below the viewport; a mark on
+// screen counts in neither. Each chip exists only while its count is > 0. Click = land the NEAREST one in
+// that direction through the chat's own scroll-to-uuid route (scrollToAnchor → landOn's one flash, the rail
+// tick's and the notch's route) and pulse the mark itself — and NOT mark it read: opening the thread does,
+// as today. Same dress and home as #jump-bottom (body-level, fixed, bottom-left, the menu-card vocabulary),
+// placed by measurement over the jump chip's slot so the three never overlap. The box is created once and
+// its two chips update IN PLACE (label, tip, data-tid/uuid), so a re-render can never eat a click (the
+// delegate rides the stable box). Every input is an event the chat already listens for: the jump chip's
+// own update (scroll, resize, the content ResizeObserver, tab switch, append — updateJumpBtn's tail), the
+// comments frame and every transcript rebuild (applyCommentMarks' tail), plus the pane's own size (a pane
+// measuring 0 drops the chips like the jump chip). No timers, no polling; a signature skips unchanged paints.
+const replyChips = el("div", "reply-chips");
+replyChips.id = "reply-chips";
+replyChips.hidden = true;
+const replyChevron = (dir: Dir): string => '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"'
+  + ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="'
+  + (dir === "above" ? "6 14.5 12 8.5 18 14.5" : "6 9.5 12 15.5 18 9.5") + '"/></svg>';   // the jump chip's stemless chevron, up or down
+const replyChip = (dir: Dir): HTMLButtonElement => {
+  const b = el("button", "reply-chip") as HTMLButtonElement;
+  b.type = "button";
+  b.id = "reply-" + dir;
+  b.dataset.act = "replyjump";
+  b.dataset.dir = dir;
+  b.hidden = true;
+  b.innerHTML = replyChevron(dir) + '<span class="reply-chip-label"></span>';
+  replyChips.appendChild(b);
+  return b;
+};
+const replyAbove = replyChip("above");
+const replyBelow = replyChip("below");
+let replyChipSig = "";
+function dressReplyChip(b: HTMLButtonElement, dir: Dir, chip: ReadyChip | null): void {
+  b.hidden = !chip;
+  if (!chip) return;
+  (b.querySelector(".reply-chip-label") as HTMLElement).textContent = chipLabel(chip.count);
+  b.dataset.tid = chip.nearest.tid;
+  b.dataset.uuid = chip.nearest.uuid;
+  b.setAttribute("aria-label", chipAria(dir, chip.count));
+  setTip(b, chipTip(dir, chip.count, chip.nearest.line));   // the one styled tip; the text swaps per update, wired once
+}
+function updateReplyChips(): void {
+  const c = document.getElementById("content");
+  const s = activeId ? sessions.get(activeId) : null;
+  const v = activeId ? views.get(activeId) : null;
+  const H = c ? c.clientHeight : 0;
+  const ready = activeId ? (commentThreads.get(activeId) || []).filter(isReplyReady) : [];
+  // no pane to measure, the read-only subagent viewer (no threads can live there), or nothing unread → no chips
+  if (!c || !s || !v || H <= 0 || s.sub || !ready.length) { replyChips.hidden = true; replyChipSig = ""; return; }
+  const cr = c.getBoundingClientRect();
+  const marks: ReadyMark[] = [];
+  let evUnit: Int32Array | null = null;
+  for (const th of ready) {
+    const turn = v.el.querySelector(`.turn[data-uuid="${cssEscape(th.anchorUuid)}"]`) as HTMLElement | null;
+    const line = replyLine(th);
+    if (turn) {
+      // the mark's own box; the turn's when the rendered text drifted past re-matching (the tick's fallback too)
+      const node = (turn.querySelector(`mark.cmt-hl[data-tid="${cssEscape(th.tid)}"]`) as HTMLElement | null) || turn;
+      const r = node.getBoundingClientRect();
+      marks.push({ tid: th.tid, uuid: th.anchorUuid, line, ...placeMark(r.top - cr.top, r.bottom - cr.top, H) });
+    } else {
+      // windowed out: which side of the rendered window the anchor lies on IS its direction (event order,
+      // translated to display units like the notches), a tier farther than any rendered mark
+      const idx = s.events.findIndex((e) => e.uuid === th.anchorUuid);
+      if (!evUnit) evUnit = eventUnitIndex(s);
+      marks.push({ tid: th.tid, uuid: th.anchorUuid, line,
+        ...placeWindowed(idx >= 0 ? evUnit[idx] : -1, v.winStart, v.winEnd ?? v.winStart) });
+    }
+  }
+  const { above, below } = readyChips(marks);
+  // the slot: the jump chip's own bottom measure, lifted over the jump chip while it shows (its real height —
+  // the coarse-pointer media query makes it taller — plus the stack gap)
+  const bottom = Math.max(0, window.innerHeight - cr.bottom) + 8 + (jumpBtn.hidden ? 0 : jumpBtn.offsetHeight + 6);
+  const sig = activeId + "|" + (above ? above.count + ":" + above.nearest.tid : "") + "|" + (below ? below.count + ":" + below.nearest.tid : "") + "|" + bottom;
+  if (sig === replyChipSig) return;
+  replyChipSig = sig;
+  dressReplyChip(replyAbove, "above", above);
+  dressReplyChip(replyBelow, "below", below);
+  replyChips.hidden = !above && !below;
+  replyChips.style.bottom = bottom + "px";
+}
+{
+  const c = document.getElementById("content");
+  if (c) {
+    document.body.appendChild(replyChips);
+    // the click is delegated on the stable box (click-safe by construction), keyed off data-act; the press
+    // pulse is the delegate's own
+    delegate(replyChips, {
+      replyjump: (elx) => {
+        const tid = elx.dataset.tid, uuid = elx.dataset.uuid;
+        if (!tid || !uuid || !activeId) return;
+        flashedAnchor = null;                  // fresh navigation → landOn's one flash on the turn
+        if (scrollToAnchor(uuid)) {
+          applyCommentMarks(activeId);         // a re-windowed anchor turn gets its highlight back before the pulse
+          const m = views.get(activeId)?.el.querySelector(`mark.cmt-hl[data-tid="${cssEscape(tid)}"]`) as HTMLElement | null;
+          if (m) flash(m);                     // …and the mark itself pulses once (.romp-acted) — the thing you came for
+        }
+        // deliberately NO commentSeen here: the chip brings you to the reply; reading it is opening the thread
+      },
+    });
+    if (typeof ResizeObserver === "function") new ResizeObserver(updateReplyChips).observe(c);   // a pane measuring 0 drops the chips
+  }
+}
 // The per-view saved spot FOLLOWS the reader (T249, the user 2026-09-07). landActive lands every show no
 // anchor scrolled on `v.stick ? bottom : v.scrollTop`, and until now those were written only by a tab
 // switch (the tab being LEFT), the jump button, the box-resize compensation and the nav trail — never by

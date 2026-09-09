@@ -2907,6 +2907,24 @@ body.picker-lifted > #picker.kb-tight { align-items: flex-start; padding: 12px 1
 #jump-bottom:hover { border-color: var(--accent); color: var(--accent); }
 #jump-bottom[hidden] { display: none; }   /* author display:flex defeats [hidden] — the login-modal lesson */
 @media (pointer: coarse) { #jump-bottom { width: 64px; height: 32px; } }   /* the phone half: WIDEN for the hit area, never heighten — the compact look is the ask */
+/* replies ready (the user 2026-09-08): two chips stacked ABOVE the jump chip in the SAME slot and dress —
+   "↑ 2 replies unread" / "↓ 1 reply unread" — for the unread landed replies whose marks sit off-screen in
+   that direction (render.ts updateReplyChips places the box by measurement over the jump chip, so the three
+   never overlap). The jump chip's tokens, token for token: the menu card background, the --menu-border
+   hairline, the toast shadow, the pill radius, the 22px height, dim at rest and accent on hover. Text at
+   the seek-note's 12px — the size this bottom-of-pane chrome already wears — in the page font (a button
+   does not inherit it on its own); the chevron is the jump chip's stemless glyph, turned. */
+#reply-chips { position: fixed; left: 14px; z-index: 40; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+#reply-chips[hidden] { display: none; }
+.reply-chip {
+  height: 22px; border-radius: var(--radius-pill); cursor: pointer; padding: 0 10px 0 6px;
+  display: flex; align-items: center; gap: 4px; font: inherit; font-size: 12px; line-height: 1; white-space: nowrap;
+  background: var(--vscode-menu-background, var(--surface-raised)); color: var(--dim);
+  border: 1px solid var(--menu-border); box-shadow: var(--shadow-toast);
+}
+.reply-chip:hover { border-color: var(--accent); color: var(--accent); }
+.reply-chip[hidden] { display: none; }   /* author display:flex defeats [hidden] — the jump chip's own lesson */
+@media (pointer: coarse) { .reply-chip { height: 32px; padding: 0 14px 0 9px; } }   /* the phone half: the jump chip's taller target, same stack */
 #seek-note .seek-note-x {
   flex: 0 0 auto; border: none; background: none; cursor: pointer; color: var(--dim);
   font-size: 11px; line-height: 1.4; padding: 2px 4px; border-radius: 8px;
@@ -3234,18 +3252,19 @@ mark.cmt-hl {
   color: inherit;
   border-radius: 0;
   cursor: pointer;
-  position: relative;   /* anchors the unread dot on the run's last segment */
 }
 mark.cmt-hl.unread { background: color-mix(in srgb, var(--cmt-hl) 45%, transparent); }
-/* NEW-here dot (the user 2026-08-23): the 45% unread tint alone was too subtle to read as "something
-   new since you last looked". A thread with messages you haven't seen — it replied while the box was
-   closed, and you haven't opened it since — wears a solid full-strength dot on the top-right corner
-   of its run's LAST segment (one dot per thread), ringed in the page bg so it reads over any text.
-   It clears with the unread flag the moment the popover opens (optimistic + kernel watermark). */
-mark.cmt-hl.unread.hl-last::after {
-  content: ""; position: absolute; top: -4px; right: -4px; width: 7px; height: 7px;
-  border-radius: 50%; background: var(--cmt-hl); box-shadow: 0 0 0 1.5px var(--bg);
-}
+/* UNREAD = the needs-you ring (the user 2026-09-08): a landed reply you have not opened wears the SAME
+   dashed ring the tab strip puts on a session that needs you (.tab.tab-awaiting: `2px dashed
+   var(--st-awaiting-bg)`, inset) — one idiom for "something here waits on you", scaled to a text run:
+   1.5px so the dash/gap (Chromium scales them with the width) shortens with it, offset OUTWARD so the
+   ring never crosses the glyphs. An outline, so nothing reflows when it comes and goes; on a run that
+   wraps, every line fragment is ringed. It replaces the 2026-08-23 corner dot (a yellow dot on yellow
+   read as decoration, not as an ask). Its OWN rule, apart from the fill line above: the fill still says
+   pending vs landed exactly as before — the 45% yellow tier is the landed reply, .busy's green wash below
+   the reply still being written — and T237's tests pin that line byte for byte. Read marks wear no ring.
+   Clears with the unread flag the moment the popover opens (optimistic + kernel watermark). */
+mark.cmt-hl.unread { outline: 1.5px dashed var(--st-awaiting-bg); outline-offset: 1px; }
 /* the turn's rail segment shouts an unread thread (the user 2026-08-23): the identity line's own
    segment tints the comment yellow — wider and fully opaque so it reads from across the pane — and
    the rail-hit strip over it opens the thread on click. applyCommentMarks clears the class the

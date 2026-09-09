@@ -95,13 +95,17 @@ test("the popover keeps the chat renderer but sheds its transcript-coupled hover
     "no rail time-markers on gutterless popover turns");
 });
 
-test("an unread thread wears a NEW-here dot on its last segment and a shouting rail tick", () => {
+test("an unread thread wears the needs-you RING on its mark and a shouting rail tick", () => {
   // the user 2026-08-23: the 45% unread tint alone was too subtle — a thread that replied while the
-  // box was closed needs a visible element. One dot per thread (the run's hl-last segment), ringed
-  // in the page bg; the rail tick grows and double-rings. Both clear with the unread flag on open.
-  assert.match(CSS, /mark\.cmt-hl\.unread\.hl-last::after \{\s*\n\s*content: ""; position: absolute; top: -4px; right: -4px; width: 7px; height: 7px;/);
-  assert.match(CSS, /border-radius: 50%; background: var\(--cmt-hl\); box-shadow: 0 0 0 1\.5px var\(--bg\);/);
-  assert.match(CSS, /mark\.cmt-hl \{[^}]*position: relative;/s, "the mark anchors its own dot");
+  // box was closed needs a visible element. That element was a yellow corner dot on the run's last
+  // segment until 2026-09-08, when the user asked for the tab strip's needs-you idiom instead: the
+  // SAME dashed ring a tab wears while its session waits on you (.tab.tab-awaiting, --st-awaiting-bg),
+  // scaled to a text run — one idiom for "this waits on you" across the surface. The dot pins below
+  // were rewritten deliberately for that; the ring's pins live in comment-mark.test.ts. The rail tick
+  // still grows and double-rings. Both clear with the unread flag on open.
+  assert.doesNotMatch(CSS, /mark\.cmt-hl\.unread\.hl-last::after/, "the corner dot is gone — the ring replaced it");
+  assert.match(CSS, /mark\.cmt-hl\.unread \{ outline: 1\.5px dashed var\(--st-awaiting-bg\); outline-offset: 1px; \}/);
+  assert.doesNotMatch(CSS, /mark\.cmt-hl \{[^}]*position: relative;/s, "nothing left for the mark to anchor");
   assert.match(CSS, /\.cmt-tick\.unread \{ width: 10px; height: 6px; right: 0; opacity: 1;/);
   // the clearing story is the existing machinery, untouched: optimistic on open + kernel watermark
   assert.match(UI, /if \(th\) th\.unread = false;\s*\/\/ optimistic; the kernel's watermark reconciles/);
