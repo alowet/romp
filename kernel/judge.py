@@ -63,7 +63,8 @@ _cred = sys.modules.get("romp_credentials") or SourceFileLoader(
 
 HOME     = Path.home()
 STATE    = Path(os.environ.get("ROMP_STATE_DIR")   # per-kernel state root override (plans/multi-kernel.md)
-                or Path(os.environ.get("XDG_STATE_HOME", str(HOME / ".local/state"))) / "romp")
+                or Path(os.environ.get("XDG_STATE_HOME") or str(HOME / ".local/state")) / "romp")
+# `or`, not a .get default: an empty XDG_STATE_HOME is unset (the note at event_model.py's STATE).
 # Keep the romp state root private (0700): it holds session names, prompts,
 # captions, goals, and postal message bodies. The traverse bit on the root is
 # enough to block other local users from reading anything beneath it. Runs on
