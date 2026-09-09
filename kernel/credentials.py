@@ -54,6 +54,14 @@ HELPER_TIMEOUT_S = 15
 HELPER_ENV_PASSTHROUGH = ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "TERM",
                           "CLAUDE_CONFIG_DIR")
 HELPER_ENV_PREFIXES = ("LC_", "XDG_")
+# Why a box cannot bill one side of the per-session pick, as ONE sentence each: the Billing menu's greyed
+# option (its hover), set_auth's refusal, the launch's fall-to-the-other-side notice and the picker's
+# reply all say the same words (the user 2026-09-08: the picker never disappears, the unavailable
+# option is greyed with the reason). Shared here because the kernel, the SDK backend and the judges each
+# load this module and none imports another.
+WHY_NO_LOGIN = "no Claude login signed in on this machine"
+WHY_NO_HELPER = "no apiKeyHelper configured"
+WHY_MANAGED_HELPER = "the apiKeyHelper is set in managed settings, login cannot apply"
 # Claude Code's managed settings, the top of its precedence: one path per platform (its documentation).
 MANAGED_SETTINGS = {"darwin": "/Library/Application Support/ClaudeCode/managed-settings.json"}
 MANAGED_SETTINGS_DEFAULT = "/etc/claude-code/managed-settings.json"

@@ -644,6 +644,11 @@ body.chat-theme-yatharth .tab.active.colored:not(.tab-blocked) {
 .ctx-caret { margin-left: auto; padding-left: 10px; opacity: 0.55; align-self: center; }
 .ctx-sub { z-index: 101; }
 .ctx-sub .ctx-item { padding-right: 26px; position: relative; }
+/* a choice this box cannot bill (the Billing flyout, the user 2026-09-08: both options always listed,
+   the unavailable one greyed with the reason in its title, inert) — the same dim-and-no-hover the
+   feed view menu's .forced items wear */
+.ctx-sub .ctx-item.disabled { opacity: 0.45; cursor: default; }
+.ctx-sub .ctx-item.disabled:hover { background: transparent; color: inherit; }   /* .ctx-item:hover also recolours */
 .ctx-sub .ctx-item.current::after {
   content: "✓"; position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
   background: var(--check-bg); color: #fff; border-radius: 50%;

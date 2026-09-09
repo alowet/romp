@@ -300,11 +300,32 @@ toggle says SDK: segmented buttons when the selected host offers both choices,
 and with only one real choice, the same spot writes out which applies,
 `Login (name@example.com)` or `API key`. The key choice exists when Claude
 Code's settings for the kernel's working directory carry a helper; romp reads
-the setting and never runs it for this. A live session additionally wears a
-statusline badge for *switching*, beside mode/model/effort, and that control
-keeps the stricter rule: it exists only when both choices are real (a
-one-option selector is noise). Switching reconnects the session to apply, with
-the same switching-dots the effort badge wears.
+the setting and never runs it for this. A live session's tab menu carries a
+**Billing** submenu that lists BOTH choices on every box (since 2026-09-08; it
+used to exist only when both were real): the choice this machine cannot bill
+is greyed and inert, with the reason in its hover, `no Claude login signed in
+on this machine`, `no apiKeyHelper configured`, or `the apiKeyHelper is set in
+managed settings, login cannot apply`. The status payload carries the same
+availability as `authAvail` (`authBoth` rides beside it for older clients).
+Switching reconnects the session to apply, with the same switching-dots the
+effort badge wears.
+
+On a one-auth box the picker never chooses the missing side. The remembered
+default falls to the side that exists, in both directions: a remembered login
+pick on a machine with no login seeds new sessions on the API key, exactly as
+a remembered key pick on a helper-less machine already fell to the login, and
+the fall is said once per process as a problem row. An explicit pick that
+names the missing side (a session picked "login" on a box that later lost its
+login) launches on the other side when one exists and says so once per session
+start, on the card's Billing sub-line as `⚠ login unavailable, billing API key`
+and in the log; the fall itself rides the status as `authPickFell`, so the hover
+and the sub-line never infer one. A pick with nothing to fall to (a box with
+neither side) launches as picked and the CLI decides; the sub-line then says
+the side is unavailable and claims no fall. A side whose availability cannot
+be read just now (the operator's settings file, or `~/.claude.json`, mid-rewrite
+or unreadable) is cannot-tell: the launch keeps the pick as is, says so once
+per session, and never falls on a read failure. `setAuth` refuses the
+missing side with that same reason in the toast.
 
 A pick reaches the CLI through the session's per-session settings layer, the
 file the SDK hands the CLI as its `--settings` argument. A login pick writes
