@@ -74,6 +74,19 @@ lands on it. An image map (`<map>`, `usemap`) is dropped. The same rules apply t
 a chat message, where a link to an element's own `id` or `<a name>` lands on it under the
 prefix.
 
+**Text size and width.** The **A−** and **A+** buttons in the viewer's title bar make the
+text of any text file smaller or larger in fixed steps from 70% to 200%: a markdown file's
+Rendered and Raw views, the code view of every other text file, and a document opened from
+a link on the dashboard's own address. They appear wherever the viewer opens (over the chat
+or the feed), and not for a picture or a PDF, which have no text to size. Ctrl (or Cmd) and
+the mouse wheel over the text do the same. Once the size is off 100%, the percentage appears
+between the buttons; click it to go back. The choice is kept in this browser and applies to
+every file you open here. Prose keeps a readable line length that grows with the text size,
+and code blocks keep that width and wrap long lines. A table is as wide as its columns need,
+up to the width of the viewer, and scrolls sideways on its own beyond that; a table inside a
+quote or a list item stays within the prose width. Pictures shrink to fit, so the page is
+never wider than the viewer.
+
 **Opening a PDF.** A PDF the session mentions, or one you click in the file browser, opens
 inside the dashboard like an image: the chat's PDF card opens it full-view, a path or a
 file-browser row opens it in the file viewer. Cmd-click it instead (Ctrl on Windows and

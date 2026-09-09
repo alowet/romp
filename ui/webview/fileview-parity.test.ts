@@ -20,10 +20,14 @@ const FEED = read("feed.css");
 
 const RULES = [
   "#romp-fileview {", ".fileview {", "body.fileview-open {", ".fileview-bar {", ".fileview-name {",
-  ".fileview-dir {", ".fileview-base {", ".fileview-sess {", ".fileview-sess .host-prefix {", ".fileview-acts {", ".fileview-btn {", ".fileview-btn:hover {",
+  ".fileview-dir {", ".fileview-base {", ".fileview-sess {", ".fileview-sess .host-prefix {", ".fileview-acts {",
+  ".fileview-bar .fileview-name {", ".fileview-bar .fileview-acts {",   // the bar's own wrap (scoped: the file browser's row wears .fileview-acts too)
+  ".fileview-btn {", ".fileview-btn:hover {",
   "a.fileview-btn {", ".fileview-gh {", ".fileview-gh-why {", ".fileview-gh-dots {",
-  ".fileview-gh .fileview-btn:disabled {", ".fileview-gh .fileview-btn:disabled:hover {",
-  ".fileview-gh .fileview-btn:disabled:active {", "a.fileview-gh-note {", ".fileview-body {", ".fileview-md {",
+  // one disabled dress for every bar button: the GitHub unit's no-link state and the text-size control's ends
+  '.fileview-btn:disabled, .fileview-btn[aria-disabled="true"] {', '.fileview-btn:disabled:hover, .fileview-btn[aria-disabled="true"]:hover {',
+  '.fileview-btn:disabled:active, .fileview-btn[aria-disabled="true"]:active {', ".fileview-size-reset {", ".fileview-size-reset.fileview-size-default {",
+  "a.fileview-gh-note {", ".fileview-body {", ".fileview-md {",
   ":where(.fileview-md) svg, :where(.fileview-md) canvas, :where(.fileview-md) video {",
   ':where(.fileview-md :is(svg, canvas)[width]:not([width$="%"])) {',
   ".fileview-md table {",

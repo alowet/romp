@@ -81,7 +81,9 @@ test("selecting in the viewer seeds the composer's editor chip — the editorSel
   // mouseup posts to the composer's window — this document's when it holds one (the browseFiles
   // precedent — no import cycle with render.ts), else the shell's chat pane (composerWindow, below) —
   // and render.ts's existing editorSelection handler owns the chip end to end
-  assert.match(VIEW, /box\.addEventListener\("mouseup", \(\) => \{/);
+  // the handler reads the event's target since the text-size control: a press on a title-bar button with a passage
+  // still selected in the body settles no selection (file-view-text-size.test.ts runs the gate)
+  assert.match(VIEW, /box\.addEventListener\("mouseup", \(ev\) => \{/);
   assert.match(VIEW, /seedTarget\.postMessage\(\{ type: "editorSelection", text: picked, sid: sid \|\| undefined, src: quoteSrcLabel\(path, doc, picked\) \}, "\*"\);/);
   // a collapsed or out-of-viewer selection seeds nothing, and CodeMirror selections are edits
   assert.match(VIEW, /if \(!sel \|\| sel\.isCollapsed \|\| !sel\.anchorNode \|\| !box\.contains\(sel\.anchorNode\)\) return;/);
