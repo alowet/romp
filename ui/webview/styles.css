@@ -651,6 +651,11 @@ body.chat-theme-yatharth .tab.active.colored:not(.tab-blocked) {
 .ctx-caret { margin-left: auto; padding-left: 10px; opacity: 0.55; align-self: center; }
 .ctx-sub { z-index: 101; }
 .ctx-sub .ctx-item { padding-right: 26px; position: relative; }
+/* a choice this box cannot bill (the Billing flyout, the user 2026-09-08: both options always listed,
+   the unavailable one greyed with the reason in its title, inert) — the same dim-and-no-hover the
+   feed view menu's .forced items wear */
+.ctx-sub .ctx-item.disabled { opacity: 0.45; cursor: default; }
+.ctx-sub .ctx-item.disabled:hover { background: transparent; color: inherit; }   /* .ctx-item:hover also recolours */
 .ctx-sub .ctx-item.current::after {
   content: "✓"; position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
   background: var(--check-bg); color: #fff; border-radius: 50%;
@@ -1535,14 +1540,7 @@ body.chat-theme-yatharth .meta-btn.mode-risky, body.chat-theme-yatharth .meta-it
    so a storm that produced nothing never reads like a recovery (the user 2026-07-25) */
 .gaveup-text { color: var(--st-blocked-bg); font-weight: 600; }
 /* the durable "safeguards flagged → switched model" note (the user 2026-08-03: a mid-turn model swap
-   must be apparent in the chat, never silent) — the retried note's slim rail treatment in the warning
-   voice; the CLI's full explanation expands below the line on click */
-.modelswap-text { color: var(--warn, #d7a23a); font-weight: 600; }
-.modelswap-line { cursor: pointer; }
-.modelswap-line:hover .modelswap-text { filter: brightness(1.15); }
-.modelswap-body { display: none; color: var(--dim); font-size: 0.92em; margin: 4px 0 2px;
-  white-space: pre-wrap; max-width: 72ch; }
-.modelswap-body.expanded { display: block; }
+   must be apparent in the chat, never silent) is a notice card since T279: see .notice-card-refusal */
 /* the durable record of a died turn — the live card's chrome without its buttons; slightly dimmer body
    so history reads calmer than the ACTIVE blocked card while staying unmistakably an error */
 .apierror-note .apierror-body { color: var(--dim); }
@@ -2379,11 +2377,26 @@ body.chat-theme-yatharth .meta-btn.mode-risky, body.chat-theme-yatharth .meta-it
 .notice-card-compact { border-left-color: var(--st-compacting-bg, #14b8a6); }
 .notice-chip-compact { color: var(--st-compacting-bg, #14b8a6); border-color: var(--st-compacting-bg, #14b8a6); }
 .notice-dot-compact { border-color: var(--st-compacting-bg, #14b8a6); }
+/* a peer session's / channel's message surfaced as a notice (renderInjected, the user 2026-09-07) — the
+   teammate card's dashed, neutral language (NOT the per-peer color chrome of a romp postal card), on the
+   notice-card frame so every injected record wears one family */
+.notice-card-peer { border-left-color: var(--dim); border-style: dashed; }
+.notice-chip-peer { color: var(--fg); opacity: 0.85; border-color: var(--dim); }
+.notice-dot-peer { border-color: var(--dim); }
 /* the /clear boundary — QUIET, like the timeline's film-splice seam: a dim frame (this is a historical
    marker, not a live status), with the pre-clear conversation nested in the body once lazy-loaded. */
 .notice-card-clear { border-left-color: var(--dim); }
 .notice-chip-clear { color: var(--dim); border-color: var(--dim); }
 .notice-dot-clear { border-color: var(--dim); }
+/* a safeguards refusal the CLI retried on a fallback model (T279): the heads-up amber — attention, not an
+   error. The fold: the API's explanation, then the CLI's own line, dimmed. */
+.notice-card-refusal { border-left-color: var(--warn, #d7a23a); }
+.notice-chip-refusal { color: var(--warn, #d7a23a); border-color: var(--warn, #d7a23a); }
+.notice-dot-refusal { border-color: var(--warn, #d7a23a); }
+.refusal-swap { font-weight: 600; }
+.refusal-cli-line { color: var(--dim); }
+.refusal-swap + .refusal-explanation, .refusal-swap + .refusal-cli-line,
+.refusal-explanation + .refusal-cli-line { margin-top: 6px; }
 .clear-loading { display: inline-flex; align-items: center; gap: 8px; }
 .clear-truncated { color: var(--dim); padding: 4px 0 6px; }
 

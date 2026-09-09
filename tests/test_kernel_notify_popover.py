@@ -287,8 +287,31 @@ class PushTestRoute(_LoopbackMixin, unittest.TestCase):
         self.assertEqual(d["tag"], "romp:" + SID_WEB)
         # a turn's routing shape under kind test: the shell POSTs /reveal for the sid, no card to scroll to
         self.assertEqual(d["data"], {"sid": SID_WEB, "host": "", "kind": "test", "cardId": "",
-                                     "url": "/?push-reveal=" + SID_WEB})
+                                     "url": "/?push-reveal=" + SID_WEB,
+                                     "name": "web"})   # the same name the answer carries (2026-09-09: the shell's offer chip reads it off the payload)
         self.assertNotIn("badge", d, "the count rides its own push")
+
+    def test_every_test_push_leaves_a_line_in_the_kernel_log(self):
+        # 2026-09-08: a phone's test tap brought romp forward and nothing more, and the journal could not say
+        # whether the test had carried a session — this route logged nothing. One stderr line per test push: the
+        # session clipped (none when the shell attached none; a federated one keeps its host prefix), the
+        # endpoint's host only, and the push service's answer; an unsubscribed endpoint logs too
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf), \
+             mock.patch.object(km, "_vapid_keys", return_value=(None, "pub")), \
+             mock.patch.object(km, "_push_post", return_value=(201, "Created")), \
+             mock.patch.object(km, "_name_of", return_value=None):
+            self._post("/push/test", {"endpoint": self.ep})
+            self._post("/push/test", {"endpoint": self.ep, "sid": SID_WEB, "host": ""})
+            self._post("/push/test", {"endpoint": self.ep, "sid": "boxa:" + SID_API, "host": "boxa"})
+            self._post("/push/test", {"endpoint": "https://push.example.net/send/nobody"})
+        lines = [l for l in buf.getvalue().splitlines() if l.startswith("[push] test")]
+        self.assertEqual(lines, ["[push] test sid=none endpoint=push.example.net: 201",
+                                 "[push] test sid=%s endpoint=push.example.net: 201" % SID_WEB[:8],
+                                 "[push] test sid=boxa:%s endpoint=push.example.net: 201" % SID_API[:8],
+                                 "[push] test sid=none endpoint=push.example.net: not subscribed"])
+        self.assertNotIn(SID_WEB, buf.getvalue(), "ids clipped: enough to match rows, never the whole id")
 
     def test_a_federated_session_keeps_its_prefix_and_falls_back_to_the_short_id(self):
         # a remote session's name lives at its origin kernel; with no snapshot of that kernel's
@@ -828,26 +851,37 @@ class ShellPopover(unittest.TestCase):
         # the mobile header's #mcur chip mirrors — rather than growing a second channel for one fact
         self.assertIn("function activeSession(){", js)
         self.assertIn("document.getElementById('f-chat')", js)
-        self.assertIn("d.querySelector('#tabs .tab.active[data-id]')", js)
+        self.assertIn("tb=d&&d.querySelector('#tabs')", js)
+        self.assertIn("t=tb.querySelector('.tab.active[data-id]')", js)
         # a federated tab's id is host:sid, so the host is its prefix; a bare local id has none.
         # The tab's LABEL rides along too (2026-09-06): the kernel names the session from its own
         # registry or its snapshot of the owning host, and falls back to this — the user's own UI
         # text, display-only, clipped here as well as there
         self.assertIn("var i=id.indexOf(':');\nvar lab=t&&t.querySelector('.tab-label');\nreturn {sid:id,host:i>0?id.slice(0,i):'',label:", js)
-        self.assertIn(".replace(/\\s+/g,' ').trim().slice(0,80)}", js)   # flattened + clipped at the same cap the kernel applies
+        self.assertIn(".replace(/\\s+/g,' ').trim().slice(0,80),why:why,tabs:n}", js)   # flattened + clipped at the same cap the kernel applies; plus why an empty read is empty (2026-09-08)
         self.assertEqual(km.PUSH_LABEL_MAX, 80)
+        # WHY an empty read is empty (2026-09-08): each miss has a name, and the chip's own first-tab
+        # fallback is NOT taken here — the test attaches the session in front or none, never a guess
+        for why in ("why='no-frame'", "why='no-doc'", "why='no-tabs'", "why='none-active'", "why='threw'"):
+            self.assertIn(why, js)
         handler = js[js.index("if(act==='test')"):]
         # read AT the press, before the subscription lookup's await: the session you were looking
-        # at, not the one you switch to while it sends
+        # at, not the one you switch to while it sends — and filed at once as the trail's first row
         self.assertLess(handler.index("var at=activeSession();"), handler.index("sub().then("))
+        self.assertLess(handler.index("diag('push-test',{sidAttached:!!at.sid,host:at.host,why:at.why,tabs:at.tabs});"), handler.index("sub().then("))
         self.assertIn("post('/push/test',{endpoint:s.endpoint,sid:at.sid,host:at.host,label:at.label})", handler)
         # on success with a session, ONE sentence says where the tap goes — in the kernel's words
-        # (d.name, the name the notification body carries) — after the outcome, before the master-off note
+        # (d.name, the name the notification body carries) — after the outcome, before the master-off note;
+        # on success WITHOUT one, the line says so (2026-09-08): a plain probe must never pass for a landing test
         line = "if(ok&&d.name)testOut.textContent+=' Tapping it brings you back to '+d.name+'.';"
+        none = "else if(ok)testOut.textContent+=' No session was attached — the tap will only bring romp forward.';"
         self.assertIn(line, handler)
+        self.assertIn(none, handler)
         self.assertEqual(js.count("Tapping it brings you back to"), 1, "one sentence, appended once")
+        self.assertEqual(js.count("No session was attached"), 1)
         self.assertLess(handler.index("'The push service accepted it.'"), handler.index(line))
-        self.assertLess(handler.index(line), handler.index("if(!isOn)testOut.textContent+="))
+        self.assertLess(handler.index(line), handler.index(none))
+        self.assertLess(handler.index(none), handler.index("if(!isOn)testOut.textContent+="))
 
     def test_the_bell_opens_it_and_the_rows_are_the_switches(self):
         js = km._LANDING_PUSH_JS
@@ -921,6 +955,154 @@ class ShellPopover(unittest.TestCase):
         for lit in ("#252526", "#cccccc", "rgba(255,255,255", "rgba(0,0,0,0.35)", "#1EA1EB"):
             self.assertNotIn(lit, bare, lit)
         self.assertIn("background:var(--accent)", pop, "the on-state pill is accent chrome")
+
+
+# The bell's script, EXECUTED (the test_error_center.py pattern): node runs _LANDING_PUSH_JS against a
+# hand-rolled DOM — the popover's nodes, the bells, and a chat iframe whose document is swapped per
+# scenario — and presses the test button on each shape the phone can present. Pins what the press
+# ATTACHES and what it SAYS, not the words of the popover: the active tab's id when the strip has one;
+# none — filed with why — when the strip is still the boot window's placeholders (none active yet:
+# the mobile chip shows the first tab then, its own fallback, and the test must not guess that one),
+# when the chat frame has no document yet, no frame, or no strip; and the result line then says so.
+_PUSH_HARNESS = r"""
+'use strict';
+const DIAG = [], FETCHES = [], NOTES = [];
+function node(attrs) {
+  attrs = Object.assign({}, attrs || {});
+  const n = { hidden: false, disabled: false, textContent: '', className: '', style: {}, _h: {}, _cls: new Set(), parentNode: null,
+    classList: { toggle: (c, on) => { if (on === undefined) on = !n._cls.has(c); if (on) n._cls.add(c); else n._cls.delete(c); },
+                 add: (c) => n._cls.add(c), remove: (c) => n._cls.delete(c), contains: (c) => n._cls.has(c) },
+    setAttribute: (k, v) => { attrs[k] = String(v); }, getAttribute: (k) => (k in attrs ? attrs[k] : null),
+    querySelector: (sel) => (n._q && sel in n._q ? n._q[sel] : null),
+    querySelectorAll: (sel) => (n._qa && n._qa[sel]) || [],
+    addEventListener: (k, f) => { n._h[k] = f; },
+    getBoundingClientRect: () => ({ top: 700, right: 380 }) };
+  return n;
+}
+const bell = node(), back = node(), pop = node(), devSub = node(), testBtn = node({ 'data-act': 'test' }), testOut = node();
+testBtn.textContent = 'Send a test notification'; testBtn.parentNode = pop;
+pop._q = { '[data-act=all]': node(), '[data-act=dev]': node(), '[data-act=turns]': node() };
+const frame = { contentDocument: null };      // the chat iframe: its document is the scenario
+let hasFrame = true;
+global.window = global;
+global.innerHeight = 800; global.innerWidth = 390;
+global.document = {
+  querySelectorAll: (sel) => (sel === '#mbell,#rail-bell' ? [bell] : []),
+  getElementById: (id) => ({ 'rbell-back': back, 'rbell-pop': pop, 'rbp-dev-sub': devSub, 'rbp-test': testBtn,
+                             'rbp-test-out': testOut, 'f-chat': hasFrame ? frame : null })[id] || null,
+};
+global.Notification = { permission: 'granted', requestPermission: () => Promise.resolve('granted') };
+global.PushManager = function () {};
+const SUB = { endpoint: 'https://push.example.net/send/dev-1' };
+Object.defineProperty(global, 'navigator', { configurable: true,
+  value: { serviceWorker: { getRegistration: () => Promise.resolve({ pushManager: { getSubscription: () => Promise.resolve(SUB) } }) } } });
+global.fetch = (path, init) => {
+  if (init && init.method === 'POST') {
+    const b = JSON.parse(init.body); FETCHES.push([path, b]);
+    const res = { ok: true, status: 201, detail: 'Created' };
+    if (b.sid) { res.sid = b.sid; res.name = b.sid.indexOf(':') > 0 ? b.sid.split(':')[0] + ':api' : 'web'; }   // the kernel names every sid it is handed
+    return Promise.resolve({ ok: true, json: () => Promise.resolve(res) });
+  }
+  return Promise.resolve({ ok: true, json: () => Promise.resolve({ on: true }) });   // /notify-all, /notify-turns: the master on, so no master-off sentence rides the result
+};
+global.__rompShellDiag = (what, data) => DIAG.push([what, data]);
+global.__rompNotify = (kind, text) => NOTES.push([kind, text]);
+"""
+_PUSH_DRIVER = r"""
+const tick = () => new Promise((r) => setTimeout(r, 0));
+// a chat document whose strip holds `ids`, with the tab at `active` active (-1: none — the boot window)
+function chatDoc(ids, active, label) {
+  const tabs = ids.map((id, i) => { const t = node({ 'data-id': id });
+    const lab = node(); lab.textContent = label || ('  s' + i + '  '); t._q = { '.tab-label': lab }; return t; });
+  const strip = node(); strip._qa = { '.tab[data-id]': tabs }; strip._q = { '.tab.active[data-id]': active >= 0 ? tabs[active] : null };
+  return { querySelector: (sel) => (sel === '#tabs' ? strip : null) };
+}
+async function press() {
+  DIAG.length = 0; FETCHES.length = 0; NOTES.length = 0; testOut.textContent = ''; testOut._cls.clear();
+  pop._h.click({ target: testBtn });
+  const pressed = { disabled: testBtn.disabled, label: testBtn.textContent, diag: DIAG.slice(), fetches: FETCHES.length };
+  await tick(); await tick();
+  return { pressed, fetches: FETCHES.slice(), out: testOut.textContent, bad: testOut._cls.has('bad'), notes: NOTES.slice(),
+           restored: { disabled: testBtn.disabled, label: testBtn.textContent } };
+}
+(async () => {
+  await tick();                                                  // the boot fetches settle (master on, device subscribed)
+  const out = {};
+  frame.contentDocument = chatDoc(['S1', 'S2'], -1);            // the phone's boot window: two placeholders, none active yet
+  out.noneActive = await press();
+  frame.contentDocument = chatDoc(['S1', 'boxa:S2'], 1, ' boxa:api ');   // a federated tab in front, its label padded the way text nodes are
+  out.active = await press();
+  frame.contentDocument = chatDoc(['S1'], 0);
+  out.local = await press();
+  frame.contentDocument = null;                                  // a chat frame mid-load: no document yet
+  out.noDoc = await press();
+  hasFrame = false;
+  out.noFrame = await press();
+  hasFrame = true;
+  frame.contentDocument = { querySelector: () => null };         // a chat page without a strip at all
+  out.noTabs = await press();
+  frame.contentDocument = { querySelector: () => { throw new Error('cross-origin'); } };   // a document the shell may not read
+  out.threw = await press();
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+class LandingPushExecutes(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import subprocess
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(_PUSH_HARNESS + km._LANDING_PUSH_JS + _PUSH_DRIVER)
+            path = f.name
+        try:
+            r = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
+        finally:
+            os.unlink(path)
+        assert r.returncode == 0, "the bell's script threw: " + r.stderr[:800]
+        cls.out = json.loads(r.stdout.strip().splitlines()[-1])
+
+    EP = "https://push.example.net/send/dev-1"
+
+    def test_the_boot_windows_strip_attaches_no_session_and_the_line_says_so(self):
+        # the phone (2026-09-08): the strip holds the kernel's placeholders before the first session payload
+        # names an active one; the mobile chip shows the FIRST tab then (its own fallback), and the test must
+        # attach none rather than guess that one — filed as a row with the why, said in the result line
+        r = self.out["noneActive"]
+        self.assertEqual(r["pressed"]["diag"], [["push-test", {"sidAttached": False, "host": "", "why": "none-active", "tabs": 2}]])
+        self.assertEqual(r["pressed"]["fetches"], 0, "the row is filed at the press, before the subscription lookup")
+        self.assertEqual(r["fetches"], [["/push/test", {"endpoint": self.EP, "sid": "", "host": "", "label": ""}]])
+        self.assertEqual(r["out"], "The push service accepted it. No session was attached — the tap will only bring romp forward.")
+        self.assertFalse(r["bad"])
+
+    def test_the_session_in_front_is_attached_and_named(self):
+        r = self.out["active"]
+        self.assertEqual(r["pressed"]["diag"], [["push-test", {"sidAttached": True, "host": "boxa", "why": "", "tabs": 2}]])
+        self.assertEqual(r["fetches"], [["/push/test", {"endpoint": self.EP, "sid": "boxa:S2", "host": "boxa", "label": "boxa:api"}]])
+        self.assertEqual(r["out"], "The push service accepted it. Tapping it brings you back to boxa:api.")
+        r = self.out["local"]
+        self.assertEqual(r["pressed"]["diag"], [["push-test", {"sidAttached": True, "host": "", "why": "", "tabs": 1}]])
+        self.assertEqual(r["fetches"][0][1]["sid"], "S1")
+        self.assertEqual(r["out"], "The push service accepted it. Tapping it brings you back to web.")
+        for k in ("noneActive", "active", "local"):
+            self.assertNotIn("sid", self.out[k]["pressed"]["diag"][0][1], "the row is structure only: attached or not, never which")
+
+    def test_every_other_empty_read_names_its_reason(self):
+        # a frame mid-load (no document yet), no frame, a page without a strip, a document the shell may not
+        # read: each attaches nothing, files its reason, and the line says no session was attached
+        for key, why in (("noDoc", "no-doc"), ("noFrame", "no-frame"), ("noTabs", "no-tabs"), ("threw", "threw")):
+            r = self.out[key]
+            self.assertEqual(r["pressed"]["diag"], [["push-test", {"sidAttached": False, "host": "", "why": why, "tabs": 0}]], key)
+            self.assertEqual(r["fetches"][0][1]["sid"], "", key)
+            self.assertIn("No session was attached", r["out"], key)
+            self.assertFalse(r["bad"], key)
+
+    def test_the_button_acknowledges_and_restores(self):
+        for key in ("noneActive", "active", "noFrame"):
+            r = self.out[key]
+            self.assertEqual((r["pressed"]["disabled"], r["pressed"]["label"]), (True, "Sending…"), key)
+            self.assertEqual(r["restored"], {"disabled": False, "label": "Send a test notification"}, key)
+            self.assertEqual(r["notes"], [], key)
 
 
 if __name__ == "__main__":

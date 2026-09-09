@@ -18,6 +18,9 @@ SourceFileLoader("romp_judge", os.path.join(BIN, "romp-judge")).load_module()
 os.environ["ROMP_KERNEL_NO_OPEN"] = "1"
 km = SourceFileLoader("romp_kernel_sf", os.path.join(BIN, "romp-kernel")).load_module()
 # the kernel's helpers read/write jd.STATE; sandbox THAT module's STATE (the one the kernel actually uses)
+# ...with _rebind_state, never STATE alone: GOALDIR and every derived dir stay at the import-bound root otherwise,
+# and that module is ONE object shared by every test module in the process, so a goal store saved there outlived
+# this module and reached every later module's feed for the placeholder sid (T281).
 jd = km.jd
 
 
@@ -25,11 +28,11 @@ class SessionFlags(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.saved = jd.STATE
-        jd.STATE = Path(self.td.name)
+        jd._rebind_state(Path(self.td.name))
         km._flags_cache.clear()
 
     def tearDown(self):
-        jd.STATE = self.saved
+        jd._rebind_state(self.saved)
         self.td.cleanup()
 
     def test_default_is_empty(self):
@@ -78,7 +81,7 @@ class AutoNudgeWiring(unittest.TestCase):
     def test_version_reports_autonudge_state_for_the_checkbox(self):
         saved = jd.STATE
         td = tempfile.TemporaryDirectory()
-        jd.STATE = Path(td.name)
+        jd._rebind_state(Path(td.name))
         km._autonudge_cache.clear()
         try:
             self.assertTrue(km._version_info()["autoNudge"], "on by default (no state file)")
@@ -87,19 +90,19 @@ class AutoNudgeWiring(unittest.TestCase):
             km._set_auto_nudge(True)
             self.assertTrue(km._version_info()["autoNudge"], "the gear reads the kernel's authoritative state")
         finally:
-            jd.STATE = saved
+            jd._rebind_state(saved)
             td.cleanup()
 
     def test_default_on_even_when_state_file_lacks_the_key(self):
         saved = jd.STATE
         td = tempfile.TemporaryDirectory()
-        jd.STATE = Path(td.name)
+        jd._rebind_state(Path(td.name))
         km._autonudge_cache.clear()
         try:
             (Path(td.name) / "auto-nudge.json").write_text('{"nudged": {}}')  # present, no "enabled" key
             self.assertTrue(km._auto_nudge_on(), "a state file missing the enabled key still defaults on")
         finally:
-            jd.STATE = saved
+            jd._rebind_state(saved)
             td.cleanup()
 
 
@@ -115,11 +118,11 @@ class FlagsStoreUnreadableRefuses(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.saved = jd.STATE
-        jd.STATE = Path(self.td.name)
+        jd._rebind_state(Path(self.td.name))
         km._flags_cache.clear()
 
     def tearDown(self):
-        jd.STATE = self.saved
+        jd._rebind_state(self.saved)
         km._flags_cache.clear()
         self.td.cleanup()
 
@@ -279,7 +282,7 @@ class FlagsDisplayReaderServesUnproved(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.saved = jd.STATE
-        jd.STATE = Path(self.td.name)
+        jd._rebind_state(Path(self.td.name))
         km._flags_cache.clear()
         km._state_fault_seen.clear()
         self.notices = []
@@ -288,7 +291,7 @@ class FlagsDisplayReaderServesUnproved(unittest.TestCase):
 
     def tearDown(self):
         km._sync_notice = self._notice
-        jd.STATE = self.saved
+        jd._rebind_state(self.saved)
         km._flags_cache.clear()
         km._state_fault_seen.clear()
         self.td.cleanup()
@@ -423,13 +426,14 @@ class FlagsWsRefusal(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.saved = (jd.STATE, km._mark_views_dirty)
-        jd.STATE = Path(self.td.name)
+        jd._rebind_state(Path(self.td.name))
         km._flags_cache.clear()
         self.dirty = []
         km._mark_views_dirty = lambda: self.dirty.append(1)
 
     def tearDown(self):
-        jd.STATE, km._mark_views_dirty = self.saved
+        jd._rebind_state(self.saved[0])
+        km._mark_views_dirty = self.saved[1]
         km._flags_cache.clear()
         self.td.cleanup()
 
@@ -499,13 +503,14 @@ class SessionBellJudgedAgainstAProvedMaster(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.saved = (jd.STATE, km._mark_views_dirty)
-        jd.STATE = Path(self.td.name)
+        jd._rebind_state(Path(self.td.name))
         km._flags_cache.clear(); km._notify_cards_cache.clear()
         self.dirty = []
         km._mark_views_dirty = lambda: self.dirty.append(1)
 
     def tearDown(self):
-        jd.STATE, km._mark_views_dirty = self.saved
+        jd._rebind_state(self.saved[0])
+        km._mark_views_dirty = self.saved[1]
         km._flags_cache.clear(); km._notify_cards_cache.clear()
         self.td.cleanup()
 
@@ -558,7 +563,7 @@ class FlagsWsWriteFailure(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.saved = (jd.STATE, km._mark_views_dirty, km._sync_notice)
-        jd.STATE = Path(self.td.name)
+        jd._rebind_state(Path(self.td.name))
         km._flags_cache.clear(); km._notify_cards_cache.clear(); km._state_fault_seen.clear()
         vars(km).get("_state_write_fault_seen", {}).clear()
         self.dirty, self.notices = [], []
@@ -566,7 +571,8 @@ class FlagsWsWriteFailure(unittest.TestCase):
         km._sync_notice = lambda text, ok=True, kind="sync": self.notices.append((text, ok))
 
     def tearDown(self):
-        jd.STATE, km._mark_views_dirty, km._sync_notice = self.saved
+        jd._rebind_state(self.saved[0])
+        km._mark_views_dirty, km._sync_notice = self.saved[1:]
         km._flags_cache.clear(); km._notify_cards_cache.clear(); km._state_fault_seen.clear()
         vars(km).get("_state_write_fault_seen", {}).clear()
         self.td.cleanup()
@@ -801,14 +807,15 @@ class WsFlagsMustBeBooleans(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.saved = (jd.STATE, km._mark_views_dirty, km._push_soon, km._ws_act_now_tick)
-        jd.STATE = Path(self.td.name)
+        jd._rebind_state(Path(self.td.name))
         km._flags_cache.clear()
         km._mark_views_dirty = lambda: None
         km._push_soon = lambda: None
         km._ws_act_now_tick = lambda: None           # turn-on acts at once in service; not under test here
 
     def tearDown(self):
-        jd.STATE, km._mark_views_dirty, km._push_soon, km._ws_act_now_tick = self.saved
+        jd._rebind_state(self.saved[0])
+        km._mark_views_dirty, km._push_soon, km._ws_act_now_tick = self.saved[1:]
         km._flags_cache.clear()
         self.td.cleanup()
 

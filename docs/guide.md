@@ -538,6 +538,11 @@ switches indented under it, and a button:
   switch off, the answer adds that real notifications will not arrive until it
   is on.
 
+The handler that answers a tap lives on the phone, and the phone refreshes it
+whenever you open the app and whenever a notification arrives. If a tap ever
+opens Romp on the wrong session, close the app from the app switcher and open
+it again once.
+
 The bell itself shows the state of the device you are looking at: lit when the
 main switch is on and this device is set up, and crossed out otherwise. Its
 tooltip says which of the two is off.

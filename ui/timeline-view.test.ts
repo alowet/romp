@@ -56,26 +56,26 @@ test("idleGaps: inter-gap then trailing — ascending, trailing last and flagged
 });
 
 test("work anchor prefers the readable reply line", () => {
-  assert.equal(workAnchorOf({ uuid: "p1", workUuid: "w1", replyUuid: "r1" }), "r1");
+  assert.equal(workAnchorOf({ promptId: "p1", workId: "w1", replyUuid: "r1" }), "r1");
 });
 
 test("work anchor falls back to the first reply line when no readable reply", () => {
-  assert.equal(workAnchorOf({ uuid: "p1", workUuid: "w1", replyUuid: null }), "w1");
+  assert.equal(workAnchorOf({ promptId: "p1", workId: "w1", replyUuid: null }), "w1");
 });
 
 test("interrupted period (no reply lines) anchors on the boundary line", () => {
-  assert.equal(workAnchorOf({ uuid: "p1", workUuid: null, replyUuid: null }), "p1");
+  assert.equal(workAnchorOf({ promptId: "p1", workId: null, replyUuid: null }), "p1");
 });
 
 test("no event / no uuids yields null (openChat then uses anchorT / bottom)", () => {
   assert.equal(workAnchorOf(null), null);
-  assert.equal(workAnchorOf({ uuid: null, workUuid: null, replyUuid: null }), null);
+  assert.equal(workAnchorOf({ promptId: null, workId: null, replyUuid: null }), null);
 });
 
 test("bar click and focus handler both route through workAnchorOf", () => {
   const src = fs.readFileSync(viewPath, "utf8");
   // the work-bar click must carry the work anchor + the period start as anchorT
-  assert.match(src, /openChat\(t\.tid \|\| this\._laneTid\(s\), workAnchorOf\(t\), false, false, t\.start\)/);
+  assert.match(src, /openChat\(s\.id, workAnchorOf\(t\), false, false, t\.start\)/);   // T278b: the lane key is the bar's session
   // the feed-focus landing uses the same chain, so the two can't drift apart
   assert.match(src, /workAnchorOf\(byId\)/);
 });
@@ -191,7 +191,7 @@ test("dragAxis: vertical-dominant → row reorder", () => {
 test("a postal connector click jumps to the message's OWN card BY ID (mm.id → data-mid), not nearest-time (the user 2026-06-20)", () => {
   const src = fs.readFileSync(viewPath, "utf8");
   // msgNav passes the postal message id as the chat anchor; the chat (scrollToAnchor) matches it to the
-  // card's data-mid. nearestTurnAnchor stays only to resolve the tab (tid) + as a uuid fallback — the old
-  // time-nearest anchor (which landed on whatever turn was closest to the exec time) is gone.
-  assert.match(src, /this\.openChat\(\(an && an\.tid\) \|\| mm\.toId, mm\.id \|\| \(an && \(an\.uuid \|\| an\.replyUuid\)\)/);
+  // card's data-mid. nearestTurnAnchor stays only as a uuid fallback (the tab is the lane, mm.toId; bars carry
+  // no tid since T278b) — the old time-nearest anchor (whatever turn was closest to the exec time) is gone.
+  assert.match(src, /this\.openChat\(mm\.toId, mm\.id \|\| \(an && \(an\.promptId \|\| an\.replyUuid\)\)/);
 });

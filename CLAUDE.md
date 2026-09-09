@@ -183,7 +183,18 @@ mid-test. The failure is ordering-dependent: green alone, red only under the ful
 suite. Tests that mint goals therefore use a private synthetic sid of their own
 (any invented uuid; still synthetic, never real) and clean their sid's journal in
 tearDown. Precedent + worked diagnosis: the model-fallback dedupe tests' class
-docstring (`tests/test_model_fallback_card.py`, DedupeBackstop).
+docstring (`tests/test_model_fallback_card.py`, DedupeBackstop). A second face of
+the same collision (2026-09-08, four end-to-end tests green alone and red in CI's
+serial order): a test that exercises the nudge walk and stubs `jd.load_goals` as
+the walk's snapshot must ALSO stub `jd.load_goals_shared_or_fault`, the walk's
+shared read-only view since the jobs-stage change, and move the goal directory
+with the state (`jd._rebind_state(tmp)` repoints GOALDIR and every derived dir;
+assigning `jd.STATE` alone leaves GOALDIR where import bound it), because the
+shared view reads a store FILE when one exists and delegates to `load_goals` only
+when none does, so an earlier module's store for the shared placeholder sid at the
+unrebound GOALDIR was what the walk read (no goal due, no fire, a deferral never
+cleared, a KeyError). Precedent: `tests/test_nudge_injected_turn_arm.py`,
+`test_nudge_fresh_guard.py`, `test_nudge_memo_deadlock.py`, `test_nudge_bundle.py`.
 
 ## Authoritative sources — fail loudly, don't degrade silently (user rule, 2026-07-03)
 Read state from its AUTHORITATIVE source — a designed API, or the live store that
