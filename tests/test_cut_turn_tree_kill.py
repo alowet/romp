@@ -165,6 +165,29 @@ class ScopePath(unittest.TestCase):
         self.assertIsNone(out["scope"])
         self.assertEqual(out["tree"], 2)
 
+    def test_a_survivor_of_the_grace_gets_sigkill_on_a_fake_clock(self):
+        # The escalation, pinned with no real process, pid or second behind it (T276c): the liveness poll,
+        # the grace sleep and the clock are seams. The loop ignores its SIGTERM; the clock steps past the
+        # grace in recorded sleeps; exactly the survivor is SIGKILLed, once, after every SIGTERM.
+        be = _backend()
+        killed, slept, clock = [], [], [0.0]
+        ps = ("  %d %d /x/claude --input-format stream-json --resume %s\n"
+              "  %d %d bash -c tool\n"
+              "  %d %d sleep 300\n") % (CLI, MANAGER, SID, TOOL, CLI, LOOP, TOOL)
+        def alive(p):                    # the loop outlives its SIGTERM until its SIGKILL is recorded
+            return p == LOOP and (LOOP, signal.SIGKILL) not in killed
+        def sleep(s):
+            slept.append(s); clock[0] += s
+        out = be._end_cli_tree(CLI, ps.splitlines(), kill=lambda p, s: killed.append((p, s)),
+                               run=lambda *a, **k: None, cgroup=lambda pid: "",
+                               alive=alive, sleep=sleep, now=lambda: clock[0])
+        self.assertEqual(killed, [(TOOL, signal.SIGTERM), (LOOP, signal.SIGTERM), (CLI, signal.SIGTERM),
+                                  (LOOP, signal.SIGKILL)],
+                         "SIGTERM to the tree children-first then the CLI; SIGKILL to the one survivor only")
+        self.assertTrue(slept and all(s == 0.05 for s in slept), "the grace waits in short recorded sleeps")
+        self.assertGreaterEqual(clock[0], sb.TREE_KILL_GRACE, "…until the fake clock passes the grace")
+        self.assertEqual((out["signaled"], out["forced"], out["tree"]), (3, 1, 2))
+
     def test_the_leftover_scope_sweep_stops_our_dead_sessions_scopes_only(self):
         be = _backend()
         # a real child of THIS process stands in for "this kernel's live session": its unit is skipped

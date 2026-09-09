@@ -7216,7 +7216,8 @@ class SdkBackend:
         except PermissionError:
             return True
 
-    def _end_cli_tree(self, pid: int, ps_lines: list[str], kill=None, run=None, cgroup=None) -> dict:
+    def _end_cli_tree(self, pid: int, ps_lines: list[str], kill=None, run=None, cgroup=None,
+                      killpg=None, alive=None, sleep=None, now=None) -> dict:
         """End an orphaned session CLI and EVERYTHING it left behind (T276): its scope unit when it runs
         in one (systemd ends every process in the cgroup, a tool shell's setsid children and any
         re-parented leftover included), and, always, the process tree the `ps` listing still shows
@@ -7229,6 +7230,12 @@ class SdkBackend:
         kill = kill or os.kill
         run = run or subprocess.run
         cgroup = cgroup or _read_cgroup
+        # the process-group kill, the liveness poll and the grace clock are seams too (T276c): a test then
+        # pins the exact signal sequence with no real process, pid or second behind it
+        killpg = killpg or os.killpg
+        alive = alive or self._pid_alive
+        sleep = sleep or time.sleep
+        now = now or time.time
         unit = scope_unit_of(cgroup(pid) or "")
         # The scope must be the CLI's OWN: bin/romp-cli-scope names the unit with the pid the CLI runs as
         # (`romp-session-<sid8>-$$-$t`, then execs into it), so a CLI in its own scope always carries its pid
@@ -7264,7 +7271,7 @@ class SdkBackend:
         def signal_all(sig, only_alive: bool) -> int:
             n = 0
             for p in targets:
-                if only_alive and not self._pid_alive(p):
+                if only_alive and not alive(p):
                     continue
                 if not same(p):
                     continue          # the pid now names another process
@@ -7274,7 +7281,7 @@ class SdkBackend:
                     pg = None
                 try:
                     if pg is not None and pg == p and pg != own_pg:
-                        os.killpg(pg, sig)          # a setsid'd tool child leads its own group: take the group
+                        killpg(pg, sig)             # a setsid'd tool child leads its own group: take the group
                     else:
                         kill(p, sig)
                     n += 1
@@ -7282,10 +7289,10 @@ class SdkBackend:
                     pass
             return n
         signaled = signal_all(signal.SIGTERM, False)   # unconditionally: the OS answers for a pid already gone
-        deadline = time.time() + TREE_KILL_GRACE
-        while time.time() < deadline and any(self._pid_alive(p) for p in targets):
-            time.sleep(0.05)
-        forced = signal_all(signal.SIGKILL, True) if any(self._pid_alive(p) for p in targets) else 0
+        deadline = now() + TREE_KILL_GRACE
+        while now() < deadline and any(alive(p) for p in targets):
+            sleep(0.05)
+        forced = signal_all(signal.SIGKILL, True) if any(alive(p) for p in targets) else 0
         return {"scope": unit if stopped else None, "signaled": signaled, "forced": forced, "tree": len(targets) - 1}
 
     def _stop_leftover_scopes(self, lastsids: list[str], run=None) -> int:

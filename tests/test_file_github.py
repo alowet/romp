@@ -19,6 +19,7 @@ import threading
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
@@ -418,25 +419,32 @@ class BranchOnOrigin(_WithOrigin):
     def test_the_cut_kills_the_ssh_git_spawned_not_git_alone(self):
         # subprocess.run's timeout kill reached git alone; the ssh it had spawned sat in its TCP connect
         # for minutes after the viewer was told "could not check" (reproduced 2026-09-05). The query
-        # runs in its own session now and the deadline kills the whole group.
-        _git("checkout", "-q", "-b", "wip", cwd=self.tmp)
-        pidfile = os.path.join(self.root, "stuck-ssh.pid")
-        os.environ["GIT_SSH_COMMAND"] = _script(self.root, "stuck-ssh",
-                                                "echo $$ > '%s'\nexec sleep 30\n" % pidfile)
-        real = km.GH_LS_REMOTE_S
-        km.GH_LS_REMOTE_S = 0.3
-        try:
-            self.assertEqual(km._file_github_link(self.fp, None),
-                             (self.URL % "wip", "could not check whether branch wip is on origin"))
-        finally:
-            km.GH_LS_REMOTE_S = real
-        self.assertTrue(os.path.exists(pidfile), "the stand-in ssh ran before the cut")
-        pid = int(open(pidfile).read())
-        self.addCleanup(_kill_quiet, pid)
-        deadline = time.time() + 3
-        while _alive(pid) and time.time() < deadline:
-            time.sleep(0.02)
-        self.assertFalse(_alive(pid), "the ssh git spawned outlived the cut")
+        # runs in its own session now and the deadline kills the whole group. Pinned on the MECHANISM
+        # (T276c): the earlier version raced a real git against a 0.3 s deadline and a stand-in ssh's
+        # pidfile — on a slow runner git had not reached ssh by the cut, and the test flaked. Here a fake
+        # Popen stands in for git: its first communicate times out, and the query must (1) have started
+        # git in its own session (start_new_session, so the pid IS the group) and (2) kill THE GROUP by
+        # that pid with SIGKILL, then reap — the two facts that reach the ssh under git.
+        calls = {"popen": [], "killpg": [], "communicate": 0}
+        class FakeGit:
+            pid = 7_654_321                      # above pid_max: never a live process on the box
+            def communicate(self, timeout=None):
+                calls["communicate"] += 1
+                if calls["communicate"] == 1:
+                    raise subprocess.TimeoutExpired(cmd="git", timeout=timeout)
+                return ("", "")
+            def kill(self):
+                calls.setdefault("kill", 0); calls["kill"] += 1
+        def fake_popen(argv, **kw):
+            calls["popen"].append((list(argv), kw)); return FakeGit()
+        with mock.patch.object(km.subprocess, "Popen", side_effect=fake_popen), \
+             mock.patch.object(km.os, "killpg", side_effect=lambda g, s: calls["killpg"].append((g, s))):
+            out = km._git_net_out(["ls-remote", "--exit-code", "--heads", "origin", "wip"], self.tmp, 0.3, dict(os.environ))
+        self.assertIsNone(out, "a timed-out query has no answer")
+        self.assertEqual(len(calls["popen"]), 1)
+        self.assertTrue(calls["popen"][0][1].get("start_new_session"), "git starts in its own session, so its pid names the whole group")
+        self.assertEqual(calls["killpg"], [(FakeGit.pid, km.signal.SIGKILL)], "the deadline kills the GROUP under git's pid — the ssh with it")
+        self.assertEqual(calls["communicate"], 2, "…and the dead group is reaped")
 
     def test_a_detached_sha_is_never_checked(self):
         sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.tmp,
