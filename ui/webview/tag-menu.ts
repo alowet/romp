@@ -1,9 +1,14 @@
 // The SHARED tag-lens menu (the user 2026-08-25): one component every webview surface mounts —
-// the outline pane, the chat tab strip, the feed's local filter. (The timeline inlines the same
-// behavior in MENU_STYLE: it may live in Obsidian's document and loads no modules.) The menu is
-// multi-select toggles on ONE surface's lens: All a plain exclusive pick, (no tags) and every
-// name-keyed union tag toggling with the ✓ per selected row, the menu staying open across toggles
-// (a settings panel, not a command). A CAPTIONED DIVIDER says which surface the selection governs
+// the outline pane, the chat tab strip, the feed's local filter. (The timeline inlines its OWN copy
+// of this menu in MENU_STYLE, since it may live in Obsidian's document and loads no modules; that
+// copy still draws each tag as a colour-dot row with a ✓, not as the chips below — T283 changed the
+// shared component only, the timeline's mirror is its own follow-up.) The menu is
+// multi-select toggles on ONE surface's lens: All a plain exclusive pick, (no tags) toggling with
+// the ✓ when selected, and every name-keyed union tag as ITS OWN CHIP acting as a toggle button
+// (the user 2026-09-09, T283: the pill every surface already wears, one tag per line with the chip
+// at the left as the group-by-tag strip settled it; selected = full colour, unselected = faded, no
+// colour change, aria-pressed on the chip) — the menu staying open across toggles (a settings
+// panel, not a command). A CAPTIONED DIVIDER says which surface the selection governs
 // ("filters these tabs") — the shared idiom, sub-line scale. One management entry, "Configure
 // tags…", when the surface offers a route to the dialog.
 //
@@ -90,15 +95,12 @@ export function openTagMenu(anchor: HTMLElement, opts: TagMenuOpts): void {
     const lens = opts.lens();
     // (the scope caption retired 2026-08-25 — the user: the button tooltip already names the
     // surface, so it is the ONE scope carrier and the menu opens straight onto its rows)
-    const row = (label: string, current: boolean, dot?: string | null, dim?: boolean) => {
+    // a plain row (All, (no tags), the group switch, Configure tags…): the label, the ✓ when current; the
+    // tags are not rows any more but chips (below), so the colour dot the tag rows wore is gone (T283)
+    const row = (label: string, current: boolean, dim?: boolean) => {
       const r = document.createElement("div");
       r.setAttribute("style", "padding:4px 22px 4px 8px;border-radius:4px;cursor:pointer;position:relative;white-space:nowrap;"
         + (dim ? "opacity:0.85;" : ""));
-      if (dot) {
-        const d = document.createElement("span");
-        d.setAttribute("style", "display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;background:" + dot + ";");
-        r.appendChild(d);
-      }
       r.appendChild(document.createTextNode(label));
       if (current) {
         const c = document.createElement("span");
@@ -116,18 +118,31 @@ export function openTagMenu(anchor: HTMLElement, opts: TagMenuOpts): void {
     row("All", lensAll(lens)).addEventListener("click", () => opts.onApply({ all: true }, true));
     row("(no tags)", !lensAll(lens) && !!lens.none)
       .addEventListener("click", () => { opts.onApply(toggleLens(lens, "none"), false); build(); });
-    for (const u of opts.unions())
-      row(u.name, !lensAll(lens) && (lens.tags || []).includes(u.name), u.color || "#9aa0a6")
-        .addEventListener("click", () => { opts.onApply(toggleLens(lens, { tag: u.name }), false); build(); });
+    for (const u of opts.unions()) {
+      // one tag per line, the chip at the left: the chip IS the toggle (aria-pressed), full colour when
+      // selected, faded when not — the same pill tagChip builds for every other surface
+      const on = !lensAll(lens) && (lens.tags || []).includes(u.name);
+      const r = document.createElement("div");
+      r.setAttribute("style", "padding:3px 8px;border-radius:4px;cursor:pointer;white-space:nowrap;display:flex;align-items:center;");
+      const chip = tagChip(u.name, u.color || null, { off: !on });
+      chip.setAttribute("role", "button");
+      chip.setAttribute("aria-pressed", on ? "true" : "false");
+      chip.setAttribute("title", on ? "selected — click to drop it from the filter" : "click to add it to the filter");
+      r.appendChild(chip);
+      r.addEventListener("mouseenter", () => { r.style.background = "var(--menu-hover, rgba(255,255,255,0.09))"; });
+      r.addEventListener("mouseleave", () => { r.style.background = "transparent"; });
+      r.addEventListener("click", () => { opts.onApply(toggleLens(lens, { tag: u.name }), false); build(); });
+      menu.appendChild(r);
+    }
     if (opts.groupToggle || opts.onConfigure) {
       const s = document.createElement("div");
       s.setAttribute("style", "height:1px;margin:4px 6px;background:var(--menu-border, rgba(255,255,255,0.12));");
       menu.appendChild(s);
     }
     if (opts.groupToggle)
-      row(opts.groupToggle.label, opts.groupToggle.on(), null, true).addEventListener("click", () => { opts.groupToggle!.toggle(); build(); });
+      row(opts.groupToggle.label, opts.groupToggle.on(), true).addEventListener("click", () => { opts.groupToggle!.toggle(); build(); });
     if (opts.onConfigure)
-      row("Configure tags…", false, null, true).addEventListener("click", () => { closeTagMenu(); opts.onConfigure!(); });
+      row("Configure tags…", false, true).addEventListener("click", () => { closeTagMenu(); opts.onConfigure!(); });
   };
   build();
   document.body.appendChild(menu);
@@ -173,13 +188,20 @@ export const TAG_BTN_WASH = "rgba(156,210,255,0.12)";     // the feed .on's fain
  *  tags bar and the feed's tag chips wear. `inheritSize` drops the pill's own 0.82em for a host that
  *  already sits at the surface's sub-line size (the group header), so no em nests inside an em (the
  *  fonts rule). The uncoloured fallback is the theme's --dim (a token, so the light theme is never
- *  handed a dark gray), with the constant as the file:// fallback. */
-export function tagChip(label: string, color?: string | null, opts?: { inheritSize?: boolean }): HTMLElement {
+ *  handed a dark gray), with the constant as the file:// fallback.
+ *  `off` is the FADED state (T283): a chip standing for an unselected toggle keeps its colour and fades
+ *  to TAG_CHIP_OFF_OPACITY — the class names the state for the sheets and the pins, the inline opacity
+ *  paints it on a sheet-less host, the two equal by construction. */
+export const TAG_CHIP_OFF_CLASS = "tag-chip-off";
+export const TAG_CHIP_OFF_OPACITY = "0.45";   // pinned equal to .tag-chip-off in styles.css / feed.css
+export function tagChip(label: string, color?: string | null, opts?: { inheritSize?: boolean; off?: boolean }): HTMLElement {
   const col = color || ("var(--dim, " + TAG_BTN_GRAY + ")");
   const chip = document.createElement("span");
   chip.setAttribute("style", "display:inline-flex;align-items:center;gap:5px;padding:2px 7px;"
     + "border-radius:9px;" + (opts && opts.inheritSize ? "" : "font-size:0.82em;")
-    + "border:1px solid " + col + ";color:" + col + ";background:transparent;white-space:nowrap;");
+    + "border:1px solid " + col + ";color:" + col + ";background:transparent;white-space:nowrap;"
+    + (opts && opts.off ? "opacity:" + TAG_CHIP_OFF_OPACITY + ";" : ""));
+  if (opts && opts.off) chip.setAttribute("class", TAG_CHIP_OFF_CLASS);
   chip.appendChild(document.createTextNode(label));
   return chip;
 }
