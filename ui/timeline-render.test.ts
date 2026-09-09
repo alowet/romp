@@ -49,7 +49,7 @@ g.window = g;   // the view reads window.* (event listeners / globals) in its co
 g.innerWidth = 1400; g.innerHeight = 800;   // moveTip() clamps the tooltip to the viewport
 
 const viewPath = path.resolve(process.cwd(), "..", "ui", "romp-timeline-view.js");
-const { TimelinePanel, fmtSpan } = createRequire(__filename)(viewPath);
+const { TimelinePanel, fmtSpan, expandBars } = createRequire(__filename)(viewPath);
 
 const DAY = 86400, WEEK = 7 * DAY, MONTH = 30 * DAY;
 test("fmtSpan: concise day/week/month label for long collapsed gaps", () => {
@@ -750,16 +750,36 @@ test("prompt-dot hover shows the MESSAGE caption once ready, falling back to the
 // turns/judging/messages/nudges) which paints instantly, then {type:"bars"} = the heavy detail. update()
 // renders the skeleton; applyBars() fills the bars; and a skeleton-only update must NOT blink the bars out.
 function skeletonOf(full: any) {
-  return { now: full.now, sessions: full.sessions, turns: {}, judging: [], messages: [], nudges: [],
+  // the kernel's lanes skeleton: turns and judging EMPTY, judging as a map since the wire carries it per lane (T278c)
+  return { now: full.now, sessions: full.sessions, turns: {}, judging: {}, messages: [], nudges: [],
            activeChat: null, focus: null, hover: null, usage: null };
 }
+
+test("a cold start on the skeleton's empty judging map draws the judge band without throwing once the backstop fires", () => {
+  // the skeleton carries judging as {} (T278c); before update() expanded every payload's judging, a cold start
+  // (no previous data to carry) kept the object, and the judge band's draw read a list method on it once the
+  // loader backstop set the bars loaded: a blank pane with no loader until a bars frame landed
+  g.localStorage.getItem = (k: string) => (k === "romp:settings" ? JSON.stringify({ debug: true }) : null);
+  try {
+    const panel: any = new TimelinePanel(makeNode("div"));
+    const full = synthData();
+    panel.update(skeletonOf(full));
+    assert.deepEqual(panel.data.judging, [], "the empty map expands to the empty list every reader expects");
+    if (panel._loaderBackstop != null) { clearTimeout(panel._loaderBackstop); panel._loaderBackstop = null; }
+    panel._barsLoaded = true;                                      // what the backstop does before it draws
+    assert.doesNotThrow(() => panel.draw());
+    assert.ok(panel.svg.children.length > 3, "lanes and the band's chrome are drawn, not a blank plot");
+  } finally {
+    g.localStorage.getItem = () => null;
+  }
+});
 test("applyBars fills the deferred bars onto a lanes-only skeleton, and draw() emits them", () => {
   const panel: any = new TimelinePanel(makeNode("div"));
   const full = synthData();
   panel.update(skeletonOf(full));                                    // the {type:"data"} lanes skeleton
   assert.equal(Object.keys(panel.data.turns).length, 0, "the skeleton paints lanes with no bars yet");
   panel.applyBars({ type: "bars", turns: full.turns, judging: [], messages: [], nudges: [], now: full.now });
-  assert.deepEqual(panel.data.turns, full.turns, "applyBars merges the bars into the live data");
+  assert.deepEqual(panel.data.turns, expandBars(full.turns), "applyBars merges the bars into the live data");
   assert.ok(panel.svg.children.length > 10, "the bars render after applyBars (a populated SVG)");
 });
 test("a skeleton-only update preserves the bars from the last applyBars (no per-push blink)", () => {
@@ -769,7 +789,7 @@ test("a skeleton-only update preserves the bars from the last applyBars (no per-
   panel.applyBars({ type: "bars", turns: full.turns, judging: [], messages: [], nudges: [], now: full.now });
   const next = skeletonOf(full); next.now = full.now + 1;           // a fresh push: lanes skeleton again
   panel.update(next);
-  assert.deepEqual(panel.data.turns, full.turns, "the prior bars survive a lanes-only update (carried over)");
+  assert.deepEqual(panel.data.turns, expandBars(full.turns), "the prior bars survive a lanes-only update (carried over)");
 });
 
 // A message SENT before the visible window used to clamp its start to the left edge and hug the

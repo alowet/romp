@@ -385,7 +385,8 @@ let MENU_STYLE = null, MENU_CHECK_STYLE = null;   // set by applyPal() below (da
 // Judging band: a compact second timeline UNDER the session lanes, on the SAME axis — one row per
 // summarizer judge (docs/judges.md). Each mark is FILLED with the colour of the SESSION it acted on and
 // OUTLINED in the judge's OWN colour (so a bar reads as "judge X on session Y"). Fed by
-// data.judging = [{judge, sid, t, kind, text}]. Each judge's colour is a distinct hue from the romp palette.
+// data.judging = [{judge, sid, t, t1, kind, text, ms, in, out, sent, recv, open}] once expanded (expandJudging); on the
+// wire it rides per lane as compact entries (T278c). Each judge's colour is a distinct hue from the romp palette.
 // Each judge belongs to a SET (the user 2026-06-29): 'index' = the captioner + archiver (caption/archive
 // bookkeeping); 'triage' = planner/grouper/closer/distiller/courier (goal triage). The two settings toggles
 // (showIndexJudges / showTriageJudges) gate each set's rows on the band — see judgesShown().
@@ -560,6 +561,53 @@ function dragAxis(dx, dy, threshold) {
 // usually a thinking block), then workUuid (first reply line), then the boundary
 // uuid (an interrupted period has no reply at all). Shared by the focus handler
 // and the work-bar click so the two landings can never drift apart again.
+// THE WIRE BAR (T278c): the kernel sends a bar as {id, start, end} plus one-letter keys with every default
+// omitted, and the judging band per lane as compact entries (see kernel/kernel.py _BAR_WIRE / _JUDGING_WIRE);
+// the expanders below give every reader the long names it always had, once per frame at the boundary
+// (_mergeBars). A lane array the shim hands back unchanged across a delta expands once and is reused: the
+// per-lane caches keyed on array identity keep working. A long-named bar (an older kernel, a test fixture)
+// passes through with its defaults filled. BAR_WIRE is the kernel's table, byte for byte (a test compares).
+const BAR_WIRE = { p: ['promptId', null], w: ['workId', null], r: ['replyUuid', null], q: ['prompt', ''], c: ['summary', ''],
+  m: ['msgCaption', ''], s: ['src', 'typed'], d: ['mids', []], u: ['open', false], t: ['cont', false], a: ['nudgeAuto', false], o: ['romp', false] };
+const JUDGING_WIRE = { j: ['judge', null], kd: ['kind', 'run'], x: ['text', ''], ms: ['ms', 0], in: ['in', 0], out: ['out', 0], s: ['sent', null], r: ['recv', null], u: ['open', false] };
+function expandBar(b) {
+  if (!b || typeof b !== 'object') return b;
+  const out = { id: b.id, start: b.start, end: b.end };
+  for (const short in BAR_WIRE) {
+    const [name, dflt] = BAR_WIRE[short];
+    out[name] = (short in b) ? b[short] : (name in b) ? b[name] : (Array.isArray(dflt) ? [] : dflt);
+  }
+  out.pending = ('pending' in b) ? !!b.pending : false;
+  for (const k in b) if (!(k in BAR_WIRE) && !(k in out)) out[k] = b[k];   // anything else rides through (a fixture's extras)
+  return out;
+}
+const _lanesExpanded = new WeakMap();   // wire lane array -> its expanded array: an untouched lane keeps its identity
+function expandBars(turns) {
+  const out = {};
+  for (const sid in (turns || {})) {
+    const lane = turns[sid];
+    if (!Array.isArray(lane)) { out[sid] = lane; continue; }
+    let ex = _lanesExpanded.get(lane);
+    if (!ex) { ex = lane.map(expandBar); _lanesExpanded.set(lane, ex); }
+    out[sid] = ex;
+  }
+  return out;
+}
+function expandJudging(j) {
+  if (Array.isArray(j)) return j;                    // the legacy flat list (an older kernel), or an empty band
+  const out = [];
+  for (const sid in (j || {})) {
+    const lane = j[sid];
+    if (!Array.isArray(lane)) continue;
+    for (const c of lane) {
+      const e = { judge: c.j, sid, t: c.t };
+      if ('t1' in c) e.t1 = c.t1;
+      for (const short in JUDGING_WIRE) { if (short === 'j') continue; const [name, dflt] = JUDGING_WIRE[short]; e[name] = (short in c) ? c[short] : dflt; }
+      out.push(e);
+    }
+  }
+  return out;
+}
 function workAnchorOf(t) { return (t && (t.replyUuid || t.workId || t.promptId)) || null; }   // T278b: workId/promptId ARE the work/prompt uuids; the wire no longer repeats them as workUuid/uuid
 
 // Which ATOM of a turn a highlight set covers — `hit(id)` = membership in the active DAG-journey
@@ -2056,6 +2104,11 @@ class TimelinePanel {
     // applyBars lands. Read the RAW turns BEFORE the prev-carry below back-fills them.
     const ownBars = !!(data.turns && Object.keys(data.turns).length);
     if (ownBars) this._barsLoaded = true;
+    // the wire's shapes are expanded HERE for every payload (T278c), as _mergeBars does for the two-message path:
+    // a full one-shot payload carries compact bars and per-lane judging, and the lanes SKELETON carries judging
+    // as an empty map, which the judge band's draw would otherwise read as a list on a cold start
+    if (ownBars) data.turns = expandBars(data.turns);
+    if (data.judging !== undefined) data.judging = expandJudging(data.judging);
     if (data.turns) for (const k of Object.keys(data.turns)) this._barsSeen.add(k);
     const prev = this.data;
     if (prev && (!data.turns || !Object.keys(data.turns).length)) {
@@ -2170,9 +2223,9 @@ class TimelinePanel {
   // turns/judging/messages, the loader latch, the live edge's clock (2026-09-07). applyBars() paints after
   // it; update() runs it for a frame that was parked ahead of its skeleton.
   _mergeBars(m) {
-    this.data.turns = m.turns || {};
+    this.data.turns = expandBars(m.turns || {});      // the wire's compact bars, long-named for every reader (T278c)
     for (const k of Object.keys(this.data.turns)) this._barsSeen.add(k);
-    this.data.judging = m.judging || [];
+    this.data.judging = expandJudging(m.judging || []);
     this.data.messages = m.messages || [];
     // (nudges array retired 2026-07-07 payload audit: auto-nudges render from the bar's nudgeAuto)
     // Keep the romp loader up through the COLD warm-up rather than flashing "no romp activity" (the user
@@ -6283,4 +6336,4 @@ class TimelinePanel {
   body(s) { return s ? '<div class="b">' + s + '</div>' : ''; }
 }
 
-module.exports = { TimelinePanel, badgeFor, roundedPath, crossX, workAnchorOf, idleGaps, fmtSpan, dotLit, barLit, interpNow, shouldReanchorEdge, reanchorEdge, isFreshNowSample, barEndT, dragAxis, stripRompMarks, collapseRepeat, reqText, menuTop, offsetRect, viewVisible, viewLabel, viewMoreCount, viewToggleMember, viewTagUnion, lensAll, lensToggle, lensVisible, lensLabel, timelineLens, loadModelChoices, MODEL_CHOICES };
+module.exports = { TimelinePanel, expandBar, expandBars, expandJudging, BAR_WIRE, JUDGING_WIRE, badgeFor, roundedPath, crossX, workAnchorOf, idleGaps, fmtSpan, dotLit, barLit, interpNow, shouldReanchorEdge, reanchorEdge, isFreshNowSample, barEndT, dragAxis, stripRompMarks, collapseRepeat, reqText, menuTop, offsetRect, viewVisible, viewLabel, viewMoreCount, viewToggleMember, viewTagUnion, lensAll, lensToggle, lensVisible, lensLabel, timelineLens, loadModelChoices, MODEL_CHOICES };
