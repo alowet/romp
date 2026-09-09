@@ -821,7 +821,7 @@ def cost_state_watermarks(o):
     return {"total": float(total), "tokens": tokens}
 
 
-def last_cost_state(path):
+def last_cost_state(path, scan_bytes: int = 8 << 20):
     """The resumed transcript's LAST `cost-state` record, as the watermarks a CLI that restores it would
     hold (cost_state_watermarks), or None when the file has no such record or cannot be read.
 
@@ -851,16 +851,19 @@ def last_cost_state(path):
 
     Scans BACKWARDS in 64 KB chunks (a line split by a chunk edge is carried into the earlier chunk and
     reassembled) and stops at the first hit, so a transcript that carries the record costs a chunk or
-    two, and one that never carried it costs one sequential read of the whole file, on the event loop
-    at connect time."""
+    two. The scan is BOUNDED to the last `scan_bytes` (8 MB by default; last_record_uuid's tail read has
+    the same reason: a transcript can be tens of MB and this runs on the event loop at every connect):
+    a record older than that is treated as absent, which is the answer the print-mode CLI gives for its
+    own counters today (it restores nothing), so the two sides still agree (review find, 2026-09-09)."""
     marker = b'"cost-state"'
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             pos = f.tell()
+            floor = max(0, pos - int(scan_bytes))   # the oldest byte the bounded scan may reach
             carry = b""
-            while pos > 0:
-                step = min(pos, 1 << 16)
+            while pos > floor:
+                step = min(pos - floor, 1 << 16)
                 pos -= step
                 f.seek(pos)
                 chunk = f.read(step) + carry    # carry: the later chunk's first-line fragment, which this
