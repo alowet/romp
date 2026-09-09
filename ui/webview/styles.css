@@ -3585,6 +3585,9 @@ body.filebrowse-open { overflow: hidden; }
 /* a refusal explains itself in place, in the kernel's own words (too large — with the size and the
    cap; not a text file; not found) over the path it was asked for. Never a blank pane. */
 .fileview-err { padding: 18px 14px; font-size: 0.86em; color: var(--warn); }
+/* the edit-mode notice (file-view.ts noteBar) is a row of the card, between the title bar and the body:
+   it keeps its height and the body row shrinks under it, so the editor's 100% is the body it can see */
+.fileview > .fileview-err { flex: 0 0 auto; }
 .fileview-err-hint { margin-top: 6px; color: var(--dim); font-size: 0.92em;
   font-family: var(--mono, ui-monospace, monospace); word-break: break-all; }
 /* the way out of a refusal: when the file exists but cannot render (413/415), the kernel's words are
