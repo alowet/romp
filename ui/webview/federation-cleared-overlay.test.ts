@@ -12,13 +12,13 @@ const A = "HOSTA:" + SID;
 function remoteFeed() {
   return {
     type: "feed", now: 100,
-    asks: [{ itemId: A + ":g1", sid: A }, { itemId: A + ":g2", sid: A }],
-    items: [{ itemId: A + ":g9", sid: A }],
+    asks: [{ itemId: SID + ":g1", sid: A }, { itemId: SID + ":g2", sid: A }],
+    items: [{ itemId: SID + ":g9", sid: A }],
     ledgers: [{ sid: A, name: "HOSTA:api", ledger: { tree: [], archivedTops: [
-      { id: A + ":g1", depth: 0, cleared: false, done: true },
-      { id: A + ":g1a", depth: 1, cleared: false, done: true },
-      { id: A + ":g3", depth: 0, cleared: false, done: true },
-      { id: A + ":g3a", depth: 1, cleared: false, done: true },
+      { id: SID + ":g1", depth: 0, cleared: false, done: true },
+      { id: SID + ":g1a", depth: 1, cleared: false, done: true },
+      { id: SID + ":g3", depth: 0, cleared: false, done: true },
+      { id: SID + ":g3a", depth: 1, cleared: false, done: true },
     ] } }],
   };
 }
@@ -27,7 +27,7 @@ test("a foreign clear on the local payload drops the remote ask and reads the re
   const local = { type: "feed", now: 7, asks: [{ itemId: SID + ":g1", sid: SID }], ledgers: [], clearedForeign: [SID + ":g1", SID + ":g9"] };
   const remote = remoteFeed();
   const merged = mergeHostFeeds({ "": local, HOSTA: remote }, ["", "HOSTA"]);
-  assert.deepEqual(merged.asks.map((a: any) => a.itemId), [SID + ":g1", A + ":g2"], "the remote g1 ask is gone; the LOCAL g1 stays (the local kernel already applied its ledger)");
+  assert.deepEqual(merged.asks.map((a: any) => [a.sid, a.itemId]), [[SID, SID + ":g1"], [A, SID + ":g2"]], "the remote g1 ask is gone; the LOCAL g1 stays (the local kernel already applied its ledger)");
   assert.deepEqual(merged.items.map((c: any) => c.itemId), [], "the remote item is gone");
   const tops = merged.ledgers.find((l: any) => l.sid === A).ledger.archivedTops;
   assert.deepEqual(tops.map((n: any) => [n.id.split(":").pop(), n.cleared]),
@@ -47,8 +47,8 @@ test("without foreign ids nothing changes, and a remote host with none named pas
 });
 
 test("the overlay is pure over the rows it is given and ignores junk ids", () => {
-  const merged: any = { asks: [{ itemId: A + ":g1" }], items: [] };
-  const ledgers = [{ sid: A, ledger: { tree: [], archivedTops: [{ id: A + ":g1", depth: 0, cleared: false }] } }];
+  const merged: any = { asks: [{ itemId: SID + ":g1", sid: A }], items: [] };
+  const ledgers = [{ sid: A, ledger: { tree: [], archivedTops: [{ id: SID + ":g1", depth: 0, cleared: false }] } }];
   applyViewerClears(merged, ledgers, [SID + ":g1", 42, null]);
   assert.equal(merged.asks.length, 0);
   assert.equal(ledgers[0].ledger.archivedTops[0].cleared, true);
