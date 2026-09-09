@@ -99,7 +99,8 @@ const survey = () => page.evaluate(() => {
     seps: Array.from(document.querySelectorAll("#tabs .tab-group-sep")).map((e) => ({ w: e.getBoundingClientRect().width, h: e.getBoundingClientRect().height })),
     breaks: document.querySelectorAll("#tabs .tab-group-break").length,
     lines: Array.from(document.querySelectorAll("#tabs .tab-row-line")).map((l) => parseFloat(l.style.top)),
-    heads: Array.from(document.querySelectorAll("#tabs .tab-group-head")).map((h) => ({ group: h.dataset.group, act: h.dataset.act, folded: h.dataset.folded, count: h.querySelector(".tab-group-count")?.textContent })),
+    heads: Array.from(document.querySelectorAll("#tabs .tab-group-head")).map((h) => ({ group: h.dataset.group, act: h.dataset.act, folded: h.dataset.folded, count: h.querySelector(".tab-group-count")?.textContent,
+      kids: Array.from(h.children).map((c) => Array.from(c.classList).find((k) => k.startsWith("tab-group-")) || c.className) })),   // T284: the child order
   };
 });
 const open = await survey();
@@ -270,6 +271,12 @@ class ServedGroupsOnOwnLines(unittest.TestCase):
         self.assertEqual(next(t for g, _h, t in secs if g == "archived"), [], "folded: no archived tab rendered")
         same_row = [i for i in o["items"] if i["top"] == arch_head["top"] and i["w"] > 0 and i["id"]]
         self.assertEqual(same_row, [], "folded: the header row alone: %r" % same_row)
+        # T284 (the user 2026-09-09): every header opens chip, caret, count, the feed's grouped headers' order
+        # (name at the left, caret and count together at the right); the folded header's member pip comes
+        # last, so the folded and the open row share one shape and the caret is always the chip's neighbour
+        for h in o["heads"]:
+            self.assertEqual(h["kids"][:3], ["tab-group-chip", "tab-group-caret", "tab-group-count"], "%r: chip, caret, count: %r" % (h["group"], h["kids"]))
+        self.assertEqual(arch["kids"], ["tab-group-chip", "tab-group-caret", "tab-group-count", "tab-group-pip"], "folded: the pip after the count")
         # the per-row hairlines (T134, kept): one under every row but the last, none at the strip's top edge
         self.assertNotIn(0.0, o["lines"], "no hairline at the top edge (a break is not a row): %r" % o["lines"])
         self.assertTrue(o["lines"], "rows are still grounded by hairlines: %r" % o["lines"])

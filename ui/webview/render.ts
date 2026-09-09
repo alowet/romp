@@ -5303,18 +5303,25 @@ function makeGroupHead(sec: TabSection, collapsed: boolean, holdsActive: boolean
       if (e.key === "Enter" || e.key === " ") { e.preventDefault(); head.click(); }
     });
   }
+  // The header's order mirrors the feed's grouped headers (T284, the user 2026-09-09: the caret sat
+  // beside the chip at the left; the feed's Working / Blocked / Completed headers and its session
+  // headers put the name at the left and the caret with its count together at the RIGHT): the tag's
+  // chip first, then the caret and the count right after it, then (folded) the gist's pip last — so
+  // the folded and the open row share one shape and the caret is always the chip's neighbour. The
+  // whole row stays the fold's click target, the keyboard and aria paths above are unchanged, and the
+  // fold state key (the tag's name) is unchanged.
+  // The tag as THE CHIP it wears everywhere (T251, the user 2026-09-07: the swatch+name pair read as a
+  // plain label; the chip says "this is the tag" the way the tags bar and the feed say it, so which
+  // tabs belong to which group reads at a glance). The shared builder from tag-menu.ts — one
+  // vocabulary, never a lookalike — inheriting the header's own sub-line size (no nested em).
+  const chip = tagChip(name, sec.color, { inheritSize: true });
+  chip.classList.add("tab-group-chip");
+  head.appendChild(chip);
+  // the caret and the count, right after the chip (the feed's order: name, caret, then count)
   const caret = el("span", "tab-group-caret");
   caret.textContent = "▸";                       // turned down by CSS while open (.tab-group-head:not(.collapsed))
   caret.setAttribute("aria-hidden", "true");
   head.appendChild(caret);
-  // the tag as THE CHIP it wears everywhere (T251, the user 2026-09-07: the swatch+name pair read as a
-  // plain label; the chip says "this is the tag" the way the tags bar and the feed say it, so which
-  // tabs belong to which group reads at a glance). The shared builder from tag-menu.ts — one
-  // vocabulary, never a lookalike — inheriting the header's own sub-line size (no nested em). The
-  // count rides right after it in the same row.
-  const chip = tagChip(name, sec.color, { inheritSize: true });
-  chip.classList.add("tab-group-chip");
-  head.appendChild(chip);
   const n = el("span", "tab-group-count");
   n.textContent = words.count;   // folded: the hidden members — a pinned one shows itself; all pinned: the total (headWords)
   head.appendChild(n);

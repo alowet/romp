@@ -386,7 +386,8 @@ body.tabbar-resizing { cursor: ns-resize; user-select: none; }
 .tab-group-head.dragging { opacity: 0.45; }
 .tab-group-head.drop-target { box-shadow: inset 2px 0 0 var(--accent); }
 /* the disclosure chevron: ▸ folded, turned down while open — the fold-caret idiom (a CSS transition on
-   the flip, no timer) */
+   the flip, no timer). Right after the chip with the count after it (T284), the feed's grouped headers'
+   order; the header is content-sized, so the DOM order alone places them. */
 .tab-group-caret { display: inline-block; flex: 0 0 auto; width: 0.9em; text-align: center; transition: transform 0.12s ease; }
 .tab-group-head:not(.collapsed) .tab-group-caret { transform: rotate(90deg); }
 /* the tag's color as a short bar, not a dot: a dot beside a name is a session pip */
