@@ -9,7 +9,9 @@ parse cache's key bound to the session object, the store file's key with its jou
 episode log's key and the transcript path. Pins: unchanged inputs skip after a scan that placed nothing; a
 moved store, a fresh parse or an episode boundary un-skips that session alone; a write landing during the
 scan is seen next pass; three sessions with one moved place exactly what the ungated pass places; a parse
-the cache does not hold is never skipped; the scan asks the writer's loader for nothing; the counters.
+the cache does not hold is never skipped; the scan asks the writer's loader for nothing; the counters. A raise
+inside one session's scan is that session's pass-crash row: the other sessions place, the rows its unfinished scan
+queued are dropped and theirs are kept, it is not recorded, and the tiers after the courier run (CourierScanCrash).
 
 Synthetic fixtures only: placeholder sids, invented text, hostname TESTHOST; a temp root per test."""
 import json
@@ -371,6 +373,157 @@ class CourierSkip(_World):
         finally:
             jd._rebind_state(saved)
             other.cleanup()
+
+
+
+class CourierScanCrash(_World):
+    """A raise inside ONE session's scan is that session's pass-crash row, not the tier's (2026-09-09). The
+    per-session boundary in run_courier covered the parse, the store read and the link attach; the settle, the
+    episode floor and the segment walk ran outside it, so one poisoned session left run_courier before the
+    write loop (no other session placed), left run_triage before the propagate, group, consolidate and distill
+    passes, and left only a stderr traceback. Pins: the other sessions place in the crashing pass; one row for
+    the crashed session with the scan note; the rows its half-walked scan queued are dropped, and only those;
+    it is not recorded (scanned again next pass, placed once the poison lifts), and a record from an earlier
+    scan is dropped; the tiers after the courier run.
+
+    The poisoned session is C: discover walks the names directory sorted, so A's and B's scans run first and
+    their rows are on the pending list when C's scan raises. Each poison records the order it saw and the
+    assertions check that premise. With the FIRST session poisoned, dropping the crashed session's rows and
+    dropping every session's rows are indistinguishable, and the second is the fault this boundary removes."""
+
+    def _crash_rows(self):
+        text = jd.ERRORS.read_text() if jd.ERRORS.exists() else ""
+        return [r for r in (json.loads(l) for l in text.splitlines() if l.strip()) if r.get("err") == "pass-crash"]
+
+    @staticmethod
+    def _planted(store):
+        return [nd for nd in store["nodes"].values() if isinstance(nd.get("origin"), dict)]
+
+    def _poisoned_pass(self, attr, poison, now=T0 + 200):
+        """One pass with jd.<attr> replaced by `poison`; restored whatever the pass does."""
+        real = getattr(jd, attr)
+        setattr(jd, attr, poison)
+        try:
+            return self.run_pass(now=now)
+        finally:
+            setattr(jd, attr, real)
+
+    def _assert_c_scanned_after_a_and_b(self, order):
+        self.assertEqual(list(dict.fromkeys(order)), [A, B, C],
+                         "premise: C's scan follows A's and B's, so their rows are queued when it raises")
+
+    def _assert_row_and_recovery(self, counts, order, planted_c):
+        self._assert_c_scanned_after_a_and_b(order)
+        self.assertEqual(counts, (3, 0, 0), "every session scanned; A and B have rows to place, C's scan died")
+        self.assertTrue(self._planted(jd.load_goals(A)) and self._planted(jd.load_goals(B)),
+                        "A and B placed in the pass whose scan of C raised: only C's queued rows went with the crash")
+        self.assertEqual(self._planted(jd.load_goals(C)), [], "nothing placed from C's unfinished scan")
+        rows = self._crash_rows()
+        self.assertEqual([(r["judge"], r["fsid"]) for r in rows], [("courier", C)], "one row, C's")
+        self.assertTrue(rows[0]["note"].startswith("scan: RuntimeError("), rows[0]["note"])
+        self.assertNotIn(C, jd._COURIER_SEEN, "a scan that raised is not recorded: C is scanned again next pass")
+        # the poison lifted: C places on the next pass and settles like the others
+        self.assertEqual(self.run_pass(), (3, 0, 2), "C scanned with rows to place, A and B recorded")
+        self.assertEqual(len(self._planted(jd.load_goals(C))), planted_c, "C's delegates planted once its scan completes")
+        self.assertEqual(self.run_pass(), (1, 2, 1))
+        self.assertEqual(self.run_pass(), (0, 3, 0))
+        self.assertEqual(len(self._crash_rows()), 1, "no further rows once the scan completes")
+
+    def test_a_raise_in_the_segment_walk_is_that_sessions_row_and_the_others_place(self):
+        # C has TWO delegates and the walk raises on the second turn: the row the first turn queued must go
+        # with the crash (or the write loop places from a walk that never finished, and C, never recorded,
+        # re-attempts the rest every pass while the poison lasts), and A's and B's rows must stay.
+        self.deliver(C, T0 + 100)
+        real, order = jd._segs, []
+
+        def poison(turn, store):
+            order.append(store.get("rompUuid"))
+            if order.count(C) == 2:
+                raise RuntimeError("seam walk failed")
+            return real(turn, store)
+        counts = self._poisoned_pass("_segs", poison)
+        self.assertEqual(order.count(C), 2, "premise: C's first turn walked, the second raised")
+        self._assert_row_and_recovery(counts, order, planted_c=2)
+
+    def test_a_raise_in_the_episode_floor_is_that_sessions_row_and_the_others_place(self):
+        real, order = jd.episode_floor, []
+
+        def poison(sid):
+            order.append(sid)
+            if sid == C:
+                raise RuntimeError("episode log unreadable")
+            return real(sid)
+        self._assert_row_and_recovery(self._poisoned_pass("episode_floor", poison), order, planted_c=1)
+
+    def test_a_raise_in_the_settle_is_that_sessions_row_and_the_others_place(self):
+        # The settle reads the background-hold state (_awaiting_bg_hold, _bg_unresolved) and a raise there
+        # propagates by design (_bg_expiry_key's docstring). The planner files it as the session's row; so
+        # does the courier now.
+        real, order = jd._session_settled, []
+
+        def poison(fsid, path, session, store, now=None):
+            order.append(fsid)
+            if fsid == C:
+                raise RuntimeError("background hold unreadable")
+            return real(fsid, path, session, store, now)
+        self._assert_row_and_recovery(self._poisoned_pass("_session_settled", poison), order, planted_c=1)
+
+    def test_a_recorded_session_whose_rescan_raised_holds_no_stale_record(self):
+        # C is recorded, a delivery moves its inputs, and the rescan raises. The record says C's last scan
+        # found nothing to place, which is no longer so: it is dropped, as the rows-to-place arm drops it,
+        # rather than kept under a key a later pass could match.
+        self.run_pass(); self.run_pass()
+        self.assertEqual(self.run_pass(), (0, 3, 0), "premise: all three recorded")
+        self.assertIn(C, jd._COURIER_SEEN)
+        self.deliver(C, T0 + 150)
+        real = jd.episode_floor
+
+        def poison(sid):
+            if sid == C:
+                raise RuntimeError("episode log unreadable")
+            return real(sid)
+        self.assertEqual(self._poisoned_pass("episode_floor", poison, now=T0 + 300), (1, 2, 0),
+                         "C alone scanned (its inputs moved), and its scan died")
+        self.assertNotIn(C, jd._COURIER_SEEN, "the earlier record is dropped, not kept under its stale key")
+        self.assertEqual([(r["judge"], r["fsid"]) for r in self._crash_rows()], [("courier", C)])
+        self.assertEqual(self.run_pass(now=T0 + 300), (1, 2, 0), "the poison lifted: C places its second delegate")
+        self.assertEqual(len(self._planted(jd.load_goals(C))), 2)
+        self.assertEqual(self.run_pass(now=T0 + 300), (1, 2, 1))
+        self.assertEqual(self.run_pass(now=T0 + 300), (0, 3, 0))
+
+    def test_the_tiers_after_the_courier_run_in_the_crashing_pass(self):
+        # run_triage is one try/finally around the tier sequence: a raise leaving run_courier skipped the
+        # propagate, group, consolidate and distill passes for every session until the poison lifted.
+        ran, tiers = [], ("run_rewound_reconcile", "run_plan", "run_close", "run_unblock", "run_propagate",
+                          "run_group", "run_consolidate", "run_distill")
+        saved = {t: getattr(jd, t) for t in tiers}
+        for t in tiers:
+            setattr(jd, t, (lambda name: lambda *a, **k: ran.append(name))(t))
+        real, order = jd._segs, []
+
+        def poison(turn, store):
+            order.append(store.get("rompUuid"))
+            if order[-1] == C:
+                raise RuntimeError("seam walk failed")
+            return real(turn, store)
+        jd._segs = poison
+        try:
+            jd._discover_cache["fp"] = None
+            jd._discover_cache["result"] = None
+            jd._postal_from_memo["key"] = None
+            jd.run_triage(now=T0 + 200)
+        finally:
+            jd._segs = real
+            for t, fn in saved.items():
+                setattr(jd, t, fn)
+        self._assert_c_scanned_after_a_and_b(order)
+        self.assertIn("run_propagate", ran, "the tier after the courier ran in the crashing pass")
+        after = (["run_propagate"] + (["run_group"] if jd.GROUPER_ON else []) + (["run_consolidate"] if jd.CONSOLIDATE_ON else [])
+                 + (["run_distill"] if jd.DISTILLER_ON else []))
+        self.assertEqual(ran[ran.index("run_propagate"):], after, "every tier after the courier ran, in order")
+        self.assertTrue(self._planted(jd.load_goals(A)) and self._planted(jd.load_goals(B)), "A and B placed")
+        self.assertEqual([(r["judge"], r["fsid"]) for r in self._crash_rows()], [("courier", C)])
+        self.assertNotIn(C, jd._COURIER_SEEN)
 
 
 if __name__ == "__main__":
