@@ -126,6 +126,30 @@ class ScopePath(unittest.TestCase):
         self.assertEqual(out["scope"], unit)
         self.assertEqual(out["tree"], 0)
 
+    def test_an_inherited_scope_is_never_stopped_only_the_clis_own(self):
+        # the lean review of T276 (2026-09-09): the real-process test's fake CLI sat in the cgroup of the romp
+        # session running the tests, and the reaper stopped THAT session's scope. A scope is the CLI's own
+        # only when the unit name carries the CLI's pid (bin/romp-cli-scope names it so and execs into it).
+        be = _backend()
+        runs, killed = [], []
+        inherited = "romp-session-49985d8b-%d-1757374700.scope" % (CLI + 7)   # another pid: not this CLI's scope
+        cg = lambda pid: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/%s\n" % inherited
+        ps = "  %d %d /x/claude --input-format stream-json --resume %s\n" % (CLI, MANAGER, SID)
+        out = be._end_cli_tree(CLI, ps.splitlines(), kill=lambda p, s: killed.append((p, s)),
+                               run=lambda *a, **k: runs.append(list(a[0])), cgroup=cg)
+        self.assertEqual(runs, [], "no systemctl: the unit is not this CLI's, so stopping it would end someone else's session")
+        self.assertEqual(killed, [(CLI, signal.SIGTERM)], "the tree walk alone")
+        self.assertIsNone(out["scope"])
+
+    def test_a_failed_stop_is_not_reported_as_stopped(self):
+        be = _backend()
+        unit = "romp-session-11111111-%d-1757374800.scope" % CLI
+        cg = lambda pid: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/%s\n" % unit
+        run = lambda argv, **kw: mock.Mock(stdout="", stderr="Failed to stop: Unit not loaded.", returncode=5)
+        out = be._end_cli_tree(CLI, ("  %d 1 /x/claude --input-format stream-json --resume %s\n" % (CLI, SID)).splitlines(),
+                               kill=lambda p, s: None, run=run, cgroup=cg)
+        self.assertIsNone(out["scope"], "a nonzero systemctl is not a stopped scope; the tree walk still ran")
+
     def test_a_cli_with_no_scope_falls_back_to_the_tree_children_first(self):
         be = _backend()
         runs, killed = [], []
@@ -180,7 +204,8 @@ class BootReconcileEndsTheTree(unittest.TestCase):
         def run(argv, **kw):
             runs.append(list(argv)); return mock.Mock(stdout=ps if argv == sb.PS_ARGV else (listing if argv == sb.SCOPE_LIST_ARGV else ""), returncode=0)
         with mock.patch.object(sb.subprocess, "run", side_effect=run), \
-             mock.patch.object(sb.os, "kill", side_effect=lambda p, s: killed.append((p, s))):
+             mock.patch.object(sb.os, "kill", side_effect=lambda p, s: killed.append((p, s))), \
+             mock.patch.object(sb.SdkBackend, "_pid_alive", lambda self, p: False):   # fake pids read as gone on every platform (no /proc on macOS → os.kill(pid, 0) would be this mock)
             be._boot_reconcile([sb.read_reg(Path(d), SID)])
         self.assertEqual([p for p, _ in killed], [TOOL, LOOP, CLI], "the orphan's tree, children first, then the CLI; the tmux CLI and the live CLI untouched")
         self.assertEqual(runs[0], sb.PS_ARGV, "the listing is read first, with PS_ARGV")
@@ -193,7 +218,10 @@ class BootReconcileEndsTheTree(unittest.TestCase):
 class RealProcessTree(unittest.TestCase):
     """The fixture the dispatch asked for: a 'session' (a fake CLI shell) whose child spawns a DETACHED sleep loop;
     after the simulated cut — the reaper ending the orphaned CLI's tree — the loop is gone, and a bystander outside
-    the tree is untouched. No scope here (ROMP_CLI_SCOPE=0), so this is the process-group fallback."""
+    the tree is untouched. The cgroup seam is pinned EMPTY: the fake CLI inherits the cgroup of whatever runs
+    the tests (a romp session's own scope, when run from one — ROMP_CLI_SCOPE=0 only governs spawned CLIs), and
+    the reaper's own pid check would already refuse that unit, but this class is about the process-group
+    fallback, so it never consults the real cgroup at all."""
 
     def _tree(self):
         marker = "romp-t276-loop-" + uuid.uuid4().hex
@@ -229,7 +257,7 @@ class RealProcessTree(unittest.TestCase):
         loop_pids = [p for p in self._marker_pids(marker) if p != cli.pid]   # the fake CLI's own argv carries the marker too
         self.assertTrue(loop_pids and all(p in sb.descendants(ps, cli.pid) for p in loop_pids),
                         "the setsid'd loop is still the CLI's descendant by ppid: %r vs %r" % (loop_pids, sb.descendants(ps, cli.pid)))
-        out = be._end_cli_tree(cli.pid, ps)
+        out = be._end_cli_tree(cli.pid, ps, cgroup=lambda p: "")
         deadline = time.time() + 5
         while time.time() < deadline and (self._marker_pids(marker) or cli.poll() is None):
             time.sleep(0.05)

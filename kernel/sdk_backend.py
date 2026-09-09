@@ -2729,6 +2729,17 @@ def _read_cgroup(pid: int) -> str:
         return ""
 
 
+def _read_starttime(pid: int) -> int | None:
+    """The process start time (clock ticks since boot, /proc/<pid>/stat field 22) — a pid's identity across a
+    reuse; None where it cannot be read (no procfs, the pid gone)."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            tail = f.read().rsplit(")", 1)[1].split()
+        return int(tail[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def _read_ppid(pid: int) -> int | None:
     """The parent pid from /proc/<pid>/stat, or None where it cannot be read."""
     try:
@@ -7136,11 +7147,23 @@ class SdkBackend:
         run = run or subprocess.run
         cgroup = cgroup or _read_cgroup
         unit = scope_unit_of(cgroup(pid) or "")
+        # The scope must be the CLI's OWN: bin/romp-cli-scope names the unit with the pid the CLI runs as
+        # (`romp-session-<sid8>-$$-$t`, then execs into it), so a CLI in its own scope always carries its pid
+        # in the name. A CLI whose cgroup names a scope with ANOTHER pid merely INHERITED it — a kernel launched
+        # from inside a romp session's tool shell spawns CLIs inside that session's scope — and stopping that
+        # unit would end the launching session, not the orphan (the lean review of T276, 2026-09-09: the
+        # real-process test did exactly that to the session running it). Such a CLI is treated as unscoped.
+        if unit and scope_pid(unit) != pid:
+            self._log("cut-turn reap: pid %d sits in %s, a scope it did not start (inherited) — tree walk only" % (pid, unit))
+            unit = None
         stopped = False
         if unit:
             try:
-                run(["systemctl", "--user", "stop", unit], capture_output=True, text=True, timeout=SCOPE_STOP_TIMEOUT)
-                stopped = True
+                res = run(["systemctl", "--user", "stop", unit], capture_output=True, text=True, timeout=SCOPE_STOP_TIMEOUT)
+                stopped = (getattr(res, "returncode", 0) == 0)
+                if not stopped:
+                    err = ((getattr(res, "stderr", "") or "").strip().splitlines() or ["(no stderr)"])[0]
+                    self._log("cut-turn reap: systemctl stop %s exited %s: %s; the tree walk still runs" % (unit, getattr(res, "returncode", "?"), err))
             except Exception as e:
                 self._log("cut-turn reap: stopping %s failed (%s); falling back to the process tree" % (unit, e))
         own_pg = None
@@ -7149,11 +7172,19 @@ class SdkBackend:
         except OSError:
             pass
         targets = [p for p in descendants(ps_lines, pid) if p != os.getpid()] + [pid]
+        # a pid reused by an unrelated process between the ps snapshot and a signal must not be hit: remember
+        # each target's start time (procfs) and skip any whose identity changed; no procfs → no such check
+        born = {p: _read_starttime(p) for p in targets}
+        def same(p) -> bool:
+            b = born.get(p)
+            return b is None or _read_starttime(p) == b
         def signal_all(sig, only_alive: bool) -> int:
             n = 0
             for p in targets:
                 if only_alive and not self._pid_alive(p):
                     continue
+                if not same(p):
+                    continue          # the pid now names another process
                 try:
                     pg = os.getpgid(p)
                 except OSError:
