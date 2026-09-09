@@ -4452,7 +4452,9 @@ class ViewBuilder(unittest.TestCase):
         km._tmux_name_of = lambda s: "testsess"
         km.subprocess.run = lambda cmd, *a, **k: (calls.append(cmd), _R())[1]
         try:
-            out = km._rename_session(SID, "newname")
+            with mock.patch.dict(os.environ):
+                os.environ.pop("ROMP_TMUX_SOCKET", None)   # the bare argv this pins is the no-socket one:
+                out = km._rename_session(SID, "newname")   # a per-kernel socket prepends -L (test_tmux_optional)
             self.assertEqual(out, "newname")
             self.assertTrue(any(c[:2] == ["tmux", "rename-session"] and "newname" in c for c in calls),
                             "live rename must call `tmux rename-session ... newname`")

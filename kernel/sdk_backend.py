@@ -1485,8 +1485,14 @@ def write_name(state_dir: Path, sid: str, name: str, cwd: str, bg: str = "", fg:
     p = Path(state_dir) / "names" / sid
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
-    tmp.write_text("\t".join([name, cwd, bg, fg]) + "\n")
-    os.replace(tmp, p)
+    try:
+        tmp.write_text("\t".join([name, cwd, bg, fg]) + "\n")
+        os.replace(tmp, p)
+    finally:
+        try:                       # never LEAK the staging file: open() creates it before a write can die
+            tmp.unlink()           # (ENOSPC, EROFS), and the names scanners read the dir, so a stray .tmp
+        except OSError:            # was a phantom session (the same guard CodexBackend._write_name carries)
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -9539,15 +9545,37 @@ class SdkBackend:
         _ls = reg.get("lastSid")
         _tp = Path(transcript_path(reg.get("cwd") or "", _ls)) if _ls else None
         _has_history = bool(_tp) and _tp.exists() and _tp.stat().st_size > 0
-        self._update_reg(sid, name=new_name,
-                         **({"renameNote": new_name} if _has_history else {}))   # locked RMW — see set_effort's race note
-        # keep the shared names/ identity file in sync (preserve colours)
+        note = {"renameNote": new_name} if _has_history else {}
+        fields = {"name": new_name, **note}          # the keys this write moves: what the rollback below puts back
+        self._update_reg(sid, name=new_name, **note)   # locked RMW — see set_effort's race note
+        # keep the shared names/ identity file in sync (preserve colours). Durable registry FIRST; a
+        # names write that RAISES (ENOSPC, EROFS, a permission fault) used to leave the registry holding
+        # the new name and the exception escaping with no compensation, so a rename the caller was told
+        # failed applied itself at the next restart (2026-09-08). write_name is tmp + os.replace and
+        # removes its own temp, so a raise leaves names/<sid> exactly as it was, by construction — there
+        # is NO restore write here (an in-place rewrite would be the one non-atomic write on this path,
+        # an mtime bump for no content change, and under the very ENOSPC it would exist for it truncates
+        # a good file). Only the registry can disagree: re-run it with the old fields (dropping a
+        # renameNote this rename stamped) and re-raise so the caller stays loud. The in-memory name
+        # moves last, so a failure never touches it — the shape CodexBackend.rename has.
         try:
             parts = (Path(self.state_dir) / "names" / sid).read_text().rstrip("\n").split("\t")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             parts = [new_name, reg.get("cwd", "")]
         parts += ["", "", ""]
-        write_name(self.state_dir, sid, new_name, parts[1], parts[2], parts[3])
+        try:
+            write_name(self.state_dir, sid, new_name, parts[1], parts[2], parts[3])
+        except BaseException:
+            try:
+                self._update_reg_dropping(sid, drop=[k for k in fields if k not in reg],
+                                          **{k: reg[k] for k in fields if k in reg})
+            except Exception as e2:
+                # a silent pass here hides the ONE moment the code knows the stores disagree: the
+                # registry alone holds the NEW name and will apply the rename the caller was told
+                # failed at the next restart
+                self._log("sdk rename compensation failed for %s: the registry alone holds the new "
+                          "name and will apply it at the next restart (%s)" % (sid, e2))
+            raise
         s = self.sessions.get(sid)
         if s:
             s.name = new_name
