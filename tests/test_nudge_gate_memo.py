@@ -168,6 +168,36 @@ class GateMemo(_Gate):
             km._nudge_placement_gate(SID, self._turns(), self._view())
         self.assertEqual(pu.call_count, 1, "the clears log is a gate input: the key moved")
 
+    def test_a_placement_landing_between_the_read_and_the_derivation_is_never_pinned(self):
+        """The maintainers' review of the first cut (2026-09-09): cycle N read the view, a judge published a
+        placement, the gate stat'd the NEW file and cached the OLD bytes' answer under it, and cycle N+1 served
+        'planner-queue' until the store next moved. The store half of the key is the view object itself now,
+        and the answer is cached only while that view is still the current one."""
+        turns, view_old = self._turns(), self._view()
+        seg_id = next(u[0] for u in jd.plan_units({"turns": turns}, view_old) if u[1] == "work")
+        self.store["placements"] = {seg_id: SID + ":g1"}
+        self.store["seq"] = 2
+        self._save_store()                                   # the judge's publish lands between the read and the gate
+        self.assertTrue(km._nudge_placement_gate(SID, turns, view_old), "derived from the old bytes: still unplanned")
+        self.assertNotIn(SID, km._nudge_gate_memo, "not cached: the view it derived from is no longer current")
+        view_new = self._view()
+        self.assertIsNot(view_new, view_old)
+        with patch.object(jd, "plan_units", wraps=jd.plan_units) as pu:
+            got = km._nudge_placement_gate(SID, self._turns(), view_new)
+        self.assertEqual(pu.call_count, 1, "re-derived against the current view")
+        self.assertFalse(got, "the placement landed: the queue is empty")
+        self.assertEqual(km._NUDGE_GATE_STATS, {"served": 0, "derived": 2})
+        self.assertIs(km._nudge_gate_memo[SID][1], view_new)
+
+    def test_a_store_that_is_not_the_shared_view_is_derived_every_time(self):
+        turns = self._turns()
+        fresh = jd.load_goals(SID)                           # a writer's mutable store, not the view
+        with patch.object(jd, "plan_units", wraps=jd.plan_units) as pu:
+            km._nudge_placement_gate(SID, turns, fresh)
+            km._nudge_placement_gate(SID, turns, fresh)
+        self.assertEqual(pu.call_count, 2)
+        self.assertNotIn(SID, km._nudge_gate_memo)
+
     def test_a_failed_derivation_is_never_cached_and_waves_nothing_through(self):
         turns, store = self._turns(), self._view()
         import io
@@ -193,7 +223,7 @@ class GateMemo(_Gate):
         turns, store = self._turns(), self._view()
         km._nudge_gate_memo.clear()
         for i in range(km._NUDGE_GATE_MEMO_MAX + 1):
-            km._nudge_gate_memo["11111111-2222-3333-4444-%012d" % i] = (("k",), False)
+            km._nudge_gate_memo["11111111-2222-3333-4444-%012d" % i] = (("k",), None, None, False)
         oldest = next(iter(km._nudge_gate_memo))
         before = len(km._nudge_gate_memo)
         km._nudge_placement_gate(SID, turns, store)    # a store past the bound evicts the oldest entry first

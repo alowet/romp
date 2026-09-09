@@ -10715,7 +10715,7 @@ def _nudge_response_ready(turns, store, rec, gid, now):
     return True, resp
 
 
-_nudge_gate_memo = {}            # sid -> (parse key, store key, unplanned): the placement gate's answer while its inputs stand
+_nudge_gate_memo = {}            # sid -> (parse key, the shared view object, clears-log stat, unplanned): the gate's answer while its inputs stand
 _NUDGE_GATE_STATS = {"served": 0, "derived": 0}   # /perf memos.nudgeGate: how often the walk re-derived the gate
 _NUDGE_GATE_MEMO_MAX = 512
 
@@ -10725,26 +10725,26 @@ def _nudge_placement_gate(sid, turns, store):
     (parse, store) and served while both stand (2026-09-09). The derivation re-segments every turn, applies
     the seams, builds the plan units and normalizes every recorded placement key; on the maintainer's box it
     was 70% of the kernel's CPU, run for every idle session on every pusher cycle with nothing changed
-    (py-spy: _seg_key, _placed_key, _segment_id, _mint_quote under _auto_nudge_session). Its inputs are
-    exactly two: the parse (parsed_session's own cache key: the transcript's and the states file's stat, and
-    the pending cut) and the store's bytes (the store file's and its override journal's stat, the same key
-    the shared loader and the timeline's dead-lane memo use), so a key built from those is exact: a new
-    turn, an idle atom, a placement landing, a user override each move it, and nothing else changes the
-    answer, except one: _placed_key scopes its fuzzy match by the session's episode floor, which is the
-    clears log (EPIDIR/<sid>.jsonl), so that file's stat rides the key too (found by the same check the
-    dead-lane memo went through). A parse the cache does not hold (a fresh parse the caller made outside
-    parsed_session) is derived every time, never cached. The exception path is unchanged: a gate that cannot
-    be computed waves nothing through silently."""
+    (py-spy: _seg_key, _placed_key, _segment_id, _mint_quote under _auto_nudge_session). Its inputs: the
+    parse, the store's bytes, and the clears log (_placed_key scopes its fuzzy match by the episode floor).
+
+    Both halves are IDENTITY-bound, never stat'd after the read (review 2026-09-09: the first cut stat'd the
+    store file after the walk had read the view, so a placement a judge published in between was keyed under
+    the NEW file with the OLD bytes' answer and served until the store next moved). The parse half is
+    parsed_session's cached object; the store half is the shared read-only view object itself, which the
+    shared loader replaces whenever the store, its override journal or the archive moves, and the answer is
+    cached only when that view is STILL the current one after the derivation. The clears log's stat is taken
+    BEFORE the derivation, so a boundary appended during it leaves a key the next cycle's stat cannot match.
+    A parse the cache does not hold, or a store that is not the current shared view, is derived every time
+    and never cached. The exception path is unchanged: a gate that cannot be computed waves nothing through
+    silently, and is never cached."""
     pk = jd._PARSE_CACHE.get(sid)
     parse_key = pk[0] if (pk is not None and pk[1] is not None and pk[1].get("turns") is turns) else None
-    key = None
-    if parse_key is not None:
-        key = (parse_key, _stat_key(jd.GOALDIR / (sid + ".json")), _stat_key(jd.STATE / "overrides" / (sid + ".jsonl")),
-               _stat_key(jd.EPIDIR / (sid + ".jsonl")))
-        hit = _nudge_gate_memo.get(sid)
-        if hit is not None and hit[0] == key:
-            _NUDGE_GATE_STATS["served"] += 1
-            return hit[1]
+    epi = _stat_key(jd.EPIDIR / (sid + ".jsonl")) if parse_key is not None else None
+    hit = _nudge_gate_memo.get(sid) if parse_key is not None else None
+    if hit is not None and hit[0] == parse_key and hit[1] is store and hit[2] == epi:
+        _NUDGE_GATE_STATS["served"] += 1
+        return hit[3]
     try:
         _live = {sg["id"] for tn in turns for sg in jd._segs(tn, store)}
         unplanned = any(not jd._placed_key(store.get("placements") or {}, jd._unit_key(u[0], u[1]), _live)
@@ -10755,10 +10755,15 @@ def _nudge_placement_gate(sid, turns, store):
                          % (sid, traceback.format_exc()))                 #  2026-07-21: a mute gate error
         return unplanned                         #  would wave nudges through); a failed derivation is not cached
     _NUDGE_GATE_STATS["derived"] += 1
-    if key is not None:
-        if len(_nudge_gate_memo) > _NUDGE_GATE_MEMO_MAX:      # bounded by the session count; evict oldest-inserted
-            _nudge_gate_memo.pop(next(iter(_nudge_gate_memo)))
-        _nudge_gate_memo[sid] = (key, unplanned)
+    if parse_key is not None:
+        try:
+            current, _f = jd.load_goals_shared_or_fault(sid)   # a stat and a compare on the shared loader's key
+        except Exception:
+            current = None
+        if current is store:                     # the view we derived from is still the store's current one
+            if len(_nudge_gate_memo) > _NUDGE_GATE_MEMO_MAX:      # bounded by the session count; evict oldest-inserted
+                _nudge_gate_memo.pop(next(iter(_nudge_gate_memo)))
+            _nudge_gate_memo[sid] = (parse_key, store, epi, unplanned)
     return unplanned
 
 
