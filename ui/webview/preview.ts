@@ -450,8 +450,10 @@ export function previewFull(path: string, sid?: string | null, verified = false,
     // The hidden sentinel keeps the spot healable with zero visual noise when the mention really
     // is dead; a probe that later succeeds unhides the card in place.
     if (!verified) {
+      // a 502 is the relay's link verdict (HEAD carries no body to read): that one waits for the reconnect-class
+      // heal like an image's link failure (T291); any other miss keeps the per-message heal
       const probe = () => fetch(fileUrl(path, sid), { method: "HEAD" })
-        .then((r) => { if (r.ok) { box.style.display = ""; } else { box.style.display = "none"; failedPreviews.set(box, probe); } })
+        .then((r) => { if (r.ok) { box.style.display = ""; } else { box.style.display = "none"; (r.status === 502 ? settledPreviews : failedPreviews).set(box, probe); } })
         .catch(() => { box.style.display = "none"; failedPreviews.set(box, probe); });
       probe();
     }
@@ -482,6 +484,40 @@ export function previewFull(path: string, sid?: string | null, verified = false,
     let total = 0;
     let fetching = false;                            // one managed attempt at a time (a tap mid-fetch no-ops)
     let lastErr = "";                                // the newest attempt's server-side reason, shown verbatim
+    // The wait box is REUSED across attempts (T291, the user 2026-09-09: two figures on a remote session
+    // whose relay was failing re-attempted on every kernel push, and each attempt swapped the box between
+    // the one-line "fetching…" and the five-line failure note — the whole transcript above the reader
+    // moved by four lines, ten times a second, for the length of the streaming turn). One wait element,
+    // one swirl, one note, kept from attempt to attempt; only the note's TEXT changes, and only when the
+    // words do. An attempt therefore never changes the box's layout; the picture landing does.
+    const waitBox = (): { wait: HTMLElement; note: HTMLElement } => {
+      let wait = box.firstElementChild as HTMLElement | null;
+      if (!wait || !wait.classList.contains("path-full-wait")) wait = mkWait(box);
+      const chip = wait.querySelector(".path-full-retry") as HTMLElement | null;
+      if (chip) {
+        // the one new-evidence heal (autoRetries 1) keeps the chip's shape: the chip carries the words while it
+        // runs. A tap or a reconnect heal re-armed the budget (3): the loading persona returns, swirl and note,
+        // inside the same wait element (the 2026-08-16 rule: the chip is the give-up state only)
+        if (autoRetries <= 1) return { wait, note: chip };
+        chip.remove();
+      }
+      let spin = wait.querySelector(".path-load-spin") as HTMLImageElement | null;
+      if (!spin) {
+        spin = document.createElement("img");
+        spin.className = "path-load-spin";
+        spin.src = "/media/romp-swirl-glyph.svg";
+        spin.alt = "loading preview…";
+        wait.appendChild(spin);
+      }
+      let note = wait.querySelector(".path-load-note") as HTMLElement | null;
+      if (!note) {
+        note = document.createElement("span");
+        note.className = "path-load-note";
+        wait.appendChild(note);
+      }
+      return { wait, note };
+    };
+    const setNote = (note: HTMLElement, text: string) => { if (note.textContent !== text) note.textContent = text; };
     const showChip = () => {
       if (!box.isConnected) return;                  // the turn re-rendered; a fresh box owns this spot now
       // ONE continuous narrative while the machinery is still going (the user 2026-08-16, third
@@ -495,26 +531,26 @@ export function previewFull(path: string, sid?: string | null, verified = false,
       // kernel restart — the tunnel re-dial window produces instant "no attached host" 404s and
       // "tunnel not answering" 502s, and three of those spent the whole budget right before the link
       // came back). A failure that names the LINK, not the image, doesn't decrement: the preview
-      // keeps retrying on every kernel push until the tunnel is up, and only real verdicts — a true
-      // not-found from the owning kernel, a transfer that died with zero progress — spend attempts.
+      // re-attempts when the link itself comes back (the reconnect-class heal below, T291), and only
+      // real verdicts — a true not-found from the owning kernel, a transfer that died with zero
+      // progress — spend attempts.
       const transient = /tunnel to .* is not answering|no attached host|re-dialing/i.test(lastErr);
       if (autoRetries > 0 || transient) {
-        if (!transient) autoRetries--;
-        failedPreviews.set(box, () => build(true));
-        const wait = mkWait(box);
+        // A LINK failure heals on the reconnect-class event alone (T291): romp:wsup when this page's
+        // kernel socket comes back, hostUp when the federated tunnel does (the tunnel poll dispatches
+        // it on the down→up transition), romp:hostRelayUp when the host's relay socket reopens (a
+        // remote kernel's restart fires that one and neither of the others), never on the next kernel push. A streaming session pushes
+        // many times a second, and a dead link answered every one of those instantly: the per-push
+        // retry was the flicker. The budget stays untouched, as before; the tap still retries at once.
+        if (transient) settledPreviews.set(box, () => build(true));
+        else { autoRetries--; failedPreviews.set(box, () => build(true)); }
+        const { wait, note } = waitBox();
         wait.title = path + " — tap to retry now";
         wait.style.cursor = "pointer";
         wait.onclick = (ev) => { ev.stopPropagation(); autoRetries = 3; ackTap(ev); build(true); };   // a tap re-arms persistence
-        const spin = document.createElement("img");
-        spin.className = "path-load-spin";
-        spin.src = "/media/romp-swirl-glyph.svg";
-        spin.alt = "loading preview…";
-        const note = document.createElement("span");
-        note.className = "path-load-note";
-        note.textContent = (got > 0 ? "connection dropped at " + fmtBytes(got, total)
-                                    : lastErr || "connection dropped")
-                           + " — retrying · tap to retry now";
-        wait.append(spin, note);
+        setNote(note, (got > 0 ? "connection dropped at " + fmtBytes(got, total)
+                               : lastErr || "connection dropped")
+                      + (transient ? " — retries when the link is back · tap to retry now" : " — retrying · tap to retry now"));
         if (fails > 1) {
           note.classList.add("path-retry-flash");
           note.addEventListener("animationend", () => note.classList.remove("path-retry-flash"), { once: true });
@@ -645,15 +681,10 @@ export function previewFull(path: string, sid?: string | null, verified = false,
       if (fetching) return;
       fetching = true;
       const started = Date.now();
-      const wait = mkWait(box);
-      const spin = document.createElement("img");
-      spin.className = "path-load-spin";
-      spin.src = "/media/romp-swirl-glyph.svg";
-      spin.alt = "loading preview…";
-      const note = document.createElement("span");
-      note.className = "path-load-note";
-      note.textContent = got > 0 ? "resuming… " + fmtBytes(got, total) : "fetching…";
-      wait.append(spin, note);
+      // the wait box stays as it is while the attempt runs (T291): a note already up keeps its words, so a
+      // retry from a failure note does not shrink the box to one line and grow it back on the next failure
+      const { note } = waitBox();
+      if (!note.textContent) setNote(note, got > 0 ? "resuming… " + fmtBytes(got, total) : "fetching…");
       resumeFetch(note).then((objUrl) => {
         fetching = false;
         lastErr = "";
@@ -718,7 +749,9 @@ export function installMdImgHeal(): void {
     const src = img.src || "";
     if (!src || src.startsWith("data:")) return;     // a broken data: URI has no server to heal
     if (img.onerror || img.closest(".path-full")) return;   // the preview machinery retries its own
-    failedPreviews.set(img, () => {
+    // a relay URL (fileUrl builds /remote/<host>/file for a remote sid) failed on the LINK's account as
+    // likely as the image's: it waits for the reconnect-class heal (T291); a local src keeps the per-message one
+    (/\/remote\/[^/]+\/file\b/.test(src) ? settledPreviews : failedPreviews).set(img, () => {
       const u = img.src;
       img.removeAttribute("src");
       img.src = u;                                   // a fresh attempt; a repeat error re-registers here
