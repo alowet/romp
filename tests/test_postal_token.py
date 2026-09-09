@@ -335,6 +335,12 @@ class _PostalTokenFile(unittest.TestCase):
     def setUp(self):
         self.f = ps.STATE.parent / "serve-token"
         self.lock = self.f.with_name("serve-token.lock")
+        # The fixture owns its state directory (T274, 2026-09-08): the module's XDG_STATE_HOME is a fresh temp dir,
+        # and only the two minting cases (birth, the flock race) create STATE.parent through the loader. Run alone —
+        # a parallel worker scheduling one of the other six by itself — those wrote the token, the lock, or the
+        # symlink into a directory that did not exist yet and failed on the parent, then again in _restore. Serially
+        # they passed on a sibling's side effect, which is not a fixture.
+        self.f.parent.mkdir(parents=True, exist_ok=True)
         self._env = self._umask = None
         self.addCleanup(self._restore)      # registered FIRST: a failing _clear() must not leak a zeroed umask
         self._env = os.environ.pop("ROMP_SERVE_TOKEN", None)

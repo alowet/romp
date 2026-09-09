@@ -222,7 +222,21 @@ var R = window.__rompReload;
 STORE["romp:reloaded"] = JSON.stringify({ reason: "build", detail: "9", from: 6, path: "/feed", t: 1 });
 out({ first: R.announce(null), left: STORE["romp:reloaded"] || null });""")
         self.assertIsNone(s3["first"], "a marker another page wrote (a standalone /feed reload) is not this page's to announce")
-        self.assertIsNone(s3["left"], "…but it is consumed, so it cannot be misattributed later")
+        self.assertIsNotNone(s3["left"], "…and it is LEFT for the page it names (T272, 2026-09-08): sessionStorage is shared across the shell "
+                                         "and its same-origin panes, and a pane's shim that read as standalone for a beat consumed the "
+                                         "shell's marker before the path check — the shell then found nothing to announce, and the "
+                                         "notification-center line the served test waits for never appeared")
+        # the shell's marker (path "/") survives a pane's early announce and is announced by the shell itself, once
+        s4 = run_core("""
+var R = window.__rompReload; var notes = [];
+STORE["romp:reloaded"] = JSON.stringify({ reason: "restart", detail: "2.2", from: 6, path: "/", t: 1 });
+location.pathname = "/chat"; var pane = R.announce(null);
+location.pathname = "/"; var shell = R.announce(function (k, t) { notes.push([k, t]); }); var again = R.announce(null);
+out({ pane: pane, shell: shell, again: again, notes: notes, left: STORE["romp:reloaded"] || null });""")
+        self.assertIsNone(s4["pane"], "the chat pane leaves the shell's marker alone")
+        self.assertEqual(s4["shell"], "Reloaded onto build 7 — the kernel restarted.", "the shell announces its own reload")
+        self.assertEqual(s4["notes"], [["reload", "Reloaded onto build 7 — the kernel restarted."]])
+        self.assertIsNone(s4["again"], "one line per reload"); self.assertIsNone(s4["left"], "consumed by its own page")
 
     def test_the_shell_composes_gesture_state_across_its_panes_and_a_pane_forwards_its_request(self):
         s = run_core("""
@@ -258,6 +272,31 @@ out({ held: held, after: state() });""")
         self.assertEqual(s["held"]["reloads"], 0, "a prompt typed during the outage sits in the pane's queue: the shell's earlier reopen must not take the page down")
         self.assertEqual(s["held"]["waiting"], "sends")
         self.assertEqual(s["after"]["reloads"], 1, "the flush is the ending event")
+
+    def test_a_held_reload_wears_a_face_once_per_hold_and_never_for_a_gesture(self):
+        # T272 follow-up (the manager's review): nothing displayed the core's `waiting`, so a reload held by a pane's
+        # reason (an upload in flight) sat invisible. The `held` hook fires once per owed request and reason — the shell
+        # files a notification-center line, a standalone pane raises its bar — and never for a momentary gesture hold.
+        s = run_core("""
+var R = window.__rompReload; var held = []; R.held = function (b, o) { held.push([b, o && o.reason]); };
+var busyReason = "upload";
+window.__rompPaneBusy = function () { return busyReason; };
+R.noteVersion({ boot: "2.2" });                       // owed, held on the pane's upload
+R.ended(); await tick(); R.ended(); await tick();     // re-asks while the same hold stands: no second line
+busyReason = "held-send"; R.ended(); await tick();    // the reason changed: one line for it
+busyReason = ""; R.ended(); await tick();             // idle: fires
+out({ held: held, reloads: RELOADS, waiting: R.waiting });""")
+        self.assertEqual(s["held"], [["upload", "restart"], ["held-send", "restart"]], "once per hold reason, with the owed request")
+        self.assertEqual(s["reloads"], 1)
+        s2 = run_core("""
+var R = window.__rompReload; var held = []; R.held = function (b) { held.push(b); };
+emit("pointerdown"); R.noteVersion({ boot: "2.2" });   // a held pointer: a gesture hold, no line
+var during = state();
+emit("pointerup"); await tick();
+out({ held: held, during: during, reloads: RELOADS });""")
+        self.assertEqual(s2["during"]["waiting"], "pointer")
+        self.assertEqual(s2["held"], ["pointer"], "the hook is told every hold; the shell's line filters gestures out (heldReloadText)")
+        self.assertEqual(s2["reloads"], 1)
 
     def test_a_touch_pan_holds_from_pointercancel_until_the_finger_lifts(self):
         s = run_core("""
@@ -350,6 +389,17 @@ class ReloadWiringPinned(unittest.TestCase):
         self.assertIn("if(m.build){if(RL)RL.request('build','');else{buildStale=true;show(BUILDMSG);}}", js)
         self.assertIn("if(m&&m.romp==='wsFresh'){connStale=false;if(buildStale)show(BUILDMSG);else box.classList.remove('show');}", js,
                       "the CONNECTION prompt for a plain reconnect is untouched")
+
+    def test_a_held_reload_is_told_to_the_notification_center_and_to_a_standalone_panes_bar(self):
+        # the shell's stale script installs the `held` hook: the line names what the reload waits for (an upload, a held
+        # send, queued sends) and skips momentary gesture holds; a standalone pane (no shell) raises its own bar
+        js = km._STALE_JS
+        self.assertIn("RL.held=function(b){var t=(b==='upload'?'The dashboard will reload once the upload in progress finishes.'", js)
+        self.assertIn("if(t&&window.__rompNotify)window.__rompNotify('reload',t);", js)
+        shim = km._shim("chat", 7) if callable(getattr(km, "_shim", None)) else ""
+        self.assertIn("window.__rompReload.held=function(b){var t=(b==='upload'?", shim)
+        self.assertIn("if(t)selfBar(t,'held');", shim)
+        self.assertIn("!window.__rompReload.inShell()", shim, "only a standalone pane raises its own bar; in the shell the center speaks")
 
     def test_a_remote_kernels_restart_or_bundle_never_reaches_the_core(self):
         fed = open(os.path.join(ROOT, "ui", "webview", "federation.ts")).read()

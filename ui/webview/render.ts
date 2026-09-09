@@ -39,7 +39,8 @@ import { DEFAULT_CHORDS } from "./commands";
 import { NavHistory } from "./nav-history";
 import { StagedStack } from "./staged-messages";
 import { type PendingSend, type TailEvent, OPT_PREFIX, isOptimisticUuid, newPending, reconcilePending, queuedCopyToHide, dropPending, bareGroupLabel, sentAtLabel } from "./send-pending";
-import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued } from "./queued-held";
+import { reconcileHeld, heldAsQueued, type HeldCopy, type HeldQueued, type HeldMemory } from "./queued-held";
+import { reloadHoldReason } from "./reload-hold";
 import { mintProvisionalId, isProvisionalId, provisionalName, adoptsProvisional, focusResolvesProvisional } from "./provisional";
 import { onlyTag, matchesOnly } from "./only-filter";
 import { numberDiff, type DiffRow } from "./diff-lines";
@@ -451,12 +452,38 @@ function stripOptimistic(s: Session, keepHeld = false): void {
 // pending sends are reconciled (a held copy of OUR text is then hidden for our bubble like any kernel copy).
 const HELD_PREFIX = "held:";
 const isHeldGroup = (e: ChatEvent): boolean => e.kind === "queued" && !!e.uuid && e.uuid.startsWith(HELD_PREFIX);
-const heldQueued = new Map<string, { prev: HeldQueued[]; held: HeldCopy[] }>();
+const heldQueued = new Map<string, HeldMemory>();
+// the copies the user cancelled with the ✕ on this client, per session (their qid, or their text when the kernel
+// gave none): the kernel drops them and nothing lands, so a vanished cancelled copy is never held; the entry is
+// forgotten once the queue no longer lists the copy (the cancel took effect) — event-based, no timer
+const cancelledQueued = new Map<string, { qid?: string; md: string }[]>();
+function noteCancelledQueued(sid: string, md: string, qid?: string): void {
+  const list = cancelledQueued.get(sid) || [];
+  list.push({ qid, md });
+  cancelledQueued.set(sid, list);
+}
 function reconcileHeldCopies(s: Session): void {
-  const mem = heldQueued.get(s.id) || { prev: [], held: [] };
+  // idempotent: a frame that kept the resident events (an empty full frame) still carries the previous pass's held
+  // marks and group — cleared first, so the pass recomputes from the kernel's copies alone
+  for (let i = s.events.length - 1; i >= 0; i--) {
+    const e = s.events[i];
+    if (isHeldGroup(e)) { s.events.splice(i, 1); continue; }
+    if (e.kind === "queued" && e.texts.some((t) => t.landing)) s.events[i] = { ...e, texts: e.texts.filter((t) => !t.landing) };
+  }
+  const mem = heldQueued.get(s.id) || { prev: [], anchor: null, held: [] };
   const qi = tailQueuedIdx(s.events);
   const cur = qi >= 0 ? ((s.events[qi] as Extract<ChatEvent, { kind: "queued" }>).texts as HeldQueued[]) : [];
-  const r = reconcileHeld(mem.prev, mem.held, s.events as any, cur);
+  const cancelled = cancelledQueued.get(s.id) || [];
+  const settled = !(s.status.state === "working" || s.status.state === "compacting");
+  const r = reconcileHeld(mem, s.events as any, cur, {
+    settled,
+    cancelled: (c) => cancelled.some((x) => x.qid && c.qid ? x.qid === c.qid : x.md.trim() === c.md.trim()),
+  });
+  // a cancel has taken effect once the kernel's queue no longer lists the copy: forget it
+  if (cancelled.length) {
+    const still = cancelled.filter((x) => cur.some((t) => x.qid && t.qid ? t.qid === x.qid : (typeof t.md === "string" && t.md.trim() === x.md.trim())));
+    if (still.length) cancelledQueued.set(s.id, still); else cancelledQueued.delete(s.id);
+  }
   heldQueued.set(s.id, r);
   // the held set changed (a copy taken, a copy landed): the frame may keep its LENGTH while a held card gives way to
   // the landed atom, and the repaint's no-op fast path reads length alone — so the view is marked stale here
@@ -1876,6 +1903,10 @@ function renderEvent(ev: ChatEvent, prevEpoch?: number | null, worked?: number |
     const hid = el("div", "turn turn-user turn-echo-hidden"); hid.style.display = "none"; return hid;
   }
   const turn = renderEventInner(ev);
+  // OUR cached pending group comes back as the SAME element on every push (renderPendingGroup): its anchors, hover
+  // wiring and rail chrome were attached the first time and must not accumulate (T262h follow-up)
+  if (turn.dataset.wired === "1") return turn;
+  if (ev.kind === "queued" && isOptimistic(ev) && ev.bare) turn.dataset.wired = "1";
   // pending-rewind overlay (reconcileRewind): this turn sits AFTER an edited message — it belongs to
   // the branch being abandoned, so it dims until the kernel's rewound payload replaces it
   if ((ev as any).rewound) turn.classList.add("rewound");
@@ -3965,7 +3996,8 @@ function fillBareLabel(label: HTMLElement, nLost: number, nSending: number): voi
 const pendingGroupNode = new Map<string, { sig: string; node: HTMLElement }>();
 function renderPendingGroup(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
   const sid = renderingSid || activeId || "";
-  const sig = JSON.stringify(ev.texts.map((t) => [t.md, !!t.lost, t.qts, t.imgPaths || null])) + "|" + JSON.stringify(ev.held || null);
+  const sig = JSON.stringify(ev.texts.map((t) => [t.md, !!t.lost, t.qts, t.imgPaths || null])) + "|" + JSON.stringify(ev.held || null)
+    + (ev.held && ev.held.resetsAt ? "|" + Math.floor(Date.now() / 60000) : "");   // a held countdown reads the minute: re-rendered as it ticks
   const fresh = renderQueued(ev);
   const cached = pendingGroupNode.get(sid);
   if (cached && cached.node.isConnected !== undefined) {
@@ -4033,7 +4065,8 @@ function renderQueued(ev: Extract<ChatEvent, { kind: "queued" }>): HTMLElement {
       : askNote;
     const label = el("span", "queued-count");
     label.dataset.why = why;      // the ✕'s recount rewrites the count and keeps this suffix as-is
-    label.textContent = queuedCountText(n, nCmd, nSys, nNudge) + why;
+    // every copy taken but not landed (T262i): the head says so, so a held card never reads as a queued one
+    label.textContent = (texts.every((t) => t.landing) ? `${n} ${n === 1 ? "message" : "messages"} landing…` : queuedCountText(n, nCmd, nSys, nNudge)) + why;
     // `detail` is the CLI's OWN sentence about the limit (it carries the reset time as a wall clock, which
     // is why that flavor has no epoch to count down to). One level deeper on hover, per the compact-by-
     // default rule — the head keeps its one-line reason.
@@ -12950,6 +12983,7 @@ function retirePendingShip(key: string, shipId?: string): string | null {
     if (!list.length) pendingShips.delete(id);
     persistDrafts();
     if (id === activeId) renderComposerFiles(id);
+    endReloadHoldIfIdle();
     return id;
   }
   return null;
@@ -13017,6 +13051,29 @@ let shipGateSid: string | null = null;
 // Assigned by setupComposer (sendComposer lives in its closure); the WS ack handler fires a held
 // send through it when the last pending ship lands.
 let fireHeldSend: () => void = () => {};
+// The reload core (kernel.py _RELOAD_CORE_JS) asks every pane before it reloads the page (T265). A page reload
+// costs an upload in flight its bytes (persistDrafts keeps only the names, for the loss toast) and a send held on
+// the upload gate its release — the T215 wedge the reconnect re-ship heals in the same page. So while a ship
+// awaits its ack, or a send is held on one, this pane reports itself busy and the core waits for the ending event
+// (the ack retires the chip, the held send fires) before it fires; the shim's own reasons come first (T272).
+{
+  const shimBusy = (window as any).__rompPaneBusy as (() => string) | undefined;
+  (window as any).__rompPaneBusy = (): string => {
+    const b = shimBusy ? shimBusy() : "";
+    if (b) return b;
+    // only ships whose ack can still arrive hold (reload-hold.ts): a ship to a host whose relay is down, or to a host
+    // no longer attached, would otherwise hold every reload of this tab for good (the review of this hold)
+    return reloadHoldReason([...pendingShips.keys()], shipGateSid, (window as any).__rompFed);
+  };
+}
+// The ENDING event of those holds, told to the core the way the shim tells it its own (kernel.py ws.onopen →
+// __rompReload.ended()): the moment the last pending ship retires and no send is held, an owed reload may fire. The
+// core re-tries only on gesture ends, blur, a fresh request or the shell's poll, so without this a standalone page
+// stayed on the old build until the user's next unrelated click (the review of this change).
+function endReloadHoldIfIdle(): void {
+  if (pendingShips.size || shipGateSid) return;
+  try { (window as any).__rompReload?.ended?.(); } catch { /* a page without the core (the VS Code webview) */ }
+}
 
 // Persist drafts across a full RELOAD (the user 2026-06-25: a half-typed message must survive a refresh, not
 // only a tab switch). The Map is in-memory, so mirror it into the webview's persisted state — the same store
@@ -13399,6 +13456,7 @@ function renderComposerFiles(id: string | null): void {
         if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }
         if (held || gateWasOpen) warnToast("The pending upload was dismissed — your held message was NOT sent.");
       }
+      endReloadHoldIfIdle();   // after the settle above cleared the gate: the dismissed last chip ends the hold (T272)
       renderComposerFiles(id);
     });
     box.appendChild(x);
@@ -14717,6 +14775,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
       if (gateOpen) { shipGateSid = null; closeConfirm(null); }
       if (owner === activeId) fireHeldSend();
       else warnToast("attachments finished uploading on another tab — the held message was not sent; review it there.");
+      endReloadHoldIfIdle();   // the ending event follows the release: the held send has been posted
     }
   } else if (m.type === "dropSaveFailed" && typeof m.name === "string") {
     // the kernel could not SAVE the shipped bytes — clear the pending chip and say so loudly,
@@ -14728,6 +14787,7 @@ listenForFrames(perfFrameHandler("chat", (m) => vscodeApi?.postMessage(m), (e: M
     const held = !!owner && sendOnShip.delete(owner);    // a held send must not fire without the file it waited for
     const gateWasOpen = shipGateSid === owner;
     if (gateWasOpen) { shipGateSid = null; closeConfirm(null); }   // the question is moot — but a failed save never auto-sends
+    endReloadHoldIfIdle();
     warnToast(m.name + " couldn't be saved on the kernel, so it was not attached — try again."
               + (held || gateWasOpen ? " Your message was NOT sent." : ""));
     if (owner && owner === activeId) renderComposerFiles(owner);   // the held-send button state clears with the hold
@@ -14956,7 +15016,7 @@ function setupComposer() {
                   [{ label: "Wait for the upload", value: "wait" },
                    { label: "Send without " + them, value: "now", danger: true }],
                   (v) => {
-                    shipGateSid = null;
+                    shipGateSid = null; endReloadHoldIfIdle();
                     if (v === "now") sendComposer({ pastShipGate: true });
                     else if (v === "wait") { sendOnShip.add(sid); renderComposerFiles(sid); }
                   });
@@ -15834,6 +15894,7 @@ setupSettings();
       const provisional = isProvisionalId(sidQ);
       if (provisional && qmd) forgetProvisionalSend(qmd);
       const msg: Record<string, unknown> = { type: "cancelQueued", id: sidQ, md: qmd };
+      if (qmd && el.dataset.qopt !== "1") noteCancelledQueued(sidQ, qmd, el.dataset.qid || undefined);   // a kernel copy: never held once it vanishes (T262i)
       if (el.dataset.qidx !== undefined) msg.idx = Number(el.dataset.qidx);
       if (el.dataset.qpark !== undefined) msg.park = Number(el.dataset.qpark);
       if (!provisional) vscodeApi.postMessage(msg);

@@ -35,7 +35,7 @@ import { applyTheme } from "./theme";
 import { canPreview } from "./preview";
 import { initFileView, setFileViewIdentity, hostStub } from "./file-view";
 import { initFileBrowse, openFileBrowse } from "./file-browse";
-import { VIEW_STATE_KEY, parseViewState, serializeViewState, pruneViewState, capViewState, type FeedViewState } from "./feed-view-state";
+import { VIEW_STATE_KEY, parseViewState, serializeViewState, pruneViewState, capViewState, type FeedViewState, threadKey, threadKeys } from "./feed-view-state";
 import { wireTip, setTip, pruneTip } from "./tip";
 import { perfFrameHandler } from "./perf-telemetry";
 import { listenForFrames } from "./frame-listener";
@@ -738,9 +738,9 @@ let renderSeq = 0;
 // ONE builder for every Clear on the feed (the user 2026-09-08): the card's, the turn-group's and the
 // session header's wear the same element, class set, label and hover, so they cannot drift apart. Callers
 // add behaviour (an onclick, a data-act) and, for the header, a layout-only positional class.
-function clearButton(title: string): HTMLElement {
+function clearButton(title: string, label = "Clear"): HTMLElement {
   const b = el("button", "fdismiss");
-  b.textContent = "Clear";
+  b.textContent = label;   // "Clear" on a card; the session header's says "Clear all" (T271, the user 2026-09-08) — same chrome, same builder
   b.title = title;
   return b;
 }
@@ -1526,7 +1526,7 @@ let colOrder: string[] = [];                         // [] = each layout's own C
   for (const k of st.nodes) collapsedNodes.add(k);
   for (const k of st.logs) nodeLogOpen.add(k);
   for (const k of st.asks) expandedAsks.add(k);
-  for (const k of st.threads) collapsedThreads.add(k);
+  for (const k of st.threads) for (const key of threadKeys(k)) collapsedThreads.add(key);   // a pre-T263c bare sid = every column
   for (const k of st.cols) collapsedCols.add(k);
   colOrder = st.order.slice();
 })();
@@ -2549,6 +2549,18 @@ function memberMark(m: AskItem): string {
 // Fold N sibling asks (shared turnId) into one AskGroup. Column = WORST member
 // (any needs-input → needsInput; else any open → asks; else completed). Identity
 // (name/color/sid) is the shared asking session; age/tint follow the newest member.
+// The typed-turn GROUPS a card list forms — the render's rule, shared with the jump-unfold (T263e) so the two
+// can never disagree: host-flagged asks (groupTitle) gather by turnId, and a turn folds only with ≥2 current
+// members — a lone survivor (siblings cleared) renders as a single card.
+function turnGroups(list: AskItem[]): Map<string, AskItem[]> {
+  const byTurn = new Map<string, AskItem[]>();
+  for (const a of list) {
+    if (!a.groupTitle || !a.turnId) continue;
+    const arr = byTurn.get(a.turnId) || []; arr.push(a); byTurn.set(a.turnId, arr);
+  }
+  for (const [tid, ms] of Array.from(byTurn)) if (ms.length < 2) byTurn.delete(tid);
+  return byTurn;
+}
 function buildGroup(turnId: string, members: AskItem[]): AskGroup {
   const ms = members.slice().sort((a, b) => a.t - b.t);                       // chronological
   const repr = ms.reduce((x, y) => (y.t > x.t ? y : x), ms[0]);               // most-recent → freshest age/tint
@@ -3512,7 +3524,8 @@ type Entry =
   // a SESSION HEADER row in grouped mode (the user 2026-07-13): the session's name + working dot on the
   // column backdrop, heading that session's run of cards. Only emitted for runs that exist.
   // `folded` = how many of this run's cards the header is standing in for (0 when the thread is expanded)
-  | { kind: "sess"; t: number; sid: string; name: string; color: { bg: string; fg: string } | null; live: boolean; folded: number };
+  // `col` = the column this header heads: the fold is per (session, column) — T263c, the user 2026-09-08
+  | { kind: "sess"; t: number; sid: string; col: Column; name: string; color: { bg: string; fg: string } | null; live: boolean; folded: number };
 
 // ONE counting rule (the user 2026-08-26): every number on the board counts CARDS, never rows — a
 // turn-group entry is worth its members, a folded session header is worth the cards it stands in for.
@@ -3542,14 +3555,15 @@ function makeSessHead(): HTMLElement {
   const fold = el("button", "feed-sess-fold");
   const cnt = el("span", "feed-sess-foldn"); cnt.style.display = "none";
   // CLEAR for the whole session (the user 2026-09-08): far right of the header row, the header's own size,
-  // as quiet as the caret — one word, the same "Clear" every card wears. One click clears every card this
+  // as quiet as the caret — the card's Clear in the same chrome, reading "Clear all" (T271, the user 2026-09-08:
+  // it clears the whole session, so its label says so). One click clears every card this
   // session has in the current view (every column, folded ones included), with the same optimistic Undo
   // the group clear uses instead of a confirm dialog. The action is DELEGATED on the stable columns root
   // (data-act, installed once where the root is built) — never bound to this header node, which grouped
   // mode re-homes and re-renders; the header only says which session it stands for (data-fsid).
   // THE card's Clear, built by the same builder (the user 2026-09-08: same size, the outline, blue on hover),
   // plus one positional class that carries layout only (far right of the row) — never a lookalike
-  const clr = clearButton("clear every card for this session");
+  const clr = clearButton("clear every card for this session", "Clear all");
   clr.classList.add("feed-sess-clear"); clr.dataset.act = "sess-clear"; clr.style.display = "none";
   h.append(nm, fold, cnt, svc, clr, svcList);
   (h as any)._name = nm; (h as any)._fold = fold; (h as any)._foldn = cnt;
@@ -3572,10 +3586,13 @@ function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
   setWorkDot(nm, dotFor(e.name));   // the working/awaiting dot rides the header, not the cards
   // the fold caret + the "n cards" stand-in for what it hides
   const fold = (h as any)._fold as HTMLElement, foldn = (h as any)._foldn as HTMLElement;
-  const shut = collapsedThreads.has(e.sid);
+  // per (session, COLUMN) — T263c, the user 2026-09-08: the same session folds in Blocked and stays open in
+  // Working; a card that lands in this column later inherits this column's fold
+  const tkey = threadKey(e.sid, e.col);
+  const shut = collapsedThreads.has(tkey);
   h.classList.toggle("folded", shut);
   setText(fold, shut ? "▸" : "▾");               // ▸ folded / ▾ open
-  fold.title = shut ? "show this session's cards" : "collapse this session to its name — new cards stay folded too";
+  fold.title = shut ? "show this session's cards in this column" : "collapse this session's cards in this column to its name — new cards here stay folded too";
   fold.setAttribute("aria-expanded", shut ? "false" : "true");
   fold.setAttribute("aria-label", (shut ? "expand " : "collapse ") + e.name);
   foldn.style.display = shut && e.folded ? "" : "none";
@@ -3584,7 +3601,7 @@ function updateSessHead(h: HTMLElement, e: Entry & { kind: "sess" }): void {
   foldn.title = e.folded === 1 ? "1 card folded under this session" : e.folded + " cards folded under this session";
   fold.onclick = (ev) => {
     ev.stopPropagation();   // the fold IS the acknowledgement: local state + an immediate re-render
-    if (collapsedThreads.has(e.sid)) collapsedThreads.delete(e.sid); else collapsedThreads.add(e.sid);
+    if (collapsedThreads.has(tkey)) collapsedThreads.delete(tkey); else collapsedThreads.add(tkey);
     render();
   };
   // the session-wide Clear: which session, and only while it has cards in the current view (a header
@@ -4848,17 +4865,11 @@ function render() {
   // The display-side view filters (session filter + search), shared with the hover-freeze badge
   // painter so the deferred-churn hint counts exactly what the user would see move (viewFiltered).
   let shown = viewFiltered(asks);
-  // Derive sibling GROUPS at render time, keyed by the shared typed turn (turnId).
-  // Only host-flagged asks (groupTitle) participate, and a turn needs ≥2 current
-  // members to fold — a lone survivor (siblings cleared) renders as a single card.
-  const byTurn = new Map<string, AskItem[]>();
-  for (const a of shown) {
-    if (!a.groupTitle || !a.turnId) continue;
-    const arr = byTurn.get(a.turnId) || []; arr.push(a); byTurn.set(a.turnId, arr);
-  }
+  // Derive sibling GROUPS at render time, keyed by the shared typed turn (turnId) — turnGroups, the rule the
+  // jump-unfold reads too, so what renders as a group and what unfolds as one can never disagree (T263e).
+  const byTurn = turnGroups(shown);
   const grouped = new Set<string>();   // itemIds folded into a group → excluded from single ask cards
   for (const [tid, members] of byTurn) {
-    if (members.length < 2) continue;
     members.forEach((m) => grouped.add(m.itemId));
     const g = buildGroup(tid, members);
     buckets[g.column].push({ kind: "group", t: g.t, group: g });
@@ -4889,13 +4900,13 @@ function render() {
         if (s !== cur) {
           cur = s;
           const src: any = e.kind === "ask" ? e.ask : e.kind === "group" ? e.group : e;
-          head = { kind: "sess", t: e.t, sid: s, name: src.name, color: src.color || null, live: !!src.live, folded: 0 };
+          head = { kind: "sess", t: e.t, sid: s, col: k, name: src.name, color: src.color || null, live: !!src.live, folded: 0 };
           withHeads.push(head);
         }
         // A COLLAPSED thread contributes its header and nothing else — the run's cards are counted onto the
         // header instead of rendered, so the folded row still says how much is under it. CARDS, not rows
         // (entryCards): a turn-group folds as its member count, the same rule the section chip reads.
-        if (collapsedThreads.has(s)) { if (head) head.folded += entryCards(e); continue; }
+        if (collapsedThreads.has(threadKey(s, k))) { if (head) head.folded += entryCards(e); continue; }
         withHeads.push(e);
       }
       buckets[k] = withHeads;
@@ -5850,9 +5861,16 @@ function applyExtHover() {
 function unfoldThreadsFor(keys: Set<string>): void {
   if (!collapsedThreads.size) return;
   let opened = false;
+  // the run each card RENDERS in — per (session, column), T263c — read from the MODEL, never a memo of the last
+  // paint (T263e, review of T263d: a memo went stale in flat mode and under a held paint): a member of a typed
+  // turn with ≥2 current members renders in the group's column (buildGroup: the worst member's), else in its
+  // own — the render's own rule, shared (turnGroups)
+  const colOf = new Map<string, Column>();
+  for (const [tid, ms] of turnGroups(viewFiltered(asks))) { const c = buildGroup(tid, ms).column; for (const m of ms) colOf.set(m.itemId, c); }
   for (const a of asks) {
-    if (collapsedThreads.has(a.sid) && extHoverMatches("a:" + a.itemId, keys)) {
-      collapsedThreads.delete(a.sid); opened = true;
+    const tkey = threadKey(a.sid, colOf.get(a.itemId) ?? askColumn(a));
+    if (collapsedThreads.has(tkey) && extHoverMatches("a:" + a.itemId, keys)) {
+      collapsedThreads.delete(tkey); opened = true;
     }
   }
   if (opened) render();

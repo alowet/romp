@@ -52,6 +52,13 @@ GEAR = open(os.path.join(ROOT, "ui", "webview", "gear.js")).read()
 
 
 class SourcePins(unittest.TestCase):
+    def test_the_concurrency_options_span_exactly_the_kernels_range(self):
+        # the kernel refuses anything outside jd.CONCURRENCY_MIN..MAX (its _CONCURRENCY_VALUES); the gear's
+        # loop must paint exactly that range, or a stored value could be off the list (T277). The served
+        # matrix below proves it end to end where a browser exists; this pin runs everywhere.
+        self.assertIn("for (var ci = %d; ci <= %d; ci++)" % (km.jd.CONCURRENCY_MIN, km.jd.CONCURRENCY_MAX), GEAR,
+                      "the gear's concurrency options span exactly the kernel's range")
+
     def test_every_facade_joins_the_one_repaint_registry(self):
         # the versionMenu label sync must repaint on fill()'s silent writes exactly like the
         # selectPick facades do — one registry, flushed at the end of fill()
@@ -63,7 +70,7 @@ class SourcePins(unittest.TestCase):
         self.assertIn("function setShow(sel, val)", GEAR)
         # a stored value with no option INJECTS a marked one — honest, never the default lie
         self.assertIn("not in this kernel's list", GEAR)
-        for sel in ("jm", "im", "dm", "cmm", "je", "ie", "de", "cme", "upm"):
+        for sel in ("jm", "im", "dm", "cmm", "je", "ie", "jc", "de", "cme", "upm"):
             self.assertIn("setShow(%s, v." % sel, GEAR, sel + " must render through setShow")
 
 
@@ -86,6 +93,7 @@ MATRIX = {
     "rs-cmtmodel":      ("comment-model", ["session", "default"] + MODELS_ALL),
     "rs-judgeeffort":   ("judge-effort", EFFORTS),
     "rs-indexeffort":   ("index-effort", EFFORTS),
+    "rs-judgeconc":     ("judge-concurrency", [str(n) for n in range(km.jd.CONCURRENCY_MIN, km.jd.CONCURRENCY_MAX + 1)]),
     "rs-distilleffort": ("distill-effort", ["triage", "none"] + EFFORTS),
     "rs-cmteffort":     ("comment-effort", ["session"] + EFFORTS),
 }
