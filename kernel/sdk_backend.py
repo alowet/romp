@@ -786,6 +786,112 @@ def last_record_uuid(path, tail_bytes: int = 262144) -> str:
     return ""
 
 
+# The first result after a connect whose cost delta exceeds this is traced as an INFO line in the settle
+# (SdkSession._on_message), never a problem. On the CLI as probed (print mode, 2026-09-06) a resumed
+# process starts its counters at zero: a resume neither restores a cost-state record nor arms its writer.
+# So a first delta this large is the turn's own cost, recorded right, with nothing for the user to act
+# on; a problem row here would send them to check a figure that is correct. The trace is for the day a
+# CLI restores cost history in print mode: then a first result carries the whole history in
+# total_cost_usd, and the figure is wrong only if that restore and the connect-time seed read different
+# files (last_cost_state).
+SANE_TURN_USD = 200.0
+
+
+def cost_state_watermarks(o):
+    """The watermarks a CLI would hold after restoring the `cost-state` transcript record `o`, or None
+    when `o` is not one or its total is unusable: {"total": float, "tokens": {snake_case: int}}. The
+    tokens are the record's modelUsage summed per field across models into the four keys
+    SdkSession._turn_usage diffs against, the same sum it makes of a result's map; an absent or empty
+    map seeds no token watermarks."""
+    if not isinstance(o, dict) or o.get("type") != "cost-state":
+        return None
+    total = o.get("totalCostUSD")
+    if not isinstance(total, (int, float)) or not (0 <= total < float("inf")):
+        return None
+    tokens = {}
+    mu = o.get("modelUsage")
+    if isinstance(mu, dict) and mu:
+        tokens = {k: 0 for k, _ in SdkSession._USAGE_KEYS}
+        for m in mu.values():
+            if not isinstance(m, dict):
+                continue
+            for k, mk in SdkSession._USAGE_KEYS:
+                v = m.get(mk)
+                tokens[k] += int(v) if isinstance(v, (int, float)) else 0
+    return {"total": float(total), "tokens": tokens}
+
+
+def last_cost_state(path, scan_bytes: int = 8 << 20):
+    """The resumed transcript's LAST `cost-state` record, as the watermarks a CLI that restores it would
+    hold (cost_state_watermarks), or None when the file has no such record or cannot be read.
+
+    Why read it: the CLI has a restore path for this record. Its transcript loader files `cost-state`
+    as last-wins, its writer emits totalCostUSD and modelUsage, the two counters the settle diffs, and
+    a resume that restores the record sets both. Should a CLI restore them in print mode, the first
+    result after a reconnect would carry the whole session's history in total_cost_usd, and watermarks
+    reset to zero would record that history as one turn's spend; seeding from the same file the CLI
+    reads makes the first delta this turn's own work. The seed reads transcript_path(cwd, resume_sid)
+    and reads it again when init corrects the cwd (the CLI's own string keys its transcript path), with
+    the sid the CLI LOADED when that init also landed a new fsid, so the two sides open the same file
+    (SdkSession._seed_spend_watermarks).
+
+    What the CLI does today, as probed in print mode (2026-09-06): its writer runs only once the process
+    has claimed its cost state. The interactive TUI claims it at startup; a print-mode (SDK) process
+    claims it only through the /clear session-id rotation, and a print-mode resume claims nothing and
+    restores nothing. The /clear saver runs before the rotation, so the SECOND and later /clear in one
+    process appends a record to the conversation that /clear abandons; the conversation romp resumes
+    (the reg's lastSid, the current one) never carries one. So every seed today reads zero, and the
+    CLI's counters start at zero on the same resume: the two agree. The one way a record reaches a
+    resumed file is a lastSid left on an abandoned conversation (the kernel dying between the saver's
+    write and the init flip); the print-mode CLI still starts at zero there, and the shrunken-counter
+    rule records the first turn whole while its own total sits below the seed. The residual: a first
+    turn costlier than the whole recorded history is under-counted by the seed, and the same holds per
+    token field (_turn_usage diffs each field on its own), so a first turn whose count in one field
+    exceeds the recorded history's is under-counted in that field.
+
+    Scans BACKWARDS in 64 KB chunks (a line split by a chunk edge is carried into the earlier chunk and
+    reassembled) and stops at the first hit, so a transcript that carries the record costs a chunk or
+    two. The scan is BOUNDED to the last `scan_bytes` (8 MB by default; last_record_uuid's tail read has
+    the same reason: a transcript can be tens of MB and this runs on the event loop at every connect):
+    a record older than that is treated as absent, which is the answer the print-mode CLI gives for its
+    own counters today (it restores nothing), so the two sides still agree (review find, 2026-09-09)."""
+    marker = b'"cost-state"'
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            floor = max(0, pos - int(scan_bytes))   # the oldest byte the bounded scan may reach
+            carry = b""
+            while pos > floor:
+                step = min(pos - floor, 1 << 16)
+                pos -= step
+                f.seek(pos)
+                chunk = f.read(step) + carry    # carry: the later chunk's first-line fragment, which this
+                #                                 chunk's last line continues into
+                head, nl, body = chunk.partition(b"\n")
+                if pos > 0:
+                    carry = head                # this chunk's first line is a fragment that completes in the
+                    #                             earlier chunk, so it travels there whole
+                    if not nl:
+                        continue                # no line boundary in this chunk at all
+                else:
+                    carry, body = b"", chunk    # the file's head: every line here is complete
+                if marker not in body:
+                    continue
+                for line in reversed(body.split(b"\n")):
+                    if marker not in line:
+                        continue
+                    try:
+                        rec = cost_state_watermarks(json.loads(line))
+                    except (ValueError, OverflowError, TypeError):
+                        continue                # not JSON, or a field no int() takes: skipped like an unusable total
+                    if rec is not None:
+                        return rec
+    except OSError:
+        return None
+    return None
+
+
 def rewind_disposition(rewind_to: str, rewind_leaf: str, leaf_now: str) -> str:
     """Should a (re)connect apply a pending conversation rewind? ONE-SHOT and event-guarded:
     "apply"  — a rewind is pending and the transcript's leaf is still the one recorded at
@@ -3806,6 +3912,9 @@ class SdkSession:
         #   total when the deltas were written (`usage: this.totalUsage`) and is the TURN's own total
         #   on the current CLI — diffing it under-counted every turn but the first (the user
         #   2026-09-06). Which counter is which, and the measurement: _turn_usage.
+        self._spend_first_result = False   # True from a connect until its first result settles: that result's
+        #   delta is checked against SANE_TURN_USD (an info-line trace; see the constant), and the init
+        #   handler may re-seed the watermarks while it is still True (a cwd correction; _seed_spend_watermarks)
         self._usage_fallback_noted = False  # the once-per-session line for a paid result whose modelUsage map
         #   is there but empty (usage_fallback_notice, the CLI cause); the SDK cause is said once per
         #   backend on its flag, _usage_fallback_sdk_noted (see _note_usage_fallback)
@@ -4826,8 +4935,8 @@ class SdkSession:
                     # create, the ready chip landing at 5-12s with the cycle).
                     self.backend._push_session(self.sid)
                     self._connected.set()   # the control channel exists from here (move() waits on this)
-                    self._last_cost_total = 0.0   # a fresh CLI process starts its cumulative cost at zero
-                    self._last_usage_totals = {}  # …and its cumulative token counters
+                    self._seed_spend_watermarks()   # a fresh CLI process starts its cumulative counters at
+                    #   zero, or at what it restores from the resumed transcript's cost-state record
                     # The CLI is demonstrably up, so any recorded launch failure is HISTORY — clear it
                     # here, at the proof, rather than on a timer. This is what lifts the usage-limit
                     # hold once the window resets: the next _ensure connects, the error record goes, and
@@ -5208,6 +5317,34 @@ class SdkSession:
         except Exception:
             pass    # a raising log callback: the count proceeds (the docstring's rule)
 
+    def _seed_spend_watermarks(self, resume_sid=None):
+        """Reset the spend watermarks for the CLI process a connect just started: zero for a fresh
+        process, or, when the resumed transcript carries a `cost-state` record, the counters that record
+        holds, because a CLI that restores them reports its first total_cost_usd as the whole session's
+        history plus this turn (last_cost_state has the full story, including why every seed reads zero
+        on the CLI as probed). Arms the first-result check either way. Called at connect, and again from
+        the init handler when the CLI's cwd corrects the registry's before any result has settled: the
+        transcript path is keyed on the cwd, so that is when the seed can have read the wrong file. That
+        second call is for a resumed session only (a fresh process has no loaded transcript to read), and
+        an init that ends a /clear skips it: the watermarks keep the zero the event set.
+        `resume_sid` names the transcript the CLI LOADED when that differs from self.resume_sid: the
+        init that corrects the cwd may in the same message have landed a new fsid, and the file a
+        restoring CLI took its counters from is the old one; the new fsid's file has no record yet."""
+        self._last_cost_total = 0.0   # a fresh CLI process starts its cumulative cost at zero
+        self._last_usage_totals = {}  # and its cumulative token counters
+        self._spend_first_result = True
+        sid = resume_sid or self.resume_sid
+        if not sid:
+            return
+        cs = last_cost_state(transcript_path(self.cwd, sid))
+        if not cs:
+            return
+        self._last_cost_total = cs["total"]
+        self._last_usage_totals = dict(cs["tokens"])
+        self.backend._log("spend: %s resumes a transcript with a cost-state record: watermarks seeded at its "
+                          "totals (cumulative $%.2f) so the first result records only this turn"
+                          % (self.name, cs["total"]), problem=False)
+
     async def _drain(self, client, AssistantMessage, ResultMessage, SystemMessage):
         """The receive loop. Every streamed message goes through _handle_stream_message, which keeps
         a handler's failure to that one message; what ends this loop is the STREAM ending — the CLI
@@ -5401,6 +5538,8 @@ class SdkSession:
             # rail's /usage bars — see _note_auth_source.
             self.backend._note_auth_source(self, d.get("apiKeySource"))
             fsid = d.get("session_id")
+            loaded_sid = self.resume_sid   # the transcript the CLI LOADED: a flip below moves resume_sid to the
+            #                                fsid it will WRITE, and the spend re-seed wants the former
             if fsid and fsid != self.resume_sid:
                 old = self.resume_sid
                 self.resume_sid = fsid
@@ -5416,6 +5555,8 @@ class SdkSession:
                     # rule in _turn_usage / the cost delta stays as the backstop for a reset we did not see.
                     self._last_cost_total = 0.0
                     self._last_usage_totals = {}
+                    loaded_sid = None   # zero IS the seed here: the cwd re-seed below stands down (the loaded
+                    #                     file may carry a record the /clear saver wrote as it abandoned it)
                 # A RESUME landing on a NEW fsid = a fresh-headed fork: record the old->new lineage
                 # (see append_resume_fork for the full story — the parser stitches the chain from it,
                 # the user 2026-08-14). A /clear's flip and a born-as-a-fork copy record nothing.
@@ -5442,6 +5583,15 @@ class SdkSession:
                 self.backend._log("sdk %s: adopting CLI cwd %r (registry had %r)" % (self.sid[:8], cli_cwd, self.cwd))
                 self.cwd = cli_cwd
                 self.backend._update_reg(self.sid, cwd=cli_cwd)
+                if loaded_sid and getattr(self, "_spend_first_result", False):   # getattr: __new__-built test doubles
+                    # The connect-time seed read the transcript under the REGISTRY's cwd; the CLI loaded the
+                    # one under ITS cwd (the same keying). No result has settled since the connect, so re-seed
+                    # from the file the CLI opened: a registry variant that holds no transcript left the seed
+                    # at zero for a file that carries a record, or the reverse. Never after a settle: resetting
+                    # the watermarks mid-process would count the cumulative counters whole again. The file the
+                    # CLI opened is the PRE-flip sid's: when this same init also landed a new fsid, resume_sid
+                    # now names the file the CLI will write, which holds no record yet.
+                    self._seed_spend_watermarks(resume_sid=loaded_sid)
             self.backend._poke()   # publish the model + permission-mode from init promptly: the snapshot reads
                                    # self.model, but with no poke the new model would wait out the 3s producer
                                    # backstop. NB: this init branch fires only once the FIRST turn arrives — the
@@ -5680,6 +5830,8 @@ class SdkSession:
                 if isinstance(total, (int, float)) and total > 0:
                     delta = total - self._last_cost_total if total >= self._last_cost_total else total
                     self._last_cost_total = float(total)
+                    first = getattr(self, "_spend_first_result", False)   # getattr: __new__-built test doubles
+                    self._spend_first_result = False   # the watermark moved: the process's first result is in
                     # the tokens: THIS turn's counts, from whichever result counter is a running total —
                     # the two are not the same kind (see _turn_usage; the flat `usage` is per-turn now)
                     turn_u = self._turn_usage(msg)
@@ -5689,6 +5841,19 @@ class SdkSession:
                     #   rail and the optimizer; a deliberate fork has no threadOf and bills itself)
                     #   + token readout; keyed = THIS session's init-reported auth, so the API sum stays
                     #   honest on a mixed host (see _record_spend)
+                    if first and delta > SANE_TURN_USD:
+                        # A first-after-connect delta above the mark: on the CLI as probed a resumed process
+                        # starts its counters at zero (SANE_TURN_USD), so this is the turn's own cost, recorded
+                        # as is and traced as an INFO line, not a problem: the figure is right and there is
+                        # nothing for the user to act on. It is wrong only if a CLI that restores cost history
+                        # read a different file than the connect-time seed (last_cost_state). After the record,
+                        # so a raising log callback costs the line and never the count.
+                        self.backend._log("spend: %s's first result after connect cost $%.2f, above %.0f USD for "
+                                          "one turn (the CLI's cumulative total: $%.2f). Recorded as is: a resumed "
+                                          "CLI process starts its cost at zero, so this is the turn's own cost. It "
+                                          "would be wrong only if a CLI that restores cost history read a different "
+                                          "transcript than the connect-time seed (last_cost_state)."
+                                          % (self.name, delta, SANE_TURN_USD, total), problem=False)
             finally:
                 # THE SETTLE — everything that makes the turn over for the kernel — runs whatever the
                 # bookkeeping above did (the rewind flags, the live-tail sweep, the refreshes, the spend

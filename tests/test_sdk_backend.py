@@ -2965,10 +2965,13 @@ class SpendRecord(unittest.TestCase):
         self.assertIn("sid=self.thread_of or self.sid)   # the rail's spend", src,
                       "a comment THREAD bills its OWNING session (T144); a plain session bills itself "
                       "(T100's per-session attribution, completed)")
+        self.assertIn("self._seed_spend_watermarks()   # a fresh CLI process starts its cumulative counters at", src,
+                      "each connect resets both watermarks with its new process, or seeds them from the resumed "
+                      "transcript's cost-state record (the resume-guard tests below)")
         self.assertIn("self._last_cost_total = 0.0   # a fresh CLI process starts its cumulative cost at zero",
-                      src, "each connect resets the watermark with its new process")
-        self.assertIn("self._last_usage_totals = {}  # …and its cumulative token counters", src,
-                      "the token watermarks reset with the same new process")
+                      src, "the seed starts the cost watermark at zero")
+        self.assertIn("self._last_usage_totals = {}  # and its cumulative token counters", src,
+                      "and the token watermarks with it")
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin", "romp-kernel")) as f:
             ksrc = f.read()
         self.assertIn('if o.get("apiKey") or (not _claude_account() and (jd.STATE / "spend.json").exists()):',
@@ -2976,9 +2979,9 @@ class SpendRecord(unittest.TestCase):
         self.assertIn('"spend": _spend_windows()', ksrc)
         self.assertIn("def _spend_windows(keyed_only=False):", ksrc)   # keyed_only: the mixed-host API sum (test_session_auth)
 
-    def _spend_session(self, sid="11111111-2222-3333-4444-bbbbbbbbbbbb", name="n"):
+    def _spend_session(self, sid="11111111-2222-3333-4444-bbbbbbbbbbbb", name="n", **reg):
         import asyncio
-        s = sb.SdkSession(self.be, {"sid": sid, "name": name, "cwd": "/tmp"})
+        s = sb.SdkSession(self.be, {"sid": sid, "name": name, "cwd": "/tmp", **reg})
         self.be._forward = lambda sess, msg: None
         self.be._turn_completed = lambda sid: None
         async def _noop(): pass
@@ -3212,6 +3215,274 @@ class SpendRecord(unittest.TestCase):
         k = json.loads(self.p.read_text())["days"][self._today()]["key"]
         self.assertEqual((k["tok"], k["tokIn"], k["tokOut"], k["tokCacheR"], k["tokCacheW"]), (1200, 100, 40, 1000, 60))
         self.assertEqual(k["turns"], 1, "the login turn is carried forward, not counted")
+
+    # ── the resume guard: a CLI that restores its cost counters on resume must not have the whole
+    # ── session's history recorded as one turn's spend
+    _FSID = "22222222-3333-4444-5555-dddddddddddd"
+
+    @staticmethod
+    def _cost_state(total, model_usage, fsid=_FSID):
+        """The CLI's `cost-state` transcript record: totalCostUSD and modelUsage, the two counters the
+        settle diffs, beside the duration fields the record also carries."""
+        return json.dumps({"type": "cost-state", "sessionId": fsid, "totalCostUSD": total,
+                           "totalAPIDuration": 1, "totalDuration": 2, "startTime": 3,
+                           "modelUsage": model_usage})
+
+    @staticmethod
+    def _costed(total, model_usage):
+        r = _ResultMessage()
+        r.total_cost_usd = total
+        r.model_usage = model_usage
+        r.usage = {"input_tokens": 9999}     # never read while the map is present: the map governs
+        return r
+
+    @staticmethod
+    def _init_of(s):
+        """Deliver an init SystemMessage to `s` the way the stream does (the class passed as the
+        SystemMessage type is the double's own, so isinstance holds)."""
+        class _Sys:
+            def __init__(self, data): self.subtype = "init"; self.data = data
+        def init(data):
+            async def go():
+                s._on_message(_Sys(data), _AssistantMessage, _ResultMessage, _Sys)
+                await asyncio.sleep(0)
+            asyncio.run(go())
+        return init
+
+    def _private_dir(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        return td.name
+
+    def _resumed_session(self, transcript_lines, sid="11111111-2222-3333-4444-eeeeeeeeeeee", name="n"):
+        """A session whose reg resumes _FSID from self.d, with that transcript on disk under a private
+        CLAUDE_CONFIG_DIR (transcript_path reads the env at call time)."""
+        env = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": self._private_dir()})
+        env.start()
+        self.addCleanup(env.stop)
+        p = Path(sb.transcript_path(self.d, self._FSID))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(transcript_lines) + "\n")
+        return self._spend_session(sid, name=name, cwd=self.d, lastSid=self._FSID)
+
+    def test_connect_seeds_the_watermarks_from_the_transcripts_last_cost_state(self):
+        """The CLI's transcript loader files `cost-state` as last-wins and its writer emits totalCostUSD
+        + modelUsage, the two counters the settle diffs. A CLI that restores them on resume reports its
+        first total_cost_usd as the WHOLE session's history plus this turn; watermarks at zero would
+        record that history as one turn's spend. Seeding from the record the CLI restores keeps the
+        first delta this turn's own."""
+        mu_old = {"claude-x": {"inputTokens": 400, "outputTokens": 40,
+                               "cacheReadInputTokens": 9000, "cacheCreationInputTokens": 100}}
+        mu = {"claude-x": {"inputTokens": 1000, "outputTokens": 200,
+                           "cacheReadInputTokens": 50000, "cacheCreationInputTokens": 3000}}
+        s, run, day = self._resumed_session([
+            json.dumps({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "hello"}}),
+            self._cost_state(4.0, mu_old),                     # an earlier snapshot, superseded (last-wins)
+            json.dumps({"type": "assistant", "uuid": "a1", "message": {"role": "assistant", "content": []}}),
+            self._cost_state(12.5, mu),
+            json.dumps({"type": "last-prompt", "lastPrompt": "x"}),   # uuid-less trailers after it are fine
+        ])
+        lines = []
+        self.be._log_cb = lines.append
+        seeded = lambda: [l for l in lines if "watermarks seeded" in l]
+        s._seed_spend_watermarks()                             # the connect-time step
+        self.assertEqual(s._last_cost_total, 12.5, "the LAST record's total is the seed")
+        self.assertEqual(s._last_usage_totals, {"input_tokens": 1000, "output_tokens": 200,
+                                                "cache_read_input_tokens": 50000,
+                                                "cache_creation_input_tokens": 3000})
+        self.assertTrue(s._spend_first_result)
+        self.assertEqual(len(seeded()), 1, "the seed is said once, in the kernel log")
+        self.assertIn("12.50", seeded()[0])
+        self.assertEqual(self.be.problems(), [], "an info line, not a problem: nothing for the user to act on")
+        # the restoring CLI's first result: history + this turn. Only THIS turn lands.
+        run(self._costed(13.0, {"claude-x": {"inputTokens": 1500, "outputTokens": 260,
+                                             "cacheReadInputTokens": 50000, "cacheCreationInputTokens": 3000}}))
+        d = day()
+        self.assertAlmostEqual(d["usd"], 0.5)
+        self.assertEqual((d["tokIn"], d["tokOut"], d["tokCacheR"]), (500, 60, 0))
+        self.assertFalse(s._spend_first_result)
+        self.assertEqual(len(seeded()), 1, "the settle says nothing about the seed")
+        # a CLI that wrote the record but did NOT restore: its own first total sits below the seed, so the
+        # shrunken-counter rule records it whole. The common case stays right without knowing which CLI it is.
+        s._seed_spend_watermarks()
+        self.assertEqual(len(seeded()), 2, "each connect that seeds says so")
+        run(self._costed(0.7, {"claude-x": {"inputTokens": 300}}))
+        self.assertAlmostEqual(day()["usd"], 1.2)
+        self.assertEqual(day()["tokIn"], 800)
+        self.assertEqual(self.be.problems(), [])
+
+    def test_no_cost_state_record_and_no_resume_target_leave_the_watermarks_at_zero(self):
+        s, run, day = self._resumed_session([
+            json.dumps({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "hello"}}),
+            json.dumps({"type": "assistant", "uuid": "a1", "message": {"role": "assistant", "content": [],
+                                                                        "usage": {"input_tokens": 5}}}),
+        ])
+        s._last_cost_total, s._last_usage_totals = 9.0, {"input_tokens": 9}   # stale from the old process
+        s._seed_spend_watermarks()
+        self.assertEqual((s._last_cost_total, s._last_usage_totals), (0.0, {}),
+                         "no record: a fresh process starts at zero, as every resume does on the CLI as probed")
+        run(self._costed(1.5, {"claude-x": {"inputTokens": 100}}))
+        self.assertAlmostEqual(day()["usd"], 1.5, msg="the first result is recorded whole")
+        self.assertEqual(day()["tokIn"], 100)
+        s.resume_sid = None                                    # no resume target at all
+        s._last_cost_total = 3.0
+        s._seed_spend_watermarks()
+        self.assertEqual((s._last_cost_total, s._last_usage_totals, s._spend_first_result), (0.0, {}, True))
+
+    def test_last_cost_state_reads_backwards_across_chunk_edges_and_takes_the_last_valid_record(self):
+        p = Path(self._private_dir()) / "t.jsonl"
+        filler = json.dumps({"type": "user", "uuid": "u", "message": {"role": "user", "content": "x" * 900}})
+        mu = {"m": {"inputTokens": 7, "outputTokens": 3}}
+        # a valid record early in the file, then ~200 KB with no marker: the scan walks several 64 KB
+        # chunks back to it. A later record with an unusable total is skipped, not taken as "none".
+        lines = [filler, self._cost_state(2.25, mu)] + [filler] * 220
+        lines.append(json.dumps({"type": "cost-state", "totalCostUSD": "not a number", "modelUsage": mu}))
+        p.write_text("\n".join(lines) + "\n")
+        self.assertEqual(sb.last_cost_state(str(p)), {"total": 2.25, "tokens": {
+            "input_tokens": 7, "output_tokens": 3, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}})
+        # a record STRADDLING a chunk edge: the tail after it is 21 bytes short of a chunk, so the edge of
+        # the last chunk (read first) falls inside the record, whose two halves land in different chunks
+        rec = self._cost_state(5.5, mu)
+        head = "\n".join([filler] * 80) + "\n"
+        tail = "x" * ((1 << 16) - 22) + "\n"
+        p.write_text(head + rec + "\n" + tail)
+        size = p.stat().st_size
+        start = len(head.encode())
+        edge = size - (1 << 16)
+        self.assertTrue(start < edge < start + len(rec), "the premise: the chunk edge falls inside the record")
+        self.assertEqual(sb.last_cost_state(str(p))["total"], 5.5, "a line split by the chunk edge is reassembled")
+        # last-wins: two valid records take the later one; no trailing newline is fine
+        p.write_text(self._cost_state(1.0, mu) + "\n" + self._cost_state(9.0, {}))
+        self.assertEqual(sb.last_cost_state(str(p)), {"total": 9.0, "tokens": {}},
+                         "an empty modelUsage seeds no token watermarks")
+        # two models sum per field, the settle's own count of a result's map
+        p.write_text(self._cost_state(3.0, {"a": {"inputTokens": 5, "cacheReadInputTokens": 10},
+                                            "b": {"inputTokens": 6, "outputTokens": 1, "webSearchRequests": 4},
+                                            "c": "not a map"}) + "\n")
+        self.assertEqual(sb.last_cost_state(str(p))["tokens"], {
+            "input_tokens": 11, "output_tokens": 1, "cache_read_input_tokens": 10, "cache_creation_input_tokens": 0})
+        # a negative or non-finite total is unusable, like a non-number
+        p.write_text(self._cost_state(-1.0, mu) + "\n")
+        self.assertIsNone(sb.last_cost_state(str(p)))
+        p.write_text('{"type": "cost-state", "totalCostUSD": NaN, "modelUsage": {}}\n')
+        self.assertIsNone(sb.last_cost_state(str(p)))
+        p.write_text('{"type": "cost-state", "totalCostUSD": Infinity, "modelUsage": {}}\n')
+        self.assertIsNone(sb.last_cost_state(str(p)))
+        self.assertIsNone(sb.last_cost_state(str(p.parent / "missing.jsonl")))
+        p.write_text("")
+        self.assertIsNone(sb.last_cost_state(str(p)))
+        p.write_text(filler + "\n")
+        self.assertIsNone(sb.last_cost_state(str(p)), "no record: None, never a zero seed")
+
+    def test_a_first_result_after_connect_above_the_single_turn_mark_is_recorded_and_traced_as_info(self):
+        """On the CLI as probed a resumed process starts its cost counters at zero, so a first delta above
+        the mark is the turn's own cost: recorded as is and traced in the kernel log, NOT a problem (a
+        problem row for a right figure sends the user to check a record that is correct)."""
+        lines = []
+        self.be._log_cb = lines.append
+        traced = lambda: [l for l in lines if "first result after connect" in l]
+        s, run, day = self._spend_session()
+        s._seed_spend_watermarks()                             # no resume target: zero watermarks
+        run(self._costed(5.0, {"m": {"inputTokens": 10}}))
+        self.assertEqual(traced(), [], "an ordinary first turn says nothing")
+        s._seed_spend_watermarks()                             # a reconnect
+        run(self._costed(250.0, {"m": {"inputTokens": 20}}))
+        self.assertEqual(len(traced()), 1)
+        self.assertIn("250.00", traced()[0])
+        self.assertIn("Recorded as is", traced()[0])
+        self.assertEqual(self.be.problems(), [], "an info line: the figure is right, nothing to act on")
+        self.assertAlmostEqual(day()["usd"], 255.0, msg="recorded anyway; the record drops nothing")
+        run(self._costed(500.0, {"m": {"inputTokens": 30}}))   # a 250 USD delta on the NEXT result
+        self.assertEqual(len(traced()), 1, "only the FIRST result after a connect is checked")
+        self.assertAlmostEqual(day()["usd"], 505.0)
+
+    def test_init_correcting_the_cwd_re_seeds_the_watermarks_before_the_first_result(self):
+        """The connect-time seed reads the transcript under the REGISTRY's cwd; the CLI loads the one
+        under ITS cwd, which init reports (the same keying: transcript_path realpaths the string, so a
+        create-time variant such as a wrong case holds no transcript). Adopting the CLI's cwd re-seeds
+        from the file the CLI opened while no result has settled, and never afterwards: resetting the
+        watermarks mid-process would count the cumulative counters whole again."""
+        mu = {"m": {"inputTokens": 1000, "outputTokens": 200}}
+        s, run, day = self._resumed_session([self._cost_state(12.5, mu)])   # the record lives under self.d
+        variant = self._private_dir()
+        s.cwd = variant                                        # the registry's variant: no transcript there
+        sb.write_reg(self.d, s.sid, {"sid": s.sid, "name": "n", "cwd": variant, "alive": True, "lastSid": self._FSID})
+        s._seed_spend_watermarks()
+        self.assertEqual((s._last_cost_total, s._last_usage_totals), (0.0, {}), "nothing under the variant")
+        init = self._init_of(s)
+        init({"cwd": self.d, "session_id": self._FSID, "model": "claude-x"})
+        self.assertEqual(s.cwd, self.d)
+        self.assertEqual(sb.read_reg(self.d, s.sid)["cwd"], self.d)
+        self.assertEqual(s._last_cost_total, 12.5, "re-seeded from the file under the CLI's cwd")
+        self.assertEqual(s._last_usage_totals["input_tokens"], 1000)
+        self.assertTrue(s._spend_first_result)
+        run(self._costed(13.0, {"m": {"inputTokens": 1500, "outputTokens": 260}}))
+        self.assertAlmostEqual(day()["usd"], 0.5, msg="the first result records only this turn")
+        self.assertEqual(day()["tokIn"], 500)
+        # a cwd correction AFTER a settle (none is expected; the guard is the point) leaves them alone
+        init({"cwd": self._private_dir(), "session_id": self._FSID, "model": "claude-x"})
+        self.assertEqual(s._last_cost_total, 13.0, "no re-seed once a result has settled")
+        run(self._costed(13.2, {"m": {"inputTokens": 1600, "outputTokens": 260}}))
+        self.assertAlmostEqual(day()["usd"], 0.7)
+        self.assertEqual(day()["tokIn"], 600)
+
+    def test_an_init_that_lands_a_new_fsid_and_corrects_the_cwd_re_seeds_from_the_file_the_cli_loaded(self):
+        """One init can both land a NEW fsid (a resume the CLI continues under a fresh file; a rewind via
+        --resume-session-at is an in-place branch on the same fsid and never flips it) and correct the
+        cwd. The flip moves resume_sid to the file the CLI will WRITE, which holds no record yet; a CLI
+        that restores its counters took them from the file it LOADED, the old fsid's. The re-seed reads
+        that one."""
+        new_fsid = "33333333-4444-5555-6666-ffffffffffff"
+        mu = {"m": {"inputTokens": 1000, "outputTokens": 200}}
+        s, run, day = self._resumed_session([self._cost_state(12.5, mu)])   # the OLD fsid's record, under self.d
+        variant = self._private_dir()
+        s.cwd = variant                                        # the registry's variant: no transcript there
+        sb.write_reg(self.d, s.sid, {"sid": s.sid, "name": "n", "cwd": variant, "alive": True, "lastSid": self._FSID})
+        s._seed_spend_watermarks()
+        self.assertEqual(s._last_cost_total, 0.0, "nothing under the variant")
+        self._init_of(s)({"cwd": self.d, "session_id": new_fsid, "model": "claude-x"})
+        self.assertEqual((s.cwd, s.resume_sid), (self.d, new_fsid), "cwd adopted, fsid flipped")
+        self.assertEqual(sb.read_reg(self.d, s.sid)["lastSid"], new_fsid)
+        self.assertEqual(s._last_cost_total, 12.5, "re-seeded from the OLD fsid's file under the CLI's cwd")
+        self.assertEqual(s._last_usage_totals["input_tokens"], 1000)
+        run(self._costed(13.0, {"m": {"inputTokens": 1500, "outputTokens": 260}}))
+        self.assertAlmostEqual(day()["usd"], 0.5, msg="the restoring CLI's first result records only this turn")
+        self.assertEqual(day()["tokIn"], 500)
+        # a flip WITHOUT a cwd correction re-seeds nothing: the connect-time seed read the loaded file already
+        s2, _, _ = self._spend_session("11111111-2222-3333-4444-abababababab", name="n2", cwd=self.d, lastSid=self._FSID)
+        sb.write_reg(self.d, s2.sid, {"sid": s2.sid, "name": "n2", "cwd": self.d, "alive": True, "lastSid": self._FSID})
+        s2._seed_spend_watermarks()
+        self.assertEqual(s2._last_cost_total, 12.5)
+        # the record changes under the seed: a re-seed here would read 99.0
+        Path(sb.transcript_path(self.d, self._FSID)).write_text(self._cost_state(99.0, mu) + "\n")
+        self._init_of(s2)({"cwd": self.d, "session_id": new_fsid, "model": "claude-x"})
+        self.assertEqual((s2.resume_sid, s2._last_cost_total), (new_fsid, 12.5), "flipped, seed kept: not re-read")
+
+    def test_an_init_that_ends_a_clear_and_corrects_the_cwd_keeps_the_watermarks_at_zero(self):
+        """A /clear's init flip zeroes the watermarks on the event: the CLI zeroed its counters at that
+        instant. When the same init also corrects the cwd, the re-seed stands down. The file the CLI
+        loaded may carry a record (the CLI's writer appends one to the conversation a /clear abandons),
+        and seeding from it would hold the watermarks above counters that are at zero."""
+        mu = {"m": {"inputTokens": 1000, "outputTokens": 200}}
+        s, run, day = self._resumed_session([self._cost_state(12.5, mu)])
+        variant = self._private_dir()
+        s.cwd = variant
+        sb.write_reg(self.d, s.sid, {"sid": s.sid, "name": "n", "cwd": variant, "alive": True, "lastSid": self._FSID})
+        s._seed_spend_watermarks()
+        self.assertEqual(s._last_cost_total, 0.0)
+        new_fsid = "33333333-4444-5555-6666-ffffffffffff"
+        # planted so the stand-down is observable: a re-seed that fell back to the NEW fsid's file would read 7.0
+        p = Path(sb.transcript_path(self.d, new_fsid))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(self._cost_state(7.0, mu, fsid=new_fsid) + "\n")
+        s._clearing = True                                     # a /clear was delivered on this connection...
+        self._init_of(s)({"cwd": self.d, "session_id": new_fsid, "model": "claude-x"})
+        self.assertEqual(s.cwd, self.d, "...and its init lands a new fsid under the CLI's cwd")
+        self.assertEqual((s._last_cost_total, s._last_usage_totals), (0.0, {}),
+                         "the clear's zero stands: neither the abandoned conversation's record nor the new file is read")
+        run(self._costed(13.0, {"m": {"inputTokens": 1500}}))
+        self.assertAlmostEqual(day()["usd"], 13.0, msg="the first post-clear turn is the whole counter")
+        self.assertEqual(day()["tokIn"], 1500)
 
 
 class RewindFiles(unittest.TestCase):
