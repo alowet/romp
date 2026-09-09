@@ -95,6 +95,70 @@ export function tailLabel(children: ArrayLike<{ className?: string }>): string {
   return "";
 }
 
+/** The breadcrumb for one height change of a unit that is NOT the tail (T262n, the user's 2026-09-08 laptop capture:
+ *  one unwritten move in eleven minutes, a 24 px shrink of the transcript with the reader at the bottom, and no row
+ *  named what shrank). The view rail's row says the transcript changed height and names the TAIL; when a unit above
+ *  the tail changes height in place, that row still names the tail. This one names the unit: `cls` its class list,
+ *  `fromTail` how many units above the tail it sits (1 = the unit just above it), `stick` the view's recorded follow
+ *  mode and `atBottom` the measured bottom at the read. A row only: nothing is written or decided from it. */
+export function unitChangeRow(sid: string, dh: number, cls: string, fromTail: number, stick: boolean, atBottom: boolean, sh = 0, ch = 0) {
+  return { sid, dh, cls: String(cls || "").slice(0, 60), fromTail, stick, atBottom, sh, ch };
+}
+
+export interface UnitHeights<T> { get(t: T): number | undefined; set(t: T, h: number): unknown; }
+
+/** Boxes of the scroller OUTSIDE the thread (the T262n follow-up): #content's direct children that are not a
+ *  thread and not the live-ask host (which has its own rows): the host-offline foot, #sub-head, the build
+ *  placeholders. The laptop capture's one unwritten move had no tailchange row, so its 24 px came from one of
+ *  these, on a remote-host tab, where the foot is the one such box. A box has no place in the thread, so its
+ *  unit row carries fromTail BOX_FROM_TAIL and names the box by id (#host-offline-foot) else by class. */
+export const BOX_FROM_TAIL = -1;
+export function boxLabel(box: { id?: string; className?: string }): string {
+  return box.id ? "#" + box.id : String(box.className || "");
+}
+/** Fold one ResizeObserver callback over the scroller's boxes into the in-place changes to file: the first
+ *  observation is the baseline (the pane records it when the box appears), an unchanged height files nothing. */
+export function boxChanges<T extends { id?: string; className?: string }>(entries: Array<{ target: T; height: number }>,
+                                                                        heights: UnitHeights<T>): Array<{ target: T; dh: number; cls: string }> {
+  const out: Array<{ target: T; dh: number; cls: string }> = [];
+  for (const e of entries) {
+    const prev = heights.get(e.target);
+    heights.set(e.target, e.height);
+    if (prev === undefined || e.height === prev) continue;
+    out.push({ target: e.target, dh: e.height - prev, cls: boxLabel(e.target) });
+  }
+  return out;
+}
+/** Fold one ResizeObserver callback over a view's units into the non-tail changes to file. `entries` are the
+ *  observed units with their new heights, `children` the view's children in order, `heights` the last height seen
+ *  per unit (a WeakMap in the pane). The first observation of a unit is its baseline and files nothing (observe()
+ *  reports once on attach); an unchanged height files nothing; a virtualization spacer never files (its spacer rows
+ *  say what it did); the TAIL unit (the last child that is not a spacer, tailLabel's rule) never files here, because
+ *  the view rail's row already carries its change; a unit no longer in the window files nothing. `fromTail` counts
+ *  UNITS when `unitOf` can say which unit a child belongs to (the pane's data-unit: a day divider is a child of its
+ *  own carrying the unit it opens, so counting children would read one turn plus a divider as two turns); it falls
+ *  back to child distance where no unit index exists. */
+export function unitChanges<T extends { className?: string }>(entries: Array<{ target: T; height: number }>, children: ArrayLike<T>,
+                                                                heights: UnitHeights<T>, unitOf?: (t: T) => number | undefined): Array<{ target: T; dh: number; cls: string; fromTail: number }> {
+  let tail = -1;
+  for (let i = children.length - 1; i >= 0; i--) if (String(children[i]?.className || "").indexOf("tx-spacer") < 0) { tail = i; break; }
+  const out: Array<{ target: T; dh: number; cls: string; fromTail: number }> = [];
+  for (const e of entries) {
+    const prev = heights.get(e.target);
+    heights.set(e.target, e.height);
+    if (prev === undefined || e.height === prev) continue;
+    const cls = String(e.target?.className || "");
+    if (cls.indexOf("tx-spacer") >= 0) continue;
+    let idx = -1;
+    for (let i = 0; i < children.length; i++) if (children[i] === e.target) { idx = i; break; }
+    if (idx < 0 || idx === tail) continue;
+    const ut = unitOf ? unitOf(children[tail]) : undefined, uu = unitOf ? unitOf(e.target) : undefined;
+    const byUnit = typeof ut === "number" && typeof uu === "number" && !Number.isNaN(ut) && !Number.isNaN(uu);
+    out.push({ target: e.target, dh: e.height - prev, cls, fromTail: byUnit ? ut - uu : tail - idx });
+  }
+  return out;
+}
+
 /** The breadcrumb for one write that moved the view. `sh`/`ch` = #content's scrollHeight/clientHeight after the
  *  write (T262e, the user 2026-09-08: their laptop's rows showed the view moving UP by the same 95 px on two
  *  sessions with no write between the rows — an UNWRITTEN move, which the rows could not classify: a browser

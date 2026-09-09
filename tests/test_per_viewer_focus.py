@@ -79,6 +79,18 @@ class Wiring(unittest.TestCase):
         self.assertIn('get("wid")', shim)
         self.assertIn('window.sessionStorage.getItem("romp:wid")', shim)
 
+    def test_the_id_is_minted_before_any_pane_can_connect(self):
+        # 2026-09-09 (the served tap-resume test, tests/test_notification_tap_resume_browser.py, two runs in
+        # three on localhost): the mint sat in the BODY script, after the iframes, and the chat pane's shim read
+        # sessionStorage and connected first — its socket carried no wid, so a reveal the kernel aimed at this
+        # dashboard's wid found no chat socket to deliver to and parked for a ready that never comes on a live
+        # page. A phone's first-ever load runs the same race. The mint lives in the head, ahead of <body> and
+        # so of the first <iframe>: no pane can connect before the id exists.
+        html = km._landing()
+        mint = html.index("sessionStorage.setItem('romp:wid'")
+        self.assertLess(mint, html.index("<body"), "minted in the head")
+        self.assertLess(mint, html.index("<iframe"), "…before any pane is even parsed")
+
     def test_an_empty_wid_falls_through_to_the_broadcast(self):
         self.assertIn("if not wid:\n        return _send_to_app(app, msg)",
                       inspect.getsource(km._send_to_view))
