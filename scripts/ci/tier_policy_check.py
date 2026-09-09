@@ -256,8 +256,9 @@ def _refresh_label_counter(repo, head, token, head_repo=None, head_branch=None, 
 def run_one(repo, n, token):
     """Evaluate one PR and post its verdict. A failure while BUILDING the record (or applying the body's
     declared tier) posts a failing verdict naming the error when the head is known (never a silent gap on
-    a required check), and re-raises so the job reads red; in --all-open the caller isolates it so one PR
-    cannot starve the others."""
+    a required check), and re-raises so the job reads red for an EVALUATION failure (a failing verdict that
+    was posted leaves the job green, T273c); in --all-open the caller isolates it so one PR cannot starve
+    the others."""
     head = None
     try:
         pr, _ = _req("GET", "/repos/%s/pulls/%d" % (repo, n), token)
@@ -299,8 +300,13 @@ def main(argv):
                 sys.stderr.write("PR #%s: %s\n" % (p["number"], traceback.format_exc().strip().splitlines()[-1]))
                 rc = 1
         return rc
-    v = run_one(repo, int(argv[argv.index("--pr") + 1]), token)
-    return 1 if v["conclusion"] != "success" else 0
+    # The job's exit is NOT the verdict (T273c): the verdict is the check run posted above, and a failing one is
+    # a gate waiting on someone, not a broken job. A job red on every failing verdict doubled every waiting PR's
+    # red rows ("Tier policy" the required check plus this job), and a contributor's feature awaiting the
+    # owner's approval read as a broken PR. Nonzero only when the evaluation itself failed: run_one re-raises
+    # after posting "evaluation failed", so a fetch or post error still reaches the job's status and the log.
+    run_one(repo, int(argv[argv.index("--pr") + 1]), token)
+    return 0
 
 
 if __name__ == "__main__":

@@ -36,10 +36,13 @@ name: Tier policy
 #   timeline for dates and no commit date, so there is no clock for a forged date, a reopen or a sibling
 #   PR's head to feed. Beyond the verdict it writes the body's declared tier as a label and lists and
 #   re-runs the label counter's workflow run on the head; neither reaches the record the policy grades.
-# - The job below is named "Tier policy evaluation", NOT "Tier policy": the required check is the
+# - The job below is named "Tier policy: post verdict", NOT "Tier policy": the required check is the
 #   API-posted verdict alone. Were the job named the same, every head would carry two same-named runs
 #   (the job's, frozen at push time, and the verdict the hourly sweep moves) and which one the ruleset
-#   honors is undocumented.
+#   honors is undocumented. The job's own status is not the verdict (T273c): it is green whenever it
+#   evaluated and posted, whatever the verdict said, and red only when the evaluation itself failed
+#   (could not fetch, could not post). A job red on every failing verdict doubled each waiting PR's red
+#   rows, and a contributor's feature awaiting the owner's approval read as a broken PR.
 # - RESIDUAL, stated as open: a PR can add a pull_request-triggered workflow whose JOB is named
 #   "Tier policy"; GitHub Actions creates that run on the head with no token, under the same app and
 #   sha as the base verdict, and the merge box follows the newest same-named run - app selection
@@ -69,7 +72,7 @@ permissions:
 
 jobs:
   policy:
-    name: Tier policy evaluation
+    name: "Tier policy: post verdict"
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

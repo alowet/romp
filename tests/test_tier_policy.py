@@ -29,8 +29,10 @@ guarded.
 
 Synthetic only: invented logins, placeholder shas, TESTHOST-free."""
 import importlib.util
+import io
 import os
 import re
+import sys
 import tempfile
 import types
 import unittest
@@ -669,7 +671,7 @@ class WorkflowPins(unittest.TestCase):
         # head (the job's, frozen at push time, and the API-posted verdict the hourly sweep moves) leave
         # it undocumented which one the ruleset honors - so only the API-posted verdict carries the name
         jobs = self.wf[self.wf.index("\njobs:"):]
-        self.assertIn("    name: Tier policy evaluation", jobs)
+        self.assertIn('    name: "Tier policy: post verdict"', jobs)   # T273c: the row says what the job does (quoted: the colon)
         self.assertNotRegex(jobs, r"name: Tier policy[ \t]*\n")
 
     def test_the_three_tier_label_lists_agree(self):
@@ -1287,3 +1289,53 @@ class DeclaredTier(unittest.TestCase):
         v = tp.evaluate(pr(labels=["fix", "feature"], body="Tier: fix"))
         self.assertEqual(v["conclusion"], "failure")
         self.assertIn("2", v["title"])
+
+
+class JobExitCode(unittest.TestCase):
+    """The workflow JOB's status is not the verdict (T273c, the user 2026-09-09, who read a contributor's PR with
+    seven red rows as broken when one gate was waiting on them): the verdict is the check run the script posts,
+    so the job exits 0 whenever it evaluated and posted, whatever the verdict said, and nonzero only when the
+    evaluation itself failed (could not fetch, could not post)."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location(
+            "tier_policy_check_exit", os.path.join(os.path.dirname(HERE), "scripts", "ci", "tier_policy_check.py"))
+        self.tc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.tc)
+        os.environ["GITHUB_TOKEN"] = "tok"
+        self.addCleanup(os.environ.pop, "GITHUB_TOKEN", None)
+
+    def test_a_failing_verdict_is_a_posted_verdict_and_the_job_exits_zero(self):
+        self.tc.run_one = lambda repo, n, token: {"conclusion": "failure", "title": "Tier policy: feature",
+                                                  "summary": "A feature by a non-admin author needs an admin's approval: none yet."}
+        self.assertEqual(self.tc.main(["--pr", "42"]), 0, "the verdict is the check run's conclusion, not the job's")
+
+    def test_a_passing_verdict_exits_zero_too(self):
+        self.tc.run_one = lambda repo, n, token: {"conclusion": "success", "title": "Tier policy: fix", "summary": "ok"}
+        self.assertEqual(self.tc.main(["--pr", "42"]), 0)
+
+    def test_an_evaluation_error_still_fails_the_job(self):
+        def boom(repo, n, token):
+            raise RuntimeError("the API said 502")
+        self.tc.run_one = boom
+        with self.assertRaises(RuntimeError):
+            self.tc.main(["--pr", "42"])
+
+    def test_the_hourly_pass_exits_zero_on_failing_verdicts_and_nonzero_on_an_error(self):
+        self.tc._get_all = lambda path, token: [{"number": 1}, {"number": 2}]
+        verdicts = {1: {"conclusion": "failure", "title": "t", "summary": "s"}, 2: {"conclusion": "success", "title": "t", "summary": "s"}}
+        self.tc.run_one = lambda repo, n, token: verdicts[n]
+        self.assertEqual(self.tc.main(["--all-open"]), 0, "two posted verdicts, one of them failing: the sweep did its job")
+
+        def one_boom(repo, n, token):
+            if n == 2:
+                raise RuntimeError("could not post")
+            return verdicts[1]
+        self.tc.run_one = one_boom
+        err, old = io.StringIO(), sys.stderr
+        sys.stderr = err
+        try:
+            self.assertEqual(self.tc.main(["--all-open"]), 1, "one PR's evaluation failed: the job says so")
+        finally:
+            sys.stderr = old
+        self.assertIn("could not post", err.getvalue())
