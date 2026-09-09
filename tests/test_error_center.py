@@ -289,7 +289,7 @@ class ErrorCenterWiring(unittest.TestCase):
         self.assertIn("n<=0?'!'", html)
         self.assertNotIn("M8 2 C5.8 2 4.5 3.7", html, "the old bell path left the shell entirely")
         # "Log", not "Errors" (the user 2026-07-29): quiet informational kinds live here too, so the
-        # old name oversold every entry as a problem. BOTH glyphs (rail + mobile) say what it is.
+        # old name oversold every entry as a problem. the mobile glyph says what it is (the rail's copy left with T290).
         self.assertIn("title='Log — click to open'", html)
         self.assertEqual(html.count("title='Log — click to open'"), 1, "the mobile bar's #merr only (T290)")
         self.assertIn("<div class=rerr-top>Log<span class=sp></span>", html)

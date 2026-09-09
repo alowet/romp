@@ -44954,7 +44954,7 @@ def _rdrift_block():
             + "<script>" + _RDRIFT_JS + "</script>")
 
 
-# The errors glyph, shared by the desktop rail and the mobile bar: a warning TRIANGLE (was a bell
+# The errors glyph, the mobile bar's glyph (the desktop rail's copy left with T290): a warning TRIANGLE (was a bell
 # until 2026-07-28 — the bell now means the session/card notification toggles, so the error center
 # wears the unambiguous trouble shape instead). The unread COUNT lives INSIDE the triangle (the user
 # 2026-07-28 — the old corner badge clipped): an svg <text> the errs JS drives (.rerr-n), digits 1-9,
@@ -45657,7 +45657,7 @@ def _landing():
             # usage-limit / judge-degraded — which got in the way): the bell in the bottom bar's action
             # cluster goes RED when an error lands; clicking it opens the Log as a centered modal
             # (the one panel treatment, the user 2026-08-08), newest first, per-row clear + Clear all.
-            "#rail-errs.has,#merr.has{color:#ff6b6b}"   # red bell = something unread / a live problem; no count badge (it clipped, and the number added nothing — the user 2026-07-27)
+            "#merr.has{color:#ff6b6b}"   # red bell = something unread / a live problem; no count badge (it clipped, and the number added nothing — the user 2026-07-27)
             # centered like every other panel (the user 2026-08-08: one modal treatment — centered card,
             # 0.55 dim, dashboard unchanged behind it; it used to sit bottom-right over the feed)
             "#rerr-back{position:fixed;inset:0;z-index:210;display:flex;align-items:center;justify-content:center;"
