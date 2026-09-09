@@ -638,11 +638,12 @@ def wait_for_census(before, timeout=5.0):
     "nothing this module started outlives it", so a thread from an EARLIER module that happens to end during this one
     cannot fail it, and a thread this module started has a moment (20 ms polls, up to `timeout`) to reach its exit
     after join(timeout) returned. Returns the sorted leftovers; a clean module gets []."""
+    import collections
     import time
     deadline = time.monotonic() + timeout
-    base = set(before)
+    base = collections.Counter(before)
     while True:
-        extra = sorted(set(thread_census()) - base)
-        if not extra or time.monotonic() >= deadline:
+        extra = sorted((collections.Counter(thread_census()) - base).elements())   # by COUNT: a second thread of a
+        if not extra or time.monotonic() >= deadline:                              # kind already present is a leftover
             return extra
         time.sleep(0.02)

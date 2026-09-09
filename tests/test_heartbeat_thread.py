@@ -31,6 +31,13 @@ class WsHeartbeat(unittest.TestCase):
         self.census0 = thread_census()
         self.saved_ka = km.KEEPALIVE_S
         self.saved_push_all = km._push_all
+        # A real _pusher cycle runs the tick jobs before its push; on a module-fresh kernel the usage poll fires on
+        # the FIRST cycle and builds a real SdkBackend (re-executing sdk_backend.py into the shared module and
+        # touching the shared judge's latches). These tests are about the beat, so the cycle's jobs and the
+        # backend are stubbed for the class; each test still chooses its own _push_all.
+        self.saved_jobs = (km._pusher_cycle_jobs, km._sdk)
+        km._pusher_cycle_jobs = lambda *a, **k: None
+        km._sdk = lambda: None
         self.threads = []                              # every loop this test starts; tearDown ends them
         self.wedge = None
         with km._clients_lock:
@@ -50,7 +57,11 @@ class WsHeartbeat(unittest.TestCase):
         km._pusher_wake.set()
         for t in self.threads:
             t.join(5)
-        km._LOOPS_STOP.clear()
+        if not any(t.is_alive() for t in self.threads):
+            km._LOOPS_STOP.clear()                     # every loop ended: the seam is free for the next test
+        # (a loop still alive keeps the stop set, so it exits at its next check instead of running on; the
+        #  census assertion below then reports it)
+        km._pusher_cycle_jobs, km._sdk = self.saved_jobs
         km.KEEPALIVE_S = self.saved_ka
         with km._clients_lock:
             km._clients[:] = self.saved_clients
@@ -127,8 +138,8 @@ class WsHeartbeat(unittest.TestCase):
         km._LOOPS_STOP.set()
         km._pusher_wake.set()
         pusher.join(5); beat.join(5)
-        km._LOOPS_STOP.clear()
         self.assertFalse(pusher.is_alive() or beat.is_alive(), "both loops ended on the stop seam")
+        km._LOOPS_STOP.clear()
         self.assertEqual(wait_for_census(self.census0), [])
 
     @staticmethod
