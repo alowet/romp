@@ -21,6 +21,8 @@ import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
+
+from tests.conftest import thread_census, wait_for_census
 import tempfile
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -91,14 +93,21 @@ class _FakeRemoteKernel:
             self.done.set()
 
     def close(self):
-        try:
-            self.srv.close()
-        except OSError:
-            pass
+        # End the serve thread (T282): a listening socket closed from another thread does not wake accept()
+        # on Linux; shutdown() does. Then wait for the thread's exit, bounded.
+        for op in (lambda: self.srv.shutdown(socket.SHUT_RDWR), self.srv.close):
+            try:
+                op()
+            except OSError:
+                pass
+        self.done.wait(5)
 
 
 class RemoteWsProxy(unittest.TestCase):
     def setUp(self):
+        self._census0 = thread_census()
+        self.addCleanup(lambda: self.assertEqual(wait_for_census(self._census0), [],
+                                                 "no thread of this test outlives it (T282)"))   # runs LAST
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), km.Handler)
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
@@ -141,6 +150,7 @@ class RemoteWsProxy(unittest.TestCase):
 
     def test_splices_both_directions_and_rewrites_the_token(self):
         fake = _FakeRemoteKernel()
+        self.addCleanup(fake.close)
         self._register("gpu1", fake.port)
         try:
             s, status, head, tail, key = self._upgrade("/remote/gpu1/ws?app=chat&token=whatever-the-browser-sent")
@@ -178,6 +188,7 @@ class RemoteWsProxy(unittest.TestCase):
         """Dial the relay for `host` with `browser_path` and return the query the FAR side received, parsed."""
         from urllib.parse import parse_qs, urlsplit
         fake = _FakeRemoteKernel()
+        self.addCleanup(fake.close)
         try:
             self._register(host, fake.port, token=km._remotes[host]["token"] if host in km._remotes else REMOTE_TOKEN)
             s, status, _, _, _ = self._upgrade(browser_path)
@@ -214,6 +225,7 @@ class RemoteWsProxy(unittest.TestCase):
 
     def test_unauthorized_403s_before_any_dial(self):
         fake = _FakeRemoteKernel()
+        self.addCleanup(fake.close)
         self._register("gpu1", fake.port)
         try:
             s, status, _, _, _ = self._upgrade("/remote/gpu1/ws", token=False)
@@ -236,6 +248,7 @@ class RemoteWsProxy(unittest.TestCase):
 
     def test_non_websocket_request_400s(self):
         fake = _FakeRemoteKernel()
+        self.addCleanup(fake.close)
         self._register("gpu1", fake.port)
         try:
             s, status, _, _, _ = self._upgrade("/remote/gpu1/ws", ws_headers=False)

@@ -610,3 +610,39 @@ def pytest_collectreport(report):
     Redacted BEFORE the other implementations see it: the terminal reporter files it from here."""
     _redact_report(report)
     yield
+
+
+# ── thread census (T282) ──────────────────────────────────────────────────────────────────────────────
+# A test that starts a real kernel loop, a backend pump or a fake server must end it before its module ends: a
+# daemon thread that outlives its module runs against whatever the shared modules (the judge, the event model)
+# are bound to by then. These two helpers are the pin every such module carries, and the module-boundary
+# tracer reads the same census, so a leak is named by the module that made it.
+def thread_census():
+    """The live non-main threads as stable descriptors: the target's qualified name when the thread has one,
+    else its name; pytest-timeout's own watchdog thread excluded. Sorted, so two censuses compare directly."""
+    import threading
+    out = []
+    for t in threading.enumerate():
+        if t is threading.main_thread():
+            continue
+        target = getattr(t, "_target", None)
+        mod = (getattr(target, "__module__", "") or "") if target is not None else ""
+        if t.name.startswith("pytest_timeout") or mod.startswith("pytest_timeout"):
+            continue
+        out.append("%s.%s" % (mod, getattr(target, "__qualname__", None) or repr(target)) if target is not None else t.name)
+    return sorted(out)
+
+
+def wait_for_census(before, timeout=5.0):
+    """The threads alive now that were NOT in `before`, once that set is empty or at the deadline: a module's pin is
+    "nothing this module started outlives it", so a thread from an EARLIER module that happens to end during this one
+    cannot fail it, and a thread this module started has a moment (20 ms polls, up to `timeout`) to reach its exit
+    after join(timeout) returned. Returns the sorted leftovers; a clean module gets []."""
+    import time
+    deadline = time.monotonic() + timeout
+    base = set(before)
+    while True:
+        extra = sorted(set(thread_census()) - base)
+        if not extra or time.monotonic() >= deadline:
+            return extra
+        time.sleep(0.02)

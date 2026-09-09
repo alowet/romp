@@ -19,6 +19,7 @@ import tempfile
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
@@ -129,6 +130,29 @@ class NodeLogRows(unittest.TestCase):
 
 
 class SubNodeDrop(unittest.TestCase):
+    def setUp(self):
+        # the kernel's judge is one module object shared by every test module in the process, so a store saved at its import-bound GOALDIR outlives the module and reaches every later module's feed for the placeholder sid (T281/T282); a private root for the duration.
+        self._td = tempfile.TemporaryDirectory()
+        self._state = jd.STATE
+        jd._rebind_state(Path(self._td.name))
+
+    def tearDown(self):
+        jd._rebind_state(self._state)
+        self._td.cleanup()
+
+    def test_the_store_this_module_saves_does_not_outlive_it(self):
+        # The residue pin (T281/T282): a store saved through the shared judge lands under this test's root and
+        # the run-wide root (what every later module's feed reads) is exactly as it was.
+        shared = Path(self._state) / "goals" / (SID + ".json")
+        before = (shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None)
+        st = jd.load_goals(SID)
+        st["nodes"][SID + ":t282"] = jd.GuardedNode({"id": SID + ":t282", "text": "a note", "parentId": None, "nodeComplete": False,
+                                                        "blocked": False, "cleared": False, "trail": [], "t": 1, "mt": 1, "log": []})
+        jd.save_goals(SID, st)
+        self.assertTrue((Path(self._td.name) / "goals" / (SID + ".json")).exists(), "the store lives under this module's root")
+        self.assertEqual((shared.exists(), shared.stat().st_mtime_ns if shared.exists() else None), before,
+                         "the run-wide goals directory is untouched by this module")
+
     """The item-level "Drop" (nodeOverride op:clear): the same user-authority clear seam as a card
     Clear, scoped to ONE sub — checks it off as no-longer-needed without claiming completion."""
 

@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 
+from tests.conftest import thread_census, wait_for_census
+
 HERE = os.path.dirname(os.path.realpath(__file__))
 BIN = os.path.join(os.path.dirname(HERE), "bin")
 os.environ["ROMP_KERNEL_NO_OPEN"] = "1"
@@ -118,7 +120,12 @@ class Chrome(unittest.TestCase):
     no-op for a session with no tmux name (an SDK session skips)."""
 
     def setUp(self):
+        self._census0 = thread_census()
         self.T = km._TMUX
+        # A painted badge starts an expiry thread that sleeps BADGE_TTL (300 s) before it looks again; under the
+        # full suite that thread outlived this module by minutes (T282). Zero TTL here: the thread wakes at once,
+        # reads the stubbed token ("" ≠ the badge's) and ends without clearing anything.
+        self.T.BADGE_TTL = 0
         self.saved = (self.T.set_var, self.T.fire, self.T.display, self.T.show_var, self.T.refresh_client,
                       km._name_of, km._identity_of)
         self.sets, self.fires = [], []
@@ -132,6 +139,8 @@ class Chrome(unittest.TestCase):
     def tearDown(self):
         (self.T.set_var, self.T.fire, self.T.display, self.T.show_var, self.T.refresh_client,
          km._name_of, km._identity_of) = self.saved
+        self.T.__dict__.pop("BADGE_TTL", None)                  # back to the class constant
+        self.assertEqual(wait_for_census(self._census0), [], "no badge-expiry thread outlives the test (T282)")
 
     def test_mail_badge_paints_the_recipient(self):
         km._name_of = lambda sid: "recip" if sid == "r" else None

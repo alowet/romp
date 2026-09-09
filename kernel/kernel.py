@@ -36361,8 +36361,9 @@ def _heartbeat():
     ~40-byte frame is schedulable on time no matter how pegged the CPU-bound threads are, so the
     watchdog now measures the SOCKET's health, not the kernel's load. Frame-safety: _ws_send holds the
     per-client write lock, so beating concurrently with the pusher can't interleave frames."""
-    while True:
-        time.sleep(KEEPALIVE_S)
+    while not _LOOPS_STOP.is_set():
+        if _LOOPS_STOP.wait(KEEPALIVE_S):      # the sleep, ended early only by the stop seam (T282)
+            return
         try:
             _keepalive_all()
         except Exception:
@@ -39569,6 +39570,10 @@ _last_producer_sig = [None]
 # Event-driven wake: POST /tick (poked by the Stop / UserPromptSubmit hooks the instant a turn ends or a
 # prompt lands) sets this so the producer runs a judge pass NOW instead of waiting out the 20s backstop.
 _producer_wake = threading.Event()
+# The three long-lived loops (_producer, _pusher, _heartbeat) run for the kernel's lifetime; this event is the
+# ONE way to end them, for a test that starts a real loop and must not leave it running past its module
+# (T282). Never set in production: the kernel's loops end with the process.
+_LOOPS_STOP = threading.Event()
 # Same idea for the CHAT PUSHER: the SDK live-tail (and any caller) sets this to push the chat NOW
 # instead of waiting out the 4s poll — the SDK stream leads the transcript on disk, so an immediate push
 # of the in-memory live atoms makes messages appear instantly. 4s stays as the backstop.
@@ -40823,7 +40828,7 @@ def _run_tier(fn):
 
 def _producer():
     _prev_wall = _prev_mono = None
-    while True:
+    while not _LOOPS_STOP.is_set():
         _nw, _nm = time.time(), time.monotonic()        # detect a host suspension (laptop slept) since the
         _iv = _detect_suspend(_prev_wall, _prev_mono, _nw, _nm)   # last tick: wall jumped past monotonic
         if _iv:
@@ -41036,7 +41041,7 @@ def _pusher_cycle_jobs(now, tmux, any_client):
 
 
 def _pusher():
-    while True:
+    while not _LOOPS_STOP.is_set():
         _pusher_cycle()
         # Event-driven (woken by the SDK live-tail and by /tick on hook events) with a SHORT 0.5s backstop
         # poll, so tmux sessions — which have no per-message event for mid-turn streaming — still refresh
